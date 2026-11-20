@@ -323,7 +323,7 @@ test "every PRG: convert is deterministic and width-correct" {
         // "Non-zero upper half" does not say that: giving the second block the
         // same tweak as the first leaves it non-zero and stable while halving
         // convert's entropy to 128 bits for every out_bytes in 17..32, with the
-        // top half a byte-for-byte copy of the bottom. Measured 2026-08-11: that
+        // top half a byte-for-byte copy of the bottom. Measured: that
         // mutation left the whole suite at exit 0 before this assertion existed.
         const wide = p.convert(32, s);
         try std.testing.expect(@as(u128, @truncate(wide)) != @as(u128, @truncate(wide >> 128)));
@@ -444,7 +444,7 @@ test "Aes128Mmo: the LEFT child is the UNTWEAKED MMO — the link to the FIPS an
 }
 
 test "Aes128Mmo: convert is exactly the documented H_2 ‖ H_3, tweak in byte 0" {
-    // Long-hand recomputation, as for `expand` above. Mutation run 2026-10-06:
+    // Long-hand recomputation, as for `expand` above. Mutation run:
     // XORing the convert tweak into byte 1 instead of byte 0 kept every other
     // test green — the leaf map stays deterministic and distinct from both
     // children, it is just not the function the module doc defines.
@@ -462,7 +462,7 @@ test "Aes128Mmo: convert is exactly the documented H_2 ‖ H_3, tweak in byte 0"
 }
 
 test "every PRG: convert(L) is the low L bytes of convert(32), for every L" {
-    // Pins the two-block threshold at exactly L > 16. Mutation run 2026-10-06:
+    // Pins the two-block threshold at exactly L > 16. Mutation run:
     // with the second block computed only for L > 24, L in 17..24 read
     // uninitialised bytes and nothing noticed — the 32-byte test still took
     // the two-block path.

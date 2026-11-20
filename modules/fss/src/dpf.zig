@@ -95,7 +95,7 @@ inline fn blackBox(x: u8) u8 {
 ///
 /// ⛔ The mask is laundered, and that is LOAD-BEARING, not defensive. `cond` is
 /// a `u1`, so without the barrier LLVM can recover "`cond == 0` makes `m` zero
-/// and the whole loop a no-op" and emit a jump over it. Measured 2026-09-09:
+/// and the whole loop a no-op" and emit a jump over it. Measured:
 /// this same function, at ReleaseFast, compiled BOTH ways in one binary — the
 /// two call sites in `genWithSeeds` stayed branch-free (`cmovne`), while the
 /// one in `eval` (`dpf.zig`, the descent) became `test $0x1,%r9b` / `je` on the
@@ -115,7 +115,7 @@ inline fn xorMasked(dst: *Seed, src: Seed, cond: u1) void {
 /// pattern LLVM rewrites to `t ? x : 0`, and Zig 0.17.0 (LLVM 22) then lowered
 /// that select in `eval`'s leaf, `key.cw_final & (0 -% t)`, to
 /// `test $0x1,%r13b` / `je` skipping the load of `cw_final` -- a jump on the
-/// secret final control bit (ctgrind `fss/eval` 0 -> 1, 2026-10-18; the 0.16
+/// secret final control bit (ctgrind `fss/eval` 0 -> 1,; the 0.16
 /// build was branch-free). Every secret-bit mask over an `Elem` uses this.
 pub inline fn secretMask(comptime T: type, bit: u1) T {
     const word_bits = @bitSizeOf(usize);
@@ -305,12 +305,12 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         ///
         /// The keys are written through `out`, never returned: a returned
         /// `[2]Key` sits in the caller's result slot, out of reach of the burn
-        /// (the stack probe found the root seeds there, 2026-10-09).
+        /// (the stack probe found the root seeds there).
         ///
         /// `alpha` and `beta` come by pointer, like the seeds: the point `α` is
         /// the secret this key hides, and a by-value argument would sit in
         /// the entry frame's argument tuple, above the burn, as a dead-stack
-        /// copy (8 + up to 8·L bytes; SPEC Backlog, closed 2026-11-18).
+        /// copy (8 + up to 8·L bytes; SPEC Backlog, closed).
         pub fn genWithSeeds(alpha: *const Index, beta: *const Elem, s0: *const Seed, s1: *const Seed, out: *[2]Key) void {
             return burn.run(burn.gen_burn, void, genBody, .{ alpha, beta, s0, s1, out });
         }

@@ -1105,7 +1105,7 @@ test "fuzz Mpf gen over arbitrary seeds never panics" {
 }
 
 test "corpus: the key seeds drive party and count, and the counts are pinned" {
-    // Measured 2026-09-08. ⛔ The load-bearing number is `emitted_total`, not
+    // Measured. ⛔ The load-bearing number is `emitted_total`, not
     // "it did not panic": `count` was 0 on the single input this target ever
     // ran, so `evalEachFullWith` emitted NOTHING and the interleaved walk was
     // never once compared against the naive per-point path — which is the
@@ -1154,7 +1154,7 @@ test "corpus: the key seeds drive party and count, and the counts are pinned" {
 }
 
 test "corpus: the Gen seeds get past the distinctness guard, and the counts are pinned" {
-    // Measured 2026-09-08. ⛔ `accepted` is the load-bearing number here and
+    // Measured. ⛔ `accepted` is the load-bearing number here and
     // it was **0**: the single input this target ever ran was eight
     // byte-identical all-zero root seeds, which `requireDistinctSeeds`
     // refuses, so the harness took its `catch return` every time and
