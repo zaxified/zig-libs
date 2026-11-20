@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit recorded (51 mutants, 46 killed, 5 decided, 1 new test); ctgrind source pins refreshed (tests only).
 - **2026-11-14** — tests only: stale-audit restore (delta mutation run over `nonceGen`/`nonceGenBody`, `sign`/`signBurned`, `burnSignStack`, `getSecondKey`, `reduceToScalar`, `cbytesExt` and the secnonce guards they read; 51 mutants, 46 killed, 5 equivalent or unobservable). New test: `getSecondKey` on an empty list returns the zero marker and does not slice past the end. No code change.
 - **2026-10-10** — tests: deterministic fuzz driver `MUSIG2_FUZZ` (testkit) over `partialSigVerify` on damaged partial signatures (only the published one verifies) and a full 2-3 signer session with optional tweak (partial and aggregate signatures verify; flipped bit, wrong message refused). No change to the library code.
 - **2026-10-09** — **BREAKING:** `nonceGen(out: *NonceGenResult, sk: ?*const [32]u8, …, rand_prime: *const [32]u8, io) NonceGenError!void` — the result goes through `out` (zeroed secnonce on error), `sk` and `rand_prime` by pointer (were by value: the caller frame kept copies); migrate with `var r: NonceGenResult = undefined; try nonceGen(&r, &sk, …, &rand_prime, io)`. `nonceGen` now runs under a 32 KiB dead-stack burn (`burn.zig`); new `stackprobe2_test.zig` on `testkit.stackprobe`. `sign` unchanged.
@@ -45,7 +44,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   and `n + 1` are refused, `keyAgg`/`nonceAgg`/`partialSigAgg` refuse an empty input, `sign`
   refuses a session listing the signer's x with the other parity. No source change.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 101**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ 81 of the 103 total contexts are the mandatory self-verify (`partialSigVerifyInternal`) re-running k256's deliberately variable-time GLV/wNAF machinery on the partial signature about to be returned — the same shape `bip340` (63/80) and `adaptor` (74/90) show, at a near-identical ratio. That is a property of this signing family, not of this module, which is why the row is pinned as a bound. The pre-self-verify body is 17, all accepted classes. `root.zig:887`'s masked parity select re-canonicalises the selected bytes (2 contexts) — the mask is one uniform byte so the outcome never varies, reported rather than hidden.
 
 - **2026-09-07** — Test-only, no production change: `fuzzPartialSigVerify`, the harness
   named "never panics on **corrupted** partial-signature bytes", had never corrupted a byte.

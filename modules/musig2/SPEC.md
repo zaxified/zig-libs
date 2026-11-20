@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-14 (85/92, 7 eq) · src 2576801921b0e5b5
 
-*Delta mutation run 2026-11-14* (about 6 % of the production lines changed since 2026-10-08: dead-stack burns, Zig 0.17 spellings): `nonceGen`/`nonceGenBody`, `sign`/`burnSignStack`, the secnonce-consuming part of `signBurned`, `reduceToScalar`, `cbytesExt`, `getSecondKey`, `SecNonce.deinit`/`scalarAt`/`pubkeyBytes` whole: 51 mutants, 46 killed (one test gap -- `getSecondKey` on an empty list -- closed by a new test; 4 burn mutants killed by the ReleaseFast stack probe), 5 decided: nonce derivation's only error needs a hash = 0 (unobservable), k = 0 maps to the same `InvalidNonce` (2), a local wipe under the probed burn, self-verify fails only under faults.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind; `sign` <=103 in-file since Zig 0.17.0, 2026-10-18: +2 = k256 `Fe.fromBytes`'s canonicity test inside `cpoint`'s `lift`, no longer folded into the identical check of `XOnlyPublicKey.fromBytes`, over the signer's own public key and public nonce that partial-signature self-verification parses -- public values)
 
 **Performance:** not measured
@@ -21,17 +19,6 @@
 MuSig2 multi-signature scheme over secp256k1 (BIP327); see
 [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
-
-**Status: complete (v2, tweak-aware)** — the full BIP327 core signing flow
-(`KeyAgg`/`NonceGen`/`NonceAgg`/`GetSessionValues`/`Sign`/
-`PartialSigVerify`/`PartialSigAgg`) AND key tweaking (`ApplyTweak` —
-`KeyAggContext.applyTweak`, plain and x-only, composing via
-`gacc`/`tacc`) are implemented and byte-exact against the official BIP327
-vectors (including every `tweak_vectors.json` case and `sig_agg`'s two
-tweaked cases); the final aggregate signature verifies under plain
-`bip340.verify` against the (possibly tweaked) aggregate key. See "Out of
-scope" for what is still deliberately omitted (`DeterministicSign`) and
-"Done record" for the implementation passes' crypto-core notes.
 
 ## Compared with
 
@@ -49,6 +36,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only MuSig2 in Zig; all seven non-deterministic BIP327 vector files byte-exact; constant-time masked parity selects in `sign`; tweak chain composed by the `gacc`/`tacc` accumulators. **Where we are behind:** no `DeterministicSign` (BIP327 optional; libsecp and btcd omit it *(inferred for btcd)*), no MuSig2-with-adaptor glue (zkp has it; see the `adaptor` module), no `nonce_gen_counter`, no session-object wrapper (caller passes `SessionContext` each call).
 
 ## Design
+
+MuSig2 implements the full BIP327 core signing flow (`KeyAgg`, `NonceGen`, `NonceAgg`, `GetSessionValues`,
+`Sign`, `PartialSigVerify`, `PartialSigAgg`) and key tweaking (`ApplyTweak`: plain and x-only, composing through the
+`gacc`/`tacc` accumulators). Seven of the eight official BIP327 vector files are byte-exact; the final aggregate
+signature verifies under plain `bip340.verify` against the (possibly tweaked) aggregate key. `DeterministicSign` is
+not implemented (*Backlog / deferred*).
 
 - **Source of truth**: BIP327 ("MuSig2 for BIP340-compatible
   Multi-Signatures", `bitcoin/bips`), consumed directly as
@@ -106,6 +99,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **`keySort` is real** — pure lexicographic byte-sort
   (`std.mem.sort`/`std.mem.order`), byte-exact against
   `key_sort_vectors.json`.
+- **`SessionError`** is `KeyAggError || AggNonceError || ApplyTweakError` (`root.zig:712`), so `getSessionValues`
+  never panics, even on a hand-constructed (never `fromBytes`-validated) `SessionContext.aggnonce`, and an
+  out-of-range tweak or a tweaked key at infinity is a session-level failure, as in BIP327's `GetSessionValues`.
+- **Index checks**: `partialSigVerify` returns `error.InvalidPublicKey` / `error.InvalidPubNonce` when `signer_index`
+  is past either list (`root.zig:1002-1003`) instead of indexing out of bounds.
+- **Dead-stack burns**: `sign` runs its work in `noinline signBurned` with the key passed by pointer (so `sign`'s own
+  frame holds none) and zeroes `sign_stack_burn` (32 KiB) bytes at that depth after it returns, on the error path too
+  (`root.zig:884-975`); `nonceGen` does the same through `burn.run` / `burn.nonce_burn` (`root.zig:369`,
+  `burn.zig:38`). The stack probes (*Verification*) go red if either burn is removed.
 
 ## Threat model / limits
 
@@ -195,18 +197,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   masked byte-select copied from `bip340.sign`'s step 7; and the
   `verify_fail` vector "wrong signature = the negation of a valid one" is
   the KAT that would catch a flipped `g`/parity in any of the three.
-- **Nonce reuse**: same failure mode as `bip340`'s own `SPEC.md` documents
-  for its single-signer nonce — reusing a `SecNonce` (calling `sign` twice
-  with the same one, even for different messages/co-signer sets) leaks
-  the signer's secret key via the standard two-equations-two-unknowns
-  Schnorr algebra. Since 2026-10-08 `sign` takes the
-  `SecNonce` by pointer and zeroes it on entry, whatever the outcome (BIP327
-  `Sign`: `secnonce[0:64] = bytes(64, 0)`; libsecp256k1 `musig_partial_sign`
-  does the same), so a second `sign` over it is `error.InvalidSecNonce`.
-  Until then it took a copy, and "used at most once" was left to the caller
-  — a retry after a failed or repeated call signed again over the same
-  nonce. What remains the caller's: never duplicate or persist a `SecNonce`
-  before signing (a copy is not reached).
+- **Nonce reuse**: same failure mode as `bip340`'s own `SPEC.md` documents for its single-signer nonce: reusing a
+  `SecNonce` (calling `sign` twice with the same one, even for different messages or co-signer sets) leaks the
+  signer's secret key via the standard two-equations-two-unknowns Schnorr algebra. `sign` takes the `SecNonce` by
+  pointer and zeroes it on entry, whatever the outcome (BIP327 `Sign`: `secnonce[0:64] = bytes(64, 0)`;
+  libsecp256k1 `musig_partial_sign` does the same), so a second `sign` over it is `error.InvalidSecNonce`
+  (`root.zig:284-292`, `root.zig:898`). What remains the caller's: never duplicate or persist a `SecNonce` before
+  signing (a copy is not reached).
 - **The mandatory self-verify in `Sign`**: BIP327's `Sign` algorithm
   requires running `PartialSigVerifyInternal` on the freshly-produced
   partial signature before returning it — the same fail-closed philosophy
@@ -217,13 +214,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   check unconditionally and returns `error.SignatureVerificationFailed`
   (never the unverified `s`) if it does not pass.
 
-## Tweaking (implemented in v2)
+## Tweaking
 
-Formerly out of scope; implemented exactly along the seam v1 left open
-(the formulas in `sign`/`partialSigVerifyInternal`/`partialSigAgg` were
-already written in their general `gacc`/`tacc` form — the tweak pass
-changed NONE of them, it only made the accumulators take non-trivial
-values):
+`ApplyTweak` runs exactly along the general `gacc`/`tacc` form that `sign`, `partialSigVerifyInternal` and
+`partialSigAgg` consume (none of them hardcodes `1`/`0`; only `keyAgg`'s output values are the untweaked base):
 
 - **`KeyAggContext.applyTweak(tweak, is_xonly)`** = BIP327 `ApplyTweak`
   (covering both `ApplyPlainTweak` and `ApplyXonlyTweak` via the flag):
@@ -245,175 +239,36 @@ values):
   `applyTweak` uses variable-time `mulPublic`/branches per `keyAgg`'s own
   precedent; no secret ever enters the tweak path (the signer's secret is
   only re-corrected inside `sign` via the constant-time `Scalar.mul`s of
-  `d = g·gacc·d'`, unchanged from v1).
+  `d = g·gacc·d'`).
 
-## Out of scope
+## What is deliberately not done
 
-- **`DeterministicSign`** (BIP327 §"Deterministic and Stateless Signing
-  for a Single Signer") — the optional single-signer convenience wrapper
-  around `NonceGen`+`Sign` for the LAST signer in a session. Not part of
-  the core flow the task scoped; `det_sign_vectors.json` was not fetched
-  into `kat_vectors.zig`.
-- **Zeroizing `bip340.SecretKey`** and copies of a `SecNonce` the caller
-  made — consumer-side (see "Nonce reuse" above); the `SecNonce` passed to
-  `sign` itself is consumed there.
-
-## Done record — crypto-core implementation pass
-
-The six formerly-stubbed cores, implemented in the scaffold's dependency
-order (each later function calls into `getSessionValues`, which calls into
-`keyAgg`), with the KAT group that pins each:
-
-1. **`keyAgg`** — `KeyAggCoeffInternal` (the by-VALUE "second key"
-   coefficient-1 rule, shared with `sign`/`partialSigVerifyInternal` via
-   `keyAggCoeff`) + `Q = Σ a_i·P_i` (`mulPublic` per-term, PUBLIC-scalar
-   variable-time per `bip340.verify`'s precedent, complete `add`
-   accumulation) + the `is_infinite(Q)` rogue-key check. Pinned by all 4
-   `key_agg` valid vectors (including both duplicated-key cases) byte-exact.
-2. **`nonceAgg`** — `R_j = Σ R_{i,j}` for `j=1,2`, `cbytes_ext` encoding;
-   an infinite sum is ENCODED (33 zero bytes), not rejected. Pinned by
-   both `nonce_agg` valid vectors, including the point-at-infinity one.
-3. **`getSessionValues`** — `b = int(H_noncecoef(aggnonce ‖ xbytes(Q) ‖
-   m))`, `R' = R1 + b·R2` (infinity halves = identity in the sum),
-   substitute `R = G` if `R'` is infinite, `e` via BIP340's own challenge
-   tag. Pinned transitively by every `sign_verify`/`sig_agg` vector, and
-   directly by the "Both halves of aggregate nonce correspond to point at
-   infinity" signing vector (which exercises the `G` substitution).
-4. **`sign`** — constant-time masked parity select of `k1/k2` on
-   `has_even_y(R)` (byte-mask technique copied from `bip340.sign` step 7),
-   `d = g·gacc·d'` (the security-critical secret-key negation), `s = k1 +
-   b·k2 + e·a·d`, plus the spec's MANDATORY `partialSigVerifyInternal`
-   self-check before returning (`error.SignatureVerificationFailed`,
-   fail-closed). Pinned by all 6 `sign_verify` valid vectors byte-exact.
-5. **`partialSigVerifyInternal`** — `Re* = ±(R*,1 + b·R*,2)` per
-   `has_even_y(R)`, `g' = g·gacc`, equation `s·G == Re* + e·a·g'·P`
-   (variable-time `mulPublic`; every failure path is an error return,
-   never a panic; either side may legitimately be the identity). `g` comes
-   from the SAME `gFromQ` helper `sign` uses, so signer and verifier
-   cannot disagree on the flip. Pinned by `verify_fail` cases 0/1 — case 0
-   ("wrong signature = negation of a valid one") is exactly the vector a
-   flipped `g`/parity would turn into a false accept — and by every valid
-   partial signature round-tripping through the top-level
-   `partialSigVerify`.
-6. **`partialSigAgg`** — `g` from `has_even_y(Q)` (`gFromQ` again), `s =
-   Σs_i + e·g·tacc mod n` (tweak-general formula, `tacc = 0` in v1), `sig
-   = xbytes(R) ‖ bytes(32,s)`. Pinned by the 2 untweaked `sig_agg` valid
-   vectors byte-exact, each additionally verified by plain
-   `bip340.verify` under the aggregate x-only key.
-
-`SessionError` was widened to `KeyAggError || AggNonceError` so
-`getSessionValues` never panics even on a hand-constructed (never-
-`fromBytes`-validated) `SessionContext.aggnonce`. A 3-signer end-to-end
-test (nonceGen → nonceAgg → sign → partialSigVerify → partialSigAgg →
-`bip340.verify`) closes the loop on fresh, non-vector data, including a
-cross-signer rejection check.
-
-## Done record — tweaking pass (v2)
-
-- **`KeyAggContext.applyTweak`** implemented per the "Tweaking" section
-  above; `SessionError` widened again (`|| ApplyTweakError`) since
-  BIP327's `GetSessionValues` runs the `ApplyTweak` loop itself.
-  `sign`/`partialSigVerifyInternal`/`partialSigAgg` needed NO formula
-  changes — audit confirmed all three already consumed the context's
-  `gacc`/`tacc` (`d = g·sv.gacc·d'`, `g' = g·sv.gacc`, `s = Σs_i +
-  e·g·sv.tacc`), never a hardcoded 1/0; the v1 "hardcoding" lived solely
-  in `keyAgg`'s output values.
-- **`partialSigVerify`** gained the `tweaks` parameter (BIP327's own
-  top-level signature); the previously-embedded-but-skipped `sig_agg`
-  tweaked cases 2/3 now assert byte-exactly, and the two key_agg tweak
-  error cases (t = n out of range; plain tweak landing the single-key
-  aggregate exactly on the point at infinity) were transcribed and assert
-  against `applyTweak`.
-- **KATs added**: all of `tweak_vectors.json` (5 valid chains — each
-  signed byte-exact, accepted by the tweak-aware `partialSigVerify`, and
-  REJECTED by an untweaked verify of the same psig; 1 error case, hit at
-  both the `applyTweak` leaf and through `sign`), plus a second end-to-end
-  test: 3 signers, a BIP341-shaped `TapTweak` x-only tweak, full protocol
-  → the 64-byte aggregate verifies under the TWEAKED x-only key via plain
-  `bip340.verify` and fails under the untweaked one.
+- **Zeroizing `bip340.SecretKey`** and copies of a `SecNonce` the caller made: consumer-side (see *Nonce reuse*
+  above); the `SecNonce` passed to `sign` itself is consumed there.
 
 ## Verification
 
-- KAT oracles: the official BIP327 test vectors, seven of the eight
-  published JSON files under `bip-0327/vectors/` in `bitcoin/bips` (see
-  `NOTICE`; only `det_sign_vectors.json` remains deliberately not
-  embedded), transcribed into `src/kat_vectors.zig`.
-- `zig build test-musig2` (Debug) and `-Doptimize=ReleaseFast`: all pass,
-  no skips — every embedded official vector asserts for real
-  (untweaked AND tweaked), plus the end-to-end tests. `zig fmt
-  --check modules/musig2/` clean; a repo-hygiene grep for
-  scratch/home-directory leakage over this module's tree has no hits.
-
-### Audit 2026-10-08 (review + mutation over the current src)
-
-Review against BIP327 and the k256/bip340 APIs as they stand after the 2026-10-07/08 speed work
-and burns: `NonceGen`'s preimage, `KeyAgg` (second-key rule by value, `L`, `Q`, infinity),
-`ApplyTweak` (`g`, `t < n`, `gacc`, `tacc`), `GetSessionValues` (`b`, the `G` substitute, `e`
-under BIP340's tag), `Sign` (masked parity select, `d = g·gacc·d'`, `s`, self-verify),
-`PartialSigVerifyInternal` (`Re*` parity, `g'`, the equation), `PartialSigAgg`. Formulas match.
-Two findings, fixed:
-- **MEDIUM — `sign` did not consume the secnonce.** It took a `SecNonce` by value, so the
-  caller's copy survived every call; BIP327's `Sign` overwrites `secnonce[0:64]` and libsecp256k1
-  clears it on entry, precisely so that a retry cannot sign twice over one nonce (two partial
-  signatures, one nonce: the secret key falls out). Now `sign(secnonce: *SecNonce, …)`, zeroed
-  on entry on every path. Breaking; no consumer in the repo.
-- **LOW — `partialSigVerify` indexed `pubkeys`/`pubnonces` with an unchecked `signer_index`**:
-  an index past either list panicked in safe builds and was out of bounds in ReleaseFast. Now an
-  error.
-- **HIGH — the key and both nonces on the dead stack after `sign`** (found the same day, after
-  the same probe found the nonce in the sibling `adaptor.preSign`). The new
-  `src/stackprobe_test.zig` (bip340's method, negative and positive control; needles `d'`,
-  `n−d'`, `k1'`, `k2'` and their negations in three images) found per partial signature `d'`
-  once and `k1'`/`k2'` four times each — either nonce with the published `s` is the key. Fixed
-  as `bip340.sign`: the work in `noinline signBurned` (the key passed by pointer, so `sign`'s
-  frame holds none), `sign_stack_burn` (32 KiB; 16.3 KB measured dirty) zeroed after it
-  returns. Probe green; the burn removed in a copy of the tree → residue again.
-
-Mutation schemata (ReleaseSafe, one binary): 41 mutants over `root.zig` — the secnonce
-consumption, parity select, `d` (without `g`, without `gacc`), `s` without `b`, the coefficient,
-self-verify, key binding, pk-in-session, every `NonceGen` preimage field, `GetSecondKey`, the
-second-key rule, `KeyAgg`'s infinity, every `ApplyTweak` step, `b`, the `G` substitute, `e`,
-`Re*` parity, `g'`, the equation, the `tacc` term and its `g`, `NonceAgg`'s halves, `cpoint`'s
-parity and `cpoint_ext`'s infinity, the secnonce zero check, both new index checks, both `s < n`
-checks, `hasEvenY`, the tweak loop, `KeySort`'s order. **39/41 killed, 2 equivalent** — `Sign`'s
-self-verify and `KeyAgg`'s infinity check, for the reasons of the 2026-10-05 run below. Two new
-tests: the secnonce is zeroed after a successful and after a failed `sign` and cannot sign
-again; an out-of-range `signer_index` on either list is an error.
-
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, 29 tests, `setsid -w timeout -s
-KILL 20` per mutant): **54 mutants, 45 killed, 9 equivalent or unobservable**. Points: `cpoint`'s
-tag and parity, `cpoint_ext`'s infinity rule, every codec's range/curve check, `NonceGen`'s
-preimage (aux xor, each length prefix, the absent-message marker, the index byte) and its pk
-binding, `GetSecondKey`, `KeyAggCoeff`'s second-key rule and `L`, `ApplyTweak` (`g`, `t < n`,
-infinity, `gacc`, `tacc`), every `u > 0` guard, `NonceAgg`'s infinity encoding, the session's
-`b`, `R` (incl. the `G` substitute) and `e`, `Sign`'s secnonce binding, pk-in-session, nonce
-parity, `d`, `s` and self-verify, `PartialSigVerify`'s checks, `Re*` parity, `g'` and equation,
-`PartialSigAgg`'s `tacc` term, `KeySort`, and the blame indices.
-
-First pass: 15 survivors. **No defect in the code; 6 were test gaps**, closed by 4 tests in
-`kat_test.zig`:
-
-- An aggnonce half `02‖0^32` or `03‖0^32` is invalid; only `bytes(33, 0)` is infinity —
-  recognising infinity by the x bytes alone survived.
-- A secnonce scalar of `n` or `n + 1` is `InvalidSecNonce` (the official vector has only
-  `k1 = 0`); reducing mod `n` survived.
-- `keyAgg`, `nonceAgg` and `partialSigAgg` refuse an empty input (`0 < u`); without the guards
-  they returned `PointAtInfinity`, an all-zero aggnonce, and a "signature" `s = e·g·tacc`.
-- `sign` refuses a session listing the signer's x with the other parity prefix — matching the
-  list without the prefix survived.
-
-Equivalent or unobservable (9), each reasoned: `NonceGen`'s `k ≠ 0` (probability 2^-256);
-`GetSecondKey`'s empty guard (every caller fails on an empty list first); `KeyAgg`'s
-infinity check (a rogue-key cancellation needs `P2 = −a1·P1` with `a1` hashed over `P2` —
-not constructible); `R' = R1` versus `O + R1` (the same point); `Sign`'s self-verify and the
-internal pk-in-list check (algebraically always pass for a correct signer — they guard against
-faults, not inputs); the local secnonce wipe (a stack copy, not observable in-process);
-`PartialSigVerify`'s up-front signer-key check (the session's `KeyAgg` refuses the same key,
-only the precedence between two errors changes); `PartialSigVerify`'s `s < n` versus `s mod n`
-(accepting `s + n` needs a valid `s < 2^256 − n`, ~2^-128; `s = n` reduces to 0 and fails the
-equation).
+- **Run**: `scripts/modtest musig2`; `zig build test-musig2 -Doptimize=ReleaseFast` runs the stack probes, which skip in Debug and ReleaseSafe.
+- **KAT oracles**: the official BIP327 vectors, seven of the eight published JSON files under `bip-0327/vectors/` in
+  `bitcoin/bips` (see `NOTICE`; only `det_sign_vectors.json` is not embedded), transcribed into
+  `src/kat_vectors.zig`. `src/kat_test.zig` asserts every embedded vector for real, valid and "invalid contribution"
+  cases, untweaked and tweaked, at the leaf codec and through the composite function, plus two 3-signer end-to-end
+  protocol tests (untweaked; a BIP341-shaped x-only tweak) ending in `bip340.verify` (and, tweaked, failing under the
+  untweaked key).
+- **Module-added tests** (no official vector): `sign` consumes the secnonce (zeroed after success and failure, a
+  second `sign` is `InvalidSecNonce`); `SecretKeyMismatch`; the signer's x listed with the other parity prefix; a
+  secnonce scalar of `n` or `n + 1`; aggnonce infinity is exactly 33 zero bytes; empty inputs to `keyAgg`,
+  `nonceAgg`, `partialSigAgg`; an out-of-range `signer_index`; `getSecondKey` on an empty list; `SecNonce.deinit`.
+- **Stack probes**: `src/stackprobe_test.zig` (after `sign`) and `src/stackprobe2_test.zig` (after `nonceGen`) scan the
+  dead stack in ReleaseFast for the secret key, both nonces and their negations, with a positive control.
+- **Fuzz**: `MUSIG2_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver) over two harnesses in
+  `src/fuzz_test.zig`: `musig2-psig` (`partialSigVerify` never panics, only the published signature verifies; weight
+  1/4) and `musig2-session` (a genuine session verifies and every damaged part is refused; weight 1/20). Each has an
+  in-suite reach check.
+- **Constant time**: `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh`, module row `musig2/sign`); the card's
+  `ct` entry names the current context count and what the remainder is.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Anchoring
 
@@ -426,5 +281,8 @@ equation).
 
 ## Backlog / deferred
 
-- **BIP327 `DeterministicSign`** (survey 2026-09-30) — spec-complete claim needs it; useful for the last signer/hardware wallet; libsecp lacks it, so few users miss it. Effort S–M (fetch `det_sign_vectors.json`). Fits §2.
-- **Adaptor support: nonce parity + adapt/extract on partial-sig aggregation** (survey 2026-09-30) — the combination used for atomic swaps and PTLCs; secp256k1-zkp offers it. Effort M; cooperates with the `adaptor` module. Fits §2.
+- **BIP327 `DeterministicSign`**: the optional single-signer wrapper around `NonceGen` + `Sign` for the last signer
+  (useful for hardware wallets); libsecp256k1 lacks it, so few users miss it. Needs `det_sign_vectors.json` embedded
+  in `src/kat_vectors.zig`. Effort S-M. Fits CONVENTIONS §2.
+- **Adaptor support: nonce parity + adapt/extract on partial-signature aggregation**: the combination used for atomic
+  swaps and PTLCs; secp256k1-zkp offers it. Effort M; cooperates with the `adaptor` module. Fits §2.
