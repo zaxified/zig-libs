@@ -20,15 +20,6 @@ SPAKE2+, an AUGMENTED (asymmetric) PAKE, per RFC 9383 —
 P-256/SHA-256/HKDF-SHA256/HMAC-SHA256 ciphersuite; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: complete.** Ciphersuite constants, wire encoders, and the seven
-crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`,
-`deriveKeys`, `proverFinish`, `verifierFinish`) are all implemented — no
-`@panic`/TODO stub remains in `root.zig`. See "The seven crypto cores"
-below for what each does and how it is anchored. An eighth function,
-`verifierConfirm`, was added additively so the real protocol is drivable
-by two genuinely blind parties — see "Driving the real, blind protocol"
-below.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module come from its SPEC (only RFC 9383's P-256/SHA-256/HKDF/HMAC ciphersuite; no other curve or hash; `computeW0W1` takes the caller's PBKDF output) and the public decls of `src/root.zig`. Competitor feature claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read, and the SPAKE2+ implementations that exist are few and mostly P-256 only, so the reference set is small.
@@ -65,8 +56,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   ("names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)") both pin
   this distinction so it cannot silently drift.
 - **The group**: this repository's `p256` module (byte-exact to
-  `std.crypto.ecc.P256`, which is what this module was written against
-  and was moved off on 2026-07-19), a PRIME-order Weierstrass curve
+  `std.crypto.ecc.P256`), a PRIME-order Weierstrass curve
   — cofactor `h = 1` always for this ciphersuite (`cofactor_h` in
   `root.zig`), so every `h*x*(...)`/`h*y*(...)` term in RFC 9383's `Z`/
   `V` equations collapses to a no-op multiplication-by-one. This is a
@@ -225,9 +215,8 @@ self-consistency check; it closed audit finding F1.
   protocol complete prior to receipt and validation of these key
   confirmation messages" and Appendix A.5's own pseudocode uses
   `not_equal_constant_time`. `proverFinish`/`verifierFinish`'s
-  `ConfirmationMismatch` error is this gate; a specialist implementing
-  the stub MUST use a constant-time comparison for the received-vs-
-  expected confirmation MAC (NOT `std.mem.eql`, which is variable-time),
+  `ConfirmationMismatch` error is this gate; the received-vs-expected
+  confirmation MAC is compared with `std.crypto.timing_safe.eql` (NOT `std.mem.eql`, which is variable-time),
   the same discipline `bip340`'s self-verify / `adaptor`'s tamper checks
   already establish elsewhere in this repository for MAC/signature
   comparisons that gate a security-relevant accept/reject decision.
@@ -243,7 +232,7 @@ self-consistency check; it closed audit finding F1.
   crypto modules leave to their callers (no built-in secure-erase
   primitive is assumed here). `TT` (the `tt` field, allocator-owned —
   the caller already frees it) belongs on this list too, not just
-  `K_main`: `VerifierConfirmResult`'s own doc comment establishes that
+  `K_main` (the transcripts the module frees itself — `verifierConfirm`'s and the `*Finish` ones on an error path — are zeroed first by `freeTranscript`, `secureZero` + `free`, because `TT` ends in `w0` and `Allocator.free` leaves memory intact in ReleaseFast): `VerifierConfirmResult`'s own doc comment establishes that
   `TT` is a ONE-CALL pre-image of `K_shared` through this module's public
   `deriveKeys` (`deriveKeys(&keys, tt)`, then `keys.k_shared == K_shared`), exactly the same
   distance as `K_main` — the caller-owned buffer it frees is exactly as
@@ -256,14 +245,14 @@ self-consistency check; it closed audit finding F1.
   module has no way to enforce (mirrors `adaptor.preVerify`'s note that
   binding an adaptor point to the right protocol context is the
   caller's job, not the primitive's).
-- **Dead-stack hygiene (2026-10-08).** No secret stays on the stack after a call,
+- **Dead-stack hygiene.** No secret stays on the stack after a call,
   neither in this module's frames nor in the caller's. Secret scalars (`w0`, `w1`,
   `x`, `y`; `z`, `v`, `w0` for `computeTranscript`) are taken by `*const` pointer;
   secret results (`W0W1`, `DerivedKeys`, `kdf`'s output, `ProverFinishResult`,
   `VerifierFinishResult`) leave through an `out` parameter, zeroed on error. Every
   secret-touching entry point runs its body one frame down and then zeroes the stack
   that body dirtied (`src/burn.zig`; 32 KiB for the multiplying cores, 4 KiB for the
-  hash/MAC/KDF ones). `mac` still returns its tag by value: it is the public
+  hash/MAC/KDF ones). `mac` returns its tag by value: it is the public
   confirmation message (the HMAC key pads, the only secret in it, are burned);
   `hash` is a plain digest of caller data. `src/stackprobe_test.zig` (ReleaseFast
   only) measures it per entry point: 0 residues of the scalars, the points
@@ -271,15 +260,9 @@ self-consistency check; it closed audit finding F1.
   `K_shared`, with a negative and a positive control in the same binary. The
   caller's own copies — the `out` structs, `tt` — are the caller's to wipe.
 
-## The seven crypto cores (all implemented)
+## The seven crypto cores
 
-The seven crypto cores in `root.zig` are all real — no `@panic`/TODO stub
-remains. Each function's own doc comment spells out the exact RFC 9383
-construction step-by-step, following the sibling `bip340`/`frost`/
-`adaptor` modules' established idioms (constant-time multiply-then-add
-for secret-touching scalar ops, `Scalar.fromBytes48` wide reduction,
-allocator-owned variable-length output, constant-time MAC/confirmation
-comparison):
+Each of the seven crypto cores in `root.zig` has a doc comment that spells out the exact RFC 9383 construction step-by-step; the cores follow the sibling `bip340`/`frost`/`adaptor` modules' established idioms (constant-time multiply-then-add for secret-touching scalar ops, `Scalar.fromBytes48` wide reduction, allocator-owned variable-length output, constant-time MAC/confirmation comparison):
 
 1. **`computeW0W1`** — split an 80-byte PBKDF output into two 40-byte
    halves, wide-reduce each mod `p` via `Scalar.fromBytes48`. Outside
@@ -326,7 +309,7 @@ function needs the OTHER party's confirmation value before it will run,
 and two blind parties — neither of whom starts out knowing anything the
 other hasn't sent — cannot resolve that on their own.
 
-The circularity is not in the protocol; it was in the API surface.
+The circularity is not in the protocol, only in a naive reading of the API surface.
 RFC 9383 Appendix A.5's own pseudocode is not circular, because the two
 roles are not symmetric in when they act: the Verifier computes and
 transmits `confirmV` FIRST, with no `confirmP` in existence yet; only
@@ -334,10 +317,10 @@ after the Prover receives and validates that `confirmV` does it compute
 and transmit `confirmP`; the Verifier's check of `confirmP` is the LAST
 step of the whole protocol. `verifierFinish` models that last step
 correctly (it is only ever called once `confirmP` genuinely exists) —
-but nothing modeled the EARLIER step, the Verifier's confirmV emission,
+but `verifierFinish` cannot also be the EARLIER step, the Verifier's confirmV emission,
 which by construction cannot depend on `confirmP`.
 
-`verifierConfirm` is that earlier step, added additively: the same
+`verifierConfirm` is that earlier step, kept separate from `verifierFinish`: the same
 `Z = h*y*(X - w0*M)` / `V = h*y*L` / transcript / key-schedule
 computation `verifierFinish` performs, stopping right after
 `confirmV = MAC(K_confirmV, shareP)` — no `received_confirm_p` parameter,
@@ -349,17 +332,12 @@ validation would reintroduce the exact class of defect this addition
 fixes, only worse (a silently-unauthenticated key instead of a stuck
 protocol).
 
-⚠ **Omitting the `k_shared` FIELD is not what makes that true, and the
-first version of this function got it wrong.** It also returned `tt` and
-`k_main` "for KAT visibility", and each of those is a one-call pre-image of
-`K_shared` through this module's own public `deriveKeys`/`kdf` — measured
-2026-09-01: both `deriveKeys(tt).k_shared` (the by-value form then) and
-`kdf(32, "", &vc.k_main, "SharedKey")` equal the real `K_shared`, at the
-moment the Verifier has never seen a `confirmP`. `Z`/`V` were two calls
-away by the same route. All of them now stay inside the call, which frees
-its own transcript; the byte-exact KAT coverage they carried is unchanged,
-because `verifierFinish` recomputes and returns the same values on the same
-inputs, after the confirmation check, where returning them is safe.
+⚠ **Omitting the `k_shared` field is not what makes that true.** Returning `tt` or `k_main` would hand the caller a
+one-call pre-image of `K_shared` through this module's own public `deriveKeys`/`kdf` (`deriveKeys(&keys, tt)` then
+`keys.k_shared`, or `kdf(32, "", &k_main, "SharedKey")`) at a moment the Verifier has never seen a `confirmP`; `Z` and
+`V` are two calls away by the same route. So all of them stay inside the call, which frees (and wipes) its own
+transcript; the byte-exact KAT coverage they would carry comes from `verifierFinish`, which recomputes and returns the
+same values on the same inputs after the confirmation check, where returning them is safe.
 
 Scope this honestly: it is a gate against a caller's **mistake**, not
 against a hostile Verifier. The Verifier holds `w0`, `L`, `y` and both
@@ -390,32 +368,34 @@ returns it caller-owned in `VerifierConfirmResult.tt`.
 
 ## Verification
 
-- `zig build test-spake2plus` and `-Doptimize=ReleaseFast` both go green;
-  `zig fmt --check modules/spake2plus/` clean.
+Run `scripts/modtest spake2plus` (ReleaseFast: `zig build test-spake2plus -Doptimize=ReleaseFast`); `zig fmt --check
+modules/spake2plus/`; constant time `scripts/checks/ctgrind.sh spake2plus --check`; fuzz
+`SPAKE2PLUS_FUZZ=<runs>[,<first seed>]` (deterministic driver, never `zig build --fuzz`).
 
-### Mutation run 2026-10-05
+- **Official vector.** `kat_test.zig` asserts `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`,
+  `verifierConfirm` (with no `confirmP` input) and `verifierFinish` byte-exact against RFC 9383 Appendix C's P-256/SHA-256
+  vector (`kat_vectors.zig`), plus `computeTranscript`, `mac` and `mPoint`/`nPoint`.
+- **Foreign goldens.** `bssl_w0w1_test.zig` pins `computeW0W1` and `computeL` against frozen BoringSSL `Register`
+  outputs (`bssl_w0w1_vectors.zig`), including the modular-reduction boundary halves.
+- **Properties and refusals.** A genuinely blind end-to-end run agrees on `K_shared`; a mismatched password fails at the
+  first confirmation with no key on either side; a tampered `confirmV`/`confirmP` or a tampered share is refused; every
+  identity share or `L` and every non-canonical scalar is refused (the canonicality guard is load-bearing: `n + 1` would
+  alias onto `1`); `computeW0W1` takes exactly 80 octets; `*Finish` zero `out` on every error; the transcripts the module
+  frees are zeroed first (ReleaseFast only: the safe modes already overwrite the slice).
+- **Fuzz.** `SPAKE2PLUS_FUZZ`: the share-decode boundary and the entry point behind it, and a genuine exchange against
+  tampered ones (`root.zig`; the exchange harness runs at 1/20 of the budget).
+- **Stack residue.** `stackprobe_test.zig` (ReleaseFast) per entry point, with a negative and a positive control.
+- **ctgrind.** Targets `w0w1`, `computel`, `proverstart`, `verifierstart`, `proverfinish`, `verifierfinish`, each with an
+  untainted control and a no-`-fvalgrind` trap; a `CT discipline` test in `root.zig` forbids the variable-time `mul`
+  variants on secrets.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **33 mutants, 30 killed, 2 equivalent, 1 test gap**. Points: `computeW0W1`'s length and
-halves, every `w0`/`w1`/`x`/`y` canonicality check in all six entry points, every identity check
-(shares, `L`), `X = x·P + w0·M`, `Y − w0·N`, `V`'s scalar, both confirmation checks and their MAC
-inputs and keys, the transcript's `w0` slot, length encoding and identity order, and
-`deriveKeys`' split and info strings.
+## What is deliberately not done
 
-- **Test gap (closed):** `computeW0W1` with a `<` length check accepted 81+ octets. New test:
-  exactly 80; 79 and 81 refused.
-- **Equivalent (2):** `proverStart`/`verifierStart`'s identity-share check — `x·P = −w0·M` needs
-  the discrete logarithm of `M` (resp. `N`), which RFC 9383 §4 generated to be unknown.
-
-**Review finding while reading for the run (fixed):** `verifierConfirm` freed its transcript,
-and both `*Finish` freed theirs on `ConfirmationMismatch`, without zeroing them. `TT` ends in
-`w0` and is a one-call pre-image of `K_shared`; the caller never sees these buffers, and
-`Allocator.free` leaves memory intact in ReleaseFast (only the safe modes overwrite it with
-0xAA). The § "Threat model / limits" note put the wipe on the caller, which covers the `tt` a
-successful `*Finish` returns but not these three. They now go through `freeTranscript`
-(`secureZero` + `free`). Test: a counting allocator asserts every transcript the module frees
-is all-zero at the vtable — ReleaseFast only (skipped in the safe modes, where `free` already
-overwrites the slice); verified to fail with the wipe removed.
+- **No internal randomness.** `x`/`y` are caller-supplied (see *Threat model / limits*).
+- **No failed-attempt counting.** The module is stateless; rate limiting is the caller's.
+- **No PBKDF.** `computeW0W1` takes the caller's 80-byte PBKDF output.
+- **No prover/verifier state objects**, only the eight functions.
 
 ## Anchoring
 
@@ -428,5 +408,4 @@ overwrites the slice); verified to fail with the wipe removed.
 
 ## Backlog / deferred
 
-- **Other RFC 9383 §4 ciphersuites** (survey 2026-09-30): P-256/SHA-512, P-384/SHA-512, P-521/SHA-512, edwards25519/SHA-256, edwards448/SHA-512, and the AES-CMAC MAC variant. Only a user whose peer picked one of them notices (Matter/Thread use the first); each needs its own `M`/`N` and vectors. Effort: medium each. Fits §2 (std has P-384 and edwards25519; P-521 and edwards448 would need own curves).
-
+- **Other RFC 9383 §4 ciphersuites:** P-256/SHA-512, P-384/SHA-512, P-521/SHA-512, edwards25519/SHA-256, edwards448/SHA-512, and the AES-CMAC MAC variant. Only a user whose peer picked one of them notices (Matter/Thread use the first); each needs its own `M`/`N` and vectors. Effort: medium each. Fits §2 (std has P-384 and edwards25519; P-521 and edwards448 would need own curves).

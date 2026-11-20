@@ -9,21 +9,11 @@ the Prover (client) holds a password-derived `w0` AND `w1`; the Verifier
 itself — so a Verifier-database compromise does not directly hand an
 attacker the password.
 
-**Status: complete.** Ciphersuite constants, wire encoders
-(`m_compressed_sec1`/`n_compressed_sec1`, `mPoint`/`nPoint`,
-`computeTranscript`, the `hash`/`mac`/`kdf` primitive wrappers), and the
-seven crypto cores (`computeW0W1`, `computeL`, `proverStart`,
-`verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) are all
-implemented and KAT-validated — no `@panic`/TODO stub remains in
-`root.zig`. An eighth function, `verifierConfirm`, lets the Verifier emit
-its `confirmV` message before it has seen the Prover's `confirmP` — see
-"Protocol flow" below and [SPEC.md](SPEC.md) for why that split is
-necessary, and the `V`-computation asymmetry this scheme's security
-hinges on.
+The module has eight public entry points: the seven crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) and `verifierConfirm`, which lets the Verifier emit its `confirmV` message before it has seen the Prover's `confirmP` — see "Protocol flow" below and [SPEC.md](SPEC.md) for why that split is necessary, and for the `V`-computation asymmetry this scheme's security hinges on.
 
 | File | Contents |
 |---|---|
-| `root.zig` | `M`/`N` ciphersuite constants + `mPoint`/`nPoint`, `computeTranscript`, `hash`/`mac`/`kdf` wrappers, the 7 crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`), and `verifierConfirm` (the Verifier's confirmV-emission half, split out of `verifierFinish` so a blind two-party run is drivable) — all REAL |
+| `root.zig` | `M`/`N` ciphersuite constants + `mPoint`/`nPoint`, `computeTranscript`, `hash`/`mac`/`kdf` wrappers, the 7 crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`), and `verifierConfirm` (the Verifier's confirmV-emission half, split out of `verifierFinish` so a blind two-party run is drivable) |
 | `kat_vectors.zig` | RFC 9383 Appendix C's 1 official P-256/SHA-256 test vector, byte-exact |
 | `kat_test.zig` | Byte-exact KAT assertions against that vector + a genuinely-blind end-to-end Prover<->Verifier run (no foreknowledge of either confirmation value) + mismatched-password, tamper-rejection, RFC 9383 §6 group-membership and non-canonical-scalar tests |
 | `bssl_w0w1_vectors.zig` | Frozen goldens captured from BoringSSL's `bssl::spake2plus::Register` — registration vectors plus modular-reduction boundary halves. The oracle for `computeW0W1`, which RFC 9383 Appendix C cannot reach |
@@ -134,9 +124,10 @@ spake2plus → p256 (sibling module; byte-exact to std.crypto.ecc.P256) /
 ## Verify
 
 ```
-zig build test-spake2plus                     # Debug — green
+scripts/modtest spake2plus
 zig build test-spake2plus -Doptimize=ReleaseFast
 zig fmt --check modules/spake2plus/
+scripts/checks/ctgrind.sh spake2plus --check
 ```
 
 `kat_test.zig` asserts byte-exact `computeL`/`proverStart`/
@@ -148,5 +139,9 @@ public API in the real RFC 9383 Appendix A.5 message order — neither
 party is fed a confirmation value it did not itself just receive) and
 tamper rejection (corrupted confirmation MAC, corrupted share).
 `computeW0W1` has no official byte-exact oracle — see `SPEC.md`'s note.
+
+## Not provided
+
+Only the P-256/SHA-256 ciphersuite: no other RFC 9383 §4 suite, no PBKDF, no internal randomness, no attempt counting, no prover/verifier state objects. See `SPEC.md` § What is deliberately not done and § Backlog / deferred.
 
 Provenance: see [NOTICE](NOTICE).

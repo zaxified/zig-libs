@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: struct `@typeInfo` `.fields` -> `.field_names`.
 
 - **2026-10-10** — tests: deterministic fuzz driver `SPAKE2PLUS_FUZZ` (testkit) over the share-decode boundary and a full SPAKE2+ exchange (both sides finish with equal K_shared; tampered confirmations, shares, context or password refused). No change to the library code.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** every secret path left
@@ -40,7 +39,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   killed, 2 equivalent; `SPEC.md` § "Mutation run 2026-10-05") — `computeW0W1` refuses 81 octets,
   and a ReleaseFast-only test checks every module-freed transcript is zero at free time.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **w0w1 4 / computel 3 / proverstart 7 / verifierstart 7 / proverfinish 12 / verifierfinish 10**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. First measurement behind `SPEC.md`'s two claims ("EVERY scalar multiplication MUST use P256's constant-time mul" and "Key-confirmation MUST be constant-time-compared"). ⭐ The confirmation MAC measured clean: exactly one context each, the unavoidable branch on the aggregate accept/reject the return value already discloses, with **no contexts from inside the byte-comparison loop**. `root.zig`'s own source-text test already said it "cannot measure timing" and that whether `p256`'s `mul` is branch-free "is p256's to prove — that gap is recorded, not closed here"; this harness is that measurement. ⚠ The password is the secret here, and a password has far less entropy than a key, so any real dependence would be worth more to an attacker than the same dependence on a 256-bit scalar — which is why the canonicality checks on `w0`/`w1`/`x`/`y` are recorded even though none of those values ever crosses the wire.
 
 - **2026-09-07** — Fuzz reach: `fuzzShareDecode`'s "half the draws come from a REAL
   encoding" branch had never executed once. The branch gate was `smith.value(bool)`, the
