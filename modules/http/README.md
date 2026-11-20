@@ -483,8 +483,9 @@ HEADERS frame is materialized into it once the body ends.
   request line → 414; oversized body → 413; unsupported HTTP version →
   505; missing Host on 1.1 → 400 (not for CONNECT, as Go);
   `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
-  handler error → 500 when nothing was sent, otherwise the connection dies
-  mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read
+  handler error → 500 when nothing was sent (413 when a body cap was the cause, 400 when
+  the request body's framing was broken; `Request.bodyOverCap` reports the 413 case),
+  otherwise the connection dies mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read
   (`Request.reader`); a handler that answers without reading never invites
   the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).
@@ -590,6 +591,12 @@ error), a request refused before its handler (`request_refused`, with the
 status), a server-side failure (`server_failed`: 503 no working memory, 500
 broken framing) and `accept` errors (`accept_failed`) — h1 and h2 alike;
 success never calls it.
+
+**Memory per connection.** An idle admitted connection costs about 46 KiB
+before its first byte (its buffer slab and bookkeeping), and the server has
+no built-in connection cap: `Options.on_connect` is the admission control and
+`Server.activeConnections()` its input, so size `max connections x 46 KiB`
+into the process budget.
 
 **Size limits** (all configurable in `Options`):
 

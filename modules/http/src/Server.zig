@@ -2782,6 +2782,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         gunzip_body.scratch = sc;
         if (opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = padded };
         req.decoded = &gunzip_body.reader;
+        req.decoded_exceeded = &gunzip_body.exceeded;
     }
     // Compression is considered only when configured AND the working
     // memory is there; the Accept-Encoding negotiation is per request.
@@ -2842,6 +2843,13 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 413);
         if (decode_gzip and gunzip_body.exceeded)
             return respondError(opts, out, date, 413);
+        // A body whose FRAMING failed (a refused chunk line, a trailer
+        // section past its cap, a body cut short of its Content-Length or
+        // chunk) is the client's fault too: 400, as nginx answers a
+        // malformed chunked body. The decoder's failure is final and the
+        // connection closes either way.
+        if (bodyFramingFailed(&body))
+            return respondError(opts, out, date, 400);
         // `sent_head` was checked above, so this cannot fail; handled rather
         // than asserted so the guard survives ReleaseFast.
         fireError(opts.on_error, opts.on_error_ctx, .handler_failed, err, 500, opts.peer);
@@ -2910,6 +2918,17 @@ noinline fn requestEncodingOf(head: *const h1.RequestHead) gzip.RequestEncoding 
         if (lines > 1) return .unsupported;
     }
     return gzip.requestContentEncoding(first);
+}
+
+/// Did the request body's framing decoder refuse the wire bytes? Out of line:
+/// the serving frame is budgeted (`frame_probe`).
+noinline fn bodyFramingFailed(body: *const RequestBody) bool {
+    return switch (body.*) {
+        .chunked => |*c| c.fail_reason != null,
+        .capped => |*c| c.inner.fail_reason != null,
+        .limited => |*l| l.truncated,
+        .none, .external => false,
+    };
 }
 
 fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u16) ConnDisposition {
@@ -3003,6 +3022,11 @@ pub const Request = struct {
     /// returns this decoded (e.g. gunzipped) stream instead of `body`'s raw
     /// framing reader. The framing `body` remains the drain source.
     decoded: ?*Reader = null,
+    /// Where the over-cap flags of the two bodies live, for `bodyOverCap`:
+    /// the decoder's `GunzipBody.exceeded`, and (h2 streaming, whose body is
+    /// `.external`) `StreamBody.exceeded`. Null when no such cap is in play.
+    decoded_exceeded: ?*const bool = null,
+    body_exceeded: ?*const bool = null,
     /// Trailer-source override: when set, `trailer`/`iterateTrailers`/
     /// `trailers` read this raw CRLF field block instead of the chunked
     /// body's captured one. The h2 path uses it — there is no chunked
@@ -3158,6 +3182,21 @@ pub const Request = struct {
             if (!rw.sent_head) sendContinue(rw.out);
         };
         return req.decoded orelse req.body.reader();
+    }
+
+    /// True once a body read of this request failed because the body crossed
+    /// a size cap the server enforces: a chunked or streamed body over
+    /// `max_body_bytes`, or a gzip body that inflated past
+    /// `max_decompressed_request_bytes`. These are the cases where a handler's
+    /// read fails and the serving loop answers 413 instead of the handler's
+    /// own error, so a middleware (an access log) that sees the handler fail
+    /// asks this to log what the server answers. Meaningful after the handler
+    /// returned (or after the failing read); false before any read hit a cap.
+    pub fn bodyOverCap(req: *const Request) bool {
+        if (req.body.* == .capped and req.body.capped.exceeded) return true;
+        if (req.body_exceeded) |f| if (f.*) return true;
+        if (req.decoded_exceeded) |f| if (f.*) return true;
+        return false;
     }
 
     /// Out of line: the serving frame is budgeted (`frame_probe`).
@@ -3454,6 +3493,12 @@ pub const GunzipBody = struct {
     /// has used a byte past the end of the body (a truncated stream -- see
     /// `gzip.PaddedSource`), and the bytes of that read are withheld.
     scratch: ?*const GunzipScratch = null,
+    /// How the decoded stream ended, latched: a reader may be polled again
+    /// after `EndOfStream` (std's `readVec` swallows the first one when it
+    /// already copied bytes, and `readSliceShort` then asks once more), and
+    /// the end check must not run twice -- the second `checkTrailer` read a
+    /// trailer that was already consumed and failed a valid body.
+    ended: enum { running, done, failed } = .running,
     reader: Reader,
 
     /// Running trailer-verification state (see `trailer_check`).
@@ -3485,6 +3530,11 @@ pub const GunzipBody = struct {
 
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const c: *GunzipBody = @alignCast(@fieldParentPtr("reader", r));
+        switch (c.ended) {
+            .running => {},
+            .done => return error.EndOfStream,
+            .failed => return error.ReadFailed,
+        }
         if (c.trailer_check) |*tc| {
             if (!tc.header_done) {
                 gzip.skipGzipHeader(tc.source) catch |err| switch (err) {
@@ -3544,11 +3594,13 @@ pub const GunzipBody = struct {
     /// The decoded stream ended: check the trailer when asked to, then that
     /// neither the stream nor its trailer ran past the end of the body.
     fn end(c: *GunzipBody) Reader.StreamError!usize {
+        c.ended = .failed;
         if (c.trailer_check) |*tc| {
             gzip.checkTrailer(tc.source, tc.crc, tc.size) catch
                 return error.ReadFailed;
         }
         try c.refuseTruncated();
+        c.ended = .done;
         return error.EndOfStream;
     }
 
@@ -5528,6 +5580,9 @@ test "BodyLimit: a body ending exactly at the cap passes though the reader first
     try testing.expect(std.mem.endsWith(u8, got, "fits"));
 }
 
+/// What `/overcap` saw (`Request.bodyOverCap`); tests run one at a time.
+var over_cap_seen: ?bool = null;
+
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
     if (std.mem.eql(u8, req.path, "/method") or (req.method == .connect and req.path.len == 0)) {
@@ -5536,6 +5591,22 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
+    } else if (std.mem.eql(u8, req.path, "/gzhash")) {
+        // The hash of the (decoded) body, for the gzip-body fuzz harness.
+        var buf: [512]u8 = undefined;
+        const n = try req.reader().readSliceShort(&buf);
+        var out: [24]u8 = undefined;
+        try rw.writeAll(try std.mem.print(&out, "h={x:0>16}", .{std.hash.Wyhash.hash(0, buf[0..n])}));
+    } else if (std.mem.eql(u8, req.path, "/overcap")) {
+        // Drains the body, records `bodyOverCap` after the failing read (or
+        // the clean end), then fails on its own when the query says so.
+        _ = req.reader().discardRemaining() catch |e| {
+            over_cap_seen = req.bodyOverCap();
+            return e;
+        };
+        over_cap_seen = req.bodyOverCap();
+        if (req.query.len != 0) return error.HandlerOwnFailure;
+        try rw.writeAll("ok");
     } else if (std.mem.eql(u8, req.path, "/limit8")) {
         // Go `MaxBytesReader`: 8 octets, a 413 of the handler's own over it.
         var limit: BodyLimit = undefined;
@@ -6076,7 +6147,7 @@ test "serveStream: a bare LF cannot stand in for the head-terminating CRLF and s
 
 test "serveStream: a chunked body the decoder refused is not resumed by the drain, no request rides behind it (O1-1, O1-2)" {
     // `/echo` `try`s its body read, so a refused chunk makes it fail and the
-    // loop answers 500 -- and then drained the body for keep-alive. The drain
+    // loop answers 400 (500 before 2026-11-19) -- and then drained the body for keep-alive. The drain
     // resumed the decoder behind the refused line (`40 `), decoded the `0`
     // a front end saw as chunk data, and served `/hello` behind it. The
     // second wire ends its trailer section on a bare LF line, which a
@@ -6091,7 +6162,7 @@ test "serveStream: a chunked body the decoder refused is not resumed by the drai
             var hits: Hits = .init(0);
             var out_buf: [4096]u8 = undefined;
             const got = runStreamWith(.{ .max_body_bytes = cap }, &hits, wire, &out_buf);
-            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
             try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
             try testing.expect(std.mem.find(u8, got, "hello") == null);
             try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
@@ -6125,6 +6196,37 @@ test "serveStream: protocol rejections (505, 400s, 431)" {
     try testing.expect(std.mem.find(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
     const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ (strRepeat("a", 2000)) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, runStream(null, long_head, &out_buf), "HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+test "serveStream: a body whose framing failed is the client's fault: 400, not 500; a handler's own failure stays 500" {
+    const wires = [_][]const u8{
+        // Content-Length cut short by the end of the stream.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc",
+        // A chunk cut short, and a chunked body that just ends.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabc",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+        // A refused chunk size and a missing CRLF after the chunk data.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n",
+        // A trailer section past its cap (one line of 33 KiB).
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: " ++ strRepeat("a", 33 * 1024) ++ "\r\n\r\n",
+    };
+    for (wires) |wire| {
+        for ([_]?u64{ null, 1024 }) |cap| { // plain chunked and `Capped`
+            if (cap != null and std.mem.find(u8, wire, "chunked") == null) continue;
+            var out_buf: [4096]u8 = undefined;
+            const got = runStreamWith(.{ .max_body_bytes = cap }, null, wire, &out_buf);
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+            try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
+        }
+    }
+    // Negative controls: the same bodies, well framed, are served; a handler
+    // that fails over a well-framed body is a 500.
+    var out_buf: [4096]u8 = undefined;
+    var got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    got = runStream(null, "POST /overcap?x HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
 }
 
 test "serveStream: handler error → clean 500, keep-alive survives" {
@@ -8117,6 +8219,43 @@ test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, wire, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
     try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
+}
+
+test "Request.bodyOverCap: true exactly when the serving loop answers 413 for a body cap, false for any other failure" {
+    var out_buf: [4096]u8 = undefined;
+    const chunked = "POST /overcap HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    // A chunked body over `max_body_bytes`: 413, and the middleware's view agrees.
+    over_cap_seen = null;
+    var got = runStreamWith(.{ .max_body_bytes = 8 }, null, chunked ++ "14\r\n01234567890123456789\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+    try testing.expectEqual(@as(?bool, true), over_cap_seen);
+    // Exactly at the cap: fine, and not "over".
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_body_bytes = 8 }, null, chunked ++ "8\r\n01234567\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
+    // A handler failure of its own on a within-cap body is 500, not over the cap.
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_body_bytes = 8 }, null, "POST /overcap?x HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
+    // A gzip body that inflates past the decompressed cap: 413, over the cap.
+    const plain = strRepeat("gzipped-body!", 4);
+    const compressed = try gzipAlloc(plain);
+    defer testing.allocator.free(compressed);
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+    var wire_buf: [1024]u8 = undefined;
+    const over_path = try std.mem.print(&wire_buf, "POST /overcap{s}", .{wire["POST /echo".len..]});
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, over_path, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+    try testing.expectEqual(@as(?bool, true), over_cap_seen);
+    // The same body under a roomy cap: 200, not over.
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, over_path, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
 }
 
 test "serveStream: a gzip request body cut short is refused, not a std flate panic" {
@@ -11406,6 +11545,163 @@ test "fuzz driver: HTTP_FUZZ (server dispatch)" {
 
 test "fuzz harness: server dispatch, 300 seeds, reaches every outcome" {
     try DispatchMark.reach(fuzzDispatch, "http-server-dispatch", 300);
+}
+
+// ── fuzz: a gzip request body through the decoder and the serving loop ─────
+
+const GunzipMark = fz.Marker(enum { intact_served, damaged_refused });
+
+/// Compress a plaintext drawn from the source, damage the stream (flipped
+/// octets, a cut), and send it as a gzip request body with the trailer check
+/// on and off. Whatever std's flate does with a crafted stream, the loop must
+/// answer (never crash or hang), and with the check on a 200 must have handed
+/// the handler exactly the plaintext: the CRC-32 and ISIZE leave no other way
+/// for a damaged stream to be accepted.
+fn fuzzGzipBody(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var plain: [300]u8 = undefined;
+    const plen: usize = fz.drawInput(S, src, &plain, &.{});
+    // 0: as drawn (stored / fixed blocks); 1: a small alphabet (dynamic
+    // Huffman blocks); 2: the first 16 octets repeated (long matches).
+    switch (src.valueRangeAtMost(u8, 0, 2)) {
+        0 => {},
+        1 => for (plain[0..plen]) |*b| {
+            b.* = 'a' + (b.* & 3);
+        },
+        else => if (plen > 16) for (plain[16..plen], 0..) |*b, i| {
+            b.* = plain[i % 16];
+        },
+    }
+    const compressed = try gzipAlloc(plain[0..plen]);
+    defer gpa.free(compressed);
+    var damaged = false;
+    var n = compressed.len;
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| {
+        const at = src.index(n);
+        const v = src.value(u8);
+        if (compressed[at] != v) damaged = true;
+        compressed[at] = v;
+    }
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+        const cut = src.index(n + 1);
+        if (cut != n) damaged = true;
+        n = cut;
+    }
+    const wire = try gpa.print("POST /gzhash HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ n, compressed[0..n] });
+    defer gpa.free(wire);
+    var hash_buf: [24]u8 = undefined;
+    const want = try std.mem.print(&hash_buf, "h={x:0>16}", .{std.hash.Wyhash.hash(0, plain[0..plen])});
+
+    for ([_]bool{ true, false }) |verify| {
+        var out_buf: [1024]u8 = undefined;
+        const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = verify }, null, wire, &out_buf);
+        if (!std.mem.startsWith(u8, got, "HTTP/1.1 ")) return error.NotAResponse;
+        const ok = std.mem.startsWith(u8, got, "HTTP/1.1 200 ");
+        if (!ok and !std.mem.startsWith(u8, got, "HTTP/1.1 413 ") and !std.mem.startsWith(u8, got, "HTTP/1.1 500 "))
+            return error.UnexpectedStatus;
+        if (ok and verify and !std.mem.endsWith(u8, got, want)) return error.CorruptBodyAccepted;
+        if (verify and !damaged and !ok) {
+            std.debug.print("intact gzip body of {d} octets refused: {s}\n", .{ plen, got[0..@min(got.len, 40)] });
+            return error.IntactBodyRefused;
+        }
+        if (verify and damaged and !ok) GunzipMark.mark(.damaged_refused);
+        if (verify and ok) GunzipMark.mark(.intact_served);
+    }
+}
+
+fn fuzzGzipBodySmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzGzipBody, smith, script[0..n]);
+}
+
+test "GunzipBody: the end state is latched, both ways, over repeated polls" {
+    const good = try gzipAlloc("hello gzip");
+    defer testing.allocator.free(good);
+    const bad = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad);
+    bad[bad.len - 1] ^= 0xff; // ISIZE
+    for ([_]struct { body: []const u8, end: Reader.StreamError }{
+        .{ .body = good, .end = error.EndOfStream },
+        .{ .body = bad, .end = error.ReadFailed },
+    }) |c| {
+        var src: Reader = .fixed(c.body);
+        const sc = try testing.allocator.create(GunzipScratch);
+        defer testing.allocator.destroy(sc);
+        const padded = sc.start(&src, .raw);
+        var gb: GunzipBody = .init(&sc.decompress.reader, 400, &sc.out);
+        gb.scratch = sc;
+        gb.trailer_check = .{ .source = padded };
+        var buf: [64]u8 = undefined;
+        var polls_after_end: usize = 0;
+        var polls: usize = 0;
+        while (polls < 12) : (polls += 1) {
+            var w: Writer = .fixed(&buf);
+            if (gb.reader.stream(&w, .unlimited)) |_| {
+                try testing.expectEqual(@as(usize, 0), polls_after_end);
+            } else |e| {
+                // Every poll from the first end on answers the same, and
+                // never decodes another byte.
+                try testing.expectEqual(c.end, e);
+                polls_after_end += 1;
+                try testing.expectEqual(@as(usize, 0), w.end);
+            }
+        }
+        try testing.expect(polls_after_end >= 5);
+    }
+}
+
+test "GunzipBody: a reader polled again after EndOfStream stays ended; readSliceShort reads a valid body at any size (verify_inbound_trailer on and off)" {
+    // std's `readVec` swallows the first EndOfStream when it already copied
+    // bytes and `readSliceShort` asks again: the second end check used to
+    // re-read the consumed trailer and fail a VALID body with ReadFailed.
+    var fails: usize = 0;
+    for ([_]bool{ true, false }) |verify| for ([_]u8{ 0, 1, 2 }) |mode| for (0..120) |len| {
+        var plain: [120]u8 = undefined;
+        var prng: std.Random.DefaultPrng = .init(len * 3 + mode);
+        prng.random().bytes(&plain);
+        switch (mode) {
+            0 => {},
+            1 => for (plain[0..len]) |*b| {
+                b.* = 'a' + (b.* & 3);
+            },
+            else => if (len > 16) for (plain[16..len], 0..) |*b, i| {
+                b.* = plain[i % 16];
+            },
+        }
+        const compressed = try gzipAlloc(plain[0..len]);
+        defer testing.allocator.free(compressed);
+        const wire = try testing.allocator.print("POST /gzhash HTTP/1.1\r\nHost: t\r\n" ++
+            "Content-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ compressed.len, compressed });
+        defer testing.allocator.free(wire);
+        var out_buf: [1024]u8 = undefined;
+        const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = verify }, null, wire, &out_buf);
+        var want_buf: [24]u8 = undefined;
+        const want = try std.mem.print(&want_buf, "h={x:0>16}", .{std.hash.Wyhash.hash(0, plain[0..len])});
+        if (!std.mem.startsWith(u8, got, "HTTP/1.1 200 ") or !std.mem.endsWith(u8, got, want)) fails += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), fails);
+    // A body whose trailer is wrong stays refused on every later poll.
+    const compressed = try gzipAlloc("hello gzip");
+    defer testing.allocator.free(compressed);
+    compressed[compressed.len - 1] ^= 0xff; // ISIZE
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+    var out_buf: [1024]u8 = undefined;
+    const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = true }, null, wire, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+}
+
+test "fuzz: a damaged gzip request body is refused or decodes to exactly the plaintext" {
+    try testing.fuzz({}, fuzzGzipBodySmith, .{});
+}
+
+test "fuzz driver: HTTP_FUZZ (gzip request body)" {
+    try fz.fuzz_driver.run(fuzzGzipBody, .{ .prefix = "HTTP_FUZZ", .name = "http-gzip-body" });
+}
+
+test "fuzz harness: gzip request body, 300 seeds, reaches every outcome" {
+    try GunzipMark.reach(fuzzGzipBody, "http-gzip-body", 300);
 }
 
 test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {

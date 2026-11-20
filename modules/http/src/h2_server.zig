@@ -2166,7 +2166,9 @@ const Session = struct {
             gunzip_body.scratch = sc;
             if (s.opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = padded };
             req.decoded = &gunzip_body.reader;
+            req.decoded_exceeded = &gunzip_body.exceeded;
         }
+        if (streaming) req.body_exceeded = &sb.exceeded;
 
         // ── run the handler against the stock ResponseWriter ────────────
         var date_buf: [Server.http_date_len]u8 = undefined;
@@ -8116,6 +8118,88 @@ test "mutation run 2: a streaming request's declared content-length reaches the 
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, .{ .handler = bodyLimitHandler, .stream_request = streamRoutes }, &out_buf);
     try testing.expectEqualStrings("read 0 exceeded true", peer.resp(sid).body.items);
+}
+
+var over_cap_seen: ?bool = null;
+
+fn overCapProbe(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req.reader().discardRemaining() catch |e| {
+        over_cap_seen = req.bodyOverCap();
+        return e;
+    };
+    over_cap_seen = req.bodyOverCap();
+    try rw.writeAll("ok");
+}
+
+test "h2 Request.bodyOverCap: a streamed body over max_body_bytes and a gzip body over the decompressed cap both say so; a body within the caps does not" {
+    const gpa = testing.allocator;
+    var out_buf: [16384]u8 = undefined;
+    // Streamed body over the cap.
+    {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-over"), false);
+        try peer.conn.sendData(&peer.wire, sid, strRepeat("z", 32), true);
+        over_cap_seen = null;
+        try runOffline(&peer, .{ .handler = overCapProbe, .stream_request = streamRoutes, .max_body_bytes = 8 }, &out_buf);
+        try testing.expectEqual(@as(u16, 413), peer.resp(sid).status);
+        try testing.expectEqual(@as(?bool, true), over_cap_seen);
+    }
+    // Streamed body within the cap.
+    {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-fits"), false);
+        try peer.conn.sendData(&peer.wire, sid, "abc", true);
+        over_cap_seen = null;
+        try runOffline(&peer, .{ .handler = overCapProbe, .stream_request = streamRoutes, .max_body_bytes = 8 }, &out_buf);
+        try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+        try testing.expectEqual(@as(?bool, false), over_cap_seen);
+    }
+    // Gzip body over / within the decompressed cap.
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    for ([_]struct { cap: u64, status: u16, seen: bool }{
+        .{ .cap = 16, .status = 413, .seen = true },
+        .{ .cap = 1 << 20, .status = 200, .seen = false },
+    }) |c| {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+        try peer.conn.sendData(&peer.wire, sid, compressed, true);
+        over_cap_seen = null;
+        try runOffline(&peer, .{ .handler = overCapProbe, .max_decompressed_request_bytes = c.cap }, &out_buf);
+        try testing.expectEqual(c.status, peer.resp(sid).status);
+        try testing.expectEqual(@as(?bool, c.seen), over_cap_seen);
+    }
+}
+
+fn shortReadHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const n = try req.reader().readSliceShort(&buf);
+    var out: [16]u8 = undefined;
+    try rw.writeAll(try std.mem.print(&out, "n={d}", .{n}));
+}
+
+test "h2c serve: a valid gzip body read with readSliceShort is served with verify_inbound_trailer on and off (GunzipBody is polled again after EndOfStream)" {
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    for ([_]bool{ true, false }) |verify| {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+        try peer.conn.sendData(&peer.wire, sid, compressed, true);
+        var out_buf: [16384]u8 = undefined;
+        try runOffline(&peer, .{ .handler = shortReadHandler, .max_decompressed_request_bytes = 1 << 20, .verify_inbound_trailer = verify }, &out_buf);
+        try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+        var want: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.mem.print(&want, "n={d}", .{gz_plain.len}), peer.resp(sid).body.items);
+    }
 }
 
 fn closeHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
