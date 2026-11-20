@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over sntp's `decodeResponse` harness (added
-//! 2026-10-09). The harness body is generic over its source of choices
+//! Deterministic fuzz driver over sntp's `decodeResponse` harness. The harness body is generic over its source of choices
 //! (`fn(comptime S, *S, gpa)`). The first draw is one `slice` of bytes (the
 //! datagram, exactly as `std.testing.fuzz` seeds it); a second, ranged draw
 //! picks a SHAPE: 0 = the bytes as they are, 1-3 = patch them into a datagram

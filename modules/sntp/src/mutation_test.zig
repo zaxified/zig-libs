@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-11-17 whole-module mutation of `root.zig`: boundary
+//! Tests added by the whole-module mutation of `root.zig`: boundary
 //! cases the mutants found open (clamp edge, era boundary, rounding direction,
 //! printable-ASCII limits, key length limits, datagram length checks) and a
 //! scripted loopback "server" that sees what `query` puts on the wire and

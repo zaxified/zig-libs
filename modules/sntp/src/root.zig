@@ -505,7 +505,7 @@ pub fn decodeResponse(bytes: []const u8, kiss_out: ?*KissOfDeath) DecodeError!Re
         // LI=3, stratum 0, Reference ID 0 -- chronyd 4.8 and ntpd both do --
         // and that is "not synchronized", not "go away": it used to come back
         // as KissOfDeath/.unrecognized, telling a caller that honours KoD to
-        // back off from a server that only needs time (ntp oracle 2026-10-05).
+        // back off from a server that only needs time (ntp oracle).
         if (!isKissCode(p.reference_id)) {
             return if (p.leap == .unsynchronized) error.UnsynchronizedLeap else error.UnsynchronizedStratum;
         }
@@ -1276,7 +1276,7 @@ test "decodeResponse: an unregistered/malformed kiss code maps to .unrecognized,
 }
 
 test "decodeResponse: an unsynchronized server's stratum-0 reply is UnsynchronizedLeap, not Kiss-o'-Death" {
-    // chronyd 4.8 with no reference, byte for byte (ntp oracle 2026-10-05):
+    // chronyd 4.8 with no reference, byte for byte (ntp oracle):
     // LI=3 VN=4 mode 4, stratum 0, Reference ID 0.
     var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0xe4;
@@ -1458,7 +1458,7 @@ test "nowTimestamp is in a sane modern range" {
     try testing.expect(infer < 4_102_444_800 * @as(i128, std.time.ns_per_s)); // < 2100
 }
 
-// ── era arithmetic (sntp grade 2, 2026-11-03) ───────────────────────────────
+// ── era arithmetic (sntp grade 2) ───────────────────────────────
 
 const rollover_unix_s: i128 = 2_085_978_496; // 2036-02-07T06:28:16Z, NTP seconds 2^32
 
@@ -1858,7 +1858,7 @@ test "processReply: a matching peer reaches validation and can succeed" {
 // These 48 bytes did NOT come from this module: they are the real reply from
 // the public `time.google.com` NTP service (216.239.35.4:123, stratum-1,
 // reference id "GOOG") to a genuine SNTP client-mode request, captured once
-// with a throwaway UDP client and frozen here (2026-08-01). `t1` below is the
+// with a throwaway UDP client and frozen here. `t1` below is the
 // timestamp that request actually sent (also captured), so `verifyOriginate`
 // is exercised against a real echoed value, not a hand-typed one.
 //
@@ -1978,7 +1978,7 @@ test "fuzz: decodeResponse never panics on arbitrary bytes" {
 fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length (the ranged draw would find fewer than eight octets and return the
-    // range MINIMUM, so the datagram was never read; measured 2026-09-07).
+    // range MINIMUM, so the datagram was never read; measured).
     // The harness body lives in `fuzz_test.zig`, generic over its source.
     const ft = @import("fuzz_test.zig");
     var script: [64]u8 = undefined;
@@ -2014,7 +2014,7 @@ test "corpus: every seed reaches decodeResponse, and the accepted count is pinne
         }
     }
     try testing.expectEqual(decode_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 11 non-empty, 0
+    // Measured: with the collapsing draw, 0 of 11 non-empty, 0
     // accepted and 11 of 11 `InvalidLength` from the SAME empty slice. After:
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 2), wrong_length);
@@ -2035,7 +2035,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

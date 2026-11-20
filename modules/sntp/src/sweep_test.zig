@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for sntp, wave GV. Finding SN-1, from
-//! the 2026-10-29 no-panic sweep of `sntp`.
+//! the no-panic sweep of `sntp`.
 const std = @import("std");
 const testing = std.testing;
 const sntp = @import("root.zig");
@@ -70,7 +70,7 @@ test "query: forged replies (wrong-nonce KoD, short datagram) are skipped, the g
     try testing.expectEqual(@as(u8, 2), result.reply.stratum);
 }
 
-// ── grade-2 additions (2026-11-03): every new pub input ─────────────────────
+// ── grade-2 additions: every new pub input ─────────────────────
 
 test "sweep: Timestamp.diffNanos / toUnixNanosInferEra / toUnixNanosNear take any value" {
     const edges = [_]u32{ 0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF };
