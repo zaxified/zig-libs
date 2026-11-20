@@ -233,7 +233,7 @@ fn fuzzDatabaseInit(_: void, smith: *std.testing.Smith) !void {
     // replay, so `record_len` was **0 every time** — `Database.init` returned
     // `ZeroRecordLen` before it looked at anything else, and `count`, `record`,
     // `domainBitsFor` and `wordsPerRecord` below it had never once executed in
-    // this harness. Measured 2026-09-07: 0 of 9 seeds accepted before, 5 after.
+    // this harness. Measured: 0 of 9 seeds accepted before, 5 after.
     const record_len: usize = @intCast(smith.value(u64) % ((1 << 20) + 1));
     const db = Database.init(buf[0..len], record_len) catch return;
     // Every accessor must be total on a Database that init accepted.

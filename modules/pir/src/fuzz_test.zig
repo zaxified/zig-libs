@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for pir (added 2026-10-10, the jwt pattern).
+//! Deterministic fuzz driver for pir(the jwt pattern).
 //!
 //! Driver: `PIR_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_ONLY`
 //! selects a harness by name, `_MS`, `_SEEDFILE`, `_INPUT` as documented

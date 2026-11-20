@@ -931,7 +931,7 @@ test "ATTACK: BOTH servers zeroing everything is rejected — the presence word 
     }
     try testing.expectError(error.AnswerRejected, tampered.reconstruct(&got));
 
-    // The same transcript on the wire path (mutation run 2026-10-06: the
+    // The same transcript on the wire path(the
     // presence check dropped from `reconstructFromBytes` alone survived).
     const zv: [2 * 4]u8 = @splat(0);
     const zt: [3 * V.tag_word_len]u8 = @splat(0);
@@ -1392,7 +1392,7 @@ test "SELF: geometry errors are returned, never asserted" {
         error.AnswerLengthMismatch,
         V.reconstruct(&q.secret, &va, &va, ta[0..2], &ta, &rec),
     );
-    // each tag operand is checked on its own (mutation run 2026-10-06)
+    // each tag operand is checked on its own
     try testing.expectError(
         error.AnswerLengthMismatch,
         V.reconstruct(&q.secret, &va, &va, &ta, ta[0..2], &rec),
@@ -1405,7 +1405,7 @@ test "SELF: geometry errors are returned, never asserted" {
 }
 
 test "EXACT: each channel's keys carry that channel's own seeds" {
-    // Mutation run 2026-10-06: seeding the tag DPF with the VALUE seed `sv0`
+    // Mutation run: seeding the tag DPF with the VALUE seed `sv0`
     // kept every test green (the protocol stays correct), while handing
     // server 0 two keys with the same root seed — the cross-channel reuse
     // `query`'s SeedReuse check exists to refuse from the caller.
@@ -1889,7 +1889,7 @@ test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" 
     try testing.expectEqual(@as(usize, 1), verified);
     try testing.expectEqual(@as(usize, 4), rejected);
     try testing.expectEqual(@as(usize, 1), honest_ok);
-    // The two knobs, measured 2026-09-08 and already alive: `seedTail` writes
+    // The two knobs, measured and already alive: `seedTail` writes
     // a full eight-octet word for each, so 6 of the 7 seeds ask for a non-zero
     // record length and 6 carry a secret other than the `| 1` minimum. Pinned
     // as counts so a seed losing its tail — which would collapse every bundle

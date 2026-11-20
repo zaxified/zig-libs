@@ -1395,7 +1395,7 @@ test "SELF: geometry errors are returned, never asserted" {
     try testing.expectError(error.AnswerLengthMismatch, P.reconstruct(out[0..1], &out, &rec));
     try testing.expectError(error.AnswerLengthMismatch, P.reconstructFromBytes(&buf, &buf, &rec));
     // Too LONG is a mismatch too, and each operand is checked on its own
-    // (mutation run 2026-10-06: `!=` → `<` on these, and dropping the `a1`
+    //(`!=` → `<` on these, and dropping the `a1`
     // check, all survived until these lines existed).
     var long: [9]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, P.answerToBytes(&out, &long));
@@ -2008,7 +2008,7 @@ test "SELF: multi-index geometry errors are returned, never asserted" {
     var buf: [7]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, M.reconstructFromBytes(&buf, &buf, 6, &rec));
 
-    // Mutation run 2026-10-06: a too-LONG records_out, and the aggregate's
+    // Mutation run: a too-LONG records_out, and the aggregate's
     // domain check, had no test.
     var rec_long: [2 * 6 + 1]u8 = undefined;
     try testing.expectError(error.RecordsLengthMismatch, M.reconstruct(&out, &out, 6, &rec_long));

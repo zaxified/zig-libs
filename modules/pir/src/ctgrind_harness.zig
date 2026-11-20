@@ -8,7 +8,7 @@
 //!
 //! Audit finding M2 (A1 `pir.md`): *"`pir` and `fss` are not in the `ct` module
 //! list for ctgrind — the module's central claim has therefore never been
-//! machine-checked."* The `fss` half was closed on 2026-09-09 and it was NOT a
+//! machine-checked."* The `fss` half was closed and it was NOT a
 //! formality: the moment `fss` entered the gate it exposed a real defect —
 //! `xorMasked` skipped the XOR exactly when the secret bit was zero, and the
 //! 7.4% the barrier costs IS the signal that used to be readable. `pir` sits
