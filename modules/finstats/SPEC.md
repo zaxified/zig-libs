@@ -271,10 +271,6 @@ authoritative). The newer functions have no bench row; see *Backlog / deferred*.
   measure.
 - **Independent review of `slice.zig` before its "errors, dates" section:** the independent read-only review of the
   slice surface did not cover it, so the card's review date stays.
-- **The one unexplained mutation survivor:** `drawPath` with Sattolo's shuffle instead of Fisher-Yates. `resampleStat`
-  carries `buf` from one sim to the next, so Sattolo's walk still reaches every order for 4 or more returns and only the
-  correlation between consecutive paths differs. A test would need a frequency check over consecutive paths through a
-  private function; not written.
 - **No mutants yet:** the `xirrPrecise` 1e-14 derivative guard and bracket exits, `gpdFit`'s grid bounds and
   golden-section constants, `distOf`'s percentile positions, the `tradeStats` and `periodStats` wrappers.
 - **O(n) rolling reducers:** `rollingApply` / `rollingBetaAlpha` are O(rows x window); running-sum or monotonic-deque

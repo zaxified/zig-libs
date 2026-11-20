@@ -1265,3 +1265,34 @@ pub fn resampleReturns(a: std.mem.Allocator, xs: []const f64, comptime func: fn 
     }
     return out;
 }
+
+test "drawPath .permute: every order of 4 values is equally frequent across consecutive paths, and a path repeats at 1/24 (Fisher-Yates, not Sattolo)" {
+    // `resampleStat` carries `buf` from one draw to the next, so the property has to hold over
+    // CONSECUTIVE paths. Sattolo's shuffle (j < i) never leaves a path as it was and flips the
+    // parity every time: it would give 0 repeats below, Fisher-Yates 1/24 of the draws.
+    const draws = 24_000;
+    const xs = [4]f64{ 0, 1, 2, 3 };
+    var buf = xs;
+    var prng = std.Random.DefaultPrng.init(0x5a77a120);
+    const rnd = prng.random();
+    var seen: [256]usize = @splat(0);
+    var repeats: usize = 0;
+    var prev: u8 = 0b11_10_01_00; // the identity order
+    for (0..draws) |_| {
+        drawPath(rnd, &xs, &buf, .permute);
+        var key: u8 = 0;
+        for (buf, 0..) |v, i| key |= @as(u8, @intFromFloat(v)) << @intCast(2 * i);
+        seen[key] += 1;
+        if (key == prev) repeats += 1;
+        prev = key;
+    }
+    // Expected 1000 per order and 1000 repeats; sd about 31, the band is 6 sd wide.
+    var orders: usize = 0;
+    for (seen) |c| {
+        if (c == 0) continue;
+        orders += 1;
+        try std.testing.expect(c > 800 and c < 1200);
+    }
+    try std.testing.expectEqual(@as(usize, 24), orders);
+    try std.testing.expect(repeats > 800 and repeats < 1200);
+}
