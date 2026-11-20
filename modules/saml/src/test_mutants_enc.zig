@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Killing tests from the 2026-11-18 whole-module mutation audit, third part:
+//! Killing tests from the whole-module mutation audit, third part:
 //! the decryption options (`allow_weak_rsa15`, `decrypt_kek`) must reach
 //! `xmlenc` on all three paths (EncryptedAssertion, EncryptedID,
 //! EncryptedAttribute). The wrappers here use RSA-OAEP, RSA-1_5 or an AES key

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Regression tests from the 2026-11-13 no-panic sweep (finding prefix SAML).
+//! Regression tests from the no-panic sweep (finding prefix SAML).
 
 const std = @import("std");
 const testing = std.testing;

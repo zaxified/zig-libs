@@ -224,7 +224,7 @@ const sv_confirmation_then_bad_bearer =
     "</saml:SubjectConfirmation>";
 
 test "SAMLCore 2.4.1: a later INVALID SubjectConfirmation does not undo an earlier valid one under .either" {
-    // A1 audit A1/saml.md raised this as an open question ("sender-vouches
+    // A1 audit raised this as an open question ("sender-vouches
     // under .either shortcuts Bearer checks") -- resolved by reading the
     // actual normative text rather than guessing, per QUESTIONS-ROUND-2.md
     // Q5 ("where the norm isn't silent, follow it"). SAMLCore SS2.4.1,

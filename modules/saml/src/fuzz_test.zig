@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for saml's deterministic fuzz driver (added 2026-10-09),
+//! Shared plumbing for saml's deterministic fuzz driver,
 //! and the one harness that needs nothing private: `consumeResponseXml` over
 //! the genuinely signed fixture.
 //!

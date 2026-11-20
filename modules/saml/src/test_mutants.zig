@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Killing tests from the 2026-11-18 whole-module mutation audit of `root.zig`.
+//! Killing tests from the whole-module mutation audit of `root.zig`.
 //! Each test names the behaviour it pins; the positive control sits beside the
 //! refusal so a refusal cannot pass for the wrong reason. Documents that must
 //! carry a valid signature are minted with `test_sign.zig` (or with `mintCustom`

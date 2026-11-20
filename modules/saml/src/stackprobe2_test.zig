@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the four consume entry points
-//! burned in the 2026-10-09 `check-secret-api` pass: `consumeResponse{,Xml}`
+//! burned in the `check-secret-api` pass: `consumeResponse{,Xml}`
 //! with an encrypted assertion (the SP's RSA decryption key is the needle; the
 //! decrypted assertion is checked by the residue rule) and
 //! `consumeLogoutRequest{,Xml}` with an `EncryptedID`. The older
@@ -16,7 +16,7 @@ const fx = @import("fixtures.zig");
 const sp = @import("testkit").stackprobe;
 
 // The burn is 256 KiB; the window must exceed the body's depth (~258 KB at
-// CI's -Dcpu, 2026-10-17: the 256 KiB window was itself reached).
+// CI's -Dcpu: the 256 KiB window was itself reached).
 const P = sp.Probe(.{ .window = 512 * 1024 });
 
 const alloc = std.heap.page_allocator; // global-alloc-ok: the probe's file-scope fixtures (keys, encoded responses) outlive the test block and must not come from testing.allocator

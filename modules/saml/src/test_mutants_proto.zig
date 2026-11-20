@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Killing tests from the 2026-11-18 whole-module mutation audit, second part:
+//! Killing tests from the whole-module mutation audit, second part:
 //! Single Logout, the Artifact binding and IdP metadata. The messages that need
 //! no signature are consumed with `.redirect_verified` (the Redirect binding's
 //! signature is checked on the query string, not in the document); the signed

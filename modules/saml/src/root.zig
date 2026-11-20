@@ -225,12 +225,11 @@ pub const max_untrusted_elements = 8192;
 /// site — and that sentence is asserted by a test rather than merely written,
 /// because a first draft of it was already false: three sites inlined the same
 /// options instead of calling the helper, which carries the property but not the
-/// guarantee the sentence claims.
-/// `utf8_only`: since 2026-10-04 `xml` also reads UTF-16 / ISO-8859-1 /
-/// US-ASCII input. A SAML message is UTF-8 in practice, and accepting more
-/// encodings here would only widen what a forged message can try against
-/// another parser on the path (an encoding-confusion surface), so this module
-/// keeps refusing them, as it did before.
+/// guarantee the sentence claims. `utf8_only`: `xml` also reads UTF-16 /
+/// ISO-8859-1 / US-ASCII input. A SAML message is UTF-8 in practice, and
+/// accepting more encodings here would only widen what a forged message can try
+/// against another parser on the path (an encoding-confusion surface), so this
+/// module keeps refusing them, as it did before.
 fn untrustedXmlOptions() xml.Options {
     return .{ .id_attr_names = &.{"ID"}, .max_elements = max_untrusted_elements, .utf8_only = true };
 }
@@ -462,7 +461,7 @@ pub const AuthnResult = struct {
     /// load-bearing. `std.crypto.secureZero` it (and `attributes`) before
     /// `deinit` if the identity is sensitive in your deployment.
     ///
-    /// The sentence was missing until 2026-09-03: the zeroization pass wiped the
+    /// The sentence was missing until: the zeroization pass wiped the
     /// three transient decrypted buffers (Z1) and did not discharge the Z2
     /// obligation on the longest-lived copy of the same secret. `xmlenc`, one
     /// layer down, carries it.
@@ -581,7 +580,7 @@ pub const ConsumeError = error{
     /// after the four rules): "An assertion that is determined to be
     /// Invalid or Indeterminate MUST be rejected by a relying party" — so
     /// Indeterminate is a hard reject here, not a downgrade to Valid-minus-
-    /// one-condition. A1 audit F13, closed 2026-09-11 (Q1: fail-closed
+    /// one-condition. A1 audit F13, closed (Q1: fail-closed
     /// per the norm, no consumer in this repo to preserve compatibility
     /// for).
     ConditionNotUnderstood,
@@ -1377,8 +1376,7 @@ fn validateSubjectConfirmation(alloc: std.mem.Allocator, subject: *const xml.Ele
                 // applied. The caller MUST ensure `idp_key` is the trusted
                 // attesting authority (see SPEC.md "Sender-vouches").
                 //
-                // ⚠ But the TIME BOUNDS are honoured, and were not until
-                // 2026-09-03. SAMLCore §2.4.1.2 lists `NotBefore`/`NotOnOrAfter`
+                // ⚠ But the TIME BOUNDS are honoured, and were not. SAMLCore §2.4.1.2 lists `NotBefore`/`NotOnOrAfter`
                 // on `<SubjectConfirmationData>` as "optional attributes that
                 // can apply to ANY method"; the Bearer and HoK arms both read
                 // them and this one returned without ever fetching the element.
@@ -2443,8 +2441,7 @@ fn findX509(el: *const xml.Element) ?*xml.Element {
 /// The key is held by pointer: an `rsa.SecretKey` is 11.8 KiB of `p`, `q`,
 /// `d` and the CRT values, and as a by-value field every options struct that
 /// carries a `SigningKey` copied all of it into the caller's frame and every
-/// frame it was passed through, where nothing wiped it (dead-stack sweep,
-/// 2026-10-08). The key must outlive the call it is passed to.
+/// frame it was passed through, where nothing wiped it. The key must outlive the call it is passed to.
 pub const SigningKey = union(enum) {
     /// The SP's own RSA private key, used to sign an outgoing protocol message.
     rsa: *const rsa.SecretKey,
@@ -4493,7 +4490,7 @@ test "corpus: the IdP metadata seeds reach the parser, and the counts are pinned
     // empty `Metadata` if the parser accepted it.
     try testing.expectEqual(@as(usize, 1), endpoints);
     try testing.expectEqual(@as(usize, 1), certs);
-    // Measured 2026-09-08: 0 before — the substitution loop had never made a
+    // Measured: 0 before — the substitution loop had never made a
     // single substitution on a replay, because every seed used a bare
     // `testkit.fuzz.seed`, which appends nothing. 6 now, all of them on the one
     // seed built by `seedSubst`; the five document seeds still arrive verbatim,
@@ -4663,8 +4660,7 @@ test "M02 teeth: signedTargetMatches itself refuses zero or multiple references"
     // `max_references = 1`, so a real two-reference `<ds:Signature>` never
     // gets past `xmldsig.verify` (`error.TooManyReferences`) to reach here at
     // all (2026-09 A1 audit F9/M02 -- the earlier read of this finding as
-    // needing a minted two-reference DOCUMENT was itself stale: F11, closed
-    // 2026-09-06, had already added that cap for an unrelated reason).
+    // needing a minted two-reference DOCUMENT was itself stale: F11, closed, had already added that cap for an unrelated reason).
     //
     // A claim like "fails closed" has to hold on the function's own terms,
     // not only because of a sibling module's cap it happens to compose with
@@ -4735,7 +4731,7 @@ test "M31 teeth: verifyCoveringDecrypted refuses an EncryptedAssertion that is n
     // (`consumeResponseXml` -> `processEncryptedAssertion`), `enc` is found
     // by scanning `root`'s DIRECT children, so `enc.parent == outer_root`
     // holds BY CONSTRUCTION every time that path runs -- the mismatch this
-    // check guards against cannot arise through it today (2026-09-14 audit
+    // check guards against cannot arise through it today (audit
     // triage flagged this exact reachability question for `saml` F9's last
     // five items; this is the answer for M31). Testing the function's own
     // contract directly is what is left, and it is a real defense-in-depth
