@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for btcaddr's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for btcaddr's deterministic fuzz driver.
 //!
 //! The decode harness body stays in `unit_test.zig` beside its corpus, generic
 //! over its source of choices, `fn(comptime S, *S, gpa)`; `testing.fuzz` hands

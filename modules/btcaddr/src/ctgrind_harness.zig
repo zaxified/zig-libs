@@ -9,8 +9,8 @@
 //!
 //! ## Target — taints ONE secret and nothing that is public
 //!
-//! * `wif` — a private key through `wifEncode` and back through `wifDecode`
-//!   (added 2026-10-18). Covers what `bip32/xprv` does not: the borrow-and-
+//! * `wif` — a private key through `wifEncode` and back through `wifDecode`.
+//! Covers what `bip32/xprv` does not: the borrow-and-
 //!   mask `keyInRange` on both sides (it replaced an early-exit `mem.eql` +
 //!   `mem.order`) and the declassified version byte / compression flag. The
 //!   Base58Check text is the key in another radix, so the string stays

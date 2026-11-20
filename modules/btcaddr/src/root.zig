@@ -396,7 +396,7 @@ inline fn public(comptime T: type, v: T) T {
     return x;
 }
 
-/// `1 <= key < n`, in constant time (2026-10-18; was `std.mem.eql` +
+/// `1 <= key < n`, in constant time (was `std.mem.eql` +
 /// `std.mem.order`, both early-exit on the first differing byte of the key):
 /// the borrow out of `key - n` over all 32 bytes, ANDed with "some byte is
 /// non-zero". Only the verdict is public.
@@ -448,7 +448,7 @@ fn wifDecodeBody(out: *Wif, s: []const u8) WifDecodeError!void {
     errdefer std.crypto.secureZero(u8, &out.key);
     var buf: [34]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
-    // Constant-time Base58Check (2026-10-18): the string IS the key in
+    // Constant-time Base58Check: the string IS the key in
     // another radix. Its length (public) and the verdict are what it reveals.
     const payload = base58.checkDecodeSecret(s, &buf) catch |e| return switch (e) {
         error.BufferTooSmall => error.InvalidPayloadLength,
@@ -484,7 +484,7 @@ fn wifEncodeBody(key: *const [32]u8, compressed: bool, network: Network, out: []
     payload[0] = network.wifVersion();
     payload[1..33].* = key.*;
     payload[33] = 0x01;
-    // Constant-time Base58Check (2026-10-18). `out` needs
+    // Constant-time Base58Check. `out` needs
     // `base58.maxEncodedLenFor(37 or 38)` = 51 / 52 bytes (`max_wif_len`).
     return base58.checkEncodeSecret(payload[0..if (compressed) 34 else 33], out);
 }
