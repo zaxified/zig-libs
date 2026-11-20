@@ -4037,8 +4037,9 @@ test "Identity.user: an open Basic plane names nobody, even when a Basic header 
 }
 
 test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
-    // `cookies.find` since 2026-10-18: a quoted `;` stays in the value.
-    try testing.expectEqualStrings("x;y", cookieValue("a=1; sid=\"x;y\"; b=2", "sid").?);
+    // `cookies.find` since 2026-11-20: every `;` ends a pair, quoted or not (Go
+    // net/http, browsers; the cookie-sandwich fix), so a quoted `;` cuts the value.
+    try testing.expectEqualStrings("\"x", cookieValue("a=1; sid=\"x;y\"; b=2", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("sid=abc", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("a=1; sid=abc; b=2", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("a=1;\tsid = \"abc\" ;b=2", "sid").?);

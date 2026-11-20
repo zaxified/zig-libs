@@ -1422,8 +1422,8 @@ stun	ReleaseFast	ltkey	1	0	4784371a37aa6e60	f48e64fbf4283df1
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	6a83404f420d5aa4	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	b103fe6f25824296	7a197b81f402a7ea
+sessions	ReleaseFast	csrf	1	0	fa7518537276445d	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	23da120c22b5ef42	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
@@ -2105,9 +2105,9 @@ minisign	ReleaseFast	open	1	6	6b8a8eb128632bbf	1876f3ea9f53cddd
 # (`containsFp`, timing_safe.eql folded without early exit) adds none. No
 # witness: the verdict leaves the module as a constant enum chosen by that one
 # branch, so total = in-file.
-aaa-gate	ReleaseFast	bearer	2	2	ceb733315669ee34	b0e8295638441324
-aaa-gate	ReleaseFast	api_key	2	2	ceb733315669ee34	964c6a19647f3cd3
-aaa-gate	ReleaseFast	basic	2	2	ceb733315669ee34	3e1202ab86ba6261
+aaa-gate	ReleaseFast	bearer	2	2	467d558251f35544	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	467d558251f35544	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	467d558251f35544	3e1202ab86ba6261
 
 # tls13 (2026-10-31). ks*: the whole RFC 8446 §7.1 schedule over tainted PSK + DHE secret,
 # 0 in-file (HKDF/HMAC are std's; the 20 contexts are the propagation witness).
