@@ -48,7 +48,7 @@ exists and has a lock and a copy guard; all HSS levels 1..8 with any parameter m
 (H20 takes hours, H25 days); no serialisation of the secret key beyond `(SEED, I,
 levels, position)`, which is deliberate but means every restart rebuilds the trees; no
 RFC vector for W1 and W2; never run against a foreign implementation as a black-box
-oracle; no stack-residue test (→ Backlog).
+oracle (→ Backlog).
 
 ## Design & invariants
 
@@ -157,7 +157,7 @@ RFC 8554 Appendix F, transcribed by script from the RFC text into `src/kat_vecto
    differs from H5/H10 in constants and the cache height only.
 
 Round trips and the stateful discipline (`src/unit_test.zig`; the audit-2026-10-03 tests
-are listed under Audit below): every `w` at H5, H10 at
+are described under Verification): every `w` at H5, H10 at
 W2; HSS `L = 1..8`; mixed parameter sets; the position strictly increasing across a
 lower-tree boundary; a key exhausted after exactly `32 x 32` signatures (HSS) and 32 (LMS);
 a key restored at a `Position` signs the same bytes as the walked one; the persistence
@@ -174,7 +174,7 @@ and every cached node against §5.3's recursive definition.
   bound in signing depends on the message digest `Q` (public: it is recomputable from
   the signature) and on parameters, never on the secret; the secret enters only as hash
   input. Timing of the hash itself is `std.crypto`'s.
-- **Secret handling (dead-stack sweep 2026-10-09):** the SEED goes in **by pointer**
+- **Secret handling (dead-stack sweep):** the SEED goes in **by pointer**
   (`*const [32]u8`) to `Tree.init` / `initCached`, `LmsSecretKey.init` and `SecretKey.init`,
   and every key comes out through an **out-parameter** (zeroed seed on error), so neither
   the module's frames nor the caller's hold a copy. The secret-touching bodies (tree build,
@@ -202,67 +202,37 @@ and every cached node against §5.3's recursive definition.
   `UnsupportedLmsType` / `UnsupportedOtsType` at parse and `false` at verify, never a
   guessed layout.
 
-### Audit 2026-10-03
+## Verification
 
-**Review** of all of `src/` (RFC 8554 §3-§6, Appendix A-C) with the stateful discipline first:
-what happens to a leaf on a crash, a failed write, an allocation failure or an error path.
-Result: no HIGH/MED/LOW defect; the discipline holds and is now pinned by tests.
-
-- `LmsSecretKey.sign` and `SecretKey.signPersisting` check exhaustion and output size, build
-  any missing tree (the only allocating step), call the hook with the NEXT position, advance
-  the in-memory position, and only then write signature bytes. Every early return (exhausted,
-  `OutputTooSmall`, `OutOfMemory`, `PersistFailed`) happens before the advance, so no error
-  path spends or reuses a leaf. A crash after the hook returned wastes at most one leaf (safe
-  direction); a hook that reports an error after it already stored the position leaves the
-  in-memory key at the old position, and the retry stores the same position again before it
-  signs: nothing was released in between.
-- HSS safety across a restart rests on one property: the certificate a parent leaf produces
-  for a child tree is a pure function of the key (deterministic child seed, deterministic
-  randomizer `C`). A restored key re-certifies the same child at the same parent leaf and
-  emits identical bytes. A random `C` would turn that re-certification into a reused leaf.
-  Pinned by "a key restored at a position signs exactly what the walked key would" and by the
-  mutants on `deriveChild` and `deriveRandomizer` below.
-- Findings, all INFO (no code change): `SigningKey.init` takes the key by value, so the caller's
-  original aliases the handle's caches and stale position; `Tree.sign` preconditions are
-  asserts only (UB in ReleaseFast); a restored position cannot be checked for staleness
-  (documented: never restore an older copy). All three are in Backlog.
-- Spec conformance beyond the KATs checked by reading: Algorithm 4b/6a/§6.3 check order,
-  `q < 2^h`, both typecodes, exact lengths, `Nspk + 1 == L`; `coef`/`Cksm` index and shift
-  arithmetic for every `w`; `C` input `i = 0xffff` cannot collide with a chain index (`i <= 264`).
-
-**Mutation run** (schemata, ReleaseSafe, one binary, `LMS_MUT=N`, 67 mutants over `core.zig`
-and `sign.zig`: coef/Cksm arithmetic, the four domain separators, chain bounds, every
-verification check, parse limits, cache height, exhaustion and size guards, `Position.next`,
-`init` validation, `deriveChild`, the tree-reuse test in `ensureTrees`, the persist order and
-error handling, the copy guard and both locks): **60 killed, 7 equivalent**. The first pass left
-14 alive, 7 real:
-
-| mutant | survived because | killed by |
-|---|---|---|
-| `HssPublicKey.verify` without its `L` in 1..8 guard | no test built a key with `L = 0` (`L - 1` underflow) | "hand-built key with L outside 1..8" |
-| `cacheHeight` for H20/H25 off by one | those trees are never built in tests | `cacheHeight` test in `sign.zig` |
-| `LmsSecretKey.sign` refusing `out.len == signatureLength` | tests used oversized buffers | "out exactly signatureLength" |
-| `deriveChild` without the path | every parent leaf certified the SAME child tree (its leaves then sign twice); all signatures still verified | "every lower tree is its own tree" |
-| `deriveChild` tag fixed to 0 | child tree identifier = first 16 bytes of its seed (a secret byte string published as `I`) | same test (`id != seed[0..16]`) |
-| `ensureTrees` not recording the built path | rebuilt the child tree on every signature: identical bytes, no functional difference | "out of memory ... staying in a tree allocates nothing" |
-| `SigningKey.sign` without the spin guard | only the `Io`-mutex path had a concurrency test, and it checked a count, not exclusion | "a second signer cannot enter while the first is inside the persist hook" (both guards) |
-
-Equivalent (reason): `cacheHeight` with `h > 14` instead of `h > 15` (h = 15 gives 0 either
-way); `i > c` instead of `i >= c` in `Tree.sign` (a cached node equals the recomputed one; cost
-only); `<=` instead of `<` in the HSS non-final length check (equality leaves no room for the
-final signature, which the length check of `lmsCandidate` rejects); advancing `LmsSecretKey.q`
-after instead of before `Tree.sign` (single-threaded and `sign` cannot fail there; the bare key
-is documented as not thread-safe); dropping `!pos.exhausted` in `SecretKey.init` (exhausted
-positions made by `Position.next` have `q = 0`, which validates); `level` in the `deriveChild`
-hash (the path length already encodes it and the master is fixed-length); `keep < total` in
-`ensureTrees` (`keep <= built <= total`).
-
-Tests added (`src/unit_test.zig`, `src/sign.zig`): the six above plus "the position is durable
-before any signature byte exists; the last write says exhausted" (the hook sees an all-zero
-output buffer and the old in-memory position, and the final write carries `exhausted`; an
-exhausted key never calls the hook) and "a position persisted as exhausted restores as
-exhausted and never signs". The OOM test also pins the SPEC claim that an allocation failure
-while building a tree (node cache and certificate buffer, separately) burns no leaf.
+- **Run:** `scripts/modtest lms`. The byte-exact and round-trip classes are described under *Validation* above.
+- **Stateful discipline** (`src/unit_test.zig`, `src/sign.zig`): the position is durable before any signature
+  byte exists (the hook sees an all-zero output buffer and the old in-memory position; the last write says
+  exhausted; an exhausted key never calls the hook); a position persisted as exhausted restores as exhausted
+  and never signs; a key restored at a position signs exactly what the walked key would; a failed allocation
+  while building a tree (node cache and certificate buffer, separately) burns no leaf and staying inside a
+  tree allocates nothing; a second signer cannot enter `SigningKey.sign` while the first is inside the persist
+  hook (spin and `Io`-mutex guards); every lower tree is its own tree (`deriveChild` takes the path and a
+  tag; the child tree identifier is not a prefix of its seed); a hand-built key with `L` outside 1..8;
+  `cacheHeight` for H20/H25; an output buffer of exactly `signatureLength`.
+- **Fuzz:** `LMS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver, never `zig build --fuzz`), harnesses
+  `lms-verify`, `lms-parse`, `lms-sign-verify` (scale 100: each run is a real signature) and `hss-sign-verify`
+  (scale 200), with a pinned corpus of a real signature and one-bit mutants; every reach label must be hit
+  (`src/fuzz_test.zig`, bodies in `src/root.zig`).
+- **ctgrind:** `src/ctgrind_harness.zig` via `scripts/checks/ctgrind.sh lms`: rows `lms` (seed through LMS H5/W4
+  key generation and two signatures) and `hss` (two-level HSS); the reported contexts are chain lengths from the
+  message digest over the published randomizer `C`, an artefact (the card's Hardening line has the counts).
+- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (ReleaseFast only), described under
+  *Threat notes*.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The mutation run covered `core.zig` and `sign.zig`: coef/Cksm arithmetic, the four
+  domain separators, chain bounds, every verification check, parse limits, cache height, exhaustion and size guards,
+  `Position.next`, `init` validation, `deriveChild`, the tree-reuse test in `ensureTrees`, the persist order and
+  error handling, the copy guard and both locks. The equivalent ones: `cacheHeight` at `h > 14` against `h > 15`
+  (h = 15 gives 0 either way), `i > c` against `i >= c` in `Tree.sign` (a cached node equals the recomputed one),
+  `<=` for `<` in the HSS non-final length check (rejected later by `lmsCandidate`), the order of advancing
+  `LmsSecretKey.q` against `Tree.sign` (single-threaded, cannot fail there), dropping `!pos.exhausted` in
+  `SecretKey.init`, `level` in the `deriveChild` hash (the path length encodes it), `keep < total` in
+  `ensureTrees`.
 
 ## Backlog / deferred
 
@@ -288,16 +258,12 @@ while building a tree (node cache and certificate buffer, separately) burns no l
   point with a documented stack bound (`p * 32` is never held: the chain state is one
   `n`-byte value) is a small follow-up.
 - **A foreign black-box oracle** (a differential run against cisco/hash-sigs's built binary
-  through the wire format, not its source), not done for this first version; and a dead-stack
-  residue test like `xmss`'s. (The mutation run is done: Audit 2026-10-03 below.) *(The
-  dead-stack residue test now exists: `stackprobe_test.zig`, 2026-10-09.)*
-- **`SigningKey.init` takes the `SecretKey` by pointer and wipes it** *(audit 2026-10-03,
-  INFO; narrowed 2026-10-09)*: the source is zeroed after the move, so its seeds and stale
-  position no longer linger, but `deinit` on the zeroed source is still not a no-op the type
+  through the wire format, not its source), not done for this first version.
+- **`SigningKey.init` takes the `SecretKey` by pointer and wipes it**: the source is zeroed after the move, so
+  its seeds and stale position do not linger, but `deinit` on the zeroed source is still not a no-op the type
   system prevents. A stricter shape would build the `SecretKey` in place inside the handle
   (`SigningKey.initInPlace(dst, gpa, levels, seed, id, restore_at, persist)`).
-- **`Tree.sign` / `signWithRandomizer` preconditions are `std.debug.assert` only** *(audit
-  2026-10-03, INFO)*: `q >= 2^h` or `out.len != lmsSignatureLength` is a panic in ReleaseSafe and
+- **`Tree.sign` / `signWithRandomizer` preconditions are `std.debug.assert` only** (INFO): `q >= 2^h` or `out.len != lmsSignatureLength` is a panic in ReleaseSafe and
   undefined behaviour in ReleaseFast. `Tree` is the stateless building block (`LmsSecretKey` /
   `SecretKey` check both before calling it); a checked variant returning an error would be an
   API addition.

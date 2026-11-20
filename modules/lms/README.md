@@ -18,7 +18,8 @@ a leaf twice breaks the scheme.
 - **Model after:** RFC 8554, clean-room; validated on RFC 8554 Appendix F (both
   HSS signatures verify, and Test Case 2's public keys and signatures are
   reproduced byte for byte). See `NOTICE`.
-- **Platform:** any. **Role:** util. **Deps:** none (std SHA-256).
+- **Platform:** any. **Role:** util. **Concurrency:** reentrant (no globals; a bare `SecretKey` is
+  caller-synchronised, `SigningKey` locks). **Deps:** none (std SHA-256).
 
 ```zig
 const lms = @import("lms");
