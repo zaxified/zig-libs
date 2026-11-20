@@ -11,7 +11,7 @@ of logging an `http` request/response pair.
   escaping rule) + Heroku/`kr/logfmt` (logfmt) + the common JSON-Lines access-log convention
   (Caddy/nginx json access log).
 - **Platform:** any. **Role:** codec. **Concurrency:** threadsafe (`Sink`; the formatters are pure functions, no shared
-  state). **Deps:** `http` (for the `entryFromRequest` bridge), `router` (the middleware), `datefmt` (`%{format}t`, backup names) + std only.
+  state). **Deps:** `http` (for the `entryFromRequest` bridge), `router` (the middleware), `datefmt` (`%{format}t`, backup names), `jsontext` (the JSON string escaper) + std only.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
 DATA: `src/json_oracle_vectors.zig` holds entries our tooling drew
@@ -125,8 +125,8 @@ var logger = accesslog.Logger{ .sink = &sink, .clock = clock, .response_headers 
 
 `Entry.timestamp_ns` is the request start; `end:` adds `latency_ns`. The wall clock is UTC
 shifted by `Entry.utc_offset_min` (`Logger.utc_offset_min`). Unsupported strftime directives
-(`%Z %U %W %g`) and the `RotatingFile` failure policy are listed in `SPEC.md` ("Backlog /
-deferred") and the module docs of `timefmt.zig` / `filewriter.zig`.
+(`%Z %U %W %g`) are listed in `SPEC.md` ("What is deliberately not done"); the `RotatingFile`
+failure policy is in the module docs of `timefmt.zig` / `filewriter.zig` and in `SPEC.md` ("Design notes by feature").
 
 ## Time contract — no system clock, ever
 
@@ -243,8 +243,15 @@ fn logRequest(ctx: ?*anyopaque, e: metrics.AccessEntry) void {
 }
 ```
 
-`Sink` used to be `metrics.AccessLog` (removed there 2026-10-06), so there is one access-log
-implementation, with every field and all three formats.
+`Sink` replaced `metrics.AccessLog`, so there is one access-log implementation, with every field
+and all three formats.
+
+## Not provided
+
+No PII redaction or maximum field length, no recovery of the original bytes of an ill-formed
+field from JSON Lines, no time-based or compressed rotation, no `drop_oldest` queue mode, and
+the strftime directives `%Z %U %W %g`: `SPEC.md` "What is deliberately not done" gives each
+reason, "Backlog / deferred" what is open.
 
 See `SPEC.md` for the full field table, the exact escaping guarantee per format, and the
 `entryFromRequest`/`ResponseWriter.body` byte-count contract.

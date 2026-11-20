@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [tower-rs/tower-http](https://github.com/tower-rs/tower-http) (`Trace`) | Rust | MIT (`tower-http/LICENSE`) | 919 | tower-http-0.7.1 (2026-08-31) | README: "high level logging of requests and responses" (HTTP and gRPC). Emits through `tracing`, not a fixed line format. |
 | Zig (`karlseguin/http.zig`, `log.zig`) | Zig | MIT *(inferred for `log.zig`)* | 1.6k (http.zig) | http.zig pushed 2026-08-26 | http.zig's README documents no access-log middleware. `log.zig` is the catalog's "structured logging: adopt" entry, general-purpose, not an access-log codec. |
 
-**Where we are ahead:** log-injection and log-evasion safety is specified and tested to a higher standard than any project above documents it (every field escaped for every format; ill-formed UTF-8 replaced so a client cannot make its own record unparseable; verified against goaccess); three formats from one `Entry` with a stable JSON schema; zero allocation; no clock read; the fastest JSON writer measured (0.89× phuslu/log), and one U+FFFD per maximal subpart where five Go JSON loggers write one per byte (`**Ahead:**`). **Where we are behind:** Closed 2026-11-17: `%{Name}i` for any request header (`Entry.request_headers`, `Logger.request_headers`); Closed 2026-11-06: `%{format}t` (strftime plus `begin:`/`end:`, `sec`, `msec`, `usec`, `msec_frac`, `usec_frac`), `%{Name}o` (`Entry.response_headers`, `Logger.response_headers`), a rotating file writer (`RotatingFile`), and `Sink.Options.template` so a `LogFormat` can drive a `Sink`/`Logger`. Closed 2026-11-05: `%{ms}T`/`%{us}T`/`%{s}T`. Closed 2026-10-11: user-defined format string (`LogFormat`, Common falls out of it), extra fields (`Entry.extra`), a router middleware (`Logger`), conditional logging / sampling (`Logger.keep`).
+**Where we are ahead:** log-injection and log-evasion safety is specified and tested to a higher standard than any project above documents it (every field escaped for every format; ill-formed UTF-8 replaced so a client cannot make its own record unparseable; verified against goaccess); three formats from one `Entry` with a stable JSON schema; zero allocation; no clock read; the fastest JSON writer measured (0.89× phuslu/log), and one U+FFFD per maximal subpart where five Go JSON loggers write one per byte (`**Ahead:**`). **Where we are behind:** the reference's access-log directives are covered (`%{Name}i` for any request header, `%{Name}o`, `%{format}t`, `%{ms}T`/`%{us}T`/`%{s}T`, a `LogFormat` template that can drive a `Sink` or `Logger`), as are extra fields, a router middleware, conditional logging / sampling and a rotating file writer. What is left out, with the reason, is under *What is deliberately not done* (strftime `%Z %U %W %g`, merging repeated request headers, time-based or compressed rotation, multi-process coordination); open items are under *Backlog / deferred*.
 
 ## Fields (`Entry`)
 
@@ -58,6 +58,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | `trace_id` | `?[]const u8` | Distributed-trace id (W3C `traceparent`'s trace-id). |
 | `span_id` | `?[]const u8` | Distributed-trace span id. |
 | `extra` | `[]const Field` | Extra key/value pairs rendered after the fixed fields in JSON Lines and logfmt (Combined ignores them, except `%{key}x` in a `LogFormat` template); invalid, colliding or repeated keys are skipped. Empty by default. |
+| `response_headers` | `[]const Field` | Response headers for `LogFormat`'s `%{Name}o` (first match, case-insensitive); not written by any of the three fixed formats. Empty = `-`. |
+| `request_headers` | `[]const Field` | Request headers for `LogFormat`'s `%{Name}i` other than `Referer`/`User-Agent` (first match, case-insensitive); not written by any of the three fixed formats. Empty = `-`. |
+| `utc_offset_min` | `i16` | Minutes east of UTC for `%{format}t` and `%z`; default 0 (UTC); clamped to ±23:59. Used by nothing else. |
+
 
 Only `timestamp_ns`, `method`, `target`, `status` are required; `protocol` defaults to
 `"HTTP/1.1"`; everything else is `?` and null when unknown.
@@ -69,8 +73,8 @@ nanosecond Unix timestamp, used verbatim by JSON/logfmt and as the numeric fallb
 Combined's `[%t]` when `time_formatted` is null. Reproducing Apache's actual `[%t]` shape
 (`10/Oct/2000:13:55:36 -0700`) requires a timezone-aware calendar conversion, which is a
 separate formatting concern this module deliberately does not perform — a caller that wants
-the spec-shaped bracket formats the string itself (e.g. with the `datefmt` module, not a
-dependency of this one) and passes it as `time_formatted`. Without it, Combined still emits
+the spec-shaped bracket formats the string itself (e.g. with the `datefmt` module, which this module itself depends on for
+`LogFormat`'s `%{format}t`) and passes it as `time_formatted`. Without it, Combined still emits
 exactly one well-formed bracketed field (`[<ns-epoch>]`) — not calendar-shaped, but not
 malformed either, and it costs nothing extra to support.
 
@@ -127,7 +131,7 @@ the wire.
 - **logfmt** — a value is quoted only when `logfmtNeedsQuote` is true: it is empty or contains a
   space, `"`, `=`, `\`, or any control byte (`0x00-0x1F` or `0x7F`). When quoted, `"`/`\` are
   backslash-escaped, `\n`/`\r`/`\t` get short escapes, any other control byte becomes `\u00HH`
-  (go-logfmt's JSON-style escape; `\xHH` until 2026-10-05, which go-logfmt refuses).
+  (go-logfmt's JSON-style escape; go-logfmt refuses `\xHH`).
   Because the quoting trigger set is exactly the escape set, an unquoted value is guaranteed to
   contain none of those bytes — benign passthrough is byte-identical, and anything that would
   read as a second `key=value` pair (a bare `=`), break out of a quoted value (a bare `"`), or
@@ -139,8 +143,8 @@ the wire.
   close its surrounding quote early or emit a raw newline, so the record stays exactly one line
   no matter what it contains. The unquoted slots escape their own delimiters on top: `%u` and
   `%h` hex-escape space, `"`, `[` and `]` (`%h` is `-` when empty), and a `]` inside `[%t]` is
-  hex-escaped. A `]` in a quoted field is kept as sent, as Apache keeps it (until 2026-10-25
-  every field hex-escaped it, so `/q?a[]=1` logged as `/q?a[\x5d=1`).
+  hex-escaped. A `]` in a quoted field is kept as sent, as Apache keeps it
+  (`/q?a[]=1` is logged as `/q?a[]=1`).
 
 All three were verified against a shared adversarial payload — `"`, `\r\n` (line-forge
 attempt), `{`/`}` (JSON-structure-confusion attempt), a fake ` status=200` logfmt pair, and
@@ -168,14 +172,12 @@ rather than passing it through.
 | ill-formed UTF-8 (surrogates, overlongs, truncated sequences, bare continuation bytes, `F5`–`FF`) | **replaced** with U+FFFD, one per ill-formed subsequence | passed through unchanged |
 | control bytes `0x00`–`0x1F` | escaped (`\n`, `\u0007`, …) — unchanged by this contract | escaped (logfmt `\u00HH`, Combined `\xHH`) — unchanged |
 
-**This ends the byte-exact round trip for non-UTF-8 input, and that is deliberate.** Before
-2026-08-11 the JSON writer passed every byte ≥ `0x20` through verbatim and the module's docs
-claimed a malformed byte "only ever affects display, never the string's structural validity" —
-that sentence was the opposite of the truth (`std.json` answers `error.SyntaxError` on such a
-line, as does CPython's `json`). The owner's decision, 2026-08-11: *the access log must always
-be readable; a bad byte must never break it.* The original bytes of an ill-formed field are
+**This ends the byte-exact round trip for non-UTF-8 input, and that is deliberate.** A writer
+that passed every byte ≥ `0x20` through verbatim would produce a line `std.json` rejects with
+`error.SyntaxError`, as does CPython's `json`. The decision: *the access log must always be
+readable; a bad byte must never break it.* The original bytes of an ill-formed field are
 **not recoverable** from JSON Lines output; a deployment that needs them must keep the raw
-value elsewhere (see "Not shipped" below).
+value elsewhere (see *What is deliberately not done*).
 
 ### Substitution policy: one U+FFFD per maximal subpart
 
@@ -213,71 +215,38 @@ U+FFFD itself while reading, so jq cannot be used as the oracle for this). A dep
 feeds Combined or logfmt into a JSON-producing analyser inherits the problem at that boundary;
 using this module's JSON Lines output avoids it at the source.
 
-**Why this is left alone rather than worked around, and what each alternative would cost.**
-Two other options were weighed and rejected:
-
-- *Sanitize `%r`/Referer/User-Agent for Combined and logfmt too, the way JSON Lines already
-  does.* This would make goaccess's own report valid UTF-8, but at the cost of the primary log
-  file itself: Combined and logfmt are what an incident responder reads first, and the exact
-  byte an attacker sent — silently replaced with U+FFFD — can be the detail that identifies the
-  attack (a payload's non-ASCII shape, a specific malformed encoding a scanner is known to send).
-  A log rewritten for a downstream tool's convenience is no longer a faithful record of what was
-  received. JSON Lines pays that price deliberately, for a documented reason (RFC 8259 makes an
-  unparseable record equivalent to a dropped one — see above); Combined/logfmt have no such
-  requirement forcing the trade, so paying it there would be sanitizing without a corresponding
-  gain other than pleasing one specific downstream tool's parser.
-- *Emit a fourth, goaccess-safe view alongside Combined/logfmt.* Rejected as redundant: the
-  sanitized view this would produce already exists under a different name — JSON Lines — so a
-  dedicated view would mean testing and maintaining a near-duplicate output format for one
-  external consumer's limitation, when pointing that consumer at the existing sanitized format
-  solves it with no new surface.
-
-The decision, restated: Combined and logfmt stay byte-exact, unconditionally, including for
-bytes that break a downstream tool's own output. A deployment whose analyser needs a guaranteed-
-UTF-8 artifact gets one by pointing it at this module's JSON Lines output instead — that option
-already exists and was built for a materially identical reason (RFC 8259 conformance), not
-retrofitted for this finding.
-
-### Not shipped: recovering the original bytes
-
-Keeping the raw value recoverable is cheap and was deliberately **not** made the default: an
-opt-in flag could emit an extra sibling key (e.g. `"user_agent_raw":"<hex>"`) for each field
-whose input was ill-formed, hex being both compact enough and unconditionally UTF-8-safe. It
-costs one extra key only on the records that need it, keeps the default lossy-but-parseable per
-the decision above, and is a strictly additive schema change (the fixed key order stays; the
-raw keys appear after the field they belong to). Not implemented — no consumer asked for it,
-and an always-present raw copy of every attacker-controlled field is also an unbounded-size
-amplifier on a hot path.
+The decision: Combined and logfmt stay byte-exact, unconditionally, including for bytes that break a downstream tool's own output. A deployment whose analyser needs a guaranteed-UTF-8 artifact points it at this module's JSON Lines output instead. The two alternatives that were weighed and refused are under *What is deliberately not done*.
 
 ## `entryFromRequest` — the http bridge
 
 `entryFromRequest(req: *const http.Server.Request, res: *const http.Server.ResponseWriter,
 addr_buf: []u8, opts: FromRequestOptions) Entry` builds an `Entry` from one served request:
-method/target/protocol from `req`, status from `res.status`, `User-Agent`/`Referer` from
-`req.header(...)`, `remote_addr` formatted from `req.peerAddress()` into the caller-supplied
-`addr_buf` (zero allocation — 64 bytes comfortably covers the longest `std.Io.net.IpAddress`
-textual form, `"[xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx]:65535"` at 47 bytes).
-`request_bytes` defaults to the request's declared `Content-Length` (an `opts.request_bytes`
-override wins when given). `response_bytes` uses the same best-effort contract as
-`metrics.AccessEntry.bytes`: exact for a buffered or declared-length body, `0` for
-HEAD/204/304 (`.discard`), `null` for chunked/until-close/compressed streaming (no running
-total is kept). `timestamp_ns`/`time_formatted`/`latency_ns`/`request_id` all come from `opts`
-— this module has no other source for them (see the time contract above).
+method/target/protocol from `req` (`HTTP/2.0`, `HTTP/1.0` or `HTTP/1.1` from the request head), status from `res.status`,
+`User-Agent`/`Referer` from `req.header(...)`, `remote_addr` formatted from `req.peerAddress()` into the
+caller-supplied `addr_buf` (zero allocation — 64 bytes comfortably covers the longest
+`std.Io.net.IpAddress` textual form, `"[xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx]:65535"` at 47 bytes; when
+`addr_buf` is too small `remote_addr` stays null). `request_bytes` defaults to the request's declared
+`Content-Length` (an `opts.request_bytes` override wins when given). `response_bytes` is
+`ResponseWriter.bodyBytesSent()`: the body octets on the wire after any content coding and without chunk
+framing, for a buffered, declared-length, chunked, until-close or compressed body alike, on h1 and h2; `0` for
+HEAD/204/304 (`.discard`). A compressed body is exact once the response has ended; before that only what the
+encoder has emitted is counted. `timestamp_ns`/`time_formatted`/`latency_ns`/`request_id`/`trace_id`/`span_id`/
+`user`/`extra`/`request_headers`/`response_headers` all come from `opts` (`FromRequestOptions`) — this module
+has no other source for them (see the time contract above).
 
 The formatter itself (`write`/`writeJsonLines`/`writeLogfmt`/`writeCombined`) never touches
 `http` types — it only consumes the plain `Entry`, so it works identically for a hand-built
 record (tests, non-`http.Server`-backed transports, replaying archived data).
 
-## `Sink` — many writers, one log (moved from `metrics`, 2026-10-06)
+## `Sink` — many writers, one log
 
 `Sink` (`src/sink.zig`) is the thread-safe line writer over one shared `std.Io.Writer`:
-`log(entry)` formats with `write` in `Options.format` and commits the line through a group
-commit. Until 2026-10-06 it was `metrics.AccessLog`, with two narrow formats of its own (a
-five-field JSON and a `.combined` that goaccess refused — that module's known defect); one
-module now owns access logging, and `metrics.RequestMetrics` only offers the hook
+`log(entry)` formats with `write` in `Options.format` (or, when `Options.template` is set, with that `LogFormat`)
+and commits the line through a group commit. It replaced `metrics.AccessLog`, which had two narrow formats of
+its own; one module now owns access logging, and `metrics.RequestMetrics` only offers the hook
 (`AccessEntry.req`/`.res` → `entryFromRequest` → `Sink.log`, README "With `metrics`").
 
-Invariants (`metrics` audit F4, fixed 2026-09-16; its tests and opt-in bench moved along):
+Invariants (from the `metrics` audit F4; its tests and opt-in bench moved along):
 the spinlock is never held across `writer` I/O — lines are formatted under it into an inline
 batch (2 × 4 KiB, no allocation), and a single flusher, one of the calling threads (never a
 background thread), swaps the batch out and writes/flushes it with the lock released. A line
@@ -287,7 +256,41 @@ cleared only with an empty batch or a waiter present, so a non-empty batch alway
 call committed to writing it; with no call in flight the batch is empty, so there is no
 `deinit`. A waiter parks on the `Options.io` futex when given one (required under an `Io` that
 runs several tasks per thread), else spins boundedly and yields. Writer errors are swallowed by
-whichever call was flusher — an access log never fails the request.
+whichever call was flusher — an access log never fails the request. On the direct paths
+(`synchronized = false`, or a line longer than the batch) a line is rendered whole and written in one call, up to
+`Sink.direct_line_max` (8 KiB), and streamed above that.
+
+## Design notes by feature
+
+- **`Entry.user`** — Combined `%u` with every Combined delimiter hex-escaped; a `user` key in JSON Lines and logfmt written only when set, so output with `user = null` carries no extra key.
+- **`Entry.extra`** — `Entry.extra: []const Field` (`Field = {key, value}`, string values), rendered after the fixed fields in JSON Lines (top-level keys) and logfmt (pairs) with the fixed fields' value escapers; Combined ignores it unless a `LogFormat` prints a field with `%{key}x`. Key grammar `[A-Za-z0-9_.-]{1,64}` (`isValidExtraKey`, `max_extra_key_len`); the one rule for a bad key is **skip**: an invalid key, a key equal to a fixed key (ASCII case-insensitively) or a repeat of an earlier key (first wins) is not written at all.
+- **`LogFormat`** (`logformat.zig`) — runtime `parse` / `comptimeParse` of an Apache 2.4 template: `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{ms}T`/`%{us}T`/`%{s}T` (Apache 2.4.13's units), `%{Name}i`, `%{Name}o`, `%{format}t`, `%{key}x`; typed parse errors (`UnknownDirective`, `UnterminatedDirective`, `EmptyName`, `BadTimeFormat`, `BadHeaderName`, `BadExtraKey`, `ControlByteInLiteral`, `TooManyItems`; `UnsupportedHeader` and `ResponseHeadersUnavailable` stay in the set for source compatibility and are no longer returned). Every untrusted value goes through the Combined escaper; a template with a control byte in its literal text is rejected.
+- **Request and response headers** — as Apache `mod_log_config`: `Entry.request_headers` / `Entry.response_headers` (borrowed slices, bounded by the caller); `%{Name}i` / `%{Name}o` print the first match case-insensitively, escaped like every value, `-` when absent; `Referer`/`User-Agent` for `%{Name}i` still come from their own fields. A name outside the `Field` key grammar is `BadHeaderName`. `Logger.request_headers` / `Logger.response_headers` list names (at most `Logger.max_request_headers` / `Logger.max_response_headers`, 8 each), read with `Request.header` and, after the chain, `ResponseWriter.getHeader`. `Content-Length`, `Connection`, `Transfer-Encoding`, `Date` and `Server` are managed by the response writer and read as absent (Apache logs them); an accessor for them is an `http` change. Repeated request header lines: `Request.header` returns the first (Apache merges them with `, `; not done here).
+- **`%{format}t`** (`timefmt.zig`) — a strftime format, `begin:` (default) / `end:` prefix, and `sec`, `msec`, `usec`, `msec_frac` (3 digits), `usec_frac` (6 digits), as httpd 2.4 `mod_log_config`; no brackets (only plain `%t` has them). The strftime format is translated to a `datefmt` layout and rendered by `Layout.formatBuf`; the walk also runs at parse time, so every format that parses renders. Printed locally from `datefmt` values: `%e %k %l %P %w %C %s`; composites `%F %T %R %D %r %c %x %X`. `Entry.timestamp_ns` is the request **begin**; `end:` adds `latency_ns` (equal to begin when not timed). The wall clock is UTC shifted by `Entry.utc_offset_min` (`Logger.utc_offset_min`), because the module reads no clock and the standard library has no zone database. Unsupported directives are `error.BadTimeFormat` (see *What is deliberately not done*).
+- **`Logger`** (`middleware.zig`) — a stateful `router.Middleware` that times the request with an injected `Clock`, builds the `Entry` with `entryFromRequest` and logs it to a `*Sink` (the Sink's format). Ids and user come from optional caller functions (`StrFn`), not from a dependency on `requestid`/`tracecontext`; `extra_fn` fills `Entry.extra` (at most `Logger.max_extra` = 8). Written after the chain, also on a handler error (the status `http.Server` answers with, error re-raised). `keep` makes logging conditional (nginx `access_log if=`, Apache `CustomLog env=`) and is how sampling is done. `latency_ns` is computed without overflow for a clock spanning the whole `i64` range.
+- **`RotatingFile`** (`filewriter.zig`) — a size-rotated file as an unbuffered `std.Io.Writer` (the role of phuslu/log's `FileWriter`). Size-based rotation on write (never splits a write), `max_backups` (0 = keep all, as phuslu), `file_permissions`, `utc_offset_min` for the timestamp in the backup name, backups never overwritten (`_NN` suffix). **Failed rotation:** the record is written to the current file anyway (it grows past `max_size`), the failure is counted (`rotate_failures`, `last_rotate_error`) and rotation is retried on the next write; a record is lost only if the write itself fails, which `write` returns. Full behaviour list in the module doc of `filewriter.zig`.
+- **`AsyncSink`** (`async_sink.zig`) — the non-blocking sibling of `Sink` (allocation-free, task-free, group commit, caller-flushed). `AsyncSink.init(self, gpa, io, writer, .{ .max_bytes, .max_lines, .format, .template })` allocates one byte ring and starts one writer task (`Io.Group.concurrent`; `error.ConcurrencyUnavailable` when `io` has none, `error.InvalidOptions` for a zero capacity). `log(line)` / `logEntry(entry)` never wait for the destination: the mutex is held for a memcpy only; a line that does not fit whole, a queue already at `max_lines`, a line over `max_bytes`, or a line logged after `deinit` began is dropped and counted (`dropped() u64`). Both return `bool` (true = queued, false = dropped and counted; an empty line is ignored and returns true) so a caller counts drops per class itself. `flush()` waits for what was accepted before the call; `deinit()` drains, stops the writer and frees. The writer takes everything queued as one batch (up to two `writeAll`s across the ring seam, one `flush`) and releases its space afterwards, so producers never overwrite it. Writer errors are swallowed and not counted as drops.
+- **`writeLogfmtValue`** — `pub`, with the quoting/escaping of the logfmt writer: `LogfmtValueOptions.max_len` (default null) cuts the raw value to that many bytes before quoting, byte-wise; `quote` (`.when_needed` default | `.always`), `escape` (`.json_u` default | `.hex_x`: every byte outside 0x20..0x7e as `\xNN`, `"`/`\` unchanged) and `cut_marker` (`?[]const u8`, appended only when `max_len` cut the value; it is part of the value, so the pre-escape size is at most `max_len + marker.len`).
+
+## Design & invariants
+
+- Every `write*` function takes `entry: Entry` by value and a `*std.Io.Writer` — no allocation,
+  no panics (bounded by the caller's writer; a full fixed buffer returns
+  `std.Io.Writer.Error`, never overruns or aborts), reentrant (pure functions, no shared or
+  internal state). `Sink` is the one stateful type and synchronizes itself (see "`Sink`"), so
+  the module's `meta.concurrency` is `threadsafe`.
+- `std` + `http` (for `Server.Request`/`Server.ResponseWriter` types in
+  `entryFromRequest`) + `router` (for `Logger`, a `router.Middleware`) + `datefmt` (`%{format}t`, backup names)
+  + `jsontext` (the JSON string escaper) — no other module dependency, no C/libc.
+- `Entry.extra` rule: a field is rendered only if its key matches `[A-Za-z0-9_.-]{1,64}`, is not
+  a fixed key (ASCII case-insensitive) and does not repeat an earlier key; otherwise it is
+  skipped whole. Keys are therefore written raw, which is safe because the grammar has no
+  quote, `=`, space, control or non-ASCII byte. Values are arbitrary bytes, escaped per format.
+- `LogFormat`: parsed once into a fixed array of at most 64 items (no allocator); literal text
+  borrows the template. Values are escaped with the Combined escaper; the template is trusted
+  but may not contain a control byte, so the only `\n` in a record is the terminator. `%b` is
+  `-` only when the byte count is unknown (`0` prints `0`, as `writeCombined`; Apache prints `-`
+  for 0). `%{Name}i` covers `Referer`, `User-Agent` and any header in `Entry.request_headers`.
 
 ## Threat model / out of scope
 
@@ -300,185 +303,50 @@ still produces a pathologically long — but still single, still well-formed —
 header sizes upstream, e.g. `http.Server.Options`' own 431/414 limits), and PII
 redaction/scrubbing (an app that logs a bearer token in a custom field is an app policy issue,
 not something this formatter can detect).
+Residual risk: `extraRenderable` deduplicates `Entry.extra` in O(n²) under the sink lock. `Logger` caps extras
+at 8 and no request input sets the count, but a consumer passing thousands of request-derived extras directly
+pays quadratic time (see *Backlog / deferred*). A writer that fails mid-batch may leave a partial line before the
+next batch (best-effort sink).
 
 ## Performance
 
-**The field, 2026-10-25** (`zig build bench-accesslog`, `BENCH_ROUNDS=5`): ref 0.13–0.31× Go; `json_encoding` 0.89× phuslu/log v1.0.138 (the fastest), 0.60× zerolog v1.35.1, 0.72× serde_json 1.0.150, 0.21× zap v1.28.0; logfmt 0.28× go-logfmt. The card carries these figures.
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-accesslog`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.9 %): ref 0.13–0.33×, against 0.13–0.33× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side).
-
-**Mutation + review (2026-11-12, whole module,** `root.zig`, `logformat.zig`, `middleware.zig`, `sink.zig`, `timefmt.zig`, `filewriter.zig` production code (operator-generated switches — comparisons, boundaries, `and`/`or`, arithmetic incl. saturating, `@min`/`@max`, literals, forced conditions, switch patterns and arm swaps, assignment operators, dropped calls — plus manual mutants for the `entryFromRequest` fields, the 15 reserved extra keys, `Logger` wiring, the `%D`/`%{ms}T`/`%T` units and the Sink capacities; `@inComptime()` keeps the comptime parsers unmutated), schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 1314 mutants, 1246 killed (42 by hang), 68 equivalent or unobservable, 0 undecided, no defect. New tests: `end:` with null latency at 999 999 999 ns, one-letter tokens doubled, `%C` for 1999 and 2100; `RotatingFile` descriptor count with `max_backups` 0 vs 1; a record over `max_size` rotating a one-byte file on the `write` and `drain` paths; a `Sink` line of exactly `direct_line_max` bytes is one write, one byte more is streamed; `RotatingFile.drain` with slices before a huge splat saturates. Equivalent: Sink scheduling (spin/yield/wait, wake latency, a redundant `writeBatch`, the batch-capacity boundary, a dead `waiting = false` store); timefmt guards that cannot be reached (nesting depth 1, at most 256 of 768 layout bytes), no-op `flush`/`lit("")`, `@max(year, 0|1)`, `t.n > 0|1`; filewriter: `isBackup` caps names at 223 bytes, a trailing `continue`, `oldest_len == 0` implied by `count > max_backups >= 1`, the 1970 clamp, `+|=` on real slice lengths; root: the control range extended to 0x20 (space has its own arm). Cut: `bench.zig`, `jsontext` (its own module), top-level constants (their comparison sites are mutated), `for` headers, atomic orderings.
-
-**Mutation (2026-11-07, whole module,** `root.zig`, `logformat.zig`, `middleware.zig`, `sink.zig`, `timefmt.zig`, `filewriter.zig` production code, schemata in a detached copy (`@inComptime()` keeps `comptimeParse`/`parseSpec` unmutated), ReleaseSafe, strict verdict): 1026 mutants, 983 killed (55 by 23 new tests), 43 equivalent or unobservable, 0 undecided; no defect. New tests: raw non-ASCII in quoted logfmt values, `%h` quote/backslash and `[` in `%t`, `hostOnly("[::1]]:80")`, the method from the request, `%l` vs `%u`, `%{format}t` control-byte bounds and UTF-8, saturated latency and offsets at the i64 top, adjacent strftime directives, a hand-built `Spec` (bad format → `-`, dead writer → `WriteFailed`), eleven `RotatingFile` edges (name bounds, double close, no rotation when closed, max_size 0 and u64 top, foreign reopen, rotated-file permissions, `isBackup` shape, recorded prune failure, `max_backups = 0` after open, year 9999, refused rename), `Sink` lines over 8 KiB on every path, the eighth captured response header, a handler error under the body cap logs 500. Equivalent/unobservable (reason per id in the table): aliases (`%b`/`%h`, `%T`/`%X`, `%D`/`%x`), byte-class bounds on unreachable bytes, datefmt's 64-token limit, `isBackup` false above 223 bytes, unreachable depth/error guards, fault-injection-only write paths, `Sink` scheduling/latency/assert-only mutants; the 2026-10-29 equivalents re-checked on the current source.
-
-## Backlog / deferred
-- **2026-11-07 (mutation run, LOW, not reproduced):** after a write that fails part-way (ENOSPC), `RotatingFile` keeps `size` at the last complete record while the partial bytes stay in the file; later writes at offset `size` overwrite them, so until they pass it the tail holds a fragment of the failed record. Seen in the setup of "a failing slice keeps the size…" (`filewriter.zig`). Fix idea: truncate to `size` after a failed write, or advance `size` by the bytes that reached the file.
-
-- ~~**Apache `%{format}t`**~~ *(grade probe 2026-11-05)* — DONE 2026-11-06 (`timefmt.zig`): `%{...}t` with a strftime format, `begin:` (default) / `end:` prefix, and `sec`, `msec`, `usec`, `msec_frac` (3 digits), `usec_frac` (6 digits), anchored on httpd 2.4 `mod_log_config` from the probe file (not re-read; sure of the keyword set, less of exotic strftime corners). No brackets (only plain `%t` has them). Formatting is `datefmt`'s: the strftime format is translated to a `datefmt` layout and rendered by `Layout.formatBuf`; the walk also runs at parse time, so every format that parses renders. Printed locally from `datefmt` values: `%e %k %l %P %w %C %s`. Supported composites: `%F %T %R %D %r %c %x %X`. **Left out, factual reasons:** `%Z` (`Entry` carries a UTC offset, not a zone name), `%U %W %g` (no `datefmt` token; week-of-year Sunday/Monday variants), `%n %t` (control bytes cannot be in a template), `%E`/`%O` and glibc flags (`%-d`): all `error.BadTimeFormat`. Apache's 2.5-only `cu`/`cu_s` tokens are not in 2.4 and not supported. `Entry.timestamp_ns` is the request **begin**; `end:` adds `latency_ns` (not timed: equal to begin). Time zone: UTC shifted by `Entry.utc_offset_min` (`Logger.utc_offset_min`), because the module reads no clock and the standard library has no zone database; Apache prints server-local time. New dependency: `datefmt`.
-- ~~**Apache `%{Name}o`**~~ *(grade probe 2026-11-05)* — DONE 2026-11-06: `Entry.response_headers: []const Field` (bounded by the caller's slice), `%{Name}o` prints the first match (case-insensitive) escaped like every value, `-` when absent; the name must fit the `Field` key grammar (`BadHeaderName`). `Logger.response_headers` lists header names (at most `Logger.max_response_headers` = 8) read after the chain with `ResponseWriter.getHeader`; `Content-Length`, `Connection`, `Transfer-Encoding`, `Date` and `Server` are managed by the writer and read as absent (Apache logs them) — a response writer accessor for them is a `http` change, not done here. `ResponseHeadersUnavailable` stays in the error set, unused. **`Sink.Options.template`** (new, additive): a `*const LogFormat` that replaces `format`; before it `Logger`/`Sink` could not use a template at all.
-- ~~**Rotating file writer**~~ *(phuslu `FileWriter`, grade probe 2026-11-05)* — DONE 2026-11-06 (`filewriter.zig`, `RotatingFile`): see its module doc. Size-based rotation on write (never splits a write), `max_backups` (0 = keep all, as phuslu), `file_permissions`, `utc_offset_min` for the timestamp in the backup name, backups never overwritten (`_NN` suffix). **Failed rotation:** the record is written to the current file anyway (it grows past `max_size`), the failure is counted (`rotate_failures`, `last_rotate_error`) and rotation is retried on the next write; a record is lost only if the write itself fails, which `write` returns. **Left out:** phuslu's configurable `TimeFormat` (the pruner must recognise its own backups, so the name shape is fixed), compression of backups (a `gzip` pass belongs in a separate step), time-based rotation (not size-driven; no clock in the module), multi-process coordination.
-
-- **No-panic sweep 2026-10-29:** request fields, `LogFormat.parse`, writers and `Sink` clean; fixed `Logger.run` latency `end - start` overflowing i64 for a clock spanning minInt..maxInt (AL-1). Left: `extraRenderable` deduplicates `Entry.extra` in O(n²) under the sink lock — `Logger` caps extras at 8 and no request input sets the count; a consumer passing thousands of request-derived extras directly would pay quadratic time (candidate: hash-based dedup above a threshold).
-- ~~**logfmt anchoring**~~ — DONE 2026-10-05: go-logfmt reads every line back (Anchoring).
-
-- ~~**`response_bytes` for a streamed body**~~ — DONE 2026-09-28 (from the web-server consumer M11.5c): `http`'s new
-  `ResponseWriter.bodyBytesSent` counts the body octets of a chunked, compressed (after coding)
-  or HTTP/1.0 until-close body, without chunk framing (`%b`), on h1 and h2 alike;
-  `entryFromRequest` reads it, so a streamed export or a compressed answer logs its size instead
-  of `-`. Exact at any time except a compressed body before `end` (only what the encoder has
-  emitted so far).
-- ~~**`%u` — the authenticated user**~~ — DONE 2026-09-25: `Entry.user` (Combined `%u` with every
-  Combined delimiter hex-escaped, a `user` key in JSON Lines/logfmt written only when set, so
-  output with `user = null` is byte-identical to before).
-
-- ~~**Arbitrary extra fields on `Entry`**~~ *(survey 2026-09-30)* — DONE 2026-10-11: `Entry.extra: []const Field` (`Field = {key, value}`, string values), rendered after the fixed fields in JSON Lines (top-level keys) and logfmt (pairs) with the fixed fields' value escapers; Combined ignores it unless a `LogFormat` prints a field with `%{key}x`. Key grammar `[A-Za-z0-9_.-]{1,64}`; the one rule for a bad key is **skip**: an invalid key, a key equal to a fixed key (ASCII case-insensitively) or a repeat of an earlier key (first wins) is not written at all. `FromRequestOptions` gained `user` and `extra`. A typed value union was not needed (string values cover tenant/route/cache-status).
-- ~~**Router middleware wrapper**~~ *(survey 2026-09-30)* — DONE 2026-10-11: `Logger` (`middleware.zig`), a stateful `router.Middleware` that times the request with an injected `Clock`, builds the `Entry` with `entryFromRequest` and logs it to a `*Sink` (the Sink's format). Ids and user come from optional caller functions (`StrFn`), not from a dependency on `requestid`/`tracecontext` (the only new dependency is `router`); `extra_fn` fills `Entry.extra`. Written after the chain, also on a handler error (status 500, error re-raised).
-- ~~**User-defined format string**~~ *(survey 2026-09-30)* — DONE 2026-10-11: `LogFormat` (`logformat.zig`), runtime `parse` / `comptimeParse` of an Apache 2.4 template: `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{Referer}i`, `%{User-Agent}i`, `%{key}x`; typed parse errors; other request headers are rejected at parse because `Entry` carries none (`%{Name}o` since 2026-11-06, below). Every untrusted value goes through the Combined escaper; a template with a control byte in its literal text is rejected.
-- ~~**`%{Name}i` for any request header**~~ — DONE 2026-11-17, as Apache `mod_log_config` (the reference): `Entry.request_headers: []const Field` (borrowed), `%{Name}i` prints the first match case-insensitively, escaped like every value, `-` when absent; `Referer`/`User-Agent` still come from their own fields. `Logger.request_headers` lists names (at most `Logger.max_request_headers` = 8) read with `Request.header`. A name outside the `Field` key grammar is `BadHeaderName` (it was `UnsupportedHeader`, now unused). Repeated header lines: `Request.header` returns the first (Apache merges them with `, `; not done here).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- ~~**`Sink` non-blocking overflow mode**~~ *(consumer request 2026-11-15)* — DONE 2026-11-15 as a sibling, `AsyncSink` (`async_sink.zig`); `Sink` is unchanged (allocation-free, task-free, group commit, caller-flushed). `AsyncSink.init(self, gpa, io, writer, .{ .max_bytes, .max_lines, .format, .template })` allocates one byte ring and starts one writer task (`Io.Group.concurrent`; `error.ConcurrencyUnavailable` when `io` has none, `error.InvalidOptions` for a zero capacity). `log(line)` / `logEntry(entry)` never wait for the destination: the mutex is held for a memcpy only; a line that does not fit whole, a queue already at `max_lines`, a line over `max_bytes`, or a line logged after `deinit` began is dropped and counted (`dropped() u64`). `flush()` waits for what was accepted before the call; `deinit()` drains, stops the writer and frees. The writer takes everything queued as one batch (up to two `writeAll`s across the ring seam, one `flush`) and releases its space afterwards, so producers never overwrite it. Writer errors are swallowed and not counted as drops. **Left out:** a `drop_oldest` mode, per-level policies, a `blocking` mode (that is `Sink`).
-- ~~**`writeLogfmtValue` public**~~ *(consumer request 2026-11-15)* — DONE 2026-11-15: `writeLogfmtValue(w, s, .{ .max_len })` is `pub` with the unchanged quoting/escaping; `max_len` (default null) cuts the raw value to that many bytes before quoting, byte-wise, no marker.
-
-- ~~**Strict quoting mode for `writeLogfmtValue`, and per-caller drop counts in `AsyncSink`**~~ *(consumer migration 2026-11-15)* — DONE 2026-11-15: `LogfmtValueOptions` gains `quote` (`.when_needed` default | `.always`), `escape` (`.json_u` default | `.hex_x`: every byte outside 0x20..0x7e as `\xNN`, `"`/`\` unchanged) and `cut_marker` (`?[]const u8`, appended only when `max_len` cut the value; it is part of the value, so the pre-escape size is at most `max_len + marker.len`). `AsyncSink.log`/`logEntry` return `bool` (true = queued, false = dropped and counted; an empty line is ignored and returns true) so a caller counts drops per class itself — BREAKING (minor) for callers that ignored the former `void`.
-
-## Design & invariants
-
-- Every `write*` function takes `entry: Entry` by value and a `*std.Io.Writer` — no allocation,
-  no panics (bounded by the caller's writer; a full fixed buffer returns
-  `std.Io.Writer.Error`, never overruns or aborts), reentrant (pure functions, no shared or
-  internal state). `Sink` is the one stateful type and synchronizes itself (see "`Sink`"), so
-  the module's `meta.concurrency` is `threadsafe`.
-- `std` + `http` (for `Server.Request`/`Server.ResponseWriter` types in
-  `entryFromRequest`) + `router` (for `Logger`, a `router.Middleware`) — no other module
-  dependency, no C/libc.
-- `Entry.extra` rule: a field is rendered only if its key matches `[A-Za-z0-9_.-]{1,64}`, is not
-  a fixed key (ASCII case-insensitive) and does not repeat an earlier key; otherwise it is
-  skipped whole. Keys are therefore written raw, which is safe because the grammar has no
-  quote, `=`, space, control or non-ASCII byte. Values are arbitrary bytes, escaped per format.
-- `LogFormat`: parsed once into a fixed array of at most 64 items (no allocator); literal text
-  borrows the template. Values are escaped with the Combined escaper; the template is trusted
-  but may not contain a control byte, so the only `\n` in a record is the terminator. `%b` is
-  `-` only when the byte count is unknown (`0` prints `0`, as `writeCombined`; Apache prints `-`
-  for 0). `%{Name}i` covers `Referer` and `User-Agent` only.
+`zig build bench-accesslog` (`BENCH_ROUNDS=5`, `tools/bench.zig`) against Go `encoding/json` + `log/slog` + go-logfmt;
+the fastest-in-the-field comparison uses `tools/go_fast_bench` and `tools/rust_fast_bench`. The card's
+`**Performance:**` line carries the figures and is authoritative. `src/bench.zig` (opt-in, `ACCESSLOG_BENCH=1`) times the JSON Lines
+writer on clean ASCII, valid-UTF-8 and mostly ill-formed records; the sanitizing scan batches pass-through runs into one
+`writeAll`, so a clean record costs less than a byte-by-byte escaper and only records that carry bad bytes pay extra.
+Nothing is allocated and nothing is copied when the input is clean.
 
 ## Verification
 
-`zig build test-accesslog` (Debug + ReleaseFast): byte-exact golden strings for a
-representative `Entry` in each of the 3 formats + the `write` enum-dispatch wrapper +
-missing-optional-fields rendering per format's convention; the log-injection suite (JSON/
-logfmt/Combined, each with a shared adversarial payload plus a Combined-specific forged-line
-payload, plus a benign positive control per format); `entryFromRequest` pulling every field off
-a socket-free `http.Server.Request`/`ResponseWriter` pair (HTTP/1.1 with a peer address and
-headers, HTTP/1.0 with none, and a `request_bytes` override), and one test proving its output
-feeds straight into `writeCombined`.
+- **Run:** `scripts/modtest accesslog`; the interop and oracle programs are `tools/interop.zig` (foreign JSON readers), `tools/go_logfmt`, `tools/go_json`, `tools/go_utf8_probe`; the benches are `zig build bench-accesslog` and the `tools/go_fast_bench` / `tools/rust_fast_bench` programs.
+- **Goldens:** byte-exact strings for a representative `Entry` in each of the 3 formats, the `write` enum-dispatch wrapper and missing-optional-field rendering per format's convention.
+- **Log injection:** the suite for JSON/logfmt/Combined, each with a shared adversarial payload plus a Combined-specific forged-line payload and a benign positive control per format; 256-byte sweeps of every escaper.
+- **`entryFromRequest`:** every field off a socket-free `http.Server.Request`/`ResponseWriter` pair (HTTP/1.1 with a peer address and headers, HTTP/1.0 with none, a `request_bytes` override), and one test proving its output feeds straight into `writeCombined`.
+- **Encoding contract:** a table of vectors asserting the exact bytes emitted for every ill-formed shape (surrogates, overlongs, truncations, bare continuations, `F5`–`FF`) and every Table 3-7 boundary that must pass untouched; an exhaustive cross-check of the well-formedness classifier against `std.unicode` over every 1- and 2-byte string and the boundary-byte 3-/4-byte extensions; a brute-forced check that each reported ill-formed length is the *maximal* subpart, using `std.unicode`; the surviving byte-exact round trip as its own test. Externally anchored on CPython's `json` (it enforces UTF-8 at the decode step); `jq` is not used as that oracle, it substitutes U+FFFD itself while reading and accepts both.
+- **`Entry.extra`, `LogFormat`, `Logger`:** goldens for `extra`; every bad-key class leaves the output byte-identical to an entry without it, with the 64-byte key as the positive control; the adversarial corpus as a value; the Combined template renders byte-identical to `writeCombined` over the goldens, the null variants, every `%u` shape, the adversarial payloads and the fuzz corpus; every directive has an exact-bytes test and every parse error class a test; `Logger` through `http.Server.serveStream` with a fake clock (timestamp, latency, backwards clock), logfmt and Combined, a failing handler.
+- **`%{format}t`, `RotatingFile`, `Sink`, `AsyncSink`:** strftime directives and their offsets and clamps; rotation, pruning, failed-rotation and refused-rename policy and descriptor counts of `RotatingFile`; `Sink` lines at, below and above `direct_line_max`, every path of the template option; `AsyncSink` drops, line and byte caps, late `log` behind a stalled destination, template sink, drain on `deinit`; `writeLogfmtValue` options (`max_len`, `quote`, `escape`, `cut_marker`).
+- **Fuzz:** three `testing.fuzz` harnesses, one per format (`ACCESSLOG_FUZZ`, run through the deterministic driver), driven from a **written** corpus. The JSON oracle is one-sided and absolute: for any input bytes the emitted line parses; a field that was valid UTF-8 comes back byte-exact, one that was not comes back valid UTF-8 containing U+FFFD. The corpus is written rather than generated because a corpus-driven `std.testing.Smith` resolves every *weighted* draw to the range minimum, which would leave every field empty; a dedicated test decodes the corpus and asserts that each JSON-visible slot receives ill-formed UTF-8 at least once. The JSON and logfmt harnesses draw extras too.
+- **Anchors:** see Anchoring (goaccess, Python json, Go encoding/json, jq, go-logfmt).
+- **Mutation:** operator-generated schemata over the production code of `root.zig`, `logformat.zig`, `middleware.zig`, `sink.zig`, `timefmt.zig`, `filewriter.zig` and `async_sink.zig` (comparisons, boundaries, `and`/`or`, arithmetic, literals, forced conditions, switch arms, dropped calls, plus manual mutants for the `entryFromRequest` fields, the reserved extra keys, `Logger` wiring, the `%D`/`%{ms}T`/`%T` units and the Sink capacities), schemata in a detached copy, ReleaseSafe, strict verdict. Equivalent or unobservable classes: `Sink` scheduling (spin/yield/wait, wake latency, a redundant `writeBatch`, the batch-capacity boundary), `timefmt` guards that cannot be reached, no-op `flush`/`lit("")`, `isBackup` name caps, aliases (`%b`/`%h`, `%T`/`%X`, `%D`/`%x`), byte-class bounds on unreachable bytes, fault-injection-only write paths, the `deinit` wait on `writer_done` (redundant with `group.await`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-For the encoding contract: a table of ~30 vectors asserting the **exact bytes** emitted for
-every ill-formed shape (surrogates, overlongs, truncations, bare continuations, `F5`–`FF`) and
-for every boundary of Table 3-7 that must pass through untouched; an exhaustive cross-check of
-the well-formedness classifier against `std.unicode` over every 1- and 2-byte string and the
-boundary-byte 3-/4-byte extensions; a brute-forced check that each reported ill-formed length
-really is the *maximal* subpart, using `std.unicode` rather than a second copy of this module's
-table; and the surviving byte-exact round trip stated as its own test. Externally anchored on
-CPython's `json` (which enforces UTF-8 at the decode step): 16/16 vectors accepted with
-sanitization, 14/16 rejected without it. `jq` is deliberately not used as that oracle — it
-substitutes U+FFFD itself while reading and so accepts both.
+## What is deliberately not done
 
-Three `testing.fuzz` harnesses, one per format, driven from a **written** corpus. The JSON
-oracle is one-sided and absolute: for any input bytes the emitted line parses, with no
-predicate guarding the assertion; a field that was valid UTF-8 additionally comes back
-byte-exact, one that was not comes back valid UTF-8 containing U+FFFD. The corpus is written
-rather than generated because a corpus-driven `std.testing.Smith` resolves every *weighted*
-draw (`bool`, a small `valueRangeAtMost`) to the range minimum, which would leave every field
-empty and every optional absent outside `zig build fuzz`; a dedicated test decodes the corpus
-back and asserts that each JSON-visible slot receives ill-formed UTF-8 at least once, so the
-harness cannot silently degenerate.
+- **Recovering the original bytes of an ill-formed field.** An opt-in flag could emit an extra sibling key (e.g. `"user_agent_raw":"<hex>"`) for each field whose input was ill-formed; it would be a strictly additive schema change. Not implemented: no consumer asked for it, and an always-present raw copy of every attacker-controlled field is an unbounded-size amplifier on a hot path.
+- **Sanitizing `%r`/Referer/User-Agent for Combined and logfmt too, the way JSON Lines does.** It would make goaccess's own report valid UTF-8, but at the cost of the primary log file: Combined and logfmt are what an incident responder reads first, and the exact byte an attacker sent, silently replaced with U+FFFD, can be the detail that identifies the attack. JSON Lines pays that price for a documented reason (RFC 8259 makes an unparseable record equivalent to a dropped one); Combined/logfmt have no such requirement.
+- **A fourth, goaccess-safe view alongside Combined/logfmt.** Redundant: the sanitized view already exists as JSON Lines, and a near-duplicate output format for one external consumer's limitation is more surface to test and maintain.
+- **strftime `%Z %U %W %g`, `%n %t`, `%E`/`%O` and glibc flags (`%-d`) in `%{format}t`** (`error.BadTimeFormat`): `Entry` carries a UTC offset, not a zone name (`%Z`); `datefmt` has no week-of-year Sunday/Monday token (`%U %W %g`); control bytes cannot be in a template (`%n %t`). Apache's 2.5-only `cu`/`cu_s` tokens are not in httpd 2.4 and not supported. The time zone is UTC shifted by `utc_offset_min`; Apache prints server-local time.
+- **Typed values in `Entry.extra`.** A typed value union was not needed: string values cover tenant/route/cache-status.
+- **Merging repeated request header lines for `%{Name}i`** (Apache joins them with `, `): `Request.header` returns the first.
+- **`RotatingFile`:** phuslu's configurable `TimeFormat` (the pruner must recognise its own backups, so the name shape is fixed), compression of backups (a `gzip` pass belongs in a separate step), time-based rotation (not size-driven; no clock in the module), multi-process coordination.
+- **`AsyncSink`:** a `drop_oldest` mode, per-level policies, a `blocking` mode (that is `Sink`).
+- **A maximum field length, PII redaction and downstream pipeline parsing bugs** (see *Threat model / out of scope*).
 
-Cost, measured (`ACCESSLOG_BENCH=1 … -Doptimize=ReleaseFast`, `src/bench.zig`, 200 000 records
-× 5 alternating rounds, minimum, against a frozen copy of the pre-change writer): a clean ASCII
-record **456.7 → 256.2 ns** (−43.9 %, because the sanitizing scan batches pass-through runs
-into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 record 436.1 →
-329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
-i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
-nothing is copied when the input is clean.
+## Backlog / deferred
 
-**Audit 2026-11-17 (delta mutation, `%{Name}i`).** 10 schemata mutants over the request-header capture (ReleaseSafe, one
-build, each mutant under `setsid -w timeout` and `ulimit -v`): the `%{Name}i` name-grammar check dropped, the Referer
-special case dropped, the lookup reading `response_headers`, an exact-case instead of case-insensitive match, the first
-match skipped, the `max_request_headers` cap dropped, the header lookup skipped, the captured count not advanced, the
-`Entry.request_headers` slice emptied in `Logger` and in `entryFromRequest`. 10/10 killed first run (the cap one by an
-index panic), no equivalents; the Audit line is cumulative (1330/1400 + 10/10).
-
-**Audit 2026-11-15 (gap-wave delta).** 31 schemata mutants over the strict logfmt value options and the queued-or-dropped
-return values (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`). `writeLogfmtValue` and
-`logfmtNeedsQuote` (25): the `.hex_x` high-byte trigger (dropped, always on, the 0x80 and 0xFF bytes excluded), the cut
-decision (`<=`, always, never), the marker (appended uncut, dropped), `quote = .always` (ignored, always), the
-empty-value test (marker length ignored, dropped), the two needs-quote checks (value, marker) dropped or given the wrong
-escape style, the verbatim writes of value and marker skipped, the two-part loop (marker, value dropped), the escape
-switch forced to `json_u`, the printable arm (dropped, 0x7e escaped), the `\xNN` arm (dropped, upper-case, one digit).
-`AsyncSink.log` / `logEntry` (6): the empty-line, dropped and queued results inverted, `logEntry` forwarding the
-queue's result (forced true, forced false) and its formatter-failure result. First run: 28 killed (2 by hangs), 3
-survived; each got a test: a marker that only `.hex_x` must quote (the needs-quote check for the marker had been
-passing the wrong escape style unseen), the 0x7e boundary inside a quoted `.hex_x` value, and a `logEntry` whose
-formatted line the queue drops (its `false` return was only reachable through the formatter-failure path before).
-Rerun: 31/31 killed. No equivalents, no unobservables; the Audit line is cumulative (1299/1369 + 31/31).
-
-**Audit 2026-11-15 (delta mutation).** 55 schemata mutants over the new code, ReleaseSafe, one build, each mutant
-under `setsid -w timeout` (15 s) and `ulimit -v`. `writeLogfmtValue`'s `max_len` (6): the limit ignored, one byte
-too many or too few, the cut applied after the quoting decision, the verbatim write or the escape loop reading the
-uncut value. `async_sink.zig`, whole file (49): `init`'s two option checks; `deinit`'s `closing`, wake, drain wait,
-reap and free; `log`'s empty-line check, newline detection and accounting, the `closing`/byte/line drop conditions
-(each dropped, each off by one) and counter, the ring offsets, the wrap-around split and both copies, the newline
-byte, `used`/`lines`/`accepted` updates and the wake; `logEntry`'s format and template choice and its drop count;
-`dropped`, `flush`'s target and exit condition; the writer task's wait, exit test, wrap split, both writes, the
-flush, and the `head`/`used`/`lines`/`completed` bookkeeping, both broadcasts and `writer_done`. 27 of the first
-run's kills were hangs (a missing wake, broadcast or exit flag), counted as kills. 6 survived: a line logged after
-`deinit` began was accepted instead of dropped, the line cap was one too generous (and, separately, absent) with
-the byte cap hiding it, and the template path of `logEntry` was never exercised; each got a test (a late `log`
-behind a stalled destination, a queue whose line cap binds first, a template sink) and the rerun killed all four
-that a test can reach. The two left: the wait on `writer_done` in `deinit` is EQUIVALENT (redundant with the
-`group.await` right after it, which returns only once the task has finished); skipping the `group.await` itself
-is UNOBSERVABLE (the task is already past its last access to the sink once `writer_done` is seen, so only the
-reaping of the task handle differs; it needs a leak or ordering check inside the `Io` implementation).
-53/55; the score counts the unobservable one with the equivalents (2 eq): 1 equivalent, 1 unobservable.
-
-**Audit 2026-10-04 (mutation).** 33 schemata mutants over `utf8Step` (every second-byte
-range of Table 3-7, continuation checks, maximal-subpart lengths), `writeJsonString`
-(escapes, U+FFFD substitution and step), logfmt quoting triggers and escapes, Combined
-(`hostOnly`, `%u` delimiters, `]`/DEL/control escapes, `-` for absent fields) and
-`entryFromRequest` (protocol, `request_bytes` override, Referer): 33 killed, 0 equivalent,
-0 left alive. One survivor of the first run got a test: a logfmt value holding DEL (0x7F)
-must be quoted and hex-escaped (`logfmtNeedsQuote` in lockstep with `writeLogfmtValue`).
-
-**Mutation + review (2026-10-25).** 380 schemata mutants over `root.zig`, `logformat.zig`,
-`middleware.zig` and `sink.zig` (the copy parsed `LogFormat` templates at run time, so the
-`comptimeParse` paths were reachable): 373 killed (9 by a hang), 7 argued equivalent (`]` in
-`%u` through the Combined escaper, which escaped it then; a pad width for two-digit hex; first
-vs last colon where there is one; four Sink mutants that only cost latency, since
-`finishFlushing` writes the batch and wakes the waiters anyway), 0 alive. The first run left 57;
-the new tests are 256-byte sweeps of every escaper, `LogFormat` items, `Logger` paths and a
-capturing Sink writer. The review (every non-test function) found four LOW defects, all fixed
-with tests: `]` hex-escaped in quoted fields (`/q?a[]=1` → `/q?a[\x5d=1`); `%h` not escaping
-a space and blank when empty; HTTP/2 logged as `HTTP/1.1` (new `http` `RequestHead.http2`);
-`Logger` logging 500 where the server answered 413 or had already sent another status. Left as
-a note: a writer that fails mid-batch may leave a partial line before the next batch
-(best-effort sink, SPEC § Sink).
-
-**Extra fields, `LogFormat`, `Logger` (2026-10-11).** Goldens for `extra` in both formats; every
-bad-key class (empty, 65 bytes, space, `=`, `"`, CR/LF, NUL, non-ASCII, every fixed key exact and
-case-folded) leaves the output byte-identical to an entry without it, with the 64-byte key as the
-positive control; the adversarial corpus as a value (round trip through `std.json` for valid UTF-8,
-U+FFFD otherwise; logfmt stays one line); the JSON and logfmt fuzz harnesses draw extras too (a
-fuzzed key must not become a key). `LogFormat`: the Combined template renders **byte-identical**
-to `writeCombined` over the goldens, the null/absent variants, every `%u` shape, the adversarial
-payloads in every escaped slot, the whole fuzz corpus and 300 random draws; the Common Log Format
-template is the same line up to the referer and has its own golden; every directive has an exact-
-bytes test, every parse error class a test. `Logger`: through `http.Server.serveStream` with a
-fake clock (timestamp, latency, backwards clock), logfmt and Combined, a failing handler.
-Negative controls run as one schemata-style batch of nine mutants (fixed-key check removed, key
-length bound removed, duplicate check removed, raw extra value in JSON, `%b` null as `0`, `%q`
-losing its `?`, literal control-byte check removed, latency from `abs`, error status not set to 500):
-all nine killed by the named tests.
+- **`RotatingFile` partial write after ENOSPC (LOW, not reproduced).** After a write that fails part-way, `RotatingFile` keeps `size` at the last complete record while the partial bytes stay in the file; later writes at offset `size` overwrite them, so until they pass it the tail holds a fragment of the failed record (`filewriter.zig`, setup of the test "a failing slice keeps the size…"). Fix idea: truncate to `size` after a failed write, or advance `size` by the bytes that reached the file.
+- **`extraRenderable` is O(n²) in the number of `Entry.extra` fields,** under the sink lock. Candidate: hash-based dedup above a threshold. Harmless while `Logger` caps extras at 8 (see *Threat model / out of scope*).
 
 ## Anchoring
 
@@ -488,5 +356,3 @@ all nine killed by the named tests.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
 **What the tests actually contain.** Combined anchored by real goaccess 1.10.2 (verdicts frozen as byte literals); JSON Lines and logfmt: src/json_oracle_test.zig replays three foreign readers (`tools/interop.zig` + `tools/json_oracle.py` + `tools/go_json`, frozen 2026-10-05) -- Python json, Go encoding/json (UseNumber) and jq -- over 421 entries (hostile strings in every string field: quotes, backslashes, every control byte, DEL, `"}],{"x":1`, a literal `\u0000`, valid UTF-8 up to U+10FFFF, and ill-formed UTF-8: truncated, surrogate, overlong, past U+10FFFF, stray continuation; i64/u64 extremes): each reads every line back to exactly its entry, one line per record, in key order (Python, jq), with each ill-formed subsequence as one U+FFFD per maximal subpart -- Python's own `decode('utf-8', 'replace')`, so the substitution policy is foreign-judged too; and go-logfmt v0.6.1 (`tools/go_logfmt`), the de-facto reference logfmt reader, decodes every logfmt line to exactly the entry's key/value pairs, raw bytes included. A mutated line (a changed value, a second value) is caught. Still self-graded: `entryFromRequest` (which request facts land in which field).
-
-**How it got there.** The anchoring work landed. DONE(combined). Anchor found a REAL BUG: %h carried host:port, goaccess failed 100% of lines (valid=0/failed=2); 3 in-house tests asserted the same wrong shape. JSON/logfmt still lack a foreign parser — no logfmt oracle installed, python json never run 2026-10-05: JSON Lines anchored by Python json + Go encoding/json + jq -- no defect found. Later the same day (go-logfmt fetched, user OK): logfmt anchored too -- it found a DEFECT: control bytes were escaped `\xHH`, which go-logfmt refuses as an invalid quoted value, so one control byte in any field made the whole line unreadable; now `\u00HH`.
