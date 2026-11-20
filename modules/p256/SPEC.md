@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-13)
 
-**Audit:** review 2026-07-21 · mutation 2026-11-18 (282/359, 77 eq) · src cb8715133e291724
+**Audit:** review 2026-07-21 · mutation 2026-11-18 (282/359, 77 eq) · src 8966c610edddfd4e
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind) · panic 2026-10-30 (sweep + blind review: own Signature type with a total toDer (std's indexes an empty slice for r/s = 0), explicit identity-key reject; delta audit 11/12 + 1 eq)
 
@@ -397,6 +397,8 @@ there are no GLV constants to own here.
       So this was no source finding, and no burn changed.
   - Behaviour change from the audit: `fromAffineCoordinates` refuses `(0, 1)`
     (std, SEC 1).
+
+- **Audit 2026-11-20 (test-only change).** `git diff` of `modules/p256/src` against the audited commit shows one added test block (the stack-budget test in `stackprobe2_test.zig`) and no production line, so no mutation was run. The card's `src` hash is re-recorded; the counts are unchanged.
 
 ## Performance — `bench-p256` against OpenSSL (2026-10-10)
 

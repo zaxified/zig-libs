@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests/audit: the only change since the card's source hash is the stack-budget test (no production line), so no mutation was run; card hash re-recorded, SPEC "Audit 2026-11-20".
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** README "Stack use" (minimum stack, measured: worst 22.9 KiB Debug / 17.5 KiB ReleaseFast, advice 64 KiB) and the test `stack use: ...` in `src/stackprobe2_test.zig` that pins the burn sizes and runs the entry points in a 64 KiB thread. Test-only; no source change.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog 13: the portable ctgrind lane now covers every module with a harness except jwe, megolm and xmlenc. Per-CPU variant rows were added to `ctgrind-expected.tsv`.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the portable code path is now measured in CI (lane `ctgrind portable amd64`, `CTGRIND_CPU=x86_64`); SPEC Backlog 13 done for p256.
