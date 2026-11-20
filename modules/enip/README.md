@@ -14,6 +14,7 @@ fleet-simulation target.
 - **Platform:** any (the codecs, the client's logic and the adapter are pure
   computation; only the optional `TcpTransport` / `UdpDiscovery` adapters touch
   `std.Io.net`).
+- **Depends on:** `netaddr` (the `sockaddr_in` items bridge to `netaddr.Ip`).
 - **Model after:** ODVA CIP Volume 1 (Common Industrial Protocol) and Volume 2
   (EtherNet/IP Adaptation), with wire behaviour cross-checked against captured
   traffic between three independent third-party stacks, against Wireshark's own
@@ -114,6 +115,11 @@ fleet-simulation target.
   with an odd length and no pad, a Multiple Service Packet offset table
   pointing outside the payload, an additional-status count that overruns and a
   tag read whose type code contradicts the data length are all typed errors.
+
+## Not provided
+
+No implicit (Class 0/1) I/O engine, no Template Object or UDT member decoding, no CIP Safety, Sync or Security, no
+PCCC. See SPEC.md, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Use
 
@@ -234,25 +240,21 @@ ENIP_TEST_CONNECTED=127.0.0.1:44818 zig build test-enip
 ENIP_TEST_LISTEN=127.0.0.1:44830 zig build test-enip
 ```
 
-The offline suite includes **139 byte-exact goldens captured from real
-traffic between three independent third-party implementations**, covering
-*both* directions of the wire:
+The offline suite includes byte-exact goldens captured from real traffic between independent third-party
+implementations, covering *both* directions of the wire (`src/goldens.zig`):
 
-- **61** proxied between a third-party client (`cpppo`, `pycomm3`) and a
-  third-party target — our **client** direction;
-- **32** (`adapter_table`) recorded with those same two clients driving **our
-  own `Adapter`** — our **listening** direction;
-- **46** (`discovery_table`, `discovery_instance_table`) of a *stock*
-  `pycomm3.LogixDriver` browsing our adapter end to end: Program Name object,
-  tag-list upload, and reads/writes of tags it derived from the wire alone.
+- `table`: proxied between a third-party client (`cpppo`, `pycomm3`) and a third-party target, our **client** direction;
+- `adapter_table`: recorded with those same two clients driving **our own `Adapter`**, our **listening** direction;
+- `discovery_table`, `discovery_instance_table`: a *stock* `pycomm3.LogixDriver` browsing our adapter end to end (Program
+  Name object, tag-list upload, reads and writes of tags it derived from the wire alone);
+- `stdobj_table`, `assembly_table`: a stock `pycomm3` `CIPDriver` reading and writing the TCP/IP Interface, Ethernet
+  Link and Assembly objects of our adapter.
 
-Every one decodes and re-encodes to the identical octets, every CIP path is
-rebuilt from its *decoded segments*, and a coverage assertion fails if the
-table stops containing any command, item type, service or routing shape — plus full
-client↔adapter round trips over an in-memory wire and `std.testing.fuzz`
-sweeps over every decoder, the tag-path parser, the client's reply handling
-and the adapter's request handler. See SPEC.md for what is third-party
-validated versus self-derived, and what is deferred.
+Every one decodes and re-encodes to the identical octets, every CIP path is rebuilt from its *decoded segments*, the
+adapter's replies are replayed byte for byte, and a coverage assertion fails if the first table stops containing any
+command, item type, service or routing shape. The suite adds full client-adapter round trips over an in-memory wire and
+fuzz harnesses over every decoder, the tag-path parser, the client's reply handling and the adapter's request handler
+(driver: `ENIP_FUZZ`). See SPEC.md for what is third-party validated versus self-derived, and what is open.
 
 Provenance: clean-room from the published ODVA CIP Volume 1 / Volume 2 frame
 layouts. `cpppo` and `pycomm3` were used as black-box test oracles and as

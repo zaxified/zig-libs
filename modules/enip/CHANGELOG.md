@@ -5,14 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the Assembly object (58 mutants: 55 killed, 3 argued equivalent; card `mutation 2026-11-18 (1523/1575, 52 eq)`); tests added for class-only addressing, the withheld class's class attributes and the largest instance id.
 - **2026-11-18** — Adapter serves the **Assembly object** (class `0x04`) from the new `Config.assemblies` (a list of `stdobj.Assembly`: instance id, byte buffer, `writable`, optional `before_get`/`after_set` hooks; empty by default, which withholds the class as before): `Get_Attribute_Single` of the data (3) and size (4) attributes and of the class attributes 1, 2, 3, 6, 7, `Set_Attribute_Single` of the data on a writable instance with the exact size. Refusals as OpENer: unknown instance `0x05`, unknown attribute `0x14`, non-writable or size attribute `0x0E`, short `0x13`, long `0x15`, hook refusal `0x09`; `Get_Attributes_All` is `service_not_supported`. Anchored against a stock pycomm3 `CIPDriver` (`goldens.assembly_table`, replayed byte-exact; the live test takes `ENIP_TEST_ASM=1`). Behaviour change: only for a caller that sets `Config.assemblies`; `Set_Attribute_Single` on class `0x04` is `service_not_supported` as before when the list is empty. Backlog item closed.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the TCP/IP Interface and Ethernet Link objects are anchored against a stock `pycomm3` `CIPDriver` (raw replies for attributes 1-6 and 1-3, a host-name Set, refusals): `goldens.stdobj_table`, replayed byte-exact; the live test takes `ENIP_TEST_STDOBJ=1` to serve the captured configuration. No encoding differed from what pycomm3 reads.
 - **2026-11-18** — Adapter serves the **Ethernet Link object** (class `0xF6`, instance 1): `Get_Attributes_All` and `Get_Attribute_Single` for the required attributes 1 to 3 (interface speed, interface flags, physical address) from the new `Config.ethernet_link` (`null` withholds it); the optional counters and everything else answer `attribute_not_supported`. Behaviour change: class `0xF6` used to answer `path_destination_unknown` for everything and now answers as above by default. Delta mutation: 15 mutants, 14 killed, 1 equivalent.
 - **2026-11-18** — Adapter serves the **TCP/IP Interface object** (class `0xF5`, instance 1): `Get_Attributes_All` and `Get_Attribute_Single` for attributes 1 to 6 (status, configuration capability and control, physical link path, interface configuration, host name) from the new `Config.tcpip` (`stdobj` module; `null` withholds it), and `Set_Attribute_Single` for attributes 3, 5 and 6 behind `Config.allow_tcpip_set` (otherwise `attribute_not_settable`). Behaviour change: class `0xF5` used to answer `path_destination_unknown` for everything and now answers as above by default; `Set_Attribute_Single` on it used to be `service_not_supported`. Delta mutation: 111 mutants, 105 killed, 6 equivalent.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `Timeout.fromMilliseconds(0)` stays `null`; decided against the references (none converts milliseconds, they send fixed non-zero tick pairs or a raw pair from the caller), SPEC "`Timeout.fromMilliseconds(0)`, decided 2026-11-18". Backlog item closed; no code touched.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** reply matching decided against the references and left as is (SPEC, "Reply matching, decided 2026-11-18"): pycomm3 and EIPScanner compare neither the reply service nor the connected-address id, libplctag checks only its own typed services' reply service and logs the id; so `sendCip` / `sendConnectedCip` stay as they are. Backlog item closed; no code touched.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records two reply-matching gaps and the zero-timeout semantics found by the mutation audit (no code change).
 - **2026-11-17** — Fix: `Client.sendConnectedCip` no longer consumes a sequence count for a request that cannot be framed (a request of 245-446 octets passed the margin guard, advanced `conn.sequence`, then failed `BufferTooSmall`); the count is committed after both encodes succeed (CIP Vol 2: sequence count per transmitted data packet). Behaviour change: the connection's `sequence` is unchanged after a `BufferTooSmall` from this call.
 - **2026-11-17** — Whole-module mutation audit (1391 mutants, 1349 killed, 42 argued equivalent/unobservable; card `mutation 2026-11-17 (1349/1391, 42 eq)`); about 90 boundary tests added next to the code (data-length ceilings, path limits, exact buffers, every CIP type's width and byte order, session and connection matching, reply budgets, TCP framing). NO CONSUMER-VISIBLE CHANGE besides the fix above.
 
@@ -54,61 +49,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   timeout covers only a message's first octet. Each fix has a test that failed
   before it (the 32-bit one under `-Dtarget=x86-linux-musl`).
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE.** `connmgr`'s fuzz corpus: the
-  three entries meant to exercise the accept path of `UnconnectedSend`,
-  `ForwardOpen` and `ForwardClose` were typed by hand and, per the harness's own
-  note, only ever hit the reject path. Worse, re-measured today: two of them
-  (the `Unconnected_Send` bodies) no longer decode AT ALL — `UnconnectedSend.decode`
-  grew `TrailingData`/`BadReserved` checks after these seeds were written (the F3
-  regression fix), and the note claiming "2 accepted" was never re-run against
-  that change. All three are now built through the module's own encoders instead
-  of by hand (`UnconnectedSend.encode`/`ForwardOpen.encode`/`ForwardClose.encode`),
-  plus a companion test that pins the round trip. Measured: 11/11 non-empty
-  seeds, both `UnconnectedSend` seeds now accepted (were 0), the encoder-built
-  `ForwardOpen` accepted at its own width (was 0), the encoder-built
-  `ForwardClose` accepted (was 0) — verified with a mutant on `ForwardOpen.encode`
-  (flipped one output byte): 5/170 tests failed, including both new tests, at the
-  exact byte the mutant touched; reverted, back to 167/170 (3 skip). `large`
-  `ForwardOpen` and both reply decoders (`ForwardOpenReply`/`ForwardCloseReply`)
-  still have no seed shaped for them — a corpus gap the updated harness comment
-  now records rather than hides.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` copies in
-  this module's fuzz files are now `testkit.fuzz.seed` / `seedHex`. The helper
-  existed **33 times across 12 modules in three shapes**, each carrying its own
-  note about the same trap (the returned array has to be container-level or the
-  slice dangles with the right length and garbage behind it), and the count was
-  growing by roughly eight per module burned down. Proved byte-identical to the
-  copies it replaces before the copies were deleted — a temporary test compared
-  the old formula against the new one over this module's own seed literals, and
-  was itself checked non-vacuous by breaking it. Test-only; nothing a consumer
-  imports changed.
 
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** all 14 fuzz harnesses in
-  this module were replaying a single fixed input. Thirteen drew their frame as
-  `smith.bytes(&buf)` followed by a ranged `smith.valueRangeAtMost(...)`, and a
-  `Smith` ranged draw returns the range MINIMUM unless the eight octets it reads
-  as a little-endian u64 already lie inside the range — `bytes` had just eaten
-  the seed, so the length was its minimum every time. They now draw with
-  `smith.slice(&buf)`, the knobs that used to precede the frame (`fuzzAdapter`'s
-  session-open flag, `fuzzTypes`' type code, `fuzzAttrList`' value width) follow
-  it and are drawn with `value(u64)`, and each harness carries a corpus of real
-  wire frames or tag paths. Measured over those corpora, non-empty inputs /
-  inputs a decoder accepts: encapsulation 0 -> 13/11, the framer 0 -> 5 fed and
-  6 messages out, identity and service items 0 -> 7/6, CPF lists 0 -> 10/4, CPF
-  envelopes 0 -> 5/3, CIP messages 0 -> 12/10, Multiple Service 0 -> 8/5,
-  attribute lists 1 -> 8 distinct (list, width) pairs, EPATHs 0 -> 13/10, tag
-  paths 0 -> 16/9, tag payloads 1 -> 14 distinct (payload, type code) pairs and
-  0 -> 14 accepted, Connection Manager 0 -> 9/2.
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** two of those harnesses were
-  worse than the count suggests, and both are now measured in their own
-  comments. `fuzzAdapter`'s `smith.boolWeighted(1, 1)` — "half the runs start
-  with a session already open, so the paths past the session check are
-  reachable" — was `false` on every run, so no run ever had a session open;
-  it is now 6 of 12, with 9 replies where there were none. `fuzzClientReply`'s
-  ranged length had a minimum of 24 rather than 0, so the client was fed a bare
-  encapsulation header with an empty body on every seed; the six seeds now
-  arrive at 28..82 octets and the CPF body reaches the reply decoder.
 
 - **2026-08-22** — `TransportError` and `client.Error` gained a `Canceled` variant, and
   `TcpTransport` now recovers it at the socket boundary. A `std.Io` cancellation
