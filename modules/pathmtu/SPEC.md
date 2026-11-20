@@ -262,9 +262,10 @@ based PMTU probing methods (this module is ICMP/DF-bit only, per RFC
   ReleaseFast). `LiveProber.buf` is zero-filled at construction, not `undefined`:
   `echo.writeEchoRequest` writes only the 8-byte echo header, so the rest of the
   payload is zeros, never stale stack content.
-- **Wall-clock bound of `probe`:** about 17 sizes x (`retries` + 1) x `timeout_ms`,
-  all caller parameters. `probeHops` has `Options.deadline_ms` (default 2 minutes);
-  `probe` has none.
+- **Wall-clock bound of `probe`:** about 17 sizes x (`retries` + 1) x `timeout_ms`, all
+  caller parameters, as in tracepath. `Options.probe_deadline_ms` (default 0 = none) is an
+  opt-in budget for the whole search: once spent nothing more is sent and `probe` fails with
+  `error.DeadlineExceeded`. `probeHops` has `Options.deadline_ms` (default 2 minutes).
 - **A multi-homed destination:** `probeHops` takes an Echo Reply only from the exact
   address it probed (anything else could be a spoof). A reply from another address
   of the same host is dropped; the caller sees silence at that hop,
@@ -461,8 +462,6 @@ the host changes).
   the MTU a Fragmentation Needed reports), but `probe` and `probeHops` read only the error-queue entry's type, code and
   offender (`src/root.zig`), so they bisect without a hint: results are exact but cost about 11 probes per narrowing. Plan:
   read `ee_info` where the entry arrives and feed it as the hint.
-- **A wall-clock bound for `probe`:** add one (as `probeHops` has `Options.deadline_ms`) only if a consumer forwards the
-  `timeout_ms` and `retries` values that make the worst case long.
 - **Backoff for rate-limited routers:** a smarter backoff than the single re-probe is not built (see the per-hop walk design note).
 
 ## Open

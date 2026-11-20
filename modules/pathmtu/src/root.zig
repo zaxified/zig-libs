@@ -217,6 +217,12 @@ pub const Options = struct {
     /// further probe counts as unanswered without being sent, so the walk ends
     /// through `max_silent_hops`. Safe default: two minutes.
     deadline_ms: u32 = 120_000,
+    /// `probe`: opt-in wall-clock budget for the whole search, in
+    /// milliseconds. 0 (the default) means none: the run time is then about
+    /// 17 sizes x (`retries` + 1) x `timeout_ms`, as in tracepath. Once spent
+    /// nothing more is sent and `probe` fails with `error.DeadlineExceeded`
+    /// (a partial search has no honest `Result`).
+    probe_deadline_ms: u32 = 0,
 };
 
 /// See `Options.on_attempt`.
@@ -594,6 +600,8 @@ pub const ProbeError = error{
     /// SPEC.md "Limits and refusals" for why the two cases are handled
     /// differently.
     CeilingTooHigh,
+    /// `Options.probe_deadline_ms` was spent before the search finished.
+    DeadlineExceeded,
     Unexpected,
 };
 
@@ -630,8 +638,9 @@ fn LiveProberFor(comptime hop_mode: bool) type {
         /// Hop walk only: the destination (an Echo Reply must come from it, and every
         /// ICMP error must quote it).
         dest_ip: netaddr.Ip = .{ .v4 = .{ 0, 0, 0, 0 } },
-        /// Hop walk only: absolute `icmp.monoNow()` after which nothing is sent and
-        /// no wait outlasts it, however large `timeout_ms` and `retries` are.
+        /// Absolute `icmp.monoNow()` after which nothing is sent and
+        /// no wait outlasts it, however large `timeout_ms` and `retries` are
+        /// (a hop walk always sets it; `probe` only with `probe_deadline_ms`).
         hop_deadline_ns: u64 = std.math.maxInt(u64),
         /// Hop walk only: set when the TTL could not be applied (the walk is then void).
         ttl_failed: bool = false,
@@ -705,7 +714,7 @@ fn LiveProberFor(comptime hop_mode: bool) type {
             var tries: u16 = 0;
             while (tries <= self.retries) : (tries += 1) {
                 // A hop walk's overall deadline stops the retries too.
-                if (hop_mode and @as(u64, @intCast(icmp.monoNow())) >= self.hop_deadline_ns) break;
+                if (@as(u64, @intCast(icmp.monoNow())) >= self.hop_deadline_ns) break;
                 const seq = self.seq;
                 self.seq +%= 1;
                 // `attempt` already panics above when `wire_size` overruns the
@@ -726,7 +735,7 @@ fn LiveProberFor(comptime hop_mode: bool) type {
                 };
                 any_sent = true;
 
-                const deadline: u64 = attemptDeadline(@intCast(icmp.monoNow()), self.timeout_ms, if (hop_mode) self.hop_deadline_ns else std.math.maxInt(u64));
+                const deadline: u64 = attemptDeadline(@intCast(icmp.monoNow()), self.timeout_ms, self.hop_deadline_ns);
                 var recv_buf: [max_probe_mtu + 128]u8 = undefined;
                 while (true) {
                     // ⚠ The deadline is checked at the TOP, before every receive.
@@ -1052,11 +1061,17 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         // see SPEC.md "Threat model" for exactly which attacker this does
         // and does not raise the bar against). Was a fixed 1.
         .seq = randomStartSeq(),
+        .hop_deadline_ns = if (opts.probe_deadline_ms == 0) std.math.maxInt(u64) else @as(u64, @intCast(icmp.monoNow())) +| @as(u64, opts.probe_deadline_ms) * std.time.ns_per_ms,
     };
 
-    const observer = opts.on_attempt orelse return searchWith(lp.prober(), floor, ceiling, iface_mtu);
-    var observed: ObservedProber = .{ .inner = lp.prober(), .observer = observer };
-    return searchWith(observed.prober(), floor, ceiling, iface_mtu);
+    const searched = if (opts.on_attempt) |observer| blk: {
+        var observed: ObservedProber = .{ .inner = lp.prober(), .observer = observer };
+        break :blk searchWith(observed.prober(), floor, ceiling, iface_mtu);
+    } else searchWith(lp.prober(), floor, ceiling, iface_mtu);
+    // A spent budget turns the unsent probes into silence: whatever the search
+    // concluded from it (even `Unreachable`) is not an answer about the path.
+    if (@as(u64, @intCast(icmp.monoNow())) >= lp.hop_deadline_ns) return error.DeadlineExceeded;
+    return searched;
 }
 
 /// Per-hop path MTU, what `tracepath(8)` prints: walks TTL 1, 2, ... with DF
@@ -2799,6 +2814,30 @@ test "live: probeHops() takes its ceiling from Options.iface; an exhausted deadl
     const r0 = try probeHops(dest, .{ .timeout_ms = 500, .retries = 1, .deadline_ms = 0 }, &out);
     try testing.expect(r0.timed_out);
     try testing.expect(!r0.reached);
+}
+
+test "live: probe() with an exhausted probe_deadline_ms sends nothing and fails with DeadlineExceeded; 0 is no budget" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    const dest: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    var lp: LiveProber = undefined;
+    var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch return error.SkipZigTest;
+    defer sock.close();
+    lp = .{
+        .sock = &sock,
+        .family = .v4,
+        .ip_header_len = ipv4_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &dest.v4) } },
+        .retries = 3,
+        .timeout_ms = 60_000,
+        .hop_deadline_ns = 0,
+    };
+    var p = lp.prober();
+    // Spent budget: nothing is sent, no wait outlasts it.
+    try testing.expectEqual(ProbeOutcome.send_failed, p.probe(1400));
+    // No budget (the default): the same probe on loopback is answered.
+    const r = try probe(dest, .{ .timeout_ms = 500, .retries = 1, .iface = "lo" });
+    try testing.expect(r.mtu >= min_mtu_v4);
 }
 
 test "live: the hop prober applies the TTL, remembers a TTL the kernel refuses, and drops an Echo Reply from another address" {
