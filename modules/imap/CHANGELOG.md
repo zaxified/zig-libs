@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
@@ -19,11 +17,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   half, a one-byte STARTTLS injection, SELECT before LOGIN, the BODYSTRUCTURE
   depth edge, a valueless body parameter). No code change.
 
-- **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE:** test-only double free fixed in
-  `live_test.zig`'s `pymapPath`. On a host without pymap the `access` catch freed
-  `path` and returned the skip error, and the `errdefer` freed it again, so the
-  "LIVE pymap interop" test crashed (SIGABRT) instead of skipping and
-  `scripts/modtest imap` was red on any such host. Now 156 pass, 1 skip.
 
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `Decoder.charge` gains a
   test-only call counter (`void` outside a test build, so the increment

@@ -37,9 +37,8 @@ or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 **Status: complete for a read-only client** — no `AUTHENTICATE`/XOAUTH2, `STORE`,
 `APPEND`, `EXPUNGE`, `COPY`/`MOVE` or mailbox management (see *Backlog*). Modified UTF-7, the wire grammar, the response reader,
 the command encoder, the session, `FETCH` with `ENVELOPE` and `BODYSTRUCTURE`,
-`SEARCH` in both reply shapes, `IDLE`, and `LIST` / `LSUB` / `STATUS` (audit
-A1 F6 — not a port, these three are not in go-imap's ported surface; see
-`NOTICE`).
+`SEARCH` in both reply shapes, `IDLE`, and `LIST` / `LSUB` / `STATUS` (not a
+port: these three are not in go-imap's ported surface; see `NOTICE`).
 
 **Anchored against a live server.** Alongside the RFC transcripts (which pin
 the *parsing*), a LIVE test drives the client against **pymap** — an
@@ -130,7 +129,10 @@ Three decisions in here are load-bearing rather than stylistic:
   the budget is started in exactly one place, `response.Reader.next`, because a
   line is what that function reads. Refusal is `error.LineTooLong`; nothing is
   truncated, since a silently shortened mailbox name is a wrong answer rather
-  than a smaller one.
+  than a smaller one. One literal is bounded by `max_literal`, but a line can
+  carry many literal headers, so `Options.max_literal_total` (32 MiB) bounds the
+  sum of the literal sizes one line announces (`error.LiteralTooLarge`); list
+  nesting is bounded by `Options.max_depth` (1000).
 - **A server may not send `{123+}`.** The non-synchronising literal is a
   client-to-server construct (RFC 7888); go-imap accepts it only when decoding
   as a server, and so this rejects it outright rather than being liberal about
@@ -189,7 +191,9 @@ value contains NUL, CR or LF, exceeds 4096 bytes, or carries raw UTF-8 without
 `UTF8=ACCEPT`. Then it must be a literal, and a plain literal means writing
 `{n}` and *waiting for the server's `+`* before the payload.
 
-That wait belongs to the session, so the encoder does not fake it: it returns
+That wait belongs to the session, so the encoder does not fake it: it calls the
+`Options.on_sync` seam the session installs in every command entry (so no command
+can lose the handshake), and without a session it returns
 `error.SyncLiteralRequired`. With `LITERAL+` (any size) or `LITERAL-` (up to
 4096) it emits `{n+}` and no wait is needed. A password containing a newline is
 therefore either a clean literal or an explicit error — never a command line
@@ -287,71 +291,51 @@ this client runs no timer because it owns no thread.
 FETCH and SEARCH results are allocated from an allocator **you** pass, not the
 session's per-line arena, because they span many response lines.
 
-## What the live peer found
-
-The offline suite was 107 tests green. The first run against a real server
-failed — and the cause was a design gap no scripted peer would have shown: the
-synchronising-literal handshake had been wired into `LOGIN` **only**. A
-perfectly legal `SEARCH BODY "a\r\nb"`, which can travel no other way, came
-back as `error.SyncLiteralRequired` instead of doing the handshake.
-
-The fix moved the wait behind a seam in the encoder (`Options.on_sync`) that
-the session installs, so every command gets it rather than one. Arming happens
-in each command entry rather than in the caller: a forgotten call would
-silently lose the handshake, which is the bug the seam exists to prevent.
-
 ## Tests
 
-`zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
+`zig build test-imap` (or `scripts/modtest imap`). Anchoring is stated per tier
+(CONVENTIONS §5):
 
 - **Tier 1** — the worked example published in RFC 3501 §5.1.3, asserted in
   both directions, plus the alphabet distinction from RFC 2152 UTF-7.
 - **Tier 1** — for the grammar, field-by-field parses of the response shapes
   printed in RFC 9051 (`* 172 EXISTS`, the `FLAGS` list, a `{n}` literal).
 - **Tier 2** — the vector table from go-imap's own `internal/utf7`
-  `decoder_test.go`, including all 25 rejection cases. This is the source that
+  `decoder_test.go`, including its rejection cases. This is the source that
   was ported, so it catches transcription slips and **cannot** catch a shared
   misreading of the RFC; it is not counted as an external anchor.
+- **Live peer** — the pymap session above (greet through logout, including a
+  `SEARCH` literal that can travel no other way than the synchronising
+  handshake, which is why `Options.on_sync` serves every command).
 
-Every rule that could be quietly dropped has a test proven to fail when it is:
-four in the UTF-7 codec (alphabet, canonical-run check, null shift, surrogate
-arithmetic), six in the grammar (non-sync literal rejection, the literal cap
-firing before allocation, the trailing-space rule, the depth guard, `]` in
-astrings, INBOX case-folding), eight in the response reader (the `\\*`
-flag-perm wildcard, the capability exceptions, both server tolerances, the
-unknown-code skip, tagged PREAUTH/BYE rejection, the numeric prefix, and
-keeping an unknown line's remainder), eight in the encoder (each rule that
-decides quoted-vs-literal, `&` escaping, the INBOX atom, quote escaping, the
-flag grammar, and `LITERAL-`'s ceiling), eight in the session (tag
+Every rule that could be quietly dropped has a test that fails when it is: the
+UTF-7 codec's alphabet, canonical-run, null-shift and surrogate rules; in the
+grammar, non-sync literal rejection, the literal cap firing before allocation,
+the trailing-space rule, the depth guard, `]` in astrings and INBOX
+case-folding; in the response reader, the `\\*` flag-perm wildcard, the
+capability exceptions, both server tolerances, the unknown-code skip, tagged
+PREAUTH/BYE rejection and the kept remainder of an unknown line; in the encoder,
+each rule that decides quoted-vs-literal, `&` escaping, the INBOX atom, quote
+escaping, the flag grammar and `LITERAL-`'s ceiling; in the session, tag
 matching, the continuation wait, the state gate, capability-driven literal
-policy, BYE handling, response-code absorption, and both halves of the
-failed-SELECT cleanup), and ten across part 2 (the BODYSTRUCTURE depth guard,
-the 7bit default, `text/*` line counts, parameter-key folding, `BODY.PEEK`,
+policy, BYE handling, response-code absorption and both halves of the
+failed-SELECT cleanup; in FETCH/SEARCH/IDLE, the BODYSTRUCTURE depth guard, the
+7bit default, `text/*` line counts, parameter-key folding, `BODY.PEEK`,
 system-flag search keys, the `ALL` fallback, the ESEARCH correlator, the IDLE
-state gate, and FETCH results being allocated where they can outlive the line). Verified by planting each defect and
-watching the suite go red, then confirming the revert byte-for-byte. A planted
-defect that fails to COMPILE proves nothing, so six of those were rewritten
-until they built and then failed — and one of them turned out to pass, which
-exposed a test with no teeth: clearing mailbox state on a failed SELECT was
-already covered by clearing it on entry, so the test could not tell the two
-apart. The transcript now emits untagged data before the refusal, which only
-the failure path can clean up.
+state gate and FETCH results being allocated where they can outlive the line.
+The delivered defaults of `max_line`, `max_literal`, `max_depth` and
+`fetch.Options.max_depth` are pinned by tests.
 
-**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the wire
-decoder's budgets and refusals, the encoder's argument/sequence-set/section/
-flag/quoting checks, the modified-UTF-7 decoder, tagged-status rejection,
-the session's state and STARTTLS gates, and the BODYSTRUCTURE parser): 38
-killed. The first pass left 17; tests were added for both literal ceilings
-at their exact value and the per-line total's reset in `startLine`, an
-escape's second byte counting against `max_line`, every atom-special
-(the backslash was untested), a non-NIL atom where an nstring is expected, DEL in a
-section specifier (encoder and decoder) and in `quotable`'s 0x7f/0x80 edge,
-a backslash in a flag's second position, a high surrogate followed by a
-non-low one (`&2ADgAA-`), a single injected byte after the STARTTLS OK,
-SELECT before authentication, the BODYSTRUCTURE depth bound at exactly
-`max_depth`, and a parameter key without a value. Equivalent: the explicit
-`=` and CR refusals in a base64 run (the padless decoder rejects both bytes
-as out-of-alphabet anyway).
+**Fuzz:** `IMAP_FUZZ=<runs>[,<first seed>]` runs the deterministic driver over
+the harnesses (UTF-7 decode, command builders, SEARCH and FETCH encoders with
+CR/LF/NUL/quote bytes injected, the response reader), in the ordinary test
+binary.
+
+**Audit:** the card's `**Audit:**` line is the current score, cumulative over the
+last whole-module mutation run and the delta runs after it.
+
+**Instruments:** `tools/` holds a differential oracle for the UTF-7 codec
+against pymap's server-side codec (`tools/README.md`).
 
 ## Anchoring
 
@@ -369,4 +353,3 @@ as out-of-alphabet anyway).
 - **Mailbox management: `CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`/`UNSUBSCRIBE`** *(survey 2026-09-30)*. Effort: small. Fits §2.
 - **`NAMESPACE`, `ENABLE`, `ID`** (read-only `EXAMINE` is already `select(…, true)`) *(survey 2026-09-30)*. Namespace is needed to list mailboxes correctly on Dovecot/Cyrus setups with prefixes; `ENABLE` is required to turn on UTF8/CONDSTORE. Effort: small each. Fits §2.
 - **`CONDSTORE`/`QRESYNC` (RFC 7162), `SORT`/`THREAD`, `COMPRESS=DEFLATE`** *(survey 2026-09-30)*. Efficient resync of large mailboxes; go-imap v2 supports several of them *(inferred)*. Effort: medium each; COMPRESS needs a deflate stream (sibling compression modules exist, not checked). Fits §2 only with a sibling for COMPRESS.
-- ~~**Doc: README says `Status: COMPLETE`**~~ *(survey 2026-09-30)* — fixed the same day: the status line now says read-only client.
