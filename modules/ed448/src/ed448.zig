@@ -1186,3 +1186,78 @@ test "mulDoubleBaseVartime (wNAF, comptime B table) agrees with the constant-tim
         try std.testing.expect(got.equivalent(want));
     }
 }
+
+/// Encodings of the three non-identity small-order points: (0, -1) of order 2,
+/// and (1, 0), (-1, 0) of order 4.
+fn smallOrderEncodings() [3][57]u8 {
+    var t2 = @as([57]u8, @splat(0));
+    t2[0..field.encoded_bytes].* = field.p_bytes;
+    t2[0] -= 1; // y = p - 1 = -1
+    const t4a = @as([57]u8, @splat(0)); // y = 0, x even (p - 1)
+    var t4b = @as([57]u8, @splat(0));
+    t4b[56] = 0x80; // y = 0, x odd (1)
+    return .{ t2, t4a, t4b };
+}
+
+test "verify rejects a small-order public key that is not the identity (forgery for every message)" {
+    var one = @as([57]u8, @splat(0));
+    one[0] = 1;
+    // R = B, S = 1: with [4]A' = O both sides of the cofactored equation are [4]B.
+    const sig: Signature = .{ .r = Point.basePoint.toBytes(), .s = one };
+    for (smallOrderEncodings()) |enc| {
+        const t = try Point.fromBytes(enc);
+        try std.testing.expect(t.clearCofactor().equivalent(Point.identityElement));
+        try std.testing.expect(!t.equivalent(Point.identityElement));
+        for ([_][]const u8{ "", "any message at all" }) |msg| {
+            try std.testing.expectError(error.SignatureVerificationFailed, verify(sig, msg, "", PublicKey.fromBytes(enc)));
+        }
+    }
+}
+
+test "verify rejects a small-order R that is not the identity, even from the key holder" {
+    const kp = KeyPair.create(&(@as([57]u8, @splat(7))));
+    for (smallOrderEncodings()) |enc| {
+        const k = scalar.reduceWide(try shake114(0, "", &.{ &enc, &kp.public_key.bytes, "hello" }));
+        const sig: Signature = .{ .r = enc, .s = scalar.mulAdd(k, testSecretScalar(kp), scalar.zero) };
+        try std.testing.expectError(error.SignatureVerificationFailed, verify(sig, "hello", "", kp.public_key));
+    }
+}
+
+test "Point.fromBytes rejects every set bit among bits 448..454 of byte 56" {
+    for (0..7) |bit| {
+        var enc = Point.basePoint.toBytes();
+        enc[56] |= @as(u8, 1) << @intCast(bit);
+        try std.testing.expectError(error.InvalidEncoding, Point.fromBytes(enc));
+    }
+}
+
+test "Point.equivalent compares both coordinates: (x, y) and (x, -y) differ" {
+    const b = Point.basePoint;
+    const flipped: Point = .{ .x = b.x, .y = b.y.neg(), .z = Fe.one };
+    try std.testing.expect(!b.equivalent(flipped));
+    // and a non-normalised representative of the same point is equivalent
+    const k = Fe.one.add(Fe.one);
+    const scaled: Point = .{ .x = b.x.mul(k), .y = b.y.mul(k), .z = k };
+    try std.testing.expect(b.equivalent(scaled));
+    try std.testing.expect(scaled.equivalent(b));
+}
+
+test "SecretKey / PublicKey codecs and lift" {
+    var raw: [57]u8 = undefined;
+    for (&raw, 0..) |*b, i| b.* = @truncate(i * 11 + 1);
+    const sk = SecretKey.fromBytes(raw);
+    try std.testing.expectEqualSlices(u8, &raw, &sk.bytes);
+    try std.testing.expectEqualSlices(u8, &raw, &sk.toBytes());
+    var sk2: SecretKey = .{ .bytes = @splat(0) };
+    SecretKey.fromBytesInto(&sk2, &raw);
+    try std.testing.expectEqualSlices(u8, &raw, &sk2.bytes);
+    var out = @as([57]u8, @splat(0));
+    SecretKey.toBytesInto(&out, &sk2);
+    try std.testing.expectEqualSlices(u8, &raw, &out);
+    const pk = PublicKey.fromBytes(raw);
+    try std.testing.expectEqualSlices(u8, &raw, &pk.toBytes());
+    const two_b = Point.basePoint.dbl();
+    const lifted = try PublicKey.fromBytes(two_b.toBytes()).lift();
+    try std.testing.expect(lifted.equivalent(two_b));
+    try std.testing.expect(!lifted.equivalent(Point.basePoint));
+}

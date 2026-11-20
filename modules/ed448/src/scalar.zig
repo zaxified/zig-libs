@@ -326,3 +326,19 @@ test "add/mul/mulAdd: identities and wrap-around mod L" {
     // mulAdd(a, b, c) == a*b + c: (L-1)*2 + 2 == L-2+2... i.e. -2+2 == 0
     try std.testing.expectEqualSlices(u8, &zero, &mulAdd(l_minus_1, two, two));
 }
+
+test "mul accepts any 456-bit operand (bits 448..455 included) and reduces it mod L" {
+    const l: u1024 = std.mem.readInt(u456, &l_bytes, .little);
+    var a: [encoded_bytes]u8 = undefined;
+    var b: [encoded_bytes]u8 = undefined;
+    for (&a, &b, 0..) |*x, *y, i| {
+        x.* = @truncate(i * 29 + 0x91);
+        y.* = @truncate(i * 53 + 0x5d);
+    }
+    a[encoded_bytes - 1] = 0xff;
+    b[encoded_bytes - 1] = 0xa5;
+    const want: u1024 = (@as(u1024, std.mem.readInt(u456, &a, .little)) * std.mem.readInt(u456, &b, .little)) % l;
+    var wb: [encoded_bytes]u8 = undefined;
+    std.mem.writeInt(u456, &wb, @intCast(want), .little);
+    try std.testing.expectEqualSlices(u8, &wb, &mul(a, b));
+}

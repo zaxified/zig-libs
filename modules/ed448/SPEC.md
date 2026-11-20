@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 Ed448/X448 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/58, 2 eq) · src 21dcdf9acf36dd37
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (280/307, 23 eq) · src 2105a944956f16d9
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-11-13 (ctgrind: full 3, ladder 0, decaf448 scalarmul 0 — unchanged; select masks laundered) · panic 2026-11-13 (sweep of every pub entry point of field/scalar/ed448/x448: `Point.toBytes` of a `z = 0` point is total instead of `unreachable`; `Fe.random` redraws at most 64 times, so a broken `io` no longer hangs it; a hand-built `Fe` with a limb over 2^57 is a documented contract violation)
 
@@ -309,13 +309,34 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `decaf448`); the cofactored equation (an order-4 point on `R`, which an equation multiplied by 2 would
   reject); `equivalent` on `P` and `-P`; a 255-octet context; the scalar canonical check deciding at the
   most significant differing byte; X448 of `u = 0, 1, p - 1` giving all zeros (RFC 7748 §5); `isZero`/`eql`
-  reading every limb.
+  reading every limb; the field's canonical-range check at the most
+  significant differing byte; operands at the 2^57 - 1 limb bound through every field operation and
+  `canonical` against a big-integer oracle; `scalar.mul` of 456-bit operands; order-2 and order-4
+  public keys and `R` refused by `verify` (the forgery `A' = (0, -1)`, `R = B`, `S = 1`); every padding
+  bit of a point encoding; `Point.equivalent` on `(x, y)` against `(x, -y)`; a non-canonical X448 `u`
+  refused with the output wiped; the `SecretKey`/`PublicKey` codecs and `lift`; the `Fe.random` fallback
+  value.
 - **Fuzz** (`src/fuzz_test.zig`, `ED448_FUZZ`): `ed448_point` and `ed448_signature` harnesses, plus a
   seed loop with reach checks in every test run.
 - **Dead-stack probes:** `src/stackprobe_test.zig` (Ed448 signing, X448) and `src/stackprobe2_test.zig`
   (Ed448 key generation), ReleaseFast.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
   whole-module mutation run and the delta runs after it.
+- **Mutation:** whole-module schemata over `field.zig`, `scalar.zig`, `ed448.zig`, `x448.zig` (285
+  mutants, ReleaseSafe: canonical-range compares, carry/fold/weak-reduction steps, every addition-chain
+  step of `invert`/`sqrt`/`sqrtRatio`, the point formulas, the masked table scan, the windowed and comb
+  loops, the NAF recoding and Straus loop, point decode and encode, `dom4`, sign/verify steps, the X448
+  ladder) plus 22 burn/wipe mutants in a ReleaseFast build of the stack probes (a burn skipped, a burn
+  halved, a `secureZero` skipped). 280 killed, 23 argued equivalent, 4 open. Equivalent: the
+  `t[17]` carry of `scalar.mul` (a product of two 456-bit values is below 2^912), `ctSelectPoint` with
+  `<=` (the last true position is the index), the NAF mask of width w-1 and `>` for `>=` on an odd
+  digit (cost only), the final X448 swap (the clamped scalar's bit 0 is 0), the three `blackBox`
+  launderings (visible only to the `ctgrind` rows `full` and `ladder`, which fail if the compiler
+  turns a mask into a branch), halved burns that still cover every secret the probe finds, and the
+  `secureZero` defers whose frame the burn clears right after. Open: the stack probes do not call
+  `Point.mul`, `Point.mulBasePoint`, `x448.KeyPair.fromEd448` or `x448.KeyPair.generate` directly, so
+  their own burn/wipe is unobserved (the probes cover the same frames through signing, key creation
+  and `scalarmult`).
 
 ## Performance
 

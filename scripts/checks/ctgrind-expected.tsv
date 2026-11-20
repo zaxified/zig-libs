@@ -364,8 +364,8 @@ decaf448	ReleaseFast	scalarmul	1	0	3f804876c85b9670	77a1bd1038ca1053
 # refusal stringToPoint already made itself.
 ecvrf	ReleaseFast	prove	1	0	ccaef648b780fefd	f676793e0800a787
 ecvrf	ReleaseFast	verify	1	>=1	ccaef648b780fefd	087c8ff4d336d9b1
-ed448	ReleaseFast	full	1	3	f62ab564af715e98	5853bb35135afb85
-ed448	ReleaseFast	ladder	1	0	7ebd208087a0d79d	43db8426e0d6c6e7
+ed448	ReleaseFast	full	1	3	63619b5170879c8f	5853bb35135afb85
+ed448	ReleaseFast	ladder	1	0	abb0dd0ddc97640b	43db8426e0d6c6e7
 # k256 — the field layer is clean; every group/sign/ecdsa context is a
 # `rejectIdentity`, an input/output validation, or (in `ecdsa` alone) the RFC
 # 6979 §3.2 nonce-retry rejection, itemised line by line in

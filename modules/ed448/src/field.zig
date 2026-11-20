@@ -964,4 +964,72 @@ test "Fe.random with an io that never yields a canonical draw is bounded and can
     const fe = Fe.random(io);
     try std.testing.expectEqual(@as(usize, Fe.random_attempts), Stuck.calls);
     _ = try Fe.fromBytes(fe.toBytes());
+    // Every draw is >= p, so the result is the last one with its top bit cleared: 2^447 - 1.
+    var want = @as([encoded_bytes]u8, @splat(0xff));
+    want[encoded_bytes - 1] = 0x7f;
+    try std.testing.expectEqualSlices(u8, &want, &fe.toBytes());
+}
+
+// ── contract boundary and canonical-range checks against a big-integer oracle ──
+
+fn bigValue(fe: Fe) u1024 {
+    var v: u1024 = 0;
+    for (fe.limbs, 0..) |l, i| v += @as(u1024, l) << @intCast(56 * i);
+    return v;
+}
+
+fn bigP() u1024 {
+    return std.mem.readInt(u448, &p_bytes, .little);
+}
+
+fn expectResidue(got: Fe, want: u1024) !void {
+    try std.testing.expectEqual(want % bigP(), bigValue(got) % bigP());
+    const w: u448 = @intCast(want % bigP());
+    var wb: [encoded_bytes]u8 = undefined;
+    std.mem.writeInt(u448, &wb, w, .little);
+    try std.testing.expectEqualSlices(u8, &wb, &got.toBytes());
+}
+
+test "weakly reduced operands up to the 2^57 - 1 limb bound: every operation and canonical() match a big-integer oracle" {
+    const top: u64 = (1 << 57) - 1;
+    // Vectors found by search: after two fold rounds a limb is still >= 2^56,
+    // so `canonical`'s third round is needed.
+    const vecs = [_][num_limbs]u64{
+        .{ 144115188075855870, 72057594037927941, 144115188075855871, 66805239798574056, 144115188075855871, 72057594037927934, 144115188075855871, 144115188075855870 },
+        .{ 72057594037927934, 144115188075855870, 17917717441018748, 72057594037927934, 72057594037927935, 72057594037927935, 144115188075855871, 144115188075855870 },
+        .{ 144115188075855870, 72057594037927934, 108195597684339623, 128466703708117167, 72057594037927934, 72057594037927935, 72057594037927935, 144115188075855871 },
+        @as([num_limbs]u64, @splat(top)),
+        @as([num_limbs]u64, @splat(0)),
+    };
+    for (vecs) |va| {
+        const a: Fe = .{ .limbs = va };
+        try expectResidue(a, bigValue(a)); // canonical()
+        for (vecs) |vb| {
+            const b: Fe = .{ .limbs = vb };
+            const ba = bigValue(a) % bigP();
+            const bb = bigValue(b) % bigP();
+            try expectResidue(a.add(b), ba + bb);
+            try expectResidue(a.sub(b), ba + bigP() - bb);
+            try expectResidue(a.mul(b), ba * bb);
+        }
+        try expectResidue(a.square(), (bigValue(a) % bigP()) * (bigValue(a) % bigP()));
+        try expectResidue(a.neg(), bigP() - bigValue(a) % bigP());
+        try expectResidue(a.mulSmall(0xffffffff), (bigValue(a) % bigP()) * 0xffffffff);
+    }
+}
+
+test "rejectNonCanonical decides at the most significant differing byte" {
+    // 2^448 - 256 > p although its lowest byte is below p's: a compare that
+    // lets a lower byte win once any byte is smaller would accept it.
+    var big = @as([encoded_bytes]u8, @splat(0xff));
+    big[0] = 0;
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(big));
+    // p with only its top byte lowered is below p and must be accepted.
+    var below = p_bytes;
+    below[encoded_bytes - 1] = 0xfe;
+    try Fe.rejectNonCanonical(below);
+    // One above p in byte 28 (0xfe -> 0xff), lower bytes all 0xff: > p.
+    var above = p_bytes;
+    above[28] = 0xff;
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(above));
 }

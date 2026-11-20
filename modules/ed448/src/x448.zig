@@ -437,3 +437,10 @@ test "publicKeyFromEd448 refuses the identity and an undecodable key" {
     bad = ed448.Point.basePoint.toBytes();
     _ = try publicKeyFromEd448(bad);
 }
+
+test "scalarmult rejects a non-canonical u (RFC 7748 §5 allows masking; this module refuses) and wipes the output" {
+    var k: [scalar_length]u8 = @splat(0x33);
+    var out: [shared_length]u8 = @splat(0xaa);
+    try std.testing.expectError(error.NonCanonical, scalarmult(&out, &k, field.p_bytes));
+    try std.testing.expect(std.mem.allEqual(u8, &out, 0));
+}
