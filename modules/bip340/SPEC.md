@@ -6,7 +6,7 @@
 
 **Scope:** parity — libsecp256k1 v0.8.0 `schnorrsig` + `extrakeys` (BIP340) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-14 (89/117, 28 eq) · src bd9aa2fd2c7afd84
+**Audit:** review 2026-10-08 · mutation 2026-11-14 (89/117, 28 eq) · src 45303320d6252311
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind) · panic 2026-11-13 (sweep of every pub entry point: decoders, hand-built `KeyPair`/`LiftedPublicKey`/`BatchItem`, `sign`/`verify`/`verifyLifted`/`verifyBatch`; one LOW: `verifyBatch` redrew a randomizer forever from an all-zero `io.randomSecure`, now `false` after 8 draws)
 

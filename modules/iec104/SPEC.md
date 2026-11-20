@@ -6,7 +6,7 @@
 
 **Scope:** core — lib60870 v2.4.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-18 (941/963, 22 eq) · src 55ca48a6517aecfe
+**Audit:** review 2026-09-10 · mutation 2026-11-18 (941/963, 22 eq) · src b7db811bed6dc14a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, IEC104_FUZZ) · ct n/a — no authentication (keyword review, 2026-10-07)
 

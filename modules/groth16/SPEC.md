@@ -6,7 +6,7 @@
 
 **Scope:** core — snarkjs 0.7.6 + circom 2.2.3 (reference), rapidsnark v0.0.8, arkworks-rs/groth16 0.6.0 (surveyed 2026-10-05)
 
-**Audit:** review 2026-10-02 · mutation 2026-11-20 (521/570, 49 eq) · src a78cf593f884eec8
+**Audit:** review 2026-10-02 · mutation 2026-11-20 (521/570, 49 eq) · src 6baef96b8fa4bded
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GROTH16_FUZZ) · ct 2026-10-09 (ctgrind)
 

@@ -6,7 +6,7 @@
 
 **Scope:** mvp — FRR isisd SPF (10.7, `isis_spf.c` behaviour) and holo-isis `spf.rs` (v0.9.0), ISO 10589 §7.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (78/92, 14 eq) · src c94c2dc375fab924
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (78/92, 14 eq) · src 753f91ae18785583
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_SPF_FUZZ) · ct n/a — SPF computation (keyword review, 2026-10-07)
 

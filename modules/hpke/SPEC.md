@@ -8,7 +8,7 @@
 
 **Ahead:** feature — psk, auth and auth_psk modes (Go 1.26 `crypto/hpke` is base mode only; one-stage psk per draft-ietf-hpke-hpke §5.1), ML-KEM-512 and the TurboSHAKE128/256 KDFs (Go skips both of its own vectors; here they pass byte-exact, `kat_go_test.zig`) (measured 2026-10-31)
 
-**Audit:** review 2026-11-01 · mutation 2026-11-17 (33/37, 4 eq) · src 0e45f6deada54027
+**Audit:** review 2026-11-01 · mutation 2026-11-17 (33/37, 4 eq) · src 4fa834ae30a81390
 
 **Hardening:** fuzz 2026-10-31 (pq KEMs and one-stage KDFs: `hpke-pq-kem`/`hpke-pq-kdf`, 8 × 100,000 runs clean, every reach label hit, 8 planted mutants caught; RFC 9180 harnesses 2026-10-10, 200,000-run budget, HPKE_FUZZ) · ct 2026-10-31 (ctgrind: pq decap per family + one-stage schedule added, P-384 rows 0 contexts on the `p384` module; every nonzero context attributed) · panic 2026-10-31 (sweep + blind review: export length past 255·Nh → `LabelTooLong`, `out` zeroed on every error path, i2osp/os2ip checked panics; delta audit 27/27; pq/kdf/schedule blind review 2026-10-31: 2 MED fixed — stale or garbage expanded AES key — and an over-long plaintext refused instead of the AEAD's panic)
 

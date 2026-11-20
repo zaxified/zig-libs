@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-18 (373/409, 36 eq) · src 69949e3be30b3521
+**Audit:** review 2026-10-08 · mutation 2026-11-18 (373/409, 36 eq) · src 317e9175fa59a868
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, K256_FUZZ; mul at 1/4, sign at 1/4 of it) · ct 2026-09-15 (ctgrind)
 

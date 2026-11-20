@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — a damaged file (1 to 8 bytes flipped in one random non-meta page, or anywhere in the file; 3 000 trials each, one process per trial): kvtree panicked, crashed or hung in 0 of 6 000, read through plain `FsStorage` and again through `FsStorage.initMmap`; bbolt v1.5.0 panicked in 234 (slice bounds, SIGSEGV in its mmap), LMDB 0.9.31 crashed in 292 (238 SIGSEGV, 54 SIGBUS). None of the three detects most such damage — node pages carry no checksum on any side — so the lead is "a damaged file never takes the process down", not detection (`tools/corrupt_probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (549/598, 49 eq) · src 286d7ad0b162661a
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (549/598, 49 eq) · src a9a83a41275fdb8c
 
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, KVTREE_FUZZ) · ct n/a — B-tree store (keyword review, 2026-10-07) · panic 2026-10-29 (every page offset/length/count/child id checked at its point of use → `Corrupt`, descent depth-capped, forged metas refused at open, cursor left unpositioned after an error)

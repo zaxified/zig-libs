@@ -6,7 +6,7 @@
 
 **Scope:** core — GNU coreutils du 9.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation 2026-11-17 (312/350, 38 eq) · src 83316980cbb48cc9
+**Audit:** review 2026-09-04 · mutation 2026-11-17 (312/350, 38 eq) · src 7aa6925859d8e5ee
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DISKUSAGE_FUZZ) · ct n/a — filesystem walking (keyword review, 2026-10-07)
 

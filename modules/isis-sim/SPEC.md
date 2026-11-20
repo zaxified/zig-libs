@@ -6,7 +6,7 @@
 
 **Scope:** mvp — no direct reference; FRR topotests / containerlab for the use case (surveyed 2026-09-30; poc -> mvp 2026-09-30 after lossy medium, aging and LAN circuits)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-19 (57/59, 2 eq) · src ac16ab3f4cf74ed5
+**Audit:** review 2026-09-03 · mutation 2026-11-19 (57/59, 2 eq) · src a2a805c084dfd1a7
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — IS-IS simulation (keyword review, 2026-10-07)
 

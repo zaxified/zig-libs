@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — alexliesenfeld/health v0.8.1, the reference, in its default configuration answers a failing readiness check with the check's raw error text in the JSON body (`"error":"dial tcp 10.0.3.7:5432: connect: connection refused"`; `WithDisabledDetails` is opt-in), so an unauthenticated prober learns internal addresses; this module's `Check` returns `bool`, no error text exists to leak, and `detail = false` drops even the names (test "readiness: detail=false keeps the status but not the dependency names") (measured 2026-10-24) · correctness — the reference's handler never reads the HTTP method: POST, PUT, DELETE, PATCH and OPTIONS to its path each run every dependency check and get the probe's 503 (`tools/lead_probe`, 7 methods, 1 check call each); here only GET/HEAD are probes and every other method reaches the app with no check run (tests "non-probe methods on a probe path reach the app and run no check (the reference runs every check)", "isProbeMethod: GET and HEAD are probe methods, everything else is not (audit F1)") (measured 2026-10-24)
 
-**Audit:** review 2026-10-29 · mutation 2026-10-29 (48/49, 1 eq) · src 8b5b86b8ffd44745
+**Audit:** review 2026-10-29 · mutation 2026-10-29 (48/49, 1 eq) · src af840b7eefe02e5f
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — health probes (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; `respond(.startup)` without a startup probe answers 404)
 

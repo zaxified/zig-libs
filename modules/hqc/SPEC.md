@@ -6,7 +6,7 @@
 
 **Scope:** parity — HQC reference v5.0.0 (spec of 2025-08-22), as packaged in liboqs 0.16.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-21 (256/275, 19 eq) · src b0c9e1401a6c0e29
+**Audit:** review 2026-09-10 · mutation 2026-11-21 (256/275, 19 eq) · src c426cfb19834826e
 
 **Hardening:** fuzz 2026-10-07 (100,000 runs clean, HQC_FUZZ, roundtrip and implicit reject) · ct 2026-09-09 (ctgrind) · panic 2026-10-30 (sweep + blind review: Ring/sampleVect caller asserts → checked panics, comptime parameter guards, `stack_bytes` documented; delta audit 12/13 + 1 eq)
 

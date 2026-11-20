@@ -6,7 +6,7 @@
 
 **Scope:** core — Linux kernel IP reassembly behaviour, smoltcp (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (159/164, 5 eq) · src 927ca8ad3f5bcfc2
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (159/164, 5 eq) · src 4ecdcee1d3c3ce83
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ETHFRAG_FUZZ) · ct n/a — frame fragmentation (keyword review, 2026-10-07)
 

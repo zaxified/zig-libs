@@ -6,7 +6,7 @@
 
 **Scope:** core — go-jose v4.1.5 / panva jose (JWE compact) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-21 (172/178, 6 eq) · src 59f481e58c37917b
+**Audit:** review 2026-09-03 · mutation 2026-11-21 (172/178, 6 eq) · src 06bdc4f8850f852a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct 2026-11-13 (ctgrind, decrypt side, tainted key per kind: dir CEK 18, AxxxKW/GCMKW KEK 5, ECDH-ES static key 8, PBES2 password 3, RSA-OAEP key 20 in-file, unattributed 0; every context is a designed public verdict, itemised under Constant-time; the encrypt side draws its secrets internally and emits only public ciphertext, so it takes no tainted input) · panic 2026-11-13 (sweep of every pub entry point: an `apu`/`apv`/`iv`/`tag`/`p2s`/`epk` member over 128 bytes overran the header encoder's base64 scratch, now `HeaderTooLarge`/`BufferTooSmall`; the Concat KDF accepts an empty output and panics with a checked message beyond its 32-bit fields; a GCM plaintext past 2^36 - 32 bytes is `BufferTooSmall`)
 

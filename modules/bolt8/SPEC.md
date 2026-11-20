@@ -6,7 +6,7 @@
 
 **Scope:** parity — lnd `brontide` (lnd v0.21.3-beta) / LDK `PeerChannelEncryptor` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-19 (134/140, 6 eq) · src 3bea2d1c9423e981
+**Audit:** review 2026-10-08 · mutation 2026-11-19 (134/140, 6 eq) · src 64a118dd2add366e
 
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per target, 5 targets, BOLT8_FUZZ) · ct 2026-09-08 (ctgrind) · panic 2026-11-14 (sweep of every pub entry point: the wire parsers, secp256k1 inputs, send/recv, the 1000-message rotation are clean; LOW `readAct2`/`genAct3`/`genAct2`/`readAct3` panicked on `.?` when a caller set the pub `state` field by hand ahead of the act that fills it, now `error.WrongState` and the object goes to `.failed`)

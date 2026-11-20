@@ -6,7 +6,7 @@
 
 **Scope:** core — draft-irtf-cfrg-bbs-signatures -12 and zkryptium (draft-10) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the pin moved to -12 and the SHAKE-256 suite landed, both suites byte-exact on the draft's vectors)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-20 (133/136, 1 eq) · src 13f4108587f2da69
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (133/136, 1 eq) · src 848849db9039e22a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify oracles at scale 200 = 1,000 runs each (a sign or proof plus up to five pairing checks per run), BBS_FUZZ) · ct 2026-10-06 (ctgrind)
 

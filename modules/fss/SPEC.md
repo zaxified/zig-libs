@@ -6,7 +6,7 @@
 
 **Scope:** mvp — google/distributed_point_functions and libfss (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-18 (43/44, 1 eq) · src 6488dc09720282d9
+**Audit:** review 2026-09-09 · mutation 2026-11-18 (43/44, 1 eq) · src 5848e7b8345eca18
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, FSS_FUZZ) · ct 2026-09-09 (ctgrind)
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — drand Go client (drand/drand v2.1.7) (surveyed 2026-09-30; mvp -> core after chained `pedersen-bls-chained` verification of the default network landed 2026-10-06)
 
-**Audit:** review 2026-09-16 · mutation 2026-11-17 (158/162, 4 eq) · src d3335129e45af8a6
+**Audit:** review 2026-09-16 · mutation 2026-11-17 (158/162, 4 eq) · src ef99e6cee67aa4c6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify harnesses at scale 20 = 10,000 runs, DRAND_FUZZ) · ct n/a — public beacon verification (keyword review, 2026-10-07)
 

@@ -6,7 +6,7 @@
 
 **Scope:** parity — GNU coreutils df 9.12 (surveyed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (268/279, 10 eq) · src 9a93a64046ad3338
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (268/279, 10 eq) · src eb669ed24ef3630d
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DISKFREE_FUZZ) · ct n/a — statvfs reporting (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: OutOfMemory propagates instead of "no data" / a short table; delta audit 14/14)
 

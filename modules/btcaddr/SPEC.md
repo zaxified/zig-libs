@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core `DecodeDestination`/`EncodeDestination`/`DecodeSecret`/`EncodeSecret` + rust-bitcoin `Address` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-11-21 (84/84) · src ce7f7a39593384be
+**Audit:** review 2026-10-03 · mutation 2026-11-21 (84/84) · src ad30013dd6600080
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BTCADDR_FUZZ) · ct 2026-10-18 (ctgrind: the WIF private-key round trip, row `wif`; address derivation is public)
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — Sidekiq (Ruby; lease/retry/dead-queue model) with Asynq as the closest embeddable peer (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (37/38, 1 eq) · src ef657e08e7e8d1fe
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (37/38, 1 eq) · src 8c0e97a891b68f5a
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — job persistence (keyword review, 2026-10-07)
 

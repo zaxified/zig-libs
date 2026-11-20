@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libbpf 1.7.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-18 (1096/1233, 137 eq) · src 5a7d1f20fe53bbc9
+**Audit:** review 2026-09-02 · mutation 2026-11-18 (1096/1233, 137 eq) · src 3b8ecad5e9984279
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, EBPF_FUZZ) · ct n/a — bpf program loader (keyword review, 2026-10-07)
 

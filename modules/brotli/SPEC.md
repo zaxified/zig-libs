@@ -8,7 +8,7 @@
 
 **Ahead:** feature — `parallel.compress` writes the same bytes for any worker count: at `.q9` on `/usr/share/ieee-data/oui.txt` (5.8 MB) and `/usr/share/misc/pci.ids` (1.6 MB), 1, 2, 4 and 8 workers give one stream each; rust-brotli 9.1.1 `compress_multi` cuts the input by its thread count (`enc/threading/mod.rs` `get_range`) and gives four different streams (oui.txt 1 093 996 / 1 097 379 / 1 099 267 / 1 119 003 B), google/brotli and andybalholm/brotli have no multithreaded single-stream compression; reproducible builds of compressed assets need the first (rust side: `tools/foreign_rust` workload `multi<N> <file>`; ours: the test "parallel: the bytes do not depend on the worker count") (measured 2026-10-27)
 
-**Audit:** review 2026-10-29 · mutation 2026-10-29 (98/121, 23 eq) · src 16b53a9784138458
+**Audit:** review 2026-10-29 · mutation 2026-10-29 (98/121, 23 eq) · src 40833e1897ec4a6f
 
 **Hardening:** fuzz 2026-10-27 (240,000 runs clean, 4 seeds × 60 000, ReleaseSafe, after the decoder's checkless literal loop came back to life; 2026-10-15: 360,000 runs, ~25% decoded reach; input and exact output against a guard page) · ct n/a — compression only (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator + independent sweep of every pub entry point: no data-reachable panic; one-shot input past 4 GiB through `StreamWriter`, `parallel` jobs ≤ 1 GiB, prepared dictionary indexes its tail, an unbuffered reader ends the input, an empty `StreamWriter` buffer works, two dictionaries a checked panic)
 

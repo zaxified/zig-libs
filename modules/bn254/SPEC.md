@@ -6,7 +6,7 @@
 
 **Scope:** core — go-ethereum `core/vm` alt_bn128 precompiles + gnark-crypto (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-20 (426/441, 15 eq) · src f9b2f60f650f9b0a
+**Audit:** review 2026-09-03 · mutation 2026-11-20 (426/441, 15 eq) · src fe3ddef4519dd0b0
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BN254_FUZZ; ecadd and ecmul at 1/4, ecpairing at 1/10, algebra at 1/100 of it) · ct 2026-10-02 (ctgrind)
 

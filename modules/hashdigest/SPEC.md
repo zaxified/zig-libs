@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `crypto/sha256` + `crypto/sha512` + `crypto/sha3` + `encoding/hex` and RustCrypto `sha2`/`sha3`/`blake2`/`digest` (surveyed 2026-11-02)
 
-**Audit:** review 2026-07-18 · mutation 2026-11-19 (123/130, 7 eq) · src 75fcec3d84f8edd3
+**Audit:** review 2026-07-18 · mutation 2026-11-19 (123/130, 7 eq) · src 788c1cc257dc0d63
 
 **Hardening:** fuzz 2026-11-02 (checksum-file parser: 3,000,000 runs clean in ReleaseSafe, `HASHDIGEST_FUZZ`, every reach label hit) · ct n/a — digests; `blake3Keyed`'s key goes only into std's BLAKE3 and is wiped after (not ctgrind-checked) · burn 2026-11-02 (stackprobe of `blake3Keyed`/`blake3DeriveKey` clean at 16 KiB; red at 8 KiB for derive and with the burn removed) · panic 2026-11-02 (sweep HD-3: new inputs; the 2026-10-30 sweep predates the new code and the vectorised BLAKE2b)
 

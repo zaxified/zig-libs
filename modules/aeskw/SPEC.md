@@ -6,7 +6,7 @@
 
 **Scope:** core — RustCrypto `aes-kw` 0.3.1 (RFC 3394 + 5649) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-21 (64/66, 2 eq) · src 01d57db26f0c1f5d
+**Audit:** review 2026-08-06 · mutation 2026-11-21 (64/66, 2 eq) · src 6df02cc908918656
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean, AESKW_FUZZ); 2026-11-16 `unwrapPad` (200,000 driver runs clean, ReleaseSafe, AESKW_PAD_FUZZ; every outcome reached) · ct 2026-11-16 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap and the RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, AES-128/192/256; 12 in-file = each integrity verdict after its constant-time compare, twice per KEK size per construction)
 **Performance:** not measured

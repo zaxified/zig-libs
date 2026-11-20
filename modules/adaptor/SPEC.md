@@ -6,7 +6,7 @@
 
 **Scope:** core — secp256kfun `schnorr_fun::adaptor` (BIP340 adaptor signatures; no standard exists) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-14 (60/70, 10 eq) · src a274653f66e9d601
+**Audit:** review 2026-10-08 · mutation 2026-11-14 (60/70, 10 eq) · src 0d76800042370abc
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ADAPTOR_FUZZ; flow at 1/4 of it) · ct 2026-09-09 (ctgrind)
 

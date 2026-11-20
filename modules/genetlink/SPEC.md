@@ -6,7 +6,7 @@
 
 **Scope:** core — mdlayher/genetlink v1.4.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (200/211, 11 eq) · src 227d13c366852aeb
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (200/211, 11 eq) · src 1e7ba6e43afb899a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GENETLINK_FUZZ) · ct n/a — netlink codec (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: family check on group replies, `resolveMcastGroups` resets `out` on error, length mismatch checked panic; delta audit 13/13)
 

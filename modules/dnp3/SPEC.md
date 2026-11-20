@@ -6,7 +6,7 @@
 
 **Scope:** mvp — opendnp3 3.1.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-19 (139/144, 5 eq) · src 5585e9378e8d59d9
+**Audit:** review 2026-09-02 · mutation 2026-11-19 (139/144, 5 eq) · src 7d618e61016ae071
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DNP3_FUZZ: `dnp3-fragment` and `dnp3-session` over the structured hostile-field generator, plus damaged genuine reads and damaged link frames; `dnp3-sa` Secure Authentication wrap / MAC / g120 objects as an oracle; 2026-11-19 `dnp3-sa` extended to the SAv5 status-bound wrap, 4 × 50,000 seeds clean) · ct 2026-11-19 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict; SAv5 status-bound wrap `keys5` 6 = the same verdict per call site, see "Key-wrap layout")
 **Performance:** not measured

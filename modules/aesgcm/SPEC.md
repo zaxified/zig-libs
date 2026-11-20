@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 AES-GCM (EVP), against Go `crypto/cipher`, RustCrypto `aes-gcm`, ring and `std.crypto.aead.aes_gcm` (surveyed 2026-10-10)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-20 (140/160, 20 eq) · src 94532c8312b07304
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (140/160, 20 eq) · src 43af424c6670f136
 
 **Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192 and eight nonce/tag shapes) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict) · panic 2026-10-30 (sweep of every pub entry point + blind review: length contract a checked panic in every mode, over-limit ciphertext → AuthenticationFailed + zeroed m, test seams behind test_hooks; delta audit 10/11 + 2 call sites reachable only above 64 GiB)
 

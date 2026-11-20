@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `crypto/cipher` CBC (1.26), RustCrypto `cbc` 0.2.1 + `cts` + `block-padding`, OpenSSL 3.5 EVP AES-CBC / AES-CBC-CTS (surveyed 2026-09-30, gaps closed 2026-10-16)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-20 (142/152, 10 eq) · src 3d5fd62dd6f3fd87
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (142/152, 10 eq) · src ff7c34701076867b
 
 **Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-18 on Zig 0.17.0 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero; the verdict goes through the `rejectIf` asm barrier since 0.17 split iso7816's into two jumps, see `root.zig` `rejectIf`) · panic 2026-10-30 (sweep + blind review: length sums saturate, in-place padding total (`placeMsg`); delta audit 8/9 + 1 eq)
 

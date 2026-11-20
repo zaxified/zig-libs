@@ -6,7 +6,7 @@
 
 **Scope:** core — blst v0.3.17 (surveyed 2026-10-06; raised from mvp 2026-10-06 when all six ciphersuites, batch verification, EIP-2333 and the G1/G2 MSM landed)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-20 (60/64, 4 eq) · src db1c7931c4544e88
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (60/64, 4 eq) · src a73ca5ee40f9ca79
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BLS12_381_FUZZ; codec at 1/10, sign-verify at 1/200 of it) · ct 2026-10-02 (ctgrind)
 

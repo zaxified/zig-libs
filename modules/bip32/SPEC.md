@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `bip32` + rust-bip39 / bitcoinjs `bip39`+`bip32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-19 (266/287, 21 eq) · src 347ee7873ca59d7f
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (266/287, 21 eq) · src abae98b642c6f00a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BIP32_FUZZ; derive at 1/2 of it) · ct 2026-09-16 (ctgrind)
 

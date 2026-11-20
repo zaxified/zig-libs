@@ -6,7 +6,7 @@
 
 **Scope:** mvp — FRR isisd flooding (10.7) and holo-isis flooding (v0.9.0), ISO 10589 §7.3.15/.16 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src af21bfdbf6dffad7
+**Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src bb2ca33694622bae
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — LSP flooding (keyword review, 2026-10-07)
 

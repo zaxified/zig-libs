@@ -6,7 +6,7 @@
 
 **Scope:** parity — conntrack-tools / libnetfilter_conntrack, ti-mo/conntrack v0.6.0, florianl/go-conntrack v0.7.0 (surveyed 2026-11-03; every substantial feature is built or rejected with a reason, see "Compared with"; the only open items are outside this module: `nfnetlink_cttimeout`/`cthelper`)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-19 (348/361, 6 eq) · src f4a7e1f4e7f646b3
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (348/361, 6 eq) · src 5393cbd722e939fd
 
 **Hardening:** fuzz 2026-11-03 (`CONNTRACK_FUZZ=200000` per harness, ReleaseSafe, 3 harnesses: decode, decode of damaged corpus entries, dump engine over every request kind; clean, every per-decoder and per-engine-path reach label hit, `fz.Seen`) · ct n/a — netlink conntrack decoding (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `dump()` 1 Mi flow cap, DUMP_INTR and one-bad-record exits drain to DONE, `EventIterator` ends after a framing error; delta audit 21/21)
 

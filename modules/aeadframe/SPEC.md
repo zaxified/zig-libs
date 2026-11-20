@@ -6,7 +6,7 @@
 
 **Scope:** core — IPsec ESP (RFC 4303) / DTLS 1.3 record layer (RFC 9147 §5); no single reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-17 (79/82, 3 eq) · src 551b77868cdf0024
+**Audit:** review 2026-08-06 · mutation 2026-11-17 (79/82, 3 eq) · src 12960c74187ef162
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, AEADFRAME_FUZZ) · ct 2026-10-10 (ctgrind: channel keys + plaintext through seal/rekey/open, ChaCha20-Poly1305 and AES-256-GCM; 5 in-file each = AEAD verdicts + the rekey same-key verdict)
 **Performance:** not measured
