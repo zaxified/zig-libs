@@ -118,6 +118,8 @@ pub const FileSpool = rebody.FileSpool;
 // The branchless civil-from-days calendar, for the `Date` header. std has one
 // too, and it walks a year at a time from 1970 -- see `formatHttpDate`.
 const datefmt = @import("datefmt");
+const netaddr = @import("netaddr");
+const proxyproto = @import("proxyproto");
 const flate = std.compress.flate;
 const net = std.Io.net;
 const Reader = std.Io.Reader;
@@ -161,6 +163,21 @@ last_bind_error: ?[]const u8,
 /// Called once per request, from the connection's thread. Errors turn into
 /// a 500 when nothing was sent yet, otherwise the connection is closed.
 pub const Handler = *const fn (*Request, *ResponseWriter) anyerror!void;
+
+/// `Options.proxy_protocol`. Anyone can write a PROXY line, so a header is
+/// honored only from `trusted` peers (go-proxyproto's and nginx's rule): from
+/// any other peer it is `proxyproto.ReadError.UntrustedPeer`, the connection
+/// is dropped and `on_error` hears `request_refused` with that error and
+/// status 0. A LOCAL command, an UNSPEC family and a non-TCP family leave the
+/// socket peer as it is.
+pub const ProxyProtocol = struct {
+    /// Peers allowed to send a header. EMPTY TRUSTS NOBODY.
+    trusted: []const netaddr.Prefix,
+    /// A connection without a header is refused (`error.Missing`). True by
+    /// default: with `false`, a trusted peer's first request bytes are
+    /// examined as a candidate header (see `proxyproto.read`).
+    required: bool = true,
+};
 
 /// Verdict of an `on_connect` hook.
 pub const ConnDecision = enum { accept, reject };
@@ -531,6 +548,14 @@ pub const Options = struct {
     on_connect: ?OnConnectFn = null,
     /// Opaque pointer passed to `on_connect`.
     on_connect_ctx: ?*anyopaque = null,
+    /// PROXY protocol (HAProxy v1/v2) on the accept path: read the header a
+    /// balancer in front sends first, and serve the connection as the real
+    /// client's — `Request.peerAddress` (and so `ratelimit`, `abuseguard`,
+    /// `accesslog`) sees the address in the header. Null (default) reads
+    /// nothing. The hooks `on_connect`, `on_conn_state`, `on_conn_closed`
+    /// and `on_error` keep reporting the socket peer (the balancer): the
+    /// header is read after admission. See `ProxyProtocol`.
+    proxy_protocol: ?ProxyProtocol = null,
     /// Lend a connection its working memory one request at a time instead of
     /// taking the caller's for the whole connection. Null keeps the buffers
     /// the serving loop allocates per connection, which is what every caller
@@ -1634,6 +1659,29 @@ fn connMain(s: *Server, stream: net.Stream) void {
     s.register(&control);
     defer s.unregister(&control);
 
+    // PROXY protocol: the real client's address replaces the socket peer
+    // for everything the handler and the access-side modules see.
+    var peer = stream.socket.address;
+    if (o.proxy_protocol) |pp| {
+        var hbuf: [proxyproto.default_max_v2_len]u8 = undefined;
+        const got = proxyproto.read(&tr.reader, &hbuf, .{
+            .peer = netaddr.Ip.fromStd(stream.socket.address),
+            .trusted = pp.trusted,
+            .required = pp.required,
+            .max_v2_len = @min(proxyproto.default_max_v2_len, o.read_buffer_size),
+        }) catch |e| {
+            fireError(o.on_error, o.on_error_ctx, .request_refused, e, 0, stream.socket.address);
+            sum_end = if (tr.timed_out or tw.timed_out) connEnd(&tr, &tw) else .errored;
+            return;
+        };
+        if (got) |h| if (h.command == .proxy and (h.family == .tcp4 or h.family == .tcp6)) {
+            if (h.source) |src| switch (src) {
+                .inet => |i| peer = i.ip.toStd(i.port),
+                .unix => {},
+            };
+        };
+    }
+
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
     // through to the HTTP/1.1 loop below with nothing consumed. The stall
@@ -1662,7 +1710,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .server_name = o.server_name,
                 .error_headers = o.error_headers,
                 .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
-                .peer = stream.socket.address,
+                .peer = peer,
                 .max_header_bytes = o.max_header_bytes,
                 .max_body_bytes = o.max_body_bytes,
                 .response_buffer_size = o.response_buffer_size,
@@ -1700,7 +1748,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .server_name = o.server_name,
         .error_headers = o.error_headers,
         .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
-        .peer = stream.socket.address,
+        .peer = peer,
         .max_request_line_bytes = o.max_request_line_bytes,
         .max_body_bytes = o.max_body_bytes,
         .on_conn_state = o.on_conn_state,
@@ -10273,6 +10321,80 @@ test "integration: on_connect rejecting the peer refuses the connection" {
     }
     // A rejected connection is never admitted.
     try testing.expectEqual(@as(usize, 0), server.activeConnections());
+}
+
+/// Send `preamble` then (when it reads one back) one `/connmeta` request to a
+/// server started with `opts`; the body of the 200, or null when the server
+/// dropped the connection without answering.
+fn proxyProtocolProbe(opts: Options, preamble: []const u8, buf: []u8) !?[]const u8 {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var o = opts;
+    o.handler = testHandler;
+    var server = init(io, testing.allocator, o);
+    defer server.deinit();
+    server.bind() catch |err| {
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll(preamble);
+    try sw.interface.writeAll("GET /connmeta HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    var head_buf: [2048]u8 = undefined;
+    const head = h1.readHead(&sr.interface, &head_buf) catch return null;
+    const res = try h1.ResponseHead.parse(head);
+    if (res.status != 200) return null;
+    const body = try sr.interface.take(@intCast(res.content_length.?));
+    @memcpy(buf[0..body.len], body);
+    return buf[0..body.len];
+}
+
+test "integration: PROXY protocol v1 and v2 from a trusted peer set the request's peer" {
+    const trusted = [_]netaddr.Prefix{netaddr.parsePrefix("127.0.0.0/8").?};
+    var buf: [128]u8 = undefined;
+    const opts: Options = .{ .handler = testHandler, .proxy_protocol = .{ .trusted = &trusted } };
+
+    const v1 = (try proxyProtocolProbe(opts, "PROXY TCP4 203.0.113.9 10.0.0.1 4321 80\r\n", &buf)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("203.0.113.9:4321 #0", v1);
+
+    var hdr: [128]u8 = undefined;
+    var hw: Writer = .fixed(&hdr);
+    try proxyproto.writeV2(&hw, .{
+        .family = .tcp6,
+        .source = .{ .inet = .{ .ip = netaddr.parseIp("2001:db8::7").?, .port = 5555 } },
+        .destination = .{ .inet = .{ .ip = netaddr.parseIp("2001:db8::1").?, .port = 443 } },
+    }, "");
+    const v2 = (try proxyProtocolProbe(opts, hw.buffered(), &buf)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("[2001:db8::7]:5555 #0", v2);
+
+    // LOCAL (a balancer health check): the socket peer stays.
+    const local = (try proxyProtocolProbe(opts, "PROXY UNKNOWN\r\n", &buf)) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, local, "127.0.0.1:"));
+}
+
+test "integration: PROXY protocol refuses an untrusted peer, a missing header and a bad one" {
+    const trusted = [_]netaddr.Prefix{netaddr.parsePrefix("127.0.0.0/8").?};
+    var buf: [128]u8 = undefined;
+    const line = "PROXY TCP4 203.0.113.9 10.0.0.1 4321 80\r\n";
+    // Nobody trusted: the claimed address is never believed, nothing is served.
+    try testing.expect((try proxyProtocolProbe(.{ .handler = testHandler, .proxy_protocol = .{ .trusted = &.{} } }, line, &buf)) == null);
+    // Trusted but required, and none sent.
+    try testing.expect((try proxyProtocolProbe(.{ .handler = testHandler, .proxy_protocol = .{ .trusted = &trusted } }, "", &buf)) == null);
+    // Malformed.
+    try testing.expect((try proxyProtocolProbe(.{ .handler = testHandler, .proxy_protocol = .{ .trusted = &trusted } }, "PROXY TCP4 not-an-ip x 1 2\r\n", &buf)) == null);
+    // Off by default: the bytes are just a bad request, and the peer is the socket's.
+    try testing.expect((try proxyProtocolProbe(.{ .handler = testHandler }, line, &buf)) == null);
 }
 
 test "integration: activeConnections reflects an in-flight request" {
