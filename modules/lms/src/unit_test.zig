@@ -858,12 +858,12 @@ fn handBuiltHss(alloc: std.mem.Allocator, n_levels: usize, msg: []const u8, top:
     var off: usize = 4;
     for (0..n_levels - 1) |i| {
         const child = trees[i + 1].publicKey().toBytes();
-        trees[i].sign(0, &child, out[off..][0..sl]);
+        _ = try trees[i].sign(0, &child, out[off..][0..sl]);
         off += sl;
         @memcpy(out[off..][0..pk_len], &child);
         off += pk_len;
     }
-    trees[n_levels - 1].sign(0, msg, out[off..][0..sl]);
+    _ = try trees[n_levels - 1].sign(0, msg, out[off..][0..sl]);
     top.* = trees[0].publicKey();
     return out;
 }
