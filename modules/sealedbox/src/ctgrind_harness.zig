@@ -54,7 +54,7 @@
 //! ✅ Fixed the same day: the module carries its own table-free codecs for
 //! secret material (`b64ct` for base64, `root.zig`'s `ctHexChar`/
 //! `ctHexNibble`). **Encoders are now exact 0; `hexdec` is exact 1.** `b64dec`
-//! is exact 0 since: `b64ct` declassifies the verdict it returns
+//! is exact 0: `b64ct` declassifies the verdict it returns
 //! (its contract makes it public), so the accept/reject is no longer reported.
 //!
 //! ⚠ **`hexdec`'s 1 is the right answer and a 0 would be wrong.** It is
