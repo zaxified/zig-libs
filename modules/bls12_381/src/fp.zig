@@ -20,9 +20,8 @@
 //! This replaces the previous `std.crypto.ff`-backed field, which kept
 //! elements canonical (non-Montgomery) at rest and paid a full Montgomery
 //! round-trip (2×toMontgomery + montMul + fromMontgomery) on every
-//! multiply over 63-bit redundant limbs (measured `Fp.mul` ≈ 1259 ns; see
-//! `audit/modules/bls12_381.md` finding F2). The Montgomery-resident field
-//! below removes both costs. The public API shape (method names /
+//! multiply over 63-bit redundant limbs (measured `Fp.mul` ≈ 1259 ns). The
+//! Montgomery-resident field below removes both costs. The public API shape (method names /
 //! signatures) is unchanged, so the whole `Fp2`/`Fp6`/`Fp12` tower and the
 //! `G1`/`G2`/pairing/hash-to-curve/kzg/bls_sig code above it is untouched
 //! — the single exception is `hash_to_curve.zig`'s wide reduction, which
@@ -593,7 +592,7 @@ pub const Fp = struct {
     /// limb-wise merge on the Montgomery representation). The mask goes
     /// through `blackBox`: without it, once `ctSelect` is inlined into the
     /// `G1`/`G2` ladders LLVM recovers `cond ∈ {0,1}` from the scalar bit and
-    /// lowers the merge to a conditional jump — measured 2026-10-02 (ctgrind,
+    /// lowers the merge to a conditional jump — measured (ctgrind,
     /// `fp.zig` ctSelect inside `scalarMulBytes`, every BLS secret-key
     /// multiplication), the same defect `bn254`'s `ctSelect` closed earlier.
     pub fn ctSelect(cond: bool, a: Fp, b: Fp) Fp {

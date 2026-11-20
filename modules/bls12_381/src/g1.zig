@@ -322,7 +322,7 @@ pub const Jacobian = struct {
     /// pairing result (a real, exploited class of bug in early BLS
     /// implementations). The identity passes (it is in `G1`).
     ///
-    /// Construction (2026-09-15, A1 `drand` F4): the GLV-endomorphism
+    /// Construction (A1 `drand` F4): the GLV-endomorphism
     /// membership test `φ(P) == [-x²]P`, `φ(x, y) = (βx, y)`, `x` the
     /// BLS seed — Scott, "A note on group membership tests for G1, G2
     /// and GT on BLS pairing-friendly curves" (ePrint 2021/1130) §6, with
@@ -351,7 +351,7 @@ pub const Jacobian = struct {
         return eqlPoints(endomorphismPhi(self), x2p.negate());
     }
 
-    /// The pre-2026-09-15 subgroup check, `[r]P == O` via the
+    /// The earlier subgroup check, `[r]P == O` via the
     /// constant-time 255-bit ladder. Kept ONLY as the reference the
     /// differential tests hold `subgroupCheck` against (it is the
     /// definition of the subgroup, so it needs no cited theorem); no
@@ -517,7 +517,7 @@ fn recoverY(x: Fp, sort: bool) G1Error!Fp {
 /// (`error.NotInSubgroup`). The point at infinity is accepted; callers
 /// that must refuse it (public keys) check `infinity` themselves.
 /// Safe on bytes from a peer — the checking decoder is the default, as
-/// in zkcrypto `bls12_381` and arkworks (2026-10-03: coconut's verifier
+/// in zkcrypto `bls12_381` and arkworks (coconut's verifier
 /// trusted an unchecked decode and accepted a cofactor-order point).
 pub fn fromBytesUncompressed(bytes: [uncompressed_bytes]u8) G1Error!Affine {
     const p = try fromBytesUncompressedUnchecked(bytes);
@@ -650,7 +650,7 @@ test "fromBytesCompressed rejects the compression flag unset" {
 }
 
 test "infinity encodings: only the canonical all-zero form is accepted" {
-    // Mutation run 2026-10-05: none of these refusals had a test.
+    // Mutation run: none of these refusals had a test.
     var u = toBytesUncompressed(Affine.identity);
     try std.testing.expect((try fromBytesUncompressed(u)).infinity);
     u[0] |= 0x01; // a coordinate bit under the infinity flag

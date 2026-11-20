@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! threshold — Part 6 of the `bls12_381` arc: **trusted-dealer**
 //! threshold BLS over any Basic or ProofOfPossession ciphersuite of
-//! `scheme.zig` (`Threshold(variant, scheme)`, generalised 2026-11-17 the
+//! `scheme.zig` (`Threshold(variant, scheme)`, generalised the
 //! way `scheme.zig` generalised the signatures). The file-level names are
 //! the min-pk POP instance `MinPk` (public keys/shares in `G1`,
 //! signatures/partial signatures in `G2` — Part 4's `bls_sig.zig`
@@ -47,7 +47,7 @@
 //! participants, not merely a different `splitSecretKey` signature, and
 //! would be a distinct follow-up module/part.
 //!
-//! **Status: COMPLETE (crypto-core pass 2026-07-14).** Every function
+//! **Status: COMPLETE (crypto-core pass).** Every function
 //! is real: the Shamir polynomial evaluation (`evalPolynomialAt`),
 //! Feldman commitment computation (`feldmanCommitCoefficient`), Feldman
 //! evaluation-in-the-exponent (`derivePublicKeyShare`), and Lagrange
@@ -733,7 +733,7 @@ test "VerificationVector.fromBytesAlloc rejects a length/count mismatch" {
     try std.testing.expectError(error.InvalidEncoding, VerificationVector.fromBytesAlloc(allocator, &bytes));
 
     // Trailing bytes past the declared count are refused too (mutation
-    // run 2026-10-05: `!=` weakened to `<` survived).
+    // run: `!=` weakened to `<` survived).
     var long = @as([4 + g1.compressed_bytes + 1]u8, @splat(0));
     std.mem.writeInt(u32, long[0..4], 1, .big);
     long[4..][0..g1.compressed_bytes].* = g1.toBytesCompressed(g1.Affine.generator);

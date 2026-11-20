@@ -350,8 +350,8 @@ test "keyGen is deterministic (same IKM/key_info -> same SK) and produces a nonz
 
 test "keyGen matches an independent Python recomputation of the -05 construction" {
     // NOT an external KAT (the draft has none, see keyGen's doc comment):
-    // the -05 text above re-implemented with Python's hmac/hashlib
-    // (2026-10-05), so the IKM || I2OSP(0, 1) suffix, the I2OSP(L, 2)
+    // the -05 text above re-implemented with Python's hmac/hashlib,
+    // so the IKM || I2OSP(0, 1) suffix, the I2OSP(L, 2)
     // info suffix and the raw first-iteration salt are each pinned. The
     // mutation run of that date dropped the I2OSP(0, 1) octet and nothing
     // failed.
@@ -421,7 +421,7 @@ test "aggregate is commutative/associative over G2 points (property; no signatur
 test "aggregate KAT: three published signatures over the same message combine to the published aggregate" {
     // Source: ethereum/bls12-381-tests, tag v0.1.2, JSON encoding,
     // aggregate/aggregate_0xabab...ab.json (message = 32 bytes of
-    // 0xab). Downloaded 2026-07-14 from
+    // 0xab). Downloaded from
     // https://github.com/ethereum/bls12-381-tests/releases/download/v0.1.2/bls_tests_json.tar.gz
     // — see NOTICE. This is the same ciphersuite/vector family the
     // Ethereum consensus-spec-tests general/phase0/bls/aggregate suite

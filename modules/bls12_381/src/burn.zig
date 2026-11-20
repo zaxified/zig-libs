@@ -11,11 +11,11 @@
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -33,23 +33,22 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `keyGen` (HKDF-SHA-256 + `Fr.reduceWide`) dirtied 2.2 KiB in ReleaseFast
-/// (2026-10-09).
+/// `keyGen` (HKDF-SHA-256 + `Fr.reduceWide`) dirtied 2.2 KiB in ReleaseFast.
 pub const keygen_burn = 8 * 1024;
 
-/// The `SecretKey` / `SecretKeyShare` codecs dirtied 0.6 KiB (2026-10-09).
+/// The `SecretKey` / `SecretKeyShare` codecs dirtied 0.6 KiB.
 pub const codec_burn = 4 * 1024;
 
 /// A secret-scalar multiply: `skToPk` 6.3 KiB (G1) / 12.6 KiB (G2), `sign`
 /// and `popProve` ≤ 16.5 KiB (hash-to-G2 + G2 multiply), `partialSign`
-/// 16.5 KiB, `splitSecretKey` 6.6 KiB in ReleaseFast (2026-10-09).
+/// 16.5 KiB, `splitSecretKey` 6.6 KiB in ReleaseFast.
 pub const sign_burn = 32 * 1024;
 
 /// EIP-2333: a child derivation holds two 8 KiB Lamport keys and their 16 KiB
-/// public key; it dirtied 35 KiB in ReleaseFast (2026-10-09).
+/// public key; it dirtied 35 KiB in ReleaseFast.
 pub const derive_burn = 64 * 1024;
 
 /// `Fr.randomInto` (the drawn bytes, the by-value `fromBytes` argument and the
 /// Montgomery conversion temporaries; the fail-closed `entropy.fill` frames
-/// below it) -- sized with the `keygen_burn` margin (2026-11-19).
+/// below it) -- sized with the `keygen_burn` margin.
 pub const random_burn = 8 * 1024;

@@ -8,7 +8,7 @@
 //!
 //! **Status: implemented** — arithmetic is `montint.Field(r)`: Montgomery
 //! form, built only from montint's constant-time primitives. Until
-//! 2026-10-02 it delegated to `std.crypto.ff`, which is NOT constant-time
+//! it delegated to `std.crypto.ff`, which is NOT constant-time
 //! in ReleaseFast (ctgrind: `montgomeryMul`'s extra-reduction select and
 //! `powWithEncodedExponent`'s window select compile to conditional jumps),
 //! so every `mul` over a secret key or share leaked. `modulus` (the ff

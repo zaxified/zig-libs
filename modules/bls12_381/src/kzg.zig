@@ -10,9 +10,9 @@
 //! constant-size (48-byte) proof — the primitive behind Ethereum's blob
 //! transactions (EIP-4844) and every KZG-based data-availability scheme.
 //!
-//! **Status: COMPLETE (crypto-core pass 2026-07-14).** Model-after:
+//! **Status: COMPLETE (crypto-core pass).** Model-after:
 //! `consensus-specs` `specs/deneb/polynomial-commitments.md` (fetched
-//! 2026-07-14 from `github.com/ethereum/consensus-specs` `master` branch
+//! from `github.com/ethereum/consensus-specs` `master` branch
 //! — see `NOTICE` for the exact commit-independent citation and every
 //! constant's provenance; re-fetched and re-read line-by-line during the
 //! crypto-core pass, not recalled). Everything is REAL: the
@@ -293,7 +293,7 @@ fn jacScalarMulVartime(p: g1.Jacobian, s: []const u8) g1.Jacobian {
 
 /// Variable-time `[r]P == O` subgroup check. It WAS the trusted-setup
 /// loader's `G1` check (~3x faster than the old constant-time `[r]P`
-/// form); since 2026-09-15 `g1.Jacobian.subgroupCheck` is an endomorphism
+/// form); `g1.Jacobian.subgroupCheck` is an endomorphism
 /// test that is faster still, so the loader uses that, and this stays
 /// only as an independent reference the tests below compare it with.
 fn subgroupCheckVartime(p: g1.Jacobian) bool {

@@ -225,7 +225,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
@@ -332,7 +332,7 @@ fn lamportNeedles(n: *Needles, parent: Fr, index: u32) void {
 }
 
 // ── API adapter: the only place that names the shapes under test ────────────
-// (BEFORE the 2026-10-09 fix these took and returned the secrets by value.)
+// (BEFORE the fix these took and returned the secrets by value.)
 
 const MinPkPop = bls_sig.MinPkPop;
 const MinSigBasic = bls_sig.MinSigBasic;

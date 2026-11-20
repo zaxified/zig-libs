@@ -72,7 +72,7 @@ pub const Fp2 = struct {
 
     /// REAL: zero iff both components are.
     /// One accumulator over both components: `c0.isZero() and
-    /// c1.isZero()` short-circuits, a branch on `c0` — measured 2026-10-02
+    /// c1.isZero()` short-circuits, a branch on `c0` — measured
     /// (ctgrind) inside `G2.Jacobian.add`'s identity checks on the ladder's
     /// secret-derived accumulator.
     pub fn isZero(self: Fp2) bool {

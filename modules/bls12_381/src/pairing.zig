@@ -20,9 +20,9 @@
 //!      it in the order-`r` cyclotomic subgroup `Gt` — see that
 //!      function's doc comment for the standard easy/hard split.
 //!
-//! **Status: implemented** (Part-2 crypto-core pass, 2026-07-14).
+//! **Status: implemented** (Part-2 crypto-core pass).
 //! `multiMillerLoop` is the real optimal-ate loop (inversion-free
-//! Jacobian D-type-twist line evaluation since 2026-09-16 — see
+//! Jacobian D-type-twist line evaluation — see
 //! `TwistPoint`; shared accumulator, allocation-free batching);
 //! `finalExpHardPart` is the real Hayashida-Hayasaka-Teruya exact-`d`
 //! cyclotomic chain (see its doc comment for why the FCKRH `3d` chain
@@ -190,8 +190,7 @@ pub const PairingPair = struct {
 /// `g2.zig`'s `subgroupCheck`/`clearCofactor` apply to their own
 /// deferred Bowe fast paths (`SPEC.md` Backlog).
 ///
-/// ⚠ Measured before assuming it is the big one (2026-09-16,
-/// ReleaseFast, `drand`'s 2-pair beacon check): dense `Fp12.mul` is
+/// ⚠ Measured before assuming it is the big one (ReleaseFast, `drand`'s 2-pair beacon check): dense `Fp12.mul` is
 /// 7.7 µs and the walk makes ~137 of them = 1.06 ms, plus 63 squarings
 /// at 5.7 µs = 0.36 ms. A sparse multiply saves a fraction of the
 /// former — worth roughly 0.3 ms of a then-10.01 ms verification. The
@@ -239,7 +238,7 @@ const miller_batch_max = 8;
 /// steps advance: `g2.Jacobian` (`x = X/Z²`, `y = Y/Z³`) — this module's
 /// own audited, complete group law (`g2.zig`), NOT a second copy of it.
 ///
-/// It was AFFINE until 2026-09-16, which made the chord/tangent slope
+/// It was AFFINE previously, which made the chord/tangent slope
 /// `λ` explicit at the cost of one `Fp2.inv` per step per pair. Measured
 /// (ReleaseFast, process CPU time, 7 interleaved reps, `drand`'s 2-pair
 /// beacon check): `Fp2.inv` 42.8 µs x 136 inversions per verification
@@ -323,7 +322,7 @@ fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
 /// factor to a power, which stays in `Fp2*`. Pinned by the test "an Fp2
 /// factor on a line value does not change the pairing"; the whole
 /// construction is pinned by the byte-exact `e(G1, G2)` KAT below, which
-/// did NOT move when the steps went projective (2026-09-16).
+/// did NOT move when the steps went projective.
 fn lineValue(c00: Fp2, c01: Fp2, c11: Fp2) Fp12 {
     return .{
         .c0 = .{ .c0 = c00, .c1 = c01, .c2 = Fp2.zero },
@@ -781,7 +780,7 @@ test "pairing with either input at infinity is 1 (and skips the line math)" {
 
 // ── the AFFINE Miller loop, kept as a test-only reference ───────────────
 //
-// This is the implementation the module shipped until 2026-09-16, when
+// This is the implementation the module shipped previously, when
 // `doublingStep`/`additionStep` went Jacobian to stop paying an `Fp2.inv`
 // per step (see `TwistPoint`). It is retained here, and ONLY here, as the
 // differential oracle for that change — the same role `g2.zig` gives

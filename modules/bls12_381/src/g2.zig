@@ -280,7 +280,7 @@ pub const Jacobian = struct {
     /// in the order-`r` subgroup. Same pitfall/reasoning as `g1.zig`'s
     /// `Jacobian.subgroupCheck`; the identity passes.
     ///
-    /// Construction (2026-09-15, A1 `drand` F4): `ψ(P) == [x]P`, `ψ` the
+    /// Construction (A1 `drand` F4): `ψ(P) == [x]P`, `ψ` the
     /// untwist-Frobenius-twist endomorphism — Scott, ePrint 2021/1130 §4
     /// ("the endomorphism test becomes simply a matter of confirming that
     /// ψ(Q) = uQ"), whose proof El Housni–Guillevic–Piellard (ePrint
@@ -301,7 +301,7 @@ pub const Jacobian = struct {
         return eqlPoints(endomorphismPsi(self), mulByAbsXPublic(self).negate());
     }
 
-    /// The pre-2026-09-15 check, `[r]P == O` via the constant-time
+    /// The earlier check, `[r]P == O` via the constant-time
     /// ladder — the test-only reference (see `g1.zig`'s twin).
     fn subgroupCheckByOrder(self: Jacobian) bool {
         return scalarMulBytes(self, &scalarmod.r_bytes).isIdentity();
@@ -444,7 +444,7 @@ fn recoverY(x: Fp2, sort: bool) G2Error!Fp2 {
 /// (`error.NotInSubgroup`). The point at infinity is accepted; callers
 /// that must refuse it (public keys) check `infinity` themselves.
 /// Safe on bytes from a peer — the checking decoder is the default, as
-/// in zkcrypto `bls12_381` and arkworks (2026-10-03: coconut's verifier
+/// in zkcrypto `bls12_381` and arkworks (coconut's verifier
 /// trusted an unchecked decode and accepted a cofactor-order point).
 pub fn fromBytesUncompressed(bytes: [uncompressed_bytes]u8) G2Error!Affine {
     const p = try fromBytesUncompressedUnchecked(bytes);
@@ -582,7 +582,7 @@ test "fromBytesCompressed rejects the compression flag unset" {
 }
 
 test "infinity encodings: only the canonical all-zero form is accepted" {
-    // Mutation run 2026-10-05: none of these refusals had a test.
+    // Mutation run: none of these refusals had a test.
     var u = toBytesUncompressed(Affine.identity);
     try std.testing.expect((try fromBytesUncompressed(u)).infinity);
     u[0] |= 0x01;
