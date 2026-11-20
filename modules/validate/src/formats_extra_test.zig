@@ -57,7 +57,7 @@ test "urn_rfc2141: the NID urn and unescaped reserved characters fail (RFC 2141 
     try expectAll(.urn_rfc2141, &.{ "urn:isbn:a%2Fb", "urn:a:b" }, &.{ "urn:urn:x", "URN:UrN:x", "urn:isbn:a/b", "urn:isbn:a?b", "urn:isbn:a#b" });
 }
 
-// ── mutation run 2026-11-05: boundaries and checksums no vector pinned ──────
+// ── mutation run: boundaries and checksums no vector pinned ──────
 
 test "rgb, rgba: no mixed percent and integer, an alpha above 1 is no alpha" {
     try expectAll(.rgb, &.{"rgb(10%,20%,30%)"}, &.{ "rgb(10%,20,30)", "rgb(10%,20%,30)", "rgb(10,20%,30)" });

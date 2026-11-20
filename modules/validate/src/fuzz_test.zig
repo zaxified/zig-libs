@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Support for validate's deterministic fuzz driver (added 2026-10-09): the
+//! Support for validate's deterministic fuzz driver: the
 //! source adapter `testing.fuzz` feeds the harnesses through, and reach
 //! labels. The harness bodies and the driver tests live in `root.zig` beside
 //! the private body/format builders they share with the corpus guards.

@@ -9,23 +9,19 @@
 //! tiers that peel apart cleanly:
 //!
 //! - **Validator core** (no HTTP anywhere): a `Rule` set — `required`, type
-//!   (`string`/`int`/`float`/`bool`/`array`/`object`), `min`/`max` (numeric,
-//!   inclusive), `min_len`/`max_len` (string chars / array items), `one_of`
-//!   (the JSON-Schema `enum` keyword — `enum` is a Zig keyword), `none_of`,
-//!   exclusive `gt`/`lt`, `ignore_case`, `pattern` and `patterns`
-//!   (literal, prefix, suffix, charset, contains, excludes and their negations
-//!   — **regex is the caller's**, see below), `omit_empty`/`omit_zero`,
-//!   `any_of`, per-rule `code`/`message`, `format` (the JSON Schema 2020-12 `format` vocabulary as
-//!   assertions: `email`, `uri`/`uri_reference`, `uuid`, `ipv4`/`ipv6`,
-//!   `hostname`, `date`/`time`/`date_time`, `duration`, `json_pointer`, and
-//!   since 2026-10-11 go-playground's `uuid3/4/5/7`, `http_url`, `base64*`,
-//!   `hex`, `e164`, `alpha`, `alphanumeric`, `numeric`, `ascii`,
-//!   `lowercase`/`uppercase`, `jwt`, `semver`, `cidr`, `mac` —
-//!   also standalone via `validateFormat`), cross-field rules (`Rule.cross`:
-//!   `eq_field` .. `excluded_without_all`) and a `custom` predicate —
-//!   validated against a `std.json.Value`. A JSON array can be the document
-//!   root (`validateJsonRoot`, `[]const T` bodies).
-//!   Every error is **aggregated** into `{ path, code, message }` — never
+//!   (`string`/`int`/`float`/`bool`/`array`/`object`), `min`/`max` (numeric, inclusive),
+//!   `min_len`/`max_len` (string chars / array items), `one_of` (the JSON-Schema `enum` keyword —
+//!   `enum` is a Zig keyword), `none_of`, exclusive `gt`/`lt`, `ignore_case`, `pattern` and
+//!   `patterns` (literal, prefix, suffix, charset, contains, excludes and their negations —
+//!   **regex is the caller's**, see below), `omit_empty`/`omit_zero`, `any_of`, per-rule
+//!   `code`/`message`, `format` (the JSON Schema 2020-12 `format` vocabulary as assertions:
+//!   `email`, `uri`/`uri_reference`, `uuid`, `ipv4`/`ipv6`, `hostname`, `date`/`time`/`date_time`,
+//!   `duration`, `json_pointer`, and go-playground's `uuid3/4/5/7`, `http_url`, `base64*`, `hex`,
+//!   `e164`, `alpha`, `alphanumeric`, `numeric`, `ascii`, `lowercase`/`uppercase`, `jwt`,
+//!   `semver`, `cidr`, `mac` — also standalone via `validateFormat`), cross-field rules
+//!   (`Rule.cross`: `eq_field` .. `excluded_without_all`) and a `custom` predicate — validated
+//!   against a `std.json.Value`. A JSON array can be the document root (`validateJsonRoot`,
+//!   `[]const T` bodies). Every error is **aggregated** into `{ path, code, message }` — never
 //!   fail-fast; users hate fixing one field at a time (pydantic behavior).
 //! - **Body**: the idiomatic **typed** style `parseInto(T, gpa, body)` — a
 //!   comptime-reflected schema derived from struct `T` (field types → kinds,
@@ -67,11 +63,12 @@
 //! middleware and the handler must preserve `ctx.data` (the router's
 //! cooperative-scratch convention) or the getters return null.
 //!
-//! Regex `pattern`: the repo has no regex engine, so `Pattern.matcher` takes
+//! Regex `pattern`: this module has no regex engine of its own (the repo's
+//! `regex` module is not a dependency), so `Pattern.matcher` takes
 //! the caller's (any `fn (ctx, string) bool` — a regex library, a hand-written
 //! check) together with the expression's source text, which this module never
 //! interprets: it is what the exported JSON Schema's `pattern` says and what
-//! the error message quotes (decision 2026-09-30).
+//! the error message quotes (decision).
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -118,7 +115,7 @@ const Value = std.json.Value;
 /// carrying `required`, `format`, `min_len`, `max_len`, `one_of` and
 /// `pattern` returned `ok() == true` for input that violated all of them.
 /// A validator that fails open by default is worse than no validator, because
-/// someone is relying on it. Audit 2026-09-02.
+/// someone is relying on it. Audit.
 pub const Kind = enum { string, int, float, bool, array, object, any };
 
 /// String pattern: four built-in shapes, or a caller-supplied matcher (see
@@ -193,7 +190,7 @@ pub const Matcher = struct {
 /// - `json_pointer` — RFC 6901: "" or `/`-prefixed, `~` only as `~0`/`~1`.
 ///
 /// The formats below `json_pointer` are go-playground/validator's, not JSON
-/// Schema's (2026-10-11); each cites the baked-in it follows. All are pure
+/// Schema's; each cites the baked-in it follows. All are pure
 /// byte-level checks (no allocation, never a panic).
 ///
 /// - `uuid3` / `uuid4` / `uuid5` — go's regexes: **lowercase** hex only, the
@@ -226,7 +223,7 @@ pub const Matcher = struct {
 /// - `mac` — Go's `net.ParseMAC`: 6, 8 or 20 octets as `xx:xx:..`, `xx-xx-..`,
 ///   `xxxx.xxxx.xxxx` or unseparated hex (`isMAC`, 495).
 ///
-/// Second wave (2026-11-05), also go-playground's tags (names as there); the
+/// Second wave, also go-playground's tags (names as there); the
 /// bodies are `formats_extra.zig`, tables `format_tables.zig`. The `*_addr`
 /// formats are SYNTAX ONLY: a literal IP (plus a numeric port where the tag has
 /// one); the rival resolves names, a validator of untrusted input does no I/O.
@@ -449,8 +446,7 @@ pub const Rule = struct {
     /// CHARACTERS while `std.json` still decodes 16 BYTES: `"éééééééé"` (16
     /// bytes, 8 code points) was rejected as too short although it decodes
     /// perfectly, and a 16-code-point/17-byte string passed the rule and then
-    /// failed inside `parseFromValue` as an unpathed root `invalid`. Audit
-    /// 2026-09-02.
+    /// failed inside `parseFromValue` as an unpathed root `invalid`. Audit.
     min_bytes: ?usize = null,
     max_bytes: ?usize = null,
     /// One-of allow-list (the JSON Schema `enum` keyword; named `one_of`
@@ -816,7 +812,7 @@ const Builder = struct {
         // ⛔ The cap is checked BEFORE the message is formatted. It used to be
         // checked only inside `append`, so every error past the cap still
         // paid an `allocPrint` into the report arena and was then dropped on
-        // the floor. Measured (audit 2026-09-02): a 996 KiB body of 340 000
+        // the floor. Measured: a 996 KiB body of 340 000
         // nodes -- all of it inside the DEFAULT `Limits` -- built 339 000
         // formatted messages nobody could read and left an 18 802 KiB report
         // arena behind, for the 1000 errors it retained. `Builder.append`'s
@@ -1220,13 +1216,13 @@ fn intFloatOrder(a: i128, f: f64) ?std.math.Order {
 
 /// Order of two numeric values, null when either is not a number. Integers
 /// -- past i64 too, as digits -- compare exactly with each other and with a
-/// float (review 2026-10-24 M2: `18446744073709551615` and
+/// float (review M2: `18446744073709551615` and
 /// `18446744073709551614` were equal as f64); anything else as f64.
 fn numberOrder(x: Value, y: Value) ?std.math.Order {
     // An integer text past i128 against a value inside the i128 range (an
     // exact integer, or a float in [-2^127, 2^127)): the text is the larger
     // in magnitude, so its sign decides. f64 would round both and could call
-    // them equal (review 2026-10-24: `170141183460469231731687303715884105727`
+    // them equal (review: `170141183460469231731687303715884105727`
     // == `170141183460469231731687303715884105728`).
     if (bigIntNegative(y)) |neg| if (inI128Domain(x)) return if (neg) .gt else .lt;
     if (bigIntNegative(x)) |neg| if (inI128Domain(y)) return if (neg) .lt else .gt;
@@ -1662,7 +1658,7 @@ fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) All
     //
     // `.any` now means "any TYPE is acceptable"; whatever type does arrive is
     // held to the constraints the rule states. A rule with no constraints is
-    // unaffected, which is what `.any` was for. Audit 2026-09-02.
+    // unaffected, which is what `.any` was for. Audit.
     const effective: Kind = if (rule.kind != .any) rule.kind else switch (v) {
         .string => .string,
         .integer, .number_string => .int,
@@ -1678,8 +1674,8 @@ fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) All
                 // Written as "not inside", so a NaN fails every bound it has.
                 // ⛔ `n < m` / `n > m` are both false for NaN: query `x=nan`
                 // passed `min = 0, max = 100` (pydantic refuses it;
-                // `query_oracle_test.zig`, 2026-10-06). JSON cannot spell NaN.
-                // An integer is held to the bound exactly (review 2026-10-24
+                // `query_oracle_test.zig`). JSON cannot spell NaN.
+                // An integer is held to the bound exactly (review
                 // M8: `9007199254740993` passed `max = 9007199254740992` as
                 // f64); a null order (NaN) fails both.
                 if (rule.min) |m| if (boundOrder(v, n, m)) |o| {
@@ -1698,13 +1694,13 @@ fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) All
                 // A value that survived the type gate but whose numeric text
                 // cannot be parsed fails CLOSED — never silently treated as 0.
                 // `effective`, not `rule.kind`: an `.any` rule has no type
-                // of its own (review 2026-10-24 M1: a hand-built
+                // of its own (review M1: a hand-built
                 // `.number_string` reached `appendTypeError(.any)`).
                 try appendTypeError(b, path, effective);
             }
             // go-playground's `oneof` on a number (`oneof=5 7 9`): each entry
             // is a JSON number text, compared by value (integers exactly).
-            // ⛔ An `.int`/`.float` rule ignored `one_of` before 2026-10-24,
+            // ⛔ An `.int`/`.float` rule ignored `one_of` before,
             // while the schema it exported listed the entries as strings and
             // so refused every number.
             if (rule.one_of) |allowed| if (rule.kind != .any and numValue(v) != null and !oneOfNumber(allowed, v)) {
@@ -1791,7 +1787,7 @@ fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) All
 /// ⛔ The literal used to count as an int only when it parsed as an i64, so
 /// `100000000000000000000000` was `int_type` while the same number spelled
 /// `1e23` passed; JSON Schema says integer for both (python-jsonschema and
-/// ajv, `schema_oracle_test.zig`, 2026-10-05). Bounds still compare as f64;
+/// ajv, `schema_oracle_test.zig`). Bounds still compare as f64;
 /// a typed `parseInto` bounds every integer field by its bit width.
 fn typeGate(v: Value, kind: Kind) bool {
     return switch (kind) {
@@ -1865,9 +1861,9 @@ fn needsWholeContainer(rule: *const Rule) bool {
 ///
 /// ⛔ They used to be checked on strings only, so `.{ .kind = .any, .one_of
 /// = &.{"red", "green"} }` accepted `5`, `true`, `null`, `[]` and `{}` --
-/// the `.any` fail-open of the 2026-09-02 audit, left on two constraints --
+/// the `.any` fail-open of the audit, left on two constraints --
 /// while the schema the module exports for the same rule refused them all
-/// (python-jsonschema and ajv, `schema_oracle_test.zig`, 2026-10-05).
+/// (python-jsonschema and ajv, `schema_oracle_test.zig`).
 fn checkNotAString(b: *Builder, path: []const u8, rule: *const Rule) Allocator.Error!void {
     if (rule.one_of) |allowed| try b.appendEnumError(path, allowed);
     if (rule.pattern) |p| if (p == .literal)
@@ -1924,7 +1920,7 @@ fn countComparison() bool {
 /// spelling; any other number as its f64 (`numberOrder` compares those as
 /// f64 too). Object members are hashed in the order of their own hashes, so
 /// member order does not matter -- sorted, not summed: a sum of hashes under
-/// a public key falls to a generalized-birthday attack (review 2026-10-24),
+/// a public key falls to a generalized-birthday attack,
 /// which would put crafted objects in one run of `firstDuplicate`.
 fn jsonHash(a: Allocator, v: Value) Allocator.Error!u128 {
     var h = JsonHasher.init(&json_hash_key);
@@ -2099,8 +2095,7 @@ fn decodeAt(s: []const u8, i: *usize) ?u21 {
 ///
 /// ⛔ It used to test BYTES: with the set `¢ü` (C2 A2 C3 BC) the string `â`
 /// (C3 A2) passed, every byte being in the set, while the exported
-/// `^[¢ü]*$` refuses it (python-jsonschema and ajv, schema_oracle_test.zig,
-/// 2026-10-05). ASCII sets answer as before.
+/// `^[¢ü]*$` refuses it (python-jsonschema and ajv, schema_oracle_test.zig). ASCII sets answer as before.
 fn inCharset(s: []const u8, set: []const u8) bool {
     const view = std.unicode.Utf8View.init(s) catch return false;
     var it = view.iterator();
@@ -2452,7 +2447,7 @@ fn uriSchemeLen(s: []const u8) ?usize {
 /// IP-literal host of an authority (§3.2.2), `[` IPv6address `]` or
 /// `[v` HEXDIG+ `.` … `]`. Anywhere else (`https://examp[e.com`, `[::1]]`)
 /// the reference is not a URI; go-playground's `uri` refuses both (go format
-/// oracle, 2026-10-24) and so does this. `rest` is what follows the scheme.
+/// oracle) and so does this. `rest` is what follows the scheme.
 fn uriBracketsOk(rest: []const u8) bool {
     if (std.mem.findAny(u8, rest, "[]") == null) return true;
     if (!std.mem.startsWith(u8, rest, "//")) return false;
@@ -2647,7 +2642,7 @@ fn allDigits(s: []const u8) bool {
     return true;
 }
 
-// ── go-playground formats (2026-10-11) ──────────────────────────────────────
+// ── go-playground formats ──────────────────────────────────────
 //
 // Each is a byte-level scan of `s`: no allocation, no recursion, a bounded
 // loop over the input, and any byte sequence (empty, huge, not UTF-8) is simply
@@ -3116,7 +3111,7 @@ fn assertLookup(comptime P: type) void {
 /// Coerce one string value to the rule's kind, then run the shared checks.
 ///
 /// ⛔ Anchored on pydantic (lax mode, fed the decoded bytes), Go's strconv and
-/// Python's `int()`/`float()` -- `query_oracle_test.zig`, 2026-10-06. Four
+/// Python's `int()`/`float()` -- `query_oracle_test.zig`. Four
 /// departures were fixed here: an integer past i64 was `int_parsing` (so a
 /// `u64` query field refused 2^63..2^64-1; all three take any integer);
 /// `1__0` passed as an integer and `0x10`/`0x1p3` as floats (`std.fmt`
@@ -3573,7 +3568,7 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     // the builder is aborted here, and an `errdefer` still armed below would
     // free its arena a SECOND time when the decode that follows runs out of
     // memory -- a double free, found by a sizing probe on a
-    // FixedBufferAllocator (2026-09-22), whose `free` asserts ownership.
+    // FixedBufferAllocator, whose `free` asserts ownership.
     {
         var b = Builder.initLimited(gpa, limits);
         errdefer b.abort();
@@ -3719,7 +3714,7 @@ fn undecodable(arena: Allocator, path: []const u8) Allocator.Error!Report {
 //
 // `parseIntoLimited` / `validateJsonLimited` build the whole document as a
 // `std.json.Value` tree and then walk it. That tree is what their memory is:
-// measured 2026-09-22, the smallest FixedBufferAllocator `parseIntoLimited`
+// measured, the smallest FixedBufferAllocator `parseIntoLimited`
 // completes in is 4.4 KiB for a 118-byte body, 47 KiB for 1.1 KiB and 955 KiB
 // for 16.5 KiB (peak live bytes on a heap: 4.3 / 31 / 449 KiB) -- 30-60x the
 // body, which rules out a server that decodes into a fixed per-request buffer.
@@ -4894,7 +4889,7 @@ const Walker = struct {
         f.dup = false;
         // A scan while the object is small; past `key_set_from` keys a set,
         // or one object of N keys cost N²/2 comparisons -- seconds of CPU at
-        // a raised `max_object_members` (review 2026-10-24 M7). The tree
+        // a raised `max_object_members` (review M7). The tree
         // path's ObjectMap was never quadratic.
         const before = w.keys.items[f.key_mark .. w.keys.items.len - 1];
         if (before.len < key_set_from) {
@@ -5169,7 +5164,7 @@ const TokenTap = struct {
 
     /// What std's decoder calls for a sentinel-terminated slice field
     /// (`[:0]const u8`); without it such a `T` did not compile (review
-    /// 2026-10-24 L10).
+    /// L10).
     pub fn allocNextIntoArrayListMax(t: *TokenTap, value_list: *std.array_list.Managed(u8), when: std.json.AllocWhen, max_value_len: usize) AllocIntoArrayListError!?[]const u8 {
         const token = try t.nextAllocMax(t.w.gpa, .alloc_if_needed, max_value_len);
         defer freeToken(t.w.gpa, token);
@@ -5479,7 +5474,7 @@ fn namedBefore(r: *const Rule, j: usize, op: CrossOp, other: []const u8) bool {
 /// `r.cross`? `required_if`/`required_unless` entries differ by their value:
 /// `required_unless = [{status,"a"},{status,"b"}]` is two alternatives, and
 /// deduplicating by the sibling alone exported only the first (review
-/// 2026-10-24 M6: `{"status":"b"}` exempt here, required by the schema).
+/// M6: `{"status":"b"}` exempt here, required by the schema).
 fn sameBefore(r: *const Rule, j: usize) bool {
     const e = r.cross[j];
     for (r.cross[0..j]) |c| if (c.op == e.op and std.mem.eql(u8, c.other, e.other) and std.mem.eql(u8, c.value, e.value)) return true;
@@ -5901,7 +5896,7 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     // A `bool`, `array` or `object` rule ignores the string constraints in
     // `checkRule`, and an `int`/`float` rule ignores the string patterns, so
     // an `enum`/`const` for them would refuse what the module accepts; they
-    // are left out (the 2026-11-05 backlog item, same class for `one_of` and
+    // are left out (the backlog item, same class for `one_of` and
     // `none_of` on `bool`/`array`/`object`).
     const strings_apply = r.kind == .string or r.kind == .any;
     const literal: ?[]const u8 = if (strings_apply) (if (r.pattern) |p| (if (p == .literal) p.literal else null) else null) else null;
@@ -6094,7 +6089,7 @@ fn writePatternMembers(s: *std.json.Stringify, p: Pattern, allow_null: bool) std
         // The end of the string is `(?![\s\S])`, not `$`: Python `re`,
         // PCRE, Java and .NET let `$` match before a final "\n", so a
         // consumer of the schema on those engines accepted `"abc\n"` where
-        // the module refuses it (review 2026-10-24 M5). ECMA-262 and every
+        // the module refuses it (review M5). ECMA-262 and every
         // one of those read the lookahead the same way.
         .suffix => |suf| {
             try s.objectField("pattern");
@@ -6521,7 +6516,7 @@ pub const PathParams = struct {
 
     fn runParams(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
         const v: *const PathParams = @ptrCast(@alignCast(state.?));
-        // `router` F6 (A1/router.md): `ctx.params` is already `*const
+        // `router` F6 (A1 audit): `ctx.params` is already `*const
         // router.Params` now, not a value -- no `&` needed (that used to
         // take `&Params`, now it would take `*const *const Params`).
         var report = try validateParams(v.gpa, ctx.params, v.schema);
@@ -6687,7 +6682,7 @@ test "min/max: inclusive bounds → greater_than_equal / less_than_equal" {
 }
 
 test "bounds: every lower bound accepts its exact edge, tree and streaming paths" {
-    // Mutation 2026-10-04: `n < min` → `n <= min`, and the same flip on the
+    // Mutation: `n < min` → `n <= min`, and the same flip on the
     // array `min_len` of both the tree path (`checkRule`) and the streaming
     // path (`Walker.closeArray`), all survived -- only the upper edge was
     // pinned. WHY the edge passes: `Rule.min`/`min_len` are inclusive (the
@@ -6715,11 +6710,7 @@ test "bounds: every lower bound accepts its exact edge, tree and streaming paths
 }
 
 test "int gate: an integer beyond i64 is an integer; a typed field bounds it" {
-    // Until 2026-10-05 an integer literal past i64 (std.json's
-    // `.number_string`) was `int_type` while `1e20` -- the same number as a
-    // float -- passed; JSON Schema calls both integers (python-jsonschema and
-    // ajv, schema_oracle_test.zig). It also refused every `u64` above 2^63-1
-    // in `parseInto`.
+    // It also refused every `u64` above 2^63-1 in `parseInto`.
     const schema = [_]Rule{.{ .field = "n", .kind = .int }};
     var r = try validateJson(testing.allocator, "{\"n\":99999999999999999999}", &schema);
     defer r.deinit();
@@ -7032,7 +7023,7 @@ test "format truth table: hostname" {
         "123.example",
         (strRepeat("a", 63)) ++ ".example", // longest legal label
         // Exactly 253 bytes, the RFC 1035 §2.3.4 255-octet wire limit minus
-        // the leading length octet and the root label (mutation 2026-10-04:
+        // the leading length octet and the root label (mutation:
         // a 254 cap survived, only a 257-byte name was tested):
         (strRepeat("a", 63)) ++ "." ++ (strRepeat("b", 63)) ++ "." ++ (strRepeat("c", 63)) ++ "." ++ (strRepeat("d", 61)),
     }, &.{
@@ -7500,7 +7491,7 @@ test "query: coercion int/float/bool + parsing-failure codes" {
     try testing.expect(good2.ok());
 
     // "1" coerces to TRUE, as "0" does to false -- pydantic's lax str→bool
-    // set (mutation 2026-10-04: dropping "1" survived). The custom check sees
+    // set (mutation: dropping "1" survived). The custom check sees
     // the coerced value (`Custom.check` doc), so "1" → false would fail too.
     const want_true = [_]Rule{.{ .field = "b", .kind = .bool, .custom = .{ .check = isTrue, .code = "not_true", .message = "" } }};
     var one = try validateQuery(testing.allocator, "b=1", &want_true);
@@ -7598,8 +7589,7 @@ test "parseQueryLeaky: decoding, first duplicate wins, encoded key, unknown keys
 }
 
 test "parseQueryLeaky: the text coercions the query oracle found broken" {
-    // Each assertion is one departure `query_oracle_test.zig` caught
-    // (2026-10-06); see `checkCoerced` and the bounds in `checkRule`.
+    // Each assertion is one departure `query_oracle_test.zig` caught; see `checkCoerced` and the bounds in `checkRule`.
     const Q = struct {
         id: u64 = 0,
         price: f64 = 0,
@@ -8343,7 +8333,7 @@ test "streaming: a valid document allocates no error path, and decodes into a bo
 test "writeJsonSchemaFor: golden, checked against an independent JSON Schema implementation" {
     // The golden below was checked with Python `jsonschema` 4.19.2 (Draft
     // 2020-12, format assertions on) against `parseIntoLimited` on 33 bodies
-    // covering every mapping here (2026-09-22): the two agreed on 32. The one
+    // covering every mapping here: the two agreed on 32. The one
     // difference is by design -- `"ab"` for `[3]u8` passes the schema (which
     // can only say "1..3 code points") and fails the byte bound.
     const T = struct {
@@ -8476,9 +8466,9 @@ test "case tables: sorted, disjoint runs whose stride divides their span; Go's v
     try testing.expect(validateFormat(.lowercase, "漢字 123 !") and validateFormat(.uppercase, "漢字 123 !"));
 }
 
-// ── pinned by the 2026-10-24 (wave 8) mutation audit ────────────────────────
+// ── pinned by the (wave 8) mutation audit ────────────────────────
 // Each assertion below kills a mutant of the new code that survived the rest
-// of the suite (report: the 2026-10-24 mutation report for `validate`).
+// of the suite (report: the mutation report for `validate`).
 
 test "mutation wave 8: case tables -- ASCII upper in a lowercase string, the last run of each table" {
     try testing.expect(!validateFormat(.lowercase, "Z") and !validateFormat(.lowercase, "aZ"));
@@ -9297,7 +9287,7 @@ test "stacked Query + Body middleware: both getters work via the slot chain" {
 test "getters return null when no validate middleware ran" {
     var req: http.Server.Request = undefined;
     var res: http.Server.ResponseWriter = undefined;
-    // `router` F6 (A1/router.md): `Ctx.params` is now `*const router.Params`,
+    // `router` F6 (A1 audit): `Ctx.params` is now `*const router.Params`,
     // not a value -- needs an addressable local.
     var empty_params: router.Params = .{};
     var ctx: router.Ctx = .{ .req = &req, .res = &res, .params = &empty_params, .state = null };
@@ -9454,7 +9444,7 @@ const fuzz_driver = fuzzseed.driver;
 // reason the shape generator exists, had never run once. `fuzzValidateFormat`
 // was worse: `smith.value(Format)` gave `.email` for ever and the string was
 // empty, so **eleven of the twelve formats had never been called at all**.
-// Measured 2026-09-07: 1 body, 1 format, 0 non-empty strings.
+// Measured: 1 body, 1 format, 0 non-empty strings.
 
 const json_buf_len = 512;
 const format_buf_len = 128;
@@ -9507,7 +9497,7 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x00\x01" ++ "\x01\x02\x03\x04\x05"), // near-miss alphabet, email
     fuzzseed.seed("\x05\x01" ++ "\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11"), // near-miss alphabet, ipv6
     fuzzseed.seed("\x0b\x01" ++ "\x11\x12\x13"), // near-miss alphabet, json_pointer
-    // go-playground formats (2026-10-11): octet 0 is the `Format` index, one valid string each
+    // go-playground formats: octet 0 is the `Format` index, one valid string each
     fuzzseed.seed("\x0c\x00" ++ "6fa459ea-ee8a-3ca4-894e-db77e160355e"), // uuid3
     fuzzseed.seed("\x0d\x00" ++ "550e8400-e29b-41d4-a716-446655440000"), // uuid4
     fuzzseed.seed("\x0d\x00" ++ "550e8400-e29b-11d4-a716-446655440000"), // uuid4, but version 1
@@ -9532,7 +9522,7 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x1f\x00" ++ "1.2.3-rc.1+build.5"), // semver
     fuzzseed.seed("\x20\x00" ++ "10.0.0.0/8"), // cidr
     fuzzseed.seed("\x21\x00" ++ "00:1a:2b:3c:4d:5e"), // mac
-    // second wave (2026-11-05): one valid string per new format, octet 0 = the `Format` index
+    // second wave: one valid string per new format, octet 0 = the `Format` index
     fuzzseed.seed("\x22\x00" ++ "#a1b2c3"), // hexcolor
     fuzzseed.seed("\x23\x00" ++ "rgb(1, 2, 3)"), // rgb
     fuzzseed.seed("\x24\x00" ++ "rgba(1,2,3,0.5)"), // rgba
@@ -9747,7 +9737,7 @@ test "corpus: every body reaches validateJson, and the violations reported are p
         if (r.ok()) valid += 1;
         violations += r.errors.len;
     }
-    // Measured 2026-09-07. The single body this target used to build was
+    // Measured. The single body this target used to build was
     // `"{}"`, which reports exactly the two missing required fields.
     try testing.expectEqual(@as(usize, 17), nonempty);
     try testing.expectEqual(@as(usize, 692), octets);
@@ -9828,8 +9818,8 @@ test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere"
 test "corpus: every Format is exercised, and the strings each accepts are pinned" {
     // ⭐ The number that was 1 before, and the only one that says this target
     // is no longer stuck on `.email`: how many DISTINCT formats the corpus
-    // selects. All of them (34 since 2026-10-11), and the accepted count
-    // beside it so a corpus of refusals only would be visible.
+    // selects. All of them, and the accepted count beside it so a corpus of
+    // refusals only would be visible.
     const formats = std.enums.values(Format);
     var seen = @as([97]bool, @splat(false));
     var nonempty: usize = 0;
@@ -9846,8 +9836,8 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     }
     try testing.expectEqual(@as(usize, 97), formats.len);
     for (seen) |v| try testing.expect(v);
-    // Measured 2026-09-07 (21 / 12; before: 1 format, 0 non-empty strings, 0
-    // accepted). 2026-10-11: +24 seeds for the go-playground formats, 21 of
+    // Measured (21 / 12; before: 1 format, 0 non-empty strings, 0
+    // accepted).: +24 seeds for the go-playground formats, 21 of
     // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
     // one-character base64_raw_url are the refusals).
     try testing.expectEqual(@as(usize, 108), nonempty);
@@ -9883,7 +9873,7 @@ test {
 }
 
 test "a rule that forgot its kind is not a no-op: .any constrains the value" {
-    // ⛔ MEDIUM regression (audit 2026-09-02). `.any` is the DEFAULT kind and
+    // ⛔ MEDIUM regression. `.any` is the DEFAULT kind and
     // used to void every constraint, so one omitted `.kind = .string` turned
     // a fully specified rule into nothing at all — with no signal.
     const rules = [_]Rule{.{
@@ -9921,7 +9911,7 @@ test "a derived [N]u8 rule counts BYTES, because that is what the decoder fills"
     // The code-point fix silently broke the derived rule: 16 code points is
     // not 16 bytes, so a string that decodes perfectly was rejected and one
     // that does not was passed through to fail unpathed inside
-    // `parseFromValue`. Audit 2026-09-02.
+    // `parseFromValue`. Audit.
     const T = struct { fixed: [16]u8 };
     const rules = comptime rulesFor(T);
     try testing.expectEqual(@as(?usize, 16), rules[0].min_bytes);
@@ -9945,7 +9935,7 @@ test "the Limits defaults are the security control, so each one is pinned" {
     // ⛔ Three of the four defaults SPEC names as the control had nothing
     // behind them: raising `max_array_elements` 10 000 → 1e8,
     // `max_object_members` 1 000 → 1e8 or `max_total_nodes` 1e6 → 1e11 each
-    // left the whole suite green (audit 2026-09-02). The one test that
+    // left the whole suite green. The one test that
     // claimed to cover this exercised `max_depth` alone; every other limit
     // test passes its own `Limits`. The defaults worked — nothing would have
     // noticed them stopping.
@@ -9989,8 +9979,7 @@ test "the Limits defaults are the security control, so each one is pinned" {
 
 test "isEmail's documented 254-byte ceiling is enforced" {
     // Documented, and nothing pinned it: removing the check left the suite
-    // green while 255..318-byte addresses became acceptable (audit
-    // 2026-09-02). The corpus has no long-address case.
+    // green while 255..318-byte addresses became acceptable. The corpus has no long-address case.
     const gpa = testing.allocator;
     // local(60) + '@' + labels of 'b' separated by dots + ".com", built to
     // exactly 254 bytes and then to 255.
@@ -10015,7 +10004,7 @@ test "isEmail's documented 254-byte ceiling is enforced" {
 }
 
 test "the error cap bounds the WORK, not just the list" {
-    // ⛔ MEDIUM regression (audit 2026-09-02). `max_errors` capped the error
+    // ⛔ MEDIUM regression. `max_errors` capped the error
     // LIST inside `append`, but `appendf` formatted its message first — so a
     // 996 KiB body of 340 000 nodes, every part of it inside the DEFAULT
     // `Limits`, built 339 000 messages nobody could read and left an 18 802
@@ -10097,8 +10086,7 @@ test "the offset-optional date-time profile is a CHOICE, and this is where it is
     // 3339 proper forbids and the `Format` doc calls a deliberate ISO 8601
     // profile. Nothing pinned it: the vendored corpus has no date-time case
     // at all and reaches the `time` one only through a documented skip, so
-    // the choice could have been reversed by accident in either direction
-    // (audit 2026-09-02). If a future change makes the offset mandatory, this
+    // the choice could have been reversed by accident in either direction. If a future change makes the offset mandatory, this
     // test is the conversation, not a surprise.
     try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59"));
     try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59Z"));
@@ -10113,7 +10101,7 @@ test "the offset-optional date-time profile is a CHOICE, and this is where it is
     try testing.expect(!validateFormat(.time, "24:00:00"));
 }
 
-// ── tests: cross-field rules (2026-10-11) ───────────────────────────────────
+// ── tests: cross-field rules ───────────────────────────────────
 //
 // Every case runs on the tree AND the streaming path and must give the same
 // errors (`expectBoth`), at the (path, code) pairs the case lists.
@@ -10713,7 +10701,7 @@ test "cross: the schema export — required_with is dependentRequired, the other
     , &.{
         .{ .field = "c", .cross = &.{.{ .op = .required_if, .other = "n", .value = "5" }} },
     });
-    // Two values for one sibling are two entries (review 2026-10-24 M6: the
+    // Two values for one sibling are two entries (review M6: the
     // second was dropped, so `{"role":"auditor"}` was exempt here and
     // required by the schema); an exact repeat stays one.
     try expectJsonEq(
@@ -10735,7 +10723,7 @@ test "cross: the schema export — required_with is dependentRequired, the other
     });
 }
 
-// ── tests: pinned by the 2026-10-24 mutation audit ──────────────────────────
+// ── tests: pinned by the mutation audit ──────────────────────────
 //
 // Each one names the mutation that survived the suite without it.
 
@@ -11149,7 +11137,7 @@ test "root array: the exported schema — writeJsonSchemaRoot and writeJsonSchem
     , w2.buffered());
 }
 
-// ── tests: the go-playground formats (2026-10-11) ───────────────────────────
+// ── tests: the go-playground formats ───────────────────────────
 
 test "format truth table: uuid3 / uuid4 / uuid5 / uuid7 — version and variant (baked_in.go 650-668, regexes.go)" {
     try expectFormat(.uuid3, &.{"6fa459ea-ee8a-3ca4-894e-db77e160355e"}, &.{
@@ -11419,7 +11407,7 @@ const unique_atoms = [_][]const u8{
     "\"a\"",                                   "\"b\"",                                   "\"1\"",                                    "true",                                     "false",                  "null",                  "[]",                  "{}",
     "[1]",                                     "[1.0]",                                   "[1,2]",                                    "[2,1]",                                    "[[1]]",                  "[[1e0]]",               "{\"x\":1,\"y\":[2]}", "{\"y\":[2.0],\"x\":1}",
     "{\"x\":1}",                               "{\"x\":null}",                            "18446744073709551617",                     "18446744073709551616",                     "1e400",                  "1E400",                 "9007199254740993",    "9007199254740992",
-    // the i128 edge (review 2026-10-24 LOW-1)
+    // the i128 edge (review LOW-1)
     "170141183460469231731687303715884105727", "170141183460469231731687303715884105728", "-170141183460469231731687303715884105728", "-170141183460469231731687303715884105729", "-1.7014118346046924e38", "1.7014118346046923e38",
 };
 
@@ -11837,7 +11825,7 @@ test "fuzz: the cross corpus reaches cross-field violations" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -11847,7 +11835,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── sweep GJ (no-panic sweep, 2026-10-29) ───────────────────────────────────
+// ── sweep GJ ───────────────────────────────────
 
 /// Bytes the arena of a finished report holds (the capacity it grew to).
 fn reportBytes(r: *const Report) usize {
@@ -12244,7 +12232,7 @@ test "a float-spelled integer at the edge of a wide int is refused, not decoded 
     }
 }
 
-// ── the rule vocabulary of 2026-11-05 ───────────────────────────────────────
+// ── the rule vocabulary ───────────────────────────────────────
 
 test "gt, lt: exclusive bounds, inclusive ones beside them, codes and params" {
     const schema = [_]Rule{.{ .field = "n", .kind = .int, .gt = 5, .lt = 7 }};
@@ -12907,7 +12895,7 @@ test "fuzz driver: VALIDATE_FUZZ (rules)" {
     try fuzz_driver.run(rulesHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "rules" });
 }
 
-// ── whole-module mutation run 2026-11-07: tests for the survivors ───────────
+// ── whole-module mutation run: tests for the survivors ───────────
 // Truth tables below were written from the RFC/grammar each validator names
 // (and the go-playground tag it mirrors), not from the code under test.
 
@@ -13441,7 +13429,7 @@ test "a1 mutation: streaming walk counts nodes inside a materialized array, a 33
     }
 }
 
-// ── a1 mutation follow-up (2026-11-07): ownership and inline limits ─────────
+// ── a1 mutation follow-up: ownership and inline limits ─────────
 //
 // The streaming walker's scratch is a 1 KiB stack buffer (the one-pass
 // decoder's 2 KiB) in front of the caller's allocator, so a leak or a double
