@@ -9,6 +9,7 @@ fragmentation. Feeds SCADA/utility fleet-simulation now; real RTU
 monitoring/control is a later consumer.
 
 - No mature pure-Zig DNP3 library exists.
+- **Depends on:** `aeskw` (AES Key Wrap) and `aesgcm` (AES-GMAC), for Secure Authentication only.
 - **Platform:** any — every codec is a pure function over byte slices, no
   allocation, no I/O. Wiring to a real transport (TCP or serial) is left to
   the caller.
@@ -79,8 +80,8 @@ Implemented:
     correct FIR/FIN and an **incrementing** application sequence number, each
     non-final fragment asking for a confirm; `next()` produces the following
     one. The transport layer below segments consistently.
-  - **Unsolicited responses:** `unsolicited()` builds the fragment (UNS + CON
-    set, its own sequence counter, suppressed while one is unconfirmed or
+  - **Unsolicited responses:** `unsolicited()` builds the fragment (needs
+    `Config.unsolicited_supported`, default off; UNS + CON set, its own sequence counter, suppressed while one is unconfirmed or
     while the restart IIN is set). The *retry timer* is the caller's.
 - Malformed/short/corrupt bytes never panic anywhere in `link`/`transport`/
   `application`/`objects`/`records`/`outstation` — every decode path returns
@@ -119,30 +120,12 @@ override it). Randomness for challenge data comes from the caller's
 `RandomSource`; time is the outstation's injected `now_ms`. Wire interop with a
 foreign SA master is unproven (no SA peer exists to test against); see SPEC.md.
 
-## Deferred
+## Not provided
 
-Honest list of what this module does **not** do:
-
-- **Unsolicited retry policy.** The fragment builder is here; the retry timer
-  and back-off are the caller's, driven through `confirmTimedOut()`.
-- **File transfer (g70), data sets (g85–g88), device attributes (g0), octet
-  strings (g110/g111), time-and-interval (g50v4), analog deadbands (g34),
-  time-synchronisation with delay compensation (g50v2/g51).**
-- **Secure Authentication: asymmetric update-key change (SAv5/SAv6), the
-  g121/g122 security-statistic objects on the wire, and authenticated
-  responses in the monitoring direction.** The outstation integration covers
-  the symmetric procedures only; statistics are counted in memory.
-- **Data-link confirmed user data.** The outstation answers RESET_LINK_STATES,
-  TEST_LINK_STATES and REQUEST_LINK_STATUS, and accepts both confirmed and
-  unconfirmed user data, but always sends its own frames as *unconfirmed*
-  user data. The FCB/FCV toggle is decoded, not enforced.
-- **Actual transport I/O.** `Session` produces and consumes byte slices;
-  running it over TCP or a serial port (or over a simulated fleet) is the
-  caller's job.
-- **A stateful master session.** The master role is still the pure codecs —
-  no poll scheduler, no task queue, no response-timeout state machine.
-- **Relative-time event variations (g2v3, g4v3)** are encodable by
-  `records`, but the outstation never chooses them: it emits absolute time.
+No transport I/O (TCP/serial/TLS: `Session` moves byte slices), no unsolicited retry timer, and no
+stateful master session; object groups g0/g70/g85-g88/g110-g111/g34, SAv5/SAv6 asymmetric key change and
+a few link/event details are not built. See SPEC.md *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Use
 
@@ -279,7 +262,7 @@ draws (function code, group/variation, qualifier and range fields drawn from
 each field's boundary values) that assert they reached the command path's range
 arithmetic. The same generator backs two `std.testing.fuzz` targets.
 
-**Interop (2026-07-23).** `src/goldens.zig` replays two sessions captured from
+**Interop.** `src/goldens.zig` replays two sessions captured from
 a live **opendnp3** peer (built from source):
 
 1. *opendnp3's `master-demo` → this outstation*, over a real loopback TCP
@@ -304,12 +287,6 @@ dissected cleanly with zero malformed or expert-error indications, and every
 field matched: DIR/PRM, link addresses, application function codes, FIR/FIN/
 CON/SEQ, the IIN restart and class-1 bits, and every object identifier in the
 class-0 response (0x0102, 0x0302, 0x0a02, 0x1401, 0x1501, 0x1e01, 0x2801).
-
-Two real interop bugs were found and fixed this way — the outstation was
-setting the link-layer DIR bit as if it were the master (opendnp3 logged
-"master frame received for master" and dropped every reply), and continuation
-fragments were reusing the request's application sequence number instead of
-incrementing it ("Response with bad sequence").
 
 Provenance: clean-room from IEEE 1815-2012 (DNP3), an open standard. Design
 references (behavioral/structural only, no source consulted or copied):

@@ -29,7 +29,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nblair2/go-dnp3](https://github.com/nblair2/go-dnp3) | Go | MPL-2.0 | 1 | push 2026-09-26 | Small Go library (red-team tooling context, *inferred*); not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos dnp3 --language=zig` found nothing besides zig-libs itself. |
 
-**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** no stateful master (poll scheduler, task queue, timeouts), Secure Authentication only symmetric and only in the outstation, no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design) (→ Backlog items).
+**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** no stateful master (poll scheduler, task queue, timeouts), Secure Authentication only symmetric and only in the outstation, no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design, see *What is deliberately not done*; the rest is in *Backlog / deferred*).
+
 
 ## Design & invariants
 
@@ -75,9 +76,8 @@ Six allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own
   `nextFrames` (the continuation of a multi-fragment response) and `unsolicitedFrames` (an
   outstation-initiated unsolicited response) — because all three share `Session.tx_seq`, and a
   caller that frames an outstation-initiated fragment itself has to duplicate that sequence
-  bookkeeping. `unsolicitedFrames` was added after `fleetsim`'s DNP3 adapter did exactly that
-  re-implementation over the public `link`/`transport` API; it is additive, and the fragment-level
-  `Outstation.unsolicited` is unchanged for callers that own their own framing.
+  bookkeeping. The fragment-level `Outstation.unsolicited` stays for callers that own their own
+  framing.
   Everything time-dependent — the select-before-operate window, the confirm timeout — is driven by
   an injected `now_ms` or by an explicit `confirmTimedOut()` call; the module owns no clock and
   spawns no thread.
@@ -108,8 +108,7 @@ which is a local programming mistake.
   latches IIN2.3 until the buffer drains completely.
 - **Fragmentation.** Each fragment of a multi-fragment response carries the *next* application
   sequence number (§5.1.6.2) and clears FIR after the first. Reusing the request's sequence for
-  every fragment is a classic interop failure and is exactly what opendnp3 caught in this module's
-  first draft.
+  every fragment is a classic interop failure (opendnp3 stalls with "Response with bad sequence").
 - **Select-before-operate.** The SELECT is stored with its arm time, its object bytes verbatim and
   the peer that sent it. An OPERATE must carry the SELECT's sequence + 1, byte-identical objects
   and the same peer; otherwise it is `NO_SELECT`. Once the arm window closes the select is dropped
@@ -125,23 +124,21 @@ which is a local programming mistake.
 ## CRC verification
 
 DNP3's link-layer CRC-16 is the reveng CRC-catalogue "CRC-16/DNP": width=16, poly=0x3D65,
-init=0x0000, refin=true, refout=true, xorout=0xFFFF, check("123456789")=0xEA82. `link.crc16` is a
-table-driven implementation (table built from the reflected polynomial 0xA6BC =
-`reflect(0x3D65, 16)`, matching the `refin`/`refout` convention).
+init=0x0000, refin=true, refout=true, xorout=0xFFFF, check("123456789")=0xEA82. `link.crc16`
+delegates to `std.hash.crc.@"CRC-16/DNP"` (std builds its table from the reflected polynomial
+0xA6BC = `reflect(0x3D65, 16)`).
 
-The CRC was originally cross-checked against a **from-scratch bit-serial reference implementation**
-written directly from the (width, poly, init, refin, refout, xorout) parameters — an independent
-second implementation of the algorithm (not a port of the Zig table-driven code), which reproduces
-the catalogue check value and agrees with the table-driven implementation on every vector in
-`link.zig`'s test file (empty input, single bytes 0x00/0xFF, short ASCII strings, a 16-byte
-sequential block, a 16-byte repeated block, and two synthetic 8/13-byte link-header-shaped blocks).
-That gap is now closed. `src/goldens.zig` replays real link frames from live opendnp3 sessions
-(see Verification below); opendnp3 built and validated the CRC on every frame this module sent, and
-this module validated the CRC on every frame opendnp3 sent, in both roles. Wireshark's DNP3
-dissector also parsed all 43 captured frames without a single CRC or malformed indication.
+`link.zig`'s tests pin the catalogue check value and further vectors (empty input, single bytes
+0x00/0xFF, short ASCII strings, a 16-byte sequential block, a 16-byte repeated block, and two
+synthetic 8/13-byte link-header-shaped blocks) computed by a from-scratch bit-serial engine written
+directly from the (width, poly, init, refin, refout, xorout) parameters, independent of any table
+code. `src/goldens.zig` replays real link frames from live opendnp3 sessions (see Verification):
+opendnp3 built and validated the CRC on every frame this module sent, and this module validated
+the CRC on every frame opendnp3 sent, in both roles. Wireshark's DNP3 dissector also parsed all
+captured frames without a CRC or malformed indication.
 
-The remaining full-stack round-trip tests in `link.zig`/`root.zig` are still self-consistency tests
-(encode with this module, decode with this module, assert equality) and are documented as such.
+The full-stack round-trip tests in `link.zig`/`root.zig` are self-consistency tests (encode with
+this module, decode with this module, assert equality) and are documented as such.
 
 ## Threat model / out of scope
 
@@ -159,14 +156,13 @@ whole 32-bit space, a prefix-less command header naming a point index past the 1
 a variation the module does not implement, an unassigned function code, and a zero-length fragment
 all resolve to a response with the right IIN bits rather than an error or a crash.
 
-⚠ **And a WELL-FORMED request is part of that surface too, which this paragraph used to leave
-unsaid** (audit 2026-09-02). Three of that audit's findings needed nothing malformed at all: a
-`READ g20v2` -- a spec-defined 16-bit counter variation -- against a counter holding more than
-`0xFFFF` drove an unbounded series of identical empty fragments, because the value the master asked
-for could not be carried in the variation it asked for and the response cursor treated that as "no
-room, retry"; a `READ g30v1` against a point CONFIGURED as a float reached an inactive union field;
-and a `DIRECT_OPERATE` carrying a NaN setpoint walked through a declared `[min, max]` because
-`value < min or value > max` is false for a NaN. The threat model is not "malformed bytes": it is
+The threat model also covers WELL-FORMED requests. A `READ g20v2` -- a spec-defined 16-bit
+counter variation -- against a counter holding more than `0xFFFF` must not drive an unbounded
+series of identical empty fragments (the value the master asked for cannot be carried in the
+variation it asked for; the response cursor must not treat that as "no room, retry"); a
+`READ g30v1` against a point CONFIGURED as a float must not reach an inactive union field; and a
+`DIRECT_OPERATE` carrying a NaN setpoint must not walk through a declared `[min, max]`
+(`value < min or value > max` is false for a NaN). The threat model is not "malformed bytes": it is
 every request a master can legally send, against every state the caller's database can legally
 hold. Wire-driven
 object-instance counts always go through `objects.Range.objectCount()` / `objectSpanBytes()`, whose
@@ -214,7 +210,8 @@ file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0),
 the send path (the outstation always sends unconfirmed user data; the FCB/FCV toggle is decoded but
 not enforced), Secure Authentication beyond the outstation's symmetric procedures (see its own
 section), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
-hands the caller bytes to send/receive, nothing more.
+hands the caller bytes to send/receive, nothing more. The reasons and the open items
+are in *What is deliberately not done* and *Backlog / deferred*.
 
 ## g120 Secure Authentication — SAv2 symmetric core
 
@@ -223,11 +220,11 @@ object group 120:
 
 - **AES Key Wrap (RFC 3394)** — via the shared `modules/aeskw` module (`aeskw.wrap`/`aeskw.unwrap`
   over `std.crypto.core.aes`, AES-128 and AES-256 KEK; std ships no key-wrap). Byte-exact against
-  the RFC 3394 §4 published vectors. This used to be a local copy in `sa.zig`; it has been
-  collapsed onto the canonical extracted module, which `jwe` and `xmlenc` also use.
+  the RFC 3394 §4 published vectors. The module is shared with `jwe` and `xmlenc`.
 - **MAC algorithms** (`mac`) — the SA algorithm registry: HMAC-SHA-1 (truncated to 4/8/10 octets),
-  HMAC-SHA-256 (truncated to 8/16 octets), and AES-GMAC (12-octet tag), all via `std.crypto`, with
-  constant-time verification (`std.crypto.timing_safe`-style byte compare).
+  HMAC-SHA-256 (truncated to 8/16 octets), and AES-GMAC (12-octet tag), with
+  constant-time verification (`ctEql` in `sa.zig`). HMAC runs on `std.crypto`, GMAC on the
+  shared `modules/aesgcm` module (std AES-GCM is 2.6x slower on Zig 0.17, #36256).
 - **g120 codecs** — `Challenge` (v1), `Reply` (v2), `AggressiveModeRequest` (v3),
   `SessionKeyStatusRequest` (v4), `SessionKeyStatus` (v5), `SessionKeyChange` (v6), `SaError` (v7),
   `AggregateMac` (v9), plus the group-120 free-format object header (qualifier `0x5B`).
@@ -235,12 +232,6 @@ object group 120:
   `wrapSessionKeys`/`unwrapSessionKeys`, and `SeqCounter` / `KeyExpiry` / `lookupUpdateKey` state
   helpers that take the clock/counters as parameters (no wall-clock dependence).
 
-**Corrected from the earlier scaffold** (cross-checked against the Wireshark DNP3 dissector,
-`epan/dissectors/packet-dnp.c`): the `HmacAlgorithm` id/truncation table (scaffold listed
-nonexistent SHA-3 variants and wrong SHA-1/SHA-256 lengths); the `KeyStatus` ordering (OK=1,
-NOT_INIT=2, not the reverse); the `SaError` field order + a missing user-number field; and the
-`Challenge` object's missing user-number + reason fields. The variation numbers themselves
-(v1/v2/v3/v4/v5/v6/v7/v9) were already correct.
 
 **MAC-input construction (security crux):** the reply MAC is computed over the received challenge
 message concatenated with the critical ASDU being authenticated; callers pass the exact wire byte
@@ -262,13 +253,12 @@ only: one outstanding challenge, one key-change window, one stored critical requ
 caller-owned storage. It is clock-injected (the outstation's `now_ms`) and takes its challenge
 randomness from a caller `RandomSource`. It does no I/O and no allocation.
 
-**Reference check.** The owner rule asks for the reference's behaviour first. That check could
-not be made in this pass: the reference (opendnp3) dropped SA from its current releases, the
-older SA branch was not available locally, and the web lookup was refused by the agent's tooling.
-There is also no SA-capable peer in this repository. The behaviour below is therefore read from
-the standard's procedure as the `sa.zig` codecs encode it, and each choice that could differ
-from a foreign implementation is listed as an open question in the Backlog. Wire interop with a
-foreign SA master is **unproven**.
+**Reference check.** The owner rule asks for the reference's behaviour first. The reference
+(opendnp3) dropped SA from its current releases and there is no SA-capable peer in this
+repository. The behaviour below is therefore read from the standard's procedure as the `sa.zig`
+codecs encode it, and each choice that could differ from a foreign implementation is listed as
+an open question in the Backlog. Wire interop with a foreign SA master is **unproven**.
+
 
 Behaviour, and why:
 
@@ -320,7 +310,7 @@ Behaviour, and why:
   AUTHENTICATE_REQUESTs are counted and ignored.
 - **Statistics** (`Statistics`) count each of these events in memory.
 
-**Key-wrap layout (open question (a), decided 2026-11-19).** The g120v6 wrapped data is
+**Key-wrap layout.** The g120v6 wrapped data is
 AES-KW (RFC 3394) over: key length (u16 LE), control key, monitoring key, the key-status message,
 and zero padding to a multiple of 8. The key-status message is the g120v5 object body that opened
 the key-change window, exactly as sent: KSQ through the challenge data, plus its MAC when it had
@@ -331,7 +321,7 @@ returns the one error `Unauthentic`: integrity, length field, total length, or a
 
 Why: the KSQ alone cannot stop a replay. It restarts at 0 with the outstation, and any peer can
 step it with unauthenticated g120v4s. Binding the change to the status's fresh random challenge
-data closes the replay of a recorded g120v6 after a restart (review MEDIUM-1, regression test in
+data closes the replay of a recorded g120v6 after a restart (regression test in
 `secure_auth`). The layout is the one recalled for IEEE 1815-2012 SAv5 and opendnp3 2.x; it is
 **not checked against the standard's text** or a foreign implementation. Which bytes count as
 "the key-status message" (object body, whole object, or ASDU) and the padding byte are the
@@ -356,7 +346,7 @@ declassifies exactly two public byte ranges (`makeMemDefined`, a no-op without `
 - the embedded status, `recovered[2+2·klen .. 2+2·klen+expected.len]`, which went out on the wire
   as the g120v5.
 
-The keys stay tainted. Native (skylake), measured 2026-11-19:
+The keys stay tainted. Native (skylake):
 - tainted in-file 6. All six are `aeskw` root.zig:203, the timing-safe integrity verdict, once
   per unwrap call site in the harness (genuine, tampered, other status) × 16/32-octet keys.
 - No context fires in `sa.zig` itself.
@@ -376,9 +366,9 @@ Nothing is tainted in the trap build. Those contexts are std's bitsliced soft AE
 partial batch with `undefined` lanes, and that definedness reaching plaintext that is public
 after the verdict. The declassification above is compiled out in that build.
 
-**Security notes** (from the independent review of 2026-11-19):
+**Security notes** (from the independent review):
 
-- *Unauthenticated messages can disturb an exchange in flight (review MEDIUM-2).* SA cannot
+- *Unauthenticated messages can disturb an exchange in flight.* SA cannot
   stop a station from sending unauthenticated traffic. Each such message can cost the master one
   exchange, and the master recovers with its next attempt:
   - another critical request replaces the outstanding challenge;
@@ -396,15 +386,15 @@ after the verdict. The declassification above is compiled out in that build.
   known user without keys (NOT_INIT), and that window refuses every key change. Timing still
   differs (no MAC is computed for an unknown or unkeyed user); user numbers are not secret.
 
-- *A request SA only challenges, refuses or ignores does not touch the outstation (review LOW-2).*
+- *A request SA only challenges, refuses or ignores does not touch the outstation.*
   The screen runs before the outstation abandons a response series, clears the await-confirm
-  state or records the sequence number, so an unauthenticated critical request no longer aborts a
+  state or records the sequence number, so an unauthenticated critical request does not abort a
   multi-fragment response or an event report awaiting its CONFIRM.
-- *Unauthenticated state changes that remain (review LOW-2, documented).* CONFIRM is not critical
+- *Unauthenticated state changes that remain (documented).* CONFIRM is not critical
   (as in the standard), so a forged CONFIRM retires the events in flight. IMMEDIATE_FREEZE and
   FREEZE_CLEAR are optional-critical and left out of the default set. A caller who needs them
   authenticated adds them with `FunctionSet.with`. CONFIRM cannot usefully be challenged.
-- *Aggressive-mode age and online guessing (review LOW-1, documented).* An aggressive-mode request
+- *Aggressive-mode age and online guessing (documented).* An aggressive-mode request
   stays valid until the CSQ or the last challenge moves on, or the keys expire, so a withheld
   request can be delivered late. The standard has the same property and adds no timeout either.
   There is also no per-user lockout after repeated MAC failures: the g120v7 replies stop after
@@ -422,155 +412,106 @@ foreign SA master computes the same.
 
 ## Verification
 
-Offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
-Breakdown: `link` (12) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
-(empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
-malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/
-multi-segment segmentation+reassembly, sequence-mismatch/continuation-before-FIR/FIR-restart/
-buffer-too-small/empty-segment error paths; `application` (7) — app-control round-trip, IIN
-round-trip, request/response header round-trips, `buildRequest`, short-fragment errors,
-non-exhaustive function-code decode; `objects` (20) — qualifier byte round-trip, object-header
-round-trips for every implemented range shape (1/2/4-byte start-stop, all-values, count+prefix,
-4-byte count), range/qualifier-mismatch and value-out-of-range errors, a short/garbage decode
-sweep, flags-byte round-trip, and an encode/decode round-trip for every core object
-(g1v1 packed bits, g1v2, g12v1 CROB, g20v1/v2, g30v1/v2, g40v1, g41v1/v2/v3, g50v1) plus a
-short-record error sweep; `sa` (21) — the SAv5 status-bound key wrap (round trip, every wire failure one error, length-field lies, the minimum status), AES-KW RFC 3394 §4.1/§4.3/§4.6 vectors + wrong-KEK/corruption
-reject + malformed-length errors (integration tests through the shared `modules/aeskw` module, which
-carries its own byte-exact KAT suite), HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs,
-AES-GMAC (McGrew GCM test case 1) + compute/verify, constant-time verify accept/tamper/wrong-length,
-g120 object-header + v1/v3/v4/v5/v6/v7/v9 codec round-trips, short/garbage decode sweep, session-key
-wrap/unwrap (128- and 256-bit, wrong-update-key reject), the full challenge-response flow
-(build v1 → compute v2 → verify accept; tamper MAC or ASDU → reject), and the `SeqCounter`/
-`KeyExpiry`/`lookupUpdateKey` state helpers; `root` (4) — full link→transport→application
-stack round-trips (single-frame and forced multi-frame >250-byte fragments) and a
-master-builds-READ/outstation-parses + outstation-builds-RESPONSE/master-parses round trip;
-`records` (11) — the layout table's wire lengths against the object library, state-in-flags
-encoding for binary and double-bit, absolute-time and float variations, narrow-variation range
-rejection, packed shapes, a short-record sweep, and the point-kind ↔ group mapping both ways;
-`outstation` (54) — IIN (restart set/cleared, need-time, class bits, overflow latch,
-func-not-supported, object-unknown), READ (class 0 walking all seven point types in order, every
-qualifier shape, variation 0 per-point selection, packed variations, mixed-variation header
-splitting, hostile ranges), events (oldest-first with the right group/variation/index prefix,
-confirm retires, timeout releases, per-class filtering, direct event-group reads with and without
-a count limit, ring overflow semantics), commands (SELECT+OPERATE, timeout, wrong sequence,
-different objects, different index, DIRECT_OPERATE and its no-ack form, all four CROB operations,
-nonexistent and command-less points, analog output bounds, hook veto), DELAY_MEASURE, restart
-(refused and allowed), ENABLE/DISABLE_UNSOLICITED, unsolicited responses, freeze and freeze-clear,
-ASSIGN_CLASS, fragmentation (FIR/FIN/SEQ across a series, and a new request abandoning one),
-`Session` (link-service replies, a frame addressed to another station dropped, a frame *from*
-another station dropped with its opt-out proved to switch, a SELECT armed by one station refused to
-an OPERATE from another in both directions, "no peer known" proved to be a value rather than a
-wildcard, a broadcast executed but unanswered, a request split across transport segments,
-out-of-order segments, bad CRC,
-`unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`), hostile input
-(including a full-width command range and a point index past the 16-bit space), and four fuzz
-harnesses; `goldens` (5) — the captured-session replays; `secure_auth` (22) — the hand-derived
-exchange vectors, bad reply MAC and its retry, a reply with the wrong CSQ / sequence / peer / no
-peer / unknown user / keyless user / empty key / wrong key, reply timeout and replaced
-challenges, SELECT+OPERATE each authenticated, non-critical requests byte-identical with and
-without SA, the critical-set override, no-ack requests, aggressive-mode refusals, key-change
-refusals (KSQ, user, update key, short or undecodable data, replay), expiry by time / count /
-status request and a disabled axis, old keys wiped, the error budget, unexpected AUTH requests,
-challenge shapes and the storage boundary, a challenge that could not be sent, and aggressive
-mode cancelling an outstanding challenge, a recorded key change replayed after a restart with the
-KSQ stepped to match, a key change whose confirmation MAC cannot be computed, and a challenged
-request leaving a response awaiting its confirm alone.
+- **Run:** `scripts/modtest dnp3` (the same suite as `zig build test-dnp3`, optionally with
+  `-Doptimize=ReleaseFast`). Offline: the interop captures are in-tree goldens, no peer is needed.
+- **Test classes by area.** `link`: CRC catalogue check value and known-answer vectors, control-octet
+  round-trip, frame round-trips (empty, short, multi-block, exact 16-octet block boundary), encode/decode
+  error paths and a malformed-input sweep. `transport`: octet round-trip, segmentation and reassembly
+  (empty, single, multi-segment), sequence-mismatch, continuation-before-FIR, FIR-restart, buffer-too-small
+  and empty-segment errors. `application`: control and IIN round-trips, request/response headers,
+  `buildRequest`, short-fragment errors, non-exhaustive function-code decode. `objects`: qualifier byte,
+  object-header round-trips for every range shape, range/qualifier mismatch errors, short/garbage sweeps,
+  flags byte, and a round-trip of every core object. `records`: the layout table's wire lengths against
+  the object library, state-in-flags for binary and double-bit, absolute-time and float variations,
+  narrow-variation range rejection, packed shapes, the point-kind to group mapping. `root`: full
+  link-transport-application round-trips (single and forced multi-frame) in both roles.
+  `sa`: AES-KW RFC 3394 vectors through the shared `aeskw` module (which carries its own KAT suite),
+  HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs, AES-GMAC (McGrew GCM test case 1),
+  constant-time verify accept/tamper/wrong-length, g120 codec round-trips and garbage sweeps, session-key
+  wrap/unwrap including the SAv5 status-bound layout (every wire failure is one error, length-field lies,
+  the minimum status), the challenge-response flow, and the `SeqCounter`/`KeyExpiry`/`lookupUpdateKey`
+  helpers. `outstation`: IIN bits, READ (class 0 over all seven point types, every qualifier shape,
+  variation 0, packed variations, mixed-variation header splitting, hostile ranges), events (ordering,
+  confirm retires, timeout releases, per-class filtering, ring overflow), commands (SELECT+OPERATE,
+  timeout, wrong sequence/objects/index/peer, DIRECT_OPERATE and its no-ack form, every CROB operation,
+  analog output bounds, hook veto), DELAY_MEASURE, restart, unsolicited enable/disable and responses,
+  freeze and freeze-clear, ASSIGN_CLASS, fragmentation, hostile input (including a full-width command
+  range and a point index past the 16-bit space), and `Session` (link-service replies, both address
+  filters and the source-filter opt-out, SELECT/OPERATE across stations in both directions, broadcast
+  executed but unanswered, a request split across transport segments, out-of-order segments, bad CRC,
+  `unsolicitedFrames` framing and `tx_seq`). `secure_auth`: the hand-derived exchange vectors, bad reply
+  MAC and its retry, replies with the wrong CSQ / sequence / peer / user / key, reply timeout and
+  replaced challenges, SELECT+OPERATE each authenticated, non-critical requests byte-identical with and
+  without SA, the critical-set override, no-ack requests, aggressive-mode refusals, key-change refusals
+  (KSQ, user, update key, short data, replay including a recorded key change replayed after a restart),
+  expiry by time / count / status request, wiped old keys, the error budget, challenge shapes and the
+  storage boundary, and a challenged request leaving a response awaiting its confirm alone.
+- **Goldens and oracles.** `src/goldens.zig` replays sessions captured from a live **opendnp3** peer
+  (Apache-2.0, built from source, used strictly as a black box): (1) its `master-demo` against this
+  outstation over a real loopback TCP socket with a byte-moving proxy in between: startup tasks, an
+  integrity scan (class 3/2/1/0), an ad-hoc `ScanRange(g1v2, 0, 3)`, DISABLE_UNSOLICITED, a CROB
+  select+operate that opendnp3 reported as SUCCESS, a class-1 exception scan across an injected
+  process-image change (a g11v2 and a g2v2 event, CONFIRMed), a COLD_RESTART, and a second integrity scan
+  after the master cleared the restart IIN with a WRITE of g80v1; (2) the same master against a
+  fragmented response (300 binary inputs, `max_tx_fragment` 400), which opendnp3 confirmed and
+  reassembled with no sequence warnings; (3) the reverse direction, this module's master-side codecs
+  parsing what opendnp3's `outstation-demo` encoded (an unsolicited NULL response, g1v2, g20v1, g52v2).
+  Replaying (1) and (2) in order reproduces every reply byte for byte, 48-bit event timestamps included,
+  because the tests advance the same injected clock the harness did. The captured frames were also
+  dissected with Wireshark's DNP3 dissector: no malformed or expert indication, and DIR/PRM, addresses,
+  function codes, FIR/FIN/CON/SEQ, the restart and class-1 IIN bits and every object identifier of the
+  class-0 response matched this module's decoder. Tests marked SELF-DERIVED prove self-consistency only.
+  The first `secure_auth` test pins a whole SA exchange against vectors derived outside the module by
+  `tools/sa_outstation_kat.py` (Python `hmac`/`hashlib` and the `cryptography` package's RFC 3394 wrap),
+  which proves the module computes what *Secure Authentication integration* says, not that a foreign
+  SA master computes the same.
+- **Fuzz:** deterministic driver, `DNP3_FUZZ=<runs>[,<first seed>]`: harness `dnp3-fragment`
+  (`Outstation.handle` over structured request fragments), `dnp3-session` (`Session.feedFrame` over
+  structured, damaged-genuine and damaged link frames; both in `src/outstation.zig`) and `dnp3-sa` (SA
+  wrap, MAC and g120 objects as an oracle, `src/fuzz_test.zig`). Each has a reach test that fails when the
+  generator stops producing the shapes it exists for; fixed-iteration random-byte loops and
+  `std.testing.fuzz` targets over the same generators sit beside them.
+- **ctgrind:** rows `mac`, `keys` and `keys5` in `scripts/checks/ctgrind-expected.tsv` (SA session key
+  through every MAC and the reply MAC; update and session keys through the key wrap; the SAv5
+  status-bound wrap), read in *Key-wrap layout*.
+- **Stack probe:** `src/stackprobe_test.zig` (ReleaseFast) goes red when an SA entry point outgrows its
+  dead-stack burn in `src/burn.zig` or leaves a key in a frame.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-**Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
-(Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box
-peer:
+## What is deliberately not done
 
-1. *`master-demo` → this outstation*, over a real loopback TCP socket with a byte-moving proxy in
-   between. Startup tasks, integrity scan (class 3/2/1/0), an ad-hoc `ScanRange(g1v2, 0, 3)`,
-   DISABLE_UNSOLICITED, a CROB select+operate that opendnp3 reported as
-   `Received command result w/ summary: SUCCESS`, a class-1 exception scan across an injected
-   process-image change (which returned a g11v2 binary-output event and a g2v2 binary-input event
-   and was CONFIRMed), a COLD_RESTART reported as `Success, Time: 100`, and a second integrity
-   scan after the master cleared the restart IIN with a WRITE of g80v1. No protocol warnings.
-2. *The same master against a fragmented response*: 300 binary inputs and `max_tx_fragment = 400`,
-   so the class-0 scan spans multiple fragments. opendnp3 confirmed each non-final fragment and
-   reassembled the series with no "Response with bad sequence" warnings.
-3. *This module's master-side codecs → opendnp3's `outstation-demo`*, the reverse direction, which
-   cross-checks the pre-existing parsers against a third-party encoder: an unsolicited NULL
-   response, five g1v2 binary inputs, ten g20v1 counters and a g52v2 time delay, all decoded.
-
-Replaying sessions 1 and 2 **in order** reproduces every reply byte for byte, 48-bit event
-timestamps included, because the tests advance the same injected clock the harness did.
-
-Two real interop bugs were found this way and fixed:
-
-- The outstation set the link-layer **DIR bit** as if it were the master. opendnp3 logged
-  `Master frame received for master` / `Frame w/ unknown route, source: 10, dest 1` and dropped
-  every reply. §9.2.4.1.2: DIR is 1 for master-originated frames, 0 for outstation-originated ones.
-- **Continuation fragments reused the request's application sequence number** instead of
-  incrementing it (§5.1.6.2), so opendnp3 logged `Response with bad sequence` and stalled on every
-  multi-fragment response.
-
-**Independent dissection.** The captured session was written to a pcap (Ethernet/IPv4/TCP framing
-so the dissector sees port 20000) and dissected with Wireshark 4.6.4's DNP3 dissector via
-`rawshark` (`tshark` is not installed). All 43 frames dissected cleanly with **zero** malformed or
-expert-error indications, and every field matched this module's decoder: DIR/PRM (1/1 on the
-master's frames, 0/1 on ours), link addresses (10←1 and 1←10), application function codes (READ 1,
-WRITE 2, SELECT 3, OPERATE 4, CONFIRM 0, COLD_RESTART 13, DISABLE_UNSOLICITED 21, RESPONSE 129),
-FIR/FIN/CON/SEQ, `dnp3.al.iin.rst` set before the WRITE of g80v1 and clear after, `dnp3.al.iin.cls1d`
-set exactly on the responses that carried class-1 events, and the object identifiers in each
-class-0 response (0x0102 g1v2, 0x0302 g3v2, 0x0a02 g10v2, 0x1401 g20v1, 0x1501 g21v1, 0x1e01 g30v1,
-0x2801 g40v1) plus 0x0b02/0x0202 on the event response and 0x3402 (g52v2) on the restart reply.
-
-**Mutation run 2026-10-05** (in-place, Debug, 38 mutants over the link frame
-checks and CRCs, transport reassembly, the SA MAC compare, g120 object decoding,
-session-key unwrap, `SeqCounter`/`KeyExpiry`, and the outstation's
-select-before-operate gate, command and read/freeze range checks): 28 killed.
-Nine survivors were missing tests, now added: the second start octet on its
-own, a continuation after a FIN, bit 7 of a tampered MAC (`ctEql`), session
-keys that unwrap to the wrong length, a g120 header with the wrong qualifier, a
-read range and a freeze range ending one past the last point, `update`/
-`reportChange` one past the database, and a SELECT of exactly
-`max_select_bytes`. Equivalent: dropping `user_len > max_user_data_len` in
-`decodeFrame` (the length octet caps `user_len` at 255 − 5 = 250, which is the
-limit).
-
-**Delta mutation run 2026-11-19** (schemata, ReleaseSafe, 68 mutants over every decision in
-`secure_auth.zig` and the outstation hook): 50 killed first. Of the 18 survivors, 16 got
-killing tests. One of those gaps was in an authentication decision: no test had sent a reply
-MAC computed under the *empty* key of a user without session keys. The code refused it (the
-keyed-user check), but nothing proved that. Two survivors are equivalent. Dropping the
-`consumed == tail` test on the g120v9 object is covered because a size other than the MAC
-length either fails to decode or fails the length-checked constant-time compare. Dropping the
-`wrapped.len == 2·key_len + 8` test is covered because AES-KW rejects any such length. Result
-66/68 killed, 2 eq. Not mutated: the `secureZero` of the
-unwrapped-key scratch (observable only to a stack probe over a key change, which the module
-does not have yet) and of the confirmation-MAC buffer (that MAC goes on the wire).
-
-**Review-fix delta mutation 2026-11-19** (schemata, ReleaseSafe, 38 mutants over the review
-fixes: `secure_auth.zig`, the outstation hook, `sa.wrapSessionKeysWithStatus` /
-`unwrapSessionKeysWithStatus` and its minimum-status guard). Run 1 over 36: 30 killed. 4
-survivors got killing tests and were re-run killed: an ignored reply's count (two sites), the
-wrap's 16/32 key-length check, and klen ∈ {16, 32}, whose test had placed the status at the wrong
-offset. Two are equivalent. Dropping `wrapped.len - 8 > plain.len` is covered because aeskw
-refuses a short output buffer, which maps to `Unauthentic`. The `UnsupportedKeyLength → KeyLength`
-mapping is dead behind the update-key pre-check, which mutant 127 proves needed. The 2 guard
-mutants were run separately and killed. Result 36/38 killed, 2 eq.
+- **Transport I/O (TCP/serial/TLS).** `Session` consumes and produces byte slices; running it over a
+  channel is the caller's job (reference: opendnp3 and stepfunc ship channels, this module is
+  allocation-free, clock-free and I/O-free by design).
+- **Unsolicited retry policy.** `Outstation.unsolicited` builds the fragment and `confirmTimedOut`
+  puts the events back; the retry timer, the back-off and the "unsolicited allowed after the first
+  integrity poll" convention are the caller's, because the module owns no clock and no timer.
+- **Several masters on one `Outstation`.** One `Outstation` is one DNP3 association; serving several
+  masters means one `Outstation` per association over a shared point database, as both reference
+  stacks do.
 
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- **Unsolicited retry policy.** `unsolicited()` builds the fragment and `confirmTimedOut()` puts
-  the events back; the retry timer, the back-off and the "unsolicited allowed after the first
-  integrity poll" convention are the caller's.
-- **File transfer (g70), data sets (g85–g88), device attributes (g0), octet strings (g110/g111),
-  time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation
-  (g50v2/g51).**
+- **Stateful master session** (integrity/class polls, task queue, response timeout, unsolicited
+  handling). The master role is still the pure codecs. opendnp3 and stepfunc both ship it and most
+  DNP3 users are SCADA masters: this is the top gap. Large (~1-2 weeks); fits the allocation-free,
+  clock-injected, no-I/O shape.
+- **Object groups not built:** file transfer (g70) and device attributes (g0), used by
+  commissioning and configuration tools (medium); data sets (g85-g88), octet strings (g110/g111),
+  time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation (g50v2/g51).
 - **Secure Authentication, what the outstation integration leaves out:** the SAv5/SAv6
-  asymmetric update-key change (g120 v8/v10–v15), the g121/g122 security-statistic objects on
+  asymmetric update-key change (g120 v8/v10-v15), the g121/g122 security-statistic objects on
   the wire (counted in memory only), authenticated responses in the monitoring direction,
   AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
   side, and a stack probe over the key-change path.
-- x86_64 portable ctgrind trap counts for `keys5` include std soft-AES pad-lane definedness
-  reaching post-verdict public plaintext (sa.zig:896-899); revisit if std stops padding with
-  undefined.
-- ⚠ **FINDING (2026-11-19, open): `sa.ErrorCode` values past 1 may be wrong.** `sa.zig` has
+- **Open questions for the SA integration** (each needs the standard's text or a foreign
+  implementation to settle): (a) which bytes count as "the key-status message" in the g120v6
+  wrapped data (object body, whole object or ASDU) and the padding byte (the decision itself is in
+  *Key-wrap layout*); (b) what the g120v5 MAC covers (here: the received g120v6 object, under the new
+  monitoring key, only in the confirmation); (c) the exact default critical-function table;
+  (d) whether a reply may carry a sequence number other than the challenged request's; (e) the
+  aggressive-mode MAC input (here: last challenge message || request up to g120v9).
+- **FINDING (open): `sa.ErrorCode` values past 1 may be wrong.** `sa.zig` has
   1 authentication_failed, 2 unexpected_reply, 3 no_available_session_key, 4 unknown_user,
   5 unknown_association, 6 unknown_sequence_number, 7 unknown_key_change_method,
   8 unsupported_security_algorithm, 9 unsupported_mac_algorithm, 10 mac_algorithm_not_permitted,
@@ -585,35 +526,14 @@ mutants were run separately and killed. Result 36/38 killed, 2 eq.
   11 unknown user, 12 max session-key-status requests exceeded. Neither table has been checked
   against the standard. The two agree only on code 1, so the outstation emits only code 1.
   Check against the standard's table, then renumber (a behaviour change of `sa.ErrorCode`).
-- **Open questions for the SA integration** (each needs the standard's text or a foreign
-  implementation to settle):
-  (a) ~~whether the g120v6 wrapped data carries the last g120v5 message~~ — decided
-  2026-11-19, yes (see "Key-wrap layout"); the exact byte definition is still unverified;
-  (b) what the g120v5 MAC covers (here: the received g120v6 object, under the new
-  monitoring key, only in the confirmation);
-  (c) the exact default critical-function table;
-  (d) whether a reply may carry a sequence number other than the challenged request's;
-  (e) the aggressive-mode MAC input (here: last challenge message ‖ request up to g120v9).
 - **Data-link confirmed user data on the send path.** The outstation answers RESET_LINK_STATES,
   TEST_LINK_STATES and REQUEST_LINK_STATUS and accepts both confirmed and unconfirmed user data,
   but always *sends* unconfirmed user data; the FCB/FCV toggle is decoded, not enforced.
 - **Relative-time event variations (g2v3, g4v3)** are encodable by `records` but the outstation
   never selects them; it always emits absolute time.
-- **A stateful master session type** (poll scheduler, task queue, response-timeout state machine) —
-  the master role is still the pure codecs.
-- **pydnp3** could not be used as a second peer: its sdist needs a CMake build of a vendored
-  opendnp3 that fails on Python 3.14 in this environment. opendnp3's own C++ demos were built and
-  used instead.
-
-- (survey 2026-09-30) **Stateful master session** (integrity/class polls, task queue, response timeout, unsolicited handling): opendnp3 and stepfunc both ship it and most DNP3 users are SCADA masters; already listed above as "A stateful master session type" — this survey raises it to the top gap; large (~1-2 weeks), fits §2 (clock-injected, no I/O).
-- (survey 2026-09-30) ~~**Outstation SA integration**~~ — done 2026-11-19 (symmetric procedures, `secure_auth.zig`); the rest is listed above.
-- (survey 2026-09-30) **File transfer g70 and device attributes g0**: used by commissioning/config tools; medium, fits §2.
-
-## Status
-
-`gap · any (pure codec + outstation, no I/O) · both (master codecs + a stateful outstation) ·
-reentrant codecs, single-owner Outstation/Session` + deps: none (std only) — canonical source is
-`pub const meta` in src/root.zig.
+- **Portable ctgrind trap counts for `keys5`** include std soft-AES pad-lane definedness
+  reaching post-verdict public plaintext (`sa.zig` unwrap); revisit if std stops padding with
+  undefined.
 
 ## Anchoring
 
@@ -623,3 +543,4 @@ reentrant codecs, single-owner Outstation/Session` + deps: none (std only) — c
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** goldens.zig: live captured sessions vs real opendnp3 peer, both directions
+
