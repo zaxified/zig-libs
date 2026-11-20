@@ -972,6 +972,10 @@ records (the per-record 4 KiB burn).
 
 ## Backlog / deferred
 
+- **M3: differential run against the fork and the web-server consumer on a branch.** The seams are in (one send
+  buffer, `Connection.reader()`/`writer()` in place, `Server.writeSlot`/`commitWrite`, rekey bound
+  `max_records_per_key`); the run itself — same traffic through the fork and through this server, outputs and
+  throughput compared — has not been done.
 - **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
   `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
   are unobservable today.
