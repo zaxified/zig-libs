@@ -8,17 +8,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-17** — Whole-module mutation of `src/root.zig` (224 mutants, 213 killed, 11 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 14 tests added: a real loopback exchange, injected cancel and concurrency faults, and the edges of the caps, the numeric host forms and the documentation prefixes (see SPEC § Audit 2026-11-17). No source change, no behaviour change.
 - **2026-11-16** — **BEHAVIOUR CHANGE:** `lookup` now formats each hop's query with that server's syntax (new `serverQuery`, `LookupOptions.per_server_syntax = true`): `whois.arin.net` gets `n <ip>` for an IP literal, `whois.verisign-grs.com` gets `domain <name>` for a domain name; every other hop and query kind still gets the bare query. Set `per_server_syntax = false` for the old send-verbatim behaviour.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. test-only `ReadCueIo` hooks `Io.VTable.operate` and counts `Operation.net_read` (`netRead` left the vtable). Also: comptime `strRepeat` helper quota raised.
 - **2026-10-10** — **SECURITY (Fixed): a trailing dot hid a numeric host from the special-use guard.** `127.0.0.1.`, `127.1.` and `2130706433.` are now read as the address they denote (ONE trailing dot is stripped before the `inet_aton` analysis); two trailing dots leave an empty part and are refused as an invalid numeric form.
 - **2026-10-10** — **SECURITY (Fixed): the special-use destination guard let `inet_aton` numeric spellings of non-routable addresses through.** ``isSpecialUseHost`` classified only canonical IP literals, so `127.1`, `2130706433`, `0x7f.0.0.1`, `017700000001`, `10.1` and the like returned false although a resolver that takes them as IPv4 dials 127.0.0.1 / 10.0.0.1. The host is now read as an `inet_aton` form (1-4 dot-separated parts, decimal, octal or hex; the last part fills the remaining bytes) and the address it denotes is classified; a numeric-shaped host that is not a valid form (a part that overflows, an empty or malformed part) is refused outright. Public numeric spellings (`134744072` = 8.8.8.8) stay allowed. Found by the `WHOIS_FUZZ` oracle.
 - **2026-10-10** — tests: deterministic fuzz driver `WHOIS_FUZZ` over the referral harness (generic over its choice source) plus a referral/query roundtrip oracle and an SSRF oracle (`isSpecialUseHost` refuses every private, loopback, link-local and IPv4-mapped spelling, with trailing dots and upper case). No code change.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `TcpTransport` cancel tests canceled after a fixed
-  sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a
-  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
-  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
-  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
 
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the audit F17 regression
   test now counts response lines scanned instead of timing `nextServer`

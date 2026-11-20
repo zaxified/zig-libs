@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — clean-room from public RFC 3912, no third-party code).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line and the module's own NOTICE (a provenance note only: clean-room from public RFC 3912, no third-party code).
 
 ## Compared with
 
@@ -24,12 +24,12 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot); s
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [rfc1036/whois](https://github.com/rfc1036/whois) — **reference** | C | GPL-2.0 (API; source not read) | 623 | push 2026-07-25 (no GitHub release) | The de-facto command-line client. Its README: "can automatically select the appropriate whois server for most queries" from an internal database it says is "often more accurate than IANA's published one". Notices *(inferred from general knowledge)*: per-server query flags, IDN handling, charset conversion. Here: IANA bootstrap plus referral chase, one query text for every hop. |
+| [rfc1036/whois](https://github.com/rfc1036/whois) — **reference** | C | GPL-2.0 (API; source not read) | 623 | push 2026-07-25 (no GitHub release) | The de-facto command-line client. Its README: "can automatically select the appropriate whois server for most queries" from an internal database it says is "often more accurate than IANA's published one". Notices *(inferred from general knowledge)*: per-server query flags, IDN handling, charset conversion. Here: IANA bootstrap plus referral chase, with the documented ARIN and Verisign query flags per hop (every other hop gets the bare query). |
 | [likexian/whois](https://github.com/likexian/whois) | Go | Apache-2.0 | 494 | v1.15.7 (2026-01-04) | Its README: "domain, IP include IPv4 and IPv6, ASN are supported"; module plus binary. Parsing lives in a separate `whois-parser` package *(inferred)*. |
 | [saidutt46/domain-check](https://github.com/saidutt46/domain-check) | Rust | NOASSERTION (not read) | 308 | push 2026-09-29 | A domain-availability tool: "RDAP with WHOIS fallback", CLI + Rust library. Shows where Rust users go for WHOIS: a bundled tool, not a protocol crate *(no standalone protocol crate above 100 stars found in a `whois language:rust` search)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | `std` has none; GitHub search `whois language:zig` returned no repository on 2026-09-30. |
 
-**Where we are ahead:** the only WHOIS client in Zig (search above); zero-allocation and I/O-agnostic (`Transport` seam); the referral chase is bounded on depth, cycles and response size and refuses special-use referral targets (also after resolution in `TcpTransport`), which neither README above describes; CRLF-injection-proof query formatting · **Where we are behind:** no per-server query syntax inside `lookup` (the ARIN/Verisign helpers exist but `lookup` sends one query text to every hop), no IDN/punycode conversion, no built-in TLD→server table (relies on the IANA hop), no reply parsing beyond referral keys (by design: SPEC "Design") (→ Backlog).
+**Where we are ahead:** the only WHOIS client in Zig (search above); zero-allocation and I/O-agnostic (`Transport` seam); the referral chase is bounded on depth, cycles and response size and refuses special-use referral targets (also after resolution in `TcpTransport`), which neither README above describes; CRLF-injection-proof query formatting · **Where we are behind:** per-server query syntax covers only ARIN and Verisign (the reference client has more flags), no IDN/punycode conversion (→ Backlog), no built-in TLD→server table (relies on the IANA hop), no reply parsing beyond referral keys (both by design, see *What is deliberately not done*).
 
 ## Design & invariants
 Transport seam, zero allocation: `Transport` is one function — connect to `server:port`, send the
@@ -44,6 +44,8 @@ parsing: replies are NOT parsed beyond the referral keys — every registry has 
 format; `fieldValue` (case-insensitive key, trimmed value) is the only concession; `nextServer`/
 `parseServerRef` never error on garbage. Query safety: `formatQuery` rejects embedded CR/LF (would
 inject a second WHOIS command) and enforces `max_query_len`. Reentrant — no shared state anywhere.
+
+Per-hop query syntax: `serverQuery(buf, server, query)` is what `lookup` uses for each hop (`LookupOptions.per_server_syntax`, default `true`; `false` sends `query` verbatim to every hop). Following the reference client's per-server flags: `whois.arin.net` gets `n <ip>` for an IP literal, `whois.verisign-grs.com` gets `domain <name>` for a dotted non-IP name; any other server, any other query kind (ASN, handle) and any query that already contains a space get the bare query. The host comparison is ASCII case-insensitive and ignores one trailing dot. Only these two registries' flags are built in; the others the reference client knows (DENIC, JPNIC) are not added, only inferred (see Backlog).
 Clean-room from RFC 3912 plus the documented IANA/registry referral-line conventions (IANA `refer:`,
 ARIN `ReferralServer:`, Verisign `Registrar WHOIS Server:`, the `whois://` URL form) — no third-party
 whois implementation consulted or copied; nothing to attribute (the module-local `NOTICE` is a
@@ -86,37 +88,28 @@ caller's own `LookupOptions.root` from a referral — a caller who wants this tr
 loopback/private server on purpose (a local mirror, or a test peer) sets `deny_special_use = false`.
 
 ## Verification
-Tests (`scripts/modtest whois`), all but one offline from canned buffers: `formatQuery` round-trip + CRLF-injection and
-length rejection; the documented ARIN/Verisign query conveniences; `fieldValue` and `parseServerRef`
-(whois:// URL, ports, scheme/garbage rejection); a known-answer referral extraction; `isSpecialUseHost`
-classification (loopback/RFC 1918/link-local/unique-local/`localhost`, the trailing-dot spelling, and
-that a normal public host passes); the full `lookup` behavior over a scripted transport —
-IANA→Verisign→registrar chain, self-referral and two-server-cycle termination, depth-cap `truncated`
-reporting, byte-cap `ResponseTooLarge`, referral port carried from a `whois://` URL, up-front rejection
-of bad root/oversized query, transport-failure propagation, and the SSRF guard refusing a
-loopback/RFC 1918 referral (string form and, over real loopback sockets, resolved form) while a normal
-public referral still proceeds. The one exception dials loopback on purpose: `TcpTransport`'s
-cancellation test binds its own listener and connects to it (`deny_special_use = false`) to prove a
-canceled read surfaces `error.Canceled` rather than `error.TransportFailed`; no test ever dials a real
-registry. Run: `zig build test-whois`.
 
-## Audit 2026-11-17 (whole-module mutation)
+Run: `scripts/modtest whois` (the `whois` build step; the module is tagged `timing` and `loopback`). All but one test run offline from canned buffers; no test dials a real registry.
 
-224 mutants over every non-test line of `src/root.zig`, one schemata build in ReleaseSafe and one run per mutant, baseline first: `formatQuery` and the two prefixed queries (length caps, buffer fit, CR/LF refusal, the terminator, the prefixes), `Transport.exchange`, `fieldValue` and `nextServer` (empty key, line shapes, colon, trims, first occurrence, priority), `parseServerRef` (trim, scheme, path cut, bracketed and bare v6, port parsing and range, host length, both charsets), `isSpecialUseHost` (trailing dots, `localhost` and `.localhost`, numeric forms, the unmapped literal), `parseInetAton` (trailing dot, charset, part count, hex and octal prefixes, the 32-bit cap, the byte range, the last-part room, byte order), `isSpecialUseIp` and the documentation prefixes octet by octet, `serverQuery` (host match and case, the space test, the IP and dot tests), `Chain`, `lookup` (root port, per-hop syntax, cycle and special-use guards, the hop cap, `truncated` on every return, the referral port), and `TcpTransport` (the error mapping, the flush, the exact-fit probe, the bounded runner, the resolved-address guard). Round 1: 166 killed + 5 hung, 53 survived. The suite never ran a real exchange, so 14 tests were added: the 512/513-byte edge and the exact-fit buffer of `formatQuery`; the prefix counted against the cap and a buffer shorter than the prefix; line shapes only a strict reader refuses (an empty key, a line as long as the key, first occurrence, a CR-only or blank value that must not hide a later one, an unparseable referral that must not hide a lower-priority key); CR, scheme case, `[::1]x43`, `[::1]:0` and underscores in `parseServerRef`; `.LOCALHOST`, `1.abc`, the 32-bit cap (`4294967295`, `4294967296`, `4294967297`), `1.2.3.256`, `10.1.65536`, the neighbours of the three TEST-NETs and of `2001:db8::/32`; `parseInetAton` on `""`, `"."` and `0X7f`; `serverQuery` host case; `Chain.append` at 255 and 256 bytes; the root port and the referral port in `lookup`; and `TcpTransport` end to end over loopback (the query reaches the peer, an exact-fit reply is returned, one byte over is `ResponseTooLarge`, bounded) plus four faults injected through a wrapped `std.Io` (no unit of concurrency, a cancel while resolving, a cancel while writing bounded and unbounded, a cancel while reading under `timeout_ms`). Round 2 and 3: 213 killed (counting the 5 hangs), 11 do not die, none a defect:
+- **Query and parse classes:** `formatQuery` round trip, CRLF-injection and length rejection (the 512/513-byte edge, the exact-fit buffer, the prefix counted against the cap); the ARIN/Verisign conveniences and `serverQuery`; `fieldValue` and `nextServer` line shapes (empty key, first occurrence, CR-only or blank values, an unparseable referral that must not hide a lower-priority key); `parseServerRef` (`whois://` URL form, bracketed and bare v6, ports and their range, scheme and charset rejection, host length).
+- **SSRF guard:** `isSpecialUseHost` over loopback, RFC 1918, link-local, unique-local, `localhost` and `.localhost`, the trailing-dot spelling, every `inet_aton` numeric form (decimal, octal, hex, 1-4 parts, the 32-bit cap) and the documentation prefixes octet by octet; and that a normal public host passes.
+- **`lookup` over a scripted transport:** the IANA to Verisign to registrar chain, self-referral and two-server-cycle termination, depth-cap `truncated`, byte-cap `ResponseTooLarge`, `max_referrals` clamped to `Chain.capacity`, the referral port carried from a `whois://` URL, per-hop syntax on and off, up-front rejection of a bad root or oversized query, transport-failure propagation, the SSRF guard refusing a loopback/RFC 1918 referral, a normal public referral proceeding, `Chain.append` at its length edges.
+- **`TcpTransport` over real loopback sockets:** the query reaches the peer, an exact-fit reply is returned, one byte over is `ResponseTooLarge`, the resolved-address guard refuses a loopback address by default; cancellation (while resolving, writing, reading, under `timeout_ms`) surfaces `error.Canceled` through a wrapped `std.Io` that injects the faults (`deny_special_use = false` there, because the peer is loopback on purpose).
+- **Goldens (`src/goldens.zig`):** real port-43 replies captured from IANA and Verisign (LF and CRLF), including a real referral cycle; see Anchoring.
+- **Fuzz:** `WHOIS_FUZZ` (deterministic driver, `src/fuzz_test.zig`) over the referral-line parser on hostile text, with a roundtrip oracle and an SSRF oracle; a reach test pins that the harness hits every outcome.
+- **Mutation:** whole-module over every non-test line of `src/root.zig` (not mutated: constants, the test-only line counter, type declarations and error sets, doc comments, test files). The equivalent mutants are of three kinds: an empty remainder that answers the same `QueryTooLong`, a trim or digit check that a later check decides identically, and cost-only probes; the unobservable ones need an injected clock or resolver (the deadline exactly now, a success landing in the cancel window, a public resolved address with a live peer).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-- EQUIVALENT (8): `prefixedQuery` with a buffer exactly as long as the prefix (the empty remainder answers the same `QueryTooLong`); the inner value trim of `nextServer` (the line is already trimmed and `parseServerRef` trims the same bytes); the non-digit-start test of `parseInetAton` (the per-part digit check right below decides it identically); the empty-digits check (`parseInt` of `""` fails the same way); `room < 32` (it is 32 only for a single part, which the part cap already bounds); `isUniqueLocal` in `isSpecialUseIp` (`isPrivate` covers `fc00::/7`); the always-probe read of the exact-fit check (cost-only); and `connectChecked` skipping the empty-answer check (it falls through to `UnknownHostName`, mapped to the same `TransportFailed`).
-- UNOBSERVABLE (3): `runBounded` treating a deadline exactly now as not yet expired (needs the clock to read exactly the deadline; injection: a fake clock); a success that lands in the cancelation window being dropped (injection: a gate between completion and cancel); and `connectChecked` refusing always instead of only special-use addresses (needs a resolved, routable, non special-use address with a live peer; injection: a resolver answering a public address).
+## What is deliberately not done
 
-Not mutated: constants (`default_port`, `iana_root`, the caps, `referral_keys`, `Chain.capacity`), the test-only line counter, type declarations and error sets, doc comments, and the test files. Counts on the card are whole-module (they replace the earlier mutation entry, which carried none).
+- **No reply parsing beyond the referral keys** (`fieldValue` is the only concession): every registry has its own freeform format. Replies are opaque bytes.
+- **No built-in TLD to server table:** the IANA hop resolves any TLD, IP or ASN; the reference client's internal database is not reproduced.
+- **No port restriction on a referral** beyond `!= 0`, and no hostname-plus-port cycle guard (see Threat model).
 
 ## Backlog / deferred
-- ✅ DONE 2026-11-16 (`serverQuery` + `LookupOptions.per_server_syntax`, default true: ARIN `n <ip>`, Verisign `domain <name>`; DENIC/JPNIC flags not added, only inferred) **Per-server query syntax in `lookup`** *(survey 2026-09-30)*. `arinIpQuery`/`verisignDomainQuery` exist but `lookup` (`src/root.zig`, `lookup`) formats one wire query and sends it to every hop; the reference client switches flags per server (ARIN `n `, Verisign `domain `, DENIC/JPNIC-style switches *(inferred)*), so some registries return a fuzzy or unhelpful answer to the bare query. Effort: small (a hop-aware query callback or a table for the few servers with documented flags). Fits CONVENTIONS §2.
-- **IDN (punycode/UTS #46) conversion of the query** *(survey 2026-09-30)*. A Unicode domain reaches the registry as raw UTF-8, which most port-43 servers reject; the reference client converts. Effort: medium — no sibling punycode/IDNA module (`ls modules | rg -i 'idn|puny'` empty; the README catalog was searched for punycode/idna/xn--). Fits §2.
 
-## Status
-`gap · any (logic over a transport seam; optional TcpTransport is posix) · client · reentrant` +
-deps: `netaddr` (special-use address classification for the referral SSRF guard) — canonical source is
-`pub const meta` in src/root.zig.
+- **IDN (punycode/UTS #46) conversion of the query** *(survey 2026-09-30)*. A Unicode domain reaches the registry as raw UTF-8, which most port-43 servers reject; the reference client converts. Effort: medium; there is no sibling punycode/IDNA module in `modules/`. Fits CONVENTIONS §2.
+- **Per-server flags for further registries (DENIC, JPNIC-style switches).** Not added because the syntax is only inferred, not read from a source; `serverQuery` is the one place to add a table entry.
 
 ## Anchoring
 
@@ -126,5 +119,3 @@ deps: `netaddr` (special-use address classification for the referral SSRF guard)
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/goldens.zig carries real port-43 replies captured live from IANA and Verisign, including a real referral cycle; root.zig's own canned replies say in their comment that they are only `modeled on the real line conventions`, so the transport and the remaining parse paths stay self
-
-**How it got there.** The anchoring work landed. DONE ea2d000: real IANA+Verisign port-43 replies; real referral CYCLE exercised
