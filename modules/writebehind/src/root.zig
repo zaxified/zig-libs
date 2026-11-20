@@ -358,9 +358,9 @@ pub const Options = struct {
     /// **counted and inspectable** (`poisonedCount` / `poisoned`), never silent;
     /// treat a non-zero count as data loss that has already happened.
     ///
-    /// This defaulted to `jobqueue`'s own `max_attempts` of 5 until,
-    /// which silently dropped an acked write after five rejections while the
-    /// SPEC promised the opposite.
+    /// This does not default to `jobqueue`'s own `max_attempts` of 5, which
+    /// would silently drop an acked write after five rejections while the
+    /// SPEC promises the opposite.
     ///
     /// Note the shutdown consequence: `deinit` runs `flushAll`, so tearing down
     /// while the sink is refusing blocks for up to `flush_timeout_ns`.
