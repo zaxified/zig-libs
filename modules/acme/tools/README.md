@@ -23,9 +23,9 @@ GOBIN=~/.local/share/zig-libs/oracle-bin/pebble go install github.com/letsencryp
 
 Loopback only; fixed ports 5001 5002 5003 8053 8055 14000 14001 15000. A new transcript is not
 byte-identical to the old one (Pebble draws its IDs, nonces and keys); the replay holds for any
-transcript of a run in which all six scenarios came out as expected.
+transcript of a run in which all nine scenarios came out as expected.
 
-**What the replay holds** (2026-10-06, Pebble v2.10.1, go1.26.0): six scenarios, each served back
+**What the replay holds** (Pebble v2.10.1, go1.26.0): the nine scenarios plus `lifecycle` and `steps`, each served back
 to the client from Pebble's recorded answers — the issued chain byte for byte, `badNonce`
 rejections retried, the `connection` and `rejectedIdentifier` problems reported through
 `lastProblem`.

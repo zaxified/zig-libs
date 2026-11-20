@@ -11,7 +11,6 @@ tests pin, and oracles that drive a foreign implementation through the public AP
 wire format. The audit's mutation runners and per-finding probes were deleted on
 2026-09-17; what they found is pinned by tests in `src/` or filed as open findings.
 
-All figures below were measured on 2026-09-16 against the tree as it stands.
 
 ## The goldens can be re-derived, not just read
 
@@ -21,7 +20,7 @@ All figures below were measured on 2026-09-16 against the tree as it stands.
 | `capture.sh` | — Runs one `tc` command inside `unshare -rn` under `strace` and prints the `sendmsg` payload as hex. |
 | `parse_strace.py` | — Turns that strace output into one hex line per buffer. |
 
-`src/goldens.zig` is ~106 KB of byte-exact netlink datagrams captured from a
+`src/goldens.zig` holds byte-exact netlink datagrams captured from a
 real `iproute2`. Its header records the capture recipe in prose; this is the
 executable half. **A golden nobody can re-derive is a number, not evidence** —
 and before this migration the recipe existed only as a comment plus a script in
@@ -30,7 +29,7 @@ a droppable cache.
     modules/tc/tools/verify_goldens.py          # all of them
     modules/tc/tools/verify_goldens.py htb      # only matching names
 
-Measured: **51 of 51 goldens reproduced**, 0 MISS, 0 TMO, on
+A clean run reports every golden reproduced (0 MISS, 0 TMO) on
 `iproute2-6.19.0` with `/proc/net/psched = 000003e8 00000040 000f4240
 3b9aca00` — the same calibration `ratespec.golden_psched` pins, which is what
 makes the rate tables host-independent.

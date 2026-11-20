@@ -1,7 +1,6 @@
 # `websocket` tools
 
-Recipes for committed data (`CONVENTIONS.md` §9): run by hand, never by a test. Moved here on
-2026-09-17 from a private `~/.cache` directory, where they were the only copy.
+Recipes for committed data (`CONVENTIONS.md` §9): run by hand, never by a test.
 
 The frozen three-implementation corpus in `src/connection.zig` came from:
 
@@ -24,9 +23,8 @@ The three-implementation corpus above is entirely post-handshake data frames fed
 `verify_response_probe.zig` do: they diff the module's `handshake.verifyResponse`
 (client side) and `handshake.acceptHandshake` (server side) against python-websockets
 15.0.1's (BSD-3-Clause, verified via `pip show websockets`) `ClientProtocol`/
-`ServerProtocol` over the same fixed case table. Adopted 2026-09-17 from an audit
-reproducer that only printed python-websockets' own verdicts (`CONVENTIONS.md` §9);
-this version also builds and runs the Zig side and diffs the two.
+`ServerProtocol` over the same fixed case table. It builds and runs the Zig side and
+diffs it against python-websockets' verdicts (`CONVENTIONS.md` §9).
 
 ```bash
 scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
@@ -57,20 +55,16 @@ scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
 modules/websocket/tools/oracle_handshake.py <scratch>/verify_response_probe
 ```
 
-**Measured 2026-09-17: 10/10 cases agree** (6 client-side `verifyResponse` cases, 4
-server-side `acceptHandshake` cases) — no case where this module's ACCEPT/REJECT
-decision differs from python-websockets'. Needs `pip install websockets==15.0.1`.
+The case table holds 10 cases (6 client-side `verifyResponse`, 4 server-side
+`acceptHandshake`); the script exits 0 iff every case agrees. Nine agree. The tenth, the
+`Origin: https://evil.example` row, is a *known, deliberate* divergence: `acceptHandshake`'s
+`Origin` allow-list (SPEC.md "Server-side `Origin` check") rejects it with
+`error.OriginNotAllowed` (the Origin's host does not match `Host: h`), while python-websockets'
+bare `ServerProtocol` has no origin policy of its own, so the script reports one MISMATCH for it
+(the comment on that row in `verify_response_probe.zig` explains why). Needs
+`pip install websockets==15.0.1`.
 
-**Stale as of 2026-09-28** for one row: `acceptHandshake`'s new `Origin` allow-list
-(SPEC.md "Server-side `Origin` check") makes the `server_cases` "Origin: https://evil.example"
-case a *known, deliberate* divergence rather than an agreement — this module's default policy
-now rejects it (`error.OriginNotAllowed`, Origin's host doesn't match `Host: h`), while
-python-websockets' bare `ServerProtocol` has no origin policy of its own to check it against.
-The other 9 rows are unaffected. Not re-run for this change (no python/go environment
-available); re-running would now report 9/10, with this row's comment in
-`verify_response_probe.zig` explaining why.
-
-## The live oracle: `interop.zig` + `go_oracle/` (2026-10-26)
+## The live oracle: `interop.zig` + `go_oracle/`
 
 `zig build interop-websocket` (a program, not a test; `check-interop` compiles it) builds
 `go_oracle` — github.com/coder/websocket v1.8.15 and github.com/gorilla/websocket v1.5.3 through
@@ -85,7 +79,7 @@ Verdicts: `.zig-cache/interop-websocket/verdicts.tsv`.
 handshake in the scenarios without 1 MiB of plain payload, replayed hermetically by
 `src/interop_replay_test.zig`.
 
-## Fastest in the field: `go_bench/gorilla/`, `rust_fast_bench/` (2026-10-26)
+## Fastest in the field: `go_bench/gorilla/`, `rust_fast_bench/`
 
 `zig build bench-websocket` also times gorilla/websocket v1.5.3 (`go_bench/gorilla`, same module
 cache) and denoland/fastwebsockets 0.10.0 + snapview/tungstenite 0.30.0 (`rust_fast_bench`,

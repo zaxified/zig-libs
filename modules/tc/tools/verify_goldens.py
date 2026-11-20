@@ -5,7 +5,7 @@ and compare it byte-for-byte with the pinned constant.
 
     modules/tc/tools/verify_goldens.py [name-substring]
 
-`modules/tc/src/goldens.zig` is ~106 KB of byte-exact netlink datagrams taken
+`modules/tc/src/goldens.zig` holds byte-exact netlink datagrams taken
 from a stock `tc` binary. Its header records the capture recipe in prose; this
 is the executable half -- without it the constants can be read but not
 re-derived, and a golden nobody can re-derive is a number, not evidence.
@@ -91,9 +91,9 @@ MANUAL = {
 # ⚠ COVERAGE FLOOR. Every case above is DISCOVERED by parsing comments, so a
 # change to how goldens.zig spells its `// tc` lines silently shrinks the run
 # rather than breaking it -- and "reproduced 0 / 0 goldens" both reads like a
-# success and exits 0. Measured 2026-09-16: 51 constants, 51 of them reachable
-# through a recorded command line, 51 reproduced. So the discovery step owes a
-# case for every constant, and losing one is a defect in THIS script.
+# success and exits 0. Every constant is reachable through a recorded command
+# line, so the discovery step owes a case for every constant, and losing one
+# is a defect in THIS script.
 missing = sorted(set(goldens) - {g for _, _, g in cases})
 if missing and not want_filter:
     print(f"⛔ the extractor found {len(cases)} cases for {len(goldens)} constants; "

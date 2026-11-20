@@ -40,8 +40,8 @@ It builds, so run it under `hw run`:
 
     hw run -- python3 -I modules/dns/tools/update_server.py check
 
-Last run 2026-10-16: 37 checks, 0 failures (it caught the ARCOUNT-not-restored resend bug in
-`update.send` on its first run).
+It exits non-zero when any check fails (its first run caught the ARCOUNT-not-restored resend bug
+in `update.send`).
 
 ## Go dnsmessage oracle (frozen, replayed by `test-dns`)
 

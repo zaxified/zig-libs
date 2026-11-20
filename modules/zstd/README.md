@@ -55,11 +55,11 @@ libc.
   `error.LevelUnsupported` where libzstd would quietly clamp to 22.
 - **Output:** one frame, content size in the header, optional content checksum
   (`checksum = true`). Byte-identical to `ZSTD_compress2()` with the same
-  level and checksum setting — pinned by the golden test on a 56-case corpus
+  level and checksum setting — pinned by the golden test on a 107-case corpus
   (every case at levels -5…10 with and without checksum, cases up
-  to 600 KB at levels 11–22, 14 cases found by mutation testing at the one
-  level each pins, 15 compressed with long-distance matching switched
-  on by hand, 13 with index overflow correction run often, and 9 inputs laid
+  to 600 KB at levels 11–22, cases found by mutation testing at the one
+  level each pins, cases compressed with long-distance matching switched
+  on by hand or with index overflow correction run often, and inputs laid
   out by hand for one compressor boundary each: 2038 frames), and against
   libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
   3500 MiB index limit.
@@ -555,18 +555,18 @@ fresh one's). The module is `heavy` in `build.zig`:
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
-`src/stream_test.zig` does the same for streaming: 72 cases, each a schedule of calls
+`src/stream_test.zig` does the same for streaming: 99 cases, each a schedule of calls
 (pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
 so libzstd's input buffer wraps, index overflow correction run often, long-distance
-matching switched on by hand; 24 of them found by mutation testing) over
-corpus inputs at levels -10 … 22, with and without checksum — 586 streams,
+matching switched on by hand; many found by mutation testing) over
+corpus inputs at levels -10 … 22, with and without checksum — 692 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 
-`src/param_test.zig` does it for the advanced parameters: 64 cases (an
-input, a `name=value` list of libzstd parameters, levels) — 125 frames equal
+`src/param_test.zig` does it for the advanced parameters: 68 cases (an
+input, a `name=value` list of libzstd parameters, levels) — 129 frames equal
 to what `ZSTD_compress2` produced with the same parameters set
-(`src/testdata/param_goldens.zig`); 15 more stream cases carry parameters
+(`src/testdata/param_goldens.zig`); some stream cases carry parameters
 too. It also pins the bounds of every parameter, magicless frames both ways
 and the content-size flag.
 
@@ -578,19 +578,19 @@ the window limit, stable output, the `Reader`), and
 off-line against libzstd's decoder through `tools/zdec.c` (see SPEC.md,
 *Anchoring*).
 
-`src/dict_golden_test.zig` does it for dictionary training: 54 runs (13
+`src/dict_golden_test.zig` does it for dictionary training: 54 runs (15
 generated sample sets, `src/testdata/dict_samples.zig`, × cover and
 fastCover parameters, capacities, split points; refusals included), each
 content equal in length and SHA-256 to what libzstd's trainer placed in the
 buffer before finalization (`src/testdata/dict_goldens.zig`,
 `tools/ztrain.c` calling the trainers' internal steps).
 
-`src/dict_test.zig` does it with dictionaries: 74 cases (an input, a
+`src/dict_test.zig` does it with dictionaries: 173 cases (an input, a
 dictionary — raw content from the corpus generators, two trained by
 libzstd's `ZDICT_trainFromBuffer` and committed as `src/testdata/*.zdict`,
 those with 1-, 2- and 4-byte IDs, and a hand-built one whose tables all
 need checking — the way it is used, content type, parameters, levels
-−5…22) — 326 frames and streams equal to libzstd's
+−5…22) — 729 frames and streams equal to libzstd's
 (`src/testdata/cdict_goldens.zig`), which the recipe also decodes back
 with the dictionary.
 

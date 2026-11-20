@@ -25,9 +25,9 @@ Run (from the repo root):
     modules/websocket/tools/oracle_handshake.py <path-to-verify_response_probe>
 
 Produces: one line per case ("agree"/"MISMATCH") plus a summary; exit code
-0 iff every case agrees.
+0 iff every case agrees (the Origin case does not).
 
-measured 2026-09-17: 10/10 cases agree (see tools/README.md).
+The Origin case is a known, deliberate divergence (see tools/README.md).
 """
 import subprocess
 import sys

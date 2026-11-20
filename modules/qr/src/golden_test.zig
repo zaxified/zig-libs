@@ -7,8 +7,8 @@
 //! subprocess: these tests run everywhere, including CI, which never has
 //! segno installed.
 //!
-//! Why this exists: the module's other 31 tests are self-consistency --
-//! round trips, literal pins against the standard, four fuzz harnesses -- and
+//! Why this exists: the module's other tests are self-consistency --
+//! round trips, literal pins against the standard, the fuzz harnesses -- and
 //! every one of them is blind to a whole defect class by construction. A
 //! round trip decodes with the same `Walk` order and the same
 //! (possibly-wrong) block-structure table the encode used, so a bug in
@@ -17,11 +17,8 @@
 //! which is what forcing segno to the identical (version, ecc, mask) and
 //! diffing module-for-module gives us.
 //!
-//! `SPEC.md` used to describe exactly this kind of comparison ("672
-//! matrices... byte-identical", "320 matrices... byte-identical") with zero
-//! test code behind either number -- see the module's CHANGELOG for the
-//! Entry that corrected the claim. This file, `tools/reference.py` and
-//! `testdata/golden_matrices.zig` are what make the claim real.
+//! This file, `tools/reference.py` and `testdata/golden_matrices.zig` are the
+//! external-oracle anchor for the encoder (SPEC.md "Verification").
 
 const std = @import("std");
 const testing = std.testing;
