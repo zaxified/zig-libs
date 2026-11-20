@@ -88,12 +88,9 @@ with its leaf index precisely because two members may publish the same one.
   ratchet tree, the transcript hashes, the epoch secrets and this member's path
   secrets all have to survive together or not at all — and half of it would be
   worse than none.
-- **Handshakes travel as `PublicMessage`.** `mls.Group` refuses a handshake
-  framed as `PrivateMessage` (`error.PrivateHandshakeNotSupported`) because
-  that path needs the §9 secret tree driven for the handshake ratchet too. RFC
-  9420 §6 permits either framing; this app takes the one the library supports.
-  The cost is real: the delivery service sees *that* membership changed, though
-  not the content of anything.
+- **Handshakes travel as `PublicMessage`**, `mls.Group`'s default framing. RFC
+  9420 §6 permits either. The cost is real: the delivery service sees *that*
+  membership changed, though not the content of anything.
 - **No Update proposals and no external joins.** Both are in the module's API;
   neither is wired up here. Add, Remove and a member's own departure are.
 - **`/leave` is a proposal, not an act**, because §12.4 forbids a committer

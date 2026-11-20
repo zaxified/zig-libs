@@ -59,12 +59,7 @@
 //! and lives in `keyschedule.zig`, and so now is the Commit creation it
 //! also needs). There is no half-built code behind a switch anywhere.
 //!
-//! **The one boundary Parts 7-8 state as a named refusal rather than
-//! silence** is worth knowing about, because a caller meets it at runtime:
-//! `group.Error.PrivateHandshakeNotSupported` (a Commit or proposal framed
-//! as a `PrivateMessage` — the §9 secret tree exists but this object does
-//! not drive it per epoch). It is not a gate: it is a permanent, documented
-//! property of what these parts own. Both Commit paths are transactional
+//! Both Commit paths are transactional
 //! (see `group.zig`'s doc comment on atomicity) and `framing.MLSMessage.decode`
 //! handles every §17.2 wire format.
 //!

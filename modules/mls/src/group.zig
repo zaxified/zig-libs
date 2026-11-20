@@ -39,20 +39,16 @@
 //! order, with each step commented by its bullet, because splitting it up
 //! is exactly how the order drifts.
 //!
+//! **`PrivateMessage` and the secret tree.** The group drives §9's secret
+//! tree per epoch (`secret_tree`, created on first use, dropped on every
+//! adopted Commit): `protectApplication`/`unprotectApplication` send and
+//! receive application data, and proposals and Commits can be sent
+//! (`HandshakeFraming`) and received as `PrivateMessage` too. Part 8 added
+//! `createProposal`, `createCommit` and the `UpdatePath` generation under
+//! them, so this object is a complete client and not only a follower.
+//!
 //! **What this object deliberately does NOT own.**
 //!
-//! ⚠ Creating Commits and proposals used to be on this list, and is not any
-//! more: Part 8 added `createProposal`, `createCommit` and the `UpdatePath`
-//! generation under them, so this object is a complete client and not only a
-//! follower. The list below is what is still true.
-//!
-//!   * **Application messages and the secret tree.** `secrettree.zig` owns
-//!     §9's ratchets, but this object does not drive them: a Commit changes
-//!     `encryption_secret`, and re-keying the secret tree per epoch is a
-//!     separate concern with its own generation/deletion policy. Handshake
-//!     messages sent as `PrivateMessage` are therefore NOT accepted here —
-//!     see `error.PrivateHandshakeNotSupported`, which is a scope boundary
-//!     stated as a named refusal rather than a silent gap.
 //!   * **§7.3 LeafNode validation and §10.1 KeyPackage validation** (Part
 //!     3, still not built). `processCommit` checks the leaf properties
 //!     §12.4.2 names EXPLICITLY in its own bullets — `leaf_node_source ==
@@ -114,12 +110,9 @@ const treehash = @import("treehash.zig");
 const treekem = @import("treekem.zig");
 const treemath = @import("treemath.zig");
 const welcome_mod = @import("welcome.zig");
+const secrettree = @import("secrettree.zig");
 
 pub const Error = error{
-    /// The message was a `PrivateMessage`. Encrypted handshake messages
-    /// need the §9 secret tree driven per epoch, which this object does not
-    /// own — a scope boundary, not a decode failure.
-    PrivateHandshakeNotSupported,
     /// `FramedContent.epoch` did not equal the group's current epoch
     /// (§12.4.2's first bullet).
     WrongEpoch,
@@ -326,6 +319,40 @@ pub const Policy = struct {
     /// expressible. The other §7.3 rules are not here — see this file's doc
     /// comment.
     check_key_uniqueness: bool = true,
+    /// §9.2's bound on how far ahead of a sender's ratchet one received
+    /// `PrivateMessage` may claim to be: a generation more than this past
+    /// the ratchet's position is `error.GenerationTooFarAhead` instead of
+    /// that many KDF calls. 1000 is OpenMLS's `maximum_forward_distance`
+    /// default (`SenderRatchetConfiguration`).
+    maximum_forward_distance: u32 = 1000,
+};
+
+/// How many skipped-over generations of one sender's ratchet a member keeps
+/// for messages that arrive out of order (§9.2: members "MAY keep unconsumed
+/// values around for some reasonable amount of time"). 5 is OpenMLS's
+/// `out_of_order_tolerance` default. A compile-time constant, because each
+/// ratchet's retained keys are a fixed-size ring (`secrettree.Window`).
+pub const out_of_order_tolerance: usize = 5;
+
+/// How this member frames a handshake message it sends (§6): a signed,
+/// MAC'd `PublicMessage`, or an encrypted `PrivateMessage` under its own
+/// handshake ratchet. The default is `PublicMessage`, like OpenMLS's
+/// `WireFormatPolicy` default (`PURE_PLAINTEXT_WIRE_FORMAT_POLICY` for
+/// outgoing handshakes). External Commits are always `PublicMessage`
+/// (§12.4.3.2: the sender is not a member and has no ratchet).
+pub const HandshakeFraming = union(enum) {
+    public_message,
+    private_message: PrivateFraming,
+};
+
+/// What sending a `PrivateMessage` needs beyond the content.
+pub const PrivateFraming = struct {
+    /// Source of §6.3.1's `reuse_guard`, which "MUST be freshly random"
+    /// per message.
+    io: std.Io,
+    /// Zero octets inside the encrypted envelope (§6.3.1: "It is up to the
+    /// application to decide ... how much padding to add").
+    padding_len: usize = 0,
 };
 
 /// An arena whose memory is wiped on its way back to the allocator beneath
@@ -492,6 +519,21 @@ pub fn Group(comptime S: type) type {
         /// the arena.
         resumption_history: std.ArrayList(ResumptionEntry),
 
+        /// This epoch's §9 secret tree, created on the first `PrivateMessage`
+        /// sent or received in the epoch, and dropped (wiped) when a Commit
+        /// is adopted: like OpenMLS's default (`max_past_epochs` 0), a
+        /// message of an earlier epoch is `error.WrongEpoch`. Creating it
+        /// wipes `secrets.encryption_secret` (§9.2: the tree's root secret
+        /// is consumed once its children are derived; the tree holds it).
+        secret_tree: ?*SecretTree = null,
+
+        /// Handshake messages this member sent as a `PrivateMessage` during
+        /// the current epoch: the wire bytes and the `AuthenticatedContent`
+        /// inside them. Its own ratchet consumed the key on sending, so
+        /// without this record the member could not open its own proposal
+        /// when it commits it by reference. Cleared when a Commit is adopted.
+        sent_private: std.ArrayList(SentPrivate) = .empty,
+
         /// Private keys for Update proposals THIS member has published but
         /// that no Commit has applied yet (§12.1: a proposal "should be
         /// cached ... [to] be retrieved ... in a later Commit message", and
@@ -508,6 +550,15 @@ pub fn Group(comptime S: type) type {
         /// it works whether the Update was committed by value or by
         /// reference, and whether or not this member is the committer.
         pending_updates: std.ArrayList(PendingUpdate),
+
+        pub const SecretTree = secrettree.EpochTree(S, out_of_order_tolerance);
+
+        pub const SentPrivate = struct {
+            /// The `MLSMessage(PrivateMessage)` bytes, owned (`gpa`).
+            msg: []u8,
+            /// The encoded `AuthenticatedContent` it carries, owned (`gpa`).
+            authenticated_content: []u8,
+        };
 
         pub const PendingUpdate = struct {
             /// Arena-owned; compared against the leaf the Commit installs.
@@ -528,6 +579,8 @@ pub fn Group(comptime S: type) type {
             self.epoch_arenas.deinit(gpa);
             if (self.tree_arena) |t| t.destroy(gpa);
             self.arena.destroy(gpa);
+            dropSecretTree(gpa, self.secret_tree);
+            freeSentPrivate(gpa, &self.sent_private);
             self.secrets.wipe();
             std.crypto.secureZero(u8, &self.my_encryption_priv);
             self.* = undefined;
@@ -564,6 +617,241 @@ pub fn Group(comptime S: type) type {
         /// The number of leaves the tree currently spans (blank included).
         pub fn treeSize(self: *const Self) usize {
             return self.ratchet_tree.nLeaves();
+        }
+
+        // ── §6.3 + §9: PrivateMessage, driven by the epoch's secret tree ──
+
+        fn dropSecretTree(gpa: std.mem.Allocator, t: ?*SecretTree) void {
+            if (t) |p| {
+                p.deinit();
+                gpa.destroy(p);
+            }
+        }
+
+        fn freeSentPrivate(gpa: std.mem.Allocator, list: *std.ArrayList(SentPrivate)) void {
+            for (list.items) |e| {
+                std.crypto.secureZero(u8, e.authenticated_content);
+                gpa.free(e.authenticated_content);
+                gpa.free(e.msg);
+            }
+            list.deinit(gpa);
+        }
+
+        /// This epoch's secret tree, created on first use (see `secret_tree`).
+        fn secretTree(self: *Self) !*SecretTree {
+            if (self.secret_tree) |t| return t;
+            const t = try self.gpa.create(SecretTree);
+            errdefer self.gpa.destroy(t);
+            t.* = try SecretTree.init(
+                self.gpa,
+                &self.secrets.encryption_secret,
+                self.ratchet_tree.nLeaves(),
+                self.policy.maximum_forward_distance,
+            );
+            std.crypto.secureZero(u8, &self.secrets.encryption_secret);
+            self.secret_tree = t;
+            return t;
+        }
+
+        /// Whether opening a `PrivateMessage` uses up its ratchet key.
+        const KeyUse = enum {
+            /// Application data: the key is erased once used, so a replay
+            /// is `error.GenerationConsumed` (§9.2).
+            consume,
+            /// A handshake message inside a Commit that may still be
+            /// refused: the window is left as it was, so a refusal changes
+            /// nothing. On adoption the whole tree goes, and the key with it.
+            peek,
+        };
+
+        /// RFC 9420 §6.3.2 and §6.3.1 for a `PrivateMessage` of THIS epoch:
+        /// decrypt the sender data, check that `leaf_index` names a member,
+        /// take the key for `generation` from that leaf's ratchet of the
+        /// content type's kind, decrypt and parse the content, and verify
+        /// its signature against the sender's leaf and the current
+        /// `GroupContext`. The returned content aliases `pm` and memory from
+        /// `arena`.
+        fn openPrivate(
+            self: *Self,
+            arena: std.mem.Allocator,
+            gpa: std.mem.Allocator,
+            pm: framing.PrivateMessage,
+            gc: []const u8,
+            use: KeyUse,
+        ) !framing.AuthenticatedContent {
+            if (pm.epoch != self.epoch) return error.WrongEpoch;
+            const sd = try framing.decryptSenderData(S, gpa, pm, &self.secrets.sender_data_secret);
+            // §6.3.2: "the recipient MUST verify that the leaf_index ...
+            // is a member" — a non-blank leaf of the current tree.
+            const key = try leafSignatureKey(S, &self.ratchet_tree, sd.leaf_index);
+            const kind: secrettree.RatchetKind = if (pm.content_type == .application) .application else .handshake;
+            const st = try self.secretTree();
+            const w = try st.ratchet(sd.leaf_index, kind);
+            // The key is taken from a COPY of the sender's window, which
+            // replaces the window only once the message has decrypted and
+            // its signature verified: a forged or damaged message (the
+            // sender data is sampled from the ciphertext, so anyone can
+            // aim one at a real generation) must not burn the key the
+            // genuine message needs.
+            var trial = w.*;
+            defer trial.wipe();
+            var kn: secrettree.KeyNonce(S) = undefined;
+            defer kn.wipe();
+            try trial.get(sd.generation, &kn);
+            const pt = try framing.decryptContent(S, arena, pm, &kn, sd.reuse_guard);
+            const ac = try framing.parsePrivateContent(arena, pm, pt, sd.leaf_index);
+            try framing.verifyFramedContent(S, gpa, key, ac, gc);
+            if (use == .consume) w.* = trial;
+            return ac;
+        }
+
+        /// RFC 9420 §6.3's send path from this member: the next generation
+        /// of its own ratchet of `fc`'s kind, a fresh `reuse_guard`, and the
+        /// `MLSMessage(PrivateMessage)` bytes (allocated from `allocator`).
+        /// `signature` is a signature already made over `fc` (a Commit's,
+        /// see `framing.ProtectPrivateParams.signature`), or `null`.
+        fn sealPrivate(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            pf: PrivateFraming,
+            signature_key_pair: *const S.Sig.KeyPair,
+            fc: framing.FramedContent,
+            signature: ?[]const u8,
+            confirmation_tag: ?[]const u8,
+            gc: []const u8,
+        ) ![]u8 {
+            const gpa = self.gpa;
+            const st = try self.secretTree();
+            const w = try st.ratchet(self.my_leaf_index, fc.body.ratchetKind());
+            if (w.final_spent) return error.RatchetExhausted;
+            const generation = w.ratchet.generation;
+            var guard: [4]u8 = undefined;
+            try pf.io.randomSecure(&guard);
+            var kn: secrettree.KeyNonce(S) = undefined;
+            defer kn.wipe();
+            try w.get(generation, &kn);
+            const bare = try framing.protectPrivate(S, gpa, .{
+                .signature_key_pair = signature_key_pair,
+                .group_context = gc,
+                .content = fc,
+                .confirmation_tag = confirmation_tag,
+                .key_nonce = &kn,
+                .generation = generation,
+                .reuse_guard = guard,
+                .sender_data_secret = &self.secrets.sender_data_secret,
+                .padding_len = pf.padding_len,
+                .signature = signature,
+            });
+            defer gpa.free(bare);
+            return framing.wrapPrivateMessage(allocator, bare);
+        }
+
+        /// What `protectApplication` needs.
+        pub const ApplicationParams = struct {
+            /// Draws §6.3.1's `reuse_guard`.
+            io: std.Io,
+            /// This member's signing key (borrowed, see `ProposeParams`).
+            signature_key_pair: *const S.Sig.KeyPair,
+            /// The application data.
+            data: []const u8,
+            /// §6's `authenticated_data`: sent in the clear, covered by the
+            /// content AEAD and the signature.
+            authenticated_data: []const u8 = &.{},
+            /// See `PrivateFraming.padding_len`.
+            padding_len: usize = 0,
+        };
+
+        /// RFC 9420 §6.3: application data from this member, as an
+        /// `MLSMessage(PrivateMessage)` (§6.2: "Application messages MUST be
+        /// sent as PrivateMessage") under the next generation of this
+        /// member's application ratchet in the current epoch. Returns the
+        /// wire bytes, allocated from `allocator`. The generation used is
+        /// gone afterwards: a member does not decrypt its own messages.
+        pub fn protectApplication(self: *Self, allocator: std.mem.Allocator, params: ApplicationParams) @TypeOf(protectApplicationBody(self, allocator, params)) {
+            return burn.run(burn.group_burn, @TypeOf(protectApplicationBody(self, allocator, params)), protectApplicationBody, .{ self, allocator, params });
+        }
+
+        fn protectApplicationBody(self: *Self, allocator: std.mem.Allocator, params: ApplicationParams) ![]u8 {
+            const gc = try self.groupContextAlloc(self.gpa);
+            defer self.gpa.free(gc);
+            const fc: framing.FramedContent = .{
+                .group_id = self.group_id,
+                .epoch = self.epoch,
+                .sender = .{ .member = self.my_leaf_index },
+                .authenticated_data = params.authenticated_data,
+                .body = .{ .application = params.data },
+            };
+            return self.sealPrivate(
+                allocator,
+                .{ .io = params.io, .padding_len = params.padding_len },
+                params.signature_key_pair,
+                fc,
+                null,
+                null,
+                gc,
+            );
+        }
+
+        /// One application message `unprotectApplication` opened.
+        pub const ApplicationMessage = struct {
+            /// The sender's leaf index.
+            sender: u32,
+            /// The application data, owned by the caller.
+            data: []u8,
+            /// The message's `authenticated_data`, owned by the caller.
+            authenticated_data: []u8,
+
+            pub fn deinit(self: ApplicationMessage, allocator: std.mem.Allocator) void {
+                std.crypto.secureZero(u8, self.data);
+                allocator.free(self.data);
+                allocator.free(self.authenticated_data);
+            }
+        };
+
+        /// RFC 9420 §6.3.2 + §6.3.1 + §6.1 for an application message of the
+        /// CURRENT epoch: `msg` is the whole `MLSMessage(PrivateMessage)`.
+        /// The key it names is consumed (§9.2), so the same message opens
+        /// once; the sender's ratchet keeps `out_of_order_tolerance` skipped
+        /// generations for late messages and refuses a jump past
+        /// `Policy.maximum_forward_distance`.
+        ///
+        /// Errors: `WrongContentType` for anything but an application
+        /// `PrivateMessage` (a handshake message goes to `processCommit`),
+        /// `WrongEpoch` for another epoch, `UnknownMember` when the sender
+        /// data names no member, `GenerationConsumed` /
+        /// `GenerationTooFarAhead` from the ratchet, `DecryptionFailed`, and
+        /// a signature failure.
+        pub fn unprotectApplication(self: *Self, allocator: std.mem.Allocator, msg: []const u8) @TypeOf(unprotectApplicationBody(self, allocator, msg)) {
+            return burn.run(burn.group_burn, @TypeOf(unprotectApplicationBody(self, allocator, msg)), unprotectApplicationBody, .{ self, allocator, msg });
+        }
+
+        fn unprotectApplicationBody(self: *Self, allocator: std.mem.Allocator, msg: []const u8) !ApplicationMessage {
+            const gpa = self.gpa;
+            const scratch = try WipingArena.create(gpa);
+            defer scratch.destroy(gpa);
+            const arena = scratch.allocator();
+            var r = codec.Reader.init(msg);
+            const m = try framing.MLSMessage.decode(arena, &r);
+            if (!r.atEnd()) return error.Malformed;
+            const pm = switch (m) {
+                .private_message => |x| x,
+                else => return error.WrongContentType,
+            };
+            if (pm.content_type != .application) return error.WrongContentType;
+            const gc = try self.groupContextAlloc(gpa);
+            defer gpa.free(gc);
+            const ac = try self.openPrivate(arena, gpa, pm, gc, .consume);
+            const data = switch (ac.content.body) {
+                .application => |d| d,
+                else => return error.WrongContentType,
+            };
+            const out_data = try allocator.dupe(u8, data);
+            errdefer allocator.free(out_data);
+            return .{
+                .sender = ac.content.sender.member,
+                .data = out_data,
+                .authenticated_data = try allocator.dupe(u8, ac.content.authenticated_data),
+            };
         }
 
         // ── the Commit transaction ────────────────────────────────────────
@@ -654,11 +942,20 @@ pub fn Group(comptime S: type) type {
             next.epoch_arenas = self.epoch_arenas;
             next.epoch_arenas.appendAssumeCapacity(msgs);
             next.tree_arena = f.tree;
+            // The new epoch starts without a secret tree (created on first
+            // use from its own `encryption_secret`) and without sent
+            // handshake messages; the previous epoch's are released below.
+            next.secret_tree = null;
+            next.sent_private = .empty;
 
             const old_tree = self.tree_arena;
             const old_history = self.resumption_history.items;
+            const old_secret_tree = self.secret_tree;
+            var old_sent = self.sent_private;
             self.* = next.*;
             f.adopted = true;
+            dropSecretTree(gpa, old_secret_tree);
+            freeSentPrivate(gpa, &old_sent);
 
             // What the previous epoch held that nothing reads any more: its
             // tree containers, and — if the history moved — the superseded
@@ -1146,30 +1443,64 @@ pub fn Group(comptime S: type) type {
             var reader = codec.Reader.init(msg_copy);
             const msg = try framing.MLSMessage.decode(arena, &reader);
             if (!reader.atEnd()) return error.Malformed;
-            const pm = switch (msg) {
-                .public_message => |m| m,
-                .private_message => return error.PrivateHandshakeNotSupported,
-                else => return error.WrongContentType,
-            };
 
             const old_gc = try self.groupContextAlloc(gpa);
             defer gpa.free(old_gc);
 
+            // A Commit sent as a `PrivateMessage` (§6.3) is opened with this
+            // epoch's handshake ratchet of the sender, then joins the common
+            // path below as the `AuthenticatedContent` it carried — whose
+            // `wire_format` is `mls_private_message`, which is what §8.2's
+            // transcript hashes. A `PrivateMessage` always comes from a
+            // `member` and carries no `membership_tag` (§6.3.2), so the
+            // signature verified inside `openPrivate` is its whole
+            // authentication. The ratchet key is only peeked, not consumed:
+            // the whole tree is replaced once the Commit is adopted, and a
+            // refused Commit must leave the group as it was.
+            if (msg == .private_message) {
+                const prm = msg.private_message;
+                if (prm.epoch != self.epoch) return error.WrongEpoch;
+                if (prm.content_type != .commit) return error.WrongContentType;
+                const pac = try self.openPrivate(arena, gpa, prm, old_gc, .peek);
+                return self.processCommitContent(params, msgs, &adopted, pac, null, old_gc);
+            }
+            const pm = switch (msg) {
+                .public_message => |m| m,
+                else => return error.WrongContentType,
+            };
+            return self.processCommitContent(params, msgs, &adopted, pm.authenticatedContent(), pm, old_gc);
+        }
+
+        /// `processCommit` from the decoded `AuthenticatedContent` on. `pm` is
+        /// the enclosing `PublicMessage`, or `null` for a Commit that came as
+        /// a `PrivateMessage` (its signature is already verified).
+        fn processCommitContent(
+            self: *Self,
+            params: CommitParams,
+            msgs: *WipingArena,
+            adopted: *bool,
+            ac: framing.AuthenticatedContent,
+            pm_opt: ?framing.PublicMessage,
+            old_gc: []const u8,
+        ) !void {
+            const gpa = self.gpa;
+            const arena = msgs.allocator();
+
             // Bullet 1: the epoch must match.
-            if (pm.content.epoch != self.epoch) return error.WrongEpoch;
-            if (pm.content.contentType() != .commit) return error.WrongContentType;
+            if (ac.content.epoch != self.epoch) return error.WrongEpoch;
+            if (ac.content.contentType() != .commit) return error.WrongContentType;
 
             // The body is read BEFORE the signature check rather than after,
             // because an external Commit's verification key is inside it
             // (§6.1's `new_member_commit` bullet). Reading a union arm
             // authenticates nothing on its own; every byte of it is still
             // covered by the signature verified two statements below.
-            const commit = switch (pm.content.body) {
+            const commit = switch (ac.content.body) {
                 .commit => |c| c,
                 else => return error.WrongContentType,
             };
 
-            const external = pm.content.sender == .new_member_commit;
+            const external = ac.content.sender == .new_member_commit;
 
             // Bullets 2-3: unprotect with the CURRENT epoch's keys, then
             // check the signature — both against the OLD GroupContext.
@@ -1179,8 +1510,12 @@ pub fn Group(comptime S: type) type {
             // path bullet ASSIGNS one, after the proposals have been
             // applied, so it cannot be known here.
             var member_committer: u32 = undefined;
-            const ac = pm.authenticatedContent();
-            if (external) {
+            if (pm_opt == null) {
+                // Opened by `openPrivate`, which verified the signature
+                // against the sender's leaf.
+                member_committer = ac.content.sender.member;
+            } else if (external) {
+                const pm = pm_opt.?;
                 try rejectExternalCommitFraming(pm);
                 // §12.4.3.2: "External Commits MUST contain a path field
                 // (and is therefore a 'full' Commit)." Checked here rather
@@ -1191,6 +1526,7 @@ pub fn Group(comptime S: type) type {
                 const key = try leafNodeSignatureKey(S, path.leaf_node);
                 try framing.verifyFramedContent(S, gpa, key, ac, old_gc);
             } else {
+                const pm = pm_opt.?;
                 member_committer = switch (pm.content.sender) {
                     .member => |i| i,
                     else => return error.UnexpectedSenderType,
@@ -1423,7 +1759,7 @@ pub fn Group(comptime S: type) type {
             // The last step that can fail; `adopt` cannot.
             try self.reserveAdoption(&txn, arena);
             self.adopt(&txn, msgs);
-            adopted = true;
+            adopted.* = true;
         }
 
         /// RFC 9420 §8.3's RECEIVING half, wired to this epoch: recover the
@@ -1455,6 +1791,8 @@ pub fn Group(comptime S: type) type {
             signature_key_pair: *const S.Sig.KeyPair,
             proposal: content.Proposal,
             authenticated_data: []const u8 = &.{},
+            /// `PublicMessage` (the default) or `PrivateMessage`.
+            framing: HandshakeFraming = .public_message,
         };
 
         /// RFC 9420 §12.1: frame a `Proposal` as a signed, MAC'd
@@ -1468,11 +1806,16 @@ pub fn Group(comptime S: type) type {
         /// returned bytes; they are what a later `createCommit`'s
         /// `.by_reference` arm and a receiver's `CommitParams.proposal_msgs`
         /// both take.
-        pub fn createProposal(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) @TypeOf(createProposalBody(self, allocator, params)) {
+        ///
+        /// With `framing = .private_message` the proposal is encrypted under
+        /// this member's handshake ratchet instead (§6.3), and remembered
+        /// for the rest of the epoch so this member can commit it by
+        /// reference (`sent_private`).
+        pub fn createProposal(self: *Self, allocator: std.mem.Allocator, params: ProposeParams) @TypeOf(createProposalBody(self, allocator, params)) {
             return burn.run(burn.group_burn, @TypeOf(createProposalBody(self, allocator, params)), createProposalBody, .{ self, allocator, params });
         }
 
-        fn createProposalBody(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
+        fn createProposalBody(self: *Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
             const gpa = self.gpa;
             const gc = try self.groupContextAlloc(gpa);
             defer gpa.free(gc);
@@ -1484,6 +1827,23 @@ pub fn Group(comptime S: type) type {
                 .authenticated_data = params.authenticated_data,
                 .body = .{ .proposal = params.proposal },
             };
+            if (params.framing == .private_message) {
+                const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_private_message, fc, gc);
+                const sig_bytes = S.encodeSignature(sig);
+                const ac: framing.AuthenticatedContent = .{
+                    .wire_format = .mls_private_message,
+                    .content = fc,
+                    .auth = .{ .signature = sig_bytes.slice() },
+                };
+                const ac_bytes = try ac.encodeAlloc(gpa);
+                errdefer gpa.free(ac_bytes);
+                try self.sent_private.ensureUnusedCapacity(gpa, 1);
+                const out = try self.sealPrivate(allocator, params.framing.private_message, params.signature_key_pair, fc, sig_bytes.slice(), null, gc);
+                errdefer allocator.free(out);
+                const msg_copy = try gpa.dupe(u8, out);
+                self.sent_private.appendAssumeCapacity(.{ .msg = msg_copy, .authenticated_content = ac_bytes });
+                return out;
+            }
             const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_public_message, fc, gc);
             const sig_bytes = S.encodeSignature(sig);
             const auth: framing.FramedContentAuthData = .{ .signature = sig_bytes.slice() };
@@ -1608,13 +1968,18 @@ pub fn Group(comptime S: type) type {
             /// Further `GroupInfo` extensions (§12.4.3: "additional data
             /// that might be useful to new joiners"). Borrowed for the call.
             group_info_extensions: []const tree.Extension = &.{},
+            /// The Commit as a `PublicMessage` (the default) or as a
+            /// `PrivateMessage` under this member's handshake ratchet of the
+            /// epoch being left (§6.3).
+            framing: HandshakeFraming = .public_message,
         };
 
         /// The three messages one Commit produces. All three are allocated
         /// from the allocator passed to `createCommit`.
         pub const Created = struct {
-            /// `MLSMessage(PublicMessage)` carrying the Commit — send to
-            /// every existing member.
+            /// `MLSMessage(PublicMessage)` — or `MLSMessage(PrivateMessage)`
+            /// with `CreateCommitParams.framing = .private_message` —
+            /// carrying the Commit; send to every existing member.
             commit: []u8,
             /// `MLSMessage(Welcome)` covering every member this Commit
             /// added, or `null` when it added none. §12.4.3.1 lets a
@@ -1879,7 +2244,13 @@ pub fn Group(comptime S: type) type {
                 .authenticated_data = params.authenticated_data,
                 .body = .{ .commit = commit },
             };
-            const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_public_message, fc, old_gc);
+            // The wire format is signed (§6.1's `FramedContentTBS`) and
+            // hashed into the transcript (§8.2), so it is fixed first.
+            const wf: framing.WireFormat = if (params.framing == .private_message and !external)
+                .mls_private_message
+            else
+                .mls_public_message;
+            const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, wf, fc, old_gc);
             const sig_bytes = S.encodeSignature(sig);
 
             // §8.2's confirmed hash covers `wire_format || content ||
@@ -1887,7 +2258,7 @@ pub fn Group(comptime S: type) type {
             // this order possible at all: the tag is derived from a key
             // schedule that consumes a GroupContext containing this hash.
             var ac: framing.AuthenticatedContent = .{
-                .wire_format = .mls_public_message,
+                .wire_format = wf,
                 .content = fc,
                 .auth = .{ .signature = sig_bytes.slice(), .confirmation_tag = null },
             };
@@ -1937,18 +2308,26 @@ pub fn Group(comptime S: type) type {
             // member of the epoch it is committing against — and §6.2 gives
             // its `PublicMessage` no field to put a tag in. `null` here is
             // not "we skipped a step": it is the wire format.
-            const mtag: ?[S.Nm]u8 = if (external)
-                null
-            else
-                try framing.membershipTag(S, gpa, &w.secrets.membership_key, fc, ac.auth, old_gc);
-            const commit_msg: framing.MLSMessage = .{
-                .public_message = .{
-                    .content = fc,
-                    .auth = ac.auth,
-                    .membership_tag = if (mtag) |*t| t else null,
-                },
+            //
+            // As a `PrivateMessage` (§6.3) there is no `membership_tag`: the
+            // content AEAD under the old epoch's handshake ratchet takes its
+            // place, carrying the signature made above.
+            const commit_bytes = if (wf == .mls_private_message)
+                try self.sealPrivate(allocator, params.framing.private_message, params.signature_key_pair, fc, ac.auth.signature, &tag, old_gc)
+            else blk: {
+                const mtag: ?[S.Nm]u8 = if (external)
+                    null
+                else
+                    try framing.membershipTag(S, gpa, &w.secrets.membership_key, fc, ac.auth, old_gc);
+                const commit_msg: framing.MLSMessage = .{
+                    .public_message = .{
+                        .content = fc,
+                        .auth = ac.auth,
+                        .membership_tag = if (mtag) |*t| t else null,
+                    },
+                };
+                break :blk try commit_msg.encodeAlloc(allocator);
             };
-            const commit_bytes = try commit_msg.encodeAlloc(allocator);
             errdefer allocator.free(commit_bytes);
 
             // ── §12.4.1: "Construct a GroupInfo reflecting the new state."
@@ -2465,8 +2844,13 @@ pub fn Group(comptime S: type) type {
         /// verify..."), and the by-reference `ProposalRef` it puts in the
         /// Commit has to be computed over exactly the bytes the receiver
         /// will hash.
+        ///
+        /// A proposal sent as a `PrivateMessage` is opened with the sender's
+        /// handshake ratchet (peeked, not consumed: see `KeyUse`); one this
+        /// member sent itself is taken from `sent_private`, since its own
+        /// ratchet no longer holds the key.
         fn authenticateProposalMessage(
-            self: *const Self,
+            self: *Self,
             arena: std.mem.Allocator,
             gpa: std.mem.Allocator,
             bytes: []const u8,
@@ -2476,28 +2860,43 @@ pub fn Group(comptime S: type) type {
             var r = codec.Reader.init(copy);
             const m = try framing.MLSMessage.decode(arena, &r);
             if (!r.atEnd()) return error.Malformed;
-            const p = switch (m) {
-                .public_message => |x| x,
-                .private_message => return error.PrivateHandshakeNotSupported,
+            const pac: framing.AuthenticatedContent = switch (m) {
+                .public_message => |p| blk: {
+                    if (p.content.contentType() != .proposal) return error.WrongContentType;
+                    if (p.content.epoch != self.epoch) return error.WrongEpoch;
+                    const sender: u32 = switch (p.content.sender) {
+                        .member => |i| i,
+                        else => return error.UnexpectedSenderType,
+                    };
+                    const key = try leafSignatureKey(S, &self.ratchet_tree, sender);
+                    try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, p, old_gc);
+                    const pac = p.authenticatedContent();
+                    try framing.verifyFramedContent(S, gpa, key, pac, old_gc);
+                    break :blk pac;
+                },
+                .private_message => |p| blk: {
+                    if (p.content_type != .proposal) return error.WrongContentType;
+                    if (p.epoch != self.epoch) return error.WrongEpoch;
+                    for (self.sent_private.items) |e| {
+                        if (!std.mem.eql(u8, e.msg, bytes)) continue;
+                        // Copied: the record is freed when the Commit is
+                        // adopted, and an Add's leaf aliases these bytes.
+                        var er = codec.Reader.init(try arena.dupe(u8, e.authenticated_content));
+                        const own = try framing.AuthenticatedContent.decode(arena, &er);
+                        if (!er.atEnd()) return error.Malformed;
+                        break :blk own;
+                    }
+                    break :blk try self.openPrivate(arena, gpa, p, old_gc, .peek);
+                },
                 else => return error.WrongContentType,
             };
-            if (p.content.contentType() != .proposal) return error.WrongContentType;
-            if (p.content.epoch != self.epoch) return error.WrongEpoch;
-            const sender: u32 = switch (p.content.sender) {
-                .member => |i| i,
-                else => return error.UnexpectedSenderType,
-            };
-            const key = try leafSignatureKey(S, &self.ratchet_tree, sender);
-            try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, p, old_gc);
-            const pac = p.authenticatedContent();
-            try framing.verifyFramedContent(S, gpa, key, pac, old_gc);
             return .{
                 .ref = try framing.proposalRef(S, gpa, pac),
-                .proposal = switch (p.content.body) {
+                .proposal = switch (pac.content.body) {
                     .proposal => |x| x,
                     else => return error.WrongContentType,
                 },
-                .sender = sender,
+                .sender = pac.content.sender.member,
             };
         }
 
@@ -3993,6 +4392,227 @@ test "§12.4.1: a three-member group runs Commits in both directions, with propo
         try expectSameEpoch(&b, &d_grp);
         try testing.expectEqual(@as(u64, 5), b.epoch);
     }
+}
+
+test "§6.3/§9: application messages through the group's secret tree — out of order, once each, never across epochs" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    const carol = try TestClient.init(aa, "carol", 3);
+
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "app", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b: Group(TestSuite) = undefined;
+    var c_grp: Group(TestSuite) = undefined;
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = carol.kp } } },
+        });
+        defer c.deinit(gpa);
+        b = try bob.join(gpa, c.welcome.?, &.{});
+        c_grp = try carol.join(gpa, c.welcome.?, &.{});
+    }
+    defer b.deinit();
+    defer c_grp.deinit();
+
+    var sent: [3][]u8 = undefined;
+    for (&sent, 0..) |*m, i| {
+        m.* = try a.protectApplication(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .data = &[_]u8{ 'm', '0' + @as(u8, @intCast(i)) },
+            .authenticated_data = "ad",
+            .padding_len = 7,
+        });
+    }
+    defer for (sent) |m| gpa.free(m);
+
+    // In order for carol; out of order for bob (2, then 0, then 1).
+    for (sent, 0..) |m, i| {
+        const got = try c_grp.unprotectApplication(gpa, m);
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(u32, 0), got.sender);
+        try testing.expectEqualSlices(u8, &[_]u8{ 'm', '0' + @as(u8, @intCast(i)) }, got.data);
+        try testing.expectEqualSlices(u8, "ad", got.authenticated_data);
+    }
+    for ([_]usize{ 2, 0, 1 }) |i| {
+        const got = try b.unprotectApplication(gpa, sent[i]);
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(u8, '0' + @as(u8, @intCast(i))), got.data[1]);
+    }
+    // Each key opens once (§9.2), and the sender's own key is gone.
+    try testing.expectError(error.GenerationConsumed, b.unprotectApplication(gpa, sent[1]));
+    try testing.expectError(error.GenerationConsumed, a.unprotectApplication(gpa, sent[0]));
+
+    // A flipped ciphertext byte fails the AEAD, not the parser.
+    {
+        const m = try b.protectApplication(gpa, .{ .io = io, .signature_key_pair = &bob.sig, .data = "x" });
+        defer gpa.free(m);
+        const bad = try gpa.dupe(u8, m);
+        defer gpa.free(bad);
+        bad[bad.len - 1] ^= 1;
+        try testing.expectError(error.DecryptionFailed, c_grp.unprotectApplication(gpa, bad));
+        const got = try c_grp.unprotectApplication(gpa, m);
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(u32, 1), got.sender);
+    }
+
+    // A handshake message is not application data.
+    {
+        const prop = try a.createProposal(gpa, .{
+            .signature_key_pair = &alice.sig,
+            .proposal = .{ .remove = 2 },
+            .framing = .{ .private_message = .{ .io = io } },
+        });
+        defer gpa.free(prop);
+        try testing.expectError(error.WrongContentType, b.unprotectApplication(gpa, prop));
+    }
+
+    // A new epoch drops the old tree: an old-epoch message is WrongEpoch,
+    // and the new epoch's messages flow.
+    const old = try a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "late" });
+    defer gpa.free(old);
+    {
+        const c = try b.createCommit(gpa, .{ .io = io, .signature_key_pair = &bob.sig });
+        defer c.deinit(gpa);
+        try a.processCommit(.{ .commit_msg = c.commit });
+    }
+    try testing.expectError(error.WrongEpoch, a.unprotectApplication(gpa, old));
+    {
+        const m = try a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "new" });
+        defer gpa.free(m);
+        const got = try b.unprotectApplication(gpa, m);
+        defer got.deinit(gpa);
+        try testing.expectEqualSlices(u8, "new", got.data);
+    }
+}
+
+test "§6.3/§9.2: a forged generation far ahead is GenerationTooFarAhead, within the bound it decrypts" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "jump", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    b.policy.maximum_forward_distance = 2;
+
+    // Alice sends four; bob sees only the last (generation 3, a jump of 3).
+    var msgs: [4][]u8 = undefined;
+    for (&msgs) |*m| m.* = try a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "j" });
+    defer for (msgs) |m| gpa.free(m);
+    try testing.expectError(error.GenerationTooFarAhead, b.unprotectApplication(gpa, msgs[3]));
+    // Generation 2 is within the bound; then 3 is one step ahead.
+    for ([_]usize{ 2, 3 }) |i| {
+        const got = try b.unprotectApplication(gpa, msgs[i]);
+        got.deinit(gpa);
+    }
+}
+
+test "§6.3: proposals and Commits framed as PrivateMessage, by reference and by value, and a refused one changes nothing" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    const carol = try TestClient.init(aa, "carol", 3);
+    const dave = try TestClient.init(aa, "dave", 4);
+    const private: HandshakeFraming = .{ .private_message = .{ .io = io, .padding_len = 3 } };
+
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "priv", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }}, .framing = private });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    try expectSameEpoch(&a, &b);
+
+    // Bob proposes carol privately; alice proposes dave privately and
+    // commits BOTH by reference, privately — her own proposal comes from
+    // `sent_private`, since her ratchet no longer holds its key.
+    const p_bob = try b.createProposal(gpa, .{ .signature_key_pair = &bob.sig, .proposal = .{ .add = carol.kp }, .framing = private });
+    defer gpa.free(p_bob);
+    const p_alice = try a.createProposal(gpa, .{ .signature_key_pair = &alice.sig, .proposal = .{ .add = dave.kp }, .framing = private });
+    defer gpa.free(p_alice);
+    try testing.expectEqual(framing.WireFormat.mls_private_message, (try decodeWireFormat(p_bob)));
+
+    const c = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &alice.sig,
+        .proposals = &.{ .{ .by_reference = p_bob }, .{ .by_reference = p_alice } },
+        .framing = private,
+    });
+    defer c.deinit(gpa);
+    try testing.expectEqual(framing.WireFormat.mls_private_message, (try decodeWireFormat(c.commit)));
+    try testing.expectEqual(@as(usize, 0), a.sent_private.items.len);
+
+    // Refused for a missing proposal: nothing consumed, so the same bytes
+    // are accepted once the proposal is supplied.
+    var auth_before: [TestSuite.Nh]u8 = undefined;
+    b.epochAuthenticator(&auth_before);
+    try testing.expectError(error.ProposalNotFound, b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{p_bob} }));
+    try testing.expectEqual(@as(u64, 1), b.epoch);
+    var auth_after: [TestSuite.Nh]u8 = undefined;
+    b.epochAuthenticator(&auth_after);
+    try testing.expectEqualSlices(u8, &auth_before, &auth_after);
+    try b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{ p_bob, p_alice } });
+    try expectSameEpoch(&a, &b);
+
+    var c_grp = try carol.join(gpa, c.welcome.?, &.{});
+    defer c_grp.deinit();
+    var d_grp = try dave.join(gpa, c.welcome.?, &.{});
+    defer d_grp.deinit();
+    try expectSameEpoch(&a, &c_grp);
+    try expectSameEpoch(&a, &d_grp);
+
+    // A tampered private Commit is refused, and the receiver stays put.
+    {
+        const c2 = try d_grp.createCommit(gpa, .{ .io = io, .signature_key_pair = &dave.sig, .framing = private });
+        defer c2.deinit(gpa);
+        const bad = try gpa.dupe(u8, c2.commit);
+        defer gpa.free(bad);
+        bad[bad.len - 2] ^= 0x40;
+        try testing.expectError(error.DecryptionFailed, c_grp.processCommit(.{ .commit_msg = bad }));
+        for ([_]*Group(TestSuite){ &a, &b, &c_grp }) |g| try g.processCommit(.{ .commit_msg = c2.commit });
+        try expectSameEpoch(&a, &d_grp);
+        try expectSameEpoch(&c_grp, &d_grp);
+        try expectSameEpoch(&b, &d_grp);
+    }
+
+    // A private Commit of an older epoch is WrongEpoch.
+    try testing.expectError(error.WrongEpoch, b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{ p_bob, p_alice } }));
+}
+
+fn decodeWireFormat(msg: []const u8) !framing.WireFormat {
+    var r = codec.Reader.init(msg);
+    _ = try r.readU16();
+    return r.readEnum(framing.WireFormat);
 }
 
 test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, in both the truncating and the non-truncating shape" {

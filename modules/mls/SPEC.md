@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no group-level application-message send/receive (the secret tree is not driven per epoch, so a caller wires `secrettree` + `framing.protectPrivate` by hand — `group.zig` module doc), `PrivateMessage` handshakes refused (`error.PrivateHandshakeNotSupported`), five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, no KeyPackage/LeafNode admission validation beyond the rules a Commit names, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, no KeyPackage/LeafNode admission validation beyond the rules a Commit names, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -657,11 +657,8 @@ how the order drifts. Three places in it produce perfectly well-formed
 both ways into a group (Part 6's `Welcome`, Part 9's external Commit). The gaps
 are named:
 
-- **No `PrivateMessage` handshakes** — `error.PrivateHandshakeNotSupported`
-  (`group.zig`, `2481`). `secrettree.zig` owns §9's ratchets, but the group
-  object does not drive them per epoch; that has its own generation and deletion
-  policy. The passive-client vectors contain only `PublicMessage`s, and
-  `kat_passive_test.zig` ASSERTS that, so the boundary is not an untested claim.
+- **`PrivateMessage` is driven by the group** — application data both ways
+  and handshakes both ways; see *`PrivateMessage` through the group* below.
 - **No §7.3/§10.1 admission validation beyond what Part 8 lists.**
   `processCommit` checks the leaf properties §12.4.2 names in its own bullets —
   `leaf_node_source == commit`, the committer's encryption key actually
@@ -720,6 +717,64 @@ Commit's `UpdatePath`, then each Add's `KeyPackage`). Deep-copying every
 decodes from that copy. Group state is retained wholesale and dropped wholesale,
 which is how MLS treats it too. The cost is a limit stated under *Threat model*:
 the arenas grow monotonically with session length until `deinit`.
+
+### `PrivateMessage` through the group (§6.3, §9, §9.2)
+
+`Group(S)` drives the §9 secret tree of its current epoch (`secret_tree`,
+`secrettree.EpochTree`):
+
+- **Lifetime.** Created on the first `PrivateMessage` sent or received in an
+  epoch from `secrets.encryption_secret`, which is then wiped (the tree holds
+  the root). Dropped, wiped, when a Commit is adopted: a message of an earlier
+  epoch is `error.WrongEpoch`. This is OpenMLS's default (`max_past_epochs` 0);
+  a member that a Commit removes keeps its group, and so its tree, at the old
+  epoch (`error.RemovedFromGroup`), which is §12.4.2's "keep the secret tree for
+  a short time".
+- **§9.2 deletion.** The tree keeps only node secrets not yet consumed:
+  deriving a leaf walks down from the lowest held ancestor, derives both
+  children of each node it passes and deletes the node; a leaf secret is
+  consumed into its handshake and application ratchets (`secrettree.Window`).
+- **Out-of-order and forward bounds.** Each ratchet keeps
+  `group.out_of_order_tolerance` (5) skipped generations and refuses a jump past
+  `Policy.maximum_forward_distance` (1000) with `error.GenerationTooFarAhead` —
+  OpenMLS's `SenderRatchetConfiguration` defaults. A key is used once; a replay
+  is `error.GenerationConsumed`, and a member cannot open its own messages.
+- **Sending application data.** `protectApplication` frames, signs and
+  encrypts under the next generation of the member's application ratchet with a
+  fresh `reuse_guard` from `io`, and returns `MLSMessage(PrivateMessage)` bytes
+  (§6.2: application messages are always `PrivateMessage`).
+- **Receiving application data.** `unprotectApplication` takes the whole
+  `MLSMessage`: `WrongContentType` for anything but an application
+  `PrivateMessage`; then §6.3.2's sender data, the `leaf_index` checked to name
+  a member (`UnknownMember`), the key for `generation`, the content AEAD, the
+  §6.3.1 zero padding and the §6.1 signature against the sender's leaf and the
+  current `GroupContext`. The key is taken from a COPY of the sender's window
+  that replaces it only after the signature verified, so a forged or damaged
+  message does not burn the key the genuine one needs.
+- **Handshakes.** `ProposeParams.framing` / `CreateCommitParams.framing`
+  (`HandshakeFraming`, default `.public_message` like OpenMLS's default wire
+  format policy) send a proposal or Commit as `PrivateMessage` under the
+  handshake ratchet. A Commit's signature enters §8.2's transcript before its
+  `confirmation_tag` exists, so `framing.ProtectPrivateParams.signature`
+  carries that same signature into the envelope. `processCommit` and the
+  proposals handed to it accept either framing; a private handshake's key is
+  only peeked (a refused Commit leaves the group as it was and the same bytes
+  are accepted later), and the tree goes on adoption. A member's own private
+  proposals are kept for the epoch (`sent_private`) because its own ratchet no
+  longer holds their keys — that is how it commits them by reference. External
+  Commits are always `PublicMessage` (the sender has no leaf, hence no ratchet).
+- **Not merged into one `framing` call.** `framing`'s decryption stays three
+  stages (`decryptSenderData`, `decryptContent`, `parsePrivateContent`) for a
+  caller that keeps its own key schedule; `unprotectApplication` and
+  `processCommit` are the single call for a `Group`.
+- **Anchors.** `kat_framing_test.zig`'s `message-protection.json` vectors pin
+  the framing both ways, `secret-tree.json` the ratchets (the tree's leaves are
+  checked against `ratchetBaseSecret` for every leaf); the group-level paths are
+  self-interop in `group.zig` (out-of-order, replay, tamper, forward bound,
+  epoch change; private proposals and Commits by value and by reference, a
+  refused private Commit accepted later). The recorded `passive-client-*`
+  sessions carry no `PrivateMessage`, so no external vector covers a private
+  handshake.
 
 ## Part 8 — Creating Commits
 
@@ -1481,19 +1536,6 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **Group-level application messages: a per-epoch secret-tree driver and
-  `protectApplication`/`unprotect`.** The everyday operation of an MLS client:
-  `group.zig` never encrypts or decrypts application data (its header calls it a
-  scope boundary), while OpenMLS and mls-rs expose it as the main call. Effort:
-  medium (generation/deletion policy for the ratchets per epoch; the
-  out-of-order window already exists in `secrettree.Window`). Fits the scope.
-- **`PrivateMessage` handshake messages (proposals/commits).** The common
-  wire-format policy in deployments encrypts handshakes too; `processCommit`
-  returns `PrivateHandshakeNotSupported`. Effort: medium, together with the item
-  above (needs the secret tree).
-- **A single `unprotectPrivate` in `framing.zig`.** Decryption stays three stages
-  because the key lookup between them is the caller's; revisit together with the
-  two items above, once the group object drives the secret tree per epoch.
 - **Part 3: §7.3/§10.1 LeafNode and KeyPackage admission validation, and X.509
   credentials.** Lifetime, capability and extension consistency; credential
   acceptance hooks. Every real deployment needs at least the lifetime and

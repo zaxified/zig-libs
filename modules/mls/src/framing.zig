@@ -961,6 +961,12 @@ pub fn ProtectPrivateParams(comptime S: type) type {
         /// message's true length (§6.3.1: "It is up to the application to
         /// decide ... how much padding to add").
         padding_len: usize = 0,
+        /// An already-computed encoded signature over `content` (wire format
+        /// `mls_private_message`), used instead of signing here. A Commit
+        /// needs it: its signature enters §8.2's confirmed transcript hash
+        /// BEFORE the `confirmation_tag` that goes into this envelope exists,
+        /// and the signature on the wire must be that same one.
+        signature: ?[]const u8 = null,
     };
 }
 
@@ -979,17 +985,19 @@ fn protectPrivateBody(comptime S: type, allocator: std.mem.Allocator, params: Pr
         else => return error.SenderNotMember, // §6.3.2's MUST
     };
 
-    const sig = try signFramedContent(
-        S,
-        allocator,
-        params.signature_key_pair,
-        .mls_private_message,
-        params.content,
-        params.group_context,
-    );
-    const sig_bytes = S.encodeSignature(sig);
+    var sig_bytes: S.SignatureBytes = .{ .buf = undefined, .len = 0 };
+    if (params.signature == null) {
+        sig_bytes = S.encodeSignature(try signFramedContent(
+            S,
+            allocator,
+            params.signature_key_pair,
+            .mls_private_message,
+            params.content,
+            params.group_context,
+        ));
+    }
     const auth: FramedContentAuthData = .{
-        .signature = sig_bytes.slice(),
+        .signature = params.signature orelse sig_bytes.slice(),
         .confirmation_tag = params.confirmation_tag,
     };
 

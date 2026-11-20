@@ -86,9 +86,11 @@
 //! restored from the `passive-client-*.json` recorded sessions, including
 //! the 200-Commit one. What is a round trip and what is anchored is stated
 //! per test rather than blurred.
-//! What Part 8 does NOT do: accept or send handshake messages framed as
-//! `PrivateMessage` (`error.PrivateHandshakeNotSupported` — driving the §9
-//! secret tree per epoch is a separate concern).
+//! Handshake messages may be framed either way: `HandshakeFraming` picks
+//! `PrivateMessage` for proposals and Commits this member sends, and
+//! `processCommit` opens one with the epoch's secret tree, which the group
+//! drives per epoch (it also carries `protectApplication`/
+//! `unprotectApplication`).
 //!
 //! Part 9 adds §12.4.3.2's external Commits, in both directions and in one
 //! piece: `Group(S).joinByExternalCommit` turns a published `GroupInfo`

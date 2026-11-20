@@ -384,6 +384,144 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
     };
 }
 
+// ── §9 + §9.2: one epoch's secret tree, driven ────────────────────────────
+
+/// RFC 9420 §9 for ONE epoch of a group, with §9.2's deletion schedule: the
+/// state a member keeps to send and receive `PrivateMessage`s in that epoch.
+///
+/// `nodeSecret` re-derives a node from `encryption_secret` on every call,
+/// which needs the root kept for the whole epoch. This type keeps instead
+/// only the node secrets not yet consumed: it starts with the root, and
+/// deriving a leaf walks down from the lowest ancestor still held, deriving
+/// BOTH children of every node it passes and then deleting that node — §9.2's
+/// "a node's secret is consumed once both of its children have been
+/// derived". A leaf's secret is consumed into its two ratchets (`Window`s,
+/// one per `RatchetKind`), created the first time the leaf is needed.
+///
+/// Memory: one optional `Nh`-byte slot per node of the full tree over the
+/// next power of two leaves and one pointer per leaf,
+/// allocated by `init`; a leaf's two windows are allocated on first use.
+/// Every secret is wiped on release (`deinit`) or when consumed.
+pub fn EpochTree(comptime S: type, comptime window_capacity: usize) type {
+    return struct {
+        const Self = @This();
+        pub const LeafWindow = Window(S, window_capacity);
+        pub const LeafRatchets = struct { handshake: LeafWindow, application: LeafWindow };
+
+        allocator: std.mem.Allocator,
+        n_leaves: usize,
+        /// Node secrets not yet consumed, by node index.
+        nodes: []?[S.Nh]u8,
+        /// Each leaf's ratchets, once derived.
+        leaves: []?*LeafRatchets,
+        /// Applied to every window this tree creates.
+        max_forward_jump: u32,
+
+        /// The tree for a group of `n_leaves` leaves whose epoch has
+        /// `encryption_secret` (the root's secret, §9). The caller may wipe
+        /// its own copy of `encryption_secret` afterwards — this tree holds
+        /// the only one it needs.
+        pub fn init(
+            allocator: std.mem.Allocator,
+            encryption_secret: *const [S.Nh]u8,
+            n_leaves: usize,
+            max_forward_jump: u32,
+        ) (Error || std.mem.Allocator.Error)!Self {
+            if (n_leaves == 0) return error.NodeIndexOutOfRange;
+            // Sized for the FULL tree over the next power of two: in a tree
+            // whose leaf count is not one, `treemath.parent` walks through
+            // nodes past `node_width(n_leaves)` (as `nodeSecret` does), and
+            // their secrets have to live somewhere while they are held.
+            const full = std.math.ceilPowerOfTwo(usize, n_leaves) catch return error.NodeIndexOutOfRange;
+            const nodes = try allocator.alloc(?[S.Nh]u8, treemath.node_width(full));
+            errdefer allocator.free(nodes);
+            @memset(nodes, null);
+            const leaves = try allocator.alloc(?*LeafRatchets, n_leaves);
+            @memset(leaves, null);
+            nodes[treemath.root(n_leaves)] = encryption_secret.*;
+            return .{
+                .allocator = allocator,
+                .n_leaves = n_leaves,
+                .nodes = nodes,
+                .leaves = leaves,
+                .max_forward_jump = max_forward_jump,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.nodes));
+            self.allocator.free(self.nodes);
+            for (self.leaves) |slot| if (slot) |lr| {
+                lr.handshake.wipe();
+                lr.application.wipe();
+                self.allocator.destroy(lr);
+            };
+            self.allocator.free(self.leaves);
+            self.* = undefined;
+        }
+
+        /// The `kind` ratchet of `leaf`, derived on first use.
+        pub fn ratchet(self: *Self, leaf: u32, kind: RatchetKind) (Error || std.mem.Allocator.Error)!*LeafWindow {
+            if (leaf >= self.n_leaves) return error.NodeIndexOutOfRange;
+            const lr = self.leaves[leaf] orelse blk: {
+                const fresh = try self.allocator.create(LeafRatchets);
+                errdefer self.allocator.destroy(fresh);
+                try burn.run(burn.kdf_burn, Error!void, deriveLeafBody, .{ self, leaf, fresh });
+                self.leaves[leaf] = fresh;
+                break :blk fresh;
+            };
+            return switch (kind) {
+                .handshake => &lr.handshake,
+                .application => &lr.application,
+            };
+        }
+
+        fn deriveLeafBody(self: *Self, leaf: u32, out: *LeafRatchets) Error!void {
+            const target = @as(usize, leaf) * 2;
+            // The path from the leaf up to the root, leaf first.
+            var path: [treemath.max_path_len + 1]usize = undefined;
+            var len: usize = 0;
+            var x = target;
+            while (true) {
+                path[len] = x;
+                len += 1;
+                x = treemath.parent(x, self.n_leaves) orelse break;
+            }
+            // The lowest node on it still holding a secret. One always
+            // exists: consuming a node stores both its children, so an
+            // underived leaf always has a held ancestor (or is held itself).
+            var i: usize = 0;
+            while (i < len and self.nodes[path[i]] == null) i += 1;
+            if (i == len) return error.NodeIndexOutOfRange;
+            while (i > 0) : (i -= 1) {
+                const p = path[i];
+                const parent_secret = &self.nodes[p].?;
+                const l = treemath.left(p).?;
+                const r = treemath.right(p).?;
+                var tmp: [S.Nh]u8 = undefined;
+                defer std.crypto.secureZero(u8, &tmp);
+                try childSecret(S, parent_secret, true, &tmp);
+                self.nodes[l] = tmp;
+                try childSecret(S, parent_secret, false, &tmp);
+                self.nodes[r] = tmp;
+                std.crypto.secureZero(u8, parent_secret);
+                self.nodes[p] = null;
+            }
+            const leaf_secret = &self.nodes[target].?;
+            var base: [S.Nh]u8 = undefined;
+            defer std.crypto.secureZero(u8, &base);
+            try crypto.ExpandWithLabel(S, leaf_secret, label_handshake, "", &base);
+            LeafWindow.init(&base, &out.handshake);
+            try crypto.ExpandWithLabel(S, leaf_secret, label_application, "", &base);
+            LeafWindow.init(&base, &out.application);
+            out.handshake.max_forward_jump = self.max_forward_jump;
+            out.application.max_forward_jump = self.max_forward_jump;
+            std.crypto.secureZero(u8, leaf_secret);
+            self.nodes[target] = null;
+        }
+    };
+}
+
 // ── §6.3.2: sender-data key and nonce ─────────────────────────────────────
 
 /// RFC 9420 §6.3.2's key and nonce for the `SenderData` AEAD.
@@ -638,4 +776,44 @@ test "senderDataKeys: bound to the ciphertext sample, and a short ciphertext use
     const s2 = try tSender(TestSuite, sds, short[0..8]);
     try testing.expectEqualSlices(u8, &s1.key, &s2.key);
     try testing.expect(!std.mem.eql(u8, &s1.key, &a.key));
+}
+
+test "EpochTree: every leaf's ratchets equal ratchetBaseSecret's, in any order, and every node secret is consumed" {
+    const es = @as([TestSuite.Nh]u8, @splat(0x5a));
+    // Powers of two (what RFC 9420's trees are) and 3/5/7, whose parent
+    // chains pass through nodes past `node_width(n)`.
+    for ([_]usize{ 1, 2, 3, 5, 7, 8 }) |n| {
+        var t = try EpochTree(TestSuite, 4).init(testing.allocator, &es, n, 7);
+        defer t.deinit();
+        // Right to left, then the same leaves again (already derived).
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            for ([_]RatchetKind{ .application, .handshake }) |kind| {
+                const w = try t.ratchet(@intCast(i), kind);
+                try testing.expectEqual(@as(u32, 7), w.max_forward_jump);
+                const want = try tBase(TestSuite, es, n, i, kind);
+                try testing.expectEqualSlices(u8, &want, &w.ratchet.secret);
+            }
+        }
+        // Every node of the real tree; past it, a full tree's phantom
+        // right-hand nodes may stay held (no leaf ever needs them).
+        for (t.nodes[0..treemath.node_width(n)]) |slot| try testing.expect(slot == null);
+        try testing.expectError(error.NodeIndexOutOfRange, t.ratchet(@intCast(n), .application));
+    }
+}
+
+test "EpochTree: deriving one leaf keeps its sibling subtrees and deletes the ancestors" {
+    const es = @as([TestSuite.Nh]u8, @splat(0x21));
+    var t = try EpochTree(TestSuite, 2).init(testing.allocator, &es, 4, default_max_forward_jump);
+    defer t.deinit();
+    _ = try t.ratchet(0, .handshake);
+    // Root 3 and node 1 consumed, leaf 0 consumed into its ratchets; leaf 2
+    // (node 2) and the right subtree (node 5) are held.
+    try testing.expect(t.nodes[3] == null);
+    try testing.expect(t.nodes[1] == null);
+    try testing.expect(t.nodes[0] == null);
+    try testing.expectEqualSlices(u8, &(try tNode(TestSuite, es, 4, 2)), &t.nodes[2].?);
+    try testing.expectEqualSlices(u8, &(try tNode(TestSuite, es, 4, 5)), &t.nodes[5].?);
+    try testing.expectError(error.NodeIndexOutOfRange, EpochTree(TestSuite, 2).init(testing.allocator, &es, 0, 1));
 }

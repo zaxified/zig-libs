@@ -9,14 +9,10 @@
 //! design and says so, so the lock is what makes this a legal owner rather
 //! than a second one.
 //!
-//! **Handshakes are `PublicMessage` here.** `mls.Group` refuses a handshake
-//! framed as `PrivateMessage` (`error.PrivateHandshakeNotSupported`) because
-//! that path needs the §9 secret tree driven for the handshake ratchet too,
-//! and the group object does not drive it. RFC 9420 §6 permits either framing,
-//! so this app takes the one the library supports and says so out loud rather
-//! than discovering it at runtime. The cost is real and worth naming: the
-//! Delivery Service can see the group's membership changes, though not its
-//! messages.
+//! **Handshakes are `PublicMessage` here** — `mls.Group`'s default framing
+//! (`HandshakeFraming`); RFC 9420 §6 permits either. The cost is real and worth
+//! naming: the Delivery Service can see the group's membership changes, though
+//! not its messages.
 
 const std = @import("std");
 const mls = @import("mls");

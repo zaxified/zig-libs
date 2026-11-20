@@ -191,9 +191,6 @@ pub fn main() !void {
         // §12.2: the committed proposal list is not one this member will
         // accept, whatever the signature says.
         error.InvalidProposalList => return error.CommitUnexpectedlyInvalidProposalList,
-        // Handshake messages framed as `PrivateMessage` need the §9 secret
-        // tree driven per epoch, which this group object does not own.
-        error.PrivateHandshakeNotSupported => return error.CommitUnexpectedlyPrivate,
         else => return err,
     };
 

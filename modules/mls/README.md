@@ -66,8 +66,7 @@ and `GroupInfo` that go with them. The two §7.3 rules that need only the leaf a
 the tree are applied, in both directions.
 
 **What it cannot** (details in `SPEC.md`'s "What is deliberately not done" and
-"Backlog / deferred"): send or accept `PrivateMessage` handshakes, encrypt or
-decrypt application data per group epoch, follow through on a `ReInit` (§11.2)
+"Backlog / deferred"): follow through on a `ReInit` (§11.2)
 or branch (§11.3), or apply the §10.1/§7.3 admission rules that need a clock, a
 credential authority or an extension registry.
 
@@ -115,8 +114,7 @@ credential authority or an extension registry.
 
 ## Not provided
 
-No transport, no `PrivateMessage` handshakes and no per-epoch application-message
-send/receive on a `Group`, no ReInit or branch, no credential authority, no
+No transport, no ReInit or branch, no credential authority, no
 suite negotiation inside a group (the suite is a compile-time parameter). The
 reasons are in `SPEC.md`'s "What is deliberately not done"; what is planned is
 in its "Backlog / deferred".
@@ -517,9 +515,34 @@ consume), `g.epoch`, `g.my_leaf_index`, `g.treeSize()`, and
 `g.policy` (`mls.GroupPolicy` — the two §12.2 rules RFC 9420 defers to "the
 application", defaulting ON).
 
-**What it refuses, by name.** `error.PrivateHandshakeNotSupported` — a
-Commit or proposal framed as a `PrivateMessage`; driving the §9 secret tree
-per epoch is not this object's job.
+**Application messages and `PrivateMessage` handshakes.** The group drives
+its epoch's §9 secret tree:
+
+```zig
+const wire = try g.protectApplication(allocator, .{
+    .io = io,
+    .signature_key_pair = &my_signature_key,
+    .data = "hello",
+});
+defer allocator.free(wire); // MLSMessage(PrivateMessage)
+
+// on another member:
+const got = try other.unprotectApplication(allocator, wire);
+defer got.deinit(allocator); // got.sender, got.data, got.authenticated_data
+
+// handshakes encrypted too (default: .public_message)
+const c = try g.createCommit(allocator, .{
+    .io = io,
+    .signature_key_pair = &my_signature_key,
+    .framing = .{ .private_message = .{ .io = io } },
+});
+```
+
+A message of an earlier epoch is `error.WrongEpoch` (the tree is dropped when a
+Commit is adopted), a replay `error.GenerationConsumed`, a jump past
+`g.policy.maximum_forward_distance` `error.GenerationTooFarAhead`; up to
+`mls.group.out_of_order_tolerance` skipped generations per sender stay
+decryptable.
 
 **A refused Commit changes nothing.** `processCommit` and `createCommit`
 build the new epoch on a working copy and swap it in only once nothing can
@@ -538,8 +561,7 @@ group is left at the previous epoch, untouched, so the same note's "keep
 the secret tree for a short time to decrypt late messages" stays open to the
 caller; `deinit` is the caller's to call, and should be soon.
 
-**What it does not do:** send or accept `PrivateMessage` handshakes, follow
-through on a `ReInit` (§11.2) or branch (§11.3), or apply the §7.3/§10.1
+**What it does not do:** follow through on a `ReInit` (§11.2) or branch (§11.3), or apply the §7.3/§10.1
 admission rules that
 need a clock, a credential authority or an extension registry (Part 3) — the
 two that need only the leaf and the tree are applied, see

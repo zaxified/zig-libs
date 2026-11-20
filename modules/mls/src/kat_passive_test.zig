@@ -353,12 +353,11 @@ test "reduction coverage: passive-client-handling-commit still spans empty and n
 }
 
 test "reduction coverage: every recorded message is a PublicMessage" {
-    // `group.zig` refuses `PrivateMessage` handshakes
-    // (`error.PrivateHandshakeNotSupported`) — a documented scope boundary.
-    // That boundary is only honest while the vectors driving it contain no
-    // PrivateMessage, so assert it rather than assume it: a re-filter that
-    // introduced one would otherwise turn a green suite into a silent
-    // "this case is never tested".
+    // The replay below drives `processCommit`'s `PublicMessage` path only:
+    // the recorded sessions carry no `PrivateMessage` handshake (the
+    // `PrivateMessage` path is anchored by `kat_framing_test.zig`'s
+    // message-protection vectors and self-interop in `group.zig`). Asserted
+    // rather than assumed, so a re-filter that introduced one is noticed.
     const files = [_][]const u8{ welcome_json, handling_commit_json };
     for (files) |json| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
