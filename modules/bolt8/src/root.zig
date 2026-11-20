@@ -15,8 +15,7 @@
 //! BOLT#8's "Sender Actions"/"Receiver Actions" lists), and all of
 //! `transport.zig` (the post-handshake Lightning-message framing AND the
 //! key-rotation ratchet). Everything is KAT-verified byte-exact against
-//! BOLT#8 Appendix A, including all published negative vectors — see
-//! `../SPEC.md`'s "TODO(fable) — done record".
+//! BOLT#8 Appendix A, including all published negative vectors.
 //!
 //! Provenance: clean-room from BOLT#8 ("Encrypted and Authenticated
 //! Transport", `lightning/bolts`) — a public, open Lightning Network

@@ -105,8 +105,8 @@ pub const bad_pubkey_serialization = hx("04466d7fcae563e5cb09a0d1870bb5803448046
 pub const bad_recovered_static_key = hx("044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa");
 
 /// The final post-Act-Three transcript hash (`SymmetricState.h`, what
-/// `HandshakeResult.handshake_hash` is filled from) — audit finding F1
-/// (2026-09-05): BOLT#8 does not publish this value, and the only
+/// `HandshakeResult.handshake_hash` is filled from) — audit finding F1:
+/// BOLT#8 does not publish this value, and the only
 /// assertions on it compared the two sides of the SAME handshake against
 /// each other, which a channel-binding value that is IDENTICAL on both
 /// sides by construction (both run the same mixHash sequence) will always
@@ -125,7 +125,7 @@ pub const handshake_hash_final = hx("3e385d26eb49e88ddd66f70f7b24e597867feecf320
 
 /// "transport-responder act1 bad key serialization test": `act1_bytes`
 /// with `e.pub`'s SEC1 prefix patched `0x03` -> `0x04` (byte index 1, the
-/// first byte of the 33-byte key) — audit finding F4 (2026-09-05): of
+/// first byte of the 33-byte key) — audit finding F4: of
 /// BOLT#8's 16 named test vectors, this was the one this module embedded
 /// nowhere and exercised nowhere (`kat_test.zig` confirms the module
 /// rejects it correctly with `error.InvalidPublicKey` via the full

@@ -30,7 +30,7 @@ pub const ParseError = error{
     /// The buffer was not exactly the fixed act length — too short OR too
     /// long ("Read _exactly_ N bytes from the network buffer" — a short
     /// read is a hard failure, not a partial-parse; BOLT#8's own
-    /// `*_READ_FAILED` test vectors). Audit finding F9 (2026-09-05):
+    /// `*_READ_FAILED` test vectors). Audit finding F9:
     /// `fromBytes` used to accept `bytes.len > act_len` and silently
     /// discard the tail rather than reject it, and return no count of
     /// bytes consumed — so a caller could never tell where the next
@@ -176,7 +176,7 @@ test "Act3: 'transport-responder act3 short read test' — 65 bytes fails ShortR
 }
 
 test "fromBytes rejects a buffer LONGER than the act, not just a shorter one (F9)" {
-    // Audit finding F9 (2026-09-05): BOLT#8 says "Read _exactly_ N bytes
+    // Audit finding F9: BOLT#8 says "Read _exactly_ N bytes
     // from the network buffer", but `fromBytes` used to accept
     // `bytes.len > act_len` and silently discard the tail. Mutation A2 (the
     // audit's own `!=` in place of `<`) left the OLD suite and a live
@@ -271,7 +271,7 @@ const act1_seeds = [_][]const u8{
     // "transport-responder act1 short read test": 49 octets -> ShortRead.
     testkit.fuzz.seed(kv.act1_bytes[0 .. act1_len - 1]),
     // A full act with 32 octets of trailing garbage, filling the buffer.
-    // Audit finding F9 (2026-09-05): `fromBytes` used to silently ignore
+    // Audit finding F9: `fromBytes` used to silently ignore
     // this tail instead of rejecting it (BOLT#8: "Read _exactly_ N bytes");
     // now this seed is REJECTED (ShortRead), which is what the "accepted"
     // count below counts.

@@ -10,9 +10,10 @@
 //! NOT on `noise.HandshakeState`. `noise`'s `HandshakeState.initialize`
 //! derives the Noise protocol-name string via a `dhName(DH)` lookup
 //! (`noise/src/state.zig`) that knows `std.crypto.dh.X25519` and any type
-//! declaring `pub const noise_name`; this module's secp256k1 `dh` adapter
-//! declares none, and BOLT#8 drives its own Act One/Two/Three rather than a
-//! generic pattern, so `.initialize` is never called here.
+//! declaring `pub const noise_name` (this module's secp256k1 `dh` adapter
+//! declares one, so a `HandshakeState` type can be named), but BOLT#8 drives
+//! its own Act One/Two/Three rather than a generic pattern, so `.initialize`
+//! is never called here.
 //! `SymmetricState`, by contrast, never references the `DH` type at all —
 //! it operates purely on opaque `[]const u8` key material — so it is fully
 //! reusable, DH-agnostic infrastructure. Whether `noise/src/patterns.zig`
@@ -150,7 +151,7 @@ pub const Ephemeral = union(enum) {
 /// `genAct1`/`genAct2` with an `Ephemeral` — `.csprng` draws a fresh share,
 /// which is the only shape Noise_XK's forward secrecy is defined for.
 ///
-/// `void`, not a `@compileError` inside the function (as until 2026-10-07):
+/// `void`, not a `@compileError` inside the function (as previously):
 /// `check-testonly` and `check-pubfn-reach` reference every public
 /// declaration of a non-test build, and a `@compileError` there fails them,
 /// which had kept this module out of `test_deps` (and testkit's fuzz driver).
@@ -171,7 +172,7 @@ pub const HandshakeResult = struct {
     /// The peer's static public key — for the initiator this is the `rs`
     /// it already knew before the handshake started (Noise_XK's whole
     /// point); for the responder it is the `rs` Act Three just recovered
-    /// and validated. Audit finding F7 (2026-09-05): before this field
+    /// and validated. Audit finding F7: before this field
     /// existed, the ONLY output of authentication (in Lightning, the peer's
     /// node id) lived solely on the `Initiator`/`Responder` object itself
     /// (`.rs_pub`) and this module had no in-repo consumer, so its own
@@ -230,7 +231,7 @@ pub const Initiator = struct {
     /// Zero the key material this object directly owns: the long-term
     /// static private key, the ephemeral private key (if one was drawn),
     /// the running chaining key, and the embedded cipher key. Audit finding
-    /// F2 (2026-09-05): this module had no zeroization mechanism at all,
+    /// F2: this module had no zeroization mechanism at all,
     /// mirroring `noise.HandshakeState.wipe` (which this module does not
     /// use — see the module doc comment — but the pattern is the same:
     /// the transcript hash stays available for `getHandshakeHash`, only
@@ -651,7 +652,7 @@ pub const Responder = struct {
     }
 };
 
-/// Review 2026-10-08 (HIGH; SPEC § Backlog "Dead-stack copies", until then
+/// Review (HIGH; SPEC § Backlog "Dead-stack copies", until then
 /// unmeasured). `deinit` wipes what the handshake objects own, and nothing
 /// wiped the copies in dead frames: measured with `stackprobe_test.zig`
 /// (ReleaseFast), every act left its private keys, DH outputs, chaining and
@@ -662,11 +663,11 @@ pub const Responder = struct {
 /// load-bearing.
 noinline fn burnStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -676,7 +677,7 @@ noinline fn burnStack() void {
 }
 
 /// The deepest act (`k256`'s own 16 KiB `mul` burn under it) dirtied
-/// 17.7 KiB in ReleaseFast (2026-10-08); `stackprobe_test.zig` goes red when
+/// 17.7 KiB in ReleaseFast; `stackprobe_test.zig` goes red when
 /// a call tree outgrows this.
 const stack_burn = 24 * 1024;
 
@@ -695,9 +696,8 @@ test "Suite(dh, ChaChaPoly, SHA256) type-checks and its SymmetricState is DH-agn
     ss.mixHash(prologue);
     try testing.expect(!ss.cipher_state.hasKey());
     // Deliberately NOT tested: Suite.HandshakeState.initialize(...) — see
-    // the module doc comment: the secp256k1 adapter declares no
-    // `noise_name`, so dhName would @compileError; this module drives the
-    // handshake itself instead of reusing noise.HandshakeState.
+    // the module doc comment: this module drives the handshake
+    // itself instead of reusing noise.HandshakeState.
 }
 
 const kv = @import("kat_vectors.zig");
@@ -747,7 +747,7 @@ test "Initiator.init / Responder.init: BOLT#8 'Handshake State Initialization' m
     try testing.expectEqual(h_before_act1.*, initiator.ss.h);
 }
 
-// ── B6 RNG-seam pins (2026-08-12) ─────────────────────────────────────
+// ── B6 RNG-seam pins ─────────────────────────────────────
 //
 // R1 was: `e` was a PUBLIC INPUT field and `genAct1` did `self.e orelse
 // dh.KeyPair.generate(random)`, so a consumer who assigned it got a constant
@@ -856,7 +856,7 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     try testing.expectError(error.WrongState, responder.readAct3(fin.msg, &scratch_result));
 }
 
-// ── no-panic sweep (2026-11-14) ───────────────────────────────────────
+// ── no-panic sweep ───────────────────────────────────────
 
 // `state` is a pub field with a default, so a consumer can build an object by
 // literal (or assign the field) and land in an act whose earlier act never ran.

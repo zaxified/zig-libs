@@ -93,7 +93,7 @@ pub const Direction = struct {
     }
 };
 
-/// ⚠ Audit finding F13 (2026-09-05): `NonceExhausted` in both error sets is
+/// ⚠ Audit finding F13: `NonceExhausted` in both error sets is
 /// structurally UNREACHABLE today. `maybeRotate` resets `n` to 0 the instant
 /// it reaches `rotation_interval` (1000), so `n` can never climb toward
 /// `CipherState`'s actual exhaustion point (2^64-1) — a `Direction` that
@@ -131,7 +131,7 @@ pub const Transport = struct {
     }
 
     /// Zero both directions' live cipher key and rotation chaining key.
-    /// Audit finding F2 (2026-09-05): additive, no existing signature
+    /// Audit finding F2: additive, no existing signature
     /// changes (`DECISIONS.md` P1/P3, zero in-repo consumers). See
     /// `handshake.Initiator.deinit`'s doc comment for the same caveat about
     /// dead-stack copies this does not reach.
@@ -170,7 +170,7 @@ pub const Transport = struct {
     /// encrypted length prefix, returning the plaintext length `l` the
     /// caller must then read `l + 16` more bytes for (`recvMessage`).
     ///
-    /// ⚠ Audit finding F6 (2026-09-05): `rx`'s nonce advances on EVERY call
+    /// ⚠ Audit finding F6: `rx`'s nonce advances on EVERY call
     /// to `recvLength` OR `recvMessage`, in strict alternation — there is no
     /// state tracking which one is expected next. A `recvLength` whose
     /// matching `recvMessage` never arrives (the caller read a header, then
@@ -341,7 +341,7 @@ test "Transport.recvMessage: a tampered ciphertext fails closed with DecryptionF
 }
 
 test "F13: NonceExhausted is structurally unreachable through this module's own send/recv" {
-    // Audit finding F13 (2026-09-05): `maybeRotate` resets `n` to 0 at
+    // Audit finding F13: `maybeRotate` resets `n` to 0 at
     // `rotation_interval` (1000), so a `Direction` driven only through
     // `sendMessage`/`recvLength`/`recvMessage` can never approach
     // `CipherState`'s real exhaustion point (2^64-1). 4000 messages spans
@@ -366,7 +366,7 @@ test "F13: NonceExhausted is structurally unreachable through this module's own 
 
 // ── fuzz: the untrusted-wire transport decoders never panic/OOB ────────────
 //
-// Audit finding F3 (2026-09-05), second half: `act.zig`'s framing decoders
+// Audit finding F3, second half: `act.zig`'s framing decoders
 // got real corpora in a prior session, but "transport `decode`" (this
 // file's `recvLength`/`recvMessage`) had NO harness at all — a fixed-size
 // `Transport`, wired from the published KAT keys so every draw exercises a

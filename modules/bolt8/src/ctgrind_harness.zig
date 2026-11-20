@@ -10,7 +10,7 @@
 //!
 //! ## Why this module has one at all
 //!
-//! Until 2026-09-08 `bolt8` was outside the ctgrind table and its ledger
+//! Until `bolt8` was outside the ctgrind table and its ledger
 //! recorded the constant-time verdict as "PASS (inherited)" — read, never
 //! instrumented — while the module holds the node's long-term static private
 //! key, the ephemeral keys, `temp_k*` and both transport keys. Audit finding

@@ -21,8 +21,7 @@
 //! type). This is a non-issue for `noise.SymmetricState` (which treats DH
 //! output as an opaque `[]const u8`, never a `[DHLEN]u8`-shaped value) but
 //! DOES rule out driving this handshake through `noise.HandshakeState` —
-//! see `../SPEC.md`'s "Noise-reuse decision" for the exact mechanism
-//! (`state.zig`'s `dhName` only recognizes `std.crypto.dh.X25519`).
+//! see `../SPEC.md`'s "Noise-reuse decision" for the exact mechanism.
 //!
 //! Modeled after this repo's own `sphinx` module's `fromSec1 -> mul ->
 //! toCompressedSec1 -> Sha256.hash` chain (BOLT#4 defines an IDENTICAL
@@ -125,7 +124,7 @@ pub const KeyPair = struct {
         }
     }
 
-    /// Zero the private scalar. Audit finding F2 (2026-09-05): this module
+    /// Zero the private scalar. Audit finding F2: this module
     /// had no zeroization anywhere; additive method, no existing signature
     /// changes (`DECISIONS.md` P1/P3, zero in-repo consumers). Does not
     /// reach copies of `secret_key` made by earlier by-value calls (e.g.

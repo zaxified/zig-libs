@@ -83,7 +83,7 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     try testing.expectEqual(kv.init_rk.*, r.sk);
     try testing.expectEqual(kv.ck_temp_k3[0].*, r.ck);
     try testing.expectEqual(a3.result.handshake_hash, r.handshake_hash);
-    // Audit finding F1 (2026-09-05): the line above only ever compared the
+    // Audit finding F1: the line above only ever compared the
     // two sides against EACH OTHER, which a value both sides compute the
     // same way will match even if computed wrong — two mutations that
     // replaced handshake_hash outright (with `ck`, and with an all-zero
@@ -94,7 +94,7 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     try testing.expectEqual(kv.handshake_hash_final.*, a3.result.handshake_hash);
     try testing.expectEqual(kv.init_ls_pub.*, responder.rs_pub.?);
 
-    // Audit finding F7 (2026-09-05): the peer's identity (in Lightning, the
+    // Audit finding F7: the peer's identity (in Lightning, the
     // node id) used to live ONLY on the `Initiator`/`Responder` object,
     // never in `HandshakeResult` -- each side's result must now carry the
     // OTHER side's static public key, matching the published fixture keys.
@@ -180,7 +180,7 @@ test "F5: readAct2 failing kills the initiator too, even though the transcript a
 test "F5: Act One failing on a malformed rs, and readAct1 failing on a bad MAC, kill the object too" {
     // Act One's only failure is the DH against `rs`, which `init` takes
     // unvalidated. Its `.failed` errdefer had no test: dropping it survived
-    // the 2026-10-08 mutation run, leaving the initiator in `.start` with
+    // the mutation run, leaving the initiator in `.start` with
     // `h` already holding the first ephemeral -- a retry would run Act One
     // again over a transcript the responder can never match.
     const ls = tu.keyPair(kv.init_ls_priv.*);
@@ -198,7 +198,7 @@ test "F5: Act One failing on a malformed rs, and readAct1 failing on a bad MAC, 
 }
 
 test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 must reject a malformed e.pub prefix" {
-    // Audit finding F4 (2026-09-05): of BOLT#8's 16 named test vectors, this
+    // Audit finding F4: of BOLT#8's 16 named test vectors, this
     // was the one embedded nowhere and exercised nowhere. The module
     // rejects it correctly today -- this pins that against regression.
     const ls = tu.keyPair(kv.resp_ls_priv.*);
@@ -246,7 +246,7 @@ test "wiring sanity: Transport built from the published sk/rk/ck reproduces the 
 }
 
 test "README 'post-handshake transport' snippet, verbatim, with real types (F9 2026-09-05: it used to fail to compile)" {
-    // Audit finding F12 (2026-09-05): `var plain: [l]u8 = undefined;` where
+    // Audit finding F12: `var plain: [l]u8 = undefined;` where
     // `l` is `Transport.recvLength`'s runtime `u16` result -- "unable to
     // resolve comptime value". This is the corrected form, kept in the real
     // suite (not just the doc) so it cannot silently rot again.
@@ -347,7 +347,7 @@ test "wiring sanity: Initiator.init/Responder.init from the published identities
 }
 
 test "F2: deinit zeroes the key material each object directly owns" {
-    // Audit finding F2 (2026-09-05): the module had no zeroization at all.
+    // Audit finding F2: the module had no zeroization at all.
     // This does not claim the dead stack is clean (see SPEC.md's note on
     // that) -- only that the LIVE fields on these objects go to zero.
     var initiator = try initiatorAfterAct1();

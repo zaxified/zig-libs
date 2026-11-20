@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over bolt8's five existing `testing.fuzz`
-//! harnesses (added 2026-10-07): the three act decoders in `act.zig` and the
+//! harnesses: the three act decoders in `act.zig` and the
 //! two transport decoders in `transport.zig`. The harness bodies stay where
 //! they were, now generic over their source of choices
 //! (`fn(comptime S, *S, gpa)`); this file adds the cursor adapter

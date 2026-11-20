@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for the key
-//! and transport entry points added to the dead-stack rule in the 2026-10-09
+//! and transport entry points added to the dead-stack rule in the
 //! sweep: `KeyPair.generateDeterministic`, `KeyPair.generate`, `dh`,
 //! `Direction.init`. (`Initiator`/`Responder.init`, the acts and
 //! `Transport.init` stay covered by the older `stackprobe_test.zig`.)
