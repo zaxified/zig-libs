@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests added by the 2026-11-18 whole-module mutation audit: each one pins a
+//! Tests added by the whole-module mutation audit: each one pins a
 //! behaviour that a mutant of `root.zig` could change without any earlier test
 //! noticing (large method numbers, header validation order, exact-fit buffers,
 //! boundary lengths of fixed-size attributes, padding of error responses,

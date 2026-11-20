@@ -1140,7 +1140,7 @@ pub const QueryOptions = struct {
     /// when nothing better is known); doubles after every send.
     rto_ms: u32 = 500,
     /// Rc: requests sent in total (RFC 8489 default 7). 1 = no
-    /// retransmission (the pre-2026-10-04 behaviour).
+    /// retransmission (the earlier behaviour).
     max_requests: u8 = 7,
     /// Rm: after the last request, wait `last_wait_factor * rto_ms` more
     /// (RFC 8489 default 16).
@@ -1258,7 +1258,7 @@ pub fn query(
     var sched = Schedule.init(options);
     // What arrived instead of our answer, if anything: reported on give-up
     // in place of `error.Timeout`, so "the server answered garbage" stays
-    // distinguishable from "nothing came back" (the errors the pre-2026-10-04
+    // distinguishable from "nothing came back" (the errors the earlier
     // single-shot `query` returned at once).
     var stray: ?(DecodeError || error{TransactionMismatch}) = null;
     while (sched.nextSend()) |send_at| {
@@ -1979,7 +1979,7 @@ test "query: normal answered path still works, unaffected by the bound" {
     try testing.expectEqual(@as(u16, 4989), result.port);
 }
 
-// ── 2026-10-04: retransmission, responder, URIs, long-term credentials ─────
+// ──: retransmission, responder, URIs, long-term credentials ─────
 
 test "Schedule: the RFC 8489 §6.2.1 example — 0, 500, 1500, 3500, 7500, 15500, 31500, give up at 39500" {
     // RFC 8489 §6.2.1: "if RTO is 500 ms, requests would be sent at times
@@ -2364,7 +2364,7 @@ test "fuzz: decode + every accessor never crash on arbitrary bytes" {
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length (the ranged draw would find fewer than eight octets and return the
-    // range MINIMUM, so the message was never read; measured 2026-09-07).
+    // range MINIMUM, so the message was never read; measured).
     // The harness body lives in `fuzz_test.zig`, generic over its source.
     const ft = @import("fuzz_test.zig");
     var script: [1024]u8 = undefined;
@@ -2398,7 +2398,7 @@ test "corpus: every seed reaches decode, and the walk/accessor counts are pinned
         if (msg.verifyFingerprint() and msg.verifyMessageIntegrity(rfc5769_password)) verified += 1;
     }
     try testing.expectEqual(decode_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 10 seeds non-empty,
+    // Measured: with the collapsing draw, 0 of 10 seeds non-empty,
     // 0 decoded, 0 attributes walked and 0 verified — one empty slice, ten
     // times. After:
     try testing.expectEqual(@as(usize, 6), accepted);
