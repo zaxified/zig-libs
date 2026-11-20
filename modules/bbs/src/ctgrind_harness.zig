@@ -2,16 +2,13 @@
 
 //! ctgrind_harness — constant-time evidence for two of `bbs.zig`'s four
 //! core functions, as an actual committed program instead of an unmeasured
-//! sentence. Run it through `../../../scripts/checks/ctgrind.sh bbs` (once the
-//! coordinator adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this
-//! file's doc comment suggests below — that script REFUSES an unlisted
-//! module rather than silently skipping it).
+//! sentence. Run it through `../../../scripts/checks/ctgrind.sh bbs` (its expected
+//! rows are in `scripts/checks/ctgrind-expected.tsv`).
 //!
 //! NOT wired into `zig build test-bbs` — memcheck's context count is
 //! valgrind's own verdict, not something a Zig test can assert on. `zig
-//! build check-ctgrind` compiles it (a rot guard, no valgrind) once the
-//! coordinator's `build.zig` discovery picks this file up by its path
-//! existing.
+//! build check-ctgrind` compiles it (a rot guard, no valgrind): the
+//! harness is discovered by its path existing.
 //!
 //! ## Is there a pre-existing constant-time claim this is evidence for?
 //!
@@ -338,26 +335,3 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
-// generate mechanically — every existing entry carries hand-written
-// reasoning in its own comment; this follows the same shape) ───────────
-//
-// declare -A TARGETS=(
-//     [bbs]="sign proofgen"
-// )
-// declare -A MODES=(
-//     [bbs]="ReleaseFast"
-// )
-// declare -A PATTERN=(
-//     # bbs's own files plus the bls12_381 substrate every G1 `scalarMul`
-//     # and every `hash_to_scalar` call bottoms out in — see this file's
-//     # module doc comment ("Inherited substrate") for why each is here
-//     # and why `g2[.]zig`/`fp2[.]zig` are deliberately NOT.
-//     [bbs/sign]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
-//     [bbs/proofgen]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
-// )
-// declare -A LABEL=(
-//     [bbs/sign]='bbs sign SK+bls12_381 g1/fp/ff'
-//     [bbs/proofgen]='bbs proofGen undisclosed msgs+randomness+bls12_381 g1/fp/ff'
-// )
