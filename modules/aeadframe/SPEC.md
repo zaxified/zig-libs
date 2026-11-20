@@ -147,7 +147,7 @@ iff `(e₁,s₁) = (e₂,s₂)`. Nonce uniqueness under one key therefore reduce
 
 Hence within a `Sealer`'s lifetime no nonce is ever reused. (Constructing a
 *fresh* `Sealer` with a `(key, epoch)` pair already used elsewhere is the
-caller's responsibility — the guarantee is per live Sealer; see §6 deferred.)
+caller's responsibility — the guarantee is per live Sealer; see *What is deliberately not done*.)
 
 The `chachapoly` and std AEADs both build their internal counter from a 96-bit
 nonce; a distinct 12-byte nonce is exactly what each needs to stay in its safe
@@ -181,18 +181,13 @@ current key and `new_epoch` does not strictly advance past the current epoch,
 it returns `error.NonceSpaceReuse` with the sealer's state untouched. `seal`
 and `bumpEpoch` cannot express it at all (both are strictly increasing and
 refuse at their ceilings), so no sequence of calls on a live `Sealer` emits a
-nonce twice, with the single exception recorded in §8 (re-installing a key this
+nonce twice, with the single exception recorded in *What is deliberately not done* (re-installing a key this
 sealer used *earlier*).
 
 Note the asymmetry with a *different* key: `rekey` imposes no epoch ordering
 there, because an independent key gives an independent keystream and the epoch
 field is then irrelevant to collision. `Opener.rekey` stays infallible — a
 receiver emits no nonce, so it has no nonce space to spend.
-
-> History: until this guard existed, `SPEC.md` asserted at this point that "the
-> API offers no such operation", while `Sealer.rekey` accepted exactly it and
-> silently reset `seq`. The sentence is corrected rather than deleted so the
-> claim and the check are visibly the same statement.
 
 On the receive side, an epoch change (`bumpEpoch`/`rekey`) **resets the replay
 window** — the old sequence numbers describe a spent nonce space and carry no
@@ -250,7 +245,10 @@ Do not file it as one.
   window (`0 < highest − seq ≤ size`) and its bit is clear. A duplicate of
   `highest` (`diff 0`) or a too-old `seq` (`diff > size`) returns `false`.
 - `commit(seq)`: slides the window on a new high (shifting the bitmap and
-  setting the old mark's bit), or sets the in-window bit for a late arrival.
+  setting the old mark's bit), or sets the in-window bit for a late arrival. A new
+  high that advances by exactly the window size keeps the old mark's bit (it then
+  sits at `diff == size`, the last slot `accepts` treats as in-window); only a
+  larger jump clears the bitmap.
 
 **Verify-then-commit ordering.** `Opener.open` calls `accepts` as a cheap
 pre-filter, runs the AEAD, and calls `commit` **only after** the tag verifies.
@@ -299,14 +297,15 @@ arbitrary bytes:
   each delivered record still authenticates individually. This is not a
   defect specific to this module (ESP and DTLS 1.3 leave the identical gap
   to a higher layer, e.g. a length-prefixed application message or an
-  explicit close-notify), but this module's own docs previously did not say
-  so despite framing itself as a complete record layer. **The caller's
+  explicit close-notify). **The caller's
   transport/application layer is responsible for detecting stream
   truncation** — e.g. a length-prefixed outer message, a sequence-number
   gap check against an expected total, or an explicit terminator record the
   caller defines above this layer. `aeadframe` does not provide one.
 
-## 7. Verification
+## Verification
+
+Run with `scripts/modtest aeadframe`.
 
 - **KAT (framing anchor).** One record with fixed key/epoch/seq/aad/plaintext
   is pinned byte-exact: header bytes (hand-verifiable) plus ciphertext+tag
@@ -317,14 +316,36 @@ arbitrary bytes:
   12-byte nonce-layout KAT anchors the endianness independently.
 - **Both AEADs.** The behavioural suite (round-trip, empty plaintext, AAD
   mismatch, ciphertext/tag/header tamper, monotonic nonce, sequence ceiling,
-  replay, epoch/rekey) runs `inline for` over `{ChaChaChannel, AesGcmChannel}`.
+  replay, epoch/rekey) runs `inline for` over `{ChaChaChannel, AesGcmChannel}`;
+  padding (§2.1) and the overlap opener (§4.1) have their own tests for both.
+- **Replay window.** `replay.zig` holds the window against `RefOracle`, a plain
+  set with the same age cutoff, over a randomised trace at widths 8/32/64 that
+  includes jumps of exactly the window size, plus explicit edge sweeps
+  (exactly-at-edge, oversized `size` with hostile diffs).
 - **Positive controls (permanent).** Two sentinels prove the safety tests have
   teeth: a broken nonce derivation that drops the epoch is shown to *collide*
   (so the real injectivity test would go red on that regression), and an
   always-accept replay stub is shown to *admit* a duplicate the real window
   rejects.
+- **Fuzz.** The deterministic driver, `AEADFRAME_FUZZ=<runs>[,<first seed>]`
+  (`src/fuzz_test.zig`), has two harnesses: `aeadframe-channel` (both AEADs,
+  Sealer to Opener, records delivered in a drawn order with duplicates against
+  an independent replay-window model; damaged copies, other AAD, an undersized
+  buffer and an old epoch are refused and change nothing; the top of the
+  sequence space is exhausted, never wrapped) and `aeadframe-record`
+  (`record.parse`); both have reach checks. A `std.testing.fuzz` harness over
+  `open` (untrusted-decode section of `channel.zig`, seeded from the module's own
+  records) runs with the ordinary tests.
+- **Constant time.** `src/ctgrind_harness.zig` (targets `chacha` and `aes`,
+  `scripts/checks/ctgrind.sh aeadframe`) taints the channel keys and the
+  plaintext through `seal`, `rekeyInto` and `open`, including a tampered record;
+  the rows are in `scripts/checks/ctgrind-expected.tsv`.
+- **Key residue.** `src/stackprobe_test.zig` checks that no channel key is left
+  on the stack after any entry point, for both instantiations.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
-## 8. Deferred / out of scope
+## What is deliberately not done
 
 - **Key agreement / handshake.** No Noise/HPKE/X25519 here — the key is an
   input. A future module (or the fabric orchestrator) performs the handshake and
@@ -351,37 +372,9 @@ arbitrary bytes:
   thread/loop and holds no lock. Sharing one across threads is the caller's to
   synchronise.
 
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **34 mutants first pass, 28 killed; after the fix and 2 tests, 35 of 35 killed** (one
-mutant replaced: the original `shift >= eff` became the fix, so its mutant now re-introduces the
-bug). Points: record parse length and version, the nonce layout, every replay-window edge
-(`accepts`: unstarted, fresh, duplicate, trailing edge; `commit`: clear, shift, bit position,
-in-window marking; `reset`), the AAD limit in all three places, `seal`'s buffer and sequence
-ceiling and advance, both `bumpEpoch`s, `rekey`'s nonce-space rule and seq/window restart,
-`open`'s epoch/buffer/AAD/replay checks, failed-plaintext wipe, window commit, and `wipe`.
-
-- **Defect (fixed) — a replay accepted at the window edge.** `commit` cleared the bitmap when
-  a new record advanced the high-water mark by exactly the window size (`shift >= eff`), but the
-  previous high-water mark then sits at `diff == eff`, the last slot `accepts` treats as
-  in-window — so it was accepted a second time (default window: receive seq 0, then seq 64, and
-  a replay of seq 0 opened). The randomised reference-set test advanced by 1–3 only and never hit
-  it. Now `shift > eff` clears; `shift == 64` keeps only the old mark's bit (`<< 64` is not
-  expressible). Test pins sizes 8/32/64; the randomised trace also jumps by exactly the window.
-  The same copy of this window in `oscore` had the same defect, fixed alongside.
-- **Test gaps closed:** AAD of exactly `max_caller_aad` (seal and open; the limit was only
-  checked beyond it), seq restart at 0 after `bumpEpoch`/`rekey` on a sealer that had sealed,
-  and `Opener.rekey` restarting the window.
-
-### Delta mutation 2026-11-17 (padding and overlap)
-
-47 schemata mutants over the code added the same day (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`): `record.zig` (`parseWith`: the allow flag and the version compare forced, the version refusal dropped, the trailer-length guard at its boundary and dropped, the `padded` flag; `padForBlock`: the small-block shortcut, the trailer term, the aligned case, the clamp; the version byte of `encodePadded`) and `channel.zig` (`sealCore`: the trailer in the body length, the header version, the pad-length value's endianness, the zero fill, the plaintext copy, the tag offset, `sealedLenPadded`; `openBody`: the allow flag, the epoch test, the previous-epoch test, which key and which window the previous epoch uses, the window commit, the padded branch; `stripPadding`: the trailer-fit bound at its boundary and dropped, the zero check, its length by one, the plaintext length, the trailer's endianness; `bumpEpochOverlap`, `rekeyOverlapBody`, `bumpEpoch`, `rekeyBody` and `wipe`: the retained epoch's assignment, its window, the key and window reset, the same-epoch refusal, the drop; `dropPrevious`; `previousEpoch`). First run: 43 killed, 4 survived. One test fix (a plain `rekey` after an overlap was checked against an already-empty retained slot) killed one: 44 killed. Three survivors, each argued: `bumpEpochOverlap` and `rekeyOverlapBody` without their leading `dropPrevious()` are EQUIVALENT (the next statement overwrites the whole retained slot, key included); `dropPrevious` without its `secureZero` is UNOBSERVABLE here (the test that reads the retained key through a pointer after the drop still sees zeros, because this compiler's null store clears the optional's payload too; the explicit wipe stays as the guarantee the language does not give). Not run: the rekeyOverlap same-epoch compare as `<=` (one anchor, taken by the dropped-check mutant; a test pins a lower distinct epoch as accepted). The card's counts are cumulative with the 2026-10-05 run: 35 + 44 = 79 killed, 3 equivalent, 82 mutants.
-
 ## Backlog / deferred
 
-- **Multi-epoch opener (overlap window at rekey)** — DONE 2026-11-17, see §4.1.
-- **Optional length padding** — DONE 2026-11-17, see §2.1.
+None open.
 
 ## Anchoring
 
