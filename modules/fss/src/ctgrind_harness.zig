@@ -8,9 +8,8 @@
 //! `xorMasked` in `dpf.zig`), so the instruction and branch trace is
 //! identical for every key, every α and every control-bit pattern." Until
 //! this file, that sentence was asserted in prose and never run under an
-//! instrument. `fss` has no per-module block in `scripts/checks/ctgrind.sh` yet
-//! (see the suggested wiring at the bottom of this comment), so drive it by
-//! hand:
+//! instrument. Run it through `scripts/checks/ctgrind.sh fss` (expected rows in
+//! `scripts/checks/ctgrind-expected.tsv`), or by hand:
 //!
 //!     zig build ctgrind -Dctgrind-module=fss -Dctgrind-valgrind=true  -Doptimize=ReleaseFast
 //!     zig build ctgrind -Dctgrind-module=fss -Dctgrind-valgrind=false -Doptimize=ReleaseFast
@@ -59,8 +58,8 @@
 //! implementation whose indices depend on the data, and that is `prg.zig`'s
 //! OWN, already-documented, non-`dpf.zig` caveat (see `prg.zig`'s module doc
 //! and `SPEC.md`'s "Constant time" section) — not a new finding. This
-//! harness's claim is about `dpf.zig`'s tree; see the suggested `PATTERN`
-//! below for how that is kept separate from the PRG's own story.
+//! harness's claim is about `dpf.zig`'s tree; the `PATTERN` in
+//! `scripts/checks/ctgrind.sh` keeps it separate from the PRG's own story.
 //!
 //! ## The two traps (same shape as every other harness in this collection)
 //!
@@ -88,24 +87,6 @@
 //! what proves the taint actually reached the output — so a zero count
 //! inside `dpf.zig` itself means "no branch found", not "taint never
 //! arrived".
-//!
-//! ## Suggested `scripts/checks/ctgrind.sh` wiring (`fss` has no block there yet)
-//!
-//!     TARGETS[fss]="gen eval"
-//!     MODES[fss]="ReleaseFast"
-//!     PATTERN[fss/gen]='dpf[.]zig|group[.]zig'
-//!     PATTERN[fss/eval]='dpf[.]zig|group[.]zig'
-//!     LABEL[fss/gen]='fss genWithSeeds (alpha,s0,s1)'
-//!     LABEL[fss/eval]='fss eval (key)'
-//!
-//! `prg[.]zig` and std's AES core are deliberately NOT in the suggested
-//! pattern: the claim under test is `dpf.zig`'s tree, and `prg.zig`'s own
-//! constant-time story is hardware-AES-conditional and separately documented
-//! (see above). If a run's total does not equal in-file+witness on a target
-//! that lacks hardware AES, that is `prg.zig`'s known caveat surfacing
-//! through `unattr`, not a bug in this harness's classification — widen
-//! `--pattern` with `aes[.]zig|core[.]zig` to confirm before treating it as
-//! new.
 
 const std = @import("std");
 const builtin = @import("builtin");
