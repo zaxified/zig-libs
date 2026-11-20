@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## What it computes
 
-For one source `S`, one member set, and a caller-supplied `spf-ect.Graph`, a
+For one source `S`, one member set, and a caller-supplied `spf-ect.Graph` (`build`; `buildAll` returns the same trees for every source and a list of member sets), a
 per-node plan `{ rpf_ingress, replicate_to, is_member }` that a forwarder uses to
 deliver BUM (broadcast/unknown-unicast/multicast) traffic for an I-SID on `S`'s
 pruned shortest-path tree. This is the control-plane half deferred to by the
@@ -165,12 +165,11 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 - **Designated-forwarder election** — the separate `df-elect` module.
 - **Topology extraction** — building the `spf-ect.Graph` from an LSDB is the upstream `isis-spf`'s job.
 
-(The all-sources batch and the 802.1aq ECT-mask variants are not refused: see *Backlog / deferred*.)
+(The 802.1aq ECT-mask variants are not refused: see *Backlog / deferred*.)
 
 ## Backlog / deferred
 
 - **802.1aq ECT-mask tie-break in `spf-ect` (or a variant hook in `bumtree.build`)** (survey 2026-09-30): two SPB bridges only agree on the tree if they run the same ECT algorithm; a network with a non-Zig bridge needs the standard's, not ours. Effort M (needs the standard's algorithm text; no public vectors, see Anchoring). Fits CONVENTIONS §2 (pure Zig).
-- **All-sources / all-I-SIDs batch (`buildAll`)** (survey 2026-09-30): what an SPB node actually computes on a topology change is the state for every (source, I-SID) pair; today the caller loops over `build`. Effort S. Fits §2. The reference simulator does it in one pass.
 
 ## Anchoring
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **ADDED (additive):** `buildAll(gpa, graph, isid_members)` returns `AllTrees`, the `build` result for every source node and every member set (`AllTrees.get(source, isid)`, `deinit`).
 - **2026-10-05** — Mutation run: 24 of 24 killed, 0 equivalent; 1 test added (source id
   == `node_count`, `deliversLocally` of a reachable non-member, `prune = false` past an
   unreachable node). No code change.

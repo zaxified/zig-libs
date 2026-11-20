@@ -26,7 +26,7 @@ Path Forwarding Check (RPFC). Clean-room from the public standard.
 
 **Status:** `any · util · single_owner` · deps: `spf-ect` (which owns Dijkstra +
 the ECT tie-break) — canonical metadata is `pub const meta` in `src/root.zig`.
-Scope is one source per call (the caller iterates sources); see *Not provided* below.
+Scope is one source and one member set per `build` call; `buildAll` runs every source and every member set of one topology; see *Not provided* below.
 
 ## Why (the gap this closes)
 
@@ -95,7 +95,7 @@ LSDB itself.
 ## Not provided
 
 FIB installation, the replication I/O, designated-forwarder election and topology extraction belong to other
-modules or to the caller; all-source batches and the 802.1aq ECT-mask tie-break variants are not built yet. See
+modules or to the caller; the 802.1aq ECT-mask tie-break variants are not built yet. See
 `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify

@@ -49,7 +49,7 @@
 //! and mutually-consistent RPF checks (the SPB symmetry property).
 //!
 //! Scope is tight: per-source pruned SPT + replication next-hops + RPF, for ONE
-//! source — the caller iterates sources. The upstream that builds the
+//! source per `build` (`buildAll` loops it over every source and member set). The upstream that builds the
 //! `spf-ect.Graph` from a link-state database is `isis-spf`; this module takes the
 //! graph directly and parses no LSDB. See `SPEC.md` for the deferred list.
 
@@ -350,6 +350,54 @@ pub fn buildWith(
     };
 }
 
+/// The trees for every (source, I-SID) pair of one topology: what an SPB node
+/// recomputes after a topology change. Caller-owned; free with `deinit`.
+pub const AllTrees = struct {
+    gpa: Allocator,
+    /// `graph.nodeCount()` at build time; every node is a source.
+    node_count: u32,
+    /// Number of member sets given to `buildAll`.
+    isid_count: usize,
+    /// `trees[source * isid_count + isid]`.
+    trees: []BumTree,
+
+    pub fn deinit(self: *AllTrees) void {
+        for (self.trees) |*t| t.deinit();
+        self.gpa.free(self.trees);
+        self.* = undefined;
+    }
+
+    /// The tree rooted at `source` for member set number `isid`, or `null`
+    /// when either index is out of range.
+    pub fn get(self: *const AllTrees, source: NodeId, isid: usize) ?*const BumTree {
+        if (source >= self.node_count or isid >= self.isid_count) return null;
+        return &self.trees[@as(usize, source) * self.isid_count + isid];
+    }
+};
+
+/// `build` for every node of `graph` as the source and every member set of
+/// `isid_members` (one slice per I-SID, in the caller's order): the whole
+/// per-topology state in one call, same result as looping over `build`.
+pub fn buildAll(
+    gpa: Allocator,
+    graph: *const spf.Graph,
+    isid_members: []const []const NodeId,
+) Allocator.Error!AllTrees {
+    const n = graph.nodeCount();
+    const trees = try gpa.alloc(BumTree, @as(usize, n) * isid_members.len);
+    errdefer gpa.free(trees);
+    var built: usize = 0;
+    errdefer for (trees[0..built]) |*t| t.deinit();
+    var source: NodeId = 0;
+    while (source < n) : (source += 1) {
+        for (isid_members) |members| {
+            trees[built] = try build(gpa, graph, source, members);
+            built += 1;
+        }
+    }
+    return .{ .gpa = gpa, .node_count = n, .isid_count = isid_members.len, .trees = trees };
+}
+
 /// Is child `c` a replication target under `opts`? With pruning on, iff its
 /// subtree holds a member; with pruning off, always (the positive control).
 fn included(opts: Options, has_member: []const bool, c: NodeId) bool {
@@ -417,6 +465,50 @@ test "golden: exact replication next-hops, RPF ingress, is_member" {
     // Local delivery flags.
     for ([_]NodeId{ 0, 1, 2, 4, 6 }) |x| try testing.expect(!bt.isMember(x));
     for ([_]NodeId{ 3, 5 }) |x| try testing.expect(bt.isMember(x));
+}
+
+test "buildAll: every (source, I-SID) tree equals the one build() gives, and allocation failures leak nothing" {
+    const gpa = testing.allocator;
+    var g = try goldenGraph(gpa);
+    defer g.deinit();
+    const sets = [_][]const NodeId{ &.{ 3, 5 }, &.{}, &.{ 6, 99 } };
+
+    var all = try buildAll(gpa, &g, &sets);
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 7 * 3), all.trees.len);
+    var source: NodeId = 0;
+    while (source < 7) : (source += 1) {
+        for (sets, 0..) |members, isid| {
+            var one = try build(gpa, &g, source, members);
+            defer one.deinit();
+            const t = all.get(source, isid).?;
+            try testing.expectEqual(source, t.source);
+            var node: NodeId = 0;
+            while (node < 7) : (node += 1) {
+                try testing.expectEqualSlices(NodeId, one.replicateTo(node), t.replicateTo(node));
+                try testing.expectEqual(one.rpfIngress(node), t.rpfIngress(node));
+                try testing.expectEqual(one.isMember(node), t.isMember(node));
+            }
+        }
+    }
+    try testing.expect(all.get(7, 0) == null);
+    try testing.expect(all.get(0, 3) == null);
+
+    // No I-SIDs: an empty result, not an error.
+    var none = try buildAll(gpa, &g, &.{});
+    defer none.deinit();
+    try testing.expect(none.get(0, 0) == null);
+
+    // Every allocation failing in turn: no leak (testing.allocator checks), no partial result.
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        if (buildAll(fa.allocator(), &g, &sets)) |res| {
+            var r = res;
+            r.deinit();
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
 }
 
 test "plan: matches the per-field accessors and returns null out of range" {
