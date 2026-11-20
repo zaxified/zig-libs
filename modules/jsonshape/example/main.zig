@@ -103,6 +103,9 @@ pub fn main() !void {
         error.WorkLimit, error.DepthLimit => return err,
         // Likewise: the columns here are scalar.
         error.UnsupportedColumnType => return err,
+        // Strict-mode path errors: this call leaves `.strict` off, so none of
+        // them can occur here; the arm exists because they are published.
+        error.PathSyntax, error.PathNotFound, error.NotAnArray => return err,
     }
 
     // And the bound itself, from outside: an operator-fixed path against a

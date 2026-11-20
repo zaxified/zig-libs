@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **SOURCE-BREAKING (correction of the 2026-11-19 entry):** the three new `ShapeError` values are added to the error set even with `strict` off, so a consumer's exhaustive `switch` over `shape`'s error fails to compile until it gains an arm for `PathSyntax`, `PathNotFound` and `NotAnArray` (runtime behaviour with `strict = false` is unchanged). The module's own example had exactly that break and now has the arm.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `strict` (13 mutants, all killed); tests added for multi-selector (indefinite) paths and empty dot-path segments. Card counts cumulative.
 - **2026-11-19** — New opt-in `ShapeSpec.strict` (default false: no behaviour change) with `ShapeError.PathSyntax`, `PathNotFound` and `NotAnArray`, so a wrong `path` is told apart from a genuinely empty result (Jayway JsonPath's definite/indefinite split; see SPEC § Backlog).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
