@@ -837,7 +837,7 @@ fn setBitBe(buf: []u8, bit: usize) void {
 /// Constant-time in `m`'s value along the path a PRIME takes: this runs on
 /// the secret candidates of `generateSafePrime`/`generateBlumPrime`. Since
 /// it is `montint.DynModint.isProbablePrime` (the recipe this
-/// function introduced on, moved into montint so `rsa` and
+/// function introduced, moved into montint so `rsa` and
 /// `paillier` share it): montint ladder modulo the secret `m`, witnesses
 /// below `2^(bits−1)` (no compare against `m`), `m − 1 = d·2^s` by masked
 /// shifts, a round's verdicts OR-ed before the one branch. Variable-time
