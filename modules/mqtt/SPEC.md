@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [eclipse-mosquitto/mosquitto](https://github.com/eclipse-mosquitto/mosquitto) — **reference** | C | EPL-2.0 OR EDL-1.0 (`epl-v20` + `edl-v10` files present; API says NOASSERTION) | 11.2k | push 2026-09-03 (no GitHub releases) | Its README: broker for MQTT 5.0, 3.1.1 and 3.1, plus C/C++ client library and CLI tools; TLS via build option. Here (2026-10-01): 5.0 and 3.1.1 (not 3.1), QoS 2 both ways; the broker has no extended auth, `$SYS`, bridges or persistence of its own. Interop measured against 2.1.2 (`tools/interop.zig`). |
-| [eclipse-paho/paho.mqtt.c](https://github.com/eclipse-paho/paho.mqtt.c) | C | EPL-2.0 OR EDL-1.0 (files present) | 2.4k | v1.3.16 (2026-02-20) | Client library: MQTT 3.1/3.1.1/5.0, TLS, websockets, auto-reconnect *(inferred from its documentation; README not read)*. Here the client is transport-agnostic and has no reconnect policy. |
+| [eclipse-mosquitto/mosquitto](https://github.com/eclipse-mosquitto/mosquitto) — **reference** | C | EPL-2.0 OR EDL-1.0 (`epl-v20` + `edl-v10` files present; API says NOASSERTION) | 11.2k | push 2026-09-03 (no GitHub releases) | Its README: broker for MQTT 5.0, 3.1.1 and 3.1, plus C/C++ client library and CLI tools; TLS via build option. Here: 5.0 and 3.1.1 (not 3.1), QoS 2 both ways, extended auth, `$SYS`, bridges (`bridge`) and a persistence seam (the broker writes no store itself). Interop measured against 2.1.2 (`tools/interop.zig`). |
+| [eclipse-paho/paho.mqtt.c](https://github.com/eclipse-paho/paho.mqtt.c) | C | EPL-2.0 OR EDL-1.0 (files present) | 2.4k | v1.3.16 (2026-02-20) | Client library: MQTT 3.1/3.1.1/5.0, TLS, websockets, auto-reconnect *(inferred from its documentation; README not read)*. Here the client is transport-agnostic; reconnect is a sans-I/O backoff schedule (`reconnect`) plus an opt-in outbox that resumes in-flight QoS 1/2 publishes. |
 | [eclipse-paho/paho.mqtt.golang](https://github.com/eclipse-paho/paho.mqtt.golang) | Go | EPL-2.0 OR EDL-1.0 (files present) | 3.1k | v1.5.1 (2025-09-16) | The de-facto Go client, 3.1.1, with TLS/websocket and reconnect built in *(inferred)*. Feature-equal on protocol level; ours is sans-I/O and offline-testable. |
 | [bytebeamio/rumqtt](https://github.com/bytebeamio/rumqtt) | Rust | Apache-2.0 | 2.2k | rumqttc-0.25.1 (2025-11-21) | Rust client (`rumqttc`) and a broker (`rumqttd`), MQTT 3.1.1 and 5 *(inferred)*. |
 | [karlseguin/mqttz](https://github.com/karlseguin/mqttz) | Zig | MIT | 59 | push 2026-06-01 | Zig client only, low-level and a POSIX client; its README describes an MQTT 5 client (`Client5`), no timeouts in the low-level one. No broker. |
 | [ikskuh/zig-mqtt](https://github.com/ikskuh/zig-mqtt) | Zig | MIT | 24 | push 2022-12-28 | Unmaintained since 2022 (push date); client only *(README not read)*. |
 
-**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; every message-path row of `zig build bench-mqtt` is faster than Mosquitto 2.1.2 with the same driver (0.72–0.97×); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Not built (Backlog): a TLS *listener* in `TcpServer` (after the http TLS server), outbound Topic Aliases (MAY; no demand), the remaining `$SYS` load/heap topics, an inline in-process subscribe, MQTT 3.1 (`MQIsdp`). A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
+**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; the message-path rows of `zig build bench-mqtt` against Mosquitto 2.1.2 with the same driver (the card's Performance line carries the range); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Not built (see *Backlog / deferred*): a TLS *listener* in `TcpServer`, the remaining `$SYS` load/heap topics, an inline in-process subscribe, MQTT 3.1 (`MQIsdp`; a 3.1 CONNECT is refused with CONNACK 0x01). Outbound Topic Aliases, broker and client, are built. A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
 
 ## Design & invariants
 Three allocation-free codec/client layers plus a broker, all offline-testable; MQTT 3.1.1 and 5.0
@@ -58,51 +58,45 @@ allow-all). PUBLISH fan-out at min(publisher QoS, granted QoS), one copy per con
 granted QoS among overlapping filters; QoS 0 fire-and-forget, QoS 1 inbound→immediate PUBACK,
 outbound→packet-id allocated in the *subscriber's* id space tracked pending until PUBACK; retained
 store (empty payload clears, delivered right after SUBACK). The global spinlock guards only short
-registry mutations and the fan-out *snapshot* — never a socket write. ⚠ That was **false for
-SUBSCRIBE** until 2026-09-03: the retained walk ran once per filter in the packet, duplicates
-included, snapshotting the whole store each time under the lock. Measured on a quarter-full default
-store: 261 bytes in, 67 MB and 131 074 PUBLISH packets out, 3 s of one core with the lock held —
-and `Broker.mutex` is a pure spinlock with no yield, so every other handler thread burns a core
-waiting. The walk is now de-duplicated per packet and bounded by `max_retained_deliveries` /
-`max_retained_bytes`; each connection has its own
+registry mutations and the fan-out *snapshot* — never a socket write. The retained walk of a SUBSCRIBE is
+de-duplicated per packet (a filter repeated in one packet is walked once) and bounded by
+`max_retained_deliveries` / `max_retained_bytes`: otherwise a few hundred bytes of SUBSCRIBE could
+snapshot the whole retained store once per filter under the lock, and `Broker.mutex` is a pure spinlock
+with no yield, so every other handler thread would burn a core waiting. Each connection has its own
 `tx_lock`, and fan-out readers reference-count targets so a mid-fan-out disconnect never writes to
 freed memory; a per-subscriber delivery failure is contained to that subscriber. Same caller-driven
 socket-free seam as the client, reversed; `TcpServer` is an optional `std.Io.net` accept loop
 (thread-per-connection). Modeled after the OASIS MQTT 3.1.1 spec (open, royalty-free);
-mosquitto/Paho are behavior references only — see NOTICE.
+mosquitto/Paho are behavior references only — see the README's `Provenance:` line.
 
 ## Threat model / out of scope
 MQTT (3.1.1 and 5.0) carries credentials and payloads in the clear; transport confidentiality/authentication
 is TLS, out of scope for both client and broker — the caller supplies the transport (typically
 MQTT-over-TLS, or `TcpServer` handed plaintext behind a TLS-terminating proxy). The codec's
 guarantee is robustness: hostile broker/client bytes, overlong varints, and bad UTF-8 all resolve
-to typed errors, never panics (fuzzed both directions, 5.0 included). Since 2026-10-17: 5.0 extended
-authentication in the broker (`extendedAuthFn`), offline-message replay in the client (the outbox),
-a persistence seam for the broker's retained store and session bodies; QoS 2 is implemented on both sides since
-2026-10-01 (it used to be a broker-side protocol violation that tore the connection down);
-the broker still does not write a store itself (a server keeps sessions and retained messages with `sessionStatesWith`/`retainedMessages` and restores them). **Will/LWT is no
-longer deferred** (2026-09-11): the broker keeps the will from CONNECT, publishes it on any
-ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4). The publish happens *after*
-the connection has left the subscription index (2026-09-16, A1 M2), so the dying client is not
-written its own Will; it still cannot happen under the registry lock, which `fanout` takes itself.
-`Broker.publish` (2026-09-11) lets the server originate a message with no client behind it — same
-retained-store and fan-out path, but no ACL call and no `onPublishFn` tap, since neither has a
-connection to be about. It is held to `max_packet_size` like a receiver (2026-09-16, A1 M1): an
-inbound PUBLISH cannot exceed that bound because `rx_buf` is exactly that size, and a
-server-originated one that did used to return SUCCESS while disconnecting every matching
-subscriber — and, with `retain`, kill every later subscriber at SUBSCRIBE. It now refuses
+to typed errors, never panics (fuzzed both directions, 5.0 included). The module provides 5.0 extended
+authentication in the broker (`extendedAuthFn`), offline-message replay in the client (the outbox) and a persistence
+seam for the broker's retained store and session bodies; QoS 2 is implemented on both sides. The broker does not
+write a store itself (a server keeps sessions and retained messages with `sessionStatesWith`/`retainedMessages` and
+restores them). **Will/LWT:** the broker keeps the will from CONNECT, publishes it on any ungraceful end and discards
+it on a clean DISCONNECT (3.1.2.5, 3.14.4). The publish happens *after* the connection has left the subscription
+index (A1 M2), so the dying client is not written its own Will; it never happens under the registry lock, which
+`fanout` takes itself. `Broker.publish` lets the server originate a message with no client behind it — same
+retained-store and fan-out path, but no ACL call and no `onPublishFn` tap, since neither has a connection to be
+about. It is held to `max_packet_size` like a receiver (A1 M1): an inbound PUBLISH cannot exceed that bound because
+`rx_buf` is exactly that size, and a server-originated one that did would return SUCCESS while disconnecting every
+matching subscriber (and, with `retain`, kill every later subscriber at SUBSCRIBE), so it refuses
 `error.PayloadTooLarge`.
 
 ## Broker: production-hardened
-The broker was a functional first cut hardened against the trivial DoS/resource-exhaustion vectors
-first (the accept loop never runs a connection handler inline on a failed task spawn;
+The broker is hardened against the trivial DoS/resource-exhaustion vectors (the accept loop never runs a connection handler inline on a failed task spawn;
 `Config.max_connections` / `max_subscriptions_total` / `max_subscriptions_per_conn` /
 `max_retained` cap the shared connection set, subscription index and retained store; a `SUBSCRIBE`
 over `max_filters_per_subscribe` is rejected as a whole; a connection that opens a socket but never
-sends CONNECT is dropped after `Config.connect_timeout_ms`). The four remaining architectural
-limitations have now been fixed:
+sends CONNECT is dropped after `Config.connect_timeout_ms`). Four architectural
+properties hold:
 
-- **PUBLISH fan-out no longer holds a global lock across I/O, and is no longer O(total
+- **PUBLISH fan-out holds no global lock across I/O, and is not O(total
   subscriptions).** *(FIX A)* Subscriptions live in a **topic-filter trie** (`Index`): levels split
   on `/`, a `+` single-level-wildcard child, and `#` attached to the current node's `hash_subs`
   (also matching that node's own level, spec 4.7.1-2); the `$`-topic exclusion for a leading
@@ -112,7 +106,7 @@ limitations have now been fixed:
   `max_filter_levels`), never the whole subscription set. `handlePublish` takes `Broker.mutex`
   **only** to update the retained store and snapshot the matching `(conn, granted-QoS)` set (one
   copy per connection at its highest granted QoS), then **releases it before any socket write**, so
-  a large fan-out can no longer stall `accept()` or any other client. Each `Connection` carries a
+  a large fan-out cannot stall `accept()` or any other client. Each `Connection` carries a
   `tx_lock` guarding its `tx_buf` + packet-id pool + writes, so it can be written concurrently by
   many fan-out threads and its own owner thread without corruption or wire-interleaving. A fan-out
   reader takes a reference (`Connection.refs`) on each target under the global lock; `remove`
@@ -128,25 +122,24 @@ limitations have now been fixed:
   PUBACK path is untouched. Each `tx_buf` is additionally sized `max_packet_size + tx_headroom` so a
   subscriber re-encode (which allocates a fresh packet id) always fits — no delivery can fail on
   buffer size at all. (With `min(publisher, granted)` QoS a delivered packet never exceeds the
-  inbound one, so the failure now cannot arise from sizing; the containment guards residual
+  inbound one, so the failure cannot arise from sizing; the containment guards residual
   transport failures.) `error.Canceled` — the fan-out thread itself being canceled through the
   `std.Io` cancellation protocol, not a peer misbehaving — is deliberately **not** contained this
   way: containing it would flag every remaining subscriber in this publish's target set as failed
   and disconnect them for something none of them did. The fan-out loop instead releases its
   reference on every target and aborts the publish.
 - **Session take-over closes the superseded socket.** *(FIX C)* `takeover` marks the old
-  connection `.disconnected`, drops its routing state and now calls `Transport.close` (a socket
+  connection `.disconnected`, drops its routing state and calls `Transport.close` (a socket
   *shutdown*, not a close) so a read loop blocked with `keep_alive_s == 0` wakes immediately and its
   owner thread reaps it via `remove` — no leaked thread/socket. `remove` drains fan-out references
   before freeing, and shutdown races safely with the owner's own `stream.close` (no double close of
   the fd).
-- **Optional authentication + per-operation ACL.** *(FIX D)* `Config` gains an `authenticateFn`
+- **Optional authentication + per-operation ACL.** *(FIX D)* `Config` has an `authenticateFn`
   (+`auth_ctx`) invoked in `handleConnect` with the client id + username + password — a deny returns
   the proper CONNACK (`not_authorized` / `bad_username_or_password`) and closes; and an
   `authorizeFn` (+`acl_ctx`) checked in `handlePublish`/`handleSubscribe` with the client identity +
   topic + operation + the PUBLISH's RETAIN flag (`AclRequest.retain`, false for SUBSCRIBE — so a
-  retained publish can be denied where a plain one is allowed, as mosquitto's ACL can; added
-  2026-09-22). A denied SUBSCRIBE yields per-filter SUBACK `0x80`; a denied PUBLISH is
+  retained publish can be denied where a plain one is allowed, as mosquitto's ACL can). A denied SUBSCRIBE yields per-filter SUBACK `0x80`; a denied PUBLISH is
   silently dropped (not retained, not fanned out) while the publisher is still PUBACKed. The
   authenticated username is threaded onto the connection so the ACL hook sees it. Both hooks are a
   clean function-pointer + opaque-ctx seam with **no external deps**; both default to null =
@@ -154,20 +147,25 @@ limitations have now been fixed:
 - **Publish tap verdicts.** `Config.onPublishFn` sees every PUBLISH the ACL allowed, before the
   retained store, fan-out and PUBACK, and answers a `PublishVerdict`: `.accept` (take it as without
   a tap), `.refuse` (no store, no fan-out, no PUBACK, close — the publisher keeps its copy), or
-  `.consume` (2026-09-22: PUBACK only — no store, no fan-out; a RETAIN flag is ignored). `.consume`
+  `.consume` (PUBACK only — no store, no fan-out; a RETAIN flag is ignored). `.consume`
   is for a PUBLISH addressed to the broker's host — a request it answers on another topic, a
-  control command — which `.accept` would also route to every matching subscriber.
+  control command — which `.accept` would also route to every matching subscriber. With
+  `Config.tap_wills = true` (off by default) an ungraceful end's Will is handed to the tap as a publish too, after the
+  connection is out of the index (the M2 ordering), on the `remove` caller's thread with no lock held; the verdict is
+  honoured minus the connection (`.accept` → retained + fan-out, `.consume` and `.refuse` → neither, counted in
+  `tapRefusals`).
 
-Residual deferred scope (documented, not bugs): the broker writes no store itself (the seam
+Residual scope (documented, not bugs): the broker writes no store itself (the seam
 hands sessions and retained messages to the server). TLS is a transport the caller supplies: the
-client side is a tested recipe over `tlsclient` (`interop-mqtt -- --tls`); a `TcpServer` TLS
-listener waits for the http TLS server (terminate in front until then). A clean-session subscriber
-whose window is full no longer loses QoS 1/2 messages (2026-10-17): they wait in a per-connection
+client side is a tested recipe over `tlsclient` (`interop-mqtt -- --tls`); `TcpServer` has no TLS
+listener (terminate in front; see *Backlog / deferred*). A clean-session subscriber
+whose window is full does not lose QoS 1/2 messages: they wait in a per-connection
 queue under the same caps as a session's. The concurrency hardening
 targets the thread-per-connection `TcpServer`; the offline core remains single-owner per connection
-and fully socket-free for testing.
+and fully socket-free for testing. `Broker.fanout` collapses matches to owners and gathers Subscription
+Identifiers in one pass with a pointer-keyed map, so the work under the registry lock is O(matches).
 
-## Persistent sessions (2026-09-21)
+## Persistent sessions
 A CONNECT with clean session 0 gets a `Session` keyed by client id (spec 3.1.2.4): subscriptions,
 a queue of QoS 1 messages, and up to `max_in_flight` sent-but-unacknowledged ones. Resume answers
 `session_present = 1`, resends the in-flight messages with DUP and their original ids (4.4), then
@@ -201,7 +199,7 @@ Bounds: `max_sessions` (new past it → CONNACK `server_unavailable`; a resume a
 broker has no clock. QoS 0 is not queued (3.1.2.4 leaves it optional).
 
 ⚠ Not persisted by the broker: sessions are memory. A server that keeps them across its own
-restart does it with two calls (2026-09-21): `sessionStates(arena)` copies out every session —
+restart does it with two calls: `sessionStates(arena)` copies out every session —
 client id, subscriptions with their granted QoS, queued, in flight, and a per-session `drops`
 count — under one lock, and `restoreSession(client_id, subs, offline_since_ms)` recreates one offline, all or
 nothing, before clients connect. What goes back into the restored queue is the server's business
@@ -210,11 +208,11 @@ queued by the `publish` that fans it out, so `queued + inflight == 0` at an inst
 message published to the session before it has been acknowledged. `restoreSession` applies no
 ACL (as `publish` does not — no client is asking) and refuses what no SUBSCRIBE could have been
 granted: an invalid or too-deep filter, QoS 2, past `max_subscriptions_per_conn`/`_total`.
-The expiry clock carries over too (2026-09-28, ingest-consumer audit R5): `SessionState.offline_since_ms` is
+The expiry clock carries over too (ingest-consumer audit R5): `SessionState.offline_since_ms` is
 when an offline session went offline (null while online) on the caller's clock, and
 `restoreSession`'s last argument takes it back — for a session that was online, the restart's
 own `now`. Only meaningful if that clock is wall time, which survives the restart.
-5.0 sessions round-trip whole since 2026-10-02: `SessionSub` carries No Local, Retain As
+5.0 sessions round-trip whole: `SessionSub` carries No Local, Retain As
 Published and the Subscription Identifier (defaulted fields — Retain Handling acts once, at the
 SUBSCRIBE, and is not session state), and `restoreSessionWith(…, .{ .expiry_interval_s })` takes
 `SessionState.expiry_interval_s` back, capped by `Config.session_expiry_ms` as a CONNECT's would
@@ -223,7 +221,7 @@ on a Shared Subscription and a Subscription Identifier above 268 435 455, which 
 decoder refuses on SUBSCRIBE. ⚠ A client that resumes a restored 5.0 session sets its expiry
 anew with its CONNECT (absent = 0, 3.1.2.11.2), as with any resume.
 
-## QoS 2 in the broker (2026-10-01)
+## QoS 2 in the broker
 Spec 4.3.3, both directions, 3.1.1 and 5.0 alike. **Inbound:** a QoS 2 PUBLISH is routed once
 and PUBRECed; its id is remembered until the PUBREL (`Connection.inbound_qos2`, or
 `Session.inbound_qos2` for a persistent client, under `Session.lock` — a client that reconnects
@@ -239,7 +237,7 @@ matching ack frees an in-flight message (`ackInflight` by phase — a PUBCOMP ne
 or an unreleased QoS 2). A 5.0 failure-coded PUBREC ends the delivery without PUBREL (4.4.0-2).
 `Config.maximum_qos` caps grants, inbound QoS, `publish` and `restoreSession`.
 
-## MQTT 5.0 (2026-10-01)
+## MQTT 5.0
 **Codec.** The version is a parameter (`decodePacket` / `encodePacket` / `packetWireLen`); nothing on
 the wire says which version a packet is but the CONNECT, so a server decodes its first packet as
 5.0 when it is a CONNECT (a CONNECT of either level decodes and reports `Connect.version`) and
@@ -295,37 +293,52 @@ cancelled by the client's return, published at once when the session ends first 
 DISCONNECT:* refusals and acks carry 5.0 codes; a handler that fails records `close_reason` and
 `process` sends the DISCONNECT before returning the error as before. A take-over's DISCONNECT 0x8E
 is written after `Broker.mutex` is released (`Superseded`, a reference held, then
-`tellSuperseded`) — never a write under the registry lock. *Not implemented:* extended
-authentication (a CONNECT naming a method gets 0x8C). (Outbound topic aliases: 2026-11-17. Response
-Information and Reason Strings from the broker were added later: 2026-11-17 and 2026-10-17.)
+`tellSuperseded`) — never a write under the registry lock. *Extended
+authentication* needs `Config.extendedAuthFn` (see *S2 parity*); without it a CONNECT naming a method gets 0x8C, which
+4.12.0-1 allows.
 
-## Review 2026-10-01 (independent, of the QoS 2 + 5.0 broker work)
-A read-only adversarial review (Sonnet, coordinator-verified) reported 12 findings; each was
-checked against the code. **Fixed, each with a test** ("review F<n>: …") and a mutant that
-reverts the fix (55/55 killed): **F1** `takeover` superseded a connection still inside its own
-CONNECT (whose state was then set back to `.connected`); with the take-over's DISCONNECT taking
-the other connection's `tx_lock` while holding its own, two same-id 5.0 CONNECTs could deadlock —
-now only `.connected` connections are superseded, a CONNECT closed meanwhile aborts, and (F2) the
-0x8E goes only through `tryLock` before the socket is closed, so a writer blocked on a dead peer
-never stalls the new connection. **F3** an offline session's expiry counted from the connection's
-last packet, not its close — an idle keep-alive-0 client lost its session at the next sweep; also
-3.1.1 with `session_expiry_ms` (pre-existing, production path). **F5** only DISCONNECT 0x00
-discards the Will (5.0 3.14.4-3). **F6** a resume resent every in-flight message regardless of the
-new connection's Receive Maximum / Maximum Packet Size — now `resend` marks them and `pumpLocked`
-paces them. **F7** `deinit` leaked a discarded session still held by a connection (pre-existing).
-**F8** expired retained/queued messages lingered against the caps — swept in `expireSessions`.
-**F9a** a Will survived an OOM in `createSession`. **F11** a PUBREC for a QoS 1 id got a success
-PUBREL on the clean path. **Not changed:** F4 (No Local on `$share/` is refused by the codec at
-decode, 3.8.3-4 — the review had not read that part); F10 (3.2.2-19/20 bound Reason String and
-User Property, which the broker never sends in CONNACK); F9b (the two refusal CONNACKs written
-with `Broker.mutex` held go to the new connection's own fresh socket; pre-existing, kept); F12
-documented on `Config.topic_alias_maximum`.
+**Outbound Topic Aliases** (broker, `Broker.encodeDelivery`), as Mosquitto (lib/send_publish.c `send__publish`,
+lib/alias_mosq.c): for a 5.0 subscriber that announced a Topic Alias Maximum, the first PUBLISH of a topic on the
+connection carries the topic and the next free alias (1, 2, ...), every later one of that topic an empty topic and the
+alias; no eviction (once the slots are used, further topics go unaliased); a new connection starts empty; 3.1.1 clients
+and clients with no maximum are never aliased. Applied on all five delivery paths (live, the clean-session queue, a
+persistent session's resend, queue and QoS 0 queue). Differs from Mosquitto: `Config.outbound_topic_aliases` (default 16,
+0 = off) caps what a client's announced maximum may make the broker allocate (Mosquitto takes the client's number as it is,
+up to 65535 owned topic copies per connection), and an aliased form that would exceed the client's Maximum Packet Size or
+`tx_buf` goes out plain and uses no slot (the plain form is held to those limits already).
 
-## S2 parity (2026-10-17)
+**Client automatic outbound aliases** are opt-in (`Buffers.out_aliases`, empty = off), after paho.golang's `topicaliases`
+extension (`TAHandler.PublishHook`; first-come, not an LRU): a publish of a topic with no alias takes the next free slot (up
+to `min(slots, the server's Topic Alias Maximum)`) and sends the topic with the alias; later publishes of it send an empty
+topic and the alias; no eviction (when the slots are used, further topics go plain); reset on `connect`. A publish carrying
+its own `properties.topic_alias` is untouched. The slot is taken only after the packet went out, the first-use form (3 bytes
+longer) that would exceed the server's Maximum Packet Size goes plain, a topic over `alias_topic_capacity` goes plain, and
+with an outbox a QoS 1/2 publish keeps its topic (it may be resent on a connection whose aliases are empty).
 
-The gaps the 2026-10-16 survey listed and the owner
-put in scope, built in three waves; every API is additive and defaults to the old behaviour unless
-marked BREAKING (none is).
+**Response Information:** `Config.response_information` (default null = never sent, as Mosquitto, whose man page lists
+Request Response Information / Response Information as "supported but not used", and HiveMQ, which has no broker setting for
+it; it is a MAY). Set, it goes into the CONNACK of a 5.0 client that sent Request Response Information = 1; it is not sent
+for an invalid or over-long value or when the CONNACK would exceed the client's Maximum Packet Size. Reason Strings go on
+5.0 refusals and failure acks (see *S2 parity*).
+
+## Review-driven behaviours
+Each has a test named `review F<n>: …` in `src/broker.zig`. A take-over supersedes only a `.connected` connection (never one
+still inside its own CONNECT), a CONNECT closed meanwhile aborts, and the take-over's DISCONNECT 0x8E goes through `tryLock`
+before the socket is closed, so a writer blocked on a dead peer never stalls the new connection and two same-id 5.0 CONNECTs
+cannot deadlock (F1, F2). An offline session's expiry counts from the connection's close, not its last packet, 3.1.1 with
+`session_expiry_ms` included (F3). Only DISCONNECT 0x00 discards the Will (5.0 3.14.4-3, F5). A resume resends within the new
+connection's Receive Maximum / Maximum Packet Size: `resend` marks the messages and `pumpLocked` paces them (F6). `deinit` frees
+a discarded session a connection still holds (F7). Expired retained and queued messages are swept in `expireSessions` and do
+not linger against the caps (F8). A PUBREC for a QoS 1 id is an unknown QoS 2 id (0x92) and changes nothing (F11). Decisions:
+No Local on `$share/` is refused by the codec at decode (3.8.3-4, F4); the broker never sends Reason String or User Property
+in a CONNACK, so 3.2.2-19/20 do not bind it (F10); the two refusal CONNACKs written with `Broker.mutex` held go to the new
+connection's own fresh socket, so they cannot block on a peer (F9b); the alias limit is documented on
+`Config.topic_alias_maximum` (F12).
+
+## S2 parity
+
+The features that bring the module to parity with the Mosquitto broker and the paho-class clients; every API is
+additive and defaults to the behaviour without it.
 
 **Client.**
 - `reconnect.Reconnect` — sans-I/O backoff schedule (`initial_ms`, `max_ms`, `multiplier`, full jitter
@@ -341,7 +354,7 @@ marked BREAKING (none is).
 **Broker.**
 - Extended authentication (5.0 §4.12): `Config.extendedAuthFn` drives AUTH challenges at CONNECT and
   re-authentication (AUTH 0x19) with a 64-byte per-connection state slot; the plain `authenticateFn`
-  runs after it; without the hook a method is refused 0x8C as before.
+  runs after it; without the hook a method is refused 0x8C.
 - Operator limits: `max_keepalive_s` (5.0 Server Keep Alive; 3.1.1 refused 0x02, as Mosquitto),
   `retain_available` (5.0 Retain Available = 0, DISCONNECT 0x9A), `retain_expiry_interval_ms` (an age
   limit, where Mosquitto's option is a scan period), `queue_qos0_messages`.
@@ -350,8 +363,9 @@ marked BREAKING (none is).
   take-over DISCONNECT and the protocol-level CONNACK, whose bytes the replays pin).
 - `$SYS/broker/...` (Mosquitto's names, 16 topics) via `publishSys(now)`, `sys_interval_ms` (0 = off);
   `TcpServer`'s upkeep calls it.
-- Per-connection queue for clean-session subscribers (the bench found 100k QoS 1 messages never all
-  arriving: a full window used to drop them; Mosquitto queues).
+- Per-connection queue for clean-session subscribers: a full window queues instead of dropping, as Mosquitto does
+  (counted in `queueDrops`, which moves only through `countQueueDrop` together with
+  `$SYS/broker/publish/messages/dropped`).
 - Persistence seam: `retainedMessages`/`restoreRetained`; `sessionStatesWith(.{ .messages = true })`
   exports queued and in-flight bodies with ids and QoS 2 state, `restoreSessionWith` restores them
   (`RestoreError.InvalidMessage` for a bad record).
@@ -363,7 +377,8 @@ marked BREAKING (none is).
 - `acl.zig` — Mosquitto `acl_file` semantics (`topic`/`user`/`pattern`, `read`/`write`/`readwrite`/`deny`,
   `%u`/`%c`; a name containing `/ + #` never widens a rule; a SUBSCRIBE is denied when any deny rule
   overlaps its filter) and `password_file` `$7$` PBKDF2-HMAC-SHA512 hashes, checked against real
-  `mosquitto_passwd` 2.1.2 output; `authorize`/`authenticate` plug into `Config`.
+  `mosquitto_passwd` 2.1.2 output (the stored verifier is decoded and encoded with `b64ct`, constant time; the iteration
+  count is read with `std.fmt.parseInt`, a public field of the stored line); `authorize`/`authenticate` plug into `Config`.
 - `bridge.zig` — a Mosquitto-style bridge: a loopback client into the local broker and a remote client
   whose socket the caller owns; rules `in`/`out`/`both` with QoS and local/remote prefixes; loops
   prevented by No Local (5.0) or a recent-message ring (3.1.1, `both` needs distinct prefixes —
@@ -373,137 +388,10 @@ marked BREAKING (none is).
   (`src/ws_recipe_test.zig`), TLS via `tlsclient` against Mosquitto's TLS listener
   (`zig build interop-mqtt -- --tls`).
 
-**Performance** (`zig build bench-mqtt`, `tools/bench.zig`): one raw driver loads our `TcpServer` and
-Mosquitto 2.1.2 (podman, `set_tcp_nodelay true`, `max_queued_messages 0`; ours `tcp_nodelay`, queues
-unbounded — MQTT has no end-to-end flow control, so bounded queues would compare drop policies),
-2026-10-17, best of 5: QoS 0 1→1 0.72×, QoS 1 1→1 0.87×, QoS 2 1→1 0.91× (publisher window 10:
-Mosquitto stops answering past ~20 unreleased inbound QoS 2 publishes), fan-out 100 0.87×, fan-in 32
-0.97×, 1 KiB round trip 0.76×, connect 0.96×.
+## Will ACL, retained byte cap, session ownership
 
-## Verification
-**External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the
-spec text and driven by a scripted fake peer — SPEC.md previously said mosquitto/Paho were
-"behavior references only" and were never run. They now have been: real `paho-mqtt` bytes talking
-to a real `amqtt` broker (both foreign) for a full CONNECT/SUBSCRIBE/PUBLISH-QoS-0/1/2/PING/
-DISCONNECT session, a retained-message round trip, and a Will/LWT delivery on ungraceful loss; this
-module's own `Client`, live, against real `amqtt` (QoS 0/1/2 + CONNECT-with-Will, byte-exact
-encoder reproduction plus real-broker decode); and this module's own `Broker`, live, against real
-`paho` (QoS 0/1 fan-out with the RETAIN bit correctly cleared on a live delivery — a case no prior
-offline test asserted — retain-before-subscribe, and the documented QoS-2-tears-the-connection-down
-behavior against a genuine client). A real, reported (not "fixed") finding: `amqtt` does not perform
-the spec 3.3.5 QoS-downgrade-on-delivery that this module's own `Broker` does. ⚠ The captures
-**cannot** anchor our own downgrade: every publish in them has publisher QoS equal to granted QoS,
-so §3.3.5 is never exercised and mutating `minQos` away leaves all eight golden tests green. Only
-the in-tree test catches it. Genuine anchor, no discrimination on that property — see the file's
-doc comment. See the file's doc
-comment for capture provenance and attribution (root `NOTICE` §0 — black-box oracle, no source
-consulted).
-
-Client + codec offline tests — golden-byte KATs against
-the spec wire layout, every remaining-length varint boundary, a scripted fake broker driving full
-QoS 1/QoS 2 handshakes, DUP retransmit + receive dedup, keep-alive/ping timeout, packet-id wrap +
-pool exhaustion, rx-buffer overflow, a topic-match truth table, and two 1000-iteration garbage-byte
-no-panic sweeps (codec + client). Broker: mirrors the same seam reversed — a scripted fake *client*
-hand-encodes raw CONNECT/SUBSCRIBE/PUBLISH bytes against broker-side connection objects (no
-socket): connect fan-in, subscribe→SUBACK→delivery, overlapping-filter single-copy fan-out,
-retain-before-subscribe, QoS 1 PUBACK + broker-assigned delivery id, exact-string unsubscribe,
-PINGRESP, DISCONNECT, keep-alive teardown, session take-over, and a 1000-iteration hostile-byte
-no-panic sweep. The production-hardening fixes each carry a dedicated test: trie fan-out routing
-across `+`/`#`/exact/`$SYS` subscribers (FIX A wildcard correctness); a lock-probe subscriber whose
-write seam re-acquires the global spinlock — reaching the assertions proves the fan-out released the
-lock before writing (FIX A no-lock-across-I/O); a failing subscriber transport contained so the
-publisher is still PUBACKed and a healthy peer still delivered while the offender is dropped, plus a
-max-size QoS 1 re-encode that does not overflow (FIX B); session take-over shutting the superseded
-socket down (FIX C); and auth-deny (both CONNACK codes) + ACL-deny of PUBLISH and per-filter
-SUBSCRIBE with the username threaded through (FIX D). `TcpServer` is compile-checked but never bound
-in the offline suite.
-
-**Multi-threaded stress / race pass (the concurrency hardening, exercised under real parallel load).**
-A dedicated test stands up a real `TcpServer` on a loopback ephemeral port (`127.0.0.1:0`) and drives
-it with **16 concurrent OS-thread clients over real sockets** (`std.Thread.spawn` clients; the broker
-serves one handler thread per connection via `std.Io.Group.concurrent`, `concurrent_limit = .unlimited`
-— genuine parallelism across cores). Each worker reconnects for many iterations in one of four
-adversarial roles: (0) publisher hammering the hot namespace QoS0+QoS1 with interleaved unsub/resub
-churn; (1) a subscriber that takes some fan-out then **abruptly closes its socket mid-fan-out** so a
-broker write to it fails (FIX B containment); (2) a **take-over racer** that CONNECTs a shared
-client-id concurrently with its peers (FIX C take-over socket-shutdown + zombie reaping under race);
-(3) a slow reader doing heavy **subscribe/unsubscribe churn concurrent with fan-out** (FIX A
-snapshot-under-lock + `refs` mid-fan-out UAF safety). Subscribers register overlapping `#`/`+`/exact
-filters so each publish collapses to one copy per connection. Invariants asserted after the storm:
-no crash/panic/UAF/double-free/leak (`std.testing.allocator` is a thread-safe DebugAllocator checking
-every broker alloc/free from every handler thread); no deadlock/hang (a watchdog thread panics past a
-90 s deadline, so a wedge fails the test instead of hanging CI); the accept loop never stalls behind a
-fan-out (a liveness probe reconnects throughout and its CONNECT→CONNACK always completes within a
-2 s bound); delivery still works end-to-end afterwards (a fresh sub+pub round-trips); no torn/corrupt
-packet is ever decoded on a live stream; and once every client socket is closed the connection set
-drains to 0 and `subscriptionCount()` to 0 (no take-over zombie, no leaked or wrapped-negative count).
-The test is socket-gated (`error.SkipZigTest` on a single-threaded build or where loopback/threads are
-unavailable), so a constrained `zig build test` stays green.
-
-**QoS 2 and MQTT 5.0 (2026-10-01).** Codec: the spec's own CONNECT example (Figure 3-6) as a KAT,
-every property round-tripped in its packet, every refusal class (wrong packet → Malformed, repeat /
-zero / out of range → Protocol Error), short forms, forwarding order, a v5 fuzz harness with its own
-pinned corpus. Client: announced limits, CONNACK limits on publish, inbound aliases, refusing acks,
-server DISCONNECT, AUTH. Broker: QoS 2 dedup (also across a session reconnect), PUBREL resend on
-resume, acks freeing only their own message, 5.0 sessions/expiry, Message Expiry through the
-retained store and queues, forwarding to 5.0 and 3.1.1 subscribers, No Local, RAP, Retain
-Handling, Subscription Identifiers, shared subscriptions, take-over 0x8E, Will Delay, client limits,
-violations' DISCONNECT reasons. **External:** `tools/interop.zig` against Eclipse Mosquitto 2.1.2
-and paho-mqtt 2.1.0, replayed hermetically by `src/v5_replay.zig`; broker session state against
-Mosquitto by `tools/session_oracle.py`, replayed by `src/session_replay.zig` (see Anchoring). **Stress:** half
-the workers speak 5.0 (QoS 2, identifiers, a shared subscription, session expiry, delayed Wills,
-0x8E take-overs); 1× Debug, 10× ReleaseSafe, 40× ReleaseFast clean. **Mutation 2026-10-01:** 48
-mutants over the new guards (one schemata build), 45 killed at first; the 3 survivors became tests
-(Topic Alias 0 on decode, an alias above the client's announced maximum, a PUBCOMP that must not
-free a QoS 1 / unreleased QoS 2 message); 48/48.
-
-**Delta mutation 2026-11-17 (Topic Aliases, broker and client).** 38 schemata mutants (ReleaseSafe, one build, each under
-`setsid -w timeout` and `ulimit -v`) over `Broker.encodeDelivery` (alias found / assigned / cap / maximum-packet-size
-boundary / slot bookkeeping, the five delivery call sites, the CONNECT cap and its default, the table's release) and
-the client's `planAlias` / `publish` (slot commit after send, reset on `connect`, the caller's own alias, outbox rule,
-`min(slots, server maximum)`, the topic-capacity bound, the plain fallback for `PacketTooLarge` and
-`BufferTooSmall`). First run: 31 killed, 7 survived; one test added (the caller's own alias while slots are free), a
-rebuild killed it. Six EQUIVALENT: broker `encodeDelivery`'s version, zero-maximum and empty-topic guards (`out_alias_max`
-is set only under 5.0 and a zero maximum already stops at the slot-count test; a delivery's topic is never empty),
-client `planAlias`'s version and zero-slots guards (the server maximum is 0 under 3.1.1 and `room` is 0 without slots)
-and its empty-topic guard (an empty topic needs an explicit alias, which returns earlier). The Audit line is cumulative
-(55/56 + 32/38, 1 + 6 eq).
-
-**Delta mutation 2026-11-17** (Response Information; schemata over `broker.zig`'s tests, 8 mutants:
-the v5 gate, the request default, the fit check, the Maximum Packet Size drop and its `>` boundary,
-the length limit, the NUL check, the UTF-8 check): 7 killed (the boundary one after a test was
-added at the exact CONNACK size), 1 EQUIVALENT: dropping `v5 and` from `want_response_info` — a 3.1.1
-CONNECT is decoded without properties, so `request_response_information` is null and the gate stays
-false. The audit line is cumulative (48 + 8).
-
-**Persistent sessions** have 16 offline tests (resume with `session_present`, queue while away,
-socket death without DISCONNECT, clean-session discard, DUP resend with the original id, a failed
-write kept in flight, QoS 0 not queued, both queue bounds, the in-flight window refilled by
-PUBACK, persistent and clean take-over, `max_sessions` without a stray Will, expiry, retained QoS 1
-through the queue, `deinit` with queued and in-flight messages), plus 4 for keeping them across a
-server restart (`sessionStates` of online and offline sessions with a drop, a restored session
-queueing and resumed, `restoreSession` refusals leaving nothing, expiry from the restore). 16 guards were removed one at a
-time on 2026-09-21 and each turned a test red (runner deleted afterwards, CONVENTIONS §9). The
-stress pass runs its upper half of workers on persistent sessions — resuming on most reconnects,
-discarding with a clean CONNECT on every third — and asserts after the storm that every
-remaining subscription is a session's, every session is offline and holds exactly the registry's
-reference. Run 10× ReleaseSafe and 20× ReleaseFast clean; with `ownsRouting` removed it failed 5
-of 5. ⚠ The valgrind pass below predates sessions and has not been repeated for them. (A run over
-the Debug build was made and is not evidence either way — CONVENTIONS §7.1: nothing measured under
-valgrind may be a Debug build.)
-
-Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here (self-hosted backend; TSan needs `-fllvm`; measured on 0.16, not re-checked on 0.17) — it compiles and links but
-emits **zero `__tsan_*` instrumentation** and fails to flag a deliberate data race — so, per the SPEC's
-own fallback, race detection is the real-thread run under **Debug and `-Doptimize=ReleaseFast`, repeated
-(the committed 16×40 config was run 15× Debug + 40× ReleaseFast, plus one heavy 48×150 pass, all clean)**
-and cross-checked with a **valgrind `memcheck` pass (no errors, no leaks, no invalid read/write** — i.e. no
-use-after-free in the reference-counted teardown). No race, deadlock, or UAF was found; the hardening is
-confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
-
-## Ingest-consumer audit S1 fixes (2026-09-28)
-
-**The Will is ACL-checked** (S1 R1). Before, any authenticated account could publish anything,
-retained, anywhere by dropping its socket: the Will went through `fanout` with no ACL. Now, once
+**The Will is ACL-checked** (S1 R1). Without it any authenticated account could publish anything,
+retained, anywhere by dropping its socket: the Will goes through `fanout`. Once
 the CONNECT is authenticated, `authorizeFn` sees the Will topic as a publish (`retain` = the
 Will's), and a denial refuses the CONNECT with `not_authorized`, as mosquitto does; nothing is
 registered. The decision is taken once, at CONNECT. `AuthRequest.will` (`WillInfo`: topic, QoS,
@@ -518,87 +406,14 @@ Past the cap a new topic is refused and an update that would cross it removes th
 `retainedRefusals()`. `retainedBytes()` reports the store's size. Not to be confused with
 `max_retained_bytes`, the per-SUBSCRIBE delivery envelope.
 
-**A session belongs to its username** (S1 R3). Take-over and resume went by client id alone, so
-another account that knew the id resumed the session (subscriptions and queue, never ACL-checked
-for it), took over the live connection, or discarded everything with clean session 1. `Session`
-now records the username that created it; a CONNECT whose username differs from the session's
+**A session belongs to its username** (S1 R3). Take-over and resume do not go by client id alone: otherwise
+another account that knew the id could resume the session (subscriptions and queue, never ACL-checked
+for it), take over the live connection, or discard everything with clean session 1. `Session`
+records the username that created it; a CONNECT whose username differs from the session's
 owner, or from a `.connected` connection holding the id, is refused with `not_authorized` before
 anything changes hands. `sessionStates` reports the owner (`SessionState.username`) and
 `restoreSession(client_id, username, subs, offline_since_ms)` takes it back. The binding holds
 with or without an `authenticateFn`; without one, the username is only what clients claim.
-
-Mutants (one schemata build): skipping the Will ACL, the owner check, and the byte cap on an
-update and on a new topic — each caught by its own test.
-
-## Performance
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-mqtt`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.72–1.05×, against 0.72–0.97× before. The card carries these figures.
-
-## Backlog / deferred
-- **Constant time — DONE 2026-10-18**: `acl.zig` decoded the stored `$7$` verifier with std base64; now `b64ct` (decode in `parseHash`, encode in `formatHashBody`). The iteration count is still read with `std.fmt.parseInt` (a public field of the stored line, not a secret).
-~~**`Broker.qos1Drops()` is dead but its doc says it counts**~~ ✅ DONE 2026-10-17 — removed (BREAKING; the tag allows it): nothing incremented it since the clean-session window queue. Verifying it found a real defect beside it: `enqueueConn`'s out-of-memory path bumped `queue_drops` but not `stats.publish_dropped`, so `$SYS/broker/publish/messages/dropped` under-reported; both now move only through `countQueueDrop`, pinned by a FailingAllocator test. `queueDrops` docs corrected (QoS 1/2, persistent and clean-session queues).
-**`interop-mqtt` hangs instead of failing when its peer is unreachable** — DONE 2026-10-07: the watchdog is a plain thread ending the process with `exit_group` (and removing the live container), every podman and paho call has a timeout, the image is pulled as its own step, the venv is checked first, and each step is printed. Why the old `io.concurrent` watchdog did not fire on the runner is NOT established — locally it fired at 120 s under a hanging fake `podman`; the new program fails with named `Timeout` errors there and passed on the CI lane once mosquitto and paho were installed (probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). On a GitHub runner the program ran 22 minutes with no output until the job was cancelled; a missing or unstartable mosquitto container must end the run with a named error. The lane now bounds every program with `timeout` and lists mqtt as a local-only oracle (podman + mosquitto + paho are not installed there); fix the hang before moving it back.
-**`Broker.rxRoom(conn)` / `Client.rxRoom()`: how much `feed` takes now** — DONE (2026-09-29, requested by the ingest daemon audit R13). The receive buffer's room once what `process`/`poll` consumed is compacted away, so a server reading in fixed chunks feeds at most that, processes, and feeds the rest instead of dropping a client whose read holds the tail of one packet and the head of the next. 0 after `process` returned `.keep` = an incomplete packet as large as the buffer, which can never complete. Test: "rxRoom: a read holding one packet's tail…".
-**The publish tap never sees a Will** — DONE (2026-09-29, found by the MQTT-proxy consumer of the energy-monitoring consumer). `Config.tap_wills = true` hands an ungraceful end's Will to `onPublishFn` as a publish, after the connection is out of the index (the M2 ordering), on the `remove` caller's thread with no lock held; the verdict is honoured minus the connection (`.accept` → retained + fan-out, `.consume` → neither, `.refuse` → neither, counted in `tapRefusals`). Off by default. Tests: "tap_wills: …" (both directions, clean DISCONNECT, consume/refuse).
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-Broker deferrals (documented, not bugs; QoS 2 and MQTT 5.0 have since shipped, see below): sessions persisted
-across a broker restart, DUP retransmit to clean-session subscribers, TLS. The four architectural limitations of the first
-cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-killing per-subscriber
-delivery failures, take-over socket leak, and missing auth/ACL — are now fixed (trie index +
-snapshot-then-write off the lock + per-connection `tx_lock` + reference-counted teardown; contained
-per-subscriber failures; take-over socket shutdown; optional auth/ACL hooks). **The broker
-(`broker.zig`) was reviewed 2026-07-10 (adversarial security pass)** — varint/topic-matcher/
-state-machine handling confirmed clean; the accept-loop inline-wedge DoS (CRIT) found in that pass
-was fixed. The concurrency hardening's recommended
-multi-threaded stress/race pass is now **COVERED** — see Verification above (16 real-socket
-OS-thread clients racing fan-out / take-over / churn, run repeatedly under Debug + ReleaseFast and
-under valgrind memcheck, all clean; TSan is a no-op stub in Zig 0.16.0, so real-thread stress is the
-fallback).
-- ~~**MQTT 5.0**~~ — DONE 2026-10-01 (codec, client, broker; see *MQTT 5.0*). ~~**Broker-side inbound QoS 2**~~ — DONE 2026-10-01, both directions (see *QoS 2 in the broker*).
-- ✅ DONE 2026-10-17 (`00040f033`: `Config.extendedAuthFn`, multi-step AUTH at CONNECT, re-authentication, per-connection state slot; `broker.zig`). **Broker extended authentication** (2026-10-01, deferred from the 5.0 work): AUTH exchanges (4.12) need a hook shaped like `authenticateFn` but multi-step (method, data in → continue/success/deny + data out) and per-connection state between CONNECT and CONNACK, plus re-authentication. Today a CONNECT naming a method gets CONNACK 0x8C, which 4.12.0-1 allows. Effort: medium. The client side already exists (caller-driven).
-- ~~**`restoreSession` for 5.0 sessions**~~ — done 2026-10-02: `SessionSub` options, `restoreSessionWith` with `expiry_interval_s` (see § sessions above).
-- ~~**Broker outbound Topic Aliases**~~ *(2026-10-01)* — DONE 2026-11-17, as Mosquitto (lib/send_publish.c `send__publish`, lib/alias_mosq.c, read 2026-11-17): for a 5.0 subscriber that announced a Topic Alias Maximum, the first PUBLISH of a topic on the connection carries the topic and the next free alias (1, 2, ...), every later one of that topic an empty topic and the alias; no eviction (once the slots are used, further topics go unaliased); a new connection starts empty; 3.1.1 clients and clients with no maximum are never aliased. Applied on all five delivery paths (live, the clean-session queue, a persistent session's resend, queue and QoS 0 queue) by `Broker.encodeDelivery`. Where this differs from Mosquitto: `Config.outbound_topic_aliases` (default 16, 0 = off) caps what a client's announced maximum may make the broker allocate (Mosquitto takes the client's number as it is -- up to 65535 owned topic copies per connection), and an aliased form that would exceed the client's Maximum Packet Size or `tx_buf` goes out plain and uses no slot (the plain form was already held to those limits).
-- ~~**Payload Format validation** (2026-10-01)~~ ✅ DONE 2026-11-16 (already present since 2026-10-17, line was stale: `Config.validate_payload_format`, default on; a 5.0 PUBLISH with Payload Format Indicator 1 and invalid UTF-8 gets PUBACK/PUBREC 0x99 or DISCONNECT 0x99; test `payload format: invalid UTF-8 ...`).
-- ~~**Response Information / Reason Strings from the broker** (2026-10-01)~~ ✅ DONE: Reason Strings since 2026-10-17 (line was stale), Response Information 2026-11-17 — `Config.response_information` (default null = never sent, as Mosquitto, whose man page lists Request Response Information / Response Information as "supported but not used", and HiveMQ, which has no broker setting for it (an extension interceptor does it); it is a MAY). Set, it goes into the CONNACK of a 5.0 client that sent Request Response Information = 1; not sent for an invalid/over-long value or when the CONNACK would exceed the client's Maximum Packet Size. Tests `v5 CONNACK: Response Information ...`.
-- ~~**Client: automatic outbound Topic Aliases**~~ *(2026-10-01)* — DONE 2026-11-17, opt-in (`Buffers.out_aliases`, empty = off), after paho.golang's `topicaliases` extension (`TAHandler.PublishHook`, read 2026-11-17; it is the one paho client that does this, and it is first-come, not an LRU, as this line first said): a publish of a topic with no alias takes the next free slot (up to `min(slots, the server's Topic Alias Maximum)`) and sends the topic with the alias; later publishes of it send an empty topic and the alias; no eviction -- when the slots are used, further topics go plain; reset on `connect`. A publish carrying its own `properties.topic_alias` is untouched. Own details: the slot is taken only after the packet went out, the first-use form (3 bytes longer) that would exceed the server's Maximum Packet Size goes plain, a topic over `alias_topic_capacity` goes plain, and with an outbox a QoS 1/2 publish keeps its topic (it may be resent on a connection whose aliases are empty). An LRU that re-points an alias at a new topic needs a decision per server (a re-pointed alias races the in-flight empty-topic publishes); not done.
-- ~~**`$SYS` broker statistics topics** (survey 2026-09-30)~~ ✅ DONE 2026-11-16 (already present since 2026-10-17, line was stale: `Broker.publishSys(now)` publishes 16 Mosquitto-named `$SYS/broker/...` retained topics, opt-in via `Config.sys_interval_ms` (0 = off, default), `TcpServer` upkeep calls it; clients cannot publish or leave a Will under `$SYS/`, tests `$SYS: ...` and `review M3`; load/heap topics stay in the Backlog above).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-- (GM, 2026-10-29) Global byte caps if a consumer needs them: queued bytes
-  across all sessions/connections (`(max_sessions + max_connections) *
-  max_queued_bytes`), subscription filter bytes (`max_subscriptions_total *
-  max_packet_size`), and an examined-entries envelope for the retained walk at
-  SUBSCRIBE (documented in `Config`; mosquitto has no such caps either).
-- (GM, 2026-10-29) DONE: `Broker.fanout` collapsed matches to owners and
-  gathered Subscription Identifiers with nested scans (owners x matches under
-  the registry lock); now one pass with a pointer-keyed map (review R-MQ-2).
-- (GM review, 2026-10-29) Backlog, each with the review's trigger:
-  - R-MQ-1 follow-up: a bounded per-connection outbox (a slow subscriber is
-    now cut off by `TcpServer.write_timeout_ms`, but a publisher still waits up
-    to that long inside the write).
-  - R-MQ-6: persistent sessions never expire by default (`session_expiry_ms =
-    0`); 1024 anonymous clean_session=0 CONNECTs with unique ids fill
-    `max_sessions` until restart (mosquitto's default too). A safe default or
-    docs.
-  - R-MQ-7: Shared Subscriptions are a flat list (`fanout`, `findShared`,
-    `pickShared`): 65536 distinct `$share/g<i>/...` groups make every PUBLISH
-    and SUBSCRIBE scan them all under the lock. Put groups into the trie.
-  - R-MQ-9: a CONNACK refusal (`claimedByAnother`, session limit) is written
-    while holding `b.mutex`; only a consumer `Transport` that blocks could
-    stall the broker (the stock socket cannot block on a fresh connection).
-  - R-MQ-11: bridges have no hop or loop bound (two bridges between one pair
-    of brokers, a ring, a 3.1.1 remote reordering more than the 32 remembered
-    messages): messages can circulate at link speed. Operator error, as in
-    mosquitto.
-  - R-MQ-12: PBKDF2 login cost: a hostile password file with
-    `max_iterations` 1e7 makes each CONNECT cost seconds; no unauthenticated
-    rate limit (config-time concern).
-
-## Status
-`gap · any (codec+client pure; TcpTransport uses std.Io.net) · client+codec · single-owner` + deps:
-none (std only) — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring
 
@@ -609,4 +424,46 @@ none (std only) — canonical source is `pub const meta` in src/root.zig.
 
 **What the tests actually contain.** src/external_goldens.zig freezes real MQTT 3.1.1 sessions captured through a byte-logging proxy between paho and amqtt -- neither side ours -- covering CONNECT/PUBLISH/SUBSCRIBE and the RETAIN bit; src/testdata/v5_transcript.txt (taken by tools/interop.zig, replayed by src/v5_replay.zig) freezes MQTT 5.0 sessions of our Client against Eclipse Mosquitto 2.1.2 and of paho-mqtt 2.1.0 clients against our Broker -- properties, reason codes, subscription identifiers, topic aliases both ways, shared subscriptions, No Local, retain options, Wills with properties, session resume, take-over 0x8E -- with our bytes re-encoding to what mosquitto accepted and the broker reproducing every byte paho received; topic.zig validation and matching are anchored since 2026-10-05 to a real Mosquitto 2.1.2 over a raw MQTT 5.0 socket (`tools/topic_oracle.py` -> `src/topic_vectors.zig`, replayed by `src/topic_oracle_test.zig`: 43 filters granted or refused, 32 names accepted or refused, every valid filter x name pair by delivery with per-filter Subscription Identifiers; one listed divergence, `$share` alone); broker.zig session state is anchored since 2026-10-06 to the same Mosquitto over raw sockets (`tools/session_oracle.py` -> `src/testdata/session_transcript.txt`, replayed by `src/session_replay.zig`: 23 scenarios -- persistent sessions and the offline queue, QoS 1 redelivery with DUP and the same identifier, PUBREL resent, QoS 2 duplicate suppression across a reconnect, retained messages and their QoS, Wills on drop / violation / take-over / keep-alive, take-over of a persistent session, CONNECT refusals, protocol violations, 5.0 Session Expiry and Will Delay timers -- every connection's bytes and whether the broker closed it; one listed divergence, overlapping subscriptions, settled by NanoMQ and amqtt via `--peer`)
 
-**How it got there.** The anchoring work landed. DONE 0b466d6: 9 real paho/amqtt sessions both directions; amqtt itself violates 3.3.5
+## Verification
+
+- **Run:** `scripts/modtest mqtt`. The live oracles are `zig build interop-mqtt` (our `Client` against Mosquitto 2.1.2, paho-mqtt clients against our `Broker`; `-- --capture` re-takes the frozen transcripts, `-- --tls` runs the MQTT-over-TLS recipe over `tlsclient`) and `tools/session_oracle.py` / `tools/topic_oracle.py`; they need podman, the Mosquitto image and a paho venv, so they are local-only. `interop-mqtt` fails with a named `Timeout` instead of hanging: a plain OS thread ends the process with `exit_group` past its deadline, every podman and paho call has its own timeout, and each step is printed.
+- **Offline tests** (no socket, caller-driven clock): golden-byte KATs against the spec wire layout (the spec's own CONNECT example included), every remaining-length varint boundary, every 5.0 property round-tripped in its packet and every refusal class, a topic-match truth table, and no-panic sweeps over hostile bytes (`src/sweep_wire_test.zig`, `src/sweep_session_test.zig`). Client: a scripted fake broker drives QoS 1/2 handshakes, DUP retransmit and receive dedup, keep-alive and ping timeout, packet-id wrap and exhaustion, rx-buffer overflow, the 5.0 limits, aliases, AUTH, the outbox and reconnect (`src/reconnect_test.zig`). Broker: a scripted fake client hand-encodes raw packets against connection objects — fan-in and fan-out, overlapping filters, retain, QoS 1/2 both ways, take-over, keep-alive teardown, persistent sessions (resume, queue bounds, DUP resend, restore refusals, expiry), 5.0 sessions and expiry, forwarding, No Local, Retain As Published and Handling, Subscription Identifiers, shared subscriptions, delayed Wills, reason codes, ACL and authentication paths, bridge (`src/bridge_test.zig`) and `$SYS`.
+- **Hardening tests:** each of FIX A–D has its own test (trie routing across `+`/`#`/exact/`$SYS`; a lock-probe subscriber whose write seam re-acquires the global spinlock, so reaching its assertions proves fan-out released the lock; a failing subscriber transport contained; a max-size QoS 1 re-encode; take-over shutting the superseded socket down; auth and ACL denials), as has each `review F<n>` behaviour and each of the retained-store, Will-ACL and session-owner rules.
+- **Stress / race pass:** a real `TcpServer` on a loopback ephemeral port driven by 16 OS-thread clients in four adversarial roles (a publisher with subscribe/unsubscribe churn, a subscriber that closes its socket mid-fan-out, a same-client-id take-over racer, a slow reader churning subscriptions during fan-out); half the workers speak 5.0 and the upper half use persistent sessions. After the storm it asserts no crash, use-after-free, double free or leak (`std.testing.allocator`), no deadlock (a 90 s watchdog), an accept loop that never stalls (a probe reconnects throughout), end-to-end delivery afterwards, no torn packet, and a connection and subscription count that drains to zero. It is socket-gated (`error.SkipZigTest` where loopback or threads are unavailable). Race detection is repeated real-thread runs under Debug and `-Doptimize=ReleaseFast`, cross-checked with a valgrind `memcheck` pass of the stress test (not repeated since persistent sessions and 5.0 joined it, see *Open*); ThreadSanitizer needs `-fllvm` (the self-hosted backend emits no instrumentation).
+- **Oracles:** see *Anchoring* (`src/external_goldens.zig`, `src/v5_replay.zig`, `src/session_replay.zig`, `src/topic_oracle_test.zig`).
+- **Fuzz:** run by testkit's deterministic driver as `MQTT_FUZZ=<runs>[,<first seed>]`: `mqtt-decode`, `mqtt-decode-mutated`, `mqtt-v5-decode`, `mqtt-v5-decode-mutated` (`src/packet.zig`), `mqtt-acl-parse`, `mqtt-broker-session` (random 5.0 packet streams through the extended-auth state machine) and `mqtt-broker-multi` (shared client ids, 3.1.1 and 5.0, persistent sessions, delayed Wills, failing subscriber transports) (`src/fuzz_session_test.zig`).
+- **Constant time:** `src/ctgrind_harness.zig` taints the CONNECT password and the 5.0 Authentication Data through `encode` and `decode`, and the password through `acl.Passwords.verify`; run it with `scripts/checks/ctgrind.sh mqtt` (the card's Hardening line has the verdict). `src/stackprobe_test.zig` (ReleaseFast only) probes the credential-carrying encoders for stack residue.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-mqtt` (`tools/bench.zig`).
+
+## Performance
+
+The bench is `zig build bench-mqtt` (`BENCH_ROUNDS=5`, ReleaseFast): one raw driver loads our `TcpServer` and Mosquitto 2.1.2 (podman, `set_tcp_nodelay true`, `max_queued_messages 0`; ours with `tcp_nodelay` and unbounded queues, since MQTT has no end-to-end flow control and bounded queues would compare drop policies). The card's Performance line carries the figures and is authoritative.
+
+## What is deliberately not done
+
+- **Outbound Topic Alias eviction (an LRU).** Aliases are first-come in both the broker and the client; an LRU that re-points an alias at a new topic needs a decision per server (a re-pointed alias races the in-flight empty-topic publishes).
+- **A configuration-file daemon, a dynamic-security plugin, clustering and rule engines.** Product features on top of the hooks, not library scope.
+- **A store written by the broker.** The broker keeps sessions and retained messages in memory; a server persists them through the seam (`sessionStatesWith`, `retainedMessages`, `restoreSession`, `restoreRetained`).
+- **Transport security in the codec, client or broker core.** The caller supplies the transport (TLS, WebSocket as tested recipes); see *Threat model / out of scope*.
+- **Response Information by default.** It is a MAY; `Config.response_information` is null, as in Mosquitto.
+
+## Open
+
+- The valgrind `memcheck` pass of the stress test predates persistent sessions, 5.0 and the clean-session queue and has not been repeated for them (a valgrind run must not use a Debug build).
+
+## Backlog / deferred
+
+- **A TLS listener in `TcpServer`.** The accept loop takes plaintext; terminate TLS in front. The collection has a `tlsserver` module; `TcpServer` does not use it.
+- **The remaining `$SYS` load and heap topics** (`publishSys` publishes 16 Mosquitto-named `$SYS/broker/...` topics).
+- **An inline in-process subscribe** (a subscriber with no transport).
+- **MQTT 3.1 (`MQIsdp`).** A 3.1 CONNECT is refused with CONNACK 0x01 (the 3.1.1 format).
+- **Differential oracle against karlseguin's library (idea, not scheduled).** `karlseguin/mqttz` is a client only (MIT, Zig 0.16): drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so the broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9).
+- **Global byte caps, if a consumer needs them:** queued bytes across all sessions and connections (`(max_sessions + max_connections) * max_queued_bytes`), subscription filter bytes (`max_subscriptions_total * max_packet_size`), and an examined-entries envelope for the retained walk at SUBSCRIBE (documented in `Config`; Mosquitto has no such caps either).
+- **Sweep-review items, each with the review's trigger:**
+  - R-MQ-1 follow-up: a bounded per-connection outbox (a slow subscriber is cut off by `TcpServer.write_timeout_ms`, but a publisher still waits up to that long inside the write).
+  - R-MQ-6: persistent sessions never expire by default (`session_expiry_ms = 0`); 1024 anonymous `clean_session=0` CONNECTs with unique ids fill `max_sessions` until restart (Mosquitto's default too). A safe default or docs.
+  - R-MQ-7: Shared Subscriptions are a flat list (`fanout`, `findShared`, `pickShared`): 65536 distinct `$share/g<i>/...` groups make every PUBLISH and SUBSCRIBE scan them all under the lock. Put groups into the trie.
+  - R-MQ-9: a CONNACK refusal (`claimedByAnother`, session limit) is written while holding `b.mutex`; only a consumer `Transport` that blocks could stall the broker (the stock socket cannot block on a fresh connection).
+  - R-MQ-11: bridges have no hop or loop bound (two bridges between one pair of brokers, a ring, a 3.1.1 remote reordering more than the 32 remembered messages): messages can circulate at link speed. Operator error, as in Mosquitto.
+  - R-MQ-12: PBKDF2 login cost: a hostile password file with `max_iterations` 1e7 makes each CONNECT cost seconds; no unauthenticated rate limit (config-time concern).

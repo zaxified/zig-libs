@@ -9,6 +9,7 @@ transport-agnostic client and a broker, all fully offline-testable.
 - No mature pure-Zig MQTT library exists.
 - **Platform:** any (codec + client are pure computation; only the optional
   `TcpTransport` adapter touches `std.Io.net`).
+- **Deps:** `b64ct` (constant-time base64 for the `$7$` password verifier) + std.
 - **Model after:** MQTT 3.1.1 and 5.0 (OASIS) / mosquitto+paho behavior.
 - **Scope:**
   - **Codec** (`packet`): encode + decode for all 14 control-packet types —
@@ -46,7 +47,8 @@ transport-agnostic client and a broker, all fully offline-testable.
     65535→1, in-use guard). Caller drives the clock (`now` in ms, no hidden
     time calls); `tick` sends keep-alive PINGREQ and reports ping timeouts.
     `publishDup` retransmits an unacked QoS > 0 publish with the DUP flag.
-    Retained-session replay (buffering payloads) is deliberately the
+    Replaying unacknowledged QoS 1/2 publishes across a reconnect is the
+    opt-in outbox (`Buffers.outbox`); buffering received payloads is the
     caller's job.
     **5.0** (`Connect.version = .v5`): `connect` announces what the client can
     hold (Receive Maximum = `max_in_flight`, Maximum Packet Size = the receive
@@ -126,8 +128,9 @@ transport-agnostic client and a broker, all fully offline-testable.
     Subscriptions** `$share/{group}/{filter}` (round-robin, connected members first
     — for 3.1.1 clients too); Will properties and Will Delay (`publishDueWills(now)`,
     run once a second by `TcpServer` with `expireSessions`). `Broker.publishWith`
-    takes properties and a Message Expiry. Extended authentication is not
-    implemented: a CONNECT naming a method gets 0x8C.
+    takes properties and a Message Expiry. Extended authentication needs
+    `Config.extendedAuthFn` (see S2 parity below): without it a CONNECT naming a
+    method gets 0x8C.
 
     **Will / LWT** (3.1.2.5, 3.14.4): the will registered at CONNECT is kept
     (owned copies — the decoded slices point into the receive buffer), published
@@ -175,7 +178,7 @@ transport-agnostic client and a broker, all fully offline-testable.
     keeps the message alive instead of acknowledging one it lost. Null by
     default = accept everything.
 
-    **Since 2026-10-17 (S2 parity, see SPEC.md "S2 parity"):** extended
+    **S2 parity features (see SPEC.md "S2 parity"):** extended
     authentication, `$SYS`, a persistence seam for retained messages and session
     bodies, operator limits, Payload Format checks and Reason Strings, a
     per-connection queue for clean-session subscribers, `acl` (Mosquitto
@@ -249,7 +252,7 @@ count that drains cleanly to zero (no take-over zombie). It is socket-gated
 `-fsanitize-thread` is a no-op on the self-hosted backend (TSan works only with `-fllvm`; measured on 0.16, not re-checked on 0.17) (no `__tsan_*` instrumentation is linked), so the
 race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
 repeated many times, cross-checked with a valgrind `memcheck` pass (no errors).
-Since 2026-10-01 half its workers speak 5.0 — QoS 2, Subscription Identifiers, a
+Half its workers speak 5.0 — QoS 2, Subscription Identifiers, a
 Shared Subscription, Session Expiry, delayed Wills, take-overs telling 0x8E.
 
 **External anchor for 5.0** (`tools/interop.zig`, `zig build interop-mqtt`): our
@@ -266,6 +269,12 @@ CONNECT refusals, violations, Session Expiry and Will Delay. Frozen in
 `src/testdata/session_transcript.txt`; `src/session_replay.zig` feeds the same
 client bytes to a `Broker` and requires the bytes Mosquitto sent, with one listed,
 spec-permitted divergence (overlapping subscriptions get one copy here).
+
+## Not provided
+
+No TLS listener in `TcpServer` (the caller supplies the transport; TLS and WebSocket are tested recipes), no MQTT 3.1
+(`MQIsdp`), no store written by the broker (a persistence seam instead), no configuration-file daemon, dynamic-security
+plugin, clustering or rule engine. See SPEC.md *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 and Version 5.0
 specifications (open, royalty-free standards); mosquitto (EPL-2.0 or EDL-1.0) and Eclipse
