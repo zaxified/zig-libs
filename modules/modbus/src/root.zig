@@ -549,14 +549,14 @@ pub const rtu = struct {
 /// type 0x0E): request encoding, response parsing and the object model the
 /// `server` side answers from.
 ///
-/// Reference check: pymodbus `pdu/mei_message.py` (BSD-3, read 2026-11-19):
+/// Reference check: pymodbus `pdu/mei_message.py` (BSD-3, read):
 /// request = MEI type, read code, object id (3 bytes); an invalid read code
 /// or object id is exception 0x03; an unknown object in individual access is
 /// exception 0x02; the response header is MEI, read code, conformity level,
 /// more-follows, next object id, object count, then (id, length, value)
 /// triples inside the 253-byte PDU budget. The category ranges, the
 /// cumulative stream walk, the restart rule and the conformity values below
-/// were checked against the V1.1b3 PDF text (section 6.21) on 2026-11-19.
+/// were checked against the V1.1b3 PDF text (section 6.21) on.
 pub const device_id = struct {
     /// MEI type for Read Device Identification.
     pub const mei_type = 0x0E;
@@ -606,9 +606,8 @@ pub const device_id = struct {
     };
 
     /// First and last object id a stream read code walks; null for
-    /// `individual`. Behaviour change 2026-11-19: this used to return the
-    /// category alone (regular 0x03..0x7F, extended 0x80..0xFF); the spec's
-    /// categories are cumulative, so every walk starts at 0x00. Reserved ids
+    /// `individual`. The spec's categories are cumulative (regular is
+    /// 0x00..0x7F, extended 0x00..0xFF), so every walk starts at 0x00. Reserved ids
     /// (`isReserved`) inside the range are skipped.
     pub fn categoryRange(code: ReadCode) ?struct { first: u8, last: u8 } {
         return switch (code) {
@@ -721,7 +720,7 @@ pub const device_id = struct {
 ///
 /// The frame boundary comes from the function code (fixed length, or a byte
 /// count field inside the frame) and is confirmed by the CRC-16. This is the
-/// approach pymodbus's RTU framer takes (read 2026-11-19: it asks the decoder
+/// approach pymodbus's RTU framer takes (read: it asks the decoder
 /// for the frame size from the function code, then checks the CRC, and
 /// hunts forward over garbage). Unlike pymodbus, a CRC failure here drops one
 /// byte and rescans, so a valid frame behind garbage or behind a corrupted
@@ -1980,7 +1979,7 @@ test "garbage frames never panic" {
 // length was 0 for every input a corpus can carry — and the target had no
 // corpus, so the one input it ever ran was empty. Both `decodeAdu`s answered
 // `error.ShortFrame` on their first line and all four PDU response parsers
-// were handed a zero-length slice. Measured 2026-09-07: 1 round, 0 frames
+// were handed a zero-length slice. Measured: 1 round, 0 frames
 // decoded, 0 registers or bits parsed. The "corpus-guided coverage" this
 // target was added for needed a corpus, and there was none.
 
@@ -2059,7 +2058,7 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
         if (pdu.parseWriteSingleResponse(bytes, .write_single_register, 1, 2)) |_| responses += 1 else |_| {}
         if (pdu.parseWriteMultipleResponse(bytes, .write_multiple_registers, 1, 2)) |_| responses += 1 else |_| {}
     }
-    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 frames decoded.
+    // Measured. Before: 1 round, 0 non-empty, 0 frames decoded.
     try testing.expectEqual(adu_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 6), tcp_ok);
     try testing.expectEqual(@as(usize, 3), rtu_ok);
@@ -2527,7 +2526,7 @@ test "RtuStream: file-record requests with several sub-requests are sized by the
     try testing.expectEqualSlices(u8, &resp, s2.next().?.pdu);
 }
 
-// ── TcpTransport reply framing (audit 2026-11-19) ──────────────────────────
+// ── TcpTransport reply framing ──────────────────────────
 
 /// A peer that accepts one connection, drains the request, writes `reply`
 /// and keeps the connection open for a while.

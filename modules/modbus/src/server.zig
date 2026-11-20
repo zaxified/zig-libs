@@ -175,7 +175,7 @@ pub const Config = struct {
     /// FC 0x17 Read/Write Multiple Registers.
     read_write_registers: bool = true,
 
-    /// FC 0x16 Mask Write Register. Behaviour change 2026-11-19: it used to
+    /// FC 0x16 Mask Write Register. Behaviour change: it used to
     /// be unimplemented (`IllegalFunction`); libmodbus and pymodbus both
     /// serve it. Set false to restore the old answer.
     mask_write_register: bool = true,
@@ -303,7 +303,7 @@ pub const Server = struct {
                     // half that was missing: a restart-comms request received
                     // while already muted was processed AND answered, and a
                     // malformed one put an exception frame on a bus the device
-                    // is supposed to be silent on (audit 2026-09-02).
+                    // is supposed to be silent on.
                     self.counters.slave_no_response +%= 1;
                     return null;
                 }
@@ -332,10 +332,10 @@ pub const Server = struct {
                 const reply_pdu = try self.handlePdu(frame.pdu, &pdu_buf);
                 if (was_listening or self.listen_only) {
                     // §6.8 sub 0x0004: the request that puts the device into
-                    // listen-only mode is itself not answered -- and (the half
-                    // that was missing until 2026-09-02) a device ALREADY in
-                    // the mode answers nothing at all, not even the exception
-                    // a malformed restart request would otherwise produce.
+                    // listen-only mode is itself not answered -- and a device
+                    // ALREADY in the mode answers nothing at all, not even the
+                    // exception a malformed restart request would otherwise
+                    // produce.
                     self.counters.slave_no_response +%= 1;
                     return null;
                 }
@@ -416,7 +416,7 @@ pub const Server = struct {
         // no panic at all -- the prior audit record's claim that "the failure
         // mode really is a safety panic rather than silent corruption" holds
         // only in Debug. This turns the coupling into a check that exists in
-        // every build. Audit 2026-09-02.
+        // every build. Audit.
         if (self.reply_len > out.len) return self.exception(out, fc_byte, .server_device_failure);
         return out[0..self.reply_len];
     }
@@ -774,7 +774,7 @@ pub const Server = struct {
                 // only, and over TCP this sub-function is a one-frame,
                 // unauthenticated, permanent denial of service: twelve bytes
                 // mute the server for EVERY master on EVERY connection until
-                // someone sends a restart (measured 2026-09-02 — five
+                // someone sends a restart (measured — five
                 // subsequent reads, all silent). A serial bus has one master
                 // and physical access; a TCP listener has neither. The rest
                 // of FC 08 stays available on both framings: echo and the
@@ -1460,7 +1460,7 @@ test "FC 08 sub 0x0004: listen-only mode swallows everything until a restart" {
     // "If the port is currently in Listen Only Mode, no response is returned"
     // -- and the old behaviour put a frame on a bus the device is supposed to
     // be silent on, including an exception frame for a MALFORMED restart
-    // request, which is the arm below. Audit 2026-09-02.
+    // request, which is the arm below. Audit.
     var restart_buf: [mb.rtu.max_adu_len]u8 = undefined;
     const restart = try mb.rtu.encodeAdu(&restart_buf, 5, &.{ 0x08, 0x00, 0x01, 0x00, 0x00 });
     try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(restart, &out));
@@ -1652,7 +1652,7 @@ test "fuzz: structurally valid requests with wire-controlled fields never panic"
 // was empty: the framing was always `.rtu`, `smith.bytes` then a ranged length
 // gave `len` = 0, the "half the budget goes to PDUs that start with a real
 // function code" branch never ran (its gate is `len > 0`), and
-// `handlePdu("")` was the entire target. Measured 2026-09-07: 1 round, 0
+// `handlePdu("")` was the entire target. Measured: 1 round, 0
 // octets, 0 function codes dispatched, the `.tcp` arm never once constructed.
 //
 // Both knobs are gone. The framing is no longer drawn at all — every input
@@ -1733,7 +1733,7 @@ test "corpus: every request seed reaches the dispatch table, and the replies are
             if (reply[0] & 0x80 != 0) exceptions += 1;
         }
     }
-    // Measured 2026-09-07. Before: 1 round, `handlePdu("")`, `.rtu` only.
+    // Measured. Before: 1 round, `handlePdu("")`, `.rtu` only.
     try testing.expectEqual(server_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 512), reply_octets);
     try testing.expectEqual(@as(usize, 12), exceptions);
@@ -1805,7 +1805,7 @@ fn fuzzServerOnce(framing: mb.Framing, bytes: []const u8) !void {
 }
 
 test "a device in listen-only mode answers nothing at all, not even an exception" {
-    // ⛔ MEDIUM regression (audit 2026-09-02). Only the frame that ENTERED
+    // ⛔ MEDIUM regression. Only the frame that ENTERED
     // the mode was suppressed, so any PDU matching `isRestartDiagnostic`
     // received while already muted was answered — and a malformed one
     // produced an EXCEPTION frame on a bus the device is supposed to be
@@ -1832,7 +1832,7 @@ test "a device in listen-only mode answers nothing at all, not even an exception
 test "over TCP, one unauthenticated frame cannot mute the server for everyone" {
     // FC 08 is serial-line-only in the spec, and over TCP `force listen only
     // mode` was an unauthenticated, permanent, all-connections denial of
-    // service costing twelve bytes (audit 2026-09-02). It is `illegal
+    // service costing twelve bytes. It is `illegal
     // function` over TCP now; the rest of FC 08 is untouched.
     var fix = Fixture{};
     var server = fix.server(.tcp);
@@ -1856,7 +1856,7 @@ test "over TCP, one unauthenticated frame cannot mute the server for everyone" {
 
 test "FC 0x10: an address window miss is an exception, and writes nothing" {
     // ⛔ One of four guards between a peer PDU and the process image that had
-    // NO test at all (audit 2026-09-02): disabling it left the suite green
+    // NO test at all: disabling it left the suite green
     // (77/77). It is load-bearing — without it, this frame panics in Debug
     // ("attempt to use null value") and in ReleaseFast writes 0xDEAD into the
     // WRONG register and answers the master with a positive reply.

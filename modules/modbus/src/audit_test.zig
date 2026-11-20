@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests added by the 2026-11-19 whole-module mutation audit: each pins down
+//! Tests added by the whole-module mutation audit: each pins down
 //! a boundary, a length check, a counter or a side effect that no earlier test
-//! observed (see SPEC.md "Audit 2026-11-19 (whole-module mutation)").
+//! observed (see SPEC.md "Audit (whole-module mutation)").
 
 const std = @import("std");
 const mb = @import("root.zig");

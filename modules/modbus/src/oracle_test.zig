@@ -73,8 +73,7 @@ fn eqButConformity(a: []const u8, b: []const u8) bool {
 }
 
 test "oracle FC 0x2B/0x0E: every byte matches pymodbus except where it departs from spec 6.21" {
-    // Where pymodbus 3.16.2 departs from the spec text (V1.1b3 6.21, checked
-    // 2026-11-19), the spec wins (owner rule: spec-mandatory first). Each
+    // Where pymodbus 3.16.2 departs from the spec text (V1.1b3 6.21, checked), the spec wins (owner rule: spec-mandatory first). Each
     // departure is a named class with an exact count, so a new difference
     // fails this test instead of joining a pile.
     //   restart:  a stream request whose object id is not a known object of

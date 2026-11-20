@@ -65,7 +65,7 @@ const Exchange = struct {
 
 // ── CAPTURED: pymodbus 3.14.0 ModbusTcpClient -> this module's Server ───────
 //
-// Recorded 2026-07-23. A pymodbus master issued each call over a real
+// Recorded. A pymodbus master issued each call over a real
 // loopback TCP socket; this module's `server.Server` (configured exactly as
 // `captureServer` above) produced every reply byte; the harness logged both
 // directions verbatim. The `PARSED` column of the capture log — what pymodbus
