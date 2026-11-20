@@ -32,10 +32,7 @@ one; **not** a max-flow disjoint-path guarantee.
 Pure graph algorithm, zero I/O. Shared kernel of an SPB simulator and an
 encrypted SCADA/OT L2VPN fabric.
 
-- **Status:** the mvp scope (the ECT tie-break over Dijkstra) is implemented —
-  both tiers, property-tested; ECT-ALGORITHM mask variants, ECMP output and the
-  rest are under [Backlog / deferred](#backlog--deferred).
-  **Platform:** any.
+- **Platform:** any.
 - **Deps:** none (std only).
 - **Model after:** the IEEE 802.1aq / RFC 6329 SPB **ECT** path-vector
   tie-break idea, generalized off VLAN fabrics onto a plain weighted graph.
@@ -124,8 +121,8 @@ of the topology, not of the comparator.
 ## Verify
 
 ```
-zig build test-spf-ect                          # Debug
-zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast
+scripts/modtest spf-ect                          # Debug
+scripts/modtest spf-ect -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
 The property harness is the real check: reversal symmetry, strict-total-order
@@ -134,33 +131,17 @@ to 7 nodes, and second-tree validity plus disjointness. A comparator that is
 merely *consistent* would pass a round-trip test; only the total-order laws and
 the brute-force oracle pin it.
 
-**Mutation run 2026-10-05** (in-place, Debug, 33 mutants over the graph
-builder's refusals and atomicity, `pathTo`, all three comparator keys in both
-the streaming and the sort-based form, the multiset cursor, the disjointness
-key and Dijkstra's relax/tie step): 29 killed (one, a cursor that never
-advances, by a deterministic hang caught by the lane timeout). The first pass
-left 10; four tests added: `addEdge` rolls back its first arc when the second
-fails; the edge key decides a node-key tie ahead of forward order (and key 3
-is forward order); `comparePaths` and `comparePathsAlloc` agree on arbitrary
-sequences (duplicates, prefixes); `comparePathsDisjoint` ranks by primary
-overlap first. Equivalent: key 3 of the hot-path comparator (Dijkstra's two
-candidates always differ in key 1 or 2), dropping the stale-heap-entry skip
-(a settled node re-relaxes to the same predecessors), dropping `e.to != root`
-(the root's predecessor is `null`, which the next clause tests), and adopting
-on `.eq` (`.eq` only for the identical path, i.e. the same predecessor).
+Every test that killed a mutant of the last mutation run is committed in the suite (builder rollback on a failed second arc, the edge key deciding a node-key tie ahead of forward order, `comparePaths` against `comparePathsAlloc` on arbitrary sequences, `comparePathsDisjoint` ranking by primary overlap first). Run it with `scripts/modtest spf-ect`. The card's `**Audit:**` line is the current mutation score.
 
 Provenance: clean-room from the public IEEE 802.1aq / RFC 6329 description of
-ECT — no third-party source ported or studied, so no `NOTICE` entry is required
-(root [`NOTICE`](../../NOTICE) §0).
+ECT — no third-party source ported or studied, so the module has no `NOTICE` of its own.
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
-
-- **802.1aq ECT-ALGORITHM selection (mask 0x00 base + the 15 variants) with a conformance vector** (survey 2026-09-30). Why: two SPB bridges must compute the same tree; today `comparePaths` cannot be shown to agree with a foreign bridge, and `isis` already decodes the ECT-VID tuples that name the algorithm. Effort: ~1 week including finding published vectors (the standard has worked examples; no open implementation to diff against). Fits §2: yes.
-- **Multi-parent (ECMP) tree output** (survey 2026-09-30). Why: `isis-spf` cannot offer IP-style ECMP or node-exclusion without it; gonum's `AllShortest` and every production IS-IS SPF keep all equal-cost parents. Effort: ~2–3 days. Fits §2: yes.
-- **Transit-exclusion hook for a node (overload bit)** (survey 2026-09-30). Why: `isis-spf` SPEC §6 defers overload handling solely because the graph has no such hook. Effort: ~1 day. Fits §2: yes.
-- **Incremental SPF on edge change** (survey 2026-09-30). Why: large LSDBs recompute fully on every LSP today; holo/FRR use partial/incremental runs. Effort: ~1 week. Fits §2: yes. Priority low.
+- **802.1aq ECT-ALGORITHM selection (mask 0x00 base + the 15 variants) with a conformance vector.** Why: two SPB bridges must compute the same tree; today `comparePaths` cannot be shown to agree with a foreign bridge, and `isis` already decodes the ECT-VID tuples that name the algorithm. Effort: ~1 week including finding published vectors (the standard has worked examples; no open implementation to diff against). Fits §2: yes.
+- **Multi-parent (ECMP) tree output.** Why: `isis-spf` cannot offer IP-style ECMP or node-exclusion without it; gonum's `AllShortest` and every production IS-IS SPF keep all equal-cost parents. Effort: ~2–3 days. Fits §2: yes.
+- **Transit-exclusion hook for a node (overload bit).** Why: `isis-spf` SPEC §6 defers overload handling solely because the graph has no such hook. Effort: ~1 day. Fits §2: yes.
+- **Incremental SPF on edge change.** Why: large LSDBs recompute fully on every LSP today; holo/FRR use partial/incremental runs. Effort: ~1 week. Fits §2: yes. Priority low.
 
 ## Anchoring
 
