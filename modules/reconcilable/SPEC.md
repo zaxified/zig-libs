@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [kube-rs/kube](https://github.com/kube-rs/kube) (`kube-runtime`) | Rust | Apache-2.0 | 3.8k | 4.2.0 (2026-07-22) | Rust controller runtime tied to Kubernetes API objects; async, with its own scheduler and reconcile-trigger streams *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No generic reconcile loop or dedup work queue found (`gh search repos 'reconciler controller' --language zig`: no result). |
 
-**Where we are ahead:** the only generic (Kubernetes-free), allocation-bounded (fixed slot arena) reconciler for Zig; clockless and syscall-free by construction (builds for windows/macos/wasm32-wasi per README), so it is deterministic to test; and `RollbackTimer` (Juniper-style commit-confirmed) has no counterpart in the projects above. **Where we are behind:** one owner, one thread — no concurrent workers or thread-safe enqueue (`Concurrency: single_owner`), no global rate limit (deliberate, §4), only aggregate counters (`Stats`), no per-key time-in-queue or duration metrics (deliberate, §10), no multi-kind manager (§10).
+**Where we are ahead:** the only generic (Kubernetes-free), allocation-bounded (fixed slot arena) reconciler for Zig; clockless and syscall-free by construction (builds for windows/macos/wasm32-wasi per README), so it is deterministic to test; and `RollbackTimer` (Juniper-style commit-confirmed) has no counterpart in the projects above. **Where we are behind:** one owner, one thread — no concurrent workers or thread-safe enqueue (`Concurrency: single_owner`), no global rate limit (deliberate, §4), only aggregate counters (`Stats`), no per-key time-in-queue or duration metrics (deliberate, see *What is deliberately not done*), no multi-kind manager (*Backlog / deferred*).
 
 ## 1. What was consulted, and what was not
 
@@ -156,8 +156,7 @@ forever). `queue.zig`'s "BOUND: the timer heap never grows past capacity under
 endless rescheduling" runs 40 000 reschedules over 8 keys and asserts
 `heap_len ≤ capacity` on every iteration; with lazy deletion it would be
 asserting `40 000 ≤ 8`. The bound is proven by a test that fails if the
-mechanism is removed, not stated in a comment. (This was verified by actually
-removing it — see §9.)
+mechanism is removed, not stated in a comment.
 
 **At capacity:** `error.AtCapacity`, a counter, and a sticky
 `Stats.overflowed`. Never eviction. Evicting a desired key leaves the world
@@ -258,8 +257,8 @@ What the module has instead:
    - a brute-force **model of the queue itself**: 32 runs × 300 ops comparing
      membership, per-key state, tracked count and FIFO head against a naive
      array-and-sort implementation of the same semantics.
-2. **Bound tests that fail if the mechanism is removed** — §5, verified by
-   mutation (§9).
+2. **Bound tests that fail if the mechanism is removed** — §5 (the heap bound,
+   the per-tick snapshot), checked by hand mutation.
 3. **`RollbackTimer` characterisation** over 20 000 randomized
    arm/confirm/poll interleavings: `confirm`'s result is a pure function of
    (was armed, before the deadline), and `.expired` fires exactly once iff no
@@ -275,56 +274,6 @@ the waiting-loop boundary in the way ours is). It is a real project, not a
 test-file addition, and it would anchor scheduling order — not correctness of
 convergence, which has no oracle at all.
 
-## 9. Mutation testing
-
-**M1 — remove the bound mechanism.** The indexed-heap `reschedule`
-(decrease-key) was replaced with the lazy-deletion form: push a fresh heap node
-on every reschedule and leave stale ones to be skipped on pop. Result — 4 tests
-go red, and the first symptom is not an assertion at all:
-
-```
-BOUND: the timer heap never grows past capacity under endless rescheduling
-  → panic: index out of bounds: index 8, len 8
-PROPERTY: tracked keys never exceed capacity, and overflow is loud, not silent
-  → panic: reached unreachable code
-PROPERTY: WorkQueue matches a brute-force model of (ready set, timer map)
-  → panic: reached unreachable code
-immediate enqueue pulls a waiting key forward; earlier deadline wins
-  → heap_len 2, expected 1
-```
-
-That is a stronger result than a failed assertion: because the heap array is
-allocated at exactly `capacity`, **lazy deletion cannot even be expressed** —
-the ninth node for eight keys runs off the end of the array. The fixed-size
-allocation *is* the bound, and the tests find it on the 20th of 40 000
-iterations. (This also corrects a plausible-sounding claim: the mutation is not
-"functionally invisible except for memory growth" — the stale nodes also break
-`stateOf`/`tracked` accounting, which is what trips the model comparison.)
-
-**M2 — remove the per-tick fairness snapshot.** `tick` takes the ready count
-*before* draining, so a key re-enqueued by a pass runs in the next tick. Making
-the budget unbounded-and-live instead (`while ready_len > 0`) is caught by
-exactly one test and nothing else:
-
-```
-a self-enqueue during a pass runs in the NEXT tick, not this one  → 44/45
-```
-
-One test, one property — which is what a mutation is supposed to show.
-
-## 10. Backlog
-
-- A `Reconciler` that owns several key *kinds* (upstream's manager/controller
-  split). Today each kind is its own `Reconciler` instance with its own `Ctx`;
-  that is sufficient for both consumers and avoids type erasure. Revisit only if a
-  consumer needs cross-kind ordering.
-- Optional per-key metrics (time-in-queue, reconcile duration). Deliberately
-  absent: it would require a clock inside the module (§2). If wanted, the
-  caller can time `tick` itself.
-- `WorkQueue` is currently only reachable as a generic function; if a consumer
-  wants a scheduler that is not a reconciler, its `Finish` API may want a
-  friendlier surface.
-
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a
@@ -334,6 +283,29 @@ One test, one property — which is what a mutation is supposed to show.
 
 **What the tests actually contain.** in-process reconcile loop modeled after k8s controller-runtime, no wire
 
+## Verification
+
+- **Run:** `scripts/modtest reconcilable` (`zig build test-reconcilable`); `scripts/lib/dark-tests.sh reconcilable`
+  checks that every submodule's tests really run.
+- **Tests:** the property tests and the brute-force queue model of §8 (`src/props.zig`, `src/queue.zig`), the
+  bound and allocation-free tests of §5, the `RollbackTimer` characterisation of §7, and the example's
+  idempotence observation (`example/main.zig`).
+- **Fuzz / constant time:** n/a — no untrusted bytes are parsed (§6); no secret.
+- **Audit:** the card's `**Audit:**` line is the current score; the module has had no whole-module mutation run
+  (the bound and per-tick-snapshot tests were checked by hand mutation).
+
+## What is deliberately not done
+
+- **A global rate limit** (client-go's token bucket): the caller owns the loop and `budget_per_tick` expresses
+  throughput in its clock; a bucket would need a clock inside a module built to have none (§2, §4).
+- **Per-key metrics** (time-in-queue, reconcile duration): they would require a clock inside the module (§2); the
+  caller can time `tick` itself.
+- **Eviction at capacity**: `enqueue` is refused loudly instead (§5).
+
 ## Backlog / deferred
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- A `Reconciler` that owns several key *kinds* (upstream's manager/controller split). Today each kind is its own
+  `Reconciler` instance with its own `Ctx`; that is sufficient for both consumers and avoids type erasure.
+  Revisit only if a consumer needs cross-kind ordering.
+- `WorkQueue` is reachable only as a generic function; if a consumer wants a scheduler that is not a reconciler, its
+  `Finish` API may want a friendlier surface.
