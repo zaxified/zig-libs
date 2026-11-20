@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-18 (373/409, 36 eq) · src ffd88ca82cda1dd9
 
-*Whole-module mutation run 2026-11-14* (the 2026-10 field/comb/GLV/ecmult rewrite had changed > 20 % of the production lines): 408 mutants over field.zig, group.zig, ecmult.zig and the guards of sign.zig / ecdsa_recover.zig (394 ReleaseSafe, 14 wipe/burn mutants in a ReleaseFast stack-probe binary); 338 killed first, 34 more by 13 new tests (normalize contract, lazy-reduce carry, isZero/equivalent per limb, updateDe range, divsteps59 against the textbook rule, identity encodings, mulInto zeroing on error, IdentityElement on zero products, G recognised by exact limbs, splitToSignedHalves bounds, sign refusing r = 0 / s = 0). 36 decided without a kill: variable-time safegcd round-count/limb-shrink mutants (result-preserving; 66/69 on an exhaustive port check, not a proof), four unobservable (CT safegcd zeta margin, an `inverse` exit never reached, r = 0 needing an unknown dlog, a zero DRBG candidate), recoding equivalents (|d| <= 32 either way), redundant identity guards, wipes of buffers the burn already covers. Not mutated: comptime table builders (covered by the std/BIP340 differentials and corrupted-table controls), the no-longer-dispatched asm core, unchanged scalar.zig.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, K256_FUZZ; mul at 1/4, sign at 1/4 of it) · ct 2026-09-15 (ctgrind)
 
 **Performance:** not measured
@@ -20,7 +18,7 @@
 
 Auditor/design reference. Module purpose + API live in `README.md`; meta tags
 live in `src/root.zig`'s `pub const meta`. This file covers the design decisions,
-the constant-time contract, and the two gated Fable cores.
+the constant-time contract, and the two cores behind `gate.zig` (the amd64 field core and the GLV multiply).
 
 ## Compared with
 
@@ -28,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) (libsecp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | The yardstick: ECDSA sign/verify, key tweaking, serialization/parsing, RFC 6979, plus optional modules for recovery, ECDH, BIP340 Schnorr, ElligatorSwift (BIP324), MuSig2 (BIP327) and Silent Payments (BIP352) (its README); constant-time signing, safegcd inversion, no heap. This module is ~1.6–2.6× behind it on BIP340 keypair/verify (`zig build bench-bip340`, 2026-10-07). |
+| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) (libsecp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | The yardstick: ECDSA sign/verify, key tweaking, serialization/parsing, RFC 6979, plus optional modules for recovery, ECDH, BIP340 Schnorr, ElligatorSwift (BIP324), MuSig2 (BIP327) and Silent Payments (BIP352) (its README); constant-time signing, safegcd inversion, no heap. Against it this module runs at about 0.7–0.8× of its speed on BIP340 keypair and sign and at parity on verify (`zig build bench-bip340`; the card's Performance line is the figure of record). |
 | Zig `std.crypto.ecc.Secp256k1` + `std.crypto.sign.ecdsa` | Zig | MIT | — | Zig 0.16.0 | The Zig baseline: portable fiat-crypto field, no asm, no GLV in the constant-time path; ECDSA over secp256k1 present (`lib/std/crypto/pcurves`, `ecdsa.zig`); no Schnorr. This module is 2.3× faster on secret-scalar multiply, ~6.5× on ECDSA verify (module's own bench). |
 | [Syndica/secp256k1-zig](https://github.com/Syndica/secp256k1-zig) | Zig (C bindings) | Apache-2.0 | 1 | push 2026-05-28 | Zig bindings to libsecp256k1: the reference's speed and modules, but links the C library *(inferred from the name and description; README not read)*. |
 | [rust-bitcoin/rust-secp256k1](https://github.com/rust-bitcoin/rust-secp256k1) | Rust (C bindings) | CC0-1.0 | 431 | push 2026-08-17 (no releases via the API) | Idiomatic Rust bindings around libsecp256k1 with the full module set; links the C library. |
@@ -36,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd](https://github.com/btcsuite/btcd) `btcec` | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | The Go Bitcoin stack's secp256k1 (with a `decred/dcrd` fork below); ECDSA, Schnorr, ECDH, recovery *(inferred)*. |
 | [decred/dcrd](https://github.com/decred/dcrd) `dcrec/secp256k1` | Go | ISC | 776 | release-v2.1.6 (2026-08-18) | Pure Go with amd64 field assembly (`field64_amd64.s` in its listing), `ecdsa/` and `schnorr/` subpackages, ECDH, private/public key types. |
 
-**Where we are ahead:** among the Zig options we found (std, and bindings to libsecp256k1) the only pure-Zig secp256k1 with GLV, a `MULX/ADX` field and a fixed-base comb: 2.3–6.5× faster than `std` on sign/verify/ECDH by the module's own numbers, with zero C; the sibling modules carry the Bitcoin layers on top (`bip340` incl. batch verify and x-only keys, `musig2`, `taproot`, `frost`, `bolt8`, `bitcoinscript` with strict DER); ctgrind-measured constant-time paths; anchored on BIP340's 19 vectors, bit-for-bit against `std`, and Wycheproof ECDSA secp256k1 vectors (`src/wycheproof_*.zig`, generated by `tools/gen-k256-wycheproof.py`). **Where we are behind:** libsecp256k1's speed (~1.6–2.6× on BIP340 keypair/verify), ElligatorSwift/BIP324, Silent Payments/BIP352, context blinding, a non-amd64 fast path and the safegcd inversion (→ Backlog).
+**Where we are ahead:** among the Zig options we found (std, and bindings to libsecp256k1) the only pure-Zig secp256k1 with GLV, a limb-level field multiply and a fixed-base comb: 2.3–6.5× faster than `std` on sign/verify/ECDH by the module's own numbers, with zero C; the sibling modules carry the Bitcoin layers on top (`bip340` incl. batch verify and x-only keys, `musig2`, `taproot`, `frost`, `bolt8`, `bitcoinscript` with strict DER); ctgrind-measured constant-time paths; anchored on BIP340's 19 vectors, bit-for-bit against `std`, and Wycheproof ECDSA secp256k1 vectors (`src/wycheproof_*.zig`, generated by `tools/gen-k256-wycheproof.py`). **Where we are behind:** libsecp256k1's speed on keypair and sign (~0.7–0.8×; verify is at parity), ElligatorSwift/BIP324, Silent Payments/BIP352, context blinding, an aarch64 field asm and a safegcd inversion for the scalar field, which is std's (→ Backlog; hybrid SEC1 tags and a libsecp-speed non-goal are in *What is deliberately not done*).
 
 ## Dedup — why this module exists although std HAS secp256k1
 
@@ -48,8 +46,7 @@ justified by two facts:
    field, no asm, no GLV in the constant-time path), which is ~9–14× slower than
    libsecp256k1, and we cannot patch std. **11 modules in this repo ride k256
    today, not std** (the 8 Bitcoin/Lightning modules plus `bitcoinscript`,
-   `lninvoice`, `bip32` — verified 2026-09-10 against the root `build.zig`;
-   see backlog item 5 below, which this closes).
+   `lninvoice`, `bip32`; `rg -l '@import("k256")' modules`).
 2. **The collection's thesis.** zig-libs exists so native Zig is usable INSTEAD
    of linking a C library. A secp256k1 that is within a small factor of
    libsecp256k1 — while staying zero-C/no-libc — is exactly that thesis applied to
@@ -83,7 +80,7 @@ flag, fold OF before loop control) transfers directly to the field-fold rows.
 `x` by `(x mod 2^256) + c·(x ≫ 256)`. Each fold shrinks the excess by ~223 bits,
 so **four folds** provably reach `< 2^256` (bounds: `<2^290 → <2^257 → <2^256+c →
 <2^256`), after which one constant-time masked conditional subtract of `p`
-canonicalises. The SCAFFOLD implements this on wide (`u256`/`u512`) integers
+canonicalises. The portable path implements this on wide (`u256`/`u512`) integers
 (`field.reduceWide`) — representative of the fold structure, and the correctness
 oracle. The gated `MULX/ADX` core (`fast_core.fieldMul`/`fieldSq`) performs the
 SAME fold on explicit 64-bit limbs; **carry propagation in that fold is the
@@ -92,30 +89,32 @@ carry, and the second/third fold's top word must be handled without a
 data-dependent branch. The differential (`oracle_test.zig`) pins it bit-for-bit to
 `reduceWide`.
 
-**2026-11-13:** `Fe.invert` is the constant-time safegcd (libsecp256k1's
-`secp256k1_modinv64`, a fixed 590 divsteps); the Fermat chain below is
-`invertChain`, its test oracle. Square roots still use the chain. `Fe.mul`/`Fe.sq`
-run the limb-level Zig form of the product + reduction (`mulLimbs`/`sqLimbs`,
-inlined); the amd64 asm core is no longer dispatched (its `memory` clobber cost
-~20 % of a verify), see `field.zig` § limb-level multiply.
+`Fe.invert` is the constant-time safegcd (libsecp256k1's `secp256k1_modinv64`, a fixed 590
+divsteps); the Fermat chain is `invertChain` (255 S + 15 M), its test oracle. Square roots
+`a^((p+1)/4)` (valid because `p ≡ 3 mod 4`, BIP340's `lift_x` root) run libsecp256k1's
+run-of-ones addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed tail;
+253 S + 13 M), a fixed schedule, so constant-time in `a`; `powConst` (square-and-multiply over the
+whole exponent) is the test oracle of both chains. `Fe.mul`/`Fe.sq` run the limb-level Zig form of
+the product and reduction (`mulLimbs`/`sqLimbs`, inlined; `use_limb_mul` in `field.zig`). The
+amd64 asm core (`fast_core`, differential-tested against the portable path) is not dispatched:
+its `memory` clobber cost ~20 % of a verify.
 
-Inversion is Fermat (`a^(p−2)`) and square roots `a^((p+1)/4)` (valid because
-`p ≡ 3 mod 4`, BIP340's `lift_x` root), both through libsecp256k1's run-of-ones
-addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed tail):
-255 S + 15 M and 253 S + 13 M, a fixed schedule, so constant-time in `a`. Until
-2026-10-07 both ran a square-and-multiply over the whole exponent (~2× the work);
-`powConst` remains as their test oracle.
+For PUBLIC values only, `Fe.invertPublic` is a VARIABLE-TIME safegcd inversion (Bernstein–Yang
+divsteps, ported from libsecp256k1's `modinv64_var`), much faster than the chain. The verifiers use
+it through `Secp256k1.affineCoordinatesPublic`; nothing on a secret path may.
 
-For PUBLIC values only, `Fe.invertPublic` (2026-10-07) is a VARIABLE-TIME
-safegcd inversion (Bernstein–Yang divsteps, ported from libsecp256k1's
-`modinv64_var`): ~1.5 µs against ~7.5 µs for the chain on this host. The
-verifiers use it through `Secp256k1.affineCoordinatesPublic`; nothing on a
-secret path may.
+The amd64 core needs only TWO folds: after fold 2 the value is `< 2^256 + 2^67 < 2p`, so one
+masked "`+c`, keep if it (or fold 2) carried" step finishes — see `fast_core.zig`'s module doc.
+The portable `reduceWide` keeps the four-fold form.
 
-The amd64 core needs only TWO folds: after fold 2 the value is `< 2^256 + 2^67 <
-2p`, so one masked "`+c`, keep if it (or fold 2) carried" step finishes — see
-`fast_core.zig`'s module doc (2026-10-07; it had mirrored all four folds plus a
-separate canonicalise). The portable `reduceWide` keeps the four-fold form.
+**Weak field elements in `ecmult`.** The variable-time double-base multiply
+(`mulDoubleBasePublic` with `basePoint`, `mulMultiBasePublic`) works on weak elements (`F` in
+`ecmult.zig`): values `< 2^256` (not necessarily `< p`), where add/sub/`mulSmall` fold only the
+carry out of 2^256 and `field.mulWeak`/`sqWeak` stop after the two Solinas folds. Branch-free:
+the rare second folds are masked, not branched on. Masking costs ~4 % against branching on
+them, but the branches put ~50 ctgrind contexts into `adaptor/presign` (whose mandatory
+self-check verifies secret-derived values), so they stay masked. The doubling is libsecp256k1's
+`gej_double` (3M + 4S). The secret paths keep canonical `Fe`.
 
 ## Point representation & scalar multiplication
 
@@ -127,17 +126,15 @@ that completeness is what lets the constant-time ladder run with no special case
 The formula bodies are arithmetically identical to std's, run over k256's `Fe`, so
 the whole group is byte-exact vs std at the point level.
 
-> The Fable phase's fast path will typically move the accelerated scalarmuls to
-> **Jacobian** coordinates (cheaper mixed-add for a wNAF/precomp table) — that is
-> an implementation freedom of the gated cores. The differential compares the
-> resulting affine point, so the coordinate system inside a core is not
-> constrained, only the result.
+`ecmult.zig` works in Jacobian coordinates inside the public double-base and multi-base
+multiplies (the incomplete `a = 0` formulas, special cases as branches, legal because everything
+is public); the results are compared and returned as affine points, so the coordinate system
+inside a core is not constrained.
 
 Scalar multiply variants:
 
 - **`mul`** — CONSTANT-TIME fixed-window multiply for a secret scalar on an
-  arbitrary point (ECDH: `sphinx`, `bolt8`, `bolt3`, `frost`). Since 2026-09-16
-  (A1 F5): the scalar is recoded into 65 signed base-16 digits in `[−8, 7]`, a
+  arbitrary point (ECDH: `sphinx`, `bolt8`, `bolt3`, `frost`). The scalar is recoded into 65 signed base-16 digits in `[−8, 7]`, a
   table `(1..8)·P` is built per call (1 doubling + 6 adds), and the result is
   evaluated high window first — 4 doublings and 1 add per window instead of 1
   doubling and 1 add per bit. The recoding (`signedDigit`) and the masked
@@ -152,7 +149,7 @@ Scalar multiply variants:
 - **`mulDoubleBasePublic`** — VARIABLE-TIME `s1·P1 + s2·P2`, the verifier's
   `s·G − e·P` workhorse (BIP340 verify + ECDSA verify). When one base is
   `basePoint` (exact limbs — every verifier passes the constant) it runs
-  `ecmult.mulDoubleBaseG` (2026-10-07): libsecp256k1's `ecmult` shape — Jacobian
+  `ecmult.mulDoubleBaseG`: libsecp256k1's `ecmult` shape — Jacobian
   coordinates with the incomplete `a = 0` formulas (dbl 2M+5S, mixed add 8M+3S;
   the special cases are branches, legal because everything is public), GLV+wNAF
   on both scalars, P's odd multiples brought to one common Z so they act as
@@ -161,23 +158,29 @@ Scalar multiply variants:
   width 12 measured 0.6 % faster for 4× the table, not taken). Otherwise the RCB
   GLV combine (`glvCombine`) runs; it and the plain double-and-add are the
   oracles `ecmult.zig`'s tests pin it to (plus std).
-- **`mulMultiBasePublic`** — VARIABLE-TIME `s0·G + Σ s_i·P_i` for public data
-  (2026-10-07): the same `ecmult` core for up to 16 bases per pass, every
+- **`mulMultiBasePublic`** — VARIABLE-TIME `s0·G + Σ s_i·P_i` for public data:
+  the same `ecmult` core for up to 16 bases per pass, every
   point's table brought into one common frame `S = Π s_j` by prefix/suffix
   products (no inversion), one doubling chain, G once; longer sums are
   chunked and the partial sums added. `bip340.verifyBatch` rides it.
-
-The fast-path DESIGN the Fable phase targets: a comptime fixed-base wNAF table for
-`G` (constant-time base-point mul), and GLV for variable-base — documented here so
-the core author has the target shape.
+**`combMulBase` — the constant-time fixed-base multiply** (secret nonces and keys: BIP340 and
+ECDSA signing, key derivation). `p256`'s layout: window `w = 6` (`fb_w`), 43 windows (`fb_t`), a
+signed-digit recoding (running-carry Booth, so `Σ dᵢ·2^{w·i} = k` exactly, including the raw-scalar
+range to 2^256−1) with a masked point negation, which halves the table to `{1,…,32}·2^{6i}·G` per
+window: an AFFINE table (`CombTable`, `43 · 32 · 64 B = 88 KiB` of `.rodata`), generated at comptime
+through the portable field path (an `@inComptime()` guard in `field.zig` keeps the runtime asm core
+out of the comptime interpreter). There are no online doublings; below the top window the
+accumulator takes constant-time Jacobian mixed additions, the top window the complete RCB mixed
+addition (`addMixed`); the proof that the incomplete addition never sees `P = O` or `P = ±Q` is at
+`combMulBaseWithTable`. `mul` (variable base) keeps its own w = 4 projective per-call table (`comb_w`,
+`comb_t`, above); an affine per-call table would need a constant-time batch inversion.
 
 **Known limitation — compressed SEC1 is not a round-trip for the point at
 infinity.** `toCompressedSec1(identityElement)` encodes `03‖0^32`, and
 `fromSec1` of that same string returns `error.NotSquare` (7 is not a quadratic
 residue mod `p`, so `x = 0` has no compressed encoding). The uncompressed
 (`04‖0^32‖0^31 01`) and single-byte (`00`) encodings both round-trip correctly;
-only the compressed form breaks, and only for this one point (A1/k256.md F10,
-2026-09-10). `std.crypto.ecc.Secp256k1` has the identical gap, so this is an
+only the compressed form breaks, and only for this one point. `std.crypto.ecc.Secp256k1` has the identical gap, so this is an
 inherited property, not a regression — but the identity point is a real
 mid-computation value in the aggregation consumers (`musig2`, `taproot`,
 `bip32`), and the failure mode is fail-closed (an error, never a wrong point),
@@ -219,224 +222,115 @@ GLV to the double-base `s·G − e·P` path.
   explicitly VARIABLE-TIME and only for PUBLIC scalars (verification), matching
   std's `mulPublic`/`mulDoubleBasePublic` contract.
 - **Scalar**: inherited from std (constant-time fiat field), re-exported.
-- **Gated cores** carry the same contract: the `MULX/ADX` field fold's trip counts
-  derive only from the public limb count; the GLV core must keep the decomposition
-  and combine free of secret-dependent branches (GLV in a constant-time context is
-  the known-tricky part — sign handling of `k1`/`k2` must be masked, cf. std's
-  `mulPublic` which is vartime and side-steps it).
+- **Gated cores** carry the same contract: the `MULX/ADX` field fold's trip counts derive only from
+  the public limb count; the GLV decomposition and combine run on public scalars only.
+- **Fixed-base multiply (`combMulBase`, secret nonces):**
+  - the table gather is a masked linear scan over every entry of each window at FIXED table
+    offsets, the per-entry select mask laundered through a `blackBox` inline-asm barrier, so LLVM
+    cannot recover the equality and lower it to a secret-indexed jump table (the powMont-gather
+    leak class). Disassembly of the ReleaseFast `k·G`: zero indirect jumps, zero secret-indexed
+    loads (the only base+index operand is the window extraction `k >> shift`, whose index is the
+    PUBLIC loop counter);
+  - the signed-digit recoding is branch-free (`setcc`/`cmov`/masks, no Jcc on the scalar), and the
+    conditional point negation is a masked field-negate;
+  - `mulWithTable` and the comb end in `rejectIdentityOneBranch`: on baseline x86-64
+    (`-mcpu=x86_64`, the portable ctgrind lane) the plain `rejectIdentity` compiled to two jumps;
+    the verdict is the public identity outcome;
+  - the portable field `normalize`/`sub` selects are `blackBox`-laundered too: without the barrier
+    LLVM turned the `mask = 0 − carry` field-carry select into a data-dependent `test/jne`. For
+    `normalize` this is measured (removing its three barriers, `Fe.cMov`'s kept, puts 28 new memcheck
+    contexts into the `mul` row at the carry fold and the conditional subtract). For `Fe.sub`'s
+    single barrier there is no such measurement: removing it alone produces no new context, so it
+    stands as defence in depth. After laundering, the only branches left on the whole path are the
+    public-trip-count loop control and the final `rejectIdentity` endpoint check (it reveals only
+    "result == O", always false for a valid nonce, as in std's `basePoint.mul`).
 
-The SCAFFOLD's portable path is the correctness reference, not a hardened
-production target on its own; hardware side-channel review (esp. of the eventual
-addition-chain inverse and the GLV sign handling) is a later-phase obligation.
+### Measured, not merely asserted (ctgrind)
 
-### MEASURED, not merely asserted (ctgrind)
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by `scripts/checks/ctgrind.sh k256`, marks
+the secret `MAKE_MEM_UNDEFINED`, forces a volatile reload, and drives it through five targets:
+`field` (an element and the `cMov` select bit), `mul` (a scalar, point decoded at run time, the
+ECDH path), `comb` (a scalar), `sign` (a 32-byte secret key, `bip340Sign`) and `ecdsa` (a 32-byte
+private key, RFC 6979 `ecdsa_recover.sign`). Each target has a control (nothing tainted: 0
+contexts) and a trap (tainted but built without `-fvalgrind`: 0 contexts). Contexts are bucketed
+`in-file` (the stack names a k256 source file), `witness` (the harness's own result formatting,
+not constant-time on purpose: it proves the taint arrived) and `unattr` (neither: always a
+`--check` failure, because the driver once dropped such contexts silently). The pinned in-file
+counts (`scripts/checks/ctgrind-expected.tsv`):
 
-Every statement above used to rest on disassembly read once by hand. Since
-2026-08-13 it rests on a committed program:
-[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-`scripts/checks/ctgrind.sh k256`, which marks the secret `MAKE_MEM_UNDEFINED`, forces a
-volatile reload, and drives it through five code paths.
-
-**Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
-re-measured 2026-08-13 after the `ecdsa` target and the driver's fail-closed
-counting rule were added). Three bucket columns, not one, and they sum to
-`total` on every row:
-
-- `in-file` — contexts whose stack names a k256 source file (see
-  `scripts/checks/ctgrind.sh`'s `PATTERN` map for the exact regex per target);
-- `witness` — contexts in the harness's own result formatting, which is not
-  constant-time on purpose: it is what proves the taint arrived;
-- `unattr` — contexts matching NEITHER. **Always a `--check` failure.** Before
-  this column existed the driver silently dropped them, and that is not
-  hypothetical: see the `Fe.cMov` row of the positive-control table below.
-
-| target | what is tainted | `-fvalgrind` | tainted | total | in-file | witness | unattr | exit |
-|---|---|---|---|---|---|---|---|---|
-| `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 6 | 0 | 99 |
-| `field` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
-| `field` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `mul` | scalar, point decoded at run time | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul` via `mulInner` + burn, 2026-09-15; before `mulInner`: base point 7/1, runtime point 8/2; the ladder read 8/2)* |
-| `mul` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
-| `mul` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `comb` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 |
-| `comb` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
-| `comb` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 2 | 0 | 99 |
-| `sign` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
-| `sign` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `ecdsa` | 32-byte private key | yes | **yes** | 15 | **10** | 5 | 0 | 99 *(Zig 0.17.0, 2026-10-18: one of `signInner`'s contexts gone in the LLVM 22 build; 16/11 on 0.16 since 2026-09-16, `r = x(R) mod n`; 15/10 before, see below)* |
-| `ecdsa` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
-| `ecdsa` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-
-**The field layer is zero.** `Fe.cMov` driven by a TAINTED select bit,
-`add`/`sub`/`normalize`, the amd64 `fast_core` `mul`/`sq`, and `invert`'s
-public-exponent `powConst` together report **0** contexts in `field.zig` /
-`fast_core.zig`. That zero is readable only because the other three rows are
-non-zero: the taint demonstrably propagates through this module's arithmetic.
-
-**The 1 + 1 group contexts are `rejectIdentity`, not the multiply.** Located
-exactly (`--stacks`, 2026-09-16):
-
-- `group.zig:347` — `mulWithTable`'s trailing `try acc.rejectIdentity()`, reached
-  from `mul` → `mulInner` (`group.zig:284`/`:292`). The 256-bit ladder it replaced
-  read **2** here (`group.zig:277`, LLVM split the `z = 0` test from the
-  affine-identity test); the windowed build reads 1 or 2 on the same source
-  expression depending on inlining — measured 2026-09-15: base point 1; point
-  decoded at run time 2 before `mulInner` existed, 1 after. That is the compiler
-  placing one test at one or two addresses, not a property of the module.
-- `group.zig:399` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`, reached
-  from `combMulBase` (`group.zig:378`). Unchanged at 1 after the recoding and
-  gather were factored into the helpers `mul` shares.
-
-Both branch on "did the whole multiplication land on the neutral element", i.e.
-`s ≡ 0 (mod n)` — one bit, once, after the ladder, not per scalar bit or per
-window. It is the same validation `std.crypto.ecc.Secp256k1.mul` performs and it
-is what makes `error.IdentityElement` reachable. **The per-bit `cMov` select and
-the per-window masked table gather report nothing**, which is the claim the
-`blackBox` barriers exist to hold.
-
-**The 11 `sign` contexts** are **two at `group.zig:399`** (2026-09-16; `:346` before the recoding/gather helpers were factored out) — one per
-`combMulBase` call, inlined from `sign.zig:62` and `sign.zig:80` — plus nine
-input/output validations, all on lines that must branch by contract:
-
-- `sign.zig:58` / `:76` — `dp.isZero()` / `k0.isZero()`, the BIP340-mandated
-  "fail if d′ = 0 / k′ = 0" checks;
-- `sign.zig:64` / `:83` — `Pa.y.isOdd()` / `Ra.y.isOdd()`, branches on the
-  PUBLIC key and the PUBLIC nonce point (memcheck has no notion of "public
-  function of a secret", so tainting `sk` taints them too);
-- five contexts at std's `crypto/pcurves/common.zig:75` — `Field.fromBytes`'s
-  canonicality rejection, reached from `scalar.zig:87`/`:202`/`:208`. That is
-  std's own scalar field, which `scalar.zig` re-exports verbatim (see "Scope"
-  below); k256 adds no branch there.
-
-(An earlier revision of this paragraph said the `sign` row's two group contexts
-were "those two" from the bullets above — i.e. `mul`'s `group.zig:277` and
-`comb`'s `group.zig:346`. Measured: `bip340Sign` never calls `Secp256k1.mul`,
-so `group.zig:277` appears in the `mul` row only, and `sign`'s pair is
-`group.zig:346` twice. The count was right; the attribution was not. Line
-numbers in this note are the 2026-08-13 ones.)
-
-**The 11 `ecdsa` contexts** (lines as of 2026-09-16) — `ecdsa_recover.sign`, RFC 6979 deterministic
-ECDSA, the module's other shipped secret path (in-repo consumer: `lninvoice`'s
-BOLT#11 signer). One is `group.zig:399` again; the rest are validations, with
-one exception that is called out because it is genuinely a branch on secret
-material:
-
-- `ecdsa_recover.zig:189` (via `scalar.zig:87`) / `:190` — canonicality and
-  `isZero` on the caller's private key;
-- `ecdsa_recover.zig:118` (via `scalar.zig:87`) — canonicality of the DRBG
-  output, inside `rfc6979Nonce`;
-- **`ecdsa_recover.zig:119` — `if (!cand.isZero())`, the RFC 6979 §3.2 retry
-  test, a branch on the SECRET nonce candidate.** Retry probability ≈ 2^-127
-  (the rejected set `[n, 2^256) ∪ {0}` has size < 2^129 out of 2^256); kept
-  because there is no rejection-free variant that still yields the RFC's exact
-  nonce, and libsecp256k1's `nonce_function_rfc6979` branches on the same
-  condition. Documented at the source, not silenced;
-- `group.zig:399` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
-- `ecdsa_recover.zig:206` (via `reduceToScalar` → `fromBytes48`, `scalar.zig:202`
-  AND `:208` — **two** contexts) / `:207` — `r = x(R) mod n` and `r.isZero()`.
-  Until 2026-09-16 (A1 G7) this was `Scalar.fromBytes(x(R))` — ONE context, and
-  a check that REJECTED `x(R) ≥ n` with `error.InvalidNonce` instead of reducing,
-  which is what the extra context replaced. Both new ones are `fromBytes48`'s
-  canonicality checks on 24-byte chunks padded to 32 bytes: the value is
-  < 2^192 < n, so they cannot fire, and they run on `r`, which is published;
-- `ecdsa_recover.zig:209` — `s.isZero()`;
-- `ecdsa_recover.zig:217` — `Ra.x.toInt() >= n`, the recid bit-1 case;
-- `ecdsa_recover.zig:226` — `isLowS(s)`, the BIP-62 canonicalisation.
-
-`recoverPubkey` is deliberately unmeasured: every one of its inputs is public,
-and it ends in the variable-time `mulDoubleBasePublic`.
-
-### Secret residue on the dead stack (`ecdsa_recover.sign`)
-
-Constant time says nothing about what a returned frame leaves behind. Measured
-2026-09-16 (A1 G2, `src/stackprobe_test.zig`, ReleaseFast): after
-`ecdsa_recover.sign` returned, its callees' dead frames held the RFC 6979
-nonce **six times per signature** — `k` big-endian ×1 (the ABI copy of the
-`combMulBase(k_bytes)` argument), the std scalar field's Montgomery image of
-`k` ×3, of `k⁻¹` ×1, and of `d` ×1 — although every named local was already
-`secureZero`ed. They are copies made inside by-value callees (std's
-`Scalar.invert`/`mul`/`toBytes` take the element by value), so no source-level
-zeroing can name them, and a pointer signature on `combMulBase` would have
-removed one of six. A nonce plus its published signature is the private key.
-
-So `sign` runs the computation in a `noinline` `signInner` and then zeroes
-`sign_stack_burn` = 16 KiB at that depth. With the burn call removed the call
-tree dirties 2 608 B; with it: **0 residues in all eight representations over
-5 repeats**, negative control 0, positive control (a nonce parked in a local)
-1. The probe asserts exactly that in the ReleaseFast lane. It SKIPS in Debug
-and ReleaseSafe, where `undefined` is filled and the scan cannot see a dead
-frame — measured: at ReleaseSafe its positive control read 0. The burn adds no
-branch: the `ecdsa` ctgrind row read 15/10/5/0 before and after, same source
-lines shifted by the inserted text. `sign.bip340Sign` got the same shape on
-2026-10-08 (review R3): unconverted, it left `d` once and the nonce up to twice per
-signature; with the burn, 0 in twelve representations over 5 repeats, both
-even-y arms; ctgrind `sign` 11 in-file before and after.
-
-**`Secp256k1.combMulBase` (review 2026-10-08).** The claim below that the comb
-multiply left nothing ("`combMulBase` after F5: 0") no longer held: measured with
-the new probe "combMulBase" (ReleaseFast), the little-endian image of the SECRET
-scalar **once per call** (5 of 5), the call tree dirtying 1.3 KiB. Every key
-derivation in the family runs it on a secret (bip32's `pubkeyFromPriv`, taproot
-tweaks, frost/dkg shares). Same shape as `mul`: `noinline` `combMulBaseInner`,
-then `comb_stack_burn` = 8 KiB zeroed at that depth; probe 5 → 0 over 5 calls in
-three representations (BE, LE, `Scalar` image), negative control 0, positive 1.
-**Burn speed (2026-10-08).** Every burn in this module (and in the family built on it) is
-volatile 32-byte vector stores, not `secureZero`: without libc the volatile byte memset behind
-`secureZero` runs at ~3 B/ns (2.5 µs per 8 KiB), vector stores at ~100 B/ns. Measured on the
-switch (ReleaseFast, ns per call, min of 9 × 3000): `ecdsa_recover.sign` 77 029 → 72 692,
-`sign.bip340Sign` 66 218 → 60 289, `mul` 80 968 → 75 492, `combMulBase` 21 229 → 20 707
-(that one was already on `u64` stores). Probes unchanged at 0.
-`combMulBaseWithTable` (the test seam) does not burn.
-
-**`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-15).** The windowed
-multiply (F5) left the u256 image of the SECRET scalar on the dead stack **twice
-per call** at ReleaseFast (the ladder before it: once; `combMulBase` after F5:
-0). Declaring `k` a `var` and `secureZero`ing it changed nothing — the copies are
-the compiler's temporaries of the recoding's wide shifts. So `mul` got the G2
-shape: `noinline` `mulInner`, then `mul_stack_burn` = 16 KiB zeroed at that
-depth. Probe "A1 R1" (point decoded at run time, the result returned unencoded so
-nothing overwrites the dead frames): **10 → 0** over 5 calls, negative control 0,
-positive control 1; wire mutant (burn call removed) **10**, with the call tree
-dirtying 2 744 B. ⚠ With the result encoded right after `mul` (a field
-inversion) the probe read 0 even without the burn — which copies survive
-depends on what the caller runs next, so the region burn, not the layout, is
-the fix. ReleaseSmall read 0 before and after. Cost, interleaved A/B in one
-process against the tree without the burn (ReleaseFast, 9 rounds × 1000 calls):
-127.5 vs 124.2 µs median, per-round ratio 1.025 [0.925 .. 1.058], inside the
-spread. The `mul` ctgrind row is unchanged by the burn (7/1/6/0).
-
-**The `mul` ctgrind target multiplies a point decoded at run time (A1 R2, same
-re-audit).** Until 2026-09-15 it used `Secp256k1.basePoint`; `mul` builds its
-table per call from `p`, so a comptime-known point is a different binary from
-the ECDH path it stands for. Measured on the pre-`mulInner` tree: base point
-7/1, runtime point **8/2** (the extra context is `rejectIdentity` split in two,
-not the loop), and the secret-digit branch of the F5 positive control on the
-runtime point **9/3**, new context at the injected line.
-
-**The harnesses were shown to have teeth** (positive controls, each reverted and
-`cmp`-verified byte-identical afterwards):
-
-| injected defect | effect |
+| target | in-file contexts |
 |---|---|
-| `blackBox` removed from `Fe.cMov` | `--check` **FAILS**. On the `field` row the leak appears as **1 unattributed** `Conditional jump` context (total 6 → 5, in-file still 0), stack `reloadVolatile (ctgrind_harness.zig:0)` ← `main` — memcheck attributes the inlined select to the harness file, so no k256 pattern matches it. `mul` 8/2 → 1/1, `comb` 7/1 → 8/2, `sign` 13/11 → 17/15. **Until 2026-08-13 the field row read 0/0 and the driver dropped that context silently**; that is why `unattr` exists (`scripts/checks/ctgrind.sh`, "the SECOND trap"). |
-| `blackBox` removed from `normalize`'s three masks AND `Fe.sub`'s, `Fe.cMov`'s kept | `mul` 8/2 → **35/29**: 28 NEW contexts, all at `normalize (field.zig:83)` and `normalize (field.zig:91)` — the carry fold and the conditional subtract, branching on the secret. `normalize`'s barriers are load-bearing and this is the measurement that shows it. (Removing ALL barriers *including* `Fe.cMov`'s does NOT show this: the `cMov` leak resolves the taint first and these contexts never appear, which is the same "total can go down" effect noted below. A whole-file barrier kill is the WRONG control for a per-site question.) |
-| `blackBox` removed from `Fe.sub`'s mask ALONE | `mul` 8/2 → 7/1 and **no new context at `field.zig:229`/`:230`** — the count moved DOWN. `Fe.sub`'s barrier has **no demonstrated teeth** under this harness. It is kept as defence-in-depth against a compiler that would lower the masked add-back to a branch, not because one currently does; nothing here proves it is preventing anything. |
-| `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` *(the 256-bit ladder, 2026-08-13; now `mulLadder`, which no target drives)* |
-| windowed `mul`: `if (mags[i] > 4) acc = acc.add(acc.neg()).add(acc)` inserted after each window's add — a branch on a secret digit that leaves the point unchanged, so every value test stays green | `mul` 7/1 → **8/2**, the new context `Conditional jump … uninitialised value(s)` **at the injected line** (`group.zig:327`), `rejectIdentity` moved to `:329`; all other rows unchanged (2026-09-16, A1 F5) |
-| masked comb gather → `g = tab[i][m-1]` | `comb` 1 → 4 contexts, including memcheck's "Use of uninitialised value of size 8" on the *address* — the b199192 secret-indexed-load signature |
-| branch on a byte of the secret scalar `d` in `bip340Sign` | `sign` 11 → 12, new context at the injected line |
-| `rfc6979Nonce` → constant `0x42`×32 | `zig build test-k256` **exit 1**, one failure: the BOLT#11 nonce anchor in `ecdsa_recover.zig`. Before that test existed (2026-08-13) the same mutation left all 34 tests green at **exit 0**, with the only red in the repository being the CONSUMER `lninvoice`. |
+| `field` | 0 |
+| `mul` | 1 |
+| `comb` | 1 |
+| `sign` | 11 |
+| `ecdsa` | 10 |
 
-Note for anyone re-running these: an injected leak can make the TOTAL go **down**
-(memcheck resolves the branch and the taint stops propagating downstream), so
-"the number went up" is the wrong pass criterion. The criterion is "a new context
-appeared at the mutated location".
+**The field layer is zero.** `Fe.cMov` driven by a TAINTED select bit, `add`/`sub`/`normalize`, the
+amd64 `fast_core` `mul`/`sq`, and `invert`'s public-exponent chain report 0 contexts in
+`field.zig` / `fast_core.zig`. That zero is readable only because the other rows are non-zero: the
+taint demonstrably propagates through this module's arithmetic.
 
-**What is deliberately NOT measured**: `mulPublic` / `mulPublicGlv` /
-`mulDoubleBasePublic` and everything under them are documented VARIABLE-TIME for
-PUBLIC scalars. Tainting a scalar into them would light up memcheck by design and
-would measure nothing about a claim.
+**The group contexts are `rejectIdentity`, not the multiply.** The one context of `mul` is
+`mulWithTable`'s trailing identity check, of `comb` the comb's (`combMulBaseWithTable`). Each
+branches on "did the whole multiplication land on the neutral element", i.e. `s ≡ 0 (mod n)`: one
+bit, once, after the multiply, not per scalar bit or per window. It is the same validation
+`std.crypto.ecc.Secp256k1.mul` performs and what makes `error.IdentityElement` reachable. The
+per-bit `cMov` select and the per-window masked gather report nothing, which is the claim the
+`blackBox` barriers exist to hold. (Whether the compiler places that one test at one or two
+addresses varies with inlining and with the target CPU, hence `rejectIdentityOneBranch`.)
+
+**The `sign` contexts** are the comb's identity check once per `combMulBase` call (two), plus
+input/output validations that must branch by contract: `dp.isZero()` / `k0.isZero()` (BIP340's
+"fail if d′ = 0 / k′ = 0"); `Pa.y.isOdd()` / `Ra.y.isOdd()`, branches on the PUBLIC key and the
+PUBLIC nonce point (memcheck has no notion of "public function of a secret", so tainting `sk`
+taints them too); and five contexts in std's `crypto/pcurves/common.zig` `Field.fromBytes`
+canonicality rejection, reached from `scalar.zig` (std's own scalar field, which `scalar.zig`
+re-exports verbatim; k256 adds no branch there).
+
+**The `ecdsa` contexts** (`ecdsa_recover.sign`, RFC 6979 deterministic ECDSA, the module's other
+shipped secret path) are the comb's identity check and validations of the private key, the DRBG
+output, `r`, `s` and the recovery-id/low-S canonicalisation — with one genuine branch on secret
+material: **`if (!cand.isZero())`, the RFC 6979 §3.2 retry test on the SECRET nonce candidate.**
+Retry probability ≈ 2^-127 (the rejected set `[n, 2^256) ∪ {0}` has size < 2^129 out of 2^256); kept
+because there is no rejection-free variant that still yields the RFC's exact nonce, and
+libsecp256k1's `nonce_function_rfc6979` branches on the same condition. Documented at the source,
+not silenced. `r = x(R) mod n` reduces through `fromBytes48`, whose canonicality checks run on a
+published value and cannot fire. Re-attribute exact lines with `scripts/checks/ctgrind.sh k256
+--stacks` after a source change.
+
+`recoverPubkey` is deliberately unmeasured: every one of its inputs is public, and it ends in the
+variable-time `mulDoubleBasePublic`. Likewise `mulPublic` / `mulPublicGlv` / `mulDoubleBasePublic`
+and everything under them are documented VARIABLE-TIME for PUBLIC scalars; tainting a scalar into
+them would light up memcheck by design and measure nothing about a claim.
+
+Note for anyone re-running a positive control: an injected leak can make the TOTAL go **down**
+(memcheck resolves the branch and the taint stops propagating downstream), so "the number went up"
+is the wrong pass criterion; the criterion is "a new context appeared at the mutated location".
+
+## Secret residue on the dead stack
+
+Constant time says nothing about what a returned frame leaves behind: copies made inside by-value
+callees (std's `Scalar.invert`/`mul`/`toBytes` take the element by value) and the compiler's
+temporaries of wide shifts live in dead stack memory that no source-level `secureZero` can name.
+A nonce plus its published signature is the private key. So every public entry point that touches
+a secret runs its body one frame down (`noinline`) and then zeroes, at that depth, a region deeper
+than the body was measured to reach:
+
+| entry point | inner | region zeroed |
+|---|---|---|
+| `ecdsa_recover.sign` | `signInner` | `sign_stack_burn` = 16 KiB |
+| `sign.bip340Sign` | `burnBip340Stack` after the body | `bip340_stack_burn` = 16 KiB |
+| `Secp256k1.mul` (ECDH path) | `mulInner` | `mul_stack_burn` = 16 KiB |
+| `Secp256k1.combMulBase` | `combMulBaseInner` | `comb_stack_burn` = 8 KiB |
+
+`combMulBaseWithTable` (the test seam) does not burn. Every burn is volatile 32-byte vector stores,
+not `secureZero`: without libc the volatile byte memset behind `secureZero` is ~30× slower. Which
+copies survive depends on what the caller runs next, so the region burn, not the layout, is the
+fix. The burns add no branch (the ctgrind rows are unchanged by them). The stack probe
+(`src/stackprobe_test.zig`, ReleaseFast) asserts 0 residues of the secret in its big-endian,
+little-endian and in-memory representations for each entry point; it skips in Debug and
+ReleaseSafe, where `undefined` is filled and the scan cannot see a dead frame.
 
 ## Scope — the scalar field is intentionally std's
 
@@ -448,292 +342,101 @@ payoff, so `scalar.zig` re-exports std's constant-time scalar field verbatim. Th
 keeps the module's complexity budget where the cost is, and keeps the scaffold
 bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
 
+## Limits and residual risks
+
+- Compressed SEC1 is not a round-trip for the point at infinity (see *Point representation*);
+  fail-closed. A caller that must serialise a possible infinity uses the uncompressed or
+  single-byte form.
+- `oddMultiplesGlobalZ` (the table behind the public multiplies) panics when a table hits
+  `a = ±2a`, impossible on secp256k1 (prime order) but reachable by a hand-built `Secp256k1{…}` that
+  is off the curve. Every decoder (`fromSec1`, `fromAffineCoordinates`, `recoverY`) checks the
+  curve, so only a caller bypassing them gets there; the RCB path gives a wrong point there instead.
+- No constant-time claim for `mulPublic`, `mulPublicGlv`, `mulDoubleBasePublic`,
+  `mulMultiBasePublic`, `Fe.invertPublic`, `recoverPubkey` and the verifiers: public inputs only.
+- RFC 6979 retry on the secret candidate (see *Measured*): ≈ 2^-127.
+- `scalar.zig` is std's scalar field: its constant-time behaviour is std's.
+- The amd64 asm core exists and is tested but is not dispatched (`use_limb_mul`).
+
 ## Verification
 
-### Mutation run 2026-10-08
+Run with `zig build test-k256` (Debug and ReleaseFast) or `scripts/modtest k256`; `K256_BENCH=1`
+adds the opt-in ns/op micro-benchmark (`src/bench.zig`).
 
-48 mutants as schemata (one ReleaseSafe and one ReleaseFast binary, a runtime switch per
-mutant), aimed at the code the 2026-10-07/08 speed work wrote and at the dead-stack burns:
-`Fe.add`/`mulSmall`, the `invert`/`sqrt` chains, safegcd (divsteps, `update_de`/`update_fg`,
-limb shrinking, `normalize62`), the amd64 asm (row-1 carry, fold-1 OF carry, CF2 in the
-finish), `ecmult` (both doubling multiples, the `h = 0` cases, frame scales, the global-Z walk,
-Straus prefix/suffix, wNAF sign, scalar reduction, `topDigit`, negated entries, φ), the
-homogeneous ↔ Jacobian maps, `mulMultiBasePublic`'s chunking and identity check, the G-second
-dispatch, `affineCoordinatesPublic`, three verifier checks and the three burns (`mul`,
-`ecdsa_recover.sign`, `bip340Sign`; probes in ReleaseFast). **48/48 killed**, 0 equivalent,
-after four tests the run asked for: `Fe.add`'s two carries and `mulSmall`'s fold carry (sums
-in [p, 2^256) and folds past 2^256 — random draws reach them with probability ~2^-220), G as
-the SECOND base of `mulDoubleBasePublic` (scalars could be swapped), and
-`affineCoordinatesPublic` on an identity `(0 : Y : 0)` with `Y ∉ {0, 1}`. Three safegcd
-mutants are HANG verdicts (the loop no longer terminates), killed by the 120 s cap.
+- **Field/group/scalar differentials** (`field.zig` / `group.zig` / `scalar.zig`): `k256.op ==
+  std.op` byte-exact via `toBytes` on thousands of random inputs — mul/sq/add/sub/neg/invert/sqrt,
+  dbl/add/scalarmul/double-base, recoverY, the GLV split, the β-endomorphism. This std
+  differential is the anti-self-consistency anchor: std is a correct secp256k1 on the same curve.
+  The core-vs-portable differentials (`oracle_test.zig`) pin the amd64 field core and the GLV
+  multiply to the portable path; `mul` is pinned to `mulLadder` and std over edge scalars (every
+  window at 8 / 7 / 15, `2^252±`, `2^255±`, `n−1`…`n+2`, `(n−1)/2`, `λ`, `2^256−1`) × points
+  (base, identity, random projective, its negation, an un-normalised sum, the same with `z = 1`),
+  affine bytes AND error agreement, plus a randomized pass and the consumers' BOLT#4 / #8 / #3
+  vectors through the new `mul`. The ecmult paths are pinned to `glvCombine`, the plain
+  double-and-add and std (`ecmult.zig` tests).
+- **BIP340 official vectors** (`kat_vectors.zig` / `kat_test.zig`): the 8 secret-key rows sign
+  byte-exact to the published signature; all 19 rows verify to the published TRUE/FALSE (catching
+  R.y-parity, r/s-range, non-canonical-point). The end-to-end anchor across an independent
+  implementation.
+- **Wycheproof ECDSA secp256k1/SHA-256** (`src/wycheproof_*.zig`, generated by
+  `tools/gen-k256-wycheproof.py`): every P1363 vector and every low-S/Bitcoin vector gets the
+  verdict upstream says.
+- **ECDSA differential** (`oracle_test.zig`): `sign.ecdsaVerify` accepts every signature from
+  `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` and rejects tampered ones; the `(r, n − s)` twin of
+  every std signature is accepted by `ecdsaVerify` and refused by `ecdsaVerifyLowS` (exactly one of
+  the pair passes).
+- **Recoverable ECDSA** (`ecdsa_recover.zig`): RFC 6979 deterministic `sign` + `recoverPubkey`
+  round-trip to the signer's own pubkey over random keys/messages, cross-checked against
+  `sign.ecdsaVerify`; a bit-flipped signature recovers a DIFFERENT (or non-recoverable) key; the
+  low-S boundary.
+- **The deterministic nonce's anchor** (`ecdsa_recover.zig`): BOLT#11's first worked example — the
+  specification's own private key, its signing-preimage SHA-256 and the `(r, s, recid)` carried by
+  the invoice string — must be reproduced byte-exact, and the key must produce the node ID the spec
+  prints. Every other test here is self-consistent under any nonce, so this is what holds
+  `rfc6979Nonce` to RFC 6979. It is a BOLT#11 artifact, not an RFC 6979 one: RFC 6979 Appendix A.2
+  publishes vectors for DSA and the NIST curves only.
+- **Recovery-id bit 1, `R.x ≥ n`**: no signer reaches it (probability ~2^-128), so the vectors are
+  built: for an on-curve `R` with `x = n + t`, `Q = r⁻¹·(s·R − e·G)` with `r = x − n` makes `(r, s)`
+  a valid signature under `Q`; std computes `Q` and std's verifier accepts the signature before
+  k256 is consulted. `recoverPubkey` must return exactly `Q` with bit 1 set (both parities), not
+  with it clear, and must refuse `r = p − n`. On the signing side a comptime commitment parameter of
+  `signInner` hands the real signing code such an `R`: `recid` bit 1 set, `r = x − n`, recovery
+  lands on std's point.
+- **Positive controls**: a Solinas fold with `c = 2^32 + 976` (off by one) disagrees with std on
+  most random inputs (the reduction constant is load-bearing and the equality checks have teeth);
+  `mulWithTable` with one table entry replaced by the identity disagrees with std; the ctgrind
+  harness is shown to have teeth by injected defects (see *Measured*).
+- **Dead-stack probe** (`src/stackprobe_test.zig`, ReleaseFast): see *Secret residue on the dead
+  stack*; the probes for `mul`, `combMulBase`, `ecdsa_recover.sign` and `bip340Sign`, with negative
+  and positive controls in the same binary.
+- **Fuzz** (`src/fuzz_test.zig`): four harnesses — `sec1`, `fe`, `mul` and `sign` — run by the
+  deterministic driver, `K256_FUZZ=<runs>[,<first seed>] scripts/modtest k256` (`mul` and `sign` at 1/4
+  of the budget); the verdict comes from the driver's summary, never from `zig build --fuzz`.
+- **ctgrind**: `scripts/checks/ctgrind.sh k256` (rows above; pinned in
+  `scripts/checks/ctgrind-expected.tsv`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
-- **Field/group/scalar differentials** (`field.zig`/`group.zig`/`scalar.zig`):
-  `k256.op == std.op` byte-exact via `toBytes` on thousands of random inputs —
-  mul/sq/add/sub/neg/invert/sqrt, dbl/add/scalarmul/double-base, recoverY, the GLV
-  split, the β-endomorphism. This std differential is the anti-self-consistency
-  anchor: std is a correct secp256k1 on the same curve, a far stronger oracle than
-  self-consistency.
-- **BIP340 official vectors** (`kat_vectors.zig`/`kat_test.zig`): the 8 secret-key
-  rows sign byte-exact to the published signature; all 19 rows verify to the
-  published TRUE/FALSE (catching R.y-parity, r/s-range, non-canonical-point). This
-  is the end-to-end anchor across an entirely independent implementation.
-- **ECDSA differential** (`oracle_test.zig`): `sign.ecdsaVerify` accepts every
-  signature from `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` and rejects tampered
-  ones.
-- **Recoverable ECDSA** (`ecdsa_recover.zig`'s own tests): RFC 6979 deterministic
-  `sign` + `recoverPubkey` round-trip to the signer's own pubkey over random
-  keys/messages, cross-checked against `sign.ecdsaVerify`; a bit-flipped signature
-  recovers a DIFFERENT (or non-recoverable) key; the low-S boundary. Moved in from
-  `lninvoice` (the original, and for a while only, consumer) — general secp256k1
-  machinery, not anything BOLT#11-specific.
-- **The deterministic nonce's own anchor** (`ecdsa_recover.zig`, added
-  2026-08-13): BOLT#11's first worked example — the specification's own private
-  key, its own signing-preimage SHA-256, and the `(r, s, recid)` carried by the
-  `lnbc1pvjluez…` string it prints — must be reproduced byte-exact, and the same
-  private key must produce the node ID the spec prints. Note what this fixes:
-  every OTHER test here is self-consistent under any nonce, so replacing
-  `rfc6979Nonce` with a constant left all 34 tests green (exit 0) and reddened
-  only the CONSUMER `lninvoice`. It now reddens this module. **This is a BOLT#11
-  artifact, not an RFC 6979 one** — RFC 6979 Appendix A.2 publishes vectors for
-  DSA and the NIST curves only (A.2.5, P-256, is what `p256` transcribes); it
-  has no secp256k1 section.
-- **Recovery-id bit 1, `R.x ≥ n`** (`ecdsa_recover.zig`, A1 G7, 2026-09-16): no
-  signer reaches it (probability ~2^-128), so the vectors are built instead of
-  searched for. For an on-curve `R` with `x = n + t`, `Q = r⁻¹·(s·R − e·G)` with
-  `r = x − n` makes `(r, s)` a valid signature under `Q`; std computes `Q` and
-  std's ECDSA verifier accepts the signature before k256 is consulted.
-  `recoverPubkey` must return exactly `Q` with bit 1 set (both parities), must
-  not with it clear, and must refuse `r = p − n`. On the signing side a comptime
-  commitment parameter of `signInner` lets the test hand the real signing code
-  such an `R`: `recid` bit 1 must be set, `r = x − n`, and recovery must land on
-  std's point for that parity. That test found `sign` rejecting `x(R) ≥ n` with
-  `error.InvalidNonce` instead of reducing it — fixed to `r = x(R) mod n`.
-- **Broken positive control** (`kat_test.zig`): a Solinas fold with `c = 2^32 +
-  976` (off by one) disagrees with std on >400/500 random inputs — proving the
-  reduction constant is load-bearing and the equality checks have teeth.
-- **Gated differentials** (`oracle_test.zig`): SKIP until each gate flips, then
-  pin the core bit-for-bit to the portable path.
+## Performance
 
-### Mutation run 2026-10-05
+The benches are `src/bench.zig` (opt-in, `K256_BENCH=1`) and the `bip340` module's `bench-bip340`,
+which compares BIP340 keypair, sign and verify against libsecp256k1. The card's Performance line is
+the figure of record. Verify rides the field multiply, the GLV double-base multiply with the affine
+G table at wNAF width `g_window = 10` (width 12 measured within noise, not taken), weak field
+elements and the integer GLV split (`ecmult.splitToSignedHalves`/`splitInteger`: both halves over
+the integers from the lattice basis) with zero-run wNAF; sign rides the fixed-base comb
+(`combMulBase`).
 
-Mutant schemata over a copy of `src/` (one ReleaseSafe build of the whole test binary, 50 tests,
-`setsid -w timeout -s KILL 20` per mutant; the four stack-wipe mutants also against a ReleaseFast
-build filtered to `STACKPROBE`, where those probes run): **62 mutants, 47 killed, 15 equivalent
-or unobservable**. Points: BIP340 sign (key/nonce zero checks, both even-y normalisations, `t`,
-the nonce and challenge hash inputs) and verify (`lift_x` parity, `r < p`, `s < n`, even `y(R)`,
-challenge), ECDSA verify (`r, s ≠ 0`, `x(R) mod n`, low-S, the hash), `isLowS`'s boundary, RFC 6979
-(both DRBG separators, the candidate check), `sign`'s key/`r`/`s` checks, recid bits 0 and 1,
-low-S with its recid flip, `recoverPubkey`'s range checks, parity and `−e`, both stack burns and
-both named wipes, `rejectIdentity`, the on-curve check, every `fromSec1` length/tag/parity rule,
-`toCompressedSec1`'s tag, the identity checks of every multiply, the GLV reduction, the signed-
-digit recoding and its sign, `Fe.fromBytes`/`rejectNonCanonical`/`sqrt`/`normalize`/`isOdd`, and
-the GLV split's rounding.
+## What is deliberately not done
 
-First pass: 24 survivors. **No defect in the code; 7 were test gaps**, closed by 5 tests:
-
-- `ecdsaVerify` with the one-octet `00` public key (the point at infinity) must reject a pair
-  that solves the key-free equation (`r = x(k·G)`, `s = e·k⁻¹`) — with the GLV double-base
-  path's identity-input check removed, that forgery VERIFIED and every test stayed green
-  (`sign.zig`). Plus the group-level pin: `mulDoubleBasePublic` refuses an identity base in
-  either position, like its double-add fallback (`group.zig`).
-- `fromSec1` refuses `00` with trailing bytes, `04` with a 65th coordinate byte, and the X9.62
-  hybrid tags `06`/`07` (libsecp256k1 accepts hybrid; this module's grammar and std, its
-  oracle, do not) — `<` length checks and a hybrid arm survived (`group.zig`).
-- `sign` refuses the private keys 0, `n`, `n + 1` and `2^256 − 1`: without the zero check it
-  signed under the point at infinity (`ecdsa_recover.zig`).
-- `recoverPubkey` with recid bit 1 and `r + n ≥ p`: `r = n − 1` gives `2n − 1 > 2^256`, which
-  without the check panics on `@intCast` in safe modes and truncates in ReleaseFast.
-
-Equivalent or unobservable (15), each reasoned:
-
-- Unreachable branches (probability ≤ 2^-127, or excluded by an earlier check): `bip340Sign`'s
-  `d' = 0` (`combMulBase(0)` already returns the same error) and `k' = 0`, RFC 6979's
-  `cand ≠ 0` and retry separator, `sign`'s `r = 0` and `s = 0`.
-- `bip340Verify`'s `r < p`: `x(R)` is always `< p`, so `r ≥ p` can never equal it.
-- `bip340Verify`'s `s < n` replaced by `s mod n`: accepting `s + n` needs a valid signature with
-  `s < 2^256 − n` (~2^-127 per signature), which cannot be constructed without breaking the
-  challenge hash. Kept, as in BIP340.
-- `ecdsaVerify`'s `r, s ≠ 0`: `s = 0` zeroes both coefficients (identity → reject); `r = 0`
-  needs `x(u1·G) = n`, a discrete logarithm.
-- `rejectIdentity`'s affine `(0, ·)` case: 7 is not a square mod `p` (checked), so no point has
-  `x = 0`; it only mirrors std.
-- `mulPublicGlv`'s identity-input check: an identity base makes every table entry and the
-  result the identity, which `glvCombine` rejects anyway.
-- `signedDigit` with `x > half`: digit 8 is still in the table (`mag ≤ 2^(w−1)`), a different
-  but exact recoding.
-- `normalize`'s second fold: both callers feed `s0 + carry·c < 2^256` (`add`: sum `< 2p`;
-  `reduceWide`: carry 0), so it never fires.
-- The named wipes of the RFC 6979 DRBG state and of `mul`'s digit arrays: the 16 KiB burns in
-  `sign`/`mul` clear the same region (both burns themselves are killed by the probes). Kept as
-  defence in depth.
-
-## Performance status — VERIFY and SIGN both optimized
-
-All three accelerators are in and **both signature paths are optimized**.
-
-**Verify** rides the `MULX/ADX` field multiply + the GLV double-base multiply:
-ECDSA/BIP340 verify at **~2–3.5× libsecp256k1** (this host: field mul ~2.9×,
-ECDSA verify ~2.5× libsecp / ~6.5× std).
-
-**Sign** now rides the **fixed-base comb table** (`group.combMulBase`, backlog
-#3): a precomputed table of `G`-multiples turns each secret `k·G` into a
-constant-time table-gathered sum with NO online doublings. The base-point
-multiply drops from **~208 µs → ~33 µs (~6.2×)** and BIP340/ECDSA sign from
-**~395 µs → ~93 µs (~4.3×)** this host — i.e. from ~10× to **~2.3× libsecp256k1**
-(vs the ~40 µs reference), inside the module's ~2–4× target. Sign stays byte-exact
-to the 8 official BIP340 sign vectors, now through the comb path.
-
-### The comb (constant-time k·G) and its side-channel contract
-
-**2026-11-13: the comb is now w = 6 with an affine table** (`43 · 32 · 64 B =
-88 KiB`) and constant-time Jacobian mixed additions below the top window, the
-complete RCB mixed addition (`addMixed`) on it — `p256`'s layout; the proof that
-the incomplete addition never sees `P = O` or `P = ±Q` is at
-`combMulBaseWithTable`. The w = 4 description below is the previous layout,
-which `mul` (variable base) still uses for its per-call table.
-
-Window `w = 4`, `comb_t = 65` signed digits (a running-carry Booth recoding, so
-`Σ dᵢ·2^{w·i} = k` exactly, incl. the raw-scalar range to 2^256−1). Each window
-owns a table of `{1,…,2^{w−1}}·2^{w·i}·G`; the sign of a digit is a masked point
-negation, halving the table. The table is **comptime-generated** via the portable
-field path (an `@inComptime()` guard in `field.zig` keeps the runtime asm core out
-of the comptime interpreter) and stored **projective** (no comptime inversions).
-Memory: `65·8·(3×32 B) = 48.75 KiB` of `.rodata`.
-
-Constant-time contract (secret nonce — verified by disassembly of the ReleaseFast
-`k·G`):
-- **Table gather is a masked linear scan** over every entry of each window, at
-  FIXED table offsets, with the per-entry select mask laundered through a
-  `blackBox` inline-asm barrier — so LLVM cannot recover the equality and lower it
-  to a secret-indexed jump table (the powMont-gather leak class, montint
-  `b199192`). Disasm confirms: zero indirect jumps, zero secret-indexed loads
-  (the only base+index operand is the window extraction `k >> shift`, whose index
-  is the PUBLIC loop counter).
-- **The signed-digit recoding is branch-free** (`setcc`/`cmov`/masks, no Jcc on
-  the scalar), and the conditional point negation is a masked field-negate.
-- **`mulWithTable` ends in `rejectIdentityOneBranch`** (2026-11-18): on baseline x86-64 (`-mcpu=x86_64`, the portable ctgrind lane) the plain `rejectIdentity` compiled to two jumps (`mul` 2 in-file instead of 1), as the comb's had on 2026-11-13. The verdict is the public identity outcome; native counts are unchanged.
-- **The portable field `normalize`/`sub` selects are `blackBox`-laundered** too:
-  without the barrier LLVM turned the `mask = 0 − carry` field-carry select into a
-  data-dependent `test/jne` — a secret-dependent branch on the secret-scalar path.
-  For `normalize` this is now measured, not just disassembled: removing its three
-  barriers (and leaving `Fe.cMov`'s in place) puts **28 new memcheck contexts** at
-  `field.zig:83`/`:91` in the `mul` row. For **`Fe.sub`'s single barrier there is
-  no such measurement**: removing it alone produces no new context anywhere, so it
-  stands as defence-in-depth, not as a barrier shown to be holding a branch back
-  today. After laundering, the only branches left on the whole path are the
-  public-trip-count loop control and the standard final `rejectIdentity` endpoint
-  check (reveals only "result == O", always false for a valid nonce, as in std's
-  `basePoint.mul`).
-
-## Backlog (the Fable phase + beyond)
-
-- **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07/08
-  speed work). One HIGH finding, fixed:
-  - **R3 (HIGH, fixed 2026-10-08)**: `sign.bip340Sign` left `d` and the nonce `k'`/`n − k'` on
-    the dead stack (see "Secret residue on the dead stack"). Known since A1 as "not covered by
-    this claim", never measured; the README and the example present it as the Schnorr API.
-  - Checked clean: `safegcd` limb by limb against libsecp256k1's `modinv64_impl.h`
-    (`divsteps_62_var`, `update_de_62`, `update_fg_62_var`, `normalize_62`, the `modinv64_var`
-    loop, `modulus_inv62`); the `invert`/`sqrt` addition chains (libsecp's, and tested against
-    `powConst`); `Fe.add`'s two-chain select and `mulSmall`'s single fold; the amd64 asm
-    product rows and the Solinas finish (fold-1 excess < 2^34, CF2 and `T`'s carry disjoint,
-    `W < 2^256 + 2^67 < 2p`); `ecmult` — dbl-2009-l, the mixed addition and its `h = 0` cases,
-    the global-Z table (z-ratios walked back), the frame algebra of `addGeScaled` and the
-    Straus prefix/suffix scales, wNAF bounds (no u256 overflow below `n + 2^w`, indices inside
-    the tables), the homogeneous ↔ Jacobian maps; `mulMultiBasePublic`'s chunking.
-  - Note, not a defect: `oddMultiplesGlobalZ` panics when a table hits `a = ±2a`, impossible on
-    secp256k1 (prime order) but reachable by a hand-built `Secp256k1{…}` that is off the curve
-    — every decoder (`fromSec1`, `fromAffineCoordinates`, `recoverY`) checks the curve, so only
-    a caller bypassing them gets there. The RCB path gives a wrong point there instead.
-- **Speed toward libsecp256k1, 2026-11-13** (`bip340` bench vs libsecp256k1 v0.8.0): keypair 0.69–0.72×, sign 0.78–0.79× (no self-verify on either side), verify 0.99–1.01× — after CT safegcd inversion, the w = 6 affine comb, the inlined limb multiply, the integer GLV split and zero-run wNAF (verify 1.12–1.16× at that point), then **weak field elements in `ecmult`** (`F`: values `< 2^256`, add/sub/mulSmall fold only the carry out of 2^256, `field.mulWeak`/`sqWeak` stop after the two Solinas folds; branch-free, the rare second folds masked) and **libsecp256k1's `gej_double`** (3M + 4S). The secret paths keep canonical `Fe`. Measured: masking the rare second folds costs ~4 % against branching on them (0.95–0.97×), but the branches put ~50 ctgrind contexts into `adaptor/presign` (whose mandatory self-check verifies secret-derived values) — kept masked. Open for verify: a wider G table (libsecp's window is 15, ours 10; w = 12 read 0.95× vs 0.97× in one pair of runs, inside the noise, not kept), and the limb multiply's instruction count. The secret-path `mul` (variable base, w = 4 projective, RCB) did not get the comb's treatment: an affine per-call table needs a constant-time batch inversion; not measured.
-- **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
-  33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
-  inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
-  — verify 85 → 59 µs. Open, by expected gain: (1) ~~variable-time safegcd inversion~~ DONE 2026-10-07
-  (`Fe.invertPublic`, verify 59 → 53 µs); (2) ~~`verifyBatch` on a multi-point Straus~~ DONE 2026-10-07
-  (`mulMultiBasePublic`, 79 → 51 µs/sig); a double-base with two arbitrary points still runs
-  the RCB `glvCombine` (no consumer on a hot path); (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
-  skip the select — DONE 2026-11-13 for the public double-base multiply only (`ecmult`'s weak form, above); (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,
-  store/load). Each needs ctgrind re-measured where it touches CT paths.
-
-1. ~~`fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the
-   special-prime fold (watch the fold-carry propagation; see montint's asm notes).~~
-   **DONE** — `gate.field_asm_implemented = true`; core-vs-portable differential
-   live in `oracle_test.zig`.
-2. ~~`group.mulPublicGlv` — GLV+wNAF variable-base multiply on the proven
-   `splitScalar`; extend GLV to the double-base verify path.~~
-   **DONE** — `gate.glv_scalarmul_implemented = true`; differential live.
-3. ~~Fixed-base wNAF/precomp table for `G` (constant-time base-point mul).~~
-   **DONE** — `group.combMulBase` (fixed-base comb, w=4, signed-digit,
-   blackBox-guarded CT gather). Sign ~4.3× faster (~2.3× libsecp256k1).
-4. ~~Addition-chain field inverse (replace the Fermat square-and-multiply).~~ **DONE 2026-10-07**
-   (addition-chain `invert`/`sqrt`, plus the safegcd `Fe.invertPublic` for public inputs).
-5. ~~Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to
-   k256.~~ **DONE, and undercounted** — verified 2026-09-10 (A1/k256.md F6):
-   11 modules ride k256 in production, not 8 (the original 8 plus
-   `bitcoinscript`, `lninvoice`, `bip32`); the only remaining
-   `std.crypto.ecc.Secp256k1` references are comments and test oracles
-   (e.g. `musig2/src/kat_test.zig`).
-6. ~~Side-channel review of the CT paths (inverse, GLV sign handling).~~ **DONE** — ctgrind
-   measured (see "MEASURED, not merely asserted").
-7. ~~Variable-base constant-time multiply is still the plain ladder.~~
-   **DONE 2026-09-16 (A1 F5), under DECISIONS P5** — `mul` is now the
-   fixed-window signed-digit multiply described under "Scalar multiply
-   variants". The four P5 proofs, all taken on the shipped code:
-   1. **Bit-exact against the previous implementation**: `oracle_test.zig`
-      "F5: windowed mul == mulLadder == std" — 26 edge scalars (0…17, every
-      window 8 / 7 / 15, 2^252±, 2^255±, `n−1`…`n+2`, `(n−1)/2`, `λ`,
-      `2^256−1`…) × 6 points (base, identity, random projective, its negation,
-      an un-normalised projective sum, the same point with `z = 1`), affine
-      bytes AND error agreement with `mulLadder` and with std. External KATs
-      through the new `mul`: the consumers' BOLT#4 (`sphinx`), BOLT#8
-      (`bolt8`) and BOLT#3 (`bolt3`) vectors, all green.
-   2. **Randomized differential**: 1 000 fresh (random point, raw 256-bit
-      scalar) pairs at ReleaseFast (48 in Debug), same three-way comparison.
-      Positive control: `mulWithTable` with one table entry replaced by the
-      identity must disagree with std on > 90 % of 500 inputs, and does.
-   3. **ctgrind**: the `mul` row reads **7 total / 1 in-file / 6 witness /
-      0 unattr** — the one in-file context is `mulWithTable`'s trailing
-      `rejectIdentity` (`group.zig:347`); nothing in the recoding, the table
-      build, the gather or the doubling loop. The ladder read 8/2 on the same
-      harness.
-   4. **Measured benefit** (interleaved A/B, ReleaseFast, random non-base
-      point, 9 rounds × 1 000 calls, arm order rotated per round, ratios per
-      round): windowed `mul` **114 747 ns/op** median [111 878 … 120 946],
-      `mulLadder` 203 645 [200 658 … 214 003], std's CT `mul` 257 958
-      [251 588 … 277 702]. **1.80× over the ladder** [1.66 … 1.84] and
-      **2.26× over std** [2.11 … 2.33], where the ladder was 1.27× std. This is
-      the one secret-scalar curve operation `sphinx` pays per onion hop and
-      `bolt8` per Noise handshake, and the new code is small: a table build
-      and a Horner loop over public counters, with both secret-touching steps
-      reused from the comb, which already carried its own ctgrind row and std
-      differential.
-
-   The 2026-09-15 record that motivated it, kept for history:
-   **Variable-base constant-time multiply (`Secp256k1.mul`, the ECDH path)
-   is still the plain always-double-and-add ladder — no windowing.**
-   Measured (fix campaign perf pass, 2026-09-15, ReleaseFast, 5 interleaved
-   A/B rounds against `std.crypto.ecc.Secp256k1`, same process): k256
-   ~197 µs/op vs std ~252–309 µs/op, **only ~1.26–1.57× faster** — in the
-   same ballpark as the audit's 2026-09-04 figure (1.37–1.38×), while the
-   fixed-base comb (#3) and the GLV variable-base paths (#2) are 3.5–8×
-   faster. The gap is algorithmic (a full point add on every one of 256
-   bits vs. a windowed multiply), not a coding inefficiency, and it is the
-   ONE curve operation `sphinx` (per-hop ECDH) and `bolt8` (Noise ECDH)
-   actually call with a secret scalar. **Deliberately left unimplemented
-   this pass**: a runtime-built windowed table over an arbitrary (not
-   fixed) point needs its own CT-gather construction (unlike #3's
-   comptime-built table) and would be a new algorithm under this repo's
-   "no bespoke crypto without proof" doctrine — bit-exact KAT, a
-   randomized differential, a `ctgrind` target, AND a `ctgrind` run are
-   all required before it ships, and `scripts/checks/ctgrind.sh` was out of
-   scope for this pass (foreground-only, no full-repo tooling). See
-   `A1/k256.md` F5 disposition.
-- **ElligatorSwift (BIP324 v2 transport key exchange)** (survey 2026-09-30): libsecp256k1 ships it; a Bitcoin peer connection needs it. Effort M-L (published vectors exist in BIP324; nothing else in the repo covers it). Fits §2. Probably its own module on top of `k256` rather than inside it.
-- **Silent Payments (BIP352) helpers** (survey 2026-09-30): libsecp256k1 has a module; the ECDH and tweak arithmetic exist here (`Secp256k1.mul`, `add`). Effort M. Fits §2; a separate module (`bip352`) rather than `k256`.
-- **Context blinding / randomised secret-scalar multiply** (survey 2026-09-30): libsecp256k1's `context_randomize` hardens signing against power/EM side channels; k256 relies on the constant-time recoding alone. Effort S-M. Fits §2.
-- **aarch64 field asm** (survey 2026-09-30): arm64 (Lightning nodes on ARM boards, phones) runs the portable Solinas path only; decred's package ships amd64 assembly, libsecp256k1 has 32/64-bit generic and ARM asm. Effort M-L, untestable without arm64 CI. Fits §2.
-- **Item 4 above (addition-chain / safegcd inverse)** (survey 2026-09-30): the field inverse is done (see item 4); what remains is the scalar-field inverse, which is std's here (libsecp256k1 uses safegcd for both). Effort M.
+- **Libsecp256k1 speed parity and hand-tuned asm** is a non-goal; the target is a small factor
+  (~2–4×, now closer) with zero C and no libc.
+- **Scalar-field acceleration**: `scalar.zig` re-exports std's constant-time scalar field verbatim
+  (see *Scope*); a handful of ops per signature next to the point multiply.
+- **Hybrid SEC1 tags `06` / `07`**: refused (libsecp256k1 accepts them); this module's grammar and
+  std, its oracle, do not.
+- **Compressed encoding of the identity**: fail-closed, see *Limits and residual risks*.
+- **Dispatching the amd64 asm field core**: its `memory` clobber costs ~20 % of a verify; the
+  limb-level Zig multiply is faster.
 
 ## Anchoring
 
@@ -746,6 +449,27 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 
 ## Backlog / deferred
 
-- **`mul`'s local scalar wipe is untested** (mutation 2026-11-14, LOW): `defer secureZero(&s)` in `mul` survives its skip mutant; the stack probe covers `mulInto` only, and the by-value argument copy in the caller's frame prevents an isolating probe for `mul` itself.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Verify speed toward libsecp256k1**: a wider G table (libsecp's window is 15, ours 10; width 12
+  read 0.95× vs 0.97× in one pair of runs, inside the noise, not kept), and the limb multiply's
+  instruction count (field mul latency ~80 cycles: product rows ~27, reduction ~25, store/load).
+  Each change that touches a constant-time path needs ctgrind re-measured. A double-base with two
+  arbitrary points still runs the RCB `glvCombine` (no consumer on a hot path).
+- **Secret-path `mul` speed** (variable base, w = 4 projective, RCB): did not get the comb's
+  treatment; an affine per-call table needs a constant-time batch inversion. Not measured.
+- **`mul`'s local scalar wipe is untested** (LOW): `defer secureZero(&s)` in `mul` survives its skip
+  mutant; the stack probe covers `mulInto` only, and the by-value argument copy in the caller's frame
+  prevents an isolating probe for `mul` itself.
+- **ElligatorSwift (BIP324 v2 transport key exchange)**: libsecp256k1 ships it; a Bitcoin peer
+  connection needs it. Effort M-L (published vectors exist in BIP324; nothing else in the repo
+  covers it). Fits §2. Probably its own module on top of `k256` rather than inside it.
+- **Silent Payments (BIP352) helpers**: libsecp256k1 has a module; the ECDH and tweak arithmetic
+  exist here (`Secp256k1.mul`, `add`). Effort M. Fits §2; a separate module (`bip352`) rather than
+  `k256`.
+- **Context blinding / randomised secret-scalar multiply**: libsecp256k1's `context_randomize`
+  hardens signing against power/EM side channels; k256 relies on the constant-time recoding alone.
+  Effort S-M. Fits §2.
+- **aarch64 field asm**: arm64 (Lightning nodes on ARM boards, phones) runs the portable limb-level
+  path only; decred's package ships amd64 assembly, libsecp256k1 has 32/64-bit generic and ARM asm.
+  Effort M-L, untestable without arm64 CI. Fits §2.
+- **Safegcd inverse for the scalar field**: the base-field inverse is done; the scalar-field inverse
+  is std's here (libsecp256k1 uses safegcd for both). Effort M.

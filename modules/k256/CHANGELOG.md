@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** constant-time: on baseline x86-64 (`-mcpu=x86_64`) LLVM compiled the closing `rejectIdentity` of the variable-base `mul` (`mulWithTable`) into two jumps instead of one (ctgrind `mul` 2 in-file instead of the pinned 1; also +1 in bolt8 `dh`/`act3` and +2 in sphinx `construct`). It now uses `rejectIdentityOneBranch`, as the comb already did; the verdict is the public identity outcome. Native counts unchanged, results bit-identical. ctgrind source digests re-pinned. Delta mutant (the plain form back) killed by the portable ctgrind run.
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit recorded (372/408 killed, 36 decided; A1 again); ctgrind source pins refreshed for the new tests; Backlog: `mul`'s local wipe has no isolating test.
 - **2026-11-14** — **TESTS ONLY (no code change):** mutation re-run over the production code changed since the 2026-10-08 audit asked for 13 new tests: `normalize`'s second fold, `reduceLimbsLazy`'s carry into limb 1, `Fe.isZero`/`equivalent` over all four limbs, `safegcd.updateDe`'s (−2p, p) range invariant, `divsteps59` against a textbook divstep from δ = 1/2 (zeta and the scaled matrix), every identity encoding through `rejectIdentity`/`affineCoordinates*`/`fromAffineCoordinates`, `mulInto` zeroing `out`, the public multiplies' identity results and inputs, the exact-limbs G dispatch of `mulDoubleBasePublic`, `F.isZero` per limb, `splitToSignedHalves` reduction and zero, and `ecdsa_recover` refusing r = 0 and s = 0 through the signing seam.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE** (same results, faster): the variable-time double-base multiply (`mulDoubleBasePublic` with `basePoint`, `mulMultiBasePublic`; `ecmult.zig`) now works on WEAK field elements — values `< 2^256`, not reduced below `p` between operations: add/sub/mulSmall fold only the carry out of 2^256, and its multiply (`field.mulWeak`/`sqWeak`) stops after the two Solinas folds instead of the canonicalising four-limb select; branch-free (the rare second folds are masked, zero tests are one verdict), public data only. Doubling switched from dbl-2009-l (2M + 5S, eleven additions) to libsecp256k1's `gej_double` (3M + 4S, six additions and one halving). BIP340 verify 41.4–41.8 → 35.4–35.6 µs (`zig build bench-bip340`, 0.99–1.01× libsecp256k1 v0.8.0, was 1.12–1.16×); batch verify ~40.8 → ~39 µs per signature. The constant-time paths (`Fe`, `mul`, comb, sign) are unchanged: `reduceLimbs` was split into `foldLimbs` + finish without changing what it computes. ctgrind: k256 rows unchanged (source pins re-pinned); `adaptor/presign`, whose self-check runs this multiply on secret-derived values, reads 80 within its `<=90` bound. New test: the weak ops against integer arithmetic mod p on edges that reach every rare branch.
 - **2026-11-13** — docs: SPEC notes for the safegcd `invert`, the limb multiply, the w = 6 affine comb, and the verify gap still open (lazy reduction, G window, multiply instruction count). No code change.
@@ -173,15 +172,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `Fe{ .limbs = ... }` will now fail to compile. No in-repo consumer of the
   11 that depend on this module ever touched the field directly (verified
   by grep, before and after); all 11 re-run green.
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** added Wycheproof ECDSA
-  secp256k1/SHA-256 verification vectors (audit G3, MED) — this module
-  shipped zero ECDSA test vectors of its own (only BIP340 Schnorr vectors).
-  357 vectors (234 P1363 + 123 Bitcoin/low-S), run against `sign.ecdsaVerify`
-  and `sign.ecdsaVerifyLowS` in `wycheproof_kat_test.zig`. Third-party data
-  under Apache-2.0, attributed in `NOTICE`; generator is
-  `modules/k256/tools/gen-k256-wycheproof.py`, mirroring the sibling `p256`
-  module's own Wycheproof fixture. No production code changed; the point of
-  this entry is the fixture existing, not a behaviour change.
 
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code changed,
   but a source comment was corrected. This module reproduces two bodies of published values and

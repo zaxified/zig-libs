@@ -15,7 +15,7 @@ three techniques std forgoes:
   (`2^256 ≡ 2^32 + 977`, folded instead of a generic Montgomery reduce),
 - the **GLV endomorphism** (`k = k1 + k2·λ`, both ≈ √n) for ~40% fewer doublings
   on variable-base multiplies,
-- an **amd64 `MULX/ADX`** field multiply/square.
+- a limb-level field multiply/square (an **amd64 `MULX/ADX`** core exists, tested but not dispatched).
 
 Realistic target: **~2–4× libsecp256k1** (parity with decades-tuned asm-grade C
 is not expected; ~9–14× → ~2–4× is the win). This is NOT a std-gap fill — std
@@ -23,24 +23,22 @@ already has secp256k1 — it is a *performance-specialized reimplementation*
 justified by the measured gap plus the collection's thesis that native Zig should
 be usable INSTEAD of linking a C crypto library. See `SPEC.md §Dedup`.
 
-## Status: core phase done (both Fable cores implemented and gated ON)
+## Cores and gates
 
 The **portable path is real, constant-time, and byte-exact against
-`std.crypto.ecc.Secp256k1` + the 19 official BIP340 vectors** — it is the
-correctness oracle and the non-amd64 fallback. The two irreducible cores below
-are now IMPLEMENTED, with `gate.field_asm_implemented` /
-`gate.glv_scalarmul_implemented` both flipped to `true`, so the
-core-vs-portable differentials in `oracle_test.zig` run live (not skipped):
+`std.crypto.ecc.Secp256k1` + the 19 official BIP340 vectors** — it is the correctness oracle and the
+fallback on every target. Two cores sit behind `gate.zig` flags (both `true`), and their
+core-vs-portable differentials in `oracle_test.zig` run live:
 
 | Gate flag | Core | Portable fallback (the oracle it's pinned against) |
 |---|---|---|
 | `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` field mul + square | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
 | `gate.glv_scalarmul_implemented` | `group.mulPublicGlv` — GLV+wNAF variable-base scalarmul | `group.mulPublicDoubleAdd` |
 
-The GLV **decomposition** (`scalar.splitScalar`, the lattice constants) is
-real and tested byte-exact vs std, and both gated cores now build on it for
-real — see `gate.zig` for the exact cut-lines and `SPEC.md`'s Performance
-status section for measured numbers.
+`Fe.mul` / `Fe.sq` currently run the limb-level Zig form (`mulLimbs` / `sqLimbs`), which measured
+faster than the asm core's call; the asm core is tested but not dispatched. The GLV decomposition
+(`scalar.splitScalar`, the lattice constants) is tested byte-exact vs std; the verifiers run on the
+`ecmult` double-base path. See `SPEC.md`.
 
 ## Usage
 
@@ -53,7 +51,7 @@ const k256 = @import("k256");
 // Field arithmetic over p = 2^256 − 2^32 − 977.
 const a = try k256.Fe.fromBytes(a_be, .big);
 const b = try k256.Fe.fromBytes(b_be, .big);
-const prod = a.mul(b);          // Solinas reduce (or gated MULX/ADX core)
+const prod = a.mul(b);          // limb-level Solinas reduce
 const inv = a.invert();
 
 // Curve group.
@@ -89,7 +87,7 @@ K256_BENCH=1 zig build test-k256 -Doptimize=ReleaseFast # opt-in ns/op baseline
 
 Green in both Debug and ReleaseFast (the one skip is the opt-in
 `K256_BENCH` micro-benchmark, gated behind an env var, not a core gap — both
-Fable cores are implemented and their differentials run for real). The suite
+cores are implemented and their differentials run for real). The suite
 includes the field/group/scalar differentials vs `std.crypto.ecc.Secp256k1`
 (thousands of random inputs, bit-exact via `toBytes`), the core-vs-portable
 differentials for the amd64 `MULX/ADX` field core and the GLV scalarmul core,
@@ -102,12 +100,15 @@ exactly one, a broken-Solinas-constant positive control the harness flags RED, a
 (originally `lninvoice`'s, moved here — general secp256k1 machinery, not
 BOLT#11-specific).
 
-Measured on this host (ReleaseFast, accelerated MULX/ADX + GLV + comb-base
-path vs std): ECDSA/BIP340 verify **~2–3.5× libsecp256k1** (field mul ~2.9×,
-ECDSA verify ~2.5× libsecp / ~6.5× std), BIP340/ECDSA sign **~2.3×
-libsecp256k1** via the fixed-base comb table (`group.combMulBase`) — both
-signature paths land inside the module's ~2–4×-libsecp256k1 target. See
-`SPEC.md`'s Performance status section for the full breakdown.
+Speed: `K256_BENCH=1` runs the opt-in ns/op micro-benchmark; the `bip340` module's
+`zig build bench-bip340` compares BIP340 keypair, sign and verify with libsecp256k1. The figures
+live on the card's Performance line (see `SPEC.md`'s Performance section).
+
+## Not provided
+
+ElligatorSwift (BIP324), Silent Payments (BIP352) helpers, context blinding, an aarch64 field asm
+and hybrid SEC1 tags (`06` / `07`) are not provided; the scalar field is std's. See `SPEC.md`:
+*What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the secp256k1 domain parameters + the public
 BIP340 specification. Design reference: bitcoin-core/libsecp256k1 (**MIT**,
