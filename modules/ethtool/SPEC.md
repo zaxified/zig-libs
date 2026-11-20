@@ -18,7 +18,7 @@
 
 What this module is and how to use it: see [README.md](README.md).
 Metadata (platform/role/concurrency/deps): `pub const meta` in
-`src/root.zig`. Provenance and licences: the repo-root `NOTICE`.
+`src/root.zig`. Provenance and licences: the README's `Provenance:` line, and *Provenance* below.
 
 This document answers the other question — how it was built, what it is
 asserted against, and what could go wrong.
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 |---|---|---|--:|---|---|
 | `ethtool(8)` (kernel.org `ethtool/ethtool`; the GitHub repo of that name is empty) — **reference** | C | GPL-2.0 (utility; source not read) | — | 6.19 (installed and run as the capture oracle) | The CLI. Netlink half is covered here; it also does `-i` drvinfo, plain `-S` private counters, WOL, EEE, FEC, private flags, RSS/indirection (`-x`/`-X`), flow steering (`-n`/`-N`), `-p` identify, `-t` self-test, `-T` timestamping, `--cable-test`, `--show-phys`, module firmware flash. |
 | [mdlayher/ethtool](https://github.com/mdlayher/ethtool) | Go | MIT | 76 | v0.6.1 (2026-06-03) | Netlink only: link info/mode/state, WOL, FEC, private flags, and link-mode update. Its pkg.go.dev API has no rings/coalesce/pause/channels/features/stats/module EEPROM. |
-| [safchain/ethtool](https://github.com/safchain/ethtool) | Go | Apache-2.0 | 147 | v0.7.0 (2025-11-12) | `SIOCETHTOOL` ioctl API: link settings, channels, coalesce, ring, pause, WOL, RSS indirection, driver info, bus info, permanent MAC, private stats, features, private flags, identify, timestamping info, msglvl, module EEPROM. The ioctl route is exactly what this module excludes by design. |
+| [safchain/ethtool](https://github.com/safchain/ethtool) | Go | Apache-2.0 | 147 | v0.7.0 (2025-11-12) | `SIOCETHTOOL` ioctl API: link settings, channels, coalesce, ring, pause, WOL, RSS indirection, driver info, bus info, permanent MAC, private stats, features, private flags, identify, timestamping info, msglvl, module EEPROM. The ioctl route is what this module excludes by design, except the two calls that have no netlink message (*Two ioctl calls*). |
 | [rust-netlink/ethtool](https://github.com/rust-netlink/ethtool) | Rust | MIT | 12 | v0.3.0 (2026-08-18) | Tokio netlink client; README is one line *(coverage unread, inferred to be a subset)*. |
 | Zig ecosystem / `std` | Zig | — | — | — | None found. |
 
@@ -39,225 +39,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 link settings with typed bitsets, rings, coalesce, pause, channels, feature flags with SET-ack
 verification, standard statistics groups, string sets, module EEPROM and the monitor group —
 with request bytes diffed against the real `ethtool` 6.19 and replies captured from real NICs;
-no libc, and ioctl only for the two calls with no netlink message (`-i`, plain `-S`). **Where we are behind:** the reference's WOL/EEE/FEC/private flags/RSS/identify/
-timestamping/cable-test (→ Backlog). `-i` and plain `-S` are now here (`src/ioctl.zig`, §4).
+no libc, and ioctl only for the two calls with no netlink message (`-i`, plain `-S`). **Where we are behind:** the reference's RSS writes (`-X`), flow steering, identify (`-p`), self-test (`-t`),
+timestamping configuration and cable test (→ *Backlog / deferred*); everything else it does with a netlink message is typed here, and `-i` and plain `-S` are the two ioctl calls (`src/ioctl.zig`).
 
-## 1. Verification story
+## Design invariants
 
-### 1.1 Two capture environments
-
-| environment | what it produced |
-|---|---|
-| ordinary unprivileged user, real NICs (`enp0s31f6`, an Intel `e1000e`; `wlp2s0`, `iwlwifi`) | every request golden, and the GET-reply and error goldens |
-| unprivileged user+net namespace (`unshare -rn`) with a `veth` pair | the two compact `FEATURES_SET_REPLY` goldens and the `FEATURES_NTF` notification golden — all three need CAP_NET_ADMIN to provoke |
-| `unshare -rn` + a raw `AF_NETLINK` socket (Python `socket.AF_NETLINK`, no library beyond stdlib) instead of the real `ethtool` binary | `reply_features_set_honoured_verbose` (wave-2 F1) — the real `ethtool` CLI always requests a *compact* reply, so the *verbose* reply shape this module's own `setFeaturesByName` actually receives had no capture route through `ethtool` itself; sending the request by hand (same verbose `WANTED` bitset, `compact_bitsets` omitted) was the only way to provoke it |
-
-The namespace harness is the one `CONVENTIONS.md` §7 prescribes for netlink
-modules. It is worth stressing that SET *requests* did **not** need it: the
-kernel refuses an unprivileged SET only after `ethtool` has already handed the
-bytes to `sendto`, so an unprivileged `strace` still pins them byte for byte.
-
-### 1.2 Request goldens — captured from a real `ethtool`, byte for byte
-
-```sh
-strace -f -e trace=%network -e write=all -e read=all -xx -s 16384 \
-    -e abbrev=none ethtool <args>
-```
-
-`-e trace=%network`, not `sendmsg`: **`ethtool` sends with `sendto`**, so the
-`-e trace=sendmsg` recipe the sibling `nl80211` goldens use captures the
-kernel's replies and none of the requests. That cost an hour and is recorded
-at the top of `src/goldens.zig` so it costs nobody else one.
-
-Twenty-one request goldens are committed, one per command line:
-
-| command | pins |
-|---|---|
-| `ethtool enp0s31f6` | `LINKMODES_GET` (no flags), `LINKINFO_GET`, `LINKSTATE_GET` |
-| `ethtool -g / -c / -a / -l / -k` | `RINGS_GET`, `COALESCE_GET`, `PAUSE_GET`, `CHANNELS_GET`, `FEATURES_GET` |
-| `ethtool -a` (2nd request) | `LINKMODES_GET` **with** `ETHTOOL_FLAG_COMPACT_BITSETS` — the same command as the first golden, differing in exactly the 8 bytes of the flag attribute |
-| `ethtool -k`, `ethtool -S … --groups` | two `STRSET_GET`s with an **empty header nest** (a device-independent string table) |
-| `ethtool -S enp0s31f6 --groups eth-mac eth-ctrl rmon` | `STATS_GET` + the verbose name-keyed group bitset + the one command whose header nest is attribute **2**, not 1 |
-| `ethtool -G … rx 512`, `-A … autoneg off`, `-K … tso off`, `-s … speed 100 duplex full autoneg on` | the four SET request shapes |
-| `ethtool -m enp0s31f6` | `MODULE_EEPROM_GET` |
-| `unshare -rn` + `ethtool -K veth0 tso on` | the 5-name masked verbose `FEATURES_SET` bitset |
-| `unshare -rn` + `ethtool -L veth0 combined 1` / `-C veth0 adaptive-rx on` / `-s veth0 port tp` / `--set-module veth0 power-mode-policy high` | `CHANNELS_SET`, `COALESCE_SET`, `LINKINFO_SET`, `MODULE_SET` (wave-2 F6 — these four had **no** golden at all, self round-trip only, until this pass) |
-
-Only `nlmsg_seq` is treated as a runtime value (each test builds with the
-sequence the capture used). `nlmsg_pid` needs no special handling — `ethtool`,
-like this module, writes 0 and lets the kernel fill it in. Everything else,
-including attribute order and padding, is a plain byte compare.
-
-Each of those tests drives this module's own public request encoder (§2.1a) —
-the same `buildX` the client method calls — so the capture is compared against
-what an `Ethtool` actually puts on the wire, not against a re-spelling of it
-in the test. `FEATURES_SET` is the exception, for the reason §2.1a gives.
-Encoder shapes `ethtool` never sends (a SET keyed by bit index, a *device's*
-string sets, `PAUSE_GET` with `ETHTOOL_FLAG_STATS`, `MODULE_GET`) have no
-capture to compare against and are decoded back with this module's own
-primitives instead, asserting the optional attributes that must be **absent**
-as well as those present.
-
-One encoder was reordered to keep that compare plain: `appendLinkModesSet`
-emits speed → duplex → autoneg, which is the order `ethtool -s` uses. Netlink
-attaches no meaning to attribute order; matching the reference tool turns a
-set comparison into a byte comparison, which is strictly stronger.
-
-### 1.3 What could **not** be captured from `ethtool`
-
-- **Compact bitsets in a request.** `ethtool` always keys the bitsets it
-  *sends* by name, because userspace does not want to hardcode kernel bit
-  numbers. `bitset.appendCompact` and `bitset.appendIndexedValues` are
-  therefore UAPI-derived and covered by round-trip + hostile-input tests.
-- **A verbose `FEATURES_GET` reply.** `ethtool` always sets
-  `ETHTOOL_FLAG_COMPACT_BITSETS` for features. That reply was fetched instead
-  with a 30-line raw `AF_NETLINK` client — the oracle there is the kernel
-  itself, not `ethtool`. It earns its place: it is the only golden that pins
-  the `NOMASK`-verbose rule in §2.2.
-- **The `monitor` notification.** `ethtool --monitor` only prints, so the
-  group was joined by a small raw reader in the namespace while `ethtool -K`
-  ran. The committed message is the kernel's, byte for byte.
-- **Non-empty statistics groups.** No NIC available implements the
-  standardised `eth-mac`/`eth-ctrl`/`rmon` counters, so the real `STATS_GET`
-  reply has three groups and no counters in them — which is itself the case
-  worth pinning (empty ≠ error). Counter and histogram decoding, including the
-  open-ended last RMON bucket, is covered by constructed replies in
-  `stats.zig` and is honestly labelled UAPI-derived.
-- **Module EEPROM data.** No pluggable transceiver was available; only the
-  request is pinned. `moduleinfo.parseEeprom` is covered by constructed
-  replies.
-
-### 1.4 Decoder goldens — real kernel replies
-
-Sixteen reply goldens are decoded back through the module. The ones that carry
-their weight:
-
-- **The same link-mode bitset in both encodings** (`ethtool <dev>` verbose vs
-  `ethtool -a <dev>` compact, seconds apart on the same NIC). A dedicated test
-  walks all 125 bits and requires `supports`/`advertises` to agree — so the two
-  decoders check each other rather than both being checked against my reading
-  of the header.
-- **The same feature bitsets in both encodings**, likewise cross-checked over
-  all 64 bits for active/supported/fixed.
-- **`FEATURES_GET` + `STRSET_GET` together**, exercising the name → index →
-  bit round trip that compact bitsets force on a caller. This is what caught
-  the fact that four of the 64 feature bits are named with an **empty string**
-  — a decoder that skipped empty names would have silently shifted every index
-  after them.
-- **Two `FEATURES_SET_REPLY`s**, one fully honoured and one where the kernel
-  refused four of five requested bits. These are what established the actual
-  diff semantics (§2.3). Both are **compact** — the format the real `ethtool`
-  CLI asks for (it always sets `compact_bitsets`, per `bitset.zig`'s file
-  header). This module's own `setFeaturesByName`/`setFeaturesByIndex` never
-  set that flag (`features.zig`'s `buildSetFeaturesByName`/`ByIndex`), so the reply shape the
-  shipped code path actually receives was, until wave-2 F1, unanchored —
-  the two committed goldens exercised a request shape our own API doesn't
-  send. Closed by a **third** `FEATURES_SET_REPLY` golden,
-  `reply_features_set_honoured_verbose`, captured live (`unshare -rn`, a raw
-  `AF_NETLINK` socket carrying the exact same verbose `WANTED` bitset
-  `ethtool -K veth0 tso on` sends, header's `compact_bitsets` omitted) — the
-  first byte-exact evidence for what the kernel actually replies with on the
-  path this module's own by-name API drives. (Considered and rejected: just
-  making those encoders set `compact_bitsets` to match the two existing
-  goldens instead — that would silently break `SetResult.honouredByName`,
-  which only has names to report when the reply is verbose, for every
-  caller of `setFeaturesByName`.)
-- **A real `FEATURES_NTF`** off the `monitor` group, decoded with the ordinary
-  `features.parse` to demonstrate that a notification's payload is a GET
-  reply's payload.
-- **Three error replies**: `-EPERM` (`WOL_GET` unprivileged), `-EOPNOTSUPP`
-  with no extended ACK (`CHANNELS_GET` on `e1000e`), and `-EOPNOTSUPP` **with**
-  `NLMSGERR_ATTR_MSG` = "failed to retrieve link settings" (`LINKMODES_GET` on
-  Wi-Fi). The last one is why the socket enables `NETLINK_EXT_ACK`, and it also
-  pins the uncapped-echo layout: the kernel echoes the *whole* request when it
-  attaches a message, so the ext-ACK walk must skip `nlmsg_len` bytes, not 16.
-- **The nlctrl `CTRL_CMD_NEWFAMILY` reply**, asserting family id 23 and
-  `monitor` group id 8 — and that 23 > `GENL_ID_CTRL`, i.e. that it really is
-  dynamically assigned.
-
-### 1.5 Anonymisation
-
-One **length-preserving** substitution was applied to every committed reply:
-`nlmsg_pid` was zeroed. That field is the capturing process's netlink port id,
-which the kernel derives from its pid; it identifies a session on the capture
-machine and nothing about the protocol, and nothing in these tests reads it
-(the goldens are decoded, not matched against a socket).
-
-Nothing else was touched. There is nothing else to touch: **the ethtool
-netlink family carries no MAC addresses, serial numbers or bus IDs at all.**
-The one command that would (`ethtool -i` — driver, firmware version, bus id)
-has no netlink message and never left the ioctl path; `src/ioctl.zig` covers it, and its tests
-commit no captured bus ids or driver strings (the comparison runs live). The `MODULE_EEPROM` data
-attribute *could* carry a transceiver serial number, but no module was present
-and no EEPROM bytes were captured.
-
-Interface names (`enp0s31f6`, `wlp2s0`, `veth0`) were deliberately kept: they
-are udev bus-path names or names this harness created, they carry no identity,
-and keeping them makes the capture commands in the comments reproducible.
-
-### 1.6 Hostile-input tests
-
-Every decoder is fed truncated TLVs, wrong-width scalars and contradictory
-attributes, and must answer with `error.Truncated` / `error.BadLength` rather
-than a panic or an over-read. Specifically rejected:
-
-- a compact bitset whose `VALUE`/`MASK` word count contradicts its `SIZE`;
-- a `VALUE` payload that is not a whole number of `u32` words;
-- a bitset carrying **both** encodings, or `NOMASK` **and** a `MASK`;
-- a `SIZE` or `COUNT` of `0xffffffff` — bounded (`bitset.max_bits`,
-  `stats.max_strings`) *before* any allocation;
-- a bit index at or beyond `max_bits`;
-- duplicate `VALUE`/`OURS`/`HW`/`ACTIVE`/… attributes (a leak vector, since the
-  second parse would orphan the first allocation);
-- a string-set entry with no index or no value (it would put every later index
-  out of step);
-- an `ETHTOOL_A_MODULE_EEPROM_DATA` longer than the kernel's own 128-byte
-  ceiling;
-- a statistics counter that is not exactly 8 bytes.
-
-Four `std.testing.fuzz` harnesses (bitsets, parameters, statistics/string
-sets, notifications) additionally require no crash, no leak and no unbounded
-loop on arbitrary bytes.
-
-### 1.7 Live tests
-
-Eleven tests run against the real kernel. They pick a target with the sibling
-`netlink` module's `RTM_GETLINK` dump (not `/sys` — same no-libc discipline,
-and it yields `ARPHRD_ETHER` so a loopback or tunnel is not mistaken for a
-NIC), and every one of them prints `SKIPPED: …` and passes when a driver does
-not implement the operation. `EOPNOTSUPP` is the *normal* answer for most of
-this family on most drivers; a suite that failed on it would be useless.
-
-The strongest one asks the same kernel for the same link modes twice, once
-verbose and once compact, and requires every bit to agree — a decoder bug in
-either encoding fails on any machine with an Ethernet NIC.
-
-Two tests need CAP_NET_ADMIN (`RINGS_SET` writing the current value back, and
-`FEATURES_SET` re-requesting a feature's current state) and skip without it.
-Both were run for real inside `unshare -rn` against a `veth` pair; the
-features one exercises the full SET → `SetResult` path.
-
-### 1.8 Delta mutation audit
-
-**Audit 2026-11-17 (delta mutation).** 42 schemata mutants over `RSS_GET` (`rss.zig` `Rss.deinit`/`usesHfunc`,
-`parseRss`, `buildRss`, and `Ethtool.rss` in `client.zig`), ReleaseSafe, one build, each mutant under
-`setsid -w timeout` and `ulimit -v`: the free guards and the reset in `deinit`, the match polarity of
-`usesHfunc`, each attribute arm dropped or stored into the wrong field, the INDIR and HKEY duplicate guards
-(forced shut, forced open), the multiple-of-four guard and its modulus, the element count and byte offset of the
-table, the endianness, the key copy length, the unknown-attribute arm, the `errdefer`, and in `buildRss` the
-family id, command, sequence, device, context presence, value and attribute type and the `errdefer`. First
-run: 33 killed (2 of them HANG: a wrong sequence number makes the exchange wait), 9 survived. 3 new tests
-killed 3 (`Rss.deinit` clears the value so a second call is harmless; an unknown attribute is skipped; the
-request frame's family id, sequence and encoded device), 2 are EQUIVALENT (an empty INDIR or HKEY reaching
-`alloc`/`dupe` with length 0: a zero-length allocation allocates nothing and leaves the slice empty, which is
-what the `continue` leaves too), 4 are UNOBSERVABLE (`Ethtool.rss` passing `null` for the context, a wrong
-header attribute, a skipped `reply.deinit`, an empty reply body: the success path needs a NIC whose driver
-implements `get_rxfh`; the live test skips on every device available here, and a unit test would need a
-netlink peer answering `RSS_GET`). 36 killed + 6 eq (2 equivalent + 4 unobservable) = 42.
-
-## 2. Design invariants
-
-### 2.1 Nothing the kernel assigns is hardcoded
+### Nothing the kernel assigns is hardcoded
 
 The family id was 23 on the development machine; it is whatever nlctrl hands
 out on the next boot, and is resolved at open. So is the `monitor` group id (8
@@ -266,7 +53,7 @@ the `CTRL_ATTR_MCAST_GROUPS` walk lives here as a pure function
 (`client.findMcastGroupId`) — the same extension point `nl80211` documents. If
 a third family needs it, that is the code to promote.
 
-### 2.1a One encoder per operation, and it is public
+### One encoder per operation, and it is public
 
 Building a request and performing it are separate steps, and only the second
 needs a socket. Each request-performing `Ethtool` method has a matching
@@ -289,7 +76,7 @@ and unchanged here: `FEATURES_SET` goes out with no header flags, where
 `ethtool -K` sets `ETHTOOL_FLAG_COMPACT_BITSETS`. Both are valid; this module
 reads the verbose `FEATURES_SET_REPLY`. `goldens.zig` pins the difference.
 
-### 2.2 Bitsets: three rules, all learned from bytes
+### Bitsets: three rules, all learned from bytes
 
 1. **Encoding follows the request.** A reply's bitsets are compact iff the
    request's `ETHTOOL_A_HEADER_FLAGS` carried `ETHTOOL_FLAG_COMPACT_BITSETS`.
@@ -309,7 +96,7 @@ reads the verbose `FEATURES_SET_REPLY`. `goldens.zig` pins the difference.
 The word count of a compact bitset is `ceil(size/32)` exactly, enforced in both
 directions — a reply that disagrees is malformed, not something to guess at.
 
-### 2.3 A SET's ACK is not proof, and the *mask* is the signal
+### A SET's ACK is not proof, and the *mask* is the signal
 
 `FEATURES_SET` always ACKs. The `FEATURES_SET_REPLY`'s two bitsets are diffs:
 
@@ -333,7 +120,7 @@ that was requested *off* and refused a success, because its value bit is 0.
 numbers are the same but the meanings are not, and reusing `Features` would
 invite reading `active` as "what is on now".
 
-### 2.4 Absent is not zero
+### Absent is not zero
 
 Every reply field is an optional and nothing is defaulted. `ethtool -g` prints
 `n/a` for exactly the attributes the kernel omitted, and a consumer that
@@ -341,7 +128,7 @@ turned those into 0 would report a device with no TX ring. Symmetrically, an
 absent field in a `*Set` struct means "leave it alone": a SET carries only what
 changes, and sending an empty one is a legal no-op rather than a wipe.
 
-### 2.5 The blocking seam
+### The blocking seam
 
 `EventSocket` has exactly one blocking call, `waitForNotification`, doing one
 `recvmsg` when its buffer is drained. `fd()` is exposed so a caller can poll
@@ -353,16 +140,45 @@ The event socket is separate from the command socket because multicast
 membership is per-socket: subscribing the command socket would make every
 request have to filter unsolicited notifications out of its own reply stream.
 
-### 2.6 Lifetimes
+### Lifetimes
 
 Anything with a heap allocation (`LinkModes`, `Features`, `SetResult`, `Stats`,
-`StringSets`, `Eeprom`, `Notification`, `Bitset`) owns it and has `deinit`.
+`StringSets`, `Eeprom`, `Notification`, `Bitset`, `Eee`, `Fec`, `Wol`,
+`Privflags`, `TsInfo`, `Rss`) owns it and has `deinit`.
 Everything else is a plain value type whose strings live in fixed inline
 buffers (`header.Device`), so it can be returned by value and outlive the
 receive buffer. Every allocating parser has `errdefer` on the partially-built
 result, and duplicate-attribute checks exist partly to make that airtight.
 
-## 3. Threat model
+### Two ioctl calls
+
+`ethtool -i` (drvinfo: driver, firmware version, bus id) and plain `ethtool -S` (the driver's private counter
+array) have no netlink message and never will; they are the reference tool's most-used calls, so the module
+carries exactly two `SIOCETHTOOL` entry points in `src/ioctl.zig`: `drvinfo()` (`ETHTOOL_GDRVINFO`) and
+`driverStats()` (`ETHTOOL_GSSET_INFO` + `ETHTOOL_GSTRINGS` + `ETHTOOL_GSTATS`), in pure Zig over
+`std.os.linux.ioctl`, no libc. That is what ethtool(8) itself does: netlink where a message exists, ioctl where
+none does, and the kernel keeps these ioctls as stable uAPI. No other ioctl command is added and nothing netlink
+already covers is duplicated (see *What is deliberately not done*).
+
+- The counter count from `GSSET_INFO` must agree with the `GSTRINGS` length and the `GSTATS` `n_stats`; on a
+  mismatch the sequence is retried once and a second mismatch is `error.StatsChanged`.
+- The kernel sizes its copy-out by its own current count, so the scratch buffers are always allocated for the
+  bound (`max_stats` = 65536, `error.TooManyStats` beyond), never for the count just read.
+- A name field without a NUL is `error.BadReply`; so is an image with the wrong command or set id or a short
+  reply (`assembleStats`).
+- The interface name is validated (`validateName`: 1..15 bytes, no NUL, `/`, `:` or whitespace, not `.` or `..`)
+  before any syscall (`error.InvalidInterfaceName`).
+
+### WOL's SOPASS is a secret
+
+`wol.zig` wipes (`std.crypto.secureZero`) every buffer it owns that held the SecureOn password: the reply copy
+and the socket receive buffer right after a GET decodes (on error paths too), the request builder's buffer
+(reserved up front so no growth leaves a stale copy) and the sent datagram after `Ethtool.setWol`.
+`Wol.deinit` zeroes the `sopass` it handed to the caller. A caller of the offline `buildSetWol` owns the
+datagram and zeroes it with `wol.wipe`; the caller's own `WolSet.sopass` value is the caller's to wipe. FEC's
+per-lane statistics stay on `raw`.
+
+## Threat model
 
 The peer is the local kernel, so this is not an adversarial channel in the way
 `nl80211`'s over-the-air information elements are. What is still defended
@@ -387,65 +203,252 @@ What is explicitly **not** defended against: a caller passing a device name it
 did not validate. Names are length- and NUL-checked (so they cannot overflow
 `IFNAMSIZ` or smuggle an embedded terminator), but a name is otherwise passed
 through to the kernel, which is the correct place to resolve it.
+Likewise the caller's own copies of a WOL SOPASS (`WolSet.sopass`, a `Wol.sopass` kept past `deinit`, the
+datagram of `buildSetWol`) are the caller's to wipe.
 
-## 4. Deferred
+## What is deliberately not done
 
-(2026-11-16: `WOL`, `EEE`, `FEC`, `PRIVFLAGS` and `TSINFO_GET` left this table and are typed calls.
-**WOL's `SOPASS` is a secret**: `wol.zig` zeroes the reply copy and the socket receive buffer after a
-GET, builds a SET in a pre-reserved buffer that is zeroed, and zeroes the sent datagram. A caller of
-the offline `buildSetWol` zeroes its result with `wol.wipe`. FEC's per-lane statistics stay on `raw`.)
+- **A second transport beyond the two ioctl calls.** `SIOCETHTOOL` is used only for `drvinfo()` and
+  `driverStats()`, which have no netlink message; no other legacy ioctl command is or will be added, and nothing
+  that netlink already covers is duplicated.
+- **SFF-8472 / SFF-8636 / CMIS decoding.** `moduleEeprom` returns raw bytes and stops there; turning them into
+  vendor strings, wavelengths and DOM readings is a separate spec family and would be its own module.
+- **Compact bitsets in the FEATURES_SET encoders** (to match the two compact captures): rejected. It would
+  silently break `SetResult.honouredByName`, which only has names to report when the reply is verbose, for every
+  caller of `setFeaturesByName`.
 
-Reachable through `Ethtool.raw`, not modelled:
+## Verification
+
+### Capture environments
+
+| environment | what it produced |
+|---|---|
+| ordinary unprivileged user, real NICs (`enp0s31f6`, an Intel `e1000e`; `wlp2s0`, `iwlwifi`) | every request golden, and the GET-reply and error goldens |
+| unprivileged user+net namespace (`unshare -rn`) with a `veth` pair | the two compact `FEATURES_SET_REPLY` goldens and the `FEATURES_NTF` notification golden — all three need CAP_NET_ADMIN to provoke |
+| `unshare -rn` + a raw `AF_NETLINK` socket (Python `socket.AF_NETLINK`, no library beyond stdlib) instead of the real `ethtool` binary | `reply_features_set_honoured_verbose` — the real `ethtool` CLI always requests a *compact* reply, so the *verbose* reply shape this module's own `setFeaturesByName` actually receives had no capture route through `ethtool` itself; sending the request by hand (same verbose `WANTED` bitset, `compact_bitsets` omitted) was the only way to provoke it |
+
+The namespace harness is the one `CONVENTIONS.md` §7 prescribes for netlink
+modules. It is worth stressing that SET *requests* did **not** need it: the
+kernel refuses an unprivileged SET only after `ethtool` has already handed the
+bytes to `sendto`, so an unprivileged `strace` still pins them byte for byte.
+
+### Request goldens — captured from a real `ethtool`, byte for byte
+
+```sh
+strace -f -e trace=%network -e write=all -e read=all -xx -s 16384 \
+    -e abbrev=none ethtool <args>
+```
+
+`-e trace=%network`, not `sendmsg`: **`ethtool` sends with `sendto`**, so the
+`-e trace=sendmsg` recipe the sibling `nl80211` goldens use captures the
+kernel's replies and none of the requests. That cost an hour and is recorded
+at the top of `src/goldens.zig` so it costs nobody else one.
+
+The request goldens are committed one per command line:
+
+| command | pins |
+|---|---|
+| `ethtool enp0s31f6` | `LINKMODES_GET` (no flags), `LINKINFO_GET`, `LINKSTATE_GET` |
+| `ethtool -g / -c / -a / -l / -k` | `RINGS_GET`, `COALESCE_GET`, `PAUSE_GET`, `CHANNELS_GET`, `FEATURES_GET` |
+| `ethtool -a` (2nd request) | `LINKMODES_GET` **with** `ETHTOOL_FLAG_COMPACT_BITSETS` — the same command as the first golden, differing in exactly the 8 bytes of the flag attribute |
+| `ethtool -k`, `ethtool -S … --groups` | two `STRSET_GET`s with an **empty header nest** (a device-independent string table) |
+| `ethtool -S enp0s31f6 --groups eth-mac eth-ctrl rmon` | `STATS_GET` + the verbose name-keyed group bitset + the one command whose header nest is attribute **2**, not 1 |
+| `ethtool -G … rx 512`, `-A … autoneg off`, `-K … tso off`, `-s … speed 100 duplex full autoneg on` | the four SET request shapes |
+| `ethtool -m enp0s31f6` | `MODULE_EEPROM_GET` |
+| `unshare -rn` + `ethtool -K veth0 tso on` | the 5-name masked verbose `FEATURES_SET` bitset |
+| `unshare -rn` + `ethtool -L veth0 combined 1` / `-C veth0 adaptive-rx on` / `-s veth0 port tp` / `--set-module veth0 power-mode-policy high` | `CHANNELS_SET`, `COALESCE_SET`, `LINKINFO_SET`, `MODULE_SET` |
+
+Only `nlmsg_seq` is treated as a runtime value (each test builds with the
+sequence the capture used). `nlmsg_pid` needs no special handling — `ethtool`,
+like this module, writes 0 and lets the kernel fill it in. Everything else,
+including attribute order and padding, is a plain byte compare.
+
+Each of those tests drives this module's own public request encoder (*One encoder per operation*) —
+the same `buildX` the client method calls — so the capture is compared against
+what an `Ethtool` actually puts on the wire, not against a re-spelling of it
+in the test. `FEATURES_SET` is the exception, for the reason *One encoder per operation* gives.
+Encoder shapes `ethtool` never sends (a SET keyed by bit index, a *device's*
+string sets, `PAUSE_GET` with `ETHTOOL_FLAG_STATS`, `MODULE_GET`) have no
+capture to compare against and are decoded back with this module's own
+primitives instead, asserting the optional attributes that must be **absent**
+as well as those present.
+
+One encoder was reordered to keep that compare plain: `appendLinkModesSet`
+emits speed → duplex → autoneg, which is the order `ethtool -s` uses. Netlink
+attaches no meaning to attribute order; matching the reference tool turns a
+set comparison into a byte comparison, which is strictly stronger.
+
+### What could **not** be captured from `ethtool`
+
+- **Compact bitsets in a request.** `ethtool` always keys the bitsets it
+  *sends* by name, because userspace does not want to hardcode kernel bit
+  numbers. `bitset.appendCompact` and `bitset.appendIndexedValues` are
+  therefore UAPI-derived and covered by round-trip + hostile-input tests.
+- **A verbose `FEATURES_GET` reply.** `ethtool` always sets
+  `ETHTOOL_FLAG_COMPACT_BITSETS` for features. That reply was fetched instead
+  with a 30-line raw `AF_NETLINK` client — the oracle there is the kernel
+  itself, not `ethtool`. It earns its place: it is the only golden that pins
+  the `NOMASK`-verbose rule (*Bitsets*).
+- **The `monitor` notification.** `ethtool --monitor` only prints, so the
+  group was joined by a small raw reader in the namespace while `ethtool -K`
+  ran. The committed message is the kernel's, byte for byte.
+- **Non-empty statistics groups.** No NIC available implements the
+  standardised `eth-mac`/`eth-ctrl`/`rmon` counters, so the real `STATS_GET`
+  reply has three groups and no counters in them — which is itself the case
+  worth pinning (empty ≠ error). Counter and histogram decoding, including the
+  open-ended last RMON bucket, is covered by constructed replies in
+  `stats.zig` and is honestly labelled UAPI-derived.
+- **Module EEPROM data.** No pluggable transceiver was available; only the
+  request is pinned. `moduleinfo.parseEeprom` is covered by constructed
+  replies.
+
+### Decoder goldens — real kernel replies
+
+Reply goldens are decoded back through the module. The ones that carry
+their weight:
+
+- **The same link-mode bitset in both encodings** (`ethtool <dev>` verbose vs
+  `ethtool -a <dev>` compact, seconds apart on the same NIC). A dedicated test
+  walks all 125 bits and requires `supports`/`advertises` to agree — so the two
+  decoders check each other rather than both being checked against my reading
+  of the header.
+- **The same feature bitsets in both encodings**, likewise cross-checked over
+  all 64 bits for active/supported/fixed.
+- **`FEATURES_GET` + `STRSET_GET` together**, exercising the name → index →
+  bit round trip that compact bitsets force on a caller. This is what caught
+  the fact that four of the 64 feature bits are named with an **empty string**
+  — a decoder that skipped empty names would have silently shifted every index
+  after them.
+- **Three `FEATURES_SET_REPLY`s**: one fully honoured and one where the kernel
+  refused four of five requested bits, which established the actual diff
+  semantics (*A SET's ACK is not proof*), and a third, `reply_features_set_honoured_verbose`.
+  The first two are **compact** — the format the real `ethtool` CLI asks for
+  (it always sets `compact_bitsets`, per `bitset.zig`'s file header). This
+  module's own `setFeaturesByName`/`setFeaturesByIndex` never set that flag
+  (`features.zig`'s `buildSetFeaturesByName`/`ByIndex`), so the reply they
+  actually receive is the verbose one, and the third golden pins it: captured
+  live (`unshare -rn`, a raw `AF_NETLINK` socket carrying the exact same
+  verbose `WANTED` bitset `ethtool -K veth0 tso on` sends, header's
+  `compact_bitsets` omitted), the byte-exact evidence for what the kernel
+  replies with on the path this module's by-name API drives.
+- **A real `FEATURES_NTF`** off the `monitor` group, decoded with the ordinary
+  `features.parse` to demonstrate that a notification's payload is a GET
+  reply's payload.
+- **Three error replies**: `-EPERM` (`WOL_GET` unprivileged), `-EOPNOTSUPP`
+  with no extended ACK (`CHANNELS_GET` on `e1000e`), and `-EOPNOTSUPP` **with**
+  `NLMSGERR_ATTR_MSG` = "failed to retrieve link settings" (`LINKMODES_GET` on
+  Wi-Fi). The last one is why the socket enables `NETLINK_EXT_ACK`, and it also
+  pins the uncapped-echo layout: the kernel echoes the *whole* request when it
+  attaches a message, so the ext-ACK walk must skip `nlmsg_len` bytes, not 16.
+- **The nlctrl `CTRL_CMD_NEWFAMILY` reply**, asserting family id 23 and
+  `monitor` group id 8 — and that 23 > `GENL_ID_CTRL`, i.e. that it really is
+  dynamically assigned.
+
+### Anonymisation
+
+One **length-preserving** substitution was applied to every committed reply:
+`nlmsg_pid` was zeroed. That field is the capturing process's netlink port id,
+which the kernel derives from its pid; it identifies a session on the capture
+machine and nothing about the protocol, and nothing in these tests reads it
+(the goldens are decoded, not matched against a socket).
+
+Nothing else was touched. There is nothing else to touch: **the ethtool
+netlink family carries no MAC addresses, serial numbers or bus IDs at all.**
+The one command that would (`ethtool -i` — driver, firmware version, bus id)
+has no netlink message and never left the ioctl path; `src/ioctl.zig` covers it, and its tests
+commit no captured bus ids or driver strings (the comparison runs live). The `MODULE_EEPROM` data
+attribute *could* carry a transceiver serial number, but no module was present
+and no EEPROM bytes were captured.
+
+Interface names (`enp0s31f6`, `wlp2s0`, `veth0`) were deliberately kept: they
+are udev bus-path names or names this harness created, they carry no identity,
+and keeping them makes the capture commands in the comments reproducible.
+
+### Hostile-input tests
+
+Every decoder is fed truncated TLVs, wrong-width scalars and contradictory
+attributes, and must answer with `error.Truncated` / `error.BadLength` rather
+than a panic or an over-read. Specifically rejected:
+
+- a compact bitset whose `VALUE`/`MASK` word count contradicts its `SIZE`;
+- a `VALUE` payload that is not a whole number of `u32` words;
+- a bitset carrying **both** encodings, or `NOMASK` **and** a `MASK`;
+- a `SIZE` or `COUNT` of `0xffffffff` — bounded (`bitset.max_bits`,
+  `stats.max_strings`) *before* any allocation;
+- a bit index at or beyond `max_bits`;
+- duplicate `VALUE`/`OURS`/`HW`/`ACTIVE`/… attributes (a leak vector, since the
+  second parse would orphan the first allocation);
+- a string-set entry with no index or no value (it would put every later index
+  out of step);
+- an `ETHTOOL_A_MODULE_EEPROM_DATA` longer than the kernel's own 128-byte
+  ceiling;
+- a statistics counter that is not exactly 8 bytes.
+
+Four fuzz harnesses (`ethtool-bitset`, `ethtool-params`, `ethtool-stats`,
+`ethtool-notification` in `src/fuzz_test.zig`) additionally require no crash,
+no leak and no unbounded loop on arbitrary bytes. Their verdicts come from the
+deterministic driver, `ETHTOOL_FUZZ=<runs>[,<first seed>]` (testkit's fuzz
+driver; `ETHTOOL_FUZZ_ONLY` selects a harness), whose inputs are corpus
+entries built by this module's own encoders with a few octets damaged; a
+reach test in the ordinary suite checks that the harnesses get everywhere.
+
+### Live tests
+
+The live tests run against the real kernel. They pick a target with the sibling
+`netlink` module's `RTM_GETLINK` dump (not `/sys` — same no-libc discipline,
+and it yields `ARPHRD_ETHER` so a loopback or tunnel is not mistaken for a
+NIC), and every one of them prints `SKIPPED: …` and passes when a driver does
+not implement the operation. `EOPNOTSUPP` is the *normal* answer for most of
+this family on most drivers; a suite that failed on it would be useless.
+
+The strongest one asks the same kernel for the same link modes twice, once
+verbose and once compact, and requires every bit to agree — a decoder bug in
+either encoding fails on any machine with an Ethernet NIC.
+
+Two tests need CAP_NET_ADMIN (`RINGS_SET` writing the current value back, and
+`FEATURES_SET` re-requesting a feature's current state) and skip without it.
+Both run for real inside `unshare -rn` against a `veth` pair; the
+features one exercises the full SET → `SetResult` path.
+
+### Calls without a capture
+
+`EEE`, `FEC`, `WOL`, `PRIVFLAGS`, `TSINFO_GET` and `RSS_GET` have no `strace` golden (`goldens.zig` pins none of
+them): their encoders and decoders are covered by round trips built from the kernel's attribute layout
+(hand-built reply buffers, malformed-attribute cases such as wrong sizes, a table that is not a multiple of four
+bytes, duplicates), plus live tests that answer or skip cleanly when the driver reports `NotSupported`. They are
+UAPI-derived, not diffed against `ethtool`. The success path of `Ethtool.rss` needs a NIC whose driver implements
+`get_rxfh` and is not exercised on a machine without one.
+
+### The two ioctl calls
+
+Decoding tests run on hand-built byte images from the uAPI layout (the struct sizes are comptime-asserted,
+`ethtool_drvinfo` = 196 bytes), and a live test runs `ethtool -i` and `ethtool -S` on a real interface as the
+oracle and compares driver, version, firmware version, bus info, and the stats names and count exactly. Values
+are compared only for `*_packets` / `*_bytes` counters, bracketed by an `ethtool -S` run before and one after
+the call. No captured values are committed (they would carry this machine's bus ids); the comparison happens at
+test time and skips when no interface answers.
+
+### Run and score
+
+`scripts/modtest ethtool`; the live and privileged tests skip where the machine cannot answer.
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
+
+## Backlog / deferred
+
+Reachable through `Ethtool.raw`, not modelled; all fit CONVENTIONS §2 (netlink over raw syscalls, no libc).
 
 | command family | why deferred |
 |---|---|
 | `DEBUG` | driver-private message-level flag set; the `PRIVFLAGS` shape would fit, add on demand |
-| `TSCONFIG`, `PHC_VCLOCKS`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed (2026-11-16) |
-| `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have |
+| `TSCONFIG`, `PHC_VCLOCKS`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed |
+| `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have (effort: medium) |
 | `RSS_SET` (and the `RSS_GET` per-flow `FLOW_HASH` nest / dump form), `PLCA`, `MM`, `PSE`, `PHY`, `TUNNEL_INFO`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
+| FEC per-lane statistics (`FEC_STATS`) | stays on `raw`; `FEC_GET`/`SET` are typed |
 | the all-devices **dump** form (`NLM_F_DUMP` with an empty header nest) | the typed API is per-device; `raw(.{ .dump = true })` reaches it |
 
-Survey findings (survey 2026-09-30), ranked by how often `ethtool(8)` users reach for them; all fit CONVENTIONS §2
-(netlink over raw syscalls, no libc). Each is reachable through `raw` today.
-
-1. ✅ DONE 2026-11-16 (`Ethtool.eee`/`setEee`, `fec`/`setFec` in `eee_fec.zig`; FEC_STATS left to `raw`) **EEE and FEC `GET`/`SET`** (survey 2026-09-30) — `--show-eee`/`--show-fec` are routine on 10G+ and copper; mdlayher/ethtool already has FEC. Effort: small (bitsets exist).
-2. ✅ DONE 2026-11-16 (`Ethtool.wol`/`setWol` in `wol.zig`; SOPASS buffers wiped, see its header) **WOL `GET`/`SET`** (survey 2026-09-30) — the everyday laptop/server `ethtool -s ... wol g`; mdlayher/ethtool has it. Effort: small; `SOPASS` needs the secret handling noted above.
-3. ✅ DONE 2026-11-16 (`Ethtool.privflags`/`setPrivflags` in `privflags.zig`) **`PRIVFLAGS` `GET`/`SET`** (survey 2026-09-30) — driver switches; `STRSET` half exists. Effort: small.
-4. ✅ DONE 2026-11-17 (`Ethtool.rss` in `rss.zig`: hfunc, key, indirection table, context, input xfrm; read-only, `FLOW_HASH` nest left to `raw`) **`RSS_GET` / indirection table** (survey 2026-09-30) — `ethtool -x` is standard for NIC tuning; safchain has `GetIndir`. Effort: medium.
-5. ✅ DONE 2026-11-16 (`Ethtool.tsInfo` in `tsinfo.zig`; stats / provider nests left to `raw`) **`TSINFO_GET`** (survey 2026-09-30) — `ethtool -T`, first stop for PTP setup. Effort: small-medium.
-6. **Cable test (`CABLE_TEST_ACT`/`TDR`)** (survey 2026-09-30) — needs request/notification correlation. Effort: medium.
-
-**Decided 2026-09-30 (user, option B): a small, bounded `SIOCETHTOOL` part — done 2026-09-30.**
-`ethtool -i` (drvinfo: driver, firmware version, bus id) and plain `ethtool -S` (the driver's
-private counter array) have no netlink message and never will; they are the reference tool's
-most-used calls. So this module gets exactly two ioctl entry points, `drvinfo()`
-(`ETHTOOL_GDRVINFO`) and `driverStats()` (`ETHTOOL_GSSET_INFO` + `ETHTOOL_GSTRINGS` +
-`ETHTOOL_GSTATS`), in pure Zig over `std.os.linux.ioctl`, with no libc, in their own
-`src/ioctl.zig`. That is what ethtool(8) itself does: netlink where a message exists, ioctl
-where none does. The kernel keeps these ioctls as stable uAPI. The earlier refusal ("a second,
-unrelated transport") holds for everything else. No other ioctl command is added, and nothing
-that netlink already covers is duplicated. Implemented in `src/ioctl.zig`.
-Decisions: the counter count from `GSSET_INFO` must agree with the `GSTRINGS` length and the
-`GSTATS` `n_stats`; on a mismatch the sequence is retried once and a second mismatch is
-`error.StatsChanged`. The kernel sizes its copy-out by its own current count, so the scratch
-buffers are always allocated for the bound (`max_stats` = 65536, `error.TooManyStats` beyond),
-never for the count just read. A name field without a NUL is `error.BadReply`. The interface
-name is validated (1..15 bytes, no NUL, '/', ':' or whitespace) before any syscall.
-
-Verification: decoding tests on hand-built byte images from the uAPI layout (the struct sizes
-are comptime-asserted, `ethtool_drvinfo` = 196), and a live test that runs `ethtool -i` and
-`ethtool -S` on a real interface as the oracle and compares driver, version, firmware version,
-bus info, and the stats names and count exactly. Values are compared only for `*_packets` /
-`*_bytes` counters, bracketed by an `ethtool -S` run before and one after the call. No captured
-values are committed (they would carry this machine's bus ids); the comparison happens at test
-time and skips when no interface answers.
-
-Also deliberately absent: **SFF-8472 / SFF-8636 / CMIS decoding.**
-`moduleEeprom` returns raw bytes and stops there; turning them into vendor
-strings, wavelengths and DOM readings is a separate spec family and would be
-its own module.
-
-## 5. Provenance
+## Provenance
 
 Clean-room from the kernel UAPI headers `linux/ethtool_netlink_generated.h`
 and `linux/ethtool.h` (GPL-2.0 WITH Linux-syscall-note). Constants,
@@ -456,9 +459,9 @@ The `ethtool` binary (v6.19) was used **only as a black-box oracle**: run under
 `strace`, its `sendto` payloads compared against this module's encoders. No
 `ethtool` source was read or ported, and no `ethtool` behaviour beyond the wire
 bytes was copied. Per `CONVENTIONS.md` §5 a black-box oracle is neither
-required attribution nor a design reference; the `NOTICE` entry this module
+required attribution nor a design reference; the attribution this module
 does need is for the **kernel UAPI headers**, on the same Linux-syscall-note
-basis as `netlink`/`genetlink`/`nl80211` — see `NOTICE`.
+basis as `netlink`/`genetlink`/`nl80211` — see the README's `Provenance:` line.
 
 ## Anchoring
 

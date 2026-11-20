@@ -37,7 +37,7 @@ against this module's — no `ethtool` source consulted, studied or ported. DATA
 |---|---|
 | **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, `EEE_GET`/`SET`, `FEC_GET`/`SET`, `WOL_GET`/`SET` (SOPASS wiped), `PRIVFLAGS_GET`/`SET`, `TSINFO_GET`, `RSS_GET`, the `monitor` multicast group |
 | **Escape hatch** | `Ethtool.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred** | DEBUG, TSCONFIG, cable test, RSS, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see `SPEC.md` |
+| **Not typed** | DEBUG, TSCONFIG, cable test, `RSS_SET`, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see *Not provided* |
 | **Two ioctls, nothing more** | `ioctl.drvinfo()` (`ethtool -i`: driver/version/firmware/bus info) and `ioctl.driverStats()` (plain `ethtool -S`: the driver's private counter array) over `SIOCETHTOOL` — there is no netlink message for either. No other legacy ioctl command is or will be here. See "The two ioctl calls" below. |
 
 ## API
@@ -124,7 +124,8 @@ defer ethtool.Ethtool.freeRawReplies(gpa, replies);
 ```
 
 Sub-namespaces, all `pub`: `uapi` (every constant and enum), `bitset`,
-`header`, `link`, `params`, `features`, `stats`, `moduleinfo`, `client`, plus
+`header`, `link`, `params`, `features`, `stats`, `moduleinfo`, `eee_fec`,
+`wol`, `privflags`, `rss`, `tsinfo`, `client`, `ioctl`, plus
 `genl` and `codec` for driving `raw`. Every encoder and decoder is a pure
 function over byte slices, so the wire format is testable without a socket.
 
@@ -240,10 +241,11 @@ defer st.deinit(gpa);
 for (0..st.count()) |i| std.debug.print("{s}: {d}\n", .{ st.name(i), st.value(i) });
 ```
 
-- Errors are typed: `InvalidInterfaceName` (checked before any syscall),
-  `NoSuchDevice`, `NotSupported`, `PermissionDenied`, and for `driverStats`
-  also `TooManyStats` (more than `ioctl.max_stats` = 65536 counters),
-  `StatsChanged` and `BadReply`.
+- Errors are typed: `InvalidInterfaceName` (checked before any syscall: 1..15
+  bytes, no NUL, `/`, `:` or whitespace, not `.` or `..`), `NoSuchDevice`,
+  `NotSupported`, `PermissionDenied`, `InvalidRequest`, `SystemResources`,
+  `Unexpected`, and for `driverStats` also `TooManyStats` (more than
+  `ioctl.max_stats` = 65536 counters), `StatsChanged` and `BadReply`.
 - The counter count is read first and can change before the names and values
   are read; the sequence is retried once, then `StatsChanged`.
 - `STATS_GET` (above) is a different thing: the newer standardised groups
@@ -271,6 +273,12 @@ for (0..st.count()) |i| std.debug.print("{s}: {d}\n", .{ st.name(i), st.value(i)
   sizes, string-set counts and EEPROM lengths are all bounded before anything
   is allocated.
 
+## Not provided
+
+The commands listed as *Not typed* above (reachable through `raw`), `SFF-8472`/`SFF-8636`/CMIS decoding of module
+EEPROM bytes (`moduleEeprom` returns them raw) and every `SIOCETHTOOL` command beyond the two above. The reasons
+and the open items are in `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
+
 ## Verify
 
 ```sh
@@ -291,5 +299,5 @@ ip link add veth0 type veth peer name veth1 && ip link set veth0 up
 zig build test-ethtool
 ```
 
-Capture commands, both capture environments, anonymisation and the full
-deferred list are documented in `SPEC.md` and at the top of `src/goldens.zig`.
+Capture commands, the capture environments and anonymisation are documented in
+`SPEC.md` *Verification* and at the top of `src/goldens.zig`.
