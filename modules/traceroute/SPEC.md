@@ -31,9 +31,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02 (`tracerou
 | [mehrdadrad/mylg](https://github.com/mehrdadrad/mylg) | Go | MIT | 2.7k | push 2020-02-26 | Network diagnostic CLI with traceroute; stale since 2020 *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no traceroute; a GitHub search (`traceroute`, language Zig) found no traceroute library. |
 
-**Where we are ahead:** the only Zig traceroute engine found; against the C tools it is a testable library with an injectable transport (offline canned-packet tests on a virtual clock), partial-trace-on-transport-failure, spoof hardening (Echo Reply must come from the destination; random ident/seq; bounded run time), and it returns a structured `Trace`. **Where we are behind** (re-checked 2026-11-02): half-open raw SYN, adaptive `-w` waits, flow labels and Dublin-style multipath enumeration (→ Backlog); ASN/reverse-DNS annotation is left to sibling modules (`dns`). Built since the survey: every method and option above.
+**Where we are ahead:** the only Zig traceroute engine found; against the C tools it is a testable library with an injectable transport (offline canned-packet tests on a virtual clock), partial-trace-on-transport-failure, spoof hardening (Echo Reply must come from the destination; random ident/seq; bounded run time), and it returns a structured `Trace`. **Where we are behind:** half-open raw SYN, adaptive `-w` waits, flow labels and Dublin-style multipath enumeration (left out on purpose, see *What is deliberately not done*); ASN/reverse-DNS annotation is left to sibling modules (`dns`). Built since the survey: every method and option above.
 
 ## Design & invariants
+
 Pure engine behind a `Transport` seam: `traceWith` is the hop state machine over an injectable
 transport (`sendFn` with TTL / `recvFn` bytes + source / `nowFn` clock), fully offline-testable from
 canned packet bytes on a virtual clock; `LinuxTransport` + `trace` are the live path. Correlation over
@@ -45,7 +46,7 @@ RTT is unambiguous. `Options.parallel` opens a window (traceroute(8)'s `-N`, who
 goes when fewer than that are unanswered and within their deadline and `send_gap_ms` has passed, an answer
 past its deadline still lands in its slot but frees no second place, and the trace ends at the LOWEST
 terminal TTL, whichever arrived first; answers above it are not in the result. With `parallel = 1` this is
-the same engine: the 24 kernel-oracle transcripts replay unchanged. `max_silent_hops` is mtr's `-U`. Hop count and probes-per-hop are bounded
+the same engine: the kernel-oracle transcripts replay unchanged. `max_silent_hops` is mtr's `-U`. Hop count and probes-per-hop are bounded
 (`Options.validate`; `max_probes_per_hop = 16`, `max_payload = 1024`). Allocation: `Trace` owns
 exactly two slices (`hops`, `probes`), sized to the used prefix and freed by `deinit`; per-hop
 `stats()` streams through a `latency-stats` Accumulator. Live path is Linux: a raw ICMP socket
@@ -56,9 +57,12 @@ Clean-room from the classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-st
 ICMP Echo — a public technique) and RFC 792 ICMP formats via the sibling `icmp.echo` codec — see
 README Provenance.
 
+
+`LinuxTransport.recvImpl` drains the error queue after each wakeup (`waitForData`) and discards the entries: the queued IP_RECVERR entry keeps POLLERR set, so without it the receive loop would busy-spin after the first ICMP error (a raw socket also gets the message as a datagram). A forged Destination Unreachable or Time Exceeded with the right ident, sequence and quoted destination is accepted; that is the threat model below.
+
 ### A transport failure returns a partial `Trace`, not just an error
 
-`traceWith` used to propagate a `sendFn`/`recvFn` failure with `try`, which discarded every
+Propagating a `sendFn`/`recvFn` failure with `try` would discard every
 hop already collected — for a traceroute, eight good hops then a broken socket is most of the
 answer, not a failure to report as opaquely as a caller mistake. Zig has no error payloads, so
 carrying the partial result out alongside the error needed a shape decision:
@@ -77,8 +81,8 @@ carrying the partial result out alongside the error needed a shape decision:
   to `error{ InvalidOptions, OutOfMemory }`.** This follows the module's own existing shape:
   `Trace` already records *how* a trace stopped as data (`reached`, `unreachable_code`), not as a
   distinct error per termination mode — a transport failure is simply a third way to stop early,
-  and was the odd one out for using the `!` channel instead of a field. `sendFn`/`recvFn` failures
-  are now caught inside `traceWith` (`catch |err| { transport_err = err; break :outer; }`) instead
+  and would be the odd one out if it used the `!` channel instead of a field. `sendFn`/`recvFn` failures
+  are caught inside `traceWith` (`catch |err| { transport_err = err; break :outer; }`) instead
   of propagated with `try`, so the function falls through to the same hop-packing code every other
   termination path already uses, and returns a `Trace` whose `hops`/`probes` hold whatever was
   collected up to the failure. The genuine no-partial-data cases (`InvalidOptions`, the initial
@@ -94,18 +98,16 @@ definition follows a successful send) leaves `hops_used` as already set — that
 least one real attempt, the same way an `unreachable_code` stop mid-hop keeps the hop it stopped
 in (see `wire.zig`'s sibling test "destination unreachable terminates and records the code").
 
-**BREAKING for a caller that matched `TraceError`/`TransportError` on `traceWith`'s return.** A
-`try traceWith(...)` or `catch |err| switch (err) { error.SendFailed, error.RecvFailed => ... }`
-no longer compiles/fires for those two — the same failure now arrives as `tr.transport_err` on a
-successful return. See CHANGELOG.md.
+A caller does not match `TransportError` on `traceWith`'s return: a `catch |err| switch (err) { error.SendFailed, error.RecvFailed => ... }`
+never fires for those two; the failure arrives as `tr.transport_err` on a successful return.
 
-## UDP method, extensions, live options (2026-10-04)
+## UDP method, extensions, live options
 
 **UDP.** Probe *k* is a datagram from the transport's bound source port (`Options.ident`, the
 correlation token — the live path uses the kernel's ephemeral port, or `Options.source_port`) to `udp_port_base + k`; the
 `validate` rule keeps that window inside 1…65535. A reply is an ICMP error quoting an IPv4/IPv6
 header with protocol/next-header 17 and the probe's source and destination ports, with the
-quoted destination equal to the trace's (the A1 F3 rule, now also for UDP). The destination's
+quoted destination equal to the trace's (the A1 F3 rule, for UDP as for ICMP). The destination's
 own Port Unreachable (IPv4 code 3, IPv6 code 4) from the destination's address is `.reply` and
 sets `reached`; any other Destination Unreachable — or a Port Unreachable from anyone else (A1
 F1) — is terminal. The same first-answer-wins rule (A1 F12) holds. The live path sends from a
@@ -122,7 +124,7 @@ length; class 1 / C-Type 1 entries become `MplsEntry` (label 20 bits, TC 3, S 1,
 `max_mpls_labels` per probe. ICMPv4 checksums are verified before any of this (`icmpMessage`),
 as `icmp.echo` does for the ICMP method.
 
-**Interface Information (RFC 5837, 2026-11-02).** `ifInfoOf(family, msg)` walks the same objects
+**Interface Information (RFC 5837).** `ifInfoOf(family, msg)` walks the same objects
 for class 2 and returns an `IfInfoSet` (`Probe.if_info`, filled by `classifyIcmp`; at most
 `max_if_infos` = 4, one per role, §4.5). The C-Type is read most significant bit first (§4.1):
 bits 0-1 the role (`IfRole`: incoming, sub-IP, outgoing, next hop), bits 2-3 reserved and
@@ -132,8 +134,7 @@ octets), name sub-object (a length octet that counts itself, a multiple of 4 up 
 padded: a name of up to `max_if_name` = 63), MTU (4 octets). A damaged object (a field past its
 object, bytes left over, a bad name length, an AFI that is unknown or not the message's family)
 ends the walk and keeps the objects before it; two objects of one role are illegal and drop the
-whole set. An all-padding name reads as "no name". `Probe` carries the set inline: `@sizeOf(Probe)`
-grew from 112 to 512 bytes. Anchored on `golang.org/x/net/icmp` v0.61.0 (`tools/go_oracle`, 136
+whole set. An all-padding name reads as "no name". `Probe` carries the set inline (a large struct). Anchored on `golang.org/x/net/icmp` v0.61.0 (`tools/go_oracle`, 136
 frozen messages in `src/if_info_vectors.zig`: every role and every subset of the four fields,
 both families, Time Exceeded and Destination Unreachable, several objects, MPLS ahead of the
 object). x/net agrees with the RFC on the bit values and field order; it can only marshal a name
@@ -145,7 +146,7 @@ AFI without consuming the address — none of which this decoder copies.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
-## Continuous mode over UDP and TCP (2026-11-02)
+## Continuous mode over UDP and TCP
 
 `MtrOptions.method` with `udp_port_base`, `dst_port`, `flow_stable`, `payload_fill`, for `Mtr` and `MtrSet`
 alike: all of them go through the same `Prober` as `traceWith`, so there is no second copy of the
@@ -164,7 +165,7 @@ read it whatever the gap. A set's round can outgrow that, so over TCP `MtrSetOpt
 Oracle: `mtr-*` and `mtrset-*` in `tools/kernel_oracle.py` run `LiveMtr` and `LiveMtrSet` on the live chain,
 every method, against the topology, and `mtr -r` agrees for ICMP, UDP and TCP.
 
-## TCP method (2026-11-02)
+## TCP method
 
 A connection attempt per probe, non-blocking, with the probe's TTL and `IP_RECVERR`: traceroute(8)'s
 `tcpconn` shape, not half-open raw SYN. It needs no privilege, which is what the network-monitor consumer runs with, and the
@@ -185,7 +186,7 @@ the oldest when it needs the place; a socket per attempt means that many file de
 `tools/kernel_oracle.py`, the four scenarios plus `open-port` (a listener on the server), against
 `traceroute -T`.
 
-## Flow-stable probes (Paris traceroute, 2026-11-02)
+## Flow-stable probes (Paris traceroute)
 
 Per-flow load balancers hash the 5-tuple, so classic UDP probes, whose destination port differs, can
 take different branches and draw a path no packet took. `Options.flow_stable` keeps what they hash
@@ -208,25 +209,24 @@ constant and carries the probe id where they do not look.
   agrees with the kernel's.
 - **`Hop.distinctAddresses` on a flow-stable trace** means per-packet balancing, not per-flow.
 
-## Unprivileged UDP: the UDP socket's own error queue (2026-11-02)
+## Unprivileged UDP: the UDP socket's own error queue
 
 `.udp` with `.dgram`, or with `.auto` when a raw socket is refused, as traceroute(8) runs without
 privilege. `sock` is the UDP socket itself and only its error queue is read: a datagram on that socket
 comes from anyone and is never an answer, so it is read and dropped (left unread it would keep the
 poll from sleeping). The kernel returns the datagram's payload, not its header, so `errQueuePacket`
 rebuilds the quoted UDP header from the socket's port and `msg_name`'s and hands the engine the same
-message a raw socket sees: one parser, the same spoof rules. Oracle: 8 more kernel transcripts
+message a raw socket sees: one parser, the same spoof rules. Oracle: 8 kernel transcripts
 (`udp-dgram`), every hop as the topology dictates and as traceroute(8) reports it.
 
-## Unprivileged traceroute: the ping socket's error queue (2026-10-31)
+## Unprivileged traceroute: the ping socket's error queue
 
-The claim this SPEC used to make — "DGRAM sockets deliver ICMP errors on the error queue, not as
-packets, so raw is required" — was half right: they do arrive only on the error queue, but that
+A ping (DGRAM) socket delivers ICMP errors only on the error queue, not as packets, but that
 queue carries everything a hop needs. With IP_RECVERR/IPV6_RECVERR (set by `icmp.Socket.open`) a
 Time Exceeded or Destination Unreachable about one of the socket's echo requests is queued as
 `sock_extended_err` (ICMP type, code, origin), the reporting router as `SO_EE_OFFENDER`, the
 probe's destination as `msg_name`, and the quoted echo header (ident, seq) as payload —
-`icmp.Socket.recvErr` now returns all four (`ErrInfo.offender`, `.origin`). The kernel delivers
+`icmp.Socket.recvErr` returns all four (`ErrInfo.offender`, `.origin`). The kernel delivers
 these per socket by echo ident, so only the socket's own probes reach it; the ident is the
 kernel's (it rewrites what we write), which is why `trace` uses `lt.ident()` there.
 
@@ -251,7 +251,7 @@ topology's router, the same as the raw traces and traceroute(8); the replay test
 rebuilt packets through `traceWith`. A live test traces 127.0.0.1 over a ping socket in the netns
 lane, where `ping_group_range` is open and no capability is held.
 
-## Continuous mode: `Mtr` (2026-10-31)
+## Continuous mode: `Mtr`
 
 What mtr shows, as a library: `Mtr.round` sends one ICMP probe to every TTL of the path (`gap_ms`
 apart — a paced round, never a burst), waits `timeout_ms` after the last, and folds the answers
@@ -260,7 +260,7 @@ into `MtrHop` running statistics (sent, received → loss, last/best/worst/avg R
 last Destination Unreachable code). `LiveMtr` is the same over its own `LinuxTransport`, so it
 works unprivileged on a ping socket.
 
-**More statistics (2026-11-02).** `MtrHop` also keeps mtr's remaining columns, all updated in
+**More statistics.** `MtrHop` also keeps mtr's remaining columns, all updated in
 `record` and all plain data. `worst_jitter_ns` is the largest |ΔRTT|. `interarrival_jitter_ns` is the
 RFC 3550 A.8 estimator J += (|D| − J)/16 over consecutive answers, in integer ns (the division
 truncates; the bias stays under 16 ns, and the tests hold it to that against a float filter).
@@ -270,7 +270,7 @@ n·Σx² − (Σx)² in 256-bit integers from the saturating `sum_ns` and a satu
 squares cannot overflow 2^128), then an integer square root floored to a whole ns. There is no
 Welford state and no float subtraction, so a 1 µs spread on a 100 ms mean does not cancel away.
 `geomeanNs()` is exp of the mean of ln(RTT) kept in `sum_ln_ns` (f64; an RTT of 0 counts as 1 ns),
-null with no answer. `@sizeOf(MtrHop)` grew from 168 to 208 bytes.
+null with no answer.
 
 **Invariants.** (1) *Rate:* `round` itself waits out the rest of `interval_ms` since the previous
 round began, and `validate` floors `interval_ms` at `min_mtr_interval_ms` (100) and caps
@@ -290,16 +290,16 @@ in some builds) — it makes "which probe was this RTT" ambiguous and the loss f
 interval; a separate thread or `std.Io` inside the engine — the caller owns scheduling, a round
 is a bounded blocking call over the same `Transport` seam, offline-testable on a virtual clock.
 
-## Many destinations: `MtrSet` (2026-10-31)
+## Many destinations: `MtrSet`
 
-**Why.** A consumer that runs several live traces (the network-monitor consumer: one per watched host) used to run one
+**Why.** A consumer that runs several live traces (the network-monitor consumer: one per watched host) would otherwise run one
 `LiveMtr` each: every trace probed its own TTL 1, 2, … — the same home gateway and ISP routers —
 once a second. Routers limit the ICMP errors they generate per source (Linux: `icmp_ratelimit`,
 about one Time Exceeded a second, with a small burst; hardware routers police their control plane
 similarly), so N traces across one router made it refuse most of them: false loss at exactly the
 hops every trace shares. `MtrSet` probes such a hop once per round, whatever the number of traces.
 
-**Design.** One transport per family; a probe goes to its member's destination through the new
+**Design.** One transport per family; a probe goes to its member's destination through
 `Transport.sendToFn` (a raw or ping socket is unconnected: `sendto` per packet). A round plans who
 probes which TTL, sends TTL by TTL across members `gap_ms` apart, collects until `timeout_ms` after
 the last, copies each shared TTL's answer to its sharers, and hands every member its answers via
@@ -330,7 +330,9 @@ still gets one probe per branch. The copied answer's RTT is the owner's; it is t
 the same TTL over a path both members agree on up to that TTL. Members of one family only (a
 consumer runs one set per family). Single owner: add/remove between rounds.
 
+
 ## Threat model / out of scope
+
 The live trace needs CAP_NET_RAW (raw ICMP socket) or, for the ICMP method, a group inside
 `net.ipv4.ping_group_range` (ping socket). On a ping socket the kernel only delivers answers about
 the socket's own echo identifier — a narrower intake than a raw socket's, and the same engine
@@ -359,8 +361,7 @@ cloud-metadata address), private, unspecified (`0.0.0.0`) and multicast/broadcas
 all accepted and probed. `netaddr` is a declared dependency and exports `isLoopback`,
 `isLinkLocalUnicast`, `isPrivate`, `isMulticast`, `isUnspecified`; this module calls none of them.
 For a diagnostic tool, tracing to a link-local next hop or a private-range destination is normal,
-legitimate use — the previous absence of a documented stance (not the absence of the checks
-themselves) was the actual gap. **A caller that exposes `trace`/`traceWith` to a destination chosen
+legitimate use. **A caller that exposes `trace`/`traceWith` to a destination chosen
 by an untrusted party (the SSRF-shaped case) must apply its own `netaddr`-predicate validation before
 calling in** — this module will not do it for them.
 
@@ -368,47 +369,36 @@ calling in** — this module will not do it for them.
 declared source, destination and protocol (`quoted_src`/`quoted_dst`/`quoted_proto`, A1 F2), and the ICMPv4
 checksum is verified before a message is used (`icmpMessage`, as `icmp.echo.parseV4` does); ICMPv6's checksum
 needs the pseudo-header, which only the kernel has. These are `icmp` module findings (`icmp`'s F2/F7 — A1
-audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope:
-non-Linux live path, MTU/PMTU discovery.
+audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope: see *What is deliberately not done*.
+
+## What is deliberately not done
+
+- **Half-open raw SYN** — the connect-per-probe TCP method gives the same result without privilege; a raw SYN would add about 250 lines of TCP header and pseudo-header code and need a raw socket.
+- **Adaptive `-w` waits** and **the IPv6 flow label (`-l`)** — not built.
+- **Dublin-style enumeration of branches** — a caller's loop over `flow_stable` traces with different source ports; this module returns the per-flow trace.
+- **`MtrSet` sharing across methods** — a set is one method.
+- **`-A` AS lookup, `-F`/`--mtu`, `-g`, `-UL`, `-D`, `-P`, output formats** — siblings (`dns`, `pathmtu`) or not a library's job.
+- **Non-Linux live path, MTU/PMTU discovery** — out of scope.
+- **Carrying unanswered probes into the next `Mtr` round, a thread or `std.Io` inside the engine, a second classification path for ping-socket answers, an out-parameter or a no-error return for a partial `Trace`, sharing `MtrSet` hops on a single matching answer** — considered and rejected, with the reasons in the design sections above.
 
 ## Verification
-Offline-first: the hop state machine runs against a fake transport that builds canned RFC 792-shaped
-response bytes (Time Exceeded, Echo Reply, Destination Unreachable, drops, late replies, load-
-balanced hops, malformed/hostile input) through the real `icmp.echo` parsers on a deterministic
-virtual clock — TTL/ident/seq stamping, terminal-code handling, `*` timeouts, `distinctAddresses`,
-per-hop `latency-stats`, IPv4 raw-header shape, IPv6, option validation. Live tests trace `127.0.0.1`
-over each socket (raw ones skipped without CAP_NET_RAW), and `kernel_oracle_test.zig` replays 54 traces
-of real routers. Run: `zig build test-traceroute`.
 
-**2026-10-04:** real kernel replies to UDP probes from a veth router sandbox (client → router →
-server in three throwaway netns inside `unshare -rnm`, tcpdump-decoded): the router's Time
-Exceeded and the server's Port Unreachable drive a two-hop UDP trace to `reached`; the same bytes
-are refused under a wrong source port, a port window that excludes them, a different destination,
-a quoted protocol other than UDP and a damaged ICMP checksum; the server's Port Unreachable from
-the router's address is terminal, not `reached`; a late duplicate does not overwrite a slot. An
-MPLS-extended Time Exceeded that tcpdump decodes ("checksum … (correct)", "label 16, tc 0, ttl 1")
-yields its two-entry stack; each RFC 4884 rule (128-byte minimum, version 2, C-Type 1, the
-compatibility checksum) is shown rejecting on its own with every checksum valid. IPv6 UDP uses
-code 4. Live (CAP_NET_RAW): a UDP trace to 127.0.0.1 ends on the loopback's Port Unreachable,
-and `iface`/`source`/`tos` are read back off the sockets. Mutation 2026-10-04: 29 mutants, all
-killed.
+Run with `scripts/modtest traceroute` (`zig build test-traceroute`).
+
+- **Offline-first.** The hop state machine runs against a fake transport that builds canned RFC 792-shaped response bytes (Time Exceeded, Echo Reply, Destination Unreachable, drops, late replies, load-balanced hops, malformed and hostile input) through the real `icmp.echo` parsers on a deterministic virtual clock: TTL/ident/seq stamping, terminal-code handling, `*` timeouts, `distinctAddresses`, per-hop `latency-stats`, IPv4 raw-header shape, IPv6, option validation, the `Mtr`/`MtrSet` rounds and sharing rule.
+- **Real kernel replies to UDP probes** from a veth router sandbox (client, router, server in three throwaway netns inside `unshare -rnm`, tcpdump-decoded): the router's Time Exceeded and the server's Port Unreachable drive a two-hop UDP trace to `reached`; the same bytes are refused under a wrong source port, a port window that excludes them, a different destination, a quoted protocol other than UDP and a damaged ICMP checksum; the server's Port Unreachable from the router's address is terminal, not `reached`; a late duplicate does not overwrite a slot. An MPLS-extended Time Exceeded that tcpdump decodes (checksum correct, label 16, tc 0, ttl 1) yields its two-entry stack; each RFC 4884 rule (128-byte minimum, version 2, C-Type 1, the compatibility checksum) is shown rejecting on its own with every checksum valid. IPv6 UDP uses code 4.
+- **Kernel oracle.** `src/kernel_oracle_test.zig` replays the frozen transcripts in `src/kernel_oracle_vectors.zig` (see *Anchoring*); `tools/interop.zig` with `tools/kernel_oracle.py` re-takes them (`zig build interop-traceroute`, see `tools/README.md`). `ecmp` (a router balancing by the 5-tuple) and `mtr-*` / `mtrset-*` (continuous mode on the live chain) are held by the oracle's `--check` verdicts, not replayed.
+- **RFC 5837 oracle.** `golang.org/x/net/icmp` v0.61.0 marshals and parses messages from this module's case tables (`tools/go_oracle`), frozen in `src/if_info_vectors.zig`.
+- **Live tests** trace `127.0.0.1` over each socket (raw ones skipped without CAP_NET_RAW; the ping-socket one runs in the netns lane, where `ping_group_range` is open and no capability is held); `iface`/`source`/`tos` are read back off the sockets with `getsockopt`.
+- **Fuzz:** the deterministic driver, `TRACEROUTE_FUZZ=<runs>[,<first seed>]` (`src/root.zig`): harnesses `traceroute`, `traceroute-mutated`, `traceroute-udp-answers`, `traceroute-window` and `traceroute-mtrset`.
+- **No-panic sweep:** `src/sweep_test.zig`.
+- **Constant time:** n/a — traceroute probes.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-traceroute` (`tools/bench.zig`, `tools/go_bench`): a codec comparison against Go `golang.org/x/net/icmp`, since Go has no tracer; the figures are the card's Performance line.
 
 ## Backlog / deferred
-- **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
-Documented out-of-scope: non-Linux live path, MTU/PMTU discovery.
-- **Review 2026-11-02, left:** a TCP attempt that gets an ICMP error other than Time Exceeded or Destination
-  Unreachable (Packet Too Big) ends there as a `*`, although the handshake could still complete.
-- **S2 survey 2026-11-02, left out:** half-open raw SYN (the connect-per-probe method gives the same
-  result without privilege; +250 lines of TCP header and pseudo-header, raw socket), adaptive `-w`
-  waits, the IPv6 flow label (`-l`), Dublin-style enumeration of branches (a caller's loop over
-  `flow_stable` traces with different source ports), `MtrSet` sharing across methods (a set is one
-  method).
-- ~~**ICMP extension objects / MPLS labels (RFC 4884/4950)**~~ — DONE 2026-10-04 (survey 2026-09-30): traceroute(8) prints them *(inferred)*; needs the quoted-datagram parsing that `icmp.echo` currently drops. Effort: medium, partly in `icmp`. Fits §2.
-- ~~**Source-address / interface / TOS options on the live path**~~ — DONE 2026-10-04 (survey 2026-09-30): multi-homed hosts cannot pick the egress; `icmp.Pinger` has `iface`/`oiface`/`tos`. Effort: small. Fits §2.
 
-## Status
-`gap · linux · client · single_owner` + deps: `icmp`, `netaddr`, `latency-stats` — canonical source
-is `pub const meta` in src/root.zig.
+- **A TCP attempt that gets an ICMP error other than Time Exceeded or Destination Unreachable** (Packet Too Big) ends there as a `*`, although the handshake could still complete.
 
 ## Anchoring
 
@@ -417,8 +407,4 @@ is `pub const meta` in src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
-**What the tests actually contain.** src/kernel_oracle_test.zig replays 54 live traces against real Linux routers (`tools/interop.zig` + `tools/kernel_oracle.py` → `kernel_oracle_vectors.zig`): a client → r1 → r2 → r3 → server chain of network namespaces per scenario — clean, r2 dropping its own Time Exceeded, r3 rejecting with Administratively Prohibited, the server dropping everything — for the ICMP and the UDP method over IPv4 and IPv6. The transport was recorded (every probe sent, every packet or timeout received, on a virtual clock); `traceWith` must send the same probes in the same order and report the same trace, and every hop is what the topology puts at that TTL — each router's client-side address, `*` for the silent one, `!X` (code 13 / v6 code 1) from the filter, the server's Echo Reply / Port Unreachable — which traceroute(8) 2.1.6 traced identically. The real tcpdump-decoded captures below anchor the refusal rules (wrong port, destination, protocol, checksum) and the RFC 4884/4950 extension parsing. Self only: the canned-fixture tests of hostile input, which have no outside answer
-
-**Kernel oracle 2026-10-05.** One defect, fixed the same day: a terminal hop (Destination Unreachable) stopped after its first probe and reported the unsent rest as `.timeout` — a `*`, and a loss in `Hop.stats`, where traceroute(8) shows `!X` for every probe. It now sends the hop's full count, as it always did for the destination's hop.
-
-**How it got there.** The anchoring work landed. DONE 466cc70: real 2-hop veth router; Time Exceeded from a real TTL decrement
+**What the tests actually contain.** src/kernel_oracle_test.zig replays 54 live traces against real Linux routers (`tools/interop.zig` + `tools/kernel_oracle.py` → `kernel_oracle_vectors.zig`): a client → r1 → r2 → r3 → server chain of network namespaces per scenario — clean, r2 dropping its own Time Exceeded, r3 rejecting with Administratively Prohibited, the server dropping everything — for the ICMP and the UDP method over IPv4 and IPv6. The transport was recorded (every probe sent, every packet or timeout received, on a virtual clock); `traceWith` must send the same probes in the same order and report the same trace, and every hop is what the topology puts at that TTL — each router's client-side address, `*` for the silent one, `!X` (code 13 / v6 code 1) from the filter, the server's Echo Reply / Port Unreachable — which traceroute(8) 2.1.6 traced identically. The tcpdump-decoded captures described under *Verification* anchor the refusal rules (wrong port, destination, protocol, checksum) and the RFC 4884/4950 extension parsing. Self only: the canned-fixture tests of hostile input, which have no outside answer

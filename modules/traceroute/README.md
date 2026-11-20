@@ -27,6 +27,8 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
 
+Not provided: ASN/reverse-DNS annotation, MTU discovery, a non-Linux live path, half-open raw SYN probes, adaptive waits and Dublin-style branch enumeration; the reasons are in SPEC *What is deliberately not done*, the one open item in *Backlog / deferred*.
+
 Continuous mode (mtr): `Mtr` / `LiveMtr` — `round()` probes every TTL once,
 paced, and keeps per-hop running statistics (`MtrHop`: sent/received/loss,
 last/avg/best/worst, jitter, responders); rounds are at least `interval_ms`
@@ -57,10 +59,13 @@ already tell you the other two ways a trace can stop early. Only `error.InvalidO
 and `error.OutOfMemory` are real Zig errors, because neither has a partial trace to
 show for it — they happen before any probe is sent.
 
-Two probe methods (`Options.method`): `.icmp` (the default; `traceroute -I`,
-mtr) and `.udp` (traceroute(8)'s default: UDP to port 33434 upwards, the
+Three probe methods (`Options.method`): `.icmp` (the default; `traceroute -I`,
+mtr), `.udp` (traceroute(8)'s default: UDP to port 33434 upwards, the
 destination answers Port Unreachable — the method that still works where ICMP
-echo is filtered). Routers that quote an RFC 4950 MPLS label stack in an RFC
+echo is filtered) and `.tcp` (a non-blocking connect per probe to `Options.dst_port`,
+default 80, no privilege needed; the destination answers SYN-ACK or RST). Further options:
+`parallel` / `send_gap_ms` (probes in flight, traceroute(8)'s `-N` / `-z`),
+`flow_stable` (Paris probes: the 5-tuple stays constant), `max_silent_hops` (mtr's `-U`). Routers that quote an RFC 4950 MPLS label stack in an RFC
 4884 extension get it on the hop (`Probe.mpls`, what `traceroute -e` shows).
 On a multi-homed host, `Options.iface` / `.source` / `.tos` / `.fwmark` pick
 the egress for the live `trace`; `.source_port` fixes the UDP method's source
