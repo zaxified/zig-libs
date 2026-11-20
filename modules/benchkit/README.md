@@ -18,18 +18,19 @@
 
 **Downstream consumer:** no
 
-The comparison driver behind every `**Performance:**` line. **Bench-only**:
+The comparison driver behind every card `**Performance:**` line. **Bench-only**:
 `build.zig` hands it to each `modules/<m>/tools/bench.zig` program (built
-ReleaseFast by `zig build bench-<m>`) and to nothing a downstream user imports.
+ReleaseFast by `zig build bench-<m>`) and to the interop tools of the modules
+that list it in `interop_deps`; no downstream user imports it.
 
-- **Status:** complete. **Platform:** any (the cycle counter is Linux `perf_event_open`; elsewhere wall time).
+- **Platform:** any (the cycle counter is Linux `perf_event_open`; elsewhere wall time).
 - **Deps:** none (std only). Its own tests use `testkit.child`.
 - **Model after:** criterion and Go's `testing.B`, reduced to the comparison a maturity card quotes.
 
-It was `testkit.bench` until 2026-11-14. It moved into a module of its own
-because `testkit` is a `test_dep` of 221 modules: every edit here re-keyed all
-of their tests in every CI lane (8 of testkit's 31 changes in the six weeks
-before), while no test imports it. Now an edit re-keys the bench programs only.
+It is a module of its own, not part of `testkit`, because `testkit` is a
+`test_dep` of most modules: an edit to the driver there re-keyed all of their
+tests in every CI lane, while no test imports it. Here an edit re-keys the
+bench programs only.
 
 ## Compared with
 
@@ -63,9 +64,10 @@ const summary = try bench.drive(io, arena, run, ctx, once, workloads, out);
 counter opens), `foreign` / `foreignArgv` (`<exe> <dir> <workload>`), `drive`
 (per workload the sides alternate for `rounds`, ratios ours/ref and
 ours/min(ref, alt), spread over 5 % flagged, a differing count fails the run),
-`goBuild`, `buildForeign`, `foreignOnce`. `Work(Op)` carries three variations:
+`goBuild`, `buildForeign`, `foreignOnce`. `Work(Op)` carries four variations:
 `info` (shown, not in the verdict), `ours_foreign` (our side timed by the
-foreign program), `wall_only` (a threaded op). The scoring (`score`,
+foreign program), `wall_only` (a threaded op), `fast_only` (the reference has
+no such workload, so the row counts for the fastest-alternative ratio only). The scoring (`score`,
 `Summary.add`) is a pure function of the rows and is what the tests check;
 `example/main.zig` shows it on made-up rows.
 
@@ -81,23 +83,25 @@ Provenance: original work of the zig-libs authors (MIT). No third-party source
 consulted or copied, so no `NOTICE` entry is required (root
 [`NOTICE`](../../NOTICE) §0). DATA: none.
 
+## Not provided
+
+Statistics over repeated runs (medians, confidence intervals, a significance
+test for a delta, as benchstat): the verdict is best-of-rounds plus a 5 %
+spread flag. The open items are under *Backlog / deferred*.
+
 ## Backlog / deferred
 
-- 2026-11-14: statistics over rounds (median, a confidence interval, a
-  significance test for a delta, as benchstat) -- today best-of-rounds and a
-  5 % spread flag.
-- 2026-11-14 (mutation run, 5 unobservable survivors): the timeouts of
-  `foreignArgv`, `goBuild`, `buildForeign` and `foreignOnce` (60 s / 600 s
-  constants) and `Cycles.open` returning null on Linux (indistinguishable from
-  `perf_event_open` being denied, the documented wall-time fallback) cannot be
-  observed by a test. A timeout parameter (or `Run` field) a test can set to
-  ~300 ms would make the four timeout mutants killable; the counter one needs a
-  lane where perf is guaranteed.
-- 2026-11-14 (mutation run, observation): `parseForeign` tokenizes on tabs, so
-  empty fields are skipped -- `x\t\t5\t3` parses as a three-field row instead
-  of being rejected. Undocumented, unpinned.
-- (from testkit, no-panic sweep 2026-10-29) `timeIt` never ends on a frozen
-  clock (not input-driven).
+- Statistics over rounds (median, a confidence interval, a significance test
+  for a delta, as benchstat).
+- The 60 s / 600 s timeouts of `foreignArgv`, `foreignOnce`, `buildForeign` and
+  `goBuild` (`run_timeout`, `build_timeout`) are constants, so no test can
+  observe them: a timeout parameter (or `Run` field) a test can set to about
+  300 ms would make them testable. `Cycles.open` returning null on Linux is
+  indistinguishable from `perf_event_open` being denied (the documented
+  wall-time fallback) and needs a lane where perf is guaranteed.
+- `parseForeign` tokenizes on tabs, so empty fields are skipped: `x\t\t5\t3`
+  parses as a three-field row instead of being rejected. Undocumented, unpinned.
+- `timeIt` never ends on a frozen clock (not input-driven).
 
 ## Anchoring
 
