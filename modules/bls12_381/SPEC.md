@@ -34,25 +34,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/zig-pairings](https://github.com/jedisct1/zig-pairings) | Zig | none found (no LICENSE file; the API reports none) — source not read | 7 | pushed 2026-09-09 | Its README: BLS12-381 and BN462 per draft-irtf-cfrg-pairing-friendly-curves-14, group ops, pairing, serialization. No signatures/KZG seen in the README *(inferred)*. |
 | [ChainSafe/blst-z](https://github.com/ChainSafe/blst-z) | Zig (bindings) | MIT | 4 | v0.1.0-rc.7 (2025-05-08) | Zig wrapper over blst *(inferred from the name; README not read)* — links the C library, so not a pure-Zig option. |
 
-**Where we are ahead:** the only Zig BLS12-381 with signatures, hash-to-curve, EIP-4844 KZG (embedded, subgroup-checked ceremony setup) and threshold BLS (Shamir + Feldman VSS) in one dependency-free package; blst itself has neither KZG nor threshold *(inferred)*, and the Zig alternatives are unlicensed or link C. **Where we are behind:** EIP-7594 cells; draft -05 where blst tracks V6; no -04-compatible `key_gen` (blst's default; EIP-2333 covers the Ethereum use); speed (pure Zig, no assembly; the SPEC recorded a 2-pair verify at 10 ms before its inversion-free Miller loop landed) (→ Backlog).
+**Where we are ahead:** the only Zig BLS12-381 with signatures, hash-to-curve, EIP-4844 KZG (embedded, subgroup-checked ceremony setup) and threshold BLS (Shamir + Feldman VSS) in one dependency-free package; blst itself has neither KZG nor threshold *(inferred)*, and the Zig alternatives are unlicensed or link C. **Where we are behind:** EIP-7594 cells; draft -05 where blst tracks V6 (`keyGenV4` covers blst's default `key_gen`); speed (pure Zig, no assembly) (→ Backlog).
 
 ## Purpose
 
-Parts 1-5 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
-the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
-pairing groups `G1`/`G2` — everything the pairing function needs as its
+Six parts (`README.md`). Part 1: the base field `Fp`,
+the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the
+two pairing groups `G1`/`G2` — everything the pairing function needs as its
 foundation. Part 2 (`pairing.zig`): the pairing itself, `e: G1 x G2 ->
 Gt`, `Gt ⊂ Fp12*` — the optimal ate Miller loop plus final
 exponentiation. Part 3 (`hash_to_curve.zig`): RFC 9380 hash-to-curve
 for `G1`/`G2` — the primitive BLS signatures use to hash a message onto
-the curve. Part 4 (`bls_sig.zig`, **COMPLETE**): BLS signatures per
-draft-irtf-cfrg-bls-signature-05, minimal-pubkey-size/ProofOfPossession
-ciphersuite. Part 5 (`kzg.zig`, **COMPLETE**): EIP-4844 (deneb)
-KZG polynomial commitments over the trusted-setup ceremony's `G1`/`G2`
-points. Part 6 (`threshold.zig`, **COMPLETE**): trusted-dealer
-threshold BLS — Shamir secret sharing + Feldman VSS +
-Lagrange-in-the-exponent combining, over Part 4's min-pk ciphersuite —
-see "Part 6 design" below.
+the curve. Part 4 (`bls_sig.zig`, `scheme.zig`): BLS signatures per
+draft-irtf-cfrg-bls-signature-05, all six ciphersuites (min-pk and
+min-sig, each Basic, MessageAugmentation and ProofOfPossession), batch
+verification, EIP-2333 key derivation and the `G1`/`G2` MSM. Part 5
+(`kzg.zig`): EIP-4844 (deneb) KZG polynomial commitments over the
+trusted-setup ceremony's `G1`/`G2` points. Part 6 (`threshold.zig`):
+trusted-dealer threshold BLS — Shamir secret sharing + Feldman VSS +
+Lagrange-in-the-exponent combining, over Part 4's suites — see "Part 6
+design" below.
 
 ## Model-after + seed
 
@@ -62,42 +63,33 @@ see "Part 6 design" below.
   list and the independent re-derivation/verification performed on
   every embedded constant.
 - **`Fp` is hand-rolled, `Fr` is `montint.Field`** (`fp.zig`/
-  `scalar.zig`). ⚠ Corrected 2026-10-02: this said both rode on
-  `std.crypto.ff`. `Fp` has had its own constant-time Montgomery
-  backend (CIOS/SOS, `blackBox` barrier) for a while; `Fr` moved to
-  `montint.Field(r)` on 2026-10-02 after ctgrind showed `std.crypto.ff`
-  is not constant-time in ReleaseFast (`montgomeryMul`'s extra-reduction
-  select and `powWithEncodedExponent`'s window select compile to
-  conditional jumps) — every `Fr.mul` over a secret key or share leaked.
-  `std.crypto.ff` remains only as the `modulus` constant and a test
-  oracle. `Fp` uses a 384-bit
-  (48-byte) container for the 381-bit `p`; `Fr` uses a 256-bit
-  (32-byte) container for the 255-bit `r`.
-- **Design references for the field-tower arithmetic** (implemented by
-  the crypto-core pass): Devegili–Ó hÉigeartaigh–Scott–Dahab's
+  `scalar.zig`). `Fp` has its own constant-time Montgomery backend
+  (CIOS multiply, SOS squaring, six `u64` limbs, `blackBox` barrier;
+  `fp.zig` module doc). `Fr` is `montint.Field(r)` (`scalar.zig:69`):
+  `std.crypto.ff` is not constant-time in ReleaseFast
+  (`montgomeryMul`'s extra-reduction select and
+  `powWithEncodedExponent`'s window select compile to conditional
+  jumps), so every `Fr.mul` over a secret key or share would leak.
+  `std.crypto.ff` remains only as the `modulus` constants and a test
+  oracle (`fp.zig:61`, `scalar.zig:27`). `Fp` encodes as 48 bytes (381-bit
+  `p`), `Fr` as 32 bytes (255-bit `r`).
+- **Design references for the field-tower arithmetic** : Devegili–Ó hÉigeartaigh–Scott–Dahab's
   tower-field multiplication paper (`Fp6`/`Fp12` mul/square/inv), Adj &
   Rodriguez-Henriquez ePrint 2012/685 Alg. 9 (`Fp2.sqrt`, the complex
   method), and the Bernstein–Lange Explicit-Formulas Database
   (`add-2007-bl`/`dbl-2009-l` Jacobian point formulas) — see `NOTICE`
   for full citations. `zkcrypto/bls12_381`/`blst` remain UNREAD as
   source code; every formula was validated against
-  independently-computed vectors instead (NOTICE's "Verification
-  performed (crypto-core pass)").
+  independently-computed vectors instead (NOTICE's "Verification performed" sections).
 
 ## Design & invariants
 
-- **All arithmetic implemented** (crypto-core pass, 2026-07-14): the
-  scaffold's REAL/STUB split is resolved — every field and group
-  operation is now real (`Fp12.cyclotomicSquare`, the one stub left
-  at that date, landed with the Part-2 final exponentiation).
-- **Montgomery-storage decision (settled)**: `Fp`/`Fr` store values
-  CANONICALLY (non-Montgomery) at rest; `std.crypto.ff` operations
-  preserve the first operand's form, so canonical-in/canonical-out
-  holds everywhere and `toBytes`/`fromBytes` need no conversion at the
-  struct boundary. Cost: `mul`/`sq` convert in/out of Montgomery form
-  internally (a few extra Montgomery multiplications per call).
-  Persistent Montgomery storage is a deferred Part-2 (pairing hot
-  path) optimization — see Backlog.
+- **Montgomery-resident storage (settled)**: `Fp` and `Fr` hold
+  values in the Montgomery domain at rest (`fp.zig` module doc:
+  `a·R mod p`, `R = 2^384`; `Fr` via `montint.Field`), and
+  `toBytes`/`fromBytes` convert at the struct boundary. The old
+  canonical-at-rest layout paid a full Montgomery round trip on every
+  multiply.
 - **Frobenius coefficients: derived in code, never transcribed.**
   `Fp6`'s `γ_1 = ξ^((p-1)/3)` (and `γ_2 = γ_1²`) and `Fp12`'s
   `γ = ξ^((p-1)/6)` are computed via `Fp2.pow` with exponents derived
@@ -105,8 +97,7 @@ see "Part 6 design" below.
   hard-fails the build if a division is inexact). Tests pin them two
   ways: definitionally (`frobenius(a) == a^p` computed with plain
   mul/square) and byte-exactly against independently-recomputed values
-  (NOTICE). Coefficients are recomputed per `frobenius` call — cheap
-  for Part 1; caching is a Part-2 optimization (Backlog).
+  (NOTICE). The coefficients are comptime constants (`fp6.zig:227` `frobenius_gamma_1`/`frobenius_gamma_2`, `fp12.zig:301` `frobenius_gamma`), so no `pow` runs per `frobenius` call.
 - **`Fp2` non-residue convention: `u² = -1`.** Confirmed by
   independently checking the `G2` generator on-curve under exactly this
   convention (`NOTICE`'s "Verification performed"). A different
@@ -122,13 +113,11 @@ see "Part 6 design" below.
   bug across implementations (byte-swapping the two halves produces a
   different-but-parseable value that can pass shape checks and only
   fail — or, on unlucky input, not even fail — the on-curve check).
-- **The G2 cofactor scaffold bug (found and fixed by the crypto-core
-  pass).** The scaffold's `g2.zig` `cofactor_bytes` was derived with
+- **The G2 cofactor pitfall.** A first derivation of `g2.zig`'s `cofactor_bytes` used
   the QUADRATIC-twist trace formula `#E' = p² + 1 - t2` — which is
   actually the order of `E(Fp2)` (the original curve over `Fp2`), not
   of the SEXTIC twist `G2` lives on. Because `E(Fp2) ⊇ E(Fp) ⊇ G1`,
-  that wrong order is ALSO divisible by `r`, so the scaffold's
-  exact-division sanity check passed. Caught because `clearCofactor`
+  that wrong order is ALSO divisible by `r`, so an exact-division sanity check passes. Caught because `clearCofactor`
   built on it failed the behavioral test (`[r]([h2]P) != O` — a direct
   Lagrange violation for the claimed group order); corrected via the
   CM equation for sextic twists (`f² = (4p² - t2²)/3`, `#E' = p² + 1 -
@@ -137,7 +126,7 @@ see "Part 6 design" below.
   alone cannot distinguish the twist's order from the curve's; a
   behavioral (Lagrange) test can.
 
-## Part 2 design (the pairing — crypto-core pass DONE, 2026-07-14)
+## Part 2 design (the pairing)
 
 - **Construction: optimal ate pairing (Vercauteren 2010), BLS12 family.**
   The standard choice for BLS12 curves — the shortest known Miller loop
@@ -147,25 +136,32 @@ see "Part 6 design" below.
   own `b' = 4(1+u)` curve-equation choice and the `u^2=-1` non-residue
   convention `SPEC.md`'s Part-1 section documents) — line evaluations
   use the D-type untwisting map (Costello-Lange-Naehrig 2010).
-- **Miller loop (as implemented)**: per-pair `T` accumulators in AFFINE
-  twist coordinates (chord/tangent slope explicit for the line
-  function; one `Fp2.inv` per step — total, because the twist group's
-  order `r*h2` is odd, so no 2-torsion, and `T == ±Q` is impossible
-  for subgroup inputs; see the doc comments' non-degeneracy arguments).
-  Lines are evaluated at the TWISTED image of `P` — off the untwisted
-  line by a fixed `w^3` factor per line, which the final exponentiation
-  provably kills (`(w^3)^((p^12-1)/r) = 1`, derivation in `lineEval`'s
-  doc comment) — giving the sparse `c0.c0/c0.c1/c1.c1` ("014") shape,
-  promoted to a dense `Fp12.mul` in the correctness-first baseline.
-  Multi-pairing shares one seed-bit walk + one accumulator per batch of
-  up to 8 pairs (fixed stack storage, allocation-free; the batch
-  product is exact — squaring distributes — so batching only forgoes
-  cross-batch shared squarings). The negative seed is handled by ONE
-  final conjugation.
+- **Miller loop (as implemented)**: per-pair `T` accumulators in
+  `g2.Jacobian` (`pairing.zig:254`, `TwistPoint`) — this module's own
+  complete group law, not a second copy of it. Each doubling/addition
+  step multiplies its line value by the factor that clears the
+  denominators (`2YZ³` for the tangent, `Z·h` for the chord) instead of
+  forming the slope, so no `Fp2.inv` runs in the loop; see "Inversion-
+  free Miller loop" in the threat model. The twist group's order `r*h2`
+  is odd, so no 2-torsion, and `T == ±Q` is impossible for subgroup
+  inputs (the steps assert it; see the doc comments' non-degeneracy
+  arguments). Lines are evaluated at the TWISTED image of `P` — off the
+  untwisted line by a fixed `w^3` factor per line, which the final
+  exponentiation provably kills (`(w^3)^((p^12-1)/r) = 1`, derivation in
+  `lineEval`'s doc comment) — giving the sparse `c0.c0/c0.c1/c1.c1`
+  ("014") shape, promoted to a dense `Fp12.mul` (`pairing.zig:327`; the
+  sparse multiply is open, Backlog). Multi-pairing shares one seed-bit
+  walk + one accumulator per batch of up to 8 pairs
+  (`miller_batch_max`, `pairing.zig:236`; fixed stack storage,
+  allocation-free; the batch product is exact — squaring distributes — so
+  batching only forgoes cross-batch shared squarings). The negative seed
+  is handled by ONE final conjugation (`pairing.zig:209`). The affine
+  step functions survive as test-only references
+  (`doublingStepAffineRef`, `additionStepAffineRef`).
 - **Final exponentiation hard part (as implemented)**: the
   Hayashida–Hayasaka–Teruya (ePrint 2020/875, BLS12 case) EXACT-`d`
   cyclotomic identity `d = (p^4-p^2+1)/r = k*(x+p)*(x^2+p^2-1) + 1`
-  with `k = (x-1)^2/3` — chosen over the scaffold's FCKRH (ePrint
+  with `k = (x-1)^2/3` — chosen over the FCKRH (ePrint
   2011/465) suggestion because FCKRH's chain computes `f^(3d)` (a fixed
   CUBE of the canonical pairing: bilinearity-equivalent, and
   `pairingCheck`-equivalent since `gcd(3,r)=1`, but NOT byte-equal to
@@ -192,10 +188,9 @@ see "Part 6 design" below.
   identities positive and negative, `e(G1,G2)^r == 1`) PLUS the
   byte-exact `e(G1,G2)` KAT from the IETF draft (primary) and py_ecc
   (conjugate cross-check) — the "property tests as the strong oracle,
-  byte-exact KAT layered on top" pattern from `adaptor`/`spake2plus`,
-  now with both layers in place.
+  byte-exact KAT layered on top" pattern from `adaptor`/`spake2plus`.
 
-## Part 3 design (hash-to-curve — COMPLETE, crypto-core pass 2026-07-14)
+## Part 3 design (hash-to-curve)
 
 - **Suites**: `BLS12381G1_XMD:SHA-256_SSWU_RO_` (RFC 9380 §8.8.1) and
   `BLS12381G2_XMD:SHA-256_SSWU_RO_` (§8.8.2) — the two `hash_to_curve`
@@ -217,10 +212,7 @@ see "Part 6 design" below.
   `g(B/(Z*A))` is always a QR, so the gx2 fallback never fails) was
   verified numerically — see `NOTICE`.
 - **`clear_cofactor` = `h_eff` multiplication, NOT plain-cofactor
-  multiplication — a scaffold-plan CORRECTION.** The scaffold planned to
-  reuse Part 1's `clearCofactor` (multiply by the true cofactor `h`)
-  and documented both as "valid per §7"; that is WRONG for these
-  suites: §7 pins `clear_cofactor(P) := h_eff * P` (a fixed suite
+  multiplication.** Reusing Part 1's `clearCofactor` (multiply by the true cofactor `h`) as "valid per §7" is WRONG for these suites: §7 pins `clear_cofactor(P) := h_eff * P` (a fixed suite
   parameter, §8.8.1/§8.8.2) and explicitly says plain-`h` multiplication
   "does not generally give the same result ... and MUST NOT be used"
   when `h_eff` comes from a fast clearing method (both BLS12-381
@@ -231,7 +223,7 @@ see "Part 6 design" below.
   entry 21); `g1`/`g2.Jacobian.clearCofactor` remains what it always
   was — a correct way to land arbitrary points in the subgroup — it
   just is not RFC 9380's `clear_cofactor`.
-- **`expand_message_xof` (SHAKE-256), 2026-10-06**: RFC 9380 §5.3.2, for the
+- **`expand_message_xof` (SHAKE-256)**: RFC 9380 §5.3.2, for the
   `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite of draft-irtf-cfrg-bbs-signatures
   Appendix A.1 (`hashToCurveG1PartsWith(.xof_shake256, ..)`; G2 has no XOF
   variant — no consumer). K.6-anchored; the G1 suite itself is anchored by
@@ -251,8 +243,7 @@ see "Part 6 design" below.
   explicitly-flagged departure from a literal "reuse the existing
   implementation" instruction; the owner may instead choose to factor a
   shared `expand_message_xmd` helper across all three modules later,
-  but that is a cross-module refactor this scaffolding pass does not
-  make unilaterally.
+  but that is a cross-module refactor this module does not make unilaterally.
 - **The `Fp` wide-reduction gap**: `hash_to_field`'s `OS2IP(tv) mod p`
   step needs to reduce a 512-bit (`L=64`-byte) integer into `Fp`
   (384-bit container). `scalar.zig`'s `Fr.reduceWide` already solves the
@@ -269,8 +260,7 @@ see "Part 6 design" below.
 - **Constant provenance**: `g1_iso_z`/`g1_iso_a`/`g1_iso_b` and
   `g2_iso_z`/`g2_iso_a`/`g2_iso_b` (the SSWU curve/`Z` parameters for
   `E1'`/`E2'`) are single field-element constants cited verbatim from
-  RFC 9380 §8.8.1/§8.8.2's own raw text (re-confirmed against that text
-  during the crypto-core pass), the same citation discipline `fp.zig`'s
+  RFC 9380 §8.8.1/§8.8.2's own raw text (re-confirmed against that text), the same citation discipline `fp.zig`'s
   `p_bytes`/`g1.zig`'s generator already use. The 11-isogeny (`G1`,
   Appendix E.2, 53 `Fp` constants) and 3-isogeny (`G2`, Appendix E.3,
   13 `Fp2` constants) coefficient tables were NEVER hand-transcribed:
@@ -284,11 +274,9 @@ see "Part 6 design" below.
   scalars (§8.8.1/§8.8.2) are likewise cited from the raw text
   (`NOTICE` entry 21).
 
-## Part 4 design (BLS signatures — SCAFFOLDED 2026-07-14, crypto-core pass COMPLETE 2026-07-14)
+## Part 4 design (BLS signatures)
 
-- **2026-10-06: all six ciphersuites.** The bullets below describe the
-  original min-pk ProofOfPossession pass and still hold for it; the
-  generalisation lives in `scheme.zig`: `Bls(variant, scheme)` with
+- **All six ciphersuites.** The bullets below are written for the min-pk ProofOfPossession suite; the generalisation lives in `scheme.zig`: `Bls(variant, scheme)` with
   `variant` ∈ {min-pk, min-sig} (which group holds the key and which
   the signature and message hash) and `scheme` ∈ {Basic `NUL`,
   MessageAugmentation `AUG`, ProofOfPossession `POP`} (draft §3.1-§3.3).
@@ -316,8 +304,8 @@ see "Part 6 design" below.
   master/child derivation (HKDF_mod_r with the salt hashed before the
   first round, the Lamport tree) and an EIP-2334 path parser.
   **MSM** (`msm.zig`): Pippenger for `G1` and `G2`, moved out of
-  `kzg.zig` (which now delegates), public data only.
-- **Ciphersuite (original pass): minimal-pubkey-size, ProofOfPossession, ONLY.**
+  `kzg.zig` (which delegates), public data only.
+- **Ciphersuite of the file-level names: minimal-pubkey-size, ProofOfPossession.**
   `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
   (draft-irtf-cfrg-bls-signature-05 §4.2.3) — public keys in `G1`
   (48-byte compressed), signatures in `G2` (96-byte compressed),
@@ -326,10 +314,7 @@ see "Part 6 design" below.
   the ciphersuite Ethereum's consensus layer (and most production BLS
   deployments) actually use — the smaller (48-byte) element goes in
   the more-frequently-transmitted slot (public keys, stored/gossiped
-  far more often than the signatures verifying them). The min-sig
-  variant (pubkeys in `G2`, signatures in `G1`) and the Basic and
-  MessageAugmentation schemes (draft §3.1/§3.2) were originally out of
-  scope and were added 2026-10-06 (`scheme.zig`).
+  far more often than the signatures verifying them). The min-sig variant (pubkeys in `G2`, signatures in `G1`) and the Basic and MessageAugmentation schemes (draft §3.1/§3.2) are the other instances of `scheme.zig`'s `Bls(variant, scheme)`.
 - **The exact verify equation, in this module's own argument
   convention.** `pairing.pairing(p: G1.Affine, q: G2.Affine)` fixes
   the FIRST argument to `G1`, second to `G2`. The draft's abstract
@@ -409,21 +394,17 @@ see "Part 6 design" below.
      "splitting zero" pitfall the draft's own security considerations
      warn about); this module's `keyValidate` rejects it explicitly,
      ahead of the subgroup check.
-- **`KeyGen` (draft §2.3) — REAL, but deliberately NOT KAT-verified.**
-  Mechanical HKDF-Extract/Expand construction over `std.crypto.kdf.
-  hkdf.HkdfSha256` plus `Fr.reduceWide` (`OS2IP(OKM) mod r`) — both
-  already-real primitives, so implemented directly rather than
-  stubbed. NOT wired against a byte-exact external vector: the draft's
-  own Appendix B is "TBA" for KeyGen vectors as of `-05`, and EIP-2333
-  — despite an almost-identical HKDF shape and the same
-  `"BLS-SIG-KEYGEN-SALT-"` string — is a DIFFERENT algorithm (its
-  `derive_master_SK` pre-hashes the salt on the FIRST call, which the
-  draft's own text documents as the OLDER, `-04`-compatible behavior,
-  not `-05`'s). Conflating the two would silently pin the wrong
-  algorithm under a vector that looks plausible — flagged in
-  `bls_sig.zig`'s `keyGen` doc comment as a `TODO(fable)` rather than
-  guessed. `keyGen` is exercised today only by the self-consistent
-  round-trip test (`keyGen` -> `skToPk` -> ... -> `verify`).
+- **`KeyGen` (draft §2.3) and `keyGenV4`.** Mechanical
+  HKDF-Extract/Expand construction over `std.crypto.kdf.hkdf.HkdfSha256`
+  plus `Fr.reduceWide` (`OS2IP(OKM) mod r`). `keyGen` is draft -05;
+  `keyGenV4` (`bls_sig.zig:180`) is the draft -04 form blst's default
+  `key_gen` implements (the salt hashed before the first round, as
+  EIP-2333's `derive_master_SK` does). The two differ, so a key generated
+  by blst's default from the same IKM is not `keyGen`'s output. The draft's
+  Appendix B has no KeyGen vectors ("TBA" as of -05); both are byte-exact
+  against blst (`key_gen_v5` and the default `key_gen`) over the vectors
+  of `src/blst_vectors.zig` (`src/blst_interop_test.zig`). Both accept a
+  `key_info` of any length.
 - **The `Aggregate`/`aggregatePublicKeys` vs. verify split.** Plain
   point summation (`Aggregate`, draft §2.8, and its `G1`-side analogue)
   needs NO pairing and no security judgment. Everything that CHECKS an
@@ -445,15 +426,10 @@ see "Part 6 design" below.
   ship only inside a ~200MB release tarball this pass did not download,
   so the smaller, directly-fetched-and-verified sibling repo was used
   instead — flagged here rather than silently assumed byte-identical.
-  All wired KATs — `aggregate`, `sign`, `verify` (accept + reject),
-  `fastAggregateVerify` — PASS byte-exactly since the crypto-core pass,
-  alongside the self-consistent `popProve`/`popVerify` and end-to-end
-  round trips.
-- **Part 4 constant-time choices (crypto-core pass).** The SECRET-key
+  The wired KATs — `aggregate`, `sign`, `verify` (accept + reject), `fastAggregateVerify` — are byte-exact, alongside the self-consistent `popProve`/`popVerify` and end-to-end round trips.
+- **Part 4 constant-time choices.** The SECRET-key
   paths — `keyGen`, `skToPk`, `sign`, `popProve` — touch `sk` only via
-  `Fr`'s constant-time arithmetic (`montint.Field`; it was
-  `std.crypto.ff` until 2026-10-02, which was NOT constant-time — see
-  above) and Part 1's constant-time
+  `Fr`'s constant-time arithmetic (`montint.Field`; `std.crypto.ff` is not constant-time — see above) and Part 1's constant-time
   double-and-add-always `scalarMul` (`skToPk` on `G1`, `sign`/`popProve`
   on `G2`); they contain no secret-dependent branches or memory
   accesses (`keyGen`'s retry loop branches only on the derived scalar
@@ -465,11 +441,10 @@ see "Part 6 design" below.
   variable-time, like the pairing and hash-to-curve they compose
   (see "Constant-time choices" under Threat model).
 
-## Part 5 design (KZG polynomial commitments — COMPLETE 2026-07-14)
+## Part 5 design (KZG polynomial commitments)
 
 - **Model-after: `consensus-specs` `specs/deneb/polynomial-commitments.md`**
-  (the deneb/EIP-4844 KZG spec — fetched from the `master` branch,
-  2026-07-14; see `NOTICE` for the exact citation). Every constant
+  (the deneb/EIP-4844 KZG spec — fetched from the `master` branch; see `NOTICE` for the exact citation). Every constant
   (`FIELD_ELEMENTS_PER_BLOB`, `BYTES_PER_*`, `BLS_MODULUS`,
   `PRIMITIVE_ROOT_OF_UNITY`, the two Fiat-Shamir domain strings,
   `G1_POINT_AT_INFINITY`) is copied verbatim from the fetched spec text,
@@ -496,32 +471,19 @@ see "Part 6 design" below.
   `blobToKzgCommitment` applies `bitReversalPermutation` (REAL, this
   file) itself, matching the spec's own
   `bit_reversal_permutation(KZG_SETUP_G1_LAGRANGE)` composition in
-  `blob_to_kzg_commitment` — a scaffolding-time finding worth recording
-  explicitly (an easy point to get backwards, à la the Part-1 `g2`
+  `blob_to_kzg_commitment` — a finding worth recording explicitly (an easy point to get backwards, à la the Part-1 `g2`
   cofactor and Part-3 `h_eff` corrections this module has already hit
   once each).
-- **Crypto-core pass (2026-07-14) — implementation decisions.** Every
-  formerly-stubbed function is now real, each implementing exactly the
-  construction its scaffold doc comment specified (the spec text was
-  re-fetched and re-read during this pass, not recalled — `NOTICE`).
-  The settled decisions:
+- **Implementation decisions** (the spec text was fetched and read, not recalled — `NOTICE`):
   - **Trusted-setup loading is memoized process-wide** (`loadTrustedSetup`
     / `validated_setup_cache`): the input is a `@embedFile`d compile-time
     constant, so the first full validation's verdict holds for every
     call — subsequent loads deep-copy the already-validated points into
     the caller's allocator. NOTHING is skipped; the 8257-point on-curve +
-    subgroup validation simply isn't repeated per call (the scaffold's
-    per-call re-validation cost minutes per test binary for zero added
-    assurance). The cache is a write-once atomic pointer (lock-free; a
+    subgroup validation simply isn't repeated per call (per-call re-validation costs minutes per test binary for zero added assurance). The cache is a write-once atomic pointer (lock-free; a
     first-load race means redundant validation, never a wrong result).
   - **First-load validation is parallelized** (`parseAndValidateEmbeddedSetup`):
-    setup points are PUBLIC (threat model below). Until 2026-09-15 the
-    `G1` points used the variable-time `[r]P == O` check
-    (`subgroupCheckVartime`, ~3x faster than the constant-time `[r]P`
-    ladder); since then they use `g1.Jacobian.subgroupCheck`, the
-    endomorphism test, which is faster than both ("Subgroup checks"
-    below), and `subgroupCheckVartime` is kept only as a test
-    reference. The per-point checks are independent and fan
+    setup points are PUBLIC (threat model below). The `G1` points use `g1.Jacobian.subgroupCheck`, the endomorphism test ("Subgroup checks" below); `subgroupCheckVartime` (`kzg.zig:299`) is kept only as a test reference. The per-point checks are independent and fan
     out across CPU cores (`std.Thread.spawn`, serial fallback if
     spawning fails). The 65 `G2` points ride on worker 0 with the
     existing constant-time check (not worth a `G2` vartime twin).
@@ -542,8 +504,7 @@ see "Part 6 design" below.
     `O(n·256)` full add+double pairs. Zero digits skip bucket work, so
     zero scalars/identity points drop out naturally; `n == 0` returns
     the identity (spec's explicit case). It takes an allocator (scalar
-    bytes + bucket array) — a deliberate signature change from the
-    scaffold.
+    bytes + bucket array) .
   - **The primitive `2^32` root of unity is DERIVED, not embedded**
     (`primitiveRootOfUnity2Pow32`): `7^((r-1)/2^32) mod r` per the
     spec's own `compute_roots_of_unity` formula, with the exponent
@@ -553,7 +514,7 @@ see "Part 6 design" below.
     is proven exactly `2^32` by tests (`w^(2^32) == 1`, `w^(2^31) ==
     -1`), and the whole domain convention is pinned against the REAL
     ceremony by the two monomial-vs-Lagrange cross-check tests (below).
-  - **`evaluatePolynomialInEvaluationForm` takes an allocator now**
+  - **`evaluatePolynomialInEvaluationForm` takes an allocator**
     (barycentric denominators are batch-inverted via the Montgomery
     trick, `batchInvInPlace` — one `Fr.inv` + `3n` muls instead of 4096
     Fermat exponentiations per evaluation); the in-domain branch
@@ -585,7 +546,7 @@ see "Part 6 design" below.
   blob, `z`, or `y` with a non-canonical element is a malformed-input
   error, not a silently-reduced one.
 
-## Part 6 design (threshold BLS — COMPLETE, crypto-core pass 2026-07-14)
+## Part 6 design (threshold BLS)
 
 - **Trusted-dealer Shamir + Feldman VSS, min-pk ciphersuite, reusing
   Part 4 wholesale.** `threshold.zig` does not introduce a new
@@ -611,8 +572,7 @@ see "Part 6 design" below.
   restated over this module's own `Fr`/`u32` indices in
   `combineSignatures`'s own doc comment. Only the FIELD/GROUP the
   arithmetic runs over differs (`Fr`/`G1`/`G2` here vs. `Secp256k1.
-  scalar`/`Secp256k1` there); the crypto-core pass (2026-07-14) ported
-  `frost.zig`'s already-KAT-validated Horner-evaluation and Lagrange-
+  scalar`/`Secp256k1` there); the implementation ports `frost.zig`'s already-KAT-validated Horner-evaluation and Lagrange-
   interpolation loops nearly verbatim, swapping the field/group types.
   The Lagrange coefficient formula is `frost.deriveInterpolatingValue`'s
   exact numerator/denominator-product form:
@@ -622,7 +582,7 @@ see "Part 6 design" below.
   - `evalPolynomialAt` (Shamir share computation — the secret `sk`, the
     secret coefficients, AND the output share): pure `Fr.add`/`Fr.mul`
     Horner loop, constant-time via `montint.Field`'s Montgomery
-    arithmetic (since 2026-10-02; `std.crypto.ff` before, which leaked); loop bound and evaluation point are public.
+    arithmetic; loop bound and evaluation point are public.
   - `feldmanCommitCoefficient` (`[coeff]G1` for a secret coefficient):
     `g1.Jacobian.scalarMul`, Part 1's constant-time
     double-and-add-always ladder — exactly `bls_sig.skToPk`'s path.
@@ -678,21 +638,17 @@ see "Part 6 design" below.
   implementation bug — an attacker can submit a small-subgroup point
   and force a degenerate or predictable pairing result, potentially
   forging signatures or breaking aggregation soundness depending on the
-  scheme built on top. **Since 2026-10-03 every wire-decode entry point
+  scheme built on top. **Every wire-decode entry point
   (`fromBytesUncompressed`/`fromBytesCompressed` for both `G1` and
   `G2`) checks subgroup membership itself** (`error.NotInSubgroup`), as
   zkcrypto `bls12_381` and arkworks do; the old behaviour is the
   explicitly named `fromBytes*Unchecked`, for bytes the caller already
   trusts (its own output, a pinned constant, a vector of a deliberately
-  non-member point). Before that the check was a separate call every
-  consumer had to remember, and one did not: coconut's verifier
-  accepted `σ = (T, 1)` with `T` of cofactor order, a universal
-  credential forgery (relation audit 2026-10-03). The identity still
+  non-member point). A check left to a separate call every consumer must remember is a check one consumer eventually forgets (a verifier that accepts a cofactor-order point is a universal forgery), which is why the decoders do it. The identity still
   decodes (it is a member); `keyValidate` refuses it for public keys.
   Functions that take an already-built `Affine` (`verify` and friends)
   keep their own checks, because an `Affine` can be made without the
-  decoder. Since 2026-09-15
-  `subgroupCheck` also checks the curve equation itself (the premise of
+  decoder. `subgroupCheck` also checks the curve equation itself (the premise of
   the membership theorem it implements — see "Subgroup checks" below),
   so it is `true` exactly for members of `G1`/`G2`.
 - **Constant-time choices (as implemented).**
@@ -722,22 +678,14 @@ see "Part 6 design" below.
     case fired (the accumulator's state is secret-dependent inside
     scalarMul).
   - `ctSelect` (`Fp`, lifted componentwise to `Fp2` and points) is a
-    limb-mask merge, the mask laundered through `blackBox`. ⚠ Until
-    2026-10-02 it was not: inlined into the `G1`/`G2` ladders, LLVM
-    lowered the unlaundered mask to a conditional jump on the SCALAR BIT
-    (ctgrind `fp.zig:597` inside `scalarMulBytes`) — every `skToPk`/`sign`
-    leaked the key bit by bit. The same day `Fp2.isZero`'s `and` (a
-    short-circuit branch inside `G2.add`'s identity checks) became one
-    accumulator. The ladder rows were counting both without saying so;
-    they now read 2 each, the public result's `toAffine`.
+    limb-mask merge, the mask laundered through `blackBox`. The laundering is load-bearing: inlined into the `G1`/`G2` ladders, an unlaundered mask lowers to a conditional jump on the SCALAR BIT. `Fp2.isZero` is one accumulator (`fp2.zig:78`), not a short-circuit `and` that would branch inside `G2.add`'s identity checks.
   - `Fp.random`/`Fr.random` rejection-sample (never reduce a same-width
     sample — the classic bias footgun for these field shapes).
   Verification-side operations on public data (subgroup checks of
   public points, decompression) do not need — and some do not get —
   constant time; a faster public-scalar `scalarMul` variant is a
   possible later addition if a hot public-input call site appears.
-- **Subgroup checks — endomorphism tests, not `[r]P == O` (2026-09-15,
-  A1 `drand` F4; a new algorithm).**
+- **Subgroup checks — endomorphism tests, not `[r]P == O`.**
   `g1.Jacobian.subgroupCheck` is `isOnCurve(P) ∧ φ(P) == [−x²]P`,
   `φ(x, y) = (βx, y)`; `g2.Jacobian.subgroupCheck` is `isOnCurve(P) ∧
   ψ(P) == [x]P`, `ψ` untwist-Frobenius-twist. Source: Scott, ePrint
@@ -750,35 +698,26 @@ see "Part 6 design" below.
   constants by the "F4 subgroup" tests, and the eigenvalue (which cube
   root `β`, the sign of `x`, the `ψ` coefficients) is pinned on the
   generators and, for `ψ`, by `ψ² − [t]ψ + [p] = 0` on non-members.
-  Why it is worth a new algorithm: ReleaseFast, 7 interleaved reps,
-  process CPU time, one run: `G1` **0.774 → 0.123 ms** (min–max
-  0.694–0.791 → 0.109–0.126), `G2` **2.41 → 0.175 ms** (2.15–2.46 →
-  0.156–0.181); `drand.verifyRoundPoints` 10.34 → 9.72 ms median
-  (ranges overlap, but lower in 7/7 paired reps by 0.51–0.90 ms, the
-  size of the saved `G1` check). The multiplication by `|x|`
-  (`mulByAbsXPublic`) branches only on the bits of that fixed public
-  constant; the point arithmetic is the same complete branchless
-  `double`/`add`, and `scalarMulBytes` (the secret-scalar engine) is
-  unchanged. The old `[r]P == O` form survives as the private
-  test-only reference `subgroupCheckByOrder`, which every differential
-  test holds the fast check against: members (identity, generators,
-  random multiples, cleared cofactors), random curve/twist points,
-  `[r]R` torsion alone and added to members, points of order exactly
-  3 and 11 (`G1`) and 13 and 23 (`G2`), off-curve points, RFC 9380's
+  The check is several times cheaper than the `[r]P == O` ladder. The
+  multiplication by `|x|` (`mulByAbsXPublic`, `g1.zig:379`,
+  `g2.zig:325`) branches only on the bits of that fixed public constant;
+  the point arithmetic is the same complete branchless `double`/`add`,
+  and `scalarMulBytes` (the secret-scalar engine) is unchanged. The
+  `[r]P == O` form survives as the private test-only reference
+  `subgroupCheckByOrder` (`g1.zig:359`), which every differential test
+  holds the fast check against: members (identity, generators, random
+  multiples, cleared cofactors), random curve/twist points, `[r]R`
+  torsion alone and added to members, points of order exactly 3 and 11
+  (`G1`) and 13 and 23 (`G2`), off-curve points, and RFC 9380's
   published pre-`clear_cofactor` `Q0/Q1` (outside) and final `P`
-  (inside), and 60 live drand quicknet signatures plus the chain key
-  (probe, not in the suite). No ctgrind target: the inputs are public,
-  and the ctgrind rows over `g1.zig`/`g2.zig` need a re-pin only
-  because those files' digests changed.
-- **Inversion-free Miller loop — Jacobian point steps (2026-09-16, A1
-  `drand` F4).** The doubling/addition steps keep the accumulator `T` in
-  `g2.Jacobian` and multiply each line value through by the factor that
-  clears its denominators (`2YZ³` for the tangent, `Z·h` for the chord),
-  instead of forming the slope `λ` — which needed one `Fp2.inv` per step
-  per pair. `Fp.inv` is Fermat's `a^(p-2)`, a 381-bit exponentiation, so
-  those inversions were the dominant cost of a pairing: measured on
-  `drand`'s 2-pair beacon check (ReleaseFast, process CPU time), 136 of
-  them at 42.8 µs = **5.82 ms of a 10.01 ms verification**.
+  (inside). No ctgrind target: the inputs are public.
+- **Inversion-free Miller loop — Jacobian point steps.** The
+  doubling/addition steps keep the accumulator `T` in `g2.Jacobian` and
+  multiply each line value through by the factor that clears its
+  denominators (`2YZ³` for the tangent, `Z·h` for the chord), instead of
+  forming the slope `λ` — which needed one `Fp2.inv` per step per pair.
+  `Fp.inv` is Fermat's `a^(p-2)`, a 381-bit exponentiation, so those
+  inversions dominated the cost of a pairing.
   The scale factors are free because the final exponentiation's easy part
   raises to `p^6 − 1` and `Frobenius^6` fixes `Fp6` — hence `Fp2` —
   elementwise, so `c^(p^6−1) = 1` for every `c ∈ Fp6*`; this is the same
@@ -787,13 +726,11 @@ see "Part 6 design" below.
   the pairing" pins it with a control. Point arithmetic is NOT re-derived
   here: `T <- 2T` and `T <- T + Q` are `g2.Jacobian.double`/`add`.
   Evidence: the byte-exact `e(G1, G2)` KAT is unmoved, and a randomized
-  differential (12 random point pairs) agrees with the retained affine
-  reference `millerLoopAffineRef`. **7 interleaved paired reps, both arms
-  in one binary: `multiMillerLoop` 6.92 → 1.94 ms, `drand`'s beacon
-  verification 9.27 → 4.28 ms, faster in 7/7 with non-overlapping
-  ranges.** ⚠ RAW Miller values changed (by that `Fp2` factor) — they are
-  not a wire format and no consumer may pin them; only the
-  final-exponentiated pairing is a value.
+  differential agrees with the retained affine step references
+  (`doublingStepAffineRef`/`additionStepAffineRef`, `pairing.zig:807`/
+  `:819`). ⚠ RAW Miller values carry that `Fp2` factor — they are not a
+  wire format and no consumer may pin them; only the final-exponentiated
+  pairing is a value.
 - **The pairing is VARIABLE-TIME — deliberately.** Pairings operate on
   PUBLIC inputs (public keys, signatures, commitments — every
   BLS/KZG-style consumer verifies public data with them); the Miller
@@ -802,8 +739,7 @@ see "Part 6 design" below.
   and no constant-time contortion is attempted or needed. Do NOT feed
   the pairing secret points without revisiting this (no known scheme
   does). The pairing also assumes SUBGROUP inputs for its internal
-  non-degeneracy arguments (the steps' asserts — `catch unreachable`
-  inversions until 2026-09-16): an on-curve but small-order non-subgroup
+  non-degeneracy arguments (the steps' asserts): an on-curve but small-order non-subgroup
   point could trap mid-loop — a loud failure, not a silent wrong value, and
   exactly the input class the module-wide subgroup-check obligation
   already excludes at trust boundaries.
@@ -817,17 +753,6 @@ see "Part 6 design" below.
   password-hashing use cases (§10.2), which this module does not target.
   Do NOT feed `hash_to_curve`/`encode_to_curve` a secret message without
   revisiting this (no BLS/KZG/threshold-BLS consumer does).
-- **Out of scope for Parts 1-3**: BLS signatures, KZG, threshold BLS
-  (Parts 4-6). Also out of scope for Part 3 specifically: any suite
-  other than the two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs BLS12-381
-  actually uses (e.g. `expand_message_xof`/SHAKE variants RFC 9380
-  defines for other curves) — this module implements only the SHA-256
-  `expand_message_xmd` variant.
-- **Out of scope for Part 4** (the original pass): the min-sig variant
-  and the Basic/MessageAugmentation schemes — **all implemented
-  2026-10-06** (`scheme.zig`, see "Part 4 design"). Still out: the
-  draft -04-compatible KeyGen (blst's default `key_gen`, pre-hashed
-  salt); Ethereum key derivation uses EIP-2333 (`eip2333.zig`).
 - **KZG runs on PUBLIC data — variable-time is fine (Part 5).** Every
   KZG operation's inputs (blobs, commitments, proofs, the evaluation
   point `z`) are public by construction in every consumer this module
@@ -835,8 +760,7 @@ see "Part 6 design" below.
   trusted-setup ceremony's own points are published) — there is no
   secret-scalar path through `kzg.zig` analogous to Part 4's `sk`/
   `sign`/`popProve`. AS IMPLEMENTED: `g1Msm` runs on dedicated
-  variable-time `G1` arithmetic (the trusted-setup subgroup validation
-  did too until 2026-09-15; it now uses `g1.Jacobian.subgroupCheck`)
+  variable-time `G1` arithmetic 
   (`jacAddVartime`/`jacMixedAddVartime`/`jacScalarMulVartime`,
   `kzg.zig` — branchy twins of `g1.zig`'s constant-time formulas,
   pinned equal by tests); the FFT, barycentric evaluation, batch
@@ -853,459 +777,136 @@ see "Part 6 design" below.
   property of the ceremony process, not verifiable from the published
   points alone). `loadTrustedSetup`'s validation (on-curve + subgroup)
   only rules out MALFORMED points, not a compromised ceremony.
-- **Out of scope for Part 5**: the EIP-7594 (PeerDAS) cell/multi-proof
-  scheme (`compute_cells`, `compute_cells_and_kzg_proofs`,
-  `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs` —
-  `c-kzg-4844`'s `tests/` directory carries vectors for these too, but
-  they are a materially larger, separate spec
-  (`specs/fulu/polynomial-commitments-sampling.md`-family) built on TOP
-  of this file's primitives, not required by EIP-4844 itself); any KZG
-  ceremony/setup GENERATION code (this module only ever CONSUMES a
-  published setup); threshold BLS (Part 6, unaffected by Part 5's scope).
-- **Out of scope for Part 6** (see "Part 6 design" above for the
-  detailed reasoning): a full Pedersen/GJKR-style **distributed key
-  generation (DKG)** — this file is trusted-dealer ONLY; threshold
-  shares under the **MessageAugmentation** suites (a share signs
-  `SkToPk(share) || msg`, which does not interpolate — `Threshold(_,
-  .message_augmentation)` is a compile error; min-sig Basic/POP shares
-  landed 2026-11-17); any THRESHOLD-signing-time interactivity
-  (there is none needed — the entire point of BLS's linear signing
-  equation, per `threshold.zig`'s module doc comment) beyond a signer
-  calling `partialSign` once and a combiner calling `combineSignatures`
-  once shares reach it; and identifiable-abort tooling beyond the
-  single `verifyPartialSignature` check already provided (no
-  complaint/blame sub-protocol, since there is no interactive round to
-  misbehave in). `SecretKeyShare.scalar` carries the SAME sensitivity as
-  a `bls_sig.SecretKey.scalar` (see Part 4's constant-time notes above)
-  — the stubbed `evalPolynomialAt`/`feldmanCommitCoefficient` MUST,
-  once filled in, preserve that discipline (`Fr`'s constant-time ops,
-  `g1.zig`'s constant-time `scalarMul`); `combineSignatures`'s Lagrange
-  coefficients are computed from PUBLIC indices only, so no equivalent
-  constraint applies there (same reasoning as `frost.
-  deriveInterpolatingValue`'s own threat-model note).
+
+- **Secrets in callers' frames.** The module's secret entry points burn their stack
+  (`burn.zig`; the probe `src/stackprobe_test.zig` goes red when a body outgrows its burn).
+  `Fr.randomInto(out, io)` (`scalar.zig:184`) draws a scalar into the caller's slot under
+  `burn.run` (`burn.random_burn`). `Fr.random` (`scalar.zig:172`) returns a secret by value,
+  and `scalarMul` (`g1.zig:274`) and `msm` take scalars by value: a consumer that draws a nonce
+  or blinding factor and multiplies with it outside the module's own entry points leaves it in
+  its own frames and wraps the call in a burned frame of its own.
 
 ## Verification
 
-- **KAT/oracle vectors wired** (all pass):
-  - `fp.zig`: `p` is odd and exactly 381 bits (`modulus.bits()`);
-    `half_p_bytes` independently recomputed as `(p-1)>>1` via raw byte
-    arithmetic; zero/one round-trips; canonical-boundary rejection;
-    field identities (`a·a⁻¹ = 1`, `(a+b)² = a²+2ab+b²`,
-    `sqrt(a²) ∈ {±a}`, `sqrt(-1) = null` since `p ≡ 3 mod 4`);
-    `pExponentBytes` reproduces `half_p_bytes`; `random` round-trips.
-  - `scalar.zig`: the mirror `Fr` set, plus `reduceWide` KATs (`r → 0`,
-    `r+1 → 1`, canonical passthrough, and a byte-exact
-    `(2^512 - 1) mod r` vector computed independently).
-  - `fp2.zig`: Karatsuba mul pinned by `u·u = -1`,
-    `(1+u)(1-u) = 2`; norm-trick inv; `mulByNonresidue ==` general mul
-    by `ξ`; `frobenius` is an involution AND `== pow(p)`
-    (definitional); `sqrt(a²) ∈ {±a}`, `sqrt(ξ) = null` (`ξ` is a
-    non-residue — verified independently), both `sqrt` branches
-    exercised.
-  - `fp6.zig`/`fp12.zig`: ring identities; `v³ = ξ` and `w² = v`
-    (the defining tower relations, checked through general mul);
-    norm-trick inversions; `frobenius == pow(p)` (definitional — this
-    single test would catch ANY Frobenius-coefficient error) and
-    order-6/order-12 (+`frobenius⁶ == conjugate`) checks; the derived
-    `γ` coefficients byte-match independently-recomputed constants.
-  - `g1.zig`/`g2.zig`: generator serialization KATs (`97f1d3a7...`
-    reproduced for `G1`); full group-law suite (identity/inverse/
-    commutativity/associativity/`add-vs-double` consistency);
-    scalar-mul edge cases and distributivity; **independent
-    cross-check vectors** for `[2]G`, `[k]G`, `[2]G2`, `[k]G2`
-    (computed with a from-scratch affine-coordinates implementation —
-    different algorithm family, see `NOTICE`); `subgroupCheck` accepts
-    the generators and REJECTS independently-verified non-subgroup
-    curve points, which `clearCofactor` then repairs (this behavioral
-    pair is what caught the scaffold's wrong `h2`); decompression
-    round-trips with both sort-bit values plus a `NotOnCurve` reject
-    vector; uncompressed round-trips through real Jacobian arithmetic.
-  - `root.zig`: every `encoded_bytes` constant matches its documented
-    wire width; the dark-tests aggregator lists every submodule (Parts 1+2).
-  - `fp12.zig` (Part-2 additions): `cyclotomicSquare == square` on a
-    REAL cyclotomic-subgroup element (built pairing-free via the easy-
-    part construction, iterated 3 steps) and on `one`;
-    `frobeniusMap(k)` consistency for `k ∈ {0,1,2,3,6,12,13}`
-    (including `frobeniusMap(6) == conjugate` and the mod-12
-    reduction).
-  - `pairing.zig` (Part 2 — ALL PASS): `Gt`/`PairingPair`/`bls_x_abs`
-    sanity; `millerLoop` is definitionally `multiMillerLoop`'s `N=1`
-    case; non-degeneracy (`e(G1,G2) != 1`); bilinearity
-    (`e([3]P,[5]Q) == e(P,Q)^15`, additivity in both `G1` and `G2`,
-    `e([7]P,Q) == e(P,[7]Q) == e(P,Q)^7`); the `pairingCheck` identity
-    `e(P,Q)*e(-P,Q) == 1`, a 3-pair product-to-one check, and the
-    negative (`pairingCheck` on a single non-trivial pair rejects);
-    infinity-input handling (`e(O,Q) == e(P,O) == 1`, including inside
-    a multi-pairing); final-exp subgroup-membership sanity
-    (`e(G1,G2)^r == 1`); and the byte-exact `e(G1,G2)` KAT — the IETF
-    draft-irtf-cfrg-pairing-friendly-curves-11 Appendix B optimal-ate
-    vector (primary) plus the py_ecc-is-the-conjugate cross-check (see
-    "Part 2 design" above).
-- **Green in both modes (Parts 1-2)**: `zig build test-bls12_381`
-  (Debug) and `zig build test-bls12_381 -Doptimize=ReleaseFast`
-  (ReleaseFast — exercised deliberately, this repo has been bitten by
-  Debug-only-green UB before) both report **all tests pass, no
-  panics**. `zig fmt --check modules/bls12_381/` is clean.
-- **Part 3 vectors (`hash_to_curve.zig` + the new `fp.zig`/`fp2.zig`
-  helpers — ALL PASS)**: `expandMessageXmd` against RFC 9380
-  **Appendix K.1** (`expand_message_xmd(SHA-256)`, DST
-  `"QUUX-V01-CS02-with-expander-SHA256-128"`) for both published
-  `len_in_bytes` values, `0x20` (`ell=1`) and `0x80` (`ell=4`), all 5
-  messages each; `hashToFieldFp`/`hashToFieldFp2` against **Appendix
-  J.9.1**/**J.10.1**'s `u[0]`/`u[1]` intermediates;
-  `mapToCurveG1`/`mapToCurveG2` against J.9.1/J.10.1's **`Q0`/`Q1`**
-  intermediates (localizing any bug to the SSWU+isogeny map, plus
-  on-curve assertions); `hashToCurveG1`/`hashToCurveG2` against
-  J.9.1/J.10.1's **final `P`** — all 5 messages each, byte-exact, so
-  the entire chain (including the add + `h_eff` clear_cofactor tail)
-  is pinned at every stage the RFC publishes. Property tests:
-  `hashToCurve*`/`encodeToCurve*` outputs are on-curve AND pass
-  `subgroupCheck` for arbitrary non-vector messages; `sswuG1`/`sswuG2`
-  at `u = 0` exercise the `tv1 == 0` exceptional branch and land on
-  `E1'`/`E2'` with `sgn0(y) == 0`; `Fp`/`Fp2` `inv0`/`sgn0` unit tests
-  (including the `sgn0`-vs-`isLexicographicallyLargest` convention
-  distinction). **Net (Parts 1-3): `zig build test-bls12_381` reports
-  all tests pass, no panics, in both Debug and ReleaseFast** (`zig fmt
-  --check` clean).
-- **Part 4 (`bls_sig.zig`) — COMPLETE**: the scaffold-era tests (wire codecs, `keyGen`
-  IKM/determinism, `skToPk`+`keyValidate`, `keyValidate` rejecting the
-  identity and a non-subgroup point, `aggregate`/`aggregatePublicKeys`
-  empty-set rejection, single-signature and commutativity/associativity
-  properties, `coreAggregateVerify`/`aggregateVerify`/
-  `fastAggregateVerify` precondition rejection, and the byte-exact
-  `aggregate` KAT against `ethereum/bls12-381-tests` v0.1.2's
-  `aggregate_0xabab...ab.json`); the pairing-core tests, now passing:
-  `sign` against `sign_case_11b8c7cad5238946.json` (byte-exact 96-byte
-  signature), `verify` accept/reject against
-  `verify_valid_case_195246ee3bd3b6ec.json` (the reject case
-  substitutes a genuine mismatched signature rather than the upstream
-  byte-tampered vector, which fails to DESERIALIZE rather than
-  exercising `verify`'s pairing check — see that test's own comment),
-  `fastAggregateVerify` against
-  `fast_aggregate_verify_valid_3d7576f3c0e3570a.json`, a
-  self-consistent `popProve`/`popVerify` round trip (accept + a
-  wrong-key proof rejected), and a self-consistent end-to-end
-  `keyGen`->`skToPk`->`sign`->`verify`->`aggregate`->`aggregateVerify`
-  round trip with wrong-message/wrong-key/swapped-message tampering;
-  PLUS new security-check tests proving the mandatory checks FIRE:
-  `verify`/`popVerify`/`aggregateVerify` reject the IDENTITY public
-  key (KeyValidate fires, fail-closed, no panic); `verify`/`popVerify`/
-  `aggregateVerify`/`fastAggregateVerify` reject an on-curve
-  NON-SUBGROUP `G2` signature (crafted via `mapToCurveG2` WITHOUT
-  cofactor clearing, its non-membership asserted as a test
-  precondition); and an 8-signer `aggregateVerify` round trip (9
-  pairing terms) crossing `coreAggregateVerify`'s Miller-chunk
-  boundary, with a cross-boundary message-swap tamper rejected.
-  **`zig build test-bls12_381` reports all tests pass, no panics, in both
-  Debug and ReleaseFast** (`zig fmt --check` clean).
-- **Part 5 (`kzg.zig`) — COMPLETE**: constants cross-checked
-  against the fetched spec text (including an independent decimal->hex
-  conversion confirming `BLS_MODULUS == scalar.r_bytes`);
-  `G1_POINT_AT_INFINITY` cross-checked against `g1.zig`'s own compressed-
-  identity encoding; `isPowerOfTwo`/`reverseBits`/`bitReversalPermutation`
-  (the involution property, plus the spec's own order-8 worked example)
-  and `computePowers` (small worked cases, `n=0`). `loadTrustedSetup` is
-  exercised structurally (every slice's length) AND semantically
-  (`g1_monomial[0]`/`g2_monomial[0]` equal this module's own `G1`/`G2`
-  generators — the `[s^0]G = G` identity). `bytesToBlsField`/
-  `validateKzgG1`/`blobToPolynomial` are exercised for both their accept
-  AND reject paths (non-canonical field element, non-subgroup point).
-  **Byte-exact `ethereum/c-kzg-4844` KAT coverage across every EIP-4844
-  public function**, over TWO embedded blobs — the constant-2 blob
-  (permutation-invariant) and the "random" blob #4 (added by the
-  crypto-core pass precisely because it is permutation-SENSITIVE: it
-  would catch any bit-reversal/root-of-unity error the constant blob
-  cannot); `NOTICE` has every fetched file's path + sha256:
-  `blob_to_kzg_commitment_case_valid_blob_{1,4}`,
-  `compute_kzg_proof_case_valid_blob_1_0` and `_4_{2,5}`,
-  `verify_kzg_proof_case_correct_proof_1_0`/`_4_2` (accept) +
-  `verify_kzg_proof_case_incorrect_proof_0_0`/`_4_2` (reject),
-  `compute_blob_kzg_proof_case_valid_blob_{1,4}` (which pin
-  `computeChallenge`'s Fiat-Shamir transcript byte-exactly — the output
-  proof is an opening at the challenge point),
-  `verify_blob_kzg_proof_case_correct_proof_{1,4}` (accept) +
-  `verify_blob_kzg_proof_case_incorrect_proof_1` (reject), and a
-  two-blob batch of the pinned tuples (accept) with swapped proofs
-  (reject). PROPERTY layer: the vartime `G1` helpers against the
-  constant-time engine on random + every degenerate case; `g1Msm`
-  against naive scalar-mul (plus empty input, zero scalars, identity
-  points, a full-width scalar); the derived root of unity's order is
-  exactly `2^32` and the 4096-domain is primitive/complete; `fft`
-  against a naive DFT + `ifft ∘ fft == id`; TWO monomial-vs-Lagrange
-  ceremony cross-checks (the `ifft`-coefficient commitment of blob #4,
-  and a linear polynomial's `[c0]G + [c1][s]G1` prediction); barycentric
-  evaluation of a known linear polynomial (out-of-domain formula AND
-  in-domain indexing); `computeKzgProof` at an in-domain `z` (y indexes
-  the polynomial, proof verifies); a full pseudorandom-blob
-  commit->prove->verify round trip with wrong-`y`/wrong-proof/
-  tampered-blob rejections; `batchInvInPlace`; and fail-closed
-  non-canonical-field-element rejection at every bytes entry point. Plus
-  the scaffold's cross-check that the constant blob's KAT commitment
-  independently equals `g1.zig`'s own pre-existing `[2]G` KAT.
-  **`zig build test-bls12_381` (Debug) and `zig test -OReleaseFast`
-  report all tests pass, no panics** (`zig fmt --check` clean).
-- **Mutation run 2026-10-05** (in-place, ReleaseSafe, 43 mutants over the
-  `g1`/`g2` codecs and subgroup/on-curve checks, `Fp` canonicality, the
-  `bls_sig` verify family and KeyGen, hash-to-curve, threshold combine and
-  codecs, KZG decode/batch): 39 killed. The first pass left 16; tests were
-  added for the infinity encodings (`G1` and `G2`: a set coordinate bit, a
-  nonzero tail, infinity + sort), the on-curve refusal of the uncompressed
-  decoders (the checked decoder used to answer `NotInSubgroup` for an
-  off-curve point, so nothing noticed the curve check gone), `eqlPoints` on
-  the identity, `Fp.fromInt(p)`, `popVerify` of the identity key with the
-  identity proof (KeyValidate is the only guard there), a KeyGen vector
-  recomputed in Python (drops of the `I2OSP(0, 1)` octet survived), and a
-  trailing byte after a verification vector. Equivalent: the 11-isogeny's
-  exceptional case `or` → `and` (`x_den = ψ²`, `y_den = ψ³`, checked over
-  the table, so they vanish together); the trailing-data refusal of the
-  setup parser (it reads only the embedded, pinned file); and removing
-  `signature_subgroup_check` from `verify` and `coreAggregateVerify` — no
-  feasible input tells: the pairing is not blind to cofactor torsion
-  (measured: `sig + [r]P` fails the equation too), so a non-`G2` signature
-  that passes it needs a `GT` discrete log. The checks stay as the draft's
-  MUST.
-- **Mutation run 2026-10-06** (schemata, ReleaseSafe, 36 mutants over the
-  new code: `scheme.zig`'s min-sig negation, subgroup and `KeyValidate`
-  checks, AUG prefix on sign and verify, aggregation seeds, the chunked
-  Miller flush, Basic's distinct-message rule, `fastAggregateVerify`'s
-  key set, the POP DSTs, `verifyBatch`'s coefficients, checks and
-  scaling; `msm.zig`'s digit extraction, window doubling, running sum and
-  the vartime degenerate cases; `eip2333.zig`'s salt hashing, bit flip,
-  index endianness, seed length, path parsing and intermediate-key wipe;
-  the `…Parts` streaming): 32 killed, 4 equivalent — the signature
-  subgroup check dropped from `verify`, the aggregate check and the
-  batch (the same argument as above, now for `G1` signatures too: the
-  min-sig test's off-subgroup `G1` point fails the pairing without the
-  check), and `verifyBatch`'s top-bit set on `r_i` (it only rules out
-  `r_i = 0`, probability 2^-128).
-- 2026-11-17 (delta, min-sig threshold): schemata over a detached copy
-  (one ReleaseSafe build, the kit's `run.sh`), 26 mutants on the now
-  generic `Threshold(variant, scheme)`: both share codecs' index write and
-  zero-index refusal, the verification-vector count prefix, short-input
-  and exact-length checks, `splitSecretKey`'s `t > n` and coefficient-count
-  guards, the share evaluation point, the `j == 0` secret commitment, the
-  Feldman `scalarMul`, `groupPublicKey`'s index, `derivePublicKeyShare`'s
-  Horner add, `partialSign` and `verifyPartialSignature` under the other
-  scheme of the same variant, the index-mismatch check, all four
-  `combineSignatures` preconditions, its accumulator start, the self-skip,
-  numerator and denominator of `lambda_i` and the per-partial
-  `scalarMul`: **26/26 killed**. Card: 32 + 26 = 58 killed, 4 equivalent,
-  62 total.
+Run `scripts/modtest bls12_381` (Debug is slow: the KZG KATs dominate; the tests are exercised in
+Debug and ReleaseFast). The blst oracle is `tools/blst-vectors` (a Rust program that drives
+supranational/blst as a black box and emits `src/blst_vectors.zig`).
 
-## Status
+- **Fields and groups.** `fp.zig`/`scalar.zig`: `p` odd and exactly 381 bits, `half_p_bytes`
+  independently recomputed, canonical-boundary rejection, field identities, `Fr.reduceWide` KATs.
+  `fp2`/`fp6`/`fp12`: ring and tower relations (`u² = -1`, `v³ = ξ`, `w² = v`) checked through
+  general multiplication, norm-trick inversions, `frobenius == pow(p)` (definitional; catches any
+  Frobenius-coefficient error), the derived `γ` coefficients against independently recomputed
+  constants, `cyclotomicSquare == square` on a real cyclotomic element. `g1`/`g2`: generator
+  serialization KATs, the full group-law suite, independent cross-check vectors for `[k]G`
+  (a from-scratch affine implementation, a different algorithm family — see `NOTICE`),
+  `subgroupCheck` accepting the generators and rejecting independently verified non-subgroup
+  points (the behavioural pair that caught the wrong `h2`), decoders with both sort-bit values,
+  off-curve and infinity encodings; the "F4 subgroup" tests re-derive the endomorphism
+  preconditions and hold the fast check against `subgroupCheckByOrder`.
+- **Pairing.** Bilinearity property suite (non-degeneracy, `e([a]P,[b]Q) == e(P,Q)^(ab)`, additivity
+  on both sides, `pairingCheck` identities positive and negative, `e(G1,G2)^r == 1`, infinity
+  inputs including inside a multi-pairing), the byte-exact `e(G1,G2)` vector of
+  draft-irtf-cfrg-pairing-friendly-curves (Appendix B) and the py_ecc conjugate cross-check; the
+  raw-Miller-factor test and the affine-reference differential.
+- **Hash-to-curve.** RFC 9380 Appendix K.1 (`expand_message_xmd`, both published lengths, all
+  messages), J.9.1/J.10.1 `u`, `Q0`/`Q1` and final `P` (all messages, byte-exact, so every stage the
+  RFC publishes is pinned); K.6 for the SHAKE-256 expander; on-curve and subgroup properties for
+  arbitrary messages; the SSWU `tv1 == 0` exceptional branch; `inv0`/`sgn0` unit tests.
+- **Signatures.** `ethereum/bls12-381-tests` v0.1.2 KATs (`sign`, `verify` accept and reject,
+  `aggregate`, `fast_aggregate_verify`; paths and hashes in `NOTICE`); all six suites and `keyGen`/
+  `keyGenV4` byte-exact against blst (`src/blst_interop_test.zig`: `skToPk`/`sign`/`popProve` bytes,
+  foreign signatures and aggregates verify, a flipped message bit is refused; the oracle asserts its
+  own verify and one tampered message per suite before printing); security-check tests that the
+  mandatory checks fire (identity key, non-subgroup signature, an 8-signer aggregate across the
+  Miller chunk boundary with a cross-boundary swap); `verifyBatch` against `verify` and the
+  cancelling-error control (the unweighted aggregate accepts what the weighted batch refuses);
+  EIP-2333 against the EIP's vectors and blst's `derive_*_eip2333`; `msm` against the naive
+  constant-time sum.
+- **KZG.** Constants against the spec text, `bitReversalPermutation`/`computePowers` worked cases,
+  `loadTrustedSetup` structure and `[s^0]G = G`, accept and reject paths of the codecs;
+  `ethereum/c-kzg-4844` KATs for every EIP-4844 public function over two embedded blobs (a constant
+  blob and a permutation-sensitive random one); the vartime `G1` helpers against the constant-time
+  engine on random and degenerate inputs; `g1Msm` against naive scalar multiplication; the root of
+  unity's exact order; `fft` against a naive DFT; two monomial-vs-Lagrange ceremony cross-checks;
+  barycentric evaluation in and out of the domain; a full commit/prove/verify round trip with
+  rejections.
+- **Threshold.** Keystone tests (a combine of any `t` partials equals `bls_sig.sign` byte for byte
+  and verifies under `groupPublicKey`), subset independence, Feldman consistency, partial-signature
+  verification, below-threshold failure, precondition rejection; every min-pk test mirrored for
+  min-sig POP and Basic, and a combined min-sig signature equal to `MinSigPop.sign` under the key
+  reconstructed by Lagrange over `Fr`.
+- **Fuzz.** Driver prefix `BLS12_381_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver,
+  `src/fuzz_test.zig`): a codec harness (decoders never crash; what they accept re-encodes to the same
+  octets, `:99`) and a sign-verify harness (genuine signatures verify, every damaged one is refused,
+  `:184`).
+- **Constant time.** ctgrind targets `field`, `g1_scalarmul`, `g2_scalarmul`
+  (`src/ctgrind_harness.zig`, rows in the ctgrind table). The pairing, hash-to-curve and KZG paths take public data only and have
+  no ctgrind target. The dead-stack probe (`src/stackprobe_test.zig`) covers key generation, signing,
+  EIP-2333, threshold and `Fr.randomInto`.
+- **Mutation, unkillable by construction.** Removing `signature_subgroup_check` from `verify`,
+  `coreAggregateVerify` or the batch is not observable by any feasible input: the pairing is not
+  blind to cofactor torsion (`sig + [r]P` fails the equation too), so a non-subgroup signature that
+  passes it needs a `GT` discrete log. The checks stay as the draft's MUST.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-**Part 1 COMPLETE (crypto-core pass, 2026-07-14).** All field-tower
-and group arithmetic implemented and verified — see "Design &
-invariants" for the settled design decisions (canonical storage,
-derived Frobenius coefficients, branchless point arithmetic, the fixed
-G2 cofactor) and "Verification" for the test inventory.
+## What is deliberately not done
 
-**Part 2 COMPLETE (crypto-core pass, 2026-07-14).** `multiMillerLoop`
-(optimal ate, inversion-free Jacobian D-type-twist line evaluation, allocation-free
-batched multi-pairing), `finalExpHardPart` (Hayashida–Hayasaka–Teruya
-exact-`d` cyclotomic chain), `Fp12.cyclotomicSquare` (Granger–Scott)
-and `Fp12.frobeniusMap` (naive repeated Frobenius) are all real and
-verified — bilinearity property suite plus the byte-exact IETF-draft
-`e(G1,G2)` KAT with py_ecc conjugate cross-check. See "Part 2 design"
-above for the algorithm choices and the FCKRH-vs-exact-`d` and
-negative-seed-convention findings.
+- **Distributed key generation (Pedersen/GJKR).** `threshold.zig` is trusted-dealer only. A DKG, where
+  no single party learns `sk`, is a materially different, interactive protocol (every participant
+  deals shares of its own polynomial plus a complaint/justification round), a separate module with
+  its own message shapes, not a variant of `splitSecretKey`.
+- **Threshold under MessageAugmentation.** `Threshold(_, .message_augmentation)` is a compile error
+  (`threshold.zig:242`): AUG signs `SkToPk(SK) || msg`, and under a share that prefix is the share's
+  key, so partials sign different messages and do not interpolate. No reference does threshold AUG
+  either (drand's threshold network signs with Basic).
+- **Blame tooling.** No complaint/blame sub-protocol beyond `verifyPartialSignature`: there is no
+  interactive round to misbehave in.
+- **Ceremony generation or security.** The module consumes a published trusted setup; it has no role in
+  generating it and makes no claim about the ceremony's toxic waste.
+- **Other hash-to-curve suites.** The two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs and the `G1` SHAKE-256
+  suite (BBS) are implemented; no `G2` XOF variant (no consumer), and the §5.3.3 long-DST rehash is
+  not implemented for either expander (`dst.len <= 255` is asserted, `hash_to_curve.zig:177`).
+- **Constant-time pairing, hash-to-curve, KZG.** They operate on public data; see the threat model.
+- **A shared `expand_message_xmd`.** The module carries its own general-`ell` implementation rather
+  than depend on `frost` or `voprf` (each is hardcoded to a fixed `ell`, and a dependency edge to a
+  threshold or OPRF module for one hash primitive is a layering smell); factoring one helper across
+  the three is a cross-module refactor.
 
-**Part 3 COMPLETE (crypto-core pass, 2026-07-14).** The full RFC 9380
-chain — `expandMessageXmd` (§5.3.1, general `ell`), `hashToFieldFp`/
-`hashToFieldFp2` (§5.2), `sswuG1`/`sswuG2` (§6.6.2 Simplified SWU, on
-the new `Fp`/`Fp2` `inv0`/`sgn0` helpers), `isogenyMap11`/`isogenyMap3`
-(§6.6.3 iso_map over the programmatically-sourced Appendix E.2/E.3
-tables), and the `hashToCurve*`/`encodeToCurve*` compositions with
-`h_eff`-based `clear_cofactor` — is implemented and byte-exact against
-RFC 9380's own J.9.1/J.10.1 vectors at every published stage. See
-"Part 3 design" above for the `expand_message_xmd`
-reuse-vs-reimplement decision, the `Fp` wide-reduction finding, the
-constant-provenance discipline, and the `h_eff`-vs-plain-cofactor
-scaffold correction (the one place the scaffold's stated plan was
-wrong).
+## Backlog / deferred
 
-**Part 4 COMPLETE (crypto-core pass, 2026-07-14).** Minimal-pubkey-size,
-ProofOfPossession BLS signatures (draft-irtf-cfrg-bls-signature-05):
-everything is real — wire codecs, `keyGen`, `skToPk`, `keyValidate`,
-`aggregate`/`aggregatePublicKeys`, and the pairing-based `sign`,
-`verify`, `coreAggregateVerify`/`aggregateVerify`,
-`fastAggregateVerify`, `popProve`/`popVerify` cores, each implementing
-exactly the construction its scaffold doc comment specified (see
-"Part 4 design" above, including the crypto-core-pass notes on the
-chunked Miller accumulator and the draft-faithful
-`fastAggregateVerify`). Byte-exact against the `ethereum/bls12-381-tests`
-v0.1.2 `sign`/`verify`/`aggregate`/`fast_aggregate_verify` vectors;
-mandatory subgroup/`KeyValidate` checks proven to fire by dedicated
-fail-closed tests. `zig build test-bls12_381`: pass, no panics,
-Debug AND ReleaseFast — see "Verification" above.
-
-**Part 5 COMPLETE (crypto-core pass, 2026-07-14).** EIP-4844 (deneb)
-KZG polynomial commitments over this module's own
-`G1`/`G2`/`Fr`/pairing primitives — everything is real: the
-trusted-setup loader (embeds + validates the official Ethereum KZG
-ceremony's `trusted_setup.txt`, on-curve + subgroup-checking all 8257
-points ONCE per process, memoized — see "Part 5 design"),
-blob<->polynomial (de)serialization with canonical-field-element
-enforcement, `G1`/commitment/proof validation, the bit-reversal-
-permutation/`computePowers` helpers, `g1Msm` (Pippenger over
-variable-time public-data arithmetic), the `Fr` radix-2 NTT
-(`fft`/`ifft`) with the runtime-DERIVED primitive `2^32` root of unity,
-`evaluatePolynomialInEvaluationForm` (barycentric, batch-inverted
-denominators, in-domain special case), `computeKzgProofImpl`
-(evaluation-form quotient incl. the in-domain removable singularity),
-`verifyKzgProofImpl`/`verifyKzgProofBatchImpl` (the pairing-product
-checks: `e(proof, [s]₂ - [z]₂) == e(commitment - [y]₁, [1]₂)` as
-`pairingCheck({P - [y]G, -G2}, {proof, [s]₂ - [z]₂})`, and its
-`r`-powers random-linear-combination batch generalization), and
-`computeChallenge` (Fiat-Shamir). Byte-exact against
-`ethereum/c-kzg-4844` KATs across every public function, over both a
-constant and a permutation-sensitive random blob, plus two
-monomial-vs-Lagrange ceremony cross-checks and a full property suite —
-see "Verification" above. `zig build test-bls12_381`: pass, no
-panics, Debug AND ReleaseFast.
-
-**Part 6 COMPLETE (crypto-core pass 2026-07-14).** Trusted-dealer
-threshold BLS over Part 4's min-pk ciphersuite: the four crypto cores —
-`evalPolynomialAt` (Shamir evaluation), `feldmanCommitCoefficient`
-(Feldman commit), `derivePublicKeyShare` (Feldman
-evaluate-in-the-exponent), and `combineSignatures`'s interpolation step
-(Lagrange-in-the-exponent, `frost.deriveInterpolatingValue`'s exact
-coefficient formula `lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1` via
-`Fr.inv`) — implemented per the constructions quoted in each doc
-comment; see "Part 6 design" above for the const-time breakdown. The
-verification chain that pins Part 6 transitively to REAL vectors: the
-keystone tests assert `splitSecretKey` -> `partialSign` (`t` distinct
-shares) -> `combineSignatures` equals `bls_sig.sign(&sk, msg)`
-BYTE-FOR-BYTE and verifies via `bls_sig.verify(groupPublicKey(vvec),
-...)` — and Part 4's `sign`/`verify` are themselves pinned to
-`ethereum/bls12-381-tests` v0.1.2. Also covered: subset-independence
-(two different 3-of-5 subsets combine to the identical signature),
-Feldman VSS-consistency (`derivePublicKeyShare(vvec, i)` ==
-`bls_sig.skToPk(&share_i)` for every dealt share), partial-signature
-verification over a real dealing (accepts every honest partial against
-its VSS-derived key share; rejects wrong-share and wrong-index
-partials), the `(t=2,n=3)` and `(t=n=4)` end-to-end cases, an
-over-determined combine (4 partials of a `t=3` dealing, same
-signature), a below-threshold sanity check (2 partials of a `t=3`
-dealing interpolate a WRONG signature that fails `bls_sig.verify` —
-`t` really is the threshold), and precondition rejection
-(too-few/duplicate-index/zero-index partials, invalid `(t, n,
-coefficients)` splits). `zig build test-bls12_381`: pass, no
-panics, Debug AND ReleaseFast.
-
-**min-sig threshold (2026-11-17).** `threshold.zig` is now
-`Threshold(variant, scheme)` over `scheme.zig`'s `Bls(variant, scheme)`,
-the same generalisation the signature suites got: Feldman commitments,
-key shares and the group key in `PkGroup`, partial and combined
-signatures in `SigGroup`, `partialSign`/`verifyPartialSignature` the
-suite's own `sign`/`verify` under a share. `MinPk` (min-pk POP) carries
-the old file-level names unchanged; `MinSig` is min-sig POP and
-`Threshold(.min_sig, .basic)` drand quicknet's suite. MessageAugmentation
-is a compile error: AUG signs `SkToPk(SK) || msg`, and under a share that
-prefix is the share's key, so partials sign different messages and do
-not interpolate (no reference does threshold AUG either: drand's
-threshold network signs with Basic, min-pk chained and min-sig
-quicknet). Const-time: the shares are the same `Fr` scalars; the only new
-secret-touching operation is `feldmanCommitCoefficient`'s `G2`
-`scalarMul` (`g2.zig`'s constant-time ladder, the `g2_scalarmul`
-ctgrind row) and `partialSign`'s `G1` `scalarMul` inside
-`MinSigPop.sign` (the `g1_scalarmul` row). Anchor: every min-pk test
-mirrored over min-sig POP and Basic, and a combined min-sig signature
-equals `MinSigPop.sign` under the key reconstructed by Lagrange over
-`Fr` (no group involved) and verifies under `MinSigPop` — whose
-`sign`/`verify` are byte-exact against blst and drand quicknet.
-
-### Backlog (deferred)
-
-0. **Dead stack of the curve layer's own callers (2026-10-09).** The secret entry points of this
-   module burn (`burn.zig`, probe `stackprobe_test.zig`), but `Fr.random` returns a secret by
-   value and `scalarMul`/`msm` take scalars by value: a consumer that draws a nonce or blinding
-   factor and multiplies with it outside these entry points (bbs, coconut, ibe, tlock) leaves it
-   in its own frames. Fixed per consumer in its sweep; an `Fr.randomInto(out, io)` twin is the
-   likely first need. ✅ 2026-11-16: `Fr.randomInto` exists (the drawn bytes wiped); ✅ 2026-11-19: its body
-   runs under `burn.run` (`random_burn`) and the stack probe has a `Fr.randomInto` case
-   (a fake `Io` replays known bytes; without the burn it finds the drawn bytes and the
-   scalar). The by-value `scalarMul`/`msm` part stays open: pointer-taking variants were
-   not added (the item asks only for the `randomInto` twin, and `scalarMul`/`msm` have
-   many call sites in `g1`/`g2`/`msm`/the scheme code; a consumer that must not leave the
-   scalar in its frame wraps the call in its own burned frame).
-1. **The Miller-loop sparse-multiplication optimization** — a freshly
-   computed line value is structurally sparse (3 nonzero `Fp2`
-   coefficients out of 6 — the "014" shape `lineValue` documents); the
-   implemented baseline promotes it to a dense `Fp12` and uses the
-   general `mul`, correctness-first; a dedicated sparse-multiply is a
-   real, well-known follow-up optimization (`multiMillerLoop`'s own
-   `TODO` note), not a correctness prerequisite.
-
-   ⚠ **This entry used to lead with the sparse multiply and mention
-   inversion-free point steps as a trailing clause ("fine for
-   verification workloads"). Measured 2026-09-16, that ordering was
-   backwards by a factor of twenty**, which is why the projective steps
-   are now DONE (see "Inversion-free Miller loop" in the threat model
-   above) and this item is what actually remains. On `drand`'s 2-pair
-   beacon check, ReleaseFast, process CPU time: the affine steps' 136
-   `Fp2.inv` calls cost 42.8 µs each = **5.82 ms** of a 10.01 ms
-   verification, while the ~137 dense `Fp12.mul` folds cost 7.7 µs each
-   = 1.06 ms, of which a sparse multiply saves a fraction — call it
-   **0.3 ms**. The lesson is the general one: a deferred-optimization
-   note is a guess until someone measures the pieces.
-2. **The fast cofactor-clearing path** (Bowe's untwist-Frobenius-twist
-   technique, cited in `NOTICE`) — `clearCofactor` is still the simple
-   `scalarMul`-by-cofactor form. The fast SUBGROUP CHECKS are done
-   (2026-09-15, see "Subgroup checks" in the threat model).
-3. **Performance**: persistent Montgomery storage for
-   `Fp`/`Fr` (currently canonical-at-rest — see the convention note in
-   `fp.zig`), caching the `Fp6`/`Fp12` Frobenius coefficients (currently
-   recomputed per call — directly relevant to `Fp12.frobeniusMap`'s own
-   deferred caching choice), and a fixed-window scalar
-   multiplication (currently double-and-add-always).
-4. **Optional API additions if consumers appear**: a variable-time
-   public-scalar `scalarMul` for verification-side hot paths; a
-   secret-exponent (ladder) `Fp2.pow`; skipping the full final
-   exponentiation for `pairingCheck` specifically when a cheaper
-   not-equal-to-one test suffices (`pairingCheck`'s own `TODO(fable)`
-   note).
-5. **Part 3 performance follow-ups** (correctness is DONE — see
-   Status): the endomorphism-based FAST `clear_cofactor` evaluation
-   (Scott [WB19] for `G1`, Budroni-Pintore [BP17]/Appendix G.3 for
-   `G2`) — the current implementation multiplies by the same suite
-   `h_eff` those methods are equivalent to, via the generic
-   constant-time `scalarMulBytes` (`G2`'s 636-bit `h_eff` makes this
-   the dominant hash-to-curve cost); §6.6.3's add-on-`E1'`-before-
-   `iso_map` homomorphism trick (saves one isogeny evaluation per
-   `hash_to_curve`); and a variable-time public-scalar multiplication
-   for the `h_eff` step (hash-to-curve input is public — see the
-   threat model).
-6. **Part 4 follow-ups**: ~~a byte-exact `keyGen` KAT~~ — ✅ 2026-10-06,
-   blst's `key_gen_v5` (`blst_interop_test.zig`); ~~the min-sig
-   variant~~ — ✅ 2026-10-06 (`scheme.zig`).
-7. **Part 5 follow-ups (the crypto-core pass itself is DONE — see
-   Status)**: MSM performance beyond baseline Pippenger (signed/NAF
-   digits, affine batch-inverted bucket additions, per-window
-   parallelism — the implemented bucket method is already `O(n·256/c)`
-   but each addition still pays full Jacobian arithmetic); a
-   precomputed/cached bit-reversal-permuted Lagrange basis on
-   `TrustedSetup` (currently re-permuted per commitment/proof — a cheap
-   copy, but avoidable); EIP-7594/PeerDAS cell proofs (explicitly out
-   of scope for Part 5 itself, `SPEC.md`'s threat model — `fft`/`ifft`
-   are already in place for it).
-8. **Part 6 follow-ups (the crypto-core pass itself is DONE 2026-07-14
-   — see Status; `evalPolynomialAt`, `feldmanCommitCoefficient`,
-   `derivePublicKeyShare` and `combineSignatures` are implemented in
-   `threshold.zig`)**: a full Pedersen/GJKR-style DKG (explicitly out of
-   scope for this trusted-dealer pass, "Part 6 design"/"Out of scope
-   for Part 6" above) would be a genuinely separate follow-up
-   module/part, not an extension of `threshold.zig` itself.
-
-- ~~**min-sig ciphersuite**~~, ~~**Basic and MessageAugmentation schemes**~~, ~~**batch verification with random linear combination**~~, ~~**public MSM for G1 and G2**~~, ~~**EIP-2333**~~ *(survey 2026-09-30)* — ✅ all 2026-10-06 (`scheme.zig`, `msm.zig`, `eip2333.zig`; "Part 4 design").
-- ✅ **DONE 2026-11-16 (`bls_sig.keyGenV4`, byte-exact to blst's default `key_gen` over every case of `blst_vectors.zig`):** **draft -04-compatible KeyGen** *(2026-10-06)*: blst's default `key_gen` pre-hashes the salt (the -04 behaviour, also EIP-2333's `HKDF_mod_r`); ours is -05. A caller porting keys generated by blst's default from the same IKM gets a different key. Effort: small (a `keyGenV4` beside `keyGen`); wanted only if such a caller appears. Fits §2.
-- ✅ **DONE 2026-11-17 (`threshold.Threshold(variant, scheme)`, `threshold.MinSig`; the file-level names stay the min-pk POP instance `threshold.MinPk`; tests: every min-pk test mirrored for min-sig POP and Basic, plus a combined min-sig signature equal to `MinSigPop.sign` under the key reconstructed by Lagrange over `Fr` and verifying under `MinSigPop`, suite separation from Basic/min-pk):** **min-sig threshold shares** *(2026-10-06)*: `threshold.zig` deals and combines min-pk only. Effort: small-medium (the same generalisation `scheme.zig` did). Fits §2.
-- **EIP-7594 (PeerDAS) cell proofs** *(survey 2026-09-30)*: c-kzg-4844 has them; SPEC "Out of scope for Part 5" defers them as "materially larger", with no refusal. Effort: large. Fits §2.
+- **Pointer-taking scalar entry points.** `scalarMul` and `msm` take scalars by value (see the threat
+  model's "Secrets in callers' frames"); pointer-taking variants were not added (many call sites in
+  `g1`/`g2`/`msm`/the scheme code). Wanted when a consumer cannot burn its own frame.
+- **Sparse Miller-loop multiplication.** A fresh line value is structurally sparse (3 nonzero `Fp2`
+  coefficients of 6, the "014" shape `lineValue` documents); the baseline promotes it to a dense
+  `Fp12` (`pairing.zig:327`). A dedicated sparse multiply is a well-known follow-up
+  (`multiMillerLoop`'s own `TODO`), a fraction of the verification cost now that the point steps are
+  inversion-free; measure before building.
+- **Fast cofactor clearing.** `g1`/`g2` `clearCofactor` multiply by the plain cofactor
+  (`g2.zig:352`); Bowe's untwist-Frobenius-twist technique is cheaper. For hash-to-curve the same
+  holds for the `h_eff` step (Scott [WB19] for `G1`, Budroni-Pintore [BP17]/Appendix G.3 for `G2`):
+  today it is the generic constant-time `scalarMulBytes`, and `G2`'s 636-bit `h_eff` is the dominant
+  hash-to-curve cost.
+- **Hash-to-curve: add-before-isogeny.** §6.6.3's homomorphism trick (add on `E1'` before `iso_map`)
+  saves one isogeny evaluation per `hash_to_curve`; a variable-time public-scalar multiplication for
+  the `h_eff` step (the message is public).
+- **Fixed-window scalar multiplication** (currently constant-time double-and-add-always,
+  `g1.zig:287`).
+- **Optional API additions if consumers appear.** A variable-time public-scalar `scalarMul` for
+  verification-side hot paths; a secret-exponent (ladder) `Fp2.pow`; skipping the full final
+  exponentiation in `pairingCheck` when a cheaper not-equal-to-one test suffices (`pairing.zig:598`
+  `TODO`).
+- **MSM beyond baseline Pippenger.** Signed/NAF digits, affine batch-inverted bucket additions,
+  per-window parallelism (each addition still pays full Jacobian arithmetic); a cached
+  bit-reversal-permuted Lagrange basis on `TrustedSetup` (currently re-permuted per commitment/proof).
+- **EIP-7594 (PeerDAS) cell proofs.** c-kzg-4844 has them (`compute_cells`, `compute_cells_and_kzg_proofs`,
+  `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs`); a materially larger, separate spec
+  (`specs/fulu/polynomial-commitments-sampling.md` family) built on top of this module's primitives
+  (`fft`/`ifft` are in place). Effort: large. Fits §2.
 
 ## Anchoring
-**Audit 2026-11-20 (delta mutation).** The only non-test source change since the last audit is `Fr.randomInto` running its body one frame down under `burn.run` with a new `burn.random_burn` (8 KiB, 0.56 KiB measured dirty depth). 2 schemata mutants in a ReleaseFast build of the module's stack probe: the wrap dropped, `random_burn` shrunk to 256 B. Both killed by the new `Fr.randomInto` probe case; the baseline passes. Card counts are cumulative: 58/62 + 2/2 = 60/64, 4 eq. Not mutated: the `burn.stack`/`burn.run` bodies (unchanged since the earlier audits).
-
-
 **Anchor grade:** class B · oracle MIXED
 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
@@ -1313,4 +914,3 @@ equals `MinSigPop.sign` under the key reconstructed by Lagrange over
 
 **What the tests actually contain.** EXTERNAL: IETF draft/py_ecc byte-exact KATs (fields, pairing, hash-to-curve); `ethereum/bls12-381-tests` for the min-pk POP suite; all six signature suites byte-exact against supranational/blst 0.3.16 run as a black box (`tools/blst-vectors` → `src/blst_vectors.zig`, `src/blst_interop_test.zig`: keyGen = blst `key_gen_v5`, `skToPk`/`sign`/`popProve` bytes, foreign signatures and aggregates verify, a flipped message bit is refused; the oracle asserts its own verify and one tampered message per suite before printing); live drand mainnet beacons for min-pk Basic (chained) and min-sig Basic (quicknet); EIP-2333 against the EIP's own vectors and against blst `derive_*_eip2333`; KZG against c-kzg-4844 vectors. SELF: threshold BLS dealing and share codecs (keystone checks against our own, externally anchored, `sign`), `verifyBatch` (checked against `verify` and a cancelling-error control), MSM (against the constant-time naive sum).
 
-**How it got there.** KeyGen had no KAT (draft App. B is "TBA") until blst's `key_gen_v5` was run as an oracle (2026-10-06); its default `key_gen` turned out to be the -04 variant (pre-hashed salt), which explained why no Ethereum-side vector ever matched. An independent Python recomputation of both drafts agreed.

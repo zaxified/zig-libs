@@ -5,81 +5,58 @@ KZG polynomial commitments, and threshold-BLS schemes — the base field
 `Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, the
 two pairing groups `G1`/`G2`, and the pairing `e: G1 x G2 -> Gt`.
 
-**Status: Parts 1-6 complete.** Part 1's full
-field-tower and group arithmetic, every curve/field constant
-independently verified (see `NOTICE` — including a G2-cofactor
-scaffold bug found and fixed during the crypto-core pass),
-constant-time scalar multiplication and branchless point addition.
-Part 2 (`pairing.zig`) is the real pairing: the optimal ate Miller loop
-(D-type-twist line evaluation, batched allocation-free multi-pairing)
-and the full final exponentiation (easy part + the
-Hayashida-Hayasaka-Teruya exact hard-part chain), verified by a full
-bilinearity property suite PLUS a byte-exact `e(G1,G2)` KAT against the
-IETF pairing-friendly-curves draft's official test vector (with a
-py_ecc cross-check). Part 3 (`hash_to_curve.zig`) is RFC 9380
-hash-to-curve for `G1`/`G2` (suites
-`BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`/`_NU_`): the full
-`expand_message_xmd` → `hash_to_field` → Simplified-SWU-plus-isogeny →
-`h_eff` clear-cofactor chain, byte-exact against RFC 9380's own
-vectors at every published stage (Appendix K.1; J.9.1/J.10.1 `u`,
-`Q0`/`Q1`, final `P` — all 5 messages each), with the isogeny
-coefficient tables sourced programmatically from the RFC's raw text
-and verified by an independent implementation (see `NOTICE`). Part 4
-(`bls_sig.zig`, `scheme.zig`) is BLS signatures per
-draft-irtf-cfrg-bls-signature-05, **all six ciphersuites**:
-`bls_sig.Bls(variant, scheme)` for min-pk / min-sig times Basic /
-MessageAugmentation / ProofOfPossession (`bls_sig.MinPkPop`, `MinSigBasic`,
-… — the file-level `bls_sig.sign`/`verify`/… are `MinPkPop`, Ethereum's
-suite) — `keyGen`/`skToPk`/`keyValidate`, `sign`/`verify`,
-signature/pubkey aggregation with `aggregateVerify` (and, for POP,
-`fastAggregateVerify` and `popProve`/`popVerify`), and `verifyBatch`
-(random-linear-combination batch verification of independent
-signatures). Byte-exact against `ethereum/bls12-381-tests` v0.1.2 and,
-for all six suites and `keyGen`, against supranational/blst run as a
-black box; live drand beacons verify under both Basic layouts. The
-mandatory subgroup/`KeyValidate` checks are fail-closed at every verify
-entry point. `eip2333.zig` derives Ethereum validator keys
-(`deriveMasterSk`/`deriveChildSk`/`derivePath`, EIP-2334 paths), checked
-against the EIP's vectors and blst; `msm.zig` is Pippenger
-multi-scalar multiplication for `G1` and `G2` (public data only). Part 5 (`kzg.zig`) is EIP-4844
-(deneb) KZG polynomial commitments: the trusted-setup loader (parses
-and validates the embedded official Ethereum KZG ceremony
-`trusted_setup.txt`, on-curve + subgroup-checking all 8257 points —
-once per process, memoized), blob<->polynomial (de)serialization with
-canonical-field-element enforcement, `blobToKzgCommitment`,
-`computeKzgProof`/`verifyKzgProof`, `computeBlobKzgProof`/
-`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus reusable `Fr`
-FFT/inverse-FFT and Pippenger `G1` multi-scalar-multiplication
-primitives — byte-exact against `ethereum/c-kzg-4844`'s official KAT
-vectors across every public function (see `kzg.zig`'s module doc
-comment and `SPEC.md`). Parts 1-6: all pass, no panics, in
-Debug AND ReleaseFast (see `SPEC.md` for the design record).
+The module is built in six parts, all in this package:
 
-**Part 6 (`threshold.zig`) is COMPLETE.** Trusted-dealer threshold BLS
-— Shamir secret sharing + Feldman verifiable secret sharing (VSS) +
-Lagrange-interpolation-in-the-exponent combining — built entirely on
-Part 4's min-pk ciphersuite (a partial signature IS a `bls_sig.sign`
-call under a Shamir share; a combined signature IS an ordinary
-`bls_sig.Signature`, byte-for-byte equal to `bls_sig.sign(&sk, msg)` and
-verified with the ordinary `bls_sig.verify` — which transitively pins
-the threshold path to Part 4's `ethereum/bls12-381-tests` vectors). See
-`threshold.zig`'s own module doc comment and `SPEC.md`'s "Part 6
-design" (including the const-time breakdown for the secret paths).
+1. **Field tower and groups** (`fp.zig`, `fp2.zig`, `fp6.zig`, `fp12.zig`, `scalar.zig`, `g1.zig`,
+   `g2.zig`): every field and group operation, constant-time scalar multiplication and branchless
+   complete point addition; every curve and field constant independently verified (see `NOTICE`).
+2. **The pairing** (`pairing.zig`): the optimal ate Miller loop (Jacobian D-type-twist line
+   evaluation, batched allocation-free multi-pairing) and the full final exponentiation (easy part
+   plus the Hayashida-Hayasaka-Teruya exact hard-part chain), byte-exact against the IETF
+   pairing-friendly-curves draft's `e(G1,G2)` vector with a py_ecc cross-check.
+3. **Hash-to-curve** (`hash_to_curve.zig`): RFC 9380 for `G1`/`G2` (suites
+   `BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`/`_NU_`, plus the `G1` SHAKE-256 suite): the full
+   `expand_message_xmd` -> `hash_to_field` -> Simplified-SWU-plus-isogeny -> `h_eff` clear-cofactor
+   chain, byte-exact against RFC 9380's own vectors at every published stage; the isogeny tables
+   were parsed from the RFC text and checked by an independent implementation (see `NOTICE`).
+4. **BLS signatures** (`bls_sig.zig`, `scheme.zig`): draft-irtf-cfrg-bls-signature-05, **all six
+   ciphersuites** — `bls_sig.Bls(variant, scheme)` for min-pk / min-sig times Basic /
+   MessageAugmentation / ProofOfPossession (`bls_sig.MinPkPop`, `MinSigBasic`, ...; the file-level
+   `bls_sig.sign`/`verify`/... are `MinPkPop`, Ethereum's suite): `keyGen`/`keyGenV4`/`skToPk`/
+   `keyValidate`, `sign`/`verify`, aggregation with `aggregateVerify` (and, for POP,
+   `fastAggregateVerify` and `popProve`/`popVerify`), and `verifyBatch` (random-linear-combination
+   batch verification of independent signatures). Byte-exact against `ethereum/bls12-381-tests`
+   v0.1.2 and, for all six suites and both key generations, against supranational/blst run as a
+   black box; live drand beacons verify under both Basic layouts. The mandatory subgroup and
+   `KeyValidate` checks are fail-closed at every verify entry point. `eip2333.zig` derives Ethereum
+   validator keys (`deriveMasterSk`/`deriveChildSk`/`derivePath`, EIP-2334 paths), checked against
+   the EIP's vectors and blst; `msm.zig` is Pippenger multi-scalar multiplication for `G1` and `G2`
+   (public data only).
+5. **KZG** (`kzg.zig`): EIP-4844 (deneb) polynomial commitments. The trusted-setup loader parses
+   and validates the embedded official Ethereum KZG ceremony `trusted_setup.txt` (on-curve and
+   subgroup check of all 8257 points, once per process, memoized); blob <-> polynomial
+   (de)serialization with canonical-field-element enforcement; `blobToKzgCommitment`,
+   `computeKzgProof`/`verifyKzgProof`, `computeBlobKzgProof`/`verifyBlobKzgProof`/
+   `verifyBlobKzgProofBatch`; reusable `Fr` FFT/inverse-FFT and `G1` multi-scalar multiplication.
+   Byte-exact against `ethereum/c-kzg-4844`'s KAT vectors for every public function.
+6. **Threshold BLS** (`threshold.zig`): trusted-dealer Shamir secret sharing + Feldman verifiable
+   secret sharing + Lagrange-interpolation-in-the-exponent combining, generic over the suite
+   (`Threshold(variant, scheme)`; min-pk and min-sig, Basic and POP; the file-level names are the
+   min-pk POP instance `MinPk`). A partial signature IS a `sign` call under a Shamir share; a combined
+   signature IS an ordinary signature, byte-for-byte equal to `sign(&sk, msg)` and verified with the
+   ordinary `verify`, which pins the threshold path to the signature vectors.
 
-## The multi-part arc
-
-This module is planned across several parts.
-
-| Part | Scope | Status |
-|---|---|---|
-| 1 | Field tower (`Fp`/`Fp2`/`Fp6`/`Fp12`) + groups (`G1`/`G2`) | **done** |
-| 2 | The pairing itself: Miller loop + final exponentiation | **done** |
-| 3 | Hash-to-curve (RFC 9380, for hashing messages onto `G1`/`G2`) | **done** |
-| 4 | BLS signatures (draft-irtf-cfrg-bls-signature-05, min-pk/ProofOfPossession) | **done** |
-| 5 | KZG polynomial commitments (EIP-4844 / deneb) | **done** |
-| 6 | Threshold BLS (trusted-dealer Shamir + Feldman VSS + Lagrange combine) | **done** |
+See `SPEC.md` for the design record (including the constant-time breakdown for the secret paths).
 
 **Deps:** `entropy` (batch-verify randomness, key material), `montint` (constant-time `Fr` arithmetic); no third-party code.
+
+## Not provided
+
+EIP-7594 (PeerDAS) cell proofs, distributed key generation (threshold is trusted-dealer only),
+threshold shares under the MessageAugmentation suites, and constant-time pairing, hash-to-curve or
+KZG (they take public data only). See `SPEC.md` *What is deliberately not done* and *Backlog /
+deferred*.
+
 
 ## Import
 
@@ -179,11 +156,11 @@ caller already trusts only. A point built some other way still needs
 
 | File | Contents |
 |---|---|
-| `fp.zig` | Base field `Fp` (mod `p`), built on `std.crypto.ff.Modulus(384)` |
+| `fp.zig` | Base field `Fp` (mod `p`): own constant-time Montgomery backend (six `u64` limbs; `std.crypto.ff` only as a comptime constant and test oracle) |
 | `fp2.zig` | `Fp2 = Fp[u]/(u²+1)` |
 | `fp6.zig` | `Fp6 = Fp2[v]/(v³−(u+1))` |
 | `fp12.zig` | `Fp12 = Fp6[w]/(w²−v)` — the pairing's target field |
-| `scalar.zig` | Scalar field `Fr` (mod `r`, the group order), built on `std.crypto.ff.Modulus(256)` |
+| `scalar.zig` | Scalar field `Fr` (mod `r`, the group order), `montint.Field(r)` |
 | `g1.zig` | `G1`: the order-`r` subgroup of `E(Fp): y²=x³+4` |
 | `g2.zig` | `G2`: the order-`r` subgroup of the sextic twist `E'(Fp2): y²=x³+4(1+u)` |
 | `pairing.zig` | Part 2: `e: G1 x G2 -> Gt`, the optimal ate Miller loop + final exponentiation |
@@ -197,10 +174,14 @@ caller already trusts only. A point built some other way still needs
 | `src/data/kzg_test_vectors/` | Two embedded `c-kzg-4844` KAT blobs (constant-2 + random #4; see `NOTICE`) |
 | `threshold.zig` | Part 6: trusted-dealer threshold BLS, `Threshold(variant, scheme)` (min-pk/min-sig × Basic/POP; file-level names = `MinPk`) — `splitSecretKey`/`groupPublicKey`/`derivePublicKeyShare` (Shamir+Feldman VSS), `partialSign`/`verifyPartialSignature` (thin over `bls_sig`), `combineSignatures` (Lagrange-in-the-exponent) |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
+| `burn.zig` | Dead-stack burn for every entry point that holds a secret (probe: `stackprobe_test.zig`) |
+| `blst_vectors.zig`, `blst_interop_test.zig` | supranational/blst black-box vectors (produced by `tools/blst-vectors`) and the test that checks all six suites against them |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | Fuzz driver (`BLS12_381_FUZZ`), dead-stack probe, ctgrind harness |
 
 ## Verify
 
 ```
+scripts/modtest bls12_381                        # the module's tests
 zig build test-bls12_381                        # Debug (slow: the KZG KATs dominate, several minutes)
 zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast (~1 min)
 zig fmt --check modules/bls12_381/

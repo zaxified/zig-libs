@@ -5,9 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests/audit: delta mutation of the `Fr.randomInto` burn (2 mutants in the stack probe, both killed); card counts 60/64, SPEC "Audit 2026-11-20". No source change.
 - **2026-11-19** — **BEHAVIOURAL, not breaking:** `Fr.randomInto` runs its body in a burned frame (`burn.random_burn`, 8 KiB): the by-value `fromBytes` argument and the conversion temporaries it left on the dead stack (the drawn bytes and the scalar) are zeroed before it returns. New stack-probe case `Fr.randomInto` (a fake `Io` replays known bytes); without the burn it finds both images. Same values drawn.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the generic threshold layer (26/26 killed); card mutation 58/62 (4 eq) and source hash.
 - **2026-11-17** — `threshold.Threshold(variant, scheme)`: trusted-dealer threshold BLS for min-sig too (`threshold.MinSig`, keys and Feldman commitments in `G2`, partial and combined signatures in `G1`), Basic or ProofOfPossession; MessageAugmentation is a compile error (a share would sign its own key's bytes). The file-level `threshold.*` names are the unchanged min-pk POP instance `threshold.MinPk`. A combined min-sig signature equals `MinSigPop.sign` under the reconstructed key.
 - **2026-11-16** — `keyGen` / `keyGenV4` take a `key_info` of any length: HKDF-Expand is written out so `key_info`
   streams into the HMAC. Before, a `key_info` over 254 bytes hit a `std.debug.assert` (a consumer-reachable panic, UB in
@@ -16,8 +14,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   round), blst's default `key_gen` and EIP-2333's `HKDF_mod_r`; checked byte for byte against blst's `sk` vectors.
 - **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
   nonce or key is never returned by value through the caller's frame.
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `BLS12_381_FUZZ` (testkit) over secret/public-key/signature decoders (canonical re-encode, damaged genuine encodings refused) and sign/verify, fast and distinct-message aggregation and proof of possession (flipped, wrong message/key, swapped messages refused). No change to the library code.
 - **2026-10-09** — **BREAKING, HIGH: every entry point that holds a BLS secret left it on the dead
@@ -63,7 +59,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   KAT; blst's default `key_gen` is the draft -04 variant), live drand beacons for both
   Basic layouts, EIP-2333 against the EIP and blst. Mutation run over the new code:
   32 of 36 killed, 4 equivalent.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Backlog item 8 no longer says the Part 6 crypto-core pass is "NOT started" — it was completed 2026-07-14 (Status, `threshold.zig`); only the DKG follow-up remains.
 - **2026-10-05** — Mutation run: 39 of 43 killed, 4 equivalent; 8 tests added
   and 1 extended (infinity encodings of `G1`/`G2`, on-curve refusal of the
   uncompressed decoders, `eqlPoints` on the identity, `Fp.fromInt(p)`,
@@ -102,7 +97,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-15** — **BEHAVIOURAL (stricter only on invalid input) + ⚠ large performance change:** A1 `drand` F4. `g1.Jacobian.subgroupCheck` and `g2.Jacobian.subgroupCheck` no longer compute `[r]P == O`; they check the curve equation and then the endomorphism membership tests `φ(P) == [−x²]P` (`G1`) and `ψ(P) == [x]P` (`G2`, untwist-Frobenius-twist) — Scott, ePrint 2021/1130 §6/§4; proof and conditions from El Housni–Guillevic–Piellard, ePrint 2022/352 §4.3 Propositions 4/5, whose gcd conditions the new "F4 subgroup" tests re-derive for this curve. ReleaseFast, 7 interleaved reps: `G1` **0.774 → 0.123 ms**, `G2` **2.41 → 0.175 ms**; `drand.verifyRoundPoints` 10.34 → 9.72 ms median. Verdicts are unchanged for every point ON the curve (differential tests against the kept reference `[r]P == O` over members, random non-members, `[r]R` torsion, points of order 3/11/13/23, RFC 9380's pre-`clear_cofactor` `Q0/Q1`, and 60 live drand signatures); the one difference is deliberate: an OFF-curve point of order `r` — e.g. the image `(a²x, a³y)` of a member on an isomorphic curve — used to pass and is now refused. Every decoder already required `isOnCurve`, so only a caller that builds a raw `Affine` sees it. `kzg`'s trusted-setup loader now uses `subgroupCheck` for `G1` (faster than its own variable-time `[r]P`, which stays as a test reference). `scalarMulBytes`/`scalarMul` (the secret-scalar engine) are untouched; `g1.zig`/`g2.zig` digests changed, so the ctgrind rows `g1_scalarmul`/`g2_scalarmul` need a re-pin.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **field 1 / g1_scalarmul 5 / g2_scalarmul 8**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⛔⛔ `SPEC.md:387` and `bls_sig.zig:48` both claim "no secret-dependent branches"; the measurement disagrees. The heaviest item is `Fp.ctSelect` (`fp.zig:597`), which this module's own prose calls "a byte-mask merge … branch-free and index-free" — **two independent agents disassembled it inside `g1.Jacobian.scalarMulBytes` and found `bt %esi,%edx; jae`**, a real conditional jump on a bit of the secret scalar. ⭐ The repair pattern is already in this tree: `p256/src/group.zig:502-508` names this exact LLVM lowering ("a plain `cMov` here was observed to lower to a secret-dependent branch", the montint `b199192` class) and launders its mask through `blackBox`. Also measured: every `scalarMul` converts the secret scalar to bytes through `std.crypto.ff`, whose `Uint.toBytes` branches at `ff.zig:150`, and `Fp2.isZero` is `c0.isZero() and c1.isZero()` — Zig's `and` SHORT-CIRCUITS, so it is a real branch sitting upstream of `g2.zig`'s otherwise branchless point addition. Scope: every consumer (`ibe`, `bbs`, `coconut`, `groth16`, `tlock`).
 
 - **2026-09-09** — `NOTICE` becomes a third-party attribution instead of a provenance note,
   for the 807 177-byte `data/trusted_setup.txt` and the KZG vectors reproduced from
