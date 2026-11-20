@@ -1307,6 +1307,13 @@ fn refuseTooLong(m: []u8, c_len: usize) bool {
 /// Test-only access to internals (empty outside tests).
 pub const test_hooks = if (builtin.is_test) struct {
     pub const refuse = refuseTooLong;
+    /// The x/crypto engine's routing predicate, for tests with fabricated
+    /// slices (it only compares addresses and lengths).
+    pub const takes = xcryptoTakes;
+    /// Calls that reached the engine (`xcryptoSeal` / `xcryptoOpen`): the
+    /// engine's tests compare it with the Zig wide path, which is vacuous
+    /// when routing never selects the engine.
+    pub var xcrypto_calls: usize = 0;
 } else struct {};
 
 // ── the x/crypto amd64 engine ────────────────────────────────────────────────
@@ -1401,6 +1408,7 @@ fn xcryptoState(k: *const [32]u8, npub: [12]u8) [16]u32 {
 }
 
 noinline fn xcryptoSeal(c: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, npub: [12]u8, k: *const [32]u8) void {
+    if (builtin.is_test) test_hooks.xcrypto_calls += 1;
     var st = xcryptoState(k, npub);
     defer std.crypto.secureZero(u32, &st);
     var args: XcArgs = .{
@@ -1421,6 +1429,7 @@ noinline fn xcryptoSeal(c: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, np
 
 /// Writes the plaintext before the tag is known (as x/crypto); a mismatch zeroes `m`.
 noinline fn xcryptoOpen(m: []u8, c: []const u8, tag: [16]u8, ad: []const u8, npub: [12]u8, k: *const [32]u8) error{AuthenticationFailed}!void {
+    if (builtin.is_test) test_hooks.xcrypto_calls += 1;
     var st = xcryptoState(k, npub);
     defer std.crypto.secureZero(u32, &st);
     var t = tag;
@@ -2622,7 +2631,7 @@ const aead_pairs = .{
     .{ XChaCha8Poly1305, std.crypto.aead.chacha_poly.XChaCha8Poly1305 },
 };
 
-const variant_lens = [_]usize{ 0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 255, 256, 511, 512, 513, 575, 576, 1000, 1420, 4103 };
+const variant_lens = [_]usize{ 0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 255, 256, 447, 448, 449, 511, 512, 513, 575, 576, 1000, 1420, 4103 };
 
 test "every stream variant: xor and stream byte-exact vs std, both engines, edge lengths and counters" {
     var rng = std.Random.DefaultPrng.init(0x5eed_c4a7);

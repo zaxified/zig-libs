@@ -93,6 +93,87 @@ test "xcrypto: seal and open agree with the Zig wide path, every length 0..1100 
     }
 }
 
+test "xcrypto: routing takes exactly the calls the engine can run (aliasing, length bound, counter wrap)" {
+    const takes = cp.test_hooks.takes;
+    var buf: [8300]u8 = undefined;
+    // In place, and apart on either side (adjacent counts as apart).
+    try testing.expect(takes(buf[0..300], buf[0..300], buf[1000..1013]));
+    try testing.expect(takes(buf[0..300], buf[300..600], buf[1000..1013]));
+    try testing.expect(takes(buf[300..600], buf[0..300], buf[1000..1013]));
+    // One byte of overlap, either way round, and a heavier one: the Zig path.
+    try testing.expect(!takes(buf[0..300], buf[299..599], buf[1000..1013]));
+    try testing.expect(!takes(buf[299..599], buf[0..300], buf[1000..1013]));
+    try testing.expect(!takes(buf[0..300], buf[5..305], buf[1000..1013]));
+    try testing.expect(!takes(buf[5..305], buf[0..300], buf[1000..1013]));
+    // The output must be apart from the AD; the AD may overlap the input.
+    try testing.expect(!takes(buf[0..300], buf[0..300], buf[100..113]));
+    try testing.expect(!takes(buf[0..300], buf[0..300], buf[299..312]));
+    try testing.expect(takes(buf[0..300], buf[0..300], buf[300..313]));
+    try testing.expect(takes(buf[0..300], buf[0..300], buf[100..100]));
+    try testing.expect(takes(buf[1000..1300], buf[0..300], buf[10..23]));
+    // The length bound is inclusive.
+    try testing.expect(takes(buf[0..cp.xcrypto_max], buf[0..cp.xcrypto_max], buf[5000..5013]));
+    try testing.expect(!takes(buf[0 .. cp.xcrypto_max + 1], buf[0 .. cp.xcrypto_max + 1], buf[5000..5013]));
+    // Past the 32-bit block counter (from counter 1) the engine is never taken, even
+    // with the length bound lifted; the slices are fabricated, `takes` only compares
+    // addresses and lengths.
+    cp.force_xcrypto_all = true;
+    defer cp.force_xcrypto_all = false;
+    const last: usize = 64 * ((1 << 32) - 1);
+    const base: usize = 4096;
+    const no_ad = buf[0..0];
+    const o_ok = @as([*]u8, @ptrFromInt(base))[0..last];
+    const i_ok = @as([*]const u8, @ptrFromInt(base))[0..last];
+    try testing.expect(takes(o_ok, i_ok, no_ad));
+    const o_wrap = @as([*]u8, @ptrFromInt(base))[0 .. last + 1];
+    const i_wrap = @as([*]const u8, @ptrFromInt(base))[0 .. last + 1];
+    try testing.expect(!takes(o_wrap, i_wrap, no_ad));
+}
+
+test "xcrypto: a seal or open the routing accepts reaches the engine, any other does not" {
+    if (!cp.xcrypto_engine) return error.SkipZigTest;
+    const hooks = cp.test_hooks;
+    var m: [cp.xcrypto_max + 1]u8 = undefined;
+    fill(&m, 21);
+    var c: [cp.xcrypto_max + 1]u8 = undefined;
+    var k: [32]u8 = undefined;
+    fill(&k, 22);
+    const npub: [12]u8 = @splat(6);
+    var ad: [13]u8 = undefined;
+    fill(&ad, 23);
+    var tag: [16]u8 = undefined;
+
+    var calls = hooks.xcrypto_calls;
+    // Wide path, in range: both directions reach the engine, apart and in place.
+    A.encrypt(c[0..300], &tag, m[0..300], &ad, npub, k);
+    try testing.expectEqual(calls + 1, hooks.xcrypto_calls);
+    calls = hooks.xcrypto_calls;
+    var back: [300]u8 = undefined;
+    try A.decrypt(&back, c[0..300], tag, &ad, npub, k);
+    try testing.expectEqual(calls + 1, hooks.xcrypto_calls);
+    try testing.expectEqualSlices(u8, m[0..300], &back);
+    calls = hooks.xcrypto_calls;
+    @memcpy(back[0..300], m[0..300]);
+    A.encrypt(&back, &tag, &back, &ad, npub, k);
+    try testing.expectEqual(calls + 1, hooks.xcrypto_calls);
+    // The last length the engine takes, and the first it does not.
+    calls = hooks.xcrypto_calls;
+    A.encrypt(c[0..cp.xcrypto_max], &tag, m[0..cp.xcrypto_max], &ad, npub, k);
+    try testing.expectEqual(calls + 1, hooks.xcrypto_calls);
+    calls = hooks.xcrypto_calls;
+    A.encrypt(&c, &tag, &m, &ad, npub, k);
+    try testing.expectEqual(calls, hooks.xcrypto_calls);
+    try A.decrypt(&m, &c, tag, &ad, npub, k);
+    try testing.expectEqual(calls, hooks.xcrypto_calls);
+    // Short engine (<= 192 B of message plus AD) and the switched-off engine.
+    A.encrypt(c[0..100], &tag, m[0..100], &ad, npub, k);
+    try testing.expectEqual(calls, hooks.xcrypto_calls);
+    cp.force_no_xcrypto = true;
+    defer cp.force_no_xcrypto = false;
+    A.encrypt(c[0..300], &tag, m[0..300], &ad, npub, k);
+    try testing.expectEqual(calls, hooks.xcrypto_calls);
+}
+
 /// Two pages, the second PROT_NONE: `buf[4096 - n ..][0..n]` ends at the guard.
 const Guarded = struct {
     pages: []align(4096) u8,
