@@ -25,7 +25,7 @@
 //! the `generic` backend runs std's own AES and GHASH primitives (hardware on
 //! arm64 when the target has `aes`), still with the per-key state cached.
 //!
-//! AES-192 (`Aes192Gcm`, since 2026-10-10): std 0.16 has no AES-192, so the
+//! AES-192 (`Aes192Gcm`,): std 0.16 has no AES-192, so the
 //! generic backend and the stateless generic path take the block cipher from
 //! the sibling `aes192` module (std's round primitive under its own key
 //! expansion); the x86-64 kernel runs it with Nr = 12 and its own
@@ -160,7 +160,7 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
         /// to the protocol entry point that owns the key and the message
         /// (dtls/quic-crypto `protect`, oscore, hpke, aeadframe), which runs
         /// this call inside its own burn. Burning here too would pay twice per
-        /// record (decision 2026-10-09).
+        /// record (decision).
         pub const Context = struct {
             impl: union(Backend) {
                 generic: Generic,
@@ -1254,7 +1254,7 @@ test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are ref
         }
     }
     // Pinned so a regenerated table that silently lost a class shows here.
-    // 79 + 54 for 128/256; 37 + 27 for 192 (added 2026-10-10).
+    // 79 + 54 for 128/256; 37 + 27 for 192.
     try testing.expectEqual(@as(usize, 116), counts[1]);
     try testing.expectEqual(@as(usize, 81), counts[0]);
 }

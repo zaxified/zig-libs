@@ -47,7 +47,7 @@ test "STACKPROBE: no AES-GCM key or round-key residue after any entry point" {
     _ = try P.run("Aes128Gcm.decryptInto", root.Aes128Gcm.decryptInto, .{ &pt, &ct, tag, ad, nonce, k128 }, &.{k128}, .{});
     try std.testing.expectEqualSlices(u8, &msg, &pt);
 
-    // AES-192 (2026-10-10): both backends' key schedules and the stateless pair.
+    // AES-192: both backends' key schedules and the stateless pair.
     const k192: *const [24]u8 = key[0..24];
     _ = try P.run("Aes192Gcm.initWithInto generic", root.Aes192Gcm.initWithInto, .{ &ctx192, .generic, k192 }, &.{ k192, std.mem.asBytes(&ctx192) }, .{});
     if (root.available(.aesni))

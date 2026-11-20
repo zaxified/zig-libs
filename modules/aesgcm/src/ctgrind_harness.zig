@@ -31,7 +31,7 @@
 //!                 GHASH with the schedule cached). Its pattern names std's
 //!                 files too: std's property IS this backend's property.
 //!
-//! Each target runs AES-128, AES-192 (since 2026-10-10; generic = the `aes192`
+//! Each target runs AES-128, AES-192 (generic = the `aes192`
 //! module's block cipher) and AES-256 over lengths that reach every path:
 //! the short single-group path (0, 13, 64, 96), the tail after AD hashed
 //! separately (112 with 20-byte AD), one batch plus the delayed GHASH (200),
