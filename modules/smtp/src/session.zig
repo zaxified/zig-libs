@@ -1935,7 +1935,7 @@ test "too many recipients is bounded" {
     }));
 }
 
-// ── OAuth bearer mechanisms and DSN parameters (2026-11-16) ────────────────
+// ── OAuth bearer mechanisms and DSN parameters ────────────────
 
 test "XOAUTH2 login with a token past the 512-octet default line" {
     const gpa = testing.allocator;

@@ -826,7 +826,7 @@ test "live interop: a full session against a real SMTP server" {
     }
 }
 
-// ── deterministic fuzz driver (SMTP_FUZZ, added 2026-10-10) ─────────────────
+// ── deterministic fuzz driver (SMTP_FUZZ) ─────────────────
 //
 // A whole SMTP conversation against a scripted server, ONE reply of which is
 // damaged, dropped, re-coded, replaced by garbage or doubled, with the bytes

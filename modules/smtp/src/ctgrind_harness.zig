@@ -10,12 +10,10 @@
 //! ## What this measures
 //!
 //!  * `auth` — the password tainted through `auth.plainResponse` (RFC 4616
-//!    `authzid NUL authcid NUL passwd`, base64) and `auth.loginResponse`
-//!    (AUTH LOGIN's base64 of the password), at password lengths that hit
-//!    each base64 tail (0, 1 and 2 leftover bytes). Usernames and lengths are
-//!    public. Until 2026-10-10 the credential went through std's base64
-//!    encoder (an alphabet table indexed by the secret) and a per-byte
-//!    branching NUL/CR/LF check; `b64ct.zig` and a masked check replaced both.
+//!    `authzid NUL authcid NUL passwd`, base64) and `auth.loginResponse` (AUTH
+//!    LOGIN's base64 of the password), at password lengths that hit each
+//!    base64 tail (0, 1 and 2 leftover bytes). Usernames and lengths are
+//!    public.
 //!
 //! SMTP has no other secret: TLS is the `tlsclient` module's.
 //!

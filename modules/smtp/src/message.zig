@@ -1205,12 +1205,12 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
         while (it.next()) |k| gpa.free(k.*);
     }
     try testing.expectEqual(render_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 10 seeds non-empty before the draw was fixed
+    // Measured: 0 of 10 seeds non-empty before the draw was fixed
     // and `render` only ever saw an empty subject and an empty body; 10 of 10
     // after.
     try testing.expectEqual(@as(usize, 8), rendered);
     try testing.expectEqual(@as(usize, 9), subject_nonempty);
-    // Measured 2026-09-08. With the old all-zero 16-octet tail these were 1 and
+    // Measured. With the old all-zero 16-octet tail these were 1 and
     // 0: one boundary string for the whole corpus and not a single pre-epoch
     // date. ⛔ Not `> 1` — the count is what notices a seed losing its tail.
     try testing.expectEqual(@as(usize, 8), boundaries.count());
@@ -1221,7 +1221,7 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

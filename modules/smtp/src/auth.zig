@@ -61,7 +61,7 @@ pub const AuthError = error{
 const b64 = std.base64.standard;
 // Not std's encoder for the credential: it indexes its alphabet by the secret
 // (with the old per-byte `checkCredential`: 312 memcheck contexts, ctgrind
-// `smtp/auth`, 2026-10-10; 6 after, the single validity verdict per call).
+// `smtp/auth`; 6 after, the single validity verdict per call).
 const b64ct = @import("b64ct").standard;
 
 /// The two challenges LOGIN uses, base64 as they appear on the wire.
@@ -69,7 +69,7 @@ pub const login_username_challenge = "VXNlcm5hbWU6"; // "Username:"
 pub const login_password_challenge = "UGFzc3dvcmQ6"; // "Password:"
 
 /// A credential must not hold NUL, CR or LF. Scanned without a branch per
-/// byte (the password is secret; ctgrind `smtp/auth`, 2026-10-10): each
+/// byte (the password is secret; ctgrind `smtp/auth`): each
 /// byte's match is a borrow-derived bit, ORed together and branched on once.
 fn checkCredential(s: []const u8) AuthError!void {
     var bad: u8 = 0;
@@ -776,7 +776,7 @@ test "corpus: every auth seed reaches all four entry points, and the counts are 
         if (classifyLoginChallenge(s) != .unknown) classified += 1;
     }
     try testing.expectEqual(auth_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 15 seeds non-empty before the draw was fixed,
+    // Measured: 0 of 15 seeds non-empty before the draw was fixed,
     // 15 of 15 after.
     try testing.expectEqual(@as(usize, 12), credential_ok);
     try testing.expectEqual(@as(usize, 9), challenge_ok);
@@ -789,7 +789,7 @@ test "corpus: every auth seed reaches all four entry points, and the counts are 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

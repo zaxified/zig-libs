@@ -1044,7 +1044,7 @@ test "corpus: every header seed reaches the renderers, and the counts are pinned
         } else |_| {}
     }
     try testing.expectEqual(header_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 17 seeds non-empty before the draw was fixed
+    // Measured: 0 of 17 seeds non-empty before the draw was fixed
     // and every renderer saw the empty value; 17 of 17 after.
     try testing.expectEqual(@as(usize, 14), rendered);
     try testing.expectEqual(@as(usize, 7), encoded_words);
@@ -1054,7 +1054,7 @@ test "corpus: every header seed reaches the renderers, and the counts are pinned
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

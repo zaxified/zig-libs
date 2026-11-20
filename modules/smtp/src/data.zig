@@ -675,7 +675,7 @@ test "corpus: every dot seed reaches the stuffer, and the counts are pinned" {
         } else |_| {}
     }
     try testing.expectEqual(dot_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 16 seeds non-empty before the draw was fixed
+    // Measured: 0 of 16 seeds non-empty before the draw was fixed
     // and the stuffer only ever saw the empty body; 16 of 16 after.
     try testing.expectEqual(@as(usize, 14), stuff_ok);
     try testing.expectEqual(@as(usize, 3), unstuff_terminated);
@@ -705,7 +705,7 @@ fn canonicalise(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

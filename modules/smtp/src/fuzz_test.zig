@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for smtp's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for smtp's deterministic fuzz driver.
 //!
 //! The harness body lives in `client.zig` beside the `FakeServer` it scripts;
 //! it is generic over its source of choices, `fn(comptime S, *S, gpa)`.
