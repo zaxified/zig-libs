@@ -4423,6 +4423,9 @@ test "§6.3/§9: application messages through the group's secret tree — out of
     }
     defer b.deinit();
     defer c_grp.deinit();
+    // Three members, four leaves: a group's tree (and so its secret tree)
+    // always spans a power of two (§7.8's doubling, §12.4.3.3's padding).
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
 
     var sent: [3][]u8 = undefined;
     for (&sent, 0..) |*m, i| {

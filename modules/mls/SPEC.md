@@ -1512,12 +1512,15 @@ Gaps that are unverified rather than unbuilt:
   `applyProposals` before the leaf is assigned, so the joiner can land in the
   leaf its own old appearance just vacated, but the receiver-is-removed case is
   not tested.
-- The secret tree's non-power-of-two shape. `secrettree.nodeSecret` walks
-  `treemath`'s truncated tree, which is what §9 requires ("the same structure as
-  the group's ratchet tree"), but `secret-tree.json` publishes only 1-, 8- and
-  32-leaf trees. The truncated-tree path is reasoned-correct (it reuses the
-  vector-pinned `treemath`), and any group of, say, 5 members exercises it
-  without an external anchor.
+- The secret tree over a non-power-of-two leaf count. `secret-tree.json`
+  publishes only 1-, 8- and 32-leaf trees, and no group reaches any other
+  shape: a ratchet tree's width is always `2^(d+1) - 1` (`tree.paddedWidth` on
+  decode, `RatchetTree.addLeaf` doubling, §7.7's truncation halving), so §9's
+  secret tree "with the same structure" is always full — a three-member group
+  spans four leaves (asserted in `group.zig`'s application-message test).
+  Only a direct caller of `secrettree.nodeSecret`/`EpochTree` with such a
+  count reaches that path; `EpochTree` is checked against `nodeSecret` for 3,
+  5 and 7 leaves, with no external anchor.
 - §12.4's `pathRequiredTypes` and §12.4.2's own bullet disagree and the module
   follows §12.4 (the section that defines §17.4's "Path Required" column).
   Following the broader rule can only reject Commits a §12.4.2-literal
@@ -1565,6 +1568,3 @@ Gaps that are unverified rather than unbuilt:
 - **Standalone `Add`/`Update`/`Remove`/`PreSharedKey`/`ExternalInit`/
   `GroupContextExtensions` types in `content.zig`** (each is a `Proposal` union
   arm today): split them out when an extension proposal type needs a real struct.
-- **The secret tree's non-power-of-two shape has no upstream vector** (see
-  *Open*); a vector, or a differential oracle over a 5-member group, would anchor
-  it.
