@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [kolapapa/surge-ping](https://github.com/kolapapa/surge-ping) | Rust | MIT | 99 | not fetched | Async ICMP ping crate, one client shared across targets *(inferred; README not read)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no ICMP (this module's README). A GitHub search (`icmp ping`, language Zig, by stars) turned up no ICMP prober library. |
 
-**Where we are ahead:** the only Zig ICMP library found, and against the Go/Rust crates the only one built as a scheduler for many targets (global pacing, in-flight cap, per-subnet spacing, batched syscalls, kernel receive timestamps), with a pure codec anchored on real kernel captures, source-address checking and both address families. **Where we are behind:** no Windows/macOS/BSD (a deliberate ceiling, SPEC "Backlog"), and (until 2026-11-16) no standard deviation in `Stats` (pro-bing has it; fping's own summary does not). Neither was a gap against the reference's Linux behavior.
+**Where we are ahead:** the only Zig ICMP library found, and against the Go/Rust crates the only one built as a scheduler for many targets (global pacing, in-flight cap, per-subnet spacing, batched syscalls, kernel receive timestamps), with a pure codec anchored on real kernel captures, source-address checking and both address families. **Where we are behind:** no Windows/macOS/BSD (a deliberate ceiling, see *What is deliberately not done*). That is not a gap against the reference's Linux behavior.
 
 ## Design & invariants
 Layered, codec is pure: `echo` — build/parse + internet checksum, bounds-checked, never panics on
@@ -49,10 +49,36 @@ portable fallback. Modes mirror fping: `.alive` (stop at first reply, retry time
 vs select, plus an in-flight cap, per-subnet spacing and first-probe jitter). Wire formats per
 RFC 792/4443/1071. See this module's own `NOTICE` — a provenance record, not a license obligation.
 
-**A pending ICMP error is not the next send's (2026-10-31).** With IP_RECVERR (A1 F5) the kernel
+**A pending ICMP error is not the next send's.** With IP_RECVERR the kernel
 stores every ICMP error about any probe in sk_err as well, and the next send — to any target —
-fails with it once. `Socket.sendTo` retries once on the errnos `icmp_err_convert` produces; see
-CHANGELOG 2026-10-31.
+fails with it once. `Socket.sendTo` retries once on the errnos `icmp_err_convert` produces.
+
+**Features and decisions.**
+- `Config.io` runs the `Pinger` over `std.Io` instead of raw syscalls: ping sockets from `std.Io.net`
+  (`IoSocket`), clocks and waits from the `Io`, so a deterministic or evented `Io` can drive it. That path
+  has no RAW sockets, kernel receive timestamps, TTL/TOS, error queue or interface binding: `ttl`, `tos`,
+  `dont_fragment`, `fwmark`, `iface`, `oiface` and `socket_mode = .raw` give `error.NeedsRawSockets`
+  (`pinger.zig` `ensureIoSockets`); `recv_buf_size` is ignored.
+- `Stats.stddevNs()` is the population standard deviation of the received RTTs (pro-bing's `StdDevRtt`
+  definition, Welford online, no stored samples; `null` before the first reply, 0 after one);
+  `Stats.jitterNs()` is the mean absolute difference of consecutive RTTs (not the RFC 3550 smoothed
+  estimator; `null` until two replies). One function (`Stats.noteReply`) updates them for the reply path.
+- `Socket.ErrInfo` carries `offender` (`SO_EE_OFFENDER`, the router that sent the error), `origin`
+  (`ee_origin`; `origin_icmp` / `origin_icmp6`) and `ee_info` (`sock_extended_err.ee_info`: the next-hop MTU of
+  a Frag-Needed / Packet Too Big, also a local `EMSGSIZE`'s path MTU; other errors leave whatever the kernel
+  put there, so read it for those types only; reference: Linux `errqueue.h`, `ip(7)`).
+- Sequence slots: `takeSlot` recycles an answered slot when the id counter reaches it and skips only slots of
+  probes in flight, so with `max_inflight < 65536` it never fails (`SequenceSpaceExhausted` needs every id
+  held by an unanswered probe). A recycled slot's duplicate-detection window ends early.
+- `parseV4` does not check the protocol of the IP header an ICMP error quotes (the v6 parser checks that the
+  next header is 58), so an error quoting a UDP datagram whose first payload byte is 8 is read as quoting an
+  echo request and `quoted_proto` reports 17. fping's `handle_random_icmp` and iputils `ping4_parse_reply`
+  (quoted type, destination and id only) do not check it either, and Go `x/net/icmp` returns the quoted
+  datagram raw; the engine's ident / slot / destination checks follow.
+- Bounds in the socket layer: `Socket.parseControl` ends its walk when a control message's length lies or its
+  aligned step passes the end (as glibc `__cmsg_nxthdr` does; `parseErrControl` likewise); `waitReadable`'s
+  wait goes through `nsToTimespec`, which saturates the seconds to the `sec` type's maximum; `icmp_errors` and
+  the other `Stats` counters saturate.
 
 ## Threat model / out of scope
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not
@@ -77,6 +103,11 @@ list that silently includes loopback/`0.0.0.0`/link-local addresses a caller did
 handing it to `addTarget`. Out of scope: non-Linux platforms, capture/BPF, and any anti-spoofing
 token.
 
+**Known limits.** `Pinger.stats(id)` / `targetAddr(id)` with an id `addTarget*` never returned is a documented
+checked panic (`icmp: target id out of range`). `timeout_q` keeps the events of answered probes until their
+time, so with a huge `timeout_ns` in `.loop` mode the queue grows with the probes sent (events of recycled
+slots stay behind an unanswered head until it expires).
+
 ## Verification
 Offline: RFC 1071 checksum goldens (vector + wire-byte goldens v4/v6, comptime + property
 variants), build→parse round trips, error-quote parsing, fuzzed parsers (never panic on garbage),
@@ -91,60 +122,44 @@ hand-computed from RFC 792/4443. Integration: pings `127.0.0.1` / `::1` end-to-e
 asserts a correlated reply with plausible RTT, skipped via `error.SkipZigTest` when no ICMP socket
 can be opened. Run: `zig build test-icmp`.
 
-**Audit 2026-11-17 (whole-module mutation).** 590 schemata mutants (ReleaseSafe, one switch per mutant, run on the loopback
-network-namespace lane) over `checksum.zig` (13), `echo.zig` (106), `Socket.zig` (152), `IoSocket.zig` (10) and
-`pinger.zig` (309): every guard, boundary, field offset, arm of the type switches, option passed to `setsockopt`,
-cmsg walk, pacing/retry/duplicate/statistics step of the engine. Round 1 killed 320 and left 270, which showed the
-engine's tests only watched sends and timeouts, not what a reply is booked as: the ping socket's options and
-ancillary-data parsing were untested (`open` skipped on any refusal), and `Stats` totals, min/max, the per-probe
-callback, the retry timeline and the options handed to `Socket.open` were not asserted at all. Closed by 52 new tests:
-`audit_test.zig` (the engine on the UDP loopback rig of `sweep_test.zig`: the bytes on the wire and their checksum, a
-batch's distinct sequence numbers, replies/duplicates/RTT/min/max/jitter from the kernel timestamp, TTL/TOS, ICMP
-timestamp replies, RAW IP-header stripping, retry backoff timeline, count/loop modes, send failures, prepare's reset,
-jitter, pollFds, the error queue's ident/slot/family/source checks, v6 error destination, option plumbing read back
-with `getsockopt`, `Config.io` refusals and descriptor counts) and in-file tests for the private parts (`Socket`:
-option read-back, `buildPktinfo`, `parseControl`/`parseErrControl` byte layouts and bounds, a real loopback
-round trip through `recvMsg`/`recvBatch`/`sendMany`/pktinfo, the error queue; `pinger`: `Stats`, `Addr`, `eventOwns`,
-`handleTimeout`, `checkDone`, `sourceMatches`, `backoff`, `originateMsAt`, `ifNameToIndex`; `echo`/`checksum`/`IoSocket`
-boundary cases). The send-errno table became the pure function `Socket.sendResult` (same mapping) so each errno is
-tested without provoking it. Final: 536 killed (13 of them hangs), 54 equivalent or unobservable, none surviving.
-Equivalent (37): guards the next test subsumes (`parseV4` quote guards, `parseSrc` tiny `namelen`, a v6 `else` arm no
-input reaches), the family check before a `bind` the kernel refuses anyway, a pktinfo with ifindex 0, defensive
-clamps the kernel never needs, two clock readings equal to the nanosecond (three `>`/`>=` pairs), cost-only choices
-(busy loop vs wait, `sendmmsg` vs `sendto`, subnet-waiter compaction thresholds, one extra error-queue entry), state
-that another line sets to the same value, and `ifNameToIndex` on an empty or 16-byte name (the kernel NUL-terminates).
-Unobservable (17): needs `CAP_NET_RAW` / `CAP_NET_ADMIN` (RAW mode, the RAW ident, forging the pending ICMP error,
-`SO_MARK`: a privileged `unshare -rn` run kills them through the tests that skip unprivileged, or the new
-read-back when the mark is settable), more than 1024 replies queued (the drain budget; the flood test is
-privileged-only and timing dependent), a refused `getrandom`, `MSG_NOSIGNAL` on a datagram socket, two simultaneous
-`Io` completions, an error path `commitProbe` cannot take, a 65 KiB ICMP message, a receive timestamp later than the
-read clock. Decision 2026-11-18, no behaviour change: `parseV4` does not check the quoted IP protocol (the v6 parser checks the next
-header is 58), so an ICMP error quoting a UDP datagram whose first payload byte is 8 is read as quoting an echo request and
-`quoted_proto` reports 17. fping's `handle_random_icmp` and iputils `ping4_parse_reply` (`ping/ping.c`: quoted type, destination
-and id only) do not check it, and Go `x/net/icmp` hands the quoted datagram back raw; the engine's ident/slot/destination checks
-follow. The `quoted_proto` comment now says so (it claimed "always 1"), and a test pins the reported value.
+- **Run:** `scripts/modtest icmp` (`zig build test-icmp`). Tests that need CAP_NET_RAW or a settable `SO_MARK`
+  skip unprivileged; a user-namespace run (`unshare -rn`, with `ping_group_range` set for the DGRAM side)
+  exercises them.
+- **Engine tests** (`src/audit_test.zig`, on the UDP loopback rig of `src/sweep_test.zig`): the bytes on the wire
+  and their checksum, a batch's distinct sequence numbers, replies / duplicates / RTT / min / max / jitter from
+  the kernel timestamp, TTL/TOS, ICMP timestamp replies, RAW IP-header stripping, the retry backoff timeline,
+  count and loop modes, send failures, prepare's reset, first-probe jitter, `pollFds`, the error queue's
+  ident / slot / family / source checks, option plumbing read back with `getsockopt`, `Config.io` refusals; in-file
+  tests for the private parts (`Socket`: option read-back, `buildPktinfo`, `parseControl` / `parseErrControl` byte
+  layouts and bounds including lying lengths, a real loopback round trip through `recvMsg` / `recvBatch` /
+  `sendMany`; `pinger`: `Stats`, `Addr`, `eventOwns`, `handleTimeout`, `checkDone`, `sourceMatches`, `backoff`,
+  `ifNameToIndex`, `nsToTimespec` on an i32-`sec` stand-in, sequence-slot recycling over 70 000 sends). The send-errno
+  table is the pure function `Socket.sendResult`, so each errno is tested without provoking it.
+- **Fuzz:** `ICMP_FUZZ=<runs>` (testkit's deterministic driver, test `fuzz driver: ICMP_FUZZ` in `src/echo.zig`),
+  harnesses over the parsers; a seed loop with reach checks runs in every test run.
+- **ctgrind:** not applicable (no secret).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The whole-module run covered `checksum.zig`, `echo.zig`, `Socket.zig`,
+  `IoSocket.zig` and `pinger.zig`: every guard, boundary, field offset, type-switch arm, `setsockopt` option,
+  cmsg walk and pacing / retry / duplicate / statistics step. The equivalent ones are guards a neighbouring test
+  subsumes, defensive clamps, cost-only choices and state set to the same value elsewhere; the unobservable ones
+  need CAP_NET_RAW / CAP_NET_ADMIN (RAW mode and its ident, forging a pending ICMP error, `SO_MARK`), more than
+  1024 queued replies, a refused `getrandom` and similar.
 
-**Delta mutation 2026-11-19 (wave-9 fixes: `ee_info`, checked cmsg walk, `nsToTimespec`).** 10 schemata mutants (ReleaseSafe, one switch per mutant): 8 killed, 2 equivalent. Killed: dropped `ee_info` assignment, `>` to `>=` and `<` to `<=` on the cmsg length guards, the dropped room check (panics on the lying-length test), the unclamped negative wait, the saturation arm (0 and max-1), and the nanosecond part. Equivalent: the walk's `step > control.len - off` check (dropped, or `>=`) is belt and braces, because the loop guard `off + hdr_len <= control.len` already ends the walk once `off` reaches the end and the length check bounds `step` far below overflow.
+## What is deliberately not done
+
+- **Non-Linux platforms (Windows, macOS, BSD)** — raw errno-encoded `std.os.linux` syscalls, no libc, no portable
+  fallback: a deliberate scope ceiling shared with rawsock / netlink / wireguard / l2disco / procnet, not a gap
+  against the reference's Linux behaviour.
+- **Eager purge of an answered probe's slot on reply** — considered and not done: the answered slot is the
+  duplicate-reply window (`Stats.duplicates`), and fping likewise keeps its seqmap entries after the reply
+  (`--seqmap-timeout`) while iputils `ping` detects duplicates through a per-sequence bitmap reused as the 16-bit
+  counter wraps. Releasing on reply would drop duplicate counting, which both references keep.
+- **Authenticating replies, validating target addresses, anti-spoofing tokens** — see *Threat model*.
 
 ## Backlog / deferred
-None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
-netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
-- ✅ DONE 2026-11-19 (`ErrInfo.ee_info: u32 = 0`, additive) **`ErrInfo` lacks `ee_info`** (requested by pathmtu, 2026-11-03): the next-hop MTU of a Frag-Needed / Packet Too Big, which `IP_RECVERR` delivers in `sock_extended_err.ee_info`. Without it pathmtu's ping-socket lane bisects, about 11 probes per narrowing, where the hint would give one. Reference: Linux `errqueue.h` / `ip(7)` (`ee_info` holds the MTU for those errors; iputils `ping` reads it the same way for its `Frag needed and DF set (mtu = N)` line). Test: synthetic control messages, v4 and v6.
-- ✅ DONE 2026-11-16 (`Stats.stddevNs()` population std dev via Welford, `Stats.jitterNs()` mean absolute consecutive difference, additive fields) **Standard deviation / jitter in `Stats`** (survey 2026-09-30): pro-bing reports `StdDevRtt`; `Stats` keeps min/max/total/last only, so a caller feeding results through the callback must accumulate its own sum of squares (rg `min_ns|total_ns` in `src/pinger.zig`). Effort: small. Fits CONVENTIONS §2.
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons:
-- `Pinger.stats(id)` / `targetAddr(id)` with an id `addTarget*` never returned: now a documented checked panic; the message path cannot be asserted in-process.
-- ✅ DONE 2026-11-19 `drainErrQueue`'s `icmp_errors +|= 1` (same saturation as IC-5): tested on a real `MSG_ERRQUEUE` entry (a forged Time Exceeded about a DGRAM probe, preset counter at `maxInt(u32)`). The injector is a RAW socket, so the test needs CAP_NET_RAW (e.g. `unshare -rn` with `ping_group_range` set for the DGRAM side) and skips otherwise, like the existing error-queue test; an unprivileged process cannot make the kernel queue an ICMP error without a router or a raw injector.
-- ✅ DONE 2026-11-19 `waitReadable` converted up to 292 years of wait into `timespec.sec` with `@intCast` (trips on a 32-bit target, i32 sec): now `nsToTimespec`, which saturates the seconds to the `sec` type's maximum; tested on an i32-`sec` stand-in at the boundary.
-- ✅ DONE 2026-11-19 `Socket.parseControl`: `off + cmsg.len` could overflow for a lying `cmsg_len` (kernel-generated data, not network-reachable). Now `cmsg.len > control.len - off` (as `parseErrControl` already did) and a step past the end ends the walk, like glibc `__cmsg_nxthdr` / the kernel's `CMSG_NXTHDR`; the timestamp read no longer casts the data pointer. Tests: lying lengths behind a valid cmsg.
-- ✅ Sequence-slot exhaustion by a fast, honest responder is closed (sweep REV-seqmap-1, 2026-10-31; re-checked 2026-11-18 for the security triage): `takeSlot` recycles an answered slot when the id counter reaches it and skips only slots of probes in flight, so with `max_inflight < 65536` it never fails (`SequenceSpaceExhausted` needs every id held by an unanswered probe). Tests: 70 000 sends behind an unanswered head, and 70 000 sends all answered. **Eager purge on reply was considered and not done:** the answered slot is the duplicate-reply window (`Stats.duplicates`), and fping likewise keeps its seqmap entries after the reply (`--seqmap-timeout`) while iputils `ping` detects duplicates through a per-sequence bitmap that is reused as the 16-bit counter wraps — releasing on reply would drop duplicate counting, which both references keep. Remaining cost: `timeout_q` keeps the (stale) events of recycled slots behind an unanswered head until it expires, so with a huge `timeout_ns` in `.loop` mode the queue grows with the probes sent.
-- `timeout_q` keeps answered events until their time: with a huge `timeout_ns` in `.loop` mode it grows with the probes sent.
-
-## Status
-`extract · linux · client · single_owner` · deps: `seqmap`, `netaddr` — canonical source is `pub
-const meta` in src/root.zig.
+None open.
 
 ## Anchoring
 
@@ -168,5 +183,3 @@ comes from tcpdump's output (test `tcpdump-decoded ICMP errors`; it fails with
 redirect mapped to `.other` or packet-too-big to `.dest_unreachable`, checked
 2026-10-04). Live kernel ping test. The remaining hand-built packets in
 `echo.zig` are rejection and boundary cases asserted from the RFC text.
-
-**How it got there.** The anchoring work landed. DONE a326e4a: 8 real fixtures via unprivileged netns capture; unreachable types named

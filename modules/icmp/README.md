@@ -11,10 +11,11 @@ workloads (thousands of host checks per cycle).
   first-probe jitter, sendmmsg/recvmmsg).
 - **Why:** no small pure-Zig ICMP library exists; std has no ICMP support.
 - **Platform:** linux (raw errno-encoded `std.os.linux` syscalls, no libc —
-  conscious ceiling, see SPEC "Backlog / deferred"). **Role:** client. **Concurrency:**
+  conscious ceiling, see SPEC *What is deliberately not done*). **Role:** client. **Concurrency:**
   single_owner (one thread/loop owns a `Pinger`; `stop()` is
   async-signal-safe).
-- **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format).
+- **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format), `clock` (monotonic and
+  real-time reads).
 
 Provenance: clean-room; wire formats per RFC 792 (ICMP), RFC 4443 (ICMPv6),
 RFC 1071 (internet checksum), with `ip(7)`/`ipv6(7)` for the socket options.
@@ -75,6 +76,9 @@ defer sock.close();
   answered slot's timeout event is still queued; ICMP errors (unreachable,
   time exceeded) are counted but the probe still resolves via timeout — all
   matching fping's observable behavior.
+- `Config.io` runs the engine over `std.Io` (a deterministic or evented `Io` can drive it); that path has no
+  RAW sockets, kernel timestamps, TTL/TOS, error queue or interface binding (those options give
+  `error.NeedsRawSockets`).
 - The IPv6 echo checksum is left zero — the kernel fills it (it owns the
   pseudo-header) for both DGRAM and RAW ICMPv6 sockets.
 - Extras carried over: ICMP timestamp probes (RFC 792, v4-only), TTL/TOS
