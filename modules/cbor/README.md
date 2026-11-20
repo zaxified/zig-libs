@@ -157,7 +157,7 @@ trees, duplicate-key and indefinite-length verdicts).
 
 ## Not provided
 
-No bignum arithmetic or bignum-aware preferred serialization, no COSE beyond `COSE_Key` (EC2/OKP/AKP, public
+No bignum arithmetic (preferred serialization of tag-2/3 bignums is done), no COSE beyond `COSE_Key` (EC2/OKP/AKP, public
 material only) and `COSE_Sign1`, no diagnostic-notation parser, no callback decoder for input that never sits in
 memory whole, no recording of definite versus indefinite length in `Value`, no NaN payloads under `canonical`, and
 typed mapping stops at 64-bit integers and untagged unions. Reasons and plans: SPEC.md *What is deliberately not

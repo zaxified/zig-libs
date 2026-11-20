@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — Behaviour change: bignum-aware preferred serialization (RFC 8949 §3.4.3). `encode` with `canonical = true` writes a tag-2/3 byte string without leading zero bytes and, when at most 8 bytes remain, as the major type 0/1 integer (`c2 41 05` becomes `05`; `c3 41 00` becomes `20`). `decode` with `deterministic = true` (and `strict_options`) now answers `error.NotDeterministic` for a tag-2/3 bignum that fits 64 bits or has a leading zero byte, so it still accepts exactly the canonical output. Wider bignums are unchanged. Plain `encode` (no `canonical`) keeps the tag as given.
+
 
 
 - **2026-10-18** — Ported to Zig 0.17.0. `typed.zig` iterates struct fields through a small `fieldRecs` shim over the 0.17 struct-of-arrays `@typeInfo`; `@Int` replaces `std.meta.Int`; `info.attrs.@"const"`. `cbor_options` is still honoured when `pub` (it is only probed with `@hasDecl`, which is pub-only in 0.17).

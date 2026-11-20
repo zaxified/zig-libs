@@ -699,3 +699,61 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "canonical: bignum-aware preferred serialization (RFC 8949 section 3.4.3)" {
+    // Expected bytes by hand from the rule: no leading zero bytes, and a
+    // value that fits major type 0/1 is the integer (tag 3 holds n, value
+    // -1 - n, exactly like major type 1).
+    const a = testing.allocator;
+    const small5: Value = .{ .bytes = &[_]u8{0x05} };
+    const lead0: Value = .{ .bytes = &[_]u8{ 0x00, 0x00, 0x01, 0x00 } };
+    const empty: Value = .{ .bytes = &.{} };
+    const max64: Value = .{ .bytes = &[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } };
+    const pad_max64: Value = .{ .bytes = &[_]u8{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } };
+    const two64: Value = .{ .bytes = &[_]u8{ 0x01, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    const pad_two64: Value = .{ .bytes = &[_]u8{ 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    const cases = [_]struct { v: Value, tag: u64, want: []const u8 }{
+        .{ .v = small5, .tag = 2, .want = &unhex("05") },
+        .{ .v = small5, .tag = 3, .want = &unhex("25") }, // -1 - 5 = -6
+        .{ .v = lead0, .tag = 2, .want = &unhex("190100") },
+        .{ .v = empty, .tag = 2, .want = &unhex("00") },
+        .{ .v = empty, .tag = 3, .want = &unhex("20") },
+        .{ .v = max64, .tag = 2, .want = &unhex("1bffffffffffffffff") },
+        .{ .v = max64, .tag = 3, .want = &unhex("3bffffffffffffffff") },
+        .{ .v = pad_max64, .tag = 2, .want = &unhex("1bffffffffffffffff") },
+        .{ .v = two64, .tag = 2, .want = &unhex("c249010000000000000000") },
+        .{ .v = pad_two64, .tag = 3, .want = &unhex("c349010000000000000000") },
+    };
+    for (cases) |c| {
+        const inner = c.v;
+        const got = try cbor.encode(a, .{ .tag = .{ .number = c.tag, .value = &inner } }, .{ .canonical = true });
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, c.want, got);
+        // The canonical output passes the strict decoder.
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = try cbor.decode(arena.allocator(), got, cbor.strict_options);
+    }
+    // Without `canonical` the tag stays as given.
+    const plain = try cbor.encode(a, .{ .tag = .{ .number = 2, .value = &small5 } }, .{});
+    defer a.free(plain);
+    try testing.expectEqualSlices(u8, &unhex("c24105"), plain);
+    // A tag 2 over a non-byte-string is not a bignum: left alone.
+    const text: Value = .{ .text = "x" };
+    const odd = try cbor.encode(a, .{ .tag = .{ .number = 2, .value = &text } }, .{ .canonical = true });
+    defer a.free(odd);
+    try testing.expectEqualSlices(u8, &unhex("c26178"), odd);
+    // `deterministic` refuses the non-preferred bignum forms.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bad = [_][]const u8{
+        &unhex("c24105"), // fits 64 bits
+        &unhex("c340"), // empty payload
+        &unhex("c24800ffffffffffffff"), // leading zero, 8 bytes after it
+        &unhex("c24a00010000000000000000"), // leading zero before a 9-byte value
+        &unhex("c2480000000000000000"), // 8 bytes
+    };
+    for (bad) |b| try testing.expectError(error.NotDeterministic, cbor.decode(arena.allocator(), b, .{ .deterministic = true }));
+    // ... while the lenient decoder takes them as before.
+    for (bad) |b| _ = try cbor.decode(arena.allocator(), b, .{});
+}

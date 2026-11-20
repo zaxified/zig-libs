@@ -108,7 +108,7 @@ pub const DecodeError = error{
     /// under `deterministic`, anything RFC 8949 §4.2.1 Core Deterministic
     /// Encoding rules out (a longer-than-needed argument, a float that would
     /// fit a shorter width, a NaN other than `0xf97e00`, map keys out of
-    /// bytewise order).
+    /// bytewise order, a bignum that fits 64 bits or has leading zeros).
     NotDeterministic,
     OutOfMemory,
 };
@@ -456,6 +456,16 @@ const Decoder = struct {
                 const inner = try self.allocator.create(Value);
                 errdefer self.allocator.destroy(inner);
                 inner.* = try self.decodeValue(depth + 1);
+                errdefer freeValue(self.allocator, inner.*);
+                // `deterministic` accepts exactly what `canonical` writes,
+                // and `canonical` writes a bignum that fits 64 bits (or
+                // has leading zeros) as an integer / without them.
+                if (self.deterministic and (tag_num == 2 or tag_num == 3)) {
+                    switch (inner.*) {
+                        .bytes => |mag| if (!bignumIsPreferred(mag)) return error.NotDeterministic,
+                        else => {},
+                    }
+                }
                 break :blk .{ .tag = .{ .number = tag_num, .value = inner } };
             },
             7 => try self.decodeSimpleOrFloat(info),
@@ -701,7 +711,9 @@ pub const EncodeOptions = struct {
     /// Since 2026-10-04 `canonical` is the whole of RFC 8949 §4.2.1 Core
     /// Deterministic Encoding: it also implies `shortest_floats`, so a
     /// float is written in the shortest width that keeps its value and every
-    /// NaN as `0xf97e00`. `decode` with `.deterministic = true` accepts
+    /// NaN as `0xf97e00`, and a bignum (tag 2/3 over a byte string) without
+    /// leading zero bytes, written as a major type 0/1 integer when it fits
+    /// 64 bits (§3.4.3). `decode` with `.deterministic = true` accepts
     /// exactly this output.
     canonical: bool = false,
     /// RFC 8949 §4.1 preferred serialization for floats: write each float in
@@ -847,6 +859,25 @@ fn encodeInto(list: *std.ArrayList(u8), a: Allocator, value: Value, options: Enc
         },
         .map => |entries| try encodeMap(list, a, entries, options),
         .tag => |t| {
+            if (options.canonical and (t.number == 2 or t.number == 3)) {
+                switch (t.value.*) {
+                    .bytes => |mag| {
+                        // RFC 8949 §3.4.3 preferred serialization of a
+                        // bignum: no leading zero bytes, and a value that
+                        // fits major type 0/1 is written as that integer.
+                        const m = bignumMagnitude(mag);
+                        if (m.len <= 8) {
+                            var v: u64 = 0;
+                            for (m) |byte| v = (v << 8) | byte;
+                            return writeHead(list, a, if (t.number == 2) 0 else 1, v);
+                        }
+                        try writeHead(list, a, 6, t.number);
+                        try writeHead(list, a, 2, @intCast(m.len));
+                        return list.appendSlice(a, m);
+                    },
+                    else => {},
+                }
+            }
             try writeHead(list, a, 6, t.number);
             try encodeInto(list, a, t.value.*, options);
         },
@@ -874,6 +905,19 @@ fn encodeInto(list: *std.ArrayList(u8), a: Allocator, value: Value, options: Enc
             try appendBE(list, a, @as(u64, @bitCast(f)));
         },
     }
+}
+
+/// A bignum payload without its leading zero bytes (RFC 8949 §3.4.3).
+fn bignumMagnitude(bytes: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < bytes.len and bytes[i] == 0) i += 1;
+    return bytes[i..];
+}
+
+/// Whether a tag 2/3 payload is in preferred serialization (§3.4.3): wider
+/// than 64 bits, no leading zero byte. Anything else has a shorter encoding.
+fn bignumIsPreferred(bytes: []const u8) bool {
+    return bytes.len > 8 and bytes[0] != 0;
 }
 
 fn shrinks(options: EncodeOptions) bool {

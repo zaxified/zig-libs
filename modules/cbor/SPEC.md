@@ -45,8 +45,7 @@ pre-allocation from a declared length, UTF-8 check, closed error set, fuzz test)
 Encoding (floats shrunk, NaN canonical), CBOR Sequences, diagnostic notation matching RFC 8949 Appendix A, a
 zero-allocation token reader (incremental at token granularity) and push writer, and comptime typed mapping with
 integer keys — the libcbor/fxamacker feature set a typical user reaches for. **Where we are behind:** no callback/push decoder for input that never sits in memory whole (the reader needs a slice; it
-retries a cut token, it does not keep partial-string state); no bignum helpers or bignum-aware preferred
-serialization; typed mapping has no field-level tag mapping or >64-bit integers; no diagnostic-notation *parser*;
+retries a cut token, it does not keep partial-string state); no bignum helpers; typed mapping has no field-level tag mapping or >64-bit integers; no diagnostic-notation *parser*;
 no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
 Items refused on purpose are in *What is deliberately not done*; the open ones in *Backlog / deferred*.
 
@@ -101,8 +100,10 @@ Items refused on purpose are in *What is deliberately not done*; the open ones i
 - **`canonical` = RFC 8949 §4.2.1.** Keys sorted bytewise on their encodings and
   floats in the shortest exact width (`shortestFloat`: the bits must survive the round trip, so
   `-0.0` stays `-0.0` and a value that would round is not shrunk); every NaN becomes `f97e00`
-  (§4.2.2 leaves NaN to the protocol — the dCBOR/cbor2 choice). Not covered: bignum-aware
-  preferred serialization (§3.4.3, a tag-2/3 bignum that fits 64 bits stays a bignum).
+  (§4.2.2 leaves NaN to the protocol — the dCBOR/cbor2 choice). Bignums follow §3.4.3 preferred
+  serialization: a tag-2/3 byte string loses its leading zero bytes and, when at most 8 bytes remain, is written as
+  the major type 0/1 integer (cbor2's canonical mode does the same); `deterministic` decoding refuses a bignum that
+  has a leading zero or fits 64 bits (`NotDeterministic`), so it stays "the canonical encoding of its own value".
 - **Strict decoding.** `reject_indefinite` fails `NotDeterministic` at the head of
   any indefinite item. `deterministic` (implies it) also checks each head's argument against the
   next-shorter form (`minForInfo`), each float with `shortestFloat` (NaN only as `f97e00`), and
@@ -256,8 +257,6 @@ Run: `scripts/modtest cbor` (`zig build test-cbor`; add `-Doptimize=ReleaseFast`
 - **`COSE_Mac0` / `COSE_Encrypt0` / multi-signer `COSE_Sign`:** wait for a consumer beyond WebAuthn/attestation (the
   reference, libcbor, has no COSE at all). Effort: medium each; fits CONVENTIONS §2 (the primitives exist as
   siblings).
-- **Bignum-aware preferred serialization (RFC 8949 §3.4.3):** `canonical` and `deterministic` treat tags 2/3 like
-  any tag, so a bignum that fits 64 bits stays a bignum. Small; no consumer.
 - **Typed mapping: tag to Zig type mapping and integers wider than 64 bits.** No consumer.
 
 ## Anchoring
