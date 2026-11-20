@@ -28,7 +28,7 @@ documentation and READMEs were consulted.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [nginx/nginx](https://github.com/nginx/nginx) (`upstream`) — **reference** | C | BSD-2-Clause | 31.8k | release-1.31.6 (2026-09-15) | Round-robin, weights, least_conn, ip_hash/hash (incl. consistent), passive `max_fails`/`fail_timeout` *(inferred from documentation, not re-read this run)*. Here: rr, random, smooth WRR (the nginx algorithm), least-connections, EWMA, power-of-two least-request and consistent-hash `ring_hash` (`pickByKey`; since 2026-10-04). |
+| [nginx/nginx](https://github.com/nginx/nginx) (`upstream`) — **reference** | C | BSD-2-Clause | 31.8k | release-1.31.6 (2026-09-15) | Round-robin, weights, least_conn, ip_hash/hash (incl. consistent), passive `max_fails`/`fail_timeout` *(inferred from documentation, not re-read this run)*. Here: rr, random, smooth WRR (the nginx algorithm), least-connections, EWMA, power-of-two least-request and consistent-hash `ring_hash` (`pickByKey`). |
 | [envoyproxy/envoy](https://github.com/envoyproxy/envoy) (cluster manager) | C++ | Apache-2.0 | 29.0k | v1.39.1 (2026-08-27) | Adds ring-hash, maglev, least-request with power-of-two choices, outlier detection, slow start, priorities/locality, dynamic membership via xDS *(inferred)*. |
 | [haproxy/haproxy](https://github.com/haproxy/haproxy) | C | GPL-2.0 / LGPL mix (API: NOASSERTION; source not read) | 6.9k | push 2026-09-29 (no GitHub releases) | Active health checks with rise/fall thresholds, many balance algorithms *(inferred)*. |
 | [traefik/traefik](https://github.com/traefik/traefik) | Go | MIT | 65.0k | v3.7.13 (2026-09-04) | Server pools with weighted round-robin, health checks, sticky sessions, dynamic providers *(inferred)*. |
@@ -40,11 +40,11 @@ Zig `std` has no load balancer.
 **Where we are ahead:** the only reusable Zig upstream-pool library found; passive (breaker)
 and active (`healthTick`) health kept orthogonal, bulkhead per upstream, pick-as-full-admission
 with a `PickGuard`, deterministic virtual-clock tests, no ambient clock or entropy.
-**Where we are behind** (re-checked 2026-10-04): no slow start and no success-rate outlier
-ejection (Envoy), no Maglev table, no priorities/locality, no service discovery (→ Backlog; DNS
-resolution belongs to `dns`). Built since the survey: runtime add/remove/drain with safe
-retirement, consistent hashing on a ring (`ring_hash`, `pickByKey`), power-of-two-choices
-(`least_request`).
+**Where we are behind:** no slow start and no success-rate outlier
+ejection (Envoy), no Maglev table, no priorities/locality, no service discovery (→ *Backlog / deferred*; DNS
+resolution belongs to `dns`). Runtime add/remove/drain with safe
+retirement, consistent hashing on a ring (`ring_hash`, `pickByKey`) and power-of-two-choices
+(`least_request`) exist.
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code, design references only).
 
@@ -75,14 +75,13 @@ them: a per-upstream `resilience.CircuitBreaker` (passive health) and optional p
 Clean-room; design references Envoy/HAProxy upstream-cluster semantics and resilience4j's Bulkhead
 (behavior only) — see README Provenance.
 
-**Membership while serving (2026-10-04).** `add`, `remove`, `drain`/`undrain`, `reap`, `getById`,
+**Membership while serving.** `add`, `remove`, `drain`/`undrain`, `reap`, `getById`,
 `count` and `stats` take the pool lock (`add`/`remove` allocate under it). `remove(id)` sets
 `draining` and `retired`, `orderedRemove`s the member (registration order, so least-conn/EWMA
 ties stay stable), moves it to `retired`, keeps the rotation on the member that followed it, and
 rebuilds the ring. A retired member stays allocated while `in_flight > 0` or `pins > 0`; `reap`
 frees the others. `report` releases its hold LAST (the in-flight decrement), so nothing touches a
-member after that point — before 2026-10-04 the latency fold ran after it, harmless only while
-members were immortal. `healthTick` dups the member list under the lock, pins each, checks outside
+member after that point. `healthTick` dups the member list under the lock, pins each, checks outside
 the lock, unpins under it; `health_busy` makes a tick that starts during another a no-op (incl. one
 started from inside a check). `undrain` never revives a retired member.
 
@@ -107,50 +106,44 @@ backpressure signaling to callers beyond the per-upstream bulkhead cap and `NoHe
 responsibility, not this module's.
 
 ## Verification
-Fully offline and deterministic (scripted fake operation + fake `HealthChecker` + virtual
-clock, no real sockets): registration bounds/duplicate/parse errors; round-robin cycles the healthy
-set; a failing upstream trips its breaker, is skipped, and is re-admitted after cooldown;
-bulkhead-full upstreams are skipped and `pick` returns null when all are full; least-connections and
-EWMA pick the least-loaded/fastest; smooth-WRR distributes exactly by weight without bursting; seeded
-random is reproducible and never picks a down upstream; failover `call` tries the next healthy
-upstream, honors `max_tries`, returns the last error when exhausted and `NoHealthyUpstream` when
-nothing was pickable; `healthTick` marks down/up, gates on the interval, and walks a recovered breaker
-`open → half_open → closed`; per-upstream and pool-wide stats; a 4-thread `call()` hammer asserting
-the per-upstream bulkhead cap is never exceeded and no slot leaks. Run: `zig build test-upstream`.
 
-**2026-10-04 (mvp → core).** Ring owners are checked against Python's `xxhash` package driven as a
-black box, building the same ring by the documented rule (8 keys over 5 members, the same 8 after
-removing one, and the exact 4 539 / 9 666 / 15 795 split of 30 000 keys over weights 1:2:3).
-Invariant tests: removal moves only the removed member's keys and an added member takes keys only
-for itself (5 000 keys); a down owner's keys walk on while everyone else's stay; a key spelled like
-a point lands on that point's member; the ring bound. P2C never picks a member that loses every
-pair. Membership: report after remove, reap only idle, re-add of a removed id, the rotation after
-removing the member it pointed at, drain under every strategy, WRR exact split with a drained
-member, a member removed and reaped from inside a health check (pinned), a nested tick. **Seeded
-model sweep** (140 seeds × 300 ops, every strategy): add/remove/drain/undrain/pick/pickByKey/
-report/healthTick/reap against a model — no inadmissible pick, null only when no member is
-admissible, per-member in-flight equals the model's holds, `reap` frees exactly the idle retired
-members, no stale ring index, no leak; reach pinned (8 286 picks, 4 295 checked nulls, 1 899
-removes, 1 564 reaped). A 3-worker `call()` + churn-thread test (remove/reap/re-add 3 000 times).
-**Mutation 2026-10-04:** 25 mutants, 9 survived the first run; 8 killed by tests added with their
-reasons, 1 equivalent: `ringPoints` choosing the proportional branch at exactly `total × ppw ==
-max_ring_points` gives `weight × ppw` either way.
+- **Run:** `scripts/modtest upstream` (`zig build test-upstream`).
+- **Tests:** fully offline and deterministic (scripted fake operation + fake `HealthChecker` + virtual clock, no
+  sockets): registration bounds, duplicates and parse errors; every strategy (rotation, exact smooth-WRR split,
+  least-connections, EWMA warm-up, seeded random reproducible, P2C never picks a member that loses every pair);
+  breaker trip, skip and re-admission after the cooldown; bulkhead-full skipping; `call()` failover (`max_tries`,
+  last error, `NoHealthyUpstream`); `healthTick` marking down/up, interval gating, and the breaker walking
+  `open → half_open → closed`; per-upstream and pool stats.
+- **Ring oracle:** ring owners are held to Python's `xxhash` package driven as a black box (the expected values
+  are frozen in the test, which builds the same ring by the documented rule), plus the key distribution over
+  weights 1:2:3. Invariants: removal moves only the removed member's keys, an added member takes keys only for
+  itself, a down owner's keys walk on while everyone else's stay, a key spelled like a point lands on that
+  point's member, the ring bound.
+- **Membership:** report after remove, reap only idle members, re-add of a removed id, the rotation after removing
+  the member it pointed at, drain under every strategy, a member removed and reaped from inside a health check
+  (pinned), a nested tick; a seeded model sweep (every strategy; add/remove/drain/undrain/pick/pickByKey/report/
+  healthTick/reap against a model: no inadmissible pick, null only when no member is admissible, in-flight equals
+  the model's holds, `reap` frees exactly the idle retired members, no stale ring index, no leak, reach pinned).
+- **Concurrency:** a 4-thread `call()` hammer asserts the per-upstream bulkhead cap is never exceeded and no slot
+  leaks; a `call()` + churn-thread test (remove/reap/re-add).
+- **Fuzz / constant time:** no fuzz obligation under check-fuzz; ct n/a.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
+
+## What is deliberately not done
+
+- **Service discovery / DNS resolution** — belongs to `dns`; the pool takes `host:port` members.
+- **Slow start and success-rate outlier ejection are deferred, not refused** — see *Backlog / deferred*.
 
 ## Backlog / deferred
-**2026-10-04:** runtime membership, consistent hashing and P2C are **done**. Still deferred: slow
-start and success-rate outlier ejection — both need time inside `pick` (this module reads no clock
-there; the breaker and active health already eject on consecutive failures) and windowed
-statistics per member; Maglev (the ring covers the use; Maglev trades rebuild cost for lookup
-speed, worth it only at fleet sizes no consumer has); priorities/locality (no consumer).
 
-- ~~**(survey 2026-09-30) Runtime membership change**~~ — DONE 2026-10-04: (remove, drain, re-add an upstream while the pool is serving) — `add`/`deinit` are documented as single-owner setup/teardown, so a fleet that changes (autoscaling, service discovery) needs a rebuilt pool; nginx reloads and Envoy/tower `Discover` handle it. Effort: medium (needs safe retirement while picks/reports are in flight). Fits §2: yes.
-- ~~**(survey 2026-09-30) Key-based strategies: `hash` / consistent hash (ring or maglev)**~~ — DONE 2026-10-04 (ring; Maglev deferred): — needed for cache affinity and sticky routing (nginx `hash`/`ip_hash`, Envoy ring-hash). Effort: small–medium. Fits §2: yes.
-- ~~**(survey 2026-09-30) Power-of-two-choices least-request**~~ — DONE 2026-10-04: — the usual scalable replacement for exact least-connections (Envoy, tower). Effort: small. Fits §2: yes.
-- **(survey 2026-09-30) Slow start and outlier ejection beyond consecutive failures** (success-rate based) — Envoy features that stop a fresh or degraded member being hit at full weight. Effort: medium. Fits §2: yes.
-
-## Status
-`gap · any (pure logic; active-health I/O via the injected seam) · client · threadsafe` + deps:
-`resilience`, `probe` — canonical source is `pub const meta` in src/root.zig.
+- **Slow start and outlier ejection beyond consecutive failures** (success-rate based; Envoy) — stop a fresh or
+  degraded member being hit at full weight. Both need time inside `pick` (this module reads no clock there; the
+  breaker and active health already eject on consecutive failures) and windowed statistics per member. Effort:
+  medium.
+- **Maglev** — the ring covers the use; Maglev trades rebuild cost for lookup speed, worth it only at fleet sizes
+  no consumer has.
+- **Priorities / locality** — no consumer.
 
 ## Anchoring
 

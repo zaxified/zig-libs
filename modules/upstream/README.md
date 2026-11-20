@@ -41,6 +41,7 @@ techniques.
 | `pickByKey(key)` | `.ring_hash`: the key's ring owner, or the next admissible member on the ring | same admission as `pick()` |
 | `drain(u)` / `undrain(u)` | stop / resume routing new calls to `u`; calls in flight finish | — |
 | `remove(id)` / `reap()` | take a member out while serving (its keys alone move on the ring); free removed members once nothing is in flight on them | `reap` from the owner that stopped handing out their pointers |
+| `ringOwner(key)` | `.ring_hash`: the member that owns `key` on the ring, admissible or not (tests, routing decided elsewhere) | — |
 | `upstreamStats(u)` / `stats()` | health, draining, breaker state, in-flight, picks, failures, latency min/avg/max; retired count | — |
 
 ## Strategies
@@ -141,17 +142,12 @@ pool.healthTick(now_ns);
 
 ## Verification
 
-`zig build test-upstream` — fully offline and deterministic (scripted fake
-operation + fake `HealthChecker` + virtual clock; no sockets anywhere):
-registration bounds/duplicate/parse errors; round-robin cycles healthy
-upstreams; a failing upstream trips its breaker, is skipped, and is
-re-admitted after the cooldown; bulkhead-full upstreams are skipped and
-`pick` returns null when all are full; least-connections and EWMA pick the
-least-loaded/fastest; smooth-WRR distributes exactly by weight (and never
-bursts); seeded random is reproducible and never picks a down upstream;
-failover `call` tries the next healthy upstream, honors `max_tries`,
-returns the last error when exhausted and `NoHealthyUpstream` when nothing
-was pickable; `healthTick` marks down/up, gates on the interval, and walks
-a recovered breaker `open → half_open → closed`; per-upstream + pool stats;
-plus a 4-thread `call()` hammer asserting the per-upstream bulkhead cap is
-never exceeded and no slot leaks.
+`scripts/modtest upstream` (`zig build test-upstream`) — fully offline and deterministic (scripted fake
+operation + fake `HealthChecker` + virtual clock; no sockets anywhere): every strategy, breaker and bulkhead
+skipping, `call()` failover, `healthTick`, ring owners against Python's `xxhash` and the ring invariants,
+membership churn against a model, and a multi-thread `call()` hammer. See SPEC *Verification*.
+
+## Not provided
+
+Slow start, success-rate outlier ejection, Maglev, priorities/locality, service discovery (DNS resolution
+belongs to `dns`): see SPEC *What is deliberately not done* and *Backlog / deferred*.
