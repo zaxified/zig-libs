@@ -6,62 +6,49 @@ the matching private key" API, plus a multi-message `Context` (§5.2) for
 streaming use and a secret-export function (§5.3) higher-level protocols
 (MLS and friends) can pull their own derived keys from.
 
-**Status: crypto-implementation pass done — everything is real and
-KAT-validated** against RFC 9180 Appendix A, byte-exact, in **all four
-modes**: A.1.1 base (the full vector: DHKEM `Encap`/`Decap`/
-`DeriveKeyPair`, key schedule, all 6 encryption tuples, all 3 exported
-values, single-shot `sealBase`/`openBase` end-to-end), A.1.2 `psk`, A.1.3
-`auth` and A.1.4 `auth_psk` driven through the same full chain, plus A.2
-(ChaCha20Poly1305), A.3 (P-256) and A.3.2/A.3.3/A.3.4 (the three non-base
-modes over P-256). `AuthEncap`/`AuthDecap` are anchored to the RFC's own
-published `enc`/`shared_secret` for both KEMs, not merely round-trip-tested.
-See `SPEC.md` for the threat model, the done-records, and the one place
-this module is deliberately stricter than the RFC (§5.1.2's PSK-length
-floor, `error.PskTooShort`).
+**Coverage.** All four RFC 9180 modes (base, psk, auth, auth_psk) are anchored
+byte-exact to Appendix A (A.1 to A.4 and A.6), to Go 1.26 `crypto/hpke`'s test
+vectors and to a live differential run against Go (see *Verify* and *Interop*);
+`AuthEncap`/`AuthDecap` are anchored to the RFC's own published
+`enc`/`shared_secret`, not merely round-trip-tested. `SPEC.md` carries the
+threat model, the design, and the one place this module is deliberately
+stricter than the RFC (§5.1.2's PSK-length floor, `error.PskTooShort`).
 
-**The key-schedule KDF is HKDF-SHA256/384/512, dispatched on `Nh`** (not
-hard-wired) — `schedule.KdfOf(Nh)` picks the `Hkdf(Hmac)` instantiation for
-`Nh` = 32/48/64, so passing `Nh=64` to any existing `Context`/`keySchedule`/
-`setup*`/`seal*`/`open*` call runs HKDF-SHA512 instead, no signature
-change. This is a SEPARATE choice from a DHKEM's own internal KDF (fixed
-per `kem_id`, RFC 9180 §7.1 Table 2 — X25519/P-256 stay HKDF-SHA256
-internally, P-384 HKDF-SHA384, regardless of the outer `Nh`). KAT: RFC 9180
-Appendix A.4 (`DHKEM(P-256, HKDF-SHA256), HKDF-SHA512, AES-128-GCM`), see
-SPEC.md's done-record.
+**Suites.**
 
-**Four DHKEMs: X25519, P-256, (since 2026-08-06) P-384 and (since 2026-10-10) P-521** — P-521 (`P521Kem`, kem_id 0x0012) on the in-repo `p521` module, anchored byte-exact to RFC 9180 A.6 in all four modes. P-384:
-(`dhkem_p384_hkdf_sha384`, kem_id 0x0011) — structurally identical to
-`P256Kem`, built directly on `std.crypto.ecc.P384` (no local
-perf-specialized sibling the way `p256` is for P-256). **RFC 9180 Appendix
-A has no worked test-vector section for DHKEM(P-384, HKDF-SHA384) at
-all** — checked against this module's own record of the appendix's
-contents and an offline Go-stdlib vector fixture, neither of which
-contains a P-384 entry — so `P384Kem` is anchored by RFC 9180 §7.1 Table
-2's definitional type widths, self-consistency round trips (Encap/Decap,
-AuthEncap/AuthDecap, DeriveKeyPair) and malformed-SEC1/fuzz rejection
-instead of a byte-exact KAT. See SPEC.md's done-record for the full
-search trail and reasoning.
+- **KEMs:** `X25519Kem`, `P256Kem`, `P384Kem`, `P521Kem` (DHKEMs, all four modes) and
+  `MlKem512Kem`, `MlKem768Kem`, `MlKem1024Kem`, `MlKem768P256Kem`,
+  `MlKem1024P384Kem`, `MlKem768X25519Kem` (X-Wing) (draft-ietf-hpke-pq; base and psk
+  modes only, no `AuthEncap` for a KEM that is not a DH).
+- **Key-schedule KDF:** the comptime `Nh` argument of every entry point is the integer
+  32/48/64 (HKDF-SHA256/384/512; `schedule.KdfOf(Nh)`) or one of `hpke.kdf.{HkdfSha256,
+  HkdfSha384, HkdfSha512, Shake128, Shake256, TurboShake128, TurboShake256}`. It is a
+  SEPARATE choice from a DHKEM's own internal KDF (fixed per `kem_id`, RFC 9180 §7.1
+  Table 2: X25519/P-256 HKDF-SHA256, P-384 HKDF-SHA384, P-521 HKDF-SHA512).
+- **AEAD:** AES-128-GCM and AES-256-GCM (`aesgcm` module; std's types are accepted
+  identically), `hpke.ChaCha20Poly1305` and `hpke.ExportOnly` (aead_id 0xFFFF:
+  `exportSecret` only).
 
 | File | Provides |
 |---|---|
 | `suite.zig` | `KemId`/`KdfId`/`AeadId`/`Mode`, `i2osp`/`os2ip`, `suiteId`/`kemSuiteId`, `labeledExtract`/`labeledExpand` (§4) |
-| `dhkem.zig` | `X25519Kem`/`P256Kem`/`P384Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1–§7.1.3) |
-| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, `KdfOf(Nh)`/`kdfIdOf(Nh)` (the HKDF-SHA256/384/512 dispatch), §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, now thin compositions over `setup*` |
-| `kat_rfc9180.zig` | RFC 9180 Appendix A vectors: A.1 in all four modes (full), A.2/A.3/A.4 headers, A.3's three non-base modes — driven end-to-end through the real implementation |
+| `dhkem.zig` | `X25519Kem`/`P256Kem`/`P384Kem`/`P521Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair`/`keyPairFromSecret` and, on the NIST KEMs, `validatePublicKey` (§4.1/§7.1.1–§7.1.3) |
+| `pq.zig`, `kdf.zig` | the draft-ietf-hpke-pq KEMs; the `hpke.kdf` types, including the one-stage SHAKE/TurboSHAKE KDFs |
+| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, `KdfOf(Nh)`, §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, thin compositions over `setup*` |
+| `burn.zig` | the stack-zeroing every secret-touching entry point runs under |
+| `kat_*.zig`, `go_oracle_*.zig`, `fuzz_test.zig`, … | the test classes listed under *Verify* |
 
 - **Model after:** RFC 9180 (Hybrid Public Key Encryption).
 - **Platform:** any. **Role:** util (no owned transport/socket — an
   application decides how `enc` and ciphertext travel). **Concurrency:**
   reentrant — `Context` is a plain caller-owned value, every free function
   touches only its parameters.
-- **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
-  `std.crypto.ecc.P256`), `p521` (DHKEM(P-521)'s group), `p384`
-  (DHKEM(P-384)'s group), `ct25519` (X25519 for DHKEM(X25519) and X-Wing;
-  `X25519Kem.KeyPair` stays `std.crypto.dh.X25519.KeyPair`), `chachapoly`
-  (the ChaCha20-Poly1305 AEAD) and `entropy` (key generation). Also `std`
-  directly: `std.crypto.kdf.hkdf.HkdfSha256`/
-  `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
-  HmacSha384)`, no named alias in `std`), `aesgcm` (AES-GCM AEADs).
+- **Deps:** `p256`, `p384` and `p521` (the DHKEM(P-256/384/521) and hybrid-KEM
+  groups), `ct25519` (X25519 for DHKEM(X25519) and X-Wing; `X25519Kem.KeyPair`
+  stays `std.crypto.dh.X25519.KeyPair`), `mlkem` (the ML-KEM half of the pq KEMs),
+  `chachapoly` (the ChaCha20-Poly1305 AEAD), `aesgcm` (the AES-GCM AEADs) and `entropy`
+  (key generation). Also `std` directly: HKDF (`Hkdf` over `HmacSha384` for
+  HKDF-SHA384, which `std` names no alias for) and SHA-3/SHAKE/TurboSHAKE.
 
 ## Import
 
@@ -69,9 +56,9 @@ search trail and reasoning.
 const hpke = @import("hpke");
 ```
 
-## API surface (today)
+## API surface
 
-**Real — suite/label plumbing** (`suite.zig`, re-exported at
+**Suite/label plumbing** (`suite.zig`, re-exported at
 `hpke.suite`):
 
 ```zig
@@ -176,24 +163,17 @@ try context.exportSecret(&suite_id, "my exporter label", &secret);
 ## Verify
 
 ```sh
-zig build test-hpke
+scripts/modtest hpke
 ```
 
-All tests are real, no skip guards: the full RFC 9180 A.1 vector driven
-end-to-end through the actual implementation (DHKEM Encap/Decap/
-DeriveKeyPair, key schedule, all 6 published encryption tuples including
-the seq-skipping ones, all 3 exported values, `sealBaseDeterministic` →
-`openBase` reproducing `enc` + the first ciphertext in one call); the same
-full chain for `mode_psk`/`mode_auth`/`mode_auth_psk` against A.1.2/A.1.3/
-A.1.4 and A.3.2/A.3.3/A.3.4 (including `AuthEncap`/`AuthDecap` and
-`P256Kem.deriveKeyPair` byte-exact); A.2 (ChaCha20Poly1305) and A.3
-(P-256) headers byte-exact; low-order/malformed-key rejection
-(`error.DhFailed`/`error.DeserializeError`), `VerifyPSKInputs` consistency
-and the §5.1.2 PSK floor (`error.PskTooShort`), seq fail-closed at the
-ceiling, wrong-`pkS`/wrong-`psk`/wrong-mode open rejection, and
-fresh-random-key round trips through every `seal*`→`open*` pair
-(X25519+AES-128-GCM and P-256+ChaCha20Poly1305). Green in Debug and
-ReleaseFast.
+Test classes: RFC 9180 Appendix A (A.1 to A.4, A.6) byte-exact in all four modes
+through the key-schedule, `Context`, `setup*` and single-shot entry points; Go 1.26
+`crypto/hpke`'s vectors (every KEM, KDF and AEAD it offers, X448 excepted); a frozen replay
+of the live Go differential run (*Interop*); negative paths (low-order and malformed
+keys, `VerifyPSKInputs` and the §5.1.2 PSK floor, `seq` fail-closed at the ceiling,
+wrong-`pkS`/`psk`/mode rejection); no-panic sweep and boundary tests; deterministic fuzz
+drivers (`HPKE_FUZZ`); a ReleaseFast stack probe for secrets on the dead stack. `SPEC.md`
+*Verification* lists them with their anchors.
 
 ## Interop
 
@@ -212,9 +192,17 @@ sides. `src/go_oracle_test.zig` replays the frozen subset in `test-hpke`
 without Go. The Go peer (`tools/go_oracle/`, standard library only) is a test
 binary because `testing/cryptotest` is the only way to pin Go's randomness.
 
+## Not provided
+
+No runtime-agile suite selection (suites are comptime types), no X448 DHKEM, no
+`auth`/`auth_psk` mode for the pq KEMs, and no `validatePublicKey` for X25519: `SPEC.md`
+*What is deliberately not done* and *Backlog / deferred* give the reasons and what is open.
+
 ## Provenance
 
-Clean-room from RFC 9180 (public IETF specification); nothing is ported.
-One design reference was consulted afterwards: `jedisct1/zig-hpke` (MIT),
+The RFC 9180 core is clean-room from RFC 9180 (public IETF specification). The
+draft-ietf-hpke-pq KEMs and one-stage KDFs (`pq.zig`, `kdf.zig`) are ported from Go 1.26
+`crypto/hpke` (BSD-3-Clause; `NOTICE` carries the condition) and tested on its vectors.
+One design reference was consulted for the core afterwards: `jedisct1/zig-hpke` (MIT),
 read in a 2026-07-21 diff audit that produced the `error.InvalidLength`
 hardening in `src/schedule.zig`. See `NOTICE` for the full statement.

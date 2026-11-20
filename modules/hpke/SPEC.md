@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-11-17 (33/37, 4 eq) · src 0e45f6deada54027
 
-Audit detail: the 2026-11-01 mutation run is a delta from `70207995` (the 2026-10-31 run, 125/139, 14 eq) over X25519 on `ct25519`, P-521 keygen on the comb and the switch to the `mlkem` module: 21 mutants, one survivor closed by a new test (low-order `enc` in AuthDecap); equivalents: a second DH's error mapping on an already-checked key, and three local wipes under `burn.run` (observable by the ReleaseFast stackprobe only). the 2026-11-01 review is a delta over the live Go oracle's replay (`src/go_oracle_test.zig`, test code only) and over `P521Kem.deriveKeyPair` moving from `mulInto(basePoint, …)` to p521's `mulBaseCtUnburned` comb (the only library change since the 2026-10-31 mutation run; its output is pinned byte-exact by RFC 9180 A.6's pkEm/pkRm/pkSm in `kat_rfc9180_a6_test.zig`, so any functional mutant of it is killed there). 2026-11-01 also: DHKEM(X25519) and X-Wing's X25519 moved from std to `ct25519` (`recoverPublicKey`, `scalarmult`; `X25519Kem.KeyPair` stays std's type) — outputs pinned byte-exact by RFC 9180 A.1 (all four modes) and the Go oracle replay, so any functional mutant of the switch is killed there.
-
 **Hardening:** fuzz 2026-10-31 (pq KEMs and one-stage KDFs: `hpke-pq-kem`/`hpke-pq-kdf`, 8 × 100,000 runs clean, every reach label hit, 8 planted mutants caught; RFC 9180 harnesses 2026-10-10, 200,000-run budget, HPKE_FUZZ) · ct 2026-10-31 (ctgrind: pq decap per family + one-stage schedule added, P-384 rows 0 contexts on the `p384` module; every nonzero context attributed) · panic 2026-10-31 (sweep + blind review: export length past 255·Nh → `LabelTooLong`, `out` zeroed on every error path, i2osp/os2ip checked panics; delta audit 27/27; pq/kdf/schedule blind review 2026-10-31: 2 MED fixed — stale or garbage expanded AES key — and an over-long plaintext refused instead of the AEAD's panic)
 
 **Performance:** ref 0.20–0.99× Go crypto/hpke (Go 1.26.8; 50 rows over 11 suites incl. the pq KEMs; worst p256_keygen 0.99×) · fastest 1.34× AWS-LC (aws-lc-sys 0.44.0 `EVP_HPKE`, `bench-hpke -- --vs=awslc`; it has only DHKEM(X25519): worst x25519_keygen 1.34×, setupS 1.29×, setupR 1.27× — ct25519's X25519 against AWS-LC's s2n-bignum asm, was 2.93× on std's ladder; seal/open/export 0.60–1.13×) · OpenSSL 3.5.5 `OSSL_HPKE` worst 1.15× over its 29 classic rows; rozbb/rust-hpke not measured (RustCrypto, no asm) (measured 2026-11-01)
@@ -35,35 +33,29 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/zig-hpke](https://github.com/jedisct1/zig-hpke) | Zig | MIT | 18 | pushed 2026-05-19 | The Zig peer. Its README: X25519, P-256, P-384, ML-KEM-512/768/1024, MLKEM768-X25519, -P256, MLKEM1024-P384, HKDF and SHAKE/TurboSHAKE KDFs, AES-GCM/ChaCha. No P-521 or X448. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No HPKE, but ships the parts for the PQ suites: `kem.ml_kem` and `kem.hybrid` (`MlKem768X25519`, `MlKem768P256`, `MlKem1024P384`; checked in `lib/std/crypto/`). No P-521. |
 
-**Since 2026-10-31 (gaps closed):** ML-KEM-512/768/1024, MLKEM768-P256, MLKEM1024-P384 and X-Wing (`pq.zig`), the SHAKE128/256 and TurboSHAKE128/256 one-stage KDFs (`kdf.zig`) and the export-only AEAD (`ExportOnly`) — every KEM, KDF and AEAD Go 1.26 offers, anchored byte-exact to all of Go's `testdata` vectors (`rfc9180.json` + `hpke-pq.json`) through the public setup/seal/open/export entry points. Remaining difference: no runtime-agile `NewKEM(id)` (suites are comptime types here, as in rust-hpke) and no X448.
+**Gaps closed since the survey:** ML-KEM-512/768/1024, MLKEM768-P256, MLKEM1024-P384 and X-Wing (`pq.zig`), the SHAKE128/256 and TurboSHAKE128/256 one-stage KDFs (`kdf.zig`) and the export-only AEAD (`ExportOnly`): every KEM, KDF and AEAD Go 1.26 offers, anchored byte-exact to all of Go's `testdata` vectors (`rfc9180.json` + `hpke-pq.json`) through the public setup/seal/open/export entry points. Remaining differences: no runtime-agile `NewKEM(id)` (suites are comptime types here, as in rust-hpke) and no X448 DHKEM (both under *Backlog / deferred*).
 
-**Where we were ahead (2026-09-30):** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, four DHKEMs (P-521 since 2026-10-10, RFC 9180 A.6 in all four modes), the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and the RFC's §5.1.2 PSK-length floor (32 bytes) enforced, which its pseudocode omits. **Where we are behind:** no post-quantum or hybrid KEM (Go stdlib, rust-hpke and zig-hpke all have them), no SHAKE KDFs, no X448 DHKEM, no `export_only` (0xFFFF) suite — all but X448 closed 2026-10-31 (above).
+**Where we are ahead:** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, four DHKEMs (P-521 anchored to RFC 9180 A.6 in all four modes), the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and the RFC's §5.1.2 PSK-length floor (32 bytes) enforced, which its pseudocode omits. **Where we are behind:** no runtime-agile suite selection and no X448 DHKEM (*Backlog / deferred*).
 
 ## What this is, in one paragraph
 
-RFC 9180 Hybrid Public Key Encryption: a KEM (Encap/Decap over a DH group)
-composed with an HKDF-based key schedule and an AEAD into a "seal to a
-public key" / "open with the matching private key" primitive, plus a
-multi-message `Context` for streaming use and a secret-export function
-(§5.3) higher-level protocols can pull their own derived keys from (e.g.
-MLS). This module targets the three DHKEM instantiations `std.crypto` can
-drive without a C dependency — `dhkem_x25519_hkdf_sha256` (kem_id
-0x0020), `dhkem_p256_hkdf_sha256` (kem_id 0x0010) and, since 2026-08-06,
-`dhkem_p384_hkdf_sha384` (kem_id 0x0011), plus since 2026-10-10
-`dhkem_p521_hkdf_sha512` (kem_id 0x0012, the in-repo `p521` module, since std
-has no P-521; DeriveKeyPair with §7.1.3's 0x01 bitmask) — each fixed to ITS OWN internal
-KDF (HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384, RFC 9180 §7.1
-Table 2), all three spec-named AEADs (AES-128-GCM, AES-256-GCM,
-ChaCha20Poly1305), and all three spec-named OUTER key-schedule KDFs
-(HKDF-SHA256/384/512, `Nh` = 32/48/64 — `schedule.KdfOf`/`kdfIdOf` dispatch
-on `Nh`, see `schedule.zig`'s module doc comment) — a DHKEM's own internal
-KDF and the ciphersuite's key-schedule KDF are RFC 9180's own SEPARATE
-choices (§4.1 vs §7.2), so e.g. `DHKEM(P-256, HKDF-SHA256)` + an
-HKDF-SHA512 key schedule (Appendix A.4) is a real, already-KATed
-combination, not a hypothetical one — and `DHKEM(P-384, HKDF-SHA384)`
-paired with an HKDF-SHA384 key schedule (the natural pairing, `Nh`=48 both
-places) works the same way, just without an Appendix A vector to KAT it
-against (see the P-384 done-record item below).
+RFC 9180 Hybrid Public Key Encryption: a KEM composed with a key schedule and an
+AEAD into a "seal to a public key" / "open with the matching private key"
+primitive, plus a multi-message `Context` for streaming use and a
+secret-export function (§5.3) higher-level protocols can pull their own
+derived keys from (e.g. MLS). KEMs: the four DHKEMs `dhkem_x25519_hkdf_sha256`
+(kem_id 0x0020), `dhkem_p256_hkdf_sha256` (0x0010), `dhkem_p384_hkdf_sha384`
+(0x0011) and `dhkem_p521_hkdf_sha512` (0x0012; the in-repo `p521` module,
+DeriveKeyPair with §7.1.3's 0x01 bitmask), each fixed to ITS OWN internal KDF
+(HKDF-SHA256 for X25519/P-256, HKDF-SHA384 for P-384, HKDF-SHA512 for P-521,
+RFC 9180 §7.1 Table 2), and the draft-ietf-hpke-pq KEMs (below). AEADs: the
+three spec-named AES-128-GCM, AES-256-GCM and ChaCha20Poly1305, and export-only.
+Key-schedule KDFs: HKDF-SHA256/384/512 (`Nh` = 32/48/64, `schedule.KdfOf`/
+`kdfIdOf` dispatch on `Nh`, see `schedule.zig`'s module doc comment) and the
+one-stage SHAKE/TurboSHAKE KDFs. A DHKEM's own internal KDF and the
+ciphersuite's key-schedule KDF are RFC 9180's own SEPARATE choices (§4.1 vs
+§7.2), so e.g. `DHKEM(P-256, HKDF-SHA256)` + an HKDF-SHA512 key schedule
+(Appendix A.4) is a real, already-KATed combination, not a hypothetical one.
 
 ## Modes covered (RFC 9180 §5.1 Table 1)
 
@@ -82,17 +74,15 @@ All four are represented in `suite.Mode`; `dhkem.zig` implements
 `KeyScheduleError.InconsistentPsk`) is the place mode/PSK consistency
 gets enforced, not the type system.
 
-**All four modes are externally anchored** (2026-07-28): every mode is
+**All four modes are externally anchored:** every mode is
 driven end-to-end against RFC 9180's own Appendix A vectors — A.1.1/A.1.2/
 A.1.3/A.1.4 over `DHKEM(X25519)+AES-128-GCM` and A.3.1–A.3.4 over
-`DHKEM(P-256)+AES-128-GCM` — comparing `DeriveKeyPair` output, `enc`,
+`DHKEM(P-256)+AES-128-GCM`, and A.6 over `DHKEM(P-521)+HKDF-SHA512` in all four modes (`kat_rfc9180_a6.zig`) — comparing `DeriveKeyPair` output, `enc`,
 `shared_secret`, `key_schedule_context`, `secret`, `key`, `base_nonce`,
 `exporter_secret`, the published ciphertexts and the published exported
 values byte-for-byte. This matters more for the non-base modes than the
-count of extra tests suggests: `psk`/`auth`/`auth_psk` were previously
-reachable only through a hand-composed `keySchedule` + KEM call and were
-verified only by this module's own round trip, and **a round trip passes
-even when the sender and the recipient share the same misreading of §5.1**
+count of extra tests suggests:
+**a round trip passes even when the sender and the recipient share the same misreading of §5.1**
 (a wrong mode byte, a `psk_id_hash` over the wrong input, a `dh || dh2`
 concatenated in the wrong order). Each mode also has a §6.1 single-shot
 wrapper pair (`sealPsk`/`openPsk`, `sealAuth`/`openAuth`,
@@ -114,25 +104,24 @@ KAT seams on the sender side, same pattern as `sealBaseDeterministic`).
 This is what a protocol layered over HPKE that only ever wants
 `Context.Export` — never `Seal`/`Open` — needs: MLS (RFC 9420) §8.3
 external initialization and §12.4 external commits derive their
-`init_secret` this way. Added 2026-07-29 for exactly that consumer
+`init_secret` this way. Added for exactly that consumer
 (`modules/mls`); no new crypto — `setup*S`/`setup*R` call the identical
 `Kem.encap*`/`Kem.decap*`/`Kem.authEncap*`/`Kem.authDecap*` +
-`keySchedule` steps the single-shot wrappers already called, through two
-small shared helpers (`setupEncapped`/`setupDecapped`) that `sealEncapped`/
-`openDecapped` (the single-shot wrappers' shared body) now compose over
-too, so both layers stay provably in sync rather than carrying two copies
-of the same recipe.
+`keySchedule` steps the single-shot wrappers call, through one pair of
+shared helpers (`setupS`/`setupR` in `schedule.zig`) that the single-shot
+wrappers' shared bodies (`sealOnce`/`openOnce`: one `setupS`/`setupR`, then
+one `Context` seal/open) compose over too, so both layers stay in sync
+rather than carrying two copies of the same recipe. All four modes share
+that one body: a per-mode copy is exactly where a `mode` or a `psk` argument
+silently goes missing, and such an omission still round-trips.
 
 KAT: every mode is re-driven through the real `setup*S`/`setup*R` entry
 points against the same RFC 9180 Appendix A vectors already anchoring
 `keySchedule` (A.1.1–A.1.4 over X25519, A.3.2–A.3.4 over P-256) —
 `enc` and every `Context` field checked on both sides, one `Seal`/`Open`
-round trip, and (the point of this pass) every published exported value
-reproduced through `Context.exportSecret` called on the `Context` a
-`setup*` caller actually receives, not a hand-built stand-in. Mutation-
-checked: corrupting one byte of a published exported value turns the new
-`setupBaseS`/`setupBaseR` test red (alongside the two tests that already
-covered that byte), confirming the new path is not vacuous.
+round trip, and every published exported value reproduced through
+`Context.exportSecret` called on the `Context` a `setup*` caller actually
+receives, not a hand-built stand-in.
 
 **One deliberate deviation from the RFC's pseudocode: the PSK-length
 floor.** RFC 9180 §5.1.2 — "The PSK MUST have at least 32 bytes of entropy
@@ -144,9 +133,8 @@ observable from the bytes), and `keySchedule` rejects it with
 `KeyScheduleError.PskTooShort`. The floor is 32 bytes for every KDF
 (`schedule.psk_min_len`), inclusive — the RFC's own Appendix A PSK vectors
 are exactly 32 bytes, so a stricter floor would reject the spec's test
-vectors. Until 2026-10-10 the floor was `Nh`, which did exactly that at
-HKDF-SHA512 (A.6.2/A.6.4, 32-byte PSK, Nh = 64); `Nh` is only the RFC's
-SHOULD. Consistency
+vectors: a floor of `Nh` would refuse A.6.2/A.6.4's 32-byte PSK at
+HKDF-SHA512 (Nh = 64), and `Nh` is only the RFC's SHOULD. Consistency
 (`VerifyPSKInputs`) is checked FIRST, so a caller with the mode/PSK
 combination wrong still gets the RFC's own diagnosis (`InconsistentPsk`)
 rather than a length complaint about a PSK that should not have been
@@ -154,16 +142,13 @@ supplied at all.
 
 ## Design & invariants
 
-**Two-pass shape, following `noise`/`tlsresume`/`ssh`'s precedent — both
-passes now done.** The RFC's domain-separation machinery (`suite_id`/
-`LabeledExtract`/`LabeledExpand`, §4) landed real in the scaffolding
-pass (pure composition over `std.crypto.kdf.hkdf`). The DH exchange, the
-key-schedule composition, and the AEAD seal/open — each a
-security-critical recipe (which bytes get concatenated in which order,
-which value is the salt vs the IKM, when to reject a low-order DH
-result) — were filled in by the dedicated crypto-implementation pass
-(2026-07-12) and are KAT-validated byte-exact against RFC 9180 Appendix
-A.1/A.2/A.3 (see the done-record checklist below).
+**Layering.** `suite.zig` holds the domain-separation machinery (`suite_id`,
+`LabeledExtract`/`LabeledExpand`, §4: pure composition over HKDF);
+`dhkem.zig` the DH exchanges and key derivation; `schedule.zig` the key
+schedule, the AEAD seal/open and the setup and single-shot wrappers. The
+security-critical recipes (which bytes get concatenated in which order, which
+value is the salt vs the IKM, when to reject a low-order DH result) are
+KAT-validated byte-exact against RFC 9180 Appendix A (see *Verification*).
 
 **`LabeledExtract` streams; `LabeledExpand` doesn't (implementation
 detail, not a spec requirement).** `Hkdf.extractInit`/`.update`/`.final`
@@ -201,19 +186,16 @@ that fits in 64 bits, so nothing in the covered range diverges from RFC
 9180; only the point where a real implementation would fail closed moves
 earlier (fewer messages before mandatory rekey), never later.
 
-**P-256's DH is an x-coordinate-only ECDH, not std's `X25519.scalarmult`
-shape.** `std.crypto.ecc.P256` exposes point arithmetic
+**The NIST curves' DH is an x-coordinate-only ECDH, not X25519's
+`scalarmult` shape.** The `p256` (and `p384`) module exposes point arithmetic
 (`fromSec1`/`toUncompressedSec1`/`mul`/`affineCoordinates`), not a
-packaged "DH function" the way `std.crypto.dh.X25519` does — RFC 9180
+packaged "DH function" the way X25519 does — RFC 9180
 **§4.1**'s `DH(skX, pkY)` for NIST curves yields the X coordinate only,
 verbatim: "For P-256, P-384, and P-521, the size Ndh of the Diffie-Hellman
 shared secret is equal to 32, 48, and 66, respectively, corresponding to the
 x-coordinate of the resulting elliptic curve point [IEEE1363]." (§4.1 also
 fixes the failure mode: `DH` "can raise a ValidationError as described in
-Section 7.1.4", not a deserialization error.) Earlier revisions of this file
-cited §7.1.2 — which is "SerializePrivateKey and DeserializePrivateKey", not
-`DH` — and quoted "a DHError error", a name that appears nowhere in RFC 9180
-(audit BD-26). `dhkem.P256Kem`'s
+Section 7.1.4", not a deserialization error.) `dhkem.P256Kem`'s
 `encapDeterministic`/`decap` implement as
 `P256.fromSec1(pk).mul(sk, .big).affineCoordinates().x.toBytes(.big)`
 (NOT `.toUncompressedSec1()`, NOT the Y coordinate) — KAT-confirmed by
@@ -229,395 +211,84 @@ deterministic entry points take the ephemeral `KeyPair` as a parameter
 rather than drawing one from `std.Io` internally; `encap`/`authEncap` are
 thin `generateKeyPair(io)` + `*Deterministic` wrappers for real callers.
 
-**No secret on the dead stack, the caller's frame included (2026-10-08).**
+**No secret on the dead stack, the caller's frame included.**
 Private keys are taken as `*const KeyPair`; key pairs, shared secrets,
 `Context`/`Setup` and `labeledExtract`'s PRK are written into `out` pointers
 (zeroed on error), never returned — a by-value argument or a returned value is
 a copy in the caller's frame that nothing wipes. Every public entry point that
 touches a secret runs its body one frame down and zeroes the stack it used
-(`src/burn.zig`: 32 KiB for anything that reaches a KEM, 8 KiB for
-`Context.seal`/`open`/`exportSecret` and `keySchedule`).
+(`src/burn.zig`: `kem_burn` 32 KiB for anything that reaches a DHKEM,
+`pq_burn_768`/`pq_burn_1024` 88/132 KiB for the pq KEMs, `aead_burn` 8 KiB for
+`exportSecret` and `keySchedule`, `msg_burn` 2 KiB for each `Context.seal`/
+`open`, `kdf_burn` 4 KiB for `labeledExtract`/`labeledExpand`).
 
-**Stack requirement of the burn (2026-10-31).** `burn.stack(n)` is a real
+**Stack requirement of the burn.** `burn.stack(n)` is a real
 `n`-byte stack array, zeroed by volatile stores, and it sits below the entry
-point's body frame. Every KEM entry point (`encap*`/`decap`/`authEncap*`/
+point's body frame. Every DHKEM entry point (`encap*`/`decap`/`authEncap*`/
 `authDecap`/`deriveKeyPair`, `setup*`, `seal*`/`open*`, and so
 `tlsserver`'s ECH `setupBaseR`) therefore needs the 32 KiB burn **plus** the
-body's own frame (P-384 measured 12.6 KiB in ReleaseFast) on top of the
-caller's stack; `Context.seal`/`open`/`exportSecret` and `keySchedule` need 8 KiB
-plus their body. Budget about 64 KiB of free stack for a call into hpke.
+body's own frame (measured in ReleaseFast: P-256 9.7 KiB, X25519 2.5 KiB) on top of the
+caller's stack; `exportSecret` and `keySchedule` need 8 KiB and
+`Context.seal`/`open` 2 KiB, each plus its body. The pq entry points need their
+88 or 132 KiB burn plus a body of about 59 KiB (the 768 family) or 87 KiB (the
+1024 family) at key generation. Budget about 64 KiB of free stack for a call
+into a DHKEM and about 150 KiB (768) or 220 KiB (1024) for a pq KEM.
 A caller on a small thread or coroutine stack (below roughly 48 KiB free)
 overflows with no guard page check from this module. Not measured against
 the stack sizes of the consumers (the web-server consumer's TLS handshake thread, the router-tool consumer tasks);
 whoever runs hpke on a custom stack must check.
-`src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation of all
-three KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
+`src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation, the pq KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
 against the keys, DH outputs (both coordinates), `eae_prk`, the shared secret,
 the key schedule's `secret`, the AEAD key, AES round keys and GHASH key, and the
 exporter secret.
 
-## Threat model
+## Design notes by feature
 
-- **Nonce reuse under `Context.seal`.** RFC 9180 §5.2 derives each
-  message's AEAD nonce from a per-context `seq` counter — reusing a nonce
-  under the same key (e.g. skipping the `incrementSeq` call, or calling
-  `seal` concurrently on a shared `Context` without external
-  synchronization) breaks AES-GCM/ChaCha20-Poly1305 confidentiality
-  outright (nonce-reuse forgery, a full plaintext-recovery break for
-  GCM). `seal` increments `seq` only after a successful encrypt and
-  before returning — never skipped, and a `seq` that could not be
-  advanced past the message is rejected BEFORE any ciphertext is
-  produced. `Context` has no internal
-  locking (`meta.concurrency = .reentrant`, mirroring `noise.CipherState`
-  and `dtls`'s AEAD state) — a `Context` shared across threads without
-  external synchronization is a caller error, not something this module
-  guards against, matching this repo's no-hidden-locking convention.
-- **Sequence-number overflow.** `incrementSeq`'s fail-closed
-  `error.MessageLimitReached` at `maxInt(u64)` (a conservative sub-limit
-  of RFC 9180's actual `2^(8*Nn)-1` ceiling, see Design above) exists
-  specifically so a long-lived `Context` cannot be driven into nonce
-  reuse by sheer message volume — the caller MUST re-key (a fresh
-  `Encap`/`KeySchedule`) rather than continue, and the type never wraps
-  silently.
-- **KEM low-order/identity-element DH results.** RFC 9180 **§7.1.4**
-  requires rejecting a DH computation that lands on the identity
-  element — verbatim: "senders and recipients MUST ensure the Diffie-Hellman
-  shared secret is not the point at infinity" and "recipients MUST check
-  whether the Diffie-Hellman shared secret is the all-zero value and abort if
-  so". (§7.1.1/§7.1.2, cited here before audit BD-26, only cover key
-  *serialization* and defer validation to §7.1.4.) That is (X25519's documented all-zero output for a maliciously chosen
-  public key, RFC 7748 §6.1; P-256's point-at-infinity) — silently
-  proceeding would let a peer force a known, attacker-predictable
-  `shared_secret`. Every `Encap`/`Decap`/`AuthEncap`/`AuthDecap` maps
-  std's `IdentityElementError` rejection (performed const-time inside
-  `X25519.scalarmult`/`P256.mul` themselves) to `error.DhFailed`, and
-  the all-zero-pk X25519 case is regression-tested; P-256 additionally
-  rejects malformed SEC1 encodings with `error.DeserializeError` before
-  any scalar multiplication.
-- **`auth`/`auth_psk` mode sender-key confusion.** `AuthEncap`/
-  `AuthDecap` bind the SENDER's static key into the shared secret (`dh2 =
-  DH(skS, pkR)` / `DH(skR, pkS)`) specifically so a receiver can be
-  convinced the message came from a specific sender's static keypair —
-  an implementation that accepts `auth` mode but never actually checks
-  `pkS` is bound (e.g. silently falling back to unauthenticated `dh` only)
-  would defeat the entire point of the mode. The signatures
-  (`authEncapDeterministic`/`authDecap` both REQUIRE the extra key
-  parameter, no optional-omit path) make that mistake a type error to
-  attempt, not a runtime silent-downgrade; the binding is
-  regression-tested (a wrong `pkS` decaps to a DIFFERENT shared secret).
-- **`I2OSP`/label-buffer sizing.** `labeledExpand`'s bounded 512-byte
-  scratch buffer returns `error.LabelTooLong` on overflow rather than
-  panicking on caller-supplied `info`/`exporter_context` — an application
-  that (unusually) wants to bind gigabytes of exporter context data gets
-  a typed error, not an aborted process, on attacker-influenced-length
-  input.
-- **PSK handling is (almost) entirely the caller's responsibility.** This
-  module never generates, stores, or rotates a PSK — `keySchedule` checks
-  the mode/PSK-presence *shape* (RFC 9180's `VerifyPSKInputs`,
-  `KeyScheduleError.InconsistentPsk`) plus §5.1.2's length floor
-  (`KeyScheduleError.PskTooShort`, see "Modes covered" above), and nothing
-  else: PSK freshness, rotation, storage and the actual ENTROPY of a
-  long-enough PSK are the caller's, mirroring `tlsresume`'s STEK key
-  material never being generated by that module either. A 32-byte counter
-  passes the length floor and is still a catastrophic PSK; the floor
-  removes only the failure mode that is detectable from the bytes.
-- **`auth` mode is not a signature.** `AuthEncap`/`AuthDecap` authenticate
-  the sender to *the specific recipient whose key was used* and to nobody
-  else: the recipient can compute the same `shared_secret` themselves, so
-  they can forge any "auth-mode message from that sender to themselves"
-  and cannot prove one to a third party. RFC 9180 §9.1 also notes DHKEM's
-  key-compromise-impersonation limit — an attacker holding `skR` can craft
-  messages that appear to come from any sender. Applications needing
-  transferable or third-party-verifiable sender authentication need a
-  signature, not `mode_auth`.
+- **Two KDF choices, kept apart.** The outer key-schedule KDF is `Nh`-dispatched,
+  not hard-wired: `schedule.KdfOf(Nh)` maps `Nh` = 32/48/64 to HKDF-SHA256/384/512
+  (HKDF-SHA384 is `Hkdf` over `HmacSha384`, since `std` names no alias), and
+  `kdfIdOf`/`suiteIdOf` embed the matching `kdf_id` in the `suite_id`. A DHKEM's
+  own internal KDF is fixed per `kem_id` by RFC 9180 §7.1 Table 2 and is
+  unaffected by the outer `kdf_id`: `dhkem.zig`'s `extractAndExpand` takes the
+  `Hkdf` type as a parameter, `Nsecret` stays the KEM's own width, and
+  `dhkem.zig` does not import `schedule.zig`, so neither choice leaks into the
+  other. Anchored by RFC 9180 A.4 (`DHKEM(P-256, HKDF-SHA256)` + HKDF-SHA512 key
+  schedule, `Nh` = 64) through the encap/decap, key-schedule and single-shot
+  paths.
+- **`DHKEM(P-384, HKDF-SHA384)` (`P384Kem`).** Structurally `P256Kem` on the
+  `p384` module: `Npk` 97 (SEC1 uncompressed), `Nsk` = `Nsecret` = 48, the same
+  x-coordinate-only ECDH, the same §7.1.3 rejection-sampling `deriveKeyPair`
+  (bitmask 0xFF, unlike P-521's 0x01), the same `dh ‖ dh2` fold in the auth
+  modes, and HKDF-SHA384 as its own KDF. RFC 9180 Appendix A has no P-384 vector;
+  its anchors are Go's `hpke-pq.json` P-384 vector, the live Go differential run,
+  and a test that recomputes `shared_secret` through an independent labeled-HKDF
+  derivation (a wrong internal KDF round-trips with itself and would pass every
+  self-consistency test).
+- **`DHKEM(P-521, HKDF-SHA512)` (`P521Kem`).** `Nsecret` 64, `Nsk` 66, `Npk` 133.
+  Every DH runs through `p521.ecdhInto` (constant time in the scalar, peer point
+  validated, identity result refused); `DeriveKeyPair` uses the 0x01 bitmask
+  §7.1.3 gives P-521 (66 bytes = 528 bits against a 521-bit order).
+- **Key generation.** Every KEM's `generateKeyPair` is RFC 9180 §4's
+  `DeriveKeyPair(random(Nsk))` with `entropy.fill` as `random`, not std's
+  `io.random` path: a degraded seed would silently become the shared secret of
+  every message the sender seals. It also puts the key-generation path under the
+  Appendix A known-answer tests.
+- **AEAD binding.** Every entry point takes the AEAD as a comptime type;
+  `aeadIdOf` maps the `aesgcm` and `std` AES-GCM types and the `chachapoly` and
+  `std` ChaCha20Poly1305 types to the same registered `aead_id`, so the choice
+  cannot reach the wire. `Context` keeps the AEAD with its key already expanded
+  (`aesgcm.Context`), set by the key schedule and re-expanded whenever `key`
+  differs from the key it was expanded from (compared in constant time on every
+  message), so a `Context` built field by field or with a rewritten `key` never
+  runs on a stale or garbage key schedule. ChaCha20Poly1305 and export-only have
+  no such state.
+- **Error behaviour.** Every secret result is zeroed on every error path; an
+  export or `labeledExpand` length past 255·`Nh` is `LabelTooLong`; a plaintext
+  past the AEAD's limit (`Context.max_message_len`) or a wrong-length `out`
+  buffer is `InvalidLength` in every build mode (a real runtime check, not a
+  `std.debug.assert`).
 
-## Done-record — crypto-implementation pass (2026-07-12)
-
-The former dependency-ordered TODO(fable) checklist, each item now
-implemented and KAT-verified (order preserved):
-
-1. ✅ **`dhkem.X25519Kem.encapDeterministic`/`.decap`** (§4.1/§7.1.1) —
-   `X25519.scalarmult` (std's own const-time identity rejection mapped
-   to `error.DhFailed`) + the shared `extractAndExpand` helper
-   (`labeledExtract("", "eae_prk", dh)` → `labeledExpand(...,
-   "shared_secret", enc ‖ pkRm, 32)` under `kemSuiteId`). KAT:
-   `kat_rfc9180.a1` `enc`/`shared_secret` byte-exact + Decap round trip;
-   all-zero (low-order) pkR regression-tested to fail with
-   `error.DhFailed`.
-2. ✅ **`dhkem.X25519Kem.deriveKeyPair`** (§7.1.3) — `dkp_prk =
-   LabeledExtract("", "dkp_prk", ikm)`; `sk = LabeledExpand(dkp_prk,
-   "sk", "", 32)`; `X25519.KeyPair.generateDeterministic(sk)` (seed
-   stored verbatim as `secret_key`, clamped at use). KAT: A.1.1's
-   `skEm`/`pkEm` from `ikmE` AND `skRm`/`pkRm` from `ikmR`, byte-exact.
-3. ✅ **`schedule.keySchedule`** (§5.1) — `VerifyPSKInputs` (psk/psk_id
-   present-together + mode-consistency, `error.InconsistentPsk`) then
-   the §5.1 psk_id_hash/info_hash/ksc/secret/key/base_nonce/
-   exporter_secret chain. KAT: A.1.1's `key`/`base_nonce`/
-   `exporter_secret` driven end-to-end from `shared_secret`; all four
-   consistent and all four inconsistent mode/PSK combinations tested.
-4. ✅ **`schedule.Context.seal`/`.open`** (§5.2) — `Aead.encrypt`/
-   `.decrypt` at `computeNonce(seq)`, `incrementSeq` only after success,
-   plus a fail-closed pre-check at `seq == maxInt(u64)` BEFORE any
-   ciphertext is produced/consumed (see the threat model). KAT: all 6 of
-   A.1.1's published `(seq, pt, aad, ct)` tuples through the real
-   `Context` (seq 0/1/2 via self-increment, 4/255 via direct `seq`
-   assignment — the `noise.CipherState.setNonce` precedent); tamper/
-   wrong-aad/truncated-ct rejection without advancing `seq`.
-5. ✅ **`schedule.Context.exportSecret`** (§5.3) — thin wrapper over
-   `suite.labeledExpand(exporter_secret, "sec", ...)`. KAT: A.1.1.2's 3
-   exported values through the method itself.
-6. ✅ **`schedule.sealBase`/`.openBase`** (§6.1) — composition of 1+3+4,
-   plus `sealBaseDeterministic` (ephemeral-injected KAT seam) and the
-   comptime `aeadIdOf`/`suiteIdOf` suite-id assembly. KAT:
-   `sealBaseDeterministic(X25519Kem, Aes128Gcm, ...)` reproduces A.1's
-   `enc` + first ciphertext in one call; `openBase` recovers the
-   plaintext; fresh-random-key round trips (X25519+AES-128-GCM and
-   P-256+ChaCha20Poly1305) including a mismatched-`info` rejection.
-7. ✅ **`dhkem.P256Kem.encapDeterministic`/`.decap`/`.deriveKeyPair`**
-   (§4.1's x-coordinate rule, §7.1.1's SEC1 deserialization, §7.1.3's
-   `DeriveKeyPair`) — x-coordinate-only ECDH
-   (`P256.fromSec1(pk).mul(sk,.big).affineCoordinates().x.toBytes(.big)`,
-   `error.DeserializeError` on malformed SEC1, `error.DhFailed` on
-   identity) and the §7.1.3 rejection-sampling `deriveKeyPair` loop
-   (`bitmask = 0xFF` for P-256, candidate rejected iff zero or ≥ n via
-   `P256.scalar.rejectNonCanonical`). KAT: `kat_rfc9180.a3`'s
-   `enc`/`shared_secret`; deriveKeyPair self-consistency (A.3's header
-   publishes no `ikm` fields).
-8. ✅ **`AuthEncap`/`AuthDecap`** for both KEMs (§4.1's `dh ‖ dh2` fold,
-   one 64-byte ikm to a single `LabeledExtract`; `kem_context = enc ‖
-   pkRm ‖ pkSm`) — **byte-exact against A.1.3/A.1.4 (X25519) and
-   A.3.3/A.3.4 (P-256)** since 2026-07-28 (item 11); the older
-   self-consistency round trips are kept for the property the vectors
-   cannot express (a WRONG `pkS` must diverge).
-9. ✅ **A.2 (`ChaCha20Poly1305`) end-to-end** — Encap/Decap +
-   keySchedule (Nk=32) + seq-0 Seal reproduce `kat_rfc9180.a2`'s
-   `shared_secret`/`key`/`base_nonce`/`exporter_secret`/`seq0_ct`.
-10. ✅ **`psk`/`auth_psk` PSK-mode KAT** — closed by item 11 (was: "no
-    Appendix A PSK-mode vector embedded; fetch §A.x.2 before relying on
-    psk/auth_psk modes").
-
-## Done-record — non-base-mode anchoring pass (2026-07-28)
-
-11. ✅ **RFC 9180 A.1.2/A.1.3/A.1.4 + A.3.2/A.3.3/A.3.4 embedded and driven
-    end-to-end** (`kat_rfc9180.zig`'s `a1_psk`/`a1_auth`/`a1_auth_psk`/
-    `a3_psk`/`a3_auth`/`a3_auth_psk` + the generic `driveVector` harness),
-    closing the module's last unanchored surface. Every stage is compared
-    against the RFC's own published value, never against a re-derivation:
-    `DeriveKeyPair(ikmE/ikmR/ikmS)` → `skEm`/`pkEm`, `skRm`/`pkRm`,
-    `skSm`/`pkSm`; `Encap`/`AuthEncap` → `enc` + `shared_secret` and
-    `Decap`/`AuthDecap` back; `key_schedule_context` reassembled from the
-    §4 primitives (checked SEPARATELY from `keySchedule`, so a wrong mode
-    byte or `psk_id_hash` names its own stage instead of surfacing as an
-    opaque wrong `key`); `keySchedule` → `key`/`base_nonce`/
-    `exporter_secret`; every published `(seq, pt, aad, ct)` tuple sealed
-    AND opened; every published exported value. Side effects worth noting:
-    A.3.2–A.3.4 publish `ikmE`/`ikmR`/`ikmS`, so **`P256Kem.deriveKeyPair`'s
-    §7.1.3 rejection-sampling loop now has an RFC anchor too** (A.3.1's base
-    header publishes no `ikm` fields, which is why it previously had only a
-    self-consistency test). Each assertion stage was mutation-checked —
-    corrupting one byte of `ikmS`, `key_schedule_context`, `shared_secret`,
-    a `ct` or an `exported_value` each turns the suite red, so no stage is
-    vacuous.
-12. ✅ **§6.1 single-shot wrappers for the three non-base modes** —
-    `sealPsk`/`openPsk`, `sealAuth`/`openAuth`, `sealAuthPsk`/`openAuthPsk`
-    (+ `*Deterministic` KAT seams), mirroring `sealBase`/`openBase`'s shape
-    and inferred error set exactly. All four modes now share ONE
-    key-schedule-and-seal body (`sealEncapped`/`openDecapped`) instead of a
-    per-mode copy — a per-mode copy is exactly where a `mode` or a `psk`
-    argument silently goes missing, and such an omission still round-trips.
-    KAT: A.1.2/A.1.3/A.1.4 and A.3.2/A.3.3/A.3.4 `enc` + first ciphertext
-    through the one-call path.
-13. ✅ **§5.1.2 PSK-length floor** (`KeyScheduleError.PskTooShort`) — see
-    "Modes covered" above for the MUST-vs-SHOULD reasoning and why the
-    floor sits at exactly `Nh`.
-
-## Done-record — §5.1 setup layer for `mls` (2026-07-29)
-
-14. ✅ **`setupBaseS`/`setupBaseR` + `setupPskS`/`setupPskR` +
-    `setupAuthS`/`setupAuthR` + `setupAuthPskS`/`setupAuthPskR`** — see
-    "Setup layer" above. `Context` and `keySchedule` were ALREADY public
-    (re-exported at `hpke.Context`/`hpke.keySchedule`) and already
-    KAT-driven directly against every mode's exported values (item 11);
-    what was missing was purely the Encap/Decap+KeySchedule convenience
-    composition RFC 9180 §5.1 itself names, one layer below §6.1's
-    single-shot wrappers. `sealEncapped`/`openDecapped` (the single-shot
-    wrappers' shared body) were refactored to compose over the new
-    `setupEncapped`/`setupDecapped` helpers — behavior-preserving, verified
-    by the full existing `zig build test-hpke` suite staying green
-    unchanged. `modules/mls`'s `test-mls` also verified green (its only
-    consumption of this module, `sealBase`/`openBase` in `crypto.zig`, is
-    untouched).
-
-## Done-record — HKDF-SHA384/SHA512 key-schedule KDF (2026-08-05)
-
-15. ✅ **The outer key-schedule KDF is `Nh`-dispatched, not hard-wired to
-    HKDF-SHA256.** Before this pass, `schedule.keySchedule`/
-    `Context.exportSecret` called `std.crypto.kdf.hkdf.HkdfSha256` directly
-    (a `comptime std.debug.assert(Nh == HkdfSha256.prk_length)` enforced
-    the only value `Nh` could legally be), even though `suite.zig`'s
-    `labeledExtract`/`labeledExpand` were ALREADY generic over any
-    `Hkdf(Hmac)` instantiation — the hardcoding was one layer up, in
-    `schedule.zig`. `schedule.KdfOf(Nh)` (public) now maps `Nh` — already
-    threaded through every `Context`/`keySchedule`/`setup*`/`seal*`/`open*`
-    signature, originally just for buffer sizing — to HKDF-SHA256 (32),
-    HKDF-SHA384 (48, built from `std.crypto.kdf.hkdf.Hkdf` over
-    `std.crypto.auth.hmac.sha2.HmacSha384`, since `std` names no
-    `HkdfSha384` alias the way it does the other two), or HKDF-SHA512 (64);
-    `kdfIdOf(Nh)` (private, next to `aeadIdOf`) supplies the matching
-    `suite_id` byte so `suiteIdOf` embeds the RIGHT `kdf_id` per `Nh`
-    instead of always `hkdf_sha256`. **No public signature changed** — an
-    existing caller passing `Nh=32` (every caller before this pass,
-    including `modules/mls`'s `sealBase`/`openBase` calls) gets the
-    byte-identical HKDF-SHA256 path; the existing A.1/A.1.2/A.1.3/A.1.4/
-    A.2/A.3/A.3.2/A.3.3/A.3.4 vectors all still pass unchanged (the
-    regression net for this refactor).
-    A DHKEM's OWN internal KDF (`dhkem.zig`'s `ExtractAndExpand`) is
-    UNTOUCHED and deliberately so — RFC 9180 §7.1 Table 2 fixes it per
-    `kem_id`, a separate choice from the ciphersuite's `kdf_id` this item
-    widens (§4.1 vs §7.2/§7.2.1). KAT: RFC 9180 Appendix A.4 (`DHKEM(P-256,
-    HKDF-SHA256), HKDF-SHA512, AES-128-GCM`) — `kat_rfc9180.zig`'s `a4` —
-    is the first vector this module drives with `Nh` != 32: DHKEM
-    Encap/Decap reproduce the published `enc`/`shared_secret` (still 32
-    bytes, the KEM's `Nsecret`, UNCHANGED by the outer `kdf_id`),
-    `key_schedule_context`/`secret` reproduced via
-    `suite.labeledExtract(schedule.KdfOf(64), ...)` directly (checked
-    separately from `keySchedule`, the same "own stage" discipline item 11
-    used), `schedule.keySchedule(Aead, 64, ...)` reproduces
-    `key`/`base_nonce`/`exporter_secret` (all 64-byte `Nh`-width, except
-    `key`/`base_nonce` which are AEAD/nonce-width as always), all 6
-    published `(seq, pt, aad, ct)` tuples sealed AND opened through the
-    real `Context(Aead, 64)`, and `sealBaseDeterministic`/`openBase`
-    (the §6.1 single-shot pair, exercising `suiteIdOf`'s `Nh`-dispatch too)
-    reproduce `enc` + the first ciphertext end-to-end. A.4's vector was
-    extracted from a local (no network fetch) copy of the RFC's own
-    published `test-vectors.json`, bundled as Go's standard-library HPKE
-    test fixture (`crypto/internal/hpke/testdata/rfc9180-vectors.json`) —
-    present in this machine's Go module cache — not authored by this repo
-    and not derived from this module's own output; A.4 does not carry an
-    exported-value (§A.4.1.2) vector in that source, so `Context.
-    exportSecret`'s HKDF-SHA512 path (`Context.exportSecret` itself is
-    UNCHANGED code, already covered mechanically by `KdfOf`) has no
-    byte-exact anchor for `Nh`=64 specifically — an honest narrower claim
-    than every other vector in this file. Mutation-checked: temporarily
-    mapping `kdfIdOf(64)` to `hkdf_sha384`'s id instead of `hkdf_sha512`'s
-    compiles fine (the bug is a wrong CONSTANT, not a type/width error) and
-    turns the A.4 `sealBaseDeterministic`/`openBase` KAT red — confirming
-    `suiteIdOf`'s `Nh`-dispatch is load-bearing, not vacuous.
-    HKDF-SHA384 (`Nh`=48) has no dedicated RFC 9180 Appendix A vector to
-    anchor against (no Appendix A section pairs an HKDF-SHA384 key
-    schedule with a KEM this module instantiates) — its correctness rests
-    on `KdfOf(48)` being the identical `Hkdf(Hmac)` composition `KdfOf(32)`/
-    `KdfOf(64)` already use, over `std.crypto.auth.hmac.sha2.HmacSha384`
-    (std's own HMAC-SHA384, itself not this module's code), not a
-    hand-rolled HKDF variant; there is no independent-of-this-module
-    anchor for it, a real (if narrow) coverage gap flagged here rather
-    than silently left implicit.
-
-## Done-record — DHKEM(P-384, HKDF-SHA384) (2026-08-06)
-
-16. ✅ **`dhkem.P384Kem`** — a third DHKEM, `kem_id` 0x0011 (RFC 9180 §7.1
-    Table 2), structurally identical to `P256Kem`: `Npk`=97 (SEC1
-    uncompressed `0x04 || X(48) || Y(48)`), `Nsk`=48, `Nsecret`=48, the same
-    x-coordinate-only ECDH (`fromSec1(pk).mul(sk,.big).affineCoordinates().
-    x.toBytes(.big)`), the same §7.1.3 rejection-sampling `deriveKeyPair`
-    loop (`bitmask`=0xFF — P-384's 384-bit order needs no narrowing, same
-    reasoning as P-256, unlike P-521's 0x01), and the same `AuthEncap`/
-    `AuthDecap` `dh || dh2` fold. The one real difference: DHKEM(P-384, …)'s
-    OWN internal KDF (RFC 9180 §7.1 Table 2) is HKDF-SHA384, not
-    HKDF-SHA256 — the first KEM this module instantiates where that's true
-    — so `dhkem.zig`'s shared `extractAndExpand` helper (previously
-    hardcoded to `HkdfSha256`, correct for both prior KEMs) is now
-    parameterized on the `Hkdf` type, with `X25519Kem`/`P256Kem` passing
-    `HkdfSha256` explicitly at every call site and `P384Kem` passing a
-    locally-built `Hkdf(HmacSha384)` (the same composition
-    `schedule.KdfOf(48)` already uses for the OUTER key schedule — a
-    coincidence of both landing on `Nh`=48, not a code-sharing shortcut:
-    `dhkem.zig` does not import `schedule.zig`, since a DHKEM's own KDF and
-    the outer key-schedule KDF are RFC 9180's own separate choices, the
-    same discipline `schedule.zig`'s module doc comment already states for
-    the reverse direction). `P384Kem`'s curve group is
-    `std.crypto.ecc.P384` directly, not a new local perf-specialized
-    module the way `p256` is for P-256 — `p256`'s README states its
-    reason for existing is a measured perf gap on named hot paths (P2
-    HTTPS-API JWT/TLS, 2FA/WebAuthn, `spake2plus`); nothing currently
-    calls `hpke`'s P-384 path on such a path, so building on std directly
-    (this repo's default posture) is the correct call here, not a
-    corner cut.
-    **No RFC 9180 Appendix A vector exists for DHKEM(P-384, HKDF-SHA384)
-    at all.** This was checked, not assumed: (a) this module's own record
-    of Appendix A's contents (done-record item 15 and "Verification
-    status" §3 below, both written from an earlier faithful pass over the
-    RFC) already enumerates every section — A.1/A.2 (X25519), A.3/A.4/A.5
-    (P-256), A.6 (P-521), A.7 (export-only) — and none is P-384; (b) the
-    offline `rfc9180-vectors.json` fixture bundled with the Go standard
-    library's `crypto/internal/hpke` package (the same local, no-network
-    source A.4 was extracted from, present in this machine's Go module
-    cache under multiple toolchain versions) contains exactly 6 entries —
-    X25519+AES128GCM, X25519+ChaCha, P256+AES128GCM, P256+SHA512+AES128GCM,
-    P256+ChaCha, P521+SHA512+AES256GCM — and P-384 is not among them
-    either. Go's own HPKE implementation supports P-384 curve arithmetic
-    elsewhere (`crypto/ecdh`) yet chose not to include an HPKE P-384 test
-    case, consistent with there being no RFC vector to draw one from. A
-    wider local search (this machine's Go module cache across many
-    toolchain versions, a bundled BoringSSL reference inside the Flutter
-    engine checkout — build files only, no source present locally — this
-    repo's own `audit/` notes, and the installed wolfSSL headers) turned
-    up no P-384 HPKE vector anywhere on this machine, and no network
-    fetch was available or used to look further. Per this repo's own
-    convention (do not self-generate a vector and present it as an
-    anchor — see done-record item 15's A.4-export-value gap and the
-    module's history of a previously-reverted self-generated "anchor"),
-    `P384Kem` is instead anchored the same way `P256Kem`'s own
-    non-KAT-covered surfaces already are: RFC 9180 §7.1 Table 2's
-    definitional `Npk`/`Nsk`/`Nsecret` widths and `kem_id` (type-width
-    test), a pure-math `basePoint.mul`+`toUncompressedSec1` smoke test
-    (scalar=1 → the curve's own basePoint), self-consistency round trips
-    for `Encap`/`Decap`, `AuthEncap`/`AuthDecap` (including the
-    wrong-`pkS`-diverges property) and `deriveKeyPair` (determinism,
-    distinctness, on-curve, Encap/Decap round trip through a derived key),
-    malformed-SEC1 rejection (`error.DeserializeError`), and fuzz coverage
-    of `decap`/`authDecap` against arbitrary attacker-controlled bytes
-    (`fuzzedSec1Bytes` generalized from `P256Kem`'s fuzz harness to a
-    comptime-`N` helper so both KEMs' fuzzers share one biasing recipe).
-    This is an honest, narrower claim than every A.1/A.2/A.3/A.4-anchored
-    surface in this file: round-trip and structural tests cannot catch a
-    misreading the sender and recipient share (see "Modes covered" above
-    on why that matters), so `P384Kem`'s `AuthEncap`/`AuthDecap` fold in
-    particular rests on being byte-for-byte the same recipe as the
-    RFC-anchored `X25519Kem`/`P256Kem` folds, not an independent external
-    check. Regression: the pre-existing A.1/A.1.2/A.1.3/A.1.4/A.2/A.3/
-    A.3.2/A.3.3/A.3.4/A.4 vectors were re-run unchanged after this work —
-    all still pass byte-exact — and `modules/mls`'s `test-mls` (the only
-    downstream consumer) stays green.
-    Teeth (replayed independently): temporarily changing `P384Kem`'s
-    `kem_id` inside `extractAndExpand`'s `suite_id` construction (i.e. the
-    KEM-context domain separator, analogous to done-record item 15's
-    `kdfIdOf` mutation) breaks the `Encap`/`Decap` round trip test — a
-    sender and receiver computing `kemSuiteId` from two different `kem_id`
-    constants derive two different `eae_prk`s and disagree on
-    `shared_secret`, so the mismatch is caught even without an external
-    vector. Exit 1 mutated, exit 0 restored — see this repo's task record
-    for the exact line and both exit codes.
-
-    ⚠ **Corrected 2026-08-11 (re-audit).** The paragraph above used to be
-    the whole teeth story, and it was not enough. The list of anchors above
-    leaves ONE parameter unpinned: the KEM's own internal KDF. The
-    type-width test asserts `HkdfSha384.prk_length == 48` and
-    `P384Kem.Nsecret == 48`, but the first is a property of the *alias* and
-    the second is a separately-declared constant that `extractAndExpand`
-    takes as its own comptime parameter — `labeledExpand` expands to
-    whatever length it is asked for. So swapping `P384Kem`'s four
-    `extractAndExpand(HkdfSha384, …)` call sites to `HkdfSha256` (and,
-    separately, to HKDF-SHA512) left the ENTIRE suite at **exit 0** — a
-    module wire-incompatible with every other HPKE implementation, with
-    every round trip still agreeing with itself. `dhkem.zig` now carries a
-    discriminating test ("shared_secret matches an independent labeled-HKDF
-    derivation") that recomputes `shared_secret` via std's one-shot
-    `Hkdf.extract`/`.expand` over hand-concatenated labeled buffers instead
-    of `suite.labeledExtract`'s streaming HMAC; the same SHA-256 mutation is
-    now **exit 1**, clean tree **exit 0**.
-
-## Post-quantum KEMs, one-stage KDFs, export-only (2026-10-31)
+## Post-quantum KEMs, one-stage KDFs, export-only
 
 draft-ietf-hpke-pq and draft-ietf-hpke-hpke §4.4/§5.1, as Go 1.26 `crypto/hpke` implements them
 (construction ported from its `pq.go`/`kdf.go`/`hpke.go`, BSD-3-Clause, NOTICE).
@@ -649,29 +320,24 @@ draft-ietf-hpke-pq and draft-ietf-hpke-hpke §4.4/§5.1, as Go 1.26 `crypto/hpke
   ciphertext decapsulates to FIPS 203's implicit-rejection secret and fails at the AEAD.
 - **Export-only** (`hpke.ExportOnly`, aead_id 0xFFFF): Nk = Nn = 0, the key schedule skips
   key/base_nonce, `seal`/`open` are compile errors.
-- **ML-KEM is the `mlkem` module's** (since 2026-11-01; byte-identical to std's `std.crypto.kem.ml_kem`
-  it replaced); its constant-time behaviour is that module's. Re-measured on `mlkem` by full CI
-  41323098008 (2026-11-01): std's FO verdict context (`ml_kem.zig:1429`) is gone, `mlkem`
-  declassifies its own verdict, so every ML-KEM row lost exactly that one context. Curves as for the DHKEMs: X25519 `ct25519` (since 2026-11-01), P-256
-  `p256`, P-384 `p384` (since 2026-10-31 for the DHKEM too).
-  Machine-checked (`scripts/checks/ctgrind.sh hpke`, ReleaseFast, `src/ctgrind_harness.zig`;
-  pinned in `scripts/checks/ctgrind-expected.tsv`): `mlkem768_decap` 0, `mlkem1024_decap` 0,
-  `xwing_decap` 0, `mlkem768_p256_decap` 1, `mlkem1024_p384_decap` 0, `onestage` 0, with the seed,
-  the expanded private state and the hybrids' curve scalar tainted. Every
-  nonzero context is std's or a sibling module's, none in `pq.zig`/`kdf.zig`/`schedule.zig`: until
-  the `mlkem` switch the ML-KEM FO verdict (`ml_kem.zig:1429` `ctneq`, 1 in each row), and for the
-  curve halves the same single context as the DHKEM rows (X-Wing: none since 2026-11-01 — on `ct25519` the identity check is constant time, std's `curve25519.zig:77` `isZero` context went with the switch, as in `x25519_decap` 1 → 0 and `x25519_authdecap` 2 → 0;
-  MLKEM768-P256: `p256` `group.zig:567` `mulCtWindowed`; MLKEM1024-P384: 0, the `p384` module
-  declassifies). `onestage` taints the shared secret through `setup`'s SHAKE256 `labeledDerive`
-  (key, base_nonce, exporter secret): 0 in-file. The DHKEM P-384 rows are 0 since the move to
-  `p384` (were 2 / 4 in std's code).
+- **ML-KEM is the `mlkem` module's** (byte-identical to std's `std.crypto.kem.ml_kem`);
+  its constant-time behaviour is that module's. Curves as for the DHKEMs: X25519 from
+  `ct25519`, P-256 from `p256`, P-384 from `p384`. Machine-checked
+  (`scripts/checks/ctgrind.sh hpke`, ReleaseFast, `src/ctgrind_harness.zig`; the pinned
+  counts and the attribution of every nonzero context are in
+  `scripts/checks/ctgrind-expected.tsv`): rows `mlkem768_decap`, `mlkem1024_decap`,
+  `xwing_decap`, `mlkem768_p256_decap`, `mlkem1024_p384_decap` and `onestage`, with the
+  seed, the expanded private state and the hybrids' curve scalar tainted. A nonzero
+  context in a pq row belongs to a sibling module (MLKEM768-P256: `p256`'s windowed
+  multiply), none to `pq.zig`/`kdf.zig`/`schedule.zig`. `onestage` taints the shared
+  secret through `setup`'s SHAKE256 `labeledDerive` (key, base_nonce, exporter secret).
 - **Burns:** `pq_burn_768` 88 KiB, `pq_burn_1024` 132 KiB per entry point, 1.5x the deepest
-  unburned ReleaseFast depth measured by `stackprobe_test.zig` (2026-10-31): key generation
+  unburned ReleaseFast depth measured by `stackprobe_test.zig`: key generation
   (`fromSeed`/`deriveKeyPair`) 57.8-59.0 KiB for the 768 family and 86.1-87.1 KiB for the 1024
   one; `encapDeterministic` and `decap` are 15-25 KiB shallower. Probes cover `fromSeed`,
   `deriveKeyPair`, `encapDeterministic` and `decap` of ML-KEM-768/1024, X-Wing, MLKEM768-P256,
   MLKEM1024-P384, and `setupBaseR` over X-Wing + SHAKE256.
-- **Fuzzing (2026-10-31, `fuzz_test.zig`, `HPKE_FUZZ`, harnesses `hpke-pq-kem` and
+- **Fuzzing (`fuzz_test.zig`, `HPKE_FUZZ`, harnesses `hpke-pq-kem` and
   `hpke-pq-kdf`):** per run one of the six pq KEMs: a genuine `setupBaseS`/`setupBaseR` pair
   agrees; a damaged `enc` (random octets, a flipped bit in the ML-KEM or the curve part, a zero
   curve half, a SEC1 form byte, the masked top bit of X-Wing's u-coordinate) is refused
@@ -681,10 +347,8 @@ draft-ietf-hpke-pq and draft-ietf-hpke-hpke §4.4/§5.1, as Go 1.26 `crypto/hpke
   TurboSHAKE128/256, over ChaCha20-Poly1305 and export-only): psk/psk_id/info and export
   lengths around 65,535 give `LabelTooLong` on both sides, otherwise both sides agree and equal an
   independent restatement of `CombineSecrets_OneStage`/`Export` driven straight through the XOF.
-  Every outcome carries a reach label (in-suite 24/60-seed check); 8 planted mutants (hybrid
-  combiner without ct_T, psk/info length prefix dropped, ML-KEM key canonicity check skipped,
-  one-stage `L`/psk bounds dropped, receiver binding the wrong ek_T, export label changed) are
-  all caught; 100,000 runs per harness clean at ~550 runs/s per core.
+  Every outcome carries a reach label, checked in-suite over 24 (pq KEMs) and 60 (one-stage
+  KDFs) seeds.
 
 **Anchor:** Go 1.26.8's `crypto/hpke/testdata` (`src/testdata/go_vectors.zig`, regenerated by
 `tools/gen_go_vectors.py`; sha256 of both inputs in its header): `hpke-pq.json`'s 12 non-X448
@@ -692,186 +356,17 @@ vectors (every intermediate: derived key pair, enc, key, base_nonce, exporter_se
 encryptions, five exports) and `rfc9180.json`'s 24 (X25519/P-256/P-521 × HKDF-SHA256/512 × the
 three AEADs and export-only, as SHAKE128 digests over 1000 seal/open and 1000 exports of length
 0..999), all through `setupBaseS`/`setupBaseR`, `Context.seal`/`open`/`exportSecret` and the
-single-shot pair. Probe: corrupting the hybrid combiner's label fails the first hybrid vector
-(0x0050), 2026-10-31.
+single-shot pair.
 
-## Performance — `bench-hpke` (2026-10-31)
-
-`zig build bench-hpke` (`tools/bench.zig` driving `tools/go_bench/main.go`, Go stdlib only):
-an interop check first (Go opens ours and we open Go's, all 11 suites), then each row on both
-sides, ns per op, ReleaseFast, `BENCH_ROUNDS=5`, Intel Core i7-7920HQ (Kaby Lake), Linux 7.0,
-Zig 0.17.0, Go 1.26.8. Load from other sessions: largest spread 17.8 %, the card's worst row is
-1.00× so the P2 margin (1.1×) holds. Keygen differs in method: ours runs the RFC's
-DeriveKeyPair on a random seed, Go draws the scalar directly. Go's `Seal` allocates its output,
-ours writes into the caller's buffer. The fastest-in-field column is not measured yet
-(candidates: rozbb/rust-hpke, Apache-2.0 OR MIT, every suite; cloudflare/circl, BSD-3).
-
-```
-bench-hpke: building the Go side ...
-bench-hpke: interop OK (Go opens ours and we open Go's, 11 suites)
-workload               ours ns      ref ns      alt ns    /ref   /fast spr us spr rf spr al  count
-x25519_keygen            49045       55413           0   0.885   0.885   5.3%   1.7%   0.0%  32
-x25519_setupS           106938      120954           0   0.884   0.884   2.5%  12.0%   0.0%  32
-x25519_setupR            58168       66982           0   0.868   0.868   2.1%   2.9%   0.0%  1
-x25519_seal64               88         185           0   0.477   0.477   0.9%   5.2%   0.0%  80
-x25519_open64               89         179           0   0.497   0.497   4.7%   7.9%   0.0%  64
-x25519_seal16k            3137        5288           0   0.593   0.593   0.6%  12.8%   0.0%  16400
-x25519_open16k            3256        5358           0   0.608   0.608   2.8%   7.4%   0.0%  16384
-p256_keygen              15030       15027           0   1.000   1.000   2.6%   2.8%   0.0%  65
-p256_setupS              77490       88025           0   0.880   0.880   2.4%   0.8%   0.0%  65
-p256_setupR              62465       73364           0   0.851   0.851   2.2%   2.7%   0.0%  1
-p256_seal64                 88         190           0   0.465   0.465   3.0%  17.8%   0.0%  80
-p256_open64                 85         172           0   0.493   0.493   5.4%  12.0%   0.0%  64
-p256_seal16k              3097        5177           0   0.598   0.598   1.5%   3.6%   0.0%  16400
-p256_open16k              3278        5427           0   0.604   0.604   8.8%   4.6%   0.0%  16384
-p384_keygen              70086      166695           0   0.420   0.420   4.0%   1.9%   0.0%  97
-p384_setupS             324731      730474           0   0.445   0.445   1.2%   3.8%   0.0%  97
-p384_setupR             251937      568002           0   0.444   0.444   1.4%   1.6%   0.0%  1
-p384_seal64                 88         194           0   0.452   0.452   1.2%   3.9%   0.0%  80
-p384_open64                 88         177           0   0.496   0.496   1.8%  11.3%   0.0%  64
-p384_seal16k              3109        5425           0   0.573   0.573   1.2%   2.4%   0.0%  16400
-p384_open16k              3280        5580           0   0.588   0.588   3.5%   4.9%   0.0%  16384
-p521_keygen             338552      486838           0   0.695   0.695   1.6%   2.0%   0.0%  133
-p521_setupS             680944     2219988           0   0.307   0.307   2.2%   1.7%   0.0%  133
-p521_setupR             348461     1763905           0   0.198   0.198   1.4%   1.7%   0.0%  1
-p521_seal64                 88         190           0   0.461   0.461   1.3%   6.0%   0.0%  80
-p521_open64                 87         178           0   0.489   0.489   1.8%   3.5%   0.0%  64
-p521_seal16k              3114        5645           0   0.552   0.552   1.6%   4.8%   0.0%  16400
-p521_open16k              3309        5511           0   0.600   0.600   2.8%   6.0%   0.0%  16384
-x25519cc_seal16k          8122       10555           0   0.769   0.769   1.4%   8.6%   0.0%  16400
-x25519cc_export           1190        1424           0   0.836   0.836   1.7%   6.6%   0.0%  32
-mlkem768_keygen          43532       68990           0   0.631   0.631   1.4%  10.2%   0.0%  1184
-mlkem768_setupS          54249       58434           0   0.928   0.928  13.1%  16.5%   0.0%  1088
-mlkem768_setupR          45762       81495           0   0.562   0.562   2.9%   2.1%   0.0%  1
-mlkem1024_keygen         69681      106707           0   0.653   0.653   0.9%  17.6%   0.0%  1568
-mlkem1024_setupS         77582       84612           0   0.917   0.917   2.5%   2.0%   0.0%  1568
-mlkem1024_setupR         60203      123680           0   0.487   0.487   2.5%   2.0%   0.0%  1
-xwing_keygen             90990      125095           0   0.727   0.727   2.0%   8.0%   0.0%  1216
-xwing_setupS            148878      169135           0   0.880   0.880   2.5%   2.2%   0.0%  1120
-xwing_setupR             94015      137568           0   0.683   0.683   1.8%   1.2%   0.0%  1
-mlkem768p256_keygen       56628       85499           0   0.662   0.662   1.3%  10.3%   0.0%  1249
-mlkem768p256_setupS      116431      131672           0   0.884   0.884   3.0%   2.7%   0.0%  1153
-mlkem768p256_setupR       96108      140366           0   0.685   0.685   1.9%   1.9%   0.0%  1
-mlkem1024p384_keygen      133412      270180           0   0.494   0.494   2.3%   2.6%   0.0%  1665
-mlkem1024p384_setupS      377058      792600           0   0.476   0.476   4.4%   6.0%   0.0%  1665
-mlkem1024p384_setupR      291822      658767           0   0.443   0.443   4.3%   4.4%   0.0%  1
-xwingshake_keygen        89677      122722           0   0.731   0.731  11.8%   2.1%   0.0%  1216
-xwingshake_setupS       143485      160616           0   0.893   0.893   2.2%   4.2%   0.0%  1120
-xwingshake_setupR        86855      129164           0   0.672   0.672   2.8%   1.6%   0.0%  1
-xwingshake_seal64           87         187           0   0.467   0.467   7.8%   4.0%   0.0%  80
-rounds: 5; ratios by wall time; largest spread 17.8% (OVER 5 %: noisy run, repeat)
-reference: Go crypto/hpke, go1.26.8
-worst ours/Go = 1.000 (best 0.198)
-card: **Performance:** ref 0.20–1.00× Go crypto/hpke (Go <version>) · fastest ? (measured <today>)
-```
-
-## Audit (2026-10-31)
-
-- **Blind review** (independent, read-only, of the pq/kdf/schedule/dhkem diff): 0 HIGH, 2 MED,
-  9 LOW. MED-1/MED-2: the lazily expanded AES key could run on a garbage state (a `Context`
-  built from `undefined`) or a stale one (`key` rewritten after use) → `aead_key` compared in
-  constant time on every message, re-expanded on a mismatch (tests in `sweep_test.zig`, each
-  shown to fail without the compare). LOW-1: a plaintext past the AEAD's limit reached the
-  AEAD's panic → `InvalidLength`. Others kept with reasons (probability-2^-128 panics not
-  reachable by data, nonce not secret, burn sizes documented). No spec deviation, no API
-  regression for mls / tlsserver / dtls.
-- **Mutation** (schemata, 139 mutants over suite/kdf/pq/schedule/dhkem, unfiltered suite):
-  111 killed by the existing tests, 14 more by eight new tests (`src/mutation_test.zig`:
-  exact boundaries 512 / 65535 / 65536, max_message_len, `out` zeroed on pq error paths,
-  hybrid candidate skipping, undecodable ek_T/ct_T, zero ephemeral scalar), 14 argued
-  equivalent (9 by invariant: u16 cast under 255·Nh, a valid scalar times a non-identity point
-  of a prime-order group, the eager vs lazy expansion giving the same bytes, a zero-length
-  expand, X25519 dh2; 5 by probability ≤ 2^-32 or a 64 GiB input). No bug leads.
-
-**`keyPairFromSecret` delta mutation (2026-11-17).** 13 mutants over the four
-new bodies, one per guard and class: the X25519 public key and stored secret;
-for each NIST curve, the range check dropped, the zero check dropped and the
-stored secret replaced; for P-384/P-521, the little-endian reversal skipped.
-Result 13/13 killed, 0 equivalent. The two P-256 guard drops are killed by a
-panic (the base-point multiply of `0` or `n` returns the identity), which is
-the reason the guards exist.
-
-**`validatePublicKey` delta mutation (2026-11-17).** 3 mutants, one per
-curve, each skipping the decode (every key accepted): 3/3 killed by
-`validatePublicKey: P-256/384/521 ...` (ReleaseSafe schemata, kit runner).
-The card now carries both deltas on top of the 2026-11-01 run, cumulatively:
-17/21 + 13/13 + 3/3 = 33/37, 4 equivalent; they cover every source change
-since its hash (`keyPairFromSecret`, `validatePublicKey`).
-
-## Performance work (2026-10-31)
-
-- `Context` keeps the AEAD with its key expanded (`aesgcm.Context`, set on the first
-  seal/open), and the per-message burn is 2 KiB (`msg_burn`, 1.1 KiB measured) instead of the
-  8 KiB `aead_burn` around an `Aead.encrypt` that expanded the key and burned 4 KiB itself:
-  a 64-byte seal was 1.7–1.9× Go. `chachapoly` burns its own message state, so no second burn.
-- DHKEM(P-384) and MLKEM1024-P384 moved from std's P-384 to the `p384` module (fixed-base comb
-  for key generation): keygen was 2.7× Go, setupS 1.24×.
-
-## Verification status
-
-1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests
-   pass, no skip guards. RFC 9180 Appendix A.1's full vector drives
-   DHKEM Encap/Decap/DeriveKeyPair, KeySchedule, all 6 Seal/Open tuples,
-   all 3 exports, and single-shot sealBase/openBase end-to-end through
-   the real implementation; A.2 (ChaCha20Poly1305) and A.3 (P-256)
-   headers byte-exact; and A.1.2/A.1.3/A.1.4 + A.3.2/A.3.3/A.3.4 drive
-   the same full chain for `mode_psk`/`mode_auth`/`mode_auth_psk` over
-   both KEMs. All seven of those vectors are ALSO driven through the
-   `setup*S`/`setup*R` entry points directly (`driveSetupVector` in
-   `kat_rfc9180.zig`) — `enc`, every `Context` field, one Seal/Open round
-   trip, and every published exported value via `Context.exportSecret`
-   called on the `Context` the new API hands back. A.4 (`DHKEM(P-256,
-   HKDF-SHA256), HKDF-SHA512, AES-128-GCM`) drives the same DHKEM
-   Encap/Decap + KeySchedule + all 6 Seal/Open tuples + single-shot
-   sealBase/openBase chain with `Nh`=64 (HKDF-SHA512) instead of 32 — see
-   done-record item 15. `P384Kem` (done-record item 16) is exercised by
-   self-consistency round trips (Encap/Decap, AuthEncap/AuthDecap,
-   DeriveKeyPair) and fuzz coverage, NOT an Appendix A vector — see that
-   item for why none exists.
-2. **Negative-path:** low-order X25519 pkR (`error.DhFailed`), malformed
-   P-256/P-384 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
-   truncated-ct (`error.DecryptionFailed`, `seq` not advanced),
-   wrong-length `out` buffer on `seal`/`open` (`error.InvalidLength`,
-   a real runtime check in every build mode, not a `std.debug.assert`
-   ReleaseFast/ReleaseSmall would compile out — found in the 2026-07-21
-   `zig-hpke` diff audit, `seq` confirmed not advanced), `seq`-ceiling
-   fail-closed (`error.MessageLimitReached` before any AEAD call), all
-   `VerifyPSKInputs` inconsistencies (`error.InconsistentPsk`), the
-   §5.1.2 PSK floor (`error.PskTooShort` at 1/8/16/31 bytes, accepted at
-   exactly 32), and per-mode single-shot rejection (wrong `pkS`, wrong
-   `psk`, wrong `psk_id`, and opening an `auth_psk` ciphertext with
-   `openAuth` or an `auth` ciphertext with `openBase`).
-3. **Open:** three narrow, explicitly-flagged gaps (see done-record items
-   15/16). HKDF-SHA384 (`Nh`=48, the OUTER key-schedule KDF) has no RFC
-   9180 Appendix A vector at all (no section pairs it with a KEM this
-   module instantiates), so it rests on being the same `Hkdf(Hmac)`
-   composition as the other two widths, not an independent anchor. A.4's
-   `Context.exportSecret` output has no byte-exact anchor either (the
-   offline `test-vectors.json` copy this module's A.4 was extracted from
-   carries Setup+Encryptions but not Export). `P384Kem` (DHKEM(P-384,
-   HKDF-SHA384) — the KEM's OWN internal KDF, a separate gap from the
-   outer-KDF one above) has NO RFC 9180 Appendix A vector at all, checked
-   against both this module's own record of the appendix's contents and
-   the offline Go-stdlib `rfc9180-vectors.json` fixture (see done-record
-   item 16); it is anchored by type widths, self-consistency round trips
-   and malformed-input rejection instead. Otherwise, every RFC 9180
-   surface this module implements has an embedded official vector. The
-   Appendix A sections still NOT embedded are A.7+ (export-only AEAD) —
-   A.6 (P-521) is embedded in full since 2026-10-10
-   (`kat_rfc9180_a6.zig`, `tools/gen_rfc9180_a6.py`) — and the
-   `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
-   embedded A.1/A.3/A.4 mode vectors only in the `aead_id`/`kdf_id` bytes
-   of `suite_id` — already covered by their respective base headers.
-
-## Key pair from a private key (2026-11-17)
+## Key pair from a private key
 
 `X25519Kem`/`P256Kem`/`P384Kem`/`P521Kem.keyPairFromSecret(out, sk)` rebuild a
 `KeyPair` from a serialized private key, which is RFC 9180 §7.1.2's
-`DeserializePrivateKey` plus the public half. Before, only X25519 had a way to
-do it (its `KeyPair` is std's, with `generateDeterministic`). The NIST KEMs
-offered only `deriveKeyPair(ikm)` and `generateKeyPair`, so a protocol that
-holds its private keys (MLS: a member's init and leaf keys, the interop
-vectors' `init_priv`/`encryption_priv`) could not use them. `sk` goes in by
+`DeserializePrivateKey` plus the public half. X25519's `KeyPair` is std's, which can also be
+rebuilt from a seed (`generateDeterministic`); the NIST KEMs otherwise offer only
+`deriveKeyPair(ikm)` and `generateKeyPair`, which cannot take a private key from
+elsewhere, so a protocol that holds its private keys (MLS: a member's init and leaf
+keys, the interop vectors' `init_priv`/`encryption_priv`) needs this. `sk` goes in by
 pointer, the pair comes out in `out`, and the body runs under `kem_burn`. The
 NIST curves refuse a scalar outside `[1, n-1]` with `error.DeserializeError`,
 which is the error the KEMs already use for a key that does not deserialize.
@@ -881,10 +376,9 @@ stores `sk` unclamped, exactly as `deriveKeyPair` does. Anchors are in
 (34 keys) and every Go vector's `skRm`/`pkRm` (P-384's only external anchor)
 rebuilds its public key. `deriveKeyPair`'s output round-trips for all four
 KEMs. For each NIST curve, `0`, `n`, `n+1` and all-ones are refused, and `1`
-and `n-1` are accepted. Delta mutation 2026-11-17 over the four bodies: see the
-`keyPairFromSecret` paragraph of the Audit section below.
+and `n-1` are accepted.
 
-## Public-key admission check (2026-11-17)
+## Public-key admission check
 
 `P256Kem`/`P384Kem`/`P521Kem.validatePublicKey(&pk)` refuse a public key that
 `encap` would refuse, with the same `error.DeserializeError`, so a protocol
@@ -906,15 +400,191 @@ curve (y off the curve, `0x02`/`0x00`/`0x06` prefixes, all zeros, x ≥ p,
 y ≥ p), each refused by both `validatePublicKey` and `encapDeterministic`, and
 a real key accepted by both.
 
+## Threat model
+
+- **Nonce reuse under `Context.seal`.** RFC 9180 §5.2 derives each
+  message's AEAD nonce from a per-context `seq` counter — reusing a nonce
+  under the same key (e.g. skipping the `incrementSeq` call, or calling
+  `seal` concurrently on a shared `Context` without external
+  synchronization) breaks AES-GCM/ChaCha20-Poly1305 confidentiality
+  outright (nonce-reuse forgery, a full plaintext-recovery break for
+  GCM). `seal` increments `seq` only after a successful encrypt and
+  before returning — never skipped, and a `seq` that could not be
+  advanced past the message is rejected BEFORE any ciphertext is
+  produced. `Context` has no internal
+  locking (`meta.concurrency = .reentrant`, mirroring `noise.CipherState`
+  and `dtls`'s AEAD state) — a `Context` shared across threads without
+  external synchronization is a caller error, not something this module
+  guards against, matching this repo's no-hidden-locking convention.
+- **Sequence-number overflow.** `incrementSeq`'s fail-closed
+  `error.MessageLimitReached` at `maxInt(u64)` (a conservative sub-limit
+  of RFC 9180's actual `2^(8*Nn)-1` ceiling, see Design above) exists
+  specifically so a long-lived `Context` cannot be driven into nonce
+  reuse by sheer message volume — the caller MUST re-key (a fresh
+  `Encap`/`KeySchedule`) rather than continue, and the type never wraps
+  silently.
+- **KEM low-order/identity-element DH results.** RFC 9180 **§7.1.4**
+  requires rejecting a DH computation that lands on the identity
+  element — verbatim: "senders and recipients MUST ensure the Diffie-Hellman
+  shared secret is not the point at infinity" and "recipients MUST check
+  whether the Diffie-Hellman shared secret is the all-zero value and abort if
+  so". (§7.1.1/§7.1.2 only cover key
+  *serialization* and defer validation to §7.1.4.) That is (X25519's documented all-zero output for a maliciously chosen
+  public key, RFC 7748 §6.1; P-256's point-at-infinity) — silently
+  proceeding would let a peer force a known, attacker-predictable
+  `shared_secret`. Every `Encap`/`Decap`/`AuthEncap`/`AuthDecap` maps
+  the group's identity / low-order rejection (`ct25519`'s X25519 `scalarmult`,
+  the `p256`/`p384` `mul`, `p521.ecdhInto`) to `error.DhFailed`, and
+  the all-zero-pk X25519 case is regression-tested; the NIST KEMs additionally
+  reject malformed SEC1 encodings with `error.DeserializeError` before
+  any scalar multiplication. The pq KEMs refuse a non-canonical ML-KEM
+  encapsulation key or an off-curve point with `DeserializeError`, a low-order
+  X25519 share or the identity with `DhFailed`; a forged ML-KEM ciphertext
+  decapsulates to FIPS 203's implicit-rejection secret and fails at the AEAD.
+- **`auth`/`auth_psk` mode sender-key confusion.** `AuthEncap`/
+  `AuthDecap` bind the SENDER's static key into the shared secret (`dh2 =
+  DH(skS, pkR)` / `DH(skR, pkS)`) specifically so a receiver can be
+  convinced the message came from a specific sender's static keypair —
+  an implementation that accepts `auth` mode but never actually checks
+  `pkS` is bound (e.g. silently falling back to unauthenticated `dh` only)
+  would defeat the entire point of the mode. The signatures
+  (`authEncapDeterministic`/`authDecap` both REQUIRE the extra key
+  parameter, no optional-omit path) make that mistake a type error to
+  attempt, not a runtime silent-downgrade; the binding is
+  regression-tested (a wrong `pkS` decaps to a DIFFERENT shared secret).
+- **`I2OSP`/label-buffer sizing.** `labeledExpand`'s bounded 512-byte
+  scratch buffer returns `error.LabelTooLong` on overflow rather than
+  panicking on caller-supplied `info`/`exporter_context` — an application
+  that (unusually) wants to bind gigabytes of exporter context data gets
+  a typed error, not an aborted process, on attacker-influenced-length
+  input. An export length past 255·`Nh` is `LabelTooLong` too (HKDF-Expand's
+  limit), and every secret output (`out`) is zeroed on every error path.
+- **A hand-built or modified `Context`.** `Context` fields are public so a
+  protocol can transport them; the expanded AEAD key is compared in constant
+  time with `key` on every message and re-expanded on a mismatch, so a stale
+  or garbage key schedule never runs. A used `Context` copied by value carries
+  its own copy of the expanded key: wipe both.
+- **Stack depth.** The burn (`src/burn.zig`) is a real stack array, so a caller on
+  a small thread or coroutine stack must budget it (see *Design & invariants*);
+  this module has no guard-page check.
+- **PSK handling is (almost) entirely the caller's responsibility.** This
+  module never generates, stores, or rotates a PSK — `keySchedule` checks
+  the mode/PSK-presence *shape* (RFC 9180's `VerifyPSKInputs`,
+  `KeyScheduleError.InconsistentPsk`) plus §5.1.2's length floor
+  (`KeyScheduleError.PskTooShort`, see "Modes covered" above), and nothing
+  else: PSK freshness, rotation, storage and the actual ENTROPY of a
+  long-enough PSK are the caller's, mirroring `tlsresume`'s STEK key
+  material never being generated by that module either. A 32-byte counter
+  passes the length floor and is still a catastrophic PSK; the floor
+  removes only the failure mode that is detectable from the bytes.
+- **`auth` mode is not a signature.** `AuthEncap`/`AuthDecap` authenticate
+  the sender to *the specific recipient whose key was used* and to nobody
+  else: the recipient can compute the same `shared_secret` themselves, so
+  they can forge any "auth-mode message from that sender to themselves"
+  and cannot prove one to a third party. RFC 9180 §9.1 also notes DHKEM's
+  key-compromise-impersonation limit — an attacker holding `skR` can craft
+  messages that appear to come from any sender. Applications needing
+  transferable or third-party-verifiable sender authentication need a
+  signature, not `mode_auth`.
+
+## Verification
+
+How to run: `scripts/modtest hpke` (module tests, Debug and ReleaseFast; the
+fuzz drivers and the stack probe run inside it), `zig build interop-hpke`
+(live Go 1.26 `crypto/hpke` as the peer; needs `go`), `zig build bench-hpke`
+(a program, not a test: see *Performance*), `scripts/checks/ctgrind.sh hpke`
+(ReleaseFast, valgrind).
+
+- **Known answers, byte-exact.** RFC 9180 Appendix A (`kat_rfc9180.zig`): A.1
+  (X25519 + AES-128-GCM) in all four modes drives DHKEM Encap/Decap/DeriveKeyPair,
+  the key schedule, every published seal/open tuple (including the seq-skipping
+  ones) and every exported value, through the `keySchedule`, `Context`,
+  `setup*S`/`setup*R` (`driveSetupVector`) and single-shot entry points; A.2
+  (ChaCha20Poly1305, under both `chachapoly` and std's type), A.3 (P-256, all four
+  modes, including `P256Kem.deriveKeyPair`), A.4 (`DHKEM(P-256, HKDF-SHA256)` +
+  HKDF-SHA512, `Nh` = 64); A.6 (P-521, all four modes: `kat_rfc9180_a6.zig`,
+  `tools/gen_rfc9180_a6.py`). `kat_go_test.zig` drives Go 1.26.8's `rfc9180.json`
+  (X25519/P-256/P-521 × HKDF-SHA256/512 × the three AEADs and export-only, as SHAKE128
+  digests over 1000 seal/open rounds and 1000 exports) and `hpke-pq.json` (the pq
+  KEMs, the one-stage KDFs, and the P-384 vector) through the public entry points;
+  its inputs are pinned by sha256 in `src/testdata/go_vectors.zig`
+  (`tools/gen_go_vectors.py`). Go skips ML-KEM-512 and TurboSHAKE, which pass here.
+- **Live differential oracle.** `tools/interop.zig` against Go (`tools/go_oracle/`,
+  standard library only) runs 45 suites (9 KEMs × 5 KDFs, the AEAD rotating) in both
+  directions, compares exports, and requires the same verdict on both sides after one
+  flipped bit in `enc`, ciphertext or `aad`. `src/go_oracle_test.zig` replays the frozen
+  transcript (`go_oracle_vectors.zig`, written by `interop-hpke -- --write`) without Go.
+  This is also the anchor of the HKDF-SHA384 key schedule and of `P384Kem`'s
+  Encap/Decap, which RFC 9180 Appendix A does not cover.
+- **Negative paths.** Low-order X25519 `pkR` (`DhFailed`), malformed NIST SEC1
+  (`DeserializeError`), AEAD tamper / wrong `aad` / truncated ciphertext
+  (`DecryptionFailed`, `seq` not advanced), wrong-length `out` (`InvalidLength`),
+  `seq` ceiling (`MessageLimitReached` before any AEAD call), every
+  `VerifyPSKInputs` inconsistency (`InconsistentPsk`), the §5.1.2 PSK floor
+  (`PskTooShort` at 1/8/16/31 bytes, accepted at exactly 32), and per-mode
+  single-shot rejection (wrong `pkS`, `psk`, `psk_id`, or the wrong `open*`).
+  `keypair_from_secret_test.zig`: every Appendix A and Go vector private key rebuilds
+  its public key, the NIST curves refuse `0`, `n`, `n+1` and all-ones and accept `1`
+  and `n-1`; `validatePublicKey` is tested against `encapDeterministic` on seven bad-key
+  classes per curve (`dhkem.zig`).
+- **Boundary and sweep tests.** `sweep_test.zig` (no-panic sweep: one test per finding)
+  and `mutation_test.zig` (one test per mutant the original suite let survive: exact
+  boundaries 512 / 65535 / 65536, `max_message_len`, `out` zeroed on pq error paths,
+  hybrid candidate skipping, undecodable `ek_T`/`ct_T`, zero ephemeral scalar).
+- **Fuzzing** (deterministic driver, prefix `HPKE_FUZZ`; never `zig build --fuzz`):
+  `hpke-seal-open`, `hpke-p256-decap`, `hpke-p256-auth-decap`, `hpke-p384-decap`,
+  `hpke-p384-auth-decap` (a genuine `enc` agrees with the sender, a damaged one
+  diverges), `hpke-pq-kem` and `hpke-pq-kdf` (see the pq section). Every harness reaches
+  each outcome class (reach labels asserted in-suite).
+- **Secrets on the dead stack.** `stackprobe_test.zig` / `stackprobe2_test.zig`
+  (ReleaseFast): the keys, DH outputs, `eae_prk`, shared secret, key-schedule `secret`,
+  AEAD key, AES round keys, GHASH key and exporter secret are absent from the stack
+  after the DHKEMs, `labeledExtract`/`labeledExpand`, setup, seal/open, export and the
+  pq KEMs and one-stage setup.
+- **Constant time.** `src/ctgrind_harness.zig`: decap and authDecap of every DHKEM,
+  `open` (the AEAD context), every pq decap and the one-stage schedule, ReleaseFast;
+  pinned in `scripts/checks/ctgrind-expected.tsv` (the file attributes every nonzero
+  context to a sibling module's code).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
+- **Open:** one-stage `psk` mode has no published vector (*Backlog / deferred*).
+  Every other surface this module implements has an external vector or the live oracle.
+
+## Performance
+
+`zig build bench-hpke` (`tools/bench.zig`, driving `tools/go_bench/main.go` for the Go
+reference and `tools/c_bench/foreign_bench.c` for OpenSSL 3.5 `OSSL_HPKE`, ReleaseFast): an
+interop check first (Go opens ours and we open Go's, every suite), then per suite
+keygen, setupS, setupR, seal/open of 64 B and 16 KiB and export, on both sides with
+alternating rounds (`BENCH_ROUNDS`). Suites: x25519, p256, p384, p521, x25519cc
+(ChaCha20Poly1305), then the pq KEMs (keygen/setupS/setupR) and xwingshake. Go's
+`Seal` allocates its output, ours writes into the caller's buffer; keygen differs
+in method (ours runs DeriveKeyPair on a random seed, Go draws the scalar). `-- --vs=awslc`
+times the two X25519 suites against AWS-LC's `EVP_HPKE` (`tools/rust_bench`) instead, the
+only HPKE KEM it has. OpenSSL 3.5.5 has no HPKE for the pq KEMs, so those rows have no
+`fastest` ratio. rozbb/rust-hpke is not measured. The card's `**Performance:**` line
+is the authoritative figure set.
+
+## What is deliberately not done
+
+- **No `auth`/`auth_psk` mode for the pq and hybrid KEMs.** There is no `AuthEncap` for a
+  KEM that is not a DH; the draft defines none. The auth modes are a compile error over
+  them (base and psk only).
+- **No `validatePublicKey` for X25519.** RFC 9180 §7.1.4 needs no public-key validation there
+  (the all-zero DH check runs at `encap`), and Go accepts every 32-byte string. A protocol
+  that wants the low-order points refused at admission checks them itself, as `mls` does.
+- **No sequence counter beyond `u64`.** RFC 9180's `seq` runs to `2^(8·Nn)-1`; this module
+  fails closed at `maxInt(u64)` (`MessageLimitReached`): a conservative sub-range.
+- **No internal locking of a `Context`**, per the repo's no-hidden-locking convention.
+- **`ExportOnly` has no `seal`/`open`** (a compile error), as RFC 9180 §7.3 defines it.
+- **No runtime-agile `NewKEM`/`NewKDF`/`NewAEAD`**: suites are comptime types; see
+  *Backlog / deferred* for what a consumer that negotiates a suite does.
+
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- **Done 2026-10-31:** post-quantum and hybrid KEMs, SHAKE/TurboSHAKE one-stage KDFs, the `export_only` suite (formerly three Backlog items; see "Post-quantum KEMs, one-stage KDFs, export-only").
-- **Done 2026-11-17:** public-key admission check for the NIST DHKEMs (`validatePublicKey`, asked by `mls`; see "Public-key admission check").
 - **Runtime-agile suite selection** (Go `NewKEM`/`NewKDF`/`NewAEAD` by id): suites are comptime types here. A protocol that negotiates the suite (ECH, MLS) switches over the ids it supports itself (`tlsserver/src/ech.zig` does). Small; only if a consumer asks.
 - **One-stage psk mode has no published vector:** the draft's vectors and Go's are base mode only; psk over a one-stage KDF follows draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage` text and is pinned by round trips only (`kat_go_test.zig`). Re-anchor when a psk vector is published.
-- **DHKEM(X448, HKDF-SHA512)** (0x0021) *(survey 2026-09-30)*: RFC 9180 registers it (MLS suites 0x0004/0x0006 need it); none of the peers offer X448. Small on top of sibling `ed448` (`x448.scalarmult`). Fits §2. (DHKEM(P-521, HKDF-SHA512) 0x0012: done 2026-10-10 on the `p521` module, RFC 9180 A.6 byte-exact.)
+- **DHKEM(X448, HKDF-SHA512)** (0x0021): RFC 9180 registers it (MLS suites 0x0004/0x0006 need it); none of the peers offer X448. Small on top of sibling `ed448` (`x448.scalarmult`). Fits §2.
 
 ## Anchoring
 
