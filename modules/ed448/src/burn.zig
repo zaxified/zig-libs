@@ -31,5 +31,11 @@ pub const point_burn = 48 * 1024;
 /// fix (2026-10-08), `[r]B` included.
 pub const sign_burn = 48 * 1024;
 
+/// `KeyPair.createInto` (and `generateInto` through it) dirties ~49 KiB in
+/// ReleaseFast: the `[s]B` comb (`point_burn`) plus its own frames. With the
+/// 48 KiB `sign_burn` the probe showed 49 B of residue at the burn end when it
+/// ran alone (2026-11-21); 56 KiB leaves ~7 KiB (14 %) of margin.
+pub const create_burn = 56 * 1024;
+
 /// `x448.scalarmult` dirtied 3.8 KiB in ReleaseFast (2026-10-08).
 pub const x448_burn = 8 * 1024;

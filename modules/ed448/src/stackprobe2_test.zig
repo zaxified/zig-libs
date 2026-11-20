@@ -32,22 +32,13 @@ test "STACKPROBE: Ed448 key generation leaves no secret on the dead stack" {
 var mul_scalar: scalar.CompressedScalar = undefined;
 var mul_sink: ed.Point = undefined;
 
-noinline fn mulSink(p: ed.Point, s: scalar.CompressedScalar) void {
+noinline fn mulSink(p: ed.Point, s: *const scalar.CompressedScalar) void {
     mul_sink = ed.Point.mul(p, s);
 }
 
-noinline fn mulBaseSink(s: scalar.CompressedScalar) void {
+noinline fn mulBaseSink(s: *const scalar.CompressedScalar) void {
     mul_sink = ed.Point.mulBasePoint(s);
 }
-
-/// `mul` / `mulBasePoint` take the scalar BY VALUE: the copy lives in the
-/// caller's argument area, above the burn (known gap, see SPEC Limits). The
-/// needle-free probes below check what the module itself controls: a burn
-/// exists and no non-paint byte lies below it. The `known gap` tests pin the
-/// by-value copy with needles: they expect the hit and go red when the API
-/// takes the scalar by pointer (then delete them and pass the scalar as a
-/// needle in the first two).
-const no_needles: []const []const u8 = &.{};
 
 fn initMulScalar() void {
     var digest: [114]u8 = undefined;
@@ -55,23 +46,16 @@ fn initMulScalar() void {
     mul_scalar = scalar.reduceWide(digest);
 }
 
-test "STACKPROBE: Point.mul burns its body (no residue below the burn)" {
+test "STACKPROBE: Point.mul leaves no scalar on the dead stack" {
     try sp.skipUnlessOptimized();
     initMulScalar();
-    _ = try P.run("Point.mul", mulSink, .{ ed.Point.basePoint.dbl(), mul_scalar }, no_needles, .{});
+    _ = try P.run("Point.mul", mulSink, .{ ed.Point.basePoint.dbl(), &mul_scalar }, &.{&mul_scalar}, .{});
 }
 
-test "STACKPROBE: Point.mulBasePoint burns its body (no residue below the burn)" {
+test "STACKPROBE: Point.mulBasePoint leaves no scalar on the dead stack" {
     try sp.skipUnlessOptimized();
     initMulScalar();
-    _ = try P.run("Point.mulBasePoint", mulBaseSink, .{mul_scalar}, no_needles, .{});
-}
-
-test "STACKPROBE: known gap, Point.mul and mulBasePoint leave the by-value scalar copy in the caller frame" {
-    try sp.skipUnlessOptimized();
-    initMulScalar();
-    try std.testing.expectError(error.DeadStackResidue, P.run("Point.mul (needles)", mulSink, .{ ed.Point.basePoint.dbl(), mul_scalar }, &.{&mul_scalar}, .{ .quiet = true }));
-    try std.testing.expectError(error.DeadStackResidue, P.run("Point.mulBasePoint (needles)", mulBaseSink, .{mul_scalar}, &.{&mul_scalar}, .{ .quiet = true }));
+    _ = try P.run("Point.mulBasePoint", mulBaseSink, .{&mul_scalar}, &.{&mul_scalar}, .{});
 }
 
 var x_out: x448.KeyPair = undefined;

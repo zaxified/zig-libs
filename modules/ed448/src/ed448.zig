@@ -205,9 +205,11 @@ pub const Point = struct {
     /// element for decaf448) and only the SCALAR is secret, so building
     /// the table is data-independent regardless.
     ///
-    /// Burned (`burn.zig`): the scalar is secret for decaf448's callers.
-    pub fn mul(p: Point, s: scalar.CompressedScalar) Point {
-        const r = mulUnburned(p, &s);
+    /// Burned (`burn.zig`): the scalar is secret for decaf448's callers. The
+    /// scalar is taken BY POINTER so that no copy of it lands in the caller's
+    /// frame, above the burn.
+    pub fn mul(p: Point, s: *const scalar.CompressedScalar) Point {
+        const r = mulUnburned(p, s);
         burn.stack(burn.point_burn);
         return r;
     }
@@ -274,9 +276,9 @@ pub const Point = struct {
     /// never a secret-dependent load or branch. Used by `KeyPair.create`
     /// and `signInternal` for their `[s]B` / `[r]B` base-point mults.
     ///
-    /// Burned like `mul`.
-    pub fn mulBasePoint(s: scalar.CompressedScalar) Point {
-        const r = mulBasePointUnburned(&s);
+    /// Burned like `mul`; the scalar is by pointer for the same reason.
+    pub fn mulBasePoint(s: *const scalar.CompressedScalar) Point {
+        const r = mulBasePointUnburned(s);
         burn.stack(burn.point_burn);
         return r;
     }
@@ -608,7 +610,7 @@ pub const KeyPair = struct {
     /// `create` with the key pair into `out`; the body's frames are burned.
     pub fn createInto(out: *KeyPair, seed: *const [57]u8) void {
         createUnburned(out, seed);
-        burn.stack(burn.sign_burn);
+        burn.stack(burn.create_burn);
     }
 
     noinline fn createUnburned(out: *KeyPair, seed: *const [57]u8) void {
@@ -618,7 +620,7 @@ pub const KeyPair = struct {
         var s = h[0..57].*;
         defer std.crypto.secureZero(u8, &s);
         scalar.clamp(&s);
-        const a_point = Point.mulBasePoint(s);
+        const a_point = Point.mulBasePoint(&s);
         out.public_key = PublicKey.fromBytes(a_point.toBytes());
         out.secret_key.bytes = seed.*;
     }
@@ -693,7 +695,7 @@ noinline fn signInternalUnburned(kp: *const KeyPair, ph_message: []const u8, ctx
     defer std.crypto.secureZero(u8, &r_digest);
     var r_scalar = scalar.reduceWide(r_digest);
     defer std.crypto.secureZero(u8, &r_scalar);
-    const r_point = Point.mulBasePoint(r_scalar);
+    const r_point = Point.mulBasePoint(&r_scalar);
     const r_bytes = r_point.toBytes();
 
     const k_digest = try shake114(phflag, ctx, &.{ &r_bytes, &kp.public_key.bytes, ph_message });
@@ -1064,7 +1066,7 @@ test "verify is cofactored: an order-4 component on R is accepted (RFC 8032 §5.
     const kp = KeyPair.create(&(@as([57]u8, @splat(5))));
     var r = scalar.zero;
     r[0] = 42;
-    const r_bytes = Point.mulBasePoint(r).add(t4).toBytes();
+    const r_bytes = Point.mulBasePoint(&r).add(t4).toBytes();
     const k = scalar.reduceWide(try shake114(0, "", &.{ &r_bytes, &kp.public_key.bytes, "msg" }));
     const sig: Signature = .{ .r = r_bytes, .s = scalar.mulAdd(k, testSecretScalar(kp), r) };
     try verify(sig, "msg", "", kp.public_key);
@@ -1160,7 +1162,8 @@ test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to en
 }
 
 test "mulDoubleBaseVartime (wNAF, comptime B table) agrees with the constant-time [s1]B + [s2]P, including all-ones and sparse scalars" {
-    const P = Point.mulBasePoint(scalar.reduceWide(@as([114]u8, @splat(0x5a))));
+    const p_scalar = scalar.reduceWide(@as([114]u8, @splat(0x5a)));
+    const P = Point.mulBasePoint(&p_scalar);
     var digest: [114]u8 = undefined;
     for (0..12) |round| {
         for (&digest, 0..) |*b, i| b.* = @truncate(i * 31 + round * 101 + 7);
@@ -1181,7 +1184,7 @@ test "mulDoubleBaseVartime (wNAF, comptime B table) agrees with the constant-tim
             },
             else => {},
         }
-        const want = Point.mulBasePoint(s1).add(P.mul(s2));
+        const want = Point.mulBasePoint(&s1).add(P.mul(&s2));
         const got = Point.mulDoubleBaseVartime(&s1, &s2, P);
         try std.testing.expect(got.equivalent(want));
     }

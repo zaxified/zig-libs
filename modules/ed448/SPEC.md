@@ -239,7 +239,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   bytes, it always passes.
 - **Dead stack.** `Point.mul`, `Point.mulBasePoint`, Ed448 signing and key creation, and
   `x448.scalarmult` / `x448.KeyPair.fromEd448` run their body one frame down (`noinline`) and then
-  zero the bytes it dirtied (`burn.zig`, 48 KiB for the point and signing paths, 8 KiB for X448;
+  zero the bytes it dirtied (`burn.zig`, 48 KiB for the point and signing paths, 56 KiB for key creation,
+  8 KiB for X448; `Point.mul` and `Point.mulBasePoint` take the secret scalar by pointer so no copy of it lands
+  in the caller's frame, above the burn;
   `stackprobe_test.zig` and `stackprobe2_test.zig` go red when a body outgrows its burn).
 - **X448's `scalarmult` REJECTS non-canonical `u`** rather than silently
   masking the high bit the way RFC 7748 §5's own text permits
@@ -260,12 +262,6 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   its own doc comment (see above); `Fe.invert`'s use inside `Point.
   toBytes` operates on a coordinate `Z`, not directly secret, but should
   still avoid branching on its value out of general hygiene.
-- **`Point.mul` and `Point.mulBasePoint` take the secret scalar by value.** The 57-byte copy sits in
-  the caller's argument area, above the burn, so it survives on the dead stack after the call (the
-  probe finds it 111..223 B below the region top; everything the body itself writes is burned, no
-  residue below the burn). Callers: `KeyPair.create` and the signing nonce (`ed448.zig`, inside
-  burned frames), the `decaf448` scalar multiplication (`element.zig`, caller frame unburned), the
-  ctgrind harness. A by-pointer variant is in the backlog; `stackprobe2_test.zig` pins the gap.
 - **Ed448's `verify` uses cofactored (not cofactorless) checking.** Same
   rationale `std.crypto.sign.Ed25519`'s own default `verify()` documents:
   broader interoperability, aligns with common batch-verification
@@ -325,9 +321,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Fuzz** (`src/fuzz_test.zig`, `ED448_FUZZ`): `ed448_point` and `ed448_signature` harnesses, plus a
   seed loop with reach checks in every test run.
 - **Dead-stack probes:** `src/stackprobe_test.zig` (Ed448 signing, X448) and `src/stackprobe2_test.zig`
-  (Ed448 key generation, `Point.mul` and `Point.mulBasePoint` without needles because of the by-value
-  scalar, `x448.KeyPair.fromEd448` and `generate` with needles, plus a `known gap` test that expects the
-  by-value scalar copy and goes red once the API takes a pointer), ReleaseFast.
+  (Ed448 key generation, `Point.mul`, `Point.mulBasePoint`, `x448.KeyPair.fromEd448` and `generate`, all with
+  needles), ReleaseFast.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
   whole-module mutation run and the delta runs after it.
 - **Mutation:** whole-module schemata over `field.zig`, `scalar.zig`, `ed448.zig`, `x448.zig` (285
@@ -344,7 +339,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `secureZero` defers whose frame the burn clears right after. The four burn/wipe sites no probe called
   directly (`Point.mul`, `Point.mulBasePoint`, `x448.KeyPair.fromEd448`, the `generate` seed wipe) are
   killed by the direct probes of `stackprobe2_test.zig` (a burn skipped gives no zero run, a skipped
-  wipe leaves the seed).
+  wipe leaves the seed). DELTAPLACEHOLDER
 
 ## Performance
 
@@ -362,10 +357,6 @@ forced-inline `mulI`/`squareI`) are in *Design*.
   guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
 - **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
 - **Ed448 batch verification and key blinding** *(survey 2026-09-30)*: `std.crypto.sign.Ed25519` offers `verifyBatch` and a `key_blinding` submodule; neither has an Ed448 analogue here.
-- **By-pointer `Point.mul` / `Point.mulBasePoint`** (pub API change, needs the owner's decision): the
-  secret scalar is passed by value, so a copy stays in the caller's frame. A pointer parameter (as
-  `x448.scalarmult`'s key) removes it; then pass the scalar as a needle in the `stackprobe2_test.zig`
-  probes and delete the `known gap` test.
 - **`scalar.zig` `condSubL` mask not laundered**: `Fe`'s selects use `field.blackBox`; the same change on the scalar's conditional subtraction made `decaf448`'s `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
 - **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 

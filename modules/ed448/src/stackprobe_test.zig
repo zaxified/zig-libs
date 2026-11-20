@@ -313,7 +313,7 @@ fn signNeedles(n: *Needles, ph_message: []const u8, phflag: u1) !void {
     n.addImage("r digest", &r_digest);
     const r = scalar.reduceWide(r_digest);
     n.addImage("r", &r);
-    const r_bytes = ed.Point.mulBasePoint(r).toBytes();
+    const r_bytes = ed.Point.mulBasePoint(&r).toBytes();
     var hk = Shake256.init(.{});
     try ed.absorbDom4(&hk, phflag, ctx);
     hk.update(&r_bytes);

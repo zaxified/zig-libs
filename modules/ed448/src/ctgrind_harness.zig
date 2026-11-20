@@ -146,8 +146,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const wide_r = reloadVolatile(114, &wide);
             const s: scalar.CompressedScalar = scalar.reduceWide(wide_r);
 
-            const q = Point.mul(Point.basePoint, s);
-            const r = Point.mulBasePoint(s);
+            const q = Point.mul(Point.basePoint, &s);
+            const r = Point.mulBasePoint(&s);
 
             // NOT `Point.toBytes`: that runs `Fe.invert`, which is the branch
             // the `full` target exists to account for. `Fe.toBytes` is a

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **BREAKING + FIX (secret scalar on the caller's dead stack):** `Point.mul(p, s)` and `Point.mulBasePoint(s)` take the scalar by pointer, `s: *const scalar.CompressedScalar` (was by value): the by-value copy lived in the caller's argument area, above the burn, where no `burn.stack` could reach it (found by the needle probes in `src/stackprobe2_test.zig`). Migrate with `Point.mul(p, &s)` / `Point.mulBasePoint(&s)`; the result is unchanged. `KeyPair.createInto` (and so `create`, `generateInto`, `generate`) burns 56 KiB (`burn.create_burn`) instead of 48 KiB: the probe showed 49 B of residue at the end of the old burn when it ran alone.
 - **2026-11-17** — **TESTS (no src change):** all 11 RFC 8032 §7.4/§7.5 vectors (9 Ed448 incl. the 1023-octet message, 2 Ed448ph; `rfc8032_vectors.zig`) and the 87 Wycheproof `ed448_test.json` cases (`wycheproof_vectors.zig`; 17 valid, 70 invalid, 0 acceptable) are asserted in `kat_test.zig`; `verify` agrees with Wycheproof on every case (12 wrong-length, 16 non-canonical `S`, 42 rejected by the verification/small-order check). Wycheproof attribution added to `NOTICE`.
 - **2026-11-16** — `x448.KeyPair.fromEd448` and `x448.publicKeyFromEd448` (libdecaf's Ed448 → X448 conversion, std's
   `X25519.KeyPair.fromEd25519` analogue): u = y²/x² through RFC 7748's 4-isogeny, the secret the first 56 bytes of

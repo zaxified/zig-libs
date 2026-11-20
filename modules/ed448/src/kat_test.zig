@@ -115,7 +115,7 @@ test "RFC 8032 §7.4/§7.5: the variable-base Point.mul reproduces the public ke
         std.crypto.hash.sha3.Shake256.hash(&vec.sk, &h, .{});
         var s = h[0..57].*;
         scalar.clamp(&s);
-        const a = ed448.Point.mul(ed448.Point.basePoint, s);
+        const a = ed448.Point.mul(ed448.Point.basePoint, &s);
         try std.testing.expectEqualSlices(u8, &vec.pk, &a.toBytes());
     }
 }

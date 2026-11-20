@@ -265,8 +265,8 @@ pub const Element = struct {
     /// `SPEC.md`'s "Constant-time note (measured)" for the full table.
     ///
     /// Scalar by pointer (BREAKING 2026-10-08): by value, the caller's frame
-    /// kept a copy of it (`stackprobe_test.zig`). The multiply itself is
-    /// burned in ed448's `Point.mul`.
+    /// kept a copy of it (`stackprobe_test.zig`). The widened copy is passed on
+    /// to ed448's `Point.mul` by pointer too and wiped before this frame is left.
     pub fn scalarMul(a: Element, s: *const scalar.CompressedScalar) Element {
         const r = scalarMulUnburned(a, s);
         burn.stack(burn.scalar_burn);
@@ -275,7 +275,9 @@ pub const Element = struct {
 
     /// The widened copy of `s` lives here, in a burned frame.
     noinline fn scalarMulUnburned(a: Element, s: *const scalar.CompressedScalar) Element {
-        return .{ .p = Point.mul(a.p, scalar.toEd448(s.*)) };
+        var wide = scalar.toEd448(s.*);
+        defer std.crypto.secureZero(u8, &wide);
+        return .{ .p = Point.mul(a.p, &wide) };
     }
 
     /// Group equality (RFC 9496 §5.3.3): for internal representations
