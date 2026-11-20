@@ -30,7 +30,7 @@ No foreign source was read; feature claims are from public documentation as reme
 | Python [`base64`](https://docs.python.org/3/library/base64.html) `b32encode`/`b32decode`/`b32hexencode` — **reference** | Python | PSF-2.0 (API: NOASSERTION for python/cpython) | — (cpython: 77.4k) | Python 3.x stdlib | `casefold`, `map01` (0→O, 1→L/I for hand-typed text); padding required on decode *(inferred)*. Used here as the black-box KAT oracle (`tools/gen_kat.py`). This module adds optional/forbidden padding and whitespace skipping, and lacks `map01`. |
 | [ia0/data-encoding](https://github.com/ia0/data-encoding) | Rust | MIT | 203 | push 2026-09-01 (no GitHub release) | Constant-per-spec encodings (BASE32, BASE32HEX, `_NOPAD`, DNSSEC), custom specifications, trailing-bit checking, streaming-friendly lengths *(inferred)*. The broad, spec-driven ceiling. |
 | [andreasots/base32](https://github.com/andreasots/base32) | Rust | Apache-2.0 | 35 | push 2026-08-23 | RFC 4648 and Crockford alphabets, simple encode/decode *(inferred)*. Source not read (not MIT). |
-| Zig `std` | Zig | MIT | — | Zig 0.16.0 | No base32 at all (`std.base64` only). `dnssec` here carried a private base32hex until 2026-10-02; it uses this module now. |
+| Zig `std` | Zig | MIT | — | Zig 0.16.0 | No base32 at all (`std.base64` only). `dnssec` uses this module for NSEC3 owner-hash labels (`.hex`, `.forbidden` padding, `.insensitive` case); its own base32hex is gone. |
 
 **Where we are ahead:** strict-by-default decoding (exact padding count, canonical trailing bits,
 typed errors per fault — accepted text maps injectively to bytes), opt-in leniency exactly
@@ -70,7 +70,7 @@ and LF anywhere, including between `=`. Both are off by default (RFC 4648 §3.3)
 ## Constant-time contract
 
 Secrets (TOTP keys) pass through this module, so both directions are constant-time
-over the data (since 2026-10-10). `encode` and `decode` index no table and branch on no
+over the data. `encode` and `decode` index no table and branch on no
 symbol value: each symbol is computed arithmetically (range decisions are borrows turned
 into masks, the technique of `sessions/src/idhex.zig`), and the validity of the decoded
 characters is accumulated as a mask and reported once, after the loop. What still
@@ -80,65 +80,51 @@ The final `NonCanonical` verdict reads the unused low bits once, at the end. Evi
 ctgrind harness `src/ctgrind_harness.zig` (see Hardening). The module does not zero any
 buffer: callers own `dest` and should clear it after use.
 
+## Limits and residual risks
+
+- `encodedLen` multiplies `n * 8` unchecked; it overflows only for `n >= 2^61`, which no slice can have.
+- When `dest` is too small, `BufferTooSmall` is reported where the buffer runs out, ranked by position against a bad
+  character or misplaced padding met earlier; it comes before the length / padding-count / canonical-bits faults a
+  complete scan would find. On error the contents of `dest` are unspecified.
+- `decodeAlloc` decodes into a temporary buffer and frees it without clearing it, so a decoded secret (also the partial
+  one of a failed decode) stays in freed heap memory. Consistent with "the module does not zero any buffer"; see
+  *Backlog / deferred*.
+
 ## Verification
 
+Run: `scripts/modtest base32`; the deterministic fuzz driver: `BASE32_FUZZ=<runs>[,<first seed>]` (harnesses
+`base32-decode`, `base32-roundtrip`); constant time: `scripts/checks/ctgrind.sh base32`.
+
 - RFC 4648 §10 vectors in both alphabets (encode and strict decode).
-- `src/kat_vectors.zig`: 45 inputs (lengths 0..41, all-zero, all-one, the 256
-  byte values) with Python-stdlib encodings for both alphabets; padded,
-  unpadded and round-tripped. Regenerate with `python3 tools/gen_kat.py`.
-- Every rejection class with the exact error: non-alphabet bytes (digits `0 1 8
-  9`, `-`, `_`, NUL, UTF-8), all padding faults per mode, impossible lengths,
-  non-canonical bits at 2/4/5/7 symbols in both alphabets.
-- Round trip over lengths 0..300, seeded PRNG, every alphabet × pad × case.
-- Injectivity: flipping the lowest spare bit of a canonical text is always
-  `NonCanonical`.
-- Fuzz harness: decode never panics; every accepted text equals the canonical
-  encoding of its own output modulo case, padding and whitespace.
+- `src/kat_vectors.zig`: inputs of lengths 0..41, all-zero, all-one and the 256 byte values with Python-stdlib encodings
+  for both alphabets; padded, unpadded and round-tripped. Regenerate with `python3 tools/gen_kat.py`.
+- Every rejection class with the exact error: non-alphabet bytes (digits `0 1 8 9`, `-`, `_`, NUL, UTF-8), all padding
+  faults per mode, impossible lengths, non-canonical bits at 2/4/5/7 symbols in both alphabets.
+- Round trip over lengths 0..300, seeded PRNG, every alphabet x pad x case; lower-case output, the whitespace set
+  (space, tab, CR, LF) and `decodeAlloc` on unpadded text are each asserted.
+- Injectivity: flipping the lowest spare bit of a canonical text is always `NonCanonical`.
+- The arithmetic symbol mapping is cross-checked against a table implementation over every 5-bit value, every byte, both
+  alphabets and cases, and random texts including the error kind.
+- Fuzz: the decode harness (never panics; every accepted text equals the canonical encoding of its own output modulo case,
+  padding and whitespace) and the roundtrip oracle (what `encode` issued is accepted and decodes to the original; strict
+  padding is enforced; a substituted symbol never decodes to the original).
+- ctgrind (`src/ctgrind_harness.zig`, ReleaseFast): `encode` taints the data (both alphabets, padded/unpadded, both
+  cases); `decode` taints the encoded text (padding required/optional, case-insensitive, one rejected input). The
+  contexts left in `decode` are the per-character `=` test, whose outcome the public length fixes, and the validity
+  verdict taken once at the end; the exact rows are in the Hardening line.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-### Audit 2026-10-03
+## What is deliberately not done
 
-Reviewed: all of `src/root.zig` (encode, table-driven decode, length helpers,
-alloc wrappers) against RFC 4648 §6/§7/§3.3/§3.5 and the Go/Python behaviour
-named in the card. No HIGH or MED defect. Findings:
-
-- LOW (fixed): the module doc pointed at SPEC.md "Threat model"; the section is
-  "Constant-time contract".
-- INFO: `decodeAlloc` decodes into a temporary buffer and frees it without
-  clearing it, so a decoded secret (also the partial one of a failed decode)
-  stays in freed heap memory. Consistent with "the module does not zero any
-  buffer" above, but see Backlog.
-- INFO: `encodedLen` multiplies `n * 8` unchecked; it overflows only for
-  `n >= 2^61`, which no slice can have.
-- INFO: when `dest` is too small, `BufferTooSmall` is reported where the
-  buffer runs out, before the length / padding / canonical-bits faults that a
-  complete scan would find (stated in the `decode` doc comment as "unspecified
-  contents on error"; the error precedence list covers the other faults only).
-
-Mutation run (schemata, ReleaseSafe, 40 mutants over `encodedLen`,
-`decodedLenUpperBound`, the encoder's block/shift/padding/case logic, the
-tables, whitespace set, padding modes, buffer bounds, length switch and
-canonical-bits check): 38 killed, 2 equivalent. The first pass left 6; four
-real ones are pinned now: lower-case `A` in `encode` (no test looked at
-lower-case output beyond three strings), the tab and carriage return members
-of the whitespace set (only space and LF were exercised), and `decodeAlloc`'s
-buffer size for unpadded text (only padded text went through it). Equivalent:
-the digit symbols `0`-`9` already have bit 0x20 set, so OR-ing the case bit
-into a digit (encoder) or building its table entry (`c | 0x20`, decoder)
-changes nothing.
+Custom or Crockford / z-base-32 / Geohash alphabets and `map01` (Python's hand-typed 0/1 mapping) are not provided: the
+module is the two RFC 4648 alphabets (see *What this module is, and what it is not*).
 
 ## Backlog / deferred
 
-- `decodeAlloc` could `secureZero` its temporary buffer before freeing it
-  (found in the 2026-10-03 audit; TOTP secrets pass through it). Not
-  observable by a test, so not done here.
-
-- ~~**`dnssec` could switch to this module**~~ — done 2026-10-02: `dnssec.nsec3` reads owner-hash labels with `.hex`, `.forbidden` padding, `.insensitive` case. The strict trailing-length check closed an aliasing its private decoder had (a 33-symbol label decoding like the 32-symbol one).
+- `decodeAlloc` could `secureZero` its temporary buffer before freeing it (TOTP secrets pass through it). Not observable
+  by a test, so not done.
 - Streaming encoder/decoder (for secrets read in pieces): none needed yet.
-
-## Status
-
-`gap · any · codec · reentrant` — canonical source is `pub const meta` in
-`src/root.zig`.
 
 ## Anchoring
 

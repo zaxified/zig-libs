@@ -34,6 +34,7 @@ const n = try base32.decode(&raw, "jbsw y3dp ehpk 3pxp", .{
 | `encodedLen(n, pad)`, `decodedLenUpperBound(text_len)` | buffer sizing |
 | `encode(dest, src, opts)`, `decode(dest, text, opts) !usize` | caller-buffer codec |
 | `encodeAlloc`, `decodeAlloc` | owning wrappers |
+| `EncodeError` | `BufferTooSmall` |
 | `DecodeError` | `InvalidCharacter`, `InvalidPadding`, `InvalidLength`, `NonCanonical`, `BufferTooSmall` |
 
 Constant-time in the data (arithmetic symbol mapping, one validity verdict at
