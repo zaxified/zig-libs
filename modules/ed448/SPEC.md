@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 Ed448/X448 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-11-20 (284/307, 23 eq) · src 2e7824e776501e18
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (287/311, 24 eq) · src 74915aeb4a65fca4
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-11-13 (ctgrind: full 3, ladder 0, decaf448 scalarmul 0 — unchanged; select masks laundered) · panic 2026-11-13 (sweep of every pub entry point of field/scalar/ed448/x448: `Point.toBytes` of a `z = 0` point is total instead of `unreachable`; `Fe.random` redraws at most 64 times, so a broken `io` no longer hangs it; a hand-built `Fe` with a limb over 2^57 is a documented contract violation)
 
@@ -329,8 +329,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   mutants, ReleaseSafe: canonical-range compares, carry/fold/weak-reduction steps, every addition-chain
   step of `invert`/`sqrt`/`sqrtRatio`, the point formulas, the masked table scan, the windowed and comb
   loops, the NAF recoding and Straus loop, point decode and encode, `dom4`, sign/verify steps, the X448
-  ladder) plus 22 burn/wipe mutants in a ReleaseFast build of the stack probes (a burn skipped, a burn
-  halved, a `secureZero` skipped). 280 killed, 23 argued equivalent, 4 open. Equivalent: the
+  ladder) plus 26 burn/wipe mutants in a ReleaseFast build of the stack probes (a burn skipped, a burn
+  halved, a `secureZero` skipped). 287 killed, 24 argued equivalent, 0 open (311 in all). Equivalent: the
   `t[17]` carry of `scalar.mul` (a product of two 456-bit values is below 2^912), `ctSelectPoint` with
   `<=` (the last true position is the index), the NAF mask of width w-1 and `>` for `>=` on an odd
   digit (cost only), the final X448 swap (the clamped scalar's bit 0 is 0), the three `blackBox`
@@ -339,7 +339,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `secureZero` defers whose frame the burn clears right after. The four burn/wipe sites no probe called
   directly (`Point.mul`, `Point.mulBasePoint`, `x448.KeyPair.fromEd448`, the `generate` seed wipe) are
   killed by the direct probes of `stackprobe2_test.zig` (a burn skipped gives no zero run, a skipped
-  wipe leaves the seed). DELTAPLACEHOLDER
+  wipe leaves the seed). A delta run over the by-pointer change
+  (ReleaseFast schemata, burn sites switched inside the callee) killed three more: the `Point.mul`, `Point.mulBasePoint`
+  and `KeyPair.createInto` burns skipped (`DeadStackResidue`); the wipe of the widened scalar copy in `decaf448`'s
+  `Element.scalarMul` is argued equivalent (the 4 KiB entry burn clears the same frame right after).
 
 ## Performance
 
