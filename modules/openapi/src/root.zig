@@ -1084,7 +1084,8 @@ fn writeOperation(
     try jw.write(operation_id);
     try writeParameters(jw, arena, rt, extra);
     try writeRequestBody(jw, arena, rt, extra);
-    if (extra) |x| try checkResponseExamples(rt, x);
+    if (extra) |x| try checkResponseExamples(arena, rt, x);
+    const examples = try responseExamples(arena, extra);
     try jw.objectField("responses");
     try jw.beginObject();
     if (rt.doc != null and rt.doc.?.responses.len != 0) {
@@ -1099,22 +1100,20 @@ fn writeOperation(
         // with the documented contract (P2), not a new error: the
         // pre-fix output was not valid JSON at all, so there is no
         // well-formed behavior being taken away.
-        // Earlier entries scanned directly: a capped "seen" buffer (32 used
-        // to be the cap) let a repeat past it out as a duplicate key
-        // (review 2026-10-23); the list is the caller's, short.
-        const responses = rt.doc.?.responses;
-        for (responses, 0..) |resp, ri| {
-            const dup = for (responses[0..ri]) |prev| {
-                if (prev.status == resp.status) break true;
-            } else false;
-            if (dup) continue;
+        // A hash set of the statuses written so far (a capped "seen" buffer,
+        // 32 used to be the cap, let a repeat past it out as a duplicate key,
+        // review 2026-10-23; a scan of the earlier entries was quadratic in
+        // the list, R-openapi-1).
+        var seen: std.AutoHashMapUnmanaged(u16, void) = .empty;
+        for (rt.doc.?.responses) |resp| {
+            if ((try seen.getOrPut(arena, resp.status)).found_existing) continue;
             var code_buf: [5]u8 = undefined;
             const code = std.mem.print(&code_buf, "{d}", .{resp.status}) catch unreachable;
             try jw.objectField(code);
             try jw.beginObject();
             try jw.objectField("description");
             try jw.write(resp.description);
-            const example_text = responseExample(extra, resp.status);
+            const example_text = examples.get(resp.status);
             if (resp.schema != null or example_text != null) {
                 const schema: ?std.json.Value = if (resp.schema) |t|
                     (try parseSchema(arena, t)) orelse return error.InvalidResponseSchema
@@ -1137,7 +1136,7 @@ fn writeOperation(
         try jw.beginObject();
         try jw.objectField("description");
         try jw.write("Successful Response");
-        if (responseExample(extra, 200)) |t| {
+        if (examples.get(200)) |t| {
             const example = (try parseText(arena, t)) orelse return error.InvalidExample;
             try jw.objectField("content");
             try jw.beginObject();
@@ -1211,24 +1210,28 @@ fn writeRequestBody(jw: *std.json.Stringify, arena: Allocator, rt: router.Route,
     try jw.endObject();
 }
 
-/// The example text registered for `status`, first entry wins.
-fn responseExample(extra: ?*const RouteExtra, status: u16) ?[]const u8 {
-    const x = extra orelse return null;
+/// The example text registered per status, first entry wins (a hash map, so a
+/// route with many responses and examples stays linear, R-openapi-1).
+fn responseExamples(arena: Allocator, extra: ?*const RouteExtra) Allocator.Error!std.AutoHashMapUnmanaged(u16, []const u8) {
+    var map: std.AutoHashMapUnmanaged(u16, []const u8) = .empty;
+    const x = extra orelse return map;
     for (x.response_examples) |e| {
-        if (e.status == status) return e.json;
+        const gop = try map.getOrPut(arena, e.status);
+        if (!gop.found_existing) gop.value_ptr.* = e.json;
     }
-    return null;
+    return map;
 }
 
 /// Every `response_examples` status must be one the operation documents (the
 /// default 200 when it documents none) -- an example for a response the
 /// document does not have would be silently dropped otherwise.
-fn checkResponseExamples(rt: router.Route, x: *const RouteExtra) BuildError!void {
+fn checkResponseExamples(arena: Allocator, rt: router.Route, x: *const RouteExtra) BuildError!void {
+    if (x.response_examples.len == 0) return;
     const responses: []const router.RouteDoc.Response = if (rt.doc) |d| d.responses else &.{};
+    var statuses: std.AutoHashMapUnmanaged(u16, void) = .empty;
+    for (responses) |resp| try statuses.put(arena, resp.status, {});
     for (x.response_examples) |e| {
-        const documented = if (responses.len == 0) e.status == 200 else for (responses) |resp| {
-            if (resp.status == e.status) break true;
-        } else false;
+        const documented = if (responses.len == 0) e.status == 200 else statuses.contains(e.status);
         if (!documented) return error.UnknownRouteExtra;
     }
 }
@@ -2113,12 +2116,16 @@ fn decodePointerToken(gpa: Allocator, buf: *std.ArrayList(u8), token: []const u8
     while (i < token.len) {
         var c = token[i];
         i += 1;
+        // RFC 3986 `"%" HEXDIG HEXDIG`: exactly two hex digits (parseInt would
+        // also take a sign, `%+f`, R-openapi-3).
         if (c == '%' and i + 2 <= token.len) {
-            if (std.fmt.parseInt(u8, token[i .. i + 2], 16)) |b| {
-                buf.appendAssumeCapacity(b);
+            const hi = std.fmt.charToDigit(token[i], 16) catch 16;
+            const lo = std.fmt.charToDigit(token[i + 1], 16) catch 16;
+            if (hi < 16 and lo < 16) {
+                buf.appendAssumeCapacity(hi << 4 | lo);
                 i += 2;
                 continue;
-            } else |_| {}
+            }
         }
         if (c == '~' and i < token.len) {
             switch (token[i]) {

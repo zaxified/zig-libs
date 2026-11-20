@@ -333,3 +333,50 @@ test "build: 30000 route_extras matched to 30000 routes stay linear, first entry
     try expectFast(t0);
     try testing.expect(std.mem.find(u8, json, "\"/r0\":{\"get\":{\"operationId\":\"get_r0\",\"requestBody\":{\"content\":{\"application/json\":{\"example\":1}}") != null);
 }
+
+test "build: 100000 responses and 100000 response examples on one route stay linear, first entry wins (sweep R-openapi-1)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n = 100_000;
+    // 201 repeated, 200 last: the old scans walked the whole list per entry
+    const responses = try arena.alloc(router.RouteDoc.Response, n + 1);
+    for (responses[0..n]) |*r| r.* = .{ .status = 201, .description = "first" };
+    responses[n] = .{ .status = 200, .description = "ok" };
+    responses[n - 1].description = "ignored";
+    const examples = try arena.alloc(oa.ResponseExample, n + 1);
+    for (examples[0..n]) |*e| e.* = .{ .status = 200, .json = "1" };
+    examples[n] = .{ .status = 201, .json = "2" };
+    examples[n - 1].json = "3"; // a later 200 entry loses against the first
+    const doc: router.RouteDoc = .{ .responses = responses };
+    const route: router.Route = .{ .method = .get, .pattern = "/x", .doc = &doc };
+    const info: oa.Info = .{ .title = "T", .version = "1", .route_extras = &.{.{ .method = .get, .pattern = "/x", .response_examples = examples }} };
+    const t0 = monoNs();
+    const routes = [_]router.Route{route};
+    const json = try Generator.buildRoutes(testing.allocator, &routes, info);
+    defer testing.allocator.free(json);
+    try expectFast(t0);
+    try testing.expect(std.mem.find(u8, json, "\"responses\":{\"201\":{\"description\":\"first\",\"content\":{\"application/json\":{\"example\":2}}},\"200\":{\"description\":\"ok\",\"content\":{\"application/json\":{\"example\":1}}}}") != null);
+}
+
+test "validateOpenApi31: a signed or short percent escape in a pointer token is not decoded (sweep R-openapi-3)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const head = "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"t\",\"version\":\"1\"},\"paths\":{}," ++
+        "\"x-k\":{\"a\\u000f\":{},\"a\\u0010\":{},\"\u{20ac}\":{},\"a\\u0000\":{},\"a%\":{},\"a%4\":{}},";
+    // `%0f` / `%0F` are the byte 0x0f; `%+f` and `%-0` are not escapes (parseInt took
+    // them as 0x0f and 0x00, so they resolved), `%` or `%4` at the end stand for themselves.
+    const ok = [_][]const u8{ "a%0f", "a%0F", "a%00", "a%", "a%4", "%E2%82%AC", "%e2%82%ac" };
+    const bad = [_][]const u8{ "a%+f", "a%-0", "a%g0", "a%0g", "a%0", "a%4g" };
+    for (ok) |tok| {
+        const text = try arena.print("{s}\"x\":{{\"$ref\":\"#/x-k/{s}\"}}}}", .{ head, tok });
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        try oa.validateOpenApi31(testing.allocator, doc);
+    }
+    for (bad) |tok| {
+        const text = try arena.print("{s}\"x\":{{\"$ref\":\"#/x-k/{s}\"}}}}", .{ head, tok });
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        try testing.expectError(error.DanglingRef, oa.validateOpenApi31(testing.allocator, doc));
+    }
+}
