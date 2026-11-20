@@ -2293,6 +2293,15 @@ pub const ConnControl = struct {
         return true;
     }
 
+    /// Wake the connection task out of a blocking read: shut the socket's
+    /// receive side down, so the read fails and the loop looks at its own
+    /// state again. For a task that decided, on another thread, that the
+    /// connection ends (an h2 worker whose response was `Connection: close`).
+    /// The write side stays open for the GOAWAY and the responses in flight.
+    pub fn wakeRead(c: *ConnControl) void {
+        c.stream.shutdown(c.server.io, .recv) catch {};
+    }
+
     /// Whether the response being made should end the connection: the
     /// server drains or has keep-alives off (Go `SetKeepAlivesEnabled`).
     pub fn mustClose(c: *const ConnControl) bool {

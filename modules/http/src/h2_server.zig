@@ -1227,7 +1227,16 @@ const Session = struct {
             s.fireConnState(.idle);
             s.lock();
             s.finishJob(id, disp);
-            if (disp == .close) s.closing = true;
+            if (disp == .close) {
+                s.closing = true;
+                // The connection task may sit in a blocking read the peer
+                // will not end (Go closes the connection after GOAWAY instead
+                // of waiting on the peer). Before `inflight` drops, so the
+                // control, owned by that task, is still alive. A connection
+                // served over a BYO transport has no control: there the task
+                // leaves at the next frame, or when its read times out.
+                if (s.opts.control) |c| c.wakeRead();
+            }
             s.inflight -= 1;
             s.announce(); // the drain in `run` waits for `inflight == 0`
             // A slot just freed: pull the next ready stream in now rather
@@ -8918,6 +8927,60 @@ const Wave4Trickle = struct {
         return t.ping.len;
     }
 };
+
+// S10-1: the same on a real socket. The peer sends one request answered with
+// `Connection: close` and then says nothing; the connection task is parked in
+// its blocking read. The worker's retirement wakes it, so the connection
+// closes at once instead of at the read timeout.
+test "dispatcher: a worker's .close ends a connection whose peer stays silent (S10-1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try stageGet(&peer, "/close");
+
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var server = Server.init(io, gpa, .{
+        .handler = wave4CloseHandler,
+        .enable_h2c = true,
+        .h2_dispatcher = pd.iface(8),
+        .read_timeout_ms = 20_000,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.serve() catch {};
+        }
+    }.run, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll(peer.wire.items);
+    try sw.interface.flush();
+
+    const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+    // Drain to EOF: the server closes after its GOAWAY.
+    var sink: [1024]u8 = undefined;
+    while (true) {
+        const n = sr.interface.readSliceShort(&sink) catch break;
+        if (n == 0) break;
+    }
+    const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds - t0, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms < 5_000);
+}
 
 // 19023: with a dispatcher, a worker that retires with `.close` sets
 // `closing`; the connection task, blocked in its read, only looks again when
