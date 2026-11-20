@@ -10,11 +10,11 @@
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -34,7 +34,7 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 /// Anything that multiplies a point (`computeL`, `proverStart`,
 /// `verifierStart`, the three Z/V cores). Measured in ReleaseFast before the
-/// burns existed (2026-10-08, `stackprobe_test.zig`): the dirtied depth of
+/// burns existed (`stackprobe_test.zig`): the dirtied depth of
 /// these calls was 8.6 KiB (`computeL`), 9.0 KiB (the shares), 10.3-10.8 KiB
 /// (`proverFinish`/`verifierConfirm`/`verifierFinish`) — of which the `p256`
 /// multiply's own 8 KiB burn is the bulk. 32 KiB is the next power of two

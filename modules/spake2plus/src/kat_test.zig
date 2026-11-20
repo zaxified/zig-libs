@@ -183,7 +183,7 @@ test "KAT: verifierConfirm reproduces confirmV byte-exact — with NO confirmP i
     try std.testing.expectEqualSlices(u8, &hexN(32, vec.confirm_v), &result.confirm_v);
 }
 
-// Audit 2026-09-01. `VerifierConfirmResult` used to carry `tt` and `k_main`
+// Audit. `VerifierConfirmResult` used to carry `tt` and `k_main`
 // "for KAT visibility" while README/SPEC/its own doc comment all claimed the
 // type made an unauthenticated `K_shared` impossible to obtain. It did not:
 // either field yields the real `K_shared` in one public call, at the moment
@@ -293,7 +293,7 @@ test "verifierFinish REJECTS an identity-element registration record L (RFC 9383
     ));
 }
 
-// Audit 2026-09-01: `verifierConfirm` arrived with commit `7386e724` as a
+// Audit: `verifierConfirm` arrived with commit `7386e724` as a
 // THIRD entry point taking a share straight off the wire, and the §6 test
 // set above was never extended to it. Both mutations — dropping either
 // `rejectIdentity` inside `verifierConfirm` — survived the whole suite in
@@ -333,7 +333,7 @@ test "verifierConfirm REJECTS an identity-element registration record L (RFC 938
 
 // ── non-canonical scalars (the `rejectNonCanonical` guards) ─────────────
 //
-// Audit 2026-09-01: all twelve `rejectNonCanonical` call sites were
+// Audit: all twelve `rejectNonCanonical` call sites were
 // unpinned — every one could be deleted with the suite green in both
 // modes. They are not decorative. `p256`'s `mul` reduces the scalar mod
 // `n` silently, measured: `basePoint.mul(n+1)` returns exactly
@@ -490,7 +490,7 @@ test "false anchor fix: verifierConfirm lets a genuinely blind Verifier go first
     try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_shared), &prover_result.k_shared);
 }
 
-// Audit 2026-09-01: the suite ran the whole protocol only with both parties
+// Audit: the suite ran the whole protocol only with both parties
 // holding the SAME password. Every tamper test corrupted a MAC or a share
 // after the fact, so the module's headline property — a WRONG PASSWORD does
 // not authenticate — was asserted only indirectly, by the KAT numbers
@@ -633,7 +633,7 @@ test "property: proverFinish REJECTS a shareV tampered to a different (but still
     ));
 }
 
-// Mutation run 2026-10-05: a `<` length check survived. RFC 9383 §3.2 (and
+// Mutation run: a `<` length check survived. RFC 9383 §3.2 (and
 // BoringSSL's Register()) split exactly 80 octets into two 40-octet halves;
 // anything longer is a caller error, not "use the first 80".
 test "computeW0W1 takes exactly 80 octets: 79 and 81 are refused" {
@@ -679,7 +679,7 @@ const WipeCheckAllocator = struct {
     }
 };
 
-// Review finding 2026-10-05 (during the mutation run): `verifierConfirm` and
+// Review finding (during the mutation run): `verifierConfirm` and
 // both `*Finish` on `ConfirmationMismatch` freed their own `TT` without
 // zeroing it. `TT` ends in `w0` and is a one-call pre-image of `K_shared`,
 // and `free` leaves memory intact in ReleaseFast. The caller never sees these
@@ -701,7 +701,7 @@ test "transcripts the module frees itself are zeroed first (ReleaseFast)" {
     try std.testing.expectEqual(@as(usize, 0), wc.dirty_frees);
 }
 
-// The out-param contract (2026-10-08): a failed `*Finish` leaves nothing of the
+// The out-param contract: a failed `*Finish` leaves nothing of the
 // half-computed result in the caller's `out`, and `out.tt` is the empty slice
 // (the module freed its own transcript).
 test "proverFinish / verifierFinish zero `out` on every error" {

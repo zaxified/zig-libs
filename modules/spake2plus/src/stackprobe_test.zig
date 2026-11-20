@@ -5,7 +5,7 @@
 //! `proverFinish`, `verifierConfirm`, `verifierFinish`. Kept in the module per
 //! `CONVENTIONS.md` §9.
 //!
-//! Engine as `hpke`'s probe (2026-10-08 form): the measured region is addressed
+//! Engine as `hpke`'s probe (form): the measured region is addressed
 //! directly `PAD` below the probe and the call runs under a `PAD`-deep `shim`,
 //! so even the caller-side frames of the call (a by-value scalar copy, a
 //! returned secret's temporary) are seen. ReleaseFast/ReleaseSmall only — Debug

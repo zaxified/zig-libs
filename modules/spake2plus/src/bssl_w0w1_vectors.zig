@@ -14,7 +14,7 @@
 //! ## Provenance
 //!
 //! * Reference:  BoringSSL `crypto/spake2plus/spake2plus.cc`, commit
-//!               `922245af6eda11b3f101ab5f542093eb5e7d1a74` (2026-08-07).
+//!               `922245af6eda11b3f101ab5f542093eb5e7d1a74`.
 //! * Licence:    Apache-2.0 (The BoringSSL Authors). Nothing from it is
 //!               copied or translated into this repo -- it was built, *run*,
 //!               and its outputs recorded, so no foreign condition attaches
@@ -25,7 +25,7 @@
 //!               `  -I boringssl -I boringssl/include \`
 //!               `  boringssl/build/libcrypto.a -lpthread`
 //!               `./capture_w0w1 > modules/spake2plus/src/bssl_w0w1_vectors.zig`
-//! * Captured:   2026-08-09.
+//! * Captured:.
 //!
 //! ## Two sets
 //!

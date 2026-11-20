@@ -225,11 +225,10 @@ pub fn nPoint() P256 {
 
 // ── Hash / MAC / KDF wrappers (RFC 9383 §4's ciphersuite row) ──────────
 //
-// REAL — one-line wrappers around std primitives, no protocol-specific
-// composition (that composition is `deriveKeys`, which IS a stubbed
-// core). `kat_test.zig`'s "REAL TODAY" section checks `mac` directly
+// One-line wrappers around std primitives, no protocol-specific composition
+// (that composition is `deriveKeys`). `kat_test.zig` checks `mac` directly
 // against the official vector's `K_confirmP`/`confirmP` pair, with no
-// core involved — this passes right now, before any core is implemented.
+// protocol core involved.
 
 /// `Hash()` for this ciphersuite: plain SHA-256 (RFC 9383 §4's `Hash`
 /// column). REAL.
@@ -339,8 +338,7 @@ fn kdfInto(comptime len: usize, out: *[len]u8, salt: []const u8, ikm: []const u8
 ///
 /// Byte-exact against RFC 9383 Appendix C's official P-256/SHA-256
 /// vector's published `TT` (570 bytes for that vector) — see
-/// `kat_test.zig`'s "REAL TODAY" section, which passes right now, with
-/// no core implemented (this function has no stub dependency).
+/// `kat_test.zig`, which checks it with no other protocol core involved.
 ///
 /// `z`, `v` and `w0` are SECRET (the transcript is a one-call pre-image of
 /// `K_shared`), so they are taken by pointer and the copy into the returned
@@ -424,7 +422,7 @@ fn writeField(out: []u8, offset: usize, field: []const u8) usize {
     return off;
 }
 
-// ── crypto cores (TODO(fable): stubbed — see each doc comment) ─────────
+// ── crypto cores ────────────────────────────────────────────────────
 
 /// The registration-phase scalar pair `(w0, w1)` (RFC 9383 §3.2).
 pub const W0W1 = struct {
@@ -659,7 +657,7 @@ pub const DerivedKeys = struct {
 /// non-conformant construction; RFC 9383's own pseudocode is explicit
 /// about the `||` split of ONE expand call's output).
 ///
-/// Every sub-step (`hash`, `kdf`) is already REAL — this stub is purely
+/// Every sub-step (`hash`, `kdf`) is a plain wrapper — this function is
 /// the three-line composition above, but is a named core (not inlined
 /// into `proverFinish`/`verifierFinish`) so `kat_test.zig` can pin
 /// `K_main`/`K_confirmP`/`K_confirmV`/`K_shared` byte-exact against RFC
@@ -1304,7 +1302,7 @@ test "mPoint/nPoint parse the RFC 9383 §4 P-256 constants and land on-curve, no
 // executed once, and `smith.bytes` over an empty input memsets the share
 // to zero. Every run of this target decoded 65 zero octets — tag 0 with a
 // 64-octet body, `error.InvalidEncoding` on `fromSec1`'s second line. The
-// fix for the SHAPE (2026-09-01) bought nothing because the DRAW was still
+// fix for the SHAPE bought nothing because the DRAW was still
 // collapsed; both halves have to be closed.
 //
 // So the branch is gone. The share comes from ONE byte-first draw, and the
@@ -1532,7 +1530,7 @@ test "corpus: every share seed reaches fromSec1, and the points parsed are pinne
         point.rejectIdentity() catch continue;
         on_curve += 1;
     }
-    // Measured 2026-09-07. Before: 1 round, 1 input, all 65 octets zero, 0
+    // Measured. Before: 1 round, 1 input, all 65 octets zero, 0
     // parsed. After: 9 of 10 non-empty, 3 parsed, 3 on the curve.
     try std.testing.expectEqual(share_seeds.len - 1, nonempty); // the deliberate empty seed
     try std.testing.expectEqual(@as(usize, 3), parsed);
@@ -1545,7 +1543,7 @@ test "corpus: every share seed reaches fromSec1, and the points parsed are pinne
 // `mulPublic`/`mulDoubleBasePublic`. Nothing enforced it: swapping
 // `computeL`'s multiply — the one that touches `w1`, whose secrecy is the
 // entire point of the "+" in SPAKE2+ — for `mulPublic` left all 29 tests
-// green in Debug AND ReleaseFast (measured, audit 2026-09-01).
+// green in Debug AND ReleaseFast (measured, audit).
 //
 // ⚠ What this test pins is the CALL SITE, which is exactly what the claim
 // says: it cannot measure timing. Whether `p256`'s `mul` is itself free of
