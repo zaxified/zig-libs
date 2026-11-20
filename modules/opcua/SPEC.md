@@ -20,11 +20,11 @@ OPC-UA (IEC 62541 / OPC 10000) binary client **and** server. Usage: see
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. open62541 is MPL-2.0 and node-opcua/gopcua are MIT: only READMEs/docs of any of them were read this run, no source. Claims about our side come from the SPEC's own "Deferred / not implemented" list (checked with `rg -i 'numericrange|index_range|deadband|history' src/server.zig`).
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. open62541 is MPL-2.0 and node-opcua/gopcua are MIT: only READMEs/docs of any of them were read this run, no source. Claims about our side come from this SPEC's *What is deliberately not done* and *Backlog / deferred* (checked with `rg -i 'numericrange|index_range|deadband|history' src/server.zig`).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [open62541/open62541](https://github.com/open62541/open62541) — **reference** | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | Client and server, "zero errors indicated by the OPC Foundation CTT for the supported features" (its README); features overview in its FEATURES.md *(not read; PubSub, events/alarms, history, full NodeSet, multiple security policies are what a user of it expects — inferred)*. We speak `#None` and `Basic256Sha256` only, no events/history/node management (NumericRange is implemented since 2026-11-19). |
+| [open62541/open62541](https://github.com/open62541/open62541) — **reference** | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | Client and server, "zero errors indicated by the OPC Foundation CTT for the supported features" (its README); features overview in its FEATURES.md *(not read; PubSub, events/alarms, history, full NodeSet, multiple security policies are what a user of it expects — inferred)*. We speak `#None` and `Basic256Sha256` only, no events/history/node management (NumericRange on Read and Write is implemented). |
 | [node-opcua/node-opcua](https://github.com/node-opcua/node-opcua) | TypeScript | MIT | 1.7k | v2.186.0 (2026-09-20) | The broadest open client+server toolkit with alarms, history, full NodeSets *(inferred)*. |
 | [gopcua/opcua](https://github.com/gopcua/opcua) | Go | MIT | 1.1k | v0.9.1 (2026-08-09) | Go client (used by Telegraf) with security modes, polling and subscriptions (its README); server is experimental *(inferred)*. |
 | [FreeOpcUa/opcua-asyncio](https://github.com/FreeOpcUa/opcua-asyncio) | Python | LGPL-3.0 | 1.5k | v2.0.1 (2026-06-29) | Python client+server; used here as the black-box interop peer at SignAndEncrypt (source not read). |
@@ -75,6 +75,85 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   a malformed *service body* becomes a `ServiceFault` (the connection
   survives), while a malformed *framing/limit* violation becomes an `ERR`
   message and a closed connection — the split OPC 10000-6 §7.1.4 describes.
+
+## Design notes by feature
+
+- **Client-side SecureChannel renewal.** `SecureChannel.renew(now_ms, options)` (`root.zig:241`) sends
+  `OpenSecureChannel` with `RequestType = Renew` (OPC 10000-4 §5.5.2) on the open channel: same channel id, policy and
+  mode; at Sign/SignAndEncrypt fresh nonces are exchanged and the keys re-derived (P-SHA256, §6.7.5).
+  `renewalDue(now_ms)` (`root.zig:203`) / `renewIfDue(now_ms, options)` (`root.zig:253`) time it: **75 % of the revised
+  lifetime** (`renewal_fraction_percent`, `root.zig:141`), **but not sooner than `min_renewal_delay_ms` (50 ms,
+  `root.zig:138`) after the token arrived**; a revised lifetime of 0 is refused with `error.InvalidTokenLifetime`
+  (`services.zig:59`), and with no lifetime (`token_lifetime_ms == 0`) nothing is ever due. References: open62541's
+  client sets its next renewal to 75 % of the revised lifetime, node-opcua clamps its timer to `max(75 %, 50 ms)` (read
+  as behaviour only). One deliberate difference: they count from the server's `CreatedAt` or a local timer; this module
+  has no clock (`meta.platform = .any`), so the caller passes a monotonic `now_ms` to `open` (`OpenOptions.now_ms`,
+  `root.zig:164`) and `renew`, and the deadline is counted on that local clock, immune to server clock skew. The new
+  token and keys take over the moment the answer is read (what both references do); the server keeps accepting the old
+  token for `token_renewal_overlap_ms`, capped at its own expiry, so a request in flight is not cut off. A refused
+  renewal (a Bad answer, an answer naming another channel, an empty server nonce at a secured policy, a failed
+  signature) leaves the old token, keys, lifetime and install time untouched, so the caller can retry while the old
+  token lives; renewing a channel that was never opened or was closed is `error.InvalidSecureMessage` before any I/O.
+  The client has one request in flight at a time, so `renew` is called between requests.
+- **Client-side subscription and path services.** `Subscription.setMonitoringMode(mode, item_ids)`
+  (`root.zig:1429`, §5.12.4) and `Subscription.modifyMonitoredItems(specs, timestamps)` (`root.zig:1371`, §5.12.3, no
+  filter, like `createMonitoredItems`) and `Session.translateBrowsePaths(paths)` (`root.zig:804`) are the raw services:
+  one result per id / item / path (a stale id or a path that matched nothing is a Bad entry, not a failed call; an empty
+  list is the server's ServiceFault, kept on `Channel.last_service_result`), and the caller frees the response with
+  `services.freeSetMonitoringModeResponse` / `freeModifyMonitoredItemsResponse` /
+  `freeTranslateBrowsePathsToNodeIdsResponse` (`services.zig:2965,2913,2806`). The shape follows open62541 (the generated
+  service call, results as the server sent them); a one-path convenience is left to callers. `MonitoredItemModifySpec`
+  (`root.zig:1350`) carries the `ClientHandle`, because the spec puts it into the modified parameters and our server
+  stores it: the `monitored_items` correlation table follows the new handle for every item whose result is not Bad, and
+  a Bad result leaves the entry as it was. `setMonitoringMode` keeps no local bookkeeping (the client table does not
+  track the mode).
+- **Per-policy RSA key-length band.** `SecurityPolicy.minAsymmetricKeyBits` / `maxAsymmetricKeyBits` / `allowsKeyBits`
+  (`security.zig:109-131`): 2048..4096 for `Basic256Sha256` and the reserved `Aes256_Sha256_RsaPss`
+  (`Aes128_Sha256_RsaOaep` has the same row but is not an enum value here; `Basic128Rsa15`/`Basic256` are not
+  implemented, so their 1024..2048 row has nothing to attach to). Checked on the modulus length read from the
+  certificate's structure (`security.certificateKeyBits`, `security.zig:442`, over `rsa.PublicKey.modulusBitsFromDer`)
+  before the key is parsed, so the answer is the same under every build profile. Enforced on the peer certificate key
+  (server `checkPeerCertificate`: `BadCertificateUseNotAllowed`, what open62541 answers from `rsaNewChannelContext`,
+  256..512 bytes; client `SecureChannel.open`: `error.KeyLengthOutOfPolicy`) and on the own key (server: OPN refused
+  `BadSecurityPolicyRejected`; client: the same error; `generateSelfSigned` with `modulus_bits` out of band:
+  `error.KeyLengthOutOfPolicy` before any prime search). One deliberate difference from open62541: the band is on the
+  exact bit length (the spec text), not `(bits+7)/8`, so a non-byte-aligned 2041..2047-bit modulus is refused here and
+  accepted there. node-opcua documents the same 2048/4096 rows. Testing escape
+  `insecure_allow_key_length_outside_policy` on `GenerateSelfSignedOptions`, `SecurityContext` and `SecurityConfig`
+  (`security.zig:265,567`; named after rsa's `insecure_allow_small_modulus`); under it a key past the build's RSA
+  capacity still cannot be used (`BadCertificateInvalid`).
+- **NumericRange** (OPC 10000-4 §7.27). `numeric_range.zig`: `parse`, `Range.format`, `Range.init`, `readRange`,
+  `writeRange`; the server applies them in the Read handler and `NodeStore.writeAttributeRange` (`nodestore.zig:951`);
+  the client sends one with `Session.readAttributeRange` / `writeValueRange` (`root.zig:655,665`) or any
+  `ReadValueId.index_range` / `WriteValue.index_range` string. Spec first; open62541 (`UA_NumericRange_parse`,
+  `checkAdjustRange`, `UA_Variant_copyRange`, `Variant_setRange`; MPL-2.0, read as behaviour only) where the spec is
+  silent; node-opcua agrees where noted.
+  - *Syntax:* `dimension[,dimension]*`, `dimension = n | n:m`, digits only, each index a `u32`; `n:m` needs `n < m`
+    (`3:3` and `5:2` are errors; one element is `3`). Anything else is `BadIndexRangeInvalid`. Bounds: text at most 256
+    bytes, at most 16 dimensions (`numeric_range.zig:48-49`; open62541 allows 100), so nothing is allocated for an index,
+    only for the elements actually selected; all arithmetic is `u64`.
+  - *Read:* a range reaching past the end is clipped (§7.27; open62541 clamps too); one that starts past the end, a
+    dimension count different from the value's, an empty/null value, or a non-Value attribute is `BadIndexRangeNoData`.
+    The result is a `DataValue` with the clipped slice (`dimensions` set for a multi-dimensional array) and the stored
+    status and timestamps. A String/ByteString scalar takes a one-dimension range over its bytes; an array of
+    Strings/ByteStrings takes one more trailing dimension over the bytes inside each selected element (§7.27 Table 166:
+    `0:1,7:9` on `["TestString","Test","String"]` gives `["ing", null]`; only "no element has data" is `NoData`).
+    **Known difference:** open62541 `UA_Variant_copyRange` fails the whole request when one element fails; the spec wins.
+    Order of checks: attribute id, syntax, data encoding, node (an unknown node wins over a well-formed range).
+  - *A scalar that is not a String/ByteString/XmlElement takes no range,* on Read and on Write: the range is not used
+    and the whole value is read or written (§7.28 ReadValueId, §5.11.4 Write; node-opcua does the same). **Known
+    difference:** open62541 treats a scalar as a one-element array (index `0` reads it, any other is
+    `BadIndexRangeNoData`); the LIVE test asserts open62541's answer.
+  - *Write:* the range must lie inside the stored array (no growth; `BadIndexRangeNoData`); the new value must have
+    exactly as many elements as the range selects, else `BadIndexRangeDataMismatch` (§5.11.4, §7.27). **Known
+    difference:** open62541 answers `BadIndexRangeInvalid`; the LIVE test asserts that. A scalar of the right type counts
+    as one element; same built-in type as the stored one (`BadTypeMismatch`); nothing stored -> `BadIndexRangeInvalid`.
+    Access-level checks keep their precedence. A range on a non-Value attribute is not used. The write is built on a
+    copy and swapped in, so every refusal leaves the stored value untouched. Writing into the bytes of String elements
+    (one more dimension than the array): one String per selected element, each exactly as wide as the byte range; every
+    selected element must contain the range (`NoData`); counts and widths are checked (`DataMismatch`).
+  - *Limits:* monitored items ignore `IndexRange` (Backlog); a range with more than 16 dimensions is refused.
+
 
 ## Threat model
 
@@ -157,7 +236,7 @@ no `std.mem.eql` on a secret anywhere in the security path.
   are still correct.
 
 **Hostile DER is a first-class input**, and the two extraction entry points
-now take different routes through it. `std.crypto.Certificate`'s reader
+take different routes through it. `std.crypto.Certificate`'s reader
 indexes without bounds checks and computes element ends without clamping, so
 `security.certificateValidity` — which genuinely needs `notBefore`/`notAfter`
 — puts a recursive DER well-formedness walk plus a zero-padded scratch copy in
@@ -218,60 +297,10 @@ Sessions are **channel-bound**: a request replaying a valid AuthenticationToken
 on a different SecureChannel is `BadSecureChannelIdInvalid` (session transfer
 between channels is not implemented, which closes that door rather than
 opening it half-way).
+**Residual risk:** `Config.max_lifetime_count` (the ceiling on a granted `LifetimeCount`) below three keep-alive
+counts silently overrides §5.13.2's floor (`server.zig:2845-2847`, `@min(raw, cfg.max_lifetime_count)` after the
+floor); it is an operator setting, not peer input.
 
-**Review 2026-10-06** (adversarial re-review; the last review was 2026-09-02).
-Scope: the code that landed after it — C4–C8 of 2026-09-10 (`decodeArray`/
-`decodeVariantArraySlice` `freeItem`, the `nodestore` `dup*` errdefers, the new
-`free*` for `RelativePath`/`BrowsePath`/`BrowsePathResult`,
-`Config.max_lifetime_count`) — and the server receive path end to end: HEL/ACK
-negotiation, chunk framing and reassembly limits, the OPN security stage
-(thumbprint, certificate checks, OAEP decrypt, PKCS#1 v1.5 verify, padding
-strip), the symmetric stage (token selection, AES-CBC, HMAC, padding), renewal
-and the overlap window, CreateSession/ActivateSession (certificate binding,
-`ClientSignature`, identity tokens), service dispatch and the subscription
-engine. Every row of the threat-model table above was checked against the code.
-Findings: **H1** (fixed) — a `#None` channel could be "renewed" by a
-Basic256Sha256 OPN; the None token became the overlap token with no keys, and a
-MSG naming it hit `c.prev_keys.?` in `openSymmetricChunk`: a remote panic in
-Debug/ReleaseSafe, from any peer holding any self-signed certificate (the
-default `certificate_policy = null`), on any server advertising `#None` beside a
-secured endpoint. **M1** (fixed) — the inbound `SequenceNumber` of secured
-chunks was read and discarded, so a captured signed/encrypted Write or Call
-re-executed whenever an on-path attacker played it back within the token's
-life. **L1** (fixed) — `sampleDue` freed `last_value` before duplicating its
-replacement; an OutOfMemory there left a dangling pointer that was compared
-against and then freed twice. **L2** (fixed) — C4's array decoders still leaked
-an element decoded just before a failed list growth. **L3** (fixed) —
-`NodeStore.dupAttributes` had C7's partial-failure leak and was missed by C7.
-Each has a test that failed before its fix. **Open at the review, reported to
-the owner:** (a) pre-authentication cost of an OPN — every chunk is
-RSA-OAEP-decrypted block by block (≈250 private-key operations for a 64 KiB
-chunk under a 2048-bit key, up to `max_chunk_count` chunks) before its signature
-can be checked. **Fixed 2026-10-06:** an OPN must be one final chunk (`C`/`A` is
-`ERR BadTcpMessageTypeInvalid` on the MessageHeader alone — asyncua sends OPN as
-one chunk citing §6.7.2 and open62541 refuses anything else with that code), and
-its encrypted region may not exceed `SecurityConfig.max_opn_encrypted_len`
-(default 4096 bytes; the recorded asyncua OPN's is 512) — `ERR
-BadTcpMessageTooLarge` on the clear header, before the thumbprint, the
-certificate or any RSA operation; a test feeds forged `C`, `A` and oversize
-OPNs that were refused only after RSA-OAEP failed on them before the fix; (b) the
-client never checks the server's `SequenceNumber`, and `Channel.recvService`
-decodes with the caller's allocator but frees neither a string-typed response
-NodeId, a `ServiceFault`, a response rejected as Bad, nor the fields of a struct
-a truncated response cut short — a hostile server leaks client memory per
-response. **Fixed 2026-10-06:** `recvService` decodes through a tracking
-pass-through allocator and frees everything it decoded on every refusal (an
-accepted response is returned as plain caller-allocator memory, as before), and
-on a signed/encrypted channel every response chunk's `SequenceNumber` must pass
-the server's own `security.sequenceFollows` (the `issue` OPN response starts the
-count, everything after continues it, as open62541 does in both roles) else
-`error.SequenceNumberInvalid`; six tests — one per leak shape, an every-cut
-truncation sweep, `checkAllAllocationFailures`, and a replay/gap sequence —
-each failed before the fix; (c) `Config.max_lifetime_count` below three
-keep-alive counts silently overrides §5.13.2's floor (an operator setting, not
-peer input). The M1 check is the rule open62541 and asyncua apply; the asyncua
-transcript replays byte-for-byte under it, the open62541 live tests did not run
-here (no container runtime).
 
 ## Codec-only vs driven
 
@@ -279,13 +308,13 @@ Everything in `encoding` and `services` is a codec; what makes it *driven* is
 whether a state machine in `root` (client) or `server` (server) uses it.
 
 - **Driven, both directions, at `#None` *and* `Basic256Sha256`
-  Sign/SignAndEncrypt:** OpenSecureChannel/CloseSecureChannel,
+  Sign/SignAndEncrypt:** OpenSecureChannel (issue and renew)/CloseSecureChannel,
   GetEndpoints, FindServers, CreateSession, ActivateSession, CloseSession,
-  Read, Write, Browse, BrowseNext, Call, CreateSubscription, ModifySubscription,
-  SetPublishingMode, DeleteSubscriptions, CreateMonitoredItems,
+  Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, Call,
+  CreateSubscription, ModifySubscription, SetPublishingMode, DeleteSubscriptions,
+  CreateMonitoredItems, ModifyMonitoredItems, SetMonitoringMode,
   DeleteMonitoredItems, Publish, Republish.
-- **Driven server-side only** (the client half has no call for them yet):
-  TranslateBrowsePathsToNodeIds, ModifyMonitoredItems, SetMonitoringMode.
+
 - **Codec-only** (structures encode/decode, nothing drives them):
   `EventNotificationList`/`EventFieldList` (no server-side event model),
   `StatusChangeNotification` on the client side, `DiagnosticInfo` trees
@@ -297,207 +326,128 @@ whether a state machine in `root` (client) or `server` (server) uses it.
 
 ## Verification
 
-`zig build test-opcua` — green in Debug and ReleaseFast.
+Run `scripts/modtest opcua` (add `-Doptimize=ReleaseFast` for the optimised-build probes). The LIVE tests need a
+container runtime (`podman`) and skip loudly when it or the port is unavailable.
 
-- **Offline:** RFC/spec-shaped round-trips for every built-in type, transport
-  framing, secure-channel KATs, address-space unit tests, and an end-to-end
-  suite that drives the *server* with the module's own *client* encoder over
-  an in-memory pipe (both halves must agree on bytes, not just on structs).
-- **Hostile input:** oversize chunk, chunk count over the negotiated maximum,
-  abort chunk mid-message, message-size/type violations, reserved NodeId
-  encoding byte, ExtensionObject body length overrun, continuation point from
-  another session, publish acknowledgement for an unknown sequence number,
-  MSG before OPN, wrong TokenId, rejected security policy — each asserted to
-  produce a typed error/fault, never a crash or a hang. Plus
-  `std.testing.fuzz` feeding arbitrary bytes into `feed`/`tick`.
-- **Hostile security input** (all asserted to produce a specific `Bad…`
-  status, and to close the channel rather than answer politely): a flipped bit
-  in the chunk-type byte / SecureChannelId / ciphertext, a chunk sealed with
-  the wrong keys, a correctly-MAC'd chunk with a `PaddingSize` pointing past
-  the message, an expired SecurityToken, the previous token used past its
-  renewal overlap, an OPN addressed to another server's certificate, an OPN
-  with a wrong-length nonce, an unadvertised SecurityMode, a certificate the
-  trust policy rejects, a certificate outside its validity window, an absent /
-  stale-nonce / foreign-key `ClientSignature`, a `CreateSession` presenting a
-  certificate other than the channel's, a session replayed on a second
-  channel, a replayed encrypted password, a replayed MSG chunk, a `#None`
-  channel renewed under Basic256Sha256, and a plaintext password against an
-  encrypted `UserTokenPolicy`. Certificate parsing additionally gets every
-  prefix of a real certificate, every single-byte mutation of one, hand-built
-  malformed DER, and `std.testing.fuzz`.
-- **Live (the real oracle), skipping loudly when unavailable:**
-  - *their client → our server*: open62541 1.0.5's stock
-    `tutorial_client_firststeps` (connect + Read i=2258),
-    `client_subscription_loop` (subscription + repeated DataChange
-    notifications) and `client` (GetEndpoints on its own connection, username
-    login, Browse of the Objects folder, Read/Write of a String NodeId,
-    subscription, method Call) run from `docker.io/open62541/open62541` with
-    `--network host`; their stdout is the assertion;
-  - *their client → our server, secured*: open62541's stock `client_encryption`,
-    which picks our SignAndEncrypt endpoint out of `GetEndpoints` on its own.
-    (The Python `asyncua` half of this used to live here; since 2026-09-07 it is
-    `zig build interop-opcua`, outside the module — see the next bullet.)
-  - *our client → their server*: the pre-existing live tests against a real
-    `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt;
-  - *our client → our server*: over a real loopback socket, with the server
-    driven from a second thread.
-- **Replayed third-party interop, hermetic** (`src/asyncua_replay.zig` over
-  `src/testdata/asyncua_transcript.txt`): the whole recorded Python **`asyncua`
-  2.0.1** exchange, re-executed with **no interpreter, no `asyncua`, no child
-  process and no socket**. asyncua generates its own throwaway RSA-2048
-  certificate and makes seven connections — GetEndpoints at
-  `SecurityPolicy#None` before each secured session, one session at
-  **Basic256Sha256 / SignAndEncrypt** (browse the Objects folder, read and write
-  `ns=1;s=the.answer`, call a method, receive subscription notifications), one
-  at **Sign** with a Basic256Sha256-encrypted `UserNameIdentityToken`, and one
-  holding a 10 s SecurityToken while reading every second for 30 s, which forces
-  real mid-stream renewals across the overlap window. The replay feeds every
-  recorded client datagram back in at its recorded `t=` and requires this server
-  to answer with **exactly the recorded bytes**, then re-derives each
-  connection's SecurityPolicy/SecurityMode, walks the opc.tcp framing of both
-  directions (no `ERR` anywhere, ≥3 `OPN` on the renewal channel), decodes the
-  `GetEndpointsResponse` off the unsecured leg and requires our three endpoints
-  with our own certificate on the secured two, and checks `the.answer` ended at
-  the value asyncua wrote.
+- **Offline:** RFC/spec-shaped round-trips for every built-in type, transport framing, secure-channel KATs,
+  address-space unit tests, and an end-to-end suite that drives the *server* with the module's own *client* encoder
+  over an in-memory pipe (both halves must agree on bytes, not just on structs); the client's `SecureChannel`,
+  `Session` and `Subscription` against `Connection` over that pipe at `#None` and at SignAndEncrypt, and scripted-peer
+  tests for answers a real server would not give (surplus or failed results, an answer for another channel, an empty
+  nonce, a CreateSession answer signed with another key).
+- **Hostile input:** oversize chunk, chunk count over the negotiated maximum, abort chunk mid-message, message-size/type
+  violations, reserved NodeId encoding byte, ExtensionObject body length overrun, continuation point from another
+  session, publish acknowledgement for an unknown sequence number, MSG before OPN, wrong TokenId, rejected security
+  policy — each asserted to produce a typed error/fault, never a crash or a hang. Plus `std.testing.fuzz` feeding
+  arbitrary bytes into `feed`/`tick`.
+- **Hostile security input** (each a specific `Bad…` status and a closed channel rather than a polite answer): a flipped
+  bit in the chunk-type byte / SecureChannelId / ciphertext, a chunk sealed with the wrong keys, a correctly-MAC'd chunk
+  with a `PaddingSize` pointing past the message, an expired SecurityToken, the previous token used past its renewal
+  overlap, an OPN addressed to another server's certificate, a wrong-length nonce, an unadvertised SecurityMode, a
+  certificate the trust policy rejects, a certificate outside its validity window, an absent / stale-nonce /
+  foreign-key `ClientSignature`, a `CreateSession` presenting a certificate other than the channel's, a session
+  replayed on a second channel, a replayed encrypted password, a replayed MSG chunk, a `#None` channel renewed under
+  Basic256Sha256, a plaintext password against an encrypted `UserTokenPolicy`, certificate keys at the edges of the
+  per-policy band. Certificate parsing additionally gets every prefix of a real certificate, every single-byte
+  mutation of one, hand-built malformed DER, and `std.testing.fuzz`.
+- **Fuzz:** `OPCUA_FUZZ=<runs>[,<first seed>]` through testkit's deterministic driver (`_ONLY` selects a harness).
+  Harnesses: `opcua-session` (a recorded client conversation at `#None`) and `opcua-secure` (at Basic256Sha256
+  SignAndEncrypt), each replayed with one chunk damaged / dropped / duplicated / swapped / replaced, a rig per run
+  (`server.zig`); `opcua-range` (a live session reading and writing ranged values against a model of an `Int32[5]`
+  re-derived from the grammar, structured and byte-edited ranges, reach labels counted in the plain test lane); the DER
+  harness and `fuzzConnection` (`fuzz_test.zig`).
+- **Live (the real oracle):**
+  - *their client -> our server:* open62541's stock `tutorial_client_firststeps`, `client_subscription_loop`, `client`
+    (GetEndpoints on its own connection, username login, Browse, Read/Write of a String NodeId, subscription, method
+    Call) and `client_encryption` (picks our SignAndEncrypt endpoint out of `GetEndpoints` itself), run from
+    `docker.io/open62541/open62541` with `--network host`; their stdout is the assertion;
+  - *our client -> their server:* a real `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt, client-side
+    renewal, `translateBrowsePaths`, `modifyMonitoredItems`, `setMonitoringMode`, and ranged reads/writes of its Demo
+    Int32 scalar, `Int32[10]` and `Int32[3][3]` (one table compared as a whole; the lines marked KNOWN DIFFERENCE are
+    where this module answers otherwise, see NumericRange above);
+  - *our client -> our server:* over a real loopback socket, the server driven from a second thread.
+- **Replayed third-party interop, hermetic** (`src/asyncua_replay.zig` over `src/testdata/asyncua_transcript.txt`): the
+  whole recorded Python **`asyncua`** exchange, re-executed with no interpreter, no `asyncua`, no child process and no
+  socket. asyncua generates its own throwaway RSA-2048 certificate and makes seven connections — GetEndpoints at
+  `#None` before each secured session, one session at Basic256Sha256 / SignAndEncrypt (browse the Objects folder,
+  read and write `ns=1;s=the.answer`, call a method, receive subscription notifications), one at Sign with a
+  Basic256Sha256-encrypted `UserNameIdentityToken`, and one holding a 10 s SecurityToken while reading every second for
+  30 s, which forces real mid-stream renewals across the overlap window. The replay feeds every recorded client
+  datagram back in at its recorded `t=` and requires this server to answer with **exactly the recorded bytes**, then
+  re-derives each connection's policy/mode, walks the opc.tcp framing of both directions (no `ERR`, at least three
+  `OPN` on the renewal channel), decodes the `GetEndpointsResponse` and requires our three endpoints with our own
+  certificate on the secured two, and checks `the.answer` ended at the value asyncua wrote.
+  What makes it replayable is what the module already had: `Server.init` takes the `std.Random` it draws from (one
+  seeded `DefaultCsprng` produces the RSA key pair, the certificate, every nonce, token id and AuthenticationToken, in
+  a fixed draw order), and `feed`/`tick` take `now_ms` with `wall_clock_epoch` fixing the wall clock's zero. What it
+  cannot carry: it cannot discover a NEW divergence (the peer's bytes are frozen at one asyncua release); it cannot
+  tell "we broke interop" from "we changed valid bytes" (a different nonce draw or a reordered endpoint list fails it
+  with no peer having refused anything: a red replay is a summons to re-run `zig build interop-opcua`, not a verdict);
+  it cannot prove asyncua ACCEPTS what we send; and asyncua's own assertions and exit status were checked when the
+  transcript was taken and are kept in the file as `#` notes.
+- **Live, outside the module** (`zig build interop-opcua`, needs a Python with `asyncua` + `cryptography`; `-- --capture`
+  rewrites the transcript): `tools/asyncua_driver.py` driving this server for real. The only half that can find a new
+  divergence, and a pre-release check; the replay is the per-commit one. `zig build check-interop` compiles it on every
+  lane so the instrument cannot rot.
+- **Basic256Sha256 goldens** (`server_interop.zig`): *self-derived*, labelled as such — a full asymmetric
+  `OpenSecureChannel` message (from a fixed key seed and a fixed OAEP seed, so `rsa.generate`, `rsa.selfSignedCert`,
+  RSA-OAEP and RSA-PKCS1v1.5 are pinned byte for byte) and one MSG chunk at each of Sign and SignAndEncrypt, each
+  re-encoded and re-opened identically; *captured* from a real `open62541 server_ctt` — the OPN request and response of
+  a live Sign handshake (real certificates cross-checked against each other's thumbprints; the encrypted region is
+  asserted opaque and block-aligned, since decrypting it needs an ephemeral key this repository does not persist) and
+  one Read request/response MSG chunk at each of Sign and SignAndEncrypt, decoded, decrypted, verified and re-encoded
+  byte-identically with the session keys that exchange derived. No live capture triggered multi-chunk secured framing;
+  `server.zig`'s multi-chunk-secured-Browse test covers it self-derived. **Key derivation KAT:** `deriveKeys` over two
+  fixed 32-byte nonces against bytes computed by an independent Python implementation of RFC 5246 §5's P_hash with
+  SHA-256; `pSha256` itself is anchored by the published TLS-1.2 PRF/SHA-256 vector, and the layout (which slice is
+  which key) is cross-checked by the live interop.
+- **`#None` goldens** cut from live traffic (`OPCUA_CAPTURE_DIR=… zig build test-opcua` dumps the raw streams): Hello,
+  OpenSecureChannel, GetEndpoints, CreateSession, ActivateSession, Read, Browse, CreateSubscription,
+  CreateMonitoredItems and an acknowledging Publish request are **captured** open62541 bytes; the ACK, OPN response,
+  GetEndpoints/Read/Publish responses are **self-derived** (this server's encoder) and labelled so in the source. Each
+  decodes and re-encodes byte-identically; all are anonymised (loopback addresses only, no certificates, no device
+  identities).
+- **Wireshark cross-check** (one-off): the captured messages were framed as pcap-style records and dissected with
+  `rawshark -d proto:opcua`; none was `_ws.malformed`, and the dissector read this server's own fields correctly.
+- **Stack probe** (`stackprobe_test.zig`, ReleaseFast only) and **ctgrind** (`ctgrind_harness.zig`, not in the test
+  lane): channel nonces through `deriveKeys` leave 0 contexts, keys and body through sign/encrypt and decrypt/verify
+  leave the HMAC verdict and the post-MAC padding/length handling (see the card's `**Hardening:**` line). The probe does
+  not reach the paths that need a live peer (Backlog).
+- **Mutation:** the optimised-build probes alone see the wipes of freed key material (`Allocator.free` poisons the block
+  in Debug and ReleaseSafe); those mutants are argued UNOBSERVABLE, not tested.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-  **What makes it replayable** is what the module already had, and nothing was
-  weakened or stubbed to get it: `Server.init` takes the `std.Random` it draws
-  from (one seeded `DefaultCsprng` produces the RSA key pair, the certificate,
-  every nonce, every token id and every AuthenticationToken, in a fixed draw
-  order), and `feed`/`tick` take `now_ms` as a parameter with
-  `wall_clock_epoch` fixing the wall clock's zero. Seed, `start_time` and every
-  `t=` are in the transcript.
 
-  **What the replay cannot carry, and must not be read as covering:**
-  - It cannot discover a NEW divergence. The peer's bytes are frozen at one
-    asyncua release; a change a newer asyncua would refuse passes here.
-  - It cannot tell "we broke interop" from "we changed valid bytes". A
-    different nonce draw or a reordered endpoint list fails it without any real
-    peer having refused anything. A red replay is a summons to re-run
-    `zig build interop-opcua`, not a verdict.
-  - It cannot prove asyncua ACCEPTS what we send — only that we still send what
-    asyncua accepted, which coincide only while the recording is current.
-  - It cannot check what was never bytes on the wire: asyncua's own assertions
-    (it found `the.answer` in the browse, its write read back as 31337, the
-    method echoed, its subscription handler fired, 30 reads survived the
-    renewals) and its exit status were checked when the transcript was taken and
-    are kept in the file as `#` notes because nothing here can re-check them.
-    What IS re-checked is that this server still produces the very bytes those
-    assertions were made about.
-- **Live, outside the module** (`zig build interop-opcua`, needs a Python with
-  `asyncua` + `cryptography`; `-- --capture` rewrites the transcript):
-  `tools/asyncua_driver.py` driving this server for real. It is the only half
-  that can find a new divergence, and it is a pre-release check — the replay is
-  the per-commit one. `zig build check-interop` compiles it on every lane so the
-  instrument cannot rot unnoticed.
-- **Basic256Sha256 goldens** — two families, both in `server_interop.zig`:
-  - **Self-derived**, labelled as such: a full asymmetric `OpenSecureChannel`
-    message (791 bytes, from a fixed key seed and a fixed OAEP seed, so the
-    whole stack under it — `rsa.generate`, `rsa.selfSignedCert`, RSA-OAEP,
-    RSA-PKCS1v1.5 — is pinned byte-for-byte) and one MSG chunk at each of
-    Sign and SignAndEncrypt. Each is re-encoded and re-opened identically.
-  - **Captured**, from a real `open62541 server_ctt`: the OPN request +
-    response of a live Sign handshake (real client and server X.509
-    certificates, cross-checked against each other's thumbprints; the
-    encrypted region is asserted opaque and block-aligned rather than
-    decrypted, since that needs the ephemeral, OS-entropy-seeded client RSA
-    key this repository does not persist), and one Read request/response MSG
-    chunk at each of Sign and SignAndEncrypt — decoded, decrypted, verified
-    *and* re-encoded byte-identically using the actual session keys that
-    exchange derived (dumped straight out of `ch.io.security.?.keys` right
-    after the live handshake succeeded, since re-deriving them offline would
-    need that same non-reproducible RSA key). Cut from `root.zig`'s "LIVE
-    open62541 secure interop" test with `OPCUA_CAPTURE_DIR` set, the same
-    mechanism as the `#None` goldens below. Not covered: no live capture here
-    triggered multi-chunk (`'C'`-type) secured framing — see `server.zig`'s
-    own multi-chunk-secured-Browse test for that, self-derived rather than
-    captured.
-  - **Key derivation KAT:** `deriveKeys` over two fixed 32-byte nonces
-    against expected bytes computed by an *independent* Python implementation
-    of RFC 5246 §5's P_hash with SHA-256 (OPC 10000-6 §6.7.5's construction);
-    `pSha256` itself is separately anchored by the published TLS-1.2
-    PRF/SHA-256 vector, and the *layout* (which slice is which key, and which
-    nonce is secret vs seed per direction) is cross-checked by the live
-    interop — a real asyncua/open62541 client cannot exchange one signed
-    chunk with this server if any of the six outputs is wrong or swapped.
-- **`#None` goldens** cut from live traffic (`OPCUA_CAPTURE_DIR=… zig build
-  test-opcua` dumps the raw streams): Hello, OpenSecureChannel, GetEndpoints,
-  CreateSession, ActivateSession, Read, Browse, CreateSubscription,
-  CreateMonitoredItems and an acknowledging Publish request are **captured**
-  open62541 bytes; the ACK, OPN response, GetEndpoints/Read/Publish responses
-  are **self-derived** (this server's encoder) and labelled as such in the
-  source. Each one decodes *and* re-encodes byte-identically. All of them are
-  anonymised: loopback addresses only, no certificates, no device identities.
-- **Wireshark cross-check.** `tshark` is unavailable here but `rawshark`
-  (Wireshark 4.6.4, same dissectors) is: each captured message was framed as
-  a pcap-style record and fed through
-  `rawshark -r /dev/stdin -d proto:opcua -F <field>`. Result: 198/198 messages
-  across the six streams dissected, **no `_ws.malformed`**, and the dissector
-  reads this server's own fields correctly — `opcua.EndpointUrl =
-  "opc.tcp://localhost:4840"`, `opcua.ApplicationUri =
-  "urn:zig-libs:opcua:interop-server"`, three `opcua.SecurityPolicyUri =
-  "…#None"` out of one GetEndpointsResponse, and `opcua.SubscriptionId=1`,
-  `opcua.MonitoredItemId=1`, `opcua.ClientHandle=1` plus a real wall-clock
-  `opcua.DateTime` out of a PublishResponse.
+## What is deliberately not done
 
-**Audit 2026-11-19 (key-length band under profile=small).** The full CI's `small` lane (`-Dprofile=small`, RSA capacity 4096 bits) failed four key-band tests: a 4097-bit certificate could not be parsed there, so it was `InvalidCertificate` / `BadCertificateInvalid` instead of `KeyLengthOutOfPolicy` / `BadCertificateUseNotAllowed`. The band is now checked on the modulus length read from the certificate's structure (`security.certificateKeyBits`, over `rsa.PublicKey.modulusBitsFromDer`) before the key is parsed, in `certificatePublicKeyForPolicy` (so also `checkContextKeyLengths` and `SecureChannel.open`) and in the server's `checkPeerCertificate`; the answer is now the same under every profile. Only the testing escape `insecure_allow_key_length_outside_policy` still differs: a key past the build's capacity cannot be used at all (`BadCertificateInvalid`). Delta mutation: 3 mutants (the early band check, the RSA OID check of `certificateKeyBits`, the server's band check), 3 killed after one killing test (an RSA key structure under another algorithm OID); the card counts are cumulative (993 + 3 of 1072 + 3). Tested in Debug (default profile) and ReleaseSafe with `-Dprofile=small`.
+Server side, deliberately out of scope for this part — each is a Bad status, never a silent partial answer:
 
-**Audit 2026-11-19 (delta mutation, NumericRange reference alignment).** 23 schemata mutants over the changed lines: `takesRange` and the unused-range Read path, the per-element null rule and its `NoData` guard, the String-element Write (exact element selection, element and width checks, null elements, byte offset), the `DataMismatch` statuses and the size checks, and `writeAttributeRange` (non-Value attributes and unused-range scalars falling back to a plain write, the status mapping). First pass 18 killed, 5 survivors (all in the new String-element write path and the `DataMismatch` mapping); five killing tests were added and a confirming run of those five killed all. **23 killed, 0 equivalent, 0 survivors**; the card counts are cumulative (970 + 23 killed of 1049 + 23, 79 eq). LIVE open62541 1.0.5 cases (ranged read/write of server_ctt's Demo Int32 scalar, Int32[10] and Int32[3][3], one table compared as a whole) pin open62541's answers; the lines marked KNOWN DIFFERENCE are where this module answers otherwise (element-count mismatch, write past the end and too few dimensions: open62541 says `BadIndexRangeInvalid`, here DataMismatch/NoData per §5.11.4/§7.27; a range on a scalar: `BadIndexRangeNoData` there on Read and Write, not used here per §7.28/§5.11.4 and node-opcua). A ranged read of the NamespaceArray (a data-source node) is `BadIndexRangeInvalid` in open62541 and is not pinned.
+- **Security policies other than `#None` and `Basic256Sha256`:** no `Basic128Rsa15`, no `Basic256` (both deprecated), no
+  `Aes128Sha256RsaOaep`, no `Aes256Sha256RsaPss` (an enum value + URI only). Any OPN naming one is
+  `BadSecurityPolicyRejected`. The newer two are wanted (Backlog).
+- **Identity tokens:** no `X509IdentityToken`, no `IssuedIdentityToken` (`BadIdentityTokenInvalid`) — and therefore no
+  `UserTokenSignature` verification, which is what those tokens need.
+- **PKI:** no trust store, no chain building, no CRL/OCSP, no `ApplicationUri`-vs-SAN matching — see the threat model;
+  the accept/reject verdict is the caller's `CertificatePolicy`. A library that invented a trust list would be wrong
+  everywhere.
+- **Filters:** no deadband or event filters on monitored items (`BadMonitoredItemFilterUnsupported`), and therefore no
+  events, no `EventNotificationList` production, no alarms & conditions (Backlog).
+- **Node management:** no AddNodes/AddReferences/DeleteNodes/DeleteReferences (`BadServiceUnsupported`) — the address
+  space is built by the host program, not over the wire (Backlog).
+- **Other service sets:** no Query, no HistoryRead/HistoryUpdate (Backlog), no RegisterNodes/UnregisterNodes, no
+  RegisterServer, no session transfer between channels, no `TransferSubscriptions`, no Views (a non-null ViewId is
+  `BadViewIdUnknown`), no `DataEncoding` other than Default Binary, no reverse-connect, no discovery server
+  registration, no multi-server namespaces (`ExpandedNodeId.server_index` is decoded, never resolved).
+- **Address space:** the seeded namespace 0 is the browsable *skeleton*, not the full ~2000-node standard nodeset (a
+  generated NodeSet2 artifact; Backlog); no ModellingRules, no `Argument` metadata on Method nodes (a Call's arguments
+  are validated by the method implementation itself), no `DataTypeDefinition`/`RolePermissions`/`AccessRestrictions`
+  attributes.
+- **Interleaving:** one message at a time per connection (a second chunk run interleaved with an unfinished one is
+  `BadTcpMessageTypeInvalid`); a response is never sent in chunks smaller than the negotiated buffer minus its own
+  framing.
+- **Client side:** no `Variant` `ArrayDimensions` reshaping (multi-dimensional arrays stay flat).
 
-**Audit 2026-11-19 (delta mutation, NumericRange).** 72 schemata mutants over the new non-test code: `numeric_range.zig` (parser: digit bounds, u32 overflow, length and dimension caps, `a:b` order, separators, dimension bookkeeping; `Selection` odometer and strides; `select` clipping vs exact, `arrayLens` fallbacks, `subBytes`, `readRange`/`writeRange` status codes, nested String dimension, element placement, kept `dimensions`), `NodeStore.writeAttributeRange` (empty range delegation, attribute and access checks and their precedence, stored-value and status mapping, kept status and source timestamp) and the Read handler's range branch. Offline tests only (`numeric_range`, the three `NumericRange` server tests, the Read/Write tests and the range fuzz harness were selected; the LIVE and loopback tests were not). First pass: 65 killed, 7 survivors; a second pass after five new tests: **70 killed, 2 EQUIVALENT, 0 survivors**. The two: dropping the `text.len == 0` guard of `parse` (an empty text then fails in `readIndex` with the same error) and `d <= 0` -> `d < 0` in `arrayLens` (a zero dimension needs a zero-length array, and every range on an empty array is `NoData` either way). Two judgement calls: the `NodeStore` write branch for a Variable whose DataValue has no value at all is reachable only through `addNode` with a raw `VariableAttributes` (the test builds one), and the Read handler's non-Value attribute branch is observable only through `ArrayDimensions` (same). The card counts are cumulative (900 + 70 killed of 977 + 72, 77 + 2 eq). The range fuzz harness `opcua-range` ran clean for 18750 runs in 19 s (every reach label hit; the lowest, `text_write`, 113 times); its first runs found two wrong expectations in the harness itself (an empty edited text is "no range", and a nested String read clips each element), no defect in the module.
-
-**Audit 2026-11-19 (delta mutation, client-side services).** 50 schemata mutants over the new non-test code of `root.zig` and `services.zig` (the shared OPN `exchange` of `open`/`renew`, `renewalDue`, the `renew` guards and `renewIfDue`, `modifyMonitoredItems` with its handle-table update, `setMonitoringMode`, `translateBrowsePaths`, the two new `result_fns`): guard drops, flipped comparisons and boundary shifts, skipped assignments, swapped request types, wrong request fields, a dropped `results` loop. Offline tests only (the LIVE open62541 cases were left out of the runner, as in every earlier run, and ran in the plain `modtest`). Result: **48 killed**, **2 UNOBSERVABLE**, 0 survivors. The two are the wipes of stack copies of key material: the local `ChannelKeys` in `exchange` (`derived`, copied into the channel one line before) and the local `SecureChannel` in `openBody` after it was copied to `out`; both frames sit under `burn.run(open_burn)` and only a ReleaseFast stack probe with a live peer could see them (see the 2026-10-09 backlog note: `stackprobe_test.zig` does not reach the live paths). A first pass left one survivor (the `i >= specs.len` guard of the `modifyMonitoredItems` bookkeeping, reachable only by a server that answers more results than items), killed by a scripted-peer test; the request fields on the wire are pinned by decoding the client's last request in the pipe tests (a field swap or a wrong timestamps mode is visible only there, the server ignores `TimestampsToReturn`). The card counts are cumulative (838 + 48 killed of 912 + 50, 74 + 2 eq).
-
-**Audit 2026-11-19 (delta mutation, review fixes).** 15 schemata mutants over the review-fix code (the renewal floor, the zero-lifetime and nonce-length refusals, the result-count refusal of `createMonitoredItems`/`modifyMonitoredItems` with its free, the nonce-wipe defer). 14 killed (13 in the first run, 1 in the confirming run), 1 UNOBSERVABLE (skipping the `secureZero` of the heap-held server nonce right before its `free`: the safe-build allocator poisons freed bytes, so only a ReleaseFast scanning allocator could see it), 1 survivor in the first pass (the `>` variant of the create count check, which no test exercised with a short or absent result array); a scripted test for that was added afterwards and a confirming run (that mutant alone, ONLY=8) killed it (`FAIL (TestExpectedError)`: the short answer was accepted). The card counts stay cumulative (886 + 14, 962 + 15 -> shown as 900/977, 77 eq).
-
-**Audit 2026-11-18 (whole-module mutation).** 885 schemata mutants over the non-test code of every source file (`transport`, `encoding`, `security`, `services`, `nodestore`, `server`, `root`): guard drops and boundary flips, skipped assignments and counters, flipped returns, wipe skips, comparison/connective flips inside return and `const` expressions, and 9 hand-written ones. Offline only: the podman/open62541 tests were not selected; the loopback client-to-server test, the golden captures and the asyncua replay were. Result: **809 killed** (7 of them by timeout), **29 EQUIVALENT**, **45 UNOBSERVABLE**, 2 excluded (a test-support allocator inside `services.zig`); none open. The card carries 809/883 with 74 eq (equivalent + unobservable). The second pass (after a first one that left 220 open) added tests, all in `server.zig` except two scripted client tests in `root.zig`, for: the SecureChannel gate (short bodies, channel 0 before any OPN, a foreign channel id, an OPN with channel id 0 on an open channel, CLO interleaved into a MSG run, assembly state reset after a message and an abort), channel teardown (`deinit` clears ids, token deadline, certificate and both key sets), the token window (`tokenExpired` boundary, token 0 never riding on an unset previous token, a 6-byte and an 8-byte secured body, a replayed secured renewal refused by its sequence number), send-side sequence wrap and the exact `max_chunk_count`, OPN handler states (foreign body type, mode mismatch, renewal without a channel, channel/token/session/subscription/monitored-item/continuation-handle wraps to 1, an issue dropping the overlap token, a refused secured renewal followed by a `#None` OPN), the client side of the secured-OPN sequence rebase, Read/Write attribute-id-before-node order, index ranges and data-encoding names, `applyTimestamps` per mode, BrowseNext/Translate/Call list limits, handle echo and per-item rules (dangling reference target, direction, type filter, subtypes, namespace of the target name, inverse links, executable flags, missing implementation, empty argument list), subscription and monitored-item limits and stored fields, and the publish engine (keep-alive, late and lifetime counters at their boundaries, the 64-cycle stall resync, sampling grid and disabled mode, both queue overflow policies, the retransmission bound, `MaxNotificationsPerPublish` splitting, sampling-mode items never reported, a pending keep-alive staying a keep-alive, two due cycles answering two parked Publish requests, a connection ticking only its own channel's sessions). The `root.zig` client bookkeeping is pinned by two tests that run `SecureChannel`/`Session`/`Subscription` against `Connection` over an in-memory pipe (a `std.Io.Reader` whose `stream` pumps the server; no socket, no thread) at `#None` and at SignAndEncrypt (token fields, revised session timeout, subscription and monitored-item bookkeeping, session reset on `deinit`, the session nonce read back by decrypting the client's own CreateSession, the key payload not retained after `close`, a CreateSession answer signed with another key refused) and by two scripted-peer tests (surplus and failed `CreateMonitoredItems` results, every notification kind, an empty Read, an absent acknowledgement list, an empty server nonce). **One defect found and fixed:** `Session.create` leaked the SessionId and the AuthenticationToken (an opaque 32-byte string) when it refused a CreateSession answer after receiving it (a bad ServerSignature); `freeCreateSessionResponse` leaves both NodeIds to the caller, which the success path hands to the `Session`. The error path now frees them. No wire or API behaviour changed.
-
-**EQUIVALENT / UNOBSERVABLE (74).** `len < -1` -> `<= -1` in four length decoders and the server's string reader (the -1 case returns one line earlier); the 4-byte prefix checks of `viewAsymmetricHeader`/`openAsymmetricMessage` (subsumed by the loop bound that follows); `enc_len == 0` and `body_end < 16` (subsumed by later minimum-length checks); `k <= 42` in four RSA helpers (needs a modulus of at most 336 bits, `rsa` refuses below 512); the `> maxInt(i32)` and `> maxInt(u32) - 8` bounds at exactly their limit (a 2 GiB / 4 GiB input); attribute id 27 (the store answers BadAttributeIdInvalid, the same status as the range check); `Server.deinit`/`NodeStore.deinit` poison writes and the `secureZero` calls on freed locals (not observable without an allocator that snapshots blocks; stack residue is the stackprobe test's job); CreateSession on channel 0 (`handleSecureChunk` refuses the chunk first). Second pass: `space == 0` in `Connection.feed` (a chunk is refused above the negotiated receive size, so the buffer is never full with an incomplete chunk); `len < -1` in the server's `takeStringSlice` (`viewAsymmetricHeader` already refused it); the `.none` branch of the send-side chunk budget (`maxSymmetricPayload(.., .none)` subtracts the same 24 bytes); the issue branch's `prev_token_id`/`prev_token_valid_until_ms` resets (already done by `closeChannel`); `requested == 0` in `reviseLifetime` (`@max(0, floor)` is `floor`); the publish engine's tail guards that duplicate `publishNotification`'s own empty-queue return; the Int32 element bounds of `encodeU32Array`/`encodeStatusCodeArray` (a 2 GiB array); the wipe of the client nonce on the stack, of the decoded server nonce before its free and of the channel keys right before `sec.keys = null` in `SecureChannel` (residue is the ReleaseFast stackprobe's job).
-
-## Deferred / not implemented
-
-Server side, deliberately out of scope for this part — each is a Bad status,
-never a silent partial answer:
-
-- **Security policies other than `#None` and `Basic256Sha256`:** no
-  `Basic128Rsa15`, no `Basic256` (both deprecated), no `Aes128Sha256RsaOaep`,
-  no `Aes256Sha256RsaPss` (an enum value + URI only). Any OPN naming one is
-  `BadSecurityPolicyRejected`.
-- **Identity tokens:** no `X509IdentityToken`, no `IssuedIdentityToken`
-  (`BadIdentityTokenInvalid`) — and therefore no `UserTokenSignature`
-  verification, which is what those tokens need.
-- **PKI:** no trust store, no chain building, no CRL/OCSP, no
-  `ApplicationUri`-vs-SAN matching — see the threat model; the accept/reject
-  verdict is the caller's `CertificatePolicy`.
-- **NumericRange on monitored items:** the `IndexRange` of a `MonitoredItemCreateRequest`'s `ItemToMonitor` is ignored (the whole value is sampled and reported); Read and Write apply it (see the 2026-11-19 DONE entry in the Backlog).
-- **Filters:** no deadband or event filters on monitored items
-  (`BadMonitoredItemFilterUnsupported`), and therefore no events, no
-  `EventNotificationList` production, no alarms & conditions.
-- **Node management:** no AddNodes/AddReferences/DeleteNodes/DeleteReferences
-  (`BadServiceUnsupported`) — the address space is built by the host program,
-  not over the wire.
-- **Other service sets:** no Query, no HistoryRead/HistoryUpdate, no
-  RegisterNodes/UnregisterNodes, no RegisterServer, no session transfer
-  between channels, no `TransferSubscriptions`, no Views (a non-null ViewId is
-  `BadViewIdUnknown`), no `DataEncoding` other than Default Binary, no
-  reverse-connect, no discovery server registration, no multi-server
-  namespaces (`ExpandedNodeId.server_index` is decoded, never resolved).
-- **Address space:** the seeded namespace 0 is the browsable *skeleton*, not
-  the full ~2000-node standard nodeset (a generated NodeSet2 artifact); no
-  ModellingRules, no `Argument` metadata on Method nodes (a Call's arguments
-  are validated by the method implementation itself), no
-  `DataTypeDefinition`/`RolePermissions`/`AccessRestrictions` attributes.
-- **Interleaving:** one message at a time per connection (a second chunk run
-  interleaved with an unfinished one is `BadTcpMessageTypeInvalid`); a
-  response is never sent in chunks smaller than the negotiated buffer minus
-  its own framing.
-- Client side, unchanged from before: no `Variant` `ArrayDimensions`
-  reshaping (multi-dimensional arrays stay flat).
-
-## Status
-
-`gap · any · both(client + server) · single_owner` + deps: `rsa`, `x509` —
-canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring
 
@@ -508,26 +458,12 @@ canonical source is `pub const meta` in src/root.zig.
 
 **What the tests actually contain.** P-SHA256/AES KAT EXTERNAL; binary framing self round-trip; open62541 interop skips if unreachable
 
-**How it got there.** The anchoring work landed. DONE 02ecea2: real open62541 Sign+SignAndEncrypt handshakes captured and frozen
-
 ## Backlog / deferred
 
-- (2026-11-19) **LIVE fixture is not safe to run twice at once.** The open62541 LIVE tests start a container with a fixed name (`opcua-zig-libs-live-test`) on the fixed port 4840, so two test runs in parallel (two worktrees, or a test run next to a mutation run) break each other with spurious failures and extra skips, and a crashed run leaves a stale container behind. Next: a per-run container name and an ephemeral host port passed to the tests, and removal of a stale container of the same run at start.
-- **DONE 2026-11-19 — Client-side SecureChannel renewal.** `SecureChannel.renew(now_ms, options)` sends `OpenSecureChannel` with `RequestType = Renew` (OPC 10000-4 §5.5.2) on the open channel: same channel id, policy and mode; at Sign/SignAndEncrypt fresh nonces are exchanged and the keys re-derived (P-SHA256, §6.7.5). `renewalDue(now_ms)` / `renewIfDue(now_ms, options)` implement the timing: **75 % of the revised lifetime, but not sooner than `min_renewal_delay_ms` (50 ms) after the token arrived** (node-opcua clamps its renewal timer to `max(75 %, 50 ms)`; open62541 has no floor; a revised lifetime of 0 is refused with `error.InvalidTokenLifetime`) (OPC 10000-4 §5.5.2.1; open62541's client sets `nextChannelRenewal` to 75 % of the revised lifetime in `ua_client_connect.c`, node-opcua raises `lifetime_75` and renews in `client_secure_channel_layer.ts`; both read in 2026-11). One deliberate difference: they count from the server's `CreatedAt` (open62541) or a local timer; this module has no clock (`meta.platform = .any`), so the caller passes a monotonic `now_ms` to `open` (`OpenOptions.now_ms`) and `renew`, and the deadline is counted on that local clock, immune to server clock skew. The new token and keys take over the moment the answer is read (what both references do); the server keeps accepting the old token for `token_renewal_overlap_ms`, capped at its own expiry (the server half, unchanged), so a request that was in flight is not cut off. A refused renewal (a Bad answer, an answer naming another channel, an empty server nonce at a secured policy, a failed signature) leaves the old token, keys, lifetime and install time untouched, so the caller can retry while the old token lives; renewing a channel that was never opened or was closed is `error.InvalidSecureMessage` before any I/O. The client has one request in flight at a time, so `renew` is called between requests; with no lifetime (`token_lifetime_ms == 0`) nothing is ever due. Tests: renewal timeline over the in-memory pipe at SignAndEncrypt with an injected clock (not due at 7 499 ms of 10 000, due at 7 500; tokens and keys switch; the session carries on; a message sealed under the old token is served at the last instant of the overlap (`<=`) and the connection is dropped one millisecond later; a second renewal, a lifetime clamped by the server, a closed channel refused), scripted-peer tests (answer for another channel / without a nonce keep the old state; a good answer swaps it), `renewalDue` boundaries and overflow, and one LIVE case against open62541 (renew, same channel id, new token, the session keeps reading).
-- **DONE 2026-11-19 — Client-side SetMonitoringMode.** `Subscription.setMonitoringMode(mode, item_ids)` (OPC 10000-4 §5.12.4): the raw service for a list of ids on this subscription, one `StatusCode` per id (a stale id is a Bad entry, not a failed call), the caller frees it with `services.freeSetMonitoringModeResponse`. open62541's `UA_Client_MonitoredItems_setMonitoringMode` (`client_subscriptions.h`) is the same call. No local bookkeeping: the client table does not track the mode. Tests: pipe fixture (the three modes, a stale id among good ones, only the named item moves, an empty list as ServiceFault) and one LIVE case against open62541.
-- **DONE 2026-11-19 — Client-side ModifyMonitoredItems.** `Subscription.modifyMonitoredItems(specs, timestamps)` (OPC 10000-4 §5.12.3, no filter, like `createMonitoredItems`). `MonitoredItemModifySpec` carries the `ClientHandle` because the spec puts it into the modified parameters and our server stores it, so later notifications carry the new handle; the `monitored_items` correlation table therefore follows the new handle for every item whose result is not Bad, and a Bad result (stale id) leaves the entry as it was. Reference: open62541's `UA_Client_MonitoredItems_modify` (`client_subscriptions.h`) is the same service; here the revised values are in the returned `ModifyMonitoredItemsResponse` (the caller frees it with `services.freeModifyMonitoredItemsResponse`), as for `createMonitoredItems`. `services.result_fns` gained `modify_monitored_items`/`set_monitoring_mode`. Tests: pipe fixture (handle re-label, server-side sampling/queue/discard fields, a stale id answered Bad with the entry untouched, an empty list as ServiceFault) and one LIVE case against open62541.
-- **DONE 2026-11-19 — Client-side TranslateBrowsePathsToNodeIds.** `Session.translateBrowsePaths(paths)` is the raw service, one `BrowsePathResult` per `BrowsePath` (a path that matched nothing is a Bad per-path status, not a failed call; an empty list is the server's `BadNothingToDo` ServiceFault, kept on `Channel.last_service_result`), the caller frees it with `services.freeTranslateBrowsePathsToNodeIdsResponse`. Shape: open62541 exposes the generated service call `UA_Client_Service_translateBrowsePathsToNodeIds` (results as the server sent them) beside a one-path convenience `UA_Client_translateBrowsePathToNodeIds`; this module ships the service call, consistent with `browse`/`read`/`call` here, and leaves a single-path helper to callers (the request/response types and codecs already existed for the server half). Tests: the module's own server over the in-memory pipe (forward path to the user variable, an inverse step, no match, unknown start node, empty element list, the resolved id read back, the empty-request fault) and one LIVE case against open62541 (Root/Objects/Server/ServerStatus/CurrentTime resolves to `i=2258`).
-- **DONE 2026-11-19 — Per-policy RSA key-length band** (wave-7 rsa floor follow-up). `SecurityPolicy.minAsymmetricKeyBits`/`maxAsymmetricKeyBits`/`allowsKeyBits` (2048..4096 for `Basic256Sha256` and the reserved `Aes256_Sha256_RsaPss`; Aes128_Sha256_RsaOaep has the same row but is not an enum value here; Basic128Rsa15/Basic256 are not implemented, so their 1024..2048 row has nothing to attach to). Enforced on the peer certificate key (server: `checkPeerCertificate`, `BadCertificateUseNotAllowed` — what open62541 answers, `plugins/crypto/mbedtls/securitypolicy_rsa.c` `rsaNewChannelContext`, 256..512 bytes; client: `SecureChannel.open` -> `error.KeyLengthOutOfPolicy`), on the own key (server: OPN refused `BadSecurityPolicyRejected`; client: same error; `generateSelfSigned` with `modulus_bits` out of band -> `error.KeyLengthOutOfPolicy` before any prime search). One deliberate difference from open62541: the band is on the exact bit length (the spec text), not `(bits+7)/8`, so a non-byte-aligned 2041..2047-bit modulus is refused here and accepted there. node-opcua documents the same 2048/4096 rows (`security_policy.ts`) and enforces them via its certificate checks. Testing escape `insecure_allow_key_length_outside_policy` on `GenerateSelfSignedOptions`, `SecurityContext` and `SecurityConfig` (named after rsa's `insecure_allow_small_modulus`); the module's own tests use fixed 1024/1280-bit keys through it, so a 1024-bit key under the default policy is exercised only by the dedicated band tests (1024/2047/2048/4096/4097 per policy, synthetic SPKI certificates). Delta mutation 2026-11-19 of the band code (policy constants and comparison, `generateSelfSigned` guard, `checkContextKeyLengths`, the server's own-key and peer-certificate checks and their statuses, the `SecureChannel.open` call): 29 mutants, 29 killed, 0 survivors; the card counts are cumulative (809 + 29 killed of 883 + 29). The LIVE open62541 interop tests were left out of the mutant runs (they stall under the runner's time limit) and ran in the plain `modtest`.
-- (2026-10-09, dead-stack sweep) **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
-- (survey 2026-09-30) **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`**: `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
-- (survey 2026-09-30) **Monitored-item filters (deadband) and events/alarms & conditions**: nearly every open62541/node-opcua user subscribes with a deadband; events are the next request; medium (deadband) to large (A&C), fits §2.
-- **DONE 2026-11-19 — NumericRange on Read/Write** (OPC 10000-4 §7.27; was: every non-empty `IndexRange` answered `BadIndexRangeInvalid`). New `numeric_range.zig`: `parse`/`Range.format`/`Range.init`, `readRange`, `writeRange`; the server applies them in the Read handler (`readOne`) and `NodeStore.writeAttributeRange` (Write); the client sends one with `Session.readAttributeRange` / `writeValueRange` (or any `ReadValueId.index_range`/`WriteValue.index_range` string). Rules, spec first, open62541 (`UA_NumericRange_parse`, `checkAdjustRange`, `UA_Variant_copyRange`, `Variant_setRange`, `ReadWithNodeMaybeAsync`; MPL-2.0, read as behaviour only) where the spec is silent:
-  - Syntax: `dimension[,dimension]*`, `dimension = n | n:m`, digits only (leading zeros allowed by the grammar), each index a `u32`; `n:m` needs `n < m` (so `3:3`, `5:2` are errors; one element is `3`). Anything else, an empty dimension, a sign, a space, an index above 2^32-1 -> `BadIndexRangeInvalid`. Bounds: text <= 256 bytes, <= 16 dimensions (open62541 allows 100; real arrays have a handful), so nothing is allocated for an index, only for the elements actually selected (<= the stored array); all arithmetic is `u64`.
-  - Read: a range reaching past the end is clipped to the array (§7.27: lower bound out of range is `Bad_IndexRangeNoData`, an upper bound out of range gives a partial result; open62541 `checkAdjustRange` clamps too); one that starts past the end, a dimension count different from the value's (§7.27: "All dimensions shall be specified for a NumericRange to be valid"; "All other invalid requests with a valid syntax shall result in Bad_IndexRangeNoData"), an empty/null value, or a non-Value attribute (open62541 `ReadWithNodeMaybeAsync`) -> `BadIndexRangeNoData`. The result is a `DataValue` with the clipped slice (`dimensions` set for a multi-dimensional array) and the stored status and timestamps. A String/ByteString scalar takes a one-dimension range over its bytes; an array of Strings/ByteStrings takes one more trailing dimension over the bytes inside each selected element (§7.27: "Arrays of ByteString and String values are treated as two dimensional arrays"); an element with nothing in the byte range is a null element and only "no element has data" is `NoData` (§7.27 Table 166: `0:1,7:9` on `["TestString","Test","String"]` gives `["ing", null]`, `0:1,10:15` gives `Bad_IndexRangeNoData`; open62541 `UA_Variant_copyRange` instead fails the whole request when one element fails: known difference, the spec wins). Order of checks: attribute id, syntax, data encoding, node (unknown node wins over a well-formed range).
-  - A scalar that is not a String/ByteString/XmlElement takes no range, on Read and on Write: the range is not used and the whole value is read or written. Spec: §7.28 ReadValueId, indexRange: "This parameter is null or empty if the specified Attribute is not an array." and §5.11.4 Write: "This parameter is not used if the specified Attribute is not an array." node-opcua (`extractRange`/`canRange`, datavalue.ts) does the same. **Known difference:** open62541 treats a scalar as a one-element array (`UA_Variant_copyRange`), so index `0` reads it and any other index is `BadIndexRangeNoData` (the LIVE test asserts open62541's answer).
-  - Write: the range must lie inside the stored array (no growth; `BadIndexRangeNoData`); the new value must have exactly as many elements as the range selects, else **`BadIndexRangeDataMismatch`** (§5.11.4 result code: "The data to be written does not match the IndexRange."; §7.27: "When writing a value, the size of the array shall match the size specified by the NumericRange"). **Known difference:** open62541 answers `BadIndexRangeInvalid` (`Variant_setRange`); the LIVE test asserts that. A scalar of the right type counts as one element (the spec text says the Value "shall be an array even if only one element is being written"; open62541 accepts a scalar too). Same built-in type as the stored one (`BadTypeMismatch`, as open62541). Nothing stored (`.empty`/null) -> `BadIndexRangeInvalid` (open62541 `writeInternalValueAttribute`). Access-level checks keep their precedence. A range on a non-Value attribute is not used and the attribute is written (or refused) as without it (open62541 ignores it too; the spec does not restrict ranges to Value). The write is built on a copy and swapped in, so every refusal leaves the stored value untouched.
-  - Write into the bytes of String elements of an array of Strings/ByteStrings (one more dimension than the array): the new value holds one String per selected element, each exactly as wide as the byte range; every selected element must contain the range (`NoData`), counts and widths are checked (`DataMismatch`). Bounded like Read: only selected elements are copied.
-  - Not done: monitored items ignore `IndexRange` (see Deferred); `NumericRange` strings with more than 16 dimensions are refused.
-  - Tests: syntax table (valid / invalid, bounds), `readRange`/`writeRange` per status code, multi-dimensional and string cases, no allocation for a huge index (failing allocator), the module's own server over the wire (`server.zig`: 3 tests), our client against our server over loopback (`Session.readAttributeRange`/`writeValueRange`), the server fuzz harness `opcua-range` (`OPCUA_FUZZ=<runs> OPCUA_FUZZ_ONLY=opcua-range`; a model of an Int32[5] re-derived from the grammar, structured and byte-edited ranges, reach labels counted over 300 seeds in the plain test lane). LIVE open62541 cases in `root.zig` (one table, see the audit paragraph).
-- (survey 2026-09-30) **HistoryRead**: needed for historian access; medium, fits §2 (the store is caller-supplied).
-- (survey 2026-09-30) **Full standard NodeSet + node management + PubSub (Part 14)**: large, fits §2 for NodeSet (generated data); PubSub is a project of its own.
+- **LIVE fixture is not safe to run twice at once.** The open62541 LIVE tests start a container with a fixed name (`opcua-zig-libs-live-test`) on the fixed port 4840, so two test runs in parallel (two worktrees, or a test run next to a mutation run) break each other with spurious failures and extra skips, and a crashed run leaves a stale container behind. Next: a per-run container name and an ephemeral host port passed to the tests, and removal of a stale container of the same run at start.
+- **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
+- **NumericRange on monitored items:** the `IndexRange` of a `MonitoredItemCreateRequest`'s `ItemToMonitor` is ignored (the whole value is sampled and reported); Read and Write apply it.
+- **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`** (survey): `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
+- **Monitored-item filters (deadband) and events/alarms & conditions** (survey): nearly every open62541/node-opcua user subscribes with a deadband; events are the next request; medium (deadband) to large (A&C), fits §2.
+- **HistoryRead** (survey): needed for historian access; medium, fits §2 (the store is caller-supplied).
+- **Full standard NodeSet + node management + PubSub (Part 14)** (survey): large, fits §2 for NodeSet (generated data); PubSub is a project of its own.

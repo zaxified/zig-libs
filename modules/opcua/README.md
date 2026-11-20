@@ -114,7 +114,10 @@ Transport-agnostic: `Connection` takes an already-connected
 (CreateSession/ActivateSession/CloseSession), the service functions
 `read`/`write`/`browse`/`browseNext`/`call`, and `Subscription`
 (CreateSubscription / MonitoredItems / Publish with typed `Notification`
-decoding) — all over the transport's chunk assembler.
+decoding, `modifyMonitoredItems`, `setMonitoringMode`), `Session.translateBrowsePaths`,
+`SecureChannel.renew`/`renewIfDue` — all over the transport's chunk assembler. The RSA key of a peer
+certificate (and of the own key) must be 2048..4096 bits for `Basic256Sha256`
+(`error.KeyLengthOutOfPolicy` on the client, `BadCertificateUseNotAllowed` on the server).
 
 ## Server: the address space (`opcua.nodestore`)
 
@@ -240,11 +243,14 @@ var srv = opcua.server.Server.init(gpa, &store, .{
   chain: an OPC UA trust list is a deployment artifact. `null` accepts any
   structurally valid, in-date certificate — a lab setting, documented as such.
 
-Not implemented, each a `Bad…` status rather than a silent partial answer:
-`Basic128Rsa15`, `Basic256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`,
-`X509IdentityToken`/`IssuedIdentityToken`, certificate revocation (no CRL/OCSP
-— fold that into your `certificate_policy`), and `ApplicationUri`-vs-SAN
-matching. See SPEC.md.
+## Not provided
+
+Each a `Bad…` status rather than a silent partial answer: security policies other than `#None` and `Basic256Sha256`
+(`Basic128Rsa15`, `Basic256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), `X509IdentityToken`/`IssuedIdentityToken`,
+a trust store and certificate revocation (no CRL/OCSP — fold that into your `certificate_policy`),
+`ApplicationUri`-vs-SAN matching, deadband/event filters and events, HistoryRead, node management, PubSub, and the full
+standard NodeSet. `IndexRange` is applied on Read and Write but ignored on monitored items. What is deliberately refused
+is in SPEC.md *What is deliberately not done*; what is wanted and open is in *Backlog / deferred*.
 
 ## Verification
 
