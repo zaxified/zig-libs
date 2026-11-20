@@ -22,8 +22,7 @@ claim is settled by RUNNING the real `uci` binary: `root.zig`'s "real uci
 capture" and "addressing
 probe" sections freeze raw config bytes together with that binary's own
 `export`/`show`/`get` stdout, taken inside the `scripts/vm/` OpenWRT VM and
-replayed by tests — a black-box oracle, which root `NOTICE` §0 records as owing
-no attribution. See SPEC.md for the findings.
+replayed by tests — a black-box oracle that owes no attribution. See SPEC.md for the findings.
 
 ## API
 
@@ -100,7 +99,7 @@ a rename onto a section name or option key already in use (`uci` then holds
 two of one name, which `parse` refuses and `serialize` cannot write) —
 `error.DuplicateSection` / `error.DuplicateOption`.
 
-## Files, commit, batch, import (since 2026-11-04; POSIX)
+## Files, commit, batch, import (POSIX)
 
 ```zig
 // The caller opens the directories (the module never discovers /etc/config)
@@ -141,8 +140,6 @@ try store.revert("network");                             // `uci revert network`
 - `Session` stops at the first failing command (`error.NoSuchSection`, ...);
   `RunOptions.keep_going` runs on like `uci batch` and counts failures in
   `RunReport`. Edits live in memory until `commit`; `discard` drops them.
-- Not done (see SPEC.md): a rename onto a name already in use (the binary holds
-  two; not built, budget), ucimap, hooks.
 
 Provenance of the data and tools added with this layer: `src/testdata/store_capture.txt`
 is the output of `tools/capture-store.py` (the real `uci` run as a black box on
@@ -213,8 +210,10 @@ builds from a source copy (`LIBUCI_SRC`), whose source is never kept here.
 - Canonical output: optional `package <name>` header (bare when
   identifier-safe, quoted otherwise — matches real `uci export`'s own
   rendering), blank line between section blocks, tab-indented options, values
-  single-quoted (double-quoted with escapes when they contain `'` or control
-  characters).
+  single-quoted (double-quoted with escapes when they contain `'`; a control
+  byte other than tab, LF and CR is `error.UnserializableValue`). `serialize`
+  also refuses an empty section type, section name or option key
+  (`error.InvalidName`), which `parse` accepts.
 - Bounded: inputs over 16 MiB → `error.InputTooLarge`; lines over 16 KiB →
   `error.LineTooLong`; the built model over 300000 total items (sections +
   options + values, combined) → `error.MemoryLimitExceeded` (audit A1 U3 —
@@ -224,16 +223,26 @@ builds from a source copy (`LIBUCI_SRC`), whose source is never kept here.
 
 - An empty quoted section name (`config rule ''`) is treated as anonymous;
   an empty quoted section type or option key (`config ''`, `option '' v`) is
-  accepted literally — the one case the name/type/key validation above does
-  not cover, since real `uci` treats a zero-length argument as "insufficient
+  accepted literally by `parse` — the one case the name/type/key validation above
+  does not cover, since real `uci` treats a zero-length argument as "insufficient
   arguments" (a different failure mode) rather than an invalid character.
-- Values containing ANY control character below 0x20 — `\n` `\t` `\r`
-  included, since none of them has a working escape (see above) — cannot be
-  represented in UCI text and serialize to `error.UnserializableValue`.
+  `serialize` refuses to write one (`error.InvalidName`).
+- Values containing a control character below 0x20 other than `\n`, `\t` and
+  `\r` cannot be represented in UCI text and serialize to
+  `error.UnserializableValue`; those three are written literally inside the
+  quotes (see above).
 - Staged-but-uncommitted state (`uci set` without `commit` — LuCI's "Save"
   without "Apply") is NOT in `/etc/config/<pkg>`: read the delta file
-  (`/tmp/.uci/<pkg>`; the reading stays the caller's I/O) and pass it to
-  `applyDelta`. An empty delta file means nothing is staged (`uci revert`
-  truncates rather than deletes it). Still out of scope: `commit` itself
-  (writing `/etc/config` — keep that on the binary, which also runs the
-  hooks), `/etc/config` discovery, `/var/state`, `uci import`.
+  (`/tmp/.uci/<pkg>`; `Store.loadStaged` does it, or pass the bytes to
+  `applyDelta`). An empty delta file means nothing is staged (`uci revert`
+  truncates rather than deletes it). `commit` and `uci import` are in the file
+  layer above (`Store`, `Session`); `/etc/config` discovery is the caller's (it
+  opens the directory), and hooks are the caller's too.
+
+## Not provided
+
+A rename onto a section name or option key already in use (the binary holds two of
+one name), ucimap typed schemas and plugins, hooks and `reload_config`, `-S`,
+`-q`, `changes`, `-n`/`-N`, following a symlink chain out of the config
+directory. SPEC.md *What is deliberately not done* has the reasons and
+*Backlog / deferred* what may still come.

@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (35/36, 1 eq) · src ?
 
-Delta audit 2026-11-04 (independent read of the 2026-11 file layer, 183 mutants: 158 killed, 78 of them by tests it added, 25 survivors decided, 5 of those not built then). Fixed after it, each with a test that went red on old behaviour: `save` after a reorder of thousands of sections wrote a delta no load accepted (now one `^` per moved section, `save` replays its own output and refuses with `WouldNotReload`, the old delta stays); a package named `-x` saved as a delete record for `x` (now `InvalidPackageName` at `save`, as for `.`, `=`, space, `'`; the real binary accepts `-x` and loses the change); reaper buffer, `merge` atomic on a hand-built duplicate, `revert` fsync, `LockFailed`. The real binary replays the new records to the same order (`UCI_BIN`, 80 random rounds, the test goes red on a shifted position). No mutants re-run over these fixes, `LockFailed` tested only through the seam, power loss simulated. Not a whole-module score, so the Audit line stays as it is.
-
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, UCI_FUZZ) · ct n/a — OpenWrt config parsing (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: Editor growth capped at max_total_items, hashed lookups, `max_delta_work` → WorkLimitExceeded, linear delList/show, `max_show_len` → OutputTooLarge; delta audit 76/77 + 1 argued)
 
 **Performance:** ref 0.51× go-uci v0.0.0-20210918132103-37c7b10c14fa (`zig build bench-uci`, ReleaseFast, default configuration, 5 rounds, best of each side, wall time, one run of the final code on a shared host, spreads 4–42 %; in-process load of a file from the page cache on every side, ours `Store.load` (lstat, flock-free read, parse): `parse_small` (6 sections) 0.39×, `parse_large` (600 sections) 0.42×, `parse_quoted` (300 sections: apostrophe in double quotes, escaped quotes, `#` inside a quote, bare words) 0.51×; go-uci has no export and cannot read a multi-line value, so those rows have no reference; no process-spawning row; not like for like in model: ours is one arena of slices, go-uci a token stream plus GC garbage) · fastest 1.05× libuci (the OpenWrt C library, built with `zig cc -O3 -march=native` from a source copy and linked into `tools/c_bench.c`, source never read; fastest on the small/large rows and the one that makes the reference the other implementation; ours/libuci: `parse_small` 0.63×, `parse_large` 0.83×, `parse_quoted` 1.05× (worst), `parse_multiline` 1.04× (a value spanning two lines, libuci alone), `export_small` 0.30×, `export_large` 0.35×; the quoted rows are where libuci is level with or ahead of us; the bench compares section counts, not output bytes — the differential tests do; commit is fsync-bound and not benched; rust-uci wraps libuci and was not measured) (measured 2026-11-04)
@@ -18,11 +16,13 @@ Delta audit 2026-11-04 (independent read of the 2026-11 file layer, 183 mutants:
 
 **Downstream consumer:** yes
 
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's `Provenance:` line (no NOTICE: clean-room; the real `uci` binary is a black-box oracle).
+
 ## Compared with
 
 Surveyed 2026-09-30, re-surveyed 2026-11-04 (grade-2 pass) per `SURVEY-PLAYBOOK.md`; stars and activity as of the first date. Licences first: libuci and the `uci` CLI are LGPL-2.1, so **none of their source was read, at any time**: libuci's behaviour comes only from running the binary built from a source copy (`tools/capture-store.py`, `tools/capture-*.sh`, the differential oracle) and the README. digineo/go-uci's `LICENSE` is the MIT text (read 2026-11-04, pinned `v0.0.0-20210918132103-37c7b10c14fa`); its non-test source imports only the Go standard library, has no `init`, `exec`, `net`, `unsafe` or cgo, and its `uci.go` was read whole (commit path, tree API). rust-uci (MIT OR Apache-2.0) wraps libuci and was not read or built. Sibling modules checked (`ls modules`): none parses UCI, none writes a file atomically for a config store except `blobstore`/`filestore`, whose sync discipline this module copies (the code is its own).
 
-**Gap survey, 2026-11-04** (every libuci/`uci` feature a user would notice; [V] = verified by running the binary, [I] = inferred from README/usage text):
+**Gap survey** (every libuci/`uci` feature a user would notice; [V] = verified by running the binary, [I] = inferred from README/usage text). The rejected rows keep their reasons in *What is deliberately not done*; the one feature not built for budget is in *Backlog / deferred*:
 
 | Feature | Verdict |
 |---|---|
@@ -56,15 +56,13 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 (grade-2 pass) per `SURVEY-PLAYBOOK.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openwrt/uci](https://github.com/openwrt/uci) (libuci, `uci` CLI) — **fastest** (measured, parse and export), and the feature yardstick of the Scope line | C | LGPL-2.1 (per rust-uci's README and this module's SPEC; API reports none) | 24 | push 2026-03 (no releases) | Config tree in `/etc/config`, staged delta files, `set`/`add`/`delete`/`rename`/`reorder`, `commit`/`revert`/`save`, `show`/`export`/`import`, `-P` save dirs, typed ucimap, hooks. We now have all of it that an in-process user notices except a rename onto a name already in use and ucimap (survey table below; `save`, `revert` to option level, `-C`, `-p`, `-P` and the writer lock are built); commit is stricter (directory `fsync`, a file `parse` could not read back is refused, `NotRegularFile` instead of "not found"). Byte-level grammar quirks are matched against the real binary (130 probes + 13 store cases). |
+| [openwrt/uci](https://github.com/openwrt/uci) (libuci, `uci` CLI) — **fastest** (measured, parse and export), and the feature yardstick of the Scope line | C | LGPL-2.1 (per rust-uci's README and this module's SPEC; API reports none) | 24 | push 2026-03 (no releases) | Config tree in `/etc/config`, staged delta files, `set`/`add`/`delete`/`rename`/`reorder`, `commit`/`revert`/`save`, `show`/`export`/`import`, `-P` save dirs, typed ucimap, hooks. We have all of it that an in-process user notices except a rename onto a name already in use and ucimap (survey table above; `save`, `revert` to option level, `-C`, `-p`, `-P` and the writer lock are built); commit is stricter (directory `fsync`, a file `parse` could not read back is refused, `NotRegularFile` instead of "not found"). Byte-level grammar quirks are matched against the real binary (130 probes + 13 store cases). |
 | [digineo/go-uci](https://github.com/digineo/go-uci) — **reference** (for the P axis: libuci is the fastest, so the other measured implementation is the reference) | Go | MIT (`LICENSE`, read 2026-11-04) | 108 | push 2026-06 (v2 pre-release; no releases); pinned `v0.0.0-20210918132103-37c7b10c14fa` (2021-09) | Native Go tree over `/etc/config`: get/set by key, `Commit()` that writes a temp file in the config directory, `chmod 0644`, `fsync`, `rename` *(read)*, so a crash leaves the old or the new file; no directory `fsync`, mode forced to 0644 instead of kept, no delta files (it never sees staged changes), no `import`/`batch`, refuses a `package` line ("imports/exports not yet supported"), not transactional across packages. We are ahead on commit durability and the delta overlay; it has a smaller, tree-style API. |
 | [namib-project/rust-uci](https://github.com/namib-project/rust-uci) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE; wraps LGPL libuci via C bindings) | 22 | push 2026-05 | libuci bindings, so full libuci behaviour but a C dependency. |
 | [openwisp/netjsonconfig](https://github.com/openwisp/netjsonconfig) | Python | other (licence file not read) | 387 | push 2026-09 | Generates UCI from NetJSON; a generator, not a codec. Different problem. |
 | Zig ecosystem / `std` | Zig | — | — | — | Nothing found (GitHub search "uci openwrt" lists no Zig project; README of this module says no maintained pure-Zig UCI codec exists). |
 
-**Where we are ahead:** only pure-Zig codec found; grammar measured against the real `uci` binary rather than the wiki (mid-word `#`, multi-line quotes, `;` quirk, `@type[N]` and `pkg.<name>` addressing); DoS-bounded and never-panic with line-numbered diagnostics; canonical round-trip-stable serialization; a commit that is atomic and durable down to the directory entry and refuses text it could not read back; faster than go-uci on every measured row, and than libuci on the plain parse and export rows but not on quoted values (1.05×) or a multi-line value (1.04×) (Performance line) · **Where we are behind** (re-checked 2026-11-04): a rename onto a name already in use is refused where `uci` accepts it (not built, budget → Backlog); no typed ucimap schema; a symlink chain or a link out of the directory is refused where the binary follows it (deliberate). Every other feature of the survey table is done or rejected with a reason.
-
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code, clean-room; the real `uci` binary is a black-box oracle).
+**Where we are ahead:** only pure-Zig codec found; grammar measured against the real `uci` binary rather than the wiki (mid-word `#`, multi-line quotes, `;` quirk, `@type[N]` and `pkg.<name>` addressing); DoS-bounded and never-panic with line-numbered diagnostics; canonical round-trip-stable serialization; a commit that is atomic and durable down to the directory entry and refuses text it could not read back; faster than go-uci on every measured row, and than libuci on the plain parse and export rows but not on quoted values (1.05×) or a multi-line value (1.04×) (Performance line) · **Where we are behind:** a rename onto a name already in use is refused where `uci` accepts it (not built, budget → *Backlog / deferred*); no typed ucimap schema, and a symlink chain or a link out of the directory is refused where the binary follows it (both deliberate, see *What is deliberately not done*). Every other feature of the survey table is done or rejected with a reason.
 
 ## Design & invariants
 Typed model, one arena: `parse`/`parseDiag` build a `Package{ name?, sections:[]Section }`
@@ -80,12 +78,11 @@ value, written back raw, not via an escape); bare words end at whitespace; adjac
 token concatenate (`'a'"b"c` → `abc`). Audit A1 U5: a quote (either kind) MAY span physical lines —
 the real `uci` binary keeps reading
 until the matching quote closes, and the value keeps the real `\n` byte at each line break crossed;
-only running out of input with a quote still open is `error.UnterminatedQuote` (previously: any quote
-left open at the end of the line it started on, which rejected the ENTIRE file for a legitimate
-multi-line value — a certificate, an SSH key, a LuCI banner). Outside a quote a statement is one
+only running out of input with a quote still open is `error.UnterminatedQuote` (a legitimate
+multi-line value — a certificate, an SSH key, a LuCI banner — must not reject the entire file). Outside a quote a statement is one
 physical line, except where a backslash continues it. **Statement grammar, all measured against the
 real binary run as a black box and replayed from `src/testdata/grammar_capture.txt` (130 probes,
-`tools/capture-grammar.sh`; audit A1 U8/U9/U10/U19, 2026-09-13):** outside quotes a backslash takes
+`tools/capture-grammar.sh`; audit A1 U8/U9/U10/U19):** outside quotes a backslash takes
 the next byte literally (`a\ b` is one word, `a\#b` is `a#b`), a backslash before LF or CRLF continues
 the word on the next line and adds nothing, and one at end of input adds nothing; inside double
 quotes a backslash before a line break adds nothing too (`"a\<LF>b"` is `ab`). `;` separates
@@ -100,23 +97,24 @@ only). A `;` where a section name or value would start is an empty argument, not
 by its file, so `Package.name` is only ever set by the caller, for `serialize`'s header. `#` starts
 a comment at the start of a token, OR anywhere inside a bare (unquoted) run — either way it truncates
 the token AND discards the rest of the line, matching real `uci` (audit A1 U4, measured against the
-real binary: `a#b` unquoted is `a`, not `a#b` — this SPEC previously claimed the opposite as "the
-format", which the real binary disproved); `#` inside quotes stays literal. CRLF accepted (outside a
+real binary: `a#b` unquoted is `a`, not `a#b`); `#` inside quotes stays literal. CRLF accepted (outside a
 quote only — the CRLF tolerance is a statement-grammar convenience, not part of a quoted value's
 content). Repeated-key semantics: a repeated `option` under one key overwrites
 (last wins, matching `uci set`); `list` entries accumulate in order; mixing `option` and `list` under
 one key → `error.MixedOptionList` — **this module's OWN additional strictness, not real UCI
 semantics** (audit A1 U11): real `uci` merges a mixed option/list under one key (whichever kind
 appears LAST for that key wins, discarding the earlier kind) rather than rejecting the whole file.
-An empty or missing value follows real `uci` (audit A1 U10, which supersedes the U12 rejection):
+An empty or missing value follows real `uci` (audit A1 U10):
 `option k ''` and `option k` set nothing and leave an earlier value alone, `list k ''` and `list k`
 add an empty element; `serialize` refuses a hand-built single option with an empty value
 (`UnserializableValue`), since it could not be read back. Section/option names real `uci` never accepts are rejected too
 (audit A1 U7, `error.InvalidName`; not enforced on an option KEY when *writing* — see
 `SerializeError.InvalidName` in `root.zig`): section/option names must be alphanumeric or `_` (not
 even `-`); section types are looser (alphanumeric/`_` or any other printable, non-space ASCII byte).
-A zero-length name/type/key is exempt from that check (see U7's fix commit) — `config ''`/`option ''
-v` producing a literal empty type/key stays accepted, per the deviation noted below. A `config`
+A zero-length name/type/key is exempt from that check on `parse` — `config ''`/`option ''
+v` producing a literal empty type/key stays accepted, per the deviation noted in the Threat model — but
+`serialize` refuses an empty type, section name or key with `error.InvalidName` (libuci refuses such a
+file as a whole). A `config`
 block reusing the name of an earlier section of the same type continues that section, measured
 against the real `uci` binary (audit A1 U1/U25, `tools/capture-grammar.sh`): its lines apply as if
 they followed the first block (a repeated option replaces, a list appends, `option`/`list` mixed under
@@ -139,7 +137,8 @@ from a 16.6 MB file; a flat item-count cap bounds that regardless of input shape
 input size — see `max_total_items`'s doc comment in `root.zig` for why a size-relative ratio does
 not work here). Canonical output: optional `package
 '<name>'` header, blank line between section blocks, tab-indented options, values single-quoted
-(double-quoted with escapes only when they contain `'` or a control char). Accessors: `section(type,
+(double-quoted with escapes only when they contain `'`; a control byte other than tab, LF and CR has no
+representation and is `error.UnserializableValue`). Accessors: `section(type,
 name)`, `get`/`getList`, `iterate(type)`, deep `eql`. Two more resolve the addressing forms a UCI key
 path uses: `sectionByName(name)` resolves `pkg.<name>.<opt>` (UCI indexes section names in one
 namespace per package, not one per type); `nth(type, index)` resolves `@type[N]` positional
@@ -149,20 +148,25 @@ result — is "not found", returned here as `null` rather than an error; anonymo
 sections of `type` both count).
 
 **Both of those are MEASURED against the real `uci` binary.** The transcript is frozen in `root.zig`'s "addressing probe" capture and replayed by a test; it was
-taken 2026-09-08 in the same OpenWRT 25.12.4 guest the rest of the capture comes from, with a
+taken in the same OpenWRT 25.12.4 guest the rest of the capture comes from, with a
 config carrying a NAMED, an ANONYMOUS and a second NAMED section of one type — the case the older
 `testcfg` capture could not answer, because both of its `rule` sections are anonymous. Real `uci`
 labels the anonymous section `@t[1]` in its own `uci show` output, so the ordering is corroborated
 from a second direction. Clean-room from the documented OpenWRT UCI file format, with the real
-binary used purely as a black-box oracle (root `NOTICE` §0).
+binary used purely as a black-box oracle (the README's `Provenance:` line).
 
-**Provenance check (audit A1 U17, 2026-09-13).** Earlier fix passes cited libuci source files and
-line numbers in comments here and in `root.zig`, which contradicted the clean-room statement above.
-libuci is LGPL-2.1. A reviewer who read libuci's source, kept apart from whoever edits this module,
-compared the two region by region (tokenizer, name validators, serializer quoting, section lookup,
-`nth`) and reported only verdicts: no ported logic, the matches are observable behaviour of the
-format. The citations were replaced by the black-box measurements they stood for, and the grammar
-fixed the same day (U8/U9/U10/U19) was written from `uci` runs alone.
+**Provenance check (audit A1 U17).** libuci is LGPL-2.1; this module's behaviour comes from running the
+binary, not from its source, and no libuci file or line is cited. A reviewer who read libuci's source,
+kept apart from whoever edits this module, compared the two region by region (tokenizer, name
+validators, serializer quoting, section lookup, `nth`) and reported only verdicts: no ported logic, the
+matches are observable behaviour of the format. The grammar (U8/U9/U10/U19) was written from `uci`
+runs alone.
+
+**Name-validation carve-outs.** The name/type/key validator (U7) deliberately exempts a zero-length
+name/type/key on `parse` (a real, load-bearing shape: U18's regression test), and `serialize` does
+not reject an option key containing `'` (U14: such a key, however it got into a hand-built `Package`,
+is written quoted rather than bare, so it cannot inject). Both carve-outs are narrow and rest on an
+earlier guarantee; widening the validator needs U14 and U18 re-read first.
 
 ## Threat model / out of scope
 Not security-sensitive; the hardening is denial-of-service and crash resistance on hostile config
@@ -174,23 +178,23 @@ it is the one shape the U7 name/type/key validator deliberately does not cover, 
 handling of a zero-length argument is a different failure mode — "insufficient arguments" at the
 CLI-argument layer — not a character-class violation); values with control chars other than
 `\n \t \r` cannot be represented in UCI text and fail serialization. The codec itself (`parse`,
-`serialize`, `Editor`, `applyDelta`, `show`, `parseScript`) is I/O-free. Since 2026-11-04 the
+`serialize`, `Editor`, `applyDelta`, `show`, `parseScript`) is I/O-free. The
 file layer (`Store`, `Session`; `src/store.zig`, `src/batch.zig`) reads and writes a config
 directory the caller hands in as a `std.Io.Dir`; still out of scope: `/etc/config` discovery
-(the caller opens the directory), hooks and `reload_config`, and the
-`-P` overlay directories (`save` as delta records is built: it replays its own output before it replaces the
+(the caller opens the directory), hooks and `reload_config` (see *What is
+deliberately not done*). `save` as delta records is built: it replays its own output before it replaces the
 delta file, so a delta that would not load again, or would cost more than `max_delta_work`, is
 `WouldNotReload` and the old delta stays; a package name no record can carry is `InvalidPackageName`:
 a leading `-`, or `.`, `=`, space, `'` -- measured: the real binary writes `-x.lan.x='1'`, a delete record
-for package `x`, and loses the change itself) File-layer threats and answers: a package name from a request cannot
+for package `x`, and loses the change itself). File-layer threats and answers: a package name from a request cannot
 leave the directory (one plain name by default); a FIFO/device/symlink planted as a config or
 delta file is refused without being opened for reading beyond a stat-checked handle; a file
 over `max_bytes` is refused unread; a commit never writes text `parse` would refuse; a crash
 leaves the old or the new file; a hostile script is bounded by `max_input_len`,
 `max_total_items` and the editor work cap (`WorkLimitExceeded`).
 
-**Closed 2026-10-04 by `applyDelta` (see "Staged deltas" below), kept for the record. The concrete trap in "this is the file codec only": a file-only reader loses staged-but-uncommitted
-state.** `uci set` without a following `commit` never touches `/etc/config/<pkg>` — it appends a
+**A file-only reader loses staged-but-uncommitted state** (`applyDelta` and `Store.loadStaged` answer it, see
+*Staged deltas* below). `uci set` without a following `commit` never touches `/etc/config/<pkg>` — it appends a
 delta line to `/tmp/.uci/<pkg>`, and `uci get`/`uci show` return that staged value while the on-disk
 config file still holds the old one. This is exactly LuCI's "Save" without
 "Apply" (routers commonly sit in this state — a webUI change staged but not yet applied), and it is
@@ -198,7 +202,7 @@ the concrete trap for anyone replacing a shelled-out `uci get` with `parse(gpa,
 readFile("/etc/config/<pkg>"))`: the read is silently stale for any package with a pending delta,
 with no error to catch it.
 
-**Measured on the real binary** (OpenWRT 25.12.4 guest, 2026-09-08), not assumed. A config holding
+**Measured on the real binary** (OpenWRT 25.12.4 guest), not assumed. A config holding
 `option v A`, then `uci set probe.alpha.v=Z` with no commit:
 
 ```
@@ -220,7 +224,7 @@ So a caller that checks for the delta file's EXISTENCE as a "has staged changes"
 that fallback permanently true the first time anything is staged and reverted, even with zero
 changes actually pending — check the file's contents/size, not merely whether it exists.
 
-## Staged deltas, editing and `uci show` (2026-10-04, `src/edit.zig`)
+## Staged deltas, editing and `uci show` (`src/edit.zig`)
 
 Measured, not read: `tools/capture-delta.sh` builds the real `uci` from OpenWrt's tree into a
 droppable cache and drives it only through its command line; nothing of libuci's source was read.
@@ -245,165 +249,78 @@ droppable cache and drives it only through its command line; nothing of libuci's
   and `serialize` cannot write.
 - **Bounds:** a delta is held to `max_input_len`; the result to `max_total_items`
   (`toPackage`). Malformed records are `error.BadDelta` with the line they start on.
-- Mutation 2026-10-04, one equivalent: `@type[N]` with `idx > count` instead of `>=` falls through
-  the counting loop to the same `null`.
 
 ## Verification
-Golden tests: parse a realistic `network` config into the model and assert its structure; round-trip
-stability (`parse∘serialize` equal, second pass byte-identical) and the exact canonical serialization
-bytes. Quoting: double-quote escapes, single-quote literalness, bare words, mid-word `#` (truncates
-the token AND discards the rest of the line — audit A1 U4), token concatenation of quoted segments,
-comments/blank lines, empty quoted value. Semantics: anonymous sections, list accumulation,
-duplicate-option last-wins, mixed option/list rejected, duplicate SECTION name rejected regardless of
-type (audit A1 U1), invalid section/option names rejected (audit A1 U7), the model-size cap (audit A1
-U3, exact 2N+1-item boundary pinned). Errors (with asserted line numbers): unterminated single/double
-quote, option before any section, bad keyword, missing/too-many arguments, line-too-long,
-input-too-large. Plus accessor lookups (incl.
-`sectionByName`/`nth` against the real-`uci`-capture fixture below — name-across-types resolution,
-`@type[N]` positive/negative/out-of-range/no-match), CRLF input,
-`package` header serialization, and quoted-type round-tripping (a type needing quotes but still
-valid per real uci's name rule — no equivalent case exists for a key, see U7 below). Run: `zig build
-test-uci`.
 
-**Fuzz corpus (audit A1 U15).** `fuzzParse`/`fuzzRoundTrip` run a fixed, pinned corpus
-(`parse_seeds`/`roundtrip_scripts` in `root.zig`) on every `zig build test-uci` — no `--fuzz`
-needed for that baseline coverage; each seed's shape is asserted by a `corpus: …` test next to it.
-For generative fuzzing beyond the pinned corpus: the deterministic driver
-`UCI_FUZZ=<runs>[,<first seed>]` (since 2026-10-09; see the driver section in `src/root.zig`)
-runs the same harnesses from seeds in the ordinary test binary and gives a verdict;
-`zig build --fuzz` does not.
+- Run: `scripts/modtest uci` (`zig build test-uci`); it needs no foreign tool. The tests are in `src/root.zig` (codec),
+  `src/edit.zig` (editor), `src/store_test.zig` (file layer and `Session`), `src/sweep_test.zig` (no-panic sweep: work
+  caps and growth caps) and `src/libuci_oracle_test.zig`.
+- Codec classes: golden parse of a realistic `network` config; round-trip stability (`parse` of `serialize` equal, second
+  pass byte-identical) and the exact canonical bytes; quoting (double-quote escapes, single-quote literalness, bare words,
+  mid-word `#`, token concatenation, quoted-type round-trip, multi-line quotes); semantics (anonymous sections, list
+  accumulation, repeated-option last wins, `MixedOptionList`, same-type duplicate name merges, different-type duplicate
+  is `DuplicateSection`, name/type/key validation, the exact model-size boundary of `max_total_items`); errors with
+  asserted line numbers; accessors (`sectionByName`, `nth`: positive, negative, out of range, no match); CRLF; `package`
+  header.
+- File-layer classes: `commit` call order and failure of each step through a wrapped `std.Io` (temp fsync, rename,
+  directory fsync, modes, temp-name collision, lock waits), hostile names and file kinds, read errors that are not
+  absence, `save`/`revert` records and their replay, `Session` batches against the capture, the stamp (`ChangedOnDisk`).
+- Oracles, all external: frozen stdout of the real `uci` binary (`root.zig` "real uci capture" and "addressing probe",
+  `src/testdata/grammar_capture.txt` from `tools/capture-grammar.sh`, `src/testdata/delta_capture.txt` from
+  `tools/capture-delta.sh`, `src/testdata/store_capture.txt` from `tools/capture-store.py`); the libuci differential
+  (`src/testdata/libuci_capture.zig` from `zig build interop-uci -- --capture`, replayed by
+  `src/libuci_oracle_test.zig`, see Anchoring); two tests drive a live `uci` when `UCI_BIN` is set (a commit by the
+  binary in between is noticed; the binary replays `save`'s `^` records to the same order) and skip otherwise.
+  The instruments and how to run them: `tools/README.md`.
+- Fuzz: a fixed pinned corpus (`parse_seeds`, `roundtrip_scripts`) runs in every test run; the deterministic driver
+  `UCI_FUZZ=<runs>[,<first seed>]` runs the parse, round-trip and session harnesses (`uci-parse`, `uci-roundtrip`,
+  `uci-session`) from seeds in the ordinary test binary. `zig build --fuzz` is not used.
+- A round trip through this module's own encoder and decoder cannot see a symmetric bug; every behaviour that matters
+  is therefore held against a captured foreign result, not against the module's own output.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-**Real `uci` capture (OpenWRT 25.12.4 VM lane).** Two hand-written configs were pushed into
-`/etc/config/` inside the `scripts/vm/` OpenWRT VM and run through the real `uci` binary; the raw
-config bytes plus the real `uci export`/`uci show` stdout are frozen in `root.zig`'s "real uci
-capture" section — exercising the real binary purely as a black-box test oracle (root `NOTICE`
-policy §0). One config concentrates on quoting/escaping (one option per escape sequence); the other
-covers anonymous sections + their `@type[N]` generated addressing, list options, and mixed
-quoting/bare-word styles.
+## Performance
 
-**Two real, reproducible bugs were found this way and fixed (not papered over in a golden):**
-1. Real `uci`'s double-quote escapes are only `\\`, `\"`, `\'` — a backslash before any OTHER
-   character (n/t/r included) drops the backslash and keeps that character literally; UCI text has
-   **no escape that produces an actual control byte**. This module previously converted `\n`/`\t`/
-   `\r` to real control bytes — invisible to every existing test because they only ever round-tripped
-   through this module's own encoder/decoder pair (a self-consistent "blind oracle"; even the fuzz
-   round-trip harness can't see a symmetric bug). Confirmed with 8 independent escape probes
-   (`\\`,`\"`,`\'`,`\n`,`\t`,`\r`,`\y`, plus single-quote-takes-no-escapes) against the real binary.
-   Fixed in the parser and serializer. ⚠ **Correction (audit A1 U6, after this SPEC entry was
-   written):** the serializer fix above over-corrected — it rejected `\n`/`\t`/`\r` outright as
-   `error.UnserializableValue`, on the reasoning that "no escape produces them" implied "they can't be
-   represented". That conflates two different claims: the real binary DOES accept
-   those three sub-0x20 bytes in a value, it just never needs a backslash escape for them — they're
-   written back literally, raw, inside the quotes. The serializer now does the same. `\n` in
-   particular is representable end to end only because a quote may now span physical lines (U5,
-   below) — a value containing a real newline round-trips as a multi-line quoted literal, the shape
-   `uci export` itself produces (e.g. `option multi 'line1<LF>line2'`).
-3. **Audit A1 U5 (found in the follow-up fix campaign, not the original audit pass):** the parser
-   used to be line-oriented — one statement, one physical line, full stop — so a quoted value that
-   didn't close before the line ended was `error.UnterminatedQuote`, rejecting the WHOLE file. Real
-   `uci` instead keeps reading further lines until the quote closes (measured); the value keeps the
-   real `\n` byte at each line break.
-   A value with an embedded newline is not exotic here — a certificate, an SSH key, a LuCI banner —
-   and the old behavior failed on the entire package for one such value, not just that option. Fixed
-   by rewriting the tokenizer from line-oriented to byte-oriented: outside a quote, the statement
-   grammar is still exactly one physical line (unaffected); inside a quote, `\n` is ordinary content
-   and only genuine end-of-file with a quote still open is an error. Verified both directions: the
-   audit's own multi-line capture (`option multi 'line1<LF>line2'`) now parses AND round-trips, and
-   the full existing corpus (golden captures, real OpenWRT configs, the mutation suite, all
-   diagnostic-line-number tests) is unchanged — see `root.zig`'s "audit A1 U5" test and the fix
-   commit for the RED→GREEN numbers.
-2. Real `uci export` prints a bare, unquoted `package <name>` header when the name is
-   identifier-safe (`package testcfg`, not `package 'testcfg'`). Fixed (`serialize` now treats the
-   package name like a section-type word). Since audit A1 U19 (2026-09-13) that name comes from the
-   caller: `parse` checks a `package` line and ignores it, as real `uci` does when loading a file.
+`zig build bench-uci` (`tools/bench.zig`, with `tools/c_bench.c` and `tools/go_bench/`; needs `LIBUCI_SRC`); the card's
+Performance line has the figures.
 
-**One style-only difference found and deliberately NOT changed:** a value containing a literal `'`
-is double-quoted by this module (`"a'b"`); real `uci` instead splices single-quoted segments the
-POSIX-shell way (`'a'\''b'`). Both encode the identical value; changing this module's simpler,
-single-segment choice to replicate real `uci`'s multi-segment splicing was judged not worth it for a
-cosmetic difference with no behavioral impact. Also not replicated: real `uci export` emits one
-extra trailing blank line after the very last section (this module's blank line is only ever
-*between* blocks) — a CLI-output-only convention, not a canonical-serialization invariant, and
-changing it would touch every other hand test asserting no trailing blank line.
+## What is deliberately not done
 
-**Audit A1, second fix pass (2026-09-10, fixwt/c).** This module has zero consumers in this repo
-(verified against `example-apps/` too), so per the campaign's P1 rule, input-hardening decisions —
-including new error values and rejecting input that previously parsed — are the fixer's call, not a
-question for the user. Four findings closed this way:
-1. **U1 — duplicate section name.** Two `config` blocks sharing a name used to silently build TWO
-   `Section`s, with every accessor answering from the FIRST one's (stale) values — the device uses
-   the LAST. The model can't represent real uci's merge, so both a same-type collision (which real
-   uci merges) and a same-name/different-type collision (which real uci's strict mode already
-   rejects) now fail closed as `error.DuplicateSection`, rather than one implementation of "the
-   config" silently disagreeing with the other about which value is live. *Superseded 2026-09-17
-   (audit A1 U25):* the same-type case now merges, as measured on the real binary; see above.
-2. **U3 — the 16 MiB input cap didn't bound the built MODEL.** Measured 22x-41.5x live-byte
-   amplification on a legal, `max_input_len`-sized input (up to 371 MB RSS from 16.6 MB of text). A
-   ratio-of-input-size cap was tried and rejected: the worst measured shape amplifies close enough to
-   this module's OWN legitimate N=64000-distinct-keys perf test (U2's regression guard) that no ratio
-   can admit one and reject the other. `max_total_items` (a flat cap on sections+options+values
-   combined, independent of input size) does — `error.MemoryLimitExceeded`.
-3. **U4 — mid-word `#`.** This SPEC claimed, as fact about the format, that `#` only starts a comment
-   at the start of a token. The real binary disproves it: `#` anywhere in a bare (unquoted) run
-   truncates the token AND discards the rest of the line. Fixed in `nextToken`; the SPEC line above is
-   corrected, not just the code.
-4. **U7 — no name/type/key validation.** The real uci binary never accepted
-   most of the 15 hand-written probes this module did (hyphens/dots/spaces/non-ASCII in a name or
-   type, hyphens/dots in a key) — dangerous on the WRITE path especially, since `serialize` could
-   produce a file real uci refuses to load back, breaking the whole package, not just one section.
-   Both `parse` and `serialize` now enforce it (`error.InvalidName`) for section type/name; `parse`
-   also enforces it for option keys, but `serialize` deliberately does not (see U14 below). Zero-length
-   names/keys are exempt — see the Threat model section's note on U18.
-
-Two more findings closed WITHOUT a code change, by correcting this SPEC instead (P2, "documentation is
-the spec, fix the code" — but here the code and doc already agreed with each other, they were just
-both wrong about what real uci does, so the fix corrects the CLAIM, not the code):
-- **U11/U12 — `MixedOptionList`/valueless-`option` rejection presented as "UCI semantics".** They
-  aren't: real uci is more lenient on both (merges a mixed option/list, whichever kind is LAST for a
-  key wins; loads a file with a valueless `option` and simply drops it). This module's stricter,
-  reject-the-whole-file behavior is intentional and unchanged, but the "Repeated-key semantics" line
-  above now says so explicitly instead of implying it is inherited from the format.
-
-**One tension this surfaced, for whoever revisits U5/U6/U8/U9/U10/U19 next:** U7's validation
-deliberately carves out a zero-length name/type/key (a real, load-bearing shape — U18's regression
-test) and deliberately does NOT reject an option key containing `'` at `serialize` time (U14's
-already-closed guarantee that such a key, however it got into a hand-built `Package`, is written
-quoted rather than bare/injectable). Both carve-outs are narrow and load-bearing on an *earlier* fix;
-widening U7 later without re-reading U14/U18 first will silently re-break one of them.
+- **`changes`** (re-rendering the delta): the raw delta is `Store.staged`; the CLI's rendering is cosmetic.
+- **`-q`**: errors are typed values, nothing prints.
+- **`-n`/`-N`** (name unnamed sections on export): no difference in `export` or `show` output was measured with either.
+- **`-S`** (non-strict): keeps loading after a parse error and hides a corrupt file; unsafe for a config writer. Strict
+  is the binary's default and the only mode here.
+- **ucimap typed schemas, plugins**: C struct mapping; `Section.getBool`/`getInt` are the typed read path.
+- **Hooks and `reload_config`**: the system's, not libuci's; the caller runs them.
+- **Following a symlink chain or a link out of the directory** as a config file: the binary follows both; this module
+  refuses with `NotRegularFile` (a same-directory link is followed). `StoreOptions.allow_paths` allows a relative target.
+- **Two style differences from `uci export`**: a value containing `'` is double-quoted here where the binary splices
+  single-quoted segments (`'a'\''b'`), and the binary writes one extra trailing blank line after the last section. Both
+  encode the same value; changing either was judged not worth touching the other tests.
+- **Mixed `option`/`list` under one key** is rejected as `MixedOptionList`, where the binary merges (the last kind
+  wins): this module's own strictness, kept on purpose.
 
 ## Backlog / deferred
-- ~~Delta overlay, mutation helpers, typed value coercion, `uci show`~~ (survey 2026-09-30) —
-  **done 2026-10-04** (see "Staged deltas, editing and `uci show`"). `uci export` is `serialize`
-  (its two documented style differences stand). **`commit`, `import`, `import -m`, `batch`,
-  `revert` to option level, `save`, `-d`, `-f`, `-p`, `-C`, the writer `flock`: done 2026-11-04**
-  (`src/store.zig`, `src/batch.zig`, `src/diff.zig`, below). Still deferred: **ucimap-style typed
-  schemas**; **duplicate-name renames** as `uci` performs them (needs a model that allows
-  duplicates first; not built for budget); **`Session.commit(null)` over packages the session
-  never opened** (the binary commits every package with a delta in the save directory; this needs
-  a directory listing of the save dir); **several `-p` orders beyond the one measured** (one
-  extra directory observed: its delta first, then the save directory's).
-- (sweep GY, 2026-10-31) **`serialize` output can exceed what `parse` accepts**: a value or line
-  longer than `max_line_len` (16 KiB), or a package over `max_input_len` (16 MiB), is written
-  without complaint (real `uci` loads such a file), but `parse` then refuses it with
-  `LineTooLong`/`InputTooLarge`. Documented on `serialize`; a refusing `SerializeError` member
-  would be the alternative if a consumer writes values from untrusted sources.
-- (sweep GY review) **Delete-heavy deltas on very large sections can hit `max_delta_work`**: a
-  record that removes an option or list entry shifts the rest of that section (O(options)), so a
-  delta of many such records on a section with ~100k+ options stops with `WorkLimitExceeded`
-  (about 650 deletes at 100k options). Real sections hold tens of options. `Editor.applyDelta` is
-  not atomic: earlier records stay applied after an error (documented; the free `applyDelta`
+
+- **Duplicate-name renames** as `uci` performs them (a rename onto a name already in use; the binary holds two sections of
+  one name and a committed file merges them on reload). Not built for budget: needs duplicate ids in `Editor` and a
+  merge in `toPackage`; today `DuplicateSection`/`DuplicateOption`. The one place the Scope line's "parity" is short.
+- **`Session.commit(null)` over packages the session never opened**: it writes only the packages the session changed;
+  the binary commits every package with a delta in the save directory, which needs a directory listing of it.
+- **Several `-p` orders beyond the one measured** (one extra directory observed: its delta first, then the save
+  directory's).
+- **`serialize` output can exceed what `parse` accepts**: a value or line longer than `max_line_len` (16 KiB), or a
+  package over `max_input_len` (16 MiB), is written without complaint (real `uci` loads such a file), but `parse` then
+  refuses it with `LineTooLong`/`InputTooLarge`. Documented on `serialize`; a refusing `SerializeError` member would be
+  the alternative if a consumer writes values from untrusted sources.
+- **Delete-heavy deltas on very large sections can hit `max_delta_work`**: a record that removes an option or list entry
+  shifts the rest of that section (O(options)), so a delta of many such records on a section with ~100k+ options stops
+  with `WorkLimitExceeded` (about 650 deletes at 100k options). Real sections hold tens of options.
+  `Editor.applyDelta` is not atomic: earlier records stay applied after an error (documented; the free `applyDelta`
   works on a copy).
-- (sweep GY) **`Editor` section/option lookup by `@type[N]`** is O(sections) per call (id and key
-  lookups are hashed); `applyDelta` bounds the total with `max_delta_work`.
-Beyond the documented UCI-CLI-layer/typed-coercion out-of-scope list above, and the two
-deliberate style differences from real `uci export` noted above (literal-value quoting-segment style;
-one trailing blank line).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
-src/root.zig.
+- **`Editor` section/option lookup by `@type[N]`** is O(sections) per call (id and key lookups are hashed);
+  `applyDelta` bounds the total with `max_delta_work`.
 
 ## Anchoring
 
@@ -413,5 +330,3 @@ src/root.zig.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** (2026-10-04) `src/testdata/delta_capture.txt` (`tools/capture-delta.sh`): three scenarios of real `uci` commands — config, the delta file it wrote, `uci -X show` and `uci show` after — replayed by `applyDelta`/`Editor` and compared byte for byte; generated ids pinned to the binary's. Before that: `root.zig`'s "real uci capture" section asserts against verbatim `uci export` / `uci show` stdout captured from a real uci binary, which is what surfaced two symmetric escape bugs a round trip could not see; `src/testdata/grammar_capture.txt` (130 probe files, `tools/capture-grammar.sh`) pins the statement grammar — backslash, `;`, empty values, `package` — against the same binary's `uci show`; since 2026-10-06 the parser AND the serializer are anchored to libuci itself on 465 inputs (the 65 grammar probes + 400 seeded random configs, `tools/libuci_corpus.py` -> `zig build interop-uci -- --capture` -> `src/testdata/libuci_capture.zig`, replayed by `src/libuci_oracle_test.zig`): this module's model equals libuci's or both refuse (137 same, 316 both refuse, 0 value divergences), the 3 fail-open inputs are exactly the empty-word shape (U18) and the 9 refusals exactly the deliberate strictness errors, and libuci reads every text `serialize` writes back as the model it was written from
-
-**How it got there.** The anchoring work landed. DONE 463e443: real uci; TWO symmetric escape bugs a round trip could never see
