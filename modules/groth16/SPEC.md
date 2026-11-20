@@ -6,7 +6,7 @@
 
 **Scope:** core — snarkjs 0.7.6 + circom 2.2.3 (reference), rapidsnark v0.0.8, arkworks-rs/groth16 0.6.0 (surveyed 2026-10-05)
 
-**Audit:** review 2026-10-02 · mutation 2026-11-17 (517/566, 49 eq) · src 1e45d499f904a6c5
+**Audit:** review 2026-10-02 · mutation 2026-11-20 (521/570, 49 eq) · src a78cf593f884eec8
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GROTH16_FUZZ) · ct 2026-10-09 (ctgrind)
 
@@ -455,6 +455,8 @@ varying bytes, does (killed, 2026-11-17 run). The wipes of the freed witness and
 needle for a bucket sum and never frees the witness) are killed in ReleaseFast by the new heap test; that test is skipped in Debug and ReleaseSafe like the probe.
 One observation that is not a defect: the toy prover's dead C path above (a speed-only simplification, not applied: that prover is the module's anchor and is
 kept simple on purpose).
+
+**Audit 2026-11-20 (delta mutation).** The only non-test source change since the whole-module audit is `Randomizers.randomInto` (two `Fr.randomInto` draws straight into the caller's storage). 4 schemata mutants (ReleaseFast, the module's stack probe plus the new unit test): the `r` draw skipped, the `s` draw skipped, `s` copied from `r`, the second draw aimed at `r`. All 4 killed (the probe and `Randomizers.randomInto fills both scalars in place, distinct and canonical`). The `burn.run` wrap of `bn254.Fr.randomInto` that the probe case also covers is mutated in the bn254 delta (5 more kills through this same probe). Card counts are cumulative: 517/566 + 4/4 = 521/570, 49 eq.
 
 ## Backlog / deferred
 

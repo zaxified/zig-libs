@@ -6,7 +6,7 @@
 
 **Scope:** core — go-ethereum `core/vm` alt_bn128 precompiles + gnark-crypto (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (421/436, 15 eq) · src bb6d3a04edb796c8
+**Audit:** review 2026-09-03 · mutation 2026-11-20 (426/441, 15 eq) · src f9b2f60f650f9b0a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BN254_FUZZ; ecadd and ecmul at 1/4, ecpairing at 1/10, algebra at 1/100 of it) · ct 2026-10-02 (ctgrind)
 
@@ -964,6 +964,8 @@ shape of `scalarMulZeroing`); behaviour unchanged.
 - **`ecPairingCheck`'s `k == 0` early return:** the general path returns the final exponentiation of 1, which is 1 (cost-only).
 - **`additionStep` evaluates the line through `q` or through `t`:** the line passes through both points, so `lambda * x - y` is the same value (taken before `t`
   is updated).
+
+**Audit 2026-11-20 (delta mutation).** The only non-test source change since the whole-module audit is `Fr.randomInto` running its body one frame down under `burn.run` (new `src/burn.zig`, `random_burn` 2 KiB, 0.4 KiB measured dirty depth). 5 schemata mutants (ReleaseFast, run through the `groth16` stack probe, which is the test that sees a dead-stack residue of the drawn scalar): the wrap dropped (body called directly), `random_burn` shrunk to 256 B, the burn's stores skipped, the burn loop cut to a quarter, `stack(n)` dropped from `run`. All 5 killed (the probe reports the drawn bytes and the scalar 175..575 B below the region top); the baseline (mutant 0) passes under the same switches. Card counts are cumulative: 421/436 + 5/5 = 426/441, 15 eq.
 
 ## Backlog
 

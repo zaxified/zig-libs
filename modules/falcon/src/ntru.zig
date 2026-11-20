@@ -1987,6 +1987,37 @@ test "probe.rnsImage equals the pool's top-level f, g residues (plain and NTT)" 
     }
 }
 
+test "probe.rnsImage: every prime, plain and NTT, against an independent model" {
+    // makeFg's top level only ever uses primes[0]; the probe needles use the
+    // first four, so the others are checked here without the solver's help.
+    const logn = 9;
+    const n = 1 << logn;
+    const primes = computePrimes();
+    var f: [n]i8 = undefined;
+    for (&f, 0..) |*a, i| a.* = @intCast(@as(i32, @intCast(i * 13 % 29)) - 14);
+    var img: [n]u32 = undefined;
+    for (0..4) |j| {
+        const p: i64 = primes[j].p;
+        // plain: the signed residue mod p
+        probe.rnsImage(logn, &f, j, false, &img);
+        for (f, img) |x, y| try std.testing.expectEqual(@as(u32, @intCast(@mod(@as(i64, x), p))), y);
+        // NTT of a constant polynomial c: c at every root
+        var c: [n]i8 = @splat(0);
+        c[0] = -7;
+        probe.rnsImage(logn, &c, j, true, &img);
+        for (img) |y| try std.testing.expectEqual(@as(u32, @intCast(@mod(@as(i64, -7), p))), y);
+        // NTT of x: every value is a root of x^n + 1
+        var x: [n]i8 = @splat(0);
+        x[1] = 1;
+        probe.rnsImage(logn, &x, j, true, &img);
+        for (img) |y| {
+            var acc: i64 = 1;
+            for (0..n) |_| acc = @mod(acc * @as(i64, y), p);
+            try std.testing.expectEqual(p - 1, acc);
+        }
+    }
+}
+
 test "NTRUSolve reproduces the Falcon-1024 KAT secret key's F byte-exact" {
     const falcon = @import("root.zig");
     const v = @import("kat_vectors.zig");

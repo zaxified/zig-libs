@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests/audit: delta mutation of the `Fr.randomInto` burn (5 mutants through the `groth16` stack probe, all killed); card counts 426/441, SPEC "Audit 2026-11-20". No source change.
 - **2026-11-19** — **BEHAVIOURAL, not breaking:** `Fr.randomInto` runs its body in a burned frame (new `src/burn.zig`, `random_burn` 2 KiB): the by-value `fromBytes` argument and the Montgomery conversion temporaries it left on the dead stack (the drawn bytes and the scalar, found by the dead-stack probe in `groth16`) are zeroed before it returns. Same values drawn; only what stays behind changed.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (436 mutants, 421 killed, 15 equivalent; the card now carries the count). 12 new tests (`src/audit_test.zig`, `scalar.zig`) pin per-limb and per-component `isZero`/`eql`, the `subLimbs` borrow chain, `Fp.fromInt` bounds and wide values, non-canonical identities on `G1`/`G2`, malformed `G1`/`G2` encodings (each coordinate, over-long compressed input, the `G2` compressed flag order) and `groth16.verify`'s refusal of an off-curve `A`/`C` and an out-of-subgroup `B`. Library code: `Fr.randomInto`'s body moved into a private `randomIntoBuf` so a test can see the wipe; same behaviour. ctgrind row `scalarmul` re-pinned (digest only, counts unchanged).
 

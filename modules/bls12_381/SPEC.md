@@ -6,7 +6,7 @@
 
 **Scope:** core — blst v0.3.17 (surveyed 2026-10-06; raised from mvp 2026-10-06 when all six ciphersuites, batch verification, EIP-2333 and the G1/G2 MSM landed)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-17 (58/62, 4 eq) · src e26bdbd1a3fd3789
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (60/64, 4 eq) · src db1c7931c4544e88
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BLS12_381_FUZZ; codec at 1/10, sign-verify at 1/200 of it) · ct 2026-10-02 (ctgrind)
 
@@ -1303,6 +1303,8 @@ equals `MinSigPop.sign` under the key reconstructed by Lagrange over
 - **EIP-7594 (PeerDAS) cell proofs** *(survey 2026-09-30)*: c-kzg-4844 has them; SPEC "Out of scope for Part 5" defers them as "materially larger", with no refusal. Effort: large. Fits §2.
 
 ## Anchoring
+**Audit 2026-11-20 (delta mutation).** The only non-test source change since the last audit is `Fr.randomInto` running its body one frame down under `burn.run` with a new `burn.random_burn` (8 KiB, 0.56 KiB measured dirty depth). 2 schemata mutants in a ReleaseFast build of the module's stack probe: the wrap dropped, `random_burn` shrunk to 256 B. Both killed by the new `Fr.randomInto` probe case; the baseline passes. Card counts are cumulative: 58/62 + 2/2 = 60/64, 4 eq. Not mutated: the `burn.stack`/`burn.run` bodies (unchanged since the earlier audits).
+
 
 **Anchor grade:** class B · oracle MIXED
 

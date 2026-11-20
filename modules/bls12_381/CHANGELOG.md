@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests/audit: delta mutation of the `Fr.randomInto` burn (2 mutants in the stack probe, both killed); card counts 60/64, SPEC "Audit 2026-11-20". No source change.
 - **2026-11-19** — **BEHAVIOURAL, not breaking:** `Fr.randomInto` runs its body in a burned frame (`burn.random_burn`, 8 KiB): the by-value `fromBytes` argument and the conversion temporaries it left on the dead stack (the drawn bytes and the scalar) are zeroed before it returns. New stack-probe case `Fr.randomInto` (a fake `Io` replays known bytes); without the burn it finds both images. Same values drawn.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the generic threshold layer (26/26 killed); card mutation 58/62 (4 eq) and source hash.
 - **2026-11-17** — `threshold.Threshold(variant, scheme)`: trusted-dealer threshold BLS for min-sig too (`threshold.MinSig`, keys and Feldman commitments in `G2`, partial and combined signatures in `G1`), Basic or ProofOfPossession; MessageAugmentation is a compile error (a share would sign its own key's bytes). The file-level `threshold.*` names are the unchanged min-pk POP instance `threshold.MinPk`. A combined min-sig signature equals `MinSigPop.sign` under the reconstructed key.
