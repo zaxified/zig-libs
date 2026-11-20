@@ -2,7 +2,7 @@
 
 Single-owner `poll(2)` loop plus a fork/detach **job table** for pushing
 blocking work off the loop thread: a worker forks/execs an arbitrary argv, and
-its result is drained back on the loop's next tick. Two independent building
+its result is drained back on the loop's next tick. Independent building
 blocks that only share the "single owner drives the loop" discipline:
 
 - **`Loop`** — a thin, allocation-free wrapper over `poll(2)` (`Loop.poll`) plus
@@ -111,13 +111,7 @@ try jobs.spawnDetachedEnv(gpa, &.{ "/bin/sh", "-c", "echo $X" }, .{ .list = &.{"
 try jobs.spawnDetachedEnv(gpa, argv, .inherit, &record);   // snapshot of /proc/self/environ
 ```
 
-## Not in scope (DEFER)
+## Not provided
 
-- **The curl-specific fetch** (body read into a buffer, negative-cache on
-  failure, stderr capture) stays in the app — this module only spawns + reports
-  process completion.
-- **epoll / fd registration.** `Loop.poll` is still `poll(2)`: O(n) in the fd
-  count, and the caller keeps the `pollfd` array. No signal handles.
-- **Back-pressure beyond a fixed slot count** (queueing/retry) — the caller
-  handles a full table (e.g. re-try on a later tick).
-- **Windows / non-Linux** — Linux-only by design (raw syscalls).
+The curl-specific fetch, epoll / fd registration and signal handles, queueing beyond the fixed slot count and
+Windows / non-Linux support: see SPEC.md *What is deliberately not done* and *Backlog / deferred*.

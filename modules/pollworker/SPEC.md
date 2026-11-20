@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.Io` | Zig | MIT | — | Zig 0.16.0 | `std.Io` (Threaded / Evented) with groups and futures is the std answer to "push blocking work off the loop" *(inferred; not re-checked in std source this run)*. |
 | siblings in this repo | Zig | MIT | — | — | `procrun` (subprocess runner: capped capture, timeout, cancel) and `workerpool` (in-process worker pool) cover what `JobTable.spawnDetached` does with more features. |
 
-**Where we are ahead:** nothing at feature level; what it offers is small and dependency-free: allocation-free, lock-free per-slot `FREE→RUNNING→DONE` handoff with acquire/release, async-signal-safe fork/exec window with raw syscalls and no libc, `wait(2)` status decoded without libc macros. **Where we are behind:** `poll(2)` only (O(n) per call, no epoll/io_uring), no fd registry or handles (the caller keeps the `pollfd` array), no signal handles (timers, async wake-up and child environment since 2026-11-13), no capture of child output *(`procrun` does)*, no queueing beyond a fixed slot count, Linux only.
+**Where we are ahead:** nothing at feature level; what it offers is small and dependency-free: allocation-free, lock-free per-slot `FREE→RUNNING→DONE` handoff with acquire/release, async-signal-safe fork/exec window with raw syscalls and no libc, `wait(2)` status decoded without libc macros. **Where we are behind:** `poll(2)` only (O(n) per call, no epoll/io_uring), no fd registry or handles (the caller keeps the `pollfd` array), no signal handles (timers, async wake-up and child environment are here), no capture of child output *(`procrun` does)*, no queueing beyond a fixed slot count, Linux only.
 
 ## Design & invariants
 Two independent building blocks sharing only the "single owner drives the loop" discipline.
@@ -63,7 +63,7 @@ the curl-specific fetch body is deliberately not included —
 `spawnDetached` generalizes it to an arbitrary argv. Modeled after a single-owner event loop +
 detached-fork worker pool pattern.
 
-### Wake-up, timers, environment (2026-11-13)
+### Wake-up, timers, environment
 
 **`Waker`** (libuv `uv_async_send`): non-blocking close-on-exec `eventfd`, self-pipe if the
 kernel refuses one. `wake()` is thread-safe, async-signal-safe, never blocks or fails (a
@@ -73,7 +73,7 @@ is busy) makes `finish` do `DONE store -> wake`. Because a worker touches the ta
 waker for a few instructions after the DONE store, `finish` with a waker brackets itself with an
 atomic `finishing` counter incremented BEFORE the store; after the last DONE the loop calls
 `quiesce()` (spin-yield until zero) before destroying the table or closing the waker. Without a
-waker `finish` is the old single store, and no `quiesce` is needed.
+waker `finish` is a single store, and no `quiesce` is needed.
 
 **`Timers`** (libuv `uv_timer_*`): binary min-heap on `(due, start order)` with slot-tracked
 heap positions (stop/re-arm are O(log n)). The clock is an injected `u64` millisecond value
@@ -112,44 +112,42 @@ modes: a `fork`/`thread-spawn` failure returns a typed error (`spawn_failed` in 
 case, never assumed successful.
 
 ## Verification
-2026-11-13 additions: `Waker` semantics on both backends (coalescing, no lost wake, a 100k flood
-over the pipe fallback, cross-thread wake of a 60 s poll), `JobTable` completion waking a real
-`spawnDetached` job, `Timers` ordering/ties/repeat/stop/again/cancel-from-callback/growth under
-`run`/stale handles/`max_timers`/allocation failure plus a 4000-step model test against a
-brute-force list, `splitEnviron` model test, `.empty`/`.list`/`.inherit` children observed through
-`/bin/sh`, invalid/oversized environments refused, allocation failure at every step. No fuzz
-driver yet (no `fuzz_test.zig` in this module; the only parser is the environ splitter,
-covered by the model test).
 
-`Loop.poll`: a pipe becomes readable within timeout (real syscall, Linux-gated). `Loop.
-tick`: maintenance callbacks run in registration order. `JobTable`: claim/finish/drain handoff plus
-slot reuse under N-jobs-through-2-slots (multi-round, real threads, asserts exact sum/count and
-zero-busy after drain — proves the acquire/release handoff is actually visible, not just
-sequentially consistent by luck). `JobTable.spawnDetached`: real fork/exec against `/bin/true` and
-`/bin/false` (skipped if either binary is absent), asserting exact ok/fail counts and busy-count
-convergence via a bounded spin-wait. Run: `zig build test-pollworker`.
+- **Run:** `zig build test-pollworker` (`scripts/modtest pollworker`).
+- `Waker` semantics on both backends (coalescing, no lost wake, a 100k flood
+  over the pipe fallback, cross-thread wake of a 60 s poll), `JobTable` completion waking a real
+  `spawnDetached` job, `Timers` ordering/ties/repeat/stop/again/cancel-from-callback/growth under
+  `run`/stale handles/`max_timers`/allocation failure plus a 4000-step model test against a
+  brute-force list, `splitEnviron` model test, `.empty`/`.list`/`.inherit` children observed through
+  `/bin/sh`, invalid/oversized environments refused, allocation failure at every step.
+- `Loop.poll`: a pipe becomes readable within timeout (real syscall, Linux-gated). `Loop.
+  tick`: maintenance callbacks run in registration order. `JobTable`: claim/finish/drain handoff plus
+  slot reuse under N-jobs-through-2-slots (multi-round, real threads, asserts exact sum/count and
+  zero-busy after drain — proves the acquire/release handoff is actually visible, not just
+  sequentially consistent by luck). `JobTable.spawnDetached`: real fork/exec against `/bin/true` and
+  `/bin/false` (skipped if either binary is absent), asserting exact ok/fail counts and busy-count
+  convergence via a bounded spin-wait; a signal during `poll` is `Interrupted`; `drain` leaves a RUNNING slot alone;
+  an empty argv is refused without a slot; an allocation failure at every step of `spawnDetached` leaks nothing and
+  frees the slot; every argv element reaches the child; an unexec'able target exits 127; the child does not inherit
+  a non-CLOEXEC fd.
+- **Fuzz:** none (no `fuzz_test.zig` in this module; the only parser is the environ splitter, covered by the model
+  test).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-**Mutation run 2026-10-05** (in-place, Debug, 22 mutants over `Loop.poll`/`tick`,
-every `JobTable` state transition, `spawnDetached`'s refusals and rollbacks,
-`OwnedArgv`, the child side of `runChild` and `decodeStatus`): 22 killed. The
-first pass left 9; seven tests were added (a signal during `poll` is `Interrupted`;
-`drain` leaves a RUNNING slot alone; an empty argv is refused without a slot; an
-allocation failure at every step of `spawnDetached` leaks nothing and frees the
-slot; every argv element reaches the child; an unexec'able target exits 127; the
-child does not inherit a non-CLOEXEC fd). None equivalent.
+## What is deliberately not done
+
+- **The curl-specific fetch** (buffer read, negative-cache, stderr capture) stays in the app; this module only spawns
+  and reports process completion.
+- **Back-pressure beyond the fixed slot count** (queueing/retry): the caller handles a full table (e.g. retries on a
+  later tick).
+- **Windows / non-Linux:** Linux-only by design (see *Threat model / out of scope*).
 
 ## Backlog / deferred
-Per the module README's "Not in scope (DEFER)": the curl-specific fetch body (buffer read,
-negative-cache, stderr capture) stays in the app, not this module; back-pressure beyond the fixed
-slot count (queueing/retry is the caller's job); Windows/non-Linux support (out of scope by design).
 
 - (survey 2026-09-30) **Optional epoll backend / fd registration** — `poll(2)` is O(n) in the fd count; libuv/mio/libxev use epoll. Effort: medium. Fits §2.
-- (2026-11-13) **Signal handles** (libuv `uv_signal_t`) — not started; a signalfd-based handle would fit the `Waker` shape.
-- (2026-11-13) **Env merge/overlay** (`.inherit` + overrides) — callers build the list themselves today.
-
-## Status
-`extract · linux · util · single_owner` + deps: none (std only) — canonical source is `pub const
-meta` in src/root.zig.
+- **Signal handles** (libuv `uv_signal_t`) — not started; a signalfd-based handle would fit the `Waker` shape.
+- **Env merge/overlay** (`.inherit` + overrides) — callers build the list themselves today.
 
 ## Anchoring
 
