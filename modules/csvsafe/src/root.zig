@@ -18,15 +18,16 @@
 //! Signed-number exception: `+` and `-` also legitimately lead a number
 //! (`-12.34`, `+5`, `+.5`) or a `+`-prefixed international phone number
 //! (`+420 555 0101`). Prefixing those would corrupt the value, so a `+`/`-`
-//! lead is guarded ONLY when the following byte is not a digit or the decimal
-//! separator — i.e. only when it is actually a formula/comment lead
-//! (`+SUM(...)`, `-- comment`, a lone `+`).
+//! lead passes unguarded only when the byte right after the sign is a digit or
+//! the decimal separator AND every following byte is a digit, `.`, `,`, the
+//! decimal separator or a space (`isSignedNumber`); anything else is guarded
+//! (`+SUM(...)`, `-- comment`, a lone `+`, `-1+cmd|'/c calc'!A1`).
 //!
 //! Scope is deliberately ONE concern. The guard itself does NOT quote
 //! (RFC 4180) and does NOT remap decimal separators — those belong to the CSV
 //! writer. `writeField` / `writeRecord` chain the guard and `csvstream`'s
 //! quoting in the right order (guard first) for a caller who writes CSV with
-//! `csvstream`. See README "DEFER".
+//! `csvstream`. See README `## Not provided`.
 
 const std = @import("std");
 const csvstream = @import("csvstream");

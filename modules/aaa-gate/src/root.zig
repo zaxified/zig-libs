@@ -187,8 +187,9 @@ pub const AuthMode = enum {
 };
 
 /// Where an API key is looked for. `Options.api_key_sources` lists them in
-/// order; every source that carries a non-empty value is verified and the
-/// first valid one admits the request (echo's `KeyLookup`).
+/// order; the first source that carries a non-empty value is THE presented
+/// key and decides: a wrong key there is not rescued by a valid one in a later
+/// source (echo's `KeyLookup` order).
 pub const KeySource = struct {
     kind: Kind,
     /// Header name (case-insensitive), query parameter name or cookie name
@@ -464,8 +465,9 @@ pub const Options = struct {
     api_key_query_param: ?[]const u8 = null,
     /// Ordered API-key sources (`KeySource`); when non-empty they REPLACE
     /// `api_key_header` / `api_key_query_param`. Names and prefixes are
-    /// copied into the gate. Each source with a non-empty value is
-    /// verified; the first valid one admits.
+    /// copied into the gate. The first source with a non-empty value
+    /// is the presented key and is the one verified; later sources are not
+    /// consulted.
     api_key_sources: []const KeySource = &.{},
     /// Valid Basic user:password pairs (`.basic` / `.any`). Not retained —
     /// only the SHA-256 of `user:password` is stored. Users must not
@@ -599,7 +601,7 @@ pub const Gate = struct {
     /// `api_key`, `extra_api_keys` entry, `api_key_sources` name,
     /// `api_key_header`, `api_key_query_param` (when set) or
     /// `deny_content_type`; a `realm` with `"`, `\` or a control byte; a Basic
-    /// user with `:` or an empty password. (Until 2026-11-07 these panicked.)
+    /// user with `:` or an empty password.
     pub fn init(gpa: Allocator, options: Options) InitError!Gate {
         if (!optionsValid(&options)) return error.InvalidOptions;
         var tokens: std.ArrayList([Sha256.digest_length]u8) = .empty;
@@ -1229,8 +1231,7 @@ fn bearerToken(req: *const http.Server.Request) ?[]const u8 {
 /// `Authorization` (and an API-key header) is a singleton field (RFC 9110
 /// §5.3): two lines are a malformed request, and a proxy in front may read
 /// the other one than we do -- so such a request is DENIED, whatever either
-/// line holds (fiber v3 refuses it too; before 2026-10-25 the first line
-/// decided, so a valid first line admitted any second one). Only a present
+/// line holds (fiber v3 refuses it too). Only a present
 /// field is looked at twice: the second lookup scans the block after the
 /// first line, so a request without the field pays nothing.
 fn repeatedField(req: *const http.Server.Request, name: []const u8) bool {
@@ -1313,7 +1314,7 @@ fn headerKey(value: ?[]const u8, prefix: []const u8) ?[]const u8 {
 }
 
 /// Value of the first cookie named `name` in one `Cookie` field value
-/// (`a=1; b=2`), or null: `cookies.find` (2026-10-18; was a private copy).
+/// (`a=1; b=2`), or null: `cookies.find`.
 /// The name compare is exact (case-sensitive, RFC 6265 section 5.4);
 /// surrounding SP/TAB is trimmed and one pair of surrounding double quotes
 /// stripped; a `;` inside quotes does not end the value; the value is not
@@ -1491,7 +1492,7 @@ fn authorize(g: *Gate, req: *const http.Server.Request, user_out: *[basic_creden
 /// present the decode + digest compare run one frame down and the stack they
 /// dirtied is burned afterwards (`burn.request_burn`): the decoded
 /// `user:password` and the SHA-256 state that absorbed it must not survive
-/// in a dead frame (found by the request-path stack probe, 2026-11-07). On
+/// in a dead frame (found by the request-path stack probe). On
 /// `.ok_basic` the user name is copied to `user_out`/`user_len`.
 fn basicCheck(g: *Gate, req: *const http.Server.Request, user_out: *[basic_credentials_max]u8, user_len: *usize) Gate.Verdict {
     if (req.header("authorization") == null) return g.verifyBasic(null);
@@ -1518,9 +1519,7 @@ fn keepUser(user: []const u8, out: *[basic_credentials_max]u8, len: *usize) void
 /// no `Authorization` header where it is read, no API-key value where keys
 /// are read. Anything present, valid or not, is a credential -- except an
 /// empty (blank) API-key value, which is missing in every source alike:
-/// header, query and cookie (echo's extractors; until 2026-11-07 an empty
-/// key HEADER counted as presented while an empty query/cookie value did
-/// not). A non-blank key header that lacks its `prefix` is still presented
+/// header, query and cookie (echo's extractors). A non-blank key header that lacks its `prefix` is still presented
 /// (malformed, so a 401).
 fn noCredential(g: *const Gate, req: *const http.Server.Request) bool {
     const reads_authorization = switch (g.auth_mode) {

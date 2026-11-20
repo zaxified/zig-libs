@@ -1765,7 +1765,7 @@ pub const Metadata = struct {
 /// must be identical to the requested one (`IssuerMismatch`).
 ///
 /// Refuses an `http://` issuer and a document naming an `http://`
-/// `jwks_uri` (`error.InsecureKeySource`, since 2026-09-28) — see
+/// `jwks_uri` (`error.InsecureKeySource`) — see
 /// `discoverWith` to allow them.
 pub fn discover(
     gpa: std.mem.Allocator,
@@ -2050,7 +2050,7 @@ pub const Provider = struct {
     };
 
     /// `options.issuer` or `options.jwks_uri` must be set: neither is
-    /// `error.NoKeySource` (a panic until 2026-11-07).
+    /// `error.NoKeySource`.
     pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) error{NoKeySource}!Provider {
         if (options.issuer == null and options.jwks_uri == null) return error.NoKeySource;
         return .{ .gpa = gpa, .fetcher = fetcher, .options = options };

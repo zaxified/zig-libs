@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — golang.org/x/time v0.15.0 `rate`, the reference, gives a reservation's tokens back AGAIN on every repeated `CancelAt`: burst 3 at 1/s, `AllowN(t0, 3)`, `ReserveN(t0, 3)`, then the same reservation cancelled ten times with an `AllowN(t0, 3)` after each admitted 30 events at one instant against a burst of 3 (`tools/lead_probe`); this module zeroes a cancelled reservation, so a second cancel is a no-op (test "TokenBucket: reserveNAt honours max_wait; a second cancel is a no-op (deliberate x/time/rate divergence)") (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (244/263, 19 eq) · src 61758fc30593b9d0
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (244/263, 19 eq) · src 336852adefc144af
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — token-bucket rate limit (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator sweep of every pub entry point: no data-reachable panic; `TokenBucket` config and a missing middleware/`on_connect` context are checked panics)
 

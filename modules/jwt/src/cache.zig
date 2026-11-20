@@ -58,11 +58,13 @@ pub const Config = struct {
     /// Most tokens held at once. Rounded up so the bucket count is a power
     /// of two (`VerifiedCache.capacity` reports the result). Must be > 0.
     capacity: usize,
-    /// Bytes folded into every key besides the claim policy: name the
-    /// configuration of the caller's derive step (which claim is the
-    /// principal id, which scope names map to which bits), so two callers
-    /// deriving different `Value`s from one token never share an entry.
-    /// Copied; at most `max_context_len` bytes.
+    /// Bytes folded into every key besides the claim policy. **No effect
+    /// today:** each instance has its own table and its own random MAC key,
+    /// so entries are never shared between instances, and within one
+    /// instance the value is a constant. Callers whose derive steps differ
+    /// (which claim is the principal id, which scope names map to which
+    /// bits) must use separate instances. Copied; at most `max_context_len`
+    /// bytes.
     context: []const u8 = "",
 };
 
@@ -159,8 +161,9 @@ pub fn VerifiedCache(comptime Value: type) type {
 
         /// Free the table. The derived values are wiped first (they may name
         /// a principal, and the freed block goes back to the allocator), and
-        /// so is the MAC key. Using the cache afterwards is a caller bug and
-        /// panics with `jwt.VerifiedCache: used after deinit`.
+        /// so is the MAC key. Using the cache afterwards is still a caller
+        /// bug, but it does not panic: a lookup is a miss and an insert does
+        /// nothing (the cache degrades to "no cache").
         pub fn deinit(self: *Self) void {
             std.crypto.secureZero(u8, &self.mac_key);
             std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.buckets));
@@ -222,8 +225,9 @@ pub fn VerifiedCache(comptime Value: type) type {
         /// value cannot be made, e.g. no principal claim) is
         /// `error.NotDerived`, and nothing is stored.
         ///
-        /// `derive` must be a pure function of the token: whatever else it
-        /// reads belongs in `Config.context`. The whole call returns what
+        /// `derive` must be a pure function of the token, and the cache has
+        /// no way to tell derive steps apart (`Config.context` has no effect):
+        /// use one instance per derive configuration. The whole call returns what
         /// `parseVerifyJwks` + `derive` would return without the cache.
         pub fn verifyJwks(
             self: *Self,
@@ -252,7 +256,7 @@ pub fn VerifiedCache(comptime Value: type) type {
 
         /// Null after `deinit` (no table): a lookup is a miss and an insert
         /// does nothing, so a use after `deinit` degrades to "no cache"
-        /// instead of a panic (it panicked until 2026-11-07).
+        /// instead of a panic.
         fn bucketOf(self: *Self, digest: *const [digest_len]u8) ?*Bucket {
             if (self.buckets.len == 0) return null;
             const h = std.mem.readInt(u64, digest[0..8], .little);

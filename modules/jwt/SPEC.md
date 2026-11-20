@@ -8,9 +8,9 @@
 
 **Ahead:** correctness — six tokens golang-jwt v5.3.1 accepts and this module refuses, each on an RFC rule: a `crit` naming an extension the recipient does not process, a `crit` naming a registered parameter, an empty `crit` (RFC 7515 §4.1.11), a signature and a payload segment whose unused base64url bits are set (RFC 7515 §2 with RFC 4648 §3.5: two strings for one token), and duplicate claim names (RFC 7519 §4: reject or take the last; golang-jwt takes the last, this module rejects); out of 81 rows `zig build interop-jwt` judges against golang-jwt, the other 75 agree (test `lead: crit, non-canonical base64url and duplicate claims -- golang-jwt v5.3.1 accepts six tokens this module refuses`, `src/go_oracle_vectors.zig`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (1344/1436, 92 eq) · src 09cd392d3e37fab4
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (1344/1436, 92 eq) · src cf90fc0bfb50cd85
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-28 (independent sweep of every pub entry point: token length cap, `crit` list cap, failed-refresh throttle, total `Claims.claim`, checked panics for `Provider.init` and `VerifiedCache` after deinit)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-28 (independent sweep of every pub entry point: token length cap, `crit` list cap, failed-refresh throttle, total `Claims.claim`, `Provider.init` with no key source is `error.NoKeySource`, a `VerifiedCache` used after deinit is a miss, not a panic)
 
 **Performance:** ref 0.20–0.88× golang-jwt v5.3.1 (Go 1.26.8) · fastest 1.21× jsonwebtoken 9.3.1 (measured 2026-10-26)
 
@@ -38,6 +38,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Design & invariants
 
+- **Dependencies:** deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519`, `b64ct`, `sha2`, `keycodec`, `clock` (wall-clock read for `Clock.system`); the canonical list is `pub const meta` in `src/root.zig`.
 - **Layered, offline core first:** parse+claims (P1) → HS/ES/EdDSA verify (P2) → RS256/384/512
   (P3) → JWKS by-`kid` (P4) → networked `Provider` = OIDC discovery + JWKS fetch + cache (P5) →
   `ResourceServer` `router` middleware **+ framework-agnostic `Guard`** (P6) → OAuth2/OIDC
@@ -232,7 +233,7 @@ fixes the first two and every part of the third except the clock, and re-evaluat
   `require_exp`, `reject_future_iat`), length-prefixed, with the token last; a comptime check
   fails the build when a field is added to `Options` without being folded in or excluded. So the
   same token under another audience, issuer or leeway is another entry — one cache may even be
-  shared between verifiers. The 16-byte MAC key is drawn at `init` with `io.randomSecure`
+  shared between verifiers (every verifier sharing it must use the same `derive`). The 16-byte MAC key is drawn at `init` with `io.randomSecure`
   (fail-closed, CONVENTIONS §2.2) and wiped at `deinit`. Without it an attacker cannot compute a
   single tag offline, and a request whose bytes differ from a cached token's hits only if the two
   tags collide — 2^-128 per request, and each attempt is an online request that learns one bit
@@ -270,7 +271,8 @@ fixes the first two and every part of the third except the clock, and re-evaluat
   hit path allocation-free and bounds an entry: a token whose claims do not fit the caller's
   `Value` is refused by `derive` and simply not cached. `derive` must be a pure function of the
   token; what else it reads (which claim names the principal, which scopes map to which bits)
-  goes into `Config.context`, which is folded into the key.
+  needs its own `VerifiedCache` instance (`Config.context` is folded into the key but, being a
+  per-instance constant, separates nothing; see Backlog).
 
 **Residual differences — none in the answer, under one assumption.** With the MAC key secret, a
 hit returns what verifying again would, except with probability 2^-128 per request. What does
@@ -396,7 +398,8 @@ the figures and is authoritative.
   `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
 - **`VerifiedCache` `Config.context` has no effect.** Each instance has its own table and random MAC
   key, so folding a per-instance constant into the key never changes a hit; separate callers are
-  kept apart by separate instances already. Either drop the field or say so in its doc.
+  kept apart by separate instances already. The docs say so; open: either remove the field
+  (breaking) or make it effective.
 - **Dead-stack probes missing:** no stackprobe covers PEM key loading (its wipes are unobservable) or
   `VerifiedCache.init`'s MAC-key copy; a probe in `stackprobe_test.zig` would decide those mutants.
 - **Dead-stack residue not yet probed or burned:** the `kty:"oct"` secret in `parseJwks` (`jwkMaterial`

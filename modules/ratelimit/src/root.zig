@@ -48,8 +48,10 @@
 //!
 //! **Caveat when directly reachable:** clients can then send forged
 //! `X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them —
-//! choosing their own bucket (a per-client limiter, not an unkeyed
-//! bypass). If you are *not* behind a proxy that always sets XFF — or are
+//! choosing their own key. A new forged value per request is a new full
+//! bucket, so the limiter is largely dodged (and the forged keys can flush
+//! other clients' entries out of the table). If you are *not* behind a
+//! proxy that always sets XFF — or are
 //! reachable both through it and directly — use
 //! `KeySource{ .forwarded_ip_trusted = .loopback }` (or `.{ .set = &proxies }`):
 //! the headers then count only when the socket peer is a trusted proxy
