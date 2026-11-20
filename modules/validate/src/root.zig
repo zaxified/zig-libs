@@ -12087,15 +12087,36 @@ test "sharing past the scan table: tracked shared rules are definitions, the res
         }
         break :blk rules;
     };
-    // The scan really collides here: shared rules sit off their home slot.
+    // The table really probes: two rules whose home slot is the same. More
+    // than `scan_slots` distinct rules cannot all have distinct home slots
+    // (pigeonhole), whatever addresses the linker gave them, so a pair exists.
+    const pool = try testing.allocator.alloc(Rule, scan_slots + 1);
+    defer testing.allocator.free(pool);
+    for (pool) |*r| r.* = .{ .field = "x", .kind = .string };
+    var first_of: [scan_slots]?usize = @splat(null);
+    var pair: [2]usize = undefined;
+    for (pool, 0..) |*r, i| {
+        const h = Export.hashSlot(r);
+        if (first_of[h]) |j| {
+            pair = .{ j, i };
+            break;
+        }
+        first_of[h] = i;
+    } else return error.TestUnexpectedResult;
     var probe: Export = .{ .s = undefined };
-    probe.scanFields(&outer, 0);
-    var displaced: usize = 0;
-    for (0..probe.n) |idx| {
-        if (probe.refs[idx] < 2) continue;
-        if (probe.slots[Export.hashSlot(probe.order[idx])] != idx + 1) displaced += 1;
-    }
-    try testing.expect(displaced > 0);
+    const ra = &pool[pair[0]];
+    const rb = &pool[pair[1]];
+    probe.scanRule(ra, 0);
+    probe.scanRule(rb, 0);
+    probe.scanRule(ra, 0);
+    probe.scanRule(rb, 0);
+    try testing.expectEqual(@as(usize, 2), probe.n);
+    try testing.expectEqual(@as(?usize, 0), probe.find(ra));
+    try testing.expectEqual(@as(?usize, 1), probe.find(rb)); // found after the collision
+    try testing.expectEqual(@as(u16, 2), probe.refs[0]);
+    try testing.expectEqual(@as(u16, 2), probe.refs[1]); // the second sighting hit the entry, did not add one
+    try testing.expect(probe.slots[Export.hashSlot(rb)] != 2); // rb sits off its home slot
+    try testing.expectEqual(@as(?usize, null), probe.find(&pool[(pair[1] + 1) % pool.len]));
 
     var w: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w.deinit();
