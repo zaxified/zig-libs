@@ -8,7 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-19 (134/140, 6 eq) · src 3bea2d1c9423e981
 
-*Whole-module mutation run 2026-11-14* (about 540 production lines touched since 2026-10-08): 137 mutants; 131 killed (4 after new tests: rejected seed zeroes `out`, a too-small `sendMessage` buffer spends no nonce, the sweep's hand-set-state paths end in `.failed`; burn/wipe mutants by the ReleaseFast stack probe). 5 equivalent (the `isZero` check before `combMulBase`, which errors on 0 anyway; the length frame's even nonce never reaches 1000 (2); `>=` at a counter that resets at exactly 1000; an oversized body caught by noise's own length check with the same error and state). 1 accepted: the `secureZero` of the seed copy in `dh.KeyPair.generateBody` is invisible to every test because `burn.run(ecc_burn)` zeroes that frame anyway (verified on a plain source copy with the wipe deleted, no mutant switch to distort the frame); kept as defence in depth.
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per target, 5 targets, BOLT8_FUZZ) · ct 2026-09-08 (ctgrind) · panic 2026-11-14 (sweep of every pub entry point: the wire parsers, secp256k1 inputs, send/recv, the 1000-message rotation are clean; LOW `readAct2`/`genAct3`/`genAct2`/`readAct3` panicked on `.?` when a caller set the pub `state` field by hand ahead of the act that fills it, now `error.WrongState` and the object goes to `.failed`)
 
@@ -27,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [lightningnetwork/lnd](https://github.com/lightningnetwork/lnd) (`brontide`) — **reference** | Go | MIT | 8.2k | v0.21.3-beta (2026-09-02) | `brontide` is the de-facto BOLT#8 reference; this module is interop-tested against it (`tools/peer.zig` vs lnd's `brontide`, per the module SPEC). brontide additionally wraps a `net.Conn` with a 5 s handshake read timeout and pooled buffers; this module is sans-io and leaves the deadline to the caller (SPEC F8). **Measured 2026-10-07** (`zig build bench-bolt8`, ReleaseFast vs brontide v0.21.3-beta built with Go 1.26.0 on btcec/v2 v2.5.0 and x/crypto v0.57.0, in memory, fixed keys; the three acts and the first transport frame of 1 KiB and 65535 bytes byte-equal first; i7-7920HQ, 2 runs): full handshake (both sides, acts 1–3) ours/lnd 0.79; encrypt+decrypt of 1 KiB 1.09–1.13; of 65535 bytes 1.06 (key rotation included). |
+| [lightningnetwork/lnd](https://github.com/lightningnetwork/lnd) (`brontide`) — **reference** | Go | MIT | 8.2k | v0.21.3-beta (2026-09-02) | `brontide` is the de-facto BOLT#8 reference; this module is interop-tested against it (`tools/peer.zig` vs lnd's `brontide`, per the module SPEC). brontide additionally wraps a `net.Conn` with a 5 s handshake read timeout and pooled buffers; this module is sans-io and leaves the deadline to the caller (SPEC F8). Measured with `zig build bench-bolt8` (ReleaseFast, in memory, fixed keys; the three acts and the first transport frame of 1 KiB and 65535 bytes byte-equal first); the card's `**Performance:**` line carries the figures. |
 | [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `lightning` crate implements the encryptor inside its peer manager, not as a stand-alone library *(inferred)*. |
 | [ElementsProject/lightning](https://github.com/ElementsProject/lightning) (Core Lightning) | C | BSD-MIT (`LICENSE`; `ccan/` has its own) | 3.1k | v26.06.8 (2026-09-22) | Handshake in C inside `connectd` *(inferred)*. |
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | Scala transport codecs *(inferred)*. |
@@ -41,8 +40,8 @@ BOLT#8 instantiates `Noise_XK_secp256k1_ChaChaPoly_SHA256` on top of the
 Noise Protocol Framework. This repo already ships a COMPLETE, tested
 generic Noise implementation (`../noise`) — the question is whether this
 module can drive that implementation directly, or must implement its own
-handshake driver on top of a narrower reuse surface. Two separate gaps
-were investigated; only one turned out to be real.
+handshake driver on top of a narrower reuse surface. Two separate gaps are
+considered below.
 
 ### 1. The DH width split — NOT a problem
 
@@ -72,96 +71,45 @@ settles this cleanly:
 
 **Conclusion: a secp256k1 DH adapter (`public_length = 33`, `scalarmult`
 returning `[32]u8`) is fully compatible with `noise`'s DH-width handling.**
-This part of the investigation would have supported driving the handshake
-through `noise.HandshakeState` directly (option A in the task brief).
+So the width split does not stop the handshake from being driven through
+`noise.HandshakeState`; it only needs the adapter below.
+### 2. `noise`'s protocol-name lookup
 
-### 2. `HandshakeState.initialize`'s protocol-name lookup — a REAL blocker
+`HandshakeState.initialize` builds the protocol-name string from `dhName(DH)` (`noise/src/state.zig:24`). A DH
+type outside `std` joins a suite by declaring `pub const noise_name`, which `dh.zig` does
+(`noise_name = "secp256k1"`, `dh.zig:41`), and `noise/src/patterns.zig:75` ships the `XK` pattern. So the type
+lookup no longer rules out `noise.HandshakeState` for this suite. This module nevertheless drives the three-act
+`Noise_XK` handshake itself (`handshake.zig`'s `Initiator`/`Responder`), reusing ONLY
+`noise.Suite(dh, ChaCha20Poly1305, SHA256).SymmetricState` (`handshake.zig:54`) and never `HandshakeState`; whether
+the generic state machine could replace the hand-written driver has not been tried or compared.
+`dh.zig` is the `DH` type parameter passed to `Suite(...)`: it supplies `public_length`, `KeyPair`, `noise_name`
+and a `scalarmult` alias for API-shape parity (`scalarmult` is never called by this module).
 
-`state.zig`'s `dhName(comptime T: type) []const u8` (used inside
-`HandshakeState.initialize` to build the `"Noise_" ++ pattern.name ++ "_"
-++ dhName(DH) ++ ...` protocol-name string per spec §8) is:
+### Why driving `SymmetricState` directly is cheap
 
-```zig
-fn dhName(comptime T: type) []const u8 {
-    if (T == std.crypto.dh.X25519) return "25519";
-    @compileError("noise: no spec §8 protocol name for DH type " ++ @typeName(T));
-}
-```
+BOLT#8's per-act nonce/key bookkeeping (`temp_k1`/`temp_k2`/`temp_k3`, the exact nonce each is used at) falls out
+of `SymmetricState`'s own state machine, as long as one instance is threaded through all three acts in order
+(exactly mirroring how `HandshakeState.writeMessage`/`readMessage` process one pattern's tokens per call):
 
-This recognizes **only** `std.crypto.dh.X25519`. Instantiating
-`noise.Suite(Secp256k1DH, ChaChaPoly, SHA256)` itself compiles fine (the
-struct's other top-level decls — `DHLEN`, `KeyPair`, the comptime
-assertions — never call `dhName`), and `Suite.SymmetricState` is fully
-usable standalone. But the MOMENT any code path calls
-`Suite.HandshakeState.initialize(...)`, `dhName(Secp256k1DH)` executes at
-comptime and hits its `@compileError` branch — this is not a runtime
-failure to catch, it is a **build failure**, unconditionally, for any `DH`
-other than X25519. `noise/src/patterns.zig` also doesn't define an `XK`
-pattern (only NN/NK/XX/IK), which would additionally need a local
-`HandshakePattern` value — moot, since this module never reaches the code
-path that would consult one.
+- **Act Three's `c` field is encrypted at nonce 1, not 0** (BOLT#8: `c = encryptWithAD(temp_k2, 1, h, s.pub)`) —
+  this falls out of `CipherState`'s auto-incrementing nonce counter, PROVIDED the driver does not re-key between
+  Act Two's zero-payload `encryptAndHash` (nonce 0, using `temp_k2`) and Act Three's static-key `encryptAndHash`
+  (nonce 1, same `temp_k2` — no intervening `mixKey`). This is the easiest correctness sinkhole of the handshake
+  and is flagged in `genAct3`'s and `readAct3`'s doc comments.
+- **`rck = sck = ck`** (BOLT#8 Act Three step 8/step 11): `SymmetricState.split()` reads `self.ck` to derive the two
+  transport `CipherState`s but does **not** overwrite it (unlike `mixKey`/`mixKeyAndHash`, which both do
+  `self.ck = out[0]`), so `ss.ck` immediately after `split()` IS the value BOLT#8 wants seeded into `sck`/`rck`.
+  `HandshakeResult.ck` is `ss.ck` read at that point.
+- **The message-key rotation ratchet is also `SymmetricState.mixKey`**, reused after the handshake: BOLT#8's
+  `ck', k' = HKDF(ck, k)` is the formula `mixKey` implements (`out = HKDF(ck, ikm, 2); ck = out[0]; cipher_state =
+  initializeKey(out[1])`, which also resets the nonce to 0, the spec's "reset the nonce"). `transport.zig`'s
+  `Direction.rotate()` builds a throwaway `SymmetricState` shell seeded with `(chain, cipher.k)` and calls
+  `.mixKey(&cipher.k)` (`transport.zig:80-85`).
 
-Empirically verified (not just read) before committing to this shape: a
-throwaway `noise.Suite(FakeDH, ChaChaPoly, SHA256)` with a hand-rolled
-33-byte-pubkey `FakeDH` type compiles and its `SymmetricState` runs fine
-standalone — confirming `Suite(DH,...)`'s non-`HandshakeState` surface
-never touches `dhName`.
-
-**Decision: (B).** This module drives the three-act `Noise_XK` handshake
-itself (`handshake.zig`'s `Initiator`/`Responder`), reusing ONLY
-`noise.Suite(dh, ChaChaPoly, SHA256).SymmetricState` — never
-`HandshakeState`. `dh.zig` (this module's own file) IS the `DH` type
-parameter passed to `Suite(...)` (it supplies `public_length`, `KeyPair`,
-and a `scalarmult` alias for API-shape parity, even though `scalarmult` —
-and therefore `dhName` — is never actually invoked).
-
-### Why this split is a genuine free lunch, not just "it compiles"
-
-Once `HandshakeState` is off the table, the natural worry is that BOLT#8's
-per-act nonce/key bookkeeping (temp_k1/temp_k2/temp_k3, the exact nonce
-each is used at) has to be hand-rolled and could easily drift from the
-spec. It doesn't, because `SymmetricState`'s own state machine ALREADY
-encodes the right invariants, as long as one instance is threaded through
-all three acts in order (exactly mirroring how `HandshakeState.
-writeMessage`/`readMessage` process one pattern's tokens per call):
-
-- **Act Three's `c` field is encrypted at nonce 1, not 0** (BOLT#8: `c =
-  encryptWithAD(temp_k2, 1, h, s.pub)`) — this falls out automatically
-  from `CipherState`'s auto-incrementing nonce counter, PROVIDED the
-  driver does not re-key between Act Two's zero-payload `encryptAndHash`
-  (nonce 0, using `temp_k2`) and Act Three's static-key `encryptAndHash`
-  (nonce 1, same `temp_k2` — no intervening `mixKey`). This is the single
-  easiest correctness sinkhole for whoever fills in `genAct3`/`readAct3`
-  — flagged explicitly in both functions' doc comments.
-- **`rck = sck = ck`** (BOLT#8 Act Three step 8/step 11): `SymmetricState.
-  split()` reads `self.ck` to derive the two transport `CipherState`s but
-  does **not** overwrite it (unlike `mixKey`/`mixKeyAndHash`, which both
-  do `self.ck = out[0]`) — so `ss.ck` immediately after calling `split()`
-  IS, with zero extra bookkeeping, exactly the value BOLT#8 wants seeded
-  into `sck`/`rck`. `handshake.HandshakeResult.ck` is just `ss.ck` read at
-  that point.
-- **The message-key rotation ratchet is ALSO just `SymmetricState.
-  mixKey`**, reused a second time post-handshake: BOLT#8's `ck', k' =
-  HKDF(ck, k)` is the exact same three-line formula `mixKey` already
-  implements (`out = HKDF(ck, ikm, 2); ck = out[0]; cipher_state =
-  initializeKey(out[1])` — which also resets the nonce to 0, covering the
-  spec's own step 3 "reset the nonce" for free). `transport.zig`'s
-  `Direction.rotate()` builds a throwaway `SymmetricState` shell seeded
-  with `(chain, cipher.k)` and calls `.mixKey(&cipher.k)` — this is why
-  `transport.zig` needed **zero** stubbing: the "rotation ratchet" is not
-  new crypto, it is the same primitive noise already implements, called a
-  second time after the handshake ends.
-
-This is also why the STUBBED surface is exactly as narrow as it is: only
-the six functions that decide **when** each DH happens and **what** gets
-mixed into the running key at each of the three acts
-(`Initiator.genAct1`/`.readAct2`/`.genAct3`,
-`Responder.readAct1`/`.genAct2`/`.readAct3`) are reserved — everything
-else in this module (`dh.zig`'s ECDH primitive, `act.zig`'s framing,
-`Initiator.init`/`Responder.init`'s pre-Act-One transcript setup, all of
-`transport.zig`) is real, because none of it required deciding anything
-BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
-`noise`'s existing, KAT-verified `SymmetricState`.
+So the code that decides when each DH happens and what is mixed into the running key at each act is exactly the six
+act functions (`Initiator.genAct1`/`.readAct2`/`.genAct3`, `Responder.readAct1`/`.genAct2`/`.readAct3`); everything
+else (`dh.zig`'s ECDH, `act.zig`'s framing, both `init`s' pre-Act-One transcript, all of `transport.zig`) is
+byte-for-byte what BOLT#8 spells out or what `noise`'s KAT-verified `SymmetricState` already does.
 
 ## Design & framing
 
@@ -182,7 +130,7 @@ BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
   ChaChaPoly_SHA256")` (`SymmetricState.initializeSymmetric`), `ck = h`,
   `h = SHA256(h || "lightning")` (`.mixHash(prologue)`), then both sides
   mix in the responder's static key from their own perspective
-  (`Initiator.init`/`Responder.init`) — all REAL, all pure
+  (`Initiator.init`/`Responder.init`) — all pure
   `SymmetricState` calls with no DH/AEAD involved.
 - **Transport framing** (`transport.zig`): `2-byte length ‖ 16-byte tag ‖
   encrypted payload ‖ 16-byte tag`, big-endian length, zero-length AD,
@@ -193,8 +141,58 @@ BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
 - **Key rotation** (`transport.zig`'s `Direction.rotate`/`.maybeRotate`):
   triggers when a direction's `CipherState.n` reaches 1000 (every 500
   messages, since each message consumes two nonce values — one for the
-  length prefix, one for the payload); see "genuine free lunch" above for
-  why this is real, not stubbed.
+  length prefix, one for the payload); the rotation is `SymmetricState.mixKey`
+  (see *Why driving `SymmetricState` directly is cheap*).
+
+- **Act drivers** (`handshake.zig`): each act is one ECDH (`dh.dh`) mixed in with `SymmetricState.mixKey`, one
+  `encryptAndHash`/`decryptAndHash`, plus the act's `mixHash` steps.
+  - `Initiator.genAct1`: `mixHash(e.pub)` → `es = ECDH(e.priv, rs)` → `mixKey(es)` → `encryptAndHash("")`.
+  - `Responder.readAct1`: the mirror (`es = ECDH(s.priv, re)`), `decryptAndHash(tag)` fail-closed.
+  - `Responder.genAct2`: `mixHash(e.pub)` → `ee = ECDH(e.priv, re)` → `mixKey(ee)` → `encryptAndHash("")`;
+    `Initiator.readAct2` is the mirror.
+  - `Initiator.genAct3`: `encryptAndHash(ls.pub)` at nonce 1 → `se = ECDH(ls.priv, re)` → `mixKey(se)` →
+    `encryptAndHash("")` → `split()` with `sk = pair[1].k`, `rk = pair[0].k`, `ck = ss.ck` (unmutated by `split`),
+    `handshake_hash = ss.h` (`handshake.zig:396-432`).
+  - `Responder.readAct3`: `decryptAndHash(c)` at nonce 1 recovers `rs`; the recovered key is validated by the
+    `se = ECDH(e.priv, rs)` call itself (`Secp256k1.fromSec1` → `error.InvalidPublicKey`) BEFORE it is stored in
+    `rs_pub`; then `mixKey(se)` → `decryptAndHash(t)` → `split()` with the assignment order swapped (`rk` from
+    `pair[0]`, `sk` from `pair[1]`) (`handshake.zig:607-650`).
+- **Act ordering and failure.** Each object drives one handshake. Every act checks its own expected `state` first
+  (`Initiator.State = start → awaiting_act2 → ready_act3 → done`, `Responder.State = start → ready_act2 →
+  awaiting_act3 → done`, both with `failed`, `handshake.zig:228,452`) and `errdefer`s into `.failed` on any error, so
+  an act out of order, a retry of a failed act and a second `genAct1` on one object are all `error.WrongState`
+  (never a silent reuse of the previous ephemeral share). An act that reads a field an earlier act fills (a
+  caller set the pub `state` by hand) answers `error.WrongState` instead of panicking. `Responder.rs_pub` is set only
+  from a parsed key and cleared again if the final MAC (`t`) fails, so a half-authenticated peer never looks
+  authenticated.
+- **Entropy seam** (`handshake.Ephemeral`, `handshake.zig:110`). Act One's `e` is the initiator's only per-session
+  secret input: the Act-One wire bytes and `es` are pure functions of it. `Ephemeral` is a tagged union with a
+  `csprng` arm (production: an assertion the caller makes about its generator) and a `seeded_for_test` arm, and a
+  private `source()` accessor (the shape of `dtls`'s `Connection.Entropy`; `std.Random` is a vtable, so a bare
+  parameter cannot tell a real CSPRNG from `DefaultPrng.init(0)`). This is fail-visible, not fail-closed: nothing
+  checks what is inside `.csprng`. `Initiator.ephemeral`/`Responder.ephemeral` are outputs: `genAct1`/`genAct2`
+  always draw, so pre-setting the field cannot pin the share. The KAT injection Appendix A needs is
+  `genAct1WithEphemeral`/`genAct2WithEphemeral`, declared `void` outside a test build (`testOnly`,
+  `handshake.zig:157`), so production code cannot express a pinned ephemeral.
+- **Handshake result.** `HandshakeResult` carries `sk`, `rk`, `ck`, `handshake_hash` and `remote_static` (the peer's
+  static key: the initiator's `rs`, or the responder's validated Act Three `rs`). `wipe()` zeroes `sk`/`rk`/`ck`
+  (call it after `Transport.init`, which copies them); `handshake_hash` and `remote_static` are public and stay;
+  copies a caller made by value are not reached (`handshake.zig:166-192`).
+- **Zeroization and the dead stack.** `Initiator.deinit`, `Responder.deinit`, `Transport.deinit` and
+  `KeyPair.deinit` zero what the object directly owns. Secrets do not stay in dead frames either: `init`s and
+  every act run one frame down and then zero 24 KiB at that depth (`burnStack`, `stack_burn`,
+  `handshake.zig:663,681`; volatile 16-byte vector stores, `k256`'s own 16 KiB `mul` burn sits under it);
+  `KeyPair` creation, `dh` and `Transport.init`/`Direction.init` run under `burn.run` (`burn.zig`: 32 KiB for the ECC
+  paths, 4 KiB for the transport init). For that, `Initiator.init`/`Responder.init` take the `KeyPair` by pointer
+  and `genAct3(&out)`/`readAct3(msg, &out)` write the `HandshakeResult` to `out` (a returned result would land in a
+  temporary of the caller's frame no wipe here reaches). `noise`'s `CipherState` and `chachapoly`'s AEAD burn
+  their own frames, so `sendMessage`/`recvLength`/`recvMessage` leave no key behind either. `dh`'s compressed
+  shared point is dead-stack data inside the burned frame. `Direction.rotate`'s `SymmetricState` shell runs once per
+  1000 messages and is not covered by the probe (see *Verification*).
+- **`NonceExhausted`** is in `SendError` and `RecvError` (`transport.zig:108-109`) but is structurally unreachable
+  through this module's own `sendMessage`/`recvLength`/`recvMessage`: `maybeRotate` resets the nonce at
+  `rotation_interval` (1000), so it never climbs toward `CipherState`'s exhaustion point. It stays in the sets
+  because `CipherState` can still return it if `Direction`'s invariant is ever broken; a test pins it.
 
 ## Threat model
 
@@ -221,8 +219,8 @@ BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
   `kat_test.zig` against `act3_bad_rs_message`, with the underlying
   parse-rejection additionally real-tested standalone in `dh.zig`.
 - **Nonce-continuity is the single easiest place a from-scratch
-  reimplementation of this handshake goes subtly wrong** (see "genuine
-  free lunch" above) — get it wrong and every downstream ciphertext byte
+  reimplementation of this handshake goes subtly wrong** (see *Why driving
+  `SymmetricState` directly is cheap*) — get it wrong and every downstream ciphertext byte
   changes silently (it still "compiles and runs", it just never
   interoperates with a real Lightning node). Both `genAct3`/`readAct3`'s
   doc comments call this out explicitly as the load-bearing detail.
@@ -235,246 +233,130 @@ BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
   same posture as this repo's `ssh` module's transport layer), and
   anything above the Lightning-message byte boundary (message-type
   dispatch, `init`/`ping`/gossip semantics — BOLT#1/BOLT#7 territory, not
-  this module's concern). ⚠ **Audit finding F8 (2026-09-05): that caller-owned
-  read loop needs a deadline, and this module cannot enforce one.**
-  `Responder.readAct1` cannot tell a genuine 50-byte Act One from 50 bytes
-  chosen by an attacker without first spending one variable-base secp256k1
-  scalar multiply (`es = ECDH(s.priv, re)`, measured ~244 µs CPU on this
-  audit's hardware) — the MAC that would reject a forgery is checked only
-  AFTER that ECDH, because `temp_k1` is derived from its output. `brontide`
-  bounds this with an explicit `handshakeReadTimeout` (5 s) around its own
-  read loop; this module's caller must supply the equivalent, since the
-  read loop itself lives outside this module's scope by design (above).
-  Without one, an attacker who never completes a handshake can hold a
-  responder in `readAct1` indefinitely per connection attempt.
-
-## TODO(fable) — done record (fill-in pass completed 2026-07-12)
-
-All six `handshake.zig` act-driver stubs were implemented in the
-checklist's dependency order — each is exactly its doc comment's BOLT#8
-recipe (one `dh.dh` ECDH mixed via `SymmetricState.mixKey`, one
-`encryptAndHash`/`decryptAndHash`, plus the act's `mixHash` steps) — and
-every formerly-`SkipZigTest` KAT assertion in `kat_test.zig` was
-re-enabled; the module now carries **zero skips**:
-
-1. **`Initiator.genAct1`** — `mixHash(e.pub)` → `es = ECDH(e.priv, rs)` →
-   `mixKey(es)` → `encryptAndHash("")`. Reproduces
-   `kat_vectors.act1_bytes` byte-exact (KAT-injected ephemeral via the
-   test-build-only `genAct1WithEphemeral` hook; `genAct1` itself always
-   draws from its `Ephemeral` argument — see "RNG seam" below).
-2. **`Responder.readAct1`** — mirror (`es = ECDH(s.priv, re)`),
-   `decryptAndHash(tag)` fail-closed. Accepts `act1_bytes`, rejects
-   `act1_bad_mac` with `error.DecryptionFailed`.
-3. **`Responder.genAct2`** — `mixHash(e.pub)` → `ee = ECDH(e.priv, re)` →
-   `mixKey(ee)` → `encryptAndHash("")`. Reproduces `act2_bytes`
-   byte-exact.
-4. **`Initiator.readAct2`** — mirror (`ee = ECDH(e.priv, re)`). Accepts
-   `act2_bytes`, rejects `act2_bad_mac` with `error.DecryptionFailed`.
-5. **`Initiator.genAct3`** — `encryptAndHash(ls.pub)` at nonce 1 (the
-   temp_k2 nonce-continuity property: same `SymmetricState` instance, no
-   intervening `mixKey` — see "genuine free lunch" above) → `se =
-   ECDH(ls.priv, re)` → `mixKey(se)` → `encryptAndHash("")` → `split()`
-   with `sk = pair[0].k`, `rk = pair[1].k`, `ck = ss.ck` (unmutated by
-   `split`), `handshake_hash = ss.h`. Reproduces `act3_bytes` byte-exact
-   AND `HandshakeResult.{sk,rk,ck}` == `{init_sk, init_rk,
-   ck_temp_k3[0]}`.
-6. **`Responder.readAct3`** — `decryptAndHash(c)` at nonce 1 recovers
-   `rs`; the recovered key is validated by the `se = ECDH(e.priv, rs)`
-   call itself (`Secp256k1.fromSec1` → `error.InvalidPublicKey`) BEFORE
-   being stored into `self.rs_pub`; then `mixKey(se)` →
-   `decryptAndHash(t)` → `split()` with the assignment order SWAPPED
-   (`rk = pair[0].k`, `sk = pair[1].k`). Accepts `act3_bytes` (its
-   `rk`/`sk` == the initiator's `sk`/`rk`, both == the published
-   vectors; recovered `rs` == `init_ls_pub`; final `h` matches the
-   initiator's), rejects `act3_bad_ciphertext`/`act3_bad_tag`
-   (`DecryptionFailed`) and `act3_bad_rs_message` (`InvalidPublicKey`
-   after a SUCCESSFUL decrypt, `rs_pub` left unset).
-
-`kat_test.zig`'s full-handshake test additionally closes the loop through
-`transport.zig`: `Transport`s built from BOTH sides' fresh
-`HandshakeResult`s round-trip a `"hello"` (initiator's first frame ==
-the published message-0 vector, responder decrypts it back).
+  this module's concern).
+- **Residual risk: the caller-owned read loop needs a deadline, and this module cannot enforce one.**
+  `Responder.readAct1` cannot tell a genuine 50-byte Act One from 50 bytes chosen by an attacker without first
+  spending one variable-base secp256k1 scalar multiply (`es = ECDH(s.priv, re)`, about 244 µs CPU on the audit
+  hardware): the MAC that would reject a forgery is checked only AFTER that ECDH, because `temp_k1` is derived
+  from its output. `brontide` bounds this with an explicit `handshakeReadTimeout` (5 s) around its own read
+  loop; this module's caller must supply the equivalent. Without one, an attacker who never completes a handshake
+  can hold a responder in `readAct1` indefinitely per connection attempt.
+- **Residual risk: `recvLength` and `recvMessage` alternate on one nonce stream, with no state tracking which is
+  expected next.** A `recvLength` whose matching `recvMessage` never arrives (a timeout or lower-layer error
+  between header and body) permanently desyncs `rx`: every later frame fails closed with
+  `error.DecryptionFailed`. `brontide`'s `ReadHeader`/`ReadBody` carry the same warning. If the transport layer can
+  fail between the two calls, rebuild the `Transport` (a fresh handshake) rather than retry on the same one.
 
 ## Constant-time
 
-Measured, since 2026-09-08. Before that the ledger recorded this module's
-constant-time verdict as **"PASS (inherited)"** — derived from reading, never
-instrumented — while the module holds the node's long-term static private key,
-the ephemeral keys, `temp_k*` and both transport keys (audit finding F10).
-
-The instrument is committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig),
-driven by [`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh). It marks the
-secret `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot
-keep a defined register copy, and drives it through the real entry points.
+The module holds the node's long-term static private key, the ephemeral keys, `temp_k*` and both transport keys, so
+its constant-time property is measured, not inherited. The instrument is
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+[`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh): it marks the secret `MAKE_MEM_UNDEFINED`,
+forces a volatile reload so the optimizer cannot keep a defined register copy, and drives it through the real entry
+points (ReleaseFast only).
 
 ```sh
 scripts/checks/ctgrind.sh bolt8
 ```
 
-Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `ReleaseFast`, 2026-09-08.
-`in-file` = memcheck error CONTEXTS whose stack names this module's own files
-**or the files it delegates to** (see below), not error counts:
+`in-file` = memcheck error CONTEXTS whose stack names this module's own files **or the files it delegates to**,
+not error counts. The expected counts are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
-| target | what is tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
-|---|---|---:|---:|---:|---:|
-| `dh` | static private scalar | 3 | **1** | 0 | 0 |
-| `keygen` | the 32-byte seed | 5 | **3** | 0 | 0 |
-| `act3` | responder ephemeral + `temp_k2` | 8 | **6** | 0 | 0 |
-| `transport` | both transport keys + both chaining keys | 5 | **3** | 0 | 0 |
+| target | what is tainted | in-file |
+|---|---|---:|
+| `dh` | static private scalar | **1** |
+| `keygen` | the 32-byte seed | **3** |
+| `act3` | responder ephemeral + `temp_k2` | **6** |
+| `transport` | both transport keys + both chaining keys | **3** |
 
-The control and trap rows are what make the numbers mean anything: untainted,
-every target reports 0, so the counts are taint-caused and not ambient noise;
-and built without `-fvalgrind` every run reports 0 regardless, because
-`std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`
-— a clean run built without the switch is a silent no-op, not a result.
+Untainted, every target reports 0 (the control), and built without `-fvalgrind` every run reports 0 regardless,
+because `std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support` — a clean run built without
+the switch is a silent no-op, not a result.
 
-**Why the pattern names `k256`'s and std's files too.** This module DELEGATES
-its scalar multiplication to `k256` and its AEAD to std's ChaCha20-Poly1305.
-Their constant-time property IS this module's property for every byte that
-flows through them, so attributing those contexts to someone else and calling
-them not our problem would be the same evasion as widening a pattern until a
-count goes away.
+**Why the pattern names `k256`'s and the AEAD's files too.** This module DELEGATES its scalar multiplication to
+`k256` and its AEAD to `chachapoly` (through `noise`'s re-export). Their constant-time property IS this module's
+property for every byte that flows through them; attributing those contexts to someone else would be the same
+evasion as widening a pattern until a count goes away.
 
 **Every non-zero is accounted for, and none of them is a leak:**
 
 | context | verdict |
 |---|---|
-| `rejectIdentity` at the end of k256's ladder (`group.zig:278`), via `dh.zig:122` | Branch on "the product was the identity element", reachable only for `k ≡ 0 mod n`. The same class `k256`'s own table already accounts for. |
-| scalar canonicality (`common.zig:75` via `scalar.zig:87`), `if (d.isZero())` (`dh.zig:80`), `rejectIdentity` in `combMulBaseWithTable` (`group.zig:347`) | The three invalid-secret rejections of `generateDeterministic`. Each branches on the validity of a key that would be discarded anyway. `dh.zig:80` is in this module's own code. |
-| `if (!verify)` in std's `decrypt` (`chacha20.zig:713`), twice in `act3` and twice in `transport` | Branching on the ANSWER is the API; the comparison that produced it is std's constant-time one. Present because the AEAD key is tainted, so the answer is tainted too. |
-| `fromSec1` (`group.zig:116/123/124`), `fromBytes` (`field.zig:162`), `sqrt` (`field.zig:306`), one `mul` — all in `act3` | Decompressing the peer's static key. `rs` is a PUBLIC key, but it arrives by decryption under a tainted key, so memcheck cannot know that. An artefact of the taint model, stated rather than patched around. |
-| `if (c.len != out.len + 16)` (`transport.zig:149`) | The length came from `recvLength`, i.e. from a decryption under a tainted key. A BOLT#8 message length is a public property of the frame. |
+| `rejectIdentity` at the end of k256's ladder, via `dh()` | Branch on "the product was the identity element", reachable only for `k ≡ 0 mod n`. The same class `k256`'s own table accounts for. |
+| scalar canonicality in `k256`, `if (d.isZero())` in `generateDeterministicBody` (`dh.zig:104`), `rejectIdentity` in `combMulBaseWithTable` | The three invalid-secret rejections of `generateDeterministic`. Each branches on the validity of a key that would be discarded anyway. The `isZero` check is in this module's own code. |
+| the AEAD's tag-verify branch, twice in `act3` and twice in `transport` | Branching on the ANSWER is the API; the comparison that produced it is constant-time. Present because the AEAD key is tainted, so the answer is tainted too. |
+| `fromSec1`, `fromBytes`, `sqrt`, one `mul` — all in `act3` | Decompressing the peer's static key. `rs` is a PUBLIC key, but it arrives by decryption under a tainted key, so memcheck cannot know that. An artefact of the taint model, stated rather than patched around. |
+| `if (c.len != out.len + 16)` in `recvMessage` (`transport.zig:198`) | The length came from `recvLength`, i.e. from a decryption under a tainted key. A BOLT#8 message length is a public property of the frame. |
 
-**Teeth, measured 2026-09-08.** A secret-dependent early return in `dh()` (an
-OR-fold over the key bytes and a compare, the exact defect class) moves `dh`
-from **1 in-file to 2** and `act3` from **6 to 7**, and `--check` fails; the
-source digest fires on the same edit. Reverted; `cmp` against a pre-mutation
-copy confirmed byte-identical.
+**Teeth.** A secret-dependent early return in `dh()` (an OR-fold over the key bytes and a compare, the defect
+class) moves the `dh` row up and fails `--check`; the source digest fires on the same edit.
 
-**There is no `act1` row, on purpose.** The initiator's Act One never touches
-the static key — it draws its ephemeral inside — so the taint has no path into
-it and the row would read 0 for a reason that has nothing to do with constant
-time. A row that cannot fail is not evidence, and next to four that can it
-would be read as one.
+**There is no `act1` row, on purpose.** The initiator's Act One never touches the static key — it draws its
+ephemeral inside — so the taint has no path into it and the row would read 0 for a reason that has nothing to do
+with constant time. A row that cannot fail is not evidence.
 
-**Limits, so the claim is exactly as wide as the evidence.** memcheck sees
-branches and addresses, not cache timing: this says nothing about
-cache-timing side channels. The harness taints five places and runs 600
-messages across a key rotation; a secret path it does not drive is not covered.
+**Limits, so the claim is exactly as wide as the evidence.** memcheck sees branches and addresses, not cache
+timing: this says nothing about cache-timing side channels. The harness taints the places named in the table and
+runs 600 messages across a key rotation; a secret path it does not drive is not covered.
 
 ## Verification
 
-### Audit 2026-10-08 (review + mutation over the current src)
+- **Run:** `scripts/modtest bolt8` (ReleaseFast for the stack probes); fuzz verdicts come from the deterministic
+  driver (`BOLT8_FUZZ=<runs>[,<first seed>]`, testkit's driver), never `zig build --fuzz`.
+- **Oracle:** the official BOLT#8 "Appendix A: Transport Test Vectors" from `lightning/bolts` (`08-transport.md`),
+  embedded in `src/kat_vectors.zig` (fetch provenance in `NOTICE`; every constant was checked against the fetched
+  file for length and exact substring). The pre-Act-One `ck` and transcript hash `h` were additionally recomputed
+  from BOLT#8's "Handshake State Initialization" formulas with Python `hashlib`, not through this module's code.
+- **Test classes:**
+  - Primitive (`dh.zig`): `generateDeterministic` reproduces all four published identities' public keys; `dh`
+    reproduces the three published per-act ECDH outputs (`es`/`ee`/`se`) in both directions and rejects malformed
+    points; the seed bounds (0 and `n` refused, `n − 1` accepted); a rejected seed leaves a zeroed pair in `out`.
+  - Framing (`act.zig`): `Act1`/`Act2`/`Act3` round-trip the published wire messages byte-exact and reject the
+    published short-read and bad-version vectors and a buffer longer than the act.
+  - Handshake (`handshake.zig`, `kat_test.zig`): `init` against the independent oracle; the full act1→act2→act3 walk
+    on both sides, byte-exact, including the transport keys and a post-handshake `"hello"` matching the published
+    message-0 vector; all five crypto-level negative vectors (`act1`/`act2` bad MAC, `act3` bad ciphertext, bad
+    tag, bad `rs`); fail-closed state (`.failed`, `rs_pub` cleared, `WrongState` for hand-set states and re-entry);
+    `Ephemeral` arms and that pre-setting `ephemeral` cannot steer Act One; `deinit` and `wipe` zeroing; the same
+    vectors under the `chachapoly` AEAD and under `std`'s (`StdAeadSuite`), byte-identical.
+  - Transport (`transport.zig`): `Direction.rotate` reproduces both published rotation intermediates;
+    `sendMessage` reproduces the six published outputs (indices 0/1/500/501/1000/1001) across both rotation
+    boundaries; a long send/receive round trip across the rotation; the 65535-byte maximum; size and buffer
+    refusals (a too-small buffer spends no nonce); a tampered or forged body fails closed with
+    `DecryptionFailed`, releases no plaintext and leaves `rx` usable; `NonceExhausted` unreachability.
+  - The README's transport snippet is compiled and run verbatim.
+- **Interop:** `tools/peer.zig` paired against lnd's `brontide` (fetched by `tools/fetch-oracle.sh`, never
+  vendored; needs a Go toolchain, see `tools/README.md`) completes the full handshake and a 1100-message
+  bidirectional exchange in both roles, and fails closed with `DecryptionFailed` against two forged-handshake
+  wire attacks.
+- **Fuzz:** five harnesses (`act.act1Harness`/`act2Harness`/`act3Harness`, `transport.recvLengthHarness`/
+  `recvMessageHarness`) generic over their choice source, run by `src/fuzz_test.zig` under `BOLT8_FUZZ`; every
+  test run also replays 500 seeds per harness and checks that every outcome the harnesses judge was reached.
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast) scans for both static and both ephemeral keys, `es`/`ee`/
+  `se` and their shared-point x, `ck` and the cipher key after each act, and `sk`/`rk` after every handshake and
+  transport step, each step on global state so the objects' own fields are never scanned (negative control 0,
+  positive control seen); `src/stackprobe2_test.zig` covers key creation, `dh` and `Direction.init`.
+- **Constant time:** the four ctgrind rows above.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-Review of the whole production surface (`act.zig`, `dh.zig`, `handshake.zig`, `transport.zig`)
-after the 2026-10-07 changes (test-only KAT hooks now `void` outside a test build; fuzz
-harnesses) and the k256 speed work underneath: act framing exact-length and version-first; ECDH
-= SHA-256 of the compressed `k·rk` over a point `fromSec1` validated (secp256k1 has cofactor 1,
-so no small-subgroup case), `k256`'s constant-time `mul`; every act checks its own state first and
-errdefers into `.failed`; `rs` stored only after it parses and cleared again if the final MAC
-fails; Act Two → Act Three nonce continuity; `sk`/`rk` from `split()` in opposite order on the
-two sides; rotation at nonce 1000 through `mixKey` over `(chain, k)`; send/receive size bounds.
-Clean. Two notes, no code change: `handshake.zig`'s `deinit` doc pointed at a "zeroization note"
-this file did not have — now § Backlog "Dead-stack copies"; `dh.dh`'s compressed shared point is
-one more such copy.
+## Performance
 
-Mutation schemata (ReleaseSafe, one binary): 40 mutants over the four files — the three parsers
-(length, version, field offsets), `toBytes`'s version, `dh` (hashed encoding, scalar byte order),
-both `init`s' pre-message hash, every act's state check and `.failed` errdefer, each act's
-`mixHash`/`mixKey`/MAC check, the DH key each act uses, `re_pub`/`rs_pub` handling, both sides'
-`sk`/`rk` order, `remote_static`, rotation (trigger, chain advance, after each frame), the size
-bounds, the length's byte order, `Transport.init`'s keys and `deinit`. **38/40 killed, 2
-equivalent** (the rotation check after the LENGTH frame, either side — as on 2026-10-04: the
-nonce before a length frame is always even, so 1000 is always reached by a body) after one test
-the first run (36/39 + the readAct1 mutant added for it) asked for: Act One's `.failed` errdefer
-had no test — Act One fails only on a malformed `rs`, which `init` takes unvalidated. The new F5
-test drives that path and readAct1's bad MAC.
+`zig build bench-bolt8` (`tools/bench.zig`) against lnd's `brontide`; the card's `**Performance:**` line carries
+the figures.
 
-- KAT oracle: the official BOLT#8 "Appendix A: Transport Test Vectors",
-  fetched directly from `lightning/bolts`, `08-transport.md` (raw GitHub,
-  `master` branch). Embedded in `src/kat_vectors.zig` — see `NOTICE` for
-  the exact fetch provenance. Every hex constant was independently
-  verified (byte length + exact substring match against the fetched file)
-  before transcription, not merely eyeballed.
-- Independent cross-check: the pre-Act-One `ck` (`kv.ck_after_init`) and
-  the full pre-Act-One transcript hash `h` (`handshake.zig`'s own test)
-  were additionally recomputed from scratch via Python `hashlib` directly
-  from BOLT#8's "Handshake State Initialization" formulas — not merely
-  re-run through this module's own Zig code — confirming the spec's
-  published `ck` intermediate independently.
-- Real, exercised today (Debug + ReleaseFast, zero skips anywhere):
-  `Secp256k1DH.KeyPair.generateDeterministic` reproduces all 4 published
-  identities' public keys; `dh.dh` reproduces all 3 published per-act ECDH
-  outputs (`es`/`ee`/`se`), in BOTH directions, and rejects 2 malformed
-  points; `act.Act1`/`.Act2`/`.Act3` round-trip all 3 published wire
-  messages byte-exact and reject 6 published short-read/bad-version
-  negative vectors; `Initiator.init`/`Responder.init` agree with each
-  other and match an independent oracle; `transport.Direction.rotate`
-  reproduces both published rotation intermediates byte-exact;
-  `Transport.sendMessage` reproduces all 6 published message-test outputs
-  (indices 0/1/500/501/1000/1001) across both key-rotation boundaries; a
-  full 1002-message send/receive round-trip decrypts every message back
-  to `"hello"`; a tampered transport ciphertext fails closed with
-  `error.DecryptionFailed`.
-- Crypto-level (formerly reserved, now real — see the done record above):
-  the full act1->act2->act3 walk end-to-end (both sides, byte-exact,
-  including the transport keys and a post-handshake `"hello"` round-trip
-  matching the published message-0 vector), and all five crypto-dependent
-  negative vectors (`act2_bad_mac`, `act1_bad_mac`, `act3_bad_ciphertext`,
-  `act3_bad_tag`, `act3_bad_rs_message`) — all in `kat_test.zig`, zero
-  `SkipZigTest` remaining.
+## What is deliberately not done
 
-### Mutation run 2026-10-04
-
-Mutant schemata over a copy (one ReleaseSafe build of every test, 62 in the
-binary, `setsid -w timeout -s KILL 20` per mutant): **32 mutants, 29 killed, 3
-equivalent**. Points: key rotation (trigger at 1000, ikm, chain advance),
-`sendMessage`'s size bound and buffer check, the length's byte order, rotation
-after each frame, `recvMessage`'s buffer check, `Transport.init`'s key
-assignment, `deinit`; the three act parsers (length, version, field offsets);
-`Initiator.init`'s prologue; every act's state check, `.failed` on error and
-`rs_pub` clearing (F5); Act One's MAC; the responder's `sk`/`rk` order; Act
-Three's `se` key and nonce continuity; `dh`'s key validation, error mapping
-and hashed encoding.
-
-- **Tests added:** a 65535-byte message (BOLT#8's maximum) goes through
-  send/receive — the old test only covered 65536, so `>=` for `>` survived;
-  `sendMessage` refuses a buffer one byte too large (the old test only tried
-  one too small, which the AEAD rejects on its own); `generateDeterministic`
-  refuses 0 and `n` and accepts `n − 1`.
-- **Equivalent:** dropping the rotation check after the length frame, on
-  either side — length and body alternate, so the nonce before a length frame
-  is always even and 1000 is always reached by a body; dropping
-  `generateDeterministic`'s explicit zero check — `combMulBase` refuses 0
-  itself and the error maps to the same `InvalidSecretKey`.
-
-## RNG seam (B6 audit, 2026-08-12)
-
-BOLT#8's Act One `e` is the initiator's only per-session secret input: the
-Act-One wire bytes and `es = ECDH(e.priv, rs)` are pure functions of it. Two
-shapes in the original driver let a consumer fix that value without ever
-deciding to.
-
-- `Initiator.e`/`Responder.e` were **public input fields** and the act steps
-  did `self.e orelse dh.KeyPair.generate(random)`. Assigning the field made the
-  `random` argument dead code, so every Act One carried the same `e_pub` —
-  cross-session linkability, a constant `es`, no initiator forward secrecy.
-  The fields are now named `ephemeral` and are pure **outputs**: `genAct1`/
-  `genAct2` always draw. The KAT injection Appendix A needs moved to
-  `genAct1WithEphemeral`/`genAct2WithEphemeral`, which `@compileError` outside
-  a test build (`assertTestOnly`) — production cannot express a pinned
-  ephemeral at all.
-- The generator argument is now `Ephemeral`, a tagged union with a `csprng`
-  arm and a `seeded_for_test` arm and a private `source()` accessor (the same
-  shape as `dtls`'s `Connection.Entropy`). `std.Random` is a vtable, so
-  `DefaultPrng.init(0).random()` and a real CSPRNG are indistinguishable at a
-  bare parameter; naming the arm is what makes the choice a decision. This is
-  *fail-visible*, not fail-closed: nothing checks what is inside `.csprng`.
-
-Both acts are additionally guarded by a linear state machine
-(`start → awaiting_act2 → ready_act3 → done` and the responder's mirror), so a
-second `genAct1` on one object is `error.WrongState` rather than a silent reuse
-of the cached share.
+- **No socket or connection wrapper and no built-in handshake deadline.** The module is sans-io; the caller owns
+  the read loop and its timeout (`brontide` wraps a `net.Conn` with a 5 s handshake read timeout). See *Threat
+  model*.
+- **Nothing above the Lightning-message byte boundary:** message-type dispatch, `init`/`ping`/gossip semantics are
+  BOLT#1/BOLT#7.
+- **No production path that pins an ephemeral.** Noise_XK has no session resumption or pre-agreed share; the
+  Appendix A vectors reach the test-only `…WithEphemeral` hooks (see *Design & framing*).
+- **No `act1` ctgrind row** (see *Constant-time*).
+- **`NonceExhausted` is kept in the error sets** although unreachable (see *Design & framing*).
 
 ## Anchoring
 
@@ -490,27 +372,8 @@ plus an independent interop anchor: `tools/peer.zig` paired against lnd's own `b
 `error.DecryptionFailed` against two forged-handshake wire attacks — see `tools/README.md` for the
 measured run.
 
-## Performance
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-bolt8`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.53–1.28×, against 0.79–1.13× before. The card carries these figures.
-
 ## Backlog / deferred
 
-- **`HandshakeResult.wipe()` — DONE 2026-11-19 (additive).** Zeroes `sk`/`rk`/`ck` (`secureZero`, the module's own pattern); `handshake_hash` and `remote_static` are public and stay. Documented on the type: call it after `Transport.init`. Named `wipe`, not `deinit`: the struct owns no resources. Delta mutation 2026-11-19: 3 mutants (each of the three `secureZero` calls skipped), 3 killed by the new test; the card counts are cumulative (old + 3).
-- **Dead-stack copies — MEASURED AND FIXED 2026-10-08 (handshake HIGH, transport MEDIUM).**
-  `src/stackprobe_test.zig` (ReleaseFast; needles: both static and both ephemeral keys, `es`/`ee`/
-  `se` and their shared-point x, `ck` and the cipher key after each act, `sk`/`rk`; every step on
-  global state so the objects' own fields are never scanned). Before: every step left secrets —
-  `init` the static key ×2, each act its private key and DH output (`readAct2` also `temp_k2`),
-  `genAct3`/`readAct3` the static/ephemeral key, `se`, `ck`, and the transport keys `sk` ×4 and
-  `rk` ×3 per handshake. Fix (BREAKING): `init`s and every act run one frame down and then zero
-  24 KiB at that depth (volatile vector stores; `k256`'s 16 KiB `mul` burn sits under it);
-  `Initiator.init`/`Responder.init` take the `KeyPair` by pointer; `genAct3(&out)` returns the
-  `Act3` and writes the `HandshakeResult` to `out`, `readAct3(msg, &out)` likewise (a returned
-  result lands in a temporary of the caller's frame no wipe here reaches). After: 0 over 9 steps
-  × 3 handshakes, negative 0, positive 1. Transport (same day): `sendMessage` left the transport key ×2 and `recvLength`+`recvMessage`
-  ×1 per message — inside `chachapoly`'s AEAD and in `noise`'s `CipherState` frame (the key passed
-  by value); both now burn (see their SPECs) and the probe covers both steps: 0.
-  `Direction.rotate`'s `SymmetricState` shell runs once per 1000 messages and was not probed.
-
-- 2026-10-07 (bench-bolt8): 1.06–1.13× slower than lnd brontide on the transport (ChaCha20-Poly1305 over 1 KiB and 64 KiB messages; brontide's Go `x/crypto` has amd64 assembly for it (checked: `chacha20poly1305_amd64.s` in x/crypto v0.57.0), ours uses the Zig std AEAD), while the handshake is 0.79× (1.27× faster). The gap sits in the AEAD, not in this module's framing; closing it belongs to the `chachapoly` module, not here.
+- **Transport throughput is above 1.1× lnd `brontide`'s on 1 KiB and 64 KiB messages** (the card's performance
+  limit); the handshake is faster than `brontide`'s. The gap sits in the AEAD, not in this module's framing: Go's
+  `x/crypto` has amd64 assembly for ChaCha20-Poly1305. Closing it belongs to the `chachapoly` module.

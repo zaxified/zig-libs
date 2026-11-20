@@ -6,21 +6,19 @@ Lightning-message transport, incl. its every-500-messages key rotation.
 Builds on this repo's own `noise` module (the generic Noise Protocol
 Framework core).
 
-**Status: complete.** The full three-act handshake (both sides), the wire
-framing, the secp256k1 DH primitive, and the ENTIRE post-handshake
-transport — including key rotation — are implemented and KAT-verified
-byte-exact against the official BOLT#8 Appendix A vectors (positive AND
-negative, zero skipped tests). See `SPEC.md` for the design (why the
-handshake is driven over this repo's already-KAT-verified
-`noise.SymmetricState` rather than `noise.HandshakeState`) and its
-"TODO(fable) — done record" for the per-function verification detail.
+The full three-act handshake (both sides), the wire framing, the secp256k1 DH primitive and the whole
+post-handshake transport, including key rotation, are checked byte-exact against the official BOLT#8 Appendix A
+vectors (positive and negative) and interop-tested against lnd's `brontide`. See `SPEC.md` for the design (why
+the handshake is driven over `noise.SymmetricState` rather than `noise.HandshakeState`) and the verification
+detail. Dependencies: `noise` (the generic Noise core; its re-exported ChaCha20-Poly1305 is the AEAD) and `k256`
+(secp256k1).
 
 | File | Contents |
 |---|---|
-| `dh.zig` | `Secp256k1DH` — BOLT#8's `ECDH(k, rk)` adapter, `KeyPair` (REAL) |
-| `act.zig` | `Act1`/`Act2`/`Act3` — the fixed 50/50/66-byte handshake framing (REAL) |
-| `handshake.zig` | `Initiator`/`Responder` — the `Noise_XK` act driver (REAL) |
-| `transport.zig` | `Transport` — post-handshake message framing + key rotation (REAL) |
+| `dh.zig` | `Secp256k1DH` — BOLT#8's `ECDH(k, rk)` adapter, `KeyPair` |
+| `act.zig` | `Act1`/`Act2`/`Act3` — the fixed 50/50/66-byte handshake framing |
+| `handshake.zig` | `Initiator`/`Responder` — the `Noise_XK` act driver |
+| `transport.zig` | `Transport` — post-handshake message framing + key rotation |
 | `kat_vectors.zig` | The official BOLT#8 Appendix A test vectors, embedded |
 | `kat_test.zig` | Full-handshake KAT assertions (end-to-end + all negative vectors) |
 
@@ -78,8 +76,13 @@ Each `Initiator`/`Responder` drives **one** handshake, in order. A second
 reuse of the previous ephemeral share — build a fresh one to retry. The
 ephemeral itself is always drawn inside `genAct1`/`genAct2`; there is no way to
 pin it from production code (the Appendix A vectors reach the
-`genAct1WithEphemeral`/`genAct2WithEphemeral` hooks, which `@compileError`
-outside a test build).
+`genAct1WithEphemeral`/`genAct2WithEphemeral` hooks, which are declared `void`
+outside a test build, so a call does not compile).
+
+A failed act marks the object `.failed`; every later act on it is `error.WrongState`.
+`HandshakeResult.wipe()` zeroes `sk`/`rk`/`ck`: call it once `Transport.init`
+has copied them. `deinit()` on `Initiator`/`Responder`/`Transport`/`KeyPair` zeroes the
+key material each owns.
 
 **The post-handshake transport** (once a `HandshakeResult` is in hand):
 
@@ -96,12 +99,26 @@ const plain = buf[0..l]; // `l` is runtime, so this must be a SLICE, not an arra
 try t.recvMessage(wire_bytes[bolt8.transport.length_frame_len..][0 .. l + 16], plain);
 ```
 
+## Limits
+
+- **No I/O and no deadline.** The module is sans-io: the caller reads exactly the act or frame length off the
+  wire. `Responder.readAct1` spends a secp256k1 multiply before it can check the MAC, so the caller's read loop
+  needs a handshake deadline (lnd's `brontide` uses 5 s).
+- **`recvLength` and `recvMessage` must alternate.** If the transport can fail between the header and the body,
+  `rx` is desynced for good (every later frame is `error.DecryptionFailed`): rebuild with a fresh handshake.
+- **A message is at most `transport.max_message_len` (65535) bytes**; `sendMessage` refuses more
+  (`error.MessageTooLong`) and wants an `out` of exactly `length_frame_len + m.len + 16` bytes.
+
+## Not provided
+
+A socket or connection wrapper, a built-in handshake deadline, and anything above the Lightning-message byte
+boundary (message dispatch, `init`/`ping`/gossip) are left to the caller; see `SPEC.md` *What is deliberately not
+done*. The one open performance item is in *Backlog / deferred*.
+
 ## Verify
 
 ```
-zig build test-bolt8                       # Debug
-zig build test-bolt8 -Doptimize=ReleaseFast # ReleaseFast
-zig fmt --check modules/bolt8/
+scripts/modtest bolt8
 ```
 
 The official BOLT#8 Appendix A test vectors (`src/kat_vectors.zig`) are

@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-19** — Additive: `HandshakeResult.wipe()` zeroes `sk`/`rk`/`ck` once `Transport.init` has copied them (SPEC Backlog item closed).
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** card records the no-panic sweep and the whole-module mutation run (131/137 killed, 6 decided); ctgrind source pins refreshed after the sweep fix (counts unchanged).
 - **2026-11-14** — Test: `Responder.deinit` is pinned to zero its ephemeral key and embedded cipher key, not just `ls` and `ck`.
 - **2026-11-14** — Mutation run: new tests pin that a too-small `sendMessage` buffer spends no nonce, that a rejected seed zeroes `generateDeterministicInto`'s `out`, and that the hand-set-state errors mark `genAct3`/`genAct2` `.failed`.
 - **2026-11-14** — SPEC Backlog: `HandshakeResult` has no wipe helper (additive, deferred).
@@ -20,11 +19,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   forms.
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). Secrets go in by pointer, key-holding results come out through `out`: `KeyPair.generateDeterministic(out: *KeyPair, seed: *const [32]u8) SecretKeyError!void`, `KeyPair.generate(out: *KeyPair, random) void`, `dh.dh(secret_key: *const [32]u8, remote_pub)` (and `scalarmult`), `Initiator.init(out: *Initiator, ls, rs_pub) void`, `Responder.init(out: *Responder, ls) void`, `Transport.init(out: *Transport, result: *const HandshakeResult) void`, `Direction.init(out, key: *const [32]u8, chain: *const [32]u8) void`. `generateDeterministic`, `generate`, `dh` and `Transport`/`Direction.init` run under a stack burn (new `src/burn.zig`: 32 KiB ECC, 4 KiB init); the handshake acts keep their own `burnStack`. New `src/stackprobe2_test.zig` (testkit engine) probes the key/ECDH/direction entry points; the old probe was migrated to the new signatures. Tests use the value-shaped helpers in `src/testutil.zig`. `tools/peer.zig` (already out of date with `genAct3`) was not migrated.
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the
@@ -41,11 +35,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   returning it (a returned result lands in a caller temporary nothing can wipe). The per-message
   transport-key copies were in `chachapoly` and `noise`, fixed there the same day; the probe now
   covers `sendMessage`/`recvMessage` too.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the five `testing.fuzz`
-  harnesses (acts 1–3, transport length and message) are generic over their
-  source and run by testkit's deterministic driver `BOLT8_FUZZ` (new
-  `src/fuzz_test.zig`); the local copy of `testkit.fuzz.seed` is gone now that
-  testkit is a test dependency. Test code only.
 - **2026-10-07** — The test-only `Initiator.genAct1WithEphemeral` /
   `Responder.genAct2WithEphemeral` are declared `void` outside a test build
   instead of hitting a `@compileError` inside them, and the secp256k1 `dh`
@@ -131,19 +120,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   and `act3` to 7 and fails the gate. `act1` deliberately has no row, because Act One never
   touches the static key and its zero would say nothing.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of
-  `zig build check-testonly` again, and its fuzz corpus uses a nine-line local
-  copy of `testkit.fuzz`'s seed helper rather than the shared one. Enrolling it
-  via `test_deps` puts it in that gate, whose probe imports the *published*
-  module and references every declaration three levels deep — and this module
-  deliberately guards a test-only function with a `@compileError` that fires
-  outside a test build, so the probe touches a decl that exists to refuse being
-  touched. The two gates contradict each other for any module shaped this way.
-  ⛔ A local copy is the thing `testkit.fuzz` was created to abolish (33 of them
-  across 12 modules). What stops this one drifting is its anchor test, which
-  drives the real `std.testing.Smith` over what the helper produces — the same
-  shape as testkit's own tests, so a future Zig that changes `slice`'s framing
-  fails here loudly instead of leaving the corpus quietly seeding nothing.
 
 - **2026-09-07** — The three `act.zig` fuzz targets had never parsed an act. Each drew
   `smith.bytes(&buf)` and then a ranged length, which returns the range minimum when
