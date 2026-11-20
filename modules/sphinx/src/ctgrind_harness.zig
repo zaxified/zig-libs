@@ -6,16 +6,9 @@
 //! test-sphinx` — memcheck's context count is valgrind's own verdict, not
 //! something a Zig test can assert on.
 //!
-//! Suggested `scripts/checks/ctgrind.sh` config (NOT added here — the shared script
-//! is coordinator-owned while other harnesses are in flight; see the
-//! per-module block below for the exact lines):
-//!
-//!   TARGETS[sphinx]="construct process"
-//!   MODES[sphinx]="ReleaseFast"
-//!   PATTERN[sphinx/construct]='core[.]zig|keyderive[.]zig|hopframe[.]zig|bigsize[.]zig|group[.]zig|field[.]zig|scalar[.]zig|common[.]zig'
-//!   PATTERN[sphinx/process]='core[.]zig|keyderive[.]zig|hopframe[.]zig|bigsize[.]zig|group[.]zig|field[.]zig|common[.]zig'
-//!   LABEL[sphinx/construct]='sphinx construct (session_key fwd chain)+k256'
-//!   LABEL[sphinx/process]='sphinx process (relay privkey unwrap)+k256'
+//! Run through `../../../scripts/checks/ctgrind.sh sphinx` (targets
+//! `construct` and `process`, ReleaseFast); the pinned counts are in
+//! `scripts/checks/ctgrind-expected.tsv`.
 //!
 //! ## The two targets, and which claim each pins
 //!
@@ -41,9 +34,9 @@
 //!   (`std.crypto.timing_safe.eql`, `core.zig:437`), the ChaCha20
 //!   deobfuscation, `hopframe.readHopFrame`'s bigsize/length parse, the
 //!   all-zero check that decides "this is the final destination" vs.
-//!   "forward onward" (`timing_safe.eql` against zero since 2026-10-06, was
-//!   `std.mem.allEqual`; `core.zig:480`), and the re-blinding
-//!   point-multiply for the outgoing packet.
+//!   "forward onward" (`timing_safe.eql` against zero, was
+//!   `std.mem.allEqual`; `core.zig:480`), and the re-blinding point-multiply
+//!   for the outgoing packet.
 //!
 //! Both targets use the REAL, published KAT fixture (`kat_vectors.zig`) for
 //! every value that is not the one being tainted — the route pubkeys,
@@ -199,7 +192,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const result = try sphinx.process(&node_privkey, pkt, &associated_data);
 
             // ⚠ TWO ways of reaching the payload are wrong here, both measured
-            // on 2026-09-09 rather than reasoned about:
+            // rather than reasoned about:
             //
             //   `if (result.next_packet) |np|` — whether that optional is
             //   present is decided by `core.zig`'s all-zero test of `frame.hmac`

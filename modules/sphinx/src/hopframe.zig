@@ -137,7 +137,7 @@ pub fn leftShift(buf: []u8, shift: usize) void {
 const testing = std.testing;
 
 test "readHopFrame: a declared length near 2^64 is BufferTooSmall, not an overflow" {
-    // fuzz 2026-10-10 (sphinx-forged): `payload_len + hmac_len` wrapped for
+    // fuzz (sphinx-forged): `payload_len + hmac_len` wrapped for
     // lengths within 32 of maxInt(u64).
     var buf: [64]u8 = @splat(0);
     buf[0] = 0xff;
@@ -203,7 +203,7 @@ test "readHopFrame rejects a truncated buffer" {
 }
 
 test "hop frame edges: one-short dest, length 1 reserved, exact-fit buffer" {
-    // Mutation run 2026-10-05: none of these three edges had a test.
+    // Mutation run: none of these three edges had a test.
     const payload = @as([2]u8, @splat(0xaa));
     const hmac = @as([hmac_len]u8, @splat(0xbb));
     var dest: [1 + 2 + hmac_len]u8 = undefined;

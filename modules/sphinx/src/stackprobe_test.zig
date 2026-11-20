@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack residue probe for `deriveHopSecrets`, `construct` and `process`
-//! (review 2026-10-08), kept in the module per `CONVENTIONS.md` §9. Method as
-//! `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the earlier
+//!, kept in the module per `CONVENTIONS.md` §9. Method as
+//! `p256`'s `stackprobe_test.zig`(the earlier
 //! "scan a local buffer at the call's depth" form was blind to the
 //! top few hundred bytes of the measured call): paint a stack region below the
 //! probe, run one call under a `PAD`-deep shim, snapshot the region and count

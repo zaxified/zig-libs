@@ -228,7 +228,7 @@ fn fuzzOnionPacketDecode(_: void, smith: *std.testing.Smith) !void {
     // range MINIMUM: `len` was 0 for every input this lane can carry, and
     // `fromSlice` refused it with `error.WrongLength` before touching a byte.
     // `fromBytes` — the version check, the SEC1 decode, and `toBytes` behind
-    // it — had never run from this target at all. Measured 2026-09-07 over the
+    // it — had never run from this target at all. Measured over the
     // corpus: 0 of 14 seeds arrived non-empty and 0 packets parsed before;
     // 13 of 14 and 3 after.
     const len: usize = smith.slice(&buf);
@@ -264,7 +264,7 @@ test "corpus: every seed reaches fromSlice, and which of them get past the lengt
     }
     // One seed is deliberately the empty slice.
     try testing.expectEqual(decode_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. Before the draw was restructured all three were 0:
+    // Measured. Before the draw was restructured all three were 0:
     // the only input this target ever handed `fromSlice` was the empty slice,
     // which `error.WrongLength` refuses on the first line.
     try testing.expectEqual(@as(usize, 9), past_length);
@@ -276,7 +276,7 @@ test "corpus: every seed reaches fromSlice, and which of them get past the lengt
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

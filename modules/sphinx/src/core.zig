@@ -571,7 +571,7 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
     // secret-derived: compared in constant time BY CONSTRUCTION
     // (`timing_safe.eql`, pinned by check-ct-compare). It used to be
     // `std.mem.allEqual`, an early-exit loop that LLVM happened to vectorise
-    // into one `vptest` (ctgrind 2026-09-09) — safe by accident only. The
+    // into one `vptest` (ctgrind) — safe by accident only. The
     // branch on the verdict is the hop's own public decision (forward or
     // deliver), not a leak.
     const zero_hmac = @as([hmac_len]u8, @splat(0));
@@ -603,7 +603,7 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
     return result;
 }
 
-/// Review 2026-10-08 (HIGH). Measured with `stackprobe_test.zig`
+/// Review (HIGH). Measured with `stackprobe_test.zig`
 /// (ReleaseFast): the named wipes above did not keep the route's secrets off
 /// the stack — `deriveHopSecrets` and `construct` left blinded ephemeral
 /// scalars, blinding factors and `rho`/`mu`/`pad` keys in dead frames,
@@ -613,11 +613,11 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
 /// depth. `noinline` is load-bearing.
 noinline fn burnStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -627,7 +627,7 @@ noinline fn burnStack() void {
 }
 
 /// `process` (2 600-byte stream buffers, `k256`'s 16 KiB `mul` burn under it)
-/// dirtied 32 KiB in ReleaseFast (2026-10-08); `stackprobe_test.zig` goes red
+/// dirtied 32 KiB in ReleaseFast; `stackprobe_test.zig` goes red
 /// when a call tree outgrows this.
 const stack_burn = 40 * 1024;
 
@@ -703,7 +703,7 @@ test "HopSecret / ProcessResult field shapes" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, pr.payload());
 }
 
-// ── mutation run 2026-10-05: edges and refusals no test above reached ────
+// ── mutation run: edges and refusals no test above reached ────
 
 /// An onion for `node_privkey` whose decrypted hop_payloads begin with
 /// `plaintext` (zero-padded to 1300) and whose HMAC is genuine -- so

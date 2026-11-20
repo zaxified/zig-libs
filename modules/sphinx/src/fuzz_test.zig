@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for sphinx (added 2026-10-10): `SPHINX_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for sphinx: `SPHINX_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `sphinx-packet` (OnionPacket.fromSlice on damaged genuine packets: accepted
 //! means it re-encodes to the input), `sphinx-route` (a whole route built by

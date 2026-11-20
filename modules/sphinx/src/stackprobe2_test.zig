@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for the BOLT#4
-//! key-derivation primitives burned in the 2026-10-09 sweep: `generateKey`
+//! key-derivation primitives burned in the sweep: `generateKey`
 //! and `generateCipherStream`. (`construct`/`process`/`deriveHopSecrets` stay
 //! covered by the older `stackprobe_test.zig`.) Tight per-hop burn (2 KiB).
 //! ReleaseFast only (`skipUnlessOptimized`).
