@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1207 data rows) and `script_assets_test.json` are the yardsticks; here all 107 witness rows plus 297 filtered non-witness rows are pinned, not the full file. Core also has sigop counting, `Solver`/standardness, `ExtractDestination`, script compression — none here. |
+| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1207 data rows) and `script_assets_test.json` are the yardsticks; here every witness-bearing row plus a machine-filtered subset of the non-witness rows are pinned, not the full file. Core also has sigop counting, `Solver`/standardness, `ExtractDestination`, script compression — none here. |
 | [btcsuite/btcd (`txscript`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Full engine plus `scriptbuilder.go`, `standard.go` (classification, sigop counts), `pkscript.go`, `taproot.go`, `sign.go`: a Go user gets a builder, a disassembler, standardness and signing beside the VM (file list read via the GitHub API). |
 | [rust-bitcoin/rust-bitcoin (`script`, `bitcoinconsensus` feature)](https://github.com/rust-bitcoin/rust-bitcoin) | Rust | CC0-1.0 | 2.7k | units-0.2.0 (tag; push 2026-09-30) | Script types, builder and asm/hex display; verification only by binding libbitcoinconsensus *(inferred)*. A pure-Rust interpreter exists in rust-miniscript for miniscript fragments only *(inferred)*. |
 | [rust-bitcoin/rust-miniscript](https://github.com/rust-bitcoin/rust-miniscript) | Rust | CC0-1.0 | 426 | push 2026-09-26 | Miniscript/descriptors and their satisfaction; no consensus VM, no descriptor layer here either. |
 | [bitcoin-core/btcdeb](https://github.com/bitcoin-core/btcdeb) | C++ | MIT | 595 | push 2026-07-26 | Script debugger built on Core's interpreter — a step-through tool this module has no counterpart of. |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | Script compile/decompile/toASM and payments; no consensus interpreter *(inferred)*. |
 
-**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` (no `script_assets_test.json`).
+**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` and of `script_assets_test.json` (five real transactions of the latter, see *Verification*).
 
 ## Design & invariants
 
@@ -59,8 +59,7 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   validator verifying more than one input of the same transaction should build the cache once
   with `TxContext.withPrecomputed(allocator)` and vary only `input_index`; all three sighash call
   sites (`sigcheck.zig` BIP143, `verify.zig` BIP341 key-path, `tapscript.zig` BIP341/342
-  script-path) route through it when present. Measured over 800 inputs: segwit-v0 277 ms → 28 ms,
-  taproot key-path 410 ms → 46 ms, with the growth ratio per doubling falling from ~3.9 to ~2.0.
+  script-path) route through it when present; without it, per-input cost grows with the transaction.
   The legacy (`.base`) algorithm has no cache and never will — its digest depends on the input
   index and scriptCode, which is precisely the defect BIP143 retired.
 - `sigcheck.zig` — BIP62/66/146 signature/pubkey encoding checks, and the actual ECDSA
@@ -71,9 +70,8 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   no further hashing. Calling `ecdsaVerify(pk, &sighash, sig)` would hash that digest a *third*
   time and silently verify against the wrong value. `sigcheck.zig`'s `ecdsaVerifyDigest` is
   `k256.sign.ecdsaVerify`'s exact arithmetic (built from `k256.Secp256k1`/`k256.Scalar` directly)
-  with that extra hash removed — this was caught by the module's own signed-vs-verified
-  round-trip test (`e2e_test.zig`), which is exactly the failure mode a "sign it myself, verify it
-  myself" test is supposed to catch.
+  with that extra hash removed; `e2e_test.zig`'s signed-vs-verified round trips pin that the digest is
+  not hashed again.
 - `interpreter.zig` — `eval` (legacy/segwit-v0) + `evalTapscript` (BIP342): the opcode-dispatch
   loop, `IF`/`NOTIF`/`ELSE`/`ENDIF` structuring, `OP_CODESEPARATOR`-aware scriptCode, and the
   tapscript deltas (Schnorr `OP_CHECKSIG`/`OP_CHECKSIGADD`, the `OP_SUCCESSx` pre-scan, the
@@ -121,7 +119,7 @@ BIP340 Schnorr signature verified directly against the witness-program bytes ove
 key-path sighash — no script execution at all, per spec.
 
 Taproot **script-path** spending (BIP341/342, a witness stack of ≥2 elements after annex-stripping)
-is now implemented end to end:
+is implemented end to end:
 
 - **Commitment (BIP341 "Script validation rules", `tapscript.verifyCommitment`)** — the last
   witness item is the control block (`33 + 32m` bytes, `m ≤ 128`), the second-to-last is the leaf
@@ -160,32 +158,31 @@ is now implemented end to end:
   the opcode position of the last executed `OP_CODESEPARATOR` (or `0xffffffff`), counting every
   parsed opcode (executed or not). Because `bitcointx.bip341.sigMsg` is key-path-only (hard-coded
   `spend_type = 0x00`, no extension), this module rebuilds the common message; its `ext_flag = 0`
-  prefix is cross-checked byte-for-byte against that KAT-backed function (`tapscript.zig`). A future
-  DRY refactor lifting a shared `commonSigMsg` into `bitcointx` is left for the interop backlog.
+  prefix is cross-checked byte-for-byte against that KAT-backed function (`tapscript.zig`).
 
 **Verification honesty**: the taproot *commitment* math and the SigMsg *common prefix* are backed by
 external BIP341 vectors / `bitcointx`'s KAT-backed key-path sigMsg respectively. The end-to-end
 tapscript *spends* (`tapscript_test.zig`) are **constructed round-trips** (build output → sign the
 tapscript sighash → verify, each with a positive control), not byte-exact against an external
-consensus transaction vector — **but this gap is now separately closed** by
-`consensus_kat_test.zig`/`consensus_kat_vectors.zig` (2026-07-28): 5 real transactions
-machine-extracted, byte-for-byte, from Bitcoin Core's own
-`bitcoin-core/qa-assets:unit_test_data/script_assets_test.json` fuzz/unit corpus (the same corpus
+consensus transaction vector. That gap is closed in part by
+`consensus_kat_test.zig`/`consensus_kat_vectors.zig`: five real transactions
+machine-extracted, byte for byte, from Bitcoin Core's own
+`bitcoin-core/qa-assets:unit_test_data/script_assets_test.json` corpus (the one
 `src/test/script_tests.cpp`'s `script_assets_test` runs), each with a `success` witness that MUST
 verify and a `failure` witness (same tx/prevouts/flags) that MUST fail, run through the real
 `verifyScript` entry point (full tx deserialization + all inputs' spent outputs, not a stand-in).
 Covers: plain key-path spend, a script-path spend with an annex, an `OP_SUCCESSx` short-circuit, a
 control-block length-validation failure, and the unknown-leaf-version anyone-can-spend path. This
-is a representative slice, not exhaustive coverage of the corpus (2244 entries total) — widening it
-is left for the interop backlog.
+is a representative slice, not exhaustive coverage of the corpus (2244 entries upstream); widening it
+is in *Backlog / deferred*.
 
-### `FindAndDelete(vchSig)` — implemented (was out of scope until 2026-08-06)
+### `FindAndDelete(vchSig)`
 
 `FindAndDelete(scriptCode, CScript() << vchSig)` — the historical per-signature literal-byte-removal
 quirk Bitcoin Core applies to the scriptCode before hashing it, distinct from
 `FindAndDelete(OP_CODESEPARATOR)` — **is implemented** (`interpreter.findAndDelete`,
 `interpreter.scriptCodeFor`), for `SigVersion.base` only, in both `OP_CHECKSIG`(`VERIFY`) and
-`OP_CHECKMULTISIG`(`VERIFY`). It was previously declared out of scope; that was wrong. A legacy
+`OP_CHECKMULTISIG`(`VERIFY`). It cannot be left out: a legacy
 script whose scriptCode contains a supplied signature's canonical push gets a *different sighash*
 without it, hence the opposite validity verdict from every other node — a chain-split primitive, not
 a cosmetic gap. Core's own `tx_valid.json`/`tx_invalid.json` pin it with real transactions and say so
@@ -225,178 +222,39 @@ scriptCode is itself undecodable and fails on reaching those bytes regardless.
 `error.SigFindanddelete`, and `OP_CODESEPARATOR` in a `SigVersion.base` script is
 `error.OpCodeseparator` **even in an unexecuted branch** (Core checks it above the opcode `switch`).
 
-Note that `bitcointx`'s `sighash_legacy.zig` still documents the same cut on the transaction side;
-that module's own `FindAndDelete` gap is tracked separately — this module supplies the scriptCode
-already transformed, so no legacy verdict here depends on it.
+This module supplies the scriptCode to the legacy sighash already transformed, so no legacy verdict here
+depends on the serializer in `bitcointx` doing a `FindAndDelete(vchSig)` itself.
 
-## Verification
+## Flags
 
-### script_tests.json coverage
+`ScriptFlags` mirrors Bitcoin Core's `SCRIPT_VERIFY_*` set field-for-field; every field's doc
+comment in `flags.zig` states exactly what it gates. That includes the three tapscript
+standardness/policy flags — `discourage_op_success`, `discourage_upgradable_pubkeytype`,
+`discourage_upgradable_taproot_version` — which reject (as non-standard) the consensus-valid BIP342
+upgrade hooks (`OP_SUCCESSx`, unknown CHECKSIG pubkey types, unknown leaf versions). All three are
+`false` in `.none` and `true` in `.standard`.
 
-`script_tests_vectors.zig` pins 297 rows (plus, appended 2026-11-18, 29 rows of the current corpus admitted for signature/pubkey parsing without strict flags and five hand-built hybrid-key cases: 331 in all) machine-filtered (not hand-picked) from Bitcoin Core's
-official `src/test/data/script_tests.json` (fetched 2026-07 from the `bitcoin/bitcoin` `master`
-branch), then machine-transcribed verbatim via a one-off Python script — never hand-typed. The
-filter: keep only rows (a) with no witness field — **those now live in
-`script_tests_witness_vectors.zig`, see below; this file still excludes them, but the corpus as a
-whole no longer does**; (b) whose `scriptSig`/
-`scriptPubKey` asm text uses only mnemonics this module's opcode table implements (a plain
-substring/token check — this mechanically excludes every BIP342 tapscript-only vector). From the
-~1108 rows surviving that filter, every row is kept for buckets with ≤20 members (every distinct
-error class Bitcoin Core's test suite exercises that this module can reach), and a fixed-seed
-random sample of 70 `OK` rows / 20 rows for buckets larger than 20 (`EVAL_FALSE`/`BAD_OPCODE`/
-`INVALID_STACK_OPERATION`/`DISABLED_OPCODE`/`SCRIPTNUM`/`MINIMALDATA`/`SIG_DER`).
+It also includes `const_scriptcode` (`SCRIPT_VERIFY_CONST_SCRIPTCODE`), which
+rejects the two legacy scriptCode mutations — `FindAndDelete(vchSig)` removing something, and
+`OP_CODESEPARATOR` appearing in a `SigVersion.base` script at all, executed branch or not. Both
+remain fully implemented at consensus level (flag off); the flag only makes them observable. It is
+`false` in `.none` and `true` in `.standard`, matching Core's `STANDARD_SCRIPT_VERIFY_FLAGS`.
 
-Two further exclusions — (c) `OP_CODESEPARATOR` rows and (d) `CONST_SCRIPTCODE` rows — were
-**removed on 2026-08-06** along with the `FindAndDelete(vchSig)` scope cut they existed to justify.
-Re-running the filter without them admits exactly **one** additional row (the 297th, appended at
-the end of the vectors file): `script_tests.json` contains a single `CODESEPARATOR` row in total
-and **zero** rows carrying the `CONST_SCRIPTCODE` flag *at that time*. (Correction 2026-11-18:
-Core's current `script_tests.json` carries 3 non-witness `CONST_SCRIPTCODE` rows; they are pinned
-with the hybrid-key rows added that day.) So the 2026-08 corpus was never able to exercise
-`FindAndDelete(vchSig)`, with or without the filter — Core tests that behaviour elsewhere, and both
-places are now pinned here:
-
-- **`tx_findanddelete_vectors.zig` / `tx_findanddelete_test.zig`** — 38 rows machine-transcribed
-  from Core's `src/test/data/tx_valid.json` (18) and `tx_invalid.json` (20): every row that names
-  `CONST_SCRIPTCODE` in its flags field, or contains `CODESEPARATOR` in a prevout script, or sits
-  under a `FindAndDelete` comment block. These are REAL transactions (several mainnet/testnet3),
-  run through `verifyScript` with full deserialization, prevouts matched by outpoint, and Core's
-  per-file flag semantics (`tx_valid`'s field is the flags to EXCLUDE, `tx_invalid`'s the flags to
-  APPLY). They include the entire `SCRIPT_VERIFY_CONST_SCRIPTCODE tests` section of
-  `tx_invalid.json` (12 rows), which is the external oracle for the flag itself.
-- **`findanddelete_test.zig`** — Bitcoin Core's own `script_FindAndDelete` unit test
-  (`src/test/script_tests.cpp`), all 16 cases byte-for-byte, as the oracle for the primitive's
-  greedy-but-single-pass, boundary-re-anchoring, invalid-trailing-push semantics.
-
-### script_tests.json witness rows
-
-`script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` pin the rows the file above
-drops. Counted on upstream `v29.0`: `script_tests.json` holds **1258 array entries, 51 comment-only,
-so 1207 data rows, of which 107 carry a witness field** (a leading
-`[<stack item hex>..., <amount in BTC>]` array). All 107 are vendored — no sampling, no mnemonic
-filter needed (they use only `NOP`/`HASH160`/`EQUAL`/`CHECKSIG`). **Zero** of them set `TAPROOT`:
-Core keeps the BIP342 corpus in `script_assets_test.json`, so that is a property of upstream, not
-of a filter here.
-
-This is the module's first external oracle for segwit v0 — P2WPKH/P2WSH dispatch,
-`WITNESS_MALLEATED`, `WITNESS_MALLEATED_P2SH`, program length/version rules, witness-v0
-`MINIMALIF`, post-witness `CLEANSTACK`, and the compressed-pubkey rule were previously anchored
-only by round trips this repo wrote itself. Importing it immediately exposed a real divergence:
-`OP_IF`/`OP_NOTIF` on an empty stack returned `InvalidStackOperation`, where Core's
-`interpreter.cpp` (v29.0, `case OP_IF: case OP_NOTIF:`) returns
-`SCRIPT_ERR_UNBALANCED_CONDITIONAL` — the one place in `EvalScript` where a `stack.size() < n`
-check does NOT use `INVALID_STACK_OPERATION`. Two rows of `script_tests_vectors.zig` had been
-transcribed with the implementation's answer rather than Core's; both are corrected.
-
-One mapping is deliberately not injective and is recorded rather than hidden: Core's
-`WITNESS_PUBKEYTYPE` and `PUBKEYTYPE` both land on this module's single `Pubkeytype`
-(`sigcheck.zig`), so the corpus cannot distinguish them. Each row keeps Core's own `SCRIPT_ERR_*`
-name in a `core_expect` field.
-
-### BIP65/BIP112 boundary rows
-
-`tx_locktime_vectors.zig` / `tx_locktime_test.zig` pin the `CHECKLOCKTIMEVERIFY` /
-`CHECKSEQUENCEVERIFY` rows of Core's `tx_valid.json` (**38**) and `tx_invalid.json` (**30**).
-Counted on upstream `v29.0`: `tx_valid.json` has 247 array entries / 127 comment-only / 120 data
-rows (10 naming CLTV and 28 naming CSV in a prevout script); `tx_invalid.json` has 201 / 108 / 93
-(16 and 14).
-
-`script_tests.json` **cannot** anchor these opcodes at all, however many rows are imported:
-`script_tests.cpp`'s synthetic spend is fixed at `nLockTime = 0` and `nSequence = SEQUENCE_FINAL`
-for every row, and both opcodes compare against exactly those two fields. A consistent mutation of
-the comparison plus the module's own boundary unit test passes the entire 297-row corpus. The
-imported rows straddle 499999999/500000000/500000001 (the height↔time threshold),
-4194303/4194304 (BIP112's type flag), the `CScriptNum` sign edge, and negative operands.
-
-`script_tests_test.zig` assembles each row's asm text (`asmparser.zig`, a transcription of
-Bitcoin Core's own `ParseScript`) into script bytes, reproduces Bitcoin Core's EXACT synthetic
-crediting/spending transaction pair (`script_tests.cpp`'s `BuildCreditingTransaction`/
-`BuildSpendingTransaction` — this is what makes the CHECKSIG-bearing vectors meaningful: their
-signatures were computed against precisely this pair), runs `verifyScript`, and asserts the
-result's CLASS matches (`OK` vs. the JSON's named error, mapped 1:1 to this module's error names
-— e.g. `SCRIPTNUM` → `UnknownError`, the class Bitcoin Core itself folds arithmetic-`CScriptNum`
-overflow/non-minimality into via its generic exception catch, distinct from the dedicated
-`MinimalData` class which is push-opcode minimality only).
-
-Three real bugs were caught and fixed by getting these rows green (not merely by unit tests of
-each function in isolation) — each is exactly the kind of subtle cross-cutting mistake a
-"synthesize opcodes independently, believe the docs, never run the official corpus" approach would
-have missed:
-
-1. **`isValidSignatureEncoding`'s length arithmetic** (BIP66's exact byte-count check) is written
-   against the FULL popped stack element (DER bytes + trailing sighash-type byte) — Bitcoin Core's
-   own `IsValidSignatureEncoding` takes `vchSig` exactly as popped, hashtype included. Calling it
-   with DER-only bytes (excluding the hashtype byte) undercounts by one and rejects every
-   otherwise-valid signature the instant `DERSIG`/`LOW_S`/`STRICTENC` is set (i.e. on almost every
-   vector in the corpus).
-2. **`OP_CHECKMULTISIG`'s pubkey/signature walk order was reversed.** Bitcoin Core walks both
-   blocks starting from the TOP of their stack region (the LAST-pushed pubkey/signature first),
-   not push (script-reading) order — `stacktop(-ikey)` with `ikey` initialized just past the
-   popped count and incrementing toward the bottom. A 1-of-2 multisig with an invalid second
-   pubkey exposed this: with the (wrong) forward order the valid first pubkey matches immediately
-   and the loop exits before ever examining the invalid second key, silently passing; Core (and,
-   after the fix, this module) tries the invalid key FIRST and fails closed with `Pubkeytype`.
-3. **`OP_CHECKMULTISIG`'s early-bail condition must run every loop iteration, not only after a
-   signature match.** The condition ("remaining required signatures now exceed remaining
-   available keys → can never succeed → stop") is what keeps the loop's key index in bounds when
-   NO signature ever matches (e.g. every supplied "signature" is the empty string) — gating it on
-   "only check after a match" leaves nothing to terminate that case, walking the key index past
-   the end of the pubkey array. Caught by a real BIP66/NULLFAIL-compliance vector in the corpus
-   whose scriptSig supplies only empty elements.
-4. `OP_IF`/`OP_NOTIF`'s `MINIMALIF` check is gated on `sigversion == WITNESS_V0` in Bitcoin Core,
-   not on the flag alone — a base/legacy-context script with the `MINIMALIF` flag set and a
-   non-minimal boolean must reach `EVAL_FALSE`, not fail closed with `MinimalIf` at the `IF`
-   itself. Caught by a corpus vector combining `P2SH,WITNESS,MINIMALIF` with a base-context (not
-   witness-program-shaped) `scriptPubKey`.
-5. `OP_CHECKSIG`'s encoding checks (signature DER/hashtype, pubkey compressed/uncompressed shape)
-   must run even when the signature is the empty string — Bitcoin Core's
-   `CheckSignatureEncoding(vchSig,...) && CheckPubKeyEncoding(vchPubKey,...)` are two independent,
-   unconditionally-evaluated checks ANDed together, not a short-circuit on the signature alone (an
-   empty signature trivially PASSES `CheckSignatureEncoding` — it's `CheckPubKeyEncoding` that can
-   still fail on a malformed pubkey next to it). Caught by a P2PK vector with a truncated
-   uncompressed pubkey and a deliberately-empty scriptSig, expecting `Pubkeytype`.
-
-### End-to-end real spends (`e2e_test.zig`)
-
-Three real, self-signed spends, each verified through the SAME code path a production caller
-would use (`bitcointx` sighash → `sigcheck`/`bip340.verify` curve check), with a positive control
-(a one-byte-tampered signature must fail):
-
-- **P2PKH** — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` keypair, legacy sighash, DER signature
-  (BIP62-low-S-normalized, since the raw signer doesn't do this automatically and `ScriptFlags.standard`
-  enforces `LOW_S`), `OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG`.
-- **P2WPKH** — same keypair shape, BIP143 sighash (with the correct implicit P2PKH-shaped
-  scriptCode), 2-item witness stack.
-- **P2TR key-path** — `bip340` keypair, BIP341 sighash (`SIGHASH_DEFAULT`), BIP340 Schnorr
-  signature, single-item witness stack. Uses the internal key directly as the taproot output key
-  (no BIP341 tweak) — legitimate for consensus purposes (BIP341 does not require a script-tree
-  tweak), and orthogonal to what this test checks (sighash + Schnorr correctness, not the tweak
-  procedure, which is a spender/wallet-side construction concern).
-
-### DoS teeth (`interpreter.zig` + `dos_test.zig`)
-
-`interpreter.zig`'s own tests: script size, op count (including the "hidden inside a never-taken
-`IF` branch" case), single-push size, and aggregate stack size, each proven to fail closed with
-the specific typed error, no OOM/panic. `dos_test.zig` adds `verifyScript`-level teeth: witness
-item count, an oversized P2WSH stack-seed item, an oversized P2WPKH witness item, and confirms a
-P2SH redeem script (bounded to `MAX_SCRIPT_ELEMENT_SIZE` as a *push*, independent of its own
-`MAX_SCRIPT_SIZE` ceiling once *executed*) round-trips correctly at the boundary.
+## Signature and public-key parsing
 
 ### Signature encoding: strict (BIP66) versus Core's lax parser
 
 With `dersig`, `low_s` or `strictenc` set, a signature element must pass `isValidSignatureEncoding`
 (BIP66, transcribed). Without them Core does NOT skip DER: `CPubKey::Verify` runs
-`ecdsa_signature_parse_der_lax` (`src/pubkey.cpp`, MIT; read 2026-11-17) and `sigcheck.parseDerLoose`
+`ecdsa_signature_parse_der_lax` (`src/pubkey.cpp`, MIT) and `sigcheck.parseDerLoose`
 reproduces its acceptance rules exactly: tag `0x30`; a sequence length that is short-form, or
 long-form whose length bytes are skipped, and is NEVER checked against the data; `R` and `S` as `0x02`
 integers whose length is short-form or long-form (leading zero length bytes skipped, at most three
 significant ones); the content must lie inside the input; leading zeros trimmed, no sign padding
 (values read as unsigned), trailing bytes after `S` ignored; more than 32 significant bytes is an
-overflow, which Core turns into the all-zero signature and this module into "does not verify". Before
-2026-11-17 the parser was stricter (long-form lengths and an over-long sequence length were refused),
-a consensus divergence for validation without `dersig`. High-`S` signatures verify (Core normalizes
-`S`); `low_s` rejects them first. The element's LAST byte is always the hashtype, so an `S` that ends
-in the sighash byte does not borrow it.
+overflow, which Core turns into the all-zero signature and this module into "does not verify".
+High-`S` signatures verify (Core normalizes `S`); `low_s` rejects them first. The element's LAST byte is
+always the hashtype, so an `S` that ends in the sighash byte does not borrow it.
 
 ### Hybrid public keys without STRICTENC
 
@@ -404,50 +262,27 @@ With `strictenc` set a 65-byte `0x06`/`0x07` key is refused as `Pubkeytype` (Cor
 pinned by the `script_tests.json` hybrid rows). Without it Core still verifies against such a key:
 `CPubKey::IsValid` accepts a 65-byte key with tag `4`, `6` or `7` (`src/pubkey.h` `GetLen`), and
 `CPubKey::Verify` parses it with libsecp256k1's `secp256k1_ec_pubkey_parse`, whose
-`secp256k1_ge_parse_with_hybrid65` (`src/group_impl.h`, MIT; both read 2026-11-18) accepts tag `0x06` only
+`secp256k1_ge_parse_with_hybrid65` (`src/group_impl.h`, MIT) accepts tag `0x06` only
 when y is even and `0x07` only when y is odd, with x and y below the field prime and the point on the
 curve; anything else is "does not verify". `sigcheck.hybridToUncompressed` reproduces the parity rule
 before calling `k256`, whose own `fromSec1` refuses hybrid keys by contract: a matching hybrid key is
 rewritten to its `0x04` form, a mismatching one is passed through unchanged and refused by `k256`
-(verify=false, never a script error). Before 2026-11-18 every hybrid key failed to verify without
-`strictenc`, a consensus divergence for validation without that flag (Core's `script_tests.json`: "1-of-2
-with the second 1 hybrid pubkey and no STRICTENC"). The pinned vectors carry that row, 28 more rows of the
-current corpus that exercise signature/pubkey parsing without `STRICTENC`/`DERSIG`/`LOW_S` and were dropped by
-the 2026-07 sampling, and five hand-built parity/off-curve cases. The delta mutation of this change: 15
-mutants, 15 killed (cumulative with the whole-module run: 661/690, 29 eq; card src hash abff56c3c6934a57).
+(verify=false, never a script error). Core's `script_tests.json` carries the row "1-of-2
+with the second 1 hybrid pubkey and no STRICTENC".
 
-## Flags
-
-`ScriptFlags` mirrors Bitcoin Core's `SCRIPT_VERIFY_*` set field-for-field; every field's doc
-comment in `flags.zig` states exactly what it gates. This now includes the three tapscript
-standardness/policy flags — `discourage_op_success`, `discourage_upgradable_pubkeytype`,
-`discourage_upgradable_taproot_version` — which reject (as non-standard) the consensus-valid BIP342
-upgrade hooks (`OP_SUCCESSx`, unknown CHECKSIG pubkey types, unknown leaf versions). All three are
-`false` in `.none` and `true` in `.standard`.
-
-It also includes `const_scriptcode` (`SCRIPT_VERIFY_CONST_SCRIPTCODE`, added 2026-08-06), which
-rejects the two legacy scriptCode mutations — `FindAndDelete(vchSig)` removing something, and
-`OP_CODESEPARATOR` appearing in a `SigVersion.base` script at all, executed branch or not. Both
-remain fully implemented at consensus level (flag off); the flag only makes them observable. It is
-`false` in `.none` and `true` in `.standard`, matching Core's `STANDARD_SCRIPT_VERIFY_FLAGS`.
-
-### Audit 2026-11-17 (whole-module mutation)
-
-**Audit 2026-11-17 (whole-module mutation).** 675 mutants over every non-test line of `opcodes.zig`, `number.zig`, `sigcheck.zig`, `interpreter.zig`, `tapscript.zig` and `verify.zig` (stack machine: every opcode's semantics and stack-depth guard, push decoding and minimal-push rules, `FindAndDelete` and the scriptCode builder, the condition stack, CLTV/CSV, CHECKSIG / CHECKMULTISIG including NULLFAIL/NULLDUMMY, tapscript budget and pubkey typing, BIP66 checks, the lax DER parser, the BIP341 commitment and signature rules, witness-program recognition, P2SH, every `verifyScript` limit and flag). `flags.zig`, `limits.zig`, `txctx.zig`, `root.zig` (constants and declarations, covered by their own tests) and every `*_test.zig` / `*_vectors.zig` / `asmparser.zig` (test support) were not mutated. Sighash computation itself lives in `bitcointx` and is out of this module's source. One schemata build per round, baseline first. Round 1 (before any change): 445 killed, 3 hung, 209 survived: the pinned `script_tests.json` subset leaves most stack opcodes without an exact-result check and most guards without an exactly-one-short case. About 30 tests (many table rows each) were added (`mutation_gap_test.zig`, plus tests in `interpreter.zig`, `sigcheck.zig`, `number.zig`): exact result stacks for every stack, arithmetic and hash opcode; every depth guard with one operand too few and exactly enough; shortest-push at every length boundary; the canonical push `FindAndDelete` searches for at all four shapes; PUSHDATA prefixes that are the last bytes of the script; the tapscript budget landing on zero, pubkey typing, codeseparator position, MINIMALIF; CLTV/CSV operand typing, policy NOPs, disable flags and the 16-bit mask; VERIF in an unexecuted branch; limits exactly at their bound; P2SH recognition (each of its three markers), the single-push rule, CLEANSTACK after a wrapped witness program; witness-program shapes; every taproot dispatch rule; the validation-weight budget to the byte (with and without annex); `checkSchnorrSig` sizes and hashtype; BIP66 length edges; flag-by-flag encoding checks; a CHECKMULTISIG signed over the post-codeseparator scriptCode; an `S` that ends in its own hashtype byte. **Finding fixed:** the loose DER parser was stricter than Bitcoin Core's lax parser (see "Signature encoding"); rewritten after `ecdsa_signature_parse_der_lax`, with a hand-built signature per lax rule, and its 31 delta mutants killed (two are equivalent, counted below). Round 2: 636 killed, 3 hung, 36 survived; 7 more were killed by three added tests, 29 do not die: 27 EQUIVALENT (an empty-data minimal push is covered by the generic `opcode == len` rule; the `OP_n` arm of the minimal-push check never fires because a data push opcode is `<= 0x4e`; a 76-byte push is `0x4c` either way; the `findAndDelete` end test duplicates `readInstruction`'s own bound; `ConditionStack` `>=` for `==` under `first_false <= size`; CHECKMULTISIG `len <= n_keys` fails with the same error one step later; the `key_i >= n_keys` guard under `sigs_remaining <= keys_remaining`; `instr.data == null` implied by `opcode > OP_16`; the MINIMALIF `top.len >= 1` arm under `top.len > 1`; BIP66 minimum length 8 under `len_r, len_s >= 1`; `isLowS` over the full element parses the same; an empty signature reaches `false` through the parser; a lax-parse long-form length with 4 significant bytes is at least 2^24 and cannot fit; the lax sequence-length bound when no byte can follow; `isExactPush`'s compare and undecodable arm, `0x50` as a version, 1- and 41-byte programs, the key-path `<= 1` arm and the initial-stack bound, which earlier checks make unreachable; the stack copy when `p2sh` is off is cost-only; an empty stack copy and CLEANSTACK `> 1` follow from a non-empty stack) and 2 UNOBSERVABLE (the BIP341 tweak `>=` order: a tagged hash landing on or above the group order is a 2^-128 event with no known preimage). Counts on the card are whole-module.
-
-### Script builder and disassembler (`script.zig`)
+## Script builder and disassembler (`script.zig`)
 
 Public API: `ScriptBuilder` (`pushOpcode`, `pushData`, `pushInt`, `bytes`, `toOwnedSlice`,
 `reset`), `toAsm` (writer-based) / `toAsmAlloc`, `opcodeName`, `AsmOptions`, `Limits`.
 Reference per the owner rule (behave like the reference): Bitcoin Core's `CScript::operator<<` /
 `CheckMinimalPush` and `ScriptToAsmStr` / `GetOpName` (behaviour only; this module stays
-clean-room), btcd's `txscript.ScriptBuilder` (source read 2026-11-19) for the bounds.
+clean-room), btcd's `txscript.ScriptBuilder` for the bounds.
 
 - **Pushes are minimal in Core's `MINIMALDATA` sense.** Empty data is `OP_0`; one byte `1..16` is
   `OP_1..OP_16`; the byte `0x81` is `OP_1NEGATE`; up to 75 bytes a direct push, then
   `OP_PUSHDATA1/2/4` at the 76 / 256 / 65 536 boundaries. `pushInt` is `OP_0` / `OP_1NEGATE` /
   `OP_1..OP_16` for those values, otherwise the minimal `CScriptNum` bytes as a data push (`i64`
-  extremes included; `number.encode` was made total for `minInt(i64)`).
+  extremes included; `number.encode` is total for `minInt(i64)`).
   *Differences from the references.* Core's `operator<<(vector)` is not minimal for the 0-byte and
   special 1-byte cases (it writes `01 05` for `{5}`); a script built with it fails `MINIMALDATA`
   policy, which is why Core's own code pushes numbers through the `int64_t` overload. We follow the
@@ -472,25 +307,160 @@ clean-room), btcd's `txscript.ScriptBuilder` (source read 2026-11-19) for the bo
   that starts with `OP_RETURN` or exceeds 10 000 bytes (`IsUnspendable`). Like Core's text, the
   output is not injective: `01 05` and `OP_5` both read `5`, and a 5-byte push whose hex digits
   are all decimal looks like a number. Core's parser for this text does not exist either (its
-  `ParseScript` reads the `script_tests.json` grammar, which `asmparser.zig` transcribes).
+  `ParseScript` reads the `script_tests.json` grammar, which the test-only `asmparser.zig` transcribes; `asmparser.assemble` stays test-only).
   *btcd differences, not followed:* its `DisasmString` shows data pushes as hex without the
-  number reading of 1 to 4 bytes (source read 2026-11-19: `disasmOpcode` in compact mode
+  number reading of 1 to 4 bytes (`disasmOpcode` in compact mode
   writes `OP_0`..`OP_16` and `OP_1NEGATE` as numbers and every data push as hex) and has no
   sighash decoding.
-- **Verification.** `script.zig` unit tests (every push-length boundary, `pushInt` table, limits at
-  the byte, the 32-bit length ceiling, every opcode-name class, `[error]` for each truncation shape,
-  sighash decode on and off); `script_asm_test.zig`: `toAsm` over every pinned `script_tests.json`
-  script and over the same scripts cut short, exact byte round trip `toAsm` -> `asmparser.assemble`
-  for the scripts whose pushes are canonical (1 146 cases) and a fixed-point check for the rest
-  (the text of a re-assembled script equals the original text), a randomised
-  `ScriptBuilder` -> text -> bytes round trip (400 scripts), and builder output compared with the
-  parser's own quoted-string and decimal pushes.
-- **Delta mutation 2026-11-19** (new code: `script.zig` production lines, `number.encode`): 67
-  mutants (push-length classes and boundaries, both limits, every special-case arm of `pushData`
-  and `pushInt`, opcode-name ranges, sighash names, the decode gate, `[error]`, the 1-to-4-byte
-  number rule): 65 killed, 2 equivalent (the empty-data special case is covered by the generic
-  direct-push rule, which writes the same `00`; `n >= 1` against `n >= 0` in `pushInt`, `0` having
-  matched the first disjunct). One build, schemata, baseline first; the first run left 6 survivors, four of which died to a test added for them (pushes that exactly fill `max_script_size` at every length class) after the 2/4-byte length boundary, the 32-bit length ceiling (failing allocator) and the empty-script / 10 000-byte decode bound had been tested.
+
+## Verification
+
+Run `scripts/modtest bitcoinscript`. Every vector file is machine-transcribed (never hand-typed) from Bitcoin Core's
+`src/test/data/*.json`; no generator is kept in the repository.
+
+### script_tests.json coverage
+
+`script_tests_vectors.zig` pins non-witness rows machine-filtered (not hand-picked) from Bitcoin Core's
+`src/test/data/script_tests.json` (the `bitcoin/bitcoin` `master` branch). The filter keeps only rows (a) with no
+witness field (those live in `script_tests_witness_vectors.zig`, below) and (b) whose `scriptSig`/`scriptPubKey`
+asm text uses only mnemonics this module's opcode table implements (a plain substring/token check, which
+mechanically excludes every BIP342 tapscript-only vector). Of the ~1108 rows surviving that filter, every row is kept
+for buckets with ≤20 members (every distinct error class Bitcoin Core's test suite exercises that this module can
+reach), and a fixed-seed random sample of 70 `OK` rows / 20 rows for buckets larger than 20
+(`EVAL_FALSE`/`BAD_OPCODE`/`INVALID_STACK_OPERATION`/`DISABLED_OPCODE`/`SCRIPTNUM`/`MINIMALDATA`/`SIG_DER`).
+`OP_CODESEPARATOR` and `CONST_SCRIPTCODE` rows are not filtered out: the corpus has a single `CODESEPARATOR` row and
+three non-witness `CONST_SCRIPTCODE` rows. The file also carries the rows of the current corpus that exercise
+signature/pubkey parsing without `STRICTENC`/`DERSIG`/`LOW_S` (the sampling had dropped them) and five hand-built
+hybrid-key parity / off-curve cases.
+
+The corpus cannot exercise `FindAndDelete(vchSig)` (Core tests that behaviour elsewhere), so two further sources pin it:
+
+- **`tx_findanddelete_vectors.zig` / `tx_findanddelete_test.zig`** — the rows of Core's `src/test/data/tx_valid.json`
+  and `tx_invalid.json` that name `CONST_SCRIPTCODE` in their flags field, contain `CODESEPARATOR` in a prevout
+  script, or sit under a `FindAndDelete` comment block. These are REAL transactions (several mainnet/testnet3), run
+  through `verifyScript` with full deserialization, prevouts matched by outpoint, and Core's per-file flag semantics
+  (`tx_valid`'s field is the flags to EXCLUDE, `tx_invalid`'s the flags to APPLY). They include the entire
+  `SCRIPT_VERIFY_CONST_SCRIPTCODE tests` section of `tx_invalid.json`, the external oracle for the flag itself.
+- **`findanddelete_test.zig`** — Bitcoin Core's own `script_FindAndDelete` unit test (`src/test/script_tests.cpp`),
+  every case byte for byte, as the oracle for the primitive's greedy-but-single-pass, boundary-re-anchoring,
+  invalid-trailing-push semantics.
+
+### script_tests.json witness rows
+
+`script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` pin the rows the file above drops: every row
+of `script_tests.json` that carries a witness field (a leading `[<stack item hex>..., <amount in BTC>]` array), with no
+sampling and no mnemonic filter (they use only `NOP`/`HASH160`/`EQUAL`/`CHECKSIG`; counted on upstream `v29.0`:
+1258 array entries, 51 comment-only, 1207 data rows, of which 107 carry a witness). None of them sets `TAPROOT`:
+Core keeps the BIP342 corpus in `script_assets_test.json`.
+
+This is the external oracle for segwit v0: P2WPKH/P2WSH dispatch, `WITNESS_MALLEATED`, `WITNESS_MALLEATED_P2SH`,
+program length/version rules, witness-v0 `MINIMALIF`, post-witness `CLEANSTACK`, and the compressed-pubkey rule.
+`OP_IF`/`OP_NOTIF` on an empty stack is `UnbalancedConditional` (Core v29.0 `SCRIPT_ERR_UNBALANCED_CONDITIONAL`), the one
+place in `EvalScript` where a `stack.size() < n` check does NOT use `INVALID_STACK_OPERATION`.
+
+One mapping is deliberately not injective and is recorded rather than hidden: Core's `WITNESS_PUBKEYTYPE` and
+`PUBKEYTYPE` both land on this module's single `Pubkeytype` (`sigcheck.zig`), so the corpus cannot distinguish them.
+Each row keeps Core's own `SCRIPT_ERR_*` name in a `core_expect` field.
+
+### BIP65/BIP112 boundary rows
+
+`tx_locktime_vectors.zig` / `tx_locktime_test.zig` pin the `CHECKLOCKTIMEVERIFY` / `CHECKSEQUENCEVERIFY` rows of Core's
+`tx_valid.json` and `tx_invalid.json` (counted on upstream `v29.0`: `tx_valid.json` 120 data rows, 10 naming CLTV and
+28 naming CSV in a prevout script; `tx_invalid.json` 93 data rows, 16 and 14).
+
+`script_tests.json` **cannot** anchor these opcodes at all, however many rows are imported:
+`script_tests.cpp`'s synthetic spend is fixed at `nLockTime = 0` and `nSequence = SEQUENCE_FINAL`
+for every row, and both opcodes compare against exactly those two fields. A consistent mutation of
+the comparison plus the module's own boundary unit test passes the whole `script_tests.json` subset. The
+imported rows straddle 499999999/500000000/500000001 (the height↔time threshold),
+4194303/4194304 (BIP112's type flag), the `CScriptNum` sign edge, and negative operands.
+
+### Runner semantics (`script_tests_test.zig`)
+
+`script_tests_test.zig` assembles each row's asm text (`asmparser.zig`, a transcription of
+Bitcoin Core's own `ParseScript`) into script bytes, reproduces Bitcoin Core's EXACT synthetic
+crediting/spending transaction pair (`script_tests.cpp`'s `BuildCreditingTransaction`/
+`BuildSpendingTransaction` — what makes the CHECKSIG-bearing vectors meaningful: their
+signatures were computed against precisely this pair), runs `verifyScript`, and asserts the
+result's CLASS matches (`OK` vs. the JSON's named error, mapped 1:1 to this module's error names
+— e.g. `SCRIPTNUM` → `UnknownError`, the class Bitcoin Core itself folds arithmetic-`CScriptNum`
+overflow/non-minimality into via its generic exception catch, distinct from the dedicated
+`MinimalData` class which is push-opcode minimality only).
+
+Semantics the corpus pins, each a cross-cutting rule rather than a property of one function:
+
+1. `isValidSignatureEncoding`'s length arithmetic (BIP66's exact byte-count check) is written against the FULL popped
+   stack element (DER bytes + trailing sighash-type byte), as Core's `IsValidSignatureEncoding` takes `vchSig` exactly
+   as popped; with DER-only bytes every valid signature is rejected once `DERSIG`/`LOW_S`/`STRICTENC` is set.
+2. `OP_CHECKMULTISIG` walks the pubkey and signature blocks from the TOP of their stack region (the LAST-pushed
+   first), not in script-reading order: a 1-of-2 multisig with an invalid second pubkey must examine that key first and
+   fail closed with `Pubkeytype`.
+3. `OP_CHECKMULTISIG`'s early-bail condition ("remaining required signatures exceed remaining available keys, so it can
+   never succeed") runs every loop iteration, not only after a signature match; it is what keeps the key index in
+   bounds when no signature ever matches (every supplied "signature" empty).
+4. `OP_IF`/`OP_NOTIF`'s `MINIMALIF` check is gated on `sigversion == WITNESS_V0` (not on the flag alone): a base-context
+   script with `MINIMALIF` set and a non-minimal boolean reaches `EVAL_FALSE`, not `MinimalIf`.
+5. `OP_CHECKSIG`'s signature and pubkey encoding checks are two independent, unconditionally evaluated checks (Core's
+   `CheckSignatureEncoding(vchSig,...) && CheckPubKeyEncoding(vchPubKey,...)`): they run even when the signature is the
+   empty string, so a P2PK spend with a truncated pubkey and an empty scriptSig fails with `Pubkeytype`.
+
+### End-to-end real spends (`e2e_test.zig`)
+
+Three real, self-signed spends, each verified through the SAME code path a production caller
+would use (`bitcointx` sighash → `sigcheck`/`bip340.verify` curve check), with a positive control
+(a one-byte-tampered signature must fail):
+
+- **P2PKH** — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` keypair, legacy sighash, DER signature
+  (BIP62-low-S-normalized, since the raw signer doesn't do this automatically and `ScriptFlags.standard`
+  enforces `LOW_S`), `OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG`.
+- **P2WPKH** — same keypair shape, BIP143 sighash (with the correct implicit P2PKH-shaped
+  scriptCode), 2-item witness stack.
+- **P2TR key-path** — `bip340` keypair, BIP341 sighash (`SIGHASH_DEFAULT`), BIP340 Schnorr
+  signature, single-item witness stack. Uses the internal key directly as the taproot output key
+  (no BIP341 tweak) — legitimate for consensus purposes (BIP341 does not require a script-tree
+  tweak), and orthogonal to what this test checks (sighash + Schnorr correctness, not the tweak
+  procedure, which is a spender/wallet-side construction concern).
+
+`tapscript_test.zig` adds constructed tapscript script-path spends (`OP_CHECKSIG`, an `OP_CHECKSIGADD` threshold,
+`OP_SUCCESSx`, empty signature, validation-weight exhaustion); `tapscript.zig` pins the taproot commitment against the
+BIP341 `wallet-test-vectors.json` KATs.
+
+### DoS teeth (`interpreter.zig` + `dos_test.zig`)
+
+`interpreter.zig`'s own tests: script size, op count (including the "hidden inside a never-taken
+`IF` branch" case), single-push size, and aggregate stack size, each proven to fail closed with
+the specific typed error, no OOM/panic. `dos_test.zig` adds `verifyScript`-level teeth: witness
+item count, an oversized P2WSH stack-seed item, an oversized P2WPKH witness item, and confirms a
+P2SH redeem script (bounded to `MAX_SCRIPT_ELEMENT_SIZE` as a *push*, independent of its own
+`MAX_SCRIPT_SIZE` ceiling once *executed*) round-trips correctly at the boundary.
+
+### Other test classes
+
+`mutation_gap_test.zig` and tests in `interpreter.zig`, `sigcheck.zig`, `number.zig` pin exact result stacks for every
+stack, arithmetic and hash opcode; each depth guard with one operand too few and exactly enough; shortest-push at
+every length boundary; the canonical push `FindAndDelete` searches for; the tapscript budget landing on zero;
+CLTV/CSV operand typing and the 16-bit mask; limits exactly at their bound; P2SH recognition; witness-program
+shapes; every taproot dispatch rule; BIP66 length edges; flag-by-flag encoding checks; the lax DER parser with a
+hand-built signature per rule.
+
+`script.zig` unit tests (every push-length boundary, `pushInt` table, limits at the byte, the 32-bit length ceiling,
+every opcode-name class, `[error]` for each truncation shape, sighash decode on and off); `script_asm_test.zig`:
+`toAsm` over every pinned `script_tests.json` script and over the same scripts cut short, an exact byte round trip
+`toAsm` -> `asmparser.assemble` for the scripts whose pushes are canonical and a fixed-point check for the rest
+(the text of a re-assembled script equals the original text), a randomised `ScriptBuilder` -> text -> bytes round
+trip, and builder output compared with the parser's own quoted-string and decimal pushes.
+`taproot_builder_xcheck_test.zig` cross-checks `taproot`'s script-tree builder against this module's consensus
+verifier.
+
+- **Fuzz:** the deterministic driver, `BITCOINSCRIPT_FUZZ=<runs>[,<first seed>]` (`_ONLY` selects a harness), runs two
+  harnesses in the ordinary test binary: `bitcoinscript-verify` (`verifyScript`) and `bitcoinscript-tapscript` (a
+  tapscript leaf); both also run as `std.testing.fuzz` corpus targets.
+- **ctgrind:** none; script data is public (card, Hardening line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The run covered `opcodes.zig`, `number.zig`, `sigcheck.zig`, `interpreter.zig`,
+  `tapscript.zig`, `verify.zig` (and the delta runs `script.zig` and `number.encode`); `flags.zig`, `limits.zig`,
+  `txctx.zig`, `root.zig` and test support were not mutated, and sighash computation lives in `bitcointx`.
+
 
 ## Anchoring
 
@@ -504,8 +474,6 @@ clean-room), btcd's `txscript.ScriptBuilder` (source read 2026-11-19) for the bo
 ## Backlog / deferred
 
 - **Sigop counting (legacy, P2SH, witness) — `GetLegacySigOpCount`/`GetTransactionSigOpCost` equivalents** (survey 2026-09-30) — block validation is impossible without it (block sigop cost limit) and btcd/Core expose it. `rg -i sigop src/` finds only the tapscript validation-weight budget. Effort M. Fits §2.
-- **DONE 2026-11-19 — Script builder + disassembler (`toAsm`) as public API** (survey 2026-09-30) — `ScriptBuilder` and `toAsm` / `toAsmAlloc` in `script.zig`; see "Script builder and disassembler" above. `asmparser.assemble` (Core's `script_tests.json` text format) stays test-only.
-- **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered since: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
-- **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — 297 of ~1100 non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
+- **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — the non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
+- **Shared `commonSigMsg` in `bitcointx`.** `tapscript.sigMsg` rebuilds the BIP341 common signature message because `bitcointx.bip341.sigMsg` is key-path-only (`spend_type = 0x00`, no extension); lifting one shared implementation into `bitcointx` would remove the duplicate (the `ext_flag = 0` prefix is cross-checked byte for byte today).

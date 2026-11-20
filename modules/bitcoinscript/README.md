@@ -12,7 +12,8 @@ segwit v0 (P2WPKH/P2WSH), and BIP341/342 taproot **key-path and script-path (tap
 - **Executes UNTRUSTED scripts.** Every consensus DoS bound (script/push/stack size, op count,
   pubkey count) is enforced before the resource it bounds is consumed; every malformed or
   adversarial input is a typed error, never a panic. See `SPEC.md` "Threat model / DoS bounds".
-- **Platform:** any — pure computation over caller-owned bytes, no I/O.
+- **Platform:** any — pure computation over caller-owned bytes, no I/O. Depends on `bitcointx`, `k256`,
+  `bip340`, `ripemd160` and `std`.
 - **Model after:** Bitcoin Core `script/interpreter.cpp` (and `script_tests.json` as its own
   conformance corpus); BIP16/62/65/66/112/141/142/143/144/146/340/341/342.
 
@@ -35,6 +36,11 @@ Implemented:
   `witness_pubkeytype`, `nullfail`, `minimaldata`, `taproot`, `sigpushonly`,
   `const_scriptcode`, `discourage_op_success`, `discourage_upgradable_pubkeytype`,
   `discourage_upgradable_taproot_version`.
+
+## Not provided
+
+No sigop counting, no standardness / template classification (basic classification and destination extraction live
+in the sibling `btcaddr`), no signing, no script debugger; see `SPEC.md` *Backlog / deferred*.
 
 ## Use
 
@@ -95,7 +101,7 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
   and 520-byte elements unless `Limits` says otherwise.
 - `toAsm(script, writer, .{})` / `toAsmAlloc` — Core-style disassembly (`OP_DUP OP_HASH160 <hex> …`,
   small pushes as numbers, `[error]` for a truncated push; `.sighash_decode` shows `[ALL]` etc.);
-  `opcodeName(byte)`.
+  `script.opcodeName(byte)`.
 - `EvalError` / `VerifyError` — typed error sets; every failure mode Bitcoin Core's
   `script_tests.json` names has a corresponding variant (see `SPEC.md` "script_tests.json
   coverage" for the exact name mapping).
@@ -108,14 +114,13 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
 zig build test-bitcoinscript --summary all
 ```
 
-297 + 107 pinned rows from Bitcoin Core's official `script_tests.json` (the second batch being
-its witness-bearing rows), 68 BIP65/BIP112 boundary rows from `tx_valid.json`/`tx_invalid.json`,
+Pinned rows from Bitcoin Core's official `script_tests.json` (a filtered subset of the non-witness rows and every
+witness-bearing row), the `CHECKLOCKTIMEVERIFY` / `CHECKSEQUENCEVERIFY` rows of `tx_valid.json` / `tx_invalid.json`,
 real end-to-end spends
 (P2PKH/P2WPKH/P2TR key-path plus BIP342 tapscript script-path: `OP_CHECKSIG`, `OP_CHECKSIGADD`
 threshold, `OP_SUCCESSx`, empty-sig, and validation-weight exhaustion — `tapscript_test.zig`),
 BIP341 wallet-test-vector KATs for the taproot commitment (`tapscript.zig`), and DoS-bound teeth —
-see `SPEC.md` "Verification" for what's pinned and why, including three real cross-cutting bugs the
-official corpus caught that isolated unit tests did not.
+see `SPEC.md` "Verification" for what's pinned and why. Fuzz: `BITCOINSCRIPT_FUZZ=<runs>`.
 
 Provenance: the interpreter is clean-room from the published consensus rules and
 the BIPs — no Bitcoin Core source is ported. ⚠ But `script_tests_vectors.zig`'s
