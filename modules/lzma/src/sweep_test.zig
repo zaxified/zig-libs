@@ -122,6 +122,29 @@ test "Lzma1Props.toBytes: out-of-range props are a checked lzma panic (sweep LZ-
     try expectPanicMessage(propsHuge, needle_props);
 }
 
+test "Lzma1Props: the 9-byte ZIP method 14 header round-trips and refuses a wrong size or bad properties" {
+    const p: lzma.Lzma1Props = .{ .lc = 3, .lp = 0, .pb = 2, .dict_size = 1 << 20 };
+    const h = p.toZipHeader();
+    // Python zipfile's bytes: version 9.4, size 5, then lc/lp/pb (0x5d) and the dictionary size.
+    try testing.expectEqualSlices(u8, &.{ 9, 4, 5, 0, 0x5d, 0, 0, 0x10, 0 }, &h);
+    try testing.expectEqual(p, try lzma.Lzma1Props.fromZipHeader(&h));
+    // The version bytes are not checked.
+    var other = h;
+    other[0] = 5;
+    other[1] = 200;
+    try testing.expectEqual(p, try lzma.Lzma1Props.fromZipHeader(&other));
+    // A properties size other than 5, and properties fromBytes refuses (0xe1 = 225: lc+lp+pb out of range).
+    var bad = h;
+    bad[2] = 6;
+    try testing.expectError(error.BadProperties, lzma.Lzma1Props.fromZipHeader(&bad));
+    bad = h;
+    bad[3] = 1;
+    try testing.expectError(error.BadProperties, lzma.Lzma1Props.fromZipHeader(&bad));
+    bad = h;
+    bad[4] = 225;
+    try testing.expectError(error.BadProperties, lzma.Lzma1Props.fromZipHeader(&bad));
+}
+
 // ── LZ-5: input reader with no buffer ──
 
 fn nullStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {

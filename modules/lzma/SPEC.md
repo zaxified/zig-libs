@@ -65,6 +65,9 @@ the `xz` command-line program.
 - **`.lzma`**: properties byte, dictionary size (u32 LE), uncompressed size (u64 LE, all ones =
   unknown), then LZMA1; the encoder writes the size as unknown and an end marker, the dictionary
   size rounded up to 2^n or 2^n + 2^(n-1).
+- **ZIP method 14** (APPNOTE 5.8.8): a 9-byte header, then raw LZMA1 (an end marker when the entry's flag bit 1 is
+  set, else the size from the central directory): LZMA SDK version (2 bytes, 9.4 written, not checked), properties
+  size (u16 LE, must be 5), the 5 property bytes. `Lzma1Props.fromZipHeader` / `toZipHeader` are the two directions.
 - **LZMA2** frames LZMA as chunks of at most 2 MiB uncompressed / 64 KiB compressed: control byte
   `0x00` end; `0x01`/`0x02` stored chunk with / without dictionary reset; `0x80 | ...` LZMA chunk
   (bits 5-6: 0 nothing reset, 1 state reset, 2 + new properties, 3 + dictionary reset; low five
@@ -195,4 +198,3 @@ algorithm*.
 - **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
 - **B6** Encoder time is caller-bounded: `LzmaOptions.depth` (and `nice_len`) are not capped, a huge `depth` on repetitive data makes each byte cost up to a dictionary of chain steps (liblzma behaves the same). Not a crash; cap only if a consumer ever takes `depth` from untrusted input.
 - **B7** A public CRC-64/XZ (PCLMULQDQ + slicing-by-8) beside the `crc32` module; `src/crc64.zig` is the private one the decoder uses (the encoder and `xzfmt`'s index still use std's).
-- **B5** zipstream convenience: a function that writes / reads the 9-byte ZIP method 14 header.

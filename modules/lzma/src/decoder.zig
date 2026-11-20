@@ -92,6 +92,29 @@ pub const Lzma1Props = struct {
         std.mem.writeInt(u32, b[1..5], p.dict_size, .little);
         return b;
     }
+
+    /// Length of ZIP's method 14 (LZMA) header: APPNOTE 5.8.8's 2 version
+    /// bytes, the 2-byte properties size and the 5 property bytes.
+    pub const zip_header_len = 9;
+
+    /// Reads the 9 bytes that open a ZIP method 14 entry (`2` bytes of LZMA
+    /// SDK version, ignored as every reader does; properties size, which must
+    /// be 5; the 5 property bytes). `error.BadProperties` for another size or
+    /// properties `fromBytes` refuses. The raw LZMA1 stream follows the header.
+    pub fn fromZipHeader(b: *const [zip_header_len]u8) Invalid!Lzma1Props {
+        if (std.mem.readInt(u16, b[2..4], .little) != 5) return error.BadProperties;
+        return fromBytes(b[4..9]);
+    }
+
+    /// The 9-byte ZIP method 14 header for `p`, as Python's `zipfile` writes it
+    /// (LZMA SDK version 9.4, properties size 5). Out-of-range props panic as in
+    /// `toBytes`.
+    pub fn toZipHeader(p: Lzma1Props) [zip_header_len]u8 {
+        var h: [zip_header_len]u8 = undefined;
+        h[0..4].* = .{ 9, 4, 5, 0 };
+        h[4..9].* = p.toBytes();
+        return h;
+    }
 };
 
 pub const Format = union(enum) {

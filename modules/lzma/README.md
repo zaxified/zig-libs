@@ -38,7 +38,7 @@ while (try r.reader.takeDelimiter('\n')) |line| { ... }
 
 `Format` says what the bytes are: `.xz`; `.lzma_alone` (the 13-byte-header `.lzma` file);
 `.{ .lzma1 = .{ .props, .uncompressed_size, .allow_eopm } }` (raw LZMA1, the properties out of band —
-ZIP method 14: `Lzma1Props.fromBytes` reads the 5 bytes after ZIP's 4-byte header, the size is
+ZIP method 14: `Lzma1Props.fromZipHeader` reads the entry's 9-byte header (`toZipHeader` writes it), the size is
 the entry's, `allow_eopm` is general-purpose bit 1); `.{ .lzma2 = .{ .dict_size } }` (raw LZMA2
 chunks to the `0x00` end byte).
 
@@ -69,7 +69,7 @@ defer sw.deinit();
 try sw.writer.print("{d}\n", .{42});
 try sw.finish();
 
-// ZIP method 14: raw LZMA1 with an end marker, then write the 9 header bytes yourself.
+// ZIP method 14: the 9 header bytes (`Lzma1Props.toZipHeader`), then raw LZMA1 with an end marker.
 var o = lzma.preset(6, false);
 const raw = try lzma.compress(gpa, input, .lzma1, .{ .lzma = o });
 ```
