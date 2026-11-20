@@ -845,7 +845,7 @@ fn fuzzCounters(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "driver: 3000 PRNG scripts through every counter parser (deterministic)" {
-    // The verdict run (~/.claude/fuzzing.md): a seeded PRNG writes the SCRIPT,
+    // The deterministic verdict driver (`PROCNET_FUZZ`): a seeded PRNG writes the SCRIPT,
     // so every choice — sample, mode, damage, truncation — is exercised, and a
     // failure reproduces from its iteration number.
     var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);

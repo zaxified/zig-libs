@@ -244,14 +244,14 @@ declare -A TARGETS=(
     [tfhe]="keygen encrypt decrypt bootstrap noise"
     [dkg]="coeffs combine"
     # ── writeback round, 2026-09-09: the sealedbox contradiction ───────────
-    # A1 `sealedbox.md` M1 said the secret-key codecs light up; the coverage
+    # An early audit said the secret-key codecs light up; the coverage
     # pass filed the module as a thin std wrapper with nothing to measure. Both
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
     [cookies]="derive sign verify verify2 seal open tsign tverify tseal topen"
     [aaa-gate]="bearer api_key basic"
-    # A1 `pir.md` M2: the module's central claim was never machine-checked, and
+    # pir: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
     # ── 2026-09-16: A1 opaque M5 and bip32 M6, first harnesses ─────────────

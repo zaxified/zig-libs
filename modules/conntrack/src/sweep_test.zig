@@ -3,7 +3,7 @@
 //! The findings that needed code changes (CT-1, CT-2) live next to the private
 //! dump engines in root.zig; these pin the entry points the sweep found CLEAN,
 //! so a later change cannot silently open them.
-//! See the 2026-10-29 panic-sweep report for `conntrack`.
+//! Source: the 2026-10-29 no-panic sweep of `conntrack`.
 const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");

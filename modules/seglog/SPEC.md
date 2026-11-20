@@ -6,7 +6,7 @@
 
 **Scope:** core — tidwall/wal v1.2.1 (the embeddable reference, MIT; Apache Kafka's log layer is the shape model), against rosedblabs/wal, hashicorp/raft-wal, Prometheus tsdb/wlog, etcd's WAL, TiKV raft-engine, Rust `commitlog` and `okaywal`, and the Zig WAL crates (surveyed 2026-11-16; the gaps that keep it from parity are under Backlog)
 
-**Audit:** review 2026-11-16 · mutation 2026-11-16 (405/466, 52 eq) · src 7150add918727047
+**Audit:** review 2026-11-16 · mutation 2026-11-16 (405/466, 52 eq) · src 8f39084a49eeebb1
 
 **Hardening:** fuzz 2026-11-15 (60,000 runs clean in one 47 s verdict, SEGLOG_FUZZ, ReleaseSafe; reach, each class hit 3,000 to 650,000 times: append, rotate, compact, compress, preallocation, a trailing-zero tail, flip / flip-near-the-end / truncate / junk damage of the segment, index, compressed-segment and manifest files, a quarter of the runs a version-1 migration (1,814 refused), writer open refused 14,613, `verify` found damage 5,024, `resync` 5,709, reader opened 30,921, `seek` / `seekTime` found a position; no planted-mutant check of the harness yet) · ct n/a — holds no secret material (record checksums only) · panic 2026-11-15 (every `pub` entry point and every `assert` / `unreachable` / `.?` / `@intCast` / `@intFromFloat` / unchecked add swept: `verify` on a reader whose manifest went bad, a `Position` with an absurd offset, LSNs near 2^64 from a crafted manifest or record, `quantileUpperUs(NaN)`, a `.clamp` range with min above max, `compactByKey` with a `keyOf` that changes its answer, an oversized `.idx` file, a backend handle with bit 31 set, `rotate` past the manifest's 2^20 segments — all errors or total now; `resync` does no CRC at an offset whose header cannot be accepted)
 

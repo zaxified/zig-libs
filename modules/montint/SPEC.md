@@ -6,7 +6,7 @@
 
 **Scope:** parity — Zig std.crypto.ff 0.16.0 (API), crypto-bigint 0.7.5, `filippo.io/bigmod` and OpenSSL BN 4.0.3 on the constant-time modular-arithmetic core: run-time and comptime moduli, modmul/modexp (secret and public exponent), element predicates and `compare`, CT inversion (batched safegcd; also of the modulus mod an even `n`), square root mod a prime, gcd/lcm/exact division, Miller-Rabin (surveyed 2026-10-05 and 2026-10-14, gaps closed 2026-10-14); Baillie-PSW, little-endian/primitive helpers and an aarch64 asm path are out (see Backlog)
 
-**Audit:** review 2026-11-01 · mutation 2026-11-15 (197/224, 27 eq) · src 0a39ee3b419607e4
+**Audit:** review 2026-11-01 · mutation 2026-11-15 (197/224, 27 eq) · src d38368cc303e3993
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: caller-contract asserts → checked panics (limbs, asm_core, safegcd nbits, Field.pow, fromElemUncheckedBits), even modulus folded into the safegcd verdict branch-free, `sqrt` work capped (`error.SqrtWorkLimit`), `stack_bytes` documented and probed; delta audit 46/48 + eq/NA)
 

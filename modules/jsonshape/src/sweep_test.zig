@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! No-panic sweep tests for jsonshape (wave GW). Findings JS-1 .. JS-3, see
-//! the 2026-10-29 panic-sweep report for `jsonshape`.
+//! No-panic sweep tests for jsonshape (wave GW). Findings JS-1 .. JS-3, from
+//! the 2026-10-29 no-panic sweep of `jsonshape`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

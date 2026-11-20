@@ -6,7 +6,7 @@
 
 **Scope:** parity — ipfs/go-ds-flatfs v0.6.1 (the like-for-like file-backed block store), with the git object store, restic and cacache-rs as design yardsticks (surveyed 2026-11-02; every substantial feature closed, rejected with a reason or owned by a sibling, see Compared with and *What is deliberately not done*)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-17 (252/282, 30 eq) · src f309022c36481536
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (252/282, 30 eq) · src cb2f7a1f9ee40381
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `uniqSafe` (temp name ≤ 255 B), fanout validated everywhere, put ≤ 64 MiB and exactly 64 MiB readable, gc mtime/keep casts; delta audit 23/25 + 2 eq)
 

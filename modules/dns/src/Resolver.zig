@@ -125,7 +125,7 @@ pub const DohMethod = enum {
 /// explicit `Options.servers`), `effectiveTimeoutMs` honors resolv.conf's
 /// `options timeout:` instead. Named so the struct default and that
 /// comparison can never drift apart into two unverifiable copies of the same
-/// number ([[feedback_n_copies_of_one_invariant_is_one_unverifiable_guard]]).
+/// number.
 pub const default_timeout_ms: u32 = 5000;
 /// `Options.attempts`'s own struct default; see `default_timeout_ms`.
 pub const default_attempts: u8 = 2;

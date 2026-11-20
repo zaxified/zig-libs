@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for the data plane (handshake/noise/transport), wave GR.
-//! Findings WH-1 .. WH-6, see the 2026-10-29 panic-sweep report for `wireguard-dataplane`.
+//! Findings WH-1 .. WH-6, from the 2026-10-29 no-panic sweep of `wireguard-dataplane`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

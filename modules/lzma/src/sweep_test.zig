@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! No-panic sweep tests (wave GZ). Findings LZ-1 .. LZ-7, see
-//! the 2026-10-29 panic-sweep report for `lzma`.
+//! No-panic sweep tests (wave GZ). Findings LZ-1 .. LZ-7, from
+//! the 2026-10-29 no-panic sweep of `lzma`.
 
 const std = @import("std");
 const builtin = @import("builtin");

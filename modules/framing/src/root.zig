@@ -1134,7 +1134,7 @@ test "Decoder: oversize refused at the prefix, not after buffering the body; Not
 }
 
 test "driver: 2000 PRNG streams — Decoder agrees with readFrame, garbage never panics" {
-    // Deterministic verdict run (~/.claude/fuzzing.md): every format, random
+    // Deterministic verdict driver (`FRAMING_FUZZ`): every format, random
     // payloads written then fed back in random-sized pieces must come out
     // identical; random bytes must end in a frame, "need more", or one of
     // the two declared errors — never a crash.

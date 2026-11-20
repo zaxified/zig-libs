@@ -1553,17 +1553,15 @@ pub const Log = struct {
     }
 
     /// Rebuild a lost or unreadable `MANIFEST` from `ids`' own segment
-    /// headers and seals (audit finding L4, ingest-consumer audit 2026-09-27: a torn or
+    /// headers and seals (audit finding L4: a torn or
     /// corrupt `MANIFEST` otherwise has no recovery path in the library or
     /// its tools — every other kind of damage does). `ids`, ascending, are
     /// the segments to include, in the order they form the log. `kv.Storage`
-    /// has no directory listing (zig-libs request, `ziglibs-requests.md`,
-    /// module `kv` — the same gap `open`'s own design already declines to
-    /// work around, since a log that derived its segments from file names
+    /// has no directory listing (the same gap `open`'s own design already
+    /// declines to work around, since a log that derived its segments from file names
     /// would adopt any stray file that looked like one), so this cannot
     /// discover `ids` by itself; a caller that can list the directory (an
-    /// operator's `ls seg-*.log seg-*.zst`, or the ingest daemon's
-    /// `seglog_cli.manifestRebuild`) supplies them.
+    /// operator's `ls seg-*.log seg-*.zst`) supplies them.
     ///
     /// Every id but the last must be a closed segment: its header already
     /// carries its own first LSN (the format's base-LSN field), and its seal

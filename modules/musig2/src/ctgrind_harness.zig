@@ -151,8 +151,8 @@
 //! to "k256's problem" would be the evasion `scripts/checks/ctgrind.sh`'s header
 //! exists to refuse (same reasoning as `bip340/sign`'s pattern, which this
 //! harness's PATTERN copies almost verbatim since the call graph is a
-//! superset of bip340's). The per-line breakdown in the audit record marks
-//! each context musig2-own, bip340-inherited, or k256/std-inherited.
+//! superset of bip340's). Each context is musig2-own, bip340-inherited, or
+//! k256/std-inherited.
 //!
 //! ⚠ `root[.]zig` is a THREE-WAY basename collision here (musig2's own
 //! `root.zig`, `bip340`'s `root.zig`, and `k256`'s `root.zig` — the same

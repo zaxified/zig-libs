@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep regression tests (wave GT). The sweep found no defect in
-//! slhdsa (see the 2026-10-29 panic-sweep report for `slhdsa`); these pin
-//! the "Clean" claims: every attacker-reachable verify entry answers false for
+//! slhdsa; these pin the "Clean" claims: every attacker-reachable verify entry answers false for
 //! malformed input and the signing entries refuse bad lengths with an error.
 const std = @import("std");
 const testing = std.testing;

@@ -27,17 +27,17 @@
 //! function of `Y` was reported as if it were a branch on `sk`: `encodeToCurve`'s
 //! try-and-increment (`H = encode_to_curve(PK_string, alpha)`, which every
 //! verifier recomputes from public inputs) and `proveExpanded`'s decode of `H`.
-//! That was 3 contexts, and 5 once A1 E14 made `stringToPoint` strict — all
+//! That was 3 contexts, and 5 once `stringToPoint` became strict — all
 //! five over-taint of a public value, none on `x` or `k` (measured with
-//! `--stacks`; see A1 `ecvrf.md` § Dispozice 2026-09-16 (ctgrind harness)).
-//! `KeyPair` (A1 E10) is that seam. The only code of the one-shot `prove` this
+//! `--stacks`).
+//! `KeyPair` is that seam. The only code of the one-shot `prove` this
 //! target does not execute is its own single line composing `expandSecretKey`,
 //! `mulBase` and `proveExpanded`, all three of which it does execute.
 //!
 //! A zero in-file count here therefore means "no branch on `x`, `prefix` or
 //! `k`", not "no branch on a function of `Y`".
 //!
-//! ## `verify` — DOCUMENTARY, not a constant-time claim (A1 E15)
+//! ## `verify` — DOCUMENTARY, not a constant-time claim
 //!
 //! `verify` has no secret: the key, `alpha` and the proof are all public, and
 //! SPEC.md says `verify` is variable-time by design. This target taints
@@ -46,7 +46,7 @@
 //! decode of `H`, `mulDoubleBasePublic`, and the `c == c'` verdict). None of
 //! them is a leak.
 //!
-//! ⛔ It does NOT prove what E15 asked for. E15 named the mutation
+//! ⛔ It does NOT prove what an earlier audit finding asked for. That finding named the mutation
 //! "`timing_safe.eql` → `std.mem.eql`" as green in every gate; measured
 //! 2026-09-16, that mutation is green HERE too — 7 / 7, same lines — because
 //! both forms end in one branch on a tainted equality at the same call site,

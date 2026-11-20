@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! No-panic sweep tests (wave GT, findings MI-1 .. MI-6), see
-//! the 2026-10-29 panic-sweep report for `montint`.
+//! No-panic sweep tests (wave GT, findings MI-1 .. MI-6), from
+//! the 2026-10-29 no-panic sweep of `montint`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

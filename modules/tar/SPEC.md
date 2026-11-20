@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `archive/tar` (Go 1.26.8) / tar-rs 0.4.46; GNU tar, busybox and pax archives read: pax `path`/`linkpath`/`size`/`uid`/`gid`/`uname`/`gname`/`mtime` incl. nanoseconds, sparse members (GNU old 'S', pax `GNU.sparse` 0.0/0.1/1.0; `-Dtar-sparse`), `checkPath`/`checkEntry`/`checkArchive` for extractors (surveyed 2026-11-04; consciously not done: pax 'g' application, arbitrary pax records, sparse writing, an extractor)
 
-**Audit:** review 2026-09-01 · mutation 2026-11-19 (66/68, 2 eq) · src d0d9dc0fda41cf7d
+**Audit:** review 2026-09-01 · mutation 2026-11-19 (66/68, 2 eq) · src 29db558f4ec033e2
 
 **Hardening:** fuzz 2026-11-04 (`TAR_FUZZ`: `reader`/`mutated` 30,000 runs and the new `sparse` harness 100,000 runs clean, Debug; `sparse` reach: `sparse_entry` 67,599 and `after_sparse` 58,793 of 100,000, i.e. past the sparse member to the one behind it) · ct n/a — archive reading (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: iterative `packDir` walk, unopenable files skipped before the header, short reads zero-padded and counted in `skipped`, `writeEntry` checked panic; delta audit 18/24 + 5 eq, 1 unkillable (needs a truncation race))
 

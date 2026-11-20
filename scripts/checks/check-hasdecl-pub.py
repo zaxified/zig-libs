@@ -8,8 +8,8 @@ selects an optional capability — "use the fast path if the sink has `tailPtr`"
 — therefore goes quietly false when the capability is declared without `pub`,
 and nothing fails: the slow path is correct, the tests stay green, only the
 speed is gone. That is how `brotli`'s fast literal loop (`Sink.tailPtr`) and
-`lzma`'s `FastSrc.peek` path were dead from the 0.17 migration until § FC of
-the maturity log (2026-10-27). The first sweep after that found a third one in
+`lzma`'s `FastSrc.peek` path were dead from the 0.17 migration until
+2026-10-27. The first sweep after that found a third one in
 `metrics/tools/bench.zig`: `const net_prefix` without `pub`, so every workload
 row was treated as a network one.
 

@@ -4,7 +4,7 @@
 
 WHY THIS EXISTS
 ---------------
-Ten dead-stack waves (2026-10-08..09, the owner's maturity log § AD..AP) found the
+Ten dead-stack waves (2026-10-08..09) found the
 same three shapes in every secret-holding module, each time with a
 hand-written stack probe and three ReleaseFast builds per module:
 
@@ -717,7 +717,7 @@ def read_baseline():
 
 HEADER = """\
 # Known findings of scripts/checks/check-secret-api.py, burned down by the
-# dead-stack campaign (the owner's maturity log, 2026-10). `--ratchet` fails on a
+# dead-stack campaign (2026-10). `--ratchet` fails on a
 # finding NOT listed here and on a row here that no longer fires -- delete it.
 # Never add a row by hand to get a new module past the gate: fix the shape,
 # or put `secret-api-ok: <reason>` above the function.

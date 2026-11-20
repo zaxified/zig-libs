@@ -910,8 +910,7 @@ jobs:
           # loaded host, harness builds not counted).
           lanes+=('{"name":"ctgrind portable amd64","args":"","cmd":"ctgrind-portable","cachekey":"portable-ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":90,"skip_live":""}')
 
-          # ⭐ INSTRUCTION COUNTS, added 2026-10-08 (scripts/count-insns, evaluated
-          # in CML's maturity tasks § AE): every module with a
+          # ⭐ INSTRUCTION COUNTS, added 2026-10-08 (scripts/count-insns): every module with a
           # `tools/count.tsv` is held to its counts per operation under
           # cachegrind -- a number the shared, noisy runner cannot move, unlike
           # a timing. A move of more than 2 % either way fails the lane: a

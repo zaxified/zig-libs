@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GV) for nftables' public API.
-//! Findings NF-1 .. NF-6, see the 2026-10-29 panic-sweep report for `nftables`.
+//! Findings NF-1 .. NF-6, from the 2026-10-29 no-panic sweep of `nftables`.
 //! Tests that need the private reply engines sit at the end of socket.zig.
 const std = @import("std");
 const builtin = @import("builtin");

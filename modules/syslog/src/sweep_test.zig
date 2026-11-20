@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! No-panic sweep tests (wave GY). Findings SL-*, see
-//! the 2026-10-29 panic-sweep report for `syslog`.
+//! No-panic sweep tests (wave GY). Findings SL-*, from
+//! the 2026-10-29 no-panic sweep of `syslog`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

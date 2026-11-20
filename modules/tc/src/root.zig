@@ -291,7 +291,7 @@ pub const default_recv_timeout_ms: u32 = 10_000;
 /// tick width is `1000 / CONFIG_HZ` ms and is a kernel build option, not a
 /// module or a caller decision — this host runs `CONFIG_HZ=1000` (1ms
 /// ticks, exact round-trip for whole milliseconds), but a `scripts/vm/`
-/// Debian guest measured 52ms back for a 50ms request (A1 tc.md F-VM1),
+/// Debian guest measured 52ms back for a 50ms request,
 /// consistent with a 4ms tick (`CONFIG_HZ=250`, a common distro default).
 /// Confirmed black-box on this host by requesting sub-millisecond values
 /// directly (`.zig-cache/probe/tc_f_vm1/probe.zig`): the read-back is

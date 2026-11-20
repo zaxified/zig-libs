@@ -6,7 +6,7 @@
 
 **Scope:** parity — liblzma 5.8.1 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-31 · mutation 2026-11-01 (498/568, 52 eq) · src 1f433032315ba741
+**Audit:** review 2026-10-31 · mutation 2026-11-01 (498/568, 52 eq) · src b877b71ab41a6033
 
 **Hardening:** fuzz 2026-10-20 (200,000 decoder runs + 5,000 round-trip runs clean, LZMA_FUZZ, every reach label hit; arbitrary and mutated streams of all four framings, synthetic .xz with correct header CRCs, chunked and failing readers and sinks, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed (keyword review, 2026-10-20) · panic 2026-10-31 (sweep + blind review: encoder offset wrap past 4 GiB, StreamWriter double finish, preset clamp, `max_output: ?u64` 256 MiB default; decoder clean; delta audit 19/20 + 1 argued)
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! No-panic sweep tests for dns, wave GV. Findings DN-1 .. DN-4, see
-//! the 2026-10-29 panic-sweep report for `dns`.
+//! No-panic sweep tests for dns, wave GV. Findings DN-1 .. DN-4, from
+//! the 2026-10-29 no-panic sweep of `dns`.
 const std = @import("std");
 const testing = std.testing;
 const netaddr = @import("netaddr");

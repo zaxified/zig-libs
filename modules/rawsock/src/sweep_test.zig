@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for rawsock (wave GS). Findings RS1 .. RS4 (the tests of the private
-//! helpers behind RS2/RS3 sit in filter.zig / root.zig and use `expectSurvives`), see
-//! the 2026-10-29 panic-sweep report for `rawsock`.
+//! helpers behind RS2/RS3 sit in filter.zig / root.zig and use `expectSurvives`), from
+//! the 2026-10-29 no-panic sweep of `rawsock`.
 //!
 //! Every body runs in a forked child: a panic, an overflow trap or a stack
 //! overflow kills the child, not the test binary, and the parent asserts it

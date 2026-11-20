@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! No-panic sweep tests (wave GY). Findings DF-*, see
-//! the 2026-10-29 panic-sweep report for `diskfree`.
+//! No-panic sweep tests (wave GY). Findings DF-*, from
+//! the 2026-10-29 no-panic sweep of `diskfree`.
 const std = @import("std");
 const testing = std.testing;
 const mounts = @import("mounts.zig");

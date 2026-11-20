@@ -6,7 +6,7 @@
 
 **Scope:** parity — RFC 9535 JSONPath complete (official compliance suite 715/715) with the query surface of theory/jsonpath v0.12.2 and serde_json_path 0.7.2: strict compile with the failure's offset, compile once and query many, Normalized Paths, `match()`/`search()` over RFC 9485 I-Regexp; jq's JSON-to-JSON language is another tool, refused below (surveyed 2026-11-02, gaps closed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (52/55, 2 eq) · src fd978eb3be01175b
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (52/55, 2 eq) · src 56f33588988d47cf
 
 **Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=3000000`, 3M seeds clean after the review fixes, ReleaseSafe, every reach label hit) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
 
