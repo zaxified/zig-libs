@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Sparse members (2026-11-04): GNU old 'S' and pax 0.0 / 0.1 / 1.0. The four
+//! Sparse members: GNU old 'S' and pax 0.0 / 0.1 / 1.0. The four
 //! fixtures are GNU tar 1.35's output for one synthetic 1 053 576-byte file with
 //! three data islands (`tar --sparse`, `-b 1`, recipe in `testdata/README`-free
 //! form below); Go's `archive/tar` reads the same four to the same SHA-256
@@ -620,7 +620,7 @@ pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     }
 }
 
-// ── fix round 2026-11-04 (independent review) ───────────────────────────────
+// ── fix round (independent review) ───────────────────────────────
 
 fn paxBlock(out: *std.ArrayList(u8), gpa: std.mem.Allocator, recs: []const [2][]const u8) !void {
     var px: std.ArrayList(u8) = .empty;
@@ -824,7 +824,7 @@ test "checkArchive: symlink chains through `..` after a name are refused" {
     }
 }
 
-// ── delta audit 2026-11-04: tests for the guards the first mutant set missed ──
+// ── delta audit: tests for the guards the first mutant set missed ──
 
 /// A source over `data` whose first read at offset `fail_at` fails with
 /// `ReadFailed`; every later read works. A reader that is not sticky would go on.

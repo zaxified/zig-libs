@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Support for tar's deterministic fuzz driver (added 2026-10-09): the source
+//! Support for tar's deterministic fuzz driver: the source
 //! adapter `testing.fuzz` feeds the harness through, and reach labels. The
 //! harness bodies and the driver tests live in `root.zig` beside the private
 //! corpus builder and checksum helper they share.

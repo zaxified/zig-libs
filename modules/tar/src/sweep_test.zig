@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for tar (wave GW). Findings TA-1 .. TA-3, from
-//! the 2026-10-29 no-panic sweep of `tar`. The hostile-archive tests at
+//! the no-panic sweep of `tar`. The hostile-archive tests at
 //! the end pin the reader's "clean" verdicts (they pass without any fix).
 const std = @import("std");
 const builtin = @import("builtin");
@@ -531,7 +531,7 @@ test "packDir: a destination that fails ends the call with WriteFailed (sweep au
     try testing.expectError(error.WriteFailed, tar.packDir(io, gpa, &.{root_path}, &w));
 }
 
-// ── extraction-safety API and sparse members (2026-11-04) ───────────────────
+// ── extraction-safety API and sparse members ───────────────────
 
 test "checkPath: refuses empty, NUL, absolute and `..` names by default" {
     const bad = [_]struct { p: []const u8, e: anyerror }{
@@ -652,7 +652,7 @@ test "sparse fixtures: every truncation of each is an error or a short read, nev
     }
 }
 
-// ── fix round 2026-11-04 ────────────────────────────────────────────────────
+// ── fix round ────────────────────────────────────────────────────
 
 test "checkEntry: a symlink target with `..` after a name is refused unless the policy allows it" {
     const sym = struct {

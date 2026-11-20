@@ -912,7 +912,7 @@ pub const Reader = struct {
     /// Skip `n` bytes in steps of at most 256 MiB. `std.Io.Reader.discardAll64`
     /// hands `discardShort` a `maxInt(usize)` limit, and on a 32-bit target
     /// (the router-tool consumer's mips / arm) `seek + n` overflows: a declared size of a few GiB
-    /// in a header panicked the reader under qemu-mips (2026-11-04, the
+    /// in a header panicked the reader under qemu-mips (the
     /// corpus test's 8 GiB claim). Found by running the tests there; a
     /// workaround here, not an upstream report.
     fn discard(self: *Reader, n: u64) ReadError!void {
@@ -2459,8 +2459,7 @@ test "record helper: the length prefix counts itself" {
 test "pax 'x' path overrides the header name; unused records are parsed past, padding skipped" {
     // What Python's tarfile (PAX_FORMAT, its default since 3.8), Go's
     // archive/tar and bsdtar write for a name over 100 bytes: a pax `path`,
-    // and a TRUNCATED name in the ustar field. Before 2026-09-30 this reader
-    // discarded the pax header and reported the truncated name.
+    // and a TRUNCATED name in the ustar field.
     const long = strRepeat("dir/", 30) ++ "file.txt"; // 128 bytes
     var rb: [3][256]u8 = undefined;
     const payload = try std.mem.concat(testing.allocator, u8, &.{
@@ -3287,7 +3286,7 @@ fn systemTar(gpa: Allocator, io: std.Io, cwd: std.Io.Dir, argv: []const []const 
 // a little-endian `u64`, returning the range MINIMUM when fewer remain, so
 // the length was 0 for every input a corpus can carry. The target had no
 // corpus either, so the one input it ever ran was empty and `Reader.next`
-// answered on its first short read. Measured 2026-09-07: 1 round, 0
+// answered on its first short read. Measured: 1 round, 0
 // non-empty inputs, 0 entries walked, 0 content octets read.
 //
 // ⚠ AND THE BUFFER WAS TOO SMALL FOR THE THREAT MODEL IT NAMES. At
@@ -3465,7 +3464,7 @@ test "corpus: every archive seed reaches the reader, and what it walks is pinned
             }
         }
     }
-    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 entries, 0 octets.
+    // Measured. Before: 1 round, 0 non-empty, 0 entries, 0 octets.
     try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 7), entries);
     try testing.expectEqual(@as(usize, 1556), octets); // 20 of real content + 1536 read against the 8 GiB size claim before the stream ran out
@@ -3576,8 +3575,7 @@ test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere"
 
 test "GNU tar --format=pax: a long name arrives through the pax 'x' header (external anchor)" {
     // The same archive shape Python's tarfile and Go's archive/tar write by
-    // default for a long name. Before 2026-09-30 this reader reported the
-    // truncated ustar name instead.
+    // default for a long name.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -3755,7 +3753,7 @@ test "GNU tar lists + extracts our pax-mode archive (external cross-check of the
     }
 }
 
-// ── mutation run 2026-10-04: one test per surviving mutant ─────────────────
+// ── mutation run: one test per surviving mutant ─────────────────
 
 /// Read every entry of `archive` and return the first `next()` error, or
 /// null when the archive reads cleanly.
@@ -3772,7 +3770,7 @@ fn firstReadError(archive: []const u8) !?ReadError {
 
 test "reader: a size near maxInt(u64) is BadHeader on every path, never a skip that overflows" {
     // The guards' own comments: no real archive needs a size this close to
-    // maxInt(u64), and `size + padding` would wrap. Mutation 2026-10-04:
+    // maxInt(u64), and `size + padding` would wrap. Mutation:
     // removing either guard survived -- a 'g' header reached
     // `discard(h.size + content_pad)` (a ReleaseSafe panic), a pax `size`
     // record was handed out as the entry's size.
@@ -3794,7 +3792,7 @@ test "reader: a size near maxInt(u64) is BadHeader on every path, never a skip t
 
 test "pax: a 'size' record applies to its own entry only" {
     // POSIX pax 'x': "the extended header records shall apply only to the
-    // following file". Mutation 2026-10-04: a pax size left set for the
+    // following file". Mutation: a pax size left set for the
     // NEXT entry survived; that entry would then be read 5 bytes long.
     var rb: [64]u8 = undefined;
     const payload = paxRecord(&rb, "size", "5");
@@ -3829,7 +3827,7 @@ test "pax: a 'size' record applies to its own entry only" {
 test "pax: an empty 'size' value deletes the keyword, the header's size stands" {
     // POSIX pax: "If the <value> field is zero length, it shall delete any
     // header block field ... of the same name" -- the readPax doc says the
-    // same. Mutation 2026-10-04: refusing `size=` survived.
+    // same. Mutation: refusing `size=` survived.
     var rb: [64]u8 = undefined;
     var abuf: [8 * block_size]u8 = undefined;
     var w: std.Io.Writer = .fixed(&abuf);
@@ -3846,7 +3844,7 @@ test "pax: the record length and a numeric value are plain decimal digits" {
     // POSIX pax record: "<length> <keyword>=<value>\n", length "a decimal
     // number"; `size` "a decimal number". `std.fmt.parseInt` alone also takes
     // a sign and `_` separators -- the digit loops are what refuse them.
-    // Mutation 2026-10-04: dropping either digit loop survived.
+    // Mutation: dropping either digit loop survived.
     var rb: [64]u8 = undefined;
     var abuf: [8 * block_size]u8 = undefined;
     var block: [block_size]u8 = undefined;
@@ -3863,7 +3861,7 @@ test "typeflag '7' (contiguous file) reads as a regular file with its content" {
     // POSIX ustar: '7' is "reserved to represent a file to which an
     // implementation has associated some high-performance attribute";
     // implementations without one treat it as a regular file, as GNU tar
-    // does (the `carries_content` comment above). Mutation 2026-10-04:
+    // does (the `carries_content` comment above). Mutation:
     // reporting it as `.other` survived.
     var abuf: [6 * block_size]u8 = undefined;
     var w: std.Io.Writer = .fixed(&abuf);
@@ -3882,7 +3880,7 @@ test "typeflag '7' (contiguous file) reads as a regular file with its content" {
 
 test "GNU 'L' record with an empty payload is BadHeader" {
     // `ReadError.BadHeader` doc: "bad 'L'-'K' size". An empty long name
-    // would leave the next entry nameless. Mutation 2026-10-04: accepting
+    // would leave the next entry nameless. Mutation: accepting
     // size 0 survived.
     var abuf: [6 * block_size]u8 = undefined;
     var w: std.Io.Writer = .fixed(&abuf);
@@ -3898,7 +3896,7 @@ test "GNU 'L' record with an empty payload is BadHeader" {
 test "GNU magic: bytes 345..500 are not a ustar prefix" {
     // GNU's old header (`struct oldgnu_header`, magic "ustar  \0") keeps
     // atime/ctime/offsets where POSIX ustar has `prefix`; reading them as a
-    // prefix would invent a directory. Mutation 2026-10-04: honouring the
+    // prefix would invent a directory. Mutation: honouring the
     // prefix under GNU magic survived.
     var block: [block_size]u8 = undefined;
     emitHeader(&block, "file", "", 0o644, 0, 0, 0, 0, '0');
@@ -3919,7 +3917,7 @@ test "checksum: all 8 field bytes count as spaces, and a signed sum is accepted"
     // ... treating each byte of the chksum field as a space", whatever those
     // bytes hold -- so a field written as 7 digits + NUL (no trailing space)
     // checks the same. And historical tars summed SIGNED bytes; GNU tar
-    // accepts either (the `verifyChecksum` doc). Mutation 2026-10-04: both a
+    // accepts either (the `verifyChecksum` doc). Mutation: both a
     // 7-byte space window and dropping the signed form survived.
     var abuf: [3 * block_size]u8 = undefined;
     @memset(abuf[block_size..], 0);
@@ -3945,7 +3943,7 @@ test "checksum: all 8 field bytes count as spaces, and a signed sum is accepted"
 test "writer: the ustar name/prefix limits are exact (100 / 155 bytes)" {
     // POSIX ustar: `name` is 100 bytes, `prefix` 155. A path one byte over
     // either needs the GNU 'L' record or a pax `path` record, and must come
-    // back whole. Mutation 2026-10-04: off-by-one limits in the GNU 'L'
+    // back whole. Mutation: off-by-one limits in the GNU 'L'
     // threshold and in `splitPrefix` (name 101, prefix 156) all survived --
     // the copy into the field silently truncated.
     const cases = [_]struct { path: []const u8, mode: LongNames }{
@@ -3970,7 +3968,7 @@ test "writer: 8 GiB - 1 is still octal; 8 GiB needs base-256, and a pax 'size' r
     // The 12-byte ustar size field holds 11 octal digits, at most
     // 0o77777777777 = 8 GiB - 1 (`writeSizeField` doc: base-256 only beyond,
     // as GNU tar does); `LongNames.pax` emits records "for exactly the fields
-    // that do not fit". Mutation 2026-10-04: moving either threshold by one
+    // that do not fit". Mutation: moving either threshold by one
     // survived -- the reader decodes both encodings, so only the bytes show it.
     var abuf: [4 * block_size]u8 = undefined;
     var w: std.Io.Writer = .fixed(&abuf);
@@ -4004,7 +4002,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

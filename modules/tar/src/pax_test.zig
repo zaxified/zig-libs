@@ -3,7 +3,7 @@
 //! pax extended headers: external anchors for the READ direction, hand-computed
 //! bytes and round trips for the WRITE direction.
 //!
-//! READ anchors (`testdata/read_pax_*.tar`, produced 2026-09-30 by real tools,
+//! READ anchors (`testdata/read_pax_*.tar`, produced by real tools,
 //! never by this module; each is < 10 KiB — GNU tar with `-b 1`, Python with
 //! `tarfile.RECORDSIZE = 512`, so there is no 10240-byte record padding):
 //!
@@ -457,7 +457,7 @@ test "pax mode still refuses a mode that does not fit (there is no pax keyword f
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
