@@ -8,12 +8,9 @@ counterpart to the sibling [`bn254`](../bn254/) module's Groth16 *verifier*
 accepts. Construction: Groth 2016, *"On the Size of Pairing-based
 Non-interactive Arguments."*
 
-**Status: implemented.** The entire mechanical + math layer AND the prover
-core (`setup` + `prove`) are implemented and anchored. `gate.
-prover_core_implemented` is `true`; the flag is retained as a self-documenting
-marker of the scaffold→core boundary, not a live switch — `setup`/`prove` no
-longer `@panic`. The core was an **Opus** task, not a Fable one, because the
-`bn254` verifier is a complete deterministic anchor (see [SPEC.md](SPEC.md)).
+The prover core (`setup` + `prove`, over a hand-built R1CS and a toy CRS) and the snarkjs ecosystem layer
+(`.zkey`/`.wtns`/`.r1cs`/`.ptau` readers, the zkey prover, phase-2 setup/contribute/verify) are implemented and
+anchored by the `bn254` verifier and by real `snarkjs`/`circom` files (see [SPEC.md](SPEC.md)).
 
 ## What is real today
 
@@ -40,9 +37,8 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 
 Correctness is anchored by the sibling `bn254` module's Groth16 verifier:
 `prove(setup(…)) → bn254.groth16Verify == true`, and any tampered proof/public
-input → `false`. That end-to-end test now runs (the core is implemented).
-Today's teeth come from the sub-anchors that run independently, plus the
-end-to-end test itself:
+input → `false`. The anchor is that end-to-end test plus the sub-anchors that
+run independently of it:
 
 - **NTT round-trip:** `intt(ntt(v)) == v`.
 - **FFT vs schoolbook:** `fft.mulViaFFT == poly.mulSchoolbook`.
@@ -76,7 +72,8 @@ const w = try groth16.circom.parseWitness(gpa, wtns_bytes); // circom `.wtns`
 defer groth16.circom.freeWitness(gpa, w); // wipes, then frees
 
 // Fresh r, s for EVERY proof. Secrets go in by pointer; the caller wipes them.
-var rand: groth16.Randomizers = .{ .r = groth16.Fr.random(io), .s = groth16.Fr.random(io) };
+var rand: groth16.Randomizers = undefined;
+groth16.Randomizers.randomInto(&rand, io); // draws straight into `rand`, no copy in this frame
 defer std.crypto.secureZero(u8, std.mem.asBytes(&rand));
 const proof = try groth16.zkprove.prove(gpa, z, w, &rand);
 std.debug.assert(try groth16.verify(z.verifyingKey(), proof, w[1 .. z.n_public + 1]));
@@ -129,11 +126,29 @@ ceremony instead of materialising these five scalars directly. `ToxicWaste`
 carries a `deinit()` that zeroes all five fields; `setup` also wipes its own
 internal copy on every exit.
 
+## Limits
+
+- **Proofs are malleable** (Groth16 itself): never use proof bytes as a nullifier or replay key.
+- **`verify` trusts the verifying key.** It validates the proof (on-curve, G2 subgroup), not the key; a key from a
+  `.zkey` is only as trustworthy as whoever made it (`phase2.verify` checks it against the circuit and the `.ptau`).
+- **`zkprove.prove` is variable-time in the witness** (Pippenger MSM); `proveWith(…, .{ .msm = .constant_time })` is
+  the constant-time choice, about 21× slower.
+- **`setup` is a toy**: the toxic waste is in memory. Real keys come from a ceremony (`phase2`).
+- `zkprove` refuses a `2^28` domain (`DomainTooLarge`); files are read from memory, not streamed.
+
+SPEC.md § 5b has the reasons and the residual risks.
+
+## Not provided
+
+No multi-threading, Solidity verifier or calldata export, witness calculation, circuit DSL, PLONK or other curves, and
+snarkjs's own `zkey verify` rejects keys made or contributed here. What is deliberately refused is in SPEC.md *What is
+deliberately not done*; what is wanted and open is in *Backlog / deferred*.
+
 ## Verify
 
 ```
-zig build test-groth16                       # Debug: all tests pass, none gated
-zig build test-groth16 -Doptimize=ReleaseFast
+scripts/modtest groth16
+scripts/modtest groth16 -Doptimize=ReleaseFast   # also runs the stack-probe and heap-wipe tests
 zig fmt --check modules/groth16
 ```
 

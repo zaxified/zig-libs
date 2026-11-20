@@ -22,7 +22,7 @@ document answers *how/why it is built and what could go wrong*.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; re-surveyed 2026-10-05 (stars and activity as of that date). Foreign source was not read for any row; claims come from READMEs, release pages, registries (npm, crates.io, the Go module proxy) and LICENSE files, and are marked *(inferred)* where they do not. Verdict re-assessed 2026-10-05 after the 2026-10-02 snarkjs-ecosystem work (A8) landed (mvp → core).
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; re-surveyed 2026-10-05 (stars and activity as of that date). Foreign source was not read for any row; claims come from READMEs, release pages, registries (npm, crates.io, the Go module proxy) and LICENSE files, and are marked *(inferred)* where they do not.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -34,9 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; re-surveyed 2026-10-05 (stars and 
 | [Consensys/gnark](https://github.com/Consensys/gnark) | Go | Apache-2.0 (LICENSE) | 1.7k | v0.16.3 (2026-08-24) | Circuit DSL, Groth16 + PLONK on several curves, Solidity verifier export (BN254 primary), audited; own README warns serialized formats are unstable across versions. MPC setup support *(inferred, not in README)*. |
 | Zig ecosystem (GitHub search `groth16` / `snark` with `language:Zig`, 2026-10-05) | Zig | — | 0 | — | Nothing comparable: `groth16` finds no Zig repository; `snark` finds only `c0utin/znark` ("zk-SNARK library", 0 stars, no licence declared; not read). Nothing in Zig `std`. |
 
-**Where we are ahead:** the only Zig Groth16 prover we know of, pure Zig over the in-repo `bn254`. It reads snarkjs's `.zkey` and circom's `.wtns`/`.r1cs` and proves against them (`zkprove`); a real `snarkjs@0.7.6` accepts those proofs — pinned byte for byte on the committed fixture, and on a 10 000-constraint circuit in a manual `tools/snarkjs/gen.sh big` run at 1.9 s on one core against snarkjs's 1.8 s on all of them. Against rapidsnark, the native prover a Zig user would otherwise shell out to, we add phase 2: `phase2.newZkey` reproduces `snarkjs groth16 setup` byte for byte apart from the circuit hash, `phase2.contribute` produces keys snarkjs proves with, and `phase2.verify` checks a downloaded key against its `.r1cs` and `.ptau`. **Where we are even:** the main use case — circom circuit, real ceremony `.zkey`, `.wtns` → proof, verify, `proof.json`/`public.json`/`verification_key.json` that snarkjs reads (rapidsnark's whole feature set, minus speed). **Where we are behind (→ Backlog):** single-threaded (rapidsnark, snarkjs, arkworks, bellman and gnark all use every core); no Solidity verifier / calldata export (snarkjs, gnark, ark-circom); no reading of snarkjs's `proof.json`/`verification_key.json`; no witness calculation (ark-circom runs circom's WASM; here the `.wtns` comes from circom's own generator, as for rapidsnark); snarkjs's `zkey verify` rejects keys made or contributed here (§ 4b); files must be in memory; no `.ptau` phase 1 (reading only); no circuit DSL; BN254 only; no PLONK.
-
-**Re-surveyed 2026-10-05.** The 2026-09-30 row for snarkjs said "we prove only a hand-built R1CS against a toy CRS"; two days later A8 added the `.zkey`/`.wtns`/`.r1cs`/`.ptau` readers, the zkey prover with Pippenger MSM, and phase-2 setup/contribute/verify, all checked against snarkjs in both directions. With that, every step of the main use case works and is checked against the reference, and what remains (speed, Solidity export, snarkjs `zkey verify` interop, streaming for very large ceremony files) is either done by snarkjs on the same files or hit only by large circuits and ceremony coordinators — `core`, not `parity`. Corrections to the 2026-09-30 table: arkworks-rs/groth16 is at 0.6.0 on crates.io (2026-04), not 0.3.0; bellman shipped 0.15.0 (2026-09-26); ark-circom added.
+**Where we are ahead:** the only Zig Groth16 prover we know of, pure Zig over the in-repo `bn254`. It reads snarkjs's `.zkey` and circom's `.wtns`/`.r1cs` and proves against them (`zkprove`); a real `snarkjs@0.7.6` accepts those proofs — pinned byte for byte on the committed fixture, and on a 10 000-constraint circuit in a manual `tools/snarkjs/gen.sh big` run at 1.9 s on one core against snarkjs's 1.8 s on all of them. Against rapidsnark, the native prover a Zig user would otherwise shell out to, we add phase 2: `phase2.newZkey` reproduces `snarkjs groth16 setup` byte for byte apart from the circuit hash, `phase2.contribute` produces keys snarkjs proves with, and `phase2.verify` checks a downloaded key against its `.r1cs` and `.ptau`. **Where we are even:** the main use case — circom circuit, real ceremony `.zkey`, `.wtns` → proof, verify, `proof.json`/`public.json`/`verification_key.json` that snarkjs reads (rapidsnark's whole feature set, minus speed). **Where we are behind (→ Backlog):** single-threaded (rapidsnark, snarkjs, arkworks, bellman and gnark all use every core); no Solidity verifier / calldata export (snarkjs, gnark, ark-circom); no witness calculation (ark-circom runs circom's WASM; here the `.wtns` comes from circom's own generator, as for rapidsnark; see *What is deliberately not done*); snarkjs's `zkey verify` rejects keys made or contributed here (§ 4b); files must be in memory; no `.ptau` phase 1 (reading only); no circuit DSL; BN254 only; no PLONK (the last three: *What is deliberately not done* and *Backlog / deferred*).
 
 ## 1. Construction
 
@@ -89,17 +87,16 @@ repo to reuse: `bfv`'s NTT is over word-size NTT primes (`Z_q`), not `Fr`;
 accumulation loop, not an exported MSM. All four (`poly`/`domain`/`fft`/`msm`
 + `r1cs`/`qap`) are new here, built clean-room from the construction.
 
-## 3. Phase-1 scope + sub-split
+## 3. Scope
 
-**Real + ungated (this scaffold):** everything feeding the prover —
-`field`, `poly` (incl. exact division by `Z=x^n−1`), `domain` (roots of unity,
-vanishing poly), `fft` (radix-2 NTT/INTT + FFT multiply), `msm` (naive `G1`/
-`G2`), `r1cs` (constraint system + satisfaction), `qap` (interpolation + the
-`A·B−C` divisibility oracle). Plus the deliberately-broken positive control.
+**Ungated, everything feeding the prover:** `field`, `poly` (incl. exact division by `Z=x^n−1`), `domain` (roots of
+unity, vanishing poly), `fft` (radix-2 NTT/INTT + FFT multiply), `msm` (naive `G1`/`G2`, and Pippenger), `r1cs`
+(constraint system + satisfaction), `qap` (interpolation + the `A·B−C` divisibility oracle), plus the deliberately
+broken positive control `prover.brokenProof`.
 
-**Prover core (Part 2, now shipped — `gate.prover_core_implemented = true`):**
-`prover.setup` (toy trusted setup) and `prover.prove` (the proof assembly).
-The end-to-end `prove→verify` anchor runs green (see §6).
+**Prover core:** `prover.setup` (toy trusted setup) and `prover.prove` (the proof assembly); the end-to-end
+`prove → bn254.groth16Verify` anchor runs unconditionally (`gate.prover_core_implemented` is the retained marker of
+the scaffold→core boundary, not a switch). See § Verification.
 
 ## 4. CRS approach — toy setup for the algebra, snarkjs files for real use
 
@@ -108,18 +105,17 @@ Two paths, both live:
 - **Toy trusted setup (`prover.setup`).** Samples the CRS from an explicit,
   INSECURE toxic waste. Self-contained and deterministic: the algebra anchor
   (`prove → bn254.groth16Verify`) needs nothing but this repo.
-- **The snarkjs ecosystem (2026-10-02).** `zkey`/`circom`/`ptau` read the
+- **The snarkjs ecosystem.** `zkey`/`circom`/`ptau` read the
   files, `zkprove.prove` proves from a `.zkey` and a `.wtns`, and `phase2`
   replaces the toxic waste with a real ceremony: `newZkey(r1cs, ptau)` (δ = 1,
   every secret behind the `.ptau`), `contribute` (δ ← x·δ, C and H ← x⁻¹·…),
   `verify` (is this a well-formed key for this circuit over this ceremony, for
   SOME δ).
-
 ### 4a. What was learned about the formats, and how
 
 Black box only: snarkjs and circom are GPL-3.0, so their source was not read
-for any of this. (One earlier exception, the August 2026 JSON exporter, is
-recorded under § 5 — closed by a clean-room review on 2026-10-02.) Every
+for any of this. (One earlier exception, the JSON exporter's first version, is
+recorded under § 5a — closed by a clean-room review.) Every
 layout fact in `snarkjs_bin.zig`/`zkey.zig`/`ptau.zig`/`circom.zig` came
 from comparing the bytes they write with the decimals their own `export json`
 prints, or from testing a hypothesis against the files. The non-obvious ones:
@@ -137,7 +133,6 @@ prints, or from testing a hypothesis against the files. The non-obvious ones:
   `A[m + i][i] = 1` per public signal.
 - The `.ptau` Lagrange basis is over this module's own domain
   (`Σ ωⁱ·Lᵢ(τ) = [τ]₁`, checked).
-
 ### 4b. Where compatibility stops
 
 - **Circuit hash.** zkey section 10 starts with a 64-byte hash snarkjs computes
@@ -152,6 +147,16 @@ prints, or from testing a hypothesis against the files. The non-obvious ones:
   snarkjs record and snarkjs's `zkey verify` cannot check one of ours
   ("Inconsistent transcript"). `phase2.verify` does not depend on either: it
   checks the key itself.
+### 4c. Reading snarkjs's JSON
+
+`snarkjs_import.parseProof`, `parseVerifyingKey` (with `freeVerifyingKey`) and `parsePublic` read exactly the shape
+`snarkjs_export` writes (`snarkjs_import.zig:157,171,201,207`): canonical decimal strings, G1 as `[x,y,"1"]`, G2 as
+`[[x0,x1],[y0,y1],["1","0"]]` in math order, `"protocol": "groth16"` and `"curve": "bn128"` required, the infinity
+literals accepted, `nPublic` cross-checked against the `IC` length, unknown members such as `vk_alphabeta_12`
+ignored. It refuses, each as its own `ImportError`: invalid JSON, a wrong shape, a wrong protocol or curve, a
+non-canonical number (empty, sign, leading zero, non-digit, too large, or `>= p` / `>= r`), a point off the curve or
+the twist, a G2 point outside the order-`r` subgroup, an `nPublic` mismatch (`snarkjs_import.zig:29`). The export
+tests' values round-trip, and snarkjs's own fixture proof verifies under the parsed key.
 
 ## 5. The Fable-vs-Opus tier call — **this core is Opus, not Fable**
 
@@ -190,10 +195,9 @@ prover has nowhere to hide: the verifier is the ground truth and it is in-repo.
 This is a valid, valuable finding — not every "F-vein" task is Fable, and
 saying so protects the Fable budget for cores that actually need it.
 
-**Recommendation: Phase 2 (the toy-setup + `prove` core) goes to Opus.** Fable
-is not warranted for any part of this module.
+**Recommendation (followed): the Groth16 core is an Opus task.** Fable is not warranted for any part of this module.
 
-### 5a. Correction (2026-08-02) — the "complete oracle" claim had one blind spot
+### 5a. The oracle's one blind spot, and how it was closed
 
 The tier call above is right about the **algebra**: `bn254.groth16Verify` does
 catch any wrong QAP coefficient, witness index, sign, or randomizer. But it is
@@ -206,38 +210,27 @@ bytes, not another reading of the same in-repo types.
 
 Closed: `src/snarkjs_export.zig` renders this module's `Proof`/
 `VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses
-(every rule now backed by a run — snarkjs's output files, its verdict on our
-proof, and `gen.sh json` for the identity points; see the provenance note
-below), and
+(every rule backed by a run — snarkjs's output files, its verdict on our
+proof, and `gen.sh json` for the identity points), and
 `src/snarkjs_kat_test.zig` freezes a run of the real, independently
 -authored `snarkjs@0.7.6` (GPL-3.0, black box, never vendored)
 accepting a proof from this module's own `setup`/`prove` — first try, no
 serialization deviation found — and rejecting a one-limb-tampered copy. See
 that file's module doc comment for the full transcript (including a Bun
 -runtime crash on the literal CLI invocation, worked around without touching
-snarkjs's own verification logic) and this module's anchor record (`SPEC.md` § Anchoring) for
-the bookkeeping. What remains self-oracle, correctly: the QAP/R1CS layer —
+snarkjs's own verification logic) and § Anchoring for the bookkeeping. What remains self-oracle, correctly: the QAP/R1CS layer —
 `snarkjs` was only ever shown the final group elements, never our R1CS, so it
 has no opinion on whether a proof corresponds to its circuit's intended
 semantics. That is a legitimate end state (no external vector exists for a
 custom circuit's intermediate polynomials), not remaining anchor debt.
 
-**Provenance (2026-10-02).** The exporter's August 2026 doc said its shape was
-read out of snarkjs's bundled source and called snarkjs Apache-2.0 — it is
-GPL-3.0, as is ffjavascript. Clean-room check: one isolated reviewer read the
-GPL source and this module and returned verdicts only (no code, no names);
-the module's code is behaviour-only or independent everywhere, with a few
-weak, format- or math-forced structural matches (zkey contribution field
-names that also appear in snarkjs's logs; the textbook accumulation order of
-the proof terms; two helper names, since renamed). The defect was the
-comments, which cited the reference's internals; they are rewritten, and each
-JSON rule is now established by running the tools (`tools/snarkjs/gen.sh`).
+**Clean-room status.** snarkjs and ffjavascript are GPL-3.0. One isolated reviewer read that source and this module and
+returned verdicts only (no code, no names): the module's code is behaviour-only or independent everywhere, with a few
+weak, format- or math-forced structural matches (zkey contribution field names that also appear in snarkjs's logs; the
+textbook accumulation order of the proof terms). Each JSON rule is established by running the tools
+(`tools/snarkjs/gen.sh`), and the comments cite behaviour, not the reference's internals.
 
 ## 5b. Threat model
-
-⚠ **This section did not exist until 2026-09-03**, though the document's first
-line has promised a threat model since the file was written. Two things a
-Groth16 consumer has to be told, and neither was anywhere in SPEC or README.
 
 **1. Proofs are MALLEABLE. Never use proof bytes as a nullifier or replay key.**
 Given a valid `(πA, πB, πC)` and any nonzero scalar `k`, the pair
@@ -255,34 +248,35 @@ re-export of `bn254.groth16Verify`, which validates the untrusted PROOF — an
 G2 point `B`, so the classic Groth16 G2-subgroup bug is not present. The
 verifying key is trusted verbatim. `bn254` states that boundary; this module's
 re-export repeated none of it. A `vk` an attacker supplies is a `vk` an attacker
-can forge proofs against. (Since 2026-10-03 `zkey.parse` refuses β₂/γ₂/δ₂ and every
+can forge proofs against. (`zkey.parse` refuses β₂/γ₂/δ₂ and every
 contribution's `g2_spx` outside `G2`, closing the relation audit's LOW on
 `g2_spx`; a vk from a parsed `.zkey` therefore has subgroup points, but a
 parsed `.zkey` is still only as trustworthy as whoever made it.)
 
 **3. The evaluation domain is part of the statement.** `setup`, `prove` and
 `qap.checkDivisible` all refuse a constraint system larger than the domain
-(`error.DomainTooSmall`). Until 2026-09-03 that was a `std.debug.assert`, and in
-ReleaseFast the circuit was silently TRUNCATED to fit — the CRS then being built
-from the truncated circuit, so the dropped constraints were absent from the
-statement the verifier checks, with nothing at any layer reporting it.
+(`error.DomainTooSmall`, `prover.zig:259,370`, `qap.zig:40`). The refusal is an error in every build mode, never an
+assert: a circuit silently truncated to fit would give a CRS built from the truncated circuit, so the dropped
+constraints would be absent from the statement the verifier checks, with nothing at any layer reporting it.
+`zkprove` refuses a `2^28` domain (`ProveError.DomainTooLarge`, `zkprove.zig:47`: the coset needs a `2^29`-th root of
+unity, which `Fr` does not have) and a witness whose length is not the key's `n_vars` (`WitnessMismatch`);
+`phase2.newZkey` refuses `CircuitTooLarge` and `PtauTooSmall` (`phase2.zig:62`).
 
 **4. The zkey prover's default MSM is variable-time in the witness.**
 `msm.pippengerG1`/`pippengerG2` pick buckets by scalar digits and branch on
 empty buckets — the trade snarkjs, rapidsnark, arkworks and gnark all make. A
 co-resident attacker who can time or cache-probe the prover learns about the
-witness. Since 2026-10-09 `zkprove.proveWith(…, .{ .msm = .constant_time })`
+witness. `zkprove.proveWith(…, .{ .msm = .constant_time })`
 is the alternative: one constant-time `scalarMul` per term, same proof byte
 for byte (`snarkjs_files_test.zig`), measured by `src/ctgrind_harness.zig`
 with the private witness and `r`/`s` tainted — 6 in-file contexts, all
 `toAffine` on the three published proof points, none in the MSM, the NTTs or
 the A·w/B·w accumulation; the Pippenger row of the same harness (the positive
-control) reads 26 (54 on Zig 0.17.0: LLVM 22 unrolls the per-bit branch of the small-MSM path, same branch at more addresses). It costs ~21× the default: 34 s against 1.6 s at 10 000
+control) must read at least 10 (`scripts/checks/ctgrind-expected.tsv`). It costs ~21× the default: 34 s against 1.6 s at 10 000
 constraints, one core, ReleaseFast (`tools/snarkjs/g16 prove-ct`; snarkjs
 verified that proof). `zkprove.prove` stays Pippenger, the default every
 other prover has. The toy `prove` uses the constant-time naive MSM.
 `contribute`'s secret goes through `bn254`'s constant-time `scalarMul` only.
-
 **5. A `.zkey` is trusted by the prover; `phase2.verify` is how it earns that.**
 `zkey.parse` checks that every point is on its curve and every index is in
 range, so a hostile file cannot crash the prover or make it read out of
@@ -296,49 +290,72 @@ others have checked.
 
 **6. A contribution record is a consistency proof, not a proof of knowledge.**
 `g2_sp` is `[h]₂` for a public hash `h`, so `[x]₂` can be read off any record
-and a valid record for `x' = k·x_prev` written without knowing `x'` (review
-2026-10-02). The ceremony still ends at an unknown δ if one contributor was
+and a valid record for `x' = k·x_prev` written without knowing `x'` (found by review). The ceremony still ends at an unknown δ if one contributor was
 honest — fixing δ to a known value needs `[1/δ_before]₂`, which nothing
 reveals — but `verifyContribution` does not prove who knew what. Hash-to-G2
 is the fix (backlog). `verify` checks neither the circuit hash nor the
 records before the last; it checks the key.
 
-## 6. Verification harness — teeth today
+**7. Readers refuse before they allocate.** `.r1cs` requires section 3, which pays 8 bytes per wire and so bounds
+`n_wires` by the file's size (`circom.zig:116-120`); `zkey` checks every section size against the header counts before
+allocating from one (`zkey.zig:179-271`). A 400-byte file cannot announce 2³² wires.
 
-Runs today, no gated code (see `fft.zig`/`msm.zig`/`qap.zig`/`prover.zig`
-tests):
+**8. Secrets leave nothing on the dead stack.** `prover.setup`, `prover.prove`, `zkprove.prove`, `phase2.contribute`
+and `circom.parseWitness` take their secrets by pointer (`*const ToxicWaste`, `*const Randomizers`, `*const Fr`), run
+their bodies one frame down and zero the stack that body dirtied (`src/burn.zig`); `msm.pippengerG1/G2` wipe their limb
+and bucket scratch before freeing it. `Randomizers.randomInto(out, io)` (`prover.zig:86`) draws both scalars through
+`bn254.Fr.randomInto` straight into the caller's storage, so no copy stays in the caller's frame. `src/stackprobe_test.zig`
+(ReleaseFast only) pins it: toxic waste and everything derived from it, the witness, `r`, `s`, `r·s`, the QAP evaluations
+and quotient and the `r·δ`/`s·δ`/`r·s·δ` points as needles, plus the `Randomizers.randomInto` draw — 0 residues, with
+a negative and a positive control in the same binary. Residual risks: the caller's own copies (the `Randomizers` and
+`ToxicWaste` variables, the witness vector) are the caller's to wipe (`circom.freeWitness` does it for the
+`parseWitness` result); the `.wtns` and `.zkey` file bytes the caller read in are out of reach; and the helpers that
+take a witness slice and run in the caller's frames — `r1cs.System.isSatisfied`/`evalConstraint`,
+`qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are not burned (a consumer calling them on a real
+witness does its own `burn.run`-style wrapper; Backlog item 0).
 
-- **Sub-anchors.** NTT round-trip identity; `fft.mulViaFFT == poly.mulSchoolbook`;
-  `msm` single-term/linearity `==` `G.scalarMul`; `domain` root-of-unity
-  primitivity (`ω^n==1 ∧ ω^{n/2}≠1`), points vanish under `Z`.
-- **QAP divisibility oracle.** `qap.checkDivisible` `==` `r1cs.isSatisfied`
-  over a swept family of witnesses (satisfying and non-satisfying) — the
-  self-contained proof that the interpolation/vanishing-division stack is
-  correct.
-- **Positive control.** `bn254.groth16Verify` REJECTS `prover.brokenProof()`
-  (generator points — not a real proof), proving the end-to-end anchor has
-  teeth before `prove` exists.
+## Verification
 
-End-to-end (now live — `gate.prover_core_implemented == true`, Part 2):
+Run: `scripts/modtest groth16` (add `-Doptimize=ReleaseFast` for the stack probe and the heap-wipe tests, which only
+run in an optimised build). Test classes:
 
-- **End-to-end.** `prove(setup(…)) → bn254.groth16Verify == true` on a
-  non-trivial circuit (4 constraints, 3 public inputs: `out1=x²`, `out2=y²`,
-  `out3=(x+y)²`); tampered proof (negated `πA`/`πC`) / wrong public input /
-  non-satisfying witness → `false`.
+- **Sub-anchors** (`fft.zig`, `msm.zig`, `qap.zig`, `prover.zig`, `domain.zig`): NTT round-trip identity;
+  `fft.mulViaFFT == poly.mulSchoolbook`; `msm` single-term/linearity `==` `G.scalarMul`; `domain` root-of-unity
+  primitivity (`ω^n==1 ∧ ω^{n/2}≠1`), points vanish under `Z`; Pippenger against the naive MSM across sizes and
+  window widths (`runWindow` driven directly for the widths no test size reaches).
+- **QAP divisibility oracle.** `qap.checkDivisible` `==` `r1cs.isSatisfied` over a swept family of witnesses
+  (satisfying and not) — the self-contained proof that the interpolation/vanishing-division stack is correct.
+- **Positive control.** `bn254.groth16Verify` REJECTS `prover.brokenProof()` (generator points, not a real proof).
+- **End-to-end** (`harness_test.zig`). `prove(setup(…)) → bn254.groth16Verify == true` on a non-trivial circuit
+  (4 constraints, 3 public inputs: `out1=x²`, `out2=y²`, `out3=(x+y)²`); tampered proof (negated `πA`/`πC`), wrong
+  public input and non-satisfying witness → `false`.
+- **snarkjs/circom fixtures** (`snarkjs_files_test.zig`, `snarkjs_kat_test.zig`; see § Anchoring): the foreign
+  files read and round-tripped byte for byte, both proving directions, `newZkey`, `phase2.verify` verdicts per
+  tampering, the JSON exporter (`snarkjs_export.zig`) and importer (`snarkjs_import.zig`, round trip, snarkjs's own files, refusals).
+- **Audit tests** (`audit_test.zig`, and in `phase2.zig`, `qap.zig`, `msm.zig`): the `2^28`-th root of unity pinned to
+  the ark-bn254 / snarkjs constant (generators 5 and 7 give the same root for every domain up to `2^5`, so small
+  fixtures cannot tell them apart); every reader refusal reached through its own guard; the contribution transcript
+  pinned by an independent derivation; the circuit hash pinned and sensitive to each of its six sections; `newZkey`'s
+  domain rule on circuits with coefficients and on exact powers of two (against this module's own rule, not snarkjs;
+  Backlog item 7).
+- **Fuzz** (`fuzz_test.zig`): `GROTH16_FUZZ=<runs>[,<first seed>]` through testkit's deterministic driver. It damages
+  the real snarkjs/circom fixtures with aim at the structure (section table, header counts, flips, truncation,
+  reordered sections, random bytes) and requires: no crash, hang or leak; an intact file accepted; `write(parse(x))`
+  a fixed point for zkeys; a parsed key provable and `phase2.verify`-able without a bounds trip; `.wtns` round trip;
+  a reach test fails the suite if a reader stops accepting or refusing some inputs. Proof/verifying-key verification
+  is fuzzed in `bn254`.
+- **Stack probe** (`stackprobe_test.zig`, ReleaseFast/ReleaseSmall only): § 5b item 8. The wipes of `freeWitness` and of
+  the Pippenger bucket array are visible only there, because `Allocator.free` poisons the block in Debug and
+  ReleaseSafe before the allocator sees it.
+- **ctgrind** (`scripts/checks/ctgrind.sh groth16`, `ctgrind_harness.zig`, not part of the test lane): row `zkprove_ct`
+  (the claim, 6 in-file contexts, all `toAffine` on the published proof points) and row `zkprove_vt` (the positive
+  control, at least 10). The wipes of the six `secureZero` defers of `prover.prove` and of `x_inv` in `contribute` are
+  shadowed by the entry point's burn, so no test can see them (belt and braces).
+- **Interop oracle** (manual, needs node and a circom build: `tools/snarkjs/gen.sh fixtures|ours|big|json`;
+  `tools/snarkjs/g16.zig` is the command line). The 10 000-constraint `big` run is not committed.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-All pass, Debug **and** ReleaseFast.
-
-## 7. Deferred increments (out of Phase 1)
-
-- ~~The prover core itself~~ (done), ~~snarkjs `.zkey`/`.wtns` ingestion and
-  the snarkjs cross-check~~ and ~~Pippenger MSM~~ (done 2026-10-02, A8; the
-  runtime-sized domain came with them — `zkprove` has no `2^14` cap, only
-  `Fr`'s `2^27` for the doubled coset). What remains is in § Backlog.
-- A circuit / gadget DSL (hand-built R1CS or circom's `.r1cs` only, for now).
-- Universal / updatable setup, custom gates, **PLONK / Halo2** — deliberate
-  scope non-goals: the backlog flags these as the scope-explosion Groth16 was
-  chosen to avoid.
-- Proof recursion / aggregation.
 
 ## 8. Provenance
 
@@ -359,21 +376,6 @@ is this module's own output. The files hold field elements and curve points
 computed from those inputs, not code or text of either project.
 
 
-## Fuzz harness
-
-The old EMIT-ONLY exemption ended with the file readers (2026-10-02), as it
-said it would. `src/fuzz_test.zig` damages the real snarkjs/circom fixtures
-with aim at the structure (section table, header counts, flips, truncation,
-reordered sections, random bytes) and requires: no crash, hang or leak; an
-intact file accepted; `write(parse(x))` a fixed point for zkeys; a parsed key
-provable and `phase2.verify`-able without a bounds trip; `.wtns` round trip.
-First verdict run (8 × 20 000 seeds, ReleaseSafe) found two defects, both from
-one root — `.r1cs` took `n_wires` from the header unchecked, so a 400-byte
-file announced 2³² wires (OOM in the caller's witness allocation; at 10⁸
-wires ten seconds of memset). Fixed by requiring section 3, which pays
-8 bytes per wire; plus `zkey` now checks every section size before allocating
-from a header count. Second run: 160 000 inputs clean in 74 s.
-
 ## Anchoring
 
 **Anchor grade:** class B · oracle MIXED
@@ -383,107 +385,34 @@ from a header count. Second run: 160 000 inputs clean in 74 s.
 
 **What the tests actually contain.** Foreign: real snarkjs@0.7.6 / circom 2.2.3 files in `src/testdata/snarkjs` (made by `tools/snarkjs/gen.sh`); snarkjs's own proof verifies under our parsed key; our proof from snarkjs's key is pinned byte for byte and was accepted by snarkjs's verifier (a one-limb tamper rejected); `newZkey` equals `groth16 setup` byte for byte outside the circuit hash; `phase2.verify` accepts snarkjs's keys and names what each of seven tamperings broke. Self: the QAP/R1CS layer of hand-built circuits (`qap.checkDivisible == r1cs.isSatisfied`) and our own contribution proof.
 
-**How it got there.** 2026-08-02: snarkjs judged this module's toy-setup proof (`snarkjs_kat_test.zig`). 2026-10-02 (A8): the file formats were established black-box (§ 4a), then checked both directions — our prover on snarkjs keys, snarkjs's prover on our keys (`newZkey` and after `contribute`), at 10 000 constraints as well as on the committed fixture. Mutation 2026-10-02: 49 mutants over the new code, 46 killed; two equivalent (the small-MSM threshold changes only speed; the B₂ size check before allocation is unreachable because sections 5 and 6 pin `n_vars` first) and one undecided (`verify`'s G2 subgroup check on δ₂: the off-subgroup point we can build fails the δ same-ratio check anyway — kept as defence in depth). The run asked for 24 tests, all added.
+## What is deliberately not done
 
-**7. Secrets leave nothing on the dead stack (2026-10-09).** `prover.setup`,
-`prover.prove`, `zkprove.prove`, `phase2.contribute` and `circom.parseWitness` take
-their secrets by pointer (`*const ToxicWaste`, `*const Randomizers`, `*const Fr`),
-run their bodies one frame down and zero the stack that body dirtied
-(`src/burn.zig`); `msm.pippengerG1/G2` wipe their limb and bucket scratch before
-freeing it. `src/stackprobe_test.zig` (ReleaseFast only) pins it: toxic waste and
-everything derived from it, the witness, `r`, `s`, `r·s`, the QAP evaluations and
-quotient and the `r·δ`/`s·δ`/`r·s·δ` points as needles — 0 residues, with a negative
-and a positive control in the same binary. The caller's own copies (the `Randomizers`
-and `ToxicWaste` variables, the witness vector) are the caller's to wipe;
-`circom.freeWitness` does it for the `parseWitness` result. Out of reach: the `.wtns`
-and `.zkey` file bytes the caller read in.
+- **Witness calculation for circom circuits.** It means executing circom's generated WASM or C++; a WASM interpreter
+  is out of this module's scope, and circom's own native generator writes the `.wtns` (rapidsnark makes the same
+  split). The survey's judgment, not a recorded owner decision.
+- **PLONK, FFLONK, Halo2, universal / updatable setup, custom gates, other curves** (survey, scope): the
+  scope explosion Groth16 was chosen to avoid. `.r1cs` custom-gate sections 4 and 5 are refused (`circom.zig:103`, `error.Unsupported`).
+- **Proof recursion / aggregation.**
+- **A circuit / gadget DSL.** R1CS is hand-built or comes from circom; the constraint-synthesis API is Backlog item 9.
+- **Dropping the toy prover's dead C path.** The toy `prover.prove` interpolates C and
+  subtracts it although the quotient depends only on A·B's coefficients `>= n`; kept: that prover is the module's
+  anchor and is kept simple on purpose.
 
-## Mutation audit (2026-11-17)
-
-**Audit 2026-11-17 (whole-module mutation).** 566 schemata mutants over every production file (`prover`, `msm`, `poly`, `domain`, `fft`, `qap`, `r1cs`,
-`circom`, `ptau`, `snarkjs_bin`, `snarkjs_import`, `snarkjs_export`, `zkey`, `zkprove`, `phase2`, `burn`; ReleaseSafe, one build, each mutant under `ulimit -v`
-and a 30-60 s kill; the 14 wipe and burn mutants also in a ReleaseFast build, the only mode in which `stackprobe_test.zig` runs): **517 killed, 49 equivalent
-or unobservable, 0 open.** Mutated: every guard, bound, length and flag of the readers (`BinFile`, `Cursor`, `r1cs`, `wtns`, `ptau`, `zkey`, the JSON importer
-and exporter), the field/FFT/polynomial arithmetic, the QAP quotient of both provers (toy `prover` and `zkprove`'s coset form), the Pippenger window loop and
-its small-input path, `phase2` (`newZkey` row/domain rule, coefficient and column bookkeeping, the circuit hash, `contribute`, the transcript, `verify`'s ten
-count comparisons, four coefficient fields and every key comparison, `verifyContribution`), and the secret wipes. Not mutated (arid): constants and comptime
-derivations, `ctgrind_harness.zig`, `fuzz_test.zig`, `gate.zig`, the example. The bn254 side of the 2026-11-17 MSM reuse (public `addVartime`/`mixedAddVartime`)
-is counted in that module's card, not here. 415 mutants died on the existing tests; 150 survived, and 102 more (including one added afterwards) were killed by
-the new tests (`src/audit_test.zig`, `qap.zig`, `msm.zig`, `phase2.zig`, second build). What they pin, none of which any earlier test saw: the 2^28-th root of
-unity as the ark-bn254 / snarkjs constant (generators 5 and 7 give the SAME root for every domain up to 2^5, so every fixture here was blind to the choice);
-both bounds of `poly.add/sub` with operands of different length, the empty product, `divByVanishing` at exactly `max_degree`; the QAP divisibility test on a
-circuit whose A, B, C rows differ and on a domain exactly as large as the circuit; every `r1cs`/`ptau`/`zkey`/`wtns` refusal that was only reached through a
-different guard (versions, header and constraint-section trailing bytes, custom-gate sections 4 and 5, exact-fit signal counts, each required `ptau` section,
-a domain of exactly 2^28, a forged coefficient count, accessors one past the last point, field-prime width, `byteLen` overflow, ids 0 and 11 ignored by the
-section-order pass); the JSON importer's u256 overflow in the multiply and in the add, `:` as a digit, the infinity encodings of G1 and G2, a negative
-`nPublic`; `phase2.verify` naming the broken field for each count, coefficient field and key element, with `eqG1`/`eqG2` seen through one coordinate only
-(negated point; x multiplied by a cube root of unity); a contribution transcript pinned by an independent derivation (affine arithmetic and blake2b outside
-this module) so every input of the hash and the domain tag are covered, its `type` equal to snarkjs's, the name length bound; contribution records that
-exactly one guard refuses (`g1_s` at infinity, `delta_after` at infinity, a `g1_sx` that is not s*x: the first two satisfy both pairing ratios); the circuit
-hash pinned (derived from the bytes of `t0.zkey`) and sensitive to each of its six sections; `newZkey` on a circuit with coefficients (domain = next power of
-two of the rows, including a row count that is exactly one, the minimum domain 2, `PtauTooSmall` at the boundary, the coefficient records, and a proof that
-verifies); the Pippenger window widths 2..11 driven directly (`runWindow`, split out of `run` with no behaviour change; the `scalar_bits` 254 -> 253 mutant
-only loses a window at c = 11, i.e. >= 2^14 terms); `zkprove` refusing a 2^28 domain before allocating; and, in optimised builds only, that `freeWitness` and the
-Pippenger bucket array are wiped (`Allocator.free` poisons the block before the allocator sees it in Debug and ReleaseSafe, so only ReleaseFast can tell).
-
-**The 49 survivors**, each with the invariant that makes it equivalent or unobservable (the last three groups cannot be seen by any test):
-
-- *No effect on any result, or cost only (34):* `prover.prove` interpolates C and subtracts it, but C has degree < n and the quotient depends only on the
-  coefficients >= n of A*B, so the whole C path (`c_ev` row, its inverse NTT, the subtraction) is dead work in the toy prover (colEval guard `j >= n`, which
-  `setup` makes unreachable); Pippenger window width (`windowBits`), the zero / +1 / -1 shortcuts and the `n < 8` split are cost-only, the extra top bucket is never
-  written, one extra top window has only zero digits, and `i > j` instead of `i < j` swaps each bit-reversal pair once either way; `divByVanishing` never reads
-  `rem[i >= n]` again and visits each quotient index once; the QAP padding of A and of B is redundant with each other (the product with the other side's zero
-  padding is zero); `r1cs` `n_wires == 0` and the term-bound pre-check are subsumed by the checks after them; `BinFile.get` is only called with constants < 32;
-  `byteLen`'s usize cast is the identity on 64-bit targets; `g1ToBytes`/`g2ToBytes` infinity guards (the identity has zero coordinates); `zkey`'s section-order
-  pass is covered by `BinFile.parse` (duplicates) and `get` (missing); `n_vars == 0` is refused by `n_public >= n_vars`; the b_g2 section size is checked again
-  by `g2SliceUnchecked`; the 78-digit cap of `decimalToBytes` is subsumed by its overflow checks; `zkprove`'s A/B matrix assignment (the quotient of A*B - C with
-  C := A*B is symmetric in A and B); the default MSM choice (`prove` against `proveWith(.constant_time)`, identical proof, 21x slower); `phase2.verify`'s two
-  infinity guards of delta and its delta_g2 subgroup check (each redundant with the other guard, the pairing ratio and `zkey.parse`'s own subgroup check).
-- *Observed by a ctgrind row, not by a test (4):* `zkprove` mapping `.constant_time` to Pippenger (G1, G2) or `.pippenger` to the naive MSM (G1, G2): the same
-  proof, a different instruction trace. Row `zkprove_ct` (6 in-file contexts) would read >= 10, row `zkprove_vt` (positive control, >= 10) would read 0.
-  `ctgrind --check groth16` run once on the final sources: counts unchanged (6 and 54), source digests re-pinned.
-- *Not constructible (4):* `ptau` section 12 and `lagrangeBytes` at power 28 (a power-28 `.ptau` is over 2^29 points, tens of GiB) and `CircuitTooLarge` at 2^29
-  rows (needs > 2^28 constraints).
-- *Wipes shadowed by the entry point's burn (7):* the six `secureZero` defers of `prover.prove` (`a_ev`, `b_ev`, `c_ev`, `ab`, `p`, `h`) and the one of `x_inv` in
-  `contribute`. The array and the inverse live in the body's frame, and `burn.run` zeroes that frame (`prove_burn + n * per_point_burn`, twice the 8n field
-  elements the body keeps; `contribute_burn`) before the entry point returns; the stack probe sees the burn, not the defer. They are belt and braces.
-
-One mutant is only killed in an optimised build: `zkprove` without `@memset(evals, Fr.zero)` survives ReleaseSafe and Debug, because `Allocator.alloc` re-poisons
-every block with the constant byte 0xaa after the allocator returns it, and a constant offset of an evaluation vector cancels out of the quotient
-((A+g)(B+k) - interp((A_i+g)(B_i+k)) = A*B - C): no allocator can make the missing zeroing visible there. In ReleaseFast the test's allocator, which hands out
-varying bytes, does (killed, 2026-11-17 run). The wipes of the freed witness and of the Pippenger buckets (survivors of the existing stack probe, which has no
-needle for a bucket sum and never frees the witness) are killed in ReleaseFast by the new heap test; that test is skipped in Debug and ReleaseSafe like the probe.
-One observation that is not a defect: the toy prover's dead C path above (a speed-only simplification, not applied: that prover is the module's anchor and is
-kept simple on purpose).
-
-**Audit 2026-11-20 (delta mutation).** The only non-test source change since the whole-module audit is `Randomizers.randomInto` (two `Fr.randomInto` draws straight into the caller's storage). 4 schemata mutants (ReleaseFast, the module's stack probe plus the new unit test): the `r` draw skipped, the `s` draw skipped, `s` copied from `r`, the second draw aimed at `r`. All 4 killed (the probe and `Randomizers.randomInto fills both scalars in place, distinct and canonical`). The `burn.run` wrap of `bn254.Fr.randomInto` that the probe case also covers is mutated in the bn254 delta (5 more kills through this same probe). Card counts are cumulative: 517/566 + 4/4 = 521/570, 49 eq.
 
 ## Backlog / deferred
 
-0. **Secret hygiene beyond the five entry points** (sweep 2026-10-09): the helpers
-   that take a witness slice and run in the caller's frames — `r1cs.System.isSatisfied`/
-   `evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are
-   not burned (a consumer that calls them on a real witness should do its own
-   `burn.run`-style wrapper); ✅ DONE 2026-11-19 for the `Fr.random` part:
-   `Randomizers.randomInto(out, io)` draws both scalars through `bn254.Fr.randomInto`
-   (burned body) so no copy stays in the caller's frame; the stack probe has a
-   `Randomizers.randomInto` case (fake `Io`, known draw). **Still open: the helper
-   wrapper part** (the witness-slice helpers above are not burned); `phase2.newZkey`
-   handles public data only.
+0. **Secret hygiene beyond the entry points:** the helpers that take a witness slice and run in the caller's frames —
+   `r1cs.System.isSatisfied`/`evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are not
+   burned (§ 5b item 8). `phase2.newZkey` handles public data only.
 
-Re-ranked by the 2026-10-05 re-survey. Missing and it matters, most-hit first:
+Missing and it matters, most-hit first:
 
-1. **Multi-threaded prover and setup** (A8; survey 2026-10-05): snarkjs, rapidsnark, arkworks, bellman and gnark all use every core; ours is one. Even at 10 000 constraints, but a user with a 10⁶-constraint circuit waits minutes where rapidsnark takes seconds *(inferred)*. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`. Effort: medium. Fits §2.
-2. **Solidity verifier and calldata export** (survey 2026-10-05): snarkjs, gnark and ark-circom write a verifier contract for a key, and snarkjs the `verifyProof(...)` calldata for a proof. Today a user deploying on-chain runs snarkjs on the same `.zkey`/`proof.json`, which works *(inferred: same key, same equation; not run here)*. Effort: small-medium (a template over `VerifyingKey` plus the EVM's G2 coordinate order); needs a black-box oracle run (solc / an EVM) to anchor. Fits §2.
-3. ✅ DONE 2026-11-16 (`snarkjs_import.parseProof`/`parseVerifyingKey`/`parsePublic`: exactly the shape `snarkjs_export` writes — decimal canonical strings, `[x,y,"1"]`, G2 `[[x0,x1],[y0,y1],["1","0"]]` math order, `groth16`/`bn128` required, infinity literals, `nPublic` cross-checked, unknown members such as `vk_alphabeta_12` ignored; refuses wrong protocol/curve, non-canonical numbers, off-curve G1/G2, G2 outside the subgroup; export test values round-trip, and snarkjs's own fixture proof verifies under the parsed key) **Reading snarkjs's `proof.json` and `verification_key.json`** (survey 2026-10-05): the export is one-way, so a Zig server verifying proofs a browser made with snarkjs has to parse the decimal JSON itself. Effort: small (the shape is pinned by `snarkjs_export.zig`'s tests). Fits §2.
-4. **snarkjs's circuit hash and contribution proof** (A8, 2026-10-02): needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
-5. **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log, so a record proves knowledge.
-6. **Positional file source** (A8): readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
-7. **Faster `contribute`** (A8): 12 s at 10 000 constraints, one constant-time `scalarMul` + inversion per C/H point; a fixed-window constant-time multiply and batch normalisation should take most of it.
-8. **Domain-size boundary fixture** (provenance review 2026-10-02): `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. (2026-11-17: `src/audit_test.zig` pins this module's own rule, row counts 4 and 16 giving domains 4 and 16 and a row count of 1 giving 2, but against itself, not against snarkjs; the black-box fixture is still wanted.)
-9. **Phase-1 (`.ptau`) contribution and verification**: reading only today; users take a published ceremony (§ 5b item 5).
-10. **Circuit-building API (constraint-synthesis trait or gadget helpers)** (survey 2026-09-30): arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
-
-Not planned here (the survey's judgment, not a recorded decision): **witness calculation for circom circuits** — it means executing circom's generated WASM or C++; a WASM interpreter is out of this module's scope, and circom's own native generator writes the `.wtns` (rapidsnark makes the same split). PLONK / FFLONK / other curves (§ 7).
-
-Done: ~~snarkjs `.zkey`/`.wtns`/`.r1cs`/`.ptau` readers, the zkey prover, Pippenger MSM, phase-2 setup/contribute/verify~~ (A8, 2026-10-02 — the 2026-09-30 survey's top gaps).
+1. **Multi-threaded prover and setup**: snarkjs, rapidsnark, arkworks, bellman and gnark all use every core; ours is one. Even at 10 000 constraints, but a user with a 10⁶-constraint circuit waits minutes where rapidsnark takes seconds *(inferred)*. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`. Effort: medium. Fits §2.
+2. **Solidity verifier and calldata export**: snarkjs, gnark and ark-circom write a verifier contract for a key, and snarkjs the `verifyProof(...)` calldata for a proof. Today a user deploying on-chain runs snarkjs on the same `.zkey`/`proof.json`, which works *(inferred: same key, same equation; not run here)*. Effort: small-medium (a template over `VerifyingKey` plus the EVM's G2 coordinate order); needs a black-box oracle run (solc / an EVM) to anchor. Fits §2.
+3. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
+4. **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log, so a record proves knowledge.
+5. **Positional file source:** readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
+6. **Faster `contribute`:** 12 s at 10 000 constraints, one constant-time `scalarMul` + inversion per C/H point; a fixed-window constant-time multiply and batch normalisation should take most of it.
+7. **Domain-size boundary fixture:** `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it against snarkjs; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. `src/audit_test.zig` pins this module's own rule, but against itself.
+8. **Phase-1 (`.ptau`) contribution and verification**: reading only; users take a published ceremony (§ 5b item 5).
+9. **Circuit-building API (constraint-synthesis trait or gadget helpers):** arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
