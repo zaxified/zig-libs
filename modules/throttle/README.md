@@ -22,7 +22,7 @@ load shedding). Design references only. Clock-injection patterns follow the
   (no mutex, no allocation, no hidden globals); all orderings are
   deliberately `seq_cst` so the waiter/releaser handoff audit stays simple.
 - **Deps:** `router`, `http` (http is exercised by the tests and by the 503
-  path's response types via `router.Ctx`).
+  path's response types via `router.Ctx`), `clock` (the default monotonic clock).
 
 ## Layers
 
@@ -126,8 +126,8 @@ connection task; that *is* the backpressure, bounded by
 - Unlike `ratelimit`'s 429, no exact retry time is computable (it depends on
   in-flight handler durations) — `Retry-After` is the configured
   `retry_after_ms` hint.
-- TODO: adaptive limit discovery (Netflix Gradient-style AIMD on observed
-  latency) — the static `max_in_flight` is the required primary.
+- Adaptive limit discovery (Netflix Gradient-style AIMD on observed latency)
+  is not implemented: `max_in_flight` is static (SPEC.md, Backlog).
 
 ## Verification
 

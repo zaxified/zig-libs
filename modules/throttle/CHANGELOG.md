@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-16** — New `Partitioned` limiter (Netflix `PartitionedLimiter` shape): per-partition guaranteed percentage shares of `max_in_flight` plus borrowing of unused capacity (`tryAcquire(p)` / `release(p)` / `inFlight` / `inFlightIn` / `guaranteed` / `middleware()` with an optional `classify` callback). `init` returns `PartitionError` (`ZeroLimit`, `NoPartitions`, `TooManyPartitions`, `SharesExceed100`) instead of panicking. Additive; `Throttle` is unchanged. Note the borrowed total may exceed `max_in_flight` by up to the sum of guarantees while guaranteed requests land on a fully borrowed budget.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private monotonic OS read behind `Clock.monotonic` (duplicate-code pass) is replaced by the `clock` module: `Clock` is now `clock.Clock` (same fields, `.monotonic`, `now()`; additionally `.coarse` and `since()`). A failed read still gives 0; a negative timespec field now maps to 0 instead of tripping `@intCast`. New dependency: `clock`.
 - **2026-10-04** — Tests: first mutation run (27 mutants, 25 killed, 2 equivalent); 5 tests added
   (fake-clock deadline arithmetic and `>=` boundary, release in the pre-wait window, canceled

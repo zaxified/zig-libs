@@ -14,8 +14,6 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): multi-thread stress checks cap/accounting invariants; semaphore examples
-
 **Known defects:** none recorded
 
 **Downstream consumer:** no
@@ -28,7 +26,7 @@ this repo: `ratelimit` (per-key rate, 429), `abuseguard` (per-IP connections) an
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Netflix/concurrency-limits](https://github.com/Netflix/concurrency-limits) — **reference** (the design this module names) | Java | Apache-2.0 | 3.6k | v0.5.4 (2025-12-08) | README (read): adaptive limit discovery from TCP congestion-control ideas (Vegas, Gradient2, AIMD-style), servlet/gRPC integrations, partitioned limits *(partitions inferred)*. Here: a static `max_in_flight` only; the adaptive variant is a documented TODO. |
+| [Netflix/concurrency-limits](https://github.com/Netflix/concurrency-limits) — **reference** (the design this module names) | Java | Apache-2.0 | 3.6k | v0.5.4 (2025-12-08) | README (read): adaptive limit discovery from TCP congestion-control ideas (Vegas, Gradient2, AIMD-style), servlet/gRPC integrations, partitioned limits *(partitions inferred)*. Here: a static `max_in_flight` only; the adaptive variant is open (Backlog). |
 | [golang/sync](https://github.com/golang/sync) `semaphore` | Go | BSD-3-Clause | 933 | push 2026-09-23 (no GitHub releases) | Weighted semaphore, FIFO hand-off, context cancellation *(inferred)*. This module: unit weight, deliberate barging (no FIFO), a bounded wait instead of context, and the HTTP 503 middleware built in. |
 | [tower-rs/tower](https://github.com/tower-rs/tower) (`limit`, `load_shed`) | Rust | MIT | 4.3k | tower-0.5.3 (2026-01-12) | `ConcurrencyLimit` and `LoadShed` layers around a service: the same static-cap-plus-shed shape *(inferred)*. |
 | [envoyproxy/envoy](https://github.com/envoyproxy/envoy) (adaptive concurrency filter, circuit-breaker limits) | C++ | Apache-2.0 | 29.0k | v1.39.1 (2026-08-27) | Proxy-level: static `max_requests` and an adaptive concurrency HTTP filter *(inferred)*; not a library. |
@@ -39,7 +37,7 @@ this repo: `ratelimit` (per-key rate, 429), `abuseguard` (per-IP connections) an
 (503 plus `Retry-After`, released on handler error); lock-free CAS semaphore, no allocation,
 bounded waiter set, an 8-thread over-admission stress test. **Where we are behind:** adaptive
 limit discovery (Netflix Gradient/Vegas, Envoy adaptive filter), FIFO fairness and weighted
-acquires (Go semaphore) and priority limits (partitioned limits now exist: `Partitioned`).
+acquires (Go semaphore) and priority limits (partitioned limits exist: `Partitioned`).
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — design references only, no source copied).
 
@@ -60,62 +58,55 @@ counter, waiter counter, release generation) stays auditable under a single tota
 after Go `x/sync/semaphore` (slot semantics) + SEDA (bounded-queue load shedding) + Netflix
 concurrency-limits (design notes) — see README Provenance.
 
+**`Partitioned`** (Netflix `PartitionedLimiter` shape): up to `max_partitions` (16) partitions, each with a
+guaranteed percentage share of `max_in_flight`, in fixed storage. A request is admitted when its partition is
+under its share OR the total is under `max_in_flight` (borrowing idle capacity), so a flood in one partition
+cannot take another's guaranteed slots; the price is that the total may exceed `max_in_flight` by at most the sum of
+the guarantees, as in Netflix. Bad configuration (zero limit, no partitions, more than 16, shares above 100 %) is a
+`PartitionError` from `init`, never a panic. `middleware()` takes a `classify` callback (null = partition 0). No
+waiting: a refused request is shed at once (503 + `Retry-After`).
+
 ## Threat model / out of scope
 Not per-key: a single client can consume the whole in-flight budget same as a legitimate burst — pair
 with `ratelimit` (per-key rate) or `abuseguard` (per-IP connections) for that. No adaptive limit
 discovery: `max_in_flight` is a static number the operator must size correctly (a Netflix
-Gradient-style AIMD variant is a documented TODO, not implemented). Bounded wait requires the caller
+Gradient-style AIMD variant is in the Backlog). Bounded wait requires the caller
 to pass an `Io` whenever `max_wait_ms > 0`; the default (immediate shed) touches no `Io` at all. A
 parked request keeps occupying its server connection task — the backpressure is real capacity held,
 bounded by `max_waiters × max_wait_ms`, not a queueing mechanism that frees resources while waiting.
 
 ## Verification
-Offline: acquire-to-cap/release semantics, 0-wait fast path, an 8-thread over-admission
-stress for both `tryAcquire` and the bounded-wait path, deadline shed with the full wait honored,
-release-inside-the-window handoff, waiter-cap immediate shed. Middleware goldens over the
-socket-free `http.Server.serveStream` (503 wire bytes + `Retry-After` rounding, release-on-handler-
-error, throttled 404s, bounded-wait 200-after-release and 503-after-deadline). In-process integration
-(`router` + `http.Server` + `http.Client` over loopback): N slots occupied by live blocked requests →
-request N+1 sheds with 503 + `Retry-After`, a released slot serves a fresh request, everything drains
-to zero — skips only when loopback binding is unavailable. Run: `zig build test-throttle`.
 
-## Mutation run 2026-10-04
+- **Run:** `zig build test-throttle` (`scripts/modtest throttle`).
+- There is no independent model; the tests check invariants (cap and accounting) and the semaphore's examples.
+- **Offline:** acquire-to-cap/release semantics, 0-wait fast path, an 8-thread over-admission stress for both
+  `tryAcquire` and the bounded-wait path, deadline shed with the full wait honored (the deadline is the first clock
+  reading plus `max_wait_ms`, reached with `>=`; the injected clock is used), release-inside-the-window handoff
+  (including a release between the failed attempt and the futex wait, and a lost-wakeup detector), a canceled `Io`
+  wait sheds at once, waiter-cap immediate shed, the monotonic clock keeps sub-second resolution.
+- **Middleware goldens** over the socket-free `http.Server.serveStream`: 503 wire bytes, `Retry-After` is
+  `ceil(ms / 1000)` with a floor of 1 second, release-on-handler-error, throttled 404s, bounded-wait 200-after-release
+  and 503-after-deadline.
+- **Partitioned:** bad shares refused with errors, a flood cannot starve another partition's share, borrowing and
+  reclaiming, release accounting and a bad index, a zero-share partition only borrows, `classify` picks the
+  partition, 8 threads never lose accounting.
+- **Integration** (`router` + `http.Server` + `http.Client` over loopback): N slots occupied by live blocked requests
+  → request N+1 sheds with 503 + `Retry-After`, a released slot serves a fresh request, everything drains to zero;
+  skips only when loopback binding is unavailable.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-27 mutants (mutant schemata, one ReleaseSafe build, run per mutant under a 20 s cap): `>=`/`>` in
-`tryAcquire`, the waiter cap and the deadline test, the unit and origin of the deadline, the
-counter increments and decrements (slots and waiters), every step of `release` (decrement,
-notify gate, generation bump, wake, wake count), the `maxWaiters` default and explicit value,
-`Retry-After` rounding and floor, the middleware's `defer release` and `acquire` vs `tryAcquire`,
-the injected clock, the monotonic clock's nanosecond part, the 503 status, the cancel path.
-First run: 19 killed, 8 survived. Survivors and verdicts:
+## What is deliberately not done
 
-- Equivalent: `acquire` without the `max_wait_ms == 0` early return (with a zero wait the loop
-  makes one more `tryAcquire` and sheds at once; with no `Io` it still sheds); `wake all` reduced
-  to `wake one` (one freed slot needs one woken waiter; the difference only shows when the woken
-  waiter simultaneously hits its deadline, which no deterministic test can schedule).
-- Test gaps, now killed: `now >= deadline` vs `>` (fake-clock reading counts), clock injection
-  ignored, a lost wakeup in the window between the failed attempt and the futex wait (the scripted
-  clock releases inside that window), canceled wait not shedding, `Retry-After` floor of 1 s,
-  monotonic clock without nanoseconds.
-
-Tests added: 5 (`bounded wait: deadline is the first clock reading ...`, `... a release between
-the failed attempt and the futex wait is not lost`, `... canceled Io wait sheds at once ...`,
-`middleware: Retry-After is ceil(ms / 1000) with a floor of 1 second`, `Clock.monotonic keeps
-sub-second resolution ...`). Final run: 25 of 27 killed, 2 equivalent, 0 findings.
+- **Weighted acquires and FIFO fairness** (Go semaphore): refused by the design note above (barging, no per-waiter
+  queue memory).
 
 ## Backlog / deferred
-Adaptive limit discovery (Netflix Gradient-style AIMD on observed latency) — documented TODO in
-README, not implemented.
 
-- **(survey 2026-09-30) Adaptive limit discovery** — already the item above; it is the defining feature of the design this module is modelled on (Netflix concurrency-limits, Envoy's adaptive concurrency filter), and a static `max_in_flight` goes stale when the service auto-scales. Effort: medium (a limit algorithm fed by observed latency, Vegas/Gradient2-style; needs the injected `Clock`). Fits §2: yes.
-- **(survey 2026-09-30) Partitioned or priority limits** (e.g. reserve slots for health checks or a paying tier; Netflix ships partitioned limiters *(inferred)*) — today one shared budget, so a flood of low-value requests can starve important ones. Effort: small–medium. Fits §2: yes. ✅ DONE 2026-11-16 (`Partitioned`: up to 16 partitions with guaranteed percentage shares, borrowing of unused capacity, admit when under own share OR total < max_in_flight; shares > 100 % / empty / > 16 / zero limit = `PartitionError`, never a panic; `middleware()` with a `classify` callback; no waiting; the total may exceed `max_in_flight` by at most the sum of guarantees, as in Netflix)
-- Weighted acquires and FIFO fairness are refused by the SPEC's own design note (barging, no per-waiter queue memory).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · posix · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **Adaptive limit discovery** (Netflix Gradient-style AIMD on observed latency; survey 2026-09-30) — the defining
+  feature of the design this module is modelled on (Netflix concurrency-limits, Envoy's adaptive concurrency
+  filter), and a static `max_in_flight` goes stale when the service auto-scales. Effort: medium (a limit algorithm
+  fed by observed latency, Vegas/Gradient2-style; needs the injected `Clock`). Fits §2: yes.
 
 ## Anchoring
 
