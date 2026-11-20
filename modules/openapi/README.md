@@ -14,10 +14,10 @@ code. Closes the Web service / API cluster.
   mapping). Document format per the OpenAPI Specification 3.1.0.
 - **Platform:** any. **Role:** util. **Concurrency:** threadsafe —
   `Generator.build`/`Generator.write` are pure functions of an immutable
-  (post-build) Router, but `Endpoint` builds the document once (lazily, on
-  the first request) and caches it behind a lock, so it is not reentrant:
-  a route registered after that first request will not appear in the
-  served document.
+  (post-build) Router, but `Endpoint` builds the document lazily on the
+  first request and publishes it once under a lock (concurrent first
+  requests may each build it), so it is not reentrant: a route registered
+  after that first request will not appear in the served document.
 - **Deps:** `router`, `http` (+ `std.json`).
 
 Provenance: clean-room. Design references: FastAPI (MIT; generated-spec
@@ -27,7 +27,7 @@ shape + defaults), utoipa (MIT OR Apache-2.0), OpenAPI Specification 3.1.0
 (`tools/spec_oracle.py`), the documents this module built for them, mutations of
 those, and openapi-spec-validator's verdicts (Apache-2.0) and FastAPI's path mapping
 (MIT), both run as black boxes —
-observed behaviour, exempt per root `NOTICE` §0.
+observed behaviour, no code copied.
 
 ## Usage
 
@@ -78,10 +78,10 @@ defer gpa.free(json2);
 
 | Topic | Behavior |
 |---|---|
-| Version | `openapi: "3.1.0"`; `info` from `Info` (title + version required, description optional) |
+| Version | `openapi: "3.1.0"`; `info` from `Info` (title + version required; description, `contact`, `license` optional); `Info.tags` adds top-level `tags` (description, `externalDocs`; a duplicate name → `error.InvalidTags`) |
 | Paths | router patterns → templates: `:id` → `{id}`, `*rest` → `{rest}`; methods grouped per path |
 | Determinism | paths in first-registration order; methods per path in `http.Method` declaration order; fixed key order; minified |
-| Path params | always `required: true`, `schema: {type: "string"}` (router captures raw path bytes); a `*wildcard` becomes a plain `{param}` (OpenAPI has no cross-segment template — FastAPI's `:path` compromise) |
+| Path params | always `required: true`, `schema: {type: "string"}` (router captures raw path bytes) unless `RouteExtra.path_parameters` declares a schema/description for the name; a `*wildcard` becomes a plain `{param}` (OpenAPI has no cross-segment template — FastAPI's `:path` compromise) |
 | `RouteDoc` | surfaces `summary`/`description`/`tags`/`requestBody`/`responses`/`deprecated`; `request_schema` must be JSON whose value is an object or a boolean (a JSON Schema) and is re-emitted normalized under `requestBody.content."application/json".schema` (malformed → `error.InvalidRequestSchema`); `query_schema` (an object schema) becomes one `in: query` parameter per property (malformed → `error.InvalidQuerySchema`) |
 | `operationId` | deterministic: lowercase method + `_` + the converted path's segments joined by `_` (`GET /users/{id}` → `get_users_id`); an operation whose id an earlier one already holds (`/a/b` and `/a_b`, `/users` and `/users/`) gets the smallest free `_<n>` suffix (`get_a_b_2`), and the self-check refuses duplicates (`error.DuplicateOperationId`) |
 | Undocumented routes | minimal operation with default `responses: {"200": {"description": "Successful Response"}}` (FastAPI's default) |
@@ -89,10 +89,10 @@ defer gpa.free(json2);
 | `servers` | `Info.servers`: `url` + optional `description`, after `info` |
 | `components.schemas` | `Info.schemas` (name + JSON Schema text) is emitted once; routes point at it with `openapi.schemaRef("Name")` (`{"$ref":"#/components/schemas/Name"}`) in `request_schema` / `Response.schema` / `query_schema`. Same name with a different body → `error.SchemaConflict`; a `$ref` that resolves nowhere → `error.DanglingRef` |
 | Security | `bearer_auth` as before; `Info.security_schemes` adds apiKey (header/query/cookie), http basic/bearer, OAuth2 (implicit/password/clientCredentials/authorizationCode), openIdConnect; `Info.security` makes requirements document-wide, `RouteExtra.security` replaces them for one operation (`&.{}` = public). An undeclared name → `error.UnknownSecurityScheme` |
-| `route_extras` | `Info.route_extras` (matched by `method` + raw `pattern`, since `router.RouteDoc` is not ours to extend): `header_parameters`, `cookie_parameters`, `request_example`, `request_bodies` (further request media types, each with schema/example), `request_body_required`, `path_parameters` (schema/description per path parameter), `response_examples` (`example` on the media type), `security`. An entry for no registered route → `error.UnknownRouteExtra` |
-| Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks |
+| `route_extras` | `Info.route_extras` (matched by `method` + raw `pattern`, since `router.RouteDoc` is not ours to extend): `header_parameters`, `cookie_parameters`, `request_example`, `request_bodies` (further request media types, each with schema/example), `request_body_required`, `path_parameters` (schema/description per path parameter), `response_examples` (`example` on the media type), `security`, `operation_id` (replaces the derived id). An entry for no registered route → `error.UnknownRouteExtra`; a `path_parameters` name that is no capture → `error.UnknownPathParameter`; the same request media type twice → `error.DuplicateRequestBody`, an empty one → `error.InvalidMediaType` |
+| Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks, CONNECT and extension-method routes (a 3.1 Path Item has no field for them) |
 | Self-check | `Generator.build` parses its own output back and runs `validateOpenApi31` on it before returning — a malformed document is a `BuildError`, never served |
-| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidQuerySchema` (bad `query_schema`), `InvalidResponseSchema` (bad response schema), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, `InvalidComponentSchema`, `SchemaConflict`, `DuplicateSecurityScheme`, `InvalidParameterSchema`, `InvalidExample`, `UnknownRouteExtra`, plus every `ConformanceError` variant (the self-check above) |
+| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidQuerySchema` (bad `query_schema`), `InvalidResponseSchema` (bad response schema), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, `InvalidComponentSchema`, `SchemaConflict`, `DuplicateSecurityScheme`, `InvalidParameterSchema`, `InvalidExample`, `UnknownRouteExtra`, `UnknownPathParameter`, `DuplicateRequestBody`, `InvalidMediaType`, `OutOfMemory` (never cached by `Endpoint`), plus every `ConformanceError` variant (the self-check above) |
 
 **Endpoint** is an *intercepting* `router.Middleware` (the
 `metrics.Endpoint` pattern — `router.Handler` is a stateless fn pointer and
@@ -108,12 +108,11 @@ Instead, the optional `docs_path` serves a tiny self-contained HTML viewer
 (inline CSS + vanilla JS, zero external assets) that fetches the spec and
 lists every operation with method, path, tags, summary and deprecation.
 
-## Follow-up unlocked
+## Not provided
 
-`router.Ctx.matchedPattern()` (added together with this module) gives
-`metrics` a bounded-cardinality **route-pattern label** for its request
-counter/histogram — the label that was deliberately absent because labeling
-by raw path would be the cardinality footgun. Not wired up in this task.
+OpenAPI 3.0 / Swagger 2.0 output, runtime request/response validation, client SDK generation, a Swagger-UI
+page and automatic `pattern` from a router constraint are left out; see SPEC *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Verification
 
@@ -126,6 +125,10 @@ by raw path would be the cardinality footgun. Not wired up in this task.
   `$ref` schemas, every security scheme kind with per-operation selection, header/cookie
   parameters and examples; each also passes `validateOpenApi31`; negative tests for the
   typed errors.
+- Differential and fuzz: documents for drawn route tables replayed against
+  openapi-spec-validator's frozen verdicts and FastAPI's path mapping
+  (`src/spec_oracle_test.zig`), the `OPENAPI_FUZZ` driver over the generator
+  and the checker (SPEC *Verification*).
 - In-process integration: `http.Server` + router + endpoint on
   `127.0.0.1:0`, fetched with `http.Client` — the served document parses
   and contains the registered routes/operations.

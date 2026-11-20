@@ -10,7 +10,6 @@
 
 **Audit:** review 2026-11-07 · mutation 2026-11-20 (446/451, 5 eq) · src ed598b4df38610f1
 
-Audit detail: the 2026-11-01 review is a delta over `src/fuzz_test.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
 **Hardening:** fuzz 2026-10-23 (200,000-run budget per harness clean, OPENAPI_FUZZ, re-run over the A1 fixes; `build` = generator paths agree + output re-checked, `spec` = checker on raw and damaged documents) · ct n/a — schema generation (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: `validateRefs` iterative; caller JSON text at most 128 deep; `$ref` and checker parameter/template lookups hashed)
 
@@ -20,7 +19,7 @@ Audit detail: the 2026-11-01 review is a delta over `src/fuzz_test.zig` (the fuz
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the module's `NOTICE` and the README's `Provenance:` line.
 
 ## Compared with
 
@@ -34,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [swaggo/swag](https://github.com/swaggo/swag) | Go | MIT | 13.0k | v2.0.0-rc6 (2026-09-13) | Generates the spec from comment annotations. *(inferred)* |
 | [h0rv/zchema](https://github.com/h0rv/zchema) / [nevindra/nilo](https://github.com/nevindra/nilo) | Zig | MIT / MIT | 3 / 4 | push 2026-06-07 / 2026-09-29 | Zig ecosystem: zchema generates OpenAPI 3.1 from Zig types over `std.http.Server` (needs a separate JSON Schema library); nilo is a framework with OpenAPI built in. The README claim "nothing comparable in Zig" is stale. *(inferred from READMEs)* |
 
-**Where we are ahead:** deterministic byte-identical output, atomic failure (`InvalidUtf8`, `PathCollision`, malformed schema are errors, never a partial document — `write` included since 2026-10-23), unique `operationId`s (a colliding base gets a `_<n>` suffix, and the self-check refuses duplicates), per-route include filter, validator-checked output, and it plugs into the module's own `router`/`validate` (`query_schema` from `writeJsonSchemaFor`). · **Where we are behind:** the survey gaps are closed (2026-10-12: `components/schemas` + `$ref`, `servers`, further security schemes, header/cookie parameters, `examples`); closed 2026-11-05: `info.contact`, `info.license`, top-level `tags` (description, `externalDocs`), a caller's `operationId` (`RouteExtra.operation_id`); closed 2026-11-06: typed path parameters (`RouteExtra.path_parameters`) and request bodies of other media types (`RouteExtra.request_bodies`); what remains is header/cookie parameters and examples declared in `Info.route_extras` beside the route rather than on it (by design: `router` stays spec-agnostic), AND-combinations of security schemes, a single `example` per media type (no named `examples` map), and `$ref` use inside `RouteDoc` being text (`schemaRef`), not derived from Zig types
+**Where we are ahead:** deterministic byte-identical output, atomic failure (`InvalidUtf8`, `PathCollision`, malformed schema are errors, never a partial document — `write` included), unique `operationId`s (a colliding base gets a `_<n>` suffix, and the self-check refuses duplicates), per-route include filter, validator-checked output, and it plugs into the module's own `router`/`validate` (`query_schema` from `writeJsonSchemaFor`). · **Where we are behind:** header/cookie parameters and examples are declared in `Info.route_extras` beside the route rather than on it (by design: `router` stays spec-agnostic, see *What is deliberately not done*), security requirements cannot be AND-combined, there is a single `example` per media type (no named `examples` map), and `$ref` use inside `RouteDoc` is text (`schemaRef`), not derived from Zig types.
 
 ## Design & invariants
 Two layers. `Generator` walks `Router.routes()` and emits a valid OpenAPI 3.1 JSON document
@@ -47,80 +46,92 @@ the first request that needs it, and cached (behind a lock) for the Endpoint's w
 route registered AFTER that first request will not appear. Deterministic, minified output: paths in
 first-registration order, methods per path in `http.Method` declaration order, fixed key order
 inside every object, no whitespace — two runs over the same router produce byte-identical
-documents. Documented FastAPI-shape compromises: path parameters always `required: true` with
-`schema: {type: "string"}`; a `*wildcard` segment becomes a plain `{param}` (OpenAPI has no
+documents. Documented FastAPI-shape compromises: path parameters are always `required: true` with
+`schema: {type: "string"}` unless `RouteExtra.path_parameters` declares a schema or description for the name; a `*wildcard` segment becomes a plain `{param}` (OpenAPI has no
 cross-segment template, matching FastAPI's own `:path` compromise); undocumented routes get a
 minimal 200-only operation; implicit HEAD→GET auto-route and 404/405 fallbacks are not emitted (they
-are dispatch behavior, not operations). `RouteDoc.request_schema` (JSON Schema as text) is parsed
+are dispatch behavior, not operations); CONNECT and extension-method (`.other`) routes are not emitted either (an OpenAPI 3.1 Path Item has no field for them, root.zig:630-632). `RouteDoc.request_schema` (JSON Schema as text) is parsed
 and re-emitted normalized/minified; malformed text is a typed `error.InvalidRequestSchema`, never a
-panic or silent drop. `RouteDoc.query_schema` (an object schema as text, or `allOf` of them, 2026-09-28) becomes one
+panic or silent drop. `RouteDoc.query_schema` (an object schema as text, or `allOf` of them) becomes one
 `in: query` parameter per property after the path parameters, required when any part requires it,
 `allOf` of its schemas when several parts describe it; a schema that does not name parameters that
 way is `error.InvalidQuerySchema`.
 
-**`operationId` (audit finding openapi-F13, reversing a prior "deliberately omitted" decision):**
-now always emitted, deterministically — lowercase method + `_` + the converted path's segments
-joined by `_`, a templated segment's `{`/`}` stripped (`GET /users/{id}` → `get_users_id`). Unique
-across one document. The base above is NOT injective (review 2026-10-23: `/a/b` and `/a_b`,
-`/users` and `/users/`, `/u/:id` and `/u/id` share one, and the earlier "unique by construction"
-claim was wrong — openapi-spec-validator refused such a document with `DuplicateOperationIDError`
-while the build's own check let it through). So an operation whose base an operation EARLIER in the
+**`operationId`:** always emitted, deterministically — lowercase method + `_` + the converted path's segments
+joined by `_`, a templated segment's `{`/`}` stripped (`GET /users/{id}` → `get_users_id`; `operationIdBase`,
+root.zig:1252). `RouteExtra.operation_id` replaces it for one route (root.zig:315). The base is NOT injective
+(`/a/b` and `/a_b`, `/users` and `/users/`, `/u/:id` and `/u/id` share one), so an operation whose id an operation EARLIER in the
 document (paths in first-registration order, methods in `http.Method` order) already holds gets the
-base plus the smallest `_<n>`, n ≥ 2, that is neither another route's base nor already picked; a
-route whose base collides with nothing keeps it, so existing documents' ids do not move. And
-`validateOpenApi31` refuses two operations (paths and webhooks together) with one id —
+base plus the smallest `_<n>`, n ≥ 2, that is neither another route's base nor already picked
+(`operationIds`, root.zig:1272); a route whose base collides with nothing keeps it, so existing documents'
+ids do not move. `validateOpenApi31` refuses two operations (paths and webhooks together) with one id —
 `error.DuplicateOperationId` — so the self-check holds the property, not the construction.
 
-**UTF-8 (audit finding openapi-F4):** every `[]const u8` this module is about to hand to
+**UTF-8:** every `[]const u8` this module is about to hand to
 `std.json.Stringify` — `Info` fields, every `RouteDoc` string field, and each route's raw pattern
 (which also covers the converted path: `convertPattern` only rewrites `:`/`*`/`{`/`}`, all ASCII) —
-is checked with `std.unicode.utf8ValidateSlice` BEFORE any output is written, atomically failing
+is checked with `std.unicode.utf8ValidateSlice` BEFORE any output is written (`checkUtf8`, root.zig:999), atomically failing
 the whole build with `error.InvalidUtf8` rather than emitting a partial document. JSON text MUST be
 valid UTF-8 (RFC 8259 §8.1); `std.json.Stringify.write([]const u8)` does not enforce that itself —
 a non-UTF-8 slice silently becomes a JSON array of byte values instead of a string, and a raw
 non-UTF-8 byte reaching an `objectField` key goes out unescaped, producing text `std.json` itself
-refuses to re-parse (falsifying a prior PASS-log claim that "route metadata cannot break the
-document structure").
+refuses to re-parse.
 
-**Path collisions are a build error, not a silent merge (audit finding openapi-F5):** two different
+**Path collisions are a build error, not a silent merge:** two different
 `router` routes can convert to the same `(path, method)` — `/f/:p` and `/f/*p` both become
 `/f/{p}`, or a literal `/f/{p}` collides with `/f/:p` — and `router` accepts both as distinct,
-independently dispatchable routes. Silently keeping only the first (as before) made a real,
-reachable route disappear from the document without a trace; that is `error.PathCollision` now.
+independently dispatchable routes. Keeping only one would make a real,
+reachable route disappear from the document without a trace, so that is `error.PathCollision`.
 This is a different situation from a genuinely duplicate key with only ONE underlying value (two
-`RouteDoc.Response`s sharing a status code, or a pattern reusing one capture name — both still
-"first wins", correct because there is nothing else to pick).
+`RouteDoc.Response`s sharing a status code, or a pattern reusing one capture name — both "first wins", correct because
+there is nothing else to pick; a response status and an example per status are tracked in hash sets, so a route with
+100000 responses stays linear). `PathCollision` also fires for two router-legal routes that differ only in a capture's
+constraint (`/x/{id:[0-9]+}` and `/x/{id:[a-z]+}`, both `/x/{id}`): OpenAPI has one path item per template, so the
+honest outcome is the error; the `Endpoint` then answers 500 until one route is excluded with `Info.include`.
 
-**Self-check (audit finding openapi-F9, closes F12 as a strict subset):** `Generator.build` parses
-its own generated JSON back and runs `validateOpenApi31` (below) on it before returning — the
-checker already existed and already caught this class of defect in the module's OWN tests (an
-empty `info.title`, an F4-class encoding problem turning a string into an array), but never ran on
-a document before it reached a caller. Costs one extra parse of the whole document, paid once per
-`Endpoint`'s lifetime (the F1 fix already caches the outcome after the first call).
+**Self-check:** `Generator.build` parses its own generated JSON back and runs `validateOpenApi31` (below) on it
+before returning (root.zig:414-430), so a defect in the generator itself is a `BuildError` (`SelfCheckMalformed`, or the
+checker's error), never a served document. Costs one extra parse of the whole document, paid once per
+`Endpoint`'s lifetime (the outcome is cached after the first call). `Generator.write` builds the document in memory first,
+so the caller's writer receives either the whole validated document or nothing.
 
-**Excluding a route (audit finding openapi-F11, additive):** `Info.include: ?*const fn (router.Route)
-bool`, `null` by default (every registered route is documented, the pre-fix behavior). Applied
-before anything else touches a route, so an excluded route's metadata is never UTF-8-checked or
+**Excluding a route:** `Info.include: ?*const fn (router.Route) bool`, `null` by default (every registered route
+is documented). Applied before anything else touches a route, so an excluded route's metadata is never UTF-8-checked or
 written and cannot trigger `error.InvalidUtf8`/`error.PathCollision` against one that IS included.
 
-Concurrency: `Generator.build`/`Generator.write` are reentrant — pure
+**Concurrency:** `Generator.build`/`Generator.write` are reentrant — pure
 functions of an immutable (post-`build`) `Router` — but `Endpoint` is `.threadsafe`, not
-`.reentrant`: it builds the document once behind a lock (a failed build is cached too, so a bad
-`request_schema` does not pay full generation cost on every request either) and serves the same
+`.reentrant`: it publishes the built document once under a lock (`Endpoint.spec`, root.zig:1600) and serves the same
 cached bytes for its whole lifetime; a route registered after the first request is invisible to
-it. ⚠ **Precondition, not a guarantee (audit finding openapi-F10):** "post-`build`" above means
+it. The build itself runs OUTSIDE the lock, so concurrent first callers may each build once (bounded by the number of
+threads; the losers free their copy). A build that fails with a property of the route table (a bad `request_schema`)
+is cached too, so it does not pay full generation cost on every request; `OutOfMemory` is a transient condition and is
+returned uncached (the next request builds again, and an allocation failure in the self-check parse is `OutOfMemory`,
+never `SelfCheckMalformed`). ⚠ **Precondition, not a guarantee:** "post-`build`" above means
 registration (`add`/`addDoc`/`group`) has FULLY completed before the Router is handed to
 `http.Server`/any concurrent dispatch — `r.routes()` is read once, unsynchronized, by whichever
 request thread happens to trigger the build, so a route registered concurrently with (not just
-chronologically before) that read races `Router`'s own backing slice. The audit could not force a
-crash (`Router` allocates from an arena, so a grown-past block stays mapped), but did not need to:
-the fix is the same "building is single-owner" phase discipline `router/SPEC.md` §Concurrency
-already requires, made explicit here and in `Endpoint`'s own doc comment, not new synchronization. Responses carry a strong `ETag` (a fingerprint of the cached document); a matching
-`If-None-Match` gets `304`. No external assets: Swagger-UI needs CDN JS/CSS (a CSP/provenance problem) so it is deliberately not
-served; the optional `docs_path` instead serves a tiny self-contained HTML viewer (inline CSS +
-vanilla JS, zero external requests). Clean-room; design references only (behavior, no source
+chronologically before) that read races `Router`'s own backing slice. The fix is the same "building is
+single-owner" phase discipline `router/SPEC.md` §Concurrency already requires, not new synchronization. Responses carry a strong `ETag` (a fixed-seed Wyhash fingerprint of the cached
+document, `etagOf`, root.zig:1655); a matching `If-None-Match` gets `304` (`http.conditional`). `Endpoint` answers every
+method other than GET/HEAD on its path (and on `docs_path`) with 405 + `Allow: GET, HEAD`, a CORS preflight `OPTIONS`
+included — register a CORS middleware before it if browsers on other origins fetch the spec. No external assets: Swagger-UI needs
+CDN JS/CSS (a CSP/provenance problem) so it is deliberately not served; the optional `docs_path` instead serves a tiny
+self-contained HTML viewer (inline CSS + vanilla JS, zero external requests; `Endpoint.path` is spliced into the script
+as an escaped string literal with `<` as `\u003c`, `writeScriptString`, root.zig:1775). Because the script and style are inline, a strict
+`Content-Security-Policy` without `'unsafe-inline'` blocks the page: serve it under a policy that allows them, or not at all.
+Clean-room; design references only (behavior, no source
 copied — see NOTICE): FastAPI (document shape) and utoipa (route-metadata→spec mapping); format per
 the OpenAPI Specification 3.1.0.
+
+## Design notes by feature
+
+- **`components/schemas` and `$ref`.** `Info.schemas` (a named-schema registry, root.zig:186) is emitted once under `components.schemas`; `schemaRef(name)` (root.zig:193) builds the `$ref` text a route's schema fields carry (`request_schema`, `Response.schema`, `query_schema`). The same name with a different normalized body is `error.SchemaConflict` (identical repeats fold, a whitespace-different repeat included); an invalid entry is `error.InvalidComponentSchema`. `validateOpenApi31` resolves every local `$ref` as a JSON Pointer (`error.DanglingRef`; `%XX` decoded with exactly two hex digits per RFC 3986, a sign or a lone `%` stands for itself, `~0`/`~1` per RFC 6901; a `$ref` inside a subtree that has its own `$id` is not checked against the document (it points into that resource), and references to other documents are not followed). The registry lives in `Info`, not `RouteDoc` (that type belongs to `router`).
+- **`servers`, security, extras.** `Info.servers`; `Info.security_schemes` (apiKey header/query/cookie, http basic, http bearer with format, OAuth2 implicit/password/clientCredentials/authorizationCode, openIdConnect) alongside `bearer_auth`; `Info.security` (document-wide; each entry is one alternative, so requirements are OR-combined) and per-operation `RouteExtra.security` (`&.{}` = public). `Info.route_extras` (matched to a route by method + raw pattern, first entry for a route wins) carries header/cookie parameters, `request_example` and `response_examples` (an `example` on the media type). An entry matching no registered route, or an example for an undocumented status, is `error.UnknownRouteExtra`; an entry for a route excluded by `Info.include` is not an error and is not emitted. The checker adds `UnknownSecurityScheme`, `InvalidSecurityScheme`, `InvalidServer`, `InvalidComponentName`. All of it is off by default, and then the output is byte-identical to the plain document.
+- **`info` and tags.** `Info.contact`, `Info.license` and top-level `Info.tags` (description and `externalDocs` per tag; names unique, `error.InvalidTags`; a tag used by a route need not be listed). The checker refuses a license without `name` or with both `identifier` and `url` (`InvalidLicense`).
+- **Other request media types and typed path parameters.** `RouteExtra.request_bodies` (`RequestBody{media_type, schema, example}`, emitted after the derived `application/json` body; the same media type twice, compared case-insensitively and including the derived body, is `error.DuplicateRequestBody`; an empty one is `error.InvalidMediaType`) and `request_body_required`. `RouteExtra.path_parameters` (`PathParameter{name, description, schema, deprecated}`), declared on the openapi side so `router` stays spec-agnostic; a name that is no capture of the pattern is `error.UnknownPathParameter`, and the checker refuses an `in: path` parameter missing from the template (`UndeclaredPathParameter`) and a template variable without one (`UnresolvedPathParameter`).
+- **`query_schema` shapes.** An object schema whose `properties` name the parameters, or `allOf` of such schemas (what `validate.writeJsonSchemaFor` writes when a type declares `validate_rules`), the schema's own `properties`/`required` counting beside its `allOf` parts. Parameters come in order of first appearance; one named by several parts gets `allOf` of its schemas and is required when any part requires it; `anyOf`/`oneOf`/`not`/`if` parts are skipped as conditional, a `$ref` part and a `required` name no part describes are `error.InvalidQuerySchema` (root.zig:1447).
+- **JSON text depth.** JSON text taken from the caller (`request_schema`, response and parameter schemas, components, examples) may nest at most 128 deep (`max_json_depth`, root.zig:725; deeper is `Invalid*Schema` / `InvalidExample`, because `std.json`'s writer asserts a depth of 256 in safe builds and overflows the stack in fast ones); `validateRefs` and the depth check are iterative (root.zig:2057), so a document nested ~10^5 deep is a verdict, not a stack overflow.
 
 ## Threat model / out of scope
 Not a security boundary: the generated document exposes exactly the route/method/doc metadata
@@ -130,127 +141,36 @@ must not put secrets in `RouteDoc` fields. `Endpoint` adds no auth of its own �
 `/openapi.json` (and the docs page) behind the router's own auth middleware if it should not be
 public. Does not validate that `request_schema`/`responses` describe the handler's actual behavior
 — only that `request_schema` is JSON whose value is an object or a boolean (the JSON Schema 2020-12
-shapes; `null`, `5` or `[]` used to go out as a `schema`, refused by openapi-spec-validator, until
-2026-10-23), not that its keywords are meaningful; a documented contract the handler
+shapes; `null`, `5` or `[]` are the field's typed error, not a `schema`), not that its keywords are meaningful; a documented contract the handler
 doesn't honor is a caller bug this module cannot catch. Does not generate client SDKs, do
 request/response validation at runtime, or support OpenAPI 3.0/Swagger 2.0 output.
 
 ## Verification
-`zig build test-openapi`. Offline: golden OpenAPI 3.1 JSON for a known route set
-(`:id`→`{id}` conversion, required path parameters, `RouteDoc` fields surfaced, default 200 for
-undocumented routes); empty router produces a valid empty-`paths` document with no panic; method
-grouping deterministic by `http.Method` enum order; malformed `request_schema` returns
-`error.InvalidRequestSchema`; the endpoint serves GET/HEAD, 405+`Allow` on other methods, passes
-through everything else (driven socket-free via `http.Server.serveStream`); the docs page is
-checked for zero external asset references. In-process integration: a real `http.Server` + router +
-endpoint bound to `127.0.0.1:0`, fetched with `http.Client` — the served document parses and
-contains the registered routes/operations.
 
-**Parity members (2026-10-12), `src/parity_test.zig`.** Golden (exact-bytes) documents: servers + one
-`User` model referenced by two routes (emitted once, a whitespace-different repeat folded); every
-security scheme kind with a document-wide requirement and per-operation selection (including the
-public `security: []` override); header/cookie parameters after the query ones, request and response
-`example`s (also on an undocumented route's default 200 and a body example without a schema); the
-unused-members document byte-identical to the plain one. Each golden document also passes
-`validateOpenApi31` (through `Generator.build`'s self-check and again explicitly), and all five
-were accepted by openapi-spec-validator 0.7.1 (2026-10-12, run over the frozen golden text by the
-reviewing session; the goldens pin those bytes, so the external verdict holds while they stay
-green). Negative:
-dangling `$ref` (no registry, registry without the name), `SchemaConflict`, `InvalidComponentSchema`,
-bad component names, an undeclared security scheme (document-wide and per operation),
-`DuplicateSecurityScheme`, OAuth2 without a flow or missing a URL, empty apiKey name / OIDC URL,
-`InvalidServer`, `UnknownRouteExtra` (unregistered route, undocumented status), `InvalidExample`,
-`InvalidParameterSchema`, a duplicated header parameter, non-UTF-8. The checker alone on hand-written
-documents: JSON Pointer `~0`/`~1`, array indices, scalar descent, other-document refs ignored. Not
-re-run through `openapi_spec_validator` (the existing frozen oracle vectors are untouched and green).
+Run: `scripts/modtest openapi` (offline). Interop instruments: `zig build interop-openapi` re-takes the oracle vectors and `-- --check` compares them with the committed file (`tools/README.md`; needs python3 with `openapi-spec-validator` and a FastAPI virtualenv outside the repository).
 
-### External-anchor investigation: `openapi_spec_validator` (2026-08-01, done)
+- **Golden and behaviour tests** (`src/root.zig`): golden OpenAPI 3.1 JSON for a known route set (`:id`→`{id}` conversion, required path parameters, `RouteDoc` fields surfaced, default 200 for undocumented routes); an empty router produces a valid empty-`paths` document; method grouping deterministic by `http.Method` order; every typed `BuildError`; the endpoint serves GET/HEAD, 405 + `Allow` on other methods, passes through everything else (driven socket-free via `http.Server.serveStream`); the docs page is checked for zero external asset references and for its escaped script string; an allocation-failure sweep over the build and the endpoint's cache (OOM is returned and not cached); the checker's refusals as a table of hand-written documents.
+- **Parity members** (`src/parity_test.zig`): exact-bytes golden documents for servers plus one shared model referenced by two routes (emitted once, a whitespace-different repeat folded), every security scheme kind with a document-wide requirement and per-operation selection (including the public `security: []` override), header/cookie parameters and request/response examples (also on an undocumented route's default 200 and a body example without a schema), and the unused-members document byte-identical to the plain one. Each golden document passes `validateOpenApi31` (through `Generator.build`'s self-check and again explicitly) and was accepted by openapi-spec-validator 0.7.1, run once over the frozen golden text (the goldens pin those bytes, so the external verdict holds while they stay green). Negative tests: dangling `$ref`, `SchemaConflict`, `InvalidComponentSchema`, bad component names, an undeclared security scheme, `DuplicateSecurityScheme`, malformed OAuth2 / apiKey / OIDC declarations, `InvalidServer`, `UnknownRouteExtra`, `InvalidExample`, `InvalidParameterSchema`, a duplicated header parameter, non-UTF-8 in every `Info` string, contact/license/tag fields reaching the document, custom operation ids stepping derived ids around them.
+- **External validator anchor** (`external anchor:` tests in `src/root.zig`): the exact JSON `Generator.build` produces for the golden route set, and a deliberately invalid document (a response without `description`), were run once, offline, through `openapi_spec_validator`; its verdicts (accepted; rejected with the same defect `error.MissingResponseDescription` reports) are frozen as offline tests and the tool is not re-invoked at test time. The OpenAPI Initiative's own published v3.1 example document is accepted by the checker (the module's `NOTICE` carries its Apache-2.0 attribution). See *Anchoring* for the generated-table oracle.
+- **Oracle replay** (`src/spec_oracle_test.zig`, vectors in `src/spec_oracle_vectors.zig`, producers `tools/spec_oracle.py` + `tools/interop.zig`): the validator's verdicts on documents the module built for drawn route tables, on mutations of them, and FastAPI's path mapping of the same routes; see *Anchoring*.
+- **No-panic sweep** (`src/sweep_test.zig`): a document or schema text nested hundreds of thousands deep, large inputs (many refs into one object, tens of thousands of parameters, template variables, properties, `required` names, captures, registry entries, security schemes, `route_extras`, responses and response examples) stay linear and exact, the 128-depth boundary, and signed or short percent escapes in pointer tokens are not decoded.
+- **Fuzz:** the deterministic driver `OPENAPI_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`, testkit's driver, never `zig build --fuzz`) runs two harnesses: `build` (a whole `Info` + route table drawn from a byte script, the document built twice by two paths that must agree byte for byte, and a document that built must satisfy the checker) and `spec` (the checker on raw bytes as JSON, and on a valid generated document damaged at the byte level and by structural token swaps). A verbatim-spec corpus is replayed in every run.
+- **In-process integration:** a real `http.Server` + router + endpoint bound to `127.0.0.1:0`, fetched with `http.Client`: the served document parses and contains the registered routes/operations.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-The in-house structural checker (`validateOpenApi31`) and the adopted OAI example (both above)
-prove this module accepts a real document and that its own rules fire — not that a real,
-schema-driven validator agrees. `openapi_spec_validator` (JSON-Schema-backed, the reference
-OAS validator) was run once, offline, in a throwaway venv (`~/.cache/zig-libs-openapi`),
-against two documents: (1) the exact JSON `Generator.build` produces for the route set in
-"generate: golden OpenAPI 3.1 document for a known route set" — `validate()` raised no
-exception, confirming this module's own generated output is genuinely valid OAS 3.1, not
-merely self-consistent; (2) a deliberately invalid document missing a response
-`description` — rejected with `OpenAPIValidationError: 'description' is a required
-property`, the same structural defect this module's own checker already reports as
-`error.MissingResponseDescription`, now independently confirmed rather than assumed. **No
-disagreement was found.** Both documents and the real verdict are frozen as permanent
-offline tests in `src/root.zig` (`external anchor: …`); per the governing rule the tool was
-run once and is not re-invoked at test time. No `/NOTICE` entry (black-box validating
-oracle, root NOTICE §0); the module's existing NOTICE for the adopted OAI example document
-is unrelated and unaffected.
+## What is deliberately not done
 
-**Audit 2026-10-04 (mutation).** 35 schemata mutants over the UTF-8 pre-checks, `include`
-filtering, `PathCollision`, pattern templating, operation members (requestBody `required`,
-duplicate statuses, the default 200, `deprecated`), `operationId`, path and query
-parameters (every `InvalidQuerySchema` branch, `allOf` merging, `required`), the endpoint
-(HEAD/GET, 304, 405 + `Allow`, docs path) and `validateOpenApi31`: 34 killed, 1 equivalent,
-0 left alive. Equivalent: admitting a 1-byte `:` segment as a path parameter -- outside the
-input contract (`buildRoutes` takes patterns in `Router.add` syntax, and `router` refuses an
-empty parameter name with `InvalidPattern`). Tests added for the 3 real gaps: a non-UTF-8
-response description, a non-string response `description` (OAS 3.1 §4.8.17), and non-operation
-Path Item members (`summary`, `parameters`; OAS 3.1 §4.8.9) passing the checker.
-
-**Audit 2026-10-23 (A1 re-audit for grade 1).** Sonnet review (11 findings) over the whole of
-`src/root.zig` + 95 schemata mutants over the generator (UTF-8 pre-checks, include filter,
-collisions, templating, operations, operationId and its disambiguation, parameters, query schema
-mapping, schemas registry, security schemes, `write`'s atomicity), the endpoint (OOM not cached,
-304, 405 + `Allow`, docs path and its escaping, cache publish) and `validateOpenApi31` (every
-refusal, operationId uniqueness, `$id` scopes, `%XX` pointer decoding): 86 killed at once, 9
-survivors were each a missing test (a `RouteExtra` matched by pattern alone, an escaped `}` inside a
-constraint, an implicit OAuth2 flow without `authorizationUrl`, a stray or empty `{}` in a path key,
-`in: body`, a query parameter named like a template variable, status keys `600` and `2ab`) — 95/95
-after them. Fixed from the review: duplicate `operationId`s (above); a transient `OutOfMemory` was
-cached by `Endpoint` and answered every later request until a restart (now returned, the next
-request builds again); a schema that is JSON but not a schema (`null`, `5`, `[]`) went out as one
-(now the field's typed error — request, response, component, parameter and query-property
-schemas); a `query_schema`'s own `properties`/`required` were dropped once it had `allOf` — which
-is exactly where `validate.writeJsonSchemaFor` puts cross-field rules, so such a type documented NO
-query parameters (now both count; `anyOf`/`oneOf`/`not`/`if` parts are skipped as conditional, a
-`$ref` part is `InvalidQuerySchema`); `Generator.write` streamed into the caller's writer, leaving a
-prefix on a mid-walk error and skipping the self-check (now the built document or nothing); a `$ref`
-inside a subtree with its own `$id` was resolved against the document (`DanglingRef` on a schema
-openapi-spec-validator accepts) and `%XX` in a pointer was not decoded; the docs page spliced
-`Endpoint.path` raw into a script string (now escaped, `<` as `\u003c`) and its comment claimed
-strict-CSP friendliness it does not have (inline script/style); duplicate response statuses past
-the 32nd and duplicate captures past the 64th escaped their capped dedup buffers (now no cap).
-Not changed, with reason → Backlog.
-
-**Mutation (2026-11-07, whole module,** `root.zig` production code, schemata in a detached copy, ReleaseSafe, strict verdict): 436 mutants, 431 killed (78 by new tests), 5 equivalent, 0 undecided. The earlier 108-mutant run was thin; covered now: every UTF-8 pre-check, include filter, path grouping and collisions, components/security, registry dedup, the depth cap (±1, dropped, children), `resolveExtras`, `convertPattern`/`appendTemplateSegment`, operation/request-body/response/parameter writers, operation ids, `Endpoint.spec` cache/OOM/leak, ETag, the 405 answer, the docs-page script string, and ~100 `validateOpenApi31` refusals. New tests: a ~50-case `validateOpenApi31` table, invalid UTF-8 in 29 members, an allocation-failure sweep, every OAuth2 flow key, response examples, ETag format, the script string's escapes. Equivalent: the empty-extras shortcut (104), a template colon at any depth (151, refused as `InvalidPathKey` either way), the operation-id counter (217, the picked id is in `taken`), the `InvalidServer` object guard (395, `paramField` returns null), and 295 (the `\u{x:0>4}` padding sits in a comptime format string, so the switch could not reach it; the script-string test pins `\u001f`/`\u0001`). **Finding openapi-O1 (fixed `1c33b51a`):** an allocation failure in `buildRoutes`' self-check parse came back as `SelfCheckMalformed`, which `Endpoint.spec` caches for good — one transient OOM left the endpoint answering 500 until restart; the sweep now requires `OutOfMemory`.
-
-**Delta mutation 2026-11-20 (wave 9, linear response bookkeeping + strict `%XX` decoding).** 15 schemata mutants over the change (the response-status hash set and its `continue`, the per-route example map and its first-entry-wins rule, the documented-status check and its early return, `decodePointerToken`'s bound, radix, both error fallbacks, the `and` of the two digit checks and the shift/or): 14 killed at once, the survivor (radix 10 for the high digit, only decimal high digits were exercised) became test cases with `%E2%82%AC` / `%e2%82%ac`; 15/15. The card counts are the 2026-11-07 whole-module run plus this delta (431 + 15 killed of 436 + 15).
+- **OpenAPI 3.0 / Swagger 2.0 output, request/response runtime validation, client SDK generation:** out of scope, not planned. The module emits 3.1.0 only; `validateOpenApi31` accepts 3.1.x only.
+- **`route_extras` on `RouteDoc`:** rejected. `router` would grow OpenAPI-only concepts (security requirements, examples, header/cookie parameter schemas) and a deep copy of them, for every router user, while `Info.route_extras` gives the same document and keeps `router` independent of the spec format. Revisit only if a second consumer of `RouteDoc` needs the same fields.
+- **A router `{name:re}` constraint is NOT auto-emitted as `pattern`:** RE2 syntax is not ECMA-262, so a copy can be wrong; declare `pattern` in the `PathParameter` schema. No `encoding` object for multipart parts.
+- **Swagger-UI:** not served (needs external JS/CSS), see *Design & invariants*.
+- **Secrets in documentation:** the module does not scrub `RouteDoc` text (see *Threat model / out of scope*).
 
 ## Backlog / deferred
-- **Delta audit 2026-10-29 (no-panic sweep § GI):** 13 schemata mutants over the sweep diff (depth cap and its boundary, depth walk without arrays, validateRefs pushes, `$id` skip, first-entry-wins, operationId counter start, query `required` dedup, parameter/template checks): 12 killed on the first run; the survivor (a `$ref` entry's name/in no longer counted as an earlier parameter) became a case in the OA-3 test. 13/13. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI), left as LOW**: ~~R-openapi-1 per-route response bookkeeping (duplicate-status scan, `responseExample`, `checkResponseExamples`) is quadratic in a route's `responses` list~~ — DONE 2026-11-20 (a status hash set and one status-to-example map per route; test "100000 responses and 100000 response examples … stay linear"); R-openapi-2 `Endpoint.spec` lets concurrent first callers each build, and an OOM build is retried per request (no single-flight); ~~R-openapi-3 `decodePointerToken` takes a signed `%+f` / `%-0` escape~~ — DONE 2026-11-20 (exactly two hex digits, RFC 3986 `pct-encoded`; a sign or a lone `%` stands for itself); R-openapi-4 the sweep's timing tests assert a 5 s budget on work that takes milliseconds.
-- **Review 2026-10-23, kept as designed:** (a) `PathCollision` also fires for two router-legal
-  routes that differ only in a capture's constraint (`/x/{id:[0-9]+}` and `/x/{id:[a-z]+}`, both
-  `/x/{id}`) — OpenAPI has one path item per template, so the honest outcome is the error; the
-  Endpoint then answers 500 until one route is excluded with `Info.include`. (b) ~~Deeply nested
-  schema text recurses in `validateRefs` and `std.json`'s writer~~ — fixed by the 2026-10-29 no-panic
-  sweep: `validateRefs` is iterative, JSON text taken from the caller may nest at most 128 deep
-  (`max_json_depth`; deeper is `Invalid*Schema` / `InvalidExample`, since the writer asserts 256 in
-  safe builds). (c)
-  `Endpoint` answers every non-GET/HEAD method on its path with 405, a CORS preflight `OPTIONS`
-  included — register a CORS middleware before it if browsers on other origins fetch the spec.
-OpenAPI 3.0/Swagger 2.0 output, request/response runtime validation, and client SDK generation are
-explicitly out of scope, not planned. Richer path-parameter typing beyond `string` would require
-`router` itself to carry richer capture types.
 
-- ~~**`components/schemas` + `$ref` reuse**~~ — DONE 2026-10-12: `Info.schemas` (named-schema registry, emitted once under `components.schemas`; `schemaRef(name)` builds the `$ref` text a route's schema fields carry; same name + different normalized body is `error.SchemaConflict`, identical repeats fold) and `validateOpenApi31` resolves every local `$ref` as a JSON Pointer (`error.DanglingRef`; other-document refs are not followed). The registry lives in `Info`, not `RouteDoc` (that type belongs to `router`).
-- ~~**`servers`, further security schemes (apiKey, OAuth2/OIDC), header and cookie parameters, `examples`**~~ — DONE 2026-10-12: `Info.servers`; `Info.security_schemes` (apiKey header/query/cookie, http basic, http bearer with format, OAuth2 implicit/password/clientCredentials/authorizationCode, openIdConnect) alongside `bearer_auth`; `Info.security` (document-wide) and per-operation `security` (`&.{}` = public); `Info.route_extras` (matched by method + raw pattern) for header/cookie parameters and `example` on request/response media types. Checker: `UnknownSecurityScheme`, `InvalidSecurityScheme`, `InvalidServer`, `InvalidComponentName`.
-- ~~**Request bodies other than `application/json`; typed path parameters**~~ — DONE 2026-11-06: `RouteExtra.request_bodies` (`RequestBody{media_type, schema, example}`, emitted after the derived `application/json` body; same media type twice, case-insensitively, is `DuplicateRequestBody`; empty is `InvalidMediaType`) and `request_body_required`; `RouteExtra.path_parameters` (`PathParameter{name, description, schema, deprecated}`, declared on the openapi side so `router` stays spec-agnostic; a name that is no capture is `UnknownPathParameter`, and the checker already refuses an `in: path` parameter missing from the template, `UndeclaredPathParameter`). Deliberately not done: a `{name:re}` router constraint is NOT auto-emitted as `pattern` (RE2 syntax is not ECMA-262, so a copy can be wrong; declare `pattern` in the parameter schema), and no `encoding` object for multipart parts. Anchored on FastAPI/utoipa output shapes from memory (fairly sure).
-- ~~**Move `route_extras` onto `RouteDoc`**~~ (2026-10-12) — REJECTED the same day (owner left the call to the session): `router` would grow OpenAPI-only concepts (security requirements, examples, header/cookie parameter schemas) and a deep copy of them, for every router user, while `Info.route_extras` gives the same document and keeps `router` independent of the spec format. Revisit only if a second consumer of `RouteDoc` needs the same fields.
-- **OpenAPI 3.2** (survey 2026-09-30) — the Specification repo's latest release is 3.2.1 (2026-09-10); we emit 3.1.0, which remains valid and widely supported. Watch only.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · util · threadsafe` + deps: `router`, `http` (+ `std.json`) — canonical source is
-`pub const meta` in src/root.zig.
+- **`Endpoint.spec` single-flight (LOW):** concurrent first callers each build the document (bounded by the thread count) and an `OutOfMemory` build is retried per request; there is no single-flight. Left as designed until a consumer sees the cost.
+- **Sweep timing tests (LOW):** the no-panic sweep's timing tests assert a 5 s budget on work that takes milliseconds, so they catch a quadratic regression only loosely; tighten if a regression slips through.
+- **OpenAPI 3.2:** the Specification repo's latest release is 3.2.1; we emit 3.1.0, which remains valid and widely supported. Watch only.
 
 ## Anchoring
 
@@ -260,5 +180,3 @@ explicitly out of scope, not planned. Richer path-parameter typing beyond `strin
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
 **What the tests actually contain.** The `external anchor` tests in src/root.zig freeze openapi_spec_validator's verdict on this module's OWN generated document (accepted) and on a deliberately invalid one (rejected, for the same reason validateOpenApi31 reports) -- teeth in both directions; the test "conformance: the checker accepts the OpenAPI Initiative's own published v3.1 example" adds the OAI's published v3.1 example. The generator's route-to-path mapping beyond that document is self-graded src/spec_oracle_test.zig replays openapi-spec-validator 0.7.1 (`tools/interop.zig` + `tools/spec_oracle.py`, frozen 2026-10-05) over 102 route tables (100 drawn: static segments with UTF-8, dots, tildes, percent signs; `:params`; `{name}` captures, whole and inside a segment, with and without a regexp constraint (since 2026-10-07); a final `*wildcard`; trailing slashes; every method; RouteDoc summaries, tags, deprecated, request/query/response schemas, problem+json media types; bearer auth), each registered on a real `router.Router`: `Generator.build` must produce the very document the validator accepted, or refuse as frozen. Then 168 mutations of accepted documents -- the shapes a generator bug could produce (a template variable without its parameter and the reverse, an optional or duplicate parameter, a bad `in`, a parameter without schema, a bad response key, a response without description, empty responses, a path key without `/`, no title) -- on which `validateOpenApi31` must answer as the validator did, or as a named class decides (SCOPE: unknown members the checker does not police; VALIDATOR_LAX: a path parameter not in its template, which OAS 3.1 forbids and the validator lets through; OPENAPI_30). And FastAPI 0.142 (`tools/fastapi_oracle`, the generator this module's document shape models), given the same routes (`:name` -> `{name}`, `*name` -> `{name:path}`, `{name}` captures verbatim, a constraint dropped), produces the same path templates, the same methods per path and the same path parameters per operation for every one of the 102 built tables (re-taken 2026-10-07: 290 templates, 70 with a capture inside a segment, 29 tables with a regexp constraint, 51 with a wildcard) -- a generation-time invariant; the replay pins the documents it held for. Still checked only structurally (by the validator): the query parameters derived from `query_schema` and the embedded request/response schemas.
-
-**How it got there.** The anchoring work landed. DONE 0bbcefe: real validator both directions; found in-house checker blind to path-param rule 2026-10-05: the generated-document oracle found a DEFECT: a route with a literal `{x}` static segment produced a document with a template variable and no parameter -- built, served, and refused by the validator, because the build's own check (`validateOpenApi31`) never looked at path parameters. The checker now verifies parameters and the template both ways (plus `in`, schema/content, duplicates, response keys), so such a build fails with `UnresolvedPathParameter`. Later the same day (FastAPI installed, user OK): the route-to-template mapping agrees with FastAPI's on every table -- no defect.
