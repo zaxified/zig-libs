@@ -88,6 +88,31 @@ pub const TC_U32 = struct {
     pub const EAT: u8 = 8;
 };
 
+/// A u32 hash-table handle word: `ht` is the table id (`800:` is 0x800), `bucket`
+/// the hash bucket, `node` the entry in it. It is what `TCA_U32_HASH` and
+/// `TCA_U32_LINK` carry, and what a filter's `tcm_handle` holds for a node
+/// (`Handle.fromRaw(htHandle(…))`).
+pub fn htHandle(ht: u12, bucket: u8, node: u12) u32 {
+    return (@as(u32, ht) << 20) | (@as(u32, bucket) << 12) | @as(u32, node);
+}
+
+/// `struct tc_u32_mark` — `match mark VAL MASK`, a match on the packet's
+/// firewall mark. The kernel keeps a hit counter next to it; a request sends 0.
+pub const U32Mark = struct {
+    val: u32,
+    mask: u32,
+    success: u32 = 0,
+};
+
+/// `TCA_CLS_FLAGS_*` — bits of `U32.flags` and `Flower.flags`.
+pub const TCA_CLS_FLAGS = struct {
+    pub const SKIP_HW: u32 = 1;
+    pub const SKIP_SW: u32 = 2;
+    pub const IN_HW: u32 = 4;
+    pub const NOT_IN_HW: u32 = 8;
+    pub const VERBOSE: u32 = 16;
+};
+
 /// `sizeof(struct tc_u32_sel)` without keys: flags/offshift/nkeys + 1 pad,
 /// offmask, off, offoff, hoff, hmask.
 pub const tc_u32_sel_len = 16;
@@ -193,6 +218,25 @@ pub const U32 = struct {
     /// `action …` — the action list run on a match, emitted as the nested
     /// `TCA_U32_ACT`. Empty means "select a class and stop", the v2 behaviour.
     actions: []const ActionSpec = &.{},
+    /// `divisor N` — create a hash table of N buckets (`tc filter add …
+    /// handle 10: u32 divisor 16`). `tc` sends nothing else with it, and so
+    /// does this encoder.
+    divisor: ?u32 = null,
+    /// `ht ID:BUCKET:NODE` — put this filter into that hash table
+    /// (`TCA_U32_HASH`); see `htHandle`.
+    hash: ?u32 = null,
+    /// `link ID:` — a match continues in the hash table with that id
+    /// (`TCA_U32_LINK`); see `htHandle`.
+    link: ?u32 = null,
+    /// `match mark VAL MASK`.
+    mark: ?U32Mark = null,
+    /// `indev NAME` — only for packets received on that interface.
+    indev: ?[]const u8 = null,
+    /// `TCA_U32_FLAGS` — `TCA_CLS_FLAGS.*` (`skip_hw`, `skip_sw`).
+    flags: u32 = 0,
+    /// Further `tc_u32_sel.flags` bits (`TC_U32.OFFSET | VAROFFSET | EAT`),
+    /// next to `TERMINAL`, for a selector with variable offsets.
+    sel_flags: u8 = 0,
 };
 
 /// Wire readback of a u32 filter's options.
@@ -204,6 +248,26 @@ pub const U32Wire = struct {
     /// declared.
     keys: [8]U32Key = @splat(.{ .val = @splat(0), .mask = @splat(0), .off = 0 }),
     keys_len: u8 = 0,
+    /// The selector's offset fields, as the kernel stores them.
+    offshift: u8 = 0,
+    offmask: u16 = 0,
+    off: u16 = 0,
+    offoff: i16 = 0,
+    hoff: i16 = 0,
+    hmask: u32 = 0,
+    hash: ?u32 = null,
+    link: ?u32 = null,
+    divisor: ?u32 = null,
+    mark: ?U32Mark = null,
+    /// `TCA_U32_FLAGS`.
+    cls_flags: ?u32 = null,
+    indev_buf: [qdisc.kind_max]u8 = @splat(0),
+    indev_len: u8 = 0,
+
+    /// `indev`, or an empty slice.
+    pub fn indev(w: *const U32Wire) []const u8 {
+        return w.indev_buf[0..w.indev_len];
+    }
 };
 
 fn appendU32Options(
@@ -213,11 +277,30 @@ fn appendU32Options(
     ps: Psched,
 ) EncodeError!void {
     if (u.keys.len > u32_max_keys) return error.TooManyKeys;
+    if (u.divisor) |d| {
+        // A hash-table creation request carries the divisor and nothing else.
+        return codec.appendAttrU32(gpa, list, TCA_U32.DIVISOR, d);
+    }
     // Emission order matches the `tc` binary's requests (the goldens pin it):
     // everything given on the command line first (the classid, then the action list), then the
     // selector — which is why `flowid X:Y action …` puts CLASSID before ACT.
+    if (u.mark) |m| {
+        var raw: [12]u8 = undefined;
+        std.mem.writeInt(u32, raw[0..4], m.val, native_endian);
+        std.mem.writeInt(u32, raw[4..8], m.mask, native_endian);
+        std.mem.writeInt(u32, raw[8..12], m.success, native_endian);
+        try appendBytes(gpa, list, TCA_U32.MARK, &raw);
+    }
     if (u.classid) |c| try codec.appendAttrU32(gpa, list, TCA_U32.CLASSID, c.raw);
     try action.appendActionList(gpa, list, TCA_U32.ACT, u.actions, ps);
+    if (u.link) |l| try codec.appendAttrU32(gpa, list, TCA_U32.LINK, l);
+    if (u.hash) |h| try codec.appendAttrU32(gpa, list, TCA_U32.HASH, h);
+    if (u.indev) |name| {
+        codec.appendAttrString(gpa, list, TCA_U32.INDEV, name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
 
     const sel_len = tc_u32_sel_len + u.keys.len * tc_u32_key_len;
     var hdr: [codec.attr_header_len]u8 = undefined;
@@ -226,7 +309,7 @@ fn appendU32Options(
     try list.appendSlice(gpa, &hdr);
 
     var sel: [tc_u32_sel_len]u8 = @splat(0);
-    sel[0] = if (u.terminal) TC_U32.TERMINAL else 0;
+    sel[0] = (if (u.terminal) TC_U32.TERMINAL else 0) | u.sel_flags;
     sel[1] = u.offshift;
     sel[2] = @intCast(u.keys.len);
     // sel[3] is the compiler's padding byte before the __be16 offmask.
@@ -238,6 +321,7 @@ fn appendU32Options(
     try list.appendSlice(gpa, &sel);
     for (u.keys) |k| try list.appendSlice(gpa, &k.encode());
     // sel_len is a multiple of 4 by construction — no padding needed.
+    if (u.flags != 0) try codec.appendAttrU32(gpa, list, TCA_U32.FLAGS, u.flags);
 }
 
 pub fn parseU32Options(data: []const u8) codec.Error!U32Wire {
@@ -250,13 +334,36 @@ pub fn parseU32Options(data: []const u8) codec.Error!U32Wire {
         TCA_U32.SEL => {
             if (a.data.len < tc_u32_sel_len) return error.BadLength;
             uw.flags = a.data[0];
+            uw.offshift = a.data[1];
             uw.nkeys = a.data[2];
+            uw.offmask = std.mem.readInt(u16, a.data[4..6], native_endian);
+            uw.off = std.mem.readInt(u16, a.data[6..8], native_endian);
+            uw.offoff = std.mem.readInt(i16, a.data[8..10], native_endian);
+            uw.hoff = std.mem.readInt(i16, a.data[10..12], native_endian);
+            uw.hmask = std.mem.readInt(u32, a.data[12..16], native_endian);
             var off: usize = tc_u32_sel_len;
             while (off + tc_u32_key_len <= a.data.len and uw.keys_len < uw.keys.len) {
                 uw.keys[uw.keys_len] = U32Key.decode(a.data[off..][0..tc_u32_key_len]);
                 uw.keys_len += 1;
                 off += tc_u32_key_len;
             }
+        },
+        TCA_U32.HASH => uw.hash = readScalar(u32, a.data, native_endian),
+        TCA_U32.LINK => uw.link = readScalar(u32, a.data, native_endian),
+        TCA_U32.DIVISOR => uw.divisor = readScalar(u32, a.data, native_endian),
+        TCA_U32.FLAGS => uw.cls_flags = readScalar(u32, a.data, native_endian),
+        TCA_U32.MARK => if (a.data.len >= 12) {
+            uw.mark = .{
+                .val = std.mem.readInt(u32, a.data[0..4], native_endian),
+                .mask = std.mem.readInt(u32, a.data[4..8], native_endian),
+                .success = std.mem.readInt(u32, a.data[8..12], native_endian),
+            };
+        },
+        TCA_U32.INDEV => {
+            const name = a.asString();
+            const n = @min(name.len, uw.indev_buf.len);
+            @memcpy(uw.indev_buf[0..n], name[0..n]);
+            uw.indev_len = @intCast(n);
         },
         else => {},
     };

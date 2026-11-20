@@ -4429,3 +4429,186 @@ const g_flower_enc_v6 =
     "0db800000000000000000000000214002200ffffffffffffffffffffffffffffffff080016000000000006000800080000" ++
     "00";
 const seq_flower_enc_v6: u32 = 1795218406;
+
+// ── u32 hash tables, links, marks, indev, flags and variable offsets ────────
+
+fn u32Golden(comptime hex: []const u8, seq: u32, prio: u16, handle: u32, u: filter.U32) !filter.U32Wire {
+    const codec = @import("netlink").codec;
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq,
+        .add,
+        .{
+            .ifindex = lo,
+            .parent = Handle.init(1, 0),
+            .prio = prio,
+            .eth_type = ETH_P.IP,
+            .handle = Handle.fromRaw(handle),
+        },
+        .{ .u32 = u },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(hex, req);
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const f = try filter.parseFilter(m.payload);
+    return f.u32_sel.?;
+}
+
+test "golden: u32 hash table creation (divisor), with and without a handle" {
+    // tc filter add dev lo parent 1: protocol ip prio 70 u32 divisor 256
+    var w = try u32Golden(g_u32x_divisor, seq_u32x_divisor, 70, 0, .{ .divisor = 256 });
+    try testing.expectEqual(@as(?u32, 256), w.divisor);
+    try testing.expectEqual(@as(u8, 0), w.nkeys);
+    // tc filter add dev lo parent 1: protocol ip prio 71 handle 10: u32 divisor 16
+    w = try u32Golden(g_u32x_divisor_handle, seq_u32x_divisor_handle, 71, filter.htHandle(0x10, 0, 0), .{ .divisor = 16 });
+    try testing.expectEqual(@as(?u32, 16), w.divisor);
+}
+
+test "golden: u32 link into a hash table and a hash key" {
+    // tc filter add dev lo parent 1: protocol ip prio 72 u32 ht 800: order 1 link 10: hashkey mask 0x000000ff at 12 match ip src 10.0.0.0/8
+    const w = try u32Golden(g_u32x_link_hash, seq_u32x_link_hash, 72, 1, .{
+        .terminal = false,
+        .hash = filter.htHandle(0x800, 0, 0),
+        .link = filter.htHandle(0x10, 0, 0),
+        .hoff = 12,
+        // htonl(0xff): the mask is a big-endian word stored as it is.
+        .hmask = std.mem.readInt(u32, &.{ 0, 0, 0, 0xff }, native_endian),
+        .keys = &.{U32Key.ipv4Src(.{ 10, 0, 0, 0 }, 8)},
+    });
+    try testing.expectEqual(@as(?u32, 0x80000000), w.hash);
+    try testing.expectEqual(@as(?u32, 0x01000000), w.link);
+    try testing.expectEqual(@as(i16, 12), w.hoff);
+    try testing.expectEqual(@as(u32, 0xff000000), w.hmask);
+}
+
+test "golden: u32 filter placed in a hash-table bucket" {
+    // tc filter add dev lo parent 1: protocol ip prio 73 u32 ht 10:2 match ip dst 10.0.0.1/32 flowid 1:10
+    const w = try u32Golden(g_u32x_ht_node, seq_u32x_ht_node, 73, 0, .{
+        .classid = Handle.init(1, 0x10),
+        .hash = filter.htHandle(0x10, 2, 0),
+        .keys = &.{U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32)},
+    });
+    try testing.expectEqual(@as(?u32, 0x01002000), w.hash);
+}
+
+test "golden: u32 indev and skip_hw" {
+    // tc filter add dev lo parent 1: protocol ip prio 75 u32 match ip src 10.0.0.1/32 flowid 1:10 indev lo
+    var w = try u32Golden(g_u32x_indev, seq_u32x_indev, 75, 0, .{
+        .classid = Handle.init(1, 0x10),
+        .keys = &.{U32Key.ipv4Src(.{ 10, 0, 0, 1 }, 32)},
+        .indev = "lo",
+    });
+    try testing.expectEqualStrings("lo", w.indev());
+    // tc filter add dev lo parent 1: protocol ip prio 76 u32 match ip src 10.0.0.1/32 flowid 1:10 skip_hw
+    w = try u32Golden(g_u32x_skip_hw, seq_u32x_skip_hw, 76, 0, .{
+        .classid = Handle.init(1, 0x10),
+        .keys = &.{U32Key.ipv4Src(.{ 10, 0, 0, 1 }, 32)},
+        .flags = filter.TCA_CLS_FLAGS.SKIP_HW,
+    });
+    try testing.expectEqual(@as(?u32, 1), w.cls_flags);
+}
+
+test "golden: u32 variable offsets (at nexthdr, offset/shift/eat)" {
+    // tc filter add dev lo parent 1: protocol ip prio 77 u32 match tcp dst 80 0xffff at nexthdr+0 flowid 1:10
+    var w = try u32Golden(g_u32x_nexthdr, seq_u32x_nexthdr, 77, 0, .{
+        .classid = Handle.init(1, 0x10),
+        .keys = &.{.{ .mask = .{ 0xff, 0xff, 0, 0 }, .val = .{ 0, 0x50, 0, 0 }, .off = 0, .offmask = -1 }},
+    });
+    try testing.expectEqual(@as(i32, -1), w.keys[0].offmask);
+    // tc filter add dev lo parent 1: protocol ip prio 78 u32 offset at 0 mask 0f00 shift 6 eat match ip src 1.1.1.1/32 flowid 1:10
+    w = try u32Golden(g_u32x_offset_eat, seq_u32x_offset_eat, 78, 0, .{
+        .classid = Handle.init(1, 0x10),
+        .sel_flags = filter.TC_U32.VAROFFSET | filter.TC_U32.EAT,
+        .offshift = 6,
+        .offmask = 15,
+        .keys = &.{U32Key.ipv4Src(.{ 1, 1, 1, 1 }, 32)},
+    });
+    try testing.expectEqual(@as(u8, 13), w.flags);
+    try testing.expectEqual(@as(u8, 6), w.offshift);
+    try testing.expectEqual(@as(u16, 15), w.offmask);
+}
+
+test "u32 mark match round-trips (no golden: tc sends an uninitialised hit counter)" {
+    const codec = @import("netlink").codec;
+    const req = try message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 74, .eth_type = ETH_P.IP },
+        .{ .u32 = .{ .classid = Handle.init(1, 0x10), .mark = .{ .val = 5, .mask = 0xff } } },
+        ps,
+    );
+    defer gpa.free(req);
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    const w = (try filter.parseFilter(m.payload)).u32_sel.?;
+    try testing.expectEqual(@as(u32, 5), w.mark.?.val);
+    try testing.expectEqual(@as(u32, 0xff), w.mark.?.mask);
+    try testing.expectEqual(@as(u32, 0), w.mark.?.success);
+}
+
+// ── captured request bytes: u32 extras ──────────────────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=56
+// tc filter add dev lo parent 1: protocol ip prio 70 u32 divisor 256
+const g_u32x_divisor =
+    "380000002c00050660dc006b00000000000000000100000000000000000001000800460008000100753332000c00020008" ++
+    "00040000010000";
+const seq_u32x_divisor: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=56
+// tc filter add dev lo parent 1: protocol ip prio 71 handle 10: u32 divisor 16
+const g_u32x_divisor_handle =
+    "380000002c00050660dc006b00000000000000000100000000000001000001000800470008000100753332000c00020008" ++
+    "00040010000000";
+const seq_u32x_divisor_handle: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=100
+// tc filter add dev lo parent 1: protocol ip prio 72 u32 ht 800: order 1 link 10: hashkey mask 0x000000ff at 12 match ip src 10.0.0.0/8
+const g_u32x_link_hash =
+    "640000002c00050660dc006b00000000000000000100000001000000000001000800480008000100753332003800020008" ++
+    "00030000000001080002000000008024000500000001000000000000000c00000000ffff0000000a0000000c0000000000" ++
+    "0000";
+const seq_u32x_link_hash: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=100
+// tc filter add dev lo parent 1: protocol ip prio 73 u32 ht 10:2 match ip dst 10.0.0.1/32 flowid 1:10
+const g_u32x_ht_node =
+    "640000002c00050660dc006b00000000000000000100000000000000000001000800490008000100753332003800020008" ++
+    "0001001000010008000200002000012400050001000100000000000000000000000000ffffffff0a000001100000000000" ++
+    "0000";
+const seq_u32x_ht_node: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=100
+// tc filter add dev lo parent 1: protocol ip prio 75 u32 match ip src 10.0.0.1/32 flowid 1:10 indev lo
+const g_u32x_indev =
+    "640000002c00050660dc006b000000000000000001000000000000000000010008004b0008000100753332003800020008" ++
+    "00010010000100070008006c6f00002400050001000100000000000000000000000000ffffffff0a0000010c0000000000" ++
+    "0000";
+const seq_u32x_indev: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=100
+// tc filter add dev lo parent 1: protocol ip prio 76 u32 match ip src 10.0.0.1/32 flowid 1:10 skip_hw
+const g_u32x_skip_hw =
+    "640000002c00050660dc006b000000000000000001000000000000000000010008004c0008000100753332003800020008" ++
+    "000100100001002400050001000100000000000000000000000000ffffffff0a0000010c0000000000000008000b000100" ++
+    "0000";
+const seq_u32x_skip_hw: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=92
+// tc filter add dev lo parent 1: protocol ip prio 77 u32 match tcp dst 80 0xffff at nexthdr+0 flowid 1:10
+const g_u32x_nexthdr =
+    "5c0000002c00050660dc006b000000000000000001000000000000000000010008004d0008000100753332003000020008" ++
+    "000100100001002400050001000100000000000000000000000000ffff00000050000000000000ffffffff";
+const seq_u32x_nexthdr: u32 = 1795218528;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218528 len=92
+// tc filter add dev lo parent 1: protocol ip prio 78 u32 offset at 0 mask 0f00 shift 6 eat match ip src 1.1.1.1/32 flowid 1:10
+const g_u32x_offset_eat =
+    "5c0000002c00050660dc006b000000000000000001000000000000000000010008004e0008000100753332003000020008" ++
+    "00010010000100240005000d0601000f0000000000000000000000ffffffff010101010c00000000000000";
+const seq_u32x_offset_eat: u32 = 1795218528;
