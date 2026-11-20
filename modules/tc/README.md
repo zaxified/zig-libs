@@ -155,7 +155,8 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `Prefix6` — the ergonomic input structs; every field is doc-commented in
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).
 - `Qdisc`, `Class`, `Filter` — dump results, each with a `kind()` plus an optional
-  decoded-options field per modelled kind (`q.netem`, `q.htb`, `q.tbf`, `q.fq_codel`,
+  decoded-options field per modelled kind (qdiscs and classes also carry `stats`, the `tc -s`
+  counters, and an `fq_codel` qdisc its `fq_codel_xstats`) (`q.netem`, `q.htb`, `q.tbf`, `q.fq_codel`,
   `q.cake`, `q.prio`, `q.fifo`, `q.sfq`, `q.codel`, `q.fq`, `q.hfsc`, `q.red`, `c.htb`, `f.u32_sel`, `f.flower`, `f.matchall`, `f.bpf`, `f.classid()`).
 - `Psched`, `RateSpec`, `LinkLayer` and the rate-table helpers in `tc.ratespec`.
 - `tc.message` — the pure request builders (`buildQdiscSet`, `buildClassSet`,
@@ -175,8 +176,8 @@ unshare -rn zig build test-tc     # + the live netns round-trip (qdisc→class�
 
 Every write op needs `CAP_NET_ADMIN`; the `RTM_GET*` dumps do not. The encoders are
 checked against **byte-exact requests captured from a real `iproute2` `tc`** under
-`strace` (50 goldens, each with the exact command in a comment) — see SPEC.md for the
-full verification story and the deferred list.
+`strace` (each golden with the exact command in a comment) — see SPEC.md for the
+full verification story and *Backlog / deferred* for what is not covered.
 
 One asymmetry worth knowing: qdiscs, classes and filters are namespaced, so
 `unshare -rn` is enough to exercise them; the **shared action table** is guarded by

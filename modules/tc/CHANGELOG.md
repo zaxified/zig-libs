@@ -5,13 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `hfsc`/`red`, 25/25 killed (one test added: red options readback field by field); card counts cumulative.
 - **2026-11-17** — **API addition:** qdiscs `hfsc` (`default_class`) and `red` (`limit`/`qth_min`/`qth_max`/`wlog`/`plog`/`scell_log`/`stab`/`max_p`/`flags`): `QdiscSpec.hfsc` / `.red`, `Qdisc.hfsc` / `.red` (exports `Hfsc`, `HfscWire`, `Red`, `RedWire`, `qdisc.red_flag_*`). 6 byte-exact goldens from iproute2 6.19.0 (`verify_goldens.py` reproduces them). `buildQdiscSet` pads the options attribute after its length (hfsc's payload is two octets); no change for any other kind. The derived RED fields stay caller-supplied.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the matchall/bpf classifiers and the classic qdiscs (`filter.zig`, `qdisc.zig`), 50/50 killed (one needed a new test: one-band prio with a valid map); tests added for bpf instruction layout, the bpf flag attributes read back apart, prio bands 16, payload-length edges, single-field sfq options, the sfq RED fields and a distinct-value codel/fq round trip.
 - **2026-11-17** — **API addition:** classic qdiscs `prio`, `pfifo`/`bfifo`, `sfq`, `codel` and `fq` (backlog 5; `hfsc` and `red` stay open): `QdiscSpec.prio` / `.pfifo` / `.bfifo` / `.sfq` / `.codel` / `.fq` (exports `Prio`, `Fifo`, `Sfq`, `SfqRed`, `Codel`, `Fq` and their `*Wire` readbacks), `Qdisc.prio` / `.fifo` / `.sfq` / `.codel` / `.fq` on dumps (a payload shorter than the kernel struct leaves the field null). `carriesOptions` is now per value: a limit-less `pfifo`/`bfifo` and an argument-less `sfq` send no `TCA_OPTIONS`, as `tc` does. New `EncodeError.InvalidPrioBands`. 20 byte-exact goldens from iproute2 6.19.0.
 - **2026-11-17** — **API addition:** `matchall` and `bpf` classifiers (backlog 3): `FilterSpec.matchall` / `.bpf` (exports `Matchall`, `Bpf`, `BpfInsn`, `MatchallWire`, `BpfWire`), `Filter.matchall` / `Filter.bpf` and the action list of both on dumps. `bpf` carries an inline classic-BPF program (`bytecode`); the eBPF `obj`/`fd` forms are not modelled (no golden capturable without `bpf(2)`). New `EncodeError.BadBpfProgram` (empty or over 4096 instructions). 12 byte-exact goldens from iproute2 6.19.0.
 - **2026-11-17** — **API addition:** `ingress` and `clsact` qdiscs (backlog 1): `QdiscSpec.ingress` / `.clsact` (exports `Ingress`, `Clsact`), kind only with no `TCA_OPTIONS` like `mq`. Byte-exact goldens captured from iproute2 6.19.0 (`tc qdisc add dev lo ingress|clsact`: handle `ffff:`, parent `Handle.ingress`/`.clsact`).
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the statistics decoding (`qdisc.zig`), 70/70 killed; six tests added (hardware counters, 64-bit rate estimator, attribute order, minimum sizes, legacy fallback, fq_codel xstats members).
 - **2026-11-17** — **API addition:** statistics on qdisc/class dumps (backlog 2). `Qdisc.stats` / `Class.stats: ?Stats` (bytes, packets, qlen, backlog, drops, requeues, overlimits, bps/pps, hw counters) decoded from `TCA_STATS2` (`PKT64` overrides the u32 packet count, `RATE_EST64` the u32 rate), falling back to legacy `TCA_STATS`; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. Null when the kernel sent none; short sub-attributes are skipped, a malformed nest is a codec error, never a panic. New exports `Stats`, `FqCodelXstats`. Offline tests only.
 - **2026-11-09** — **Fix (no-panic):** an action kind longer than one netlink attribute (`ActionSpec.raw.kind`, `ActionRef.kind`, so `appendActionList`, `appendActionRefs` and `message.buildAction*`) returned through `unreachable` — a panic in safe builds, undefined behaviour in ReleaseFast. It is now `error.OptionsTooLong`, as the qdisc/class/filter kind already was (F8). Test in `action.zig`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `appendAttrU64` copies in `action` and `qdisc` are now `netlink.codec.appendAttrU64` (duplicate-code pass).
@@ -40,13 +37,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   error-set change). Per receive, not per dump, so a long table is never cut off. New
   `Socket.setRecvTimeout(ms)` changes it, 0 blocks forever.
 
-- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `Socket.dump`'s retry-attempt-cap and
-  `reply_type` filter (A1/tc.md F6) now have permanent tests. `dump()` was split into a thin
-  wrapper (unchanged, still calls `self.nl`) and a private `dumpVia(transport: anytype, ...)`
-  with the identical body, following the same `transport: anytype` idiom `netlink`'s own
-  `dumpOver`/`collectDumpPass` already use — this lets a scripted fixture drive the
-  `NLM_F_DUMP_INTR` restart path and a foreign-type record without a real socket or root.
-  Production path re-verified byte-for-byte unchanged before any test was added.
 - **2026-09-10** — **BEHAVIOURAL, not breaking (mop-up pass):** three more `A1/tc.md`
   findings closed (F3, F4, F9); F6/F10/F12
   remain open (F10 deliberately, deferred to the campaign's perf pass; F12 needs a user

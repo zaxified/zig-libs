@@ -34,9 +34,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** of the Go and Rust libraries, CAKE and `mq` with the full option set,
 the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
 6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
-Zig option. **Where we are behind:** `hfsc` classes and `red`'s derived fields (`wlog`/`plog`/`scell_log`/`stab` are the caller's), eBPF-object `bpf`
-filters and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
-escape hatches). `ingress`/`clsact` are typed since 2026-11-17. Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
+Zig option. **Where we are behind:** `hfsc` classes (service curves) and `red`'s derived fields
+(`wlog`/`plog`/`scell_log`/`stab` are the caller's), eBPF-object `bpf` filters and
+`pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw` escape hatches). `ingress`/`clsact`
+are typed, and statistics on qdisc/class dumps (`tc -s`) are decoded.
 
 ## Design & invariants
 
@@ -53,15 +54,11 @@ payloads, the psched rate arithmetic, and the *policy* of a dump.
 
 `tc.Socket` is therefore `struct { gpa, nl: netlink.Socket, psched }` — it has no fd, no
 buffer and no sequence counter of its own. The multi-part dump loops (`Socket.dump`,
-`Socket.actions`) used to drive the shared socket's fd directly, with a hand-rolled
-`sendto`/`MSG_PEEK|MSG_TRUNC` pair and a hand-rolled reply triage, because that seam did
-not exist when they were written; they now sit on `netlink.Socket.send` +
-`recvDatagram` + `netlink.classifyDumpMessage`, which is byte-for-byte the same triage
-they open-coded (stale (portid, seq) → skip, `NLM_F_DUMP_INTR` → restart up to 4
-attempts, `NLMSG_DONE`/bare-ACK → done, `NLMSG_ERROR` → `writeErrorFromCode`,
-`NLMSG_NOOP` → skip, `NLMSG_OVERRUN` → `SystemResources`). What stays local is only the
-policy: which request, which reply type, which parser, and the client-side
-`ifindex`/`parent` filtering (`ParentMatch`).
+`Socket.actions`) sit on `netlink.Socket.send` + `recvDatagram` + `netlink.classifyDumpMessage`
+(stale (portid, seq) → skip, `NLM_F_DUMP_INTR` → restart up to 4 attempts, `NLMSG_DONE`/bare-ACK
+→ done, `NLMSG_ERROR` → `writeErrorFromCode`, `NLMSG_NOOP` → skip, `NLMSG_OVERRUN` →
+`SystemResources`). What stays local is only the policy: which request, which reply type, which
+parser, and the client-side `ifindex`/`parent` filtering (`ParentMatch`).
 
 `Socket.actionGet` deliberately keeps an explicit triage rather than using
 `classifyDumpMessage`: it is a single-reply `RTM_GETACTION`, not a multi-part dump, so
@@ -73,8 +70,8 @@ policy: which request, which reply type, which parser, and the client-side
 |---|---|
 | `handle.zig` | `Handle` (`major:minor`), `TC_H_*`, `TC_H_MAKE`, hex parse/format |
 | `ratespec.zig` | `Psched` calibration, `tc_ratespec`, the 256-entry rate tables |
-| `qdisc.zig` | netem/htb/tbf/fq_codel/mq/cake option encode+decode, `Qdisc`/`Class` parsing |
-| `filter.zig` | u32 + flower encode+decode, `tcm_info` packing, `Filter` parsing |
+| `qdisc.zig` | every qdisc kind's option encode+decode (netem, htb, tbf, fq_codel, mq, ingress, clsact, cake, prio, pfifo/bfifo, sfq, codel, fq, hfsc, red), statistics decoding, `Qdisc`/`Class` parsing |
+| `filter.zig` | u32, flower, matchall and bpf encode+decode, `tcm_info` packing, `Filter` parsing |
 | `action.zig` | the `TCA_ACT_*` list, `tc_gen`/`TC_ACT_*`, gact/mirred/police/skbedit/vlan |
 | `message.zig` | `tcmsg` + every request builder (pure: allocator in, bytes out) |
 | `goldens.zig` | byte-exact requests captured from real `iproute2` |
@@ -103,9 +100,8 @@ the kernel installs a working filter under a protocol nothing matches. `filter.m
 ### `TCA_OPTIONS` is nested without `NLA_F_NESTED`
 
 iproute2's `addattr_nest` writes the bare attribute type; the kernel's validators ignore
-the bit. v1 of this module set `NLA_F_NESTED`, which made every request differ from
-`tc`'s by one bit. It is now cleared, so requests are byte-identical to `tc`'s. Wire
-behaviour is unchanged (the kernel masks the bit off before dispatch).
+the bit. The module writes it cleared, so requests are byte-identical to `tc`'s; setting
+it would make every request differ by one bit although the kernel masks it off before dispatch.
 
 ### Actions: a 1-based ordinal list
 
@@ -129,8 +125,8 @@ two-action goldens pin `1` and `2` on the wire. The cap is `TCA_ACT_MAX_PRIO` = 
 (`error.TooManyActions` above it) — but for an action kind with a large options
 block (`police` with `peakrate` set carries two 1 KiB rate tables), the real
 binding constraint can be `TCA_ACT_TAB`'s u16 nest length (64 KiB) reached well
-below 32 entries, surfacing as `error.OptionsTooLong` instead (wave-3 audit F9;
-pinned as a test in `action.zig`, 30 such police actions succeed, 31 do not).
+below 32 entries, surfacing as `error.OptionsTooLong` instead (pinned as a test in
+`action.zig`: 30 such police actions succeed, 31 do not).
 Already fail-closed either way — no malformed request is ever sent — this is
 about which error a caller sees, not a gap.
 
@@ -223,7 +219,7 @@ of every message into one slice.
 
 `TCA_ACT_STATS` (byte/packet counters from `TCA_STATS_BASIC`/`PKT64`, drops and
 overlimits from `TCA_STATS_QUEUE`) and each kind's `*_TM` `struct tcf_t` timestamps are
-decoded when present. The rate estimator (`TCA_STATS_RATE_EST*`) is not.
+decoded when present. The rate estimator (`TCA_STATS_RATE_EST*`) is not decoded for actions (it is for qdisc/class statistics).
 
 ### psched ticks and the rate tables
 
@@ -258,8 +254,8 @@ ticks = ceil(size * 1e6 * tick_num / (rate * tick_den))
 
 exactly in `u128`, with the calibration kept as the rational `tick_num/tick_den` instead
 of a `f64`. That yields the mathematically correct ceiling, which is what the
-higher-precision build produces — and it reproduces all 19 captured iproute2 goldens
-(three full rate tables, 768 entries, plus every buffer/burst tick) byte for byte. A
+higher-precision build produces — and it reproduces every captured iproute2 golden that
+carries a rate table (the full tables and every buffer/burst tick) byte for byte. A
 64-bit iproute2 build may differ from both by ±1 tick on such inputs; since the kernel
 does not read the tables, this has no behavioural effect.
 
@@ -283,7 +279,7 @@ Other faithfully mirrored iproute2 quirks:
 `Socket.openWithPsched` pins the calibration explicitly — that is how the goldens stay
 host-independent.
 
-### The netem encoding (unchanged from v1)
+### The netem encoding
 
 `Netem` is the ergonomic input (nanoseconds, `f64` percent `[0, 100]`); all `*_pct`
 fields scale as `u32 = round(percent / 100 * UINT32_MAX)`, the kernel's own probability
@@ -294,8 +290,8 @@ the tests do (`nw.loss == try percentToU32(1.0)`).
 The legacy `tc_netem_qopt.latency`/`.jitter` fields are psched ticks; this module always
 writes 0 into them and sets the exact nanosecond values via `TCA_NETEM_LATENCY64` /
 `TCA_NETEM_JITTER64` (kernel ≥ 4.14). The capture of `tc qdisc add … netem delay 100ms
-10ms loss 1%` confirms modern `tc` does exactly the same — that golden now guards the v1
-encoder byte for byte. A pre-4.14 kernel would see no delay applied; still out of scope.
+10ms loss 1%` confirms modern `tc` does exactly the same — that golden guards the encoder
+byte for byte. A pre-4.14 kernel would see no delay applied (*What is deliberately not done*).
 
 On dump, a real kernel may report the legacy pair as nonzero (it back-fills them from its
 internal nanosecond value for old tools); `NetemWire.legacy_latency`/`.legacy_jitter`
@@ -303,7 +299,7 @@ capture that, informational only.
 
 ### mq carries no options, cake is a flat attribute list
 
-Two qdisc kinds were added after the v2 batch, both with captured goldens.
+Two qdisc kinds, both with captured goldens.
 
 **`mq`** (`sch_mq`) is a pure pivot: attaching it to a multiqueue device makes the kernel
 auto-create one child class per hardware TX queue, onto which per-CPU qdisc trees hang.
@@ -326,14 +322,49 @@ own `sch_cake.c` numeric values and are non-exhaustive so a newer value still de
 The **emission order** mirrors iproute2's `q_cake.c` so a request is byte-identical to the
 command line: BASE_RATE64, DIFFSERV_MODE, ATM, FLOW_MODE, OVERHEAD, RAW, MPU, RTT, TARGET,
 AUTORATE, MEMORY, FWMARK, NAT, WASH, SPLIT_GSO, ACK_FILTER, INGRESS. Five captured goldens
-pin every position except RAW's and INGRESS-vs-ACK_FILTER's relative order (see the
-deferred list). A few `tc` words expand to more than one attribute, and `Cake` exposes each
+pin every position except RAW's and INGRESS-vs-ACK_FILTER's relative order (see *Open*). A few `tc` words expand to more than one attribute, and `Cake` exposes each
 attribute directly rather than reproducing the CLI's coupling: `bandwidth`/`unlimited` also
 emit `AUTORATE = 0`; `rtt T` also emits `TARGET = rtt/20` (confirmed by the `rtt 100ms`
 golden: RTT 100000 µs, TARGET 5000 µs); `raw` also sets `atm = noatm` and `overhead = 0`.
 `unlimited` is `bandwidth = 0` (an explicit `BASE_RATE64` of 0); a `null` bandwidth omits
 the attribute (also unlimited, but zero bytes on the wire). Callers reproduce a given `tc`
 line by setting exactly the fields that line sets — the goldens do precisely that.
+
+### ingress/clsact, the classic qdiscs, matchall/bpf, statistics
+
+All are typed with goldens captured from iproute2 6.19.0 (attribute order read off them).
+
+- **`ingress` / `clsact`:** `QdiscSpec.ingress` / `.clsact` (empty `Ingress` / `Clsact`) are kind only,
+  with no `TCA_OPTIONS` at all, like `mq` (`QdiscSpec.carriesOptions`). The caller passes handle `ffff:`
+  and parent `Handle.ingress` / `.clsact` exactly as `tc` sends them. They are the attach point for every
+  ingress filter and for BPF (`direct-action`).
+- **`prio`, `pfifo`/`bfifo`, `sfq`, `codel`, `fq`** (`QdiscSpec.prio` / `.pfifo` / `.bfifo` / `.sfq` /
+  `.codel` / `.fq`; `Qdisc.prio` / `.fifo` / `.sfq` / `.codel` / `.fq` on dumps). Wire facts the goldens
+  pinned: `prio` is a `tc_prio_qopt` struct followed by an attribute of type `TCA_OPTIONS` (empty, or holding
+  `TCA_PRIO_MQ` for `multiqueue`); `pfifo`/`bfifo` are one `u32`, and with no `limit` (like a bare `sfq`)
+  `tc` sends no `TCA_OPTIONS` at all; any `sfq` option sends the whole 72-octet `tc_sfq_qopt_v1`
+  (`tc_sfq_qopt_v1_len`); `fq maxrate`/`low_rate_threshold` are `u32` bytes per second and `buckets` goes
+  out as `BUCKETS_LOG` (first), so `fq buckets` is taken as its log2.
+- **`hfsc` and `red`** (`QdiscSpec.hfsc` / `.red`, `Qdisc.hfsc` / `.red`): `hfsc` options are one `u16`
+  `default_class` (`default N` is hexadecimal) and the attribute length is 6 — the padding sits outside it,
+  which is why `buildQdiscSet` pads after the options nest (`message.zig`). `red` is `TCA_RED_PARMS` (the
+  16-octet `tc_red_qopt`, flags octet 0), `STAB` (`red_stab_len` = 256), `MAX_P` (when `max_p` is set),
+  `FLAGS` (a bitfield32 with `red_supported_flags` = 0x0f as selector), in that order. `wlog`, `plog`,
+  `scell_log` and `stab` are the caller's: `tc` derives them from `burst`/`avpkt`/`probability`/`bandwidth`
+  and the derivation is not reproduced (same for `sfq` RED). The kernel does not dump `stab`.
+- **`matchall` and `bpf` classifiers** (`FilterSpec.matchall` / `.bpf`, `Filter.matchall` / `.bpf`):
+  matchall sends CLASSID, ACT, FLAGS (`skip_sw` = 2, `skip_hw` = 1); `bpf` carries an inline classic-BPF
+  program (`BpfInsn`, 1..`bpf_max_insns`) and sends CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS
+  (`direct_action` is the `da` flag), each only when given. The eBPF forms `obj`/`fd`/`pinned` are not
+  modelled: `tc` loads the object through `bpf(2)`, which an unprivileged network namespace refuses, so no
+  golden could be captured (`FilterSpec.raw` covers them).
+- **Statistics on qdisc/class dumps** (`tc -s`): `Qdisc.stats` / `Class.stats: ?Stats` (bytes, packets,
+  hardware counters, qlen, backlog, drops, requeues, overlimits, rate estimator `bps`/`pps`) from
+  `TCA_STATS2` (basic, queue, `RATE_EST64` over `RATE_EST`, `PKT64` over the 32-bit packet count,
+  `BASIC_HW`), falling back to the legacy `TCA_STATS` (no requeues) when the kernel sent no `STATS2`;
+  `Qdisc.fq_codel_xstats` from `TCA_XSTATS` of an `fq_codel` qdisc. A sub-attribute shorter than its struct
+  is skipped like other optional attributes (`stats` stays null when nothing valid decoded); a malformed
+  nest is a codec error. Layouts are from the local UAPI headers.
 
 ### Dump filtering
 
@@ -354,11 +385,10 @@ in the request, so scoping is client-side, mirroring iproute2's own printers:
 ### Every receive has a deadline
 
 `Socket.open` sets `SO_RCVTIMEO` to `default_recv_timeout_ms` (10 s) on the netlink
-socket (A1 F12, 2026-09-14). The dump loops end only on `NLMSG_DONE`, an error, or the
-restart cap; a datagram that is not ours (`(portid, seq)` mismatch) is skipped and the loop
-reads again, so a reply that never arrived used to block `recvDatagram` forever — the
-failure `actionGet`'s own comment records from an earlier type-matching bug. Now that
-receive fails the request with `error.RecvFailed`. The bound is per receive, not per dump:
+socket. The dump loops end only on `NLMSG_DONE`, an error, or the restart cap; a datagram
+that is not ours (`(portid, seq)` mismatch) is skipped and the loop reads again, so without a
+deadline a reply that never arrived would block `recvDatagram` forever. A receive that times out
+fails the request with `error.RecvFailed`. The bound is per receive, not per dump:
 a large table that keeps streaming is never cut off, only silence is. `Socket.setRecvTimeout`
 changes it; 0 restores blocking forever. A test reads the value back from the fd and shows a
 50 ms deadline releasing a receive nothing will answer.
@@ -394,217 +424,141 @@ single byte is appended, so a rejected list leaves the output buffer untouched. 
 at `UINT_MAX` instead of wrapping, and `calcXmitTime` guards every `u128` multiply, so no
 caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 
-## Out of scope / deferred
+## What is deliberately not done
 
-- **Other action kinds**: `bpf`, `connmark`, `csum`, `ct`, `ctinfo`, `gate`, `ife`,
-  `mpls`, `nat`, `pedit`, `sample`, `simple`, `tunnel_key`. `ActionSpec.raw` takes a kind
-  string plus a pre-encoded options payload for all of them.
-- **Action extras**: `TCA_ACT_FLAGS` (`no_percpu`, `skip_hw`/`skip_sw`),
-  `TCA_ACT_HW_STATS`/`USED_HW_STATS`/`IN_HW_COUNT`, and `tc actions flush`. `skbedit`'s
-  `mask` decodes but is never emitted (this iproute2 build rejected the `mask` keyword in
-  the capture harness, so it has no golden); its `flags`/`queue_mapping_max` and `vlan`'s
-  `push_eth`/`pop_eth` + `PUSH_ETH_DST`/`SRC` are neither emitted nor decoded.
-- **The legacy `TCA_U32_POLICE`** attribute — the pre-action-API way of hanging a policer
-  off a u32 filter. Use a `police` entry in `U32.actions` instead, which is what modern
-  `tc` emits.
-- **police extras**: `TCA_POLICE_AVRATE` (iproute2 6.19 rejects `avrate` in the position
-  the capture harness could reach, so it has no golden and is not emitted) and the
-  packet-rate policer `TCA_POLICE_PKTRATE64`/`PKTBURST64`.
-- **`TC_ACT_GOTO_CHAIN`** and the chain machinery (`TCA_CHAIN`, `tc chain add`). The
-  composite verdict decodes (`Verdict` is non-exhaustive) but there is no helper to build
-  one and no chain API.
-- **Per-filter action decode is capped** at `action.max_actions_decoded` = 4 entries
-  because `Filter` is a fixed-size value type; `Filter.act_list.total` reports the true
-  count, and `Socket.actions()` (the standalone dump) is uncapped.
-- **The rate estimator** (`TCA_STATS_RATE_EST`/`RATE_EST64`) and `TCA_STATS_APP` are
-  ignored; only basic counters, queue drops/overlimits and the `tcf_t` timestamps decode.
-- **Other classifiers**: `basic`, `route`, `fw`, `cgroup`, and `bpf` from an eBPF object or fd
-  (`obj`/`fd`/`pinned`; only an inline classic-BPF program is modelled). `u32`, `flower`,
-  `matchall` and `bpf bytecode` are typed; anything else needs `FilterSpec.raw`.
-- **u32 hash tables**: `TCA_U32_DIVISOR`/`HASH`/`LINK` (linked hash tables, `ht 800:`
-  bucket routing) and `TCA_U32_MARK`/`FLAGS`/`INDEV`/`POLICE`. The selector's variable
-  offset fields (`offshift`/`offmask`/`off`/`offoff`/`hoff`/`hmask`, i.e. `at nexthdr+N`)
-  are exposed on `U32` but have no golden and no helper.
-- **flower beyond L2–L4 basics**: MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP,
-  ICMP type/code, TCP flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`. The
-  `skip_hw`/`skip_sw` bits are settable via `Flower.flags` but untested against hardware.
-- **Other qdiscs**: `hfsc` and `red` are modelled since 2026-11-17 (see the done line of item 5); the qdisc-level `hfsc` only (service curves live on classes, not modelled). `QdiscSpec.raw` covers any other kind. (`mq` and `cake`
-  are now modelled — see the "mq carries no options" section.)
-- **`red`/`sfq` RED derivation**: `tc` derives `Wlog`, `Plog`, `Scell_log` and the 256-octet `stab` from `burst`/`avpkt`/`probability`/`bandwidth`; the caller supplies them. Reproducing it needs either iproute2's source (GPL, not read) or a derivation from the kernel's RED paper constants; the man page gives the recipe only in words. Effort: small once a permissively licensed statement of the formulas is at hand.
-- **CAKE knobs not modelled**: the built-in RTT/bandwidth *presets* (`datacentre`, `lan`,
-  `metro`, `regional`, `internet`, `oceanic`, `satellite`) — these are just CLI shorthands
-  that resolve to an `rtt`/`bandwidth` pair on iproute2's side, so set `rtt_us`/`bandwidth`
-  directly instead. The read-only `TCA_CAKE_STATS`/`TIN_STATS` sub-attributes (tin
-  occupancy, drop/mark counters, capacity estimate) are not decoded on a dump — `CakeWire`
-  carries the configuration attributes only, matching the module-wide "stats are ignored on
-  qdisc dumps" stance. The exact emission position of `TCA_CAKE_RAW` (only ever seen in
-  isolation, where it follows `OVERHEAD`) is placed right after `OVERHEAD`/before `MPU`; no
-  capture combines `raw` with `mpu`/`rtt` to pin it further, and the kernel is order-agnostic
-  within `TCA_OPTIONS`, so this has no behavioural effect.
+- **The legacy `TCA_U32_POLICE`** attribute — the pre-action-API way of hanging a policer off a u32
+  filter. Use a `police` entry in `U32.actions` instead, which is what modern `tc` emits.
+- **CAKE RTT/bandwidth presets** (`datacentre`, `lan`, `metro`, `regional`, `internet`, `oceanic`,
+  `satellite`): CLI shorthands that resolve to an `rtt`/`bandwidth` pair on iproute2's side; set `rtt_us`
+  / `bandwidth` directly.
+- **Unbounded per-filter action decode.** It is capped at `action.max_actions_decoded` = 4 entries
+  because `Filter` is a fixed-size value type; `Filter.act_list.total` reports the true count, and
+  `Socket.actions()` (the standalone dump) is uncapped.
+- **Pre-4.14 kernels for netem** (no `TCA_NETEM_LATENCY64`/`JITTER64`; see *The netem encoding*).
+- **Non-Linux, and big-endian hosts.** The goldens assert only on little-endian (they are captured
+  bytes); the encoders themselves use host byte order like the kernel does.
+
+## Open
+
+Unverified gaps (the code exists, nothing observes it against the real thing):
+
 - **htb offload** (`TCA_HTB_OFFLOAD`) is emitted when asked for but never verified against
-  offload-capable hardware.
-- **`TCA_STAB`** (size tables / per-packet overhead outside the rate table) and the
-  `linklayer atm` path: `LinkLayer.atm` is implemented and unit-tested against the SAR
-  formula, but has no iproute2 golden.
-- **Statistics** (qdisc/class): done 2026-11-17 (backlog 2). Still not decoded: filter
-  statistics, `TCA_XSTATS` of kinds other than `fq_codel` qdiscs (and fq_codel *class* xstats),
-  `TCA_STATS_APP`. (Per-*action* `TCA_ACT_STATS` is decoded separately.)
-- **netem's GI/GE loss models** (`TCA_NETEM_LOSS`), `TCA_NETEM_DELAY_DIST`,
-  `TCA_NETEM_SLOT*`, `TCA_NETEM_RATE64`, `TCA_NETEM_ECN` — unchanged from v1.
-- **Multicast rtnetlink events** — no notification/monitoring, matching `netlink`'s scope.
-- **Non-Linux, and big-endian hosts**: the goldens assert only on little-endian (they are
-  captured bytes); the encoders themselves use host byte order like the kernel does.
+  offload-capable hardware; flower's `skip_hw`/`skip_sw` bits (`Flower.flags`) are likewise untested
+  against hardware.
+- **`LinkLayer.atm`** is implemented and unit-tested against the SAR formula but has no iproute2 golden.
+- **A bare `matchall`** (no classid, actions or flags) is encoded as an empty `TCA_OPTIONS` nest; stock
+  `tc` sends no `TCA_OPTIONS` there and the kernel refuses it (`Invalid argument`, measured on Linux 7.0),
+  so there is no golden and the empty nest is unverified against a kernel.
+- **CAKE emission positions.** `TCA_CAKE_RAW` (only ever seen in isolation, where it follows `OVERHEAD`)
+  is placed right after `OVERHEAD`/before `MPU`, and `INGRESS` vs `ACK_FILTER` has no pinning capture; the
+  kernel is order-agnostic within `TCA_OPTIONS`, so this has no behavioural effect.
 
-Survey findings (survey 2026-09-30), ranked by how soon a `tc` user hits them; all fit CONVENTIONS §2 and are
-reachable through `raw` today:
+## Backlog / deferred
 
-1. ✅ 2026-11-17 **`ingress` / `clsact` qdiscs** (survey 2026-09-30) — `QdiscSpec.ingress` / `.clsact` (kind only, no `TCA_OPTIONS`, like `mq`); the caller passes handle `ffff:` and parent `Handle.ingress`/`.clsact` exactly as `tc` sends them. Goldens captured from iproute2 6.19.0 (`tc qdisc add dev lo ingress|clsact`). Was: the attach point for every ingress filter and for BPF (`tc filter ... direct-action`); without a typed spec a user cannot do ingress policing at all without hand-encoding. Effort: small (option-less, like `mq`).
-2. ✅ 2026-11-17 **Statistics on qdisc/class dumps** (survey 2026-09-30) — `Qdisc.stats`/`Class.stats: ?Stats` from `TCA_STATS2` (basic, queue, rate estimators, `PKT64`, `BASIC_HW`) with the legacy `TCA_STATS` as fallback; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. A sub-attribute shorter than its struct is skipped like other optional attributes (stats stay null if nothing valid decoded); a malformed nest is a codec error. Layouts from the local UAPI headers.
-3. ✅ 2026-11-17 (`matchall`, and `bpf` with an inline classic-BPF program) **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `FilterSpec.matchall` (classid, action list, `skip_sw`/`skip_hw` flags) and `FilterSpec.bpf` (`ops` classic-BPF instructions, classid, actions, `direct_action`, `flags_gen`), `Filter.matchall`/`.bpf` on dumps. 12 byte-exact goldens from iproute2 6.19.0 (`tc filter add ... matchall ...` / `bpf bytecode ...`), attribute order read off them: matchall CLASSID, ACT, FLAGS; bpf CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS. **Not done:** the eBPF forms `bpf obj|fd|pinned` — `tc` loads the object through `bpf(2)`, which an unprivileged network namespace refuses, so no golden could be captured (`FilterSpec.raw` covers them). A bare `matchall` has no golden either: stock `tc` sends no `TCA_OPTIONS` and the kernel rejects it (EINVAL); this module sends an empty options nest for it, unverified against a kernel.
-4. **`pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct`** (survey 2026-09-30) — header rewrite and tunnel actions used by most SDN-style setups; vishvananda has them. Effort: medium each (`pedit` largest).
-5. ✅ 2026-11-17 (`prio`, `pfifo`/`bfifo`, `sfq`, `codel`, `fq`, `hfsc`, `red`; hfsc and red added later the same day: 6 goldens from iproute2 6.19.0, `QdiscSpec.hfsc` / `.red`, `Qdisc.hfsc` / `.red`; `hfsc` options are one `u16` `defcls` (`default N` is hexadecimal) and the attribute length is 6, the padding sits outside it — `buildQdiscSet` now pads after the options nest; `red` is `TCA_RED_PARMS` (16-octet `tc_red_qopt`, flags octet 0), `STAB` (256), `MAX_P`, `FLAGS` (bitfield32, selector 0x0f) in that order; `wlog`/`plog`/`scell_log`/`stab` are caller-supplied, the derivation from `burst`/`avpkt` is not reproduced, same as `sfq` RED) **Classic qdiscs `prio`, `sfq`, `hfsc`, `red`, `codel`, `fq`, `pfifo`/`bfifo`** (survey 2026-09-30) — `QdiscSpec.prio` / `.pfifo` / `.bfifo` / `.sfq` / `.codel` / `.fq`, and `Qdisc.prio` / `.fifo` / `.sfq` / `.codel` / `.fq` on dumps. 20 byte-exact goldens from iproute2 6.19.0 (`tc qdisc add ... prio|pfifo|bfifo|sfq|codel|fq ...`), attribute order read off them. Wire facts the goldens pinned: `prio` is a `tc_prio_qopt` struct followed by an attribute of type `TCA_OPTIONS` (empty, or holding `TCA_PRIO_MQ` for `multiqueue`); `pfifo`/`bfifo` are one `u32`, and with no `limit` (like a bare `sfq`) `tc` sends no `TCA_OPTIONS` at all; any `sfq` option sends the whole 72-octet `tc_sfq_qopt_v1`; `fq maxrate`/`low_rate_threshold` are `u32` bytes per second and `buckets` goes out as `BUCKETS_LOG` (first). Not done inside these kinds: `sfq` RED's `wlog`/`plog`/`scell_log` are caller-supplied wire fields (`tc` derives them from `burst`/`avpkt`; the formula is not reproduced), `fq buckets` is taken as its log2, `fq`'s `defrate` (`FLOW_DEFAULT_RATE`, absent from iproute2 6.19's usage) and `fq` priomap `bands` other than 3, `codel`'s CE-threshold selector/mask, and `pfifo_fast`/`pfifo_head_drop`.
-6. **netem distributions and GI/GE loss models** (survey 2026-09-30) — needs the distribution table; matters for realistic impairment. Effort: medium.
-7. **Chains and `TC_ACT_GOTO_CHAIN`, rtnetlink event monitor** (survey 2026-09-30) — Effort: medium.
+All reachable through the `raw` escape hatches today; each fits CONVENTIONS §2.
+
+- **More action kinds.** `pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct` (header rewrite and
+  tunnel actions used by most SDN-style setups; vishvananda/netlink has them; effort medium each, `pedit`
+  largest), then `bpf`, `ctinfo`, `gate`, `ife`, `mpls`, `nat`, `simple`. `ActionSpec.raw` takes a kind
+  string plus a pre-encoded options payload for all of them.
+- **Action extras.** `TCA_ACT_FLAGS` (`no_percpu`, `skip_hw`/`skip_sw`), `TCA_ACT_HW_STATS`/
+  `USED_HW_STATS`/`IN_HW_COUNT` and `tc actions flush`. `skbedit`'s `mask` decodes but is never emitted
+  (the iproute2 build used for the captures rejected the `mask` keyword, so there is no golden); its
+  `flags`/`queue_mapping_max` and `vlan`'s `push_eth`/`pop_eth` + `PUSH_ETH_DST`/`SRC` are neither emitted
+  nor decoded.
+- **police extras.** `TCA_POLICE_AVRATE` (iproute2 6.19 rejects `avrate` in the position the capture
+  harness could reach, so there is no golden and it is not emitted) and the packet-rate policer
+  `TCA_POLICE_PKTRATE64`/`PKTBURST64`.
+- **Chains and rtnetlink events.** `TC_ACT_GOTO_CHAIN` (the composite verdict decodes, `Verdict` is
+  non-exhaustive, but there is no helper to build one) and the chain machinery (`TCA_CHAIN`,
+  `tc chain add`); multicast rtnetlink events / a monitor, matching `netlink`'s scope (none there yet).
+  Effort: medium.
+- **More statistics.** Per-action rate estimator (`TCA_STATS_RATE_EST*`), `TCA_STATS_APP`, filter
+  statistics, `TCA_XSTATS` of kinds other than `fq_codel` qdiscs (and fq_codel *class* xstats), and CAKE's
+  `TCA_CAKE_STATS`/`TIN_STATS` (tin occupancy, drop/mark counters, capacity estimate; `CakeWire` carries the
+  configuration attributes only).
+- **Other classifiers.** `basic`, `route`, `fw`, `cgroup`, and `bpf` from an eBPF object or fd
+  (`obj`/`fd`/`pinned`; no golden can be captured in an unprivileged namespace, see above); anything not
+  typed needs `FilterSpec.raw`.
+- **u32 hash tables.** `TCA_U32_DIVISOR`/`HASH`/`LINK` (linked hash tables, `ht 800:` bucket routing)
+  and `TCA_U32_MARK`/`FLAGS`/`INDEV`. The selector's variable offset fields (`offshift`/`offmask`/`off`/
+  `offoff`/`hoff`/`hmask`, i.e. `at nexthdr+N`) are exposed on `U32` but have no golden and no helper.
+- **flower beyond L2–L4 basics.** MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP, ICMP type/code, TCP
+  flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`.
+- **More qdisc options.** `hfsc` service curves on classes (only the qdisc-level `default_class` is
+  modelled); inside the classic kinds `fq`'s `defrate` (`FLOW_DEFAULT_RATE`, absent from iproute2 6.19's
+  usage) and priomap `bands` other than 3, `codel`'s CE-threshold selector/mask, and `pfifo_fast`/
+  `pfifo_head_drop`; `TCA_STAB` (size tables / per-packet overhead outside the rate table).
+- **RED parameter derivation.** `tc` derives `wlog`, `plog`, `scell_log` and the 256-octet `stab` from
+  `burst`/`avpkt`/`probability`/`bandwidth` for `red` and `sfq` RED; the caller supplies them. Reproducing
+  it needs either iproute2's source (GPL, not read) or a permissively licensed statement of the formulas;
+  the man page gives the recipe only in words. Effort: small once such a statement is at hand.
+- **netem distributions and GI/GE loss models.** `TCA_NETEM_LOSS`, `TCA_NETEM_DELAY_DIST` (needs the
+  distribution table), `TCA_NETEM_SLOT*`, `TCA_NETEM_RATE64`, `TCA_NETEM_ECN`; matters for realistic
+  impairment. Effort: medium.
 
 ## Verification
 
-- **Byte-exact goldens from real `iproute2`** (`goldens.zig`, 50 requests). The v2 batch
-  was recovered from
-  `unshare -rn strace -f -e trace=sendmsg -xx -s 8192 -e abbrev=none <cmd>` and re-encoded
-  from strace's decode; the action batch adds `-e write=all`, which prints the exact
-  bytes handed to `sendmsg` so there is no re-encoding step at all. Either way the
-  reconstruction is checked against the message's own `nlmsg_len`, so a truncated capture
-  cannot slip through. Capture host: iproute2-6.19.0, Linux 7.0,
-  `/proc/net/psched = 000003e8 00000040 000f4240 3b9aca00` (pinned as
-  `ratespec.golden_psched`, so the tests are host-independent). Each test carries the
-  exact command in a comment. Coverage:
+Run `scripts/modtest tc` (Debug); the live netns tests print `SKIPPED: …` and pass when unprivileged, and
+run with `unshare -rn zig build test-tc`.
 
-  | Golden | Command |
-  |---|---|
-  | htb qdisc | `tc qdisc add dev lo root handle 1: htb default 10` |
-  | htb qdisc (tuned) | `… htb default 0 r2q 5 direct_qlen 100` |
-  | htb class | `tc class add dev lo parent 1: classid 1:10 htb rate 1mbit ceil 2mbit` |
-  | htb class (RATE64) | `… classid 1:30 htb rate 40gbit ceil 80gbit` |
-  | htb class (tuned) | `… classid 1:40 htb prio 3 quantum 3000 burst 15k mtu 1500 rate 5mbit ceil 5mbit` |
-  | tbf | `tc qdisc add dev lo root handle 5: tbf rate 1mbit burst 32kbit latency 400ms` |
-  | tbf (peak) | `… handle 2: tbf rate 10mbit burst 10kb latency 50ms peakrate 20mbit mtu 1540` |
-  | fq_codel | `… handle 6: fq_codel limit 1200 flows 1024 target 5ms interval 100ms quantum 1514` |
-  | netem | `… handle 3: netem delay 100ms 10ms loss 1%` |
-  | mq | `tc qdisc replace dev lo root handle 1: mq` (kind only, no `TCA_OPTIONS`) |
-  | cake (bare) | `… handle 8: cake` (an empty options nest) |
-  | cake (bandwidth) | `… cake bandwidth 100mbit` |
-  | cake (full) | `… cake bandwidth 1gbit diffserv4 dual-srchost nat wash ack-filter overhead 18 mpu 64 memlimit 4194304 split-gso fwmark 0xff` |
-  | cake (overhead/mpu/rtt) | `… cake bandwidth 50mbit overhead 10 mpu 84 rtt 100ms ingress split-gso` |
-  | cake (unlimited/modes) | `… cake unlimited besteffort flowblind ptm no-ack-filter nowash nonat` |
-  | cake (raw) | `… cake raw` |
-  | u32 filter | `tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip dst 10.0.0.1/32 flowid 1:10` |
-  | u32 filter (2 keys) | `… u32 match ip src 192.168.1.0/24 match ip dst 10.0.0.1/32 flowid 1:10` |
-  | flower filter | `… protocol ip prio 2 flower ip_proto tcp dst_ip 10.0.0.0/24 dst_port 80 classid 1:10` |
-  | flower filter (full) | `… prio 3 flower ip_proto tcp src_ip 192.168.0.0/16 dst_ip 10.0.0.0/24 src_port 1234 dst_port 80 classid 1:10` |
-  | flower filter (IPv6) | `… protocol ipv6 prio 4 flower ip_proto udp src_ip 2001:db8::/32 dst_ip 2001:db8:1::1/128 dst_port 53 classid 1:30` |
-  | qdisc del / class del / filter del | `tc qdisc del dev lo root`, `tc class del dev lo classid 1:20`, `tc filter del dev lo parent 1: protocol ip prio 2` |
-  | qdisc dump / filter dump | `tc qdisc show dev lo`, `tc filter show dev lo parent 1:` |
-
-  The two 2 KiB class goldens and the two tbf goldens include the full 1024-byte rate
-  tables, so the psched arithmetic is verified entry by entry, not just structurally.
-
-  The 24 **action** goldens (every filter one is `tc filter add dev lo parent 1: protocol
-  ip prio N u32 match ip src A/32 flowid 1:10 <ACTION…>` unless noted):
-
-  | Golden | Action clause |
-  |---|---|
-  | gact drop | `action drop` |
-  | gact pass + index | `action pass index 7` |
-  | gact continue | `action continue` (`TC_ACT_UNSPEC` = -1) |
-  | gact probabilistic | `action gact drop random determ pass 2` (`tc_gact_p`) |
-  | gact + cookie | `action drop cookie a1b2c3d4` |
-  | mirred egress redirect | `action mirred egress redirect dev lo` (verdict STOLEN) |
-  | mirred ingress mirror | `action mirred ingress mirror dev lo` (verdict PIPE) |
-  | police | `action police rate 1mbit burst 10k conform-exceed drop` |
-  | police + peak | `action police rate 1mbit burst 10k mtu 1500 peakrate 2mbit conform-exceed pipe/drop` |
-  | police 64-bit | `action police rate 40gbit burst 10k mtu 1500 peakrate 80gbit conform-exceed pipe/drop` |
-  | skbedit | `action skbedit priority 1:10 mark 5 queue_mapping 2 ptype host` |
-  | vlan push / pop / modify | `action vlan push id 100 protocol 802.1Q priority 3`, `action vlan pop`, `action vlan modify id 200` |
-  | two-action PIPE chain | `action skbedit mark 7 pipe action mirred egress redirect dev lo` |
-  | two-action vlan chain | `action vlan push id 100 protocol 802.1ad priority 7 pipe action vlan pop` |
-  | flower + action | `tc filter add … prio 20 flower ip_proto tcp dst_port 80 action drop` |
-  | flower + classid + action | `… prio 31 flower ip_proto tcp dst_port 80 classid 1:10 action drop` |
-  | actions add | `tc actions add action drop index 1` |
-  | actions add ×2 | `tc actions add action drop index 1 action pass index 2` |
-  | actions add mirred | `tc actions add action mirred egress redirect dev lo index 3` |
-  | actions ls / del / get | `tc actions ls action gact`, `tc actions del action gact index 1`, `tc actions get action gact index 1` |
-
-  The three police goldens carry their full 1024-byte rate (and peak) tables, so the
-  `tc_calc_rtable_64` behaviour is verified entry by entry. The two chain goldens are what
-  pin the 1-based ordinals; the `tc actions` goldens are what pin the 4-byte `tcamsg`.
-
-- **Golden re-parse**: several goldens are fed back through `parseQdisc`/`parseClass`/
-  `parseFilter`/`parseAction` and asserted field by field, so the decoders are checked
-  against real kernel-shaped bytes rather than only against this module's own encoder —
-  including the pipe chain's two ordinals, police's 64-bit rates and tick burst, the vlan
-  chain's 802.1ad protocol, and the standalone table's `tcamsg` bodies.
-- **Encode/decode round-trip** per kind: htb class (incl. RATE64/CEIL64 clamping), tbf
-  with a peak bucket, fq_codel's "omit what is unset", u32 with two keys, flower over
-  IPv6, netem with every optional attribute populated, and a six-entry action list
-  covering all five modelled kinds plus `raw` (which also exercises the decode cap).
-- **Unit**: handle packing/parse/format (incl. the hex gotcha and overflow), `tcm_info`
-  packing both ways, `Psched` derivation (incl. the ns-resolution compat hack and a
-  degenerate divisor), `calcXmitTime` ceiling + saturation, `deriveCellLog`, ATM size
-  adjustment, `RateSpec` byte layout, `Create` flag combinations, and every
-  spec-validation error path.
-- **Fuzz** (`std.testing.fuzz`): `parseQdisc`, `parseClass`, `parseFilter`,
-  `parseAction`/`parseActionList`/`parseStats`/`actionsOf` and all `parse*Options` over
-  arbitrary bytes — never panic, never over-read.
-- **Live netns round-trip** (env-gated; prints `SKIPPED: …` and passes when unprivileged):
-  `unshare -rn zig build test-tc`. Integration tests exercise an unprivileged qdisc
-  dump, the v1 netem add/show/change/del cycle, an htb tree (qdisc → two classes, one of
-  them needing RATE64 → an fq_codel leaf under a class → u32 + flower filters → dumps of
-  all three families → filter del → class del), a tbf round-trip, an extended-ACK probe
-  with a bogus qdisc kind, an **action round-trip** (a u32 filter carrying a
-  `skbedit`→`police` PIPE chain and a flower filter carrying `mirred`, both dumped back
-  and decoded ordinal by ordinal, with police's tick burst converted back to the 10 KiB
-  requested and the kernel's own `refcnt`/`TCA_ACT_STATS` asserted), and an unprivileged
-  `RTM_GETACTION` dump. Every assertion is against what the kernel echoed back.
-
-  This was run in the development environment: green under `unshare -rn` in
-  both Debug and `--release=fast`, with only the shared-action-table write skipping; run
-  fully unprivileged, the privileged-only tests skip cleanly instead. `zig build test-netlink`
-  stays green. The mq/cake batch was captured
-  on the same host and recipe as the action goldens (`-e write=all`, exact `sendmsg` bytes
-  checked against each message's own `nlmsg_len`); `lo` is single-queue so the kernel
-  rejects the attach, but the request bytes are what the golden pins.
-
-  The one test that still skips inside `unshare -rn` is the shared-action-table write
-  (`tc actions add|del`), which needs `CAP_NET_ADMIN` in the initial user namespace — see
-  the `tcamsg` section. Its read half (`RTM_GETACTION` dump + decode) runs unprivileged
-  and is covered.
-
-  Kernel behaviours the live runs pinned down (all now encoded in the module): a **down**
-  interface has no qdisc at all (a fresh `unshare -rn` starts with `lo` DOWN, so the tests
-  admin-up first); htb dumps `HTB_VER` (0x30011) in `tc_htb_glob.version`, of which only
-  the high half is the protocol version `tc` sends; and an **empty** shared action table
-  answers a dump with `-ENOENT` rather than an empty `NLMSG_DONE`.
-
-**Audit 2026-11-17 (delta mutation, `hfsc`/`red`).** 25 schemata mutants over `appendHfscOptions`/`parseHfscOptions`, `appendRedOptions` (every field index, the flags octet, `stab` length, `MAX_P` presence and value, the `FLAGS` value and selector), `parseRedOptions` (every field, the three length guards) and `buildQdiscSet`'s padding after the options nest, one schemata build, baseline first: 20 killed, 5 survived (the parse side of `plog`, `scell_log`, the historic flags octet and the two length guards: the goldens only re-read `wlog`), killed by `red options readback` (all fields apart, wrong-sized attributes skipped) on the second build. 25/25, 0 equivalent.
-
-**Audit 2026-11-17 (delta mutation, `ingress`/`clsact`).** 3 schemata mutants (the two kind
-strings swapped; `carriesOptions` flipped for both option-less kinds): 3/3 killed by the
-kind test and the two captured goldens; cumulative 73/73 with the statistics run below.
-The `appendOptions` arm for the new kinds is a no-op gated by `carriesOptions` (not
-observable). The earlier delta run follows.
-
-**Audit 2026-11-17 (delta mutation).** 70 schemata mutants over the statistics decoding added the same day
-(`parseStats2`, `parseLegacyStats`, `pickStats`, `parseFqCodelXstats` and the STATS2/STATS/XSTATS arms of
-`parseQdisc` and `parseClass` in `qdisc.zig`), ReleaseSafe, one build, each mutant under `setsid -w timeout` and
-`ulimit -v`: the byte order of both readers, every sub-attribute's length guard (forced open, one byte tighter),
-the `seen`, `have_pkt64` and `have_rate64` flags (skipped, forced), every decoded field (set to 0), the legacy
-length bound (one shorter, one longer), the null-versus-zeroed result, the STATS2-to-STATS fallback, the xstats
-type and length guards and every xstats member, the dispatch arms and the kind check on XSTATS. First run: 42
-killed, 28 survived. Six tests added (hardware counters and the 64-bit rate estimator in either order, each
-sub-attribute alone making the counters present, `PKT64` ahead of `BASIC`, minimum-size and one-byte-short
-sub-attributes, the fallback to the legacy attribute for a qdisc and a class, every fq_codel xstats member and an
-XSTATS on another kind); the rerun killed all 28. 70/70, 0 equivalent. The 2026-09-10 run recorded no count, so
-the card carries this run's.
+- **Byte-exact goldens from real `iproute2`** (`src/goldens.zig`). Each is the complete datagram a stock
+  `tc` put on the wire, recovered from `unshare -rn strace -f -e trace=sendmsg -xx -s 8192 -e abbrev=none
+  <cmd>`; the action, mq and cake batches add `-e write=all`, which prints the exact bytes handed to
+  `sendmsg`, so there is no re-encoding step. The reconstruction is checked against the message's own
+  `nlmsg_len`, so a truncated capture cannot slip through. The capture host is pinned in the file header
+  (iproute2 6.19.0, Linux 7.0, `/proc/net/psched` as `ratespec.golden_psched`, so the tests are
+  host-independent); each test carries the exact command in a comment. Coverage by area: htb qdisc and
+  classes (plain, tuned, `RATE64`), tbf (incl. peak), fq_codel, netem, mq, cake (bare, bandwidth, full,
+  overhead/mpu/rtt, unlimited/modes, raw), ingress, clsact, the classic qdiscs, hfsc, red, u32 (one and two
+  keys), flower (IPv4, full, IPv6), matchall, bpf, the three delete forms and the qdisc/filter dumps; and
+  the action batch: gact (drop, pass + index, continue, probabilistic, cookie), mirred (redirect, mirror),
+  police (plain, peak, 64-bit), skbedit, vlan push/pop/modify, the two chain goldens that pin the 1-based
+  ordinals, flower with actions, and the standalone `tc actions` add/del/get/ls forms that pin the 4-byte
+  `tcamsg`. The class and tbf goldens include the full 1024-byte rate tables, and the police goldens their
+  rate (and peak) tables, so the psched arithmetic and `tc_calc_rtable_64` are verified entry by entry.
+- **Re-deriving the goldens.** `modules/tc/tools/verify_goldens.py` re-runs the commands against a stock
+  `tc` and diffs the bytes (`capture.sh` and `parse_strace.py` are its parts; see `modules/tc/tools/README.md`).
+  A MISS means the host disagrees, not automatically that the module is wrong: check `tc -V` first.
+- **Golden re-parse.** Several goldens are fed back through `parseQdisc`/`parseClass`/`parseFilter`/
+  `parseAction` and asserted field by field, so the decoders are checked against real kernel-shaped bytes
+  rather than only against this module's own encoder (including the pipe chain's two ordinals, police's
+  64-bit rates and tick burst, the vlan chain's 802.1ad protocol, and the standalone table's `tcamsg`
+  bodies).
+- **Encode/decode round trips** per kind (htb class incl. `RATE64`/`CEIL64` clamping, tbf with a peak
+  bucket, fq_codel's "omit what is unset", u32 with two keys, flower over IPv6, netem with every optional
+  attribute populated, an action list covering every modelled kind plus `raw` and the decode cap), a
+  readback test per newer kind (red field by field, with wrong-sized attributes skipped), and the
+  statistics tests (hardware counters, 64-bit rate estimator in either order, each sub-attribute alone,
+  minimum-size and one-byte-short sub-attributes, the fallback to the legacy attribute for a qdisc and a
+  class, every fq_codel xstats member).
+- **Unit.** Handle packing/parse/format (incl. the hex gotcha and overflow), `tcm_info` packing both ways,
+  `Psched` derivation (incl. the ns-resolution compat hack and a degenerate divisor), `calcXmitTime`
+  ceiling and saturation, `deriveCellLog`, ATM size adjustment, `RateSpec` byte layout, `Create` flag
+  combinations, every spec-validation error path, and the receive deadline (`setRecvTimeout` read back from
+  the fd; a 50 ms deadline releases a receive nothing will answer).
+- **Fuzz.** The `TC_FUZZ` deterministic driver (`TC_FUZZ=<runs>[,<first seed>]`; harnesses `tc-action`,
+  `tc-options`, `tc-filter`, `tc-dump`) and `std.testing.fuzz` over `parseQdisc`, `parseClass`,
+  `parseFilter`, `parseAction`/`parseActionList`/`parseStats`/`actionsOf` and every `parse*Options` on
+  arbitrary bytes: never panic, never over-read.
+- **Live netns round trip** (env-gated): an unprivileged qdisc dump, the v1 netem add/show/change/del
+  cycle, an htb tree (qdisc → two classes, one needing `RATE64` → an fq_codel leaf under a class → u32 +
+  flower filters → dumps of all three families → filter del → class del), a tbf round trip, an extended-ACK
+  probe with a bogus qdisc kind, an action round trip (a u32 filter carrying a `skbedit`→`police` PIPE
+  chain and a flower filter carrying `mirred`, dumped back and decoded ordinal by ordinal, with police's
+  tick burst converted back to the 10 KiB requested and the kernel's own `refcnt`/`TCA_ACT_STATS`
+  asserted) and an unprivileged `RTM_GETACTION` dump. Every assertion is against what the kernel echoed
+  back. The one test that still skips inside `unshare -rn` is the shared-action-table write
+  (`tc actions add|del`), which needs `CAP_NET_ADMIN` in the initial user namespace (see the `tcamsg`
+  section); its read half runs unprivileged. `lo` is single-queue, so the kernel rejects an `mq` attach,
+  but the request bytes are what the golden pins.
+- **Kernel behaviours the live runs pinned down** (all encoded in the module): a **down** interface has no
+  qdisc at all (a fresh `unshare -rn` starts with `lo` DOWN, so the tests admin-up first); htb dumps
+  `HTB_VER` (0x30011) in `tc_htb_glob.version`, of which only the high half is the protocol version `tc`
+  sends; and an **empty** shared action table answers a dump with `-ENOENT` rather than an empty
+  `NLMSG_DONE`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Provenance
 
@@ -619,8 +573,8 @@ the uncopyrightable ABI facts they document (struct layouts, numeric constants);
 Linux-syscall-note exception is what keeps this module cleanly MIT, exactly as already
 established for `netlink`/`wireguard`.
 
-**iproute2 (GPL-2.0-or-later) was consulted as a behaviour/design reference** for v2 and
-the action work —
+**iproute2 (GPL-2.0-or-later) was consulted as a behaviour/design reference** for the shaping
+qdiscs, filters and actions —
 `tc/tc_core.c` (`tc_calc_xmittime`, `tc_calc_rtable`, `tc_core_init`), `tc/q_htb.c`,
 `tc/q_tbf.c`, `tc/q_fq_codel.c`, `tc/f_u32.c`, `tc/f_flower.c`, `tc/tc_class.c`,
 `tc/tc_filter.c`, `tc/m_action.c`, `tc/m_gact.c`, `tc/m_mirred.c`, `tc/m_police.c`,
@@ -628,14 +582,8 @@ the action work —
 formulas, the attribute emission order (including the per-action-kind order and the
 1-based ordinal numbering) and the client-side dump-filter rules. No source
 was copied; the algorithms are re-derived and re-expressed here, and the goldens are the
-independent check that the behaviour matches. The v1 statement that no third-party
-implementation was consulted no longer holds; this module's `NOTICE` carries the matching
+independent check that the behaviour matches. This module's `NOTICE` carries the matching
 "Design reference — iproute2" declaration required by CONVENTIONS §5.
-
-## Status
-
-`gap · linux · client · reentrant` + deps: `netlink` — canonical source is `pub const
-meta` in `src/root.zig`.
 
 ## Anchoring
 
