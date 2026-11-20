@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! gate — the switch that used to guard the one part a Phase-1 SCAFFOLD did
-//! NOT ship: the **Groth16 prover core** (`prover.zig`'s `setup` toy-CRS
-//! generation + `prove` proof assembly). **It is now `true` (Part 2 shipped):**
+//! gate — the marker for the **Groth16 prover core** (`prover.zig`'s `setup`
+//! toy-CRS generation + `prove` proof assembly). It is the constant `true`:
 //! `setup`/`prove` are implemented and the end-to-end anchor
 //! (`prove(setup(…)) → bn254.groth16Verify == true`, plus tamper/wrong-input/
-//! non-satisfying-witness → `false`) runs green. The flag is retained as a
-//! self-documenting marker of the scaffold→core boundary and the tier call.
+//! non-satisfying-witness → `false`) runs unconditionally. The flag is kept so
+//! tests and docs can name the prover core.
 //!
-//! ## What IS real and ungated today (the harness has teeth without the core)
+//! ## What the harness is built from
 //!
 //! Everything feeding the prover is implemented and heavily anchored:
 //!   - `field.zig` — `Fr` helpers over the sibling `bn254` scalar field.
@@ -23,17 +22,14 @@
 //!     (`A·B−C` is divisible by `Z` iff the witness satisfies the R1CS).
 //!   - `prover.zig`'s DELIBERATELY-BROKEN positive control (`brokenProof`,
 //!     built WITHOUT the real core) — the sibling `bn254.groth16Verify`
-//!     REJECTS it, proving the end-to-end anchor has teeth before `prove`
-//!     exists.
+//!     REJECTS it, proving the end-to-end anchor has teeth.
 //!
-//! ## Why this gate is an Opus flag, not a Fable flag
+//! ## Why the core is anchored
 //!
 //! The Groth16 prover core is **fully anchored** by a complete deterministic
 //! oracle — the sibling `bn254` module's Groth16 VERIFIER. A correct prover's
 //! output verifies; ANY wrong coefficient, index, sign, or randomizer makes
 //! `bn254.groth16Verify` return `false`. There is no self-consistent-but-wrong
-//! failure mode the verifier misses (unlike an FHE noise budget or a NIZK
-//! soundness argument with no checking oracle). Published construction (Groth
-//! 2016) + a complete anchor ⇒ this is **Opus**, not Fable. See `SPEC.md`'s
-//! "Fable-vs-Opus tier call".
+//! failure mode the verifier misses. The construction is the published one
+//! (Groth 2016).
 pub const prover_core_implemented = true;

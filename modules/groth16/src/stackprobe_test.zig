@@ -260,7 +260,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
@@ -538,7 +538,7 @@ fn nBytes(sz: usize) [32]u8 {
 }
 
 // ── API adapter: the only place that names the shapes under test ────────────
-// (BEFORE the 2026-10-09 fix these took the secrets by value.)
+// (BEFORE the fix these took the secrets by value.)
 
 fn apiSetup(gpa: std.mem.Allocator, sys: r1cs.System, tw: *const prover.ToxicWaste) prover.SetupError!prover.KeyPair {
     return prover.setup(nt_domain, gpa, sys, nt_num_public, tw);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! R1CS → QAP (quadratic arithmetic program) conversion and the divisibility
-//! oracle that is THE self-contained teeth-test of this scaffold.
+//! oracle that is THE self-contained teeth-test of this module.
 //!
 //! Given an R1CS and a witness, the per-constraint dot products
 //! `(aᵢ, bᵢ, cᵢ) = (Aᵢ·w, Bᵢ·w, Cᵢ·w)` are the evaluations, at the domain
@@ -150,7 +150,7 @@ test "TEETH: a circuit larger than the domain is REFUSED, not silently truncated
 }
 
 // A circuit whose A, B and C rows are three different linear combinations:
-// w1*w2 = w3 and (w1+w2)*w3 = w4, witness [1, 3, 5, 15, 120]. (The 2026-11-17
+// w1*w2 = w3 and (w1+w2)*w3 = w4, witness [1, 3, 5, 15, 120]. (The
 // mutation audit found that no other circuit here told a row's A from its B.)
 const mix_cons = [_]r1cs.Constraint{
     .{ .a = &.{.{ .index = 1, .coeff = Fr.one }}, .b = &.{.{ .index = 2, .coeff = Fr.one }}, .c = &.{.{ .index = 3, .coeff = Fr.one }} },

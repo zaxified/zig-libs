@@ -89,7 +89,7 @@ pub fn divByVanishing(quotient: []Fr, p: []const Fr, comptime n: usize) DivError
     // Working copy of the remainder lives in a caller-free scheme: we walk
     // `p` high→low, accumulating folds into a scratch we derive on the fly.
     // To stay allocation-free we reduce in place over a local copy bounded
-    // by p.len; for scaffold-scale circuits this stack buffer is ample.
+    // by p.len; for the circuits this module handles this stack buffer is ample.
     // ⛔ NOT an assert. `std.debug.assert` is compiled out in ReleaseFast, and
     // past it `@memcpy(rem[0..p.len], p)` writes straight past a fixed stack
     // array: SIGSEGV, measured, with `p.len = 20480` at `max_degree = 16384`.
@@ -119,7 +119,7 @@ pub fn divByVanishing(quotient: []Fr, p: []const Fr, comptime n: usize) DivError
 }
 
 /// Upper bound on any polynomial length `divByVanishing` handles without
-/// allocation. `A·B − C` has degree `< 2n` and the largest scaffold domain
+/// allocation. `A·B − C` has degree `< 2n` and the largest domain
 /// in the test harness is well under this — bump if a larger circuit needs
 /// it (or promote to an allocator-based path). 2·2^13 headroom.
 pub const max_degree: usize = 1 << 14;

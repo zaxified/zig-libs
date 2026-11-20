@@ -34,8 +34,8 @@
 //!
 //! ⛔ It does NOT show that the contributor KNEW `x`. `h` is public, so
 //! anyone reads `[x]₂ = h⁻¹·g2_spx` off a published record, and can then
-//! write a valid record for `x' = k·x_prev` without knowing `x'` (review
-//! 2026-10-02). What still holds: making the final δ a value you know needs
+//! write a valid record for `x' = k·x_prev` without knowing `x'`.
+//! What still holds: making the final δ a value you know needs
 //! `[x]₂` for `x = known/δ_before`, i.e. `[1/δ_before]₂`, which no record
 //! reveals — so a ceremony with one honest contributor still ends at a δ
 //! nobody knows. A real proof of knowledge needs a `g2_sp` of unknown

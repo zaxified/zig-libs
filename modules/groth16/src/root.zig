@@ -23,16 +23,14 @@
 //!                equals R1CS satisfaction, the self-contained teeth-test.
 //!
 //! The **prover core** — `prover.setup` (toy trusted setup) and
-//! `prover.prove` (proof assembly) — is real too: `gate.prover_core_implemented`
-//! is `true` (the flag is retained as a self-documenting marker of the
-//! scaffold→core boundary, not a live switch), so `setup`/`prove` no longer
-//! `@panic` and the end-to-end test runs unconditionally. That core was an
-//! **Opus** task, not a Fable one: the `bn254` verifier is a COMPLETE
-//! deterministic anchor, so any prover error is caught (no
-//! self-consistent-but-wrong failure mode the way a Fable-tier core has). See
-//! `gate.zig` and `SPEC.md`'s tier call.
+//! `prover.prove` (proof assembly) — is implemented and always on:
+//! `gate.prover_core_implemented` is the constant `true` (kept as a marker,
+//! not a switch), `setup`/`prove` never `@panic` and the end-to-end test runs
+//! unconditionally. The `bn254` verifier is a complete deterministic anchor
+//! for it: any prover error makes `bn254.groth16Verify` reject, so there is
+//! no self-consistent-but-wrong failure mode. See `gate.zig`.
 //!
-//! **The snarkjs ecosystem** (2026-10-02): `zkey`, `circom` (`.r1cs`, `.wtns`)
+//! **The snarkjs ecosystem**: `zkey`, `circom` (`.r1cs`, `.wtns`)
 //! and `ptau` read the real files; `zkprove.prove` proves from a `.zkey`
 //! (Pippenger MSM, quotient on a coset — the form the key's H section was
 //! measured to take); `phase2` is the circuit-specific ceremony — `newZkey`, `contribute`,

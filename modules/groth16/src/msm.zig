@@ -6,7 +6,7 @@
 //! `bn254` verifier's own public-input accumulation. REAL and ungated.
 //!
 //! The naive form is constant-time and is the REFERENCE: the bucket method
-//! below (`pippengerG1`/`pippengerG2`, the prover's MSM since 2026-10-02) is
+//! below (`pippengerG1`/`pippengerG2`, the prover's MSM) is
 //! tested against it.
 
 const std = @import("std");
@@ -50,7 +50,7 @@ pub fn msmG2(bases: []const G2.Affine, scalars: []const Fr) G2.Jacobian {
 // reference this path is tested against.
 
 /// The variable-time group operations are `bn254.msm`'s (`addVartime`,
-/// `mixedAddVartime`: public in `bn254` since 2026-11-17, they were a private
+/// `mixedAddVartime`: public in `bn254`, they were a private
 /// copy here). Both curves have `a = 0`.
 fn VtOps(comptime G: type) type {
     return struct {

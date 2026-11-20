@@ -2,17 +2,11 @@
 //! The Groth16 PROVER — `setup` (a test-only toy CRS/trusted setup) and
 //! `prove` (the 3-element proof assembly `πA ∈ G1, πB ∈ G2, πC ∈ G1`). Both
 //! are IMPLEMENTED; `gate.prover_core_implemented` is `true` and there is no
-//! `@panic` anywhere in this module. See `gate.zig` for why the core was an
-//! **Opus** flag (the sibling `bn254` Groth16 verifier is a complete
-//! deterministic anchor), not a Fable one.
+//! `@panic` anywhere in this module. See `gate.zig` for why the core is
+//! anchored (the sibling `bn254` Groth16 verifier is a complete deterministic
+//! oracle).
 //!
-//! ⚠ This header said the opposite until 2026-09-03 — that both functions
-//! "`@panic` until the core lands", and that `brokenProof` was what was real
-//! "before `prove` exists". The commit that stopped 25 modules describing
-//! finished work as unimplemented fixed `root.zig`, `gate.zig`, README and
-//! SPEC, and missed this file and `harness_test.zig`.
-//!
-//! `brokenProof` is still here and still useful: a deliberately-wrong prover
+//! `brokenProof`: a deliberately-wrong prover
 //! output used as the harness's positive control, so `bn254.groth16Verify`
 //! rejecting a proof means something.
 //!

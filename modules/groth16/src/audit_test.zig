@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests that close the gaps the 2026-11-17 whole-module mutation audit found:
+//! Tests that close the gaps the whole-module mutation audit found:
 //! each one names the mutant (what a surviving change did) it exists to kill.
 //! Nothing here is a general test of the module; the module's own tests sit
 //! beside the code and in `harness_test.zig` / `snarkjs_files_test.zig`.

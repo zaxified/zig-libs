@@ -2,7 +2,7 @@
 //! snarkjs JSON importer — the reading half of `snarkjs_export.zig`: parses
 //! `proof.json`, `verification_key.json` and `public.json` into this
 //! module's `bn254`-typed values, so a Zig server can verify proofs a browser
-//! made with snarkjs (2026-11-16).
+//! made with snarkjs.
 //!
 //! It accepts exactly the shape `snarkjs_export.zig` writes and its tests pin
 //! (the same shape snarkjs itself writes, see that file's doc comment):

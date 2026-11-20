@@ -64,7 +64,7 @@ pub const Msm = enum {
     /// One constant-time `scalarMul` per term (`msm.msmG1`/`msmG2`), the
     /// group additions through `ctSelect`. For a prover sharing a machine
     /// with someone it does not trust. ~21× slower: 34 s against 1.6 s at
-    /// 10 000 constraints, one core, ReleaseFast (2026-10-09).
+    /// 10 000 constraints, one core, ReleaseFast.
     constant_time,
 };
 

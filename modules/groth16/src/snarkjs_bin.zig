@@ -245,7 +245,7 @@ pub const g2_bytes = 128;
 
 /// `count · width` as a byte length, or `BadSectionSize` if it does not fit a
 /// `usize`. Counts come from file headers; on a 32-bit target a plain product
-/// wraps and could equal a real (small) section's length (review 2026-10-02).
+/// wraps and could equal a real (small) section's length (review).
 pub fn byteLen(count: u64, width: u64) ParseError!usize {
     const n = std.math.mul(u64, count, width) catch return error.BadSectionSize;
     return std.math.cast(usize, n) orelse error.BadSectionSize;
