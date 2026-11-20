@@ -5,15 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC note only: the `final` power-table wipes are killed by the existing test "final wipes the key-derived power table it built" (12 of 12 mutants over the current `final`); no code or test changed.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-10-04 (test "final wipes the key-derived power table it built", modules/chachapoly/src/poly1305.zig, commit 721bad72e).
-- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `xcrypto_test.zig`'s guard-page helper marked `global-alloc-ok` (it needs whole OS pages; `check-global-alloc`).
 - **2026-11-08** — **Speed (no API change, bytes unchanged):** on x86-64 with AVX2/BMI2, ChaCha20-Poly1305 messages of 193 B..4 KiB run golang.org/x/crypto's amd64 assembly (BSD-3-Clause, translated by `tools/xcrypto_asm.py`; licence and changes in `NOTICE`): 1424 B open 1.11 → 1.08x x/crypto, -6..-14 % cycles at 256 B..1.5 KiB; past 4 KiB the Zig path stays (it is as fast or faster). Open writes the plaintext before the tag check and zeroes it on a mismatch, as x/crypto does. The engine's dead-stack burn is 1.5 KiB (4 KiB on the Zig wide path). **Security:** the by-value `encrypt`/`decrypt` wipe their own key copy (it could sit above the burn when not inlined). New `xcrypto_engine`, `xcrypto_max`, `xcrypto_burn` constants.
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog records a measured dead end: a scalar Poly1305 stitched into the ChaCha rounds in Zig source is byte-correct but 20-27 % slower at 1424 B open on the bench host (vector ports full, LLVM's scalar block twice x/crypto's); the 1.11× gap to x/crypto at WireGuard's size needs the assembly port.
 - **2026-11-04** — **Speed (no API change, bytes unchanged):** 1424 B open 1.17 → 1.09× x/crypto, seal 1.13 → 1.06×, 16 KiB level to 0.98×, every row at or under OpenSSL (0.37–0.98×). Poly1305's power table built in registers, the half engine's table only when used, ChaCha rounds grouped by operation on AVX2, the wide xor split in sibling frames so the dead stack is 1 KiB shallower. The wide-path burn went from 5 KiB to 4 KiB on that measurement, with more margin at the deepest row than before (848 B, was 816 B). 18 hand mutants of the new code, 17 killed, 1 equivalent; two tests added after three carry mutants survived the first set.
 
 - **2026-11-03** — **Security (dead stack, no API change):** the wide-path burn went from 4 KiB to 5 KiB. At a full 16 KiB TLS record the wide AEAD's frames reach 4.5 KiB, past the old burn, so 256..288 B stayed unzeroed in every caller; no needle hit, but the needles do not cover the Poly1305 powers. Found by `tlsserver`'s record probe in full CI. Stack probes gained 1 KiB, 4 KiB and 16 KiB rows and `XChaCha20Poly1305`. About +1 KiB of `rep stosb` per wide call: card re-measured, `tools/count.tsv` rewritten (+1024 under valgrind, which counts it per byte).
-- **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `tools/count.tsv` rewritten. Valgrind counts `rep stosb` once per byte, so the wide-path burn adds about 3840 instructions under it; time did not move.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** evidence for the short AEAD engine, from review. Stack probes at the largest short inputs (171+21, 192+0) measure the unburned body against the 1 KiB burn on native, `-Dcpu=baseline` and aarch64 (smallest margin 160 B; burn unchanged) and assert it, plus needles for the engine's duplicated key halves and keystream; a test-only `skip_aead_burn` makes that measurable. ctgrind's `aead`/`xaead` targets also run 150 B (the P = 2 path), expected in-file 4 -> 6 with the contexts named; a std differential sweep of the 192/448 seams (m 0..200 and 440..520 x 7 AD lengths, in place, XChaCha too); stale `aead_delegate_max` text fixed.
 
 - **2026-11-03** — **Speed, second step (no API change):** a message of at most 64 B uses a 2-block short pass (one latency-bound chain, faster than 4 blocks there): seal/open 64 B 176 ns, level with Go `x/crypto` v0.58.0 (1.01-1.02x), from 331 ns. The Poly1305 lane engine builds its power table r^2..r^8 by doubling (3 dependent multiplies, not 7), and the dead-stack burn uses `rep stosb` on x86-64 LLVM builds (short AEAD burn 1 KiB). 1420/1424 B stays 1.15-1.21x x/crypto (see SPEC "Performance"). `ctgrind --check chachapoly` counts unchanged, source pins re-taken. Bench now measures x/crypto on every row.
@@ -21,9 +16,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-03** — **Speed (no API change):** the AEAD's short path is no longer `std`'s. For message + AD of at most 192 B (was 128, std's code) one pass of a new 4-block diagonal-layout core (`shortKeystream`, two blocks per 256-bit register, two interleaved chains) yields the Poly1305 key and the keystream, and std's scalar Poly1305 authenticates; above that the first 8-block group also serves block 0, so the key no longer costs a separate std ChaCha call. Output byte-identical. Seal/open 64 B 331 -> ~195 ns (x/crypto 175), 1424 B 1226 -> ~1150 ns (x/crypto 900), `bench-chachapoly`, this host. `xorTail` finishes its remainder in power-of-two pieces instead of bytewise. New `Path.short` in the test witness; the short AEAD burn is 1 KiB. `tools/bench.zig` now also measures golang.org/x/crypto v0.58.0 `chacha20poly1305` (`tools/go_bench`).
 
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). `assert(out.len == in.len)` in `xor` and in every AEAD encrypt/decrypt (ChaCha, XChaCha, Poly1305 variants) is now a checked panic in every build mode (was UB in ReleaseFast). `counterWouldWrap` no longer overflows on lengths near `maxInt(usize)`. AEAD decrypt of a ciphertext whose block counter would wrap (> 256 GiB) zeroes `m` and returns `error.AuthenticationFailed` before the MAC, instead of panicking after a verified tag. The aliasing rule of encrypt/decrypt is documented (same slice, disjoint, or the output starting before the input). Tests: `src/sweep_test.zig`.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 
 - **2026-10-18** — **Fix (big-endian):** ChaCha20 keystream byte-reversed on big-endian targets under Zig 0.17. `blockWords` still byte-swapped the word vector before the vector -> bytes `@bitCast`, which 0.17 defines as little-endian on every target, so the swap now double-swapped. Swap removed. s390x (qemu, ReleaseSafe) modtest 27/55 -> 49/55 (6 skipped), as on 0.16; little-endian targets unchanged.
 - **2026-10-18** — **Speed (Zig 0.17 regression):** zig 0.17 (LLVM 22) lowers a `@bitCast` between a byte array and a vector of wider lanes byte by byte through a wide integer; `loadBlocks64`'s `[16*W]u8 -> @Vector(2W, u64)` made `Poly1305` `update` 14.5x the instructions (seal 16 KiB 82757 -> 500614 instructions, ~5x OpenSSL's time). That load, `columns8`'s and the keystream stores now go through a `@Vector(n, u8)` and a vector -> vector `@bitCast` (same little-endian-logical meaning, same constant-time shape: plain loads/stores, no new branch or index). `scripts/count-insns` seal 16 KiB 82579.5 (-0.2 % vs the 0.16 baseline), 1 KiB 8059.1 (-2.2 %), 64 B 2044.0 (-15.6 %, std 0.17's short path; unchanged by this fix).
@@ -48,14 +41,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (a 32-byte scalar survived in `voprf`'s probe). Here that was `short_path_burn` (2 KiB). Every burn now uses 16-byte
   stores, which need no realignment. No API change.
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** instruction-count cases for
-  `scripts/count-insns` (`src/count.zig`, opt-in via `ZIGLIBS_COUNT`; AEAD seal at 64 B, 1 KiB,
-  16 KiB), baseline `tools/count.tsv`, held by the CI `count amd64` lane.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the
@@ -66,12 +51,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   frame on every call. Each now runs one frame down and zeroes 2 KiB (short path) or 4 KiB (wide
   path) below it with vector stores. Cost: +5–8 % per AEAD call up to 1 KiB, +10–21 % per bare
   `xor`, within noise at 4 KiB (SPEC § "Secret residue on the dead stack").
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `chacha20_poly1305_test.json`
-  anchors the module (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 256 valid
-  vectors seal and open exactly and 60 invalid ones are refused with the output zeroed,
-  both as shipped and with this module's own engine forced; every vector's MAC input
-  also tags right through `Generic(L)` at L = 1, 2, 4, 8. No defect. The vectors are
-  Apache-2.0 data: the module now carries a `NOTICE`.
 
 - **2026-10-04** — Tests: first dated mutation run (54 mutants, 44 killed, 8 equivalent,
   2 not observable in-process; `SPEC.md` § "Mutation run 2026-10-04"). Three new tests in

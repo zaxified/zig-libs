@@ -104,9 +104,9 @@ one pass over 2 or 4 ChaCha blocks and authenticates with std's scalar Poly1305;
 a 64-byte seal went from 331 ns (std's AEAD, the previous path) to 176 ns, level
 with Go's `x/crypto/chacha20poly1305` (174 ns on the same host). A bare ChaCha run
 (or its post-group tail) of ≤ 64 bytes is still handed to `std.crypto.stream.chacha`.
-Measured against Go `x/crypto` v0.58.0 (`bench-chachapoly`, 2026-11-03): 64 B 1.01×,
-1420/1424 B (a WireGuard packet) **1.15–1.21× slower**, 16 KiB 1.02×; against
-OpenSSL 3.5.5 0.37–1.02×. Both branches are on lengths only, never on key
+Measured against Go `x/crypto` v0.58.0 (`bench-chachapoly`): 64 B 1.01×,
+1420/1424 B (a WireGuard packet) 1.07–1.09× slower, 16 KiB 0.98×; against
+OpenSSL 3.5.5 0.36–1.00× (the figures are the card's Performance line in `SPEC.md`). Both branches are on lengths only, never on key
 or plaintext; see `SPEC.md`.
 
 **The XOR is fused.** `ChaCha20.xor` used to stage the keystream into a stack
@@ -117,9 +117,18 @@ now transposed straight out of the `@Vector` state into 64-byte vectors, XORed
 against unaligned loads and stored — no intermediate keystream bytes. `xor` went
 1102 → 2383 MB/s, the 8 KiB AEAD 845 → 1406, and a 1420-byte packet 542 → 1127.
 
-Cipher (~2.4 GB/s) and MAC (~3.9 GB/s) in series predict ~1.47 GB/s, which is
-what the AEAD measures — neither side has slack left. Further gains need a wider
-block group (AVX-512) or interleaving the two passes, not another local fix.
+**One-pass stitched engine for mid-size packets.** On x86-64 ELF with AVX2, BMI2 and SSSE3,
+built through LLVM, ChaCha20-Poly1305 messages with `message + AD` above 192 B and up to
+4096 B run golang.org/x/crypto's amd64 assembly (ChaCha20 and a scalar Poly1305 interleaved in
+one loop; see Provenance and `SPEC.md`). Other lengths, the 8/12-round variants and other
+targets run this module's own engines.
+
+## Not provided
+
+libsodium's pre-RFC `crypto_aead_chacha20poly1305` and `crypto_secretstream_xchacha20poly1305`
+are out of scope; there is no NEON or SSE2 lane path for Poly1305 (those targets use std's
+scalar core). Reasons and the open items are in `SPEC.md` (*What is deliberately not done*,
+*Backlog / deferred*).
 
 ## Verify
 

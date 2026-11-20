@@ -26,19 +26,24 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [openssl/openssl](https://github.com/openssl/openssl) — **reference** (RFC 8439 AEAD) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | ChaCha20-Poly1305 and bare ChaCha20 with SIMD/asm; no XChaCha20 *(inferred)*. README measures ~1852 MB/s (AVX2, 8 KiB) for OpenSSL's ChaCha20 against this module's 1406 MB/s full AEAD on the same class of machine — parity is not claimed. |
-| [golang/crypto](https://github.com/golang/crypto) `chacha20poly1305` — **fastest** (measured 2026-11-03 against v0.58.0, `tools/go_bench`) | Go | BSD-3-Clause (LICENSE read) | 3.4k | pushed 2026-09-29 | `New` (12-byte nonce) and `NewX` (XChaCha20-Poly1305, 24-byte nonce); amd64 AVX2 assembly that stitches ChaCha20 and Poly1305 into one pass. Faster than OpenSSL 3.5.5 and libsodium 1.0.18 on every measured row (64 B: 174 ns, 1424 B: 920 ns, 16 KiB: 8.6 µs on the bench host); 1.15–1.21× ahead of this module at 1420/1424 B. |
+| [golang/crypto](https://github.com/golang/crypto) `chacha20poly1305` — **fastest** (measured against v0.58.0, `tools/go_bench`) | Go | BSD-3-Clause (LICENSE read) | 3.4k | pushed 2026-09-29 | `New` (12-byte nonce) and `NewX` (XChaCha20-Poly1305, 24-byte nonce); amd64 AVX2 assembly that stitches ChaCha20 and Poly1305 into one pass. Faster than OpenSSL 3.5.5 and libsodium 1.0.18 on every measured row; 1.07–1.09× ahead of this module at 1420/1424 B (the card's Performance line; both run x/crypto's stitched assembly there). |
 | [RustCrypto/AEADs](https://github.com/RustCrypto/AEADs) `chacha20poly1305` | Rust | Apache-2.0 OR MIT | 965 | pushed 2026-09-14 (crate 0.11.0 at main) | `ChaCha20Poly1305` and `XChaCha20Poly1305`, detached in-place API; AVX2/NEON backends *(inferred)*. |
 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | C | ISC (LICENSE read) | 14.0k | 1.0.22 (2026-04-09) | IETF ChaCha20-Poly1305 and XChaCha20-Poly1305 (the latter is what most libsodium-style protocols use) plus the old 64-bit-nonce construction and the secretstream. |
 | Zig `std.crypto.aead.chacha_poly` / `stream.chacha` | Zig | MIT | — | Zig 0.16.0 | `ChaCha20Poly1305`, `XChaCha20Poly1305`, and the 8-round `ChaCha8Poly1305`/`XChaCha8Poly1305` (checked in 0.16.0's `lib/std/crypto/chacha20.zig`). Byte-identical to this module; at the default baseline x86-64 target it is 2.5–3.3× slower per the README. |
 
-**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; the short AEAD (message + AD ≤ 192 B) has its own two-/four-block engine and is 1.9× the old std-delegated path at 64 B (331 → 176 ns, see Performance); three test-witnessed routing thresholds; faster than OpenSSL 3.5.5 and libsodium 1.0.18 at 64 B and 1420/1424 B, level at 16 KiB (1.01–1.03×); the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** Go `x/crypto` v0.58.0 by 1.07–1.09× at 1420/1424 B (WireGuard's packet size) although both run x/crypto's stitched AVX2 assembly there since 2026-11-08 (the difference is this module's 1.5 KiB dead-stack burn per call, which x/crypto does not do); the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path. XChaCha20-Poly1305, the 8/12-round variants, the 64-bit-nonce form and HChaCha20 — the 2026-09-30 gap — are in since 2026-10-13 (see "Variants"). Not taken, deliberately: libsodium's `crypto_aead_chacha20poly1305` (the pre-RFC construction, 64-bit nonce, unpadded MAC input — legacy, absent from std, Go, RustCrypto and OpenSSL) and `crypto_secretstream_xchacha20poly1305` (a framing protocol, `aeadframe`'s ground).
-
+**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; the short AEAD (message + AD ≤ 192 B) has its own two-/four-block engine; three test-witnessed routing thresholds; faster than or level with OpenSSL 3.5.5 and libsodium 1.0.18 on every measured row (the card's Performance line); the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** Go `x/crypto` v0.58.0 by 1.07–1.09× at 1420/1424 B (WireGuard's packet size) although both run x/crypto's stitched AVX2 assembly there (the difference is this module's 1.5 KiB dead-stack burn per call, which x/crypto does not do); the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path. Not taken, deliberately: libsodium's pre-RFC `crypto_aead_chacha20poly1305` and `crypto_secretstream_xchacha20poly1305` (reasons in *What is deliberately not done*).
 ## What this module is
 
 A performance-specialized ChaCha20 stream cipher + ChaCha20-Poly1305 AEAD,
 per **RFC 8439**. It duplicates capability that `std.crypto` already ships
 (`std.crypto.stream.chacha`, `std.crypto.aead.chacha_poly`) — a deliberate
 exception to the prefer-std rule, justified by throughput.
+
+Consumers already wired to this module (`@import("chachapoly")`, all using
+`ChaCha20Poly1305`): `noise`, `wireguard`, `dtls`, `quic-crypto`, `hpke`,
+`signal`, `aeadframe`, `timelock_envelope`, `megolm`, `tlock`. `bolt8` reaches it through `noise` (its `handshake.Suite` binds `noise.ChaCha20Poly1305`; a `std` suite is kept only as a differential oracle). Any
+change to the delegation thresholds or the MAC is therefore live on those
+paths, not staged behind a rewiring step.
 
 ## Why it exists (the dedup justification)
 
@@ -93,7 +98,7 @@ never emitted. The differential tests stay inside the non-wrapping domain (wrap
 past 2^32 blocks is out of `std`'s and the RFC's defined range and is not
 diffed).
 
-## Variants — rounds, the 64-bit-nonce row, XChaCha (2026-10-13)
+## Variants — rounds, the 64-bit-nonce row, XChaCha
 
 Every type in `std/crypto/chacha20.zig` has its twin here, under the same name minus `IETF`
 (`ChaCha12`, `ChaCha8`, `ChaCha{20,12,8}With64BitNonce`, `XChaCha{20,12,8}`,
@@ -109,7 +114,7 @@ pointer-keyed `*Into` twins and `hchacha20`. One engine serves them:
   the block counter is 64 bits over words 12–13, so the per-lane `counter +% j` must carry
   from word 12 into word 13 *inside* a wide group — a vector compare and select
   (`lo < lo0`), pinned by a std differential and libsodium goldens at counter
-  2^32 − 3 (lanes 3..7 carry; the carry mutant fails at byte 192, block 3). Its
+  2^32 − 3 (lanes 3..7 carry). Its
   anti-wrap rule is `counterWouldWrap64` (same `@panic`).
 - **XChaCha** runs HChaCha (the permutation without feed-forward, words 0..3 and 12..15)
   over the key and nonce bytes 0..16, then the IETF type of the same round count under
@@ -119,10 +124,9 @@ pointer-keyed `*Into` twins and `hchacha20`. One engine serves them:
   X body sits inside the public entry point's burn (stackprobe needles: the subkey and its
   one-time Poly1305 key, both 0).
 
-The wide cipher path got a frame of its own at the same time (`xorWide`, `streamWide`):
-with the short and wide paths in one frame, the generic body's frame grew by 64 B and std's
-short path reached 2303 B below the entry — past the 2 KiB `short_path_burn` (stackprobe2,
-needles 0, residue below the burn). The short path now runs at std's depth.
+The wide cipher path has a frame of its own (`xorBody`, `streamWide`): with the short and wide
+paths in one frame the generic body's frame grew by 64 B and std's short path reached 2303 B
+below the entry — past the 2 KiB `short_path_burn`. The short path runs at std's depth.
 
 ## Short inputs — the delegation thresholds and the short AEAD engine
 
@@ -135,18 +139,10 @@ short-packet traffic, the module hands those lengths back to `std`:
 | constant | in | condition | what runs |
 |---|---|---|---|
 | `delegate_max_bytes` = 64 | `ChaCha20.xor` / `.stream` | whole call, or the post-group tail, is ≤ 64 B | `std.crypto.stream.chacha.ChaCha20IETF` |
-| `aead_short_max` = 192 (2026-11-03; was `aead_delegate_max` = 128, std's AEAD) | `ChaCha20Poly1305.encrypt` / `.decrypt` | `m.len + ad.len ≤ 192` | **this module's short engine** (`shortKeystream`: block 0 = Poly1305 key and the keystream from one pass over 2 or 4 blocks; std's scalar Poly1305), not std |
+| `aead_short_max` = 192 | `ChaCha20Poly1305.encrypt` / `.decrypt` | `m.len + ad.len ≤ 192` | **this module's short engine** (`shortKeystream`: block 0 = Poly1305 key and the keystream from one pass over 2 or 4 blocks; std's scalar Poly1305), not std |
 | `wide_min_groups` = 3 | `poly1305.Generic(L).update` | fewer than 3 whole groups of the narrowest engine (< 192 B: L = 4, or L = 8's 4-lane half engine) | `std.crypto.onetimeauth.Poly1305` |
 
-**Stale until 2026-11-03, corrected:** the AEAD used to be `std.crypto.aead.chacha_poly`
-itself up to 128 B (message + AD), "parity by construction". The card then said
-`fastest 1.02× libsodium`, and Go `x/crypto` had never been measured. Measured against it
-(`tools/go_bench`): 64 B was 1.9× x/crypto (331 vs 174 ns), 1424 B 1.35–1.41×. The 64 B
-profile: 71 % of the call was TWO separate `std` ChaCha calls (the Poly1305 key block, then
-the data block; each ~118 ns: std's 2-block core run for one block, plus a bytewise xor
-tail) and 11 % the 2 KiB burn; x/crypto does the key block, the data and the MAC in one
-assembly routine. The fix is not stitching: the AEAD now generates block 0 (the key) and the
-blocks after it in ONE pass.
+The AEAD never delegates to `std`'s AEAD. Block 0 (the Poly1305 key) and the first data blocks come from ONE pass, so the key never costs a separate ChaCha call:
 
 - message + AD ≤ 192 B: `shortKeystream(P)` — `2·P` blocks in the diagonal layout, two per
   256-bit register (P = 1 for a message of ≤ 64 B, whose single chain is latency-bound anyway
@@ -158,19 +154,19 @@ blocks after it in ONE pass.
   costs a separate std call (~115 ns at 1424 B).
 
 **Consumer-visible consequence:** none in bytes (every KAT, Wycheproof and libsodium golden
-is unchanged). A WireGuard keepalive or a tunnelled ACK is now 1.9× faster than before.
+is unchanged).
 
 Every one of these branches is on a **length** — public, on the wire before a
 byte is authenticated. None may ever be made to depend on key or plaintext.
 
 `decrypt` computes the keystream first (the key block and the start of the message),
 verifies the tag, and only then XORs: a rejected message is never decrypted, and `m` is
-zeroed by `secureZero` as before (std's rejection path is no longer in the AEAD).
+zeroed by `secureZero`.
 
 `delegate_max_bytes` and `aead_short_max` are guarded by a test-build path
 witness (`chacha_path` / `aead_path`; `Path.short` is the AEAD's short engine) that asserts
 which engine each length was routed to; a mis-routing is otherwise byte-invisible.
-`wide_min_groups` has **no** such witness — flagged as such by the internal audit.
+`wide_min_groups` has its own witness, `poly1305.mac_path` (see *Threshold guards*).
 
 ## Poly1305 — lane-parallel above a threshold, std's scalar core below it
 
@@ -187,9 +183,9 @@ with the shared multiplier `r^L` and folding the lanes at the end against
 because the widest integer multiply x86 vectors have is `PMULUDQ`'s 32×32→64.
 `lanes` is picked at comptime (AVX-512F or AVX2 → 8, otherwise 1). At L ≥ 8 a run of
 3·L/2 .. 3·L blocks takes an L/2-lane half engine over the same power table
-(`wideHalf`), so the vector entry point stays at 192 B (2026-10-13: AVX2 went 4 → 8
-lanes — two independent 4-lane Horner chains, 0.77 → 0.55 cycles/B at 16 KiB with the
-shuffle load `columns8`; without the half engine 192–383 B fell back to std at 1.9×).
+(`wideHalf`), so the vector entry point stays at 192 B (AVX2 runs 8 lanes as two
+independent 4-lane Horner chains, loaded with the shuffle load `columns8`; without the half
+engine 192–383 B would fall back to std).
 
 **It is a hybrid, and that is the load-bearing design decision.** The power table
 `r^1..r^L` costs `L−1` field multiplies up front, and the 26-bit layout is
@@ -206,30 +202,35 @@ partially-reduced accumulator), `r` (the clamped key half) and `leftover`. That
 coupling is deliberate and is pinned by the every-length differential below: if
 any of those meanings drifted, the sweep would fail rather than silently forge.
 
-Measured on an i7-7920HQ (AVX2), ReleaseFast: MAC 1.0× at 32 B, 0.98× at 128 B,
-1.06× at 256 B, 1.5× at 512 B, 2.0× at 1420 B, 2.5× at 8 KiB; full AEAD 2.8× at
-8 KiB and 2.6× for a 1420-byte packet.
+The README's table gives the MAC and AEAD ratios against std; the card's Performance line is the
+comparative figure.
 
 `ChaCha20.xor` is **fused**: whole `wide`-block groups are transposed straight
 out of the `@Vector` state into 64-byte vectors, XORed against unaligned loads of
-the input and stored, with no `[64 * wide]u8` staging buffer. The staged shape it
-replaced was worse than an extra copy — its `out[j] = in[j] ^ ks[j]` loop was not
-vectorised at all, because `out` may alias `in`, so it emitted one
-`movzbl`/`xor`/`mov` per byte and held `xor` to 1102 MB/s against `stream`'s
-2219. Fused it reaches 2383 MB/s, and the AEAD 845 → 1406 MB/s at 8 KiB.
+the input and stored, with no `[64 * wide]u8` staging buffer. A staged
+shape is worse than an extra copy — its `out[j] = in[j] ^ ks[j]` loop does not
+vectorise, because `out` may alias `in`, so it emits one `movzbl`/`xor`/`mov` per byte.
 
 Only the sub-group tail still stages, and it generates one *whole* `wide` group
 and discards the unused blocks: a wide group costs roughly what a single `N = 1`
 block costs, so this wins for any tail longer than one block. The discarded lanes
 may carry block counters past 2^32-1 through the `+% iota`; those bytes are never
-emitted, so the anti-wrap guarantee is unaffected. This is most of the 1420-byte
-gain (542 → 1127 MB/s), which is the size that matters for the per-packet case.
+emitted, so the anti-wrap guarantee is unaffected. `xorTail` finishes the remainder in power-of-two pieces, not bytewise. This is most of the
+per-packet (1420-byte) gain.
 
 `xor` requires `out` and `in` to be either the same slice (in-place) or disjoint;
 partially overlapping slices are not supported, matching std's block-buffered
 `xor`. In-place is covered by tests at every length 0..1024.
 
-## The x/crypto amd64 engine (2026-11-08)
+## Engine tuning decisions
+
+Each of these was measured when it was made; the dead ends are in *What is deliberately not done*.
+
+- **ChaCha20 8-block group:** the 8×8 transpose is register shuffles (`transpose8`), not scalar inserts; `noReassoc` (an empty-asm barrier, LLVM/x86 only) stops LLVM rewriting `rotl(x ^ y, 16|8)` into two `vpshufb`; `chachaCore` is inlined so its 16 vectors do not round-trip through memory; on AVX2 `fourRounds` issues one operation of all four quarter rounds, then the next (the baseline target keeps the eight separate calls).
+- **Poly1305 lane engine:** the accumulator stays in `@Vector(L, u64)` across the lane loop; the message limbs come from 64-bit words (`loadBlocks64`, which lands blocks in the order `laneBlock` maps, and the fold table follows it); `opaque64` keeps the `& 0xffffffff` mask behind an empty-asm barrier so the backend still selects `vpmuludq` instead of emulating 64×64 multiplies; the power table `r^2..r^8` is built by doubling (3 dependent multiplies, not 7), in registers, with one carry pass per product.
+- **Dead-stack burn:** `rep stosb` on x86-64 LLVM builds, 16-byte volatile vector stores elsewhere (`burnStack`); the short AEAD has its own 1 KiB burn (`aead_short_burn`).
+
+## The x/crypto amd64 engine
 
 **What.** On x86-64 ELF with AVX2, BMI2 and SSSE3 (x/crypto's own `useAVX2`), built
 through LLVM, ChaCha20-Poly1305 (20 rounds only) messages from the end of the short
@@ -239,11 +240,10 @@ pass. Outside that window, and for the 8/12-round variants, the module's own eng
 run as before. Licence BSD-3-Clause, text and changes in `NOTICE`.
 
 **Why.** At WireGuard's packet size the stitched loop is the lever the Zig source does
-not have: a Zig-source scalar stitch measured 20-27 % slower (backlog, 2026-11-08),
+not have: a Zig-source scalar stitch is slower (see *What is deliberately not done*),
 because the vector rounds hold ports 0/1/5 and LLVM's scalar block is about twice
-x/crypto's. With the engine, `bench-wireguard` open_1424 went 1.11 → 1.04x
-wireguard-go (card P3 → P2). Past 4 KiB the Zig wide path is as fast or faster
-(per-length table at `xcrypto_max`), so the window stops there.
+x/crypto's. Past 4 KiB the Zig wide path is as fast or faster, so the window stops at
+`xcrypto_max`.
 
 **How it is built.** `tools/xcrypto_asm.py` (the recipe, kept) translates Go's Plan 9
 syntax to AT&T: register names, `CMP` operand order (Plan 9 writes it in Intel order),
@@ -271,17 +271,15 @@ checked, as x/crypto and OpenSSL do; a mismatch zeroes all of `m` (the contract)
 AD lengths, seal and open, apart and in place, a wrong tag (refused, `m` zeroed) and a
 flipped byte, engine against the Zig wide path (which the rest of the suite anchors to
 std, Wycheproof and libsodium); a guard-page test with input and output ending at a
-PROT_NONE page, 0..2100 B — with either tail patch removed it crashes (both checked,
-2026-11-08). The existing Wycheproof/libsodium/std suites run through the engine where
+PROT_NONE page, 0..2100 B, which crashes if either tail patch is removed. The existing Wycheproof/libsodium/std suites run through the engine where
 their lengths fall in the window. ctgrind (`aead`, `xaead`, 1024 B through the engine,
 both entries present in the harness binaries): no context inside the assembly; the
-in-file count stays 6, now the four short-engine tag-verdict branches in `openImpl`
+in-file count is 6: the four short-engine tag-verdict branches in `openImpl`
 plus `xcryptoOpen`'s verdict branch for an accepted and a rejected tag (the verdict is
-public). Dead stack: `stackprobe2_test.zig` measures the engine's frames at 943 B (seal)
-and 1055 B (open) without the burn; its burn is `xcrypto_burn` = 1536 B (margin 736 B),
-against 4 KiB for the Zig wide path. The by-value `encrypt`/`decrypt` now wipe their own
-key copy: un-inlined after this change, `decrypt` kept one above the burn and the
-2026-10-08 probe found it (fixed the same day).
+public). Dead stack: `stackprobe2_test.zig` measures the engine's frames without the burn and goes
+red when they outgrow `xcrypto_burn` = 1536 B (4 KiB for the Zig wide path). The by-value
+`encrypt`/`decrypt` wipe their own key copy (un-inlined, `decrypt` otherwise kept one above
+the burn, which the probe found).
 
 ## Constant-time
 
@@ -302,253 +300,186 @@ so that a deferred-carry bounds mistake panics instead of silently forging a
 tag; in `ReleaseSafe` (and in `Debug`, which arms the same checks) the compiler
 turns each of those into an overflow branch on a secret-derived value.
 
-**The measurement, in full, so the claim is exactly as wide as the evidence.**
-Since 2026-08-11 it is a **committed program**, not numbers a reader has to take
-on faith: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
-[`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh). It marks the 32-byte
-Poly1305 key `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer
-cannot keep a defined register copy, and drives it through `Poly1305.create` at
-16/64/192/1024/8192 B plus a chunked `update`/`pad`/`update`/`final` stream.
-Run it:
+**The measurement, in full, so the claim is exactly as wide as the evidence.** It is a
+**committed program**, not numbers a reader has to take on faith:
+[`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+[`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh). It marks the key
+`MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot keep a defined
+register copy, and drives three targets: `poly1305` (`Poly1305.create` at 16/64/192/1024/8192 B
+plus a chunked `update`/`pad`/`update`/`final` stream), `aead` (ChaCha20-Poly1305 seal, open
+and reject at 64, 150 and 1024 B: the short engine with one and two block pairs, and the
+wide or x/crypto path) and `xaead` (the same for XChaCha20-Poly1305, plus a
+`ChaCha20With64BitNonce` run across the 2^32 counter carry). Run it:
 
 ```sh
 scripts/checks/ctgrind.sh chachapoly
 ```
 
-Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `lanes = 4`, 2026-08-11.
-`in-file` = memcheck error CONTEXTS whose stack names `poly1305.zig`, not error
-counts:
+`in-file` = memcheck error CONTEXTS whose stack names `poly1305.zig`, not error counts. The
+expected rows are pinned in `scripts/checks/ctgrind-expected.tsv` (with a source digest per
+row, native and `cpu=x86_64` variants): `ReleaseFast` `poly1305` 0 in-file, `aead` 6 and
+`xaead` 6; `ReleaseSafe` `poly1305`, `aead` and `xaead` at least 1 (the positive control; on
+the `cpu=x86_64` baseline variant the `poly1305` positive control does not exist, because
+only the AVX2 lane path has the checked operators).
 
-| build | `-fvalgrind` | key tainted | contexts | of those, inside `poly1305.zig` | exit |
-|---|---|---|---|---|---|
-| `ReleaseFast` | yes | yes | **4** | **0** | 99 |
-| `ReleaseSafe` | yes | yes | **214** | **210** | 99 |
-| `ReleaseFast` | yes | **no** — negative control | 0 | 0 | 0 |
-| `ReleaseSafe` | yes | **no** — negative control | 0 | 0 | 0 |
-| `ReleaseFast` | **no** | yes — trap | 0 | 0 | 0 |
-| `ReleaseSafe` | **no** | yes — trap | 0 | 0 | 0 |
-
-(An earlier hand-run of the same experiment recorded 3 / 280 / 294 across the
-three claim rows of the time — `ReleaseFast`, `ReleaseSafe` and the `Debug` row
-since removed. Same shape, same conclusion; the small differences are the
-committed harness's slightly different message set, and these are the numbers
-that can now be re-taken.)
-
-**`Debug` is not in that table any more, and the reason is the compiler.** It
-carried three rows until 2026-09-08 (285 contexts, 281 in-file) as a second copy
-of the `ReleaseSafe` positive control. Zig 0.16 builds Debug with the
-self-hosted x86_64 backend — the only mode where that backend is the default —
-and valgrind's DWARF reader cannot parse the `.debug_line` it emits. Measured on
-this harness, frames carrying `(file:line)`: `ReleaseFast` 36/36, `ReleaseSafe`
-2054/2054, `Debug` **904/2130**; and of the Debug frames that do resolve, **51
-of 60 carry the wrong line number** (checked against `llvm-symbolizer`; the file
-is right 60 of 60). A context whose pattern-bearing frames all lost their line
-info cannot be attributed by any pattern, so the row failed or passed depending
-on the build rather than on this module — it was recorded as KNOWN RED on
-2026-09-02 and passed unchanged on 2026-09-08. The `ReleaseSafe` row makes
-exactly the same point through exactly the same checked operators, nothing
-consumes this module in Debug, and `CONVENTIONS.md` §7.1 had already narrowed
-the Debug CI lane to compile-only for the same kind of reason.
+The six in-file contexts of `aead` and `xaead` are all the single line
+`if (!timing_safe.eql(computed_tag, tag))` in `openImpl` (the short-engine instantiations,
+accepted and rejected tag) plus `xcryptoOpen`'s verdict branch for an accepted and a rejected
+tag: a branch on the RESULT of the tag comparison, which is public. None sits in `sealImpl`,
+the keystream, HChaCha, the subkey hand-off, the counter carry or the MAC. Every branch the
+engines add is on `m.len`/`ad.len`.
 
 Three things make the `ReleaseFast` zero mean something. First, the trap rows:
 **without `-fvalgrind` every run reads 0 regardless**, because
 `std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`,
 which the release modes disable — a clean run built without the switch is a
 silent no-op, not a result. Second, the negative-control rows: untainted, every
-mode reports 0, so the counts above are taint-caused and not ambient noise.
-Third, the `ReleaseFast` count is **non-zero** — its 4 contexts are branches on
-the *tag*, raised inside the harness's own hex formatter, which is the proof
-that taint travelled key → tag through the entire MAC and that the MAC left no
-branch behind on the way.
+mode reports 0, so the counts are taint-caused and not ambient noise. Third, the
+`ReleaseFast` total is **non-zero** — the contexts are branches on the *tag*, raised inside
+the harness's own hex formatter, which proves that taint travelled key → tag through the
+entire MAC and that the MAC left no branch behind on the way. (An `if (key[0] > 128)`
+compiles to a branchless select at `ReleaseFast` and proves nothing; the harness's check is
+the early-return defect class.)
 
-**Teeth, measured 2026-08-11.** The `ReleaseSafe` row is already a
-positive control no optimizer can delete — 210 contexts *inside*
-`poly1305.zig` prove the taint reaches the MAC's arithmetic. For the
-`ReleaseFast` row specifically, injecting a secret-dependent early return
-(`var z: u8 = 0; for (key) |b| z |= b; if (z == 0) { @memset(out, 0); return; }`
-at the top of `create` — the exact defect class) moves it from **4 total / 0
-in-file** to **5 / 1, exit 99**. This matters because the obvious cheap defect
-does *not* survive: an `if (key[0] > 128)` compiles to a branchless select at
-ReleaseFast and proves nothing. Reverted; `cmp` against a pre-mutation copy
-confirmed byte-identical.
+**`Debug` is not measured, and the reason is the compiler.** Zig builds Debug with the
+self-hosted x86_64 backend, and valgrind's DWARF reader cannot parse the `.debug_line` it
+emits: most frames lose their `(file:line)` and most of the resolved ones carry the wrong
+line, so a context cannot be attributed to `poly1305.zig` and a row passes or fails on the
+build rather than on this module. The `ReleaseSafe` row makes the same point through the same
+checked operators, nothing consumes this module in Debug, and `CONVENTIONS.md` §7.1 narrows
+the Debug CI lane to compile-only for the same kind of reason.
 
 The `ReleaseSafe` innermost frames are precisely the checked operators: the five
 schoolbook rows of `mulRed`, the carry chain, `buildPowers`' power table and the
 lane fold. `std`'s own scalar `Poly1305` shows the same class of artifact in its
 `mulWide`.
 
-**Decision (recorded, not deferred): the checked operators stay.** A
-deferred-carry bounds mistake that panics is strictly better than one that
-silently forges a tag, and the branches in question are never *taken* on correct
-input — what `ReleaseSafe` loses is the machine-checkable absence of the branch,
-not a demonstrated leak. So the contract is narrowed rather than the code:
-**ship this module at `ReleaseFast` if constant time matters**, and do not read
-the structural argument above as covering `ReleaseSafe`.
+**The checked operators stay.** A deferred-carry bounds mistake that panics is strictly better
+than one that silently forges a tag, and the branches in question are never *taken* on correct
+input — what `ReleaseSafe` loses is the machine-checkable absence of the branch, not a
+demonstrated leak. So the contract is narrowed rather than the code: **ship this module at
+`ReleaseFast` if constant time matters**, and do not read the structural argument above as
+covering `ReleaseSafe`.
 
 Beyond that measurement this is a *structural* CT argument (no secret-dependent
 control flow exists in the source), not a machine-checked-disassembly audit like
-`montint`/`k256`.
-
-**The `xaead` target (2026-10-13).** The harness's third target taints the key and drives
-`XChaCha20Poly1305` seal/open/reject at 64 and 1024 B plus a `ChaCha20With64BitNonce` run
-across the 2^32 counter carry. ReleaseFast: 8 contexts, 4 in-file — the same four as
-`aead` (the branch on the *result* of the tag comparison, std's `chacha20.zig:713` on the
-delegated path and ours on the wide path, once for the accepted and once for the rejected
-call; the result is public), and 4 in the hex-formatter witness. Nothing in HChaCha, the
-subkey hand-off or the counter carry. Controls and traps 0.
-
-**Re-taken 2026-11-03 for review gaps:** the harness's `aead` and `xaead` targets now also run
-150 B (the 65..192 B path, P = 2; before, only 64 B and 1024 B ran, so that path was never
-measured with a tainted key). ReleaseFast: `aead` 8 total / 6 in-file, `xaead` 10 / 6
-(were 6 / 4 and 8 / 4). From a `--stacks` run, all six in-file contexts are the single
-line `if (!timing_safe.eql(computed_tag, tag))` in `openImpl`: 3 instantiations (P = 1, 2,
-wide) x 2 calls (accepted, rejected tag); none in `sealImpl`, the keystream or the MAC.
-The +2 is exactly the P = 2 instantiation. ReleaseSafe `aead` 610 / 608, `xaead` 611 / 607
-(`>=1` rows). Controls and traps 0.
-
-**Re-run 2026-11-03, after the short AEAD engine and the Poly1305 power-table doubling**
-(`scripts/checks/ctgrind.sh --check chachapoly`): every count is unchanged (ReleaseFast
-`poly1305` 4 / 0 in-file, `aead` 6 / 4, `xaead` 8 / 4; ReleaseSafe 708 / 704, 608 / 606,
-609 / 605; controls and traps 0). The source pins moved, re-pinned with these reasons: `poly1305`
-rows — `buildPowers` computes r²..r⁸ by doubling (add / multiply / mask only, indices are
-comptime); `aead` and `xaead` rows — the AEAD's key block and short path are now
-`shortKeystream` (add, xor, rotate, fixed-lane shuffles) in this module's code, and the
-tag comparison's two result-dependent branches (the same four in-file contexts as before)
-now sit in `openImpl`, not in std's `decrypt`. No new branch or index depends on key,
-nonce or plaintext; every new branch is on `m.len`/`ad.len`.
+`montint`/`k256` (see *Backlog / deferred*).
 
 ## Secret residue on the dead stack
 
-Review 2026-10-08, found through `bolt8`'s transport probe; `src/stackprobe_test.zig`,
-ReleaseFast, AVX2. Every `encrypt`, `decrypt`, `xor` and `stream` left the 32-byte key and/or
-the AEAD's one-time Poly1305 key `r ‖ s` in a dead frame, once per call, at every length and on
-both engines (std's short path and the wide one) — at depths that moved between builds, so no
-named-local wipe can be relied on. Severity MEDIUM: the key also lives in the caller's cipher
-object for the session, so the copy matters after that object is wiped.
+Found through `bolt8`'s transport probe (`src/stackprobe_test.zig`, ReleaseFast, AVX2). Every
+`encrypt`, `decrypt`, `xor` and `stream` left the 32-byte key and/or the AEAD's one-time
+Poly1305 key `r ‖ s` in a dead frame, once per call, at every length and on every engine, at
+depths that moved between builds, so no named-local wipe can be relied on. Severity MEDIUM: the
+key also lives in the caller's cipher object for the session, so the copy matters after that
+object is wiped.
 
 Fix: each public entry point runs its body one frame down (`noinline`) and then zeroes the stack
-below it — 2 KiB after std's short path (dirtied ≤ 1.4 KiB), 4 KiB after the wide engine
-(≤ 3.1 KiB), chosen by the same PUBLIC length test the body makes. The AEAD calls the cipher's
-body directly, so it burns once. After: 0 over 3 needles × 4 entry points × 5 lengths × both
-engines × 3 calls; negative control 0, positive 1.
+below it (`burnStack`), the size chosen by the same PUBLIC length test the body makes:
 
-The burn runs on every call, so its speed is the price. Volatile 32-byte vector stores: 3 KiB in
-30 ns, against 115 ns for volatile `u64` stores and ~1 µs for `secureZero` (a volatile byte
-memset, ~3 B/ns without libc). Measured cost, ns per call (min of runs, ±5 % noise):
+| path | burn |
+|---|---|
+| cipher, std's short path (`short_path_burn`) | 2 KiB |
+| cipher and AEAD, wide engine (`wide_path_burn`) | 4 KiB (the deepest measured row, a 16 KiB TLS record, reaches about 3.4 KiB; the probe goes red when the margin runs out) |
+| AEAD, short engine (`aead_short_burn`) | 1 KiB |
+| AEAD, x/crypto engine (`xcrypto_burn`) | 1536 B |
 
-| length | AEAD before → after | `ChaCha20.xor` before → after |
-|---|---|---|
-| 16 B | 261 → 281 (+8 %) | 105 → 124 (+18 %) |
-| 64 B | 322 → 344 (+7 %) | 138 → 158 (+14 %) |
-| 128 B | 409 → 431 (+5 %) | 209 → 254 (+21 %) |
-| 256 B | 516 → 557 (+8 %) | 213 → 253 (+19 %) |
-| 1 KiB | 902 → 946 (+5 %) | 416 → 459 (+10 %) |
-| 4 KiB | within noise | within noise |
+The AEAD calls the cipher's body directly, so it burns once. The burn runs on every call, so
+its speed is the price; it is volatile 16-byte vector stores, or `rep stosb` on x86-64 LLVM
+builds (`secureZero`, a volatile byte memset, is far slower).
 
 **Not covered here:** the key copy a CALLER makes to pass `k` by value (the std-compatible API
 shape) — it sits in the caller's frame, above any burn of ours (seen in `bolt8`'s disassembly:
 `noise`'s `CipherState` copied `self.k` before the call). `noise` burns its own frame for that;
-other direct callers own theirs. `Poly1305` used directly is not probed.
+other direct callers own theirs. The pointer-keyed `*Into` twins leave no key copy in the
+caller's frame. `Poly1305` used directly is not probed.
 
-2026-10-13: `stackprobe_test.zig` also drives `XChaCha20Poly1305` encrypt/decrypt, `XChaCha20.xor`
-and `ChaCha20With64BitNonce.xor`, with two more needles — the HChaCha20 subkey (cross-checked
-against std's XChaCha20 keystream) and its one-time Poly1305 key. All 0.
+`stackprobe_test.zig` also drives `XChaCha20Poly1305` encrypt/decrypt, `XChaCha20.xor` and
+`ChaCha20With64BitNonce.xor`, with two more needles — the
+HChaCha20 subkey (cross-checked against std's XChaCha20 keystream) and its one-time Poly1305
+key. The secrets the engine holds beyond the key (the duplicated key halves of rows b and c,
+block 0 and the first data keystream block) are probed as needles too, and need no explicit wipe:
+they live in `sealImpl`/`openImpl`'s frame or below, all inside the burn (the residue rule counts
+every non-zero byte below the burn's top, needle or not).
 
-**The short AEAD's burn margin, measured 2026-11-03** (`stackprobe2_test.zig`, ReleaseFast,
-`CHACHAPOLY_PROBE_VERBOSE=1`; the body measured again with the burn skipped by the test-only
-`skip_aead_burn`, because with the burn on the dirtied depth is just the burn's own end).
-Depth of the unburned body below the region top, against the burn's end (`burn_top` +
-burn_len; `burn_top` is the entry frame, 143 B seal / 223 B open on x86-64, 116 / 195 on aarch64,
-and the test requires it under 512 B so the burn starts where the entry frame ends):
-
-| target | largest short input (192 total), seal / open | burn end | smallest margin | wide (193 B), seal / open | burn end |
-|---|---|---|--:|---|---|
-| x86-64 native (AVX2) | 863 / 1039 B | 1167 / 1247 B | 208 B | 3287 / 3383 B | 4239 / 4319 B |
-| x86-64 `-Dcpu=baseline` | 1007 / 991 B | 1167 / 1247 B | 160 B | 1951 / 2015 B | 4239 / 4319 B |
-| aarch64 (qemu) | 692 / 772 B | 1140 / 1220 B | 448 B | 1700 / 1764 B | 4212 / 4292 B |
-
-**That table's wide column stopped too early (fixed 2026-11-03).** The wide engine reaches deeper
-with the input: `x86_64_v3+aes+pclmul+adx`, seal / open, 193 B 3239 / 3335 B, 1 KiB and 4 KiB
-3839 / 3935 B, a full TLS record (16385+5 B) 4511 / 4607 B. Against the 4 KiB burn's end (4239 /
-4319 B) the record left bytes unzeroed in every caller. No needle was found there, but the probe's
-needles are the key and the first keystream, not the Poly1305 powers, so this is a defect and not
-a margin question. `tlsserver`'s record probe caught it in the first scheduled full CI (run
-41622100028); this module's probe had no row past 4 KiB. The burn is 5 KiB now (end 5263 / 5343 B,
-margin 752 / 736 B), the probe has rows at 1 KiB, 4 KiB and 16 KiB, and the pointer-keyed
-`XChaCha20Poly1305` entry points, which share the wide engine and the constant, are probed too.
-Not measured with the new rows: `-Dcpu=baseline` and aarch64 at 16 KiB.
-
-Inputs probed: 171+21 and 192+0 (the largest short ones), 64+0, 65+0, 100+16, 193+0. The test
-asserts `body <= burn_top + burn_len`, so a larger frame turns it red rather than
-printing. The margin is small on x86-64 (160 B at baseline, the reviewer's estimate of
-0.9-1.1 KiB held: 1007 / 991 B) and the burn was not raised; the next stack growth in
-`sealImpl`/`openImpl` or the MAC will need it raised, which the test now says.
-The secrets the engine holds beyond the key (the duplicated key halves of rows b and c,
-block 0 and the first data keystream block) are probed as needles too (zero hits), and need
-no explicit wipe: they live in `sealImpl`/`openImpl`'s frame or below, all inside the burn
-(the residue rule counts every non-zero byte below the burn's top, needle or not, and the
-unburned depth above is below the burn's end).
+`stackprobe2_test.zig` measures the burn's margin: it runs the AEAD body again with the burn
+skipped by the test-only `skip_aead_burn` (with the burn on, the dirtied depth is just the
+burn's own end), at the largest short inputs (171+21 and 192+0), 64+0, 65+0, 100+16, 193+0,
+and at 1 KiB, 4 KiB and full TLS-record sizes (16385+5, 16640+5) for the wide engine, driving the pointer-keyed `encryptInto`/`decryptInto`, and asserts `body <= burn_top + burn_len`
+and that the entry frame (`burn_top`) is under 512 B, so the burn starts where the entry frame
+ends. A larger frame turns it red rather than printing. The margin is small on x86-64
+(`-Dcpu=baseline` is the tightest short-engine case): the next stack growth in
+`sealImpl`/`openImpl` or the MAC will need the burn raised, which the test says.
 
 ## Verification
 
-- **RFC 8439 KATs**, byte-exact, Debug + ReleaseFast: §2.3.2 (ChaCha20 block /
-  keystream at counter 1), §2.4.2 (the "sunscreen" encryption), §2.5.2 (Poly1305
-  tag), §2.8.2 (AEAD encrypt: ciphertext + tag).
-- **RFC 8439 §A.3 Poly1305 vectors** — all eleven, at every lane width
-  L ∈ {1,2,4,8}. These are the ones written to break a wrong implementation:
-  r = 0, s = 0, r = 2^130−6, the two "imperfect carry propagation" pairs, and a
-  127-byte message that lands mid-lane at every width.
-- **Poly1305 differential vs `std` for EVERY length 0..2048**, at every lane
-  width, plus a random-key stress, an all-0xff key/message worst case for the
-  deferred-carry bound, and every `update` split point (the streaming path the
-  AEAD actually drives). The partial-final-block and lane-boundary-straddle
-  cases are where parallel Poly1305 implementations break, so they are swept
-  exhaustively rather than sampled.
+- **Run:** `scripts/modtest chachapoly`; the optimized mode with
+  `zig build test-chachapoly -Doptimize=ReleaseFast`; the benchmark with
+  `zig build bench-chachapoly`; the constant-time evidence with
+  `scripts/checks/ctgrind.sh chachapoly` (see *Constant-time*).
+- **RFC 8439 KATs**, byte-exact: §2.3.2 (ChaCha20 block / keystream at counter 1), §2.4.2 (the
+  "sunscreen" encryption), §2.5.2 (Poly1305 tag), §2.8.2 (AEAD encrypt: ciphertext + tag).
+- **RFC 8439 §A.3 Poly1305 vectors** — all eleven, at every lane width L ∈ {1,2,4,8}: r = 0,
+  s = 0, r = 2^130−6, the two "imperfect carry propagation" pairs, and a 127-byte message that
+  lands mid-lane at every width.
+- **Poly1305 differential vs `std` for EVERY length 0..2048**, at every lane width, plus a
+  random-key stress, an all-0xff key/message worst case for the deferred-carry bound, and every
+  `update` split point (the streaming path the AEAD actually drives). The partial-final-block and
+  lane-boundary-straddle cases are where parallel Poly1305 implementations break, so they are
+  swept exhaustively rather than sampled.
 - **Differential vs the `std` oracle** across block-boundary edge lengths
-  `{0,1,15,16,17,31,63,64,65,127,128,129,255,256,257,511,512,513,1000,4096}`:
-  our `ChaCha20.stream`/`.xor` equal `std`'s byte-for-byte at several counters;
-  our AEAD ciphertext **and** tag equal `std`'s, `decrypt(encrypt)` is identity,
-  our AEAD opens `std`'s ciphertext and `std` opens ours (cross-decrypt), and
-  both tag-tamper and ciphertext-tamper are rejected. `std` is the authority — a
-  divergence in any edge length fails the build.
-- **Wycheproof** `chacha20_poly1305_test.json` (2026-10-06): its 316 tests
-  with a 96-bit nonce — 256 valid, which must seal and open exactly, and 60
-  that must be refused with the output zeroed. Each runs twice: as shipped
-  (only 18 have m + ad above `aead_short_max`, so the rest run the short engine
-  code) and under `force_wide`, so every one also runs this module's AEAD
-  engine. A second test tags each vector's §2.8 MAC input with
-  `Generic(L)` for L ∈ {1,2,4,8} and requires a match exactly for the valid
-  ones; the lane engine absorbs 151 / 38 / 38 of them at L = 2 / 4 / 8 (pinned; L = 8 through its 4-lane half engine),
-  among them Wycheproof's 84 Poly1305 carry edge cases. Recipe
-  `tools/wycheproof.py`, Apache-2.0 data, see NOTICE. No defect; a one-bit
-  change in a valid vector's tag fails both tests (negative control,
-  2026-10-06).
-- A `>8`-block (20-block) case exercises two wide passes + a 4-block tail and the
-  per-lane counter increment across the boundary, byte-exact vs `std`.
-- **The variants (2026-10-13).** Wycheproof `xchacha20_poly1305_test.json`: its 306
-  tests with a 192-bit nonce (246 valid, 60 refused with the output zeroed), as shipped
-  and under `force_wide` (same recipe, `tools/wycheproof.py … 192`). libsodium 1.0.18
-  goldens (`tools/libsodium_goldens.py`, SHA-256 of each output, inputs rebuilt by a
-  pattern): the 64-bit-nonce ChaCha20 stream at counters 0, 1, 2^32 − 3, 2^32 − 1,
-  2^32 and 2^64 − 80 over 16 lengths up to 4103 B, the XChaCha20 stream at three
-  counters, XChaCha20-Poly1305 with 0/13/300 B of AD — 192 rows, each on both engines —
-  and the draft's §2.2.1 HChaCha20 vector. A std differential over all fifteen variant
-  types (stream: `xor` and `stream`; AEAD: seal, open, tag/nonce tamper with the output
-  zeroed) at 20 edge lengths up to 4103 B, both engines, with the 64-bit counter at the
-  same carry points. Negative control: dropping the word-13 carry fails the std
-  differential at byte 192 and the libsodium rows at byte 0. The 64-bit anti-wrap
-  predicate is pinned at the last block of the 2^64 space, which runs through this
-  module's engine.
-
-The `std` differential is what makes the SIMD safe: correctness of the transpose
-layout + tail handling + counter carry is pinned to `std`'s scalar/diagonal
-implementation at every awkward length, so a wrong keystream cannot ship.
-
-- **The short/wide seam against std (2026-11-03).** `seamSweep` in `root.zig`: ChaCha20-Poly1305
-  and XChaCha20-Poly1305, every message length 0..200 and 440..520 (so exactly 64/65, 192, 193,
-  447, 448, 449) x AD 0, 1, 15, 16, 17, 21, 32 (the total crosses 192 from the AD side): seal
-  equal to std (separate and in place), open of std's ciphertext (separate and in place),
-  a flipped tag refused with the output zeroed.
+  `{0,1,15,16,17,31,63,64,65,127,128,129,255,256,257,511,512,513,1000,4096}`: `ChaCha20.stream`/
+  `.xor` equal `std`'s byte-for-byte at several counters; the AEAD ciphertext **and** tag equal
+  `std`'s, `decrypt(encrypt)` is identity, the AEAD opens `std`'s ciphertext and `std` opens
+  ours (cross-decrypt), and both tag-tamper and ciphertext-tamper are rejected. `std` is the
+  authority: the std differential is what pins the transpose layout, the tail handling and the
+  counter carry at every awkward length, so a wrong keystream cannot ship. Also: `xor` for every
+  length 0..1024, in place (`out == in`) at every one of them, an unaligned-offset sweep, a
+  `>8`-block case (two wide passes and a tail, the per-lane counter increment across the
+  boundary), and the counter-space boundary (the last non-wrapping block is accepted and runs
+  through this module's engine).
+- **Wycheproof** `chacha20_poly1305_test.json` (the vectors with a 96-bit nonce; the file's other
+  nonce sizes need a nonce this API does not take) and `xchacha20_poly1305_test.json` (the vectors
+  with a 192-bit nonce): the valid ones must seal and open exactly, the invalid ones must be
+  refused with the output zeroed. Each runs as shipped (most vectors sit under `aead_short_max`,
+  so they exercise the short engine) and under `force_wide`, so every one also runs this
+  module's wide engine. A second test tags each ChaCha20-Poly1305 vector's §2.8 MAC input with
+  `Generic(L)` for L ∈ {1,2,4,8} and requires a match exactly for the valid ones; it includes
+  Wycheproof's Poly1305 carry edge cases and pins how many vectors the lane engine absorbs at
+  each width. Recipe `tools/wycheproof.py`, Apache-2.0 data, see `NOTICE`.
+- **The variants.** libsodium 1.0.18 goldens (`tools/libsodium_goldens.py`, SHA-256 of each
+  output, inputs rebuilt by a pattern): the 64-bit-nonce ChaCha20 stream at counters 0, 1,
+  2^32 − 3, 2^32 − 1, 2^32 and 2^64 − 80 over 16 lengths up to 4103 B, the XChaCha20 stream at
+  three counters, XChaCha20-Poly1305 with 0/13/300 B of AD, each on both engines; the draft's
+  §2.2.1 HChaCha20 vector. A std differential over all fifteen variant types (stream: `xor` and
+  `stream`; AEAD: seal, open, tag/nonce tamper with the output zeroed) at 20 edge lengths up to
+  4103 B, both engines, with the 64-bit counter at the same carry points. The 64-bit anti-wrap
+  predicate is pinned at the last block of the 2^64 space, which runs through this module's
+  engine.
+- **The short/wide seam against std.** `seamSweep` in `root.zig`: ChaCha20-Poly1305 and
+  XChaCha20-Poly1305, every message length 0..200 and 440..520 (so exactly 64/65, 192, 193,
+  447, 448, 449) × AD 0, 1, 15, 16, 17, 21, 32 (the total crosses 192 from the AD side): seal
+  equal to std (separate and in place), open of std's ciphertext (separate and in place), a
+  flipped tag refused with the output zeroed.
+- **The x/crypto engine** (`src/xcrypto_test.zig`): see *The x/crypto amd64 engine* — every
+  length 0..1100 and the seams to 20 KiB × 7 AD lengths against the Zig wide path, and the
+  guard-page test.
+- **Fuzz:** the deterministic driver, `CHACHAPOLY_FUZZ` (harness `chachapoly-decrypt`: `decrypt`
+  never panics on arbitrary ciphertext/tag/AAD/nonce/key); 300 seeds run in every test run and a
+  reach check requires every label to be hit, and a corpus test pins that every AEAD tuple
+  reaches `decrypt`. Never `zig build --fuzz`.
+- **No-panic sweep:** `src/sweep_test.zig` pins the counter predicates on huge lengths and the
+  refusal of an over-limit ciphertext before the MAC.
+- **Dead stack:** `stackprobe_test.zig` and `stackprobe2_test.zig` (see *Secret residue on the
+  dead stack*); `src/count.zig` holds the opt-in instruction-count cases for
+  `scripts/count-insns` (`tools/count.tsv`).
+- **Constant time:** `ctgrind.sh chachapoly` rows and the `ctgrind-expected.tsv` pins, see
+  *Constant-time*.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it. The two survivors the card counts as
+  unexplained are the counter-wrap `@panic` calls in `xor` and `stream`: a test binary cannot
+  survive a panic it provokes, so they are unobservable in-process; the predicate
+  `counterWouldWrap` is pinned at the block boundaries and the two call sites are one line each.
 
 ### Threshold guards — the one property bytes cannot check
 
@@ -561,270 +492,84 @@ routing:
 | constant | value | witness | first size on the fast path |
 |---|---|---|---|
 | `delegate_max_bytes` (ChaCha20) | **64** | `root.chacha_path` | 65 B |
-| `aead_short_max` (whole AEAD, `m.len + ad.len`; was `aead_delegate_max` = 128) | **192** | `root.aead_path` (`.short` up to it) | 193 B |
+| `aead_short_max` (whole AEAD, `m.len + ad.len`) | **192** | `root.aead_path` (`.short` up to it) | 193 B |
 | `wide_min_groups` (Poly1305 lanes) | **3** | `poly1305.mac_path` | 96/192/384 B at L = 2/4/8; L = 8's half engine (`.wide_half`) from 192 B |
 
 The witnesses are `void` outside a test build (`builtin.is_test` is comptime),
 so none of this reaches shipped code and the `.reentrant` claim is unaffected.
 
 **The numbers are asserted as literals, not as expressions over themselves.** A
-case table written `.{ .m = aead_delegate_max, .want = .std_delegated }` moves
-with the constant and stays green for any value of it — verified: mutating
-`aead_delegate_max` 128 → 130 and `delegate_max_bytes` 64 → 80 both exited 0
-against the symbolic tables alone. The literal tables that now follow them turn
-both red, as does `wide_min_groups` 3 → 4096 (the mutation that switches the
-lane-parallel MAC off entirely: measured cost, MAC 4048 → 1698 MB/s at 8 KiB,
-2.47× → 1.06× vs std) and 3 → 2. The symbolic tables are kept because they pin a
+case table written `.{ .m = aead_short_max, .want = .short }` moves
+with the constant and stays green for any value of it. The literal tables that follow the
+symbolic ones turn red when a constant is retuned. The symbolic tables are kept because they pin a
 different property — every comparison replayed against every implementation of
 it, which is how two real routing holes in `decrypt` and `stream` were found.
 
-## Performance — `bench-chachapoly` (2026-10-10, re-measured 2026-10-13)
+## Performance
 
-### 2026-11-03: Go x/crypto added; the short AEAD and the Poly1305 table reworked
+The comparative benchmark is `zig build bench-chachapoly` (`tools/bench.zig` driving
+`tools/c_bench/foreign_bench.c` for OpenSSL and libsodium, and `tools/go_bench` for Go
+`golang.org/x/crypto` `chacha20poly1305`). Workloads: encrypt and decrypt
+(`ChaCha20Poly1305.encryptInto`/`decryptInto`) of 64 B, 1420 B, 1424 B and 16 KiB with 13
+bytes of AD. Method: each side doubles its batch until it takes over 100 ms and keeps the
+best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its
+best; ratio = ours/theirs by user-mode cycles (`perf_event_open`, also on the Go side, pinned
+with `runtime.LockOSThread`); spread = (worst round − best round) / best round per side.
+Before timing, an interop check requires both libraries' ciphertext and tag of the 1420-byte
+message to equal ours byte for byte. Build with `-Djcc-safe` for the figures on the card.
 
-Owner decision 2026-11-03 (the `wireguard` module measured its transport at 1.33–1.94× x/crypto):
-fix it here. `bench-chachapoly` now also runs `golang.org/x/crypto` v0.58.0 `chacha20poly1305`
-(BSD-3-Clause; `tools/go_bench`, offline from the Go module cache, `go.sum` hashes from the
-cache) on every row. Pairing: same key, nonce, 13 B AD, message; Go's `New` is built once
-(it only copies the key; `setupState` per call is the key/nonce expansion ours does too);
-one op = one Seal/Open into a reused buffer; user-mode cycles on all four sides
-(`perf_event_open` from the Go side too, pinned with `runtime.LockOSThread`). Host: i7-7920HQ,
-AVX2, shared with other agents' jobs; spread ≤ 7 % (OpenSSL/libsodium columns), ≤ 2.7 %
-(x/crypto pass).
+The card's Performance line carries the current figures and its reference rows (OpenSSL
+3.5.5 EVP `chacha20-poly1305` is the scope's reference; libsodium 1.0.18 and Go x/crypto
+v0.58.0 are the other sides) and is authoritative. `README.md` has the throughput table against
+`std`.
 
-Before (first run, before any change), ours/x-crypto: seal 64 B 1.94, open 64 B 1.90, seal
-1424 B 1.35, open 1424 B 1.41. After (final run, `BENCH_ROUNDS=5`, ns per op):
+## What is deliberately not done
 
-| workload | ours | OpenSSL | libsodium | x/crypto | ours/OpenSSL | ours/x-crypto |
-|---|--:|--:|--:|--:|--:|--:|
-| `enc_64` | 176 | 448 | 372 | 174 | 0.39 | **1.01** |
-| `dec_64` | 178 | 479 | 376 | 175 | 0.37 | **1.02** |
-| `enc_1420` | 1074 | 1281 | 1722 | 930 | 0.85 | 1.15 |
-| `dec_1420` | 1069 | 1304 | 1716 | 869 | 0.82 | 1.21 |
-| `enc_1424` | 1064 | 1263 | 1667 | 921 | 0.84 | 1.17 |
-| `dec_1424` | 1056 | 1311 | 1695 | 886 | 0.82 | 1.20 |
-| `enc_16384` | 8757 | 8539 | 12114 | 8563 | 1.01 | 1.02 |
-| `dec_16384` | 8715 | 8605 | 11879 | 8626 | 1.02 | 1.02 |
-
-(The x/crypto column comes from the second pass of the same run, so its 64 B Go time
-differs from the first pass's by host noise.) 64 B reached the 1.1× aim, 1420/1424 B did
-not: 1.15–1.21× x/crypto. No existing large row got worse: 16 KiB 1.014–1.018× OpenSSL
-(1.015–1.027× before).
-
-**Profile (perf record on the bench, IPC and instruction counts from `perf stat`).**
-64 B seal: 1130 cycles / 2044 instructions (IPC 1.8) against x/crypto's 594 cycles / ~1330.
-71 % of ours was `std`'s ChaCha20 (two calls: key block, data block, each with a bytewise
-xor tail), 11 % `burnStack` (2 KiB), 12 % body, 5 % std Poly1305. Not the stitching, not
-Poly1305: two separate ChaCha invocations and a heavy burn. 1424 B seal: ours 1300 ns, Go
-910 ns (3165 cycles, 8840 instructions, IPC 2.8; ours: 8059 instructions at 1 KiB by `count-insns`, 1424 B not counted); ours was 47 %
-three wide groups, 34 % the lane Poly1305 (of which ~45 % the serial power table r¹..r⁸, 7
-dependent field multiplies, and ~50 % the group loop), 9 % the std call for the key block,
-6 % the 4 KiB burn.
-
-**What was done** (each step measured): (1) the AEAD below 192 B (was 128) runs
-`shortKeystream` — block 0 (key) and the data blocks from one pass, 2 blocks for a message of
-≤ 64 B (one latency-bound chain; measured faster than 4 blocks), 4 above — and std's scalar
-Poly1305; 64 B 331 → 176 ns. (2) Above 192 B the first wide group serves block 0 as well as
-blocks 1..7: no std call for the key (1424 B 1226 → 1145 ns). (3) The Poly1305 power table is
-built by doubling (r², then r³ r⁴ as one 2-lane multiply, then r⁵..r⁸ as one 4-lane
-multiply): 3 dependent multiplies, not 7. (4) The burn: a separate 1 KiB burn for the short
-AEAD (its frames are small) and `rep stosb` instead of 16-byte stores on x86-64 LLVM builds
-(`stackprobe` green in ReleaseFast). (5) `xorTail` finishes its remainder in power-of-two
-pieces, not bytewise.
-
-**What is not closed, and why.** 1420/1424 B stays 1.15–1.21× x/crypto. x/crypto's
-amd64 routine interleaves a scalar mulx Poly1305 with the vector ChaCha in one loop;
-ours runs the vector Poly1305 after the ChaCha, both on the same vector ports (each
-~100 % busy at IPC 2.8), so source-level stitching of the lane engine would not add
-throughput and a scalar one is a port of x/crypto's assembly (BSD-3-Clause, portable with a
-NOTICE; `modules/p256` is the repository's example of generated asm) that this pass did not
-attempt. Remaining measured costs at 1424 B (ns, of ~1065): three ChaCha groups ~570, the
-lane Poly1305 ~380 (table ~100, group loop ~200, fold ~50), burn ~40. The card therefore
-stays P2 against the reference (OpenSSL, ≤ 1.03× on every row) and says plainly that x/crypto,
-the fastest implementation measured, is 1.15–1.21× ahead at WireGuard's packet size.
-
-**Closed further 2026-11-04 (quiet host, i7-7920HQ): 1424 B open 1.17 → 1.09× x/crypto, seal 1.13 → 1.06×, 16 KiB 1.02 → 0.98×.** Not by stitching: at 16 KiB, where x/crypto stitches throughout, the two were already level, so the gap at 1424 B was the fixed cost per call (about 280 ns over the bulk rate here, about 120 ns there). Cycles below are `perf stat`, minimum of 9 fresh processes per variant, one driver; code placement alone moves a build ±4 %, so one run decides nothing.
-
-| step | 1424 B open, cycles | why |
-|---|--:|---|
-| power table in registers, one carry pass per product | 3606 → 3502 | was a row per power in memory, two scalar carry passes on each of 8 powers; 263 fewer instructions |
-| `fourRounds`, AVX2 only | 3414 → 3315 | one operation of all four quarter rounds, then the next; also 16 KiB 29975 → 29043 |
-| `xorBody`'s three sibling frames, then a 4 KiB burn | depth 3.9 → 3.0 KiB; 16 KiB record 4.5 → 3.4 KiB | std's tail ran under the group loop's 1.9 KiB frame |
-
-Tried and dropped, each measured: the half engine's table built apart is no gain at 1424 B (3597 → 3593) but 1698 → 1547 at 300 B, so it stayed; aligned 32-byte stores in place of `rep stosb`, no gain (burn's true cost is ~200 cycles at 5 KiB, measured by shrinking it; the profile's 293 overstated it); a generated AVX2 round loop with one spilled register, 3-5 % slower although LLVM spills twice as much, so spills are not what limits this core; the partial group XORed from registers without the staging buffer, 81 fewer instructions, 2 % more cycles. A smaller burn than 4 KiB would only spend the margin. `fourRounds` costs 2-4 % on baseline, so baseline keeps the eight calls.
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-chachapoly`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 7.0 %): ref 0.69–1.02× OpenSSL 3.5.5, fastest 1.02× (libsodium 1.0.18 or OpenSSL per row), against 0.83–1.03× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
-
-The comparative benchmark behind the card's Performance line. Reference: OpenSSL 3.5.5 (the
-scope's reference; system `libcrypto.so.3`, EVP `chacha20-poly1305`, AVX2 assembly); also
-measured: libsodium 1.0.18 (`crypto_aead_chacha20poly1305_ietf_*_detached`). `fastest` is per
-row the faster of the two -- OpenSSL from 1420 B up, libsodium at 64 B. Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
-
-Method: `zig build bench-chachapoly` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (both libraries' ciphertext and tag of the 1420-byte message must equal ours byte for byte).
-
-Workloads: encrypt and decrypt (`ChaCha20Poly1305.encryptInto`/`decryptInto`) of 64 B, 1420 B
-and 16 KiB with 13 bytes of AD. `BENCH_ROUNDS=5` (`alt` = libsodium), 2026-10-13 evening, after
-the u64-lane Poly1305 pass below, quiet host (largest spread 4.7 %):
-
-| workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `enc_64` | 381 | 451 | 365 | 0.841 | 1.027 | 1.9% | 4.7% | 4.4% |
-| `enc_1420` | 1272 | 1266 | 1701 | 1.012 | 1.012 | 0.5% | 2.4% | 2.1% |
-| `enc_16384` | 8738 | 8464 | 11989 | 1.027 | 1.027 | 0.9% | 0.4% | 1.9% |
-| `dec_64` | 382 | 463 | 372 | 0.828 | 1.031 | 1.1% | 4.2% | 2.3% |
-| `dec_1420` | 1275 | 1289 | 1699 | 0.994 | 0.994 | 0.3% | 3.6% | 2.6% |
-| `dec_16384` | 8793 | 8546 | 12195 | 1.026 | 1.026 | 1.7% | 1.6% | 3.6% |
-
-Two more runs the same evening: 16 KiB 1.021–1.028, 1420 B 0.987–1.014, 64 B against
-libsodium 1.015–1.044 (that column's spread reached 7.8 %). Earlier the same day, before
-the u64-lane pass: 16 KiB 1.096–1.101 (P3 by 0.001); 2026-10-10, before both passes: 16 KiB
-1.31–1.33, 1420 B 1.05–1.08.
-
-**On Zig 0.17.0 (2026-10-18, migration check; the table above is the 0.16.0 measurement).**
-0.17 lowered the `[N]u8` <-> wide-lane `@Vector` `@bitCast` in the Poly1305 loads and the
-keystream stores byte by byte; the loads and stores now go through `@Vector(n, u8)` and a
-vector-to-vector `@bitCast`, which restores the 0.16 instruction counts. `count-insns`
-(ReleaseFast, x86_64_v3), 0.16 baseline -> 0.17 after the fix: seal-1KiB 8237.1 -> 8059.1,
-seal-16KiB 82757.6 -> 82579.5 (before the fix 34294.1 / 500614.5). `bench-chachapoly` on 0.17,
-on a noisy machine (spread up to 105 %): ref 0.51–0.94× OpenSSL. This is a loaded-machine
-check, not a re-measurement of the card; the card's figures stay the 2026-10-13 ones.
-
-**The 2026-10-13 pass** (each step measured with this bench; profiles from `perf`): OpenSSL's
-EVP ChaCha20-Poly1305 is two passes too (its AEAD costs the sum of its ChaCha20 and Poly1305), so
-the stitched one-pass lever below was not the gap — both kernels were. (1) ChaCha20: the 8×8
-transpose was 128 scalar `vpinsrd` per 8 blocks → register shuffles (`transpose8`); LLVM rewrote
-`rotl(x ^ y, 16|8)` into two `vpshufb` → an empty-asm barrier (`noReassoc`, LLVM/x86 only);
-`chachaCore` inlined so its 16 vectors no longer round-trip through memory. (2) Poly1305: AVX2
-8 lanes (two independent chains) with a 4-lane half engine for 192–383 B, and the 8-block load
-as shuffles (`columns8`) instead of 32 `vpinsrd`. Tried and dropped: a two-chain carry in
-`mulRed` (no change), u64-lane accumulators (LLVM lost `vpmuludq` across the loop phi and
-emulated 64×64 multiplies — 25 % slower; solved in the evening pass below). ChaCha20 is still
-~1.15× OpenSSL's kernel.
-
-**The 2026-10-13 evening pass — u64-lane Poly1305.** The accumulator now stays in
-`@Vector(L, u64)` across the lane loop (no u32 → u64 widening and narrowing per step) and the
-message limbs come straight from 64-bit words (`loadBlocks64`: `vpunpck{l,h}qdq` of two
-32-byte loads, which lands blocks 0 2 1 3 in a 4-lane register; `laneBlock` maps lanes to
-blocks and the fold table follows it). What made the earlier attempt emulate 64×64: IR passes
-proved the accumulator < 2^28 and deleted the `& 0xffffffff` mask as redundant, and the
-backend, which sees the accumulator only through the loop phi, could then not prove the upper
-halves zero. The mask now sits behind an empty-asm barrier (`opaque64`, LLVM/x86 only, split
-per 256-bit register on AVX2), so it survives and `vpmuludq` is selected: the L = 8 loop body
-is 227 instructions per 128 B (50 `vpmuludq`, no emulation; 366 without the barrier, ~250
-before), the 4-lane half engine 93 per 64 B. AEAD 16 KiB 1.10 → 1.03× OpenSSL, 1420 B 1.04 →
-0.99–1.01×.
-
-Cross-check, two earlier runs with the roles swapped (libsodium as `ref`): ours/libsodium
-0.80–1.02 and 0.80–1.04 (64 B rows 1.01–1.04, 1420 B 0.80–0.82, 16 KiB 0.92–0.93), ours/fastest
-1.32 both times.
-
-**Reading (2026-10-13, evening).** At 64 B level with libsodium (1.02–1.04×, this column is the
-noisiest) and ahead of OpenSSL (its EVP per-call overhead); at 1420 B level with OpenSSL
-(0.99–1.01×); at 16 KiB 1.02–1.03× OpenSSL's AVX2 code, the card's worst → P2 with room. P1
-needs ref ≤ 1.0 on every row: the 16 KiB rows and 1420 B encrypt are the gap.
-
-## Non-goals / backlog
-
-- **Performance: 1420/1424 B at 1.15–1.21× Go x/crypto** *(bench 2026-11-03; the aim was
-  ≤ 1.1×)*. Needs the scalar-Poly1305-stitched-with-ChaCha loop x/crypto has
-  (`chacha20poly1305_amd64.s`, BSD-3-Clause, by Vlad Krasnov; or CRYPTOGAMS' ChaCha20-Poly1305);
-  see "2026-11-03" under Performance for the measured costs. Smaller levers measured but not
-  taken: the then 4 KiB wide-path burn (~40 ns at 1424 B), a fused instead of staged tail group.
-  **Re-measured and tried 2026-11-08 (Zig 0.17.0, i7-7920HQ, `-Djcc-safe`):** dec 1420/1424 B
-  1.12/1.11×, enc 1.08/1.04× x/crypto v0.58.0 (x/crypto's open is 7 % faster than its own seal,
-  ours level). At 1424 B the keystream alone is 2121 cycles, the lane Poly1305 1135, std's scalar
-  Poly1305 1903 (IPC 1.99, 42 instructions per block). A **Zig-source scalar stitch** — std's
-  2x64 Poly1305 folded into the 8-lane rounds of each group, first 3 blocks per double round,
-  then one stage per `fourRounds` step, fully unrolled, the key from the short engine — was
-  byte-correct and SLOWER: open 4335 and 4371 against 3416-3640 cycles (perf stat, min of 9
-  processes). The rounds keep ports 0/1/5 near full and LLVM's scalar block needs them for its
-  ~40 adds and moves; x/crypto's mulx/adcx block is about half that. So the lever is the
-  assembly port named above, not Zig source; nothing else open at this size.
-- The dead-stack burn after the wide path is 5 KiB since 2026-11-03 (4 KiB left 256..288 B of
-  a full TLS record's frames unzeroed, see Evidence); the short AEAD's is 1 KiB (`aead_short_burn`).
-
-- **Performance: 16 KiB at 1.02–1.03× OpenSSL 3.5.5** *(bench 2026-10-13 evening; P1 needs
-  ≤ 1.0 on every row)*. The u64-lane lever is spent (see "The 2026-10-13 evening pass"). Left,
-  unmeasured: fewer ChaCha20 spills (183 `vmovdqa` per 8-block core; ChaCha20 alone is ~1.15×
-  OpenSSL's kernel), the L = 8 Poly1305 loop's 50 spills (16 ymm registers for 10 accumulator
-  halves plus the r/5r tables), a carry chain split into two parallel halves as OpenSSL's.
-- **AVX-512 (L = 8, one zmm) is correctness-tested but perf-unmeasured** — no AVX-512
-  hardware here. The selection is comptime, so a host that has it takes the
-  8-lane path untested for *speed*; it is not untested for *correctness*.
-- **2-lane SSE2 / NEON Poly1305** — deliberately not taken: two 26-bit lanes do
-  not beat one 64×64→128 scalar multiply, so those targets stay on std.
-- ~~**XChaCha20 / XChaCha20-Poly1305** (24-byte extended nonce, HChaCha20)~~ — **DONE
-  2026-10-13**, with the 8/12-round and 64-bit-nonce variants (see "Variants").
-- Machine-checked CT disassembly audit (as done for the asm field modules). The
-  valgrind/memcheck tainted-key measurement in the constant-time section above
-  is not a substitute for one.
-- ~~A test-build path witness for `wide_min_groups`~~ — **DONE 2026-08-11.**
-  `poly1305.mac_path` is now the third witness alongside `chacha_path` /
-  `aead_path`, and the boundaries it asserts are written as literal byte counts
-  (96 / 192 / 384 at L = 2 / 4 / 8) rather than as `wide_min_bytes ± 1`, so the
-  test cannot re-assert a retuned constant. See "Threshold guards" below.
-
-Consumers already wired to this module (`@import("chachapoly")`, all using
-`ChaCha20Poly1305`): `noise`, `wireguard`, `dtls`, `quic-crypto`, `hpke`,
-`signal`, `aeadframe`, `timelock_envelope`, `megolm`, `tlock`. `bolt8` reaches it through `noise` (its `handshake.Suite` binds `noise.ChaCha20Poly1305`; a `std` suite is kept only as a differential oracle). Any
-change to the delegation thresholds or the MAC is therefore live on those
-paths, not staged behind a rewiring step.
-- ~~**XChaCha20-Poly1305 (24-byte nonce, HChaCha20)** *(survey 2026-09-30)*~~ — DONE 2026-10-13 (see "Variants"; Wycheproof's XChaCha20-Poly1305 file anchors it).
-- ~~**Wycheproof `chacha20_poly1305_test` vectors**~~ — DONE 2026-10-06 (see Verification). Its nine nonce-size cases need a nonce other than 96 bits, which this API does not take.
-- **Mutation run for the 2026-10-13 code** — the 2026-10-04 run predates `lastRow`'s 64-bit
-  carry, `hchacha`/`extend`, `laneBlock`/`loadBlocks64` and `opaque64`. Only the carry has a
-  negative control so far (dropping it fails the std differential at byte 192 and every
-  libsodium `nonce64` row). A wrong `laneBlock` map or fold order is caught by the RFC 8439
-  §A.3 vectors at L = 4 / 8 by construction, but no mutant has measured it.
-- **Not taken (2026-10-13):** libsodium's pre-RFC `crypto_aead_chacha20poly1305` (64-bit nonce,
-  MAC input without padding) — legacy, and none of std, Go, RustCrypto or OpenSSL ships it; the
-  `ChaCha20With64BitNonce` stream is here, the construction around it is not.
-  `crypto_secretstream_xchacha20poly1305` is a framing protocol over the AEAD (`aeadframe`'s
+- **libsodium's pre-RFC `crypto_aead_chacha20poly1305`** (64-bit nonce, MAC input without
+  padding): legacy, and none of std, Go, RustCrypto or OpenSSL ships it. The
+  `ChaCha20With64BitNonce` stream is here; the construction around it is not.
+- **`crypto_secretstream_xchacha20poly1305`**: a framing protocol over the AEAD (`aeadframe`'s
   ground), not a primitive.
+- **2-lane SSE2 / NEON Poly1305**: two 26-bit lanes do not beat one 64×64→128 scalar multiply,
+  so those targets stay on std.
+- **Checked-operator removal in the lane MAC**: the checked `*` / `+` stay (see *Constant-time*);
+  the contract is narrowed to `ReleaseFast` instead.
+- **A Zig-source scalar Poly1305 stitched into the ChaCha rounds** (std's 2×64 Poly1305 folded
+  into the 8-lane rounds of each group, then one stage per `fourRounds` step, fully unrolled):
+  byte-correct but 20–27 % slower at 1424 B open on the bench host (the rounds keep ports 0/1/5
+  near full and LLVM's scalar block needs them for its ~40 adds and moves; x/crypto's mulx/adcx
+  block is about half that). The lever is the assembly port (the x/crypto engine), not Zig source.
+- **Measured and dropped:** aligned 32-byte stores in place of `rep stosb` (no gain); a
+  generated AVX2 round loop with one spilled register (3–5 % slower although LLVM spills twice
+  as much, so spills are not what limits this core); the partial group XORed from registers
+  without the staging buffer (81 fewer instructions, 2 % more cycles); a two-chain carry in
+  `mulRed` (no change); a smaller burn than 4 KiB, which would only spend the margin.
 
-### Mutation run 2026-10-04
+## Open
 
-Mutant schemata over a copy (one ReleaseSafe build with the target's AVX2, so the
-shipped `lanes = 4` plus the tests' L ∈ {1,2,4,8}; `setsid -w timeout -s KILL 20`
-per mutant): **54 mutants, 44 killed, 8 equivalent, 2 not observable in-process**.
-Points: the anti-wrap predicate and both of its call sites, group/tail loop bounds
-and counter steps in `xor`/`stream`, key/nonce word order, the per-lane `iota`, the
-feed-forward, a rotation, the transpose byte order, both AEAD thresholds, every
-zeroing on rejection, the tag comparison, the poly-key and payload counters,
-`pad16`, the length block; in `poly1305.zig` the fast path, the partial-block
-top-up, the wide entry condition, the accumulator seed lane, the group loop, the
-lane fold, `mulRed`'s wrap, final carry and a schoolbook row, `loadBlocks`' 2^128
-bit and a shift, `carryLimbs`' wrap, `normalize`, `importAcc`/`exportAcc`'s top
-limb, the r split, the fold power order, and the power-table wipe in `final`.
+- **AVX-512 (L = 8, one zmm) is correctness-tested but perf-unmeasured**: no AVX-512 hardware
+  here. The selection is comptime, so a host that has it takes the 8-lane path untested for
+  *speed*; it is not untested for *correctness*.
+- **Burn margin at 16 KiB** is measured on x86-64 AVX2 only; `-Dcpu=baseline` and aarch64 at
+  16 KiB are not measured.
 
-First pass: 15 survivors. Five were test gaps, now closed by three tests in
-`poly1305.zig`:
+## Backlog / deferred
 
-- `final` dropping any of its four power-table wipes (or the whole block) stayed
-  green — r^L, 5·r^L and both fold vectors are key-derived and outside std's own
-  wipe. Test: "final wipes the key-derived power table it built". ✅ DONE 2026-10-04 (test "final wipes the key-derived power table it built", modules/chachapoly/src/poly1305.zig, commit 721bad72e). Re-checked 2026-11-19 against the current `final` (full and half tables): 12 mutants (each of the eight table wipes dropped, each `*_ready = false` dropped, each wipe guard dropped) all killed by that one test in a plain schemata build (the table fields are read after `final`, so no stack probe is needed); the wide-backlog line that still named this item as open was stale.
-- A partial-block top-up that over-filled (`leftover != 0` afterwards) kept every
-  later bulk on the serial core, bytes unchanged. Test: "a partial block topped up
-  by update still reaches the wide engine" (witness after a 1/5/15-byte head).
-- `normalize` reduced to one carry pass stayed green, because the shipped export
-  path runs three passes where two suffice. Test: "exportAcc drains a limb the
-  first carry pass leaves at exactly 2^26" — expected value derived by hand from
-  2^130 ≡ 5 (mod 2^130 − 5).
-
-Equivalent (reason): the whole-group loop `<=` → `<` (an exact group then goes
-through the staged tail, same bytes, same witness); `xorTail`'s 32-byte chunk
-bound (the bytewise remainder covers it); zeroing `computed_tag` on rejection (a
-stack local, defence in depth, unobservable); `update`'s fast-path pre-check and
-the wide entry's `leftover == 0` (both implied by the later checks); the lane-fold
-`carryLimbs` before `exportAcc` (lane sums stay < 2^30, and `exportAcc`
-normalises anyway); the power table left un-normalised (limb 1 < 2^26 + 2^9 keeps
-5·limb inside `mulRed`'s 2^28.33 bound, and checked arithmetic would have
-panicked otherwise); rebuilding the powers on every `wide` call (performance only).
-
-Not observable in-process: dropping the counter-wrap `@panic` in `xor` or `stream`.
-A test binary cannot survive a panic it provokes; the predicate
-`counterWouldWrap` is pinned at nine points, and the two call sites are one line
-each.
+- **Delta mutation run for the code added after the whole-module run.** The card's run predates
+  `lastRow`'s 64-bit carry, `hchacha`/`extend`, `laneBlock`/`loadBlocks64`, `opaque64`, the short
+  engine (`shortKeystream`), `fourRounds`, the power-table doubling and the x/crypto glue
+  (`xcryptoTakes`, `xcryptoSeal`, `xcryptoOpen`); the card's mutation entry has no source hash yet.
+  A wrong `laneBlock` map or fold order is caught by the RFC 8439 §A.3 vectors at L = 4 / 8 by
+  construction, but no mutant has measured it; dropping the word-13 carry fails the std
+  differential and every libsodium `nonce64` row.
+- **Machine-checked CT disassembly audit** (as done for the asm field modules). The
+  valgrind/memcheck tainted-key measurement in *Constant-time* is not a substitute for one.
+- **Performance, idea:** 1420/1424 B is 1.07–1.09× Go x/crypto (the card's Performance line;
+  both run x/crypto's assembly there; the difference is this module's dead-stack burn and
+  call). 16 KiB is at the card's figure; fewer ChaCha20 spills (about 183 `vmovdqa` per 8-block
+  core), the L = 8 Poly1305 loop's spills (16 ymm registers for 10 accumulator halves plus the
+  r/5r tables) and a carry chain split into two parallel halves (as OpenSSL's) are unmeasured
+  levers.
 
 ## Anchoring
 
