@@ -357,3 +357,65 @@ pub fn setOutputTapBip32Derivation(allocator: Allocator, ps: *psbt.Psbt, index: 
     errdefer allocator.free(value);
     try update.putOutputOwned(allocator, ps, index, output_key.TAP_BIP32_DERIVATION, &xonly, value);
 }
+
+// ── tests: whole-module mutation run additions ──────────────────────────────
+
+const testing = std.testing;
+
+test "validateInputRecord: a TAP_LEAF_SCRIPT with an empty value is refused" {
+    const cb: [33]u8 = [_]u8{0xc0} ++ @as([32]u8, @splat(0x11));
+    try testing.expectError(error.InvalidFixedFieldLength, validateInputRecord(.{ .keytype = input_key.TAP_LEAF_SCRIPT, .keydata = &cb, .value = &.{} }));
+    try validateInputRecord(.{ .keytype = input_key.TAP_LEAF_SCRIPT, .keydata = &cb, .value = &.{0xc0} });
+}
+
+test "validateOutputRecord: a malformed TAP_BIP32_DERIVATION value is refused" {
+    const key: [32]u8 = @splat(0x22);
+    // count 0, then a 3-byte tail (no room for the 4-byte fingerprint)
+    try testing.expectError(error.InvalidFixedFieldLength, validateOutputRecord(.{ .keytype = output_key.TAP_BIP32_DERIVATION, .keydata = &key, .value = &.{ 0, 1, 2, 3 } }));
+    try validateOutputRecord(.{ .keytype = output_key.TAP_BIP32_DERIVATION, .keydata = &key, .value = &.{ 0, 1, 2, 3, 4 } });
+    // a leaf-hash count larger than the bytes present
+    try testing.expectEqual(@as(?TapBip32Derivation, null), decodeTapDerivation(&.{ 1, 1, 2, 3, 4 }));
+}
+
+test "find32 needs exactly 32 bytes" {
+    var recs = [_]Record{.{ .keytype = 9, .keydata = &.{}, .value = &@as([31]u8, @splat(1)) }};
+    var m: Map = .{ .records = &recs };
+    try testing.expect(find32(m, 9) == null);
+    var ok: [32]u8 = @splat(1);
+    recs[0].value = &ok;
+    m = .{ .records = &recs };
+    try testing.expect(find32(m, 9) != null);
+}
+
+test "treeValueOk: boundaries of the leaf encoding and of the depth cap" {
+    const H = struct {
+        fn caterpillar(buf: []u8, deepest: u8) []u8 {
+            // depths: deepest, deepest, deepest - 1, ..., 1 -- the depth-first listing
+            // of a tree with one leaf per level and two at the bottom.
+            var n: usize = 0;
+            var d: u8 = deepest;
+            var first = true;
+            while (true) {
+                const reps: usize = if (first) 2 else 1;
+                for (0..reps) |_| {
+                    buf[n] = d;
+                    buf[n + 1] = 0xc0;
+                    buf[n + 2] = 0;
+                    n += 3;
+                }
+                first = false;
+                if (d == 1) break;
+                d -= 1;
+            }
+            return buf[0..n];
+        }
+    };
+    const caterpillar = H.caterpillar;
+    // one leaf at depth 0 with an empty script: the 3-byte minimum
+    try testing.expect(treeValueOk(&.{ 0, 0xc0, 0 }));
+    // declared script longer than the bytes left
+    try testing.expect(!treeValueOk(&.{ 0, 0xc0, 5, 0xaa }));
+    var buf: [3 * 140]u8 = undefined;
+    try testing.expect(treeValueOk(caterpillar(&buf, 128)));
+    try testing.expect(!treeValueOk(caterpillar(&buf, 129)));
+}

@@ -852,6 +852,42 @@ test "hostile: keylen of 0xff-class CompactSize with declared length far beyond 
     try testing.expectError(error.Truncated, parse(testing.allocator, buf.items));
 }
 
+test "Map.find needs an empty keydata; findKeyed the exact keydata" {
+    var recs = [_]Record{.{ .keytype = 7, .keydata = &.{1}, .value = &.{9} }};
+    const m: Map = .{ .records = &recs };
+    try std.testing.expect(m.find(7) == null);
+    try std.testing.expect(m.findKeyed(7, &.{1}) != null);
+    try std.testing.expect(m.findKeyed(7, &.{2}) == null);
+}
+
+test "validate*Record: key data on VERSION and a short output BIP32 derivation are refused" {
+    try std.testing.expectError(error.UnexpectedKeyData, validateGlobalRecord(.{ .keytype = global_key.VERSION, .keydata = &.{1}, .value = &.{ 0, 0, 0, 0 } }));
+    const pk: [33]u8 = [_]u8{0x02} ++ @as([32]u8, @splat(0x11));
+    try std.testing.expectError(error.InvalidFixedFieldLength, validateOutputRecord(.{ .keytype = output_key.BIP32_DERIVATION, .keydata = &pk, .value = &.{ 1, 2, 3 } }));
+    try validateOutputRecord(.{ .keytype = output_key.BIP32_DERIVATION, .keydata = &pk, .value = &.{ 1, 2, 3, 4 } });
+}
+
+test "mergeMaps sorts by raw key even when b's keys sort before a's" {
+    const a = std.testing.allocator;
+    var ra = [_]Record{.{ .keytype = 5, .keydata = &.{}, .value = &.{1} }};
+    var rb = [_]Record{.{ .keytype = 3, .keydata = &.{}, .value = &.{2} }};
+    var merged = try mergeMaps(a, .{ .records = &ra }, .{ .records = &rb });
+    defer merged.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), merged.records.len);
+    try std.testing.expectEqual(@as(u64, 3), merged.records[0].keytype);
+    try std.testing.expectEqual(@as(u64, 5), merged.records[1].keytype);
+}
+
+test "combine: a differing output-map count is DifferentTransactions even when the unsigned tx bytes agree" {
+    var g = [_]Record{.{ .keytype = global_key.UNSIGNED_TX, .keydata = &.{}, .value = &.{ 1, 2, 3 } }};
+    var empty: [0]Record = .{};
+    var outs = [_]Map{.{ .records = &empty }};
+    const pa: Psbt = .{ .global = .{ .records = &g }, .inputs = &.{}, .outputs = &outs };
+    const pb: Psbt = .{ .global = .{ .records = &g }, .inputs = &.{}, .outputs = &.{} };
+    try std.testing.expectError(error.DifferentTransactions, combine(std.testing.allocator, pa, pb));
+    try std.testing.expectError(error.DifferentTransactions, combine(std.testing.allocator, pb, pa));
+}
+
 // ── fuzz: parse never panics on an arbitrary attacker-supplied PSBT ──────
 //
 // A PSBT is a file two wallets exchange directly over an untrusted

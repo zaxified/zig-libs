@@ -1108,3 +1108,181 @@ test "hostile: decodeWitnessStack rejects trailing bytes after a complete stack"
     padded[enc.len] = 0xff;
     try testing.expectError(error.TrailingBytes, decodeWitnessStack(allocator, padded));
 }
+
+// ── tests: whole-module mutation run additions (the private recognisers) ──
+
+test "isP2pkh / isP2sh: every template byte and the exact length are required" {
+    const hash: [20]u8 = @splat(0x11);
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ hash ++ [_]u8{ 0x88, 0xac };
+    try testing.expect(isP2pkh(&p2pkh));
+    for ([_]usize{ 0, 1, 2, 23, 24 }) |i| {
+        var s = p2pkh;
+        s[i] ^= 1;
+        try testing.expect(!isP2pkh(&s));
+    }
+    try testing.expect(!isP2pkh(&(p2pkh ++ [_]u8{0}))); // 26 bytes, every template byte still in place
+    try testing.expect(!isP2pkh(p2pkh[0..24]));
+
+    const p2sh = [_]u8{ 0xa9, 0x14 } ++ hash ++ [_]u8{0x87};
+    try testing.expect(isP2sh(&p2sh));
+    for ([_]usize{ 0, 1, 22 }) |i| {
+        var s = p2sh;
+        s[i] ^= 1;
+        try testing.expect(!isP2sh(&s));
+    }
+    try testing.expect(!isP2sh(&(p2sh ++ [_]u8{0})));
+    try testing.expect(!isP2sh(p2sh[0..22]));
+}
+
+test "parseWitnessProgram and smallInt: version, push length and total length bounds" {
+    const wpkh = [_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0x22));
+    const p = parseWitnessProgram(&wpkh).?;
+    try testing.expectEqual(@as(u8, 0), p.version);
+    try testing.expectEqual(@as(usize, 20), p.program.len);
+    try testing.expectEqual(@as(u8, 1), parseWitnessProgram(&([_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(1)))).?.version);
+    try testing.expectEqual(@as(u8, 16), parseWitnessProgram(&.{ 0x60, 0x02, 0xaa, 0xbb }).?.version); // OP_16, shortest program
+    try testing.expect(parseWitnessProgram(&([_]u8{ 0x00, 40 } ++ @as([40]u8, @splat(3)))) != null); // longest program, 42 bytes
+    try testing.expect(parseWitnessProgram(&([_]u8{ 0x00, 41 } ++ @as([41]u8, @splat(3)))) == null);
+    try testing.expect(parseWitnessProgram(&.{ 0x50, 0x02, 0xaa, 0xbb }) == null); // OP_RESERVED is not a version
+    try testing.expect(parseWitnessProgram(&.{ 0x61, 0x02, 0xaa, 0xbb }) == null);
+    try testing.expect(parseWitnessProgram(&.{ 0x00, 0x01, 0xaa }) == null); // 1-byte program
+    try testing.expect(parseWitnessProgram(&.{ 0x00, 0x03, 0xaa, 0xbb }) == null); // push length disagrees with the script length
+    // Scripts too short to hold a push length byte at all.
+    try testing.expect(parseWitnessProgram(&.{}) == null);
+    try testing.expect(parseWitnessProgram(&.{0x00}) == null);
+    try testing.expect(parseWitnessProgram(&.{ 0x00, 0x02 }) == null);
+
+    try testing.expectEqual(@as(?u8, null), smallInt(0x50));
+    try testing.expectEqual(@as(?u8, 1), smallInt(0x51));
+    try testing.expectEqual(@as(?u8, 16), smallInt(0x60));
+    try testing.expectEqual(@as(?u8, null), smallInt(0x61));
+}
+
+test "parseMultisig: key push lengths, key count, the closing opcodes" {
+    const k1 = [_]u8{0x02} ++ @as([32]u8, @splat(0x11));
+    const k2 = [_]u8{0x03} ++ @as([32]u8, @splat(0x22));
+    const ok = [_]u8{ 0x51, 33 } ++ k1 ++ [_]u8{33} ++ k2 ++ [_]u8{ 0x52, 0xae };
+    const ms = parseMultisig(&ok).?;
+    try testing.expectEqual(@as(u8, 1), ms.m);
+    try testing.expectEqual(@as(u8, 2), ms.n);
+    // an uncompressed (65-byte) key is fine; 32 and 34 bytes are not
+    const k65 = [_]u8{0x04} ++ @as([64]u8, @splat(0x33));
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 65 } ++ k65 ++ [_]u8{ 0x51, 0xae })) != null);
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 34 } ++ k1 ++ [_]u8{0x00} ++ [_]u8{ 0x51, 0xae })) == null);
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 32 } ++ @as([32]u8, @splat(0x44)) ++ [_]u8{ 0x51, 0xae })) == null);
+    // OP_CHECKMULTISIGVERIFY is not OP_CHECKMULTISIG
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 33 } ++ k1 ++ [_]u8{ 0x51, 0xaf })) == null);
+    // declared n disagrees with the number of keys; m above n; trailing byte; nothing after the keys
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 33 } ++ k1 ++ [_]u8{33} ++ k2 ++ [_]u8{ 0x53, 0xae })) == null);
+    try testing.expect(parseMultisig(&([_]u8{ 0x53, 33 } ++ k1 ++ [_]u8{33} ++ k2 ++ [_]u8{ 0x52, 0xae })) == null);
+    try testing.expect(parseMultisig(&(ok ++ [_]u8{0x00})) == null);
+    try testing.expect(parseMultisig(&([_]u8{ 0x51, 33 } ++ k1)) == null);
+}
+
+test "appendPush: every push form, at its length boundaries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { data: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .data = &.{}, .want = &.{0x00} },
+        .{ .data = &.{0x05}, .want = &.{0x55} },
+        .{ .data = &.{0x01}, .want = &.{0x51} },
+        .{ .data = &.{0x10}, .want = &.{0x60} },
+        .{ .data = &.{0x11}, .want = &.{ 0x01, 0x11 } },
+        .{ .data = &.{0x00}, .want = &.{ 0x01, 0x00 } },
+        .{ .data = &.{0x81}, .want = &.{0x4f} },
+        .{ .data = &.{0x80}, .want = &.{ 0x01, 0x80 } },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        try appendPush(&buf, a, c.data);
+        try testing.expectEqualSlices(u8, c.want, buf.items);
+    }
+    const Len = struct { n: usize, prefix: []const u8 };
+    const lens = [_]Len{
+        .{ .n = 75, .prefix = &.{75} },
+        .{ .n = 76, .prefix = &.{ 0x4c, 76 } },
+        .{ .n = 255, .prefix = &.{ 0x4c, 255 } },
+        .{ .n = 256, .prefix = &.{ 0x4d, 0x00, 0x01 } },
+        .{ .n = 65535, .prefix = &.{ 0x4d, 0xff, 0xff } },
+        .{ .n = 65536, .prefix = &.{ 0x4e, 0x00, 0x00, 0x01, 0x00 } },
+    };
+    for (lens) |l| {
+        const data = try a.alloc(u8, l.n);
+        @memset(data, 0xa5);
+        var buf: std.ArrayList(u8) = .empty;
+        try appendPush(&buf, a, data);
+        try testing.expectEqualSlices(u8, l.prefix, buf.items[0..l.prefix.len]);
+        try testing.expectEqual(l.prefix.len + l.n, buf.items.len);
+        try testing.expectEqualSlices(u8, data, buf.items[l.prefix.len..]);
+    }
+}
+
+test "sighash helpers: an empty signature never matches and never hits the SINGLE bug" {
+    try testing.expect(sighashMatches(&.{}, null));
+    try testing.expect(!sighashMatches(&.{}, 1));
+    try testing.expect(sighashMatches(&.{ 0x30, 0x01 }, 1));
+    try testing.expect(!sighashMatches(&.{ 0x30, 0x02 }, 1));
+    const vin = [_]bitcointx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }};
+    const tx: bitcointx.Transaction = .{ .version = 1, .vin = @constCast(&vin), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false };
+    const ctx: bitcoinscript.TxContext = .{ .tx = tx, .input_index = 0, .spent_outputs = &.{}, .precomputed = null };
+    try testing.expect(!hitsSighashSingleBug(&.{}, ctx));
+    try testing.expect(hitsSighashSingleBug(&.{ 0x30, 0x03 }, ctx)); // SINGLE, no output at index 0
+    try testing.expect(hitsSighashSingleBug(&.{ 0x30, 0x83 }, ctx)); // SINGLE|ANYONECANPAY
+    try testing.expect(!hitsSighashSingleBug(&.{ 0x30, 0x01 }, ctx));
+}
+
+test "findMatchingPartialSig: only PARTIAL_SIG records count" {
+    const pubkey = [_]u8{0x02} ++ @as([32]u8, @splat(0x5a));
+    var h: [20]u8 = undefined;
+    ripemd160.hash160(&pubkey, &h);
+    var recs = [_]psbt.Record{.{ .keytype = psbt.input_key.SHA256, .keydata = &pubkey, .value = &.{0x30} }};
+    const m: psbt.Map = .{ .records = &recs };
+    try testing.expect(findMatchingPartialSig(m, null, &h) == null);
+    recs[0].keytype = psbt.input_key.PARTIAL_SIG;
+    try testing.expect(findMatchingPartialSig(m, null, &h) != null);
+}
+
+test "parseTapLeaf: the single-key form and every multi_a threshold encoding" {
+    const H = struct {
+        fn tapLeaf(a: Allocator, n: usize, tail: []const u8) ![]u8 {
+            var buf: std.ArrayList(u8) = .empty;
+            for (0..n) |i| {
+                try buf.append(a, 0x20);
+                try buf.appendNTimes(a, @intCast(i + 1), 32);
+                try buf.append(a, if (i == 0) 0xac else 0xba);
+            }
+            try buf.appendSlice(a, tail);
+            return buf.items;
+        }
+    };
+    const tapLeaf = H.tapLeaf;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const single = try tapLeaf(a, 1, &.{});
+    try testing.expectEqual(TapLeafShape{ .n = 1, .m = 1 }, parseTapLeaf(single).?);
+    var bad0 = try a.dupe(u8, single);
+    bad0[0] = 0x21;
+    try testing.expect(parseTapLeaf(bad0) == null);
+    var bad33 = try a.dupe(u8, single);
+    bad33[33] = 0xad;
+    try testing.expect(parseTapLeaf(bad33) == null);
+
+    try testing.expectEqual(TapLeafShape{ .n = 2, .m = 2 }, parseTapLeaf(try tapLeaf(a, 2, &.{ 0x52, 0x9c })).?);
+    try testing.expectEqual(TapLeafShape{ .n = 2, .m = 1 }, parseTapLeaf(try tapLeaf(a, 2, &.{ 0x51, 0x9c })).?); // OP_1 is the lowest small int
+    try testing.expect(parseTapLeaf(try tapLeaf(a, 2, &.{ 0x52, 0x9d })) == null); // NUMEQUALVERIFY
+    try testing.expect(parseTapLeaf(try tapLeaf(a, 1, &.{ 0x51, 0x9c })) == null); // one key is not multi_a
+    try testing.expect(parseTapLeaf(try tapLeaf(a, 2, &.{ 0x53, 0x9c })) == null); // m > n
+    // A second key element whose push byte is wrong ends the key run at one key.
+    var wrong_push = try a.dupe(u8, try tapLeaf(a, 2, &.{ 0x52, 0x9c }));
+    wrong_push[34] = 0x21;
+    try testing.expect(parseTapLeaf(wrong_push) == null);
+    // OP_16 needs 16 keys; the one-byte push form starts at 17 and ends at 127.
+    try testing.expectEqual(TapLeafShape{ .n = 16, .m = 16 }, parseTapLeaf(try tapLeaf(a, 16, &.{ 0x60, 0x9c })).?);
+    try testing.expect(parseTapLeaf(try tapLeaf(a, 16, &.{ 0x01, 0x10, 0x9c })) == null); // 16 must be OP_16
+    try testing.expectEqual(TapLeafShape{ .n = 20, .m = 17 }, parseTapLeaf(try tapLeaf(a, 20, &.{ 0x01, 0x11, 0x9c })).?);
+    try testing.expect(parseTapLeaf(try tapLeaf(a, 20, &.{ 0x01, 0x11, 0x9d })) == null);
+    try testing.expectEqual(TapLeafShape{ .n = 127, .m = 127 }, parseTapLeaf(try tapLeaf(a, 127, &.{ 0x01, 0x7f, 0x9c })).?);
+}

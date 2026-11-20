@@ -1281,3 +1281,25 @@ test "finalize: multisig skips a valid signature whose sighash type is not the d
     const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{});
     try expectInputError(results, 0, error.InsufficientSignatures);
 }
+
+test "finalize: bare multisig takes a SINGLE-bug signature when allow_sighash_single_bug is set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kp_a = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0xa1)));
+    const kp_b = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0xb2)));
+    const pk_a = kp_a.public_key.toCompressedSec1();
+    const pk_b = kp_b.public_key.toCompressedSec1();
+    const script_pubkey = [_]u8{ 0x51, 33 } ++ pk_a ++ [_]u8{33} ++ pk_b ++ [_]u8{ 0x52, 0xae };
+    const unsigned = try twoInOneOut(a);
+    const utxo = try buildWitnessUtxoValue(a, 100_000, &script_pubkey);
+    const bug_b = try derSigWithHashtype(a, normalizeLowS(try kp_b.signPrehashed(bitcointx.legacy.sighash_single_bug, null)), 0x03);
+    var r0 = [_]psbt.Record{.{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo }};
+    var r1 = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pk_b, .value = bug_b },
+    };
+    var maps = [_]psbt.Map{ .{ .records = &r0 }, .{ .records = &r1 } };
+    const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{ .allow_sighash_single_bug = true });
+    try testing.expect(results[1] == null);
+}
