@@ -24,17 +24,21 @@ VRFs show up in:
   (an attacker cannot precompute the hash of every possible name without
   the zone operator's secret key).
 
-**Status: implemented.** `prove`/`proofToHash`/`verify` and every RFC
-9381 §5.4 auxiliary function are real; validated byte-exact against RFC
-9381 Appendix B.3's three official test vectors, including every
-published intermediate value. See [SPEC.md](SPEC.md) for design notes,
-[NOTICE](NOTICE) for provenance.
+`prove`/`proofToHash`/`verify` and every RFC 9381 §5.4 auxiliary function
+are checked byte-exact against RFC 9381 Appendix B.3's three official test
+vectors, including every published intermediate value. See
+[SPEC.md](SPEC.md) for design notes, [NOTICE](NOTICE) for provenance.
 
 | File | Contents |
 |---|---|
-| `ecvrf.zig` | `prove`/`proofToHash`/`verify`, key derivation, and the §5.4 auxiliary functions (`encodeToCurve`, `nonceGeneration`, `challengeGeneration`, `decodeProof`, `validateKey`) |
+| `root.zig` | the public surface (flat re-exports of `ecvrf.zig`), `meta`, and the test aggregator |
+| `ecvrf.zig` | `prove`/`proofToHash`/`verify`, `KeyPair`, key derivation, and the §5.4 auxiliary functions (`encodeToCurve`, `nonceGeneration`, `challengeGeneration`, `decodeProof`, `validateKey`, `stringToPoint`) |
+| `burn.zig` | zeroes the dead stack under the secret-scalar entry points |
 | `kat_vectors.zig` | RFC 9381 Appendix B.3's three official ECVRF-EDWARDS25519-SHA512-TAI test vectors (Examples 16, 17, 18) |
 | `kat_test.zig` | Byte-exact KAT assertions against `kat_vectors.zig`, plus tamper/negative tests the RFC does not itself publish |
+| `fuzz_test.zig` | shared plumbing of the deterministic fuzz driver (`ECVRF_FUZZ`); the harness bodies are in `ecvrf.zig` |
+| `stackprobe_test.zig`, `stackprobe2_test.zig` | dead-stack residue probes (optimized builds) |
+| `ctgrind_harness.zig` | constant-time evidence, run by `scripts/checks/ctgrind.sh ecvrf`, not part of the tests |
 
 ## Import
 
@@ -65,8 +69,9 @@ const beta_from_pi = try ecvrf.proofToHash(pi); // 64-byte VRF output
 // SAME beta only if pi is genuinely valid for (pk, alpha).
 const beta = try ecvrf.verify(pk, alpha, pi); // error.InvalidProof / error.InvalidPublicKey on failure
 
-// Many proofs under one key: derive the public key once (~23 % faster
-// per proof, same bytes). Build it only with fromSecretKey.
+// Many proofs under one key: derive the public key once (the same
+// bytes, without the `Y = x*B` multiplication `prove` repeats). Build it
+// only with fromSecretKey; it holds the seed, so wipe it when done.
 var kp: ecvrf.KeyPair = undefined;
 ecvrf.KeyPair.fromSecretKey(&kp, &sk);
 const pi2 = kp.prove(alpha);
@@ -84,13 +89,17 @@ mismatched challenge) returns `error.InvalidPublicKey` or
 ## Ciphersuite
 
 Only **ECVRF-EDWARDS25519-SHA512-TAI** (RFC 9381 §5.5, `suite_string =
-0x03`) is implemented. RFC 9381 defines two other ciphersuites this
-module does NOT cover — see [SPEC.md](SPEC.md)'s "Out of scope" for why:
-**ECVRF-P256-SHA256-TAI** (NIST P-256), **ECVRF-EDWARDS25519-SHA512-ELL2**
-(same curve/hash, but RFC 9380 Elligator2 hash-to-curve instead of
-try-and-increment — `suite_string = 0x04`, easy to conflate with this
-module's `0x03` since both are edwards25519/SHA-512), and the
-non-elliptic-curve **RSA-FDH-VRF** family (RFC 9381 Appendix A).
+0x03`) is implemented. `0x04` is the sibling ELL2 suite (same curve and
+hash, RFC 9380 Elligator2 instead of try-and-increment) and is easy to
+conflate with it; the two are not interchangeable.
+
+## Not provided
+
+The other ciphersuites of RFC 9381: **ECVRF-P256-SHA256-TAI / -SSWU**
+(NIST P-256) and **ECVRF-EDWARDS25519-SHA512-ELL2** are open work (SPEC
+*Backlog / deferred*); the non-elliptic-curve **RSA-FDH-VRF** family
+(Appendix A) and batch verification are refused (SPEC *What is
+deliberately not done*).
 
 ## Import graph
 
@@ -105,20 +114,18 @@ One sibling zig-libs module dependency (`ct25519`); otherwise pure `std`.
 ## Verify
 
 ```
-zig build test-ecvrf                          # Debug — all green
-zig build -Doptimize=ReleaseFast test-ecvrf   # ReleaseFast — all green
-zig fmt --check modules/ecvrf/
+scripts/modtest ecvrf        # the module's tests
 ```
 
-All tests pass in both modes. `kat_test.zig` asserts byte-exact output
-against RFC 9381 Appendix B.3's three official ECVRF-EDWARDS25519-SHA512-TAI
-vectors — secret-key-to-scalar and secret-key-to-public-key derivation,
-`encodeToCurve`'s `H` (including the published `try_and_increment`
-counter, independently cross-checked), the nonce (`k_string` pre- and
-`k` post-reduction), the full 80-byte `prove` output, and the 64-byte
-`proofToHash`/`verify` output — plus negative tests the RFC does not
-itself publish: tampering each of `pi`'s three fields (`Gamma`/`c`/`s`)
-independently, a wrong `alpha`, and small-order/non-canonical public
-keys, all rejected cleanly rather than crashing.
+`kat_test.zig` asserts byte-exact output against RFC 9381 Appendix B.3's
+three official ECVRF-EDWARDS25519-SHA512-TAI vectors — secret-key-to-scalar
+and secret-key-to-public-key derivation, `encodeToCurve`'s `H` (including
+the published `try_and_increment` counter, independently cross-checked),
+the nonce (`k_string` pre- and `k` post-reduction), the full 80-byte
+`prove` output, and the 64-byte `proofToHash`/`verify` output — plus
+negative tests the RFC does not itself publish: tampering each of `pi`'s
+three fields (`Gamma`/`c`/`s`) independently, a wrong `alpha`, and
+small-order/non-canonical public keys, all rejected cleanly rather than
+crashing. Fuzz: `ECVRF_FUZZ=<runs>`. SPEC *Verification* has the rest.
 
 Provenance: see [NOTICE](NOTICE).

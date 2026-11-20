@@ -19,10 +19,6 @@
 ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381); see [README.md](README.md) for
 purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: implemented.** All of RFC 9381 §5's ciphersuite-generic
-algorithms and §5.5's ECVRF-EDWARDS25519-SHA512-TAI parameter fixing are
-real — see "Implementation notes" below.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
@@ -37,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [davxy/ark-vrf](https://github.com/davxy/ark-vrf) | Rust | MIT | 34 | pushed 2026-09-26 | Tiny/Thin/Pedersen/Ring VRF on arkworks; "loosely inspired by RFC 9381" with a different transcript, so not wire-compatible. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No VRF (checked `lib/std/crypto/`). No Zig ECVRF found on GitHub. |
 
-**Where we are ahead:** the only Zig ECVRF; byte-exact against all three RFC 9381 B.3 vectors including every intermediate value (encode-to-curve, nonce, challenge); strict RFC 8032 decoding of keys and Gamma; a `KeyPair` that caches the derived public key (~23 % faster per proof, README); `verify` never panics on hostile input. **Where we are behind:** one of the RFC's three EC suites; the P-256 suites (used by witnet/vechain-style deployments) and Edwards25519-ELL2 are missing (→ Backlog).
+**Where we are ahead:** the only Zig ECVRF; byte-exact against all three RFC 9381 B.3 vectors including every intermediate value (encode-to-curve, nonce, challenge); strict RFC 8032 decoding of keys and Gamma; a `KeyPair` that caches the derived public key (skips about a fifth of a one-shot `prove`); `verify` never panics on hostile input. **Where we are behind:** one of the RFC's three EC suites; the P-256 suites (used by witnet/vechain-style deployments) and Edwards25519-ELL2 are missing (→ Backlog).
 
 ## Design
 
@@ -103,13 +99,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (`y_point.toBytes()`) before using that as BOTH `encode_to_curve_salt`
   and `ECVRF_challenge_generation`'s `P1`, exactly mirroring what `prove`
   does with its freshly-derived `Y = x*B`; `verify` hashes
-  `point_to_string(Gamma)` the same way (A1 E14).
-- **`string_to_point` is RFC 8032 §5.1.3, strictly (A1 E14/E16,
-  2026-09-14).** `Edwards25519.fromBytes` alone accepts a `y` in
+  `point_to_string(Gamma)` the same way.
+- **`string_to_point` is RFC 8032 §5.1.3, strictly.** `Edwards25519.fromBytes` alone accepts a `y` in
   `[p, 2^255)` (reducing it) and sign bit 1 on a point with `x = 0` —
   §5.1.3 says decoding fails for both. `stringToPoint` refuses them and is
   used for `Gamma` (`decodeProof`), the public key (`validateKey`) and the
-  TAI candidate (`encodeToCurve`'s `interpret_hash_value_as_a_point`). A
+  TAI candidate (`encodeToCurve`'s `interpret_hash_value_as_a_point`). Zig 0.17's
+  `Edwards25519.fromBytes` already refuses the sign-bit-on-`x = 0` encoding itself, so
+  `stringToPoint`'s own check of it is redundant there (an equivalent mutant); it stays
+  because it is cheap and states RFC 8032 §5.1.3 in this module. A
   decoded point therefore re-encodes to exactly its input bytes, so the
   re-encodings above never differ from the caller's bytes and neither a key
   nor a proof has a second valid spelling. Tested with `y = p + 1`, a set
@@ -126,255 +124,145 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Threat model / limits
 
-- **Secret-scalar multiplication is constant-time — but NOT via std's
-  `Edwards25519.mul`.** This bullet previously claimed `prove` got that
-  property by "relying on std's primitive". That claim was **false**, and
-  measurement is what caught it. `Edwards25519.mul` is constant-time in
-  its ladder (4-bit fixed window, `cMov` table select, 64 unconditional
-  iterations) but ends in `pcMul16`'s `try q.rejectIdentity()` — i.e.
-  `if (q.x.isZero())`, a **branch on a value derived from the scalar**,
-  which then propagates an error union that forces the caller to branch
-  a second time. `prove`/`publicKey` did exactly that at five call sites
-  (`catch @panic(...)` / `catch unreachable`), leaking whether the secret
-  scalar `x` or the secret nonce `k` was zero mod the group order.
-  The sibling module `ct25519` (`ct25519.mul`/`mulBase`) replaces it: std's
-  own ladder with the trailing rejection removed, returning the neutral
-  element as an ordinary value, no error union, so no call site can branch
-  on the scalar at all. `ecvrf.zig` used to carry its own private copy of
-  that ladder; it now depends on `ct25519` instead, so the same fix (and
-  its correctness/timing test coverage) is shared with `voprf`, `opaque`,
-  `signal` and `bulletproofs` rather than duplicated per module. No
-  validation was dropped — see `ecvrf.zig`'s module doc comment for why the
-  rejection was provably dead for `x` (clamping puts it strictly between
-  `4L` and `5L`) and harmless for `k` (`validateKey` rejects a degenerate
-  public key on the VERIFIER side, which is where that check belongs).
+- **Secret-scalar multiplication is constant-time, and not via std's `Edwards25519.mul`.**
+  `Edwards25519.mul` has a constant-time ladder (4-bit fixed window, `cMov` table select) but
+  ends in `pcMul16`'s `try q.rejectIdentity()`, i.e. `if (q.x.isZero())`: a branch on a value
+  derived from the scalar, and an error union that makes the caller branch a second time. That
+  would reveal whether the secret scalar `x` or the nonce `k` is zero mod the group order.
+  `prove`, `KeyPair.prove` and `publicKey` therefore multiply with the sibling `ct25519`
+  (`ct25519.mul` / `mulBase`): std's ladder with the trailing rejection removed, the neutral
+  element returned as an ordinary value, no error union, so no call site can branch on the
+  scalar. A test pins that these entry points return plain values and that std's `mul` still
+  returns an error union. No validation is lost: RFC 8032 clamping puts `x` strictly between
+  `4L` and `5L`, so `[x]B` is never the identity; `H` is cofactor-cleared and non-identity
+  (`encodeToCurve`), so `[x]H` cannot hit std's second rejection either; a degenerate nonce
+  (probability about 2^-252) simply yields a proof carrying `U = O`, which `verify` recomputes
+  identically. A degenerate secret scalar or nonce therefore does not panic. The one `@panic`
+  in the module is `encodeToCurve`'s try-and-increment loop exhausting its 256 counters
+  (probability about 2^-256).
+- **Constant-time evidence is a committed program**, `src/ctgrind_harness.zig`, run by
+  `scripts/checks/ctgrind.sh ecvrf` (expected rows in `scripts/checks/ctgrind-expected.tsv`).
+  Target `prove` marks the 32-byte secret key undefined, derives the pair with
+  `KeyPair.fromSecretKey`, declassifies the published `Y`, and proves with `KeyPair.prove`
+  (`Gamma`, the nonce `k`, `k*B`, `k*H`, `s`): zero memcheck contexts in `ecvrf.zig`, i.e. no
+  branch on `x`, the SHA-512 prefix or `k`. The few remaining contexts are the harness's own hex
+  formatter, which is the propagation witness that makes the zero mean "no branch found" rather
+  than "the taint never arrived". `Y` has to be declassified: `H = encode_to_curve(PK_string,
+  alpha)` is a public function of `Y`, and its try-and-increment and decode branches would
+  otherwise be counted as branches on the secret (the one-shot `prove` recomputes `Y` internally
+  and gives no seam; `KeyPair` is that seam). Target `verify` taints the public `alpha` and is
+  documentary, not a constant-time claim: it lists where `verify`'s control flow depends on its
+  input (candidate decode, identity check, decode of `H`, `mulDoubleBasePublic`, the
+  `c == c'` verdict). It cannot tell `timing_safe.eql` from `std.mem.eql`; that decision is held
+  by `scripts/checks/check-ct-compare.py`, which pins `ecvrf.zig` at one `timing_safe`
+  comparison and zero plain `std.mem` ones (a count per file, so it holds the decision in place,
+  not the choice of operands). Not hardened: the SHA-512 framing and byte copies around the
+  secret-scalar calls, beyond what std's primitives provide.
+- **`verify` is deliberately variable-time.** `mulDoubleBasePublic`, `Edwards25519.fromBytes`,
+  `neg` and the final comparison work on public inputs only (public key, `alpha`, proof), as
+  `std.crypto.sign.Ed25519`'s verifier and this repository's `bip340`/`xeddsa`/`adaptor` do.
+  The challenge comparison itself uses `std.crypto.timing_safe.eql`.
+- **Try-and-increment's timing depends on `alpha_string`.** RFC 9381 §5.4.1.1 says the
+  algorithm SHOULD be avoided where the VRF input must stay secret. `encodeToCurve`'s loop
+  count (typically 1-2 iterations) leaks through timing which counters succeed. A non-issue
+  where `alpha` is public by construction (leader election, NSEC5), a real constraint if the
+  module is used with a secret `alpha`.
+- **`decodeProof` does not subgroup-check `Gamma`.** RFC 9381 §5.4.4 asks only that `Gamma`
+  decodes to a valid point and `s < q`. A low-order `Gamma` is caught by `verify`'s challenge
+  comparison (it cannot satisfy `V = s*H - c*Gamma` together with `U = s*B - c*Y` without
+  breaking the discrete-log assumption), and the proof is then refused with
+  `error.InvalidProof`, never `InvalidPublicKey` or a crash (tested for orders 1, 2, 4, 8).
+  `Y`, the key, does get an explicit low-order check (`validateKey`).
+- **`s` is refused when non-canonical (`s >= q`, §5.4.4), `c` is not range-checked** beyond
+  its fixed 16-byte width: `c < 2^128` is always below `q`, so no canonicality check is
+  meaningful for it.
+- **`proofToHash` checks structure only.** RFC 9381 §5.2 says it should run only on a `pi`
+  known to come from `prove` or from inside `verify`; it cannot tell that `Gamma` was derived
+  honestly from `(PK_string, alpha_string)`. A relying party calls `verify`, which returns the
+  same `beta` only for a valid proof.
+- **Secret material is wiped, and the entry points burn their dead stack.** Hash states that
+  absorb the seed or the SHA-512 prefix are local states wiped after use (`Sha512.hash` would
+  leave them on an unwiped frame), the clamped scalar, the nonce and the 64-byte digests are
+  `std.crypto.secureZero`'d on every path, and `prove`, `KeyPair.prove`, `publicKey`,
+  `KeyPair.fromSecretKey`, `secretScalar`, `nonceGenerationString` and `nonceGeneration` run
+  their body one `noinline` frame down and then zero the stack it dirtied (`src/burn.zig`:
+  `prove_burn` 16 KiB, `key_burn` 4 KiB). The public secret-bearing entry points take the seed by
+  pointer and return no secret by value (`secretScalar`, `nonceGeneration*` and
+  `KeyPair.fromSecretKey` write into an `out` argument). The dead-stack probes
+  (`src/stackprobe_test.zig`, `src/stackprobe2_test.zig`) scan the stack after each call for the
+  seed, `SHA-512(seed)`, the clamped `x`, `k_string`, `k` and `c*x` (with the public `c`, `s - k`
+  yields `x`) and require none; they skip themselves in Debug builds, and the first carries a
+  negative and a positive control. The per-frame `secureZero` defers inside the burned functions are
+  redundant with the burn (defence in depth; no probe can see them separately). Limits: this is
+  best-effort hygiene against reading process memory, with no `mlock` (as in this
+  repository's other secret-scalar modules); a Debug build is not probed; the caller owns its own
+  copies of the seed, and a `KeyPair` holds `secret_key`, so wipe it when done.
+- **`KeyPair` must be built with `fromSecretKey`.** `prove(sk, alpha)` recomputes `Y = x*B`,
+  about a fifth of its time; `KeyPair` derives it once. A `KeyPair` whose `public_key` was filled
+  in by hand rather than derived produces proofs that no key verifies (tested): a safe failure.
+  A precomputed base table in `ct25519` would also speed `prove`; that belongs to `ct25519`,
+  not here.
 
-  **Verified, not asserted**, and since 2026-08-11 by a **committed
-  program** rather than by numbers taken once by hand:
-  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-  `scripts/checks/ctgrind.sh ecvrf`. Target `prove` marks the 32-byte secret key
-  `MAKE_MEM_UNDEFINED`, forces a volatile reload, derives the key pair with
-  `KeyPair.fromSecretKey` (`x`, `Y = x*B`), DECLASSIFIES the published `Y`,
-  and proves with `KeyPair.prove` (`Gamma`, the nonce `k`, `k*B`, `k*H`, `s`).
+## What is deliberately not done
 
-  **Full control table** (zig 0.16.0, x86_64, ReleaseFast, 2026-09-16;
-  `in-file` = memcheck CONTEXTS whose stack names `ecvrf.zig`):
-
-  | target | `-fvalgrind` | tainted | total | in-file | witness | unattr |
-  |---|---|---|---|---|---|---|
-  | `prove` | yes | **sk** | 2 | **0** | 2 | 0 |
-  | `prove` | yes | no | 0 | 0 | 0 | 0 *(control)* |
-  | `prove` | **no** | sk | 0 | 0 | 0 | 0 *(trap)* |
-  | `verify` | yes | `alpha` (public) | 7 | 7 | 0 | 0 |
-
-  **Zero branches on `x`, `prefix` or `k`**, including all five
-  secret-scalar multiplications in `ct25519`. The 2 remaining contexts are
-  the harness's hex formatter printing the proof — the propagation witness
-  that makes the zero mean "no branch found" rather than "the taint never
-  arrived". Positive control (2026-09-16): one branch on `k[0]` inserted
-  after the nonce is derived reports in-file **1**, at the inserted line.
-
-  Before 2026-09-16 the harness called the one-shot `prove(sk, alpha)`,
-  which recomputes `Y` from `sk`, so nothing could declassify `Y` and every
-  branch on a function of `Y` was counted: 3 in-file (7 total), then **5**
-  (9 total) once `stringToPoint` became strict (A1 E14). The five, located
-  with `--stacks`: `encodeToCurve`'s candidate decode (`ecvrf.zig:330`,
-  `:331` inside std's `fromBytes`, `:332`), its identity check (`:244`), and
-  `proveExpanded`'s decode of `H` (`:417`). All five branch on
-  `H = encode_to_curve(PK_string, alpha)`, which every verifier recomputes
-  from public inputs; with `Y` declassified all five disappear and nothing
-  on the secret remains. `KeyPair.prove` and `prove` share `expandSecretKey`,
-  `mulBase` and `proveExpanded`; the only line of `prove` the target does not
-  execute is the one composing them.
-
-  `verify` is **documentary, not a constant-time claim** — `verify` has no
-  secret (see the next bullet). Tainting `alpha` lists where its control flow
-  depends on its input: the same try-and-increment/decoding branches,
-  `mulDoubleBasePublic` (`edwards25519.zig:316` via `ecvrf.zig:524`) and the
-  `c == c'` verdict (`:533`). It does **not** detect replacing
-  `timing_safe.eql` with `std.mem.eql` at `:533`: measured, 7 / 7 at the same
-  lines, because both forms end in one branch on a tainted equality at the
-  same call site and memcheck counts contexts by address.
-
-  **Zig 0.17.0 (2026-10-18): `verify` 7 / 7 -> 9 / 9, benign.** The two new
-  contexts are std's `Edwards25519.fromBytes` at `edwards25519.zig:46`, once
-  under `stringToPoint` (`ecvrf.zig:367`, the try-and-increment candidate)
-  and once under `verify`'s decode of `H` (`:574`). 0.17's std added
-  `if (x.isZero() and (s[31] >> 7) != 0) return error.InvalidEncoding` —
-  RFC 8032 §5.1.3's "x = 0 and x_0 = 1" refusal, which `stringToPoint` has
-  always made itself one line later (`:368`, A1 E14/E16). Both inputs are
-  functions of `alpha` and the public key only; nothing secret is in `verify`.
-  It also leaves `verify`'s `fromBytes(h_string) catch unreachable` sound:
-  0.17 refuses exactly the strings `stringToPoint` already refused, so `H`
-  (which passed `stringToPoint`) still decodes. The row keeps its `>=1` bound;
-  `prove` is 2 / 0 on 0.17 as on 0.16.
-
-  **That swap is caught by `scripts/checks/check-ct-compare.py` instead** (A1 E15),
-  which pins this file at one `timing_safe` comparison and zero plain
-  `std.mem` ones and runs in every lane that touches the module. Measured
-  2026-09-16 on exactly that mutation: the suite is 31/31 green in ReleaseFast
-  and ReleaseSafe, both ctgrind rows keep their counts, and only that gate
-  goes red — naming the file and the direction. ⚠ It counts per file, so it
-  holds the DECISION in place, not the choice of operands.
-
-  **Teeth, measured 2026-08-11 on the one-shot-`prove` harness.** Re-creating the historical defect —
-  pointing `prove`'s three secret-scalar multiplications back at
-  `std.crypto.ecc.Edwards25519`'s ladder, whose trailing
-  `rejectIdentity` branches on a scalar-derived value — moves the table
-  from **7 total / 3 in `ecvrf.zig`** to **12 / 8**, with the
-  `edwards25519.zig` attribution going 2 → 7. That is the same shape as
-  the "before" figure this bullet used to quote from memory (11 errors /
-  10 contexts), and it is now reproducible. Reverted; `cmp` against a
-  pre-mutation copy confirmed byte-identical.
-
-  What is still NOT hardened: the SHA-512 framing and byte copies around
-  those calls, beyond what std's own primitives provide.
-- **`verify` is deliberately variable-time** — `mulDoubleBasePublic`,
-  `Edwards25519.fromBytes`/`neg`, and the final byte comparison all
-  operate on public inputs only (the public key, the input `alpha`, and
-  the proof under test), mirroring `std.crypto.sign.Ed25519`'s own
-  verifier and this repository's `bip340`/`xeddsa`/`adaptor` convention.
-- **Try-and-increment's timing depends on `alpha_string`.** RFC 9381
-  §5.4.1.1 itself warns: "this algorithm SHOULD be avoided in
-  applications where it is important that the VRF input alpha remain
-  secret." `encodeToCurve`'s loop count (typically 1-2 iterations, per
-  the RFC's own analysis) leaks through timing whether `alpha` is
-  chosen such that early counters succeed or fail — a non-issue for
-  every use case RFC 9381 itself motivates (leader election, NSEC5),
-  where `alpha` is public by construction, but a real constraint if
-  this module is ever repurposed with a secret `alpha`.
-- **`decodeProof` does not subgroup-check `Gamma`.** RFC 9381 §5.4.4
-  does not ask for one (only "`Gamma` decodes to a valid curve point"
-  and "`s < q`") — a `Gamma` in a low-order subgroup is caught
-  downstream by `ECVRF_verify`'s challenge comparison failing (a forged
-  low-order `Gamma` cannot satisfy `V = s*H - c*Gamma` for a `c` that
-  also matches `U = s*B - c*Y`, absent breaking the discrete-log
-  assumption), matching the RFC's own design — not a gap relative to
-  the spec, but worth stating since `Y` (the actual public key) DOES get
-  an explicit low-order check (`validateKey`) while `Gamma` (part of the
-  proof, not the key) does not.
-- **`s` is checked non-canonical (`s >= q` rejected, RFC 9381 §5.4.4
-  step 8) but `c` is not range-checked beyond its fixed 16-byte width**
-  — `c < 2^128` structurally (it is exactly `cLen` bytes), always `< q`
-  (`q ~ 2^252`), so no separate canonicality check is meaningful or
-  required for `c`.
-- **Secret material is zeroed after use.** `expandSecretKey`'s clamped
-  scalar `x` and the SHA-512 `prefix`/intermediate 64-byte digests
-  touched by `prove`/`nonceGeneration` are `std.crypto.secureZero`'d via
-  `defer` — best-effort hygiene against process-memory scraping, not a
-  guarantee against a determined local attacker (no memory locking /
-  `mlock`, matching this repository's other secret-scalar-handling
-  modules, e.g. `xeddsa.zig`). **Known limitation (A1 E4, owner's decision
-  2026-09-11: document, do not patch std):** secret copies still survive on
-  the dead stack after `prove`. Measured with a dead-stack probe (an audit
-  instrument, since deleted), ReleaseFast, 5 rounds each: before 2026-09-14
-  `x=3 k=1 sk=0`; after `prove` moved its steps into `proveExpanded`
-  (secrets passed by pointer) and the SHA-512 states that absorb `sk` and
-  the prefix are wiped (`Sha512.hash` left them on an unwiped frame),
-  `x=0 k=1 sk=1`. The counts follow frame layout, not
-  just the code — passing `sk` by pointer alone measured `sk=2`. What remains
-  sits in code this module does not control (`std`'s scalar arithmetic and
-  hash internals take their inputs by value and do not wipe their frames),
-  and EACH remaining copy recovers the key: `sk` directly, `k` with the
-  published proof (`x = (s - k) / c mod q`). A process whose dead stack an
-  attacker can read should not rely on this hygiene. ⚠ The probe's own
-  `sentinels_left` counter read "untouched" (24576/24576) on both trees while
-  it still found the copies above, so treat the numbers as an A/B on one
-  instrument, not as absolute counts.
-- **`KeyPair` (A1 E10, 2026-09-14).** `prove(sk, alpha)` spends about a
-  fifth of its time recomputing `Y = x*B`. `KeyPair.fromSecretKey(sk)` derives
-  `Y` once and `KeyPair.prove` skips it: measured ReleaseFast, 5 rounds of
-  2000, median 228 380 ns/op for `prove` vs 176 229 ns/op for `KeyPair.prove`
-  (−22.8 %; taken before the E4 hash-state wipes above were added, which
-  both paths share), byte-identical proofs on every RFC 9381 vector. A `KeyPair` whose
-  `public_key` was filled in by hand rather than derived produces proofs no
-  key verifies (tested) — a safe failure. The other half of the audit's E10,
-  a precomputed base table in `ct25519` (shared with four modules), belongs
-  to the campaign's performance pass.
-- **A degenerate secret scalar or nonce (probability ~2^-252) does NOT
-  panic.** *(Corrected 2026-09-10, A1 E11: this bullet used to claim
-  `publicKey`/`prove` `@panic` if the clamped secret scalar or derived
-  nonce reduces to `0 mod q`. That was true of this module's OLD ladder —
-  `std.crypto.ecc.Edwards25519.mul`'s trailing `rejectIdentity`, `catch
-  @panic(...)`'d at five call sites — and stopped being true when `prove`/
-  `publicKey` moved to `ct25519.mul`/`mulBase` (see the bullet above):
-  those return the neutral element as an ordinary value, no error union, so
-  there is nothing left to `catch`. `rg '@panic' modules/ecvrf/src` finds
-  exactly one `@panic`, in `encodeToCurve`'s unrelated `ctr`-exhaustion
-  path, not here. The doc comment on `ecvrf.zig` itself never made this
-  claim and was right; only this bullet was stale.)* A degenerate `x` is
-  provably unreachable regardless (RFC 8032 clamping puts it strictly
-  between `4L` and `5L`, never a multiple of `L`); a degenerate `k` simply
-  produces a proof carrying `U = k*B = O`, which `verify` recomputes
-  identically and which a genuinely low-order `Y` would still be rejected
-  for on the verifier side (`validateKey`, §5.4.5) — see `ecvrf.zig`'s
-  module doc comment for the full argument.
-
-## Out of scope (this module)
-
-- **ECVRF-P256-SHA256-TAI / -SSWU** (RFC 9381 §5.5) — the NIST P-256
-  ciphersuites. Would need `std.crypto.ecc`'s P-256 support plus SEC1
-  point compression/decompression (`point_to_string`/`string_to_point`
-  per SEC1 §2.3.3/§2.3.4) — a real but separate piece of work, not
-  attempted here.
-- **ECVRF-EDWARDS25519-SHA512-ELL2** (RFC 9381 §5.5, `suite_string =
-  0x04`) — same curve and hash as this module, but `encode_to_curve` via
-  RFC 9380's Elligator2 map instead of try-and-increment.
-  `Edwards25519.fromUniform`/`elligator2` already exist in std (used
-  internally by std's own `fromString`), so this would be a
-  comparatively low-effort follow-up module — genuinely deferred, not
-  ruled out.
-- **RSA-FDH-VRF-SHA256/384/512** (RFC 9381 Appendix A) — an entirely
-  different, non-elliptic-curve VRF construction (RSA full-domain-hash
-  signatures under the hood). Would reuse this repository's `rsa`
-  module's primitives but is a distinct algorithm family, not a
-  ciphersuite variant of ECVRF.
-- **Batch verification** — RFC 9381 does not define one for ECVRF (unlike
-  Schnorr/EdDSA, where batching multiple `sB - cA` checks is a common
-  optimization); not attempted here.
+- **`validate_key = FALSE`.** RFC 9381 §5.3 lets an implementation support only one option as
+  long as it documents which; `verify` always runs `ECVRF_validate_key`, so there is no
+  unvalidated-key verification path (see *Design*).
+- **RSA-FDH-VRF-SHA256/384/512** (RFC 9381 Appendix A): a non-elliptic-curve construction (RSA
+  full-domain-hash signatures), a distinct algorithm family rather than a ciphersuite variant of
+  ECVRF; it would reuse the `rsa` module's primitives and belongs in a module of its own.
+- **Batch verification.** RFC 9381 does not define one for ECVRF (unlike Schnorr/EdDSA, where
+  batching several `sB - cA` checks is common), so none is offered.
+- **Patching std** for the secret copies its scalar arithmetic and hashes leave on dead frames:
+  the burn above clears them from this side instead.
 
 ## Verification
 
-- `zig build test-ecvrf` (Debug) and `zig build -Doptimize=ReleaseFast
-  test-ecvrf`: **all tests pass in both modes** (verified 2026-07-16).
-  `zig fmt --check modules/ecvrf/` is clean.
-- Byte-exact KATs: RFC 9381 Appendix B.3's three official
-  ECVRF-EDWARDS25519-SHA512-TAI vectors (Examples 16/17/18), each
-  checked at every layer the RFC publishes an intermediate value for —
-  `SK -> x` (`secretScalar`), `SK -> PK` (`publicKey`), `(PK, alpha) ->
-  H` (`encodeToCurve`, including an independent re-derivation of the
-  published `try_and_increment` counter), `(SK, H) -> k_string -> k`
-  (`nonceGenerationString`/`nonceGeneration`), `(SK, alpha) -> pi`
-  (`prove`, the full 80-byte proof), `pi -> beta`
-  (`proofToHash`/`verify`) — plus negative/tamper tests RFC 9381 does
-  not itself publish: independently flipping a byte inside `Gamma`/`c`/
-  `s` (each of `pi`'s three fields), a wrong `alpha`, a non-canonical
-  `s` caught at `decodeProof`, and small-order/identity public keys
-  caught at `validateKey` — every one rejects cleanly (`error.
-  InvalidProof`/`error.InvalidPublicKey`), never a panic on
-  attacker-controlled input.
-
-## Audit 2026-11-17 (whole-module mutation)
-
-110 mutants over every non-test line of `src/ecvrf.zig` and the burn loop of `src/burn.zig`: `expandSecretKey` (hash, clamp, which half is `x`), `encodeToCurve` (domain bytes, ctr string and range, candidate half, cofactor, identity), the nonce (seed hash, prefix half, reduction), `challengeGeneration` (suite and separator bytes, each of the five points, truncation), `stringToPoint` (the canonical and sign-bit rules), `decodeProof` (offsets, the Gamma and `s` checks, error codes), `validateKey` (cofactor clearing, error codes), `prove` / `KeyPair` (every step of RFC 9381 §5.1: Y, Gamma, nonce, U, V, challenge argument order, `s = k + c*x`, layout of `pi`), `hashOutputFromGamma` and `verify` (U and V formulas, challenge argument order, the comparison, error codes), plus every `burn.stack` call and every `secureZero`. One schemata build in ReleaseSafe for the functional mutants and one in ReleaseFast for the burn and wipe mutants (the stack probes only run there), baseline first in each.
-
-One test was added: a low-order Gamma (order 1, 2, 4 and 8) makes `verify` answer `InvalidProof`, never `InvalidPublicKey` or a crash (it kills the `V = s*H - c*Gamma` failure arm; for order 1, 2 and 4 `mulDoubleBasePublic` refuses `-Gamma`). The RFC 9381 Appendix B.3 vectors and the existing negative tests killed the rest: 88 mutants die (8 of them only in the ReleaseFast build: the six `burn.stack` calls and the two burn-loop mutants, killed by the stack probes).
-
-22 do not, none of them a defect (no point-validation or cofactor mutant survives except the ones below, which are equivalent by construction):
-
-- 14 EQUIVALENT by redundancy: the per-frame `secureZero` defers of `expandSecretKey`, `secretScalarUnburned`, `publicKeyUnburned`, `nonceStringFrom`, `nonceGenerationUnburned`, `proveUnburned`, `keyPairProveUnburned` and `proveExpanded`. The burn below each public entry point overwrites the dead frames they would have wiped, and the stack probes (which see the state after the burn) cannot tell. Seeing one needs a probe of an unburned frame, and that fails at baseline: `std`'s SHA-512 and `ct25519` frames hold seed-derived words there, which is why the burn exists. Kept as defence in depth.
-- (Removed afterwards: `ExpandedSecretKey` carried a `prefix` field that was only copied and wiped, `nonceStringFrom` re-derives it from the seed. The field and its three wipes are gone, 4 equivalent mutants with it: 114 became 110 and 26 became 22. The ctgrind counts did not move, the source digests did.)
-- `stringToPoint`'s `x = 0` with sign bit 1 refusal removed: EQUIVALENT on Zig 0.17: `Edwards25519.fromBytes` refuses that encoding itself (the test "RFC 8032 §5.1.3 strict decoding" asserts it); the guard stays for the std that accepted it (0.16).
-- `verify` using the caller's `PK_string` / `Gamma` bytes instead of the re-encoded point (3 mutants): EQUIVALENT, strict decoding makes the re-encoding the caller's own bytes (A1 E14/E16).
-- UNOBSERVABLE: `ctr <= 256` (differs only after 256 failed try-and-increment rounds, probability 2^-256); `rejectIdentity` dropped in `encodeToCurve` (needs a hash whose cofactor-cleared point is the identity, 2^-250); the `U` failure arm of `verify` returning `InvalidPublicKey` (`mulDoubleBasePublic` refuses only a `-Y` of order dividing 4, which `validateKey` has already refused); comparing only the first or only the last 8 challenge bytes (2 mutants: a collision of the truncated challenge needs 2^64 hash evaluations, and a random forgery of the existing test hits it with probability 2^-64).
-
-Not mutated: the constants (`suite_string`, lengths: comptime, pinned by a values test), the `@panic` after 256 rounds, `fuzz_test.zig` and the other test files. Counts on the card are whole-module.
+- Run: `scripts/modtest ecvrf`. The example (`example/main.zig`) is built by
+  `zig build check-examples -Dmodule=ecvrf`. There is no foreign-implementation interop step:
+  the anchors are the RFC's published vectors (see *Anchoring*).
+- **Known answers** (`src/kat_test.zig`, vectors in `src/kat_vectors.zig`): RFC 9381 Appendix
+  B.3's three ECVRF-EDWARDS25519-SHA512-TAI vectors (Examples 16, 17, 18), byte-exact at every
+  layer the RFC publishes an intermediate for: `SK -> x` (`secretScalar`), `SK -> PK`
+  (`publicKey`), `(PK, alpha) -> H` (`encodeToCurve`, with an independent check of the published
+  `try_and_increment` counter), `(SK, H) -> k_string -> k` (`nonceGenerationString`,
+  `nonceGeneration`), `(SK, alpha) -> pi` (`prove`, the full 80-byte proof), `pi -> beta`
+  (`proofToHash`, `verify`); `KeyPair` reproduces the same bytes.
+- **Negative tests** the RFC does not publish: each of `pi`'s three fields (`Gamma`, `c`, `s`)
+  tampered on its own, a wrong `alpha`, a non-canonical `s`, a `Gamma` that is not a point
+  encoding or is spelled non-canonically, a public key spelled `y + p` that std would decode,
+  small-order and identity public keys (`validateKey`), a low-order `Gamma` (orders 1, 2, 4, 8),
+  random `(c, s)` forgeries against a valid `Gamma`, and a hand-filled `KeyPair`. Every one is
+  refused with `error.InvalidProof` or `error.InvalidPublicKey`, never a panic.
+- **Structural tests** in `src/ecvrf.zig` and `src/root.zig`: the wire constants and `suite_string
+  = 0x03`, `padChallenge`, the prove -> verify round trip, secret-scalar multiplies are total,
+  `meta.deps` is exactly `{ct25519}`. `ECVRF_BENCH` opts in to a print-only `verify` timing.
+- **Fuzz:** the deterministic driver `ECVRF_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY` selects
+  a harness) over `ecvrf-decode-proof` (accepted proofs re-encode canonically), `ecvrf-verify`
+  (damaged key/proof pairs) and `ecvrf-prove-verify` (a genuine proof is accepted and the hashes
+  agree; a flipped bit, another `alpha` or another key is refused). Each harness has an in-suite
+  seeded check that it reaches every outcome.
+- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig`, optimized builds only
+  (see *Threat model*).
+- **ctgrind:** rows `prove` and `verify` in `scripts/checks/ctgrind-expected.tsv`, harness
+  `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh ecvrf`; `check-ct-compare.py`
+  pins the one `timing_safe` comparison.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **Own `x = 0` + sign-bit check is redundant on Zig 0.17** (migration review 2026-10-19): 0.17 std `Edwards25519.fromBytes` already rejects that encoding (`edwards25519.zig:46`), so the KAT control at `kat_test.zig` (~381) passes with the module's own line (`ecvrf.zig:368`) deleted — an equivalent mutant on 0.17. The check stays (cheap, documents RFC 8032 §5.1.3, and the CT notes above rely on it); a mutation run should count that mutant as equivalent, not as a missing test.
-- **ECVRF-EDWARDS25519-SHA512-ELL2** (RFC 9381, suite 0x04) *(survey 2026-09-30)*: the suite without try-and-increment's data-dependent loop over alpha (TAI is not suitable for secret input, as ProtonMail's README also notes). SPEC "Out of scope" says std's `Edwards25519.fromUniform`/`elligator2` make this "comparatively low-effort". Effort: small. Fits §2.
-- **ECVRF-P256-SHA256-TAI and -SSWU** (RFC 9381, suites 0x01/0x02) *(survey 2026-09-30)*: the P-256/secp256k1-family peers above (witnet, vechain) are built around them; SPEC "Out of scope": needs P-256 and SEC1 point compression. std has `ecc.P256` with SEC1 (de)compression; sibling `p256` exists. Effort: medium. Fits §2.
+- **ECVRF-EDWARDS25519-SHA512-ELL2** (RFC 9381, `suite_string = 0x04`): the suite without
+  try-and-increment's data-dependent loop over `alpha` (TAI is not suitable for secret input, as
+  ProtonMail's README also notes). Same curve and hash as this module; `encode_to_curve` is RFC
+  9380's Elligator2, and std's `Edwards25519.fromUniform`/`elligator2` exist, so the work is
+  small. Not started; fits the module's scope.
+- **ECVRF-P256-SHA256-TAI and -SSWU** (RFC 9381, suites 0x01/0x02): the P-256 deployments
+  (witnet/vechain-style) are built around them. They need P-256 with SEC1 point
+  compression/decompression (`point_to_string`/`string_to_point` per SEC1 §2.3.3/§2.3.4) and
+  big-endian `int_to_string`; std has `ecc.P256` with SEC1 (de)compression and the sibling `p256`
+  exists. Effort: medium. Not started; fits the module's scope.
+
 
 ## Anchoring
 

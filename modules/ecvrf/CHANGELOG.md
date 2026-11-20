@@ -18,10 +18,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `KeyPair.prove` and `publicKey` now burn their stack (`burn.zig`), and `prove`, `publicKey` and
   `KeyPair.fromSecretKey` take `sk: *const SecretKey` (by value, the caller's frame kept the seed).
   0 residues after, caller's frame included.
-- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
-  dead-stack probe `src/zeroize_probe_test.zig` (A1 E4) is deleted: it
-  asserted nothing and its stderr failed the CI lane in ReleaseFast. SPEC.md's
-  E4 limitation keeps its numbers; its last run still read `k=1 sk=1`.
 
 - **2026-09-16** — documentation only, no code and no gate data changed (A1 E15
   closed). The audit recorded that nothing anywhere caught replacing `verify`'s
