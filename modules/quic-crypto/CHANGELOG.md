@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **SOURCE-BREAKING (error set):** `headerprot.HeaderProtectionError.SampleTooShort` is removed. Nothing returned it: the sample is a `[16]u8` argument of `computeMaskAes`/`computeMaskChaCha20`, and `apply`/`remove` take the computed mask and return only `PacketTooShort`. Code that names `error.SampleTooShort` (e.g. a `switch` arm) must drop it; behaviour is unchanged.
 
 - **2026-10-19** — AES-GCM in tests, probes and docs moved from `std.crypto.aead.aes_gcm` to the zig-libs `aesgcm` module (new dep; Zig 0.17 #36256). `Protection(Aead)` is generic and unchanged; std AEAD types still work. Same bytes on the wire.
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).

@@ -111,7 +111,9 @@ CONSTRUCTIONS, re-expressed QUIC-shaped:
   FIXED `pn_offset + 4` (§5.4.2: the PN is assumed 4 bytes for sampling), from
   the ciphertext AFTER packet protection. A wrong offset or a mask computed
   over plaintext leaks or corrupts the PN. Both mask primitives are pinned
-  byte-exact against App. A.2/A.3/A.5.
+  byte-exact against App. A.2/A.3/A.5. Taking the 16 sample bytes is the caller's (they are a
+  `[16]u8` argument of `computeMaskAes`/`computeMaskChaCha20`), so `apply`/`remove` have no
+  too-short-sample case; their only error is `PacketTooShort`.
 - **PN-length ordering hazard (§5.4.1).** On receive, the 2 bits that encode
   the PN length are themselves masked, so `remove` MUST unmask the first byte
   before it can know how many PN bytes to unmask. Implementing `remove` as

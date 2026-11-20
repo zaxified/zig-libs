@@ -37,9 +37,9 @@
 const std = @import("std");
 const burn = @import("burn.zig");
 
+/// The sample is a `[16]u8` parameter of `computeMaskAes`/`computeMaskChaCha20`,
+/// taken by the caller, so a too-short sample cannot reach `apply`/`remove`.
 pub const HeaderProtectionError = error{
-    /// The 16-byte sample window would run past the end of the packet.
-    SampleTooShort,
     /// The masked packet-number length (1..4) would run past the packet end.
     PacketTooShort,
 };
