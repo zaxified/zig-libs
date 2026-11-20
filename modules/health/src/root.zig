@@ -213,7 +213,7 @@ fn respondStartup(h: *const Health, res: *http.Server.ResponseWriter) anyerror!v
 /// are kept on the stack; every check still runs once and still counts for the
 /// status). Far past any real service's dependency count. The ones past it are
 /// summed up in one last `"(N more)"` entry, `down` when any of them failed —
-/// before 2026-10-24 they were left out, so a 503 could list only `up` checks.
+/// previously they were left out, so a 503 could list only `up` checks.
 const json_max_checks = 256;
 
 /// Write `s` as a JSON string literal. Quote, backslash and control bytes are
@@ -221,7 +221,7 @@ const json_max_checks = 256;
 /// `\u00XX` so the document stays valid JSON.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     // A plain ASCII name (the usual "database", "cache") needs no escape:
-    // one write instead of a call per byte (2026-10-24: the per-byte path was
+    // one write instead of a call per byte (the per-byte path was
     // most of a 3-check JSON readiness probe, 1.28x fiber's healthcheck).
     for (s) |c| {
         if (c < 0x20 or c >= 0x7f or c == '"' or c == '\\') break;
@@ -517,7 +517,7 @@ test "readiness detail: lines that exactly fill the budget are all kept; one mor
     // exact budget -- both listed, no marker. A third failing check does not
     // fit and is replaced by `not ready: ...`. And a 503 is `no-store` like
     // the 200 (a cached "not ready" would outlive the outage). Mutation
-    // 2026-10-04: an off-by-one budget, a dropped marker and a dropped
+    // an off-by-one budget, a dropped marker and a dropped
     // Cache-Control on /readyz all survived.
     const n200 = strRepeat("a", 200);
     const n288 = strRepeat("b", 288);
@@ -809,7 +809,7 @@ test "pathsDistinct: two probes on one path are refused (middleware() panics on 
 }
 
 test "json body: checks past json_max_checks are summed in one last entry, down if any failed" {
-    // Review 2026-10-24: with 258 checks and only the last one down, the body
+    // Review: with 258 checks and only the last one down, the body
     // was a 503 whose `details` listed 256 `up` checks and nothing else.
     var checks: [json_max_checks + 2]Check = @splat(.{ .name = "c", .checkFn = alwaysUp });
     var h = Health{ .checks = &checks, .json = true };
@@ -833,7 +833,7 @@ test "json body: checks past json_max_checks are summed in one last entry, down 
     parsed.deinit();
 
     // Exactly json_max_checks: every check listed, no summary entry
-    // (mutation 2026-10-24: `>=` for `>` added a "(0 more)").
+    // (mutation: `>=` for `>` added a "(0 more)").
     h.checks = checks[0..json_max_checks];
     const full = runWireWide(&r, wire("/readyz"), &buf);
     try testing.expect(std.mem.endsWith(u8, bodyOf(full), ",\"c\":{\"status\":\"up\"}}}"));
@@ -1113,7 +1113,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
