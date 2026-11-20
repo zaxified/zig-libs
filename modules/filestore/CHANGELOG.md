@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Clock.wall_clock` (duplicate-code pass) now reads `clock.realtimeNs()`, which saturates at the `i64` range exactly as the private `nsSinceEpoch` did; that helper and its test are removed (saturation is tested in `clock`). New dependency: `clock` (was std only).
 - **2026-11-01** — **Added:** `Store.durability` (`.full` default = today's fsync of file + directory; `.data` = file only, diskv's strongest; `.none` = atomic, no fsync, diskv's `Write`) and `AtomicWriteOptions.sync_file`. **Fixed (independent review):** `importFile` refuses a non-regular source (`error.NotAFile`; a moved directory or symlink became an unreadable key); `casPutBytes` over an expired record drops the stale `.expiry` deadline (the bytes it reported written were invisible); `KeyIterator` stats DT_UNKNOWN entries; `openRecord` on a directory is `error.IsDir`. **Performance:** `tools/bench.zig` vs diskv v3.0.0, ref 0.06–1.00× (P2). The fuzz model draws the durability level and checks a successful CAS is readable.
 - **2026-11-01** — **Added** (scope parity with diskv v3): `iterate`/`iteratePrefix` (`KeyIterator`), `listPrefix`, `has`, `eraseKind`, streaming `createTemp`/`commit`/`discardTemp`/`openRecord`, `importFile` (copy or move), `encodeKey`/`decodeKey` (any bytes as a key), `Store.file_permissions`/`dir_permissions` and `AtomicWriteOptions.permissions`. **Fixed:** `delete` on a never-created kind returns `false` instead of `error.FileNotFound` from the directory fsync. **Tests:** model-based fuzz harness `ops` (`FILESTORE_FUZZ`, every public op against an in-memory model; 1,200 driver runs clean). `list` now shares `KeyIterator`'s filter (unchanged results).
@@ -14,7 +12,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `list` skips names the API cannot address (fail `segmentSafe`), so one foreign file no longer fails `listTyped`/`sweep` for a whole kind; `putBytes`/`putManyBytes` above 64 MiB are `error.StreamTooLong` (what `getBytes` returns), before any I/O; `wallNow` saturates.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-04** — **Tests:** mutation run (23 schemata mutants, 22 killed, 1 race-only survivor
   documented in SPEC). One new test pins the 128-byte name edge, whole-batch validation in

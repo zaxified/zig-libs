@@ -19,7 +19,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line — clean-room, no `NOTICE` entry.
 
 ## Compared with
 
@@ -40,7 +40,7 @@ key-value engines), `blobstore` (content-addressed), `ramcache` (memory cache).
 mention *(its source was not read, so whether it syncs is unverified)*; TTL with a sweep, version CAS
 (`casPutBytes`), per-key advisory locks (`lockKey`); typed JSON with a `skipped` count on
 `listTyped`; traversal checks on every entry point. **Where we are behind:** nothing a diskv user
-reaches for, since 2026-11-01. diskv's API (v3, pkg.go.dev) mapped: `Read`/`Write` = `getBytes`/
+reaches for. diskv's API (v3, pkg.go.dev) mapped: `Read`/`Write` = `getBytes`/
 `putBytes`; `ReadStream`/`WriteStream` = `openRecord`/`createTemp`+`commit`; `Keys`/`KeysPrefix` =
 `iterate`/`iteratePrefix`/`listPrefix`; `Has` = `has`; `Erase`/`EraseAll` = `delete`/`eraseKind`
 (per kind); `Import(src, key, move)` = `importFile`; `FilePerm`/`PathPerm` = `file_permissions`/
@@ -55,26 +55,49 @@ by `rename`).
 DB-less durable keyed document store: one flat file per record under `<base>/<kind>/<key>`, plus a
 thin typed-JSON convenience layer (`put`/`get`/`listTyped`) over the same raw-bytes files
 (`putBytes`/`getBytes`/`list`/`delete`) — no forced file extension, no separate directory tree for
-the typed API. Crash safety: every write lands in a hidden `.<key>-<n>.part` temp (`n` a
-process-local atomic counter, so two writers in the same process never collide) and is made visible
-by a single `rename(2)`, with an `fsync` of the temp before the rename and of the directory after —
-a crash mid-write leaves only an orphaned temp, never listed (hidden files skipped), never read (its
-name is not a valid key), never a torn live record, and a `putBytes` that returned is on stable
-media. ⚠ Until 2026-09-03 there were **no fsyncs at all** (measured on the example with `strace`:
-5 renames, 0 fsyncs), so "crash safety" covered concurrent readers and not crashes, while the
-module's own one-line description said "durable". The sibling `blobstore` had fsynced its temp
-since its own audit and this module never followed (`blobstore` added the directory half on
-2026-09-03). Re-take the reading with `strace -e trace=rename,renameat,fsync` on `run-example-filestore`:
-5 renames, 10 fsyncs. Path safety: `kind`
-and `key` must each pass `segmentSafe` (`[A-Za-z0-9._-]`, no leading dot, no `.`/`..`) on every
-public entry point, so a request can never traverse out of `base`. `listTyped` tolerance:
-unparseable files are skipped rather than failing the whole listing, but the `skipped` count is
-returned so callers can detect/alert on drift. Platform: posix (visibility relies on atomic
-`rename(2)`; filesystem via `std.Io`). Role: util. Concurrency: reentrant — no shared state except
-the process-local ingest counter. Original work of the zig-libs authors (MIT): atomic
-temp-then-rename writes, `segmentSafe` path validation, and the `listTyped` skip-count are
-first-class — no JSON is ever written in place, no path is built without a traversal guard, and no
-unparseable record is silently dropped. No third-party source — no NOTICE entry.
+the typed API. Platform: posix (visibility relies on atomic `rename(2)`; filesystem via `std.Io`).
+Role: util. Concurrency: reentrant — no shared state except the process-local ingest counter.
+Original work of the zig-libs authors (MIT); no third-party source — no NOTICE entry.
+
+- **Crash safety.** Every write lands in a hidden `.<key>-<pid>-<n>.part` temp (`nextUniq`: the pid
+  and a process-local atomic counter, so two writers in one process or in two processes never share a
+  temp path) and is made visible by a single `rename(2)`. With the default `Store.durability = .full`
+  the temp is `fsync`ed before the rename and the kind directory after it (also after `delete`,
+  `eraseKind` and `commit`; `putManyBytes` syncs the directory once per batch, not per record), so a
+  `putBytes` that returned is on stable media. `.data` syncs the file only (diskv's strongest
+  mode, `TempDir` + `WriteStream(sync)`): after a power loss the record is the old one or the whole new
+  one, but a rename or delete that returned may be lost. `.none` never syncs (diskv's `Write`): still
+  atomic against readers and process crashes, a power loss can lose recent writes. A crash mid-write
+  leaves only an orphaned temp: never listed (hidden), never read (its name is not a valid key),
+  never a torn live record. `writeFileAtomic(io, dir, sub_path, bytes, opts)` is the same sequence
+  for one file at a path of the caller's choosing (`AtomicWriteOptions`: `sync_dir`, `sync_file`,
+  `permissions`). `Store.file_permissions` / `dir_permissions` are the modes of everything the store
+  creates (records, temps, sidecars / kind directories; diskv's `FilePerm` / `PathPerm`).
+- **Path safety.** `kind` and `key` must each pass `segmentSafe` (`[A-Za-z0-9._-]`, 1 to 128 bytes, no
+  leading dot, so no `.`/`..`) on every public entry point, so a request can never traverse out of
+  `base`; the leading dot is also what reserves the `.part` temp and sidecar names.
+- **Record size.** `putBytes`/`putManyBytes` refuse a record over 64 MiB (`error.StreamTooLong`) up
+  front, and a record of exactly 64 MiB reads back whole; a larger record exists only through the
+  streaming path and is readable only through `openRecord`.
+- **Listing.** `list`/`listPrefix`/`iterate`/`iteratePrefix` skip hidden files (temps, sidecars),
+  subdirectories and any name that is not a `segmentSafe` key, so one foreign file cannot fail
+  `listTyped` or `sweep` for a whole kind; a file whose `readdir` type is unknown is `stat`ed.
+  `listTyped` skips unparseable files rather than failing the listing, and returns the `skipped`
+  count so callers can detect and alert on drift. `delete` on a kind that was never created is
+  `false`, not an error.
+- **Streaming, import, key encoding** (diskv's `ReadStream`/`WriteStream`, `Import`, `Transform`).
+  `createTemp` / `commit` / `discardTemp` / `openRecord` have the shape of `blobstore`'s raw layer:
+  a hidden temp unique per call with no size limit, `commit` = `fsync` + rename + directory
+  `fsync`, `openRecord` null when the record is absent or expired and `error.IsDir` for a directory.
+  `importFile` makes an existing file a record, by one `rename(2)` when `move` is set and the source
+  is on the same filesystem, otherwise by streaming copy (then deleting the source when moving); it
+  refuses a source that is not a regular file (`error.NotAFile`), leaves an existing `.expiry`
+  sidecar alone like `putBytes`, and a moved file keeps its own mode. `encodeKey`/`decodeKey` map
+  any non-empty byte string to a `segmentSafe` key reversibly: `[A-Za-z0-9.-]` pass through (a
+  leading `.` does not), every other byte, `_` included, becomes `_HH`; distinct inputs give
+  distinct keys (`InvalidName` for empty input or a result of `.`/`..`, `NameTooLong` over 128
+  bytes). `has` answers like `getBytes` without reading; `eraseKind` deletes a kind's records and
+  their `.expiry` sidecars and syncs the directory once.
 
 ### TTL, CAS and cross-process locking (sidecars, not headers)
 Three optional layers sit beside the raw-bytes/typed-JSON layer, all keyed off the same `kind`/`key`:
@@ -87,7 +110,10 @@ Three optional layers sit beside the raw-bytes/typed-JSON layer, all keyed off t
   directory scan and still reports an expired-but-unswept key; `get`/`getBytes`/`listTyped` (which
   is built on `getBytes`) do not. `putBytes`/`casPutBytes` do not clear a prior `.expiry` sidecar —
   mixing plain `putBytes` and `putWithTTL` on the same key inherits the old deadline for the new
-  bytes; `delete` does clear it (a deleted record leaves no trace).
+  bytes; `delete` does clear it (a deleted record leaves no trace). A corrupt sidecar (truncated, non-numeric, overflowing) reads as no TTL, never as a read
+  error on the healthy record; a CAS over an expired record drops the stale deadline. `putWithTTL` writes
+  the sidecar before the record, so a crash between them leaves a deadline with no record (absent, as an
+  already-expired record would be), never a record that never expires.
   - **`Store.ttl: bool = true` opt-out.** The `.expiry` probe in `getBytes` costs a syscall on
     *every* call, even for a store that never TTLs anything. Setting `store.ttl = false` skips that
     probe entirely — chosen as a store-level option rather than a parallel `getBytesNoTtl` entry
@@ -123,75 +149,93 @@ Three optional layers sit beside the raw-bytes/typed-JSON layer, all keyed off t
 ## Threat model / out of scope
 Path traversal via `kind`/`key` is the primary threat modeled: `segmentSafe` rejects any segment
 containing `/`, a leading dot, or `.`/`..`, checked on every public entry point, so a hostile/buggy
-key cannot escape `base`. Cross-process ingest locking is now modeled for the CAS/TTL write path
+key cannot escape `base`. Cross-process ingest locking is modeled for the CAS/TTL write path
 specifically (`lockKey`, an advisory `flock` — see above); plain `putBytes`/`getBytes` are still
 *not* locked by design (last-write-wins on `rename(2)`, never a torn file, just a benign overwrite
-race — unchanged from v1). Not modeled/out of scope: encryption/at-rest confidentiality (files are
+race). Not modeled/out of scope: encryption/at-rest confidentiality (files are
 plain bytes on disk, permissions are the caller's/filesystem's concern); mandatory (non-advisory)
 locking — `flock` is advisory, a process that ignores the API can still read/write past it, same
 caveat the option's own doc comment states; TTL/CAS interaction with each other (`casPutBytes` does
 not consult or clear the `.expiry` sidecar — they are independent, orthogonal sidecars, see above).
 
-## Verification
-Tests cover: the original set (put/get/delete/list round-trip, atomic temp+rename visibility,
-`segmentSafe` traversal rejection, typed-JSON round-trip, `listTyped` skipped-count) plus additions
-from this backlog batch — TTL present-then-expired-then-still-`list`-visible (deterministic via an
-injectable `Store.clock`/`ManualClock`, no real-time sleeps), `sweep` reaping only expired keys and
-leaving live-TTL/no-TTL keys + returning the exact count, CAS create/update/mismatch semantics
-end-to-end, a **positive control** proving a lost update silently happens with plain `putBytes` and
-is instead caught (`error.VersionMismatch`) with `casPutBytes` on the identical scenario, `lockKey`
-contention proven with an independent second file descriptor on the same lock path (flock is scoped
-to the open-file-description, so this genuinely exercises the same kernel behavior a second process
-would hit), `casPutBytes` proven to actually *block* on a lock held by another thread (timed
-against a background holder — a dropped `lockKey` call would make this test go from
-waits-~150ms to returns-in-microseconds), and (2026-08-18) `Store.ttl = false` proven to skip the
-`.expiry` probe via a corrupt sidecar the default (`ttl = true`) path chokes on parsing while the
-opted-out path ignores it entirely; `putWithTTL` proven to refuse with `error.TtlDisabled` on a
-`ttl = false` store and to leave neither a record nor a sidecar behind when refused; and the one
-hazard that remains reachable now that `putWithTTL` closes off self-inflicted resurrection — a
-record TTL'd *before* the store was reconfigured to `ttl = false` (or by another writer sharing
-`base`) is still served past its deadline, correctly absent under the default, and still reapable by
-`sweep` regardless of the flag. Run: `zig build test-filestore`.
+## What is deliberately not done
 
-**Audit 2026-10-04 (mutation).** 23 schemata mutants over `segmentSafe`, the name checks on
-every entry point, `putManyBytes` validation and directory sync, the TTL path (`getBytes`
-honouring expiry, `TtlDisabled`, the deadline, the `>=` edge, corrupt and whitespace-padded
-sidecars, `delete` clearing the sidecar), `sweep`, CAS, `list`'s filters, `listTyped`'s
-skip count and `versionOf`'s seed: 22 killed, 0 equivalent, 1 left alive. Alive: `sweep`'s
-re-check of the deadline after taking the key lock -- it only matters when a concurrent
-`putWithTTL` refreshes the deadline between the unlocked check and the lock, which no
-single-threaded test can place. Six survivors of the first run got one test: the 128-byte
-name edge, a bad key late in a `putManyBytes` batch writing nothing, `delete` removing the
-`.expiry` sidecar, a sidecar with a trailing newline, a subdirectory not listed as a key, and
-the version seed pinned to the bytes "filestor".
+- **Nested-directory key transforms** (diskv `Transform`): one flat directory per kind is the design;
+  any byte string becomes a flat key through `encodeKey`.
+- **An in-memory read cache** (diskv `CacheSizeMax`): compose `ramcache` over `getBytes`.
+- **An ordered key index** (diskv `Index`): an ordered index is `kv`/`kvtree`; diskv's is in memory and
+  rebuilt on start.
+- **Compression** (diskv `Compression`): the caller compresses with `zstd`/`brotli`; a store that
+  recompresses could not stream or `importFile` by `rename`.
+- **Mandatory (non-advisory) locking and encryption at rest:** see *Threat model / out of scope*.
+
+## Known limits
+
+Accepted, none a data-integrity defect of a returned write:
+
+- `delete` and `eraseKind` remove the record before its `.expiry` sidecar, so a crash between the two
+  leaves an orphan deadline that the next `putBytes` of that key inherits (`eraseKind` does not clean
+  such orphans); `eraseKind` itself is not atomic: a crash part-way leaves a subset deleted.
+- A moved `importFile` source's directory is not `fsync`ed.
+- Temp names are unique per PID namespace: two containers sharing a `base` (same pid, same counter)
+  could collide, and a temp is opened with `.truncate`, not exclusive create.
+- Crash-orphaned `.part` temps are never reclaimed.
+- `putWithTTL` renewal over an existing record is fail-closed only for a new key: a crash keeps the old
+  bytes under the new deadline.
+- `list`/`iterate` include expired-unswept records (by design: `sweep` relies on it).
+- `list`/`listTyped` materialise every name (`listTyped` every record's bytes) in the caller's arena;
+  `iterate`/`iteratePrefix` walk keys without that.
+- A FIFO planted at a record path blocks the opening call.
+- A caller that wraps `lockKey` around `casPutBytes`/`putWithTTL` self-deadlocks (the `flock` is per open
+  file description).
+- A typed `get`/`listTyped` into a self-recursive `T` recurses with the document depth (std.json);
+  `std.json.Value` parses iteratively but costs ~40 bytes per open container.
+
+## Verification
+
+Run `scripts/modtest filestore` (tests are disk-bound: every write is durable). Test classes:
+
+- **Layout and safety:** `segmentSafe` on every public entry point, the 128-byte name edge, `writeFileAtomic`,
+  hostile `base` contents (a directory where a record or sidecar is expected, foreign names, a corrupt or
+  oversized sidecar) never a crash, a stray `.part` temp invisible to `list`/`get`.
+- **Records:** put/get/delete/list round trips, typed JSON and `listTyped`'s skip count, `putManyBytes`
+  validating the whole batch before writing, the 64 MiB edge, `iterate`/`listPrefix`/`has`/`eraseKind`,
+  streaming `createTemp`/`commit`/`openRecord`, `importFile` (copy and move, permissions, non-regular
+  source refused), `encodeKey`/`decodeKey` round trip and uniqueness.
+- **Durability:** which operations sync the directory at each `Durability` level, with results identical
+  across levels; two pids never produce the same temp name (with the counter-only shape shown to collide
+  as the control).
+- **TTL, CAS, locking:** TTL present then expired then still `list`-visible under an injectable
+  `Store.clock`; `sweep` reaping only expired keys; `ttl = false` skipping the probe (observable through a
+  corrupt sidecar), `putWithTTL` refusing with `TtlDisabled`, and the pre-existing-sidecar hazard; CAS
+  create/update/mismatch with a positive control (plain `putBytes` loses the update, `casPutBytes`
+  catches it); `lockKey` contention through an independent file descriptor and a thread that holds the
+  lock; the crash-between-writes order of `putWithTTL`; a corrupt sidecar reading as no TTL.
+- **Fuzz:** one model harness, `ops`, run by testkit's deterministic driver as `FILESTORE_FUZZ`
+  (`src/fuzz_test.zig`): random sequences of every public `Store` operation against an in-memory model
+  of the documented semantics (including the surprising ones: `putBytes` keeps an old deadline, `list`
+  sees expired-unswept records, CAS compares against the live version), plus a fixed seed loop with
+  reach checks in every test run. Runs are disk-bound.
+- **Constant time:** n/a, file storage.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Bench:** `zig build bench-filestore` (`tools/bench.zig`, with a Go reference side driving diskv v3
+  through its public API) at equal durability levels; the figures are on the card's Performance line.
+
+## Open
+
+- The model fuzz harness injects no faults (a failing `fsync`, a full disk), so the failure paths are
+  unexercised.
+- `sweep`'s re-check of the deadline after taking the key lock is the one mutation survivor: it matters
+  only when a concurrent `putWithTTL` refreshes the deadline between the unlocked check and the lock,
+  which no single-threaded test can place.
 
 ## Backlog / deferred
 
-None open from the original v1 backlog — TTL/expiry, ETag/version CAS, and cross-process ingest
-locking are all implemented (see "TTL, CAS and cross-process locking" above). Possible future work,
-not currently planned: a `sweep`-all-kinds convenience (today `sweep` takes one `kind` at a time,
-matching `list`'s per-kind scoping); mandatory (non-advisory) locking; encryption at rest.
-
-- ~~Streaming read/write~~, ~~arbitrary keys~~ *(survey 2026-09-30)*: done 2026-11-01
-  (`createTemp`/`commit`/`openRecord`, `encodeKey`/`decodeKey`). Read cache: `ramcache` composes
-  over `getBytes` (see § Compared with).
-
-- **Review 2026-11-01 (independent, of `7aae3323`)** — fixed then: `importFile` refuses a non-regular
-  source (`error.NotAFile`), a CAS over an expired record drops the stale deadline, `KeyIterator`
-  stats DT_UNKNOWN entries, `openRecord` on a directory is `error.IsDir`. Left, LOW: `delete`/`eraseKind`
-  remove the record before its `.expiry` sidecar, so a crash between them leaves an orphan deadline the
-  next `putBytes` of that key inherits (and `eraseKind` never cleans orphans); a moved `importFile`
-  source's directory is not fsynced; temp names are unique per PID namespace only (two containers
-  sharing a `base` could collide; `.truncate`, not exclusive create); crash-orphaned `.part` temps
-  are never reclaimed; `putWithTTL` renewal is fail-closed only for a new key (a crash keeps the old
-  bytes under the new deadline); `list`/`iterate` include expired-unswept records (by design, `sweep`
-  relies on it). The model fuzz harness injects no faults (failure paths unexercised).
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, fix round) **`list`/`listTyped` materialize every name/item** into the caller's arena (iterator or paged form is the fix; `listTyped` keeps every record's bytes). Foreign file names that are not valid keys are no longer listed. (Fixed 2026-11-01: `delete` on a never-created kind returns `false`, not the directory fsync's `FileNotFound`.) A FIFO planted at a record path blocks the opening call. A caller wrapping `lockKey` around `casPutBytes`/`putWithTTL` self-deadlocks (the flock is per open file description). A typed `get`/`listTyped` into a self-recursive `T` recurses with the document depth (std.json); `std.json.Value` parses iteratively but costs ~40 bytes per open container.
-
-## Status
-`extract · posix · util · reentrant` · deps: none — canonical source is `pub const meta` in
-src/root.zig.
+- **`listTyped` iterator or paged form:** `listTyped` still materialises every record's bytes in the
+  caller's arena (keys have `iterate`/`iteratePrefix`).
+- **A `sweep`-all-kinds convenience** (today `sweep` takes one `kind`, matching `list`'s scoping). Not
+  planned.
 
 ## Anchoring
 

@@ -13,7 +13,7 @@ opt-in sidecar layers — see "TTL, CAS and locking" below.
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via
   `std.Io`). **Role:** util. **Concurrency:** reentrant — no shared state
   except a process-local atomic counter for ingest temp names.
-- **Deps:** none — std only.
+- **Deps:** `clock` (the `Store.clock` default); otherwise std only.
 
 Provenance: original work of the zig-libs authors (MIT). Atomic
 temp-then-rename writes and `segmentSafe` path validation (no JSON is ever
@@ -95,17 +95,18 @@ const k = try filestore.encodeKey(&kb, "alice@example.com"); // "alice_40example
 
 ## Design notes
 
-- **Crash safety.** Every write lands in a hidden `.<key>-<n>.part` temp
-  (`n` = a process-local atomic counter, so two writers in the same process
-  never collide on the same temp path) and is made visible by a single
-  `rename(2)`, with an `fsync` of the temp before it and of the directory
-  after. A crash mid-write leaves only an orphaned temp — never listed
+- **Crash safety.** Every write lands in a hidden `.<key>-<pid>-<n>.part` temp
+  (the process id and a process-local atomic counter, so two writers never
+  collide on the same temp path, in one process or two) and is made visible by
+  a single `rename(2)`, with (by default) an `fsync` of the temp before it and
+  of the directory after. A crash mid-write leaves only an orphaned temp — never listed
   (hidden files are skipped), never read (its name is not a valid key), never
   a torn live record — and a `putBytes` that returned is on stable media.
   Both `fsync`s matter and neither is implied by `rename`: without the first
   the directory entry can point at blocks that were never written, without
   the second the rename itself can be lost. Two `fsync`s per write is the
-  price; verify with `strace -e trace=rename,fsync` on the example. The same
+  price (`Store.durability` = `.data` or `.none` trades them away, see the API
+  snippet; atomicity stays); verify with `strace -e trace=rename,fsync` on the example. The same
   sequence is public as `writeFileAtomic(io, dir, sub_path, bytes, .{})` for a
   single file at a path of the caller's choosing (outside the kind/key layout).
 - **Path safety.** `kind` and `key` must each be a safe single segment
@@ -175,9 +176,9 @@ const k = try filestore.encodeKey(&kb, "alice@example.com"); // "alice_40example
   cost unless you touch TTL/CAS, and last-write-wins on the bare `rename(2)`
   (never a torn file) remains the documented behavior for them.
 
-## Backlog (deferred, not implemented)
+## Not provided
 
-None from the original v1 backlog — TTL/expiry, ETag/version CAS and
-cross-process locking (above) close it out. Not currently planned: a
-`sweep`-all-kinds convenience (today one `kind` at a time, like `list`);
-mandatory (non-advisory) locking; encryption at rest.
+Mandatory (non-advisory) locking, encryption at rest, nested-directory key
+transforms, a read cache and an ordered index (compose `ramcache`, `kv`/`kvtree`)
+are out; see `SPEC.md` *Threat model / out of scope*, *Compared with* and
+*Backlog / deferred*.
