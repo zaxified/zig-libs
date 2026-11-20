@@ -106,7 +106,9 @@ fn smallestFor(x: i128) ColumnType {
 
 /// polars' weak literal (D6): an integer literal that fits the column's width leaves it, one
 /// that does not widens it to the smaller type holding it; a float literal gives a Float32
-/// column Float32 and an integer one Float64.
+/// column Float32 and an integer one Float64. This is the rule of the frame arithmetic, which
+/// differs from `Expr`'s (`expr.weakJoin`) for an unsigned column: polars' `df + 1000` of a
+/// UInt8 column is Int16 here (the signed ladder), its `col + 1000` expression UInt16.
 fn literalMeet(op: ex.Binary, col: ColumnType, v: Value) ?ColumnType {
     if (!dtype.isWidth(col)) return null;
     if (op == .div) return switch (v) { // as `Expr`: a literal is weak, beside Float32 it stays Float32
@@ -373,10 +375,17 @@ fn xOf(v: Value) ?f64 {
 
 /// Fill the missing numbers of `col` from the present ones; a gap before the first or
 /// after the last present x stays null (polars; pandas' `limit_direction` default fills
-/// the trailing gap by repeating). The output is float.
+/// the trailing gap by repeating). The output is float. A text, bool, categorical, binary or
+/// nested column is `error.BadArgument`.
 pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!Frame {
     try checkRows(f);
     const ci = try mustIndex(f, spec.col);
+    // A text, bool, categorical, binary or nested column has no numbers to fill from (polars refuses
+    // it too): not an all-null float column.
+    switch (f.columns[ci].type) {
+        .text, .bool, .categorical, .binary, .list, .@"struct", .array => return error.BadArgument,
+        else => {},
+    }
     const bi: ?usize = if (spec.by) |b| try mustIndex(f, b) else null;
     var pts: std.ArrayList(Pt) = .empty;
     defer pts.deinit(a);
@@ -596,9 +605,12 @@ pub const DynamicSpec = struct {
     /// labelled by their first day, `n` must be 1), `ME`/`M`, `QE`/`Q`, `YE`/`Y`/`A`
     /// (calendar bins labelled by their last day), `W` and `W-SUN`..`W-SAT` (weeks
     /// ending on that day, labelled by it). `B` (business days) and other anchors are
-    /// `error.BadArgument`. `closed`, `label` and `start_by` are then not read; the bins
-    /// of the end-labelled rules are whole days, so a time on the last day belongs to
-    /// the bin ending on it, as pandas.
+    /// `error.BadArgument`. With a `rule`, `closed` and `label` are read by the rules that
+    /// are not end-labelled (`ME`, `QE`, `YE`, `W-*` fix them: left closed, labelled by the last
+    /// day) and `start_by` only by `D` and the fixed-length rules (the weekly rules set their own
+    /// weekday); `origin` is read by the fixed-length bins only (calendar bins and a weekday
+    /// `start_by` sit on the calendar). The bins of the end-labelled rules are whole days, so a
+    /// time on the last day belongs to the bin ending on it, as pandas.
     rule: ?[]const u8 = null,
     /// polars `period`: the window's length when it is not `every` (windows then overlap
     /// or leave gaps); null = `every`.
@@ -923,6 +935,7 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
     defer rows_idx.deinit(a);
     var lowers: std.ArrayList(i64) = .empty;
     defer lowers.deinit(a);
+    var scanned: usize = 0;
     for (ts, 0..) |t_opt, ri| {
         const t = t_opt orelse continue;
         const g = ids[ri];
@@ -930,6 +943,9 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
         var k = gr.indexAtOrBefore(t, false) orelse return error.TooLarge;
         var span: usize = 0;
         while (k >= k0[g]) : (k -= 1) {
+            // Windows scanned and excluded by `closed` count too: rows x span is capped as the pairs are.
+            scanned += 1;
+            if (scanned > 4 * max_dynamic_memberships) return error.TooLarge;
             // Same answer as the first row's `indexAtOrBefore`: an instant out of range is
             // `TooLarge`, not a row that silently has no window.
             const lo = gr.lower(k) orelse return error.TooLarge;

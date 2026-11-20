@@ -100,7 +100,8 @@ pub fn rsplitLiteral(a: std.mem.Allocator, t: []const u8, by: []const u8, limit:
     defer pieces.deinit(a);
     const max = limit orelse std.math.maxInt(usize);
     var end = t.len;
-    while (pieces.items.len + 1 < max) {
+    // An empty `by` matches everywhere (it would never run out of pieces): none is cut.
+    while (by.len != 0 and pieces.items.len + 1 < max) {
         const hit = std.mem.findLast(u8, t[0..end], by) orelse break;
         try pieces.append(a, .{ .text = t[hit + by.len .. end] });
         end = hit;
@@ -301,6 +302,8 @@ pub fn wrap(a: std.mem.Allocator, t: []const u8, width: usize, break_long_words:
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     var col: usize = 0;
+    // Invalid UTF-8 counts bytes (as `exprfn.charStarts`), valid text code points.
+    const valid = std.unicode.utf8ValidateSlice(t);
     for (t) |c| {
         switch (c) {
             '\t' => {
@@ -315,7 +318,7 @@ pub fn wrap(a: std.mem.Allocator, t: []const u8, width: usize, break_long_words:
             },
             else => {
                 try buf.append(a, c);
-                if (c & 0xC0 != 0x80) col += 1;
+                if (!valid or c & 0xC0 != 0x80) col += 1;
             },
         }
     }

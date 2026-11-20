@@ -1682,7 +1682,10 @@ const Compiler = struct {
             },
             .match_regex => |r| {
                 _ = try c.matcher(r.pattern); // the user's pattern alone must be valid
-                const anchored = try c.a.print("\\A(?:{s}){s}", .{ r.pattern, if (r.full) "\\z" else "" });
+                // A `(?x)` pattern may end in a `#` comment, which would swallow the wrapper's `)`: a newline
+                // ends it (and is ignored white space in that mode).
+                const nl: []const u8 = if (hasExtendedFlag(r.pattern)) "\n" else "";
+                const anchored = try c.a.print("\\A(?:{s}{s}){s}", .{ r.pattern, nl, if (r.full) "\\z" else "" });
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .regex = .{ .op = .contains, .m = try c.matcher(anchored), .groups = &.{} } }, 1);
             },
@@ -1901,6 +1904,24 @@ const Compiler = struct {
         }
     }
 };
+
+/// Whether `pat` turns on the verbose flag somewhere: a group `(?...x...)` or `(?...x...:`
+/// with `x` among the letters right after `(?` (so `(?-x)` does not count).
+fn hasExtendedFlag(pat: []const u8) bool {
+    var i: usize = 0;
+    while (i + 2 < pat.len) : (i += 1) {
+        if (pat[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (pat[i] != '(' or pat[i + 1] != '?') continue;
+        var j = i + 2;
+        while (j < pat.len and std.ascii.isAlphabetic(pat[j])) : (j += 1) {
+            if (pat[j] == 'x') return true;
+        }
+    }
+    return false;
+}
 
 /// `error.BadExpr` when a name appears twice.
 fn noDuplicateNames(a: std.mem.Allocator, names: []const []const u8) Error!void {
@@ -2870,7 +2891,10 @@ fn elemFill(v: *ElemVec, a: std.mem.Allocator, one_a: std.mem.Allocator, f: Fram
 fn winCells(a: std.mem.Allocator, cells: []const Value, op: wn.WindowOp, out: []Value) Error!void {
     wn.cellVector(a, cells, op, out) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.TooLarge,
+        error.TooLarge => error.TooLarge,
+        error.NoSuchColumn => error.NoSuchColumn,
+        // An option the window kernel refuses (a decay, a fill): the expression is wrong, nothing is too large.
+        error.BadOption, error.InvalidDecay, error.BadFill => error.BadExpr,
     };
 }
 
@@ -3135,6 +3159,18 @@ fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
         .convert_time_zone => |r| r.zone,
         .replace_time_zone => |r| r.zone,
         .element_op => |r| zoneOf(f, r.x),
+        // A zoned element or field taken out of a list or struct keeps the zone its schema declares.
+        .list => |l| switch (l.op) {
+            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| (if (c.type == .timestamp) c.time_zone else null) else null,
+            else => null,
+        },
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| (if (c.type == .timestamp) c.time_zone else null) else null,
+        // `min`/`max` of instants is one of them; the other folds are no instant.
+        .fold => |r| blk: {
+            if (r.op != .min and r.op != .max) break :blk null;
+            for (r.parts) |*x| if (zoneOf(f, x)) |z| break :blk z;
+            break :blk null;
+        },
         .offset_by => |r| zoneOf(f, r.x),
         .truncate => |r| zoneOf(f, r.x),
         .add_business_days => |r| zoneOf(f, r.x),

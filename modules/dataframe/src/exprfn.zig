@@ -232,7 +232,8 @@ fn erfcFraction(ax: f64) f64 {
 pub fn erfc(x: f64) f64 {
     if (std.math.isNan(x)) return x;
     const ax = @abs(x);
-    const r: f64 = if (ax < 2.0) 1 - erfSeries(ax) else if (ax < 27.0) erfcFraction(ax) else 0;
+    // The series is `erf`, and `1 - erf` loses digits as erfc shrinks: from 1 up (erfc < 0.16) the fraction answers.
+    const r: f64 = if (ax < 1.0) 1 - erfSeries(ax) else if (ax < 27.0) erfcFraction(ax) else 0;
     return if (x < 0) 2 - r else r;
 }
 
@@ -268,20 +269,22 @@ pub fn eqMissing(l: Value, r: Value) bool {
 // ── text ────────────────────────────────────────────────────────────────────
 
 /// Byte offset of each character's start, and the end: code points for valid UTF-8,
-/// bytes otherwise.
-pub fn charStarts(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]usize {
-    var out: std.ArrayList(usize) = .empty;
+/// bytes otherwise (so a slice of an invalid text can cut inside a sequence: the text has
+/// no characters to keep whole). Four bytes per character, a text past 4 GiB is out of memory.
+pub fn charStarts(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]u32 {
+    if (t.len >= std.math.maxInt(u32)) return error.OutOfMemory;
+    var out: std.ArrayList(u32) = .empty;
     try out.ensureTotalCapacity(a, t.len + 1);
     if (std.unicode.utf8ValidateSlice(t)) {
         var i: usize = 0;
         while (i < t.len) {
-            out.appendAssumeCapacity(i);
+            out.appendAssumeCapacity(@intCast(i));
             i += std.unicode.utf8ByteSequenceLength(t[i]) catch 1;
         }
     } else {
-        for (0..t.len) |i| out.appendAssumeCapacity(i);
+        for (0..t.len) |i| out.appendAssumeCapacity(@intCast(i));
     }
-    out.appendAssumeCapacity(t.len);
+    out.appendAssumeCapacity(@intCast(t.len));
     // Owned, so `free` gets the length it was given (the capacity was the byte count; a
     // shorter slice freed under `expr`'s budget drifted its count, review R2 L3).
     return out.toOwnedSlice(a);
