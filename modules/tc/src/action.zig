@@ -184,6 +184,14 @@ pub const kind_mirred = "mirred";
 pub const kind_police = "police";
 pub const kind_skbedit = "skbedit";
 pub const kind_vlan = "vlan";
+pub const kind_connmark = "connmark";
+pub const kind_csum = "csum";
+pub const kind_sample = "sample";
+pub const kind_tunnel_key = "tunnel_key";
+pub const kind_mpls = "mpls";
+pub const kind_nat = "nat";
+pub const kind_pedit = "pedit";
+pub const kind_ct = "ct";
 
 /// `TCA_ACT_MAX_PRIO` — the kernel's cap on actions in one list.
 pub const max_actions = 32;
@@ -208,6 +216,8 @@ pub const tc_mirred_len = tc_gen_len + 8;
 pub const tc_vlan_len = tc_gen_len + 4;
 /// `sizeof(struct tc_skbedit)` — nothing but the prologue.
 pub const tc_skbedit_len = tc_gen_len;
+/// `SKBEDIT_F_INHERITDSFIELD` — a bit of the 64-bit `TCA_SKBEDIT_FLAGS`.
+pub const SKBEDIT_F_INHERITDSFIELD: u64 = 0x20;
 /// `sizeof(struct tc_police)` — see `Police` for the field order (it is *not*
 /// a `tc_gen` prologue plus extras).
 pub const tc_police_len = 56;
@@ -293,8 +303,11 @@ pub const EncodeError = std.mem.Allocator.Error || error{
     TooManyActions,
     /// A `TCA_ACT_COOKIE` longer than `TC_COOKIE_MAX_SIZE`.
     CookieTooLong,
-    /// `police` without a rate.
+    /// `police` without a rate (`rate`, `pkt_rate` or `avrate`).
     MissingRate,
+    /// `police` with both a byte `rate` and a packet `pkt_rate` — `tc` and
+    /// the kernel allow one.
+    RateConflict,
     /// `police` without a burst — the kernel has no sensible default.
     MissingBurst,
     /// `police` with a `peakrate` but no `mtu` (`tc` rejects this too).
@@ -363,6 +376,7 @@ pub const Gact = struct {
     random: ?GactProb = null,
     /// `TCA_ACT_COOKIE`, ≤ 16 opaque bytes echoed back on dump.
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 /// Wire readback of a gact action's options.
@@ -404,6 +418,7 @@ pub const Mirred = struct {
     /// what `tc` sends.
     action: ?Verdict = null,
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 /// Wire readback of a mirred action's options.
@@ -425,11 +440,12 @@ pub const MirredWire = struct {
 /// Rates are **bytes per second** and `burst`/`mtu` are **bytes**, converted
 /// to psched ticks with the same `ratespec` arithmetic htb and tbf use.
 pub const Police = struct {
-    /// Committed rate in bytes/s. Required.
-    rate: u64,
-    /// Bucket depth in bytes (`burst`/`buffer`). Required — the kernel has no
-    /// default.
-    burst: u64,
+    /// Committed rate in bytes/s. Required unless `pkt_rate` or `avrate` is
+    /// given.
+    rate: u64 = 0,
+    /// Bucket depth in bytes (`burst`/`buffer`). Required with `rate` — the
+    /// kernel has no default.
+    burst: u64 = 0,
     /// Optional peak rate in bytes/s; needs `mtu`.
     peakrate: u64 = 0,
     /// Peak-bucket MTU in bytes. Sent verbatim in `tc_police.mtu` (unlike
@@ -453,7 +469,18 @@ pub const Police = struct {
     /// Force the rate/peak table cell shift; null derives it from `mtu`.
     cell_log: ?u8 = null,
     pcell_log: ?u8 = null,
+    /// `pkts_rate N` — a packet-per-second policer (`TCA_POLICE_PKTRATE64`)
+    /// instead of a byte rate; give `rate = 0` and a `pkt_burst`.
+    pkt_rate: u64 = 0,
+    /// `pkts_burst N` — the bucket depth in packets, sent as ticks
+    /// (`TCA_POLICE_PKTBURST64`).
+    pkt_burst: u64 = 0,
+    /// `avrate N` — the average-rate limit in bytes per second
+    /// (`TCA_POLICE_AVRATE`), which `tc` sends alone (the kernel needs a
+    /// rate estimator for it). With it, `rate` and `burst` may stay 0.
+    avrate: u32 = 0,
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 /// Wire readback of a police action's options.
@@ -478,6 +505,12 @@ pub const PoliceWire = struct {
     peakrate64: u64 = 0,
     /// `TCA_POLICE_RESULT` — the notexceed verdict, when the kernel sent one.
     notexceed: ?Verdict = null,
+    /// `TCA_POLICE_AVRATE`.
+    avrate: ?u32 = null,
+    /// `TCA_POLICE_PKTRATE64`, packets per second.
+    pkt_rate: ?u64 = null,
+    /// `TCA_POLICE_PKTBURST64`, in psched ticks.
+    pkt_burst: ?u64 = null,
 };
 
 // ── skbedit ─────────────────────────────────────────────────────────────────
@@ -496,6 +529,12 @@ pub const Skbedit = struct {
     priority: ?Handle = null,
     /// `mark N` — the firewall mark.
     mark: ?u32 = null,
+    /// `mark N/MASK` — the mask half (`TCA_SKBEDIT_MASK`): only the bits in
+    /// the mask are replaced. Sent right after the mark.
+    mask: ?u32 = null,
+    /// `inheritdsfield` — take the skb priority from the packet's DS field
+    /// (`SKBEDIT_F_INHERITDSFIELD` in `TCA_SKBEDIT_FLAGS`).
+    inherit_dsfield: bool = false,
     /// `queue_mapping N` — the TX queue.
     queue_mapping: ?u16 = null,
     /// `ptype host|broadcast|multicast|otherhost` (`PACKET.*`).
@@ -504,12 +543,14 @@ pub const Skbedit = struct {
     /// skbedit is a mid-list action, so the verdict defaults to `.pipe`.
     action: Verdict = .pipe,
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 /// Wire readback of an skbedit action's options.
 pub const SkbeditWire = struct {
     priority: ?Handle = null,
     mark: ?u32 = null,
+    inherit_dsfield: bool = false,
     queue_mapping: ?u16 = null,
     ptype: ?u16 = null,
     mask: ?u32 = null,
@@ -538,10 +579,15 @@ pub const Vlan = struct {
     proto: ?u16 = null,
     /// `priority N` — the 3-bit PCP.
     prio: ?u8 = null,
+    /// `push_eth dst_mac M` / `src_mac M` — the Ethernet header a
+    /// `.push_eth` action puts on a packet that has none.
+    eth_dst: ?[6]u8 = null,
+    eth_src: ?[6]u8 = null,
     index: u32 = 0,
     /// vlan is a mid-list action, so the verdict defaults to `.pipe`.
     action: Verdict = .pipe,
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 /// Wire readback of a vlan action's options.
@@ -550,6 +596,588 @@ pub const VlanWire = struct {
     id: ?u16 = null,
     proto: ?u16 = null,
     prio: ?u8 = null,
+    eth_dst: ?[6]u8 = null,
+    eth_src: ?[6]u8 = null,
+};
+
+// ── per-action attributes shared by every kind ──────────────────────────────
+
+/// `struct nla_bitfield32` — a value and the selector naming which bits of it
+/// the kernel should look at.
+pub const Bitfield32 = struct {
+    value: u32,
+    selector: u32,
+
+    fn encode(b: Bitfield32) [8]u8 {
+        var out: [8]u8 = undefined;
+        std.mem.writeInt(u32, out[0..4], b.value, native_endian);
+        std.mem.writeInt(u32, out[4..8], b.selector, native_endian);
+        return out;
+    }
+
+    fn decode(data: []const u8) ?Bitfield32 {
+        if (data.len < 8) return null;
+        return .{
+            .value = std.mem.readInt(u32, data[0..4], native_endian),
+            .selector = std.mem.readInt(u32, data[4..8], native_endian),
+        };
+    }
+};
+
+/// `TCA_ACT_FLAGS_*` — bits of `Extra.flags`.
+pub const TCA_ACT_FLAGS_BIT = struct {
+    pub const NO_PERCPU_STATS: u32 = 1 << 0;
+    pub const SKIP_HW: u32 = 1 << 1;
+    pub const SKIP_SW: u32 = 1 << 2;
+};
+
+/// `TCA_ACT_HW_STATS_*` — bits of `Extra.hw_stats`.
+pub const TCA_ACT_HW_STATS_BIT = struct {
+    pub const IMMEDIATE: u32 = 1 << 0;
+    pub const DELAYED: u32 = 1 << 1;
+    pub const ANY: u32 = IMMEDIATE | DELAYED;
+};
+
+/// The action-level attributes every kind accepts next to its options, in
+/// the order `tc` sends them (after the cookie): `TCA_ACT_HW_STATS`, then
+/// `TCA_ACT_FLAGS`. `tc … skip_hw` sends `flags = {2, 2}`; `hw_stats
+/// immediate` sends `{1, 1}`; `hw_stats disabled` sends `{0, 0}`.
+pub const Extra = struct {
+    flags: ?Bitfield32 = null,
+    hw_stats: ?Bitfield32 = null,
+};
+
+// ── connmark ────────────────────────────────────────────────────────────────
+
+/// `TCA_CONNMARK_*`.
+pub const TCA_CONNMARK = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const PAD: u16 = 3;
+};
+
+/// `sizeof(struct tc_connmark)` — prologue + `zone` + 2 bytes of padding.
+pub const tc_connmark_len = tc_gen_len + 4;
+
+/// **connmark** — restore the packet mark from the conntrack entry.
+pub const Connmark = struct {
+    /// `zone N` — the conntrack zone to look the entry up in.
+    zone: u16 = 0,
+    index: u32 = 0,
+    /// `tc` sends `TC_ACT_PIPE` for a connmark that names a zone.
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const ConnmarkWire = struct {
+    zone: u16 = 0,
+};
+
+// ── csum ────────────────────────────────────────────────────────────────────
+
+/// `TCA_CSUM_*`.
+pub const TCA_CSUM = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const PAD: u16 = 3;
+};
+
+/// `TCA_CSUM_UPDATE_FLAG_*` — which checksums `csum` recomputes.
+pub const CSUM_FLAG = struct {
+    pub const IPV4HDR: u32 = 1;
+    pub const ICMP: u32 = 2;
+    pub const IGMP: u32 = 4;
+    pub const TCP: u32 = 8;
+    pub const UDP: u32 = 16;
+    pub const UDPLITE: u32 = 32;
+    pub const SCTP: u32 = 64;
+};
+
+/// `sizeof(struct tc_csum)` — prologue + `update_flags`.
+pub const tc_csum_len = tc_gen_len + 4;
+
+/// **csum** — recompute checksums after a rewrite (`tc … action csum ip4h
+/// udp`).
+pub const Csum = struct {
+    /// `CSUM_FLAG.*` bits.
+    update_flags: u32,
+    index: u32 = 0,
+    action: Verdict = .ok,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const CsumWire = struct {
+    update_flags: u32 = 0,
+};
+
+// ── sample ──────────────────────────────────────────────────────────────────
+
+/// `TCA_SAMPLE_*`.
+pub const TCA_SAMPLE = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const RATE: u16 = 3;
+    pub const TRUNC_SIZE: u16 = 4;
+    pub const PSAMPLE_GROUP: u16 = 5;
+    pub const PAD: u16 = 6;
+};
+
+/// **sample** — copy 1 in `rate` packets to a psample group.
+pub const Sample = struct {
+    /// `rate N` — one packet in N.
+    rate: u32,
+    /// `group N` — the psample group.
+    group: u32,
+    /// `trunc N` — truncate the sampled copy to N bytes.
+    trunc_size: ?u32 = null,
+    index: u32 = 0,
+    /// sample is a mid-list action: `tc` sends `TC_ACT_PIPE`.
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const SampleWire = struct {
+    rate: ?u32 = null,
+    trunc_size: ?u32 = null,
+    group: ?u32 = null,
+};
+
+// ── tunnel_key ──────────────────────────────────────────────────────────────
+
+/// `TCA_TUNNEL_KEY_*`.
+pub const TCA_TUNNEL_KEY = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const ENC_IPV4_SRC: u16 = 3;
+    pub const ENC_IPV4_DST: u16 = 4;
+    pub const ENC_IPV6_SRC: u16 = 5;
+    pub const ENC_IPV6_DST: u16 = 6;
+    pub const ENC_KEY_ID: u16 = 7;
+    pub const PAD: u16 = 8;
+    pub const ENC_DST_PORT: u16 = 9;
+    pub const NO_CSUM: u16 = 10;
+    pub const ENC_OPTS: u16 = 11;
+    pub const ENC_TOS: u16 = 12;
+    pub const ENC_TTL: u16 = 13;
+    pub const NO_FRAG: u16 = 14;
+};
+
+/// `sizeof(struct tc_tunnel_key)` — prologue + `t_action`.
+pub const tc_tunnel_key_len = tc_gen_len + 4;
+
+/// `tc_tunnel_key.t_action`.
+pub const TunnelKeyAction = enum(i32) {
+    /// `TCA_TUNNEL_KEY_ACT_SET` — attach tunnel metadata to the packet.
+    set = 1,
+    /// `TCA_TUNNEL_KEY_ACT_RELEASE` — drop it (`tc … tunnel_key unset`).
+    release = 2,
+    _,
+};
+
+/// **tunnel_key** — set or release the encapsulation metadata of a packet
+/// (the transmit side of a metadata-mode vxlan/geneve/gre device).
+pub const TunnelKey = struct {
+    t_action: TunnelKeyAction = .set,
+    /// `src_ip` / `dst_ip` (IPv4), network byte order as written.
+    src_ip4: ?[4]u8 = null,
+    dst_ip4: ?[4]u8 = null,
+    src_ip6: ?[16]u8 = null,
+    dst_ip6: ?[16]u8 = null,
+    /// `id N` — the tunnel key / VNI, sent big-endian.
+    key_id: ?u32 = null,
+    /// `dst_port N`, sent big-endian.
+    dst_port: ?u16 = null,
+    tos: ?u8 = null,
+    ttl: ?u8 = null,
+    /// `nocsum` / `csum`. `tc` always sends `TCA_TUNNEL_KEY_NO_CSUM`: 0 when
+    /// the outer checksum is wanted, 1 for `nocsum`.
+    no_csum: bool = false,
+    /// `nofrag` — `TCA_TUNNEL_KEY_NO_FRAG` (a flag attribute).
+    no_frag: bool = false,
+    /// A pre-encoded `TCA_TUNNEL_KEY_ENC_OPTS` payload (the geneve / vxlan /
+    /// erspan option nest, which `tc` builds from `geneve_opts`,
+    /// `vxlan_opts` and `erspan_opts`). Not decoded on readback.
+    enc_opts: []const u8 = &.{},
+    index: u32 = 0,
+    /// tunnel_key is a mid-list action: `tc` sends `TC_ACT_PIPE`.
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const TunnelKeyWire = struct {
+    t_action: TunnelKeyAction = @fromBackingInt(@intCast(0)),
+    src_ip4: ?[4]u8 = null,
+    dst_ip4: ?[4]u8 = null,
+    src_ip6: ?[16]u8 = null,
+    dst_ip6: ?[16]u8 = null,
+    key_id: ?u32 = null,
+    dst_port: ?u16 = null,
+    tos: ?u8 = null,
+    ttl: ?u8 = null,
+    no_csum: ?bool = null,
+    no_frag: bool = false,
+};
+
+// ── mpls ────────────────────────────────────────────────────────────────────
+
+/// `TCA_MPLS_*`.
+pub const TCA_MPLS = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const PAD: u16 = 3;
+    pub const PROTO: u16 = 4;
+    pub const LABEL: u16 = 5;
+    pub const TC: u16 = 6;
+    pub const TTL: u16 = 7;
+    pub const BOS: u16 = 8;
+};
+
+/// `sizeof(struct tc_mpls)` — prologue + `m_action`.
+pub const tc_mpls_len = tc_gen_len + 4;
+
+/// `tc_mpls.m_action` — `TCA_MPLS_ACT_*`.
+pub const MplsAction = enum(i32) {
+    pop = 1,
+    push = 2,
+    modify = 3,
+    dec_ttl = 4,
+    mac_push = 5,
+    _,
+};
+
+/// **mpls** — push, pop or modify an MPLS label stack entry.
+pub const Mpls = struct {
+    m_action: MplsAction,
+    /// `protocol` — the ethertype of the payload (pop) or of the stack (push),
+    /// host order, sent big-endian.
+    proto: ?u16 = null,
+    label: ?u32 = null,
+    tc: ?u8 = null,
+    ttl: ?u8 = null,
+    bos: ?u8 = null,
+    index: u32 = 0,
+    /// mpls is a mid-list action: `tc` sends `TC_ACT_PIPE`.
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const MplsWire = struct {
+    m_action: MplsAction = @fromBackingInt(@intCast(0)),
+    proto: ?u16 = null,
+    label: ?u32 = null,
+    tc: ?u8 = null,
+    ttl: ?u8 = null,
+    bos: ?u8 = null,
+};
+
+// ── nat ─────────────────────────────────────────────────────────────────────
+
+/// `TCA_NAT_*`.
+pub const TCA_NAT = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const PAD: u16 = 3;
+};
+
+/// `sizeof(struct tc_nat)` — prologue + `old_addr`, `new_addr`, `mask`,
+/// `flags`.
+pub const tc_nat_len = tc_gen_len + 16;
+
+/// `TCA_NAT_FLAG_EGRESS`.
+pub const TCA_NAT_FLAG_EGRESS: u32 = 1;
+
+/// **nat** — stateless IPv4 NAT of one address or prefix (`tc … action nat
+/// ingress|egress OLD[/PLEN] NEW`).
+pub const Nat = struct {
+    /// The address (prefix) to rewrite, network byte order as written.
+    old_addr: [4]u8,
+    new_addr: [4]u8,
+    /// The prefix mask as an address (`/24` is `255.255.255.0`); `tc` sends
+    /// the all-ones mask for a bare address.
+    mask: [4]u8 = .{ 255, 255, 255, 255 },
+    /// `egress` rewrites the source address, `ingress` (false) the
+    /// destination.
+    egress: bool = false,
+    index: u32 = 0,
+    action: Verdict = .ok,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const NatWire = struct {
+    old_addr: [4]u8 = @splat(0),
+    new_addr: [4]u8 = @splat(0),
+    mask: [4]u8 = @splat(0),
+    egress: bool = false,
+};
+
+// ── pedit ───────────────────────────────────────────────────────────────────
+
+/// `TCA_PEDIT_*`.
+pub const TCA_PEDIT = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const PAD: u16 = 3;
+    pub const PARMS_EX: u16 = 4;
+    pub const KEYS_EX: u16 = 5;
+    pub const KEY_EX: u16 = 6;
+};
+
+/// `TCA_PEDIT_KEY_EX_*`.
+pub const TCA_PEDIT_KEY_EX = struct {
+    pub const HTYPE: u16 = 1;
+    pub const CMD: u16 = 2;
+};
+
+/// `sizeof(struct tc_pedit_sel)` before its keys — prologue, `nkeys`,
+/// `flags`, two bytes of padding.
+pub const tc_pedit_sel_len = tc_gen_len + 4;
+/// `sizeof(struct tc_pedit_key)`.
+pub const tc_pedit_key_len = 24;
+/// The most keys one pedit action may carry (`nkeys` is a `u8`).
+pub const max_pedit_keys = 255;
+/// How many keys a decoded pedit action keeps (the rest are counted in
+/// `PeditWire.nkeys`).
+pub const max_pedit_keys_decoded = 8;
+
+/// `enum pedit_header_type` — which header an extended key's offset is
+/// relative to.
+pub const PeditHdr = enum(u16) {
+    network = 0,
+    eth = 1,
+    ip4 = 2,
+    ip6 = 3,
+    tcp = 4,
+    udp = 5,
+    _,
+};
+
+/// `enum pedit_cmd`.
+pub const PeditCmd = enum(u16) {
+    set = 0,
+    add = 1,
+    _,
+};
+
+/// One `struct tc_pedit_key` plus its extended-key attributes: the kernel
+/// computes `word = (word & mask) ^ val` (or an add for `.add`) on the
+/// 32-bit word at `off` bytes into the header.
+///
+/// `mask` and `val` are the numbers as read **big-endian off the packet**
+/// (first byte most significant): `ip dst set 10.1.2.3` is `val =
+/// 0x0a010203, mask = 0` at `off = 16`. A set bit in `mask` KEEPS that bit.
+pub const PeditKey = struct {
+    htype: PeditHdr = .network,
+    cmd: PeditCmd = .set,
+    mask: u32,
+    val: u32,
+    off: u32,
+    at: u32 = 0,
+    offmask: u32 = 0,
+    shift: u32 = 0,
+};
+
+pub const PeditMungeError = error{
+    /// The output slice is too small for the words the range covers.
+    TooManyKeys,
+    /// `retain` has a different length than `data`.
+    BadRetain,
+};
+
+/// Split a byte-range edit into the 32-bit-word keys the kernel wants —
+/// what `tc … pedit munge ip6 dst set 2001:db8::1` does. `data` is written at
+/// byte offset `off` of the header `htype` names (`cmd` is `.set` or `.add`);
+/// `retain` (same length as `data`, default all ones) is the `retain MASK`
+/// modifier: only those bits of `data` are changed. Returns the filled prefix
+/// of `out`.
+pub fn peditMunge(
+    out: []PeditKey,
+    htype: PeditHdr,
+    cmd: PeditCmd,
+    off: u32,
+    data: []const u8,
+    retain: ?[]const u8,
+) PeditMungeError![]PeditKey {
+    if (retain) |r| if (r.len != data.len) return error.BadRetain;
+    if (data.len == 0) return out[0..0];
+    const first = off & ~@as(u32, 3);
+    const last = (off + @as(u32, @intCast(data.len)) - 1) & ~@as(u32, 3);
+    const words = (last - first) / 4 + 1;
+    if (words > out.len) return error.TooManyKeys;
+    var i: usize = 0;
+    while (i < words) : (i += 1) {
+        var keep: [4]u8 = @splat(0xff);
+        var val: [4]u8 = @splat(0);
+        const word_off = first + @as(u32, @intCast(i)) * 4;
+        for (0..4) |b| {
+            const pos = word_off + @as(u32, @intCast(b));
+            if (pos < off or pos >= off + data.len) continue;
+            const idx = pos - off;
+            const r: u8 = if (retain) |rr| rr[idx] else 0xff;
+            keep[b] = ~r;
+            val[b] = data[idx] & r;
+        }
+        out[i] = .{
+            .htype = htype,
+            .cmd = cmd,
+            .mask = std.mem.readInt(u32, &keep, .big),
+            .val = std.mem.readInt(u32, &val, .big),
+            .off = word_off,
+        };
+    }
+    return out[0..words];
+}
+
+/// **pedit** — edit packet header words in place.
+pub const Pedit = struct {
+    keys: []const PeditKey,
+    /// `true` (the default, `tc … pedit ex …`) sends `TCA_PEDIT_PARMS_EX`
+    /// plus a `TCA_PEDIT_KEYS_EX` list naming each key's header type and
+    /// command; `false` is the legacy `TCA_PEDIT_PARMS` (set only, `htype`
+    /// and `cmd` ignored, offsets relative to the network header).
+    extended: bool = true,
+    index: u32 = 0,
+    /// `tc`'s default for pedit is `TC_ACT_OK`.
+    action: Verdict = .ok,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const PeditWire = struct {
+    /// The key count the kernel reported (may exceed `keys.len`).
+    nkeys: u8 = 0,
+    flags: u8 = 0,
+    /// The first `max_pedit_keys_decoded` keys; `htype`/`cmd` come from
+    /// `TCA_PEDIT_KEYS_EX` (network / set when it is absent).
+    keys: [max_pedit_keys_decoded]PeditKey = @splat(.{ .mask = 0, .val = 0, .off = 0 }),
+    /// How many entries of `keys` are filled.
+    len: u8 = 0,
+    extended: bool = false,
+};
+
+// ── ct ──────────────────────────────────────────────────────────────────────
+
+/// `TCA_CT_*`.
+pub const TCA_CT = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const ACTION: u16 = 3;
+    pub const ZONE: u16 = 4;
+    pub const MARK: u16 = 5;
+    pub const MARK_MASK: u16 = 6;
+    pub const LABELS: u16 = 7;
+    pub const LABELS_MASK: u16 = 8;
+    pub const NAT_IPV4_MIN: u16 = 9;
+    pub const NAT_IPV4_MAX: u16 = 10;
+    pub const NAT_IPV6_MIN: u16 = 11;
+    pub const NAT_IPV6_MAX: u16 = 12;
+    pub const NAT_PORT_MIN: u16 = 13;
+    pub const NAT_PORT_MAX: u16 = 14;
+    pub const PAD: u16 = 15;
+    pub const HELPER_NAME: u16 = 16;
+    pub const HELPER_FAMILY: u16 = 17;
+    pub const HELPER_PROTO: u16 = 18;
+};
+
+/// `TCA_CT_ACT_*` — bits of `Ct.ct_action`.
+pub const CT_ACT = struct {
+    pub const COMMIT: u16 = 1 << 0;
+    pub const FORCE: u16 = 1 << 1;
+    pub const CLEAR: u16 = 1 << 2;
+    pub const NAT: u16 = 1 << 3;
+    pub const NAT_SRC: u16 = 1 << 4;
+    pub const NAT_DST: u16 = 1 << 5;
+};
+
+/// `sizeof(struct tc_ct)` — nothing but the prologue.
+pub const tc_ct_len = tc_gen_len;
+
+/// Longest `HELPER_NAME` kept on readback (`NF_CT_HELPER_NAME_LEN`).
+pub const ct_helper_name_max = 16;
+
+/// The `helper FAMILY-PROTO-NAME` modifier.
+pub const CtHelper = struct {
+    /// `AF_INET` (2) or `AF_INET6` (10).
+    family: u8,
+    /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17).
+    proto: u8,
+    name: []const u8,
+};
+
+/// **ct** — connection tracking: `tc … action ct commit zone 5 mark 7/0xff`,
+/// `ct nat`, `ct clear`.
+pub const Ct = struct {
+    /// `CT_ACT.*` bits. `tc ct commit` is `COMMIT`, `ct clear` is `CLEAR`,
+    /// `ct nat` is `NAT`; `commit nat src` adds `NAT | NAT_SRC`.
+    ct_action: u16 = 0,
+    zone: ?u16 = null,
+    mark: ?u32 = null,
+    mark_mask: ?u32 = null,
+    /// `label LABEL/MASK`, both 128 bits as sent (no byte swapping).
+    labels: ?[16]u8 = null,
+    labels_mask: ?[16]u8 = null,
+    /// `nat src|dst addr MIN-MAX` for IPv4; for a single address both equal.
+    nat_ipv4_min: ?[4]u8 = null,
+    nat_ipv4_max: ?[4]u8 = null,
+    nat_ipv6_min: ?[16]u8 = null,
+    nat_ipv6_max: ?[16]u8 = null,
+    /// `port MIN-MAX`, sent big-endian.
+    nat_port_min: ?u16 = null,
+    nat_port_max: ?u16 = null,
+    helper: ?CtHelper = null,
+    index: u32 = 0,
+    /// ct is a mid-list action: `tc` sends `TC_ACT_PIPE`.
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const CtWire = struct {
+    ct_action: u16 = 0,
+    zone: ?u16 = null,
+    mark: ?u32 = null,
+    mark_mask: ?u32 = null,
+    labels: ?[16]u8 = null,
+    labels_mask: ?[16]u8 = null,
+    nat_ipv4_min: ?[4]u8 = null,
+    nat_ipv4_max: ?[4]u8 = null,
+    nat_ipv6_min: ?[16]u8 = null,
+    nat_ipv6_max: ?[16]u8 = null,
+    nat_port_min: ?u16 = null,
+    nat_port_max: ?u16 = null,
+    helper_family: ?u8 = null,
+    helper_proto: ?u8 = null,
+    helper_name_buf: [ct_helper_name_max]u8 = @splat(0),
+    helper_name_len: u8 = 0,
+
+    pub fn helperName(w: *const CtWire) []const u8 {
+        return w.helper_name_buf[0..w.helper_name_len];
+    }
+};
+
+/// The kind-specific readback of the kinds `Action` carries in `Action.ext`.
+pub const ExtWire = union(enum) {
+    connmark: ConnmarkWire,
+    csum: CsumWire,
+    sample: SampleWire,
+    tunnel_key: TunnelKeyWire,
+    mpls: MplsWire,
+    nat: NatWire,
+    pedit: PeditWire,
+    ct: CtWire,
 };
 
 // ── raw escape hatch ────────────────────────────────────────────────────────
@@ -563,6 +1191,7 @@ pub const Raw = struct {
     options: []const u8 = &.{},
     index: u32 = 0,
     cookie: []const u8 = &.{},
+    extra: Extra = .{},
 };
 
 // ── the action spec ─────────────────────────────────────────────────────────
@@ -576,6 +1205,14 @@ pub const ActionSpec = union(enum) {
     police: Police,
     skbedit: Skbedit,
     vlan: Vlan,
+    connmark: Connmark,
+    csum: Csum,
+    sample: Sample,
+    tunnel_key: TunnelKey,
+    mpls: Mpls,
+    nat: Nat,
+    pedit: Pedit,
+    ct: Ct,
     raw: Raw,
 
     pub fn kind(self: ActionSpec) []const u8 {
@@ -585,6 +1222,14 @@ pub const ActionSpec = union(enum) {
             .police => kind_police,
             .skbedit => kind_skbedit,
             .vlan => kind_vlan,
+            .connmark => kind_connmark,
+            .csum => kind_csum,
+            .sample => kind_sample,
+            .tunnel_key => kind_tunnel_key,
+            .mpls => kind_mpls,
+            .nat => kind_nat,
+            .pedit => kind_pedit,
+            .ct => kind_ct,
             .raw => |r| r.kind,
         };
     }
@@ -593,6 +1238,13 @@ pub const ActionSpec = union(enum) {
     pub fn cookie(self: ActionSpec) []const u8 {
         return switch (self) {
             inline else => |a| a.cookie,
+        };
+    }
+
+    /// The action-level `TCA_ACT_HW_STATS` / `TCA_ACT_FLAGS` attributes.
+    pub fn extra(self: ActionSpec) Extra {
+        return switch (self) {
+            inline else => |a| a.extra,
         };
     }
 
@@ -617,6 +1269,14 @@ pub const ActionSpec = union(enum) {
             .police => |p| try appendPoliceOptions(p, gpa, list, ps),
             .skbedit => |s| try appendSkbeditOptions(s, gpa, list),
             .vlan => |v| try appendVlanOptions(v, gpa, list),
+            .connmark => |c| try appendConnmarkOptions(c, gpa, list),
+            .csum => |c| try appendCsumOptions(c, gpa, list),
+            .sample => |x| try appendSampleOptions(x, gpa, list),
+            .tunnel_key => |t| try appendTunnelKeyOptions(t, gpa, list),
+            .mpls => |m| try appendMplsOptions(m, gpa, list),
+            .nat => |n| try appendNatOptions(n, gpa, list),
+            .pedit => |x| try appendPeditOptions(x, gpa, list),
+            .ct => |c| try appendCtOptions(c, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -707,8 +1367,11 @@ fn appendPoliceOptions(
     list: *std.ArrayList(u8),
     ps: Psched,
 ) EncodeError!void {
-    if (p.rate == 0) return error.MissingRate;
-    if (p.burst == 0) return error.MissingBurst;
+    if (p.rate != 0 and p.pkt_rate != 0) return error.RateConflict;
+    if (p.rate == 0 and p.pkt_rate == 0 and p.avrate == 0) return error.MissingRate;
+    if (p.rate == 0 and p.peakrate != 0) return error.MissingRate;
+    if (p.rate != 0 and p.burst == 0) return error.MissingBurst;
+    if (p.pkt_rate != 0 and p.pkt_burst == 0) return error.MissingBurst;
     if (p.peakrate != 0 and p.mtu == 0) return error.MissingMtu;
     try ratespec.checkCellLog(p.cell_log);
     try ratespec.checkCellLog(p.pcell_log);
@@ -730,8 +1393,8 @@ fn appendPoliceOptions(
     // 64-bit rate, where those two bake the ~0U clamp into their tables.
     // The `rate 40gbit` goldens pin the difference —
     // their last table entry is 7, not the 8 the clamped rate would give.
-    ratespec.calcRateTable(ps, &rate_spec, &rtab, p.cell_log, p.mtu, p.linklayer, p.rate);
-    const burst_ticks = ps.calcXmitTime(p.rate, p.burst);
+    if (p.rate != 0) ratespec.calcRateTable(ps, &rate_spec, &rtab, p.cell_log, p.mtu, p.linklayer, p.rate);
+    const burst_ticks = if (p.rate != 0) ps.calcXmitTime(p.rate, p.burst) else 0;
     if (p.peakrate != 0) {
         // F10: unlike htb/tbf, police feeds calcRateTable the *unclamped*
         // rate via rate_override (see the note above), so the reuse
@@ -752,20 +1415,27 @@ fn appendPoliceOptions(
     std.mem.writeInt(u32, tbf[8..12], p.limit, native_endian);
     std.mem.writeInt(u32, tbf[12..16], burst_ticks, native_endian);
     std.mem.writeInt(u32, tbf[16..20], p.mtu, native_endian);
-    tbf[20..32].* = rate_spec.encode();
+    if (p.rate != 0) tbf[20..32].* = rate_spec.encode();
     if (p.peakrate != 0) tbf[32..44].* = peak_spec.encode();
     // refcnt/bindcnt/capab stay 0 — the kernel owns them.
     try appendAttr(gpa, list, TCA_POLICE.TBF, &tbf);
 
-    try appendAttr(gpa, list, TCA_POLICE.RATE, &ratespec.encodeRateTable(&rtab));
-    if (p.rate >= (1 << 32)) try appendAttrU64(gpa, list, TCA_POLICE.RATE64, p.rate);
+    if (p.rate != 0) {
+        try appendAttr(gpa, list, TCA_POLICE.RATE, &ratespec.encodeRateTable(&rtab));
+        if (p.rate >= (1 << 32)) try appendAttrU64(gpa, list, TCA_POLICE.RATE64, p.rate);
+    }
     if (p.peakrate != 0) {
         try appendAttr(gpa, list, TCA_POLICE.PEAKRATE, &ratespec.encodeRateTable(&ptab));
         if (p.peakrate >= (1 << 32))
             try appendAttrU64(gpa, list, TCA_POLICE.PEAKRATE64, p.peakrate);
     }
+    if (p.avrate != 0) try codec.appendAttrU32(gpa, list, TCA_POLICE.AVRATE, p.avrate);
     if (p.notexceed) |r|
         try codec.appendAttrU32(gpa, list, TCA_POLICE.RESULT, @bitCast(r.raw()));
+    if (p.pkt_rate != 0) {
+        try appendAttrU64(gpa, list, TCA_POLICE.PKTRATE64, p.pkt_rate);
+        try appendAttrU64(gpa, list, TCA_POLICE.PKTBURST64, ps.calcXmitTime(p.pkt_rate, p.pkt_burst));
+    }
 }
 
 fn appendSkbeditOptions(
@@ -780,7 +1450,9 @@ fn appendSkbeditOptions(
     if (s.queue_mapping) |q| try codec.appendAttrU16(gpa, list, TCA_SKBEDIT.QUEUE_MAPPING, q);
     if (s.priority) |h| try codec.appendAttrU32(gpa, list, TCA_SKBEDIT.PRIORITY, h.raw);
     if (s.mark) |m| try codec.appendAttrU32(gpa, list, TCA_SKBEDIT.MARK, m);
+    if (s.mask) |m| try codec.appendAttrU32(gpa, list, TCA_SKBEDIT.MASK, m);
     if (s.ptype) |t| try codec.appendAttrU16(gpa, list, TCA_SKBEDIT.PTYPE, t);
+    if (s.inherit_dsfield) try appendAttrU64(gpa, list, TCA_SKBEDIT.FLAGS, SKBEDIT_F_INHERITDSFIELD);
 }
 
 fn appendVlanOptions(
@@ -796,6 +1468,151 @@ fn appendVlanOptions(
     if (v.id) |id| try codec.appendAttrU16(gpa, list, TCA_VLAN.PUSH_VLAN_ID, id);
     if (v.proto) |pr| try appendAttrBe16(gpa, list, TCA_VLAN.PUSH_VLAN_PROTOCOL, pr);
     if (v.prio) |pc| try codec.appendAttrU8(gpa, list, TCA_VLAN.PUSH_VLAN_PRIORITY, pc);
+    if (v.eth_dst) |m| try appendAttr(gpa, list, TCA_VLAN.PUSH_ETH_DST, &m);
+    if (v.eth_src) |m| try appendAttr(gpa, list, TCA_VLAN.PUSH_ETH_SRC, &m);
+}
+
+/// `TCA_*_PARMS`: the `tc_gen` prologue plus a kind's fixed tail.
+fn appendGenParms(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    index: u32,
+    verdict: Verdict,
+    tail: []const u8,
+) std.mem.Allocator.Error!void {
+    var buf: [tc_gen_len + 16]u8 = undefined;
+    std.debug.assert(tail.len <= 16);
+    const gen: Gen = .{ .index = index, .action = verdict };
+    buf[0..tc_gen_len].* = gen.encode();
+    @memcpy(buf[tc_gen_len..][0..tail.len], tail);
+    try appendAttr(gpa, list, attr_type, buf[0 .. tc_gen_len + tail.len]);
+}
+
+fn appendAttrBe32(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u32,
+) std.mem.Allocator.Error!void {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, value, .big);
+    try appendAttr(gpa, list, attr_type, &raw);
+}
+
+fn appendConnmarkOptions(c: Connmark, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var tail: [4]u8 = @splat(0);
+    std.mem.writeInt(u16, tail[0..2], c.zone, native_endian);
+    try appendGenParms(gpa, list, TCA_CONNMARK.PARMS, c.index, c.action, &tail);
+}
+
+fn appendCsumOptions(c: Csum, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var tail: [4]u8 = undefined;
+    std.mem.writeInt(u32, &tail, c.update_flags, native_endian);
+    try appendGenParms(gpa, list, TCA_CSUM.PARMS, c.index, c.action, &tail);
+}
+
+fn appendSampleOptions(s: Sample, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    try appendGenParms(gpa, list, TCA_SAMPLE.PARMS, s.index, s.action, &.{});
+    try codec.appendAttrU32(gpa, list, TCA_SAMPLE.RATE, s.rate);
+    try codec.appendAttrU32(gpa, list, TCA_SAMPLE.PSAMPLE_GROUP, s.group);
+    if (s.trunc_size) |t| try codec.appendAttrU32(gpa, list, TCA_SAMPLE.TRUNC_SIZE, t);
+}
+
+fn appendTunnelKeyOptions(t: TunnelKey, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (t.enc_opts.len > std.math.maxInt(u16) - 4) return error.OptionsTooLong;
+    // Attribute order follows `tc`'s command-line parse; the PARMS block
+    // comes last (the goldens pin it).
+    if (t.src_ip4) |a| try appendAttr(gpa, list, TCA_TUNNEL_KEY.ENC_IPV4_SRC, &a);
+    if (t.dst_ip4) |a| try appendAttr(gpa, list, TCA_TUNNEL_KEY.ENC_IPV4_DST, &a);
+    if (t.src_ip6) |a| try appendAttr(gpa, list, TCA_TUNNEL_KEY.ENC_IPV6_SRC, &a);
+    if (t.dst_ip6) |a| try appendAttr(gpa, list, TCA_TUNNEL_KEY.ENC_IPV6_DST, &a);
+    if (t.key_id) |k| try appendAttrBe32(gpa, list, TCA_TUNNEL_KEY.ENC_KEY_ID, k);
+    if (t.dst_port) |p| try appendAttrBe16(gpa, list, TCA_TUNNEL_KEY.ENC_DST_PORT, p);
+    if (t.tos) |v| try codec.appendAttrU8(gpa, list, TCA_TUNNEL_KEY.ENC_TOS, v);
+    if (t.ttl) |v| try codec.appendAttrU8(gpa, list, TCA_TUNNEL_KEY.ENC_TTL, v);
+    if (t.enc_opts.len != 0) try appendAttr(gpa, list, TCA_TUNNEL_KEY.ENC_OPTS, t.enc_opts);
+    try codec.appendAttrU8(gpa, list, TCA_TUNNEL_KEY.NO_CSUM, @intFromBool(t.no_csum));
+    if (t.no_frag) try appendAttr(gpa, list, TCA_TUNNEL_KEY.NO_FRAG, &.{});
+    var tail: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tail, @backingInt(t.t_action), native_endian);
+    try appendGenParms(gpa, list, TCA_TUNNEL_KEY.PARMS, t.index, t.action, &tail);
+}
+
+fn appendMplsOptions(m: Mpls, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var tail: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tail, @backingInt(m.m_action), native_endian);
+    try appendGenParms(gpa, list, TCA_MPLS.PARMS, m.index, m.action, &tail);
+    if (m.label) |l| try codec.appendAttrU32(gpa, list, TCA_MPLS.LABEL, l);
+    if (m.proto) |p| try appendAttrBe16(gpa, list, TCA_MPLS.PROTO, p);
+    if (m.tc) |v| try codec.appendAttrU8(gpa, list, TCA_MPLS.TC, v);
+    if (m.ttl) |v| try codec.appendAttrU8(gpa, list, TCA_MPLS.TTL, v);
+    if (m.bos) |v| try codec.appendAttrU8(gpa, list, TCA_MPLS.BOS, v);
+}
+
+fn appendNatOptions(n: Nat, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var tail: [16]u8 = undefined;
+    tail[0..4].* = n.old_addr;
+    tail[4..8].* = n.new_addr;
+    tail[8..12].* = n.mask;
+    std.mem.writeInt(u32, tail[12..16], if (n.egress) TCA_NAT_FLAG_EGRESS else 0, native_endian);
+    try appendGenParms(gpa, list, TCA_NAT.PARMS, n.index, n.action, &tail);
+}
+
+fn appendPeditOptions(p: Pedit, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (p.keys.len > max_pedit_keys) return error.OptionsTooLong;
+    const sel = try gpa.alloc(u8, tc_pedit_sel_len + p.keys.len * tc_pedit_key_len);
+    defer gpa.free(sel);
+    @memset(sel, 0);
+    const gen: Gen = .{ .index = p.index, .action = p.action };
+    sel[0..tc_gen_len].* = gen.encode();
+    sel[tc_gen_len] = @intCast(p.keys.len);
+    for (p.keys, 0..) |k, i| {
+        const b = sel[tc_pedit_sel_len + i * tc_pedit_key_len ..][0..tc_pedit_key_len];
+        // struct tc_pedit_key: mask, val, off, at, offmask, shift. mask and
+        // val are the packet-order words (big-endian bytes in memory).
+        std.mem.writeInt(u32, b[0..4], k.mask, .big);
+        std.mem.writeInt(u32, b[4..8], k.val, .big);
+        std.mem.writeInt(u32, b[8..12], k.off, native_endian);
+        std.mem.writeInt(u32, b[12..16], k.at, native_endian);
+        std.mem.writeInt(u32, b[16..20], k.offmask, native_endian);
+        std.mem.writeInt(u32, b[20..24], k.shift, native_endian);
+    }
+    try appendAttr(gpa, list, if (p.extended) TCA_PEDIT.PARMS_EX else TCA_PEDIT.PARMS, sel);
+    if (!p.extended) return;
+    const keys = try codec.nestBegin(gpa, list, TCA_PEDIT.KEYS_EX | codec.NLA_F_NESTED);
+    for (p.keys) |k| {
+        const ex = try codec.nestBegin(gpa, list, TCA_PEDIT.KEY_EX | codec.NLA_F_NESTED);
+        try codec.appendAttrU16(gpa, list, TCA_PEDIT_KEY_EX.HTYPE, @backingInt(k.htype));
+        try codec.appendAttrU16(gpa, list, TCA_PEDIT_KEY_EX.CMD, @backingInt(k.cmd));
+        codec.nestEnd(list, ex) catch return error.OptionsTooLong;
+    }
+    codec.nestEnd(list, keys) catch return error.OptionsTooLong;
+}
+
+fn appendCtOptions(c: Ct, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (c.zone) |z| try codec.appendAttrU16(gpa, list, TCA_CT.ZONE, z);
+    if (c.mark) |m| try codec.appendAttrU32(gpa, list, TCA_CT.MARK, m);
+    if (c.mark_mask) |m| try codec.appendAttrU32(gpa, list, TCA_CT.MARK_MASK, m);
+    if (c.labels) |l| try appendAttr(gpa, list, TCA_CT.LABELS, &l);
+    if (c.labels_mask) |l| try appendAttr(gpa, list, TCA_CT.LABELS_MASK, &l);
+    if (c.nat_ipv4_min) |a| try appendAttr(gpa, list, TCA_CT.NAT_IPV4_MIN, &a);
+    if (c.nat_ipv4_max) |a| try appendAttr(gpa, list, TCA_CT.NAT_IPV4_MAX, &a);
+    if (c.nat_ipv6_min) |a| try appendAttr(gpa, list, TCA_CT.NAT_IPV6_MIN, &a);
+    if (c.nat_ipv6_max) |a| try appendAttr(gpa, list, TCA_CT.NAT_IPV6_MAX, &a);
+    if (c.nat_port_min) |p| try appendAttrBe16(gpa, list, TCA_CT.NAT_PORT_MIN, p);
+    if (c.nat_port_max) |p| try appendAttrBe16(gpa, list, TCA_CT.NAT_PORT_MAX, p);
+    if (c.helper) |h| {
+        try codec.appendAttrU8(gpa, list, TCA_CT.HELPER_FAMILY, h.family);
+        try codec.appendAttrU8(gpa, list, TCA_CT.HELPER_PROTO, h.proto);
+        codec.appendAttrString(gpa, list, TCA_CT.HELPER_NAME, h.name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+    // `tc` always sends the action word, 0 for a plain `ct zone N`.
+    try codec.appendAttrU16(gpa, list, TCA_CT.ACTION, c.ct_action);
+    try appendGenParms(gpa, list, TCA_CT.PARMS, c.index, c.action, &.{});
 }
 
 /// Append a complete action list as one nested attribute — `TCA_U32_ACT`,
@@ -829,6 +1646,9 @@ pub fn appendActionList(
         codec.nestEnd(list, opts) catch return error.OptionsTooLong;
         const ck = a.cookie();
         if (ck.len != 0) try appendAttr(gpa, list, TCA_ACT.COOKIE, ck);
+        const ex = a.extra();
+        if (ex.hw_stats) |b| try appendAttr(gpa, list, TCA_ACT.HW_STATS, &b.encode());
+        if (ex.flags) |b| try appendAttr(gpa, list, TCA_ACT.FLAGS, &b.encode());
         codec.nestEnd(list, entry) catch return error.OptionsTooLong;
     }
     codec.nestEnd(list, outer) catch return error.OptionsTooLong;
@@ -918,6 +1738,17 @@ pub const Action = struct {
     police: ?PoliceWire = null,
     skbedit: ?SkbeditWire = null,
     vlan: ?VlanWire = null,
+    /// The readback of the kinds added after the first five (`connmark`,
+    /// `csum`, `sample`, `tunnel_key`, `mpls`, `nat`, `pedit`, `ct`).
+    ext: ?ExtWire = null,
+    /// `TCA_ACT_FLAGS`.
+    flags: ?Bitfield32 = null,
+    /// `TCA_ACT_HW_STATS`.
+    hw_stats: ?Bitfield32 = null,
+    /// `TCA_ACT_USED_HW_STATS` — which hardware stats the kernel used.
+    used_hw_stats: ?Bitfield32 = null,
+    /// `TCA_ACT_IN_HW_COUNT` — how many devices the action is offloaded to.
+    in_hw_count: ?u32 = null,
     stats: ?Stats = null,
     tm: ?Tm = null,
 
@@ -1026,6 +1857,15 @@ fn parsePoliceOptions(a: *Action, data: []const u8) codec.Error!void {
         TCA_POLICE.PEAKRATE64 => if (attr.data.len >= 8) {
             w.peakrate64 = std.mem.readInt(u64, attr.data[0..8], native_endian);
         },
+        TCA_POLICE.AVRATE => if (attr.data.len >= 4) {
+            w.avrate = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_POLICE.PKTRATE64 => if (attr.data.len >= 8) {
+            w.pkt_rate = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_POLICE.PKTBURST64 => if (attr.data.len >= 8) {
+            w.pkt_burst = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
         TCA_POLICE.RESULT => if (attr.data.len >= 4) {
             w.notexceed = Verdict.fromRaw(std.mem.readInt(i32, attr.data[0..4], native_endian));
         },
@@ -1068,6 +1908,9 @@ fn parseSkbeditOptions(a: *Action, data: []const u8) codec.Error!void {
         TCA_SKBEDIT.MASK => if (attr.data.len >= 4) {
             w.mask = std.mem.readInt(u32, attr.data[0..4], native_endian);
         },
+        TCA_SKBEDIT.FLAGS => if (attr.data.len >= 8) {
+            w.inherit_dsfield = std.mem.readInt(u64, attr.data[0..8], native_endian) & SKBEDIT_F_INHERITDSFIELD != 0;
+        },
         TCA_SKBEDIT.TM => a.tm = parseTm(attr.data),
         else => {},
     };
@@ -1092,10 +1935,249 @@ fn parseVlanOptions(a: *Action, data: []const u8) codec.Error!void {
         TCA_VLAN.PUSH_VLAN_PRIORITY => if (attr.data.len >= 1) {
             w.prio = attr.data[0];
         },
+        TCA_VLAN.PUSH_ETH_DST => w.eth_dst = copyArray(6, attr.data),
+        TCA_VLAN.PUSH_ETH_SRC => w.eth_src = copyArray(6, attr.data),
         TCA_VLAN.TM => a.tm = parseTm(attr.data),
         else => {},
     };
     a.vlan = w;
+}
+
+fn readGen(a: *Action, data: []const u8, min_len: usize) codec.Error!void {
+    if (data.len < min_len) return error.BadLength;
+    a.gen = Gen.decode(data[0..tc_gen_len]);
+}
+
+fn copyArray(comptime n: usize, data: []const u8) ?[n]u8 {
+    if (data.len < n) return null;
+    return data[0..n].*;
+}
+
+fn parseConnmarkOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: ConnmarkWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_CONNMARK.PARMS => {
+            try readGen(a, attr.data, tc_connmark_len);
+            w.zone = std.mem.readInt(u16, attr.data[20..22], native_endian);
+        },
+        TCA_CONNMARK.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .connmark = w };
+}
+
+fn parseCsumOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: CsumWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_CSUM.PARMS => {
+            try readGen(a, attr.data, tc_csum_len);
+            w.update_flags = std.mem.readInt(u32, attr.data[20..24], native_endian);
+        },
+        TCA_CSUM.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .csum = w };
+}
+
+fn parseSampleOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: SampleWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_SAMPLE.PARMS => try readGen(a, attr.data, tc_gen_len),
+        TCA_SAMPLE.RATE => if (attr.data.len >= 4) {
+            w.rate = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_SAMPLE.TRUNC_SIZE => if (attr.data.len >= 4) {
+            w.trunc_size = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_SAMPLE.PSAMPLE_GROUP => if (attr.data.len >= 4) {
+            w.group = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_SAMPLE.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .sample = w };
+}
+
+fn parseTunnelKeyOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: TunnelKeyWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_TUNNEL_KEY.PARMS => {
+            try readGen(a, attr.data, tc_tunnel_key_len);
+            w.t_action = @fromBackingInt(@intCast(std.mem.readInt(i32, attr.data[20..24], native_endian)));
+        },
+        TCA_TUNNEL_KEY.ENC_IPV4_SRC => w.src_ip4 = copyArray(4, attr.data),
+        TCA_TUNNEL_KEY.ENC_IPV4_DST => w.dst_ip4 = copyArray(4, attr.data),
+        TCA_TUNNEL_KEY.ENC_IPV6_SRC => w.src_ip6 = copyArray(16, attr.data),
+        TCA_TUNNEL_KEY.ENC_IPV6_DST => w.dst_ip6 = copyArray(16, attr.data),
+        TCA_TUNNEL_KEY.ENC_KEY_ID => if (attr.data.len >= 4) {
+            w.key_id = std.mem.readInt(u32, attr.data[0..4], .big);
+        },
+        TCA_TUNNEL_KEY.ENC_DST_PORT => if (attr.data.len >= 2) {
+            w.dst_port = std.mem.readInt(u16, attr.data[0..2], .big);
+        },
+        TCA_TUNNEL_KEY.ENC_TOS => if (attr.data.len >= 1) {
+            w.tos = attr.data[0];
+        },
+        TCA_TUNNEL_KEY.ENC_TTL => if (attr.data.len >= 1) {
+            w.ttl = attr.data[0];
+        },
+        TCA_TUNNEL_KEY.NO_CSUM => if (attr.data.len >= 1) {
+            w.no_csum = attr.data[0] != 0;
+        },
+        TCA_TUNNEL_KEY.NO_FRAG => w.no_frag = true,
+        TCA_TUNNEL_KEY.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .tunnel_key = w };
+}
+
+fn parseMplsOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: MplsWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_MPLS.PARMS => {
+            try readGen(a, attr.data, tc_mpls_len);
+            w.m_action = @fromBackingInt(@intCast(std.mem.readInt(i32, attr.data[20..24], native_endian)));
+        },
+        TCA_MPLS.PROTO => if (attr.data.len >= 2) {
+            w.proto = std.mem.readInt(u16, attr.data[0..2], .big);
+        },
+        TCA_MPLS.LABEL => if (attr.data.len >= 4) {
+            w.label = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_MPLS.TC => if (attr.data.len >= 1) {
+            w.tc = attr.data[0];
+        },
+        TCA_MPLS.TTL => if (attr.data.len >= 1) {
+            w.ttl = attr.data[0];
+        },
+        TCA_MPLS.BOS => if (attr.data.len >= 1) {
+            w.bos = attr.data[0];
+        },
+        TCA_MPLS.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .mpls = w };
+}
+
+fn parseNatOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: NatWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_NAT.PARMS => {
+            try readGen(a, attr.data, tc_nat_len);
+            w.old_addr = attr.data[20..24].*;
+            w.new_addr = attr.data[24..28].*;
+            w.mask = attr.data[28..32].*;
+            w.egress = std.mem.readInt(u32, attr.data[32..36], native_endian) & TCA_NAT_FLAG_EGRESS != 0;
+        },
+        TCA_NAT.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .nat = w };
+}
+
+fn parsePeditOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: PeditWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_PEDIT.PARMS, TCA_PEDIT.PARMS_EX => {
+            try readGen(a, attr.data, tc_pedit_sel_len);
+            w.extended = attr.type == TCA_PEDIT.PARMS_EX;
+            w.nkeys = attr.data[tc_gen_len];
+            w.flags = attr.data[tc_gen_len + 1];
+            if (attr.data.len < tc_pedit_sel_len + @as(usize, w.nkeys) * tc_pedit_key_len)
+                return error.BadLength;
+            const n = @min(@as(usize, w.nkeys), max_pedit_keys_decoded);
+            for (0..n) |i| {
+                const b = attr.data[tc_pedit_sel_len + i * tc_pedit_key_len ..][0..tc_pedit_key_len];
+                w.keys[i] = .{
+                    .mask = std.mem.readInt(u32, b[0..4], .big),
+                    .val = std.mem.readInt(u32, b[4..8], .big),
+                    .off = std.mem.readInt(u32, b[8..12], native_endian),
+                    .at = std.mem.readInt(u32, b[12..16], native_endian),
+                    .offmask = std.mem.readInt(u32, b[16..20], native_endian),
+                    .shift = std.mem.readInt(u32, b[20..24], native_endian),
+                };
+            }
+            w.len = @intCast(n);
+        },
+        TCA_PEDIT.KEYS_EX => {
+            // One KEY_EX nest per key, in key order.
+            var ki: usize = 0;
+            var kit: codec.AttrIterator = .{ .buf = attr.data };
+            while (try kit.next()) |ex| {
+                if (ex.type != TCA_PEDIT.KEY_EX) continue;
+                if (ki < max_pedit_keys_decoded) {
+                    var eit: codec.AttrIterator = .{ .buf = ex.data };
+                    while (try eit.next()) |e| switch (e.type) {
+                        TCA_PEDIT_KEY_EX.HTYPE => if (e.data.len >= 2) {
+                            w.keys[ki].htype = @fromBackingInt(@intCast(std.mem.readInt(u16, e.data[0..2], native_endian)));
+                        },
+                        TCA_PEDIT_KEY_EX.CMD => if (e.data.len >= 2) {
+                            w.keys[ki].cmd = @fromBackingInt(@intCast(std.mem.readInt(u16, e.data[0..2], native_endian)));
+                        },
+                        else => {},
+                    };
+                }
+                ki += 1;
+            }
+        },
+        TCA_PEDIT.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .pedit = w };
+}
+
+fn parseCtOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: CtWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_CT.PARMS => try readGen(a, attr.data, tc_ct_len),
+        TCA_CT.ACTION => if (attr.data.len >= 2) {
+            w.ct_action = std.mem.readInt(u16, attr.data[0..2], native_endian);
+        },
+        TCA_CT.ZONE => if (attr.data.len >= 2) {
+            w.zone = std.mem.readInt(u16, attr.data[0..2], native_endian);
+        },
+        TCA_CT.MARK => if (attr.data.len >= 4) {
+            w.mark = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_CT.MARK_MASK => if (attr.data.len >= 4) {
+            w.mark_mask = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_CT.LABELS => w.labels = copyArray(16, attr.data),
+        TCA_CT.LABELS_MASK => w.labels_mask = copyArray(16, attr.data),
+        TCA_CT.NAT_IPV4_MIN => w.nat_ipv4_min = copyArray(4, attr.data),
+        TCA_CT.NAT_IPV4_MAX => w.nat_ipv4_max = copyArray(4, attr.data),
+        TCA_CT.NAT_IPV6_MIN => w.nat_ipv6_min = copyArray(16, attr.data),
+        TCA_CT.NAT_IPV6_MAX => w.nat_ipv6_max = copyArray(16, attr.data),
+        TCA_CT.NAT_PORT_MIN => if (attr.data.len >= 2) {
+            w.nat_port_min = std.mem.readInt(u16, attr.data[0..2], .big);
+        },
+        TCA_CT.NAT_PORT_MAX => if (attr.data.len >= 2) {
+            w.nat_port_max = std.mem.readInt(u16, attr.data[0..2], .big);
+        },
+        TCA_CT.HELPER_FAMILY => if (attr.data.len >= 1) {
+            w.helper_family = attr.data[0];
+        },
+        TCA_CT.HELPER_PROTO => if (attr.data.len >= 1) {
+            w.helper_proto = attr.data[0];
+        },
+        TCA_CT.HELPER_NAME => {
+            const s = attr.asString();
+            const n = @min(s.len, ct_helper_name_max);
+            @memcpy(w.helper_name_buf[0..n], s[0..n]);
+            w.helper_name_len = @intCast(n);
+        },
+        TCA_CT.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .ct = w };
 }
 
 /// Parse one ordinal entry of an action list (the payload of the nest whose
@@ -1116,6 +2198,12 @@ pub fn parseAction(order: u16, data: []const u8) codec.Error!Action {
             a.cookie_len = @intCast(n);
         },
         TCA_ACT.STATS => a.stats = try parseStats(attr.data),
+        TCA_ACT.FLAGS => a.flags = Bitfield32.decode(attr.data),
+        TCA_ACT.HW_STATS => a.hw_stats = Bitfield32.decode(attr.data),
+        TCA_ACT.USED_HW_STATS => a.used_hw_stats = Bitfield32.decode(attr.data),
+        TCA_ACT.IN_HW_COUNT => if (attr.data.len >= 4) {
+            a.in_hw_count = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
         else => {},
     };
     if (options) |opt| {
@@ -1130,6 +2218,22 @@ pub fn parseAction(order: u16, data: []const u8) codec.Error!Action {
             try parseSkbeditOptions(&a, opt);
         } else if (std.mem.eql(u8, k, kind_vlan)) {
             try parseVlanOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_connmark)) {
+            try parseConnmarkOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_csum)) {
+            try parseCsumOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_sample)) {
+            try parseSampleOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_tunnel_key)) {
+            try parseTunnelKeyOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_mpls)) {
+            try parseMplsOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_nat)) {
+            try parseNatOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_pedit)) {
+            try parsePeditOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_ct)) {
+            try parseCtOptions(&a, opt);
         }
     }
     return a;
@@ -1456,6 +2560,26 @@ test "police validates rate/burst/mtu before allocating" {
     ));
     try testing.expectError(error.InvalidCellLog, appendPoliceOptions(
         .{ .rate = 125_000, .burst = 1024, .peakrate = 250_000, .mtu = 1500, .pcell_log = 32 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    // A byte rate and a packet rate together, a packet rate without a
+    // burst, a peak rate without a rate: refused before anything is written.
+    try testing.expectError(error.RateConflict, appendPoliceOptions(
+        .{ .rate = 125_000, .burst = 1024, .pkt_rate = 10, .pkt_burst = 1 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    try testing.expectError(error.MissingBurst, appendPoliceOptions(
+        .{ .pkt_rate = 10 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    try testing.expectError(error.MissingRate, appendPoliceOptions(
+        .{ .peakrate = 250_000, .mtu = 1500 },
         gpa,
         &list,
         ratespec.golden_psched,

@@ -367,6 +367,37 @@ pub fn buildActionGet(
     return buildActionRefMsg(gpa, seq, RTM_GETACTION, codec.NLM_F_REQUEST, refs);
 }
 
+/// Build the `RTM_DELACTION` **flush** request (`tc actions flush action
+/// KIND`): a one-entry table naming the kind with no index, the
+/// `TCA_ROOT_FLAGS` bitfield (`TCA_ACT_FLAG_LARGE_DUMP_ON`) and the
+/// `NLM_F_REQUEST | NLM_F_ACK | NLM_F_ROOT` flags `tc` sets.
+pub fn buildActionFlush(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    kind: []const u8,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(
+        gpa,
+        &list,
+        RTM_DELACTION,
+        codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_ROOT,
+        seq,
+        0,
+    );
+    try appendTcamsg(gpa, &list);
+    try action.appendActionRefs(gpa, &list, action.TCA_ACT_TAB, &.{.{ .kind = kind }});
+    try action.appendRootFlags(
+        gpa,
+        &list,
+        action.TCA_ACT_FLAG.LARGE_DUMP_ON,
+        action.TCA_ACT_FLAG.LARGE_DUMP_ON,
+    );
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
 fn buildActionRefMsg(
     gpa: std.mem.Allocator,
     seq: u32,

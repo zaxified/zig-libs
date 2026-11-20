@@ -3217,3 +3217,828 @@ test "red options readback: every field apart, wrong-sized attributes skipped" {
     const ow = try qdisc.parseRedOptions(odd.items);
     try testing.expect(ow.limit == 0 and ow.max_p == null and ow.flags == null);
 }
+
+// ── action goldens: connmark, csum, sample, tunnel_key, pedit, mpls, nat, ct,
+// action flags, skbedit extras, vlan push_eth ───────────────────────────────
+
+/// Encode one action into the standard u32 filter and compare it with the
+/// golden; returns the first action decoded back from the golden bytes.
+fn actionGolden(comptime hex: []const u8, seq: u32, k: u8, spec: ActionSpec) !action.Action {
+    const codec = @import("netlink").codec;
+    const req = try u32ActionReq(seq, 100 + @as(u16, k), .{ 10, 0, 2, k }, &.{spec});
+    defer gpa.free(req);
+    try expectGolden(hex, req);
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const f = try filter.parseFilter(m.payload);
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+    return f.actions()[0];
+}
+
+test "golden: u32 + connmark" {
+    // tc filter add dev lo parent 1: protocol ip prio 101 u32 match ip src 10.0.2.1/32 flowid 1:10 action connmark zone 5
+    const a = try actionGolden(g_u32_connmark, seq_u32_connmark, 1, .{ .connmark = .{ .zone = 5 } });
+    try testing.expectEqualStrings("connmark", a.kind());
+    try testing.expectEqual(@as(u16, 5), a.ext.?.connmark.zone);
+    try testing.expectEqual(action.Verdict.pipe, a.gen.action);
+}
+
+test "golden: u32 + csum" {
+    // tc filter add dev lo parent 1: protocol ip prio 102 u32 match ip src 10.0.2.2/32 flowid 1:10 action csum ip4h udp
+    const a = try actionGolden(g_u32_csum, seq_u32_csum, 2, .{ .csum = .{
+        .update_flags = action.CSUM_FLAG.IPV4HDR | action.CSUM_FLAG.UDP,
+    } });
+    try testing.expectEqualStrings("csum", a.kind());
+    try testing.expectEqual(@as(u32, 0x11), a.ext.?.csum.update_flags);
+}
+
+test "golden: u32 + sample" {
+    // tc filter add dev lo parent 1: protocol ip prio 103 u32 match ip src 10.0.2.3/32 flowid 1:10 action sample rate 100 group 3 trunc 128
+    const a = try actionGolden(g_u32_sample, seq_u32_sample, 3, .{ .sample = .{
+        .rate = 100,
+        .group = 3,
+        .trunc_size = 128,
+    } });
+    const w = a.ext.?.sample;
+    try testing.expectEqual(@as(?u32, 100), w.rate);
+    try testing.expectEqual(@as(?u32, 3), w.group);
+    try testing.expectEqual(@as(?u32, 128), w.trunc_size);
+    try testing.expectEqual(action.Verdict.pipe, a.gen.action);
+}
+
+test "golden: u32 + tunnel_key set (IPv4, port, tos, ttl, nocsum)" {
+    // tc filter add dev lo parent 1: protocol ip prio 104 u32 match ip src 10.0.2.4/32 flowid 1:10 action tunnel_key set src_ip 192.0.2.1 dst_ip 192.0.2.2 id 42 dst_port 4789 nocsum tos 4 ttl 64
+    const a = try actionGolden(g_u32_tunnel_key_set, seq_u32_tunnel_key_set, 4, .{ .tunnel_key = .{
+        .src_ip4 = .{ 192, 0, 2, 1 },
+        .dst_ip4 = .{ 192, 0, 2, 2 },
+        .key_id = 42,
+        .dst_port = 4789,
+        .no_csum = true,
+        .tos = 4,
+        .ttl = 64,
+    } });
+    const w = a.ext.?.tunnel_key;
+    try testing.expectEqual(action.TunnelKeyAction.set, w.t_action);
+    try testing.expectEqual(@as(?[4]u8, .{ 192, 0, 2, 1 }), w.src_ip4);
+    try testing.expectEqual(@as(?[4]u8, .{ 192, 0, 2, 2 }), w.dst_ip4);
+    try testing.expectEqual(@as(?u32, 42), w.key_id);
+    try testing.expectEqual(@as(?u16, 4789), w.dst_port);
+    try testing.expectEqual(@as(?bool, true), w.no_csum);
+    try testing.expectEqual(@as(?u8, 4), w.tos);
+    try testing.expectEqual(@as(?u8, 64), w.ttl);
+}
+
+test "golden: u32 + tunnel_key unset" {
+    // tc filter add dev lo parent 1: protocol ip prio 105 u32 match ip src 10.0.2.5/32 flowid 1:10 action tunnel_key unset
+    const a = try actionGolden(g_u32_tunnel_key_unset, seq_u32_tunnel_key_unset, 5, .{
+        .tunnel_key = .{ .t_action = .release },
+    });
+    try testing.expectEqual(action.TunnelKeyAction.release, a.ext.?.tunnel_key.t_action);
+    try testing.expectEqual(@as(?bool, false), a.ext.?.tunnel_key.no_csum);
+}
+
+test "golden: u32 + tunnel_key set (IPv6, nofrag)" {
+    // tc filter add dev lo parent 1: protocol ip prio 106 u32 match ip src 10.0.2.6/32 flowid 1:10 action tunnel_key set src_ip 2001:db8::1 dst_ip 2001:db8::2 id 7 nofrag
+    const src6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1};
+    const dst6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{2};
+    const a = try actionGolden(g_u32_tunnel_key_v6, seq_u32_tunnel_key_v6, 6, .{ .tunnel_key = .{
+        .src_ip6 = src6,
+        .dst_ip6 = dst6,
+        .key_id = 7,
+        .no_frag = true,
+    } });
+    const w = a.ext.?.tunnel_key;
+    try testing.expectEqual(@as(?[16]u8, src6), w.src_ip6);
+    try testing.expectEqual(@as(?[16]u8, dst6), w.dst_ip6);
+    try testing.expect(w.no_frag);
+}
+
+test "golden: u32 + tunnel_key set with a pre-encoded geneve option nest" {
+    // tc filter add dev lo parent 1: protocol ip prio 107 u32 match ip src 10.0.2.7/32 flowid 1:10 action tunnel_key set src_ip 192.0.2.1 dst_ip 192.0.2.2 id 42 geneve_opts 0102:80:0a0b0c0d
+    const opts = [_]u8{
+        0x1c, 0x00, 0x01, 0x00, // TCA_TUNNEL_KEY_ENC_OPTS_GENEVE nest
+        0x06, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00, // class 0x0102 (big-endian)
+        0x05, 0x00, 0x02, 0x00, 0x80, 0x00, 0x00, 0x00, // type 0x80
+        0x08, 0x00, 0x03, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, // data
+    };
+    const a = try actionGolden(g_u32_tunnel_key_geneve, seq_u32_tunnel_key_geneve, 7, .{ .tunnel_key = .{
+        .src_ip4 = .{ 192, 0, 2, 1 },
+        .dst_ip4 = .{ 192, 0, 2, 2 },
+        .key_id = 42,
+        .enc_opts = &opts,
+    } });
+    try testing.expectEqual(@as(?u32, 42), a.ext.?.tunnel_key.key_id);
+}
+
+test "golden: u32 + pedit ip dst set (extended key)" {
+    // tc filter add dev lo parent 1: protocol ip prio 108 u32 match ip src 10.0.2.8/32 flowid 1:10 action pedit ex munge ip dst set 10.1.2.3 pipe
+    const keys = [_]action.PeditKey{.{ .htype = .ip4, .mask = 0, .val = 0x0a010203, .off = 16 }};
+    const a = try actionGolden(g_u32_pedit_ip_dst, seq_u32_pedit_ip_dst, 8, .{ .pedit = .{
+        .keys = &keys,
+        .action = .pipe,
+    } });
+    const w = a.ext.?.pedit;
+    try testing.expectEqual(@as(u8, 1), w.nkeys);
+    try testing.expect(w.extended);
+    try testing.expectEqual(action.PeditHdr.ip4, w.keys[0].htype);
+    try testing.expectEqual(action.PeditCmd.set, w.keys[0].cmd);
+    try testing.expectEqual(@as(u32, 0x0a010203), w.keys[0].val);
+    try testing.expectEqual(@as(u32, 16), w.keys[0].off);
+    try testing.expectEqual(action.Verdict.pipe, a.gen.action);
+}
+
+test "golden: u32 + pedit eth dst (a six-byte edit splits into two keys)" {
+    // tc filter add dev lo parent 1: protocol ip prio 109 u32 match ip src 10.0.2.9/32 flowid 1:10 action pedit ex munge eth dst set 00:11:22:33:44:55
+    var buf: [4]action.PeditKey = undefined;
+    const keys = try action.peditMunge(&buf, .eth, .set, 0, &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 }, null);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqual(@as(u32, 0), keys[0].mask);
+    try testing.expectEqual(@as(u32, 0x00112233), keys[0].val);
+    try testing.expectEqual(@as(u32, 0x0000ffff), keys[1].mask);
+    try testing.expectEqual(@as(u32, 0x44550000), keys[1].val);
+    try testing.expectEqual(@as(u32, 4), keys[1].off);
+    const a = try actionGolden(g_u32_pedit_eth_dst, seq_u32_pedit_eth_dst, 9, .{ .pedit = .{ .keys = keys } });
+    try testing.expectEqual(@as(u8, 2), a.ext.?.pedit.len);
+    try testing.expectEqual(action.PeditHdr.eth, a.ext.?.pedit.keys[1].htype);
+}
+
+test "golden: u32 + pedit ip6 dst (sixteen bytes, four keys)" {
+    // tc filter add dev lo parent 1: protocol ip prio 110 u32 match ip src 10.0.2.10/32 flowid 1:10 action pedit ex munge ip6 dst set 2001:db8::1
+    var buf: [4]action.PeditKey = undefined;
+    const addr: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1};
+    const keys = try action.peditMunge(&buf, .ip6, .set, 24, &addr, null);
+    try testing.expectEqual(@as(usize, 4), keys.len);
+    const a = try actionGolden(g_u32_pedit_ip6_dst, seq_u32_pedit_ip6_dst, 10, .{ .pedit = .{ .keys = keys } });
+    try testing.expectEqual(@as(u8, 4), a.ext.?.pedit.nkeys);
+    try testing.expectEqual(@as(u32, 0x20010db8), a.ext.?.pedit.keys[0].val);
+    try testing.expectEqual(@as(u32, 36), a.ext.?.pedit.keys[3].off);
+}
+
+test "golden: u32 + pedit ip ttl add" {
+    // tc filter add dev lo parent 1: protocol ip prio 111 u32 match ip src 10.0.2.11/32 flowid 1:10 action pedit ex munge ip ttl add 255
+    var buf: [1]action.PeditKey = undefined;
+    const keys = try action.peditMunge(&buf, .ip4, .add, 8, &.{0xff}, null);
+    const a = try actionGolden(g_u32_pedit_ttl_add, seq_u32_pedit_ttl_add, 11, .{ .pedit = .{ .keys = keys } });
+    try testing.expectEqual(action.PeditCmd.add, a.ext.?.pedit.keys[0].cmd);
+}
+
+test "golden: u32 + pedit with a retain mask" {
+    // tc filter add dev lo parent 1: protocol ip prio 112 u32 match ip src 10.0.2.12/32 flowid 1:10 action pedit ex munge ip dst set 10.1.2.3 retain 0xffff0000
+    var buf: [1]action.PeditKey = undefined;
+    const keys = try action.peditMunge(&buf, .ip4, .set, 16, &.{ 10, 1, 2, 3 }, &.{ 0xff, 0xff, 0, 0 });
+    try testing.expectEqual(@as(u32, 0x0000ffff), keys[0].mask);
+    try testing.expectEqual(@as(u32, 0x0a010000), keys[0].val);
+    _ = try actionGolden(g_u32_pedit_retain, seq_u32_pedit_retain, 12, .{ .pedit = .{ .keys = keys } });
+}
+
+test "golden: u32 + pedit legacy (no extended keys)" {
+    // tc filter add dev lo parent 1: protocol ip prio 113 u32 match ip src 10.0.2.13/32 flowid 1:10 action pedit munge ip dst set 10.1.2.3
+    const keys = [_]action.PeditKey{.{ .mask = 0, .val = 0x0a010203, .off = 16 }};
+    const a = try actionGolden(g_u32_pedit_legacy, seq_u32_pedit_legacy, 13, .{ .pedit = .{
+        .keys = &keys,
+        .extended = false,
+    } });
+    try testing.expect(!a.ext.?.pedit.extended);
+    try testing.expectEqual(@as(u32, 16), a.ext.?.pedit.keys[0].off);
+}
+
+test "peditMunge: a range inside one word keeps the other bytes, and bad input is refused" {
+    var buf: [2]action.PeditKey = undefined;
+    // Byte 9 of the IPv4 header (protocol) is the second byte of the word at 8.
+    const k = try action.peditMunge(&buf, .ip4, .set, 9, &.{17}, null);
+    try testing.expectEqual(@as(usize, 1), k.len);
+    try testing.expectEqual(@as(u32, 8), k[0].off);
+    try testing.expectEqual(@as(u32, 0xff00ffff), k[0].mask);
+    try testing.expectEqual(@as(u32, 0x00110000), k[0].val);
+    // A range straddling a word boundary needs two keys.
+    const two = try action.peditMunge(&buf, .tcp, .set, 3, &.{ 1, 2 }, null);
+    try testing.expectEqual(@as(usize, 2), two.len);
+    try testing.expectEqual(@as(u32, 0xffffff00), two[0].mask);
+    try testing.expectEqual(@as(u32, 0x00000001), two[0].val);
+    try testing.expectEqual(@as(u32, 0x00ffffff), two[1].mask);
+    try testing.expectEqual(@as(u32, 0x02000000), two[1].val);
+    try testing.expectError(error.TooManyKeys, action.peditMunge(buf[0..1], .tcp, .set, 3, &.{ 1, 2 }, null));
+    try testing.expectError(error.BadRetain, action.peditMunge(&buf, .tcp, .set, 0, &.{ 1, 2 }, &.{0xff}));
+    try testing.expectEqual(@as(usize, 0), (try action.peditMunge(&buf, .tcp, .set, 0, &.{}, null)).len);
+}
+
+test "golden: u32 + mpls push" {
+    // tc filter add dev lo parent 1: protocol ip prio 114 u32 match ip src 10.0.2.14/32 flowid 1:10 action mpls push protocol mpls_uc label 100 tc 3 ttl 64 bos 1
+    const a = try actionGolden(g_u32_mpls_push, seq_u32_mpls_push, 14, .{ .mpls = .{
+        .m_action = .push,
+        .proto = 0x8847,
+        .label = 100,
+        .tc = 3,
+        .ttl = 64,
+        .bos = 1,
+    } });
+    const w = a.ext.?.mpls;
+    try testing.expectEqual(action.MplsAction.push, w.m_action);
+    try testing.expectEqual(@as(?u16, 0x8847), w.proto);
+    try testing.expectEqual(@as(?u32, 100), w.label);
+    try testing.expectEqual(@as(?u8, 3), w.tc);
+    try testing.expectEqual(@as(?u8, 64), w.ttl);
+    try testing.expectEqual(@as(?u8, 1), w.bos);
+}
+
+test "golden: u32 + mpls pop, mac_push, modify and dec_ttl" {
+    // tc filter add dev lo parent 1: protocol ip prio 115 u32 match ip src 10.0.2.15/32 flowid 1:10 action mpls pop protocol ipv4
+    var a = try actionGolden(g_u32_mpls_pop, seq_u32_mpls_pop, 15, .{ .mpls = .{ .m_action = .pop, .proto = 0x0800 } });
+    try testing.expectEqual(action.MplsAction.pop, a.ext.?.mpls.m_action);
+    try testing.expectEqual(@as(?u16, 0x0800), a.ext.?.mpls.proto);
+    // tc filter add dev lo parent 1: protocol ip prio 116 u32 match ip src 10.0.2.16/32 flowid 1:10 action mpls mac_push protocol mpls_uc label 5
+    a = try actionGolden(g_u32_mpls_mac_push, seq_u32_mpls_mac_push, 16, .{ .mpls = .{
+        .m_action = .mac_push,
+        .proto = 0x8847,
+        .label = 5,
+    } });
+    try testing.expectEqual(action.MplsAction.mac_push, a.ext.?.mpls.m_action);
+    // tc filter add dev lo parent 1: protocol ip prio 117 u32 match ip src 10.0.2.17/32 flowid 1:10 action mpls modify label 7
+    a = try actionGolden(g_u32_mpls_modify, seq_u32_mpls_modify, 17, .{ .mpls = .{ .m_action = .modify, .label = 7 } });
+    try testing.expectEqual(@as(?u32, 7), a.ext.?.mpls.label);
+    // tc filter add dev lo parent 1: protocol ip prio 118 u32 match ip src 10.0.2.18/32 flowid 1:10 action mpls dec_ttl
+    a = try actionGolden(g_u32_mpls_dec_ttl, seq_u32_mpls_dec_ttl, 18, .{ .mpls = .{ .m_action = .dec_ttl } });
+    try testing.expectEqual(action.MplsAction.dec_ttl, a.ext.?.mpls.m_action);
+}
+
+test "golden: u32 + nat ingress and egress" {
+    // tc filter add dev lo parent 1: protocol ip prio 119 u32 match ip src 10.0.2.19/32 flowid 1:10 action nat ingress 192.168.1.0/24 10.0.0.1
+    var a = try actionGolden(g_u32_nat_ingress, seq_u32_nat_ingress, 19, .{ .nat = .{
+        .old_addr = .{ 192, 168, 1, 0 },
+        .new_addr = .{ 10, 0, 0, 1 },
+        .mask = .{ 255, 255, 255, 0 },
+    } });
+    try testing.expectEqual([4]u8{ 192, 168, 1, 0 }, a.ext.?.nat.old_addr);
+    try testing.expectEqual([4]u8{ 10, 0, 0, 1 }, a.ext.?.nat.new_addr);
+    try testing.expectEqual([4]u8{ 255, 255, 255, 0 }, a.ext.?.nat.mask);
+    try testing.expect(!a.ext.?.nat.egress);
+    try testing.expectEqual(action.Verdict.ok, a.gen.action);
+    // tc filter add dev lo parent 1: protocol ip prio 120 u32 match ip src 10.0.2.20/32 flowid 1:10 action nat egress 10.0.0.1 192.168.1.9 pipe
+    a = try actionGolden(g_u32_nat_egress, seq_u32_nat_egress, 20, .{ .nat = .{
+        .old_addr = .{ 10, 0, 0, 1 },
+        .new_addr = .{ 192, 168, 1, 9 },
+        .egress = true,
+        .action = .pipe,
+    } });
+    try testing.expect(a.ext.?.nat.egress);
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, a.ext.?.nat.mask);
+}
+
+test "golden: u32 + ct commit with zone and mark" {
+    // tc filter add dev lo parent 1: protocol ip prio 121 u32 match ip src 10.0.2.21/32 flowid 1:10 action ct commit zone 5 mark 7/0xff
+    const a = try actionGolden(g_u32_ct_commit, seq_u32_ct_commit, 21, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT,
+        .zone = 5,
+        .mark = 7,
+        .mark_mask = 0xff,
+    } });
+    const w = a.ext.?.ct;
+    try testing.expectEqual(action.CT_ACT.COMMIT, w.ct_action);
+    try testing.expectEqual(@as(?u16, 5), w.zone);
+    try testing.expectEqual(@as(?u32, 7), w.mark);
+    try testing.expectEqual(@as(?u32, 0xff), w.mark_mask);
+    try testing.expectEqual(action.Verdict.pipe, a.gen.action);
+}
+
+test "golden: u32 + ct commit nat (IPv4 destination, IPv6 source)" {
+    // tc filter add dev lo parent 1: protocol ip prio 122 u32 match ip src 10.0.2.22/32 flowid 1:10 action ct commit nat dst addr 192.0.2.7-192.0.2.8 port 80
+    var a = try actionGolden(g_u32_ct_nat_v4, seq_u32_ct_nat_v4, 22, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT | action.CT_ACT.NAT | action.CT_ACT.NAT_DST,
+        .nat_ipv4_min = .{ 192, 0, 2, 7 },
+        .nat_ipv4_max = .{ 192, 0, 2, 8 },
+        .nat_port_min = 80,
+        .nat_port_max = 80,
+    } });
+    try testing.expectEqual(@as(u16, 0x29), a.ext.?.ct.ct_action);
+    try testing.expectEqual(@as(?[4]u8, .{ 192, 0, 2, 8 }), a.ext.?.ct.nat_ipv4_max);
+    try testing.expectEqual(@as(?u16, 80), a.ext.?.ct.nat_port_max);
+    // tc filter add dev lo parent 1: protocol ip prio 123 u32 match ip src 10.0.2.23/32 flowid 1:10 action ct commit nat src addr 2001:db8::1-2001:db8::9 port 7
+    const lo6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1};
+    const hi6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{9};
+    a = try actionGolden(g_u32_ct_nat_v6, seq_u32_ct_nat_v6, 23, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT | action.CT_ACT.NAT | action.CT_ACT.NAT_SRC,
+        .nat_ipv6_min = lo6,
+        .nat_ipv6_max = hi6,
+        .nat_port_min = 7,
+        .nat_port_max = 7,
+    } });
+    try testing.expectEqual(@as(?[16]u8, hi6), a.ext.?.ct.nat_ipv6_max);
+}
+
+test "golden: u32 + ct commit with labels and with a helper" {
+    // tc filter add dev lo parent 1: protocol ip prio 124 u32 match ip src 10.0.2.24/32 flowid 1:10 action ct commit label 0102030405060708090a0b0c0d0e0f10/ff000000000000000000000000000001
+    const labels: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const lmask: [16]u8 = .{0xff} ++ @as([14]u8, @splat(0)) ++ .{1};
+    var a = try actionGolden(g_u32_ct_label, seq_u32_ct_label, 24, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT,
+        .labels = labels,
+        .labels_mask = lmask,
+    } });
+    try testing.expectEqual(@as(?[16]u8, labels), a.ext.?.ct.labels);
+    try testing.expectEqual(@as(?[16]u8, lmask), a.ext.?.ct.labels_mask);
+    // tc filter add dev lo parent 1: protocol ip prio 125 u32 match ip src 10.0.2.25/32 flowid 1:10 action ct commit helper ipv4-tcp-ftp
+    a = try actionGolden(g_u32_ct_helper, seq_u32_ct_helper, 25, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT,
+        .helper = .{ .family = 2, .proto = 6, .name = "ftp" },
+    } });
+    try testing.expectEqual(@as(?u8, 2), a.ext.?.ct.helper_family);
+    try testing.expectEqual(@as(?u8, 6), a.ext.?.ct.helper_proto);
+    try testing.expectEqualStrings("ftp", a.ext.?.ct.helperName());
+}
+
+test "golden: u32 + ct clear, zone only and force commit" {
+    // tc filter add dev lo parent 1: protocol ip prio 126 u32 match ip src 10.0.2.26/32 flowid 1:10 action ct clear
+    var a = try actionGolden(g_u32_ct_clear, seq_u32_ct_clear, 26, .{ .ct = .{ .ct_action = action.CT_ACT.CLEAR } });
+    try testing.expectEqual(action.CT_ACT.CLEAR, a.ext.?.ct.ct_action);
+    // tc filter add dev lo parent 1: protocol ip prio 127 u32 match ip src 10.0.2.27/32 flowid 1:10 action ct zone 3
+    a = try actionGolden(g_u32_ct_zone, seq_u32_ct_zone, 27, .{ .ct = .{ .zone = 3 } });
+    try testing.expectEqual(@as(?u16, 3), a.ext.?.ct.zone);
+    try testing.expectEqual(@as(u16, 0), a.ext.?.ct.ct_action);
+    // tc filter add dev lo parent 1: protocol ip prio 128 u32 match ip src 10.0.2.28/32 flowid 1:10 action ct force commit
+    a = try actionGolden(g_u32_ct_force, seq_u32_ct_force, 28, .{ .ct = .{
+        .ct_action = action.CT_ACT.COMMIT | action.CT_ACT.FORCE,
+    } });
+    try testing.expectEqual(@as(u16, 3), a.ext.?.ct.ct_action);
+}
+
+test "golden: gact with a cookie, hw_stats and flags" {
+    // tc filter add dev lo parent 1: protocol ip prio 129 u32 match ip src 10.0.2.29/32 flowid 1:10 action gact drop cookie 0102 hw_stats immediate skip_sw
+    var a = try actionGolden(g_u32_gact_hw_flags, seq_u32_gact_hw_flags, 29, .{ .gact = .{
+        .cookie = &.{ 1, 2 },
+        .extra = .{
+            .hw_stats = .{ .value = action.TCA_ACT_HW_STATS_BIT.IMMEDIATE, .selector = action.TCA_ACT_HW_STATS_BIT.IMMEDIATE },
+            .flags = .{ .value = action.TCA_ACT_FLAGS_BIT.SKIP_SW, .selector = action.TCA_ACT_FLAGS_BIT.SKIP_SW },
+        },
+    } });
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, a.cookie());
+    try testing.expectEqual(@as(u32, 1), a.hw_stats.?.value);
+    try testing.expectEqual(@as(u32, 4), a.flags.?.selector);
+    // tc filter add dev lo parent 1: protocol ip prio 130 u32 match ip src 10.0.2.30/32 flowid 1:10 action gact drop hw_stats disabled
+    a = try actionGolden(g_u32_gact_hw_disabled, seq_u32_gact_hw_disabled, 30, .{ .gact = .{
+        .extra = .{ .hw_stats = .{ .value = 0, .selector = 0 } },
+    } });
+    try testing.expectEqual(@as(u32, 0), a.hw_stats.?.selector);
+    // tc filter add dev lo parent 1: protocol ip prio 131 u32 match ip src 10.0.2.31/32 flowid 1:10 action gact drop skip_hw
+    a = try actionGolden(g_u32_gact_skip_hw, seq_u32_gact_skip_hw, 31, .{ .gact = .{
+        .extra = .{ .flags = .{ .value = action.TCA_ACT_FLAGS_BIT.SKIP_HW, .selector = action.TCA_ACT_FLAGS_BIT.SKIP_HW } },
+    } });
+    try testing.expectEqual(@as(u32, 2), a.flags.?.value);
+    try testing.expectEqual(@as(?action.Bitfield32, null), a.hw_stats);
+}
+
+test "golden: u32 + skbedit inheritdsfield, and mark/mask" {
+    // tc filter add dev lo parent 1: protocol ip prio 132 u32 match ip src 10.0.2.32/32 flowid 1:10 action skbedit inheritdsfield
+    var a = try actionGolden(g_u32_skbedit_inherit, seq_u32_skbedit_inherit, 32, .{ .skbedit = .{ .inherit_dsfield = true } });
+    try testing.expect(a.skbedit.?.inherit_dsfield);
+    // tc filter add dev lo parent 1: protocol ip prio 135 u32 match ip src 10.0.2.35/32 flowid 1:10 action skbedit queue_mapping 3 priority 1:10 mark 5/0xff ptype host inheritdsfield
+    a = try actionGolden(g_u32_skbedit_mask, seq_u32_skbedit_mask, 35, .{ .skbedit = .{
+        .queue_mapping = 3,
+        .priority = Handle.init(1, 0x10),
+        .mark = 5,
+        .mask = 0xff,
+        .ptype = PACKET.HOST,
+        .inherit_dsfield = true,
+    } });
+    try testing.expectEqual(@as(?u32, 0xff), a.skbedit.?.mask);
+    try testing.expectEqual(@as(?u32, 5), a.skbedit.?.mark);
+    try testing.expect(a.skbedit.?.inherit_dsfield);
+}
+
+test "golden: u32 + vlan push_eth and pop_eth" {
+    // tc filter add dev lo parent 1: protocol ip prio 133 u32 match ip src 10.0.2.33/32 flowid 1:10 action vlan push_eth dst_mac 00:11:22:33:44:55 src_mac 66:77:88:99:aa:bb
+    var a = try actionGolden(g_u32_vlan_push_eth, seq_u32_vlan_push_eth, 33, .{ .vlan = .{
+        .v_action = .push_eth,
+        .eth_dst = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 },
+        .eth_src = .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb },
+    } });
+    try testing.expectEqual(action.VlanAction.push_eth, a.vlan.?.v_action);
+    try testing.expectEqual(@as(?[6]u8, .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb }), a.vlan.?.eth_src);
+    // tc filter add dev lo parent 1: protocol ip prio 134 u32 match ip src 10.0.2.34/32 flowid 1:10 action vlan pop_eth
+    a = try actionGolden(g_u32_vlan_pop_eth, seq_u32_vlan_pop_eth, 34, .{ .vlan = .{ .v_action = .pop_eth } });
+    try testing.expectEqual(action.VlanAction.pop_eth, a.vlan.?.v_action);
+}
+
+// ── captured request bytes: the wave-14 action kinds ────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=148
+// tc filter add dev lo parent 1: protocol ip prio 101 u32 match ip src 10.0.2.1/32 flowid 1:10 action connmark zone 5
+const g_u32_connmark =
+    "940000002c0005067cd9006b00000000000000000100000000000000000001000800650008000100753332006800020008" ++
+    "0001001000010038000700340001000d000100636f6e6e6d61726b00000000200002801c00010000000000000000000300" ++
+    "00000000000000000000050000002400050001000100000000000000000000000000ffffffff0a0002010c000000000000" ++
+    "00";
+const seq_u32_connmark: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=144
+// tc filter add dev lo parent 1: protocol ip prio 102 u32 match ip src 10.0.2.2/32 flowid 1:10 action csum ip4h udp
+const g_u32_csum =
+    "900000002c0005067cd9006b00000000000000000100000000000000000001000800660008000100753332006400020008" ++
+    "000100100001003400070030000100090001006373756d00000000200002801c0001000000000000000000000000000000" ++
+    "000000000000110000002400050001000100000000000000000000000000ffffffff0a0002020c00000000000000";
+const seq_u32_csum: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=164
+// tc filter add dev lo parent 1: protocol ip prio 103 u32 match ip src 10.0.2.3/32 flowid 1:10 action sample rate 100 group 3 trunc 128
+const g_u32_sample =
+    "a40000002c0005067cd9006b00000000000000000100000000000000000001000800670008000100753332007800020008" ++
+    "0001001000010048000700440001000b00010073616d706c65000034000280180002000000000000000000030000000000" ++
+    "00000000000008000300640000000800050003000000080004008000000024000500010001000000000000000000000000" ++
+    "00ffffffff0a0002030c00000000000000";
+const seq_u32_sample: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=204
+// tc filter add dev lo parent 1: protocol ip prio 104 u32 match ip src 10.0.2.4/32 flowid 1:10 action tunnel_key set src_ip 192.0.2.1 dst_ip 192.0.2.2 id 42 dst_port 4789 nocsum tos 4 ttl 64
+const g_u32_tunnel_key_set =
+    "cc0000002c0005067cd9006b0000000000000000010000000000000000000100080068000800010075333200a000020008" ++
+    "00010010000100700007006c0001000f00010074756e6e656c5f6b657900005800028008000300c000020108000400c000" ++
+    "0202080007000000002a0600090012b5000005000c000400000005000d004000000005000a00010000001c000200000000" ++
+    "0000000000030000000000000000000000010000002400050001000100000000000000000000000000ffffffff0a000204" ++
+    "0c00000000000000";
+const seq_u32_tunnel_key_set: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=156
+// tc filter add dev lo parent 1: protocol ip prio 105 u32 match ip src 10.0.2.5/32 flowid 1:10 action tunnel_key unset
+const g_u32_tunnel_key_unset =
+    "9c0000002c0005067cd9006b00000000000000000100000000000000000001000800690008000100753332007000020008" ++
+    "00010010000100400007003c0001000f00010074756e6e656c5f6b657900002800028005000a00000000001c0002000000" ++
+    "000000000000030000000000000000000000020000002400050001000100000000000000000000000000ffffffff0a0002" ++
+    "050c00000000000000";
+const seq_u32_tunnel_key_unset: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=208
+// tc filter add dev lo parent 1: protocol ip prio 106 u32 match ip src 10.0.2.6/32 flowid 1:10 action tunnel_key set src_ip 2001:db8::1 dst_ip 2001:db8::2 id 7 nofrag
+const g_u32_tunnel_key_v6 =
+    "d00000002c0005067cd9006b000000000000000001000000000000000000010008006a000800010075333200a400020008" ++
+    "0001001000010074000700700001000f00010074756e6e656c5f6b657900005c0002801400050020010db8000000000000" ++
+    "0000000000011400060020010db8000000000000000000000002080007000000000705000a000000000004000e001c0002" ++
+    "000000000000000000030000000000000000000000010000002400050001000100000000000000000000000000ffffffff" ++
+    "0a0002060c00000000000000";
+const seq_u32_tunnel_key_v6: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=212
+// tc filter add dev lo parent 1: protocol ip prio 107 u32 match ip src 10.0.2.7/32 flowid 1:10 action tunnel_key set src_ip 192.0.2.1 dst_ip 192.0.2.2 id 42 geneve_opts 0102:80:0a0b0c0d
+const g_u32_tunnel_key_geneve =
+    "d40000002c0005067cd9006b000000000000000001000000000000000000010008006b000800010075333200a800020008" ++
+    "0001001000010078000700740001000f00010074756e6e656c5f6b657900006000028008000300c000020108000400c000" ++
+    "0202080007000000002a20000b001c00010006000100010200000500020080000000080003000a0b0c0d05000a00000000" ++
+    "001c0002000000000000000000030000000000000000000000010000002400050001000100000000000000000000000000" ++
+    "ffffffff0a0002070c00000000000000";
+const seq_u32_tunnel_key_geneve: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=192
+// tc filter add dev lo parent 1: protocol ip prio 108 u32 match ip src 10.0.2.8/32 flowid 1:10 action pedit ex munge ip dst set 10.1.2.3 pipe
+const g_u32_pedit_ip_dst =
+    "c00000002c0005067cd9006b000000000000000001000000000000000000010008006c0008000100753332009400020008" ++
+    "0001001000010064000700600001000a000100706564697400000050000280340004000000000000000000030000000000" ++
+    "00000000000001000000000000000a01020310000000000000000000000000000000180005801400068006000100020000" ++
+    "0006000200000000002400050001000100000000000000000000000000ffffffff0a0002080c00000000000000";
+const seq_u32_pedit_ip_dst: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=236
+// tc filter add dev lo parent 1: protocol ip prio 109 u32 match ip src 10.0.2.9/32 flowid 1:10 action pedit ex munge eth dst set 00:11:22:33:44:55
+const g_u32_pedit_eth_dst =
+    "ec0000002c0005067cd9006b000000000000000001000000000000000000010008006d000800010075333200c000020008" ++
+    "00010010000100900007008c0001000a00010070656469740000007c0002804c0004000000000000000000000000000000" ++
+    "000000000000020000000000000000112233000000000000000000000000000000000000ffff4455000004000000000000" ++
+    "0000000000000000002c000580140006800600010001000000060002000000000014000680060001000100000006000200" ++
+    "000000002400050001000100000000000000000000000000ffffffff0a0002090c00000000000000";
+const seq_u32_pedit_eth_dst: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=324
+// tc filter add dev lo parent 1: protocol ip prio 110 u32 match ip src 10.0.2.10/32 flowid 1:10 action pedit ex munge ip6 dst set 2001:db8::1
+const g_u32_pedit_ip6_dst =
+    "440100002c0005067cd9006b000000000000000001000000000000000000010008006e0008000100753332001801020008" ++
+    "00010010000100e8000700e40001000a0001007065646974000000d40002807c0004000000000000000000000000000000" ++
+    "000000000000040000000000000020010db81800000000000000000000000000000000000000000000001c000000000000" ++
+    "00000000000000000000000000000000002000000000000000000000000000000000000000000000012400000000000000" ++
+    "00000000000000005400058014000680060001000300000006000200000000001400068006000100030000000600020000" ++
+    "00000014000680060001000300000006000200000000001400068006000100030000000600020000000000240005000100" ++
+    "0100000000000000000000000000ffffffff0a00020a0c00000000000000";
+const seq_u32_pedit_ip6_dst: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=192
+// tc filter add dev lo parent 1: protocol ip prio 111 u32 match ip src 10.0.2.11/32 flowid 1:10 action pedit ex munge ip ttl add 255
+const g_u32_pedit_ttl_add =
+    "c00000002c0005067cd9006b000000000000000001000000000000000000010008006f0008000100753332009400020008" ++
+    "0001001000010064000700600001000a000100706564697400000050000280340004000000000000000000000000000000" ++
+    "0000000000000100000000ffffffff00000008000000000000000000000000000000180005801400068006000100020000" ++
+    "0006000200010000002400050001000100000000000000000000000000ffffffff0a00020b0c00000000000000";
+const seq_u32_pedit_ttl_add: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=192
+// tc filter add dev lo parent 1: protocol ip prio 112 u32 match ip src 10.0.2.12/32 flowid 1:10 action pedit ex munge ip dst set 10.1.2.3 retain 0xffff0000
+const g_u32_pedit_retain =
+    "c00000002c0005067cd9006b00000000000000000100000000000000000001000800700008000100753332009400020008" ++
+    "0001001000010064000700600001000a000100706564697400000050000280340004000000000000000000000000000000" ++
+    "000000000000010000000000ffff0a01000010000000000000000000000000000000180005801400068006000100020000" ++
+    "0006000200000000002400050001000100000000000000000000000000ffffffff0a00020c0c00000000000000";
+const seq_u32_pedit_retain: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=168
+// tc filter add dev lo parent 1: protocol ip prio 113 u32 match ip src 10.0.2.13/32 flowid 1:10 action pedit munge ip dst set 10.1.2.3
+const g_u32_pedit_legacy =
+    "a80000002c0005067cd9006b00000000000000000100000000000000000001000800710008000100753332007c00020008" ++
+    "000100100001004c000700480001000a000100706564697400000038000280340002000000000000000000000000000000" ++
+    "00000000000001000000000000000a01020310000000000000000000000000000000240005000100010000000000000000" ++
+    "0000000000ffffffff0a00020d0c00000000000000";
+const seq_u32_pedit_legacy: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=184
+// tc filter add dev lo parent 1: protocol ip prio 114 u32 match ip src 10.0.2.14/32 flowid 1:10 action mpls push protocol mpls_uc label 100 tc 3 ttl 64 bos 1
+const g_u32_mpls_push =
+    "b80000002c0005067cd9006b00000000000000000100000000000000000001000800720008000100753332008c00020008" ++
+    "000100100001005c00070058000100090001006d706c7300000000480002801c0002000000000000000000030000000000" ++
+    "00000000000002000000080005006400000006000400884700000500060003000000050007004000000005000800010000" ++
+    "002400050001000100000000000000000000000000ffffffff0a00020e0c00000000000000";
+const seq_u32_mpls_push: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=152
+// tc filter add dev lo parent 1: protocol ip prio 115 u32 match ip src 10.0.2.15/32 flowid 1:10 action mpls pop protocol ipv4
+const g_u32_mpls_pop =
+    "980000002c0005067cd9006b00000000000000000100000000000000000001000800730008000100753332006c00020008" ++
+    "000100100001003c00070038000100090001006d706c7300000000280002801c0002000000000000000000030000000000" ++
+    "0000000000000100000006000400080000002400050001000100000000000000000000000000ffffffff0a00020f0c0000" ++
+    "0000000000";
+const seq_u32_mpls_pop: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217788 len=160
+// tc filter add dev lo parent 1: protocol ip prio 116 u32 match ip src 10.0.2.16/32 flowid 1:10 action mpls mac_push protocol mpls_uc label 5
+const g_u32_mpls_mac_push =
+    "a00000002c0005067cd9006b00000000000000000100000000000000000001000800740008000100753332007400020008" ++
+    "000100100001004400070040000100090001006d706c7300000000300002801c0002000000000000000000030000000000" ++
+    "00000000000005000000080005000500000006000400884700002400050001000100000000000000000000000000ffffff" ++
+    "ff0a0002100c00000000000000";
+const seq_u32_mpls_mac_push: u32 = 1795217788;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 117 u32 match ip src 10.0.2.17/32 flowid 1:10 action mpls modify label 7
+const g_u32_mpls_modify =
+    "980000002c0005067dd9006b00000000000000000100000000000000000001000800750008000100753332006c00020008" ++
+    "000100100001003c00070038000100090001006d706c7300000000280002801c0002000000000000000000030000000000" ++
+    "0000000000000300000008000500070000002400050001000100000000000000000000000000ffffffff0a0002110c0000" ++
+    "0000000000";
+const seq_u32_mpls_modify: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=144
+// tc filter add dev lo parent 1: protocol ip prio 118 u32 match ip src 10.0.2.18/32 flowid 1:10 action mpls dec_ttl
+const g_u32_mpls_dec_ttl =
+    "900000002c0005067dd9006b00000000000000000100000000000000000001000800760008000100753332006400020008" ++
+    "000100100001003400070030000100090001006d706c7300000000200002801c0002000000000000000000030000000000" ++
+    "000000000000040000002400050001000100000000000000000000000000ffffffff0a0002120c00000000000000";
+const seq_u32_mpls_dec_ttl: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 119 u32 match ip src 10.0.2.19/32 flowid 1:10 action nat ingress 192.168.1.0/24 10.0.0.1
+const g_u32_nat_ingress =
+    "980000002c0005067dd9006b00000000000000000100000000000000000001000800770008000100753332006c00020008" ++
+    "000100100001003c00070038000100080001006e6174002c00028028000100000000000000000000000000000000000000" ++
+    "0000c0a801000a000001ffffff00000000002400050001000100000000000000000000000000ffffffff0a0002130c0000" ++
+    "0000000000";
+const seq_u32_nat_ingress: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 120 u32 match ip src 10.0.2.20/32 flowid 1:10 action nat egress 10.0.0.1 192.168.1.9 pipe
+const g_u32_nat_egress =
+    "980000002c0005067dd9006b00000000000000000100000000000000000001000800780008000100753332006c00020008" ++
+    "000100100001003c00070038000100080001006e6174002c00028028000100000000000000000003000000000000000000" ++
+    "00000a000001c0a80109ffffffff010000002400050001000100000000000000000000000000ffffffff0a0002140c0000" ++
+    "0000000000";
+const seq_u32_nat_egress: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=168
+// tc filter add dev lo parent 1: protocol ip prio 121 u32 match ip src 10.0.2.21/32 flowid 1:10 action ct commit zone 5 mark 7/0xff
+const g_u32_ct_commit =
+    "a80000002c0005067dd9006b00000000000000000100000000000000000001000800790008000100753332007c00020008" ++
+    "000100100001004c0007004800010007000100637400003c0002800600040005000000080005000700000008000600ff00" ++
+    "00000600030001000000180001000000000000000000030000000000000000000000240005000100010000000000000000" ++
+    "0000000000ffffffff0a0002150c00000000000000";
+const seq_u32_ct_commit: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=176
+// tc filter add dev lo parent 1: protocol ip prio 122 u32 match ip src 10.0.2.22/32 flowid 1:10 action ct commit nat dst addr 192.0.2.7-192.0.2.8 port 80
+const g_u32_ct_nat_v4 =
+    "b00000002c0005067dd9006b000000000000000001000000000000000000010008007a0008000100753332008400020008" ++
+    "00010010000100540007005000010007000100637400004400028008000900c000020708000a00c000020806000d000050" ++
+    "000006000e0000500000060003002900000018000100000000000000000003000000000000000000000024000500010001" ++
+    "00000000000000000000000000ffffffff0a0002160c00000000000000";
+const seq_u32_ct_nat_v4: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=200
+// tc filter add dev lo parent 1: protocol ip prio 123 u32 match ip src 10.0.2.23/32 flowid 1:10 action ct commit nat src addr 2001:db8::1-2001:db8::9 port 7
+const g_u32_ct_nat_v6 =
+    "c80000002c0005067dd9006b000000000000000001000000000000000000010008007b0008000100753332009c00020008" ++
+    "000100100001006c0007006800010007000100637400005c00028014000b0020010db80000000000000000000000011400" ++
+    "0c0020010db800000000000000000000000906000d000007000006000e0000070000060003001900000018000100000000" ++
+    "00000000000300000000000000000000002400050001000100000000000000000000000000ffffffff0a0002170c000000" ++
+    "00000000";
+const seq_u32_ct_nat_v6: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=184
+// tc filter add dev lo parent 1: protocol ip prio 124 u32 match ip src 10.0.2.24/32 flowid 1:10 action ct commit label 0102030405060708090a0b0c0d0e0f10/ff000000000000000000000000000001
+const g_u32_ct_label =
+    "b80000002c0005067dd9006b000000000000000001000000000000000000010008007c0008000100753332008c00020008" ++
+    "000100100001005c0007005800010007000100637400004c000280140007000102030405060708090a0b0c0d0e0f101400" ++
+    "0800ff00000000000000000000000000000106000300010000001800010000000000000000000300000000000000000000" ++
+    "002400050001000100000000000000000000000000ffffffff0a0002180c00000000000000";
+const seq_u32_ct_label: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=168
+// tc filter add dev lo parent 1: protocol ip prio 125 u32 match ip src 10.0.2.25/32 flowid 1:10 action ct commit helper ipv4-tcp-ftp
+const g_u32_ct_helper =
+    "a80000002c0005067dd9006b000000000000000001000000000000000000010008007d0008000100753332007c00020008" ++
+    "000100100001004c0007004800010007000100637400003c00028005001100020000000500120006000000080010006674" ++
+    "70000600030001000000180001000000000000000000030000000000000000000000240005000100010000000000000000" ++
+    "0000000000ffffffff0a0002190c00000000000000";
+const seq_u32_ct_helper: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=144
+// tc filter add dev lo parent 1: protocol ip prio 126 u32 match ip src 10.0.2.26/32 flowid 1:10 action ct clear
+const g_u32_ct_clear =
+    "900000002c0005067dd9006b000000000000000001000000000000000000010008007e0008000100753332006400020008" ++
+    "00010010000100340007003000010007000100637400002400028006000300040000001800010000000000000000000300" ++
+    "000000000000000000002400050001000100000000000000000000000000ffffffff0a00021a0c00000000000000";
+const seq_u32_ct_clear: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 127 u32 match ip src 10.0.2.27/32 flowid 1:10 action ct zone 3
+const g_u32_ct_zone =
+    "980000002c0005067dd9006b000000000000000001000000000000000000010008007f0008000100753332006c00020008" ++
+    "000100100001003c0007003800010007000100637400002c00028006000400030000000600030000000000180001000000" ++
+    "0000000000000300000000000000000000002400050001000100000000000000000000000000ffffffff0a00021b0c0000" ++
+    "0000000000";
+const seq_u32_ct_zone: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=144
+// tc filter add dev lo parent 1: protocol ip prio 128 u32 match ip src 10.0.2.28/32 flowid 1:10 action ct force commit
+const g_u32_ct_force =
+    "900000002c0005067dd9006b00000000000000000100000000000000000001000800800008000100753332006400020008" ++
+    "00010010000100340007003000010007000100637400002400028006000300030000001800010000000000000000000300" ++
+    "000000000000000000002400050001000100000000000000000000000000ffffffff0a00021c0c00000000000000";
+const seq_u32_ct_force: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=172
+// tc filter add dev lo parent 1: protocol ip prio 129 u32 match ip src 10.0.2.29/32 flowid 1:10 action gact drop cookie 0102 hw_stats immediate skip_sw
+const g_u32_gact_hw_flags =
+    "ac0000002c0005067dd9006b00000000000000000100000000000000000001000800810008000100753332008000020008" ++
+    "00010010000100500007004c0001000900010067616374000000001c000280180002000000000000000000020000000000" ++
+    "00000000000006000600010200000c00080001000000010000000c00070004000000040000002400050001000100000000" ++
+    "000000000000000000ffffffff0a00021d0c00000000000000";
+const seq_u32_gact_hw_flags: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 130 u32 match ip src 10.0.2.30/32 flowid 1:10 action gact drop hw_stats disabled
+const g_u32_gact_hw_disabled =
+    "980000002c0005067dd9006b00000000000000000100000000000000000001000800820008000100753332006c00020008" ++
+    "000100100001003c000700380001000900010067616374000000001c000280180002000000000000000000020000000000" ++
+    "0000000000000c00080000000000000000002400050001000100000000000000000000000000ffffffff0a00021e0c0000" ++
+    "0000000000";
+const seq_u32_gact_hw_disabled: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=152
+// tc filter add dev lo parent 1: protocol ip prio 131 u32 match ip src 10.0.2.31/32 flowid 1:10 action gact drop skip_hw
+const g_u32_gact_skip_hw =
+    "980000002c0005067dd9006b00000000000000000100000000000000000001000800830008000100753332006c00020008" ++
+    "000100100001003c000700380001000900010067616374000000001c000280180002000000000000000000020000000000" ++
+    "0000000000000c00070002000000020000002400050001000100000000000000000000000000ffffffff0a00021f0c0000" ++
+    "0000000000";
+const seq_u32_gact_skip_hw: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=168
+// tc filter add dev lo parent 1: protocol ip prio 133 u32 match ip src 10.0.2.33/32 flowid 1:10 action vlan push_eth dst_mac 00:11:22:33:44:55 src_mac 66:77:88:99:aa:bb
+const g_u32_vlan_push_eth =
+    "a80000002c0005067dd9006b00000000000000000100000000000000000001000800850008000100753332007c00020008" ++
+    "000100100001004c0007004800010009000100766c616e00000000380002801c0002000000000000000000030000000000" ++
+    "000000000000050000000a00070000112233445500000a00080066778899aabb0000240005000100010000000000000000" ++
+    "0000000000ffffffff0a0002210c00000000000000";
+const seq_u32_vlan_push_eth: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217789 len=144
+// tc filter add dev lo parent 1: protocol ip prio 134 u32 match ip src 10.0.2.34/32 flowid 1:10 action vlan pop_eth
+const g_u32_vlan_pop_eth =
+    "900000002c0005067dd9006b00000000000000000100000000000000000001000800860008000100753332006400020008" ++
+    "00010010000100340007003000010009000100766c616e00000000200002801c0002000000000000000000030000000000" ++
+    "000000000000040000002400050001000100000000000000000000000000ffffffff0a0002220c00000000000000";
+const seq_u32_vlan_pop_eth: u32 = 1795217789;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217790 len=152
+// tc filter add dev lo parent 1: protocol ip prio 132 u32 match ip src 10.0.2.32/32 flowid 1:10 action skbedit inheritdsfield
+const g_u32_skbedit_inherit =
+    "980000002c0005067ed9006b00000000000000000100000000000000000001000800840008000100753332006c00020008" ++
+    "000100100001003c000700380001000c000100736b62656469740028000280180002000000000000000000030000000000" ++
+    "0000000000000c00090020000000000000002400050001000100000000000000000000000000ffffffff0a0002200c0000" ++
+    "0000000000";
+const seq_u32_skbedit_inherit: u32 = 1795217790;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795217790 len=192
+// tc filter add dev lo parent 1: protocol ip prio 135 u32 match ip src 10.0.2.35/32 flowid 1:10 action skbedit queue_mapping 3 priority 1:10 mark 5/0xff ptype host inheritdsfield
+const g_u32_skbedit_mask =
+    "c00000002c0005067ed9006b00000000000000000100000000000000000001000800870008000100753332009400020008" ++
+    "0001001000010064000700600001000c000100736b62656469740050000280180002000000000000000000030000000000" ++
+    "00000000000006000400030000000800030010000100080005000500000008000800ff00000006000700000000000c0009" ++
+    "0020000000000000002400050001000100000000000000000000000000ffffffff0a0002230c00000000000000";
+const seq_u32_skbedit_mask: u32 = 1795217790;
+
+test "golden: u32 + police avrate" {
+    // tc filter add dev lo parent 1: protocol ip prio 140 u32 match ip src 10.0.2.40/32 flowid 1:10 action police avrate 1mbit
+    var a = try actionGolden(g_u32_police_avrate, seq_u32_police_avrate, 40, .{ .police = .{ .avrate = 125_000 } });
+    try testing.expectEqual(@as(?u32, 125_000), a.police.?.avrate);
+    try testing.expectEqual(@as(?u64, null), a.police.?.pkt_rate);
+    try testing.expectEqual(action.Verdict.reclassify, a.gen.action);
+    // tc filter add dev lo parent 1: protocol ip prio 141 u32 match ip src 10.0.2.41/32 flowid 1:10 action police avrate 1mbit conform-exceed drop/pipe
+    a = try actionGolden(g_u32_police_avrate_result, seq_u32_police_avrate_result, 41, .{ .police = .{
+        .avrate = 125_000,
+        .exceed = .shot,
+        .notexceed = .pipe,
+    } });
+    try testing.expectEqual(action.Verdict.pipe, a.police.?.notexceed.?);
+}
+
+test "golden: u32 + police pkts_rate and pkts_burst" {
+    // tc filter add dev lo parent 1: protocol ip prio 142 u32 match ip src 10.0.2.42/32 flowid 1:10 action police pkts_rate 1000 pkts_burst 10
+    var a = try actionGolden(g_u32_police_pkts, seq_u32_police_pkts, 42, .{ .police = .{
+        .pkt_rate = 1000,
+        .pkt_burst = 10,
+    } });
+    try testing.expectEqual(@as(?u64, 1000), a.police.?.pkt_rate);
+    // 10 packets at 1000 pps = 10 ms = 156,250 ticks on the golden calibration.
+    try testing.expectEqual(@as(?u64, 156_250), a.police.?.pkt_burst);
+    // tc filter add dev lo parent 1: protocol ip prio 143 u32 match ip src 10.0.2.43/32 flowid 1:10 action police pkts_rate 1000 pkts_burst 10 conform-exceed drop/pipe
+    a = try actionGolden(g_u32_police_pkts_result, seq_u32_police_pkts_result, 43, .{ .police = .{
+        .pkt_rate = 1000,
+        .pkt_burst = 10,
+        .exceed = .shot,
+        .notexceed = .pipe,
+    } });
+    try testing.expectEqual(action.Verdict.shot, a.police.?.exceed);
+    // tc filter add dev lo parent 1: protocol ip prio 144 u32 match ip src 10.0.2.44/32 flowid 1:10 action police pkts_rate 5000000000 pkts_burst 77
+    a = try actionGolden(g_u32_police_pkts_big, seq_u32_police_pkts_big, 44, .{ .police = .{
+        .pkt_rate = 5_000_000_000,
+        .pkt_burst = 77,
+    } });
+    try testing.expectEqual(@as(?u64, 5_000_000_000), a.police.?.pkt_rate);
+    try testing.expectEqual(@as(?u64, 1), a.police.?.pkt_burst);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218035 len=184
+// tc filter add dev lo parent 1: protocol ip prio 140 u32 match ip src 10.0.2.40/32 flowid 1:10 action police avrate 1mbit
+const g_u32_police_avrate =
+    "b80000002c00050673da006b000000000000000001000000000000000000010008008c0008000100753332008c00020008" ++
+    "000100100001005c000700580001000b000100706f6c6963650000480002803c0001000000000001000000000000000000" ++
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000800040048e801" ++
+    "002400050001000100000000000000000000000000ffffffff0a0002280c00000000000000";
+const seq_u32_police_avrate: u32 = 1795218035;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218035 len=192
+// tc filter add dev lo parent 1: protocol ip prio 141 u32 match ip src 10.0.2.41/32 flowid 1:10 action police avrate 1mbit conform-exceed drop/pipe
+const g_u32_police_avrate_result =
+    "c00000002c00050673da006b000000000000000001000000000000000000010008008d0008000100753332009400020008" ++
+    "0001001000010064000700600001000b000100706f6c6963650000500002803c0001000000000002000000000000000000" ++
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000800040048e801" ++
+    "0008000500030000002400050001000100000000000000000000000000ffffffff0a0002290c00000000000000";
+const seq_u32_police_avrate_result: u32 = 1795218035;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218035 len=200
+// tc filter add dev lo parent 1: protocol ip prio 142 u32 match ip src 10.0.2.42/32 flowid 1:10 action police pkts_rate 1000 pkts_burst 10
+const g_u32_police_pkts =
+    "c80000002c00050673da006b000000000000000001000000000000000000010008008e0008000100753332009c00020008" ++
+    "000100100001006c000700680001000b000100706f6c6963650000580002803c0001000000000001000000000000000000" ++
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000c000a00e80300" ++
+    "00000000000c000b005a620200000000002400050001000100000000000000000000000000ffffffff0a00022a0c000000" ++
+    "00000000";
+const seq_u32_police_pkts: u32 = 1795218035;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218035 len=208
+// tc filter add dev lo parent 1: protocol ip prio 143 u32 match ip src 10.0.2.43/32 flowid 1:10 action police pkts_rate 1000 pkts_burst 10 conform-exceed drop/pipe
+const g_u32_police_pkts_result =
+    "d00000002c00050673da006b000000000000000001000000000000000000010008008f000800010075333200a400020008" ++
+    "0001001000010074000700700001000b000100706f6c6963650000600002803c0001000000000002000000000000000000" ++
+    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000008000500030000" ++
+    "000c000a00e8030000000000000c000b005a620200000000002400050001000100000000000000000000000000ffffffff" ++
+    "0a00022b0c00000000000000";
+const seq_u32_police_pkts_result: u32 = 1795218035;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218035 len=200
+// tc filter add dev lo parent 1: protocol ip prio 144 u32 match ip src 10.0.2.44/32 flowid 1:10 action police pkts_rate 5000000000 pkts_burst 77
+const g_u32_police_pkts_big =
+    "c80000002c00050673da006b00000000000000000100000000000000000001000800900008000100753332009c00020008" ++
+    "000100100001006c000700680001000b000100706f6c6963650000580002803c0001000000000001000000000000000000" ++
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000c000a0000f205" ++
+    "2a010000000c000b0001000000000000002400050001000100000000000000000000000000ffffffff0a00022c0c000000" ++
+    "00000000";
+const seq_u32_police_pkts_big: u32 = 1795218035;
+
+// ### RTM_DELACTION type=49 flags=0x105 seq=1795218089 len=52
+// tc actions flush action gact
+const g_action_flush_gact =
+    "3400000031000501a9da006b000000000000000014000100100001000900010067616374000000000c0002000100000001" ++
+    "000000";
+const seq_action_flush_gact: u32 = 1795218089;
+
+test "golden: tc actions flush (RTM_DELACTION + ACK|ROOT, kind only, LARGE_DUMP flag)" {
+    // tc actions flush action gact
+    const req = try message.buildActionFlush(gpa, seq_action_flush_gact, "gact");
+    defer gpa.free(req);
+    try expectGolden(g_action_flush_gact, req);
+}

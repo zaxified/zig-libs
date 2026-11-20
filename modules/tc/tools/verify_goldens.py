@@ -73,6 +73,14 @@ for b in blocks:
         continue
     cases.append((tname, cmd, g.group(1)))
 
+# The wave-14 action goldens sit under a header of their own: a `// ###` line
+# and the exact `// tc ...` command directly above the constant. Constants whose
+# test did not yield a case above (several share one test) are read from there.
+seen = {g for _, _, g in cases}
+for m in re.finditer(r"^// (tc [^\n]*)\nconst (g_\w+) =", text, re.M):
+    if m.group(2) in goldens and m.group(2) not in seen:
+        cases.append((m.group(2), re.sub(r"\s+", " ", m.group(1)).strip(), m.group(2)))
+
 # Three cake goldens carry a multi-line comment WITHOUT `\` continuations, so
 # the extractor above truncates them; their full command line is taken from
 # SPEC.md's coverage table instead. (Verified by hand: all three MATCH.)

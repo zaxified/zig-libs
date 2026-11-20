@@ -11,7 +11,8 @@
 //!   (masked 32-bit matches at fixed offsets) and `flower` (structured
 //!   L2–L4 keys).
 //! * **actions** — the `TCA_*_ACT` list a filter runs on a match (`gact`,
-//!   `mirred`, `police`, `skbedit`, `vlan`, `raw`), chained by `TC_ACT_PIPE`,
+//!   `mirred`, `police`, `skbedit`, `vlan`, `connmark`, `csum`, `sample`,
+//!   `tunnel_key`, `mpls`, `nat`, `pedit`, `ct`, `raw`), chained by `TC_ACT_PIPE`,
 //!   plus the standalone shared table (`RTM_NEWACTION`/`DELACTION`/
 //!   `GETACTION`).
 //!
@@ -218,6 +219,45 @@ pub const Vlan = action.Vlan;
 pub const VlanAction = action.VlanAction;
 pub const VlanWire = action.VlanWire;
 pub const PACKET = action.PACKET;
+pub const Connmark = action.Connmark;
+pub const ConnmarkWire = action.ConnmarkWire;
+pub const Csum = action.Csum;
+pub const CsumWire = action.CsumWire;
+pub const Sample = action.Sample;
+pub const SampleWire = action.SampleWire;
+pub const TunnelKey = action.TunnelKey;
+pub const TunnelKeyAction = action.TunnelKeyAction;
+pub const TunnelKeyWire = action.TunnelKeyWire;
+pub const Mpls = action.Mpls;
+pub const MplsAction = action.MplsAction;
+pub const MplsWire = action.MplsWire;
+pub const Nat = action.Nat;
+pub const NatWire = action.NatWire;
+pub const Pedit = action.Pedit;
+pub const PeditKey = action.PeditKey;
+pub const PeditHdr = action.PeditHdr;
+pub const PeditCmd = action.PeditCmd;
+pub const PeditWire = action.PeditWire;
+pub const Ct = action.Ct;
+pub const CtHelper = action.CtHelper;
+pub const CtWire = action.CtWire;
+pub const ExtWire = action.ExtWire;
+pub const Bitfield32 = action.Bitfield32;
+pub const Extra = action.Extra;
+pub const CSUM_FLAG = action.CSUM_FLAG;
+pub const CT_ACT = action.CT_ACT;
+pub const TCA_ACT_FLAGS_BIT = action.TCA_ACT_FLAGS_BIT;
+pub const TCA_ACT_HW_STATS_BIT = action.TCA_ACT_HW_STATS_BIT;
+pub const TCA_CONNMARK = action.TCA_CONNMARK;
+pub const TCA_CSUM = action.TCA_CSUM;
+pub const TCA_SAMPLE = action.TCA_SAMPLE;
+pub const TCA_TUNNEL_KEY = action.TCA_TUNNEL_KEY;
+pub const TCA_MPLS = action.TCA_MPLS;
+pub const TCA_NAT = action.TCA_NAT;
+pub const TCA_PEDIT = action.TCA_PEDIT;
+pub const TCA_PEDIT_KEY_EX = action.TCA_PEDIT_KEY_EX;
+pub const TCA_CT = action.TCA_CT;
+pub const peditMunge = action.peditMunge;
 pub const TCA_ACT = action.TCA_ACT;
 pub const TCA_ACT_TAB = action.TCA_ACT_TAB;
 pub const TCA_ROOT = action.TCA_ROOT;
@@ -503,6 +543,16 @@ pub const Socket = struct {
     pub fn actionDel(self: *Socket, refs: []const ActionRef) WriteError!void {
         const seq = self.nl.nextSeq();
         const req = try message.buildActionDel(self.gpa, seq, refs);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Delete every shared-table action of one kind
+    /// (`tc actions flush action gact`). Needs the same privilege as
+    /// `actionAdd`.
+    pub fn actionFlush(self: *Socket, kind: []const u8) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildActionFlush(self.gpa, seq, kind);
         defer self.gpa.free(req);
         return self.nl.requestAck(req, seq);
     }
