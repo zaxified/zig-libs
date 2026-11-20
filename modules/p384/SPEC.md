@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-30 · mutation 2026-11-01 (55/57, 1 eq) · src 65e4298bf8e278e5
 
-Audit detail: the 2026-11-01 mutation run is a delta from `2649aea7` (the 2026-10-13 run, 99/120, 21 eq) over the `fast_core` asm generators, the Jacobian reorderings, `xReducesTo`, `xEqualsDoubleBasePublic`, verify and `signWithSecretKey`: 2 survivors closed by new tests (hedging noise ignored, identity sum in `xEqualsDoubleBasePublic`); 1 survivor unexplained — the square's final-carry `movl $0,%edi`, which differs only when the last reduction round carries out (~2^-32 per square), no constructed input found.
-
 **Hardening:** fuzz 2026-10-13 (200,000 runs clean, P384_FUZZ, 8 jobs × 25,000, every reach label hit) · ct 2026-10-13 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags 11) · panic 2026-10-30 (sweep + blind review: nothing to fix (DER max already covers 48×0xff); pin tests only)
 
 **Performance:** ref 0.40–0.58× OpenSSL 3.5.5 · fastest ? (measured 2026-10-20)
@@ -36,8 +34,8 @@ and `openssl speed` / Go's own `go test -bench` only, RustCrypto and aws-lc by t
 representation (`Fe` converts one to one) and std's API shape; at or below OpenSSL 3.5.5 on every
 measured operation and about twice Go's speed on the same host; RFC 6979 signatures byte-identical
 to OpenSSL's; ctgrind-checked secret paths and a dead-stack burn. **Where we are behind:** no
-measured fastest (aws-lc); no hash-to-curve (RFC 9380 P384_XMD:SHA-384_SSWU — RustCrypto has it;
-→ Backlog); asm only on amd64 with ADX/BMI2 (elsewhere the portable product, ~1.4× slower field).
+measured fastest (aws-lc); no hash-to-curve in this module (RFC 9380 P384_XMD:SHA-384_SSWU — RustCrypto has it; `voprf` carries its own
+built on `Fe`; → Backlog); asm only on amd64 with ADX, BMI2 and AVX (elsewhere the portable product, ~1.4× slower field).
 Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, as in `p521`.
 
 ## What this module is, and what it is not
@@ -45,11 +43,10 @@ Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, as in `p521`.
 NIST P-384 (secp384r1): the base field, the scalar field, the group, ECDH and ECDSA-P384 with
 RFC 6979 nonces. std ships P-384, but slowly: jwt `ES384` measured 4.2× (sign) and 2.8× (verify)
 golang-jwt on std's curve (2026-10-13), and tlsclient's P-384 key share was ~1 ms until it grew a
-private comb (2026-10-11). This module is the sibling of `p521` — the same group algorithms, the
+private comb. This module is the sibling of `p521` — the same group algorithms, the
 same API shape (std's `P384` / `Ecdsa`), so a consumer swaps a type.
 
-**Not here:** wiring into the consumers (jwt `ES384`, tlsclient's key share and CertificateVerify,
-x509 P-384 certificates — next, *Open*); hash-to-curve; PKCS#8/SPKI key codecs (the consumers own
+**Not here:** hash-to-curve; PKCS#8/SPKI key codecs (the consumers own
 their ASN.1); point compression on the ECDH output (x only, as SEC 1 specifies).
 
 ## Algorithm
@@ -64,7 +61,7 @@ Python affine arithmetic).
 interchangeable (tested). `mont.zig` is the portable arithmetic, shared with the scalar field: a
 6 × 6 schoolbook product (the square computes each off-diagonal product once), a six-round
 word-by-word reduction (−p⁻¹ mod 2^64 = 2^32 + 1), one masked final subtraction; `add`/`sub` end
-in a masked subtract / add of the modulus. On amd64 with ADX and BMI2, `mul` and `sq` run
+in a masked subtract / add of the modulus. On amd64 with ADX, BMI2 and AVX (`fast_core.supported`; the dedicated square parks words in xmm registers), `mul` and `sq` run
 `fast_core.zig`: CIOS with `MULX` and the two carry chains of `ADCX`/`ADOX` (low halves on CF,
 high halves on OF), an eight-register accumulator whose names rotate at comptime instead of a
 shift, q = T0·(2^32 + 1) by shift and add, a reduction round written for p's shape (p = 2^384 − K, the low
@@ -95,7 +92,7 @@ Renes–Costello–Batina complete formulas (a = −3); the scalar loops run in 
   `base_table.zig` (78 windows × 16 affine points, generated), one mixed addition per window and
   no doubling. A zero digit adds the window's first entry and discards the sum by a mask —
   `addMixedComplete`, without `addMixed`'s identity select (ctgrind found that select lowered to
-  a branch on the secret table point, 2026-10-13, the same finding as tlsclient's comb);
+  a branch on the secret table point, the same finding as tlsclient's comb);
 - public scalars (`mulPublic`, `mulDoubleBasePublic`; verification): width-5 NAF over the odd
   multiples, and the comb table for G's half; variable time. SEC1 decode accepts `04‖X‖Y`,
   `02/03‖X` and std's `00` identity encoding; coordinates must be < p and on the curve
@@ -169,42 +166,51 @@ generate/fromSecretKey/sign/ecdh/mul in ReleaseFast: green.
   thousands of random pairs; asm against the portable product; inversion and square-root chains
   against square-and-multiply; the comb table against `mulPublic`, the Jacobian paths against the
   RCB reference ladder (`mulRcbReference`) on edge scalars.
-- **Audit tests** (`audit_test.zig`, from the mutation run): identity inputs to the public
+- **Audit tests** (`audit_test.zig`, from the mutation runs): identity inputs to the public
   multiplies and to ECDH, secrets ≥ n, SEC1 trailing bytes, the affine (0, 0), the curve points
   with x = 0 (b is a residue mod p) through `addMixed`, −G and a zero scalar in the double-base
-  multiply, a constructed s = 0, DER leading zeros, the two DRBG known answers. The delta mutation
-  run of 2026-11-01 (57 mutants over the asm generators of `fast_core.zig`, the Jacobian
-  reorderings, `xEqualsDoubleBasePublic`, `signWithSecretKey`; 55 killed) added two: `signWithSecretKey`
-  passes the noise through (every earlier test signed with `null`), and `xEqualsDoubleBasePublic`
-  answers `IdentityElement` for a cancelling sum instead of `false`. Two survivors stay: `>=` vs `>`
-  on `r + n` against p (equivalent, `Fe.fromBytes` refuses p), and the square's `movl $0, %edi`
-  before the final carry, which differs only when the last reduction round's `adcq` carries out
-  (probability ~2^-32 per square, no input can be constructed cheaply).
+  multiply, a constructed s = 0, DER leading zeros, the two DRBG known answers, `signWithSecretKey`
+  passing the noise through (every other test signs with `null`), and `xEqualsDoubleBasePublic`
+  answering `IdentityElement` for a cancelling sum instead of `false`.
 - **Fuzz** (`fuzz_test.zig`, `P384_FUZZ`): genuine signatures verify (raw and DER), flipped bits
   in message / r‖s / public key refused, ECDH symmetric with both peer encodings, constant-time =
   vartime multiply, (a + b)·G = a·G + b·G, determinism, noisy signing, and std as an oracle.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Verification
+
+- **Run:** `scripts/modtest p384` (`zig build test-p384`).
+- **Tests** by area: the external anchors above (`kat_test.zig`, `oracle_test.zig`); field and scalar
+  arithmetic against wide integers, asm against the portable product, inversion and square-root
+  chains, comb table and Jacobian paths against the references (in `mont.zig`, `field.zig`,
+  `scalar.zig`, `group.zig`); the audit tests (`audit_test.zig`); no-panic pin tests for DER parsing,
+  SEC1 decoding and ECDH edge inputs (`sweep_test.zig`); the stack probe (`stackprobe_test.zig`).
+- **Fuzz:** `fuzz_test.zig`, one harness (genuine signatures verify, flipped bits refused, ECDH symmetry,
+  constant-time = vartime multiply, std as an oracle). Verdict from the deterministic driver:
+  `P384_FUZZ=<runs>[,<seed>]` on the ReleaseSafe test binary (never `zig build --fuzz`); a reach test
+  checks that the seeds hit every check.
+- **Constant time:** the ctgrind rows named under *Constant-time contract*.
+- **Mutation:** the scored mutants cover the `fast_core` asm generators, the Jacobian reorderings,
+  `xReducesTo`, `xEqualsDoubleBasePublic`, verify and `signWithSecretKey`. Two survivors stay: `>=`
+  vs `>` on `r + n` against p (equivalent, `Fe.fromBytes` refuses p), and the square's final-carry
+  `movl $0, %edi`, which differs only when the last reduction round's `adcq` carries out (about
+  2^-32 per square; no input can be constructed cheaply) — the card's one open survivor.
+- **Bench:** `P384_BENCH=1 scripts/modtest p384 -Doptimize=ReleaseFast` (`bench.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`P384_BENCH=1 scripts/modtest p384 -Doptimize=ReleaseFast`, best of 5 × 200, against `openssl speed -seconds 2 ecdsap384 ecdhp384`, 3 OpenSSL runs; our side ran once, the two repeats were cached test results): ECDH 234.3 µs vs 400–404 µs (0.58×), sign 95.7 µs vs 241–243 µs (0.40×), verify 279.8 µs vs 543–554 µs (0.51×); std P384 on the same build 401.9/488.3/537.3 µs. Against 0.61–1.00× on Zig 0.16.0 (2026-10-13: ECDH 423 µs): ours moved, OpenSSL did not — not investigated which change (0.17 codegen or a later commit) did it. The card carries these figures; the table below is the 0.16.0 measurement.
-
-ReleaseFast, Intel i7-7920HQ (Kaby Lake), best of 5 × 200, `P384_BENCH=1` (`bench.zig`), against
-`openssl speed -seconds 2 ecdsap384 ecdhp384` on the same host, 2026-10-13 — three rounds, ours
-and OpenSSL alternating (OpenSSL as ops/s, inverted):
-
-| op | p384 | OpenSSL 3.5.5 | ratio | std P384 |
-|---|--:|--:|--:|--:|
-| keygen | 104–109 µs | — | — | — |
-| ECDH | 423 µs | 424–446 µs | 0.95–1.00× | 1140–1167 µs |
-| sign | 156–158 µs | 257–264 µs | 0.60–0.61× | 1293–1311 µs |
-| verify | 498–502 µs | 595–609 µs | 0.82–0.84× | 2391–2456 µs |
-
-Field (`bench field`, chained): `mul` 50 ns, `sq` 45 ns with the amd64 core; the portable product
-was 70 ns. History, the same day: portable field first (ECDH 517 µs, 1.18×), then the ADX core.
-
-**Re-measured 2026-11-01 after the new field cores** (`P384_BENCH=1 scripts/modtest p384 -Doptimize=ReleaseFast -Djcc-safe`, same machine, same session, before → after): keygen 58.2 → 54.1 µs, ECDH 261.0 → 196.7, sign 103.7 → 93.6, verify 303.3 → 231.1; `Fe.mul` 50.4 → 38.4 ns, `Fe.sq` 44.5 → 34.9 ns (chained). Against aws-lc-rs 1.18 (s2n-bignum asm) in `zig build bench-tls13 -Djcc-safe`, 5 rounds: `cli_secp384r1` 1.52 → 1.19×, `verify_ecdsa_secp384r1_sha384` 1.52 → 1.22×, `srv_secp384r1` 1.36/0.94 → 1.10×. Where it came from, in order of size: the reduction round (≈ 360 → 265 instructions per product), the dedicated square, writing independent products next to each other in the Jacobian formulas (each product is an `asm volatile` block of ~260 dependent instructions; the core overlaps one block's tail with the next block's head only when the next does not wait for it: −4 %), the ECDSA x-check without an affine conversion (`xEqualsDoubleBasePublic`: one 13 µs inversion less), the scalar-field core (verify −2 %, sign −7 %). Tried and dropped: `*m` operands instead of pointer registers plus a `memory` clobber (Zig 0.17 passes the address of a slot holding the pointer; the products came out wrong). Remaining gap to aws-lc: about 130 cycles per chained product against their ~100, and the two Fermat inversions of an ECDH (23 µs, 11 %; safegcd would halve it).
+`bench.zig` (`P384_BENCH=1`, ReleaseFast) times keygen, ECDH, sign and verify, compared by hand with
+`openssl speed ecdsap384 ecdhp384` on the same host; the card's Performance line carries the current
+figures (the card is authoritative). The speed comes from the amd64 field core
+(reduction by p's shape, a dedicated square, the same core for the scalar field), the fixed-base comb,
+independent products written next to each other in the Jacobian formulas (the core overlaps one block's
+tail with the next block's head only when the next does not wait for it), and the ECDSA x-check without
+an affine conversion (`xEqualsDoubleBasePublic`). Dropped: `*m` operands instead of pointer registers
+plus a `memory` clobber (Zig 0.17 passes the address of a slot holding the pointer; the products came out
+wrong). What remains against aws-lc is the per-product cost of the asm blocks and the two Fermat inversions of an
+ECDH (about 11 %; safegcd would halve it).
 
 ## What is deliberately not done
 
@@ -213,22 +219,21 @@ was 70 ns. History, the same day: portable field first (ECDH 517 µs, 1.18×), t
 - **No ECDH object**: `ecdh`/`ecdhInto` next to `P384.mul`, as std has none for its NIST curves.
 - **The comb table is generated** (`tools/gen_base_table.py`), not built at comptime (1248
   points would cost every compile minutes) — the same numbers as tlsclient's former
-  `p384_base_table.zig`, which this module's table replaced on 2026-10-13 (tlsclient's P-384
-  key share, ECDHE, client-cert signing and server-signature verify now run here).
+  `p384_base_table.zig`, which this module's table replaced (tlsclient's P-384 key share, ECDHE,
+  client-cert signing and server-signature verify run here).
+
+## Open
+
+- Consumer wiring: x509 verifies P-384 certificate signatures through std's curve, not this module
+  (jwt `ES384`, tlsclient and hpke already use `p384`).
 
 ## Backlog / deferred
 
-- **Build option: fixed-base table size** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~120 KB (estimate); `tlsclient` and `x509` import
-  this module unconditionally, so every HTTPS consumer links it. `.small` → a smaller window (slower keygen/sign, verification unaffected
+- **Build option: fixed-base table size** (mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~120 KB (estimate); `tlsclient` imports
+  this module unconditionally, so every HTTPS client consumer links it. `.small` → a smaller window (slower keygen/sign, verification unaffected
   in kind; keep the masked lookup, re-run ctgrind). Unmeasured.
 - **Faster scalar inversion** — Fermat costs ~480 Montgomery products per signature; safegcd or
   blinding.
 - **ECDH's two field inversions** (table batch + affine output) — ~10 % of an ECDH.
-- **Hash-to-curve (RFC 9380 P384_XMD:SHA-384_SSWU_RO_)** — voprf's P384-SHA384 suite.
+- **Hash-to-curve (RFC 9380 P384_XMD:SHA-384_SSWU_RO_)** in this module — `voprf` implements it for its P384-SHA384 suite on `Fe`; a shared implementation here is not built.
 - **Measure the fastest in the field** (aws-lc) — until then `fastest ?`.
-
-## Open
-
-- Consumer wiring (owner, 2026-10-13): jwt `ES384` first (its P2 depends on it), then tlsclient
-  (key share comb, CertificateVerify), x509 (P-384 signatures), hpke DHKEM(P-384) if it moves off
-  std.

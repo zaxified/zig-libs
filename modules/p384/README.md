@@ -5,11 +5,11 @@ std ships P-384, but its generic ladder made jwt `ES384` 4.2× slower to sign th
 a TLS client's P-384 key share ~1 ms. This module is `p521`'s sibling over a 384-bit Montgomery
 field — field, group, ECDH and ECDSA-P384 (RFC 6979) with the API shape of
 `std.crypto.ecc.P384` and `std.crypto.sign.ecdsa.EcdsaP384Sha384`, so a consumer swaps a type.
-On amd64 with ADX/BMI2 the field multiply is a `MULX`/`ADCX`/`ADOX` core; elsewhere portable Zig.
+On amd64 with ADX/BMI2/AVX the field multiply is a `MULX`/`ADCX`/`ADOX` core; elsewhere portable Zig.
 
 - **Model after:** std's `P384` / `Ecdsa` (API); FIPS 186-5, SP 800-186, SEC 1, RFC 6979
   (algorithms); OpenSSL as the differential oracle.
-- **Platform:** any (portable; amd64 ADX/BMI2 asm for the field multiply). **Role:** crypto
+- **Platform:** any (portable; amd64 ADX/BMI2/AVX asm for the field multiply). **Role:** crypto
   primitive. **Concurrency:** reentrant. **Deps:** `entropy` (fail-closed key generation).
 
 Provenance: original work of the zig-libs authors (MIT), written from the public standards. Test
@@ -68,8 +68,9 @@ are listed in `SPEC.md` § Algorithm.
 
 ## Performance
 
-i7-7920HQ, ReleaseFast, 2026-10-13 (`SPEC.md` § Performance): ECDH 423 µs, sign 157 µs, verify
-500 µs — 0.95–1.00×, 0.61×, 0.83× OpenSSL 3.5.5; 0.37×, 0.12×, 0.21× std's `P384`.
+ReleaseFast, `P384_BENCH=1` (`bench.zig`): ECDH, sign and verify against OpenSSL and std's `P384` on the
+same host. The figures are on the module card's Performance line (`SPEC.md` § Maturity); the method is in
+`SPEC.md` § Performance.
 
 ## Verification
 
