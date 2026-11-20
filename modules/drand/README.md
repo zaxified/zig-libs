@@ -25,24 +25,27 @@ a convenience; performing the request is the caller's job.
 signature + chain public key (the same genuine bytes `tlock`'s KAT
 harness pins), and a permanent positive-control test proves the
 big-endian round encoding is load-bearing (little-endian hashing makes
-the genuine KAT fail). Signatures on G1, master key on G2 — the MIRROR
-of `bls12_381.bls_sig`'s min-pubkey ciphersuite, so verification is a
-direct pairing check, not `bls_sig.verify` (see [SPEC.md](SPEC.md)).
+the genuine KAT fail). Verification runs through `bls12_381.scheme`'s
+standard Basic ciphersuites — `MinSigBasic` for quicknet (signatures on G1,
+key on G2), `MinPkBasic` for the chained network — not through `bls_sig`'s
+ProofOfPossession suite (see [SPEC.md](SPEC.md)).
 
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, flattened re-exports, dark-tests aggregator, end-to-end KAT |
 | `chaininfo.zig` | `parseInfo` → `ChainInfo` (typed plain value; decodes + `KeyValidate`s the `G2` chain key for quicknet), `Scheme` enum |
 | `round.zig` | `parseRound` → `Round` (decodes **and `KeyValidate`s** the `G1` signature — the pairing equation cannot see a cofactor-torsion addend, so a non-subgroup signature is rejected here; retains `randomness`/`previous_signature`); `roundPath`/`latestPath` request-path helpers |
-| `verify.zig` | `verifyRound(info, round)` — the drand `VerifyBeacon` pairing equation on `bls12_381.pairing` + the `randomness == SHA-256(signature)` check; the fuzz harness |
+| `verify.zig` | `verifyRound(info, round)` — dispatches on the scheme to its `bls12_381.scheme` suite (the drand `VerifyBeacon` equation) + the `randomness == SHA-256(signature)` check; the points-level verifiers, `expectedRound`; the fuzz harnesses |
+| `json_uint.zig` | `Uint64` — the integer-field reader that takes JSON numbers as Go's `uint64` does |
+| `fuzz_test.zig`, `mutation_test.zig` | test-only: shared fuzz-driver plumbing; tests for refusal paths the mutation run found untested |
 
 ## Schemes covered
 
 | `schemeID` | Signatures | Key | Message | This module |
 |---|---|---|---|---|
 | `bls-unchained-g1-rfc9380` (quicknet) | `G1` (48 B) | `G2` (96 B) | `H1(SHA-256(round_be))`, RFC-9380 `_NUL_` DST | **parse + verify** |
-| `pedersen-bls-chained` (default network) | `G2` (96 B) | `G1` (48 B) | `H2(SHA-256(prev_sig ‖ round_be))`, RFC-9380 `G2` `_NUL_` DST | **parse + verify** (since 2026-10-06) |
-| `bls-unchained-on-g1` (deprecated) | `G1` (48 B) | `G2` (96 B) | `H1(SHA-256(round_be))` under the `G2` `_NUL_` DST (non-conformant reuse) | **parse + verify** (since 2026-11-16; self-consistency tests only, no external vector) |
+| `pedersen-bls-chained` (default network) | `G2` (96 B) | `G1` (48 B) | `H2(SHA-256(prev_sig ‖ round_be))`, RFC-9380 `G2` `_NUL_` DST | **parse + verify** |
+| `bls-unchained-on-g1` (deprecated) | `G1` (48 B) | `G2` (96 B) | `H1(SHA-256(round_be))` under the `G2` `_NUL_` DST (non-conformant reuse) | **parse + verify** (self-consistency tests only, no external vector) |
 
 ## Import
 
@@ -153,9 +156,8 @@ damage the genuine quicknet and default-chain fixtures field by field with
 the intact pair as the always-run positive control.
 
 The default-chain beacons come from drand's own Go test suite and
-`drand_core`'s fixtures (api.drand.sh was not reachable when they were
-committed); `tools/fetch_chained.py` re-finds them there and compares
-them with the live API.
+`drand_core`'s fixtures; `tools/fetch_chained.py packages` re-finds them there,
+and its `live` mode compares them with the live API (not yet run, SPEC Backlog).
 
 Provenance: spec/RFC-only — see [SPEC.md](SPEC.md)'s Provenance section
 (no third-party source ported; the genuine quicknet KAT bytes are the

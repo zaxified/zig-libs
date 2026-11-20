@@ -33,9 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BLS/pairing library drand's Go code uses; not a client. |
 | Zig ecosystem | Zig | — | — | — | No Zig drand client found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig drand verifier: pure functions over caller-fetched bytes, `parseInfo` re-derives and checks the chain hash, rejects non-subgroup keys/signatures and `period == 0`, fuzz-tested, KAT against live quicknet data plus a Go oracle driver in `tools/`. **Where we are even:** both League-of-Entropy mainnet networks verify — quicknet (`bls-unchained-g1-rfc9380`) and, since 2026-10-06, the chained default network (`pedersen-bls-chained`), anchored on three genuine default-chain beacons. **Where we are behind:** no `/group` parsing; no transport (deliberate, caller-owned per CONVENTIONS §2).
-
-Re-assessed 2026-10-06 (no new web survey; the table above is unchanged): with the chained default network verified, what a user of the two live mainnet chains needs is covered; what remains (the deprecated scheme, `/group`) is Backlog-grade, so Scope moved mvp -> core.
+**Where we are ahead:** the only Zig drand verifier: pure functions over caller-fetched bytes, `parseInfo` re-derives and checks the chain hash, rejects non-subgroup keys/signatures and `period == 0`, fuzz-tested, KAT against live quicknet data plus a Go oracle driver in `tools/`. **Where we are even:** both League-of-Entropy mainnet networks verify — quicknet (`bls-unchained-g1-rfc9380`) and the chained default network (`pedersen-bls-chained`), anchored on three genuine default-chain beacons. **Where we are behind:** no `/group` parsing; no transport (deliberate, caller-owned per CONVENTIONS §2).
 
 ## What it is
 
@@ -67,7 +65,7 @@ and RECOGNIZES the others.
   `tlock.ciphersuite` (`tlock` targets the identical scheme), so the two
   modules can never disagree on quicknet.
 
-### chained — `pedersen-bls-chained` (verified since 2026-10-06)
+### chained — `pedersen-bls-chained` (verified)
 
 The League of Entropy "default" network (chain hash `8990e7a9…b2ce`,
 period 30 s, genesis 1595431050).
@@ -83,8 +81,7 @@ period 30 s, genesis 1595431050).
   `groupHash` (a test checks the two published documents agree).
 - `m` is hashed to **G2** with RFC 9380 under the **standard** DST
   `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`
-  (`verify.chained_dst`). This SPEC used to say "the older non-RFC-9380
-  DST"; that was wrong. Source: drand/drand v2.1.7 `crypto/schemes.go`
+  (`verify.chained_dst`). Source: drand/drand v2.1.7 `crypto/schemes.go`
   `NewPedersenBLSChained`, which builds its suite with the RFC 9380 G1/G2
   `_NUL_` tags. Confirmed by three genuine beacons verifying under it,
   and by a positive control that they FAIL under the `_POP_` tag, the G1
@@ -99,7 +96,7 @@ period 30 s, genesis 1595431050).
   forged `previous_signature` fails the equation); a caller walking the
   chain can additionally compare it with the round it verified before.
 
-### `bls-unchained-on-g1` (deprecated; verified since 2026-11-16)
+### `bls-unchained-on-g1` (deprecated; verified)
 
 - The deprecated pre-RFC-9380 unchained scheme, kept by drand-client and
   drand/kyber for old networks. Same shape as quicknet: signature in
@@ -123,8 +120,8 @@ period 30 s, genesis 1595431050).
 
 Both verified schemes are standard ciphersuites of
 draft-irtf-cfrg-bls-signature-05 in their **Basic** (`_NUL_`) form, and
-since 2026-10-06 this module verifies through them
-(`bls12_381.scheme`), owning no pairing equation of its own:
+this module verifies through them (`bls12_381.scheme`), owning no pairing
+equation of its own:
 
 | drand scheme | suite | key | signature | message |
 |---|---|---|---|---|
@@ -142,20 +139,6 @@ negated, after `KeyValidate` of BOTH operands (non-identity, order-`r`
 subgroup). `beaconId` is `tlock.ciphersuite`'s, and a comptime check pins
 `tlock`'s `G1` DST to the suite's, so `drand` and `tlock` cannot drift on
 quicknet.
-
-### History: why this was a hand-written pairing until 2026-10-06
-
-`bls12_381` used to offer only `bls_sig`, the min-pk / ProofOfPossession
-suite (`_POP_` DST). That verifies neither drand scheme (quicknet has the
-groups swapped, chained the other DST), so both equations were evaluated
-directly on `bls12_381.pairing` with hand-written identity and
-signature-subgroup guards. When `bls12_381.scheme` gained all six suites,
-the two functions became one call each. The move closed one gap: the
-hand-written versions left the key's subgroup membership to `parseInfo`,
-so `verifyChainedRoundPoints` accepted a genuine beacon under `pk + T`
-for a `G1` cofactor-torsion `T` (the bare equation holds for it; a test
-now pins the refusal). Cost of the added key check: ~0.17 ms (quicknet's
-`G2` key) or ~0.12 ms (chained's `G1` key) of a ~4.3 ms verification.
 
 ### randomness
 
@@ -224,9 +207,8 @@ stop) feeding crafted bytes:
 - **Invalid or non-subgroup public key** → `InvalidPoint` /
   `PublicKeyNotInSubgroup`. drand `KeyValidate` (on-curve + order-`r`
   subgroup, non-identity) runs on the quicknet key at parse time: the
-  subgroup half inside `bls12_381`'s `fromBytesCompressed` (checking since
-  2026-10-03; before, this module ran `subgroupCheck` itself), the
-  identity refusal here. The error names are unchanged.
+  subgroup half inside `bls12_381`'s `fromBytesCompressed`, the
+  identity refusal here.
 - **Non-subgroup beacon signature** → `SignatureNotInSubgroup` at
   `parseRound`, and `false` from `verifyRoundPoints`. The same
   `KeyValidate` obligation applies to the `G1` signature, and the pairing
@@ -250,29 +232,27 @@ stop) feeding crafted bytes:
   `MalformedJson`; a `period` past `u32`
   → `NumberOutOfRange` (drand hashes it as 32 bits), `period == 0` →
   `InvalidPeriod` (no chain has one, and it would be a division by zero in
-  `expectedRound` — SIGFPE in ReleaseFast before the guard existed).
+  `expectedRound`).
 - **Chain hash that the document does not determine** → `ChainHashMismatch`.
   `parseInfo` recomputes drand's `chain.Info.Hash()` —
   `SHA-256(u32be period ‖ u64be genesis ‖ pubkey ‖ groupHash ‖ beaconID
   unless "default")`, `computeChainHash` — and refuses a `/info` whose
-  `hash` disagrees, exactly as drand's own client does. Before this a
-  document carrying quicknet's genuine hash and quicknet-t's KEY was
-  accepted, and quicknet-t rounds then verified "as quicknet" (A1 audit,
-  5/5). Pinned against three live chains; `groupHash` is thereby load-
+  `hash` disagrees, exactly as drand's own client does, so a document
+  carrying quicknet's genuine hash and another chain's KEY is refused.
+  Pinned against three live chains; `groupHash` is thereby load-
   bearing, not decorative.
 - **Identity signature** → `InvalidPoint` at `parseRound` (as the identity
   key is at `parseInfo`).
-- **Chained scheme (`pedersen-bls-chained`), added 2026-10-06.** The G1 key
+- **Chained scheme (`pedersen-bls-chained`).** The G1 key
   and the G2 signature get the same KeyValidate (`PublicKeyNotInSubgroup` /
   `SignatureNotInSubgroup` / `InvalidPoint`); a 96-byte signature that is
-  not a `G2` point is now `InvalidPoint` at `parseRound` (it used to be
-  retained undecoded). Unlike `G1`, a `G2` cofactor-torsion addend was
+  not a `G2` point is `InvalidPoint` at `parseRound`. Unlike `G1`, a `G2` cofactor-torsion addend was
   measured NOT to pass the bare pairing (the ate pairing is bilinear only
   on the order-`r` subgroup of `G2`), so for this scheme the subgroup check
   is defence in depth rather than the only guard; it stays, at parse and
   in `verifyChainedRoundPoints`. The KEY's subgroup check, by contrast, is
   load-bearing at the points level: `pk + T` for a `G1` torsion `T` pairs
-  like `pk`, so only `KeyValidate` refuses it (since 2026-10-06 run inside
+  like `pk`, so only `KeyValidate` refuses it (run inside
   `verifyChainedRoundPoints` too, not only at `parseInfo`). A tampered signature, round,
   `previous_signature` (altered, swapped for another round's, or dropped)
   or `randomness` is refused — each pinned by a test on genuine beacons —
@@ -282,50 +262,65 @@ stop) feeding crafted bytes:
 - **`roundPath`/`latestPath`** validate `chain_hash_hex` as hex
   (`InvalidChainHash`) — it is pasted into a URL path the caller sends.
 
-A `std.testing.fuzz` harness drives arbitrary bytes through both parsers
-and the verify path, asserting no panic / OOB / hang. A second harness
-damages the genuine fixtures field by field (`checkFixture`, decoded
-deterministically from the fuzz bytes): the intact pair MUST verify, a
-pair with an altered key/hash/groupHash MUST fail to parse, and a pair
-with an altered signature, randomness, round or scheme MUST NOT verify.
-The empty input — the one the runner feeds without `--fuzz` — is the
-intact case, so the positive control runs on every gate run; the same
-function also backs deterministic tests. A third harness
-(`checkChainedFixture`, 2026-10-06) does the same over the genuine
-default-chain `/info` and round 1000000, adding `previous_signature` as a
-damaged field; deterministic tests back it too.
+## Verification
 
-## Verification bar / KAT
+Run with `scripts/modtest drand` (`zig build test-drand`).
 
-The genuine known-answer vector is **quicknet round 1000**: the master
-public key (G2) and the round-1000 threshold signature (G1) are the same
-live-fetched League-of-Entropy production bytes `tlock`'s KAT harness
-pins (`modules/tlock/src/kat_test.zig`), which are in turn cross-checked
-there by a pairing-sanity test. `randomness` for round 1000 is
-`SHA-256(signature)` (drand's definition). `verifyRound` returns success
-on the genuine round and rejects: a flipped signature byte, the correct
-signature under the wrong round number, the signature against a
-different chain's key (quicknet-t testnet), and tampered randomness.
-
-**Positive control (permanent):** a test deliberately hashes the round
-number little-endian and shows the genuine KAT then FAILS to verify —
-proving the big-endian round encoding is load-bearing, not incidental.
-
-**Chained default network (2026-10-06).** Three genuine beacons of the
-default chain verify under its genuine `/info` key: round 1 (chained to
-the genesis seed), round 1000000 and round 2634945, plus a second chained
-network's genuine beacon (drand's Go test vector, round 3361396 under key
-`922a2e93…`) under its own key and not under the default's. EXTERNAL
-provenance: rounds 1 and 1000000 (with `randomness`) from `drand_core`
-0.0.19's fixtures (MIT; recorded there from `drand.cloudflare.com`), round
-2634945 and the key from drand/drand v2.1.7 `crypto/schemes_test.go`
-`TestVerifyBeacon`, which verifies them with drand's own scheme.
-api.drand.sh was unreachable from the committing session (egress 403);
-`tools/fetch_chained.py` re-finds every value in both packages and is the
-re-check against the live API. Refusals pinned on these beacons: tampered
-signature, three wrong rounds (incl. `+2^32`), `previous_signature` flipped
-at three positions / swapped / dropped / genesis seed altered, tampered
-randomness, cross-chain, cross-scheme.
+- **KAT.** The genuine known-answer vector is **quicknet round 1000**: the
+  master public key (G2) and the round-1000 threshold signature (G1) are the
+  same live-fetched League-of-Entropy production bytes `tlock`'s KAT harness
+  pins (`modules/tlock/src/kat_test.zig`), which are in turn cross-checked
+  there by a pairing-sanity test. `randomness` for round 1000 is
+  `SHA-256(signature)` (drand's definition). `verifyRound` returns success
+  on the genuine round and rejects: a flipped signature byte, the correct
+  signature under the wrong round number, the signature against a
+  different chain's key (quicknet-t testnet), and tampered randomness.
+- **Positive control (permanent):** a test deliberately hashes the round
+  number little-endian and shows the genuine KAT then FAILS to verify —
+  proving the big-endian round encoding is load-bearing, not incidental.
+- **Chained default network.** Three genuine beacons of the default chain
+  verify under its genuine `/info` key: round 1 (chained to the genesis
+  seed), round 1000000 and round 2634945, plus a second chained network's
+  genuine beacon (drand's Go test vector, round 3361396 under key
+  `922a2e93…`) under its own key and not under the default's. EXTERNAL
+  provenance: rounds 1 and 1000000 (with `randomness`) from `drand_core`
+  0.0.19's fixtures (MIT; recorded there from `drand.cloudflare.com`), round
+  2634945 and the key from drand/drand v2.1.7 `crypto/schemes_test.go`
+  `TestVerifyBeacon`, which verifies them with drand's own scheme.
+  `tools/fetch_chained.py` re-finds every value in both packages; a re-check
+  against the live API is open (Backlog). Refusals pinned on these beacons:
+  tampered signature, three wrong rounds (incl. `+2^32`), `previous_signature`
+  flipped at three positions / swapped / dropped / genesis seed altered,
+  tampered randomness, cross-chain, cross-scheme; positive controls show the
+  `_POP_` DST, the G1 DST and swapped digest order all fail.
+- **Deprecated scheme.** `bls-unchained-on-g1` has self-consistency tests only
+  (see its section); no external anchor.
+- **Parsers and codecs.** Round trips and every malformed variant of both
+  documents (see *Malformed-input handling*), with the document-size limits and
+  the Go-reader integer rules pinned; `computeChainHash` against three live
+  chains; `src/mutation_test.zig` pins the error codes of refusal paths that the
+  whole-module mutation run found untested.
+- **Differential.** `tools/go/main.go` (drand's own Go client, fetched not
+  vendored) and this module (`tools/verify_driver.zig`) agree over live-fetched
+  quicknet and quicknet-t rounds and over the default-chain beacons, and both
+  reject a tampered `previous_signature`; see Anchoring and `tools/README.md`.
+- **Fuzz.** The deterministic driver, `DRAND_FUZZ=<runs>[,<first seed>]`
+  (`src/fuzz_test.zig` holds the shared plumbing), runs three harnesses
+  (`drand-parse`, `drand-verify`, `drand-verify-chained`). One drives arbitrary bytes
+  through both parsers and the verify path, asserting no panic / OOB / hang.
+  A second (`checkFixture`) damages the genuine quicknet fixtures field by
+  field, decoded deterministically from the fuzz bytes: the intact pair MUST
+  verify, a pair with an altered key/hash/groupHash MUST fail to parse, and a
+  pair with an altered signature, randomness, round or scheme MUST NOT verify.
+  The empty input is the intact case, so the positive control runs on every
+  gate run; the same function also backs deterministic tests. The third
+  (`checkChainedFixture`) does the same over the genuine default-chain `/info`
+  and round 1000000, adding `previous_signature` as a damaged field.
+- **Constant time:** n/a — public beacon data, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. That run
+  covers `json_uint.zig`, `round.zig`, `chaininfo.zig` and `verify.zig`; the
+  pairing equation itself lives in `bls12_381.scheme` and is not mutated here.
 
 ## Provenance
 
@@ -334,7 +329,7 @@ third-party implementation studied as a design reference beyond drand's
 publicly documented wire format and verification equation (which are a
 spec, not a copyrightable work — `CONVENTIONS.md` §5 merger doctrine).
 The quicknet KAT bytes are the same genuine, publicly-served beacon data
-`tlock` pins. For the chained scheme (2026-10-06), drand/drand v2.1.7's
+`tlock` pins. For the chained scheme, drand/drand v2.1.7's
 `crypto/schemes.go` (MIT/Apache-2.0) was READ for the DST and the
 `DigestBeacon` construction — facts of the wire protocol, not code; nothing
 was copied — and the test beacons are DATA from drand's
@@ -343,33 +338,22 @@ No `NOTICE` entry is required; the message construction and
 DSTs are documented in `tlock`'s `ciphersuite.zig` (which cites drand's
 Go source) and reused here.
 
-## Deliberately deferred
+## What is deliberately not done
 
 - **HTTP / TLS transport, retries, endpoint discovery, gossip/libp2p**:
   out of scope by design (caller-supplied bytes).
 - **Group file / DKG / distributed-key parsing** (`/group`): not parsed;
   only `/info` and `/public/<round>`.
 
-## Audit 2026-11-17 (whole-module mutation)
-
-162 mutants over every non-test line of `src/json_uint.zig`, `src/round.zig`, `src/chaininfo.zig` and `src/verify.zig`: the Go-style `u64` reader (the negative refusal, the base, the error codes, the frees), `parseRound` and `parseInfo` (document size limit, the JSON options and the error mapping, every hex and length gate, both point decoders with the subgroup / encoding / identity codes and the kept points, the 32-bit period range, the beacon-id limit, every field of the result, the chain-hash check), the request paths and the chain-hash charset gate, `Scheme.fromId` / `isVerifiable`, `computeChainHash` (each hashed part and its endianness, the beacon-id rule), and in `verify`: the three messages (quicknet `beaconId`, the chained `SHA-256(previous ‖ round_be)`, the deprecated scheme's DST), the equation verdict and error code of each of the three scheme arms, the group-size and missing-point guards, the randomness check, and `expectedRound`. The pairing equation itself lives in `bls12_381.scheme` and is not mutated here. One ReleaseSafe schemata build, plus a second one that already carried the new tests.
-
-121 mutants died on the existing suite. 14 tests were added in `src/mutation_test.zig` (imported from `root.zig`) and with them 37 more die: a string token (also an escaped one) is `UnexpectedToken` and leaves nothing allocated; `signatureG2` of a G1 round is `InvalidPoint`; an empty signature is `InvalidHex`, and so is an odd-length one past the buffer (the even one is `InvalidLength`); documents of exactly `max_document_bytes` parse (both parsers); unknown fields are ignored (the Go reference ignores them); an allocation failure is `OutOfMemory`, not `MalformedJson`; a 48-byte signature that is no G1 encoding is `InvalidPoint` (not `SignatureNotInSubgroup`); 33-byte and non-hex `randomness` get their own codes; `Scheme.fromId` is an exact match and `isVerifiable` is true for exactly three schemes; `hash` / `groupHash` of the wrong width are `InvalidLength`, a non-hex one `InvalidHex`; an empty, odd, over-96-byte and point-less `public_key` (both groups) each get their own error; period 2^32 - 1 passes the range check while 2^32 is `NumberOutOfRange`; a 64-byte `beaconID` is kept, 65 is `InvalidLength`; and `verifyRound` of a hand-built quicknet or deprecated-scheme value reports `MissingPublicKey` / `MissingSignature` (only the chained arm was pinned). No verification check survives: the equation verdict, the message construction (all three schemes), the signature and key subgroup / identity guards, the randomness comparison and the round arithmetic are all killed.
-
-4 do not die, none of them a defect:
-
-- 2 EQUIVALENT: an empty beacon id folded into the chain hash is a zero-byte update; `expectedRound` special-casing `now == genesis_time` answers 1 either way.
-- 2 UNOBSERVABLE: the free of an `allocated_number` token in `json_uint` (only a streaming source that splits a number across a refill produces one; both parsers read a slice into an arena, the injection would be a chunked `std.json.Reader` over `Uint64`); the `catch false` of `verifyDeprecatedUnchainedPoints` (`coreAggregateVerify` errors only on an empty or length-mismatched set, and the call passes exactly one key and one message).
-
-Not mutated: the comptime constants (`max_document_bytes`, `max_beacon_id_bytes`, the key and signature widths, `default_beacon_id`), the `comptime` DST assertions, the `meta` block, `json_uint`'s token-type arms beyond their error codes, and `tools/` (the Go differential oracle). Counts on the card are whole-module.
-
 ## Backlog / deferred
 
-- ~~**Chained-scheme verification (`pedersen-bls-chained`)**~~ — DONE 2026-10-06 (see "chained — `pedersen-bls-chained`"); the DST turned out to be the standard RFC 9380 G2 tag, not a legacy one.
-- **Live re-check of the chained fixtures** *(2026-10-06)* — `tools/fetch_chained.py live` was not run (api.drand.sh blocked from the committing session); the fixtures come from two published packages. The Go differential for the chained scheme is done (2026-11-17, `tools/go/main.go` + `fetch_chained.py export`: 3/3 agree, a tampered `previous_signature` rejected 3/3 by both); a live re-fetch of the beacons is still open.
-- ~~**`bls-unchained-on-g1`** *(survey 2026-09-30)* — deprecated non-conformant DST; only for retro-compatibility.~~ ✅ DONE 2026-11-16 — verified through `QuicknetSuite.coreAggregateVerify` under the G2 `_NUL_` DST (see "`bls-unchained-on-g1`"). Open follow-up: no genuine beacon of an old `bls-unchained-on-g1` network is in the repo, so the tests are self-consistency only; add a real vector when one is available.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Live re-check of the chained fixtures** — `tools/fetch_chained.py live`
+  has not been run against the live API; the fixtures come from two published
+  packages (`packages` mode re-finds them there). A live re-fetch of the
+  beacons would close it.
+- **A genuine `bls-unchained-on-g1` beacon** — none is in the repository, so
+  that scheme's tests are self-consistency only; add a real vector when one is
+  available.
 
 ## Anchoring
 

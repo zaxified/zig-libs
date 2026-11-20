@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/` (162 mutants, 158 killed, 4 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 14 tests added in `src/mutation_test.zig` (document and field boundaries, the error code of each refusal, unknown fields, allocation failure, the hand-built-value errors of every scheme arm). No source change, no behaviour change.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** `tools/` only — the Go differential oracle now covers the chained scheme (`pedersen-bls-chained`): `go/main.go` passes `previous_signature`, `fetch_chained.py export` writes the pinned beacons in the oracle input shape; Go and this module agree on 3/3 genuine beacons and both reject 3/3 with a tampered predecessor. No `src/` change.
 - **2026-11-16** — **BEHAVIOURAL, API ADDED:** the deprecated `bls-unchained-on-g1` scheme now verifies. `Scheme.isVerifiable` is true for it, `parseInfo` decodes and `KeyValidate`s its 96-byte `G2` key into `pubkey_g2` (a 48-byte key under that label is now `InvalidLength`; before, any key parsed), and `verifyRound` returns the usual typed errors instead of `UnsupportedScheme`. New `verify.deprecated_unchained_dst` (the `G2` `_NUL_` tag hashed to `G1`, drand's known non-conformance) and `verify.verifyDeprecatedUnchainedPoints(pk_g2, round, sig_g1)`. Tests are self-consistency only (no external vector for this scheme is in the repo); they pin that the two DSTs are not interchangeable.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
@@ -148,15 +146,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   decoded POINTS rather than a parse count, since the two things the verify
   path stands on are the G2 key and the G1 signature.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
-  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
-  helper existed **33 times across 12 modules in three shapes**, each carrying its
-  own note about the same trap (the returned array has to be container-level or
-  the slice dangles with the right length and garbage behind it). Proved
-  byte-identical to the copies it replaces before they were deleted, and the
-  comparison test was itself broken on purpose first to show it was not vacuous.
-  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
-  imports changed.
 
 - **2026-09-07** — A1 security audit, the four HIGH findings fixed. **BEHAVIOURAL, not
   breaking, plus new error values:** `parseInfo` now refuses a `/info` whose `hash` is not the
