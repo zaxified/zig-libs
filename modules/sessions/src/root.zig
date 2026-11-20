@@ -2741,7 +2741,10 @@ test "corpus: every cookie seed reaches find, and the ids recovered are pinned" 
     // Measured 2026-09-07. Before: 1 round, `find("", …)`, 0 ids.
     try testing.expectEqual(cookie_header_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 5), found);
-    try testing.expectEqual(@as(usize, 124), id_octets);
+    // 2026-11-20: 124 -> 119 when `cookies` began splitting on every `;`, quoted or
+    // not (the cookie-sandwich fix): a seed whose quoted value held a `;` now ends
+    // its id at that `;`.
+    try testing.expectEqual(@as(usize, 119), id_octets);
 }
 
 test "Manager.init rejects an out-of-range id_bytes in every build mode" {
