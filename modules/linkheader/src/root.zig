@@ -180,6 +180,7 @@ pub fn validate(link: Link) error{InvalidLink}!void {
     }
     const quoted_fields = [_]?[]const u8{ link.rel, link.anchor, link.title, link.type, link.hreflang, link.media };
     for (quoted_fields) |f| if (f) |v| try checkQuotable(v);
+    if (link.hreflang) |v| if (!isLanguageTag(v)) return error.InvalidLink;
     if (link.title_star) |v| if (!isExtValue(v)) return error.InvalidLink;
     for (link.extra) |p| {
         if (p.name.len == 0) return error.InvalidLink;
@@ -496,7 +497,7 @@ pub fn decodeExtValue(out: []u8, raw: []const u8) ExtValueError!ExtValue {
 /// into `out` — what `Link.title_star` or a `*`-param in `extra` carries.
 /// Every byte outside `attr-char` is `%XX` (upper-case hex, RFC 3986 §2.1).
 pub fn encodeExtValue(out: []u8, language: []const u8, text: []const u8) error{ NoSpaceLeft, InvalidExtValue, InvalidUtf8 }![]const u8 {
-    for (language) |c| if (!(ascii.isAlphanumeric(c) or c == '-')) return error.InvalidExtValue;
+    if (language.len != 0 and !isLanguageTag(language)) return error.InvalidExtValue;
     if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
     var w: std.Io.Writer = .fixed(out);
     w.print("UTF-8'{s}'", .{language}) catch return error.NoSpaceLeft;
@@ -514,8 +515,8 @@ pub fn encodeExtValue(out: []u8, language: []const u8, text: []const u8) error{ 
 const ExtParts = struct { charset: []const u8, language: []const u8, chars: []const u8 };
 
 /// `charset'language'value-chars`, the charset a non-empty `mime-charset`
-/// and the language `ALPHA`/`DIGIT`/`-` only (the Language-Tag alphabet; its
-/// finer structure is not checked). `chars` is not checked here.
+/// and the language empty or a well-formed RFC 5646 Language-Tag
+/// (`isLanguageTag`). `chars` is not checked here.
 fn splitExt(raw: []const u8) ?ExtParts {
     const q1 = std.mem.findScalar(u8, raw, '\'') orelse return null;
     const q2 = std.mem.findScalarPos(u8, raw, q1 + 1, '\'') orelse return null;
@@ -523,8 +524,91 @@ fn splitExt(raw: []const u8) ?ExtParts {
     const language = raw[q1 + 1 .. q2];
     if (charset.len == 0) return null;
     for (charset) |c| if (!isMimeCharsetc(c)) return null;
-    for (language) |c| if (!(ascii.isAlphanumeric(c) or c == '-')) return null;
+    if (language.len != 0 and !isLanguageTag(language)) return null;
     return .{ .charset = charset, .language = language, .chars = raw[q2 + 1 ..] };
+}
+
+/// Whether `tag` is a well-formed RFC 5646 §2.1 Language-Tag (the ABNF, not
+/// validity against the IANA registry): `langtag` (language, up to three
+/// extlang subtags, script, region, variants, extensions, private use), a
+/// `privateuse` tag (`x-...`) or one of the 26 grandfathered tags. Case does
+/// not matter. A tag is 1-8 alphanumeric characters per subtag, joined by
+/// single `-`; the empty string is not a tag.
+fn isLanguageTag(tag: []const u8) bool {
+    const grandfathered = [_][]const u8{
+        "en-GB-oed", "i-ami",     "i-bnn",     "i-default",  "i-enochian",  "i-hak",  "i-klingon",
+        "i-lux",     "i-mingo",   "i-navajo",  "i-pwn",      "i-tao",       "i-tay",  "i-tsu",
+        "sgn-BE-FR", "sgn-BE-NL", "sgn-CH-DE", "art-lojban", "cel-gaulish", "no-bok", "no-nyn",
+        "zh-guoyu",  "zh-hakka",  "zh-min",    "zh-min-nan", "zh-xiang",
+    };
+    for (grandfathered) |g| if (ascii.eqlIgnoreCase(tag, g)) return true;
+
+    var it = std.mem.splitScalar(u8, tag, '-');
+    var cur: ?[]const u8 = it.next();
+    // Every subtag is 1-8 alphanumeric characters (also the empty tag, which
+    // yields one empty subtag, and `a--b`, `-a`, `a-`).
+    {
+        var chk = std.mem.splitScalar(u8, tag, '-');
+        while (chk.next()) |sub| {
+            if (sub.len == 0 or sub.len > 8) return false;
+            for (sub) |c| if (!ascii.isAlphanumeric(c)) return false;
+        }
+    }
+    const first = cur.?;
+    // privateuse: "x" 1*("-" 1*8alphanum)
+    if (first.len == 1 and (first[0] == 'x' or first[0] == 'X')) return it.peek() != null;
+
+    // language = 2*3ALPHA ["-" extlang] / 4ALPHA (reserved) / 5*8ALPHA
+    if (first.len < 2 or !allAlpha(first)) return false;
+    cur = it.next();
+    if (first.len <= 3) {
+        // extlang = 3ALPHA *2("-" 3ALPHA)
+        var n: usize = 0;
+        while (n < 3) : (n += 1) {
+            const sub = cur orelse return true;
+            if (sub.len != 3 or !allAlpha(sub)) break;
+            cur = it.next();
+        }
+    }
+    // script = 4ALPHA
+    if (cur) |sub| if (sub.len == 4 and allAlpha(sub)) {
+        cur = it.next();
+    };
+    // region = 2ALPHA / 3DIGIT
+    if (cur) |sub| if ((sub.len == 2 and allAlpha(sub)) or (sub.len == 3 and allDigit(sub))) {
+        cur = it.next();
+    };
+    // variant = 5*8alphanum / (DIGIT 3alphanum)
+    while (cur) |sub| {
+        if (sub.len >= 5 or (sub.len == 4 and ascii.isDigit(sub[0]))) cur = it.next() else break;
+    }
+    // extension = singleton 1*("-" 2*8alphanum), singleton = any but "x"
+    while (cur) |sub| {
+        if (sub.len != 1 or sub[0] == 'x' or sub[0] == 'X') break;
+        cur = it.next();
+        var n: usize = 0;
+        while (cur) |ext| : (cur = it.next()) {
+            if (ext.len < 2) break;
+            n += 1;
+        }
+        if (n == 0) return false;
+    }
+    // privateuse
+    if (cur) |sub| {
+        if (sub.len == 1 and (sub[0] == 'x' or sub[0] == 'X')) return it.peek() != null;
+        return false;
+    }
+    return true;
+}
+
+fn allAlpha(s: []const u8) bool {
+    for (s) |c| if (!ascii.isAlphabetic(c)) return false;
+    return true;
+}
+
+fn allDigit(s: []const u8) bool {
+    for (s) |c| if (!ascii.isDigit(c)) return false;
+    return true;
 }
 
 /// What the builder accepts as a `*`-param value: a UTF-8 ext-value whose
@@ -1621,4 +1705,87 @@ test "params: an empty name is not a param" {
     var ps = l.params();
     try testing.expectEqualStrings("rel", ps.next().?.name);
     try testing.expect(ps.next() == null);
+}
+
+// ── RFC 5646 Language-Tag structure (hreflang, ext-value language) ───────────
+
+test "isLanguageTag: RFC 5646 §A examples and every ABNF production are well formed" {
+    const good = [_][]const u8{
+        // simple language subtags, with an extlang, a script, a region, variants
+        "de",          "fr",                     "ja",                      "i-enochian",           "zh-Hant",         "zh-Hans",
+        "sr-Cyrl",     "sr-Latn",                "zh-cmn-Hans-CN",          "cmn-Hans-CN",          "zh-yue-HK",       "de-CH-1901",
+        "sl-IT-nedis", "hy-Latn-IT-arevela",     "de-DE",                   "en-US",                "es-419",          "de-419",
+        "sl-rozaj",    "sl-rozaj-biske",         "sl-nedis",                "de-CH-1996",           "de-Latn-DE-1996",
+        // extensions, private use
+        "en-a-bbb-x-a-ccc",
+        "de-a-value",  "en-US-u-islamcal",       "zh-CN-a-myext-x-private", "en-a-myext-b-another", "x-whatever",      "en-x-a-b-x",
+        "en-x-a-x-b",  "qaa-Qaaa-QM-x-southern", "de-Qaaa",                 "sr-Latn-QM",           "sr-Qaaa-RS",
+        // grandfathered (irregular and regular), any case
+             "en-GB-oed",
+        "i-klingon",   "I-DEFAULT",              "sgn-BE-FR",               "art-lojban",           "zh-min-nan",      "ZH-GUOYU",
+        // case does not matter
+        "EN-us",       "ZH-hant-tw",             "X-PRIVATE",
+        // reserved 4-letter and long (5-8) languages
+                      "abcd",                 "abcde",           "abcdefgh",
+    };
+    for (good) |t| testing.expect(isLanguageTag(t)) catch |e| {
+        std.debug.print("not accepted: {s}\n", .{t});
+        return e;
+    };
+}
+
+test "isLanguageTag: malformed tags are refused" {
+    const bad = [_][]const u8{
+        "",           "-",                  "en-",       "-en",          "en--US",    "e",            "1en",         "en_US",
+        "en US",      "en-US-",             "abcdefghi", "en-abcdefghi", "e1",        "en-Latn-Latn", "en-US-US",
+        // wrong order: script after region, region after variant
+           "en-US-Latn",
+        "en-1996-US",
+        // extlang: more than three, or a language of 4+ letters before one
+        "zh-aaa-bbb-ccc-ddd", "abcd-aaa",
+        // variant of 4 chars that does not start with a digit, of fewer than 4
+         "de-CH-abcd",   "de-CH-199",
+        // an extension without subtags, a 1-char extension subtag
+        "en-a",         "en-a-b",      "en-a-bb-c",
+        "en-US-a",
+        // privateuse without subtags
+           "x",                  "en-x",      "en-US-x",      "x-",        "en-x-",
+        // a grandfathered prefix is not a grandfathered tag
+               "i-klingon-x", "en-GB-oedx",
+        "i-unknown",
+        // alphabet
+         "en-U$",              "en-\u{e9}", "d\x00",
+    };
+    for (bad) |t| testing.expect(!isLanguageTag(t)) catch |e| {
+        std.debug.print("accepted: {s}\n", .{t});
+        return e;
+    };
+}
+
+test "hreflang: the builder writes a well-formed Language-Tag and refuses the rest" {
+    var buf: [128]u8 = undefined;
+    const ok = try bufPrint(&buf, &.{.{ .uri = "/a", .rel = "alternate", .hreflang = "zh-Hant-TW" }});
+    try testing.expectEqualStrings("</a>; rel=\"alternate\"; hreflang=\"zh-Hant-TW\"", ok);
+    for ([_][]const u8{ "", "en_US", "en-", "english-us-x", "e", "en US" }) |bad| {
+        try testing.expectError(error.InvalidLink, bufPrint(&buf, &.{.{ .uri = "/a", .rel = "alternate", .hreflang = bad }}));
+        try testing.expectError(error.InvalidLink, validate(.{ .uri = "/a", .rel = "alternate", .hreflang = bad }));
+    }
+    // The parser stays lenient: the value comes back as written.
+    var it = parse("</a>; rel=alternate; hreflang=\"en_US\"");
+    try testing.expectEqualStrings("en_US", it.next().?.hreflang.?);
+}
+
+test "ext-value language: a Language-Tag structure, not just its alphabet" {
+    var b: [64]u8 = undefined;
+    try testing.expectEqualStrings("zh-Hant-TW", (try decodeExtValue(&b, "UTF-8'zh-Hant-TW'a")).language);
+    try testing.expectEqualStrings("x-priv", (try decodeExtValue(&b, "UTF-8'x-priv'a")).language);
+    try testing.expectError(error.InvalidExtValue, decodeExtValue(&b, "UTF-8'en-'a"));
+    try testing.expectError(error.InvalidExtValue, decodeExtValue(&b, "UTF-8'1en'a"));
+    try testing.expectError(error.InvalidExtValue, decodeExtValue(&b, "UTF-8'en--US'a"));
+    try testing.expectEqualStrings("UTF-8'sr-Latn-RS'x", try encodeExtValue(&b, "sr-Latn-RS", "x"));
+    try testing.expectError(error.InvalidExtValue, encodeExtValue(&b, "en-", "x"));
+    try testing.expectError(error.InvalidExtValue, encodeExtValue(&b, "1", "x"));
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidLink, bufPrint(&buf, &.{.{ .uri = "/a", .rel = "next", .title_star = "UTF-8'en-'a" }}));
+    _ = try bufPrint(&buf, &.{.{ .uri = "/a", .rel = "next", .title_star = "UTF-8'en-GB-oed'a" }});
 }

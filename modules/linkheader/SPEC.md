@@ -38,7 +38,7 @@ parameters and hostile quoting (no early split on a quoted `,`, `;` or `>`, forw
 five worked examples of RFC 8288 §3.5 are byte-exact fixtures with the errata list checked; `find` matches a single token
 of a multi-relation `rel`; the builder refuses header injection (CR/LF, `>` in a URI, control bytes) instead of writing it.
 **Where we are behind** (re-checked 2026-10-04): no keyed-by-rel dictionary (requests' `links` shape — `find` and the
-iterator cover the use), no Language-Tag structure check on `hreflang`/ext-value languages, charsets other than UTF-8 in
+iterator cover the use), charsets other than UTF-8 in
 ext-values are refused (RFC 8187 reserves them). Built since the survey: every parameter (`Link.params()`/`param()`, and
 `anchor`/`media`/`title*` as fields, `extra` on build), RFC 8187 `decodeExtValue`/`encodeExtValue` + `preferredTitle`,
 `unquote`, RFC 3986 `resolve` for relative targets and anchors.
@@ -65,12 +65,14 @@ ext-values are refused (RFC 8187 reserves them). Built since the survey: every p
   `validate` before any byte of that link — not even its `", "` separator — is written: empty `rel`;
   a URI byte that is a control, SP, DEL, `<`, `>` or `"` (none is legal in a URI-Reference, `>`
   would end it, CR/LF would split the header); a quoted value with a control byte other than HTAB
-  or DEL (RFC 9110 `qdtext`/`quoted-pair`); a `*`-param that is not a UTF-8 ext-value with
+  or DEL (RFC 9110 `qdtext`/`quoted-pair`); an `hreflang` that is not a well-formed RFC 5646
+  Language-Tag (RFC 8288 §3.4.1); a `*`-param that is not a UTF-8 ext-value with
   well-formed `%XX`/`attr-char` value-chars (producers MUST use UTF-8, RFC 8187 §3.2.1); an `extra`
   name that is not a non-empty token. Non-ASCII bytes in a URI are passed through.
 - **RFC 8187.** `decodeExtValue(out, raw)` splits `charset'language'value-chars`, requires a
-  non-empty `mime-charset`, a language of ALPHA/DIGIT/`-` (Language-Tag's alphabet; its finer
-  structure is not checked), decodes `%XX` (either case) and `attr-char`, refuses any other byte,
+  non-empty `mime-charset`, a language that is empty or a well-formed RFC 5646 Language-Tag
+  (the §2.1 ABNF: language with extlang, script, region, variants, extensions, private use, or one of
+  the 26 grandfathered tags, any case; not validity against the IANA registry), decodes `%XX` (either case) and `attr-char`, refuses any other byte,
   refuses charsets other than UTF-8 (`UnsupportedCharset`) and non-UTF-8 results (`InvalidUtf8`).
   `encodeExtValue` writes `UTF-8'<lang>'` and `%XX` (upper-case hex) for every non-`attr-char`.
   `Link.preferredTitle(out)` returns the decoded `title*` if it decodes, else the unquoted `title`
@@ -92,7 +94,7 @@ ext-values are refused (RFC 8187 reserves them). Built since the survey: every p
 Not a security control, but hardened against desync: quotes, escapes, and commas/semicolons inside
 the `<uri>` or inside quoted values are handled so a crafted header cannot split a link early or
 run the scanner off the end; forward progress out of any malformed segment is guaranteed. It does
-**not** validate or percent-decode URIs on parse, does not check Language-Tag structure, decodes
+**not** validate or percent-decode URIs on parse, does not check the Language-Tag structure of a parsed `hreflang` (it comes back as written), decodes
 only UTF-8 ext-values, and does not parse the whole `Link:` header line (it works on the header
 *value*). The builder is injection-safe: no value it accepts can carry a CR, LF or other control
 byte into the header, or end a URI or quoted string early. Nothing is secret, so no constant-time
@@ -144,8 +146,6 @@ deterministic driver, harnesses `linkheader-parse`, `linkheader-roundtrip`, `lin
 
 - **A keyed-by-rel map** (requests' `links` shape): needs an allocator or a caller-sized table; `find` and the
   iterator cover the use without either.
-- **Language-Tag (RFC 5646) structure checks** on `hreflang` and the language of an ext-value (only the alphabet
-  ALPHA/DIGIT/`-` is checked today).
 - **Ext-value charsets other than UTF-8** (`UnsupportedCharset`): RFC 8187 §3.2.1 reserves them and requires
   recipients to support only UTF-8.
 
