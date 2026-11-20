@@ -1303,10 +1303,11 @@ pir	ReleaseFast	reconstruct	1	1	3002fadb4727b09e	b6ecd96f96e9b339
 # First pinned 2026-09-15. Each target taints ONE party's secrets, and the
 # other party runs untainted first, so nothing public on the wire counts as
 # secret. The non-zeros are itemised in each module's SPEC.md § constant time.
-# ⚠ opaque's source pin hashes only modules/opaque/src/root.zig, while the
-# pattern also matches voprf's and ct25519's root.zig by basename. An edit to
-# voprf does NOT turn these rows red by digest; re-run `--check opaque` after
-# one.
+# ⚠ opaque's source pin hashes only the pattern files that exist in modules/opaque/src
+# (root.zig and protocol.zig), while the pattern also matches voprf's root/protocol/groups/h2c
+# and ct25519's root.zig by basename. An edit to voprf does NOT turn these rows red by digest;
+# re-run `--check opaque` after one. The in-file contexts are itemised in opaque's SPEC.md
+# § Constant time (2026-11-21 re-read with --stacks: 4 / 11 / 2, same contexts).
 # opaque 2026-11-13: re-pinned source digest only (root.zig gained InputTooLong in three error
 # sets; PATTERN widened to voprf's new protocol/groups/h2c files). --check opaque measured
 # 4 / 11 / 2 in-file, outputs unchanged: the same contexts.
@@ -2275,6 +2276,24 @@ webhooksig	ReleaseFast	verify	1	0	691f63387d17ed1d	b517d0804f4a93d2
 webhooksig	ReleaseFast	sign	1	77	691f63387d17ed1d	854ae236c5fea038
 webhooksig	ReleaseFast	keys	1	1	691f63387d17ed1d	4fb3c2a0bf839a0e
 webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
+# mcp (2026-11-21) — the `StateSeal` HMAC key (request-state integrity). Three targets; the
+# harness taints only the 32-byte key and drives seal / open through the public API.
+# seal 16 = the PUBLIC MAC through the token's base64url encoder: std base64 `encode`
+#   (base64.zig:130, called from root.zig `StateSeal.seal`) indexes its alphabet table by
+#   each 6-bit group of the tainted MAC before the caller can declassify it. The HMAC itself
+#   is public by design and no context touches the key. 16 = the groups of the 32 MAC octets.
+# open 4 = `StateSeal.open`'s `if (!timing_safe.eql(...)) return error.StateInvalid`
+#   (root.zig:2257), once per call of the four the harness makes (genuine, one MAC octet
+#   flipped, rebound to another principal, expired). The accept/reject verdict is the value
+#   `open` returns to the caller by contract (StateInvalid versus the payload) and is not
+#   secret; the compare itself is `timing_safe.eql`, which raises no context of its own.
+#   The MAC is checked before the expiry, so the expired call also passes the verdict.
+# control >=1 = POSITIVE CONTROL: the same HMAC under the tainted key compared with an
+#   early-exit `std.mem.eql` in the harness; its branch on the key-derived tag must flag,
+#   or the zeros of the other rows would mean "the taint never arrived".
+mcp	ReleaseFast	seal	1	16	06378da3f36df69e	e0ed633eec25c1a0
+mcp	ReleaseFast	open	1	4	06378da3f36df69e	68a492911d53a84a
+mcp	ReleaseFast	control	1	>=1	f58c2a60efeb0f78	77618407a4b8daaf
 # xmlenc, 2026-11-13 (sweep hB): the RSA private key (OAEP, v1.5), the KEK (kw-aes) and
 # through them the CEK, driven through `decryptData` on a real EncryptedData. NO context is
 # xmlenc's own except the CBC plaintext length. Every non-zero is attributed below (the

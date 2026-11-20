@@ -206,14 +206,29 @@ ristretto255 configuration only.
 | `serverke2` | server private key, `oprf_seed`, server keyshare seed, `masking_key` | 2 |
 
 The source pattern also matches the sibling `voprf` and `ct25519` sources, so their constant-time property is
-this module's for every byte that flows through them. The kinds of in-file context accepted as non-leaks are verdicts of checks that
-always pass on secret-derived values (identity rejection and canonicity tests on `H(password)` and on the
-blind), verdicts that are public by protocol (the envelope MAC check and the server MAC check: success or
-failure of a login is what the peer learns anyway), and, in `login` only, `server_public_key` decoded after
-`Recover` has succeeded, which memcheck sees as secret because it is unmasked with a password-derived pad
-but which is the server's public key. The secret-scalar multiplications (`blind`, `blindEvaluate`,
-`unblind`, the key-pair derivations, the 3DH Diffie-Hellman steps) run on `ct25519` and contribute no
-context. The itemisation behind these classes was made against an earlier layout of `voprf`; see *Open*.
+this module's for every byte that flows through them. Every in-file context, by the function that holds the
+branch, and why it is not a leak:
+
+- **`voprf` `hashToGroup`, identity rejection** (`register` 1, `login` 1): `if (G.isIdentity(p))` on
+  `HashToGroup(password)`. A verdict that is false for every password except with negligible probability.
+- **`voprf` `deriveKeyPair`, zero test** (`register` 1, `login` 2, `serverke2` 2): the RFC 9497 §3.2.1 loop's
+  `timing_safe.eql(sk, 0)` followed by `continue`, on the derived scalar. Reached once per key derivation: the
+  client AKE key pair (`register`; `login` on KE1 and again inside `Recover`) and, in `serverke2`, the OPRF key
+  and the server AKE key pair. False except with negligible probability, and the loop count it controls is the
+  RFC's.
+- **`voprf` `unblind` canonicity test** (`register` 2, `login` 2): `deserializeScalar` on the blind, i.e. std's
+  `rejectNonCanonical` verdict inlined into it (two contexts at distinct addresses of that one line). The blind is
+  a canonical scalar by construction.
+- **`opaque` `recover`, envelope MAC check** (`login` 1): `!timing_safe.eql(envelope.auth_tag, expected_tag)`.
+  Public by protocol: success or failure of a login is what the peer learns anyway.
+- **`opaque` `generateKE3`, server MAC check** (`login` 1): `!timing_safe.eql(server_mac, expected)`. Same class.
+- **`opaque` `diffieHellman` on the recovered `server_public_key`** (`login` 4): the element decode
+  (std ristretto255 `rejectNonCanonical` two branches, the `fromBytes` encoding check, `voprf` `decode`'s identity
+  rejection). `Recover` has already succeeded, so the key is the server's public key; memcheck sees it as secret
+  because it is unmasked with a password-derived pad. The other two DH steps decode wire values and raise nothing.
+
+The secret-scalar multiplications (`blind`, `blindEvaluate`, `unblind`, the key-pair derivations, the 3DH
+Diffie-Hellman steps) run on `ct25519` and contribute no context.
 
 ## Secret residue on the dead stack
 
@@ -318,13 +333,6 @@ Offline. Run `scripts/modtest opaque`.
   registration plus a login; genuine accepted, flipped refused) and `opaque-hostile` (hostile wire messages); each
   harness has an in-suite reach check.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
-
-## Open
-
-- **ctgrind in-file contexts not re-itemised.** The context-by-context itemisation behind *Constant time* was made
-  before `voprf` was restructured (its `deriveKeyPair` zero test has since become a `timing_safe.eql` compare, and
-  the harness pattern was widened to its new files); the pinned counts are unchanged but which branch each context is
-  has not been re-read. Run `scripts/checks/ctgrind.sh opaque` with `--stacks` and re-itemise.
 
 ## Backlog / deferred
 

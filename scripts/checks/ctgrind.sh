@@ -340,6 +340,8 @@ declare -A TARGETS=(
     [jwe]="content kw ecdh pbes2 rsa"
     # ── 2026-11-13: webhooksig: HMAC secrets + signature compare, Standard Webhooks key text, Ed25519 whsk_ ──
     [webhooksig]="verify sign keys ed25519"
+    # ── 2026-11-21: mcp: the StateSeal HMAC key (seal / open) + a positive control (early-exit compare of the tainted tag) ──
+    [mcp]="seal open control"
     # ── 2026-11-13: xmlenc: RSA private key (OAEP, v1.5), KEK (kw-aes), CEK -> CBC/GCM content ──
     [xmlenc]="oaep cbc rsa15 kw"
     # ── 2026-11-13: saml: the SP RSA key signing a LogoutRequest / redirect query ──
@@ -441,6 +443,7 @@ declare -A MODES=(
     [jwt]="ReleaseFast"
     [jwe]="ReleaseFast"
     [webhooksig]="ReleaseFast"
+    [mcp]="ReleaseFast"
     [xmlenc]="ReleaseFast"
     [saml]="ReleaseFast"
     [minisign]="ReleaseFast"
@@ -895,6 +898,11 @@ declare -A PATTERN=(
     [webhooksig/sign]='root[.]zig|burn[.]zig'
     [webhooksig/keys]='root[.]zig|burn[.]zig'
     [webhooksig/ed25519]='root[.]zig|burn[.]zig'
+    # mcp (2026-11-21): the module's own `root.zig` (StateSeal lives there). `control` is the
+    # positive control: std's early-exit `mem.eql` on the tainted tag, no own source.
+    [mcp/seal]='root[.]zig'
+    [mcp/open]='root[.]zig'
+    [mcp/control]='mem[.]zig|ctgrind_harness[.]zig'
     [xmlenc/oaep]='root[.]zig|burn[.]zig'
     [xmlenc/cbc]='root[.]zig|burn[.]zig'
     [xmlenc/rsa15]='root[.]zig|burn[.]zig'
@@ -1269,6 +1277,9 @@ declare -A LABEL=(
     [webhooksig/sign]='webhooksig sign (every scheme, secret tainted; the public-MAC encoders are the count)'
     [webhooksig/keys]='webhooksig standard.decodeSecret + encodeSecret (whsec_ body tainted)'
     [webhooksig/ed25519]='webhooksig decodeSigningKey (both whsk_ layouts) + signEd25519 (seed tainted)'
+    [mcp/seal]='mcp StateSeal.seal (HMAC key tainted; the public-MAC base64url encoder is the count)'
+    [mcp/open]='mcp StateSeal.open (HMAC key tainted; genuine, flipped, rebound, expired)'
+    [mcp/control]='mcp POSITIVE CONTROL: early-exit mem.eql of the key-derived tag (key tainted, must flag)'
     [xmlenc/oaep]='xmlenc decryptData rsa-oaep-mgf1p + AES-256-GCM (rsa secret members tainted)'
     [xmlenc/cbc]='xmlenc decryptData rsa-oaep-mgf1p + AES-128-CBC + XML-Enc unpad (rsa secret members tainted)'
     [xmlenc/rsa15]='xmlenc decryptData rsa-1_5 + AES-256-GCM (rsa secret members tainted)'

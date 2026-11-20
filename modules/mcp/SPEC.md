@@ -8,9 +8,9 @@
 
 **Ahead:** correctness — the Go SDK v1.8.0 (the speed reference) answers `prompts/get` for a prompt whose argument is declared required, with that argument left out, by calling the handler anyway and returning what it renders (`"Hello, !"`); prompts.mdx "Error Handling" says servers SHOULD answer missing required arguments with -32602, which this module does without calling the handler (test "lead: prompts/get without a required argument is -32602", probe `tools/go_lead`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 3aff7bfc56c5aa96
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 45c06e750dce9601
 
-**Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct n/a — the only secret is the `StateSeal` HMAC-SHA-256 key, whose MAC is compared with `std.crypto.timing_safe.eql`; no ctgrind row covers it yet; the secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
+**Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct 2026-11-21 (ctgrind, the `StateSeal` HMAC-SHA-256 key tainted: seal 16 in-file = the public MAC through std base64url, open 4 = the `timing_safe.eql` accept/reject verdict that `open` returns by contract, unattributed 0, positive control flags; itemised in `scripts/checks/ctgrind-expected.tsv`); the secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
 
 **Performance:** ref 0.03–0.09× modelcontextprotocol/go-sdk v1.8.0 (Go 1.26.8; `zig build bench-mcp`, five stdio sessions of 64 requests; the TypeScript SDK needs Node, not on this host) · fastest 0.44× rmcp 3.7.0 (Rust, tokio current-thread; it validates no schemas on this path, see `tools/rs_field`) (measured 2026-10-24)
 
@@ -433,8 +433,20 @@ that the user who opens it is the user it was minted for) is the application's, 
   since random bytes never form a request), `mcp-schema-check`, `mcp-uri-template` and `mcp-client-response` (pending
   entries pre-armed, so `SamplingResult.parse`, `parseContentBlock`, `ElicitationResult.parse` and the error-object
   decode are reached and asserted to be). A fixed seed loop with reach checks runs in every test run.
-- **Constant time:** the `StateSeal` MAC is compared with `std.crypto.timing_safe.eql` (`src/root.zig`); no ctgrind row
-  covers it.
+- **Constant time (ctgrind):** `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh mcp`; the pinned counts are
+  the `mcp` rows of `scripts/checks/ctgrind-expected.tsv`. The only secret is the `StateSeal` key; it is tainted, the
+  message, binding and token stay public.
+
+  | target | drives | in-file contexts |
+  |---|---|---|
+  | `seal` | `StateSeal.seal` | 16 |
+  | `open` | `StateSeal.open`: genuine, one MAC octet flipped, rebound to another principal, expired | 4 |
+  | `control` | positive control: the same HMAC under the tainted key, early-exit `std.mem.eql` in the harness | >= 1 |
+
+  `seal`'s 16 are std's base64url encoder indexing its alphabet by each 6-bit group of the MAC; the MAC is public once
+  produced, and no context touches the key. `open`'s 4 are the `!timing_safe.eql(...)` branch, once per call: the
+  accept/reject verdict is what `open` returns by contract, the compare itself raises nothing, and the MAC is checked
+  before the expiry. The control must flag, which shows the taint reached the compare. Unattributed contexts: 0.
 - **SDK oracle.** The official MCP Python SDK is a black-box differential client (`tools/sdk_oracle/drive.py`, source
   not read): it drives the catalog of `src/sdk_oracle_catalog.zig` over stdio in both eras (the `initialize` session
   and the stateless path with `server/discover`, `_meta` per request and a multi round-trip tool answered through its

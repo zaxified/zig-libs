@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** new `src/ctgrind_harness.zig`, a constant-time (valgrind) measurement of `StateSeal`'s HMAC key that is built only by the ctgrind script and the `check-ctgrind` compile check; the published module is unchanged.
 - **2026-11-13** — **New:** typed tools. `mcp.schemaOf(T)` derives a tool's JSON Schema text from a Zig struct at compile time (ints bounded by width and +-(2^53-1), enums, optionals, slices, arrays, nested structs, `mcp_descriptions`), `ToolCall.argsAs(T)` decodes the arguments into it with a JSON-Pointer error, `ToolCall.writeJson(v)` writes a struct result. Checked against google/jsonschema-go's verdicts (`tools/typed_oracle`).
 
 - **2026-11-12** — **FIX (LOW):** `Server.addTool` applies the literal depth cap (`max_literal_depth`) before the `x-mcp-header` annotation check, so a registered schema nested past the cap is no longer parsed without one; such a schema is not JSON to this module everywhere else (`tools/list` reports it) and the annotation check skips non-JSON as before. From the 2026-11-12 mutation run.
