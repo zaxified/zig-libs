@@ -276,7 +276,7 @@ fn decodeMac(d: Digest, e: Encoding, text: []const u8) ?[max_mac_length]u8 {
     const n = d.macLength();
     if (text.len != e.encodedLen(n)) return null;
     // The right LENGTH can still be the wrong SHAPE: a padded length filled
-    // with base64 characters and no `=` decodes past `n` (2026-10-09).
+    // with base64 characters and no `=` decodes past `n`.
     if (e == .base64) {
         const sz = std.base64.standard.Decoder.calcSizeForSlice(text) catch return null;
         if (sz != n) return null;
@@ -469,7 +469,7 @@ pub const standard = struct {
     /// 64-byte seed‖public key (libsodium / `std` `SecretKey`), whose public
     /// half must then match the seed.
     ///
-    /// Into `out` (BREAKING 2026-10-09): returned in an error union, the pair —
+    /// Into `out` (BREAKING): returned in an error union, the pair —
     /// secret half included — sat in the caller's temporary. `out` is zeroed
     /// on error.
     pub fn decodeSigningKey(out: *Ed25519.KeyPair, text: []const u8) KeyError!void {
@@ -518,7 +518,7 @@ pub const standard = struct {
     /// `scratch` (at least `msg_id.len + 22 + payload.len` bytes, else
     /// `OutputTooSmall`); `std`'s streaming signer is randomized.
     ///
-    /// `key_pair` by pointer (BREAKING 2026-10-09): by value the caller's frame
+    /// `key_pair` by pointer (BREAKING): by value the caller's frame
     /// kept a copy of the secret half.
     pub fn signEd25519(out: []u8, scratch: []u8, key_pair: *const Ed25519.KeyPair, msg_id: []const u8, timestamp: u64, payload: []const u8) (SignError || error{SigningFailed})![]const u8 {
         return burn.run(burn.ed_burn, (SignError || error{SigningFailed})![]const u8, signEd25519Body, .{ out, scratch, key_pair, msg_id, timestamp, payload });
@@ -582,7 +582,7 @@ pub const standard = struct {
                 if (value.len != 88) continue;
                 // 88 characters WITHOUT `==` padding decode to 66 octets: size
                 // first, then decode into the fixed buffer (the websocket key
-                // defect of 2026-10-09, same shape).
+                // defect of, same shape).
                 const sz = std.base64.standard.Decoder.calcSizeForSlice(value) catch continue;
                 if (sz != 64) continue;
                 var sb: [64]u8 = undefined;
@@ -1161,7 +1161,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // and returns the range MINIMUM when fewer remain, `bool` is a 1-bit range,
     // and `Smith` discards the rest of its input after the first short read. So
     // the target ran exactly one input for its whole existence. Measured
-    // 2026-09-07 over the corpus above: **0 of 11 seeds non-empty, 0 MACs
+    // Over the corpus above: **0 of 11 seeds non-empty, 0 MACs
     // decoded and 0 signatures accepted before; 10 of 11 non-empty (one seed IS
     // the empty header), 5 decoded and 4 accepted after.**
     const presented_len: usize = fz.drawInput(S, src, &presented_buf, &presented_seeds);
@@ -1281,7 +1281,7 @@ test "corpus: every presented value reaches presentedMac, and the counts are pin
     }
     // One seed IS the empty header value, a legal member of a refusal corpus.
     try testing.expectEqual(presented_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draws, 0 non-empty, 0 decoded,
+    // Measured: with the collapsing draws, 0 non-empty, 0 decoded,
     // 0 accepted and exactly 1 distinct secret (a single NUL octet) across the
     // whole corpus. After:
     try testing.expectEqual(@as(usize, 5), decoded);
@@ -1290,7 +1290,7 @@ test "corpus: every presented value reaches presentedMac, and the counts are pin
 }
 
 test "decodeMac: a padded-length base64 value with no `=` is refused, not decoded past the MAC" {
-    // Regression 2026-10-09: 44 base64 characters decode to 33 octets, one more
+    // Regression: 44 base64 characters decode to 33 octets, one more
     // than SHA-256's 32; only the length was checked before the decode.
     try testing.expect(decodeMac(.sha256, .base64, strRepeat("A", 44)) == null);
     try testing.expect(decodeMac(.sha512, .base64, strRepeat("A", 88)) == null);
@@ -1527,11 +1527,11 @@ test "middleware: custom header name and rotation both accepted over the wire" {
     try expectStatus(runWire(&r, buildReq(&rb3, "X-Hub-Signature-256", old_sig, body), &respbuf), "200");
 }
 
-// ── core (2026-10-04): schemes, digests, encodings, timestamps ──────────────
+// ── core: schemes, digests, encodings, timestamps ──────────────
 //
 // Expected values come from outside this module: the Standard Webhooks
 // reference libraries' own sign test (standard-webhooks/standard-webhooks
-// libraries/go/webhook_test.go `TestWebhookSign`, read 2026-10-04), Slack's
+// libraries/go/webhook_test.go `TestWebhookSign`, read), Slack's
 // documented worked example (docs.slack.dev, "Verifying requests from
 // Slack"), and — where no provider publishes a vector (Stripe, SHA-1/512,
 // base64, Ed25519 `v1a`) — Python's `hmac` and `openssl pkeyutl -sign` run
@@ -1638,7 +1638,7 @@ test "Standard Webhooks v1a: Ed25519 against openssl, both whsk_ layouts" {
     try testing.expectError(error.InvalidHeader, standard.verify(keys, sw_id, "1614265330", junk ++ sw_v1a, sw_payload, @intCast(sw_ts), 300));
     // An 88-character v1a value WITHOUT `==` padding decodes to 66 octets: it
     // must be skipped, not decoded into the 64-octet signature buffer (same
-    // shape as the websocket key defect of 2026-10-09).
+    // shape as the websocket key defect of).
     try standard.verify(keys, sw_id, "1614265330", "v1a," ++ strRepeat("A", 88) ++ " " ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
     const fits = strRepeat("v1a,x ", max_ed25519_signatures - 1);
     try standard.verify(keys, sw_id, "1614265330", fits ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
@@ -1981,7 +1981,7 @@ test "sweep: hostile headers never panic; sign/verify is exact under every schem
             if (slack.verify(&.{&keyb}, ts_text, sl, p2[0..plen], now, 0)) |_| return error.FlipAccepted else |_| reach.flips_refused += 1;
         }
     }
-    // Reach floors (measured 2026-10-04, see SPEC.md § Verification).
+    // Reach floors (measured, see SPEC.md § Verification).
     // Measured: genuine v1 found 5, too old 92, too new 187, bad timestamp
     // 6174, bad header 2379, no match 9163, flips refused 5940.
     try testing.expect(reach.parsed_ok > 0);
@@ -1994,7 +1994,7 @@ test "sweep: hostile headers never panic; sign/verify is exact under every schem
     try testing.expect(reach.flips_refused > 5000);
 }
 
-// ── tests added for mutation survivors (2026-10-04) ─────────────────────────
+// ── tests added for mutation survivors ─────────────────────────
 
 test "a signature one byte short is refused even when the missing byte is zero" {
     // HMAC-SHA256("whsec_test_secret", `1492774577.{"n":53}`) ends in 0x00
@@ -2031,7 +2031,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

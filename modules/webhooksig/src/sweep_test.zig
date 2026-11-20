@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! No-panic sweep (2026-11-13). The finding (WHS-1: `Verifier.init`
+//! No-panic sweep. The finding (WHS-1: `Verifier.init`
 //! precondition `assert`s on caller values, UB in ReleaseFast) is fixed by
 //! making `init` total: every option contract returns `error.InvalidOptions`
 //! (one test per contract below). The accepted-side tests pin the boundaries so

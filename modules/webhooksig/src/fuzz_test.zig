@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for webhooksig's deterministic fuzz driver (added
-//! 2026-10-09).
+//! Shared plumbing for webhooksig's deterministic fuzz driver.
 //!
 //! The harness BODY stays in `root.zig` beside its corpus; it is generic over
 //! its source of choices, `fn(comptime S, *S, gpa)`, and `testing.fuzz` hands
