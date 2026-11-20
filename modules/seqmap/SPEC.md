@@ -17,7 +17,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line — clean-room, so the module has no NOTICE entry.
 
 ## Compared with
 
@@ -50,26 +50,38 @@ beyond never-panic on unknown ids. Round-robin reuse mitigates but does not elim
 aliasing across a full 2^16 wrap.
 
 ## Verification
-Unit tests: add/fetch/release lifecycle, round-robin non-reuse, exhaustion at 65536, idempotent
-release, `answered` dup-detection flag, `clear` for a new round. Run: `zig build test-seqmap`.
 
-## Mutation run 2026-10-04
+Run: `scripts/modtest seqmap` (the module is std-only; `example/main.zig` is built by `zig build check-examples -Dmodule=seqmap`).
+Tests live in `src/root.zig` and `src/sweep_test.zig`:
 
-17 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run): the occupied-slot test in `add`
-inverted, the slot store dropped, the cursor stepping by 2, advancing on failure, `add` returning the
-cursor instead of the id, each stored field altered or defaulted wrongly (`target`, `probe`, `sent_ns`,
-`answered`), `fetch` / `fetchPtr` reading the neighbouring slot, `fetch` hiding `answered`, `release` a no-op or
-freeing the neighbour, `clear` covering half the table or resetting the cursor, and the table one slot short.
-All 17 killed by the existing tests; 0 survivors, 0 equivalent, no tests added, no findings.
+- **Allocation order:** ids from a fresh map are 0, 1, 2 … in order; the cursor wraps at 65536; `clear` frees every slot
+  across the whole id space but does not reset the cursor; releasing an id the cursor has already passed does not rewind it.
+- **Exhaustion:** with all 65536 ids live `add` returns `error.Exhausted`, leaves the table and the cursor untouched
+  (it stays parked on the same id), and releasing exactly that id unblocks the next `add` with no wrap-around.
+- **Entries:** `fetch` returns the fields as `add` stored them (any `target`, `probe`, `sent_ns`); `fetchPtr` flips
+  `answered` in place; the slot stays reserved after the first reply so a duplicate is recognised; `release` is idempotent.
+- **Totality:** `fetch`, `fetchPtr` and `release` over every `u16` id of an empty table, and `add` over several full
+  cycles, never trap (the no-panic sweep pins).
+- **No allocation after `init`:** tens of thousands of `add`/`fetch`/`fetchPtr`/`release`/`clear` cycles under a failing allocator.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
+No fuzz harness (the card's `**Hardening:**` line says why), no oracle: class C, see *Anchoring*.
+
+## What is deliberately not done
+
+- **No expiry or timer.** The map has no notion of time; `sent_ns` is carried for the caller's RTT arithmetic and is
+  never read (`src/root.zig:69-72`). Slots are freed by the caller on reply, timeout or send error.
+- **No search for a free slot.** `add` tries only the id under the cursor and does not scan (`src/root.zig:118-134`):
+  that keeps it O(1) when the table is nearly full.
+- **No anti-spoofing token and no unguessable ids.** Ids are sequential and predictable by design
+  (`src/root.zig:19-28`); a caller that must resist forged replies adds its own token.
 
 ## Backlog / deferred
-None beyond the documented round-robin-wrap caveat above.
 
-- (survey 2026-09-30) Optional wider id space / composite key (identifier + sequence, as surge-ping matches replies) for ICMP-style protocols with a 16-bit identifier as well as a sequence. Small effort; fits CONVENTIONS §2. Low priority: 16-bit sequence is what the reference does *(inferred)*.
-
-## Status
-`extract · any · util · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
-src/root.zig.
+- Optional wider id space or composite key (identifier + sequence, as surge-ping matches replies) for ICMP-style
+  protocols with a 16-bit identifier as well as a sequence. Small effort; fits CONVENTIONS §2. Low priority: a 16-bit
+  sequence is what the reference does *(inferred)*.
 
 ## Anchoring
 

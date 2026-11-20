@@ -4,8 +4,7 @@ O(1) correlation map for request/reply protocols keyed by a **16-bit sequence
 number**: a fixed table of **65536 slots**, handed out round-robin, mapping an
 in-flight probe's sequence id to `{ target, probe, sent_ns, answered }`.
 
-- Clean-room implementation (round-robin fixed-table approach); see SPEC.md
-  for the two-stage process used.
+- Clean-room implementation (round-robin fixed-table approach).
 - **Why:** the correlation half of any ping/probe engine — a reply carries only
   a 16-bit id, and matching it back to "which target, which probe, sent when"
   must be O(1) at 10k+ probes in flight. Generic enough for any protocol that
@@ -15,7 +14,7 @@ in-flight probe's sequence id to `{ target, probe, sent_ns, answered }`.
   threads). **Allocation:** one table alloc at `init`; `add`/`fetch`/`release`
   never allocate.
 
-Provenance: clean-room, no third-party source involved — see SPEC.md. An
+Provenance: clean-room, no third-party source involved. An
 earlier revision was written after fping's `seqmap.c`; it was replaced by a
 two-stage clean-room reimplementation, so no fping attribution applies.
 
@@ -39,8 +38,15 @@ map.clear();                           // start of a new probing round
 - Sequence numbers are handed out **round-robin** (`next` wraps at 65536), so a
   freshly released id is not immediately reused — stale replies for it stay
   detectable as long as possible.
-- `add` fails with `error.Exhausted` only when the *next* slot is still
-  occupied, i.e. more than 65535 probes are genuinely outstanding. Keep the
-  engine's in-flight cap below the sequence space (fping does the same).
+- `add` fails with `error.Exhausted` when the slot under the cursor is still
+  occupied (all 65536 outstanding, or an old probe still holding that id after
+  a wrap). The cursor does not move on failure: the next `add` retries the same
+  id, and `release`ing it unblocks the call. Keep the engine's in-flight cap
+  below the sequence space.
 - Slots are freed **explicitly** (reply, timeout, or send error) — the map
   itself has no notion of time.
+
+## Not provided
+
+No expiry or timers, no anti-spoofing token, no 32-bit or composite keys: see
+[`SPEC.md`](SPEC.md) under *What is deliberately not done* and *Backlog / deferred*.
