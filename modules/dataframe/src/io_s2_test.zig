@@ -633,3 +633,26 @@ test "NdjsonChunkReader with n_rows never reads past them, a whole readNdjson do
     try testing.expectEqual(@as(usize, 2), c.len);
     try testing.expect((try rd.next(ar.allocator(), 10)) == null);
 }
+
+test "writeCsv: time_format lays out a time-of-day column; a bad layout is BadOptions" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try df.readCsv(a, "t\n01:02:03\n13:45:00\n", .{ .types = &.{.{ .name = "t", .type = .time }} });
+    try testing.expectEqualStrings("t\n01:02:03\n13:45:00\n", try csvOut(a, f, .{}));
+    try testing.expectEqualStrings("t\n01h02\n13h45\n", try csvOut(a, f, .{ .time_format = "%Hh%M" }));
+    try testing.expectError(error.BadOptions, csvOut(a, f, .{ .time_format = "%Q" }));
+}
+
+test "writeCsv: comment quotes a first field the reader would drop" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try df.readCsv(a, "c,n\n#a,1\nb,2\n", .{ .types = &.{.{ .name = "c", .type = .text }} });
+    try testing.expectEqualStrings("c,n\n#a,1\nb,2\n", try csvOut(a, f, .{}));
+    const s = try csvOut(a, f, .{ .comment = '#' });
+    try testing.expectEqualStrings("c,n\n\"#a\",1\nb,2\n", s);
+    const back = try df.readCsv(a, s, .{ .comment = '#' });
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualStrings("#a", back.cell(0, "c").?.text);
+}

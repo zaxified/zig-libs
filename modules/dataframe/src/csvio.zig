@@ -632,6 +632,11 @@ pub fn parseBinary(a: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!
 /// and refuses contradictory options. Allocates only when the list changes.
 fn prepareOptions(a: std.mem.Allocator, o: *CsvReadOptions) CsvReadError!void {
     if (o.decimal == 0 or (o.thousands != 0 and o.thousands == o.decimal)) return error.BadOptions;
+    // A zone that cannot apply is refused before the read, not after the whole file.
+    for (o.types) |t| {
+        const zn = t.time_zone orelse continue;
+        if (t.type != .timestamp or tz.find(zn) == null) return error.BadOptions;
+    }
     if (!o.na_filter) {
         o.null_values = &.{};
         o.extra_null_values = &.{};
@@ -1418,10 +1423,16 @@ pub const CsvWriteOptions = struct {
     /// ISO `YYYY-MM-DD`. A `.timestamp` column that is not `datetime_format`ed ignores it.
     date_format: ?[]const u8 = null,
     /// A `%` layout (pandas `date_format`, polars `datetime_format`) for `.timestamp` columns
-    /// instead of `YYYY-MM-DD HH:MM:SS[.fff]` (the cell is UTC). A `.time` (time-of-day) column is
-    /// always written in the fixed `formatTimeOfDay` layout: pandas' and polars'
-    /// `time_format` has no counterpart here.
+    /// instead of `YYYY-MM-DD HH:MM:SS[.fff]` (the cell is UTC).
     datetime_format: ?[]const u8 = null,
+    /// A `%` layout (polars `time_format`) for `.time` (time-of-day) columns instead of the
+    /// `formatTimeOfDay` form (`01:02:03`, `00:00:00.120`); the cell is read as that time on an
+    /// arbitrary day, so only the time directives (`%H %M %S %I %p %.f`...) are meaningful.
+    time_format: ?[]const u8 = null,
+    /// The reader's `comment` byte, if it has one: a first-column text that starts with it is
+    /// quoted, or the reader would drop the line as a comment (`csvstream`'s `WriteOptions.comment`,
+    /// rust-csv does the same). `0` = none; ignored with `quote = 0` or `quote_style = .never`.
+    comment: u8 = 0,
     /// Floats in scientific notation (polars `float_scientific=True`, Rust's `1.2345e2`, with
     /// `float_precision` digits when set), or never (`false`: `0.00001`, `2` for 2.0, no exponent). `null`: Python's `repr` (pandas, polars' automatic choice).
     /// pandas' `float_format="%.3e"` (exponent `e+02`) is not offered.
@@ -1446,7 +1457,7 @@ pub const CsvWriteError = error{
     OutOfMemory,
     /// `columns` names a column the frame does not have.
     NoSuchColumn,
-    /// A `date_format`/`datetime_format` that is not a `%` layout, `decimal` of `0`, or
+    /// A `date_format`/`datetime_format`/`time_format` that is not a `%` layout, `decimal` of `0`, or
     /// `double_quote = false` without `escape_char`.
     BadOptions,
 };
@@ -1468,6 +1479,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
     }
     var date_layout: ?[]const u8 = null;
     var stamp_layout: ?[]const u8 = null;
+    var time_layout: ?[]const u8 = null;
     var layouts = std.heap.ArenaAllocator.init(a);
     defer layouts.deinit();
     if (opts.date_format) |l| date_layout = dtfn.translateFormat(layouts.allocator(), l) catch |e| switch (e) {
@@ -1475,6 +1487,10 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
         error.BadFormat => return error.BadOptions,
     };
     if (opts.datetime_format) |l| stamp_layout = dtfn.translateFormat(layouts.allocator(), l) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadFormat => return error.BadOptions,
+    };
+    if (opts.time_format) |l| time_layout = dtfn.translateFormat(layouts.allocator(), l) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BadFormat => return error.BadOptions,
     };
@@ -1487,6 +1503,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
         .quote = opts.quote,
         .escape = if (opts.double_quote) 0 else opts.escape_char,
         .line_terminator = opts.line_terminator,
+        .comment = opts.comment,
         .quote_style = switch (opts.quote_style) {
             .necessary, .non_numeric => .necessary,
             .always => .always,
@@ -1504,7 +1521,8 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
         for (sel, 0..) |fi, i| {
             const c = f.columns[fi];
             if (i != 0) try w.writeByte(opts.delimiter);
-            if (single and c.name.len == 0) try csvstream.writeFieldQuoted(w, "", base) else try csvstream.writeField(w, c.name, if (opts.quote_style == .non_numeric) always else base);
+            const comment_like = i == 0 and opts.comment != 0 and opts.quote != 0 and c.name.len != 0 and c.name[0] == opts.comment and opts.quote_style != .never;
+            if (single and c.name.len == 0) try csvstream.writeFieldQuoted(w, "", base) else try csvstream.writeField(w, c.name, if (opts.quote_style == .non_numeric or comment_like) always else base);
         }
         try w.writeAll(term);
     }
@@ -1543,7 +1561,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
             var is_text_value = false;
             var layout_text: ?[]const u8 = null;
             if (v != .null) {
-                const lay = if (c.type == .date) date_layout else if (c.type == .timestamp) stamp_layout else null;
+                const lay = if (c.type == .date) date_layout else if (c.type == .timestamp) stamp_layout else if (c.type == .time) time_layout else null;
                 if (lay) |l| {
                     _ = fmt_scratch.reset(.retain_capacity);
                     const t = (if (stamp_zones[ci]) |z| dtfn.strftimeZoned(fmt_scratch.allocator(), v, "", l, z) else dtfn.strftime(fmt_scratch.allocator(), v, l)) catch return error.OutOfMemory;
@@ -1622,6 +1640,9 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                 if (single and s.len == 0) try csvstream.writeFieldQuoted(w, "", base) else try csvstream.writeField(w, s, base);
             } else if (is_text_value and s.len == 0) {
                 try csvstream.writeFieldQuoted(w, "", base);
+            } else if (ci == 0 and opts.comment != 0 and opts.quote != 0 and s.len != 0 and s[0] == opts.comment and opts.quote_style != .never) {
+                // The reader would skip this line as a comment: quote the first field.
+                try csvstream.writeField(w, s, always);
             } else {
                 try csvstream.writeField(w, s, if (opts.quote_style == .non_numeric and text_like) always else base);
             }
