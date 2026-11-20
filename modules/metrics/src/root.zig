@@ -647,7 +647,7 @@ pub const RegisterError = error{
     TooManySeries,
     /// Summary options out of range: a quantile outside [0, 1], an epsilon
     /// outside [`min_epsilon`, 1), a repeated quantile, more than `max_objectives`,
-    /// `age_buckets`/`buf_cap` 0, or a `max_age_ns` shorter than
+    /// `age_buckets`/`buf_cap` 0, a `buf_cap` above a set `max_buf_cap`, or a `max_age_ns` shorter than
     /// `age_buckets` ns.
     InvalidObjectives,
     /// The summary name is already registered with other options.
@@ -1118,6 +1118,7 @@ pub const Registry = struct {
         if (kind == .summary) {
             if (sopts.objectives.len > max_objectives) return error.InvalidObjectives;
             if (sopts.age_buckets == 0 or sopts.buf_cap == 0) return error.InvalidObjectives;
+            if (sopts.max_buf_cap != 0 and sopts.buf_cap > sopts.max_buf_cap) return error.InvalidObjectives;
             if (sopts.max_age_ns / sopts.age_buckets == 0) return error.InvalidObjectives;
             for (sopts.objectives, 0..) |o, i| {
                 if (!(o.quantile >= 0 and o.quantile <= 1)) return error.InvalidObjectives;
@@ -5050,6 +5051,7 @@ test "summary: a refused descriptor leaves no family; options are compared field
 
     const good: Objective = .{ .quantile = 0.5, .epsilon = 0.05 };
     try testing.expectError(error.InvalidObjectives, reg.summary("b_cap", "h", &.{}, .{ .objectives = &.{good}, .buf_cap = 0 }));
+    try testing.expectError(error.InvalidObjectives, reg.summary("b_cap2", "h", &.{}, .{ .objectives = &.{good}, .buf_cap = 501, .max_buf_cap = 500 }));
     try testing.expect(reg.family_index.get("b_cap") == null);
     try testing.expectError(error.InvalidObjectives, reg.summary("b_age", "h", &.{}, .{ .objectives = &.{good}, .max_age_ns = 4, .age_buckets = 5 }));
     try testing.expect(reg.family_index.get("b_age") == null);

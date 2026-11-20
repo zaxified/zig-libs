@@ -165,9 +165,12 @@ network policy) rather than gating the whole router with `.all`.
 - `delete` is O(series in the family) under the registry lock (find, then ordered remove): it keeps registration order, and
   client_golang sorts every family's series on every scrape.
 - When the parking list for a removed series cannot grow (out of memory), the series is leaked rather than freed under a
-  scrape that may still read it.
-- Summary options are the caller's to bound: `buf_cap` and `age_buckets` have no upper bound and each series allocates
-  its buffers eagerly (see Backlog).
+  scrape that may still read it. Not counted: client_golang has no such state (the garbage collector frees a removed
+  series once no scrape holds it), so there is no reference counter to match; the leak is bounded by the allocation
+  failure that caused it.
+- Summary options are the caller's to bound: `age_buckets` is a `u8` (at most 255) and `buf_cap` is unbounded by default,
+  as client_golang's `uint32` `BufCap`; each series allocates its buffers eagerly. `Summary.Options.max_buf_cap` is an
+  opt-in ceiling (0 = none; a larger `buf_cap` is `error.InvalidBufCap`).
 
 ## Verification
 
@@ -238,13 +241,10 @@ network policy) rather than gating the whole router with `.all`.
 - **Differential oracle against karlseguin/metrics.zig** (idea, not scheduled): register the same counters, gauges and
   histograms (label values that need escaping included) in both and diff the exposition byte by byte; it would live in
   `tools/` as a differential oracle (CONVENTIONS section 9); the library is MIT and targets Zig 0.16.
-- **Summary `buf_cap` / `age_buckets` without an upper bound** (caller options, eager per-series allocation).
 - **`delete` is O(series) under the registry lock** (see Known limits): open as the worry that a very large family stalls
   registrations.
 - **A `*Metric` from `Vec.with` dangles after a concurrent `delete`/`reset`** of that series when no scrape holds it; a
   refcount would close it, cost unmeasured.
-- **Parking-list leak on out-of-memory:** `unregister`/`retireLocked` leak the family/series when the append to the parking
-  list fails (deliberate: leaking beats freeing memory a scrape may read); open question whether to count it.
 
 ## Fuzzing
 

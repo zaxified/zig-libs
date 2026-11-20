@@ -57,6 +57,11 @@ pub const Options = struct {
     max_age_ns: u64 = 10 * std.time.ns_per_min,
     age_buckets: u8 = 5,
     buf_cap: u32 = 500,
+    /// Opt-in ceiling on `buf_cap` (the buffer is allocated eagerly, 8 B per
+    /// value, for every series): 0 (the default, as in client_golang's
+    /// uint32 `BufCap`) means none, else a larger `buf_cap` is
+    /// `error.InvalidBufCap`. `age_buckets` is a `u8`, so at most 255.
+    max_buf_cap: u32 = 0,
 };
 
 pub const InitError = error{
@@ -244,6 +249,7 @@ pub const Summary = struct {
         }
         if (options.age_buckets < 1) return error.InvalidAgeBuckets;
         if (options.buf_cap < 1) return error.InvalidBufCap;
+        if (options.max_buf_cap != 0 and options.buf_cap > options.max_buf_cap) return error.InvalidBufCap;
         const bucket_ns = options.max_age_ns / options.age_buckets;
         if (bucket_ns < 1) return error.InvalidMaxAge;
 
@@ -392,6 +398,9 @@ test "validation" {
     try testing.expectError(error.InvalidEpsilon, Summary.init(a, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = -0.1 }} }));
     try testing.expectError(error.InvalidAgeBuckets, Summary.init(a, .{ .age_buckets = 0 }));
     try testing.expectError(error.InvalidBufCap, Summary.init(a, .{ .buf_cap = 0 }));
+    try testing.expectError(error.InvalidBufCap, Summary.init(a, .{ .buf_cap = 1001, .max_buf_cap = 1000 }));
+    var capped = try Summary.init(a, .{ .buf_cap = 1000, .max_buf_cap = 1000 });
+    capped.deinit();
     try testing.expectError(error.InvalidMaxAge, Summary.init(a, .{ .max_age_ns = 4, .age_buckets = 5 }));
     var ok = try Summary.init(a, .{ .objectives = &.{.{ .quantile = 0, .epsilon = 0 }} });
     ok.deinit();
