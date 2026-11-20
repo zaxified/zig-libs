@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for proxyproto (added 2026-11-15):
+//! Deterministic fuzz driver for proxyproto:
 //! `PROXYPROTO_FUZZ=<runs>[,<first seed>]` (testkit's driver; `_ONLY` selects a
 //! harness by name). Harness `proxyproto-parse`: inputs are random bytes, a
 //! genuine header from the writer (every family, with TLVs and CRC) with 0-3

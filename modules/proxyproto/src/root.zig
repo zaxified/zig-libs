@@ -432,8 +432,8 @@ fn isTrusted(peer: ?netaddr.Ip, list: []const netaddr.Prefix) bool {
 /// error: `read` returns null (`error.Missing` when `required`) and the bytes
 /// stay. A complete header is `error.UntrustedPeer`.
 ///
-/// `r.buffer` must hold the largest header expected (`opts.max_v2_len`, 536 by
-/// default): a reader whose buffer is smaller than a header needs gets
+/// `r.buffer` must hold the largest header expected (`opts.max_v2_len`, 16 + 4096
+/// by default): a reader whose buffer is smaller than a header needs gets
 /// `error.TooLarge`. `buf` likewise.
 pub fn read(r: *std.Io.Reader, buf: []u8, opts: ReadOptions) ReadError!?Header {
     const popts: Options = .{ .max_v2_len = opts.max_v2_len };

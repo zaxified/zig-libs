@@ -751,7 +751,7 @@ fn findHostile(tlvs: []const u8) bool {
     return true;
 }
 
-// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
+// ── delta mutation audit: tests the first schemata run asked for ──
 
 test "crc32cValue: a CRC TLV that is not 4 bytes is Malformed" {
     const short: pp.Header = .{ .tlvs = &hex.literal("030002" ++ "0000") };
