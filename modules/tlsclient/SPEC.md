@@ -9,10 +9,6 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-13 (167/189, 22 eq) · src 3bc139102d6bc111
 
-Audit detail 2026-11-13: an independent read-only review of the TLS 1.2 ticket resumption (no forgery path; its fixes — offer-time re-verification of the stored chain for 1.2 AND 1.3, the EMS offer rule, `SessionReplaced`, ticket cap, Finished trailing bytes, `ClientHelloTooLarge` — landed before the run; its claim that Go resumes on an echoed random session_id was checked against Go 1.26 `handshake_client.go` and is wrong: Go refuses it, as this module does). Then a delta mutation run over every function the resumption commits touched (`Client.zig` offer, echo handling, abbreviated handshake, NewSessionTicket handler, reserve/store/drop with the generation logic, `copyKeptChain`, `initBody`'s cleanup; `session.zig` `fresh12`, `wipe`, `drop`, `find`, `reserve`; `hello.zig` ticket emission and `W.need`; schemata in a detached copy, ReleaseSafe plus a ReleaseFast pass): 182 mutants, 160 killed (22 by a crash), 18 equivalent, 4 unobservable with the injection named — the `offer12.master` wipe (its copy lives in `initBody`'s frame, zeroed by `burn.stack(init_burn)` on return), the version guard at the Certificate-time reserve (needs a TLS 1.3 ServerHello carrying extension 35, which no peer here sends), and the `secureZero` in `wipe`/`drop` (the following `.{}` store writes the same zeros; only an asm check tells them apart). New tests: the verification hook and `did_resume` on a resumption, an entry replaced mid-handshake neither overwritten nor dropped, a 2048-byte ticket kept, the exporter of a resumed session, NewSessionTicket placement, the offer-time chain re-check incl. `.self_signed`, every resumable suite, our Finished flushed and `write_seq` = 1 after it, openssl full + two resumed handshakes, a ticketless server, a half-made entry, a 1.3 handshake replacing a cached 1.2 session, cache key bounds, an exact-fit ClientHello. No defect. A second delta the same day over the TLS 1.3 refusal of TLS 1.2-only ServerHello extensions: 7 mutants (the version check's new disjunct and each of the six extension types dropped), one build each, all killed by `a TLS 1.3 ServerHello carrying a TLS 1.2-only extension is illegal_parameter` (M0 clean).
-
-Audit detail: the 2026-11-01 mutation run is a delta from `da5c973a` (the 2026-10-28 run, 95/95) over the switch of the X25519MLKEM768 share to the `mlkem` module: 18 mutants, 3 new tests in `fuzz_test.zig` (exact hybrid share length, low-order X25519 half, the ClientHello share's derivation); equivalents: three guards every caller already passes via `ensure()`, and a skipped re-keygen that is deterministic.
-
 **Hardening:** fuzz 2026-10-13 (`tlsclient-chain` 200,000-run budget clean; `tlsclient-flight` 200,000 runs clean — genuine TLS 1.3 flights, plain and after a cookie HelloRetryRequest, read to close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged, with the session view and a certificate selector on; the first runs found five server-triggerable std crashes, fixed; TLSCLIENT_FUZZ) · ct 2026-10-13 (ctgrind: key-share secrets through key generation (std's derivation in `keygen.zig`, public points from the `p256`/`p384` combs), ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 3 / `cv` 30 in-file (`kex` 15 until 2026-11-01: the 12 std ML-KEM `sampleUniformRejection` contexts left with the switch to `mlkem`, full CI 41323098008; `kex` 17 until 2026-10-26: X25519 on `ct25519`, the std ladder's two identity contexts gone; `kex` 18 until 2026-10-13: p256's `rejectIdentity` now one jump; `cv` 32 until Zig 0.17.0, whose std Ed25519 signing path has no context left) (cv incl. the TLS 1.2 prehashed path), all std keygen/ECDSA identity and range verdicts (P-384 via `p384`: 0), none a Client.zig branch; 2026-10-11 positive control: a secret-indexed comb table load adds a context; encrypted flight not measured) · panic 2026-10-28 (independent sweep of every pub entry point: buffer asserts on `input`/`output` and a `read_buffer` under a record now `BufferTooSmall`, `flush` dropped plaintext past `output`'s room, `realtime_now` range, a KeyUpdate ends its record (RFC 8446 §5.1, also bounds per-record work), `fresh` subtraction checked; chain 200,000 + flight 20,000 driver runs clean after it)
 **Performance:** ref 0.60–0.67× Go 1.26.8 crypto/tls client · fastest 1.09× rustls 0.23.43 + aws-lc-rs 1.18.0 (measured 2026-10-26)
 
@@ -22,18 +18,17 @@ Audit detail: the 2026-11-01 mutation run is a delta from `da5c973a` (the 2026-1
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Re-surveyed 2026-10-13 for S2: Go's client API mapped from `go doc crypto/tls.{Config,ConnectionState,Conn}` (go1.26.0; no Go source read), identifier by identifier, against this module (plan and mapping table in the owner's survey report `20261013-tlsclient-s2`). Competitor feature claims are *(inferred)* unless marked as read; ianic/tls.zig's README was read.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Re-surveyed 2026-10-13 for S2: Go's client API mapped from `go doc crypto/tls.{Config,ConnectionState,Conn}` (go1.26.0; no Go source read), identifier by identifier, against this module. Competitor feature claims are *(inferred)* unless marked as read; ianic/tls.zig's README was read.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `crypto/tls`](https://pkg.go.dev/crypto/tls) — **reference** | Go | BSD-3-Clause | — | go1.26.0 | The Scope's yardstick (owner 2026-10-13: Go's defaults). Everything its client offers is here (mapping 2026-10-13) except ECH (deferred) and `VerifiedChains` (Backlog). The handshake bench runs against its client. |
+| [Go `crypto/tls`](https://pkg.go.dev/crypto/tls) — **reference** | Go | BSD-3-Clause | — | go1.26.0 | The Scope's yardstick (owner 2026-10-13: Go's defaults). Everything its client offers is here (identifier by identifier) except ECH (deferred) and `VerifiedChains` (both in *Backlog / deferred*). The handshake bench runs against its client. |
 | [rustls/rustls](https://github.com/rustls/rustls) | Rust | Apache-2.0 OR ISC OR MIT (GitHub API says NOASSERTION; source not read) | 7.6k | v0.23.45 (2026-09-14) | ALPN, client certificates, session resumption, ECH, post-quantum key exchange *(inferred from README)*; certificate compression (RFC 8879), which Go lacks too. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | Everything, including OCSP stapling requests and renegotiation; links a large C library. |
-| Zig `std.crypto.tls.Client` | Zig | MIT | — | Zig 0.16.0 | What this module is copied from. std accepts a leaf signed by another leaf (ziglang/zig #35877), aborts on any HelloRetryRequest, has no ALPN, client certificates, resumption, exporter or session view, cannot verify Ed25519 server certificates or IP hosts, desynchronises on a server's KeyUpdate request, and has five server-triggerable crashes (2026-10-13) -- all fixed or added here. |
+| Zig `std.crypto.tls.Client` | Zig | MIT | — | Zig 0.16.0 | What this module is copied from. std accepts a leaf signed by another leaf (ziglang/zig #35877), aborts on any HelloRetryRequest, has no ALPN, client certificates, resumption, exporter or session view, cannot verify Ed25519 server certificates or IP hosts, desynchronises on a server's KeyUpdate request, and has five server-triggerable crashes -- all fixed or added here. |
 | [ianic/tls.zig](https://github.com/ianic/tls.zig) | Zig | MIT | 174 | push 2026-09-01, no releases | Ecosystem alternative: TLS 1.2/1.3 client, TLS 1.3 server, client authentication, cipher-suite selection (README, read). Whether it checks basicConstraints on the chain: not verified. |
 
-**Where we are ahead:** of Zig `std` -- see its row; RFC 5280 path validation with EKU and name/path-length constraints via `x509` instead of a link-by-link walk; each certificate's DER proven in bounds before std's parser sees it. Of Go: client CPU per handshake 0.60–0.67× (bench, same key-share offer, 2026-10-26). Of rustls + aws-lc-rs (the fastest client measured): 1.03–1.09×, behind. **Where we are behind Go** (2026-10-13): ECH (deferred by the owner), `ConnectionState.VerifiedChains`, TLS 1.2 CBC suites (deliberately not), Ed25519 client keys in TLS 1.2 (PureEdDSA cannot sign the 1.2 transcript hash) -- see Backlog.
-
+**Where we are ahead:** of Zig `std` -- see its row; RFC 5280 path validation with EKU and name/path-length constraints via `x509` instead of a link-by-link walk; each certificate's DER proven in bounds before std's parser sees it. Of Go: client CPU per handshake below Go's (the card's Performance line has the figures; same key-share offer). Of rustls + aws-lc-rs (the fastest client measured): behind it. **Where we are behind Go**: ECH (deferred by the owner), `ConnectionState.VerifiedChains` (both in *Backlog / deferred*), TLS 1.2 CBC suites and Ed25519 client keys in TLS 1.2 (PureEdDSA cannot sign the 1.2 transcript hash), each refused with its reason under *What is deliberately not done*.
 ## What this module is, and what it is not
 
 A copy of Zig 0.16.0's `std.crypto.tls.Client` whose handling of the
@@ -53,15 +48,14 @@ impersonate any host. Here:
    for every issuer name the chain mentions as trust anchors, and
    `required_eku = .server_auth` (`verify.zig`).
 
-**Defaults are Go's `crypto/tls` client's** (owner, 2026-10-13; until then
-"no change to std's behaviour by default"). The ClientHello is built at run
+**Defaults are Go's `crypto/tls` client's** (owner decision). The ClientHello is built at run
 time (`hello.zig`): Go's groups (X25519MLKEM768, X25519, P-256, P-384, P-521)
 with shares for the first two, the rest reached by HelloRetryRequest. std's
 shape stays reachable -- `groups = key_share_groups = std_groups` -- and a test
 pins that hello to std's byte for byte, except the three TLS 1.2 ECDHE_ECDSA
 suites and the ecdsa_secp521r1_sha512 signature scheme this module adds. A
 CertificateRequest without `client_auth` gets an empty Certificate, as from
-Go's client (until 2026-10-26 it failed as in std). A consumer still changes
+Go's client (std fails the handshake). A consumer still changes
 one import. The additions, each
 marked `zig-libs tlsclient` in `Client.zig`:
 
@@ -72,7 +66,7 @@ marked `zig-libs tlsclient` in `Client.zig`:
 - **HelloRetryRequest** (RFC 8446 §4.1.4): selected group and/or cookie,
   message_hash transcript, second ClientHello on record version 0x0303; a
   second HRR, an HRR that changes nothing, names a group we shared or never
-  listed, or is not TLS 1.3 is refused. TLS 1.3 now switches to the handshake
+  listed, or is not TLS 1.3 is refused. TLS 1.3 switches to the handshake
   cipher right after ServerHello and ignores the compatibility
   ChangeCipherSpec (std waited for one).
 - **TLS 1.2 ECDHE_ECDSA suites** (AES-GCM, ChaCha20); the suite must match the
@@ -119,8 +113,8 @@ marked `zig-libs tlsclient` in `Client.zig`:
   in `ConnectionInfo` (`did_resume`) and still runs `verify_connection`.
   Not offered past the ticket lifetime (≤ 7 days) or the leaf's notAfter.
   PSK derivation, binder and the NewSessionTicket codec are `tlsresume`'s.
-- **TLS 1.2 session resumption** (RFC 5077 tickets, DONE 2026-11-13; Go's, see the
-  Backlog entry for the rules it follows). The same `SessionCache` entry (one per
+- **TLS 1.2 session resumption** (RFC 5077 tickets, as Go's client does them; the rules
+  are below). The same `SessionCache` entry (one per
   server name) holds either kind: for TLS 1.2 the master secret
   (`resumption_secret[0..48]`), the ticket, the suite, whether the extended master
   secret was used, the group, the leaf's notAfter and the chain. With a cache,
@@ -140,7 +134,7 @@ marked `zig-libs tlsclient` in `Client.zig`:
   SNI (RFC 6066 §3 forbids an address there; std sent it and could not match
   an IP at all).
 - **std defects fixed on the way** (all remotely triggerable by a server,
-  found by `TLSCLIENT_FUZZ` 2026-10-13, regression tests in place): a
+  found by `TLSCLIENT_FUZZ`, regression tests in place): a
   ServerHello session-id echo of 253..255 bytes overflowed a `u8` sum; a TLS
   1.3 record shorter than the AEAD tag and a TLS 1.2 record shorter than IV +
   MAC underflowed their length; an all-zero TLS 1.3 plaintext (no content
@@ -164,7 +158,7 @@ marked `zig-libs tlsclient` in `Client.zig`:
   nothing offered a server's ALPN is ignored, as std ignores it.
 - **Client certificates, TLS 1.3 (RFC 8446 §4.3.2, §4.4.2-4.4.3).**
   `Options.client_auth` (default null: an empty Certificate, Go's answer;
-  std's `TlsUnexpectedMessage` until 2026-10-26). `parseCertRequest`
+  std's is `TlsUnexpectedMessage`). `parseCertRequest`
   keeps the context and whether `signature_algorithms` (mandatory, once)
   lists our scheme. Before the client Finished: a Certificate echoing the
   context with the chain (no entry extensions) and a CertificateVerify signed
@@ -186,9 +180,53 @@ marked `zig-libs tlsclient` in `Client.zig`:
   (ReleaseFast) checks all three key types for 0 residue.
   `max_client_auth_len` (16 KiB) bounds our messages.
 
-**Not here, on purpose:** revocation (OCSP/CRL), certificate transparency --
-std has neither, and adding them is not this module's job. `.ca =
-.self_signed` and `.no_verification` behave as in std.
+**TLS 1.2 resumption, the rules** (Go go1.26 `handshake_client.go` `loadSession`, `processServerHello`,
+`readSessionTicket`, `saveSessionTicket`, and `ticket.go`, followed here):
+
+- *Tickets only.* Go's client never resumes by a server-assigned session ID; its random 32-byte
+  `session_id` is only the marker that tells a ticket-accepting server's echo apart (RFC 5077 §3.4).
+- *No Extended Master Secret needed to resume*, but the server's answer must match the session's: a session
+  with EMS resumed by a ServerHello without it, or the reverse, is refused (RFC 7627 §5.3).
+- *One cache entry per server name* (`ClientSessionCache` key; a store replaces): the newest handshake's
+  session, TLS 1.3 or 1.2. A cached session is offered only if its version is among the hello's; a 1.3 one
+  as the PSK, a 1.2 one in the SessionTicket extension; with a cache and no usable session the extension is
+  sent empty. The server then picks the version: a 1.3 ServerHello to a cached 1.2 session is a full 1.3
+  handshake whose ticket replaces the entry.
+- *Before offering:* a leaf past its notAfter deletes the entry; a session made without verification is not
+  offered to a verifying config; the cipher suite must still be offered; the stored chain is verified again
+  under the current bundle and clock and the host name against the leaf (a removed CA or an expired
+  certificate ends the session; TLS 1.3 entries too, `Client.zig` offer-time re-check); a session whose EMS
+  use differs from this hello's is not offered.
+- *On the ServerHello:* the session_id echo means "resumed" (an echo with nothing offered, also with no
+  cache at all, is `TlsIllegalParameter`: Go's own check, an RFC 8446 §4.1.2 downgrade signal); version,
+  suite and EMS answer must equal the session's; the master secret, chain and group come from the session;
+  `verify_connection` still runs, after the server's Finished and before ours; the server's Finished is
+  first. The NewSessionTicket comes before the server's ChangeCipherSpec (required when the ServerHello
+  announced the extension, `TlsIllegalParameter` when it was not offered); a new one replaces the entry,
+  none leaves it; the lifetime hint is ignored. **Any failure after a session was loaded deletes the entry**
+  (RFC 5077 §3.2).
+- *Where this module differs from Go:* it sends no alerts in a handshake (module-wide), so Go's
+  `handshake_failure`/`illegal_parameter` are `TlsIllegalParameter`; a zero-length ticket removes the entry
+  (Go keeps an empty, never-accepted ticket: the same effect); a ticket over `max_ticket_len` (2048) is not
+  cached and a Finished with trailing octets ends the session (`TlsDecodeError`); an entry replaced between
+  offer and Finished is `SessionReplaced`, not an empty view; a ClientHello over `hello.max_len` is
+  `ClientHelloTooLarge`; OCSP response and SCTs are not kept with the session. Code: `Client.zig` (offer,
+  abbreviated handshake, ticket handler), `session.zig` (`version12` entries, `fresh12`, `wipe`, `drop`),
+  `hello.zig` (`session_ticket`); the ticket codec is `tlsresume.ticket12`.
+
+- **TLS 1.2-only extensions in a TLS 1.3 hello are refused.** A TLS 1.3 ServerHello or HelloRetryRequest
+  carrying any of ALPN, status_request, SCT, extended_master_secret, SessionTicket or renegotiation_info is
+  `TlsIllegalParameter`, asked for or not, as Go 1.26's `checkServerHelloOrHRR` refuses them.
+- **Secrets do not stay on the stack.** `Client.init` runs its body (`initBody`) one frame down and zeroes
+  `burn.init_burn` (384 KiB) after it, so the ECDHE shares, the handshake key schedule and the Certificate
+  and CertificateVerify processing leave nothing in the dead frames of std's code. `init` returns the
+  `Client` by value (std's shape), which copies the application secrets through the caller's temporaries;
+  `Client.initInto(out, ...)` writes the session in place inside the burned call tree, and `http.Client` dials
+  with it. The P-256/P-384 shared-secret multiply is `mul`, not std's variable-time `mulPublic` on our
+  ephemeral scalar.
+- **Key shares are not eager.** Key pairs are generated only for a share the hello offers or a group a
+  server picks by HelloRetryRequest (see *Key shares*).
+
 
 ## Limits and refusals
 
@@ -200,7 +238,7 @@ std has neither, and adding them is not this module's job. `.ca =
   next message instead).
 - `verifyChain` runs in a 16 KiB stack `FixedBufferAllocator`; running out is
   a refusal, never a partial verification.
-- **Buffers** (no-panic sweep 2026-10-28): `input` and `output` hold at least
+- **Buffers:** `input` and `output` hold at least
   `min_buffer_len` (an `output` that grows on rebase, `Writer.Allocating`,
   is fine) and `read_buffer` at least `tls.max_ciphertext_len`; smaller is
   `error.BufferTooSmall` at `init` (std asserted, UB in ReleaseFast; a small
@@ -208,12 +246,24 @@ std has neither, and adding them is not this module's job. `.ca =
 - **A KeyUpdate must end its record** (RFC 8446 §5.1): anything after it in
   the same record is `TlsUnexpectedMessage`, before the key changes.
 - **`realtime_now`** outside i64 milliseconds is `error.RealtimeInvalid`.
-- **Stack:** `init` needs about 400 KiB free (302 KiB deep: +6 KiB for TLS 1.2 resumption, 2026-11-13, estimated from the new locals, then the 384 KiB
+- **Stack:** `init` needs about 400 KiB free (302 KiB deep, the TLS 1.2 resumption's +6 KiB estimated from its locals, then the 384 KiB
   dead-stack burn); documented on `init`, not checked at run time.
+- **Stack-residue coverage:** the probe drives TLS 1.3 handshakes (every group and suite, a full flight);
+  a TLS 1.2 key schedule, a TLS 1.2 resumed handshake, an RSA server key and `.ca = .bundle`
+  verification are covered by the burn's depth only, unmeasured, and the 12-byte IVs are shorter than a
+  probe needle window.
+- **Fail-closed or informational findings, left as they are:** ServerHello extensions are not checked
+  against the version before it is known (TLS 1.3 values only feed `ConnectionInfo`, the transcript covers
+  them; the TLS 1.2-only extensions are refused once the version is 1.3); a second Certificate message is
+  ignored, not refused (the transcripts then disagree and Finished fails); trailing bytes after some
+  handshake bodies are tolerated; 1024-bit RSA server keys pass the size gate (`x509` judges strength);
+  `ConnectionInfo` fails the handshake instead of truncating when the server staples more than it holds.
+- **Not verified, as in Go:** a stapled OCSP response and SCTs are requested and exposed, never verified;
+  `.ca = .self_signed` and `.no_verification` behave as in std.
 
 ## Updating the copy
 
-A comptime check in `root.zig` refuses any Zig but 0.16 and 0.17 (the copy was ported to 0.17 on 2026-10-18). On an upgrade:
+A comptime check in `root.zig` refuses any Zig but 0.16 and 0.17 (the copy is ported to 0.17). On an upgrade:
 first check #35877. If std now checks CA constraints, the tripwire test in
 `interop_test.zig` ("std's client still accepts the forged chain") is red --
 retire this module and point `http` back at `std.crypto.tls`. If not,
@@ -228,20 +278,21 @@ client Finished (`peek` instead of `finalResult`), the helper functions after
 the handshake, and their tests at the end of the file. The offline test
 ("default options: the ClientHello is std's, byte for byte") and the interop
 "defaults are std's" prove the re-application left std's behaviour alone.
-Also re-apply the 2026-10-11 performance changes, all marked `zig-libs
+Also re-apply the performance changes, all marked `zig-libs
 tlsclient`: `KeyShare.init` taking its P-256/P-384 pairs from `keygen.zig`,
 and `CertificatePublicKey.verifySignature` routing P-256 to `p256` and RSA to
-`rsa.VerifyKey` (and, since 2026-10-13, P-384 everywhere to `p384`). And the
-2026-10-23 fix in the handshake record read: an alert under the handshake key
+`rsa.VerifyKey` (and P-384 everywhere to `p384`). And the
+fix in the handshake record read: an alert under the handshake key
 is `TlsAlert` (std: `TlsUnexpectedMessage`), marked the same way.
 `keygen.zig`'s std copy (`deterministicSecret`) is pinned by its differential
 tests against the new std; re-copy it if those go red.
+## Key shares
 
-## Key shares (2026-10-11; P-384 on `p384` since 2026-10-13)
-
-std's ClientHello — kept byte for byte, an offline test proves it — offers
-X25519MLKEM768, secp256r1, secp384r1 and X25519 shares, so all four key pairs
-are generated per handshake. std computes the P-256 and P-384 public keys
+std's ClientHello shape (`std_groups`, still reachable through the options and
+pinned byte for byte by an offline test) offers X25519MLKEM768, secp256r1,
+secp384r1 and X25519 shares, so all four key pairs are generated per handshake;
+under Go's defaults only the first two shares are offered and the NIST pairs are
+generated only when a server asks by HelloRetryRequest. std computes the P-256 and P-384 public keys
 with `basePoint.mul` (a 4-bit window, 64 or 96 doublings), which was ~2/3 of
 the client's CPU. `keygen.zig` produces the same key pairs, byte for byte
 (differential tests against std's `generateDeterministic`): the secret scalar
@@ -254,13 +305,95 @@ point by a constant-time fixed-base comb: `p256.P256.combMulBase` for P-256,
 it in the interop test); the server's P-384 signature is decoded by std and
 verified by `p384`, as P-256 is by `p256`.
 
-2026-10-11..13 history: a P-384 comb over std's field lived in this file with
-a generated table and a copy of std's `addMixed` minus its closing
-`cMov(p, q.x.isZero())` (ctgrind saw that select as secret-dependent loads);
-the `p384` module took over its numbers and its ctgrind lesson. ctgrind row
-`tlsclient/kex` covers `keygen.zig`. Negative controls: 8 mutants over the
-comb and the derivation (2026-10-11), all killed; the P-384 server-signature
-test goes red when `p384`'s verify is skipped (2026-10-13).
+ctgrind row `tlsclient/kex` covers `keygen.zig`.
+
+## Verification
+
+Run `scripts/modtest tlsclient` (Debug; the OpenSSL tests skip when `openssl` is absent) and
+`zig build interop-tlsclient` (the live Go oracle, below).
+
+- **Offline handshakes and refusals** (`Client.zig`, `fuzz_test.zig`, `hello.zig`, `session.zig`): the default
+  ClientHello equals std's byte for byte under `std_groups`; the ALPN ClientHello is that plus RFC 7301's
+  extension bytes written out by hand; ALPN answers, CertificateRequest parsing, the client Certificate /
+  CertificateVerify layout (the signature checked with the public key over the RFC 8446 §4.4.3 content, not
+  over the server's), a record over 2^14 bytes split and decrypted record by record, HelloRetryRequest
+  rules, version bounds, the TLS 1.2-only-extension refusals (six extensions and a control), the std crash
+  regressions, and a seeded sweep of damaged ALPN/CertificateRequest encodings with its reach pinned.
+- **OpenSSL as external anchor** (`interop_test.zig`, against `openssl s_server` with openssl-made chains from
+  `src/testdata/`): the honest chain verifies; the forged chain (a leaf signed by another leaf's key, which
+  OpenSSL's own `verify` refuses) is refused while std's client still accepts it (the tripwire); ALPN picks
+  and refusals; client certificates (P-256, P-384, Ed25519 chains verified by `-Verify`); a request
+  restricted to `ECDSA+SHA384` gets our empty Certificate (`-verify` proceeds, `-Verify` refuses on our
+  first read); TLS 1.2 resumption end to end; the exporter equal to `openssl s_server -keymatexport` in
+  both versions.
+- **Live Go oracle** (`tools/interop.zig` + `tools/go_oracle`, `zig build interop-tlsclient`): one Go
+  crypto/tls server per case (standard library only), Go's own client run first as the verdict, then this
+  client against the same server. Case groups: version bounds, every TLS 1.2 AEAD suite with bulk data
+  and TLS 1.3 bulk, every group forced on the server (HelloRetryRequest) and on the client in both
+  versions, every server key type (P-256/384/521, RSA-2048/3072/4096, Ed25519) in TLS 1.2 and 1.3, chain
+  rules (names, wildcard, IP SAN, CN-only, validity, unknown root, missing intermediate, a leaf signed by a
+  leaf, pathLen, EKU, DNS and directoryName name constraints, empty EKU, all-RSA and all-Ed25519 chains),
+  ALPN, client certificates of four key types in both versions plus requested/required without one,
+  resumption (TLS 1.3 with and without ALPN or tickets; TLS 1.2 with ECDSA, RSA, ChaCha20, ALPN, a server
+  that rejects the ticket, one that withdraws it, tickets off), OCSP/SCT stapling. The server reports in
+  its first line what it saw (version, suite, group, HRR, ALPN, resumption, verified client certificates,
+  SNI, exporter octets); the line must equal the one Go's client got and this client's own
+  `ConnectionInfo` and `exportKeyingMaterial`. Each row's expectation is `agree`, `stricter` (the two
+  **Ahead** rows) or `gap` (Ed25519 client keys in TLS 1.2); a surprise in either direction fails the run.
+- **TLS 1.2 resumption** (`src/resume12_test.zig`) against a synthetic resuming server (no certificate or
+  signature is needed for an abbreviated handshake): a cache entry is primed by hand, the server's flight is
+  built with the PRF and AES-128-GCM from `std.crypto.tls`, and the client's output is decrypted and its
+  Finished compared with the PRF over the transcript. Pinned: the ticket in the ClientHello extension and
+  the `session_id` marker; no extension without a cache or for TLS 1.3-only, an empty one without a TLS 1.2
+  session; a suite no longer offered not offered (entry kept); an expired leaf's entry deleted; resumption
+  end to end (`did_resume`, kept chain in the view, the new ticket replacing the old); a zero-length
+  NewSessionTicket dropping the entry; suite and EMS mismatches; and the refusals (an echo with no session
+  offered, a ticket extension that was not offered, a NewSessionTicket without the extension, an announced
+  ticket missing before the ChangeCipherSpec, a wrong server Finished, a malformed NewSessionTicket). A
+  server without the extended master secret cannot be built from Go's crypto/tls, so that mismatch is the
+  unit tests' only.
+- **Fuzz** (`TLSCLIENT_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, ReleaseSafe; never
+  `zig build --fuzz`): `tlsclient-chain` (a server's Certificate chain through the guard and the verifier)
+  and `tlsclient-flight` (genuine TLS 1.3 flights, plain and after a cookie HelloRetryRequest, read to
+  close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged, with the session view and a
+  certificate selector on). The card's Hardening line has the budget.
+- **Constant time (ctgrind):** row `kex` (key-share secrets through key generation and ECDHE: std's
+  derivation in `keygen.zig`, public points from the `p256`/`p384` combs) and row `cv` (the client-auth
+  key through `signCertificateVerify`, including the TLS 1.2 prehashed path); the contexts left are std
+  keygen/ECDSA identity and range verdicts, none a `Client.zig` branch; a secret-indexed comb table load
+  is the positive control. Counts and attribution live in `scripts/checks/ctgrind-expected.tsv`. The
+  encrypted flight is not measured.
+- **Stack residue:** `stackprobe_test.zig` (ReleaseFast): a canned ServerHello per group x suite and a
+  full server flight, reach checked through `ssl_key_log`, needles for every seed, secret, handshake and
+  application key and HKDF pad; zero residue through `initInto`. The client-auth signature is probed for
+  all three key types.
+- **Mutation:** schemata over `hello.zig`, `session.zig`, `verify.zig`, `keygen.zig` and the `Client.zig`
+  additions, with survivors re-run against `tools/interop.zig` built on the mutated copy; the key-share
+  comb and derivation, the resumption paths and the ALPN/client-auth additions each got their own runs.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Bench:** `zig build bench-tlsclient` (`tools/bench.zig`) measures the client's CPU per handshake
+  against the same Go server, beside `tools/go_bench` (Go's client) and `tools/rust_fast_bench` (a rustls +
+  aws-lc-rs client); the card's Performance line has the figures.
+
+## Performance
+
+The bench is `zig build bench-tlsclient` (`tools/bench.zig`; sides `tools/go_bench`, `tools/rust_fast_bench`).
+The card's `**Performance:**` line is authoritative for the figures. Go is the reference side; rustls +
+aws-lc-rs is the fastest client measured. OpenSSL and BoringSSL are not benched here (OpenSSL measured slower than
+rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not installed).
+
+## What is deliberately not done
+
+- **Revocation (OCSP/CRL) and certificate transparency:** std has neither and adding them is not this
+  module's job; a stapled OCSP response and SCTs are requested and exposed, not verified (Go verifies
+  neither).
+- **TLS 1.2 CBC suites:** Go still lists some by default; the Lucky13 class, AEAD-only here.
+- **Client renegotiation** (Go's default is never).
+- **Ed25519 client keys in TLS 1.2:** PureEdDSA cannot sign the TLS 1.2 messages' hash, so an empty
+  Certificate is sent (Ed25519 client keys work in TLS 1.3).
+- **0-RTT** (Go's client has none).
+- **Resumption by server-assigned session IDs** (Go does not either).
 
 ## Anchoring
 
@@ -271,237 +404,51 @@ test goes red when `p384`'s verify is skipped (2026-10-13).
   `verify` refuses it with "invalid CA certificate") is refused, and std's
   client still accepts it. The verification decision itself is `x509`'s,
   anchored in that module.
-- A mutant that drops the `verifyAgainstBundle` call turns the forged-chain
-  interop test red (checked 2026-09-25).
-- **2026-10-04 additions.** Against `openssl s_server` (loopback, throwaway
-  fixtures, `-rev` echo): ALPN -- openssl picks `h2` from our `http/1.1,h2`
-  (its own order), refuses a list with nothing in common with
-  no_application_protocol, and a server without ALPN leaves
-  `alpn_protocol` null; client certificates -- P-256, P-384 and Ed25519
-  chains verified by `-Verify 1 -CAfile client-ca.pem` (the server reports
-  the peer certificate); a request restricted to `ECDSA+SHA384` gets our
-  empty Certificate (`-verify` proceeds without a peer certificate,
-  `-Verify` refuses on our first read); with default options a
-  CertificateRequest failed in this client exactly as in std's (until
-  2026-10-26: now an empty Certificate, std's still fails). Offline: the
-  default ClientHello equals std's byte for byte; the ALPN ClientHello is
-  that plus RFC 7301's extension bytes written out by hand; ALPN answers,
-  CertificateRequest parsing, the Certificate/CertificateVerify layout (the
-  signature checked with the public key over the RFC 8446 §4.4.3 content,
-  and not over the server's), a >2^14-byte record split decrypted record by
-  record; a seeded sweep (20 000 damaged ALPN/CertificateRequest encodings,
-  reach pinned: 323 accepted answers, each one of ours).
-- **Mutation 2026-10-04:** 23 mutants over the additions (schemata,
-  ReleaseSafe, interop included); 3 survived the first run: the empty-name
-  ALPN check was redundant (an empty name cannot match an offered one) and
-  was removed; the duplicate-ALPN check was moved into
-  `encryptedExtensionsAlpn` and got a test; **one remains**: the refusal of a
-  second CertificateRequest in one handshake. It is reachable only from a
-  scripted TLS 1.3 server (openssl never sends two); with the check gone,
-  the server's later request would replace its earlier one, both already in
-  the transcript -- no gain for a server, which controls both. Kept, with
-  this note. `check-ct-compare` counts one more plain `mem.eql` in
-  `Client.zig` (ALPN names, public): pin `2 4`.
-
-- **Live Go oracle (2026-10-26), `tools/interop.zig` + `tools/go_oracle`.**
-  `zig build interop-tlsclient`: one Go 1.26 crypto/tls server per case
-  (stdlib only), Go's own client run first as the verdict, then this client
-  against the same server. 90 cases: version bounds (9), every TLS 1.2 AEAD
-  suite with 1 MiB of application data (6) and TLS 1.3 bulk (1), every group
-  forced on the server (HelloRetryRequest) and on the client, both versions
-  (15), every server key type -- P-256/P-384/P-521, RSA-2048/3072/4096,
-  Ed25519 -- in TLS 1.2 and 1.3 (14), chain rules (23: names, wildcard, IP
-  SAN, CN-only, validity, unknown root, missing intermediate, leaf signed by
-  a leaf, pathLen, EKU, DNS and directoryName name constraints, empty EKU,
-  all-RSA and all-Ed25519 chains), ALPN (5), client certificates of four key
-  types in both versions plus requested/required without one (11),
-  resumption (10: TLS 1.3 with and without ALPN or tickets; **TLS 1.2 since 2026-11-13** -- ECDSA,
-  RSA, ChaCha20, ALPN, a server that rejects the ticket (`UnwrapSession` nil), one that withdraws it
-  (empty `WrapSession`), tickets off; each must show Go's server `res=1` / `res=0` exactly as Go's
-  client does, and the exporter octets), OCSP/SCT stapling (2). The server reports in its first
-  line what it saw (version, suite, group, HRR, ALPN, resumption, verified
-  client certificates, SNI, 32 exporter octets); the line must equal the one
-  Go's client got (but the exporter) and this client's own `ConnectionInfo`
-  and `exportKeyingMaterial`. Expectations per row: `agree`, `stricter` (the
-  two **Ahead** rows), `gap` (Ed25519 client keys in TLS 1.2 -- Backlog). **The first run found three defects, fixed the
-  same day:** (1) a TLS 1.2 ServerKeyExchange signed by a P-384 or P-521
-  key failed (`InvalidEncoding`): std read the ECDSA scheme as naming the
-  curve, which only TLS 1.3 does -- Go signs with ecdsa_secp256r1_sha256 from
-  any ECDSA key (RFC 5246 §7.4.1.4.1); (2) a P-521 server key could not be
-  used at all in TLS 1.3: the signature_algorithms list (std's) lacked
-  ecdsa_secp521r1_sha512 and the verifier had no P-521 (now `p521`); (3) a
-  server that requests (not requires) a client certificate was unreachable
-  without `client_auth` -- std's `TlsUnexpectedMessage`; Go's client answers
-  with an empty Certificate, and so does this one now. Negative control:
-  each of the four rows was a SURPRISE before its fix.
-
-- **TLS 1.2 resumption (2026-11-13), `src/resume12_test.zig`** -- 13 tests against a synthetic
-  resuming server (no certificate or signature is needed for an abbreviated handshake): a cache entry
-  is primed by hand (master secret, ticket, chain), the server's flight is built with the PRF and
-  AES-128-GCM from `std.crypto.tls`, and the client's output is decrypted and its Finished compared
-  with the PRF over the transcript. Pinned: the ticket in the ClientHello extension and the
-  `session_id` marker; no extension without a cache or for TLS 1.3-only, an empty one without a TLS 1.2
-  session, a suite no longer offered not offered (entry kept), an expired leaf's entry deleted;
-  resumption end to end (`did_resume`, kept chain in the view, new ticket replacing the old, same
-  master secret and generation); no new ticket leaves the entry; a zero-length NewSessionTicket drops
-  it; a server that does not echo gets a full handshake and a failure then drops the stale ticket;
-  suite mismatch and EMS mismatch both ways are `illegal_parameter` + drop; an echo with no session
-  offered, a ticket extension that was not offered, a NewSessionTicket without the extension, an
-  announced ticket missing before the ChangeCipherSpec, a wrong server Finished (nothing of ours
-  sent) and a malformed NewSessionTicket are refused. Plus `session.zig` (`fresh12` ignores the
-  lifetime hint, `fresh` never offers a 1.2 entry as a PSK, `wipe` and `drop` zero the secrets) and
-  `hello.zig` (the extension: absent / empty / the ticket). Live: the six `resume-12*` rows above
-  (the first run, no surprise; a server without the extended master secret cannot be built from Go's
-  crypto/tls, so that mismatch is the unit tests' only). No new parser: the NewSessionTicket body is
-  `tlsresume.ticket12`'s, already fuzzed there; the flight fuzz harness's TLS 1.2 template does not
-  announce a ticket, so the new ClientHello bytes (a session_ticket extension only with a cache) do
-  not touch it.
-
-- **Audit 2026-10-26** (review by an independent reader + 77 mutants over
-  `hello.zig`, `session.zig`, `verify.zig`, `keygen.zig` and the
-  `Client.zig` additions, schemata in ReleaseSafe; survivors re-run against
-  `tools/interop.zig` built on the mutated copy). The review found five
-  defects, fixed: TLS 1.3 accepted PKCS#1 v1.5 and SHA-1 handshake
-  signatures (F1); a session made without verification was resumed under a
-  bundle (F2, security); interleaved resumptions stored a ticket with the
-  wrong PSK (F3, caught live by `resume-13-interleaved`); an X25519 server
-  share was accepted when only the hybrid share was sent (F4); an over-long
-  host panicked (F5). Not changed, all fail closed or are informational:
-  ServerHello extensions are not checked against the version before it is
-  known (F6: TLS 1.3 values only feed `ConnectionInfo`, the transcript covers
-  them); a second Certificate message is ignored, not refused (F7: the
-  transcripts then disagree and Finished fails); trailing bytes after some
-  handshake bodies are tolerated (F8); std's record reassembly drops a
-  handshake message spanning records in two places (F9, inherited, interop
-  only); 1024-bit RSA server keys pass the size gate, `x509` judges strength;
-  `ConnectionInfo` fails the handshake instead of truncating when the server
-  staples more than it holds (F10). The mutation run's 24 first-round
-  survivors were tests the server-message checks never had (above, in
-  CHANGELOG); second round: 76 of 77 killed by the module's tests, the 77th (the inverse of the F3 fix) by `tools/interop.zig` built on the mutated copy -- 77/77, src fddf3a20366cba44.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-## Performance
-
-**2026-10-26: the fastest in the field measured** (`zig build bench-tlsclient`, `tools/rust_fast_bench`: a rustls 0.23.43 client over aws-lc-rs 1.18.0, `prefer-post-quantum`, its own WebPkiServerVerifier, against the same Go server, client-thread user cycles like the other two sides). Before: ours 1.11× (ECDSA P-256 chain) and 1.19–1.23× (RSA-2048) of rustls. A profile of ours put std's X25519 (two Montgomery ladders: the share's public key and the shared secret) at 17.6 % of the client's CPU; aws-lc runs s2n-bignum assembly with a fixed-base variant for the public key. X25519 moved to `ct25519.X25519` (std's bytes and shape; public key from its comb, shared secret on its MULX/ADX ladder): **ref 0.60–0.67× Go 1.26.8, fastest 1.03–1.09× rustls** (two runs, 5 and 7 rounds; ours' spread ≤ 5.1 %, the foreign sides' up to 27 % from host load). What is left between us and aws-lc, by profile: std's ML-KEM-768 (keygen + decaps, ~17 %, aws-lc has AVX2 Keccak×4) and std's SHA-256 (~10 %, transcript + key schedule; aws-lc AVX assembly). (2026-11-01: the ML-KEM-768 half has since moved to the `mlkem` module, same bytes as std's.)
-
-Why rustls + aws-lc-rs is the "fastest" side and OpenSSL is not measured here: on this host OpenSSL 3.5.5 is slower than rustls + aws-lc-rs at every primitive a client handshake uses -- the full server handshake 1.1–1.7× (tlsserver's bench, 2026-10-22, the same crate versions) and chain verification 1.3–1.4× slower than Go, itself slower than rustls-webpki (x509's bench, 2026-10-26). BoringSSL, from which aws-lc is forked, is not installed; Go is the reference side.
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-tlsclient`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 13.0 %): ref 0.68–0.70× Go 1.26.8 crypto/tls, against 0.74–0.81× (Go 1.26.0) on Zig 0.16.0. The card carries these figures. The host's Go moved from 1.26.0 to 1.26.8 in between.
-
 ## Backlog / deferred
 
-- **Open 2026-11-13 (resumption mutation run):** no dead-stack probe covers the TLS 1.2 resumption path (`stackprobe_test.zig` drives 1.3 only); the +6 KiB of `init` depth is an estimate against the 384 KiB burn — add a 1.2 resumed handshake to the probe.
-- ~~A TLS 1.3 ServerHello carrying the SessionTicket extension (35) is accepted silently~~ — **DONE 2026-11-13:** a TLS 1.3 ServerHello or HelloRetryRequest carrying any TLS 1.2-only extension (ALPN, status_request, SCT, extended_master_secret, SessionTicket, renegotiation_info) is `TlsIllegalParameter`, asked for or not, as Go 1.26's `checkServerHelloOrHRR` (`handshake_client_tls13.go`) refuses them; before, ALPN there was even taken as the selection. Test: `a TLS 1.3 ServerHello carrying a TLS 1.2-only extension is illegal_parameter` (fuzz_test.zig, six extensions + a control); interop with Go unchanged (97 as expected).
-
-- **No handshake budget** *(no-panic sweep 2026-10-28, reviewer note)* — a server trickling ChangeCipherSpec, empty or partial records holds `init` as long as the transport lets it; work stays linear in the bytes received, so the bound is the caller's I/O timeout. Go caps "useless" records (`maxUselessRecords` = 16); a similar count here would turn a stall into an error. Not a panic; no consumer report.
-- **Handshake messages split across records** *(same sweep, inherited from std)* — in TLS 1.3 the cleartext buffer flips after the Certificate message while the fragment indices carry over, and TLS 1.2 drops a first fragment; a server that splits a message there fails the handshake (bounds stay safe). Real servers seen so far do not; fix with one reassembly buffer when the record layer moves off std's unions.
-- **Stack requirement checked at run time** *(same sweep)* — `init` documents ~400 KiB; a caller on a small fibre stack overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on small stacks.
-- **`eof(c: Client)` takes the client by value** *(same sweep, hygiene)* — copies the traffic keys to the stack per call; std's signature, kept for drop-in use (`c.eof()` would still compile with `*const Client`, `Client.eof(c)` would not).
-
-- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `Client.zig` (std's TLS record layer: every AES-GCM record). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after. *(2026-10-19 attempt: NOT a drop-in here — the record layer is `std.crypto.tls.ApplicationCipher` / `HandshakeCipher` (`Client.zig`, every `P.AEAD`), whose member types are std's own AES-GCM; switching means replacing those unions with module-owned cipher states (a redesign, not a type swap). `ctgrind_harness`/`fuzz_test`/`stackprobe_test` mirror the production type, so they stay on std too. `"aesgcm"` is NOT in `.deps` until the sources use it.) **Owner 2026-10-19: a separate task** — own cipher states over `aesgcm`/`chachapoly` replacing std's unions; natural to do together with the planned `tlsserver` module's record layer (one shared record-protection layer for both), and only with the bulk path measured before/after.*
-
-- **Build option: algorithm set** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Every cipher suite, group and client-auth signer is linked
-  (`p384`/`p521` imported unconditionally at src/Client.zig:16-17, TLS 1.2 suites, AEGIS, client certificates, `tlsresume`). A
-  `.small` "modern web" set could drop P-521, TLS 1.2 CBC-free leftovers, AEGIS and client auth — a peer that insists on a dropped
-  algorithm fails the handshake loudly. ⛔ NOT a knob: the ML-KEM hybrid group (post-quantum protection is a security property, CONVENTIONS
-  §4.2 rule 2) and certificate verification. Size unmeasured; `Client.init` alone was 0.8 MB (native ReleaseSafe). Dependents' tests:
-  under rsa `.small` (4096 cap) any test with an 8192-bit certificate must branch on `rsa.max_modulus_bits` first (CONVENTIONS §4.2).
-- **DONE 2026-10-11: speed.** Was 5.22–5.87× Go 1.26.0 crypto/tls client handshake (P4, card `not measured`); then 1.27–1.37× (three runs, the clean one 1.31–1.34×; P3); **2026-10-13 1.08–1.11×** with P-384 on `p384` (three 7-round runs on a quiet host: ecdsa256 1.078 / 1.088 / 1.081, rsa2048 1.079 / 1.107 / 1.084), then **1.01–1.05× (P2)** after a profile found the ClientHello re-encoding std's P-256 key share — a field inversion on std's `divstep`, ~4 % of the client's CPU — now `KeyShare.secp256r1_sec1`/`secp384r1_sec1`, made once at generation (three 7-round runs: ecdsa256 1.027 / 1.031 / 1.010, rsa2048 1.045 / 1.024 / 1.011; the last run's spreads all ≤ 4.9 %). Then 2026-10-13 (S2) with Go's two-share default: **0.74–0.81×** (three 7-round runs, ecdsa256 0.802 / 0.805 / 0.803, rsa2048 0.739 / 0.747 / 0.749, every spread ≤ 4.8 %): no P-256/P-384 key pairs are made unless the server asks. Before that, what remained of the client's CPU was mostly the three P-256 verifies (`p256`, at parity with Go's assembly elsewhere: jwt es256_verify 0.94×), X25519 twice, and the two NIST key shares Go does not send (std's ClientHello, kept). Three causes by profile, in order: x509 chain verify and the server signature on std's slow P-256/RSA (→ `p256`, `rsa.VerifyKey`), then the ClientHello's eager key shares — std's `basePoint.mul` for P-384 (~1.07 ms) and P-256 (~0.29 ms) was ~2/3 of the client CPU (→ `keygen.zig`, see § Key shares).
-
-- **ECH (Encrypted Client Hello)** — deferred (owner, 2026-10-13: "deliberately not now"). Go's client has
-  it (`EncryptedClientHelloConfigList`, configs from DNS HTTPS records); it would pull `hpke` (grade 3) into
+- **ECH (Encrypted Client Hello)**: deferred by the owner ("deliberately not now"). Go's client has it
+  (`EncryptedClientHelloConfigList`, configs from DNS HTTPS records); it would pull `hpke` (grade 3) into
   this module's closure, which then has to reach grade 2.
-- ~~**TLS 1.2 session resumption**~~ — **DONE 2026-11-13** (was S2 R8). Go's behaviour, read in
-  go1.26's `handshake_client.go` (`loadSession`, `processServerHello`, `readSessionTicket`,
-  `saveSessionTicket`) and `ticket.go`, and followed here:
-  *Tickets only.* The Go client never resumes by a server-assigned session ID; its random 32-byte
-  `session_id` is only the marker that tells a ticket-accepting server's echo apart (RFC 5077 §3.4).
-  *No Extended Master Secret needed to resume* (only FIPS 140-3 mode refuses to offer a session
-  without it), but the server's answer must match the session's: a session with EMS resumed by a
-  ServerHello without it, or the reverse, is `handshake_failure` (RFC 7627 §5.3).
-  *One cache entry per server name* (`ClientSessionCache` key; a `Put` replaces): the newest
-  handshake's session, TLS 1.3 or 1.2. A cached session is offered only if its version is among the
-  hello's; a 1.3 one as the PSK, a 1.2 one in the SessionTicket extension; with a cache and no
-  usable session the extension is sent empty. The server then picks the version -- a 1.3 ServerHello
-  to a cached 1.2 session is a full 1.3 handshake whose ticket replaces the entry.
-  *Before offering:* leaf past notAfter -> entry deleted; a session made without verification is not
-  offered to a verifying config; the cipher suite must still be offered. *On the ServerHello:* the
-  session_id echo means "resumed" (an echo with nothing offered is `illegal_parameter`: the TLS 1.3
-  compatibility id echoed -- also with no cache at all; Go's own check, an RFC 8446 §4.1.2 downgrade
-  signal, pinned by a test); then version, suite and EMS answer must equal the session's, else
-  `handshake_failure`; the master secret, chain and group come from the session; `VerifyConnection`
-  still runs, after the server's Finished and before ours; the server's Finished is first. The
-  NewSessionTicket comes before the server's ChangeCipherSpec (required when the ServerHello
-  announced the extension, `illegal_parameter` when it was not offered); a new one replaces the
-  entry, none leaves it; the lifetime hint is ignored. **Any failure after a session was loaded
-  deletes the entry** (RFC 5077 §3.2). Here, in addition: this client sends no alerts in a
-  handshake (module-wide), so Go's `handshake_failure`/`illegal_parameter` are `TlsIllegalParameter`;
-  a zero-length ticket removes the entry (Go keeps it as an empty, never-accepted ticket -- the same
-  effect); a ticket over `max_ticket_len` (2048) is not cached (Go has no cap); the cached chain's
-  validity against the bundle is not re-run at resumption (leaf notAfter and the verification tag
-  only -- as for TLS 1.3 here; Go re-verifies its `VerifiedChains`); OCSP response and SCTs are not
-  kept with the session. **Review fixes 2026-11-13**, also Go's: at offer time the stored chain is
-  verified again under the current bundle and clock and the host name against the leaf (a removed CA
-  or an expired certificate ends the session; TLS 1.3 entries too); a session whose EMS use differs
-  from this hello's is not offered; a ticket over the cap, or a Finished with trailing octets, ends it
-  (`TlsDecodeError`); an entry replaced between offer and Finished is `SessionReplaced`, not an empty
-  view; a ClientHello over `hello.max_len` is `ClientHelloTooLarge`. Code: `Client.zig` (offer, abbreviated handshake, ticket handler),
-  `session.zig` (`version12` entries, `fresh12`, `wipe`, `drop`), `hello.zig` (`session_ticket`);
-  the ticket codec is `tlsresume.ticket12`.
-- **`VerifiedChains`** — the path `x509.verifyChain` built is not exposed (`ConnectionInfo` has the chain as
+- **`VerifiedChains`**: the path `x509.verifyChain` built is not exposed (`ConnectionInfo` has the chain as
   sent). Needs `verifyChain` to return its path.
-- *Deliberately not:* TLS 1.2 CBC suites (Go still lists some by default; Lucky13 class, AEAD-only here),
-  client renegotiation (Go's default is never), Ed25519 client keys in TLS 1.2, 0-RTT (Go's client has none).
-- ~~**A `p384` module**~~ — DONE 2026-10-13: `modules/p384` (grade 2); the comb, its generator and the `addMixed` copy left this module, and P-384 key share, ECDHE, client-cert signing and server-signature verify run there.
+- **Dead-stack probe for TLS 1.2 resumption**: `stackprobe_test.zig` drives TLS 1.3 only, and the +6 KiB of
+  `init` depth for TLS 1.2 resumption is an estimate against the 384 KiB burn. Add a TLS 1.2 resumed
+  handshake to the probe.
+- **No handshake budget**: a server trickling ChangeCipherSpec, empty or partial records holds `init` as long
+  as the transport lets it; work stays linear in the bytes received, so the bound is the caller's I/O
+  timeout. Go caps "useless" records (`maxUselessRecords` = 16); a similar count here would turn a stall into
+  an error. Not a panic; no consumer report.
+- **Handshake messages split across records** (inherited from std): in TLS 1.3 the cleartext buffer flips
+  after the Certificate message while the fragment indices carry over, and TLS 1.2 drops a first fragment; a
+  server that splits a message there fails the handshake (bounds stay safe). Real servers seen so far do not;
+  fix with one reassembly buffer when the record layer moves off std's unions.
+- **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
+  overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
+  small stacks.
+- **`eof(c: Client)` takes the client by value** (hygiene): it copies the traffic keys to the stack per
+  call; std's signature, kept for drop-in use (`c.eof()` would still compile with `*const Client`,
+  `Client.eof(c)` would not).
+- **Zig 0.17: std AES-GCM is 2.6x slower, move to zig-libs `aesgcm`**: 0.17 lowers `writeInt(u128, ...)` in
+  `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig
+  #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G -> 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages.
+  This module uses std's AES-GCM for every AES-GCM record; `aesgcm` (AES-NI stitched kernel, std-shaped API)
+  is unaffected. Not a drop-in: the record layer is `std.crypto.tls.ApplicationCipher` /
+  `HandshakeCipher` (every `P.AEAD`), whose member types are std's own AES-GCM, so switching means
+  replacing those unions with module-owned cipher states over `aesgcm`/`chachapoly` (`ctgrind_harness`,
+  `fuzz_test` and `stackprobe_test` mirror the production type and move with it). Owner decision: a
+  separate task, natural to do together with the `tlsserver` record layer (one shared record-protection
+  layer for both), and only with the bulk path measured before and after. `aesgcm` is not in `.deps` until
+  the sources use it.
+- **Build option: algorithm set**: every cipher suite, group and client-auth signer is linked (`p384` and
+  `p521` are imported unconditionally, TLS 1.2 suites, AEGIS, client certificates, `tlsresume`). A `.small`
+  "modern web" set could drop P-521, AEGIS and client auth; a peer that insists on a dropped algorithm
+  fails the handshake loudly. Not a knob: the ML-KEM hybrid group (post-quantum protection is a security
+  property, CONVENTIONS §4.2 rule 2) and certificate verification. Mechanism and checklist: CONVENTIONS
+  §4.2; measure first (the HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary) and add a knob only
+  for a measured gain of roughly 100 KB or more, or a consumer request. Size unmeasured; `Client.init`
+  alone was 0.8 MB (native ReleaseSafe). Dependents' tests: under rsa `.small` (4096 cap) any test with an
+  8192-bit certificate must branch on `rsa.max_modulus_bits` first.
 
-**2026-10-09 (resolved, ECDHE + handshake key schedule):** the ECDHE key
-shares (`KeyShare`: ML-KEM-768, X25519, P-256, P-384) and the handshake key
-schedule left their secrets in `Client.init`'s frame and in std's dead frames.
-`Client.init` now runs its body (`initBody`) one frame down and zeroes
-`burn.init_burn` (320 KiB; the body's frame is 181 KiB, the deepest measured
-callee path -- ML-KEM decaps + X25519 -- reaches 237 KiB). Probe
-(`stackprobe_test.zig`, ReleaseFast): a canned ServerHello per group
-(`x25519_ml_kem768`, `x25519`, `secp256r1`, `secp384r1`) x suite
-(`AES_128_GCM_SHA256`, `AES_256_GCM_SHA384`), reach checked through
-`ssl_key_log`; 2380-2965 needle windows per group in 5 calls before, 0 after,
-NEG = 0, POS >= 1. Needles: the four seeds, the ML-KEM secret vector and sigma,
-the P-256/P-384 scalars, the X25519 scalar (raw and clamped), every shared
-secret (ML-KEM K and r, X25519, ECDH x), the handshake and master secrets, the
-client/server handshake traffic secrets, finished keys, handshake keys, and the
-HMAC pads of the HKDF keys. TLS 1.2 (ECDHE_RSA key schedule) is not probed.
-The 12-byte IVs are shorter than a needle window and are not probed. (The
-P-256/P-384 shared-secret multiply was variable-time in std -- `mulPublic` on
-our ephemeral scalar -- and is `mul` here since 2026-10-09.)
-
-**2026-10-09 (resolved, the established session):** `init` returns `Client`
-BY VALUE (std's shape), so the finished `Client` -- application traffic
-secrets and keys -- was copied through `burn.run`'s result slot in `init`'s
-frame, above the burn, and through the caller's temporaries. New
-`Client.initInto(out: *Client, …)` beside the std-compatible `init` writes the
-session to `out` inside the burned call tree; `http.Client` dials with it. The
-probe now also feeds a full server flight (ChangeCipherSpec, EncryptedExtensions,
-a P-256 Certificate, CertificateVerify, Finished; `.ca = .no_verification`, the
-signature and MAC still checked) and checks reach through the logged client
-application secret: through `init` 640 windows over the 8 sets (client/server
-application traffic secrets and keys, 437-989 B below the region top: the
-wrapper's and the caller's frames) → 0 through `initInto`. The full flight
-reaches 296 KiB below the body's entry for every group and suite (certificate
-parse + ECDSA verify, deeper than the ECDHE path), so `init_burn` went 320 →
-384 KiB. Still open: an RSA server key and `.ca = .bundle` verification are
-covered by depth only (unmeasured), and `init` itself keeps std's by-value shape
-(documented on the function).
-
-**2026-10-04:** ALPN and TLS 1.3 client certificates are **done**. Still
-deferred: session-ticket resumption (a PSK/ticket state machine and a session
-cache API -- a large divergence from std's file for a saving of one round trip
-no consumer has asked for); TLS 1.2 client certificates (the 1.2
-CertificateVerify signs the raw handshake messages with the scheme's own hash,
-so the transcript would have to be kept, not only hashed); RSA client keys
-(std has no RSA signing); ECH.
-
-- **ALPN offer + selected-protocol accessor** (survey 2026-09-30) -- done 2026-10-04.
-- **Client certificates (mTLS)** (survey 2026-09-30) -- TLS 1.3 done 2026-10-04.
-- ✅ DONE 2026-10-13 (`61554eb5e`: TLS 1.3 `Options.session_cache`, `NewSessionTicket` kept via `tlsresume`; TLS 1.2 RFC 5077 tickets added 2026-11-13, see CHANGELOG). **Session-ticket resumption on the client** (survey 2026-09-30). `new_session_ticket` is dropped, so every connection pays a full handshake. Effort: medium. Fits §2. Deferred (above).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

@@ -1,10 +1,10 @@
 # tlsclient
 
 std's TLS client (TLS 1.3 and 1.2), made into a client a Go programmer
-recognises: Go `crypto/tls`'s defaults and options (S2 parity, 2026-10-13),
+recognises: Go `crypto/tls`'s defaults and options (S2 parity),
 on top of the fix it was forked for. The fix: the certificate chain a
 server sends is verified by RFC 5280 path validation (`x509.verifyChain`), not
-link by link. Zig 0.16's `std.crypto.tls.Client` (not re-diffed on 0.17) checks the issuer name, the
+link by link. Zig 0.16's `std.crypto.tls.Client` (the copy builds on 0.16 and 0.17; std's file is not re-diffed on 0.17) checks the issuer name, the
 validity and the signature of each link and nothing else -- no
 basicConstraints, pathLenConstraint or keyUsage (ziglang/zig #35877) -- so
 anyone holding one valid certificate for any name can sign a leaf for any
@@ -24,7 +24,7 @@ the fix and this module goes.
 
 ## Use
 
-The API is std's, with two optional `Options` fields. Swap the import:
+The API is std's, with the additional optional `Options` fields described below. Swap the import:
 
 ```zig
 const tls = @import("tlsclient"); // was: std.crypto.tls
@@ -109,6 +109,12 @@ try client.exportKeyingMaterial("EXPERIMENTAL-my-proto", null, &km); // RFC 8446
   cached. ECH is not supported (deferred).
 - **KeyUpdate:** answered when the server asks, and sent on our own after
   2^23 records.
+
+## Not provided
+
+ECH, revocation checking (OCSP/CRL) and certificate-transparency verification, TLS 1.2 CBC suites, client
+renegotiation, 0-RTT, and Ed25519 client keys in TLS 1.2. SPEC.md has the reasons (*What is deliberately
+not done*) and the open items (*Backlog / deferred*).
 
 Provenance: Zig 0.16.0 `lib/std/crypto/tls/Client.zig` copied under the MIT
 license (see ./NOTICE); the change is this collection's.
