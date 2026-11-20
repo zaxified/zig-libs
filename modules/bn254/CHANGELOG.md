@@ -5,19 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests/audit: delta mutation of the `Fr.randomInto` burn (5 mutants through the `groth16` stack probe, all killed); card counts 426/441, SPEC "Audit 2026-11-20". No source change.
 - **2026-11-19** — **BEHAVIOURAL, not breaking:** `Fr.randomInto` runs its body in a burned frame (new `src/burn.zig`, `random_burn` 2 KiB): the by-value `fromBytes` argument and the Montgomery conversion temporaries it left on the dead stack (the drawn bytes and the scalar, found by the dead-stack probe in `groth16`) are zeroed before it returns. Same values drawn; only what stays behind changed.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (436 mutants, 421 killed, 15 equivalent; the card now carries the count). 12 new tests (`src/audit_test.zig`, `scalar.zig`) pin per-limb and per-component `isZero`/`eql`, the `subLimbs` borrow chain, `Fp.fromInt` bounds and wide values, non-canonical identities on `G1`/`G2`, malformed `G1`/`G2` encodings (each coordinate, over-long compressed input, the `G2` compressed flag order) and `groth16.verify`'s refusal of an off-curve `A`/`C` and an out-of-subgroup `B`. Library code: `Fr.randomInto`'s body moved into a private `randomIntoBuf` so a test can see the wipe; same behaviour. ctgrind row `scalarmul` re-pinned (digest only, counts unchanged).
 
 - **2026-11-17** — **NEW (public multi-scalar multiplication):** `bn254.msm` (`msm.zig`): `g1Msm(allocator, points, scalars)` / `g2Msm` / `msm(G, ..)`, Pippenger's bucket method, the shape and names of `bls12_381`'s (`MsmError` = `LengthMismatch` or `OutOfMemory`), plus `addVartime` / `mixedAddVartime`. Public data only: variable-time in the scalars, nothing wiped (use `Jacobian.scalarMul` for a secret scalar). The Groth16 verifier keeps its own allocation-free loop. Delta mutation 36/39 killed, 3 equivalent (card: no whole-module count, unchanged).
 
 - **2026-11-16** — Compressed `G1`/`G2` points in gnark-crypto's convention: `g1`/`g2` `toBytesCompressed`/`fromBytesCompressed` (32/64 bytes; flag bits `0b10` smaller `y`, `0b11` larger, `0b01` infinity; `G2` decode subgroup-checked and refuses non-canonical `x`, off-curve `x`, bad flags, stray infinity bytes). arkworks' convention is not offered. Additive; existing encodings unchanged.
 - **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
   nonce or key is never returned by value through the caller's frame.
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
-- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE (licence clean-up of the tests):** the precompile KATs no longer embed go-ethereum's `bn256*.json` tables (LGPL-3.0); `src/precompile_vectors.zig` is generated over our own inputs by `tools/gen_precompile_vectors.py` (independent affine BN254 arithmetic, pairing truth by bilinearity). The Groth16 KAT no longer embeds the unlicensed darkforest-v0.3 proof; it uses the snarkjs proof over `groth16`'s own test circuit. NOTICE items 5–6 rewritten.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `BN254_FUZZ` (testkit) over ecAdd/ecMul/ecPairing on damaged genuine calldata (results canonical) and the group laws (distributivity, order wrap, inverse, bilinearity of the pairing check). No change to the library code.
 - **2026-10-09** — Dead-stack sweep (wave 6): **no secret-holding entry point** — no

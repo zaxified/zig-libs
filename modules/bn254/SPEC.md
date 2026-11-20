@@ -24,26 +24,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [ethereum/go-ethereum](https://github.com/ethereum/go-ethereum) (`core/vm` precompiles, `crypto/bn256`) — **reference** for EIP-196/197 | Go | LGPL-3.0 (repo; library part; source not read; its conformance vectors were used until 2026-10-26 and removed for their licence) | 51.4k | v1.17.6 (2026-09-23) | Defines what `ecAdd`/`ecMul`/`ecPairing` must return; its `getData` padding behaviour is the reference for `padTo`. |
+| [ethereum/go-ethereum](https://github.com/ethereum/go-ethereum) (`core/vm` precompiles, `crypto/bn256`) — **reference** for EIP-196/197 | Go | LGPL-3.0 (repo; library part; source not read; its conformance vectors are not used here for their licence) | 51.4k | v1.17.6 (2026-09-23) | Defines what `ecAdd`/`ecMul`/`ecPairing` must return; its `getData` padding behaviour is the reference for `padTo`. |
 | [Consensys/gnark-crypto](https://github.com/Consensys/gnark-crypto) `ecc/bn254` | Go | Apache-2.0 | 600 | v0.21.0 (2026-08-10) | The broad toolkit for BN254: groups, pairing, MSM, FFT, hash-to-curve, compressed serialization, KZG *(inferred, README not read)*; pairs with the gnark prover. |
 | [arkworks-rs/algebra](https://github.com/arkworks-rs/algebra) (`ark-bn254`) | Rust | Apache-2.0 (API; the arkworks crates are dual MIT/Apache, *inferred*) | 889 | pushed 2026-09-30 (latest tag v0.3.0, 2021) | Generic algebra traits; BN254 curve, compressed and uncompressed serialization, MSM *(inferred)*. |
 | [paritytech/bn](https://github.com/paritytech/bn) (`substrate-bn`) | Rust | Apache-2.0 | 36 | pushed 2024-01-18 | The EVM-precompile-oriented pure-Rust BN254 (add, mul, pairing, Groth16-style use); little maintenance *(inferred)*. |
-| [iden3/snarkjs](https://github.com/iden3/snarkjs) / [rapidsnark](https://github.com/iden3/rapidsnark) | JS / C++ | GPL-3.0 / LGPL-3.0 (docs only) | 2.0k / 102 | v0.7.6 (2026-01-26) / v0.0.8 (2026-01-07) | The circom Groth16 tooling: prover and verifier. This module verifies snarkjs-produced proofs (SPEC, a real darkforest-v0.3 proof) but has no prover. |
+| [iden3/snarkjs](https://github.com/iden3/snarkjs) / [rapidsnark](https://github.com/iden3/rapidsnark) | JS / C++ | GPL-3.0 / LGPL-3.0 (docs only) | 2.0k / 102 | v0.7.6 (2026-01-26) / v0.0.8 (2026-01-07) | The circom Groth16 tooling: prover and verifier. This module verifies snarkjs-produced proofs (a snarkjs proof over our own circuit) but has no prover. |
 | [ethereum/py_ecc](https://github.com/ethereum/py_ecc) | Python | MIT | 231 | v3.0.0 (2020-05-12), pushed 2025-12-17 | Not a competitor: the oracle this module's pairing KATs were generated from. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No pairing-friendly curves. A GitHub search for BN254 in Zig found nothing. |
 
-**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication. **Where we are behind:** no compressed point encoding (EIP-196/197 have none; arkworks/gnark users expect one), no public MSM, no Groth16 prover, no hash-to-curve (→ Backlog).
+**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication; compressed `G1`/`G2` points in gnark-crypto's convention and a public Pippenger MSM. **Where we are behind:** no arkworks-convention compressed encoding, no Groth16 prover, no hash-to-curve (→ *What is deliberately not done*).
 
 ## Purpose
 
-The full 6-part arc (`README.md`) is now COMPLETE: the base field `Fp`,
-the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`
-(Parts 1-2), the pairing groups `G1`/`G2` (Part 3, `g1.zig`/`g2.zig`),
-the optimal-ate pairing (Part 4, `pairing.zig`), the EIP-196/197 EVM
-precompiles (Part 5, `precompiles.zig`), and a Groth16 zk-SNARK verifier
-(Part 6, `groth16.zig`) — see "Part 4 — pairing", "Part 5 — EVM
-precompiles", and "Part 6 — Groth16 verifier" below for each part's own
-accounting.
+The module is a six-part arc (`README.md`): the base field `Fp`, the extension
+tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr` (Parts 1-2), the pairing groups
+`G1`/`G2` (Part 3, `g1.zig`/`g2.zig`), the optimal-ate pairing (Part 4,
+`pairing.zig`), the EIP-196/197 EVM precompiles (Part 5, `precompiles.zig`),
+and a Groth16 zk-SNARK verifier (Part 6, `groth16.zig`), plus a public
+multi-scalar multiplication (`msm.zig`) and a compressed point codec in
+`g1.zig`/`g2.zig`. See "Part 4 — pairing", "Part 5 — EVM precompiles" and
+"Part 6 — Groth16 verifier" below for each part.
 
 ## Model-after + seed
 
@@ -55,18 +55,12 @@ accounting.
   `bn128_curve.curve_order` / `bn128_curve.G1` / `bn128_curve.G2`
   constants (these are PUBLISHED NUMBERS, not copyrightable expression
   — see the "NOTICE" section below for why no NOTICE entry is needed).
-- **`Fr` is `montint.Field(r)` (`scalar.zig`, since 2026-10-02 — it
-  rode on `std.crypto.ff` before, see the ctgrind section's item 2);
-  `Fp` is this module's own field.** ⚠ Corrected 2026-09-03: this section said both fields
-  did, and that the module "does NOT reimplement big-integer or
-  Montgomery arithmetic itself", for six weeks after commit `1892c814`
-  replaced `Fp`'s backend with ~450 lines of hand-written constant-time
-  Montgomery arithmetic — a CIOS multiply, a dedicated SOS square,
-  `negInvMod2_64` by Newton–Hensel, masked conditional add/subtract,
-  limb codecs and an inline-asm optimization barrier. `std.crypto.ff`
-  survives in `fp.zig` only as a comptime differential oracle in its
-  tests. This mattered beyond tidiness: a contributor following the
-  sentence would have produced byte-wrong `toBytes`. Both `Fp` and `Fr` use a 256-bit (32-byte) container — a
+- **`Fr` is `montint.Field(r)` (`scalar.zig`); `Fp` is this module's own
+  field** (`fp.zig`): hand-written constant-time Montgomery arithmetic (a CIOS
+  multiply, a dedicated SOS square, `negInvMod2_64` by Newton–Hensel, masked
+  conditional add/subtract, limb codecs and an inline-asm optimization barrier).
+  `std.crypto.ff` survives in `fp.zig` only as a comptime differential oracle in
+  its tests. Both `Fp` and `Fr` use a 256-bit (32-byte) container — a
   BN254-specific quirk vs. `bls12_381` (whose `Fp`/`Fr` use DIFFERENT
   widths, 384 vs. 256 bits) because BN254's `p` and `r` are both
   exactly 254 bits.
@@ -105,7 +99,7 @@ accounting.
 
 - **`p ≡ 3 (mod 4)`, `p ≡ 1 (mod 3)`, `p ≡ 1 (mod 6)`** — all three
   confirmed directly from `p_bytes` and independently in Python (see
-  "Verification performed" below). These are exactly the congruences
+  *Verification*). These are exactly the congruences
   every formula in this tower depends on (`Fp.sqrt`'s simple case,
   `Fp2.sqrt`'s complex method, `Fp6`/`Fp12`'s exact-division Frobenius
   exponents) — same congruence class as `bls12_381`'s `p`, which is why
@@ -127,38 +121,25 @@ accounting.
   construction (confirmed via the `G2`-twist on-curve check below: the
   twist coefficient `b₂ = 3/ξ` only lands on the known-published `G2`
   generator with `ξ = 9+u`).
-- **No `isLexicographicallyLargest` (deliberate omission vs.
-  `bls12_381`).** `bls12_381` needs this "sign of y" helper because its
-  point-serialization convention (ZCash/IETF) COMPRESSES points (x-only
-  + a 1-bit sign flag). Ethereum's EIP-196/197 `G1`/`G2` precompile
-  encoding is UNCOMPRESSED — raw `(x, y)` (and `(x_im, x_re, y_im,
-  y_re)` for `G2`) coordinate pairs, no compression, no sign bit. This
-  module therefore has no correctness need for that helper in its
-  planned arc; adding it back is a one-line change if a future
-  compressed-encoding consumer ever appears, but it would currently be
-  dead, untested code.
+- **No public `isLexicographicallyLargest` (deliberate omission vs.
+  `bls12_381`).** EIP-196/197's `G1`/`G2` precompile encoding is
+  UNCOMPRESSED — raw `(x, y)` (and `(x_im, x_re, y_im, y_re)` for `G2`)
+  coordinate pairs, no sign bit — so the precompile path needs no "sign of y"
+  helper. The compressed codec (see "Compressed points" below) has its own
+  private `isLargest` in `g1.zig`/`g2.zig`.
 - **Montgomery-storage convention: BOTH `Fp` and `Fr` store in
-  Montgomery form.** ⚠ Corrected 2026-09-03 — this said `Fp` was
-  "canonical at rest" and "deliberately left alone", which was written
-  three weeks after `1892c814` made `Fp` Montgomery-resident. `std.crypto.ff`'s
-  `Modulus.mul` preserves its first operand's form, so two canonical
-  operands cost **four** Montgomery multiplications per field multiply
-  (and `sq` costs three, the 3:4 `square`:`mul` ratio that exposed
-  this), while two Montgomery operands cost one. `Fr` is the field
-  Poseidon hashing, Groth16 witnesses and scalar multiplication live
-  in, so it converts in `fromBytes`/`reduceWide` and back in `toBytes`
-  and holds Montgomery form in between — measured 4.0× on `Fr.mul`,
-  3.0× on `Fr.square` and 4.4× on a `poseidon` `t = 3` permutation,
-  with every byte-exact KAT in this module and in `groth16`/`poseidon`
-  unchanged. The invariant (every `Fr` a constructor or operation
-  yields is in Montgomery form) is load-bearing, because `ff.Fe.eql`
-  ignores the form flag; `scalar.zig` asserts it directly in a test.
-  `Fp` went the same way in `1892c814`, with the pairing KATs as its
-  acceptance surface, and took its own hand-written backend with it.
+  Montgomery form.** `Fr` is the field Poseidon hashing, Groth16 witnesses and
+  scalar multiplication live in, so it converts in `fromBytes`/`reduceWide` and
+  back in `toBytes` and holds Montgomery form in between (two Montgomery
+  operands cost one Montgomery multiplication per field multiply; two canonical
+  operands on `std.crypto.ff` would cost four). The invariant (every `Fr` a
+  constructor or operation yields is in Montgomery form) is load-bearing;
+  `scalar.zig` asserts it directly in a test. `Fp` is Montgomery-resident too,
+  with the pairing KATs as its acceptance surface.
 - **`G1`'s cofactor is 1 — a load-bearing fact, not a simplification.**
   BN254's defining polynomial family gives `#E(Fp) = p + 1 - t = r`
   EXACTLY (`t = 6x^2+1`, confirmed `p + 1 - t == r` symbolically — see
-  "Verification performed" below), i.e. `r` (prime) IS the full order
+  *Verification*), i.e. `r` (prime) IS the full order
   of `E(Fp)`, not merely a large prime factor. Since a group of prime
   order has no nontrivial proper subgroups, `E(Fp)` and `G1` are THE
   SAME SET — `isOnCurve() == subgroupCheck()` for every point,
@@ -178,11 +159,10 @@ accounting.
   see `g2.zig`'s module doc comment. `subgroupCheck` alone (no
   clearing) is sufficient and IS exercised: a constructed on-twist,
   non-subgroup point (`x = u`) is verified to FAIL it (see `g2.zig`'s
-  tests and "Verification performed" below). Since 2026-10-03 `g2.fromBytes` runs it
-  (decoders check by default, `fromBytesUnchecked` for trusted bytes),
-  and `subgroupCheck` checks the twist equation first. Since the same
-  day the check itself is `ψ(Q) == [6x²]Q` (ψ the twisted Frobenius,
-  `t − 1 = 6x²`), proved in `g2.zig`'s doc comment from
+  `g2.fromBytes` runs the subgroup check (decoders check by default,
+  `fromBytesUnchecked` skips it for trusted bytes), and `subgroupCheck` checks
+  the twist equation first. The check itself is `ψ(Q) == [6x²]Q` (ψ the
+  twisted Frobenius, `t − 1 = 6x²`), proved in `g2.zig`'s doc comment from
   `ψ² − tψ + p = 0` and `r ∤ #E'(Fp2)/r`; every premise is a test, and a
   differential test holds it against `[r]P == O` (kept, test-only) on
   members, non-members and off-twist points.
@@ -198,65 +178,29 @@ accounting.
   every coordinate (the generator itself qualifies), so a swapped
   ordering could not silently pass.
 
-## Tier assessment — Fable NOT required for Parts 1-3
+## Compressed points (`g1.zig`, `g2.zig`)
 
-This is a **careful, verified ADAPTATION**, not novel cryptographic
-design. Every algorithm (CIOS/SOS Montgomery field arithmetic after
-Koç et al. in `fp.zig`, `montint.Field` for `Fr`, Karatsuba/Devegili
-tower multiplication, the
-Adj–Rodriguez-Henriquez complex-method square root, Granger–Scott
-cyclotomic squaring, programmatic Frobenius-coefficient derivation) is
-the SAME formula shape already proven correct and battle-tested in the
-sibling `bls12_381` module — the only things that changed are the
-modulus `p`/`r` and the `Fp6` non-residue `ξ`, both independently
-verified against multiple public sources (below) and pinned by
-byte-exact KAT. Nothing here required inventing a new algorithm,
-resolving an ambiguous spec, or making an irreducible cryptographic
-design judgment call. **No stub was left; no test was weakened to
-pass; every identity (Fermat, Frobenius=pow(p), cyclotomic-square=
-square-on-subgroup, ring axioms) held on the first implementation
-attempt** — there was no "genuinely subtle" failure to isolate.
-
-**Part 3 (`G1`/`G2`) is the same story, one level up.** The Jacobian
-`add`/`double` formulas are UNCHANGED from `bls12_381` (generic in `b`);
-`scalarMul`'s constant-time double-and-add-always construction is
-UNCHANGED. The two genuinely BN254-specific pieces — `G1`'s cofactor
-being exactly 1 (not merely "small"), and deriving `b' = 3/(9+u)` in
-`Fp2` rather than transcribing it — are ARITHMETIC FACTS with a
-mechanical derivation and an independent Python cross-check each, not
-open design questions: there was no ambiguity about which of two
-candidate formulas to use, no judgment call about a threat model, no
-place a wrong choice could have been made and only discovered by an
-adversarial audit. Every group-law identity (associativity,
-distributivity of `scalarMul`, `[r]G1 == O`, `[r]G2 == O`, the
-non-subgroup `G2` point failing `subgroupCheck`, every `[k]G`
-byte-exact KAT) passed on the first implementation attempt — again, no
-"genuinely subtle" failure surfaced. The Fable-hard work in this arc is
-Part 4's pairing core (`millerLoop`/`finalExponentiation`) — this IS
-where BN254 diverges non-trivially from BLS12-381 (a different `6x+2`
-(not `|x|`) loop parameter, the BN-specific Frobenius-tail addition
-steps, and a different final-exponentiation hard-part addition chain —
-see "Part 4 — pairing" above). Part 4's SCAFFOLD (the type
-shapes, the KAT harness, the real infinity/composition wiring) was,
-like Parts 1-3, a careful, verified adaptation of `bls12_381/src
-/pairing.zig`'s structure — no design judgment call was needed for the
-scaffold itself. The two irreducible cores were the genuinely
-harder-tier work: a dedicated Fable crypto-core pass implemented them
-(and caught a real BN-vs-BLS untwist/line-slot subtlety only the
-byte-exact KAT surfaced — see "Part 4 — pairing" below).
+`toBytesCompressed` / `fromBytesCompressed` follow gnark-crypto's `ecc/bn254`
+convention only: big-endian `x`, with the two most significant bits of byte 0
+as flags (`p` is 254 bits, so they are free): `0b10` the smaller `y` of `±y`,
+`0b11` the larger, `0b01` the point at infinity (all other bits and bytes zero).
+`G1` is 32 bytes; `G2` is 64 bytes, `x = A1 || A0` (`A1` is this module's `c1`).
+"Larger" compares the canonical big-endian values of `y` and `-y`. Decoding
+refuses (`error.InvalidEncoding`) a wrong length, flags `0b00` (gnark's
+uncompressed marker), stray bits or bytes next to the infinity flag, and `x >= p`;
+an `x` with no point on the curve and (for `G2`) a point outside the subgroup are
+refused too. arkworks' convention (little-endian `x`, flags on the last byte) is
+not offered. The `G1` generator is pinned by hand to `0x80 .. 01`; the `G2` byte
+order follows gnark's documented `A1 || A0` and this module's own `Fp2` order, no
+gnark output was available to pin it against.
 
 ## Part 4 — pairing
 
 `pairing.zig` implements the optimal-ate pairing `e: G1 x G2 -> Gt`
-(`Gt` = the order-`r` cyclotomic subgroup of `Fp12*`) — COMPLETE: every
-structural piece plus both irreducible crypto-core functions
-(`millerLoop`, `finalExponentiation`) are implemented and tested,
-byte-exact against `py_ecc`. The type shapes / KAT harness / wiring
-were a careful adaptation of `bls12_381/src/pairing.zig`'s structure
-(scaffold pass); the two cores were a dedicated Fable crypto-core pass
-— see `NOTICE`'s "Verification performed" for the tier reasoning.
+(`Gt` = the order-`r` cyclotomic subgroup of `Fp12*`), byte-exact against
+`py_ecc`.
 
-**Structural pieces (adapted from `bls12_381`, scaffold pass):**
+**Structural pieces (adapted from `bls12_381/src/pairing.zig`):**
 - `Gt` (= `Fp12`, the "trust the constructor" convention already used by
   `bls12_381.pairing.Gt`) and `PairingPair`.
 - `bn_x` (the BN seed, `4965661367192848881` — the SAME value
@@ -268,25 +212,17 @@ were a careful adaptation of `bls12_381/src/pairing.zig`'s structure
 - `multiMillerLoop`'s infinity-skip product wiring: a pair with either
   input at infinity contributes the trivial factor `1` and is SKIPPED —
   `millerLoop` is never invoked for it. An all-infinity `pairs` slice
-  therefore returns `Fp12.one` WITHOUT touching either stub, gate
-  irrelevant — the module's own `"multiMillerLoop never touches the
-  stub on an all-infinity input"` test exercises exactly this, ungated.
+  therefore returns `Fp12.one` without calling `millerLoop` (test
+  "multiMillerLoop never touches the stub on an all-infinity input").
 - `pairing`/`pairingCheck`'s composition wiring (`finalExponentiation`
   composed with `multiMillerLoop`).
-- `Fp12.cyclotomicSquare` — the ONE auxiliary primitive the final
-  exponentiation's hard part needs beyond plain `Fp12` ring arithmetic —
-  was ALREADY implemented and KAT-tested during the Part 3 field-tower
-  pass (`fp12.zig`, Granger-Scott construction, generic in the tower's
-  non-residues, so it required NO BN254-specific derivation beyond what
-  Part 3 already did). Part 4 imports it as-is; **no new implementation
-  decision was needed here** — this answers what would otherwise be an
-  open scaffold question ("implement `cyclotomicSquare` now, or stub it
-  for Fable too?"): it turned out already done.
-- Every pinned KAT hex vector's OWN byte-parse/round-trip (independent of
-  whether the pairing core exists yet to PRODUCE the values).
+- `Fp12.cyclotomicSquare` — the one auxiliary primitive the final
+  exponentiation's hard part needs beyond plain `Fp12` ring arithmetic
+  (`fp12.zig`, Granger-Scott construction, generic in the tower's
+  non-residues), imported as-is.
+- Every pinned KAT hex vector's own byte-parse/round-trip.
 
-**Cores (Fable crypto-core pass, gate `pairing_core_implemented` now
-`true`):**
+**Cores:**
 - `millerLoop(p, q) Fp12` — the per-pair `6x+2` Miller walk (plain
   binary MSB→LSB over `6x+2`; NAF is a deferred optimization) with the
   BN-specific "Frobenius tail" (`Q1 = π(Q)`, `Q2 = π²(Q)`, then
@@ -316,12 +252,14 @@ Both cores' doc comments in `pairing.zig` carry the full construction,
 the sign/Frobenius-power-ordering footgun, and the numeric
 re-verification — byte-exact-checked against the pinned KAT vectors.
 
+`millerLoop` is the plain binary walk; the sparse-line multiplication, the NAF walk and
+a shared multi-pairing walk are optimizations not done (→ *Backlog / deferred*).
+
 ## Part 4 — KAT generation
 
 No numeric worked example for BN254's pairing exists in EIP-196/197's
 spec text itself, so Part 4's KAT vectors were generated with
-`ethereum/py_ecc`'s `bn128` module (`pip install py_ecc`, version current
-as of 2026-07 — a mature, independently-authored reference
+`ethereum/py_ecc`'s `bn128` module (`pip install py_ecc`, a mature, independently-authored reference
 implementation; this is the task's own suggested KAT source) — used
 strictly as a NUMERIC ORACLE for `pairing.zig`'s pinned test vectors, not
 read/ported for algorithm shape (this module's OWN `millerLoop`/
@@ -361,8 +299,7 @@ asserted:
 - On 20 random pairs of tower elements `A`, `B`: computed `A*B` with a
   from-scratch Python re-implementation of THIS module's own tower
   arithmetic (the same `fp2_mul`/`fp6_mul`/`fp12_mul` functions already
-  established by this file's "Verification performed" §4 KAT
-  generator), mapped both the product and the two factors into
+  established by the independent tower generator, see *Verification*), mapped both the product and the two factors into
   `py_ecc`'s flat basis, and confirmed `map(A)*map(B) == map(A*B)` under
   `py_ecc`'s own `FQ12.__mul__` — i.e. the map is a genuine ring
   homomorphism, not merely coefficient-position-compatible on the
@@ -400,11 +337,9 @@ the same positive loop parameter this module's `bn_ate_loop_param`
 already derives, so `py_ecc`'s pairing convention lines up with this
 module's directly.
 
-The Python script (generator + validator, not shipped/imported by the
-module — same "kept for reproducibility" policy as this file's §4 field
--tower KAT generator) lives in scratch history only; reproducing it
-requires `pip install py_ecc` plus the tower-arithmetic functions
-already listed in this file's §4.
+The Python script (generator + validator) is not shipped with the
+module; reproducing it requires `pip install py_ecc` plus an independent
+plain-integer tower implementation (see *Verification*).
 
 ## Part 5 — EVM precompiles (`precompiles.zig`)
 
@@ -415,18 +350,12 @@ existing codecs, call an existing `G1`/`G2` group operation or
 `pairing.pairingCheck`, re-encode the result. No new field/curve/pairing
 arithmetic exists in this file.
 
-**Tier: Sonnet, not Fable — see "Tier assessment" above for the Parts
-1-4 precedent this continues.** The one property that could plausibly
-look like a "judgment call" — MUST `ecPairing` reject an on-curve-but-
-outside-subgroup `G2` operand — is not actually a judgment call: it is
-EIP-197's own specified precondition (an unchecked small-subgroup point
-makes the pairing forgeable, the standard pairing-cryptography pitfall
-`g2.zig`'s own module doc comment already documents), and the check
-itself (`g2.Jacobian.subgroupCheck`) already existed, already tested,
-from Part 3. This file's only obligation was to remember to CALL it on
-every decoded `G2` operand and to prove, with a test, that it actually
-fires in the precompile path (see "Verification performed" below) — not
-to derive why the check is needed or how to build it.
+**`ecPairing` MUST reject an on-curve-but-outside-subgroup `G2` operand.**
+This is EIP-197's own specified precondition (an unchecked small-subgroup point
+makes the pairing forgeable, the standard pairing-cryptography pitfall `g2.zig`'s
+module doc comment documents); `precompiles.zig` calls `g2.Jacobian.subgroupCheck`
+on every decoded `G2` operand, and a test proves that it fires in the precompile
+path (see "What the KAT set does NOT cover" below).
 
 **Calldata padding.** EIP-196's own spec text ("Note about the change in
 the way points and outputs are represented") and go-ethereum's
@@ -481,10 +410,10 @@ Python: a TRUE vector is `n-1` random pairs `(a_i·G1, b_i·G2)` closed by
 doubles that closing point, leaving a non-trivial power of `e(G1, G2)`
 (non-degeneracy).
 
-Until 2026-10-26 these KATs were go-ethereum's
-`core/vm/testdata/precompiles/bn256*.json` tables (LGPL-3.0), embedded
-verbatim. They were removed because copyleft-licensed data may not live in
-this repository (root `NOTICE` §1); see `NOTICE` item 5.
+The KATs are our own; go-ethereum's `core/vm/testdata/precompiles/bn256*.json`
+tables (LGPL-3.0) are deliberately not embedded: copyleft-licensed data may not
+live in this repository (see `NOTICE` item 5).
+
 
 **Coverage:**
 - `ecAdd`: two distinct points, doubling, `P + (-P) = O`, infinity on
@@ -512,8 +441,7 @@ constructions, not independent oracles):
   rejected") reuses the EXACT non-subgroup point `g2.zig`'s Part 3 test
   already constructed and independently verified in Python (`x = u`,
   `c0=0,c1=1`; that point's `y` and its "on-curve but `[r]P != O`"
-  status were confirmed outside this module during Part 3 — see this
-  file's Part 3 "Verification performed" entries), packages it as the
+  status were confirmed outside this module during Part 3 — see *Verification*), packages it as the
   `G2` half of a `192`-byte `ecPairing` calldata pair, and confirms
   `ecPairingCheck` returns `error.NotInSubgroup` rather than silently
   calling `pairing.pairingCheck` on an invalid input. This is the
@@ -538,25 +466,16 @@ constructions, not independent oracles):
 module's arc. PURE COMPOSITION over Parts 1-4, same tier posture as
 Part 5: the multi-scalar accumulation of the public-input commitment
 (`msm`, a plain loop of `G1.Jacobian.scalarMul`/`add` — no batching/
-Pippenger, deliberately, see "Backlog") and one `pairing.pairingCheck`
+Pippenger, deliberately, see *What is deliberately not done*) and one `pairing.pairingCheck`
 call over four `(G1,G2)` pairs. No new field/curve/pairing primitive.
 
-**Tier: Sonnet, not Fable.** Same argument as Part 5's tier assessment:
-the one property that could look like a judgment call — MUST `verify`
-subgroup-check the proof's `B` operand — is EIP-197's/the standard
-Groth16 verifier's own specified precondition (an unchecked
-small-subgroup `B` makes the pairing forgeable), and the check itself
-(`G2.Jacobian.subgroupCheck`) already existed, already tested, from
-Part 3. This file's only obligations were: (1) remember to CALL it
-(and `G1.isOnCurve` on `A`/`C`) on every proof field before trusting it,
-(2) get the single-`pairingCheck`-product sign convention right (`-A`,
-not `-C`/`-vk_x` — three algebraically-equivalent-looking choices, only
-one of which matches the standard snarkjs/Ethereum-verifier convention),
-and (3) wire the `IC[0] + Σ pub[i]·IC[i]` accumulation correctly. All
-three were CONFIRMED against a byte-exact, independently-computed KAT
-(below), not merely asserted — see `groth16.zig`'s own "KAT provenance"
-doc comment, and the "negated A" tamper test that shows the other sign
-fails.
+**`verify` MUST subgroup-check the proof's `B` operand** (EIP-197's and the
+standard Groth16 verifier's precondition: an unchecked small-subgroup `B` makes
+the pairing forgeable), and `isOnCurve`-check `A`/`C`. It uses a single
+`pairingCheck` product with `-A` (not `-C`/`-vk_x`; only that choice matches the
+standard snarkjs/Ethereum-verifier convention, confirmed against the snarkjs
+KAT below and by the "negated A" tamper test) and the accumulation
+`IC[0] + Σ pub[i]·IC[i]`.
 
 **The verification equation** — `e(A,B) == e(α,β)·e(vk_x,γ)·e(C,δ)`,
 checked as the single product `e(-A,B)·e(α,β)·e(vk_x,γ)·e(C,δ) == 1` via
@@ -590,7 +509,7 @@ circuit of our own: the `groth16` module's fixture `t.circom`
 `IC` points). snarkjs and circom (GPL-3.0) were run as black boxes by
 `groth16/tools/snarkjs/gen.sh`, and snarkjs's own `groth16 verify` printed
 OK on this proof; only their output over our circuit and witness is kept
-(root `NOTICE` §0). The proof is not produced by this module, so it still
+(see `NOTICE`). The proof is not produced by this module, so it still
 checks `verify` against an independent prover. The values are copied from
 the JSON files by script.
 
@@ -602,228 +521,57 @@ OPPOSITE of `g2.zig`'s EIP-197 byte-codec order (`c1||c0`,
 imaginary-first). A swapped reading lands off the twist, which `verify`'s
 own `isOnCurve`/`subgroupCheck` guards turn into `false`.
 
-Until 2026-10-26 this KAT was a proof copied from
-`darkforest-eth/darkforest-v0.3` (no licence). It was removed because data
-without an MIT-compatible grant may not live in this repository; see
-`NOTICE` item 6.
+The positive KAT is the snarkjs-produced proof above; a proof copied from a
+third-party repository without an MIT-compatible grant is deliberately not kept
+(see `NOTICE` item 6).
 
-## Verification performed
+## Verification
 
-Every embedded constant was independently re-derived/cross-checked
-with Python (`python3`, standard library only — no third-party crypto
-package), OUTSIDE this module, before being pinned as a test vector or
-comptime literal. Reproducible steps:
+Run: `scripts/modtest bn254` (ReleaseSafe, `heavy: true`); `zig build test-bn254 -Doptimize=ReleaseFast` for the second mode; the example is
+built by `zig build check-examples -Dmodule=bn254`.
 
-**1. Primality + BN polynomial-family re-derivation** (confirms `p_bytes`/`r_bytes`):
+Every embedded constant was independently re-derived or cross-checked with Python (standard library only, no third-party crypto
+package), outside this module, before being pinned as a test vector or comptime literal:
 
-```python
-p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
-r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
-x = 4965661367192848881  # the BN seed
-assert p == 36*x**4 + 36*x**3 + 24*x**2 + 6*x + 1
-assert r == 36*x**4 + 36*x**3 + 18*x**2 + 6*x + 1
-# both independently confirmed prime by a 40-round Miller-Rabin test
-```
+1. **Primality and the BN polynomial family:** `p == 36x⁴+36x³+24x²+6x+1`, `r == 36x⁴+36x³+18x²+6x+1` for the seed `x = 4965661367192848881`, both prime
+   (40-round Miller-Rabin).
+2. **`p`'s congruences:** `p % 4 == 3`, `(p-1) % 3 == 0`, `(p-1) % 6 == 0` (the algorithm-shape preconditions).
+3. **`G1`/`G2` on the curve:** `G1 = (1, 2)` on `y² = x³ + 3`; the `G2` generator on the twist `y² = x³ + b₂`, `b₂ = 3/(9+u)`, which also confirms `p` and the
+   `Fp6` non-residue `ξ = 9+u` together.
+4. **A from-scratch tower generator** (plain `pow`/`%` big-integer `Fp2`/`Fp6`/`Fp12` arithmetic, deliberately a different strategy from the Montgomery Zig code) produced every
+   KAT hex string pinned in `fp2.zig`/`fp6.zig`/`fp12.zig`'s `test "KAT: ..."` blocks: `Fp2` multiplication and inversion, the `Fp6`/`Fp12` Frobenius coefficients (`γ_1`, `γ`),
+   `Fp6` multiplication and inversion, `Fp12` multiplication, and `Fr`'s 64-byte `reduceWide`. Hex encoding: each `Fp` is 32 bytes big-endian; `Fp2`/`Fp6`/`Fp12` concatenate
+   their components high to low (`c1||c0`, `c2||c1||c0`, `c1||c0`), the module's own `toBytes` order.
+5. **`Fr.reduceWide` 64-byte KAT:** `int.from_bytes(b'\xff'*64, 'big') % r`.
+6. **`G1`/`G2` by an independent affine implementation** (textbook affine formulas, a different algorithm family from the Jacobian Zig code): `p + 1 - t == r`
+   (`t = 6x²+1`, the cofactor-1 claim); `[r]G1 == O`, `[r]G2 == O`; the `[k]G1`/`[k]G2` byte-exact KATs of `g1.zig`/`g2.zig` for `k ∈ {2, 3, 5, 0x0123...cdef}`; the on-twist
+   non-subgroup point (`x = u`) used by the negative `subgroupCheck` test; `twistB()`; the EIP-197 imaginary-first encoding of the `G2` generator and `[2]G2`.
+7. **Pairing KATs** from `py_ecc.bn128` (see "Part 4 — KAT generation"), **precompile KATs** from `tools/gen_precompile_vectors.py` (see "Part 5 — KAT sourcing"), and the
+   snarkjs-produced Groth16 proof (see "Part 6 — KAT provenance").
 
-**2. `p`'s congruences** (confirms the algorithm-shape preconditions):
-`p % 4 == 3`, `(p-1) % 3 == 0`, `(p-1) % 6 == 0` — all directly
-computed.
+None of the Python generators for items 1-6 is shipped; only `tools/gen_precompile_vectors.py` is.
 
-**3. `G1`/`G2`-on-curve cross-check** (confirms `p` AND the `Fp6`
-non-residue `ξ = 9+u` together, without this module implementing any
-group arithmetic itself — see `fp.zig`'s own KAT test for the `G1`
-half):
+Test classes, all in `src/*.zig` test blocks:
 
-```python
-# G1 = (1, 2) on y^2 = x^3 + 3 (EIP-196 / py_ecc bn128_curve.py)
-assert (2*2) % p == (1**3 + 3) % p
-
-# G2 on the sextic twist y^2 = x^3 + b2, b2 = 3/(9+u), using
-# Fp2 = Fp[u]/(u^2+1), element (c0,c1) = c0 + c1*u:
-def fp2_mul(a,b):
-    a0,a1=a; b0,b1=b
-    return ((a0*b0 - a1*b1) % p, (a0*b1 + a1*b0) % p)
-def fp2_inv(a):
-    a0,a1 = a
-    n = pow((a0*a0 + a1*a1) % p, p-2, p)
-    return ((a0*n) % p, ((-a1)*n) % p)
-xi = (9, 1)
-b2 = fp2_mul((3,0), fp2_inv(xi))
-G2x = (10857046999023057135944570762232829481370756359578518086990519993285655852781,
-       11559732032986387107991004021392285783925812861821192530917403151452391805634)
-G2y = (8495653923123431417604973247489272438418190587263600148770280649306958101930,
-       4082367875863433681332203403145435568316851327593401208105741076214120093531)
-def fp2_add(a,b): return ((a[0]+b[0])%p,(a[1]+b[1])%p)
-x3 = fp2_mul(fp2_mul(G2x,G2x), G2x)
-assert fp2_mul(G2y,G2y) == fp2_add(x3, b2)  # True
-```
-
-(`G2x`/`G2y` are `py_ecc.bn128.bn128_curve.G2`'s published coordinates,
-`FQ2([c0, c1])` meaning `c0 + c1*i`.)
-
-**4. Full independent field-tower KAT generator.** A from-scratch
-Python re-implementation of `Fp2`/`Fp6`/`Fp12` arithmetic (Montgomery
-storage NOT used — plain `pow`/`%` big-integer arithmetic, deliberately
-a DIFFERENT implementation strategy than this module's
-`std.crypto.ff`-backed Zig code, so the two cannot share a bug) was
-used to generate every KAT hex string pinned in `fp2.zig`/`fp6.zig`/
-`fp12.zig`'s `test "KAT: ..."` blocks: `Fp2` multiplication and
-inversion, `Fp6`/`Fp12` Frobenius coefficients (`γ_1`, `γ`), `Fp6`
-multiplication and inversion, `Fp12` multiplication, and `Fr`'s 64-byte
-`reduceWide` reduction. The generator (kept for reproducibility, not
-shipped/imported by the module):
-
-```python
-p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
-r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
-def fp_inv(a): return pow(a, p-2, p)
-
-def fp2_add(a,b): return ((a[0]+b[0])%p, (a[1]+b[1])%p)
-def fp2_sub(a,b): return ((a[0]-b[0])%p, (a[1]-b[1])%p)
-def fp2_mul(a,b):
-    a0,a1=a; b0,b1=b
-    return ((a0*b0 - a1*b1)%p, (a0*b1+a1*b0)%p)
-def fp2_sq(a): return fp2_mul(a,a)
-def fp2_inv(a):
-    a0,a1=a
-    ninv = fp_inv((a0*a0+a1*a1)%p)
-    return ((a0*ninv)%p, ((-a1)*ninv)%p)
-FP2_ONE=(1,0); FP2_ZERO=(0,0)
-XI = (9,1)  # Fp6 non-residue = 9+u
-
-def fp6_mulByNonresidue(a):
-    c0,c1,c2 = a
-    return (fp2_mul(c2, XI), c0, c1)
-def fp6_mul(a,b):
-    a0,a1,a2=a; b0,b1,b2=b
-    v0=fp2_mul(a0,b0); v1=fp2_mul(a1,b1); v2=fp2_mul(a2,b2)
-    t0 = fp2_sub(fp2_sub(fp2_mul(fp2_add(a1,a2),fp2_add(b1,b2)),v1),v2)
-    c0 = fp2_add(fp2_mul(t0, XI), v0)
-    c1 = fp2_add(fp2_sub(fp2_sub(fp2_mul(fp2_add(a0,a1),fp2_add(b0,b1)),v0),v1), fp2_mul(v2,XI))
-    c2 = fp2_sub(fp2_add(fp2_sub(fp2_mul(fp2_add(a0,a2),fp2_add(b0,b2)),v0),v1),v2)
-    return (c0,c1,c2)
-FP6_ONE=(FP2_ONE,FP2_ZERO,FP2_ZERO)
-def fp6_inv(a):
-    a0,a1,a2=a
-    c0 = fp2_sub(fp2_sq(a0), fp2_mul(fp2_mul(a1,a2),XI))
-    c1 = fp2_sub(fp2_mul(fp2_sq(a2),XI), fp2_mul(a0,a1))
-    c2 = fp2_sub(fp2_sq(a1), fp2_mul(a0,a2))
-    t = fp2_add(fp2_mul(fp2_add(fp2_mul(a1,c2),fp2_mul(a2,c1)),XI), fp2_mul(a0,c0))
-    tinv = fp2_inv(t)
-    return (fp2_mul(c0,tinv), fp2_mul(c1,tinv), fp2_mul(c2,tinv))
-
-def fp6_add(a,b): return tuple(fp2_add(x,y) for x,y in zip(a,b))
-def fp6_sub(a,b): return tuple(fp2_sub(x,y) for x,y in zip(a,b))
-def fp12_mul(a,b):
-    a0,a1=a; b0,b1=b
-    v0=fp6_mul(a0,b0); v1=fp6_mul(a1,b1)
-    c0 = fp6_add(v0, fp6_mulByNonresidue(v1))
-    c1 = fp6_sub(fp6_sub(fp6_mul(fp6_add(a0,a1),fp6_add(b0,b1)),v0),v1)
-    return (c0,c1)
-
-def fp2_pow(a, e):
-    acc = FP2_ONE
-    base = a
-    while e > 0:
-        if e & 1: acc = fp2_mul(acc, base)
-        base = fp2_sq(base)
-        e >>= 1
-    return acc
-
-gamma_1 = fp2_pow(XI, (p-1)//3)   # Fp6 Frobenius coefficient
-gamma   = fp2_pow(XI, (p-1)//6)   # Fp12 Frobenius coefficient
-```
-
-(Every KAT test in this module cites which of these computations it
-pins.) Hex encoding: each `Fp` value is
-`format(x % p, '064x')` (32 bytes, big-endian); `Fp2`/`Fp6`/`Fp12`
-concatenate their components HIGH-to-LOW (`c1||c0`, `c2||c1||c0`,
-`c1||c0`) matching this module's own `toBytes` convention.
-
-**5. `Fr.reduceWide` 64-byte KAT**: `int.from_bytes(b'\xff'*64, 'big')
-% r`, computed directly in Python.
-
-**6. Part 3 (`G1`/`G2`) — independent from-scratch Python EC
-implementation.** Plain textbook AFFINE-coordinate short-Weierstrass
-formulas over Python big integers (a DIFFERENT algorithm family than
-this module's Jacobian/`std.crypto.ff` Zig code) were used to:
-
-```python
-p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
-r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
-def fp_inv(a): return pow(a, p-2, p)
-def fp2_mul(a,b):
-    a0,a1=a; b0,b1=b
-    return ((a0*b0 - a1*b1) % p, (a0*b1 + a1*b0) % p)
-def fp2_sq(a): return fp2_mul(a,a)
-def fp2_inv(a):
-    a0,a1 = a
-    n = fp_inv((a0*a0 + a1*a1) % p)
-    return ((a0*n) % p, ((-a1)*n) % p)
-def fp2_add(a,b): return ((a[0]+b[0])%p, (a[1]+b[1])%p)
-def fp2_sub(a,b): return ((a[0]-b[0])%p, (a[1]-b[1])%p)
-
-xi = (9, 1)
-b2 = fp2_mul((3,0), fp2_inv(xi))  # G2's twist constant b'
-
-G1 = (1, 2)
-def g1_add(P, Q):  # standard affine EC addition/doubling over Fp
-    if P is None: return Q
-    if Q is None: return P
-    x1,y1 = P; x2,y2 = Q
-    if x1 == x2 and (y1 + y2) % p == 0: return None
-    if P == Q:
-        if y1 == 0: return None
-        m = (3*x1*x1) * fp_inv(2*y1) % p
-    else:
-        m = (y2-y1) * fp_inv((x2-x1) % p) % p
-    x3 = (m*m - x1 - x2) % p
-    y3 = (m*(x1-x3) - y1) % p
-    return (x3, y3)
-def g1_mul(P, k):
-    R, Q = None, P
-    while k > 0:
-        if k & 1: R = g1_add(R, Q)
-        Q = g1_add(Q, Q); k >>= 1
-    return R
-
-def g2_add(P, Q):  # same shape, over Fp2
-    if P is None: return Q
-    if Q is None: return P
-    x1,y1 = P; x2,y2 = Q
-    if x1 == x2 and fp2_add(y1,y2) == (0,0): return None
-    if P == Q:
-        if y1 == (0,0): return None
-        m = fp2_mul(fp2_mul((3,0), fp2_sq(x1)), fp2_inv(fp2_mul((2,0), y1)))
-    else:
-        m = fp2_mul(fp2_sub(y2,y1), fp2_inv(fp2_sub(x2,x1)))
-    x3 = fp2_sub(fp2_sub(fp2_sq(m), x1), x2)
-    y3 = fp2_sub(fp2_mul(m, fp2_sub(x1,x3)), y1)
-    return (x3, y3)
-def g2_mul(P, k):
-    R, Q = None, P
-    while k > 0:
-        if k & 1: R = g2_add(R, Q)
-        Q = g2_add(Q, Q); k >>= 1
-    return R
-```
-
-used to:
-- confirm `p + 1 - t == r` (`t = 6x^2+1`) — the polynomial identity
-  behind `G1`'s cofactor-1 claim;
-- confirm `r * G1 == O` and `r * G2 == O` (via `g1_mul`/`g2_mul`) —
-  independent of this module's own `[r]P == O` tests;
-- generate the `[k]G1`/`[k]G2` byte-exact KAT vectors pinned in
-  `g1.zig`/`g2.zig` for `k ∈ {2, 3, 5, 0x0123...cdef}`;
-- search small `x = (0, c1)` values on the `G2` twist (via `fp2_sqrt`,
-  the same complex-method construction as `fp2.zig`'s `Fp2.sqrt`) for
-  one where `g2_mul(P, r) is not None` — `x = u` (`c1 = 1`) was the
-  first hit, confirmed on-twist AND outside the subgroup, and is the
-  vector `g2.zig`'s negative `subgroupCheck` test uses;
-- confirm `twistB()`'s value (`b2` above) byte-for-byte against
-  `g2.zig`'s comptime/runtime-computed result, and the EIP-197
-  imaginary-first 128-byte encoding of the `G2` generator and `[2]G2`
-  byte-for-byte against `g2.zig`'s `toBytes` output.
+- **Field and tower** (`fp.zig`, `fp2.zig`, `fp6.zig`, `fp12.zig`, `scalar.zig`): ring axioms, Fermat, Frobenius = `a^p`, cyclotomic square = square on the subgroup, `Fp`
+  against the `std.crypto.ff` comptime oracle, the Montgomery-form invariant of `Fr`, the KATs of item 4.
+- **Groups** (`g1.zig`, `g2.zig`): group laws, `[r]G == O`, `[k]G` KATs, the on-curve and subgroup checks (including the non-member `G2` point and the differential test of the `ψ` check
+  against `[r]P == O`), the uncompressed and compressed codecs and every refusal.
+- **Pairing** (`pairing.zig`): the three `py_ecc` KATs byte-exact, bilinearity, non-degeneracy, `pairingCheck` identities, the infinity-skip wiring.
+- **Precompiles and Groth16** (`precompiles.zig`, `groth16.zig`, `precompile_vectors.zig`): the KAT tables, padding and truncation, `BadLength`, the `G2` subgroup rejection inside the
+  precompile path, the snarkjs proof verifying true and its tamper cases verifying false, `WrongPublicInputCount`.
+- **MSM** (`msm.zig`): equality with the constant-time naive sum in `G1` and `G2` over sizes that hit every window width and degenerate inputs (identity point, zero scalar, repeated point,
+  a point and its negation), the extreme scalars `r - 1` and `2^253`, the empty, mismatched-length and all-zero cases, and `addVartime`/`mixedAddVartime` against the constant-time `add`
+  on every degenerate class.
+- **Mutation-driven tests** (`src/audit_test.zig`): per-limb and per-component `isZero`/`eql` of `Fp`, `Fp2`, `Fp6`, `Fp12`; a borrow rippling through an equal limb in `subLimbs`;
+  `Fp.fromInt` at `p` and with bits in limbs 2 and 3; a non-canonical identity on the curve in `G1`/`G2`; `G1.subgroupCheck` of an off-curve point; `G1.fromBytes` with `y >= p`; all
+  four `G2` coordinates `>= p`; 33-/65-byte compressed input; the `G2` compressed flag against the lexicographic order of `y` and `-y`; `groth16.verify` refusing an off-curve `A` or `C` and
+  an on-twist non-member `B`.
+- **Dead-stack probe:** `Fr.randomInto`'s wipe is observed by the `groth16` stack probe (a fake `Io` replaying known bytes); `scalar.zig` also tests `randomIntoBuf`'s buffer wipe.
+- **Fuzz:** `src/fuzz_test.zig`, four deterministic-driver harnesses run with `BN254_FUZZ=<runs>[,<first seed>]` (`ecAdd`, `ecMul` at 1/4 of the budget, `ecPairing` at 1/10, the algebra
+  harness at 1/100), each with a reach test.
+- **Constant time:** the ctgrind rows below.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## NOTICE
 
@@ -852,63 +600,47 @@ signal):
 | target | tainted input | in-file contexts |
 |---|---|---:|
 | `field` | an `Fp` value (limbs, after a clean parse) | 1 |
-| `scalarmul` | the `Fr` scalar of `G1.Jacobian.scalarMul` | 2 (`toAffine`'s Z test + `Fp.inv`, on the public result; was 5 — item 2 below) |
+| `scalarmul` | the `Fr` scalar of `G1.Jacobian.scalarMul` | 2 (`toAffine`'s Z test + `Fp.inv`, on the public result) |
 
-⚠ **Until 2026-09-03 there was no such measurement at all.** Commit
-`1892c814` replaced `Fp`'s `std.crypto.ff` backend with a hand-written
-constant-time field — CIOS multiply, SOS square, masked conditional
-subtract, an inline-asm barrier — and `bn254` was not on the ctgrind module
-list, so none of it was ever measured. That is the same structural gap that
-let `p256`'s HIGH survive an audit. Two things the first run found:
+`Fp.ctSelect`'s mask is laundered through `blackBox` (`fp.zig`), the barrier
+that stops LLVM lowering a masked select on a 0/1 secret bit to a data-dependent
+branch; `ctSelect` is where the `G1` ladder selects on a secret bit. `Fr` is
+`montint.Field(r)`, with no `std.crypto.ff` in its arithmetic (ff's
+`montgomeryMul` branches on its extra-reduction bit and its secret-exponent
+`pow` on the exponent windows), so `Fr.toBytes`, which `scalarMul` uses to walk the
+secret scalar's bits, is not a source of contexts; the constant-time evidence for `Fr` is
+montint's own `field` target.
 
-1. **`Fp.ctSelect`'s mask was not laundered through `blackBox`**, though
-   that barrier's own doc comment describes exactly this pattern ("select on
-   a 0/1 bit via `mask = 0 - bit`; without this barrier LLVM can recover
-   `bit ∈ {0,1}` and lower the masked select to a data-dependent branch — a
-   secret-dependent branch on the Groth16 prove path"), and `ctSelect` in
-   the `G1` ladder is where a SECRET bit is selected on. The barrier was
-   applied to the carry/borrow bits and not to the consequence it names.
-   Adding it removed one context from `scalarmul` (6 → 5), so it changes
-   real codegen rather than being decorative.
-2. **Three of the five remaining `scalarmul` contexts are `std.crypto.ff`,
-   reached through `Fr.toBytes`.** `scalarMul` converts the secret scalar to
-   bytes to walk its bits, and that conversion runs `Modulus.fromMontgomery`
-   → `shrink` → `eql`, all of which memcheck reports as branching on the
-   secret (`ff.zig:595`, `:490`, `:889`). The ladder above it is genuinely
-   branchless; the CONVERSION THAT FEEDS IT is not. **Fixed 2026-10-02:**
-   `Fr` is now `montint.Field(r)` (no `std.crypto.ff` left in its
-   arithmetic). The same day's ctgrind showed the wider defect behind these
-   three: ff's `montgomeryMul` branches on its extra-reduction bit in every
-   `mul`/`sq`, and its secret-exponent pow on the exponent windows, so
-   `Fr.mul`/`square`/`pow` over a witness leaked, not only `toBytes`. The
-   Groth16/Poseidon KATs are the acceptance surface, as planned; the
-   constant-time evidence is montint's `field` target (with an `ffcontrol`
-   positive control on the old path). `scalarmul` re-measured after the
-   switch — see `scripts/checks/ctgrind-expected.tsv`.
-
-The other two contexts are `toAffine`'s `Z == 0` test and the `Fp.inv` it
+The two `scalarmul` contexts are `toAffine`'s `Z == 0` test and the `Fp.inv` it
 guards, on the RESULT point: taint propagates to an output that is public by
 construction, and memcheck cannot know it has been declassified. The single
 `field` context is `inv`'s documented `a == 0` check.
 
-Note that memcheck cannot distinguish a conditional jump from a `cmov`, so a
-context is a place to look, not a proven branch — which is why the fix above
-is justified by the count CHANGING, not by the count existing.
+Memcheck cannot distinguish a conditional jump from a `cmov`, so a
+context is a place to look, not a proven branch.
 
-## Secret-holding entry points (dead-stack sweep, 2026-10-09)
+## Secret-holding entry points
 
 None. `bn254` is arithmetic, the pairing, the EIP-196/197 precompiles (`ecMul`
 takes its scalar from public calldata) and a Groth16 *verifier* (public proof, public
 inputs, trusted key). It has no key generation, signing, ECDH or prover; the only
 secrets it ever sees are scalars handed to the generic `G1`/`G2` `scalarMul`, `Fr`
-arithmetic and `Fr.random` by a consumer, which serves public and secret scalars
+arithmetic and `Fr.random`/`Fr.randomInto` by a consumer, which serves public and secret scalars
 alike and keeps its value API (same split as `bls12_381`'s curve layer). A consumer
 that multiplies by a secret owns its frame hygiene; the Groth16 prover in `groth16`
 does it (`groth16/src/burn.zig`, stack probe). Checked with `rg -n 'pub fn'
 modules/bn254/src` — no function takes or returns a key, nonce, or witness by name or
 role.
 
-## Multi-scalar multiplication (`msm.zig`, 2026-11-17)
+**`Fr.randomInto(out: *Fr, io)`** draws a scalar into the caller's storage:
+`Fr.random` returns the fresh scalar by value, so a prover's `r`/`s` or a key made from it
+is copied into the caller's frame. The body runs under `burn.run` (`src/burn.zig`,
+`random_burn` = 2 KiB; the by-value `fromBytes` argument, the drawn bytes and the Montgomery
+conversion temporaries dirtied 0.4 KiB in ReleaseFast), and the drawn bytes are wiped
+(`randomIntoBuf` takes the scratch buffer as an out-parameter so the wipe is testable).
+`bls12_381` has the same entry point.
+
+## Multi-scalar multiplication (`msm.zig`)
 
 `msm(G, allocator, points, scalars)` (and `g1Msm`/`g2Msm`) computes `sum_i scalars[i] * points[i]` by Pippenger's bucket method: each
 scalar is cut into `c`-bit windows (`c` from 2 for n < 4 up to 8 from n = 4096), points go into the bucket of their digit, the buckets are
@@ -918,9 +650,9 @@ identity, identity points and zero scalars drop out, `points.len != scalars.len`
 
 **Public data only, variable-time.** The additions branch on `P == Q`, `P == -Q`, identity, and the bucket index depends on the scalar digits, so time and
 memory access reveal the scalars; no buffer is wiped. Secret scalars: `Jacobian.scalarMul` (constant-time). The `groth16` module's
-prover MSM (secret witness) keeps its own wiping copy of the bucket loop and now only borrows these two additions.
+prover MSM (secret witness) keeps its own wiping copy of the bucket loop and only borrows these two additions.
 
-**Reference (owner rule 2026-11-17).** The module's reference for the API is the sibling `bls12_381` (`msm.zig`, same names and error set), the algorithm is
+**Reference.** The module's reference for the API is the sibling `bls12_381` (`msm.zig`, same names and error set), the algorithm is
 the one gnark-crypto (`G1Jac.MultiExp`) and arkworks (`VariableBaseMSM::msm`) use. Those two were not read for the window rule; the
 window widths are `bls12_381`'s, not tuned for BN254 (any `c` in 1..16 gives the same sum, so they only move the cost).
 
@@ -929,81 +661,20 @@ n = 1, 3, 8, 21, 70 with every 7th input degenerate (identity point, zero scalar
 `G1`; n = 1100 and 4100 (windows 7 and 8) on one repeated base against `(sum of scalars) * base`; the largest scalar `r - 1` gives `-P`, cancels against 1,
 and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalars; `addVartime`/`mixedAddVartime` against the constant-time `add` on every degenerate class (`G2`).
 
-**Delta mutation 2026-11-17** (39 mutants over `msm.zig`, one schemata build, ReleaseSafe): 36 killed, 3 equivalent: `points.len == 0` early return dropped
-(the general path also yields the identity), `w != n_windows - 1` guard made always true (doubling the identity), `if (!any) continue` dropped (adding identity buckets,
-cost-only). The window thresholds in `windowBits` are not mutated (cost-only, see above). These 39 are folded into the whole-module count below.
+## What is deliberately not done
 
-**Audit 2026-11-17 (whole-module mutation).** 397 schemata mutants over every production file except `msm.zig` and the tooling (`fp`, `fp2`, `fp6`, `fp12`,
-`g1`, `g2`, `scalar`, `pairing`, `precompiles`, `groth16`; ReleaseSafe, one build, each mutant under `ulimit -v` and a 20 s kill), plus the 39 `msm.zig` delta
-mutants above: **436 in all, 421 killed (29 of them by a 20 s hang), 15 equivalent.** Mutated: carry and borrow propagation and the conditional subtract of
-`montMul`/`montSqr`/`addLimbs`/`subLimbs`, `geP`/`fromBytes`/`fromInt` bounds, every identity/equality/zero predicate of the tower, the Karatsuba and
-Granger-Scott formula steps, the Jacobian add/double special-case selects, scalar-multiplication loops and the secret wipe, every codec length/error/flag branch
-(uncompressed and compressed), the Miller loop (bit walk, Frobenius tail, line coefficients), the final exponentiation chain, the precompile padding and length
-rules, and `groth16.verify`'s count and input validation. Not mutated (arid): constants and comptime derivations (KAT-pinned), `toMont`/`fromMont`, byte
-order helpers, `Fp.random`/`Fr.random` rejection loops, `ctgrind_harness.zig`, `fuzz_test.zig`. 353 mutants died on the existing tests; 44 survived and 32
-of those were killed by the 12 tests of `src/audit_test.zig` and `scalar.zig` (round 2, one more build, same code): per-limb and per-component
-`isZero`/`eql` of `Fp`, `Fp2`, `Fp6`, `Fp12` (no earlier test looked at the upper limbs or at `c1`/`c2` alone); a borrow rippling through an equal limb in
-`subLimbs`; `Fp.fromInt` at `p` and with bits in limbs 2 and 3; a non-canonical identity (`z = 0`, arbitrary `x`, `y`) on the curve in `G1`/`G2`; `G1.subgroupCheck`
-of an off-curve point; `G1.fromBytes` with `y >= p`; all four `G2` coordinates `>= p`; 33-/65-byte compressed input; the `G2` compressed flag against the
-lexicographic order of `y` and `-y` (a swapped order is self-consistent, so only an independent check sees it); and `groth16.verify` refusing an off-curve `A`
-or `C` and an on-twist non-member `B`. The Groth16 ones close the gap the earlier test comment called not closable: a verifying key whose `alpha` and `IC[0]`
-are the identity leaves the check resting on `A`, `B`, `C` alone; an `(0, 0)` that is not flagged infinity makes every Miller line `c * w^3`, which the final
-exponentiation maps to 1 (the test asserts that premise through `pairingCheck`), and with `A = C = infinity` every pair is skipped, so only `verify`'s own
-validation can refuse the point. The `Fr.randomInto` wipe became observable by factoring the body into `randomIntoBuf` (scratch buffer as an out-parameter, the
-shape of `scalarMulZeroing`); behaviour unchanged.
+- **Compressed points in arkworks' convention** (little-endian `x`, flags on the last byte): only gnark-crypto's convention is offered (see "Compressed points").
+- **A public `isLexicographicallyLargest`:** the compressed codecs keep their own private `isLargest`; EIP-196/197 define no compressed form, so the precompile path needs none.
+- **`G2` cofactor value / `clearCofactor` and hash-to-curve:** BN254 has no standardized hash-to-`G2` used by EIP-197 precompile semantics or Groth16 verification (both only consume
+  caller-supplied `G2` points), so cofactor clearing has no consumer; `subgroupCheck` alone is sufficient and exercised. Revisit only if a future part adds hash-to-`G2`.
+- **A Groth16 prover:** the module verifies proofs (snarkjs-produced ones included) but does not produce them.
+- **A batched `groth16.verify` accumulation:** the verifier's own `msm` is a plain loop of `scalarMul`/`add` (a handful of public inputs, no allocator); the Pippenger `msm.zig` is a separate public API.
+- **Gas or an EVM model:** the precompiles carry none; mapping `error.*` to "revert" is a future EVM-interpreter caller's job.
 
-*Equivalent (12 here, 3 in `msm.zig` above), invariant named:*
+## Backlog / deferred
 
-- **Spare top bit of `p` (5):** `p < 2^254`, so `a + b < 2p < 2^255` and every CIOS/SOS intermediate stays below `2^255`: the fifth word is always 0. Dropping the
-  carry into `condSubP` in `addLimbs` (`fp.zig` 219), the `condSubP` top word in `montMul` (274) and `montSqr` (332), `t[L + 1]` (258) and the final
-  `s2 >> 64` carry (271) therefore changes nothing.
-- **Identity is `z == 0` (4):** in `Jacobian.add` of `G1` and `G2`, `z3 = (...) * h` is already 0 when `h == 0`, so the explicit "P == -Q" select of the canonical
-  `(1, 1, 0)` only normalises the representation (the next line's "P == Q" select overrides it anyway, which makes `h_zero == 1` equivalent for the condition).
-  Every consumer tests `z == 0` (`isIdentity`, `toAffine`, `isOnCurve`'s early return); nothing compares raw identity coordinates.
-- **`G2.mulPublic` starts at bit 128:** `6x^2 < 2^127`, so bit 127 is zero and starting at 127 only doubles the identity one more time.
-- **`ecPairingCheck`'s `k == 0` early return:** the general path returns the final exponentiation of 1, which is 1 (cost-only).
-- **`additionStep` evaluates the line through `q` or through `t`:** the line passes through both points, so `lambda * x - y` is the same value (taken before `t`
-  is updated).
-
-**Audit 2026-11-20 (delta mutation).** The only non-test source change since the whole-module audit is `Fr.randomInto` running its body one frame down under `burn.run` (new `src/burn.zig`, `random_burn` 2 KiB, 0.4 KiB measured dirty depth). 5 schemata mutants (ReleaseFast, run through the `groth16` stack probe, which is the test that sees a dead-stack residue of the drawn scalar): the wrap dropped (body called directly), `random_burn` shrunk to 256 B, the burn's stores skipped, the burn loop cut to a quarter, `stack(n)` dropped from `run`. All 5 killed (the probe reports the drawn bytes and the scalar 175..575 B below the region top); the baseline (mutant 0) passes under the same switches. Card counts are cumulative: 421/436 + 5/5 = 426/441, 15 eq.
-
-## Backlog
-
-- ✅ **DONE 2026-11-16, body burned 2026-11-19 (`Fr.randomInto`, the drawn bytes wiped):** the dead-stack probe added for it in `groth16` (`Randomizers.randomInto`, a fake `Io` replaying known bytes) found the by-value `fromBytes` argument and the scalar in the dead frame, so the body now runs under `burn.run` (`src/burn.zig`, `random_burn`; dirtied 0.4 KiB in ReleaseFast). Without the burn the probe finds both images (killed). **`Fr.randomInto`** **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
-  fresh scalar by value, so a prover's `r`/`s` or a key made from it is copied into the
-  caller's frame. `bls12_381` has the same item (its backlog item 0). Effort: small.
-- Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,
-  constant-time scalar multiplication, on-curve + subgroup checks):
-  **done** (`g1.zig`/`g2.zig`).
-- Part 4 (the optimal-ate pairing): **done** — `pairing.zig`'s
-  `Gt`/`PairingPair`/loop-parameter constants/`multiMillerLoop`/
-  `pairing`/`pairingCheck` wiring, the byte-exact KAT harness
-  (`e_g1_g2_hex`/`e_2g1_g2_hex`/`e_3g1_g2_hex`, sourced from
-  `ethereum/py_ecc`, see "Part 4 — KAT generation" above), AND both
-  crypto cores — `millerLoop` (`6x+2` Miller loop with the BN-specific
-  Frobenius-tail steps) and `finalExponentiation` (easy part + the
-  BN-specific exact-`d` hard-part addition chain) — are implemented and
-  tested, `gate.pairing_core_implemented` flipped to `true`;
-  pass in Debug AND ReleaseFast, byte-exact against py_ecc. See "Part 4
-  — pairing" above.
-- Part 5: EIP-196/197 precompile-exact semantics (point-at-infinity
-  encoding, gas-irrelevant validation rules, the exact error/success
-  behavior the EVM expects): **done** — `precompiles.zig`, see "Part 5 —
-  EVM precompiles" above.
-- Part 6 (Groth16 zk-SNARK verifier over the pairing): **done** —
-  `groth16.zig`'s `VerifyingKey`/`Proof`/`verify`, byte/semantically
-  exact against a snarkjs-produced Groth16/BN254 proof over our own
-  circuit (`groth16/src/testdata/snarkjs`). See "Part 6 — Groth16 verifier"
-  below.
-- ~~Persistent Montgomery storage / precomputed Frobenius-coefficient
-  tables~~ — **both shipped** (`1892c814`/`a1d72299` and `8644b485`);
-  this entry outlived them.
-- `G2` cofactor value/`clearCofactor` — deliberately out of scope for
-  this arc (see "Design & invariants" above); revisit only if a future
-  part adds hash-to-`G2`.
-
-- ✅ DONE 2026-11-16 (`g1`/`g2` `toBytesCompressed`/`fromBytesCompressed`, gnark-crypto convention only: big-endian `x`, top two bits of byte 0 are flags `0b10` smallest `y` / `0b11` largest `y` / `0b01` infinity; G2 `x = A1 || A0`, 64 bytes, subgroup-checked on decode; arkworks' little-endian convention is NOT offered; decode refuses wrong length/flags, stray infinity bytes, `x >= p`, no-curve `x`, off-subgroup G2; G1 generator pinned by hand to `0x80 .. 01`; G2 byte order follows gnark's documented `A1 || A0` and this module's own `Fp2` order, no gnark output was available offline to pin it) **Compressed G1/G2 serialization** (the gnark/arkworks convention) *(survey 2026-09-30)*: `g1.zig` header says there is deliberately none because EIP-196/197 define none; users exchanging keys with gnark or arkworks tooling need it. Effort: small (sign/flag bits + `sqrt`, `Fp`/`Fp2.sqrt` exist). Fits §2; the wire choice (which convention) needs a decision.
-- ✅ DONE 2026-11-17 (`msm.zig`: `g1Msm`/`g2Msm`/`msm(G, ..)`, `addVartime`/`mixedAddVartime`, shape and names of `bls12_381`'s; see "Multi-scalar multiplication") **Public multi-scalar multiplication (Pippenger) for G1/G2** *(survey 2026-09-30)*: gnark-crypto/arkworks expose one. The Groth16 verifier's own `msm` (a handful of public inputs, no allocator) is unchanged.
+- **Pairing optimizations (idea, cost-only):** `millerLoop` is the plain binary `6x+2` walk, and `multiMillerLoop` runs one full walk per pair. The sparse-line multiplication, a NAF walk and a
+  shared multi-pairing walk are the optimizations `pairing.zig`'s header comment lists as remaining `// TODO`s. The card's `**Performance:**` is `not measured`, so none is scheduled.
 
 ## Anchoring
 
@@ -1013,3 +684,4 @@ shape of `scalarMulZeroing`); behaviour unchanged.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** byte-exact against py_ecc external library (SPEC.md)
+

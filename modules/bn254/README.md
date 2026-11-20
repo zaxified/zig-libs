@@ -29,7 +29,7 @@ verified against a snarkjs-produced Groth16/BN254 proof over our own
 circuit — the proof verifies TRUE, six independent tamper cases each verify FALSE. Every
 field/curve constant independently verified (see `SPEC.md`), byte-exact
 KAT coverage against independently-computed vectors (Parts 5-6: an
-independent Python oracle and an independent prover), all passing in Debug AND
+independent Python oracle and an independent prover), all passing in ReleaseSafe AND
 ReleaseFast.
 
 This module was built by careful, verified ADAPTATION of the sibling
@@ -119,7 +119,7 @@ const proof: bn254.Groth16Proof = .{ .a = a, .b = b, .c = c };
 const valid = try bn254.groth16Verify(vk, proof, public_inputs); // bool
 ```
 
-Multi-scalar multiplication (2026-11-17; **public data only**: variable-time,
+Multi-scalar multiplication (**public data only**: variable-time,
 the bucket a point lands in depends on the scalar's digits):
 
 ```zig
@@ -127,16 +127,19 @@ const sum = try bn254.msm.g1Msm(allocator, points, scalars); // sum_i scalars[i]
 const sum2 = try bn254.msm.g2Msm(allocator, points2, scalars); // error.LengthMismatch if the slices differ
 ```
 
-Compressed points (2026-11-16): `g1.toBytesCompressed`/`fromBytesCompressed`
+Compressed points: `g1.toBytesCompressed`/`fromBytesCompressed`
 (32 bytes) and `g2.…` (64 bytes), gnark-crypto's convention (big-endian `x`,
 flag bits `0b10`/`0b11`/`0b01` = smaller `y`/larger `y`/infinity on top of byte
 0; `G2` `x = A1 || A0`, decode is subgroup-checked). arkworks' little-endian
-convention is not offered. EIP-196/197 itself stays uncompressed; there is no
-public `isLexicographicallyLargest`. Also absent: `G1`/`G2` cofactor-clearing —
-`G1`'s cofactor is 1 (nothing to clear) and `G2`'s cofactor-clearing has
-no consumer in this arc (BN254 has no standardized hash-to-`G2` needed
-for EIP-197/Groth16 verification); see `g1.zig`/`g2.zig`'s module doc
-comments.
+convention is not offered. EIP-196/197 itself stays uncompressed.
+
+## Not provided
+
+No Groth16 prover, no hash-to-curve or `G2` cofactor-clearing (`G1`'s cofactor is 1, and
+BN254 has no standardized hash-to-`G2` needed for EIP-197/Groth16 verification), no
+arkworks-convention compressed points, no public `isLexicographicallyLargest`, no gas or EVM
+model. Reasons in `SPEC.md` *What is deliberately not done*; open optimizations in
+*Backlog / deferred*.
 
 ## File layout
 
@@ -170,6 +173,6 @@ added one — [NOTICE](NOTICE) — covering `ethereum/py_ecc`'s use as a
 numeric KAT oracle and the basis-conversion methodology (see `SPEC.md`'s
 "Part 4 — KAT generation"). `NOTICE` items 5 and 6 record
 go-ethereum (a behaviour reference for calldata padding) and the
-third-party KAT data Parts 5 and 6 used until 2026-10-26, removed for
-its licence; the KATs are now our own (see `SPEC.md`'s "Part 5 — KAT
+third-party KAT data that is deliberately not embedded for its licence; the
+KATs are our own (see `SPEC.md`'s "Part 5 — KAT
 sourcing" and "Part 6 — KAT provenance").
