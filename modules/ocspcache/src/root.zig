@@ -1058,8 +1058,7 @@ const CancelTestPeer = struct {
 /// the head (or reply) is read #1 and the body read #2. With a sleep, a loaded
 /// machine could cancel an earlier step, which passes by the wrong route. It
 /// could also cancel before the connect: the peer then waits in `accept`
-/// forever, and so does `join`. That is the http full-gate hang of
-/// 2026-09-15, and the same shape as this module's peer.
+/// forever, and so does `join`. That is the http full-gate hang, and the same shape as this module's peer.
 const ReadCueIo = struct {
     vtable: std.Io.VTable,
     userdata: ?*anyopaque,
@@ -1798,7 +1797,7 @@ test "exportEntries: sorted by subject key whatever order the map iterates in" {
     for (list) |e| try testing.expectEqualSlices(u8, &e.subject_key, e.response_der);
 }
 
-// ── whole-module mutation round (2026-11-17): structure checks, scheme case,
+// ── whole-module mutation round: structure checks, scheme case,
 // the GET URL byte for byte, the eviction boundary, the production transport ─
 
 test "parseAiaOcspUrl: the outer SEQUENCE, each AccessDescription and the accessMethod OID are tag-checked" {

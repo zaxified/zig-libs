@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for ocspcache's deterministic fuzz driver (added 2026-10-09).
+//! Shared plumbing for ocspcache's deterministic fuzz driver.
 //!
 //! The harness BODIES stay in `root.zig`, beside the private transport and
 //! DER builders they use; each is generic over its source of choices,

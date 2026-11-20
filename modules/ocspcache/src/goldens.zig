@@ -68,7 +68,7 @@ const ocsp = @import("ocsp");
 pub const this_update_unix: i64 = 1785514845;
 pub const next_update_unix: i64 = 1785860385;
 /// thisUpdate + 1h — inside the response's real validity window and the
-/// delegate certificate's real validity window (2026-02-26 .. 2027-02-26).
+/// delegate certificate's real validity window (.. 2027-02-26).
 pub const now_unix: i64 = this_update_unix + 3600;
 
 pub const godaddy_leaf_der = [_]u8{

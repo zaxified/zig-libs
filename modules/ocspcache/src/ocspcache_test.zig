@@ -951,7 +951,7 @@ test "exportEntries and importStaple: every allocation failure is clean (no leak
     try testing.checkAllAllocationFailures(gpa, importOnce, .{this_update_unix + 100});
 }
 
-// ── whole-module mutation round (2026-11-17): what refresh hands the transport,
+// ── whole-module mutation round: what refresh hands the transport,
 // how it maps a transport failure, which statuses it accepts ─────────────────
 
 test "Cache.refresh: hands the transport its deadline, its ceiling and the configured CertID hash, on POST and GET" {
