@@ -180,7 +180,7 @@ test "parseTcpTimestamps: huge declared length (255) on a short buffer -> null, 
     try testing.expectEqual(@as(?Timestamps, null), parseTcpTimestamps(&bytes));
 }
 
-// ── real-capture goldens (loopback TCP handshake, tcpdump, 2026-08-01) ─────
+// ── real-capture goldens (loopback TCP handshake, tcpdump) ─────
 //
 // Every fixture above this point is a hand-built options blob — plausible,
 // but never checked against what a real TCP stack actually puts on the
@@ -296,7 +296,7 @@ const fuzzseed = @import("testkit").fuzz;
 /// "pure arbitrary bytes" branch; `smith.bytes(buf)` then ate the remaining
 /// twelve octets and the ranged length after it found nothing left and
 /// returned 0. **Both real captures arrived at `parseTcpTimestamps` as the
-/// EMPTY option list.** Measured 2026-09-07: 0 of 2 seeds carried an octet,
+/// EMPTY option list.** Measured: 0 of 2 seeds carried an octet,
 /// and 0 Timestamps options were found — from a corpus made of two frames
 /// whose whole point is that they contain one.
 ///
@@ -485,7 +485,7 @@ test "corpus: every seed reaches the parser, and the Timestamps options found ar
             tsval_sum +%= ts.tsval;
         }
     }
-    // Measured 2026-09-07. The corpus this replaces produced 0 octets and 0
+    // Measured. The corpus this replaces produced 0 octets and 0
     // Timestamps options from two frames that each contain one.
     try std.testing.expectEqual(@as(usize, 13), nonempty);
     try std.testing.expectEqual(@as(usize, 309), octets);
@@ -497,7 +497,7 @@ test "corpus: every seed reaches the parser, and the Timestamps options found ar
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

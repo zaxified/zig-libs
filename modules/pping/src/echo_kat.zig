@@ -4,7 +4,7 @@
 //! `parseIpEcho` -> `IpEcho.direction` -> `Estimator.observeEcho`.
 //!
 //! **Anchors.**
-//!   - IPv4, EXTERNAL: ten real IP packets captured on 2026-10-06 by
+//!   - IPv4, EXTERNAL: ten real IP packets captured by
 //!     `tools/capture_icmp_echo.sh` — iputils `ping` 20240117 from 127.0.0.1
 //!     to 127.0.0.2 inside a throwaway `unshare --net` namespace, recorded by
 //!     `tcpdump -i lo` 4.99.4 with nanosecond timestamps. The 14-octet
