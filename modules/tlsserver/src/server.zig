@@ -578,6 +578,69 @@ pub const Config = struct {
     /// handshake is the inner one's (its SNI, ALPN, tickets); a declined
     /// offer gets `retry_configs`. Needs `Server.setEchBuffer`.
     ech: ?*const ech.Ech = null,
+
+    pub const CheckError = CertifiedKey.CheckError || ech.Ech.CheckError || error{
+        /// `cipher_suites` is empty (rustls's provider check: "no usable
+        /// cipher suites configured").
+        NoCipherSuites,
+        /// `groups` is empty (rustls: "no kx groups configured").
+        NoGroups,
+        /// A group in `groups` that `kex` does not compute: a client
+        /// choosing it would get a HelloRetryRequest and then
+        /// `internal_error`.
+        UnsupportedGroup,
+        /// An ALPN protocol that is empty or over 255 octets (RFC 7301
+        /// §3.1: `ProtocolName<1..2^8-1>`).
+        InvalidAlpnProtocol,
+        /// `ClientAuth.schemes` names no TLS 1.3 CertificateVerify scheme
+        /// (empty, or RSA PKCS#1 v1.5 / SHA-1 only), or more than
+        /// `signature_algorithms<2..2^16-2>` holds.
+        ClientAuthSchemes,
+        /// An empty DistinguishedName in `ClientAuth.authorities`, or the
+        /// CertificateRequest's extensions over 2^16-1 octets.
+        ClientAuthAuthorities,
+        /// `Quic.transport_parameters` over the extension's 2^16-1 octets.
+        QuicTransportParameters,
+    };
+
+    /// What every handshake would refuse with `internal_error`, reported
+    /// once, up front (rustls refuses an inconsistent `ServerConfig` when
+    /// it is built; OpenSSL `SSL_CTX_check_private_key`): call it after
+    /// building the configuration. Checks the suites, the groups, the ALPN
+    /// list, client authentication's schemes and authorities, the QUIC
+    /// transport parameters, a `fixed` certificate (`CertifiedKey.check`,
+    /// RFC 8879 compressed copies included) and the ECH keys
+    /// (`ech.Ech.check`). A `select` callback's keys are checked at every
+    /// handshake (`CertifiedKey.check`). `Server.init` does not call it.
+    /// secret-api-ok: reads lengths, code points and the certificate's shape; the ECH keys' public halves are derived by `ech.Ech.check`.
+    pub fn check(self: *const Config) CheckError!void {
+        if (self.cipher_suites.len == 0) return error.NoCipherSuites;
+        if (self.groups.len == 0) return error.NoGroups;
+        for (self.groups) |g| if (kex.expectedShareLen(g) == 0) return error.UnsupportedGroup;
+        for (self.alpn_protocols) |p| if (p.len == 0 or p.len > 255) return error.InvalidAlpnProtocol;
+        if (self.client_auth) |ca| {
+            var any = false;
+            for (ca.schemes) |s| any = any or certverify.maxSignatureLen(@fromBackingInt(s)) != 0;
+            if (!any or ca.schemes.len > (std.math.maxInt(u16) - 1) / 2) return error.ClientAuthSchemes;
+            // signature_algorithms (type, length, list length, list) and
+            // certificate_authorities (type, length, list length, names).
+            var exts: usize = 4 + 2 + 2 * ca.schemes.len;
+            if (ca.authorities.len != 0) {
+                exts += 4 + 2;
+                for (ca.authorities) |dn| {
+                    if (dn.len == 0) return error.ClientAuthAuthorities;
+                    exts += 2 + dn.len;
+                }
+            }
+            if (exts > std.math.maxInt(u16)) return error.ClientAuthAuthorities;
+        }
+        if (self.quic) |q| if (q.transport_parameters.len > std.math.maxInt(u16)) return error.QuicTransportParameters;
+        switch (self.certificate) {
+            .fixed => |k| try k.check(),
+            .select => {},
+        }
+        if (self.ech) |e| try e.check();
+    }
 };
 
 /// Go's progression: record k (from 0) of a burst carries at most
@@ -628,7 +691,7 @@ pub const ClientAuth = struct {
     /// first: for the client's CertificateVerify and its chain. Must name
     /// at least one TLS 1.3 CertificateVerify scheme (an empty list is
     /// `InternalError` at the first handshake; RSA PKCS#1 v1.5 alone leaves
-    /// a client nothing to sign with).
+    /// a client nothing to sign with; `Config.check` reports both).
     schemes: []const u16 = &default_client_auth_schemes,
     /// DER DistinguishedNames sent as `certificate_authorities` (rustls
     /// `root_hint_subjects`); empty: not sent.
@@ -9149,4 +9212,72 @@ test "STACKPROBE: wave 5 — no secret residue after serialize" {
     defer std.crypto.secureZero(u8, &key);
     const key_needle = key;
     _ = try Wave5Probe.run("serialize", Server.serialize, .{ &p.s, &blob, &key, "" }, &[_][]const u8{ &secrets[0], &secrets[1], &secrets[2], &key_needle }, .{});
+}
+
+test "Config.check: what every handshake would refuse with internal_error is refused up front" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const base: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    try base.check();
+    var all = base;
+    all.groups = &supported_groups;
+    try all.check();
+
+    var c = base;
+    c.cipher_suites = &.{};
+    try testing.expectError(error.NoCipherSuites, c.check());
+    c = base;
+    c.groups = &.{};
+    try testing.expectError(error.NoGroups, c.check());
+    c.groups = &.{ kex.x25519_group, 0x0042 };
+    try testing.expectError(error.UnsupportedGroup, c.check());
+    c = base;
+    c.alpn_protocols = &.{ "h2", "" };
+    try testing.expectError(error.InvalidAlpnProtocol, c.check());
+    const long: [256]u8 = @splat('x');
+    c.alpn_protocols = &.{&long};
+    try testing.expectError(error.InvalidAlpnProtocol, c.check());
+    c.alpn_protocols = &.{long[0..255]};
+    try c.check();
+
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock } };
+    c = base;
+    c.client_auth = &auth;
+    try c.check();
+    auth.schemes = &.{};
+    try testing.expectError(error.ClientAuthSchemes, c.check());
+    auth.schemes = &.{ 0x0401, 0x0201 }; // RSA PKCS#1 v1.5 only
+    try testing.expectError(error.ClientAuthSchemes, c.check());
+    auth.schemes = &.{ 0x0401, 0x0403 };
+    try c.check();
+    auth.authorities = &.{ "dn", "" };
+    try testing.expectError(error.ClientAuthAuthorities, c.check());
+    const big: [40000]u8 = @splat(0x30);
+    auth.authorities = &.{ &big, &big };
+    try testing.expectError(error.ClientAuthAuthorities, c.check());
+    auth.authorities = &.{&big};
+    try c.check();
+
+    const tp: [65536]u8 = @splat(0);
+    var quic: Quic = .{ .transport_parameters = &tp };
+    c = base;
+    c.quic = &quic;
+    try testing.expectError(error.QuicTransportParameters, c.check());
+    quic.transport_parameters = tp[0..65535];
+    try c.check();
+
+    // The fixed certificate's own check, RFC 8879 copies included.
+    var stale = testKey().*;
+    stale.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = 1, .data = "z" }};
+    c = base;
+    c.certificate = .{ .fixed = &stale };
+    try testing.expectError(error.CompressedStale, c.check());
+    const empty_chain: CertifiedKey = .{ .chain = &.{}, .key = testKey().key };
+    c.certificate = .{ .fixed = &empty_chain };
+    try testing.expectError(error.ChainLength, c.check());
+
+    // The ECH keys' own check.
+    const no_keys: ech.Ech = .{ .keys = &.{} };
+    c = base;
+    c.ech = &no_keys;
+    try testing.expectError(error.Unsupported, c.check());
 }

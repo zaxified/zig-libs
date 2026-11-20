@@ -39,6 +39,7 @@ const config: tlsserver.Config = .{
     .alpn_protocols = &.{ "h2", "http/1.1" },
     .random = csprng.random(), // MUST be a CSPRNG
 };
+try config.check(); // what every handshake would refuse with internal_error, once, up front
 
 // Session tickets and resumption (optional): a STEK ring the application
 // rotates (`ring.maybeRotate(policy, &fresh_key, now_s)`, never while a

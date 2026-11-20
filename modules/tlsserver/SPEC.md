@@ -655,6 +655,13 @@ The receive side's refusals are the table under *Wire format*. Record protection
   its cap. `minOutputLen(config, key)` sizes the output for the first flight with a
   CertificateRequest and for the tickets with the longest leaf.
 
+- **Configuration.** A configuration the server accepts but cannot serve fails each handshake with `internal_error`.
+  `Config.check()` reports the same up front, once (rustls refuses an inconsistent `ServerConfig` when it is built, "no kx
+  groups configured"; OpenSSL `SSL_CTX_check_private_key`): no suite, no group, a group `kex` does not compute, an ALPN
+  name outside 1..255 octets, `ClientAuth.schemes` without a TLS 1.3 CertificateVerify scheme, an empty authority or a
+  CertificateRequest over its 2^16-1 octets of extensions, `Quic.transport_parameters` over 2^16-1, a `fixed`
+  certificate `CertifiedKey.check` refuses (stale RFC 8879 copies included) and ECH keys `Ech.check` refuses. `init` stays
+  infallible and does not call it; a `select` callback's keys are checked per handshake.
 - **Stack.** `fromPem` wants ~110 KiB of stack (more for RSA; up to 1.3 MiB for ML-DSA, `burn.mldsa_key_burn`). A handshake
   signs and exchanges under `tls13`'s burns: up to 352 KiB for an ML-DSA-87 signature and 256 KiB for ML-KEM-1024 (ReleaseFast
   depths ×1.3; Debug frames are larger), so a small-stack worker or fiber must be sized for the keys and groups it enables.
@@ -981,9 +988,6 @@ records (the per-record 4 KiB burn).
 - **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
   `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
   are unobservable today.
-- **`Config.check()`.** A config the server accepts but cannot serve fails per handshake with `InternalError` — a group `kex`
-  does not compute (an HRR for it first), an empty `ClientAuth.schemes`, `Quic.transport_parameters` or `authorities` over
-  64 KiB, a `compressed_certificates` mismatch. One up-front check would refuse them at `init`.
 - **Second ClientHello unchanged.** RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
   the listed changes; only the suite, the group's share, SNI and `early_data` are compared (rustls compares less). Comparing the
   first hello's other extensions (kept as a hash of their octets) would refuse a reordered or altered one with
