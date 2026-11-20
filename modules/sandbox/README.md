@@ -13,7 +13,10 @@ Five independent steps, weakest-precondition first:
    seccomp filter.
 2. **privilege drop** — `setgroups([]) → setgid → setuid`, in that exact order
    (setuid *before* setgid is the classic hole), then a **read-back** that the
-   drop stuck. Optional capability bounding-set drop (`PR_CAPBSET_DROP`) and a
+   drop stuck (real, effective and saved ids, no supplementary group, and for a
+   non-root target no capability left). It refuses a process with more than one
+   thread (`error.MultipleThreads`; ids are per thread) — drop before spawning
+   workers. Optional capability bounding-set drop (`PR_CAPBSET_DROP`) and a
    `capset`-based clear of the held sets.
 3. **rlimits** — `setrlimit` helpers, including `disableCoreDumps`
    (`RLIMIT_CORE=0`) so a crash can't spill in-memory keys to a core file.
@@ -153,7 +156,7 @@ unions for `allowPath`: `read_only` (read a file + list a dir) and
 left out of the handled mask is unrestricted everywhere, which is why the
 ruleset handles everything and the unions go to `allowPath` only. (An
 earlier `init(handled)` took a mask, and passing `read_only` there left the
-other 14 rights — write, create, unlink, mkdir, symlink, … — free for the
+other rights — write, create, unlink, mkdir, symlink, … — free for the
 whole filesystem; `initHandling(mask)` keeps that explicit form for a
 deployment that means it.) `allowPath` refuses a symlink as the final path
 component (`error.PathIsSymlink`) — resolve it yourself if that is what you
@@ -227,8 +230,8 @@ is a linear scan by default: fine for tens of rules.
   `null` (default) keeps the ABI killed. Any other host: `error.UnsupportedArch`.
   x32 rules are not available (x32 stays killed).
 - **`opts.dispatch = .tree`**: groups the rules by number and binary-searches
-  the numbers (~`2·log2(n)+2` instructions per syscall instead of 2 per
-  preceding rule). The decision is the same as `.linear`'s — rules of one
+  the numbers (about `log2(n)+4` instructions per syscall instead of one or more
+  per preceding rule). The decision is the same as `.linear`'s — rules of one
   number keep their order, first match wins — only the layout differs, and the
   program is a bit longer; use it for lists past ~50 numbers. Opt-in, not
   automatic, so short lists stay the small program they were. Jumps beyond a
@@ -330,13 +333,11 @@ zig build test-sandbox -Doptimize=ReleaseFast
 sudo zig build test-sandbox                     # adds the priv-drop tests
 ```
 
-## Deferred (v2)
+## Not provided
 
-- seccomp `USER_NOTIF` / `TRACE` actions; x32 rules and secondary ABIs other
-  than i386-on-x86-64 (multi-arch filters and tree dispatch are done).
-- Landlock ABI 9+ beyond `FS_RESOLVE_UNIX` (UDP rights, `ADD_RULE_QUIET`,
-  `RESTRICT_SELF_NO_NEW_PRIVS`) — not in the kernel this was built and tested
-  against. `FS_RESOLVE_UNIX` is in `access.all` since 2026-11-05 (masked off
-  below ABI 9, so `initExact(.everything)` there is `PartiallySupported`).
-- Remains Linux-only — the documented ceiling (no OpenBSD `pledge`/`unveil`,
-  no FreeBSD Capsicum).
+Linux only (no `pledge`/`unveil`, no Capsicum, by design). Not built: seccomp
+`USER_NOTIF` / `TRACE` actions, x32 rules and secondary ABIs other than i386 on
+x86-64, Landlock UDP rights and the other ABI 10+ additions. `FS_RESOLVE_UNIX`
+(ABI 9) is in `access.all`, masked off below ABI 9, so `initExact(.everything)`
+there is `PartiallySupported`. See SPEC.md *What is deliberately not done* and
+*Backlog / deferred*.

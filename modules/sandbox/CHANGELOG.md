@@ -5,19 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
-- **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** a `// global-alloc-ok` marker on the forked test child's `page_allocator` (full CI's `check-global-alloc` refused it); comment only, the Audit line's src hash re-pinned for that alone.
-- **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** Two new tests close the mutation run's last open mutants. (1) A root-gated `dropPrivileges` read-back test (the VM lane runs it): one wrong real/effective/saved uid or gid, or a kept permitted set, must give `DropNotEffective`, with a clean control case. (2) An emulated Landlock ABI 9 test: a seccomp user-notification supervisor answers the version query with 9 and checks that `init()` hands the kernel every right, `RESOLVE_UNIX` included. Before this, the ABI 9 path had never reached a kernel, because this host is ABI 8.
 - **2026-11-07** — **FIX (security):** `dropPrivileges`' read-back (`noCapabilities`) handed `capget` std's `linux.cap_user_header_t`, which Zig 0.17.0 declares `{ version: u32, pid: usize }` (pid at offset 8) while the kernel reads an `int` pid at offset 4 — uninitialized padding. capget asked about a garbage pid: usually ESRCH, so every clean drop by a root caller to a non-root uid returned `DropNotEffective` (fail-closed, the service did not start); a garbage value naming a live capability-free process would have passed the check for the wrong process (fail-open). Now a local `{ u32, c_int }` header, as `clearCapabilities` already had. The success control case is back in the faked-setter drop test. Found by the whole-module mutation run.
-- **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** Tests from a whole-module mutation run (241 schemata mutants). Unprivileged children with seccomp-faked syscalls now drive `dropPrivileges`' read-back, its `maxInt` refusal and each setter's error. A child per injected errno pins every typed failure branch (prctl, prlimit64, capset, Landlock create/add_rule/restrict_self, statx, read, seccomp(2), an over-long program). Also new: `setLimit` soft/hard, `initExact` net/scope plus closing the refused fd, `deinit` closing the fd, and `landlockAbiVersion` equal to the raw query. Two skip gates now use raw syscalls instead of the probe under test (`threadCount`, `landlockAbiVersion`): a broken probe used to turn those tests into skips.
 - **2026-11-05** — **BEHAVIOURAL on ABI 9+ kernels only:** `Ruleset.access.all` now handles `RESOLVE_UNIX` (`access.resolve_unix`, bit 16). Before, a sandboxed process could reach any path-named UNIX socket on such a kernel. A program that needs one now has to `allowPath` it. **Also on older kernels:** `Ruleset.initExact(.everything)` now returns `error.PartiallySupported` below ABI 9 (it succeeded on ABI 8), because strict mode refuses a right the kernel cannot enforce; best-effort `init`/`initWith` still drop the bit silently. Tested on the mask only: this host's kernel is ABI 8.
-- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (§ GK): 7 mutants over the GK fixes, 4 killed, 3 argued unobservable. Card A1 again.
 - **2026-10-29** — **Behaviour change (fix):** `dropPrivileges` reads all of `/proc/self/status` (was: the first 8 KiB), so a multithreaded process with many supplementary groups — whose `Groups:` line pushes `Threads:` further — now gets `error.MultipleThreads` instead of a silent per-thread drop; an EINTR read is retried, not taken as "unknown". `uid`/`gid` = `maxInt` (the kernel's "unchanged") is refused with `SetIdFailed` before any change; the `SetIdFailed` doc says privileges may otherwise be partly dropped. **Fix:** `Ruleset.deinit` is idempotent (a second call no longer closes a descriptor that reused the number). No-panic sweep + blind review (§ GK).
-- **2026-10-27** — **NO CONSUMER-VISIBLE CHANGE:** the example handles `error.MultipleThreads` from `dropPrivileges` (push CI `check-examples` was red on the exhaustive switch).
 - **2026-10-27** — **Performance (measurement):** `bench-sandbox` grades the per-syscall cost by BPF instructions executed (ours, libseccomp's two layouts, go-seccomp-bpf, seccompiler via `tools/foreign_steps/`); ref 0.99×, fastest 0.95× (libseccomp's tree). The interop oracle's interpreter moved to `tools/cbpf.zig`, shared with the bench. No module change.
 - **2026-10-27** — **Security:** `dropPrivileges` refuses a multi-threaded process (`error.MultipleThreads`) and checks that no capability survives a non-root drop; `allowPath` takes a single file with `access.read_only` (file rights only) and an empty clamp is a no-op; new `Ruleset.initExact`, `setNotDumpable`; `install`/`installTsync` return `NoNewPrivsRequired` for EACCES; a `.u32` condition with data past 32 bits is `error.InvalidRule`. **Performance:** `buildRules` reuses the loaded `nr` and the tree dispatch costs one `jge` per level: the 80-syscall default list as rules runs 12.4 BPF instructions per allowed syscall in the tree (was 16.8; libseccomp's tree 13.1) and 45.5 linear (was 86.0). ⚠ **API:** new error variants in `DropError`, `InstallError`, `TsyncError` -- exhaustive switches over them need an arm.
 - **2026-10-27** — **Evidence:** live libseccomp oracle `tools/interop.zig` (+ `tools/c_oracle/soracle.c`); found two libseccomp 2.6.0/2.6.1 defects with several conditional rules on one syscall, recorded as leads, and a kernel test for the dropped-rule shape. **Docs:** `ArgCmp.mask` states `(arg & mask) == (value & mask)`, as the code does. No API change.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC note on the unbuildable `linux.AUDIT.ARCH` re-checked against the 0.17.0 std (still unbuildable).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `bufPrintZ` -> `bufPrintSentinel(.., 0)`; `waitpid` status is `i32`; std 0.17 spells syscall 262 on x86-64 `newfstatat` (was `fstatat64`), the default allow-list test now expects that name and `fstatat64` as the filtered one.
 - **2026-10-11** — **ADDITIVE + one BREAKING edge (error set):** multi-architecture filters and tree dispatch, closing the survey's two testable seccomp gaps (Scope core → parity).
@@ -44,23 +37,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     `InvalidAction`, `InvalidRule`, `TooManyRules`, `ProgramTooLong`, and `build`/`buildWx` now refuse `.allow` as a
     deny action. An exhaustive `switch` over these error sets or over `Action` needs the new arms.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** audit S13, S14 (remainder), S17, S18. Tests only,
-  and the root-gated ones now actually run: `scripts/vm/run.sh sandbox` (real root in a disposable
-  Debian 6.12.96 guest) gives 35 pass / 1 skip, and `--kernel-append lsm=apparmor` gives 29 / 7.
-  - S13/S14: the privilege-drop child now starts with a supplementary group and checks saved gid
-    and an empty group list. The bounding-set child reads the set back with `PR_CAPBSET_READ`
-    (with a positive precondition) and treats EPERM as a failure under root. Seven source mutants
-    (setuid-first, saved uid kept via `setresuid(u,u,0)`, `setgroups` skipped, bounding-set loop
-    emptied, each alone and with the read-back removed) all fail in the guest, each on its own exit
-    code.
-  - S17: `install`/`installTsync` are run in a child where a seccomp pre-filter makes `prctl`,
-    respectively `seccomp`, return EINVAL. Deleting either errno check fails the test on the host.
-  - S18: ENOSYS/EOPNOTSUPP are injected the same way into `landlock_create_ruleset`, covering
-    both copies of the mapping (`landlockAbiVersion` and `initHandling`). A kernel booted with
-    `lsm=apparmor` is also checked for `error.Disabled` with no injection.
-  - The rlimit test "cannot be raised back" failed as real root, because CAP_SYS_RESOURCE raises a
-    hard limit legitimately. The child now sheds its capabilities first, which is the non-privileged
-    property `setLimit` documents.
 
 - **2026-09-14** — **BEHAVIOURAL (allows more):** audit S11, by the owner's decision to extend
   `seccomp.default_allowlist`. A process under the default filter died of SIGSYS on calls its libc

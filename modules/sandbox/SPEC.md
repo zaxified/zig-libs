@@ -34,7 +34,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [google/minijail](https://github.com/google/minijail) | C | BSD-3-Clause | 386 | linux-v18 (2023-05-23); push 2026-09-28 | Whole-process sandbox launcher (namespaces, caps, uid/gid, seccomp policy files, chroot/pivot_root) *(inferred)*: a superset in the OS-isolation direction; this module is in-process only. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | `std.os.linux` has raw syscalls and constants but no seccomp/Landlock/priv-drop helpers (this module's README, not re-checked). `gh search` for Zig seccomp/Landlock found only tiny projects (zbox 1 star; secwrap 0, an exec wrapper); none is a library. |
 
-**Where we are ahead:** the only Zig library for any of this, in pure Zig with no libseccomp/libcap/libc; hardening decisions enforced rather than documented (order-safe `dropPrivileges` with read-back of real/effective/saved ids, mandatory arch guard, `Action.errno` bounds, Landlock symlink refusal, `installTsync` returning `ThreadSyncFailed` instead of a misread success); one package for all five steps; a `.u32` argument width that compares what the kernel acts on for an `int` parameter, and an x32 kill in every rules program. **Where we are behind** (re-checked 2026-10-11, after the multi-arch/tree work): no `USER_NOTIF`/`TRACE` actions, no x32 rules, no Landlock ABI 9+ UDP rights (`RESOLVE_UNIX` is handled since 2026-11-05, enforcement untested on an ABI 9 kernel), Linux-only by design (→ Backlog). One secondary ABI (i386 on x86-64) and a binary-tree dispatch exist since 2026-10-11.
+**Where we are ahead:** the only Zig library for any of this, in pure Zig with no libseccomp/libcap/libc; hardening decisions enforced rather than documented (order-safe `dropPrivileges` with read-back of real/effective/saved ids, mandatory arch guard, `Action.errno` bounds, Landlock symlink refusal, `installTsync` returning `ThreadSyncFailed` instead of a misread success); one package for all five steps; a `.u32` argument width that compares what the kernel acts on for an `int` parameter, and an x32 kill in every rules program. **Where we are behind:** no `USER_NOTIF`/`TRACE` actions, no x32 rules, no Landlock UDP rights or `ADD_RULE_QUIET` (ABI 10+) (→ Backlog / deferred); `RESOLVE_UNIX` (ABI 9) is handled, but its enforcement is untested on an ABI 9 kernel (→ Open). Linux-only by design (→ What is deliberately not done). One secondary ABI (i386 on x86-64) and an opt-in binary-tree dispatch exist.
+
 
 ## UAPI citation (why no NOTICE entry)
 
@@ -66,14 +67,35 @@ citation lives here:
 - **Five independent, opt-in steps; the caller picks and orders them.** A server applies these last,
   after `bind`/`listen` and opening every privileged fd. Nothing here is a global — each function is
   a thin, verified wrapper over one syscall family.
+
 - **Order-safety is enforced, not documented.** `dropPrivileges` does `setgroups([]) → setgid →
   setuid` (the only safe order — setuid first strips the privilege setgid/setgroups themselves need)
   and then **reads back** real, effective AND saved uid/gid (`getresuid`/`getresgid` — the saved id
-  is the `seteuid` ladder back up) plus `getgroups() == 0`, returning `error.DropNotEffective` on
-  any mismatch. A partial/spoofed drop is fatal, never silently tolerated. The capability bounding
-  set must be dropped BEFORE `dropPrivileges`: `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which a
-  non-root uid no longer holds (the earlier README recipe had it after, where it always hit EPERM and
-  a `catch {}` swallowed it).
+  is the `seteuid` ladder back up) plus `getgroups() == 0` and, for a non-root target, with `capget`
+  that no capability is left effective or permitted (`SECBIT_KEEP_CAPS` / `SECBIT_NO_SETUID_FIXUP`
+  keep `CAP_SETUID` across `setuid`, and the process could go back to uid 0), returning
+  `error.DropNotEffective` on any mismatch. A partial/spoofed drop is fatal, never silently
+  tolerated. The drop refuses a multi-threaded process (`error.MultipleThreads`, from the `Threads:`
+  line of `/proc/self/status`, which is read in full — the `Groups:` line ahead of it can be ~390 KB):
+  ids are per thread and these are raw syscalls with no libc broadcast, so a drop would change the
+  calling thread only; nothing is changed. When `/proc` cannot be read the thread count is unknown and
+  the drop goes ahead — the caller answers for it. An id of `maxInt` (the kernel's "unchanged") is
+  `error.SetIdFailed` before the first side effect; `SetIdFailed` from a later step means a PARTIAL
+  drop, which is fatal. The `capget` header is a local `extern struct { version: u32, pid: c_int }`,
+  not std's `cap_user_header_t` (its `pid` is a `usize` at offset 8, where the kernel reads an `int`
+  at offset 4). The capability bounding set must be dropped BEFORE `dropPrivileges`:
+  `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which a non-root uid no longer holds, so after the drop it
+  always hits EPERM. Bounding sets and `clearCapabilities` are per thread: call them before
+  spawning any.
+- **Dumpability and rlimits.** `disableCoreDumps` (`RLIMIT_CORE = 0`) stops a core FILE only; a
+  piped `core_pattern` handler (systemd-coredump, apport) is not bound by it. `setNotDumpable`
+  (`PR_SET_DUMPABLE 0`) keeps the memory out of any dump and away from a same-uid `ptrace` and
+  `/proc/<pid>/mem`; the kernel resets the flag on an `execve` and whenever the effective or
+  filesystem ids change, so call it AFTER `dropPrivileges`. `setLimit` and the `limit*` helpers
+  set soft = hard, so a lowered limit cannot be raised back by an unprivileged process.
+- **No-new-privs is a precondition, never implied.** `install`, `installTsync` and `restrictSelf`
+  need `noNewPrivs()` first (or `CAP_SYS_ADMIN`); without it they return `error.NoNewPrivsRequired`
+  (EACCES / EPERM), not a generic failure.
 - **seccomp is an allow-list with a mandatory arch guard.** The generated classic-BPF program loads
   `seccomp_data.arch`, KILLs on a mismatch (always KILL, independent of the configured deny action),
   loads `nr`, then a linear `JEQ nr_i → ALLOW` chain with a single deny leaf. What the guard is FOR:
@@ -92,14 +114,14 @@ citation lives here:
   valid on any arch — and a test names its content (and, on x86-64, that exactly one spelling is
   dropped), because that filter also swallows a misspelling silently: syscall 262 is `newfstatat` in
   some tables and `fstatat64` in std's x86-64 table, and only the former was listed, so C code's
-  `stat(2)` died of SIGSYS under a list whose author had allowed it. Audit S11 (2026-09-14): 12
-  calls a runtime makes unasked were added (`rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`,
+  `stat(2)` died of SIGSYS under a list whose author had allowed it. The default list carries 12
+  calls a runtime makes unasked (`rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`,
   `clock_getres`, `sched_getaffinity`, `getrusage`, `uname`, `sysinfo`, `close_range`, `faccessat2`,
   `rt_sigtimedwait`), each checked to touch only the caller's own state, an fd it holds, or
   information `newfstatat`/`statx` already expose; a test runs all 12 under the installed default
-  filter. `prlimit64` and `setrlimit` were listed by the audit and stay OUT: both raise soft limits
-  the `limit*` helpers lowered, and `prlimit64` acts on other same-uid processes — a new grant (the
-  same test pins that the default filter kills them). `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
+  filter. `prlimit64` and `setrlimit` stay OUT: both raise soft limits the `limit*` helpers lowered,
+  and `prlimit64` acts on other same-uid processes — a new grant (the same test pins that the
+  default filter kills them). `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
   (packed u64+s32) so the byte layout matches the kernel's `copy_from_user`.
 - **The W^X preset (`seccomp.buildWx`/`buildDefaultWx`) adds argument-checked blocks, not a
   different filter shape.** For each of `{mmap, mprotect, pkey_mprotect}` present in the allow-list,
@@ -134,17 +156,22 @@ citation lives here:
 - **Landlock: `init()` handles everything; `allowPath` grants.** Landlock only restricts rights
   that are *handled*; an unhandled right is unrestricted everywhere. `Ruleset.init()` therefore
   handles `access.all` (every `LANDLOCK_ACCESS_FS_*` bit this module knows, clamped to the ABI) and
-  `allowPath(path, rights)` says what each tree may be used for. The earlier `init(handled)` took a
-  mask, and every piece of documentation passed `access.read_only` to BOTH calls — a ruleset that
-  handled `read_file|read_dir` only, leaving the other 14 rights (write, create, unlink, mkdir,
-  symlink, truncate, …) unrestricted for the whole filesystem. The A1 audit measured a process
-  "confined to a read-only tree" creating, truncating, unlinking and symlinking outside it, and
-  writing inside it. The explicit form survives as `initHandling(mask)` for the rare deployment that
-  wants a right left unhandled on purpose. `allowPath` opens with `O_NOFOLLOW` and refuses a final-
-  component symlink (`error.PathIsSymlink`) — a rule attaches to what the configuration names, not to
-  what a symlink (writable by anyone with write access to its parent) points at; one
-  `link_to_root -> /` had granted the whole filesystem. Intermediate symlink components are still
-  followed.
+  `allowPath(path, rights)` says what each tree may be used for. `init` takes no mask because a
+  ruleset that handled only `read_file|read_dir` (the mask a read-only `allowPath` takes) would
+  leave every other right — write, create, unlink, mkdir, symlink, truncate, … — unrestricted for
+  the whole filesystem (measured: a process "confined to a read-only tree" created, truncated,
+  unlinked and symlinked outside it, and wrote inside it). The explicit form is
+  `initHandling(mask)`, for the rare deployment that wants a right left unhandled on purpose;
+  `initExact` refuses any degradation (`error.PartiallySupported` when the ABI lacks a requested
+  right or scope, or a bit is outside `access.all`; no ruleset is left open). `allowPath` opens with
+  `O_NOFOLLOW` and refuses a final-component symlink (`error.PathIsSymlink`) — a rule attaches to
+  what the configuration names, not to what a symlink (writable by anyone with write access to its
+  parent) points at; one `link_to_root -> /` would grant the whole filesystem. Intermediate symlink
+  components are still followed. The granted access is clamped to the handled set and, for a file,
+  to `access.file` (the kernel refuses directory rights on a file rule, so `read_only` on a file
+  grants `read_file`); an empty clamp is a no-op, as `allowPort`'s. `Ruleset.deinit` is idempotent
+  (the fd is set to -1), so a `defer` plus an explicit call cannot close a reused descriptor; later
+  calls on it report `RulesetFailed`.
 - **Landlock network rights and scopes are opt-in (`initWith`), files are not.** `init()` still
   handles every filesystem right and nothing else. Handling `bind_tcp`/`connect_tcp` by default
   would deny every outbound connect a server makes (a JWKS fetch, an upstream) on any ABI 4+
@@ -175,7 +202,7 @@ citation lives here:
   their layout (their tests pin it) and refuse `.allow` as a deny action (`error.InvalidAction`).
   `.log` is accepted as a deny action — the profiling mode; `actionAvailable` probes it, because
   an action the kernel does not know is not refused at install, it acts as `KILL_PROCESS`.
-- **Second ABI and tree dispatch (`buildRulesWith`, 2026-10-11).** `buildRules` is
+- **Second ABI and tree dispatch (`buildRulesWith`).** `buildRules` is
   `buildRulesWith(.., .{})`, byte-identical to the earlier program. `Options.i386` (x86-64 only,
   libseccomp's `seccomp_arch_add`) turns the guard into a dispatch: `ld arch; jeq native (jt 1);
   ja <past native block>; [native block]; jeq i386 (jt 1); ja <past i386 block>; [i386 block];
@@ -197,10 +224,9 @@ citation lives here:
   one or more per preceding rule (measured in the tests with a counting interpreter: 256
   numbers, worst case ≤ 15 vs > 250 linear). In both layouts `nr` is loaded once for a run of
   rules without conditions (and not again after the x32 guard): conditions are what clobber the
-  accumulator. Since 2026-10-27; before, every node cost `jge`+`ja` and every rule reloaded
-  `nr`: the 80-syscall `default_allowlist` as rules took 16.8 instructions per allowed syscall
-  in the tree (now 12.4; libseccomp 2.6.0's optimize-2 tree 13.1) and 86.0 linear (now 45.5,
-  libseccomp's default 45.5). **Divergences from libseccomp:** it picks the layout itself
+  accumulator. The instruction counts per allowed syscall of the 80-syscall
+  `default_allowlist` as rules, against libseccomp's two layouts, are what `zig build bench-sandbox`
+  grades (card, Performance line). **Divergences from libseccomp:** it picks the layout itself
   (attribute `SCMP_FLTATR_CTL_OPTIMIZE`; level 1, a linear scan, unless set to 2) and does not promise rule order across a syscall's rules — we keep
   first-match-wins order in both layouts; it supports every arch its tables know — we support
   i386-on-x86-64 only (the one ABI testable on this host); x32 is not addable (always killed).
@@ -240,145 +266,135 @@ variant; `buildRules` is the form that narrows them by argument. A seccomp condi
 VALUES only — it cannot follow a pointer (a path, a `sockaddr`), so "connect only to port 443" is
 Landlock's job (`allowPort`), not seccomp's. Landlock covers the filesystem, TCP ports and two IPC
 scopes (and, inherently, ptrace of processes outside the domain); it does not restrict
-already-open fds or UDP (ABI 10) — pair it with seccomp + a namespace for those. Out of scope: BSD sandboxing.
+already-open fds or UDP (ABI 10) — pair it with seccomp + a namespace for those. Out of scope: BSD sandboxing (→ *What is deliberately not done*).
+
+**Residual risks a consumer relies on.**
+
+- `tgkill` is on the default allow-list: it can signal any same-uid process, SIGKILL included (`abort`/`raise`
+  and thread cancellation use it on the caller's own threads). Narrow it with `buildRules`
+  (`arg = 0, .eq, .u32, value = getpid()`) or add Landlock's `scope.signal` for processes outside the domain.
+- The `Threads:` guard of `dropPrivileges` is skipped when `/proc` is unreadable (a chroot): the caller then
+  answers for dropping before it spawns threads.
+- Kernel floors: Landlock 5.13 (`NotSupported` / `Disabled` below / without the LSM), seccomp filtering 4.14 as
+  `seccomp.available()` and `actionAvailable` probe it (`SECCOMP_GET_ACTION_AVAIL`; on 3.17–4.13 filters work
+  but `available()` says false). An action the kernel does not know is not refused at install: it acts as
+  `KILL_PROCESS`.
+- Landlock ABI 9 `RESOLVE_UNIX` is in `access.all`, so a sandboxed process cannot reach a path-named UNIX socket
+  on a kernel that has the right; enforcement has never run against a real ABI 9 kernel (→ Open).
+- `Ruleset` copies by value share the fd: do not copy a live one and `deinit` both.
 
 ## Verification
 
-The enforcement tests **fork a child**, apply one restriction, attempt the forbidden action and
-assert the child terminates exactly as configured, with a control child (no restriction) succeeding —
-the only honest way to test a security boundary; a pure unit test would prove nothing about the
-kernel actually enforcing it. **Skips are decided before the child runs**, from a probe of the
-kernel (`seccomp.available()`, `landlockAbiVersion()`, a writable `/tmp`, `int $0x80` being
-emulated) — never from the child's own failure exit. The earlier shape `if (child failed to
-install) return error.SkipZigTest` turned a broken mechanism into a green suite (A1 audit S5: a
-mutation disabling Landlock entirely produced "15 pass / 3 skip", exit 0); now `init`/`install`
-failing after the probe said yes is a failing test. `runInChild` checks `waitpid`'s return too — a
-failed wait used to leave `status = 0`, which reads as "exited 0". Unprivileged and always-run: seccomp (KILL child dies of `SIGSYS`,
-ERRNO child sees `-EPERM`, control survives), the same KILL/ERRNO shape re-verified through
-`installTsync`'s `seccomp(2)` path, a cross-thread test that spawns a worker *before* installing
-(via `installTsync`) and confirms the worker's own denied syscall brings the whole process down
-(proof `TSYNC` actually reached a thread that never called into seccomp itself — `install()`'s
-prctl form cannot do this), the W^X preset (RW `mprotect`/`mmap` still succeed; RWX denied; a raw
-syscall with a crafted non-zero high word on the `prot` argument is denied too, proving the 64-bit
-argument check and not just its low half is active), the arch guard's real job on x86-64 (a child
-under a getpid-only filter — `build` and `buildWx` — issues `int $0x80` nr 39, the i386 `mkdir`, and
-must die of SIGSYS; a directory appearing is the escape), Landlock (child confined to a temp dir is
-denied `/etc/passwd`, allowed its own file; with `init()` + `allowPath(read_only)` it is denied
-create/overwrite/mkdir/symlink/unlink outside the tree and writes inside it, while `read_write` on
-the tree still permits creating there; a symlink handed to `allowPath` is refused by name; a worker
-spawned before `restrictSelf` is measured unconfined — skips pre-5.13), rlimit (`RLIMIT_NOFILE`
-bites at the cap with EMFILE and cannot be raised back; `RLIMIT_CORE` read back as 0), Landlock
-TCP rules against two loopback listeners (port 0 bind and the granted connect succeed; the busy,
-ungranted port gives EACCES where the unconfined control gets EADDRINUSE — so the denial is
-Landlock's, not the port's), the signal and abstract-UNIX scopes (child denied `kill(parent, 0)` /
-connect to the parent's abstract socket; controls succeed), `restrictSelfAllThreads` confining a
-pre-existing worker, and `buildRules` on the kernel (`socket(AF_UNIX)` refused also with a junk
-high word, `close(fd ≥ 1000)` exact at 999/1000, an x32-numbered call killed under a deny-list,
-`.log` default letting calls run). `buildRules` codegen is also checked off-kernel by a classic-BPF
-interpreter against a direct evaluation of the rules: 40 000 seeded random rule sets × 16 inputs
-aimed at the 32-bit word boundaries (`v±1`, the same low word with another high word, …) —
-since 2026-10-11 also over both dispatch shapes and, on x86-64, with an i386 list (probe arch
-random: native, i386, junk; i386 numbers deliberately collide with native ones), plus 60 rounds
-of lists up to 200 rules per ABI (long `ja`s, duplicate numbers) comparing linear, tree and model,
-a step-count check of the tree, and kernel tests that an `int $0x80` syscall passes with an i386
-allow rule and dies without one (also under `.tree`), and that a native `getpid` allow does not
-leak to the aliasing i386 number once both ABIs are in the filter.
-Root-gated +
-`SkipZigTest` otherwise: privilege drop (drops to `nobody`, asserts uid AND gid AND saved uid, and
-that `setuid(0)`/`setgid(0)` fail) and capability bounding-set drop — ⚠ in an unprivileged run
-these two are inert, so the setuid-before-setgid hole is NOT caught by the ordinary gate; a
-privileged lane is the only cure, and it exists: `scripts/vm/run.sh sandbox` runs the suite as real
-root in a disposable guest (2026-09-15: 35 pass, and seven drop/bounding-set mutants each fail
-there). The typed failure branches no healthy kernel takes (`install`/`installTsync` errno,
-Landlock ENOSYS/EOPNOTSUPP) are driven by a seccomp pre-filter that makes the real syscall return
-that errno, in every ordinary run. `run.sh sandbox debian --kernel-append lsm=apparmor` also checks
-`error.Disabled` against a kernel without the Landlock LSM. Pure/logic tests cover the BPF program shape for `build`,
-`buildWx` and `buildRules` (arch guard including its jump targets, x32 guard, per-syscall compare,
-W^X block layout, per-rule blocks, allow/deny leaves, descending `jt`), the default allow-list's
-named content, `Action.errno` bounds and the refused rule/action inputs, struct ABI sizes, the
-monotone Landlock access mask, the per-ABI ruleset attr size / net / scope masks, and the
-`restrictSelfWith` flag degradation (log flags dropped below 7, `tsync` an error below 8). Run:
-`zig build test-sandbox` (add `-Doptimize=ReleaseFast` for the release check; `sudo` prefix to also
-exercise the two root-gated tests).
+Run: `scripts/modtest sandbox` (the build step is `test-sandbox`; `-Doptimize=ReleaseFast` for the release check;
+as root it also runs the two root-gated tests). Interop with a foreign implementation: `zig build interop-sandbox`
+(see Anchoring).
 
-**Mutation (2026-11-07, whole module,** production lines of `root.zig`, schemata in a detached copy, ReleaseSafe, strict verdict — a pass/skip change is not a kill; host kernel 7.0 Landlock ABI 8, root cases in the VM lane (`scripts/vm/run.sh sandbox debian`, Debian 6.12, ABI 6) from the mutated copy): 241 mutants, 233 killed, 8 decided without a kill, 0 undecided. New tests: `dropPrivileges` with setters faked by seccomp (read-back of uid/gid, `maxInt` refusal, each setter's error, failed `getgroups`/`capget`, groups left behind, a success control), injected errnos for every syscall's typed error (`restrict_self` was fail-open: a mutant reported success), a root-gated read-back test (one wrong real/effective/saved id each, a kept permitted set via `PR_SET_KEEPCAPS`), and an emulated ABI 9 kernel (USER_NOTIF answers the version query) proving `init()` hands over `RESOLVE_UNIX`. Two skip gates that used the code under test (`threadCount`, `landlockAbiVersion`) now use raw syscalls. Equivalent: 14 (effective ⊆ permitted is a kernel invariant), 32 (any `getgroups` errno is nonzero, refused by `ngroups != 0`), 84 (a failed `open` leaves -errno, `statx` gives EBADF → same `PathOpenFailed`), 134/139 (a length-0 program is EINVAL → same `SeccompFailed`); unobservable: 4 (EINTR on a procfs read cannot be injected once; both retry forever), 24/28 (`getresuid`/`getresgid` with valid pointers fail only with EFAULT). **Finding F1 (security, fixed `41bc8ea4`):** the `dropPrivileges` read-back passed std's `cap_user_header_t` (`pid: usize` at offset 8; the kernel reads an `int` at 4, uninitialized padding) to `capget` — clean root drops read as `DropNotEffective`, and a garbage pid naming a capability-free process would have passed fail-open; no unprivileged test reached it and the VM root lane had not run since 09-15. Cut: comptime tables (pinned by pure tests), the x86-only `UnsupportedArch` branch, a capacity hint, the u16 `RET_DATA` mask, internal asserts.
+The enforcement tests **fork a child**, apply one restriction, attempt the forbidden action and assert the child
+terminates exactly as configured, with a control child (no restriction) succeeding — the only honest way to test a
+security boundary; a pure unit test would prove nothing about the kernel actually enforcing it. **Skips are decided
+before the child runs**, from a probe of the kernel (`seccomp.available()`, `landlockAbiVersion()`, a writable
+`/tmp`, `int $0x80` being emulated) — never from the child's own failure exit: `init`/`install` failing after the
+probe said yes is a failing test, never a skip. The skip gates themselves (thread count, Landlock ABI) use raw
+syscalls, not the code under test. `runInChild` checks `waitpid`'s return too.
+
+- **seccomp, unprivileged, always run:** KILL child dies of `SIGSYS`, ERRNO child sees `-EPERM`, control survives;
+  the same shape through `installTsync`'s `seccomp(2)` path; a cross-thread test that spawns a worker *before*
+  installing (via `installTsync`) and confirms the worker's own denied syscall brings the whole process down (proof
+  `TSYNC` reached a thread that never called into seccomp itself); the W^X preset (RW `mprotect`/`mmap` succeed,
+  RWX is denied, a raw syscall with a crafted non-zero high word on `prot` is denied too, proving the 64-bit
+  argument check); the arch guard's real job on x86-64 (a child under a getpid-only filter — `build` and `buildWx` —
+  issues `int $0x80` nr 39, the i386 `mkdir`, and must die of SIGSYS; a directory appearing is the escape); the
+  default allow-list installed (the 12 runtime calls run, `prlimit64`/`setrlimit` are killed).
+- **Landlock:** a child confined to a temp dir is denied `/etc/passwd` and allowed its own file; with `init()` +
+  `allowPath(read_only)` it is denied create/overwrite/mkdir/symlink/unlink outside the tree and writes inside it,
+  while `read_write` on the tree permits creating there; a symlink handed to `allowPath` is refused by name; a
+  worker spawned before `restrictSelf` is unconfined and one confined by `restrictSelfAllThreads` is not; TCP rules
+  against two loopback listeners (port 0 bind and the granted connect succeed; the busy, ungranted port gives
+  EACCES where the unconfined control gets EADDRINUSE, so the denial is Landlock's); the signal and abstract-UNIX
+  scopes; an emulated ABI 9 kernel (a seccomp pre-filter makes the version query answer 9) proving `init()` hands
+  over `RESOLVE_UNIX`. Skips below each feature's ABI.
+- **rlimit and process state:** `RLIMIT_NOFILE` bites at the cap with EMFILE and cannot be raised back;
+  `RLIMIT_CORE`, `RLIMIT_NPROC`, `RLIMIT_AS` read back; `PR_GET_DUMPABLE` reads 0 after `setNotDumpable`.
+- **`buildRules` on the kernel:** `socket(AF_UNIX)` refused also with a junk high word, `close(fd ≥ 1000)` exact at
+  999/1000, an x32-numbered call killed under a deny-list, `.log` default letting calls run, two conditional rules
+  of one syscall on one argument both holding, `.u32` junk-high-word bypass refused, `ge` exact at the boundary.
+  On x86-64: an `int $0x80` syscall passes with an i386 allow rule and dies without one (also under `.tree`), and a
+  native `getpid` allow does not leak to the aliasing i386 number once both ABIs are in the filter.
+- **`buildRules` codegen off-kernel:** a classic-BPF interpreter against a direct evaluation of the rules on seeded
+  random rule sets (40 000 rounds × 16 inputs aimed at the 32-bit word boundaries: `v±1`, the same low word with
+  another high word), over both dispatch shapes and, on x86-64, with an i386 list (probe arch random: native, i386,
+  junk; i386 numbers deliberately collide with native ones); 60 rounds of lists up to 200 rules per ABI (long `ja`s,
+  duplicate numbers) comparing linear, tree and model; a step-count check of the tree; a program of exactly
+  `max_program_len` instructions.
+- **Typed failure branches** no healthy kernel takes (`install`/`installTsync` errno, Landlock ENOSYS/EOPNOTSUPP,
+  `restrict_self` failures, `capget` failures) are driven by a seccomp pre-filter that makes the real syscall return
+  that errno, in every ordinary run; `dropPrivileges` runs with its setters faked the same way (read-back of
+  uid/gid, `maxInt` refusal, each setter's error, a failed `getgroups`/`capget`, groups left behind, a success
+  control).
+- **Root-gated** (`SkipZigTest` otherwise): the real privilege drop (to `nobody`, asserts uid AND gid AND saved
+  uid, and that `setuid(0)`/`setgid(0)` fail; a kept permitted set via `PR_SET_KEEPCAPS`; one wrong real, effective
+  or saved id each) and the capability bounding-set drop. ⚠ In an unprivileged run these are inert, so the
+  setuid-before-setgid hole is NOT caught by the ordinary gate; a privileged lane is the only cure:
+  `scripts/vm/run.sh sandbox` runs the suite as real root in a disposable guest, and
+  `scripts/vm/run.sh sandbox debian --kernel-append lsm=apparmor` also checks `error.Disabled` against a kernel
+  without the Landlock LSM.
+- **Pure/logic tests:** the BPF program shape for `build`, `buildWx` and `buildRules` (arch guard including its jump
+  targets, x32 guard, per-syscall compare, W^X block layout, per-rule blocks, allow/deny leaves, descending `jt`),
+  the default allow-list's named content, `Action.errno` bounds and the refused rule/action inputs, struct ABI
+  sizes, the monotone Landlock access mask, the per-ABI ruleset attr size / net / scope masks, and the
+  `restrictSelfWith` flag degradation (log flags dropped below 7, `tsync` an error below 8).
+- **Fuzz:** none; the card's Hardening line records that no fuzz obligation applies. The seeded random-rule model
+  test above plays that role for the codegen.
+- **Constant time:** n/a — syscall filtering, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+- **Bench:** `zig build bench-sandbox` (`tools/bench.zig`), see Performance.
 
 ## Performance
 
-**2026-10-27, per-syscall cost graded by BPF instructions (owner).** `zig build bench-sandbox` now counts the instructions each program executes for every syscall of `default_allowlist` (80) and for a denied one; the wall-time `sys_` rows stay as context (filter ≈ 4 ns of a ≈ 550 ns syscall, run-to-run spread up to 16 %, so a ratio of 0.97 or 1.02 there says nothing). Allowed mean / worst / denied: ours `buildDefault` 44.5 / 84 / 84, ours `buildRulesWith` `.tree` 12.4 / 13 / 13 (326 instructions), libseccomp 2.6.0 default 45.5 / 85 / 85, its optimize-2 tree 13.1 / 15 / 15 (108), go-seccomp-bpf v1.6.0 45.5 / 85 / 85 (a linear chain, x32 → ENOSYS), seccompiler 0.5.0 85.0 / 164 / 164 (a `jeq` + `ja` per syscall). Ratios: ref 0.988 (default layouts), fastest 0.947 (ours tree vs libseccomp's). Filter build 0.002× libseccomp. The foreign sources were read before they were built (go-seccomp-bpf `filter.go`/`assembler.go`, imports and `//go:build ignore` generators; seccompiler's backend; libc 0.2.191's `build.rs`, which only runs `rustc --version`), the downloaded module and crate compared byte for byte with the copies read.
+`zig build bench-sandbox` counts the BPF instructions each program executes for every syscall of
+`default_allowlist` and for a denied one — ours `buildDefault` (linear), ours `buildRulesWith` `.tree`, libseccomp's
+default and optimize-2 layouts, go-seccomp-bpf and seccompiler — and builds each filter. The wall-time `sys_` rows stay
+as context only: the filter costs a few nanoseconds of a ≈ 550 ns syscall, below the run-to-run spread. The figures
+(ref, fastest, filter build) are the card's `**Performance:**` line. The foreign sources were read before they were built, and
+the downloaded module and crate compared with the copies read; their provenance is in `tools/`.
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-sandbox`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 3.7 %): ref 0.001–1.00×, against 0.001–1.01× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+## What is deliberately not done
+
+- **Anything but Linux.** No OpenBSD `pledge`/`unveil`, no FreeBSD Capsicum, no cross-platform abstraction. The
+  ceiling is permanent, not a gap (raw `std.os.linux` syscalls, like `netlink` / `rawsock`).
+- **A policy engine or a vetted policy.** The module reduces a process's own privilege; what a service may do is the
+  deployment's choice (see Threat model). The default allow-list is a starting point to profile, not a policy.
+- **Automatic tree dispatch.** `.tree` is opt-in because the linear program is smaller and easier to audit below
+  ~50 numbers.
+
+## Open
+
+- Landlock ABI 9 `RESOLVE_UNIX` is handled (`access.all`, bit 16, ABI 9 taken from go-landlock v0.10.1), but only the
+  mask and an emulated version answer are tested: the development kernel is ABI 8, so enforcement has never run
+  against a real ABI 9 kernel.
 
 ## Backlog / deferred
-- **Delta audit 2026-10-29 (§ GK):** 7 mutants over the sweep + review fixes, 4 killed; 3 argued unobservable, counted eq: the EINTR retry in `threadCountFd` (not injectable on procfs) and the `maxInt` uid/gid refusals (unprivileged, `setuid` fails with EPERM anyway — a root/VM lane test would pin "no partial drop"). ReleaseSafe, unfiltered suite.
-- **No-panic sweep 2026-10-29 (§ GK):** SB-1 (`Ruleset.deinit` twice closed a reused fd) and SB-2 (`Threads:` past an 8 KiB `/proc/self/status` skipped the `MultipleThreads` guard) fixed. Blind review (4 LOW, report text in the owner's wave log): `maxInt` ids refused before the first side effect, `SetIdFailed` documents the partial-drop state, `threadCountFd` retries EINTR instead of failing open, `deinit`/`initExact` doc notes. The `maxInt` pre-check and the EINTR retry have no killing test (not observable unprivileged / not injectable on procfs).
 
-- ~~**General seccomp argument filtering / per-rule actions**~~ — **done 2026-10-04**:
-  `seccomp.buildRules` (`Rule`, `ArgCmp` with `eq ne lt le gt ge masked_eq` and a required
-  `.u32`/`.u64` width, first match wins, x32 kill on x86-64). Both survey bullets (2026-09-30).
-- ~~**Landlock network + scoped rules**~~ — **done 2026-10-04**: `Ruleset.initWith`, `allowPort`,
-  `access_net`, `scope`; opt-in (see Design). Plus, not in the survey: `restrictSelfWith` (ABI 7
-  log flags) and `restrictSelfAllThreads` (ABI 8 TSYNC), which closes the "no TSYNC for Landlock"
-  ceiling this SPEC used to state.
-- ~~**`SECCOMP_RET_LOG`**~~ — **done 2026-10-04**: `Action.log` (+ `actionAvailable`). Still open
-  from that survey bullet: **`TRACE`, `USER_NOTIF`** — a supervisor process answering syscalls is
-  a different module's worth of protocol (the notify fd, `SECCOMP_IOCTL_NOTIF_*`); no consumer
-  asks. Effort large.
-- ~~**Multi-architecture filters (compat / x32 rules)**~~ — **DONE 2026-10-11**:
-  `seccomp.buildRulesWith(.., .{ .i386 = rules })` on x86-64 (`CompatRule` names numbers of the i386
-  table, `std.os.linux.syscalls.X86`; see Design). Kernel-tested with `int $0x80`. **Still open: x32
-  rules** — x32 stays killed (`buildRules` x32 guard); an x32 block would need its own number table
-  (`__X32_SYSCALL_BIT`, `std.os.linux.syscalls.X32`) behind the same `AUDIT_ARCH_X86_64`, plus a
-  kernel with `CONFIG_X86_X32` to test it (none here); no consumer asks. Other secondary ABIs
-  (AArch32 on aarch64, …) are `error.UnsupportedArch` — untestable on this host.
-- ~~**Binary-tree dispatch for long rule lists**~~ — **DONE 2026-10-11**: `Options.dispatch = .tree`
-  (opt-in; linear stays the default and the program for short lists is byte-identical to before).
-- **Landlock ABI 9 `RESOLVE_UNIX`: DONE 2026-11-05** in `access.all`, bit 16 and ABI 9 taken from
-  go-landlock v0.10.1, because leaving it out let a sandboxed process reach path-named UNIX sockets
-  on a kernel that has the right. Only the mask is tested: the kernel here is ABI 8, so enforcement
-  has never run against a real ABI 9 kernel.
-- **Landlock ABI 10+** (2026-10-04): UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10),
-  `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11). Not in the kernel and UAPI header this was built
-  against (7.0, ABI 8); UDP stays unrestricted on a kernel that has those rights. Add with one.
-  Effort small each.
-- **Review 2026-10-27 (Sonnet, read-only, all of `root.zig`): no codegen defect; fixed** —
-  `dropPrivileges` refuses a multi-threaded process (`error.MultipleThreads`; ids are per thread
-  and these are raw syscalls) and, for a non-root target, checks with `capget` that no capability
-  is left effective or permitted (`SECBIT_KEEP_CAPS`/`NO_SETUID_FIXUP` kept `CAP_SETUID`);
-  `allowPath` clamps a file rule to `access.file` (the kernel refused `read_only` on a file) and
-  treats an empty clamp as a no-op like `allowPort`; `Ruleset.initExact` refuses a partially
-  supported request; `setNotDumpable` (`PR_SET_DUMPABLE`), and `disableCoreDumps` no longer
-  claims to stop piped `core_pattern` handlers; `install`/`installTsync` name EACCES
-  `NoNewPrivsRequired`; a `.u32` condition with data past 32 bits is `InvalidRule`; test skips
-  decided by raw syscalls instead of the probes under test; docs: per-thread capabilities,
-  `ThreadSyncFailed` installs on no thread, `available()` needs 4.14, `tgkill` reaches same-uid
-  processes. **Left as is:** `available()` on 3.17--4.13 (documented floor 4.14); the rlimit
-  test's catch-all (`setLimit` has one error).
-  **Mutation 2026-10-27:** 42 schemata mutants over the final source (codegen: jump offsets, compare
-  opcodes, halves, masks, tree pivot/leaf, nr reuse, guards; validation; install/TSYNC; privilege
-  drop; Landlock masks/clamps/flags; rlimits; no-new-privs), one ReleaseSafe test binary: 42/42
-  killed after two tests were added for the survivors -- a program of exactly 4096 instructions
-  (`>` vs `>=` on the cap survived) and the `RLIMIT_NOFILE` hard limit read back (`n + 1` survived).
-  The TSYNC propagation test kills `installTsync` without the flag (the review's open question).
-- **Upstream report of the libseccomp rule-merge defect** (2026-10-27, owner: "note it for now"):
-  2.6.0 and 2.6.1 drop a conditional rule / take an action no rule names when several conditional
-  rules of one syscall compare the same argument (Ahead line; reproducer: the two `getppid` rules of
-  the kernel test, `seccomp_export_pfc` shows the second missing). Not reported yet; when it is,
-  re-check the Ahead claim against the fixed release.
-- **Remains Linux-only** — the documented ceiling (no `pledge`/Capsicum) is permanent, not a gap.
-
-## Status
-
-`new · linux · util · single_owner` + deps: none — canonical source is `pub const meta` in
-src/root.zig.
+- **`SECCOMP_RET_TRACE`, `USER_NOTIF`.** A supervisor process answering syscalls is a different module's worth of
+  protocol (the notify fd, `SECCOMP_IOCTL_NOTIF_*`); no consumer asks. Effort large.
+- **x32 rules, other secondary ABIs.** x32 stays killed (`buildRules` x32 guard); an x32 block would need its own
+  number table (`__X32_SYSCALL_BIT`, `std.os.linux.syscalls.X32`) behind the same `AUDIT_ARCH_X86_64`, plus a kernel
+  with `CONFIG_X86_X32` to test it (none on the development host); no consumer asks. Other secondary ABIs (AArch32
+  on aarch64, …) are `error.UnsupportedArch`, untestable on this host.
+- **Landlock ABI 10+:** UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10), `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11).
+  Not in the kernel and UAPI header this was built against (7.0, ABI 8); UDP stays unrestricted on a kernel that has
+  those rights. Add with one. Effort small each.
+- **Upstream report of the libseccomp rule-merge defect** (owner: "note it for now"): 2.6.0 and 2.6.1 drop a
+  conditional rule / take an action no rule names when several conditional rules of one syscall compare the same
+  argument (Ahead line; reproducer: the two `getppid` rules of the kernel test, `seccomp_export_pfc` shows the
+  second missing). Not reported yet; when it is, re-check the Ahead claim against the fixed release.
 
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-**Live oracle (2026-10-27):** `tools/interop.zig` + `tools/c_oracle/soracle.c` drive libseccomp through its public API (written from `seccomp.h` and the man pages; libseccomp's LGPL source was not read) and compare BEHAVIOUR: per case a random rule set (families `single`, `same` -- several rules per syscall with one action -- and `mixed`) built by `buildRulesWith` (linear and tree) and by libseccomp (optimize 1 and 2, `seccomp_export_bpf_mem`), all four programs run by a classic-BPF interpreter with the kernel checker's rules over `seccomp_data` aimed at the conditions' edges, a direct evaluation of the rules as referee. This module must equal the referee on every input; libseccomp must too unless a documented difference explains the input (`u32_width`, `precedence`, `x32`, `lib_refuses`) or libseccomp contradicts its own semantics (`lib_defect`, `lib_timeout` -- the leads above). Seeds 1–6 at `--scale 3`: ~225,000 checks each, 0 mismatches, against the system libseccomp 2.6.0 and, seeds 1–3, Debian's 2.6.1 build (`libseccomp2_2.6.1-1+b2`, SHA-256 `2d97c9f6…`, extracted with `dpkg-deb -x`, `LD_LIBRARY_PATH`). Found on the way: the `ArgCmp.mask` doc said `(arg & mask) == value` while the code (and libseccomp) compare `(arg & mask) == (value & mask)` -- doc fixed. libseccomp refuses `ERRNO(4095)` (its range is 1..4094); the kernel's `MAX_ERRNO` and this module take it. Not reported upstream (owner's call).
+**Live oracle.** `tools/interop.zig` + `tools/c_oracle/soracle.c` drive libseccomp through its public API (written from `seccomp.h` and the man pages; libseccomp's LGPL source was not read) and compare BEHAVIOUR: per case a random rule set (families `single`, `same` -- several rules per syscall with one action -- and `mixed`) built by `buildRulesWith` (linear and tree) and by libseccomp (optimize 1 and 2, `seccomp_export_bpf_mem`), all four programs run by a classic-BPF interpreter with the kernel checker's rules over `seccomp_data` aimed at the conditions' edges, a direct evaluation of the rules as referee. This module must equal the referee on every input; libseccomp must too unless a documented difference explains the input (`u32_width`, `precedence`, `x32`, `lib_refuses`) or libseccomp contradicts its own semantics (`lib_defect`, `lib_timeout` -- the Ahead line). Seeds 1–6 at `--scale 3`: ~225,000 checks each, 0 mismatches, against the system libseccomp 2.6.0 and, seeds 1–3, Debian's 2.6.1 build (`libseccomp2_2.6.1-1+b2`, SHA-256 `2d97c9f6…`, extracted with `dpkg-deb -x`, `LD_LIBRARY_PATH`). libseccomp refuses `ERRNO(4095)` (its range is 1..4094); the kernel's `MAX_ERRNO` and this module take it. Not reported upstream (owner's call).
 
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
-
-**What the tests actually contain.** seccomp/landlock/rlimit enforcement tested against the real running kernel
