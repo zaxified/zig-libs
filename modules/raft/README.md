@@ -18,11 +18,16 @@ Two ways in:
   properties after every event. This is how the `Node` you run is verified.
 
 > **Status — mvp.** Election, replication, the Figure-8 commit rule, restart
-> from persisted state. Not yet: snapshots / log compaction (the whole log is in
-> memory), membership changes (`jointMajority` exists, not wired),
-> linearizable reads. PreVote and CheckQuorum are there, off by default as in
-> etcd/raft, and so is leadership transfer (`node.transferLeadership(target)`).
-> See [`SPEC.md`](SPEC.md).
+> from persisted state, PreVote and CheckQuorum (off by default, as in
+> etcd/raft), leadership transfer (`node.transferLeadership(target)`) and flow
+> control. Depends on `netsim`. See [`SPEC.md`](SPEC.md).
+
+## Not provided
+
+Snapshots / log compaction (the whole log is in memory), membership changes
+(`safety.jointMajority` exists, not wired) and linearizable reads. They are open
+items: SPEC.md *Backlog / deferred*; what is refused on purpose is in *What is
+deliberately not done*.
 
 ## Use
 

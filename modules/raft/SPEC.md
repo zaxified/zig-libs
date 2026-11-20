@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): Raft safety checker over seed sweep with fault fuzzing; BrokenRaft must trip it; decode fuzz (invariant checker, no independent model)
+What the tests check instead of a model (the card names no model): Raft safety checker over seed sweep with fault fuzzing; BrokenRaft must trip it; decode fuzz (invariant checker, no independent model)
 
 **Known defects:** none recorded
 
@@ -26,7 +26,7 @@ Auditor/design reference for the `raft` module. Consumer usage lives in
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Source of none of these was read; claims are from their READMEs. Verdict re-assessed 2026-10-04 against the same table after `Node` landed (poc → mvp).
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Source of none of these was read; claims are from their READMEs.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [LVala/zaft](https://github.com/LVala/zaft) | Zig | MIT | 24 | push 2024-08 (Zig 0.13) | The Zig alternative: a usable node (`Raft(UserData, Entry)` with send/apply/persist callbacks) for a fixed cluster; its README lists membership changes as not yet implemented. |
 | [canonical/raft](https://github.com/canonical/raft) | C | NOASSERTION (LGPL-3.0 with linking exception *inferred*) | 945 | v0.18.1 (2024-02), push 2024-03 | C library, listed for completeness. |
 
-**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no linearizable reads (ReadIndex / lease). (PreVote and CheckQuorum — etcd's `Config.PreVote` / `Config.CheckQuorum` — landed 2026-11-18, off by default as in etcd/raft; see § PreVote and CheckQuorum. Leadership transfer — etcd's `TransferLeadership` / `MsgTimeoutNow` — landed the same day; see § Leadership transfer.) (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
+**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests, and the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced; and PreVote, CheckQuorum, leadership transfer and flow control as etcd's `Config.PreVote` / `Config.CheckQuorum` / `TransferLeadership` / `MaxSizePerMsg` / `MaxInflightMsgs` (§ PreVote and CheckQuorum, § Leadership transfer, § Flow control and hostile-peer limits). **Where we are behind (→ Backlog / deferred, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no linearizable reads (ReadIndex / lease).
 
 ## Purpose
 
@@ -74,16 +74,14 @@ Figure 2's "update stable storage before responding". The node enforces the half
 it can see: a leader counts its own log toward a commit majority only up to what
 an `advance` confirmed persisted.
 
-What moved into it from the old netsim plumbing, and what changed on the way:
+Design decisions:
 
 - **Elections are tick-driven.** Every non-leader counts toward its timeout on
-  every tick, so the "step-down forgot to re-arm the election timer" liveness bug
-  the plumbing had (below) has no place to live. The timeout is redrawn on every
+  every tick, so a "step-down forgot to re-arm the election timer" liveness bug
+  has no place to live (see *Re-arming the timer* below). The timeout is redrawn on every
   reset from `[election_ticks, election_ticks + jitter)`.
 - **Terms stop at `types.max_term`.** Decoders refuse anything above it and a
-  node there stops campaigning instead of incrementing into an overflow (the old
-  plumbing's `current_term += 1` could panic or wrap after two elections at the
-  ceiling).
+  node there stops campaigning instead of incrementing into an overflow.
 - **Senders are the transport's.** `Message` (`message.zig`) carries no
   `candidate_id` / `leader_id`; the sender is what `stepBytes`' `from` says, and
   a sender outside the cluster or equal to the receiver is dropped and counted.
@@ -91,7 +89,7 @@ What moved into it from the old netsim plumbing, and what changed on the way:
   `fingerprint` (index, term, kind, bytes), so the kernel's log and the
   invariant checkers compare content, not just terms.
 - **Rejections carry a hint** (the follower's last index), so a gap costs one
-  round trip; since 2026-11-16 also a **conflict-term hint** (§5.3: the term of
+  round trip; also a **conflict-term hint** (§5.3: the term of
   the follower's entry at `prevLogIndex` and the first index of it, or one past
   its end), on the optional 34-byte `append_resp` frame, so a divergent tail
   costs O(terms) round trips — the leader resumes after its own last entry of
@@ -103,21 +101,7 @@ What moved into it from the old netsim plumbing, and what changed on the way:
   whose index range overflows, is refused (`leaderCommitIndex` assumes
   non-decreasing terms).
 
-**Review 2026-10-04 (Sonnet, adversarial) — H1, fixed.** A leader that scheduled
-a broadcast (`propose`, or a commit advance) and was deposed by a `step` before
-its next `ready` used to send that broadcast anyway — under the NEW term it had
-just adopted, as a leader of a term it never won; a peer would accept it and
-could truncate committed entries, and a truncation of its own tail in the same
-`step` made the stale `nextIndex` point past the log (a null unwrap). Fixed in
-`becomeFollower` and `ready` (two independent guards — removing either alone is
-an equivalent mutant; removing both is killed); pinned by `node.zig`'s "H1"
-test. The model-check could not see it: it drained every node after every
-event, so no two inputs ever met before a `ready`. That is now a mode
-(`RaftConfig.drain_every_event = false`), swept in addition — but measured
-honestly: with H1 re-introduced (mutant 52) the batched sweep still PASSES; only
-the unit test kills it. The bogus broadcast needs a peer that accepts it and
-holds committed entries it would truncate, which 300 fuzzed seeds did not
-produce. The batched mode buys other interleavings, not this bug.
+**A deposed leader's scheduled broadcast is dropped.** A leader that scheduled a broadcast (`propose`, or a commit advance) and was deposed by a `step` before its next `ready` must not send it: it would go out under the NEW term the node just adopted, as a leader of a term it never won, and a peer could accept it and truncate committed entries (a truncation of its own tail in the same `step` also leaves the stale `nextIndex` past the log). `becomeFollower` clears `bcast_pending` and `ready` checks the role again (`node.zig`): two independent guards; removing either alone is an equivalent mutant, removing both is killed by `node.zig`'s "H1" test. The batched-Ready mode of the model-check (`RaftConfig.drain_every_event = false`) lets several inputs meet before one `ready`, but it does not reach this case; only the unit test does (§ Verification).
 
 ## The Fable boundary — irreducible core vs mechanical scaffold
 
@@ -165,22 +149,10 @@ test the other does not fail: dropping `effective_vote` trips `safety.zig`'s
 "§5.2 … a fresh (higher) term clears an old vote"; dropping `Node.becomeFollower`'s
 clear trips `server.zig`'s "a step-down CLEARS votedFor" and nothing else.
 
-*Re-arming the timer* (history — the pre-`Node` plumbing; with tick-driven
-elections the bug has no place to live, and the regression test stays). A leader held
-no live election timer: the one it armed as a candidate fires and is *dropped*
-by `onTimer` (`role == .leader` → return, deliberately not re-armed, so a
-step-down starts a fresh full timeout rather than the remainder of a stale one).
-So from one timeout after its election, a leader's only route back to an armed
-timer is a step-down that re-arms — every path that sets `role = .follower`
-therefore went through the plumbing's `stepDown` (today: `Node.becomeFollower`, `node.zig`). A step-down that skips the
-re-arm produces a node that is **not wedged in any way a crash test can see**:
-it answers every RPC correctly and is simply never electable again, so if the
-rest of the cluster is gone the cluster is dead with a healthy-looking node in
-it. That is why the regression test asserts an election actually *starts*;
-asserting `role == .follower` after the step-down passes either way.
+*Re-arming the timer.* Every path that sets `role = .follower` goes through `Node.becomeFollower` (`node.zig`), which restarts the election timer (`resetElectionTimer`) and which `Node`'s tick-driven timeout counts from. A step-down that skipped the re-arm would produce a node that is not wedged in any way a crash test can see: it answers every RPC correctly and is simply never electable again, so if the rest of the cluster is gone the cluster is dead with a healthy-looking node in it. That is why the regression test asserts an election actually *starts*; asserting `role == .follower` after the step-down passes either way.
 
-Two additional safety-relevant verdicts surfaced during the core pass and now
-live in the core's contract rather than the plumbing:
+Two additional safety-relevant verdicts live in the core's contract rather than
+the plumbing:
 
 - **`AppendOutcome.match_index`** — a success reply advertises the VERIFIED
   region (`prevLogIndex + entries.len`), never the follower's raw last index:
@@ -240,26 +212,22 @@ drain the disk must equal the node's log entry for entry (`error.DiskDiverged`).
 
 Every wire decoder in `types.zig` returns `DecodeError!T` (`Truncated` for a
 length problem, `InvalidEncoding` for a well-sized but impossible field) and
-validates against the buffer **before** indexing, looping, or allocating. This
-is a change in failure semantics: decoding used to be infallible-by-assumption
-and panicked on anything unexpected. Concretely it now rejects
+validates against the buffer **before** indexing, looping, or allocating. It
+rejects
 
-- any payload shorter than the fixed fields (`decode(&[_]u8{0})` used to panic
-  with `index out of bounds: index 9, len 1`);
-- an undefined RPC tag byte or `EntryKind` byte — `@enumFromInt` on raw wire
-  bytes panicked with `invalid enum value`. `tagOf` matters most: it runs
-  *before* any decoder, so a fail-closed decoder behind a panicking tag read
-  would never be reached;
+- any payload shorter than the fixed fields;
+- an undefined RPC tag byte or `EntryKind` byte (never `@enumFromInt` on raw
+  wire bytes). `tagOf` matters most: it runs *before* any decoder, so a
+  fail-closed decoder behind a panicking tag read would never be reached;
 - an `AppendEntriesReq` entry count above `max_entries_per_msg`, **and** one the
-  remaining bytes cannot back — checked before the loop. This was previously a
-  `std.debug.assert`, which is compiled out when safety is off: a 39-byte
-  message declaring 65535 entries wrote past the caller's 8-element stack array
-  (measured: SIGSEGV under `ReleaseFast`) — an out-of-bounds *write* from two
-  attacker-chosen bytes;
+  remaining bytes cannot back — checked before the loop with a real check, not
+  a `std.debug.assert` (compiled out when safety is off: a 39-byte message
+  declaring 65535 entries would write past the caller's 8-element stack array,
+  an out-of-bounds *write* from two attacker-chosen bytes);
 - a `PersistentState` log count the image cannot back, **before** `alloc` — the
-  same unbounded-count guard as `threshold_ecdsa.PublicKeys.fromBytesAlloc`. A
-  16-byte image claiming 1,000,000 entries used to allocate 24 MB and then read
-  far past the buffer; `0xFFFFFFFF` demanded ~103 GB.
+  same unbounded-count guard as `threshold_ecdsa.PublicKeys.fromBytesAlloc`: a
+  16-byte image claiming 1,000,000 entries would otherwise allocate 24 MB and
+  read far past the buffer.
 
 **Terms are bounded, and that is all a non-Byzantine protocol can do about
 them.** Every decoder refuses a term above `types.max_term`, and `Node.campaign`
@@ -267,9 +235,8 @@ refuses to start a term past it, so no peer value can make a term overflow or
 wrap. What remains is availability, not safety: one authenticated-but-hostile
 peer that sends `term = max_term` makes every node adopt it and then never
 campaign again — the cluster halts, safely, with no signal beyond the term
-itself (review 2026-10-04, M2). Raft assumes non-Byzantine peers; authenticate
-the transport. **Decision 2026-11-18: no term-jump bound** — neither reference
-has one; see § Flow control and hostile-peer limits.
+itself. Raft assumes non-Byzantine peers; authenticate the transport. There is
+no term-jump bound (*What is deliberately not done*).
 
 **Policy on a malformed message: drop it and count it** (`RaftServer.
 malformed_dropped`). Figure 2 defines no negative acknowledgement, so there is
@@ -293,9 +260,7 @@ decoder from quietly hiding a real codec bug.
 
 ## Flow control and hostile-peer limits
 
-Added 2026-11-18 (review 2026-10-04, M1/M2; Backlog 10). Three limits were
-asked for; two are implemented the way etcd/raft does them, the third is not
-implemented because no reference has it.
+Three limits were asked for; two are implemented the way etcd/raft does them, the third is not implemented because no reference has it (*What is deliberately not done*).
 
 **Byte cap per AppendEntries — `Config.max_append_bytes`, default 1 MiB.**
 The size counted is the frame's entry part: per entry
@@ -309,8 +274,7 @@ etcd server's (`server/etcdserver/raft.go`: `maxSizePerMsg = 1 * 1024 * 1024`).
 *Proposal side* — `propose` refuses an entry larger than
 `max_append_bytes - entry_header_len` (`error.EntryTooLarge`): an entry no
 AppendEntries can carry would otherwise go alone and be refused by every
-follower forever. **Behaviour change:** proposals above ~1 MiB were accepted
-before (up to the wire's 4 GiB length field). *Follower side* — neither
+follower forever. *Follower side* — neither
 reference refuses an oversized AppendEntries in the consensus core (etcd's
 `stepFollower`/`handleAppendEntries` and hashicorp's `appendEntries` have no
 size check; a limit, if any, is the transport's). `Node` has no transport of its
@@ -320,9 +284,8 @@ dropped and counted in `malformed_dropped` (the module's policy for a message
 no honest peer sends, § Malformed messages) in `step`, before anything is
 allocated for its entries and before its term is observed. `maxFrameLen()`
 gives a transport the largest frame to accept, so it can refuse longer ones
-before reading them. **Behaviour change:** a frame above the cap is dropped —
-every server must be given the same `max_append_bytes`, like
-`max_append_entries`.
+before reading them. A frame above the cap is dropped, so every server must be
+given the same `max_append_bytes`, like `max_append_entries`.
 
 **In-flight window per follower — `Config.max_inflight_msgs`, default 512;
 `max_inflight_bytes`, default 0 = unbounded.** etcd/raft's `MaxInflightMsgs`
@@ -342,23 +305,7 @@ lost message must not wedge the window); a rejection empties the window (etcd's
 with a full window gets heartbeats only (they still carry the commit index and
 hold elections off). The window matters here because this leader re-sends from
 `nextIndex` on every heartbeat until an ack moves it: before the window a slow
-or dead follower was sent a full batch per heartbeat without bound.
-**Behaviour change** only past 512 unacknowledged batches to one follower.
-
-**Term-jump bound — not implemented (decision 2026-11-18, with the references).**
-Neither reference bounds a peer's term. etcd/raft's `Step` adopts any higher
-term from an AppendEntries/heartbeat (`becomeFollower(m.Term, m.From)`); the
-only exception is a RequestVote received inside a CheckQuorum lease
-(`inLease := r.checkQuorum && r.lead != None && r.electionElapsed <
-r.electionTimeout` → ignored), and PreVote (thesis §9.6) keeps a *partitioned
-honest* node from inflating its term in the first place. hashicorp/raft's
-`appendEntries` likewise adopts `a.Term` when higher, with no bound. Both
-mechanisms answer the honest-disruption case (a rejoining node deposing a
-healthy leader), which is Backlog 7 here (PreVote / CheckQuorum, implemented
-2026-11-18, § PreVote and CheckQuorum); neither stops a peer that lies about its term, because Raft
-assumes non-Byzantine peers. So no bound was invented: the defence against a
-hostile term stays `types.max_term` (no overflow, no wrap; the cluster halts
-safely, § Malformed messages) plus an authenticated transport.
+or dead follower would be sent a full batch per heartbeat without bound.
 
 The model-check exercises both limits: `server.zig`'s hostile-peer runs (one
 server also sends every peer an over-cap AppendEntries at its own term every 50
@@ -368,19 +315,9 @@ sweep, and the cluster to keep committing. The drop counter is what pins the
 refusal: with the follower's check removed, the accepted hostile entries were
 repaired by the honest leader's walk-back before any invariant saw them.
 
-Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new `node.zig` code
-only): 30 mutants, one per guard × class — the three `init` checks,
-`maxFrameLen`, the `propose` and `step` caps, the batch loop, every window
-rule (full test by count and by bytes, add, free-covered, free-oldest, the
-rejection and new-leader resets, the ring index). First run 26 killed, 4
-survived — all four byte-window bookkeeping (`becomeLeader` and the rejection
-not resetting the bytes, `FreeFirstOne` not giving bytes back, the oldest freed
-on a PROGRESSING ack too); each got a killing test; final 30/30 killed. Added to
-the card's counts (cumulative).
-
 ## PreVote and CheckQuorum
 
-Added 2026-11-18 (Backlog 7). Both follow etcd/raft (`raft.go`: `Config.PreVote`,
+Both follow etcd/raft (`raft.go`: `Config.PreVote`,
 `Config.CheckQuorum`, `Step`, `stepLeader`'s `MsgCheckQuorum`, `tickHeartbeat`)
 and the Raft thesis (Ongaro 2014, §9.6 PreVote, §4.2.3 disruptive servers);
 hashicorp/raft (`raft.go`: `requestPreVote`, `requestVote`, `checkLeaderLease`)
@@ -446,46 +383,14 @@ the lease) followed the same day — § Leadership transfer.
 
 **Wire.** Two new tags, `pre_vote_req = 0x14` and `pre_vote_resp = 0x15`,
 the same layouts as `vote_req` / `vote_resp` (the codec versions additions by
-tag or by an optional longer frame; it has no version byte). A decoder from
-before 2026-11-18 refuses them (undefined tag → dropped and counted), so a
+tag or by an optional longer frame; it has no version byte). A decoder without
+these tags refuses them (undefined tag → dropped and counted), so a
 pre-candidate gets no answer from an old server: upgrade every server before
 setting `pre_vote`.
 
-**Tests.** `node.zig`: a timeout makes a pre-candidate and moves no term,
-vote or hard state; a majority of grants starts the election, stale grants
-and same-term refusals do not; a higher-term refusal is adopted; the
-single-node and `max_term` cases; the receiver grants only an up-to-date log
-with no live leader and moves nothing; a live leader refuses; CheckQuorum
-steps down at `election_ticks` ticks and not one before, one ack per period
-keeps it, the activity is reset each period; the lease ignores higher-term
-RequestVote and PreVote (and without `check_quorum` the vote is adopted as
-before). `server.zig` (netsim, directed): node 4 cut away for six of its
-election timeouts and healed — without PreVote it comes back with a higher
-term and the term-1 leader is deposed; with PreVote (alone, and with
-CheckQuorum) the whole cluster is still in term 1 under the same leader; a
-leader cut into a minority steps down with CheckQuorum and stays leader
-without it. Plus a 150-seed fuzzed fault sweep with both on (all five
-invariants) and a quiet liveness run (one leader, ≥ 30 commits).
-
-Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new non-test code in
-`node.zig` and `message.zig` only): 43 mutants, one per guard × class — the
-CheckQuorum tick (on/off, the counter, `>=` vs `>`, the counter reset, the
-quorum test, the step-down's leader clear and `return`, the per-period clear
-and the self flag), `quorumActive`'s `>=`, `becomeLeader`'s three resets, the
-`recent_active` mark, `preCampaign` (`max_term`, role, leader clear, timer,
-tally reset, self vote, majority, `term + 1`), `leaderLive`'s two clauses, the
-receiver's lease, `canVote` clauses, up-to-date and live-leader conjuncts,
-the reply term, `onPreVoteResp`'s adoption and its three filters, both decode
-tag splits, the tick's pre-vote switch. First run 35 killed, 8 survived — the
-step-down tick going on to send AppendEntries as a follower (no `return`),
-the pre-candidate keeping its leader, its timer not restarted, its tally not
-reset, `canVote`'s "no leader known" and "same term" clauses, and
-`becomeLeader` not clearing the activity flags or the check counter; each
-got a killing test; final 43/43. Added to the card's counts (cumulative).
-
 ## Leadership transfer
 
-Added 2026-11-18 (closes Backlog 7). Raft thesis (Ongaro 2014) §3.10; every
+Raft thesis (Ongaro 2014) §3.10; every
 rule follows etcd/raft (`raft.go`: `stepLeader`'s `MsgTransferLeader`,
 `MsgProp` and `MsgAppResp`, `stepFollower` / `stepCandidate`'s
 `MsgTimeoutNow`, `hup(campaignTransfer)`, `Step`'s `force` / `inLease`,
@@ -522,7 +427,7 @@ to (`no_vote` when none).
 - **Abandoned after one election timeout.** The request resets the leader's
   election-timeout period (etcd: `electionElapsed = 0`); if the node is still
   leader when it ends (`election_ticks` ticks — the same period the
-  CheckQuorum check uses, which a leader now always counts), the transfer is
+  CheckQuorum check uses, which a leader always counts), the transfer is
   dropped and proposals are taken again (etcd's `tickHeartbeat`; hashicorp
   waits `ElectionTimeout` too). Any step-down ends it (etcd's `reset`); a new
   leader starts with none.
@@ -535,51 +440,14 @@ term; term 0 and above `max_term` refused, as on every request). The flag is
 an optional 26th byte of `vote_req` (= 1; any other value, or the byte on a
 `pre_vote_req`, is refused — one encoding per message), the codec's
 optional-longer-frame rule as for `append_resp`'s hint; an unflagged
-RequestVote is the 25-byte frame of before. **Upgrade order:** a decoder from
-before 2026-11-18 drops both (undefined tag / wrong length, counted in
+RequestVote is the 25-byte frame of before. **Upgrade order:** a decoder without
+these tags drops both (undefined tag / wrong length, counted in
 `malformed_dropped`), so a transfer to — or a vote from — an old server
 fails, and the transfer is abandoned after one election timeout. Upgrade
 every server before calling `transferLeadership`; nothing else changes on the
 wire.
 
-**Tests.** `node.zig`: a caught-up target gets `timeout_now` at once, proposals
-are dropped, a repeat call sends nothing, a call for itself cancels, a follower
-cannot transfer, an unknown target is refused; a lagging target is sent its
-missing entries first and `timeout_now` follows exactly the ack that reaches
-the last index (not a partial one, not another follower's, not a duplicate);
-abandoned at `election_ticks` after the request and not one tick before, and
-another target restarts it; a step-down ends it and a new leader starts with
-none; `timeout_now` makes a follower campaign at once with flagged RequestVotes
-and no PreVote, while a stale one, a candidate and a pre-candidate ignore it;
-a flagged RequestVote is honoured inside the lease by a follower and by the
-old leader; an in-memory three-node cluster hands over to node 2 in term 2
-and commits under it. `message.zig`: the flag and `timeout_now` on the wire,
-and every refusal. `server.zig` (netsim, `TransferProbe`): the transfer
-succeeds — node 2 leads term 2, the very next term, and the cluster commits
-under it — with the defaults and with PreVote + CheckQuorum; a target cut away
-for 180 time units is still behind when asked and is caught up first; a
-transfer to a crashed target turns clients away, is abandoned, and the term-1
-leader commits again; a 100-seed fuzzed fault sweep with a transfer every 300
-time units (PreVote + CheckQuorum, ≥ 200 transfers) keeps all five
-invariants. raft-kv gained no command (a client-facing transfer needs a new
-client op and CLI verb — not trivial); its `propose` switch handles
-`error.ProposalDropped`.
-
-Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new non-test code in
-`node.zig` and `message.zig` only): 39 mutants, one per guard × class — the
-leader's period counter (skip, `>=` vs `>`, the reset) and the transfer
-deadline, the ordinary election's flag, `propose`'s refusal,
-`transferLeadership`'s target bound (dropped, `>` vs `>=`), leader check,
-same-target no-op, previous-transfer clear, self-target cancel, the deadline
-reset, the transferee set and the caught-up test (never / always),
-`campaign`'s flag, `onTimeoutNow`'s flag, term adoption, stale-term and role
-filters, `sendTimeoutNow`'s term, the `becomeLeader` and `becomeFollower`
-clears, the lease bypass (always / never), the ack-side `progressed`,
-transferee and caught-up conjuncts; on the wire `encodedLen`'s flag, the
-encoder's pre-vote and flag clauses and flag byte, the `timeout_now` term
-write, the decoder's tag, length and flag-byte tests, `timeout_now`'s length
-check and its term-0 refusal. First run 39/39 killed (no survivor, no
-equivalent). Added to the card's counts (cumulative: 124/126 + 39/39).
+`example-apps/raft-kv` has no transfer command (a client-facing transfer needs a new client op and CLI verb); its `propose` switch handles `error.ProposalDropped`.
 
 ## The positive control
 
@@ -590,102 +458,61 @@ so two distinct leaders for one term are recorded — tripping the **Election
 Safety** checker (`error.ElectionSafety`) on a clean run with no injected faults.
 It reuses the exact `SafetyChecker` the real `RaftServer` is held to, and its
 property/shrink/teeth tests (clean-replay, 100-seed sweep, ddmin minimization)
-run today. The other four properties are proven to have teeth by the synthetic
+run in the suite. The other four properties are proven to have teeth by the synthetic
 predicate tests in `checks.zig`; the real-cluster model-check tests exercise all
 five end-to-end.
 
-## Membership changes (§6) — designed, predicate implemented, not yet wired
+## Membership (§6): what exists
 
-Phase 1 scaffolds membership without implementing its safety logic:
+Membership change is not implemented; two pieces are in place:
 
-- Log entries carry an `EntryKind` (`noop` / `command` / `config`), so the log
-  container is already membership-ready; `config` entries carry no payload yet.
-- `safety.jointMajority` is the joint-consensus predicate: during a
-  `C_old → C_old,new → C_new` transition an election/commit counts only if it
-  wins majorities in **both** configurations. Implemented and unit-tested (the
-  gate flip must leave no reachable `@panic`), but not yet wired into the
-  protocol.
-
-Full membership change (joint consensus, the config-entry-takes-effect-when-
-appended-not-committed rule, the new-leader-commits-a-no-op-first precondition,
-and fuzzing membership churn in the harness) is the natural next Fable increment,
-scheduled after the core five properties hold. It is deliberately out of Phase-1
-scope to keep the first safety kernel focused.
+- Log entries carry an `EntryKind` (`noop` / `command` / `config`), so the log container is membership-ready; `config` entries carry no payload.
+- `safety.jointMajority` is the joint-consensus predicate: during a `C_old → C_old,new → C_new` transition an election/commit counts only if it wins majorities in **both** configurations. It is implemented and unit-tested, and not wired into the protocol. The plan is in *Backlog / deferred*.
 
 ## Verification
 
-Pure-logic + model-checking (CONVENTIONS.md §7): unit tests for codecs / log /
-checkers / the safety kernel (one test per documented wrong-but-plausible
-implementation, including the Figure-8 counterexample and the
-duplicated-AppendEntries rollback trap), plus `netsim` property + shrink +
-seed-sweep teeth tests. `scripts/modtest raft` (LLVM Debug, ~1 min as of 2026-10-04; the
-harness ticks every 10 time units) — including the
-real-`RaftServer` model-check tests (a 300-seed
-fuzzed fault sweep enforcing all five invariants live, a quiet-network
-election-liveness run, and the two step-down regressions, which drive a real
-leader to a demotion by response and then require it to campaign again and to
-grant a vote in the term it just adopted).
-During the 2026-08 core pass (the pre-`Node` plumbing) the suite was
-additionally validated against an extended 1500-seed default sweep and a
-500-seed heavy sweep (40 fault events, horizon 2500, until 3000) — both clean
-(ad-hoc runs, not part of the committed suite).
+`scripts/modtest raft` (LLVM Debug; the harness ticks every 10 time units); `-Doptimize=ReleaseSafe` as well. Pure-logic plus model-checking (CONVENTIONS.md §7).
 
-Sim-vs-paper durability note: a netsim `crash_node` freezes a node and
-`restart_node` re-enters via `onStart`, which now rebuilds the `Node` from the
-server's disk ALONE — volatile state is lost exactly as Figure 2 says. What the
-sim still cannot do is crash a server in the MIDDLE of a Ready (each event is
-atomic), so "sent before persisted" orderings are pinned by `node.zig`'s unit
-tests, not by the sweep (→ Backlog: a torn-Ready fault).
+- **Unit tests:** codecs (`types.zig`, `message.zig`), the log container (`log.zig`), the five invariant checkers (`checks.zig`) and the safety kernel (`safety.zig`): one test per documented wrong-but-plausible implementation, including the Figure-8 counterexample and the duplicated-AppendEntries rollback trap. `node.zig` drives an in-memory cluster: election, replication, crash and restart from disk, truncation reaching the disk, hint walk-back, the step-down cases (the stale-broadcast test above), persistence-before-commit, `max_term`.
+- **Teeth tests:** each checker has a test that feeds it a hand-built violating state and asserts it is caught (`checks.zig`); `BrokenRaft` must trip Election Safety on a clean run, and the index-only §5.4.1 injection (`srv.bug = .index_only_up_to_date`) must trip Leader Completeness on a directed schedule. The `naive_truncation` injection is not caught by the sweep (an entry's identity is `(creating term, index)`); its teeth are `safety.zig`'s "the trap" test and `node.zig`'s duplicated-AppendEntries test.
+- **Model-check** (`server.zig`, real `Node`s inside `netsim`, all five invariants live after every event, `error.DiskDiverged` if a disk differs from its node's log): a 300-seed fuzzed fault sweep; a 150-seed sweep with Readys batched per tick (`drain_every_event = false`); a quiet-network election-liveness run; a directed crash/restart run; the two step-down regressions (a leader demoted by a response or a refused vote stands for election again; a step-down clears `votedFor` so the node can vote in the term it just adopted); `malformed_dropped` must stay 0 in the harness, where every byte comes from our own `encode`.
+- **Hostile peer:** one server sends every peer an over-cap AppendEntries at its own term every 50 time units (1 KiB cap, two-message window) in a directed run and a 100-seed fault sweep: every hostile frame must be dropped and counted, the five invariants hold and the cluster keeps committing. The drop counter is what pins the refusal: with the follower's check removed, the accepted hostile entries were repaired by the honest leader's walk-back before any invariant saw them.
+- **PreVote and CheckQuorum:** `node.zig` pins a timeout making a pre-candidate that moves no term, vote or hard state; a majority of grants starting the election, stale grants and same-term refusals not; a higher-term refusal adopted; the single-node and `max_term` cases; the receiver granting only an up-to-date log with no live leader and moving nothing; CheckQuorum stepping down at `election_ticks` ticks and not one before, one ack per period keeping the leader, the activity reset each period; the lease ignoring a higher-term RequestVote or PreVote (and without `check_quorum` the vote adopted as usual). `server.zig` (directed): a node cut away for six election timeouts and healed deposes the leader without PreVote, and does not with PreVote (alone, and with CheckQuorum); a leader cut into a minority steps down with CheckQuorum and stays leader without it; plus a 150-seed fault sweep with both on and a quiet liveness run (one leader, at least 30 commits).
+- **Leadership transfer:** `node.zig` pins a caught-up target getting `timeout_now` at once and proposals dropped, a repeat call sending nothing, a call for itself cancelling, a follower unable to transfer, an unknown target refused; a lagging target sent its missing entries first and `timeout_now` following exactly the ack that reaches the last index (not a partial one, not another follower's, not a duplicate); abandonment at `election_ticks` after the request and not one tick before; a step-down ending it; `timeout_now` making a follower campaign at once with flagged RequestVotes and no PreVote while a stale one, a candidate and a pre-candidate ignore it; a flagged RequestVote honoured inside the lease by a follower and by the old leader. `message.zig`: the flag and `timeout_now` on the wire and every refusal. `server.zig` (`TransferProbe`): the transfer succeeds (the target leads the very next term and the cluster commits under it) with the defaults and with PreVote + CheckQuorum; a target cut away is caught up first; a transfer to a crashed target is abandoned and the old leader commits again; a 100-seed fault sweep with a transfer every 300 time units keeps all five invariants.
+- **Fuzz:** `RAFT_FUZZ=<runs>[,<first seed>]` runs testkit's deterministic driver over `raft-message`, `raft-tag`, `raft-log-entry`, `raft-request-vote`, `raft-append-entries` and `raft-persistent` (decoders: a value or `Truncated`/`InvalidEncoding`, never a panic); in-suite reach checks run N seeds per harness.
+- **Known limit of the model-check:** a netsim `crash_node` freezes a node and `restart_node` rebuilds the `Node` from the server's disk alone, but each event is atomic, so the sim cannot crash a server in the middle of a Ready: "sent before persisted" orderings are pinned by `node.zig`'s unit tests, not by the sweep (*Backlog / deferred*: a torn-Ready fault).
+- **Constant time:** n/a: consensus, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-2026-10-04 additions to the suite: `node.zig` (an in-memory cluster: election,
-replication, crash + restart from disk, truncation reaching the disk, hint
-walk-back, the H1 step-down cases, persistence-before-commit, max_term), the
-batched-Ready sweep (`drain_every_event = false`, 150 seeds), a crash/restart
-directed run, and `message.zig`'s codec + fuzz corpus. Mutation run 2026-10-04
-(schemata, 36 + follow-up mutants over `node.zig` / `message.zig`, ReleaseSafe):
-see CHANGELOG for the survivors and the tests they produced.
+## Performance
 
-**Decision 2026-09-30 (user): stays a poc** — superseded **2026-10-04 (user):
-raise the grade; raft → mvp.** `Node` is the mvp item (a runnable node over
-caller I/O, any cluster size); snapshots, membership change, pre-vote and
-linearizable reads are the core items, still in the Backlog (pre-vote and
-leadership transfer done 2026-11-18).
+Not measured; the card's `**Performance:**` line says so.
 
-## Backlog
+## What is deliberately not done
 
-1. ~~Implement the four Fable-core decision functions; flip the gate; make the
-   two real-cluster model-check tests green across the seed sweep.~~ **Done.**
-2. Add a bounded-liveness property (a leader is eventually elected and progress
-   is made on a network that is quiet long enough) — a post-run analyzer akin to
-   df-elect's bounded-DF-window, distinct from the safety invariants. **This is
-   the gap both step-down defects fell through**: `netsim` runs `checkFn` after
-   every event, but a `checkFn` can only reject a *state*, and neither "this node
-   has stopped being electable" nor "this node refuses a vote it should grant"
-   is a bad state — each is a good event that never arrives. Note what that
-   costs: the vote-clear defect was sitting *behind* the timer defect, invisible
-   until the first was fixed and probed, and the module's whole 300-seed sweep
-   never saw either. **Every liveness property this module relies on needs its
-   own event-shaped test** — drive the cluster into the situation, advance time
-   or deliver the next message, and assert the good thing HAPPENS. Two exist
-   (`a leader demoted by a RESPONSE … stands for election again`, `CLEARS votedFor`); the general property that
-   would subsume them does not.
-3. Membership changes (§6) — wire `jointMajority` in: joint consensus,
-   config-entry semantics, fuzz churn. Note for whoever does it: a config change
-   that removes this node from the voter set is another `role = .follower` site,
-   and must go through `Node.becomeFollower` (or deliberately stop the timer) — see the
-   re-arm rule above.
-4. ~~Client command proposals in the harness (today only leader no-ops populate
-   the log).~~ **Done** — `RaftConfig.propose_client_commands` (default on) makes
-   the leader propose one distinct `(term, index)` command per heartbeat, which
-   is what gives `recordApply` a key that varies.
-5. Log compaction / snapshotting (§7) — out of current scope. (survey 2026-09-30) A user of hashicorp/raft or etcd/raft cannot run without it: the log grows without bound. Effort: large; fits §2.
-6. ~~(survey 2026-09-30) A runnable node outside `netsim`.~~ **Done 2026-10-04** — `Node` (`node.zig`); `example-apps/raft-kv` runs on it.
-7. ✅ DONE 2026-11-18 — PreVote and CheckQuorum (`Config.pre_vote` / `check_quorum`, off by default as in etcd/raft; § PreVote and CheckQuorum) and leadership transfer (`Node.transferLeadership`, `timeout_now`, the flagged RequestVote that lifts the lease; § Leadership transfer). (survey 2026-09-30) Pre-vote and leadership transfer (etcd/raft, openraft): a partitioned node rejoining must not depose a healthy leader. Effort: medium; fits §2.
-8. (survey 2026-09-30) Linearizable reads (ReadIndex / lease): a user of a consensus library expects consistent reads without writing to the log. Effort: medium; fits §2.
+- **A term-jump bound** (refusing or counting a peer's implausibly high term), decided with the references.
+  Neither reference bounds a peer's term. etcd/raft's `Step` adopts any higher
+  term from an AppendEntries/heartbeat (`becomeFollower(m.Term, m.From)`); the
+  only exception is a RequestVote received inside a CheckQuorum lease
+  (`inLease := r.checkQuorum && r.lead != None && r.electionElapsed <
+  r.electionTimeout` → ignored), and PreVote (thesis §9.6) keeps a *partitioned
+  honest* node from inflating its term in the first place. hashicorp/raft's
+  `appendEntries` likewise adopts `a.Term` when higher, with no bound. Both
+  mechanisms answer the honest-disruption case (a rejoining node deposing a
+  healthy leader), which PreVote and CheckQuorum answer here (§ PreVote and CheckQuorum); neither stops a peer that lies about its term, because Raft
+  assumes non-Byzantine peers. So no bound was invented: the defence against a
+  hostile term stays `types.max_term` (no overflow, no wrap; the cluster halts
+  safely, § Malformed messages) plus an authenticated transport.
+- **A negative acknowledgement for a malformed message.** Figure 2 defines none, so there is nothing legal to reply, and inventing one would add both a protocol message and an amplification vector; a malformed message is dropped and counted (§ Malformed messages).
+- **A policy for a peer that sends only malformed messages** (evict, alarm, stop counting it toward quorum): that is operator policy above this layer; this module guarantees only that the condition is observable (`malformed_dropped`).
 
-9. (review 2026-10-04, M3) A torn-Ready crash fault in the harness: crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep — not only the unit tests — checks the persist-before-send order. Effort: medium.
-10. ✅ DONE 2026-11-18 (`Config.max_append_bytes` / `max_inflight_msgs` / `max_inflight_bytes`, `Node.maxFrameLen`; no term-jump bound — no reference has one, see § Flow control and hostile-peer limits) (review 2026-10-04, M1/M2) Flow control and hostile-peer limits: a byte cap per AppendEntries (today an entry cap), an in-flight window, a term-jump bound or counter. Effort: medium.
-11. ✅ DONE 2026-11-16 (`message.AppendResp.conflict_term/conflict_index`, optional 34-byte frame; `Node` follower fills it, leader uses it) (review 2026-10-04) A conflict-term hint (§5.3's optimization) so a follower with a long divergent tail costs O(terms) round trips, not O(tail). Effort: small.
+## Backlog / deferred
+
+- **A bounded-liveness property for the model-check:** a leader is eventually elected and progress is made on a network that is quiet long enough, a post-run analyzer distinct from the safety invariants. A `checkFn` can only reject a *state*, and "this node has stopped being electable" or "this node refuses a vote it should grant" is not a bad state: it is a good event that never arrives. Until the general property exists, every liveness property the module relies on needs its own event-shaped test (drive the cluster into the situation, advance time or deliver the next message, and assert the good thing happens). Two exist (the step-down regressions); the general property that would subsume them does not.
+- **Membership changes (§6):** wire `jointMajority` in: joint consensus, config-entry-takes-effect-when-appended-not-committed, the new-leader-commits-a-no-op-first precondition, fuzzed membership churn in the harness. A config change that removes this node from the voter set is another `role = .follower` site and must go through `Node.becomeFollower` (or deliberately stop the timer).
+- **Log compaction / snapshotting (§7):** a user of hashicorp/raft or etcd/raft cannot run without it, the log grows without bound. Effort: large.
+- **Linearizable reads (ReadIndex / lease):** a user of a consensus library expects consistent reads without writing to the log. Effort: medium.
+- **A torn-Ready crash fault in the harness:** crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep, not only the unit tests, checks the persist-before-send order. Effort: medium.
 
 ## Anchoring
 
