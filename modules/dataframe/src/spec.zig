@@ -299,7 +299,8 @@ pub const JoinSpec = struct {
     /// written by `semi` / `anti` (every row is one kind there).
     indicator: ?[]const u8 = null,
     /// Check the key cardinality (pandas `validate`): `error.ValidationFailed` when a side
-    /// that must be unique repeats a key (a missing key counts as a key). polars'
+    /// that must be unique repeats a key (a missing key counts as a key, except under
+    /// `null_keys = .no_match`, where it equals nothing; a cross join is unique with one row). polars'
     /// `validate` names the same four shapes.
     validate: JoinValidate = .none,
     /// Appended to a left column whose name a kept right column also has (the left half of
