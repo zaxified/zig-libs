@@ -25,7 +25,7 @@
 //! tag (`runTag`: protocol, session id, `t`, `n`); a frame whose tag is not
 //! this run's is refused with `WrongSession`, so the frames of an aborted run
 //! cannot be replayed into the retry, nor keygen frames into a refresh
-//! (review 2026-10-03 F7: the Feldman, complaint and defense frames carried
+//! (review F7: the Feldman, complaint and defense frames carried
 //! no session binding of their own). Hand `handle` the frame as sent.
 //!
 //! **Early frames.** A frame for a later round (a fast peer's Πfac while we
@@ -52,13 +52,13 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const init_stack_burn = 192 * 1024;
 const start_stack_burn = 1984 * 1024;
 const handle_stack_burn = 768 * 1024;
 const advance_stack_burn = 1408 * 1024;
-// takeKeyShare: measured 367 B dirty in a mutation-schemata build (2026-11-17).
+// takeKeyShare: measured 367 B dirty in a mutation-schemata build.
 const take_key_share_stack_burn = 2 * 1024;
 
 const aux_info = tecdsa.aux_info;
@@ -391,7 +391,7 @@ pub const EcdsaKeygen = struct {
     /// 0 for a raw session id and 1 for a session id longer than 64 bytes
     /// replaced by its SHA-256 (every party does the same, so contexts
     /// agree). The form byte keeps a raw 32-byte session id from equalling
-    /// another session id's digest (review F8, 2026-10-03).
+    /// another session id's digest (review F8).
     fn context(self: *const EcdsaKeygen, buf: *[ctx_max]u8, index: u32) []const u8 {
         return keygenContext(buf, self.session_id, self.cfg.t, self.cfg.n, index);
     }
@@ -418,7 +418,7 @@ pub const EcdsaKeygen = struct {
     }
 };
 
-// ── run tag (review 2026-10-03 F7) ───────────────────────────────────────
+// ── run tag (review F7) ───────────────────────────────────────
 
 pub const run_tag_len = 16;
 pub const RunTag = [run_tag_len]u8;

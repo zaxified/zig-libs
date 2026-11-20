@@ -29,7 +29,7 @@
 //! wraps `Participant` with the rounds that exchange and prove every party's
 //! Paillier key and ring-Pedersen tuple (Πmod, Πprm, Πfac) and ends in a
 //! `threshold_ecdsa.KeyShare`. Jointly generated aux parameters remain out of
-//! scope (SPEC "Out of scope").
+//! scope (see the SPEC's "What is deliberately not done").
 //!
 //! **Status — COMPLETE.** The five irreducible GJKR functions in
 //! `core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
@@ -45,7 +45,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const assemble_key_shares_stack_burn = 80 * 1024;
 

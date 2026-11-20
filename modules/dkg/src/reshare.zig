@@ -81,7 +81,7 @@ const snapshot = @import("snapshot.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const receiver_init_stack_burn = 24 * 1024;
 const receiver_handle_stack_burn = 24 * 1024;
@@ -504,7 +504,7 @@ pub const ReshareReceiver = struct {
     /// `UnknownSender`. The two id spaces overlap numerically, so a bare id
     /// would let new party `j` pass a broadcast off as old dealer `j` (whose
     /// `B_0 = X_j` is public), win first-wins and get the honest dealer
-    /// excluded (review 2026-10-01, F7).
+    /// excluded (review, F7).
     pub fn handle(self: *ReshareReceiver, from: Sender, bytes: []const u8) MessageError!void {
         const result = handleUnburned(self, from, bytes);
         burn.stack(receiver_handle_stack_burn);
@@ -1910,7 +1910,7 @@ test "ReshareReceiver: each combination a run cannot produce is refused" {
     }
 }
 
-// ── whole-module mutation audit 2026-11-17: killing tests ───────────────
+// ── whole-module mutation audit: killing tests ───────────────
 
 test "ReshareConfig.validate: an invalid old committee, the new-threshold cap and its boundary" {
     const g = try commit.feldmanEvalShare(&Scalar.one);

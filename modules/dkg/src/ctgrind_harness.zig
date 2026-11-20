@@ -84,7 +84,7 @@
 //! directly as `ctgrind_result`.
 //!
 //! ⛔ It used to be driven through `Secp256k1.basePoint.mul` instead, and
-//! measuring that on 2026-09-09 showed the witness had swallowed the
+//! measuring that showed the witness had swallowed the
 //! subject: all FIVE contexts came from the witness (`pcMul16` via `mul`,
 //! this file's branch on `mul`'s error-union tag, `Element.fromPoint`, and
 //! the print), and NONE from `combineKeyShare`. Worse, the first and third
@@ -96,7 +96,7 @@
 //!
 //! ## A disputed claim round 2 already settled — do not re-derive it
 //!
-//! `threshold_ecdsa`'s own harness (round 2, 2026-09-09) measured and
+//! `threshold_ecdsa`'s own harness (round 2) measured and
 //! closed a triage claim that routing a secret-scalar `basePoint.mul`
 //! through `k256` instead of `std.crypto.ecc.Secp256k1` would remove a
 //! branch: it does not, because `k256`'s own `Secp256k1.mul`/`combMulBase`
@@ -261,7 +261,7 @@ fn runCombine(tainted: bool) !void {
     };
 
     // ⛔⛔ THE WITNESS USED TO OUTWEIGH THE SUBJECT. This printed `x_j * G`, and
-    // measuring that on 2026-09-09 showed all FIVE of this row's contexts came
+    // measuring that showed all FIVE of this row's contexts came
     // from the witness, none from `combineKeyShare`:
     //
     //   secp256k1.zig:408  pcMul16, via mul() at line 253   -> counted IN-FILE
@@ -328,7 +328,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 // )
 // declare -A PATTERN=(
 //     # VERIFIED against real `valgrind --tool=memcheck` logs for both
-//     # targets (2026-09-09, `t=2,n=3`, ReleaseFast). ⚠ `root[.]zig` here
+//     # targets (`t=2,n=3`, ReleaseFast). ⚠ `root[.]zig` here
 //     # is threshold_ecdsa's `root.zig` (`Element.fromPoint`/`.point()`),
 //     # NEVER dkg's own — dkg's own `root.zig` never appeared in either
 //     # target's log, but the basename collision is the same trap
@@ -341,7 +341,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 //     [dkg/combine]='dkg final combined share'
 // )
 //
-// Measured (ReleaseFast, 2026-09-09): coeffs total=98 (control=0, trap=0);
+// Measured (ReleaseFast): coeffs total=98 (control=0, trap=0);
 // combine total=2, in-file=0, witness=2, unattr=0 (control=0, trap=0).
 //
 // `combine` reached that number in two corrections, both of which were the

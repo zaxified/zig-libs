@@ -4,7 +4,7 @@
 //! secret (the two dealing polynomials, the shares sent and accepted, the
 //! output share), kept in the module per `CONVENTIONS.md` §9.
 //!
-//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! Method as `p256`'s `stackprobe_test.zig` (direct region,: the
 //! earlier "scan a local buffer at the call's depth" form was blind to the top
 //! few hundred bytes of the measured call): paint a stack region below the
 //! probe, run one call under a `PAD`-deep shim, snapshot the region and look for

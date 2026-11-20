@@ -74,7 +74,7 @@ const snapshot = @import("snapshot.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const init_stack_burn = 24 * 1024;
 const init_with_polynomials_stack_burn = 24 * 1024;
@@ -1744,7 +1744,7 @@ test "fuzz: Participant.handle never panics, in any round" {
     try std.testing.fuzz({}, fuzzParticipantSmith, .{ .corpus = seeds.items });
 }
 
-// ── whole-module mutation audit 2026-11-17: killing tests ───────────────
+// ── whole-module mutation audit: killing tests ───────────────
 
 test "initWithPolynomials refuses an invalid config, no honest majority, a bad index and wrong polynomial lengths" {
     const allocator = testing.allocator;

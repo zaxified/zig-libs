@@ -44,7 +44,7 @@ pub const Kind = enum(u8) {
     /// Point-to-point.
     ecdsa_fac_proof = 33,
     /// `EcdsaRefresh` key confirmation: SHA-256 over the public part of the
-    /// party's new `KeyShare` (review 2026-10-03 F6). Broadcast.
+    /// party's new `KeyShare` (review F6). Broadcast.
     ecdsa_confirm = 34,
 };
 
@@ -106,7 +106,7 @@ pub const MessageError = error{
     DuplicateMessage,
     /// The frame's run tag is not this run's (`EcdsaKeygen`, `EcdsaRefresh`):
     /// a frame of another session or of the other protocol, replayed or
-    /// misrouted (review 2026-10-03 F7).
+    /// misrouted (review F7).
     WrongSession,
     /// Well-formed but refers to something that does not exist: a defense
     /// nobody complained about, a Feldman broadcast from a disqualified dealer.

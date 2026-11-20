@@ -35,7 +35,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const verify_pedersen_share_stack_burn = 24 * 1024;
 const verify_feldman_share_stack_burn = 24 * 1024;
@@ -349,7 +349,7 @@ test "computeQual: undefended complaint, >t distinct complainers, dedup, EmptyQu
     }, &.{ false, false, false, false }));
 }
 
-// Whole-module mutation audit 2026-11-17: the guards the drivers never reach.
+// Whole-module mutation audit: the guards the drivers never reach.
 test "computeQual: an accused id outside 1..n is ignored, and dedup is per accused dealer" {
     const testing = std.testing;
     const cfg: Config = .{ .t = 2, .n = 4 };

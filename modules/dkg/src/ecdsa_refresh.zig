@@ -29,7 +29,7 @@
 //! .done        `takeKeyShare()`
 //! ```
 //!
-//! **Key confirmation** (review 2026-10-03 F6). Agreement on the new key
+//! **Key confirmation** (review F6). Agreement on the new key
 //! table and commitments used to rest on the transport's reliable broadcast
 //! alone: a transport that showed one party a different announcement or
 //! dealer set left honest parties holding shares that do not fit together —
@@ -52,7 +52,7 @@
 //! (`ecdsa_keygen.keygenContext`), so a refresh needs a session id no other
 //! run used, and every frame carries the run tag (`ecdsa_keygen.runTag`,
 //! protocol `refresh`): frames of another run or of a keygen are refused
-//! with `WrongSession` (review 2026-10-03 F7). Transport duties are as in
+//! with `WrongSession` (review F7). Transport duties are as in
 //! keygen: reliable broadcast, authenticated senders, confidential
 //! point-to-point frames.
 
@@ -66,13 +66,13 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64,; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const init_stack_burn = 192 * 1024;
 const start_stack_burn = 1984 * 1024;
 const handle_stack_burn = 768 * 1024;
 const advance_stack_burn = 1408 * 1024;
-// takeKeyShare: measured 367 B dirty in a mutation-schemata build (2026-11-17).
+// takeKeyShare: measured 367 B dirty in a mutation-schemata build.
 const take_key_share_stack_burn = 2 * 1024;
 
 const aux_info = tecdsa.aux_info;
@@ -86,7 +86,7 @@ pub const InitError = reshare.DealerInitError || reshare.ReceiverInitError || er
 pub const StartError = error{
     WrongRound,
     /// This party's new aux material repeats a modulus or the message key of
-    /// the old table: the refresh would renew nothing (review 2026-10-03 F14).
+    /// the old table: the refresh would renew nothing (review F14).
     StaleAuxMaterial,
 } || tecdsa.aux_proofs.ProveError || aux_info.Announcement.AllocError;
 pub const AdvanceError = error{
@@ -676,7 +676,7 @@ fn runAll(comptime P: type, allocator: std.mem.Allocator, parties: []P, drop: ?*
 
 /// In the confirmation round every other round's frame is out of round; a
 /// confirmation of the wrong length is Malformed, a second one a duplicate
-/// (mutation audit 2026-11-17).
+/// (mutation audit).
 fn confirmGuards(allocator: std.mem.Allocator, p: *EcdsaRefresh, peers_confirmed: bool) !void {
     const peer: u32 = p.me % 3 + 1;
     var list: std.ArrayList(Outgoing) = .empty;
