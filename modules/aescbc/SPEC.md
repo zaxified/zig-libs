@@ -22,9 +22,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `crypto/cipher`](https://pkg.go.dev/crypto/cipher) (`NewCBCEncrypter`/`NewCBCDecrypter`) — **reference** | Go | BSD-3-Clause *(Go project licence, inferred)* | — | Go stdlib | Incremental CBC objects (`CryptBlocks` chained across calls, `SetIV`), in-place operation, any `cipher.Block` incl. AES-192; no padding, no CTS. Here: `Encryptor`/`Decryptor` (same shape), in place, AES-128/192/256. `zig build bench-aescbc` (2026-10-16): 0.19–0.83× (Go's decrypt is not pipelined, 4.7× slower than ours on 16 KiB). |
+| [Go `crypto/cipher`](https://pkg.go.dev/crypto/cipher) (`NewCBCEncrypter`/`NewCBCDecrypter`) — **reference** | Go | BSD-3-Clause *(Go project licence, inferred)* | — | Go stdlib | Incremental CBC objects (`CryptBlocks` chained across calls, `SetIV`), in-place operation, any `cipher.Block` incl. AES-192; no padding, no CTS. Here: `Encryptor`/`Decryptor` (same shape), in place, AES-128/192/256. `zig build bench-aescbc` (figures: the card's Performance line; Go's decrypt is not pipelined, 4.7× slower than ours on 16 KiB). |
 | [RustCrypto/block-modes](https://github.com/RustCrypto/block-modes) (`cbc` 0.2.1, `cts`) | Rust | MIT OR Apache-2.0 (README + Cargo.toml) | 96 | push 2026-08-21, no GitHub releases | Generic over any block cipher, stateful encryptor and decryptor, in-place buffers; padding is a type parameter (PKCS#7, zero, ANSI X9.23, ISO 10126, ISO 7816, none) *(padding list inferred from the `cipher` crate)*; `cts` crate: CS1/CS2/CS3. Here: all six paddings (one-shot helpers + `StreamEncryptor`/`StreamDecryptor`), CS1/CS2/CS3. |
-| [openssl/openssl](https://github.com/openssl/openssl) (`EVP_aes_*_cbc`, `AES-*-CBC-CTS`) — **fastest** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29); measured 3.5.5 | Streaming `EVP_Cipher*` API over any chunk length, PKCS#7 on by default (constant-time-ish unpad *(inferred)*), AES-128/192/256, AES-NI with an 8-wide pipelined decrypt; CTS as a provider cipher (`cts_mode` CS1/CS2/CS3). Here: `StreamEncryptor`/`StreamDecryptor` (Update/Final shape), CTS byte-equal in all three variants (bench interop). Bench: 0.33–1.03× (level on bulk work, ahead on small messages, where EVP's per-call dispatch dominates). |
+| [openssl/openssl](https://github.com/openssl/openssl) (`EVP_aes_*_cbc`, `AES-*-CBC-CTS`) — **fastest** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29); measured 3.5.5 | Streaming `EVP_Cipher*` API over any chunk length, PKCS#7 on by default (constant-time-ish unpad *(inferred)*), AES-128/192/256, AES-NI with an 8-wide pipelined decrypt; CTS as a provider cipher (`cts_mode` CS1/CS2/CS3). Here: `StreamEncryptor`/`StreamDecryptor` (Update/Final shape), CTS byte-equal in all three variants (bench interop). Bench (figures: the card's Performance line): level on bulk work, ahead on small messages, where EVP's per-call dispatch dominates. |
 | Zig `std.crypto` (0.16.0) | Zig | MIT | — | Zig 0.16.0 | AES-128/256 block cipher and `modes.ctr` only — verified: `lib/std/crypto/modes.zig` has `ctr`/`ctrSlice`, no CBC; no AES-192. `cbc_mac.zig` is CBC-MAC, not encryption. |
 
 Zig ecosystem: a GitHub search for Zig repositories on "aes cbc" returned only an unrelated
@@ -33,18 +33,15 @@ one-star crypto grab-bag (`Jesssullivan/zig-crypto`, licence "Other", not read).
 **Where we are ahead:** the only pure-Zig CBC; every unpadder measured branch-free under ctgrind
 (one context each, the accept/reject verdict the API returns anyway) with a documented
 padding-oracle posture; no allocation; 3–5× OpenSSL's speed on 64-byte messages. **Where we are
-behind:** nothing a user of the three would notice. Not taken (deliberately): Go's "any
-`cipher.Block`" (this module is AES-only by name; the comptime `Aes` parameter takes any type with
-std's `initEnc`/`initDec` shape, so another 16-byte cipher plugs in without a code change), and
-RustCrypto's other block modes (CFB, OFB, IGE, PCBC — separate modules' business; CTR is
-`std.crypto.core.modes.ctr`).
+behind:** nothing a user of the three would notice. Not taken: Go's "any `cipher.Block`" and RustCrypto's other block modes (CFB, OFB, IGE, PCBC); see
+*What is deliberately not done*.
 
 Raw AES-CBC (NIST SP800-38A §6.2) over `std.crypto.core.aes`'s
 `Aes128`/`Aes256`, plus the two padding schemes this repo's consumers need.
 `std.crypto.core.aes` (Zig 0.17) ships the AES block cipher but no CBC mode (`modes.zig` has `ctr`/`ctrSlice` only);
 CBC had been hand-rolled independently in `xmlenc` (XML-Encryption content
 decryption) and `jwe` (`AxxxCBC-HSxxx`, RFC 7518 §5.2). This module is the
-single extracted core both now build on (see Status).
+single extracted core both build on; `jwe`, `xmlenc`, `megolm`, `rsa` and `keycodec` import it.
 
 ## API
 
@@ -92,7 +89,7 @@ output). Decryption has no such chain through the cipher, so `decrypt`, `Decrypt
 current x86-64) through `decryptWide` per step — the pipelining OpenSSL's `aesni_cbc_encrypt`
 does, and the reason Go's per-block decrypt is 4.7× slower (*Performance*). The keyed one-shot
 entry points (`encrypt`, `decrypt`, the CTS pair) run under a measured dead-stack burn (1 KiB,
-CTS 1.5 KiB); `initInto` and `update` under 512 B (`src/burn.zig`, `stackprobe_test.zig`). Code
+CTS 1.5 KiB); `initInto` under 512 B and `update` under 1 KiB (`src/burn.zig`, `stackprobe_test.zig`). Code
 that encrypts many messages under one key keeps an `Encryptor`/`Decryptor` (key schedule once,
 `setIv` per message): that is what the bench's `enc_N`/`dec_N` rows time.
 
@@ -190,8 +187,8 @@ the oracle on their own**:
 
 ## AES-192
 
-`std.crypto.core.aes` in Zig 0.17 exports only `Aes128`/`Aes256`. Since
-2026-10-10 the `aes192` module supplies `Aes192` with the same declarations
+`std.crypto.core.aes` in Zig 0.17 exports only `Aes128`/`Aes256`. The
+`aes192` module supplies `Aes192` with the same declarations
 (`key_bits`, `initEnc`, `initDec`, the contexts' `encrypt`/`decrypt`), and
 because this module is `comptime`-generic over the block-cipher type it takes
 it with no code change: `encrypt(aes192.Aes192, &key24, iv, …)`. aescbc does
@@ -199,15 +196,21 @@ not depend on `aes192` (only its tests do, through `test_deps`); a caller
 passes the type. Anchored by SP800-38A F.2.3/F.2.4 (below); the deterministic
 fuzz harness draws AES-192 for a third of its inputs.
 
-## Validation
+## Verification
+
+Run with `scripts/modtest aescbc`; the deterministic fuzz drivers run as `AESCBC_FUZZ` (never `zig build --fuzz`).
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Constant time:** ctgrind harness `src/ctgrind_harness.zig` over the five unpadders (one in-file context each, the accept/reject verdict the API returns anyway; 0 for `unpadZero`); rows in the card's Hardening line.
+- **Bench:** `zig build bench-aescbc` (`tools/bench.zig`, Go `crypto/cipher` and OpenSSL as foreign sides).
 
 - **Byte-exact vs. NIST SP800-38A**, both directions:
   - Appendix F.2.1 (AES-128-CBC) — encrypt and decrypt, byte-exact.
   - Appendix F.2.3/F.2.4 (AES-192-CBC, over `aes192.Aes192`) — encrypt and
     decrypt, byte-exact (re-checked against OpenSSL 3 `aes-192-cbc`).
   - Appendix F.2.5 (AES-256-CBC) — encrypt and decrypt, byte-exact (same
-    vector transcribed in `ctap2pin/src/kat_vectors.zig`; `xmlenc` no longer
-    carries its own copy and relies on this module's, which stays zero-dep).
+    vector transcribed in `ctap2pin/src/kat_vectors.zig`; `xmlenc`
+    relies on this module's copy, which stays zero-dep).
 - Raw-CBC edge cases: rejects non-block-aligned input/output on both
   directions, rejects an undersized `out` buffer, round-trips an empty
   message and a multi-block message.
@@ -241,14 +244,6 @@ fuzz harness draws AES-192 for a third of its inputs.
   module's `encrypt` byte-for-byte, so a future edit here that silently
   diverges from that shape gets caught.
 
-## Status
-
-`extract` — implemented and tested, both Debug and `-Doptimize=ReleaseFast`.
-Zero dependencies (std-only). `jwe` (`src/enc.zig`), `xmlenc` and `megolm`
-(`src/cipher.zig`) import it; their hand-rolled CBC loops are gone, and their
-byte-exact KATs (RFC 7518 Appendix B for `jwe`, NIST SP800-38A + the SAML
-round-trip suite for `xmlenc`) now run through this module.
-
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL
@@ -258,25 +253,17 @@ round-trip suite for `xmlenc`) now run through this module.
 
 **What the tests actually contain.** NIST SP800-38A Appendix F.2.5 byte-exact vector in kat_vectors.zig
 
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **17 mutants, all killed after one test**. Points: both modes' alignment and buffer
-checks and chaining value, `paddedLenPkcs7`, `padPkcs7`'s buffer, and every `unpadPkcs7` /
-`unpadXmlEnc` rule (empty, unaligned, pad 0, pad > 16, which bytes are compared and against
-what). No defect. Gap closed: the "pad length > block_len" test set only the last octet to 0x11,
-so the byte comparison refused it too and `n > block_len` was unpinned (`n > 17` survived) — a
-whole block of 0x11 is now refused by both unpadders.
-
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aescbc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.20–0.77×, fastest 1.20×, against 0.19–0.83× before (bench repeated after the fix: the CTS rows (OpenSSL only: Go has no CTS) now count for `fastest`, not for the Go ratio — since `benchkit` (2026-10-17) they had gone into it, so the first 0.17 run read ref 0.21–1.21×). The card carries these figures.
+`zig build bench-aescbc` (`tools/bench.zig`) against Go `crypto/cipher` and OpenSSL EVP, ReleaseFast; the card's Performance line carries the figures (the CTS rows count against OpenSSL only: Go has no CTS).
+
+## What is deliberately not done
+
+- **Any `cipher.Block` (Go) / any block cipher type (RustCrypto).** The module is AES-only by name; the comptime `Aes` parameter takes any type with std's `initEnc`/`initDec` shape, so another 16-byte cipher plugs in without a code change.
+- **CFB, OFB, IGE, PCBC** (RustCrypto's other block modes): separate modules' business; CTR is `std.crypto.core.modes.ctr`.
+- **A `padXmlEnc`.** `xmlenc` only decrypts; an encoder can use `padPkcs7`, a valid instance of the looser XML-Enc scheme.
 
 ## Backlog / deferred
 
-- **CTS encrypt 1.20× OpenSSL** *(bench 2026-10-20, `cts_enc_1000`; `cts_dec_1000` 0.98×)*: the one-shot `encryptCts` pays the key expansion and a 1536-byte burn per call over a latency-bound CBC chain (63 blocks); OpenSSL's provider path is ~200 ns cheaper per call. Counts for `fastest` only (Go has no CTS), so it blocks P1, not P2. Candidates: a smaller burn sized to the body, or a keyed CTS context.
-- ~~**(survey 2026-09-30) Incremental CBC state**~~ — done 2026-10-16: `Encryptor`/`Decryptor`, plus `StreamEncryptor`/`StreamDecryptor` for any chunk length.
-- ~~**(survey 2026-09-30) Further padding schemes**~~ — done 2026-10-16: ANSI X9.23, ISO 10126, ISO/IEC 7816-4, zero.
-- ~~**Ciphertext stealing**~~ — done 2026-10-16 (CS1/CS2/CS3; found missing against OpenSSL 3 and RustCrypto `cts` at the S2 pass).
-- **Mutation run over the 2026-10-16 code** (CTS, streaming, the three new unpadders, the wide decrypt) — the 2026-10-05 run predates it; the fuzz harnesses carry those paths today (`Audit` src stays `?`).
-- ~~**AES-192**~~ — done 2026-10-10: pass `aes192.Aes192`; see *AES-192*.
+- **CTS encrypt is 1.20× OpenSSL** (`cts_enc_1000`; `cts_dec_1000` is 0.98×): the one-shot `encryptCts` pays the key expansion and a 1536-byte burn per call over a latency-bound CBC chain (63 blocks); OpenSSL's provider path is ~200 ns cheaper per call. Counts for the card's `fastest` figure only (Go has no CTS), so it blocks P1, not P2. Candidates: a smaller burn sized to the body, or a keyed CTS context.
+- **Mutation run over the CTS, streaming, the three newer unpadders and the wide decrypt.** The card's whole-module run predates them; the fuzz harnesses carry those paths meanwhile (the card's `src` stays `?`).

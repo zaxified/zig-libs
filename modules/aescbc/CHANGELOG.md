@@ -5,12 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `Stream.maxUpdateLen`, `paddedLenPkcs7` and `paddedLenZero` saturate instead of wrapping for a size near `maxInt(usize)` (pad functions then answer `BufferTooSmall`); the `pad*` functions accept `out` overlapping `msg` (in-place padding panicked in `@memcpy`, UB in ReleaseFast). Tests: `src/sweep_test.zig`.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** the four rejecting unpadders (`unpadPkcs7`, `unpadXmlEnc`/`unpadIso10126`, `unpadAnsiX923`, `unpadIso7816`) take their single accept/reject branch through `rejectIf`, an empty-asm barrier on the folded flag. Zig 0.17 / LLVM had split `unpadIso7816`'s `if (invalid != 0)` into two jumps (one per failure reason: wrong marker, no marker) when inlined into the ctgrind harness's `main` (6 contexts / 2 in-file, was 5 / 1 on 0.16); with the barrier 5 / 1 again in that same harness shape. Results unchanged, checked against a branchy reference on structured and random last blocks (new test) and at comptime. ctgrind harness: one `noinline` instance per stripper, because 0.17 tail-merged the inlined pkcs7/x923 verdicts into one jump DWARF reports at `ctgrind_harness.zig:0` (in-file 0, an unattributed context).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged). Examples/tools ported to Zig 0.17.0 (bench enum loop -> `field_names`/`field_values`).
@@ -30,7 +26,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `SPEC.md` § "Mutation run 2026-10-05"): a whole block of 0x11 (pad 17) is refused. No source
   change.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, plus a measured note on `unpadPkcs7`. The 2026-09-09 ctgrind coverage pass had filed this module as a thin wrapper over `std` whose harness would measure `std` rather than us; that was wrong — `unpadPkcs7`/`unpadXmlEnc` strip padding from a just-decrypted buffer, so the length byte `N` is secret-derived, and the module states its own constant-time property about them. Measured ReleaseFast with the WHOLE padded buffer marked undefined: **1 in-file context per target**, at `root.zig`'s `if (invalid != 0)` — the accept/reject decision the function returns to its caller anyway. ⭐ The scan loop contributes **0**, so there is no early exit and no distinct signal per failure reason, which is exactly what the doc comment claimed. Both targets carry an untainted control row and a no-`-fvalgrind` trap row, both 0. ⚠ Measured rather than reviewed because the same `@intFromBool`/`u1` idiom did NOT survive the compiler in `fss` (`dpf.zig:326`).
 
 - **2026-09-07** — Fuzz: `fuzzUnpad` had never executed one of its assertions.
   It drew `valueRangeAtMost(u16, 0, 512)` *before* the bytes, and a ranged draw
