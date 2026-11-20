@@ -35,16 +35,16 @@
 //!   `nack`.
 //! - **monotonic** (`MonoClock`, `u64` ns) drives *lease expiry*: a dequeued
 //!   job is invisible until either acked or its visibility timeout lapses.
-//!   `std` has no `time.timestamp` in 0.16, so the OS defaults go straight
-//!   through `clock_gettime` (posix); both are injectable.
+//!   The OS defaults come from the repo's `clock` module
+//!   (`realtimeNs`/`monotonicNs`); both are injectable.
 //!
 //! ## Delivery model (honesty note)
 //!
 //! This is **at-least-once**. A lease is an *in-memory*, single-process
 //! reservation (there is no cross-process lock in `kv`); a crash re-exposes
 //! every un-acked job as ready on the next `open`. Make your consumer
-//! idempotent. See the DEFER list at the bottom of this doc comment for the
-//! full set of v1 non-goals.
+//! idempotent. See `SPEC.md` "What is deliberately not done" for the
+//! full set of non-goals.
 
 const std = @import("std");
 const clock_lib = @import("clock");
@@ -79,8 +79,8 @@ pub const WallClock = struct {
     ctx: ?*anyopaque = null,
     nowFn: *const fn (?*anyopaque) i64,
 
-    /// The OS wall clock (`CLOCK_REALTIME` via posix `clock_gettime`) — the
-    /// production default. `std` has no `time.timestamp` in 0.16.
+    /// The OS wall clock (`CLOCK_REALTIME`, via the `clock` module) — the
+    /// production default.
     pub const system: WallClock = .{ .nowFn = systemNowNs };
 
     pub fn now(c: WallClock) i64 {
