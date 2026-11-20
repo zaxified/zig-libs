@@ -5,7 +5,7 @@ canonical implementation that had previously accreted three times independently 
 (`jwe`'s `A128KW`/`A256KW`, `dnp3`'s SAv2 session-key wrap, `xmlenc`'s `kw-aes128`/`kw-aes256`
 unwrap) into one place. No allocation, no panics, no deps beyond `aes192` — every buffer is caller-supplied.
 
-- **Model after:** RFC 3394 (AES Key Wrap).
+- **Model after:** RFC 3394 (AES Key Wrap) and RFC 5649 (with padding); RustCrypto `aes-kw` as the reference.
 - **Platform:** any. **Role:** crypto primitive. **Concurrency:** reentrant (no shared state, no
   allocation). **Deps:** `aes192` (the 24-byte KEK arm; AES-128/256 are `std.crypto.core.aes`).
 

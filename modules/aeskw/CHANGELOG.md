@@ -5,17 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe covers `wrapPad` / `unwrapPad` (no KEK or key-data
-  residue, ReleaseFast).
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** a fuzz harness for `unwrapPad` (genuine, flipped, wrong KEK, truncated,
-  damaged, small buffer; AESKW_PAD_FUZZ driver, 200,000 runs clean).
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind harness also drives `wrapPad` / `unwrapPad` / a tampered
-  `unwrapPad` (12 in-file contexts: each integrity verdict, accept and reject, per KEK size); ct-compare pin 2.
 - **2026-11-16** — New: `wrapPad`/`unwrapPad`, RFC 5649 AES Key Wrap with Padding (any key length 1..2^32-1, AIV `A65959A6 || MLI`, n = 1 single-block case, all three KEK widths); `unwrapPad` folds the AIV/MLI/zero-padding checks into one constant-time verdict and wipes `out` on failure; empty plaintext is `error.InvalidLength`. RFC 5649 §6 KATs, round trip over 1..64 bytes, negative tests. `wrap`/`unwrap` share the recurrence core but are byte-for-byte unchanged. Fuzz/ctgrind/stackprobe harness rows for the new pair are not added yet.
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
 
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `AESKW_FUZZ` (`src/fuzz_test.zig`): `aeskw-unwrap` — a wrapped key (AES-128/192/256 KEK, 2-8 semiblocks) unwraps exactly; one flipped bit, another KEK, any truncation and a damaged copy are refused, every refusal leaves `out` all zero (no partial key material); unsupported KEK sizes and short buffers get their own errors. ReleaseSafe, clean.

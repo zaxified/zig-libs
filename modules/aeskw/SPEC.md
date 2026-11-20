@@ -21,16 +21,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [RustCrypto/key-wraps](https://github.com/RustCrypto/key-wraps) (`aes-kw` 0.3.1) — **reference** | Rust | MIT OR Apache-2.0 (Cargo.toml + README) | 12 | push 2026-09-02, no GitHub releases | README: "NIST AES-KW Key Wrap and AES-KWP Key Wrap with Padding modes", RFC 3394 and RFC 5649, KEK of 128/192/256 bits. This module: RFC 3394 only, KEK 128/192/256. |
+| [RustCrypto/key-wraps](https://github.com/RustCrypto/key-wraps) (`aes-kw` 0.3.1) — **reference** | Rust | MIT OR Apache-2.0 (Cargo.toml + README) | 12 | push 2026-09-02, no GitHub releases | README: "NIST AES-KW Key Wrap and AES-KWP Key Wrap with Padding modes", RFC 3394 and RFC 5649, KEK of 128/192/256 bits. This module: RFC 3394 and RFC 5649 (`wrap`/`unwrap`, `wrapPad`/`unwrapPad`), KEK 128/192/256. |
 | [openssl/openssl](https://github.com/openssl/openssl) (`id-aes*-wrap`, `-wrap-pad`) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | Both KW and KWP, all KEK sizes *(inferred from OpenSSL's cipher list)*. |
 | [go-jose/go-jose](https://github.com/go-jose/go-jose) (internal A128KW/A192KW/A256KW) | Go | Apache-2.0 | 536 | v4.1.5 (2026-09-03) | Key wrap only as part of JWE, not a reusable API *(inferred)*. |
 | [NickBall/go-aes-key-wrap](https://github.com/NickBall/go-aes-key-wrap) | Go | MIT | 11 | push 2017-09-29 (unmaintained) | Standalone RFC 3394 `Wrap`/`Unwrap` for Go; last touched 2017. Go's stdlib has no key wrap. |
 | Zig `std.crypto` (0.16.0) | Zig | MIT | — | Zig 0.16.0 | No AES key wrap (verified: `lib/std/crypto/` lists `aes_siv`, `aes_gcm`, `aes_ccm`, `aes_ocb`, no `kw`); no AES-192. |
 
 **Where we are ahead:** the only pure-Zig AES-KW; constant-time integrity check, scratch
-zeroization on failure, zero-alloc caller-supplied buffers. **Where we are behind:** RFC 5649
-KWP shipped 2026-11-16 (`wrapPad`/`unwrapPad`, see *Scope*). (The 192-bit KEK gap closed 2026-10-10 via the
-`aes192` module.)
+zeroization on failure, zero-alloc caller-supplied buffers. **Where we are behind:** nothing against the
+reference's functions (KW and KWP, all three KEK widths); no speed figure is recorded (the card's
+Performance line).
 
 RFC 3394 AES Key Wrap. Usage: see ./README.md.
 
@@ -39,7 +39,7 @@ RFC 3394 AES Key Wrap. Usage: see ./README.md.
 - **RFC 3394** (the unpadded "AES Key Wrap" construction, §2.2.1 wrap / §2.2.2 unwrap /
   §2.2.3.1 default IV): `wrap`/`unwrap`. `plaintext`/recovered key data is a multiple of 8
   bytes, >= 16 (>= 2 semiblocks) — the RFC's own domain.
-- **RFC 5649 (AES Key Wrap with Padding)** — `wrapPad`/`unwrapPad` (2026-11-16): key data of
+- **RFC 5649 (AES Key Wrap with Padding)** — `wrapPad`/`unwrapPad`: key data of
   1..2^32-1 bytes, zero-padded to 8n, IV = `A65959A6 || MLI` (32-bit big-endian length). n = 1
   is one AES block encryption/decryption (no recurrence); n >= 2 shares the RFC 3394 core with
   `wrap`/`unwrap`. `unwrapPad` takes an `out` of `ciphertext.len - 8` bytes (the padded size),
@@ -49,9 +49,8 @@ RFC 3394 AES Key Wrap. Usage: see ./README.md.
   Anchored on RFC 5649 §6 (20-byte and 7-byte key data, 192-bit KEK).
 - **KEK width: AES-128 (16-byte), AES-192 (24-byte) and AES-256 (32-byte).** Anything else
   returns `error.UnsupportedKeyLength`. Zig 0.17's `std.crypto.core.aes` ships only
-  `Aes128`/`Aes256` (`aes.zig:27-28`); the 24-byte arm of `encBlock`/`decBlock` runs on the sibling `aes192`
-  module (own FIPS-197 key expansion over std's round primitive, same constant-time posture),
-  added 2026-10-10. Before that a 24-byte KEK was refused.
+  `Aes128`/`Aes256`; the 24-byte arm of `encBlock`/`decBlock` runs on the sibling `aes192`
+  module (own FIPS-197 key expansion over std's round primitive, same constant-time posture).
 
 ## Design & invariants
 
@@ -124,8 +123,7 @@ wrapped blob may arrive over an untrusted channel (SAv2 session-key change on th
 XML-Enc `EncryptedKey`, a JOSE `A128KW`/`A256KW` Encrypted Key) — `unwrap` never trusts the
 ciphertext's length or content, rejects malformed shapes before touching AES, and fails closed
 without a plaintext-derived timing or content leak. Not covered: key derivation/agreement (how
-the KEK itself was established — out of this module's scope, same posture as RFC 3394 itself),
-
+the KEK itself was established — out of this module's scope, same posture as RFC 3394 itself).
 
 ## Anchoring
 
@@ -134,19 +132,33 @@ the KEK itself was established — out of this module's scope, same posture as R
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 3394 wrap/unwrap KATs (README Provenance)
+**What the tests actually contain.** RFC 3394 §4.1–§4.6 KATs and RFC 5649 §6 KATs (listed in *Scope* and
+the README), each byte-exact in both directions.
 
-### Mutation run 2026-10-05
+## Verification
 
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **13 mutants, 12 killed, 1 equivalent**. Points: both length and alignment checks,
-the KEK-width check order, both buffer checks, the counter `t` in both directions and its byte
-order, the integrity check, and both output wipes. No defect. Gap closed: `wrap` with the
-`% 8` check removed wrapped 16 octets of a 17-octet key and left the 17th in the output in the
-clear — no test used an unaligned length ≥ 16; now 17/20/23/25 are refused. **Equivalent:** the
-wipe on a KEK-width error in `unwrap` (the output then holds only a copy of the ciphertext).
+- **Run:** `scripts/modtest aeskw`.
+- **Tests** (`src/root.zig`): the KATs above; unwrap failing closed (wrong KEK, single-bit-corrupted ciphertext:
+  `error.Unauthentic`, all-zero `out`, with a correct-KEK positive control); `wrapPad`/`unwrapPad` round trip
+  over 1..64 bytes at all KEK sizes and their refusals (tamper, wrong MLI, non-zero padding, bad lengths,
+  wiped output); length and KEK-width validation with positive controls at the boundaries; `wrap` refusing
+  key data that is not whole 64-bit blocks; `wrap` validating the KEK width before writing into `out`;
+  fuzz corpora with pinned counts.
+- **Fuzz:** testkit's deterministic driver, `AESKW_FUZZ` (`aeskw-unwrap`: round trip, flipped bit, other KEK,
+  truncation, damage, all with a zeroed `out` on refusal) and `AESKW_PAD_FUZZ` (`aeskw-unwrap-pad`), in
+  `src/fuzz_test.zig`, with reach checks in the ordinary test run.
+- **Constant time:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh aeskw`: KEK and wrapped key
+  tainted through `wrap`, `unwrap`, a tampered `unwrap` and the same three for `wrapPad`/`unwrapPad`, AES-128,
+  AES-192 and AES-256; every integrity verdict is taken after the constant-time compare.
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast only): no KEK or key-data residue after the four
+  functions (`burn.run` around each body).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Speed:** not measured; see the card's Performance line.
+
+## Open
+
+- `wrapPad`/`unwrapPad` were added after the last whole-module mutation run and have none of their own.
 
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-16: `wrapPad`/`unwrapPad` (RFC 5649, §6 KATs, all KEK widths, constant-time verdict, refuses empty plaintext). Fuzz (AESKW_PAD_FUZZ) and ctgrind (12 in-file) extended the same day; the stackprobe test for the padded pair too (ReleaseFast, no KEK / key-data residue). ~~**(survey 2026-09-30) RFC 5649 AES Key Wrap with Padding (`wrapPad`/`unwrapPad`)** — RustCrypto `aes-kw` and OpenSSL both ship it; it is what KMIP/PKCS#11/CMS key-wrap uses for key data that is not an 8-byte multiple. Additive on top of the existing core (see *Scope*). Effort: small–medium (alternative IV, padding, the n=1 single-block special case, KATs from RFC 5649 §6). Fits §2: yes.~~
-- ~~**AES-192 KEK** is blocked on `std` (no `Aes192`)~~ — done 2026-10-10 over the `aes192` module (RFC 3394 §4.2/§4.4 KATs, fuzz harnesses and ctgrind row extended to three KEK widths).
+None open.
