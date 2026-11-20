@@ -636,11 +636,34 @@ const CharIter = struct {
     }
 };
 
-/// Display columns of `text` (tabs aligned from column 0).
-fn lineWidth(text: []const u8, tab: usize) usize {
+/// Display columns of `text` (tabs aligned from column 0), reading no further
+/// than `cap` columns: the result is the exact width when that is below `cap`, else some value >= `cap`. For a
+/// caller that only needs to know how far a line reaches up to a bound.
+fn lineWidthAtLeast(text: []const u8, tab: usize, cap: usize) usize {
     var it: CharIter = .{ .text = text, .tab = tab };
-    while (it.next()) |_| {}
+    while (it.col < cap) {
+        _ = it.next() orelse break;
+    }
     return it.col;
+}
+
+/// The columns `s` takes once `writeEscaped` has written it: `\n` `\r` `\t`
+/// are 2, another C0 control, DEL and an invalid byte `\xNN` are 4, a C1
+/// control, U+2028/U+2029 and a bidirectional control `\u{NNNN}` are 8, any
+/// other character its `charWidth`.
+fn escapedWidth(s: []const u8) usize {
+    var it: CharIter = .{ .text = s, .tab = 0 };
+    var cols: usize = 0;
+    while (it.next()) |ch| {
+        cols += if (!ch.valid)
+            4
+        else switch (ch.cp) {
+            '\n', '\r', '\t' => 2,
+            0...8, 11, 12, 14...0x1f, 0x7f => 4,
+            else => if (isShownAsQuestion(ch.cp)) 8 else charWidth(ch.cp),
+        };
+    }
+    return cols;
 }
 
 /// The 1-based character column of the 1-based byte column `byte_col`
@@ -845,7 +868,9 @@ const Margin = struct {
     /// (the skipped columns are those before `left`, a wide character
     /// straddling it is skipped whole).
     fn window(m: Margin, text: []const u8, tab: usize) Window {
-        const line_len = lineWidth(text, tab);
+        // Nothing beyond `computed_right` (or the width `right` tests against)
+        // changes the window, so a longer line is not measured to its end.
+        const line_len = lineWidthAtLeast(text, tab, @max(m.computed_right, m.computed_left +| m.term_width) +| 1);
         const lft = m.left(line_len);
         const rgt = m.right(line_len);
         var w: Window = .{ .bs = text.len, .be = text.len, .cut_left = m.wasCutLeft(), .cut_right = line_len > rgt };
@@ -977,13 +1002,15 @@ const Layout = struct {
             var total: usize = 0;
             var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
             while (it.next()) |ch| {
-                if (ch.idx >= lend and ch.idx < win.be) total += ch.width;
+                if (ch.idx >= win.be) break;
+                if (ch.idx >= lend) total += ch.width;
             }
             var before: usize = 0;
             rstart = @min(win.be, text.len);
             it = .{ .text = text, .tab = l.opts.tab_width };
             while (it.next()) |ch| {
-                if (ch.idx < lend or ch.idx >= win.be) continue;
+                if (ch.idx >= win.be) break;
+                if (ch.idx < lend) continue;
                 // The last character that still leaves three columns after it.
                 if (total - before >= 3 and total - before - ch.width < 3) {
                     rstart = ch.idx;
@@ -1270,11 +1297,9 @@ fn computeMargin(labs: []const Lab, g: usize, src: *const Source, o: RenderOptio
     var span_left: usize = std.math.maxInt(usize);
     var span_right: usize = 0;
     var label_right: usize = 0;
-    var max_line_len: usize = 0;
     var cur = nextShown(labs, g, src, 0, o);
     while (cur) |ln| : (cur = nextShown(labs, g, src, ln + 1, o)) {
         const text = lineIn(src, ln) orelse continue;
-        max_line_len = @max(max_line_len, lineWidth(text, tab));
         var lead: usize = 0;
         while (lead < text.len and (text[lead] == ' ' or text[lead] == '\t')) lead += 1;
         if (lead < text.len) {
@@ -1291,7 +1316,8 @@ fn computeMargin(labs: []const Lab, g: usize, src: *const Source, o: RenderOptio
             if (l.sl == l.el or l.el == ln) {
                 span_left = @min(span_left, @min(a, b));
                 span_right = @max(span_right, @max(a, b));
-                label_right = @max(label_right, b + (if (l.msg.len > 0) lineWidth(l.msg, 4) + 1 else 0));
+                // The message is written escaped (`writeEscaped`), so its width is that of the escapes.
+                label_right = @max(label_right, b + (if (l.msg.len > 0) escapedWidth(l.msg) + 1 else 0));
             } else {
                 span_left = @min(span_left, a);
                 span_right = @max(span_right, a);
@@ -1301,7 +1327,17 @@ fn computeMargin(labs: []const Lab, g: usize, src: *const Source, o: RenderOptio
     }
     if (ws_left == std.math.maxInt(usize)) ws_left = 0;
     if (span_left == std.math.maxInt(usize)) span_left = 0;
-    return Margin.init(ws_left, span_left, span_right, label_right, @as(usize, term_width) -| code_offset, max_line_len);
+    // The longest shown line decides only whether it is wider than the window,
+    // so it is measured up to the left edge plus the width and no further.
+    const tw = @as(usize, term_width) -| code_offset;
+    const cap = Margin.init(ws_left, span_left, span_right, label_right, tw, 0).computed_left +| tw +| 1;
+    var max_line_len: usize = 0;
+    cur = nextShown(labs, g, src, 0, o);
+    while (cur) |ln| : (cur = nextShown(labs, g, src, ln + 1, o)) {
+        const text = lineIn(src, ln) orelse continue;
+        max_line_len = @max(max_line_len, lineWidthAtLeast(text, tab, cap));
+    }
+    return Margin.init(ws_left, span_left, span_right, label_right, tw, max_line_len);
 }
 
 // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/views.rs (RichDiagnostic::render: files, locus, gaps, border, notes)
@@ -3363,6 +3399,65 @@ test "term_width: a label message is measured in display columns, an all-blank l
     ,
         out,
     );
+}
+
+test "escapedWidth: the columns writeEscaped writes" {
+    try testing.expectEqual(@as(usize, 0), escapedWidth(""));
+    try testing.expectEqual(@as(usize, 3), escapedWidth("abc"));
+    try testing.expectEqual(@as(usize, 2 + 2 + 2), escapedWidth("\n\r\t"));
+    try testing.expectEqual(@as(usize, 4 * 3), escapedWidth("\x01\x7f\x1b"));
+    try testing.expectEqual(@as(usize, 8 * 3), escapedWidth("\u{85}\u{2028}\u{202e}"));
+    try testing.expectEqual(@as(usize, 4 + 4), escapedWidth("\xff\xc3")); // invalid bytes, a truncated sequence
+    try testing.expectEqual(@as(usize, 2 + 0), escapedWidth("\u{4e16}\xcc\x81")); // wide, combining mark
+    // The count is what the writer writes, character for character.
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "plain", "a\tb\n", "\x00\x1f\x7f", "\xc2\x85\xe2\x80\xa8", "\xff\xfe", "\xe2\x80\xaeend" }) |msg| {
+        var w = std.Io.Writer.fixed(&buf);
+        try writeEscaped(&w, msg);
+        try testing.expectEqual(w.buffered().len, escapedWidth(msg)); // no wide or zero-width characters here
+    }
+}
+
+fn sourceRow(out: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |l| if (std.mem.startsWith(u8, l, "1 |")) return l;
+    return "";
+}
+
+test "term_width: a label message with control characters is measured as written, not raw" {
+    const line100 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL";
+    var d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 41, .end_line = 1, .end_col = 45, .severity = .@"error", .code = "", .message = "m", .span_message = "\u{85}\u{85}\u{85}\u{85}\u{85}" };
+    const esc = try snipOf(line100 ++ "\n", d, .{ .term_width = 40 });
+    defer testing.allocator.free(esc);
+    // Written, the message is 40 columns (`\u{0085}` five times): the window is the one a plain 40-column message gets.
+    d.span_message = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const plain = try snipOf(line100 ++ "\n", d, .{ .term_width = 40 });
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings(sourceRow(plain), sourceRow(esc));
+    // …and it differs from the window a 5-column message gets (the raw count it was given before).
+    d.span_message = "xxxxx";
+    const raw3 = try snipOf(line100 ++ "\n", d, .{ .term_width = 40 });
+    defer testing.allocator.free(raw3);
+    try testing.expect(!std.mem.eql(u8, sourceRow(raw3), sourceRow(esc)));
+}
+
+test "term_width: how long the line is beyond the window does not change the output" {
+    const head = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL";
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 41, .end_line = 1, .end_col = 45, .severity = .@"error", .code = "", .message = "m", .span_message = "msg", .labels = &.{
+        .{ .line = 1, .col = 60, .end_line = 1, .end_col = 62, .message = "other" },
+    } };
+    var short_line: [200]u8 = undefined;
+    var long_line: [30000]u8 = undefined;
+    @memcpy(short_line[0..head.len], head);
+    @memset(short_line[head.len..], 'q');
+    @memcpy(long_line[0..head.len], head);
+    @memset(long_line[head.len..], 'q');
+    const a = try snipOf(&short_line, d, .{ .term_width = 40 });
+    defer testing.allocator.free(a);
+    const b = try snipOf(&long_line, d, .{ .term_width = 40 });
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
+    try testing.expect(std.mem.indexOf(u8, a, "...") != null);
 }
 
 test "colour: hanging labels draw their pointers in the label's own colour and reset after the carets" {

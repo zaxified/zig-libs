@@ -90,7 +90,7 @@ caller's responsibility, not this module's.
 
 - Without `Source.line_starts`, `lineIn` scans `text` from the top for every quoted line, so huge context-line options or many diagnostics (`fromLsp` / `writeLspArray`) over a large file cost O(lines × text). Documented on `line_starts`, which makes it O(1); building the index lazily would need an allocator the renderers do not take.
 - `caretPointers` is up to 64 × 64 × line length for one multi-MB line carrying 64 labels with `term_width = null`: linear in the input with a large constant; not measured.
-- The `term_width` cut path walks the whole line (a 100 KB line costs about 3x annotate-snippets; see Backlog).
+- The `term_width` cut path measures a line only as far as the window needs (up to its right edge, so a line a megabyte long costs no more than one a window wide beyond the cut); the columns before the window are still walked, as a byte-to-column map needs them. A label message counts as written (`writeEscaped`'s escapes: 2, 4 or 8 columns for a control character), not as its raw bytes.
 
 ## Verification
 
@@ -113,10 +113,8 @@ Run: `scripts/modtest diagnostics`. The module has no fuzz obligation (the card'
 
 ## Backlog / deferred
 
-- **R15: the `term_width` cut path walks the whole line** (the bench info row: a 100 KB line costs about 3x annotate-snippets); scan only the window. Effort S.
 - **R11: diff-style suggestion rendering** (annotate-snippets `Patch`). Effort M. Marked `later` in the survey; the card's Scope line lists it as deliberately not done: the owner decides which holds.
 - **`end_col` without `end_line` / `line` without `col`:** the snippet renderer ignores the former (one caret) while `writeLsp` honours it, and a span with `line` but no `col` is one caret at column 1 in the snippet but the whole line in LSP. Align or document (LOW, no promise broken).
-- **`term_width` margin measures a label message raw:** a message with control characters (printed escaped, 2-6 columns each) can place the window a few columns off (LOW).
 - The sibling `json5` module intends to formalize its `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
 ## Anchoring
