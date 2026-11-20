@@ -15,6 +15,7 @@ const core = @import("core.zig");
 const dtype = @import("dtype.zig");
 const catfn = @import("catfn.zig");
 const lf = @import("listfn.zig");
+const textio = @import("textio.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -195,10 +196,12 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         m.* = try fm.NameIndex.init(a, t.columns);
         built += 1;
     }
-    for (frames) |t| {
+    for (frames, maps) |t, m| {
         try checkRows(t);
         total = std.math.add(usize, total, t.len) catch return error.TooLarge;
-        for (t.columns) |c| {
+        for (t.columns, 0..) |c, ci| {
+            // A name the frame repeats reads as its first column: the later ones are not looked at.
+            if (m.get(c.name).? != ci) continue;
             const gop = try names.getOrPut(a, c.name);
             if (!gop.found_existing) {
                 gop.value_ptr.* = c; // its type and inner columns
@@ -772,6 +775,8 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
         }
         if (sel.items.len == 0) for (0..f.columns.len) |i| try sel.append(a, i);
     }
+    // pandas: "Cannot describe a DataFrame without columns" (ValueError).
+    if (sel.items.len == 0) return error.BadArgument;
     const pcts = try describePercentiles(a, spec.percentiles);
     // Output cells: at most the eight fixed statistic rows plus one per percentile, for every
     // selected column and the label column.
@@ -1295,7 +1300,9 @@ pub const CutSpec = struct {
     include_lowest: bool = false,
 };
 
-pub const CutError = Error || error{BadEdges};
+/// `BadEdges`: see `cut`. `DuplicateColumn`: `out`, or `break_out`, is a name the frame has or
+/// the two are the same (polars' `DuplicateError`; pandas would overwrite).
+pub const CutError = Error || error{ BadEdges, DuplicateColumn };
 
 /// pandas' `cut(x, bins=n, retbins=True)` edges: `n + 1` ascending edges for the present
 /// numbers of `col`. `error.BadEdges` for `bins == 0`, no number, or a non-finite
@@ -1347,10 +1354,11 @@ fn roundFrac(x: f64, p: i32) f64 {
     return aroundEven(x, digits);
 }
 
+/// A bin edge as Python's `repr(float)` prints it (pandas' interval text): `2.0`, `1e-07`, `1e+300`.
 fn edgeText(a: std.mem.Allocator, x: f64) std.mem.Allocator.Error![]const u8 {
     if (std.math.isInf(x)) return if (x > 0) "inf" else "-inf";
-    const t = try a.print("{d}", .{x});
-    return if (std.mem.indexOfScalar(u8, t, '.') == null) try a.print("{s}.0", .{t}) else t;
+    var buf: [textio.max_float_len]u8 = undefined;
+    return a.dupe(u8, textio.formatFloat(&buf, x));
 }
 
 /// The texts pandas gives the bins: `(a, b]` / `[a, b)` of the rounded edges.
@@ -1384,9 +1392,13 @@ fn intervalLabels(a: std.mem.Allocator, e: []const f64, right: bool, include_low
 /// a label count that is not the bin count: `error.BadEdges`. The bins come from `edges`
 /// or, when empty, from `bins` (see `binEdges`, which also returns them: pandas'
 /// `retbins`). The output is the label text, the interval text (`interval_labels`) or the
-/// bin number; `break_out` adds the bin's right edge (polars `include_breaks`).
+/// bin number; `break_out` adds the bin's right edge (polars `include_breaks`). `labels`
+/// win over `interval_labels`, and `precision` is read only by `interval_labels` (pandas'
+/// `precision` likewise has no effect with `labels` given).
 pub fn cut(a: std.mem.Allocator, f: Frame, spec: CutSpec) CutError!Frame {
     const ci = try mustIndex(f, spec.col);
+    if (f.columnIndex(spec.out) != null) return error.DuplicateColumn;
+    if (spec.break_out) |b| if (f.columnIndex(b) != null or std.mem.eql(u8, b, spec.out)) return error.DuplicateColumn;
     // Interval texts (two prints per bin and the precision search) are built for every bin,
     // used or not: with `bins` as a count, bound them by the rows (or 4096 bins).
     if (spec.edges.len == 0 and spec.interval_labels and spec.labels.len == 0 and spec.bins > @max(f.len, 4096)) return error.TooLarge;
@@ -1627,7 +1639,9 @@ fn binOf(breaks: []const Value, x: Value, right_closed: bool) u32 {
 
 fn compatible(col_type: ColumnType, v: Value) bool {
     return switch (v) {
-        .int, .float => numericType(col_type),
+        .int => numericType(col_type),
+        // A float breakpoint declares no instant or span: a timestamp or duration takes int ones.
+        .float => col_type == .int or col_type == .float,
         .text => col_type == .text or col_type == .date,
         else => false,
     };
@@ -1640,8 +1654,9 @@ fn compatible(col_type: ColumnType, v: Value) bool {
 /// derived breakpoints are rounded to the side that keeps the bins' integers those of the
 /// exact ones (up for `[a, b)`, down for `(a, b]`, in exact arithmetic), for a float column
 /// they are floats. The column is `int`, `float`, `timestamp`, `duration`, `date` or `text`
-/// (a count needs a numeric one); breakpoints must be non-decreasing and of the column's
-/// kind (`error.BadEdges`). Null and NaN cells (the module's one missing rule; polars bins
+/// (a count needs a numeric one, with finite extremes: else `error.BadEdges`); breakpoints
+/// must be non-decreasing and of the column's kind (`error.BadEdges`; a timestamp or duration
+/// takes int breakpoints, a float one is refused). Null and NaN cells (the module's one missing rule; polars bins
 /// a NaN last) give null. A result of `include_intervals` is a record column. Bins are capped
 /// at `max_bins` (`error.TooLarge`). Unlike `cut` there is no pandas finite-range edge: the
 /// outer bins are open.
@@ -1688,6 +1703,8 @@ fn binIntervalsImpl(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinE
                 if (dtype.isFloat(ty) or mn != .int or mx != .int) {
                     const lo = mn.asFloat() orelse return error.NotOrderable;
                     const hi = mx.asFloat() orelse return error.NotOrderable;
+                    // An infinite extreme has no equal-width bins (they would all be NaN).
+                    if (!std.math.isFinite(lo) or !std.math.isFinite(hi)) return error.BadEdges;
                     o.* = .{ .float = lo + (hi - lo) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n)) };
                 } else {
                     // (min * (n - i) + max * i) / n in exact arithmetic, rounded as the bin side asks.
