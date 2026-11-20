@@ -10,7 +10,7 @@ shell-outs, no `wpa_supplicant` linkage, no libc.
   information-element formats. `iw` was used **only as a black-box capture
   oracle** under `strace` — its requests are the byte-exact goldens this module
   is asserted against — no `iw`, `wpa_supplicant` or `hostapd` source was read or
-  ported. Both `iw` and (since 2026-08-08) `wpa_supplicant` 2.11 + `hostapd` are used
+  ported. Both `iw` and `wpa_supplicant` 2.11 + `hostapd` are used
   as black-box capture oracles; see `SPEC.md` §1.1/§1.2.
 - **Platform:** linux (raw `std.os.linux` AF_NETLINK syscalls — a conscious
   ceiling). **Role:** client. **Concurrency:** reentrant (no globals; one
@@ -45,7 +45,7 @@ ceiling**:
 |---|---|
 | **Implemented** | `GET_WIPHY` (split dump, merged), `GET_INTERFACE`, `TRIGGER_SCAN` + `GET_SCAN` + the `scan` multicast event, `GET_STATION`, `CONNECT`/`DISCONNECT`, `GET_REG`/`REQ_SET_REG`, `GET_SURVEY`, `SET_WIPHY` (channel/chandef, tx power), `NEW_INTERFACE`/`DEL_INTERFACE`/`SET_INTERFACE` (type), `SET_POWER_SAVE`/`GET_POWER_SAVE`, scheduled scan (`START`/`STOP_SCHED_SCAN`), `JOIN`/`LEAVE_IBSS`, `JOIN`/`LEAVE_MESH`, `SET_WIPHY` RTS/fragmentation/retry/coverage, monitor flags / 4addr / MAC on `NEW`/`SET_INTERFACE`, `RELOAD_REGDB`; decoding of HT/VHT/HE capabilities, interface combinations, extended features, BSS Load |
 | **Escape hatch** | `Nl80211.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred / not doing** | AP mode, P2P, TDLS, WoWLAN, CQM, key management, raw MLME, vendor commands, MLO — each with its reason in `SPEC.md` § Compared with |
+| **Deferred / not doing** | AP mode, P2P, TDLS, WoWLAN, CQM, key management, raw MLME, vendor commands, MLO — reasons in `SPEC.md` *What is deliberately not done*, open items in *Backlog / deferred* |
 | **Out of scope, permanently** | the supplicant (4-way handshake, EAP, SAE) — see "Connecting" below |
 
 ## API
@@ -152,6 +152,11 @@ if (std.os.linux.poll(&pfd, 1, 5000) > 0) {
 }
 ```
 
+The request/reply calls (the dumps, `connect`, `triggerScan`, …) block until the kernel answers: call
+`wifi.setRecvTimeout(millis)` to bound a silent peer, or poll `wifi.fd()`. A talkative peer is bounded by fixed
+datagram, byte and item budgets and a reply that outgrows a parser ceiling is `error.TooManyMessages` (close the
+client after it).
+
 Same seam discipline as the sibling `netconf` (`Client.pumpOnce`) and `ebpf`
 (ring-buffer consumer) modules: threading policy belongs to the application.
 
@@ -214,6 +219,9 @@ try wifi.disconnect(wlan, nl80211.connect.reason_deauth_leaving);
 - **`Wiphy.supportsCommand` means "advertised", not "possible"** —
   `NL80211_ATTR_SUPPORTED_COMMANDS` is a partial list and omits `TRIGGER_SCAN`
   even on radios that scan; infer scan capability from `max_num_scan_ssids`.
+- **Capability tables are bounded and say so.** A radio with more interface combinations, limits, HE sets or
+  extended-feature bytes than the module keeps still decodes; `Wiphy.capabilities_truncated` /
+  `Band.he_truncated` is set instead of an error.
 - **Malformed kernel replies → typed errors** (`error.Truncated` /
   `error.BadLength` from the fuzz-tested netlink codec), never a panic;
   `NLMSG_ERROR` errnos map onto `error.AccessDenied`, `error.NoSuchDevice`,
@@ -222,6 +230,7 @@ try wifi.disconnect(wlan, nl80211.connect.reason_deauth_leaving);
 ## Verify
 
 ```sh
+scripts/modtest nl80211                 # the module's gate (runs in a network namespace)
 zig build test-nl80211                  # Debug
 zig build test-nl80211 --release=fast
 ```

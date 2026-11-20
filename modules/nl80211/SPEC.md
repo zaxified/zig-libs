@@ -26,21 +26,56 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; S2 re-survey 2026-11-07. Licences 
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [iw](https://wireless.docs.kernel.org/en/latest/en/users/documentation/iw.html) (kernel.org) — **reference** | C | ISC *(inferred; not on GitHub, source not read)* | — | 6.17 (the capture oracle, §1.1) | The yardstick: every request golden here is an `iw` invocation captured under `strace`. Here: list, dev, link, station dump, scan trigger/dump/sched_start/sched_stop, connect/disconnect, reg get/set/reload, survey, set channel/freq/txpower/type/power_save/monitor/4addr/rts/frag/retry/coverage, interface add/del, ibss join/leave, mesh join/leave. Not here: AP/`hostapd` side, P2P, TDLS, WoWLAN, CQM, offchannel/mgmt frames, `set bitrates`, mesh/IBSS option parsing, `iw event` pretty-printing, HE/EHT capability *bit* decoding. |
+| [iw](https://wireless.docs.kernel.org/en/latest/en/users/documentation/iw.html) (kernel.org) — **reference** | C | ISC *(inferred; not on GitHub, source not read)* | — | 6.17 (the capture oracle, § 1.1) | The yardstick: every request golden here is an `iw` invocation captured under `strace`. Here: list, dev, link, station dump, scan trigger/dump/sched_start/sched_stop, connect/disconnect, reg get/set/reload, survey, set channel/freq/txpower/type/power_save/monitor/4addr/rts/frag/retry/coverage, interface add/del, ibss join/leave, mesh join/leave. Not here: AP/`hostapd` side, P2P, TDLS, WoWLAN, CQM, offchannel/mgmt frames, `set bitrates`, mesh/IBSS option parsing, `iw event` pretty-printing, HE/EHT capability *bit* decoding. |
 | [mdlayher/wifi](https://github.com/mdlayher/wifi) v0.10.0 — **the Go reference** (the only permissive library with a callable decoder) | Go | MIT | 323 | v0.10.0; push 2026-11-01 | Interfaces, BSS (with RSN and BSS Load), station info with HT/VHT/HE/EHT rate details, survey, PHYs (bands, HT and VHT capability bits, interface combinations), scan with context, connect, WPA-PSK connect from a passphrase, regulatory get/set/reload, EXT_FEATURE check. Here: all of it. Beyond it: raw escape hatch, event socket, IE walk with hostile-input hardening, channel/txpower/interface lifecycle, sched scan, IBSS/mesh. |
 | [rust-netlink/wl-nl80211](https://github.com/rust-netlink/wl-nl80211) | Rust | MIT | 21 | push 2026-11-04 | Typed message model of a wide slice of nl80211 (frames, CQM, WoWLAN, rekey, keys, MLO, stats, EHT/UHR elements) on the rust-netlink stack; its own `TODO.md` lists the high-level layer (typed connect, interface, BSS, wiphy objects) as still to come. Here: the typed high-level shapes it plans plus byte-golden anchoring; not here: the rejected low-level families below. *(README/TODO/tree read; source not read)* |
 | [svinota/pyroute2](https://github.com/svinota/pyroute2) (`IW`) | Python | NOASSERTION (API); source not read | 1.1k | 0.9.6 (2026-04-15) | Netlink toolbox with an nl80211 `IW` class covering scan/interface/station operations. *(inferred)* |
 | [MarekMracna/zig-netlink-wifi](https://github.com/MarekMracna/zig-netlink-wifi) | Zig | AGPL-3.0 | 0 | push 2025-11-09 | Its description: "Experiments with netlink and IEEE 802.11 in Zig". AGPL: source not read. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No nl80211. *(inferred)* |
 
-**Verdict per survey gap** (survey date 2026-11-07). *Done in this wave:* PMK from a passphrase (`connect.pmkFromPassphrase`, IEEE 802.11i Annex H.4 vectors); HT and VHT capability words with named accessors plus A-MPDU parameters and MCS sets, HE MAC/PHY/MCS bytes per interface-type group (`caps`, `Band.ht_caps`/`vht_caps`/`heSets`); interface combinations (`Wiphy.ifaceCombinations`); the extended-feature bitmap (`Wiphy.hasExtFeature`); the BSS Load element (`ie.BssLoad`, standard and Cisco forms); `RELOAD_REGDB`; radio RTS/fragmentation threshold, retry limits and coverage class; monitor flags, 4addr and MAC on interface add/set; scheduled scan start/stop (SSIDs, channels, match SSIDs); IBSS and mesh join/leave. *Already built before:* interfaces, stations with HT/VHT/HE/EHT rate decoding, scan, connect/disconnect (open, WEP, WPA with a PMK), survey, regulatory get/set, channel and tx power, interface add/del/type, power save, event socket. *Rejected, with a reason (none of these is also in the Backlog):* **key management (`NEW_KEY`/`DEL_KEY`/`SET_KEY`/`GET_KEY`), raw MLME (`AUTHENTICATE`/`ASSOCIATE`/`DEAUTHENTICATE`/`DISASSOCIATE`), PMKSA cache** — these are the supplicant's half (§4: a half supplicant is worse than none) and `iw` has no standalone key command either; the kernel's own SME path through `connect` is covered; **AP mode (`START_AP`, `SET_BSS`, station add/del)** — `iw` has none (that is `hostapd`'s job), no Go library has it, and a beaconing AP without an EAPOL authenticator cannot be secured; **P2P, TDLS, WoWLAN, coalesce, CQM, offchannel and management-frame TX/RX, vendor commands** — only wl-nl80211 models them, each needs a live peer or radio to anchor and `iw`'s versions are debugging aids; they stay reachable through `raw`; **HE/EHT capability *bit* decoding** — the bytes are exposed unchanged; per-bit accessors need an HE radio to anchor against (this host's iwlwifi is 802.11ac) and no surveyed Go library decodes them either; **mesh configuration (`MESHCONF_*`, 30 parameters) and IBSS/mesh security** — `join` with the defaults is built; the parameters are reachable through `raw`; **`iw event` pretty-printing** — events decode into `Event` and the scan-terminal predicates; typed CONNECT/ROAM/DISCONNECT events are Backlog below.
+**Verdict per survey gap** (survey date 2026-11-07). *Built from the survey:* PMK from a passphrase (`connect.pmkFromPassphrase`, IEEE 802.11i Annex H.4 vectors); HT and VHT capability words with named accessors plus A-MPDU parameters and MCS sets, HE MAC/PHY/MCS bytes per interface-type group (`caps`, `Band.ht_caps`/`vht_caps`/`heSets`); interface combinations (`Wiphy.ifaceCombinations`); the extended-feature bitmap (`Wiphy.hasExtFeature`); the BSS Load element (`ie.BssLoad`, standard and Cisco forms); `RELOAD_REGDB`; radio RTS/fragmentation threshold, retry limits and coverage class; monitor flags, 4addr and MAC on interface add/set; scheduled scan start/stop (SSIDs, channels, match SSIDs); IBSS and mesh join/leave. *Already built before:* interfaces, stations with HT/VHT/HE/EHT rate decoding, scan, connect/disconnect (open, WEP, WPA with a PMK), survey, regulatory get/set, channel and tx power, interface add/del/type, power save, event socket. *Rejected, with the reasons in *What is deliberately not done*:* key management, raw MLME and the PMKSA cache; AP mode; P2P, TDLS, WoWLAN, coalesce, CQM, offchannel and management-frame TX/RX, vendor commands; mesh configuration (`MESHCONF_*`) and IBSS/mesh security; `iw event` pretty-printing. *Deferred, open in *Backlog / deferred*:* HE/EHT capability *bit* decoding (needs a capture from an HE radio), typed CONNECT/ROAM/DISCONNECT events.
 
 **Where we are ahead:** the only typed pure-Zig nl80211 client we found, request bytes pinned to a real `iw` 6.17 on Linux 7.0 (36 goldens); a decode about 10–14× faster than mdlayher/wifi on the bench corpus (no allocation per message); hostile-IE hardening (a malformed element cannot downgrade a BSS to `.open`); dumps that never return an interrupted or capped table as complete; scan trigger/results, connect/disconnect, regulatory, survey, sched scan, IBSS/mesh and a multicast `EventSocket` in one API; the capability decoders checked against a real radio's capture. **Where we are behind:** the rejected families above (AP, P2P, TDLS, WoWLAN, CQM, keys, raw MLME, HE bit decoding), typed mlme/regulatory event decoding.
 
-## 1. Verification story
+## Verification
 
-**Mutation (strict re-run, 2026-11-15, whole module,** production code of `caps.zig`, `client.zig` 1-1053, `config.zig`, `connect.zig`, `ie.zig`, `iface.zig`, `modes.zig`, `reg.zig`, `root.zig`, `scan.zig`, `station.zig`, `uapi.zig`, `wiphy.zig`; schemata in a detached copy, ReleaseSafe, tests under `scripts/lib/netns-run`, strict verdict: a mutant is killed only by a failure the unmutated baseline lacks): 519 mutants over every condition (flip each `if`/`while` condition; drop each arm of an `and`/`or`; `<`/`<=`/`>`/`>=` off by one; flip a returned boolean), every assignment (skip it), every `append`/`put`/`write`/`add` call and every optional-field body (skip it); 506 killed (1 by a HANG), 13 equivalent, 0 undecided, no defect (first pass 2026-11-15: 490 killed, 13 equivalent, 16 unobservable; the 16 are closed, see the last sentence of this paragraph). The 2026-10-04 run (27/28) had no src hash and predates the capability decoders, the config builders and the HE/ext-feature parser. The 104 survivors of the first pass were closed by `src/strict_test.zig` (capability stream/MCS ranges, IE iterator/`find*`/`parseRsn`/`summarize` first-wins and short-body arms, interface-name and SSID limits, station counter precedence, channel geometry, interface-option rules, passphrase character range, `PREV_BSSID`, IBSS/mesh/scan/sched-scan limits), by tests at the end of `wiphy.zig` (band HT/VHT flags, HE MCS widths and zero-fill, combination replacement, ext-feature ceiling, wiphy-name limit, iftype number 32) and of `client.zig` (`awaitAckStep` and `dumpStep` budgets exact at `max_dump_messages` and `max_dump_bytes`, foreign pid/seq and non-error messages skipped, `raw` and `buildSimple` driven against the kernel's always-present control family instead of nl80211). Equivalent: `code >= 0` vs `> 0` in `errnoToError` (0 maps to `Unexpected` either way); `cf1 < freq` and `cf > freq` (centre and primary never coincide once `d % 20 == 10`, and `d` is the same for both orders); `d >= width/2` vs `>` (recorded 2026-10-04); `i > 65535` in the WEP-key and scan-list loops (65536 attributes overflow their nest first; both paths report `InvalidRequest`); `e.id == EXTENSION` in `findExtension` (only extension elements carry an `ext_id`); `parseRsn`'s `off >= body.len` after the pairwise and AKM lists vs `>` (the next list reader and the capability guard return the same value for an absent tail); `off += 4` after the last field of `parseRsnLike` (dead store); `n >= 32` in `Wiphy.supportsIftype` (`Iftype` has no member 32); `cap += 8 + p.len` in `buildConnect` (a reservation: it decides whether the buffer may grow, not what it holds). **The 16 formerly unobservable mutants — closed 2026-11-15 (same day).** The collector bodies of `Nl80211.wiphys/interfaces/interfaceByIndex/stations/scanResults/regDomains/survey/powerSave` (their `m.cmd` filters, `append`s and `found` guards) and `EventSocket.waitForEvent`'s buffer hand-over were bound to a real generic-netlink socket, which answers only to nl80211 commands (the live tests tolerate an empty answer, a mutated filter gives an empty answer, a radio needs hardware or `mac80211_hwsim`). They now live in transport-generic internal functions (`collect*`, `waitForEventStep`, `Dump` generic over the transport; `newInterface` shares `collectInterface`), the way `dumpStep`/`awaitAckStep` are; no consumer-visible change. Scripted-socket tests at the end of `client.zig` drive each one (foreign command skipped, every append, found/not-found, empty answer, a record that fails to decode, buffer hand-over with one `recv` per drained datagram). Delta run over the new location (schemata in a detached copy, ReleaseSafe, tests under `scripts/lib/netns-run`, strict verdict): 32 mutants (each collector's filter never applying and always applying, each `append`, the found-guard arms, the `found`/`state` assignments, the `orelse` arms, the optional-body guards, the event loop's hand-over and its drained-buffer return) — baseline passes, 32 killed, 0 survived. These are a re-cut of the 16 (a superset: each filter now has both directions), not a re-run of all 519. Cut: `while (true)` loops (flipping gives a function that cannot return), numeric UAPI constants and the `uapi.zig` tables (anchored by the `iw` goldens), printing and test helpers, `catch`/`orelse` arms (reached through their guards).
+Run: `scripts/modtest nl80211` (the module's tests run in a network namespace). Fuzz: `NL80211_FUZZ=<runs>[,<first seed>]`
+(testkit's deterministic driver, `src/fuzz_test.zig`).
 
+- **Request goldens** (§ 1.1) and the one supplicant-captured `CONNECT` (§ 1.2): every request encoder against bytes a real
+  `iw` / `wpa_supplicant` put on the wire.
+- **Decoder goldens** (§ 1.3): real kernel replies, anonymised (§ 1.4).
+- **Hostile input** (§ 1.5), **live tests** (§ 1.6), the no-panic sweep (`src/sweep_test.zig`: dump, wiphy and regulatory
+  ceilings, aggregate channel cap, parser re-feed after `OutOfMemory`).
+- **Boundary tests** (`src/strict_test.zig` and the tests at the end of `wiphy.zig` and `client.zig`): capability stream and
+  MCS ranges, IE iterator and `find*` / `parseRsn` / `summarize` first-wins and short-body arms, interface-name and SSID
+  limits, station counter precedence, channel geometry, interface-option rules, passphrase character range, `PREV_BSSID`,
+  IBSS/mesh/scan/sched-scan limits, band HT/VHT flags, HE MCS widths, combination replacement, the ext-feature ceiling, the
+  wiphy-name limit, `awaitAckStep` / `dumpStep` budgets exact at `max_dump_messages` and `max_dump_bytes`, foreign pid/seq and
+  non-error messages skipped; `raw` and `buildSimple` driven against the kernel's always-present control family.
+- **Scripted-socket tests** (end of `client.zig`): the reply collectors and `waitForEventStep` run over a scripted transport
+  (foreign command skipped, every append, found / not found, empty answer, a record that fails to decode, buffer hand-over with
+  one `recv` per drained datagram), see § 2.5.
+- **Fuzz:** harnesses over the regulatory, station, scan/BSS, interface, wiphy (seeds carry HT/VHT/HE, interface-combination
+  and `EXT_FEATURES` data), information-element and event parsers; the allocating ones run under the testing allocator.
+- **Mutation:** a whole-module schemata run over the production code of `caps.zig`, `client.zig`, `config.zig`, `connect.zig`,
+  `ie.zig`, `iface.zig`, `modes.zig`, `reg.zig`, `root.zig`, `scan.zig`, `station.zig`, `uapi.zig` and `wiphy.zig`, tests under
+  `scripts/lib/netns-run`, strict verdict (a mutant is killed only by a failure the unmutated baseline lacks). Classes: flip
+  each `if` / `while` condition; drop each arm of an `and` / `or`; `<` / `<=` / `>` / `>=` off by one; flip a returned boolean;
+  skip every assignment, every `append` / `put` / `write` / `add` call and every optional-field body. Cut: `while (true)` loops
+  (flipping gives a function that cannot return), numeric UAPI constants and the `uapi.zig` tables (anchored by the `iw`
+  goldens), printing and test helpers, `catch` / `orelse` arms (reached through their guards). Equivalent mutants and why:
+  `code >= 0` vs `> 0` in `errnoToError` (0 maps to `Unexpected` either way); `cf1 < freq` and `cf > freq` (centre and primary
+  never coincide once `d % 20 == 10`, and `d` is the same for both orders); `d >= width/2` vs `>` (`width/2` is a multiple of
+  20 for every width of 40 MHz and up, and such a `d` already fails `d % 20 == 10`); `i > 65535` in the WEP-key and scan-list
+  loops (65536 attributes overflow their nest first; both paths report `InvalidRequest`); `e.id == EXTENSION` in
+  `findExtension` (only extension elements carry an `ext_id`); `parseRsn`'s `off >= body.len` after the pairwise and AKM lists
+  vs `>` (the next list reader and the capability guard return the same value for an absent tail); `off += 4` after the last
+  field of `parseRsnLike` (dead store); `n >= 32` in `Wiphy.supportsIftype` (`Iftype` has no member 32); `cap += 8 + p.len` in
+  `buildConnect` (a reservation: it decides whether the buffer may grow, not what it holds).
+- **Constant time:** n/a — wifi netlink queries, no secret compared.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-nl80211` (`tools/bench.zig`, `tools/go_bench/`) against mdlayher/wifi decoders; figures on the card's `**Performance:**` line.
 
 ### 1.1 Request goldens — captured from a real `iw`, byte for byte
 
@@ -86,7 +121,7 @@ to each golden in `src/goldens.zig`.
 | `START_SCHED_SCAN` (interval; SSIDs + channels + matches), `STOP_SCHED_SCAN` | `iw dev lo scan sched_start interval 5000` · `… interval 5000 freqs 2412 2437 matches ssid TestNet active ssid TestNet` · `… scan sched_stop` ¹ |
 | `JOIN_IBSS`, `LEAVE_IBSS`, `JOIN_MESH`, `LEAVE_MESH` | `iw dev lo ibss join TestNet 2412 fixed-freq 02:00:00:aa:bb:cc beacon-interval 200` · `… ibss leave` · `… mesh join zmesh freq 2412` · `… mesh leave` ¹ |
 
-¹ Captured 2026-10-04 (the 2026-11-07 additions the same way, with `iw` 6.17) inside `unshare -rn`: `lo` is no wireless device and `phy#99` does not
+¹ Captured with `iw` 6.17 inside `unshare -rn`: `lo` is no wireless device and `phy#99` does not
 exist, so the kernel refused every one of these and nothing on the capture host changed — `iw`
 puts the same request bytes on the wire either way. One reply golden comes with them: a real
 iwlwifi radio's `GET_POWER_SAVE` answer (read-only, unprivileged), which `iw` printed as
@@ -128,7 +163,7 @@ these `CONNECT` attributes have **no `iw` golden**:
 `AKM_SUITES`, `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS`, `SOCKET_OWNER`,
 `PREV_BSSID`.
 
-**ANCHORED for five of the nine, 2026-08-08 (wave-2 F7).** `wpa_supplicant`
+**Anchored for five of the nine.** `wpa_supplicant`
 2.11 was made to associate WPA2-PSK, for real, to a real `hostapd` AP over the
 kernel's own `mac80211_hwsim` radios inside the repo's privileged VM lane
 (`scripts/vm/run.sh`'s guest — no host radio, no host privilege), and its
@@ -288,6 +323,27 @@ Every internal caller either copies into a fixed-size field (`Interface`,
 `Bss` owns its IE streams for exactly this reason: a scan result must outlive
 the datagram it arrived in.
 
+### 2.5 Design notes by feature
+
+- **Transport-generic collectors.** The reply collectors (`collectWiphys`, `collectInterfaces`, `collectInterface`,
+  `collectStations`, `collectScanResults`, `collectRegDomains`, `collectSurvey`, `collectPowerSave`, `src/client.zig:727-829`),
+  `dumpStep`, `awaitAckStep` and `waitForEventStep` take any transport (`cl: anytype`), so scripted-socket tests drive the
+  filter, append and found-guard logic that a real generic-netlink socket cannot exercise (it answers only to nl80211
+  commands and a radio needs hardware).
+- **Capability tables keep a fixed number of entries and say so.** More interface combinations than `max_iface_combinations`
+  (32), limits than `max_iface_limits` (8), HE sets than `max_he_sets` (8) or extended-feature bytes than
+  `max_ext_feature_bytes` (32) are dropped, not an error: `Wiphy.capabilities_truncated` / `Band.he_truncated` is set
+  (`src/caps.zig:207-232`, `src/wiphy.zig:63,144,186`). Bits past the kept bytes read as false through `hasExtFeature`.
+- **`HtCaps.txMaxStreams`** reads the streams field only when "Tx MCS Set Defined" is set and "Tx Rx MCS Set Not Equal" is
+  also set, as IEEE 802.11-2020 9.4.2.55.4 defines it; otherwise it returns 0 (`src/caps.zig:99-107`).
+- **Key material.** `buildConnect` reserves its capacity once, returns an exact copy and wipes its working buffer on every
+  path (`src/connect.zig:178-190`); `Nl80211.connect` wipes the request (`src/client.zig:326`); `pmkFromPassphrase` writes the
+  key through an out pointer. std's PBKDF2 and HMAC frames are not scrubbed: the module has no stack burn
+  (`src/connect.zig:148-150`).
+- **The radio-limits builder's coverage class** (`config.buildSetWiphyParams`) takes any `u8`, as `iw` and the kernel do (`src/config.zig:326,346`).
+- **A scan on an interface that is administratively down** answers `ENETDOWN`; `errnoToError` maps it to `error.NetworkDown`
+  (`src/client.zig:103,137`), not `Unexpected`.
+
 ## 3. Threat model
 
 The one untrusted input is **information elements**: verbatim bytes off the
@@ -328,40 +384,42 @@ can already do far worse to the network stack; this module adds no privilege.
 `requestRegDomain` is only a hint — the kernel intersects it with the driver's
 constraints, so it cannot be used to escape a regulatory limit.
 
-## 4. Deferred
+**Limits a caller relies on.**
 
-Explicitly not implemented, in rough order of likely usefulness. Each is
-reachable today through `Nl80211.raw` with caller-encoded attributes.
+- **Request/reply calls block without a deadline unless `setRecvTimeout` is set** (`src/client.zig:565`): the datagram budget
+  (`max_dump_messages`, 65536, `src/client.zig:596`), the byte budget (`max_dump_bytes`, 64 MiB, `src/client.zig:604`) and the
+  item budget (`max_dump_items`, 65536, `src/client.zig:676`) bound a talkative peer (`error.TooManyMessages`; close the client
+  after it, `src/client.zig:182`), a silent one is bounded only by `setRecvTimeout` or the caller polling `fd()`.
+  `EventSocket.waitForEvent` blocks by design (§ 2.3).
+- **Parser ceilings are fixed constants:** `wiphy.max_wiphys` / `max_bands` / `max_channels_per_band` / `max_total_channels`
+  (256 / 16 / 1024 / 16384, `src/wiphy.zig:53-59`) and `reg.max_rules` / `max_domains` (1024 / 256, `src/reg.zig:36-37`); a well-formed
+  reply that outgrows one is `TooManyMessages` (`src/client.zig:629-649`).
+- **Secrets on the stack:** PBKDF2 frames inside `pmkFromPassphrase` are not scrubbed (§ 2.5).
 
-| area | commands |
-|---|---|
-| Scheduled scan results | `SCHED_SCAN_RESULTS` event decoding — start/stop are built (2026-11-07) |
-| Interface lifecycle | built: add/del/type, monitor flags, 4addr, MAC on add (2026-11-07) |
-| Radio configuration | `SET_WIPHY` antenna masks — channel, tx power, RTS/frag, retry limits and coverage class are built |
-| Key management | `NEW_KEY`, `DEL_KEY`, `SET_KEY`, `GET_KEY` |
-| Raw MLME | `AUTHENTICATE`, `ASSOCIATE`, `DEAUTHENTICATE`, `DISASSOCIATE` |
-| PMKSA caching | `SET_PMKSA`, `DEL_PMKSA`, `FLUSH_PMKSA` |
-| AP mode | `START_AP`, `STOP_AP`, `SET_BSS`, `NEW_STATION`, `DEL_STATION` |
-| Mesh | `GET_MESH_CONFIG`, `SET_MESH_CONFIG`, mpath — join/leave are built (2026-11-07) |
-| IBSS | built: `JOIN_IBSS`, `LEAVE_IBSS` (2026-11-07) |
-| P2P | `START_P2P_DEVICE`, `STOP_P2P_DEVICE`, remain-on-channel, frame TX/RX |
-| Monitor mode | built (2026-11-07) via `InterfaceOptions.monitor` |
-| TDLS | `TDLS_MGMT`, `TDLS_OPER` |
-| Power / offload | WoWLAN triggers, coalesce rules, rekey offload — power save is built |
-| CQM | connection-quality-monitor thresholds and events |
-| Vendor | `VENDOR` commands and events |
-| MLO (802.11be) | multi-link `BSS_MLD_ADDR` / `MLO_LINK_ID` handling beyond decoding the attributes |
-| Capability decoding | HE/EHT capability *bit* accessors, `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL` — HT/VHT bits, HE bytes, interface combinations and `EXT_FEATURE` bits are built (2026-11-07) |
-| Events beyond scan | the `mlme` and `regulatory` groups decode into `Event`, but only the scan-terminal predicates are modelled (typed CONNECT/ROAM/DISCONNECT/NEW_STATION events are Backlog) |
+## What is deliberately not done
 
-**Permanently out of scope:** a supplicant. `NL80211_CMD_CONNECT` only works
-end-to-end on drivers with an internal SME; on mac80211 hardware WPA needs
-EAPOL exchange, PTK/GTK derivation and installation, PMKSA caching and SAE —
-a large, security-critical state machine. Shipping half of one would be worse
-than shipping none. See `src/connect.zig`'s header for which of the three
-association paths this module implements.
+Each is reachable today through `Nl80211.raw` with caller-encoded attributes.
 
-## 5. Provenance
+- **A supplicant — permanently out of scope.** `NL80211_CMD_CONNECT` only works end-to-end on drivers with an internal SME;
+  on mac80211 hardware WPA needs EAPOL exchange, PTK/GTK derivation and installation, PMKSA caching and SAE — a large,
+  security-critical state machine. Shipping half of one would be worse than shipping none. See `src/connect.zig`'s header for
+  which of the three association paths this module implements.
+- **Key management (`NEW_KEY`, `DEL_KEY`, `SET_KEY`, `GET_KEY`), raw MLME (`AUTHENTICATE`, `ASSOCIATE`, `DEAUTHENTICATE`,
+  `DISASSOCIATE`) and the PMKSA cache (`SET_PMKSA`, `DEL_PMKSA`, `FLUSH_PMKSA`):** the supplicant's half (see above), and `iw` has
+  no standalone key command either; the kernel's own SME path through `connect` is covered.
+- **AP mode (`START_AP`, `STOP_AP`, `SET_BSS`, `NEW_STATION`, `DEL_STATION`):** `iw` has none (that is `hostapd`'s job), no Go
+  library has it, and a beaconing AP without an EAPOL authenticator cannot be secured.
+- **P2P (`START_P2P_DEVICE`, remain-on-channel, frame TX/RX), TDLS, WoWLAN, coalesce rules, rekey offload, CQM, offchannel and
+  management-frame TX/RX, vendor commands:** only wl-nl80211 models them, each needs a live peer or radio to anchor, and `iw`'s
+  versions are debugging aids.
+- **Mesh configuration (`GET_MESH_CONFIG`, `SET_MESH_CONFIG`, `MESHCONF_*` — 30 parameters — and mpath) and IBSS/mesh security:**
+  `join` with the defaults is built; the parameters are reachable through `raw`.
+- **`iw event` pretty-printing:** events decode into `Event` and the scan-terminal predicates; typed events are in *Backlog /
+  deferred*.
+- **A timer or deadline inside the module:** the blocking seam stays the caller's `poll()` (§ 2.3, same discipline as the
+  sibling `netconf` and `ebpf` modules).
+
+## Provenance
 
 Clean-room from the kernel UAPI (`linux/nl80211.h`, `linux/genetlink.h`,
 `linux/netlink.h` — GPL-2.0 WITH Linux-syscall-note; the constants and layouts
@@ -372,18 +430,21 @@ information-element formats.
 diffed against this module's — the same relationship the `tc` module has with
 `iproute2` and the `nftables` module has with `nft`. No `iw` or
 `wpa_supplicant` source was read, studied for design, or ported, so per
-`CONVENTIONS.md` §5 this needs no `/NOTICE` design-reference entry. See
-`NOTICE` for the module's own attribution line.
+`CONVENTIONS.md` §5 this needs no design-reference entry. See the README's `Provenance:` line for the module's own
+attribution.
 
 ## Backlog / deferred
-- ~~**2026-11-15 (strict mutation re-audit):** the collector bodies … have 16 unkillable mutants~~ — **done 2026-11-15:** generic over the transport (`collect*`, `waitForEventStep`), scripted-socket tests, 32/32 delta mutants killed (see § 1, Mutation).
-- **Independent review of the 2026-11-07 S2 wave (Sonnet, read-only), fixed the same day:** M1 `HtCaps.txMaxStreams` read the streams field with "Tx Rx MCS Set Not Equal" CLEAR (inverted against IEEE 802.11-2020 9.4.2.55.4; a test pins both inputs); M2 a radio with more interface combinations, limits, HE sets or extended-feature bytes than kept failed its whole GET_WIPHY with `TooManyEntries` — now the excess is dropped and `Wiphy.capabilities_truncated` / `Band.he_truncated` set; M3 key material: `buildConnect` reserves its capacity once, returns an exact copy and wipes its buffer, `Client.connect` wipes the request, `pmkFromPassphrase` writes through an out pointer (std's PBKDF2 frames are not scrubbed: the module has no stack burn, documented); M4 fuzz seeds for the new decoders. L1: coverage class takes any u8, as `iw` and the kernel do. Open LOW: the third 802.11i H.4 vector (63 characters) is not pinned; an empty mesh id is passed to the kernel unchecked.
 
-- **2026-11-07 (S2 survey):** done: PMK from passphrase, HT/VHT/HE capability decoding, interface combinations, extended features, BSS Load, `RELOAD_REGDB`, radio thresholds, interface options, scheduled scan start/stop, IBSS and mesh join/leave (verdicts in "Compared with"). Still open, small: typed CONNECT/ROAM/DISCONNECT/NEW_STATION events and `SCHED_SCAN_RESULTS` on the event socket (decode only; every `iw event` user sees them); HE/EHT per-bit accessors once a capture from an HE radio exists. New code not yet fuzzed: `caps` and the wiphy additions ride on the existing wiphy fuzz harness (the new attributes are not in its seed corpus), the new builders take no wire input.
-- **2026-10-04:** items (1) `GET_SURVEY`, (2) `SET_WIPHY` channel/tx power and interface add/del/type, and (4) power save are **done** (`config.zig`). (3) HT/VHT/HE capability decoding stays deferred: it is tables of bitfields per 802.11 amendment, needs captures of radios that advertise each (this host has one iwlwifi), and no consumer reads it — the router-tool consumer reads interfaces and stations. Mutation equivalent recorded: in `Channel.center1`, `d >= width/2` vs `d > width/2` cannot differ because `width/2` is a multiple of 20 for every width ≥ 40 MHz and such a `d` already fails `d % 20 == 10`.
-- **Survey ranking of §4** *(survey 2026-09-30)* — what an `iw` user hits first: (1) **`GET_SURVEY`** (channel occupancy — read-only, small; the natural next read after `scanResults`); (2) **`SET_WIPHY` (channel, tx power)** and **`SET_INTERFACE` / `NEW_INTERFACE` / `DEL_INTERFACE`** (monitor-mode and AP interface lifecycle — `iw dev … set channel`, `interface add`; medium); (3) **HT/VHT/HE capability decoding** in `Wiphy`/`Bss` (medium, mostly tables); (4) `SET_POWER_SAVE` (small). All fit §2. `NEW_INTERFACE` here is decode-only (`rg 'NEW_INTERFACE' src/client.zig`: only reply matching, no request builder).
-- **Request/reply calls block without a deadline unless `setRecvTimeout` is set** *(no-panic sweep GX, 2026-10-31)*: datagram, byte (64 MiB) and item (65536 messages) budgets bound a talkative peer, a silent one is bounded only by the caller's `setRecvTimeout`/`fd()` polling, as documented. `EventSocket.waitForEvent` blocks by design. No module-level timer is built (seam discipline, see `client.zig` header).
-- **Parser ceilings are fixed constants** *(sweep GX)*: `wiphy.max_wiphys/max_bands/max_channels_per_band/max_total_channels` (256/16/1024/16384), `reg.max_rules/max_domains` (1024/256), `max_dump_items` (65536). Make them options only if real hardware ever meets one.
+- **Typed events:** CONNECT / ROAM / DISCONNECT / NEW_STATION and `SCHED_SCAN_RESULTS` on the event socket. `Event` carries the
+  command number with `status_code`, `reason_code` and `mac`, but only the scan-terminal predicates are modelled
+  (`src/client.zig:920-950`); every `iw event` user sees these. Decode only.
+- **Capability decoding beyond HT/VHT/HE bytes:** HE/EHT per-bit accessors (needs a capture from an HE radio; this host's iwlwifi
+  is 802.11ac), `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL`, and multi-link (`BSS_MLD_ADDR` / `MLO_LINK_ID`) handling beyond decoding the attributes.
+- **`SET_WIPHY` antenna masks** (channel, tx power, RTS/fragmentation, retry limits and coverage class are built).
+- **The third IEEE 802.11i H.4 vector (63 characters) is not pinned**; `pmkFromPassphrase`'s test pins two vectors and the
+  63-character length boundary only (`src/connect.zig:326-347`).
+- **An empty mesh id is passed to the kernel unchecked** (`src/modes.zig:73` rejects only more than 32 bytes).
+- **Parser ceilings as options:** make the fixed ceilings (see § 3, Limits) options only if real hardware ever meets one.
 
 ## Anchoring
 
@@ -393,5 +454,3 @@ diffed against this module's — the same relationship the `tc` module has with
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** goldens captured from real iw under strace; live kernel tests skip cleanly (bonus)
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-08 (wave-2 F7). The counterpart the finding asked for was obtained by going where the privilege legitimately exists instead of asking the host for root: scripts/vm's Debian guest, whose STOCK cloud kernel does carry mac80211_hwsim (verified before anything was built -- `modprobe mac80211_hwsim radios=2` -> phy0/phy1, wlan0/wlan1). hostapd ran a WPA2-PSK AP on wlan0 and wpa_supplicant associated on wlan1 with `driver_param=force_connect_cmd=1`, which is the load-bearing detail: without it a mac80211 driver makes wpa_supplicant run its OWN SME and emit AUTHENTICATE+ASSOCIATE, never CONNECT, so the capture would not exist. The association completed for real (wpa_state=COMPLETED, key_mgmt=WPA2-PSK, PTK=CCMP GTK=CCMP). Exactly one NL80211_CMD_CONNECT appeared in the 147-message strace capture; its 320 bytes are frozen in goldens.zig as `wpa2_connect_capture` and compared attribute-by-attribute against what buildConnect emits for the same association. IFINDEX, MAC, SSID, WIPHY_FREQ, AUTH_TYPE, PRIVACY, WPA_VERSIONS, CIPHER_SUITES_PAIRWISE, CIPHER_SUITE_GROUP, AKM_SUITES and SOCKET_OWNER agree byte for byte -- number, length, payload width and value -- on the first comparison, with nothing adjusted to fit. That also anchors CIPHER.CCMP (00-0F-AC:4) and AKM.PSK (00-0F-AC:2) on a real wire, two suite selectors no header on the capture host declares (narrows F3). Mutation-tested: ATTR.WPA_VERSIONS 75 -> 175 gives exit 1, 1/108 fail, and ONLY the new test failed -- the other 106, connect.zig's own round-trips included, never noticed, which is exactly the consistent-mutation blindness F3 recorded as a negative control. Two genuine disagreements with the counterpart were found and PINNED rather than normalised away: the supplicant's message-wide attribute order differs from this module's (ours follows iw's; netlink does not care, and the four security attributes appear in the same relative order in both), and the supplicant emits SOCKET_OWNER twice where this module emits it once. STILL SELF-ONLY, and asserted absent from the capture rather than merely described: PMK, USE_MFP, WANT_1X_4WAY_HS, PREV_BSSID -- a PSK association driven through cfg80211's own SME sends none of them, and mac80211_hwsim offers no 4-way-handshake offload, so PMK is out of reach of this lane entirely; their attribute numbers stay standing-checked by scripts/checks/check-uapi-consts.py. BONUS DEFECT, found by running the live suite as real root in that guest (scripts/vm/run.sh nl80211 debian, via run.sh's new guest_setup hook): TRIGGER_SCAN on an administratively-down interface answers ENETDOWN (-100, measured with a temporary probe, not assumed) and client.errnoToError had no case for it, so the single commonest failure of a scan surfaced as error.Unexpected. Nothing unprivileged could ever have seen it -- the only test that reaches that line had always stopped at the AccessDenied skip. Now error.NetworkDown, and with the radios brought up in guest_setup the whole suite runs 108/108 with ZERO skips in the VM.
