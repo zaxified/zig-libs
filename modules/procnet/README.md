@@ -8,8 +8,8 @@ returning typed values (`netaddr.Ip`/`Prefix`, not allocated dotted-string
 IPs).
 
 Provenance: original work of the zig-libs authors (MIT) — typed parsers for
-`/proc/net/route` (`routesOutcome`/`hexToV4`), `/proc/net/{tcp,udp}`
-(`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`),
+`/proc/net/route` (`parseRoutes`/`hexToV4`), `/proc/net/{tcp,udp}`
+(`parseTcp`/`parseUdp`), `/proc/net/nf_conntrack` (`parseConntrack`/`kvField`),
 and `/proc/<pid>/stat` (`parseProcStat`), plus the `snapshot`/thermal-zone/
 meminfo helpers. `arp.zig` (`/proc/net/arp`) is clean-room from `proc(5)`.
 IPv6 socket-table support (`tcp6`/`udp6`) and the hex→`netaddr.Ip` address
@@ -68,7 +68,8 @@ for (socks) |s| for (owners.findAll(s.inode)) |o| _ = .{ o.pid, o.fd, o.name() }
 // `owners.denied` counts processes this uid may not look into: their
 // sockets are listed, but unattributed. Partial, never an error.
 
-// Conntrack flows, capped sample + true total (/proc/net/nf_conntrack)
+// Conntrack flows, capped sample + `total` rows of the text read (/proc/net/nf_conntrack);
+// `ct.text_truncated`: the file was longer than the 4 MiB read limit, so `total` is a prefix count
 var ct = try procnet.readConntrack(gpa, io, 50);
 defer ct.deinit(gpa);
 for (ct.flows) |f| _ = .{ f.src, f.dst, f.sport, f.dport, f.proto(), f.state() };
@@ -83,7 +84,7 @@ var snap = try procnet.snapshot(gpa, io);
 defer snap.deinit(gpa);
 ```
 
-### Host counters (2026-10-04, `src/counters.zig`)
+### Host counters (`src/counters.zig`)
 
 ```zig
 const devs = try procnet.readNetDev(gpa, io);      // []NetDevEntry: rx/tx bytes, packets, errs, drop, … (16 counters)
@@ -99,7 +100,7 @@ Formats are the kernel's documented ones (proc(5), `iostats.rst`); fixtures
 are real captures; each parser also runs under the shared fuzz harness and a
 3000-script deterministic driver that feeds every parser every damaged sample.
 
-### Per-process readers and network counters (2026-10-17, prometheus/procfs parity)
+### Per-process readers and network counters (prometheus/procfs parity)
 
 Every per-process reader takes a `procnet.ProcRef` — `.self` (the calling
 process, via `/proc/self`) or `.{ .pid = n }` — and every parser underneath is
@@ -128,8 +129,8 @@ defer unix.deinit(gpa);
 `parsePidStat`, `parseLimits`, `parsePidStatus`, `parsePidIo`, `parseCgroups`,
 `cmdlineArgs`, `parsePairs` and `parseUnix` are the pure halves. Page size comes
 from the running kernel (`std.heap.pageSize()`; `parseProcStatWithPage` for a
-capture from another machine) — `rss_kb` used to assume 4 KiB pages, which is
-wrong on 16 KiB / 64 KiB arm64 and ppc64 kernels.
+capture from another machine), not a 4 KiB constant, so `rss_kb` is right on 16 KiB /
+64 KiB arm64 and ppc64 kernels.
 
 ⚠ `process_network_receive_bytes_total` / `..._transmit_...` in a Prometheus
 process collector come from `/proc/<pid>/net/netstat` `IpExt InOctets` /
@@ -155,7 +156,7 @@ routes, `-N` neighbours and `-s` snapshot.
   whole table.
 - `SocketEntry`/`parseTcp`/`parseUdp` return *every* row with its `state`
   (not pre-filtered to `LISTEN`/bound) — filtering is the
-  caller's job now that the type carries state.
+  caller's job.
 - A read past its `limit` **truncates**; it does not fail. The tail of a
   very large table is missing and the last partial row is dropped as
   malformed, rather than the whole table coming back empty.
@@ -199,20 +200,10 @@ routes, `-N` neighbours and `-s` snapshot.
   with `parseUdpWithEndian`/`parseRoutesWithEndian` alongside it. The
   argument is the *producer's* byte order, never the parsing machine's.
 
-## DEFER (beyond this module's current scope)
+## Not provided
 
-- ~~`/proc/net/unix`~~ — done 2026-10-17 (`readUnix`, own `UnixEntry` type).
-- Per-socket columns past `inode` in `/proc/net/{tcp,udp}`: the
-  `tr:tm->when` timer, `retrnsmt`, `timeout`, and the TCP diagnostics tail
-  (`rto`, `ato`, `snd_cwnd`, `ssthresh`). These are `ss -o` and `ss -i`
-  territory — a per-connection timing/congestion view with its own shape,
-  and (`ss -i` in particular) mostly answered better over `sock_diag` than
-  from this file.
-- The conntrack **reply** tuple, and `mark`/`use`/`packets`/`bytes`.
-  `ConntrackFlow` decodes the original-direction tuple only, which the type
-  says; the reply tuple is where NAT translation is visible and deserves
-  explicit modelling rather than four more fields.
-- ~~`/proc/<pid>/status`~~ — done 2026-10-17 (`readPidStatus`).
-- ~~`/proc/net/snmp` / `/proc/net/netstat`~~ — done 2026-10-17 (`readSnmp`/`readNetstat`, per-pid variants).
-- `statvfs`/`/proc/mounts` disk usage — filesystem space, not a `/proc/net`
-  or per-process concern; a different module axis entirely.
+Per-socket timer and congestion columns (`ss -o`/`ss -i`, better answered over `sock_diag`),
+`statvfs`/`/proc/mounts` disk usage, and the `/sys` and other `/proc` areas outside the
+prometheus/procfs parity scope are not covered; the conntrack reply tuple and
+`mark`/`use`/`packets`/`bytes` are not decoded yet. Reasons and open items are in `SPEC.md`
+(*What is deliberately not done*, *Backlog / deferred*).

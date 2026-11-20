@@ -26,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; re-surveyed 2026-10-17 for the gra
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [prometheus/procfs](https://github.com/prometheus/procfs) — **reference** | Go | Apache-2.0 | 883 | v0.21.1 read (upstream pushed 2026-10-16, v0.22.0) | The most complete typed Linux `/proc` + `/sys` parser set and the library behind the Prometheus `process_*` collector. Typed structs per file (`ProcStat`, `ProcStatus`, `ProcLimits`, `ProcIO`, `NetUNIX`, `ProcNetstat`, `ProcSnmp`, cgroups, cmdline, `FileDescriptorsLen`), `Self()`. Parses with `fmt.Fscan` / regexps, errors per file. Beyond this module and **not** in its scope: `/sys` (class/net, block, hwmon), fdinfo/maps/smaps, psi, interrupts, softirqs, mountstats/NFS, xfs, bcache, ipvs, wireless, xfrm, zoneinfo, `/proc/sys`. |
-| [shirou/gopsutil](https://github.com/shirou/gopsutil) | Go | BSD-3-Clause (LICENSE file read; the API reports NOASSERTION) | 11.9k | v4.26.9 (2026-10-01) | Cross-platform psutil: per-interface I/O counters, CPU times and percent, disk I/O, memory, per-process status/fds/connections/username. Linux-only here by choice; the Linux readings are covered by `counters.zig` and the per-process readers. The README's former "model after". *(inferred from its known API; source not read)* |
+| [shirou/gopsutil](https://github.com/shirou/gopsutil) | Go | BSD-3-Clause (LICENSE file read; the API reports NOASSERTION) | 11.9k | v4.26.9 (2026-10-01) | Cross-platform psutil: per-interface I/O counters, CPU times and percent, disk I/O, memory, per-process status/fds/connections/username. Linux-only here by choice; the Linux readings are covered by `counters.zig` and the per-process readers. The module's `meta` model-after. *(inferred from its known API; source not read)* |
 | [eminence/procfs](https://github.com/eminence/procfs) | Rust | Apache-2.0 | 449 | pushed 2026-06-26 | Typed Rust `/proc` interface, same breadth idea. *(inferred)* |
 | [GuillaumeGomez/sysinfo](https://github.com/GuillaumeGomez/sysinfo) | Rust | MIT | 2.7k | v0.39.6 (pushed 2026-10-16) | Cross-platform system/process/network/disk info, counter-oriented. *(inferred)* |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No `/proc` parsers. *(inferred)* |
@@ -35,10 +35,9 @@ Siblings that cover neighbouring ground: `diskfree`/`diskusage` (space, not I/O 
 
 **Scope: parity with procfs v0.21.1, for the files a Linux monitoring agent reads** (decided 2026-10-17; the metrics module's Prometheus `process_*` collector is built on it). Covered, each with a pure parser and a thin live reader: `/proc/<pid>/{stat, limits, status, io, cmdline, cgroup, fd (count), net/netstat, net/snmp}` addressed by `ProcRef` (`.self` or a pid), system-wide `/proc/net/{snmp, netstat, unix}`, plus what was already here (`net/dev`, `stat`, `meminfo`, `diskstats`, `ipv6_route`, `tcp`/`udp` v4+v6, `route`, `arp`, conntrack text). Deliberately NOT covered, as ND/SIB in the survey: the `/sys` tree, fdinfo/maps/smaps/schedstat/psi/interrupts/softirqs, mountstats, `/proc/sys`, per-process `environ`/`exe`/`cwd`, sockstat/softnet/protocols/wireless/xfrm/tls_stat/ipvs, cpuinfo, vmstat, zoneinfo, swaps (mountinfo lives in `diskfree`).
 
-**Where we are ahead:** typed `netaddr.Ip`/`Prefix` instead of strings; every parser treated as a hostile-input surface (lxcfs / faked `/proc`), fuzzed, and pinned to a big-endian kernel's capture; dual-stack `tcp6`/`udp6` with the `ss -p`-style socket→process owner join that reports `scanned`/`denied`/`vanished` instead of a silent blank; allocation-free per-process readers (stack buffers) where procfs allocates per field; a bad row or field is skipped or reads 0 where procfs fails the whole file (`Proc.Limits` errors on one unparsable line); the unix table keeps paths with spaces (procfs cuts at the first space) and the netstat/snmp table keeps every counter a kernel prints, including ones added after this release. **Where we are behind:** breadth beyond the list above (see "Deliberately NOT covered"); procfs has typed struct fields per `TcpExt`/`IpExt` counter where this module offers `get(section, name)`; no bench vs procfs recorded yet (Performance: not measured).
+**Where we are ahead:** typed `netaddr.Ip`/`Prefix` instead of strings; every parser treated as a hostile-input surface (lxcfs / faked `/proc`), fuzzed, and pinned to a big-endian kernel's capture; dual-stack `tcp6`/`udp6` with the `ss -p`-style socket→process owner join that reports `scanned`/`denied`/`vanished` instead of a silent blank; allocation-free per-process readers (stack buffers) where procfs allocates per field; a bad row or field is skipped or reads 0 where procfs fails the whole file (`Proc.Limits` errors on one unparsable line); the unix table keeps paths with spaces (procfs cuts at the first space) and the netstat/snmp table keeps every counter a kernel prints, including ones added after this release. **Where we are behind:** breadth beyond the list above (see "Deliberately NOT covered"); procfs has typed struct fields per `TcpExt`/`IpExt` counter where this module offers `get(section, name)`; no comparison against the fastest implementation in the field (the card's `fastest ?`); prometheus/procfs, the reference, is measured by `zig build bench-procnet`.
 
 **Quirks reproduced from procfs, documented:** `USER_HZ` is the constant 100 (`user_hz`), as in procfs; `process_network_*` come from `IpExt` of `/proc/<pid>/net/netstat`, which is the process's network NAMESPACE, not the process (`pairs.zig` header, README); `countFds` follows procfs's rule exactly — the fstat size of `/proc/<pid>/fd` on Linux >= 6.2, a directory count otherwise (which, on an older kernel and for `.self`, includes the listing's own descriptor). Corrected here, not reproduced: the page size is the running kernel's, not procfs's `os.Getpagesize()` of the Go runtime (identical in practice) and not a 4 KiB constant (this module's own earlier bug).
-
 ## Design & invariants
 Layout mirrors the `dns`/`http` modules: `root.zig` owns the shared file-reading primitive
 (`readVirtualFile`) and the system `snapshot`; each `/proc/net/*` table gets its own pure,
@@ -64,12 +63,12 @@ is not the expected path). Addresses are returned as typed `netaddr.Ip`/`Prefix`
 dotted-string IPs — IPv6 socket addresses (`tcp6`/`udp6`) decode as four 32-bit words concatenated
 in address order (verified against real kernel captures under `src/testdata/`), each word in the
 byte order of the KERNEL THAT WROTE the file, which is what the hex columns actually encode (see
-"The hex address decode on a big-endian target" below; `parseX` means "this machine's order" and
+"The hex address decode and byte order" below; `parseX` means "this machine's order" and
 `parseXWithEndian` states a foreign capture's). Malformed rows are skipped, not fatal — one corrupt
 line never sinks the whole table. A read past `limit` truncates to the bounded prefix rather than failing (the last partial row
 is then skipped as malformed like any other), so an oversized table yields a short listing, never an
 empty one. `SocketEntry` returns every row with its `state` (not pre-filtered to
-LISTEN/bound) — filtering is now the caller's job — and carries the full row the kernel prints: local
+LISTEN/bound) — filtering is the caller's job — and carries the full row the kernel prints: local
 AND peer endpoint, `uid`, `inode`, and the `tx_queue`/`rx_queue` pair (`ss`'s Send-Q/Recv-Q). `inode`
 is structural rather than informational: it is the only key joining a socket to a process, and `0` is
 the kernel's own value for a socket that has none (a `TIME_WAIT` orphan, or a connection still sitting
@@ -85,25 +84,81 @@ behaves identically, verified live. `SockState` reuses the
 kernel's `net/tcp_states.h` values for UDP too (`.close` = unconnected/bound, `.established` =
 connect()-ed — UDP has no separate state space). Concurrency: reentrant, no shared state — each
 call is independent, callers may run them from any thread. Original work of the zig-libs authors
-(MIT): typed parsers for `/proc/net/route` (`routesOutcome`/`hexToV4`), `/proc/net/{tcp,udp}`
-(`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`), `/proc/<pid>/stat`
+(MIT): typed parsers for `/proc/net/route` (`parseRoutes`/`hexToV4`), `/proc/net/{tcp,udp}`
+(`parseTcp`/`parseUdp`), `/proc/net/nf_conntrack` (`parseConntrack`/`kvField`), `/proc/<pid>/stat`
 (`parseProcStat`), plus the snapshot/thermal-zone/meminfo helpers; `arp.zig` is clean-room from
 `proc(5)`; IPv6 socket-table support extends IPv4-only reads to full dual-stack coverage. Written
 clean-room against the documented Linux `/proc` file format (`proc(5)`) and the kernel's own
-`/proc` ABI. The 2026-10-17 parity files (`pidstat.zig`, `pidfiles.zig`, `pairs.zig`, `unix.zig`) were
+`/proc` ABI. The parity files (`pidstat.zig`, `pidfiles.zig`, `pairs.zig`, `unix.zig`) were
 written from `proc(5)` and live kernel output; prometheus/procfs v0.21.1 (Apache-2.0) source was READ for
 its field lists and quirks and nothing was copied.
+## Design notes by feature
+
+- **The hex address decode and byte order.** The eight hex characters of an address column are the
+  native-byte-order memory image of a `u32` holding the `__be32`, so a little-endian kernel
+  writes loopback as `0100007F` and a big-endian kernel as `7F000001`; the port is printed as a
+  number and is identical on both. The address octets are the parsed value written back out
+  **in the producing kernel's byte order**: `hexWord` (`sockets.zig`) and `hexToV4`
+  (`routes.zig`) parse the hex string into an integer value (`parseInt(u32, s, 16)`) and lay it
+  out in an explicitly requested order with `writeInt`; neither step consults the CPU's
+  representation. `parseTcp`/`parseUdp`/`parseRoutes` mean "written by a kernel of THIS machine's
+  byte order" (correct for every live read, because those read the running kernel's own files);
+  `parseTcpWithEndian`/`parseUdpWithEndian`/`parseRoutesWithEndian` take the producer's byte
+  order for a foreign capture. This was measured on a big-endian kernel, not inferred (OpenWrt
+  malta/be under `qemu-system-mips`: a socket bound to an address chosen in advance, then
+  `/proc/net/tcp` read back; captures `src/testdata/tcp-mips-be.txt` and `tcp6-mips-be.txt`,
+  the latter from an address asymmetric in every word so a wrong per-word byte order and a wrong
+  word order both show). The secondary sources that call the file "little-endian regardless of
+  architecture" are wrong; the kernel's `proc_net_tcp` documentation does not mention
+  endianness. A wrong-endian read of `/proc/net/route` does not merely mis-decode: the `Mask`
+  column goes through the same path, so a big-endian `FFFFFF00` read low-byte-first is
+  `0.255.255.255`, not a contiguous CIDR mask, and the row would be dropped. `qemu-mips`
+  user-mode emulation cannot show what a big-endian kernel prints (its `/proc` is the host
+  kernel's, so a big-endian process there reads little-endian files); it is the right tool for
+  "does OUR code behave differently compiled big-endian" (it does not) and the suite runs under it.
+- **Bounded reads say so.** `readImpl` reads one byte past `limit`: that extra byte is the
+  evidence the file is longer, so a file of exactly `limit` bytes is not flagged `truncated` (the
+  flag means "longer than `limit`"; the same completeness idiom as `head -c` readers and a
+  `LimitReader` with a one-byte probe). The line-wise variants (`readVirtualLinesReporting`) cut the
+  result back to the last whole line, so a cut never ends inside a value; `pairs.readTable`
+  (`/proc/<pid>/net/{snmp,netstat}`) and `readPidCgroups` (`CgroupList.truncated`) read whole lines.
+  `Reported(T){ entries, truncated }` is the shape of the five `*Reporting` twins of the line-table
+  readers (`readArp`, `readRoutes`, `readIpv6Routes`, `readNetDev`, `readDiskstats`); the plain
+  readers are thin wrappers that drop the flag.
+- **`indexSocketOwners` bounds.** `SocketOwnerOptions` caps the processes scanned
+  (`max_processes`), the descriptors per process (`max_fds_per_process`), the owner records kept
+  (`max_owners`) and the descriptors examined across all processes (`max_total_fds`, one
+  `readlinkat` each, socket or not); `truncated` is set when any cap fires. Worst-case work is
+  `min(max_processes × max_fds_per_process, max_total_fds)` `readlinkat` calls; worst-case memory
+  is `max_owners` × 88 B. `SocketOwnerIndex.find`/`findAll` are O(log n).
+- **`/proc/net/unix`.** `parseUnix`/`readUnix` take `UnixOptions{ .max_entries = 1 << 19 }` and
+  return `UnixTable{ entries, truncated }`: the first valid row past the cap stops the parse, and
+  exactly `max_entries` rows is not truncated. Forged short rows inside socket names amplify about
+  12× (17 B of text become a 176 B `UnixEntry`), so 524 288 rows is about 92 MB worst case, the
+  order of `SocketOwnerOptions.max_owners`. prometheus/procfs has no cap; the shape copies
+  `readConntrack`'s cap + flag. Abstract names start with `@`; a path with spaces is kept.
+- **Counters (`counters.zig`).** `/proc/net/dev` (the name is split at the first `:`: it is
+  right-aligned and may touch the colon), `/proc/stat` (`cpu`/`cpuN`, `ctxt`, `btime`,
+  `processes`, `procs_*`; guest time is NOT added to `total` because proc(5) says it is already inside
+  user/nice; `busy` excludes iowait, as top/mpstat/gopsutil do), `/proc/meminfo` (exact key up to
+  the colon; `null` = line absent, distinct from 0), `/proc/diskstats` (iostats.rst fields 1–11; the
+  discard group 12–15 and flush group 16–17 only when the row has them, so a 14-counter row
+  reports neither), `/proc/net/ipv6_route` (network-order hex, exact field widths, prefix ≤ 128).
+  Every row that is not the documented shape is skipped; counters are parsed into `u64` and
+  summed saturating.
+- **Per-process readers and counters (the prometheus/procfs parity files).** `/proc/net/unix`,
+  `/proc/<pid>/{stat, status, limits, io, cmdline, cgroup, fd}`, `ProcRef` (`.self` or a pid) and
+  the runtime page size (`std.heap.pageSize()`; `parseProcStatWithPage` for a capture from another
+  machine), `/proc/net/{snmp, netstat}` and the per-pid twins through one header/value-pair parser
+  (`pairs.zig`) that keeps every counter the kernel prints.
 
 ## Threat model / out of scope
-**The `/proc` text this module parses is not always the kernel's own.** An earlier revision of
-this section said it was — "not security-sensitive in the traditional sense … not
-attacker-controlled" — while five of this module's own fuzz harnesses said the opposite in their
-doc comments ("a bind-mounted/faked `/proc`, a snapshot read from a file"). That contradiction is
-what left an unchecked `@intFromFloat` on `/proc/uptime` in `snapshot()` until the 2026-09-02
-re-audit: lxcfs bind-mounts `/proc/{uptime,meminfo,loadavg,stat}` into every LXC container as a
-matter of course, and `unshare --map-root-user --mount` is available to any local user on a
-default kernel. Treat every decode entry point as a hostile-input surface, the same as a wire
-parser. Every parser treats a malformed line as skip-and-continue rather than a hard failure or
+**The `/proc` text this module parses is not always the kernel's own.** lxcfs bind-mounts
+`/proc/{uptime,meminfo,loadavg,stat}` into every LXC container as a matter of course, and
+`unshare --map-root-user --mount` is available to any local user on a default kernel; several of
+this module's fuzz harnesses say so in their doc comments ("a bind-mounted/faked `/proc`, a
+snapshot read from a file"). Treat every decode entry point as a hostile-input surface, the same as
+a wire parser. Every parser treats a malformed line as skip-and-continue rather than a hard failure or
 panic, and no conversion from file content may be an `@intCast`/`@intFromFloat`/`.?`.
 
 Linux-only platform ceiling is accepted scope (raw `/proc`+`/sys` reads, no portable fallback),
@@ -111,7 +166,7 @@ grouped with the repo's other Linux-only members (icmp/rawsock/netlink/wireguard
 
 Reads are bounded, and a bounded read **says so**: `readVirtualFileReporting` returns whether the
 limit was hit, `readSockets` returns `SocketTable.truncated`, `readConntrack` returns
-`ConntrackResult.text_truncated`, `indexSocketOwners` returns `truncated`, the five line-table
+`ConntrackResult.text_truncated`, `indexSocketOwners` returns `truncated`, `readUnix` returns `UnixTable.truncated`, the five line-table
 readers have `readArpReporting`/`readRoutesReporting`/`readIpv6RoutesReporting`/
 `readNetDevReporting`/`readDiskstatsReporting` twins returning `Reported(T){ entries, truncated }`, and
 `listProcesses`/`readConntrack` take an explicit cap. So an adversarially huge `/proc` table (a
@@ -121,231 +176,106 @@ cannot silently shorten an answer either. ⚠ `indexSocketOwners`' caps bound th
 full owner record per descriptor without opening a socket, so sixteen processes with one socket
 each produced 129 322 records with both walk caps unfired.
 
+**`/proc/net/unix` can be forged by a local user.** A pathname socket name may contain `\n`, so
+`bind("x\n<well-formed row>")` makes the kernel print a second, attacker-written row (any inode,
+flags, path). This is not fixable in a text parser (a forged row is indistinguishable) and is
+documented at `parseUnix`. A consumer deciding who listens on what should use `NETLINK_SOCK_DIAG` (`ss` does), which is
+the `netlink` module's job.
+
+**`indexSocketOwners` default memory.** `SocketOwnerOptions.max_owners = 1 << 20` × 88 B is about
+92 MB live (up to about 2.5× while the list grows), the worst case a local user can force with
+dup'd sockets. It is bounded and documented; a lower default or a byte budget is an owner policy
+decision (*Backlog / deferred*).
+
 Out of scope: writing to any `/proc`/`/sys` file (read-only by design); anything requiring
 elevated privileges beyond normal `/proc` read permissions.
-
 ## Verification
-114 `test` blocks per `zig build test-procnet` (2026-10-17; 8 of them are the env-gated `PROCNET_FUZZ` verdict runs and skip unless the variable is set; the earlier "57 tests" figure predated `counters.zig` and was stale) across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig`/`counters.zig`/`pidstat.zig`/`pidfiles.zig`/`pairs.zig`/`unix.zig`/`fuzz_proc.zig` (dark-aggregated
-from `root.zig`), golden-text fixtures under `src/testdata/` for each table (including real
-`tcp6`/`udp6` kernel captures verifying the four-word hex IPv6 decode, and a real BIG-ENDIAN
-`/proc/net/tcp` capture, `tcp-mips-be.txt`, whose ground truth is the address the capture script
-itself bound), malformed-row-skipped-not-fatal cases, the `readVirtualFile` streaming-vs-`stat`-size-0 behavior and its
-truncate-don't-vanish limit, per-column tests for every field decoded out of a socket row, and gated
-live smoke tests against the real `/proc` (including one that opens its own listener and asserts the
-process join attributes it to this pid under the fd this process holds). Run: `zig build
-test-procnet`. The suite is also run on a BIG-ENDIAN CPU — `zig test -OReleaseSafe -target
-mips-linux-musl --test-cmd qemu-mips --test-cmd-bin --dep netaddr -Mroot=modules/procnet/src/root.zig
--Mnetaddr=modules/netaddr/src/root.zig`, 57/57 — which is load-bearing rather than decorative: the
-tests pinning what the *endian-less* `parseTcp`/`parseRoutes` decode expect a DIFFERENT answer per
-target, so a decode that quietly hard-coded little-endian would pass natively and fail there.
-Verified by mutation, both directions: restoring the old unconditional low-byte-first decode turns
-the big-endian-capture tests red in both lanes, and hard-coding the endian-less entry points to
-`.little` passes natively and fails only under qemu-mips.
 
-The parity files (2026-10-17) add: fixtures copied from this machine's own `/proc/self/*` (kernel 7.0) with every expected number read off the fixture; crafted edge cases per parser (a `comm` with `) (` inside, fields missing on older kernels, an overlong `comm`/path, CRLF, negative and overflowing numbers, count-mismatched header/value pairs, a stray line shifting a pair, a unix path with spaces); a test per live reader against THIS process by `.self` and by pid (`getrlimit` as the oracle for `limits`, a listener this test binds for `net/unix`, descriptors it opens for `countFds`, `status` VmRSS against `stat` rss); the page-size test (`parseProcStatWithPage` at 4/16/64 KiB) that fails against the old hard-coded `*| 4`; and `src/fuzz_proc.zig`, eight deterministic-driver harnesses (`PROCNET_FUZZ=<runs>`) with invariants (the full-stat parser agrees with `parseProcStat` on whether a line parses; every borrowed slice lies inside the input) and a 400-seed always-on run that fails if a harness stops reaching its parser. Mutation-tested 2026-10-18 (60/62, 2 equivalent; see "Mutation (2026-10-18" below); fuzz: the 2026-10-17 driver run (8×200k) of the implementation wave.
-
-Beyond the suite, `example/main.zig` was diffed against real `ss` from iproute2 6.19.0 on a live
-host. Five deliberately-created listening sockets (v4/v6, TCP/UDP, wildcard and loopback) compared
-byte-identical on Netid, State, Recv-Q, Local Address:Port, Peer Address:Port and the whole `ss -p`
-process column including the fd number. Whole-machine, `ss -tuln` and the demo each returned 47 rows
-and every row matched after normalising away two renderings `ss` derives from `sock_diag` and
-`/proc/net/*` does not carry (the `%iface` `SO_BINDTODEVICE` suffix, and `*` vs `[::]` for an
-`IPV6_V6ONLY` wildcard). Set-equality against a live machine is not claimable in general — sockets
-open and close between two reads, and `ss` prefers netlink and can legitimately see what these text
-files do not — so the strong claim is the controlled-socket one and the whole-machine figure is a
-snapshot, not an invariant.
-
-**Mutation (2026-10-18,** schemata over a copy of `src/`, one ReleaseSafe build of the whole suite behind a
-`ZL_MUT` switch, each mutant run under `setsid -w timeout -s KILL 20`): 62 mutants in the
-prometheus/procfs parity files and `counters.zig` -- in `pidstat.zig` the `cpuSeconds` sum and `USER_HZ`
-divisor, the start-time divisor, the negative-`rss` and saturating `residentBytes` rules, the field-index
-map and the missing-field bounds; in `pairs.zig` the section/pair resync, the signed-value fallback, the
-mismatch rollback, the dropped non-numeric value and `ipExtOctets`/`get`; in `unix.zig` the separator set,
-the trailing colon, the inode column switch, the path trimming and the flag bit; in `pidfiles.zig` the
-`limits` header, label boundary, `unlimited`, unknown-row count and soft/hard accessors, the `io` field
-count, `kB` and hex conversions, the `NSpid`/CPU-list bounds, `ArgIterator`'s trailing NUL and the
-`cgroup` second colon; in `process.zig` the page-size clamp and multiplier; in `counters.zig` the CPU
-column bounds, `busyFraction`'s two guards, `total`/`busy` terms, the disk name limit and the 11/15/17
-column thresholds, the `/128` prefix bound and the `used` fallback. First run: 47 killed, 15 alive. Seven
-tests added (negative `rss` at any magnitude; a close-paren before the open-paren; an empty section name and a
-table with only `OutOctets`; tab and CRLF separated `unix` rows with flags `0x20000`; a label glued to its
-number and distinct soft/hard values; steal in `total` and an unchanged-busy `busyFraction`; a 32/33-byte disk
-name and a 16-counter row). Rerun: 60 killed, 2 equivalent. Equivalent: `parsePidStat`'s `rp <= lp` guard (a
-line with `)` before `(` has a `)` inside the text before `(`, so the pid prefix fails to parse with the same
-`null`), and the resync of a `pairs.zig` "value line" that has no colon (`pending = val_line` is skipped on
-the next turn of the loop exactly as `lines.next()` would have skipped it). Not mutated: the live `countFds`
-size-versus-directory-listing choice (kernel >= 6.2 reports the count as the size, so the listing path runs
-only on older kernels), and the socket/route/ARP/conntrack files of the earlier run.
-
-**Mutation delta (2026-11-13,** since `bbe3a85c`: the dropped cut row and checked `ipv6_route` digits, the
-`*Reporting` twins, the no-panic sweep fixes; schemata over a detached copy, ReleaseSafe, strict verdict;
-every touched function whole): 128 mutants in `readImpl`, `wholeLinesLen`, `readVirtualLinesReporting`,
-`readVirtualFileReporting`; `parseHex128`, `parseHexU32`, `parsePrefixLen`, `parseIpv6Routes` (all ten field
-guards and assignments), the five `read*From`/`read*Reporting` readers of `counters.zig`, `readStat`,
-`readMeminfo`; the `arp`/`routes` readers; `readSockets`, `readUnix`, `readConntrack`; `SocketOwnerIndex.find`/
-`findAll` and `indexSocketOwners` (process, per-fd, owner and total caps, error mapping, name lookup, sort,
-non-numeric `/proc` entries); `parseLimits`/`parseLimitValue`. **111 killed (4 by a crash), 17 equivalent,
-0 undecided.** Tests added (`sweep_test.zig`, `reported_test.zig`): live `readSockets` and `readUnix` of this
-process's own sockets; `indexSocketOwners` fields, order and `denied` accounting; `max_fds_per_process`
-exactly; a `max_owners` cap met inside this process stops the walk before a forked child with a higher pid;
-descriptor exhaustion (`EMFILE`) is a denied process and a partial sweep; a `/proc/net/udp` past its 512 KiB
-limit is reported truncated and ends on a whole row; every `ipv6_route` column in its own place, including the
-`+`/`-` hole of `parseHexU32`/`parsePrefixLen`; `parseLimits` accounting. Live tests skip when a prerequisite
-is missing or the machine moves under two sweeps. Equivalent: two-hex-digit `parseInt` after `isHex` cannot
-fail and a missing token is `""`, which the length checks already reject (3); no `Resource` label is a prefix
-of another (1); the inner `max_owners` flag is re-set by the outer guard (1); `total_fds >=`/`>` needs control
-of `/proc`'s order (1, as in the sweep's delta); 11 that differ only for a `/proc` file past its fixed limit or
-absent (`/proc/stat` > 1 MiB, `/proc/net/unix` > 16 MiB, conntrack > 4 MiB or not loaded) or on a pid-exit race
-— the injection they need is a path/limit seam. Noted, fixed 2026-11-19: a file of exactly `limit` bytes used to be flagged `truncated` though complete; `readImpl` now reads `limit + 1` bytes, so the flag means "longer than `limit`" (reference: `head -c`-style bounded readers and Go's `io.LimitReader` + one-byte probe idiom report completeness the same way). Combined with the run above: 171/190, 19 equivalent.
-
-### The hex address decode on a big-endian target — measured, and what is left
-
-Two different questions hide behind "does this work on big-endian", and they
-have different answers. Both have now been measured; the second turned out the
-opposite way from what the secondary sources said, and it was a real bug.
-
-**Question 1 — does OUR code behave differently when compiled big-endian? No.
-Measured 2026-08-24, not reasoned about.** The same fixed `/proc/net/tcp` table
-was fed through `parseTcp` in two builds and the decoded addresses compared:
-
-    zig build-exe -target mips-linux-musl ...   # ELF 32-bit MSB, MIPS32
-    qemu-mips ./probe                           # reports: native endian: big
-
-Both builds printed byte-identical results (`0100007F` -> `127.0.0.1`,
-`7F000001` -> `1.0.0.127`), and the module's whole suite was then run the same
-way — `zig test -target mips-linux-musl --test-cmd qemu-mips --test-cmd-bin` —
-with **51/51 passing**.
-
-The reason matters more than the measurement. `hexWord` (`src/sockets.zig`) and
-`hexToV4` (`src/routes.zig`) parse a hex STRING into an integer VALUE with
-`parseInt(u32, s, 16)` and then lay that value out in an explicitly requested
-byte order with `writeInt`. Neither step consults the CPU's representation, so
-no byte-order reinterpretation ever happens and the machine running the decode
-cannot reach the result. (Before the fix below, the octets came out with
-`& 0xff` and `>> 8` instead — different code, same property.) An earlier
-version of this section framed the risk as "the decoders have never been RUN on
-`.linux32`" and read a green `portable-procnet-linux32` row as weak evidence.
-Running them there proves nothing either: there was nothing endian-dependent to
-run — which is exactly why a green cross-target suite was not evidence about
-Question 2, and why the bug below survived one.
-
-**Question 2 — what does a big-endian KERNEL print into the file? Its own byte
-order. MEASURED 2026-08-24, and the answer was the opposite of what the
-secondary sources said.** A big-endian MIPS kernel was booted, a socket bound
-to an address chosen in advance, and `/proc/net/tcp` read back:
-
-    OpenWrt 25.12.4, target malta/be, from
-      openwrt-25.12.4-malta-be-vmlinux-initramfs.elf
-      (sha256 verified against the release's sha256sums)
-    booted under qemu-system-mips -M malta
-    uname -m = mips; /proc/cpuinfo "system type: MIPS Malta"
-    ip link set lo up; dropbear -R -p 127.0.0.1:12345
-    captured 2026-08-24 -> src/testdata/tcp-mips-be.txt
-
-       0: 7F000001:3039 00000000:0000 0A ...
-
-`7F000001` is 127.0.0.1 in NATURAL order; a little-endian kernel writes
-`0100007F` for the same socket (as every other fixture here does). The ground
-truth needs no foreign tool and no `ss`: the address and port were CHOSEN when
-the socket was bound. The port half, `3039` = 12345, is identical on both
-producers — the kernel prints it as a number.
-
-So the eight hex characters are the native-byte-order memory image of a `u32`
-holding the `__be32`, and the address octets are that value written back out
-**in the producing kernel's byte order**. The secondary sources describing the
-file as "little-endian regardless of architecture" are wrong, and so was the
-one primary report that agreed with them (Bitcoin issue #31812, which *inferred*
-the byte order from which tests failed under emulated s390x and quoted no file
-contents). The kernel's own `proc_net_tcp` documentation does not mention
-endianness at all.
-
-**What the module does about it.** Both decoders took the parsed integer's LOW
-byte as the first octet unconditionally, so they decoded that capture as
-`1.0.0.127` — confirmed by an outside consumer built against the published
-module, which printed `local=1.0.0.127:22` for a `7F000001` row. The producing
-byte order is now an explicit parameter of the decode:
-
-* `parseTcp`/`parseUdp`/`parseRoutes` keep their signatures and mean "written
-  by a kernel of THIS machine's byte order". That is correct for every live
-  read by construction — `readSockets`/`readRoutes` read the running kernel's
-  own files — and for any capture that has not crossed architectures.
-* `parseTcpWithEndian`/`parseUdpWithEndian`/`parseRoutesWithEndian` take the
-  producer's byte order for a foreign capture, and are what the little-endian
-  fixtures here are now parsed with, so they keep decoding correctly when the
-  suite runs on a big-endian target.
-
-⚠ A wrong-endian read of `/proc/net/route` does not merely mis-decode: the
-`Mask` column goes through the same path, so a big-endian `FFFFFF00` (/24) read
-low-byte-first becomes 0.255.255.255, which is not a contiguous CIDR mask and
-the row is DROPPED. A big-endian router would have lost routes silently.
-
-**On qemu.** `qemu-mips` user-mode emulation cannot answer Question 2 at all —
-the `/proc` it exposes is the HOST kernel's, so a big-endian process there reads
-little-endian files. That is why a full-system `qemu-system-mips` guest was
-needed for the capture. User-mode qemu remains the right tool for Question 1,
-and the whole suite is run under it (`zig test -OReleaseSafe -target
-mips-linux-musl --test-cmd qemu-mips --test-cmd-bin`) precisely so the
-native-order tests get evaluated on a big-endian CPU as well as this one.
-
-Closed the same day for `tcp6` as well. The v6 case was briefly covered by a
-test DERIVED from the measured v4 rule, on the reasoning that a v6 column is
-four of the same `__be32`-as-host-word groups — and on the belief that the
-big-endian guest had no IPv6. That belief was simply wrong: `/proc/net/tcp6`
-exists on it, and only the loopback address had not been configured. So the
-capture was taken too, from the same guest and the same way:
-`ip -6 addr add 2001:db8:1:2:3:4:5:6/128 dev lo`, then
-`dropbear -R -p [2001:db8:1:2:3:4:5:6]:12345`. The address is asymmetric in
-every one of the four words, so a wrong per-word byte order and a wrong WORD
-order would both show. The big-endian kernel wrote it straight through —
-`20010DB8 00010002 00030004 00050006` — where a little-endian kernel writes
-four swapped words, `B80D0120 02000100 04000300 06000500`. The reasoning had
-been right; it is now evidence instead of an argument, in
-`testdata/tcp6-mips-be.txt`, and the test also asserts that reading those bytes
-with the WRONG producer order does not yield the address, so the fixture cannot
-pass for the wrong reason.
+- **Run:** `scripts/modtest procnet` (`zig build test-procnet`); the fuzz verdict with
+  `PROCNET_FUZZ=<runs>[,<first seed>]` (`PROCNET_FUZZ_ONLY=<substring>` for one harness); the
+  benchmark with `zig build bench-procnet`.
+- **Pure parsers, golden text.** Every table has fixtures under `src/testdata/` (real captures,
+  including real `tcp6`/`udp6` kernel captures that verify the four-word hex IPv6 decode, and a
+  real BIG-ENDIAN `/proc/net/tcp` and `tcp6` capture, `tcp-mips-be.txt` / `tcp6-mips-be.txt`,
+  whose ground truth is the address the capture script itself bound; the test also asserts that
+  reading those bytes with the WRONG producer order does not yield the address). Malformed-row
+  skipped-not-fatal cases, per-column tests for every field decoded out of a socket row, and the
+  `readVirtualFile` streaming-vs-`stat`-size-0 behaviour with its truncate-don't-vanish limit.
+- **Per-process readers:** fixtures copied from a real machine's `/proc/self/*` with every expected
+  number read off the fixture; crafted edge cases per parser (a `comm` with `) (` inside, fields
+  missing on older kernels, an overlong `comm`/path, CRLF, negative and overflowing numbers,
+  count-mismatched header/value pairs, a stray line shifting a pair, a unix path with spaces); a
+  test per live reader against THIS process by `.self` and by pid (`getrlimit` as the oracle for
+  `limits`, a listener the test binds for `net/unix`, descriptors it opens for `countFds`,
+  `status` VmRSS against `stat` rss); the page-size test (`parseProcStatWithPage` at 4/16/64 KiB).
+- **Live smoke tests** against the real `/proc` (skipped when a prerequisite is missing or the
+  machine moves under two sweeps), including one that opens its own listener and asserts the
+  process join attributes it to this pid under the fd this process holds; `src/sweep_test.zig`
+  and `src/reported_test.zig` pin the caps (`max_fds_per_process` exactly, `max_owners` met
+  inside this process stops the walk before a forked child with a higher pid, descriptor
+  exhaustion is a denied process and a partial sweep), the `*Reporting` truncation flags (a
+  `/proc/net/udp` past its read limit is reported truncated and ends on a whole row), every
+  `ipv6_route` column in its own place, and the `find`/`findAll` cost (measured in thread CPU
+  time, not wall clock).
+- **Big-endian CPU.** The suite is also run under `zig test -OReleaseSafe -target mips-linux-musl
+  --test-cmd qemu-mips --test-cmd-bin --dep netaddr -Mroot=modules/procnet/src/root.zig
+  -Mnetaddr=modules/netaddr/src/root.zig`. It is load-bearing rather than decorative: the tests
+  pinning what the endian-less `parseTcp`/`parseRoutes` decode expect a DIFFERENT answer per
+  target, so a decode that quietly hard-coded little-endian passes natively and fails there.
+- **Fuzz:** `src/fuzz_proc.zig`, eight deterministic-driver harnesses (`pidstat`, `limits`,
+  `status`, `io`, `cgroup`, `cmdline`, `pairs`, `unix`; `PROCNET_FUZZ=<runs>`) with invariants (the
+  full-stat parser agrees with `parseProcStat` on whether a line parses; every borrowed slice lies
+  inside the input), and an always-on run (400 seeds each) that fails if a harness stops
+  reaching its parser; the older parsers have `std.testing.fuzz` corpus harnesses (`fuzzsample.zig` turns a seed into a
+  sample of `/proc` text), and `counters.zig` also runs a deterministic PRNG-script driver through
+  every counter parser. Never `zig build --fuzz`.
+- **Against a foreign tool:** `example/main.zig` (the `ss`-shaped demo) was diffed against real `ss`
+  from iproute2 on a live host. Controlled listening sockets (v4/v6, TCP/UDP, wildcard and
+  loopback) compared byte-identical on Netid, State, Recv-Q, Local Address:Port, Peer
+  Address:Port and the whole `ss -p` process column including the fd number; on a whole machine
+  every row matched after normalising two renderings `ss` derives from `sock_diag` and
+  `/proc/net/*` does not carry (the `%iface` `SO_BINDTODEVICE` suffix, and `*` vs `[::]` for an
+  `IPV6_V6ONLY` wildcard). Set-equality against a live machine is not claimable in general —
+  sockets open and close between two reads, and `ss` prefers netlink — so the strong claim is the
+  controlled-socket one.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it. Not mutated: the live `countFds`
+  size-versus-directory-listing choice (kernel >= 6.2 reports the count as the size, so the
+  listing path runs only on older kernels).
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-procnet`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 16.9 %): ref 0.16–0.89×, against 0.16–0.95× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+`zig build bench-procnet` (`tools/bench.zig` with `tools/go_bench/`; see `tools/README.md`) is the
+comparative benchmark against prometheus/procfs, the reference. The card's Performance line is the
+authoritative figure.
+
+## What is deliberately not done
+
+- **Per-socket columns past `inode` in `/proc/net/{tcp,udp}`** (the `tr:tm->when` timer,
+  `retrnsmt`, `timeout`, and the TCP diagnostics tail `rto`, `ato`, `snd_cwnd`, `ssthresh`): `ss -o`
+  and `ss -i` territory, a per-connection timing/congestion view with its own shape that is
+  answered better over `sock_diag` than from this file.
+- **`statvfs` / `/proc/mounts` disk usage**: filesystem space, not a `/proc/net` or per-process
+  concern (`diskfree`/`diskusage` own it).
+- **Writing to any `/proc`/`/sys` file** and anything requiring privileges beyond normal `/proc`
+  read permissions (read-only by design).
+- **The parity scope's exclusions** (the `/sys` tree, fdinfo/maps/smaps/schedstat/psi/interrupts/
+  softirqs, mountstats, `/proc/sys`, per-process `environ`/`exe`/`cwd`, sockstat/softnet/protocols/
+  wireless/xfrm/tls_stat/ipvs, cpuinfo, vmstat, zoneinfo, swaps): listed under *Compared with*.
+- **A `/proc/net/unix` forged-row filter**: not possible in a text parser (see *Threat model*).
+
+## Open
+
+- **No comparison against the fastest implementation in the field** (the card's `fastest ?`):
+  prometheus/procfs is the only measured side.
 
 ## Backlog / deferred
-- **Delta mutation 2026-11-19** *(wave 9, base `d8cf18e39`: `readImpl` one-byte probe, `pairs.readTable`, `pidfiles.readPidCgroups`)* — 16 schemata mutants (probe `limit +| 1` to `limit` and to `+| 2`, `StreamTooLong` flag, `>` to `>=` and to `true`, the flag set and the shrink skipped or off by one; line-wise read swapped for the plain read and the limit ignored in both readers; `CgroupList.truncated` forced false/true; the cgroup limit constant): 14 killed, 2 EQUIVALENT (`+| 2`: one more byte is read and cut again, cost-only; `truncated = !mut` in the `StreamTooLong` arm: the following `len > limit` test sets the flag for the same input, the arm is redundant). One survivor on the first run (`pairs.readTable` limit forced to 0: the live test skipped on the empty table) killed by a new test that reads the file independently and then requires rows; cumulative on the card 192/214, 22 eq.
-- **Delta mutation 2026-11-18** *(`UnixOptions.max_entries`)* — 8 schemata mutants over `parseUnix`/`readUnix` (cap comparison `>=` to `>` and to `-| 1`, the flag dropped or forced false, `break` dropped, `or` to `and`, `or` reduced to either side): 7 killed, 1 UNOBSERVABLE (dropping `f.truncated` from `t.truncated or f.truncated` in `readUnix` needs a `/proc/net/unix` over the 16 MiB read limit; `readVirtualLinesReporting` itself is tested for that flag), counted with the equivalents on the card (cumulative 178/198, 20 eq). New tests: `parseUnix: max_entries caps forged short rows...` (cap, cap - 1, 0, junk past the cap) and `readUnix: max_entries cuts the live table...` (also pins the 524 288 default).
-- **Delta review 2026-11-02** *(read-only, independent, `bbe3a85c..` of `src/`)* — covered the changes since the recorded audit, not the whole module, with no mutation run, so the `**Audit:**` line stays stale on purpose (A1 needs a mutation run over the current source). No fix needed; the `readUnix` memory item below stays open. Low, practically unreachable: `pairs.readTable` (1 MiB limit) and `readPidCgroups` (64 KiB) do not use the whole-line read, so a cut could end inside a value. ✅ DONE 2026-11-19: both read whole lines now (`CgroupList.truncated` added). Test quality: `SocketOwnerIndex.find cost does not grow...` asserted a wall-clock ratio and could flake under load. ✅ DONE 2026-11-19: it now measures thread CPU time.
-- **`indexSocketOwners` default memory** *(sweep GO, 2026-10-30)* — `SocketOwnerOptions.max_owners = 1 << 20` x 88 B = ~92 MB live (up to ~2.5x while the list grows) is the worst case a local user can force with dup'd sockets. Bounded and documented, not a bug; a lower default (or a byte budget) is an owner policy decision.
-- **`readUnix`/`parseUnix` `max_entries` option** *(sweep GO review REV-PN-2, 2026-10-30)* — forged short rows inside AF_UNIX socket names amplify ~12x (17 B of text -> 176 B `UnixEntry`), up to ~185 MB live from the 16 MiB read limit. Needs a signature change (an options argument with `max_entries` and a `truncated` flag); documented on both functions meanwhile. ✅ DONE 2026-11-18: `parseUnix`/`readUnix` take `UnixOptions{ max_entries = 1 << 19 }` (524 288 rows x 176 B = about 92 MB worst case, the order of `SocketOwnerOptions.max_owners`) and `parseUnix` now returns `UnixTable` with `truncated` (cap hit: the first valid row past it stops the parse; exactly `max_entries` rows is not truncated). Reference: prometheus/procfs has no cap; the shape copies `readConntrack`'s cap + flag and `SocketOwnerOptions`.
-- **`indexSocketOwners` `max_total_fds`** *(REV-PN-1)* — added, default `1 << 20` examined descriptors across all processes; worst-case work is `min(max_processes x max_fds_per_process, max_total_fds)` `readlinkat` calls.
-- **`/proc/net/unix` can be forged by a local user** *(audit 2026-10-19, `procnet-S9-3`)* — `src/unix.zig` `parseUnix`: a pathname socket name may contain `\n`, so `bind("x\n<well-formed row>")` makes the kernel print a second, attacker-written row (any inode, flags, path). Not fixable in a text parser (a forged row is indistinguishable); documented at `parseUnix`. A consumer deciding who listens on what should use `NETLINK_SOCK_DIAG` (`ss` does), which is a different module's job (`netlink`).
-- **`readArp`/`readRoutes`/`readIpv6Routes`/`readNetDev`/`readDiskstats` truncate silently** *(audit 2026-10-19)* — the cap (256 KiB arp/route ≈ 3 000 rows) is documented, but unlike `readSockets`/`readConntrack`/`readUnix` the result carries no `truncated` flag; adding one changes the return types (BREAKING), so it waits for an owner decision. **DONE 2026-10-20:** non-breaking `read*Reporting` twins returning `Reported(T){ entries, truncated }`; the plain readers are unchanged thin wrappers.
-**2026-10-17 — done, prometheus/procfs parity pass:** `/proc/net/unix`, `/proc/<pid>/status`, `/proc/net/{snmp,netstat}` (and the per-pid twins), plus full `/proc/<pid>/stat`, `limits`, `io`, `cmdline`, `cgroup`, fd count, `ProcRef` (`.self`/pid) and the runtime page size. The entries below that name them are history. Still open: mutation run 2026-10-18 (60/62, 2 eq) and the 8×200k fuzz driver run on the new files, no bench vs procfs.
 
-Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row
-shape entirely: a filesystem path or an abstract NUL-containing name, no address/port pair, so it
-wants its own entry type; it was missing from the DEFER list itself until 2026-08-23, which made the
-list read as if it were covered); the socket columns past `inode` (`tr:tm->when`, `retrnsmt`,
-`timeout`, and the `rto`/`ato`/`snd_cwnd`/`ssthresh` tail — `ss -o`/`ss -i` territory, and the
-congestion half is answered better over `sock_diag` than from this file); the conntrack **reply**
-tuple and `mark`/`use`/`packets`/`bytes` (where NAT translation is visible; `ConntrackFlow` says it
-decodes the original direction only); ~~`/proc/net/dev`~~ and ~~`/proc/diskstats`~~ (done 2026-10-04, see below); `/proc/<pid>/status` (richer per-process fields — VmRSS breakdown, uid/gid, cgroup —
-beyond `stat`'s scalars, a planned `status.zig` sibling to `process.zig`); ~~`/proc/net/ipv6_route`~~ (done 2026-10-04); `statvfs`/
-`/proc/mounts` disk-usage (a different module axis, not a `/proc/net`/per-process concern).
-
-- **Counters, 2026-10-04 — survey ranks (1)–(4) done** except `/proc/net/unix`: `counters.zig`
-  parses `/proc/net/dev` (name split at the first `:` — it is right-aligned and may touch the
-  colon), `/proc/stat` (`cpu`/`cpuN`, `ctxt`, `btime`, `processes`, `procs_*`; guest time is NOT
-  added to `total` because proc(5) says it is already inside user/nice; `busy` excludes iowait as
-  top/mpstat/gopsutil do), `/proc/meminfo` (exact key up to the colon; null = line absent,
-  distinct from 0), `/proc/diskstats` (iostats.rst fields 1–11, the discard group 12–15 and flush
-  group 16–17 only when the row has them — a 14-counter row reports neither), `/proc/net/ipv6_route`
-  (network-order hex, exact field widths, prefix ≤ 128). Hostile input: every row that is not the
-  documented shape is skipped; counters are parsed into u64 and summed saturating. Still deferred:
-  **`/proc/net/unix`** (own row shape, no consumer yet), **`/proc/<pid>/status`** (planned
-  `status.zig`), **`/proc/net/{snmp,netstat}`** (header/value line pairs; no consumer yet).
-- **Survey ranking** *(survey 2026-09-30)* — what a gopsutil / procfs user hits first, none present (`rg 'net/dev|/proc/stat|diskstats|net/snmp|net/unix|ipv6_route' src/` matches only a `/proc/cpuinfo` comment): (1) **`/proc/net/dev`** interface byte/packet/error counters — the single most common network reading; small (one table parser, same shape as `arp.zig`); (2) **`/proc/stat` CPU times + `/proc/meminfo` as a typed struct** — the host-health basics `snapshot` only samples in part; small; (3) **`/proc/diskstats`**; small; (4) **`/proc/net/unix`** and **`/proc/net/ipv6_route`**; small-medium each (own entry types); (5) **`/proc/<pid>/status`**; small-medium; (6) `/proc/net/snmp` + `netstat` counters; small. All fit §2.
-
-## Status
-`extract · linux · util · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
-src/root.zig.
+- **Conntrack reply tuple and `mark`/`use`/`packets`/`bytes`.** `ConntrackFlow` decodes the
+  original-direction tuple only, which the type says; the reply tuple is where NAT translation is
+  visible and deserves explicit modelling rather than four more fields.
+- **`indexSocketOwners` default memory.** `SocketOwnerOptions.max_owners = 1 << 20` × 88 B is about
+  92 MB live; a lower default (or a byte budget) is an owner policy decision.
 
 ## Anchoring
 
