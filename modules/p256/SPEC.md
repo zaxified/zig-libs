@@ -26,13 +26,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openssl/openssl](https://github.com/openssl/openssl) — **reference** (nistz256) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | ECDSA and ECDH over P-256/384/521, any digest, DER keys (SPKI/PKCS#8/SEC1), FIPS provider. README's measurement: sign 37 µs against OpenSSL 3.5.5's 24.6 µs quiet / 36.8 µs loaded; verify 125–128 µs against 128 µs — level within noise, on one host. |
+| [openssl/openssl](https://github.com/openssl/openssl) — **reference** (nistz256) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | ECDSA and ECDH over P-256/384/521, any digest, DER keys (SPKI/PKCS#8/SEC1), FIPS provider. Measured against it: the card's **Performance:** line. |
 | [Go `crypto/ecdsa`](https://pkg.go.dev/crypto/ecdsa) + [`crypto/ecdh`](https://pkg.go.dev/crypto/ecdh) | Go | BSD-3-Clause | — | current Go release | P-224/256/384/521, `ecdh` key objects with `ECDH()` method, ASN.1/raw signatures, deterministic ECDSA per RFC 6979 *(inferred for the current release)*; P-256 has assembly on amd64/arm64/s390x/ppc64le *(inferred)*. |
 | [RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves) `p256` | Rust | Apache-2.0 OR MIT | 876 | pushed 2026-09-28 (crate 0.14.0 at main) | `ecdsa` + `ecdh` + `hash2curve` + `pkcs8` integration through the `elliptic-curve` trait family; constant-time generic field arithmetic, no hand-written asm *(inferred)*. |
 | [briansmith/ring](https://github.com/briansmith/ring) | Rust/asm | ISC-style + Apache-2.0 parts (LICENSE read) | 4.1k | pushed 2026-07-23 | ECDSA P-256 sign/verify and ECDH agreement with BoringSSL-derived nistz256 *(inferred)*; no point-level API. |
 | Zig `std.crypto.ecc.P256` + `sign.ecdsa` | Zig | MIT | — | Zig 0.16.0 | Portable fiat-crypto field, no asm; full point API, SEC1 codecs, ECDSA over any hash. This module is bit-exact with it and about 10× faster on sign, 3× on verify (README, one host). |
 
-**Where we are ahead:** the fastest pure-Zig P-256 by a wide margin and, per the README's same-day measurement, level with OpenSSL nistz256 on sign and verify without C or libc; bit-exact with `std` and RFC 6979; ECDH (`ecdh`/`ecdhInto`) and ECDSA over any hash (`Ecdsa(Hash)`) in std's shape, both burned; Wycheproof ECDSA (SHA-256 P1363 + DER, SHA-512 P1363 + DER, SHA3-256 DER) and Wycheproof ECDH vectors, NIST CAVP 186-4 SigVer/SigGen/KeyPair/PKV and the ECC CDH primitive; ctgrind targets with positive controls; drop-in `EcdsaP256Sha256` shape. **Where we are behind:** asm only on amd64+ADX/BMI2, other targets run the portable Solinas path (aarch64 field core → Backlog 11); no hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_ — RustCrypto has it; → Backlog 12). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, as in `p384`/`p521`; P-384/P-521 are separate modules.
+**Where we are ahead:** the fastest pure-Zig P-256 by a wide margin and close to OpenSSL nistz256 on sign, verify and ECDH without C or libc (the card's **Performance:** line); bit-exact with `std` and RFC 6979; ECDH (`ecdh`/`ecdhInto`) and ECDSA over any hash (`Ecdsa(Hash)`) in std's shape, both burned; Wycheproof ECDSA (SHA-256 P1363 + DER, SHA-512 P1363 + DER, SHA3-256 DER) and Wycheproof ECDH vectors, NIST CAVP 186-4 SigVer/SigGen/KeyPair/PKV and the ECC CDH primitive; ctgrind targets with positive controls; drop-in `EcdsaP256Sha256` shape. **Where we are behind:** asm only on amd64+ADX/BMI2, other targets run the portable Solinas path (aarch64 field core → *Backlog / deferred*); no hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_ — RustCrypto has it; → *Backlog / deferred*). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, see *What is deliberately not done*.
 
 ## Dedup — why this module exists although std HAS P-256
 
@@ -53,9 +53,8 @@ by two facts:
    staying zero-C/no-libc — is exactly that thesis applied to the second most
    deployed curve in the repo (after secp256k1 / `k256`).
 
-The realistic target is **~2–3× OpenSSL nistz256**, the same ballpark the sibling
-`k256` arc reached vs libsecp256k1. Parity with decades-tuned asm-grade C is
-explicitly a non-goal.
+The original target was ~2–3× OpenSSL nistz256, the same ballpark the sibling `k256` arc reached against libsecp256k1;
+the module has since reached and passed it (the card's **Performance:** line).
 
 This module is the direct P-256 analogue of `k256` and REUSES its structure (the
 gated-core split, the portable-oracle/asm-differential harness, the
@@ -64,31 +63,22 @@ called out below.
 
 ## Field representation — four full 2^64 limbs
 
-> **Since 2026-10-10 `Fe` is MONTGOMERY-domain** (`limbs = a·2^256 mod p`,
-> canonical). `mul`/`sq` are a MULX/ADX product followed by a Montgomery REDC
-> (`fast_core.montMul`/`montSq`, ~68 TSC cycles against 131 for the word-shuffle
-> Solinas multiply below): for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each of
-> the four rounds' quotient digit is the low limb itself and `m·p` is two shifts
-> plus one 64×64 multiply. The portable path is `field.montMulPortable`
-> (`montReducePortable`, the `(p+1)/2^64` shortcut, comptime-evaluable — the
-> comb table is built through it); `oracle_test.zig` pins asm and portable to a
-> naive textbook REDC. `fromBytes`/`fromInt` convert in (`·R²`, or `(x≪256) mod p`
-> at comptime), `toBytes`/`toInt`/`isOdd` convert out with a scalar four-round
-> REDC (`fromMontLimbs`, register-only: the pointer-based asm call left an ECDH
-> shared `x` on the caller's dead stack — stack probe, 2026-10-10), `invert`
-> multiplies safegcd's `(aR)⁻¹` by `R³`. `add`/`sub`/`neg`/`cMov`/`isZero`/
-> `equivalent` are domain-agnostic and unchanged. `Fe.limbs` is still a public
-> field; no consumer reads it. Everything below about the NORMAL-domain Solinas
-> reduction still describes `field.mulPortable`/`fast_core.fieldMul`, which are
-> kept with their differentials but no longer reached by `Fe`.
+`Fe` stores the base-field value as **four full 2^64 little-endian limbs** (`[4]u64`), always canonical (`< p`) between
+operations, in the **Montgomery domain** (`limbs = a·2^256 mod p`, `R = 2^256`). `mul`/`sq` are a MULX/ADX product followed
+by a Montgomery REDC (`fast_core.montMul`/`montSq` and the register-returning `montMulRegs`/`montSqRegs` the field calls,
+`field.zig:281`): for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each of the four rounds' quotient digit is the low limb itself
+and `m·p` is two shifts plus one 64×64 multiply. The portable path is `field.montMulPortable` (`montReducePortable`, the
+`(p+1)/2^64` shortcut, comptime-evaluable — the comb table is built through it); `oracle_test.zig` pins asm and portable to
+a naive textbook REDC. `fromBytes`/`fromInt` convert in (`·R²`, or `(x≪256) mod p` at comptime), `toBytes`/`toInt`/`isOdd`
+convert out with a scalar four-round REDC (`fromMontLimbs`, register-only: a pointer-based asm call left an ECDH shared `x`
+on the caller's dead stack), `invert` multiplies safegcd's `(aR)⁻¹` by `R³`. `add`/`sub`/`neg`/`cMov`/`isZero`/`equivalent`
+are domain-agnostic. `Fe.limbs` is a public field. The API mirrors `std.crypto.ecc.P256.Fe` method for method, so
+`group.zig` is a drop-in and the oracle differential is a direct `p256.Fe.op == std.Fe.op` comparison via `toBytes` (both
+representations serialise to the same canonical integer).
 
-`Fe` stores the base-field value as **four full 2^64 little-endian limbs**
-(`[4]u64`), always canonical (`< p`) between operations, **NORMAL domain** (not
-Montgomery — the special reduction is used directly, as nistz256 does for its
-field). The API mirrors `std.crypto.ecc.P256.Fe` method-for-method, so `group.zig`
-is a drop-in and the oracle differential is a direct `p256.Fe.op == std.Fe.op`
-comparison via `toBytes` (both representations serialise to the same canonical
-integer regardless of internal domain).
+The Solinas reduction below is the normal-domain reduction: `field.mulPortable`/`sqPortable` and
+`fast_core.fieldMul`/`fieldSq` are kept with their differentials as an independent second reduction and are not reached by
+`Fe`.
 
 ### The special-prime (Solinas) reduction — the curve-specific, Fable-hard part
 
@@ -109,9 +99,8 @@ subtract of `p`. The 11-fold portable reduction was validated against a bignum
 was written.
 
 **Carry propagation in this fold is the classic error-prone spot** and the reason
-this reduction is the Fable-hard core: the gated `MULX/ADX` version
-(`fast_core.fieldMul`/`fieldSq`, IMPLEMENTED in the core phase) must reproduce the
-SAME reduction (same canonical result) on explicit 64-bit limbs. Two equivalent
+this reduction is the Fable-hard core: the `MULX/ADX` version
+(`fast_core.fieldMul`/`fieldSq`) reproduces the SAME reduction (same canonical result) on explicit 64-bit limbs. Two equivalent
 limb-level shapes (documented in `fast_core.zig`; the implemented core uses the
 second):
 
@@ -132,7 +121,7 @@ of 59, each batch run on the low 64 bits of `(f, g)` and applied once as a 2×2
 matrix to 5-limb signed-62 vectors — the libsecp256k1 `modinv64` shape, generic
 over the modulus so the scalar field shares it. The Fermat inverse `a^(p−2)`
 (`Fe.invertFermat`) stays as the oracle the differential pins it to and as the
-gate-off fallback. Measured 2026-09-28: 12.1 µs → ~2.4 µs. Square roots use
+gate-off fallback. Square roots use
 `a^((p+1)/4)` (valid because `p ≡ 3 (mod 4)`); they are only reached by
 compressed-point decoding, so they stay on the exponentiation.
 
@@ -154,14 +143,15 @@ reason the fixed-base table can be stored affine.
 Scalar multiply variants (**NO GLV** — see below):
 
 - **`mul`** — CONSTANT-TIME variable-base multiply (secret scalars: key
-  derivation). Scaffold: fixed 256-bit double-and-add with a branch-free `cMov`
-  bit select. Gated fast core: `mulCtWindowed`. `mul` on the base point itself
+  derivation). Gate-off fallback: fixed 256-bit double-and-add with a branch-free
+  `cMov` bit select. Gated fast core: `mulCtWindowed`. `mul` on the base point itself
   (std's ECDSA signer calls `basePoint.mul`) redirects to `combMulBase`.
 - **`combMulBase`** — CONSTANT-TIME fixed-base `s·G` (the ECDSA signing path:
-  nonce commitment `k·G` + pubkey `d·G`). Scaffold: falls back to the double-and-add
-  ladder over `G`. Gated fast core: `combMulBaseFast` — 43 windows of 6 bits over a
-  comptime AFFINE table (`base_table`, 43 × 32 × 64 B = 88 064 B), one masked
-  gather + one complete mixed addition per window, no doublings.
+  nonce commitment `k·G` + pubkey `d·G`). Gate-off fallback: the double-and-add ladder over
+  `G`. Gated fast core: `combMulBaseFast` — 43 windows of 6 bits over a comptime
+  AFFINE table (`base_table`, 43 × 32 × 64 B = 88 064 B), one masked gather + one mixed
+  addition per window, no doublings (the incomplete CT Jacobian mixed addition below the
+  top window, the complete formula on it; the argument is in `combMulBaseFastWithTable`).
 - **`mulPublic` / `mulDoubleBasePublic`** — VARIABLE-TIME public-scalar multiplies
   (verification's `u1·G + u2·Q`), in **Jacobian coordinates** (`group.Jac`: dbl
   4M+4S as one generated asm block on amd64, 3M+5S in Zig elsewhere; mixed add
@@ -199,8 +189,37 @@ branch-free (`setcc`/`cmov`/masks, no `Jcc` on the scalar), and the conditional
 point negation a masked field-negate. The comb table is built at **comptime** via
 the portable field path (the `@inComptime()` guard in `field.zig` keeps the runtime
 asm core out of the comptime interpreter) and stored **projective** (no comptime
-inversions). Disassembly of the ReleaseFast `k·G` should confirm zero indirect
-jumps and zero secret-indexed loads before the core is declared done.
+inversions). ctgrind (row `comb`) measures that property.
+
+## Design notes by feature
+
+- **Field in registers.** `fast_core.addRegs`/`subRegs` (`fast_core.zig:904`, `:956`) do the field add/sub on register
+  operands (LLVM lowered the portable `u256` versions with `setb` to memory and `sbb $0` mask chains), and the Montgomery
+  products return their result in registers (`montMulRegs`/`montSqRegs`) instead of through an out-pointer, with a
+  canonical tail that subtracts `p` in place and adds it back masked. `cmov` stays out of the tail: memcheck flags a CMOVcc
+  on a secret just as it flags a jump, which would blind ctgrind. The multiply is an interleaved (CIOS) Montgomery
+  multiply.
+- **Generated point formulas** (`src/point_asm.zig`). One generated asm block per point formula: a comptime field program
+  over a scratch frame, with the field core's multiply, square and REDC text rebased onto frame offsets, add/sub with
+  memory operands, and register forwarding (an add/sub/half whose operand is the previous result takes it from registers;
+  a result is stored only when a later op reads its slot from memory or it is an output). The operation order is
+  nistz256's, chosen because every `adc`/`sbb`/`adcx`/`adox`/shift competes for the same two ports and a square costs a
+  multiply in this core: doubling is 4M + 4S + 11 add/sub/half (`Z3 = 2·Y·Z`, `S = (2Y)²·X`, `8Y⁴` as half of `(2Y)⁴`;
+  `point_asm.zig:326`) instead of dbl-2001-b's 3M + 5S + 16, and the CT mixed addition is madd-2004-hmv, 8M + 3S + 7 add/sub
+  (`point_asm.zig:365`, `Jac.addMixedCtFormula`). `Jac.dblFormula` (dbl-2001-b) is kept as the oracle and as the
+  doubling where the field core is not asm, so the differential in `group.zig` compares bit for bit; `Jac.dblTimes` runs
+  a window's five doublings over one frame (`group.zig:866-899`). amd64 only, like the field core.
+- **Windowed variable-base multiply (`mulCtWindowed`).** Fixed window w = 5, 52 signed digits in [−16, 15], a table of the
+  magnitudes {1..16}·P built on a public schedule and made affine by one constant-time batch inversion
+  (`batchToAffineCt`), then per digit 5 Jacobian doublings and one table add, top-down; the incomplete CT mixed addition
+  is used above the last window (the argument is in `mulCtWindowed`).
+- **Fixed-base comb.** w = 6, 43 windows over the affine `base_table`; the accumulator is Jacobian, windows below the top
+  use the incomplete CT mixed addition (`acc = ±Q` is impossible there because the partial sum is smaller in magnitude
+  than the next digit's contribution; the identity is a masked select), the top window uses the complete formula.
+- **Key generation** draws the secret scalar directly from the CSPRNG by rejection (32 random bytes kept iff `0 < d < n`,
+  a branch-free range test), as OpenSSL and Go do, instead of std's HMAC-DRBG over a random seed (`sign.zig`,
+  `KeyPair.generateInto`); `generateDeterministic` keeps std's derivation byte for byte.
+- **Scalar inverse and field inverse** are the constant-time safegcd of `modinv.zig`, described above.
 
 ## Constant-time contract
 
@@ -213,33 +232,17 @@ jumps and zero secret-indexed loads before the core is declared done.
   fallback `mulDoubleAddCt` is a fixed 256-iteration double-and-add with `cMov`.
   `mulPublic`/`mulDoubleBasePublic` are explicitly VARIABLE-TIME and only for
   PUBLIC scalars (verification), matching std's contract.
-  Secret POINT (2026-11-13, ctgrind row `secpt`, found by a voprf harness): the
-  fast-path test `isBasePointRepr` is branch-free (limbs of the three differences
-  OR-ed, one compare), where it used to short-circuit on x, then y, then z. The one
-  jump on its verdict ("the point is exactly G") is declassified: it is false for
-  every point except the public constant, so a secret point reveals nothing unless
-  it equals G (about 2^-256 for a hashed point). Row `secpt`: 2 in-file before the
-  fix, 1 after (the product's `rejectIdentity` verdict, as in `comb`).
-  Secret SCALAR against an arbitrary point (2026-11-18, ctgrind row `ecdh`):
-  `p256.ecdh` with the private key tainted. No p256 row fed `mulCtWindowed` a
-  secret digit before; the hpke and tls13 P-256 rows reach it through their
-  consumers. 3 in-file, all verdicts: the two range checks on the secret
-  (ecdh.zig:55/:56, revealed by the error) and the product's `rejectIdentity`
-  (group.zig:585).
-  **Portable REDC, finding (2026-11-18):** the portable path (no ADX/BMI2: aarch64,
-  baseline x86-64) branched on a secret. With `CTGRIND_CPU=x86_64` the `secpt` row
-  gave 2 in-file where the native one gives 1. The extra context: `Conditional
-  jump` at `montReducePortable` (field.zig:258), under `montMulPortable` <
-  `Fe.mul` < `batchToAffineCt` (group.zig:1225) < `mulCtWindowed` (group.zig:531)
-  < `mulInto`. That is the table of multiples of a SECRET point. In the
-  disassembly, `keep_bit = d[1] & ~hi` was a `jae` on the borrow of the `lo − p`
-  subtract in that one inlined copy, and a `cmovae` in the 75 others; only the
-  combined bit went through `blackBox`. Fix: launder both flags before combining
-  them (`blackBox(d[1]) & ~blackBox(hi)`), and the same in the portable `Fe.add`,
-  which has the identical shape although no context was seen there. After the
-  fix the portable `secpt` is back to 1, the native rows are unchanged (`--check`
-  OK), and the native ADX path is untouched. CI measures ctgrind at
-  `CTGRIND_CPU=skylake` only, so nothing guards the portable path (Backlog 13).
+  Secret POINT (ctgrind row `secpt`): the fast-path test `isBasePointRepr` is branch-free (limbs of the three differences
+  OR-ed, one compare). The one jump on its verdict ("the point is exactly G") is declassified: it is false for every point
+  except the public constant, so a secret point reveals nothing unless it equals G (about 2^-256 for a hashed point). The
+  row's one in-file context is the product's `rejectIdentity` verdict, as in `comb`.
+  Secret SCALAR against an arbitrary point (ctgrind row `ecdh`): `p256.ecdh` with the private key tainted reaches
+  `mulCtWindowed` with secret digits. Its in-file contexts are all verdicts: the two range checks on the secret
+  (`ecdh.zig`, revealed by the error) and the product's `rejectIdentity` (`group.zig`).
+  Portable path (no ADX/BMI2: aarch64, baseline x86-64): the conditional subtract of `montReducePortable` launders both of
+  its flags before combining them (`blackBox(d[1]) & ~blackBox(hi)`, `field.zig:263`), and the portable `Fe.add` does the
+  same, because LLVM lowered the combined bit to a `jae` in one inlined copy. The CI lane `ctgrind portable amd64`
+  (`CTGRIND_CPU=x86_64`) measures this path against its own pins, so it is guarded as the native one is.
 - **Scalar**: `mul`/`add`/`sub`/codecs are std's constant-time fiat field, wrapped;
   `invert` is this module's safegcd (`modinv.zig`, fixed 590 divsteps, every
   decision a `blackBox`-laundered mask), re-encoded through std's branch-free
@@ -249,477 +252,121 @@ jumps and zero secret-indexed loads before the core is declared done.
   (`zeta < 0`, `g` odd), the signs of `d`/`e`/`f` and the two conditional modulus
   adds in `normalize` are masked selects with laundered masks; `i64×i64→i128`
   multiplies only. The only branch is on the comptime modulus limbs.
-- **Gated cores** carry the same contract: the `MULX/ADX` field fold's trip count
+- **Gated cores** carry the same contract: the `MULX/ADX` field core's trip count
   derives only from the public limb count; the comb/windowed gather must stay the
   `blackBox`-guarded masked scan.
 
-The SCAFFOLD's portable path is the correctness reference, not a hardened
-production target on its own; hardware side-channel review (esp. of the eventual
-addition-chain inverse and the comb gather) is a later-phase obligation.
+The portable path is the correctness oracle and the non-amd64 fallback; it is held to the same contract and measured by
+the portable ctgrind lane.
 
 ## Scope — the scalar field is std's arithmetic with this module's inverse
 
-Scalar-field `mul`/`add`/`sub` mod `n` are a handful of ~80 ns operations per
-signature and `n` has no exploitable special form, so `scalar.zig` wraps std's
-constant-time fiat scalar with the same public surface. ⭐ **The inverse is the
-exception, and this section claimed otherwise until 2026-09-28.** std's
-`Scalar.invert` is Bernstein–Yang too, but fiat's `divstep` is one divstep per
-call over the full 5-limb vectors, 741 calls: measured 40.7 µs against ~41 µs for
-the entire constant-time `k·G` — 45 % of a signature, and 9.7 % of a whole the web-server consumer
-TLS handshake in `perf` (`p256_scalar_64.divstep`). `Scalar.invert` therefore
-runs `modinv.zig` (~3 µs), pinned to std's inverse by a differential. Unlike k256
-there are no GLV constants to own here.
+Scalar-field `mul`/`add`/`sub` mod `n` are a handful of ~80 ns operations per signature and `n` has no exploitable special
+form, so `scalar.zig` wraps std's constant-time fiat scalar with the same public surface. **The inverse is the
+exception.** std's `Scalar.invert` is Bernstein–Yang too, but fiat's `divstep` is one divstep per call over the full 5-limb
+vectors, 741 calls: measured 40.7 µs against ~41 µs for the entire constant-time `k·G`, 45 % of a signature, and 9.7 % of
+a whole the web-server consumer TLS handshake in `perf` (`p256_scalar_64.divstep`). `Scalar.invert` therefore runs
+`modinv.zig` (~3 µs), pinned to std's inverse by a differential. Unlike k256 there are no GLV constants to own here.
 
 ## Verification
 
-- **Field/group differentials** (`field.zig`/`group.zig`): `p256.op == std.op`
-  byte-exact via `toBytes` on thousands of random inputs — mul/sq/add/sub/neg/
-  invert/sqrt, dbl/add/scalarmul/comb/double-base, recoverY, SEC1 round-trip. This
-  std differential is the anti-self-consistency anchor: std is a correct P-256 on
-  the same curve, a far stronger oracle than self-consistency. Plus a reduction
-  fold-boundary/max-limb edge sweep.
-- **RFC 6979 official vectors** (`kat_vectors.zig`/`kat_test.zig`): the two P-256/
-  SHA-256 rows (`"sample"`, `"test"`) from RFC 6979 A.2.5 must `ecdsaVerify` TRUE
-  and tamper FALSE; std's own P-256 verifier is asserted to accept the same rows
-  (pinning the transcription to std, not just to p256's self-consistency). This is
-  the end-to-end anchor across an entirely independent (deterministic RFC 6979)
-  implementation.
-- **ECDSA differential** (`oracle_test.zig`): `sign.ecdsaVerify` accepts every
-  signature from `std.crypto.sign.ecdsa.EcdsaP256Sha256` and rejects tampered ones;
-  and every signature `sign.ecdsaSign` produces (random key + nonce) is accepted by
-  BOTH p256 and std — sign+verify agree with std in both directions.
-- **ECDH and ECDSA over other hashes** (`cavp_wycheproof_test.zig`, `ecdh.zig`; vectors
-  from `tools/gen_vectors.py`, row counts asserted): Wycheproof ECDH (363 rows) and CAVP
-  CDH (25) through `ecdhInto`; Wycheproof ECDSA SHA-512 DER (554) / P1363 (311) and SHA3-256
-  DER (482) through `Ecdsa(H)` AND the module's own `ecdsaVerifyDigest` (the two must agree
-  row for row, and with upstream); CAVP SigVer (75, SHA-1..512), SigGen (60, signatures
-  verified and the SHA-256 rows re-signed with the given `k`), KeyPair (10), PKV (12).
-  `Ecdsa(Sha256/384/512/Sha3_256)` signatures are byte-identical to std's
-  `Ecdsa(P256, H)` (`sign.zig`); `ecdh` agrees with std on random, flipped and random-tail
-  SEC1 peers, both verdicts (`ecdh.zig`); `ecdhInto` leaves no residue (`stackprobe_test.zig`).
-- **Broken positive control** (`kat_test.zig`): a Solinas fold with the wrong
-  constant `M − 1` disagrees with std on >400/500 random inputs — proving the
-  reduction constant is load-bearing and the equality checks have teeth.
-- **Gated differentials** (`oracle_test.zig`): LIVE (all gates on) — they pin
-  each core bit-for-bit to the portable path (and the comb also to std), plus a
-  corrupted-comb-table positive control (window 10 replaced by `G`; the table is
-  affine, so "identity" is not an expressible corruption). On non-amd64 the
-  field one skips (core not present there).
-- **Inversion differentials**: `modinv.invert` vs `x·x⁻¹ ≡ 1` under a bignum
-  `% m` for both moduli (`modinv.zig`); `Fe.invert` vs `Fe.invertFermat` AND
-  std's field inverse; `Scalar.invert` vs std's scalar inverse — each on random
-  draws plus 0 (→ 0), 1, 2, `m−1`, `m−2`, single bits at the 62-bit limb seams,
-  `m/2`. Positive control seen once, unplanned: with the correction factor's sign
-  wrong (`−m⁻¹` for `m⁻¹`) 20 of 44 tests went red, including RFC 6979 and
-  Wycheproof.
-- **Group formula differentials** (`group.zig`): `addMixed` vs `add` with
-  `Z2 = 1` — same limbs, not just the same point — plus the identity, `P = Q`,
-  `P = −Q`; `basePoint.mulPublic` (fixed-base vartime) vs std + the CT comb on
-  random scalars and every recoding edge (1, 2, `n−1`, `n` → refused, `2^256−1`,
-  `2^256−17`, the top-window boundary); `mulDoubleBasePublic` with `G` in either
-  slot, with a second representation of `G` (misses the redirect on purpose),
-  and the Jacobian join's `P = ±Q` cases.
-- **Audit 2026-11-18 (whole-module mutation).** 353 schemata mutants over the non-test
-  code of `field`, `modinv`, `scalar`, `group`, `sign`, `ecdh`, `burn`. One mutant per
-  condition × class: guards, boundaries, skipped assignments, carries/folds/conditional
-  subtracts, masked selects, recoding, wipes. Out of scope: `fast_core.zig` (inline asm;
-  its Zig wrappers are comptime dispatch), `point_asm.zig` (comptime asm-text generator),
-  `gate.zig`/`root.zig` (no runtime code), `buildBaseTable` (comptime only), the
-  test-only `reduceWideFold` oracle and test instrumentation.
-  - Result: 282 killed, 77 equivalent/unobservable, 0 open. Card `(282/359, 77 eq)`
-    (353 whole-module + 6 delta mutants of the 2026-11-18 portable fix below).
-  - Killed: 273 by tests and 9 by ctgrind.
-    - Tests ran in three builds: native ReleaseSafe, a portable `-mcpu=x86_64`
-      ReleaseSafe build where the non-ADX field paths run, and the ReleaseFast stack
-      probe.
-    - 11 new test blocks cover the canonical boundary, `isZero` on each limb,
-      `normalize`'s second fold, the identity forms, `isBasePointRepr` per coordinate,
-      identity inputs, the vartime `P = ±Q` additions (`s = n`, `s = n + 30`) and a
-      zero scalar in the double-base sum. In `sign`: zero key, `s = 0` by
-      construction, the `e ≡ 0` forgery through `ecdsaVerifyDigest`, long-form DER
-      lengths at `n = 66`, `generateInto`'s rejection loop through a scripted `Io`,
-      and `*Into` zeroing on error.
-  - 40 equivalent: unreachable boundaries, cost-only redirects, and alternative
-    recodings that are equally valid. One is a loose comment: `reduceWideShuffle`'s
-    bias `5p` could be `4p`, since the exact minimum of the accumulator over all word
-    extremes is above `−4p`.
-  - 17 unobservable:
-    - `r = 0` would need a discrete log.
-    - Two safegcd range terms: no wrong inverse in 40 000 inputs of a Python port.
-    - 14 wipes: the probe stays clean because the caller's burn overlaps, there is no
-      needle for that secret (the HMAC-DRBG `K ⊕ pad`), or the error path is
-      unreachable.
-  - Constant-time mutants (blackBox dropped, or a select turned into a branch), each
-    measured ALONE: the mutant forced on in a scratch copy, one `ctgrind.sh --stacks
-    p256` per mutant, its contexts diffed against an unmutated baseline. Native
-    (skylake) for the native paths; a secret scalar (the `ecdh` row) for the
-    windowed multiply; `CTGRIND_CPU=x86_64` for the portable field paths. A first
-    combined build had shown line-0 contexts that could not be attributed; every one
-    of them is now accounted for.
-    - `Fe.cMov` mask without `blackBox` (field.zig:441): `sign` +2. The identity
-      `cMov` in `affineCoordinates` (group.zig:339) becomes a branch on the
-      is-identity bit; the context is reported in the inlined `montMulRegs`
-      (`fast_core.zig:0`) under group.zig:338, for both R and the public key.
-    - Comb gather mask without `blackBox` (group.zig:681): `comb` +57, `sign` +100,
-      at `combMulBaseFastWithTable` (group.zig:0): the table scan branches on the
-      secret digit. The combined build hid it because the gather-to-branch mutant
-      had replaced the same select.
-    - Comb nonzero-digit mask without `blackBox` (group.zig:696): `comb` +1,
-      `sign` +2, at group.zig:0.
-    - `gatherSigned` match mask without `blackBox` (group.zig:1247): `ecdh` +4,
-      two branches at group.zig:563 and :575 and two loads indexed by the secret
-      digit (group.zig:0).
-    - Portable `montReducePortable` keep mask without `blackBox` (field.zig:259 before
-      the fix): `secpt` +1 at the select.
-    - 17 stay unobservable, now with that measurement as the reason: the second
-      `Fe.cMov` form, the seven safegcd masks, the comb recoding and sign masks,
-      the windowed recoding/nonzero/`started` masks and `gatherSigned`'s sign mask
-      (with a secret scalar), and the portable `normalize`/`Fe.add`/`Fe.sub`
-      masks. LLVM kept each of these branch-free without its barrier. The barriers
-      stay as defence against a future compiler.
-  - Finding, fixed the same day: the portable REDC branched on a secret (see the
-    § Constant-time contract note of 2026-11-18). The fix's delta mutants: 401/404
-    (the keep bit ignoring the high word/carry) are killed by the portable tests,
-    402 (the borrow without `blackBox`) brings the `jae` back (`secpt` +1 at
-    field.zig:263). 403 (`hi` without `blackBox`; measured alone 2026-11-18 with CTGRIND_CPU=x86_64: secpt stays at 1, no context) and
-    405/406 (`Fe.add`'s two flags) are unobservable: both together are the pre-fix
-    `Fe.add`, which showed no context on the portable baseline.
-  - The ctgrind kills: the comb gather turned into a branch, the windowed digit select
-    turned into a branch (seen with the scalar also tainted, a scratch harness
-    variant), and `rejectIdentity`'s verdict without its barrier, which splits into
-    two jumps.
-  - Wipe mutants: the switch sits inside the burn, keyed by a comptime site id, so
-    the caller's frame stays unchanged.
-    - A switch at the burn site itself, in the caller, perturbed the wrapper frame.
-      The probe then found `k`/`d` above the burn in the schemata build, even for
-      the unmutated original.
-    - The plain build, and a schemata build without burn-site switches, are clean.
-      So this was no source finding, and no burn changed.
-  - Behaviour change from the audit: `fromAffineCoordinates` refuses `(0, 1)`
-    (std, SEC 1).
+Run `scripts/modtest p256` (Debug; `-Doptimize=ReleaseFast` for the optimized lane); `P256_BENCH=1 zig build test-p256
+-Doptimize=ReleaseFast` adds the opt-in ns/op baseline against std (the only skipped test).
 
-- **Audit 2026-11-20 (test-only change).** `git diff` of `modules/p256/src` against the audited commit shows one added test block (the stack-budget test in `stackprobe2_test.zig`) and no production line, so no mutation was run. The card's `src` hash is re-recorded; the counts are unchanged.
+- **Field/group differentials** (`field.zig`/`group.zig`): `p256.op == std.op` byte-exact via `toBytes` on thousands of
+  random inputs — mul/sq/add/sub/neg/invert/sqrt, dbl/add/scalarmul/comb/double-base, recoverY, SEC1 round-trip. This std
+  differential is the anti-self-consistency anchor: std is a correct P-256 on the same curve, a far stronger oracle than
+  self-consistency. Plus a reduction fold-boundary/max-limb edge sweep.
+- **RFC 6979 official vectors** (`kat_vectors.zig`/`kat_test.zig`): the two P-256/SHA-256 rows (`"sample"`, `"test"`) from
+  RFC 6979 A.2.5 must `ecdsaVerify` true and tamper false; std's own P-256 verifier is asserted to accept the same rows
+  (pinning the transcription to std), and `ecdsaSignDeterministic` reproduces them byte for byte.
+- **ECDSA differential** (`oracle_test.zig`): `sign.ecdsaVerify` accepts every signature from
+  `std.crypto.sign.ecdsa.EcdsaP256Sha256` and rejects tampered ones; every signature `sign.ecdsaSign` produces (random key
+  and nonce) is accepted by both p256 and std.
+- **ECDH and ECDSA over other hashes** (`cavp_wycheproof_test.zig`, `ecdh.zig`; vectors generated by
+  `tools/gen_vectors.py`, row counts asserted): Wycheproof ECDH and the CAVP CDH primitive through `ecdhInto`; Wycheproof
+  ECDSA SHA-512 DER and P1363 and SHA3-256 DER through `Ecdsa(H)` and the module's own `ecdsaVerifyDigest` (the two must
+  agree row for row, and with upstream); CAVP SigVer (SHA-1..512), SigGen (signatures verified and the SHA-256 rows
+  re-signed with the given `k`), KeyPair and PKV. `Ecdsa(Sha256/384/512/Sha3_256)` signatures are byte-identical to std's
+  `Ecdsa(P256, H)` (`sign.zig`); `ecdh` agrees with std on random, flipped and random-tail SEC1 peers, both verdicts;
+  `ecdhInto` leaves no residue (`stackprobe_test.zig`).
+- **Broken positive control** (`kat_test.zig`): a Solinas fold with the wrong constant `M − 1` disagrees with std on most
+  random inputs, proving the reduction constant is load-bearing and the equality checks have teeth.
+- **Gated differentials** (`oracle_test.zig`): each core is pinned bit for bit to the portable path (the comb also to std),
+  plus a corrupted-comb-table positive control (window 10 replaced by `G`; the table is affine, so "identity" is not an
+  expressible corruption). On non-amd64 the field one skips (core not present there), never a green light.
+- **Inversion differentials**: `modinv.invert` vs `x·x⁻¹ ≡ 1` under a bignum `% m` for both moduli (`modinv.zig`);
+  `Fe.invert` vs `Fe.invertFermat` and std's field inverse; `Scalar.invert` vs std's scalar inverse — each on random draws
+  plus 0 (→ 0), 1, 2, `m−1`, `m−2`, single bits at the 62-bit limb seams and `m/2`.
+- **Group formula differentials** (`group.zig`): `addMixed` vs `add` with `Z2 = 1` — same limbs, not just the same point —
+  plus the identity, `P = Q`, `P = −Q`; `basePoint.mulPublic` (fixed-base vartime) vs std and the CT comb on random scalars
+  and every recoding edge (1, 2, `n−1`, `n` refused, `2^256−1`, `2^256−17`, the top-window boundary);
+  `mulDoubleBasePublic` with `G` in either slot, with a second representation of `G` (misses the redirect on purpose), and
+  the Jacobian join's `P = ±Q` cases.
+- **Stack:** `stackprobe_test.zig` (`ecdhInto` leaves no residue) and `stackprobe2_test.zig` (the three burn sizes, seven
+  entry points in a 64 KiB thread, depth within 32 KiB; a non-root test file, so the ctgrind source digests stay current).
+- **Fuzz:** the SEC1 harness (`p256-sec1`, `group.zig`), run by testkit's deterministic driver as `P256_FUZZ=<runs>`.
+- **Constant time:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh p256` (rows `comb`, `sign`, `secpt`,
+  `ecdh`, with positive controls), natively and in the portable lane (`CTGRIND_CPU=x86_64`).
+- **Mutation scope:** the non-test code of `field`, `modinv`, `scalar`, `group`, `sign`, `ecdh`, `burn`, one mutant per
+  condition × class (guards, boundaries, skipped assignments, carries/folds/conditional subtracts, masked selects,
+  recoding, wipes). Out of scope: `fast_core.zig` (inline asm; its Zig wrappers are comptime dispatch), `point_asm.zig` (a
+  comptime asm-text generator), `gate.zig`/`root.zig` (no runtime code), `buildBaseTable` (comptime only), the test-only
+  `reduceWideFold` oracle and test instrumentation. Constant-time mutants (a `blackBox` dropped, or a select turned into a
+  branch) are judged by ctgrind rather than by a test.
+- **Bench:** `zig build bench-p256` (`tools/bench.zig`), see § Performance.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
-## Performance — `bench-p256` against OpenSSL (2026-10-10)
+## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-p256`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 6.4 %): ref 0.78–1.05× OpenSSL 3.5.5, against 0.81–1.06× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
+`zig build bench-p256` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`) is the comparative benchmark behind the
+card's **Performance:** line; the card is the authoritative figure. Reference: OpenSSL (system `libcrypto`, EVP over the
+x86-64 `ecp_nistz256` assembly, MULX/ADX, w = 7 precomputed base-point table), against this module built with
+`zig cc -O3 -march=native` on the C side. Method: each side doubles its batch until it takes over 100 ms and keeps the best
+of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by
+user-mode cycles; the spread, (worst round − best round) / best per side, shows host noise. Before timing, an interop check
+runs (OpenSSL must verify our signature, imported as SubjectPublicKeyInfo, and we must verify OpenSSL's DER signature).
 
-The comparative benchmark behind the card's Performance line (the section below,
-"Performance status", is the older in-module `P256_BENCH` history against `std`). Reference:
-OpenSSL 3.5.5, system `libcrypto.so.3`, EVP over the x86-64 `ecp_nistz256` assembly (MULX/ADX,
-w=7 precomputed base-point table). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+Workloads, one operation on a 32-byte message: `sign` = `EcdsaP256Sha256.KeyPair.sign` (RFC 6979 nonce) vs `SHA256` +
+`EVP_PKEY_sign` (random nonce); `sign_raw` = `ecdsaSignDeterministic` vs the same; `verify` = `ecdsaVerify` (the fast verifier
+a JWT ES256 check uses) vs `SHA256` + `EVP_PKEY_verify`; `verify_std` = the std-shaped `EcdsaP256Sha256.Signature.verify` vs
+the same; `ecdh` = `P256.mul(peer, d)` + affine `x` vs `EVP_PKEY_derive` (peer set once); `keygen` = `KeyPair.generate` vs
+`EVP_PKEY_keygen`.
 
-Method: `zig build bench-p256` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL must verify our signature, imported as SubjectPublicKeyInfo, and we must verify OpenSSL's DER signature).
+`P256_BENCH=1` (ReleaseFast) is the older in-module baseline: ns/op of field, group and ECDSA operations against std, with
+no foreign comparison. The levers behind the figures (Montgomery field, register-resident field operations, generated point
+formulas in nistz256's operation order, the Jacobian windowed multiply and comb) are in § Design notes by feature.
 
-Workloads, one operation on a 32-byte message: `sign` = `EcdsaP256Sha256.KeyPair.sign`
-(RFC 6979 nonce) vs `SHA256` + `EVP_PKEY_sign` (random nonce); `sign_raw` =
-`ecdsaSignDeterministic` vs the same; `verify` = `ecdsaVerify` (the fast verifier jwt's ES256
-uses) vs `SHA256` + `EVP_PKEY_verify`; `verify_std` = the std-shaped
-`EcdsaP256Sha256.Signature.verify` vs the same; `ecdh` = `P256.mul(peer, d)` + affine `x` vs
-`EVP_PKEY_derive` (peer set once); `keygen` = `KeyPair.generate` vs `EVP_PKEY_keygen` (+ free).
-`BENCH_ROUNDS=5`:
+## What is deliberately not done
 
-| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
-|---|---:|---:|---:|---:|---:|
-| `sign` | 36979 | 24481 | 1.537 | 4.3% | 13.4% |
-| `sign_raw` | 36419 | 24389 | 1.529 | 2.8% | 3.3% |
-| `verify` | 130068 | 68395 | 1.898 | 1.2% | 2.1% |
-| `verify_std` | 130628 | 69149 | 1.890 | 0.8% | 3.6% |
-| `ecdh` | 169730 | 50802 | 3.313 | 0.4% | 3.3% |
-| `keygen` | 30376 | 14228 | 2.198 | 0.9% | 20.6% |
+- **Key codecs (PKCS#8/SPKI/PEM)** live with the consumers, as in `p384`/`p521`; P-384 and P-521 are separate modules.
+- **GLV.** P-256 admits no efficiently computable endomorphism, so there is no scalar split (see *No GLV*).
+- **A std-gap role.** std already has P-256; this module exists for speed (see *Dedup*), and tracks std byte for byte
+  rather than extending its API.
 
-A first run (3 rounds, heavier load, spreads up to 72 %) gave the same picture: 1.47–3.19×,
-`ecdh` worst.
+## Backlog / deferred
 
-**Reading (first measurement).** Every row was behind; the worst was `ecdh` at 3.3× — the
-constant-time variable-base `mul` (~170 µs against nistz256's ~51 µs) — so P4.
-
-### After the 2026-10-10 performance pass (the card's numbers)
-
-Two levers, both measured: (1) **Montgomery-domain field** (`Fe` stores `a·2^256 mod p`; the
-MULX/ADX multiply with a 4-round REDC — this prime's `−p⁻¹ ≡ 1 (mod 2^64)` — is 68 TSC cycles
-against the word-shuffle Solinas's 131, chained), which moved every row: ecdh 3.28 → 2.05,
-keygen 2.19 → 1.63, verify 1.86 → 1.18, sign 1.54 → 1.23 (one 3-round run); (2) **`mulCtWindowed`
-at w = 5 with Jacobian doublings** around the complete RCB addition (per window: projective →
-Jacobian, five `Jac.dbl` at 3M+5S instead of 8M+3S+2m_b, back, one complete add; the identity
-mapped to the doubling fixed point `(1:1:0)` by a masked select): ecdh 2.05 → 1.59. Same method,
-`BENCH_ROUNDS=7`, two full runs (spreads ≤ 9.5 % ref, ≤ 2.6 % ours) plus two `keygen ecdh` runs:
-
-| workload | ours ns/op (run 2) | ref ns/op | ours/ref run 1 | run 2 | extra runs |
-|---|---:|---:|---:|---:|---|
-| `sign` | 27624 | 23457 | 1.228 | 1.235 | |
-| `sign_raw` | 27340 | 23214 | 1.206 | 1.202 | |
-| `verify` | 79824 | 65583 | 1.208 | 1.203 | |
-| `verify_std` | 79642 | 65795 | 1.223 | 1.208 | |
-| `ecdh` | 77656 | 48745 | 1.593 | 1.589 | 1.588, 1.628 |
-| `keygen` | 21497 | 13548 | 1.919 | 1.639 | 1.656, 1.892 |
-
-`keygen` is **bimodal** (≈ 21.3 µs or ≈ 24.7 µs per run, each run internally tight) and is the
-row closest to 2×; its profile is the comb `d·G` (~70 %) and std's HMAC-DRBG seed→scalar
-derivation in `generateDeterministic` (~25 %, SHA-256 without SHA-NI on this host), which
-OpenSSL does not pay. Not chased further here — see Backlog.
-
-### After the 2026-10-13 pass (the card's numbers)
-
-Five levers, each measured with `bench-p256` (3 rounds) before the next:
-
-1. **Field add/sub in asm with register operands** (`fast_core.addRegs`/`subRegs`): LLVM lowered
-   the portable u256 versions with `setb` to memory and `sbb $0` mask chains. Every row moved: verify
-   1.21 → 1.04, sign 1.21 → 1.13, ecdh 1.56 → 1.34.
-2. **Montgomery products returned in registers** (`montMulRegs`/`montSqRegs`) instead of through an
-   out-pointer, and a canonical tail that subtracts `p` in place and adds it back masked (12
-   instructions, not 22 for subtract-into-copies + XOR-blend; `cmov` stays out — memcheck flags a
-   CMOVcc on a secret just as it flags a jump, which would blind ctgrind).
-3. **Key generation draws the scalar directly** (rejection on `0 < d < n`, branch-free test), as
-   OpenSSL and Go do, instead of std's HMAC-DRBG over a seed: keygen 1.63 → 1.03.
-4. **Comb in Jacobian with the incomplete CT mixed addition** (7M + 4S against RCB-mixed 11M +
-   2·m_b) below the top window, the complete formula on top (the `P ≠ ±Q` argument is in
-   `combMulBaseFastWithTable`): sign 1.13 → 1.05, keygen 1.03 → 0.89.
-5. **ECDH table affine by one CT batch inversion + incomplete CT mixed addition** above the last
-   window (argument in `mulCtWindowed`): ecdh 1.34 → 1.21–1.24.
-   An interleaved (CIOS) Montgomery multiply replaced the product-then-reduce one in the same
-   pass; it moved ecdh by ~1 %, kept because it is no slower and its window bound is simpler.
-
-`BENCH_ROUNDS=7`, quiet host:
-
-| workload | ours ns/op | ref ns/op | ours/ref |
-|---|---:|---:|---:|
-| `sign` | 23115 | 23138 | 1.061 |
-| `sign_raw` | 22541 | 22896 | 1.048 |
-| `verify` | 67612 | 64647 | 1.043 |
-| `verify_std` | 68440 | 65891 | 1.045 |
-| `ecdh` | 59130 | 47456 | 1.241 |
-| `keygen` | 11550 | 13167 | 0.922 |
-
-(ratios by user-mode cycles; the ns columns are each side's best round.) **What is left is ECDH,
-and it is not the operation count**: per window this module now does 5 Jacobian doublings (8 field
-multiplies each) + one 11-multiply mixed addition against nistz256's 5 × 8 + a 16-multiply Jacobian
-addition. Cutting `Jac.dbl` from 1 602 to 1 378 instructions (lever 2) left ECDH where it was, so
-the doubling chain is bound by the latency of its field operations, each ~120 µops — about all
-the reorder window holds, so two independent multiplies barely overlap. The lever is the one
-nistz256 uses: the whole point doubling (and addition) as ONE asm routine over a scratch frame, so
-the scheduler sees the formula, not opaque blocks (Backlog).
-
-### After the 2026-10-14 pass (the card's numbers)
-
-The 2026-10-13 reading said the doubling chain was latency-bound on opaque field blocks and
-proposed one asm routine per point formula. Measured first (`perf record` over `bench-p256
-ecdh`, `perf annotate`): `Jac.dbl` was 62 % of ECDH at IPC 2.4, 1 373 instructions per doubling,
-350 of them stack moves (the input point copied twice, every product parked for the next
-pointer-taking multiply). Three levers, each measured with `bench-p256` before the next:
-
-1. **One generated asm block per formula** (`src/point_asm.zig`): a comptime field program over
-   a scratch frame, `fast_core`'s CIOS multiply and square + REDC text rebased onto frame offsets,
-   add/sub with memory operands. ECDH 1.21 → 1.22 — **nothing**; verify/sign ~2 % better. The
-   glue was not the bound: the instruction count fell only ~5 % and IPC fell with it.
-2. **nistz256's operation order.** The add/sub chains were 30 % of a doubling's instructions, and
-   every `adc`/`sbb`/`adcx`/`adox`/shift competes for ports 0 and 6 (Kaby Lake) — about 615 of
-   those µops per doubling, a ~310-cycle floor on two ports. Doubling 4M + 4S + 11 add/sub/half
-   (`Z3 = 2·Y·Z`; `S = (2Y)²·X`; `8Y⁴` = half of `(2Y)⁴`, the halving's shift on `SHRD` off the
-   flag ports) instead of dbl-2001-b's 3M + 5S + 16 — a square costs a multiply in this core;
-   CT mixed addition madd-2004-hmv 8M + 3S + 7 instead of madd-2007-bl 7M + 4S + 14. ECDH
-   1.22 → 1.10.
-3. **Register forwarding in the generator** (an add/sub/half whose `a` is the previous result
-   takes it from registers; a result is stored only when a later op reads its slot from memory
-   or it is an output) and the window's five doublings over one frame (`Jac.dblTimes`):
-   ECDH 1.10 → 1.04.
-
-The doubling program is the same polynomials as `Jac.dblFormula` (dbl-2001-b, kept as the
-oracle), so the differential in `group.zig` compares bit for bit; the mixed addition is another
-Jacobian representative than before, so `addMixedCtFormula` moved to madd-2004-hmv with it.
-`BENCH_ROUNDS=7`, two full runs right after a long whole-collection build (load settling; the
-second run's ns, both runs' ratios):
-
-| workload | ours ns/op | ref ns/op | ours/ref run 1 | run 2 |
-|---|---:|---:|---:|---:|
-| `sign` | 23887 | 24498 | 1.003 | 0.991 |
-| `sign_raw` | 22094 | 22802 | 0.985 | 0.997 |
-| `verify` | 61873 | 65522 | 0.943 | 0.942 |
-| `verify_std` | 61236 | 64969 | 0.936 | 0.948 |
-| `ecdh` | 51033 | 48886 | 1.057 | 1.049 |
-| `keygen` | 10391 | 13508 | 0.813 | 0.811 |
-
-## Performance status
-
-**Scaffold baseline** (both gates off — the portable oracle, the "before"),
-which — unlike k256, whose tiny-constant Solinas beat std's field — was **slower
-than std** across the board (the 11-fold wide `M`-multiply reduction and the naive
-double-and-add ladder are correctness-first, not fast). This host, ReleaseFast:
-
-| op | p256-PORT | std | note |
-|---|---|---|---|
-| field mul | ~139 ns | ~61 ns | wide `M`-fold, 11 iterations |
-| field sq | ~277 ns | ~112 ns | uses the general mul (no dedicated square yet) |
-| CT `k·G` | ~1113 µs | ~323 µs | naive double-and-add vs std's windowed |
-| ECDSA verify | ~1262 µs | ~756 µs | double-and-add double-base |
-| ECDSA sign | ~1197 µs | ~405 µs | naive `k·G` + Fermat inverse |
-
-**Fable-core phase results** (both gates ON — MULX/ADX word-shuffle field +
-comb/windowed scalarmul; same host, i7-7920HQ, ReleaseFast, `P256_BENCH=1`):
-
-| op | p256-ASM | vs portable | vs std | note |
-|---|---|---|---|---|
-| field mul | ~34 ns | 4.1× | 1.7× | word-shuffle reduce (`fast_core.zig`) |
-| field sq (chained sq+mul) | ~74 ns | 3.7× | 1.3× | dedicated square + shared reduce |
-| CT `k·G` | ~43 µs | 26× | 7.5× | fixed-base comb, no doublings online |
-| ECDSA sign | ~90 µs | 13× | 4.3× | comb `k·G` + Fermat inverse |
-| ECDSA verify | ~241 µs | 5.2× | 2.7× | interleaved wNAF (Straus–Shamir) double-base |
-
-vs OpenSSL nistz256 (≈ 25 µs sign / ≈ 79 µs verify reference): **sign ≈ 3.6×,
-verify ≈ 3.0×**. Both are in the 2–3× target band. The verify win came from the
-**owner-phase interleaved wNAF** (backlog #4, done): a shared doubling chain +
-width-5 odd-multiple table per base dropped the double-base multiply from ~256
-additions to ~86, taking verify from ~392 µs (5.0× nistz256) to ~241 µs. The
-remaining lever is the addition-chain field inverse (backlog #5) — the Fermat
-square-and-multiply inverse in `affineCoordinates` is now ~9 % of verify, so it
-buys only ~1–2 % more; deferred as low-value. Measured before/after on this host:
-`mulPublic` ~211 µs → ~167 µs, ECDSA verify ~341 µs → ~241 µs.
-
-**Sign/verify phase (2026-09-28)** — same host, ReleaseFast `-mcpu=native`,
-`taskset -c 1`, HEAD and new binaries interleaved twice back to back (the host
-was loaded by other sessions; best of two per row, so read them as ratios):
-
-| op | before | after | what changed |
-|---|---|---|---|
-| `Fe.add` | 10.0 ns | 5.3 ns | one conditional subtract instead of the two-fold `normalize` |
-| `Fe.invert` | 12.5 µs | 2.3 µs | safegcd (`modinv.zig`) for Fermat |
-| `Scalar.invert` | 31.7–40.7 µs | 2.2 µs | safegcd for std's one-divstep-per-call fiat |
-| `P256.dbl` / `add` (RCB, CT paths) | 536 / 622 ns | 468 / 516 ns | `Fe.add` |
-| CT `k·G` (`combMulBase`) | 40.3 µs | 25.1 µs | w = 6 affine table + mixed complete add |
-| `mulCtWindowed` (CT `k·P`) | 202 µs | 163 µs | `Fe.add` only |
-| `mulPublic` (`Q`, vartime) | 170 µs | 107 µs | Jacobian wNAF, affine table |
-| `mulDoubleBasePublic` (`G`, `Q`) | 212 µs | 125 µs | fixed-base `u1·G` + Jacobian wNAF `u2·Q` |
-| `sign.ecdsaSign` | 97.3 µs | 29.2 µs | |
-| `sign.ecdsaVerify` | 261 µs | 128 µs | |
-| `EcdsaP256Sha256.sign` (std generic over this group — the web-server consumer TLS) | 94.5 µs | 37.1 µs | the 8 µs over `ecdsaSign` is std's nonce derivation + codecs |
-| `EcdsaP256Sha256.verify` (std generic — two `mulPublic` + `add`) | 413 µs | 125 µs | `basePoint.mulPublic` redirect |
-
-Profile BEFORE (`perf record --call-graph lbr` + the component bench, same
-session): a signature was `k·G` comb 41 µs (46 %) + **`Scalar.invert` 40 µs
-(45 %)** + `Fe.invert` 12 µs (13 %); a verify was the double-base multiply
-258 µs (73 %: 256 RCB doublings ≈ 139 µs, ~90 RCB additions ≈ 55 µs, tables
-and recoding the rest) + `Scalar.invert` 40 µs + `Fe.invert` ~14 µs; SHA-256,
-SEC1 decoding and the scalar codecs were under 1 %. So the SPEC's earlier
-"scalar field NOT on the accel critical path" was wrong by half a signature —
-the same `p256_scalar_64.divstep` showed as 9.7 % of an entire the web-server consumer TLS
-handshake. `Fe.sq` costs the same as `Fe.mul` (30 vs 33 ns) because the
-word-shuffle reduction, not the product, dominates the asm core — which bounds
-what the point formulas can gain and is the largest remaining lever (backlog 8).
-
-OpenSSL 3.5.5 `nistz256` on this host the same day (loaded): 36.8 µs sign,
-128 µs verify. `EcdsaP256Sha256.sign` 37 µs and `.verify` 125 µs are within
-measurement noise of that — the 2–3× target band is passed; parity with the
-asm-grade reference remains explicitly a non-goal, and the loaded-host caveat
-applies to both columns.
-
-Binary size: the fixed-base table grew from 49 920 B (65 × 8 projective) to
-88 064 B (43 × 32 affine) of `.rodata`; `zig build test-p256` compile time
-grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
-
-## Backlog
-
-- ~~**Document a minimum stack size (review GP, 2026-10-30).**~~ **DONE 2026-11-19:** README "Stack use": measured worst depth 22.9 KiB (Debug, `ecdhInto`) / 17.5 KiB (ReleaseFast, `sign`), burn included; advice 64 KiB of free stack. Pinned by `stack use: ...` in `src/stackprobe2_test.zig` (a non-root test file, so the ctgrind source digests stay current): the three burn sizes, seven entry points in a 64 KiB thread, depth <= 32 KiB. The original estimate ("about 30 KiB for one ECDH") was too high; the affine-table multiply measured 16.5 KiB.
-
-- **Self-hosted Debug does not compile (found 2026-10-22 from the web-server consumer's test redesign).** `fast_core.zig:81`
-  says "No `movabsq` (rejected by the self-hosted assembler)", but `fast_core.zig:560/712/921/924/974`
-  and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also reports "ran out of
-  registers lowering inline asm" at `fast_core.zig:904/956`. Any consumer's `-fno-llvm` Debug build
-  (the T0 edit loop of `~/.claude/zig-backend.md`) fails in p256. Fix: the module's own recipe
-  (`movl $imm32` + `shlq`/`orq`), in the generator for `point_asm`; then a self-hosted Debug
-  `modtest` lane (or `-Dselfhosted` compile) so it cannot regress silently. montint has the same gap.
-
-**Performance levers.** Done 2026-10-14 (SPEC "After the 2026-10-14 pass"): point formulas as
-generated asm, nistz256's operation order, register forwarding — ecdh 1.24 → 1.05×, every row
-≤ 1.1. Open, none needed for P2:
-- **ECDH ~1.05×:** not re-profiled after lever 3. Candidate levers: keep the CIOS output in r8..r11 so a multiply's result forwards into
-  a following add/sub without moves; fuse the `3·M` and `2·S` add chains; nistz256's
-  `mul_by_2`/`mul_by_3` shapes. Measure the doubling's cycles in isolation first.
-- **aarch64:** `point_asm` is amd64-only, like the field core (item 11).
-
-Done earlier, kept for the record (2026-10-10 bench): Montgomery-domain field (item 8 below) and
-`mulCtWindowed` w = 5 with Jacobian doublings, then the levers below:
-- **`keygen` (1.64–1.92×, bimodal):** (a) a CT Jacobian mixed addition in the comb for
-  windows 0..41 (madd 7M+4S vs RCB-mixed 11M+2m_b; `acc = ±Q` is impossible there because
-  `|Σ_{j<i} d_j·2^{6j}| < 2^{6i} ≤ |d_i·2^{6i}| < n/2`, the identity is a masked select, the
-  top window stays complete) — est. −3 µs on keygen and sign; (b) `generate` drawing the scalar
-  directly instead of std's HMAC-DRBG over a random seed (−5 µs) — needs a constant-time
-  canonicality check of the candidate, which is why it was not done in passing.
-- **`ecdh` (1.59×):** what is left is field add/sub overhead (~10 per Jacobian doubling,
-  u256 + `blackBox`) and the per-window conversions; an asm add/sub would help every row.
-
-Original proposals (2026-10-10, before the pass):
-- **`ecdh` 3.3× — the CT variable-base `mul`.** nistz256 does a signed 5-bit Booth window (16
-  precomputed multiples, CT gather), ~51 doublings-and-adds, entirely in the MULX/ADX field.
-  Check that `mul`'s gated windowed core runs on `fast_core`'s asm field throughout (not the
-  portable `Fe`), switch to Booth w=5 with a CT table select, and replace the final Fermat
-  inversion (`affineCoordinates` → `z.invert()`) with a CT safegcd/addition-chain inverse
-  (`modinv.zig` has the vartime one for verify).
-- **`keygen` 2.2× / `sign` 1.5× — the base-point multiply.** OpenSSL uses a w=7 precomputed
-  table (37 × 64 affine points, ~150 KB) and no doublings online. Route `KeyPair` generation
-  and the signer's `k·G` through the comb (`combMulBaseFast`) or a larger static table; for
-  `sign`, also the Fermat inverse of `k` (CT addition chain) and RFC 6979's HMAC-DRBG cost
-  (~2–3 µs of the 37 µs).
-- **`verify` 1.9×** — a precomputed static table for `G` in the double-base (w=7, as OpenSSL),
-  leaving the wNAF only for the public key; z-inversion via `modinv`.
-1. ~~`fast_core.fieldMul`/`fieldSq`~~ — **DONE (Fable core phase)**: `MULX/ADX`
-   product + the signed NIST word-shuffle reduction (HMV Alg. 2.29), validated
-   against a bignum `% p` oracle on 2M random products before the asm, then
-   pinned to the portable oracle by the live gated differential.
-2. ~~`group.combMulBaseFast`~~ — **DONE (Fable core phase)**: fixed-base comb
-   (comptime projective table, signed-digit, `blackBox`-guarded CT gather).
-3. ~~`group.mulCtWindowed`~~ — **DONE (Fable core phase)**: CT windowed
-   variable-base (w = 4 signed digits, runtime magnitude table, same CT gather);
-   w = 5 with Jacobian doublings since 2026-10-10.
-4. ~~wNAF `slide` acceleration for `mulPublic` / `mulDoubleBasePublic`~~ —
-   **DONE (owner-verify phase)**: interleaved width-5 wNAF (Straus–Shamir),
-   one shared doubling chain + an odd-multiple table per base. Vartime/public
-   only; byte-exact vs the plain ladder + std. Verify ~392 µs → ~241 µs
-   (~5.0× → ~3.0× nistz256).
-5. ~~Addition-chain field inverse~~ — **DONE differently (2026-09-28)**: a
-   constant-time safegcd (`modinv.zig`) replaces the Fermat inverse for BOTH
-   fields (12.5 → 2.3 µs base, 31–41 → 2.2 µs scalar); an addition chain would
-   have reached ~9 µs.
-6. Rewire the P-256 consumers (jwt ES256, ctap2pin, spake2plus, hpke/voprf/mls/jwe)
-   from `std.crypto.ecc.P256` to p256.
-7. Side-channel review of the CT paths (inverse, comb/windowed gather). Note:
-   ReleaseFast disasm of both field asm blocks (branch-free, DIT-only) and both
-   scalarmul cores (masked gather at fixed offsets, public-index loops only) was
-   done in the core phase; the recoding/negation selects required `blackBox`
-   laundering — without it LLVM lowered them to a secret-dependent CMOV/branch.
-   2026-09-28: the w = 6 comb's ReleaseFast disasm (`combMulBase`, 5 052
-   instructions with everything inlined) has zero indirect jumps, zero CMOVs,
-   two public loop back-edges (the 0x800-byte vectorised gather over a window,
-   the window loop) and the two `je` of `rejectIdentity`; ctgrind: `comb` 2
-   in-file contexts (that identity check, now two jumps — ONE since 2026-10-13,
-   when `rejectIdentity` laundered its verdict through `blackBox`), `sign` 12 (2 × 2
-   comb + std's five scalar canonicality compares + one more of the same class
-   in `Scalar.invert`'s re-encoding + `isZero` on `r`/`s`), controls/traps 0,
-   `--check` OK.
-8. ✅ **DONE 2026-10-10** (`fast_core.montMul`/`montSq`, measured 131 → 68 TSC cycles per
-   multiply; every bench row moved 1.25–1.6×). Original note: **Montgomery-domain field core** — measured headroom, not done: `Fe.mul`
-   33 ns / `Fe.sq` 30 ns are bounded by the ~130-instruction word-shuffle
-   reduce (the MULX product is ~50). nistz256's interleaved Montgomery reduce
-   exploits `p₀⁻¹ ≡ 1 (mod 2^64)` and `p`'s shape at ~8 instructions per round;
-   an estimated ~22 ns multiply would take every point-level number above to
-   ~0.7× (sign ~29 → ~21 µs, verify ~128 → ~90 µs). It changes the field
-   representation (constants, codecs, the comptime table, every differential's
-   `toBytes` still works) — days, not hours, with a new asm core to prove; do
-   it as its own gated phase with the portable oracle kept in normal domain.
-9. Smaller levers, each measured or estimated 2026-09-28: comb w = 7 (37
-   windows, 151 KB table) ≈ −3 µs on sign for +63 KB; an addition chain for
-   `sqrt` (compressed-key decoding, 10.5 µs) ≈ −2 µs; `mulCtWindowed` at w = 5
-   ≈ −15 µs on the ECDH-style `P256.mul` (hpke/spake2plus/ctap2pin, not on the
-   web-server consumer/jwt path); std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in
-   its generic nonce derivation and codecs, which this module cannot reach.
-10. ~~**Wycheproof ECDH (`ecdh_secp256r1_*`) vectors**~~ — **DONE 2026-10-13**: `ecdh`/`ecdhInto` (`src/ecdh.zig`, p384's shape) run against the 363 Wycheproof rows whose public key is a strict-DER SPKI naming secp256r1 (330 valid, 26 invalid, 7 acceptable; the 249 other rows test an ASN.1 parser) and the 25 CAVP CDH rows, and differentially against std on random and mutated SEC1 peers. Also done in the same pass: `Ecdsa(Hash)` with Wycheproof SHA-512 (DER + P1363) and SHA3-256 (DER) and CAVP SigVer/SigGen/KeyPair/PKV (`tools/gen_vectors.py`). *(Original note, survey 2026-09-30: variable-base `P256.mul` is what hpke/spake2plus/ctap2pin/jwe-ES use as ECDH, and only the ECDSA vectors were run; ECDH's invalid-curve and twist points are the classic P-256 failure.)*
-11. **aarch64 field core** *(survey 2026-09-30)*: the `MULX/ADX` core is amd64-only; ARM servers get the portable Solinas path, whose speed relative to `std`'s is unmeasured here. Effort: medium (a `umulh` product with the existing word-shuffle reduction). Fits §2.
-12. **Hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_)** *(survey 2026-10-13, deferred)*: no module of the collection asks for it of P-256 today (hash-to-curve exists in `bls12_381` only), and a point-level `hashToCurve` is one more public surface to keep correct. Effort: medium (SSWU map, isogeny-free for P-256, plus the RFC's vectors).
-13. ✅ DONE 2026-11-18 for p256 (owner decision): CI lane `ctgrind portable amd64` runs `scripts/test.sh ctgrind-portable` (`CTGRIND_CPU=x86_64`, p256 only — its portable counts equal the asm ones: comb 1, sign 10, secpt 1, ecdh 3). EXTENDED 2026-11-18 to every module with a harness: all 93 others were measured with `CTGRIND_CPU=x86_64`. 57 matched their pins unchanged (montint, sha2, hqc, p384, aescbc, p521, rsa, paillier, mlkem among them). Two real secret branches were found and fixed: bfv `modarith.csub`/`subMod` (`jb`) and bech32 base58 `digitChar` (`jae`). One inlining split was fixed (k256 `mulWithTable`'s `rejectIdentity`), and aes192's bitsliced padding is now zeroed. The modules whose portable code legitimately differs (std soft AES, std X25519, std `mem.eql` chunking, code shape, falcon's open fpr question, chachapoly's AVX2-only positive control) carry `cpu=x86_64` variant rows in `ctgrind-expected.tsv` (format in its header). The lane now runs every module except jwe, megolm and xmlenc (unattributed contexts in std soft-AES frames, each with a Backlog item). crc32/crc32c have no ctgrind harness (their table/PCLMUL split is a public-data CRC). Original text: **ctgrind portable lane** *(2026-11-18, from the portable REDC finding)*: run
-    `scripts/checks/ctgrind.sh` also with `CTGRIND_CPU=x86_64` (no ADX/BMI2) for p256
-    and every other module with an asm/portable split, with its own expected counts.
-    The CI lane is skylake-only, so a secret-dependent branch on the portable path
-    (the path aarch64 runs) goes unseen. That is how the `montReducePortable` `jae`
-    survived.
+- **Self-hosted Debug does not compile.** `fast_core.zig:81` says "No `movabsq` (rejected by the self-hosted assembler)",
+  but `fast_core.zig:560/712/921/924` and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also
+  runs out of registers lowering inline asm at `fast_core.zig:904/956` (`addRegs`/`subRegs`). Any consumer's `-fno-llvm`
+  Debug build (the edit loop) fails in p256. Plan: the module's own recipe (`movl $imm32` + `shlq`/`orq`), in the generator
+  for `point_asm`; then a self-hosted Debug `modtest` lane (or a `-Dselfhosted` compile) so it cannot regress silently.
+  montint has the same gap.
+- **ECDH lever.** About 1.05× OpenSSL, not re-profiled since the generated point formulas. Candidates: keep the CIOS output
+  in r8..r11 so a multiply's result forwards into a following add/sub without moves; fuse the `3·M` and `2·S` add chains;
+  nistz256's `mul_by_2`/`mul_by_3` shapes. Measure the doubling's cycles in isolation first. None is needed for P2.
+- **Smaller levers**, each estimated: comb w = 7 (37 windows, 151 KB table) ≈ −3 µs on sign for +63 KB; an addition chain for
+  `sqrt` (compressed-key decoding) ≈ −2 µs. std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in its generic nonce
+  derivation and codecs, which this module cannot reach.
+- **aarch64 field core and point formulas.** The `MULX/ADX` core and `point_asm` are amd64-only; ARM servers get the
+  portable Montgomery path, whose speed relative to std's is unmeasured here. Effort: medium (a `umulh` product with the
+  existing reduction). Fits CONVENTIONS §2.
+- **Hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_)**, deferred: no module of the collection asks for it of P-256 today
+  (hash-to-curve exists in `bls12_381` only), and a point-level `hashToCurve` is one more public surface to keep correct.
+  Effort: medium (SSWU map, isogeny-free for P-256, plus the RFC's vectors).
+- **Rewire the P-256 consumers** (jwt ES256, ctap2pin, spake2plus, hpke/voprf/mls/jwe) from `std.crypto.ecc.P256` to
+  p256, where not yet done (several already import `p256`).
 
 ## Anchoring
 

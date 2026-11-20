@@ -11,67 +11,41 @@ P-256 suites of `hpke`/`voprf`/`mls`/`jwe` — every one of them rides
 **zero-C/no-libc** invariant (inline asm is still native Zig) while pulling in the
 techniques std forgoes:
 
-- the **P-256 special-prime (Solinas) reduction** for
-  `p = 2^256 − 2^224 + 2^192 + 2^96 − 1` (`2^256 ≡ 2^224 − 2^192 − 2^96 + 1`,
-  folded instead of a generic Montgomery reduce),
+- a **Montgomery-domain field** for `p = 2^256 − 2^224 + 2^192 + 2^96 − 1` whose REDC
+  exploits the prime's shape (`−p⁻¹ ≡ 1 (mod 2^64)`: each round's quotient digit is the
+  low limb); the NIST special-prime (Solinas) reduction
+  (`2^256 ≡ 2^224 − 2^192 − 2^96 + 1`) is kept as an independent portable oracle,
 - **windowed + fixed-base-comb** constant-time scalar multiplies — P-256 has **no**
   efficiently-computable endomorphism, so (unlike k256/secp256k1) there is no GLV,
 - an **amd64 `MULX/ADX`** field multiply/square.
 
-Realistic target: **~2–3× OpenSSL nistz256** (the sibling `k256` secp256k1 arc hit
-~2.5× libsecp256k1 with the same recipe). This is NOT a std-gap fill — std already
+The original target was **~2–3× OpenSSL nistz256** (the sibling `k256` secp256k1 arc hit
+~2.5× libsecp256k1 with the same recipe); the module now measures at or near OpenSSL
+(the card's **Performance:** line in `SPEC.md`). This is NOT a std-gap fill — std already
 has P-256 — it is a *performance-specialized reimplementation* justified by the
 measured gap plus the collection's thesis that native Zig should be usable
 INSTEAD of linking a C crypto library. See `SPEC.md §Dedup`.
 
-## Measured on the signing path (2026-08-25, i7-7920HQ, ReleaseFast)
+## Performance
 
-ECDSA P-256 **sign**, the operation a TLS server runs once per full handshake
-and a JWT issuer runs once per token:
+`zig build bench-p256` measures sign, verify, ECDH and key generation against OpenSSL's nistz256; the card's
+**Performance:** line in `SPEC.md` holds the current ratios, and `SPEC.md` § Performance describes the method. Against
+`std.crypto.sign.ecdsa.EcdsaP256Sha256` this module is about 10× faster on sign and about 3× on verify (one host).
+`P256.mul` recognises the base point and redirects to the fixed-base comb, because std's signer computes `R` as
+`basePoint.mul(k)`, so std's generic `Ecdsa` over this group takes the fast path too.
 
-| | µs / sign | vs OpenSSL |
-|---|---|---|
-| `std.crypto.sign.ecdsa.EcdsaP256Sha256` | 394 | 16.0× |
-| `p256.EcdsaP256Sha256`, **before** the comb was reachable | 252 | 10.2× |
-| `p256.EcdsaP256Sha256`, 2026-08-25 | 102 | 4.2× |
-| `p256.EcdsaP256Sha256`, **2026-09-28** (safegcd inverses, w = 6 affine comb) | **37** | 1.5× |
-| OpenSSL 3.5.5 `nistz256` (`openssl speed ecdsap256`) | 24.6 | 1.0× |
-
-The 2026-09-28 row was measured on a loaded host; OpenSSL measured the same day
-under the same load gave 36.8 µs, i.e. parity within noise. Verify the same day:
-`EcdsaP256Sha256.verify` 413 → 125 µs (std's generic verifier now hits the
-fixed-base table through `basePoint.mulPublic`), `sign.ecdsaVerify` 261 → 128 µs,
-against 128 µs for nistz256. Full component table in `SPEC.md`
-§ "Performance status".
-
-⚠ **The step from 252 to 102 was not new code — it was connecting code that was
-already here.** `std.crypto.sign.ecdsa.Ecdsa.sign` computes `R` as
-`Curve.basePoint.mul(k, .big)`, and this module exports `EcdsaP256Sha256` as
-`Ecdsa(P256, Sha256)`. `P256.mul` is the *variable-base* multiply, so the
-fixed-base comb — built for signing, documented as the signing hot path, and
-differentialled against the ladder — **had no call site on the signing path at
-all**. `combMulBase` was reached only from `xmldsig`, which calls it by name.
-`P256.mul` now recognises the base point and redirects (235 µs → 56 µs on that
-multiply alone).
-
-The step from 102 to 37 was two things the profile named: the scalar
-inversion `k⁻¹ mod n` through std's fiat divstep was 45 % of a signature (it is
-now this module's constant-time safegcd, `modinv.zig`, shared with `Fe.invert`),
-and the comb gained an affine w = 6 table with a complete mixed addition. What
-remains against nistz256 is the field multiply itself (`SPEC.md` backlog 8).
-
-## Status: cores IMPLEMENTED (both gates on) + vartime wNAF verify
+## Cores and gates
 
 The **portable path is real, constant-time, and byte-exact against
 `std.crypto.ecc.P256` + the RFC 6979 ECDSA-P256 vectors + std's ECDSA signer** —
 it is the correctness oracle and the non-amd64 fallback. Both irreducible cores
-are now IMPLEMENTED and both gate flags are `true`, so the core-vs-portable
+are implemented and every gate flag is `true`, so the core-vs-portable
 differentials run for real (bit-exact vs the oracle + std); flipping a flag back
 to `false` restores the proven portable fallback:
 
 | Gate flag | Core (implemented) | Portable fallback (the oracle it matches bit-for-bit) |
 |---|---|---|
-| `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` product + the signed **NIST word-shuffle** Solinas reduction (HMV Alg. 2.29) | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
+| `gate.field_asm_implemented` | `fast_core.montMul` / `montSq` (`montMulRegs` / `montSqRegs`) — amd64 `MULX/ADX` product + Montgomery REDC; `fast_core.fieldMul` / `fieldSq` (signed NIST word-shuffle Solinas reduction, HMV Alg. 2.29) are kept as a differential oracle | `field.montMulPortable` (portable REDC; `field.mulPortable` / `sqPortable` are the wide-int Solinas oracle) |
 | `gate.fast_scalarmul_implemented` | `group.combMulBaseFast` (fixed-base comb `k·G` over a comptime affine table, w = 6) + `group.mulCtWindowed` (CT windowed variable-base) — `blackBox`-guarded masked CT gather | `group.mulDoubleAddCt` / `basePoint.mulDoubleAddCt` |
 | `gate.fast_invert_implemented` | `modinv.invert` — constant-time Bernstein–Yang safegcd (62-bit batches), shared by `Fe.invert` and `Scalar.invert` | `Fe.invertFermat` (`a^(p−2)`) / std's fiat scalar inverse |
 
@@ -91,7 +65,7 @@ const p256 = @import("p256");
 // Field arithmetic over p = 2^256 − 2^224 + 2^192 + 2^96 − 1.
 const a = try p256.Fe.fromBytes(a_be, .big);
 const b = try p256.Fe.fromBytes(b_be, .big);
-const prod = a.mul(b);          // Solinas reduce (or gated MULX/ADX core)
+const prod = a.mul(b);          // Montgomery multiply (MULX/ADX core where present, portable REDC elsewhere)
 const inv = a.invert();
 
 // Curve group (a = −3).
@@ -140,7 +114,7 @@ No allocation, no globals; the cost is stack. Every secret-scalar entry point
 (`P256.mul`, `ecdh`/`ecdhInto`, the ECDSA signers, key generation) runs its body
 one frame down and then zeroes the stack it dirtied (`burn.zig`: `mul_burn` 16 KiB,
 `affine_burn` 4 KiB, `sign_burn` 8 KiB), so the burn counts toward the need.
-Measured depth of the deepest call (2026-11-19, bytes dirtied below the caller,
+Measured depth of the deepest call (bytes dirtied below the caller,
 burn included): **22.9 KiB in Debug** (`ecdhInto`; `sign` 21.0, `verify` 19.1,
 `generate` 18.3, `mul` 16.5 KiB) and **17.5 KiB in ReleaseFast** (`sign`; `generate` 17.0,
 `ecdhInto` 16.5, `mul` 16.2, `verify` 9.0 KiB; the public-input `mulPublic` 1.5 KiB).
