@@ -10,28 +10,28 @@ output group `Z_{2^{8L}}` for every `x`, while **each key alone hides
 Prio/Poplar private analytics (Firefox telemetry, Apple–Google exposure
 notifications), Riposte metadata-private messaging, and 2-server PIR.
 
-**Status: Phase-1 COMPLETE.** The PRG, output group, key types + byte codec,
-the full-domain checker, and the entire verification harness are REAL and
-tested — and the Fable-irreducible core — the **correction-word construction**
-(`Dpf(n,L).genWithSeeds`, BGI16 Fig.1) and its matching traversal (`.eval`) —
-is implemented (`gate.core_implemented = true`). Every formerly-gated test now
-executes: full-domain exhaustive reconstruction, the byte-exact KAT vs the
-independent reference vectors, the security smell test, and the CW-perturbation
-positive control (all pass, no skips, Debug + ReleaseFast). See [SPEC.md](SPEC.md)
-for the construction, the output-group choice, the exact Fable boundary, and the
-external-reference anchoring.
+**Status.** The PRG, output group, key types and byte codec, the full-domain checker and the verification harness
+are implemented and tested, together with the correction-word construction (`Dpf(n,L).genWithSeeds`, BGI16 Fig. 1)
+and its matching traversal (`.eval`). Every test executes (`gate.core_implemented = true`): exhaustive full-domain
+reconstruction, the byte-exact KAT against the independent reference vectors, the security smell test and the
+CW-perturbation positive control. See [SPEC.md](SPEC.md) for the construction, the output-group choice, the exact
+Fable boundary, and the external-reference anchoring.
 
 | File | Contents |
 |---|---|
-| `root.zig` | Module doc, `meta`, re-exports (`Dpf`, `prg`, `group`, `kat_vectors`), dark-tests aggregator |
+| `root.zig` | Module doc, `meta`, re-exports (`Dpf`, `DpfWith`, `Mpf`, `MpfWith`, `prg`, `group`, `gate`, `kat_vectors`, `KeyFormatError`, `GenError`), dark-tests aggregator |
 | `prg.zig` | **REAL.** Two length-doubling PRGs `G` + seed→group `convert`: `Aes128Mmo` (fixed-key AES, **default**) and `Sha256Prg` (exact byte definitions pinned in-file) |
 | `group.zig` | **REAL.** `Z2k(L)` — the `Z_{2^{8L}}` output group (add/sub/neg + byte codec) |
-| `dpf.zig` | `Dpf(n,L)` = `DpfWith(prg.default, n, L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `evalFull`/`evalFullWith` (tree-reuse **prefix** evaluation, ~1 PRG call/point; `evalAll` kept naive as its oracle), `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
+| `dpf.zig` | `Dpf(n,L)` = `DpfWith(prg.default, n, L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `toBytesTagged`/`fromBytesTagged`, `evalAll`, `evalFull`/`evalFullWith` (tree-reuse **prefix** evaluation, ~1 PRG call/point; `evalAll` kept naive as its oracle), `evalRangeWith` (the same walk over a window `[lo, hi)`), `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
 | `mpf.zig` | `Mpf(n,L,k)` — **multi-point** FSS: `k` independent `Dpf` instances summed. No new cryptographic surface, no failure probability, keys linear in `k` |
 | `gate.zig` | The single switch (`core_implemented = true`) marking the correction-word core done |
 | `kat_vectors.zig` | Recorded independent-reference KAT vectors (the anti-self-consistency anchor) |
 | `kat_test.zig` | The deterministic verification harness + positive controls |
 | `mpf_test.zig` | The multi-point harness, incl. the KAT anchor inherited by composition and the seed-reuse leak control |
+| `fuzz_test.zig` | Deterministic fuzz driver (`FSS_FUZZ`), harnesses `fss-dpf` and `fss-mpf` |
+| `stackprobe_test.zig`, `burn.zig` | Dead-stack burn of every secret-touching entry point, and the probe that checks it |
+| `ctgrind_harness.zig` | Constant-time measurement of `genWithSeeds` and `eval` under valgrind |
+| `bench.zig` | Opt-in bench (`FSS_BENCH=1`): PRG A/B and tree-reuse against the per-point loop |
 
 ## Import
 
@@ -69,6 +69,9 @@ D.evalFull(0, &k0, &fast);
 // Streaming form for allocator-free consumers (pir's server loop): emits
 // (x, value) for each x in [0, count), ascending, materializing nothing.
 D.evalFullWith(0, &k0, n_records, ctx, myEmitFn);
+// The same walk over a window [lo, hi) (a shard of the domain); disjoint shards
+// cost O(N + shards*n) PRG calls in total, and equal evalFull's values.
+D.evalRangeWith(0, &k0, lo, hi, ctx, myEmitFn);
 
 // Verification oracle: first x where the two evals fail to reconstruct, or null.
 const bad = D.firstMismatch(&out0, &out1, alpha, beta);
@@ -130,12 +133,11 @@ Repeated points are a **multiset**: `α_j == α_l` makes the shared function
   the module pure `.any` computation (no OS/CSPRNG dependency). The caller MUST
   pass two independent, unpredictable, secret 16-byte seeds from a real CSPRNG;
   reusing or leaking a seed breaks the hiding property.
-- **The PRG is part of the key format, and the default CHANGED.** `Dpf`/`Mpf`
-  now use fixed-key AES-128 (`prg.Aes128Mmo`, format tag `0x02`); they used
-  SHA-256 (`prg.Sha256Prg`, tag `0x01`), which is still available via
-  `DpfWith`/`MpfWith`. **The two produce keys of the same LENGTH and different
-  contents**, so a key stored before this change decodes without complaint and
-  evaluates to garbage. `Key.toBytesTagged`/`fromBytesTagged` are the storage
+- **The PRG is part of the key format.** `Dpf`/`Mpf` use fixed-key AES-128
+  (`prg.Aes128Mmo`, format tag `0x02`); SHA-256 (`prg.Sha256Prg`, tag `0x01`) is
+  available via `DpfWith`/`MpfWith`. **The two produce keys of the same LENGTH and
+  different contents**, so a key stored by a build with the other PRG decodes
+  without complaint and evaluates to garbage. `Key.toBytesTagged`/`fromBytesTagged` are the storage
   codec that catches exactly that (`error.UnsupportedKeyFormat`); the wire
   codec `toBytes`/`fromBytes` is deliberately left header-free, because `pir`
   asserts a query share contains no constant bytes. Anything that persists a
@@ -145,7 +147,7 @@ Repeated points are a **multiset**: `α_j == α_l` makes the shared function
   its own keys, tweak convention and (protobuf) key layout, so its vectors are
   still not matched byte-exact — see [SPEC.md](SPEC.md).
 - **Constant time, with one caveat that is in the PRG, not the tree.** Neither
-  `Gen` nor any evaluator branches on a secret bit any more: the α path bit and
+  `Gen` nor any evaluator branches on a secret bit: the α path bit and
   the running control bit are XOR-masked selects. The remaining data-dependence
   is `std.crypto.core.aes`'s T-table fallback on targets WITHOUT hardware AES
   (`prg.Aes128Mmo.constant_time == false` there); on such a target choose
@@ -173,6 +175,7 @@ fss → std.crypto.core.aes.Aes128    (default PRG)
 ## Verify
 
 ```
+scripts/modtest fss                         # the module's tests (Debug); all pass, no skips
 zig build test-fss                          # Debug — all pass, no skips
 zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
 FSS_FUZZ=<runs>[,<first seed>] zig build test-fss   # deterministic fuzz driver (src/fuzz_test.zig)
@@ -180,11 +183,14 @@ FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast  # PRG A/B + evalFull vs e
 zig fmt --check modules/fss/
 ```
 
-All tests execute (the gate is `true`): the four formerly-gated
-core-dependent tests (full-domain correctness, byte-exact KAT, security smell,
-CW-perturbation control) plus the deterministic positive controls
-(`brokenAllBeta`/`brokenAllZero` → the `firstMismatch` checker), which are
-core-independent and prove the harness has teeth on their own.
+All tests execute (the gate is `true`); the deterministic positive controls (`brokenAllBeta`/`brokenAllZero` →
+the `firstMismatch` checker) are core-independent and prove the harness has teeth on their own.
+
+## Not provided
+
+Distributed comparison and interval functions, incremental (hierarchical) DPFs and non-`Z_{2^{8L}}` output groups are
+open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
+libraries are refused (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party
 source ported or studied. Per `CONVENTIONS.md §5` this needs no `NOTICE` entry

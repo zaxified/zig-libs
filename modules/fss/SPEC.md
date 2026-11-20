@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [weikengchen/libdpf](https://github.com/weikengchen/libdpf) | C / Rust | none detected by the API (not verified) | 14 | push 2026-03-20 | "A template for 2-server 1-bit DPF" with hardware AES for x86_64 and ARM64. |
 | Zig ecosystem | Zig | — | — | — | No FSS or DPF in `std`; none found on GitHub (search 2026-09-30). Sibling `pir` builds two-server PIR on this module; there is no sibling for Prio / VDAF. |
 
-**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. **Where we are behind:** no distributed comparison or interval functions (Google's tree has `dcf/`, libfss offers comparison), no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog). *(added 2026-10-06 from the 2026-09-30 survey table)*
+**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. **Where we are behind:** no distributed comparison or interval functions (Google's tree has `dcf/`, libfss offers comparison), no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog; the last is under *What is deliberately not done*).
 
 ## What this module is
 
@@ -62,7 +62,7 @@ a copyrightable work) — the citation lives here.
 
 The output group is **`Z_{2^{8L}}`** (integers mod `2^{8L}`, i.e. `L`-byte
 little-endian, wrapping add), `L = out_bytes` a compile-time parameter
-(`Dpf(n, L)`). Justification:
+(`Dpf(n, L)`, `L ∈ 1..32`, `dpf.zig:147`). Justification:
 
 - It is the **standard** DPF output group in the BGI construction: the final
   output correction word is computed once in the group and the two parties'
@@ -76,8 +76,7 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
   in the value (see `group.zig`).
 - The **GF(2)^m XOR group** is the other textbook choice; it is the special
   case where `add == sub == XOR`. It is a trivial variant of the same code
-  path (a one-line group swap) and is left as a scoped-out increment rather
-  than a second output type in Phase 1.
+  path (a one-line group swap) and is not built (see *Backlog / deferred*).
 
 **Domain parameterization:** the input domain is `{0,1}^n` (indices
 `0..2^n`), `n = n_bits` a compile-time parameter, `n ∈ 1..31`. Bits are read
@@ -85,7 +84,7 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
 so it is only practical for small `n`; large-`n` DPFs use single-point `Eval`
 (`O(n)`) or the tree-reuse `evalFull`/`evalFullWith` over a domain **prefix**
 (§"Tree-reuse prefix evaluation" below), which costs `O(out.len)` regardless
-of `2^n`.
+of `2^n`; `evalRangeWith` does the same for a window `[lo, hi)` (`dpf.zig:521`).
 
 ## The Fable-core vs mechanical split
 
@@ -113,18 +112,19 @@ eyeball-correctness is what places it at the Fable tier, even though it is
 
 **Mechanical scaffold (REAL and tested today):**
 
-- `prg.zig` — the SHA-256 length-doubling PRG `G` and the seed→group
-  `convert` (ordinary hashing; the exact byte definitions are pinned in that
-  file's doc comment).
+- `prg.zig` — the two length-doubling PRGs `G` (`Aes128Mmo`, the default, and
+  `Sha256Prg`) and the seed→group `convert` (the exact byte definitions are
+  pinned in that file's doc comment).
 - `group.zig` — `Z2k(L)` add/sub/neg + byte codec.
 - `dpf.zig` — the `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, the
   mechanical `evalAll` loop over `eval`, the tree-reuse `evalFull`/
-  `evalFullWith` prefix evaluator (§ below), and the `firstMismatch`
-  full-domain checker.
+  `evalFullWith`/`evalRangeWith` evaluators (§ below), the tagged storage codec
+  (`toBytesTagged`/`fromBytesTagged`) and the `firstMismatch` full-domain
+  checker.
 - `kat_test.zig` — the entire harness.
 
 `evalAll` is deliberately the **naive** loop over `eval`, and stays that way
-now that the tree-reuse evaluator exists: the naive loop is structurally
+beside the tree-reuse evaluator: the naive loop is structurally
 independent of the tree walk, which makes it the differential oracle
 `evalFull` is tested against element-for-element. The tree-reuse evaluator
 itself is mechanical scaffold, not new Fable surface — it re-applies `eval`'s
@@ -178,59 +178,50 @@ self-consistency is **not** accepted as the sole correctness signal.
   archived outside the repo (it is a build-time oracle, not shipped code; per
   `CONVENTIONS.md §5` this needs no `NOTICE` entry).
 
-  *During scaffolding this was validated end-to-end:* a throwaway reference
-  implementation of the core was dropped in, the gate flipped, and all 18
-  tests — including the byte-exact KAT — passed, confirming the scaffold's
-  serialization/endianness match the reference before the core was re-gated.
-  So the Fable pass has a byte-exact target, not a moving one.
 
-## Verification harness (`CONVENTIONS.md §7` — pure logic, deterministic)
+## Verification
 
-Verification is **deterministic** (fixed seeds ⇒ Gen is a pure function;
-full-domain reconstruction is exhaustive), so every assertion is exact.
+Run: `scripts/modtest fss`. Verification is **deterministic** (fixed seeds ⇒ Gen is a pure function; full-domain
+reconstruction is exhaustive), so every assertion is exact. Every test executes (`gate.core_implemented = true`);
+a skip is never a pass.
 
-1. **Full-domain correctness** (core-dependent): for several `(α,β)` at `n=8`,
-   Gen then EvalAll on both keys, assert `firstMismatch == null` — i.e.
-   `Eval0(x)+Eval1(x) == f_{α,β}(x)` for **all** `2^8` points.
-2. **Byte-exact KAT** (core-dependent): the anti-self-consistency anchor above.
-3. **Security smell test** (core-dependent, **heuristic — not a proof**): one key's
-   EvalAll must not collapse to a constant and must have many distinct values
-   (no `α`-spike). Documents that it is a defense-in-depth smell test, not a
-   proof of the hiding property.
+1. **Full-domain correctness** (`kat_test.zig`): for several `(α,β)` at `n=8`, Gen then `evalAll` on both keys,
+   assert `firstMismatch == null` — i.e. `Eval0(x)+Eval1(x) == f_{α,β}(x)` for **all** `2^8` points.
+2. **Byte-exact KAT**: the anti-self-consistency anchor above (`kat_vectors.zig`).
+3. **Security smell test** (**heuristic — not a proof**): one key's `evalAll` must not collapse to a constant and must
+   have many distinct values (no `α`-spike). A defense-in-depth smell test, not a proof of the hiding property.
 4. **Positive controls (harness teeth):**
-   - *Core-independent:* `brokenAllBeta` (reconstructs `β` everywhere) and
-     `brokenAllZero` (reconstructs `0` everywhere) are fed to `firstMismatch`,
-     which MUST reject each — proving the checker catches both a
-     spurious-nonzero-off-target and a missing-`β`-on-target sharing
-     independent of Gen/Eval.
-   - *Core-dependent (stronger):* flip one control-bit CW in a real key and confirm the
-     **same** `firstMismatch` catches it — proving the CW anchor and the
-     reconstruction check are both load-bearing. Deterministic, so it fails
-     deterministically.
+   - *Core-independent:* `brokenAllBeta` (reconstructs `β` everywhere) and `brokenAllZero` (reconstructs `0`
+     everywhere) are fed to `firstMismatch`, which MUST reject each — proving the checker catches both a
+     spurious-nonzero-off-target and a missing-`β`-on-target sharing independent of Gen/Eval.
+   - *Core-dependent (stronger):* flip one control-bit CW in a real key and confirm the **same** `firstMismatch`
+     catches it — proving the CW anchor and the reconstruction check are both load-bearing.
+5. **Evaluator equivalence** (`kat_test.zig`): `evalFull`, `evalFullWith` and `evalRangeWith` reproduce `eval`/
+   `evalAll` bit-for-bit (full domains, prefixes inside/at/past the position of α, prefix lengths 0/1 and a
+   straddling leaf, disjoint shards that do not divide the domain), `evalAll`'s naive loop being the independent
+   oracle; `mpf_test.zig` does the same for `Mpf.evalEachFullWith` against `evalEach`, plus the KAT inherited by
+   composition and the seed-reuse leak control.
+6. **PRG and codec** (`prg.zig`, `dpf.zig`): `Aes128Mmo` pinned to FIPS-197 Appendix B and `convert` to the
+   long-hand `H_2 ‖ H_3`; `convert(L)` is the low `L` bytes of `convert(32)` for every `L`; distinct format tags and
+   tagged round trip (`dpf.zig:640`ff).
 
-The Fable pass implemented the two core functions to reproduce
-`kat_vectors.zig` byte-exact and flipped `gate.core_implemented` to `true`, so
-every formerly-gated test now runs as an executed assertion (all pass, no
-skips, Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
-(`error.SkipZigTest`) — a skip was never a pass.
-
-**Mutation run 2026-10-06** (in-place, Debug, 40 mutants over `dpf.zig`'s
-Gen/Eval/range walk/codec/checker, `mpf.zig`'s seed-reuse guard, interleaved
-walk and checker, both PRGs and the group): 39 killed. The first pass left 3;
-two missing tests were added in `prg.zig` (`Aes128Mmo.convert` against the
-long-hand `H_2 ‖ H_3` — the convert tweak moved to byte 1 survived; and
-`convert(L)` as the low `L` bytes of `convert(32)` for every `L` — the
-second block skipped for `L ∈ 17..24` survived, reading uninitialised bytes).
-Two mutants that first failed to compile were rewritten and counted. One is
-equivalent for value tests: dropping `xorMasked`'s `blackBox` barrier changes
-no value; it is a constant-time property, held by `scripts/checks/ctgrind.sh`
-(CHANGELOG 2026-09-09), not by `zig build test`.
+- **Fuzz:** testkit's deterministic driver, `FSS_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`), harnesses
+  `fss-dpf` and `fss-mpf`: generated key pairs reconstruct the point function through the byte codec, a wrong format
+  tag is refused, a repeated `Mpf` seed is refused, and on arbitrary or damaged key bytes the tree-reuse walk equals
+  the per-point `eval`, `evalEach` sums to `eval` and re-encoding reaches a fixed point. Reach tests in every run
+  check that each outcome is hit.
+- **Dead stack:** `stackprobe_test.zig` (`testkit.stackprobe`, ReleaseFast only) looks for the root seeds and
+  serialized key bytes below every entry point's burn.
+- **Constant time:** `src/ctgrind_harness.zig`, rows `fss/gen` and `fss/eval` in `scripts/checks/ctgrind-expected.tsv`
+  (ReleaseFast; 0 in-file contexts). Removing `xorMasked`'s optimization barrier changes no value, so it is an
+  equivalent mutant for `zig build test`; ctgrind is what holds it.
+- **Bench:** `FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast` (`src/bench.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Multi-point FSS (`mpf.zig`)
 
 Shares of `f_{A,B}(x) = Σ_j β_j·1{x==α_j}` — non-zero at `k` chosen points.
-This was on the scoped-out list below as part of "General FSS"; it is now
-built, and the scoped-out entry has been narrowed to what remains.
 
 ### Construction chosen, and the trade-off accepted
 
@@ -271,7 +262,7 @@ single instance's pass from `O(N·n)` to `O(N)` hashes, and the *interleaved*
 `evalEachFullWith` (§"Interleaved multi-tree prefix evaluation") applies that
 walk to all `k` instances at once, so the consumer's data is traversed once and
 the total is `~k·N` hashes rather than `k·N·n`. The cuckoo revisit bar is
-therefore now the factor `k` itself — which is the construction, not the
+therefore the factor `k` itself — which is the construction, not the
 traversal, and no walk can remove it.
 
 ### Seed independence is a security requirement, and is enforced
@@ -311,7 +302,7 @@ plaintext multi-point function, and against the sum of the anchored
 components). No vector computed by this implementation is presented as an
 anchor anywhere.
 
-### The encoding is not injective (finding)
+### The encoding is not injective
 
 Found by fuzzing under `--release=safe`, and it applies to `dpf`'s existing
 codec, not only to `mpf`'s: `serializeCw` writes each control-bit correction
@@ -331,10 +322,6 @@ Consequences, none of which is a vulnerability here:
   (`fromBytes` then `toBytes`) or it will treat equivalent keys as distinct.
 
 ## Tree-reuse prefix evaluation (`evalFull` / `evalFullWith`)
-
-This was on the scoped-out list below ("Efficient tree-reuse `evalFull` —
-`O(2^n)` full-domain instead of the naive `O(n·2^n)` loop"); it is now built,
-and the entry has been removed.
 
 ### What was built, and why it lives here and not in `pir`
 
@@ -371,7 +358,7 @@ materializing nothing. It exists because `pir` is a no-allocator module whose
 record count is a runtime value: the server folds each evaluation into its
 answer as the walk produces it, so no `count`-sized buffer exists anywhere.
 
-### Verification and measured effect
+### Verification and cost
 
 Equivalence is exact and asserted, not argued: `kat_test.zig` requires
 `evalFull` to reproduce the `eval`/`evalAll` path **bit-for-bit,
@@ -380,16 +367,9 @@ of an `n=16` domain (α inside, at the prefix's last point, just past it, and
 at the far end of the domain), prefix lengths 0/1/257 (a full subtree plus a
 straddling leaf), for both parties — with `evalAll`'s naive loop as the
 structurally independent oracle, plus a streaming-form test asserting each
-index is emitted exactly once, in order. Mutation-tested (earlier, undated): mis-gating one
-child's seed-CW application (parent's `t` → child's `t`) is caught by three of
-these tests; shortening the prefix by one at the consumer is caught by `pir`'s
-every-record-influences-the-answer test.
+index is emitted exactly once, in order.
 
-Measured (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, this
-host): `n=16` full domain 570 ms → 52 ms (**~11×**, theory `(2n+1)/3 ≈ 11`);
-500-point prefix of an `n=20` domain 5.1 ms → 0.36 ms (**~13–15×**), with
-`evalFull`'s per-point cost flat (~0.7–0.8 µs) across both — i.e. it follows
-the prefix length, not the domain size.
+Cost follows the prefix length, not the domain size; `FSS_BENCH=1` prints the `evalFull`-against-`eval`-loop comparison, and the ratio tracks the theory `(2n+1)/3` of PRG calls (every node expanded once instead of `n` times per point).
 
 ## Interleaved multi-tree prefix evaluation (`Mpf.evalEachFullWith`)
 
@@ -434,37 +414,9 @@ fuzz target's arbitrary key material over a fuzzer-chosen prefix. The oracle is
 `evalEach` (a loop over `dpf.eval`), deliberately left naive and untouched;
 `pir.zig` additionally keeps the pre-interleaving server loop as a test-only
 oracle and requires `Multi.answer`/`answerAggregate` to reproduce it word for
-word. Mutation-tested (earlier, undated; each confirmed to turn the suite red):
+word.
 
-| mutation | caught by |
-|---|---|
-| instance 0's CWs applied to every tree | 4 `mpf` + 6 `pir` tests |
-| seed CW gated on the child's control bit, not the parent's | 4 `mpf` + 7 `pir` |
-| one instance's state not advanced into a child | 4 `mpf` + 6 `pir` |
-| **consistent** reorder: right subtree first with `base` adjusted to match, so every value still lands at its own index | 4 `mpf` tests — and in `pir` **only** the access-order pin (every functional test stays green, because the answer accumulation is commutative) |
-| instances 0 and 1 swapped at the leaf | 3 `mpf` + 5 `pir` — but **not** the summed-form test, which is permutation-invariant: the per-instance oracle is what has teeth here |
-| tail pruning off by one (`base > count`) | prefix-boundary test + bounds panics in both modules |
-
-Measured (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, this host,
-against the per-point `evalEach` loop, both routes asserted equal first):
-`n=14, k=4` full `2^14` domain 495 ms → 52 ms (**~9.5×**); `n=20, k=8`, the
-`pir` shape of a 500-record prefix in a `2^20` domain, 43.1 ms → 3.0 ms
-(**~14×**). Both ratios track the theoretical `~(2n+1)/3`, as the single-tree
-case does.
-
-## Scoped out (future increments, NOT Phase 1)
-
-- **DCF / comparison functions** — `f_{α,β}^<(x) = β if x < α else 0`
-  (Boyle–Chandran–Gilboa–Jain–Kohl–Scholl et al.); a `dcf.zig` sibling reusing
-  this PRG/group. The `Dpf`-now / room-for-`dcf`-later layout is why the module
-  is named `fss` rather than `dpf`.
-- **General FSS** — interval and decision-tree functions. (Multi-point was on
-  this list and is now `mpf.zig`, above.)
-- **Sublinear multi-point FSS** — the cuckoo/batch-code construction, with the
-  revisit trigger stated above.
-- **2-server PIR** built on `EvalAll` — now its own module, `pir`.
-  (Fixed-key AES and the constant-time review were on this list; both are now
-  built — §"PRG choice" below.)
+Cost: the hash count stays `~k·N`, linear in `k`; the `FSS_BENCH=1` bench compares the walk against the per-point `evalEach` loop (both routes asserted equal first), and the ratio tracks the theory `~(2n+1)/3`, as in the single-tree case.
 
 ## PRG choice (`prg.zig`) — why the default is fixed-key AES
 
@@ -486,20 +438,7 @@ also holds. That is precisely the setting Guo–Kolesnikov–Rosulek–Roy (S&P 
 introduced σ for; plain MMO is correlation-robust but not *circular*
 correlation-robust under XOR offsets.
 
-**Measured** (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, i7-7920HQ,
-AES-NI present, same binary, same run — the SHA-256 row IS the pre-change
-module, since the construction code is identical):
-
-| | SHA-256 | fixed-key AES | |
-|---|---|---|---|
-| raw `expand` | 2.00 M/s | 71.8 M/s | **36×** |
-| `Gen`, n=12 | 75.4 k keys/s | 1.86 M keys/s | **25×** |
-| `evalFull`, n=12 full domain | 1.21 M evals/s | 30.3 M evals/s | **25×** |
-
-Larger than the "~10×" this was scoped out with, because the AES PRG also
-halves the number of primitive calls per node (one 128-bit block per child
-instead of a 256-bit hash for 17 bytes) and the two children pipeline through
-one `encryptWide`.
+**Speed.** The AES PRG is more than an order of magnitude faster than SHA-256 for raw `expand`, `Gen` and `evalFull` (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast` prints both PRGs side by side from the same binary; the SHA-256 row is the construction with the slower primitive, since the construction code is identical). Beyond hardware AES it also halves the number of primitive calls per node (one 128-bit block per child instead of a 256-bit hash for 17 bytes) and the two children pipeline through one `encryptWide`.
 
 **Key-format consequence, stated rather than discovered later.** Same `(n, L)`
 under two PRGs gives keys of the **same length** and different contents, so an
@@ -516,7 +455,7 @@ exactly like `n`, `L` and `k`, none of which are in the bytes either.
 ## Constant time
 
 `genWithSeeds`, `eval`, `evalFull`/`evalFullWith` and `Mpf`'s interleaved walk
-no longer branch on a secret bit. The α path bit in Gen and the running control
+do not branch on a secret bit. The α path bit in Gen and the running control
 bit `t` in every evaluator drive XOR-masked selects (`selectSeed`, `selectBit`,
 `xorMasked` in `dpf.zig`), so the instruction and branch trace is identical for
 every key, every α and every control-bit pattern. `x` in `eval` is a public
@@ -525,7 +464,7 @@ of the two is secret.
 
 ⛔ **`xorMasked`'s mask goes through an optimization barrier, and removing it
 reintroduces the leak.** Writing the select branch-free is not sufficient here,
-and this was measured rather than assumed: at ReleaseFast on 2026-09-09 the very
+and this was measured rather than assumed: at ReleaseFast the very
 same `xorMasked` compiled BOTH ways inside one binary — branch-free (`cmovne`)
 at `genWithSeeds`' two call sites, and `test $0x1,%r9b` / `je` on the secret
 control bit `t` at `eval`'s. `cond` is a `u1`, so LLVM could recover that a zero
@@ -535,13 +474,13 @@ an empty inline-asm (the montint `b199192` idiom, as in `p256`, `k256` and
 directly: `fss/eval` reports 0 in-file contexts, and did report one before the
 barrier was added.
 
-⛔ **The leaf's `cw_final` mask needs the same barrier (Zig 0.17.0, 2026-10-18).**
+⛔ **The leaf's `cw_final` mask needs the same barrier (Zig 0.17.0).**
 `key.cw_final & (0 -% @as(Elem, t))` is the select LLVM recognises as
 `t ? cw_final : 0`; under Zig 0.17.0 (LLVM 22) `eval`'s leaf compiled it to
 `test $0x1,%r13b` / `je` over the load of `cw_final` -- a jump on the secret
 final control bit, `fss/eval` 0 -> 1 (the 0.16 build was branch-free). Every mask
 built from a secret bit over an `Elem` -- `eval`'s and `evalFull`'s leaf, Gen's
-`cw_final` negation, `Mpf`'s leaf and seed-CW masks -- now goes through
+`cw_final` negation, `Mpf`'s leaf and seed-CW masks -- goes through
 `secretMask` (`dpf.zig`): the mask is made in one opaque machine word behind the
 empty-asm barrier and replicated across the `Elem` width.
 
@@ -554,14 +493,53 @@ does not claim constant time. `prg.Aes128Mmo.constant_time` exposes this, and
 target. This is a real cost of the swap and is the second reason the SHA-256
 PRG was kept.
 
+## Secret handling on the stack
+
+Every entry point that touches a key, a seed or the secret point takes it **by pointer** and runs its body one frame
+down under `burn.run`, which then zeroes the stack the body dirtied (`burn.zig`; the burn sizes are `gen_burn`,
+`walk_burn`, `mpf_walk_burn`, `codec_burn`). Keys are written through an `out` pointer (`genWithSeeds`, `fromBytes`,
+`fromBytesTagged`), never returned: a returned key sits in the caller's result slot, above the burn.
+
+`Dpf.genWithSeeds` and `Mpf.genWithSeeds` take the point `α` and value `β` (`alphas`/`betas`) by `*const`, like the
+seeds (`dpf.zig:314`, `mpf.zig:233`); the body copies them inside its own burned frame, so `burn.run`'s argument tuple
+holds only pointers. A caller's own temporaries (the local the pointer points at, a `@intCast` result) are the
+caller's to wipe: the module cannot reach them. The `prg` `expand`/`convert` primitives keep their by-value shape
+(per-node hot calls under the walk's burn). The stack probe's needles are the seeds and serialized key bytes, so it
+does not observe `α` itself; for `α` the guarantee is by construction.
+
+## What is deliberately not done
+
+- **Sublinear multi-point FSS (cuckoo / batch-code construction).** `Mpf` is `k` independent DPFs summed; the
+  bucketed construction trades a placement-failure probability and new cryptographic surface for `O(N)` server work.
+  The trade-off and the one thing that would justify revisiting it (a consumer for which `k` passes dominate,
+  measured) are under *Multi-point FSS*.
+- **Byte-exact interoperability with other DPF libraries.** Keys are module-defined (PRG, tweaks, control-bit
+  extraction, layout); matching Google's would need its fixed keys, tweak convention, byte order, control-bit
+  extraction, packed value correction and protobuf layout, none of which a published vector file pins. See
+  *External-reference anchoring*.
+- **A header on the wire codec.** `toBytes`/`fromBytes` stay header-free (a constant tag byte would hand an observer
+  a constant and break `pir`'s no-structural-constant-bytes census); the tag lives in the storage codec only.
+- **A second output type for the XOR group in the first version** — `add == sub == XOR` is a one-line group swap,
+  listed under Backlog with the other groups.
+
 ## Backlog / deferred
 
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `convert` (per DPF tree node), `fromBytesBody`, `serializeCwBody`. Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
-
-- **DONE 2026-11-18 (owner decision) — Dead stack: `alpha`/`beta` by value** *(2026-10-09, dead-stack sweep)*: `Dpf.genWithSeeds` and `Mpf.genWithSeeds` take the secret point and value by `*const` (like the seeds), and the body copies them inside its own burned frame, so `burn.run`'s argument tuple holds only pointers. Pre-1.0 API change; every call site updated. A caller's own temporaries (the local the pointer points at, a `@intCast` result) are the caller's to wipe: the module cannot reach them. The stack probe's needles are the seeds, so it does not observe α itself; the guarantee is by construction.
-- **Distributed comparison function (DCF) and interval functions** *(survey 2026-09-30)*: the module doc names `dcf.zig` as the reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of extra state per level, reuses `prg` and `group`); fits §2.
-- **Incremental / hierarchical DPF (IDPF)** *(survey 2026-09-30)*: the headline feature of the reference library; private heavy hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes internally but there is no per-level output/CW. Medium; fits §2.
-- **Non-`Z_{2^{8L}}` output groups** (`XOR`, `Z_N`, tuples/vectors of elements) *(survey 2026-09-30, inferred from Google's API)*: only the additive `Z_{2^{8L}}` group exists (`group.zig`); PIR-by-XOR and VDAF-style field elements need others. Small-medium; fits §2.
+- **Zig 0.17: wide integer loads/stores on a possibly hot path**: 0.17 lowers a `@bitCast` between `[N]u8` (N > 8)
+  and a wider-element type to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256). The widths here go
+  through `std.mem.readInt`/`writeInt` of `Elem` (up to `u256`) in `prg.zig:170,277`, `group.zig:47,53` and the key
+  codec (`dpf.zig:208,240`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
+  share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative`
+  (identical bytes, 8 instructions).
+- **Distributed comparison function (DCF) and interval functions** *(survey)*: the module doc names `dcf.zig` as the
+  reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics
+  (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of
+  extra state per level, reuses `prg` and `group`); general interval and decision-tree functions would follow.
+- **Incremental / hierarchical DPF (IDPF)** *(survey)*: the headline feature of the reference library; private heavy
+  hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes
+  internally but there is no per-level output/CW. Medium.
+- **Non-`Z_{2^{8L}}` output groups** (`XOR`, `Z_N`, tuples/vectors of elements) *(survey, inferred from Google's
+  API)*: only the additive `Z_{2^{8L}}` group exists (`group.zig`); PIR-by-XOR and VDAF-style field elements need
+  others. Small-medium.
 
 ## Anchoring
 
@@ -571,5 +549,3 @@ PRG was kept.
 - **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
 
 **What the tests actually contain.** independent Python re-derivation from BGI16 emits KAT vectors, stated over the retained Sha256Prg (SPEC.md); FIPS-197 App. B pins the AES MMO step only
-
-**How it got there.** No external oracle exists for what remains. NOT ANCHOR DEBT - reclassified 2026-08-02, RE-CHECKED 2026-08-06 after the PRG swap landed. The default PRG IS now fixed-key AES (prg.Aes128Mmo) and it did NOT buy byte-exact agreement with Google: that would additionally need Google's own fixed keys, tweak convention, control-bit extraction, packed value-correction and protobuf key layout, and their tests compute expectations inline rather than publishing a vector file. So the earlier note's central claim was WRONG - the PRG was never the only obstacle. What the swap did buy is ~25-36x speed (SPEC.md §'PRG choice'). Tier stays REDERIVED and the vectors were NOT regenerated: they are stated over the retained Sha256Prg instantiation, and DpfWith shares one body of correction-word code, so they still pin the construction byte-exact. Genuinely external and newly added, but narrow: the MMO step is pinned to FIPS-197 App. B - that anchors the AES call, NOT the DPF.
