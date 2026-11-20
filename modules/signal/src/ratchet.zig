@@ -1321,7 +1321,7 @@ fn fuzzHeaderFromBytes(_: void, smith: *std.testing.Smith) !void {
     // fewer than the eight it reads as a little-endian `u64` and returned the
     // range MINIMUM: `len` was 0 for every input this lane can carry, and
     // `fromBytes` refused it on the `bytes.len != encoded_length` line without
-    // reading an octet. Measured 2026-09-07 over the corpus: 0 of 12 seeds
+    // reading an octet. Measured over the corpus: 0 of 12 seeds
     // arrived non-empty and 0 headers decoded before; 11 and 8 after.
     const len: usize = smith.slice(&buf);
     const h = Header.fromBytes(buf[0..len]) catch return;
@@ -1350,7 +1350,7 @@ test "corpus: every header seed reaches fromBytes, and the fields decoded are pi
     }
     // One seed is deliberately the empty slice.
     try testing.expectEqual(header_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. Before the draw was restructured all four were 0 —
+    // Measured. Before the draw was restructured all four were 0 —
     // the only input this target ever handed `fromBytes` was the empty slice.
     try testing.expectEqual(@as(usize, 7), decoded);
     try testing.expectEqual(@as(u64, 12884905889), counter_sum);
@@ -1416,7 +1416,7 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     // empty slice on every round, which it refuses for being shorter than the
     // 16-octet tag. `Smith.slice` memsets the tail, so the leading 40 octets
     // are always a well-formed header and the remainder is the ciphertext.
-    // Measured 2026-09-07 over the corpus: 0 of 13 seeds carried a ciphertext
+    // Measured over the corpus: 0 of 13 seeds carried a ciphertext
     // octet before, 11 after, and the `TooManySkippedMessages` guard had never
     // been reached.
     var raw: [decrypt_buf_len]u8 = undefined;
@@ -1476,7 +1476,7 @@ test "corpus: every decrypt seed reaches decrypt, and the refusals it draws are 
     }
     // One seed is deliberately empty.
     try testing.expectEqual(decrypt_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. Before the draws were restructured `ct_octets` was
+    // Measured. Before the draws were restructured `ct_octets` was
     // 0 across the whole corpus, `TooManySkippedMessages` had never fired, and
     // `aeadOpen` was handed an empty slice every round — so the only refusal
     // this target had ever produced was the "shorter than the 16-octet tag"
@@ -1596,7 +1596,7 @@ test "interop: this module's own KDF_RK info is a pinned literal, and is NOT lib
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

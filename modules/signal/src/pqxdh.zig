@@ -28,7 +28,7 @@
 //!
 //! **2. There are no published PQXDH test vectors.** Neither the spec page nor
 //! libsignal publishes byte-exact known-answer data for the composed
-//! agreement — checked 2026-08-22. So the anchoring here is layered rather
+//! agreement — checked. So the anchoring here is layered rather
 //! than end-to-end: `xeddsa` carries libsignal's own published vector, and the
 //! composition itself is checked against an independent HKDF implementation
 //! (`tools/pqxdh-kdf-check.py`, whose output is pinned in
@@ -827,12 +827,12 @@ test "a substituted KEM prekey yields a DIFFERENT SK, and respond refuses the in
     try testing.expectEqualStrings("hello", right.plaintext);
 }
 
-// ── the entropy seam (audit 2026-09-01) ──────────────────────────────────────
+// ── the entropy seam ──────────────────────────────────────
 //
 // `CONVENTIONS.md` §2.2: anything that becomes a key or ephemeral key material
 // is drawn with `entropy.fill`/`io.randomSecure`, never `io.random`, whose
 // contract permits a silent degrade. `x3dh.generateKeyPair` was moved to the
-// fail-closed source on 2026-08-13 for exactly this reason; the two ML-KEM
+// fail-closed source for exactly this reason; the two ML-KEM
 // draws added with PQXDH reached `io.random` through std's convenience
 // wrappers (`Kem.KeyPair.generate` / `PublicKey.encaps`) and inherited nothing
 // of that decision. A weak draw there leaves every Diffie-Hellman strong and

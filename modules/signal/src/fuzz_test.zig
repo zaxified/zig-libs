@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for signal (added 2026-10-10): `SIGNAL_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for signal: `SIGNAL_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `signal-ratchet` (a live Double Ratchet conversation, in order and
 //! reversed; every delivery first tried with a flipped bit and a damaged

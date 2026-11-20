@@ -44,7 +44,7 @@
 //!   repo:     https://github.com/signalapp/libsignal
 //!   commit:   857c4dc ("Remove require_pq_ratio from protocol and bridge.")
 //!   crate:    libsignal-protocol 0.1.0 (workspace member `rust/protocol`)
-//!   captured: 2026-08-09, rustc 1.93.1
+//!   captured:, rustc 1.93.1
 //!   method:   `tools/libsignal_dump.rs` (a `#[cfg(test)] mod zig_libs_dump`) appended to
 //!             `rust/protocol/src/ratchet/keys.rs` in a throwaway checkout
 //!             kept outside this repository, driving libsignal's OWN
@@ -182,7 +182,7 @@ pub const root_ratchets = [_]RootRatchet{
 ///
 /// Unlike the Double Ratchet vectors above, these are NOT from libsignal, and
 /// the difference matters enough to state plainly: **Signal publishes no
-/// byte-exact PQXDH vectors** — checked 2026-08-22, neither the spec page nor
+/// byte-exact PQXDH vectors** — checked, neither the spec page nor
 /// libsignal's source carries known-answer data for the composed agreement. So
 /// this is a weaker class of anchor than the ratchet's: it is a second
 /// implementation of the same arithmetic rather than the protocol's authors'

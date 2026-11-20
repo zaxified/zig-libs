@@ -25,11 +25,9 @@
 //! deployed-variant signature with all 64 single-byte tampers rejected, and
 //! the spec-pure `xeddsa.verify` must REJECT it.
 //!
-//! Until 2026-10-26 this was the vector from libsignal-protocol-c's own test
-//! suite (GPLv3); it was replaced because copyleft-licensed data may not
-//! live in this repository. What the oracle encodes about deployed libsignal
-//! is the documented convention (natural-sign `A`, sign bit in
-//! `signature[63]`), not a signature libsignal produced.
+//! What the oracle encodes about deployed libsignal is the documented
+//! convention (natural-sign `A`, sign bit in `signature[63]`), not a
+//! signature libsignal produced.
 
 const std = @import("std");
 const x3dh = @import("x3dh.zig");

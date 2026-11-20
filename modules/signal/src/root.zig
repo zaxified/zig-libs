@@ -101,7 +101,7 @@ pub const generateSignedPreKey = x3dh.generateSignedPreKey;
 // messages and associated data, so keeping both sets visible makes every
 // cross-feed a compile error on distinct types.
 //
-// Both PQXDH types have `toBytes`/`fromBytes` (2026-11-16): the X3DH layouts
+// Both PQXDH types have `toBytes`/`fromBytes`: the X3DH layouts
 // extended by the KEM fields, with the same `has_opk` discipline.
 pub const PqPreKeyBundle = pqxdh.PreKeyBundle;
 pub const PqInitialMessage = pqxdh.InitialMessage;

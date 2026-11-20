@@ -8,10 +8,8 @@
 //! decrypt, aborts the protocol and deletes SK". Shared by `x3dh.zig` and
 //! `pqxdh.zig` so the two handshakes cannot drift apart; not re-exported.
 //!
-//! Until 2026-09-13 neither handshake did this: `initiate` took the ciphertext
-//! as an opaque caller argument BEFORE `SK` existed, so no caller could satisfy
-//! the spec, and `respond` succeeded whatever the message carried. For PQXDH
-//! that left the third `AD` term, `Encode(PQPKB)`, authenticating nothing.
+//! For PQXDH that left the third `AD` term, `Encode(PQPKB)`, authenticating
+//! nothing.
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
