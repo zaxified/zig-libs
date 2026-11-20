@@ -235,7 +235,7 @@ test "RSS_GET request: default and explicit context" {
     try testing.expectError(error.InvalidRequest, buildRss(gpa, 23, 1, .byName(""), null));
 }
 
-// Delta mutation audit 2026-11-17: the tests below were added for survivors.
+// Delta mutation audit: the tests below were added for survivors.
 
 test "Rss.deinit resets the value, so a second deinit is a no-op" {
     const gpa = testing.allocator;

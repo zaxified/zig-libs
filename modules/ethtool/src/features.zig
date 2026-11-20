@@ -284,7 +284,7 @@ pub const SetResult = struct {
     /// names, so the question cannot be put to it. Returning `bool` here made
     /// a reply that had refused everything report every feature as honoured —
     /// fail-open, and the opposite of what its sibling `isSetByName` (also
-    /// `?bool`) does with the same reply (W2 re-audit 2026-09-02, `ethtool` F4).
+    /// `?bool`) does with the same reply (W2 re-audit, `ethtool` F4).
     pub fn honouredByName(r: SetResult, name: []const u8) ?bool {
         const b = r.unhonoured orelse return true;
         const bits = b.bits orelse return null;

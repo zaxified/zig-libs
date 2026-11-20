@@ -172,7 +172,7 @@ pub fn parseEeprom(gpa: std.mem.Allocator, attr_bytes: []const u8) (codec.Error 
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
     // Presence, not length: a first `DATA` of length 0 leaves `out.data.len`
     // at 0, so keying the duplicate check on the length let a second `DATA`
-    // through and silently win (W2 re-audit 2026-09-02, `ethtool` F5).
+    // through and silently win (W2 re-audit, `ethtool` F5).
     var seen_data = false;
     while (try it.next()) |a| switch (a.type) {
         uapi.MODULE_EEPROM.HEADER => out.device = try header.parse(a.data),

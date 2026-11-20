@@ -755,7 +755,7 @@ fn fuzzParams(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⛔ And it looked HEALTHIER that way: every field of every one of these
     // replies is optional — "absent attributes stay null (n/a)" is the test
     // above — so all four decoders SUCCEEDED on the empty slice every round.
-    // Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty, 36
+    // Measured over the corpus above: **0 of 9 seeds non-empty, 36
     // of 36 (seed, decoder) pairs "decoded" and 0 fields recovered before; 9
     // of 9 non-empty, 15 pairs decoded and 22 fields after.** The pair count
     // went DOWN, which is the point: the empty reply is accepted by all four

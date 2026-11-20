@@ -78,7 +78,7 @@ pub const Error = codec.Error || error{OutOfMemory};
 /// `codec.Error.BadLength` — which is what these functions used to do — made
 /// `client.zig` classify a caller-argument fault as `MalformedReply`, i.e. as
 /// the *peer's* fault, for a request that was never sent. Same shape as
-/// `header.Error` (W2 re-audit 2026-09-02, `ethtool` F3).
+/// `header.Error` (W2 re-audit, `ethtool` F3).
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
 
 /// Refuse to allocate for an absurd `SIZE`. The biggest real bitset in this
@@ -870,7 +870,7 @@ fn fuzzBitset(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⛔ And it looked HEALTHIER that way. The test twenty lines up says it in
     // as many words: "empty bitset decodes to an empty set, not an error". So
     // `parse("")` SUCCEEDED every round and the harness ran all six accessors
-    // on an empty `Bitset`. Measured 2026-09-07 over the corpus above: **0 of
+    // on an empty `Bitset`. Measured over the corpus above: **0 of
     // 10 seeds non-empty, 10 of 10 "parsed" and 0 bits set before; 10 of 10
     // non-empty, 5 parsed and 11 bits set after.**
     const len: usize = fz.drawInput(S, src, &raw, entries);
@@ -955,9 +955,9 @@ test "corpus: every bitset seed reaches the parser, and the counts are pinned" {
 // silently: `codec.nestEnd` truncated the length and returned `void`, so the
 // encoders reported success and put a header on the wire covering a fraction
 // of its own payload. `nestEnd` was given `error{AttrTooLong}` repo-wide on
-// 2026-09-02 and every call site here maps it — but nothing in this module
+// and every call site here maps it — but nothing in this module
 // drove a nest past the limit, so deleting the whole guard left the suite
-// green (W2 re-audit 2026-09-02, `ethtool` F1). These tests are the guard:
+// green (W2 re-audit, `ethtool` F1). These tests are the guard:
 // one per verbose encoder, each just over 65535 bytes of nest.
 test "a verbose bitset larger than a nest can express is refused, not truncated" {
     const gpa = testing.allocator;

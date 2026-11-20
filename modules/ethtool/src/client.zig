@@ -162,7 +162,7 @@ pub const max_error_message = @typeInfo(@FieldType(genl.Socket, "ext_ack_buf")).
 /// becomes `NoSuchDevice`, which is exactly what an `ENOENT` from nlctrl
 /// mapped to through `errnoToError` before the resolver was shared;
 /// `NameTooLong` cannot happen for a name this module hardcodes.
-/// `TooManyMessages` (genetlink audit F1, added 2026-09-10: the resolver's
+/// `TooManyMessages` (genetlink audit F1, added: the resolver's
 /// reply loop is now budget-bounded instead of spinning forever) folds onto
 /// `MalformedReply` — same bucket as any other reply stream this module
 /// could not make sense of, and no new member on `SubscribeError` itself.
@@ -768,7 +768,7 @@ pub const Ethtool = struct {
             // and nothing to check; a `*_SET_REPLY` body does, and it is the
             // message a caller reads to decide whether the change stuck — so
             // it is exactly the one that must not be about another device
-            // (W2 re-audit 2026-09-02, `ethtool` F6).
+            // (W2 re-audit, `ethtool` F6).
             try cl.checkReplyEcho(r.attrs, hdr_attr, target);
         }
     }
@@ -837,7 +837,7 @@ fn recvErr(e: genl.RecvError) RequestError {
 /// in the caller's own arguments, for a request that was never sent — was
 /// reported as the peer's fault. Encoders now return `InvalidRequest`
 /// (`bitset.BuildError`) and never reach this function
-/// (W2 re-audit 2026-09-02, `ethtool` F3).
+/// (W2 re-audit, `ethtool` F3).
 const ParseError = codec.Error || error{OutOfMemory};
 
 fn mapParse(e: ParseError) RequestError {
@@ -1456,7 +1456,7 @@ fn fuzzNotification(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     //
     // ⛔ And it looked HEALTHIER that way: a notification with no attributes
     // is a legal one, so `parseNotification` SUCCEEDED every round. Measured
-    // 2026-09-07 over the corpus above: **0 of 5 seeds non-empty, 5 of 5
+    // over the corpus above: **0 of 5 seeds non-empty, 5 of 5
     // "parsed", 0 recognised as notifications and 0 group ids found before; 5
     // of 5 non-empty, 4 parsed, 2 recognised and 1 group id after.**
     const len: usize = fz.drawInput(S, src, &raw_buf, entries);
@@ -1511,7 +1511,7 @@ test "corpus: every notification seed reaches both parsers, and the counts are p
     try testing.expectEqual(@as(usize, 1), groups);
 }
 
-// W2 re-audit 2026-09-02 (`ethtool` F6): the C-10 check was wired into
+// W2 re-audit (`ethtool` F6): the C-10 check was wired into
 // `exchangeGet` only. Every SET (`exchangeAck`, `featuresSetResult`) and the
 // one GET that collects its own reply (`moduleEeprom`) accepted a reply naming
 // a different device — and a `*_SET_REPLY` is precisely the message a caller

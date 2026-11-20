@@ -380,7 +380,7 @@ pub fn appendStringSetSelector(
     // `InvalidRequest` because `ids` is caller-supplied and unbounded: past
     // ~8000 string-set ids the nest exceeds what an `nlattr` length can
     // express. Refusing beats the silent truncation that was here until
-    // 2026-09-02 (see `codec.nestEnd`).
+    // (see `codec.nestEnd`).
 ) error{ OutOfMemory, InvalidRequest }!void {
     const sets = try codec.nestBegin(gpa, list, uapi.STRSET.STRINGSETS | codec.NLA_F_NESTED);
     for (ids) |id| {
@@ -785,7 +785,7 @@ fn fuzzStats(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // ⛔ And it looked HEALTHIER that way: a reply with no groups and no
     // string sets is a legal one, so both decoders SUCCEEDED on the empty
     // slice every round while allocating nothing and walking nothing.
-    // Measured 2026-09-07 over the corpus above: **0 of 8 seeds non-empty, 8
+    // Measured over the corpus above: **0 of 8 seeds non-empty, 8
     // of 8 stats replies and 8 of 8 string-set replies "decoded", 0 groups and
     // 0 strings recovered before; 8 of 8 non-empty, 3 and 5 decoded, 3 groups
     // and 2 strings after.**
