@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 3aff7bfc56c5aa96
 
-Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
-
 **Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct n/a — no auth token, key or crypto; secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
 
 **Performance:** ref 0.03–0.09× modelcontextprotocol/go-sdk v1.8.0 (Go 1.26.8; `zig build bench-mcp`, five stdio sessions of 64 requests; the TypeScript SDK needs Node, not on this host) · fastest 0.44× rmcp 3.7.0 (Rust, tokio current-thread; it validates no schemas on this path, see `tools/rs_field`) (measured 2026-10-24)
@@ -23,32 +21,31 @@ Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-dri
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
 the zig-libs authors (MIT), except what ./NOTICE lists (the uri_template matcher, ported from the MCP
 Python SDK; JSON-Schema-Test-Suite vectors).
-
 ## Compared with
 
 Re-surveyed 2026-10-20 per `SURVEY-PLAYBOOK.md` (first survey 2026-09-30); stars and releases as of that date.
 Read: the TypeScript SDK's docs (CC-BY-4.0), the Python SDK's server source (MIT), the specification; the
 owner allowed the TS/Go/Rust SDK source on 2026-10-20 (their LICENSE puts each contribution under MIT or
 Apache-2.0 during the relicensing). The Go SDK was run as the speed reference after a sweep of its module
-tree (`tools/go_bench`). Gap list R1–R14 and its outcome: § Backlog "S2 plan".
+tree (`tools/go_bench`). Gap list R1–R14: every server-side item is built; the refusals are under *What is deliberately not done*.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) — **reference** | TypeScript | MIT / Apache-2.0 per contribution (LICENSE: transition; API NOASSERTION) | 13.6k | v2.3.1 (2026-10-05) | Server + client packages, stdio and Streamable HTTP, auth helpers, framework middleware (Express, Fastify, Hono). Server feature set now matched here (R1–R14); still beyond us: the client role, logging, the tasks extension, OAuth helpers (→ `mcp-http`/`aaa-gate`). |
+| [modelcontextprotocol/typescript-sdk](https://github.com/modelcontextprotocol/typescript-sdk) — **reference** | TypeScript | MIT / Apache-2.0 per contribution (LICENSE: transition; API NOASSERTION) | 13.6k | v2.3.1 (2026-10-05) | Server + client packages, stdio and Streamable HTTP, auth helpers, framework middleware (Express, Fastify, Hono). Server feature set matched here (R1–R14); still beyond us: the client role, logging, the tasks extension, OAuth helpers (→ `mcp-http`/`aaa-gate`) — see *What is deliberately not done*. |
 | [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk) | Python | MIT | 24.6k | v2.3.0 (2026-10-02) | Decorator-style `MCPServer`, full client, stdio / Streamable HTTP / SSE, `server/auth` package, OpenTelemetry middleware, Apps and Skills extensions. Our differential oracle client (`tools/sdk_oracle`). |
-| [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk) | Go | MIT / Apache-2.0 per contribution | 5.2k | v1.8.0 (2026-09-14) | Server + client, typed `AddTool` with schema inference, stdio/command/Streamable HTTP transports, OAuth extensions; 2026-07-28 down to 2024-11-05. The speed reference: 2.2–33× slower than this module per session (jsonrpc2 goroutine per request). |
-| [modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`) | Rust | MIT / Apache-2.0 per contribution | 4.0k | rmcp-v3.5.1 (2026-10-05) | Resources, sampling, elicitation, logging, completions, subscriptions, tasks, pagination, transports; likely the fastest in the field — not measured here (`fastest ?`). |
+| [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk) | Go | MIT / Apache-2.0 per contribution | 5.2k | v1.8.0 (2026-09-14) | Server + client, typed `AddTool` with schema inference, stdio/command/Streamable HTTP transports, OAuth extensions; 2026-07-28 down to 2024-11-05. The speed reference (jsonrpc2 goroutine per request); the figures are on the card's `**Performance:**` line. |
+| [modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`) | Rust | MIT / Apache-2.0 per contribution | 4.0k | rmcp-v3.5.1 (2026-10-05) | Resources, sampling, elicitation, logging, completions, subscriptions, tasks, pagination, transports; the fastest implementation measured here (the card's `**Performance:**` line; it validates no schemas on that path). |
 | [muhammad-fiaz/mcp.zig](https://github.com/muhammad-fiaz/mcp.zig) | Zig | MIT | 39 | 0.0.6 (2026-09-14) | The only Zig alternative: server and client frameworks, stdio + HTTP via httpx.zig, text/image/audio/embedded content. Pre-1.0, no spec anchoring claimed *(README only)*. |
 
-**Where we are ahead:** the only Zig implementation that is dependency-free (std only) and pins its wire output
+**Where we are ahead:** the only Zig implementation with no third-party dependency (std and the sibling `jsontext`) that pins its wire output
 to the specification's own JSON examples (`spec_anchor_index` / `modern_spec_anchor_index`, two-way canaries; a
 frozen differential transcript from the official Python SDK); per-peer handshake, pending and subscription state;
 capability-gated sampling/elicitation with schema and URL-safety validation (credential-field refusal,
 loopback-only http); a JSON Schema subset validator anchored on the JSON-Schema-Test-Suite with a step budget
-against exponential schemas; `StateSeal` for MRTR state; never-panic error policy, every parser fuzzed; 2–30× faster
-than the Go SDK per session. **Where we are behind:** server role only (HTTP is the sibling `mcp-http`; no
+against exponential schemas; `StateSeal` for MRTR state; never-panic error policy, every parser fuzzed; faster
+than the Go SDK per session (card). **Where we are behind:** server role only (HTTP is the sibling `mcp-http`; no
 client); no logging (deprecated, spec says do not adopt), no tasks extension; `pattern` in tool schemas is not
-checked (no regex in the subset); cancellation over stdio only takes effect between calls (serial `serve`).
+checked (no regex in the subset); cancellation over stdio only takes effect between calls (serial `serve`); the refusals are listed under *What is deliberately not done*.
 
 ## Design & invariants
 
@@ -74,8 +71,7 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   `requestState`, `_meta.serverInfo`, never a caching hint) and discards the handler's normal output and
   return value — "ask wins", on all three methods; a declining resource template's asks are discarded
   with its contents, since declining means "not mine". Nothing is pending between rounds: the handler
-  runs to completion each time, so a tool that needs a completion is now one tool (the session path still
-  needs two calls). `ask` runs the same checks as `send*Request` (`checkSamplingRequest`/
+  runs to completion each time, so a tool that needs a completion is one tool (the session path needs two calls). `ask` runs the same checks as `send*Request` (`checkSamplingRequest`/
   `checkElicitationRequest`, one code path) against the **request's** `_meta` capabilities (mrtr.mdx: MUST
   NOT ask what the client did not declare), and keys must be non-empty and unique. Requests are serialized
   at `ask` time onto the arena, so handler-local strings may die right after. A non-object
@@ -85,7 +81,7 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   compiling). An answer that arrives unasked is treated like one that was asked for: the client is the
   user's agent and could have answered either way. The typed accessors return null for an absent **or**
   undecodable answer, which makes the spec's "ask again rather than fail" the natural handler shape.
-- **Change notifications are opt-in (`Server.push`, since 2026-10-20).** Off (the default): nothing is
+- **Change notifications are opt-in (`Server.push`).** Off (the default): nothing is
   advertised or pushed, `resources/subscribe` is -32601, and `subscriptions/listen` acknowledges
   `notifications: {}` and closes at once (the graceful closure) — holding open a stream that could never carry
   anything would tie a connection to no purpose. On: `listChanged`/`subscribe` are advertised, `resources/
@@ -135,9 +131,9 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,
   `prompts/list`, `prompts/get`, `ping`, server→client `notifications/progress`, and the two
   server→client *requests* `sampling/createMessage` + `elicitation/create` (with
-  `notifications/cancelled`); since 2026-10-20 also `completion/complete`, `resources/subscribe`/
+  `notifications/cancelled`); also `completion/complete`, `resources/subscribe`/
   `unsubscribe`, pagination (`nextCursor`, `page_size`), custom methods (`addMethod`), inbound
-  `notifications/cancelled`, and pushed `list_changed`/`resources/updated` (opt-in `push`). Modeled after MCP spec revision 2025-11-25 + JSON-RPC 2.0; the
+  `notifications/cancelled`, and pushed `list_changed`/`resources/updated` (opt-in `push`). The session path is modeled after MCP spec revision 2025-11-25 and the stateless path after 2026-07-28, both with JSON-RPC 2.0; the
   JSON-RPC core is the zig-libs authors' original work (MIT).
 - **Advertised capabilities track the registered catalog, per-capability.** `tools` is present
   unconditionally in every `initialize` result, empty catalog or not — this module's original
@@ -154,8 +150,7 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   prompts}.items.len` at the point `buildInitializeResult` runs, i.e. against whatever is registered
   by the time a given `initialize` is answered — there is no separate "declared capability" flag to
   keep in sync, and nothing here assumes registration is finished before the first handshake, only
-  that each `initialize` call is truthful about the catalog as it stands *then*. This is a
-  **BREAKING** wire change for any existing tools-only server: see CHANGELOG.md.
+  that each `initialize` call is truthful about the catalog as it stands *then*.
 - **Dispatch + ctx.** Tools dispatch by name; resources resolve by uri (exact static match first,
   then each registered template handler in order); prompts dispatch by name with declared required
   arguments validated by the server (-32602) before the handler runs. Every handler receives the
@@ -163,10 +158,10 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   module enforces. `tools/call` results carry a text content block plus `structuredContent` only
   when the tool allows it and its output **validates as** a single top-level JSON object (NDJSON,
   arrays and anything malformed are rejected); `isError:true` marks a tool failure. The check is
-  `std.json`'s, not a brace count: a count cannot tell `{` from `[`, so `{]` read as one balanced
-  object and was spliced verbatim into a response no client could parse, and it cannot see a raw
-  control character inside a string, so the newline-strip silently rewrote such a value into one
-  that disagreed with the text block beside it (re-audit F10/F13).
+  `std.json`'s, not a brace count: a count cannot tell `{` from `[`, so `{]` would read as one balanced
+  object and be spliced verbatim into a response no client could parse, and it cannot see a raw
+  control character inside a string, so the newline strip would rewrite such a value into one
+  that disagrees with the text block beside it.
 - **Never-panic error policy.** Malformed input becomes the proper JSON-RPC error (-32700/-32600/
   -32601/-32602/-32603, plus MCP's -32002 for an unresolvable `resources/read` uri), never a panic
   or a Zig error; only OOM and transport write-failure surface as `error` from `handleMessage`. A
@@ -192,24 +187,20 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   registered `ResponseHandler`, writing **nothing** — JSON-RPC forbids answering a response, and
   answering with the same id would loop. Consequence a consumer must design around: a tool that
   needs the answer is two calls (ask, then act). Pending entries are capped per peer (`max_pending`);
-  `cancelRequest` drops one and emits `notifications/cancelled`. **This fixed a live bug**: before
-  this, a client's response hit the "Missing method" branch and got a -32600 *reply*.
+  `cancelRequest` drops one and emits `notifications/cancelled`.
 - **Capabilities are stored per peer, not just parsed.** `initialize` records that peer's
   capabilities (and negotiated revision) in its `PeerState`, replacing any prior set wholesale, and
   all-false before a handshake — so a server fails closed. **Per peer** because `initialize` is a
-  per-connection act and a `Server` is shared: as three fields on the `Server` they were global, so
+  per-connection act and a `Server` is shared: as fields of the `Server` they would be global, so
   any session that could POST could declare `elicitation` and lift the gate for every other session
-  — `elicitation/create` written to a client that had declared nothing, in a revision it never
-  negotiated — while one declaring `capabilities:{}` revoked everyone else's (re-audit F11). A capability is granted only by **the JSON shape the spec defines** (each
+  while one declaring `capabilities:{}` would revoke everyone else's. A capability is granted only by **the JSON shape the spec defines** (each
   capability an object; `roots.listChanged` a bool), never by "something is present": a malformed
-  declaration such as `{"elicitation":true}` or `{"elicitation":"url"}` grants nothing at all. (The
-  latter used to grant *form* mode and deny url — the inverse of the declaration, and the
-  phishing-relevant half; re-audit 2026-08-11 F7.) The spec's MUST NOTs (no `sampling/createMessage` without `sampling`, no
+  declaration such as `{"elicitation":true}` or `{"elicitation":"url"}` grants nothing at all. The spec's MUST NOTs (no `sampling/createMessage` without `sampling`, no
   `elicitation/create` without `elicitation`, no elicitation *mode* the client did not declare, with
   `elicitation:{}` meaning form-only for backwards compatibility) are enforced at the send seam.
   `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
   is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
-- **`clientInfo` is recorded per peer too — DONE 2026-09-28** (requested by the terminal-UI consumer). `initialize`'s
+- **`clientInfo` is recorded per peer too.** `initialize`'s
   `clientInfo` (`name`, `version`, optional `title`) is parsed by `ClientInfo.parse` and, unlike
   `capabilities`, treated **leniently**: it is self-reported metadata this module never gates a
   decision on, so a missing or malformed `clientInfo` records `PeerState.client = null` and never
@@ -227,14 +218,12 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   request issued to the *same* peer; `handleMessage` is `peer = 0`. Not a wildcard in either
   direction. Scoping covers the **handshake state and the pending budget** as well as correlation
   (`PeerState`, `max_pending` counted per peer, `forgetPeer` when a session ends, `max_peers`
-  bounding a transport that forgets to). Until 2026-09-02 it covered correlation alone, and this
-  bullet's "peer scoping" heading was read — including by this file — as if it covered the gate. The check compares two handles and nothing else, so **it is exactly as good as the
+  bounding a transport that forgets to). The check compares two handles and nothing else, so **it is exactly as good as the
   transport's peer assignment** — it cannot separate two clients a transport has given the same
   handle. A multiplexing transport must therefore supply a per-client handle: `mcp-http` does when
   a `Sessions` registry is configured, and when one is not (its stateless mode, where every POST
   would be peer 0) it refuses to hand us correlatable responses at all rather than let this check
-  wave them through. Until 2026-08-11 this bullet claimed the property outright, without naming
-  the condition the transport has to meet for it to hold.
+  wave them through.
 - **Elicitation schema subset + credential refusal.** `requestedSchema` is validated against the
   spec's restricted subset (flat object of primitives; single-select enums in both the 2025-06-18
   `enum`/`enumNames` and 2025-11-25 `oneOf` spellings; 2025-11-25 multi-select enum arrays) and is
@@ -248,7 +237,61 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   in a lock to share). Transports: `serve(reader,writer)` loops; `serveStdio(io)` wires
   stdin/stdout; HTTP is one line inside an `http`/`router` handler (no `http` dep of its own).
 
-## Threat model / out of scope
+## Design notes by feature
+
+- **Typed tools (`src/typed.zig`).** `schemaOf(T)` yields the schema text at compile time and `ToolCall.argsAs(T)`
+  decodes the arguments over `std.json.Value`; the shape follows Go SDK v1.8.0 `AddTool[In, Out]` (over
+  google/jsonschema-go), the TypeScript SDK's zod schemas and the Python SDK's type hints. A struct is an object with
+  `additionalProperties:false`; `required` lists the fields that are neither `?T` nor defaulted. Integers carry
+  `minimum`/`maximum` from their width **clamped to ±(2^53−1)**, because JSON numbers are doubles in most peers and a
+  wider bound would promise values a peer cannot send exactly; `parse` enforces the same bounds and takes `5.0` as an
+  integer. `[N]T` is an array with `minItems` = `maxItems`. JSON `null` is absent for `?T`. Deliberate differences
+  from Go: `?T` and slices are not `["null", T]` (Zig has no nil slice). A failure writes
+  `error: Invalid arguments: /ptr: why` and returns `error.InvalidArguments`. `ToolCall.writeJson(v)` omits null
+  optionals, so a single object becomes `structuredContent` with no dispatcher change. Unsupported types are compile
+  errors naming the field; see *What is deliberately not done* for what the mapping omits.
+- **Tool input and output validation (`src/schema_check.zig`).** Before the handler runs, `arguments` are checked
+  against `input_schema`, and a structured result against `output_schema` (the TypeScript SDK's convention: a mismatch
+  is an `isError:true` tool result with the message). A tool that declares an `output_schema` must produce JSON that
+  conforms, so non-JSON output from it is a failure too. The checker is a JSON Schema 2020-12 **subset** (the keyword
+  list is the header of `schema_check.zig`) anchored on vectors extracted from the JSON-Schema-Test-Suite
+  (`tools/schema_suite`, `src/schema_suite_vectors.zig`). A schema outside the subset is not refused: that one tool is
+  simply not validated (`compile` reports `UnsupportedKeyword`, the server keeps the tool). `pattern` and the
+  annotation keywords are accepted and ignored. Work is bounded: `max_steps` schema applications (a budget
+  failure rather than exponential work), `max_depth` nesting, `max_ref_depth` `$ref` hops. `Server.validate_tool_io =
+  false` turns both checks off.
+- **`x-mcp-header` annotations (`src/header_annotations.zig`).** `Server.addTool` refuses a tool whose annotations
+  break the 2026-07-28 rules (server/tools.mdx and the Streamable HTTP "Schema Extension"), because an HTTP client
+  must drop such a tool from its list and it would vanish for exactly the clients the annotation was written for:
+  the name is a non-empty HTTP token, case-insensitively unique, on a `string`/`integer`/`boolean` parameter (not
+  `number`, not an array type), reachable by `properties` keys only (never `items`, `oneOf`/`anyOf`/`allOf`/`not`,
+  `if`/`then`/`else`, `$ref`), at most `max_chain` deep (the depth `mcp-http` reads). Errors are the
+  `HeaderAnnotation*` set. The depth cap of the registered schema literal is checked before the annotations are.
+- **Resource templates (`src/uri_template.zig`).** RFC 6570 levels 1–4 parse and expand, and `Template.match` goes back
+  from a concrete uri to the variables (`ResourceRequest.vars` / `variable`). The matching algorithm is ported from
+  the MCP Python SDK v2.3.0 (see `NOTICE`), with stricter percent-decoding: a malformed escape or a value that is
+  not valid UTF-8 fails the match. A trailing query is matched leniently (any order, missing parameters absent,
+  unknown ones ignored). Templates with no deterministic inverse (a repeated variable, two multi-segment variables,
+  adjacent variables with no literal, an explode on the wrong operator) parse but never match
+  (`Template.unmatchable`). No backtracking and no recursion; template and uri lengths are capped. `resources/read`
+  tries the exact static uri first, then each template handler in registration order.
+- **Pagination.** `Server.page_size` = 0 keeps the whole catalog in one page and never writes `nextCursor`. Above 0 a
+  cursor is an opaque base64url position, valid for the list that minted it only and only in its canonical form; any
+  other cursor is -32602, as pagination.mdx asks. With pagination off a request's cursor is ignored.
+- **Cancellation.** `ToolCall.cancelled()` is a flag the handler polls; `Server.cancelInflight(peer, id)` sets it and is
+  safe from another thread. A cancelled request gets no response. Only a transport that reads while a handler runs can
+  deliver it in time; `serve` reads one line at a time, so on stdio a cancel lands after the call and is ignored, as
+  the spec allows.
+- **Tool registration.** `Server.addTool` compiles the input and output schemas once and keeps
+  their canonical text, so `tools/list` writes cached bytes instead of re-parsing each schema per call.
+- **Handler-facing surface that follows the official SDKs.** Content blocks (`image`, `audio`, `resource_link`, embedded
+  `resource`, several per result, block `annotations`), handler-chosen protocol errors including the -32042 URL
+  elicitation and -32021 builders, one request context on tools, prompts and resources, `_meta` on every definition,
+  `completion/complete` through `Completer`, custom methods (`addMethod`/`addNotification`) and `extensions`
+  capabilities are listed in the README; they follow the reference SDKs' server side and add no module-specific
+  design beyond what is above.
+
+## Threat model / Limits
 
 This is a transport, not an authorization boundary: it does **not** authenticate or authorize
 callers, rate-limit, or sandbox tool handlers — a registered tool runs with the app's full
@@ -261,7 +304,7 @@ client/host roles, roots, logging (2026-07-28: "SHOULD NOT adopt"), the tasks ex
 the HTTP/SSE session transport (the sibling `mcp-http` module). Also out of scope within the
 sampling/elicitation surface: sampling-with-tools (`tools`/`toolChoice` and the tool-use/tool-result
 message shapes — `SamplingResult.parse` refuses an array content block rather than half-decoding
-it), `includeContext` and `metadata` (`notifications/elicitation/complete` is emitted since 2026-10-20: `Server.sendElicitationComplete`).
+it), `includeContext` and `metadata` (`notifications/elicitation/complete` is emitted: `Server.sendElicitationComplete`).
 
 **Sampling's trust asymmetry.** The server picks the prompt; the client owns the model access, the
 credential and the bill. The spec expects a human in the loop client-side, but a server MUST NOT
@@ -279,320 +322,178 @@ structural mitigation is `.url` mode, whose URL is scheme-checked (https, or htt
 so `javascript:`/`data:`/`file:` payloads never reach a client that is about to open them. The
 loopback allowance compares the **parsed authority's host** — authority ended at the first of
 `/?#\`, userinfo stripped at the last `@`, IPv6 literals kept bracketed, port digits only — so
-neither `http://localhost:8080@evil.example/` nor `http://localhost.evil.example/` is loopback (the
-first was accepted before re-audit F3). The backslash is in that delimiter set because the party
+neither `http://localhost:8080@evil.example/` nor `http://localhost.evil.example/` is loopback. The backslash is in that delimiter set because the party
 that opens the URL is the **client** — a browser or JS runtime, all of which parse by the WHATWG URL
 Standard, where `\` ends the authority. Reading `http://evil.example\@localhost/` the RFC 3986 way
-makes its host `localhost`; the client that opens it goes to `evil.example` over plaintext
-(re-audit F12). Agreeing with the parser that acts on the answer beats agreeing with the RFC. Every
+makes its host `localhost`; the client that opens it goes to `evil.example` over plaintext. Agreeing with the parser that acts on the answer beats agreeing with the RFC. Every
 other URL-safety rule in the spec (no credentials in the URL, no pre-authenticated links, verifying
 that the user who opens it is the user it was minted for) is the application's, not this module's.
 
+**Known limits** (documented behaviour a consumer relies on; none is a defect):
+
+- Per-peer caps count entries, not bytes: a peer may hold up to `max_subscriptions_per_peer` listens, each with up to
+  `max_listen_uri_bytes` of uris (`max_listens` in total, `max_subscription_uri_len` per uri), and a `max_line_len`
+  (16 MiB) line can parse into a much larger `std.json.Value`. The transport owns the real memory limit.
+- `readLine` keeps its buffer capacity after one long line.
+- A pending server→client request never expires on stdio: `max_pending` (256) unanswered sampling/elicitation requests
+  block further ones until `cancelRequest`.
+- A request with `id: null` is answered (JSON-RPC allows a null id, MCP forbids it); the `jsonrpc` member is not
+  checked.
+- One keyword outside the schema subset (`patternProperties`, `contains`, ...) turns off input and output validation
+  for that tool; `pattern` is never checked.
+- Template variables are percent-decoded before the handler sees them (`%2F`, `%2e%2e`, `%00` reach it as `/`, `..`,
+  NUL); a template handler that does not start with `req.vars orelse return false` shadows later templates.
+- `header_annotations` walks at most 72 levels down a schema.
+- `serve` handles one line at a time: a stdio cancellation takes effect between calls only.
+
 ## Verification
 
-Offline tests: JSON-RPC parse/encode for every standard error code, malformed JSON/non-object/
-missing-or-bad method → the right error only when an id is present, unknown method dropped when
-id-less; version negotiation + golden `initialize` (capabilities/serverInfo) and `tools/list` JSON —
-including the `resources`/`prompts` capability keys each toggling on independently the moment their
-own catalog stops being empty (a resource-template-only server counts too), and all three present
-together once every catalog is non-empty; `tools/call` param validation, ctx-threading to app state, structuredContent gating, `isError` on
-handler failure, and progress notifications interleaving before the result; golden
-`resources/list`/`templates/list`/`prompts/list`, `resources/read` text + base64-blob +
-template-uri resolution + -32002 on an unresolvable uri, `prompts/get` argument substitution +
--32602/-32603; duplicate registration rejected; blank-line/CRLF tolerance; and a full in-process
-`initialize → initialized → tools/list → tools/call` round-trip over an in-memory pipe via `serve`.
-`clientInfo` recording: name/version/title captured and replaced wholesale on re-handshake; missing
-or malformed `clientInfo` (absent, no `version`, not an object) never fails the handshake and
-records `null`; an over-long field is truncated to `max_client_info_field_len` at a UTF-8 boundary
-rather than rejected; `forgetPeer` and a re-`initialize` each free the previous copy with no leak
-(`testing.allocator`-caught).
+- **Run:** `scripts/modtest mcp` (`zig build test-mcp`). `zig build interop-mcp [-- --check]` re-takes the SDK transcript
+  (needs a Python venv with the `mcp` package, see `tools/interop.zig`); `zig build check-interop` compiles it.
+  `zig build bench-mcp` runs the benchmark against the Go and Rust SDKs (`tools/go_bench`, `tools/rs_field`).
+- **Protocol tests** (`src/root.zig`): JSON-RPC parse/encode for every standard error code; malformed JSON,
+  non-object, missing or bad method answer the right error only when an id is present; version negotiation and golden
+  `initialize` and `tools/list` JSON, including the `resources`/`prompts` capability keys toggling independently with
+  their catalogs (a template-only server counts); `tools/call` parameter validation, ctx threading, `structuredContent`
+  gating, `isError` on handler failure, progress interleaving; golden resource and prompt lists, `resources/read`
+  text, blob and template resolution and -32002, `prompts/get` substitution, -32602 and -32603; duplicate registration
+  refused; blank-line and CRLF tolerance; a full in-process `initialize → initialized → tools/list → tools/call` round
+  trip over a pipe via `serve`; `clientInfo` capture, replacement, truncation at a UTF-8 boundary, and no leak on
+  `forgetPeer` or re-`initialize`.
+- **Limit values are pinned by absolute numbers**, not by the constant they check (`max_line_len` exactly 16 MiB with
+  a 1 MiB line delivered and 17 MiB refused; 256 unanswered requests fit and the 257th does not), and every listen and
+  subscription limit is tested at its exact edge.
+- **Error-shape and allocation tests:** error tables for `SamplingResult`, `ElicitationResult`,
+  `validateElicitationSchema` and `Schema.compile`; request contexts of both protocol eras; `failProtocol` wire bytes;
+  allocation-failure sweeps (including a listen that cannot be acknowledged); a flush-counting writer; an independent
+  HMAC known answer for `StateSeal` and fake 4 GiB slices; cursor canonicality.
+- **Typed tools** (`src/typed.zig`): golden schema text for every mapping row; every generated schema compiled by
+  `schema_check` and used to accept and reject instances; `parse` round trip, defaults, `5.0`, error paths with
+  their JSON Pointer and message; an OOM case; two end-to-end `tools/call` tests. The compile-time `schemaOf` rows
+  cannot take a runtime mutation switch and are each pinned by a golden or oracle test. Compile errors (non-slice
+  pointer, `[]u8`, union, `anytype`/`comptime_int`, comptime field, empty enum, `mcp_descriptions` naming a
+  non-field, a recursive type) cannot be runtime tests. Differential oracle: `tools/typed_oracle` (google/jsonschema-go
+  from the module cache, offline) infers schemas from equivalent Go structs and judges instances; the verdicts are
+  frozen in `typed.zig`.
+- **`schema_check`, `uri_template`, `header_annotations`:** the JSON-Schema-Test-Suite vectors, the RFC 6570 examples,
+  depth and `$ref` hop limits, the step budget, number tolerance, the `tchar` set and walk depth.
+- **Anchoring on the specification's own JSON examples.** Sampling and elicitation: the emitted
+  `sampling/createMessage` line, the form-mode and URL-mode `elicitation/create` lines (of the later session revision), the form-mode line
+  for a peer of the earlier session revision (no `mode` member), and the decode of both revisions' result examples including the `-1`
+  "user rejected" error. Behaviours with **no external anchor**, pinned only by our own tests: the image/audio request
+  line and `temperature`/`stopSequences` placement, the exact `SchemaError`/`SendError` taxonomy, the credential-name
+  word list, the loopback-http URL allowance, the never-reuse id rule, `max_pending`, and the whole `peer` concept (an
+  implementation invention; the spec says nothing about multiplexing one server over several sessions).
+  The rest of the session-path surface is anchored the same way: `initialize`'s request (the lifecycle page's full
+  example, decoded without mis-parsing what it reads), `ping`, `tools/call` (the `get_weather` text example and the
+  `get_weather_data` output-schema example byte-identical, the "Unknown tool" code, the execution-error content),
+  `resources/read`, `prompts/get`, and the `notifications/progress` wire shape. `initialize`'s response and the four
+  list responses cannot be byte-identical to the spec's illustrative ones (the capability shape is fixed and narrower,
+  and the spec's example definitions carry fields such as `execution` this module does not produce), so those are
+  anchored on request decoding. `notifications/cancelled` matches the spec's `requestId`/`reason` shape, except that
+  `requestId` is always a bare integer (JSON-RPC permits either). The classification (`.literal_example` /
+  `.partial` / `.no_example`, with a `reason` for every non-full entry) is `pub const spec_anchor_index` in
+  `src/root.zig`, guarded by a canary that derives one side from the other: `DispatchMethod` is the enum
+  `handleMessage`'s exhaustive switch is written over and `OriginatedMethod` supplies the wire name of every outbound
+  emitter, and the canary checks both against the index in both directions. No disagreement with a spec example has been
+  found. The examples were retrieved from `modelcontextprotocol/modelcontextprotocol` directly, never from memory.
+- **The stateless revision** is anchored the same way, classified in `modern_spec_anchor_index` with its own two-way canary
+  against `DispatchMethod.servedStatelessly`. A *literal* anchor there means value-equal (the spec's pretty-printed
+  response and ours parse to the same JSON value, member order aside). Literal: `tools/call`, `resources/read` (the
+  with-TTL example; the request's `id` is swapped for the response's, the two files differ), `resources/templates/list`,
+  `prompts/get` (with the get example's description) and the resource-not-found error. Partial: `server/discover` (only
+  `supportedVersions` differs, theirs being a modern-only server) and the three paginated lists (no `nextCursor`).
+  `UnsupportedProtocolVersionError` matches the schema example except the `supported` list. Self-pinned only: the
+  -32602 texts for malformed `_meta`, the modern -32601 for `ping`, the `servedStatelessly` split, the non-object
+  `structuredContent` rule, the caching defaults and the per-request isolation from `PeerState`. **MRTR** is anchored on
+  the revision's `InputRequests`, `InputResponses` and state-only `InputRequiredResult` examples: a two-round tool asks
+  for the example pair and its `inputRequests` is value-equal to the `InputRequests` example (which carries
+  `"mode":"form"`; the combined `InputRequiredResult` example omits it and is not used), the retry carries the
+  `InputResponses` example verbatim and completes from it, and the load-shedding reply is value-equal to its example.
+  Self-pinned: the -32602 texts, "ask wins", the template discard rule and the `StateSeal` format (tested by flipping
+  every byte of a token, every binding field and both expiry edges). A differential test against the TypeScript SDK
+  client is open (see Backlog).
+- **Provenance of the examples:** literal JSON snippets from the MCP specification quoted as test-oracle data, the same
+  clean-room-from-a-public-spec relationship the module has with the specification as a whole; no third-party source was
+  read or ported for them, so they need no `NOTICE` entry (as `linkheader` cites RFC 8288 in its own SPEC rather than a
+  NOTICE). The specification's docs are dual-licensed Apache-2.0/MIT; Apache-2.0's NOTICE-preservation clause applies
+  to redistributing the specification itself, not to citing a few short wire-format examples as original test fixtures.
+- **Mutation.** Every central invariant is covered by a behaviour mutant that turns a test red: the capability gate,
+  the elicitation schema subset, `decline` as non-error and content-free, id reuse after a failed send, correlation by
+  id rather than arrival order, the peer check (including the consistent mutation that sets peer 0 on both sides and
+  survives every round trip), consuming a response rather than answering it, the pending cap, the credential refusal,
+  the empty-`elicitation:{}` form default, the stateless path's three refusals and unsupported-version arm,
+  `StateSeal` (MAC, expiry edge, length prefixes, principal and head in the MAC), MRTR `ask` checks, the id gate,
+  `deliverResponse`, `ClientCapabilities.parse`, the URL guard, `truncateUtf8`, `readLine`'s bound, and in the
+  typed decoder every `decode` arm. Equivalent mutants are of a few kinds: redundant defence (`decodeCursor` bounds,
+  the `splitAuthority`/`uri_template` back-ups, `isSchemaValue` against `checkSchema`, `isFinite` against `>= 2^53`),
+  caches (`canonicalText`), the `StateSeal` version byte (inside the MAC), and cost-only changes. Counts are on the card.
+- **Fuzz** (`MCP_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, test `fuzz driver: MCP_FUZZ`): five
+  harnesses: `mcp-handle-message`, `mcp-handle-message-mutated` (a corpus line with a few octets damaged or cut short,
+  since random bytes never form a request), `mcp-schema-check`, `mcp-uri-template` and `mcp-client-response` (pending
+  entries pre-armed, so `SamplingResult.parse`, `parseContentBlock`, `ElicitationResult.parse` and the error-object
+  decode are reached and asserted to be). A fixed seed loop with reach checks runs in every test run.
+- **Constant time:** the `StateSeal` MAC is compared with `std.crypto.timing_safe.eql` (`src/root.zig`); no ctgrind row
+  covers it.
+- **SDK oracle.** The official MCP Python SDK is a black-box differential client (`tools/sdk_oracle/drive.py`, source
+  not read): it drives the catalog of `src/sdk_oracle_catalog.zig` over stdio in both eras (the `initialize` session
+  and the stateless path with `server/discover`, `_meta` per request and a multi round-trip tool answered through its
+  elicitation callback) through tools (plain, failing, structured with `outputSchema`, unknown), resources and
+  templates (including not-found), prompts (including unknown) and ping; its typed models accept every answer and its
+  content checks pass. The transcript is frozen in `src/sdk_oracle_vectors.zig` and replayed byte for byte by
+  `src/sdk_oracle.zig` (no Python in CI). One judged SDK departure: it still sends `ping` on the stateless path, which
+  that revision removed; our -32601 is checked.
+- **Lead probe:** `tools/go_lead` shows the Go SDK calling the handler of a `prompts/get` whose required argument is
+  missing; this module answers -32602 without calling it (test "lead: prompts/get without a required argument is
+  -32602"), as prompts.mdx "Error Handling" says servers SHOULD.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-Sampling/elicitation are anchored on the **specification's own JSON examples**, not on
-self-consistency: the emitted `sampling/createMessage` line (2025-11-25 "Creating Messages"), the
-form-mode and URL-mode `elicitation/create` lines (2025-11-25), the form-mode line for a 2025-06-18
-peer (that revision's example — no `mode` member), and the decode of both revisions' result examples
-including the `-1` "user rejected" error. Behaviours with **no external anchor** — pinned only by our
-own tests, and therefore only as good as the reasoning behind them: the image/audio request line and
-`temperature`/`stopSequences` placement (the spec shows no wire example carrying them), the exact
-`SchemaError`/`SendError` taxonomy, the credential-name word list, the loopback-http URL allowance,
-the never-reuse id rule, `max_pending`, and the whole `peer` concept (an implementation invention —
-the spec says nothing about multiplexing one server over several sessions).
+## Performance
 
-The rest of the protocol surface is anchored the same way, extending the sampling/elicitation
-treatment to every other method this server dispatches or emits: `initialize`'s request (the
-lifecycle page's full example, including `roots`/`tasks` capabilities and clientInfo fields this
-module ignores, decoded without crashing or mis-parsing what it does read), `ping`, `tools/call`
-(the `get_weather` text example and the `get_weather_data` output-schema/`structuredContent`
-example, byte-identical down to the response's own internal whitespace; the "Unknown tool"
-protocol-error *code* and the execution-error *content*, both from tools.mdx), `resources/read`
-(the `main.rs` example), `prompts/get` (the `code_review` example), and the `notifications/progress`
-wire shape (progress/total/message field order and values). `initialize`'s response, and the
-`tools/list`/`resources/list`/`resources/templates/list`/`prompts/list` responses, cannot be
-byte-identical to the spec's own illustrative responses: this server's capability shape is fixed
-and narrower (no `logging`/`tasks`, `listChanged` always false), and its `Tool`/`Resource`/
-`ResourceTemplate`/`Prompt` types carry none of `title`/`icons`/`execution` — so those methods are
-anchored on request-decode only (the spec's literal request, including an ignored pagination
-`cursor`, parses without error). `notifications/cancelled` matches the spec's `requestId`/`reason`
-shape and reason text exactly, except `requestId` is always a bare integer (this server's own
-monotonic ids) where the spec's illustrative id is a quoted string — JSON-RPC permits either as a
-request id, so this is not a divergence. The full classification (`.literal_example` / `.partial` /
-`.no_example`, with a `reason` for every non-full entry) lives in `pub const spec_anchor_index` in
-src/root.zig, guarded by a canary test that **derives one side from the other**: `DispatchMethod` is
-the enum `handleMessage`'s exhaustive switch is written over and `OriginatedMethod` supplies the
-wire name every outbound emitter prints, and the canary checks both lists against the index in both
-directions, so a method added to (or dropped from) the dispatch surface without updating the
-classification fails loudly. (Until re-audit 2026-08-11 F9 this was a *count* canary comparing the
-index against hardcoded numbers; it never read the dispatch chain, so the drift it promised to
-catch was invisible to it.) **No disagreements were found**: every spec example this server can
-reproduce byte-for-byte, it does. Retrieved from
-`modelcontextprotocol/modelcontextprotocol` (2025-11-25 spec pages) directly, never reconstructed
-from memory.
+No diary here: the card's `**Performance:**` line carries the figures. The benchmark is `zig build bench-mcp`
+(`tools/bench.zig`; five stdio sessions of 64 requests each against the Go SDK, `tools/go_bench`, and the Rust SDK,
+`tools/rs_field`); the TypeScript SDK needs Node.
 
-**Revision 2026-07-28 (the stateless path)** is anchored the same way on that revision's own examples
-(`schema/2026-07-28/examples/**` and the `docs/specification/2026-07-28/**` pages), classified in
-`modern_spec_anchor_index` with its own two-way canary against `DispatchMethod.servedStatelessly`. There a
-*literal* anchor means **value-equal**: the spec's pretty-printed response and ours parse to the same JSON
-value, member order aside. Literal: `tools/call`, `resources/read` (the with-TTL example; the request's `id`
-is swapped for the response's — the two files differ), `resources/templates/list`, `prompts/get` (with the
-get example's description — the list and get examples describe the prompt differently), and the
-resource-not-found error from resources.mdx. Partial: `server/discover` (both the schema and the page
-example; only `supportedVersions` differs, theirs being a modern-only server), and the three paginated lists
-(no `nextCursor`). `UnsupportedProtocolVersionError` matches the schema example except the `supported`
-list. Self-pinned only: the -32602 texts for malformed `_meta`, the modern -32601 for `ping`, the
-`servedStatelessly` split, the non-object `structuredContent` rule, the caching defaults, and the
-per-request isolation from `PeerState`. **MRTR** is anchored on the revision's `InputRequests`,
-`InputResponses` and state-only `InputRequiredResult` examples: a two-round tool asks for the example pair
-and its `inputRequests` is value-equal to the `InputRequests` example (which carries `"mode":"form"`; the
-combined `InputRequiredResult` example omits it and is not used), the retry carries the `InputResponses`
-example verbatim and completes from it, and the load-shedding reply is value-equal to its example.
-Self-pinned: the -32602 texts, "ask wins", the template discard rule and the `StateSeal` format (tested by
-flipping every byte of a token, every binding field, both expiry edges). Not yet run: a differential test against the TypeScript SDK client
-(planned in Backlog).
+## What is deliberately not done
 
-Provenance: these are literal JSON snippets from the MCP specification quoted as test-oracle data,
-the same clean-room-from-a-public-spec relationship this module already has with the MCP spec as a
-whole (root NOTICE §0) — no third-party source was read or ported, so this needs no NOTICE entry
-(module-level or root), matching how `linkheader` cites RFC 8288 in its own SPEC.md rather than
-NOTICE. (The spec's docs are dual-licensed Apache-2.0/MIT, both permissive; Apache-2.0's
-NOTICE-preservation clause (§4(d)) applies to redistributing the specification itself as a
-Derivative Work, not to citing a handful of short wire-format examples as our own original test
-fixtures — the same merger-doctrine reasoning NOTICE §0 already states for protocol/format
-descriptions.)
-
-Every central invariant was **mutation-tested**: 21 deliberate mutations (drop the capability gate;
-accept a nested/array-of-objects schema; treat `decline` as an error; surface content on `decline`;
-reuse an id after a failed send; correlate by arrival order instead of id; drop the peer check; set
-peer to 0 on both the send and correlate sides — the *consistent* mutation that survives every
-round trip; answer a response instead of consuming it; record both request kinds as `.sampling`;
-misspell `maxTokens`; emit `mode` to a 2025-06-18 peer; reorder the URL-mode keys; remove the
-pending cap; remove the credential refusal; drop the empty-`elicitation:{}` form default; silently
-decode tool-use content; and, in `mcp-http`, let the JSON body keep every line and let all sessions
-share peer 0). All 21 turned a test red on behaviour, none on a compile error alone. The newly added
-spec-literal anchors were spot-checked the same way: swapping `progress`/`total` in
-`Progress.report`'s formatted values turned both the pre-existing progress test and the new
-`notifications/progress` spec-anchor test red (wrong numbers on the wire), confirming a compile-only
-mutation was not mistaken for coverage; reverted byte-for-byte (`md5sum` before/after matched).
-Run: `zig build test-mcp`.
-
-**What those 21 did not cover** (re-audit 2026-08-11): every one of them is a *behaviour/guard*
-mutation, so the module's **limit values** were unpinned — `max_line_len` could be shrunk to 1 KiB
-and `max_pending` raised to `maxInt(usize)` with the suite green. Both are now pinned by absolute
-numbers (16 MiB exactly, with a 1 MiB line still delivered and 17 MiB refused; 256 unanswered
-requests fit and the 257th does not) rather than in terms of the constant they check. The fuzz layer
-was one direction short as well: the response harness now pre-arms pending entries so
-`SamplingResult.parse`, `parseContentBlock`, `ElicitationResult.parse` and the error-object decode
-are actually reached, and asserts that it reached them.
-
-### Mutation run 2026-10-04
-
-Mutant schemata over a copy of `root.zig` (one ReleaseSafe build with `testkit`, all 139 tests,
-`setsid -w timeout -s KILL 120` per mutant): **63 mutants, 62 killed, 1 equivalent**. Aimed at what
-the 21 hand mutations of 2026-08 predate or did not reach: the 2026-07-28 path (`classifyRequest`'s
-three refusals and the unsupported-version arm, the stateless-method table, `server/discover`
-without `_meta`, `initialize` forced to the session era), `StateSeal` (MAC, expiry edge, length
-prefixes, principal and head in the MAC), MRTR (`ask`'s key and capability checks, `fromParams`'
-type checks), the id gate (`conformingId`, the response-shaped path, `notifications/initialized`
-with an id, id-less requests), `deliverResponse`, `ClientCapabilities.parse`, the elicitation
-schema subset, the URL guard, `truncateUtf8`, `readLine`'s bound, `max_pending`/`max_peers`, and
-the sampling/elicitation request checks. The equivalent one: `StateSeal.open`'s version-byte check
-— the byte is inside the MAC, so a changed version fails verification anyway (the check only fails
-fast). Eight survivors were gaps, each closed by a test: an answer carrying both `error` and
-`result` (error wins); an error `code` outside i32 (left at internal error — without the range
-check an `@intCast` would let any client crash the server; both i32 edges kept); a long
-`clientInfo.title` (only `name` was checked for truncation); `truncateUtf8` on bytes that are not
-UTF-8 (unreachable through `std.json`, cut at the bound all the same); a multi-select enum whose
-`items.type` is not `string`; userinfo with two `@` over loopback (the LAST `@` ends it, as in
-WHATWG); `allow_structured = false` with text that is one JSON object (the NDJSON test could not
-tell); a NaN model priority. No defect. Run: `zig build test-mcp`.
-
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` (1–5745: wire and JSON-RPC, sampling and elicitation, request contexts, `PeerState`, `StateSeal`, cursors, subscriptions, listens, dispatch, list builders, content writers), `uri_template.zig`, `schema_check.zig`, `header_annotations.zig`; schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 1727 mutants, 1663 killed (6 by timeout, 1 by the leak detector), 64 equivalent, 0 undecided, no consumer-reachable defect. The 2026-10-28 run had 56 mutants: the first full run here left 510 alive, closed by 55 new tests — error-shape tables for `SamplingResult`, `ElicitationResult`, `validateElicitationSchema`, `Schema.compile`; request contexts of both protocol eras; `failProtocol` wire bytes and content blocks with annotations and base64; every listen and subscription limit at its exact edge (id/uri length, uri count and bytes, per-peer and global caps); a flush-counting writer; an independent HMAC known answer for `StateSeal` and fake 4 GiB slices; cursor canonicality; the pending cap and a failed write; error-response decoding; allocation-failure sweeps incl. a listen that cannot be acknowledged; `uri_template` reserved encoding, every operator's stop characters, matching bounds; `schema_check` depth 256/257, `$ref` hop count, the 1 M-step budget, number tolerance; `header_annotations` tchar set, walk depth and `const` holding data. Equivalent: redundant defence (`decodeCursor` bounds, `splitAuthority`/`uri_template` back-ups, `isSchemaValue` vs `checkSchema`, `isFinite` vs `>= 2^53`, the cancel `conformingId` guards), the `canonicalText` cache, `empty_eq` on non-named operators, reserved-operator characters (`validName` refuses them), the `StateSeal` version byte inside the MAC, cost-only changes (anyOf `break`, `budget.left = 0`, the `$ref` depth-1 hop), the 4 GiB `seal`/`open` guards (same OOM under the runner's address-space limit). Cut: the comptime buffer size of `writeStreamNotification`, comptime format strings, `jsontext` (its own module).
-
-**Delta mutation (2026-11-12, base `f146e5099`, depth cap before the annotation check; whole-module run above):** `Server.addTool`, `findTool`, `literalDepthOk`, schemata in a detached copy, ReleaseSafe, strict verdict: 16 mutants, 16 killed, 0 undecided; no new test (the suite plus the fix's test).
-
-**Delta mutation (2026-11-13, typed tools — `src/typed.zig` and `ToolCall.argsAs`/`writeJson`; schemata in a detached copy, ReleaseSafe, strict verdict):** 91 runtime mutants over `parse`, `bad`, `under`, `underIndex`, every `decode` arm (bool, int with the float floor and ±2^63 checks and the schema's bounds, float, optional and `null`, enum, slice, fixed array length, struct unknown-property, required and default handling) and `argsAs`/`writeJson`: 90 killed, 1 equivalent (`bad` clearing `fail.pointer`: `parse` already cleared it and `bad` runs at most once per parse). Four survived the first run because `std.testing.FailingAllocator` keeps failing after its index, so the "pointer or message still built on OOM" mutants were never reached; a one-shot failing allocator in the tests kills them. Hostile inputs now pinned: ±1e300, ±inf, NaN, -0.0, the 2^63 and ±2^53 edges, `number_string`, a wrong JSON type per arm, 400-deep nesting, `null` everywhere, a 100-byte unknown key, prefix keys, OOM at every allocation. The comptime `schemaOf`/`emit` cannot take a runtime switch: 6 rows mutated one build each (required-list separator, the 2^53 clamp, enum-list separator, `minItems`, `additionalProperties`, an optional counted as required), each killed by the golden or oracle test that pins its row (M0 290/291 clean under the same `modtest`). The `std.math.cast … orelse` fallback of the int arm is dead (the bounds are a subset of T's range): no mutant.
-
-**Audit 2026-10-24 (review + mutation, grade 1).** A Sonnet read-only review of the dispatch, lists,
-calls, resources, prompts, MRTR, subscriptions, pending table, line reader, `schema_check`,
-`uri_template` and `header_annotations` found one HIGH (a remote stack overflow through
-`uniqueItems` equality on deep client values) and the fixes listed in the changelog, each with a
-test; the rest is recorded under Backlog. 44 schemata mutants over the final source (dispatch and
-id rules, tools/call validation, the cached schema bytes, pagination cursors, prompt arguments and
-the copied entry, sampling/elicitation checks, subscription limits, response correlation, the line
-cap, output validation, schema keywords, the new equality bounds, header annotations, URI query
-matching): 44 killed; the first run left 5 survivors, each a missing test (listen id over 128
-bytes, subscribe URI over the cap, non-object session output, output past the budget, a cursor one
-past the end), added.
+- **Logging** (`logging/setLevel`, `notifications/message`, a per-request `logLevel`): spec 2026-07-28 logging.mdx says
+  "New implementations SHOULD NOT adopt it" (SEP-2577); stderr or OpenTelemetry instead.
+- **The tasks extension** (`io.modelcontextprotocol/tasks`): no SDK has it in core and the TypeScript SDK v2 removed
+  task interception; reopened only if a consumer asks.
+- **Sampling-with-tools** (`tools`/`toolChoice`, tool-use and tool-result messages), `includeContext` and sampling
+  `metadata`: sampling is deprecated (SEP-2577/2596). It is the largest unbuilt piece, reopened only if a consumer
+  asks; `SamplingResult.parse` refuses an array content block rather than half-decoding it.
+- **Roots:** deprecated in 2026-07-28 and never implemented; `roots/list` is not offered as an input request.
+- **The client role** and host role.
+- **Legacy HTTP+SSE** and **JSON-RPC batching** (MCP does not use batches; an array is -32600).
+- **Full JSON Schema 2020-12** and a `pattern` check (no regex engine in the subset): see *Design notes by feature*.
+- **A handler that blocks on a sampling or elicitation answer:** not implementable without an async runtime in a
+  transport module, and it would deadlock the HTTP transport; the session path is issue-now / correlate-later and the
+  stateless path is MRTR.
+- **Typed-tools extras:** unions and `oneOf`, `default` emission, `format`/`pattern`/`minLength` constraints (Zig
+  types carry none), a `description` on the struct itself.
+- **Framework ergonomics** (middleware, OpenTelemetry, lifespan) and **OAuth**: `mcp-http` / `aaa-gate`, not the core.
+- **Removing the session path:** both eras stay until no consumer's client needs the old one and the spec's own window
+  for what it deprecates has passed.
 
 ## Backlog / deferred
-- **DONE 2026-11-13 — typed tools** (grade-probe gap; reference: Go SDK v1.8.0 `AddTool[In, Out]` over google/jsonschema-go, TS zod, Python type hints). `src/typed.zig`: `schemaOf(T)` (comptime schema text; struct -> object with `required` = neither `?T` nor defaulted, `additionalProperties:false`; ints with width bounds clamped to +-(2^53-1) because JSON numbers are doubles; floats, `[]const u8`, enums, `?T`, slices, `[N]T` with `minItems`=`maxItems`, nested structs; `mcp_descriptions` decl -> `description`), `ToolCall.argsAs(T)` (decoder over `std.json.Value`, same bounds, `5.0` is an integer, JSON `null` is absent for `?T`, failure writes `error: Invalid arguments: /ptr: why` and returns `error.InvalidArguments`; named `argsAs` since `args` is the raw value), `ToolCall.writeJson(v)` (omits null optionals; a single object becomes `structuredContent`, no dispatcher change). Deliberate differences from Go: `?T`/slices are not `["null", T]`; `nil` slices and `null` are the Go idiom, Zig has no nil slice. Not done: unions/`oneOf`, `default` emission, `format`/`pattern`/`minLength` constraints (Zig types carry none), a `description` on the struct itself.
-- **FIXED 2026-11-12 (depth cap first; the two std.json equivalence arguments still to re-check at the next run) — LOW (mutation run 2026-11-12):** `Server.addTool` ran `header_annotations.validate` before the depth guards, so a registered schema containing `x-mcp-header` or a backslash is parsed with no depth cap. The registrant is the application, not the peer; move the depth guard first with the next mcp source change. Two equivalence arguments rest on std.json/Stringify being bounded by a buffer (`compileText` literalDepthOk, `cancelInflight` conformingId) — worth a second look then.
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** M-7 large but bounded caps (listen URIs up to ~1 GiB
-  in total across peers, linear scans of the pending/listen tables); M-8 `uri_template.match` costs
-  about n x literal length per template on adversarial uris (hypothesis, unmeasured); M-9 the schema
-  step budget is not size-aware (`codePoints` / `toNum` over a 16 MiB string cost one step).
-- **Review 2026-10-24, documented rather than changed** (owner may decide otherwise):
-  per-peer caps are entry counts, not bytes (a peer may hold 1024 listens of up to 256 KiB of
-  URIs each; a 16 MiB line can parse into ~0.5 GB of `std.json.Value`), so the transport owns the
-  real memory limit; `readLine` keeps its buffer after one long line; on stdio a pending
-  server→client request never expires (256 unanswered sampling/elicitation requests block further
-  ones until `cancelRequest`); an `id: null` request is answered (MCP forbids null ids, JSON-RPC
-  allows them); `jsonrpc` is not checked; one unsupported keyword (`patternProperties`,
-  `contains`, …) turns off ALL input validation for that tool (compile returns null); template
-  `vars` are percent-decoded (`%2F`, `%2e%2e`, `%00` reach the handler); a template handler that
-  does not start with `req.vars orelse return false` shadows later templates; `header_annotations`
-  stops walking past depth 72.
-- **Speed lead not claimed** (2026-10-24): 0.44× rmcp 3.7.0 and 0.09× the Go SDK on the worst
-  workload, but the TypeScript SDK (reference) and the Python SDK were not timed here.
-
-**S2 plan — survey 2026-10-20** (goal: scope `core` → `parity` with the official SDKs' server side;
-TypeScript SDK v2.3.1 docs, Python SDK v2.3.0 source (MIT); the owner allowed reading the TS/Go/Rust
-SDK source too on 2026-10-20 — mid MIT→Apache-2.0, both permissive). Ranked; decisions are the
-coordinator's under the rule "parity with the reference, or safer":
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | Tool-result content blocks: `image`, `audio`, `resource_link`, embedded `resource`, several per result, block `annotations`; prompt messages with the same blocks | M | **DONE 2026-10-20** — `Content`, `ToolCall.add`, `PromptRequest.messageContent` |
-| R2 | Handler-chosen protocol errors (`code`, `message`, `data`) for tools/resources/prompts; `URLElicitationRequiredError` (-32042) and `MissingRequiredClientCapability` (-32021) builders | S | **DONE 2026-10-20** |
-| R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
-| R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | **DONE 2026-10-20** |
-| R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | **DONE 2026-10-20** — `ToolCall.cancelled`, thread-safe `Server.cancelInflight`; `serve` stays serial (a stdio cancel lands after the call, ignored as the spec allows) |
-| R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (the build-tool consumer request) | S | **DONE 2026-10-20** |
-| R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | **DONE 2026-10-20** — `schema_check.zig` (2020-12 subset, JSON-Schema-Test-Suite 625 cases) |
-| R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | **DONE 2026-10-20** |
-| R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | **DONE 2026-10-20** — `addMethod`/`addNotification`, `setCapabilityExtras`; Apps/Skills helpers later |
-| R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | **DONE 2026-10-20** |
-| R11 | `completion/complete` for prompt arguments and template variables | M | **DONE 2026-10-20** — `Completer` on `Prompt`/`ResourceTemplate` |
-| R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | **DONE 2026-10-20** — opt-in `push`, `PushSink`, `notify*`, `endSubscriptions`, `remove*`; `mcp-http`'s held-open SSE stream still to wire |
-| R13 | `notifications/elicitation/complete` (session era) | S | **DONE 2026-10-20** |
-| R14 | RFC 6570 resource-template matching with extracted variables | M | **DONE 2026-10-20** — `uri_template.zig` (matcher ported from the Python SDK) |
-| — | Logging (`logging/setLevel`, `notifications/message`, per-request `logLevel` in `_meta`) | S | **not doing** — 2026-07-28 logging.mdx: "New implementations SHOULD NOT adopt it" (SEP-2577); stderr / OpenTelemetry instead |
-
-Deliberately not doing: the tasks extension (no SDK has it in core; TS v2 removed task interception),
-sampling-with-tools and `includeContext` (sampling deprecated, SEP-2577/2596), roots, legacy HTTP+SSE,
-JSON-RPC batching, full JSON Schema 2020-12. Framework ergonomics (middleware, OpenTelemetry, lifespan)
-and OAuth belong to `mcp-http`/`aaa-gate`, not the core.
-
-Beyond the S2 plan: sampling-with-tools stays the largest unbuilt piece (a multi-turn tool loop with
-`ToolUseContent`/`ToolResultContent` balance rules), reopened only if a consumer asks. Perf note
-(2026-10-20 bench): `tools/list` re-parses each registered schema on every call (`writeRawJson`) and is the
-worst row (0.46× Go); caching the compact text at `addTool` would cut it, no consumer needs it yet.
-
-- ~~**Requested (the build-tool consumer, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
-  one** (`src/root.zig` `strArg`: null for both). A handler can only answer "missing 'config'" to
-  `"config": 5`; the build-tool consumer works around it by inspecting `call.args` itself (the build-tool consumer's MCP server, `src/tools.zig`
-  `wrongType`/`reqStr`, marked `zig-libs request: mcp`). Proposed: `ToolCall.strArgChecked(key)`
-  returning `union(enum) { absent, value: []const u8, wrong_type }` (same on `PromptRequest`), and
-  optionally `requireStr(key)` writing "'<key>' must be a string" / "missing '<key>'" via `fail`.
-  JSON-Schema validators and other MCP SDKs report type errors apart from missing properties.~~
-  **DONE 2026-10-20** (R6): `ToolCall.arg(T, key)` / `require(T, key)` / `strArgChecked`;
-  the build-tool consumer can drop `wrongType`/`reqStr` after its repin.
-
-**Survey 2026-09-30 — missing and it matters** (all fit CONVENTIONS §2: pure Zig, std only):
-
-- **Spec revision 2026-07-28 — M1–M4 DONE 2026-09-30** (dual-era dispatch, `server/discover`, `resultType`,
-  `serverInfo`, `CacheableResult`, the renumbered codes, -32602 resource-not-found, `ping` refused, `title`/
-  `icons`/annotations, non-object `structuredContent`; see "Design & invariants"). M1–M3 landed as one step,
-  not three: every new output had to be gated by era from the first line, or the session goldens would have
-  changed. **MRTR DONE 2026-09-30** (`InputRound`, `StateSeal`; see "Design & invariants"). Still open from
-  the plan: ~~**M5** (`mcp-http`)~~ — **DONE 2026-09-30** (see `mcp-http`'s SPEC), with `subscriptions/listen`
-  answered here (below). The differential run against the TypeScript SDK client is still to do.
-- ~~**Held-open `subscriptions/listen`**~~ — **DONE 2026-10-20** (R12) in this module; `mcp-http` still answers it as before until its stream is wired.
-- ~~**Validate `x-mcp-header` at `addTool`**~~ — **done 2026-10-02** (`header_annotations.zig`): non-token or empty names, case-insensitive duplicates, a type other than `string`/`integer`/`boolean`, and annotations off a `properties`-only chain (or deeper than `max_chain` = 32, the depth `mcp-http` reads) are refused with `HeaderAnnotation*` errors. Rules read from the 2026-07-28 `server/tools.mdx` and `transports/streamable-http.mdx`.
-- ✅ DONE 2026-09-30 (`c391886b8`: M1–M4 in `mcp`; M5 is `mcp-http`'s stateless transport, same day, see its CHANGELOG). **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
-  `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
-  largest break since the transport rewrite: **MCP becomes stateless**.
-  - **What changes for this module** (a server core; `mcp-http` has its own list, below):
-    - the `initialize` / `notifications/initialized` handshake is **removed**. Every request carries
-      `_meta` `io.modelcontextprotocol/protocolVersion`, `…/clientCapabilities` and (SHOULD)
-      `…/clientInfo`. A mismatch is `UnsupportedProtocolVersionError` (`-32022`);
-    - **`server/discover` is new and MUST be implemented**: supported versions, capabilities,
-      identity. Clients may probe it on stdio for backward compatibility;
-    - every result carries **`resultType: "complete"`** and SHOULD carry `_meta`
-      `io.modelcontextprotocol/serverInfo`;
-    - **`ping` and `logging/setLevel` are removed**; the log level travels per request in `_meta`;
-    - the list results and `resources/read` become a `CacheableResult` with required `ttlMs` and
-      `cacheScope`. `tools/list` SHOULD be in a deterministic order;
-    - resource-not-found moves from `-32002` to `-32602`. The new error codes are renumbered into
-      `-32020…-32099`;
-    - `inputSchema`/`outputSchema` accept any JSON Schema 2020-12, and `structuredContent` any
-      JSON value;
-    - `extensions` in the capabilities; tasks move out of the core into the
-      `io.modelcontextprotocol/tasks` extension; roots, sampling and logging are Deprecated
-      (earliest removal on or after 2027-07-28).
-  - **Strategy: both revisions, negotiated per request — never a flag day.** Our consumers (the build-tool consumer's MCP server,
-    the router-tool consumer's MCP server, the terminal-UI consumer) are driven by clients we do not control. The rule:
-    - a request whose `_meta` names 2026-07-28 is served statelessly;
-    - an `initialize` naming 2025-11-25 or 2025-06-18 keeps today's session path;
-    - `server/discover` answers both.
-    Remove the old path only once no consumer's client needs it, and not before the spec's own
-    12-month window for anything it deprecates.
-  - **Phases** (each a commit with its own tests):
-    - **M1:** `server/discover`, `resultType`, `serverInfo` in `_meta`, the renumbered error codes,
-      deterministic `tools/list`. Additive, harmless to old clients.
-    - **M2:** the stateless request path — per-request version and capabilities from `_meta`,
-      `UnsupportedProtocolVersionError`, `ping`/`setLevel` refused under 2026-07-28 only, the
-      per-request log level.
-    - **M3:** `CacheableResult` (`ttlMs`, `cacheScope`) and the resource-not-found code, gated by
-      the negotiated version.
-    - **M4:** the loosened schemas. It pairs with the `title`/`icons`/annotations item below.
-    - **M5:** `mcp-http`, once its own survey lands. The changes: no `Mcp-Session-Id` under
-      2026-07-28, the required `Mcp-Method`/`Mcp-Name` headers (`HeaderMismatchError` `-32020`),
-      `subscriptions/listen` in place of the GET stream and `resources/subscribe`, no
-      `Last-Event-ID` resumability, and **MRTR** (`InputRequiredResult`, `resultType:
-      "input_required"`) in place of its server-initiated sampling and elicitation requests.
-  - **Anchor:** the spec's own examples, as today, plus a differential run against the official
-    TypeScript SDK 2.2.0 client as a black-box peer over stdio. Its source is off limits
-    (mid-relicensing), running it is not. That oracle goes into `modules/mcp/tools/`.
-  - **Effort:** M1–M4 medium (about two sessions); M5 medium-large. Consumer repins follow each
-    phase.
-- ~~(survey 2026-09-30) **`title`, `icons` and tool annotations**~~ — **DONE 2026-09-30** with M4. `Implementation`'s
-  own `icons`/`description`/`websiteUrl` on `Info`: **DONE 2026-10-20** (R4).
-- **DONE 2026-10-20 (S2 plan above):** ~~(survey 2026-09-30) **Pagination (`cursor`/`nextCursor`) on the four list methods.**~~ Why: a server with hundreds of
-  tools/resources; currently the whole catalog is one reply and the request cursor is ignored. Effort: small-medium.
-- **DONE 2026-10-20 (S2 plan above):** ~~(survey 2026-09-30) **`notifications/*/list_changed` emission**~~ and **resource subscriptions**
-  (`resources/subscribe`, `notifications/resources/updated`). Why: dynamic tool sets and live resources; today
-  `listChanged`/`subscribe` are advertised `false`. Effort: medium (needs a transport-agnostic push seam, `mcp-http`
-  already has a GET stream).
-- **DONE 2026-10-20 (S2 plan above):** ~~(survey 2026-09-30) **Inbound `notifications/cancelled` for an in-progress `tools/call`**~~ (currently dropped).
-  Why: clients cancel long tool calls; the handler never learns. Effort: small-medium (needs a cancel flag in
-  `ToolCall`).
-- **DONE 2026-10-20 (S2 plan above):** ~~(survey 2026-09-30) **`completion/complete`**~~ (argument autocompletion for prompts/templates). Effort: small-medium.
-- (survey 2026-09-30) **Tasks (long-running tool invocations)** — in 2026-07-28 an official *extension*
-  (`io.modelcontextprotocol/tasks`: `tasks/get` polling, `tasks/update`), no longer core. After the plan above, on
-  demand. Effort: large.
-- Not filed (deprecated upstream): **logging** (`logging/setLevel`, `notifications/message`) — Go README: roots,
-  sampling and logging deprecated by SEP-2577 in 2026-07-28. Note this also ages the module's own sampling surface.
-
-~~**`clientInfo` is not recorded per peer**~~ — **DONE 2026-09-28**, see the "Design & invariants"
-bullet above (`ClientInfo`, `PeerState.client`, `server.clientInfo`/`call.clientInfo`).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · server · reentrant` + deps: none (std only — `std.json` + `std.Io`) — canonical
-source is `pub const meta` in src/root.zig.
+- **TypeScript SDK client as a differential peer** (plan from the 2026-07-28 revision work: TypeScript SDK client as a
+  black-box peer over stdio; its source is off limits during the relicensing, running it is not). Only the Python SDK
+  oracle exists; needs Node, not on this host. The oracle would go into `tools/`.
+- **Re-check two equivalence arguments** at the next whole-module mutation run: `compileText`'s `literalDepthOk` and
+  `cancelInflight`'s `conformingId` guard are judged equivalent because `std.json` and `Stringify` are bounded by a
+  buffer.
+- **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
+  held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete.
+- **Apps and Skills extension helpers** (the Python SDK has them): on demand, with `addMethod` and
+  `setCapabilityExtras` as the building blocks.
+- **LOW, no-panic sweep, not fixed:** large but bounded caps (listen uris up to about 1 GiB in total across peers,
+  linear scans of the pending and listen tables); `uri_template.match` costs about n × literal length per template on
+  adversarial uris (hypothesis, unmeasured); the schema step budget is not size-aware (`codePoints`/`toNum` over a
+  16 MiB string cost one step).
+- **Speed against the TypeScript and Python SDKs is not measured** (the card compares with the Go and Rust SDKs only).
 
 ## Anchoring
 
@@ -600,9 +501,6 @@ source is `pub const meta` in src/root.zig.
 
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+**Typed tools.** `src/typed.zig` tests: golden schema text for every mapping row (scalars, widths and the 2^53 clamp, enum, optional, default, array, slice, nested, descriptions with escaping, empty struct); every generated schema compiled by `schema_check` and used to accept/reject instances; `parse` round trip, defaults, `5.0`, and the error paths with their JSON Pointer and message (missing, wrong type, unknown property, integer out of range incl. above 2^53 and beyond i64, bad enum, array length, nesting); an OOM case; two end-to-end `tools/call` tests in `root.zig` (generated schema validated by the server first; `validate_tool_io = false` reaches `argsAs`). Differential oracle: `tools/typed_oracle` (google/jsonschema-go from the module cache, offline) infers schemas from equivalent Go structs and judged 24 instances; the verdicts are frozen in `typed.zig` and agree with ours for both `schemaOf`+`schema_check` and `parse`. Compile errors (cannot be runtime tests): non-slice pointer, `[]u8`, union, `anytype`/`comptime_int`, comptime field, empty enum, `mcp_descriptions` naming a non-field, a recursive type (depth > `max_depth`), a non-struct argument type for `parse`.
 
-**Typed tools (2026-11-13).** `src/typed.zig` tests: golden schema text for every mapping row (scalars, widths and the 2^53 clamp, enum, optional, default, array, slice, nested, descriptions with escaping, empty struct); every generated schema compiled by `schema_check` and used to accept/reject instances; `parse` round trip, defaults, `5.0`, and 20 error paths with their JSON Pointer and message (missing, wrong type, unknown property, integer out of range incl. above 2^53 and beyond i64, bad enum, array length, nesting); an OOM case; two end-to-end `tools/call` tests in `root.zig` (generated schema validated by the server first; `validate_tool_io = false` reaches `argsAs`). Differential oracle: `tools/typed_oracle` (google/jsonschema-go v0.4.3 from the module cache, offline) infers schemas from equivalent Go structs and judged 24 instances; the verdicts are frozen in `typed.zig` and agree with ours for both `schemaOf`+`schema_check` and `parse`. Compile errors (cannot be runtime tests): non-slice pointer, `[]u8`, union, `anytype`/`comptime_int`, comptime field, empty enum, `mcp_descriptions` naming a non-field, a recursive type (depth > `max_depth`), a non-struct argument type for `parse`.
-
-**What the tests actually contain.** sampling/elicitation lines byte-identical to spec's own JSON examples; and, since 2026-10-06, **the official MCP Python SDK 2.3.0 as a differential client** (`tools/sdk_oracle/drive.py`, black box, source not read): it drives the catalog of `src/sdk_oracle_catalog.zig` over stdio in both eras — the `initialize` session and the stateless 2026-07-28 path (`server/discover`, `_meta` per request, a multi round-trip tool answered through its elicitation callback) — through tools (plain, failing, structured + `outputSchema`, unknown), resources and templates (incl. not-found), prompts (incl. unknown) and ping; its typed models accepted every answer and 40 content checks passed, one of them the SDK refusing a stub's malformed `tools/list`. The transcript is frozen in `src/sdk_oracle_vectors.zig` and replayed byte for byte by `src/sdk_oracle.zig` (no Python in CI). One judged SDK departure: it still sends `ping` on the 2026-07-28 path, which that revision removed (changelog, major change 5) — our -32601 is checked. Not anchored, and not wire behaviour: per-peer scoping of handshake and pending state (`handleMessageFrom`), an in-process bookkeeping rule no foreign implementation has.
-
-**How it got there.** The anchoring work landed. DONE e3b4a52: 8 literal + 6 partial spec anchors, canary on the classification
+**What the tests actually contain.** Sampling/elicitation lines byte-identical to the specification's own JSON examples; and **the official MCP Python SDK as a differential client** (see *Verification*, *SDK oracle*). Not anchored, and not wire behaviour: per-peer scoping of handshake and pending state (`handleMessageFrom`), an in-process bookkeeping rule no foreign implementation has.
