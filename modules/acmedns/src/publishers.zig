@@ -189,7 +189,7 @@ pub const AcmeDns = struct {
             },
         };
         if (p.last_status != 200) {
-            p.note = "acme-dns refused the update (see last_status)";
+            p.note = if (p.last_status / 100 == 3) "redirect not followed (see last_status)" else "acme-dns refused the update (see last_status)";
             return error.PublishFailed;
         }
     }
@@ -296,7 +296,7 @@ pub const HttpReq = struct {
             },
         };
         if (status / 100 != 2) {
-            p.note = "the endpoint refused /present (see last_status)";
+            p.note = if (status / 100 == 3) "redirect not followed (see last_status)" else "the endpoint refused /present (see last_status)";
             return error.PublishFailed;
         }
     }

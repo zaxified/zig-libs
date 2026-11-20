@@ -66,7 +66,7 @@ only; see *Backlog / deferred*).
   replaces the RRset: a wildcard and its base validate at one name) and deletes exactly that value;
   `AcmeDns` refuses when the account's `fulldomain` is not where the CNAME leads (the usual setup
   error, which acme-dns itself would not report) and has no cleanup (acme-dns keeps the two newest
-  values); `HttpReq` and `AcmeDns` never follow redirects (credentials ride along) and read the response
+  values); `HttpReq` and `AcmeDns` never follow redirects (credentials ride along; a 3xx reply is named in `note` as "redirect not followed") and read the response
   body under the HTTP client's `total_timeout_ms` (64 KiB at most; so does `AcmeDns.register`); the
   endpoint's query string and fragment survive the path join; HttpReq's basic auth refuses a `:` in the
   user (RFC 7617) and credentials over 378 bytes ("user:password"), with their own note, encodes with
@@ -132,8 +132,6 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
 ## Backlog / deferred
 
 - **L2** `presentFn` maps `Canceled` to `SolverFailed` (acme's `SolverError` has no `Canceled`).
-- **L6** a 3xx from an HTTP endpoint fails with a generic note (redirects are deliberately not followed);
-  say "redirect not followed".
 - **L7** the same (domain, value) presented twice: each `present` keeps its own record, but the publisher
   removes one DNS value, so cleanup of the first removes it for both — refcount or refuse the duplicate.
 - **N1** `deinit` with pending records does not clean them up (document or clean).

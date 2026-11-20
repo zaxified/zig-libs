@@ -144,7 +144,7 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     defer threaded.deinit();
     const io = threaded.io();
     var peer: Peer = undefined;
-    peer = .{ .io = io, .listener = undefined, .serve = 4 };
+    peer = .{ .io = io, .listener = undefined, .serve = 5 };
     try peer.start(io);
     defer peer.finish();
     var ub: [64]u8 = undefined;
@@ -168,6 +168,11 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &r));
     try testing.expectEqual(@as(u16, 201), p.last_status);
     try testing.expectEqualStrings("acme-dns refused the update (see last_status)", p.note);
+    // A redirect is named as one: it is never followed.
+    peer.status = 302;
+    try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &r));
+    try testing.expectEqual(@as(u16, 302), p.last_status);
+    try testing.expectEqualStrings("redirect not followed (see last_status)", p.note);
     peer.status = 200;
     try pub_.present(pub_.ctx, &r);
     try testing.expectEqualStrings("", p.note);
@@ -180,7 +185,7 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     try testing.expect(peer.has("content-type: application/json\r\n"));
     try testing.expect(peer.has("{\"subdomain\":\"sub2\",\"txt\":\"" ++ "loqxcyv8q5onbjqxbmr7sctno3tiaxdfowyjxajeux0" ++ "\"}"));
     try testing.expect(peer.has("x-api-user: u1\r\n") and peer.has("{\"subdomain\":\"sub1\""));
-    try testing.expectEqual(@as(u32, 4), peer.requests.load(.acquire));
+    try testing.expectEqual(@as(u32, 5), peer.requests.load(.acquire));
 }
 
 test "AcmeDns.present: no account, or a CNAME elsewhere, is refused before anything is sent" {
@@ -285,6 +290,7 @@ test "post: a redirect is not followed (credentials stay with the configured end
     const dp = d.publisher();
     try testing.expectError(error.PublishFailed, dp.present(dp.ctx, &rec));
     try testing.expectEqual(@as(u16, 307), d.last_status);
+    try testing.expectEqualStrings("redirect not followed (see last_status)", d.note);
     peer.finish();
     target.finish();
     try testing.expectEqual(@as(u32, 0), target.requests.load(.acquire));
