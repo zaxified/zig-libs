@@ -5,22 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (164 mutants, 159 killed, 5 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 12 tests added at the end of `src/root.zig` (golden header bytes, fragment sizes and leak-freedom under a failing allocator, saturation and backwards-clock cases, lifetime and budget boundaries, buffer growth). No source change, no behaviour change.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog "Documented per-peer keying" re-checked against the references (Linux and smoltcp key reassembly by a peer identity carried in the packet; this wire format carries none) and the "one `Reassembler` per peer" decision recorded with its reasons; no code change.
 - **2026-11-16** — **BREAKING:** `Reassembler.init` returns `InitError!Reassembler`; an invalid config (`max_inflight`,
   `max_fragments_per_datagram` or a set `max_total_bytes` of 0, `max_frame_len` 0 or too large) is `error.InvalidConfig`
   instead of a `@panic` (no consumer-reachable panic). Callers add `try`.
 - **2026-11-16** — **ADDITIVE:** `ReassemblerConfig.max_total_bytes` (default `null`, behaviour unchanged) caps reassembly buffer bytes across all datagrams, refusing with the new `InsertError.BudgetExceeded` (a new error-set member: an exhaustive `switch` over `InsertError` needs a prong); `Reassembler.stats()`/`resetStats()`/`totalBytes()` and the `Stats` counters; one-`Reassembler`-per-peer documented in README and the type's doc comment.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `ETHFRAG_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `reassembler`. Verdict: 200,000 runs, ReleaseSafe, clean.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the fuzz harness gained a
-  burst step kind so coverage-guided fuzzing reaches the
-  `max_fragments_per_datagram` guard (A1 F6; `TooManyFragments` was 0 in
-  200,151 runs, now reached), and the two exhaustion guards return through
-  private `noinline` markers so a fuzz run can measure them. `insert` returns
-  the same `error.TableFull` / `error.TooManyFragments` on the same inputs;
-  the public API is unchanged.
 - **2026-09-11** — **BEHAVIOURAL, not breaking:** `insert`'s overlap check
   and buffer allocation no longer scale with an attacker-chosen `n` the way
   they did (A1 F8+F9). Fragment intervals are now kept sorted internally

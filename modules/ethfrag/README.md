@@ -77,9 +77,11 @@ datagram may hold its slot in total, not just how long it may sit idle.
 ## Verify
 
 ```
-zig build test-ethfrag                          # Debug
-zig build test-ethfrag -Doptimize=ReleaseFast   # ReleaseFast
+scripts/modtest ethfrag
 ```
+
+The deterministic fuzz driver (`ETHFRAG_FUZZ=<runs>`, run on the test binary directly) is
+described in `src/fuzz_test.zig`.
 
 Round-trip smoke, a 300-iteration seeded property test (fragment → shuffle →
 reassemble → byte-identical, across random frame lengths / MTUs / overheads),
@@ -93,6 +95,13 @@ capture recipe and the one confirmed, deliberate divergence (this module
 rejects an exact-duplicate fragment; the kernel tolerates it as a harmless
 retransmission). A frame is returned only once every byte is accounted for by
 non-overlapping fragments; there is no code path that returns a partial frame.
+
+## Not provided
+
+No sockets, no `frag_id` allocation policy, no retransmission/NACK, no
+authentication of fragment origin, and no peer key (one `Reassembler` per peer,
+see above). An exact duplicate fragment drops the whole datagram, stricter than
+the Linux kernel. See SPEC *What is deliberately not done*.
 
 Provenance: clean-room from RFC 791 §3.2 and RFC 5722 §3 — both public specs,
 no third-party source ported or studied, so no `NOTICE` entry is required (root

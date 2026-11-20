@@ -19,7 +19,7 @@
 Design + threat notes for auditors. Usage: see `README.md` and `src/root.zig` doc comments
 (the two public entry points, `fragment`/`Reassembler`, are documented at their
 declarations).
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from RFC 791 §3.2 /
+Attribution/provenance: see the README's `Provenance:` line — none needed here (clean-room from RFC 791 §3.2 /
 RFC 5722 §3, both public specs, not third-party source).
 
 ## Compared with
@@ -31,17 +31,19 @@ the real Linux kernel (`src/kernel_oracle.zig`).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| Linux kernel IPv4/IPv6 reassembly (`ip_defrag`, `nf_defrag`) — **reference** | C | GPL-2.0 WITH Linux-syscall-note (API: NOASSERTION); observed as a black box only | — | mainline (push 2026-09) | The behavioural yardstick, captured for 12 scenarios. Tolerates an exact-duplicate fragment (this module drops the datagram — a deliberate stricter divergence, SPEC "Verification"). Has a global memory threshold (`ipfrag_high_thresh`) and keys by source/destination/protocol/id; this module bounds by datagram count and per-datagram bytes and keys by `frag_id` only *(kernel details inferred from its documented sysctls)*. |
+| Linux kernel IPv4/IPv6 reassembly (`ip_defrag`, `nf_defrag`) — **reference** | C | GPL-2.0 WITH Linux-syscall-note (API: NOASSERTION); observed as a black box only | — | mainline (push 2026-09) | The behavioural yardstick, captured for 13 fragment sets (six scenarios over IPv4 and IPv6, plus one IPv4-only zero-length final duplicate). Tolerates an exact-duplicate fragment (this module drops the datagram — a deliberate stricter divergence, see *Verification*). Has a global memory threshold (`ipfrag_high_thresh`) and keys by source/destination/protocol/id; this module bounds by datagram count, per-datagram bytes and an optional aggregate `max_total_bytes` per instance, and keys by `frag_id` only *(kernel details inferred from its documented sysctls)*. |
 | [smoltcp-rs/smoltcp](https://github.com/smoltcp-rs/smoltcp) | Rust | 0BSD | 4.6k | v0.14.0 (2026-08-17) | IPv4 fragmentation and reassembly per its README, with compile-time buffer sizes (default 1500 B, 1 buffer, 4 gaps) and drop-on-oversize; no RFC 5722 whole-datagram-drop policy claimed *(README-level; inferred)*. |
 | [gopacket/gopacket](https://github.com/gopacket/gopacket) (`ip4defrag`) | Go | BSD-3-Clause | 316 | v1.7.2 (2026-09-15) | Packet-analysis reassembly of captured IPv4 fragments (offline/IDS use), not a transmit-side codec; the original [google/gopacket](https://github.com/google/gopacket) (BSD-3-Clause, 6.8k stars) has been dormant since 2025-03 *(package contents inferred)*. |
 | lwIP `ip4_frag` | C | BSD-3-Clause *(lwIP's licence file; API says NOASSERTION — inferred)* | 1.8k | push 2026-09 | Embedded reassembler with a fixed global pbuf budget and per-source keying *(inferred)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No fragmentation/reassembly facility; no other Zig library found. |
 
+
 **Where we are ahead:** a fragmenter *and* a reassembler in one pure-Zig codec with RFC 5722 overlap
-rejection, retroactive bounds checks, absolute datagram lifetime, caller-supplied clock, and a
-verdict-level comparison with the real kernel. **Where we are behind:** no aggregate memory budget
-across datagrams, no drop/eviction counters, and no per-peer keying (one `Reassembler` per peer is
-the caller's job) (→ Backlog).
+rejection, retroactive bounds checks, absolute datagram lifetime, caller-supplied clock, an optional
+aggregate byte budget, per-error counters, and a verdict-level comparison with the real kernel.
+**Where we are behind:** no per-peer keying inside the API (the 8-byte header carries only `frag_id`,
+so one `Reassembler` per carrier peer is the caller's job, see *Design*), and no memory threshold
+shared between instances (`max_total_bytes` is per instance).
 
 ## Design & invariants
 
@@ -54,36 +56,55 @@ argument in `src/root.zig`'s `insert` doc comment: non-overlapping intervals wit
 `[0, total_len)` whose lengths sum to `total_len` necessarily tile it with zero gaps —
 so "sum of accepted lengths == total_len" is sufficient to prove full coverage without a
 separate gap scan). **That premise — every accepted interval lies within
-`[0, total_len)` — used to be unenforced for fragments accepted before any `more=false`
-fragment had established `total_len` in the first place**: an out-of-range fragment
-arriving first (while the bound is still unknown) sailed through the bounds check that
-only exists once `total_len` IS known, then its length still counted toward `covered`.
-A specific offset/order combination could make `covered` reach `total_len` via bytes
-that lived entirely OUTSIDE the real frame while a genuine gap remained INSIDE it,
-returning `.complete` over uninitialized allocator memory for that gap — found and
-fixed while building `kernel_oracle.zig`'s teeth check; see `insert`'s retroactive
-bounds check (fires the moment `total_len` is newly established) and the regression
-test "reassembler rejects a fragment retroactively found to exceed a LATER-established
-total length" in `root.zig`. `offset`/`length` are `u16`, which is both the wire format and the
+`[0, total_len)` — holds also for fragments accepted before any `more=false`
+fragment has established `total_len`**: the bounds check only exists once `total_len` is
+known, so `insert` re-checks the already accepted intervals the moment `total_len` is newly
+established (the retroactive bounds check, `root.zig:664`) and refuses the fragment that
+turns out to lie beyond it. Without it a specific offset/order combination could make
+`covered` reach `total_len` via bytes entirely OUTSIDE the real frame while a genuine gap
+remained INSIDE it, returning `.complete` over uninitialized allocator memory. Pinned by the
+regression test "reassembler rejects a fragment retroactively found to exceed a LATER-established
+total length" and the boundary test "a retroactively-checked interval that lands exactly at the
+newly-established total_len is accepted, one past it is not" in `root.zig`. `offset`/`length` are `u16`, which is both the wire format and the
 `max_frame_len` ceiling (65535 bytes) — a width tied directly to the header, not a
 separate policy knob. Concurrency: `.reentrant` free functions; a `Reassembler` instance
 is single-owner (no internal lock — one caller drives it, matching `ratelimit`/`jobqueue`
 style bounded-state modules in this collection).
 
 Every reassembly-table entry's buffer is sized to the first fragment it receives and grows
-on demand — doubling, capped at `config.max_frame_len` (Audit F8; it used to be allocated
-at the full `max_frame_len` up front). THAT part of the cost is therefore still bounded by
-`max_inflight * max_frame_len`, but an attacker now has to send the bytes to make the
+on demand — doubling, capped at `config.max_frame_len` (not allocated at the full
+`max_frame_len` up front). That part of the cost is bounded by
+`max_inflight * max_frame_len`, and an attacker has to send the bytes to make the
 module hold them. **That is not the whole entry, though** — each accepted fragment also grows the entry's interval list
 (`Interval` records, plus `ArrayListUnmanaged` growth headroom), up to
 `max_fragments_per_datagram` (default 4096) per datagram, and that part scales with the
-number of fragments an attacker chooses to send, not with `max_frame_len`. Measured (Audit
-F4's worst case, peak live bytes against `max_inflight * max_frame_len`,
-`max_fragments_per_datagram = 4096`; re-measured 2026-09-17, after F8): `max_frame_len =
+number of fragments an attacker chooses to send, not with `max_frame_len`. Measured (the
+worst case, peak live bytes against `max_inflight * max_frame_len`,
+`max_fragments_per_datagram = 4096`): `max_frame_len =
 65535` → 0.44× the buffer-only bound; `= 9216` → 3.13×; `= 1500` (a real Ethernet MTU) →
 **5.47×**. So the buffer bound is not the *whole* bound, and the gap widens as a consumer
 configures `max_frame_len` down. A consumer that
-needs the tight bound back should also cap `max_fragments_per_datagram`. The clock is 100%
+needs the tight bound back should also cap `max_fragments_per_datagram`.
+`config.max_total_bytes` (`?usize`, default `null` = no extra cap; a set value of 0 is
+`InvalidConfig`) bounds the reassembly buffers summed over all in-flight datagrams (the
+interval lists are not counted): a fragment that would exceed it first reclaims expired
+datagrams (new datagrams only), then is refused with `error.BudgetExceeded`; a live
+datagram is never evicted, a refused new datagram leaves no state, and a refused growth of an
+existing datagram drops that datagram. `Reassembler.totalBytes()` reads the current sum.
+`Reassembler.stats()` / `resetStats()` return the saturating `u64` tallies of `Stats`
+(completed, expired, overlap, out_of_bounds, protocol_violation, too_many_fragments, table_full,
+budget_exceeded, malformed; `Truncated`, `InvalidHeader`, `LengthMismatch` and
+`EmptyNonFinalFragment` all count as malformed, `root.zig:562`). `Reassembler.init` returns
+`error.InvalidConfig` (`InitError`) for a zero `max_inflight`, `max_fragments_per_datagram` or
+`max_total_bytes`, or a `max_frame_len` of 0 or above the module ceiling (`root.zig:450`).
+**One `Reassembler` per peer:** the Linux kernel keys its fragment queues by
+(source, destination, protocol, id[, user / vrf]) and smoltcp by a per-protocol key type, but in
+both the peer identity is a field of the fragmented packet itself. Here it is not: the 8-byte header
+carries only `frag_id`, and who sent a fragment is known only to the carrier layer (the tunnel
+endpoint / UDP source the caller received it on). A peer key in the API would be a value this
+module can neither read from the wire nor verify, so the equivalent of the kernel's tuple is the
+caller's choice of instance, which also gives each peer its own `max_inflight` and
+`max_total_bytes` budget (a shared table could be starved by one peer). The clock is 100%
 caller-supplied: every state-mutating call takes a plain `now_ns: u64`, and the module
 never calls `clock_gettime` or anything else itself — a consumer wires in whatever clock
 domain (monotonic, simulated, or a network-time source) fits its event loop.
@@ -100,9 +121,9 @@ enforcement point in `Reassembler.insert`:
   case — there is deliberately no separate "identical bytes, so merge it" fast path,
   because that distinction is exactly what overlap-based IDS-evasion attacks rely on.
   A **non-final** (`more = true`) zero-length fragment is rejected outright
-  (`EmptyNonFinalFragment`, Audit F1): `fragment()` never produces one, and the
+  (`EmptyNonFinalFragment`): `fragment()` never produces one, and the
   half-open `[offset, offset+length)` overlap test degenerates to the empty set for a
-  zero-length range, so before this check a zero-length fragment could be resent at
+  zero-length range, so without this check a zero-length fragment could be resent at
   the wire's cheapest possible cost without ever tripping the duplicate check above. A
   **final** (`more = false`) zero-length fragment is still legitimate (the only way to
   close an all-empty frame); a second, identical one for the same offset is caught as
@@ -129,10 +150,10 @@ enforcement point in `Reassembler.insert`:
   for the same id) or via an explicit `expireOlderThan` sweep. A very late fragment for
   an already-expired id starts a **fresh** reassembly rather than resurrecting stale
   bytes; it never partially completes against pruned state.
-- **Steady-trickle-never-idle (Audit F2, fixed):** `timeout_ns` alone only measures the
+- **Steady-trickle-never-idle:** `timeout_ns` alone only measures the
   gap since the last accepted fragment, so a sender that keeps feeding a datagram fresh,
-  individually-legitimate, non-overlapping fragments never goes idle and — before this
-  fix — was never reclaimed, regardless of how long it held its slot.
+  individually-legitimate, non-overlapping fragments never goes idle and would never be
+  reclaimed, regardless of how long it held its slot.
   `config.max_lifetime_ns` (default `8 * timeout_ns`) adds an absolute ceiling on top,
   measured from the datagram's first fragment; `expireOlderThan` — including the sweep
   `insert` runs internally when the table is full and a *different* id needs the slot —
@@ -162,77 +183,47 @@ a distinct weakness introduced by this module).
 
 ## Verification
 
-Offline by default — this is a pure codec, no live-interop surface at runtime.
-`zig build test-ethfrag`: round-trip smoke (no-frag, zero-length, multi-fragment,
-reordered delivery), a 300-iteration seeded property test (`fragment` → shuffle →
-`Reassembler` → exact byte-identical output, across random frame lengths/MTUs/header-overheads), a targeted
-adversarial corpus (one test per threat-model bullet above: overlap, duplicate, teardrop
-overrun, contradictory final-length claims, oversized frame, tiny-fragment flood,
-resource-cap exhaustion, gap-then-timeout, malformed header, truncated bytes, length
-mismatch, out-of-bounds), `std.testing.fuzz` over the reassembler's raw wire-byte
-input (structurally-valid-but-hostile fragments plus fully arbitrary bytes), asserting
-only "never panics" + "`inflightCount()` never exceeds `max_inflight`", and an
-**external anchor** (`src/kernel_oracle.zig`) freezing 12 real IPv4/IPv6 fragment
-captures (six scenarios × two address families — in-order, out-of-order,
-missing-middle, exact-duplicate, conflicting-overlap, content-consistent-but-
-differently-sliced-overlap) plus the real Linux kernel's own observed accept/drop
-verdict for each, captured once inside an unprivileged
-`unshare --user --map-root-user --net` namespace with hand-built raw sockets (no
-`scapy`). Every capture's fragment shape is replayed through this module's own
-production `Reassembler` (re-encoded into its own wire format) and the two verdicts
-are compared offline thereafter — no kernel access needed to run the suite. Ten of
-twelve match; the remaining two are ethfrag's one confirmed, deliberate divergence
-from the kernel (see that file's doc comment): this module treats an exact-duplicate
-fragment as just another overlap and drops the whole datagram, while this host's
-kernel tolerates it as a harmless retransmission for both IPv4 and IPv6. Green in
-Debug and `-Doptimize=ReleaseFast`.
+- **Run:** `scripts/modtest ethfrag` (Debug is LLVM Debug; ReleaseFast for the fuzz and
+  measurement runs). Offline by default — this is a pure codec, no live-interop surface at runtime.
+- **Round trips:** no-frag, zero-length, multi-fragment and reordered delivery, and a seeded
+  property test (`fragment` → shuffle → `Reassembler` → byte-identical output, across random
+  frame lengths, MTUs and header overheads).
+- **Adversarial corpus:** one test per threat-model bullet above (overlap, duplicate, teardrop
+  overrun, contradictory final-length claims, oversized frame, tiny-fragment flood,
+  resource-cap exhaustion, gap-then-timeout, malformed header, truncated bytes, length
+  mismatch, out-of-bounds), plus the budget, counters, clock-goes-backwards and
+  failing-allocator tests.
+- **External anchor** (`src/kernel_oracle.zig`): 13 frozen IPv4/IPv6 fragment captures (six scenarios
+  — in-order, out-of-order, missing-middle, exact-duplicate, conflicting-overlap,
+  content-consistent-but-differently-sliced-overlap — over IPv4 and IPv6, plus an IPv4-only
+  zero-length final duplicate) with the real Linux kernel's own observed accept/drop
+  verdict for each, captured once inside an unprivileged
+  `unshare --user --map-root-user --net` namespace with hand-built raw sockets (producer:
+  `tools/capture.py`, see `tools/README.md`). Every capture's fragment shape is replayed through this module's own
+  production `Reassembler` (re-encoded into its own wire format) and the two verdicts
+  are compared offline — no kernel access needed to run the suite. Eleven match; the other
+  two are ethfrag's one confirmed, deliberate divergence
+  (see that file's doc comment): this module treats an exact-duplicate
+  fragment as just another overlap and drops the whole datagram, while the
+  kernel tolerates it as a harmless retransmission for both IPv4 and IPv6.
+- **Fuzz:** `ETHFRAG_FUZZ=<runs>[,<first seed>]` (deterministic driver in `src/fuzz_test.zig`; harness
+  names `ethfrag-<file>-<function>`, `_ONLY` selects one) over the reassembler's raw wire-byte
+  input (structurally-valid-but-hostile fragments plus fully arbitrary bytes), asserting only
+  "never panics" and "`inflightCount()` never exceeds `max_inflight`".
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
-## Audit 2026-11-17 (whole-module mutation)
+## What is deliberately not done
 
-164 mutants over every non-test line of `src/root.zig` up to the test section: the header codec (endianness, byte offsets, the more flag, the reserved checks, the length gate), `fragment` (the frame, MTU and fragment-count limits at each boundary, the payload capacity with `header_overhead`, the split arithmetic, the stamped id, the error cleanup), `lifetimeCap` and `init` (every boundary), the counters (saturation, the class each error is tallied under), `expireOlderThan` and the inline idle check (strict boundaries, saturating subtraction, the idle / lifetime combination), and `insertInner` (every length and bound check, each error code, the table-full and budget logic with their boundaries, the initial buffer, the total-length and teardrop checks, the sorted-interval overlap checks against predecessor and successors, the completion test) and `ensureCapacity` (doubling, the frame cap, the budget trim, the exact-fit refusal). One ReleaseSafe schemata build, baseline first; 130 died on the existing suite, 34 survived.
-
-12 tests were added at the end of `src/root.zig`: golden header bytes and the stamped id (a big-endian `frag_id` was never pinned: only a round trip, where a byte-swapped id is a bijection); a 65535-byte frame, the payload capacity under `header_overhead`, and exactly 4096 fragments; `fragment` under a failing allocator (no leak at any failure point); `lifetimeCap` (default factor 8, a configured cap, saturation) and `init` at `max_frame_len = 1` / `max_fragments_per_datagram = 1`; saturating counters; a clock that goes backwards (no expiry, no trap, in `expireOlderThan` and in `insert`); the lifetime counted from the first fragment and not expired exactly at the cap; a zero-length final fragment holds no bytes and needs no budget; the budget does not reclaim expired datagrams when the new one fits exactly; a failed buffer allocation leaves no table slot; overlap against a predecessor that is not the first interval; growth doubles, is capped at `max_frame_len`, is trimmed to the budget, and a growth beyond the room under the budget is refused. All 164 mutants but five die.
-
-5 do not, none a defect:
-
-- 3 EQUIVALENT: the second `!contains(frag_id)` of the table-full block (expiry only removes, the id cannot have appeared in between); the initial `last_seen_ns = 0` (overwritten a few lines later); an always-empty initial buffer (cost-only: `ensureCapacity` grows it to exactly the needed length before any byte is stored, and `total_bytes` and the budget decisions come out identical).
-- 1 EQUIVALENT: `covered >= total_len` for `covered == total_len` (the accepted intervals are disjoint and lie inside `[0, total_len)`, so `covered` never exceeds it).
-- 1 UNOBSERVABLE: the successor scan stepping by 2 instead of 1. A run of more than one successor needs a zero-length and a non-zero interval at the same offset; a zero-length interval only exists with `more = false`, which fixes `total_len` at that offset, so the non-zero one is refused as `OutOfBounds`. The injection would be an entry built by hand with both.
-
-Not mutated: the `guardTableFull` / `guardTooManyFragments` wrappers (their only purpose is a distinct PC for the fuzz reach query), the `test_f8_*` / `test_f9_*` measurement counters, the OOM arms of `expireOlderThan` and the interval insert (best-effort paths; the failing-allocator tests above cover the cleanups they share), the `found_existing` branch test, `inflightCount` / `stats` / `totalBytes` getters, and every test. Counts on the card are whole-module.
+- **No exact-duplicate tolerance**: an exact duplicate fragment drops the whole datagram, stricter
+  than the kernel (RFC 5722 §3 has no carve-out; see *Threat model* and *Verification*).
+- **No peer key in the API**: see *Design*.
+- **No fragment retransmission/NACK, no `frag_id` allocation policy, no authentication of
+  fragment origin** (see *Threat model / out of scope*).
 
 ## Backlog / deferred
 
-Survey findings (survey 2026-09-30), all low priority and all fit CONVENTIONS §2:
-
-- **Aggregate byte budget** (survey 2026-09-30) — the table is bounded by `max_inflight * max_frame_len` plus interval
-  lists; the kernel and lwIP cap total bytes. A user who lowers `max_frame_len` sees the bound widen (see
-  Design). Effort: small (`max_total_bytes` in `ReassemblerConfig`, evict-oldest or refuse).
-  ✅ DONE 2026-11-16 (`ReassemblerConfig.max_total_bytes: ?usize = null`; expired datagrams are reclaimed first, then the fragment is refused with `error.BudgetExceeded`, never evicting a live datagram; `Reassembler.totalBytes()`).
-- **Drop/eviction counters** (survey 2026-09-30) — per-error tallies (overlap, timeout, table full) for an operator's
-  dashboard; today each is only an error return. Effort: small.
-  ✅ DONE 2026-11-16 (`Reassembler.stats()` / `resetStats()` returning `Stats`: completed, expired, overlap, out_of_bounds, protocol_violation, too_many_fragments, table_full, budget_exceeded, malformed; saturating u64).
-- **Documented per-peer keying** (survey 2026-09-30) — `frag_id` is the only key, so two peers sharing a `Reassembler` can
-  collide or poison each other; the README should say one instance per peer, or the API should take a peer key. Effort: small.
-  ✅ DONE 2026-11-16 (documented: one `Reassembler` per peer, in README and the type's doc comment; API unchanged).
-  Re-checked 2026-11-17 against the reference, decision kept (no API change): the Linux kernel keys its fragment queues by
-  (source, destination, protocol, id[, user / vrf]) and smoltcp by a per-protocol key type (`FragKey`; IPv4 and 6LoWPAN
-  variants), but in both the peer identity is a field of the fragmented packet itself. Here it is not: the 8-byte header
-  carries only `frag_id`, and who sent a fragment is known only to the carrier layer (the tunnel endpoint / UDP source the
-  caller received it on). A peer key in the API would therefore be a value this module can neither read from the wire nor
-  verify, so the equivalent of the kernel's tuple is the caller's choice of instance: one `Reassembler` per carrier peer,
-  which also gives each peer its own `max_inflight` and `max_total_bytes` budget (a shared table could be starved by one
-  peer). Documented in README and the `Reassembler` doc comment.
-
-Earlier note: No Fable-tier piece was needed — every requirement (overlap/duplicate/timeout
-rejection, resource bounds, teardrop-class hardening) is protocol/state-machine logic
-with a well-specified reference (RFC 791 §3.2, RFC 5722 §3), not novel cryptography or
-adversarial-math reasoning.
-
-## Status
-
-`extract · any · codec · reentrant` · deps: none (std only) — canonical source is
-`pub const meta` in `src/root.zig`.
+None open.
 
 ## Anchoring
 
@@ -242,5 +233,3 @@ adversarial-math reasoning.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/kernel_oracle.zig grades this module's Reassembler verdict against the real Linux kernel's own IPv4/IPv6 fragment reassembly, 6 scenarios x {v4,v6} = 12 captured comparisons; the emit/fragmentation side and the overlap policy beyond those scenarios stay self
-
-**How it got there.** The anchoring work landed. DONE b8612e1: kernel reassembly oracle; UNINITIALISED-MEMORY bug fixed; 1 policy divergence
