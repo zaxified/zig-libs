@@ -11,7 +11,8 @@
 //!   module (also used by `jwe` and `xmlenc`).
 //! - **MAC algorithms** (`mac`): the SA algorithm registry — HMAC-SHA-1
 //!   (truncated to 4/8/10 octets), HMAC-SHA-256 (truncated to 8/16 octets),
-//!   and AES-GMAC (12-octet tag), all via `std.crypto`. Truncation lengths
+//!   and AES-GMAC (12-octet tag), via `std.crypto` (HMAC) and the sibling
+//!   `aesgcm` (GMAC). Truncation lengths
 //!   per the SA MAC-algorithm table. Constant-time verification.
 //! - **g120 message codecs**: v1 Challenge, v2 Reply, v3 Aggressive-Mode
 //!   Request, v4 Session-Key-Status Request, v5 Session-Key Status, v6
