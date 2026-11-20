@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-14 (73/76, 3 eq) · src ae9e1eec9c16f63d
 
-*Delta mutation run 2026-11-14* (about 25 of ~1477 production lines changed since 2026-10-08: pointer arguments for `generateNonces`/`round2Sign`, volatile vector stores in `burnStack`, Zig 0.17 spellings): `expandMessageXmd48`, `generateNonces` and its burned body, `Identifier.fromU16`, `round2Sign`/`round2SignBurned` (the own-commitment guard and every term of the share equation) and `burnStack` whole -- 37 mutants, 35 killed (one -- the zero-nonce arm returning `InvalidCommitmentList` instead of `IncorrectCommitment` -- only by a new test; burn mutants by the ReleaseFast stack probe), 2 equivalent (`n`/`sk_i` wipes inside `round2SignBurned`, whose only caller burns 32 KiB on every path; the probe stays green with either wipe skipped). Totals add the delta to the 2026-10-08 run.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`frost-protocol` at its scale, 1,000), FROST_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
@@ -21,20 +19,6 @@
 FROST (Flexible Round-Optimized Schnorr Threshold signatures), RFC 9591,
 **secp256k1/SHA-256 ciphersuite (§6.5) only**; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
-
-**Status: complete.** Wire codecs, RFC §4.3 list operations, and the five
-ciphersuite hash functions plus their pure-glue callers
-(`computeChallenge`, `nonceGenerate`, `generateNonces`) are implemented
-and cross-validated byte-exact against RFC 9591 Appendix E.5's published
-intermediate values. The ten threshold-specific cryptographic cores
-(`deriveInterpolatingValue`, `computeBindingFactors`,
-`computeGroupCommitment`, `round1Commit`, `round2Sign`, `aggregate`,
-`verifySignatureShare`, `verify`, `trustedDealerKeygen`,
-`secretShareCombine`) are all implemented — no `@panic`/TODO stubs remain
-in `root.zig` — and are likewise byte-exact against RFC 9591 Appendix
-E.5 (Debug + ReleaseFast; `zig build test-frost`). See
-`src/root.zig`'s module doc comment for the exact construction each core
-follows and what its KAT covers.
 
 ## Compared with
 
@@ -49,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No threshold-signature code. |
 | sibling [`musig2`](../musig2/README.md) | Zig | this repo | — | — | n-of-n BIP-327 multi-signature giving BIP-340 signatures; the answer for a Taproot user who does not need `t < n`. Not a FROST substitute. |
 
-**Where we are ahead:** the only RFC-vector-anchored FROST in Zig that we found (the one other Zig FROST, `bsvz-frost`, was not examined beyond its description): every intermediate value of RFC 9591 Appendix E.5 is pinned byte-exact (binding factors, nonces, shares, final signature); nominally distinct wire types (`SigningShare` vs `SignatureShare`) so a share cannot be passed where a signature share belongs; explicit-randomness inputs so signing is replayable; mutation run recorded (2026-09-07); ctgrind harness. **Where we are behind:** one ciphersuite of the RFC's five (secp256k1 only — the RFC's recommended ristretto255 and the widely deployed Ed25519 are absent) (→ Backlog); no distributed key generation (frost-core has one; the sibling `dkg` is GJKR for ECDSA only); no BIP-340 / Taproot-compatible variant (`frost-secp256k1-tr`, multi-party-sig); no `vssVerify` helper, so a participant cannot check its dealer share against the returned `vss_commitment` with this module alone (rg `vss` in `src/root.zig` finds only the returned commitment); no share refresh, repair or re-randomized signatures.
+**Where we are ahead:** the only RFC-vector-anchored FROST in Zig that we found (the one other Zig FROST, `bsvz-frost`, was not examined beyond its description): every intermediate value of RFC 9591 Appendix E.5 is pinned byte-exact (binding factors, nonces, shares, final signature); nominally distinct wire types (`SigningShare` vs `SignatureShare`) so a share cannot be passed where a signature share belongs; explicit-randomness inputs so signing is replayable; mutation-audited; ctgrind harness; dead-stack probe. **Where we are behind:** one ciphersuite of the RFC's five (secp256k1 only — the RFC's recommended ristretto255 and the widely deployed Ed25519 are absent) (→ Backlog); no distributed key generation (frost-core has one; the sibling `dkg` is GJKR for ECDSA only); no BIP-340 / Taproot-compatible variant (`frost-secp256k1-tr`, multi-party-sig); no share refresh, repair or re-randomized signatures.
 
 ## Design
 
@@ -86,8 +70,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   in `kat_test.zig`, which is a real, if indirect, `expand_message_xmd`
   KAT. `H2` shares the identical construction (only the DST label
   differs) and is validated only indirectly, through `round2Sign`'s
-  signature-share equation matching the vector's `sig_share` once that
-  core is implemented — see "what the vectors do NOT cover" below.
+  signature-share equation matching the vector's `sig_share` — see "what the vectors do NOT cover" below.
 - **BIP340 compatibility — explicit finding: NO.** Restated from
   `root.zig`'s module doc comment (the single most important correctness
   fact for a reader of this module to internalize): this ciphersuite's
@@ -100,9 +83,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `prime_order_verify` directly; it does not call `bip340.verify`, and no
   amount of encode/decode glue bridges the two (the challenge hash
   itself is different, not just the wire format). The `bip340` build
-  dependency exists only because the orchestrator wired every
-  Schnorr-family module through it for a future cross-module comparison;
-  no function in this module currently calls into `bip340`.
+  dependency is declared but no function in this module calls into `bip340`.
 - **Type design — wire types vs. raw `Scalar`**: values that flow "over
   the wire" between participants/the Coordinator (`Identifier`,
   `SigningShare`, `VerifyingShare`/`GroupPublicKey`/`NonceCommitment`
@@ -168,9 +149,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   Mitigations" — the same category of concern `bip340`'s doc comments
   flag for `d`/`k`). `Secp256k1.scalar`'s field ops are std's own
   constant-time implementation; this module introduces no additional
-  branches on secret scalars in its REAL code (the stubbed cores are
-  where a future pass must uphold this — each doc comment flags which
-  operands are secret).
+  branches on secret scalars (each core's doc comment flags which
+  operands are secret; ctgrind measures `round1Commit` and `round2Sign`, see *Verification*).
 - **Nonce reuse** (RFC 9591 §7.3 "Nonce Reuse Attacks"): reusing a
   `(hiding_nonce, binding_nonce)` pair across two `round2Sign` calls for
   the same participant is a KEY-RECOVERY vulnerability (classic
@@ -197,56 +177,39 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   key-generation protocol, which is explicitly out of scope for RFC 9591
   itself and not yet in this module (see Backlog).
 - **`verify`/`verifySignatureShare` never panic on adversarial input** —
-  both return `bool`/error unions distinguishing "malformed input" from
-  "well-formed but doesn't verify," and NEITHER treats "doesn't verify"
+  `verify` returns `bool` (every malformed input is `false`); `verifySignatureShare`
+  returns an error union for malformed input and `false` for a well-formed share that does not
+  verify; NEITHER treats "doesn't verify"
   as an error condition (mirrors `bip340.verify`'s own convention) —
   important for a Coordinator that must keep running after rejecting one
   bad share, not abort the whole process.
 
-### Audit 2026-10-08 (review + mutation over the current src)
-
-Review against RFC 9591 (secp256k1 ciphersuite) and frost-core 3.0.0, over the k256 the
-2026-10-07/08 speed work rewrote: H1–H5 and `expand_message_xmd`, `nonce_generate`, the codecs,
-`derive_interpolating_value`, binding factors, group commitment, the signature-share equation,
-`aggregate`, `verify_signature_share`, `verify` (with its canonical-`z` guard), trusted dealer and
-`secret_share_combine`. Formulas match. Findings, fixed:
-- **MEDIUM — `round2Sign` did not check its own commitments.** RFC 9591 §5.2: each participant
-  MUST ensure that its identifier AND commitments from the first round appear in
-  `commitment_list`; frost-core's `sign` returns `IncorrectCommitment`. The doc comment had left
-  it to the caller. Now checked (`nonces·G` against the listed pair), new error
-  `IncorrectCommitment`. ctgrind `sign` 5 → 13 for the recomputation and comparison (diffed
-  context by context; `scripts/checks/ctgrind-expected.tsv` comment).
-- **LOW — `trustedDealerKeygen` accepted `min_participants = 1`** (RFC 9591 Appendix C.1 raises
-  for `< 2`): a constant polynomial, every share equal to the group secret.
-- **LOW — `trustedDealerKeygen`'s error path freed the shares without zeroing them.**
-- **HIGH — the share and the nonces on the dead stack** (found the same day, after the same probe
-  found the nonce in `adaptor.preSign` and the key and nonces in `musig2.sign`). The new
-  `src/stackprobe_test.zig` (bip340's method, negative and positive control; needles `sk_i`,
-  the hiding and binding nonces, their negations, three images each) found residue after
-  `generateNonces` (`sk_i` from `nonce_generate`'s preimage, both nonces), `round1Commit` (both
-  nonces) and `round2Sign` (`sk_i`, both nonces) — a nonce next to the published signature share
-  is `lambda_i·sk_i`. Fixed as `bip340.sign`: each runs its work in a `noinline` inner function and
-  burns 32 KiB after it (19 KB measured dirty for `round2Sign`). One copy per call survived that:
-  the 64-byte `SigningNonces` passed BY VALUE was copied at the call boundary, outside any burn;
-  `round1Commit`/`round2Sign` now take `*const SigningNonces` (frost-core takes `&SigningNonces`
-  too) — breaking. Probe green; all burns removed in a copy of the tree → residue in all three.
-Not changed, noted: no single-use enforcement for `SigningNonces` (frost-core has none either; see
-"Nonce reuse" above).
-
-Mutation schemata (ReleaseSafe, one binary): 39 mutants over `root.zig` — the new commitment
-checks, `expand_message_xmd` (length, zero byte, DST length, `b0 ⊕ b1`, `b2`), H4/H5 labels,
-`nonce_generate`'s preimage order and the binding seed, identifier/element/signature validity,
-the Lagrange duplicate/membership checks and denominator sign, binding-factor input, group
-commitment terms, each term of the share equation, the challenge's argument order, `aggregate`'s
-sum, both verifications, the dealer's Horner order, constant term and VSS coefficients, the
-combine guards, sort order, the binding-factor lookup. **38/39 killed, 1 unobservable** (`verify`'s
-canonical-`z` check: a non-canonical `z` that passes the equation needs `z < 2^256 − n`,
-~2^-128, and any other `z ≥ n` fails the equation anyway) after 6 tests the first run (32/39)
-asked for: a t = 3 sharing checked share by share against `vss_commitment` (Feldman) — the
-published t = 2 vector cannot see the Horner coefficient order or which coefficient a commitment
-is taken from; `secretShareCombine` refusing one share and a repeated identifier;
-`Identifier.fromBytes(0)` and `Element.fromPoint(identity)`; plus the commitment-check and
-threshold tests for the fixes.
+- **`round2Sign` checks its own commitments.** RFC 9591 §5.2: each participant MUST ensure that its
+  identifier AND commitments from the first round appear in `commitment_list` (frost-core's `sign`
+  returns `IncorrectCommitment`). `round2Sign` recomputes the commitments from `nonces` and compares
+  them with the listed pair: `Round2SignError.IncorrectCommitment` when the listed hiding or binding
+  commitment differs, `InvalidCommitmentList` when the identifier is absent. A Coordinator could
+  otherwise choose this signer's part of `R`.
+- **`trustedDealerKeygen` refuses `min_participants < 2`** (RFC 9591 Appendix C.1: a threshold of 1 is
+  a constant polynomial, every share equal to the group secret) and zeroes the shares before freeing
+  them on an error path.
+- **Dead-stack burns.** `generateNonces`, `round1Commit` and `round2Sign` run their work in a
+  `noinline` inner function and burn 32 KiB of the stack after it (the share and both nonces would
+  otherwise stay readable there; a nonce next to the published signature share is `lambda_i·sk_i`, the
+  share). For the same reason `round1Commit`/`round2Sign` take `nonces: *const SigningNonces` (as
+  frost-core's `&SigningNonces`) and `signing_share: *const SigningShare`, so no by-value copy of a
+  secret is made at the call boundary outside any burn. The burn zeroes with volatile vector stores;
+  its buffer is 16-aligned so the frame is not realigned.
+- **`verify` guards a canonical `z`.** A hand-built `Signature` (not via `fromBytes`) with `z >= n` would
+  verify its reduced twin (std's point multiplication takes the raw 256-bit integer), so `verify` first
+  rejects a non-canonical `z`; the check is unobservable through the equation alone, since a `z`
+  that passes it needs `z < 2^256 − n`, about 2^-128.
+- **`vssVerify` (RFC 9591 Appendix C.2).** `vssVerify(share: *const ParticipantShare, vss_commitment:
+  []const Element) !bool` checks a dealer share against the Feldman commitment by Horner's rule over the
+  commitment points (equal to the RFC's sum of `C_j * i^j`). `false` on any mismatch, a malformed
+  commitment element, a zero share or a sum that is the identity; only an empty `vss_commitment` is an
+  error (`VssVerifyError.InvalidParameters`). The share enters only the constant-time base-point
+  multiplication; the commitments and identifier powers are public and use the variable-time public one.
 
 ## Out of scope
 
@@ -256,21 +219,15 @@ threshold tests for the fixes.
 - Distributed key generation (an alternative to Appendix C's trusted
   dealer) — RFC 9591 does not specify one, so the first version left it
   out; not yet, see Backlog.
-- Feldman VSS SHARE VERIFICATION (`vss_verify`, Appendix C.2) —
-  `trustedDealerKeygen` returns `vss_commitment`, which a caller can
-  independently check a share against via `vss_verify`'s formula
-  (`S_i == sum(vss_commitment[j] * i^j)`), but this module does not
-  itself expose a `vssVerify` helper — DONE 2026-11-16 (`vssVerify`).
 - Distributed/removed-Coordinator deployment shapes (RFC 9591 §7.5) — the
   Coordinator role here is left to the caller/consumer, same as the RFC's
   own framing (this module supplies the per-role FUNCTIONS, not a
   network protocol or role-assignment policy).
 
-## The ten threshold-specific cryptographic cores (all implemented)
+## The ten threshold-specific cryptographic cores
 
-All ten are implemented in `root.zig` (no `@panic`/TODO stubs remain) per
-each function's doc comment, which spells out the exact RFC 9591
-construction:
+All ten are implemented in `root.zig`; each function's doc comment spells out the exact RFC 9591
+construction (`vssVerify`, Appendix C.2, is documented under *Design*):
 
 - `deriveInterpolatingValue` (§4.2) — the Lagrange coefficient at `x=0`.
   THE threshold-specific primitive; everything else built on top of it
@@ -294,8 +251,41 @@ construction:
   (`secret_share_combine` via `polynomial_interpolate_constant`).
 
 `kat_test.zig`'s assertions (one per core, against RFC 9591 Appendix E.5's
-published intermediate/final values) are the acceptance check, and all
-pass, Debug and ReleaseFast.
+published intermediate/final values) are the acceptance check.
+
+## Verification
+
+Run `scripts/modtest frost` (the dead-stack probe runs in ReleaseFast only; Debug and ReleaseSafe fill
+`undefined`, so it is skipped there). Test classes:
+
+- **RFC 9591 Appendix E.5 KAT** (`kat_vectors.zig`, `kat_test.zig`), byte-exact: `H1` and `H3` on the
+  published preimages (an indirect `expand_message_xmd` KAT), `H4`/`H5` inside the binding-factor input,
+  `round1Commit`, `computeBindingFactors`, `trustedDealerKeygen`, `secretShareCombine` over every 2-subset,
+  `round2Sign` for both signers, `aggregate` to the published signature, `verify` and
+  `verifySignatureShare` accepting the published values and rejecting a tampered `z`, `R` or share; an end-to-end
+  (2,3) round trip.
+- **What the vectors cannot see:** a t = 3 sharing checked share by share against `vss_commitment`
+  (Feldman; the published t = 2 vector cannot see the Horner coefficient order or which coefficient a
+  commitment is taken from), `vssVerify` on dealt shares and on a tampered share, commitment and
+  identifier, `secretShareCombine` refusing one share and a repeated identifier, `Identifier.fromBytes(0)`
+  and `Element.fromPoint(identity)`, `trustedDealerKeygen` below threshold 2, `round2Sign` refusing a
+  commitment list that does not carry its own commitments (and a zero nonce reporting
+  `IncorrectCommitment`), the `deinit` wipes.
+- **Fuzz:** three harnesses run by testkit's deterministic driver as `FROST_FUZZ` (`src/fuzz_test.zig`,
+  `_ONLY` selects by name): `frost-verify` (the published signature with a few octets replaced; `verify`
+  never panics), `frost-wire` (decoders reject what is not canonical and re-encode what they accept),
+  `frost-protocol` (a (t,n) signing round trip is accepted, damaged signatures and shares are not), each
+  with a fixed seed loop and reach checks in every test run.
+- **Dead stack:** `src/stackprobe_test.zig` paints the region below the call and scans it for the signing
+  share, both nonces and their negations in big-endian, little-endian and in-memory images after
+  `generateNonces`, `round1Commit` and `round2Sign`, with a negative control (public data only) and a
+  positive control (parks the share in a local).
+- **Constant time:** ctgrind harness `src/ctgrind_harness.zig`, targets `commit` (`round1Commit`) and `sign`
+  (`round2Sign`), rows in `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Example:** `example/main.zig` drives dealer, two participants and the Coordinator through the published
+  module only.
 
 ## Anchoring
 
@@ -308,15 +298,12 @@ pass, Debug and ReleaseFast.
 
 ## Backlog / deferred
 
-- **Relation audit 2026-10-03 — LOW:** `verifySignatureShare` takes `comm_i` separately and never
+- **Relation checks (LOW):** `verifySignatureShare` takes `comm_i` separately and never
   checks it is the entry for participant `i` in the commitment list the binding factors were
   computed over; `aggregate` does not verify its output (RFC 9591 §5.3 lets the coordinator do
   so to identify a cheater). Look the commitment up from the list; offer a verifying aggregate.
-
-
-- **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** (survey 2026-09-30): ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
-- **Distributed key generation for FROST** (survey 2026-09-30): the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why the first version did too, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
-- ✅ DONE 2026-11-16 (`vssVerify(share: *const ParticipantShare, vss_commitment: []const Element) !bool`, `VssVerifyError`; tests: RFC E.5 shares, t = 3, tampered share/commitment/identifier, zero share, empty commitment) **`vssVerify` (RFC 9591 Appendix C.2) helper** (survey 2026-09-30): a participant must check its share against the dealer's `vss_commitment`; this SPEC already calls it "a reasonable, small follow-up". Effort: small. Fits §2.
-- **BIP-340-compatible (Taproot) secp256k1 variant** (survey 2026-09-30): `frost-secp256k1-tr` and multi-party-sig produce signatures a Bitcoin node accepts; ours are explicitly not BIP-340 (65-byte, 33-byte points). Effort: medium (x-only key/nonce parity handling and BIP-340 challenge). Fits §2.
-- **Share refresh / repair / re-randomized FROST** (survey 2026-09-30): available in frost-core; needed for long-lived custody keys. Effort: medium each. Fits §2. Lower priority than the four items above.
+- **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** — ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
+- **Distributed key generation for FROST** — the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why the first version did too, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
+- **BIP-340-compatible (Taproot) secp256k1 variant** — `frost-secp256k1-tr` and multi-party-sig produce signatures a Bitcoin node accepts; ours are explicitly not BIP-340 (65-byte, 33-byte points). Effort: medium (x-only key/nonce parity handling and BIP-340 challenge). Fits §2.
+- **Share refresh / repair / re-randomized FROST** — available in frost-core; needed for long-lived custody keys. Effort: medium each. Fits §2. Lower priority than the four items above.
 

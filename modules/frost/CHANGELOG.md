@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-16** — **NEW:** `vssVerify(share, vss_commitment)` (RFC 9591 Appendix C.2 `vss_verify`) and `VssVerifyError`: a participant checks its dealer share against the Feldman commitment; `false` on mismatch/malformed/zero share, `error.InvalidParameters` only for an empty commitment. The secret share only enters `combMulBase`; commitments use the public multiplication. Tests against the E.5 vector and a t = 3 sharing.
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit recorded (37 mutants, 35 killed, 2 equivalent); Audit line refreshed (A1).
 - **2026-11-14** — tests: stale-audit mutation run over the code changed since the 2026-10-08 audit (37 mutants: 34 killed by the existing suite, 2 equivalent, 1 killed by the new test below): `round2Sign` with a zero hiding or binding nonce returns `IncorrectCommitment` (the commitment recomputation fails on the identity), which no test had pinned -- the error arm was swappable for `InvalidCommitmentList`. No source change.
 - **2026-10-10** — tests: deterministic fuzz driver `FROST_FUZZ` (frost now has `testkit` in `test_deps`; the local seed/cursor copies in `kat_test.zig` are kept, see the note there): `frost-verify` (published signature with 0-40 octets replaced: the published one verifies, no other 65 octets do), new `frost-wire` (Element/Signature/scalar/Identifier decoders on damaged published values and uniform bytes; what is accepted re-encodes to the same octets) and new `frost-protocol` ((t,n) trusted-dealer keygen, drawn quorum, both rounds, aggregate, verify; a flipped signature bit, another message, a flipped bit of one signature share -- named by `verifySignatureShare`, and an `aggregate` over it is refused by `verify` -- are rejected). No source change.
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
@@ -44,21 +43,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   them on an error path. ctgrind `sign` 5 → 13 (the commitment recomputation and comparison).
   Audit 2026-10-08 (`SPEC.md`).
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: other ciphersuites, DKG and `vssVerify` in Out of scope (and DKG in Threat model) now read "not yet — see Backlog", matching the survey Backlog.
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **commit 8 / sign 5**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ SPEC.md's "this module introduces no additional branches on secret scalars in its REAL code" is CONFIRMED: the `sign` target shows zero contexts in curve arithmetic — the whole signature-share equation (`root.zig:1018-1020`) is clean, and all five contexts are std's scalar-canonicality check at the "turn secret bytes into a Scalar" API boundary, disassembled to a real `jne` rather than assumed. `commit`'s eight split 4 `rejectIdentity`-shaped (two k256's, two this module's own redundant re-check) and 4 canonicality. ⚠ Not adjusted for single-process over-taint.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** out of `zig build
-  check-testonly` again, with local copies of `testkit.fuzz`'s seed and cursor
-  helpers instead of the shared ones. Enrolling this module via `test_deps` puts
-  it in that gate, whose probe imports the *published* module and references
-  every declaration three levels deep — which reaches `std.crypto.pcurves`'s
-  secp256k1 scalar `sqrt`, a `@compileError("unimplemented")` because the group
-  order is 1 mod 4. The probe cannot compile, through no fault of this module.
-  ⛔ Local copies are what `testkit.fuzz` exists to abolish; what keeps these from
-  drifting is that each carries an anchor test driving the real
-  `std.testing.Smith` (and, for the cursor, its wrap and range behaviour), so a
-  future Zig that changes `slice`'s framing fails here loudly rather than leaving
-  the corpus quietly seeding nothing.
 
 - **2026-09-07** — Test-only, no production change: `fuzzVerify`, the harness named "never
   panics on **corrupted** signature bytes", had never corrupted a byte. Its first draw was

@@ -7,19 +7,11 @@ signing protocol — any `MIN_PARTICIPANTS`-sized subset of
 aggregate signature `(R, z)` verifiable under one group public key, with
 no interaction needed from signers outside that subset.
 
-**Status: complete.** Wire codecs, RFC §4.3 list operations, and the
-five ciphersuite hash functions (`h1`..`h5`) plus their pure-glue callers
-(`computeChallenge`, `nonceGenerate`, `generateNonces`) are implemented
-and cross-validated byte-exact against RFC 9591 Appendix E.5's own
-published intermediate values (`kat_test.zig`). The ten
-threshold-specific cryptographic cores (`computeBindingFactors`,
-`computeGroupCommitment`, `deriveInterpolatingValue`, `round1Commit`,
-`round2Sign`, `aggregate`, `verifySignatureShare`, `verify`,
-`trustedDealerKeygen`, `secretShareCombine`) are all implemented (no
-`@panic`/TODO stubs remain in `root.zig`) and likewise byte-exact against
-RFC 9591 Appendix E.5 (Debug + ReleaseFast). See `SPEC.md`
-for the design, the BIP340-compatibility finding (short version: **NOT
-compatible** — different element encoding, different signature length,
+Wire codecs, RFC §4.3 list operations, the five ciphersuite hash functions
+(`h1`..`h5`) and all the threshold-specific cores below are byte-exact against
+RFC 9591 Appendix E.5's published intermediate values (`kat_test.zig`). See
+`SPEC.md` for the design, the BIP340-compatibility finding (short version:
+**NOT compatible** — different element encoding, different signature length,
 different challenge hash), and the full threat model.
 
 | File | Contents |
@@ -138,7 +130,12 @@ std.debug.assert(frost.verify(msg, sig, keygen.group_public_key));
 zig build test-frost
 ```
 
-All tests pass (Debug and ReleaseFast) — the hash-layer tests plus the
-ten threshold-specific cores' KATs against RFC 9591 Appendix E.5, and an
-end-to-end (2,3) round-trip. See `SPEC.md` for exactly which construction
-each core follows.
+RFC 9591 Appendix E.5 known-answer tests for every core, an end-to-end (2,3)
+round trip, deterministic fuzz harnesses (`FROST_FUZZ`) and a dead-stack probe
+for the secrets; `SPEC.md` *Verification* lists the classes.
+
+## Not provided
+
+Other ciphersuites (ristretto255, Ed25519, Ed448, P-256), distributed key
+generation, a BIP-340/Taproot-compatible variant, share refresh, repair and
+re-randomized signatures: see `SPEC.md` *Compared with* and *Backlog / deferred*.
