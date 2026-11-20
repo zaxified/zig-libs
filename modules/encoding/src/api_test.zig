@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The 2026-10-20 API: every WHATWG single-byte page, the label table,
+//! The API: every WHATWG single-byte page, the label table,
 //! the caller-buffer core (`decodeInto`/`encodeInto`), the streaming
 //! `Encoder`, unmappable-character modes and fatal mode on undefined bytes.
 

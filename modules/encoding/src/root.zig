@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! encoding — legacy single-byte code page ↔ UTF-8 conversion (every
-//! WHATWG single-byte encoding since 2026-10-20, plus `x-user-defined` and the
+//! WHATWG single-byte encoding, plus `x-user-defined` and the
 //! DOS pages CP437/CP850/CP852), plus UTF-16 and UTF-32, BOM sniffing,
 //! streaming decoder and encoder over a caller-buffer core (`core.zig`), a
 //! fatal mode, `mem`-style helpers and a public custom-page constructor
@@ -50,8 +50,8 @@ pub const meta = .{
 /// Supported text encodings for input / output. `utf8` is the default and a
 /// pure pass-through. The rest are single-byte code pages: the first five in
 /// the order they were added (their tags are stable), then, since
-/// 2026-10-20, every other single-byte encoding of the WHATWG Encoding
-/// Standard, then `x-user-defined` and three DOS pages (2026-10-20, R11/R12).
+/// every other single-byte encoding of the WHATWG Encoding
+/// Standard, then `x-user-defined` and three DOS pages (R11/R12).
 /// Every member is ASCII-compatible.
 pub const Encoding = enum {
     utf8,
@@ -257,7 +257,7 @@ pub const EncodeStatus = core.EncodeStatus;
 /// Encoding Standard's UTF-8 decoder does: one U+FFFD per MAXIMAL SUBPART of an
 /// ill-formed sequence (Unicode's recommended practice, also Python's
 /// `errors="replace"`) — `e2 82` truncated is ONE U+FFFD, `f0 80 80` is three
-/// (`80` cannot follow `f0`). Until 2026-10-04 this replaced byte by byte
+/// (`80` cannot follow `f0`). Until this replaced byte by byte
 /// (two for `e2 82`) while the doc said "WHATWG". Either way a byte that
 /// cannot continue a sequence is re-read on its own, so an ASCII delimiter
 /// after bad input is never swallowed.
@@ -317,7 +317,7 @@ pub fn encodeFromUtf8Opts(alloc: std.mem.Allocator, utf8: []const u8, enc: Encod
     return e.encodeAll(alloc, utf8);
 }
 
-// ── UTF-16, BOM sniffing, streaming and fatal decoding (2026-10-04) ─────────
+// ── UTF-16, BOM sniffing, streaming and fatal decoding ─────────
 //
 // UTF-16 is deliberately NOT a member of `Encoding`. Every `Encoding` is
 // ASCII-compatible: a byte below 0x80 is that ASCII character in every one,
@@ -772,7 +772,7 @@ pub const Encoder = struct {
     }
 };
 
-// ── `mem`-style helpers (encoding_rs `mem`, 2026-10-20) ─────────────────────
+// ── `mem`-style helpers (encoding_rs `mem`) ─────────────────────
 
 /// Length of the longest well-formed UTF-8 prefix of `s`: the index of the
 /// first byte that is not part of well-formed UTF-8 (the start of an
@@ -1248,9 +1248,9 @@ test "corpus: every seed reaches both codecs, and the octets produced are pinned
         }
     }
     try std.testing.expectEqual(codec_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw and the collapsing index,
+    // Measured: with the collapsing draw and the collapsing index,
     // 0 seeds arrived non-empty and every run was `.utf8` over an empty slice —
-    // 0 / 0 / 0. After: 12 seeds, 208 / 879 / 550. 2026-10-04: 205 — the
+    // 0 / 0 / 0. After: 12 seeds, 208 / 879 / 550.: 205 — the
     // `ab e2 82` seed now decodes to ONE U+FFFD (maximal subpart, WHATWG),
     // not two, which is 3 octets fewer.
     try std.testing.expectEqual(@as(usize, 205), utf8_decoded);
@@ -1258,7 +1258,7 @@ test "corpus: every seed reaches both codecs, and the octets produced are pinned
     try std.testing.expectEqual(@as(usize, 550), table_encoded);
 }
 
-// ── UTF-8 / UTF-16 against CPython, streaming, fatal, BOM (2026-10-04) ─────
+// ── UTF-8 / UTF-16 against CPython, streaming, fatal, BOM ─────
 
 fn hexAlloc(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, hex.len / 2);
@@ -1418,7 +1418,7 @@ test "encodeUtf16: BOM, surrogate pairs, round trip" {
     defer a.free(be);
     try testing.expectEqualSlices(u8, "\x00A\xd8\x3d\xde\x00", be);
     // U+10000 is the first codepoint that needs a pair: D800 DC00 (mutation
-    // 2026-10-04: `cp > 0x10000` survived — nothing encoded the boundary).
+    // `cp > 0x10000` survived — nothing encoded the boundary).
     const first_pair = try encodeUtf16(a, "\u{10000}\u{FFFF}", .le, false);
     defer a.free(first_pair);
     try testing.expectEqualSlices(u8, "\x00\xd8\x00\xdc\xff\xff", first_pair);
@@ -1480,7 +1480,7 @@ test "Encoding stays ASCII-compatible: UTF-16 is not one of its members" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

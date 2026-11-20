@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The 2026-10-20 parity items R9-R12 and R15: `mem`-style helpers, UTF-32,
+//! The parity items R9-R12 and R15: `mem`-style helpers, UTF-32,
 //! `x-user-defined`, the DOS pages and `Custom`. (The table anchors of the new
 //! pages are in `sb_tables_test.zig`; the fuzz kinds in `fuzz_test.zig`.)
 

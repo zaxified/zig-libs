@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over encoding's existing `testing.fuzz` harness
-//! (`decodeToUtf8` / `encodeFromUtf8` over every table, added 2026-10-09). The
+//! (`decodeToUtf8` / `encodeFromUtf8` over every table, added). The
 //! body lives here, generic over its source of choices (`fn(comptime S, *S,
 //! gpa)`); `root.zig`'s `testing.fuzz` test feeds it through the cursor adapter
 //! below, the driver feeds it a PRNG. Both codecs are lenient by design (they
