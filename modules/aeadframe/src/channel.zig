@@ -1081,7 +1081,7 @@ test "wipe destroys the key in both halves and leaves the non-secret state alone
     try testing.expectEqual(@as(u32, 3), o.epoch);
 }
 
-// ── mutation run 2026-10-05 ─────────────────────────────────────────────────
+// ── mutation run ─────────────────────────────────────────────────
 
 test "AAD of exactly max_caller_aad seals and opens; one octet more is refused" {
     inline for (channels) |Ch| {

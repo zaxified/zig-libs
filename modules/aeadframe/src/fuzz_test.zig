@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for aeadframe (added 2026-10-10): `AEADFRAME_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for aeadframe: `AEADFRAME_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `aeadframe-channel` (both AEADs: a Sealer feeds an Opener with records
 //! delivered in a drawn order with duplicates; the result of every delivery

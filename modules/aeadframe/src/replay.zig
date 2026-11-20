@@ -74,7 +74,7 @@ pub const ReplayWindow = struct {
                 // (diff == eff == 64), which `accepts` still counts as in the
                 // window — so it must stay marked. Only its bit survives a
                 // 64-place shift (`<< 64` itself is not expressible on u64).
-                // Until 2026-10-05 this case (and `shift == eff` for narrower
+                // Until this case (and `shift == eff` for narrower
                 // windows) cleared the bitmap, and the old high-water mark was
                 // accepted a second time — a replay.
                 self.bitmap = @as(u64, 1) << 63;
@@ -221,7 +221,7 @@ test "reset drops history but keeps size" {
     try testing.expectEqual(@as(u7, 16), w.size);
 }
 
-// Review finding 2026-10-05 (mutation run): a jump of exactly the window size
+// Review finding (mutation run): a jump of exactly the window size
 // cleared the bitmap, but the previous high-water mark is then at diff ==
 // eff, the last slot `accepts` still treats as in-window — so it was accepted
 // again. The randomised trace above only advanced by 1–3 and never hit it.
