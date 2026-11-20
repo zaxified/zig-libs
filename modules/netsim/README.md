@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): determinism (same seed identical) and invariant hook with shrinking; harness itself, no external model
+What the tests check instead of a model (the card names none): determinism (same seed identical) and invariant hook with shrinking; harness itself, no external model
 
 **Known defects:** none recorded
 
@@ -43,8 +43,7 @@ algorithm plugs in as a `Protocol` consumer — see [`raft`](../raft),
 written against `std.Io` (sockets, clocks, tasks, files) under simulation, and
 storage faults (lost/torn unsynced writes, bit rot, disk I/O errors). `simio`
 is built on netsim — its seeded PRNG, its fault-schedule generator and its
-`ddmin` shrinker — and keeps netsim pure and platform-free (decided 2026-10-01,
-see `simio`'s SPEC "Why this module exists"). Pick netsim when the algorithm
+`ddmin` shrinker — and keeps netsim pure and platform-free (see `simio`'s SPEC "Why this module exists"). Pick netsim when the algorithm
 is (or can be written as) a message-passing state machine; pick `simio` when
 the code under test already talks to `std.Io`.
 
@@ -59,8 +58,8 @@ the code under test already talks to `std.Io`.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; **re-surveyed 2026-10-05** (stars and
-activity as of that date). Source of none of these was read — turmoil and marionette
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md` and re-surveyed 2026-10-05 (stars and
+activity as of the latter). Source of none of these was read — turmoil and marionette
 are MIT and could have been, the rest are not; every claim is from READMEs and release
 pages. "verified" = seen on the project's GitHub page, release page or crates.io on
 2026-10-05; *inferred* = not confirmed there.
@@ -94,17 +93,6 @@ heal") is checked by hand after `run` (see `raft`'s `server.zig`), not by
 `findFailing`/`shrinkTrace`; no consistency/history checker like Maelstrom's (consumers
 write invariants); a protocol is not told about a crash, so durable-vs-volatile state
 across `crash_node`/`restart_node` is each consumer's own bookkeeping.
-
-**Re-surveyed 2026-10-05 (mvp → core).** The 2026-09-30 card's "behind" list — no
-real-code interposition, no storage-fault model — predated the sibling `simio`
-(2026-10-01, `core`), which this README did not mention. Those two are now a deliberate
-split, not gaps: the user decided netsim stays a pure protocol-level engine and the
-`std.Io`/disk layer lives in `simio`, which reuses netsim's generator and ddmin
-(verified in `simio/src/search.zig`). Judged as a module on its own contract, netsim
-covers the main use case — model-checking a message-passing algorithm under network,
-crash and clock faults with replay and minimization — for 7 in-repo consumers; what is
-left is Backlog-grade (each has a workaround). Not `parity`: Maelstrom's history
-checkers and a liveness search are things a user can notice missing.
 
 ## Use
 
@@ -147,6 +135,9 @@ harness with no teeth is the failure mode this module exists to avoid, so each
 consumer ships a deliberately-broken positive control that MUST trip its
 checker (see `raft`'s `BrokenRaft`).
 
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
+
 Provenance: original work of the zig-libs authors (MIT) — the deterministic
 seeded discrete-event simulator, the failure-schedule fuzzer, the byte-exact
 replay oracle and the ddmin counterexample minimizer. The METHODOLOGY — a
@@ -158,13 +149,27 @@ queue and API are unrelated to it. The splitmix64 mixer is Sebastiano Vigna's
 public-domain algorithm. The methodology is borrowed from this repo's own `kv`
 VOPR, not its code.
 
+## What is deliberately not done
+
+- **Real-code interposition** (sockets, clocks, tasks and files under simulation) and **storage faults**
+  (torn/lost/misdirected writes, crash mid-write) — `simio` does both on top of netsim's generator and ddmin
+  (each host gets a crash-consistent disk; one-shot disk I/O errors and bit rot in its fault search); netsim
+  stays a pure, platform-free protocol-level engine.
+
 ## Backlog / deferred
 
-- **Message-corruption fault kind (bit flips / truncation on a link)** (survey 2026-09-30, still open 2026-10-05): `FaultKind` has drop, duplicate, delay, cut and crash but no byte-level damage; a codec-carrying protocol wants it. `simio`'s `corrupt_permille` covers only real `std.Io` datagrams. Effort S (a `corrupt_once` kind plus a `LinkConfig.corrupt_permille`, with the shrinker seeing it like any other fault). Fits §2.
-- **End-of-run (liveness) predicate in the search** (survey 2026-10-05): `checkFn` runs after every event, so only safety properties reach `findFailing`/`shrinkTrace`; "eventually X after the network heals" is checked by hand after `run` (`raft/src/server.zig`'s liveness tests), and such a failure cannot be minimized. Effort S (an optional `Protocol.finalFn` evaluated at `until`, reported as a violation). Fits §2.
-- **Crash notification for durable-vs-volatile state** (survey 2026-10-05): `crash_node` stops a node silently and `restart_node` re-runs `onStart`; what survives is each consumer's own bookkeeping (`raft`'s `Node` restarts from its persisted state). An optional `onCrashFn` hook would let a protocol drop volatile state at the crash instant. Effort S. Fits §2.
-- ~~**Storage-fault model (torn/lost/misdirected writes, crash mid-write)**~~ (survey 2026-09-30) — **done elsewhere, by design, 2026-10-01:** `simio` gives each host a crash-consistent disk (unsynced data lost, kept or torn per 512-byte sector; directory-sync durability) plus one-shot disk I/O errors and bit rot in its fault search, built on netsim's generator and ddmin. netsim stays protocol-level; a store or WAL under test runs on `simio`.
-- **Deliberately not here — real-code interposition** (survey 2026-10-05): sockets, clocks, tasks and files under simulation are `simio`'s job (user decision 2026-10-01, netsim stays pure and platform-free).
+- **Message-corruption fault kind (bit flips / truncation on a link):** `FaultKind` has drop, duplicate, delay,
+  cut and crash but no byte-level damage; a codec-carrying protocol wants it. `simio`'s `corrupt_permille`
+  covers only real `std.Io` datagrams. Plan: a `corrupt_once` kind plus a `LinkConfig.corrupt_permille`, with
+  the shrinker seeing it like any other fault (effort S).
+- **End-of-run (liveness) predicate in the search:** `checkFn` runs after every event, so only safety
+  properties reach `findFailing`/`shrinkTrace`; "eventually X after the network heals" is checked by hand
+  after `run` (`raft/src/server.zig`'s liveness tests), and such a failure cannot be minimized. Plan: an
+  optional `Protocol.finalFn` evaluated at `until`, reported as a violation (effort S).
+- **Crash notification for durable-vs-volatile state:** `crash_node` stops a node silently and `restart_node`
+  re-runs `onStart`; what survives is each consumer's own bookkeeping (`raft`'s `Node` restarts from its
+  persisted state). Plan: an optional `onCrashFn` hook so a protocol can drop volatile state at the crash
+  instant (effort S).
 
 ## Anchoring
 

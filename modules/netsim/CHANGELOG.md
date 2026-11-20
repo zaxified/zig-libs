@@ -5,32 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Prng.next` (duplicate-code pass) runs `std.Random.SplitMix64` (same constants, same sequence); a known-answer test pins the stream.
 - **2026-10-18** — Ported to Zig 0.17.0. Test only: the codemod-mangled `seen` array in the fault-kind teeth test rewritten with `@splat` and `.field_names.len`.
-- **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE** (documentation only):
-  re-survey per `SURVEY-PLAYBOOK.md`. Scope `mvp` → `core`: the 2026-09-30
-  card's "behind" list (no real-code interposition, no storage faults) predated
-  `simio` (2026-10-01), which now provides both on top of netsim's generator and
-  ddmin by design; netsim's own main use case is covered. README now points at
-  `simio`, "Status: complete" reworded to match the scope, `## Compared with`
-  re-verified (FoundationDB added, Maelstrom row confirmed from its README) and
-  the stale `## Verify` count (27) replaced by `scripts/modtest netsim`. Backlog:
-  storage-fault item marked done in `simio`; new items for an end-of-run
-  (liveness) predicate in the search and a crash-notification hook; the
-  message-corruption fault kind stays open.
 - **2026-10-01** — `Prng` (the seeded splitmix64 generator), `ddmin` (the
   shrinker's core, now generic over its oracle) and `cloneTraceSubset` are
   exported from the root, for `simio`, which replays its own traces. Additive;
   `shrinkTrace` behaves as before.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the audit F10 regression
-  test now counts log entries actually stored instead of timing `replay`
-  (a wall-clock `<=` guard that turned out not to reliably catch the audited
-  defect at all -- see the fix commit). Adds two test-only functions,
-  `resetLogEntriesStoredForTesting`/`logEntriesStoredForTesting`, and a
-  `builtin.is_test`-gated counter ticked once per `LogEntry` that reaches
-  `Sim.append`'s storage; zero-sized and a no-op outside a test build, so
-  `replay`/`Sim` behaviour is unchanged.
 - **2026-09-11** — A1 fix campaign (fixer slot `c`), netsim F2, F3, F4
   (last gap), F6, F8. **BEHAVIOURAL and API-breaking**, user-approved
   (Q7/Q8): all 7 in-repo consumers (`raft`, `df-elect`, `loopfree-reconv`,
@@ -149,22 +129,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `scripts/modtest netsim`: 44/44 (was 37/37 before this entry's three
   items), Debug and ReleaseFast.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F4
-  (partial). The audit's mutate.sh found 14 mutations that survive the suite
-  untouched — a fault kind or config bound that has no test observing its
-  actual EFFECT, only that it appears in a generated trace. Added 8 new tests
-  that each observe a mechanism's effect directly (a `PingPong` 2-node
-  fixture for the fault kinds, plus direct `Sim`/`Case` construction for the
-  two backstops and the config pin), each independently verified to fail
-  when its corresponding mutation is applied: `drop_once`, `link_down`,
-  `crash_node`, `restart_node`, `delay_once`, the `until` upper bound, the
-  `max_events_cap` backstop, and `Config`'s documented defaults.
-  `clock_jump` is covered incidentally by F1's positive control (already
-  asserts the offset changes). Still open, deliberately not attempted here
-  (time-boxed): `loss_permille`/`dup_permille`/`jitter`/`reorder_extra`/
-  `bandwidth` — these are `LinkConfig` statistical properties, not
-  `FaultKind`s, and need an N-sends statistical test shape rather than the
-  single-trace shape used above.
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F10
   + F12. F10: `replay` no longer builds the event `Log` when `log_out ==
   null` (a new internal `Sim.want_log` flag, default `true` — the 3 in-repo
