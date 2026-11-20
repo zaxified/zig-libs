@@ -215,7 +215,7 @@ pub fn openHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     // `bytes` call that followed it copied nothing at all. `open` was handed a
     // zero-length ciphertext, refused it on the `sealed.len < overhead` line,
     // and no other line of this module ever ran from the fuzzer. Measured
-    // 2026-09-07 over the corpus above: **0 of 8 seeds non-empty and 0 boxes
+    // Over the corpus above: **0 of 8 seeds non-empty and 0 boxes
     // opened before, 7 of 8 non-empty (one seed IS the empty ciphertext) and 1
     // opened after.**
     var sealed_len: usize = src.slice(&sealed_buf);
@@ -304,7 +304,7 @@ test "fuzz: seal never fails or panics on arbitrary plaintext, and the result op
 // Audit finding H1: the AEAD tag comparison this module relies on
 // (`std.crypto.timing_safe.eql` in `salsa20.zig`) is the ONLY thing standing
 // between a tampered ciphertext and a silently accepted forgery. Measured
-// 2026-09-09 (`A1/repro/sealedbox/forge.py`): with that comparison weakened
+// : with that comparison weakened
 // to check only the first 1/2/4/8/12/15 of the tag's 16 bytes, an attacker
 // who XOR-malleates the body of a real sealed box and brute-forces the
 // checked tag prefix gets 20/20 forgeries accepted (mean 109.3 guesses of
@@ -351,7 +351,7 @@ test "H1: a forged tag that agrees with the real one in its first 1/2/4/8 bytes 
 
 // ── L5: degenerate / small-order X25519 points ──────────────────────────
 //
-// Audit finding L5: `A1/repro/sealedbox/smallorder.py` ran 13 degenerate and
+// Audit finding L5:  ran 13 degenerate and
 // non-canonical Curve25519 points through both this module and libsodium,
 // both directions (seal to a degenerate recipient key, open a box with a
 // degenerate ephemeral-key prefix), and found 0/13 accept/reject
@@ -424,7 +424,7 @@ test "corpus: every ciphertext reaches open, and the opened count is pinned" {
     }
     // One seed IS the empty ciphertext, a legal member of a refusal corpus.
     try testing.expectEqual(open_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the length drawn first, 0 non-empty, 0 opened
+    // Measured: with the length drawn first, 0 non-empty, 0 opened
     // and 0 plaintext octets — the same empty ciphertext eight times. After:
     try testing.expectEqual(@as(usize, 1), opened);
     try testing.expectEqual(kat.message.len, recovered);

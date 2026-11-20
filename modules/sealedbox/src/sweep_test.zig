@@ -30,7 +30,7 @@ test "open: every ciphertext shorter than the overhead, and a low-order ephemera
     }
 }
 
-// ── mutation-run gaps, 2026-11-13 (see CHANGELOG) ───────────────────────────
+// ── mutation-run gaps (see CHANGELOG) ───────────────────────────
 
 test "open: an `out` buffer of the wrong size is InvalidCiphertext, in both directions" {
     // `sealed.len != out.len + overhead` was a `>` in a surviving mutant: an

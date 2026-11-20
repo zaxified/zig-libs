@@ -161,7 +161,7 @@ fn sealNonce(epk: [public_length]u8, pk: [public_length]u8) [secretbox.nonce_len
 /// log signal (audit finding L2).
 ///
 /// On ANY error, `out`'s contents are unspecified (audit finding L6). Since
-/// the 2026-10-07 rewrite a failed tag check leaves `out` untouched -- nothing
+/// the rewrite a failed tag check leaves `out` untouched -- nothing
 /// is decrypted before the tag verifies -- but that is not a promise: a
 /// caller must not read `out` unless `open` returned successfully.
 pub fn open(out: []u8, sealed: []const u8, kp: *const KeyPair) OpenError!void {
@@ -301,7 +301,7 @@ pub fn parseSecretKeyBase64(out: *[secret_length]u8, text: []const u8) KeyEncodi
 /// Encode a secret key as lowercase hex (64 chars). **SECRET material** —
 /// `wipe` the returned buffer when done with it.
 ///
-/// Pointers in, no value out (BREAKING 2026-10-08), like
+/// Pointers in, no value out (BREAKING), like
 /// `encodeSecretKeyBase64`: by value, the key stayed in the caller's frame
 /// (`stackprobe_test.zig`, direct-region engine).
 pub fn encodeSecretKeyHex(out: *[hex_sk_len]u8, sk: *const [secret_length]u8) void {
@@ -329,11 +329,11 @@ pub fn parseSecretKeyHex(out: *[secret_length]u8, text: []const u8) KeyEncodingE
 /// in a future build off the dead stack. Volatile stores keep the dead store.
 noinline fn burnCodecStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -358,7 +358,7 @@ fn publicFromSecretBody(sk: *const [secret_length]u8) error{IdentityElement}![pu
 /// Rebuild a usable `KeyPair` from a stored secret key (public key is
 /// recomputed — std's X25519 `KeyPair` treats the secret scalar as the seed).
 ///
-/// Into `out` (BREAKING 2026-10-09): returned in an error union the pair -- secret
+/// Into `out` (BREAKING): returned in an error union the pair -- secret
 /// scalar included -- sat in the caller's result slot and temporary. `out` is
 /// zeroed on error.
 pub fn keyPairFromSecretKey(out: *KeyPair, sk: *const [secret_length]u8) error{IdentityElement}!void {
@@ -375,7 +375,7 @@ fn keyPairFromSecretKeyBody(out: *KeyPair, sk: *const [secret_length]u8) error{I
 // ⛔⛔ Why these exist at all, in one measurement. `std.base64` and
 // `std.fmt.bytesToHex`/`hexToBytes` are table-driven, and a table indexed by a
 // secret byte is a cache-timing oracle -- the class of T-table AES. Measured
-// 2026-09-09 with `scripts/ctgrind.sh sealedbox` and confirmed by disassembly
+// With `scripts/ctgrind.sh sealedbox` and confirmed by disassembly
 // before anything here was written:
 //
 //     movzbl %sil,%eax                 ; the secret character
@@ -856,7 +856,7 @@ test "secret parsers zero `out` on every error, after decoding into it" {
     // The parsers decode every character into `out` before they reject (the
     // constant-time shape), so a rejected text has already left most of a key
     // there. The doc promises `out` is zeroed on any error; nothing checked it,
-    // and dropping the base64 parser's zeroing survived the 2026-10-08 mutation
+    // and dropping the base64 parser's zeroing survived the mutation
     // run. The bad character is LAST, so all of the key is decoded first.
     const good_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
     const good_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -890,8 +890,8 @@ test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte"
     // cases. The `hqc` precedent is the reason -- there, a table lookup and its
     // constant-time replacement agreed on all 65 536 pairs and STILL differed
     // in the only way that mattered (the memory access pattern). Value equality
-    // is what this test can prove; it proves it completely.
-    // (The base64 half is `b64ct`'s since 2026-11-08; its own tests cover it.)
+    // is what this test can prove; it proves it completely. (The base64 half is
+    // `b64ct`'s; its own tests cover it.)
     const hex_digits = "0123456789abcdef";
     for (0..16) |n| {
         try std.testing.expectEqual(hex_digits[n], ctHexChar(@intCast(n)));
@@ -1011,7 +1011,7 @@ test "wipe: the encoded secret really is gone from the buffer" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

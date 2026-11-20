@@ -63,7 +63,7 @@ test "STACKPROBE: no recipient secret-key residue after open or the key rebuild"
     const seal_secrets = &[_][]const u8{ &ephemeral, &dh, &box_key };
     // The residue rule looks only below the longest zero run, and ct25519's inner
     // 16 KiB burn is such a run: with no burn in `seal` the probe stays green while
-    // ~2.1 KiB of `seal`'s own frames above it go unwiped (measured 2026-11-02:
+    // ~2.1 KiB of `seal`'s own frames above it go unwiped (measured:
     // the run starts 2095..2111 B deep without the burn, 222 B with it). So pin
     // where the run starts.
     const short = try P.run("seal", sb.seal, .{ fixed_io, &sealed, msg, kp.public_key }, seal_secrets, .{});
@@ -72,7 +72,7 @@ test "STACKPROBE: no recipient secret-key residue after open or the key rebuild"
     try std.testing.expect(long.burn_top < 1024);
     // Same pin for `open`: its body (box key, subkey, keystream block, tag) runs above
     // ct25519's inner burn, so with no burn in `open` the probe stays green while
-    // those frames go unwiped (mutation run 2026-11-13: bypassing `open`'s burn and
+    // those frames go unwiped(bypassing `open`'s burn and
     // every wipe in its body survived without this).
     const open_long = try P.run("open long", sb.open, .{ &long_plain, &long_sealed, &kp }, ks, .{});
     try std.testing.expect(open_long.burn_top < 1024);

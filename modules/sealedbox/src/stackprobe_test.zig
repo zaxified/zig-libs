@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! A1/sealedbox.md L4, kept in the module per `CONVENTIONS.md` §9: the
+//! A1 audit L4, kept in the module per `CONVENTIONS.md` §9: the
 //! property `wipe` exists for — that the optimiser cannot remove its zeroing —
 //! is one no value test can see. `wipe: the encoded secret really is gone`
 //! reads the buffer right after wiping it, which keeps even a plain `@memset`
@@ -13,7 +13,7 @@
 //! looks for the secret. Measured at ReleaseFast: `secureZero` 0/5, plain
 //! `@memset` (audit mutant M10) 5/5, a no-op (M11) 5/5.
 //!
-//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! Method as `p256`'s `stackprobe_test.zig`(the
 //! earlier "scan a local buffer at the call's depth" form was blind to the top
 //! few hundred bytes of the measured call): paint a stack region below the
 //! probe, run one call under a `PAD`-deep shim, snapshot the region and count

@@ -6,7 +6,7 @@
 //!
 //! ## Why this module has a harness at all
 //!
-//! The 2026-09-09 ctgrind coverage pass filed `sealedbox` as a "thin wrapper
+//! The ctgrind coverage pass filed `sealedbox` as a "thin wrapper
 //! over std" — hand everything to `std.crypto.nacl.SealedBox`, measure nothing
 //! of our own. For `seal`/`open` that is exactly right and they are NOT
 //! targets here. But the module's own audit record (A1 `sealedbox.md`, M1)
@@ -54,7 +54,7 @@
 //! ✅ Fixed the same day: the module carries its own table-free codecs for
 //! secret material (`b64ct` for base64, `root.zig`'s `ctHexChar`/
 //! `ctHexNibble`). **Encoders are now exact 0; `hexdec` is exact 1.** `b64dec`
-//! is exact 0 since 2026-11-09: `b64ct` declassifies the verdict it returns
+//! is exact 0 since: `b64ct` declassifies the verdict it returns
 //! (its contract makes it public), so the accept/reject is no longer reported.
 //!
 //! ⚠ **`hexdec`'s 1 is the right answer and a 0 would be wrong.** It is
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("ctgrind_result={x}\n", .{key});
         },
         // The XSalsa20-Poly1305 core of `seal`/`open` (module code since the
-        // 2026-10-07 multi-block rewrite). The X25519 shared key and the
+        // Multi-block rewrite). The X25519 shared key and the
         // plaintext are tainted; the length (1100 B) drives every path: the
         // 8-block Salsa20 batch, single blocks, a partial block, and the
         // 4-way and one-lane Poly1305 loops plus the padded final block.

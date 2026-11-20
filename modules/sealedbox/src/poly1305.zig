@@ -258,7 +258,7 @@ test "finish reduces every limb state carry can leave, edge states included" {
     // Random messages never reach the states where the full reduction's last
     // carry (limb 0 into limb 1) fires: it needs limbs 2..4 all ones AND limb 1
     // at 2^26 with limb 0 near the top. Dropping that carry survived the
-    // 2026-10-08 mutation run, so the edges are driven directly here against a
+    // Mutation run, so the edges are driven directly here against a
     // wide-integer reference: (sum f_k 2^(26k)) mod 2^130-5, + s mod 2^128.
     const M: u64 = mask26;
     const p: u256 = (1 << 130) - 5;
@@ -306,7 +306,7 @@ test "h near the modulus takes the reduced branch" {
 }
 
 test "lane sum: the carry after the four lanes are added is needed (finish alone cannot take the raw sum)" {
-    // Dropping `h = carry(1, sum)` survived the 2026-11-13 mutation run: with
+    // Dropping `h = carry(1, sum)` survived the mutation run: with
     // random messages the raw lane sum (limbs up to 2^28) lands in the state
     // that breaks `finish` only about once in 2^23. This message builds it.
     // r = 1, so each lane keeps its block's limbs. Four blocks of an exact
