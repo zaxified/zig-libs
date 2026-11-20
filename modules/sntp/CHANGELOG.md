@@ -5,16 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (245 mutants, 243 killed, 2 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 17 tests added in `src/mutation_test.zig` (boundary cases and a scripted loopback server that checks the request fields, the wall-clock T1/T4, the auth version and the truncation rule). No source change, no behaviour change.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-03** — **BREAKING:** `QueryError` gained `LocalAddressMismatch`, `InvalidAuthKey`, `AuthFailed`, `CryptoNak` and the four `SyncError` cases, so code that switches over it and hands the `else` to a `DecodeError` parameter no longer compiles: name the new cases (`example/main.zig` shows how). `decodeResponse` and `Sample` are unaffected.
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** with `QueryOptions.auth`, a wrong-MAC reply or a crypto-NAK no longer ends `query` early: it is discarded and the wait goes on, `AuthFailed`/`CryptoNak` are returned only at the deadline. `Auth.validate` refuses `key_id` 0. `Auth.compute/sign/verify` burn their stack (`burn.zig`, `stackprobe_test.zig`, shown red with the burn removed). `Timestamp` conversions take a u64 path (cheaper on 32-bit). Proved against chronyd 4.8 with a keyfile.
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** `query` now also runs `checkSynchronization` (RFC 5905 freshness, root distance, causality; `QueryOptions.check_sync = false` restores the old behaviour) and may return `StaleReference`/`RootDistanceExceeded`/`TransmitBeforeReference`. Offset and delay are computed modulo the NTP era (`Timestamp.diffNanos`), so they are right across the 2036 rollover. New: `Auth` symmetric-key MAC (md5, sha1, sha256, sha512, AES-CMAC) via `QueryOptions.auth`, `QueryOptions.local_address`, `toUnixNanosInferEra`/`toUnixNanosNear`, `Sample.minErrorNanos`, `QueryResult.rootDistanceNanos`, `Packet.rootDelayNanos`/`pollSeconds`/`precisionSeconds`/`referenceText`.
 
 - **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). `query` checks the originate nonce first: a datagram from the server address that is short, malformed or echoes the wrong nonce is discarded and the wait goes on to the same deadline; Kiss-o'-Death / unsynchronized verdicts are honoured only from a reply that echoes our nonce (a spoofed KoD ended the query). `Timestamp.fromUnixNanos` saturates instead of overflowing past NTP-ns 2^64.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.
 - **2026-10-09** — tests: deterministic fuzz driver `SNTP_FUZZ` over the existing harnesses.
 
 - **2026-10-05** — **Anchoring: a real chronyd, beevik/ntp and ntplib judge `query` and the codec**

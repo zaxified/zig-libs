@@ -83,9 +83,10 @@ and raw 4-byte reason from `reference_id`, per RFC 5905 §7.4), `UnsynchronizedS
 4330 §4's own "alarm condition, clock not synchronized" — the same verdict `UnsynchronizedStratum`
 reaches by a different field), `ReceiveTimestampUnset` and `TransmitTimestampUnset` (the server
 hasn't set its own clock yet). `query` forwards its own `kiss_out: ?*KissOfDeath` parameter the same
-way, and (`OriginateMismatch` stays in the set, but `query` now discards such a reply and keeps waiting instead of returning it),
-`EntropyUnavailable` (couldn't source fresh entropy for that nonce — fails closed rather than using a
-predictable one), and `ClockUnavailable` (the local clock couldn't be read for T1/T4).
+way, and adds `EntropyUnavailable` (couldn't source fresh entropy for the origin nonce — fails closed rather than
+using a predictable one) and `ClockUnavailable` (the local clock couldn't be read for T1/T4). A reply that does not
+echo the nonce is discarded and `query` keeps waiting; `OriginateMismatch` is a member of `QueryError` that `query`
+does not return.
 
 **Security note:** this module is a single unauthenticated UDP exchange. `query` validates the reply
 thoroughly (RFC 4330 §5's checks, including the peer address/port and an anti-spoof origin nonce) but
@@ -96,12 +97,12 @@ layered on top — this module doesn't provide it.
 
 **Era rollover (2036-02-07):** offset, delay and `Sample.minErrorNanos` are
 computed modulo the NTP era (`Timestamp.diffNanos`), so an exchange across the
-wrap is exact and hostile timestamps are bounded to +-68 years.
+wrap is correct to the 1-2 ns of the fraction truncation and hostile timestamps are bounded to +-68 years.
 `toUnixNanosInferEra()` (1970..2106) and `toUnixNanosNear(pivot)` read a wire
 timestamp as Unix time in the right era. Only `nanosSinceNtpEpoch` / `toUnixNanos`
 remain era-0.
 
-**Newer API (2026-11-03):** `checkSynchronization(reply)` (RFC 5905 freshness
+**Further API:** `checkSynchronization(reply)` (RFC 5905 freshness
 36 h, root distance 16 s, causality; `query` runs it unless
 `QueryOptions.check_sync = false`), `QueryResult.rootDistanceNanos()` /
 `minErrorNanos()`, `Packet.rootDelayNanos/rootDispersionNanos/pollSeconds/
@@ -130,11 +131,9 @@ offset), and `query`'s receive-side guards (peer address/port match,
 truncation, origin-nonce echo) exercised directly, without a socket. The live
 `query` test is gated behind `error.SkipZigTest`.
 
-## Deferred (not in v1)
+## Not provided
 
-- Full NTP (RFC 5905): the intersection/clustering/combining algorithms.
-- Server side.
-- NTS and extension fields (without a key only the plain 48-byte packet is
-  parsed; longer packets are `InvalidLength`). TTL option (std has none).
-- Leap-second handling beyond surfacing the `LeapIndicator` flag.
-- Multi-server sampling / racing and best-sample selection.
+Full NTP (RFC 5905 selection/clustering), a server side, NTS and extension fields (without a key only the plain
+48-byte packet is parsed; longer packets are `InvalidLength`), multi-server sampling, leap-second handling beyond the
+`LeapIndicator` flag, NTPv5, kernel receive timestamps; no TTL option (std has none). See `SPEC.md` *What is
+deliberately not done* and *Backlog / deferred*.

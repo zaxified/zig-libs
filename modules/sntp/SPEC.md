@@ -45,15 +45,16 @@ Surveyed 2026-09-30 and re-surveyed against beevik/ntp v1.6.0 on 2026-11-02 per 
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [beevik/ntp](https://github.com/beevik/ntp) — **reference** (pinned v1.6.0, read in full: BSD-2-Clause) | Go | BSD-2-Clause | 620 | v1.6.0 (2026-09-24) | The de-facto Go SNTP client library. Its README: `Time` and `Query` with a `Response` carrying ClockOffset, RTT, Precision, Stratum, ReferenceID, RootDelay/RootDispersion/RootDistance, Leap, MinError, KissCode, Poll, plus `Validate`. We return the same raw fields (`Packet.poll`/`precision`, root delay/dispersion, `KissOfDeath`) and validate inside `decodeResponse`; derived RootDistance/MinError are not provided. Takes a hostname; ours takes an `IpAddress` (name resolution is the sibling `dns` module). |
+| [beevik/ntp](https://github.com/beevik/ntp) — **reference** (pinned v1.6.0, read in full: BSD-2-Clause) | Go | BSD-2-Clause | 620 | v1.6.0 (2026-09-24) | The de-facto Go SNTP client library. Its README: `Time` and `Query` with a `Response` carrying ClockOffset, RTT, Precision, Stratum, ReferenceID, RootDelay/RootDispersion/RootDistance, Leap, MinError, KissCode, Poll, plus `Validate`. We return the same raw fields (`Packet.poll`/`precision`, root delay/dispersion, `KissOfDeath`) and validate inside `decodeResponse` and `checkSynchronization`; derived RootDistance/MinError are `QueryResult.rootDistanceNanos` / `Sample.minErrorNanos`. Takes a hostname; ours takes an `IpAddress` (name resolution is the sibling `dns` module). |
 | [vpetrigo/sntpc](https://github.com/vpetrigo/sntpc) — not timed | Rust | Apache-2.0 | 75 | v0.11.0 (2026-07-06) | SNTPv4 client, unicast only; `no_std`-capable with a synchronous API, optional root-dispersion estimation and OS time-sync utilities (its README). Per this module's SPEC it documents the same era-0 gap *(inferred)*. |
 | [pendulum-project/ntpd-rs](https://github.com/pendulum-project/ntpd-rs) | Rust | MIT OR Apache-2.0 (`LICENSE-MIT` + `LICENSE-APACHE` per the survey playbook; API says NOASSERTION) | 1.1k | v1.9.0 (2026-06-12) | A full NTP daemon and NTS client, not a query library: intersection/clustering, NTS, server mode. A different product; here only the single-query client. |
 | [mlichvar/chrony](https://github.com/mlichvar/chrony) | C | GPL-2.0 | 220 | push 2026-08-27 | Full NTP implementation (source not read; GPL). Same category as ntpd-rs: daemon with filtering and authentication, out of scope for SNTP. |
-| [python-ntplib 0.4.0](https://pypi.org/project/ntplib/) — informational, not a "fastest" | Python | MIT | — | 0.4.0 | `NTPStats` decode + offset/delay on floats; no origin check, no suitability checks, no auth; timed in `tools/ntplib_bench.py` at 176 µs per the same 64 replies, but it does less work, so it is not a like-for-like candidate. |
+| [python-ntplib 0.4.0](https://pypi.org/project/ntplib/) — informational, not a "fastest" | Python | MIT | — | 0.4.0 | `NTPStats` decode + offset/delay on floats; no origin check, no suitability checks, no auth; timed in `tools/ntplib_bench.py` for the same 64 replies, but it does less work, so it is not a like-for-like candidate. |
 | [FObersteiner/ntp_client](https://codeberg.org/FObersteiner/ntp_client) | Zig | MIT | — (Codeberg) | not fetched | Zig SNTP client whose packet layout and offset/delay design this module's README says it mirrors (clean-room); not re-read in this survey. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No NTP/SNTP at all (this module's README). |
 
-**Where we are ahead:** of every Zig alternative on hardening — RFC 4330 §5 checks incl. peer address+port match, a 32-bit CSPRNG origin nonce (fail-closed), truncation detection, Kiss-o'-Death codes parsed per RFC 5905 §7.4, exact i128 offset/delay, and a real captured `time.google.com` reply as an anchor. **Where we are behind:** no NTS and no extension fields, no TTL option (std lacks it), no kernel receive timestamps, no multi-server sampling (→ Backlog). Full NTP (RFC 5905 selection/clustering) and server mode are chrony/ntpd-rs territory, not an SNTP library's.
+**Where we are ahead:** of every Zig alternative on hardening — RFC 4330 §5 checks incl. peer address+port match, a 32-bit CSPRNG origin nonce (fail-closed), truncation detection, Kiss-o'-Death codes parsed per RFC 5905 §7.4, exact i128 offset/delay, and a real captured `time.google.com` reply as an anchor. **Where we are behind:** no NTS and no extension fields, no TTL option (std lacks it), no kernel receive timestamps, no multi-server sampling (→ *What is deliberately not done*; TTL and the ranking against the slower Rust and Go clients → Backlog). Full NTP (RFC 5905 selection/clustering) and server mode are chrony/ntpd-rs territory, not an SNTP library's.
+
 
 ## Design & invariants
 
@@ -87,11 +88,9 @@ stratum 0 — the parsed reason code and raw `reference_id` bytes are returned v
 `kiss_out: ?*KissOfDeath` parameter, per RFC 5905 §7.4's registered Kiss Code table;
 `error.UnsynchronizedStratum` on stratum ≥ 16, per RFC 5905 §7.3 Figure 11 — 16 is "unsynchronized",
 17-255 "reserved"), Leap Indicator (`error.UnsynchronizedLeap` if LI = 3 — RFC 4330 §4's own "alarm
-condition, clock not synchronized"; audit finding F7 — this used to be checked on the stratum field
-only, an inconsistency, not a deliberate leniency), and the Receive and Transmit timestamps
+condition, clock not synchronized"; the same verdict a stratum ≥ 16 reply reaches through another field), and the Receive and Transmit timestamps
 (`error.ReceiveTimestampUnset` / `error.TransmitTimestampUnset` if either is all-zero, RFC 4330 §5
-sanity check 4 — audit finding F3 found only Transmit was checked, so a server reporting Receive = 0
-drove `query`'s offset to an unbounded, measured -63 years) before any field is trusted.
+sanity check 4 — a server reporting Receive = 0 would otherwise drive `query`'s offset to about -63 years) before any field is trusted.
 
 `query` layers RFC 4330 §5's *other* sanity check on top of `decodeResponse` — matching the reply
 against the client's own outstanding request — and it is fully implemented, not out of scope: the
@@ -100,89 +99,88 @@ keeps waiting, RFC 4330 §5), and must echo an anti-spoof origin nonce in its `o
 it's discarded like a datagram from another source (a truncated, not-48-byte or wrong-nonce datagram
 never ends `query`: it keeps waiting to the same absolute deadline, and Kiss-o'-Death / unsynchronized
 verdicts are honoured only from a reply that echoes the nonce). The nonce isn't `query`'s literal T1 clock reading —
-audit finding F4 measured the clock-derived timestamp at only 21-24 bits of unpredictability against
-`verifyOriginate`'s claimed 64, so `query` sends the true send second with 32 CSPRNG bits (from
+a clock-derived timestamp has only 21-24 bits of unpredictability (measured), against the 64 `verifyOriginate`
+would claim, so `query` sends the true send second with 32 CSPRNG bits (from
 `std.Io.randomSecure`, fail-closed — `error.EntropyUnavailable` rather than a weaker degraded seed)
 in place of the fraction, and uses the real clock reading (not the nonce) for the offset/delay math,
 so the substitution costs no accuracy. The receive-side guards (peer match, nonce echo, and a
-truncated-datagram check for audit finding F2 — the kernel silently hands back exactly 48 bytes for
+truncated-datagram check — the kernel silently hands back exactly 48 bytes for
 an oversized datagram too, distinguishable only via the receive call's truncation flag) live in
-`processReply`/`validateReply`, unit-tested directly without a socket (audit finding F1: `query`'s
-own receive loop held these guards in a form no test reached before).
+`processReply`/`validateReply`, unit-tested directly without a socket.
 
 Reading the local clock can itself fail; `nowUnixNanos`/`nowTimestamp` fail closed with
-`error.ClockUnavailable` rather than the previous silent fallback to the Unix epoch (audit finding
-F11 — an untested path, but a fail-open default that would have produced a garbage T1/T4 with no
-signal to the caller).
+`error.ClockUnavailable` rather than silently falling back to the Unix epoch (a fail-open default
+would produce a garbage T1/T4 with no signal to the caller).
 
-Out of scope: NTS and extension fields (without a key, longer packets are rejected as
-`error.InvalidLength`), server-side responder, multi-server sampling/racing and
-best-sample selection, full NTP (RFC 5905) intersection/clustering/combining algorithms, leap-second
-handling beyond surfacing the raw `LeapIndicator` flag, and the "truly paranoid," explicitly-optional
-Root Delay/Root Dispersion bound. A caller needing tamper-resistant time sync (e.g. NTS) must layer
+Out of scope: see *What is deliberately not done* (without a key, longer packets, extension fields included, are
+rejected as `error.InvalidLength`). A caller needing tamper-resistant time sync (e.g. NTS) must layer
 that itself — this module is a single unauthenticated query/response, and its offset/delay should
 never by itself step a security-sensitive clock (TLS validity windows, TOTP, Kerberos, log
 ordering): a single unauthenticated UDP exchange, even with every check above passing, is not a
-substitute for authenticated time sync on a hostile network (audit finding F12 — this caveat existed
-only as half a sentence in this file before, not anywhere a caller reading the API would see it; see
-also README.md).
+substitute for authenticated time sync on a hostile network (see also README.md).
 
-**Era rollover (2036-02-07) — handled for the exchange, bounded elsewhere (2026-11-03):** `Timestamp.seconds` is a `u32` on the wire and wraps at 2^32 s. Offset, delay and `minErrorNanos` use `Timestamp.diffNanos`, the difference folded into +-half an era (RFC 5905 §6), so an exchange spanning or after the wrap is correct to the 1-2 ns of the fraction truncation (not "exact"), a server more than 68 years off folds into a plausible-looking offset, and any hostile timestamp yields a value bounded to +-68.1 years (no overflow, no trap; swept). `toUnixNanosInferEra` (1970..2106, no clock needed) and `toUnixNanosNear(pivot)` convert to Unix time across the wrap. Still era-0-only: `nanosSinceNtpEpoch` and `toUnixNanos` (documented as such). The old tripwire test is gone: nothing in the exchange breaks in 2036 any more.
+**Era rollover — handled for the exchange, bounded elsewhere:** the NTP era wraps on 2036-02-07. `Timestamp.seconds` is a `u32` on the wire and wraps at 2^32 s. Offset, delay and `minErrorNanos` use `Timestamp.diffNanos`, the difference folded into +-half an era (RFC 5905 §6), so an exchange spanning or after the wrap is correct to the 1-2 ns of the fraction truncation (not "exact"), a server more than 68 years off folds into a plausible-looking offset, and any hostile timestamp yields a value bounded to +-68.1 years (no overflow, no trap; swept). `toUnixNanosInferEra` (1970..2106, no clock needed) and `toUnixNanosNear(pivot)` convert to Unix time across the wrap. Still era-0-only: `nanosSinceNtpEpoch` and `toUnixNanos` (documented as such).
 
-**MD5 and SHA-1 MACs are legacy only** (what deployed ntpd/chrony keyfiles still use); prefer AES-CMAC or SHA-2 where the server has it (precedent `modules/snmp/SPEC.md:167`).
+**MD5 and SHA-1 MACs are legacy only** (what deployed ntpd/chrony keyfiles still use); prefer AES-CMAC or SHA-2 where the server has it (the same stance as the sibling `snmp` module).
 
-**What a believing client must refuse (checked list, 2026-11-03):** origin cookie echo first (a forged reply, KoD included, without it is discarded); with a key, the MAC before anything the packet says: a wrong-MAC reply or a crypto-NAK is discarded and `query` keeps waiting (both can be forged, a NAK without any key; at the deadline the last one seen is returned as `AuthFailed`/`CryptoNak`, no proof of a key mismatch), a reply with no MAC and an unsigned KoD are discarded silently (plain `Timeout`: the back-off signal is lost for an unsigned KoD by design); then RFC 4330 §5 (`decodeResponse`: length, VN, mode, stratum 0/16+, LI 3, zero T2/T3); then `checkSynchronization` (reference older than 36 h, root distance over 16 s, T3 before reference, T3 before T2, zero reference skipped). Not defended: an on-path attacker who sees our request (needs the key) and a server that is plainly wrong but self-consistent; a big offset is returned, not clamped, so the caller decides (see the security caveat above).
+**What a believing client must refuse (checked list):** origin cookie echo first (a forged reply, KoD included, without it is discarded); with a key, the MAC before anything the packet says: a wrong-MAC reply or a crypto-NAK is discarded and `query` keeps waiting (both can be forged, a NAK without any key; at the deadline the last one seen is returned as `AuthFailed`/`CryptoNak`, no proof of a key mismatch), a reply with no MAC and an unsigned KoD are discarded silently (plain `Timeout`: the back-off signal is lost for an unsigned KoD by design); then RFC 4330 §5 (`decodeResponse`: length, VN, mode, stratum 0/16+, LI 3, zero T2/T3); then `checkSynchronization` (reference older than 36 h, root distance over 16 s, T3 before reference, T3 before T2, zero reference skipped). Not defended: an on-path attacker who sees our request (needs the key) and a server that is plainly wrong but self-consistent; a big offset is returned, not clamped, so the caller decides (see the security caveat above).
+
+## What is deliberately not done
+
+- **Full NTP (RFC 5905)** — the intersection/clustering/combining algorithms, and the "truly paranoid",
+  explicitly-optional Root Delay/Root Dispersion bound: that is daemon territory (chrony, ntpd-rs), not an
+  SNTP query library.
+- **Server side** — client/query only.
+- **Multi-server sampling / racing and best-sample selection** — `query` is a single one-shot request to one
+  server; beevik/ntp has none either.
+- **Leap-second handling** — only the raw `LeapIndicator` flag surfaces; there is no adjustment logic.
+- **Extension fields and NTS** — they change the packet length and NTS is TLS-keyed AEAD, a different
+  protocol (daemon territory, ntpd-rs); without a key, longer packets stay `InvalidLength`.
+- **NTPv5** — an unfinished IETF draft with no deployed servers *(inferred)*; version 3 and 4 requests only
+  (`QueryOptions.version`).
+- **Kernel receive timestamps (`SO_TIMESTAMPNS`)** — `std.Io.net` exposes no ancillary data; T4 is read right after
+  the receive.
 
 ## Verification
 
-Offline, no live server: golden request bytes (the `LI|VN|Mode` byte + T1 placement), packet
-encode/decode round-trip, a canned server response (stratum/precision/timestamps/ref-id), the
-reject paths (length, version 0, mode, Kiss-o'-Death — including the parsed `KissCode`/`raw` surfaced
-via `kiss_out` for both a registered code and an unrecognized one, `parseKissCode` against every
-RFC 5905 §7.4 registered code, stratum ≥ 16, Leap Indicator 3, an all-zero Receive Timestamp, an
-all-zero Transmit Timestamp), NTP↔Unix epoch conversion at a known instant, fraction↔nanosecond
-round-trips, offset/delay against hand-computed T1..T4 (including a negative offset), and
-`processReply`/`validateReply` (peer-address match, truncation, origin-nonce echo, and that the
-offset math uses the real T1 rather than the wire nonce) exercised directly, without a socket. The
-live `query` test is gated behind `error.SkipZigTest`. Run: `zig build test-sntp`.
+Offline, no live server. Run `scripts/modtest sntp`; the live `query` test is gated behind `error.SkipZigTest`, and the
+scripted loopback "server" tests skip themselves when the sandbox refuses a loopback bind.
 
-## Audit 2026-11-17 (whole-module mutation)
-
-245 mutants over every non-test line of `src/root.zig` (up to `deadlineFromMs`): the `Timestamp` conversions (shifts, the u64 fast path of `fromWideNanos`, the pre-1900 clamp, the era fold of `diffNanos`, `toUnixNanosInferEra` / `Near`), the `Packet` helpers and the codec (every shift, byte slice and endianness of `encode` / `decode`, the length check), `isKissCode` and `parseKissCode`, every condition of `decodeResponse` (VN, mode, the stratum 0 / 15 / 16 edges, LI 3, T2 / T3 zero, the kiss reason and raw bytes) and `verifyOriginate`, every condition of `checkSynchronization` (boundaries, operand order, the lambda terms), `Auth` (key limits per algorithm, `macLen` per algorithm and version, the MAC input, the trailer layout and length, the NAK / key id / length branches of `verify`, the compared bytes), offset / delay / `minErrorNanos` / `rootDistanceNanos`, the clock reads, and `query` with `processReply` / `validateReplyPolicy` (nonce, request fields, signing, policy, the deferred auth error, the trunc flag, which timestamp feeds which sample slot). One schemata build in ReleaseSafe, baseline first; 206 died on the existing suite, 39 survived.
-
-17 tests added in `src/mutation_test.zig`. Eleven are boundary cases the survivors named (`isZero` with only the fraction set, the first nanosecond after 1900, `seconds == 2208988800` in `toUnixNanosInferEra`, rounding in `toUnixNanosNear` at 0.4 / 0.5 / 0.6 era and far below the pivot, root delay and dispersion read from their own fields, `pollSeconds` at 0 / 62 / 63, `referenceText` on 0x1f / 0x20 / 0x7e / 0x7f / 0x80, the kiss-code byte range, T3 == reference and lambda exactly 16 s, CMAC keys one byte too long, a 52-byte datagram that is no NAK and a datagram one byte past the MAC). Six use a scripted loopback "server" that records the request and answers with a clock 10 s ahead after holding the packet 60 ms: offset and delay from the wall clock (T1 and T4 are `ioTimestamp` reads), the request is exactly mode 3 + the asked version + a nonce that keeps the current second and has a non-zero random fraction, `timeout_ms = 0` waits, `check_sync` decides a 100 s root dispersion, a version-3 SHA-256 key signs and verifies with the 32-byte MAC both ways, a signed reply padded past the receive buffer is discarded by the trunc flag (not verified at its cut length), and an unusable key is refused before a local port that is already taken could fail the bind. All 245 mutants but two die; the loopback tests skip themselves when the sandbox refuses a loopback bind.
-
-2 do not, no defect:
-
-- EQUIVALENT: `fromUnixNanos` clamping at `ntp_ns < 0` instead of `<= 0`: `ntp_ns == 0` reaches `fromWideNanos(0)`, which is `.zero` as well.
-- UNOBSERVABLE: the `defer secureZero(mac)` of `Auth.verifyBody`: the `burn.run` around every keyed entry point overwrites the dead frame below it anyway, and the stack probe (ReleaseFast only) sees the state after the burn. Seeing it needs a probe of the unburned frame, where `std`'s hash frames hold residue at baseline. Kept as defence in depth.
-
-Not mutated: the 14 rows of the `parseKissCode` table (data; the "every RFC 5905 §7.4 code" test pins all of them), the `u64` fast-path bound of `fromWideNanos` (`<=` versus `<` at `maxInt(u64)` is cost-only: both paths compute the same value), the Windows branch of `nowUnixNanos`, the debug assert in `verifyBody`, comptime constants and defaults (`packet_len`, `max_reference_age_s`, `max_root_distance_s`, `QueryOptions` defaults), and every test file. Counts on the card are whole-module.
+- **Codec and arithmetic:** golden request bytes (the `LI|VN|Mode` byte and T1 placement), packet encode/decode
+  round trip, a canned server response (stratum, precision, timestamps, reference id), NTP↔Unix epoch conversion at
+  a known instant, fraction↔nanosecond round trips, offset/delay against hand-computed T1..T4 (including a negative
+  offset), the era fold of `diffNanos` and `toUnixNanosInferEra` / `toUnixNanosNear` (sweeps over arbitrary values).
+- **Reject paths:** length, version 0, mode, Kiss-o'-Death (the parsed `KissCode` and raw bytes through `kiss_out`
+  for a registered and an unrecognized code; `parseKissCode` against every RFC 5905 §7.4 registered code), stratum ≥ 16,
+  Leap Indicator 3, all-zero Receive and Transmit timestamps, `checkSynchronization` boundaries (36 h, 16 s,
+  T3 vs T2 and reference) over hostile packets.
+- **Receive-side guards:** `processReply` / `validateReply` exercised directly, without a socket — peer address and
+  port match, truncation, origin-nonce echo, that the offset math uses the real T1 and not the wire nonce; forged
+  replies (wrong-nonce KoD, short datagram) are skipped and the genuine reply after them wins; with a key, a forged
+  NAK or wrong-MAC reply does not end the wait and a lone NAK is `CryptoNak` at the deadline.
+- **Authentication:** known answers for every algorithm (Python `hashlib` output and the RFC 4493 vectors), key limits,
+  the MAC input and trailer layout, `Auth.verify` / `sign` / `compute` over every length, key size and algorithm.
+- **Loopback `query` tests:** a scripted server that records the request and answers with a clock ahead after holding
+  the packet: offset and delay from the wall clock, the request is exactly mode 3 + the asked version + a nonce that
+  keeps the current second with a random fraction, `timeout_ms = 0` waits, `check_sync` decides a large root
+  dispersion, a version-3 SHA-256 key signs and verifies both ways, an oversized signed reply is discarded by the
+  truncation flag, an unusable key and a mismatched local address are refused before a socket is bound.
+- **Oracles:** `src/ntp_oracle_test.zig` replays the replies a real chronyd 4.8 sent, judged with beevik/ntp and ntplib
+  (producer `tools/interop.zig` + `tools/ntp_oracle.py` → `src/ntp_oracle_vectors.zig`); a real `time.google.com`
+  reply frozen in `src/root.zig`; see *Anchoring*.
+- **Fuzz:** `SNTP_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `sntp-decodeResponse`;
+  an in-suite run of 400 seeds checks that it reaches every outcome.
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast) shows no MAC key residue after `compute` / `sign` / `verify`
+  for any algorithm; every keyed entry point runs one frame down and burns it (`src/burn.zig`).
+- **Bench:** `zig build bench-sntp` against beevik/ntp (`tools/README.md`); the card's Performance line carries the figures.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **RFC 5905 freshness / root-distance checks:** done 2026-11-03 (`checkSynchronization`, on in `query`).
-
-- **Full NTP (RFC 5905)** — the intersection/clustering/combining algorithms are not built.
-- **Server side** — not built; client/query only.
-- **NTP authentication (symmetric key)** — done 2026-11-03 (`Auth`). **Extension fields / NTS** — rejected: different protocol (TLS-keyed AEAD); longer packets stay `InvalidLength` without a key.
-- **Leap-second handling** — only the raw `LeapIndicator` flag surfaces; no adjustment logic.
-- **Multi-server sampling / racing and best-sample selection** — not built; `query` is a single
-  one-shot request to one server.
-- **NTP era 0 rollover (2036-02-07)** — done for the exchange 2026-11-03, see "Era rollover".
-- **Not measured for the "fastest" mark (2026-11-03):** Rust sntpc and ntpd-rs (no crate in the cargo registry on this host, offline), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`.
+- **TTL/DSCP option:** `std.Io.net.BindOptions` offers no socket option (checked in Zig 0.17.0 `std/Io/net.zig`; not a zig-libs module gap); revisit when std grows one.
+- **Not measured for the "fastest" mark:** Rust sntpc and ntpd-rs (no crate in the cargo registry on the measuring host, offline), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`.
 - **`TransmitBeforeReceive` could refuse a coarse-clock server** whose T2 and T3 straddle a tick in the wrong order after truncation; `query` has `check_sync = false` for it. Revisit if a real server trips it (none of chronyd 4.8's replies did).
-- **RootDistance / MinError helpers** — done 2026-11-03.
-- **Local bind address** — done 2026-11-03. **TTL/DSCP** — deferred: `std.Io.net.BindOptions` offers no socket option (Zig 0.17.0); revisit when std grows one.
-- **NTPv5 (draft), kernel receive timestamps (SO_TIMESTAMPNS)** — rejected, see Compared with.
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any (portable codec; local timestamps via libc-free clock_gettime/RtlGetSystemTimePrecise) ·
-client · reentrant` + deps: none (std only; `std.Io.net` for the UDP query) — canonical source is
-`pub const meta` in src/root.zig.
 
 ## Anchoring
 
@@ -191,10 +189,6 @@ client · reentrant` + deps: none (std only; `std.Io.net` for the UDP query) —
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
-**What the tests actually contain.** src/ntp_oracle_test.zig replays replies a real chronyd 4.8 sent (`tools/interop.zig` + `tools/ntp_oracle.py` → `ntp_oracle_vectors.zig`; chronyd unprivileged with `-x` in `unshare -rn`, a fresh one per scenario): synchronized at stratum 3 to request versions 1-4 (and `query` over IPv6) and at stratum 10, unsynchronized (no reference), rate limiting with Kiss-o'-Death RATE, denying the client. `query` and the codec path (`Packet.encode`, `decodeResponse`, `verifyOriginate`, `Sample` — what a consumer with its own socket drives) were run live; the truth is the server's configuration (stratum, no leap warning, the request's version echoed, Reference ID LOCL, an offset of about zero on one clock); beevik/ntp v1.6.0 (the Go reference client, `tools/go_oracle`) reached the same accept/refuse verdicts and the same RATE kiss on the same servers; ntplib recomputed offset and delay from the very same bytes (within 2 µs, its f64). One named divergence: beevik/ntp calls the unsynchronized reply (LI=3, stratum 0, Reference ID 0) a Kiss-o'-Death; RFC 4330 §8 / RFC 5905 §7.4 make a KoD a stratum-0 reply carrying an ASCII kiss code, so this module says `UnsynchronizedLeap`. The `time.google.com` capture below stays. Self only: nothing on the wire path
+**What the tests actually contain.** src/ntp_oracle_test.zig replays replies a real chronyd 4.8 sent (`tools/interop.zig` + `tools/ntp_oracle.py` → `ntp_oracle_vectors.zig`; chronyd unprivileged with `-x` in `unshare -rn`, a fresh one per scenario): synchronized at stratum 3 to request versions 1-4 (and `query` over IPv6) and at stratum 10, unsynchronized (no reference), rate limiting with Kiss-o'-Death RATE, denying the client. `query` and the codec path (`Packet.encode`, `decodeResponse`, `verifyOriginate`, `Sample` — what a consumer with its own socket drives) were run live; the truth is the server's configuration (stratum, no leap warning, the request's version echoed, Reference ID LOCL, an offset of about zero on one clock); beevik/ntp v1.6.0 (the Go reference client, `tools/go_oracle`) reached the same accept/refuse verdicts and the same RATE kiss on the same servers; ntplib recomputed offset and delay from the very same bytes (within 2 µs, its f64). One named divergence: beevik/ntp calls the unsynchronized reply (LI=3, stratum 0, Reference ID 0) a Kiss-o'-Death; RFC 4330 §8 / RFC 5905 §7.4 make a KoD a stratum-0 reply carrying an ASCII kiss code, so this module says `UnsynchronizedLeap`. The real `time.google.com` reply frozen in `src/root.zig` stays, its live `query` test skipped by design. Self only: nothing on the wire path
 
-**Real chronyd 4.8, 2026-11-03** (`zig build interop-sntp`, unprivileged, `unshare -rn`, loopback only): the default `check_sync` accepts a healthy stratum-3 server (versions 1-4, IPv4 and IPv6); with a chrony `keyfile`, `query` with `Auth` was accepted by chronyd and chronyd's signed replies verified for MD5, SHA-1, SHA-256 and SHA-512 and AES-128-CMAC over NTPv4 (SHA-256/SHA-512 with the 20-byte truncated MAC) and SHA-256/SHA-512 over NTPv3 (full MAC); a wrong key gets no answer (`Timeout`). AES-256-CMAC was not run against a real server (known answers only).
-
-**NTP oracle 2026-10-05.** One defect, fixed the same day: the unsynchronized server's reply came back as `KissOfDeath` with code `.unrecognized` — a caller that honours KoD would back off from (or, reading it as DENY-like, stop asking) a server that only had no time yet; stratum 0 is now a KoD only with an ASCII kiss code, otherwise `UnsynchronizedLeap` (LI=3) or `UnsynchronizedStratum`.
-
-**How it got there.** The anchoring work landed. DONE d0e30ca: real time.google.com reply frozen; live test stays skipped by design
+**Real chronyd 4.8** (`zig build interop-sntp`, unprivileged, `unshare -rn`, loopback only): the default `check_sync` accepts a healthy stratum-3 server (versions 1-4, IPv4 and IPv6); with a chrony `keyfile`, `query` with `Auth` was accepted by chronyd and chronyd's signed replies verified for MD5, SHA-1, SHA-256 and SHA-512 and AES-128-CMAC over NTPv4 (SHA-256/SHA-512 with the 20-byte truncated MAC) and SHA-256/SHA-512 over NTPv3 (full MAC); a wrong key gets no answer (`Timeout`). AES-256-CMAC was not run against a real server (known answers only).
