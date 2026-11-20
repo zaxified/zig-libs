@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-10-30 (40/49, 9 eq) · src 3198cdd641d8d598
 
-Audit detail: the 2026-11-01 review is a delta over `sweep_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
-
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: exported memcpy/memset trap on a null pointer with a non-zero length instead of `.?` UB, frameless kept (objdump); delta: both forms die by signal, argued eq)
 
 **Performance:** ref 0.10–1.01× musl 1.2.5 memset/memcpy · fastest 0.57–1.08× glibc 2.43 memset/memcpy (measured 2026-10-26)
@@ -27,23 +25,23 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [musl libc](https://git.musl-libc.org/cgit/musl) `memset` — **reference** | C | MIT (COPYRIGHT: "standard MIT license", verified) | — (no GitHub mirror under bminor) | 1.2.x *(inferred)* | The libc `memset` a no-libc Zig binary would otherwise want: same C semantics (returns `dest`, low byte of `c`, length 0 writes nothing) as here. Design named in this module's README as the model (overlapping first/last vector). **Measured 2026-10-10** (see § Performance): ours/musl 0.40–1.05, worst 4 KiB aligned (1.05, level at 64 KiB and 1 MiB); ours/glibc 0.69–1.62, worst at 256 B (1.45–1.62). Before the `rep stosq` path (same bench, sides alternating): 1.23–1.32 against both at 1 MiB. Zig `compiler_rt` `@memset` is 2.7–29× slower than ours over the same sizes. |
-| Zig `compiler_rt` `memset` (Zig 0.16.0, `lib/compiler_rt.zig`) | Zig | MIT | — | Zig 0.16.0 | What every no-libc Zig binary gets today: a weak export, scalar, per this module's README one byte per iteration; measured 20-27x slower here (README table). |
+| [musl libc](https://git.musl-libc.org/cgit/musl) `memset` — **reference** | C | MIT (COPYRIGHT: "standard MIT license", verified) | — (no GitHub mirror under bminor) | 1.2.x *(inferred)* | The libc `memset` a no-libc Zig binary would otherwise want: same C semantics (returns `dest`, low byte of `c`, length 0 writes nothing) as here. Design named in this module's README as the model (overlapping first/last vector). Measured with `bench-fastmem` (see § Performance; the card has the figures). |
+| Zig `compiler_rt` `memset` (Zig 0.16.0, `lib/compiler_rt.zig`) | Zig | MIT | — | Zig 0.16.0 | What every no-libc Zig binary gets today: a weak export. On Zig 0.16 `memset` was scalar, one byte per iteration, 20-27x slower than this module (README table). On 0.17.0 `memset` is vectorised (`fastMemset`; byte-wise only in ReleaseSmall) and `memcpy` copies element by element with no string move; this module is still 1.0–1.8x faster on `memset` and 1.1–2.0x on `memcpy`. |
 | [rust-lang/compiler-builtins](https://github.com/rust-lang/compiler-builtins) `mem` | Rust | MIT OR Apache-2.0 (README verified; API says NOASSERTION) | 519 | libm-v0.2.16 (2026-01-24); push 2026-09-29 | Rust's counterpart to compiler_rt: a fallback `memset` for targets without libc, which vector-wide paths on x86 *(inferred, not read)*. Same niche and same opt-in-by-linking story. |
 | Go runtime `memclrNoHeapPointers` ([golang/go](https://github.com/golang/go)) | Go (asm) | BSD-3-Clause | 139k | push 2026-09-29 | A zeroing primitive only (no arbitrary fill byte); the technique this module's README names as a model. Not usable outside Go. |
-| glibc `memset` | C | LGPL-2.1+ (not verified; source not read) | — | — | Per-CPU IFUNC variants (ERMS `rep stosb`, AVX2/AVX-512) *(inferred)*; needs libc, which this module exists to avoid. It, not this module, is faster past a few KiB on ERMS CPUs, which this module's SPEC lists as deliberately not done. |
+| glibc `memset` | C | LGPL-2.1+ (not verified; source not read) | — | — | Per-CPU IFUNC variants (ERMS `rep stosb`, AVX2/AVX-512) *(inferred)*; needs libc, which this module exists to avoid. It, not this module, is faster past a few KiB on ERMS CPUs, which this module lists as deliberately not done. |
 
-**Where we are ahead:** of `compiler_rt` (the only alternative without libc): 20-27x at 256 B-16 KiB, including every `std.crypto.secureZero` and the deflate table clear in std; a strong-symbol export proved by a test that resolves the linked `memset`; a compile error rather than silently interposing when libc is linked. **Where we are behind:** no per-CPU dispatch and no non-temporal path for clears or copies larger than the cache (SPEC "What is deliberately not done"; glibc's non-temporal `memcpy` is 1.4–1.6× faster at 4 MiB); `memmove`/`bcmp` are not provided (SPEC "What this module is").
+**Where we are ahead:** of `compiler_rt` (the only alternative without libc): 20-27x on `memset` at 256 B-16 KiB on Zig 0.16, 1.0–1.8x (`memset`) and 1.1–2.0x (`memcpy`) on 0.17.0, including every `std.crypto.secureZero` and the deflate table clear in std; a strong-symbol export proved by a test that resolves the linked `memset`; a compile error rather than silently interposing when libc is linked. **Where we are behind:** no per-CPU dispatch and no non-temporal path for clears or copies larger than the cache (*What is deliberately not done*; glibc's non-temporal `memcpy` is 1.4–1.6× faster at 4 MiB); `memmove`/`bcmp` are not provided (*What this module is, and what it is not*).
 
 ## What this module is, and what it is not
 
 A `memset`, a `memcpy` and the switch that installs them. Not a general `mem*`
 library: each function is here because a profile of a libc-free binary showed
 compiler_rt's one on a hot path. `memcpy` was first refused (compiler_rt's is
-vectorised); `bench-websocket` (2026-10-26) then showed it at 58 % of a 64 KiB
+vectorised); `bench-websocket` then showed it at 58 % of a 64 KiB
 frame read, and a probe against glibc found why: compiler_rt copies element by
 element with no string move and no unrolled small cases, 1.6–2.3× glibc at
-64 B–16 KiB and 1.2–1.4× from 256 KiB (see § Performance). `memmove` and `bcmp`
+64 B–16 KiB and 1.2–1.4× from 256 KiB. `memmove` and `bcmp`
 are not provided: nothing on a measured hot path reaches them (std's `mem.eql`
 has its own vector loop); add them when a profile shows one.
 
@@ -56,13 +54,12 @@ has its own vector loop); add them when a profile shows one.
   byte, and aligned 32-byte stores (four per iteration) from the first 32-aligned address after the
   start up to the start of the last vector. Every byte in range is written at
   least once, none outside it.
-- `len ≥ 32 KiB` (`stos_min`; 192 KiB until 2026-10-26) on x86-64: the same head and tail vectors, and the aligned
+- `len ≥ 32 KiB` (`stos_min`) on x86-64: the same head and tail vectors, and the aligned
   middle by `rep stosq` (8-byte pattern, `⌈(end − first) / 8⌉` qwords: the last
   one ends at most 7 bytes past the tail vector's start, inside the range). Past
   L2 a vector store pays a read-for-ownership of its line; the fast-string
   protocol writes whole lines without one. Measured on the i7-7920HQ (256 KiB L2,
-  disposable probe, 2026-10-10): `rep stosq` 0.95–1.07× the loop from 4 KiB to
-  192 KiB, 0.75–0.84× from 256 KiB to 2 MiB; `rep stosb` is no better aligned
+  disposable probe): against the four-store loop `rep stosq` is 0.77–0.82× at 32 KiB, level at 64 KiB, 0.88–0.97× from 96 to 160 KiB, and 0.75–0.84× from 256 KiB to 2 MiB; `rep stosb` is no better aligned
   and 1.2–1.6× worse when the destination is not. `setLarge` is `noinline` and
   reached by a tail call, so `set` stays a leaf without a frame: with the call
   inside it the 256 B and 4 KiB rows lost 15–40 %. Not under the C backend.
@@ -79,15 +76,14 @@ never merged or rewritten; the loop issues the same full-width stores either way
   2, 4 that covers the length, overlapping in the middle, one head/tail pair
   loaded and stored at a time (the ranges do not overlap; an array holding all
   2k vectors would be filled with 0xAA through a `memset` call in safe builds)
-  — no loop and no alignment arithmetic (glibc's shape; it took `cpy_256_a` from 1.20× glibc to
-  0.83–1.03×). `set` takes the same arm for 32–256 B (`set_256_a` 1.58× → 1.06–1.10×).
+  — no loop and no alignment arithmetic (glibc's shape). `set` takes the same arm for 32–256 B.
 - `256 < len < 16 KiB`: unaligned head and tail vectors loaded first, then
   32-aligned destination stores, four per iteration, from the first aligned
   address after `dest` up to the tail. `set`'s middle loop also stores four per
-  iteration now (4 KiB 44 → 37 ns).
+  iteration.
 - `len ≥ 16 KiB` on x86-64: two vectors for the first 64 bytes, `rep movsb` from
   the first 64-aligned destination address after `dest` up to the tail vector,
-  and the tail vector. Disposable probe, 2026-10-26 (destination offsets 0/5/37,
+  and the tail vector. Disposable probe (destination offsets 0/5/37,
   source 3× that): at 8 KiB the vector loop is 0.60–0.88× the string move, at
   16 KiB the string move is 0.79–0.88× the loop and level with or ahead of it to
   2 MiB (0.75–0.95× from 256 KiB, where the loop's stores pay a
@@ -117,6 +113,24 @@ compile error: interposing libc's tuned `memset` would be a regression, and in a
 dynamically linked program it would also replace `memset` for every shared
 library loaded into it.
 
+## Limits and refusals
+
+- The exported C `memset` / `memcpy` take a null pointer only with `len == 0`
+  (nothing is touched, `dest` is returned); with a non-zero `len` a null `dest` or
+  `src` traps (SIGILL) in every build mode instead of dereferencing null
+  (undefined in C and, as `.?`, in ReleaseFast). `memset` traps with an inline-asm
+  `ud2` on x86-64 (`@trap()` elsewhere), `memcpy` with `@trap()` (`src/root.zig:101`,
+  `:163`): not `@panic` or `orelse @panic`, because a call gave the function a
+  stack frame on every call and the trap keeps it frameless.
+- `set`/`copy` take any length that describes memory the caller may write, so
+  `dest + len` does not wrap the address space.
+- Overlapping `memcpy` ranges are undefined, as in C, and unchecked; no byte
+  outside `dest[0..len]` is ever written. `dest == src` happens to work in every
+  arm. `memmove` and `bcmp` are not provided.
+- The string paths (`rep stosq`, `rep movsb`) exist on x86-64 with 64-bit
+  pointers only, and not under the C backend (`use_stos`, `use_movs`,
+  `src/root.zig:201`); every other build takes the vector loop.
+
 ## Anchoring
 
 - Every length 0..300 at every offset 0..63 for three fill values, with the bytes
@@ -125,8 +139,7 @@ library loaded into it.
 - Page-scale lengths (4095..12289) at odd offsets.
 - The `rep stosq` path: lengths `stos_min − 1 … stos_min + 2000` at offsets 0, 1,
   5, 8, 31, 32, 63 (every rounding of the qword count), bytes around the range
-  checked untouched. Shown to go red: a qword count 4 too large writes past the
-  range (2026-10-10).
+  checked untouched.
 - C semantics: returns `dest`, uses the low byte of `c` (0x1FF, -1, -129), `len == 0` writes nothing.
 - `copy`: every length 0..300 at every destination offset 0..63, against source
   offsets 0, 1, 5, 17, 32, 63 (every arm up to the loop, every head/tail overlap);
@@ -137,15 +150,14 @@ library loaded into it.
   checked unchanged. `memcpy(null, null, 0)` returns null and touches nothing.
 - Model-fuzz (`modelFuzz`): see `**Evidence:**`. Buffer sizes follow the larger
   of the two thresholds, so moving either one keeps every arm reachable (moving
-  `stos_min` below `4·movs_min` overran the canvas before that). On its own it kills every
-  non-equivalent mutant of `set`/`copy` in the 2026-10-26 run; what it does not
+  `stos_min` below `4·movs_min` overran the canvas before that). In the mutation run it killed on its own every
+  non-equivalent mutant of `set`/`copy`; what it does not
   reach are the C wrappers (guard, return value, conversion of `c`) and pure
   over-reads, which the tests above and below cover.
 - Guard pages: a mapping `[PROT_NONE][data][PROT_NONE]`, source and destination
   placed flush against either guard, lengths at every arm boundary (0..257,
   4095, `movs_min ± 1`, `3·movs_min + 5`) and `stos_min` for `set`. Any load or
-  store one byte outside the range faults. Shown to go red: a discarded vector
-  load one byte past `src` in the overlap arm (mutant 45, segfault).
+  store one byte outside the range faults.
 - Not reached on x86-64: the vector loop for `len ≥ movs_min` (`copy`) and
   `len ≥ stos_min` (`set`), which only non-x86 and C-backend builds take. It is
   the same loop as for 257 B..16 KiB, which every test above covers.
@@ -153,8 +165,6 @@ library loaded into it.
   it, never from a file-level `comptime` block, which would collide with
   `check-pubfn-reach` analysing `exportSymbols`), so the whole test runner's own
   `@memset`s run through it, and that test proves the linked `memset` is this one.
-- Shown to go red: moving the middle loop's start one vector later fails the first
-  two tests (2026-09-28).
 
 The expected bytes are computed per position from `memset`'s definition
 (C11 7.24.6.1), independently of the code under test; there is no outside
@@ -162,210 +172,36 @@ corpus to agree with.
 
 **Anchor grade:** class C · oracle n/a
 
-### Audit 2026-10-26 (`memcpy`, overlap arms, four-store loops)
+## Verification
 
-Supersedes the 2026-10-03 audit below, which covered the 188-line `memset`-only
-source.
+- **Run:** `scripts/modtest fastmem`; `zig build bench-fastmem` is the benchmark (needs `musl-gcc` and `zig cc`).
+- **Tests** (`src/root.zig`, `src/sweep_test.zig`): the exhaustive and page-scale length sweeps, the string-path boundaries, the model-fuzz (`modelFuzz`), the C-semantics tests, the guard-page test and the export test, as listed under *Anchoring*; the sweep tests fork a child and require that a null pointer with a non-zero length kills it by a signal, and that `len == 0` with null stays a no-op.
+- **Fuzz:** the model-fuzz is a seeded in-test driver (every arm reached by construction), not a `check-fuzz` harness; no fuzz obligation. **ct:** n/a, `memset`/`memcpy` only.
+- **Not covered by a run on this host:** the vector loop for `len >= movs_min` (`copy`) and `len >= stos_min` (`set`), which only non-x86 and C-backend builds take; it is the loop covered for 257 B..16 KiB.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The mutation run covered every arm split and overlap-width bound, the head, tail and middle stores, loop start, stride and remainder bound, the `rep` count, skew, source offset and fill pattern, the small arms' thresholds and offsets, the C wrappers' guard, return value and conversion of `c`, and a pure over-read; the export test is filtered out of the mutation run, because it would install the mutant as the runner's own `memcpy`. The equivalent mutants each move one boundary into the neighbouring arm, which writes the same bytes: `len < 2·k·32` in place of `<=` (`set` and `copy`: length 64k takes the next k or the loop), `>` for the `rep stosq` / `rep movsb` threshold (the threshold length takes the vector loop), the `setSmall` 16-byte arm from 17 (two `u64` stores at 0 and 8), the 4-byte arm from 5 (two `u16` stores at 0 and 2).
 
-**Review** (independent, read-only, whole `src/root.zig` and SPEC): no CRIT, HIGH
-or MED. Every arm was checked by arithmetic at the boundary lengths (31, 32, 33,
-64, 65, 128, 129, 256, 257, `movs_min − 1`, `movs_min`, `stos_min`) and at every
-destination alignment. No store or load outside the range, no byte unwritten.
-The asm constraints are right: every register the string instruction changes is
-a `+` operand, there is a memory clobber, and DF is clear per the ABI. C
-semantics are right. Acted on:
+## Performance
 
-- LOW-1: the overlap arm held all 2k vectors in an `undefined` array, which safe
-  builds fill with 0xAA. At -O0 that fill can lower to a call to `memset`, so
-  `memcpy` could call this module's `memset`. Rewritten to one pair at a time.
-- Test gaps:
-  - Over-reads of `src` were not checked at all → the guard-page test.
-  - Negative `c` was not tested → -1 and -129.
-- INFO-4: the string paths are now gated on `@sizeOf(usize) == 8` (x32 ABI).
-- INFO-1/2: doc drift (the algorithm bullets, the anchoring wording) fixed.
+`zig build bench-fastmem` (`tools/bench.zig` driving `tools/c_bench/mem_bench.c`) times one `memset` (`set_*`) or `memcpy` (`cpy_*`) of 16 B / 256 B / 4 KiB / 64 KiB / 1 MiB, destination 64-byte aligned (`a`) or 5 bytes past that (`u`), against musl 1.2.5 (the reference) and glibc (the candidate for fastest), with Zig's compiler_rt as a context column that is not part of the ratio. Every side is called through a runtime function pointer, each doubles its batch past 100 ms and keeps the best of five, the sides alternate per workload, and the canvas fingerprints must agree before timing. The card's Performance line is authoritative for the figures.
 
-Not acted on, in § Backlog:
-
-- LOW-2: there is no guard against the "LLVM rewrites a loop into a call"
-  regression, such as a dropped `volatile`. Today only the optimised CI lanes
-  would show it, as recursion.
-
-INFO-3: `dest == src` happens to work in every arm. Partial overlap is undefined,
-as in C.
-
-**Mutation** (schemata, one ReleaseSafe binary, `FASTMEM_MUT=N`, 20 s cap per
-mutant, the export test filtered out because it would install the mutant as
-the runner's own `memcpy`). 46 mutants over:
-
-- every arm split and overlap-width bound;
-- head, tail and middle stores;
-- loop start, stride and remainder bound;
-- the `rep` count, skew, source offset and fill pattern;
-- the small arms' thresholds and offsets;
-- the C wrappers' guard, return value and conversion of `c`;
-- a pure over-read.
-
-**40 killed, 6 equivalent, 0 unexplained.** Re-run after `stos_min` moved to
-32 KiB, over the source on the card: the same 40/46, the same six equivalent. The 6 equivalent mutants each move one
-boundary into the neighbouring arm, which writes the same bytes:
-
-- 2 / 24: `len < 2·k·32` in place of `<=` for `set` / `copy`, so length 64k takes
-  the next k or the loop.
-- 14 / 27: `>` for the `rep stosq` / `rep movsb` threshold, so the threshold
-  length takes the vector loop.
-- 19: `setSmall` 16-byte arm from 17. Sixteen bytes become two `u64` stores at 0
-  and 8.
-- 21: the 4-byte arm from 5. Four bytes become two `u16` stores at 0 and 2.
-
-The disposable runner and copy (`.zig-cache/fm-audit/`) are deleted.
-
-### Audit 2026-10-03 (superseded, `memset` only)
-
-Reviewed `src/root.zig` whole (188 lines) against musl's `memset` semantics and the
-SPEC's algorithm: every store of `set` stays inside `[dest, dest+len)` (the loop
-runs while `p < start+len-32`, so its last vector ends before `start+len`), the
-head vector, the aligned middle and the tail vector leave no gap, and the small
-arms cover `[0, n)` with two overlapping stores. No defect found. INFO only: an
-address sum `start + len` that wraps the address space is unreachable for a real
-allocation; `memset(null, c, n != 0)` is C undefined behaviour and traps in safe
-builds (`dest.?`), as it should.
-
-Mutation run (schemata, ReleaseSafe, 28 mutants over the `len < 32` split, head
-and tail stores, middle-loop start/end/stride, every small arm's threshold,
-tail offset and fill constant, the C wrapper's length guard, return value and
-byte truncation): **23 killed, 4 equivalent, 1 real**. Not mutated: `exportSymbols`
-(its test needs the real linked `memset`; the schemata copy skips it because a
-binary-wide `memset` runs before the test runner has an environment).
-
-- 1 `len <= 32` for the small path: a 32-byte length is two 16-byte stores, the
-  same bytes as head + tail. Equivalent.
-- 5 `alignForward(start, 32)` instead of `start + 1`: when `start` is aligned the
-  loop re-stores the head vector. Equivalent.
-- 6 `end = start + len - 31`: the extra iteration is the aligned address
-  `start + len - 32`, whose vector ends exactly at `start + len`. Equivalent.
-- 11 `p <= end`: same case as 6. Equivalent.
-- 24 real survivor: `len != 0` guard dropped, so `memset(null, c, 0)` would
-  panic on `dest.?`. Killed by `memset: len 0 accepts a null dest and
-  dereferences nothing`.
+Why P2 and not P1: the 64 KiB aligned rows sit at 1.00–1.01× musl. At 64 KiB aligned both sides run the same string store, and the string store and the vector loop are level there, so that is hardware parity; a re-run might land under 1.0 by chance, which would grade noise, so the card keeps a recorded run.
 
 ## What is deliberately not done
 
 - String stores below 32 KiB: `rep stosq` is level with the four-store loop at
-  16 KiB and costs its startup below that (1 KiB: 15.6 against 9.3 ns, probe
-  2026-10-26). The threshold is one machine's L1d; a CPU with a different cache
-  would move it, and there is no per-CPU dispatch to follow it.
+  16 KiB and costs its startup below that (1 KiB: 15.6 against 9.3 ns, probe).
+  The threshold is one machine's L1d; a CPU with a different cache would move it,
+  and there is no per-CPU dispatch to follow it.
 - Non-temporal stores for huge buffers: no caller clears more than a few hundred
   KiB at a time. The same for copies: glibc switches to non-temporal stores
   somewhere between 2 and 4 MiB on this host and is 1.4–1.6× faster than `copy`
-  at 4 MiB (probe 2026-10-26); no caller copies that much at once.
-- `memmove`, `bcmp`: see "What this module is".
-
-## Performance
-
-**Measured 2026-10-26 with `memcpy`** (`zig build bench-fastmem`, `BENCH_ROUNDS=5`,
-Zig 0.17.0, ReleaseFast, glibc 2.43, musl 1.2.5; load average 2.5–5 from other
-sessions, spreads up to 80 % on the 2 ns rows; copies read a second buffer,
-aligned or 14 bytes past it, so source and destination differ mod 64 in `u`).
-The card carries this run. `crt/ours` is compiler_rt on Zig 0.17.0, whose
-`memset` is now vectorised too (SPEC § Open): ours is still 1.0–1.8× faster on
-`memset` and 1.1–2.0× on `memcpy`.
-
-| workload | ours ns | musl ns | glibc ns | crt ns | ours/musl | ours/glibc |
-|---|---:|---:|---:|---:|---:|---:|
-| `set_16_a` | 1.95 | 3.10 | 1.94 | 3.18 | 0.63 | 1.01 |
-| `set_16_u` | 1.94 | 3.25 | 1.99 | 3.23 | 0.60 | 0.98 |
-| `set_256_a` | 2.91 | 12.02 | 2.66 | 5.37 | 0.24 | 1.10 |
-| `set_256_u` | 3.97 | 13.35 | 3.62 | 5.46 | 0.30 | 1.10 |
-| `set_4k_a` | 35.62 | 43.72 | 42.39 | 39.42 | 0.81 | 0.84 |
-| `set_4k_u` | 37.46 | 68.76 | 66.32 | 38.14 | 0.54 | 0.56 |
-| `set_64k_a` | 1082.70 | 1058.61 | 1137.91 | 1144.51 | 1.02 | 0.95 |
-| `set_64k_u` | 1127.71 | 1315.56 | 1372.99 | 1109.40 | 0.86 | 0.82 |
-| `set_1m_a` | 21362.72 | 21416.91 | 21149.49 | 32197.45 | 1.00 | 1.01 |
-| `set_1m_u` | 20935.49 | 22887.28 | 22817.68 | 33277.50 | 0.91 | 0.92 |
-| `cpy_16_a` | 1.97 | 9.05 | 2.34 | 2.57 | 0.22 | 0.84 |
-| `cpy_16_u` | 1.97 | 20.67 | 2.26 | 3.66 | 0.10 | 0.87 |
-| `cpy_256_a` | 3.46 | 12.23 | 3.37 | 6.95 | 0.28 | 1.03 |
-| `cpy_256_u` | 4.15 | 24.63 | 5.61 | 6.19 | 0.17 | 0.74 |
-| `cpy_4k_a` | 37.10 | 48.28 | 37.10 | 43.27 | 0.77 | 1.00 |
-| `cpy_4k_u` | 37.02 | 70.50 | 38.50 | 61.45 | 0.53 | 0.96 |
-| `cpy_64k_a` | 1402.18 | 1402.64 | 1458.54 | 1645.66 | 1.00 | 0.96 |
-| `cpy_64k_u` | 1476.68 | 1617.78 | 1468.01 | 1825.63 | 0.91 | 1.01 |
-| `cpy_1m_a` | 36599.87 | 35782.22 | 35063.40 | 41689.18 | 1.02 | 1.04 |
-| `cpy_1m_u` | 35785.99 | 37204.96 | 36518.42 | 44243.21 | 0.96 | 0.98 |
-
-Grade: worst ours/musl 1.02 in this run (`set_64k_a`, `cpy_1m_a`). A re-run
-after the audit (same day, 22:00, load 1.5 → 3; same source but for the
-overlap-arm rewrite) is what the card carries: ref 0.09–1.05×, fastest
-0.56–1.09×, worst `set_64k_a` 1.05 and `cpy_64k_a` 1.04. Across four runs that
-day, `set_64k_a` was 1.02–1.10× musl and `cpy_64k_a` 0.99–1.06×. That is
-systematic, not noise: a 64 KiB aligned buffer is out of L1 and in L2, and
-musl moves it with `rep stosq` / `rep movsq` while `set` runs its vector loop
-(`setLarge` started at 192 KiB).
-
-**Then `rep stosq` from 32 KiB** (`stos_min` 192 → 32 KiB, 2026-10-26, 22:05). The
-probe against the four-store loop gave 0.77–0.82× at 32 KiB, level at 64 KiB and
-0.88–0.97× from 96 to 160 KiB. `bench-fastmem` after it (load 1.75–2.5) is what
-the card carries: ref 0.10–1.01×, fastest 0.57–1.08×. `set_64k_a` came out 1.01×
-(1035.70 against musl's 1028.78 ns), `cpy_64k_a` 1.00, `cpy_1m_a` and `cpy_1m_u`
-1.00.
-
-At 64 KiB aligned both sides now run the same string store, and the string
-store and the loop are level there, so the row sits at hardware parity. A
-re-run might land under 1.0 by chance; that would grade noise, so the card keeps
-this run. → P2.
-
-Earlier, memset only:
-
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-fastmem`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 9.6 %): ref 0.34–1.03×, fastest 0.67–1.50×, against 0.40–1.05× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
-
-Measured 2026-10-10 with `zig build bench-fastmem` (`tools/bench.zig` driving
-`tools/c_bench/mem_bench.c`, then `memset_bench.c`), ReleaseFast, `fastmem.set` against musl 1.2.5
-`memset` (`musl-gcc -O2 -static`) and glibc 2.43 `memset` (`zig cc -O2`), every
-side called through a function pointer; destination 64-byte aligned (`a`) and 5
-bytes past that (`u`); canvas fingerprints equal before timing. Each side doubles
-its batch past 100 ms and keeps the best of five; per workload the three sides
-alternate for `BENCH_ROUNDS` = 5 rounds and each keeps its best. Host i7-7920HQ
-(Kaby Lake, AVX2, ERMS), Linux 7.0, Zig 0.16.0; the machine was shared with
-another session's benchmarks, which the spread (up to 25 %) shows. Two runs:
-
-| workload | ours ns | musl ns | glibc ns | ours/musl | ours/glibc |
-|---|---:|---:|---:|---:|---:|
-| `set_16_a` | 1.68 | 3.06 | 2.24 | 0.55 | 0.75 |
-| `set_16_u` | 1.86 | 3.29 | 2.38 | 0.57 | 0.78 |
-| `set_256_a` | 4.96 | 11.07 | 3.05 | 0.45 | 1.62 |
-| `set_256_u` | 5.29 | 13.31 | 3.64 | 0.40 | 1.45 |
-| `set_4k_a` | 45.03 | 42.86 | 41.96 | 1.05 | 1.07 |
-| `set_4k_u` | 48.31 | 72.00 | 69.76 | 0.67 | 0.69 |
-| `set_64k_a` | 1010.72 | 980.75 | 1026.79 | 1.03 | 0.98 |
-| `set_64k_u` | 1046.39 | 1279.60 | 1250.02 | 0.82 | 0.84 |
-| `set_1m_a` | 21275.64 | 20841.06 | 21099.45 | 1.02 | 1.01 |
-| `set_1m_u` | 20322.25 | 22464.07 | 22377.48 | 0.90 | 0.91 |
-
-The other run (same day, spreads ≤ 20 %): ours/musl 0.41–1.05, worst again
-`set_4k_a`, 1 MiB 0.95–1.01. Grade: worst ours/musl 1.05 ≤ 1.1 → P2; glibc
-(the fastest) is 1.62× at 256 B, so not P1. The bench alternated the sides from
-2026-10-10 on; the 2026-10-07 figures ran musl and glibc to completion first.
+  at 4 MiB (probe); no caller copies that much at once.
+- `rep movsq` for `copy`: 3–8 % faster at 1 MiB but 5–10 % slower at 64 KiB
+  unaligned (probe).
+- `memmove`, `bcmp`: see *What this module is, and what it is not*.
 
 ## Backlog / deferred
 
-- ~~1 MiB 1.17–1.36× slower than musl and glibc~~ — DONE 2026-10-10: `rep stosq` past 192 KiB, now 0.90–1.02× both (§ Algorithm).
-- **Performance P2 → P1** *(bench 2026-10-10, updated 2026-10-26)*: ~~glibc 1.45–1.62× at 256 B, 4 KiB aligned 1.05× musl~~ — DONE 2026-10-26 (the overlap arm and the four-store loop: 1.10× and 0.81×). ~~`rep stosq` from 32 KiB~~ — DONE 2026-10-26 (32–160 KiB 3–23 % faster). Left: the 64 KiB aligned rows at 1.00–1.01× musl, which is hardware parity (§ Performance). Not taken: `rep movsq` for `copy` (probe 2026-10-26: 3–8 % faster at 1 MiB, 5–10 % slower at 64 KiB unaligned).
-- **No-libcall guard (review LOW-2, 2026-10-26).** Nothing checks that the
-  compiled `set`, `copy`, `setLarge`, `copyLarge`, `setSmall` and `copySmall`
-  contain no `call memset` or `call memcpy`. A dropped `volatile` would turn a
-  loop into a self-call, and only the optimised CI lanes would show it, as a hang
-  or a stack overflow. Candidate: a `check-*` step that disassembles a
-  ReleaseFast object and greps it.
-- ~~**`memcpy` export**~~ — DONE 2026-10-26: `copy`/`memcpy`, exported by `exportSymbols`; `bench-websocket` read_binary_64k 1.19× → 1.12× fastwebsockets.
-
-## Open
-
-- **TRIGGERED on Zig 0.17.0 (2026-10-18):** `lib/compiler_rt.zig` `memset` is now
-  `fastMemset` (vector stores with overlapping ends; byte-wise `smallMemset` only in
-  ReleaseSmall). Re-measure `bench-fastmem` against it and decide delete / keep for
-  ReleaseSmall and the `rep stosq` large-clear path. **Measured 2026-10-26**
-  (`crt` column, § Performance): ours is 1.0–1.8× faster than 0.17's `memset`
-  (level only at 4 KiB) and 1.1–2.0× than its `memcpy` — keep; decide again on
-  the next Zig upgrade. Original item: delete this module once std's compiler_rt `memset` is vectorised (check on each
-  Zig upgrade: `lib/compiler_rt.zig`, `pub fn memset`).
+- **Performance P2 → P1:** the 64 KiB aligned rows are at 1.00–1.01× musl, which is hardware parity (§ Performance); P1 needs the reference at or below 1.0 on every row.
+- **No-libcall guard.** Nothing checks that the compiled `set`, `copy`, `setLarge`, `copyLarge`, `setSmall` and `copySmall` contain no `call memset` or `call memcpy`. A dropped `volatile` would turn a loop into a self-call, and only the optimised CI lanes would show it, as a hang or a stack overflow. Candidate: a `check-*` step that disassembles a ReleaseFast object and greps it.
+- **Re-check against compiler_rt on each Zig upgrade** (`lib/compiler_rt.zig`, `memset` and `memcpy`), and decide delete or keep. The original trigger (compiler_rt's `memset` vectorised) fired on Zig 0.17.0, but this module is still ahead (1.0–1.8× on `memset`, 1.1–2.0× on `memcpy`), so it stays.

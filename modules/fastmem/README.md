@@ -4,14 +4,15 @@
 export to replace compiler_rt's. Every runtime-length `@memset`/`@memcpy` and
 every `std.crypto.secureZero` in the binary — std's own included — then runs
 through them: on Zig 0.17.0, 1.0–1.8× faster than compiler_rt's `memset` and
-1.1–2.0× than its `memcpy`, level with glibc (0.56–1.10×; 2026-10-26). On Zig 0.16,
+1.1–2.0× than its `memcpy`, level with glibc (the card's Performance line has the ratios). On Zig 0.16,
 whose compiler_rt `memset` stored one byte per iteration, `memset` was 20–27× faster.
 
 - **Status:** gap on Zig 0.16 — without libc, std had no fast `memset` at all.
   **Zig 0.17.0's `compiler_rt.memset` is vectorised** (`fastMemset`; byte-wise only
   in ReleaseSmall) and its `memcpy` copies element by element with no string
-  move; both were re-measured 2026-10-26 and this module is still ahead (SPEC
-  § Performance). The speed table below is the 0.16 measurement.
+  move; both were re-measured on 0.17.0 and this module is still ahead (SPEC
+  § Performance; the card has the figures). The speed table below is the
+  0.16 measurement.
 - **Model after:** musl's and Go's runtime `memclr`: full-width vector stores
   with overlapping unaligned first and last vectors; `rep stosq` for the middle
   of clears from 32 KiB on x86-64 (level with musl and glibc at 1 MiB). `memcpy`
@@ -40,7 +41,7 @@ compile error — libc's are already vectorised and must not be interposed.
 
 ## Speed
 
-Zig 0.16 (`memset` only; the 0.17 table with `memcpy` is in SPEC § Performance):
+Zig 0.16 (`memset` only; `zig build bench-fastmem` measures `memset` and `memcpy` against musl and glibc on the current Zig, and the card's Performance line carries its figures):
 ns per call, best of 5, ReleaseFast `-mcpu=native`, one core of an
 i7-7920HQ (2026-09-28, loaded machine — the ratios are the point):
 
@@ -51,6 +52,10 @@ i7-7920HQ (2026-09-28, loaded machine — the ratios are the point):
 | `@memset` 16 KiB | 4 760 | 188 |
 | `secureZero` 16 KiB | 4 813 | 181 |
 | std deflate level 6, 16 KiB JSON (clears a 64 KiB table) | 284 500 | 208 700 |
+
+## Not provided
+
+`memmove` and `bcmp` (nothing on a measured hot path reaches them), per-CPU dispatch and non-temporal stores; the reasons are in SPEC *What is deliberately not done* and *What this module is, and what it is not*.
 
 Provenance: original work of the zig-libs authors (MIT). The overlapping-ends
 technique is common knowledge (musl, Go runtime); no third-party source was

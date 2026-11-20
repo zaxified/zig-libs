@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GQ). The exported C `memcpy`/`memset` unwrapped caller pointers with `.?` (undefined in ReleaseFast); a null pointer with a non-zero length now traps (SIGILL) in every build mode, a null pointer with length 0 stays a no-op as in C. The traps keep both functions frameless (`orelse @trap()` in memcpy, an inline-asm `ud2` in memset on x86-64; objdump-checked). Tests: `src/sweep_test.zig`.
 - **2026-10-26** — Audit of the `memcpy` source (independent review + 46-mutant
   schemata run: 40 killed, 6 equivalent, no defect). `copy`'s 32–256 B arm no
@@ -27,7 +25,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   four-store loop (256 B 1.58× → 1.10× glibc, 4 KiB 1.05× → 0.81× musl).
   `bench-fastmem` measures both (`tools/c_bench/memset_bench.c` → `mem_bench.c`).
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 0.17.0's compiler_rt `memset` is vectorised; the gap and speed table are labelled as 0.16 measurements; the delete-the-module trigger is recorded as fired.
 - **2026-10-10** — `set` stores the middle of a clear of 192 KiB or more with
   `rep stosq` on x86-64 (head and tail vectors unchanged): 1 MiB went from
   1.23–1.32× musl's and glibc's `memset` to 0.90–1.02×; shorter lengths run the
