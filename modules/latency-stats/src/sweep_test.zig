@@ -103,7 +103,7 @@ test "add of a fully dropped histogram does not fold its min/max (sweep REV-LS1)
     try testing.expectEqual(a.highestEquivalent(5), a.valueAtPercentile(100));
 }
 
-// ── wave 2026-11-02 (grade 2): coordinated omission, merge, iterators, wire ──
+// ── (grade 2): coordinated omission, merge, iterators, wire ──
 
 const wire = root.wire;
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Fuzz harnesses (added 2026-11-02), three of them, run by testkit's driver:
+//! Fuzz harnesses, three of them, run by testkit's driver:
 //!
 //!  - `latency-stats-wire`: `wire.decode`, the one parser of untrusted bytes.
 //!    A histogram (any `lowest`, huge counts too, so 5-9 byte varints occur) is
