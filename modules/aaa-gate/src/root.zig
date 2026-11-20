@@ -351,7 +351,7 @@ pub const AuditFn = *const fn (ctx: ?*anyopaque, entry: AuditEntry) void;
 /// `KeyFn` itself is shared across the server's per-connection threads, and a
 /// slice of a stack local does not outlive the callback. Without it this
 /// module documented a mitigation no caller could implement race-free
-/// (reported by a consumer, 2026-09-17). Returning a slice that borrows the
+/// (reported by a consumer). Returning a slice that borrows the
 /// request (`ctx.req.path`, a header value) is still fine — ignore `buf` then.
 ///
 ///     fn peerOnly(_: ?*anyopaque, c: *router.Ctx, buf: *[client_key_len_max]u8) []const u8 {
@@ -1840,7 +1840,7 @@ fn peerOnlyKey(_: ?*anyopaque, ctx: *router.Ctx, buf: *[client_key_len_max]u8) [
 }
 
 test "throttle_key: a peer-keyed extractor coalesces denials a rotating X-Forwarded-For would split" {
-    // Reproduces a consumer's measurement (2026-09-17, a service reachable
+    // Reproduces a consumer's measurement (a service reachable
     // directly with nothing in front of it): with the default forwarded-IP
     // chain, a client rotating a FORGED X-Forwarded-For lands a fresh key per
     // denial, so every one of them reaches the synchronous `on_audit` hook and
@@ -3195,7 +3195,7 @@ test "corpus: every bearer seed reaches the extractor, and the tokens found are 
         token_octets += tok.len;
     }
     try testing.expectEqual(bearer_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 19 seeds non-empty, 0 tokens found and 0 octets
+    // Measured: 0 of 19 seeds non-empty, 0 tokens found and 0 octets
     // recovered before the draw was fixed.
     try testing.expectEqual(@as(usize, 8), tokens_found);
     try testing.expectEqual(@as(usize, 37), token_octets);
@@ -3304,7 +3304,7 @@ test "corpus: every api-key seed reaches both extraction paths, and the split is
         if (@intFromPtr(key.ptr) < @intFromPtr(query.ptr)) header_side += 1 else query_side += 1;
     }
     try testing.expectEqual(api_key_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 18 seeds non-empty and every counter 0 before
+    // Measured: 0 of 18 seeds non-empty and every counter 0 before
     // the draw was fixed.
     try testing.expectEqual(@as(usize, 12), keys_found);
     try testing.expectEqual(@as(usize, 6), header_side);
@@ -3386,7 +3386,7 @@ test "corpus: every query seed reaches queryValue, and what it returned is pinne
         value_octets += v.len;
     }
     try testing.expectEqual(query_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 16 seeds non-empty, 0 hits and 0 octets before
+    // Measured: 0 of 16 seeds non-empty, 0 hits and 0 octets before
     // the draw was fixed.
     try testing.expectEqual(@as(usize, 10), hits);
     try testing.expectEqual(@as(usize, 239), value_octets);
@@ -3579,7 +3579,7 @@ test "clientKeyFrom: XFF rightmost, then X-Real-IP, then peer, then fallback; cl
     try testing.expectEqualStrings("192.0.2.9", clientKeyFrom(null, null, peer, &buf));
 }
 
-// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+// ── audit: tests asked for by mutation survivors ──────────────────
 
 test "verifyApiKey: a key verifier alone closes the api-key open plane" {
     // `verifyApiKey` doc: `.ok_open` only "with no key set and no callback"
@@ -3643,7 +3643,7 @@ test "middleware either: one configured scheme keeps the plane closed even with 
     try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "200");
 }
 
-// ── tests: HTTP Basic, key sources, cookies (echo parity, 2026-10-17) ───────
+// ── tests: HTTP Basic, key sources, cookies (echo parity) ───────
 
 test "basicCredentialsOf: RFC 7617 shapes, split at the FIRST colon, malformed is null" {
     var out: [64]u8 = undefined;
@@ -4036,7 +4036,7 @@ test "Identity.user: an open Basic plane names nobody, even when a Basic header 
 }
 
 test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
-    // `cookies.find` since 2026-11-20: every `;` ends a pair, quoted or not (Go
+    // `cookies.find`: every `;` ends a pair, quoted or not (Go
     // net/http, browsers; the cookie-sandwich fix), so a quoted `;` cuts the value.
     try testing.expectEqualStrings("\"x", cookieValue("a=1; sid=\"x;y\"; b=2", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("sid=abc", "sid").?);
@@ -4274,7 +4274,7 @@ test "corpus: every cookie seed reaches the extractor and the found/absent split
     }
 }
 
-// ── audit 2026-10-18: tests asked for by mutation survivors ──────────────────
+// ── audit: tests asked for by mutation survivors ──────────────────
 
 test "basicFingerprint: the user/password boundary is part of the digest" {
     // Without the ':' separator ("a","bc") and ("ab","c") hash the same bytes.
@@ -4422,7 +4422,7 @@ test "middleware: ctx.data is restored when the gate returns (an outer middlewar
     try testing.expect(seen_none);
 }
 
-// ── tests added by the 2026-10-25 grade-1 audit (each kills a surviving mutant) ──
+// ── tests added by the grade-1 audit (each kills a surviving mutant) ──
 
 test "Clock.monotonic: nanoseconds of CLOCK_MONOTONIC, not milliseconds" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -4514,7 +4514,7 @@ test {
     _ = @import("model_test.zig");
 }
 
-// ── lead tests (2026-10-25): header-confusion behaviour pinned over the wire ──
+// ── lead tests: header-confusion behaviour pinned over the wire ──
 // The `**Ahead:**` line of the maturity card cites these by name; the same
 // cases run against labstack/echo v5.4.0, gofiber/fiber v2.52.16 / v3.6.1 and
 // gin v1.12.0 in the field report (modules/aaa-gate/tools/go_fast_bench).
@@ -4546,7 +4546,7 @@ test "lead: two Authorization headers (or two API-key headers) are denied, whate
     var gr = try GatedRouter.init(&g, null);
     defer gr.deinit();
     var buf: [1024]u8 = undefined;
-    // valid first, wrong second: denied (before 2026-10-25 the first decided and this was a 200)
+    // valid first, wrong second: denied (previously the first decided and this was a 200)
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nAuthorization: Bearer wrong\r\n"), &buf), "401");
     // two valid lines: still denied -- the field is a singleton
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nauthorization: Bearer s3cr3t\r\n"), &buf), "401");
@@ -4674,7 +4674,7 @@ test "deny path: a challenge or content type that is not a legal header value fa
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -4684,8 +4684,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── option/argument contracts (mutation run 2026-11-07) ─────────────────────
-// Errors since 2026-11-07 (they panicked before: consumer-reachable).
+// ── option/argument contracts (mutation run) ─────────────────────
+// Errors (they panicked before: consumer-reachable).
 
 /// One documented option violation per `case` (0..13, 18, 19); anything else
 /// is a valid control.
@@ -4744,7 +4744,7 @@ test "contract: every documented option/argument violation is an error, nothing 
     g1.deinit();
 }
 
-// ── mutation run 2026-11-07: survivors of the whole-module run ───────────────
+// ── mutation run: survivors of the whole-module run ───────────────
 
 test "scheme names: another scheme of the same length is not Bearer / Basic, on the wire too" {
     // A 6-letter scheme + space + a valid token, a 5-letter scheme + space +
@@ -4794,7 +4794,7 @@ test "middleware .any: a valid bearer AND a valid API key -> the bearer identity
 
 test "empty API-key value = no credential in every source: anonymous under credentials_optional, 401 without" {
     // header, query, cookie; each blank (empty or SP/TAB only). Echo's
-    // extractors treat an empty value as missing (aligned 2026-11-07: the
+    // extractors treat an empty value as missing (aligned: the
     // header used to count as presented).
     const Src = struct { src: KeySource, req: []const u8 };
     const cases = [_]Src{
@@ -4833,7 +4833,7 @@ test "empty API-key value = no credential in every source: anonymous under crede
     }
 }
 
-// ── dead-stack probe of the request path (2026-11-07) ───────────────────────
+// ── dead-stack probe of the request path ───────────────────────
 // ReleaseFast only (`testkit.stackprobe`): after a Basic request through the
 // middleware, the decoded `user:password` must not survive in a dead frame
 // below it (decode buffer, SHA-256 state of the digest compare). The wire
@@ -4869,7 +4869,7 @@ test "STACKPROBE: no user:password residue below the middleware after a Basic re
     _ = try ProbeSP.run("basic request", probeBasicRequest, .{&r}, &secrets, .{ .burn = false, .residue = false });
 }
 
-// ── whole-module mutation run 2026-11-11: tests for the survivors ───────────
+// ── whole-module mutation run: tests for the survivors ───────────
 
 test "init: a throttle window beyond the u64 range in nanoseconds saturates, it does not overflow" {
     var clk: TestClock = .{};

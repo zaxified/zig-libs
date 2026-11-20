@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Model-based fuzzing for `aaa-gate` (2026-10-17): each harness drives the
+//! Model-based fuzzing for `aaa-gate`: each harness drives the
 //! real gate and a deliberately naive reference model with the same script
 //! and compares every observable after every step.
 //!
