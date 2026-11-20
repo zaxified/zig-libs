@@ -1320,6 +1320,11 @@ test "h2 client: a response head with an invalid field name or value is Malforme
         in = .fixed(srv.wire.items);
         const before = out.buffered().len;
 
+        // All the frames are in: the refused stream holds none of its DATA
+        // (discarded, credited back) and did not "end" as a response.
+        try s.pump();
+        try testing.expectEqual(@as(usize, 0), s.unreadLen(sid_bad));
+        try testing.expect(!s.ended(sid_bad));
         try testing.expectError(error.MalformedResponse, s.awaitHead(sid_bad));
         // The stream is reset with PROTOCOL_ERROR (§8.1.1) and released.
         const tail = out.buffered()[before..];
@@ -1339,6 +1344,23 @@ test "h2 client: a response head with an invalid field name or value is Malforme
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expectEqualStrings("fine", res.body);
     }
+}
+
+test "h2 client: an invalid head that carries END_STREAM is refused too, and the stream does not count as ended" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/bad", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{ .{ .name = ":status", .value = "204" }, .{ .name = "X-Upper", .value = "v" } }, true);
+    in = .fixed(srv.wire.items);
+    try s.pump();
+    try testing.expect(!s.ended(sid));
+    try testing.expectError(error.MalformedResponse, s.awaitHead(sid));
 }
 
 test "h2 client: readBody on a stream whose head was invalid is MalformedResponse, never body octets" {

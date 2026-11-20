@@ -11615,6 +11615,42 @@ fn fuzzGzipBodySmith(_: void, smith: *std.testing.Smith) !void {
     try fz.runFrom(fuzzGzipBody, smith, script[0..n]);
 }
 
+test "GunzipBody: the end state is latched, both ways, over repeated polls" {
+    const good = try gzipAlloc("hello gzip");
+    defer testing.allocator.free(good);
+    const bad = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad);
+    bad[bad.len - 1] ^= 0xff; // ISIZE
+    for ([_]struct { body: []const u8, end: Reader.StreamError }{
+        .{ .body = good, .end = error.EndOfStream },
+        .{ .body = bad, .end = error.ReadFailed },
+    }) |c| {
+        var src: Reader = .fixed(c.body);
+        const sc = try testing.allocator.create(GunzipScratch);
+        defer testing.allocator.destroy(sc);
+        const padded = sc.start(&src, .raw);
+        var gb: GunzipBody = .init(&sc.decompress.reader, 400, &sc.out);
+        gb.scratch = sc;
+        gb.trailer_check = .{ .source = padded };
+        var buf: [64]u8 = undefined;
+        var polls_after_end: usize = 0;
+        var polls: usize = 0;
+        while (polls < 12) : (polls += 1) {
+            var w: Writer = .fixed(&buf);
+            if (gb.reader.stream(&w, .unlimited)) |_| {
+                try testing.expectEqual(@as(usize, 0), polls_after_end);
+            } else |e| {
+                // Every poll from the first end on answers the same, and
+                // never decodes another byte.
+                try testing.expectEqual(c.end, e);
+                polls_after_end += 1;
+                try testing.expectEqual(@as(usize, 0), w.end);
+            }
+        }
+        try testing.expect(polls_after_end >= 5);
+    }
+}
+
 test "GunzipBody: a reader polled again after EndOfStream stays ended; readSliceShort reads a valid body at any size (verify_inbound_trailer on and off)" {
     // std's `readVec` swallows the first EndOfStream when it already copied
     // bytes and `readSliceShort` asks again: the second end check used to
