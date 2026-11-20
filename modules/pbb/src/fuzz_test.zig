@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for pbb's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for pbb's deterministic fuzz driver.
 //!
 //! The decode harness body stays in `root.zig` beside its corpus, generic over
 //! its source of choices, `fn(comptime S, *S, gpa)`; `testing.fuzz` hands it a
