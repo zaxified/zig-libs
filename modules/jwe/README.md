@@ -16,7 +16,7 @@ the plaintext, with `header` itself as Additional Authenticated Data.
 
 All listed algorithms are implemented and KAT-validated — see "Status"
 below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
-`aesgcm`'s `Aes192Gcm`, since std (0.17.0) has none.
+`aesgcm`'s `Aes192Gcm`, since std (checked against 0.17.1) has none.
 
 - **Model after:** RFC 7516 (JWE) + RFC 7518 (JWA encryption algorithms) +
   RFC 3394 (AES Key Wrap).
@@ -39,7 +39,7 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
 | `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (key management) | **REAL** (ephemeral-static ECDH on P-256 or X25519 + Concat KDF; RFC 7518 Appendix C KAT) |
 | `A128GCM` / `A256GCM` (content encryption) | **REAL** (`aesgcm`) |
 | `A128CBC-HS256` / `A256CBC-HS512` (content encryption) | **REAL** (AES-CBC + HMAC encrypt-then-MAC; RFC 7518 B.1/B.3 KATs) |
-| `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` / `ECDH-ES+A192KW` | **REAL** since 2026-10-10 (AES-192 from the `aes192` module, GCM from `aesgcm`; RFC 7518 B.2, RFC 3394 §4.2/§4.4 and McGrew–Viega 7–10 KATs, full-token round trips — RFC 7520 has no AES-192 examples) |
+| `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` / `ECDH-ES+A192KW` | **REAL** (AES-192 from the `aes192` module, GCM from `aesgcm`; RFC 7518 B.2, RFC 3394 §4.2/§4.4 and McGrew–Viega 7–10 KATs, full-token round trips — RFC 7520 has no AES-192 examples) |
 
 ## Usage
 
@@ -69,8 +69,7 @@ defer gpa.free(plaintext2);
 ```
 
 `KeyMaterial` is a tagged union of **six** arms (`symmetric` / `rsa_public` /
-`rsa_private` / `password` / `ec_public` / `ec_private` — the ECDH-ES pair was
-missing from this list, in the very sentence that states the defense) — its tag must match what the header's `alg` expects, or decrypt
+`rsa_private` / `password` / `ec_public` / `ec_private`) — its tag must match what the header's `alg` expects, or decrypt
 fails closed with `error.KeyMaterialMismatch` (the JWE analogue of `jwt`'s
 `AlgKeyMismatch` algorithm-confusion defense).
 
@@ -109,6 +108,12 @@ honest fit here.
 - See SPEC.md for the full threat model (constant-time tag compare,
   RSA-OAEP randomness, the AES-CBC-HMAC `AL`-encoding footgun, key-material
   confusion).
+
+## Not provided
+
+JSON serialization (flattened/general) and multiple recipients, `RSA1_5`, `zip` (DEFLATE; refused
+outright) and ECDH-ES on P-384/P-521. See `SPEC.md` § What is deliberately not done and
+§ Backlog / deferred.
 
 ## Provenance
 

@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 verify-before-decrypt CBC-HMAC with a single error for tag or padding failure; refuses `zip`
 outright (a deliberate anti-zip-bomb stance that go-jose, which implements DEF, does not take)
 and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** JSON
-serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5, ECDH-ES on P-384/P-521 (→ Backlog).
+serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5 (refused, see *What is deliberately not done*), ECDH-ES on P-384/P-521 (→ Backlog).
 
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./NOTICE (module-local — see its own note on
@@ -74,23 +74,30 @@ placement).
   re-serializing the parsed JSON) avoid any JSON-canonicalization mismatch
   between "the header as written" and "the header the tag was computed
   over" — a classic JOSE interop footgun sidestepped by construction.
-- **AES-192 comes from sibling modules, not std** (since 2026-10-10). Zig
-  0.16's `std.crypto.core.aes` ships only `Aes128`/`Aes256` and
-  `std.crypto.aead.aes_gcm` no `Aes192Gcm` (all GCM sizes now run on `aesgcm`). `A192CBC-HS384`'s CBC half runs
-  on `aes192.Aes192` through `aescbc`; `A192GCM` and `A192GCMKW` on
-  `aesgcm.Aes192Gcm`; `A192KW`, `PBES2-HS384+A192KW` and `ECDH-ES+A192KW`
-  through `aeskw`'s 24-byte KEK arm. 128/256 stay on std. Anchors: RFC 7518
-  B.2 byte-exact both directions, McGrew–Viega 10 (A192GCM) and 8 (as a
-  GCMKW wrap), RFC 3394 §4.2/§4.4 in `aeskw`, and a full-token round trip of
-  every A192 `alg` × `enc` pair (RFC 7520 has no AES-192 example).
+- **AES-192 comes from sibling modules, not std.** std's `crypto.core.aes` ships only `Aes128`/`Aes256`
+  and `crypto.aead.aes_gcm` no `Aes192Gcm` (checked against Zig 0.17.1's std); all GCM sizes run on
+  `aesgcm`. `A192CBC-HS384`'s CBC half runs on `aes192.Aes192` through `aescbc`; `A192GCM` and
+  `A192GCMKW` on `aesgcm.Aes192Gcm`; `A192KW`, `PBES2-HS384+A192KW` and `ECDH-ES+A192KW` through
+  `aeskw`'s 24-byte KEK arm. 128/256 stay on std. Anchors: RFC 7518 B.2 byte-exact both directions,
+  McGrew–Viega 10 (A192GCM) and 8 (as a GCMKW wrap), RFC 3394 §4.2/§4.4 in `aeskw`, and a full-token
+  round trip of every A192 `alg` × `enc` pair (RFC 7520 has no AES-192 example).
+- **Direct modes carry no Encrypted Key.** RFC 7516 §5.2 step 10 requires the segment to be empty for
+  Direct Encryption (`dir`) and Direct Key Agreement (`ECDH-ES`); `decryptCompact` returns
+  `error.MalformedToken` for bytes in it. The segment is outside the AAD, so without the check anyone
+  could splice bytes into it and the token would still decrypt, a second, different token for the same
+  message.
+- **Every algorithm is implemented and KAT-validated.** The KATs are listed under *Verification*;
+  `aeskw` and `aescbc` were extracted from this module's own implementations, so their KATs and error
+  shapes are unchanged. RFC 7516 A.3 (`A128KW` + `A128CBC-HS256`) is asserted byte-exact in both
+  directions (decrypt, the raw key wrap against §A.3.3, encrypt against §A.3.7 with the RFC's CEK and
+  IV fed through a fixed byte stream); A.1 (RSA-OAEP) in the decrypt direction only, OAEP being
+  randomized.
 
 ## Threat model
 
 - **Key-material confusion** (the JWE analogue of `jwt`'s RFC 8725
   algorithm-confusion defense): `KeyMaterial` is a tagged union of six arms
-  (`symmetric`/`rsa_public`/`rsa_private`/`password`/`ec_public`/`ec_private`
-  — the two ECDH-ES arms were absent from this list, in the sentence that
-  states the defense), and both
+  (`symmetric`/`rsa_public`/`rsa_private`/`password`/`ec_public`/`ec_private`), and both
   `encryptCompact` and `decryptCompact` check the header's `alg` against the
   *kind* of key material supplied before doing any crypto —
   `error.KeyMaterialMismatch` on any mismatch (an `RSA-OAEP` token can never
@@ -167,7 +174,7 @@ placement).
   Appendix C. `ECDH-ES+A192KW` included (its KEK goes to `aeskw`'s AES-192
   arm).
 
-## Constant-time (ctgrind, 2026-11-13)
+## Constant-time (ctgrind)
 
 `src/ctgrind_harness.zig`, driven by `scripts/checks/ctgrind.sh jwe`; the pinned table is in
 `scripts/checks/ctgrind-expected.tsv` (ReleaseFast, unattributed 0, controls and traps 0).
@@ -199,61 +206,61 @@ key schedule (A1) and its `undefined` batch padding (A2) add contexts, none a jw
   the same `AuthenticationFailed` as a bad tag; a ciphertext that decodes validly with a correct
   length is one whose sender (anyone, the key is public) knew the CEK, so it opens no oracle.
 
-## `TODO(fable)` checklist — done-record (completed 2026-07-11)
-
-1. ✅ **`alg.aeskw` (the shared `aeskw` module): `wrap`/`unwrap`** (RFC 3394
-   AES Key Wrap, AES-128/256 KEK). Originally hand-rolled in this module as
-   `aeskw.zig` (itself mirrored from `modules/dnp3/src/sa.zig`'s `aeskw`
-   namespace, re-expressed against the RFC text, not imported); later
-   extracted verbatim into the standalone `aeskw` module — identical
-   signatures and `Error` set — so `dnp3`/`xmlenc`/`jwe` could all collapse
-   onto one core. `jwe` now imports it rather than shipping a local copy.
-   Byte-exact against RFC 3394 §4.1 both directions; extra tests cover
-   AES-256 multi-block round-trip, wrong-KEK/corrupted-input `Unauthentic`
-   (with zeroed output), and length/KEK validation. Integrity-IV compare is
-   `std.crypto.timing_safe.eql`.
-2. ✅ **`enc.zig`: `cbc_hmac.encrypt`/`decrypt`** (RFC 7518 §5.2 AES-CBC +
-   HMAC-SHA-2, encrypt-then-MAC). The CBC + PKCS#7 mechanics were similarly
-   extracted into the standalone `aescbc` module (shared with `xmlenc`);
-   `cbc_hmac` now calls `aescbc.encrypt`/`decrypt`/`padPkcs7`/`unpadPkcs7` and
-   keeps only the AEAD composition (AAD, the `AL` bit-length encoding, HMAC
-   computation, verify-before-decrypt ordering, and remapping
-   `aescbc`'s padding error onto the same `error.AuthenticationFailed` as a
-   tag mismatch) local. Byte-exact against RFC 7518 Appendix B.1 and B.3, `E`
-   and `T`, both directions; agrees with the std-only sanity-oracle test.
-   B.2 (A192CBC-HS384) likewise, both directions, since the `aes192`
-   module (2026-10-10). Tag compare is `std.crypto.timing_safe.eql`,
-   verify-before-decrypt; padding and tag failures return the identical
-   `error.AuthenticationFailed`.
-3. ✅ **End-to-end:** `kat_rfc7516.zig`'s RFC 7516 A.3 test (A128KW +
-   A128CBC-HS256) asserts byte-exact BOTH directions — decrypt recovers the
-   exact plaintext, the raw key wrap reproduces §A.3.3's Encrypted Key, and
-   encrypt (with the RFC's CEK + IV pinned through a fixed-stream `random`)
-   reproduces §A.3.7's exact compact token through `root.zig`'s dispatch.
-4. ✅ **AES-192** (2026-10-10): the `aes192` module's block cipher and
-   `aesgcm`'s `Aes192Gcm` unlock every `A192*` algorithm — see Design.
-
 ## Verification
 
-`zig build test-jwe`: all pass, no skips (header round-trips + `zip`
-rejection, `A128GCM`/`A256GCM` real round-trips + tamper detection,
-AES-192 KATs and round trips of every `A192*` algorithm, `dir`/`RSA-OAEP-256`/GCMKW/PBES2 wiring,
-RFC 3394 §4.1 AES-KW KAT + fail-closed tests, RFC 7518 B.1/B.2/B.3 CBC-HMAC
-KATs both directions + padding-vs-tag indistinguishability,
-the RFC 7518 Appendix C ECDH-ES KATs (P-256 ECDH `Z` and Concat-KDF-derived
-key, both byte-exact) plus cross-curve/invalid-peer-material/zeroing tests
-for both P-256 and X25519, full `encryptCompact`/`decryptCompact`
-round-trips including key-material-confusion and malformed-token rejection,
-and the byte-exact RFC 7516 A.1 (decrypt-direction) and A.3
-(both-directions) token KATs). Run: `zig build test-jwe` (Debug + ReleaseFast
-both green).
+Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`, `alg.zig`,
+`ecdhes.zig`, `header.zig`, `kat_rfc7516.zig`, `sweep_test.zig`, the two stack probes).
 
-## Status
+- **Content encryption** (`enc.zig`): `A128GCM`/`A256GCM` real round trips and tamper detection;
+  `A192GCM` against McGrew–Viega test case 10; RFC 7518 B.1/B.2/B.3 (`A128CBC-HS256`, `A192CBC-HS384`,
+  `A256CBC-HS512`) byte-exact `E` and `T`, both directions; the CBC-HMAC fail-closed test (a tag
+  mismatch and a padding failure are the same error); a non-block-aligned plaintext; a std-only
+  sanity oracle for B.1; a content tag one octet too long is refused, not truncated.
+- **Key management** (`alg.zig`, `root.zig`): `dir` (CEK is the shared key, wrong length refused, a
+  non-empty Encrypted Key refused); RSA-OAEP-256 round trip on RFC 7516 A.1's 2048-bit key; GCMKW
+  for all three sizes (A256: every KEK byte load-bearing; A192: McGrew–Viega case 8 as a wrap);
+  PBES2 wiring, the `max_p2c` and `p2s >= 8` edges, and the RFC 7517 Appendix C.4/C.5 KAT; AES-KW
+  through `alg.aeskw` (RFC 3394 §4.1); wrapped CEKs and GCMKW `iv`/`tag` of the wrong length are
+  `InvalidKey`; a failed unwrap never decrypts under a predictable CEK (the RFC 7516 §11.5 decoy), and
+  every Encrypted Key failure is one error value.
+- **ECDH-ES** (`ecdhes.zig`, `root.zig`): the RFC 7518 Appendix C KATs (P-256 `Z` and the Concat-KDF
+  derived key, byte-exact); a std oracle for the Concat KDF and its counter loop; round trips for
+  `ECDH-ES`, `+A128KW`, `+A256KW` (X25519), `+A192KW`; cross-curve and key-material confusion are
+  typed errors; off-curve, bad-length, zero/non-canonical-scalar and low-order peers are refused;
+  `PrivateKey.wipe` zeroes the scalar.
+- **End to end:** every A192 `alg` × `enc` pair round-trips; RFC 7516 A.1 (decrypt) and A.3 (both
+  directions) full-token KATs in `kat_rfc7516.zig`; key-material confusion (a `dir` token against an
+  RSA key), unknown `alg`/`enc`, an empty header segment, `expect_alg`/`expect_enc`, header and member
+  size limits at max + 1, non-empty `aad_extra`, `zip` and `crit` refused, an attacker-chosen PBES2
+  work factor refused, not performed.
+- **The entropy seam:** `Entropy` has exactly two arms, and a test shows the CSPRNG requirement is
+  load-bearing (`dir` + `A256GCM` with a repeated generator reuses the IV).
+- **No-panic sweep** (`src/sweep_test.zig`, one test per finding): an over-long byte member is
+  `HeaderTooLarge`/`BufferTooSmall`, an empty Concat KDF output derives nothing, a GCM plaintext past
+  2^36 − 32 bytes is an error, a header nested thousands of levels deep is refused, junk segments of
+  odd lengths never crash under any `alg` and `enc`.
+- **Dead-stack residue:** two `STACKPROBE` tests (ReleaseFast/ReleaseSmall only) look for key, scalar
+  and `Z` residue after ephemeral generation, `deriveZ`, the KDF, `encryptCompact`/`decryptCompact` under
+  ECDH-ES, and `pbes2DeriveKek`.
+- **Fuzz:** harnesses generic over their choice source, run by `std.testing.fuzz` and by the
+  deterministic driver `JWE_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver): `decryptCompact` on
+  arbitrary tokens, an encrypt + decrypt round trip (a genuine JWE opens, a flipped one is refused), and
+  `header.parse` on arbitrary header JSON. Reach tests fail unless every outcome is hit; corpus tests
+  pin how far each seed gets, and a TEETH test checks that the decrypt harness reaches the header
+  parser.
+- **Constant time:** the ctgrind harness (`src/ctgrind_harness.zig`) and its pinned table, see
+  *Constant-time (ctgrind)*.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-`gap · any · codec · reentrant` + deps `rsa`, `p256`, `aescbc`, `aeskw`, `aes192`, `aesgcm` —
-canonical source is `pub const meta` in src/root.zig ("gap" = fills a genuine
-ecosystem gap, same category as `jwt`). Everything this module lists is real
-and KAT-validated, AES-192 included since 2026-10-10 (see Design).
+## What is deliberately not done
+
+- **RSA1_5** (RSAES-PKCS1-v1_5) — not offered, following `rsa`'s "What is deliberately not done". A JWE
+  producer can always choose RSA-OAEP, unlike the SAML IdPs that force `xmlenc` into `rsa-1_5`, and
+  RFC 8725 §3.2 advises against RSA1_5. Revisited only if a consumer's peer cannot be changed; it would
+  then be off by default and with implicit rejection, as in `xmlenc`.
+- **`zip` (DEFLATE) compression** — refused outright (`UnsupportedZip`), see *Threat model*; go-jose
+  implements it, this module takes the anti-zip-bomb stance.
 
 ## Anchoring
 
@@ -264,51 +271,13 @@ and KAT-validated, AES-192 included since 2026-10-10 (see Design).
 
 **What the tests actually contain.** RFC 7516 App A full-token KAT (kat_rfc7516.zig) + RFC 7518 App B/C KATs
 
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure, 62
-tests, `setsid -w timeout -s KILL 20` per mutant): **35 mutants, 32 killed, 3 equivalent**.
-Points: token segmentation and the header limits, the up-front `alg`/`enc` refusals,
-`expect_alg`/`expect_enc`, the typed key-error passthrough and the §11.5 decoy CEK, the OAEP
-hash choice, every wrapped-CEK and GCMKW `iv`/`tag` length check, `max_p2c` and the `p2s`
-minimum, the ECDH-ES curve checks and both Concat KDF algorithm IDs and KEK sizes, `zip`/`crit`,
-the header member limit, the GCM and CBC-HMAC tag/ciphertext checks, `AL` and the MAC input,
-`dirCek`, the PBES2 salt separator, the ECDH public-key shape, and the Concat KDF counter,
-`keydatalen` and length prefixes.
-
-First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
-
-- **Defect — `dir` accepted a non-empty Encrypted Key.** RFC 7516 §5.2 step 10 requires it to be
-  empty for Direct Encryption and Direct Key Agreement; only the ECDH-ES branch checked. The
-  segment is outside the AAD, so a `dir` token with bytes spliced into it still decrypted — a
-  second, different token for the same message, the malleability the ECDH-ES test names. Now
-  `MalformedToken`, test added (verified red on the old code).
-- **Gaps closed (8 tests in `root.zig`):** `expect_alg`/`expect_enc` had no test at all (the
-  caller's algorithm pin); an unknown `alg`/`enc` and an empty header segment (the up-front
-  check is what keeps `unknown` from `unwrapCek`'s `unreachable`); the header and member
-  limits at max + 1; a failed unwrap must not decrypt under a predictable CEK (without the decoy
-  the CEK was `cek_buf`'s leftovers — 0xAA in the safe modes, and a token sealed under 0xAA
-  decrypted); a 17-octet content tag (GCM and CBC-HMAC compared the first 16); wrapped CEKs of
-  the wrong length (RSA: 15 read past the buffer, 17 truncated) and GCMKW `iv`/`tag` one octet
-  long; the `max_p2c` and `p2s ≥ 8` edges; and the first PBES2 KAT — RFC 7517 Appendix C.4/C.5
-  (derived KEK and Encrypted Key), without which the `alg || 0x00 || p2s` separator could be
-  anything.
-- **Equivalent (3):** the root-level epk-vs-key curve check (`deriveZ` refuses the same pair
-  with the same error); CBC-HMAC's empty-ciphertext refusal (an empty ciphertext can only carry
-  a valid tag if the key holder made it, and then fails unpadding as the same error); a missing
-  P-256 `y` read as `x` (off the curve, refused by the point decoder).
-
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-18 (wave 6) ~~**Portable ctgrind (`CTGRIND_CPU=x86_64`)**~~ *(2026-11-18)*: jwe runs in `scripts/test.sh ctgrind-portable` with `cpu=x86_64` variant rows (content 487, kw 332, ecdh 181, pbes2 182; controls/traps 100/55/51/29; rsa equals its plain row). The 5 unattributed trap contexts were the HARNESS's own memcpy / free / munmap of the returned plaintext: its CBC-HS unpad length is undefined on baseline x86-64 even untainted (std soft AES pads a partial bitsliced batch with `undefined` lanes, cause A2; `--track-origins` names only aescbc's and aeskw's frames holding that inlined std buffer), and the no-`-fvalgrind` trap cannot declassify it. The harness now copies / prints / frees the length of the plaintext it sent, checked against the returned one under `-fvalgrind`. Every other extra context is std's soft-AES key schedule (A1, loads at tainted indices, no jump) or A2 (std base64 over the A2-undefined ciphertext on the encrypt side; untainted controls/traps); no jwe branch on a key. Itemised in ctgrind-expected.tsv.
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- **(survey 2026-09-30) ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only (`rg 'pub const Curve' -A3 src/ecdhes.zig`); go-jose and panva/jose accept the NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive; `std.crypto.ecc.P384` exists in Zig 0.16 *(inferred, not checked)*). Fits §2: yes.
-- **(survey 2026-09-30) JWE JSON serialization (flattened/general) and multiple recipients** — go-jose and panva/jose both ship it; deliberately out of scope for v1 (see *Design & invariants*), listed because it is an API addition, not a framing change. Effort: medium. Fits §2: yes.
-- **(survey 2026-09-30) RSA1_5** (RSAES-PKCS1-v1_5) — decided 2026-09-30: *not offered*, following `rsa`'s
-  "What is deliberately not done". A JWE producer can always choose RSA-OAEP, unlike the SAML IdPs that force
-  `xmlenc` into `rsa-1_5`, and RFC 8725 §3.2 advises against RSA1_5. Revisited only if a consumer's peer cannot be
-  changed. It would then come off by default and with implicit rejection, as in `xmlenc`.
-- ~~**AES-192 variants**~~ — done 2026-10-10 (Design); `zip` stays refused by design.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only; go-jose and panva/jose accept the
+  NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive;
+  `std.crypto.ecc.P384` is the likely base *(inferred, not checked)*). Fits §2: yes.
+- **JWE JSON serialization (flattened/general) and multiple recipients** — go-jose and panva/jose both
+  ship it; deliberately out of scope for v1 (see *Design & invariants*), listed because it is an API
+  addition, not a framing change. Effort: medium. Fits §2: yes.
+- **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
+  bench of its own.
