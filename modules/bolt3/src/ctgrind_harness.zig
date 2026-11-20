@@ -5,9 +5,8 @@
 //! constant-time scalar ladder." Until this file existed that sentence had
 //! nothing behind it but the ladder's own reputation. Run it through
 //! `zig build ctgrind -Dctgrind-module=bolt3 -Dctgrind-valgrind=true
-//! -Doptimize=ReleaseFast` (and `-Dctgrind-valgrind=false` for the trap row);
-//! `bolt3` has no entry in `scripts/checks/ctgrind.sh` yet, so it cannot be driven by
-//! name until the coordinator adds one. Not wired into `zig build
+//! -Doptimize=ReleaseFast` (and `-Dctgrind-valgrind=false` for the trap row),
+//! or by name: `scripts/checks/ctgrind.sh --check bolt3`. Not wired into `zig build
 //! test-bolt3`: memcheck's context count is valgrind's own verdict, not
 //! something a Zig test can assert on.
 //!

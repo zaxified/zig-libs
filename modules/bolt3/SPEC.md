@@ -22,13 +22,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) — **reference** | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `chan_utils` holds the same key derivations *and* commitment/HTLC transaction construction, scripts and the shachain store (README describes `chan_utils` as reusable outside Lightning); this module has only the derivations and shachain generation *(rest inferred from the README)*. |
+| [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) — **reference** | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `chan_utils` holds the same key derivations *and* commitment/HTLC transaction construction, scripts and the shachain store (README describes `chan_utils` as reusable outside Lightning); this module has the derivations and the shachain generation and store *(rest inferred from the README)*. |
 | [lightningnetwork/lnd](https://github.com/lightningnetwork/lnd) | Go | MIT | 8.2k | v0.21.3-beta (2026-09-02) | BOLT#3 key derivation, `shachain`, commitment-tx and HTLC-script building live in lnd's packages *(inferred, not opened)*; this module covers the crypto pocket only. |
 | [ElementsProject/lightning](https://github.com/ElementsProject/lightning) (Core Lightning) | C | BSD-MIT (`LICENSE`; `ccan/` has its own) | 3.1k | v26.06.8 (2026-09-22) | Derivations and shachain in C (`common/`, `ccan/`) *(inferred)*. |
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | Scala; transactions package builds commitment/HTLC transactions *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** a stand-alone, dependency-light (std + `k256`) Zig implementation, byte-exact against BOLT#3 Appendix D/E, which no other Zig library offers. **Where we are behind:** everything around the keys: commitment/HTLC transaction and script construction, feerate/dust math and the shachain *receiving* store (`RevocationStore`).
+**Where we are ahead:** a stand-alone, dependency-light (std + `k256`) Zig implementation, byte-exact against BOLT#3 Appendix D/E, which no other Zig library offers. **Where we are behind:** everything around the keys: commitment/HTLC transaction and script construction, feerate/dust math.
 
 ## Scope
 
@@ -50,6 +50,12 @@ per-commitment secret generation that sources them.
   `generate_from_seed`: from the seed, for each set bit of the 48-bit index from
   bit 47 down to 0, flip that bit of the running value and SHA-256 it. Forward-
   derivable, not backward — the property the whole revocation scheme relies on.
+- **Per-commitment secret storage** (Appendix D, `RevocationStore`): the receiver keeps the counterparty's revealed
+  secrets in 49 entries, one per trailing-zero count of the index (`where_to_put_secret`); `insert` checks that every
+  entry in a lower bucket derives from the new secret (`derive_secret`) and refuses the secret otherwise
+  (`InconsistentSecret`, store unchanged; an empty lower bucket, i.e. secrets not given in counting-down order, is
+  refused the same way, as LDK's `provide_secret` does); `get` is `derive_old_secret` (null for an index not yet
+  covered). The stored secrets are the counterparty's revealed ones, so no burn or wipe is applied.
 - Hash-to-scalar reduction reuses the repo's `bip340` idiom (widen to 48 bytes,
   wide-reduce mod n) so a hash value ≥ n is never rejected.
 
@@ -66,7 +72,9 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 
 - Run: `scripts/modtest bolt3`. The tests live in `src/root.zig`; the stack-residue probe in `src/stackprobe_test.zig`.
 - BOLT#3 **Appendix E**: all four vectors (key and revocation, public and secret) byte-exact.
-- BOLT#3 **Appendix D**: all five `generate_from_seed` generation vectors byte-exact.
+- BOLT#3 **Appendix D**: all five `generate_from_seed` generation vectors byte-exact, and all nine `insert_secret`
+  storage sequences (accepted steps and the refused last step, which leaves the store unchanged); `get` returns every
+  received secret of a 70-step run and null for the next index.
 - Cross-checks: each derived secret's public point equals the independently derived public key; a real shachain secret
   feeds the revocation derivation.
 - Refusals: invalid points (all-zero), zero secrets and secrets >= n are pinned as `InvalidPoint` / `InvalidSecret`
@@ -81,9 +89,6 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 
 ## Backlog / deferred
 
-- **App D storage half**: `RevocationStore`, the O(48)-element compact store of received per-commitment secrets with
-  derived-child consistency validation (BOLT#3 Appendix D *storage* vectors). Smaller crypto, more data structure.
-  Missing and it matters (lnd `shachain` and LDK have it); effort small; fits CONVENTIONS §2.
 - **Commitment / HTLC transaction construction**: the non-crypto serialization (to_local/to_remote/HTLC outputs,
   scripts, feerate math). Not a Fable pocket. Missing and it matters (most of what LDK `chan_utils` offers); effort
   large; fits CONVENTIONS §2, builds on `bitcointx`/`bitcoinscript`.

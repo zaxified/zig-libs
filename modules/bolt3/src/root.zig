@@ -155,18 +155,24 @@ pub const max_index: u48 = (1 << 48) - 1;
 /// secret for a given 48-bit index from a 32-byte channel seed. Starting from
 /// the seed, for each bit set in `index` (from bit 47 down to 0) flip that bit
 /// of the running value and SHA-256 it. This is the hash tree that lets a node
-/// store any prefix of already-revealed secrets in O(48) space (see the
-/// storage half — a follow-up `RevocationStore`) while making each secret
-/// derivable only forward, never backward.
+/// store any prefix of already-revealed secrets in O(48) space
+/// (`RevocationStore`) while making each secret derivable only forward,
+/// never backward.
 /// The result goes into `out`; runs under a dead-stack burn.
 pub fn perCommitmentSecret(out: *[32]u8, seed: *const [32]u8, index: u48) void {
     return burn.run(burn.shachain_burn, void, perCommitmentSecretBody, .{ out, seed, index });
 }
 
 fn perCommitmentSecretBody(out: *[32]u8, seed: *const [32]u8, index: u48) void {
-    var p = seed.*;
+    deriveBits(out, seed, 48, index);
+}
+
+/// BOLT#3 `derive_secret(base, bits, I)`: the hash walk over the low `bits`
+/// bits of `index`, from `base` (the seed when `bits` = 48).
+fn deriveBits(out: *[32]u8, base: *const [32]u8, bits: u6, index: u48) void {
+    var p = base.*;
     defer std.crypto.secureZero(u8, &p);
-    var b: usize = 48;
+    var b: usize = bits;
     while (b > 0) {
         b -= 1;
         if ((index >> @intCast(b)) & 1 == 1) {
@@ -178,6 +184,64 @@ fn perCommitmentSecretBody(out: *[32]u8, seed: *const [32]u8, index: u48) void {
     }
     out.* = p;
 }
+
+/// BOLT#3 Appendix D "Efficient Per-commitment Secret Storage": the receiver's
+/// store of the counterparty's revealed per-commitment secrets, 49 entries for
+/// all 2^48 of them. Secrets arrive counting down from `max_index`; each one is
+/// filed in the bucket of its index's trailing zero count, and every entry in a
+/// lower bucket must be derivable from it (`insert` refuses one that is not:
+/// the counterparty sent a secret that does not belong to its own chain).
+/// `get` derives any secret already received. Algorithm and refusal rule as
+/// the spec's `insert_secret` / `derive_old_secret` (lnd `shachain`, LDK
+/// `CounterpartyCommitmentSecrets` hold the same 49 entries).
+pub const RevocationStore = struct {
+    known: [49]Entry = @splat(.{}),
+
+    const Entry = struct {
+        secret: [32]u8 = @splat(0),
+        /// `null` = empty bucket.
+        index: ?u48 = null,
+    };
+
+    pub const InsertError = error{
+        /// An already stored secret is not derivable from this one (or a lower
+        /// bucket is still empty: the secrets were not given in order).
+        InconsistentSecret,
+    };
+
+    /// BOLT#3 `where_to_put_secret`: trailing zeros of `index` (48 for 0).
+    fn bucket(index: u48) u6 {
+        return if (index == 0) 48 else @intCast(@ctz(index));
+    }
+
+    /// Store the secret for `index`, after checking every entry it must
+    /// derive. On `InconsistentSecret` the store is unchanged.
+    pub fn insert(self: *RevocationStore, secret: *const [32]u8, index: u48) InsertError!void {
+        const b = bucket(index);
+        for (self.known[0..b]) |*e| {
+            const old_index = e.index orelse return error.InconsistentSecret;
+            var derived: [32]u8 = undefined;
+            deriveBits(&derived, secret, b, old_index);
+            if (!std.mem.eql(u8, &derived, &e.secret)) return error.InconsistentSecret;
+        }
+        self.known[b] = .{ .secret = secret.*, .index = index };
+    }
+
+    /// BOLT#3 `derive_old_secret`: the secret for `index`, or null when no
+    /// stored entry covers it (not received yet).
+    pub fn get(self: *const RevocationStore, index: u48) ?[32]u8 {
+        for (&self.known, 0..) |*e, b| {
+            const known_index = e.index orelse continue;
+            const mask: u48 = if (b == 48) 0 else ~((@as(u48, 1) << @intCast(b)) - 1);
+            if (index & mask == known_index & mask) {
+                var out: [32]u8 = undefined;
+                deriveBits(&out, &e.secret, @intCast(b), index);
+                return out;
+            }
+        }
+        return null;
+    }
+};
 
 // Value-shaped test wrappers over the `out`-pointer API.
 fn tPriv(b: [32]u8, p: [32]u8) Error![32]u8 {
@@ -337,4 +401,130 @@ test "derivePrivateKey / deriveRevocationPrivateKey: out is zeroed on error, wha
     out = @splat(0xaa);
     try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(&out, &zero, &tv_pcs));
     try std.testing.expectEqualSlices(u8, &zero, &out);
+}
+
+// ── BOLT#3 Appendix D: storage tests (insert_secret) ──────────────────────
+// Every sequence starts at `max_index` and counts down; `fail_last` = the
+// spec expects the last insert to be refused (all earlier ones accepted).
+const StorageCase = struct { name: []const u8, fail_last: bool, secrets: []const []const u8 };
+const storage_cases = [_]StorageCase{
+    .{ .name = "insert_secret correct sequence", .fail_last = false, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+        "c65716add7aa98ba7acb236352d665cab17345fe45b55fb879ff80e6bd0c41dd",
+        "969660042a28f32d9be17344e09374b379962d03db1574df5a8a5a47e19ce3f2",
+        "a5a64476122ca0925fb344bdc1854c1c0a59fc614298e50a33e331980a220f32",
+        "05cde6323d949933f7f7b78776bcc1ea6d9b31447732e3802e1f7ac44b650e17",
+    } },
+    .{ .name = "insert_secret #1 incorrect", .fail_last = true, .secrets = &.{
+        "02a40c85b6f28da08dfdbe0926c53fab2de6d28c10301f8f7c4073d5e42e3148",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+    } },
+    .{ .name = "insert_secret #2 incorrect (#1 derived from incorrect)", .fail_last = true, .secrets = &.{
+        "02a40c85b6f28da08dfdbe0926c53fab2de6d28c10301f8f7c4073d5e42e3148",
+        "dddc3a8d14fddf2b68fa8c7fbad2748274937479dd0f8930d5ebb4ab6bd866a3",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+    } },
+    .{ .name = "insert_secret #3 incorrect", .fail_last = true, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "c51a18b13e8527e579ec56365482c62f180b7d5760b46e9477dae59e87ed423a",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+    } },
+    .{ .name = "insert_secret #4 incorrect (1,2,3 derived from incorrect)", .fail_last = true, .secrets = &.{
+        "02a40c85b6f28da08dfdbe0926c53fab2de6d28c10301f8f7c4073d5e42e3148",
+        "dddc3a8d14fddf2b68fa8c7fbad2748274937479dd0f8930d5ebb4ab6bd866a3",
+        "c51a18b13e8527e579ec56365482c62f180b7d5760b46e9477dae59e87ed423a",
+        "ba65d7b0ef55a3ba300d4e87af29868f394f8f138d78a7011669c79b37b936f4",
+        "c65716add7aa98ba7acb236352d665cab17345fe45b55fb879ff80e6bd0c41dd",
+        "969660042a28f32d9be17344e09374b379962d03db1574df5a8a5a47e19ce3f2",
+        "a5a64476122ca0925fb344bdc1854c1c0a59fc614298e50a33e331980a220f32",
+        "05cde6323d949933f7f7b78776bcc1ea6d9b31447732e3802e1f7ac44b650e17",
+    } },
+    .{ .name = "insert_secret #5 incorrect", .fail_last = true, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+        "631373ad5f9ef654bb3dade742d09504c567edd24320d2fcd68e3cc47e2ff6a6",
+        "969660042a28f32d9be17344e09374b379962d03db1574df5a8a5a47e19ce3f2",
+    } },
+    .{ .name = "insert_secret #6 incorrect (5 derived from incorrect)", .fail_last = true, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+        "631373ad5f9ef654bb3dade742d09504c567edd24320d2fcd68e3cc47e2ff6a6",
+        "b7e76a83668bde38b373970155c868a653304308f9896692f904a23731224bb1",
+        "a5a64476122ca0925fb344bdc1854c1c0a59fc614298e50a33e331980a220f32",
+        "05cde6323d949933f7f7b78776bcc1ea6d9b31447732e3802e1f7ac44b650e17",
+    } },
+    .{ .name = "insert_secret #7 incorrect", .fail_last = true, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+        "c65716add7aa98ba7acb236352d665cab17345fe45b55fb879ff80e6bd0c41dd",
+        "969660042a28f32d9be17344e09374b379962d03db1574df5a8a5a47e19ce3f2",
+        "e7971de736e01da8ed58b94c2fc216cb1dca9e326f3a96e7194fe8ea8af6c0a3",
+        "05cde6323d949933f7f7b78776bcc1ea6d9b31447732e3802e1f7ac44b650e17",
+    } },
+    .{ .name = "insert_secret #8 incorrect", .fail_last = true, .secrets = &.{
+        "7cc854b54e3e0dcdb010d7a3fee464a9687be6e8db3be6854c475621e007a5dc",
+        "c7518c8ae4660ed02894df8976fa1a3659c1a8b4b5bec0c4b872abeba4cb8964",
+        "2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8",
+        "27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116",
+        "c65716add7aa98ba7acb236352d665cab17345fe45b55fb879ff80e6bd0c41dd",
+        "969660042a28f32d9be17344e09374b379962d03db1574df5a8a5a47e19ce3f2",
+        "a5a64476122ca0925fb344bdc1854c1c0a59fc614298e50a33e331980a220f32",
+        "a7efbc61aac46d34f77778bac22c8a20c6a46ca460addc49009bda875ec88fa4",
+    } },
+};
+
+test "BOLT#3 App D — insert_secret storage vectors" {
+    for (storage_cases) |c| {
+        var st: RevocationStore = .{};
+        for (c.secrets, 0..) |hex, k| {
+            var secret: [32]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&secret, hex);
+            const index: u48 = max_index - @as(u48, @intCast(k));
+            const last = k + 1 == c.secrets.len;
+            if (last and c.fail_last) {
+                const before = st;
+                std.testing.expectError(error.InconsistentSecret, st.insert(&secret, index)) catch |e| {
+                    std.debug.print("FAIL: {s}\n", .{c.name});
+                    return e;
+                };
+                try std.testing.expect(std.meta.eql(before, st)); // unchanged
+            } else {
+                st.insert(&secret, index) catch |e| {
+                    std.debug.print("FAIL: {s} step {d}\n", .{ c.name, k });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+test "RevocationStore.get derives every received secret and nothing newer" {
+    const seed: [32]u8 = @splat(0xff);
+    var st: RevocationStore = .{};
+    const n = 70;
+    for (0..n) |k| {
+        const index = max_index - @as(u48, @intCast(k));
+        try st.insert(&tShachain(seed, index), index);
+    }
+    for (0..n) |k| {
+        const index = max_index - @as(u48, @intCast(k));
+        try std.testing.expectEqualSlices(u8, &tShachain(seed, index), &(st.get(index) orelse return error.TestUnexpectedResult));
+    }
+    // Not received yet: the next one down.
+    try std.testing.expect(st.get(max_index - n) == null);
+    // Out of order: skipping an index leaves a lower bucket empty or wrong.
+    var gap: RevocationStore = .{};
+    try gap.insert(&tShachain(seed, max_index), max_index);
+    try std.testing.expectError(error.InconsistentSecret, gap.insert(&tShachain(seed, max_index - 3), max_index - 3));
 }
