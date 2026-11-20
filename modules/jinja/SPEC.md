@@ -23,11 +23,11 @@ what it is verified against.
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Feature claims about our side come from
-`SPEC.md` §6 (divergences D1–D22, checked against `src/filters.zig` names, not re-derived).
+`SPEC.md` §6 (divergences D1–D26, checked against `src/filters.zig` names, not re-derived).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [pallets/jinja](https://github.com/pallets/jinja) (Jinja2 3.1.6) — **reference** | Python | BSD-3-Clause | 11.8k | 3.1.6 (2025-03-05) | The yardstick and this module's byte-exact oracle (351 goldens captured from it, replayed hermetically; the live peer runs as `zig build interop-jinja`). Has the four filters (`attr`, `pprint`, `random`, `urlize`), two tests (`filter`, `test`) and three globals (`lipsum`, `cycler`, `joiner`) we lack, `{% trans %}`, the `{% autoescape %}` block, sandbox, extensions, bytecode caching, async, arbitrary-precision ints. |
+| [pallets/jinja](https://github.com/pallets/jinja) (Jinja2 3.1.6) — **reference** | Python | BSD-3-Clause | 11.8k | 3.1.6 (2025-03-05) | The yardstick and this module's byte-exact oracle (a golden corpus captured from it, replayed hermetically; the live peer runs as `zig build interop-jinja`). Has the four filters (`attr`, `pprint`, `random`, `urlize`) and the global `lipsum` we lack, `{% trans %}`, the `{% autoescape %}` block, sandbox, extensions, bytecode caching, async, arbitrary-precision ints. |
 | [mitsuhiko/minijinja](https://github.com/mitsuhiko/minijinja) | Rust | Apache-2.0 | 2.8k | 2.24.0 (2026-08-12) | Zero-dependency Jinja2-style engine by Jinja's author; documents its own deviations (no Python methods, custom delimiters optional, kwargs model) in `COMPATIBILITY.md`. Runtime values via serde, filter/function registration API, `minijinja-cli`. Also has Go, Python and WASM ports. |
 | [Keats/tera](https://github.com/Keats/tera) | Rust | MIT | 4.3k | no releases (push 2026-09-11) | Jinja2/Django-flavoured but not byte-compatible; the Rust default for static-site and config templating. |
 | [flosch/pongo2](https://github.com/flosch/pongo2) | Go | MIT | 3.1k | v6.1.0 (2026-05-02) | Django-syntax engine (Django, not Jinja2), the most used Go one *(inferred from its README title; not read)*. |
@@ -40,12 +40,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No template engine *(inferred)*. |
 
 **Where we are ahead:** of every Jinja-syntax engine here, the only one whose output is checked against the reference with a
-replayed corpus of 351 real Jinja2 3.1.6 outputs, with a maintained list of the 22 divergences and a compile error
+replayed corpus of real Jinja2 3.1.6 outputs, with a maintained list of its divergences (§6) and a compile error
 (never a silent no-op) for anything missing; explicit `undefined` policy (strict by default) and autoescape as options;
 inheritance with `super()`, `scoped`, `required`, macros, `caller()`, `namespace()`, `recursive` loops and every
 whitespace control; a contained loader (path containment, cycle and expansion bounds) and output/nesting caps; Python-exact
-number semantics and `repr`. **Where we are behind:** the four missing filters (`urlize`, `pprint`, `random`, `attr`), the missing `filter`/`test` tests, `cycler`/`joiner`/`lipsum`,
-`i64` integers, no `{% autoescape %}` block or `{% trans %}`, no
+number semantics and `repr`. **Where we are behind:** the four missing filters (`urlize`, `pprint`, `random`, and `attr`, which is rejected — see *What is deliberately not done*), the missing `lipsum` global,
+`i64` integers, no `{% autoescape %}` block or `{% trans %}`, no line statements or
 custom delimiters, and vibe-jinja's larger built-in vocabulary.
 
 ## 1. Shape
@@ -102,7 +102,8 @@ The obvious options were `std.json.Value`, `yaml.Value` (ordered pairs), or an
 interface with adapters. The decision is: **the render-time value is this
 module's own type, and ingress is a conversion** (`valueFrom` for Zig data,
 `valueFromJson` for `std.json.Value`, a documented ~20-line function for
-`yaml.Value`). `deps` stays empty.
+`yaml.Value`). The module takes no value-model dependency; its one dependency is
+`unitext`, for Unicode case mapping (D4).
 
 Three things drove it.
 
@@ -269,12 +270,12 @@ or a documented, tested behaviour.
 | D1 | Default `undefined_policy` is `.strict` (see §4) | default, opt-out |
 | D2 | i18n (`{% trans %}`/`{% pluralize %}`) and the `{% autoescape %}` block are not implemented — autoescaping is an environment option here, not a per-region switch | **compile error naming the tag** |
 | D3 | Integers are `i64`; Python's are arbitrary precision. Overflow is `error.OutOfRange` where Python grows the number | runtime error |
-| D4 | ~~`upper`/`lower`/`capitalize`/`title` ASCII-only~~ **Closed 2026-11-13:** `upper`, `lower`, `capitalize`, `title`, `is upper`/`is lower`, and the case folding of `sort`/`min`/`max`/`unique`/`groupby` use `unitext` (CPython `str` semantics: ß → SS, Final_Sigma, no Turkish tailoring). Ill-formed UTF-8 passes through unchanged instead of failing. The `title` *filter* keeps Jinja's own word rule (split on `-`, whitespace, `(`, `{`, `[`, `<`; each piece `item[0].upper() + item[1:].lower()`), the `.title()` *method* is Python's `str.title` (any non-cased character ends a word). The string methods `isdigit`/`isalpha` and `wordcount` stay ASCII/byte-based (D18) | closed |
+| D4 | `upper`, `lower`, `capitalize`, `title`, `is upper`/`is lower`, and the case folding of `sort`/`min`/`max`/`unique`/`groupby` use `unitext` (CPython `str` semantics: ß → SS, Final_Sigma, no Turkish tailoring). Ill-formed UTF-8 passes through unchanged instead of failing. The `title` *filter* keeps Jinja's own word rule (split on `-`, whitespace, `(`, `{`, `[`, `<`; each piece `item[0].upper() + item[1:].lower()`), the `.title()` *method* is Python's `str.title` (any non-cased character ends a word). The string methods `isdigit`/`isalpha` and `wordcount` stay ASCII/byte-based (D18) | silent, ASCII-only residue (D18) |
 | D5 | `map`/`select`/`reject`/`selectattr`/`rejectattr`/`items`/`dictsort`/`batch`/`slice` return lists, not generators, so rendering one directly prints `[…]` where the reference prints `<generator object …>` | silent, strictly more useful |
-| D6 | Filters absent: `attr`, `pprint`, `random`, `urlize` (`filesizeformat`, `format`, `groupby`, `wordwrap` landed 2026-11-13, §6.1) | **compile error** |
-| D7 | ✅ DONE 2026-11-16: tests `filter`, `test` and the symbolic aliases (`==` `!=` `>` `>=` `<` `<=`, usable via `select`/`reject`; `x is >=` is a syntax error in Jinja2 too) | — |
-| D8 | `cycler`/`joiner` ✅ DONE 2026-11-16 (`Value.gadget`, a stateful object: `cycler(*items)` with `.next()`/`.current`/`.reset()`, `joiner(sep=", ")` callable). Still absent: `lipsum` | `lipsum`: **runtime error** |
-| D9 | ✅ 2026-11-17 call-site `*args`/`**kwargs` (Jinja2's `parse_call_args` rules and runtime errors; 39 `d9_*` goldens). Still open: line statements/comments and custom delimiters | **compile error** |
+| D6 | Filters absent: `attr`, `pprint`, `random`, `urlize` (§6.1) | **compile error** |
+| D7 | Tests `filter`, `test` (they ask the environment, custom registrations included) and the symbolic aliases (`==` `!=` `>` `>=` `<` `<=`, usable via `select`/`reject`; `x is >=` is a syntax error in Jinja2 too) are implemented | none |
+| D8 | `cycler`/`joiner` are implemented (`Value.gadget`, a stateful object: `cycler(*items)` with `.next()`/`.current`/`.reset()`, `joiner(sep=", ")` callable). The `lipsum` global is absent | `lipsum`: **runtime error** |
+| D9 | Call-site `*args`/`**kwargs` follow Jinja2's `parse_call_args` rules and runtime errors (`d9_*` goldens). Line statements/comments and custom delimiters are not implemented | **compile error** |
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
 | D11 | String methods are a documented subset (README); an unknown one is a render error naming the type and method | runtime error |
 | D12 | `round(x, p)` falls back to scaled arithmetic when the exact integer form would exceed `u128` (roughly `|p| > 22`) | silent, beyond f64 precision |
@@ -289,35 +290,28 @@ or a documented, tested behaviour.
 | D21 | A filter or test named by a *string argument* to `map`/`select`/`reject`/`selectattr`/`rejectattr` is resolved at render time, as in the reference — unlike a directly named filter, which is resolved at compile time | runtime error |
 | D22 | `~` and `\|length` on an undefined value are `error.UndefinedValue` under `.lenient` too, where the reference's `Undefined` renders `''` and answers `0` | runtime, stricter |
 | D23 | `groupby` yields plain 2-tuples `(grouper, list)` (their `repr` is the reference's, `_GroupTuple.__repr__ = tuple.__repr__`); this model has no named tuples, so any 2-tuple whose second item is a list answers `.grouper` and `.list`, where the reference answers undefined for other tuples | silent, more permissive |
-| D24 | **Resolved by the oracle (2026-11-13):** `groupby` is case-insensitive by default, and the grouper of a group is the **first member's own attribute value** (`A, a` group as `A` when `A` comes first; the group `a, A` prints `a`), not the lower-cased sort key. Implemented and pinned by `s3_groupby_case_insensitive` | closed |
+| D24 | `groupby` is case-insensitive by default, and the grouper of a group is the **first member's own attribute value** (`A, a` group as `A` when `A` comes first; the group `a, A` prints `a`), not the lower-cased sort key. Implemented and pinned by `s3_groupby_case_insensitive` | none (matches the reference) |
 | D25 | `format` follows Python's `%` for `s r d i u x X o c e E f F g G %`, flags, width, precision and `*` (each case in the corpus, `s3_format_*`); `%a` is an error. `wordwrap` returns a plain string — **confirmed by the oracle**: the reference joins with `str.join`, so a `Markup` input is escaped on output (`s3_wordwrap_markup_in`) | runtime error (`%a`) |
 | D26 | `sameas` on empty containers is false (they have no distinguishable identity in this value model; Python is true only for the same object). `callable` is true for macros and `loop` only: `range`, `dict` and `namespace` are not first-class values here, so `range is callable` is false where the reference answers true | silent |
-
-Why `attr` was dropped rather than implemented (D6): the reference's `attr`
-filter is `getattr` *without* the `getitem` fallback, so applied to a mapping —
-which is what every context value here is — it returns undefined, always. A
-filter that can only ever produce undefined is a trap; a compile error saying it
-does not exist is better than a faithful no-op. `map(attribute=…)` and
-`selectattr` keep working on mapping keys, because those use the fallback path in
-the reference too.
 
 ### 6.1 Builtin filters, tests and globals against Jinja2 3.1.x
 
 Source: the Jinja2 3.1.x documentation lists "List of Builtin Filters / Tests / Global Functions" (templates.html) and the
-reference's `jinja2/filters.py`, `tests.py`, `defaults.py`. Status after the 2026-11-13 S3 pass.
+reference's `jinja2/filters.py`, `tests.py`, `defaults.py`. Current status.
 
 **Filters.** Present: `abs` `batch` `capitalize` `center` `count` `d`/`default` `dictsort` `e`/`escape`
 `filesizeformat` `first` `float` `forceescape` `format` `groupby` `indent` `int` `items` `join` `last` `length` `list` `lower` `map`
 `max` `min` `reject` `rejectattr` `replace` `reverse` `round` `safe` `select` `selectattr` `slice` `sort` `string` `striptags` `sum`
 `title` `tojson` `trim` `truncate` `unique` `upper` `urlencode` `wordcount` `wordwrap` `xmlattr`. Absent: `attr` (deliberately,
-see below), `pprint` (Python's pretty-printer layout), `random` (needs an injectable seed), `urlize` (URL/e-mail detection regexes).
+see *What is deliberately not done*), `pprint` (Python's pretty-printer layout), `random` (needs an injectable seed), `urlize` (URL/e-mail detection regexes).
 
-**Tests.** Present: `boolean` `callable` `defined` `divisibleby` `eq`/`equalto`/`==` (named forms only) `escaped`
+**Tests.** Present: `boolean` `callable` `defined` `divisibleby` `eq`/`equalto` `escaped`
 `even` `false` `float` `ge` `gt`/`greaterthan` `in` `integer` `iterable` `le` `lt`/`lessthan` `lower` `mapping` `ne` `none` `number`
-`odd` `sameas` `sequence` `string` `true` `undefined` `upper`. Absent: the symbolic aliases (`==`, `!=`, `>`, `>=`, `<`, `<=`),
-`filter` and `test` (they ask the environment whether a name is registered; the evaluator has no such query).
+`odd` `sameas` `sequence` `string` `true` `undefined` `upper`, `filter` and `test` (they ask the environment whether a name is
+registered, custom registrations included) and the symbolic aliases (`==`, `!=`, `>`, `>=`, `<`, `<=`, registered as test names for
+`select`/`reject`). Absent: none.
 
-**Globals.** Present: `range` `dict` `namespace`. Absent: `lipsum` (D8); `cycler`/`joiner` ✅ DONE 2026-11-16.
+**Globals.** Present: `range` `dict` `namespace` `cycler` `joiner`. Absent: `lipsum` (D8).
 
 **`format` design.** `fmt % args` is Python's printf: the engine parses the specification itself and renders floats from the
 EXACT binary value (a small bignum), because std's printer rounds the shortest round-trip digits and answers `2.68` for
@@ -335,21 +329,25 @@ including its chunker (`wordsep_re` hyphen and em-dash rules, written out by han
 folding unless `case_sensitive`, then groups equal neighbours; keys of mixed kinds are `error.TypeMismatch` as the reference's
 `sorted` raises `TypeError`. The result is a list of `(grouper, list)` tuples (D23, D24).
 
-**Why `attr` stays absent** (D6 above): see the paragraph there.
-
-## 7. Verification
+## Verification
 
 The anchor is **Python Jinja2 3.1.6**, the reference implementation, and the
-comparison is byte-for-byte: `tools/corpus.zig` holds 351 cases (template + the
+comparison is byte-for-byte: `tools/corpus.zig` holds the cases (template + the
 other templates its loader serves + JSON context + syntax options), and both
 sides render exactly that table — Zig against a `MapLoader`, Python against a
 `DictLoader` built from the same table.
 
-Since **2026-09-06** the anchor is *taken* outside the module and *replayed*
-inside it. A module here is standalone Zig with no external dependency; an
-oracle that needs a `python3` is not, so the two are no longer the same file.
+The anchor is *taken* outside the module and *replayed* inside it. A module here
+is standalone Zig with no external dependency; an oracle that needs a `python3`
+is not, so the two are not the same file.
 
-**Taking it** (`tools/interop.zig` + `tools/reference.py`, a program, never
+- **Run:** `scripts/modtest jinja` (unit tests, conformance replay, deterministic
+  fuzz seeds); `zig build interop-jinja` re-runs the live Python peer;
+  `zig build check-interop` compiles it without running it.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
+
+**Taking the anchor** (`tools/interop.zig` + `tools/reference.py`, a program, never
 built by `test-jinja`). It renders the corpus with the reference and captures
 every case — inputs *and* rendered bytes — into `src/testdata/golden.json`:
 
@@ -369,9 +367,7 @@ pre-release check rather than a per-commit one.
 **Replaying it** (`src/reference_replay_test.zig`). Every recorded case is
 rendered by this engine and compared with the reference's bytes — no child
 process, no Python, no foreign source in the module, so the assertion runs on
-every host rather than skipping on the ones without a peer. Before the split
-this half ran only where Python did; CI's peer install is `continue-on-error`,
-so a failed install degraded to a silent skip.
+every host rather than skipping on the ones without a peer.
 
 **What the transcript pins.** Rendering is not a function of the template
 alone, so the file records the Jinja2 version, the MarkupSafe version, the
@@ -381,43 +377,14 @@ pinned process environment (`PYTHONHASHSEED=0`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`),
 and Jinja's whole `policies` table — which is what decides `tojson`'s key order
 and `truncate`'s leeway. The per-case knobs (autoescape, undefined policy,
 `trim_blocks`, `lstrip_blocks`, `keep_trailing_newline`) are recorded in the
-case. Determinism is reached by pinning those, never by comparing less: all 351
-cases are compared, on the full rendered byte string.
+case. Determinism is reached by pinning those, never by comparing less: every
+case is compared, on the full rendered byte string.
 
-**The replay cannot shrink quietly.** The corpus lives outside the module now,
-so the module holds its own floor: the replay test fails below 351 cases,
-requires the corner counts the corpus exists for (≥50 cases with a loader, ≥30
-that the reference refuses, ≥35 autoescaped), requires unique names, requires
-every entry to carry its inputs, and requires the provenance header to be
-present. Measured 2026-09-06: a dropped case, a flipped output byte, and a
-missing header field each fail it.
-
-**Load-bearing check** (earlier mutation checks, before 2026-10-06). The oracle
-is verified to be load-bearing by mutation, once per surface. For the expression engine: changing `pyMod` from Python's
-floored remainder to `@rem` (C truncation) — a change no unit test notices —
-turns `mod_negatives` red in the replay (`1|1|-1|-1` vs `1|-1|1|-1`). For
-composition: making every `{% block %}` behave as if it were `scoped` — the
-single most tempting simplification in the whole inheritance implementation,
-and one that no self-written test would catch because it makes blocks see
-*more* — turns `block_in_for_is_not_scoped_by_default` red in the replay
-(`<><>` vs `<1><2>`). Both mutations were reverted.
-
-**Mutation run 2026-10-06** (in-place, Debug, 38 mutants over the loader's name
-checks, every render cap, `range`/slice/index bounds, the autoescape and
-`xmlattr` decisions, the two memory guards, `//` and the float-to-int range, the
-parser's nesting bound and two lexer refusals): 36 killed. The first pass left
-20 — the reference replay never reaches a cap or a refusal, and the bomb tests
-run each cap at ten times its value, so a cap moved one past its bound passed
-them all. Tests added: every render cap at its bound and one past it
-(`max_output_bytes`, `max_templates`, `max_template_depth` for nesting and for
-inheritance, `max_call_depth` for macros and for recursive loops), the memory
-guards and zero steps under a 1 MiB budget, `checkName`'s whole-name and
-component-count bounds and a lone NUL byte, index == length, `truncate` at
-`length == len(end)`, an unmatched closer and a cut-off `\x` escape. Equivalent:
-`checkName`'s leading-`/` rule (the empty first component refuses the same
-names as `MalformedName`, and the test accepts either refusal by design), and
-the negative-step slice's `i >= len` guard (`i` starts at most `len - 1` and
-only decreases).
+**The replay cannot shrink quietly.** The corpus lives outside the module, so the
+module holds its own floor: the replay test fails below `min_cases`, requires the
+corner counts the corpus exists for (≥50 cases with a loader, ≥30 that the
+reference refuses, ≥35 autoescaped), requires unique names, requires every entry
+to carry its inputs, and requires the provenance header to be present.
 
 **What the corpus is weighted towards.** Not the easy paths: whitespace-control
 combinations including `+` and the option interactions, `loop` inside nested
@@ -439,33 +406,38 @@ and a caller body that reads the enclosing loop, macro `varargs`/`kwargs` and th
 argument counts that must be *refused*, recursive loops with `loop.depth`, and
 composition crossed with autoescape and with whitespace control.
 
-**Fuzzing** (`fuzz_test.zig`): arbitrary bytes as template source, with and
-without the whitespace-rewriting options, must never trip a safety check. Any
-`error` is a fine outcome. Per CONVENTIONS §7.1, that evidence is about a Debug
-or ReleaseSafe build.
+**Cap and refusal tests.** Every render cap is tested at its bound and one past
+it (`max_output_bytes`, `max_templates`, `max_template_depth` for nesting and for
+inheritance, `max_call_depth` for macros and for recursive loops), as are the
+memory guards and zero steps under a 1 MiB budget, `checkName`'s whole-name and
+component-count bounds and a lone NUL byte, index == length, `truncate` at
+`length == len(end)`, an unmatched closer and a cut-off `\x` escape — the
+reference replay never reaches a cap or a refusal, so a cap moved one past its
+bound would pass it.
 
-**Scope tests** (`scope_test.zig`, 2026-11-13): the S3 built-ins. The same filters are in the oracle corpus (80 `s3_*` cases of `tools/corpus.zig`, golden.json re-captured from Jinja2 3.1.6), so the replay compares every one byte for byte; `scope_test.zig` adds the cases the corpus cannot hold (hostile widths, bounds, the sweep).
+**Call-site `*args`/`**kwargs` tests.** The grammar violations on callees that
+would render if accepted, the messages, `BadCall` for each bad operand, undefined
+as empty when lenient and an error when strict, `varargs`/`kwargs` found only
+inside a splat, and an out-of-memory sweep.
+
+**Fuzzing** (`fuzz_test.zig`): arbitrary bytes as template source, with and
+without the whitespace-rewriting options, plus numeric arguments, autoescaped
+context data, `xmlattr` and arithmetic, must never trip a safety check. Any
+`error` is a fine outcome. The verdict comes from the deterministic driver
+`JINJA_FUZZ=<runs>[,<first seed>]` (harnesses `jinja-compile`,
+`jinja-whitespace`, `jinja-numeric`, `jinja-autoescape`, `jinja-xmlattr`,
+`jinja-arith`; `JINJA_FUZZ_ONLY` selects one), run in the ordinary test binary.
+Per CONVENTIONS §7.1, that evidence is about a Debug or ReleaseSafe build.
+
+**Scope tests** (`scope_test.zig`): the S3 built-ins. The same filters are in the
+oracle corpus (the `s3_*` cases of `tools/corpus.zig`), so the replay compares
+every one byte for byte; `scope_test.zig` adds the cases the corpus cannot hold
+(hostile widths, bounds, the sweep).
 
 **Unit tests** (`engine_test.zig`) cover what the reference has no equivalent
 of: compile-time name resolution, diagnostics and line numbers, custom
 filters/tests, `valueFrom` reflection, template reuse, `renderTo`, and the
 output/`range()` ceilings.
-
-**Audit 2026-11-17 (delta mutation).** 36 schemata mutants over the call-site `*args`/`**kwargs` added the same
-day (`parseCallArgs`, `argsMention` in `parser.zig`; `evalArgs` in `render.zig`), ReleaseSafe, one build, each
-mutant under `setsid -w timeout` and `ulimit -v`: the comma rule after a splat, every duplicate / order guard
-(second `*`, `*` after `**`, positional after either, keyword after `**`, repeated keyword), the token steps and
-the stored `star`/`dstar`, the name-mention scan through both, the `*` expansion (skipped, undefined handling for
-lenient and strict, the error mapping), the keyword and `**` merge (skipped, non-mapping, non-string key,
-duplicate) and the error kind of each. First run: 21 killed, 15 survived: the goldens decide only ok versus error,
-and several wrongly accepted calls still failed later in the macro call, so the guards, the error identity
-(`BadCall`), the comma message and the strict-undefined case were not pinned. Six tests added (the grammar
-violations on callees that would render if accepted, the messages, `BadCall` for each bad operand, undefined as
-empty when lenient and an error when strict, `varargs`/`kwargs` found only inside a splat, an out-of-memory
-sweep); the rerun killed 14. 1 is UNOBSERVABLE: `error.OutOfMemory` from `value.iterate` mapped to `BadCall`
-needs an allocator that fails exactly at that call, but the render arena serves it from a chunk it already holds
-(the sweep reaches only chunk boundaries). 35 killed + 1 unobservable = 36; the card's counts are cumulative with
-the 2026-10-06 run (36/38, 2 eq), the unobservable one counted with the equivalents.
 
 ## 8. Threat model
 
@@ -488,7 +460,7 @@ see.
 
 Those bound ONE operation each, and they do not compose. `max_render_bytes`
 (256 MiB) is the render-wide bound, and it exists because the per-operation
-ones were claimed here to be the answer and are not: two 64 MiB caps multiply
+ones do not compose: two 64 MiB caps multiply
 in a single expression (`{{ ('a' * 30000)|replace('', 'b' * 30000) }}` asked
 for 1.4 GB from a 53-byte template, and at the caps for 4.5 × 10^15 bytes), a
 `range()` of 4 Mi iterations multiplies one of them again, and none of it is
@@ -506,11 +478,9 @@ OOM — but the shape is the caller's to avoid.
 
 Recursion in the parser and in the evaluator follows the source's nesting depth,
 and that is bounded explicitly by `max_nesting_depth` (256), not implicitly by
-anything about the source. An earlier revision of this section claimed the
-recursion was "bounded by the source's bracket nesting", which restated the
-problem rather than solving it: 8 000 nested parentheses (a 16 KB template),
-8 000 `|string` links and 16 000 nested `{% if %}` each overflowed the stack.
-One `Options` field now bounds all three, at compile time, as `error.TooDeep`
+anything about the source: 8 000 nested parentheses (a 16 KB template),
+8 000 `|string` links and 16 000 nested `{% if %}` would each overflow the stack
+without it. One `Options` field bounds all three, at compile time, as `error.TooDeep`
 with a diagnostic — and because it bounds the *tree*, it bounds `Renderer.eval`,
 `renderNodes` and the macro-body walker too. Siblings do not accumulate, so
 template size is not limited; only depth is.
@@ -539,7 +509,7 @@ and `<a href="{{ u }}">` with `u = "javascript:…"` still emits the scheme
 intact. This is not a divergence from the reference — Jinja2 has exactly the
 same scope, verified live in all three contexts (script, attribute, URL body)
 byte-identical to this module — so it is not a bug to fix here, only a scope
-this section previously left unstated. A caller who interpolates into a
+to know. A caller who interpolates into a
 `<script>` block wants `|tojson`; a caller who interpolates into a URI
 attribute needs its own scheme allow-list, same as with the reference.
 
@@ -569,30 +539,25 @@ API makes easy to get wrong.
 If recompilation ever shows up in a profile, the fix is a caller-owned cache
 passed *into* `render`, not a mutable environment.
 
-**It has now been profiled** (`src/bench.zig`, `JINJA_BENCH=1 scripts/lib/capped zig build test-jinja
--Doptimize=ReleaseFast`), and it does not clear that bar. The bench renders a page that
-`{% extends %}`es a real-sized base layout and `{% include %}`s a row partial per row, against a
-byte-equivalent inlined page that loads nothing, asserting the two outputs match. The gap between
-them splits cleanly:
+**It has been profiled** (`src/bench.zig`, run with `JINJA_BENCH=1` under
+`scripts/lib/capped`, ReleaseFast), and it does not clear that bar. The bench
+renders a page that `{% extends %}`es a real-sized base layout and
+`{% include %}`s a row partial per row, against a byte-equivalent inlined page
+that loads nothing, asserting the two outputs match. The gap between them
+splits cleanly: a fixed cost per render (loader lookup, inheritance machinery,
+compiling the loaded templates), which is the part a cache could remove and
+even that is an upper bound; and a per-row cost of executing one `{% include %}`
+per row, which a compiled-template cache does not remove and which the
+reference pays as well.
 
-| rows | composed | inlined | composition |
-|------|----------|---------|-------------|
-| 0    | 7.4 us   | 1.4 us  | 6.0 us      |
-| 10   | 14.1 us  | 7.6 us  | 6.5 us      |
-| 100  | 123 us   | 51.8 us | 71.2 us     |
-| 1000 | 1.04 ms  | 0.70 ms | 338 us      |
-
-The composition cost is `~6 us + ~330 ns/row`. The **fixed ~6 us is the part a cache could remove**
-(and even that is an upper bound — it also contains the loader lookup and the inheritance
-machinery); the ~330 ns/row is executing one `{% include %}` per row, which a compiled-template
-cache does not remove and which the reference pays as well.
-
-So the cost is a **constant per render, not an asymptotic gap**: ~5% of a 100-row page, 0.6% of a
-1000-row page, and 6 us of a 7 us page that nobody profiles. Against that, a caller-owned cache
-buys back the mutable-state question §9 exists to avoid. Left as designed; the bench stays in the
-tree so the bar above is re-checkable rather than re-argued. (Note the bench deliberately does not
-use `std.testing.allocator`: that is a `DebugAllocator` with guard pages, and it costs ~50 us per
-render — measured — which drowns the entire effect.)
+So the cost is a **constant per render, not an asymptotic gap**: a visible share
+of a small page, a rounding error on a large one. Against that, a caller-owned
+cache buys back the mutable-state question §9 exists to avoid (see *What is
+deliberately not done*). The bench stays in the tree so the bar above is
+re-checkable rather than re-argued; the card's `**Performance:**` line is the
+authority on figures. (The bench deliberately does not use
+`std.testing.allocator`: that is a `DebugAllocator` with guard pages, and its
+per-render cost drowns the entire effect.)
 
 ## 10. Loader containment and expansion bounds
 
@@ -614,9 +579,8 @@ one:
    opened relative to the previously held handle with `follow_symlinks = false`,
    and the final file opened the same way.
 
-The brief anticipated that symlink containment might not be achievable without
-`openat`-style primitives. In Zig 0.16 it is: `std.Io.Dir.openDir` and
-`openFile` both take `follow_symlinks`, and `openFile` additionally takes
+Symlink containment needs `openat`-style primitives, and std has them:
+`std.Io.Dir.openDir` and `openFile` both take `follow_symlinks`, and `openFile` additionally takes
 `resolve_beneath`. Walking components with `follow_symlinks = false` gives a
 **portable** guarantee that does not depend on the kernel — no symlink anywhere
 along the path is traversed, so a link planted inside the root cannot redirect a
@@ -674,32 +638,6 @@ confined to a 1 MiB `FixedBufferAllocator`: a bomb that outran its bound would
 exhaust the buffer and come back `OutOfMemory`, failing the test. That is what
 makes these bound tests rather than "it errored eventually" tests.
 
-## 11. Backlog
-
-- Four absent filters (D6): `pprint` needs Python's pretty-printer layout, `random` needs a seed in the environment to be
-  testable at all, `urlize` needs the reference's URL/e-mail regexes, `attr` is deliberate.
-- i18n (`{% trans %}`) and the `{% autoescape %}` block (D2). The latter needs
-  autoescaping to become a per-region property of the renderer rather than an
-  environment option; worth doing only alongside the former.
-- `super.super()` (D16) and callables in the context (D15) — both small, both
-  waiting for a consumer that wants them.
-- Line statements and configurable delimiters — cheap in the lexer, wanted only
-  if a real consumer asks.
-- ~~A caller-owned template cache passed into `render` (§9), if recompilation ever
-  shows up in a profile.~~ **Profiled 2026-08-09 and it does not** — the cache-removable cost is a
-  flat ~6 us per render (~5% of a 100-row page, 0.6% of a 1000-row one), not the asymptotic gap it
-  was assumed to be. See §9; the bench is `src/bench.zig`.
-- A lazy context adapter (§2), if a context ever appears that is too large to
-  convert eagerly.
-
-**Missing and it matters** *(survey 2026-09-30; `format`/`groupby`/`wordwrap`/`filesizeformat`/Unicode case closed 2026-11-13)*:
-
-- **Call-site `*args` / `**kwargs` (D9) ✅ 2026-11-17 call-site `*args`/`**kwargs`; line statements and delimiters still open; `lipsum` (D8; `cycler`/`joiner` ✅ DONE 2026-11-16 as `Value.gadget`)**; the `filter`/`test` tests and the symbolic test aliases (D7) ✅ DONE 2026-11-16 (`is filter`/`is test` via `Ctx.hasFilter`/`hasTest`; symbolic names registered in `builtin_tests`):
-  each hit occasionally by Jinja2 code ported as-is; today all are compile or render errors. `cycler`/`joiner` need a stateful
-  callable value (`cycler.next()`, `joiner()`), the others small parser work. Effort: small to medium each.
-- **Arbitrary-precision integers (D3)** *(survey 2026-09-30)*: Python grows, we raise `OutOfRange`; only matters for
-  factorial-style arithmetic in templates. Effort: large; a sibling bignum module may exist. Low priority.
-
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -707,8 +645,38 @@ makes these bound tests rather than "it errored eventually" tests.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** golden.json — 351 input-to-output pairs captured from real Python Jinja2 3.1.6 by `tools/interop.zig`, replayed hermetically by `src/reference_replay_test.zig`; the live peer runs as `zig build interop-jinja`
+**What the tests actually contain.** golden.json — input-to-output pairs captured from real Python Jinja2 3.1.6 by `tools/interop.zig`, replayed hermetically by `src/reference_replay_test.zig`; the live peer runs as `zig build interop-jinja`
+
+## What is deliberately not done
+
+- **The `attr` filter (D6).** The reference's `attr` is `getattr` *without* the
+  `getitem` fallback, so applied to a mapping — which is what every context value
+  here is — it returns undefined, always. A filter that can only ever produce
+  undefined is a trap; a compile error saying it does not exist is better than a
+  faithful no-op. `map(attribute=…)` and `selectattr` keep working on mapping
+  keys, because those use the fallback path in the reference too.
+- **A caller-owned or environment-level compiled-template cache (§9).**
+  Profiled: the removable cost is a fixed per-render overhead, not an asymptotic
+  gap, and a cache would make `Environment` mutable or add a lock paid by every
+  consumer. Revisit only if a real profile shows recompilation.
 
 ## Backlog / deferred
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 8 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **`pprint`, `random`, `urlize` (D6).** `pprint` needs Python's pretty-printer
+  layout, `random` needs a seed in the environment to be testable at all,
+  `urlize` needs the reference's URL/e-mail regexes. Each hit occasionally by
+  Jinja2 code ported as-is; today a compile error. (`attr` is rejected, see
+  above.)
+- **`lipsum` (D8).** A runtime error today; small.
+- **i18n (`{% trans %}`) and the `{% autoescape %}` block (D2).** The latter
+  needs autoescaping to become a per-region property of the renderer rather than
+  an environment option; worth doing only alongside the former.
+- **`super.super()` (D16) and callables in the context (D15).** Both small, both
+  waiting for a consumer that wants them.
+- **Line statements and configurable delimiters (D9).** Cheap in the lexer,
+  wanted only if a real consumer asks; today a compile error.
+- **A lazy context adapter (§2),** if a context ever appears that is too large to
+  convert eagerly.
+- **Arbitrary-precision integers (D3).** Python grows, we raise `OutOfRange`;
+  only matters for factorial-style arithmetic in templates. Effort: large; a
+  sibling bignum module may exist. Low priority.

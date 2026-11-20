@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of call-site `*args`/`**kwargs` (`parser.zig`, `render.zig`), 35/36 killed, 1 unobservable; six tests added (grammar violations, messages, `BadCall` identity, strict-undefined, names inside a splat, out-of-memory sweep).
 - **2026-11-17** — Call-site `*args` / `**kwargs` (D9 part 1) for macros, `{% call %}`, filters, tests and the built-in globals: `f(1, *xs, k=2, **d)`. Grammar and errors follow Jinja2 3.1.6's `parse_call_args` (one `*` before any `**`, `**` last, keywords may follow `*xs`, positionals may not; a repeated keyword, literal or via `**`, a non-iterable after `*`, a non-mapping or non-string key after `**` are errors). `ast.Args` gains `star`/`dstar`. 39 new `d9_*` cases captured from the real reference; the transcript is 470 cases. Line statements and custom delimiters remain open.
 
 - **2026-11-16** — New globals `cycler(*items)` (`.next()`, `.current`, `.reset()`) and `joiner(sep=", ")` ("" on the first call, `sep` after), as in Jinja2 3.1; new stateful `Value.gadget` variant (`jinja.Gadget`). Both used to be a render error. `lipsum` is still absent.

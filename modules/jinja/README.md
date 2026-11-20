@@ -7,8 +7,8 @@ a context value and produces bytes: `{{ expression }}` output, `{# comments #}`,
 `{% block %}` with `super()`, `scoped` and `required`; `{% include %}`;
 `{% import %}` / `{% from … import … %}`; `{% macro %}` and `{% call %}` /
 `caller()`), the full Jinja expression grammar (chained comparisons, conditional
-expressions, slices, list/dict literals, filters, tests and method calls), 46
-built-in filters, 29 built-in tests, the complete `loop` object including
+expressions, slices, list/dict literals, filters, tests and method calls), the
+built-in filters and tests listed below, the complete `loop` object including
 `{% for … recursive %}`, `namespace()`, and every whitespace control the
 reference implementation has. Semantics follow Python, not C: `/` always yields a float, `//` and `%`
 floor (`-7 % 2 == 1`), `round` is banker's rounding of the value's exact binary
@@ -20,16 +20,16 @@ is HTML-escaped — are explicit options rather than defaults you discover in
 production.
 
 Anything the reference has that this does not — i18n (`{% trans %}`), the
-`{% autoescape %}` block, four filters, two tests, three globals — is a
-**compile error naming the tag or name**, never a silent no-op. `SPEC.md` §6
-lists every one.
+`{% autoescape %}` block, four filters, the `lipsum` global — is a
+**compile error naming the tag or name** (`lipsum`: a render error), never a
+silent no-op. `SPEC.md` §6 lists every one.
 
 Provenance: clean-room from the Jinja2 documentation (the template-designer
 and API docs at jinja.palletsprojects.com) plus the observable behaviour of the
 installed reference implementation. NO Jinja2 (or MarkupSafe) source was read or
 ported. Python Jinja2 3.1.6 is used only as a byte-exact black-box test ORACLE,
 run in a subprocess by `tools/interop.zig` and never by the module (`SPEC.md`
-§7) — the root `NOTICE` §0 relationship, needing no attribution — and is
+Verification) — the root `NOTICE` §0 relationship, needing no attribution — and is
 recorded here because the module's behaviour, operator precedence, filter/test
 vocabulary and API shape are deliberately modelled on it
 (pallets/jinja, **BSD-3-Clause**; pallets/markupsafe, **BSD-3-Clause** —
@@ -126,7 +126,8 @@ Maps are **ordered pair slices**, so the order you supply keys in is the order
 
 ### Using it with the `yaml` module
 
-`jinja` deliberately depends on nothing but std (see `SPEC.md` §2). A context
+`jinja` takes no value-model dependency (see `SPEC.md` §2); its only dependency is
+`unitext`, for Unicode case mapping. A context
 from `modules/yaml` is a twenty-line conversion, and ordering survives it
 because both sides keep mappings as ordered pairs:
 
@@ -181,7 +182,7 @@ table names. `x is defined`, `x is undefined` and `x|default(…)` keep
 working under both policies.
 
 Autoescaping is off unless you ask for it, and there is no guessing from a file
-extension (this module has no loader). With it on, `|safe` marks a string as
+extension. With it on, `|safe` marks a string as
 markup, `|escape` produces markup, and markup propagates through `~`, `+`,
 `|join` and the case-changing filters exactly as markupsafe's `Markup` does. A
 filter *argument* spliced into a markup result is escaped first, so `|safe` is
@@ -292,13 +293,12 @@ interface {{ i }}
 
 ## Filters
 
-All 46 resolve at **compile time** when the template names one directly: a
+Every filter resolves at **compile time** when the template names one directly: a
 template naming a filter that is not here fails `env.compile`, with a
 diagnostic. The exception is a filter or test named by a *string argument* to
 `map`, `select`, `reject`, `selectattr` or `rejectattr` — `{{ xs|map('nope') }}`
 is resolved during the render, as it is in the reference, and surfaces as
-`error.BadArgument`. The earlier wording here said resolution "can never
-surface halfway through a render", which was a false absolute.
+`error.BadArgument`.
 
 | | | | |
 |---|---|---|---|
@@ -395,6 +395,13 @@ const out = tmpl.render(gpa, ctx, &diag) catch {
 `Diagnostic` owns a fixed buffer, so a message stays valid after the template
 and the render arena are gone.
 
+## Not provided
+
+i18n (`{% trans %}`), the `{% autoescape %}` block, line statements and custom
+delimiters, arbitrary-precision integers, and the filters `attr`, `pprint`,
+`random`, `urlize` are absent; the reasons are in `SPEC.md` *What is deliberately
+not done*, what may still come in *Backlog / deferred*.
+
 ## Verify
 
 ```sh
@@ -406,7 +413,7 @@ zig build interop-jinja -- --capture         # re-take the transcript
 Fuzzing the compiler and renderer is the deterministic driver `JINJA_FUZZ=<runs>[,<first seed>]`
 (header of `src/fuzz_test.zig`), not `zig build ... --fuzz`.
 
-The conformance suite replays `src/testdata/golden.json` — 351 cases, each one
+The conformance suite replays `src/testdata/golden.json` — each case
 an input the reference was given and the bytes **Python Jinja2 3.1.6** returned
 for it — and compares byte for byte. That runs everywhere: no `python3`, no
 subprocess, no foreign source in the module.
@@ -415,5 +422,5 @@ Taking that transcript is a separate program, `tools/interop.zig`, which renders
 `tools/corpus.zig` with the real Jinja2 and is the only thing that can notice the
 *reference* changing. It needs `python3` with `jinja2`; it is never built by
 `test-jinja`, and `zig build check-interop` compiles it without running it. See
-`SPEC.md` §7 for the design, what the transcript pins, and the full divergence
-table.
+`SPEC.md` Verification for the design and what the transcript pins, and §6 for
+the divergence table.
