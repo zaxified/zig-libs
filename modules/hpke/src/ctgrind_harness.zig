@@ -3,10 +3,8 @@
 //! ctgrind_harness — the constant-time evidence for HPKE's DHKEM decap path
 //! and the AEAD encryption context, which `SPEC.md`/`README.md` do NOT yet
 //! state as fact anywhere (see "SPEC.md/README.md currently make NO
-//! constant-time claim" below). Run it through `../../../scripts/checks/ctgrind.sh`
-//! once the coordinator adds hpke's TARGETS/MODES/PATTERN block — this
-//! module has none yet, so `ctgrind.sh hpke` refuses to run; see the
-//! suggested config lines at the bottom of this comment. This file follows
+//! constant-time claim" below). Run it through `../../../scripts/checks/ctgrind.sh hpke`
+//! (its expected rows are in `scripts/checks/ctgrind-expected.tsv`). This file follows
 //! the shape of `ct25519`'s and `chachapoly`'s harnesses (both read before
 //! writing this one): a standalone program driven by argv, deliberately NOT
 //! wired into `zig build test-hpke` — memcheck's context count is
@@ -163,34 +161,6 @@
 //! verification of an existing one. Left unstated here on purpose: this
 //! file's job is to measure, not to add prose to SPEC.md/README.md the
 //! module's maintainer has not signed off on.
-//!
-//! ## Suggested `scripts/checks/ctgrind.sh` config (NOT added by this change —
-//! touching that file is the coordinator's job, not this one)
-//!
-//! ```text
-//! TARGETS[hpke]="x25519_decap x25519_authdecap p256_decap p256_authdecap p384_decap p384_authdecap open"
-//! MODES[hpke]="ReleaseFast"
-//! PATTERN[hpke/x25519_decap]="dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/x25519_authdecap]="dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/p256_decap]="dhkem[.]zig|suite[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/p256_authdecap]="dhkem[.]zig|suite[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/p384_decap]="dhkem[.]zig|suite[.]zig|p384[.]zig|field[.]zig|common[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/p384_authdecap]="dhkem[.]zig|suite[.]zig|p384[.]zig|field[.]zig|common[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig"
-//! PATTERN[hpke/open]="schedule[.]zig|root[.]zig|chacha20[.]zig|poly1305[.]zig"
-//! LABEL[hpke/x25519_decap]="hpke X25519 decap (skR)+std x25519+hkdf"
-//! LABEL[hpke/x25519_authdecap]="hpke X25519 authDecap (skR dh+dh2)+std x25519+hkdf"
-//! LABEL[hpke/p256_decap]="hpke P-256 decap (skR)+p256 group/field+hkdf"
-//! LABEL[hpke/p256_authdecap]="hpke P-256 authDecap (skR dh+dh2)+p256+hkdf"
-//! LABEL[hpke/p384_decap]="hpke P-384 decap (skR)+std p384+hkdf"
-//! LABEL[hpke/p384_authdecap]="hpke P-384 authDecap (skR dh+dh2)+std p384+hkdf"
-//! LABEL[hpke/open]="hpke Context.open (key,base_nonce)+chachapoly"
-//! ```
-//! `field[.]zig` is reused across THREE different files here (std's
-//! `25519/field.zig`, this repo's `p256/field.zig`, std's
-//! `pcurves/p384/field.zig`) — never a collision in practice because each
-//! target's log only contains frames the binary actually executed for that
-//! argv, but worth stating given `blindrsa`/`rsa`'s documented `root[.]zig`
-//! basename collision in this same script.
 
 const std = @import("std");
 const builtin = @import("builtin");

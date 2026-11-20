@@ -14,7 +14,7 @@
 //!
 //! Construction ported from Go 1.26 `crypto/hpke/pq.go` (BSD-3-Clause, see
 //! NOTICE), checked byte for byte against the draft's vectors in Go's
-//! `testdata/hpke-pq.json` (`kat_hpke_pq.zig`):
+//! `testdata/hpke-pq.json` (`kat_go_test.zig`):
 //! - private key = seed; ML-KEM: the 64-byte FIPS 203 seed `d || z`; hybrid: 32
 //!   bytes, expanded by SHAKE256 into the ML-KEM seed and then curve-scalar
 //!   candidates (rejection-sampled for P-256/P-384, X25519 takes the first);

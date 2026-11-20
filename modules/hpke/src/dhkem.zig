@@ -36,13 +36,7 @@ const entropy = @import("entropy");
 const burn = @import("burn.zig");
 // P-256 curve group for the DHKEM(P-256, …) suite from the asm-accelerated
 // `p256` module (byte-exact to `std.crypto.ecc.P256`). The X25519 KEM path
-// stays on std (p256 covers only the P-256 curve). P-384 has no local
-// perf-specialized sibling (no stated hot path the way P-256's JWT/TLS/
-// WebAuthn callers are, `modules/p256/README.md`'s "P2 HTTPS-API hot path"
-// rationale), so `P384Kem` below is built directly on
-// `std.crypto.ecc.P384` — same API shape as `p256`'s
-// (`fromSec1`/`toUncompressedSec1`/`mul`/`affineCoordinates`/`scalar.
-// random`/`scalar.rejectNonCanonical`), just not asm-accelerated.
+// uses the `ct25519` module (see the import below).
 const P256 = @import("p256").P256;
 // P-384 from the `p384` module (constant-time `mul`, fixed-base comb for key
 // generation; std's P-384 made keygen 2.7x and setupS 1.24x Go, bench).
@@ -573,7 +567,7 @@ pub const P256Kem = struct {
 /// (HKDF-SHA384's `Nh`), Nsk = 48 (a P-384 scalar), Npk = 97 (SEC1
 /// UNCOMPRESSED point encoding — `0x04 || X(48) || Y(48)`, same convention
 /// as `P256Kem`). Structurally this is `P256Kem` with the curve group and
-/// internal KDF both swapped: `std.crypto.ecc.P384` in place of
+/// internal KDF both swapped: the `p384` module's `P384` in place of
 /// `p256`'s `P256` (`fromSec1`/`toUncompressedSec1`/`mul`/
 /// `affineCoordinates`/`scalar.random`/`scalar.rejectNonCanonical` — the
 /// identical API shape, see this file's module doc comment for why P-384

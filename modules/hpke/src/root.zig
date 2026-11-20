@@ -12,9 +12,9 @@
 //!
 //! Four DHKEMs: `P521Kem` (the in-repo `p521` module, RFC 9180 A.6
 //! byte-exact), `X25519Kem`, `P256Kem` (curve group from the local
-//! asm-accelerated `p256` module) and `P384Kem` (curve group from
-//! `std.crypto.ecc.P384` directly — no local perf-specialized sibling
-//! exists for P-384, see `dhkem.zig`'s module doc comment). RFC 9180
+//! asm-accelerated `p256` module) and `P384Kem` (curve group from the
+//! local `p384` module). The ML-KEM and hybrid KEMs of draft-ietf-hpke-pq are
+//! in `pq.zig`. RFC 9180
 //! Appendix A publishes no worked test-vector section for DHKEM(P-384,
 //! HKDF-SHA384) — `P384Kem` is anchored by type widths, self-consistency
 //! round trips and malformed-input rejection instead; see `dhkem.zig` and
