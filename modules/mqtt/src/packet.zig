@@ -2306,7 +2306,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // the loop, so `while (off < len)` never ran a single pass and `decode`
     // was **never called at all**, while the paragraph above promises a reader
     // loop over back-to-back packets. `check-fuzz-reach` only learned to see
-    // that shape on. Measured over the corpus above: **0 of 18
+    // that shape. Measured over the corpus above: **0 of 18
     // seeds reached `decode` and 0 packets were walked before, 18 of 18 and 18
     // packets after.**
     const len: usize = src.slice(&buf);

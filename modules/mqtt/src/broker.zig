@@ -53,7 +53,7 @@
 //! and resource caps (max_connections / max_subscriptions_total /
 //! max_subscriptions_per_conn / max_retained / connect_timeout_ms).
 //!
-//! QoS 2 (spec 4.3.3) both ways since: an inbound one is PUBRECed
+//! QoS 2 (spec 4.3.3) both ways: an inbound one is PUBRECed
 //! and routed once, its id remembered until the PUBREL (in the session for a
 //! persistent client, so a resend after a reconnect is not routed twice); an
 //! outbound one waits for PUBREC, then PUBCOMP, and a resumed session resends
