@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src 43c51d2aca2cf42f
 
-Audit detail: the 2026-11-02 review is a delta over the 32-bit compile fix: `Wide.slot` shifts by the same 22 as before, from a constant (a wrong shift could only cost collisions in this direct-mapped cache, or trip the bounds check), `meta.targets`, and two single-threaded test skips; no mutation run for it. The 2026-11-01 review is a delta over `go_oracle_test.zig` only (full-CI fix: the `(Reader)`/`(Longest)` tags print only for a real disagreement; a `global-alloc-ok` marker on the cached fixture); library source unchanged since the mutation run. Mutation delta 2026-11-07 (commits `e042ea5b`, `8012bc70`: `replaceN`, `replaceNLiteral`, `replaceFirst`, the `replaceAll*` forwarding; schemata, ReleaseSafe, the two replace tests): 18 mutants, 18 killed, 0 equivalent (limit default, `left != 0` bound, the decrement, `null` forwarded as `1`, template not expanded, capture slice one short, every limit forwarded or swapped between the literal and template forms in `Regex.*` and `Matcher.*`). Two survived the first run (`replaceNLiteral` with `null`, `replaceAllLiteral` over several matches: only the oracle files covered them); one test block added to `root.zig`. 2026-11-13: the source changed only by regenerating the Unicode tables for 18.0.0 (data arrays and version constants from the generator; no guard, branch or arithmetic changed), so the mutation run above still covers every guard and no delta mutants exist; the tables themselves are anchored by the oracles in the verification table.
-
 **Hardening:** fuzz 2026-10-28 (240,000 runs clean (REGEX_FUZZ), ReleaseSafe) · ct n/a — regex engine (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point, 2 MED fixed in `b2b6086e`)
 
 **Performance:** ref 0.00–0.57× Go regexp go1.26 · fastest 0.05–1.24× Rust regex 1.13.1 (measured 2026-10-28)
@@ -83,7 +81,7 @@ names, counts to 100,000, its nest limit); `regex::bytes` → `.utf8 = false`; `
 (what every entry point still matches on the stack; past it `error.PatternTooLarge`);
 `find_at`/`captures_at` → `Matcher.find`/`captures` with `from`; RE2's `ANCHOR_START` /
 regex-automata's `Input::anchored` → `Matcher.findAnchored`/`capturesAnchored`; `Regex::new` → `compileOptions`,
-no `RegexBuilder` knobs beyond `Options`. Not here: RE2's `ANCHOR_BOTH` (= `fullMatch` of the rest; Rust has none), RE2's Latin-1 mode (bytes
+no `RegexBuilder` knobs beyond `Options`. Not here (each with its reason under *What is deliberately not done*): RE2's `ANCHOR_BOTH` (= `fullMatch` of the rest; Rust has none), RE2's Latin-1 mode (bytes
 mode covers non-UTF-8 text), `FilteredRE2` and `PossibleMatchRange` (niche, nobody else). **Head-to-head with quangdn42/regex.zig** (the build-tool consumer's engine, commit `a22a2e68`, both through
 their public APIs, re-run 2026-10-07 night after the backtracker, the literal prefilter, the DFA and
 the window, x86-64 ReleaseFast, same answers on every case): per row with the pattern compiled per
@@ -96,7 +94,7 @@ loss `#([0-9]+)` 1.80 is now 0.55).
 A matcher for RE2's language with RE2's guarantee: time linear in pattern × input. It is not a
 PCRE: backreferences, lookaround, atomic groups, possessive quantifiers and recursion are refused
 by design (`error.InvalidEscape` / `error.InvalidPerlOp`), because each of them needs
-backtracking. Its lazy DFA serves `isMatch`/`fullMatch` only (on the stack, ASCII transitions
+backtracking (see *What is deliberately not done*). Its lazy DFA serves `isMatch`/`fullMatch` only (on the stack, ASCII transitions
 cached); a search that reports positions or groups runs a backtracker or a Pike VM.
 
 ## Design & invariants
@@ -126,17 +124,22 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   assertions `\b \A \z` and every `(?…)` are refused; `^`/`$` are line anchors; a negated class
   gets `\n` added before negation; a repetition may repeat a repetition, so `a*?` is `(a*)?`; a
   `-` is a class member only first or last. Leftmost-longest by default.
-- **Two builders.** `Regex.compile` first tries `syntax.BuilderOf(small_capacity)` on the stack (~9 KiB)
-  and falls back to the full `Builder` from the allocator only on `error.PatternTooLarge`; the
-  same parse runs in both, so the verdict is the full builder's. Never `b.* = .{}` on a builder or
-  a VM state set: a default-initialised table is written whole (measured: 85 % of `isMatch` and
-  most of a short compile before 2026-10-07's fix).
+- **Three builders.** `Regex.compile` first tries `syntax.BuilderOf(small_capacity)` on the stack (~9 KiB;
+  256 instructions, ranges and nodes), then the full `Builder` from the allocator, and only on
+  `error.PatternTooLarge` a heap builder of `syntax.large_capacity` (up to `4 * max_insts`
+  instructions, 65,535 ranges and nodes, ~2 MiB of scratch, freed; bytes mode stays at `max_insts`);
+  the same parse runs in all three, so the verdict is the last builder's. A program past `max_insts`
+  runs on the backtracker, the Pike VM and the set VM only: the DFAs, the one-pass engine and the
+  prefilter step aside, and `isMatch`/`fullMatch`/`shortestMatch` keep their scratch on the stack up
+  to `4 * max_insts`. a program past `4 * max_insts` is `error.PatternTooLarge`. Never `b.* = .{}` on a builder or
+  a VM state set: a default-initialised table is written whole (it cost 85 % of
+  `isMatch` and most of a short compile).
 - **Prefilter** (`analyze`, once per program): `anchored` when every path from the start passes
   `\A` before consuming or matching; `lit` = up to 16 bytes of the literal prefix (below), found
   by a 32-byte first-and-last-byte vector scan when it has two bytes or more — never one holding
   U+FFFD, which an invalid byte also matches; `first` = the UTF-8 lead bytes of every class reachable
   without consuming (none when the match can be empty, a `.` is reachable, or a class holds U+FFFD
-  — an invalid byte reads as U+FFFD and could start mid-sequence); `teddy` (2026-10-27), when
+  — an invalid byte reads as U+FFFD and could start mid-sequence); `teddy`, when
   there is no such literal and the match can start anywhere = the literal prefixes every match
   begins with (`src/teddy.zig`): a walk of every path from the start through assertions, a class
   of up to 4 code points forking it, ending at 8 bytes, a larger class, `.` or the match — none
@@ -167,7 +170,7 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   table is emptied and refilled (each step then costs what an NFA step does — still linear).
   The state holding only the start uses the prefilter's skip. Larger programs and the reader
   front end run the NFA set simulation (`runSetOn`).
-- **Backwards from the end** (`isMatch`, 2026-10-27): when every path to the match passes `\z`
+- **Backwards from the end** (`isMatch`): when every path to the match passes `\z`
   and not every one starts with `\A` (`Prefilter.end_anchored`), every match ends at the end of
   the text, so the lazy DFA runs from there towards the start (RE2's and Rust's reverse anchored
   search). A state is the set of consuming instructions from which the rest of the text reads to
@@ -179,6 +182,31 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   be empty or end with any byte), and its last bytes those every match ends with, as far as each
   level from the end holds one or two ASCII bytes (`Prefilter.tail`, up to 16: a literal suffix,
   or its two cases under `(?i)`): a text whose tail cannot end a match costs a few compares.
+- **The find DFAs** (`FindDfa`; `Matcher.find`, the iterator and the span before `captures`; leftmost-first
+  programs of up to `Dfa.max_insts` (128) instructions that are not `vm_only`). A forward pass finds where
+  the match ends and, when it can, where it starts: a transition marks where a thread began from a state
+  with none and where a later one joined the live threads (or matched empty beside them); with no join
+  since the last begin every live thread descends from that start, so it is the leftmost-first start. Otherwise
+  (and for a match at the end of the text) a backward DFA (`Back`) is run from the match's end to find it,
+  as RE2 and Rust search. A forward state is the ordered thread list (the Pike VM's priority order), what the code
+  point before was as far as an assertion can tell, and whether a thread may still start; a match among the empty
+  transitions cuts every later thread. Tables hold up to 255 states, rows premultiplied by 256 in a
+  `u16`, kept in the `Matcher` across calls and emptied when full. Rows cover every byte; a two-byte UTF-8
+  sequence is two lookups through a mid-sequence state, three- and four-byte sequences and invalid bytes are
+  decoded. The DFA is made only once the `Matcher` has been handed `dfa_after` (1 KiB) of text, because a
+  fresh DFA works out every transition it takes. When every match starts where a fast prefilter points
+  (a literal, one byte, Teddy), `find` reads forwards from each such place in turn, anchored; tries that fail
+  may read no more than twice the text they moved past plus 256 bytes, then one unanchored pass takes
+  over, so `A[^Z]*Z` over `AAAA…` stays linear. With no thread alive the DFA jumps ahead with the prefilter
+  only when that is a fast scan or the next code point cannot start a match.
+- **The one-pass engine** (`OnePass`, RE2's and Rust's; `captures` and `nextCaptures`): for a program where, read
+  anchored, the next code point always picks at most one way on (`INV-([0-9]{4}-[0-9]{4})`,
+  `(\w+)@(\w+)\.com`, `\b(\w+)\b`, `^(\d+)-(\d+)$`), the search is one thread whose captures are written in
+  place: one table load per ASCII byte, the step packing the next root's row offset, the slots set and the
+  assertions passed. Programs of up to 128 instructions and 16 groups (`max_slots` 32); a match past an
+  assertion is allowed when no way lies below it. The start comes as `find` gets it (a fast prefilter's
+  candidates read anchored by the engine itself, else the DFAs' span). Made with the find DFA; the
+  backtracker and the Pike VM answer where it does not apply. The tests compare it with the Pike VM from every start.
 - **The backtracker** (leftmost-first only): `Matcher` searches depth-first with one visited bit
   per (position, instruction), so every state is explored once — linear, like the VM — and
   carries one set of captures instead of a copy per thread (short-string submatches 4–11× faster
@@ -215,256 +243,120 @@ compiler recurse once per nesting level, bounded by `max_depth` (250) — a deep
 is refused, not a stack overflow; the deepest accepted one compiles on a 512 KiB thread stack in a
 Debug build (tested). POSIX stacked repetitions (`a**`, `a{2}{3}`), which add a tree level without
 group depth, are budgeted separately: at most `max_stacked` (64) per pattern, the next one is
-`error.NestingDepth` (audit 2026-10-19).
+`error.NestingDepth`.
+Residual risks and limits a consumer relies on: a `Regex` whose fields a caller writes by hand (all but
+`longest`) is outside the guarantee; `Span.slice` takes the input the span was found in; a `Matcher` for a
+65,534-instruction program with 64 groups would be ~134 MiB, which is why programs past `4 * max_insts` are
+refused (Backlog); the `!bytes` and `out.len` contracts of a few entry points are asserts; the one-pass/DFA cross
+check is a `debug.assert` (silent in ReleaseFast). A `std.Io.Reader` is read through its `stream`, so an
+unbuffered reader or one with a buffer under 4 bytes works (bytes held, never more than three code points past
+a match). Any program that compiles runs through every entry point without a panic and in bounded memory.
 
 ## Verification
 
-**Audit 2026-10-28, no consumer-reachable panic (owner: no setting may end a consumer's program in
-a panic or an OOM; `1ebc3cdf` and the audit's fixes):** an independent read-only sweep (Sonnet) of
-every public entry point and every `@intCast`/`unreachable`/`assert` on a consumer path, after
-oversize programs became `error.PatternTooLarge`, the reader functions `ReaderError`, and
-`RegexSet.matches` total. Two MED found, both fixed with tests: an unbuffered `std.Io.Reader`
-(`buffer.len == 0`) tripped std's assert in `takeByte` (now read through `stream`); the Rust grammar's
-counts to 100,000 over a body that emits nothing (`(?:(?:)×30000){100000}`) met no instruction
-capacity and compiled for seconds (now every compile's emission walk is budgeted, `max_emit_work`,
-→ `PatternTooLarge`). LOW: a `Regex` whose fields a caller writes by hand (all but `longest`) is
-documented as outside the guarantee; `Span.slice` takes the input the span was found in; internal
-invariant asserts (one-pass vs DFA, the reader window) stay — the fuzz harness drives both sides.
-Checked safe: `Matcher.init` ≤ ~8.4 MiB, every VM/backtracker/DFA bound, `RegexSet` (≤ 1024
-patterns), expand/replace/split, failing readers and writers, positions in `usize`. Mutation
-(schemata, 48 mutants incl. the cap, the held bytes, the partial `matches`, `BytesMode`, the
-budget and the unbuffered path): 47/48, the known equivalent. Fuzz 240,000 runs clean.
+Run with `scripts/modtest regex`; the interop lane re-takes the oracles with `zig build interop-regex -- --check`.
 
-**Audit 2026-10-28, S1 tail (anchored search `e29167d4`, Unicode 17.0 from the UCD `ba9f7f7f`):**
-the fuzz oracle for `findAnchored`/`capturesAnchored` (`find`'s match when it starts at `from`,
-else none; the Pike VM alike) — 240,000 runs clean before and after the table change; five
-planted mutants of the anchor all fail the tests. `tools/ucd_unicode/gen.py` run on UCD 16.0
-gives regex-syntax 0.8.11's tables byte for byte (440 bases, 1,413 keys, 379 fold runs; the
-interop lane re-checks it). Independent read-only review (Sonnet) of both: no correctness
-finding; LOW — one weak assert in the anchored test (fixed), and the Go replay's
-UNICODE_VERSION excuse covers only code points assigned after 15.0: a 17.0 change to an OLD code
-point (U+0295 Ll → Lo; the new capitals of A7D3/A7D5 joining their orbits) would count as
-unexplained — none of Go's vectors holds one today (12 pinned, 0 unexplained). Mutation
-(schemata, the 39 S1 mutants plus 5 on the anchor, re-run on this source): 43/44, the same
-equivalent survivor.
-
-**Audit 2026-10-28, S1 (Rust grammar, bytes mode, `RegexSet`, heap tier; `2b7d4026..0394a698`):**
-the fuzz harness was extended first (`src/fuzz_test.zig`: every atom written in both grammars with
-one meaning — the `.perl` and `.rust` programs must agree at every start; bytes mode against
-`&str` on valid UTF-8; `RegexSet` against each pattern's `isMatch`, incl. a hundred `\pL`;
-`shortestMatch` against a substring reference; the `*Alloc` variants against the stack ones; a
-share past `max_insts` and `4 * max_insts`). It found three defects in the first seconds, all
-fixed with tests: `RegexSet` summed its range offsets in a u16 (a panic past 65,535 ranges, wrong
-ranges in ReleaseFast); `(?i)` class set operations swept an unsorted folded left side
-(`(?i)[a-c~~b-d]` was the union); the Pike VM read U+FFFD as the code point before a position
-after a mid-sequence `from` where the backtracker reads the text (a Unicode `\b` after `é`). One
-2.8 s seed was the harness's own cost (a 60,000-instruction `(…){1000}` over 400 bytes); heap
-programs now take the short input. Then 240,000 runs clean in 48 s. Independent read-only review
-(Sonnet) of `23fefc70..HEAD`: one MED-HIGH — `matches()` called `isMatch` on a heap-tier program
-and panicked (fixed: `isMatchAlloc`, tested); `RegexSet` compiled every pattern before checking
-the size (fixed: refuses as it goes); LOW items to the Backlog (a `Matcher` for a 65,534-instruction
-program with 64 groups is ~134 MiB; `!bytes` and `out.len` contracts are asserts); README/SPEC
-still said Unicode 15 (fixed). Mutation (schemata, 39 mutants over the new code in `root.zig` and
-`syntax.zig`): 38 killed; the survivors the first run left — a Rust nest-height term, `(?-u)`
-byte-class mapping, `(?R-u:.)` keeping `\r` out, `(?i-u)` ASCII folding — got tests; one
-equivalent (`>= byte_base` vs `>`: no byte-class key equals `byte_base`).
-
-**Audit 2026-10-28 (byte-level DFA, forward-pass start; `6bf77207`, `8729c168` and the review fix):**
-independent read-only review (Sonnet) of `38ef348e..HEAD` — no HIGH or MED; two LOW, both
-performance: `captures` did not count its tracked starts against the joins (fixed), and a full
-table that stops caching two-byte steps (Backlog). Mutation, schemata over the new code: 12 on the
-byte rows and `ByteSet` (11 killed, 1 equivalent: the backward back-off at `pos == from` cannot
-happen, both callers refuse a `from` inside a sequence) and 8 on the start tracking (7 killed after
-the targeted test "the start read off the forward pass" was added for an empty match beside dying
-threads; 1 equivalent: not resetting `clean` at a begin only loses speed). With the earlier 70
-(68, 2 eq): 86/90, 4 eq. Fuzz driver 200,000 runs ReleaseSafe clean on the final tree.
-
-`src/go_oracle_test.zig` replays Go `regexp` (see Anchoring); `src/root.zig` holds unit tests per
-feature and a deterministic robustness driver (20,000 random patterns × 4 inputs, invalid UTF-8
-included: compile-or-refuse, the entry points agree, the prefilter only skips, the backtracker and
-the Pike VM give the same groups at every start, no trap).
-
-**Whole-module mutation run (2026-11-12, A-axis re-audit,** production code of `root.zig`, `syntax.zig`, `teddy.zig`, `replace.zig`; `casefold.zig` is generated data; schemata in a detached copy, ReleaseSafe, strict verdict, runner P ≤ 3 under `ulimit -v`): 5014 mutants — every comparison, ±1 literal, dropped assignment/call, error-name remap, switch-arm and flag-arm swap, the bodies of functions returning anonymous structs, escape values of all three grammars — 4660 killed + 113 by hang, 240 equivalent, 1 cut (a mutant of a test probe statement), 0 undecided, no production defect. A file-private, test-only probe hook (`Probe`, 38 events in `root.zig`, 5 counters in `teddy.zig`, incremented only under `builtin.is_test`; no pub API) makes the lazy-DFA and Teddy internals observable: table resets, skips, flushes, wide-cache hits, VM steps. New tests (`mutation_test.zig`, `mutation_engine_test.zig`, `root.zig`): an error table of 150 bad and borderline patterns × perl/posix/rust; a 39-row golden work table (which engine answers, how many steps); parser limits and Rust heights; class edges and the `(?i)` fold orbit in class form; `expand` and `literalPrefix` edges. Three were real test gaps: `Dfa.intern`'s full-table reset is reachable (pattern `a[ab]*b[ab]{5}\b`, an input found by search; without it the add writes past the 32-state table), the bytes-mode Pike list needs 4n entries (a four-byte sequence keys `3n + pc`; no test had put one through the bytes VM), and `wideCaches` must zero its slots (a test over an allocator pre-filled with 0xFF). Equivalent, grouped: dead stores into per-call local DFA tables; `asserts` always true where `runRevDfa` runs; stack-only scratch and `= undefined` in `deinit`; unreachable `else` arms of the class parsers; the `m.stack` 3n reserve (its peak is n: each unseen pc nets +1 only for a split or a save); `SplitIterator`'s `matches` counter (`matches == n` implies `pieces == n - 1`, the disjunct before it); cost-only — the ASCII fast paths of `isRustAlphabetic`/`isUnicodeWord`, the insertion-vs-pdq sort choice, hash and slot constants, cache flushes, skips, budgets and warm-up of `FindDfa`/`Matcher`, Teddy's bucket sizing. Cut at compile: 16 continue→break variants inside value-returning `while (true)`.
-
-**Fourth round (2026-10-28, the search engines added 10-27/28: reverse anchored `isMatch`, the
-find DFAs, Teddy, the one-pass engine).** *Review* (independent, read-only, over `d1573e80..`): no
-wrong result found; one MED — `runDfa`/`runRevDfa` told states apart by the code point before even
-in a program with no assertion (up to 4× the states, flushes over mixed text) — fixed
-(`Regex.asserts`, as `FindDfa` already did); LOWs: the one-pass/DFA cross-check is a
-`debug.assert` (silent in ReleaseFast), `Prefilter.next` needs `first` (every caller guards it),
-Teddy's `vpshufb` is chosen by the target CPU. *Mutation* (schemata, ReleaseSafe, whole suite): 70
-mutants over those engines — the tail and last-byte filters, the backward context and accept
-cache, caching across a flush in all three tables, `rev_start`/wide-cache resets, the
-leftmost-first cut and restart bit, the end-of-text accept, the idle skip and its context, state
-identity by list/context/restart, the candidate-anchored search and its step, the continuation-
-byte guard, one-pass analysis (overlap, the assertion rules, the cut) and run (match asserts,
-slot copy and reset), `endAnchored`/`lastBytes`/`tailBytes`, `findLiteral`'s bounds, Teddy's
-bounds, masks, nibbles and U+FFFD rule. 59 killed by the existing tests; the 9 survivors asked for
-tests, now in: the backward tables past their size (`start` over long runs, a pattern that ends in
-a byte; `runRevDfa` with a 2-state table over reads only a `_` ends), the candidate budget running
-out with `\b` at the skip, a one-pass candidate before where the failed one stopped, and
-`FindDfa.intern` keeping states apart by context alone. 2 equivalent: `Dfa.idle` without `restart`
-(read only when `restart` holds) and Teddy's early `.none` (an empty prefix covers every other and
-gives no `Teddy` anyway). Fuzz 200,000 ReleaseSafe runs clean after.
-
-**Third round (2026-10-07 night, speed: the lazy DFA and the backtracker's window; fuzz POSIX).**
-*Tests:* the DFA against the NFA (reader) and `Matcher.find` on 11 patterns × 300 random texts
-(assertions, `(?m)`, non-ASCII, anchored) and on 20 KB texts whose tables are emptied hundreds of
-times — one anchored pattern carries the position's parity in its state, so a single wrong
-transition shows in the answer; the window: find-all with groups against the Pike VM over 40 KB
-with sparse matches, and a program whose window is a whole number of words walked to its very
-end. *Mutation* (schemata, ReleaseSafe): 11 mutants — the row reset after a flush, the word and
-newline context, the clear on a window move, the window's edge (`>` for `>=`), the idle test,
-the handover start, the restart bit, caching a transition across a flush, and two in
-leftmost-longest; 2 survived the first tests (the window's edge — reachable only when the
-window is word-aligned; caching across a flush — self-healing in a state that forgets after 7
-bytes) and were closed by the two targeted tests above; 11/11 killed. *Fuzz:* a POSIX ERE grammar
-of its own (a third of the runs; POSIX reached 20 % of all runs, was ~1 %) and an independent
-leftmost-longest reference — the leftmost start with a full-matching substring, the longest such
-— for every assertion-free pattern (Perl patterns through their `Longest` twin); it alone kills
-a longest mode that stops at the first match. 200,000 runs clean (2,900/s, ReleaseSafe); the
-first run caught a harness error (a damaged pattern turned into `\b`), not an engine one. *Review*
-(independent, read-only, questions on DFA ≡ NFA, window ≡ Pike VM, bounds and linearity, the
-fuzz reference): no HIGH, MEDIUM or LOW; 4 INFO — one taken (an assert that a consuming
-instruction is never last, which the DFA's next-set index relies on), three are speed-only
-notes or limits of the reference by design (it shares the compiled program; inputs over 24
-bytes skip it).
-
-**Second round (2026-10-07, the parity work: `\p`, POSIX, leftmost-longest, the API on top,
-the reader, the backtracker, the literal prefilter).** *Oracle:* every Perl-syntax case replayed
-again after `Longest()` (279 cases differ from leftmost-first, all agree), two POSIX sets, every
-Unicode class name, ReplaceAll with 31 templates / Literal / Func / Split / FindAllSubmatchIndex /
-LiteralPrefix on 460 patterns, QuoteMeta of every ASCII byte, and every case once more through a
-reader yielding one byte per read; planted bugs fail it (a reader that leaves continuation bytes:
-1,541 cases; swapped backtracker branches: 8 tests). *Review* (independent, read-only, Go probed
-for every claim): 1 HIGH, 1 MEDIUM, 3 LOW, 2 INFO. **HIGH (fixed)** — `\x{D800}` (Go compiles
-it) hit `catch unreachable` in the literal-prefix walk on every compile, and was a compile error
-under `comptimeCompile`; a surrogate is now written as U+FFFD, Go's `LiteralPrefix`. **MEDIUM
-(fixed)** — `expand` with a repeated name took the first group by index; Go takes the first of
-that name that took part. **LOW (fixed)** — a reader failing in the look-ahead after a settled
-match became `error.ReadFailed`; the backtracker's job stack was unbounded (~12 MB worst case,
-now 16 Ki then the Pike VM); a `std.Io.Reader` with a buffer under 4 bytes (not `fixed`) trips
-std's own assert in `peek` — documented (2026-10-28: such a buffer now works, bytes held). INFO: the fuzz inputs never reached the 32-byte scan
-(now repeated to 400 bytes now and then). *Mutation* (schemata, ReleaseSafe, whole suite): 42
-mutants over the new code — loose names, `\p{^…}`, folding of `\p`, `Assigned`, `ASCII`, the
-varint decoder, class sharing, every POSIX rule, longest's start cut and its POSIX default,
-the backtracker's bookkeeping, restores, branch order and longest guard, the vector scan and its
-tail, the reader's toss and window, Expand's `$$` / leading zero / `}` / Unicode names, Split's
-edges and limit, QuoteMeta, literalPrefix's `\A`, ranges and completeness, the U+FFFD
-exclusion: 37 killed, 2 survivors closed by tests (`\p{ASCII}` at 0x7f; `${a b}`), 3 equivalent
-(the longest mode's equal-end check — dead, one match thread per step, removed; the backtracker's
-anchored early exit — speed only; a redundant count in completeness). *Fuzz:* the harness also
-compares the two engines, the reader with the slice, longest with first, and checks
-`replaceAll("$0")` is the input, `replaceAllLiteral("")` removes exactly the matches, split
-pieces miss the matches, every match begins with `literalPrefix`, `quoteMeta(input)` matches
-the input; a share in POSIX syntax, an eighth of the inputs repeated to ~400 bytes: 200,000
-runs clean (2,800/s, ReleaseSafe).
-
-**First round (2026-10-07, the core engine).** *Mutation:* 34 mutants — lazy marker, `(?U)`,
-repeat-size bounds, nested repetition, flag-group scope, `(?-i)`, octal backreference refusal,
-`\s`, class negation, Kelvin fold, POSIX negation, `[a-]`, alternation patching, greedy/lazy
-split order (star and counted), the empty-able star, per-member fold, Perl-class fold before
-negation, punctuation escapes, unanchored restart, leftmost-first cut, `end_line`/`begin_line`,
-`_` as a word character, `runeBefore`, empty-match adjacency and rune-width advance of the
-iterator, range binary search, full-match end check, capture restore, split order in both VMs:
-31 killed, 2 equivalent after 7 crafted oracle patterns were added; no code defect. *Review:* 1
-HIGH, 1 MEDIUM, 4 LOW, 5 INFO. **HIGH (fixed)** — nested counted repetitions of an empty body
-emit no instructions, so no capacity stopped `(?:(?:(?:a{0}){1000}){1000}){1000}` (~10⁹ emit
-calls); now Go's rule — the product of nested counted repetitions may not exceed 1000 — and
-verdict. **MEDIUM (fixed)** — 1000 nested groups overflowed a 512 KiB thread stack in Debug;
-`max_depth` is 250 and the compiler frames are small (tested on a 512 KiB thread). **LOW
-(fixed):** `a(?i)*`, `\` before a control character, `\x{+41}`/`\x{4_1}`/`\x+1`/
-`\x{000000041}`, `from` past the input. *Fuzz:* `src/fuzz_test.zig` (grammar-drawn patterns, a
-share damaged byte-wise; the entry points agree, spans well-formed, a literal-only pattern
-matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
+- **Differential oracles.** `src/go_oracle_test.zig` replays Go `regexp` (frozen in `src/go_vectors.zig`, produced by
+  `tools/go_regexp_oracle`): compile verdicts, group names, match, full match, submatches and find-all (also after
+  `Longest()`), through a slice and through a one-byte-per-read reader; ReplaceAll / Literal / Func, Split,
+  FindAllSubmatch and LiteralPrefix; QuoteMeta of every ASCII byte; every Unicode class name. `src/rust_oracle_test.zig`
+  does the same for Rust `regex` (`src/rust_vectors.zig`, `tools/rust_regex_oracle`): the Rust grammar, bytes mode,
+  `RegexSet`, `shortestMatch`. Pinned divergences: see *Anchoring*. `tools/ucd_unicode` regenerates the Unicode tables and
+  `tools/rust_unicode` holds its rules to Rust's `regex-syntax`.
+- **Unit and robustness tests** (`src/root.zig`, `src/syntax.zig`, `src/teddy.zig`): per-feature tests and a
+  deterministic robustness driver (random patterns x inputs with invalid UTF-8: compile or refuse, the entry points agree,
+  the prefilter only skips, the backtracker and the Pike VM give the same groups at every start, no trap). A file-private,
+  test-only `Probe` hook (events in `root.zig`, counters in `teddy.zig`, active only under `builtin.is_test`; no pub API) makes
+  the lazy-DFA and Teddy internals observable (table resets, skips, flushes, wide-cache hits, VM steps), and a golden work
+  table says which engine answers a pattern and how many steps it takes.
+- **Mutation-driven tests** (`src/mutation_test.zig`, `src/mutation_parse_test.zig`, `src/mutation_engine_test.zig`): an
+  error table of bad and borderline patterns x perl/posix/rust, parser limits and Rust nest heights, class edges and
+  the `(?i)` fold orbit in class form, `expand` and `literalPrefix` edges, the set VM, bytes mode, the one-pass engine,
+  the prefilter and the `Matcher`'s capture side. Each block names what it pins.
+- **Fuzz** (`src/fuzz_test.zig`; driver `REGEX_FUZZ=<runs>[,<first seed>]`, never `zig build --fuzz`): grammar-drawn
+  patterns with a share damaged byte-wise, in the Go, POSIX, Rust and bytes grammars. The entry points agree, spans are
+  well-formed, a literal-only pattern matches where `std.mem.indexOf` does; the DFA and the NFA, the backtracker and
+  the Pike VM, the reader and the slice, `.perl` and `.rust` twins of every atom, bytes mode and `&str`, a `RegexSet` and
+  each pattern's `isMatch`, `shortestMatch` against a substring reference, the `*Alloc` variants against the stack ones,
+  `findAnchored` against `find`; independent leftmost-longest reference for assertion-free patterns; `replaceAll("$0")`
+  is the input, `replaceAllLiteral("")` removes exactly the matches, split pieces miss the matches, every match begins with
+  `literalPrefix`, `quoteMeta(input)` matches the input. Inputs are sometimes repeated to ~400 bytes to reach the 32-byte
+  scan; shares past `max_insts` and `4 * max_insts` reach the heap tier.
+- **ctgrind:** not applicable (a regex engine; keyword review).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
 ## Performance
 
-**2026-10-28, byte-level DFA and the forward-pass start** (`zig build bench-regex -Djcc-safe`, both
-sides JCC-padded, two full runs on a loaded host; worst of the two per row): ref 0.00–0.57× Go
-regexp go1.26, fastest 0.05–1.24× Rust regex 1.13.1. The worst row is `inv_sub` (captures of
-`INV-([0-9]{4}-[0-9]{4})`, 1.14–1.24× over four runs; a harness of its own reads 48–52 µs best
-against Rust's ~62, the bench's batch means carry the host's tail). Czech/Greek/Cyrillic find-all:
-`\p{L}+` 0.76×, `\b\w+\b` 1.02–1.08×, `[0-9]+` 0.77–0.85×, `(?i)žluť\w*` 0.94×. What moved
-them: transition rows over every byte with mid-sequence states for two-byte UTF-8, a SIMD
-first-byte scan (`teddy.ByteSet`), the match start read off the forward pass (`FindDfa.Track`),
-and a one-pass loop without spills. A/B on this host only by counters (min cycles of 5 runs) —
-single timings swing 5–10 % with layout and load.
+`zig build bench-regex [-Djcc-safe]` (`tools/bench.zig`) compares against Go `regexp` and Rust `regex`; the card's
+`**Performance:**` line carries the figures and is authoritative. Optimisations are judged by counters (min cycles of
+several runs), not single timings, which swing 5-10 % with code layout and load.
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-regex`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.03–0.85×, against 0.02–0.91× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+## What is deliberately not done
+
+- **Backreferences, lookaround, atomic groups, possessive quantifiers, recursion** — each needs backtracking and no
+  linear-time guarantee (RE2's and Go's choice; `error.InvalidEscape` / `error.InvalidPerlOp`).
+- **Full case folding** (`ß` ↔ `ss`) — not RE2's or Go's; `(?i)` is Unicode simple folding by orbits.
+- **Go's `FindAll` limit `n`** — the limit is the caller's loop over `Matcher.iterator`.
+- **RE2's `ANCHOR_BOTH`** — it is `fullMatch` of the rest (Rust has none); **RE2's Latin-1 mode** — bytes mode covers
+  non-UTF-8 text; **`FilteredRE2`, `PossibleMatchRange`** — niche, no other engine here has them.
+- **`RegexBuilder` knobs** beyond `Options` (Rust) — one option struct is the whole configuration.
+- **`MarshalText`/`UnmarshalText`** — Go's encoding interfaces; `source` and `compile` are the same pair.
+- **Hand-written `Regex` values** — a `Regex` built by writing its fields is outside the guarantee.
 
 ## Backlog / deferred
 
-- **The Rust grammar's assertions in the DFAs** *(2026-10-28)* — a program with a Unicode `\b`
-  (the Rust grammar's default), `\<`/`\>`, the half boundaries or CRLF lines runs on the
-  backtracker and the Pike VM only (`Regex.vm_only`): `\b\w+\b` written for `.rust` is far slower
-  than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a byte past ASCII; here the
-  DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the VMs.
-  Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
-- **Unicode tables cost every consumer 94 KB** *(2026-10-28; 91 KB on Unicode 17.0)* — the grammar is chosen at run time,
-  so `unicode_tables.zig` (every property the Rust grammar names) is linked even into a program
-  that only ever compiles `.perl` patterns (the Go-generated tables were 11 KB). A build option or
-  a comptime-known grammar could leave the Rust-only properties out.
-- **Readers in bytes mode** *(2026-10-28)* — `isMatchReader`/`findReader`/`capturesReader` return
-  `error.BytesMode` for a bytes-mode `Regex`; a byte-stepping reader front end would lift it
-  (Rust has no reader API at all).
-- **Programs past `4 * max_insts`** *(owner 2026-10-28: no consumer setting may end in a panic or an
-  OOM)* — Go and Rust compile them; here `error.PatternTooLarge`, because `isMatch` has no
-  allocator and a `Matcher` for 65,534 instructions × 64 groups would be ~134 MiB. Taking them
-  back needs matching in bounded memory for any size (a windowed or chunked state set), not an
-  allocating side door.
+All open.
 
-- **A full forward table can stop caching two-byte steps** *(review 2026-10-28, LOW, perf only)* —
-  when `FindDfa` holds `limit` states and the next state already exists, `intern` does not empty
-  the table, but `midAfter` has no room: every two-byte code point from that state is stepped
-  uncached until some new state forces a flush. Not seen in the bench (≤ 20 states); a fix would
-  flush from `midAfter` at a point where `s` can be re-interned.
-  *Tried 2026-11-20, not kept:* flushing from `midAfter` (re-interning `s` and the next state) is
-  a few lines, but on the golden work table's 12-state table over Czech text it made the forward
-  steps 404 → 1,507 and the flushes 0 → 32 — a working set past the limit thrashes where the old
-  policy keeps the first states cached. It needs a measured bench with a working set just past 255
-  states and a give-up heuristic (Rust's lazy DFA quits when it clears too often), not a local change.
-- **The backward search's per-call cost** *(2026-10-27)* — when the tail filter passes, each new
-  backward state costs a closure per consuming instruction (~100 ns) and the table starts empty on
-  every call (no allocator, no cache between calls): ~1.2 µs for ten states. The `tail` filter
-  (literal suffix, `(?i)` pairs) answers the common shapes in nanoseconds; a class near the end
-  (`[A-Z]+XYZ$` on a text ending `…XYZ`) still runs the DFA. Precomputing each instruction's
-  follow set at compile time would cut the per-state cost; it costs ~2 KiB per `Regex`.
-- **Teddy past 32 prefixes, and on NEON** *(2026-10-27, after `Prefilter.teddy`)* — Rust's slim
-  Teddy takes 64 patterns and its fat variant 16 buckets; past 32 here the prefixes are cut
-  shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
+- **The Rust grammar's assertions in the DFAs** — a program with a Unicode `\b` (the Rust grammar's default),
+  `\<`/`\>`, the half boundaries or CRLF lines runs on the backtracker and the Pike VM only (`Regex.vm_only`):
+  `\b\w+\b` written for `.rust` is far slower than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a
+  byte past ASCII; here the DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the
+  VMs. Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
+- **Unicode tables cost every consumer 94 KB** — the grammar is chosen at run time, so `unicode_tables.zig` (every property
+  the Rust grammar names) is linked even into a program that only ever compiles `.perl` patterns (the Go-generated tables were
+  11 KB). A build option or a comptime-known grammar could leave the Rust-only properties out.
+- **Readers in bytes mode** — `isMatchReader`/`findReader`/`capturesReader` return `error.BytesMode` for a bytes-mode
+  `Regex`; a byte-stepping reader front end would lift it (Rust has no reader API at all).
+- **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
+  them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
+  groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
+  set), not an allocating side door.
+- **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
+  state already exists, `intern` does not empty the table, but `midAfter` has no room: every two-byte code point from that
+  state is stepped uncached until some new state forces a flush. Not seen in the bench (<= 20 states). Flushing from
+  `midAfter` is a few lines but thrashes where the old policy keeps the first states cached (a working set past the
+  limit); a fix needs a measured bench with a working set just past 255 states and a give-up heuristic (Rust's lazy DFA
+  quits when it clears too often).
+- **The backward search's per-call cost** — when the tail filter passes, each new backward state costs a closure per
+  consuming instruction (~100 ns) and the table starts empty on every call (no allocator, no cache between calls): ~1.2 us for
+  ten states. The `tail` filter answers the common shapes in nanoseconds; a class near the end (`[A-Z]+XYZ$` on a text ending
+  `…XYZ`) still runs the DFA. Precomputing each instruction's follow set at compile time would cut the per-state cost at
+  ~2 KiB per `Regex`.
+- **Teddy past 32 prefixes, and on NEON** — Rust's slim Teddy takes 64 patterns and its fat variant 16 buckets; past 32
+  here the prefixes are cut shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
   nibbles up by a select tree (AArch64 has `tbl`), unmeasured.
-- **Intel JCC erratum in the prefilter scan** *(2026-10-19 Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
-- **A DFA for searches with positions — DONE** (`FindDfa`: forward pass with the start tracked, backward `Back` for the rest, kept in the `Matcher`; see Performance) *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
-  night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
-  capture engine runs; dense long-text find-all is already 0.24–0.32 of Go's time, so speed only.
-  Would need caller-owned (`Matcher`) cache scratch.
-- **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
-- **Per-call compile + match in ReleaseSafe** *(the build-tool consumer request 2026-10-19)* — 1.1–3.7× slower than
-  quangd/regex.zig in ReleaseSafe (≈70 % `compiler_rt.memset`: safety fills `undefined` of the
-  ~9 KiB `Builder` and the DFA scratch), 2–7× faster in ReleaseFast/ReleaseSmall. Matters only to
-  consumers that ship ReleaseSafe and compile per call (the build-tool consumer ships ReleaseSmall); a fix would keep
-  those scratches out of safety's `undefined` fill. Not measured here yet.
-- **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out
-  src`; re-run the Go replay (its UNICODE_VERSION count moves) and check new binary properties or
-  property values against regex-syntax once it carries that version.
-- **A byte-stepping DFA state for `trie.search`** *(2026-10-13, from trie's fst parity)* — fst
-  searches its index with a `regex-automata` DFA (`start`/`accept(state, byte)`/`isMatch`/
-  `canMatch`); `trie.search` takes the same shape (`trie.automaton`), but this module exposes no
-  per-byte state, so in-index regex search is the one fst feature trie routes nowhere. The
-  `isMatch` DFA's states would serve if they were public and anchored; `canMatch` = "a match
-  state is still reachable" needs a dead-state flag. Effort small–medium once the DFA cache
-  can live in a caller-owned value.
-- **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a
-  caller-supplied matcher today; a `regex` default), `jsonshape` (RFC 9535 `match()`/`search()`
-  need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe` (`expect` regex). Each is
-  that module's own backlog item; listed here so the dependency is visible.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 3 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · util · reentrant` + deps: none — canonical source is `pub const meta` in src/root.zig.
+- **Intel JCC erratum in the prefilter scan** — `Prefilter.next`'s `cmp;jne` back-edge (31-40 % of `isMatch` samples) and a loop
+  in `runDfa` cross a 32-byte boundary in the current layout: a mitigated build ran in 0.825-0.856x the cycles. Layout luck,
+  moves with any edit. Plan (user-approved): the scan loop in inline asm behind `.p2align 5`, or at least
+  `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py`
+  after each compiler bump.
+- **An ASCII bitmap per class** — smaller constant factors.
+- **Per-call compile + match in ReleaseSafe** — 1.1-3.7x slower than the other Zig engine measured in ReleaseSafe
+  (about 70 % `compiler_rt.memset`: safety fills `undefined` of the ~9 KiB `Builder` and the DFA scratch), 2-7x faster in
+  ReleaseFast/ReleaseSmall. Matters only to consumers that ship ReleaseSafe and compile per call; a fix would keep those
+  scratches out of safety's `undefined` fill. Not measured here yet.
+- **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
+  (its UNICODE_VERSION count moves) and check new binary properties or property values against regex-syntax once it carries
+  that version.
+- **A byte-stepping DFA state for `trie.search`** — fst searches its index with a `regex-automata` DFA
+  (`start`/`accept(state, byte)`/`isMatch`/`canMatch`); `trie.search` takes the same shape (`trie.automaton`), but this
+  module exposes no per-byte state, so in-index regex search is the one fst feature trie routes nowhere. The `isMatch` DFA's
+  states would serve if they were public and anchored; `canMatch` = "a match state is still reachable" needs a dead-state flag.
+  Effort small-medium once the DFA cache can live in a caller-owned value.
+- **Sibling modules that can now adopt it** — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex`
+  default), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe`
+  (`expect` regex). Each is that module's own backlog item; listed here so the dependency is visible.
 
 ## Anchoring
 
@@ -484,9 +376,9 @@ patterns, `ReplaceAllString` (31 templates), `ReplaceAllLiteralString`, `Replace
 `regex-syntax` (run as a black box by `tools/rust_unicode`) on UCD 16.0, byte for byte. `src/go_oracle_test.zig` requires every answer, through a slice and through
 a one-byte-per-read reader; the listed divergences are counted and pinned — GO_DEFECT (46: the
 multi-word script names Go refuses), LITERAL_PREFIX (5: ours extends Go's), CAPACITY (1: past
-250 levels; was 5 before big patterns compiled on the heap), UNICODE_VERSION (17: code points assigned
+250 levels), UNICODE_VERSION (17: code points assigned
 after Go's 15.0, asked of this module's own `\p{Age=15.0}`). `tools/rust_regex_oracle` does the same for Rust's `regex` 1.13.1 (`src/rust_vectors.zig`,
 `src/rust_oracle_test.zig`; pinned SIZE_LIMIT, CAPACITY, SHORTEST). On the interop lane via `zig build interop-regex -- --check`.
-**Unicode 18.0 (2026-11-13):** the tables moved from UCD 17.0.0 to 18.0.0 — 13,007 code points newly assigned, three new scripts (`Jurchen`, `Proto_Cuneiform`, `Seal`) and `Age=18.0` (451 tables, 1,456 keys), no new binary property and no new break-property value; case folding 379 → 392 runs: four old lowercase letters gained capitals and so orbits ({U+0277, U+A7DD}, {U+027C, U+A7E2}, {U+AB4B, U+AB6C}, {U+AB4C, U+AB6D}), 16 new Latin Extended-G pairs in U+1DF40-1DF7F, and U+1DF95 LIGATURE LONG S WITH DESCENDER S joins ß's orbit ({U+00DF, U+1E9E, U+1DF95}, three members; `max_orbit` stays 4). Anchors: the generator's rules stay held to regex-syntax on UCD 16.0 (unchanged); the 18.0 data only by `gen.py -check`; the Go replay's UNICODE_VERSION count moved 12 → 17, each a vectors' input code point that 18.0 assigned (U+11B0A in `\p{Devanagari}`, U+1246F in `\p{Nl}` and `\p{Letter_Number}`, U+1B168 in `\p{Katakana}`, U+1DF2B in `\p{Latin}`), and no answer moved for an old code point (unexplained 0); the Rust replay (regex 1.13.1, Unicode 16.0) passes unchanged.
+**Unicode 18.0:** tables 451, 1,456 keys; case folding 392 runs (`max_orbit` stays 4). The generator's rules stay held to regex-syntax on UCD 16.0; the 18.0 data only by `gen.py -check`; the Go replay's UNICODE_VERSION rows are vectors' input code points that 18.0 assigned (no answer moved for an old code point); the Rust replay (regex 1.13.1, Unicode 16.0) passes unchanged.
 Teeth: its first run found four defects (see tools/README.md); planted bugs fail it (see
 Verification). Still self-graded: behaviour past the capacities (only the error is checked).

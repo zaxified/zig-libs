@@ -127,7 +127,7 @@ a repetition (`a*?` is `(a*)?`); leftmost-longest.
 **Rust** (`Options{ .syntax = .rust }`, Rust's `regex` 1.13 on a `&str`): flags `i m s R U u x`
 with `u` on (Unicode `\d \s \w \b`; `(?-u)` for ASCII), `(?x)` whitespace and `#` comments,
 CRLF lines `(?mR)`, `\< \> \b{start} \b{end} \b{start-half} \b{end-half}`, `\u`/`\U` escapes,
-nested classes and set operations `[a-z&&[^aeiou]]`, `--`, `~~`, every property the crate knows
+nested classes and set operations (`[a-z&&[^aeiou]]` intersection, `--` difference, the doubled tilde symmetric difference), every property the crate knows
 (`\p{scx=Greek}`, `\p{Alphabetic}`, `\p{Emoji}`, `\p{Age=6.0}`, the break properties), counts up
 to 100,000, Unicode group names. Its `\<`, `\b{…}` and `&&` read differently in Go, hence a
 grammar of its own (`.perl` stays Go's). **Bytes mode** (`.utf8 = false`, Rust's
@@ -154,6 +154,10 @@ given. The reader functions work with any buffer size; on a bytes-mode `Regex` t
 fits a 512 KiB thread stack in Debug. A `Matcher` keeps a
 pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
+## Not provided
+
+Backreferences, lookaround, atomic groups, possessive quantifiers and recursion (they need backtracking), full case folding, RE2's `ANCHOR_BOTH`/Latin-1 mode/`FilteredRE2`; open items are listed in SPEC "Backlog / deferred", the refusals with their reasons in "What is deliberately not done".
+
 ## Performance
 
 `Regex.compile` builds a pattern that fits its small builder (256 instructions, ranges and AST
@@ -161,27 +165,15 @@ nodes) in ~9 KiB of stack scratch, and only a larger one in a full `Builder` fro
 At compile time the program is analysed once: a pattern anchored at `\A`/`^` is tried at the
 start only; a literal prefix of two bytes or more is searched for by a 32-byte vector scan, a
 set of up to 32 literal prefixes (`ABCD|CDEF|…`, `(?i)abc`, `foo\d|bar\d`) by Teddy's SIMD
-nibble tables, a single first byte by `indexOfScalar`. `isMatch`/`fullMatch` run a lazy DFA on the stack
+nibble tables, a single first byte by a scalar search. `isMatch`/`fullMatch` run a lazy DFA on the stack
 (programs up to 128 instructions; transitions on ASCII bytes cached). Searches with groups run on
 a bit-state backtracker over a window of 256 Kbit / instructions positions — a short match in a
 long text included — with one set of captures instead of one per thread; an exploration longer
 than the window goes to the Pike VM.
 
-Against Go 1.26 `regexp` (2026-10-07 night, x86-64, ReleaseFast vs `go build`, 18 shared
-workloads incl. Go's own Easy/Medium/Hard, same match counts; ours/Go time, lower is better —
-ahead on all 18):
-
-| workload | ours/Go |
-|---|--:|
-| no-match scan of 1 MiB: literal, `[XYZ]ABC…`, `[ -~]*ABC…$`, 12-way alternation, `(?i)…` | 0.02–0.44 |
-| find-all over 85 KiB of invoice rows (`INV-…`, with and without groups) | 0.25–0.27 |
-| find-all over 1 MiB: dense `[A-Z]+`, literal | 0.24–0.26 |
-| find-all over 1 MiB of Czech/Greek/Cyrillic (`\p{L}+`, `\b\w+\b`, `(?i)žluť\w*`, digits) | 0.05–0.32 |
-| short-string find / submatches (anchored, pair, email) | 0.58–0.88 |
-| compile + submatch per call | 0.39 |
-
-Against quangdn42/regex.zig on the build-tool consumer's workload: ~3.7× faster per row with the pattern compiled per
-call, ~11× on precompiled find-all (SPEC "Compared with").
+Figures against Go's `regexp` and Rust's `regex` come from `zig build bench-regex`
+(`tools/bench.zig`) and are carried by the module's maturity card (`**Performance:**` line);
+SPEC "Compared with" has the head-to-head with the other Zig engines.
 
 ## Verification
 
@@ -197,13 +189,13 @@ call, ~11× on precompiled find-all (SPEC "Compared with").
   CAPACITY and SHORTEST rows.
 - The Unicode tables are generated from the UCD 18.0 by `tools/ucd_unicode`, whose rules give Rust's
   `regex-syntax` tables byte for byte when run on UCD 16.0 (the crate's version; interop lane).
-- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`, 240,000 runs clean; Go,
+- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`; Go,
   POSIX, Rust and bytes grammars) hold the engines to each other: the DFA and the NFA, the
   backtracker and the Pike VM give the same groups at every start, the reader the slice's
   answer; every pattern its twin written in the other grammar; bytes mode `&str`'s answer;
   a `RegexSet` each pattern's `isMatch`; leftmost-longest and `shortestMatch` independent
   substring references; the prefilter only skips; `replaceAll("$0")` is the identity.
-- Four rounds of independent review and mutation testing (SPEC "Verification").
+- Independent review and whole-module mutation testing; the score is the card's `**Audit:**` line (SPEC "Verification").
 - The exponential-backtracking classic `(a+)+$` on `a…ab` (5,000 bytes) is instant.
 
 `zig build test-regex`
