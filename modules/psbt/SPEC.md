@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoinjs/bip174, bitcoinjs-lib `Psbt`](https://github.com/bitcoinjs/bip174) | JavaScript | MIT | 37 | push 2026-09-08 | Creator/Updater/Signer/Combiner/Finalizer/Extractor in one class; `Psbt.fromBase64`, `updateInput`, `signInput`. |
 | [btcsuite/btcd (`btcutil/psbt`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Creator/Updater/Signer/Finalizer/Extractor packages, base64 helpers *(inferred)*. Zig `std` and the Zig ecosystem have no PSBT. |
 
-**Where we are ahead:** the only pure-Zig PSBT; byte-exact against BIP174's vectors, Core's `rpc_psbt.json`, and PSBTs captured from a live regtest Core node for every finalize shape; UTXO-to-outpoint binding and per-signature pre-verification before finalize. **Where we are behind:** no Signer (by design, see SPEC), no BIP370 v2 (not yet, → Backlog), finalizer limited to standard spend types (taproot script path only for `<key> OP_CHECKSIG` and `multi_a` leaves; no miniscript/descriptor-driven finalization like `rust-miniscript`), no `analyzepsbt`/`utxoupdatepsbt`-style RPC conveniences. *(Closed 2026-11-13: the Creator/Updater API, typed BIP371 taproot fields, hash-preimage accessors and Base64 I/O.)*
+**Where we are ahead:** the only pure-Zig PSBT; byte-exact against BIP174's vectors, Core's `rpc_psbt.json`, and PSBTs captured from a live regtest Core node for every finalize shape; UTXO-to-outpoint binding and per-signature pre-verification before finalize. **Where we are behind:** no Signer (by design, see *What is deliberately not done*), no BIP370 v2 (not yet, → Backlog), finalizer limited to standard spend types (taproot script path only for `<key> OP_CHECKSIG` and `multi_a` leaves; no miniscript/descriptor-driven finalization like `rust-miniscript`), no `analyzepsbt`/`utxoupdatepsbt`-style RPC conveniences.
 
 ## Design & invariants
 
@@ -68,7 +68,7 @@ slice into the buffer `parse` was called with — `bytes` must outlive the retur
 
 Concurrency: `.reentrant` — no shared/global state, every call is over caller-owned values.
 
-## Creator / Updater, BIP371 fields, preimages, Base64 (S3, 2026-11-13)
+## Creator / Updater, BIP371 fields, preimages, Base64
 
 **API.** All of it is re-exported from `root.zig`.
 
@@ -97,14 +97,13 @@ Concurrency: `.reentrant` — no shared/global state, every call is over caller-
 - *Base64:* `fromBase64(allocator, text) -> OwnedPsbt` (the decoded buffer the `Psbt` borrows from
   travels with it; surrounding ASCII whitespace ignored) and `toBase64(allocator, psbt)`.
 
-**`parse` is stricter (behaviour change).** Records of the BIP371 types are now structurally
-validated, like every BIP174 type: `TAP_KEY_SIG` (no keydata, 64/65-byte value), `TAP_SCRIPT_SIG`
+**`parse` validates BIP371 and preimage records structurally**, like every BIP174 type: `TAP_KEY_SIG` (no keydata, 64/65-byte value), `TAP_SCRIPT_SIG`
 (64-byte keydata, 64/65-byte value), `TAP_LEAF_SCRIPT` (control block `33 + 32m`, `m <= 128`;
 value >= 1 byte), `TAP_BIP32_DERIVATION` (32-byte key; count, hashes, fingerprint, path all
 present, counts checked against the bytes present), `TAP_INTERNAL_KEY`/`TAP_MERKLE_ROOT` (no keydata,
 32 bytes), `OUT_TAP_TREE` (one or more tuples forming one complete depth-first binary tree, depth <=
-128, even leaf versions), and the preimage keydata (20/32 bytes). New errors: `InvalidKeyDataLength`,
-`InvalidTapTree` (in `RecordError`, which `ParseError` now includes). The x-only keys and signatures
+128, even leaf versions), and the preimage keydata (20/32 bytes). BIP371-specific errors: `InvalidKeyDataLength`,
+`InvalidTapTree` (in `RecordError`, which `ParseError` includes). The x-only keys and signatures
 are not checked to be curve points/valid signatures at parse; `finalize`'s `verifyScript` pass is.
 
 **Script-path finalize.** `finalize` on a P2TR input without `TAP_KEY_SIG` walks the
@@ -120,119 +119,84 @@ present but none committed and recognised). Per BIP371 the Finalizer drops `TAP_
 `TAP_SCRIPT_SIG`, `TAP_LEAF_SCRIPT` and `TAP_MERKLE_ROOT` (and, BIP174's general rule, the preimage
 fields); `TAP_INTERNAL_KEY` and `TAP_BIP32_DERIVATION` stay.
 
-**Tests.** The BIP174 Creator/Updater walkthrough byte-exact (`update_test.zig`: creator PSBT,
-updater PSBT, updater+SIGHASH_ALL, hex and Base64) and the Base64 twin of every BIP174 valid
-vector; all 11 invalid and 6 valid PSBTs of BIP371 "Test Vectors" with per-case errors and decoded
-fields (`bip371_test.zig`; vectors machine-extracted into `bip_vectors.zig`); standard hash vectors
-for the four preimage kinds; script-path finalize round trips built with `taproot` and signed with
-`bip340` (test-only deps; `finalize_taproot_test.zig`). Core's `rpc_psbt.json`: its 11 `invalid[]`
-taproot vectors (28-35, 37, 38, 41) and `invalid_with_msg[0]`/`[1]` (taproot keypath length, empty tap
-tree) used to be asserted as accepts and are now rejects. The fuzz harness (`psbt-parse`) generates
-well-shaped BIP371/preimage records from a second cursor, walks every typed reader over what parsed,
-and round-trips the Creator.
-
 ## Verification
 
-**Invalid vectors** (`kat_vectors.zig: invalid`, 20 cases, machine-extracted by regex from BIP174's
-own "Test Vectors" section — see that file's doc comment for the exact source and why regex
-extraction rather than hand-typing): every one is asserted rejected (`kat_test.zig`'s first test),
-and 19 of the 20 are asserted to fail with the *specific* error `parse` gives for that case (traced
-by hand against the raw bytes — e.g. "invalid redeemscript typed key" decodes to keytype `0x04`
-with one extra keydata byte beyond the type, i.e. `error.UnexpectedKeyData`; "invalid pubkey length
-for input partial signature typed key" decodes to a 32-byte keydata on a `PARTIAL_SIG` record, i.e.
-`error.InvalidPubkeyLength`). The 20th ("invalid value data due to its size being not the stated
-size") is deliberately fuzzed garbage with no single well-defined rejection reason and is only
-asserted to fail somehow.
+Run with `scripts/modtest psbt` (`zig build test-psbt`).
 
-**Valid vectors** (`kat_vectors.zig: valid`, 10 cases): 8 of the 10 are asserted byte-exact on
-`parse` → `serialize` round-trip. The remaining 2 ("...0 inputs and 0 outputs" / "...0 inputs")
-encode a legacy transaction with a 0-input `vin` count — which is byte-for-byte indistinguishable
-from the BIP144 segwit marker byte, a wire-format ambiguity `bitcointx.tx` documents as a real,
-permanent restriction of the underlying transaction codec (not something this module can route
-around without changing `bitcointx`'s own wire disambiguation rule). These two are asserted to fail
-with `error.InvalidWitnessFlag` — a documented, tested limitation, not a silent gap.
-
-**Combiner vector**: BIP174's own worked example ("Given these two PSBTs with unknown key-value
-pairs... A combiner which orders keys lexicographically must produce the following PSBT") is pinned
-byte-exact: `combine(a, b)` → `serialize` equals the BIP's own expected result bytes.
-
-**Finalizer/Extractor vectors** (`kat_vectors.zig`'s `finalize_combined_hex`/`finalize_finalized_hex`/
-`finalize_extracted_tx_hex`, driven by `finalize_test.zig`'s "BIP174 official Finalizer/Extractor
-worked example" tests): the same "Test Vectors" section's main multisig-workflow narrative also
-carries a genuine pre-finalize/post-finalize/post-extract triple — a bare P2SH 2-of-2 multisig input
-plus a P2SH-P2WSH 2-of-2 multisig input. `finalize` on the pre-finalize PSBT reproduces the BIP's own
-finalized PSBT byte-exact (with the field-clearing rule checked explicitly per input, not just
-implied by the byte compare), and `extract` on the BIP's own finalized PSBT reproduces its published
-raw transaction byte-exact. P2WPKH finalization and native (non-P2SH) P2WSH multisig are NOT covered
-by BIP174's vectors — see "Regtest vectors" below for how those two are anchored instead.
-
-**Bitcoin Core vectors** (`core_kat_vectors.zig`/`core_kat_test.zig`, `test/functional/data/
-rpc_psbt.json`, a SEPARATE external oracle from BIP174): Core's own `finalizer`/`extractor` entries
-were checked first and turned out to be byte-identical to the BIP174 Finalizer/Extractor worked
-example just above — Core's functional test reuses BIP174's own example verbatim, so the P2WPKH/
-native-P2WSH gap noted above is NOT closed by this JSON. What Core's JSON DOES give this module: 45
-new (non-BIP174-duplicate) `invalid` vectors plus all 23 `invalid_with_msg` vectors, individually
-decoded to determine why each is invalid
-rather than just pattern-matching Core's message. That surfaced one genuine BIP174 gap — a present
-`PSBT_GLOBAL_VERSION` was checked for shape but never for value, though BIP174 §"Version 0" requires
-it be 0 if present — now fixed (`error.UnsupportedPsbtVersion`; `core_kat_vectors.invalid_v0_scope`'s
-`core_index = 19`/`42` are the external oracle for it). Every other vector this module still accepts
-is BIP370(PSBTv2)/MuSig2 content — not supported by this module (BIP370 is Backlog: not yet), not a bug; asserted as an
-accept, not silently skipped (`core_kat_vectors.invalid_out_of_scope`; its BIP371 members became rejects on 2026-11-13, see "Creator / Updater" above). **Correction:** two of those
-vectors (`core_index = 39`/`40`) were previously bucketed here as "a BIP174 §Signer TXID-cross-check,
-and the Signer is deferred", and therefore asserted as accepts. That was wrong. The justification was
-written while all three non-Script roles were deferred; the **Finalizer** landed afterwards and does
-consume the UTXO — so the cross-check stopped being someone else's job the moment `finalize.zig`
-existed. They are now `core_kat_vectors.invalid_utxo_binding` and are asserted as **rejects** by
-`finalize` (`error.UtxoOutpointMismatch` / `error.MissingUtxo`); `parse`, a pure v0 wire codec that
-never interprets one record against another, still accepts them, which is where this module's layering
-differs from Core's (Core refuses them at deserialize). Of Core's 42 new `valid` vectors, 27
-round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (BIP370: not yet, see Backlog), and one
-(`valid[5]`) hits the SAME 0-vin/BIP144-marker ambiguity as the two BIP174 valid vectors above, just
-surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag` — same root cause, new facet,
-not a new bug. See `core_kat_test.zig`'s doc comment for the full per-index account.
-
-**Regtest vectors** (`regtest_kat_vectors.zig`/`regtest_kat_test.zig`, `zig build test-psbt`): the
-two spend shapes neither BIP174's vectors nor Core's `rpc_psbt.json` reach — native P2WPKH and
-native (non-P2SH) P2WSH multisig — are anchored by capturing them from a real Bitcoin Core v28.0.0
-regtest node instead, once, with the resulting bytes frozen as literals (no network access at test
-time; see each vector file's doc comment for the exact `bitcoin-cli` sequence to re-derive them).
-Native P2WPKH (captured 2026-08-02): `walletcreatefundedpsbt` → `walletprocesspsbt … false` →
-`finalizepsbt`. Native P2WSH 2-of-3 multisig (captured 2026-08-05) needed a longer chain — a
-watch-only wallet holding an imported `wsh(multi(2,pk1,pk2,pk3))` descriptor funded via
-`sendtoaddress` (not mined directly, to sidestep coinbase maturity), two independent signer wallets
-each running `walletprocesspsbt … false`, then `combinepsbt` — because it is the ONE spend shape in
-this module that had no outside oracle at all before this capture: an encoder/decoder pair sharing a
-misreading would otherwise satisfy its own test. For both shapes, `finalize` on the pre-finalize
-PSBT reproduces Core's own finalized-PSBT bytes exactly, `extract` on Core's finalized PSBT
-reproduces Core's own extracted-transaction bytes exactly, and (P2WSH multisig only, as the harder
-case) the extracted transaction was independently confirmed acceptable by `testmempoolaccept` on the
-node that produced it — not just something this module's own code would accept. Every spend shape
-`finalize`/`extract` supports is now anchored against an outside oracle.
-
-**Hostile teeth beyond the BIP set** (`root.zig`'s own test block): truncated map (keylen with no
-key bytes following), `valuelen` claiming far more bytes than remain (both a 1-byte and a
-CompactSize-wide-form declared length), empty global map (no unsigned tx) — every one a typed
-error, never a panic or OOB read. `parseMap`'s `ArrayList` only grows one successfully-decoded
-record at a time (no upfront-count-driven allocation to game — there is no count field in the map
-format to begin with, it's `0x00`-terminated), so there is no large-allocation-from-a-hostile-count
-vector the way `bitcointx.tx`'s `vin`/`vout`/witness counts have; duplicate-key detection uses a
-`StringHashMapUnmanaged` over borrowed raw key slices (O(n) per map), not an O(n²) pairwise scan, so
-a legitimately-large PSBT can't be turned into a duplicate-key-check DoS.
-
-**Mutation run 2026-10-05** (in-place, Debug, 58 mutants over `root.zig`'s map parsing and
-per-key validation, `combine`, and `finalize.zig`'s script recognisers, signature selection,
-SIGHASH_SINGLE-bug refusal, UTXO binding, witness-stack codec and field clearing): 34 killed on
-the first pass (four were mis-written and re-run as valid mutants; one of those survived). Twelve
-tests added for the 19 non-equivalent survivors: `WITNESS_UTXO` at 7 octets and with trailing bytes, 64-octet `PARTIAL_SIG` keys
-and a 5-octet `SIGHASH_TYPE`, a malformed global `XPUB`, BIP141's witness-program extremes,
-`parseMultisig`'s m > n / trailing-opcode / 17th-key refusals, empty witness stacks, a sighash
-byte above the declared type, `SINGLE|ANYONECANPAY` hitting the SINGLE bug, bare multisig refusing
-a SINGLE-bug signature and never consulting one past the m-th, a type-mismatched multisig
-signature skipped, a `NON_WITNESS_UTXO` with no output at the prevout index, a v1 20-octet
-program not finalized as P2WPKH. Equivalent: `readBytes`' `n >= remaining` (a read ending exactly
-at the buffer end is always followed by a read that reports the same `Truncated`), and
-`parseMultisig`'s `m == 0` (`smallInt` never returns 0).
+- **BIP174 invalid vectors** (`kat_vectors.zig: invalid`, machine-extracted by regex from BIP174's own "Test
+  Vectors" section — see that file's doc comment for the exact source and why regex extraction rather than
+  hand-typing): every one is asserted rejected (`kat_test.zig`'s first test) and asserted to fail with the
+  *specific* error `parse` gives for that case, traced by hand against the raw bytes (e.g. "invalid redeemscript
+  typed key" decodes to keytype `0x04` with one extra keydata byte, i.e. `error.UnexpectedKeyData`; "invalid pubkey
+  length for input partial signature typed key" to a 32-byte keydata on a `PARTIAL_SIG` record, i.e.
+  `error.InvalidPubkeyLength`). The case named "invalid value data due to its size being not the stated size"
+  dies on the same rule as the witness-serialized unsigned tx (`error.UnsignedTxNotLegacySerialization`), so no
+  official invalid vector exercises a value-length mismatch; that class is covered by `root.zig`'s own hostile
+  tests (`SIGHASH_TYPE` / `PSBT_GLOBAL_VERSION` value length != 4, `BIP32_DERIVATION` value length not 4 + 4k).
+- **BIP174 valid vectors** (`kat_vectors.zig: valid`): all but two are asserted byte-exact on `parse` →
+  `serialize`. The two ("...0 inputs and 0 outputs" / "...0 inputs") encode a legacy transaction with a 0-input
+  `vin` count, which is byte-for-byte indistinguishable from the BIP144 segwit marker byte — a wire-format
+  ambiguity `bitcointx.tx` documents as a permanent restriction of the underlying transaction codec. They are
+  asserted to fail with `error.InvalidWitnessFlag`: a documented, tested limitation, not a silent gap.
+- **Combiner vector:** BIP174's own worked example ("A combiner which orders keys lexicographically must produce
+  the following PSBT") is pinned byte-exact: `combine(a, b)` → `serialize` equals the BIP's expected bytes.
+- **Finalizer/Extractor vectors** (`finalize_combined_hex` / `finalize_finalized_hex` /
+  `finalize_extracted_tx_hex` in `kat_vectors.zig`, driven by `finalize_test.zig`): the same "Test Vectors"
+  section carries a pre-finalize / post-finalize / post-extract triple — a bare P2SH 2-of-2 multisig input plus a
+  P2SH-P2WSH 2-of-2 multisig input. `finalize` on the pre-finalize PSBT reproduces the BIP's finalized PSBT
+  byte-exact (the field-clearing rule checked explicitly per input), and `extract` on the BIP's finalized PSBT
+  reproduces its raw transaction byte-exact. BIP174's vectors do not cover P2WPKH or native (non-P2SH) P2WSH
+  multisig; the regtest vectors below do.
+- **Bitcoin Core vectors** (`core_kat_vectors.zig` / `core_kat_test.zig`, Core's
+  `test/functional/data/rpc_psbt.json`, an external oracle separate from BIP174; Core's own `finalizer` /
+  `extractor` entries are byte-identical to BIP174's worked example, so they add no spend shape). Each vector was
+  decoded individually to determine why it is invalid, not pattern-matched on Core's message:
+  - a present `PSBT_GLOBAL_VERSION` must be 0 (BIP174 §"Version 0"): `invalid[19]`/`[42]` are the external oracle
+    for `error.UnsupportedPsbtVersion`;
+  - Core's BIP371 taproot-field defects (`invalid[28-35, 37, 38, 41]`, two `invalid_with_msg` entries) are asserted
+    as rejects with their specific errors;
+  - what `parse` still accepts is BIP370 (PSBTv2) / MuSig2 content, outside this module's scope, asserted as
+    accepts rather than skipped (`core_kat_vectors.invalid_out_of_scope`);
+  - `invalid[39]`/`[40]` (`invalid_utxo_binding`): a UTXO that does not bind to its input is accepted by `parse`
+    (layering, see *Threat model*) and asserted as a reject by `finalize` (`error.UtxoOutpointMismatch` /
+    `error.MissingUtxo`);
+  - Core's `valid` vectors that are v0 PSBTs round-trip byte-exact; the pure-PSBTv2 ones are refused with
+    `error.UnsupportedPsbtVersion`; `valid[5]` hits the same 0-vin / BIP144-marker ambiguity as the two BIP174 valid
+    vectors, surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag`.
+- **Regtest vectors** (`regtest_kat_vectors.zig` / `regtest_kat_test.zig`): the two spend shapes neither BIP174's
+  vectors nor Core's JSON reach — native P2WPKH and native (non-P2SH) P2WSH 2-of-3 multisig — were captured once
+  from a real Bitcoin Core v28.0.0 regtest node and frozen as literals (no network access at test time; each vector
+  file's doc comment gives the `bitcoin-cli` sequence to re-derive them). `finalize` on the pre-finalize PSBT
+  reproduces Core's finalized-PSBT bytes, `extract` on Core's finalized PSBT reproduces Core's transaction bytes,
+  and the P2WSH multisig transaction was independently confirmed acceptable by `testmempoolaccept` on the node
+  that produced it. Every spend shape `finalize`/`extract` supports is anchored against an outside oracle.
+- **Creator / Updater / Base64** (`update_test.zig`): the BIP174 Creator/Updater walkthrough byte-exact (creator
+  PSBT, updater PSBT, updater + SIGHASH_ALL, hex and Base64) and the Base64 twin of every BIP174 valid vector.
+- **BIP371 and preimages** (`bip371_test.zig`; vectors machine-extracted into `bip_vectors.zig`): the invalid and
+  valid PSBTs of BIP371 "Test Vectors" with per-case errors and decoded fields; standard hash vectors for the four
+  preimage kinds. Script-path finalize round trips are built with `taproot` and signed with `bip340` (test-only
+  dependencies; `finalize_taproot_test.zig`).
+- **Hostile input** (`root.zig`'s own tests): a truncated map (keylen with no key bytes following), a `valuelen`
+  claiming far more bytes than remain (both a 1-byte and a CompactSize-wide-form declared length), an empty global
+  map (no unsigned tx) — each a typed error, never a panic or an out-of-bounds read. `parseMap`'s `ArrayList` grows
+  one successfully-decoded record at a time (the map format has no count field to allocate ahead of), and
+  duplicate-key detection uses a `StringHashMapUnmanaged` over borrowed raw key slices (O(n) per map), so a large
+  PSBT cannot become a duplicate-key-check DoS.
+- **Fuzz:** deterministic driver, `PSBT_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`, harnesses in
+  `src/root.zig`): `psbt-parse` (a generated PSBT, including well-shaped BIP371/preimage records from a second
+  cursor, through parse, byte-exact serialize, every typed reader, the Creator round trip, finalize and extract)
+  and `psbt-damage` (a generated PSBT with 0-3 octets damaged and maybe truncated: never a panic, an accepted one
+  re-serializes byte-exact and combines with itself idempotently).
+- **Constant time:** n/a — public partial transactions, no secret.
+- **Mutation:** `root.zig`'s map parsing and per-key validation, `combine`, and `finalize.zig`'s script recognisers,
+  signature selection, SIGHASH_SINGLE-bug refusal, UTXO binding, witness-stack codec and field clearing; the tests
+  that kill the survivors pin `WITNESS_UTXO` at 7 octets and with trailing bytes, 64-octet `PARTIAL_SIG` keys, a
+  5-octet `SIGHASH_TYPE`, a malformed global `XPUB`, BIP141 witness-program extremes, `parseMultisig`'s m > n /
+  trailing-opcode / 17th-key refusals, empty witness stacks, a sighash byte above the declared type, the SINGLE
+  bug (`SINGLE|ANYONECANPAY`, bare multisig), a type-mismatched multisig signature skipped, a `NON_WITNESS_UTXO`
+  with no output at the prevout index, and a v1 20-octet program not finalized as P2WPKH.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Threat model / out of scope
 
@@ -240,12 +204,10 @@ at the buffer end is always followed by a read that reports the same `Truncated`
 violation — see `ParseError`'s doc comments for the complete error catalogue. No path panics or
 reads out of bounds on malformed/truncated/adversarial input.
 
-**Input Finalizer and Transaction Extractor are now implemented** (`finalize.zig`'s `finalize`/
-`extract`, exported from `root.zig`) — corrected here because this section used to say all three
-non-Script roles were deferred pending a Script interpreter; `bitcoinscript` now exists, so that
-blocker is gone for these two. `finalize` assembles `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` for the
+**Input Finalizer and Transaction Extractor** (`finalize.zig`'s `finalize`/`extract`, exported from `root.zig`).
+`finalize` assembles `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` for the
 standard spend types (P2PKH, P2WPKH, P2SH-P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, P2TR
-key-path), choosing single-key signatures by key hash and pre-verifying each multisig signature
+key-path and script-path), choosing single-key signatures by key hash and pre-verifying each multisig signature
 on its own (A1 F7; at most one ECDSA check per script key), refusing a legacy signature that hits
 the SIGHASH_SINGLE bug unless `FinalizeOptions.allow_sighash_single_bug` (A1 F4,
 `error.SighashSingleBug`), verifying every candidate through `bitcoinscript.verifyScript` before accepting it and
@@ -255,24 +217,25 @@ also **binds** them to the input first: a `PSBT_IN_NON_WITNESS_UTXO` must hash t
 `unsigned_tx.vin[i].prevout.txid` (`error.UtxoOutpointMismatch`), and a `PSBT_IN_WITNESS_UTXO` — which
 carries no such link — is only trusted alone, and must agree with the non-witness UTXO when both are
 present (`error.UtxoFieldsDisagree`). Without that, `verifyScript` would run against a scriptPubKey
-and amount the PSBT's (untrusted) author simply asserted. See `finalize.zig`'s own module doc comment for
+and amount the PSBT's (untrusted) author simply asserted. `parse`, a pure v0 wire codec that never interprets
+one record against another, does not make this check (Bitcoin Core refuses such PSBTs at deserialize); the refusal
+lands in `finalize`, the first role that consumes the field. See `finalize.zig`'s own module doc comment for
 the full scope cut (non-standard/timelocked/tapscript spends are `error.NonStandardScript`, never
 silently mis-assembled) and "Verification" below for the anchor.
 
-**Still deferred: Signer.** It needs private-key custody and signing policy this module has no
-opinion about (matching a scriptPubKey/redeemScript/witnessScript against a spend policy, then
-producing a signature) — `PARTIAL_SIG`/`TAP_KEY_SIG` records are expected to already be present by
-the time `finalize` runs. This module implements the Creator and Updater (`fromUnsignedTx`, the `set*` functions) and their wire codec (`parse`/`serialize`),
-the Combiner (`combine`, which BIP174 itself notes "does not need to know how to interpret scripts
-in order to combine PSBTs"), and now the Input Finalizer/Transaction Extractor above.
+**Roles.** This module implements the Creator and Updater (`fromUnsignedTx`, the `set*` functions) and their wire
+codec (`parse`/`serialize`), the Combiner (`combine`, which BIP174 itself notes "does not need to know how to
+interpret scripts in order to combine PSBTs"), and the Input Finalizer/Transaction Extractor above. The Signer is
+not provided (see *What is deliberately not done*).
 
-**Not yet — see Backlog: BIP370 (PSBTv2).** BIP174 v0 is what this module implements (the field list in
+**BIP370 (PSBTv2) is not supported — see Backlog.** BIP174 v0 is what this module implements (the field list in
 `global_key`/`input_key`/`output_key` is the complete BIP174 v0 set); BIP370's PSBTv2 extensions
 (explicit input/output counts, per-input `PSBT_IN_PREVIOUS_TXID`/`PSBT_IN_OUTPUT_INDEX` replacing
-the implicit unsigned-tx-derived shape, etc.) are a distinct, larger wire format and a separate future
-task, not attempted yet.
+the implicit unsigned-tx-derived shape, etc.) are a distinct, larger wire format. A PSBT declaring a version other
+than 0 is refused with `error.UnsupportedPsbtVersion`.
 
-**`PROPRIETARY` (`0xFC` everywhere) is not given a typed accessor** — it falls to the generic opaque-passthrough path like any other unrecognized key type, round-trips byte-for-byte, and has no convenience decoder.
+**Residual risk: memory.** Peak live memory while parsing can be well above the wire size for a PSBT dominated by
+one dense map (see *Performance*); bound the input size upstream.
 
 ## Anchoring
 
@@ -283,15 +246,12 @@ task, not attempted yet.
 
 **What the tests actually contain.** BIP174 vectors + Core rpc_psbt.json + live bitcoind v28 regtest (native P2WPKH/P2WSH captured); every spend shape now anchored
 
-**How it got there.** The anchoring work landed. DONE: finalize+extract byte-exact for bare P2SH multisig and P2SH-P2WSH multisig (BIP174 worked example, c713f6b), Core's rpc_psbt.json corpus (63c6cd1, found the GLOBAL_VERSION bug), NATIVE P2WPKH captured from a live bitcoind v28 regtest, and NATIVE P2WSH 2-of-3 multisig captured from the same (2026-08-05: watch-only wallet + wsh(multi(2,...)) descriptor imported active:false, funded via sendtoaddress not direct mining, two independent signer wallets + combinepsbt; finalize+extract byte-exact against Core's own bytes, extracted tx also confirmed acceptable by testmempoolaccept on the producing node). Every spend shape finalize/extract supports is now anchored -- no shapes left self-authored.
+## Performance
 
-## Throughput (A1 F11)
-
-Not previously published; no benchmark suite ships in this module (`perf_event_paranoid` on
-the auditing machine blocked `perf` itself), so the numbers below are from an instrumented
-`ReleaseFast` build counting bytes/ns directly, not a profiler -- treat them as an upper bound,
-not a precision measurement. `parse` is the path an attacker controls the size of, so it is
-the one measured; `combine`/`finalize` were not.
+No benchmark ships in this module and the card's Performance line is `not measured`. The figures below are a
+one-off count from an instrumented `ReleaseFast` build (bytes/ns counted directly, not a profiler), so treat them
+as an upper bound; only `parse`, the path an attacker controls the size of, was measured, `combine`/`finalize`
+were not.
 
 - **Sparse (many small input maps):** 0.78-1.10 ns/byte, flat across 100-400,000 inputs
   (4,221 B -> 16,800,027 B of wire). Not quadratic in input count.
@@ -307,9 +267,17 @@ the one measured; `combine`/`finalize` were not.
 A caller sizing a service off the sparse figure alone would be off by roughly 20-30x for a
 PSBT dominated by one dense map; size for the dense figure if map size isn't bounded upstream.
 
+## What is deliberately not done
+
+- **Signer.** It needs private-key custody and signing policy this module has no opinion about (matching a
+  scriptPubKey/redeemScript/witnessScript against a spend policy, then producing a signature);
+  `PARTIAL_SIG`/`TAP_KEY_SIG` records are expected to be present by the time `finalize` runs. A
+  `bip340`/`k256`-backed signer for the Updater's own keys would be a separate layer.
+- **A typed accessor for `PROPRIETARY` (`0xFC`, every scope).** It stays opaque passthrough like any other
+  unrecognized key type, round-trips byte-for-byte and has no convenience decoder.
+
 ## Backlog / deferred
 
-- **BIP370 (PSBTv2)** (survey 2026-09-30) — the second wire format users meet (Core, rust-psbt). Effort L. Fits §2.
+- **BIP370 (PSBTv2)** — the second wire format users meet (Core, rust-psbt). Effort L. Fits §2.
 - **Script-path finalize for other leaf shapes** — only `<key> OP_CHECKSIG` and `multi_a` leaves; timelocked / hash-locked / miniscript tapscript leaves (what `rust-miniscript`'s `PsbtExt` finalizes) need a satisfier. Also: a leaf with an invalid signature is not retried against the next leaf. Effort M–L.
-- **Signer** — by design (private-key custody and policy); a `bip340`/`k256`-backed signer for the Updater's own keys would be a separate layer.
 - **MuSig2 fields (BIP373)** — Core's `rpc_psbt.json` `invalid_with_msg[2..19]` are accepted as opaque passthrough.

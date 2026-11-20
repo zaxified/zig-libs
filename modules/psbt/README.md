@@ -4,18 +4,15 @@ BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serializati
 Updater roles (`fromUnsignedTx`, typed `set*` functions), BIP371 taproot fields, Base64 I/O, the Combiner
 role, and (via the sibling `bitcoinscript` Script interpreter) the Input Finalizer and Transaction
 Extractor roles, built on `bitcointx` for the embedded unsigned transaction / UTXO tx bodies. Parses
-untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what's still
-deliberately deferred — corrected here from an earlier version of this line that said Finalizer/
-Extractor were also deferred: only the **Signer** role remains unimplemented (it needs private-key
-custody and signing policy this module has no opinion about).
+untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what is not
+provided: only the **Signer** role is unimplemented (it needs private-key custody and signing policy
+this module has no opinion about).
 
 Provenance: the wire-format codec (`parse`/`serialize`/`combine`/`finalize`/`extract`) is clean-room
 from the published BIP174 spec (`bitcoin/bips`), no third-party source ported. The official BIP174
 test-vector BYTES this module vendors (`kat_vectors.zig`) are a separate matter — BIP174 itself is
 BSD-2-Clause, which requires attribution on redistribution of its content, including its own worked
-examples — see `NOTICE` for that attribution (corrected here: an earlier version of this line said
-no `NOTICE` entry was needed at all, which conflated "clean-room codec" with "vendored spec-author
-test data"). This module ALSO vendors conformance vectors from Bitcoin Core's `test/functional/data/
+examples — see `NOTICE` for that attribution. This module ALSO vendors conformance vectors from Bitcoin Core's `test/functional/data/
 rpc_psbt.json` (`core_kat_vectors.zig`, MIT) — a second, independent source; `NOTICE` covers both.
 
 ## Import
@@ -121,27 +118,22 @@ custody and signing policy this module has no opinion about.
 zig build test-psbt --summary all
 ```
 
-Byte-exact against BIP174's own published test vectors: all 20 official invalid PSBTs (rejected,
-19 with a specific pinned error), 8 of 10 official valid PSBTs (round-trip), the BIP's own worked
-Combiner example, and the BIP's own worked Finalizer/Extractor example (a bare P2SH 2-of-2 multisig
-input plus a P2SH-P2WSH 2-of-2 multisig input: `finalize` on the pre-finalize PSBT and `extract` on
-the finalized PSBT both reproduce the BIP's own published bytes exactly) — see `SPEC.md`
-"Verification" for the full story, including the 2 valid vectors this module can't accept (a
-`bitcointx`-inherited wire-format ambiguity, not a psbt bug).
+Byte-exact against BIP174's own published test vectors: every official invalid PSBT (rejected, each with
+a specific pinned error), every official valid PSBT that does not hit the 0-input ambiguity (round-trip),
+the BIP's own worked Combiner example, and the BIP's own worked Finalizer/Extractor example (a bare P2SH
+2-of-2 multisig input plus a P2SH-P2WSH 2-of-2 multisig input: `finalize` on the pre-finalize PSBT and
+`extract` on the finalized PSBT both reproduce the BIP's own published bytes exactly). The 2 valid vectors
+this module cannot accept (a `bitcointx`-inherited wire-format ambiguity, not a psbt bug) and the rest of the
+accounting are in `SPEC.md` "Verification".
 
-Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external
-oracle, `core_kat_vectors.zig`/`core_kat_test.zig`) — this is where a real gap was found and fixed:
-a present `PSBT_GLOBAL_VERSION` is now required to be `0` (BIP174 §"Version 0"), which `parse`
-previously didn't check. Core's own `finalizer`/`extractor` vectors turned out to be byte-identical
-to BIP174's worked example above (no new spend shape), so neither BIP174 nor Core's JSON reaches
-native P2WPKH or native P2WSH multisig — see `SPEC.md` for the full accounting, including which of
-Core's vectors are BIP370/MuSig2 content this module deliberately doesn't validate (its BIP371 taproot-field defects are rejected since 2026-11-13).
+Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external oracle,
+`core_kat_vectors.zig`/`core_kat_test.zig`): a present `PSBT_GLOBAL_VERSION` must be `0` (BIP174
+§"Version 0"), Core's BIP371 taproot-field defects are rejected, and the BIP370/MuSig2 content this module
+deliberately does not validate is asserted as accepted passthrough.
 
-Both of those two remaining shapes are now closed too, by capturing against a real Bitcoin Core
-regtest node instead (`regtest_kat_vectors.zig`/`regtest_kat_test.zig`, `zig build test-psbt`):
-native P2WPKH (captured 2026-08-02) and native P2WSH 2-of-3 multisig (captured 2026-08-05, the LAST
-spend shape in this module that had no outside oracle at all — `finalize`/`extract` on the pre-
-finalize PSBT reproduce Core's own finalized-PSBT and extracted-transaction bytes exactly, and the
-extracted transaction was independently confirmed acceptable by `testmempoolaccept` on the node
-that produced it). Every spend shape `finalize`/`extract` supports is now anchored against an
-outside oracle, not just this module's own round-trip.
+The two spend shapes neither BIP174 nor Core's JSON reach, native P2WPKH and native P2WSH 2-of-3
+multisig, are anchored by captures from a real Bitcoin Core regtest node
+(`regtest_kat_vectors.zig`/`regtest_kat_test.zig`): `finalize`/`extract` on the pre-finalize PSBT reproduce
+Core's own finalized-PSBT and extracted-transaction bytes exactly, and the extracted P2WSH transaction was
+independently confirmed acceptable by `testmempoolaccept` on the node that produced it. Every spend shape
+`finalize`/`extract` supports is anchored against an outside oracle, not just this module's own round-trip.

@@ -10,11 +10,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-13** — **NEW:** BIP371 typed fields (`psbt.bip371`): readers and Updater setters for internal key, leaf scripts, script signatures, key derivations, merkle root, tap tree, and `finalize` for P2TR script-path spends of `<key> OP_CHECKSIG` and `multi_a` leaves (witness verified through `verifyScript`). The Finalizer now also clears `TAP_SCRIPT_SIG`, `TAP_LEAF_SCRIPT`, `TAP_MERKLE_ROOT` and the preimage fields. Tests: all BIP371 valid/invalid vectors, signed script-path round trips (build.zig: test-only deps `bip340`, `taproot`); fuzz harness drives the new parse paths.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `root.zig` and `finalize.zig` call `bitcointx.tx.appendCompactSize` instead of their own copies.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-10** — tests: deterministic fuzz driver `PSBT_FUZZ`: the existing generator harness (`parse` / byte-exact `serialize` / `decodeWitnessStack` / `finalize` / `extract`) now also runs under the driver as `psbt-parse` (with well-formed witness stacks half the time), plus `psbt-damage` (a generated PSBT with 0-3 octets damaged and maybe truncated: never a panic, an accepted one re-serializes byte-exact and `combine` with itself is idempotent). ReleaseSafe, clean.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: BIP370 (PSBTv2) reads "not yet — see Backlog" instead of "out of scope", matching the Backlog item.
 - **2026-10-05** — Mutation run: 56 of 58 killed, 2 equivalent; 12 tests added (map-value
   length edges, global `XPUB` shape, witness-program and multisig recognisers, empty witness
   stacks, sighash-type filtering in single-key and multisig paths, `SINGLE|ANYONECANPAY` and
