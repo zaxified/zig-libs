@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Source-breaking (pub error set) / behaviour change:** ADDED `SerializeError.OutputTooLarge` (so `CommitError` gains it too; an exhaustive `switch` over either needs the new value). `serialize` now refuses text `parse` would refuse (a physical line over `max_line_len`, or text over `max_input_len`) instead of writing it. ADDED `serializeUnchecked` (the old behaviour) which `Store.commit` uses, so commit's own `WouldNotReload`/`FileTooLarge` answers are unchanged. Test in `root.zig`.
 - **2026-11-04** — test against the real `uci` binary (`UCI_BIN`): it replays `save`'s few `^` records to the same section order, also after a delete and a new section; card records the delta audit.
 
 

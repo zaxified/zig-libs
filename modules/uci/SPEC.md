@@ -189,7 +189,7 @@ a leading `-`, or `.`, `=`, space, `'` -- measured: the real binary writes `-x.l
 for package `x`, and loses the change itself). File-layer threats and answers: a package name from a request cannot
 leave the directory (one plain name by default); a FIFO/device/symlink planted as a config or
 delta file is refused without being opened for reading beyond a stat-checked handle; a file
-over `max_bytes` is refused unread; a commit never writes text `parse` would refuse; a crash
+over `max_bytes` is refused unread; a commit never writes text `parse` would refuse (`serialize` itself answers `OutputTooLarge` for a physical line over `max_line_len` or text over `max_input_len`, which real `uci` would load; `serializeUnchecked` skips that check for `Store`, which has its own reload check); a crash
 leaves the old or the new file; a hostile script is bounded by `max_input_len`,
 `max_total_items` and the editor work cap (`WorkLimitExceeded`).
 
@@ -310,10 +310,6 @@ Performance line has the figures.
   the binary commits every package with a delta in the save directory, which needs a directory listing of it.
 - **Several `-p` orders beyond the one measured** (one extra directory observed: its delta first, then the save
   directory's).
-- **`serialize` output can exceed what `parse` accepts**: a value or line longer than `max_line_len` (16 KiB), or a
-  package over `max_input_len` (16 MiB), is written without complaint (real `uci` loads such a file), but `parse` then
-  refuses it with `LineTooLong`/`InputTooLarge`. Documented on `serialize`; a refusing `SerializeError` member would be
-  the alternative if a consumer writes values from untrusted sources.
 - **Delete-heavy deltas on very large sections can hit `max_delta_work`**: a record that removes an option or list entry
   shifts the rest of that section (O(options)), so a delta of many such records on a section with ~100k+ options stops
   with `WorkLimitExceeded` (about 650 deletes at 100k options). Real sections hold tens of options.

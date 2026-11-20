@@ -560,7 +560,7 @@ pub const Store = struct {
     fn replaceLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package, locked: bool) CommitError!void {
         var view = pkg.*;
         view.name = null;
-        const text = try root.serialize(gpa, &view);
+        const text = try root.serializeUnchecked(gpa, &view);
         defer gpa.free(text);
         try checkReloads(gpa, text, &view, self.options.max_bytes);
 

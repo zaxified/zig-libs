@@ -1282,7 +1282,7 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     if (session_seed % 16 == 0) {
         fx.store().commitEditor(gpa, "t", ed, try fx.store().stamp("t")) catch |e| switch (e) {
             error.OutOfMemory => return e,
-            error.WouldNotReload, error.InvalidName, error.UnserializableValue, error.DuplicateSection => return,
+            error.WouldNotReload, error.InvalidName, error.UnserializableValue, error.DuplicateSection, error.OutputTooLarge => return,
             else => return e,
         };
         var back = try fx.store().load(gpa, "t", null);

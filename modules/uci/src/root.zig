@@ -210,6 +210,10 @@ pub const ParseError = error{
 };
 
 pub const SerializeError = error{
+    /// The text would be refused by `parse`: a physical line over
+    /// `max_line_len` (a trailing `\r` not counted, as in `parse`) or the
+    /// whole text over `max_input_len`. `serializeUnchecked` skips this check.
+    OutputTooLarge,
     /// A value contains a control character below 0x20 that is neither
     /// `\t`, `\n`, nor `\r` -- those three are the ONLY sub-0x20 bytes the
     /// real `uci` binary accepts in a value (measured), and it writes them
@@ -1083,15 +1087,29 @@ pub fn parseScript(gpa: Allocator, bytes: []const u8, diag: ?*Diagnostics) Parse
 // ── serializer ──────────────────────────────────────────────────────────────
 
 /// Serialize a `Package` to canonical UCI text (caller frees with `gpa`).
-/// The text is not limited to what `parse` reads back: a value or line over
-/// `max_line_len`, or output over `max_input_len`, is written as is (real
-/// `uci` loads it) and `parse` then answers `LineTooLong`/`InputTooLarge`.
-/// Canonical form:
+/// Refuses (`error.OutputTooLarge`) text `parse` would refuse: a physical line
+/// over `max_line_len`, or output over `max_input_len` (real `uci` would load
+/// such a file; this module will not write one it cannot read back).
+/// `serializeUnchecked` has no such check. Canonical form:
 /// optional `package <name>` header (bare when identifier-safe, matching
 /// real `uci export`'s own rendering), blank line between blocks, options
 /// tab-indented, values quoted (single quotes by default, double quotes with
 /// escapes when the value contains `'` or a control character).
 pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
+    const text = try serializeUnchecked(gpa, pkg);
+    errdefer gpa.free(text);
+    if (text.len > max_input_len) return error.OutputTooLarge;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const n = if (line.len > 0 and line[line.len - 1] == '\r') line.len - 1 else line.len;
+        if (n > max_line_len) return error.OutputTooLarge;
+    }
+    return text;
+}
+
+/// `serialize` without the `max_line_len` / `max_input_len` check, for a
+/// writer that applies its own reload check (`Store.commit`).
+pub fn serializeUnchecked(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
@@ -1690,6 +1708,35 @@ test "error: line too long" {
     var diag: Diagnostics = .{};
     try testing.expectError(error.LineTooLong, parseDiag(gpa, line, &diag));
     try testing.expectEqual(@as(usize, 1), diag.line);
+}
+
+test "serialize refuses text parse would refuse: a line over max_line_len or output over max_input_len (serializeUnchecked still writes it)" {
+    const gpa = testing.allocator;
+    // `\toption k '` + value + `'`: the physical line is the value plus 12 bytes.
+    const overhead = "\toption k ''".len;
+    const value = try gpa.alloc(u8, max_line_len - overhead + 1);
+    defer gpa.free(value);
+    @memset(value, 'v');
+    var opts = [_]Option{.{ .key = "k", .kind = .single, .values = &.{value} }};
+    var secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+    const pkg: Package = .{ .name = null, .sections = &secs };
+    try testing.expectError(error.OutputTooLarge, serialize(gpa, &pkg));
+    const raw = try serializeUnchecked(gpa, &pkg);
+    defer gpa.free(raw);
+    try testing.expectError(error.LineTooLong, parse(gpa, raw));
+    // one byte shorter: exactly max_line_len, accepted and read back
+    opts[0].values = &.{value[1..]};
+    const ok = try serialize(gpa, &pkg);
+    defer gpa.free(ok);
+    var back = try parse(gpa, ok);
+    back.deinit(gpa);
+    // total over max_input_len from many short lines
+    const n_opts = max_input_len / 16 + 1;
+    const many = try gpa.alloc(Option, n_opts);
+    defer gpa.free(many);
+    @memset(many, .{ .key = "kkkkkkkkkkkk", .kind = .single, .values = &.{"v"} });
+    secs[0].options = many;
+    try testing.expectError(error.OutputTooLarge, serialize(gpa, &pkg));
 }
 
 test "line exactly at max_line_len is accepted; one byte more is LineTooLong" {
@@ -2563,6 +2610,7 @@ fn roundTripOne(pkg: Package) !RoundTrip {
         error.UnserializableValue => return .refused_value,
         error.DuplicateSection => return .refused_duplicate,
         error.InvalidName => return .refused_name,
+        error.OutputTooLarge => return .refused_value,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer gpa.free(s1);
