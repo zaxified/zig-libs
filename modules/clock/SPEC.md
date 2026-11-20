@@ -28,6 +28,7 @@ zig-libs authors (MIT); the README's `Provenance:` line.
 |---|---|---|---|
 | monotonic read | `Instant::now` (CLOCK_MONOTONIC / QPC) | `time.Now()` carries a monotonic reading | `monotonicNs` |
 | coarse monotonic | quanta `Clock::recent` (upkeep thread) | — | `monotonicCoarseNs` (`CLOCK_MONOTONIC_COARSE`, no thread) |
+| monotonic incl. suspend | `Instant` does not count suspend on Linux (CLOCK_MONOTONIC) | — | `boottimeNs` (`CLOCK_BOOTTIME`) |
 | wall read | `SystemTime::now` | `time.Now()` wall part | `realtimeNs` / `Ms` / `S` |
 | saturating elapsed | `Instant::saturating_duration_since` | `time.Since` (monotonic) | `elapsedNs`, `Clock.since` |
 | injectable source | quanta `Clock` (enum over TSC/OS/mock) | none in std (benbjohnson/clock) | `Clock`, `WallClock` (ctx + fn) |
@@ -94,8 +95,6 @@ The figures are the card's Performance line (`zig build bench-clock`, ReleaseFas
 - Mutants 32/33/37/38 of the whole-module run (lock orderings downgraded to monotonic, unlocked `get` / `put`
   in `Locked`) survive only because the test host is x86-64 (TSO, atomic aligned 64-bit loads): run the race
   tests under qemu-mips / an aarch64 runner to kill them, then A1.
-- `boottimeNs` (`CLOCK_BOOTTIME`, time including suspend): no consumer in the collection needs it; add it
-  when one does (one more `posixNs` call).
 
 ## Anchoring
 

@@ -14,6 +14,8 @@
 //!   `CLOCK_MONOTONIC_COARSE`, typically 1–4 ms), several times cheaper; for
 //!   hot paths that only need "roughly now" (rate limits, idle timeouts).
 //!   Windows has no coarse variant and returns `monotonicNs()`.
+//! - `boottimeNs()` — the monotonic clock that keeps counting while the machine
+//!   is suspended (Linux `CLOCK_BOOTTIME`); not comparable with `monotonicNs()`.
 //! - `realtimeNs()` / `realtimeMs()` / `realtimeS()` — Unix time (Linux
 //!   `CLOCK_REALTIME`, Windows `RtlGetSystemTimePrecise`), floored to the
 //!   unit. Can jump in both directions when the clock is set.
@@ -52,6 +54,21 @@ pub const meta = .{
 pub fn monotonicNs() u64 {
     return switch (builtin.os.tag) {
         .windows => windowsQpcNs(),
+        else => posixNs(.MONOTONIC),
+    };
+}
+
+/// Nanoseconds on the monotonic clock that also counts time the machine spent
+/// suspended (Linux `CLOCK_BOOTTIME`; Go's
+/// `time.Now` and `monotonicNs` stop in suspend, Python's `time.monotonic`
+/// does too). Arbitrary origin, never decreases; NOT comparable with
+/// `monotonicNs` (the two differ by the time spent suspended). Windows: QPC
+/// already includes suspend (Windows 10 and later), so this is
+/// `monotonicNs()`; other POSIX targets without the clock: `monotonicNs()`.
+pub fn boottimeNs() u64 {
+    return switch (builtin.os.tag) {
+        .windows => windowsQpcNs(),
+        .linux => posixNs(.BOOTTIME),
         else => posixNs(.MONOTONIC),
     };
 }
@@ -349,6 +366,20 @@ test "monotonicNs agrees with std.Io's awake clock" {
     try testing.expect(theirs >= 0);
     const t: u64 = @intCast(theirs);
     try testing.expect(t + 1 >= ours_before and t <= ours_after + 1);
+}
+
+test "boottimeNs agrees with std.Io's boot clock and never trails monotonicNs" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ours_before = boottimeNs();
+    const theirs = std.Io.Clock.boot.now(testing.io).nanoseconds;
+    const ours_after = boottimeNs();
+    try testing.expect(theirs >= 0);
+    const t: u64 = @intCast(theirs);
+    try testing.expect(t + 1 >= ours_before and t <= ours_after + 1);
+    // Boot time includes suspend, monotonic time does not: boot >= monotonic.
+    const mono = monotonicNs();
+    try testing.expect(boottimeNs() >= mono);
+    try testing.expect(ours_before != 0);
 }
 
 test "monotonicCoarseNs is within a few ticks of monotonicNs" {
