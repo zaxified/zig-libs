@@ -17,19 +17,18 @@
 //! valgrind's output, not something a Zig test can assert on. `zig build
 //! check-ctgrind` compiles it so it cannot rot into an unbuildable recipe.
 //!
-//! ## The three targets, and why the modulus SIZE is the interesting axis
+//! ## The targets, and why the modulus SIZE is the interesting axis
 //!
-//! `montMul`/`montSqr` dispatch on the limb count `L`, and the three branches
-//! are three different bodies of code with three separate constant-time
-//! claims. A harness at one size measures one of them and says nothing about
+//! `montMul`/`montSqr` dispatch on the limb count `L`, and the branches are
+//! different bodies of code with separate constant-time claims. A harness at one size measures one of them and says nothing about
 //! the other two, so each size gets a target:
 //!
 //! * `small` — `Modint(256)`, `L = 4`. Below both `sqr_min_limbs` (8) and
-//!   `asm_min_limbs` (32), so everything routes to `montMulCios`
-//!   (`montint.zig:371`) including squaring. Drives `add`, `sub`, `mul`,
+//!   `fixed_min_limbs` (16), so everything routes to `montMulCios`
+//!   including squaring. Drives `add`, `sub`, `mul`,
 //!   `montMul` and `montSqr` from tainted operands: the target for
 //!   `SPEC.md`'s "`add`/`sub`: conditional add/subtract via a mask, no
-//!   data-dependent branch" and for `condSubTop` (`montint.zig:485`), which
+//!   data-dependent branch" and for `condSubTop`, which
 //!   every one of those ends in. This is also the size the pairing fields use
 //!   (`bn254` L=4, `bls12_381` L=6), which the dispatch comment calls out as
 //!   the ones that MUST stay portable.
@@ -38,14 +37,16 @@
 //!   and no asm core is. Drives `powMont` with a tainted EXPONENT and a
 //!   tainted base — the flagship claim: fixed 5-bit window, a multiply per
 //!   window, a branchless 32-entry gather, all `L·64` exponent bits
-//!   processed — plus one `sub` (see `runPow`). Until 2026-10-10 this target
-//!   was `Modint(1024)`, the RSA-2048 CRT width; that width now runs the
-//!   fixed-`L` asm kernel (`fixed_min_limbs = 16`) and is measured by the
-//!   `dyn` target's L = 16 run, so this one moved down to keep the portable
-//!   bodies measured.
-//! * `asm` — `Modint(2048)`, `L = 32`. At `fixed_min_limbs`, so `montMul` and
-//!   `montSqr` route into `asm_core.montMulFixed` (the comptime-unrolled
+//!   processed — plus one `sub` (see `runPow`).
+//! * `asm` — `Modint(2048)`, `L = 32`. At/above `fixed_min_limbs` and a
+//!   multiple of 8, so `montMul` and `montSqr` route into the block kernels
+//!   `asm_core.montMulBlock`/`montSqrBlock` (the comptime-unrolled
 //!   rows: "the only branch is the outer loop's `jnz` on a public counter").
+//!   The fixed-`L` kernels used for `L` not a multiple of 8 (e.g. `L = 24`)
+//!   are not driven by a target here.
+//! * `dyn` — the runtime-width `DynModint` at `L = 16` (rsa-2048's CRT primes)
+//!   and `L = 32` (paillier-2048's `p²`/`q²`): the same dispatch behind the
+//!   slot-based API.
 //!   Same tainted `powMont`, so the same window/gather logic runs on top of
 //!   the asm core. Memcheck reads real machine code, so the inline-asm block
 //!   is measured exactly like compiled Zig: a `Jcc` on a tainted flag or a
@@ -53,7 +54,7 @@
 //!
 //! ## What the counts mean
 //!
-//! All three targets are expected to report **zero** in-module contexts. That
+//! Every target is expected to report **zero** in-module contexts. That
 //! zero is only readable because the total is non-zero: the results are
 //! printed through `std.debug.print`, which is not constant-time, so a tainted
 //! byte reaching the formatter always produces contexts of its own. A zero
@@ -63,7 +64,7 @@
 //!
 //! ## What this harness does NOT pin (an honest gap)
 //!
-//! * `limbs.cmp` (`limbs.zig:45`, "Constant-time comparison … no
+//! * `limbs.cmp` ("Constant-time comparison … no
 //!   secret-dependent branch or early exit"). Every limb IS inspected — but
 //!   the function then returns `std.math.Order`, i.e. the comparison result
 //!   itself, via `if (lt == 1) return .lt;`. Any caller that uses the answer
@@ -205,9 +206,8 @@ fn runPow(comptime bits: comptime_int, comptime tag: []const u8, tainted: bool) 
     // barrier is instantiated per comptime-known `L`. That matters because the
     // leak class here is LLVM re-deriving `mask ∈ {0, ~0}` at a fully unrolled
     // width: each `L` is separate codegen with its own verdict, and L=16 is
-    // exactly the RSA-2048 CRT width the 2026-08-13 fix was about. One call
-    // here covers both remaining widths (L=8 via `portable` — L=16 until
-    // 2026-10-10, now reached through `dyn` — and L=32 via `asmcore`) without
+    // exactly the RSA-2048 CRT width the fix was about. One call
+    // here covers both remaining widths (L=8 via `portable` — L=16, now reached through `dyn` — and L=32 via `asmcore`) without
     // a fourth target, and `add`/`mul`/`montSqr` need no
     // equivalent because `condSubTop` — the thing they all end in — is already
     // driven at both widths through `powMont`'s multiplies and squarings.

@@ -8,7 +8,7 @@
 //! `montView`) so their secret modexps could run on `Modint` while every other
 //! secret operation — the reduction of a ciphertext into the mod-p domain, the
 //! CRT (Garner) recombination, products — stayed in `std.crypto.ff`. Measured
-//! 2026-10-02 (ctgrind, Zig 0.16, ReleaseFast), `std.crypto.ff` is not
+//! (ctgrind, Zig 0.16, ReleaseFast), `std.crypto.ff` is not
 //! constant-time there: `montgomeryMul`'s extra-reduction select, `reduce`'s
 //! `shiftIn`/compare and `toBytes` compile to conditional jumps. This type is
 //! the run-time counterpart of `Field(p)`: one constant-time implementation
@@ -18,7 +18,7 @@
 //! **Slots.** A modulus of `n` limbs runs on `Modint(64·L)` with `L` the
 //! smallest slot `≥ n`. The slots are every `step` limbs up to 1024 bits,
 //! then only the key sizes that occur — 1536, 2048, 3072, 4096, 6144 (ssh
-//! GEX), 8192 bits — and the type's top slot (`slot_sizes`, 2026-10-18). Every
+//! GEX), 8192 bits — and the type's top slot (`slot_sizes`). Every
 //! operation dispatches on `L` through an `inline for` over the slots, so code
 //! size grows with their count: on an ADX/BMI2 CPU each slot is straight-line
 //! asm generated for its width, and the old every-`step` list made
@@ -119,7 +119,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// caller's thread needs this plus its own frames. An `Elem` is
         /// `8·max_limbs` bytes and the operations keep a few dozen of them
         /// live (`Modint.powMont`'s 32-entry window table alone is 32).
-        /// Measured 2026-10-30, ReleaseFast, x86_64 (`stackprobe_test.zig`,
+        /// Measured, ReleaseFast, x86_64 (`stackprobe_test.zig`,
         /// the largest of `pow`/`inverse`/`sqrt` is `sqrt`, on a full-width
         /// modulus), and the bound set at 16 KiB + 128 `Elem`s (about 1.5×
         /// the measurement, which also covers the Tonelli-Shanks path of
@@ -158,8 +158,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// zero above. Not `var out = zero`: past a few hundred bytes LLVM
         /// lowers that `@memset` to Zig 0.16's byte-wise `compiler_rt.memset`,
         /// and at rsa's 8192-bit capacity (1 KiB `Elem`) the full-width zeroing
-        /// of every result was ~3 % of a 2048-bit blinded sign (perf,
-        /// 2026-10-14). Only the limbs above the slot are zeroed, by vector
+        /// of every result was ~3 % of a 2048-bit blinded sign. Only the limbs above the slot are zeroed, by vector
         /// stores.
         inline fn widen(comptime s: usize, v: *const [s]u64) Elem {
             var out: Elem = undefined;
@@ -186,7 +185,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// length is public by contract, but `fromLimbs` derives it from the
         /// value, and an early-return chain added a conditional jump per slot
         /// to every secret construction (ctgrind paillier keygen 314 → 330,
-        /// threshold_ecdsa auxgen 115 → 119, 2026-10-18).
+        /// threshold_ecdsa auxgen 115 → 119).
         fn slotFor(n: usize) usize {
             var r: usize = max_limbs;
             comptime var i = slots.len - 1;
@@ -429,9 +428,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// plus `toMontgomery(c) = montMul(c, R²)`. Both stay inside the
         /// Montgomery multiply's bound — `c·(R² mod m) < R·m` gives an output
         /// below `2m`, which its final subtract reduces — so a digit needs no
-        /// pre-reduction. (Until 2026-10-14 the digits were single 64-bit
-        /// words below `m`: 64 multiplies per 2048-bit input against a
-        /// 1024-bit prime, ~6 % of an RSA-2048 private operation; now 4.)
+        /// pre-reduction.
         fn horner(self: *const Self, src: anytype, total_bits: usize) Elem {
             inline for (slots) |s| {
                 if (s == self.L) {
@@ -806,7 +803,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             // is the public quantity (`nbits` is the modulus's own bit length,
             // which callers with a secret modulus — paillier's λ — treat as
             // secret; sizing the trip count by it put 72 secret-length
-            // branches into ctgrind `paillier keygen`, 2026-10-14). An upper
+            // branches into ctgrind `paillier keygen`). An upper
             // bound is all the divstep bound and the limb count need; the
             // product check below fails closed either way.
             const engine_ok = Inv.invert(&x, &self.m, 64 * self.L, &inv);
@@ -818,8 +815,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return (@as(u1, @intFromBool(engine_ok)) & @as(u1, @intFromBool(verified)) & below) == 1;
         }
 
-        /// The PREVIOUS `inverse` (2026-10-03), kept only as the test oracle for
-        /// the batched safegcd that replaced it (2026-10-14): same contract, one
+        /// The PREVIOUS `inverse`, kept only as the test oracle for
+        /// the batched safegcd that replaced it: same contract, one
         /// divstep at a time. `a⁻¹ mod m`: if `gcd(a, m) = 1`, writes the inverse (`< m`) to
         /// `out` and returns `true`; else returns `false` (`out` then holds
         /// garbage). `a ≥ m` — including any non-zero limb above the slot,
@@ -1621,7 +1618,7 @@ test "DynModint isProbablePrime: every odd m < 3000, Carmichael numbers, a 2048-
     // k = 96076792050576470, factors ~59–61 bits): a random witness is
     // coprime to it, so a Fermat test (`a^(m−1) = 1`) passes every round —
     // the small Carmichael numbers above do not show that, their witnesses
-    // hit a factor (mutation 2026-10-03: a Fermat mutant survived them).
+    // hit a factor (mutation: a Fermat mutant survived them).
     {
         var big: [24]u8 = undefined;
         _ = try std.fmt.hexToBytes(&big, "000c00000000026d14c0000029db0bebf000f0b38f39ee49");
@@ -1763,7 +1760,7 @@ test "DynModint toBytesBE: the modulus's width or wider, zero-padded (review L5)
     p.toBytesBE(&p.m, &wide);
     try testing.expectEqualSlices(u8, &(@as([4]u8, @splat(0)) ++ [_]u8{0x7f} ++ @as([15]u8, @splat(0xff))), &wide);
     // A shorter buffer is refused by a panic in every optimize mode (no
-    // in-process test can catch one; the ReleaseFast probe in the 2026-10-06
+    // in-process test can catch one; the ReleaseFast probe in the
     // CHANGELOG entry shows the old code truncating silently instead).
 }
 

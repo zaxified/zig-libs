@@ -4,7 +4,7 @@
 //! primitives (`montMul`, `montSqr`, `add`, `sub`, `powMont`).
 //!
 //! Why it exists: the pairing modules' scalar fields (`bls12_381.Fr`,
-//! `bn254.Fr`) were `std.crypto.ff` wrappers, and measured 2026-10-02
+//! `bn254.Fr`) were `std.crypto.ff` wrappers, and measured
 //! (ctgrind, Zig 0.16, ReleaseFast) `std.crypto.ff` is not constant-time
 //! there: `montgomeryMul`'s extra-reduction select
 //! (`need_sub = ct.eql(overflow, underflow)`) compiles to a conditional jump,

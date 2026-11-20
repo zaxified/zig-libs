@@ -107,13 +107,12 @@ test "differential: amd64 asm core == portable oracle on random (a,b,odd-N)" {
     }
 }
 
-// The fixed-`L` kernel (`asm_core.montMulFixed`, what `Modint.montMul`/
-// `montSqr` dispatch to at `L >= fixed_min_limbs` since 2026-10-10) against
-// the portable CIOS, at every size the dispatch can select plus the
-// smallest the generator accepts. Moduli with the top bit set AND with a
-// short top limb (`m < 2^(64L−63)`: `t` then never reaches the top word, a
-// different carry pattern), and operands at the edges `0`, `1`, `m − 1` —
-// the values where a dropped CF/OF tail shows first.
+// The fixed-`L` kernel against the portable CIOS, at every size the
+// dispatch can select plus the smallest the generator accepts. Moduli with
+// the top bit set AND with a short top limb (`m < 2^(64L−63)`: `t` then
+// never reaches the top word, a different carry pattern), and operands at
+// the edges `0`, `1`, `m − 1` — the values where a dropped CF/OF tail shows
+// first.
 fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
     const M = Modint(L * 64);
     var t: usize = 0;
@@ -185,7 +184,7 @@ test "differential: fixed-L asm kernels (mul, sqr) == portable CIOS (L = 2, 8, 1
     try fixedDiff(64, rand, 300);
 }
 
-// ── 2a'. almost-Montgomery block kernels (2026-11-15) ────────────────────────
+// ── 2a'. almost-Montgomery block kernels ────────────────────────
 //
 // `montMulBlockLazy`/`montSqrBlockLazy` (what `powMont`'s ladder runs at
 // `L % 8 == 0`, `L >= 16`) take operands anywhere below `R = B^L` and return

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for montint (added 2026-10-10, the jwt pattern),
+//! Deterministic fuzz driver for montint(the jwt pattern),
 //! plus the differential harnesses against `std.math.big`.
 //!
 //! Driver: `MONTINT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_ONLY`

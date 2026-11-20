@@ -8,10 +8,10 @@
 //! `(f, g)` and `(d, e)`. It is `p256/src/modinv.zig` with the limb count
 //! made a runtime (public) value and the modulus a runtime value.
 //!
-//! Moved here from `rsa` on 2026-10-14: `DynModint.inverse` runs on it, and
+//! Moved here from `rsa` on: `DynModint.inverse` runs on it, and
 //! `rsa` imports it as `montint.safegcd`.
 //!
-//! ## Why this exists (2026-10-10)
+//! ## Why this exists
 //!
 //! The F2 base blinding of every blinded private op needs `r⁻¹ mod n` for a
 //! fresh random `r`. That inverse was a `std.math.big` extended Euclid
@@ -32,11 +32,10 @@
 //! the bound for the half-delta divstep used here with `0 ≤ g ≤ f`
 //! (sipa/safegcd-bounds `genproofhd.md`, a computer-aided convex-hull proof;
 //! libsecp256k1 runs 590 for 256 bits, one below it), rounded up to whole
-//! batches — 40 batches at 1024 bits. Until 2026-10-18 it was Bernstein–Yang
-//! Theorem 11.2's bound for the original divstep (51 batches). The result is
-//! NOT trusted on the bound alone: `invert` returns `false` unless `g = 0`
-//! and `f = ±1` at the end, and the callers (rsa's `drawBlindingPair`,
-//! `DynModint.inverse`) additionally check `x·x⁻¹ ≡ 1`.
+//! batches — 40 batches at 1024 bits. The result is NOT trusted on the bound
+//! alone: `invert` returns `false` unless `g = 0` and `f = ±1` at the end,
+//! and the callers (rsa's `drawBlindingPair`, `DynModint.inverse`)
+//! additionally check `x·x⁻¹ ≡ 1`.
 //!
 //! ## Constant-time contract
 //!
@@ -101,7 +100,7 @@ pub fn Inverter(comptime max_bits: usize) type {
         // loop runs to `k` — so nothing builds, copies or wipes all `K`: at
         // rsa's 8192-bit capacity that full-width work (and its byte-wise
         // `compiler_rt.memset`/volatile wipes) was ~2 % of a 2048-bit blinded
-        // sign (2026-10-14). Limbs at or above `k` stay `undefined`.
+        // sign. Limbs at or above `k` stay `undefined`.
         fn fromLimbs(a: *const [N]u64, k: usize) S62 {
             var out: S62 = undefined;
             for (0..k) |i| {
@@ -164,7 +163,7 @@ pub fn Inverter(comptime max_bits: usize) type {
         /// `divsteps59` on two independent problems in lockstep, one per
         /// lane of a 2×64-bit vector. One batch is a 59-step dependency
         /// chain (~6 cycles a step); two chains side by side cost about one
-        /// (2026-10-14, rsa's CRT-domain blinding inverts mod p and mod q
+        /// (rsa's CRT-domain blinding inverts mod p and mod q
         /// together). The lanes are a vector, not two scalar copies: as
         /// scalars the 14 live values plus temporaries spilled to the stack
         /// and put a store-load round trip on the chain (~24 cycles a step,
@@ -329,12 +328,9 @@ pub fn Inverter(comptime max_bits: usize) type {
         /// Batches for `⌊(45907·b + 26313)/19929⌋` hddivsteps, the bound for
         /// the half-delta divstep run here with `0 ≤ g ≤ f < 2^b`
         /// (sipa/safegcd-bounds `genproofhd.md`; libsecp256k1's 590 for 256
-        /// bits sits one below it). Until 2026-10-18 this was Bernstein–Yang
-        /// Theorem 11.2's bound for the ORIGINAL divstep, `(49·b + 57)/17`:
-        /// 51 batches for rsa-2048's 1024-bit primes instead of 40, ~1 % of a
-        /// blinded private op. The result is checked either way (`invert`'s
-        /// verdict, then every caller's `x·x⁻¹ ≡ 1`), so a shortfall would be
-        /// a refusal or a redraw, never a wrong inverse.
+        /// bits sits one below it). The result is checked either way
+        /// (`invert`'s verdict, then every caller's `x·x⁻¹ ≡ 1`), so a
+        /// shortfall would be a refusal or a redraw, never a wrong inverse.
         fn batchCount(nbits: usize) usize {
             const steps = (45907 * nbits + 26313) / 19929;
             return (steps + 58) / 59;
@@ -542,11 +538,11 @@ fn zeroWords(comptime n: usize, p: *[n]u64) void {
     if (comptime asm_core.supported) asm_core.zeroWords(n, p) else std.crypto.secureZero(u64, p);
 }
 
-// ── direct tests of the update/normalize steps (2026-11-15 delta audit) ─────
+// ── direct tests of the update/normalize steps (delta audit) ─────
 //
 // The inversion tests above only see states a real divstep chain reaches, and
 // there `updateDE`'s sign corrections and `normalize`'s first conditional add
-// never decide a result (mutation 2026-11-01: three survivors). These tests
+// never decide a result (mutation: three survivors). These tests
 // drive both steps directly at the edges of their documented range
 // `(−2m, m)`, against an exact `i512` model.
 

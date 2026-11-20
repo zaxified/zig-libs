@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GT, findings MI-1 .. MI-6), from
-//! the 2026-10-29 no-panic sweep of `montint`.
+//! the no-panic sweep of `montint`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -497,7 +497,7 @@ test "sqrt: a modulus with no non-residue (q^2) ends in SqrtWorkLimit (sweep aud
     try testing.expectError(error.SqrtWorkLimit, m.sqrt(&four, &r));
 }
 
-// ── whole-src mutation run 2026-11-01 (agent Q): gaps the run found ──────────
+// ── whole-src mutation run (agent Q): gaps the run found ──────────
 
 test "Modint eql / isZero read every limb, not just the last one" {
     const M = Modint(256);

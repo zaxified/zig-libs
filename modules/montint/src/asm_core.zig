@@ -418,7 +418,7 @@ pub inline fn mulRow(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u6
         // file boundary in Zig. `check-pubfn-reach` instantiates every `pub fn`
         // DIRECTLY, on whatever target is being built, so the x86 asm below was
         // analysed on aarch64 and the aarch64 `Clobbers` struct has no `.r8`:
-        // the ReleaseSafe arm64 lane of 2026-08-24 went red on it. Its callers
+        // the ReleaseSafe arm64 lane went red on it. Its callers
         // were all guarded; the guard belongs on the function, because the one
         // caller that skipped it was not a caller at all.
         @panic(unsupported_msg);
@@ -523,13 +523,13 @@ fn condSub(z: []u64, top: u64, m: []const u64) void {
     }
 }
 
-// ── fixed-L unrolled CIOS (comptime-generated rows) — the hot path since 2026-10-10 ──
+// ── fixed-L unrolled CIOS (comptime-generated rows) — the hot path ──
 //
 // `montMul` above runs RUNTIME-`n` rows (4-way unrolled loops, remainder loops,
 // OF/CF folds at every group boundary, one asm block per outer limb). At the
 // sizes RSA actually runs — the CRT halves at L = 16/24/32 — that bookkeeping
 // cost more than the products: the portable comptime-unrolled CIOS beat it at
-// L = 16 and the rsa bench sat at 1.9–2.4× OpenSSL (2026-10-10). `Modint` knows
+// L = 16 and the rsa bench sat at 1.9–2.4× OpenSSL. `Modint` knows
 // `L` at comptime, so this kernel spells each row out completely — `L` copies
 // of `mulx / adcx mem / adox / mov` for the multiply row and the same for the
 // reduction row — and keeps only the OUTER loop (trip count `L`, public) in the
@@ -784,7 +784,7 @@ inline fn blackBox(x: u64) u64 {
 }
 
 /// `condSub` at a comptime `L`: `z ← z − m` iff `top·B^L + z ≥ m` (the
-/// value is `< 2m`, `top ∈ {0, 1}`), in asm since 2026-10-14. The Zig form
+/// value is `< 2m`, `top ∈ {0, 1}`), in asm since. The Zig form
 /// (`condSubFixedZig`, kept as the test oracle) needed a laundered mask —
 /// fully unrolled, LLVM recovers `smask ∈ {0, ~0}` and hoists pass 2 behind a
 /// branch on the secret borrow — and even laundered it compiled to ~240
@@ -838,7 +838,7 @@ fn condSubText(comptime L: usize) []const u8 {
     }
 }
 
-/// The almost-Montgomery reduction (2026-11-15): `z ← top·B^L + src − top·m`,
+/// The almost-Montgomery reduction: `z ← top·B^L + src − top·m`,
 /// i.e. subtract `m` iff the carry word `top ∈ {0, 1}` is set, with no borrow
 /// pass. For a REDC of `A < R²` (both operands `< R = B^L`) the value is
 /// `< R + m`, so the result is `< R` — not necessarily `< m`. That is enough
@@ -927,7 +927,7 @@ test "condSubFixed (asm) == condSubFixedZig at the decision edges" {
     }
 }
 
-// ── 8-row block kernels (2026-10-14) ────────────────────────────────────────
+// ── 8-row block kernels ────────────────────────────────────────
 //
 // What `montMulFixed`/`montSqrFixed` dispatch to when `L % 8 == 0` — every
 // RSA CRT half (L = 16/24/32) and modulus (L = 32/48/64). The fixed kernels
@@ -1220,7 +1220,7 @@ const have_avx = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(bu
 /// `@memset`/`secureZero`: past a few hundred bytes LLVM lowers `@memset` to
 /// a call into Zig 0.16's byte-wise `compiler_rt.memset` (735 cycles for the
 /// 768-byte `A` of an L = 48 multiply, about a quarter of its product phase —
-/// perf on the bench host, 2026-10-14), and an asm store with a memory
+/// perf on the bench host), and an asm store with a memory
 /// clobber can never be elided, so the same routine is the wipe.
 pub fn zeroWords(comptime n: usize, p: *[n]u64) void {
     const text = comptime blk: {

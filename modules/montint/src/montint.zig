@@ -40,16 +40,18 @@ pub const asm_active = asm_core.supported and gate.asm_core_implemented;
 /// register shuffle), whereas the portable CIOS is comptime-fully-unrolled with
 /// zero loop bookkeeping, so at small L the asm overhead dominates the handful
 /// of limb products. Measured on this repo's host (Kaby Lake, ReleaseFast; see
-/// `SPEC.md` "256-bit regression / small-L dispatch") the asm modmul is:
+/// `SPEC.md` "256-bit regression / small-L dispatch") the runtime-`n` asm
+/// modmul is:
 ///   L=4  (256b): ~2.4× SLOWER · L=8 (512b): ~1.06× slower · L=16 (1024b):
 ///   ~1.07× slower · L=32 (2048b): ~1.43× FASTER · L=64 (4096b): ~1.75× faster.
-/// So breakeven is ~1.5–2k bit here (higher than the canonical ~512b, a
-/// mobile-CPU/turbo effect), and we route to the asm core only at `L >= 32`
-/// (≥2048-bit: RSA/Paillier/VDF), where the win is robust. Every smaller
-/// modulus uses the portable CIOS — critically our pairing fields
-/// (`bn254` Fp = 254b → L=4, `bls12_381` Fp = 381b → L=6), which MUST stay
-/// portable. The asm core is still correct at every L (the differential proves
-/// it) — this is purely a speed dispatch.
+/// So breakeven of the runtime-`n` core is ~1.5–2k bit here (higher than the
+/// canonical ~512b, a mobile-CPU/turbo effect). The default dispatch no longer
+/// uses it: the comptime-unrolled kernels take over from `fixed_min_limbs`
+/// (below), and the pairing fields (`bn254` Fp = 254b → L=4, `bls12_381`
+/// Fp = 381b → L=6) stay portable. This cutoff only gates the runtime-`n`
+/// core's last dispatch branch, which `fixed_min_limbs` shadows. The core is
+/// still compiled, benched, and correct at every L (the differential proves
+/// it).
 pub const asm_min_limbs: usize = 32;
 
 /// Small-L cutoff for the *portable dedicated square* (`montSqrCios`). The
@@ -67,24 +69,24 @@ pub const asm_min_limbs: usize = 32;
 pub const sqr_min_limbs: usize = 8;
 
 /// Cutoff for the FIXED-`L` asm kernel (`asm_core.montMulFixed`: rows fully
-/// unrolled at comptime, outer loop in asm), which since 2026-10-10 serves
-/// BOTH `montMul` and `montSqr` (as `a·a`) at `L >= fixed_min_limbs` on an
-/// asm-capable target. Measured on the bench host (TSC cycles per op, best
-/// previous path → fixed kernel): L=8 mul 485 → 335 but square 346 → 340
-/// (a tie, so L=8 keeps the portable square; it keeps the portable multiply
-/// too, so nothing below 1024 bits changes), L=16 1273 → 989, L=24 3032 →
-/// 1930, L=32 4064 → 3154, L=48 8266 → 7071, L=64 13494 → 12173. The fixed
-/// kernel's general multiply beats even the dedicated SOS squares at these
-/// sizes, which is why the square routes through it. Supersedes
-/// `asm_min_limbs` on the dispatch (that runtime-`n` core is still compiled,
-/// benched and differentially tested, but no `Modint` reaches it).
+/// unrolled at comptime, outer loop in asm), which serves BOTH `montMul` and
+/// `montSqr` (as `a·a`) at `L >= fixed_min_limbs` on an asm-capable target.
+/// Measured on the bench host (TSC cycles per op, best previous path → fixed
+/// kernel): L=8 mul 485 → 335 but square 346 → 340 (a tie, so L=8 keeps the
+/// portable square; it keeps the portable multiply too, so nothing below
+/// 1024 bits changes), L=16 1273 → 989, L=24 3032 → 1930, L=32 4064 → 3154,
+/// L=48 8266 → 7071, L=64 13494 → 12173. The fixed kernel's general multiply
+/// beats even the dedicated SOS squares at these sizes, which is why the
+/// square routes through it. Supersedes `asm_min_limbs` on the dispatch
+/// (that runtime-`n` core is still compiled, benched and differentially
+/// tested, but no `Modint` reaches it).
 pub const fixed_min_limbs: usize = 16;
 
 /// Whether `Modint` emits straight-line asm per limb count (`montMulFixed`,
 /// `montMulBlock`, `montSqrFixed`, `montSqrBlock`: rows unrolled at comptime
 /// for each `L`) from `fixed_min_limbs` up.
 ///
-/// **Consumer build option** (CONVENTIONS §4.2; the analytics consumer request 2026-10-17):
+/// **Consumer build option** (CONVENTIONS §4.2; the analytics consumer request):
 /// `-Dmontint-asm-unroll=false`, or `-Dprofile=small`, routes every
 /// `L >= fixed_min_limbs` on an asm-capable target to the ONE looped asm
 /// kernel instead (`asm_core.montMul`/`montSqr`, runtime `n`: the same MULX/
@@ -228,7 +230,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // "obviously-correct and cheap at setup". That premise is a CALLER's,
         // and certificate path validation does not satisfy it: `x509` builds a
         // fresh `rsa.PublicKey` per chain link, so the setup was paid per
-        // operation and dominated it (measured 2026-09-08: 606 us of setup for
+        // operation and dominated it (measured: 606 us of setup for
         // a 36 us verify, 2048-bit modulus).
         //
         // So the second half came from fewer, dearer steps. Writing
@@ -243,7 +245,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // (t = the limb count): a doubling is a pass over L limbs, a
         // squaring ~L² products, so 32 doublings + 6 squarings at 2048 bits
         // cost less than the square-and-add ladder over the bits of 64·L it
-        // replaced (2026-10-26: 1 doubling + 11 `montMul(x, x)`; ~25 % of an
+        // replaced (1 doubling + 11 `montMul(x, x)`; ~25 % of an
         // `x509` RSA-2048 link was this setup). Both counts are COMPTIME —
         // the work depends on `L` alone and never on the modulus, so this
         // stays constant-time in `m`, which matters because `rsa` calls it
@@ -380,14 +382,17 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             return self.montMul(&a_mont, b);
         }
 
-        /// Montgomery multiply `z = a·b·R⁻¹ mod m`. Dispatches to the gated
-        /// amd64 core when active, else the portable CIOS oracle. Both operands
+        /// Montgomery multiply `z = a·b·R⁻¹ mod m`. Dispatches to the amd64
+        /// asm kernels when active (the looped kernel under
+        /// `-Dmontint-asm-unroll=false`, else the block kernels for
+        /// `L % 8 == 0`, else the fixed-`L` kernel, all from
+        /// `fixed_min_limbs`), else the portable CIOS oracle. Both operands
         /// and the result are `L` full-limb values; the result is fully reduced
         /// (`z < m`).
         pub fn montMul(self: *const Self, a: *const Elem, b: *const Elem) Elem {
             var z: Elem = undefined;
             // Small-L cutoff: asm only pays off for large moduli (see
-            // `asm_min_limbs`); pairing fields (L=4/6) stay portable.
+            // `fixed_min_limbs`); pairing fields (L=4/6) stay portable.
             if (comptime asm_active and !asm_unroll and L >= fixed_min_limbs) {
                 asm_core.montMul(&z, a, b, &self.m, self.n0inv);
             } else if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
@@ -404,7 +409,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
 
         /// True iff `montMul` on this `Modint` routes to the amd64 asm core
         /// (asm available+on AND the modulus is large enough to clear the
-        /// `asm_min_limbs` small-L cutoff). Used by the bench harness.
+        /// `fixed_min_limbs` small-L cutoff). Used by the bench harness.
         pub fn dispatchesToAsm() bool {
             return asm_active and L >= @min(asm_min_limbs, fixed_min_limbs);
         }
@@ -414,16 +419,17 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// `a[i]·a[j]` (i<j) is computed once and doubled instead of twice.
         ///
         /// Dispatch mirrors `montMul`:
-        ///   * `L >= asm_min_limbs` with the asm core active → the DEDICATED
-        ///     asm square `asm_core.montSqr` (SOS with `MULX/ADCX/ADOX` rows —
-        ///     each off-diagonal product computed once and doubled; measured
-        ///     faster than the asm `montMul(a,a)` it replaced at L=32/64, see
-        ///     SPEC "Benchmarks"). Covers rsa-4096, paillier, vdf,
-        ///     threshold_ecdsa on amd64 — and modexp's square steps, which are
-        ///     ~5/6 of `powMont`'s multiplies.
+        ///   * `L >= fixed_min_limbs` with the asm core active → the asm
+        ///     square: `asm_core.montSqrBlock` for `L % 8 == 0`, else
+        ///     `montSqrFixed` up to `asm_core.sqr_fixed_max_limbs` (SOS with
+        ///     `MULX/ADCX/ADOX` rows — each off-diagonal product computed once
+        ///     and doubled), above that `montMulFixed(a, a)`; the looped
+        ///     `asm_core.montSqr` under `-Dmontint-asm-unroll=false`. Covers
+        ///     rsa, paillier, vdf, threshold_ecdsa on amd64 — and modexp's
+        ///     square steps, which are ~5/6 of `powMont`'s multiplies.
         ///   * else `L >= sqr_min_limbs` → portable `montSqrCios`, the dedicated
-        ///     square (rsa-2048 CRT at L=16, and every `L >= asm_min_limbs`
-        ///     modulus on non-amd64 targets / OpenWRT).
+        ///     square (every `L >= fixed_min_limbs` modulus on non-amd64
+        ///     targets / OpenWRT, and L = 8..15 everywhere).
         ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
         ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
@@ -658,7 +664,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// kernels (`asm_core.montMulBlockLazy`/`montSqrBlockLazy`, in place):
         /// every intermediate stays `< R` instead of `< m`, which drops the
         /// borrow pass of the final subtract (one `sub/sbb` pass per multiply
-        /// instead of two) and the copy of each result. Measured 2026-11-15,
+        /// instead of two) and the copy of each result. Measured,
         /// see SPEC "Almost-Montgomery ladder".
         pub const lazy_ladder = asm_active and asm_unroll and L % 8 == 0 and L >= asm_core.block_min_limbs;
 
@@ -687,7 +693,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// no secret index; the per-entry mask laundered, see `blackBox`).
         /// Exactly one mask is all-ones, so `g |= entry & mask` suffices.
         /// For `L % 4 == 0` the accumulator is `L/4` explicit 256-bit lanes,
-        /// which LLVM keeps in registers across the scan (2026-10-14: the
+        /// which LLVM keeps in registers across the scan (the
         /// scalar-loop form kept `g` in memory, a load and a store per word
         /// per entry — ~6 % of a 1024-bit `powMont`).
         fn gather(table: anytype, digit: usize) Elem {
@@ -944,8 +950,8 @@ test "asm_min_limbs: the dispatch cutoff is pinned by value, and by what it sele
         try std.testing.expect(Modint(2048).dispatchesToAsm());
         try std.testing.expect(Modint(4096).dispatchesToAsm());
         // The RSA-2048 CRT half — the secret `dP`/`dQ` path, and the width the
-        // 2026-08-13 timing fix was about. Portable by `asm_min_limbs`, asm by
-        // `fixed_min_limbs` (2026-10-10) — and the 512-bit size below it stays
+        // Timing fix was about. Portable by `asm_min_limbs`, asm by
+        // `fixed_min_limbs` — and the 512-bit size below it stays
         // portable.
         try std.testing.expectEqual(@as(usize, 16), fixed_min_limbs);
         try std.testing.expect(Modint(1024).dispatchesToAsm());
@@ -1259,7 +1265,7 @@ fn fuzzFromBytesBE(_: void, smith: *std.testing.Smith) !void {
     // `@min(buf.len, in.len)` octets and the ranged draw that followed it read
     // fewer than the eight it needs, so it returned the range MINIMUM: `len`
     // was 0 on every input this lane can carry, and both loaders below were
-    // only ever handed the empty string. Measured 2026-09-07 over the corpus:
+    // only ever handed the empty string. Measured over the corpus:
     // 0 of 12 seeds arrived non-empty before, 12 of 12 after.
     const len: usize = smith.slice(&buf);
     _ = M.fromBytesBE(buf[0..len]) catch {};
@@ -1318,7 +1324,7 @@ test "corpus: every loader seed reaches both loaders, and what they accept is pi
     }
     // One seed is deliberately empty; the other eleven carry bytes.
     try std.testing.expectEqual(loader_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. Before the draw was restructured every one of
+    // Measured. Before the draw was restructured every one of
     // these was the empty-string result: 0 moduli, 12 elements, 0 of them
     // non-zero, 0 overflows.
     try std.testing.expectEqual(@as(usize, 5), moduli);
@@ -1329,7 +1335,7 @@ test "corpus: every loader seed reaches both loaders, and what they accept is pi
 
 // ── R² ladder: the differential that licenses it ────────────────────────────
 //
-// `computeConstants` stopped deriving R² by 64·L doublings on 2026-09-08 and
+// `computeConstants` stopped deriving R² by 64·L doublings and
 // uses a square-and-add ladder instead. The repository's standing doctrine is
 // "never a new algorithm" in a crypto module; the exception rule is that it may
 // be broken when the benefit is documented and the break is shown unable to
@@ -1340,7 +1346,7 @@ test "corpus: every loader seed reaches both loaders, and what they accept is pi
 // (The other halves: `montMul` is already under the ctgrind gate, and the
 // ladder's control flow is driven by the comptime constant 64·L, never by `m`.)
 
-/// The pre-2026-09-08 derivation, kept as the oracle. Do not "optimise" it.
+/// The earlier derivation, kept as the oracle. Do not "optimise" it.
 fn r2ByDoubling(comptime L: usize, m: [L]u64) [L]u64 {
     const M = Modint(L * 64);
     var mm: M = .{ .m = m, .n0inv = negInvMod2_64(m[0]), .r2 = undefined, .one_mont = undefined };
@@ -1486,7 +1492,7 @@ test "Modint eql/isZero/neg: the represented value, against big.int, edge and ra
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

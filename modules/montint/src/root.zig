@@ -16,14 +16,18 @@
 //! other arch. Inline asm in Zig is still native Zig — no libc, no C — so the
 //! zero-C invariant holds.
 //!
-//! ## Status: complete (asm core implemented)
+//! ## Status
 //! The PORTABLE path is **real, constant-time, and byte-exact vs an independent
 //! CPython-bignum oracle** at 256/512/2048/4096 bits — it is the correctness
-//! oracle. The amd64 asm core is now implemented too
-//! (`gate.asm_core_implemented = true`): dispatch routes large moduli
-//! (`L >= asm_min_limbs`) to `asm_core.montMul`/`montSqr` on x86-64+ADX+BMI2
-//! targets, and the asm-vs-portable differential harness runs for real (not
-//! skipped). See `gate.zig`, `asm_core.zig`, `SPEC.md`.
+//! oracle. The amd64 asm core is implemented too
+//! (`gate.asm_core_implemented = true`): on x86-64+ADX+BMI2 targets
+//! `Modint.montMul`/`montSqr` route every modulus of `L >= fixed_min_limbs`
+//! (16 limbs, 1024 bits) to the comptime-unrolled fixed-`L` kernels
+//! (`asm_core.montMulFixed`/`montSqrFixed`, block variants for `L % 8 == 0`),
+//! or to the looped runtime-`n` kernel under `-Dmontint-asm-unroll=false`;
+//! smaller moduli stay on the portable CIOS. The asm-vs-portable differential
+//! harness runs for real (not skipped). See `gate.zig`, `asm_core.zig`,
+//! `SPEC.md`.
 
 const std = @import("std");
 
