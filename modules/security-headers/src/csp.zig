@@ -134,8 +134,7 @@ pub const Error = error{
     NonceDirectiveMissing,
     /// `nonce_in` names a directive that is not a source list (`sandbox`,
     /// `report-to`, …) or whose source list is `'none'` — a nonce next to
-    /// `'none'` silently turns "nothing" into "this nonce" (review
-    /// 2026-10-17).
+    /// `'none'` silently turns "nothing" into "this nonce".
     NonceDirectiveInvalid,
     NoSpaceLeft,
 };
@@ -251,7 +250,7 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
     }
     // `Nonce.text` is a public field: a hand-built nonce holding `;`, a space
     // or a quote would inject a directive or a source. Only the CSP
-    // `base64-value` alphabet passes (mutation run 2026-11-07, LOW).
+    // `base64-value` alphabet passes(LOW).
     if (nonce) |t| for (t) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '-' or c == '_' or c == '=')) return error.InvalidCharacter;
     };
@@ -521,7 +520,7 @@ test "renderNonce: a '%' in a source is copied, never read as a format directive
     try testing.expectEqualStrings("script-src https://cdn.example/a%20b 'nonce-" ++ zero_nonce ++ "';img-src https://img.example/100%", try renderNonce(spec, &nonce, &.{.script_src}, &buf));
 }
 
-// ── audit 2026-10-18: runtime-path tests asked for by mutation survivors ────
+// ── audit: runtime-path tests asked for by mutation survivors ────
 // (the comptime `build` tests above exercise the same core at compile time;
 // these pin the rules through the run-time entry points `render` /
 // `renderNonce`, where a defect in the shared core is also reachable.)
@@ -598,7 +597,7 @@ test "renderNonce: an empty source list is allowed only because the nonce fills 
     } }, &nonce, &.{.script_src}, &buf));
 }
 
-// ── audit 2026-11-07: tests asked for by the whole-module mutation run ──────
+// ── audit: tests asked for by the whole-module mutation run ──────
 
 /// Each directive's class, restated here: the tests below must not read the
 /// production predicates (`isSourceList`, `isFlag`, `mayBeEmpty`) they pin.
@@ -687,7 +686,7 @@ test "validation: the CSP keywords, spelled out independently of the table, are 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

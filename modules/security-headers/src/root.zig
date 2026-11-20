@@ -265,7 +265,7 @@ const hsts_buf_len = "max-age=".len +
 // `setHeader` call copies BOTH the name and the value into this budget.
 const http_header_budget_bytes = @typeInfo(@FieldType(http.Server.ResponseWriter, "header_buf")).array.len;
 
-// ── closed value sets (helmet 8.3.0 parity, review 2026-10-24) ──────────────
+// ── closed value sets (helmet 8.3.0 parity, review) ──────────────
 
 const coop_tokens = [_][]const u8{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none" };
 const coep_tokens = [_][]const u8{ "require-corp", "credentialless", "unsafe-none" };
@@ -409,17 +409,17 @@ pub const SecurityHeaders = struct {
         /// comptime sibling `applyStatic` already rejects the same input
         /// with a `@compileError`.
         ///
-        /// Also returned (2026-10-24) for a name `http` treats as a framing
+        /// Also returned for a name `http` treats as a framing
         /// header — `Content-Length`, `Transfer-Encoding`, `Trailer`,
         /// `Connection` (any case): `setHeader` would not emit them but act
         /// on them (close every connection, declare a body length, fail every
         /// request on a non-number), and `applyStatic` already refuses them.
         InvalidExtraHeaderName,
-        /// A header VALUE (a named knob or an `extra` value) holds CR, LF or
-        /// NUL or any other byte `http` refuses in a field value (control bytes,
-        /// DEL; `h1.isValidFieldValue`), which `setHeader` rejects on every request.
-        /// Checked in every build mode since 2026-10-24 (was a Debug-only
-        /// assert, so a ReleaseFast build failed each request instead).
+        /// A header VALUE (a named knob or an `extra` value) holds CR, LF or NUL or
+        /// any other byte `http` refuses in a field value (control bytes, DEL;
+        /// `h1.isValidFieldValue`), which `setHeader` rejects on every request.
+        /// Checked in every build mode (was a Debug-only assert, so a ReleaseFast
+        /// build failed each request instead).
         InvalidHeaderValue,
         /// `hsts.preload` is set but `max_age_s` < `hsts_preload_min_age_s` or
         /// `include_subdomains` is off — hstspreload.org would reject the
@@ -1711,9 +1711,7 @@ test "applyCspWithNonce: report-only name, deterministic bytes, errors surface" 
 
 test "applyCspWithNonce: a large nonce policy set again reuses its header bytes (no double spend of header_copy_bytes)" {
     // A source of ~2.4 KiB: one rendered policy fits the 4 KiB copy budget
-    // next to the defaults, two copies do not. Before 2026-11-17 the second
-    // render (a nonce middleware, then a handler re-rendering) failed with
-    // `HeaderBytesExhausted`: `http` appended the replacement.
+    // next to the defaults, two copies do not.
     const big = "https://cdn.example/" ++ @as([2380]u8, @splat('a'));
     const spec: csp.Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src, .values = &.{big} }} };
     const sh: SecurityHeaders = try .init(.{ .content_security_policy = "script-src " ++ big });
@@ -1862,10 +1860,10 @@ test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our d
 }
 
 test "init: CR/LF/NUL in any value and framing names in extra are refused in every build mode" {
-    // Review 2026-10-24: values were checked by a Debug assert only, and
+    // Review: values were checked by a Debug assert only, and
     // `extra` took Connection/Content-Length, which http acts on instead of
     // emitting (every connection closed / a declared body length).
-    // Every named value knob, one at a time (mutation 2026-10-24: two of
+    // Every named value knob, one at a time (mutation: two of
     // them could lose their check unnoticed while the test poisoned three).
     inline for (.{ "content_security_policy", "content_security_policy_report_only", "x_frame_options", "referrer_policy", "permissions_policy", "cross_origin_opener_policy", "cross_origin_resource_policy", "cross_origin_embedder_policy", "x_dns_prefetch_control", "x_permitted_cross_domain_policies", "server" }) |field| {
         for ([_][]const u8{ "a\r\nX: y", "a\nb", "a\x00b" }) |bad| {
@@ -1994,7 +1992,7 @@ test "init rejects an extra header whose NAME is not a field token" {
     });
 }
 
-// ── audit 2026-10-04: test asked for by mutation survivors ──────────────────
+// ── audit: test asked for by mutation survivors ──────────────────
 
 test "the init-time budget sum counts exactly the bytes apply puts on the wire" {
     // `appliedHeaderBytes` "mirrors apply's own field list and conditions
@@ -2034,7 +2032,7 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
     try testing.expectEqual(wire_bytes, sh.appliedHeaderBytes());
 }
 
-// ── audit 2026-10-18: tests asked for by mutation survivors ────────────────
+// ── audit: tests asked for by mutation survivors ────────────────
 
 test "init accepts every RFC 9110 token character in an extra header NAME" {
     // digits, letters and each punctuation tchar (a dropped class would 500 a
@@ -2108,7 +2106,7 @@ fn staticHeaders17() []const http.Header {
     });
 }
 
-// ── audit 2026-11-07: tests asked for by the whole-module mutation run ──────
+// ── audit: tests asked for by the whole-module mutation run ──────
 
 fn distinctExtras(comptime n: usize) [n]http.Header {
     @setEvalBranchQuota(100_000);
@@ -2186,7 +2184,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
