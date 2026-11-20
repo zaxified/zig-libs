@@ -63,10 +63,10 @@
 //! request just `destroy`ed or `regenerate`d (the delete/rotate bumped the
 //! generation — the stale CAS no longer matches and is dropped, fail closed).
 //! Per-request `Session` state lives on the serving thread's stack. The
-//! `Set-Cookie` value is staged in a
-//! thread-local buffer (the response writer stores header slices uncopied and
-//! serializes them lazily at `writeHead`, after the handler returns — a stack
-//! buffer would dangle; task-per-connection makes the thread-local safe).
+//! `Set-Cookie` value is formatted into a stack local and handed to
+//! `ResponseWriter.addSetCookie`, which copies it into the writer's own header
+//! storage before returning, so it is safe under any `Io` scheduling model
+//! (thread per connection, or fibers sharing one thread).
 
 const std = @import("std");
 const clock_lib = @import("clock");

@@ -21,8 +21,6 @@
 
 **Downstream consumer:** yes
 
-Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
-
 Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's `Provenance:` line (no NOTICE: clean-room).
 
 ## Compared with
@@ -300,8 +298,8 @@ the values API, iterate, hashed ids, the model test, fuzz harnesses), `src/csrf.
 - **Constant time:** ctgrind rows `csrf` (CSRF key and token, session id tainted) and `newid` in
   `scripts/checks/ctgrind-expected.tsv`; dead-stack burn of the HMAC (`src/burn.zig`) checked by
   `src/stackprobe_test.zig`. The store lookup by id is outside these rows (*Backlog / deferred*).
-- **Audit:** the card's `**Audit:**` line is the current score; the review and mutation record, with the
-  equivalent-mutant arguments and the findings fixed, is [`AUDIT.md`](AUDIT.md).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 - **Comparative tooling** (`tools/`): `bench.zig` against scs (`go_bench/`) and fiber (`go_fast_bench/`);
   `lead_probe/`, the race probe behind the card's `**Ahead:**` line.
 
