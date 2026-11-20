@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over json5's two existing `testing.fuzz`
-//! harnesses (`preprocess`, `preprocessAnnotated`; added 2026-10-09). The
+//! harnesses (`preprocess`, `preprocessAnnotated`; added). The
 //! bodies live here, generic over their source of choices
 //! (`fn(comptime S, *S, gpa)`); `root.zig`'s `testing.fuzz` tests feed them
 //! through the cursor adapter below, the driver feeds them a PRNG.
@@ -247,7 +247,7 @@ test "single-pass Value reader: every corpus document agrees with the two-stage 
     for (ref.cases) |case| try checkDirect(testing.allocator, case.src, .{});
     for (fixtures.vectors) |v| try checkDirect(testing.allocator, v.content, .{});
     for (fixtures.vectors) |v| try checkDirect(testing.allocator, v.content, .{ .json5 = .{ .non_finite = .quoted } });
-    // 1153 taken on 2026-10-24 (of 2660 oracle cases + 3 x 112 fixtures, many
+    // 1153 taken (of 2660 oracle cases + 3 x 112 fixtures, many
     // of them must-reject); the valid ones it declines are key recovery,
     // `Infinity`/`NaN` and surrogate escapes, all left to the two-stage path.
     try testing.expect(reach[@backingInt(Label.direct)] > ref.cases.len / 3);

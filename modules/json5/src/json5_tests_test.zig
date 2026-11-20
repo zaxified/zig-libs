@@ -17,7 +17,7 @@
 //!
 //! Vectors marked `out_of_scope` are counted (the canary below guards against
 //! silently dropping one) but not asserted against `expect` in the ordinary
-//! loop. Since 2026-09-30 those are exactly the five fixtures containing
+//! loop. Since those are exactly the five fixtures containing
 //! `Infinity`/`NaN`, which are an ERROR by default; their own test asserts that
 //! and that `non_finite = .quoted` makes them parse.
 //!
@@ -54,7 +54,7 @@ const Expect = vectors_mod.Expect;
 /// all. The corpus read that as a correct rejection. With the byte routed
 /// into recovery like every other unspellable key, this case now behaves
 /// exactly like its sibling above — which is the module's deliberate
-/// behaviour, not a new divergence (W2 re-audit 2026-09-02, `json5` F7).
+/// behaviour, not a new divergence (W2 re-audit, `json5` F7).
 const known_disagreements = [_][]const u8{
     "objects/illegal-unquoted-key-symbol.txt",
     "objects/illegal-unquoted-key-number.txt",
@@ -175,7 +175,7 @@ test "json5-tests corpus: the two entry points agree on the document" {
     const alloc = testing.allocator;
     // The corpus drove `preprocess` only, so the entry point `root.zig` calls
     // "the most intricate state machine in the module" had ZERO corpus
-    // coverage (W2 re-audit 2026-09-02, `json5` F2).
+    // coverage (W2 re-audit, `json5` F2).
     //
     // The property asserted is a DIFFERENTIAL, not the README's old absolute
     // "the output is always valid JSON" — that claim is not achievable and

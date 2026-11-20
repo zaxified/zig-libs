@@ -54,7 +54,7 @@ pub const Options = struct {
     /// writer recurses once per level; `parseFromSlice` builds a
     /// `std.json.Value` of any depth without recursing, so a hostile
     /// `[[[[…` that parses would otherwise overflow the stack here
-    /// (review 2026-10-24).
+    /// (review).
     ///
     /// Size bound with `indent`: one line holds at most `max_depth * indent`
     /// bytes of indent (10 000 at the defaults and `max_indent`), so output is
@@ -472,7 +472,7 @@ fn same(a: std.json.Value, b: std.json.Value) bool {
 }
 
 test "nesting deeper than max_depth is an error, not a stack overflow" {
-    // Review 2026-10-24: `parseFromSlice` builds a `std.json.Value` of any
+    // Review: `parseFromSlice` builds a `std.json.Value` of any
     // depth without recursing; this writer recurses once per level.
     const root = @import("root.zig");
     const gpa = std.testing.allocator;

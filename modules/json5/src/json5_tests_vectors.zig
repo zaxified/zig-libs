@@ -8,7 +8,7 @@
 //!
 //! `out_of_scope`, when non-null, says why an entry is NOT asserted against `expect` by
 //! the ordinary loop in json5_tests_test.zig, but it IS counted, so silently dropping one
-//! changes a checked total instead of vanishing quietly. Since 2026-09-30 the only such
+//! changes a checked total instead of vanishing quietly. Since the only such
 //! entries are the five fixtures containing `Infinity`/`NaN`, which are an error by default
 //! and get their own test (default -> error, `non_finite = .quoted` -> parses). The 32
 //! fixtures for hex, `.5`/`5.`, `+1`, line continuations and JSON5 whitespace that used to

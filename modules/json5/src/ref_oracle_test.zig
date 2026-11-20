@@ -208,7 +208,7 @@ test "ref oracle: preprocess + std.json read every document as the reference JSO
     if (bad != 0) std.debug.print("{d} differ; {d} values agree, {d} refusals met by recovery\n", .{ bad, agreed_values, recovered });
     try testing.expectEqual(@as(usize, 0), bad);
     try testing.expect(lone_surrogates > 0); // the class is still exercised
-    // 2026-10-05: 1106 values agree (of 1204 the reference accepts), the rest
+    // 1106 values agree (of 1204 the reference accepts), the rest
     // hold a lone surrogate; most of the evidence is agreement.
     try testing.expect(agreed_values >= 1000);
 }
@@ -234,7 +234,7 @@ test "ref oracle: the editor mode never turns a refused document into valid JSON
     // 0 or 1 of the next line), this module the line the broken token
     // starts on.
     //
-    // ⛔ 56 documents came out valid with no `$err` at all (2026-10-06): a
+    // ⛔ 56 documents came out valid with no `$err` at all: a
     // bad bare word or a single-quoted string broken by a newline, outside
     // an object, was recovered with nowhere to report it -- `nul` became
     // `"nul"`, `[tru]` became `["tru"]`.
