@@ -307,7 +307,9 @@ the cache asks `size(h)`, clamps to the whole pages present (never past EOF) and
 scratch buffer. Page `i` is copied to the caller; the extra pages are then `put` as
 ordinary, unpinned, evictable entries, extras first and page `i` last (so at a tiny budget
 the requested page is the one that stays). The sequence detector is an 8-slot lossy table
-(a forgotten handle costs one missed read-ahead, never correctness).
+(a forgotten handle costs one missed read-ahead, never correctness). The scratch buffer is
+`min(k, max_pages - 1) + 1` pages, so it never exceeds the cache's own byte budget
+(`max_pages * page_size`) however large `k` is; `k` is the caller's knob for a smaller one.
 
 Why this is sound:
 - **Budget.** Pages enter through `put`, which enforces `max_pages`; a borrowed page is not
@@ -335,7 +337,6 @@ Only the copying `pread` path prefetches: a `preadRef` miss records the access b
 ## Backlog / deferred
 
 - **A whole-file invalidation scans the resident map** (last close, truncating open, `rename`, `delete` run `ramcache.removeMatching`) — LOW, bounded by `max_pages`. (R-pagecache-2)
-- **Read-ahead's scratch buffer is up to the cache's own byte budget per sequential miss** — LOW, a caller option and documented on `Options.read_ahead_pages`. (R-pagecache-3)
 - **`findByPath`/`findById` are linear in the open files** — LOW, kvtree holds two. (R-pagecache-4)
 - **A double `releasePage`, or one after `deinit`, is undetected** (a `ramcache` assert; documented on `preadRef`); a generation token would close it. (R-pagecache-5)
 

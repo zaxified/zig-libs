@@ -2662,6 +2662,53 @@ test "read-ahead: a sequential scan makes fewer inner reads and returns identica
     try testing.expect(reads[1] < reads[0] / 2);
 }
 
+test "read-ahead: the scratch buffer never exceeds the cache's byte budget, however large read_ahead_pages is" {
+    const MaxAlloc = struct {
+        inner: std.mem.Allocator,
+        max: usize = 0,
+
+        fn allocator(self: *MaxAlloc) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            self.max = @max(self.max, len);
+            return self.inner.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            self.max = @max(self.max, n);
+            return self.inner.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            self.max = @max(self.max, n);
+            return self.inner.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            self.inner.rawFree(m, a, ra);
+        }
+    };
+    var tracker: MaxAlloc = .{ .inner = testing.allocator };
+    const gpa = tracker.allocator();
+    const n = 64;
+    const max_pages = 4;
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = max_pages, .read_ahead_pages = std.math.maxInt(u32) });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(testing.allocator, st, h, n, 3);
+    pc.cache.clear();
+    tracker.max = 0;
+    const got = try scanAll(testing.allocator, st, h, n);
+    defer testing.allocator.free(got);
+    try testing.expect(pc.stats().readahead_pages > 0);
+    try testing.expectEqual(@as(usize, max_pages * default_page_size), tracker.max);
+}
+
 test "read-ahead: random (non-sequential) access triggers none" {
     const gpa = testing.allocator;
     var sim = kv.SimStorage.init(gpa);
