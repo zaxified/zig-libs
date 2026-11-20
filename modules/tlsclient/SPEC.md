@@ -69,6 +69,13 @@ marked `zig-libs tlsclient` in `Client.zig`:
   listed, or is not TLS 1.3 is refused. TLS 1.3 switches to the handshake
   cipher right after ServerHello and ignores the compatibility
   ChangeCipherSpec (std waited for one).
+- **Handshake budget**: at most 16 consecutive records during `init` that carry
+  no handshake bytes and change no cipher state (a TLS 1.3 ChangeCipherSpec, an
+  empty record); the 17th is `TlsUnexpectedMessage`, and a record with
+  handshake bytes restarts the count — Go's `crypto/tls` (conn.go
+  `maxUselessRecords` = 16, `retryReadRecord`, "too many ignored records").
+  Partial handshake records are progress, as in Go; their bound stays the
+  caller's I/O timeout.
 - **TLS 1.2 ECDHE_ECDSA suites** (AES-GCM, ChaCha20); the suite must match the
   certificate's key type.
 - **Ed25519 server certificates** (TLS 1.3 CertificateVerify, TLS 1.2
@@ -417,10 +424,6 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **Dead-stack probe for TLS 1.2 resumption**: `stackprobe_test.zig` drives TLS 1.3 only, and the +6 KiB of
   `init` depth for TLS 1.2 resumption is an estimate against the 384 KiB burn. Add a TLS 1.2 resumed
   handshake to the probe.
-- **No handshake budget**: a server trickling ChangeCipherSpec, empty or partial records holds `init` as long
-  as the transport lets it; work stays linear in the bytes received, so the bound is the caller's I/O
-  timeout. Go caps "useless" records (`maxUselessRecords` = 16); a similar count here would turn a stall into
-  an error. Not a panic; no consumer report.
 - **Handshake messages split across records** (inherited from std): in TLS 1.3 the cleartext buffer flips
   after the Certificate message while the fragment indices carry over, and TLS 1.2 drops a first fragment; a
   server that splits a message there fails the handshake (bounds stay safe). Real servers seen so far do not;

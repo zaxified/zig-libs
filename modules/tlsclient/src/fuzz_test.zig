@@ -224,7 +224,7 @@ fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
 }
 
 /// Where `putRecord` notes record offsets (the template being built).
-var cur_records: *[12]usize = &tm.f13_records;
+var cur_records: []usize = &tm.f13_records;
 var cur_nrecords: *usize = &tm.f13_nrecords;
 
 fn putRecord(w: *Writer, ct: tls.ContentType, body: []const u8) void {
@@ -426,6 +426,10 @@ const V13 = struct {
     bad_finished: bool = false,
     /// A CertificateRequest after the Certificate (RFC 8446 §4.3.2: before it).
     cr_after_cert: bool = false,
+    /// ChangeCipherSpec records after the ServerHello (1 is the
+    /// middlebox-compatibility one) and after the EncryptedExtensions.
+    ccs_after_sh: usize = 1,
+    ccs_after_ee: usize = 0,
 };
 
 fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []const u8, srv_sk: [32]u8, client_x25519_pub: [32]u8, v: V13) !usize {
@@ -445,12 +449,13 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     var w13 = Writer.fixed(out);
     w13.writeAll(prefix) catch unreachable;
     putRecord(&w13, .handshake, server_hello);
-    putRecord(&w13, .change_cipher_spec, &.{1});
+    for (0..v.ccs_after_sh) |_| putRecord(&w13, .change_cipher_spec, &.{1});
     var buf: [2048]u8 = undefined;
     var body: [2048]u8 = undefined;
     const ee = hsMsg(&buf, .encrypted_extensions, &.{ 0, 0 });
     th.update(ee);
     putEncrypted(&w13, key, iv, 0, .handshake, ee);
+    for (0..v.ccs_after_ee) |_| putRecord(&w13, .change_cipher_spec, &.{1});
 
     const der = server_cert_der;
     body[0] = 0;
@@ -671,7 +676,8 @@ fn serverHello13(buf: []u8, suite: tls.CipherSuite, extra: []const u8) []const u
 
 fn scratchRecords() void {
     const S = struct {
-        var records: [12]usize = undefined;
+        // Room for the handshake-budget flights' extra ChangeCipherSpecs.
+        var records: [64]usize = undefined;
         var n: usize = 0;
     };
     S.n = 0;
@@ -703,6 +709,30 @@ test "a TLS 1.3 CertificateRequest after the Certificate is unexpected_message (
     var flight: [4096]u8 = undefined;
     const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
     const n = try buildFlight13(&flight, "", tm.th0, tm.server_hello[0..tm.server_hello_len], @splat(0x5c), client_x25519.public_key, .{ .cr_after_cert = true });
+    try testing.expectEqual(@as(?anyerror, error.TlsUnexpectedMessage), runClient(flight[0..n], null).init_err);
+}
+
+test "handshake budget: 16 ChangeCipherSpecs in a row are ignored, the 17th is unexpected_message (Go maxUselessRecords)" {
+    try ensureTemplates();
+    scratchRecords();
+    defer restoreRecords();
+    var flight: [8192]u8 = undefined;
+    const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
+    const sh = tm.server_hello[0..tm.server_hello_len];
+    // 16 after the ServerHello: accepted.
+    scratchRecords();
+    var n = try buildFlight13(&flight, "", tm.th0, sh, @splat(0x5c), client_x25519.public_key, .{ .ccs_after_sh = 16 });
+    try testing.expectEqual(@as(?anyerror, null), runClient(flight[0..n], null).init_err);
+    // 17: refused.
+    scratchRecords();
+    n = try buildFlight13(&flight, "", tm.th0, sh, @splat(0x5c), client_x25519.public_key, .{ .ccs_after_sh = 17 });
+    try testing.expectEqual(@as(?anyerror, error.TlsUnexpectedMessage), runClient(flight[0..n], null).init_err);
+    // 16, a handshake record, 16 more: the count restarts at handshake bytes.
+    scratchRecords();
+    n = try buildFlight13(&flight, "", tm.th0, sh, @splat(0x5c), client_x25519.public_key, .{ .ccs_after_sh = 16, .ccs_after_ee = 16 });
+    try testing.expectEqual(@as(?anyerror, null), runClient(flight[0..n], null).init_err);
+    scratchRecords();
+    n = try buildFlight13(&flight, "", tm.th0, sh, @splat(0x5c), client_x25519.public_key, .{ .ccs_after_sh = 16, .ccs_after_ee = 17 });
     try testing.expectEqual(@as(?anyerror, error.TlsUnexpectedMessage), runClient(flight[0..n], null).init_err);
 }
 

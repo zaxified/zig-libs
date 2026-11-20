@@ -36,6 +36,9 @@ const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
 const max_ciphertext_len = tls.max_ciphertext_len;
+/// zig-libs tlsclient: consecutive non-advancing records `init` accepts
+/// during the handshake (Go `crypto/tls` conn.go `maxUselessRecords`).
+const max_useless_records = 16;
 const hmacExpandLabel = tls.hmacExpandLabel;
 const hkdfExpandLabel = tls.hkdfExpandLabel;
 const int = tls.int;
@@ -960,7 +963,11 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     var cleartext_fragment_start: usize = 0;
     var cleartext_fragment_end: usize = 0;
     var cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined;
+    // zig-libs tlsclient: consecutive records that neither carry handshake
+    // bytes nor change the cipher state (a TLS 1.3 CCS, an empty record).
+    var useless_records: usize = 0;
     fragment: while (true) {
+        const fragment_end_before = cleartext_fragment_end;
         // Ensure the input buffer pointer is stable in this scope.
         input.rebase(tls.max_ciphertext_record_len) catch |err| switch (err) {
             error.EndOfStream => {}, // We have assurance the remainder of stream can be buffered.
@@ -1069,6 +1076,25 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                 break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end]), record_ct };
             },
         };
+        // zig-libs tlsclient: handshake budget, as Go's `crypto/tls`
+        // (conn.go: `maxUselessRecords` = 16, `retryReadRecord`): a server
+        // trickling ChangeCipherSpecs or empty records gets 16 of them in a
+        // row, then `TlsUnexpectedMessage` (Go: "too many ignored records",
+        // alert unexpected_message). A record with handshake bytes resets the
+        // count, as Go's does; a CCS that switches the cipher state (TLS 1.2)
+        // is progress.
+        {
+            const new_len: usize = if (cipher_state == .cleartext or ct == .change_cipher_spec)
+                record_len
+            else
+                cleartext_fragment_end -| fragment_end_before;
+            if (ct == .handshake and new_len > 0) {
+                useless_records = 0;
+            } else if (new_len == 0 or (ct == .change_cipher_spec and pending_cipher_state == cipher_state)) {
+                useless_records += 1;
+                if (useless_records > max_useless_records) return error.TlsUnexpectedMessage;
+            }
+        }
         switch (ct) {
             .alert => {
                 ctd.ensure(2) catch continue :fragment;
