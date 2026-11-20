@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02; stars and
 | [besok/zig-jsonpath](https://github.com/besok/zig-jsonpath) | Zig | MIT [V] | 21 | push 2026-05-09, no release | README: "fully compliant with RFC 9535"; asks for Zig 0.12+, current-Zig compatibility not checked. No typed rows. [I] |
 | Zig `std.json` | Zig | MIT | — | Zig 0.17.0 | Parses to a dynamic `Value` or a struct; no path query API. [I: file list] This module's document tree is its `Value`. |
 
-**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.62× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.59× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, `eval_filter` against serde_json_path (→ Backlog).
+**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.62× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.59× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, `eval_filter` against serde_json_path (→ *Backlog / deferred*).
 
 Every gap, with its verdict:
 
@@ -47,15 +47,15 @@ Every gap, with its verdict:
 | First node without walking the rest | serde_json_path, ojg | **done**: `queryFirst` |
 | Duplicate object keys take the last value | serde_json, Go, jq | **done**, opt-in: `duplicate_keys = .last`; the default stays `.reject`, the safe reading of a remote feed |
 | Exact integers in filter literals | RFC's I-JSON range and beyond | **done** |
-| `exactly_one`, `at_most_one` | serde_json_path | refused: `len` of the slice |
-| `Deduplicate`, `Sort` of located nodes | theory | refused: a few lines over the slice, no consumer asks |
-| A registry of custom functions (RFC §2.4 extension point) | theory, serde_json_path | refused: a typed callback API for a feature no consumer has; a filter's power here is the RFC's five functions |
-| Print or serialise a compiled path | theory | refused: the caller holds the text it compiled |
-| Set or remove values through a path | ojg | refused: this module reads; output is rows or nodes, never an edited document |
-| Query over structs or custom trees | ojg, jsonpath-rust | refused: the tree is `std.json.Value`; a typed struct is what `std.json` gives directly |
-| jq's language | jq | refused: a JSON-to-JSON programming language, another product |
-| Streaming evaluation | none surveyed [I] | refused: see Backlog |
-| Schema inference, JSON-to-JSON output | jq (in its own way) | refused: columns are declared, output is a `Frame` |
+| `exactly_one`, `at_most_one` | serde_json_path | refused, see *What is deliberately not done* |
+| `Deduplicate`, `Sort` of located nodes | theory | refused, see *What is deliberately not done* |
+| A registry of custom functions (RFC §2.4 extension point) | theory, serde_json_path | refused, see *What is deliberately not done* |
+| Print or serialise a compiled path | theory | refused, see *What is deliberately not done* |
+| Set or remove values through a path | ojg | refused, see *What is deliberately not done* |
+| Query over structs or custom trees | ojg, jsonpath-rust | refused, see *What is deliberately not done* |
+| jq's language | jq | refused, see *What is deliberately not done* |
+| Streaming evaluation | none surveyed [I] | refused, see *What is deliberately not done* |
+| Schema inference, JSON-to-JSON output | jq (in its own way) | refused, see *What is deliberately not done* |
 
 ## Design & invariants
 
@@ -81,7 +81,7 @@ Every gap, with its verdict:
       lets `pages[*].items` concatenate several paginated arrays into one row set); any other
       match becomes a single item itself (this is what lets `..name` or `a.*` pull scattered
       scalars/objects out as rows without requiring an enclosing array).
-- **RFC 9535 engine (2026-10-04, replaces the one-comparison filter).** A recursive-descent parser
+- **RFC 9535 engine.** A recursive-descent parser
   turns the path into `Seg`s (`child` / `descendant`, each a list of `Selector`s: name, index,
   wildcard, slice, filter) and filter `Expr` trees (`or`/`and`/`not`/`exists`/`cmp`, operands
   literal / singular query / `length`/`count`/`value`). Evaluation is a node-list walk; one `Ctx`
@@ -99,13 +99,13 @@ Every gap, with its verdict:
   (64); every query, including each filter sub-query (`count()`, existence tests), is held to
   `max_matches`; every step of every evaluation is charged to `max_work`, because a filter whose
   sub-query walks the subtree (`[?@..x]`, `count(@..*)`) costs elements × subtree.
-- **Two readings of one grammar (2026-11-02).** `compile` is RFC 9535 exactly: `Parser.strict`
+- **Two readings of one grammar.** `compile` is RFC 9535 exactly: `Parser.strict`
   takes `member-name-shorthand` as written, refuses stray dots, a trailing blank, invalid UTF-8.
   `shape` keeps the permissive top-level names (`$.a-b c`) and stray dots it has accepted since
   v1, and degrades a bad path to no rows, so that no shipped configuration changes. Filters,
   brackets and functions parse the same in both, but for `-` in a filter's member names, which
   `shape` still takes; a filter's blanks before a segment (`@ .a`) are the RFC's in both.
-- **I-Regexp (`src/iregexp.zig`, 2026-11-02).** `regex` is a superset with other meanings, so a
+- **I-Regexp (`src/iregexp.zig`).** `regex` is a superset with other meanings, so a
   pattern is never handed over as written: the checker walks RFC 9485's grammar and emits the
   engine's syntax. Anything outside the grammar (`\\d`, backreferences, `(?…)`, lazy quantifiers,
   scripts in `\\p{…}`) makes the function false, which is RFC 9535 §2.4.6–7's answer, as does a
@@ -122,20 +122,16 @@ Every gap, with its verdict:
   hostile pattern over a hostile subject has no backtracking to exploit. Cost: it adds 347,296
   bytes to a stripped ReleaseFast program whose only use of this module is `shape` (349,256 →
   696,552; ReleaseSafe 463,592 → 780,520), mostly Unicode tables and the engine, whether or not a
-  path uses them (a size probe of the analytics consumer's one call, measured 2026-11-02; the analytics consumer itself not rebuilt).
-- **Column keys as paths (2026-10-04).** `JsonCol.key` / `x` / `y` containing `.` or `[`: the item's
+  path uses them (a size probe of a program whose only use of this module is one `shape` call).
+- **Column keys as paths.** `JsonCol.key` / `x` / `y` containing `.` or `[`: the item's
   own field of exactly that name first (v1 behaviour, so a key like `"a.b"` naming a real field is
   unchanged), else the key parsed once as a path and evaluated from the item (`$…` from the root),
   first match only, held to `max_matches`.
-- **Mutation 2026-10-04, two equivalents:** `stop_after` compared with `>` instead of `>=` only
-  lets a first-only walk record one extra match (the answer — first node, or `n == 1` for
-  `value()` — is unchanged); a negative-step slice's default start `len` instead of `len − 1` is
-  clamped to `len − 1` by the very next line of the algorithm.
 - **Bounded by construction, not by external limit:** `MAX_PATH_DEPTH` caps recursive-descent and
   general segment-eval recursion so a crafted path can't stack-overflow on a deep document; past it
   is `DepthLimit`, never a silent drop. Syntax errors in a `shape` path or filter (unterminated `[`,
   unknown operator, bad literal) degrade to a `.never`-segment (matches nothing) rather than an
-  error, consistent with the module's "malformed shape input never fails except BadJson" contract.
+  error, consistent with the module's "malformed shape input never fails except BadJson" contract (`strict` makes it `PathSyntax`).
 - **Limits, ours unless a spec is named.** A pattern ≤ 4096 bytes, `{n,m}` ≤ 1000, parenthesis depth 32,
   nested counts multiplied ≤ 4096 (`((){1000}){1000}` emits no instruction and costs the engine's
   compiler tens of milliseconds), and 1024 instructions (`regex.Builder`'s capacity; the engine's plain
@@ -153,8 +149,7 @@ Every gap, with its verdict:
   so a 1 MB key under many children ends in `WorkLimit` at `max_work` bytes at most, plus one path.
   `query`'s default `max_work` is a fixed 2^28: a tree does not say how long its text was.
 - **Refusals a consumer can see.** A document deeper than 64 levels under a descent or a long path is
-  `error.DepthLimit`, where before 2026-10-31 the deeper matches silently went missing; the analytics consumer's http connector
-  returns it as its own error (`src/source.zig`: `jsonshape.Error` is in its error set). A `count()` over a query selecting more than `max_matches` is
+  `error.DepthLimit`; the deeper matches are never silently dropped. A `count()` over a query selecting more than `max_matches` is
   `error.TooManyMatches` rather than a number. Both stay refusals, on purpose.
 - **Missing path → empty frame, not an error.** If the path doesn't resolve to any array/item
   (wrong key, or resolves to a non-array under the legacy dialect, or a path with no matches at
@@ -163,13 +158,26 @@ Every gap, with its verdict:
   it.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the parse tree living in the
   caller's allocator (normally an arena) — freed all at once, same memory model as `dataframe` itself.
+- **`ShapeSpec.strict` (default false, behaviour unchanged).** Opt-in, for `path` only. On: a malformed
+  path is `error.PathSyntax`; a definite path (member names and indices only, or a legacy dot-path:
+  `isDefinite`) that selects nothing is `error.PathNotFound`; a legacy dot-path ending on a non-array,
+  `null` included, is `error.NotAnArray`. An existing empty array, and a wildcard / slice / filter / `..`
+  that matches nothing, stay an empty frame. Reference behaviour: Jayway JsonPath throws
+  `PathNotFoundException` for a definite path with a missing leaf and returns an empty list for an
+  indefinite one (`SUPPRESS_EXCEPTIONS` turns the first into null/empty; `REQUIRE_PROPERTIES` makes missing
+  properties of indefinite paths errors too); jq answers a missing key with `null` and fails on iterating it
+  (`.a[]` over null), `?` suppressing that. We follow Jayway's default split because an indefinite query
+  selecting nothing is a legitimate answer. Not affected: column keys (still null on a missing key) and
+  `parseDocument` / `query`, which already return what they select. A path can be proved well-formed
+  first with `compile`.
+- **Declared `.list` / `.struct` columns are refused** (`error.UnsupportedColumnType`): `shape` builds
+  scalar cells only (`.categorical` is stored encoded, `.duration` parses like `.timestamp`); see *Backlog / deferred*.
 - **Concurrency:** reentrant, no shared state; pure logic, no I/O of its own.
-- **Boundary with `dataframe.readJson` (2026-11-08).** `dataframe` reads a whole document of
+- **Boundary with `dataframe.readJson`.** `dataframe` reads a whole document of
   records, columns or ndjson into a frame and builds list and struct columns from the nested
   values it has, no more. Querying (JSONPath), projecting deep documents onto columns by key
   paths and flattening (`json_normalize`) are this module's and are not written again there;
-  step R of the dataframe plan repoints `shape` at `dataframe.Frame` (`dataframe` cannot depend
-  on this module, that would be a cycle). The two agree on repeated keys: `.reject` by default,
+  `dataframe` cannot depend on this module (that would be a cycle), so `shape` stays here. The two agree on repeated keys: `.reject` by default,
   `.last` as the option.
 
 ## Threat model / out of scope
@@ -179,75 +187,92 @@ feed. `shape`'s errors are `Error.BadJson` on malformed JSON, `OutOfMemory`, `Er
 when a path matches (or flattens into) more than `ShapeSpec.max_matches` items (`MAX_MATCHES`,
 65,536 by default — a refusal, not a truncation), `Error.WorkLimit` and `Error.DepthLimit` — everything
 else (missing keys, type mismatches per cell, a path that resolves to nothing, a bad path) degrades
-to `.null` cells or an empty frame rather than failing, so a shape mismatch never panics. `compile`
+to `.null` cells or an empty frame rather than failing (`ShapeSpec.strict` turns a bad or missing `path` into an error), so a shape mismatch never panics. `compile`
 adds `InvalidPath`. It does not validate the *semantics* of the resulting data (values are taken as
 given from the remote source) and does no network/file I/O itself.
 
+Residual risks a caller owns (not fixable here, or bounded by the caller's limits):
+
+- **`std.json` amplification.** `std.json.Value` costs about 28-30x the input bytes (`[{},{},...]`: 40 B per
+  3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, so the feed's byte
+  cap is the caller's. A node-count cap in `checkDepth`'s pre-scan would bound it (*Backlog / deferred*).
+- **Hash collisions.** `std.json` hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys
+  can make the parse quadratic before any limit of ours runs.
+- **Non-finite floats.** They can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an
+  overflowing literal (`1e999`); `dataframe` orders and serializes them (null in JSON).
+- **The legacy dot-path ignores `max_matches`**; its rows and cells are bounded by the work budget instead.
+
 ## Verification
 
-External: `src/cts_test.zig` runs the official JSONPath Compliance Test Suite, every one of its 715
-cases through `compile`, and the 466 with a document through `query`, `queryLocated` (the nodes and
-their Normalized Paths, against any listed order where the RFC leaves it open) and `queryFirst`.
+- **Run:** `scripts/modtest jsonshape` (add `-Doptimize=ReleaseFast` for the optimized lane); `zig fmt --check modules/jsonshape`.
+- **External:** `src/cts_test.zig` runs the official JSONPath Compliance Test Suite: every case through
+  `compile`, and every case with a document through `query`, `queryLocated` (the nodes and their Normalized
+  Paths, against any listed order where the RFC leaves it open) and `queryFirst`. The suite is frozen in
+  `src/testdata/cts.json` (see *Anchoring*).
+- **RFC and original tests:** the RFC's own example tables (§2.3.1–2.3.5, Table 11, §2.5.2.3) stay in
+  `src/root.zig`, with the original set: generic-column projection, the `[x,y]` default in its three forms,
+  missing path, malformed JSON, legacy dot-path back-compat, column-key paths, `strict`. `src/query_test.zig`
+  and `src/iregexp.zig`: the I-Regexp boundary on both sides, each of the engine's wider forms false for
+  both functions, implicit anchoring, `.` and `\r`, wrong-typed arguments.
+- **Sweep:** `src/sweep_test.zig`: hostile text, 1 MiB of it, OOM at every allocation, budgets at their
+  boundary, depth, the 64-call cap, oversize and engine-refused patterns, `(a|aa)+` on a 64 KiB subject.
+- **Fuzz:** `src/fuzz_test.zig`, `JSONSHAPE_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver), plus a
+  fixed-seed run with reach checks in every test run. The harnesses check that the three query entry points
+  agree; that each Normalized Path compiles and selects exactly its node; that less budget changes the answer
+  only into `WorkLimit`; that `shape` agrees with `compile` on a path both read; slices against RFC 9535's
+  definition by membership, and `match`/`search` of plain letters against equality and containment, as
+  independent models.
+- **Constant time:** n/a, JSON shape checks over public data.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Bench:** `zig build bench-jsonshape` (`tools/bench.zig`, `tools/README.md`) against theory/jsonpath,
+  serde_json_path, ojg and jsonpath-rust.
 
-The RFC's own example tables (§2.3.1–2.3.5, Table 11, §2.5.2.3) stay in `src/root.zig`, with the original
-set: generic-column projection, the `[x,y]` default in its three forms, missing path, malformed JSON,
-legacy dot-path back-compat, column-key paths. `src/query_test.zig` and `src/iregexp.zig`: the I-Regexp
-boundary on both sides, each of the engine's wider forms false for both functions, implicit anchoring,
-`.` and `\\r`, wrong-typed arguments. `src/sweep_test.zig`: hostile text, 1 MiB of it, OOM at every
-allocation, budgets at their boundary, depth, the 64-call cap, oversize and engine-refused patterns,
-`(a|aa)+` on a 64 KiB subject.
+## Performance
 
-`src/fuzz_test.zig` (2000 seeds in every test run, `JSONSHAPE_FUZZ` for more): the three query entry
-points agree; each Normalized Path compiles and selects exactly its node; less budget changes the
-answer only into `WorkLimit`; `shape` agrees with `compile` on a path both read; slices against RFC
-9535's definition by membership, and `match`/`search` of plain letters against equality and containment,
-as independent models. Planted mutants in a copy: slice bound, unanchored `match`, an unescaped quote,
-an unpopped trail, a lost index, permissive names, all caught; a first-only walk recording the last node
-is equivalent (the walk stops first); an uncharged evaluation step changes no answer the harness can see.
+`zig build bench-jsonshape -Djcc-safe` (see `tools/README.md`) runs the same document and paths on every
+side, each over its language's usual tree, wall time over rounds. The card's `**Performance:**` line carries the
+ratios, the worst row and the measurement date; it is authoritative. `eval_match` and `eval_search` pair a
+pattern precompiled here against a compile per node on the foreign sides, a design difference, not engine speed.
 
-Run: `zig build test-jsonshape`.
+## What is deliberately not done
+
+- **`exactly_one`, `at_most_one`** (serde_json_path): `len` of the slice.
+- **`Deduplicate`, `Sort` of located nodes** (theory): a few lines over the slice, no consumer asks.
+- **A registry of custom functions** (RFC §2.4 extension point; theory, serde_json_path): a typed callback API
+  for a feature no consumer has; a filter's power here is the RFC's five functions.
+- **Printing or serialising a compiled path** (theory): the caller holds the text it compiled.
+- **Setting or removing values through a path** (ojg): this module reads; output is rows or nodes, never an
+  edited document.
+- **Query over structs or custom trees** (ojg, jsonpath-rust): the tree is `std.json.Value`; a typed struct is
+  what `std.json` gives directly.
+- **jq's language, and JSON-to-JSON reshape:** a JSON-to-JSON programming language is another product; the
+  output is always a `dataframe.Frame`.
+- **Schema inference:** no auto-sniff of the first object's keys to build `columns`; columns are declared.
+- **Streaming or bounded-memory parse.** The whole document is parsed with `parseFromSliceLeaky` up front.
+  Evaluated and deliberately not built: the engine (wildcards, recursive descent, filters) needs random access
+  and multi-pass re-visitation over the parsed tree: `..name` walks the whole document looking for every
+  occurrence, a filter re-scans an array, a wildcard fans out into N independent sub-walks. None of that maps
+  onto a single forward SAX/token pass without re-materializing the same tree incrementally (reimplementing
+  `parseFromSliceLeaky` by hand) or restricting the path dialect to a linear, non-branching subset, which would
+  mean shipping two incompatible engines. The reshape API is whole-document by design (`shape()` returns a
+  complete `Frame`, not a row iterator); a bounded-memory consumer is a different API shape (rows produced as
+  found, from a token reader) and belongs in a separate module, not a retrofit here.
+- **A configurable `MAX_PATH_DEPTH` (64).** It is a stack bound, and the trail of `queryLocated` is sized by it.
+  A document deeper than that under `..` is `DepthLimit`. Refused until a consumer meets one.
 
 ## Backlog / deferred
-- **Delta mutation 2026-11-19 (`strict`,** 13 mutants over `resolveItems`' strict branches, `descendExact` and `isDefinite`, ReleaseSafe, strict verdict): 13 killed. A first run left the multi-selector guard and the empty-segment skip of `descendExact` to new assertions (`$.d.p[7,8]` is indefinite, `.d.p` / `d.p.` resolve). Counts on the card are cumulative with the 2026-10-04 run, whose one unexplained survivor remains.
 
-- **Declared `.list` / `.struct` columns — refused (`error.UnsupportedColumnType`).** `dataframe` exports no way to turn a parsed `std.json.Value` into a nested cell (its JSON reader works on bytes), so `shape` builds scalar cells only (`.categorical` is stored encoded, `.duration` parses like `.timestamp`). Wanted: a nested-cell builder from a JSON value in `dataframe`.
-- **Streaming/bounded-memory parse — deferred, not a modest addition.** The whole document is
-  parsed with `parseFromSliceLeaky` up front; very large payloads have no streaming/bounded-memory
-  path. Evaluated for this pass and deliberately not built: the JSONPath-subset engine added here
-  (wildcards, recursive descent, filters) fundamentally needs random access and multi-pass
-  re-visitation over the parsed tree — `..name` walks the whole document looking for every
-  occurrence, a filter re-scans an array, a wildcard fans out into N independent sub-walks. None of
-  that maps onto a single forward SAX/token pass without effectively re-materializing the same
-  tree structure incrementally (i.e., reimplementing `parseFromSliceLeaky` by hand) or restricting
-  the path dialect to a linear, non-branching subset — which would mean shipping two incompatible
-  engines with different capabilities. The reshape API is whole-document by design (`shape()`
-  returns a complete `Frame`, not a row iterator); a genuinely bounded-memory/incremental
-  consumer is a different API shape (produce rows as they're found, streaming from a token
-  reader) and belongs in a separate module/function, not a retrofit here.
-- **JSON→JSON reshape** — output is always a `dataframe.Frame`, not a jq-style JSON-to-JSON
-  transform.
-- **Schema inference** — no auto-sniff of the first object's keys to build `columns`; the caller
-  always declares the spec.
-- **A `strict` mode for `shape`** — ✅ DONE 2026-11-19: `ShapeSpec.strict` (default false, behaviour unchanged). On, for `path` only: a malformed path is `error.PathSyntax`; a definite path (member names and indices only, or a legacy dot-path) that selects nothing is `error.PathNotFound`; a legacy dot-path ending on a non-array, `null` included, is `error.NotAnArray`. An existing empty array and a wildcard / slice / filter / `..` that matches nothing stay an empty frame. Reference behaviour: Jayway JsonPath throws `PathNotFoundException` for a definite path with a missing leaf and returns an empty list for an indefinite one (`SUPPRESS_EXCEPTIONS` turns the first into null/empty; `REQUIRE_PROPERTIES` makes missing properties of indefinite paths errors too); jq answers a missing key with `null` and fails on iterating it (`.a[]` over null), `?` suppressing that. We follow Jayway's default split because an indefinite query selecting nothing is a legitimate answer. Not strict: column keys (still null on a missing key) and `parseDocument`/`query` (which already return what they select).
-  rows both. A path can be proved well-formed first with `compile`; which case a run hit is not said.
-- **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see
-  `**Performance:**`). A singular query in a comparison builds a sub-`Ctx` and walks through
-  `evalSegs`; a direct walk for singular queries is the first thing to try, keeping the work charges
-  the sweep tests pin.
-- **`MAX_PATH_DEPTH` (64) is not configurable.** It is a stack bound, and the trail of `queryLocated`
-  is sized by it. A document deeper than that under `..` is `DepthLimit`. Refused until a consumer
-  meets one.
-- ~~**Nested column keys through the path engine**~~ *(survey 2026-09-30)* — **done 2026-10-04**.
-- ~~**RFC 9535 filter and selector completeness**~~ *(survey 2026-09-30)* — **done 2026-10-04**,
-  `match()`/`search()` and the compliance suite **done 2026-11-02**.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, fix round) **std.json amplification, not ours to fix**: `std.json.Value` costs ~28-30x the input bytes (`[{},{},...]`: 40 B per 3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, the feed's byte cap is the caller's (the analytics consumer: 16 MiB, i.e. up to ~0.5-1 GB per call). A node-count cap in `checkDepth`'s pre-scan would bound it. std.json hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys can make the parse quadratic before any limit of ours runs. Non-finite floats can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an overflowing literal (`1e999`); `dataframe` orders and serializes them (null in JSON). The legacy dot-path ignores `max_matches` (unchanged); its rows and cells are bounded by the work budget instead. The path-depth cap (64) now fails with `error.DepthLimit` instead of silently dropping deeper matches.
-
-## Status
-
-`extract · any · codec · reentrant` + deps: `dataframe`, `regex` — canonical source is `pub const meta` in
-src/root.zig.
+- **Declared `.list` / `.struct` columns** (`error.UnsupportedColumnType` today). `dataframe` exports no way
+  to turn a parsed `std.json.Value` into a nested cell (its JSON reader works on bytes). Wanted: a nested-cell
+  builder from a JSON value in `dataframe`.
+- **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see the
+  card's Performance line). A singular query in a comparison builds a sub-`Ctx` and walks through `evalSegs`; a
+  direct walk for singular queries is the first thing to try, keeping the work charges the sweep tests pin.
+- **A node-count cap in `checkDepth`'s pre-scan** would bound `std.json.Value`'s ~28-30x amplification (see
+  *Threat model*); today the byte cap is the caller's.
+- **The card's one unexplained mutation survivor** (from the first whole-module run, which did not record which
+  mutant it was): decide it as equivalent or kill it with a test at the next whole-module run.
 
 ## Anchoring
 

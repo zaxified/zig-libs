@@ -14,7 +14,7 @@ same engine is public as a query API (`compile`, `query`, `queryFirst`,
   produces a `Frame`; does no network/file I/O itself).
   **Concurrency:** reentrant (no shared state).
 - **Deps:** [`dataframe`](../dataframe/README.md), [`regex`](../regex/README.md)
-  (for `match()`/`search()`, nothing else).
+  (for `match()`/`search()`, nothing else), [`jsontext`](../jsontext/README.md) (the depth pre-scan).
 
 Provenance: original work of the zig-libs authors (MIT); ownership/error
 semantics are deliberate design choices. No third-party code. Committed data:
@@ -101,8 +101,7 @@ honoring the column's declared `ColumnType`, including JSON's
   (`..name`) and general path evaluation are capped at a fixed depth so a
   crafted path can't stack-overflow on a deeply-nested document; filter
   expressions nest at most 32 levels.
-  ⚠ **The depth cap alone was NOT a DoS control, though this section used to
-  read as though it were.** Depth is not the quantity that grows: `..name`
+  ⚠ **The depth cap alone is NOT a DoS control.** Depth is not the quantity that grows: `..name`
   visits every value at every level, so matches grow with the document's
   *branching*. Measured with a fixed, operator-written 6-byte path where only
   the document was hostile: **163,831 B → 393,220 rows, peak RSS 65 MiB
@@ -138,9 +137,9 @@ const jsonshape = @import("jsonshape");
 
 const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .float }
 const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys, strict }
-const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit }
+const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit, DepthLimit }
 
-fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType`; `shapeFrame` is a deprecated alias for one release
+fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType`, and `PathSyntax` / `PathNotFound` / `NotAnArray` under `strict`; `shapeFrame` is a deprecated alias for one release
 
 // RFC 9535 as a query API. Results live in `a`, which must be an arena: nothing is freed.
 // A `Path` does not borrow `text`; nodes borrow the tree, and the tree may borrow `bytes`.
@@ -160,36 +159,15 @@ A `Path` is immutable: compile once, query from any number of threads. A
 ## Verify
 
 ```
-zig build test-jsonshape
-zig build test-jsonshape -Doptimize=ReleaseFast
+scripts/modtest jsonshape
+scripts/modtest jsonshape -Doptimize=ReleaseFast
 zig fmt --check modules/jsonshape
 ```
 
-The compliance suite runs in `zig build test-jsonshape`. Fuzz:
+The compliance suite runs in `scripts/modtest jsonshape`. Fuzz:
 `JSONSHAPE_FUZZ=<runs>[,<first seed>]` on the test binary, see `src/fuzz_test.zig`.
 Benchmark: `zig build bench-jsonshape`, see `tools/README.md`.
 
-## Deferred (backlog, not implemented here)
+## Not provided
 
-RFC 9535 JSONPath is complete; the following remain out of scope — see
-`SPEC.md` Backlog for the full rationale, especially why streaming is a
-deliberate non-goal rather than an oversight:
-
-- **Streaming / bounded-memory parse** — the whole document is parsed with
-  `parseFromSliceLeaky` up front. Deliberately deferred, not just
-  unscheduled: the JSONPath-subset engine (wildcards, recursive descent,
-  filters) needs random access and multi-pass re-visitation over the
-  parsed tree, which doesn't map onto a single forward SAX/token pass
-  without either re-materializing the same tree by hand or shipping a
-  second, more restricted engine. A genuinely streaming/incremental
-  consumer is a different API shape (rows produced as found, from a token
-  reader) and belongs in a separate module, not a retrofit here.
-- **JSON→JSON reshape** — output is always a `dataframe.Frame`; reshaping
-  JSON into JSON (a jq-style transform staying in JSON) is a different
-  problem this module doesn't address.
-- **Schema inference** — there is no "sniff the first object's keys to
-  build `columns` automatically" mode; the caller always declares the
-  spec.
-- **A `strict` mode** — currently a wrong path and a genuinely-empty
-  array/no-matches are indistinguishable (both give zero rows); a mode
-  that reports which case occurred would need a richer return type.
+Streaming or bounded-memory parsing, JSON-to-JSON reshaping (a jq-style language), schema inference, a custom-function registry and editing a document through a path are not built; declared `.list`/`.struct` columns are refused (`UnsupportedColumnType`). SPEC's *What is deliberately not done* gives the reasons and *Backlog / deferred* what is open.

@@ -6,9 +6,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-20** — **SOURCE-BREAKING (correction of the 2026-11-19 entry):** the three new `ShapeError` values are added to the error set even with `strict` off, so a consumer's exhaustive `switch` over `shape`'s error fails to compile until it gains an arm for `PathSyntax`, `PathNotFound` and `NotAnArray` (runtime behaviour with `strict = false` is unchanged). The module's own example had exactly that break and now has the arm.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `strict` (13 mutants, all killed); tests added for multi-selector (indefinite) paths and empty dot-path segments. Card counts cumulative.
 - **2026-11-19** — New opt-in `ShapeSpec.strict` (default false: no behaviour change) with `ShapeError.PathSyntax`, `PathNotFound` and `NotAnArray`, so a wrong `path` is told apart from a genuinely empty result (Jayway JsonPath's definite/indefinite split; see SPEC § Backlog).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-10** — **CHANGED**: a column declared as dataframe's new fixed-size `.array` is refused with `error.UnsupportedColumnType`, as `.list` and `.struct` are (the conversion switch would otherwise reach `unreachable`).
 - **2026-11-10** — **ADDED**: a `.binary` column (dataframe's new Binary) reads a JSON string as base64, the form dataframe's writers emit (`dataframe.parseBinary`); anything else null.
 - **2026-11-10** — **ADDED**: a `.time` column (dataframe's new time of day) reads `"HH:MM:SS"` text or microseconds since midnight by `Value.cast(.time)`, as `.timestamp`/`.duration` read theirs; outside one day null.
@@ -22,13 +20,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-11-02** — FIXED, independent review of the new layer, all unreleased. Distinct patterns from the document no longer cost memory per compile (a `regex.Builder` and a fixed cache of 8; 1000 compiles grew an arena by far over 2 MiB, 64 literals by 122 MB, now capped), at the price of 1024 instructions per program rather than 4096. A Normalized Path charges its bytes. `match`/`search` charge the subject scaled by the program: a 908-instruction program took 8.4 s per MiB against 1 M steps. A `Path` no longer borrows its text. `^` and `$` are anchors only at a branch's first and last atom, literal elsewhere. Nested counts are bounded. `query`, `queryLocated` return exact slices.
 
-- **2026-11-02** — NO CONSUMER-VISIBLE CHANGE: the card for grade 2. Scope parity (survey 2026-11-02), class A with the compliance suite as its external anchor, `**Performance:**` from `zig build bench-jsonshape`, `tools/README.md`; SPEC and README no longer say "minimal jq-style subset". A test that every RFC 9485 category compiles in the engine.
 
 - **2026-11-02** — ADDED, no change at existing call sites except `match()`/`search()`, which selected nothing and now work: the full RFC 9535 query API, `compile` (strict grammar, `Diagnostic` with the offset), `query`, `queryFirst`, `queryLocated` (Normalized Paths), `parseDocument`. `match()`/`search()` over the sibling `regex` (new production dependency), through an I-Regexp check in `src/iregexp.zig` that refuses the engine's wider syntax. `ShapeSpec.duplicate_keys` (default `.reject`, unchanged). The JSONPath Compliance Test Suite (715 cases, BSD-2-Clause) frozen in `src/testdata/cts.json`, all passing; a deterministic fuzz harness (`JSONSHAPE_FUZZ`).
 
 - **2026-10-31** — **CONSUMER-VISIBLE (error set widened):** no-panic sweep + blind review (§ GW). `Error` gains `WorkLimit` and `DepthLimit`. `ShapeSpec.max_work: ?usize = null` (auto `1_000_000 + 16 × input bytes`) bounds every path step, filter, comparison, string conversion and output cell of one `shape` call; `ShapeSpec.max_depth: u32 = 512` refuses deeper documents before parsing; a descent past the path depth of 64 is `DepthLimit` instead of silently missing matches; long `||`/`&&` chains evaluate iteratively (50k terms overflowed the stack).
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-04** — ADDED: RFC 9535 JSONPath (survey 2026-09-30 gap) and paths as column keys.
