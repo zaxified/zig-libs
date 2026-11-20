@@ -3,7 +3,7 @@
 //! segqueue — an unbounded MPMC queue of fixed-size blocks that needs no
 //! participant handles and no epoch domain: the counterpart of crossbeam's
 //! `SegQueue`, beside the Michael-Scott `mpmc.Queue` (one node and one EBR pin
-//! per item) and the bounded `BoundedQueue`. Designed here (2026-10-14);
+//! per item) and the bounded `BoundedQueue`. Designed here;
 //! crossbeam's source was not read.
 //!
 //! **Positions.** `tail` (producers) and `head` (consumers) are `u64`
@@ -45,8 +45,7 @@
 //! when its stragglers are almost always done; a straggler that is not (pre-
 //! empted mid-copy) keeps only its own block waiting. An earlier version
 //! counted reads with one `fetchAdd` per pop on a per-block counter; the
-//! consumers contending for that line doubled the 4×4 wall time
-//! (2026-10-14).
+//! consumers contending for that line doubled the 4×4 wall time.
 //!
 //! **Why the block pointer read before the CAS is the right block.** A lap's
 //! block is stored into `tail_block` before `tail` leaves that lap's closed
@@ -96,7 +95,7 @@ const atomic = @import("atomic.zig");
 /// `cap_step` — not `Backoff.spin`'s 6. Every lost CAS still moved the line
 /// to the loser, so contenders that retry soon keep the line in flight;
 /// spreading them further lets a winner claim several positions while the
-/// line stays in its cache. Measured 2026-10-14 (i7-7920HQ, 4 Mi items,
+/// line stays in its cache. Measured (i7-7920HQ, 4 Mi items,
 /// median of 15 runs, ms) for caps 6 / 8 / 10: 4×4 155 / 135 / 94, 8×8
 /// 230 / 184 / 131, 1×4 146 / 80 / 84, 4×1 81 / 74 / 74, 1×1 and 2×2 flat.
 /// A pop pays the long spins only after ten straight losses, i.e. only
@@ -119,7 +118,7 @@ const CasBackoff = struct {
 /// CPU only after a long run of polls (the other thread is then probably not
 /// running). `Backoff.pause` doubles its spin each round instead, and on the
 /// block hand-off that overshot a ~300 ns window by microseconds once every
-/// lap (2026-10-14, measured).
+/// lap.
 const Waiter = struct {
     polls: u32 = 0,
     const spin_polls: u32 = 1 << 12;

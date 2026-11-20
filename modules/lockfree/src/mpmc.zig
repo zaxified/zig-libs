@@ -57,7 +57,7 @@ pub fn Queue(comptime T: type) type {
         /// Points at (or lags just behind) the last node. Padded like `head`:
         /// a line to itself, so the read-only fields below never share it
         /// (they did, and every consumer reload of `domain` missed on the
-        /// line producers CAS — 2026-10-14 profile).
+        /// line producers CAS).
         tail: atomic.CachePadded(std.atomic.Value(*Node)) align(atomic.cache_line),
         node_pool: *Pool,
         domain: *ebr.Domain,
@@ -286,7 +286,7 @@ pub fn Queue(comptime T: type) type {
         ///    assumes the advancing/draining thread is pinned. The empty-path
         ///    calls are what let a quiescing consumer (the harness drain loop)
         ///    advance the epoch by itself and empty its own bags before
-        ///    `unregister`. The amortization (2026-10-14) took the scan off the
+        ///    `unregister`. The amortization took the scan off the
         ///    hot path: per dequeue it was `max_participants` seq_cst loads.
         pub fn dequeue(self: *Self, p: *ebr.Participant) ?T {
             // Runs unpinned, after every release; forced on the empty path.

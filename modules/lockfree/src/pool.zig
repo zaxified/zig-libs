@@ -30,7 +30,7 @@
 //! was (it can hit the general-purpose allocator). The lock-free guarantees
 //! of the queue concern its head/tail/next CAS loops, not allocation.
 //!
-//! Per-thread caches (2026-10-14): `acquireCached`/`releaseCached` keep freed
+//! Per-thread caches: `acquireCached`/`releaseCached` keep freed
 //! nodes in a caller-owned `Cache` and take the lock once per `cache_batch`
 //! nodes. One lock per node was the unbounded queue's bottleneck (58 % of a
 //! 4×4 run in `acquire` + `release`, 10× crossbeam's `SegQueue`). The lock

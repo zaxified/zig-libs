@@ -8,23 +8,22 @@
 //! and a **Chase-Lev work-stealing deque** (`deque`). The immediate consumer is the in-process
 //! worker pool (P2 DL4); this is the workspace's first lock-free structure.
 //!
-//! **Status: core implemented.** The mechanical layer (Phase-1 scaffold) —
-//! typed atomic helpers + backoff + an oracle spinlock (`atomic`), a
-//! poisoning node pool whose canary catches use-after-free (`pool`), the EBR
-//! domain/participant *storage* + registration (`ebr`), the queue node types
-//! + init/deinit (`mpmc`), and the entire concurrent-stress harness with its
-//! correct oracle, its deliberately-broken positive controls, and its
-//! deterministic invariant-checker teeth (`harness`) — is complete, and the
-//! irreducible concurrency-correctness CORE — EBR's pin/unpin/retire/advance
-//! and the queue's enqueue/dequeue CAS loops — is now implemented
-//! (`gate.fable_core_implemented = true`). Every core function documents its
-//! memory-ordering argument in place; the grace-period safety theorem lives
-//! at `ebr.Domain.tryAdvance`. The gated stress tests run for real.
+//! **Layers.** The mechanical layer — typed atomic helpers + backoff + an
+//! oracle spinlock (`atomic`), a poisoning node pool whose canary catches
+//! use-after-free (`pool`), the EBR domain/participant *storage* +
+//! registration (`ebr`), the queue node types + init/deinit (`mpmc`), and the
+//! concurrent-stress harness with its correct oracle, its deliberately-broken
+//! positive controls and its deterministic invariant-checker teeth
+//! (`harness`) — and the concurrency-correctness core on top of it: EBR's
+//! pin/unpin/retire/advance and the queue's enqueue/dequeue CAS loops
+//! (`gate.fable_core_implemented = true`, so the gated stress tests run).
+//! Every core function documents its memory-ordering argument in place; the
+//! grace-period safety theorem lives at `ebr.Domain.tryAdvance`.
 //!
 //! See `SPEC.md` for the EBR-vs-hazard decision, the verification strategy
-//! (and its honest probabilistic-vs-deterministic breakdown), the exact
-//! Fable-core boundary, and the out-of-scope next increments (a lock-free
-//! hash map; hazard-pointer reclamation).
+//! (and its honest probabilistic-vs-deterministic breakdown), the core
+//! boundary, and the out-of-scope next increments (a lock-free hash map;
+//! hazard-pointer reclamation).
 
 const std = @import("std");
 

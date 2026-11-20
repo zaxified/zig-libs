@@ -59,7 +59,7 @@
 //! slots it is merely stale. A `T` that fits one `std.atomic.Value` (integer,
 //! bool, enum, pointer, optional pointer, at most a word) is one atomic; any
 //! other `T` is stored as its bytes in an array of atomic words, copied word
-//! by word (2026-10-14). Such a read can be torn — words of two laps — but
+//! by word. Such a read can be torn — words of two laps — but
 //! only when the owner has reused the slot, which needs `top` past the
 //! position, so the claim CAS fails and the torn value is dropped. A
 //! successful claim proves every word read was the position's own.
@@ -373,7 +373,7 @@ fn DequeOf(comptime T: type, comptime flavor: Flavor, comptime fault: Fault) typ
             var buf = d.buffer.load(.monotonic);
             if (b - t > @as(isize, @intCast(buf.mask))) {
                 // Cold, and out of line: with growth inlined, `push` was a
-                // call with a full prologue in the owner's loop (2026-10-14,
+                // call with a full prologue in the owner's loop (
                 // deque_owner 1.12× crossbeam).
                 @branchHint(.cold);
                 buf = try d.grow(buf, t, b);

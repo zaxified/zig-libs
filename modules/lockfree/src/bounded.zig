@@ -134,7 +134,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
         /// Pushes refused because the queue was full, striped: producers
         /// spinning on a full ring all refuse, and one shared counter made
         /// their `lock xadd`s fight over a line — `bounded_4x4` 1.0 → 1.2×
-        /// crossbeam (no counter), up to 1.7× (2026-10-14). A refusal adds to
+        /// crossbeam (no counter), up to 1.7×. A refusal adds to
         /// the stripe its thread's stack address picks; `refusedCount` sums.
         refused: [refused_stripes]atomic.CachePadded(std.atomic.Value(u64)) align(atomic.cache_line),
 
@@ -427,7 +427,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
                 // while `head` was read, `t - h` was the length at that read.
                 // That needs the release stores of `tail` and `head` above:
                 // with relaxed ones an arm64 reader saw `head` past the
-                // `tail` it read and `t - h` wrapped (tag 2026-10-06 matrix;
+                // `tail` it read and `t - h` wrapped (found by a CI matrix;
                 // x86's ordered stores hide it).
                 if (q.tail.load(.seq_cst) == t) return @min(q.ordinal(t) -% q.ordinal(h), q.slotCount());
             }

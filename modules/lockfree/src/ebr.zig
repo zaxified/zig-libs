@@ -146,7 +146,7 @@ pub const Participant = struct {
     /// guards): only the outermost pins and only its exit unpins. Touched
     /// only when nesting — whether the participant is pinned at all is its
     /// own `local_epoch`, so the plain pin+unpin pair writes nothing else
-    /// (a depth store there cost it 25 %, 2026-10-14). Single-owner.
+    /// (a depth store there cost it 25 %). Single-owner.
     nested_pins: u32,
     /// Owner-private mirror of "inside a critical section" (`local_epoch !=
     /// unpinned`), so the misuse checks below read a plain field of the
@@ -630,7 +630,7 @@ pub const Domain = struct {
     /// check reads the owner-private `pinned` field, not `local_epoch`: a
     /// load of the `local_epoch` the previous `exitCritical` just stored —
     /// store-forwarded, on the path to the `xchg` — cost +25 % on a pin+unpin
-    /// pair (`epoch_pin` 1.00 → 1.25× crossbeam, 2026-10-14).
+    /// pair (`epoch_pin` 1.00 → 1.25× crossbeam).
     pub fn enterCritical(self: *Domain, p: *Participant) Guard {
         if (p.pinned) @panic(msg_enter_pinned);
         p.pinned = true;
