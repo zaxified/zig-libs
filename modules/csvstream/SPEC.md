@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `encoding/csv`](https://pkg.go.dev/encoding/csv) — **reference** | Go (stdlib) | BSD-3-Clause | — | Go stdlib | "Newlines and commas may be included in a quoted-field" (docs read this run): a quoted field spans physical lines. `LazyQuotes` only tolerates stray/undoubled quotes. This module's default mode always ends a record at `\n`, even inside a quote; the opt-in bounded `.span` mode (2026-09-30) reads multi-line quoted fields. Go's reader also validates field count per record *(inferred)*; here arity is an opt-in helper. |
+| [Go `encoding/csv`](https://pkg.go.dev/encoding/csv) — **reference** | Go (stdlib) | BSD-3-Clause | — | Go stdlib | "Newlines and commas may be included in a quoted-field" (docs read this run): a quoted field spans physical lines. `LazyQuotes` only tolerates stray/undoubled quotes. This module's default mode always ends a record at `\n`, even inside a quote; the opt-in bounded `.span` mode reads multi-line quoted fields. Go's reader also validates field count per record *(inferred)*; here arity is an opt-in helper. |
 | [BurntSushi/rust-csv](https://github.com/BurntSushi/rust-csv) (`csv`) | Rust | MIT OR Unlicense (README: "Dual-licensed under MIT or the UNLICENSE") | 2.0k | pushed 2026-08-04 | Reader/writer with serde deserialization into structs, header handling, flexible/trim options, byte and string records, `csv-core` no-alloc state machine Re-surveyed 2026-10-20 (source of `csv` + `csv-core` read, MIT OR Unlicense verified from LICENSE-MIT/UNLICENSE): reader options `delimiter`, `quote`, `escape`, `double_quote`, `comment`, `terminator` (CRLF / any byte), `flexible`, `trim` (headers/fields/all), `has_headers`, `quoting`; `Position` (byte, line, record), `seek`; writer `QuoteStyle` (Always/Necessary/NonNumeric/Never), `escape`, `double_quote`, `terminator`, `flexible`. |
 | [matthewtolman/zig_csv](https://github.com/matthewtolman/zig_csv) | Zig | MIT | 33 | v0.8.0, pushed 2025-06-12 | Parser + writer: map, column, slice and zero-allocation stream parsers, configurable delimiter/quote/newline, writer for Zig types; targets Zig 0.14/0.15-dev (README read) — not 0.16. |
 | [peymanmortazavi/csv-zero](https://github.com/peymanmortazavi/csv-zero) | Zig | MIT | 32 | pushed 2026-07-29 | Zero-allocation SIMD field iterator over `*std.Io.Reader`, "strict RFC 4180 compliance", LF and CRLF, deliberately no record abstraction (README read). Handles quoted newlines; has no byte offsets *(inferred: not in its feature list)*. |
@@ -42,9 +42,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 unbalanced-quote flagged per line instead of swallowing the file; BOM stripping; a frozen differential
 against Python `csv` and Go `encoding/csv` over 1833 inputs, record offsets and the writer
 (`tools/oracle.py`, Anchoring), documenting every disagreement; multi-line quoted fields as an opt-in with a stated bound on what a stray quote can
-cost (`.span`, 2026-09-30) — the peers span without one. **Where we are behind:** multi-line
-fields are opt-in, not the default; no struct/serde mapping, seek or dialect sniffing (R10–R12);
-the vector search covers event finding only, not a full SIMD tokenizer (R17).
+cost (`.span`) — the peers span without one. **Where we are behind:** multi-line
+fields are opt-in, not the default; no struct/serde mapping, seek or dialect sniffing (R10–R12, *Backlog / deferred*);
+the vector search covers event finding only, not a full SIMD tokenizer (R17, *Backlog / deferred*).
 
 ## Design & invariants
 - **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote, spanned, line_number, record_index }`.
@@ -61,8 +61,10 @@ the vector search covers event finding only, not a full SIMD tokenizer (R17).
   protects the delimiter within a line. **Consequence for the writer:** `writeRecord` can correctly
   emit a valid RFC 4180 multi-line quoted field (embedded `\n`/`\r`), but this module's OWN reader
   cannot re-parse it back into one record in the default mode; `.span` mode (next bullet) reads it.
-- **`.span` mode: multi-line quoted fields, bounded (`QuotedNewlines.span`, 2026-09-30).** Built as the
-  design proposal below had it; the three decisions that made it consistent:
+- **`.span` mode: multi-line quoted fields, bounded (`QuotedNewlines.span`).** An unbalanced quote is genuinely
+  ambiguous (the start of a multi-line field or a stray byte; no local rule tells them apart), and one stray quote in a
+  12.5 M-row file once swallowed ~256 k rows when a consumer spanned lines without a bound; so spanning is opt-in
+  and bounded, and the default stays lazy. Three decisions make it consistent:
   1. *One scanner.* `SpanScanner.scan(bytes, start, at_eof)` decides every record end, and both
      `ChunkReader` (with `at_eof = false`, to cut chunks after the last complete record) and
      `LineIterator` (with `at_eof = true`, to split a cut chunk) call it. Every decision depends only on
@@ -92,9 +94,9 @@ the vector search covers event finding only, not a full SIMD tokenizer (R17).
   csvstream" (see modules/csvsafe/SPEC.md "Threat model / out of scope"), so there was nothing to
   reuse — the quoting logic here is original, std-only, no new module dependency.
 - **`StreamReader.nextFields`** composes `next()` + `splitFields` using the reader's own configured
-  `delimiter`/`quote` (`Options.delimiter`, new), so a caller that wants split fields (not just raw
-  record bytes) no longer repeats the delimiter at every call site. `next()` itself is unchanged and
-  still delimiter-agnostic.
+  `delimiter`/`quote` (`Options.delimiter`), so a caller that wants split fields (not just raw
+  record bytes) does not repeat the delimiter at every call site. `next()` itself is delimiter-agnostic
+  (whole-record bytes only).
 - **Field-buffer overflow is the caller's policy, refusal by default.** A record wider than the
   field buffer is `error.FieldBufferTooSmall` (F2: dropping the surplus in silence is a defect, not
   leniency). `splitFieldsOpts`/`nextFieldsOpts` let a caller choose `.truncate` instead — per call,
@@ -106,188 +108,159 @@ the vector search covers event finding only, not a full SIMD tokenizer (R17).
 - **BOM handling:** `StreamReader.next()` detects and strips a leading UTF-8 BOM (`utf8_bom`) on the
   very first chunk only; the first record's `byte_offset` starts right after the BOM, not at 0. The
   standalone `stripBom` helper covers in-memory callers driving `LineIterator` directly.
-- **Header/coercion/arity are opt-in helpers, not reader integration:** `Header.init` captures an
-  already-split row's fields into owned name→index bookkeeping; `parseInt`/`parseFloat`/`parseBool`
-  (coerce.zig) are thin explicit wrappers with no trimming (fields stay verbatim, per the existing
-  "spaces are preserved" splitFields test); `Header.validateArity`/`validateArity` are a plain
-  length check. None of this is wired automatically into `StreamReader` — reading/skipping a header
-  row, coercing a column, and enforcing arity all remain app policy, same rationale as before.
+- **Header, coercion and arity are opt-in; nothing is applied unless asked.** `Header.init` captures an
+  already-split row's fields into owned name→index bookkeeping, `StreamReader.readHeader` reads the next record as
+  that row (null at EOF; under `fields_per_record = .first_record` it sets the count), and
+  `parseInt`/`parseFloat`/`parseBool` (coerce.zig) are thin explicit wrappers with no trimming (fields stay
+  verbatim, per the "spaces are preserved" `splitFields` test). `Header.validateArity`/`validateArity` are a plain
+  length check; the reader's own policy is `Options.fields_per_record` (below). `StreamReader` never reads a
+  header, trims or coerces a column on its own.
+- **Dialect options, all opt-in; the defaults are the lazy-quote reading above.** The in-memory form is
+  `SplitOptions` (`escape`, `double_quote`, `trim`, `strict` with `diag` for the byte column,
+  `trailing_empty_field`, `on_overflow`), `SpanConfig` (the same dialect plus `comment`, so the record scan closes a
+  quote exactly where the split does) and `LineIterator.initOpts`; `StreamReader.Options` carries them one layer up.
+  - *Comment lines* (`comment`, Go `Comment`, rust-csv `comment`): a record whose first byte is the comment byte is
+    skipped, never a record, and its quotes never open a field; it still counts in `line_number`. It applies only at
+    a record start, so never inside a `.span` quote.
+  - *Trim* (`Trim.leading`, `Trim.all`; Go `TrimLeadingSpace`, rust-csv `Trim`, Python `skipinitialspace`): whitespace
+    is space and tab, never the delimiter itself. `.leading` skips blanks before a field, so ` "a,b"` still opens a
+    quoted field (the `.span` scanner's field-start rule takes the option too); `.all` adds trailing blanks and the
+    blanks between a closing quote and the delimiter. Blanks INSIDE quotes stay: quoting is how a CSV says a blank is
+    data (rust-csv `Trim::Fields` trims them too: a documented divergence).
+  - *Escape* (`escape`, `double_quote`; rust-csv `escape` + `double_quote`, Python `escapechar` + `doublequote`; Go has
+    neither): `escape X` is the literal `X`, only inside quotes; `double_quote = false` stops `""` being an escape, so
+    each quote is judged on its own by the close-or-literal rule. An escape byte equal to `quote` is ignored.
+  - *`strict`* (Go `LazyQuotes = false`, Python `strict`): `error.BareQuote` (a quote inside an unquoted field),
+    `error.ExtraneousQuote` (a quote inside a quoted field followed by neither the delimiter nor the record's end),
+    `error.UnterminatedQuote`. Off by default, for the reason the default-mode bullet gives.
+  - *`trailing_empty_field`* is on by default: `a,b,` is three fields (RFC 4180 reading; the module's own writer
+    round-trips it). `false` keeps the older reading that dropped the final empty field, for files that end every row
+    with a stray delimiter; `countFields` counts the default way.
+  - *Field count* (`Options.fields_per_record`, a `FieldCheck`: `.none`, `.first_record`, `.count`; Go
+    `FieldsPerRecord`, rust-csv `flexible(false)`): `nextFields` refuses a row of another width with
+    `error.FieldCountMismatch`, and `StreamReader.last` names the offending record (`line_number`, `record_index`,
+    `byte_offset`). Rows read with `next()` are not checked. The count is the first row's as split, so under
+    `.truncate` or `trailing_empty_field = false` it is that reading's count; the `.span` scanner's `field_check`
+    always counts the default way.
+  - *Positions:* every `LineSlice` carries `line_number` (1-based, every physical line counted, empty and comment lines
+    included) and `record_index` (0-based, returned records only) next to `byte_offset` (Go `FieldPos`, rust-csv
+    `Position`, Python `line_num`); `spanned` marks a record over more than one line.
+- **Writer options.** `WriteOptions`: `delimiter`, `quote`, `line_terminator` (`.crlf` default, `.lf`), `quote_style`
+  (`.necessary` default, `.always`, `.never`; rust-csv `QuoteStyle`, Python `QUOTE_*`), `escape` (write a quote and the
+  escape byte as `escape` + byte instead of doubling: the writing side of the reader's dialect) and `comment` (a
+  record whose first field starts with the reader's comment byte is quoted, or the reader would skip it; rust-csv
+  does the same). A record that is a single empty field is written as `""`, because bare it would be an empty line that
+  the reader skips (`csv.writer` does the same); `.never` and `quote = 0` still write it bare.
+- **Scanning.** The `.span` scanner and the lazy record cut jump between events (quote, delimiter, newline, escape)
+  with a 32-byte vector search (`line.zig`, scalar tail). `ChunkReader` in lazy mode remembers how many leading
+  buffer bytes are known `\n`-free (`clean`: the residual after a cut, and any buffer a search found no newline in),
+  so a refill searches only the new bytes and every byte is searched once; a refill that finds no record end doubles
+  the next read, so one growing record costs O(M log M). `.span` mode still rescans its residual (*Backlog /
+  deferred*).
 - Reentrant, no shared state, std-only (no C/libc, no new module deps).
 
-## Threat model / out of scope
+## Threat model / Limits
 Not a security boundary — a codec for cooperative/trusted input. Resource bound: bounded memory via
 chunked reads (peak = `max_record_len + chunk_size`, `ChunkReader.capacityBound()`), so an
 arbitrarily large file cannot exhaust memory just by being long; a single pathologically long *line*
 (no `\n`) is refused with `error.RecordTooLong` once it reaches `max_record_len`. Failure mode for malformed
 quoting is a flagged field (`unbalanced_quote`), never a hang or OOB read.
 
+Known limits a caller relies on:
+
+- **Dialect bytes are not validated.** `delimiter == quote`, `escape == delimiter`, `delimiter == '\n'` and
+  `quote == '\n'` do not hang or crash (progress is guaranteed) but mis-parse silently; a caller must not pass them.
+- **A huge `max_quoted_lines` with a huge `max_record_len`** lets hostile input make every line rescan up to the record
+  cap (the look-ahead per stray quote costs up to `min(max_quoted_lines lines, max_record_len)` bytes). Both are the
+  caller's choice and documented on the options.
+- **The writer can emit what the default reader cannot read back as one record**: a field with an embedded `\n`/`\r`
+  is valid RFC 4180, but only `.span` mode reads it as one record (a permanent, documented asymmetry of the default mode).
+
 ## Verification
-`zig build test-csvstream` (headless; Debug + ReleaseFast). `line.zig` carries the
-verbatim oracle tests + `stripBom` tests; `stream.zig` has file/streaming + integration tests
-(offsets index the exact source bytes across a multi-chunk file; a positional re-read proves
-seek-back) + BOM-strip and `nextFields`/delimiter tests; `writer.zig` covers RFC 4180 quoting
-(delimiter/quote/CR/LF triggers, quote-doubling, custom delimiter/quote, `quote == 0` passthrough,
-two positive controls that would fail if quoting/escaping were wrong) plus a file round-trip through
-`StreamReader`; `header.zig` covers `Header` capture/lookup/arity (incl. a ragged short-row case);
-`coerce.zig` covers `parseInt`/`parseFloat`/`parseBool` valid + invalid inputs. `root.zig` is a
-dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ = coerce; }`) so all
-submodules' tests run under a bare re-export.
 
-`csv_spectrum_test.zig` + `csv_spectrum_vectors.zig` drive the vendored `maxogden/csv-spectrum`
-corpus (12 fixtures) through `LineIterator`/`splitFields`, comparing field-by-field against the
-corpus's own expected JSON (never against this module's own output) via an explicit
-header→value adapter (built on `Header`, header.zig), once per mode. A count canary (12 vendored /
-1 out-of-scope / 3 needs-span) fails loudly if the corpus is re-vendored without re-classifying a
-case. Default mode asserts 8 fixtures; `.span` mode asserts 11 (the 8 plus the three multi-line
-ones). The twelfth is out of scope because the corpus's own pair is inconsistent.
+Run `scripts/modtest csvstream` (headless). `root.zig` carries aggregators (`test { _ = line; … }`) so every
+submodule's tests run under a bare re-export.
 
-`.span` mode's own tests (line.zig, stream.zig): the csv-spectrum shapes, CRLF kept inside a field,
-mid-field quotes literal, the IMDb shape (two stray quotes 200 lines apart → 1:1 rows, two flags),
-the exact `max_quoted_lines` bound, `field_check` catching two close stray quotes that the line cap
-lets through, the byte cap and EOF-inside-quote fallbacks, and the chunk-size sweep that holds the
-stream to the in-memory reading.
+- **Unit and integration tests**, by file. `line.zig`: the verbatim oracle cases, `stripBom`, the `.span` scanner and
+  record iterator. `stream.zig`: file/streaming and integration tests (offsets index the exact source bytes across a
+  multi-chunk file; a positional re-read proves seek-back), BOM stripping, `nextFields`/delimiter. `writer.zig`:
+  RFC 4180 quoting (delimiter/quote/CR/LF triggers, quote doubling, custom delimiter and quote, `quote == 0`
+  passthrough, two positive controls that fail if quoting or escaping were wrong) and a file round trip through
+  `StreamReader`. `header.zig`: `Header` capture, lookup and arity, including a ragged short row. `coerce.zig`:
+  `parseInt`/`parseFloat`/`parseBool` valid and invalid inputs. `dialect_test.zig`: hand cases for every dialect
+  rule (escape, `double_quote`, trim, `strict`, comment lines, positions, field-count policy, `readHeader`, writer
+  quote styles). `sweep_test.zig`: the no-panic sweep findings (saturating counters, scan start clamp, chunk size near
+  `maxInt`, no quadratic rescans, `.span` still rescanning its residual).
+- **`.span` mode:** the csv-spectrum shapes, CRLF kept inside a field, mid-field quotes literal, the stray-quote shape
+  (two stray quotes 200 lines apart give 1:1 rows and two flags), the exact `max_quoted_lines` bound,
+  `field_check` catching two close stray quotes that the line cap lets through, the byte cap and EOF-inside-quote
+  fallbacks, and a chunk-size sweep from 1 byte past the file that holds the stream to the in-memory reading.
+- **Oracles:** see *Anchoring*: `oracle_test.zig` (Python `csv` and Go `encoding/csv` over a frozen table, producer
+  `tools/oracle.py`), `oracle_dialect_test.zig` (the same under the matching dialect options,
+  `tools/oracle.py --dialect`), `csv_spectrum_test.zig` (the vendored csv-spectrum corpus, compared with its own
+  expected JSON through a header→value adapter built on `Header`, once per mode; a count canary fails if the corpus is
+  re-vendored without re-classifying a fixture; the twelfth fixture pair is inconsistent upstream and out of scope).
+- **Fuzz** (`CSVSTREAM_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver; `src/fuzz_test.zig`). Harnesses
+  `csvstream-line` (the record iterator), `csvstream-split` (`splitFields`) and `csvstream-dialect` (the dialect
+  options, with the event-jumping scanner checked against a bytewise reference); reach labels are asserted in every
+  test run.
+- **Constant time:** n/a — CSV parsing of cooperative input, no secret.
+- **Bench:** `zig build bench-csvstream` (`tools/bench.zig`, with `tools/go_bench` for the Go side).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-**Audit 2026-10-04 (mutation).** 46 schemata mutants over `splitFieldsOpts` (quoting, doubled
-quotes, the lazy-quote rule, delimiter skip, unescape, overflow policy), `countFields`,
-`freeFields`/`borrowsFrom`, the `.span` scanner (quote at buffer end, escape/close/CRLF
-arms, `max_quoted_lines`, the byte cap, field-start rule, EOF fallback, `field_check` and
-the `.first_record` header), `LineIterator` (escapes, unbalanced flag, CR strip, empty
-records, offsets), `ChunkReader`/`StreamReader` (record cap, capacity bound, offsets, EOF,
-BOM in the span cut and the offsets), the writer's quoting, `Header`/`validateArity` and
-`parseBool`: 42 killed, 4 equivalent, 0 left alive. Equivalent: treating a quote that is the
-last byte of a NON-final buffer as closing (the loop then ends and returns `.incomplete`
-regardless); skipping `""` outside quotes in `LineIterator.next` (only the quote parity at
-the newline is observable, and a pair keeps it); committing the scanner as last scanned in
-`findCut` (`scan` changes state only when it returns a record, and every record is
-committed); `base_offset == 0 or …` in the BOM check (it runs on the first chunk only, whose
-offset is always 0). Tests added for the 6 real gaps: a closing quote before CRLF in `.span`,
-`.first_record` skipping a leading blank line, `freeFields` freeing a copy that sits right
-after the record (bump allocator), long rows failing both arity checks, bytes appended after
-`init` being read (EOF only from a 0-byte read), and a quote right after a leading BOM in a
-`.span` stream cut into 8-byte reads.
+## Performance
+
+The bench is `zig build bench-csvstream` against Go `encoding/csv` (`ReuseRecord`, `LazyQuotes`); rows: narrow
+numeric, wide text, every field quoted, multi-line `.span`, in-memory `LineIterator` + `splitFields`, writer. The
+card's Performance line holds the figures (the card is authoritative).
+
+## What is deliberately not done
+
+Ids are those of the scope survey; the card's Scope line cites them.
+
+- **Custom record terminator and multi-byte delimiter (R13).** The `\n` record boundary is the module's chunk-cut and
+  safe-resync design; a bare-CR file is re-terminated by the caller (or read with `.span`, where CR stays inside the
+  field). The delimiter stays one byte; a UTF-8 multi-byte delimiter is rare. (rust-csv `Terminator::Any`, Python bare
+  `\r`, Go `Comma` as a rune.)
+- **A push-parser DFA over arbitrary partial buffers (R14).** `ChunkReader` + `StreamReader` already bound memory over
+  any `std.Io.Reader`; a resumable DFA (csv-core `read_record`) would duplicate the span scanner.
+- **Input transcoding (R15).** Compose with the sibling `encoding` module; Python, Go and rust-csv also do it through
+  wrapper readers.
+- **Writer conveniences (R16, Go `WriteAll`/`Flush`).** `std.Io.Writer` owns buffering and flush; `writeRecord` per row
+  is the API.
+- **`QuoteStyle.NonNumeric`** (rust-csv, Python `QUOTE_NONNUMERIC`): it needs a caller-supplied "is number" hint, so
+  `quote_style` ships `.necessary`, `.always` and `.never`.
 
 ## Backlog / deferred
-- **Delta mutation 2026-11-19 (lazy newline-search resume,** 8 mutants over `findCut`, the drop and the `scanned` counter, ReleaseSafe, strict verdict): 5 killed, 2 equivalent (`clean = tail_len + 1` after a drop: the first search after a drop always sees only the newline-free residual and resets `clean` to its length; the `@min(clean, len)` clamp: `clean <= len` always), 1 unobservable (the `scanned` diagnostic counter in `.span` mode, which would need a hand-summed pin of the buffer lengths). Tests added for survivors: exact chunk lists where the newline is the first byte of a refill or follows the residual, and `.span` still rescanning. Counts on the card are cumulative with the 2026-10-04 run.
 
-- **Refill rescans, what remains (no-panic sweep GN, 2026-10-30).** ✅ Lazy half DONE 2026-11-19: `ChunkReader.clean` remembers how many leading buffer bytes are known `\n`-free (the residual after a cut, and any buffer a search found no `\n` in), so a refill searches only the new bytes; every byte is searched once (`scanned` is now the bytes read, pinned by the sweep test), reads and cuts are unchanged. Open, argued: **`.span` mode still rescans the residual from its first byte** after every refill. The scanner is not resumable mid-record: `scan` returns `.incomplete` without its position inside a quoted field, the pending stray-quote look-ahead (`max_quoted_lines`) or a field check, and a resume would have to snapshot and validate that state against bytes appended later (a closing quote or newline arriving after the look-ahead gave up changes the verdict of bytes already scanned). That is a new scanner API, not a local change. The doubling reads (sweep GN) keep one growing record at O(M log M).
-- **`max_quoted_lines` huge (GN fix review).** The look-ahead per stray quote costs up to `min(max_quoted_lines lines, max_record_len)` bytes, so `max_quoted_lines = 1 << 20` with a file of lines like `"a` and a 10 MiB `max_record_len` rescans up to the record cap for every line. Caller-chosen and documented on the option; a fix would remember "no closer before X" per chunk.
-- **Per-field forced quoting in `writeField` (dataframe D3, 2026-11-07).** `WriteOptions.quote_style = .necessary` leaves an empty field bare, so a writer cannot tell an empty *text* (`""`, polars' `write_csv`) from a null on the wire without writing the two quote bytes itself (`dataframe/src/csvio.zig` `writeEmptyQuoted`, comment `zig-libs request: csvstream`). Ideal: a `force_quote: bool` in `WriteOptions` (or a `writeFieldQuoted`), honouring `.never` and `quote == 0` as today.
-- **Dialect options are not validated (GN fix review).** `delimiter == quote`, `escape == delimiter`, `delimiter == '\n'`, `quote == '\n'` do not hang or crash (progress is guaranteed) but mis-parse silently. Rejecting them needs a new error in `StreamReader.init`'s set; deferred.
-
-### Scope parity gap list (S2 re-survey 2026-10-20)
-
-Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
-deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources read:
-Go `encoding/csv` (BSD-3, stdlib; docs), rust-csv `csv` + `csv-core` (MIT OR Unlicense, source
-cloned 2026-10-20), Python `csv` (PSF, docs). The build-tool consumer column: what the build-tool consumer actually imports (verified with
-`rg`: only `LineIterator`, `LineSlice`, `ChunkReader`, `splitFields`, `splitFieldsOpts`; the build-tool consumer does its own
-header / quote / decimal / encoding policy on top, so none of the R items is a build-tool consumer need unless stated).
-Our existing features that already match the field: delimiter + quote bytes, borrowed (zero-copy,
-reuse-by-design) records, multi-line quoted fields (`.span`), lazy quotes, BOM, byte offsets, arity
-check, writer with CRLF/LF, header lookup.
-
-| # | Feature | Who has it | Effort | Recommendation | Consumer |
-|---|---|---|---|---|---|
-| R1 | Comment lines (`Comment` char: a line starting with it is skipped) | Go `Comment`; rust `comment(Some(b))` + csv-core; not Python | S | **DONE 2026-10-20** — do (reader option on `LineIterator`/`StreamReader`; must not apply inside a `.span` quote) | no |
-| R2 | Trim whitespace around fields (`TrimLeadingSpace`; rust `Trim::{Fields,Headers,All}`; Python `skipinitialspace`) | Go, rust, Python | S-M (a leading space before an opening quote must still open the quoted field, so the span scanner's field-start rule needs the option too) | **DONE 2026-10-20** — do (leading + trailing, `SplitOptions.trim`) | no (the build-tool consumer trims at access time) |
-| R3 | Separate escape char (`\"` dialects) and `doublequote = false` (reader) | rust `escape` + `double_quote`; Python `escapechar` + `doublequote`; csv-core; not Go | M (scanner, `splitFields`, `LineIterator`, span scanner) | **DONE 2026-10-20** — do (already open backlog item, now every competitor but Go has it) | no |
-| R4 | Writer quote styles: Always / Necessary (today) / NonNumeric / Never | rust `QuoteStyle`; Python `QUOTE_ALL/NONNUMERIC/NONE/STRINGS/NOTNULL`; Go: Necessary only (+ it also quotes a field with a leading space, verify against ours) | S | **DONE 2026-10-20** as `WriteOptions.quote_style` (necessary/always/never; NonNumeric not built, it needs a caller "is number" hint) — do (`WriteOptions.quoting`; `NonNumeric` needs a caller-supplied "is number" hint, so ship Always/Necessary/Never first) | no |
-| R5 | Writer escape char / `doublequote = false` | rust, Python; not Go | S after R3 | **DONE 2026-10-20** — do together with R3 | no |
-| R6 | Strict parse errors with position: bare quote in a non-quoted field, extraneous/missing quote (Go `ErrBareQuote`/`ErrQuote` when `LazyQuotes` is off; Python `strict`) | Go (default), Python | S-M (reader option `strict`; the flag `unbalanced_quote` exists, but a bare quote mid-field is silently literal) | **DONE 2026-10-20** — do (opt-in `strict`, default stays lazy, same rationale as the default-mode deviation) | no |
-| R7 | Field-count enforcement in the reader (Go `FieldsPerRecord` 0 / n / -1; rust `flexible(false)` is the default and errors `UnequalLengths`) | Go, rust | S (`FieldCheck` exists but is only the `.span` fallback heuristic; add `error.FieldCountMismatch` as a reader policy, with record number) | **DONE 2026-10-20** — do | no (the build-tool consumer validates arity itself) |
-| R8 | Position API beyond the byte offset: line number, record number, column (Go `FieldPos`/`InputOffset`; rust `Position{byte,line,record}`; Python `line_num`) | Go, rust, Python | S (`LineSlice` gets `line`/`record`; both already derivable from the scanner) | **DONE 2026-10-20** — do | no |
-| R9 | Header row integrated into the reader (rust `has_headers`/`headers()`/`set_headers`; Python `DictReader`/`DictWriter` field names) | rust, Python | S (`StreamReader.readHeader()` returning a `Header`, optional; today `Header.init` over a manual first row) | **DONE 2026-10-20** — do | no |
-| R10 | Typed record to/from struct (rust serde `deserialize`/`serialize`; Go third-party `gocsv`/`csvutil`; Python `DictReader` is the dict analogue) | rust (first-class), Go (3rd party) | M (comptime reflection over `nextFields` and `writeRecord`, `Header` column names, `coerce`) | do-later (existing item; real value but not needed for parity with Go's stdlib) | no |
-| R11 | Seek / resume at a position (rust `Reader::seek(Position)`) | rust | S (`StreamReader.seekTo(byte_offset)` on a record start; offsets are already absolute and tested via positional re-read) | do-later | no |
-| R12 | Dialect sniffing (delimiter, quote, header guess) | Python `Sniffer`; DuckDB-style tools | M | do-later (nobody in the Go/Rust core does it; heuristic, off the parity path) | no |
-| R13 | Custom record terminator (rust `Terminator::Any(b)`; Python bare `\r`; csv-core) and multi-byte delimiter (Go `Comma` is a rune) | rust, Python, Go | M (record boundary = `\n` is what makes every chunk cut safe) | not-doing, reason: the `\n` record boundary is the module's chunk-cut and safe-resync design; a bare-CR file is re-terminated by the caller (or read with `.span` where CR stays inside the field). Delimiter stays one byte; a UTF-8 multi-byte delimiter is rare | no |
-| R14 | Incremental push parser over arbitrary partial buffers with no line guarantee (csv-core `read_record` state machine) | csv-core only | L | not-doing, reason: `ChunkReader` + `StreamReader` already bound memory over any `std.Io.Reader`; a resumable DFA duplicates the span scanner | no |
-| R15 | Input transcoding (UTF-16/Latin-1 CSV): Python via `open(encoding=)`; Go/rust through wrapper readers | all via composition | S | not-doing, reason: compose with the sibling `encoding` module (the build-tool consumer does, in `pipeline.zig`) | indirectly |
-| R16 | Writer conveniences: `WriteAll`, `Flush` | Go | -- | not-doing, reason: `std.Io.Writer` owns buffering and flush; `writeRecord` per row is the API | no |
-| R17 | SIMD/accelerated scanning (zsv, csv-zero, simdcsv-style) | zsv (C, MIT), csv-zero (Zig) | M-L | partly DONE 2026-10-20 (32-byte vector event search in the `.span` scanner, the lazy record cut and quoted fields: multiline 2.37→0.89×, quoted 1.27→0.64× Go) — do-later, speed row (see P bench) | speed only |
-
-Already done or deliberately excluded earlier (kept for the record): configurable delimiter, BOM,
-header capture, coercion, writer, arity helper, multi-line quoted fields (`.span`), trailing-empty-field
-(RFC 4180), the frozen Python/Go differential.
-
-**P bench proposal.** Reference = Go `encoding/csv` (the Scope reference; `ReuseRecord = true`,
-`LazyQuotes = true` to match our reading, rows read to the end, field bytes touched so nothing is
-optimised away), fastest = `zsv` (C, MIT; build from a pinned clone under `.zig-cache`, link a
-~40-line `c_bench/driver.c` against `libzsv`, pattern `modules/decimal/tools/mpdec_bench`) and, if its
-dependencies resolve offline, rust `csv`/`csv-core` (a `rust_bench` crate with a path dependency on a
-pinned clone). Go side follows `modules/tz/tools/go_bench` (`go.mod` + `main.go`, stdlib only, `GOPROXY=off`).
-Rows (generate the data once with a seeded script, same file for all): (1) narrow numeric 10 cols x 1 M
-rows, no quotes; (2) wide text 100 cols x 100 k rows; (3) quote-heavy (every field quoted, 10 % with
-doubled quotes); (4) multi-line quoted fields (`.span` vs Go; zsv/rust where they span); (5) in-memory
-`LineIterator` + `splitFields` (no I/O) vs file-backed `StreamReader` (shows the chunk cost);
-(6) writer: 1 M records QUOTE_MINIMAL vs Go `csv.Writer` / rust `csv::Writer`. Metric = MB/s, min of 5,
-ReleaseFast, 4 threads not involved (single reader). Ratios go on the `**Performance:**` line.
-
-From README "Deferred (not implemented in v1)", now trimmed to what's still actually deferred:
-
-- ~~**Distinct quote-vs-escape char.**~~ DONE 2026-10-20 (R3/R5: `SplitOptions.escape` +
-  `double_quote`, `SpanConfig`, `WriteOptions.escape`).
-- ~~**Strict RFC 4180 opt-in, remaining half:** (b) a trailing delimiter emitting a final empty
-  field.~~ DONE 2026-10-05 as `SplitOptions.trailing_empty_field`, the DEFAULT the same day (a row
-  whose last value is empty read as a short row; the writer did not round-trip). `false` keeps the
-  old reading.
-- ~~**Differential oracle for `.span` mode**~~ DONE 2026-10-05 (Anchoring).
-
-Implemented this round (previously listed here as deferred): configurable delimiter at the
-`StreamReader` level (`Options.delimiter` + `nextFields`), BOM detection/stripping (`stripBom`,
-automatic in `StreamReader.next`), header-row capture (`Header`), typed field coercion
-(`parseInt`/`parseFloat`/`parseBool`), CSV writing (`writeField`/`writeRecord`, RFC 4180 quoting-on-
-output), and field-count/arity validation (`Header.validateArity`/`validateArity`).
-
-- ~~**Multi-line quoted fields — design proposal (2026-09-30)**~~ — **DONE 2026-09-30** as `.span` mode
-  (see "Design & invariants"); the proposal is kept below as the record of why. The build-tool consumer's K6 switch
-  `csv_multiline_quotes` maps to `StreamReader.Options.quoted_newlines = .span` (+ `field_check =
-  .first_record`). Proposal, as written before the build: replacing the survey item of the
-  same day. The build-tool consumer tracks the consumer side as roadmap K6 ("opt-in `csv_multiline_quotes`").
-  **Why it has looked unsolvable.** Three things collide:
-  1. **Chunk boundaries.** Every `\n` being a record boundary is what lets `ChunkReader` cut a
-     chunk at its last `\n` without parsing.
-  2. **Ambiguity.** An unbalanced quote is genuinely ambiguous: it is either the start of a
-     multi-line field or a stray byte, and no local rule tells them apart.
-  3. **Silent row loss.** The one time the build-tool consumer spanned lines, IMDb `title.basics.tsv` (12.5 M rows,
-     2 stray quotes 255 866 lines apart) lost ~256 k rows silently, and the open quote grew the
-     buffer without bound. Lazy quotes (2026-06-04) fixed that by giving up spanning.
-
-  **Proposal: spanning as an opt-in mode here, the policy switch in the consumer.**
-  - *Where.* The capability goes here, not in the build-tool consumer. The parser and `ChunkReader` live in this
-    module, every competitor (Go `encoding/csv`, Python `csv`, rust-csv, both Zig peers) reads
-    such fields, and a second parser in a consumer is the dual-parser anti-pattern the build-tool consumer already
-    removed once. The build-tool consumer exposes it as the config switch `csv_multiline_quotes` (K6). The default
-    stays lazy quotes, which is the build-tool consumer's safety choice and this module's default.
-  - *API.* `Options.quoted_newlines: enum { end_record, span } = .end_record`, honoured by
-    `LineIterator`, `ChunkReader` and `StreamReader`.
-  - *Chunking in `.span` mode.* `ChunkReader` carries the quote state across chunks and cuts at
-    the last newline that lies **outside** quotes: a forward scan (memchr for `"` and `\n`)
-    instead of `lastIndexOfScalar`. This costs no parallelism, because chunks are cut serially
-    today anyway; the build-tool consumer's workers evaluate records inside chunks that are already cut
-    (`pipeline.zig`).
-  - *Resolving the ambiguity: bounded lookahead with a local fallback.* A quoted field may
-    span at most `max_quoted_lines` physical lines (default e.g. 64) and at most
-    `max_record_len` bytes. If the closing quote is not found within that bound, the opening
-    quote is declared stray: the record is re-read under the lazy rule and flagged
-    `unbalanced_quote`, and a warning is emitted. The damage an unbalanced quote can do is then
-    capped at one record's look-ahead, never 256 k rows, and memory stays bounded.
-  - *Second check.* When a `Header` is known, a spanned record whose field count differs from
-    the header's also falls back to the lazy reading. The build-tool consumer found that a field-count check alone
-    does not catch a merge, but together with the line cap it rejects the re-balanced pair that
-    fooled it.
-  - *Tests.* The IMDb shape (two stray quotes far apart) must give 1:1 rows plus 2 warnings in
-    `.span` mode, as it does in `.end_record` mode. csv-spectrum's multi-line cases must pass in
-    `.span` mode. Chunk-boundary tests must put the embedded newline exactly at a chunk edge.
-  - *Effort:* M (a quote-aware boundary scan, the bounded span in `LineIterator`, the fallback),
-    not a parser rewrite: the lazy path stays the default and is untouched.
-- **Serde-style record → struct mapping** *(survey 2026-09-30)*: rust-csv and Go csv libraries
-  (`gocsv`, `csvutil`) deserialize rows into structs; here `Header` + `parseInt`/`parseFloat` are
-  manual. Effort M (comptime struct reflection over `nextFields`). Fits §2.
-
-## Status
-`extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **Serde-style record → struct mapping (R10).** rust-csv (serde) and Go libraries (`gocsv`, `csvutil`) deserialize rows
+  into structs; here `Header` + `parseInt`/`parseFloat` are manual. Effort M: comptime struct reflection over
+  `nextFields`, `writeRecord`, `Header` column names and `coerce`. Fits the module's role; not needed for parity with
+  Go's standard library.
+- **Seek / resume at a position (R11, rust-csv `Reader::seek`).** Effort S: `StreamReader.seekTo(byte_offset)` on a
+  record start; offsets are already absolute and tested via a positional re-read.
+- **Dialect sniffing (R12, Python `Sniffer`).** Effort M; heuristic, off the parity path (neither Go's nor rust's
+  core does it).
+- **A full SIMD tokenizer (R17).** Only event finding is vectorised (see *Design & invariants*); the zsv and csv-zero
+  style tokenizers are not. A speed row, not a parity one.
+- **Speed against the fastest in the field.** The card's `fastest` is not measured. Plan: `zsv` (C, MIT; a pinned clone
+  built under `.zig-cache`, a ~40-line driver linked against `libzsv`, pattern `modules/decimal/tools/mpdec_bench`) and,
+  if its dependencies resolve offline, rust `csv`/`csv-core` (a path dependency on a pinned clone), on the same
+  seeded files as the Go rows; metric MB/s, min of 5, ReleaseFast, single reader.
+- **`.span` mode rescans its residual from the first byte after every refill.** The scanner is not resumable
+  mid-record: `scan` returns `.incomplete` without its position inside a quoted field, the pending stray-quote
+  look-ahead (`max_quoted_lines`) or a field check, and a resume would have to snapshot and validate that state
+  against bytes appended later (a closing quote or newline arriving after the look-ahead gave up changes the verdict of
+  bytes already scanned). That is a new scanner API, not a local change.
+- **A smarter stray-quote look-ahead for a huge `max_quoted_lines`.** A fix would remember "no closer before X" per
+  chunk, so the per-line rescan stops at the first known-open point (see *Threat model / Limits*).
+- **Per-field forced quoting in `writeField`.** `WriteOptions.quote_style = .necessary` leaves an empty field bare, so a
+  writer cannot tell an empty *text* (`""`, polars' `write_csv`) from a null on the wire without writing the two
+  quote bytes itself (the dataframe module's CSV I/O does, marked `zig-libs request: csvstream`). Ideal: a
+  `force_quote: bool` in `WriteOptions` (or a `writeFieldQuoted`), honouring `.never` and `quote == 0` as today.
+- **Reject nonsensical dialect bytes in `StreamReader.init`** (`delimiter == quote`, `escape == delimiter`, a newline
+  as delimiter or quote; see *Threat model / Limits*). Needs a new error in `init`'s set.
 
 ## Anchoring
 
@@ -308,11 +281,3 @@ as the fields, and this module must read its own output back. Plus src/csv_spect
 vendored maxogden/csv-spectrum corpus (src/testdata/csv-spectrum), 8 of 12 pairs asserted and 4
 declared out of scope, one of which is broken upstream. Self only: `StreamReader`/`ChunkReader`
 chunk boundaries (held to the in-memory record model by the module's own tests), `Header`, `coerce`.
-
-**How it got there.** DONE 9ca8ed7: csv-spectrum 8/12 asserted, 1 fixture is itself broken
-upstream. 2026-09-17: a three-reader comparison over 146 one-line vectors, measured but not frozen.
-2026-10-05: the frozen Python/Go oracle above, which also covers `.span` mode and the writer. It found
-the module's own writer and reader disagreeing: `writeRecord(["a","b",""])` writes `a,b,`, which the
-reader read back as two fields (the trailing-delimiter deviation). `SplitOptions.trailing_empty_field`
-is the RFC 4180 reading, and the default since the same day; `countFields` (and with it `.span`
-mode's arity check) counts the same way.

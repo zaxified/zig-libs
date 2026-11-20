@@ -22,7 +22,8 @@ observed behaviour, exempt per root `NOTICE` §0; no third-party corpus is repro
 
 ## Two layers, one record model
 
-Both layers emit the same `LineSlice { bytes, byte_offset, unbalanced_quote }`.
+Both layers emit the same `LineSlice { bytes, byte_offset, unbalanced_quote, spanned,
+line_number, record_index }`.
 
 ### In-memory (standalone) — you already hold the bytes
 
@@ -78,12 +79,12 @@ every chunk ends on a `\n`, no record spans a chunk boundary, so offsets compose
 cleanly. `ChunkReader` is exposed too, for callers who want the raw record-
 aligned chunks (e.g. to hand each block to a parallel worker).
 
-`StreamReader.Options.delimiter` (new) is threaded through to
+`StreamReader.Options.delimiter` is threaded through to
 `StreamReader.nextFields(buf, alloc)` — a convenience that does `next()` +
 `splitFields` in one call, using the reader's own configured
 delimiter/quote, so callers who want split fields don't repeat the delimiter
 at every call site. `next()` itself stays delimiter-agnostic (whole-record
-bytes only), unchanged.
+bytes only).
 
 A leading UTF-8 BOM is detected and stripped automatically on the first
 chunk of `StreamReader.next()`; the standalone `stripBom(bytes)` covers
@@ -101,18 +102,16 @@ try csv.writeRecord(&w, &.{ "alice", "hello, world", "30" }, .{});
 `writeField`/`writeRecord` quote a field only when it actually contains the
 configured delimiter, quote char, CR, or LF, doubling any embedded quote char
 (RFC 4180 §2 rule 7). `WriteOptions` configures `delimiter`, `quote` (`0`
-disables quoting, mirroring the reader's convention), and `line_terminator`
-(`.crlf` — the RFC 4180 default — or `.lf`). Stateless and streaming to any
+disables quoting, mirroring the reader's convention), `line_terminator`
+(`.crlf` — the RFC 4180 default — or `.lf`), `quote_style`, `escape` and
+`comment` (see "Dialect options"). Stateless and streaming to any
 `*std.Io.Writer`, same style as the sibling `csvsafe` module's `writeSafe`.
 
 Note: a writer-emitted field with an embedded `\n`/`\r` is valid RFC 4180, but
 this module's own reader cannot re-parse it back into one record (see
 "Quoting semantics" below) — that's a permanent, documented asymmetry, not a
-bug. ⚠ It was described here as *the* asymmetry; a second one was not
-documented at all and was pinned as correct by the writer's own test — a
-single empty field was written unquoted, i.e. as an empty line, which the
-reader then skips. That one **was** a bug and is fixed: `writeRecord(&.{""})`
-emits `""`, the way `csv.writer` does and for the same reason.
+bug. A record that is a single empty field is written as `""` (not as an empty
+line, which the reader skips), the way `csv.writer` does.
 
 ## Header-row handling (opt-in)
 
@@ -127,8 +126,9 @@ const name = header.get(row_fields, "name"); // ?[]const u8
 try header.validateArity(row_fields); // error.FieldCountMismatch if ragged
 ```
 
-Not wired into `StreamReader` automatically — capturing (or skipping) the
-header row stays app policy; `Header` just holds the name→index bookkeeping.
+`StreamReader.readHeader(&buf, alloc)` reads the next record as the header row
+(see "Dialect options"); `StreamReader` never reads or skips a header on its own,
+and `Header` just holds the name→index bookkeeping.
 
 ## Typed field coercion (opt-in)
 
@@ -211,12 +211,11 @@ while (sr.nextFields(&buf, arena) catch |e| {
 
 ## Tests
 
-`zig build test-csvstream` (headless; green in Debug and
-`-Doptimize=ReleaseFast`). Tests span `line.zig` (verbatim oracle cases
+`zig build test-csvstream` (headless; Debug and `-Doptimize=ReleaseFast`). Tests span `line.zig` (verbatim oracle cases
 + `stripBom`), `stream.zig` (file/streaming + integration, incl. BOM-strip and
 `nextFields`/delimiter), `writer.zig` (RFC 4180 quoting incl. two positive
 controls + a file round-trip through `StreamReader`), `header.zig` (`Header`
-capture/lookup/arity), and `coerce.zig` (typed parsing). `root.zig` carries a
+capture/lookup/arity), and `coerce.zig` (typed parsing), plus `dialect_test.zig` and `sweep_test.zig`. `root.zig` carries a
 dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ =
 coerce; }`) so all submodules' tests run — a bare re-export would not pull them
 in.
@@ -228,13 +227,11 @@ through the vendored `maxogden/csv-spectrum` acid-test corpus
 three extra ones have multi-line quoted fields); the twelfth has an internally
 inconsistent fixture pair. See NOTICE for provenance.
 
-## Deferred (not implemented)
+## Not provided
 
-One item remains deliberately out of scope (multi-line quoted fields are
-now the opt-in `.span` mode above):
-
-- ~~Distinct quote-vs-escape char~~ — done 2026-10-20, see "Dialect options".
-
-Everything else previously listed here (configurable delimiter, header-row
-handling, typed field coercion, CSV writing, BOM handling, field-count
-validation) is now implemented — see the sections above.
+A custom record terminator and a multi-byte delimiter, a push-parser DFA, input
+transcoding (compose with the `encoding` module), writer `NonNumeric` quoting, and
+reading quoted newlines by default (`.span` is the opt-in) are refused by design;
+struct/serde mapping, seek, dialect sniffing and a full SIMD tokenizer are open
+items. The reasons and the open items are in `SPEC.md`, *What is deliberately not done*
+and *Backlog / deferred*.
