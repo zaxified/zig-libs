@@ -4,9 +4,8 @@
 //! constant-time — read the boundary, do not round it up" section, as an
 //! actual committed program instead of a claim nobody re-runs. Run it through
 //! `zig build ctgrind -Dctgrind-module=bfv -Dctgrind-valgrind=…` plus
-//! `valgrind --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no
-//! per-module TARGETS/MODES/PATTERN/LABEL entry for `bfv` yet; the suggested
-//! lines are at the bottom of this comment for the coordinator to paste in.
+//! `valgrind --tool=memcheck` by hand, or through `scripts/checks/ctgrind.sh bfv`
+//! (expected rows in `scripts/checks/ctgrind-expected.tsv`).
 //!
 //! NOT wired into `zig build test-bfv`: memcheck's context count is
 //! valgrind's own output, not something a Zig test can assert on. `zig build
@@ -192,24 +191,6 @@
 //! formatting, `linux.zig`'s `errno` off the `writev` syscall) fired
 //! non-zero, confirming the taint reached the printed value in all three
 //! runs.
-//!
-//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
-//!
-//! ```
-//! TARGETS[bfv]="keygen encrypt decrypt"
-//! MODES[bfv]="ReleaseFast"
-//! # Random.zig: sampleUniform's rejection-based draw for the PUBLIC `a` --
-//! # named rather than left `unattr` because this harness's whole-stream
-//! # entropy taint cannot separate it from s/e's draws (see "Measured" above).
-//! PATTERN[bfv/keygen]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig|Random[.]zig'
-//! PATTERN[bfv/encrypt]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig'
-//! # udivmod.zig: the u128 rescale division compiler_rt supplies -- SPEC.md's
-//! # own "decrypt branches on reconstructed coefficient values", now measured.
-//! PATTERN[bfv/decrypt]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig|udivmod[.]zig'
-//! LABEL[bfv/keygen]='bfv keyGen: ternary/uniform samplers + ring arithmetic'
-//! LABEL[bfv/encrypt]='bfv encrypt: tainted plaintext through scaledPlaintext+ring mul'
-//! LABEL[bfv/decrypt]='bfv decrypt: tainted secret through ring mul + CRT reconstruct'
-//! ```
 
 const std = @import("std");
 const builtin = @import("builtin");
