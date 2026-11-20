@@ -47,7 +47,7 @@ Grammar: `[-]?d{1,3}(<thousands>d{3})+(<decimal>d+)?`
   trailing characters) or when the normalized value is out of the `decimal`
   range.
 
-## `parse` — any locale's grouping, signs, percent (2026-10-04)
+## `parse` — any locale's grouping, signs, percent
 
 ```zig
 const cs = numparse.locale("cs").?;                     // group U+00A0, decimal ','
@@ -65,27 +65,19 @@ numparse.parse("12.5%", o);                             // → 0.125
 Separators are UTF-8 slices; `lenient_spaces` accepts any space-like spelling for a space-like
 separator (one spelling per number). Refused on purpose: a grouped number starting with `0`, `5.`,
 an exponent after a grouped number, two signs. Checked against Babel's strict `parse_decimal` on
-5 452 cases over 25 CLDR locales (`tools/babel-oracle.py`). The legacy `parseGroupedNumber` below
-is unchanged.
+11 092 cases over every sampled CLDR locale, in Latin and native digits (`tools/babel-oracle.py`).
+`localeNative(name)` reads the locale's own numbering system (`ar_EG` → Arabic-Indic digits).
+`parsePrefix(s, opts)` reads a number off the front of longer text and returns the value and the bytes
+it took (`"1,234.56 USD"` → 1234.56, 8); a digit run is never cut. The legacy `parseGroupedNumber`
+above is unchanged.
 
-## Implementation notes
+## Not provided
 
-Semantics (grammar, strictness) are preserved exactly. Two mechanical
-adaptations from an earlier design iteration:
-
-- The final re-parse targets the `decimal` module. Its `parse`
-  returns an error union, so a malformed or
-  out-of-range normalized string maps back to `null` via `catch null`.
-- Parameters renamed `thousands`/`decimal` → `thousands_sep`/`decimal_sep`
-  (avoids colliding with the `decimal` dependency name).
-
-## Deferred
-
-Currency symbols, CJK 4-digit myriad grouping, non-Latin digits, and full
-CLDR locale coverage (25 locales are built in). See `SPEC.md`.
+Currency symbols, likely-subtag resolution of unknown locale names, CJK myriad grouping, native and prefix
+percent signs: see SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 
 ```
-zig build test-numparse
+scripts/modtest numparse   # or: zig build test-numparse
 ```

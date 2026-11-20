@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-10-29 · mutation 2026-11-07 (48/59, 11 eq) · src 819121b2841331d9
 
-Audit detail: Mutation delta 2026-11-07 (commits `e042ea5b`, `8012bc70`, `eb5a7dd0`: `parsePrefix`, `digitAt`, `max_digits`; schemata, ReleaseSafe, the `parsePrefix` tests): 26 mutants, 18 killed, 8 equivalent. Equivalent: the two empty-separator guards (`parse` refuses the same options first, the guard only saves up to ~500 tries), the `catch return null` for a zero past U+10FFFF (no input byte sequence is a digit of it, the loop returns null anyway), the unbounded `end = s.len` (same result, only more work), and four slack terms of the byte cap `96 * (digit_bytes + sep_bytes) + 32` (the digit-width flip, the digit term dropped, the `3` floor, the `+ 32`; the separator term is not slack and its mutants die): `Decimal` takes at most ~60 digits (measured: 27 integer digits leave 33 for the fraction, a 59-digit fraction after `0.`), so a valid number needs at most 60 digits of at most 4 bytes plus ~10 separators, below each reduced cap for any separator length. Killed by two added test blocks: U+066A right after the last Arabic-Indic digit is no digit, an invalid lead byte (0xff, 0x80) after a number, a zero whose last UTF-8 byte is 0x80 (U+1040), and a 100-byte group separator (past `96 * 4 + 32` bytes; kills the `min` and digit-only caps).
-
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — number parsing (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: no data-reachable panic; empty, 1 MiB and hostile input over the option grid and every CLDR row pinned by tests)
 
 **Performance:** ref 0.007–0.04× Babel 2.17.0 `parse_decimal(strict)` (python 3.14; `zig build bench-numparse`, six workloads of 1000 lines incl. refusals and native digits) · fastest 0.109× ICU4C 78.2 DecimalFormat::parse (worst workload ar_EG_native; the others 0.065–0.084) (measured 2026-10-23)
@@ -28,119 +26,111 @@ the zig-libs authors (MIT).
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Scope re-assessed 2026-10-04 after `parse(s, Options)` and the CLDR locale presets were built (table rows not re-fetched).
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Table rows not re-fetched since.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [python-babel/babel](https://github.com/python-babel/babel) `numbers.parse_decimal` — **reference** | Python | BSD-3-Clause | 1.5k | v2.18.0 (2026-02-01) | Docs verified: locale by name (`en_US`, `de`, `ru`, `ar_EG`), accepts `'12 345,123'` under `ru`, other numbering systems (`٬`/`٫`), raises `NumberFormatError`. This module: two hard-wired conventions, single-byte separators. |
+| [python-babel/babel](https://github.com/python-babel/babel) `numbers.parse_decimal` — **reference** | Python | BSD-3-Clause | 1.5k | v2.18.0 (2026-02-01) | Docs verified: locale by name (`en_US`, `de`, `ru`, `ar_EG`), accepts `'12 345,123'` under `ru`, other numbering systems (`٬`/`٫`), raises `NumberFormatError`. This module: `locale(name)` gives every CLDR locale Babel knows, with UTF-8 (multi-byte) separators and the locale's native digits (`localeNative`). |
 | [unicode-org/icu](https://github.com/unicode-org/icu) `NumberFormat` | C++ / Java | Unicode-3.0 (`LICENSE`: "UNICODE LICENSE V3") | 3.6k | release-78.3 (2026-03-17) | The model named in the source comments: full CLDR locale data, currency, percent, exponent, non-3 grouping *(inferred; docs not read this run)*. |
 | Zig `std.fmt.parseFloat` / `parseInt` | Zig | MIT | — | Zig 0.16.0 | Ungrouped plain numbers only (`lib/std/fmt.zig`, `fmt/parse_float.zig`); no separators. Returns binary `f64`, not an exact decimal. |
 | sibling `decimal` (`Decimal.parse`) | Zig | MIT | — | this repo | Plain and scientific notation, exact; the ungrouped half of the job, which this module deliberately hands back to it. |
 
-**Where we are ahead:** exact `Decimal` result (no `f64` step) with an allocation-free single scan and a strict shape — `2025,06,01`, American text read under European separators and a leading-zero group (`0.234` under `.` grouping) are refused, where a lenient locale parser can mis-read them. Since 2026-10-04 also: accounting negatives (parentheses, trailing minus) and percent, which Babel's `parse_decimal` does not read. **On par since 2026-10-04:** UTF-8 separators (U+00A0, U+202F, `’`), CLDR presets by locale name, Indian lakh/crore grouping, `+`/U+2212 signs, exponent — checked against Babel's strict `parse_decimal` on 5 452 cases over 25 locales. **Where we are behind** (re-checked 2026-10-20): since 2026-10-20 every CLDR locale Babel knows and the native digits of their numbering systems are covered (generated `src/cldr_locales.zig`, 11 092 Babel goldens); left: currency symbols and CLDR's `minimumGroupingDigits` — Babel's `parse_decimal` reads neither — and Babel's likely-subtag lookup of names that are not CLDR identifiers. A number at the front of longer text: `parsePrefix` (2026-11-05, ICU's `ParsePosition` form), the longest prefix `parse` accepts that does not cut a digit run. Grouped native-digit numbers are accepted here and refused by Babel's strict mode (its check formats with Latin digits — a Babel defect), so those cases are hand-checked, not golden. Ungrouped input returning `null` from the legacy `parseGroupedNumber` is a design choice (hand-off to `Decimal.parse`); `parse` accepts it unless `require_grouping`.
+**Where we are ahead:** exact `Decimal` result (no `f64` step) with an allocation-free single scan and a strict shape — `2025,06,01`, American text read under European separators and a leading-zero group (`0.234` under `.` grouping) are refused, where a lenient locale parser can mis-read them. Also: accounting negatives (parentheses, trailing minus) and percent, which Babel's `parse_decimal` does not read. **On par:** UTF-8 separators (U+00A0, U+202F, `’`), CLDR presets by locale name, Indian lakh/crore grouping, `+`/U+2212 signs, exponent — checked against Babel's strict `parse_decimal` on 5 452 cases over 25 locales. **Where we are behind:** every CLDR locale Babel knows and the native digits of their numbering systems are covered (generated `src/cldr_locales.zig`, 11 092 Babel goldens); left: currency symbols and CLDR's `minimumGroupingDigits` — Babel's `parse_decimal` reads neither — and Babel's likely-subtag lookup of names that are not CLDR identifiers (see *What is deliberately not done* and *Backlog / deferred*). A number at the front of longer text: `parsePrefix` (ICU's `ParsePosition` form). Grouped native-digit numbers are accepted here and refused by Babel's strict mode (its check formats with Latin digits — a Babel defect), so those cases are hand-checked, not golden. Ungrouped input returning `null` from the legacy `parseGroupedNumber` is a design choice (hand-off to `Decimal.parse`); `parse` accepts it unless `require_grouping`.
 
-## Design — `parse(s, Options)` (2026-10-04)
+## Design — `parse(s, Options)`
 
 One grammar, configurable symbols: `[sign] int [dec frac] [exp] [percent]`, with `int` either
 plain digits (no separator at all) or grouped — western `d{1,3}(G d{3})+` or Indian
 `d{1,2}(G d{2})* G d{3}` — using ONE separator spelling throughout. Separators are UTF-8 slices.
 `locale(name)` returns CLDR's group/decimal symbols and grouping for every locale Babel 2.17 knows
-(1066 since 2026-10-20, generated into `src/cldr_locales.zig`; groupings western, indian, two and
-none; `localeNative` adds the default numbering system's digits; originally 25 hand rows, Babel's data; `tools/babel-oracle.py --check-table` compares the table with Babel and found
-one wrong row while it was being written, `de_AT`). `lenient_spaces` accepts any of
+(1066, generated into `src/cldr_locales.zig`; groupings western, indian, two and none;
+`localeNative` adds the default numbering system's digits, `Options.zero`).
+`tools/babel-oracle.py --check-table` compares the table with Babel. `lenient_spaces` accepts any of
 ' '/U+00A0/U+202F/U+2009 for a space-like separator (typed text mixes them; CLDR does not).
 Refused on purpose: a grouped number starting with `0`, a decimal separator with no digit after it
 (`5.`), an exponent after a grouped number, two signs (`(-1)`, `(1-)`), and anything left over.
-The digits are rewritten into a 96-byte stack buffer and handed to `Decimal.parse`, so the result
+The digits are rewritten into a 96-byte stack buffer (`max_digits`) and handed to `Decimal.parse`, so the result
 is exact (12 fractional digits, half-away-from-zero beyond); percent folds into the exponent
-(`e-2`). No allocation. The legacy `parseGroupedNumber` is unchanged.
+(`e-2`). `Options.allow_plus` (default on) reads a leading `+`. No allocation.
 
-## Design & invariants
+`parsePrefix(s, opts)` reads a number off the front of longer text (ICU's `parse` with a
+`ParsePosition`, `strtod`'s end pointer): the longest prefix `parse` accepts, as a `PrefixMatch`
+(`value`, `len`). A digit run is never cut — a number never ends where a digit (or a byte of a
+native digit) follows — so a run too long for `Decimal` is null, not its first digits. Leading space
+is not skipped. The work is bounded: only the first `96 * (digit_bytes + sep_bytes) + 32` bytes
+are tried, whatever the input length.
+
+## Design & invariants — legacy `parseGroupedNumber`
+
 A single pure function, `parseGroupedNumber(s, thousands_sep, decimal_sep) ?Decimal`, generalized
 over American (`,`/`.`) and European (`.`/`,`) grouping conventions. Grammar:
 `[-]?d{1,3}(<thousands>d{3})+(<decimal>d+)?`, with strict structural validation — 1-3 leading
 digits, then exact 3-digit groups, no trailing junk — and at least one thousands group required
 (plain ungrouped numbers like `"123"`/`"1.5"`/`"1,5"` deliberately return `null`, left to the
-caller's `decimal.Decimal.parse`). Strictness is the point: it rejects date-like strings
+caller's `decimal.Decimal.parse`; `parse` accepts them unless `require_grouping`). Strictness is the point: it rejects date-like strings
 (`"2025,06,01"`) and American input misread under European separators, rather than silently
 mis-parsing them. Implementation is a single left-to-right scan with no backtracking, normalizing
 into a fixed 40-byte stack buffer (stripping the thousands separator, rewriting the decimal
-separator to `.`) then re-parsing via `decimal.Decimal.parse`; the buffer size covers any value the
-fixed-point range can hold (~27 integer digits + dot + 12 fractional), far beyond what `3+N*4`
-digits can express, so the length guard inside the scan is a defensive bound, not a reachable
-truncation path. No allocation, no shared state — reentrant. Original work of the zig-libs authors
+separator to `.`) then re-parsing via `decimal.Decimal.parse`; the buffer holds ~27 integer digits + dot + 12
+fractional digits, and a longer normalized string is refused, not rounded (`parse` takes up to 96 bytes and
+rounds the fraction instead). No allocation, no shared state — reentrant. Original work of the zig-libs authors
 (MIT), modeled after ICU `NumberFormat` parse's western 3-digit-grouping subset. The final re-parse
-targets the extracted `decimal` module, whose `parse` returns an error union (mapped back to `null`
+targets the `decimal` module, whose `parse` returns an error union (mapped back to `null`
 via `catch null`); parameters are named `thousands_sep`/`decimal_sep` to avoid colliding with the
-`decimal` dependency's own name.
+`decimal` dependency's own name. `parse` with `require_grouping` and no `+` agrees with it everywhere except a
+leading `0` (`parse` refuses a grouped number starting with `0`).
 
 ## Threat model / out of scope
+
 Not security-sensitive — a pure text-classification/parse function with no I/O, no allocation, and
-a bounded (40-byte) working set regardless of input length (over-long input just returns `null`
+a bounded (40-byte, `parse`: 96-byte) working set regardless of input length (over-long input just returns `null`
 once the scan or the buffer copy fails its bound, never overflows or panics). Does not guarantee
 locale correctness beyond the two documented western conventions for `parseGroupedNumber`
 (no scientific notation, no percent suffixes, no non-3-digit grouping) and, for `parse`, beyond the
 1066 CLDR locales Babel knows: no currency symbols, no CJK myriad grouping, ASCII `%` only. Input
 longer than the 96-byte normalized form (e.g. 100 leading fraction zeros) is refused, not rounded;
-with `percent` an exponent that leaves Decimal's four digits (`1E-9998%`) is refused. A caller passing the wrong separator pair for their
+with `percent` an exponent that leaves Decimal's four digits is refused (`1E-9999%` becomes `e-10001`,
+so it is null while `1E-9999` is 0). A caller passing the wrong separator pair for their
 locale gets `null` (safe failure), not a mis-parsed number silently accepted.
 
 ## Verification
-Tests cover both grouping conventions, adapted for `decimal`'s error-union `parse`:
-American-format accept cases (grouped integers/decimals, negative, exact group boundaries) and
-reject cases (ungrouped, wrong group size); European-format mirror of the same, plus a
-cross-locale negative (comma/dot swapped). Run: `zig build test-numparse`.
 
-## Verification — `parse` (2026-10-04)
+- **Run:** `scripts/modtest numparse` (`zig build test-numparse`).
+- **Oracle:** Babel 2.17 `parse_decimal(strict=True)` as a black box. `tools/babel-oracle.py` writes
+  `src/testdata/babel_golden.txt` — Babel's own formatting of random values per locale (latn, and the
+  locale's native digits as `name:native` lines) plus systematic corruptions (dropped/split/swapped/mixed
+  separators, leading-zero group, dangling separator, second decimal separator), each with Babel's verdict;
+  `parse(input, locale(name).?)` must agree on every line (11 092 cases at the time of writing; the test
+  asserts a floor on cases, accepted lines, locales and native-digit lines so a truncated file cannot pass).
+  Shapes where numparse deliberately differs from Babel's strict mode are not generated: a leading `+` or
+  U+2212, a trailing decimal separator (Babel accepts `5.` but not `1.234,`), leading zeros on an ungrouped
+  integer. Grouped native-digit numbers are accepted here and refused by Babel's strict mode (its check
+  formats with Latin digits — a Babel defect), so those are hand-checked, not golden.
+- **Hand-derived tests:** what Babel does not read (parentheses, trailing minus, percent, `lenient_spaces`,
+  Indian and two-group edge shapes, native digits incl. malformed UTF-8 among them) and a refusal list;
+  `parsePrefix` against `parse` on every prefix, native digit runs never cut, hostile bytes, the byte cap.
+- **Legacy parity:** random strings over `0-9,.-`: `parse` with `require_grouping` and no `+` against
+  `parseGroupedNumber`; American and European accept/reject cases for the legacy function.
+- **Totality:** `parse`, `parseGroupedNumber`, `locale` and `parsePrefix` on empty, 1 MiB and hostile input over the
+  option grid; every `cldr_locales.zig` row names an existing numbering system (and the generator asserts the
+  row properties: sorted, separators non-empty, distinct, not prefixes of each other, free of digits and signs).
+- **Fuzz / constant time:** no fuzz obligation under check-fuzz; ct n/a (number parsing).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Bench:** `zig build bench-numparse` (`tools/bench.zig`, `tools/bench_ref.py`, `tools/icu_bench`) against Babel and
+  ICU4C; the card's Performance line holds the figures.
 
-- **Babel as a black-box oracle:** `tools/babel-oracle.py` (recipe kept) writes
-  `src/testdata/babel_golden.txt` — Babel's own formatting of random values in each of the 25
-  locales plus systematic corruptions (dropped/split/swapped/mixed separators, leading-zero group,
-  dangling separator, second decimal separator), each with `parse_decimal(strict=True)`'s verdict:
-  5 452 cases, 1 526 accepted, 3 926 refused. `parse(input, locale(name).?)` must agree on every
-  one. Shapes where numparse deliberately differs from Babel's strict mode are not generated:
-  a leading `+` or U+2212 (Babel refuses `+1,234` and sv's own `−1 234`), a trailing decimal
-  separator (Babel accepts `5.` but not `1.234,`), and leading zeros on an ungrouped integer.
-- **Features Babel does not read** (parentheses, trailing minus, percent, `lenient_spaces`, Indian
-  edge shapes): hand-derived unit tests, plus a refusal list.
-- **Legacy parity:** 20 000 random strings over `0-9,.-`: `parse` with `require_grouping` and no
-  `+` agrees with `parseGroupedNumber` everywhere except a leading `0` (the documented divergence).
-- **Review 2026-10-23** (independent, Sonnet, over everything since `4133cbbc`): no panic, OOB,
-  overflow, loop or wrong value found; `cldr_locales.zig` checked strictly sorted under the Zig
-  fold with no duplicates, every row's separators non-empty, distinct, not prefixes, free of digits
-  and signs. LOW items taken: the generator now asserts those row properties (`check_rows`), the
-  legacy buffer comment was wrong at the edge (fixed), the `percent` / `zero` docs, tests for
-  empty bodies after the strips, the `5-%` order and malformed UTF-8 (overlong, surrogate, lone
-  continuation, cut astral) among native digits, and this SPEC's drift (25 locales → 1066).
-- **Mutation 2026-10-23** (schemata, 33 mutants over `parse`, `scanDigits`, `sepAt`, `findRow`,
-  `localeNative` and the legacy `parseGroupedNumber`): 28 killed at once, 2 by new tests (a run
-  of space-likes before `%`; the four-digit exponent cap counting leading zeros), 3 equivalent
-  (the legacy digit-after-group check, refused by the decimal-part check anyway; `zero + 10` as a
-  digit, which maps to `:` and `Decimal.parse` refuses; the empty-mantissa check, as before).
-- **Mutation 2026-10-04** (schemata, 19 mutants): 15 killed at once; 2 killed by new tests (a
-  trailing minus inside parentheses; an exponent long enough to overflow `i64`, which panicked
-  without the digit cap); 1 equivalent (`first.len == 0 and !has_frac`: `Decimal.parse` refuses an
-  empty mantissa anyway, kept to state the grammar); 1 pointed at a redundant mixed-spelling check,
-  removed.
+## What is deliberately not done
+
+- **Currency symbols.** Babel's `parse_decimal` reads none either; the module hands the ungrouped half of the job to `decimal`.
+- **Likely-subtag resolution of unknown locale names.** `locale` matches CLDR identifiers only
+  (ASCII case-insensitive, `-` as `_`); an unknown name is null.
 
 ## Backlog / deferred
-- **Delta audit 2026-10-29 (no-panic sweep § GI):** the sweep changed tests only; no mutants, the review date moves. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI):** no defect. R-numparse-1 (LOW, behaviour): `1E-9999%` becomes `e-10001`, which `Decimal.parse` refuses, so it is null while `1E-9999` is 0.
-Per the module README's "Deferred" section: currency symbols, CJK 4-digit myriad grouping,
-native and prefix percent signs (`٪`, tr `%12`). (Every CLDR locale and the native digits are done
-since 2026-10-20.) (Scientific notation, percent
-suffixes and Indian lakh/crore grouping are handled by `parse` since 2026-10-04.)
-- ~~Multi-byte separators~~, ~~optional `+`, trailing and parenthesised negatives~~ — **done
-  2026-10-04** (`parse`, `Options`, `locale`).
-- **All of CLDR, currency, non-Latin digits, myriad grouping, `minimumGroupingDigits`** *(re-check
-  2026-10-04)*: the table covers 25 locales; whole-CLDR coverage needs generated data (≈ 800
-  locales × numbering systems) and currency needs symbol tables — no consumer has asked. Effort M.
-- ✅ (found implemented 2026-11-17: `Options.group_sep`/`decimal_sep` slices in src/root.zig) (historical) **Multi-byte separators** *(survey 2026-09-30)*: take the thousands/decimal separators as UTF-8 slices (or code points) instead of `u8`. Why: CLDR writes Czech, French, Russian and Swiss numbers with U+00A0/U+202F/`’` as the group separator (Babel's own `ru` example is `12 345,123`), and Excel/web exports carry them; with `u8` only an ASCII space works. Effort: small (the scan is a single pass; compare slices at group boundaries). Fits CONVENTIONS §2.
-- ✅ (found implemented 2026-11-17: `parse` with `Options` in src/root.zig) **Optional leading `+` and trailing/parenthesised negatives** *(survey 2026-09-30)*: `+1,234.56`, `1,234.56-`, `(1,234.56)` (accounting exports). Why: ICU and spreadsheets emit them; today they return `null`. Effort: small; needs an `Options` type rather than more positional parameters. Fits §2.
 
-## Status
-`extract · any · util · reentrant` + deps: `decimal` — canonical source is `pub const meta` in
-src/root.zig.
+- **Not built, no consumer has asked** (effort M each): CJK 4-digit myriad grouping, the native percent
+  sign (`٪`) and prefix percent (tr `%12`), CLDR's `minimumGroupingDigits` (Babel's `parse_decimal` reads
+  none of them either).
 
 ## Anchoring
 
