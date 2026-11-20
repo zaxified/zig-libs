@@ -175,7 +175,7 @@ const utf8_last: [256]u8 = // stylua: ignore
 
 /// 0x80..0xDF (continuation and two-byte lead bytes) are class 0, 0xE0..0xFF
 /// (three- and four-byte lead bytes) class 2. 0xD0..0xDF were class 2 until
-/// 2026-10-15 — wrong against libbrotli's `_kBrotliContextLookupTable`, so
+/// — wrong against libbrotli's `_kBrotliContextLookupTable`, so
 /// google's UTF8-mode streams of Cyrillic, Hebrew or Arabic text were refused
 /// or misdecoded, and ours were misread by every other decoder.
 const utf8_second: [256]u8 = // stylua: ignore
@@ -213,7 +213,7 @@ comptime {
 test "context_lookup is libbrotli's _kBrotliContextLookupTable" {
     // SHA-256 of the 2048 bytes libbrotlicommon 1.2.0 exports, dumped by a
     // five-line C program (`extern const uint8_t
-    // _kBrotliContextLookupTable[2048]`, printed byte by byte; 2026-10-15).
+    // _kBrotliContextLookupTable[2048]`, printed byte by byte).
     // The UTF8 mode's second-byte classes for 0xD0..0xDF once differed here
     // and nowhere else; encoder and decoder share this table, so only the
     // reference's streams could show it (`utf8-mix` in the interop corpus).

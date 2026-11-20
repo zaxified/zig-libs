@@ -410,7 +410,7 @@ test "applyOp: the RFC 7932 operations, and the shifts of RFC 9841 3.1.1" {
     try t.expectEqualSlices(u8, &.{ 0x80, 'b' }, buf[0..applyOp(&buf, "", 22, 1, "", &.{ 0x80, 'a' })]);
 }
 
-// --- RFC 7932 Appendix B / section 8 semantics (mutation run 2026-10-04) ------
+// --- RFC 7932 Appendix B / section 8 semantics (mutation run) ------
 // Transforms with an empty prefix and suffix, so the output is the bare word
 // transform: 0 identity, 9 UPPERCASE_FIRST, 44 UPPERCASE_ALL, and the OMIT
 // kinds (indices from the Appendix B table, type column).

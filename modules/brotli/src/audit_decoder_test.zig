@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests asked for by the 2026-10-27 mutation run (A1): each names the
+//! Tests asked for by the mutation run (A1): each names the
 //! mutant it kills.
 
 const std = @import("std");

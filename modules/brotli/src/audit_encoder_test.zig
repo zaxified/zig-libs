@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests asked for by the 2026-10-27 mutation run (A1): each names the
+//! Tests asked for by the mutation run (A1): each names the
 //! mutant it kills.
 
 const std = @import("std");
@@ -259,7 +259,7 @@ test "A1 m4b: a copy ending at ip_limit takes no further copy there" {
     try testing.expectEqualSlices(u8, &in, back);
     var sum: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(out, &sum, .{});
-    // Today's bytes (2026-10-27).
+    // Today's bytes.
     try expectPin("m4b", hex(sum), "c02e8f71f8d0d2a412085e5362fa79014351e55c08a51adee53c06be6287cfc9");
 }
 

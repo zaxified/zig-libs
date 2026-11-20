@@ -57,7 +57,7 @@ pub const BitReader = struct {
         if (self.source_done) return false;
         // No buffer to refill through: the input ends here. `fillMore` would
         // rebase to a capacity of 1, which std asserts on for a streaming
-        // reader — UB in ReleaseFast (no-panic sweep 2026-10-28, B-4).
+        // reader — UB in ReleaseFast (no-panic sweep, B-4).
         if (r.buffer.len == 0) {
             self.source_done = true;
             return false;

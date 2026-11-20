@@ -13,7 +13,7 @@
 //! qualities 4–9. Changes: block lengths are the real symbol counts (the
 //! reference rounds a short last block up to the minimum, which a decoder
 //! never notices but `BlockCodes` checks). The 13-context map for inputs of
-//! 1 MiB and more (`ShouldUseComplexStaticContextMap`) since 2026-10-16 (R14).
+//! 1 MiB and more (`ShouldUseComplexStaticContextMap`) (R14).
 
 const std = @import("std");
 const block_split = @import("block_split.zig");
@@ -51,7 +51,7 @@ inline fn nlog2(p: u32) f64 {
 /// `BrotliBitsEntropy`: Shannon bits of the counts, at least one bit per
 /// symbol (each is coded alone by a prefix code). Four sums in turn: one
 /// waited on each addition before it, and the splitter's entropies took
-/// twice google's time on a font (2026-10-16).
+/// twice google's time on a font.
 pub fn bitsEntropy(h: []const u32) f64 {
     var sum: usize = 0;
     var r: [4]f64 = @splat(0);
@@ -578,7 +578,7 @@ test "Splitter: a block about as close to both last types joins the last one" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

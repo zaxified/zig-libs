@@ -83,7 +83,7 @@ pub const PreparedDictionary = struct {
         // that tail: positions in it fit an item's 31 bits. Indexed from the
         // whole of a longer one they took bit 31 (`last_bit`) from 2 GiB and
         // failed their `u32` cast from 4 GiB, UB in ReleaseFast (no-panic
-        // sweep 2026-10-28, B-7). A copy's distance counts back from the
+        // sweep, B-7). A copy's distance counts back from the
         // dictionary's end, so the tail gives the distances the whole would
         // (nothing further back is in reach: the window is at most 2^30).
         const tail = source[source.len -| max_len..];
@@ -103,7 +103,7 @@ pub const PreparedDictionary = struct {
         // and walks the chains in step 3. Step 3 below hashes the positions
         // again instead, newest first, and drops each into its bucket's run
         // while the run has room: the same items without that array — 64
-        // MiB for a 16 MiB dictionary — in about the same time, 2026-10-16.)
+        // MiB for a 16 MiB dictionary — in about the same time,.)
         const num = try gpa.alloc(u16, num_buckets);
         defer gpa.free(num);
         zero(u16, num);

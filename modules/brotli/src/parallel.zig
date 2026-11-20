@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Multithreaded compression of one stream (rust-brotli's
-//! `compress_multi`; S2 analysis item C2, 2026-10-16): `compress` cuts the
+//! `compress_multi`; S2 analysis item C2): `compress` cuts the
 //! input into jobs of `job_size` bytes, compresses them on up to `threads`
 //! workers and joins the parts into one ordinary Brotli stream — any
 //! RFC 7932 decoder reads it, nothing in it says it was made in parts.
@@ -46,7 +46,7 @@ pub const min_job_size: usize = 64 << 10;
 /// The largest `ParallelOptions.job_size` (a larger one counts as this): a
 /// job and the window before it (at most 2^30) stay under the match
 /// finders' `u32` positions. A 3 GiB job went past them — a cast that
-/// panicked in a safe build, UB in ReleaseFast (no-panic sweep 2026-10-28,
+/// panicked in a safe build, UB in ReleaseFast (no-panic sweep,
 /// B-6).
 pub const max_job_size: usize = 1 << 30;
 
@@ -244,7 +244,7 @@ test "parallel: one job is compressWith's bytes" {
 }
 
 test "parallel: an input exactly one job long is compressWith's bytes" {
-    // The boundary of `input.len <= job_size` (mutation run 2026-10-27: no
+    // The boundary of `input.len <= job_size` (mutation run: no
     // test had an input of exactly one job).
     const gpa = testing.allocator;
     const input = try mixed(gpa, 50_000);

@@ -548,7 +548,7 @@ test "encode: round-trip every input shape" {
 // `smith.index(fuzz_seed_corpus.len)` — but it was never handed to
 // `std.testing.fuzz` as a `.corpus`, so outside `--fuzz` this target ran the
 // ONE input a corpus-less target gets: the empty one. Every draw in that run
-// therefore collapsed to its minimum. Traced 2026-09-07:
+// therefore collapsed to its minimum. Traced:
 //
 //   smith.index(14)                     -> 0    -> empty.compressed (1 octet)
 //   smith.boolWeighted(1, 4)            -> false
@@ -668,12 +668,12 @@ test "corpus: every reference stream reaches the decoder, and the output is pinn
         decoded += 1;
         octets_out += out.len;
     }
-    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 octets out — the
+    // Measured. Before: 1 round, 0 non-empty, 0 octets out — the
     // target decompressed `buf[0..0]` and nothing else, ever.
     try testing.expectEqual(fuzz_seed_corpus.len - 1, nonempty); // the deliberate empty seed
     // 17 reference streams decode; refused are the empty input, the
     // truncated header, and `0xff` — WBITS 24 and an empty last meta-block
-    // whose fill bit is set (RFC 7932 §9.2; refused since 2026-10-15, as
+    // whose fill bit is set (RFC 7932 §9.2; refused, as
     // google/brotli does, which takes `0x3f`, the same with a zero fill).
     try testing.expectEqual(@as(usize, 17), decoded);
     try testing.expectEqual(@as(usize, 3), refused);
@@ -684,7 +684,7 @@ test "corpus: every reference stream reaches the decoder, and the output is pinn
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

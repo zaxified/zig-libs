@@ -3,7 +3,7 @@
 //! The reference implementation's verdicts, replayed — no python3, no child
 //! process, no skip path.
 //!
-//! Until 2026-09-06 this ground was held by `src/reference_interop.zig`, which
+//! Until this ground was held by `src/reference_interop.zig`, which
 //! spawned `python3 -c <embedded driver>` from inside `test-brotli`. It ran
 //! only where google/brotli's Python binding happened to be installed, which
 //! in CI (peer install `continue-on-error`) means: not there. The live run now

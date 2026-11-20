@@ -624,7 +624,7 @@ fn DecoderOf(comptime Sink: type) type {
         /// and the input has `hot_margin` bytes at hand, with the bit reader
         /// in locals (`HotBits`): behind `self.br` its state was stored and
         /// loaded around every output byte, as an output byte may land
-        /// anywhere for the compiler (perf annotate, 2026-10-15). A read
+        /// anywhere for the compiler (perf annotate). A read
         /// never fetches input here: a header and a distance start only with
         /// `hot_margin` bytes at hand, a literal only with eight; short of
         /// them the command is handed to `resumeCommand` (literals,
@@ -641,7 +641,7 @@ fn DecoderOf(comptime Sink: type) type {
         /// `noalias`: the output is written through `out`'s buffer, which is
         /// neither `self` nor `out`, so LLVM keeps their fields in registers
         /// across those stores instead of loading them again after each
-        /// (2–3 % of decoding, 2026-10-16).
+        /// (2–3 % of decoding).
         fn hotCommands(noalias self: *Self, noalias out: *Sink) Error!Outcome {
             var mlen = self.mlen;
             defer self.mlen = mlen;
@@ -1269,7 +1269,7 @@ const hot_margin = 16;
 
 /// Literals left in an insert from which `hotCommands` takes them in a loop
 /// without checks: on text most inserts are a literal or two, where
-/// setting that loop up cost 3 % (2026-10-15).
+/// setting that loop up cost 3 %.
 const fast_literals_min = 8;
 
 /// The bit reader's state in locals for `hotCommands` (same invariants as
@@ -1309,7 +1309,7 @@ const HotBits = struct {
     /// arithmetic, which from 57..63 bits adds no byte and loads the same
     /// bits above again, and adds nothing at 64 (only right after `load`).
     /// Precondition: `canRefill`. (`if (cnt <= 56) refill()` was a third of
-    /// the decoder's branch misses on text, 2026-10-16: whether a command
+    /// the decoder's branch misses on text,: whether a command
     /// header needs a refill is data.)
     inline fn top(h: *HotBits) void {
         const full: u64 = @intFromBool(h.cnt >= 64);
@@ -1400,7 +1400,7 @@ const ListSink = struct {
     /// As `SliceSink.tailPtr`: within the capacity `reserve` made.
     // `pub`: `hotCommands` asks `@hasDecl(Sink, "tailPtr")`, which since
     // Zig 0.17 sees only `pub` declarations — without it the checkless
-    // literal loop was dead code (mutation run, 2026-10-27).
+    // literal loop was dead code (mutation run).
     pub inline fn tailPtr(s: *ListSink) [*]u8 {
         return s.list.items.ptr + s.list.items.len;
     }
@@ -1495,7 +1495,7 @@ const SliceSink = struct {
     /// room for is written there, then `advance`d over.
     // `pub`: `hotCommands` asks `@hasDecl(Sink, "tailPtr")`, which since
     // Zig 0.17 sees only `pub` declarations — without it the checkless
-    // literal loop was dead code (mutation run, 2026-10-27).
+    // literal loop was dead code (mutation run).
     pub inline fn tailPtr(s: *SliceSink) [*]u8 {
         return s.buf.ptr + s.len;
     }

@@ -13,7 +13,7 @@
 //! uncompressed meta-block. The fallback is therefore a real, exercised path,
 //! not an accident — see the `fallback` tests.
 //!
-//! Inside a compressed block (2026-09-30):
+//! Inside a compressed block:
 //!
 //! - **Matches are chosen by the bits they save** (`Matcher.gain`), not by
 //!   length: the literals covered, priced at the block's order-0 entropy,
@@ -24,7 +24,7 @@
 //! - **`.q4` is its own algorithm** (`FastMatcher`, `buildCommandsFast`):
 //!   4 slots of a 6-byte hash and the last distance, a lazy step only below
 //!   32 bytes, sparse inserts inside long copies, growing steps through long
-//!   literal runs. Sizes about google/brotli quality 4 (2026-10-14).
+//!   literal runs. Sizes about google/brotli quality 4.
 //! - **Distance short codes and implicit distances**: the encoder mirrors the
 //!   decoder's ring of the last four distances (`DistRing`) and names a
 //!   distance by its short code (0..15, no extra bits) when it can; a copy at
@@ -34,13 +34,13 @@
 //!   for the UTF8 and LSB6 modes, clustered greedily by estimated bits into
 //!   at most 16 codes, the cheaper mode kept — and then checked on real bits
 //!   against a single literal code, keeping the shorter block.
-//! - **Distance contexts** (2026-10-15): the four distance contexts (copy
+//! - **Distance contexts**: the four distance contexts (copy
 //!   length 2, 3, 4, 5+) share one to four codes, the cheapest partition.
-//! - **`.q11`** (2026-10-15): a shortest-path parse priced from the block's
+//! - **`.q11`**: a shortest-path parse priced from the block's
 //!   own statistics (`buildCommandsOptimal`) and static-dictionary words
 //!   with their transforms (`DictSearch`); three parses, the shortest as
 //!   written kept.
-//! - **Static-dictionary words at `.q9`** (2026-10-15, R15): where the hash
+//! - **Static-dictionary words at `.q9`** (R15): where the hash
 //!   finds no copy, the word google/brotli's qualities 5–9 would try
 //!   (`Matcher.findWord`, `dictionary_hash.zig`), whole or with its end cut.
 //!
@@ -49,9 +49,9 @@
 //! - No `NPOSTFIX`/`NDIRECT` search below `.q11` (only `Mode.font`'s fixed
 //!   pair, as google/brotli), no OMIT_FIRST dictionary
 //!   transforms, no dictionary words at `.q6` (5–10 % of its time for
-//!   0.25–0.7 % of size on text, 2026-10-15).
+//!   0.25–0.7 % of size on text).
 //!
-//! The result (2026-10-16): `alice29.txt` 52 275 bytes at `.q6` (google/brotli
+//! The result: `alice29.txt` 52 275 bytes at `.q6` (google/brotli
 //! q6: 51 967), 50 994 at `.q9` (q9: 51 054), 46 378 at `.q11` (q11: 46 487);
 //! never worse than store mode by more than the two-bit final-meta-block
 //! marker.
@@ -93,11 +93,11 @@ const min_match = 4;
 /// Shortest copy taken at a distance the decoder's ring already holds: it
 /// costs no distance bits, so a few covered literals pay for it. Two bytes
 /// at the last distance are an implicit-distance command — google q5/q11
-/// leave thousands of them on fonts (2026-10-15); the greedy matcher takes
+/// leave thousands of them on fonts; the greedy matcher takes
 /// two at the last two, three at the others — google q5–q9's rule
 /// (`FindLongestMatch`: `len == 2 && i < 2`). With `.q6`'s sparse search
 /// a 64 KiB font got 1 331 copies with it, 315 without (google q6: 1 298),
-/// and 1.6 % smaller; text ±0.1 % (2026-10-16).
+/// and 1.6 % smaller; text ±0.1 %.
 const min_ring_match = 2;
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
@@ -137,7 +137,7 @@ const BitWriter = struct {
 
     /// Up to 32 bits. The accumulator holds up to 31 pending bits between
     /// calls and goes out four bytes at a time (a byte per `append` was most
-    /// of `writeCompressedBlock`'s time, bench 2026-10-11).
+    /// of `writeCompressedBlock`'s time, bench).
     inline fn writeBits(self: *BitWriter, val: u32, n: u6) std.mem.Allocator.Error!void {
         const m: u64 = (@as(u64, 1) << n) - 1;
         self.acc |= (@as(u64, val) & m) << self.cnt;
@@ -346,7 +346,7 @@ const DistRing = struct {
         // Within 3 of the last or second-last: `d + 3 - last` is 0..6 and
         // picks the code from a nibble table (google/brotli
         // `ComputeDistanceCode`; the `deltas` loop it replaces was a tenth
-        // of `.q4`'s block writer, 2026-10-16).
+        // of `.q4`'s block writer).
         const o0 = @as(u64, d) +% 3 -% self.last[0];
         if (o0 < 7) return @intCast(@as(u32, 0x9750468) >> @intCast(4 * o0) & 0xf);
         const o1 = @as(u64, d) +% 3 -% self.last[1];
@@ -360,7 +360,7 @@ const DistRing = struct {
         if (code == 0) return;
         // Through a copy: assigned in place, the literal's first element
         // would overwrite `last[0]` before it is read for the second (the
-        // ring was `{d, d, d, d}` until 2026-10-15).
+        // ring was `{d, d, d, d}` previously).
         const l = self.last;
         self.last = .{ d, l[0], l[1], l[2] };
     }
@@ -445,7 +445,7 @@ fn indexOf(arr: *const [24]u32, v: u32) usize {
 /// Largest length code whose range contains `len`. Lengths below
 /// `length_lut_len` (nearly every insert and copy) come from a table built
 /// from the same scan at compile time: the scan per command was 2-3 % of
-/// compression (perf, 2026-10-14).
+/// compression (perf).
 fn lengthCode(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5, len: u32) ?LenCode {
     const lut = comptime lengthLut(offsets, nbits);
     if (len < length_lut_len) {
@@ -608,7 +608,7 @@ fn assignLengths(
     }
     // Ascending by count, ties by symbol: the order a stable sort of the
     // symbols by count gives (a block sort through an index array until
-    // 2026-10-15, 15 % of `.q1`'s cycles). max(count, floor) is monotone
+    // 15 % of `.q1`'s cycles). max(count, floor) is monotone
     // in count, so this one order stays valid for every floor tried below.
     sortKeys(keys);
 
@@ -667,7 +667,7 @@ fn assignLengths(
 /// 13 items, Shell sort with gaps 132, 57, 23, 10, 4, 1 from there). Not
 /// `std.sort.pdq`: its insertion pass swaps through byte stores here, and the
 /// next 8-byte load of the same slot waits for them (store forwarding fails)
-/// — a fifth of `.q6`'s cycles on a 16 KiB font (2026-10-16).
+/// — a fifth of `.q6`'s cycles on a 16 KiB font.
 fn sortKeys(keys: []u64) void {
     const gaps = [_]usize{ 132, 57, 23, 10, 4, 1 };
     const first: usize = if (keys.len < 13) gaps.len - 1 else 0;
@@ -858,7 +858,7 @@ fn writeComplexCode(gpa: std.mem.Allocator, w: *BitWriter, lengths: []const u8) 
 
     // The code-length code's patterns, computed rather than read off a
     // decoder table (`canonicalCode`; that table and the items' allocation
-    // were half of this function's time on a 16 KiB font, 2026-10-16). A
+    // were half of this function's time on a 16 KiB font). A
     // one-symbol code writes no bits for its symbol.
     var cl_bits: [tables.code_length_codes]u16 = @splat(0);
     var cl_emit: [tables.code_length_codes]u8 = @splat(0);
@@ -965,7 +965,7 @@ const max_rle_alphabet = @max(tables.num_command_symbols, dist_alphabet_max);
 /// `BrotliOptimizeHuffmanCountsForRle` (`c/enc/entropy_encode.c`, MIT, see
 /// `NOTICE`), its 24.8 fixed point included. A used symbol keeps a non-zero
 /// count. On a 64 KiB font at `.q6` the code headers were 2.4 KB without it,
-/// google's 0.7 KB (2026-10-16).
+/// google's 0.7 KB.
 fn optimizeCountsForRle(counts: []u32) void {
     const streak_limit: u64 = 1240;
     var nonzeros: usize = 0;
@@ -1100,7 +1100,7 @@ fn buildAndWriteCodeLimited(
 // Match finding: bucketed hash over 4-byte hashes, one lazy step.
 //
 // Each hash bucket keeps the last `depth` positions inserted under it, in a
-// ring of `depth` slots. Until 2026-10-14 this was a hash chain (`head` per
+// ring of `depth` slots. Until this was a hash chain (`head` per
 // hash, `prev` per position), walking up to `depth` links: every link is a
 // load whose address is the previous load's value, so the walk was a chain of
 // dependent cache accesses — half of `find`'s cycles waited on `prev[c]` and
@@ -1110,8 +1110,7 @@ fn buildAndWriteCodeLimited(
 /// `word`: 0 for a copy; for a static-dictionary word (`Matcher.findWord`)
 /// its length, `len` then the bytes its transformed form produces. `len`
 /// and `word` share a word (`max_match` fits 16 bits): at 16 bytes a `?Match`
-/// is no longer returned in registers, and `.q9` on text was 16 % slower
-/// (2026-10-15).
+/// is no longer returned in registers, and `.q9` on text was 16 % slower.
 const Match = struct { len: u16, word: u8 = 0, dist: u32, gain: f32 };
 
 /// Distances an explicit distance code reaches (NPOSTFIX = NDIRECT = 0):
@@ -1287,7 +1286,7 @@ fn MatcherT(comptime wide: bool) type {
         /// data: there a bucket mostly holds positions that merely share its
         /// hash bits, and each of those cost a load from far back — on a font,
         /// 66 slots visited per lookup at `.q9`, 11 with the same first four
-        /// bytes (2026-10-15). A different tag means different first four
+        /// bytes. A different tag means different first four
         /// bytes, so no copy is missed. (Tags in a byte array of their own cost
         /// text 4–7 % in the extra cache line.)
         slots: []u32,
@@ -1356,7 +1355,7 @@ fn MatcherT(comptime wide: bool) type {
 
         /// `@memset(buf, 0)` in 32-byte stores. Zig 0.16 without libc lowers
         /// `@memset` to `compiler_rt.memset`, which stores one byte at a time:
-        /// 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The stores
+        /// 20 % of `fast` compression of 128 KiB (bench). The stores
         /// are volatile so LLVM does not turn the loop back into that call. Same
         /// workaround as `zstd/src/fill.zig`; `fastmem` exports a replacement for
         /// whole executables. Delete when Zig's memset is vectorised (after 0.16)
@@ -1479,25 +1478,25 @@ fn MatcherT(comptime wide: bool) type {
         /// before `limit`, at most `max_dist` back. Null below `min_match` or
         /// when no candidate saves anything.
         /// `ring_n`: how many of the ring's distances are tried first (all four
-        /// since the ring was fixed, 2026-10-15: fonts −0.3 %, text even).
+        /// since the ring was fixed,: fonts −0.3 %, text even).
         /// Comptime, so a search
         /// without them compiles to the loop it was before they existed.
         /// `px`: a prefix dictionary is attached (`dict`) — comptime, so a
         /// search without one compiles to the loop it was before dictionaries
-        /// (the per-candidate test cost `.q9` 20 %, measured 2026-10-15).
+        /// (the per-candidate test cost `.q9` 20 %, measured).
         /// `tagged`: skip slots by their tag (`slots`) — comptime, as a mask
-        /// test in the one loop cost text 25 % in the registers it took
-        /// (2026-10-15); the caller picks per block (`tagsPay`).
+        /// test in the one loop cost text 25 % in the registers it took;
+        /// the caller picks per block (`tagsPay`).
         /// `simd` (`.q6`, 32 slots a bucket): with `tagged`, the bucket's tags
         /// are compared at once and only the slots whose tag is the position's
         /// own are visited, as google/brotli's H58 hasher does with tag bytes of
         /// their own (`hash_longest_match_simd_inc.h`; a byte array here cost
-        /// text 7 % in the extra stores, 2026-10-15).
+        /// text 7 % in the extra stores).
         /// `align(64)` (also `findWord`, `buildCommands`): where the hot loops
         /// start otherwise moves with every unrelated change, and on the
         /// measuring host (a Kaby Lake, which pays for jumps across 32-byte
         /// lines) that alone moved `.q6` by 5–10 % between builds; aligned, the
-        /// bench of the unchanged encoder was 3–10 % faster (2026-10-15).
+        /// bench of the unchanged encoder was 3–10 % faster.
         fn find(self: *const Self, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) align(64) ?Match {
             if (p + hash_len > limit) return null;
             const max_len = @min(limit - p, max_match);
@@ -1650,7 +1649,7 @@ fn MatcherT(comptime wide: bool) type {
         /// Cheap reject: whether a candidate gets the byte-by-byte compare —
         /// it can beat `best_len` (the byte there agrees, `next_eq`), or nothing
         /// was found yet. Without the short-circuit `or` it is one branch, and
-        /// `.q9` on text 5 % faster (2026-10-15).
+        /// `.q9` on text 5 % faster.
         inline fn worthComparing(best_len: usize, next_eq: bool) bool {
             return (@intFromBool(best_len == 0) | @intFromBool(next_eq)) != 0;
         }
@@ -1658,7 +1657,7 @@ fn MatcherT(comptime wide: bool) type {
         /// Whether lookups in `block` should skip slots by their tag: when the
         /// slots have tags and the block looks binary. On text most of a
         /// bucket shares its first four bytes and the test only cost
-        /// mispredicted branches (`.q9` +28 %, 2026-10-15).
+        /// mispredicted branches (`.q9` +28 %).
         fn tagsPay(self: *const Self, block: []const u8) bool {
             if (wide) return self.tag_mask != 0;
             return self.tag_mask != 0 and looksBinary(block);
@@ -1712,10 +1711,10 @@ const WideMatcher = MatcherT(true);
 const Cand = struct { len: u32, dist: u32 };
 /// Most candidates kept for a position — the parse's memory: 8 bytes each
 /// per position of the block. 16, 32 and 48 gave the same sizes on the bench
-/// payloads (2026-10-15).
+/// payloads.
 const max_cands = 16;
 
-// `.q4` has a match finder of its own (2026-10-14). `Matcher` keeps a count
+// `.q4` has a match finder of its own. `Matcher` keeps a count
 // per bucket to know which slots are written and walks them newest first: a
 // load and a store of the count on every insert, and a walk whose length the
 // count decides. Here a bucket has a fixed `fast_sweep` slots, all valid from
@@ -1746,7 +1745,7 @@ const fast_lazy_max_len = 32;
 /// Copies up to this long have every position inserted; longer ones their
 /// first and last `fast_dense_insert / 2` and every fourth between.
 const fast_dense_insert = 32;
-/// `.q4` and a prefix dictionary (2026-10-16): google's q4 does not search
+/// `.q4` and a prefix dictionary: google's q4 does not search
 /// one at all. Here its bucket's newest 8 positions, where the window found
 /// no copy: against google's q4 (its dictionary prepared once) 0.83–1.06× the
 /// time for 9–18 % smaller responses of 4–32 KiB; every lookup and 4
@@ -1853,7 +1852,7 @@ const FastMatcher = struct {
     }
 };
 
-// `.q1` (2026-10-15, R13; `.q0` with it until 2026-10-16, now `writeQ0`):
+// `.q1` (R13; `.q0` with it previously, now `writeQ0`):
 // a match finder of one slot per bucket,
 // written over at every lookup, and a parse that takes the first match it
 // finds — no gain, no lazy step — and steps faster through data that has
@@ -1865,7 +1864,7 @@ const FastMatcher = struct {
 // (`writeFragmentBlock`). Going through `Cmd`s and a resolving pass, as the
 // other levels do, cost about 80 cycles per command, which is all a
 // command may cost here (google q0: about 70 cycles a command, parse and
-// write together; bench payloads, 2026-10-15). `FragLevel` names what the
+// write together; bench payloads). `FragLevel` names what the
 // parse looks at.
 
 /// Bytes `FragMatcher` hashes.
@@ -1875,7 +1874,7 @@ const frag_bucket_log_max = 15;
 
 /// The parse's choices (`.q1`'s; `.q0`'s own were a step growing every 8
 /// misses, the last distance only after a copy, nothing inserted from a
-/// copy, no backward extension — 1.2–1.55× google's q0 time, 2026-10-15).
+/// copy, no backward extension — 1.2–1.55× google's q0 time).
 const FragLevel = struct {
     /// Misses per extra byte of step (log2).
     skip_log2: u5,
@@ -2059,7 +2058,7 @@ const FragState = struct {
 
 /// The command for the literals `data[lit_start..p)` and a copy of `len`
 /// bytes at `dist` (`len` 0: the block's final literals) into `st`. (Not
-/// inlined it saved instructions but cost 4-5 % cycles, 2026-10-15.)
+/// inlined it saved instructions but cost 4-5 % cycles,.)
 inline fn fragCommand(st: *FragState, lit_start: usize, p: usize, len: usize, dist: usize) void {
     const insert = p - lit_start;
     const r = fragResolve(insert, len, dist, st.ring.last[0]);
@@ -2086,8 +2085,7 @@ inline fn fragCommand(st: *FragState, lit_start: usize, p: usize, len: usize, di
 /// where the table has no copy, the newest position of the prefix
 /// dictionary's bucket is tried (google/brotli's quality 1 does not search a
 /// dictionary at all). Responses of 4–32 KiB against dictionaries of 16 and
-/// 256 KiB: 6–14 % smaller than without, in 0.98–1.17× the time
-/// (2026-10-16).
+/// 256 KiB: 6–14 % smaller than without, in 0.98–1.17× the time.
 fn buildFrag(
     comptime px: bool,
     comptime lv: FragLevel,
@@ -2283,7 +2281,7 @@ fn buildCommands(
             // next 8 positions are only inserted, every second one, and
             // `4 * skip_after` later the next 16, every fourth — google's
             // steps (the gradual `.q4`-like ramp before cost fonts 1.3× of
-            // google q6's time, 2026-10-16).
+            // google q6's time).
             if (sparse and p > skip_from) {
                 const far = p > skip_from + 4 * skip_after;
                 const step: usize = if (far) 4 else 2;
@@ -2341,7 +2339,7 @@ fn buildCommands(
 /// feed, form feed and carriage return) in more than one byte of 128:
 /// fonts, executables and archives are full of zeros and small numbers.
 /// Every 16th byte is looked at: a scan of all of them was 6 % of
-/// `.q6` on text (bench, 2026-10-15).
+/// `.q6` on text (bench).
 fn looksBinary(block: []const u8) bool {
     var n: usize = 0;
     var i: usize = 0;
@@ -3587,7 +3585,7 @@ fn clusterLiterals(src: anytype, mode: u2, scratch: *ClusterScratch, out: *Liter
 /// The literal model for a block: context-free (one code) at `.q4`, or
 /// when the literals are too few or too random for contexts to pay; else the
 /// cheapest clustering over the UTF8, LSB6 and SIGNED context modes. SIGNED
-/// wins on fonts (TTF: 1.2–2.2 % smaller than UTF8, 2026-10-15; google picks
+/// wins on fonts (TTF: 1.2–2.2 % smaller than UTF8,; google picks
 /// it there too); MSB6 never won on anything measured, so it is not tried.
 fn chooseLiteralModel(gpa: std.mem.Allocator, src: anytype, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
     return chooseLiteralModelIn(gpa, null, src, effort, out);
@@ -3629,8 +3627,7 @@ fn chooseLiteralModelIn(gpa: std.mem.Allocator, scratch_in: ?*ClusterScratch, sr
         // symbol used once) is a floor under its clustered cost: merging
         // never lowers entropy. A mode whose floor is no better than the
         // best so far cannot win and is skipped, cheapest floor first. Same
-        // choice as clustering all three; on fonts most modes go
-        // (2026-10-15).
+        // choice as clustering all three; on fonts most modes go.
         var used: u32 = 0;
         for (out.single) |c| used += @intFromBool(c != 0);
         const header_floor = 40 + 5 * @as(f64, @floatFromInt(used));
@@ -3851,7 +3848,7 @@ const Layout = struct {
 /// The commands of a meta-block, with block switches when `split`. Without,
 /// the codes and maps are copied into locals: behind slices, every
 /// `writeBits` (a store) made the compiler load them again per command —
-/// `.q6` was 7 % slower in cycles (2026-10-15).
+/// `.q6` was 7 % slower in cycles.
 fn emitCommands(
     comptime split: bool,
     w: *BitWriter,
@@ -4190,8 +4187,7 @@ fn writeCompressedBlock(
             // Each type's own model — its own context mode and grouping — then
             // the codes of all types merged where one code serves several. (One
             // mode and grouping for all types, with a code per (type, group),
-            // was 8 % faster at `.q9` but 0.2–0.5 % larger on fonts,
-            // 2026-10-15.)
+            // was 8 % faster at `.q9` but 0.2–0.5 % larger on fonts.)
             const first_tree = try gpa.alloc(u32, nlt + 1);
             defer gpa.free(first_tree);
             const ranges = try gpa.alloc([2]u32, blocks[0].split.lens.len);
@@ -4362,7 +4358,7 @@ fn writeCompressedBlock(
         try writeContextMap(gpa, &scratch, &.{}, 1);
         // A block without literals still needs its one code (a one-symbol
         // simple code, `padded` for the others): without it the whole block
-        // was refused and stored (found 2026-10-16, a 16 KiB tail of a
+        // was refused and stored (found, a 16 KiB tail of a
         // 17 MiB input, 19 → 16 387 bytes, once thirteen contexts were on).
         const no_lits = std.mem.allEqual(u32, &single_counts, 0);
         if (no_lits) single_counts[0] = 1;
@@ -4481,7 +4477,7 @@ fn writeFragmentBlock(
     // pending, so up to 57 bits are added between flushes. Plain locals, not
     // a struct behind a pointer: a store through `ptr` may alias anything
     // in memory, and such a struct's fields were reloaded after every one
-    // (a third of `.q0`'s cycles on html, 2026-10-15).
+    // (a third of `.q0`'s cycles on html).
     try w.room((w.cnt + payload) / 8 + 16);
     const base = w.buf.items.ptr + w.buf.items.len;
     var ptr = base;
@@ -4588,7 +4584,7 @@ const TypeWalk = struct {
 };
 
 // ---------------------------------------------------------------------------
-// `.q0` (2026-10-16): google/brotli's quality 0, ported from
+// `.q0`: google/brotli's quality 0, ported from
 // `c/enc/compress_fragment.c` (`BrotliCompressFragmentFast`) and the default
 // command code of `c/enc/encode.c` (`InitCommandPrefixCodes`) — MIT,
 // copyright Google Inc., see this module's NOTICE. One pass: the literal
@@ -4598,7 +4594,7 @@ const TypeWalk = struct {
 // two commands — "insert N, copy 2" with its distance, then "insert 0, copy
 // the rest" at the last distance — whose symbols the codes keep in an order
 // that saves branches (`Q0Codes`). No record, no second pass: the parse
-// and writer of `.q1` cost twice the instructions a command (2026-10-15).
+// and writer of `.q1` cost twice the instructions a command.
 // Changes: one call per `Core` block (google: per input chunk), the hash
 // table is `FragMatcher`'s, bits go through `Q0Bits` (locals, a
 // branch-free flush), a block larger than stored is stored by
@@ -4990,7 +4986,7 @@ inline fn q0IsMatch(in: []const u8, p1: usize, p2: usize) bool {
 /// candidate for `ip` comes out of it.
 inline fn q0AfterCopy(in: []const u8, table: []u32, ip: usize, shift: u6) usize {
     // A load per position, not google's one load shifted four ways: LLVM
-    // took those shifts apart byte by byte (2026-10-27).
+    // took those shifts apart byte by byte.
     const cur = q0Hash(in, ip, shift);
     table[q0Hash(in, ip - 3, shift)] = @intCast(ip - 3);
     table[q0Hash(in, ip - 2, shift)] = @intCast(ip - 2);
@@ -5022,7 +5018,7 @@ const Q0Block = struct {
 fn q0Commands(comptime table_bits: u6, b_io: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, next_emit_io: *usize) ?usize {
     // The bit writer, `next_emit` and `x`'s fields in locals whose address
     // never leaves this function (the same instructions as through the
-    // pointers, 2026-10-27, but the bench's layout came out 3-5 % faster).
+    // pointers,, but the bench's layout came out 3-5 % faster).
     var bits = b_io.*;
     defer b_io.* = bits;
     const b = &bits;
@@ -5350,7 +5346,7 @@ fn sliceCost(h: []const u32) f64 {
 fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_max]u32, n_dist: usize, map: *[dist_contexts]u8) usize {
     // The cost of each non-empty set of contexts under one code, once: a
     // partition's groups are such sets (zeroing and summing per group of
-    // each partition was 5 % of `.q6` on a 4 KiB font, 2026-10-16).
+    // each partition was 5 % of `.q6` on a 4 KiB font).
     var set_cost: [1 << dist_contexts]f64 = undefined;
     {
         var merged: [dist_alphabet_max]u32 = undefined;
@@ -5649,14 +5645,14 @@ pub const Effort = enum(u4) {
     /// input of `size` bytes: 2^`per_byte` slots a byte, up to a cap. Sized
     /// to the input because every call gets a fresh table, and a fresh page
     /// costs a fault when first touched: at one bucket per byte (the sizing
-    /// until 2026-10-15) the positions of a 16 KiB input landed on every
+    /// previously) the positions of a 16 KiB input landed on every
     /// page of `.q6`'s 2 MiB, most of its time (R16). The fuller buckets of
     /// a smaller table are what every input past the cap has anyway; sizes
     /// moved by ±0.3 % on 4–64 KiB slices of text, HTML, JSON and a font.
     /// `.q9`'s cap is 2^22 slots, 16 MiB (google q9: 2^15 buckets of 256,
     /// 32 MiB): at 2^20 a 1.3–5.8 MB text walked buckets of positions that
     /// share no more than their hash bits, at 1.2–1.6× google's time and
-    /// 0.3–1.2 % larger (2026-10-16); inputs under 512 KiB are unchanged.
+    /// 0.3–1.2 % larger; inputs under 512 KiB are unchanged.
     fn slotsLog(e: Effort, size: usize) u5 {
         const cap: u5, const per_byte: u5 = switch (e) {
             .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
@@ -5722,7 +5718,7 @@ pub const CompressOptions = struct {
     /// `block_size` and `window_bits` clamped into their ranges (google
     /// `SanitizeParams` clamps `lgwin`): every entry point takes its options
     /// through this, so no value of either field can hang (`block_size` 0
-    /// looped forever) or write a header no decoder reads (2026-10-27).
+    /// looped forever) or write a header no decoder reads.
     pub fn sanitized(o: CompressOptions) CompressOptions {
         var r = o;
         r.block_size = std.math.clamp(o.block_size, 1, compressed_block_size);
@@ -5773,7 +5769,7 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts_in: Compress
 
 /// The longest input the one-shot path compresses itself: its match
 /// finders keep positions as `u32`. A cast past it panicked in a safe build
-/// and was UB in ReleaseFast (no-panic sweep 2026-10-28, B-1).
+/// and was UB in ReleaseFast (no-panic sweep, B-1).
 const one_shot_max: usize = std.math.maxInt(u32);
 
 /// `compressWith(gpa, input, opts)`'s bytes, through a `StreamWriter` to
@@ -5927,7 +5923,7 @@ pub fn maxCompressedSize(n: usize, opts_in: CompressOptions) usize {
 /// `dictionary` and `prepared_dictionary` both set name two dictionaries
 /// for one stream: refused in every build mode (an `assert` was UB in
 /// ReleaseFast, where the prepared one silently won and the decoder, handed
-/// `dictionary`, read garbage; no-panic sweep 2026-10-28, B-2).
+/// `dictionary`, read garbage; no-panic sweep, B-2).
 pub fn checkOneDictionary(raw: []const u8, prepared: ?*const PreparedDictionary) void {
     if (raw.len != 0 and prepared != null)
         @panic("brotli: set dictionary or prepared_dictionary, not both");
@@ -6017,7 +6013,7 @@ pub const Core = struct {
     /// its codes, histograms and context models come and go dozens of times
     /// a block, and kept between blocks and calls they cost the allocator
     /// nothing after the first. Under Zig 0.16's `smp_allocator` that also
-    /// stops a leak (std defect, 2026-10-16: a thread that runs out of a
+    /// stops a leak (std defect,: a thread that runs out of a
     /// size class moves to another thread slot's free lists for good —
     /// `max_alloc_search` 1 — and what it freed before stays behind, so the
     /// 16 and 32 KiB classes got a new 64 KiB slab on every call: `.q4` on a
@@ -6041,7 +6037,7 @@ pub const Core = struct {
     /// large inputs (`WideMatcher`: H68 at q5–q7, H6 at q8–q9) where google
     /// picks it — a size hint of 1 MiB or more and a window of 19 bits or
     /// more (`ChooseHasher`), not a large window (google's H65 there, not
-    /// ported) — else the effort's own (R14, 2026-10-16).
+    /// ported) — else the effort's own (R14).
     fn kindFor(effort: Effort, wbits: u5, size_hint: usize) Kind {
         return switch (effort.finder()) {
             .frag => .frag,
@@ -6371,7 +6367,7 @@ pub const Core = struct {
                 // position, and for a static-dictionary word where no copy
                 // is found. (Words at `.q6` too, as google/brotli from q5:
                 // text −0.7 %, small UTF-8 −7.5 %, for 5–10 % of its time —
-                // left out by the owner, 2026-10-15.)
+                // left out by the owner,.)
                 const skip: usize = if (e == .q6) 64 else std.math.maxInt(usize);
                 const simd = e == .q6;
                 const px = c.searching();
@@ -6922,7 +6918,7 @@ test "sortKeys: ascending, as a library sort, at every length up to an alphabet"
     }
 }
 
-/// A histogram found by a search (2026-10-16) where a stride's count meets
+/// A histogram found by a search where a stride's count meets
 /// `optimizeCountsForRle`'s streak bound exactly: `>=` and `>` part there.
 const rle_kat_case4 = [256]u32{
     4,  2,  4,  3,  3,  2,  4,   3,   2,   3,   4,   2,   0,   1,   0,   0,   4,   1,   0,   0,   1,   0,   3,   3,   58,  58,  58,  58, 58,
@@ -6959,7 +6955,7 @@ fn rleKatCase(n: u32, buf: *[tables.num_command_symbols]u32) []u32 {
 test "optimizeCountsForRle: google/brotli's smoothing, count for count" {
     // SHA-256 of the counts (u32 little-endian) google/brotli 1.2.0's
     // `BrotliOptimizeHuffmanCountsForRle` leaves, from
-    // `tools/c_oracle/rle_counts_kat.c` (2026-10-16). It changes 30, 291,
+    // `tools/c_oracle/rle_counts_kat.c`. It changes 30, 291,
     // 207 and 153 of the first four; the fifth parts `>=` from `>` at the
     // streak bound. (The initial `+ 420` cannot be told from `+ 400` by any
     // input: `256·c − ⌊256·S/3⌋` is ⌈256k/3⌉, never in the 20 between.)
@@ -7190,7 +7186,7 @@ test "compressInto: the stream compressWith gives, in exactly its length; a byte
 }
 
 test "options out of range are clamped, not a hang or a bad header (block_size 0, window_bits 0..31)" {
-    // Review 2026-10-27: `block_size = 0` looped forever in `maxCompressedSize`
+    // Review: `block_size = 0` looped forever in `maxCompressedSize`
     // and in the one-shot block loop (a debug assert only), and a window
     // outside 10..30 wrote a header no decoder accepts.
     const gpa = testing.allocator;
@@ -7894,7 +7890,7 @@ test "Core.reinit: the match finder's tables as init leaves them, on the kept me
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

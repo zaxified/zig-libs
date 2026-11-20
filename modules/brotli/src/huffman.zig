@@ -7,9 +7,9 @@
 //! `1 << root_bits` entries holds every code up to that length, a shorter one
 //! repeated; a longer code's root entry links to a subtable indexed by the bits
 //! after the root. The root is always `root_bits` wide (as google/brotli's), so
-//! a decoder masks with a constant (2026-10-15: `bits` was `min(max length,
+//! a decoder masks with a constant (`bits` was `min(max length,
 //! root_bits)`, a load and a variable mask per symbol). A flat table of `1 << 15` entries (128 KiB) per literal
-//! tree missed the cache on most lookups (bench 2026-10-11). Decoding peeks
+//! tree missed the cache on most lookups (bench). Decoding peeks
 //! `bits` bits, indexes the root, follows a link once, and drops the entry's
 //! actual code length.
 

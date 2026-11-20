@@ -106,7 +106,7 @@ pub const StreamWriter = struct {
 
     /// `buffer` must outlive the writer; it may be empty (every write then
     /// goes straight to `drain` — the `assert` that refused it was UB in
-    /// ReleaseFast; no-panic sweep 2026-10-28, B-3). `gpa` holds the
+    /// ReleaseFast; no-panic sweep, B-3). `gpa` holds the
     /// history and the match finder's table.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts_in: StreamOptions) std.mem.Allocator.Error!StreamWriter {
         const opts = opts_in.sanitized();
@@ -815,7 +815,7 @@ test "a warm writer allocates nothing: the next stream after reset, every level"
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

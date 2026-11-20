@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Hand-built streams for the decoder's guards (mutation run 2026-10-04).
+//! Hand-built streams for the decoder's guards (mutation run).
 //!
 //! Every stream here is written bit by bit from RFC 7932 (section numbers in
 //! the comments), not produced by this module's encoder, so each expectation is
@@ -674,7 +674,7 @@ test "crafted: stream: bytes after the stream stay in the reader (at most 8 are 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     _ = try brotli.decompressStream(testing.allocator, &in, &out.writer, .{});
-    // Since 2026-10-15 exactly: what the bit reader read ahead goes back.
+    // Since exactly: what the bit reader read ahead goes back.
     try testing.expectEqual(@as(usize, 100), in.bufferedLen());
     try testing.expectEqual(@as(u8, 0xEE), try in.peekByte());
 }
@@ -884,7 +884,7 @@ test "crafted: a complex prefix code with a single used symbol is refused" {
     try expectErr(w.bytes.items, error.InvalidHuffman);
 }
 
-// --- the hot loop's input margin (mutation run 2026-10-15) ----------------------
+// --- the hot loop's input margin (mutation run) ----------------------
 
 /// A command code where every one of the 704 symbols is 9 or 10 bits long
 /// (section 3.5): the code-length code has only 9 and 10, one bit each, so
@@ -981,7 +981,7 @@ test "crafted: a command header that needs a second refill near the end of the i
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

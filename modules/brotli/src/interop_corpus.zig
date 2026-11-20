@@ -4,7 +4,7 @@
 //! matrix of reference-produced streams the decoder is judged on.
 //!
 //! It exists as its own file, reachable from `root.zig`, for one structural
-//! reason. Until 2026-09-06 these shapes lived in `src/reference_interop.zig`,
+//! reason. Until these shapes lived in `src/reference_interop.zig`,
 //! which spawned `python3` from inside `test-brotli`. That file is now a
 //! standalone program under `tools/`, and a program cannot `@import` a path
 //! outside its own module root — so the one shared table has to live in the
@@ -448,7 +448,7 @@ pub const dict_cases = [_]DictCase{
 
 /// The qualities the reference compresses each `DictCase` at: q2 does not
 /// search the dictionary (its quick hashers have no compound-dictionary
-/// form: 18 836 vs 18 832 bytes without, alice29, 2026-10-16) but still
+/// form: 18 836 vs 18 832 bytes without, alice29) but still
 /// counts static-dictionary words past it; q5+ search it with the deep
 /// hashers and context modelling, q11 with the optimal parse.
 pub const dict_qualities = [_]u8{ 2, 5, 9, 11 };
@@ -720,7 +720,7 @@ pub const ref_streams = [_]RefStream{
 
     // UTF8-mode context modelling over every two-byte lead-byte class
     // (`tools/gen_utf8_mix.py`): 0xD0..0xDF as `p2` was misclassed until
-    // 2026-10-15, and these streams were refused.
+    // and these streams were refused.
     .{ .input = "utf8-mix", .quality = 5, .lgwin = 22, .file = "utf8-mix.q5.w22.br" },
     .{ .input = "utf8-mix", .quality = 9, .lgwin = 22, .file = "utf8-mix.q9.w22.br" },
     .{ .input = "utf8-mix", .quality = 11, .lgwin = 22, .file = "utf8-mix.q11.w22.br" },

@@ -128,7 +128,7 @@ fn addWindow(comptime T: type, h: []u32, syms: []const T, at: usize, len: usize)
 const lanes = 8;
 /// Costs in the assignment pass: bits in fixed point (`one` = 1 bit), so
 /// the per-symbol minimum is integer lanes — a float minimum is lowered
-/// lane by lane for its NaN rules (perf annotate, 2026-10-15).
+/// lane by lane for its NaN rules (perf annotate).
 const V = @Vector(lanes, u32);
 const one = 1 << 12;
 /// A padding lane's price: out of reach, and no sum of costs overflows.
