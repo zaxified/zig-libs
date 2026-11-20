@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [lightningnetwork/lightning-onion](https://github.com/lightningnetwork/lightning-onion) (lnd's `sphinx`) — **reference** | Go | MIT | 415 | push 2026-06-24 (no releases) | Repo listing shows, next to `sphinx.go`/`path.go`/`payload.go`: `error.go` + `obfuscation.go` (return-path error obfuscation), `replaylog.go`/`replay_set.go`/`batch.go` (replay protection with batched processing), `hornet.go`. This module has construct + process, and (since 2026-11-17) the `failure` return-path functions; the replay hook is a callback, not a log. |
+| [lightningnetwork/lightning-onion](https://github.com/lightningnetwork/lightning-onion) (lnd's `sphinx`) — **reference** | Go | MIT | 415 | push 2026-06-24 (no releases) | Repo listing shows, next to `sphinx.go`/`path.go`/`payload.go`: `error.go` + `obfuscation.go` (return-path error obfuscation), `replaylog.go`/`replay_set.go`/`batch.go` (replay protection with batched processing), `hornet.go`. This module has construct + process and the `failure` return-path functions; the replay hook is a callback, not a log. |
 | [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `onion_utils` builds/peels payment onions, failure packets and attribution data, plus route blinding *(inferred)*. |
 | [ElementsProject/lightning](https://github.com/ElementsProject/lightning) (Core Lightning) | C | BSD-MIT (`LICENSE`; `ccan/` has its own) | 3.1k | v26.06.8 (2026-09-22) | `sphinx.c` in `common/`: construct, process, error wrapping *(inferred)*. |
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | `Sphinx.scala`: packets, replay-protected peel, failure packets, blinded routes *(inferred)*. |
@@ -59,7 +59,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     the secret for the failure packet; `process` does not hand it out).
   - Return path (`failure.zig`) — see "Returning Errors" below.
 - **std recon** (confirmed against `lib/std/crypto/pcurves/secp256k1.zig`
-  and `lib/std/crypto/chacha20.zig`, Zig 0.16.0; the module itself now takes
+  and `lib/std/crypto/chacha20.zig`, Zig 0.16.0; the module itself takes
   `Secp256k1` from the sibling `k256`, whose API mirrors std's):
   - ECDH point: `Secp256k1.fromSec1(&pubkey_33_bytes)` parses a compressed
     (or uncompressed/identity) SEC1-encoded point, rejecting anything
@@ -115,21 +115,27 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ss`, plus the point-multiply for the pubkey it forwards onward) without
   ever materializing the full array — see `core.process`'s doc comment,
   step 9.a.
+- **Replay-protection hook** (BOLT#4's replay rule: a node remembers the `SHA256(shared secret)` of the onions it
+  has processed and refuses a repeat). `ProcessResult.replay_tag` is that 32-byte tag. `processWithHook(priv, pkt,
+  ad, ReplayHook)` calls the caller's `hook.check(ctx, &tag)` after the HMAC verified (so a forger without the hop
+  key cannot fill the log) and before unwrapping; `false` returns `error.Replayed` (`ProcessHookError`) and the
+  packet is not unwrapped. The module stores no log (lnd ships `replaylog`; here the caller owns it): `check`
+  should record the tag atomically with the test, and must not panic or reenter `process`. `process` itself never
+  consults a hook.
 
 ## Threat model / limits
 
-- **Secret residue on the dead stack** (review 2026-10-08, `src/stackprobe_test.zig`,
-  ReleaseFast, BOLT#4 vector inputs). Before: `deriveHopSecrets` left blinded ephemeral scalars
-  and a blinding factor in dead frames, `construct` additionally `rho`/`mu`/`pad` keys and the
-  session key, `process` the node's private key and the hop's `mu` (one ephemeral scalar plus the
-  public blinding chain is the whole route's key schedule). Fix (BREAKING): the three entry
-  points take the secret 32-byte key by pointer (`*const [32]u8` — an array passed by value is
-  copied into the CALLER's frame) and run their body one frame down, followed by a 40 KiB zeroing
-  at that depth (volatile vector stores; `process` dirties 32 KiB, `k256`'s 16 KiB `mul` burn
-  included). After: 0 over 31 needles (session key, node key, `e_1..e_4` BE+LE, blinding
-  factors, every `ss_i`/`rho_i`/`mu_i`, pad key) × 4 calls × 3 repeats, negative 0, positive 1.
-  Not covered: `generateKey`/`generateCipherStream` called directly (the ChaCha20 state holds
-  `rho`; same class as `chachapoly`'s backlog "Key copies on the dead stack").
+- **Secret residue on the dead stack** (`src/stackprobe_test.zig`, ReleaseFast, BOLT#4 vector inputs). A
+  function that returns leaves its frames' contents in place, and one ephemeral scalar plus the public blinding
+  chain is the whole route's key schedule. So `deriveHopSecrets`, `construct`, `process`, `processWithHook` and
+  `sharedSecret` take the secret 32-byte key by pointer (`*const [32]u8` — an array passed by value is copied into
+  the CALLER's frame) and run their body one frame down (`noinline`), followed by a 40 KiB zeroing at that depth
+  (volatile vector stores). `generateKey` / `generateCipherStream` run under their own 2 KiB burn (one HMAC /
+  one ChaCha20 state per call), and `failure.create` / `forward` / `unwrap` under 8 KiB. The probes scan for the
+  session key, the node keys, the blinded ephemeral scalars (both byte orders), the blinding factors, every hop's
+  shared secret and `rho`/`mu` keys and the padding key, next to a negative and a positive control
+  (`stackprobe_test.zig`: `deriveHopSecrets`, `construct`, `process`; `stackprobe2_test.zig`: key derivation and
+  the failure functions).
 - **Per-hop unlinkability is the module's entire reason to exist.** Two
   distinct properties, both required, neither sufficient alone:
   - **Ephemeral-key blinding** (`deriveHopSecrets`'s blinding-factor chain,
@@ -188,26 +194,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `process` operates on values that are either fully public (the packet
   bytes) or, once past the HMAC gate, this node's own already-established
   secrets.
-  - **What ctgrind measured (2026-09-09, ReleaseFast, see CHANGELOG) — the
-    paragraph above is the intent, not what the binary does:** construct
-    10 / process 43 tainted contexts. (1) std's secp256k1 scalar code is
-    NOT branch-free here: `cmovznzU64` (`secp256k1_scalar_64.zig:104`), a
-    branchless bitmask select in source, compiles to `test $0x1,%al; jne`
-    at ReleaseFast — std's code, under every secp256k1 consumer, not
-    something this module adds or can fix. (2) `process`'s final-hop test
-    is a secret-derived comparison (`frame.hmac` is deobfuscated with the
-    shared secret). Until 2026-10-06 it was `std.mem.allEqual`, an early-exit
-    loop LLVM happened to vectorise into one `vptest`/`je` — safe by
-    accident. It is now `timing_safe.eql` against an all-zero HMAC
-    (`process`'s final-hop check, pinned by `check-ct-compare`), constant-time by
-    construction like the HMAC gate (`process`'s `mu` check). Re-measured 2026-10-06:
-    `process` 40 in-file contexts before and after, line for line the same;
-    the one at the final-hop check is the branch on the verdict (the hop's own
-    forward-or-deliver decision), not the comparison. Re-measured
-    2026-10-08 after the dead-stack fix: `construct` 7 (k256's comb identity
-    rejection 2 -> 1), `process` 44 — the +4 are memcpy contexts on the same
-    source line as before (the next `hop_payloads` copied from the decrypted
-    frame's offset), chunked differently; diff in `ctgrind-expected.tsv`.
+  - **What ctgrind measures** (`scripts/checks/ctgrind.sh sphinx`, ReleaseFast, rows `construct` and `process`;
+    the expected counts and source digests are pinned in `scripts/checks/ctgrind-expected.tsv`: `construct` 7
+    in-file contexts, `process` at most 47, controls 0) — the paragraph above is the intent, not what the
+    binary does. (1) std's secp256k1 scalar code is NOT branch-free here: `cmovznzU64`
+    (`secp256k1_scalar_64.zig`), a branchless bitmask select in source, compiles to `test $0x1,%al; jne` at
+    ReleaseFast — std's code, under every secp256k1 consumer, not something this module adds or can fix. (2)
+    `process`'s final-hop test is a secret-derived comparison (`frame.hmac` is deobfuscated with the shared
+    secret); it is `timing_safe.eql` against an all-zero HMAC (pinned by `check-ct-compare`), constant-time by
+    construction like the HMAC gate, and the one in-file context at that line is the branch on the verdict (the
+    hop's own forward-or-deliver decision), not the comparison. Some `process` contexts are `memcpy` contexts on
+    the source line that copies the next `hop_payloads` out of the decrypted frame.
 - **Out of scope for this module** (left to whatever protocol layer wires
   it in): the `payload` TLV field's own value semantics (`amt_to_forward`,
   `short_channel_id`, `payment_data`, etc. — BOLT#4's own payload-format
@@ -218,11 +215,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   plain Sphinx, not part of the base onion construction/decryption this
   module implements), and `attribution_data` on the return path.
 
-## Returning Errors (`failure.zig`, 2026-11-17)
+## Returning Errors (`failure.zig`)
 
 BOLT#4 "Returning Errors", classic form: `hmac(32) ‖ failure_len(u16) ‖ failuremsg ‖ pad_len(u16) ‖ pad`, HMAC-SHA256 under
 `um` over everything after the hmac, then the whole packet XORed with the ChaCha20 stream of the `ammag` key
-(`KeyType.ammag` is new; the key labels are the ones of "Key Generation"). Three roles, no allocation:
+(`KeyType.ammag` is the key label for it; the labels are the ones of "Key Generation"). Three roles, no allocation:
 
 - `create(out, ss, failuremsg)` (erring node; `createPadded` with an explicit pad): pad is zero bytes and brings
   `failure_len + pad_len` to exactly 256 (spec: MUST be at least 256, SHOULD be exactly 256; a longer message gets no pad).
@@ -235,154 +232,104 @@ BOLT#4 "Returning Errors", classic form: `hmac(32) ‖ failure_len(u16) ‖ fail
   not inspected). `failuremsg` itself (BOLT#4 "Failure Messages") is the caller's.
 - `sharedSecret(out, node_privkey, ephemeral_pubkey)` gives a relay (or the erring node) the secret it needs for `create`/`forward`.
 
-**Reference (owner rule 2026-11-17).** Read for this change: BOLT#4 text and `bolt04/onion-error-test.json` (`lightning/bolts`
+**Reference.** Read: BOLT#4 text and `bolt04/onion-error-test.json` (`lightning/bolts`
 master), and lnd's `lightning-onion` `DecryptError`/`EncryptError` (`crypto.go`). Matching lnd: the origin refuses a packet shorter than
 292 bytes (`2 + 2 + 256 + 32`, `PacketTooShort`), compares the HMAC in constant time, always runs a fixed number of rounds
 (spec: "SHOULD continue decrypting, until the loop has been repeated 27 times"; here `max(27, route length)`, dummy secret
 after the source is found), and returns everything after the hmac to the caller to decode. Differences: lnd keeps decrypting the
 data with the dummy secret and copies; this module peels in place and, once the source is found, only generates and discards the
 stream of the dummy rounds (same cost, packet left decrypted at the source); a route longer than 27 hops gets all its rounds
-(lnd stops at 27). Unverified by reading: LDK and Core Lightning were not read for this change; a packet where no hop verifies is
+(lnd stops at 27). Unverified by reading: LDK and Core Lightning were not read for this module; a packet where no hop verifies is
 `SourceUnidentified` in every implementation the author knows of, but that is from memory.
 
-**Not implemented:** `attribution_data` and the success-path `fulfillment_payload` (the spec's attributable-failure rev); the
-spec's trace vectors for those are not used (only their `error packet for node n` columns, which are plain classic packets).
-Failure messages with `path_key` (blinded paths turn every error into `invalid_onion_blinding`) is the caller's decision.
+**Not provided:** `attribution_data` and the success-path `fulfillment_payload` (the spec's attributable-failure rev;
+see Backlog); the spec's trace vectors for those are not used (only their `error packet for node n` columns, which
+are plain classic packets). Failure messages with `path_key` (blinded paths turn every error into
+`invalid_onion_blinding`) are the caller's decision.
 
-**Tests.** `kat_test.zig`/`failure.zig` against the vectors in `failure_vectors.zig`: `ammag` keys and hop 4's `um` key; the
-simple 2-byte failure from hop 4 through hops 3..0 equals the published 292-byte packet byte-exact and unwraps to hop 4; the
-spec trace (320-byte message, pad 704): the raw packet, hop 2's and hop 0's packets byte-exact; every hop as source; flipped bits,
-short route, empty route, foreign secret; 291/292 length bounds; a route of 40 hops with the source at 30; pad/limit table of
-`create`; truncation in `forward`; chunk-edge sizes against a one-shot stream; `parseFailure` bounds; an authenticated packet with a bad
-`failure_len`; and an end-to-end flow built from `construct`, `process`, `sharedSecret` (relays) and `deriveHopSecrets` (origin).
-The vector's private keys are one repeated byte each, so they cannot see byte order: `sharedSecret` has its own test with an
-asymmetric scalar against raw std ECDH (found by a surviving mutant).
+## The crypto cores
 
-**Mutation 2026-11-17 (delta, 37 mutants, one schemata build, ReleaseSafe):** 35 killed, 2 equivalent: (a) the dummy rounds
-(`max(27, n)` -> `n`): cost-only, the output is the same, only the time differs; (b) dropping `real and` from the HMAC test in a
-dummy round: a dummy-key HMAC matching the packet has probability 2^-256. The compare itself is `timing_safe.eql` (pinned by
-`check-ct-compare`, row `failure.zig 1`); swapping it for `mem.eql` is value-equivalent. The `secureZero` calls and the
-dead-stack burns are not mutated (the burn makes each wipe redundant; `stackprobe2_test.zig` is their test, ReleaseFast).
-The card counts are cumulative: 33/36 (3 eq) before + 35/37 (2 eq) = 68/73 (5 eq).
-
-`ctgrind --check sphinx` after the change: `construct` 7 in-file, `process` 45 in-file (pin `<=47`), controls 0; only the source digest moved (9846f38c71f15c7b -> 8df3507d45f1fbeb: `core.zig` and `keyderive.zig` changed), re-pinned.
-
-**Not verified:** `ctgrind` for the new functions (none are in the harness; `unwrap` is built from `timing_safe.eql` and
-std's HMAC/ChaCha, no branch on a secret except the found/not-found verdict) and the ReleaseFast stack probe for `sharedSecret`
-(it runs under `process`'s burn size; the probe for `create`/`forward`/`unwrap` is in `stackprobe2_test.zig`).
-
-## TODO(fable) — done record (fill-in pass completed 2026-07-12)
-
-All three `core.zig` stubs were implemented in the checklist's dependency
-order and every formerly-`SkipZigTest` KAT assertion was re-enabled (plus
-new ones); `kat_test.zig` now carries zero skips:
-
-1. **`deriveHopSecrets`** — implemented exactly per its doc-comment recipe
-   (ECDH via `Secp256k1.fromSec1(pubkey).mul(scalar, .big)` →
-   `.toCompressedSec1()` → `Sha256.hash`; blinding factor
-   `SHA256(epk ‖ ss)`; scalar chain via `Secp256k1.scalar.mul(_, _, .big)`,
-   point chain via one point-multiply per hop instead of a fresh base-point
-   multiply). Reproduces all 5 `kat_vectors.shared_secrets` byte-exact, and
-   `epk_0 == pubkeys[0]` (the fixture's documented session_key ==
-   node_privkeys[0] coincidence). `scalar.mul`'s `error.NonCanonical` (a
-   blinding factor ≥ the group order, probability ~2^-128) folds into
-   `error.IdentityElement` — same "degenerate scalar" class, fail closed.
-2. **`construct`** — validation (hop-count match, `max_hops` = 37 cap,
-   reserved-length payloads, total `shiftSize` ≤ 1300) before any EC math,
-   then `deriveHopSecrets`, filler generation, `pad`-stream seeding, and
-   the reverse-order right-shift/write-frame/XOR/HMAC wrap loop. The
-   filler recurrence used (derived from the `process`-side identity, see
-   the inline comment): with `L` = filler length so far and `s` = hop i's
-   `shiftSize`, `filler' = (filler ‖ 0^s) XOR rho_i-stream[1300-L ..
-   1300+s]` — the stream slice starts mid-stream because hop i's unwrap
-   XORs a 2600-byte stream against `(view ‖ 0^1300)` and the freshly
-   revealed tail lands at exactly those offsets. **Reproduces
-   `kat_vectors.onion` (the official published 1366-byte packet)
-   byte-exact** — the module's make-or-break oracle.
-3. **`process`** — receiver-direction ECDH, `mu`-HMAC verify via
-   `std.crypto.timing_safe.eql` (fail closed, `error.
-   IntegrityCheckFailed`), 2600-byte deobfuscation, `hopframe.
-   readHopFrame` (bigsize/short-buffer failures mapped to `error.
-   MalformedPayload`, plus a `frame.consumed <= 1300` bound so a hostile
-   length can never index the zero-padding half or overflow
-   `payload_buf`), all-zero `next_hmac` ⇒ final hop, else the
-   blinding-factor point-multiply for the outgoing `public_key` and the
-   `[consumed .. consumed+1300]` slice as the outgoing `hop_payloads`.
-   Verified against hop 0 of the published packet AND a full 5-hop
-   `construct` → `process` round-trip (every hop's TLV recovered, each
-   intermediate `next_packet` re-parses as a valid wire packet, final hop
-   flagged `next_packet == null`); 1-bit hmac tamper and wrong-node-key
-   probes both fail closed.
+- **`deriveHopSecrets`** — ECDH via `Secp256k1.fromSec1(pubkey).mul(scalar, .big)` → `.toCompressedSec1()` →
+  `Sha256.hash`; blinding factor `SHA256(epk ‖ ss)`; the scalar chain via `Secp256k1.scalar.mul(_, _, .big)`, the
+  point chain via one point-multiply per hop instead of a fresh base-point multiply. `scalar.mul`'s
+  `error.NonCanonical` (a blinding factor at or above the group order, probability ~2^-128) folds into
+  `error.IdentityElement` — the same "degenerate scalar" class, fail closed.
+- **`construct`** — all cheap validation runs before any EC math: `HopCountMismatch` (no hops, or a different
+  number of payloads), `RouteTooLong` (more than `max_hops` = 37 hops, or the total `shiftSize` above the 1300-byte
+  budget), `ReservedPayloadLength`. Then `deriveHopSecrets`, filler generation, `pad`-stream seeding and the
+  reverse-order right-shift / write-frame / XOR / HMAC wrap loop. The filler recurrence, with `L` the filler
+  length so far and `s` hop i's `shiftSize`, is `filler' = (filler ‖ 0^s) XOR rho_i-stream[1300-L .. 1300+s]`: the
+  stream slice starts mid-stream because hop i's unwrap XORs a 2600-byte stream against `(view ‖ 0^1300)` and the
+  freshly revealed tail lands at exactly those offsets. It reproduces `kat_vectors.onion`, the official published
+  1366-byte packet, byte-exact — the module's make-or-break oracle.
+- **`process`** — receiver-direction ECDH, then the `mu` HMAC verified with `std.crypto.timing_safe.eql` (fail
+  closed, `error.IntegrityCheckFailed`) before anything depends on the payload; the hop's replay tag (see below);
+  2600-byte deobfuscation; `hopframe.readHopFrame` (bigsize and short-buffer failures map to
+  `error.MalformedPayload`, a reserved length to `error.ReservedPayloadLength`) plus a `frame.consumed <= 1300`
+  bound so a hostile length can never index the zero-padding half or overflow `payload_buf`; an all-zero
+  `next_hmac` marks the final hop (`next_packet == null`), otherwise the blinding-factor point-multiply gives the
+  outgoing `public_key` and the `[consumed .. consumed+1300]` slice the outgoing `hop_payloads`.
 
 ## Verification
 
-- KAT oracle: the official BOLT#4 test vector, fetched directly from
-  `lightning/bolts` (raw GitHub, `master` branch) for this pass:
-  `bolt04/onion-test.json` (the `generate` input, the assembled 1366-byte
-  `onion`, and the `decode` array of 5 node private keys) plus
-  `04-onion-routing.md`'s "# Test Vector" section (the 5 per-hop
-  `shared_secret` values, published there rather than in the JSON).
-  Embedded verbatim in `src/kat_vectors.zig` — see its doc comment for the
-  exact provenance split between the two source files.
-- **Independent re-derivation log** (not just "copied the spec's numbers"):
-  while building `kat_vectors.zig`, the 5 `shared_secrets` were recomputed
-  from scratch in Python (the `ecdsa` PyPI package for secp256k1 point
-  arithmetic only — no Lightning/Sphinx-specific code, no code shared with
-  this Zig module or any Lightning implementation) by directly implementing
-  BOLT#4's "Shared Secret" + "Blinding Ephemeral Onion Keys" formulas:
-  `ss_i = SHA256(compress(pubkey_i * ek_i))`,
-  `bf_i = SHA256(compress(G*ek_i) ++ ss_i)`, `ek_{i+1} = ek_i * bf_i mod n`,
-  starting from `ek_0 = session_key`. All 5 outputs matched the spec's
-  published `shared_secret` values byte-for-byte before being transcribed
-  into `kat_vectors.zig`. This both confirms the doc's shared-secret →
-  hop-index mapping (the source document walks hops in REVERSE, node 4
-  down to node 0) and gives this module a from-scratch, non-Lightning
-  cross-check of the BOLT#4 formula itself, independent of the spec text's
-  own prose description.
-- Exercised (`src/kat_test.zig`, zero skips): `OnionPacket.fromBytes`/
-  `.toBytes()` round-trip on the official 1366-byte packet;
-  `Secp256k1.basePoint.mul` re-derives all 5 published pubkeys from their
-  published private keys (plain std, confirms the KAT data's internal
-  consistency independent of this module's own code); the hop-0 shared
-  secret recomputed directly against raw `std.crypto.ecc.Secp256k1` calls
-  matches `kat_vectors.shared_secrets[0]` byte-exact (an std-only
-  cross-check of `deriveHopSecrets`'s ECDH step); `bigsize.read` and
-  `hopframe.shiftSize` match the vector's 5 real payload lengths (18, 82,
-  18, 18, 272 bytes) exactly; `deriveHopSecrets` reproduces ALL 5
-  published `shared_secrets`; `construct` reproduces the published
-  1366-byte `onion` packet BYTE-EXACT; `process(node_privkeys[0], onion)`
-  extracts `payloads[0]`'s TLV content with a non-null `next_packet`; a
-  full `construct` → 5x `process` round-trip recovers every hop's TLV
-  (each intermediate packet re-parsing as a valid wire packet, final hop
-  flagged); and a 1-bit hmac tamper / wrong-node-key probe both fail
-  closed with `error.IntegrityCheckFailed`. `core.zig` additionally tests
-  its own error paths (`HopCountMismatch`, `ReservedPayloadLength`, both
-  `RouteTooLong` forms, `InvalidPublicKey`).
-- Both `zig build test-sphinx` (Debug) and `-Doptimize=ReleaseFast` pass
-  in full, with no skips; the full repo `zig build test` is green;
-  `zig fmt --check modules/sphinx/` is clean.
-- **Mutation run 2026-10-05** (in-place, Debug, 36 mutants over `construct`'s
-  route checks and filler, `process`'s HMAC gate, frame-error mapping and
-  `consumed` bound, the blinding chain, `hopframe`, `bigsize`, `packet` and
-  `keyderive`): 21 killed on the first pass (two more were mis-written and
-  re-run as valid mutants). Five tests added or extended for the ten others:
-  `process` on genuinely-MACed frames of length 0, 1, a non-canonical BigSize
-  and a 1290-octet payload that runs past 1300 octets (via a test-only
-  sealing helper, since `construct` refuses to emit them); one hop filling
-  exactly 1300 octets through `construct` and `process`; an off-curve
-  ephemeral key passed straight to `process`; the hop frame's one-short
-  destination, length-1 and exact-fit edges; BigSize `fd00fc`. Equivalent:
-  `n > max_hops + 1` (38 hops need at least 38 × 35 > 1300 octets, so
-  `RouteTooLong` comes from the shift total), `construct`'s own `len < 1` for
-  `len < 2` (`writeHopFrame` refuses the same payload with the same error),
-  and `std.mem.eql` for `timing_safe.eql` on the HMAC (same value for every
-  input; pinned by `check-ct-compare.py`, not by a test).
+- **Run:** `scripts/modtest sphinx` (add `-Doptimize=ReleaseFast` for the dead-stack probes, which skip in Debug).
+- **KAT oracle:** the official BOLT#4 test vector, taken from `lightning/bolts`: `bolt04/onion-test.json` (the
+  `generate` input, the assembled 1366-byte `onion`, and the `decode` array of 5 node private keys) plus
+  `04-onion-routing.md`'s "# Test Vector" section (the 5 per-hop `shared_secret` values, published there rather than
+  in the JSON). Embedded verbatim in `src/kat_vectors.zig`; see its doc comment for the provenance split between
+  the two source files. The return-path vectors (`bolt04/onion-error-test.json`) are in `src/failure_vectors.zig`.
+- **Independent re-derivation:** the 5 `shared_secrets` were recomputed from scratch in Python (the `ecdsa` PyPI
+  package for secp256k1 point arithmetic only — no Lightning/Sphinx code, none shared with this module) from
+  BOLT#4's "Shared Secret" + "Blinding Ephemeral Onion Keys" formulas (`ss_i = SHA256(compress(pubkey_i * ek_i))`,
+  `bf_i = SHA256(compress(G*ek_i) ++ ss_i)`, `ek_{i+1} = ek_i * bf_i mod n`, from `ek_0 = session_key`) and matched
+  the spec's published values byte for byte. That confirms the shared-secret → hop-index mapping (the source
+  document walks hops in REVERSE, node 4 down to node 0) independently of the spec's prose. The script is not kept.
+- **Exercised** (`src/kat_test.zig`, no skips): `OnionPacket.fromBytes`/`.toBytes()` round trip on the official
+  packet; `Secp256k1.basePoint.mul` re-derives all published pubkeys from their private keys (plain std, checks
+  the KAT data's own consistency); the hop-0 shared secret recomputed directly against raw
+  `std.crypto.ecc.Secp256k1` calls matches the vector (an std-only cross-check of `deriveHopSecrets`'s ECDH step);
+  `bigsize.read` and `hopframe.shiftSize` match the vector's real payload lengths; `deriveHopSecrets` reproduces
+  all published `shared_secrets`; `construct` reproduces the published `onion` byte-exact; `process` peels hop 0 of
+  the published packet; a full `construct` → `process` round trip recovers every hop's TLV (each intermediate
+  packet re-parsing as a valid wire packet, the final hop flagged); a 1-bit hmac tamper and a wrong node key fail
+  closed with `error.IntegrityCheckFailed`. `core.zig` tests its own error paths (`HopCountMismatch`,
+  `ReservedPayloadLength`, both `RouteTooLong` forms, `InvalidPublicKey`), and `process` on genuinely-MACed frames
+  that `construct` refuses to emit (length 0, 1, a non-canonical BigSize, a payload that runs past 1300 octets, via
+  a test-only sealing helper) and one hop filling exactly 1300 octets.
+- **Return path** (`kat_test.zig`, `failure.zig` against `failure_vectors.zig`): the `ammag` keys and hop 4's `um`
+  key; the simple 2-byte failure from hop 4 through hops 3..0 equals the published 292-byte packet byte-exact and
+  unwraps to hop 4; the spec trace (320-byte message, pad 704): the raw packet, hop 2's and hop 0's packets
+  byte-exact; every hop as source; flipped bits, short route, empty route, foreign secret; the 291/292 length
+  bounds; a route of 40 hops with the source at 30; the pad/limit table of `create`; truncation in `forward`;
+  chunk-edge sizes against a one-shot stream; `parseFailure` bounds; an authenticated packet with a bad
+  `failure_len`; and an end-to-end flow built from `construct`, `process`, `sharedSecret` (relays) and
+  `deriveHopSecrets` (origin). The vector's private keys are one repeated byte each, so they cannot see byte order:
+  `sharedSecret` has its own test with an asymmetric scalar against raw std ECDH.
+- **Fuzz:** deterministic driver, `SPHINX_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`): `sphinx-packet`
+  (`OnionPacket.fromSlice` on damaged genuine packets; accepted means it re-encodes to the input), `sphinx-route`
+  (a whole route built by `construct`, peeled hop by hop; a flipped bit, other associated data or a damaged packet
+  is refused) and `sphinx-forged` (a packet whose HMAC is valid because the sender chose the ephemeral key, with an
+  arbitrary deobfuscated hop frame: `process` returns a result or a typed error, never a panic).
+- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig`, ReleaseFast only (see *Threat model /
+  limits*).
+- **Constant time:** `scripts/checks/ctgrind.sh sphinx`, the rows described under *Threat model / limits*.
+- **Mutation:** whole-module over `construct`'s route checks and filler, `process`'s HMAC gate, frame-error mapping
+  and `consumed` bound, the blinding chain, `hopframe`, `bigsize`, `packet`, `keyderive` and `failure.zig`. The
+  `secureZero` calls and the dead-stack burns are not mutated (the burn makes each wipe redundant; the stack
+  probes are their test).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
+## Open
+
+- `ctgrind` has no rows for the `failure` functions (`unwrap` is built from `timing_safe.eql` and std's
+  HMAC/ChaCha, with no branch on a secret except the found/not-found verdict).
+- `sharedSecret` has no stack probe of its own; it runs under `process`'s burn size.
 
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-17 (`failure.create` / `createPadded` / `forward` / `unwrap` / `parseFailure`, `sharedSecret`; vectors byte-exact; see "Returning Errors") **Failure-message obfuscation / decryption (BOLT#4 "Returning Errors")** *(survey 2026-09-30)* — a forwarding node must wrap failures and a sender must unwrap them to learn which hop failed. Remaining: `attribution_data` (`option_attribution_data`) and the success-path `fulfillment_payload`. Effort: medium; fits §2.
-- ✅ DONE 2026-11-16 (`ProcessResult.replay_tag` = SHA256(ss); `processWithHook` + `ReplayHook`, consulted after the HMAC check, refusal = `error.Replayed`; nothing stored) **Replay-protection hook** *(survey 2026-09-30)* — expose the per-hop shared-secret hash (`SHA256(ss)`, BOLT#4 replay rule) so a caller can plug a log; lnd ships `replaylog`. Effort: small; fits §2.
-- **Route blinding (BOLT#4 "Route Blinding")** *(survey 2026-09-30)* — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (The survey lists it as missing and it matters.)
+- **`attribution_data` and the success-path `fulfillment_payload`** (BOLT#4 `option_attribution_data`: per-hop hold times and truncated HMACs) — the attributable-failure revision of "Returning Errors"; the classic failure packets are implemented. Effort: medium; fits §2.
+- **Route blinding (BOLT#4 "Route Blinding")** — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (The survey lists it as missing and it matters.)
 
 ## Anchoring
 

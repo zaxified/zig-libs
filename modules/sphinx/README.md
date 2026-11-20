@@ -23,9 +23,11 @@ threat model.
 | `hopframe.zig` | Per-hop `bigsize(length) ‖ payload ‖ hmac` framing + shift-size arithmetic (REAL) |
 | `core.zig` | `deriveHopSecrets`/`construct`/`process` — the Sphinx crypto cores; `sharedSecret` — a hop's own ECDH step |
 | `failure.zig` | BOLT#4 "Returning Errors": `create`/`forward`/`unwrap` the return-path failure packet (REAL) |
+| `burn.zig` | The dead-stack burn run around `generateKey` / `generateCipherStream` (`construct`/`process` carry their own in `core.zig`) |
 | `kat_vectors.zig` | The official BOLT#4 test vector, embedded |
 | `failure_vectors.zig` | The BOLT#4 "Returning Errors" vectors, embedded |
 | `kat_test.zig` | KAT assertions against the official vector — all live, zero skips |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `stackprobe2_test.zig`, `ctgrind_harness.zig` | Fuzz driver plumbing, dead-stack probes and the constant-time harness (verification only) |
 
 **Deps:** `k256` (secp256k1 point and scalar arithmetic); the rest is `std.crypto`.
 
