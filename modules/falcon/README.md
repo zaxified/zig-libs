@@ -30,10 +30,10 @@ replay. **Constant-time status**: the `fpr` layer is the reference's
 branchless **integer emulation** of binary64 (`fpr.zig`), so the signing
 hot path runs NO variable-latency FP instruction (`divsd`/`sqrtsd`/`mulsd`)
 on the secret-derived Gram matrix — the earlier native-`f64` timing leak on
-the signing key is closed (a whole-binary `objdump` audit, re-run
-2026-08-05, confirms zero scalar/AVX FP compute instructions reach any
-keygen/signing function — see SPEC.md's Threat model section for the
-methodology and its scope). This costs ~5x (host-dependent) on signing vs
+the signing key is closed (the executable gate `scripts/checks/check-fp-freedom.sh`
+runs a whole-binary `objdump` and confirms no scalar/AVX FP compute instruction
+reaches any keygen/signing function — see SPEC.md's Threat model section for its
+scope). This costs ~5x (host-dependent) on signing vs
 native f64; that CT tax is accepted and is the security-correct default.
 `gaussian.samplerZ` reproduces the reference's constant-time branch/table
 structure, including the documented BerExp lazy-break + norm-bound
@@ -42,8 +42,14 @@ harness (`src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh falcon`) still
 reports secret-dependent branches in `fpr` and the sampler (SPEC.md's Threat
 model has the measurement), and no dudect/binsec run exists, so treat signing as
 not yet side-channel-verified before production use (see `gaussian.zig`'s
-module doc). Out of scope: the padded/CT signature format
-(the compressed format the KATs use is implemented).
+module doc).
+
+## Not provided
+
+The padded (fixed-size) signature format, expanded signing keys, a native-FP
+fast path and a deterministic signing mode: see SPEC.md *What is deliberately
+not done* and *Backlog / deferred*. Only the compressed signature format the
+KATs use is implemented.
 
 The KAT oracle is the official **NIST Round-3** `falcon512-KAT.rsp` and
 `falcon1024-KAT.rsp` (FIPS 206 / FN-DSA is still a draft standard; Round-3

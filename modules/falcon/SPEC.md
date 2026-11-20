@@ -16,10 +16,7 @@
 
 **Downstream consumer:** no
 
-Falcon-512 and Falcon-1024, COMPLETE: verification + codecs, signing, and
-key generation, all NIST-KAT-verified byte-exactly (see "Keygen + sign"
-below for the signer/keygen internals and the constant-time caveat). See
-[README.md](README.md) for purpose and API.
+See [README.md](README.md) for purpose and API.
 
 ## Compared with
 
@@ -38,6 +35,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only Falcon in pure Zig, with no C and no libc; nothing else Zig-side has one. Signing and keygen are byte-exact against the NIST Round-3 KAT files at both degrees, and the whole FP path is integer emulation with a machine-checked "no hardware FP instruction" gate (`check-fp-freedom.sh`). **Where we are behind:** the padded signature format (liboqs ships it), expanded signing keys, no fast native-FP path (by design, ~5× slower signing), no SIMD; no FIPS 206 rebase (no draft exists yet, per the authors' own README) (→ Backlog items). ctgrind still reports leaks in `fpr` and the sampler (see Threat model) — that is the anchor/audit story, not a scope one.
 
 ## Design
+
+Falcon-512 and Falcon-1024, complete: verification + codecs, signing, and
+key generation, all NIST-KAT-verified byte-exactly (see *Keygen + sign* for the
+signer/keygen internals and *Threat model / limits* for the constant-time
+status).
+
 
 - **Source of truth**: the Falcon Round-3 specification (falcon-sign.info).
   FIPS 206 (FN-DSA) is still a draft, so the stable Round-3 wire formats and
@@ -79,132 +82,82 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   nothing here needs it). `publicKey()` recomputes h = g·f⁻¹ mod q in the
   NTT domain (pointwise Fermat inversion), erroring on non-invertible f.
 
+
 ## Threat model / limits
 
 - **Signer correctness is KAT-pinned** precisely because ffSampling + the
   discrete Gaussian sampler have the property that an incorrect sampler
   still emits signatures that pass verification while statistically leaking
   the trapdoor basis; both are byte-exact against the seeded-DRBG sign
-  vectors. **Constant-time status**: `gaussian.samplerZ` reproduces the
+  vectors.
+- **Constant-time status of signing.** `gaussian.samplerZ` reproduces the
   reference's constant-time branch/table structure, and the underlying `fpr`
   arithmetic is the reference's branchless **integer emulation** of binary64
-  (`fpr.zig`, `falcon512int` FALCON_FPEMU) — every add/sub/mul/div/sqrt and
-  float→int conversion is a fixed sequence of integer mul/shift/select with
-  no data-dependent branch, table index, or variable-latency FP instruction.
-  This eliminates the earlier native-`f64` timing leak: Falcon's signing hot
-  path runs division and sqrt on the SECRET-derived Gram matrix
-  (`fft.polyLdlFft`, `ffsampling` leaf sqrt), and hardware `divsd`/`sqrtsd`
-  have operand-dependent latency, so native f64 there was a timing side
-  channel on the signing key. **Re-verified 2026-08-05** via a one-time
-  `objdump` audit (methodology per `lockfree/SPEC.md`'s disassembly-based
-  lowering check): `zig test src/root.zig -O ReleaseFast --test-no-exec
-  -femit-bin=…` (falcon has zero external deps, so this compiles standalone),
-  then `objdump -d --no-show-raw-insn` over the WHOLE resulting binary,
-  grepped for every scalar AND AVX-encoded (`v`-prefixed) floating-point
-  compute mnemonic (`{,v}{add,sub,mul,div,sqrt,round,ucomis,comis,cvtsi2s,
-  cvts2si}{sd,ss,pd,ps}` and friends). Result: every hit is confined to
-  **test symbols** — the `fpr` tests that INTENTIONALLY
-  cross-check the integer emulation against real hardware FP, exactly as
-  documented below.
-
-  ⚠ This paragraph used to say "exactly two functions" and name them. Re-run,
-  its own grep reports **four**: those two plus `fft.test."fftRaw/ifftRaw
-  round-trip"` and a `testing.expectEqualInner` helper. The substantive claim
-  survived (all four are tests); the reproducible count did not, and it was
-  already wrong when it was written. A sentence describing a command someone
-  ran once is not a gate — it goes stale in silence and nothing reports it.
-  The check is therefore now EXECUTABLE: **`scripts/checks/check-fp-freedom.sh`**,
-  run on every gate lane, which fails and names the offending symbol. Verified
-  red: with `fpr.div`'s body replaced by a native `/`, the whole suite and the
-  KATs stay green — the emulation is bit-identical to IEEE-754, so no value
-  test can ever see the difference — while the gate reports `vdivsd` in
-  `fft.polyLdlFft`, `fft.polyDivAutoadjFft` and `fft.polyInvnorm2Fft`.
-  `polyLdlFft` operates on the secret Gram matrix, which is what this module's
-  original HIGH was about. No keygen or signing function
-  (`fpr.add`/`sign.Signer.signWithRng`/`ffsampling.sampleSignature`/
-  `gaussian.samplerZ`/`ntru.solveNtru` and everything they inline) contains
-  any such instruction. This corrects the previous, unsubstantiated phrasing
-  here ("the only FP in a linked binary is dead `compiler_rt` transcendental
-  code") — the FP that *is* present is live, intentional, test-only code, not
-  dead `compiler_rt`; the substantive claim (the signing/keygen path itself
-  emits none) holds and is now machine-verified rather than asserted. Scope
-  of what this proves: only that no native-latency-variable FP instruction
-  reaches the compiled artifact — it says nothing about `gaussian0`/`berExp`/
-  `sampler`'s branch- or table-index structure, which remains covered by the
-  unchanged "Remaining gate" below.
-  The `fpr` emulation flushes subnormal *results* to zero, as the reference
+  (`fpr.zig`, `falcon512int` FALCON_FPEMU): every add/sub/mul/div/sqrt and
+  float-to-int conversion is a fixed sequence of integer mul/shift/select.
+  This matters because Falcon's signing hot path runs division and sqrt on
+  the SECRET-derived Gram matrix (`fft.polyLdlFft`, the `ffsampling` leaf
+  sqrt), and hardware `divsd`/`sqrtsd` have operand-dependent latency. The
+  property is held by an executable gate, **`scripts/checks/check-fp-freedom.sh`**
+  (run on every gate lane): it builds the test binary in ReleaseFast, runs
+  `objdump -d` over the WHOLE binary, greps every scalar and AVX
+  floating-point compute mnemonic, and fails naming the offending symbol. Every
+  hit is confined to test symbols (the `fpr` tests that cross-check the
+  emulation against real hardware FP, an `fft` round-trip test and a
+  `testing.expectEqualInner` helper); no keygen or signing function contains
+  one. Value tests cannot see a native `/` in place of `fpr.div` (the
+  emulation is bit-identical to IEEE-754), which is why the gate exists. Scope of
+  what it proves: only that no variable-latency FP instruction reaches the
+  compiled artifact; it says nothing about branch or table-index structure
+  (next bullet).
+- The `fpr` emulation flushes subnormal *results* to zero, as the reference
   does; Falcon's signer never enters the subnormal regime (byte-exact KATs
-  are the evidence), and the 50k-random-double cross-check tests confine
-  operands to the normal range where flush-to-zero and native f64 agree
-  bit-for-bit. **CT tax**: integer bit-by-bit div/sqrt make signing ~5x
-  slower than native f64 (host-dependent; the writeup cites ~12.5x on a
-  faster host with less fixed RNG/hash overhead) — accepted, and the
-  security-correct default for a signing key. **Backend**: the module is
-  CT-only; a native-`f64` fast-path (like the reference's separate `float`
-  build variant) is intentionally NOT exposed as an in-file toggle, to avoid
-  a footgun that could silently reopen the leak — add it as a separate module
-  variant if a fast-path, non-adversarial-timing consumer ever appears.
-  **Remaining gate**: the ctgrind row below still reports
-  secret-dependent branches, and no dudect/binsec run exists — an
-  out-of-toolchain dudect run before production signing remains the honest
-  ask. **This module HAS an in-repo ctgrind harness since 2026-09-09, and the
-  argument that it should not is recorded here because measuring it is what
-  refuted it.** The paragraph this replaces said: `sampler`'s reject loop
-  iterates a *value-dependent* number of times and `berExp` keeps one
-  data-dependent early break, both copied deliberately from the reference
-  (see `src/gaussian.zig`'s header) where the constant-time argument is
-  Bernoulli decorrelation rather than a fixed trip count — so a row for
-  `falcon` would be "a permanent red that measures the reference design
-  rather than a defect", and "a red that measures nothing is worse than no
-  row."
-
-  ⭐ THE MEASUREMENT SAYS THE RED IS NOT THE SAMPLER. Tainting the NTRU
-  trapdoor `sk.tree.{f,g,big_f,big_g}` through `signRandomized`, ReleaseFast,
-  valgrind 3.26: **133 in-file contexts, of which the sampler is 16** —
-  `gaussian.zig:208` (`berExp`'s early break, 8) and `gaussian.zig:228`
-  (the reject loop, 8), exactly the two this paragraph predicted and
-  defended. The other **112 are in `fpr.zig`**: `pack` 62, `half` 42,
-  `add` 8 — the "branchless integer emulation of binary64" this same SPEC
-  describes above as having "no data-dependent branch, table index, or
-  variable-latency FP instruction". The remainder is `sign.zig:140` (the
-  norm-bound retry, 1) and `codec.zig:189/204/211` (compression branching on
-  `s2` coefficients, 4).
-
-  So the row is not a permanent red measuring the reference design. It is
-  84% a claim this file makes elsewhere and had no instrument for. Whether
-  those 112 are a real leak or an artifact of how LLVM lowers the masking
-  selects at ReleaseFast is the open question — and it is a question nobody
-  could have asked without the row. `scripts/checks/check-fp-freedom.sh`, the gate
-  this module already had, cannot see it: it `objdump`s for hardware FP
-  instructions (`divsd`, `sqrtsd`), and this leaks through conditional
-  jumps with no FP instruction anywhere.
-
-  On baseline x86-64 (`CTGRIND_CPU=x86_64`, the portable lane, 2026-11-18) the same row reads **222**: `fpr.zig`'s `pack` +67, `add` +88, `half` -26 and the sampler -12 against the native stacks. It is pinned there as a separate `cpu=x86_64` bound (`<=222`). It is the same open question as above, larger on that code shape, and is not resolved by the pin.
-  The expected row is pinned as a BOUND (`<=133`), not an exact count, for
-  the reason `ctgrind-expected.tsv` gives: only the direction is
-  load-bearing, and the number moves with a toolchain change for reasons
-  that say nothing about this module. Keygen (`ntru.zig`) likewise preserves the
-  reference's structure and now shares the integer `fpr`; it runs once per
-  key, so its side-channel exposure is far smaller than the signer's.
-- Dead stack (2026-10-09): secrets cross the API by pointer and results by
-  out-param (`generateKeyPair`, `SecretKey.fromBytes`, `toSecretKeyBytes`,
+  are the evidence), and the random-double cross-check tests confine operands
+  to the normal range where flush-to-zero and native f64 agree bit-for-bit.
+- **CT tax.** Integer bit-by-bit div/sqrt make signing about 5x slower than
+  native f64 (host-dependent); accepted as the security-correct default for a
+  signing key. A native-`f64` fast path is deliberately not exposed (see *What
+  is deliberately not done*).
+- **Remaining gate: signing is not side-channel-verified.** The in-repo ctgrind
+  harness (`src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh falcon`) taints
+  the NTRU trapdoor of a freshly generated key and runs `signRandomized`; it
+  reports secret-dependent branches, mostly in `fpr.zig` (`pack`, `half`, `add`),
+  then in the sampler (`berExp`'s early break and the reject loop, both kept from
+  the reference, where the constant-time argument is Bernoulli decorrelation
+  rather than a fixed trip count), `sign`'s norm-bound retry, and the
+  compression branching on `s2` coefficients in `codec`. The row is pinned as a
+  bound, not an exact count (`<=133` natively, a separate `cpu=x86_64` bound
+  `<=222` on baseline x86-64), because only the direction is load-bearing; the
+  pins are in `scripts/checks/ctgrind-expected.tsv`. Whether the `fpr` branches
+  are a real leak or an artifact of how LLVM lowers the masking selects is open
+  (see *Open*), and no dudect/binsec run exists: an out-of-toolchain dudect run
+  before production signing is the honest ask. Keygen (`ntru.zig`) preserves
+  the reference's structure and shares the integer `fpr`; it runs once per key,
+  so its exposure is far smaller than the signer's.
+- **Dead stack.** Secrets cross the API by pointer and results by out-param
+  (`generateKeyPair`, `SecretKey.fromBytes`, `toSecretKeyBytes`,
   `ShakePrng.init`); keygen, signing, decode/encode, `computePublic` and the
   SHAKE256 absorb/squeeze run one frame down with the dirtied stack zeroed
   (`src/burn.zig`); `src/stackprobe_test.zig` (ReleaseFast) guards it for both
-  degrees. Not covered, see Backlog: the caller's own `rng`/CSPRNG state and a
-  hardware-register or swap-level residue.
+  degrees. The keygen probe also looks for the residues of f and g modulo the
+  first four small primes, plain and forward-NTT (`ntru.probe.rnsImage`, a
+  helper compiled in test builds only). Not covered: the intermediate
+  big-integer limbs of the NTRUSolve recursion levels below the top (no
+  independent model short of re-running the descent; see *Backlog*), the
+  caller's own `rng`/CSPRNG state, and hardware-register or swap-level residue.
 - Verification and public-key handling touch public data only, so no
   constant-time claims are made or needed for that surface. Secret-key
-  *decode* is not constant-time — treat `SecretKey.fromBytes` as a
+  *decode* is not constant-time; treat `SecretKey.fromBytes` as a
   tooling/inspection path.
 - `openNistSignedMessage` implements the NIST-API envelope used by the KATs;
   it returns a sub-slice of the caller's buffer (no copy). The detached
   `PublicKey.verify` is the intended production entry point.
-- Verify is vartime hash-to-point (like the reference's default); the
-  constant-time hash-to-point variant only matters for exotic
-  nonce-known/signature-hidden scenarios and is out of scope.
+- Verify uses the vartime hash-to-point (like the reference's default).
 
 ## Verification
+
+Run with `scripts/modtest falcon` (the module's tests; every test block on disk
+is executed).
 
 - KAT oracles from the official NIST Round-3 submission package
   (`falcon-round3.zip`, falcon-sign.info):
@@ -213,22 +166,33 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   - `falcon1024-KAT.rsp`, SHA-256 =
     `036a0bf5260573cec44977284dfef756cd1143db9961b981bd1fb55828acb20d`.
 
-  For each set, vectors count ∈ {0, 1, 2, 3, 57} are embedded in
+  For each set, vectors count in {0, 1, 2, 3, 57} are embedded in
   `src/kat_vectors.zig` (msg/pk/sk/sm/seed; count 57 covers a ~1.9 KiB
-  message). The 512 .rsp SHA-256 matches this module's original citation,
-  confirming the mirror is bit-identical to the official package; both
-  files were parsed from the same tree. `seed` (the NIST-KAT DRBG input,
-  added for the keygen/sign section below) came from the same download —
-  see `kat_vectors.zig`'s module doc comment for the full chain.
+  message); `seed` is the NIST-KAT DRBG input used by the keygen/sign tests.
+  See `kat_vectors.zig`'s module doc comment for the provenance chain.
 - Per vector: sm opens + verifies; opened message equals the vector's msg;
   compressed signature re-encodes byte-exactly; pk re-encodes byte-exactly;
   sk decodes and reproduces pk via h = g·f⁻¹. Falcon-512 uses the flat API,
-  Falcon-1024 the `_1024` API — both against their own .rsp.
+  Falcon-1024 the `_1024` API, both against their own .rsp.
 - Negative: tampered message / nonce / signature bytes, wrong header bytes
   (incl. cross-degree headers), truncated envelope, nonsense length field,
-  cross-vector pk — all rejected, for both parameter sets.
-- Both `zig build test-falcon` (Debug) and `-Doptimize=ReleaseFast` green;
-  every test block on disk is executed (dark-tests rule).
+  cross-vector pk, all rejected, for both parameter sets.
+- Boundary tests (`src/boundary_test.zig`, plus unit tests in `gaussian.zig`
+  and `ntru.zig`): verify accepts a norm equal to the bound and refuses
+  bound + 1 (a crafted public key), the signer's norm-bound retry and
+  `max_attempts` behaviour, `hashToPoint` against an independent model,
+  `compDecode`/`compEncode` edges, `fpr` against the hardware on single-bit
+  mantissas and zero operands, `polyLdlFft` on general complex input,
+  `computePublic` refusing exactly the non-invertible f, the 31-bit big-integer
+  primitives against a fixed-width model.
+- Fuzz: `src/fuzz_test.zig`, deterministic driver `FALCON_FUZZ=<runs>[,<first
+  seed>]` (testkit's fuzz driver), one harness each for verify, `openNistSignedMessage`,
+  public-key decode and secret-key decode, both degrees; a Smith replay test
+  and a reach test (every outcome is reached) accompany it.
+- Constant-time and dead-stack: `check-fp-freedom.sh` and the ctgrind row (see
+  *Threat model / limits*), `src/stackprobe_test.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Keygen + sign
 
@@ -279,50 +243,53 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   pipeline and a fresh-key sign → verify round trip). `ntru.zig` also
   KAT-pins NTRUSolve in isolation: solving from the vectors' own (f, g)
   reproduces the sk's F byte-exactly at both degrees.
-- No deterministic signing mode: the former `signDeterministic` (single
-  SHAKE stream seeded from the caller's seed alone) reused the 40-byte
-  salt — and the Gaussian sampling tape — across every message signed
-  under one seed, voiding the GPV per-signature-independence argument;
-  it was removed rather than derandomized because Falcon specifies no
-  deterministic mode (no anchor for a homemade one) and deterministic
-  lattice signing invites fault-differential/trace-averaging attacks —
-  see the decision comment in `root.zig`. Reproducible signing for tests
-  = `sign.ShakePrng` + `sign.Signer.signWithRng` (the KAT tests replay
-  the NIST DRBG's two separate draws through that seam explicitly).
-- FIPS 206 (FN-DSA) rebase once final — applies to the whole module.
+
+## What is deliberately not done
+
+- **No deterministic signing mode.** Falcon specifies none (no anchor for a
+  homemade one), and a single SHAKE stream seeded from the caller's seed alone
+  reuses the 40-byte salt and the whole Gaussian sampling tape across every
+  message signed under one seed, voiding the GPV per-signature-independence
+  argument; deterministic lattice signing also invites fault-differential and
+  trace-averaging attacks (decision comment above `signRandomized` in
+  `root.zig`). Reproducible signing for tests = `sign.ShakePrng` +
+  `sign.Signer.signWithRng` (the KAT tests replay the NIST DRBG's two separate
+  draws through that seam explicitly).
+- **No native-`f64` fast path** (the reference's separate `float` build
+  variant), not even as an in-file toggle: a toggle is a footgun that could
+  silently reopen the timing leak. Add it as a separate module variant if a
+  consumer with non-adversarial timing ever appears.
+- **No constant-time hash-to-point** for verify: it only matters for exotic
+  nonce-known/signature-hidden scenarios.
+
+## Open
+
+- Whether the secret-dependent branches ctgrind reports in `fpr.zig` (`pack`,
+  `half`, `add`), which the "branchless integer emulation" claim says should not
+  exist, are a real leak or an artifact of how LLVM lowers the masking selects at
+  ReleaseFast. `check-fp-freedom.sh` cannot see it (it looks for FP instructions;
+  this leaks through conditional jumps). Unverified: needs a binary-level
+  analysis or a dudect-style timing run.
 
 ## Backlog / deferred
 
-- **Padded signature format, Falcon-padded-512/-1024** *(survey 2026-09-30)*. liboqs
-  exposes them beside the compressed format; a protocol that needs a fixed-size
-  signature (fixed-width fields, constant-length records) cannot use the compressed
-  one. Small: a different header byte and zero-padding to 666 / 1280 bytes plus the
+- **Padded signature format, Falcon-padded-512/-1024.** liboqs exposes them
+  beside the compressed format; a protocol that needs a fixed-size signature
+  (fixed-width fields, constant-length records) cannot use the compressed one.
+  Small: a different header byte and zero-padding to 666 / 1280 bytes plus the
   strict decode rule, checkable against the reference's padded vectors. Fits
   CONVENTIONS §2 (pure Zig).
-- **Rebase onto FN-DSA (FIPS 206) once a draft is published** *(survey 2026-09-30)*.
-  Already recorded in *Design* and *Keygen + sign*; listed here so the survey shows
-  it as the main way this module goes stale. Moderate (header / domain separation /
-  pre-hash), pure Zig.
-- **Expanded (precomputed-tree) signing key** *(survey 2026-09-30)*. The reference
-  offers it for repeated signing under one key; here every signature rebuilds the
-  Gram matrix and LDL tree, and the integer-emulated FP is already ~5× slower than
+- **Rebase onto FN-DSA (FIPS 206) once a draft is published.** The main way
+  this module goes stale: expect a header-byte / domain-separation / pre-hash
+  revision, not an NTT/math revision. Moderate, pure Zig.
+- **Expanded (precomputed-tree) signing key.** The reference offers it for
+  repeated signing under one key; here every signature rebuilds the Gram matrix
+  and LDL tree, and the integer-emulated FP is already about 5x slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
-
-- ✅ **DONE 2026-11-19 (needles for the top-level RNS limbs of f, g):** **Dead-stack probe of the internals below the public entry points** *(2026-10-09)*.
-  The probe sees the entry points only; the FFT-domain scratch inside
-  `ffsampling.sampleSignature` and NTRUSolve's RNS pool are wiped by their own
-  `defer`s and by the burns above them. The keygen probe now also looks for the
-  residues of f and g modulo the first four small primes, plain and forward-NTT
-  (`ntru.probe.rnsImage`, test builds only, pinned to `makeFg`'s output by a unit
-  test), both degrees: none found. Still not covered: the intermediate big-integer
-  limbs of the F/G recursion levels (depth > 0), which have no independent model
-  short of re-running the descent.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-**Audit 2026-11-17 (whole-module mutation).** 1393 mutants over every runtime line of `codec`, `poly`, `root` (verify, open, key types), `sign`, `keygen`, `gaussian` (ChaCha PRNG, RCDT, BerExp, SamplerZ), `fpr` (the integer binary64 emulation: shifts, norm/pack, add, mul, div, sqrt, rint/floor/trunc, `expm_p63`), `fft`, `ffsampling` and `ntru` (primes, Montgomery/NTT helpers, the 31-bit big-integer primitives, Bezout, the Babai reduction levels, the NTRUGen acceptance loop): 1357 behind a runtime switch in a ReleaseSafe test binary plus 36 wipe/burn mutants in a ReleaseFast binary (the switch inside `burn.zig`, README section 5). Round 1: 1133 killed (69 by timeout), 224 survived. The survivors were test gaps the KATs cannot reach (an exact-bound norm, a hash-to-point draw on a rejection threshold, the sampler's saturation, zero operands and exact cancellation in `fpr`, the 31-bit big-integer paths a valid key never takes, dead public entry points), and `boundary_test.zig` plus unit tests in `gaussian.zig` and `ntru.zig` were added: verify accepts a norm equal to the bound and refuses bound + 1 for both degrees (a crafted public key, s2 = 1) and centres residues q/2 and q/2 + 1 exactly; a long s2 with s1 = 0 is refused; `signWithRng` accepts a candidate whose norm equals the bound and refuses one above it, each half of the norm counts, an empty output buffer is refused and exactly `max_attempts` nonces are drawn; the NTRU equation f*G - g*F = q holds on the generated key (both degrees); `hashToPoint` equals an independent model including the 61444 / 61445 / multiple-of-q draws; `compDecode`/`compEncode` edges (+-2047, 2048, -0, padding, exact-fit buffers); `fpr` against the hardware on single-bit mantissas (every tie and sticky position, exponent gaps 0..65), zero operands and flush-to-zero, rint at every tie, `expm_p63` against a 128-bit evaluation; `polyLdlFft`/`polyLdlmvFft` on general complex input (the KAT Gram matrix has a real g00, which hid the imaginary-part terms); `computePublic` refuses exactly the non-invertible f (oracle: evaluation at the roots); `Prng` refill positions, `gaussian0` against the exact 72-bit RCDT comparison, `berExp` saturation and the full-match byte path; `isPrime31`, `modpNorm`, the `zint*` primitives against a fixed-width model, `zintBezout`, `zintRebuildCRT` and the `solveNtru` coefficient limit (inclusive, both signs). These killed 117 more; 1252 of 1393 are killed. 141 remain, all argued: EQUIVALENT (69) for example n*14 and n*bits are multiples of 8 (no padding bits), q and 0 as congruent representatives that every consumer reduces, a and b stay non-negative in the binary GCD (the negation flags are 0), 62*len % 30 != 0 for every limb count used, the last field-norm step works on degree-1 polynomials where the NTT is the identity, every consumer masks `p0i` with 0x7FFFFFFF, all primes are 1 mod 4; UNOBSERVABLE (72): the Babai tuning constants (the depth-0 exact reduction fixes the unique nearest-plane (F, G); a difference needs reference keygen vectors beyond the 10 KATs), the accept/reject boundaries of `generate` and the out-of-range-k rejections (need a scripted RNG or a failing reduction), `signBody`'s stale `out_of_room` (a fault-injecting sampler), and 34 wipe/burn mutants where each layer (the `defer secureZero` of the callee, the entry-point `burn.stack`) is redundant with the other: the probe only sees a secret when both are removed. Not mutated: the RCDT, `gm_tab` and constant tables, the constant bit patterns and the `comptime` table construction (`psi`, `zetas`, `REV10`). Counts on the card are whole-module. Finding: `fpr.floor(-0.0)` returns -1 (as the reference's `fpr_floor`; no caller passes a negative zero), noted in `boundary_test.zig`.
-
-**Audit 2026-11-20 (delta mutation).** The only non-test source change since the whole-module audit is `ntru.probe.rnsImage`, a helper compiled in test builds only (`builtin.is_test`; an empty struct otherwise) that gives the stack probe NTRUSolve's top-level RNS limbs of f and g. 7 schemata mutants (ReleaseSafe test binary, `probe.rnsImage` tests): the prime `p` and the root `g` taken from `primes[0]` for every `j`, a wrong `p0i`, `modpSet` replaced by the signed value, the NTT flag ignored, the NTT applied to the plain image, the NTT call skipped. The first two survived the earlier unit test (it only reads `j = 0`, which `makeFg` also uses); the new test `probe.rnsImage: every prime, plain and NTT, against an independent model` (primes 0..3: the plain image against `@mod`, the NTT of a constant against the constant, the NTT of `x` against `y^n = -1`) kills all 7. Not mutated: the `builtin.is_test` gating (comptime; the public surface of a non-test build cannot be observed by a test). Card counts are cumulative: 1252/1393 + 7/7 = 1259/1400, 141 eq.
+- **Dead-stack probe below the top NTRUSolve level.** The probe sees the entry
+  points and the top-level RNS limbs of f and g; the intermediate big-integer
+  limbs of the F/G recursion levels (depth > 0) have no independent model short
+  of re-running the descent.
 
 ## Anchoring
 
