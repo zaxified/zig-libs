@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! ctgrind harness for `mlkem` (added 2026-11-01). Run it through
+//! ctgrind harness for `mlkem`. Run it through
 //! `scripts/checks/ctgrind.sh mlkem`, which builds every mode / `-fvalgrind`
 //! switch / taint combination and prints the control table; not wired into
 //! `zig build test` (memcheck's context count is valgrind's own output).

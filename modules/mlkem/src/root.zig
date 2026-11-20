@@ -136,7 +136,7 @@ test "pairwiseConsistencyCheck rejects a mismatched pair" {
     try testing.expectError(error.PairwiseConsistency, mixed.pairwiseConsistencyCheck());
 }
 
-// Tests added by the 2026-11-11 whole-module mutation run.
+// Tests added by the whole-module mutation run.
 
 fn rejectionKey(comptime K: type, sk: *const K.SecretKey, c: *const [K.ciphertext_length]u8) [32]u8 {
     // J(z ‖ c) with z read back from the dk encoding (its last 32 bytes).

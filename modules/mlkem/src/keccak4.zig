@@ -41,7 +41,7 @@ fn setLane(v: *V4, lane: usize, x: u64) void {
 /// Keccak-f[1600] (24 rounds) on four states in parallel. Not fully
 /// unrolled: 24 inlined rounds are ~35 KB of code that overflows the uop
 /// cache and runs decoder-bound — 2239 vs 1740–1769 TSC cycles per call
-/// (i7-7920HQ, 2026-11-01); one or two rounds per iteration measured equal.
+/// (i7-7920HQ); one or two rounds per iteration measured equal.
 pub fn permute(s: *State4) void {
     var a = s.*;
     var r: usize = 0;

@@ -793,7 +793,7 @@ test "rejUniform: stops at 256, stays inside the slack, ignores a trailing parti
     try testing.expectEqual(@as(i16, 0), c[0]);
 }
 
-// Tests added by the 2026-11-11 whole-module mutation run.
+// Tests added by the whole-module mutation run.
 
 test "zetas equal the pq-crystals table entry by entry" {
     const want = [128]i16{

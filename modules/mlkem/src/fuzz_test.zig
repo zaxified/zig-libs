@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over `mlkem`'s public API (added 2026-11-01), one
+//! Deterministic fuzz driver over `mlkem`'s public API, one
 //! harness per parameter set, each generic over its source of choices
 //! (`fn(comptime S, *S, gpa)`), each checked against std's
 //! `std.crypto.kem.ml_kem.nist.MLKem*` as the oracle. One draw picks a mode:
