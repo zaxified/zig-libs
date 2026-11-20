@@ -832,3 +832,88 @@ fn testDecrypt(comptime S: type, d_id: g1.Affine, ct: S.Ciphertext) ![S.block_by
     try S.decrypt(&out, &d_id, ct);
     return out;
 }
+
+// ── 6. Pins of the default ciphersuite's own parameters ───────────────
+//
+// The parameters (`dst_g1`, the three tags, the hash order, 32-byte blocks)
+// cannot be anchored to a foreign implementation (section 5's preamble), but
+// they can be PINNED, so that a silent change of any of them -- a dropped
+// tag, a swapped domain, a different DST -- cannot pass as a round trip.
+// `h2`/`h3`/`h4` are plain SHA-2 constructions and their digests below were
+// recomputed independently with Python's `hashlib` (`h3`: big-endian
+// SHA-512 mod r); `h1` and the ciphertext are pins of this code's own output
+// (hash-to-curve under a private DST has no foreign value to match).
+
+fn unhex(comptime hex: []const u8) [hex.len / 2]u8 {
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+test "pins: h2, h3 and h4 equal independently computed SHA-2 digests" {
+    // h4(sigma) = SHA-256("zig-libs/ibe/H4" || sigma)
+    const s42 = @as([32]u8, @splat(0x42));
+    try std.testing.expectEqualSlices(u8, &unhex("73b77d7c2b923d7f1ae34ab05eeb0a8f8197951652aa9691203f9a86038a8805"), &ciphersuite.h4(&s42));
+    // h3(sigma, msg) = SHA-512("zig-libs/ibe/H3" || sigma || msg) mod r, big-endian.
+    const s11 = @as([32]u8, @splat(0x11));
+    const s22 = @as([32]u8, @splat(0x22));
+    try std.testing.expectEqualSlices(u8, &unhex("0b5794244c966d9921c83cd864b9d8e60e12eb0be84d27dec1ad4dc2ed6760e9"), &ciphersuite.h3(&s11, &s22).toBytes());
+    // h2(1) = SHA-256("zig-libs/ibe/H2" || 575 zero bytes || 0x01): Fp12 one, serialized c1 || c0.
+    try std.testing.expectEqualSlices(u8, &unhex("7582054c45ff996754472d69738bb68e27b9df4aac42f447aab66cf43cfd21b5"), &ciphersuite.h2(Fp12.one));
+}
+
+test "pins: h1 under the module's own DST (self-pin of this code's output)" {
+    try std.testing.expectEqualSlices(
+        u8,
+        &unhex("8d6d36adcad2463380d4206c00b5be398cc3b188e490bc168b3eabeb85c9651b53f63e226d58f276fc62fa814c15f271"),
+        &g1.toBytesCompressed(ciphersuite.h1("alice@example.com")),
+    );
+}
+
+/// The pinned context: msk = 7, so `mpk` and `d_id` need no PKG state.
+fn pinnedKey() struct { msk: Fr, mpk: g2.Affine } {
+    var msk_bytes = @as([32]u8, @splat(0));
+    msk_bytes[31] = 0x07;
+    const msk = Fr.fromBytes(msk_bytes) catch unreachable;
+    return .{ .msk = msk, .mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine() };
+}
+
+const pinned_ct = unhex("a8016457821464182126cf9617292ea01e603d5150afeb81c58f6d2aa1e02d16d950bc18ab846bd304384751a5e147970b48be848c79bbc18889f5f3be9ae5799e1ddea74fba4bb94d37f2ca82d42ecd046879c9f79babcb084b1ce8866ad53e2e85700771ede0f0f7e13f8670600a6547d1ac64b3ff50465e3f84fb8d4b11f2687672b0794f16d7a5bcae217401cbc6a2eeb6ae104d1003e826dde087ac5d3e");
+
+test "pins: the default scheme's ciphertext for a fixed (msk, id, message, sigma), and its decryption" {
+    const k = pinnedKey();
+    const id = "alice@example.com";
+    const message = @as([ibe.block_bytes]u8, @splat(0xAB));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x11));
+    const ct = testEncrypt(ibe.Default, k.mpk, id, message, sigma);
+    try std.testing.expectEqualSlices(u8, &pinned_ct, &ct.toBytes());
+
+    // The frozen bytes decrypt to the message under the key `extract` derives.
+    const d_id = testExtract(ibe.Default, k.msk, id);
+    const back = try testDecrypt(ibe.Default, d_id, try ibe.Ciphertext.fromBytes(pinned_ct));
+    try std.testing.expectEqualSlices(u8, &message, &back);
+}
+
+test "decrypt leaves an all-zero output buffer when the FO check rejects" {
+    const k = pinnedKey();
+    const d_id = testExtract(ibe.Default, k.msk, "alice@example.com");
+    var ct = try ibe.Ciphertext.fromBytes(pinned_ct);
+    ct.w[0] ^= 0x01; // U and V intact: the recovered message is wrong, U' != U
+    var out = @as([ibe.block_bytes]u8, @splat(0xFF));
+    try std.testing.expectError(error.FoCheckFailed, ibe.decrypt(&out, &d_id, ct));
+    try std.testing.expectEqualSlices(u8, &@as([ibe.block_bytes]u8, @splat(0)), &out);
+}
+
+test "randomSigma fills the whole block: every 8-byte lane differs between two draws" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a: [ciphersuite.block_bytes]u8 = undefined;
+    var b: [ciphersuite.block_bytes]u8 = undefined;
+    ciphersuite.randomSigma(&a, io);
+    ciphersuite.randomSigma(&b, io);
+    var lane: usize = 0;
+    while (lane < ciphersuite.block_bytes) : (lane += 8) {
+        try std.testing.expect(!std.mem.eql(u8, a[lane..][0..8], b[lane..][0..8]));
+    }
+}

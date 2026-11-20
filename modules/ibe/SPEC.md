@@ -6,7 +6,7 @@
 
 **Scope:** core — Boneh-Franklin FullIdent; Encryption4All/ibe, drand/tlock (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation ? · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (63/68, 5 eq) · src 74b3340b11f926af
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, IBE_FUZZ) · ct 2026-10-02 (ctgrind)
 
@@ -261,8 +261,25 @@ Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for 
 - **Dead stack** (`src/stackprobe_test.zig`, ReleaseFast only): no `msk`, `d_id`, `sigma`, `r`, `Gid^r` or plaintext
   residue after `setup`, `extract`, `encrypt` and `decrypt`.
 - **Constant time:** `src/ctgrind_harness.zig` (*Constant-time measurement*).
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
-  the delta runs after it.
+- **Pins** (`src/kat_test.zig`, section 6): `h2`/`h3`/`h4` against SHA-2 digests recomputed independently (Python
+  `hashlib`; `h3` is big-endian SHA-512 mod r); `h1` and a whole default-scheme ciphertext (msk 7, fixed id, message
+  and sigma) as pins of this code's own output, since a hash-to-curve DST of the module's own has no foreign value;
+  the pinned bytes decrypt; a rejected `decrypt` leaves its output buffer all zero; `randomSigma` fills every 8-byte
+  lane of the block.
+- **Mutation:** one whole-module run over `ibe.zig` and `ciphersuite.zig` (`root.zig` carries no logic; `burn.zig` is
+  covered through its call sites): 68 mutants, 63 killed, 5 equivalent, 0 open. 59 ran as ReleaseSafe schemata over
+  `fp12CtSelect`/`fp6CtSelect`, the windowed `fp12Pow` (table, digit order, squarings, select scan, byte order),
+  `setup`/`extract`/`encrypt`/`decrypt` (every hash argument, every XOR, the FO compare and its operands), the
+  `Ciphertext` codec (slot swaps, the unchecked G2 decoder), `KeyPair.deinit`, and every `ciphersuite` tag, DST,
+  hash input and the `randomSigma` draw (dropped, half-filled). Nine ran as ReleaseFast against the stack probe: the
+  four burn sites dropped, the burn halved and quartered, and three wipes. Equivalent: the two output wipes of a
+  rejected `decrypt` (the inner one in `decryptBody` and the outer one in `decrypt` zero the same buffer, each is
+  redundant with the other; dropping both is killed by the all-zero-output test), the same inner and outer wipe in
+  the stack-probe build, and the `secureZero` of `sigma` at the end of `decryptBody` (the frame it clears is zeroed
+  by the burn that follows the call, 64 KiB against 28.5 KiB dirtied). Not mutated: comptime constants (window
+  width, burn sizes, block width), the `@call(.never_inline, ...)` modifier, which cannot take a runtime switch, and
+  constant-time-only differences (a secret-indexed lookup computes the same value), which are the ctgrind rows'
+  evidence.
 
 ## What is deliberately not done
 
@@ -293,7 +310,7 @@ Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for 
 
 ## Open
 
-- **No whole-module mutation run is recorded** (the card's mutation entry is `?`).
+None.
 
 ## Anchoring
 
