@@ -93,55 +93,51 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
   box, over every length 0 … 808, ±24 bytes around one and three
   long blocks and six long blocks, at 16 alignments (a subset for the long
   ones), per available backend; `extend`, the streaming form and `combine`
-  up to 70 000 bytes against it too. It fails, among others, a long-block join
-  with the short shift table, two swapped slicing tables and a combine by
-  x^(4n) (mutations run 2026-09-27, all red).
+  up to 70 000 bytes against it too.
 - **External** — `combine` at lengths no test can hash: Go's `hash/crc32`
   (Castagnoli) gives the checksum of three prefixes (empty, `"123456789"`,
   1000 patterned bytes) followed by n zero bytes, for n at 2^k − 1, 2^k,
   2^k + 1 for k = 28 … 33, 3·2^31 + 12345 and 5 000 000 007. The test asks
   `combine(hash(P), Z(n), n)` for it, with Z(n) Go's checksum of the zeros
   alone, so every expected value is Go's. Producer `tools/gen_kat.go` →
-  `src/kat_vectors.zig`; test `combine matches Go's hash/crc32`. It fails with
-  the 2026-10-04 `k & 31` regression put back (checked 2026-10-04). The
+  `src/kat_vectors.zig`; test `combine matches Go's hash/crc32 past 2^29 and 2^32 bytes`. The
   vectors show the period directly: `"123456789"` followed by 2^31 zero bytes
   has the checksum of `"123456789"` alone.
-- **Re-derived** — `xPow8n` against repeated squaring of x and against
-  x^(8(a+b)) = x^(8a)·x^(8b) for random 63-bit lengths; the shift tables
-  against the plain table update over real zero bytes.
+- **Re-derived** — `xPow8n` against repeated squaring of x (j = 0 … 63) and against
+  x^(8(a+b)) = x^(8a)·x^(8b) for random 63-bit lengths — two oracles that do not use the `x2n` table, the
+  check that catches a period-32 table; the shift tables against the plain table update over real zero bytes.
 - **The hardware paths** run on x86-64 locally and in CI; arm64 in CI's arm64
   lane and locally under `qemu-aarch64` (both the run-time-detected and the
-  `+crc` static build, 2026-09-27). The test fails if an x86-64 or arm64 run
+  `+crc` static build). The test fails if an x86-64 or arm64 run
   never took a hardware path.
-
-- **Audit 2026-10-04** (independent review + mutation schemata over a copy,
-  one ReleaseSafe build for a baseline `-mcpu=x86_64`, so the run-time CPUID
-  dispatch is exercised). **Finding, fixed:** `combine` was wrong for
-  `len_b ≥ 2^29` bytes — `xPow8n` indexed `x2n[k & 31]`, copying zlib's
-  period-32 assumption, which does not hold for CRC-32C (period 31, above).
-  The old tests stopped at 70 000 bytes. New test `combine's zero-byte
-  operator x^(8n) is right for every u64 length` checks `xPow8n(2^j)` for
-  j = 0 … 63 against repeated squaring of x, and `xPow8n(a + b) =
-  xPow8n(a)·xPow8n(b)` for random 63-bit `a`, `b` — two oracles that do not
-  use the table; it failed before the fix. 33 mutants (conditioning in
-  `extend`/`hashWith`, `combine`'s terms, `Crc32c.update`, the dispatch cache
-  and CPUID, `multModP`'s early exit/reduction/start bit, `xPow8n`'s start
-  power, bit test and the `k & 31` regression, slicing-by-8 table and index
-  choice and the bytewise tail, the shift-table map, the three-way chain
-  seeds/offsets/joins, the word byte order, the dropped tail): 32 killed
-  (two of them by hanging), 1 alive — CPUID bit 30 for bit 20, alive only
-  because this host has both RDRAND and SSE4.2; the bit number is the SDM's,
-  checked by review.
 
 **Anchor grade:** class B · oracle EXTERNAL
 
-## Speed
+## Verification
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-crc32c`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.38–0.98×, against 0.72–1.01× before (bench repeated after the fix: the three-stream loop as one aligned asm block (Intel JCC erratum, Backlog item of 2026-10-19 done 2026-10-20); the first 0.17 run read 0.45–1.38×). The card carries these figures; what follows is the earlier measurement.
+- **Run:** `scripts/modtest crc32c`.
+- **Tests** (`src/root.zig`): the external anchors above; every backend against `std.hash.crc` at every length
+  and alignment; `extend`, the streaming form and `combine`; the zero-byte operator for every `u64` length; the
+  shift tables; backend selection. `src/sweep_test.zig` pins the edge arguments of the no-panic sweep
+  (`combine` with length 0 and the largest length; every backend on empty and one-byte input at any alignment).
+- **Fuzz:** one harness (every backend, `extend` and `combine` against std on arbitrary bytes), run by testkit's
+  deterministic driver as `CRC32C_FUZZ`, with a fixed seed loop and reach checks in every test run.
+- **Constant time:** n/a — a checksum over public data.
+- **Instruction count:** `tools/count.tsv` holds the cost per 4 KiB round for `scripts/count-insns` (`src/count.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The one
+  survivor of that run is CPUID bit 30 for bit 20 (alive only because the test host has both RDRAND and
+  SSE4.2; the bit number is the SDM's).
+- **Bench:** `zig build bench-crc32c` (`tools/bench.zig`) against Go `hash/crc32` Castagnoli (`tools/go_bench`).
 
-See README. Single-chain hardware is bound by the instruction's latency
-(~7 GB/s here); three chains reach ~20 GB/s from 4 KiB up. Below 768 bytes
-only the single chain runs.
+## Performance
+
+Single-chain hardware is bound by the instruction's latency, three interleaved chains by its throughput;
+below 768 bytes only the single chain runs. The figures against Go are the card's Performance line; the
+README table compares with std. On x86-64 with LLVM the three-stream inner loop
+is one inline-asm block behind `.p2align 5` (`X86.block3`: end-of-block bases and a negative index, so
+`add`+`jnz` fuse and the body sits in one 32-byte window), because on Skylake…Cascade Lake microcode with the
+JCC erratum a compiled loop runs 13–30 % slower depending only on where the linker places it. The
+self-hosted backend, and arm64 (unaffected), keep the plain loop.
 
 ## What is deliberately not done
 
@@ -153,10 +149,15 @@ only the single chain runs.
 
 ## Open
 
+- No mutation run is recorded for `X86.block3`, added after the whole-module run.
+
 - A caller wanting to force the table path (benchmarks, bit-exact audits)
   uses `hashWith(.table, …)`; there is no global override.
 
 ## Backlog / deferred
 
-- ~~**Intel JCC erratum: the three-way loop is a layout lottery**~~ — **done 2026-10-20** (`X86.block3`, LLVM builds; bench-crc32c 1.38× → 0.98× Go at 64 KiB) *(2026-10-19)* — on Skylake…Cascade Lake with the JCC-erratum microcode the loop's fused `cmp`+`jb` crossing a 32-byte boundary runs from the legacy decoder: 13–17 % (up to 30 %) slower depending only on where the linker puts the code (instructions equal; `idq.mite_uops` up several times). Fix (user-approved 2026-10-19): the inner three-stream loop as one inline-asm block behind `.p2align 5` (end-of-block base pointers, negative index, `add`+`jnz`; harness `crc32c-rc/h/hx.zig` `block3`: 9 208–9 220 cycles/64 KiB in every layout, 42 % fewer instructions). Not on arm64 (unaffected). Needs KATs at all tail lengths + the fuzz differential.
-- **Speed: level with Go, not ahead** *(bench 2026-10-07, `zig build bench-crc32c`: 0.72–1.01× Go `hash/crc32` Castagnoli, worst at 64 KiB)*. Both sides run three interleaved `crc32q` chains, which is the instruction's throughput limit (~8 B/cycle), so a 1.01 is a tie that the performance axis still counts as "slower". Getting ahead needs the hybrid that feeds `crc32q` and PCLMULQDQ folding in parallel (e.g. two thirds of a long block on `crc32q`, the rest folded with carry-less multiplies), anchored by the existing backend cross-check against the table path. Effort: medium.
+- **Ahead of Go, not level with it.** Both sides run three interleaved `crc32q` chains, the instruction's
+  throughput limit (~8 B/cycle). Getting clearly ahead needs the hybrid that feeds `crc32q` and PCLMULQDQ
+  folding in parallel (e.g. two thirds of a long block on `crc32q`, the rest folded with carry-less
+  multiplies), anchored by the existing backend cross-check against the table path. Effort: medium. (Pure
+  folding is under *What is deliberately not done*.)
