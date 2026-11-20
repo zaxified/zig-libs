@@ -124,8 +124,8 @@ comment.
 ## Verify
 
 ```
-zig build test-vdf                              # Debug — all pass, no skips
-zig build test-vdf -Doptimize=ReleaseFast        # all pass, no skips
+scripts/modtest vdf                             # Debug — no skips
+scripts/modtest vdf -Doptimize=ReleaseFast       # no skips
 zig fmt --check modules/vdf/
 ```
 
@@ -141,7 +141,11 @@ independently in Python (see `kat_test.zig`'s module doc comment for
 exactly how, and how to regenerate them); `eval` additionally has an
 independent-FORMULA cross-check via a factorization-known toy modulus
 (Euler's theorem shortcut vs. sequential squaring). See
-[SPEC.md](SPEC.md) for the full verification methodology and the honest
-assessment of what remains Fable-hard.
+[SPEC.md](SPEC.md) for the full verification methodology and for the two
+judgment calls `prove` and `verify` hinge on.
+
+## Not provided
+
+No class-group variant (the construction without a trusted setup), no Pietrzak proof and no trusted-setup ceremony; moduli other than 2048 bits are not supported yet. SPEC's *What is deliberately not done* gives the reasons and *Backlog / deferred* what is open.
 
 Provenance: see [NOTICE](NOTICE).

@@ -19,13 +19,6 @@
 Wesolowski Verifiable Delay Function over an RSA hidden-order group; see
 [README.md](README.md) for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: COMPLETE.** `group.zig` (Z_N* wrapper + the RSA-2048 Factoring
-Challenge modulus + element validation) and `vdf.zig`'s `eval`,
-`hashToPrime`, `pow2Mod`, and `Proof`'s codec are real and tested — as are
-the two irreducible cores `prove` and `verify` (green in Debug +
-ReleaseFast). `gate.core_implemented = true`, so the completeness/soundness
-tests that call `prove`/`verify` run (and pass). See "The Fable cores"
-below.
 
 ## Compared with
 
@@ -61,9 +54,9 @@ IACR ePrint 2018/623, §3) makes checking `y` cheap:
 Correctness is a one-line algebraic identity (`2^T = q·l + r` implies
 `π^l · x^r = x^(q·l+r) = x^(2^T) = y`). Soundness — a cheating prover
 cannot forge a `π'` for a wrong `y'` — is the module's actual crux; see
-"Honest tier assessment" below.
+"Why `prove` and `verify` need care" below.
 
-### The group is Z_N*/{±1}, not Z_N* (since 2026-09-06)
+### The group is Z_N*/{±1}, not Z_N*
 
 Wesolowski's soundness rests on the **low-order assumption** (Boneh–Bünz–
 Fisch §2.3): no one can find an element of small known order. In Z_N* one
@@ -73,7 +66,7 @@ proof `π` for `y` is, negated, a valid proof for `N-y`, and a prover
 chooses which of the two outputs to publish for the same `(N, x, T)`. A
 randomness beacon publishing `H(y)` thereby hands the prover one
 adaptively chosen bit per round. This was measured on this module
-(A1 audit F1, 2026-09-06): 38 of 38 negation forgeries accepted, at the
+(A1 audit F1): 38 of 38 negation forgeries accepted, at the
 cost of one `eval` and two `prove`s, no factorization needed.
 
 BBF §6 and every production RSA-group VDF therefore work in the quotient
@@ -92,8 +85,8 @@ the two never tie):
   `T = 0` is not refused (it is the identity map); a minimum delay is the
   caller's policy on `T`.
 
-Wire consequence: an output or proof whose raw value lay above `N/2` is
-now its negation. The RSA-2048 KAT vectors are unaffected (all below
+Wire consequence: an output or proof whose raw value lies above `N/2` is
+its negation. The RSA-2048 KAT vectors are unaffected (all below
 `N/2`); the toy-modulus vector in `kat_test.zig` pins the fold.
 
 ## Design
@@ -126,7 +119,7 @@ render, was used to resolve it, and the embedded constant is additionally
 cross-checked against three independently-computed Python KAT vectors —
 see "Verification" below).
 
-### `eval` (REAL)
+### `eval`
 
 `y := x; repeat T times: y := y*y mod N`. Mechanical — the entire point is
 that there is nothing cleverer to do here; a shortcut would defeat the
@@ -137,11 +130,14 @@ integer (`eval` never computes `2^T`, only performs `T` squarings) —
 hash input; `T` as a `u64` exponent in a `~log T`-round square-and-multiply
 mod a 256-bit prime).
 
-### `hashToPrime` (REAL) — and why determinism, not just correctness, is load-bearing
+### `hashToPrime` — and why determinism, not just correctness, is load-bearing
 
 `l` is derived from `SHAKE256(domain || N_bytes || x_bytes || y_bytes ||
 T_be64)`, squeezed to 32 bytes, then walked upward by 2 (only odd
-candidates) until a `mr_rounds = 64`-round Miller-Rabin test accepts one.
+candidates) until a `mr_rounds = 64`-round Miller-Rabin test accepts one. A candidate is
+first sieved against a table of small odd primes (`sieve_primes`, remainders carried
+incrementally across the walk), which only skips Miller-Rabin work on composites; the verdict is the
+same as without the sieve.
 
 The one design decision here that is NOT a straight port of this repo's
 existing per-module Miller-Rabin helpers (`rsa`/`paillier`/
@@ -165,24 +161,22 @@ anything the prover chooses), but is perfectly reproducible for the same
 candidate across machines and runs.
 
 The binding MUST include `y` (the prover's claim), not just `(N, x, T)` —
-see `verify`'s doc comment in `vdf.zig` and "Honest tier assessment" below
+see `verify`'s doc comment in `vdf.zig` and "Why `prove` and `verify` need care" below
 for why omitting `y` from the binding breaks soundness entirely.
 
-### `pow2Mod` (REAL)
+### `pow2Mod`
 
 `2^t mod l` via ordinary square-and-multiply — the mechanical half of
 `verify`'s check (step 3 above). Public base, public exponent, no
-cryptographic judgment call; implemented and tested today so that
-`verify`'s eventual implementation only has to wire the four steps
-together rather than also getting this piece right.
+cryptographic judgment call.
 
-### `Proof` (REAL)
+### `Proof`
 
 A single Z_N* element `π`, `group.modulus_bytes` (256) bytes, plus a
 trivial length-checked byte codec. `l` is never carried on the wire — both
 sides recompute it via `hashToPrime`.
 
-## The Fable cores (`prove` / `verify`)
+## `prove` and `verify`
 
 Both are implemented in `vdf.zig` (each with a complete per-step
 doc-comment contract):
@@ -198,61 +192,30 @@ doc-comment contract):
 - `verify`: the 4-step check (validate elements, recompute `l`, compute `r`
   via `pow2Mod`, check `π^l · x^r == y`), returning `false` (not
   panicking/UB) for any malformed/out-of-range input. The `hashToPrime`
-  binding includes `y` — the soundness crux (see "Honest tier assessment").
+  binding includes `y` — the soundness crux (see "Why `prove` and `verify` need care").
 
-## Honest tier assessment
+## Why `prove` and `verify` need care
 
-**`eval` and `hashToPrime` are mechanical, not Fable-hard** — recipe, not
-research. `eval` is "call `square` in a loop." `hashToPrime` is "hash,
-force two bits, Miller-Rabin, increment" — the ONE subtlety (deterministic
-vs. OS-random witnesses, above) is a five-line difference from a pattern
-already established three times elsewhere in this repo, not a novel
-design problem.
+`eval` and `hashToPrime` are mechanical: `eval` is `square` in a loop, `hashToPrime` is hash, force two bits,
+Miller-Rabin, increment (the one subtlety, deterministic rather than OS-random witnesses, is above).
+`prove` and `verify` are short (each well under 100 lines) but hinge on two judgment calls that are easy to get
+subtly, silently wrong:
 
-**`prove`/`verify` ARE genuinely Fable-hard, but narrowly so** — not in
-code volume (each is well under 100 lines) but in two specific judgment
-calls that are easy to get subtly, silently wrong:
-
-1. **The streaming-quotient trick in `prove`.** The NAIVE algorithm
-   (materialize `2^T` and `floor(2^T/l)` via `std.math.big.int`) is
-   actually the EASY one to get right — it is a direct transcription of
-   the formula. The hard part is the module's own design constraint (no
-   big-int dependency, bounded memory regardless of `T`): tracking the
-   long-division remainder correctly IN LOCK-STEP with `eval`'s existing
-   squaring loop, and getting the "emit a quotient bit, then fold it into
-   `π` via Horner's rule" bookkeeping exactly right. An off-by-one in
-   either the remainder-doubling step or the quotient-bit ordering
-   produces a `π` that is silently wrong for every `T` above some small
-   threshold — the kind of bug that makes the naive-vs-streaming
-   cross-check in this module's own test suite (both computing the same `π`
-   two different ways, across the `q=0`/`q=1` division boundaries)
-   mandatory, not optional polish; that cross-check ships.
-2. **`verify`'s exact relation, specifically what `hashToPrime` must
-   bind.** The four algebraic steps are five lines of code once known.
-   The judgment call is upstream of the code: `hashToPrime`'s binding MUST
-   include `y` (the prover's claim), not just `(N, x, T)` (the
-   PRE-COMPUTABLE public inputs). Binding only `(N, x, T)` would let a
-   cheating prover compute `l` in advance (before committing to any `y`
-   at all), then search for a `(y', π')` pair satisfying the check for
-   that PRE-CHOSEN `l` — the entire Fiat-Shamir soundness argument
-   (Wesolowski §3 Theorem 1) rests on `l` being chosen AFTER, and as a
-   function of, the prover's claim. This is invisible in the code (both
-   versions type-check and pass a naive smoke test), which is exactly why
-   it belongs in a dedicated pass with the full soundness argument in
-   view, not folded into scaffolding where "it compiles and the happy
-   path works" would be mistaken for "it's correct." It was implemented in
-   that dedicated pass, with `y` in the binding and the soundness rejects
-   pinned by tests below.
-
-Compare: `ethfrag`/`xdp-classifier` (cited as the "mostly mechanical, not
-actually Fable-hard" precedent this task asked to watch for) turned out to
-be recipe-following once the wire format was pinned down. `vdf`'s
-`eval`/`hashToPrime` are exactly that kind of mechanical. `prove`/`verify`
-are NOT — but the reason is narrow and precise (the two points above), not
-"big-integer cryptography is inherently hard." A Fable pass that
-internalizes those two points before writing code should produce a short,
-correct implementation; one that treats this as "just implement the
-formula" is the module's single biggest risk.
+1. **The streaming-quotient trick in `prove`.** The naive algorithm (materialize `2^T` and `floor(2^T/l)` via
+   `std.math.big.int`) is the easy one to get right: a direct transcription of the formula. The hard part is the
+   module's own design constraint (no big-int dependency, bounded memory regardless of `T`): tracking the
+   long-division remainder correctly in lock-step with `eval`'s squaring loop, and the "emit a quotient bit, then
+   fold it into `π` via Horner's rule" bookkeeping. An off-by-one in either the remainder-doubling step or the
+   quotient-bit ordering produces a `π` that is silently wrong for every `T` above some small threshold, which is
+   why the naive-vs-streaming cross-check in the test suite (both computing the same `π` two ways, across the
+   `q=0`/`q=1` division boundaries) is mandatory.
+2. **`verify`'s exact relation, specifically what `hashToPrime` must bind.** The four algebraic steps are five lines
+   of code once known. The judgment call is upstream: `hashToPrime`'s binding MUST include `y` (the prover's claim),
+   not just `(N, x, T)` (the pre-computable public inputs). Binding only `(N, x, T)` would let a cheating prover
+   compute `l` in advance (before committing to any `y`), then search for a `(y', π')` pair satisfying the check for
+   that pre-chosen `l`; the whole Fiat-Shamir soundness argument (Wesolowski §3 Theorem 1) rests on `l` being chosen
+   after, and as a function of, the prover's claim. This is invisible in the code (both versions type-check and pass
+   a naive smoke test); the soundness rejects pinned by tests cover it.
 
 ## Trusted-setup caveat
 
@@ -273,10 +236,9 @@ requires either trusting its generator or running a genuine multi-party
 one place. This module intentionally does not pick a group family that
 sidesteps the caveat (a class group of negative fundamental discriminant
 has provably unknown order with NO trusted setup — the construction
-Chia and most production VDF deployments actually ship) — see "Non-goals
-/ follow-ups" below.
+Chia and most production VDF deployments actually ship) — see *What is deliberately not done*.
 
-## `T` calibration and trust (A1 F5, F10)
+## `T` calibration and trust
 
 **Calibrate `T` against a faster adversary than this `eval`, and never
 against a Debug build.** `eval`'s squaring loop measures **1.176 µs/squaring
@@ -286,7 +248,7 @@ in ReleaseFast** on the reference machine — but OpenSSL 3.5.5's
 head start for an adversary willing to use a faster modexp than this
 module's own. `ReleaseSafe` is 2.26× slower than `ReleaseFast`, and
 **Debug is 15.81× slower** — and Debug is the lane `zig build test-vdf`
-(no flags) runs, the exact command the "Verify" section above gives first.
+and `scripts/modtest vdf` run without flags.
 Calibrating a real deployment's `T` by timing a Debug build therefore
 undershoots the intended delay by roughly **25× (1.57 × 15.81)** against an
 OpenSSL-class adversary. Always calibrate `T` against a ReleaseFast build,
@@ -305,55 +267,44 @@ a ceiling; a caller that takes `T` from the wire must impose one itself.
 
 ## Verification
 
-- **`eval`**: three byte-exact vectors against the RSA-2048 Factoring
-  Challenge modulus (`x=5`, `T ∈ {1, 5, 1000}`), each independently
-  computed via Python's arbitrary-precision `pow(x, 2**T, N)` — a
-  cross-LANGUAGE check (CPython's own modexp, not this module's
-  sequential-squaring loop). Additionally, a factorization-known toy
-  modulus (`p=1000003, q=999983`, both verified prime) cross-checks
-  `eval`'s sequential-squaring result against the Euler's-theorem shortcut
-  described above, computed via an entirely separate code path — this is
-  an independent FORMULA, not a second run of the same loop.
-- **`hashToPrime`**: one byte-exact vector (the same `T=1000` `(N,x,y)`
-  binding as the `eval` vectors above) against an independent Python
-  re-implementation of the exact SHAKE256-candidate + increment-by-2 +
-  Miller-Rabin search (found the same prime after the same 27
-  increments), plus determinism (same binding -> same `l`, checked twice)
-  and sensitivity (changing any one of `N`/`x`/`y`/`T` changes `l`) tests,
-  plus a self-consistency check (the output actually passes the module's
-  own Miller-Rabin) and a structural check (exactly `prime_bits` long, top
-  and bottom bit set).
-- **`Proof`**: round-trip + wrong-length-rejection codec tests.
-- **`group`**: the RSA-2048 challenge modulus is exactly 2048 bits and
-  round-trips through its own codec; `elementFromBytes` is tested against
-  all three documented rejection cases (`0`, `N` itself, `N+1`) plus the
-  ordinary-value accept path.
-- **`prove`/`verify`** (running): completeness across several `(x, T)`
-  pairs including `T=0`-adjacent small values and `T=10_000`; soundness
-  against a `y` off by exactly one squaring, a single-bit-tampered `π`, a
-  wrong `T`, and every one of `x`/`y`/`π` being `0` or non-canonical
-  (`>= N`). Plus a standalone naive-vs-streaming cross-check of the
-  quotient (`std.math.big.int` `shiftLeft`→`divFloor` vs.
-  `streamingQuotientPow`) across `t ∈ {1, 17, 255, 256, 257, 300, 1000}`,
-  covering the `q=0`, `q=1`-boundary, and multi-bit-quotient cases.
+- **Run:** `scripts/modtest vdf` (add `-Doptimize=ReleaseFast` for the optimized lane); `zig fmt --check modules/vdf`.
+  No test is skipped.
+- **`eval`:** byte-exact vectors against the RSA-2048 Factoring Challenge modulus (`x=5`, several `T`), each
+  computed independently with Python's arbitrary-precision `pow(x, 2**T, N)`: a cross-language check of CPython's
+  modexp, not of this module's squaring loop. A factorization-known toy modulus (`p=1000003`, `q=999983`)
+  cross-checks the sequential-squaring result against the Euler's-theorem shortcut computed through a separate
+  code path, an independent formula rather than a second run of the same loop. The toy-modulus vector in
+  `kat_test.zig` also pins the ±1 fold.
+- **`hashToPrime`:** a byte-exact vector (the same binding as the `eval` vectors) against an independent Python
+  re-implementation of the SHAKE256 candidate, increment-by-2 and Miller-Rabin search; determinism (same binding,
+  same `l`) and sensitivity (changing any one of `N`/`x`/`y`/`T` changes `l`) tests; a self-consistency check (the
+  output passes the module's own Miller-Rabin) and a structural check (exactly `prime_bits` long, top and bottom
+  bit set). The Miller-Rabin tests in `src/vdf.zig` pin the witness source (scripted witnesses 0, 1 and `n-1` are
+  redrawn, never used), the 2-adic valuation chain, and the round count.
+- **`Proof` and `group`:** codec round-trip and wrong-length rejection; the modulus is exactly 2048 bits and
+  round-trips through its own codec; `elementFromBytes` rejects `0`, `N` and `N+1` and accepts ordinary values.
+- **`prove`/`verify`:** completeness across several `(x, T)` pairs including small `T` and a large one; soundness
+  against a `y` off by one squaring, a tampered `π`, a wrong `T`, `x`/`y`/`π` equal to `0` or not canonical
+  (`>= N`), a false `y` forged against a verifier that does not bind `y` (rejected by this one), and a flipped bit
+  of `y` under the honest `π`; a naive-vs-streaming cross-check of the quotient (`std.math.big.int` against
+  `streamingQuotientPow`) across `t` values that straddle the `q=0`, `q=1` and multi-bit-quotient cases.
+- **No byte-exact third-party oracle exists for `prove`/`verify`:** no published `(N, x, T) -> (y, π)` fixture
+  for the RSA-Wesolowski construction was found (the public Wesolowski implementations are class-group, not RSA
+  `Z_N*`, and publish no byte-level fixtures), so verification rests on property and soundness tests plus the
+  independent quotient cross-check, and on the `eval`/`hashToPrime` vectors above for the real code beneath them.
+- **OpenSSL oracle:** `tools/eval_driver.zig` with `tools/openssl_oracle.py` compare `eval` at `T` far past the
+  largest KAT with OpenSSL's `BN_mod_exp`, folded into the quotient the same way (run by hand, see `tools/README.md`).
+- **Fuzz:** `VDF_FUZZ` (`src/fuzz_test.zig`, testkit's deterministic driver): harnesses `vdf-verify` (a genuine
+  triple is accepted, every damaged copy refused, never a panic), `vdf-proof-codec` and `vdf-eval` (`eval` against
+  naive repeated squaring, and its output proves and verifies), with fixed-seed runs and reach checks in every test run.
+- **Constant time:** no harness of its own; the Montgomery core the squarings run on is `montint`'s, covered by
+  its ctgrind lane (the card's `ct` line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. That run covered every non-test line of `src/vdf.zig` and `src/group.zig`; constants
+  (the RSA-2048 hex literal, `prime_bits`, `mr_rounds`, the sieve table, the domain strings), the test-only
+  references and the test files are not mutated.
 
-No published third-party `(N, x, T) -> (y, π)` fixture was found for the
-RSA-Wesolowski construction specifically (searched: Chia-Network's
-`vdf-competition`/`oldvdf-competition`, `iotaledger/vdf`,
-`poanetwork/vdf` — all three implement Wesolowski, but over a CLASS group,
-not RSA `Z_N*`, and none publishes byte-level fixtures suitable for
-cross-language embedding regardless of group). The `eval`/`hashToPrime`
-vectors above are the closest available substitute: genuine cross-language
-(Python) and cross-formula (Euler shortcut) verification of the REAL code
-in this module. For `prove`/`verify` specifically — where no byte-exact
-third-party RSA-Wesolowski oracle exists to find — verification rests on
-property + soundness (completeness round-trips, the four documented reject
-cases, and the `y`-binding proven by the wrong-`y` reject) plus the
-independent naive-vs-streaming quotient cross-check; this is inherent to
-the construction's absence of public byte vectors, and stated honestly
-rather than papered over.
-
-## Non-goals / follow-ups
+## What is deliberately not done
 
 - **Class-group variant (no trusted setup).** Out of scope for this
   module — a materially different (and more complex) group
@@ -369,35 +320,22 @@ rather than papered over.
   `N`. Out of scope; this module documents the caveat and takes `N` as a
   parameter rather than implementing a ceremony.
 
-## Audit 2026-11-17 (whole-module mutation)
-
-145 mutants over every non-test line of `src/vdf.zig` and `src/group.zig`, one schemata build in ReleaseSafe and one run per mutant, baseline first: `eval` (start, tick count, squaring, class representative), `deriveCandidate` (each hashed field, T endianness, the two forced bits), `incrementCandidateByTwo` (step, carry), the sieve (initial and stepped remainders, the divisibility test), `modSmall`, the witness seed, `randomWitness` (the 0, 1 and n-1 exclusions), `shrBytesBe`, `stripLeadingZeros`, `isProbablePrime` (n-1, the 2-adic valuation count, the shift, the pass conditions, the squaring loop bounds, the verdicts, the round count), `pow2Mod`, the `Proof` codec, `prove` (the four input checks, the binding of N/x/y/T, the class representative), `streamingQuotientPow` (every step of the long division and the Horner accumulator), `verify` (the three decode failures, the canonical and identity-class refusals, the binding, `l` and `r`, which exponent goes with which base, the quotient comparison), and in `group.zig` `montPowPublic`, `elementFromBytes`, `negate`, `canonicalize`, `isCanonical` and `isIdentityClass`. Round 1: 110 killed + 2 hung, 33 survived (4 of them were endianness mutants on a `comptime` argument, which a runtime switch cannot reach; they were rebuilt as whole statements and then died). 7 tests were added: carries through 0xff bytes in `incrementCandidateByTwo`; primes with a long run of factors of two in `n-1` (valuation 8, 12, 13, 16, 18); the witnesses 0, 1 and `n-1` redrawn, never used (a scripted witness source yields them first, and 64 liars must not rescue 561); a single round rejected by 91 over 200 seeds; `Proof.toBytes` with a short and a long buffer; `prove` refusing y = 0, y = N, x = 0, x = N and a non-canonical y; and two composites (513 and 1281) that only a full-length 2-adic chain rejects. Round 2 and 3: 125 killed (counting the 2 hangs), 20 do not die, none a defect and none a soundness gap in `verify`:
-
-- EQUIVALENT (16): the index-guard and carry-guard variants of `incrementCandidateByTwo` (a carry off the top byte aborts either way; a zero carry is cost-only); the sieve never rejecting (cost-only: Miller-Rabin rejects the same candidates); the witness mask, the leading-zero strip and its variants, a 65th round, the early composite exit inside the squaring loop (all cost-only); the extra squaring in the Miller-Rabin loop, 2 mutants (it tests a^(n-1) = -1, impossible for an odd n: every prime factor p would need v2(p-1) > v2(n-1), which forces n = 1 mod 2^(v2(n-1)+1)); `prove` reading an unreadable x as 1 (the identity-class check right after refuses it with the same error); `doubled >= l` as `doubled > l` (2r = l never happens, l is an odd prime); `verify` without its non-canonical-y early return (the final comparison against the canonical product refuses it; the guard only saves the hash-to-prime work); and two `montPowPublic` skip-loop variants (an all-zero exponent is base^0 = 1 either way; leading zero octets are cost-only).
-- UNOBSERVABLE (4): the Miller-Rabin witness seed (domain tag, candidate, which 8 bytes, byte order): the verdict depends on the seed only for a composite crafted to fool one specific seeded stream, which is the injection a test would need (2^-128 odds otherwise); the production stream is pinned against the 9-base pseudoprime.
-
-Not mutated: constants (`prime_bits`, `mr_rounds`, `max_search_candidates`, the sieve table, the domain strings, the RSA-2048 hex literal: comptime or pinned by the KATs against an independent oracle), `hashToPrimeUnsieved` and `naiveQuotientPowForTest` (test-only references), asserts, doc comments and the test files. Counts on the card are whole-module (they replace the earlier mutation entry, which carried none).
-
 ## Backlog / deferred
 
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `wide int`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `streamingQuotientPow`. Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
-
 The class-group variant and Pietrzak's proof are the two biggest gaps against the
-competition; both are already refused above under *Non-goals / follow-ups* with a
-reason, so they are not repeated here as backlog. What is left:
+competition; both are refused above under *What is deliberately not done* with a
+reason, so they are not repeated here as backlog. What is open:
 
-- **Moduli other than 2048 bits** *(survey 2026-09-30)*. `group.modulus_bits = 2048`
+- **Moduli other than 2048 bits.** `group.modulus_bits = 2048`
   is a constant; a caller with a 3072- or 4096-bit `N` (a ceremony-generated modulus,
   or a policy floor above 2048) cannot use `eval`/`prove`/`verify`. Moderate: make
   the width a comptime parameter through `group.zig`, `vdf.zig` and the montint
   instantiation, KATs per size from the OpenSSL oracle in `tools/`. Pure Zig,
   fits CONVENTIONS §2.
-- **Squaring throughput against a big-integer library** *(survey 2026-09-30)*. The
-  delay is defined by the sequential squaring rate; chiavdf ships an assembly
-  pipeline and the OpenSSL oracle in `tools/` runs `BN_mod_exp` — a user calibrating
-  `T` against those needs the ratio. Not measured in this SPEC (the perf part of
-  the tooling was deleted, see `tools/README.md`); effort: one measurement session,
-  no code unless the ratio is bad.
+- **Squaring throughput against chiavdf's assembly pipeline.** The delay is defined by the sequential squaring
+  rate; a user calibrating `T` against chiavdf needs the ratio, which is not measured (the ratio against OpenSSL's
+  `BN_mod_exp` was measured once, see *`T` calibration and trust*; the timing tool was not kept, see
+  `tools/README.md`). Effort: one measurement session, no code unless the ratio is bad.
 
 ## References
 
@@ -421,7 +359,6 @@ reason, so they are not repeated here as backlog. What is left:
 
 **What the tests actually contain.** eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N
 
-**How it got there.** No external oracle exists for what remains. no VDF paper/impl publishes a worked byte-level example over a real large modulus
 
 **Run by hand, beyond the shipped KATs.** `modules/vdf/tools/README.md` — an
 independent OpenSSL `BN_mod_exp` value oracle for `eval` at `k` far past the
