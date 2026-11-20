@@ -216,6 +216,15 @@ pub const Options = struct {
     /// streamed body cannot be replayed, and replaying is what an
     /// interceptor that retries does.
     interceptors: []const Interceptor = &.{},
+    /// Replace the network: every hop of `request` / `requestPlain` (the first
+    /// request and each redirect it follows, as Go's `Client.Do` calls
+    /// `Transport.RoundTrip`) is answered by this instead of a connection, so
+    /// a test or an in-process backend serves requests with no socket. Build
+    /// the `Response` with `synthetic`. Interceptors still wrap the whole call;
+    /// the pool, proxies, TLS, `http2` and `decompress` are not involved (the
+    /// response is returned as the round tripper made it). Not applied to
+    /// `requestStreaming*` and `putFile*`. Null (default) = the real exchange.
+    round_tripper: ?RoundTripper = null,
     /// A CA bundle shared by several clients, loaded once (`CaBundle.load`)
     /// — e.g. before a process confines itself (Landlock), for clients made
     /// later on other threads. Borrowed: it must outlive the client, which
@@ -640,6 +649,135 @@ pub fn poolSweep(c: *Client) void {
 
 // ── the request/response exchange ───────────────────────────────────────────
 
+/// `Options.round_tripper`: Go's `http.RoundTripper`.
+pub const RoundTripper = struct {
+    ctx: ?*anyopaque = null,
+    /// One hop: answer `req` or fail. The returned `Response` is the caller's
+    /// to `deinit` (make it with `Client.synthetic`). Called on the request's
+    /// task, concurrently for concurrent requests: `ctx` must be thread-safe.
+    round_trip: *const fn (ctx: ?*anyopaque, c: *Client, req: RoundTripRequest) Error!Response,
+};
+
+/// One hop as the round tripper sees it. Slices are borrowed for the call.
+pub const RoundTripRequest = struct {
+    method: http.Method,
+    method_token: []const u8,
+    url: http.Url,
+    /// The caller's headers (`Host`, `User-Agent` and the framing headers are
+    /// not added: there is no wire).
+    headers: []const http.Header,
+    body: ?[]const u8,
+};
+
+/// What `Client.synthetic` builds a `Response` from.
+pub const SyntheticOptions = struct {
+    status: u16 = 200,
+    /// Empty = the standard reason phrase.
+    reason: []const u8 = "",
+    headers: []const http.Header = &.{},
+    body: []const u8 = "",
+};
+
+/// A `Response` that owns no connection: status, headers and body as given
+/// (copied), `Content-Length` added unless `headers` carries it or a
+/// `Transfer-Encoding`, no body for 204/304. For a `RoundTripper`, or an
+/// interceptor that answers by itself. `deinit` it like any other.
+pub fn synthetic(c: *Client, o: SyntheticOptions) Error!Response {
+    const gpa = c.gpa;
+    const reason = if (o.reason.len != 0) o.reason else Server.reasonPhrase(o.status);
+    var has_len = false;
+    for (o.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) has_len = true;
+    }
+    const no_body = o.status == 204 or o.status == 304 or (o.status >= 100 and o.status < 200);
+    const body: []const u8 = if (no_body) "" else o.body;
+    var head_len: usize = "HTTP/1.1 ".len + 3 + 1 + reason.len + 2 + 2;
+    for (o.headers) |h| head_len += h.name.len + 2 + h.value.len + 2;
+    if (!has_len and !no_body) head_len += "Content-Length: ".len + 20 + 2;
+    const slab = try gpa.alloc(u8, head_len + body.len);
+    errdefer gpa.free(slab);
+    var w: std.Io.Writer = .fixed(slab[0..head_len]);
+    w.print("HTTP/1.1 {d} {s}\r\n", .{ o.status, reason }) catch return error.InvalidHeader;
+    for (o.headers) |h| {
+        if (h.name.len == 0 or std.mem.findAny(u8, h.name, ":\r\n ") != null or std.mem.findAny(u8, h.value, "\r\n") != null) return error.InvalidHeader;
+        w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.InvalidHeader;
+    }
+    if (!has_len and !no_body) w.print("Content-Length: {d}\r\n", .{body.len}) catch return error.InvalidHeader;
+    w.writeAll("\r\n") catch return error.InvalidHeader;
+    const head_text = w.buffered();
+    @memcpy(slab[head_text.len..][0..body.len], body);
+    const head = h1.ResponseHead.parse(head_text) catch return error.InvalidHeader;
+    const conn = try gpa.create(Conn);
+    errdefer gpa.destroy(conn);
+    conn.* = .{
+        .client = c,
+        .stream = undefined,
+        .sr = undefined,
+        .sw = undefined,
+        .tls_client = null,
+        .slab = slab,
+        .head_buf = slab[0..head_text.len],
+        .head_len = head_text.len,
+        .body_buf = &.{},
+        .body = .{ .none = .fixed(slab[head_text.len..][0..body.len]) },
+        .origin = undefined,
+        .synthetic = true,
+    };
+    return .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
+}
+
+/// `request` / `requestPlain` over `Options.round_tripper`: the redirect chain
+/// of the real exchange, with the round tripper as every hop's transport.
+fn requestViaRoundTripper(c: *Client, rt: RoundTripper, method: http.Method, url_text: []const u8, options: RequestOptions, plain: bool) Error!Response {
+    var url = try http.Url.parse(url_text);
+    if (plain and url.scheme != .http) return error.UnsupportedScheme;
+    try validateHeaders(options.headers);
+    try validateMethod(method, options.method_token);
+    if (options.redirect_filter) |f| {
+        if (!f.allow(f.ctx, url, url)) return error.RedirectRefused;
+    }
+    var current_method = method;
+    var current_body = options.body;
+    var url_owned: ?[]u8 = null;
+    defer if (url_owned) |s| c.gpa.free(s);
+    var redirects: u8 = 0;
+    while (true) {
+        var res = try rt.round_trip(rt.ctx, c, .{
+            .method = current_method,
+            .method_token = options.method_token,
+            .url = url,
+            .headers = options.headers,
+            .body = current_body,
+        });
+        errdefer res.deinit();
+        const status = res.status;
+        if (!options.follow_redirects) return res;
+        const next_method = http.redirectMethodFor(res.status, current_method) orelse return res;
+        const location = res.head.header("location") orelse {
+            if (res.status == 307 or res.status == 308) return res;
+            return error.BadRedirect;
+        };
+        if (redirects >= c.options.max_redirects) return error.TooManyRedirects;
+        redirects += 1;
+        const cap = "https://".len + url.host.len + ":65535[]".len + url.path.len + location.len + http.max_merged_path;
+        const buf = try c.gpa.alloc(u8, cap);
+        errdefer c.gpa.free(buf);
+        const resolved = try http.resolveLocation(url, location, buf);
+        const next_url = http.Url.parse(resolved) catch return error.BadRedirect;
+        if (plain and next_url.scheme != .http) return error.UnsupportedScheme;
+        if (refusesSchemeDowngrade(options, url, next_url)) return error.RedirectRefused;
+        if (options.redirect_filter) |f| {
+            if (!f.allow(f.ctx, url, next_url)) return error.RedirectRefused;
+        }
+        res.deinit();
+        if (url_owned) |s| c.gpa.free(s);
+        url_owned = buf;
+        url = next_url;
+        if (status != 307 and status != 308) current_body = null;
+        current_method = next_method;
+    }
+}
+
 /// One application interceptor (`Options.interceptors`). Shape after OkHttp's
 /// application `Interceptor` and Go's `http.RoundTripper` middleware idiom:
 /// it sees the request as a `Chain`, may change it, and calls
@@ -648,8 +786,8 @@ pub fn poolSweep(c: *Client) void {
 ///
 /// Rules:
 ///   * `proceed` may be called 0..n times. 0 = short-circuit (return an
-///     error such as `error.Intercepted`; an interceptor cannot fabricate a
-///     `Response`, which owns a connection); n > 1 = retry. Each `proceed`
+///     error such as `error.Intercepted`, or answer with `Client.synthetic`);
+///     n > 1 = retry. Each `proceed`
 ///     is a whole `request`: redirects and the client's stale-connection
 ///     retry run inside it, so the interceptor sees ONE call per request,
 ///     not one per hop.
@@ -760,6 +898,7 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
 /// concurrency was available, and they stop a redirect chain or a stale-conn
 /// retry from starting fresh work on a budget that is already spent.
 fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    if (c.options.round_tripper) |rt| return c.requestViaRoundTripper(rt, method, url_text, options, false);
     const deadline = c.totalDeadline();
 
     var url = try http.Url.parse(url_text);
@@ -926,6 +1065,7 @@ pub fn requestPlain(c: *Client, method: http.Method, url_text: []const u8, optio
 }
 
 fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    if (c.options.round_tripper) |rt| return c.requestViaRoundTripper(rt, method, url_text, options, true);
     const deadline = c.totalDeadline();
 
     var url = try http.Url.parse(url_text);
@@ -1993,6 +2133,9 @@ const Conn = struct {
     /// Set when ALPN chose h2 (`Options.http2`): requests on this
     /// connection run as streams of this session, one at a time.
     h2: ?*H2Conn = null,
+    /// Built by `Client.synthetic`: no socket, no pool slot, `slab` holds the
+    /// head text and the body.
+    synthetic: bool = false,
 
     const BodyState = union(enum) {
         unset,
@@ -2047,6 +2190,11 @@ const Conn = struct {
 
     fn destroy(conn: *Conn) void {
         const gpa = conn.client.gpa;
+        if (conn.synthetic) {
+            gpa.free(conn.slab);
+            gpa.destroy(conn);
+            return;
+        }
         if (conn.h2 != null) conn.client.options.http2.?.vt.destroy(conn);
         conn.stream.close(conn.client.io);
         // After the close: a waiter woken here dials at once, and the cap
