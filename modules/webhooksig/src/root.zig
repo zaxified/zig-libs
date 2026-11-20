@@ -582,7 +582,7 @@ pub const standard = struct {
                 if (value.len != 88) continue;
                 // 88 characters WITHOUT `==` padding decode to 66 octets: size
                 // first, then decode into the fixed buffer (the websocket key
-                // defect of, same shape).
+                // defect, same shape).
                 const sz = std.base64.standard.Decoder.calcSizeForSlice(value) catch continue;
                 if (sz != 64) continue;
                 var sb: [64]u8 = undefined;
