@@ -8,18 +8,6 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src 6d1438c6c026fa43
 
-**Audit 2026-11-19 (delta mutation, SNP signing).** 12 mutants over the new signing code (`snp.zig`: the placeholder and the signing call in both builders, the key lookup, the signed-slice length, the sign-failure mapping; `scheduler.zig`: `snpKey` guards and index, the key handed to the PSNP and CSNP builders), one schemata build, baseline first: 11 killed, 1 EQUIVALENT (`signed` returning the unsigned bytes when `isis.auth.sign` fails: sign cannot fail on a PDU whose placeholder was just built for the same key). The card counts are cumulative with the 2026-11-17 whole-module run (137/151, 14 eq).
-
-**Audit 2026-11-17 (whole-module mutation).** 151 mutants over every non-test line of `src/snp.zig` and `src/scheduler.zig` (the LSP-ID successor / midpoint arithmetic, SNP entry sorting and PDU building with its error mapping, the SRM drain and retransmit pacing, the per-circuit burst cap, the Down-edge reset, PSNP chunking and the SSN drain, CSNP windows, chunk tiling and the series cursor, the wakeup and truncation bookkeeping), one schemata build per round, baseline first. Round 1: 105 killed, 46 survived. 18 tests were added (3 in `snp.zig`, 15 in `scheduler.zig`): successor carrying into the top octet and across 0xFE, midpoint symmetric in its operands, `ValueTooLong` above 15 entries and `BufferTooSmall` for every shorter scratch, last-sent pruning not resurrecting a stale victim, a Down circuit losing only its own pacing records, the burst cap, pacing measured from the real send time and the wakeup naming the retransmit, an unfinished series waking at `now`, PSNP and CSNP failures for lack of effect slots or scratch ending the pass, several PSNPs keeping their own bytes in ascending order, SNP lifetimes aged to the poll time, a window of exactly 256 entries versus one cut at the 256th id, an empty database, a CSNP that found no effect slot being retried, and a finished series restarting from the bottom of the ID space. Round 2 killed 32 of the 46; 14 do not die, all EQUIVALENT:
-- `sortEntries` `<=` for `<` (LSP-IDs in one database are distinct);
-- every `wake = minOpt(wake, now)` on a path that also sets `truncated` (`next_wakeup` is `now` whenever `truncated`, so the update is overwritten): burst cap, out of effect room, PSNP full, CSNP more, CSNP full;
-- `truncated = true` and the out-of-room report in `emitCsnp` / `poll` (an out-of-room CSNP also reports `more`, and every later stage re-checks the effect room);
-- the Down-edge reset of `csnp_primed`, `csnp_next` and the victim list, the first-sight priming and a reset of a circuit that was never Up (each is redundant with another: `csnp_next` starts at 0 and is reset to 0 on a Down edge, so the first CSNP after a flap fires at once with or without priming).
-
-**Finding fixed (behaviour change).** `Scheduler.poll` panicked in Debug / ReleaseSafe on an EMPTY LSDB (a fresh router's first poll): the Debug-only ordering check `for (1..m)` in `emitCsnp` is a range `1..0` when `m == 0` (in ReleaseFast that range is undefined behaviour). The loop is now `for (1..@max(m, 1))`. The CSNP emitted for an empty database is the one ISO/IEC 10589 §7.3.15 describes for an empty summary: one PDU, Start LSP ID 0000.0000.0000.00-00, End LSP ID FFFF.FFFF.FFFF.FF-FF, no LSP Entries TLV (a test pins that content). The same pattern (`for (1..x)`, `x - 1` on a count that can be 0) was searched for in `isis-flood`, `isis-spf` and `l2forward`: every other hit is guarded (`node_count - 1` after the local system is known to be in the graph; `entries[i - 1]` / `entries[j - 1]` only on non-first chunks) or test code with a fixed non-zero count.
-
-Not mutated: the `Config` defaults and `snp` limits (comptime constants), the `emitPsnp` `db.get(...) orelse continue` (unreachable under the `isis-lsdb` invariants, see the comment there), `root.zig` (module metadata) and the golden tests. Counts on the card are whole-module.
-
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — LSP flooding (keyword review, 2026-10-07)
 
 **Performance:** not measured
@@ -31,7 +19,7 @@ Not mutated: the `Config` defaults and `snp` limits (comptime constants), the `e
 Auditor/design reference. The consumer-facing purpose, API sketch, and verify
 steps live in `README.md`; this document is the pacing model (with ISO cites), the
 SRM/SSN/CSNP output rules, the chunking scheme, the next-wakeup computation, the
-bounds, and the deferred list.
+bounds, and the authentication rules.
 
 ## Compared with
 
@@ -44,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Per-circuit SRM/SSN with LAN clear-on-send and p2p PSNP-driven retransmission (design doc §Flooding), LSP generation throttling. |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | No LSP flooding. |
 
-**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** point-to-point only — no broadcast circuits (SRM cleared on send, DIS-gated periodic CSNP; `rg -i broadcast isis-flood/src` finds only the deferral comment); SNPs carry one 15-entry #9 TLV per PDU rather than filling the MTU (SPEC §5, §8); no `partialSNPInterval` (PSNPs unpaced, SPEC §8); inter-LSP pacing approximated by a per-poll burst cap; no mesh-groups; no flooding reduction (→ Backlog); authentication is sender-side for SNPs only (§10): one key list for every circuit, `keys[0]` signs, and the module originates no LSP (it floods what the LSDB stores), so there is nothing else here for it to sign.
+**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** point-to-point only — no broadcast circuits (SRM cleared on send, DIS-gated periodic CSNP; `rg -i broadcast isis-flood/src` finds only the deferral comment); SNPs carry one 15-entry #9 TLV per PDU rather than filling the MTU (SPEC §5, Backlog); no `partialSNPInterval` (PSNPs unpaced, Backlog); inter-LSP pacing approximated by a per-poll burst cap; no mesh-groups; no flooding reduction; authentication is sender-side for SNPs only (§8): one key list for every circuit, `keys[0]` signs, and the module originates no LSP (it floods what the LSDB stores), so there is nothing else here for it to sign.
 
 ## 1. Scope
 
@@ -54,7 +42,7 @@ time-injected, single-owner: the caller supplies `now` and the set of Up
 interfaces, calls `poll`, and performs the sends; the scheduler decides what to
 send when and updates the LSDB flags (clearing SSN). It reads the `isis-lsdb`
 SRM/SSN flags + owned LSP bytes + `summarise`, and reconciliation of received
-PDUs stays in `isis-lsdb`. Out of scope: §7.
+PDUs stays in `isis-lsdb`. Out of scope: *What is deliberately not done* and *Backlog*.
 
 ## 2. What the siblings provide, and what this module adds
 
@@ -98,7 +86,7 @@ superseding LSP replaces the entry. The scheduler therefore **never** clears SRM
 it relies on retransmission until the ack path clears it. This is the P2P
 "implicit/explicit ack retransmit" model. (On a **broadcast** circuit the rule
 inverts — SRM is cleared on send and the DIS's periodic CSNP drives sync — which
-is why that case is deferred, not hacked into the P2P path; see §7.)
+is why that case is deferred, not hacked into the P2P path; see Backlog.)
 
 ## 4. SRM / SSN / CSNP output rules
 
@@ -148,18 +136,10 @@ Each poll therefore picks a **window** `[cursor, end]`:
   in-range LSP-IDs, **ascending, truncating the tail**, so a return of `n`
   entries provably enumerates all of `[cursor, entries[n-1].lsp_id]` and that
   prefix is exactly what may be claimed. One `summarise` pass per window.
-  ⚠ Until 2026-09-03 this module **binary-searched** `end` down by LSP-ID
-  instead — ~64 extra full-database passes per window — because `summarise`
-  once filled its buffer in hash order, where "the first 256" had no
-  definition. `isis-lsdb` gave it the ordered contract and documented this
-  pagination protocol; this module was not updated and its own comments went
-  on citing hash order as the justification. Measured on a 4096-LSP series:
-  991 `summarise` calls and 1.77 s, against 16 calls and 28 ms for the same
-  16 windows — **62.7× the work**, at stock `complete_snp_interval` enough to
-  starve the scheduler outright at ~12 circuits. The ordering dependency is
-  now explicit: `emitCsnp` asserts the returned prefix is ascending, and
-  `modules/isis-lsdb`'s "srmIsSet answers exactly what srmSet does" and this
-  module's SIBLING CONTRACT test pin it.
+  The ordering dependency is explicit: `emitCsnp` asserts the returned prefix is ascending, and
+  `modules/isis-lsdb`'s "srmIsSet answers exactly what srmSet does" and this module's SIBLING CONTRACT
+  test pin it. (Searching `end` down by LSP-ID instead would cost ~64 extra full-database passes per
+  window: 62.7× the work on a 4096-LSP series, enough to starve the scheduler at ~12 circuits.)
 - The window's entries are already ascending; they are split into groups
   of `lsp_entries_per_pdu`. For group `k` (entries `[i, j)`):
   - `start = (k == 0) ? cursor : successor(last_id_of_group_{k-1})`
@@ -179,7 +159,7 @@ everything to us).
 **Per-PDU cap.** Each emitted PDU carries exactly one #9 TLV, so an 8-bit TLV
 length caps it at 255 / 16 = 15 entries; `lsp_entries_per_pdu ∈ [1, 15]`
 (asserted at `init`). Packing several #9 TLVs into one PDU to fill an MTU is a
-deferred optimisation (§7) — it changes nothing on the reconcile side, which
+deferred optimisation (Backlog) — it changes nothing on the reconcile side, which
 walks every #9 TLV.
 
 ## 6. Next-wakeup computation
@@ -195,20 +175,15 @@ and `null` when nothing is pending (no Up interface). PSNP acks are emitted
 immediately and unpaced, so they contribute to the wakeup only via `truncated`
 — which is why `emitPsnp` reports `truncated` when more than
 `max_summary_entries` flags are pending on a circuit and its summary buffer
-caps the drain. It used not to, so the leftover acks and requests (reachable
-at stock settings: `request_capacity` defaults to `capacity / 4` = 1024, four
-times the buffer) were invisible to this computation and the caller slept a
-full `complete_snp_interval` on them.
+caps the drain (the leftover acks and requests are reachable at stock settings:
+`request_capacity` defaults to `capacity / 4` = 1024, four times the buffer).
 Saturating arithmetic (`+|`) guards the interval additions.
 
 **Adjacency edges.** Per-circuit scheduling state describes an *adjacency*,
 not a wire. When a circuit leaves the `up` set, its CSNP priming, resume
 cursor and pacing records are dropped, so the next adjacency is re-primed and
-re-synchronised from the bottom of the ID space. Without that, only the first
-adjacency ever seen on a circuit got its initial CSNP, and a flap mid-series
-left the cursor parked — the new neighbour's first CSNP then advertised a
-window starting in the middle of the space and the bottom of it went
-unadvertised for a full cadence.
+re-synchronised from the bottom of the ID space (a flap mid-series cannot leave
+the cursor parked in the middle of the space).
 
 ## 7. Bounds / DoS
 
@@ -233,79 +208,9 @@ unadvertised for a full cadence.
   makes the chunker's group empty forever; anything above 15 makes every
   `buildPsnp`/`buildCsnp` return `ValueTooLong`, which both emitters report as
   `truncated` — "poll again immediately" on work that never gets smaller, i.e.
-  a zero-output livelock from a config typo. The 2026-08-23 fix clamped the
-  lower end only, which fixed the case and not the rule.
+  a zero-output livelock from a config typo.
 
-## 8. Deferred (with hooks)
-
-- **LAN / broadcast flooding** — on a broadcast circuit SRM is cleared **on send**
-  (no per-neighbour ack), and only the **DIS** sends the periodic CSNP; receivers
-  send PSNPs only to request missing LSPs. This scheduler is P2P-only: it would
-  take the LSDB's `broadcast_interfaces` set plus a DIS-role input to switch an
-  interface to clear-on-send + DIS-gated CSNP. The `up`-set + per-interface timer
-  structure is the hook.
-- **Fine-grained inter-LSP transmit pacing** — the sub-second per-circuit LSP gap
-  is approximated by the per-poll burst cap (§3); a real inter-LSP timer would
-  replace it.
-- **Multi-TLV PDU packing** — filling a PDU to the link MTU with several #9 TLVs
-  (rather than one 15-entry TLV per PDU). Purely an efficiency change.
-- **`partialSNPInterval`** — ISO 10589 defines a third timer alongside
-  `minimumLSPTransmissionInterval` and `completeSNPInterval`, governing the
-  periodic transmission of Partial SNPs (RFC 9681 §3 quotes it, with "a
-  reasonable value is 2 s"). This module implements the other two and emits
-  PSNPs immediately and unpaced instead. That is a deliberate choice — §6
-  states it, and the CSNP → request-placeholder → PSNP reflection ratio is
-  ~1:1, so it is not an amplification surface — but it is a deviation from the
-  standard's timer set, recorded here rather than left implicit in §6's
-  wording.
-- **Mesh-groups (RFC 2973)** and **LSP purge-specific flooding** beyond what the
-  SRM flag already encodes (a purge is just an LSP with SRM set by the LSDB).
-- **Socket I/O** — the scheduler returns effects; the caller owns the wire.
-
-## 9. Verification
-
-Per CONVENTIONS §7 this is **pure logic** → unit + property/round-trip; the wire
-format is exercised end-to-end against the sibling `isis` codec (golden-tested)
-and the `isis-lsdb` flag machinery, so no external oracle is needed.
-
-- **SRM pace boundary** (injected `now`): send at `t=0`; no re-send at `t∈{1,4}`;
-  retransmit at `t=5 = 0 + interval`; SRM never cleared by the scheduler on P2P.
-- **Positive control** (permanent): an **unpaced** scheduler
-  (`pace_lsp_retransmit = false`) re-sends on the immediate second poll where the
-  paced one does not — the exact gate the boundary test depends on. Regressing the
-  pacing to "re-send every poll" turns the boundary test RED.
-- **Ack clears retransmit**: a PSNP echoing the same version, reconciled via
-  `lsdb.reconcilePsnp`, clears SRM; the scheduler then stops re-sending.
-- **SSN → PSNP**: two SSN-flagged LSPs → one PSNP whose decoded LSP-Entries are
-  exactly those two (id/seq/lifetime), SSN cleared afterward.
-- **Periodic CSNP**: emitted on the `complete_snp_interval` cadence (initial fire,
-  then silent within the interval, then again at the boundary), decoded and its
-  entries checked against the DB.
-- **CSNP chunking**: a tiny `lsp_entries_per_pdu` over a few LSPs → multiple
-  CSNPs whose `[start, end]` ranges tile `[00…00, FF…FF]` contiguously (each
-  start == previous end's successor, first == min, last == max) with full,
-  non-overlapping entry coverage.
-- **Up-interface gate**: an SRM-set LSP on a Down interface is not sent; it floods
-  once that interface is Up.
-- **Next-wakeup**: equals min(next retransmit, next CSNP); `null` with no Up
-  interface; `now` when truncated.
-- **Determinism**: identical `(lsdb ops, now, up)` → identical effect counts and
-  wakeup.
-- **Truncation / bounds**: a full `out` slice → `truncated`, `next_wakeup == now`;
-  the last-sent map is pruned to zero once SRM clears; `std.testing.allocator`
-  leak checks.
-- **Integration**: two nodes (each a real `Lsdb` + `Scheduler`) flood an LSP and
-  acknowledge it back through the `isis` wire codec — the second side is built,
-  not assumed — and A's retransmit stops once B's ack lands.
-
-Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
-green; the sibling `isis` (46) and `isis-lsdb` (24) suites unaffected.
-
-Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
-spec — merger doctrine); no third-party implementation source consulted or ported.
-Like the sibling `isis` codec + `isis-adj` FSM it carries no `/NOTICE` entry.
-
-## 10. Authentication (sender side, `Config.auth_keys`, 2026-11-19)
+## 8. Authentication (sender side, `Config.auth_keys`)
 
 Without keys every PDU is byte-identical to before (the goldens are unchanged).
 `Config.auth_keys` takes the same slice as `isis-lsdb`'s `Config.auth_keys` and
@@ -344,13 +249,88 @@ authentication is opt-in there). Tests: `src/auth_test.zig` (every algorithm,
 verification by `isis.auth.verify` and by the real `isis-lsdb` receiver, wrong
 key, unsigned, chunked series, rollover order, forwarded LSP byte-identical).
 
+## Verification
+
+Per CONVENTIONS §7 this is **pure logic** → unit + property/round-trip; the wire
+format is exercised end-to-end against the sibling `isis` codec (golden-tested)
+and the `isis-lsdb` flag machinery. The scheduling decisions (SRM/SSN state, pacing,
+cadence) have no wire representation, so no external oracle can grade them (see
+*Anchoring*).
+
+- **Run:** `scripts/modtest isis-flood` (`zig build test-isis-flood`); the tests live in
+  `src/scheduler.zig`, `src/snp.zig`, `src/auth_test.zig`, goldens in `src/goldens.zig`.
+- **SRM pace boundary** (injected `now`): send at `t=0`; no re-send at `t∈{1,4}`;
+  retransmit at `t=5 = 0 + interval`; SRM never cleared by the scheduler on P2P.
+- **Positive control** (permanent): an **unpaced** scheduler
+  (`pace_lsp_retransmit = false`) re-sends on the immediate second poll where the
+  paced one does not — the exact gate the boundary test depends on. Regressing the
+  pacing to "re-send every poll" turns the boundary test RED.
+- **Ack clears retransmit**: a PSNP echoing the same version, reconciled via
+  `lsdb.reconcilePsnp`, clears SRM; the scheduler then stops re-sending.
+- **Split horizon**: a received LSP is never scheduled back out its arrival circuit.
+- **SSN → PSNP**: two SSN-flagged LSPs → one PSNP whose decoded LSP-Entries are
+  exactly those two (id/seq/lifetime), SSN cleared afterward; several PSNPs keep their own bytes and list
+  the acknowledged LSPs in ascending LSP-ID order; SNP entries carry the Remaining Lifetime aged to the poll time.
+- **Periodic CSNP**: emitted on the `complete_snp_interval` cadence (initial fire,
+  then silent within the interval, then again at the boundary), decoded and its
+  entries checked against the DB.
+- **CSNP chunking**: a tiny `lsp_entries_per_pdu` over a few LSPs → multiple
+  CSNPs whose `[start, end]` ranges tile `[00…00, FF…FF]` contiguously (each
+  start == previous end's successor, first == min, last == max) with full,
+  non-overlapping entry coverage, also over a sparse ID space; a window of exactly
+  `max_summary_entries` is summarised complete, one more is cut at the last id it can
+  claim; a finished series restarts from the bottom; an empty database emits the one
+  CSNP described in §5 (Start LSP ID 0000.0000.0000.00-00, End LSP ID FFFF.FFFF.FFFF.FF-FF, no
+  LSP Entries TLV), and `poll` on an empty LSDB does not panic.
+- **Hostile peer** (over a 300-LSP database, above the 256-entry summary buffer): no CSNP ever claims a
+  range holding an LSP it did not list, and a peer LSDB fed the whole series re-floods and requests nothing.
+- **Sibling contract**: `isis-lsdb.summarise` returns an ascending, tail-truncated prefix.
+- **Up-interface gate and adjacency edges**: an SRM-set LSP on a Down interface is not sent; it floods
+  once that interface is Up; a circuit that flaps is re-primed and re-synchronised from the bottom, and a
+  Down circuit loses only its own pacing records.
+- **Next-wakeup**: equals min(next retransmit, next CSNP); `null` with no Up
+  interface; `now` when truncated, including an unfinished CSNP series, a PSNP or CSNP that found no
+  effect slot or scratch space, and more than `max_summary_entries` pending SSN flags.
+- **Determinism**: identical `(lsdb ops, now, up)` → identical effects (order and bytes) and wakeup.
+- **Bounds**: a full `out` slice → `truncated`, `next_wakeup == now`; the per-circuit burst cap sends exactly
+  that many LSPs; the last-sent map is pruned to zero once SRM clears and never resurrects a stale
+  victim; `lsp_entries_per_pdu` of zero or above 15 neither underflows nor livelocks;
+  `std.testing.allocator` leak checks.
+- **Integration**: two nodes (each a real `Lsdb` + `Scheduler`) flood an LSP and
+  acknowledge it back through the `isis` wire codec — the second side is built,
+  not assumed — and A's retransmit stops once B's ack lands.
+- **Authentication** (`src/auth_test.zig`): see §8.
+- **Mutation:** the whole-module run covered every non-test line of `src/snp.zig` and `src/scheduler.zig`
+  (LSP-ID successor and midpoint arithmetic, SNP sorting and PDU building with its error mapping, the SRM
+  drain and pacing, the burst cap, the Down-edge reset, PSNP chunking and the SSN drain, CSNP windows,
+  chunk tiling and the series cursor, the wakeup and truncation bookkeeping), and a delta run covered the
+  SNP signing code. The equivalent mutants are redundant updates (a `wake` update on a path that also sets
+  `truncated`, the Down-edge resets that duplicate each other, a sort tie that cannot occur in one
+  database, a signing failure that cannot happen for a placeholder just built for the same key). Not
+  mutated: the `Config` defaults and `snp` limits (comptime constants), the `emitPsnp`
+  `db.get(...) orelse continue` (unreachable under the `isis-lsdb` invariants, see the comment there),
+  `root.zig` (module metadata) and the golden tests.
+- **Fuzz, ct:** none (no fuzz obligation under check-fuzz; constant-time n/a for LSP flooding).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
+spec — merger doctrine); no third-party implementation source consulted or ported
+(the README's `Provenance:` line). Like the sibling `isis` codec + `isis-adj` FSM it has no NOTICE.
+
+## What is deliberately not done
+
+- **Socket I/O.** The scheduler returns effects; the caller owns the wire.
+- **LSP purge-specific flooding.** A purge is an LSP with SRM set by the LSDB; the SRM flag already
+  encodes it.
+
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
+Missing-and-it-matters items from the competitive survey.
 
-- **Broadcast-circuit flooding** (SRM cleared on send, periodic CSNP only when local system is DIS, PSNP only as request) (survey 2026-09-30). Why: every reference runs LAN circuits; hook exists (`isis-lsdb` `broadcast_interfaces`). Effort: ~3–4 days plus LAN tests. Fits §2: yes.
-- **Multi-TLV SNP packing to the link MTU** (survey 2026-09-30). Why: at 15 entries per PDU a 4096-LSP database needs ~270 CSNPs where FRR needs ~15 at 1500 bytes. Effort: ~1 day; receiver side already walks every #9 TLV. Fits §2: yes.
-- **`partialSNPInterval` pacing and real inter-LSP transmit gap** (survey 2026-09-30). Why: standard timer set; a burst cap is not a rate. Effort: ~1–2 days. Fits §2: yes. Priority low.
+- **Broadcast-circuit flooding** (SRM cleared on send, periodic CSNP only when local system is DIS, PSNP only as request). Why: every reference runs LAN circuits; on a broadcast circuit SRM is cleared **on send** (no per-neighbour ack), only the DIS sends the periodic CSNP, and receivers send PSNPs only to request missing LSPs. Hook: the LSDB's `broadcast_interfaces` set plus a DIS-role input would switch an interface to clear-on-send + DIS-gated CSNP; the `up`-set + per-interface timer structure is the place. Effort: ~3–4 days plus LAN tests. Fits §2: yes.
+- **Multi-TLV SNP packing to the link MTU** (several #9 TLVs per PDU instead of one 15-entry TLV). Why: at 15 entries per PDU a 4096-LSP database needs ~270 CSNPs where FRR needs ~15 at 1500 bytes. Purely an efficiency change; the receiver side already walks every #9 TLV. Effort: ~1 day. Fits §2: yes.
+- **`partialSNPInterval` pacing and real inter-LSP transmit gap.** Why: standard timer set; a burst cap is not a rate (the sub-second per-circuit LSP gap is approximated by `max_lsps_per_iface_per_poll`, §3). ISO 10589 defines `partialSNPInterval` alongside `minimumLSPTransmissionInterval` and `completeSNPInterval` (RFC 9681 §3 quotes it, "a reasonable value is 2 s"); this module emits PSNPs immediately and unpaced instead (§6). The CSNP → request-placeholder → PSNP reflection ratio is ~1:1, so that is not an amplification surface, but it is a deviation from the standard's timer set. Effort: ~1–2 days. Fits §2: yes. Priority low.
+- **Mesh-groups (RFC 2973).** Not built; no hook beyond the per-interface SRM flag.
 
 ## Anchoring
 
@@ -361,4 +341,4 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 
 **What the tests actually contain.** Wireshark sharkd validated CSNP/PSNP content via Scheduler.poll; SRM/SSN flag state + retransmit pace are not wire-observable, stay open
 
-**How it got there.** No external oracle exists for what remains. The SRM/SSN flag state machine, retransmit pacing gate, and CSNP cadence timer (SPEC.md §3/§4/§6) are pure in-memory scheduling decisions with no wire representation — no dissector can grade them, only unit tests do; multi-TLV-per-PDU packing is out of scope (this module always emits one #9 TLV per PDU, SPEC §8 deferred). INVESTIGATED 2026-08-05 (live-FRR feasibility, alongside the isis-dis close): NOT anchorable the way isis-spf/isis-dis were. The one piece that IS wire/state-observable — which interfaces get SRM/SSN set for a given LSP (the actual "flooding direction" decision) — is owned by the sibling isis-lsdb (reconcilePsnp/reconcileCsnp set/clear the flags this module only reads), not by this module; isis-flood's own surface is (a) the retransmit PACE (a timer interval — confirming "FRR also retransmits eventually" over a VM-jittery wall clock is not a byte-exact freeze, it is a flaky tolerance-window assertion, exactly the failure mode CONVENTIONS already rejects) and (b) the CSNP range-chunking scheme (SPEC.md §5's successor-stepped tiling is this module's OWN invented convention for splitting one DB summary across multiple PDUs — FRR chunks by its own unrelated scheme, so a disagreement would prove nothing and an agreement would be coincidence, not validation). No fixture was manufactured to paper over this; the gap is real and stays open.
+**Why the rest has no external oracle.** The SRM/SSN flag state machine, retransmit pacing gate and CSNP cadence timer (§3/§4/§6) are pure in-memory scheduling decisions with no wire representation — no dissector can grade them, only unit tests do. The one wire/state-observable piece, which interfaces get SRM/SSN set for a given LSP (the "flooding direction" decision), is owned by the sibling `isis-lsdb` (`reconcilePsnp`/`reconcileCsnp` set and clear the flags this module only reads). This module's own surface is (a) the retransmit pace (a timer interval: confirming "FRR also retransmits eventually" over a jittery wall clock is a flaky tolerance-window assertion, not a byte-exact freeze) and (b) the CSNP range-chunking scheme (§5's successor-stepped tiling is this module's own convention for splitting one summary across several PDUs; FRR chunks by its own scheme, so a disagreement would prove nothing and an agreement would be coincidence). No fixture was manufactured to paper over this; the gap stays open.

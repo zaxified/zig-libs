@@ -18,7 +18,8 @@ and the next-wakeup deadline seam. LAN/DIS-driven flooding, mesh-groups, and the
 actual socket I/O are deliberately deferred — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §7.3.15** (flooding / SNP generation) + **§7.3.16.3/.4**
-(LSP transmission pacing) — pure spec-only clean-room.
+(LSP transmission pacing) — pure spec-only clean-room. **Deps:** `isis` (PDU codecs, authentication), `isis-lsdb`
+(the SRM/SSN flags and stored LSPs). **Concurrency:** single owner.
 
 ## What's in it
 
@@ -27,7 +28,7 @@ Model after: **ISO/IEC 10589 §7.3.15** (flooding / SNP generation) + **§7.3.16
 | `scheduler` | The `Scheduler`: `poll(now, up, lsdb, out, scratch)` turns the SRM/SSN flags into `Effect`s, paces LSP retransmits via a per-`(lsp, iface)` last-sent map, drains SSN into PSNPs, drives the periodic CSNP cadence, and returns the `next_wakeup` deadline. Holds the pacing/CSNP timers + a positive-control knob. |
 | `snp` | The CSNP/PSNP serialisation + chunking leaf: build a PDU into a caller scratch buffer via the `isis` builders, cap entries per PDU (one #9 TLV = 15), and tile a CSNP series into contiguous, gap-free `[start, end]` LSP-ID ranges (`successor`, `sortEntries`, `buildPsnp`, `buildCsnp`). |
 
-**Authentication:** with `Config.auth_keys` (RFC 5304 / RFC 5310, the same keys as `isis-lsdb`) every CSNP and PSNP is signed with the first key (`auth_snp = false` leaves them unsigned for peers that do not use SNP authentication); flooded LSPs are forwarded as stored, with their originator's signature. `SPEC.md` §10.
+**Authentication:** with `Config.auth_keys` (RFC 5304 / RFC 5310, the same keys as `isis-lsdb`) every CSNP and PSNP is signed with the first key (`auth_snp = false` leaves them unsigned for peers that do not use SNP authentication); flooded LSPs are forwarded as stored, with their originator's signature. `SPEC.md` §8.
 
 ## The retransmit / pacing model (P2P)
 
@@ -108,6 +109,12 @@ for (r.effects) |e| switch (e.kind) {
 };
 // sleep until r.next_wakeup (or until a receive wakes the loop), then poll again.
 ```
+
+## Not provided
+
+Broadcast/LAN circuits and the DIS role, multi-TLV SNP packing to the MTU, `partialSNPInterval` and a real
+inter-LSP transmit gap, mesh-groups, and socket I/O; see `SPEC.md` *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Test
 
