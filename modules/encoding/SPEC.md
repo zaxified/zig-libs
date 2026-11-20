@@ -29,154 +29,71 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [whatwg/encoding](https://github.com/whatwg/encoding) (Encoding Standard) — **reference** (spec) | — | CC-BY-4.0 (`LICENSE`: "Creative Commons Attribution 4.0"; API says NOASSERTION) | 322 | pushed 2026-05-21 | Defines ~30 legacy encodings plus UTF-8/16, label resolution, BOM sniffing and error modes. This module implements five single-byte pages plus UTF-8 from its index tables. |
+| [whatwg/encoding](https://github.com/whatwg/encoding) (Encoding Standard) — **reference** (spec) | — | CC-BY-4.0 (`LICENSE`: "Creative Commons Attribution 4.0"; API says NOASSERTION) | 322 | pushed 2026-05-21 | Defines ~30 legacy encodings plus UTF-8/16, label resolution, BOM sniffing and error modes. This module implements every WHATWG single-byte encoding, UTF-8, UTF-16, `replacement` and the CJK encodings (`encoding.cjk`) from vendored index tables. |
 | [hsivonen/encoding_rs](https://github.com/hsivonen/encoding_rs) | Rust | (Apache-2.0 OR MIT) AND BSD-3-Clause (`LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE-WHATWG` present; API says NOASSERTION) | 468 | pushed 2026-09-24, no GitHub release | README verified: every Encoding Standard encoding, streaming and non-streaming decode/encode to UTF-8 and UTF-16, label resolution, used in Firefox. |
 | [golang/text](https://github.com/golang/text) `encoding/…` | Go | BSD-3-Clause | 809 | pushed 2026-09-18 | Charmap, Japanese, Korean, Chinese and Unicode sub-packages as `Encoder`/`Decoder` transformers Re-surveyed 2026-10-20 (docs; BSD-3 verified, source not needed): `charmap` (ISO-8859-x, windows-125x, KOI8, IBM/CP437/850/852/866, Macintosh, EBCDIC), `japanese`, `korean`, `simplifiedchinese`, `traditionalchinese`, `unicode` (UTF-16, `utf32`), `htmlindex` (WHATWG labels), `encoding.ReplaceUnsupported` / `HTMLEscapeUnsupported`, `transform.Transformer` streaming. |
 | [lifthrasiir/rust-encoding](https://github.com/lifthrasiir/rust-encoding) | Rust | MIT | 289 | pushed 2024-03-31 | Older multi-encoding Rust crate, superseded in practice by encoding_rs *(inferred)*. |
 | GNU libiconv / glibc `iconv` | C | LGPL *(inferred; not read, not linked)* | — | — | The Unix default; hundreds of charsets, needs libc/C. |
 | Zig `std.unicode` | Zig | MIT | — | Zig 0.16.0 | UTF-8, UTF-16LE and WTF-8 conversion only (checked in `lib/std/unicode.zig`); no legacy code pages, no big-endian UTF-16. |
 
-**Where we are ahead:** against every Zig entry the only legacy-code-page transcoder, pure Zig with no libc; its tables are checked pair by pair (640) against **vendored normative data** (WHATWG index files, Unicode.org `8859-1.TXT`), not against themselves, and both directions never error on content (invalid UTF-8 becomes U+FFFD, unmappable codepoints `?`, resync one byte at a time so delimiters survive). **Where we are behind** (re-checked 2026-10-04, after UTF-16, BOM sniffing, the streaming `Decoder` and fatal mode landed): 5 single-byte pages of ~30 — no windows-1251/1253–1258, KOI8-R/U, other ISO-8859 parts — and no CJK (→ Backlog, deferred for binary size); no UTF-16 *encoder* streaming (whole-buffer `encodeUtf16` only); the label table is ours, not the full WHATWG label list for pages we do not have.
+**Where we are ahead:** against every Zig entry the only legacy-code-page transcoder, pure Zig with no libc; every WHATWG page's table equals its vendored normative index (the five original pages, pair by pair in both directions, against the WHATWG index files and Unicode.org `8859-1.TXT`), not itself; and both directions never error on content by default (invalid UTF-8 becomes U+FFFD, unmappable codepoints `?`, resync one byte at a time so delimiters survive). **Where we are behind:** no statistical encoding detection (BOM sniffing only), no EBCDIC / further DOS pages / Kamenicky, no normalization or IDNA (see *What is deliberately not done*); speed against encoding_rs and Go x/text is on the card's Performance line (Go's CJK encoders are faster).
 
 ## Design & invariants
-Legacy single-byte code page ↔ UTF-8 transcoding for the five European code pages a legacy broker /
-Excel export is realistically saved in (`windows_1250`, `windows_1252`, `iso_8859_1`, `iso_8859_2`,
-`iso_8859_15`, plus `utf8` pass-through). `Encoding.parse` is case-insensitive with common aliases
-(`cp1250`, `latin-1`, etc.); `decodeToUtf8`/`encodeFromUtf8` take an allocator and return an owned
-buffer. Each page's low half (0x00–0x7F) is ASCII and maps to itself, so structural bytes
-(delimiters, quotes, CR, LF) survive transcoding (⚠ *delimiters*, not *positions* — see the module
-doc comment: decode expands up to 3x, so an earlier "raw byte offsets stay valid" here was false as
-written); the high half
-(0x80–0xFF) is built from an identity Latin-1/C1 base plus per-page override tables. This module
-runs only at the read edge (decode → UTF-8) and the write edge (encode ← UTF-8) — internal currency
-everywhere else is always UTF-8. Platform: any (pure logic, no OS calls). Role: codec. Concurrency:
-reentrant (tables are `const`, no shared state). Modeled after the WHATWG Encoding Standard's
-single-byte European subset; original work of the zig-libs authors — no third-party code ported.
-The five high-tables ARE anchored against vendored third-party normative DATA (WHATWG `index-*.txt`
-for windows-1250/1252 and iso-8859-2/15; Unicode.org `8859-1.TXT` for iso-8859-1, since WHATWG
-aliases the "iso-8859-1" *label* to the windows-1252 *encoding* and does not publish a separate
-index for the true ISO/IEC 8859-1 page) — see `modules/encoding/NOTICE`.
 
-## Design — UTF-16, BOM, streaming, fatal (2026-10-04)
+- **Two API families.** `Encoding` holds the ASCII-compatible encodings: `utf8` (the default), the 29 WHATWG single-byte pages (the first five tags `windows_1250`, `windows_1252`, `iso_8859_1`, `iso_8859_2`, `iso_8859_15` are the module's original set and keep their tags), `x_user_defined` and the DOS pages `cp437`/`cp850`/`cp852` (IANA names and labels, not WHATWG). UTF-16 and UTF-32 (`Decoder.Kind`, `decodeUtf16`/`decodeUtf32`…) and the CJK encodings (`encoding.cjk`) are outside `Encoding` on purpose: a byte below 0x80 is that ASCII character in every `Encoding` member, which lets a caller transcode a CSV cell by cell and write delimiters as raw bytes; in UTF-16 `,` is `2c 00` and CJK trail bytes reach 0x40–0x7E.
+- **Tables are data.** `src/sb_tables.zig` is generated by `tools/gen_tables.py` (`--check` regenerates in memory and fails on a difference) from the vendored WHATWG `encodings.json` and `index-*.txt` and Unicode.org `CP437/850/852.TXT` (see `NOTICE`): per page a 128-entry decode table (`0xFFFF` = undefined) and a sorted encode table, its inverse. The low half (0x00–0x7F) of every page is ASCII and maps to itself, so structural bytes survive (⚠ *delimiters*, not *positions*: decode expands up to 3x, `Decoder.maxUtf8Len(n)` is `3n + 8`). `core.SingleByte(decode_table)` builds a page from a comptime table; when two bytes decode to one code point the first one encodes it (WHATWG's rule).
+- **One core, two surfaces.** `Decoder` and `Encoder` (`init(kind, opts)`) work over caller buffers: `decodeInto` / `encodeInto(src, dst, last)` return a `Progress` (`status` `input_empty` / `output_full` / `malformed`, `read`, `written`, `replaced`); a partial sequence at the end of a non-`last` call is carried in the coder, and after a `last` call that consumed everything the coder is reset for reuse. `feed` / `finish` append to a `std.ArrayList(u8)`, and the allocating functions (`decodeToUtf8`, `encodeFromUtf8`, `encodeFromUtf8Opts`) are built on the same coders, so any cut and any output room give the whole-buffer answer. `Encoder.maxEncodedLen` sizes a buffer that always takes the whole input.
+- **Fast paths.** ASCII runs are scanned and copied in wide blocks, a single-byte page encodes through a two-level reverse table, UTF-8 is validated by the vector algorithm in `src/utf8_simd.zig` (a port of simdjson's, see `NOTICE`), UTF-16 to UTF-8 has branchless unit loops. Figures: the card's Performance line (`zig build bench-encoding`).
+- **Labels.** `lookupLabel` is the WHATWG "get an encoding" lookup (trim ASCII whitespace, case-insensitive, every label of the Standard) plus a few spellings WHATWG lacks (`win1250`, `latin-2`, …) and the IANA labels of the DOS pages. It returns a `LabelTarget`: `.encoding`, `.utf16`, `.replacement` or `.cjk`; `Encoding.parse` returns null for anything but `.encoding`. **One deliberate departure from WHATWG:** the labels `iso-8859-1`, `latin1` and friends select `iso_8859_1` (the true ISO/IEC 8859-1 page, identity high half), not windows-1252 as in the Standard; `.windows_1252` is the choice for web-sourced data. The `replacement` encoding (HZ-GB-2312, ISO-2022-KR, …, a security measure) decodes any non-empty input to one U+FFFD (`decodeReplacement`).
+- **Custom pages.** `Custom(decode_table)` wraps a comptime `[128]u16` (`0xFFFF` = hole) as a page with `decodeByte`, `encodeCp`, caller-buffer `decodeToUtf8` / `encodeInto`, and the allocating `decodeCustom` / `encodeCustom`; entries below U+0080 decode but never encode.
+- **Helpers.** `utf8ValidUpTo` (the exact longest valid prefix), `isAscii`, `asciiValidUpTo`, `latin1ToUtf8` and `utf8ToLatin1Lossy` (the identity `iso_8859_1` page, not windows-1252; the lossy one writes `?` for a code point above U+00FF).
+- **Introspection.** `whatwgName`, `canonicalName`, `isSingleByte`, `isAsciiCompatible`, `canEncodeEverything`.
+- Platform: any (pure logic, no OS calls). Role: codec. Concurrency: reentrant (tables are `const`, no shared state). Modeled after the WHATWG Encoding Standard; the transcoding logic is clean-room, no third-party code is ported except the UTF-8 validator.
 
-- `Decoder` is the WHATWG UTF-8 and UTF-16 decoder state machines verbatim (UTF-8: bytes needed /
-  seen / lower / upper boundary, so overlongs, surrogates and > U+10FFFF are refused at the
-  offending byte and that byte is read again; UTF-16: lead byte, lead surrogate, an unpaired lead
-  followed by another unit is one error and the unit is read again). Chunks of any size; `finish`
-  turns an unfinished sequence into one U+FFFD (or `error.Malformed` with `.fatal`). A fatal
-  decoder that failed refuses further input.
-- `decodeToUtf8(.utf8)` now runs the same machine (after a validity fast path), so its U+FFFD
-  count is WHATWG's — one per maximal subpart. **Behaviour change:** before, one per byte.
-- UTF-16 is deliberately not an `Encoding` member (every `Encoding` is ASCII-compatible; the build-tool consumer
-  transcodes cell by cell and writes delimiters raw). Entry points: `decodeUtf16`, `encodeUtf16`
-  (malformed UTF-8 → U+FFFD; optional BOM), `decode` (BOM sniff overrides the fallback and is
-  removed, WHATWG "decode"), `sniffBom`.
+## Design — UTF-8/16/32 decoders, BOM, fatal mode
 
-## Threat model / out of scope
-**Data-lenient — never traps.** On decode from a legacy page every one of the 128 high bytes maps,
-so the unmappable-codepoint fallback is provably unreachable for all five (`normative_test.zig`
-proves it; a 2026-08-14 changelog line claiming "arbitrary bytes already reach every branch" was
-wrong about exactly this). On decode from `.utf8`, malformed input becomes U+FFFD — WHATWG's own
-decoder error mode — so `decodeToUtf8` returns valid UTF-8 unconditionally, which it did not until
-2026-09-02: `.utf8` was a verbatim dupe, and `.utf8` is the default. On encode, a codepoint with no
-representation in the target page becomes `'?'`, and invalid/truncated UTF-8 passes through
-verbatim byte-for-byte, resynchronising **one byte at a time** so a delimiter following bad input is
-never swallowed. Neither direction ever errors on content (only on allocation failure) — so hostile/malformed input cannot crash or hang transcoding,
-only silently degrade fidelity (which is the documented, deliberate contract, not a bug to fix).
-Out of scope *not now* (reason under *Backlog / deferred*): broader WHATWG Encoding Standard coverage — other
-single-byte pages (windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS, EUC-JP,
-GBK/GB18030, Big5). (UTF-16 is covered since 2026-10-04, see above.) The `build(&overrides)` table pattern would generalize but there is
-no in-house need beyond the European subset; reopen only on a concrete requirement.
+- `Decoder` is the WHATWG UTF-8 and UTF-16 decoder state machines verbatim (UTF-8: bytes needed / seen / lower / upper boundary, so overlongs, surrogates and > U+10FFFF are refused at the offending byte and that byte is read again; UTF-16: lead byte, lead surrogate, an unpaired lead followed by another unit is one error and the unit is read again). Chunks of any size; `finish` turns an unfinished sequence into one U+FFFD (or `error.Malformed` with `.fatal`). A fatal decoder that failed refuses further input.
+- `decodeToUtf8(.utf8)` runs the same machine (after a validity fast path), so its U+FFFD count is WHATWG's — one per maximal subpart (`e2 82` is one, `f0 80 80` is three) — and the output is valid UTF-8 unconditionally.
+- UTF-32 (not in the Standard; Python `utf-32` and x/text `utf32` have it) uses the same shape: a malformed unit (above U+10FFFF, a surrogate) is one U+FFFD and a cut tail is one, as CPython's `errors="replace"`.
+- BOMs: `sniffBom` recognises UTF-8 and UTF-16 (WHATWG: `ff fe 00 00` is UTF-16LE); `sniffBom32` additionally recognises UTF-32 (`ff fe 00 00` / `00 00 fe ff`); `decode` / `decode32` let a BOM override the fallback encoding and remove it. `encodeUtf16` / `encodeUtf32` take an optional BOM (malformed UTF-8 → U+FFFD).
+- Entry points: `decodeUtf16`, `encodeUtf16`, `decodeUtf32`, `encodeUtf32`, `decodeFatal` (`error.Malformed` instead of U+FFFD, also for a page's undefined byte).
+- **Unmappable modes** on encode (`Unmappable`): `.question_mark` (default, as Python `errors="replace"`), `.ignore`, `.html_ncr` (`&#NNNN;`, the Standard's own encoder mode for HTML forms) and `.fatal` (`error.Unmappable`; `Encoder.encodeInto` reports `EncodeStatus.unmappable` with the code point and stops before it).
+
+## CJK (`encoding.cjk`)
+
+Shift_JIS, EUC-JP, ISO-2022-JP (stateful), EUC-KR, gb18030 (GB18030-2022), GBK and Big5, as the Standard defines them. Not ASCII-compatible, so a separate API of the same shapes: `cjk.Decoder`, `cjk.Encoder` (`decodeInto`/`encodeInto`, `feed`/`finish`), `cjk.decodeToUtf8`, `cjk.decodeFatal`, `cjk.encodeFromUtf8`; `lookupLabel("sjis")` answers `.cjk = .shift_jis`. About 300 KB of tables are compiled only into a program that references `encoding.cjk` (no build option: the `tz.full` precedent). The Big5 encoder never writes an HKSCS lead byte (such bytes still decode).
+
+## Threat model / limits
+
+**Data-lenient — never traps.** On decode from a single-byte page a byte maps to a code point, except where the Standard leaves it undefined (windows-1253, ISO-8859-8 …): that decodes to U+FFFD, and fatal mode refuses it keeping what came before. The five original pages define every one of their 128 high bytes (`normative_test.zig` proves it), so that case cannot occur for them. On decode from `.utf8`, malformed input becomes U+FFFD — WHATWG's own decoder error mode — so `decodeToUtf8` returns valid UTF-8 unconditionally, and `.utf8` is the default. On encode, a codepoint with no representation in the target page becomes `'?'` (or the chosen `Unmappable` mode), and invalid/truncated UTF-8 passes through verbatim byte-for-byte, resynchronising **one byte at a time** so a delimiter following bad input is never swallowed. Without `.fatal` neither direction ever errors on content (only on allocation failure) — so hostile/malformed input cannot crash or hang transcoding, only silently degrade fidelity (the documented, deliberate contract, not a bug to fix).
+
+Limits a consumer relies on: decode output is at most 3 bytes per input byte (plus a few); a fatal decoder that failed refuses further input until re-initialised; the `iso-8859-1` label departs from WHATWG (see *Design & invariants*); the CJK tables cost binary size in any program that references `encoding.cjk`.
+
+## What is deliberately not done
+
+- **Statistical encoding detection** (chardetng, Python `chardet`, ICU): not built; BOM sniffing only (R13). A limited form is open in *Backlog / deferred*.
+- **Unicode normalization (NFC/NFD), IDNA/punycode, UTF-7, base64/quoted-printable codecs, `utf-8-sig` as a named codec** (R14): other charters (normalization and IDNA would be a `unicodenorm` module if anyone asks); base64 has `b64ct`/`base32`; UTF-7 is rejected by WHATWG for security and maps to `replacement`; the UTF-8 BOM is handled by `decode`.
+- **CP855/858/860-866, EBCDIC, Kamenicky** (R12 remainder): no consumer; only CP437/850/852 are built (CP852 is Czech/Polish DOS).
+- **Backslash and name replacement on encode** (`\uXXXX`, `\N{}`, Python `backslashreplace`/`namereplace`): not built; `namereplace` would need the Unicode name table.
+- **UTF-16 Latin-1 converters** (encoding_rs `mem`): no consumer.
+- **A `-Dcjk` build option:** not built; the CJK tables are compiled only when referenced, which gives the same size effect without an option.
 
 ## Verification
-Tests cover: exhaustive decode+encode cross-check of all five code pages' full 128-entry high
-tables against vendored EXTERNAL normative sources — not a self-round-trip of our own tables (see
-`normative_vectors.zig` / `normative_test.zig`, 640 byte/codepoint pairs total, plus a count
-assertion per page guarding against a silently-truncated re-vendor); ASCII-identity of the low
-half; alias parsing (case-insensitive + all listed aliases per page); lenient-fallback behavior on
-unmappable codepoints (encode → `'?'`) and unmappable bytes (decode → verbatim passthrough); and
-invalid/truncated UTF-8 passthrough on encode. All five normative sources define every one of their
-128 high-byte entries (zero holes) — verified, not assumed — so there is no genuinely-undefined-byte
-case to anchor for these five pages specifically. Run: `zig build test-encoding`.
 
-## Verification — UTF-8 / UTF-16 (2026-10-04)
-
-- **CPython's codecs as a black-box oracle:** `tools/codec-oracle.py` (recipe kept) writes
-  `src/testdata/codec_golden.txt` — 5 669 cases: valid sequences of every length, truncations,
-  overlongs, encoded surrogates, out-of-range leads, lone and swapped surrogates, odd lengths,
-  random bytes, for utf-8 / utf-16le / utf-16be decode (with whether a strict decode succeeds) and
-  UTF-16 encode. Every decode case also runs through the streaming decoder at every split point
-  and byte by byte, and in fatal mode, which must fail exactly when CPython's strict decode does.
-  CPython's `errors="replace"` replaces maximal subparts, which is the WHATWG rule; the shapes in
-  the hand-written tests (`e2 82`, `f0 80 80`, `ed a0 80`, unpaired surrogates, odd tails) were
-  also checked against the Standard's algorithm by hand.
-- **Mutation 2026-10-04** (schemata, 18 mutants over the new code): 16 killed at once, 1 killed by
-  a new test (U+10000, the first codepoint that needs a surrogate pair), 1 equivalent (the
-  validity fast path in `sanitizeUtf8` — the decoder returns the same bytes, only slower).
+- **Run:** `scripts/modtest encoding` (`zig build test-encoding`). Benchmark: `zig build bench-encoding` (`tools/bench.zig`, a program not a test; generated seeded inputs, encoding_rs through `tools/rust_bench`, Go x/text through `tools/go_bench`); figures are on the card's Performance line.
+- **Normative table anchors:** `normative_test.zig` drives the public decode and encode API over every high-half pair of the five original pages against the vendored WHATWG `index-*.txt` files and Unicode.org `8859-1.TXT` (never against our own table), asserts that all five define every one of their 128 bytes, and that the vendored files still match the hash printed inside them. `sb_tables_test.zig`: every decode table equals its vendored WHATWG index, the encode table is exactly the inverse, canonical names, the shared 8-I tables, the `iso_8859_1` identity, every label of `encodings.json` resolves, and spot checks of the DOS pages and `x-user-defined` from the code charts.
+- **CPython as a black-box oracle:** `tools/codec-oracle.py` writes `src/testdata/codec_golden.txt` (valid sequences of every length, truncations, overlongs, encoded surrogates, out-of-range leads, lone and swapped surrogates, odd lengths, random bytes, for utf-8 / utf-16le / utf-16be decode with whether a strict decode succeeds, and UTF-16 encode). Every decode case also runs through the streaming decoder at every split point and byte by byte, and in fatal mode, which must fail exactly when CPython's strict decode does. CPython's `errors="replace"` replaces maximal subparts, which is the WHATWG rule; the shapes of the hand-written tests (`e2 82`, `f0 80 80`, `ed a0 80`, unpaired surrogates, odd tails) were also checked against the Standard's algorithm by hand. UTF-32 cases (`extra_test.zig`) are CPython's answers written into the test; there is no producer script for them.
+- **Go x/text as a differential oracle:** `go_oracle.zig` replays `go_oracle_vectors.zig` (generated by `tools/go_oracle`): `Encoding.parse` against `htmlindex` (labels of other encodings and whitespace/case variants included, with listed divergences: the iso-8859-1 departure, config-file spellings WHATWG does not list, VT, which WHATWG does not strip), and for every page which code points encode to a byte rather than `?` against x/text's charmap strict encoders. `cjk_test.zig` replays `cjk_oracle_vectors.zig` (generated by `tools/cjk_oracle`): ours equals a literal transliteration of the Standard everywhere and equals x/text off the classified divergences (x/text lags GB18030-2022).
+- **CJK tables and codecs:** the decode arrays equal the vendored index files; every pointer of every index through the public decoders, every hole an error; every code point gets the pointer the Standard selects, the rest is unmappable; gb18030 four-byte round trip; ISO-2022-JP states and the Standard's own encoder example.
+- **Properties and sweeps:** `api_test.zig` (any output room and any cut give the whole-buffer result for `decodeInto` and `Encoder`, `maxEncodedLen`/`maxUtf8Len` take everything in one call, fatal mode keeps what came before the undefined byte, the unmappable modes); `sweep_test.zig` (no-panic sweep: CJK decoders on every byte pair, gb18030 four-byte pointers, ISO-2022-JP escapes without an end, encoder output sizing, UTF-16/32 odd lengths and surrogates, caller-buffer encoder carry bytes and ASCII scan bounded by the room).
+- **Fuzz:** deterministic driver prefix `ENCODING_FUZZ` (`ENCODING_FUZZ=<runs>[,<first seed>]`): harness `encoding` (every page, any cut and output room against the whole-buffer answer, byte-by-byte input against the UTF state machines, `validUtf8` against std, the UTF-32 kind) and `encoding-cjk`; reach labels count the input classes gotten through, since both codecs are lenient and never fail.
+- **Mutation:** the card's mutation entry is the run over the UTF-8/UTF-16 code of the original design, plus the delta run of the no-panic sweep recorded on the card's Hardening line; a whole-module run is not recorded.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-### Scope parity gap list (S2 re-survey 2026-10-20)
-
-Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
-deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources read: WHATWG
-Encoding Standard (CC-BY-4.0, spec text), `hsivonen/encoding_rs` (cloned 2026-10-20; `LICENSE-MIT` +
-`LICENSE-APACHE` + `LICENSE-WHATWG`: (Apache-2.0 OR MIT) AND BSD-3-Clause — permissive; public API and
-source layout read), `golang/text` (BSD-3, docs), CPython `codecs` (PSF, docs; already the black-box oracle).
-GNU libiconv/glibc iconv: LGPL, not read. The build-tool consumer column: the build-tool consumer imports only `Encoding`, `encode`, `decode`
-(csv input/output encoding config, cell-by-cell transcoding in `pipeline.zig`); R items the build-tool consumer would use are marked.
-
-| # | Feature | Who has it | Effort | Recommendation | Consumer |
-|---|---|---|---|---|---|
-| R1 | The remaining WHATWG single-byte pages (windows-874, 1251, 1253-1258, KOI8-R, KOI8-U, ISO-8859-3..8, 10, 13, 14, 16, IBM866, macintosh, x-mac-cyrillic): 22 more of 28. Pages with holes (1253, 1255, 1257 ...) decode an undefined byte to U+FFFD per the Standard (our current "unmappable byte passes through" can not occur for the five pages, but will here, so this needs a defined policy) | all three (encoding_rs `single_byte.rs`/`data.rs`, x/text `charmap`, Python) | M (tables are data: vendor the WHATWG `index-*.txt`, generate via the existing `build(&overrides)` pattern, same 128-pair external anchor per page as now) | **DONE 2026-10-20** (29 pages generated from the vendored WHATWG indexes, `tools/gen_tables.py`; an undefined byte decodes to U+FFFD, fatal mode refuses it) — do, behind a comptime/build option (`pages` set) so a ReleaseSmall consumer does not carry unused tables, as the earlier "not now" note required | yes if the broker ever sends Cyrillic/Greek/Turkish; windows-1251 is the likely first |
-| R2 | CJK multi-byte: Shift_JIS, EUC-JP, ISO-2022-JP (stateful), EUC-KR, GBK/GB18030, Big5 | encoding_rs (all), x/text (all) | L (index tables ~100s of KiB; GB18030 ranges; ISO-2022-JP encoder state; Big5 HKSCS handling) | **DONE 2026-10-20** as `encoding.cjk` (separate API, not ASCII-compatible; tables compiled only when referenced; anchored on every WHATWG index pointer and x/text, divergence classes in `cjk_oracle_vectors.zig`) — **OWNER 2026-10-20: do, behind a build option `-Dcjk`** (only a consumer that enables it pays the tables), last in the encoding order — owner decision. Recommend do-later as an opt-in build flag `cjk`, last; the alternative is an explicit exclusion on the parity card: "CJK excluded: table size (> the build-tool consumer's whole ReleaseSmall budget), no consumer; reopen on demand" | no |
-| R3 | Complete WHATWG label table ("get an encoding") incl. labels of encodings we do not have returning "known but unsupported" distinct from "unknown", and the `replacement` encoding (hz-gb-2312, iso-2022-kr, iso-2022-cn, iso-2022-cn-ext, utf-7 label: decodes to a single U+FFFD, a security measure) | encoding_rs `for_label`, x/text `htmlindex.Get` | S | **DONE 2026-10-20** (`lookupLabel`: every WHATWG label; `.replacement` with `decodeReplacement`, `.unsupported` names the CJK encodings) — do (the Go oracle already checks 80 labels; extend the table, keep the 21 listed divergences) | no |
-| R4 | Streaming decoder for the single-byte pages (`Decoder.Kind` has only UTF-8/16-LE/BE) | encoding_rs `Decoder` (all), x/text `Transformer` | S (stateless; chunking is trivial) | **DONE 2026-10-20** (`Decoder` covers every `Encoding`; caller-buffer `decodeInto`) — do (makes one streaming API for every `Encoding`) | yes (the build-tool consumer reads files in chunks) |
-| R5 | Streaming encoder, incl. UTF-16 and pages (an incoming UTF-8 sequence split across chunks; `encodeUtf16` is whole-buffer only) | encoding_rs `Encoder`, x/text | S-M | **DONE 2026-10-20** (`Encoder`: pages, UTF-8 copy, UTF-16 with BOM; a cut sequence carries over) — do | yes (output side) |
-| R6 | Caller-buffer, allocation-free API with progress result (`decode_to_utf8(src, dst) -> (result, read, written)`, `max_utf8_buffer_length`, `max_buffer_length_from_utf8_if_no_unmappables`) | encoding_rs, x/text `Transformer.Transform(dst, src, atEOF)` | S-M | **DONE 2026-10-20** (`Decoder.decodeInto` / `Encoder.encodeInto` with `Progress`, `maxUtf8Len` / `maxEncodedLen`) — do; the build-tool consumer's `encodeOutCell` allocates per cell, so this is the most useful item for the consumer | yes |
-| R7 | Unmappable-character modes on encode: (a) HTML numeric character reference `&#NNNN;` (the Standard's own encoder error handling for HTML forms; encoding_rs `encode`), (b) fatal / report the offending code point (`encode_without_replacement`, Python `strict`), (c) ignore, (d) `\\uXXXX` / `\\N{}` (Python `backslashreplace`, `namereplace`) , today only `?` | encoding_rs, x/text (`ReplaceUnsupported`, `HTMLEscapeUnsupported`, custom `ErrorHandler`), Python | S (`EncodeErrors = .question_mark \| .html_ref \| .fatal \| .ignore`; skip `namereplace`, needs the Unicode name table) | **DONE 2026-10-20** (`Unmappable`: `.question_mark` default, `.ignore`, `.html_ncr`, `.fatal` with the code point; backslash forms not built) — do; fatal mode matters for a CSV export that must not silently lose a character | yes (silent `?` in exported data) |
-| R8 | Introspection: `Encoding.name()` (canonical WHATWG name), `output_encoding`, `is_ascii_compatible`, `is_single_byte`, `can_encode_everything` | encoding_rs | S | **DONE 2026-10-20** (`whatwgName`, `canonicalName`, `isSingleByte`, `isAsciiCompatible`, `canEncodeEverything`) — do | no |
-| R9 | `mem`-style helpers: `utf8ValidUpTo`, `isAscii`/`asciiValidUpTo`, Latin-1 to UTF-8/UTF-16 and back (`is_utf8_latin1`, `convert_latin1_to_utf8`, `convert_utf8_to_latin1_lossy`) | encoding_rs `mem` | S each | **DONE 2026-10-20** (`utf8ValidUpTo` = the exact longest valid prefix, vector fast path, tested against std; `isAscii`, `asciiValidUpTo`; `latin1ToUtf8` / `utf8ToLatin1Lossy` thin wrappers over the identity `iso_8859_1` page — the lossy one writes `?` for a code point above U+00FF where encoding_rs truncates; no UTF-16 Latin-1 converters, no consumer; the Latin-1 fast converters stay speed rows, see P bench) — do-later (std has `isValidUtf8`) | maybe |
-| R10 | UTF-32 LE/BE | Python `utf-32`, x/text `utf32`; WHATWG and encoding_rs deliberately exclude it | S (same shape as UTF-16; the `Decoder` machine + BOM `FF FE 00 00`) | **DONE 2026-10-20** (`Decoder.Kind` / `Encoder.Kind` `.utf32`, `decodeUtf32` / `encodeUtf32` with BOM, `core.decodeUtf32` / `utf8ToUtf32`, `sniffBom32` + `decode32` — `sniffBom`/`decode` keep the WHATWG answer where `ff fe 00 00` is UTF-16LE; malformed = one U+FFFD per unit, cut tail = one, as CPython `errors="replace"`; cases checked against CPython, fuzz kind, split/room equivalence) — do-later (parity with Go/Python; not web-reachable, so lower priority than R1) | no |
-| R11 | `x-user-defined` (0x80..0xFF to U+F780..) | WHATWG, encoding_rs | S | **DONE 2026-10-20** (`Encoding.x_user_defined`, table generated by `tools/gen_tables.py`, anchored to the Standard's definition in `sb_tables_test.zig`; `lookupLabel("x-user-defined")` is now `.encoding = .x_user_defined` and `LabelTarget.x_user_defined` is REMOVED — nothing outside the module used it) — do-later (legacy XHR; trivial once R1's table machinery exists) | no |
-| R12 | More code pages outside WHATWG: DOS/OEM (CP437, CP850, **CP852**, CP858 ...), Kamenicky, EBCDIC (CP037/500/1047) | Python (all), x/text charmap (437/850/852/855/858/860-866, 037/1047/1140), not WHATWG | M for the set (tables from unicode.org MAPPINGS or CPython as black-box oracle; same 128-pair anchoring) | **DONE 2026-10-20 for CP437/CP850/CP852** (`Encoding.cp437/cp850/cp852`, IANA names `IBM437`…, IANA labels `cp437 ibm437 437 cspc8codepage437` etc. — NOT in the WHATWG label table, listed apart in `tools/gen_tables.py`; tables from the vendored Unicode.org MICSFT/PC `CP*.TXT`, low half checked identity, anchored in `sb_tables_test.zig`; NOTICE extended). CP855/858/860-866, EBCDIC and Kamenicky not-doing without a consumer — do-later for CP852/CP437/CP850 (CP852 is Czech/Polish DOS, the owner's home market) | maybe (Czech legacy exports) |
-| R13 | Encoding detection / guessing (`chardetng`, Python `chardet`, ICU) | chardetng is a separate crate by the same author, not encoding_rs | M | do-later, limited form: "is this UTF-8, else which of our pages is most plausible" over the pages we have (also a build-tool consumer convenience when `csv_input_encoding` is unset). A full statistical detector: not-doing | maybe |
-| R14 | Unicode normalization (NFC/NFD), IDNA/punycode, UTF-7, base64/quoted-printable codecs, `utf-8-sig` as a named codec | x/text `unicode/norm`, `idna`; Python codecs | -- | not-doing: normalization and IDNA are other charters (a `unicodenorm` module if anyone asks); base64 has `b64ct`/`base32`; UTF-7 is rejected by WHATWG for security and maps to `replacement` (R3); the UTF-8 BOM is handled by `decode` | no |
-| R15 | Public custom single-byte table constructor (x/text `charmap.Charmap`, Python `charmap_build`) | x/text, Python | S (`build(&overrides)` already exists internally; expose it) | **DONE 2026-10-20** (`Custom(comptime decode: [128]u16)` wraps `core.SingleByte`: `decodeByte`, `encodeCp`, caller-buffer `decodeToUtf8` / `encodeInto`; allocating `decodeCustom` / `encodeCustom`; toy-page and built-in-table tests) — do-later | no |
-
-Already done: UTF-8/UTF-16 WHATWG decoder with chunking, fatal mode, BOM sniffing and removal, label
-parsing with a Go oracle, normative anchoring of every table entry (see Anchoring).
-
-**P bench proposal.** Reference and fastest are the same row: `encoding_rs` (Rust, SIMD-accelerated
-ASCII/Latin-1/UTF-8 paths; build a `rust_bench` crate under `tools/` with a path dependency on a pinned
-clone of `encoding_rs`, its only dependency is `cfg-if`, vendored via `cargo vendor` into `.zig-cache`).
-Secondary row: Go `golang.org/x/text` (the `go_oracle` directory already pins the module and its
-`go.sum`; add a `go_bench` beside it, `GOPROXY=off`). Pattern: `modules/tz/tools/go_bench`. Rows, all on
-the same generated 64 MiB inputs (seeded): (1) windows-1250 to UTF-8, 100 % ASCII; (2) the same with
-10 % high bytes (Czech text); (3) UTF-8 to windows-1250 with the same mix and (4) with 1 % unmappable
-characters (the `?` path); (5) UTF-8 decode with replacement: valid ASCII, valid mixed multilingual
-text, 5 % invalid bytes; (6) UTF-16LE to UTF-8 and back; (7) the streaming `Decoder` over 4 KiB chunks
-vs encoding_rs `Decoder`. Metric: GB/s, min of 5 runs, ReleaseFast, single thread; per-call overhead
-row on 20-byte cells (the build-tool consumer's cell-by-cell use), which is where allocation (R6) shows.
-
-### Earlier entries (kept for the record)
-Per the 2026-07-09 extraction-scope note: broader/CJK coverage is explicitly out of scope, not
-planned — no further backlog item recorded. The module README's "Out of scope" section is the
-canonical statement of this boundary.
-- ~~UTF-16 (LE/BE) with BOM detection~~, ~~streaming decoder~~, ~~strict/fatal mode~~ — **done
-  2026-10-04**.
-- ✅ (found implemented 2026-11-17: `decodeUtf16`/`encodeUtf16`/`sniffBom` in src/root.zig) (historical) **UTF-16 (LE/BE) with BOM detection** *(survey 2026-09-30)*: add `utf16le`/`utf16be` to `Encoding` (decode and encode) and an optional BOM sniff. Why: Excel "Unicode Text" and many Windows exports are UTF-16LE; encoding_rs and the Standard cover it, and `std.unicode` already has the LE conversion. Effort: small. Fits CONVENTIONS §2.
-- ✅ DONE 2026-10-20 (`f88e45e07`: every WHATWG single-byte page, tables generated from the vendored WHATWG indexes; the "not now" decision below is superseded). **More single-byte pages (windows-1251, KOI8-R/U, windows-1253..1258, ISO-8859-3..16)** —
-  *not now* (decided 2026-09-30): no consumer has needed them — the build-tool consumer, the main user, has not — and
-  every table ships in every consumer's binary, which the build-tool consumer watches in ReleaseSmall. When one is
-  needed, it lands through the existing `build(&overrides)` table pattern with the WHATWG
-  `index-*.txt` vendored as data, and behind a build option if the set grows, so a size-sensitive
-  consumer does not carry pages it never uses.
-- ~~**Streaming decoder/encoder**~~ — decoder **done 2026-10-04** (`Decoder`); `encodeUtf16` stays whole-buffer. *(survey 2026-09-30)*: stateful decode of chunked input (needed only for multi-byte/UTF-8 boundaries once UTF-16 lands; single-byte pages are stateless). Why: reading large exports without buffering the whole file. Effort: medium. Fits §2.
-
-## Status
-`extract · any · codec · reentrant` · deps: none — canonical source is `pub const meta` in
-src/root.zig.
+- **Encoding detection, limited form (R13):** "is this UTF-8, else which of our pages is most plausible" over the pages we have, as a convenience when an input encoding is unset; not built. A consumer might use it. (The full statistical detector is not planned, see *What is deliberately not done*.)
+- **Latin-1 fast converters** (encoding_rs `mem` `convert_latin1_to_utf8` …) are speed rows, not features: `latin1ToUtf8` / `utf8ToLatin1Lossy` are thin wrappers over the identity page.
 
 ## Anchoring
 
@@ -186,5 +103,3 @@ src/root.zig.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
 **What the tests actually contain.** src/normative_test.zig drives the PUBLIC decode+encode API across all 640 byte/codepoint pairs of the five code pages against independently vendored normative tables (WHATWG index-*.txt, Unicode.org 8859-1.TXT), never against our own table; UTF-8/UTF-16 decoding against CPython's codecs (`testdata/codec_golden.txt`); since 2026-10-05 `src/go_oracle.zig` checks `Encoding.parse` against golang.org/x/text v0.42.0 htmlindex (the WHATWG label table, 80 labels incl. other encodings' and whitespace/case variants; 21 listed divergences: the iso-8859-1 departure, config-file spellings WHATWG does not list, and VT, which WHATWG does not strip) and, for every page, which code points encode to a byte rather than '?' against x/text's charmap strict encoders over U+0080..U+10FFFF (sampled above U+3000; the C1 controls WHATWG maps in iso-8859-2/-15 and Go's charmap omits are listed). '?' itself and the verbatim pass-through of ill-formed UTF-8 on encode are documented policy, not a question an outside implementation answers (Python's `errors="replace"` writes the same '?').
-
-**How it got there.** The anchoring work landed. DONE 76f9d9c: exhaustive WHATWG tables, 640 pairs, 5 code pages

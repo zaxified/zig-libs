@@ -5,16 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked UTF-16 with BOM detection done (already implemented). No code change.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (19/21 killed + 2 eq). New test: a code point fed in three separate calls (F0 | 9F | 98 80) through the caller-buffer encoder.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). `Encoder.encodeInto` with a small caller `dst` (10–12 bytes, the documented minimum room) could keep a non-lead byte in its carry buffer and hit `unreachable` on the next call; carried bytes now go through the normal step, and output equals the whole-buffer encode for every split and every `dst` ≥ 10. The ASCII fast path (`copyAscii`, the EUC-JP ASCII run) scanned the whole remaining input on every call although at most the `dst` room is copied — quadratic in the caller-buffer loop; the scan is bounded by the room. **Contract change, fatal mode:** when an unmappable code point starts in carried bytes, `read` is now past it (as the CJK encoder documents), so skipping makes progress (it returned `read = 0` and re-hit the same code point forever). Tests: `src/sweep_test.zig`.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — Fix: `decodeUtf8`/`validPrefix` failed to compile for a target without AVX2 in an optimized mode (x86_64-windows baseline, `ReleaseSmall`: "evaluation exceeded 1000 backwards branches" in the portable lookup tree); `scan` raises its branch quota.
 - **2026-10-20** — CJK speed: inline two-byte fast paths in the Shift_JIS/EUC-KR/gb18030/GBK/Big5/ISO-2022-JP decoders, two-level code-point maps in the encoders (+49–73 KB per encoding family, only when referenced). Bench vs encoding_rs 0.09–1.10× over all 25 rows.
-- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** bench rows for the CJK encodings (decode/encode Shift_JIS, EUC-KR, gb18030, Big5, ISO-2022-JP; streaming Shift_JIS) — tools only.
 - **2026-10-20** — `encoding.cjk`: Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, gb18030, GBK, Big5 (WHATWG,
   GB18030-2022), decoders/encoders in the caller-buffer shape, tables generated from vendored WHATWG
   indexes (`tools/gen_cjk_tables.py`), x/text oracle. **Behavioural:** `LabelTarget.unsupported` is
@@ -37,7 +31,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   two-level reverse tables (the encoder searched 128 entries per character), Keiser–Lemire vector
   UTF-8 validation (`utf8_simd.zig`, simdjson port), branchless UTF-16 → UTF-8. Bench vs encoding_rs
   0.36–1.06× (was up to 40×).
-- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** comparative bench `zig build bench-encoding` vs encoding_rs 0.8.42 and Go x/text v0.42.0 (tools only).
 - **2026-10-18** — Ported to Zig 0.17.0: tests: enum iteration via `field_values`; `strRepeat` branch quota scaled with length.
 - **2026-10-09** — tests: deterministic fuzz driver `ENCODING_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Behaviour change:** the labels `cp819` and `ibm819` (IANA's own aliases of
