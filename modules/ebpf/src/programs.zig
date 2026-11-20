@@ -791,7 +791,7 @@ test "Program/Options structs have the shape the load/attach layers expect" {
     try testing.expectEqual(@as(u32, 16), ro.record_size);
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 test "xdpFilter: the instruction budget and the offset ceiling are exact" {
     // 15 fixed + 2 per key byte must fit the 64-slot buffer: 24 bytes do, 25 do not

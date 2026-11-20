@@ -1115,7 +1115,7 @@ fn fuzzParseExt(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     // empty slice, which `parseExt` refuses at the magic, so the group walk
     // and every record accessor below were unreachable.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 9 seeds non-empty,
     // 0 parsed, 0 groups walked and 0 records decoded before; 9 of 9
     // non-empty, 3 parsed, 5 groups and 8 records after.**
     const len: usize = fz.drawInput(S, src, &buf, entries);
@@ -1735,7 +1735,7 @@ test "fieldByName resolves against the running kernel" {
     try testing.expectEqual(@as(?FieldInfo, null), try fieldByName(&k, "task_struct", &.{"zig_libs_nope"}));
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 const RawBtf = btf.RawBtf;
 

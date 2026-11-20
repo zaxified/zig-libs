@@ -619,7 +619,7 @@ pub fn onlineCpus(gpa: std.mem.Allocator) OpenError![]u32 {
 /// currently offline or hot-pluggable. A caller that sizes its buffer from
 /// *online* CPUs (or from `std.Thread.getCpuCount()`, which is also online)
 /// under-allocates by exactly that difference and the kernel writes past the
-/// end. Measured under QEMU 2026-09-09 against `xdp-classifier`: a 4-byte
+/// end. Measured under QEMU against `xdp-classifier`: a 4-byte
 /// buffer took 8 bytes at 1 vCPU and 32 at 4.
 ///
 /// Allocation-free on purpose: the callers that need this are sizing a buffer
@@ -1384,7 +1384,7 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
     }
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 fn perfEpoll() linux.fd_t {
     return @intCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));

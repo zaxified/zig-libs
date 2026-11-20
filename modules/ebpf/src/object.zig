@@ -1399,7 +1399,7 @@ pub fn fixupDatasecs(obj: *Object) ParseError!void {
                 if (sym.st_shndx != sec_idx) continue;
                 if (!std.mem.eql(u8, obj.image.symbolName(obj.symtab_idx, sym), vname)) continue;
                 // `st_value` / `st_size` are u64 straight off the ELF; the
-                // BTF slots are u32 (found by the 2026-10-10 fuzz driver,
+                // BTF slots are u32 (found by the fuzz driver,
                 // EBPF_FUZZ ebpf-object seed 1867: `@intCast` panic).
                 if (sym.st_value > std.math.maxInt(u32) or sym.st_size > std.math.maxInt(u32))
                     return error.MalformedElf;
@@ -2820,7 +2820,7 @@ test "LIVE: .rodata is created, seeded and frozen" {
 
 // ── fuzz: the module's documented untrusted-input entry point ───────────────
 //
-// ⭐ There was no fuzz target in this file at all until 2026-09-07, and
+// ⭐ There was no fuzz target in this file at all previously, and
 // `check-fuzz-reach` never said so: that gate judges the DRAW of the targets
 // that exist, and a parser with no harness is invisible to it. `open()` is
 // this module's documented untrusted-input entry point ("Parse an object
@@ -3056,7 +3056,7 @@ test "corpus: every object seed reaches open, and the parsed counts are pinned" 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -3066,7 +3066,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation (2026-11-18): hand-assembled relocatable objects ──
+// ── whole-module mutation: hand-assembled relocatable objects ──
 
 /// A tiny ET_REL assembler: sections, symbols and `.rel*` sections laid out
 /// exactly as asked, so a test can build the shapes clang never emits

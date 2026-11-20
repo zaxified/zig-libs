@@ -729,7 +729,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     link.detach(); // idempotent
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 test "LinkHandle.detach closes the fd once and forgets it" {
     var h: LinkHandle = .{ .fd = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0)), .attach_type = .xdp };

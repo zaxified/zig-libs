@@ -533,8 +533,7 @@ pub fn mapInfo(map_fd: linux.fd_t) OpenError!MapInfo {
 //      (a long-lived ring's counters are not restarted at 0), and
 //      `recordStride` at the record length's maximum representable value
 //      (no usize overflow). Each asserts a SPECIFIC outcome, not merely "did
-//      not crash" — see feedback_external_anchor_limits in project memory for
-//      why a fuzz-only pass is close to worthless on its own.
+//      not crash": a fuzz-only pass is close to worthless on its own.
 //  2. A COVERAGE-GUIDED FUZZ TARGET (`testing.fuzz`, below) drives the real
 //     record walk over an arbitrary byte buffer standing in for the mapped
 //     region, with positions kept within a bounded backlog of the ring size
@@ -1496,7 +1495,7 @@ test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
     try testing.expect(rb.consumer_pos >= n * recordStride(record_size));
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 fn testEpoll() linux.fd_t {
     return @intCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));

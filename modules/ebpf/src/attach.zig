@@ -2583,7 +2583,7 @@ fn fuzzParseConfigShift(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     // ⛔ And it looked HEALTHIER that way: this parser cannot fail — it falls
     // back to `default` — so the collapse showed up as a hundred percent of
     // rounds "returning fine" while `std.mem.startsWith` refused `""` before
-    // any of the grammar ran. Measured 2026-09-07 over the corpus above:
+    // any of the grammar ran. Measured over the corpus above:
     // **0 of 17 seeds non-empty and 0 parsed before; 16 of 17 non-empty (one
     // seed IS the empty file) and 6 parsed after.**
     const len: usize = fz.drawInput(S, src, &buf, entries);
@@ -2607,7 +2607,7 @@ fn fuzzParseConfigShift(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -2617,7 +2617,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+// ── whole-module mutation ──────────────────────────────────────
 
 fn devNullFd() linux.fd_t {
     return @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));

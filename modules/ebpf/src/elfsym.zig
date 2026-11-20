@@ -1236,7 +1236,7 @@ fn fuzzOpenImage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     // **length 0 and zero flips**. The one input this target ever ran was the
     // empty slice, which `openImage` refuses at the magic.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 10 seeds non-empty,
     // 0 images opened and 0 accessor walks before; 10 of 10 non-empty, 7
     // opened, 7 accessor walks and 5 of them in the unbounded-index domain
     // this harness exists for, after.**
@@ -1651,7 +1651,7 @@ test "real library: resolved offsets agree with an independent derivation" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1661,7 +1661,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation (2026-11-18): header / table boundaries ───────────
+// ── whole-module mutation: header / table boundaries ───────────
 
 /// `SynthElf` image grown to `len` bytes (zero padded), for boundary tests.
 fn synthGrown(gpa: std.mem.Allocator, len: usize) ![]u8 {
