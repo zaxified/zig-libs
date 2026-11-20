@@ -12,8 +12,6 @@ Status: **gap** — covers **point-to-point and LAN** topology → SPF → next-
 table over the #22 Extended (RFC 5305) and #2 old-style (ISO §9.8)
 IS-reachability TLVs; a LAN pseudonode is a transit hop (members it lists and
 that list it back reach each other at their own metric, SPEC §3.2b).
-Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload bit's
-transit exclusion, and incremental SPF are deferred — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §7.2** (the decision process / SPF) with the
 equal-cost tie-break delegated to `spf-ect` (**IEEE 802.1aq / RFC 6329 ECT**).
@@ -28,16 +26,13 @@ reversal-invariant ECT tie-break, so equal-cost path selection is loop-free and
 802.1aq requires). This module builds the graph, calls `shortestPathTree`, and
 reads the resolved tree — it never picks among equal-cost paths itself.
 
-⚠ **That qualifier is load-bearing and this sentence used to omit it.** Since the
-engine became directed (one arc per admitted direction, at its own advertised
-metric) reversal invariance holds only when the metrics are symmetric, and
-`Options.reject_asymmetric` **defaults to `false`** — `compute` hard-codes it to
-`false`. The module's own frozen FRR anchor test asserts the counter-example in
-the green suite: from r1, r3 costs 15 via r5; from r3, r1 costs 30 via r4, so
-`reverse(path(r3→r1))` is not `path(r1→r3)`. **An 802.1aq/SPB caller must pass
-`.reject_asymmetric = true`** — congruent forward and reverse paths are what SPB's
-reverse-path check assumes, and nothing here refuses an asymmetric database
-unless asked.
+**That qualifier is load-bearing.** The engine is directed (one arc per admitted direction, at its own
+advertised metric), so reversal invariance holds only when the metrics are symmetric, and
+`Options.reject_asymmetric` **defaults to `false`** — `compute` hard-codes it to `false`. The module's own
+frozen FRR anchor test asserts the counter-example in the green suite: from r1, r3 costs 15 via r5; from r3,
+r1 costs 30 via r4, so `reverse(path(r3→r1))` is not `path(r1→r3)`. **An 802.1aq/SPB caller must pass
+`.reject_asymmetric = true`** — congruent forward and reverse paths are what SPB's reverse-path check assumes,
+and nothing here refuses an asymmetric database unless asked.
 
 ## The pipeline
 
@@ -97,15 +92,9 @@ if (table.nextHop(dest)) |nh| { /* forward toward `nh` */ }
 if (table.lookup(dest)) |r| { /* r.next_hop, r.metric */ }
 ```
 
-The two-way check has **no public off switch**, deliberately. `Options` carries
-no `require_two_way` field — an earlier audit removed it precisely so no
-production caller can disable the ISO §7.2.8.2 guard by accident, and `root.zig`
-carries a permanent test asserting the field's absence. ⚠ This paragraph used to
-show `computeWith(gpa, db, local, now, .{ .require_two_way = false })` as the way
-to turn it off: a call that has not compiled since the field was removed, in the
-one document a caller reads first, advertising exactly the API shape that finding
-was raised to eliminate. The positive control uses a private test-only entry
-point instead.
+The two-way check has **no public off switch**, deliberately: `Options` carries no `require_two_way` field
+(`root.zig` has a permanent test asserting its absence), so no production caller can disable the ISO §7.2.8.2
+guard by accident. The positive control uses a private test-only entry point.
 
 ## Test
 
@@ -179,3 +168,8 @@ tests above remain self-authored (SELF in the anchor record in `SPEC.md`) — th
 individually re-derived against FRR captures, only the one dedicated FRR
 topology test was added. LAN transit (since 2026-09-30) is self-authored too,
 not FRR-anchored; multi-level leaking remains out of scope (`SPEC.md` §6).
+
+## Not provided
+
+Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload bit's transit exclusion, ECMP next-hop
+sets and incremental SPF: see `SPEC.md` *Backlog / deferred*.

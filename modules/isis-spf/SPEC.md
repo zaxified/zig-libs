@@ -8,16 +8,6 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-11-17 (78/92, 14 eq) · src c94c2dc375fab924
 
-**Audit 2026-11-17 (whole-module mutation).** 92 mutants over every non-test line of `src/root.zig` (`RouteTable.lookup`'s binary search, `compute` / `computeWith` option plumbing, LSDB walk and the lifetime / purge / pseudonode filters, #22 and #2 reachability extraction incl. the max-link-metric exclusion and the 6-bit default-metric mask, the two-way check and asymmetry counting, LAN transit (`addToPseudonode`, `collectPseudonodeMembers`, `pnKey`, `addLanArcs`), `addDirected`, node interning, graph build, route table and `firstHop`), one schemata build per round, baseline first. Round 1: 62 killed + 3 hung, 27 survived. 7 tests were added: LAN transit over #2 (old-style) TLVs with the metric octet's flag bits set, the default-metric mask at bit 7 (0x40) and the value bit 0x20, a metric of 0 clamped to 1 on a point-to-point link and on a LAN, a pseudonode LSP that lists a pseudonode id (via #22 and via #2) not admitting that system, a member listed only by another pseudonode and two LANs sharing a member not merging, a cheaper point-to-point link beating a dearer LAN arc and the cheaper of two advertisements of a pseudonode winning, and the asymmetric-link count surviving an empty table. Round 2 killed 13 of the 27; 14 do not die, 12 EQUIVALENT and 2 UNOBSERVABLE:
-- the lifetime filter's `ev.is_request`, `ev.bytes.len == 0` and `ev.is_purge` terms are each redundant with `remaining_lifetime == 0` (the lsdb view reports lifetime 0 for a request placeholder and a purge, and an empty PDU does not decode);
-- an asymmetric pair counted at the higher id instead of the lower (same count, same reject error);
-- skipping either endpoint's `id_set.put` (every admitted arc has its reverse arc, so the other endpoint interns the id);
-- `<=` for `<` in the three keep-the-cheaper comparisons and `!= .gt` for `== .lt` in `lessSystemId` (equal weights, distinct ids);
-- a LAN member joined to itself and a self-advertisement kept (both become a self-arc that `spf.Graph.addArc` refuses);
-- UNOBSERVABLE: the first-value store of `addToPseudonode` and `addDirected` (`!found_existing`): the value slot of a new key is poisoned with 0xAA in safe builds and so compares greater than any weight; it would need a ReleaseFast build over zeroed memory.
-
-Not mutated: `Options` and `max_link_metric` constants (comptime), the `computeWithBrokenTwoWayForTesting` plumbing beyond its one switch, the `fuzz_test.zig` harness. Counts on the card are whole-module.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_SPF_FUZZ) · ct n/a — SPF computation (keyword review, 2026-10-07)
 
 **Performance:** not measured
@@ -51,7 +41,7 @@ synchronised link-state database (`isis-lsdb`) and produce a forwarding table
 `dest system-id → { next-hop system-id, total metric }`. Pure and deterministic;
 no I/O, no clock (time is only forwarded to `isis-lsdb` so lifetimes age to the
 caller's `now`). Point-to-point links and LAN segments (via the LSP of the pseudonode,
-§3.2b) are routed; out of scope: §6.
+§3.2b) are routed; out of scope: *Backlog / deferred*.
 
 ## 2. What each dependency provides
 
@@ -76,13 +66,16 @@ intern, graph construction, and next-hop/metric resolution.
 
 ### 3.1 Topology extraction
 
-Iterate the LSDB at `now`. Skip request placeholders (no bytes). Decode each LSP
+Iterate the LSDB at `now`. Skip request placeholders (no bytes), and every LSP whose Remaining Lifetime
+has aged to zero at `now` or that is a purge (ISO/IEC 10589 §7.3.17; `isis-lsdb` reports the aged
+lifetime, so a caller that has not ticked its database still gets expired LSPs excluded). Decode each LSP
 (a decode failure skips only that LSP). A **pseudonode LSP** (LSP-ID octet 6 ≠ 0)
 contributes only the set of ISs it lists (§3.2b); it is never an origin. The
 origin of every other LSP is `lsp_id[0..6]`. Walk the LSP's TLVs; from #22 and
 #2 records collect directed advertisements `(from ⟶ neighbour[0..6], metric)`. A
 **pseudonode neighbour** (neighbour-id octet 6 ≠ 0) is recorded as the member's
-advertisement toward that 7-octet pseudonode id instead. A malformed TLV or reachability record terminates that LSP's walk
+advertisement toward that 7-octet pseudonode id instead. A #22 advertisement at RFC 5305 §3's max-link-metric (`max_link_metric`, 0xFFFFFF) is excluded outright, not
+added as a very expensive edge, so it cannot become the path of last resort. A malformed TLV or reachability record terminates that LSP's walk
 (the records parsed before it still count); every other LSP is unaffected.
 
 Directed advertisements are deduped per ordered `(from, to)` pair, keeping the
@@ -91,9 +84,7 @@ fragments, resolves to its best cost).
 
 ### 3.2 Two-way connectivity check (ISO/IEC 10589 §7.2.8.2)
 
-Verbatim, from the clause (§7.2.8.2 "Two-way connectivity check"; earlier
-revisions of this file paraphrased it and mis-cited it as §7.2.5, which is
-"Multiple LSPs for the same system"):
+Verbatim, from the clause (§7.2.8.2 "Two-way connectivity check"):
 
 > "The Decision Process shall not utilise a link between two Intermediate
 > Systems unless both ISs report the link.
@@ -110,11 +101,26 @@ prevents a stale one-directional LSP — a neighbour that has gone away but whos
 LSP has not yet aged out, or a half-formed adjacency — from creating a
 forwarding path that does not exist.
 
-The **positive control** (`Options.require_two_way = false`) admits a single
-directed advertisement, mirroring it onto the direction nobody reported. It is
-deliberately wrong and exists only so a permanent test can show that flipping
-the flag makes the one-way link appear — i.e. that the two-way check is the
-load-bearing part, not an accident of the topology.
+The check has **no public off switch**: `Options` has no `require_two_way` field (a test asserts its
+absence), so no production caller can disable it by accident. The **positive control** is a private,
+test-only entry point (`computeWithBrokenTwoWayForTesting`) that admits a single directed
+advertisement, mirroring it onto the direction nobody reported. It is deliberately wrong and exists
+only so a permanent test can show that disabling the check makes the one-way link appear — i.e. that
+the two-way check is the load-bearing part, not an accident of the topology.
+
+### 3.2b LAN transit through pseudonodes
+
+ISO 10589 Annex C / RFC 1195 model a LAN as a pseudonode vertex: member X
+reaches it at X's own advertised metric, and it reaches every member at cost 0.
+`addLanArcs` folds the zero-cost half in: for every pair of **admitted** members
+X ≠ Y of pseudonode P it adds the arc X ⟶ Y at metric(X ⟶ P). That gives the
+same distances as a pseudonode vertex, without a zero-weight arc (which
+`spf-ect` rejects) and without a vertex that could appear as a destination or
+next hop. A member is admitted when the two-way check passes on the LAN: X
+lists P, and P's LSP (any fragment) lists X — the pseudonode speaks for the
+LAN, as each router speaks for its P2P links. Where a P2P arc X ⟶ Y exists as
+well, the cheaper one wins. The broken positive control (see 3.2) admits a member that lists P without P's confirmation. Metrics toward a
+pseudonode are clamped to ≥ 1 like every other arc.
 
 ### 3.3 Metric handling: one arc per direction
 
@@ -132,15 +138,11 @@ Algorithm"), Step 1, verbatim:
 So the weight used to relax P→N is P's *own* advertisement for N, for the
 direction actually being traversed. Each admitted direction therefore becomes
 its own `spf-ect` arc (`Graph.addArc`) at its own metric; nothing is merged.
-This closes the wrong-answer case documented in earlier revisions of this file:
 FRR 10.3 reaches r3 at cost **15 via r5**, and so does this module — the FRR
-anchor at the bottom of `src/root.zig` now asserts the agreement it used to
-assert as a divergence.
+anchor test in `src/root.zig` asserts the agreement.
 
-There is no single-weight rule that could have done this: which direction of a
-link a path traverses is decided by the tree being computed, so the needed
-weight is not knowable when the graph is built. The old rule (weight of {lo,hi}
-= lo's advertisement) answered 30 via r4 on the anchor topology.
+No single per-link weight could do this: which direction of a link a path traverses is decided by
+the tree being computed, so the needed weight is not knowable when the graph is built.
 
 Also:
 
@@ -153,15 +155,13 @@ Also:
 **Asymmetry is reported, not refused.** §7.2.8.2 permits it outright, so:
 
 - `RouteTable.asymmetric_links` counts the admitted links whose two endpoints
-  advertised **different** metrics. It no longer means "approximate" — the
-  routes are exact either way. It matters because IEEE 802.1aq *requires*
+  advertised **different** metrics. The routes are exact either way. It matters because IEEE 802.1aq *requires*
   symmetric metrics for congruent forward/reverse paths, so an SPB fabric with
   a non-zero count is misconfigured.
-- `Options.reject_asymmetric` (**default `false`**, was `true`) is the opt-in
+- `Options.reject_asymmetric` (**default `false`**) is the opt-in
   form of that check: `error.AsymmetricMetric` instead of a
   correct-but-asymmetric table. `compute` never uses it (its `Allocator.Error`
-  signature is compiled against by `isis-sim` and `spbfib`) and no longer needs
-  to.
+  signature is compiled against by `isis-sim` and `spbfib`).
 
 ### 3.4 Intern mapping (system-id ↔ NodeId)
 
@@ -212,54 +212,65 @@ node↔id tables, graph, tree) is freed before returning; the leak check runs un
 `deinit`. Given the same database and `now`, the table is byte-for-byte identical
 across runs (a permanent test pins this).
 
-### 3.2b LAN transit through pseudonodes (since 2026-09-30)
+## Verification
 
-ISO 10589 Annex C / RFC 1195 model a LAN as a pseudonode vertex: member X
-reaches it at X's own advertised metric, and it reaches every member at cost 0.
-`addLanArcs` folds the zero-cost half in: for every pair of **admitted** members
-X ≠ Y of pseudonode P it adds the arc X ⟶ Y at metric(X ⟶ P). That gives the
-same distances as a pseudonode vertex, without a zero-weight arc (which
-`spf-ect` rejects) and without a vertex that could appear as a destination or
-next hop. A member is admitted when the two-way check passes on the LAN: X
-lists P, and P's LSP (any fragment) lists X — the pseudonode speaks for the
-LAN, as each router speaks for its P2P links. Where a P2P arc X ⟶ Y exists as
-well, the cheaper one wins. The broken positive control (`require_two_way =
-false`) admits a member that lists P without P's confirmation. Metrics toward a
-pseudonode are clamped to ≥ 1 like every other arc.
+Run `scripts/modtest isis-spf`; the module's `example/main.zig` builds against the published module only.
+Test classes (`src/root.zig` unless noted):
 
-Tests: a 4-member LAN (full mesh at each member's own metric, asymmetric where
-the metrics are), a LAN composing with a P2P tail, a member the pseudonode does
-not list back (excluded, and admitted by the broken control), a pseudonode that
-lists nobody or one member, the DIS-collapse misreading (a LAN-only member is
-reachable only with real transit), and the pre-existing guards (no pseudonode
-LSP → no LAN; the pseudonode's own LSP never supplies a route).
+- **Golden topologies:** a line A-B-C with exact routes, next-hops and metrics; a 4-node path (the first hop to
+  a distance-3 destination is the immediate neighbour); a diamond where the ECT tie-break picks a
+  deterministic, stable next-hop; reconvergence after a failed link.
+- **Two-way check:** a one-way advertisement yields no edge and adding the reverse creates it, with the
+  positive control (the broken entry point DOES use the one-way edge); the absence of a public switch.
+- **Extraction:** old-style #2 reachability and its default-metric mask (bits 7 and 6 of the octet, the I/E
+  flag not folded into the value), the max-link-metric exclusion (and a normal alternate path still used),
+  a metric of 0 clamped to 1 on a point-to-point link and on a LAN, the minimum of a pair advertised twice,
+  a lifetime-zero LSP excluded.
+- **LAN transit:** a 4-member LAN as a full mesh at each member's own metric, a LAN composing with a
+  point-to-point tail, a member the pseudonode does not list back not admitted, a pseudonode listing nobody
+  or one member, the pseudonode's own LSP never supplying a route, two LANs sharing a member not merging,
+  a cheaper point-to-point arc beating a dearer LAN arc, both over #22 and over #2 TLVs.
+- **Robustness and degenerate cases:** a malformed reachability TLV skipped with the rest still routing, a
+  dangling neighbour unreachable, empty LSDB, local absent, local isolated; a leak check under
+  `std.testing.allocator`; determinism (identical databases give byte-identical, sorted tables).
+- **Asymmetric metrics:** each direction relaxes at its own metric, `asymmetric_links` counts and does not
+  fire on a symmetric database, `reject_asymmetric` refuses.
+- **FRR anchor:** a five-router topology (an asymmetric link, an equal-cost tie) computed once by a real
+  `isisd` 10.3 and frozen into literal assertions; all five rows agree, and the old wrong shape is asserted
+  not to come back (see Anchoring). The tests do not boot a VM or touch the network.
+- **Fuzz:** two harnesses run by testkit's deterministic driver as `ISIS_SPF_FUZZ` (`src/fuzz_test.zig`):
+  `isis-spf-compute` (hostile TLV regions spliced into stamped LSPs, both `compute` entry points) and
+  `isis-spf-model` (random two-way graphs against a Floyd-Warshall model), each with a fixed seed loop and
+  reach checks in every test run, and a corpus test that pins that the seeds reach the graph builder.
+- **Constant time:** n/a, SPF over public data.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-## 6. Deferred (with the reason)
-- **Multi-level (L1/L2) route leaking.** One level per computation here; the
-  L1↔L2 attached-bit default route and prefix leaking are a separate layer.
-- **IP / prefix reachability leaves.** The SPB fabric this targets forwards on
-  system-ids / I-SIDs; #135 (extended IP reachability) and friends as leaves of
-  the SPT are future work.
-- **Overload bit transit exclusion.** An overloaded node (LSP `overload` flag)
-  should not be used for *transit* but remains reachable as a destination.
-  `spf-ect` exposes no per-node transit-exclusion hook yet, so this is deferred
-  rather than approximated; the hook is an `spf-ect` Backlog item (2026-09-30
-  survey) and this one waits on it — see Backlog. (`spf-ect` is extended
-  additively when a consumer needs it, as `Graph.addArc` was — below.) The bit is available on the
-  decoded LSP for a future increment.
-- **Incremental SPF.** Each call is a full recomputation. Incremental / partial
-  SPF on an LSDB delta is a performance optimisation, not needed for correctness.
-- ~~**Directed (asymmetric) metrics.**~~ **No longer deferred** — `spf-ect`
-  gained `Graph.addArc` and this module now adds one arc per advertised
-  direction at that direction's own metric (§3.3). The FRR anchor agrees.
+## Open
+
+- RFC 5305 §3 `MAX_PATH_METRIC` (0xFE000000), a ceiling on the SUMMED path cost, is not enforced. Nothing
+  overflows (`Route.metric` is a `u64`); the difference is conformance: above the ceiling an RFC-conformant
+  peer treats all path costs as equal, while this module keeps ordering them by their true sums, so an
+  equal-cost tie-break could resolve differently at path metrics above 2^32. Closing it means clamping
+  during relaxation, which lives in `spf-ect`; clamping only the reported metric would hide the difference.
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
-
-- **IP/IPv6 prefix leaves** (#135/#236 as SPT leaves, best-path selection) (survey 2026-09-30). Why: without it the module cannot produce IP routes for an ordinary IS-IS user; needs the typed reachability TLVs in `isis`. Effort: ~1 week. Fits §2: yes.
-- **Overload-bit transit exclusion** (survey 2026-09-30). Why: operators set it to drain a node; FRR/holo/goisis honour it. Needs a transit-exclusion hook in `spf-ect` (the hook is `spf-ect`'s Backlog item "Transit-exclusion hook for a node"). Effort: ~2 days. Fits §2: yes.
-- **ECMP next-hop sets** (survey 2026-09-30). Why: IP IS-IS load-shares over equal-cost paths (`max_paths` in holo); the deterministic single-path result is right for SPB only. Needs multi-parent output from `spf-ect`. Effort: ~3 days. Fits §2: yes.
+- **Multi-level (L1/L2) route leaking.** One level per computation here; the L1↔L2 attached-bit default route
+  and prefix leaking are a separate layer.
+- **IP/IPv6 prefix reachability leaves** (#135/#236 as SPT leaves, best-path selection). The SPB fabric this
+  targets forwards on system-ids / I-SIDs, but without leaves the module cannot produce IP routes for an
+  ordinary IS-IS user; needs the typed reachability TLVs in `isis`. Effort ~1 week. Fits CONVENTIONS §2.
+- **Overload-bit transit exclusion.** An overloaded node (LSP `overload` flag) should not be used for
+  *transit* but remains reachable as a destination; operators set it to drain a node and FRR/holo/goisis
+  honour it. The bit is available on the decoded LSP, but `spf-ect` exposes no per-node transit-exclusion
+  hook yet, so this waits on that hook (an `spf-ect` Backlog item; `spf-ect` is extended additively when a
+  consumer needs it, as `Graph.addArc` was). Effort ~2 days once it exists.
+- **ECMP next-hop sets** (`max_paths` in holo). IP IS-IS load-shares over equal-cost paths; the
+  deterministic single-path result is right for SPB only. Needs multi-parent output from `spf-ect`. Effort
+  ~3 days.
+- **Incremental SPF.** Each call is a full recomputation; incremental / partial SPF on an LSDB delta is a
+  performance optimisation, not needed for correctness.
 
 ## Anchoring
 
@@ -270,4 +281,9 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 
 **What the tests actually contain.** 5-router topology run once through real isisd 10.3 in-VM, matching vertex-by-vertex on all five rows with NO remaining gap (the "modulo documented undirected-engine gap" this line used to carry was superseded by the directed rewrite and is corrected 2026-09-03); rest stays SELF
 
-**How it got there.** The anchoring work landed. DONE 2026-08-02: captured via scripts/vm/ (5 netns + veth p2p adjacencies, real IPv4 addressing was load-bearing for the P2P 3-way handshake). GPLv2 §0 restricts the program, not its output, so a routing table it computes for our topology is not a work based on FRR - licence clean, cited in the frozen test's own comment. Mutation teeth check (reverse-edge metric) confirmed the freeze catches a regression; reverted, md5sum-verified.
+The capture ran five real `isisd` instances, one per network namespace joined by veth with real IPv4 addressing
+(load-bearing for the point-to-point three-way handshake), in the Debian VM lane (`scripts/vm/`); the `vtysh`
+commands, FRR's version and the printed lines are quoted in the `FRR anchor` tests' shared comment. Nothing is
+FRR source or FRR's own fixtures: a routing table computed for a topology authored here is output, not a work
+based on the program (GPLv2 §0). What stays self-authored (SELF) is every other test above, LAN transit
+included; multi-level leaking is out of scope.

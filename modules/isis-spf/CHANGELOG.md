@@ -5,12 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from a whole-module mutation audit (92 mutants, 78 killed, 14 equivalent or unobservable): LAN transit over #2 (old-style) TLVs, the default-metric octet's flag bits, a metric of 0 clamped to 1 (point-to-point and LAN), a pseudonode LSP listing a pseudonode id, members listed by another pseudonode, LANs sharing a member, a cheaper point-to-point link against a dearer LAN arc, and the asymmetric-link count on an empty table.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (test-only: `@typeInfo` struct `field_names`).
 
 - **2026-10-10** — tests: deterministic fuzz driver `ISIS_SPF_FUZZ`: `isis-spf-compute` (hostile TLV regions spliced into stamped LSPs, then both `compute` entry points) and a new `isis-spf-model` oracle (random two-way graphs of up to 6 systems through the real LSDB; the table equals a Floyd-Warshall matrix over mutually advertised arcs below the max link metric, each direction at its own metric, and every next hop lies on a shortest path). No source change.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: §6 no longer says `spf-ect` must not be modified; the overload-bit item waits on `spf-ect`'s transit-exclusion hook (Backlog).
 - **2026-09-30** — **Added: LAN transit through pseudonodes.** A pseudonode LSP
   (LSP-ID octet 6 ≠ 0) and member advertisements toward a pseudonode used to be
   dropped, so a broadcast circuit was invisible to SPF. Now every member that
