@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-11-08 · mutation 2026-11-08 (152/161, 9 eq) · src f01b59511932b502
 
-**Audit detail:** review 2026-11-08 read `src/root.zig` in full with `invalid_utf8` x `ascii_only` x `html_safe` in mind (12 combinations) and found no defect in the writer or the prescan: every control byte is escaped, surrogates are paired, `ascii_only` cannot emit a lone surrogate (an ill-formed surrogate goes through the policy), no truncated sequence is passed through, the U+FFFD placement is per maximal subpart, `utf8Step` never reads past the slice and `depthWithin` handles an escape at the last byte. Two documentation findings (LOW): the `.reject` doc promised "the prefix before the bad byte stays in the writer" while the old code left the unflushed run out (the test pinned `"`); the new code writes the prefix and the doc says so (test pinned to `"ab`). Mutation: 153 schemata mutants in one ReleaseSafe test binary (`JT_MUT=<id>`, `setsid -w timeout -s KILL 20`, baseline first, src copy under `.zig-cache`): every branch of the escape table and its hex digits, the verbatim-table boundaries (0x1F, 0x20, 0x7E, 0x7F, `"` `\` `<` `>` `&`), `utf8Step` (every lead class remap, every second-byte bound both ways, the three length checks, the three failure lengths), `decodeScalar` (every mask and shift), the surrogate-pair maths, each option, the run flush / run restart of each of the five escaping branches, the final flush, the pending-block buffer (full, direct, order, flush, nibbles), and `depthWithin` (string and escape state, `{` and `[` separately, each closer, `>` vs `>=`, the decrement). First run of the pre-audit tests: 9 survivors of 139 — `depthWithin` never cleared the escape flag, ignored `{`, ignored `}`, or reset to zero on a closer (all four real: the old tests only used `[` and one escape shape) → tests added; five equivalents. After the pending-block rewrite (below) one more survivor was real (`put` never flushing on a full block: the test's runs were merged into one long run) → test fixed. Final survivors, all equivalent: `step.len == 3` in the U+2028 test (a well-formed sequence led by E2 is always 3 bytes: the `utf8Step` sweep compares every lead's length with `std.unicode.utf8ByteSequenceLength`), the lead-byte masks of `decodeScalar` (`0x3F` for `0x1F`, `0x1F` for `0x0F`, `0x0F` for `0x07`) and the trailing-byte mask `0x7F` for `0x3F` (the redundant bits are zero on every well-formed lead / continuation byte; proved by the new exhaustive test over all 1,112,064 scalar values, which the mutants pass), and the two write-granularity boundaries of the pending block (`>` for `>=` at exactly 64 bytes / exactly full: the same bytes in the same order, only the number of `writeAll` calls differs, which the API does not promise). The fuzz harness alone kills 77 of the 146 killed mutants (its oracle is semantic, so it cannot see exact spelling such as uppercase hex; the vectors pin that). Tests added: the replay of `testdata/vectors.txt` / `vectors_go.txt` (1231 inputs x 8 option sets + the four `reject` variants, every expected value produced by CPython, Go or the generator's own independent code, see Anchoring), `decodeScalar` over every scalar, `depthWithin` braces / closers / escapes, pending-block ordering over every run length around 64, the fuzz harness. Delta after the accesslog regression fix (2026-11-08, dd-h): 8 more schemata mutants over the new clean-string early return, its guard and the `putFinal` shortcut and the run start: six killed (never skipping the table, inverted and off-by-one guards, `run` starting at `i`, the shortcut taken with data pending, the scan bound `<=`), two equivalent (an early return that is never taken lands in the general loop, which finds nothing to escape and ends in the same single `writeAll`; `putFinal` without its `n == 0` shortcut copies through the block and flushes with the same one call, only a copy slower); the new test counts the calls that reach an unbuffered writer. One performance finding, fixed: control-heavy input was 2.0x Go's encoder (the escapes went through `w.print`); the writer now gathers escapes and short runs in a 256-byte block (`Pending`) and writes `\uXXXX` from a table, worst row 2.04x to 0.90x.
-
 **Hardening:** fuzz 2026-11-08 (4,000,000 runs clean, JSONTEXT_FUZZ, ReleaseSafe, 4 jobs x 1,000,000 seeds in 42 s; reach 5/5 labels — valid 9.6 %, ill-formed 90.4 %, reject-error, short-writer (every writer capacity from 0 to the output size), deep; oracle: a WHATWG-style decoder state machine written for the harness, `std.json`, an independent depth scan; the harness also kills 77 of the 146 audit mutants) · ct n/a — no secret: the module only formats caller-supplied text · panic 2026-11-08 (sweep of every pub entry point by the auditing agent, not an independent reviewer: `writeString`, `writeStringContents` — no allocation, so no OOM; every loop advances by `len >= 1`, so it terminates in O(n); `utf8Step` indexes `s[1..3]` only after its length checks, `s[i+1]`/`s[i+2]` in the U+2028 test only after a well-formed 3-byte step, `decodeScalar` only on a well-formed sequence; every `@intCast` is of a value bounded by construction (a scalar below 0x10000, `0xD800 + (v >> 10)` with `v <= 0xFFFFF`); the 256-byte block is checked before every append; a failing writer returns `error.WriteFailed` at every capacity, exercised by the fuzz; `.reject` returns `error.InvalidUtf8` — and `depthWithin`: constant space, `depth` cannot overflow before it exceeds `max_depth`, a closer saturates at 0, any `max_depth` including `maxInt(usize)` is accepted; no caller-contract precondition remains, there is no `unreachable` or `assert` on a caller value)
 
 **Performance:** ref 0.23–0.96× Go 1.26.8 encoding/json (an `Encoder` with `SetEscapeHTML(false)` into a reused buffer; `zig build bench-jsontext`, default options, ASCII / valid UTF-8 / ill-formed / control-heavy strings of 64 B and 4 KiB, best of 5, batch over 100 ms; worst row ctrl_4096 0.96, ASCII 4 KiB 0.50) · fastest ? (measured 2026-11-08, load average about 3 on 8 cores)
@@ -34,26 +32,17 @@ Surveyed 2026-11-08 per `SURVEY-PLAYBOOK.md` from documented behaviour; the Go a
 
 Two pieces of JSON *text* handling that a dozen modules each wrote again: `writeString` / `writeStringContents` (a JSON string literal from arbitrary bytes) and `depthWithin` (bracket depth of a buffer, string-aware, before a parser allocates). It parses nothing, builds no documents, validates no JSON, and does not write numbers, keys or separators (`std.json.Stringify` does). The caller picks the options at compile time (`StringOptions` is a `comptime` parameter), so the default loop that `accesslog` benchmarked is the one `.{}` compiles to.
 
-Not here, by decision:
-
-- **Number formatting, key ordering, pretty printing, object writers.** `std.json.Stringify` owns them. *Never* in this module: it would make it a second JSON library.
-- **Escaping DEL (0x7F).** RFC 8259 §7 does not list it; Go and serde_json do not escape it. CPython's `ensure_ascii` does. Not now; if a consumer needs it, add `StringOptions.escape_del`.
-- **Lone surrogates.** A Zig `[]const u8` is UTF-8, where a surrogate (`ED A0..BF`) is ill-formed and goes through the `invalid_utf8` policy. There is no WTF-8 mode. Never (no caller has WTF-8).
-- **A per-byte U+FFFD policy (Go's).** Refused: the maximal-subpart policy is the Unicode / WHATWG recommendation. The two differ only on a truncated valid prefix; the tests pin the difference.
-- **Escaping `/`.** Never written as `\/`; only needed inside `</script>`, which `html_safe` already covers by escaping `<`.
+What it deliberately does not do: see *What is deliberately not done*.
 
 ## Performance
 
-`zig build bench-jsontext` (`tools/bench.zig` against `tools/go_bench`, Go 1.26.8 standard library only; always ReleaseFast): `writeString` with default options against `encoding/json`'s string encoder (an `Encoder` with `SetEscapeHTML(false)`, into a reused buffer on both sides), four shapes (ASCII with nothing to escape, valid UTF-8, ill-formed, control-heavy) of 64 B and 4 KiB generated identically on both sides, best of five, batch doubled past 100 ms. Measured 2026-11-08 after the accesslog fix, load average about 4 on 8 cores (`uptime`), ours/Go:
-
-| shape | 64 B | 4 KiB |
-|---|--:|--:|
-| ascii | 0.23 | 0.50 |
-| utf8 | 0.35 | 0.66 |
-| ill-formed | 0.58 | 0.86 |
-| control-heavy | 0.73 | 0.96 |
-
-Go writes each ill-formed byte as six bytes (`\ufffd`), we write three; the bytes out differ, the work asked of the encoder is the same. Regression fix (2026-11-08): the block cost `accesslog` +11 % (its strings are short and almost never need an escape; each paid a staging copy and a flush). A string with nothing to escape now skips the block and is one `writeAll` of the caller's bytes (escaped strings take the same path as before; the table above was re-measured after the fix, 2026-11-08, load about 4); `bench-accesslog` json_encoding back to 0.985x of the pre-rewrite writer (A/B, two runs each, interleaved). History: the first measurement had control-heavy 4 KiB at 2.04x (every escape went through `w.print` and its own `writeAll`); the `Pending` block (escapes and runs under 64 bytes gathered in 256 bytes, `\uXXXX` from a table) took it to 0.90x (0.96x in the re-measurement above, same code path, a busier host). The earlier `accesslog` numbers (ASCII hot path 271 ns before the move, 274 ns after) stay valid for the default loop. No Rust encoder was measured; `fastest` is not measured.
+`zig build bench-jsontext` (`tools/bench.zig` against `tools/go_bench`, Go standard library only; always ReleaseFast):
+`writeString` with default options against `encoding/json`'s string encoder (an `Encoder` with `SetEscapeHTML(false)`,
+into a reused buffer on both sides), four shapes (ASCII with nothing to escape, valid UTF-8, ill-formed, control-heavy)
+of 64 B and 4 KiB generated identically on both sides, best of five. The card's Performance line carries the figures.
+Go writes each ill-formed byte as six bytes (`\ufffd`), we write three; the bytes out differ, the work asked of the
+encoder is the same. A string with nothing to escape skips the staging block and is one `writeAll` of the caller's bytes
+(its short, almost-never-escaped strings made the block cost `accesslog` 11 %). No Rust encoder was measured.
 
 ## Wire format / algorithm
 
@@ -66,8 +55,37 @@ The scan is table-driven: one lookup per byte for the verbatim set; a well-forme
 ## Limits and refusals
 
 - `depthWithin` cap is the caller's `max_depth` (a `usize`); the scan is O(n) and uses constant space, so it can be run on a hostile buffer before a parser.
-- `.reject` returns `error.InvalidUtf8` after writing the opening quote and everything before the bad sequence (changed 2026-11-08: the old code left out the unflushed verbatim run); the writer is then left with a partial literal. A caller that cannot tolerate that checks first with `std.unicode.utf8ValidateSlice`.
+- `.reject` returns `error.InvalidUtf8` after writing the opening quote and everything before the bad sequence; the writer is then left with a partial literal. A caller that cannot tolerate that checks first with `std.unicode.utf8ValidateSlice`.
 - No consumer-reachable panic: every public function is total on any bytes; the only `unreachable` is in `accesslog`'s wrapper, on an error the chosen options cannot return.
+
+## What is deliberately not done
+
+- **Number formatting, key ordering, pretty printing, object writers, a streaming `Encoder` object.** `std.json.Stringify` owns them
+  (use it for values; this module is for a string that arrives as bytes). *Never* in this module: it would make it a second JSON library.
+- **Escaping DEL (0x7F).** RFC 8259 §7 does not list it; Go and serde_json do not escape it. CPython's `ensure_ascii` does. Not now; if a consumer needs it, add `StringOptions.escape_del`.
+- **Lone surrogates.** A Zig `[]const u8` is UTF-8, where a surrogate (`ED A0..BF`) is ill-formed and goes through the `invalid_utf8` policy. There is no WTF-8 mode. Never (no caller has WTF-8).
+- **A per-byte U+FFFD policy (Go's).** Refused: the maximal-subpart policy is the Unicode / WHATWG recommendation. The two differ only on a truncated valid prefix; the tests pin the difference.
+- **Escaping `/`.** Never written as `\/`; only needed inside `</script>`, which `html_safe` already covers by escaping `<`.
+
+## Verification
+
+Run: `scripts/modtest jsontext`.
+
+- **Exact-byte tests** (`src/root.zig`): quotes, escapes and the C0 controls; one U+FFFD per maximal subpart; `escape_bytes`;
+  `reject`; `ascii_only` with surrogate pairs; `html_safe`; every option combination round-tripped through `std.json`;
+  ill-formed input always yields a parseable document; `utf8Step` against `std.unicode` over an exhaustive byte sweep and
+  its maximal subpart brute-forced; `decodeScalar` over every Unicode scalar value; escapes beyond one pending block and long
+  runs keep their order; a clean string is one write; `depthWithin` (strings are text, braces count like brackets,
+  closers saturate and decrement, the cap is inclusive).
+- **Frozen foreign vectors:** the test `vectors: replay …` replays `src/testdata/vectors.txt` (producer `tools/gen_vectors.py`,
+  CPython) and `vectors_go.txt` (producer `tools/go_vectors`, Go) over every option set and the `reject` variants (see Anchoring).
+- **Fuzz:** the deterministic driver, `JSONTEXT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), harness
+  `jsontext-string-depth`: every option combination must yield a literal that decodes to the reference text (an oracle written
+  for the harness: a WHATWG-style decoder state machine, `std.json`, an independent depth scan), with every writer capacity from
+  0 to the output size; reach counters over valid / ill-formed / reject-error / short-writer / deep inputs.
+- **Comparative bench:** `bench-jsontext` (see *Performance*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 
 ## Anchoring
 
@@ -89,11 +107,12 @@ The generator asserts the CPython claim the maximal-subpart policy rests on (`E2
 
 ## Backlog / deferred
 
-- **Options that would let the six remaining private JSON-string writers move here** (duplicate-code pass wave 4,
-  2026-11-08; each copy kept because no option set is byte-identical): `escape_del` (health, cbor diag escape 0x7f);
+- **Options that would let the remaining private JSON-string writers move here** (health, jinja, dataframe `jsonio`, cbor diag, json5,
+  openapi; each copy is kept because no option set is byte-identical): `escape_del` (health, cbor diag escape 0x7f);
   `short_escapes = false` — `\u0008`/`\u000c` instead of `\b`/`\f` (dataframe jsonio, json5, openapi); a per-BYTE
   U+FFFD replace (dataframe, cbor) beside today's per-maximal-subpart one; `.escape_all_high_if_invalid` (health: every
-  byte ≥ 0x80 as `\u00XX` once any byte is ill-formed); a verbatim-bytes mode (json5, openapi pass non-ASCII and
+  byte ≥ 0x80 as `\u00XX` once any byte is ill-formed, including valid sequences — `escape_bytes` here escapes only the
+  ill-formed bytes, a deliberate narrowing the health move must accept); a verbatim-bytes mode (json5, openapi pass non-ASCII and
   invalid bytes through); a caller-chosen extra escape set (openapi only `<`; jinja `tojson` `<>&'`); jinja's error
   mapping (truncated sequence = error, bad lead = `\u00XX`). Each is small; add one only together with the consumer
   that moves onto it (and a byte-identity differential against the copy before deleting it).
@@ -101,5 +120,4 @@ The generator asserts the CPython claim the maximal-subpart policy rests on (`E2
 ## Open
 
 - A live oracle (`tools/interop.zig` driving CPython and Go on random inputs) would lift the evidence grade from frozen-vectors-only to live; the frozen vectors cover every non-`own` column.
-- Move the remaining string-escaper copies onto this module (health, openapi, jinja, cbor diag, mcp, jsonshape, framing's `jsonDepthWithin`); until then each keeps its copy. Health's differs: DEL escaped, and a whole string with any ill-formed byte has every byte >= 0x80 escaped (including valid sequences) — `escape_bytes` here escapes only the ill-formed bytes, a deliberate narrowing the health move must accept.
 - No independent (second-person) panic review yet: the sweep in the Hardening line was made by the auditing agent and backed by 4,000,000 fuzz seeds.
