@@ -6,7 +6,7 @@
 
 **Scope:** core — Standard Webhooks / svix-webhooks v2.6.0 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (37/37) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (123/125, 2 eq) · src 079e6ef199d09820
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct 2026-11-13 (ctgrind: verify 0 in-file = the signature comparison and HMAC under a tainted secret raise no branch of the module (sha256/sha1/sha512, hex/base64, rotation set, Stripe, Slack, Standard Webhooks); sign 77 = the public MAC through the hex/base64 encoders; keys 1 = the SP/TAB trim of the `whsec_` text; ed25519 30 = public-signature base64 22, trims 2, std `rejectIdentity` 5, the embedded-public-half compare 1; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point: `Verifier.init`'s option preconditions were `std.debug.assert`, now `error.InvalidOptions`; no request-data crash found)
 
@@ -119,7 +119,12 @@ not zeroize it.
   `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (`standard.encodeSecret`) probe residue and the HMAC key /
   Ed25519 secret as needles (ReleaseFast only).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
-  run and the delta runs after it.
+  run and the delta runs after it. The last whole-module run put 125 mutants over `src/root.zig` (signature compare,
+  timestamp window, header parse, key-count and signature-count caps, `Verifier.init` contracts, the middleware): 123 killed,
+  2 equivalent (an 88-character length test that `calcSizeForSlice` repeats, and an empty-key test every caller of the
+  base64 key decoder repeats). 25 survived the first pass, all test gaps (output-buffer boundaries, secrets beyond `max_keys`,
+  a configured `tolerance_s`, the configured challenge, `ctx.data` restore, the stripe signature cap), closed by 9 tests; no
+  code defect. Not mutated: the stack-burn sites of `src/burn.zig` (the ReleaseFast probes' ground), allocation-failure paths.
 
 **External anchor, and one refuted.** RFC 4231 (HMAC-SHA-2 test vectors) was evaluated and
 deliberately **not** adopted: this module's `Hmac` is `std.crypto.auth.hmac.sha2.HmacSha256` used

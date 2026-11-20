@@ -2040,3 +2040,164 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run: buffers, key-count caps, custom tolerance, restore ──
+
+test "sign functions: one octet short is OutputTooSmall, the exact size works" {
+    var big: [256]u8 = undefined;
+    const key: [24]u8 = @splat(7);
+    try testing.expectError(error.OutputTooSmall, standard.sign(big[0 .. standard.v1_len - 1], &key, "id", 1, "p"));
+    _ = try standard.sign(big[0..standard.v1_len], &key, "id", 1, "p");
+
+    const Ed = std.crypto.sign.Ed25519;
+    const kp = try Ed.KeyPair.generateDeterministic(@splat(2));
+    try testing.expectError(error.OutputTooSmall, standard.signEd25519(big[0 .. standard.v1a_len - 1], &big, &kp, "id", 1, "p"));
+    _ = try standard.signEd25519(big[0..standard.v1a_len], &big, &kp, "id", 1, "p");
+
+    try testing.expectError(error.OutputTooSmall, slack.sign(big[0 .. slack.signature_len - 1], "k", 1, "b"));
+    _ = try slack.sign(big[0..slack.signature_len], "k", 1, "b");
+
+    // `t=1,v1=` + 64 hex = 2 + 1 + 4 + 64 octets.
+    try testing.expectError(error.OutputTooSmall, stripe.sign(big[0..70], "k", 1, "b"));
+    _ = try stripe.sign(big[0..71], "k", 1, "b");
+
+    const n = (try standard.encodeSecret(&big, &key)).len;
+    var small: [64]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, standard.encodeSecret(small[0 .. n - 1], &key));
+    try testing.expectEqual(n, (try standard.encodeSecret(small[0..n], &key)).len);
+}
+
+test "decodeSigningKey: the pair is zeroed when the 64-byte form's public half does not match" {
+    const Ed = std.crypto.sign.Ed25519;
+    var out = try Ed.KeyPair.generateDeterministic(@splat(1));
+    var raw: [64]u8 = @splat(0);
+    @memset(raw[0..32], 3); // a seed, then a public half that is not its own
+    var enc: [96]u8 = undefined;
+    const text = std.base64.standard.Encoder.encode(&enc, &raw);
+    try testing.expectError(error.InvalidKey, standard.decodeSigningKey(&out, text));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&out), 0));
+}
+
+test "free verify functions ignore secrets beyond max_keys (no overrun, the ninth is not tried)" {
+    const nine = [_][]const u8{ "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8" };
+    comptime std.debug.assert(nine.len == max_keys + 1);
+    var b0: [200]u8 = undefined;
+    var b8: [200]u8 = undefined;
+    const ts: u64 = 1_000_000;
+    const now: i64 = 1_000_000;
+
+    const sw0 = try standard.sign(&b0, nine[0], "m", ts, "p");
+    const sw8 = try standard.sign(&b8, nine[8], "m", ts, "p");
+    try standard.verify(.{ .secrets = &nine }, "m", "1000000", sw0, "p", now, 300);
+    try testing.expectError(error.NoMatchingSignature, standard.verify(.{ .secrets = &nine }, "m", "1000000", sw8, "p", now, 300));
+
+    const st0 = try stripe.sign(&b0, nine[0], ts, "p");
+    const st8 = try stripe.sign(&b8, nine[8], ts, "p");
+    try stripe.verify(&nine, st0, "p", now, 300);
+    try testing.expectError(error.NoMatchingSignature, stripe.verify(&nine, st8, "p", now, 300));
+
+    const sl0 = try slack.sign(&b0, nine[0], ts, "p");
+    const sl8 = try slack.sign(&b8, nine[8], ts, "p");
+    try slack.verify(&nine, "1000000", sl0, "p", now, 300);
+    try testing.expectError(error.NoMatchingSignature, slack.verify(&nine, "1000000", sl8, "p", now, 300));
+}
+
+test "Standard Webhooks: entries without a comma are skipped, an unpadded v1a value is refused" {
+    var b: [200]u8 = undefined;
+    const v1 = try standard.sign(&b, "key", "m", 5000, "p");
+    var lb: [300]u8 = undefined;
+    const list = try std.fmt.bufPrint(&lb, "garbage {s}", .{v1});
+    try standard.verify(.{ .secrets = &.{"key"} }, "m", "5000", list, "p", 5000, 300);
+
+    const pk = try standard.decodePublicKey(sw_whpk);
+    try standard.verify(.{ .public_keys = &.{pk} }, sw_id, "1614265330", sw_v1a, sw_payload, @intCast(sw_ts), 300);
+    // The same signature without its `==`: 86 characters, not the 88 the format has.
+    try testing.expectError(error.NoMatchingSignature, standard.verify(.{ .public_keys = &.{pk} }, sw_id, "1614265330", sw_v1a[0 .. sw_v1a.len - 2], sw_payload, @intCast(sw_ts), 300));
+}
+
+test "Verifier.init: Standard Webhooks with no key at all is InvalidOptions" {
+    fixed_now = 0;
+    try testing.expectError(error.InvalidOptions, Verifier.init(testing.allocator, .{ .scheme = .standard_webhooks, .clock = fixed_clock }));
+}
+
+test "Verifier: a custom tolerance_s governs every timestamped scheme" {
+    fixed_now = 100_000;
+    const now = fixed_now;
+    var b: [200]u8 = undefined;
+
+    var vs = try Verifier.init(testing.allocator, .{ .secret = "key-24-bytes-key-24-bytes", .scheme = .standard_webhooks, .clock = fixed_clock, .tolerance_s = 10 });
+    defer vs.deinit();
+    const old_sw = try standard.sign(&b, "key-24-bytes-key-24-bytes", "m", 99_980, "p");
+    const h_old: Verifier.Headers = .{ .signature = old_sw, .timestamp = "99980", .id = "m" };
+    try testing.expectError(error.TimestampTooOld, vs.verifyRequest(h_old, "p", now));
+    try testing.expectError(error.TimestampTooOld, vs.checkFreshness(h_old, now));
+    var b2: [200]u8 = undefined;
+    const fresh_sw = try standard.sign(&b2, "key-24-bytes-key-24-bytes", "m", 99_995, "p");
+    try vs.verifyRequest(.{ .signature = fresh_sw, .timestamp = "99995", .id = "m" }, "p", now);
+
+    var vt = try Verifier.init(testing.allocator, .{ .secret = "k", .scheme = .stripe, .clock = fixed_clock, .tolerance_s = 10 });
+    defer vt.deinit();
+    const old_st = try stripe.sign(&b, "k", 99_980, "p");
+    try testing.expectError(error.TimestampTooOld, vt.verifyRequest(.{ .signature = old_st }, "p", now));
+    try testing.expectError(error.TimestampTooOld, vt.checkFreshness(.{ .signature = old_st }, now));
+    // No `t=` at all is InvalidHeader, never "fresh enough".
+    try testing.expectError(error.InvalidHeader, vt.checkFreshness(.{ .signature = "v1=00" }, now));
+
+    var vk = try Verifier.init(testing.allocator, .{ .secret = "k", .scheme = .slack, .clock = fixed_clock, .tolerance_s = 10 });
+    defer vk.deinit();
+    const old_sl = try slack.sign(&b, "k", 99_980, "p");
+    try testing.expectError(error.TimestampTooOld, vk.verifyRequest(.{ .signature = old_sl, .timestamp = "99980" }, "p", now));
+    try testing.expectError(error.TimestampTooOld, vk.checkFreshness(.{ .signature = old_sl, .timestamp = "99980" }, now));
+}
+
+test "middleware: the configured challenge is sent, and a missing header is 401 even for an oversize body" {
+    var v = try Verifier.init(testing.allocator, .{ .secret = "k", .challenge = "Bearer realm=hooks", .max_body_bytes = 4 });
+    defer v.deinit();
+    var r = try gatedRouter(&v);
+    defer r.deinit();
+    var reqbuf: [512]u8 = undefined;
+    var respbuf: [1024]u8 = undefined;
+    const got = runWire(&r, buildReq(&reqbuf, null, null, "longer than four"), &respbuf);
+    try expectStatus(got, "401"); // refused unread, not the 413 reading it would give
+    try testing.expect(std.mem.find(u8, got, "\r\nWWW-Authenticate: Bearer realm=hooks\r\n") != null);
+}
+
+var restore_sentinel: u8 = 0;
+var restore_seen: bool = false;
+fn outerRestoreRun(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    ctx.data = &restore_sentinel;
+    try next.run(ctx);
+    restore_seen = ctx.data == @as(?*anyopaque, &restore_sentinel);
+}
+
+test "middleware: ctx.data is restored for the layers above once the inner chain returns" {
+    var v = try Verifier.init(testing.allocator, .{ .secret = "whsec" });
+    defer v.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = null, .run = outerRestoreRun });
+    try r.use(v.middleware());
+    try r.post("/hook", hEcho);
+    var sbuf: [64 + 8]u8 = undefined;
+    const sig = try sign("whsec", "x", &sbuf);
+    var reqbuf: [512]u8 = undefined;
+    var respbuf: [1024]u8 = undefined;
+    restore_seen = false;
+    try expectStatus(runWire(&r, buildReq(&reqbuf, null, sig, "x"), &respbuf), "200");
+    try testing.expect(restore_seen);
+}
+
+test "Stripe: exactly max_signatures v1 entries are looked at, one more is InvalidHeader" {
+    var b: [200]u8 = undefined;
+    const good = (try stripe.sign(&b, "k", 1_000_000, "p"))[2 + 7 + 1 ..]; // `v1=<hex>` after `t=1000000,`
+    for ([_]usize{ max_signatures, max_signatures + 1 }) |count| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(testing.allocator);
+        try list.appendSlice(testing.allocator, "t=1000000");
+        for (0..count - 1) |_| try list.appendSlice(testing.allocator, ",v1=00");
+        try list.append(testing.allocator, ',');
+        try list.appendSlice(testing.allocator, good);
+        const r = stripe.verify(&.{"k"}, list.items, "p", 1_000_000, 300);
+        if (count == max_signatures) try r else try testing.expectError(error.InvalidHeader, r);
+    }
+}
