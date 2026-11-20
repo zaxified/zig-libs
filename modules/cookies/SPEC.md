@@ -19,7 +19,7 @@
 **Downstream consumer:** yes
 
 HTTP cookies (RFC 6265): `Cookie` request-header parser + `Set-Cookie` response-header builder.
-Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line.
 
 ## Compared with
 
@@ -29,17 +29,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 |---|---|---|--:|---|---|
 | [SergioBenitez/cookie-rs](https://github.com/SergioBenitez/cookie-rs) (`cookie` crate) — **reference** | Rust | MIT OR Apache-2.0 (LICENSE-MIT taken) | 345 | tag 0.18.2 (no GH releases) | `Cookie` parse/build, `Set-Cookie` parsing, a `CookieJar` with delta tracking, signed and private (encrypted) child jars, percent-encoding. This module: request-header parser, `Set-Cookie` builder, signed/private values, and (src/jar.zig) a `Set-Cookie` parser and client `Jar` with a caller-supplied public-suffix list. |
 | Go [`net/http`](https://pkg.go.dev/net/http#Cookie) cookies | Go | BSD-3-Clause | — | Go stdlib | `Request.Cookie(s)`, `Cookie.String`, `ParseSetCookie`, `net/http/cookiejar` (client jar with public-suffix support). Same server-side parse/build core; the builder has no `Set-Cookie` parser, but `Jar` (src/jar.zig) has both a parser and a client jar. |
-| [gorilla/securecookie](https://github.com/gorilla/securecookie) | Go | BSD-3-Clause | 729 | v1.1.2 (2023-11-05) | HMAC-signed and optionally encrypted cookie values with key rotation and an embedded timestamp (server-side max age). Here: `signed`/`private` with rotation, no embedded timestamp (since 2026-10-12). |
+| [gorilla/securecookie](https://github.com/gorilla/securecookie) | Go | BSD-3-Clause | 729 | v1.1.2 (2023-11-05) | HMAC-signed and optionally encrypted cookie values with key rotation and an embedded timestamp (server-side max age). Here: `signed`/`private` with rotation, and an issue time under the MAC/AEAD in the `*Timed` variants (a format of our own). |
 | [jshttp/cookie](https://github.com/jshttp/cookie) | TypeScript | MIT | 1.5k | v2.0.1 (2026-06-30) | Minimal parse/serialize pair, the Node/Express cookie parser — the closest peer in scope. *(inferred)* |
 | [nektro/zig-cookies](https://github.com/nektro/zig-cookies) | Zig | MIT | 2 | push 2026-07-08 | Only Zig ecosystem hit; tiny. Zig `std` has no cookie support. *(inferred)* |
 
-**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no `CookieJar` delta tracking on the server side (the caller calls `set` per cookie); the client jar keeps no state across restarts (no persistence). Closed 2026-10-12: signed and private (encrypted) values byte-compatible with cookie-rs, key rotation, cookie-rs key derivation, percent-encoding (`percentEncode`/`percentDecode`, cookie-rs's set), server-side expiry (`*Timed`, gorilla's idea in a format of our own).
+**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no `CookieJar` delta tracking on the server side (the caller calls `set` per cookie, see *What is deliberately not done*); the client jar keeps no state across restarts (no persistence, see *Backlog / deferred*). Signed and private (encrypted) values are byte-compatible with cookie-rs, with key rotation, cookie-rs key derivation, percent-encoding (`percentEncode`/`percentDecode`, cookie-rs's set) and server-side expiry (`*Timed`, gorilla's idea in a format of our own).
 
 ## Design & invariants
 - **Allocation-free.** `parse` returns an `Iterator` whose `Cookie{name,value}` pairs **borrow the
   header**; `SetCookie.write` streams to a `*std.Io.Writer`, `bufPrint` into a caller buffer.
   Reentrant, no state.
-- **Liberal parse, strict build.** Parse follows §5.4: split on `;`, OWS-trim, split each segment on
+- **Liberal parse, strict build.** Parse follows §5.4: split on every `;` (quoted or not: a sent cookie-value never contains `;`, as in Go's `readCookies` and the browsers, and a quote-aware split lets `a="x; session=S; z="` hide `session`), OWS-trim, split each segment on
   the first `=` (valueless → empty value), strip a matching pair of surrounding DQUOTEs, skip
   empty-name segments; no charset validation on read. `find` is case-sensitive.
 - **Injection guard is the point of the build side.** `SetCookie.write` validates everything first —
@@ -47,7 +47,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   bare attribute-octet check (no CTL, no `;`) — so a control char or separator that could inject a
   second attribute/header is refused with `error.InvalidCookie` before any byte is written. Bad
   values are rejected, not auto-quoted.
-- **Signed / private values (`secure.zig`, 2026-10-12).** Codecs over the value string, no jar,
+- **Signed / private values (`secure.zig`).** Codecs over the value string, no jar,
   no allocation. `private`: AES-256-GCM (the `aesgcm` module), 96-bit nonce from the OS CSPRNG
   (`sealRandom`) or the caller (`seal`), the cookie name as AD, base64(nonce ‖ ct ‖ tag) —
   cookie-rs `PrivateJar`'s exact format, so values cross between a Rust and a Zig service with the
@@ -56,7 +56,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   another cookie name). `Key` = signing ‖ encryption (cookie-rs `Key`); `deriveInto` = HKDF-SHA256
   Expand with the master as PRK and cookie-rs's info string. `verify`/`open` take a key list
   (rotation; every key is tried, so time depends on the list length only) and answer only
-  value-or-null. `open` decrypts in place inside the caller's buffer and wipes it on refusal.
+  value-or-null. `open` decrypts in place inside the caller's buffer and wipes it on refusal. `seal`/`sealTimed` refuse a value over AES-GCM's `max_message_len` (about 64 GiB) with `error.InvalidValue`, and an `out` that overlaps the tail the record is built in with `error.NoSpaceLeft`.
   The tag (sign) and ciphertext ‖ tag (seal) are declassified for ctgrind before base64, as they
   go to the client. Keys by pointer, every entry point under a dead-stack burn.
 - **Timed values (server-side expiry).** `signTimed` = base64(HMAC) ‖ issued (decimal seconds) ‖
@@ -67,7 +67,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   gorilla/securecookie). The verdict and the authenticated issue time are declassified for ctgrind
   before the age check: public metadata, not the protected value.
 - **Percent-encoding.** `percentEncode` = cookie-rs `Cookie::encoded()` (WHATWG userinfo set +
-  `%(),`, uppercase hex), `percentDecode` keeps a malformed `%` literal.
+  `%(),`, uppercase hex), `percentDecode` keeps a malformed `%` literal and returns `error.NoSpaceLeft` when `out` is too short.
 - **SameSite=None ⇒ Secure enforced.** `.none` without `secure` → `error.InsecureSameSiteNone`
   (browsers silently drop such a cookie otherwise), surfaced at build time.
 - **`Partitioned` (CHIPS) ⇒ Secure enforced.** `partitioned` without `secure` →
@@ -84,177 +84,52 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   is never the binding constraint. Over-long ⇒ `error.BufferTooSmall`; a `Set-Cookie` is never
   truncated, since a truncated one still parses and would be stored silently corrupted.
 
+- **Client jar (`jar.zig`) and Public Suffix List (`psl.zig`).** `Jar` is RFC 6265 §5.2-§5.4 for a client: `jar.SetCookie.parse` (§5.2 with the §5.1.1 cookie-date algorithm), storage (§5.3), retrieval (§5.4: longest path first, then oldest). The list is the caller's (`PublicSuffixList.parse`); with none every `Domain` attribute counts as a public suffix (host-only when it names the host, otherwise dropped). A `Domain` with a trailing dot is dropped, since `co.uk.` reads as no public suffix. RFC 6265bis rules: `Secure` only from https and a plain origin cannot shadow a live (unexpired) secure cookie. A name+value over `max_name_value_bytes` (4096) or an attribute over `max_attribute_bytes` (1024) is ignored; eviction past `max_cookies`/`max_per_domain` removes expired cookies, then the least recently used. Thread-safe (a spin lock), and `writeCookiesAt` takes the time explicitly.
+- **Jar name prefixes (6265bis §4.1.3 / §5.7).** `setCookieAt` ignores a `__Secure-` cookie without `Secure`; a `__Host-` cookie needs `Secure`, host-only (a `Domain` the list lets through makes it a domain cookie, the host's own name included; with no list a `Domain` naming the host stays host-only) and an explicit `Path=/` attribute (a missing or invalid `Path` does not count). A refused cookie is ignored entirely, a deletion (`Max-Age=0`) included. The draft is spec-mandatory for a user agent and curl and the browsers enforce both; the match is case-insensitive like the builder's (`SetCookie.check`), stricter than the draft text and the safe direction. There is no opt-out. Go's cookiejar and Python's `http.cookiejar` do no prefix handling, so the Go oracle has no vector with a prefixed name.
+- **Jar retrieval cap.** `writeCookiesAt` sends at most 256 matching cookies; when more match, the 256 sent are the first 256 in §5.4 order (a later match replaces the last picked one if it sorts before it). Expired cookies are purged in one compaction pass.
+
 ## Threat model / out of scope
 Defends against `Set-Cookie` header/attribute injection via a reflected name/value/Path/Domain, and
 against the SameSite=None-without-Secure footgun; with `signed`/`private`, against a client that
 forges, alters or (with `.bound`/`private`) moves a value to another cookie name, and with
-`private` against a client reading it. Does not: expire a signed/private value on the server
-(a value stays valid as long as its key; put an issue time inside or rotate keys), prevent
-replay of a captured value, enforce (in the builder; `Jar` does) Domain/Path scoping or
-the public-suffix list, or evaluate Expires/Max-Age (no clock). `set` appends a `Set-Cookie` line
+`private` against a client reading it. Does not: expire a plain `sign`/`seal` value on the server
+(it stays valid as long as its key; use the `*Timed` variants or rotate keys), prevent
+replay of a captured value within its lifetime, enforce (in the builder; `Jar` does) Domain/Path scoping or
+the public-suffix list, or evaluate Expires/Max-Age (no clock). The jar spin lock is held while the caller's writer runs (see *Backlog / deferred*), and the public percent helpers and `isCookieValue` are not constant-time (not used with secrets internally). `set` appends a `Set-Cookie` line
 per call (`addSetCookie`, as Go's `http.SetCookie`); it never replaces one. The parser is
 deliberately non-validating on read.
 
 ## Verification
-Offline tests, green in Debug + ReleaseFast. Parser (7): simple pairs + `find`, OWS trimming,
-valueless cookies, quoted/unbalanced-quote values (incl. a quoted value containing a `;`, which
-does not end the segment), empty-name/first-`=` splitting, degenerate headers. Builder (11): full
-attribute set in RFC order, `__Host-`/`__Secure-` prefix constraints, minimal `name=value`,
-Domain + pre-formatted Expires, negative Max-Age,
-`SameSite=Strict`, invalid name/value/Path/Domain rejection, `SameSite=None` both branches,
-`BufferTooSmall`. Constants (1): `max_set_cookie_bytes` pinned by value and to `http`'s
-`header_copy_bytes`. `http` helpers (3): an end-to-end `get`+`set` over `http.Server.serveStream`;
-an anchor for the copy `set` depends on — a `noinline` helper sets the cookie from its own frame,
-returns, and a second `noinline` deliberately clobbers that frame before `end()` runs, so the
-value read off the wire proves `addSetCookie` copied rather than borrowed (`serveStream` offers no
-seam between the handler returning and `end()`, so the writer is driven by hand); and an
-over-long cookie refused with `BufferTooSmall`/`HeaderBytesExhausted` rather than truncated. Run:
-`zig build test-cookies`.
 
-**External anchor** (`golden_test.zig`): python3's stdlib `http.cookies` run once as a black-box
-oracle over the same awkward header shapes (quoted values incl. an embedded `;`, valueless
-attributes, empty names, duplicate names, attribute-keyword collisions), frozen and asserted
-offline — no python3 needed to run the suite. This comparison caught one real bug (the quoted-`;`
-segment split, fixed in `root.zig`'s `Iterator.next`) and surfaced several judged, NOT-adopted
-divergences (python's whole-header abort on one bad segment; its Set-Cookie-attribute-keyword
-capture applied to what is really a `Cookie` request header; last-write-wins on duplicate names;
-DQUOTE-in-name rejection) — each argued against RFC 6265 at its test site, not copied blind.
+Run: `scripts/modtest cookies` (Debug and `-Doptimize=ReleaseFast`); `zig build interop-cookies` runs the Public Suffix List oracle over the system list.
 
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig`, `jar.zig`, `psl.zig` (matching, not list data), `secure.zig`, schemata in a detached copy, three ReleaseSafe builds + one ReleaseFast build for the burn/wipe mutants (stackprobe clean at M0), strict verdict, adversarial read while placing mutants): 987 mutants, 931 killed, 56 equivalent, 0 undecided, no defect. New tests: a one-byte `Cookie` header, every weekday and month in `Expires` and in the jar's cookie-date (both cases), `percentDecode` with `%z4`/`%4z`, tab trimming in `SetCookie.parse`, empty `Domain` and `Path` ignored (an empty `Path=` was a bounds panic under the guard's mutant — verified by applying it alone), a host over 256 bytes stores and sends nothing, `cookieJar` reads the real clock on write and store, three punycode vectors (Python `str.encode('punycode')`) separating the damp, adapt-bound and tmax constants, DEL in `toAscii`, `generateInto` fills both halves, `openBufLen` within 2 bytes of the decoded size, a `sealTimedNonce` known answer built independently with std AES-256-GCM (associated-data mutants), a 7-byte plaintext sealed under `"timed1\0sid"` refused by `openTimed`. Equivalent (reason per id kept by the auditor): identical bytes from the fast and slow `write` paths, unique `used` ticks, `Entry.http_only` never read, punycode u32 cannot overflow, bias 71..73 give the same `t`, `Max-Age=0` expiry equals now, equal-length hosts never `endsWith`; `timing_safe.eql` → `std.mem.eql` (killed by `check-ct-compare`); burn around the seal/open bodies (no needle in those frames, aesgcm burns its own) and `secureZero` of the ipad-xored HMAC state (covered by `burn.run`). Cut: valgrind client requests, `ctgrind_harness.zig`, `burn.zig`, the PSL data, `lock`/`unlock`.
-
-**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 32
-mutants — the DQUOTE span toggle and `;` split, the last-segment advance, first-`=` split,
-both OWS trims, empty-name skip, the DQUOTE strip (length and closing quote), `find`'s name
-match, every `SetCookie.write` check (empty/invalid name, value octets, Path/Domain octets,
-`SameSite=None` without `Secure`, `__Secure-`, all three `__Host-` conditions), `HttpOnly`
-emission, the token/cookie-octet/attribute-octet class bounds (SP, DEL, `=`, `;`, `\`,
-CTL incl. CR/LF in attributes) and the `SameSite` token. First run: 31 killed, 1 alive (a
-case-insensitive name match); one test added (`find` is case-sensitive, RFC 6265 §5.3);
-rerun: 32 killed, 0 equivalent. No defect found.
-
-**Client jar and Public Suffix List (2026-10-05).** `jar.zig`: `SetCookie.parse` (name-value
-rules, every attribute, last-wins, the 4096/1024-byte caps, control bytes), the §5.1.1
-cookie-date algorithm (all three HTTP date layouts, tokens in any order, two-digit years,
-impossible dates), storage (host-only vs `Domain`, the PSL refusal and its host-only exception,
-no-list fail-closed, IP hosts, default path, Max-Age over Expires, deletion by a past expiry,
-replacement keeping creation order), retrieval (path match, order, Secure only over https) and
-the 6265bis Secure rules, eviction per domain and overall. `psl.zig`: RFC 3492 §7.1 punycode
-samples, normal/wildcard/exception/implicit-`*` rules, a wildcard's base, lowercasing. Anchors:
-libpsl over our own mini list (`psl_oracle.zig`, 50 hosts) and over the full system list
-(`zig build interop-cookies`, 40 476 hosts derived from every rule, 0 differ); Go's
-`net/http/cookiejar` over 54 scenarios (`jar_go_oracle.zig`; 8 judged divergences, each with the
-RFC rule and our answer pinned). Mutation (schemata, one ReleaseSafe build): 28 mutants over
-both files, 27 killed after one test was added (an uppercase rule in the list), 1 equivalent
-(the early return for an already-expired cookie, which `evict` would drop anyway).
-
-**Signed / private values (2026-10-12).** `secure_test.zig` replays `secure_vectors.zig`: cookie-rs
-`derive_from` keys for 32/33/64/100-byte masters, 7 signed values in both formats and 6 sealed
-values (empty, UTF-8, all 256 bytes, 2000 bytes) whose BYTES come from pyca/cryptography (OpenSSL)
-and whose FORMAT is cookie-rs's `src/secure/*.rs` (`tools/secure_vectors.py`); `sign`/`seal`
-must reproduce them byte for byte, `verify`/`open` must return the value. Refusals: another name,
-the other signed format, every single-byte change of a signed value, every flipped bit of a sealed
-record (and `out` left without plaintext), every truncation, an extension, a foreign key, an empty
-key list, malformed base64 (bad padding, non-canonical trailing bits); key rotation in every
-position; `seal` over every length 0..200 against an out-of-place encoding (the in-place base64).
-Fuzz harness `secure` (genuine or mutated value × both codecs × name/key changes; exact accept
-iff intact) — its first run found a real defect: 44 tag characters without padding decode to 33
-bytes and std's decoder wrote past the 32-byte tag (`verify` panicked on a client-chosen value);
-now refused and pinned by a test. ctgrind (`ctgrind_harness.zig`, key and plaintext tainted):
-0 in-file contexts for derive/sign/verify/seal, 2 for `open` = aesgcm's own accept/reject (genuine
-and forged call). Dead-stack probe over all five entry points (`stackprobe_test.zig`). Timed values
-(same day): round trip, the max-age edge (age == max accepted, +1 refused), future issue, overflowing
-age, every refusal (other name, other key, a rewritten issue time, timed through the untimed API and
-back, every flipped bit, name over 255); the `secure` fuzz harness draws timed values, issue/now
-instants including i64 extremes and cross-mode opens; ctgrind rows tsign/tverify/tseal 0, topen 2
-(aesgcm's verdict); four more stack-probe entry points.
-ctgrind row `verify2` (2026-11-07): a two-key list whose first key matches, so the running
-verdict is secret when the second compare runs; 0 in-file contexts. A short circuit on it
-(`ok or eql(...)`, mutant 676) shows as 1 in-file context there and not in the one-key `verify`.
-
-**Review + mutation (2026-10-23,** independent, Sonnet, over everything since `ee2ee2c2`: the client
-jar and PSL, the Chrome-anchored `SetCookie` checks, signed/private values, `*Timed`, today's
-table-driven validation). **Fixed from it:** (MED) a `Domain` with a trailing dot passed the PSL
-check — `co.uk.` reads as no public suffix, its last label being empty — so `http://bank.co.uk./`
-could set a cookie every `*.co.uk.` host received; such a Domain is now dropped (the fully
-qualified host keeps its host-only cookies); (LOW) an expired `Secure` cookie, not yet purged,
-still blocked a plain-origin store of the same name. Both with a test that fails without the fix.
-Checked clean: the new tables accept exactly the RFC sets (pinned byte by byte for all 256 values;
-Path now also refuses bytes ≥ 0x80, as the browser oracle had it), MAC compare is constant-time
-over every key, the timed-domain separation, freshness at `age == max_age`, nonce freshness, wipe
-on failure, no #37131 cast. 126 schemata mutants over `root`, `secure`, `jar`, `psl`: 85 killed at
-once, 36 by new tests (byte sets, IMF-fixdate fields, quoted values, Domain/Path limits, Max-Age
-extremes, the jar's shadowing, replacement, eviction, LRU, IPv6 and dotted-quad hosts, date
-fields, exact-size and empty-plaintext opens, sealTimed's nonce), 5 equivalent: `parseIssued`
-letting a lone `-` through its filter (`parseInt` fails anyway), `Max-Age=0` as `ma < 0` (expiry
-== now deletes too), the past-expiry early return (the eviction in the same lock drops it), day 32
-(the month-length check is stricter), the year > 9999 guard (`leadingDigits` caps four digits).
+- **Tests by area.** `root.zig`: the `Cookie`-header scanner (pairs, OWS trimming, valueless cookies, quoted and unbalanced values, every `;` ending a pair so no quote hides or swallows another cookie, empty names, degenerate and one-byte headers), the `SetCookie` builder (full attribute set in RFC order, `__Host-`/`__Secure-` and `Partitioned` constraints, `SameSite=None`, byte sets pinned for all 256 values in name, value, Path and Domain, IMF-fixdate fields, `Max-Age` at the extremes of `i64`, exact-size and one-byte-short buffers, in-place against part-by-part writes), `percentEncode`/`percentDecode`, and the `http` helpers (an end-to-end `get` + `set` over `http.Server.serveStream`; a `noinline` pair that sets the cookie from a frame it then clobbers, proving `addSetCookie` copies; an over-long cookie refused, never truncated; `max_set_cookie_bytes` pinned by value and to `http`'s `header_copy_bytes`). `jar.zig`: `SetCookie.parse` (name-value rules, every attribute, last wins, the 4096/1024-byte caps, control bytes), the §5.1.1 cookie-date algorithm, storage (host-only against `Domain`, the PSL refusal and its host-only exception, no list = fail closed, IP hosts, default path, `Max-Age` over `Expires`, deletion, replacement, the `__Host-`/`__Secure-` ingest rules), retrieval (path match, order, the 256 cap and its replacement rule, `Secure` only over https), the 6265bis shadowing rule, eviction per domain and overall, the jar's clock. `psl.zig`: RFC 3492 punycode vectors, normal, wildcard, exception and implicit-`*` rules, a wildcard's base. `secure.zig`: see Oracles.
+- **Oracles and goldens.** `golden_test.zig` replays frozen CPython `http.cookies` answers over awkward `Cookie` headers (no python needed to run the suite); its judged, not-adopted divergences are each argued at the test site (whole-header abort on one bad segment, Set-Cookie attribute keywords captured from a request header, last write wins on duplicate names, DQUOTE in a name, and the quoted `;` that CPython keeps in one value while this scanner splits it). `jar_go_oracle.zig` replays Go `net/http/cookiejar` over 54 scenarios (8 judged divergences, each pinned with the RFC rule). `psl_oracle.zig` replays libpsl over the module's own mini list (`psl_mini.dat`); `zig build interop-cookies` runs libpsl over the full system list derived from every rule. `setcookie_oracle_test.zig` replays `setcookie_vectors.zig`, frozen from headless Chrome (`tools/setcookie_oracle.js`) with Go's `ParseSetCookie` as a second reader (`tools/go_setcookie`). `secure_test.zig` replays `secure_vectors.zig`: cookie-rs `derive_from` keys, signed values in both formats and sealed values (empty, UTF-8, all 256 bytes, 2000 bytes) whose bytes come from pyca/cryptography (`tools/secure_vectors.py`) and whose format is cookie-rs's; `sign`/`seal` reproduce them byte for byte. Refusals: another name, the other signed format, every single-byte change of a signed value, every flipped bit of a sealed record, every truncation, an extension, a foreign key, an empty key list, malformed base64; key rotation in every position; timed values at the max-age edge, a future issue, an overflowing age, a rewritten issue time and timed through the untimed API and back. A `sealTimedNonce` known answer is built independently with std AES-256-GCM.
+- **Fuzz.** Deterministic driver (`COOKIES_FUZZ`), harnesses `jar`, `parse`, `secure` (genuine or mutated value × both codecs × name and key changes, timed and untimed, issue and now instants including `i64` extremes; exact accept iff intact); never `zig build --fuzz`.
+- **ctgrind** (`ctgrind_harness.zig`, key and plaintext tainted): rows for `derive`, `sign`, `verify`, `seal`, `open`, the timed pairs, and `verify2` (a two-key list whose first key matches, so the running verdict is secret when the second compare runs; a short circuit there shows as an in-file context). `open` and `topen` carry aesgcm's own accept/reject contexts. A dead-stack probe covers every secure entry point (`stackprobe_test.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**`build` at P1, 2026-10-24** (`zig build bench-cookies`, `BENCH_FASTHTTP=1 BENCH_ROUNDS=7`, two
-runs): `build` 529–540 ns, 1.11–1.13× valyala/fasthttp 1.76.0 (was 847 ns, 1.59×) and 0.28× Go
-net/http; parse rows unchanged (0.47–0.49× the fastest). Three changes, measured with a standalone
-A/B harness of the bench's 8 specs (cycles, min of runs): the line is filled in place in the
-writer's buffer when an upper bound of it fits (one copy per part instead of a `writeAll` call per
-part: half of the old profile was `writeAll`, `memcpy` and `writeByte`), else written part by part
-out of line; validation moved into a `noinline` `check` (inlined beside the copies, LLVM merged
-the attribute checks into a vectorized block that unpacked a mask bit by bit — a fifth of the
-row); the name, value and Path classes are checked 16 bytes at a time by compares (-5 %). Together
--28 % cycles and -29 % instructions on the harness, -36 % ns on the bench row. Validation is kept
-in full: fasthttp still writes without checking anything.
+`zig build bench-cookies` (`BENCH_FASTHTTP=1 BENCH_ROUNDS=7` adds valyala/fasthttp; `tools/rust_fast_bench` is cookie-rs and `tools/go_bench` Go `net/http`). Rows: `parse_find`, `parse_all`, `build`. The card's `**Performance:**` line carries the figures. Two comparisons are not like for like: cookie-rs has no "find one cookie" call, so `split_parse` stands for both parse rows, and cookie-rs's and fasthttp's `build` validate nothing, where this module and Go refuse invalid cookies. `build` fills the line in place in the writer's buffer when an upper bound of it fits (one copy per part), else writes part by part out of line; validation is a `noinline` `check` and compares the name, value and Path classes 16 bytes at a time.
 
-**Fastest in the field, 2026-10-23** (`zig build bench-cookies`). cookie-rs 0.18.2
-(`tools/rust_fast_bench`; `split_parse` for both parse rows, as it has no "find one cookie"
-call, and `Display` of a prebuilt `Cookie` for `build`, which validates nothing — ours and Go's
-refuse invalid cookies): ours 0.48× `parse_find`, 0.46× `parse_all`, 1.08–1.10× `build`. The
-`build` row was 1.35× before table-driven validation and a hand-written `Max-Age` (CHANGELOG).
-valyala/fasthttp 1.76.0 (`tools/go_fast_bench`, fed through `SetCanonical`, `build` compared on a
-case-folded checksum) runs with `BENCH_FASTHTTP=1` since 2026-10-23, after molecule-man/go-brrr
-1.3.0 (linked through fasthttp's brotli) was swept: no os/net/syscall/cgo in the linked packages
-(cgo `internal/cref` is test-only), assembly without CALL/SYSCALL, one `init` packing a static
-table. Result, `BENCH_ROUNDS=7`: parse rows ours 0.45× / 0.28× fasthttp, but **`build` 1.59×
-fasthttp** (847 vs 533 ns) — fasthttp's `AppendBytes` validates nothing and appends straight into
-a byte slice; ours validates name, value, Domain and Path and writes through `std.Io.Writer`
-(`bufPrint` 12 %, `writeAll` 7 %, `memcpy` 6 % of the profile). So the module is P2 on this row;
-route in Backlog.
+## What is deliberately not done
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-cookies`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.1 %): ref 0.27–0.41×, against 0.29–0.64× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+- **Server-side `CookieJar` with delta tracking** (cookie-rs): the caller calls `set` per cookie.
+- **Enforcing Domain/Path scoping and the public-suffix list in the builder**: the builder writes a line; `Jar` enforces both on ingest.
+- **Evaluating `Expires`/`Max-Age` in the builder**: no clock in the module; `expires` is a pre-formatted string.
+- **`Set-Cookie2` and `SameSite` enforcement in the client jar**: a browser's context, not an HTTP client's.
+- **Partitioned storage in the jar**: one top-level context, as Go's `cookiejar`.
+- **A bundled Public Suffix List**: the list is MPL-2.0 data the caller supplies; without one the jar is fail closed.
+- **A quote-aware `Cookie`-header scan** (CPython `http.cookies` keeps `a="x;y"` as one value): every `;` ends a pair, as in Go's `readCookies` and the browsers; a quote-aware read let `a="s; session=S; z="` hide `session` (a cookie sandwich).
+- **A bare `"` inside a value** (`a=x"y`) is yielded as is, where Go drops that cookie; the parser is non-validating on read.
 
 ## Backlog / deferred
-- ~~**Jar: `__Host-` / `__Secure-` cookie prefixes (RFC 6265bis §4.1.3) not enforced on ingest**~~ — **DONE 2026-11-19.** `Jar.setCookieAt` ignores a cookie whose name starts with `__Secure-` unless it carries `Secure`, and one starting with `__Host-` unless it carries `Secure`, is host-only (any `Domain` the Public Suffix List lets through makes it a domain cookie, the host's own name included; with no list a `Domain` naming the host stays host-only) and has an explicit `Path=/` attribute (the draft's §5.7 text; a missing or invalid `Path` attribute does not count). A refused cookie is ignored entirely, a deletion (`Max-Age=0`) included, as the draft says. Basis: the draft is spec-MANDATORY for a user agent; curl (`Curl_cookie_add`) enforces both, matching case-sensitively, with the effective path rather than the attribute; browsers enforce them (Chrome and Firefox match the prefix without regard to case); Go `net/http/cookiejar` and Python `http.cookiejar` do no prefix handling (from their sources, not re-fetched this wave). The prefix match is case-insensitive like the builder's (`SetCookie.check`): stricter than the draft text, the safe direction. No opt-out option: no legitimate client wants a `__Host-` cookie without the guarantees the prefix promises. Behaviour change versus the Go oracle on prefixed names only (no oracle vector uses one). Delta mutation 2026-11-19: 10 mutants over the two prefix conditions, the three `__Host-` clauses, the explicit-path test and the case-insensitive match, 10 killed; the card counts are cumulative (old + 10).
-- **Delta mutation 2026-11-20** (backlog batch: the `Cookie`-header scanner, `writeCookiesAt`'s top-256 selection and one-pass purge, `private.seal*`'s message-limit refusal): first run 23 mutants over the first (quote-aware) scanner variant, 22 killed at once, 1 by a new test, 0 equivalent. After the independent review replaced that scanner by a split on every `;` and cached the top-k slot, a second run of 7 mutants over the new lines (the separator, the last-segment fallback, the worst-slot cache and its three conditions): 7 killed, 0 equivalent. The 23 first-run mutants of the dropped scanner code stay in the count. Card counts are cumulative (941/997 + 30 = 971/1027).
-- ~~**2026-11-07 — whole-module mutation run (807 mutants)** left A1 one step short (mutant 676 in `signed.verifyBody`)~~ — **done 2026-11-07**: ctgrind target `verify2` (two keys, key 0 matches) kills it (1 in-file context vs 0); the overlap guards of `private.seal`/`sealTimedNonce` (mutants 723/742, former panics, now `NoSpaceLeft`) are pinned by a test; mutant 677 (`std.mem.eql`) is killed by `check-ct-compare`; the four burn bypasses around the seal/open bodies (716/722/736/760) are judged equivalent under a ReleaseFast stackprobe with key and plaintext needles (sibling burn mutants killed by the same probe). Tally: 806 counted (688 inert, replaced by 806), 757 killed, 49 equivalent.
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** `Jar.writeCookiesAt` collected at most 256 matches BEFORE the path-length sort (C-4, **DONE 2026-11-19**: when the 256 slots are full a later match replaces the last one in §5.4 order if it sorts before it, so the 256 sent are the first 256 in send order); the expired purge was `orderedRemove` per entry (C-5, **DONE 2026-11-19**: one compaction pass); still open: the jar spin lock is held across the caller's writer (C-5; fixing it needs a copy of the matches, i.e. an allocation or a bounded buffer, a design choice); `private.seal` did not check `value.len` against AES-GCM's `max_message_len` (needs a ~64 GiB `out`, C-6; **DONE 2026-11-19**: `error.InvalidValue`).
-
-- ~~P1 again (2026-10-23): `build` 1.59× fasthttp~~ — **done 2026-10-24** (1.11–1.13×, see
-  Performance). The 2026-10-24 sized-slice attempt that gave only -4–5 % had kept the checks and
-  copies in one function; splitting them is what freed the rest.
-
-- **From the 2026-10-23 review (LOW, not defects of a documented promise):** `writeCookiesAt`
-  sends at most 256 matching cookies, the first 256 in storage order rather than the most specific
-  (DONE 2026-11-19, see the sweep entry above); (the client jar's §5.7 `__Host-` / `__Secure-` ingest rules: done 2026-11-19); an unbalanced `"` in a `Cookie`
-  header swallows the later pairs (DONE 2026-11-19: the scanner splits on every `;`, quoted or not, then strips one matching DQUOTE pair per value, as Go's `readCookies` (from its source, not re-fetched this wave) and the browsers do and as RFC 6265 §4.1.1/§5.4 implies (a sent cookie-value has no `;`). An earlier same-day variant that kept a quote-aware span for a closed `"..."` still let `a="s; session=S; z="` hide `session` (cookie sandwich; found by the independent review), so the quote-aware read is dropped. Judged divergence from CPython `http.cookies` (`a="x;y"` is one value there): `golden_test.zig`. Recorded LOW: a value holding a bare `"` (`a=x"y`) is yielded as is, where Go drops that cookie)); `percentDecode` asserts
-  `out.len >= in.len` rather than returning an error (DONE 2026-11-07: it returns `error.NoSpaceLeft`).
-- **Constant time (low, found 2026-10-18 pre-tag sweep)**: the public `percentEncode`/`percentDecode` helpers use a hex table / `charToDigit` (root.zig ~368-423) and `isCookieValue` switches per byte (~214, ~281-296) — over a session id on Set-Cookie write. Not used internally with secrets; a CT variant if a consumer needs one.
-None recorded before the 2026-09-30 survey.
-
-- **A public punycode / IDNA module** (2026-10-05) — `psl.toAscii` punycodes the list's Unicode
-  rules (RFC 3492 encoding, no UTS #46 mapping) privately here; a client that has a Unicode host
-  name needs the full IDNA mapping first, and `http.Url` refuses non-ASCII. A module of its own is
-  the natural home. Effort: medium (UTS #46 tables). Fits §2: yes.
-- **Jar persistence** (2026-10-05) — save/load the non-session cookies. Go's jar has none either.
-
-- ~~**`Set-Cookie` response-header parser**~~ — **DONE 2026-10-05** (`jar.SetCookie.parse`). Was: (survey 2026-09-30) — needed by anything that acts as an HTTP client with cookies (tests of our own server, scrapers); Go `ParseSetCookie` and cookie-rs have it. Effort: small (RFC 6265 §5.2). Fits §2: yes.
-- ~~**Signed / encrypted cookie values**~~ (survey 2026-09-30) — DONE 2026-10-12: `secure.zig` (`signed`, `private`, `Key`), cookie-rs-compatible; construction chosen by the session (owner left it): AEAD AES-256-GCM with the name as AD for `private`, name-bound HMAC by default for `signed`, cookie-rs's unbound format as an option.
-- ~~**Server-side expiry for signed/private values**~~ (2026-10-12) — DONE the same day (owner left the call to the session): `signed.signTimed`/`verifyTimed`, `private.sealTimed`/`sealTimedNonce`/`openTimed`; the issue time is inside the MAC / ciphertext, in a domain of its own (`"timed1" 0x00` before the name), so timed and untimed values never stand in for each other. Our format, not cookie-rs's.
-- ~~**Client-side `CookieJar`**~~ — **DONE 2026-10-05** (`Jar` + `PublicSuffixList`, the list supplied by the caller; no list = host-only cookies). Was: (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · codec · threadsafe` + deps: `http` (the `get`/`set` helpers only; parser + builder are
-std-only), `aesgcm` (`private` values) — canonical source is `pub const meta` in src/root.zig.
+- **Jar spin lock held across the caller's writer** (`Jar.writeCookiesAt` prints while locked): fixing it needs a copy of the matches, i.e. an allocation or a bounded buffer, a design choice.
+- **Constant-time `percentEncode`/`percentDecode`** (low): they use a hex table and `charToDigit`, and `isCookieValue` switches per byte; not used internally with secrets, so a constant-time variant waits for a consumer that needs one.
+- **A public punycode / IDNA module**: `psl.toAscii` punycodes the list's Unicode rules privately (RFC 3492, no UTS #46 mapping); a client with a Unicode host name needs the full IDNA mapping first, and `http.Url` refuses non-ASCII. A module of its own is the natural home. Effort medium (UTS #46 tables).
+- **Jar persistence**: save and load the non-session cookies. Go's jar has none either.
 
 ## Anchoring
 
@@ -264,5 +139,3 @@ std-only), `aesgcm` (`private` values) — canonical source is `pub const meta` 
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** src/golden_test.zig runs CPython 3.14.4's http.cookies as a black-box oracle over the Cookie-header parse direction (16 tests, 5 divergences judged against RFC 6265, one real quote-aware split bug found); the client jar is replayed against Go's net/http/cookiejar (src/jar_go_oracle.zig, 54 scenarios, 8 divergences judged: 2 Secure rules from 6265bis, 6 where Go is off RFC 6265) and the Public Suffix List against libpsl (src/psl_oracle.zig over our own mini list; `zig build interop-cookies` over the full system list, 40 476 hosts, 0 differ); and, since 2026-10-06, the Set-Cookie BUILD direction against **headless Chrome 154** (`tools/setcookie_oracle.js`, CDP; `Storage.getCookies` after the line was served by a raw socket) with Go 1.26's `net/http.ParseSetCookie` as a second reader (`tools/go_setcookie`): 65 `SetCookie` cases, where `write` must produce exactly the frozen line when Chrome stored what the fields mean and refuse otherwise, frozen in `src/setcookie_vectors.zig` and replayed by `src/setcookie_oracle_test.zig` (no Chrome, Go or bun in CI). Two classes decide where Chrome is not the judge: RFC_GRAMMAR (Chrome stores bytes the §4.1.1 grammar excludes and Go refuses -- refused: SP, `,`, `\\`, a lone `"`, non-ASCII, a non-token name) and CONTEXT (Chrome drops a Domain of another site or a public suffix, which the line alone cannot know -- written). Not anchored: nothing of the BUILD direction is left to the module's own tests alone
-
-**How it got there.** The anchoring work landed. DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged

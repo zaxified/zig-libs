@@ -17,15 +17,17 @@ const sid = cookies.find(req.header("cookie") orelse "", "session") orelse retur
 
 - `Cookie{ name, value }` — a parsed pair (borrows the header).
 - `parse(header) Iterator` / `Iterator.next() ?Cookie` — RFC 6265 §5.4: split on
-  `;`, OWS-trim, split each on the first `=` (valueless cookie ⇒ empty value),
+  every `;` (quoted or not), OWS-trim, split each on the first `=` (valueless cookie ⇒ empty value),
   strip a matching pair of surrounding DQUOTEs, skip empty-name segments.
 - `find(header, name) ?[]const u8` — the first value for `name`
   (case-sensitive).
 - `SetCookie{ name, value, path?, domain?, max_age?, expires?, secure, http_only,
-  same_site? }` + `write(w)` / `bufPrint(buf)` — the `Set-Cookie` header value,
+  same_site?, partitioned }` + `write(w)` / `bufPrint(buf)` — the `Set-Cookie` header value,
   attributes in RFC 6265 §4.1 order. Validates FIRST (name token, value
   cookie-octet, no header-injection bytes) so a rejected cookie never leaves a
-  half-written header; `SameSite=None` without `Secure` → `InsecureSameSiteNone`.
+  half-written header; `SameSite=None` without `Secure` → `InsecureSameSiteNone`, `partitioned`
+  without `Secure` → `InsecurePartitioned`, a `__Host-`/`__Secure-` name that
+  breaks its prefix rules is refused.
   `expires` is a pre-formatted date (module is std-only/dateless; prefer `max_age`).
 
 The parser is deliberately liberal (no charset validation on read); strictness
@@ -83,7 +85,10 @@ var client = http.Client.init(io, gpa, .{ .cookie_jar = jar.cookieJar() });
   cookie-date algorithm), §5.3 storage, §5.4 retrieval (longest path, then
   oldest), RFC 6265bis's Secure rules (`Secure` only from `https://`, a plain
   response cannot shadow a secure cookie), 4096-byte name+value cap, LRU
-  eviction past `max_cookies`/`max_per_domain`. Thread-safe.
+  eviction past `max_cookies`/`max_per_domain`, and the `__Secure-`/`__Host-`
+  name-prefix rules (§4.1.3: a cookie that breaks them is ignored, a deletion
+  included). At most 256 matching cookies are sent per request, the most
+  specific first. Thread-safe; the lock is held while the caller's writer runs.
   `setCookieAt`/`writeCookiesAt` take the time explicitly; `cookieJar()` is
   the `http.Client.CookieJar` view on the `Io`'s real clock, which the client
   calls for every request and response, redirect hops included.
@@ -93,9 +98,14 @@ var client = http.Client.init(io, gpa, .{ .cookie_jar = jar.cookieJar() });
   any domain.
 - `PublicSuffixList` — `parse(gpa, text)`, `publicSuffix`, `isPublicSuffix`,
   `registrableDomain`; ICANN and private sections, wildcards and exceptions,
-  Unicode rules matched in punycode (`psl.toAscii`). Not persisted, no
-  `Set-Cookie2`, no `SameSite` enforcement (that is a browser's context, not an
-  HTTP client's).
+  Unicode rules matched in punycode (`psl.toAscii`).
+
+## Not provided
+
+No server-side jar with delta tracking, no `Set-Cookie2`, no `SameSite`
+enforcement or partitioned storage in the client jar, no jar persistence, no
+bundled Public Suffix List, no IDNA mapping. See SPEC *What is deliberately not
+done* and *Backlog / deferred*.
 
 - **Role:** codec. **Platform:** any. **Deps:** `http`
   (the `get`/`set` helpers), `aesgcm` (`private` values), `datefmt` (the civil calendar under cookie-date); the parser + builder are std-only logic.
@@ -118,14 +128,9 @@ is shipped.
 
 ## Verification
 
-`zig build test-cookies` — offline tests (parser, builder, helpers below, plus the jar, psl and secure tests and the frozen python-oracle
-goldens). Parser (7): simple pairs + `find`, OWS trimming, valueless cookies,
-quoted/unbalanced values, a quoted value containing a `;`, empty-name skipping,
-degenerate headers. Builder (11): full attribute set, `__Host-`/`__Secure-`
-prefix constraints, minimal, Domain+Expires, negative Max-Age, Strict, invalid
-name/value/Path/Domain rejection, SameSite=None both branches, BufferTooSmall.
-Constants (1): `max_set_cookie_bytes` pinned by value and to `http`'s
-`header_copy_bytes`.
-`http` helpers (3): `get`+`set` over `http.Server.serveStream`, the cookie
-surviving the dead frame it was formatted in, and an over-long cookie refused
-rather than truncated. Green in Debug + ReleaseFast.
+`scripts/modtest cookies` (Debug and ReleaseFast): offline tests for the
+parser, the builder, the `http` helpers, the jar, the Public Suffix List and
+the signed/private values, plus frozen oracle goldens (CPython `http.cookies`,
+Go `cookiejar`, libpsl, headless Chrome, cookie-rs via pyca/cryptography).
+`zig build interop-cookies` runs libpsl over the system list. Details: SPEC
+*Verification*.
