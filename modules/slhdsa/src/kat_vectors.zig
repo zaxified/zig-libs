@@ -6,7 +6,7 @@
 //! Source: NIST ACVP demo vectors, github.com/usnistgov/ACVP-Server,
 //! `gen-val/json-files/SLH-DSA-keyGen-FIPS205/internalProjection.json` and
 //! `gen-val/json-files/SLH-DSA-sigGen-FIPS205/internalProjection.json`
-//! (retrieved 2026-07-11). Hex copied verbatim (lowercased) from the JSON.
+//! (retrieved). Hex copied verbatim (lowercased) from the JSON.
 //!
 //! Per parameter set: one keyGen case (seeds -> expected pk + sk) and one
 //! sigGen case (internal interface, deterministic) — exact tgId/tcId in
@@ -212,7 +212,7 @@ pub const shake_256f = struct {
 //
 // Source: NIST ACVP, same repository as above, `SLH-DSA-sigGen-FIPS205` and
 // `SLH-DSA-sigVer-FIPS205` `internalProjection.json` groups with
-// `"preHash": "preHash"` (signatureInterface external; retrieved 2026-10-11).
+// `"preHash": "preHash"` (signatureInterface external; retrieved).
 // Hex copied verbatim (lowercased); a sigGen case records the SHA-256 of its
 // expected signature instead of the 17 KB signature itself. Only the 128f sets are recorded (the
 // pre-hash layer is parameter-set independent); `ph` is the case's hashAlg.
