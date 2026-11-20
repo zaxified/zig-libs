@@ -104,5 +104,5 @@ run against the server as an external oracle, never copied or linked.
 
 TLS 1.2 and earlier and DTLS (the `dtls` module), kTLS itself (the record keys can be handed over),
 post-handshake client authentication, PSK without (EC)DHE and external PSKs, the early exporter,
-compressed client certificates and a built-in certificate compressor, ECH split mode: see `SPEC.md`
+compressed client certificates and a built-in certificate compressor, ECH split mode, encrypted private keys (decrypt with `keycodec` first): see `SPEC.md`
 under *What is deliberately not done* and *Backlog / deferred*.

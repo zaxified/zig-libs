@@ -956,6 +956,10 @@ Test classes, by area:
   CertificateRequest and a decompressor bounded by `max_leaf_len`): BoGo has no server test for it, so parity does not ask.
   **A built-in zlib / brotli / zstd helper** for server-side compression: the caller picks (`zstd` and `brotli` are modules
   here, zlib is in std).
+- **Encrypted private keys** (`ENCRYPTED PRIVATE KEY`, PBES2): `fromPem` refuses them (`UnsupportedKey`), as rustls
+  (`PrivateKeyDer` has no encrypted form) and Go's `X509KeyPair` do; OpenSSL alone asks a password callback. A caller with
+  an encrypted key decrypts it with `keycodec` (`parseEncryptedPrivateKeyPem`, then `writePrivateKeyPem`; the reader `keys.zig` and `acme` share) and
+  hands the plaintext PEM over.
 - **Staple parsing** (expiry, matching the leaf) and BoringSSL's server OCSP callback (`ServerOCSPCallback-*`, disabled by
   rustls too): the caller refreshes the staple; a staple per selected certificate already works through
   `Config.certificate.select`.
@@ -995,8 +999,6 @@ records (the per-record 4 KiB burn).
 - **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
   `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
   are unobservable today.
-- **Key loading.** Encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys: `fromPemEncrypted`); a private-key reader shared
-  with `acme` (request filed in `x509/SPEC.md` § Backlog).
 - **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
 - **Ticket count request** (RFC 9149).
 
