@@ -32,6 +32,8 @@ it yet — in particular the sibling `coap` codec does not depend on `oscore`
 | `root.zig` | Security context types (`SecurityContext`, `CommonContext`, `SenderContext`, `RecipientContext`); `ReplayWindow`; the CBOR/option codecs (`encodeInfo`, `encodeAadArray`, `encodeEncStructure`, `OscoreOption`); the 6 crypto cores (`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`, `unprotect`) — all REAL |
 | `kat_vectors.zig` | RFC 8613 Appendix C's official test vectors — all six C.1-C.3 key-derivation vectors (client + server) and all five C.4-C.8 protected-message vectors |
 | `kat_test.zig` | Byte-exact KAT assertions against every Appendix C field, plus tamper-rejection, replay-rejection, and an end-to-end round-trip test |
+| `burn.zig` | The dead-stack burn run around the key-handling entry points (`deriveKey`, `deriveContext`, `deriveContextInto`, `protect`, `unprotect`) |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `stackprobe2_test.zig`, `ctgrind_harness.zig` | Fuzz driver plumbing, dead-stack probes and the constant-time harness (verification only) |
 
 ## Import
 
@@ -48,6 +50,9 @@ var client_ctx = try oscore.deriveContext(
     allocator, master_secret, master_salt, id_context,
     sender_id, recipient_id, .aes_ccm_16_64_128,
 );
+
+// `deriveContextInto(&ctx, allocator, ...)` is the out-parameter twin: the keys
+// exist only in the caller's slot, never in a returned temporary.
 
 // Protect an outgoing message (the caller assembles `plaintext` per
 // §5.3 — CoAP Code + Class E options + payload marker + payload; the

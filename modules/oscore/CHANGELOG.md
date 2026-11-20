@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the five dead-stack burn mutants of the whole-module mutation, previously recorded as unobservable under ReleaseSafe, were run in a ReleaseFast schemata build and are killed by the stack probes; the card moves from 269/292 (23 eq) to 274/292 (18 eq). SPEC paragraph updated, no source change.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `root.zig` (292 mutants, 269 killed, 23 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts, no replay or AEAD survivor). 9 tests added at the end of `src/root.zig`: replay window edges (oldest slot, clamp, first update, equal seq, slide, far jump, trailing edge, lower-limit resume), CBOR and AAD encoders at every header width with exact-size buffers, `OscoreOption` limits and decode edges, `deriveContextInto` against `deriveContext` and its zeroing on failure, `AadTooLarge`, and responses not replay-checked. ctgrind source digests refreshed (counts unchanged). No source change, no behaviour change.
 - **2026-10-10** — tests: deterministic fuzz driver `OSCORE_FUZZ` (testkit) over `OscoreOption.decode` (canonical re-encode) and a full protect/unprotect exchange (request and both response shapes accepted; a flipped ciphertext/tag bit, truncation, extra octet, changed AAD field or Partial IV, wrong key refused; replay refused). No change to the library code.
 - **2026-10-09** — Dead-stack sweep, part 2. `protect` and `unprotect` now run under a 4 KiB
   per-message burn (`burn.msg_burn`); new `deriveContextInto(out, …)` writes the context into
@@ -71,15 +69,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   keys and the ciphertext. Teeth: an OR-fold over the Sender Key at the top of `protect`
   moves that row to 1 and fails the gate.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
-  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
-  helper existed **33 times across 12 modules in three shapes**, each carrying its
-  own note about the same trap (the returned array has to be container-level or
-  the slice dangles with the right length and garbage behind it). Proved
-  byte-identical to the copies it replaces before they were deleted, and the
-  comparison test was itself broken on purpose first to show it was not vacuous.
-  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
-  imports changed.
 
 - **2026-09-06** — A1 security audit, the HIGH findings fixed. **Consumer-visible:**
   three new error values. `protect` returns `error.MessageTooLong` for a plaintext

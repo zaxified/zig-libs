@@ -68,9 +68,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   build a CoAP message themselves. They operate on the §5.3 "plaintext"
   and §5.4 "options" as opaque caller-supplied byte strings. **No module
   in this repository calls it** — the sibling `coap` codec does not depend
-  on `oscore`, and no seam between the two is built (A1 F16, 2026-09-13:
-  the earlier wording promised that integration as if it existed). A
-  consumer writes that wiring itself.
+  on `oscore`, and no seam between the two is built. A consumer writes
+  that wiring itself.
 - **Exchange tracking is the caller's job**: matching a response back to
   the request that generated it (needed for §5.2's "reuse the request's
   nonce" majority case) is NOT this module's concern — `unprotect`'s
@@ -120,15 +119,23 @@ external_aad = bstr .cbor aad_array
 aad_array = [ oscore_version, [ alg_aead ], request_kid, request_piv, options ]
 ```
 
-`encodeAadArray` (REAL) builds `aad_array`'s bytes directly. `encodeEncStructure`
-(REAL, plain RFC 8152 COSE, not OSCORE-specific) wraps an already-serialized
+`encodeAadArray` builds `aad_array`'s bytes directly. `encodeEncStructure`
+(plain RFC 8152 COSE, not OSCORE-specific) wraps an already-serialized
 byte string as `Enc_structure`'s third array element — note that
 `external_aad`'s own CBOR encoding IS just "wrap these bytes in a bstr
 header"; `encodeEncStructure`'s `external_aad` parameter takes the RAW
 `aad_array` bytes and does that wrapping itself, matching the RFC's own
-"`external_aad = bstr .cbor aad_array`" notation. `buildAad` is the
-two-line composition of both. Every one of these three functions was
-hand-verified against Appendix C.4's worked example while writing them:
+"`external_aad = bstr .cbor aad_array`" notation. `buildAad(dst, params)`
+writes the same `Enc_structure` bytes straight into a caller buffer by a
+different, allocation-free route (`error.BufferTooSmall` rather than a
+truncated AAD); `buildAadLen(params)` is its exact size. `protect`/`unprotect`
+build the AAD in a `max_aad_len` (192-byte) stack buffer — room for CBOR
+overhead, 7-byte `request_kid`/`request_piv` and 128 bytes of Class I
+options (no Appendix C vector has any) — and fail with `error.AadTooLarge`
+beyond it; a deployment whose Class I options routinely exceed that calls
+`buildAad` directly with a larger buffer. `encodeAadArray` and
+`encodeEncStructure` stay the allocating reference encoders that the KATs pin
+byte-exact beside `buildAad`. All of them reproduce Appendix C.4's worked example:
 `aad_array = 0x8501810a40411440` (8 bytes: array(5), uint(1), array(1)
 containing uint(10), then three bstrs of length 0/1/0), and the full
 `AAD = 0x8368456e63727970743040488501810a40411440` (20 bytes: array(3),
@@ -168,9 +175,13 @@ invariants matter:
    that inference would be wrong: it has a Partial IV in the option, yet
    is still a response, still never replay-checked).
 
-`window_size` is bounded to 64 by the `u64` bitmap backing — RFC 8613
-does not mandate an exact size ("may be different in the two endpoints",
-§3.2), and 64 comfortably covers the §3.2.2 stated default of 32.
+`window_size` (a `u7`, default 32 = the §3.2.2 stated default) is clamped to 64
+by the `u64` bitmap backing (`effWindow`) — RFC 8613 does not mandate an exact
+size ("may be different in the two endpoints", §3.2), and 64 comfortably covers
+the default. A forward jump larger than the window clears the mask; a jump of
+exactly the window keeps the old highest marked (it still sits at the trailing
+edge, which `check` treats as in range), so it cannot be accepted a second
+time.
 
 ## Persistence — RFC 8613 §7.5, Appendix B.1 (the state that is NOT the keys)
 
@@ -181,14 +192,13 @@ about them: an endpoint that keeps a Security Context across a reboot
 previously received messages**. `deriveContext` cannot help with either —
 it is a pure function of the §3.2 inputs, so calling it again after a
 restart yields the SAME keys with the sequence number back at 0 and an
-EMPTY replay window. Concretely (measured by the 2026-09-05 audit):
+EMPTY replay window. Concretely:
 
 - the first message after the re-derivation is sealed under the SAME
   `(key, nonce)` as the first message before it — AES-CCM is CTR mode, so
   the XOR of the two ciphertexts is the XOR of the two plaintexts, and the
   second plaintext falls out **without the key** (a two-time pad);
-- every request captured before the restart replays cleanly (500/500 in
-  the audit's probe), because the fresh window has nothing to compare
+- every request captured before the restart replays cleanly, because the fresh window has nothing to compare
   against.
 
 This module has no nonvolatile storage and no CoAP layer, so it cannot
@@ -289,35 +299,42 @@ always correct.
   CBOR encoders handle only PUBLIC data (sequence numbers, IDs, option
   bytes) and have no constant-time obligation.
 
-  **Measured since 2026-09-08**, instead of asserted. The instrument is
-  committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
-  `scripts/checks/ctgrind.sh oscore`. Zig 0.16.0, valgrind 3.26.0, x86_64,
-  `ReleaseFast`:
+  **Measured**, not asserted. The instrument is
+  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+  `scripts/checks/ctgrind.sh oscore` (x86_64, `ReleaseFast`, the secret tainted;
+  the expected in-file counts are pinned in `scripts/checks/ctgrind-expected.tsv`,
+  and the script requires 0 from every untainted-control and no-`-fvalgrind`
+  trap row):
 
-  | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
-  |---|---|---:|---:|---:|---:|
-  | `derive` | master secret | 4 | **0** | 0 | 0 |
-  | `protect` | derived Sender Key | 2 | **0** | 0 | 0 |
-  | `unprotect` | derived Recipient Key | 3 | **1** | 0 | 0 |
+  | target | tainted | in-file |
+  |---|---|---:|
+  | `derive` | master secret | **0** |
+  | `protect` | derived Sender Key | **0** |
+  | `unprotect` | derived Recipient Key | **1** |
 
-  ⚠ **The two zeros are zeros with a witness.** The probe that first took this
-  measurement (audit F8) reported `derive` and `protect` as 0 in-file out of a
-  total of **0**, and that is not a result — a total of zero is what a harness
-  that never reaches the module reports too. This harness prints the derived
-  keys and the ciphertext through `std.debug.print`, which is not
-  constant-time by design, so the totals of 4 and 2 show the taint arriving and
-  the in-file zero means "no branch found".
+  ⚠ **The two zeros are zeros with a witness.** A total of zero is not a result
+  — it is what a harness that never reaches the module reports too. This
+  harness prints the derived keys and the ciphertext through `std.debug.print`,
+  which is not constant-time by design, so the totals are non-zero (the taint
+  demonstrably arrives) and the in-file zero means "no branch found".
 
-  The single `unprotect` context is std's `if (!valid)` at `aes_ccm.zig:152`,
-  two lines after the `crypto.timing_safe.eql` that produced `valid`. Branching
-  on the answer is the API; the comparison is the constant-time one. It appears
+  The single `unprotect` context is std's `if (!valid)` in `aes_ccm.zig`, two
+  lines after the `crypto.timing_safe.eql` that produced `valid`. Branching on
+  the answer is the API; the comparison is the constant-time one. It appears
   only here because only `unprotect` verifies a tag.
 
-  **Teeth, measured 2026-09-08.** An OR-fold over the Sender Key and a compare,
-  injected at the top of `protect`, moves that row from **0 in-file to 1** and
-  fails `--check`. Reverted; `cmp` confirmed byte-identical.
-
   **Limit:** memcheck sees branches and addresses, not cache timing.
+
+- **Key material on the dead stack.** `deriveKey`, `deriveContext` and
+  `deriveContextInto` run their body one frame down under `burn.run`
+  (`src/burn.zig`) and then zero 8 KiB of the stack below (`derive_burn`);
+  `protect`/`unprotect` do the same with 4 KiB (`msg_burn`). `deriveContext`
+  also wipes its three derived-value locals (the returned context is a copy),
+  and `deriveContextInto` writes the keys only into the caller's slot and
+  zeroes it on error. What stays is what lies outside those frames: the
+  caller's own copies of the context, and any copy `std.crypto`'s AES/HMAC left
+  deeper than the burn reaches (`src/stackprobe_test.zig` and
+  `src/stackprobe2_test.zig` are the gate; see *Verification*).
 
 ## The six crypto cores (all implemented)
 
@@ -331,10 +348,9 @@ construction step-by-step:
    Recipient Key, Common IV — the last ALWAYS with `id = &.{}`) assembled
    into a `SecurityContext`.
 3. **`computeNonce`** (§5.2) — the XOR construction detailed above.
-4. **`buildAad`** (§5.4) — `encodeAadArray` (already real) wrapped via
-   `encodeEncStructure` (already real); a two-line composition kept as
-   its own core per this module's task brief (byte-exact-gated
-   independently of `protect`/`unprotect`, not just transitively).
+4. **`buildAad`** (§5.4) — the allocation-free writer described under
+   *The §5.4 AAD*, byte-exact-gated independently of `protect`/`unprotect`,
+   not just transitively.
 5. **`protect`**/**`unprotect`** (§8.1-§8.4) — `computeNonce` +
    `buildAad` + `std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt`/`.decrypt`,
    plus (`unprotect` only) the `ReplayWindow` check-then-verify-then-
@@ -347,60 +363,55 @@ ciphertext/option value, plus a tamper-rejection test, a replay-rejection
 test, and an end-to-end round trip with fresh (non-published) key
 material.
 
-What Appendix C alone cannot see, and what the module's own tests add on
-top of it (A1 audit, 2026-09-06 — each was a mutation that had survived
-the Appendix C suite green): a request genuinely delivered twice through
-`unprotect`; the default window width exercised at its edge (Partial IV
-40, then 8 accepted, 7 rejected); a response opened with a
-`request_nonce_source.id` that differs from `recipient.id`; non-empty
-Class I `options` changing the tag; `kid` AND `kid context` both
-non-empty (every published vector has at most one); and the guards
-`MessageTooLong`, `PartialIvTooLarge`, `IdTooLong`, `MissingPartialIv`,
-sub-tag-length payloads, and the Appendix B.1 restart procedures.
-
 ## Verification
 
-- `zig build test-oscore` and `-Doptimize=ReleaseFast` both go green;
-  `zig fmt --check modules/oscore/` clean.
-- `zig build run-example-oscore` walks two full exchanges, a replay, a
-  tamper, and a simulated reboot with Appendix B.1 recovery.
-- **Key material on the dead stack** (audit F7): `deriveContext` wipes its
-  three derived-value locals and then zeroes the stack region its HKDF/
-  HMAC callees vacated (the entry point's 8 KiB dead-stack burn, `src/burn.zig`, once per derivation).
-  Measured with the audit's probe re-pointed at heap-resident needles so
-  the caller's own live copies do not count: in ReleaseSafe/ReleaseFast
-  the derived keys were found 1-2 times below the caller before, at most
-  once after (that copy sits at the probe wrapper's own return slot). The
-  per-message path is NOT scrubbed: `protect`/`unprotect` leave std's
-  AES-128 round-key schedule behind (its first round key is the Sender/
-  Recipient Key itself) — 6 copies in Debug, 1 in release modes — and a
-  per-message scrub would cost as much as the AEAD call it follows. That
-  residue is a property of `std.crypto`'s AES, recorded here rather than
-  hidden.
+- **Run:** `scripts/modtest oscore` (add `-Doptimize=ReleaseFast` for the dead-stack probes, which skip in Debug);
+  `zig build run-example-oscore` walks two full exchanges, a replay, a tamper and a simulated reboot with Appendix
+  B.1 recovery.
+- **Known answers:** every RFC 8613 Appendix C vector (`src/kat_vectors.zig`, asserted by `src/kat_test.zig`), as
+  listed under *The six crypto cores*; the vectors are anchored externally, see *Anchoring*.
+- **Beyond Appendix C:** a request genuinely delivered twice through `unprotect`; the default window width at its
+  edge (Partial IV 40, then 8 accepted, 7 rejected); a response opened with a `request_nonce_source.id` that
+  differs from `recipient.id`; non-empty Class I `options` changing the tag; `kid` and `kid context` both
+  non-empty (every published vector has at most one); the guards `MessageTooLong`, `PartialIvTooLarge`,
+  `IdTooLong`, `MissingPartialIv`, `AadTooLarge` and sub-tag-length payloads; the Appendix B.1 restart procedures
+  across a simulated restart; `protect` making exactly one allocation per message.
+- **Replay window:** the window at its oldest slot and clamp (sizes 64, 100, 127), a jump of exactly
+  `window_size` keeping the old highest marked, an equal sequence number changing nothing, sliding keeping what
+  was seen, a far jump forgetting it, `resumeAtLowerLimit`, and a response unprotected with a window that rejects
+  the same bytes as a request (only requests are replay-checked).
+- **Codecs:** `encodeInfo` and `buildAad`/`buildAadLen` against the allocating encoders at every header width up
+  to 4 bytes (0, 23, 24, 255, 256, 65535, 65536 bytes in each of kid, piv and options) with exact-size and
+  one-short buffers; the `OscoreOption` encode limits and decode truncation, reserved bits and flags;
+  `deriveContextInto` against `deriveContext`, and its zeroed output on an allocation failure.
+- **Fuzz:** deterministic driver, `OSCORE_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`, harnesses in
+  `src/root.zig`): `oscore-option` (arbitrary bytes into `OscoreOption.decode`: only typed errors, and what is
+  accepted re-encodes to the same fields) and `oscore-exchange` (what `protect` issues is accepted by `unprotect`
+  on the peer, every damaged copy is refused with `AuthenticationFailed` and leaves the window alone, a second
+  delivery is `Replayed`).
+- **Dead stack:** `src/stackprobe_test.zig` (`deriveKey`) and `src/stackprobe2_test.zig` (`deriveContextInto`,
+  `protect`, `unprotect`) scan the stack below the call for the master secret and the derived keys; they run in
+  optimized builds only and go red when a body outgrows its burn.
+- **Constant time:** `scripts/checks/ctgrind.sh oscore`, the rows under *Threat model / limits*.
+- **Mutation:** whole-module over every non-test line of `src/root.zig` and the `burn.run` wiring (`needsCheckpoint`,
+  `resumeAfterRestart`, the whole `ReplayWindow`, both CBOR encoders, `encodeInfo`, `encodeAadArray`,
+  `encodeEncStructure`, `buildAad`/`buildAadLen`, `OscoreOption`, the three derive functions, `computeNonce`,
+  `protect`, `unprotect`). Not mutated: the constants, `meta`, the `std.debug.assert`s. No replay or AEAD
+  survivor.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-### Replay-window edge, 2026-10-05
+## What is deliberately not done
 
-`ReplayWindow.update` cleared the mask on a forward jump of exactly `window_size`, though the old
-highest then sits at `diff == window_size`, which `check` treats as in range — so it was
-accepted a second time. Found in `aeadframe`'s copy of this window by that module's mutation
-run; fixed the same way here (`shift > window` clears, `shift == 64` keeps only the old
-highest's bit). Test: "a jump of exactly window_size keeps the old highest marked", verified
-red with the old condition.
-
-## Audit 2026-11-17 (whole-module mutation)
-
-292 mutants over every non-test line of `src/root.zig` and the `burn.run` wiring of `src/burn.zig`: `needsCheckpoint` and `resumeAfterRestart` (wrapping and exhaustion), the whole `ReplayWindow` (clamp, `check`, every branch and bit of `update`, `resumeAtLowerLimit`), both CBOR encoders (every width of every head, major types, `cborHeadLen`), `encodeInfo`, `encodeAadArray`, `encodeEncStructure`, `buildAad`/`buildAadLen`, `OscoreOption` encode/decode (flags, lengths, truncation, reserved bits), `deriveKey` / `deriveContext` / `deriveContextInto` (inputs, labels, ids, errdefer wipe, stack wipes, burn), `computeNonce` (every byte of Figure 8), and `protect` / `unprotect` (length ceilings, nonce sources, replay check and update order, AAD, key and nonce arguments, error mapping). Two schemata rounds, ReleaseSafe; one more compile was an unmutated build after a kit input error.
-
-221 mutants died on the existing suite, 71 survived the first round, and 9 tests added at the end of `src/root.zig` kill 48 of them: the window at its oldest slot and clamp (sizes 64, 100, 127), the first update resetting a stale mask, an equal sequence number changing nothing, sliding keeping what was seen, a far jump forgetting it, the trailing edge recorded, `resumeAtLowerLimit` to the oldest bit; `encodeInfo` and `buildAad` / `buildAadLen` against the allocating encoders at every header width up to 4 bytes (0, 23, 24, 255, 256, 65535, 65536 bytes in each of kid, piv and options) with exact-size and one-short buffers; the `encode` limits (a 6-byte Partial IV, kid contexts of 255 and 256 bytes, the empty option); `decode` of a kid alone, an empty kid context and exact-fit truncation; `deriveContextInto` against `deriveContext` (three keys, ids, the three differing from each other) and its zeroed output on an allocation failure; `AadTooLarge` from both `protect` (nothing burned) and `unprotect`; and a response unprotected with a window that rejects the same bytes as a request (§8.4: only requests are replay-checked, the window is left alone). 269 mutants die in total; no replay or AEAD survivor, so no finding.
-
-18 do not die, none of them a defect: 8 EQUIVALENT (a redundant fall-through after the first update; bits beyond the window that `check` never reads; xor for or on disjoint bits; the three redundant buffer bounds in the AAD writer; `protect`'s exhaustion test that `computeNonce` repeats with the same mapped error, and its unreachable error arm) and 10 UNOBSERVABLE (7 need a byte string of 4 GiB or more for the 8-byte CBOR head; 3 are the key-local wipes in `deriveContextBody`: the three locals are copied by value into the returned context, so the probe cannot use them as needles there, and the `derive_burn` that runs after them overwrites the frame anyway, a redundant wipe in depth). The 5 dead-stack burn mutants that an earlier round recorded as unobservable under the ReleaseSafe schemata (`burn.run` removed around `deriveKey`, `deriveContext`, `deriveContextInto`, `protect`, `unprotect`) were rerun in a ReleaseFast schemata build, where the stack probes (`stackprobe_test.zig`, `stackprobe2_test.zig`) execute: all 5 killed (`FAIL (DeadStackResidue)`), so they count as killed (274/292). Not mutated: the constants, `meta`, the `std.debug.assert`s. `scripts/checks/ctgrind.sh --check oscore` moved only the source digests (counts unchanged); `--update-digests oscore` was run. Counts on the card are whole-module.
+- **Glue to the sibling `coap` message type** (extracting Class E options, building the outer message): left to
+  the caller by design, as libOSCORE leaves it to a CoAP-library adapter; see *Threat model / limits* and the
+  README. A `coap` + `oscore` integration example would be the natural place.
 
 ## Backlog / deferred
 
-- **EDHOC (RFC 9528) key exchange** *(survey 2026-09-30)*: OSCORE is used with a pre-shared master secret only, which is the deployment problem the IETF built EDHOC to solve; aiocoap has experimental EDHOC (README) and points at the `lakers` implementation. No sibling. Large (a month: CBOR/COSE, X25519/P-256, signatures, test vectors from RFC 9529 *(inferred)*); fits §2 (`std.crypto` covers the primitives).
-- **Group OSCORE** (draft-ietf-core-oscore-groupcomm) *(survey 2026-09-30)*: multicast use; needs signature countersignatures. Large; fits §2. Moving draft, not an RFC yet as far as checked *(inferred)*; defer.
-- **Other AEAD algorithms** (AES-CCM-16-64-128 only today; `Algorithm` enum has one member) *(survey 2026-09-30)*: RFC 8613 makes only AES-CCM-16-64-128 mandatory; ChaCha20-Poly1305 (COSE 24) and AES-GCM are the usual additions on hardware without CCM offload. Small (nonce length and ID width become algorithm-dependent); fits §2. Candidate for "deliberately not doing" if the maintainer wants MTI only.
-- **Glue to the sibling `coap` message type** (extracting Class E options, building the outer message) *(survey 2026-09-30)*: left to the caller BY DESIGN (SPEC "Threat model / limits", README "CoAP-agnostic by design"), as libOSCORE also leaves it to a CoAP-library adapter. Not filed as a gap; a `coap`+`oscore` integration example is the natural place.
+- **EDHOC (RFC 9528) key exchange**: OSCORE is used with a pre-shared master secret only, which is the deployment problem the IETF built EDHOC to solve; aiocoap has experimental EDHOC (README) and points at the `lakers` implementation. No sibling. Large (a month: CBOR/COSE, X25519/P-256, signatures, test vectors from RFC 9529 *(inferred)*); fits §2 (`std.crypto` covers the primitives).
+- **Group OSCORE** (draft-ietf-core-oscore-groupcomm): multicast use; needs signature countersignatures. Large; fits §2. Moving draft, not an RFC yet as far as checked *(inferred)*; defer.
+- **Other AEAD algorithms** (AES-CCM-16-64-128 only today; `Algorithm` has one member): RFC 8613 makes only AES-CCM-16-64-128 mandatory; ChaCha20-Poly1305 (COSE 24) and AES-GCM are the usual additions on hardware without CCM offload. Small (nonce length and ID width become algorithm-dependent); fits §2. Candidate for "deliberately not doing" if the maintainer wants MTI only.
 
 ## Anchoring
 
