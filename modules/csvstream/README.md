@@ -90,6 +90,11 @@ A leading UTF-8 BOM is detected and stripped automatically on the first
 chunk of `StreamReader.next()`; the standalone `stripBom(bytes)` covers
 in-memory callers driving `LineIterator` directly.
 
+`StreamReader.seekTo(byte_offset)` jumps to a record start saved from
+`LineSlice.byte_offset` (or 0) and reads on from there; `init` refuses a
+nonsensical dialect (a newline byte as delimiter/quote/escape/comment, delimiter
+equal to quote/escape/comment) with `error.InvalidDialect`.
+
 ## Writing (RFC 4180 quoting-on-output)
 
 ```zig
@@ -104,7 +109,8 @@ configured delimiter, quote char, CR, or LF, doubling any embedded quote char
 (RFC 4180 §2 rule 7). `WriteOptions` configures `delimiter`, `quote` (`0`
 disables quoting, mirroring the reader's convention), `line_terminator`
 (`.crlf` — the RFC 4180 default — or `.lf`), `quote_style`, `escape` and
-`comment` (see "Dialect options"). Stateless and streaming to any
+`comment` (see "Dialect options"). `writeFieldQuoted` quotes one field even where
+`necessary` would not (an empty text vs a null). Stateless and streaming to any
 `*std.Io.Writer`, same style as the sibling `csvsafe` module's `writeSafe`.
 
 Note: a writer-emitted field with an embedded `\n`/`\r` is valid RFC 4180, but
@@ -232,6 +238,6 @@ inconsistent fixture pair. See NOTICE for provenance.
 A custom record terminator and a multi-byte delimiter, a push-parser DFA, input
 transcoding (compose with the `encoding` module), writer `NonNumeric` quoting, and
 reading quoted newlines by default (`.span` is the opt-in) are refused by design;
-struct/serde mapping, seek, dialect sniffing and a full SIMD tokenizer are open
+struct/serde mapping, dialect sniffing and a full SIMD tokenizer are open
 items. The reasons and the open items are in `SPEC.md`, *What is deliberately not done*
 and *Backlog / deferred*.

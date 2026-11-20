@@ -143,6 +143,21 @@ pub const ChunkReader = struct {
         self.span = line.SpanScanner.init(quote, c);
     }
 
+    /// Repositions the reader so the next chunk starts at file offset
+    /// `byte_offset`, which the caller must know to be the start of a record
+    /// (a `LineSlice.byte_offset` it saw earlier, or 0). The residual and the
+    /// EOF state are dropped; no I/O happens here, the next `nextChunk` reads
+    /// from the new offset. An offset at or past the end of the file simply
+    /// yields no more chunks.
+    pub fn seekTo(self: *ChunkReader, byte_offset: u64) void {
+        self.buffer.items.len = 0;
+        self.last_emit_len = 0;
+        self.chunk_start_in_file = byte_offset;
+        self.bytes_read = byte_offset;
+        self.eof = false;
+        self.clean = 0;
+    }
+
     /// Where the chunk ends: one past the last record boundary in the buffer,
     /// or null when the buffer holds no complete record yet. Lazy mode: the
     /// last `\n`. Span mode: scan records forward from the residual's start
@@ -273,6 +288,17 @@ pub const ChunkReader = struct {
     }
 };
 
+fn isNewline(b: u8) bool {
+    return b == '\n' or b == '\r';
+}
+
+fn validateDialect(opts: StreamReader.Options) error{InvalidDialect}!void {
+    if (isNewline(opts.delimiter)) return error.InvalidDialect;
+    if (opts.quote != 0 and (isNewline(opts.quote) or opts.quote == opts.delimiter)) return error.InvalidDialect;
+    if (opts.escape != 0 and (isNewline(opts.escape) or opts.escape == opts.delimiter)) return error.InvalidDialect;
+    if (opts.comment != 0 and (isNewline(opts.comment) or opts.comment == opts.delimiter)) return error.InvalidDialect;
+}
+
 /// Unified streaming CSV reader: composes `ChunkReader` (file → record-aligned
 /// chunks) with a per-chunk `LineIterator` (chunk → records). `next()` returns
 /// one `LineSlice` at a time with an ABSOLUTE file byte offset, in bounded
@@ -356,7 +382,14 @@ pub const StreamReader = struct {
         fields_per_record: line.FieldCheck = .none,
     };
 
+    /// Refuses a dialect that cannot be read consistently (`error.InvalidDialect`):
+    /// a newline byte (`\n`, `\r`) as delimiter, quote, escape or comment, the
+    /// delimiter equal to the quote, the escape or the comment (Go's
+    /// `Reader.Comma` validation; Python's `csv` refuses a newline delimiter
+    /// too). A `0` quote, escape or comment means "none" and is never compared.
+    /// `escape == quote` stays valid: it is the doubling convention.
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, opts: Options) !StreamReader {
+        try validateDialect(opts);
         var chunks = try ChunkReader.initMax(io, alloc, file, opts.chunk_size, opts.max_record_len);
         var lines = LineIterator.initOpts("", 0, .{ .quote = opts.quote, .escape = opts.escape, .comment = opts.comment });
         if (opts.quoted_newlines == .span) {
@@ -392,6 +425,27 @@ pub const StreamReader = struct {
 
     pub fn deinit(self: *StreamReader) void {
         self.chunks.deinit();
+    }
+
+    /// Seek to the record that starts at file offset `byte_offset` (rust-csv
+    /// `Reader::seek`; offsets are the absolute `LineSlice.byte_offset` values
+    /// `next` returned, or 0 for the start of the file). The next `next` reads
+    /// from there, in either direction. The offset must be a record start, as
+    /// the reader cannot tell: seeking into the middle of a record yields a
+    /// partial first record, and inside a `.span` record the quote state is
+    /// not recovered. A seek to 0 re-strips a leading BOM. `line_number` and
+    /// `record_index` restart from 1 and 0 at the seek point (not recoverable
+    /// from a byte offset, exact only after a seek to 0; a caller that saved
+    /// them with the offset may set `lines.line` / `lines.record` after the
+    /// seek). `fields_per_record` / `field_check` keep the count already
+    /// learned. Offsets at or past the end of the file make `next` return null.
+    pub fn seekTo(self: *StreamReader, byte_offset: u64) void {
+        self.chunks.seekTo(byte_offset);
+        self.checked_bom = byte_offset != 0;
+        self.lines = if (self.chunks.span) |scanner|
+            LineIterator.initSpanScanner("", 0, scanner)
+        else
+            LineIterator.initOpts("", 0, .{ .quote = self.quote, .escape = self.lines.escape, .comment = self.lines.comment });
     }
 
     /// Returns the next CSV record with its absolute file byte offset, or null
@@ -1044,4 +1098,115 @@ test "StreamReader .span: a quote right after a leading BOM opens a field, in th
     try t.expectEqual(@as(u64, 3), r0.byte_offset);
     try t.expectEqualStrings("d,e", (try sr.next()).?.bytes);
     try t.expect((try sr.next()) == null);
+}
+
+test "StreamReader.seekTo: every record offset re-reads the same tail, forward and back, any chunk size" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "aa,1\nbb,\"x,y\"\ncc,3\ndd,4\nee,5\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    const starts = [_]u64{ 0, 5, 14, 19, 24 };
+    const texts = [_][]const u8{ "aa,1", "bb,\"x,y\"", "cc,3", "dd,4", "ee,5" };
+    for ([_]usize{ 1, 3, 7, 64 }) |chunk| {
+        var sr = try StreamReader.init(t.io, t.allocator, f, .{ .chunk_size = chunk, .max_record_len = 64 });
+        defer sr.deinit();
+        // Read everything (EOF state reached), then seek to each start, in a
+        // scrambled order, and read the rest of the file from there.
+        while (try sr.next()) |_| {}
+        for ([_]usize{ 3, 0, 4, 2, 1 }) |k| {
+            sr.seekTo(starts[k]);
+            for (k..texts.len) |j| {
+                const rec = (try sr.next()) orelse return error.TestUnexpectedResult;
+                try t.expectEqualStrings(texts[j], rec.bytes);
+                try t.expectEqual(starts[j], rec.byte_offset);
+            }
+            try t.expect((try sr.next()) == null);
+        }
+        // At and past the end: no records, no error.
+        sr.seekTo(body.len);
+        try t.expect((try sr.next()) == null);
+        sr.seekTo(body.len + 100);
+        try t.expect((try sr.next()) == null);
+    }
+}
+
+test "StreamReader.seekTo: a seek to 0 strips the BOM again, a seek elsewhere keeps counters from the seek point" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "\xEF\xBB\xBFa,1\nb,2\nc,3\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{});
+    defer sr.deinit();
+    const first = (try sr.next()).?;
+    try t.expectEqualStrings("a,1", first.bytes);
+    try t.expectEqual(@as(u64, 3), first.byte_offset);
+    _ = (try sr.next()).?;
+    sr.seekTo(0);
+    const again = (try sr.next()).?;
+    try t.expectEqualStrings("a,1", again.bytes);
+    try t.expectEqual(@as(u64, 3), again.byte_offset);
+    try t.expectEqual(@as(u64, 1), again.line_number);
+    try t.expectEqual(@as(u64, 0), again.record_index);
+    sr.seekTo(11);
+    const c = (try sr.next()).?;
+    try t.expectEqualStrings("c,3", c.bytes);
+    try t.expectEqual(@as(u64, 11), c.byte_offset);
+    try t.expectEqual(@as(u64, 1), c.line_number);
+}
+
+test "StreamReader.seekTo: .span mode re-reads a multi-line record and keeps the learned field count" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "h1,h2\n1,\"p\nq\"\n2,r\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{ .quoted_newlines = .span, .field_check = .first_record, .chunk_size = 4, .max_record_len = 64 });
+    defer sr.deinit();
+    while (try sr.next()) |_| {}
+    sr.seekTo(6);
+    const r1 = (try sr.next()).?;
+    try t.expectEqualStrings("1,\"p\nq\"", r1.bytes);
+    try t.expect(r1.spanned);
+    try t.expectEqual(@as(u64, 6), r1.byte_offset);
+    const r2 = (try sr.next()).?;
+    try t.expectEqualStrings("2,r", r2.bytes);
+    try t.expect((try sr.next()) == null);
+}
+
+test "StreamReader.init: a nonsensical dialect is refused, escape == quote and zeros are fine" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = "a,b\n" });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    const bad = [_]StreamReader.Options{
+        .{ .delimiter = '"' }, // delimiter == quote
+        .{ .delimiter = '\n' },
+        .{ .delimiter = '\r' },
+        .{ .quote = '\n' },
+        .{ .quote = '\r' },
+        .{ .escape = ',' }, // escape == delimiter
+        .{ .escape = '\n' },
+        .{ .comment = ',' }, // comment == delimiter
+        .{ .comment = '\r' },
+        .{ .delimiter = '\'', .quote = '\'' },
+    };
+    for (bad) |o| try t.expectError(error.InvalidDialect, StreamReader.init(t.io, t.allocator, f, o));
+    const good = [_]StreamReader.Options{
+        .{},
+        .{ .quote = 0 }, // quote 0 = none; a delimiter of 0 is not compared with it
+        .{ .escape = '"' }, // doubling convention
+        .{ .escape = '\\', .comment = '#' },
+        .{ .delimiter = '\t', .quote = 0, .escape = 0 },
+        .{ .delimiter = ';', .quote = '\'' },
+    };
+    for (good) |o| {
+        var sr = try StreamReader.init(t.io, t.allocator, f, o);
+        sr.deinit();
+    }
 }

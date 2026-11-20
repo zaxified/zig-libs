@@ -84,7 +84,24 @@ fn needsQuoting(field: []const u8, opts: WriteOptions) bool {
 /// if `needsQuoting` says it must be — the common case of a plain field costs
 /// nothing beyond the scan.
 pub fn writeField(w: *std.Io.Writer, field: []const u8, opts: WriteOptions) std.Io.Writer.Error!void {
-    if (!needsQuoting(field, opts)) {
+    return writeFieldImpl(w, field, opts, false);
+}
+
+/// `writeField` for one field that must be quoted even when `necessary` would
+/// leave it bare, e.g. an empty text that has to stay distinct from a null on
+/// the wire (`""`, as polars' `write_csv` and Python's `csv.writer` with a
+/// per-field `QUOTE_ALL` write it). Still refuses to quote where the options
+/// do: `quote == 0` and `quote_style == .never` write the field verbatim.
+pub fn writeFieldQuoted(w: *std.Io.Writer, field: []const u8, opts: WriteOptions) std.Io.Writer.Error!void {
+    return writeFieldImpl(w, field, opts, true);
+}
+
+fn writeFieldImpl(w: *std.Io.Writer, field: []const u8, opts: WriteOptions, force: bool) std.Io.Writer.Error!void {
+    const quoted = if (force)
+        opts.quote != 0 and opts.quote_style != .never
+    else
+        needsQuoting(field, opts);
+    if (!quoted) {
         try w.writeAll(field);
         return;
     }
@@ -192,6 +209,28 @@ test "writeRecord: a one-empty-field record survives its own round trip" {
     var n: usize = 0;
     while (it.next()) |_| n += 1;
     try t.expectEqual(@as(usize, 3), n);
+}
+
+test "writeFieldQuoted: forces quotes on an empty or plain field, honours never and quote 0" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeFieldQuoted(&w, "", .{});
+    try w.writeByte('|');
+    try writeFieldQuoted(&w, "a\"b", .{});
+    try w.writeByte('|');
+    try writeFieldQuoted(&w, "plain", .{});
+    try w.writeByte('|');
+    try writeFieldQuoted(&w, "x", .{ .quote_style = .never });
+    try w.writeByte('|');
+    try writeFieldQuoted(&w, "", .{ .quote = 0 });
+    try w.writeByte('|');
+    try writeFieldQuoted(&w, "", .{ .quote = '\'', .escape = '\\' });
+    try t.expectEqualStrings("\"\"|\"a\"\"b\"|\"plain\"|x||''", w.buffered());
+    // writeField is unchanged for the same inputs.
+    w = std.Io.Writer.fixed(&buf);
+    try writeField(&w, "", .{});
+    try writeField(&w, "plain", .{});
+    try t.expectEqualStrings("plain", w.buffered());
 }
 
 test "writeRecord: custom delimiter and quote char" {

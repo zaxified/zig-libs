@@ -142,6 +142,10 @@ pub const QuoteStyle = writer.QuoteStyle;
 /// only if it contains the delimiter, the quote char, a CR, or a LF.
 pub const writeField = writer.writeField;
 
+/// `writeField` that quotes the one field even when `necessary` would not
+/// (an empty text kept distinct from a null); honours `.never` and `quote == 0`.
+pub const writeFieldQuoted = writer.writeFieldQuoted;
+
 /// Writes one full record: fields joined by the delimiter, each quoted per
 /// `writeField`, terminated per `opts.line_terminator`.
 pub const writeRecord = writer.writeRecord;
