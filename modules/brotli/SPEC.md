@@ -26,14 +26,14 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [google/brotli](https://github.com/google/brotli) — **reference**, **fastest** | C | MIT | 14.9k | v1.2.0 (2025-10-27), pushed 2026-10-14 | Qualities 0–11 (q11 `alice29.txt` 46 487 B vs our `.q11` 46 378 B, `.q9` 50 994 B); streaming encoder (process / flush / finish / metadata) and a decoder resumable on both input and output; LGWIN/mode/size-hint parameters; large window (RFC 9841); raw prefix and serialized shared dictionaries on both ends (1.1.0+) — what RFC 9842 `dcb` needs; metadata callbacks. This module: complete RFC 7932 decoder (one-shot, into a buffer, push stream), four encoder efforts, one-shot or streamed (`StreamWriter`: flush / finish / reset), window bits 10–24. The fastest implementation in the field too (rust-brotli is a port, the Go one a translation — inferred). |
+| [google/brotli](https://github.com/google/brotli) — **reference**, **fastest** | C | MIT | 14.9k | v1.2.0, pushed 2026-10-14 | Qualities 0–11 (q11 `alice29.txt` 46 487 B vs our `.q11` 46 378 B, `.q9` 50 994 B); streaming encoder (process / flush / finish / metadata) and a decoder resumable on both input and output; LGWIN/mode/size-hint parameters; large window (RFC 9841); raw prefix and serialized shared dictionaries on both ends (1.1.0+) — what RFC 9842 `dcb` needs; metadata callbacks. This module: complete RFC 7932 decoder (one-shot, into a buffer, push stream), four encoder efforts, one-shot or streamed (`StreamWriter`: flush / finish / reset), window bits 10–24. The fastest implementation in the field too (rust-brotli is a port, the Go one a translation — inferred). |
 | [dropbox/rust-brotli](https://github.com/dropbox/rust-brotli) | Rust | BSD-3-Clause + MIT (`LICENSE.MIT` in repo) | 945 | pushed 2026-09-02 | Port of the reference: q0–11 (q0–9 bit-identical to C), `Read`/`Write` streaming, raw prefix (≤ 15) and serialized dictionaries, multithreaded compression, catable/appendable streams, `no_std`. *(README)* |
 | [andybalholm/brotli](https://github.com/andybalholm/brotli) | Go | MIT | 740 | pushed 2026-10-12 (tags, no releases) | Translation of the reference C: qualities 0–11, `io.Reader`/`io.Writer`; experimental `matchfinder` encoders (`NewWriterV2`). The common Go choice for `Content-Encoding: br`. *(README)* |
 | [muhammad-fiaz/brotli.zig](https://github.com/muhammad-fiaz/brotli.zig) | Zig | MIT | 2 | pushed 2026-10-05 (no releases) | README *claims* q0–11 with block splitting, large window, custom/compound dictionaries, a resumable streaming decoder and `std.Io` adapters; no published test evidence *(unverified)*. |
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
-| Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
+| Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; multithreaded compression of one stream (`parallel.compress`, 2026-10-16), which of the field only rust-brotli has, whose bytes do not depend on the worker count; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.q9` 0.72–0.95× q9's time (2026-10-15); a raw prefix dictionary searched from `.q1` (google from q5: its q1–q4 streams against a dictionary are the ones without it), prepared once for any number of compressions at google's prepared time or below from `.q4` (2026-10-16). **Where we are behind:** no NPOSTFIX/NDIRECT search below `.q11` (google neither: its q4–q9 take the mode's fixed pair, as ours), no OMIT_FIRST dictionary words; no static-dictionary words at `.q6` (google from q5; owner's choice for speed, small UTF-8 inputs 12 % larger); `.q6` on inputs of 4–64 KiB 0.87–1.10× google's time when both allocate from glibc's malloc, but a one-shot `compressWith` 1.1–2.4× under Zig 0.16's `smp_allocator`, which maps the 256 KiB match table afresh for each call (and leaks on the block writer's allocations, a std defect — R16; `Compressor`: 0.89–1.11×, no growth); `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (a fixed cost per call; 0.44–0.89× from 16 KiB); `.q11` at q11's size on text and fonts (−0.2…+0.9 %, 2026-10-16), 3.8 % behind on the generated `font_like` and 7 % on `cp852-utf8` (706 B) (→ Backlog R12).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; multithreaded compression of one stream (`parallel.compress`), which of the field only rust-brotli has, whose bytes do not depend on the worker count; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.q9` 0.72–0.95× q9's time; a raw prefix dictionary searched from `.q1` (google from q5: its q1–q4 streams against a dictionary are the ones without it), prepared once for any number of compressions at google's prepared time or below from `.q4`. **Where we are behind:** no NPOSTFIX/NDIRECT search below `.q11` (google neither: its q4–q9 take the mode's fixed pair, as ours), no OMIT_FIRST dictionary words; no static-dictionary words at `.q6` (google from q5; owner's choice for speed, small UTF-8 inputs 12 % larger; see *What is deliberately not done*); `.q6` on inputs of 4–64 KiB 0.87–1.10× google's time when both allocate from glibc's malloc, but a one-shot `compressWith` 1.1–2.4× under Zig 0.16's `smp_allocator`, which maps the 256 KiB match table afresh for each call (and leaks on the block writer's allocations, a std defect; `Compressor`: 0.89–1.11×, no growth); `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (a fixed cost per call; 0.44–0.89× from 16 KiB); `.q11` at q11's size on text and fonts (−0.2…+0.9 %), 3.8 % behind on the generated `font_like` and 7 % on `cp852-utf8` (706 B) (accepted: see *What is deliberately not done*).
 
 ## Scope & honesty
 
@@ -48,16 +48,15 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 
 All of the following are fully implemented:
 
-- **Stream header**: window bits (WBITS 10..24). The large window (RFC 9841 §6, 2026-10-14):
+- **Stream header**: window bits (WBITS 10..24). The large window (RFC 9841 §6):
   with `Options.large_window` the `1 000 100 0` marker and a 6-bit WBITS up to 62 (30 on a 32-bit
   target); without it, `InvalidWindowBits`, as google/brotli without its parameter. A large-window
   stream's distance codes are read as from the 62-bit alphabet (simple codes' symbol width) but only
   those whose largest distance stays within 0x7FFFFFFC are valid (`tables.distanceLimit`: whole
   groups of `1 << NPOSTFIX` codes) — google/brotli's limit, which the RFC allows a decoder.
   Anchored on 6 libbrotli large-window streams (WBITS 25 and 30, copies from 17 MiB back), decoded
-  by `decompress` and `decompressStream` and refused without the option; negative control: read with
-  the 24-bit alphabet, the 4 far-copy streams fail.
-- **Raw prefix dictionary** (RFC 9841 §3.2, 2026-10-14; `Options.dictionary`, all three decoders):
+  by `decompress` and `decompressStream` and refused without the option.
+- **Raw prefix dictionary** (RFC 9841 §3.2; `Options.dictionary`, all three decoders):
   distances `max_distance + 1 .. max_distance + D` copy from the dictionary at
   `D + max_distance - distance`, running on into the window's oldest byte past its end; they enter
   the distance ring like any copy; static-dictionary word ids start past them; literal contexts at
@@ -66,10 +65,10 @@ All of the following are fully implemented:
   Anchored on 20 streams libbrotli 1.2.0 made with a raw dictionary (5 cases × q2/5/9/11: long
   dictionary copies, copies running from the dictionary into the window, inputs past a 64 KiB and a
   1 KiB window, binary), decoded by all three decoders in the replay test; q5+ streams are checked to
-  need their dictionary. Negative control: without the ring push, 8 of them fail. Not exercised by
+  need their dictionary. Not exercised by
   any committed stream: a dictionary copy that runs on into the window once the output has passed
   `max_backward` (libbrotli did not emit one on the corpus).
-- **Serialized shared dictionaries** (RFC 9841 §5, 2026-10-15; `parseSharedDictionary` →
+- **Serialized shared dictionaries** (RFC 9841 §5; `parseSharedDictionary` →
   `Options.shared_dictionary`, all decoders): custom word lists (4–31 bytes), custom transform lists
   (stringlets up to 255 bytes; operations 0–22, the new ShiftFirst/ShiftAll on 7/11/16/21-bit SCALARs
   with a sign-extended ADDEND), up to 64 word/transform pairs, chosen by the literal context's map
@@ -85,15 +84,12 @@ All of the following are fully implemented:
   replay test and refused or mis-decoded without the dictionary. The packaged libbrotli refuses
   serialized dictionaries ("DO NOT USE … will fail"); the oracle is google/brotli built from source
   with `BROTLI_EXPERIMENTAL` (`interop -- --brotli-src DIR`; v1.2.0 tarball sha256
-  `816c96e8…6477dfec`, security-reviewed 2026-10-15 before it was compiled: system headers, process/
-  file/network calls, asm (ARM only), constructors (table init), data headers — clean). Negative
-  controls: the RFC's triplet order crashes on the first ShiftAll reference (index 22 of 5
-  stringlets); ignoring the context map fails the 3 context streams. The parser is tested on every
+  `816c96e8…6477dfec`, security-reviewed before it was compiled: system headers, process/
+  file/network calls, asm (ARM only), constructors (table init), data headers — clean). The parser is tested on every
   truncation, a byte more, and single-byte changes of each dictionary (it found a `u8` overflow on a
   255-byte stringlet); the differential fuzz driver decodes damaged dictionary streams (40 000 runs).
 - **End of stream**: the fill bits after the last meta-block must be zero (RFC 7932 §9.2 "should be
-  rejected"; `InvalidPadding` since 2026-10-15, as google/brotli — which takes `0x3f` and refuses
-  `0xff`; before, `0xff` decoded to nothing).
+  rejected"; `InvalidPadding`, as google/brotli — which takes `0x3f` and refuses `0xff`).
 - **Meta-block structure**: `ISLAST`, `ISLASTEMPTY`, `MNIBBLES`/`MLEN`,
   `ISUNCOMPRESSED`, and metadata meta-blocks (`MSKIPLEN`, skipped); the
   "no leading-zero final nibble/byte" rules are enforced.
@@ -145,42 +141,37 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
 **uncompressed** meta-block. Implemented:
 
 - **Effort** (`compressWith(gpa, input, .{ .effort = … })`; `compress` = `.default` = `.q6`): the
-  levels are named after the google/brotli quality they stand in for (2026-10-15, owner: the old
-  names `.fast`/`.default`/`.best`/`.max` read as Go's `BestSpeed`/`BestCompression`, which they were
-  not — `.fast` was not the fastest quality, `.best` was q9 while Go's best is q11). `.qN` promises
+  levels are named after the google/brotli quality they stand in for. `.qN` promises
   about quality N's size in at most about its time; streams are not byte-identical (not a goal).
   `Effort.fromQuality(0..11)` maps a C/Go quality to the nearest level at or above it (2..3 → `.q4`).
-  `.q1` (2026-10-15, R13) is a parse and a writer of its own (`FragMatcher`, `buildFrag`,
+  `.q1` is a parse and a writer of its own (`FragMatcher`, `buildFrag`,
   `writeFragmentBlock`): one slot per bucket, first match, growing step, one code per category.
-  `.q0` (2026-10-16) is google/brotli's quality 0 ported (`writeQ0`, `compress_fragment.c`; NOTICE):
+  `.q0` is google/brotli's quality 0 ported (`writeQ0`, `compress_fragment.c`; NOTICE):
   one pass that writes each match as it finds it — "insert N, copy 2" with the distance, then "insert
   0, copy the rest" at the last distance — with a literal code built from the block's bytes first and
   the command and distance codes of the previous meta-block (google's defaults for the first);
   96 KiB meta-blocks grown by 64 KiB while the bytes suit the literal code. It ignores a dictionary,
-  as google's quality 0 does. Older dated entries below use the old names: `.fast` = `.q4`, `.default` =
+  as google's quality 0 does. Some passages below use the old names: `.fast` = `.q4`, `.default` =
   `.q6`, `.best` = `.q9`, `.max` = `.q11`. `.q4` is its
-  own algorithm (2026-10-14): 4 slots of a 6-byte hash plus the last distance, a lazy step only for
+  own algorithm: 4 slots of a 6-byte hash plus the last distance, a lazy step only for
   matches under 32 bytes, sparse inserts inside long copies, growing steps through long literal runs,
   one literal code per block. `.q6` walks 32 bucket candidates (on binary data their tags compared at
   once), `.q9` 256; both build the meta-block as google/brotli's qualities 4–9 do — greedy block
-  splitting and a static literal context map (below, 2026-10-15); `.q11` (2026-10-15, R2) parses by shortest path with static-dictionary words (below). Every level is blessed by the reference separately (below).
-- **LZ77 by saved bits** (2026-09-30): a bucketed hash over 4-byte hashes (a hash chain until
-  2026-10-14; `.fast` hashes 6 bytes), one lazy step, matches of 4 to
+  splitting and a static literal context map (below); `.q11` parses by shortest path with static-dictionary words (below). Every level is blessed by the reference separately (below).
+- **LZ77 by saved bits**: a bucketed hash over 4-byte hashes (`.fast` hashes 6 bytes), one lazy step, matches of 4 to
   65 535 bytes. A candidate is scored by the bits it saves — its length times the block's order-0
   literal entropy, minus about log2(distance) + 6 bits of naming — and the best score wins, not the
-  longest match; a match that saves nothing is not taken. Before this, longest-match-wins made a
-  *deeper* search *worse* on random text over a small alphabet (`alpha5_flat`: 10 417 bytes at depth 8,
-  10 613 at 256; now 9 688 / 9 766), and the old 512-byte cap left `zeros` at 651 bytes (now 26).
+  longest match; a match that saves nothing is not taken.
   Matches may reach back across meta-block boundaries but never past the end of the current block, so
   `MLEN` always matches the bytes the commands produce exactly.
-- **Distance short codes and implicit distances** (2026-09-30): `DistRing` mirrors the decoder's ring of
+- **Distance short codes and implicit distances**: `DistRing` mirrors the decoder's ring of
   the last four distances (RFC 7932 §4: code 0 = last, not pushed again; 1..3 older ones; 4..15 last or
   second-last ±1..3; every other code pushes). A distance the ring can name gets its short code (no
   extra bits); a copy at the last distance whose insert/copy lengths fit an implicit-distance command
   (insert code < 8, copy code < 16) carries no distance symbol at all. The ring persists across
   meta-blocks as the decoder's does, and a block that is stored instead rolls it back.
   `quickfox_repeated` 606 → 58 bytes, `backward65536` 178 → 19.
-- **`.q6`/`.q9` meta-block model** (2026-10-15, `greedy_split.zig`, **ported from google/brotli
+- **`.q6`/`.q9` meta-block model** (`greedy_split.zig`, **ported from google/brotli
   1.2.0** `metablock.c`/`metablock_inc.h`/`encode.c`, MIT — see NOTICE): the literal, command and
   distance streams are each split greedily in one pass — every 512 / 1 024 / 512 symbols the block so
   far joins the last block's type, takes the second-last type, or opens a new one, by the entropy of
@@ -188,12 +179,8 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   context mode with a static map of one, two (after a continuation byte or not; `.q6` at most two) or
   three contexts (after ASCII / lead / continuation byte), chosen from the bigram entropy of the top
   two bits of 64-byte samples every 4 KiB; each (type, context) gets its own code, no clustering.
-  Replaced the clustered model and the iterative splitter at these levels (they are `.q11`'s now):
-  `.q9` font 1.89× → 0.72× q9's time, text 1.02× → 0.91×; `.q6` font 1.42× → 1.03× (with the in-slot
-  tag compare and context-free literal emission below). Sizes moved to the reference's: `alice29.txt`
-  `.q6` 51 327 → 52 275 (q6 51 967), `.q9` 50 536 → 51 361 (q9 51 054); font payload `.q9` 103 645 →
-  117 940 (q9 114 948). The 13-context map google uses from 1 MiB of input: since 2026-10-16 (R14).
-- **Static-dictionary words at `.q9`** (2026-10-15, R15; port of google/brotli `SearchInStaticDictionary`
+  The clustered model and the iterative splitter are `.q11`'s. From 1 MiB of input the 13-context map google uses is chosen (`chooseStaticContexts`, *Large inputs* below).
+- **Static-dictionary words at `.q9`** (port of google/brotli `SearchInStaticDictionary`
   / `TestStaticDictionaryItem` and the `dictionary_hash.c` table, MIT, see `NOTICE`): where the hash
   finds no copy, the two words `dictionary_hash.zig` keeps for the position's first four bytes (one of
   8+ bytes, one shorter; 6 031 of 32 768 buckets used) are compared, and the longer prefix taken as
@@ -204,15 +191,15 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   50 994 (q9 51 054), html −0.6 %, json −0.26 %, `cp852-utf8` 541 → 500 (q9 483), fonts ±0.1 %.
   Time: instructions +0–4 % before `findWord` took both buckets' lengths in one load and compared
   eight bytes a step, ≈ 0 after; cycles 0–5 % in one binary switched at run time. Not at `.q6`:
-  there it cost 5–10 % (bench, 2026-10-15) for 0.25–0.7 % of size on the payloads — owner's choice.
-- **Tag compare a bucket at once** (2026-10-15, `.q6`): on a binary block the 32 slots' tags (their
+  there it cost 5–10 % (bench) for 0.25–0.7 % of size on the payloads — owner's choice.
+- **Tag compare a bucket at once** (`.q6`): on a binary block the 32 slots' tags (their
   top byte) are compared in one vector operation and only matching slots visited
   newest first, the idea of google/brotli's H58 hasher (`matching_tag_mask.h`; its tag bytes in an
   array of their own cost us 7 % on text in the extra stores). Font `.q6` −10 % cycles; text as before.
-- **Literals without contexts** (2026-10-15): when every literal block type has one code for all its
+- **Literals without contexts**: when every literal block type has one code for all its
   contexts, the writer does not compute contexts (google's `literal_context_map_size == 0`). `.q6`
   font −6 %.
-- **Literal context modelling** (2026-09-30, `.default`/`.best`; since 2026-10-15 `.q11` only): per-context literal histograms (64
+- **Literal context modelling** (`.q11` only): per-context literal histograms (64
   contexts from the two previous bytes) for the UTF8 mode, and for blocks under 95 % ASCII also LSB6
   and SIGNED, clustered greedily — merge the pair
   whose union costs the fewest extra estimated bits (entropy plus a per-code header guess), while that
@@ -220,13 +207,13 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   (no RLE, no move-to-front). Skipped below 256 literals and when the block's literals are near 8
   bits each (random or compressed data). Because the choice rests on an estimate, a block that uses
   more than one literal code is written again with one, and the really shorter one is kept. SIGNED
-  wins on fonts (1.2–2.2 % smaller, 2026-10-15; libbrotli 1.2.0 decodes those streams); MSB6 never won
+  wins on fonts (1.2–2.2 % smaller; libbrotli 1.2.0 decodes those streams); MSB6 never won
   on anything measured and is not tried. `cp852-utf8` 536 → 436 bytes (q5:
   482), `monkey` 421 → 387 (q11: 405).
 - **Prefix codes**, built from the block's own symbol frequencies: *simple* codes (3.4) for alphabets
   of 1..4 used symbols — the only legal encoding when there is exactly one — and *complex* codes (3.5)
   above that, including the `REPEAT_PREVIOUS` (16) / `REPEAT_ZERO` (17) run-length codes.
-- **Counts smoothed for the code header** (2026-10-16, R16; port of google/brotli
+- **Counts smoothed for the code header** (port of google/brotli
   `BrotliOptimizeHuffmanCountsForRle`, MIT, see `NOTICE`): before the lengths of a meta-block's
   literal, command and distance codes are built (`.q4` up, as google from quality 4), strides of
   counts close to their running mean become that mean and isolated zeros among small counts ones, so
@@ -235,24 +222,21 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   `tools/c_oracle/rle_counts_kat.c`). On a 64 KiB font slice at `.q6` the code headers went 2 403 →
   686 B (google's: 686); bench payloads: font `.q6` 118 465 → 117 002, `.q9` 117 868 → 115 737,
   `.q11` 101 326 → 101 155; text, html, json ±0.1 %.
-- **`.q6` through literal runs** (2026-10-16, R16; google `CreateBackwardReferences`, MIT): 64
+- **`.q6` through literal runs** (google `CreateBackwardReferences`, MIT): 64
   literals past the last copy's start plus twice its length, the next 8 positions are only inserted,
   every second one, and from 4 × 64 further on the next 16, every fourth; after a copy from less
   than a quarter of its length back only its last 4 × distance positions are inserted, so a run does
   not fill its bucket with itself. Two-byte copies are taken at the last two ring distances, as
-  google's (`len == 2 && i < 2`; `.q9` too). Was a ramp of steps after `.q4`'s, every position of a
-  copy inserted, two bytes at the last distance only.
+  google's (`len == 2 && i < 2`; `.q9` too).
 - **Length-limited Huffman**: code lengths are bounded (15 for the data alphabets, 5 for the
   code-length alphabet) by raising a floor under the symbol counts and rebuilding until the tree fits.
 - **Window bits**: 16, or 21 when the input is longer than 65 520 bytes.
 
-- **Distance contexts** (2026-10-15, all efforts): a distance's code depends on its copy's length (2,
+- **Distance contexts** (all efforts): a distance's code depends on its copy's length (2,
   3, 4, 5+; RFC 7932 §7.2). The four histograms go to one to four codes — the cheapest of the 15
   partitions by estimated bits plus 12 for the map — and a distance context map is written when
-  more than one. `alice29.txt`: `.default` 51 467 → 51 327, `.best` 50 736 → 50 536. (**Streams of
-  `.fast`/`.default`/`.best` changed with it**; re-blessed.)
-- **`.max`: shortest-path parse** (2026-10-15, R2; rebuilt 2026-10-16 on google/brotli's zopfli,
-  R12). For a block: every position's candidates are collected once — from the bucketed hash (copies
+  more than one.
+- **`.max`: shortest-path parse** (on google/brotli's zopfli parse). For a block: every position's candidates are collected once — from the bucketed hash (copies
   each longer than any nearer one, ≤ 16; `max_cands` — 16, 32 and 48 gave the same sizes), the
   nearest earlier copy of 2 and of 3 bytes (the last position of each 2-byte value and of each
   3-byte hash in the block; fonts −0.4…−1.2 %), and the static dictionary's words longer than the
@@ -274,23 +258,18 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   (below). A copy of 325 bytes or more is taken whole and its inside is not searched (a long run
   would cost its length squared). All three parses are written and **the shortest as written
   wins** — the estimate is not the code that comes out. A fourth/fifth pass gave nothing.
-  The parse before 2026-10-16 kept one cheapest path per position with its own ring, so a copy at a
-  ring distance of a path that was not the cheapest there was never seen: each refit left fewer
-  commands (NotoSansMono 46 792 → 43 391 → 40 423, the second refit larger than the first), and q11
-  had twice its 3-byte copies, most at the last distance (NotoSansEthiopic 8 142 implicit-distance
-  commands to 4 783). Its estimates were not biased (literals and commands both ~7 % over the
-  written bits); what was missing was the other paths. Tried on the way and dropped: buckets of
+  Tried on the way and dropped: buckets of
   2 048 slots (−0.1 %), google's initial cost model and windowed literal prices for the first
   refit (+0.3…+2.5 %), one literal histogram without contexts (text +0.6 %), 100/50 split
   histograms and 10 rounds (±1 %), a one-byte quick reject before a ring copy's length (8–20 %
   slower: the length compare is cheap and the extra branch is not), probing each distinct ring
   once per position (no measurable gain), five starts on binary blocks.
-- **NPOSTFIX / NDIRECT** (2026-10-16, `.q11`): per meta-block, google/brotli's search
+- **NPOSTFIX / NDIRECT** (`.q11`): per meta-block, google/brotli's search
   (`BrotliBuildMetaBlock`, qualities 10–11): for NPOSTFIX 0..3, NDIRECT grows while the estimated
   bits of the commands' distance symbols and extra bits fall (`chooseDistParams`); distances are
   then written with them (`distanceCodeWith`, alphabets up to 520 symbols; never with a large
   window). Fonts −0.2…−0.45 % by itself, more with the parse priced by it.
-- **`Mode`** (2026-10-16, C1 of the S2 analysis; google/brotli's `BROTLI_PARAM_MODE`):
+- **`Mode`** (google/brotli's `BROTLI_PARAM_MODE`):
   `CompressOptions.mode` / `StreamOptions.mode` = `.generic` (default) / `.text` / `.font`.
   google's encoder reads it in one place only (`ChooseDistanceParams`): `.font` writes every
   meta-block from quality 4 with NPOSTFIX 1 / NDIRECT 12, and qualities 10–11 search from that
@@ -303,7 +282,7 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   on all three (its walk passes 1/12; google q11 is +0.1…+0.3 % *worse* with font mode on two).
   Streams of `.generic` unchanged; `.font` streams blessed by google/brotli (`font_q4/q6/q9/q11`,
   `stream_font_q6`).
-- **Static-dictionary words** (2026-10-15, `.max`; RFC 7932 §8): a word of 4..24 bytes with a transform
+- **Static-dictionary words** (`.max`; RFC 7932 §8): a word of 4..24 bytes with a transform
   is named by the distance `max_distance + 1 + (transform << size_bits[len]) + index` (explicit code,
   never a short one, ring untouched), with the word's length as the copy length; the command's
   `out_len` is what the transform produces. The search (`DictSearch`, built once per encoder) keeps
@@ -316,21 +295,16 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   off made the greedy parse win, 50 523 B, still a valid stream. Searched: identity, OMIT_LAST_1..9, UPPERCASE_FIRST,
   UPPERCASE_ALL with all 50 prefix/suffix strings — 113 of 121 transforms; the 8 OMIT_FIRST ones would
   need a suffix index (not done: a few of q11's 1 837 references on `alice29.txt` are of them).
-  With a prefix dictionary too since 2026-10-16: word ids then start past it (RFC 9841 §3.2), as
+  With a prefix dictionary too, word ids start past it (RFC 9841 §3.2), as
   in the decoder and google's `dictionary_start + gap`. Measured on
-  `alice29.txt`: 48 608 → 47 001 B, the largest single step of R2 (q11 puts 1 837 words there, ~13 KB
+  `alice29.txt`: 48 608 → 47 001 B, the largest single step of `.q11`'s work (q11 puts 1 837 words there, ~13 KB
   of the 152 KB); `SPEC.md` (this file) −6.4 %.
-- **Measured vs google/brotli 1.2.0** (2026-10-16): `alice29.txt` `.max` 46 378 B against q11 46 487
-  (**−0.23 %**; 46 935 before the zopfli parse); NotoSansMono-Thin 199 463 (q11 197 771, +0.86 %),
-  NotoSansEthiopic 98 537 (98 632), NotoLoopedLao 19 802 (19 817), `font_like` 101 326 (97 654,
-  +3.8 %), bench `json` 25 770 (25 711), `html` 12 042 (11 951); `monkey` 398 (405), `cp852-utf8`
-  386 (362). Time: 0.40–1.0× google/brotli q11 on the bench payloads (`c_q11_*`, 2026-10-16;
-  0.27–0.79× with the single-path parse). Memory: per position of a block 24 B of node, 8 of
+- **`.max` memory:** per position of a block 24 B of node, 8 of
   nearest short copies, 4 + 8 + 8 of prices, prefix sums and offsets, and up to 16 × 8 B of
   candidates and 24 × 6 B of words — tens of MB for a 1 MiB block of text, up to ~300 MB in the
   worst case; `.max` is not for untrusted input on a shared server.
 
-- **Block splitting** (2026-10-15, `.best`/`.max`; `block_split.zig`): the literal, insert-and-copy
+- **Block splitting** (`.best`/`.max`; `block_split.zig`): the literal, insert-and-copy
   and distance symbol streams are each cut into blocks of up to 32 types (RFC 7932 §6). Per category:
   up to 32 starting histograms from sampled windows, rounds (2 at `.best`, 4 at `.max`) of a
   Viterbi assignment — each symbol priced `-log2` of its share in a histogram, a fixed price per
@@ -343,12 +317,7 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   google q9 on all three measured), `.max` 4–6 %; text ±0.5 %. Time: `.best` +30 % on text, +55 %
   on the font-shaped payload.
 
-Deliberately *not* implemented, each costing some ratio: `NPOSTFIX`/`NDIRECT` below `.q11`, OMIT_FIRST
-dictionary transforms, block splitting at `.q4`; dictionary words at `.q4`/`.q6` (google searches them
-from q4 — at `.q6` they cost 5–10 % of its time, R15).
-
-- **Raw prefix dictionary** (2026-10-14; `CompressOptions.dictionary`, `StreamOptions.dictionary`;
-  since 2026-10-16 in a table of its own, `PreparedDictionary`): google/brotli's lean prepared
+- **Raw prefix dictionary** (`CompressOptions.dictionary`, `StreamOptions.dictionary`; indexed in a table of its own, `PreparedDictionary`): google/brotli's lean prepared
   dictionary, ported (`prepared_dictionary.zig`, from `compound_dictionary.c`, MIT, see NOTICE) —
   each position's first five bytes hashed to one of 2^17..2^22 buckets, the newest 32 positions
   of a bucket kept in runs addressed by 16-bit heads per slot of 2^7..2^12 buckets; built in two
@@ -360,20 +329,12 @@ from q4 — at `.q6` they cost 5–10 % of its time, R15).
   `.q4` its newest 8 where the window found no copy, `.q1` its newest one where the table had
   none; `.q0` none, as google's quality 0). A copy from the dictionary is named by
   `out_max + D - o` (`out_max` how far back the output reaches, up to 2^26 − 4) and ends at the
-  dictionary's end (google's too; until 2026-10-16 the dictionary sat in front of the input and a
-  copy ran on into the output). Static-dictionary words count past it, so `.q9`/`.q11` keep them.
+  dictionary's end (google's too). Static-dictionary words count past it, so `.q9`/`.q11` keep them.
   A raw `dictionary` is prepared for the call (no SHA-256) and gives exactly the bytes its
   `PreparedDictionary` gives (`prepared_dictionary`, lent, not copied; one serves concurrent
-  compressions); a stream prepares its copy once per `init`/`reset`. Measured 2026-10-16, responses
-  of 4–32 KiB against 16–256 KiB dictionaries (the bench html, TeX Live `doc.html`), window 22,
-  glibc's malloc on both sides: **prepared once** (google: `BrotliEncoderPrepareDictionary` once,
-  attached to a fresh encoder per response) `.q4` 0.83–1.02× q4's time and 9–18 % smaller (q4 does
-  not search it), `.q6` 0.90–0.97× at q6's size (+0.1…+1.3 %; was 0.98–7.03× and +5.8/+8.1 % on
-  html), `.q9` 0.10–0.16×, `.q11` 0.70–0.85× (−0.5…+0.5 %), `.q1` 1.17–1.44× q1's time for 14–21 %
-  smaller (q1 does not search it; our q1's own cost per call at 4 KiB, R16); **raw per call** against
-  google preparing per call: 0.28–1.22×. The interop `dict_*` cases (5 × our six efforts, 20 reference
+  compressions); a stream prepares its copy once per `init`/`reset`. The interop `dict_*` cases (5 × our six efforts, 20 reference
   streams at q2/5/9/11) re-blessed by libbrotli 1.2.0.
-- **Large window** (2026-10-14): `window_bits` above 24, to 30, makes a large-window stream (RFC
+- **Large window**: `window_bits` above 24, to 30, makes a large-window stream (RFC
   9841 §6): the 14-bit header, distance codes up to the 74th (to 0x7FFFFFFC), simple distance codes
   with 8-bit symbols (the 140-symbol alphabet the decoder reads them as from). Only decoders that
   ask for it accept it — not a browser's `br`. Blessed by libbrotli 1.2.0 on three cases × fast,
@@ -382,7 +343,7 @@ from q4 — at `.q6` they cost 5–10 % of its time, R15).
   `compress`/`decompress` put/check it around a dictionary stream; a streamed body is the header
   then a `StreamWriter` with the dictionary. Our windows are ≤ 16 MiB, as `dcb` requires. Against a
   `PreparedDictionary` (its `digest` is the SHA-256, taken once): `compressPrepared`, `headerFrom`.
-- **`Compressor`** (2026-10-16, R16): one encoder for call after call — `compress`/`compressInto`
+- **`Compressor`**: one encoder for call after call — `compress`/`compressInto`
   give `compressWith`'s/`compressInto`'s bytes, but the match finder's tables (kept while big
   enough, given back after 128 calls in a row needing under a third), the block writer's
   allocations (an arena kept across blocks and calls), the output buffer (the caller gets a copy)
@@ -390,9 +351,31 @@ from q4 — at `.q6` they cost 5–10 % of its time, R15).
   0.89–1.11× google q6 (one-shot 1.10–1.83×), `.q4` 0.31–1.23×, and memory flat at every level
   over 3 000 calls where one-shot calls grow (below).
 
+- **Large inputs** (`Core.kindFor`, `greedy_split.chooseStaticContexts`): from a size hint of 1 MiB (the
+  input for a one-shot call, `StreamOptions.size_hint` for a stream) and a window of 19 to 24 bits,
+  `.q6` and `.q9` use `WideMatcher`, google/brotli's hasher for large inputs (H68 at q5–q7, H6 at
+  q8–q9): a 5-byte hash into 2^15 buckets of 32 (`.q6`) or 256 (`.q9`) slots, tags compared on text
+  too (five bytes leave fewer false candidates than four). A large window keeps the four-byte table
+  (google's H65 is not ported), and `.q11` keeps its own. `chooseStaticContexts(data, quality,
+  size_hint)` ports `ShouldUseComplexStaticContextMap`: thirteen literal contexts
+  (`kStaticContextMapComplexUTF8`) where the size hint is large enough and the sampled entropy says
+  they pay; `.q9`'s match table is capped at 2^22 slots.
+- **Small inputs** (`Effort.slotsLog`, `encoder.tableSize`): the match finder's table is sized for the
+  input, not the window — slots 2^k per input byte (k = 2 at `.q6`, 3 at `.q9`/`.q11`) up to a cap
+  (2^19 slots at `.q6`, 2^22 at `.q9`/`.q11`); a one-shot call and a stream size it the same way, so
+  they give the same bytes. A small input otherwise pays for a table mapped afresh on every call
+  (the reason `Compressor` exists).
+- **Decoder hot loop** (`hotCommands`, `HotBits`): whole commands run with their lengths in locals;
+  `HotBits.top` refills without a branch (`refill`'s arithmetic, masked off at 64 bits), because whether a
+  command header needs a refill is data; `hotCommands` takes `noalias` `self` and sink so the decoder's
+  fields stay in registers across output stores; literal runs of eight or more are decoded without
+  per-literal checks, bounded by the input left (`hot_margin` plus 15 bits a literal), which is the only
+  thing keeping their reads inside the input — the fuzz driver puts the input against a guard page for
+  that reason.
+
 ### Measured ratios
 
-Ours at each effort vs. the reference (bytes; ReleaseFast, 2026-09-30):
+Ours at each effort vs. the reference (bytes; ReleaseFast):
 
 | input | raw | fast | **default** | best | max | ref q1 | ref q5 | ref q9 | ref q11 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -402,15 +385,7 @@ Ours at each effort vs. the reference (bytes; ReleaseFast, 2026-09-30):
 | `zeros` | 262 144 | 27 | **27** | 27 | 27 | 47 | 13 | 13 | 14 |
 | `random_org_10k.bin` | 10 000 | 10 004 | **10 004** | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 |
 
-(Table re-taken 2026-10-15; the 2026-09-30 one had `fast` before the `FastMatcher` and no `max`.
-`default`/`best` re-taken again the same day after the greedy model: before it 51 327 / 50 536, 421,
-436 — the clustered contexts won 100 bytes on `cp852-utf8` that google gets from dictionary words,
-R15. `best` = `.q9` re-taken after R15: 51 361 and 541 before.)
-
-Before 2026-09-30 the one setting gave `alice29.txt` 54 605, `cp852-utf8` 536, `zeros` 651. Time on
-`alice29.txt`: 7 ms fast, 17 ms default, 24 ms best (was 7 ms) — since 2026-10-14 `.fast` gives
-`alice29.txt` 55 580 B (q4: 55 504) in about the reference q4's time; a small input pays a fixed ~1 ms at
-`.default` for clustering (`cp852-utf8`: 1.1 ms). Incompressible input costs the same as the reference
+Incompressible input costs the same as the reference
 — both store it.
 
 ### Worst-case bound
@@ -421,9 +396,9 @@ block the encoder cannot encode at all (a give-up error rather than a bad
 stream) is stored too. So `compress` is never more than a few bytes of framing
 larger than its input, and `compress` itself never fails except on allocation.
 
-## Parallel compression (`parallel.compress`, 2026-10-16)
+## Parallel compression (`parallel.compress`)
 
-rust-brotli's `compress_multi`, the one capability of the field we lacked (S2 analysis C2).
+Modelled on rust-brotli's `compress_multi`.
 `parallel.compress(gpa, io, input, opts, .{ .job_size, .threads })` cuts the input into jobs
 of `job_size` bytes (default twice the window, at least 1 MiB; at least `min_job_size`
 64 KiB), runs them on up to `threads` workers — `io`'s concurrent tasks plus the calling
@@ -442,20 +417,14 @@ ordinary stream.
 - **The bytes depend on the input, the options and `job_size` only**, never on the worker
   count or the scheduling (test with 1/2/3/8 real threads). An input of one job is
   `compressWith`'s bytes. A prefix dictionary is not split (one pass).
-- **Cost of the cuts** (2026-10-16; IEEE `oui.txt` 5.8 MB and 8 MB of Zig std source, `.q4`/
+- **Cost of the cuts** (IEEE `oui.txt` 5.8 MB and 8 MB of Zig std source, `.q4`/
   `.q6`/`.q9`, CPU time with one worker against `compressWith`, min of 3): 4 MiB jobs 0.98–1.09×
   the CPU and −0.03…+0.03 % of size; 1 MiB jobs 1.09–1.25× and −0.07…+0.08 %. Inserting only the
   last quarter of the window made 1 MiB jobs up to 6.6 % larger — the whole window it is. Wall
   time with 8 workers measured only on a loaded host (load 12 on 8 cores): 1.3–2.4× one pass —
   **a quiet-host measurement is open** (Backlog R18).
-- **Evidence:** round trips at every level, windows 10–26 bits, font mode, small blocks and jobs
-  of 1 000 bytes up (dozens of cuts inside the window); interop variants `parallel_q1/q6/q11` and
-  `parallel_q4_w16` decoded by google/brotli 1.2.0; ThreadSanitizer (`-fllvm`) clean over 10
-  runs, a planted race reported; deterministic fuzz driver (harness `parallel`: random inputs,
-  levels, windows, blocks, jobs of 1–6 000 bytes) 39 000 runs clean, and both planted mutants —
-  no unknown ring, no byte alignment between jobs — FAIL at seed 0.
 
-## Streaming encoder (`StreamWriter`, 2026-10-14)
+## Streaming encoder (`StreamWriter`)
 
 - **A `std.Io.Writer`** (`init(gpa, output, buffer, StreamOptions)`), shaped as zstd's `StreamWriter`:
   `writer.flush()` ends the meta-block where it falls and byte-aligns the output with an empty
@@ -480,14 +449,10 @@ ordinary stream.
 - **History:** the window plus the block being gathered; once twice the window has been compressed,
   what no copy can reach is dropped (a multiple of 32 bytes, which keeps `FastMatcher`'s slot choice)
   and the table's positions shifted. Default window 22 bits, as google/brotli.
-- **Anchored externally:** the interop corpus has encoding variants beyond the efforts — windows 10,
-  15, 17, 24 one-shot, and two streamed with flushes (at 0, 1, 1 000, 65 536, 100 000; at 12 345 with
-  a 16-bit window; one with metadata blocks) — blessed by google/brotli and replayed like the rest
-  (326 checks, 0 mismatches).
 
-## Streaming decoder (`Decompressor`, `decompressStream`; 2026-09-30, pull reader 2026-10-15)
+## Streaming decoder (`Decompressor`, `decompressStream`)
 
-- **Pull reader (R9):** `Decompressor.init(gpa, in, buffer, options)` is a `std.Io.Reader` over the
+- **Pull reader:** `Decompressor.init(gpa, in, buffer, options)` is a `std.Io.Reader` over the
   decompressed bytes. Reading decodes as much as it needs: the decoder stops mid-command when the
   ring holds nothing but bytes not read yet — in a run of literals, in a copy (window, prefix
   dictionary), in a static-dictionary word, in a stored block — and goes on at the next read, and it
@@ -499,12 +464,7 @@ ordinary stream.
   lengths in locals and calls nothing out of line; a command that does not fit the room left, or
   copies from past the window (prefix or static dictionary), is set up in the decoder and made by
   `resumeCommand`, phase by phase. A one-shot sink always has room, so `decompress` and
-  `decompressInto` run the hot loop only. Cost against the decoder before R6/R9, in a standalone
-  ReleaseFast program decoding alice29 q5/q9/q11 300× (min of 5): +1–3 % cycles at −3.5 %
-  instructions; the bench binary's A/B moved +4–9 % with the build's code layout. The first version
-  kept the lengths in fields and called out of the loop (+30 %): `readDistance` and the sinks'
-  `copyBack` had stopped being inlined, fields were reloaded after every output byte (for the
-  compiler a byte may land on the decoder), and calls in the loop cost registers.
+  `decompressInto` run the hot loop only.
 - **Tested:** every committed vector and google/brotli stream read a byte at a time and in 7- and
   4096-byte reads (the 256 KiB copy of `zeros` stopped at every byte), through the interface's own
   buffer and helpers (`take`, `takeDelimiterInclusive`, `allocRemaining`), raw-dictionary and
@@ -531,14 +491,14 @@ ordinary stream.
 - **The two ends' failures are themselves:** `ReadFailed` from `in` (not the `TruncatedInput` it would
   otherwise surface as) and `WriteFailed` from `out`. `std.Io.Reader.fillMore` may add no bytes
   without it being the end of the stream (its own contract); only `EndOfStream` ends the input.
-- **Read-ahead given back (R11, 2026-10-15):** the bit accumulator reads up to 8 bytes ahead; at the
+- **Read-ahead given back:** the bit accumulator reads up to 8 bytes ahead; at the
   end of the stream the whole bytes it read past it go back to `in`, so `in` is left exactly after
   the stream and streams can be decoded back to back from one reader (tested over three
   concatenated streams and a tail, in pieces of 1..4096 bytes). For that the bit reader keeps the last
   8 bytes it took in `in`'s buffer when it fetches more, which needs a buffer of at least 16 bytes;
   with a smaller one, up to 8 bytes past the stream may still be consumed. `in` must have a
   non-empty buffer.
-- **Metadata (R10, 2026-10-15):** `Options.metadata` (`start(len)`, `chunk(bytes)`) receives what
+- **Metadata:** `Options.metadata` (`start(len)`, `chunk(bytes)`) receives what
   metadata meta-blocks carry, in pieces of up to 512 bytes, in all decoders; without it they are
   skipped.
 
@@ -554,157 +514,75 @@ ordinary stream.
   with a batch of truncations of a real stream; both Debug and ReleaseFast.
 - Allocator is always explicit; per-meta-block scratch (Huffman tables, context
   maps) lives in an arena that is freed when decoding finishes.
+- **Limits a caller must know:** `window_bits` 25..30 (`max_large_window_bits`) make a large-window
+  stream that the default decoder `Options` refuses (`InvalidWindowBits`; `Options.large_window` opts in);
+  `parallel.compress` does not cap `threads`, and each worker holds up to 32 MiB of match-finder tables;
+  `parallel` jobs are capped at `max_job_size` (1 GiB); `.q11` needs up to ~300 MB for a 1 MiB block
+  (see its memory note), so it is not for untrusted input on a shared server.
 
-## Validation
+## Verification
 
-- **Decoder, byte-exact** vs google/brotli reference vectors
-  (`tests/testdata/*.compressed` ↔ plaintext): empty stream, `x`, `xyzzy`,
-  `10x10y`, `64x`, `quickfox` (static dictionary), `quickfox_repeated`,
-  `ukkonooa`, `zeros`, `zerosukkanooa`, `monkey`, `backward65536` (large
-  window), `random_org_10k.bin` (incompressible), `compressed_file`,
-  `cp852-utf8`, `cp1251-utf16le`, and `alice29.txt` (152 KB, complex Huffman +
-  multiple distance block types). Additional non-embedded vectors
-  (`mapsdatazrh` 285 KB, `compressed_repeated` 144 KB) were checked externally.
-  This covers uncompressed meta-blocks, simple + complex Huffman, static-
-  dictionary references, the distance ring buffer, and block switching.
-- **Malformed batch**: truncations + hostile random inputs never panic and
-  always return a typed error; the output cap is enforced.
-- **Encoder, anchored outside this repository.** A writer and a reader can
-  share a misreading of RFC 7932 and still round trip perfectly, so a
-  self round-trip proves nothing on its own. `tools/interop.zig` (run by
-  `zig build interop-brotli`) pushes every stream this encoder emits through the **reference** implementation
-  (google/brotli, via the Python `brotli` C extension) and asserts the original
-  bytes come back — over a property sweep of input shapes: empty, single byte,
-  one-byte runs sized around the insert/copy length-code boundaries (1..6, 9,
-  10, 63..65, 1000, 22 593..22 595), 1..5-symbol alphabets both flat and skewed
-  (every simple-code shape plus the first complex one), all 256 byte values,
-  incompressible random, text at and either side of the 65 520-byte window-bits
-  switch, and multi-meta-block streams that mix compressed and stored blocks in
-  both orders. The same program also runs the *other* direction: our decoder
-  against reference output at qualities 0/1/5/9/11.
-- **…replayed hermetically.** Since 2026-09-06 the live comparison is a PROGRAM,
-  never built by `test-brotli` and never by `zig build`, so the module ships no
-  foreign source and the suite needs no python3. `--capture` freezes what the
-  reference did into `src/testdata/`: 24 reference-compressed streams
-  (`testdata/ref/*.br`, five qualities on `alice29.txt`, three window sizes on
-  `quickfox_repeated`, and q1/q11 over the rest of the corpus), which
-  `interop_replay_test.zig` decodes back to the plaintext; and, for each of the
-  45 input shapes, the SHA-256 of the exact stream google/brotli accepted
-  (`testdata/interop_blessed.zig`), which the same file re-derives from the
-  encoder. Before that it was `src/reference_interop.zig`, a test that spawned
-  `python3` and skipped when it was absent — which is every CI run.
-- **One-off randomized sweep** (not part of the suite, reproducible from the
-  seed): 600 generated inputs across nine shapes and four size classes (up to
-  200 KB, 20.3 MB of plaintext in total) compressed and then decompressed by
-  the reference implementation — zero rejections, zero mismatches, aggregate
-  ratio 3.06x.
-- **Writer unit tests** against the decoder's own primitives (`BitReader`,
-  `huffman.zig`, `tables.zig`): the fixed code-length prefix code is asserted to
-  be the exact inverse of `tables.code_length_prefix_*`; the `16`/`17` repeat
-  chains are replayed through the decoder's repeat recurrence for every length
-  3..2000; run-length-coded code lengths replay back to the original lengths
-  (hand-picked and 300 random complete codes); a complete complex code survives
-  a bit-level write/read round trip; every prefix-code shape (1..N used symbols,
-  all three alphabets) round-trips header *and* symbols; length-limited Huffman
-  is checked for Kraft equality and the depth limit; and the command/distance
-  code tables are checked against `tables.cmd_lut` and for gap-free coverage of
-  every insert length, copy length and distance.
-- **Mutation-tested.** Deliberately breaking the writer — reversing the
-  code-length prefix bit order, dropping one code from a repeat chain, emitting
-  a distance or a copy length one off, loosening the fallback comparison,
-  writing MLEN before MNIBBLES, reordering the tree groups, writing the distance
-  before the literals, swapping the insert/copy extra bits, using a wrong HSKIP,
-  ignoring the decoder's early stop in the code-length header, raising a code
-  length limit past what the format can express, and reversing simple-code
-  symbol order — each turns the suite red. One mutation was chosen specifically
-  to stay *consistent* between writer and reader (perturbing `reverseBits` in
-  the shared `huffman.zig`): it leaves every self round-trip green and is caught
-  only by the reference decoder — which is exactly why that anchor exists.
+Run: `scripts/modtest brotli` (Debug and `-Doptimize=ReleaseSafe`/`ReleaseFast`); `zig build interop-brotli`
+runs the live comparison against google/brotli (see below); `zig build bench-brotli` the speed bench.
 
-- **Mutation run 2026-10-16** (schemata as below; 32 switches over the `.q0` port `writeQ0` and its
-  length, distance, literal-code, command-code, header, merge and store-mode code, and the decoder's
-  branch-free `HotBits.top`). First run 23 killed, 9 survived. New tests and corpus entries killed 8:
-  `HotBits.top` from every count 0..64 — 64 (what `BitReader.refill` leaves from a whole-byte count)
-  is the one state the mask and the `@min` are for, and no stream in the suite or 3 000 fuzz seeds
-  entered the hot loop with it; `q0ShouldMerge` on both sides of its bound (128 samples of one symbol:
-  2 bits a symbol continue with 8 to spare, 3 do not). Interop shapes `lengths` (inserts and copies at
-  `.q0`'s length-code boundaries — the boundary copies all from one distance, since `.q0` finds a copy
-  at its first byte only through the last distance; the first corpus try, copies from anywhere, missed
-  the copy of 71 because `.q0` had not hashed the source's first position), `random_8000_copy` (the
-  store-mode switch before a match after a long incompressible insert), `alice_3000`, `alice_65536`
-  (four MLEN nibbles at exactly 2^16), and the encoding `stream_q0` (`.q0` had no streamed stream
-  blessed by the reference at all; a 3 000-byte first block in a stream-sized table is the only way
-  the odd-power table size takes effect — one-shot, the table sized for the input clamps it).
-  1 equivalent: the merge limit `total + next <= 2^20` — `Core.init` asserts `block_size <= 2^20`,
-  so `writeQ0` never sees more than 2^20 bytes (a 1 MiB + 40 000 test passed with it removed).
-- **Mutation run 2026-10-15** (schemata, one ReleaseSafe build of the whole suite plus 3 000 fuzz-driver
-  seeds per mutant; 28 switches over the code added since 2026-10-04: the hot literal loop and its
-  input bound, the `HotBits` refill and store, `copyBackSlack`/`SliceSink.copyBack` slack, `.q6`/`.q9`
-  table sizing (R16) and `tableSize`, `findWord`'s cutoff, length, transform and distance bounds (R15),
-  the greedy splitter and `chooseStaticContexts` (`greedy_split.zig`)). First run 20 killed, 8 survived.
-  New tests killed 6: a hand-built stream whose 10-bit command code and 24 + 24 extra bits need a second
-  refill, swept to every distance from the end and bit offset and decoded from the bytes before an
-  unreadable page — with a `hot_margin` of 8 that refill reads past the input, which only the page shows
-  (and only after a command with an implicit distance: an explicit one's `top` refills just before);
-  `findWord` refusing a word no distance code reaches; the splitter's type cap (256) and its 20-bit
-  preference for the last type; `chooseStaticContexts` at both thresholds (one context needs both
-  savings small; three need 0.02 bits over two). 2 equivalent: `le[n + c] = le[c]` while there is one
-  type (both "last" types are type 0, so a stale second entropy only raises `diff[1]`, which no branch
-  can then take), and `finishBlock`'s `size == 0` return (an empty block joins the last one as zero
-  symbols).
-- **Mutation run 2026-10-04** (schemata, one ReleaseSafe build, 132 switches in `decoder.zig`,
-  `bitreader.zig`, `huffman.zig`, `transforms.zig`: meta-block and metadata headers, WBITS, simple and
-  complex prefix-code bounds, context map, block-type switching, distance ring and short codes,
-  dictionary/transform bounds, MLEN accounting, the ring sink's flush/grow/wrap and cap logic, bit reader
-  edges). First run: 63 survivors — the hostile-header guards had no test at all. 110 killed, 22 equivalent.
-  New hand-built streams (`src/crafted_test.zig`, each checked against the python reference decoder),
-  `transformWord` semantics tests, a `decodeWindowBits` table test and a `buildComplex` completeness
-  test killed the rest. **Defect found and fixed:** a command producing more than MLEN bytes was
-  accepted (the reference rejects it); now `InvalidLength`. The 22 equivalent: `n == 0` in
-  VarLenUint8 (`(1<<0)+0` is the same 1); the checks on tables whose alphabets already bound the value
-  (`block_length` code < 26, `dist_offset.len`, `shift == 0`, `woff + copy`, `dv > max_allowed_distance`
-  — a 24-bit distance code cannot reach 2^31, `h.mlen > 2^24` — six nibbles cannot exceed it, the null
-  type/length trees — unreachable while a block count can only run out after the last command,
-  `distance <= 0`); the two redundant prefix-code completeness guards (`space2 != 0` is backed by the
-  Kraft check in `buildComplex` for two or more symbols and now has its own single-symbol test;
-  `num_codes == 1 or space == 0` likewise; `l > 15` and `nonzero == 0` fail with the same error one line
-  later); the ring's `min(2*len, limit)` and the cap-bounded limit (the ring never wraps under a
-  smaller cap, so only memory differs); refill at `cnt < 56`; `ttype > len` / `skip >= len` in
-  `transformWord` (the boundary case gives the same empty word either way); `r <= 0` /
-  `r >= max_allowed_distance` for ring distances (both give `InvalidDistance`, the second is
-  unreachable); `wlen == 0 and distance <= 120` (cannot fire: a transform that empties the word has an
-  index of 12 or more, hence a distance far above 120). ⚠ The sentence above about the fuzz harness's
-  surviving mutant ("the stored copy ignoring the unwritten-bytes bound is equivalent") was wrong:
-  a stored block that starts mid-ring and is longer than the free tail loses unwritten bytes without
-  that bound; `crafted: stream: a stored block longer than the ring's free tail…` kills it.
-- All tests pass in **Debug** and **ReleaseFast** (`zig build test-brotli`
-  [`-Doptimize=ReleaseFast`]).
-
-- **Streaming decoder** (`src/stream_test.zig`): every committed vector and all 24 google/brotli
-  streams decode to their plaintext through `decompressStream` — whole, in 61-byte pieces, and the
-  small ones in 1/3/7-byte slivers (chunk boundaries at every decoder state); our encoder's streams for
-  seven interop shapes; every truncation of four streams fails with *the same error* as `decompress`;
-  memory (a peak-tracking allocator): 4 MiB out through a 2 MiB window stays under 3.25 MiB, a 43-byte
-  body under a 4 MiB window under 256 KiB, 1024 meta-blocks' tables do not accumulate; the cap, the
-  ratio floor, stored blocks above the floor; `ReadFailed`/`WriteFailed` from failing ends.
-- **Differential fuzz driver** (`BROTLI_FUZZ=<runs>[,<seed>]`, testkit's deterministic driver):
-  valid streams damaged in their headers, truncated or spliced, fed to both decoders (the streaming
-  one in random piece sizes) — the verdicts must match, bytes or error. 2026-09-30: 230 000 runs
-  (≈3 000/s, ReleaseSafe) clean; reach per run: ≈32 % decoded, the rest spread over truncation, prefix
-  code, dictionary, distance and cap errors. Harness checked by planted mutants (schemata, one build):
-  4 of 5 killed (a ring that never flushes, `back(d)` off by one, growth that loses the history, a
-  chunk boundary that drops a byte); the survivor — the stored copy ignoring the unwritten-bytes bound
-  — is equivalent, because the ring is flushed at the end of every meta-block, so that bound never
-  binds at the start of a stored block.
-  **2026-10-15:** the hot literal loop (`d9f7be28`) reads the input and writes the output through
-  many-pointers — no bounds check under ReleaseSafe — and all four decoders share it, so a read past
-  the input was invisible to the verdicts (a planted one passed seed 36 silently; the run crashed only
-  ~375 seeds later, on a knock-on overflow). The harness now puts the input, and `decompressInto`'s
-  exact-size output, flush against a `PROT_NONE` page (Linux): planted over-reads (the bound without
-  its refill margin, or without the halving) fault at seed 36, an extra literal fails the verdict at
-  seed 0. Reach of that loop: a third of the runs enter it, 13 % stop at the input bound. Dictionaries
-  are built once per process and the cap-sized buffer is static (400 → 1 260 runs/s on one core).
-  360 000 runs clean (8 jobs, 22 + 43 s).
+- **Decoder, byte-exact** against google/brotli's own test vectors (`src/testdata/*.compressed` and the
+  plaintext beside each): empty stream, `x`, `xyzzy`, `10x10y`, `64x`, `quickfox` (static dictionary),
+  `quickfox_repeated`, `ukkonooa`, `zeros`, `zerosukkanooa`, `monkey`, `backward65536`, `random_org_10k.bin`
+  (incompressible), `compressed_file`, `cp852-utf8`, `cp1251-utf16le` and `alice29.txt` (complex Huffman,
+  several distance block types): uncompressed meta-blocks, simple and complex Huffman, static-dictionary
+  references, the distance ring, block switching.
+- **Hostile input:** truncations and random streams never panic and always return a typed error; the output
+  cap and the ratio bound are enforced (`crafted_test.zig` hand-builds streams for every header guard).
+- **Encoder, anchored outside this repository.** A writer and a reader can share a misreading of RFC 7932
+  and still round trip, so a self round trip proves nothing on its own. `tools/interop.zig` pushes every
+  stream the encoder emits through google/brotli (the Python extension, or google/brotli built from source
+  with `BROTLI_EXPERIMENTAL` for serialized dictionaries: `interop -- --brotli-src DIR`) and asserts the
+  original bytes come back, over a sweep of input shapes (empty, single byte, runs around the length-code
+  boundaries, 1..5-symbol alphabets flat and skewed, all 256 byte values, incompressible random, text at
+  the window-bits switch, multi-meta-block streams mixing compressed and stored blocks) and over encoding
+  variants beyond the efforts (windows 10, 15, 17, 24; streamed with flushes and metadata blocks; large
+  window; raw dictionaries; `parallel_*`; `.font` mode). The same program runs the other direction: our
+  decoder against reference output at qualities 0/1/5/9/11, and against large-window, raw-dictionary and
+  serialized-dictionary streams.
+- **…replayed hermetically.** The live comparison is a program, never built by `test-brotli` or `zig build`,
+  so the module ships no foreign source and the suite needs no python3. `--capture` freezes what the
+  reference did into `src/testdata/`: reference-compressed streams (`testdata/ref/*.br`) which
+  `interop_replay_test.zig` decodes back to the plaintext through every decoder, and, per input shape and
+  encoding variant, the SHA-256 of the exact stream google/brotli accepted (`testdata/interop_blessed.zig`),
+  which the same file re-derives from the encoder. An encoder change fails the suite until it is
+  re-blessed against a real google/brotli. Oracle producers: `tools/interop.zig`, `tools/c_oracle/` (C
+  known-answer tests, e.g. `rle_counts_kat.c` for the smoothed counts), `tools/foreign_rust` (rust-brotli
+  workloads for `parallel`).
+- **Writer unit tests** against the decoder's own primitives (`BitReader`, `huffman.zig`, `tables.zig`): the
+  fixed code-length prefix code is the exact inverse of `tables.code_length_prefix_*`; the `16`/`17` repeat
+  chains replay through the decoder's recurrence; run-length-coded code lengths replay to the original
+  lengths; a complete complex code survives a bit-level write/read round trip; every prefix-code shape
+  round-trips header and symbols; length-limited Huffman is checked for Kraft equality and the depth limit;
+  the command/distance code tables are checked against `tables.cmd_lut`.
+- **Streaming:** `stream_test.zig` decodes every committed vector and reference stream through
+  `decompressStream` and the pull reader whole, in odd-sized pieces and a byte at a time, with every
+  truncation failing with the same error as `decompress`; a peak-tracking allocator pins the memory bounds
+  (a window, and only as much as the output needs; per-meta-block tables do not accumulate); the ratio
+  floor and stored blocks above it; `ReadFailed`/`WriteFailed` from failing ends. `stream_writer.zig`
+  checks that without a flush the stream is byte-identical to `compressWith` for every write cut and buffer
+  length, history slid under a small window.
+- **Parallel:** round trips at every level, windows 10–26 bits, font mode, small blocks and jobs of 1 000
+  bytes up (many cuts inside the window); the bytes do not depend on the worker count (1/2/3/8 real
+  threads); ThreadSanitizer (`-fllvm`) clean.
+- **Fuzz:** `BROTLI_FUZZ=<runs>[,<seed>]` (testkit's deterministic driver, ReleaseSafe) runs two harnesses:
+  `stream-diff` feeds valid streams damaged in their headers, truncated or spliced to the one-shot decoder,
+  `decompressInto` and the streaming decoder (in random piece sizes), whose verdicts must match, bytes or
+  error — the input and the exact-size output sit flush against an unreadable page, so an over-read of the
+  hot literal loop faults; and `parallel` (random inputs, levels, windows, blocks and jobs of 1–6 000
+  bytes, joined streams must decode). The harnesses are checked by planted mutants (a ring that never
+  flushes, `back(d)` off by one, growth that loses history, a dropped chunk byte, a literal-loop bound
+  without its margin; no unknown ring and no byte alignment between jobs in `parallel`).
+- **Mutation:** schemata runs over the decoder, bit reader, Huffman code, transforms, the `.q0` port, the
+  greedy splitter and the dictionary search; their survivors are argued equivalent or killed by crafted
+  streams, and each killer is a committed test.
+- **ctgrind:** none — compression only, no secrets.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -717,56 +595,77 @@ ordinary stream.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-brotli`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.38–1.10× under load (load average ~4, largest spread 16.8 %), the worst row `c_q0_html` at 1.101 with a quiet 0.6 %/0.8 % spread; repeated alone on a quieter host (load 0.8, `BENCH_ROUNDS=7`): `c_q0_html` 1.092, `c_q0_text` 1.064. Card: 0.38–1.09× (was 0.39–1.07× on Zig 0.16.0). `.q0` on small HTML is the row closest to the P2 bound (1.10): a cause to look at before it crosses.
+`zig build bench-brotli` (`BENCH_ROUNDS`, default 3, user-mode cycles) pairs every effort (`c_q0_*` … `c_q11_*`)
+and every decoder form (`d_*`, with `d_*_alloc` for the allocating `decompress`) with google/brotli built
+from source on the same payloads; the reference decode is the preallocated-buffer one, matching
+`decompressInto`. The card's `**Performance:**` line is authoritative for the ratios. Rows outside the bench
+(small inputs, dictionaries, allocator effects) are Backlog R19.
+
+## What is deliberately not done
+
+- **Encoder side of serialized shared dictionaries (RFC 9841 §5):** the decoder reads them
+  (`parseSharedDictionary`), the encoder does not write them; google/brotli ships the only producer and marks
+  it experimental (owner decision: a research tool only google ships).
+- **NPOSTFIX/NDIRECT search below `.q11`:** the lower levels take the mode's fixed pair (`.font`: 1/12), as
+  google's q4–q9 do. Parameters of their own are not exposed.
+- **OMIT_FIRST dictionary transforms:** the dictionary search covers 113 of the 121 transforms; the 8
+  OMIT_FIRST ones need a suffix index. A few of q11's 1 837 references on `alice29.txt` use them.
+- **Static-dictionary words at `.q6` (and `.q4`):** google searches from q4/q5; at `.q6` the search cost
+  5–10 % of the time for 0.25–0.7 % of size (text −0.7 %, html −0.6 %, json −0.25 %, `cp852-utf8` 542 → 501
+  against q6's 482). Owner's choice: speed. Switching it on is one comptime flag in `Core.compressBlock`
+  (`buildCommands`). `.q9` and `.q11` have it.
+- **Block splitting at `.q4`:** `.q4` is 6–8 % behind q4 on fonts. Accepted (owner: comparable to the
+  reference, not identical).
+- **The `font_like` and `cp852-utf8` gaps at `.q11`:** 3.8 % behind q11 on the generated `font_like`
+  payload (its sections are uniform random fields; q11 tells them apart with a longer block-type list) and
+  7 % on `cp852-utf8` (706 B). Accepted on the same terms.
+- **A clustered literal model for small blocks at `.q6`/`.q9`:** much denser on small blocks (font tail
+  32 KiB 15 239 B against the greedy 18 984, q6 18 452), for +10–60 % of the time of such inputs. Not
+  pursued (owner: behave comparably to the reference within the tolerance bands, not beat it; the greedy
+  model is within +0.1…+4 % of google q6). `chooseLiteralModel` remains `.q11`'s.
+- **google's H65 (large window) hasher:** a large window keeps the four-byte table.
+- **A parameter to switch literal context modelling on or off:** an effort choice already (`.q4` has
+  none); wait for a consumer asking (owner: parity is the same work in the same time, not every parameter).
+- **Byte-identical streams with google/brotli:** not a goal; `.qN` promises quality N's size in at most about
+  its time.
+- **A command-line tool** (`brcat`-style joining, a `brotli` binary): out of scope (owner); concatenated
+  streams decode back to back from one reader instead (`Decompressor` gives the read-ahead back).
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** the one-shot input of 4 GiB or more (the 2026-10-27 item) is FIXED — `compressWith`/`compressInto`/`Compressor` hand it to `StreamWriter` (same bytes, relative positions), `parallel` jobs are capped at `max_job_size` (B-1, B-6), a prepared dictionary indexes only its searchable tail (B-7). Left: the encoder accepts `window_bits` 25–30 that the default decoder `Options` refuses (`InvalidWindowBits`, documented both sides, B-5); `parallel.threads` is not capped, each worker holds up to 32 MiB of tables (documented, B-6); the match finders' internals (q0–q11, `block_split`, `greedy_split`) were not swept against arbitrary inputs, only their entry points and `u32` casts.
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `copy16` (per match copy in the decoder). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
-
-- **Build option: encoder quality cap** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). The 122,784-byte RFC 7932 dictionary (src/dictionary.zig:13) is
-  needed by the DECODER, so it is not a knob. The encoder carries six effort pipelines (q0..q11, zopfli at the top, src/encoder.zig).
-  `.small` → cap quality (e.g. ≤ 9), refusing a higher one with an error. First verify that a decoder-only consumer does not already
-  avoid the encoder (Sema is lazy) — then the knob only helps encoding consumers. Unmeasured.
-- **R18 Parallel compression on a quiet host (2026-10-16, open)** — `parallel.compress`'s wall time with 1–8 workers on 5–8 MB inputs, measured so far only under load (1.3–2.4× one pass with 8). Expected near the job count, less the cuts' 0–9 % CPU.
-- **R19 Speed rows outside the bench (owner 2026-10-16: S2 = parity of features + the bench within 1.1×; these rows are Backlog, not a condition)** — `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (R16's fixed cost); one-shot `compressWith` `.q6` on 4–64 KiB under `smp_allocator` 1.10–1.83× (the allocator: `Compressor` 0.89–1.11×, glibc 0.87–1.10×); `Compressor` `.q4` up to 1.23×; a raw dictionary prepared per call up to 1.22× (prepared once: in the band); `.q6`/`.q9` on inputs of 1 MiB and more up to 1.11×/1.12× (`langtag`, R14); `.q1` with a dictionary 1.17–1.44× (exempt: google's q1 ignores the dictionary, ours is 14–21 % smaller).
-- **R20 Niche features of the field, not implemented (2026-10-16, owner: Backlog)** — concatenable/appendable streams and `STREAM_OFFSET` stitching (rust-brotli, google), NPOSTFIX/NDIRECT as parameters, a serialized shared dictionary or several raw ones on the encoder (google: experimental), google 1.2.0's tuning switches (base64 detection, SIMD hasher, H59), a peak-memory estimate, the decoder's no-ring-reallocation switch. A command-line tool: out of scope (owner).
-
-- ~~**Speed: 1.41–3.38× google/brotli 1.2.0**~~ **DONE 2026-10-11 → 1.04–1.88×** *(`zig build bench-brotli`, 5 rounds, user-mode cycles; worst row `c_default_text` 1.84–1.88× over three runs, decompress 1.49–1.78×)*. Profiled fixes: the decoder's prefix tables were flat `1 << max_len` (up to 128 KiB per literal tree, a cache miss per symbol) — now two-level, 8-bit root as google/brotli; the bit reader refilled a byte at a time and was not inlined — now one 8-byte load; every literal re-reserved output room, every LZ77 copy went byte by byte, and the output grew by doubling — now one reserve per insert, `memcpy` copies, one growth per meta-block. Encoder: a block whose context model split the literals was written three times when the context version won — now the single-code alternative goes to a scratch writer and the winner is spliced (output byte-identical, `interop_replay_test`); the bit writer appended a byte per call — now four; `Matcher.init` cleared up to 4 MiB of `prev` it never reads before writing and 512 KiB of `head`, both through Zig 0.16's byte-wise `compiler_rt.memset` — `prev` is left as allocated, `head` filled in vector stores; the match length is compared eight bytes at a time. Decoder, second pass (same day, toward P2): the reference's q9 streams are almost all short copies (text: 17 956 commands, 95 % of copies under 16 bytes, 8.5 KB of literals in 152 KB), so the cost is per command: `memcpy` calls for short copies → 16/32-byte moves into 32 bytes of slack `reserve` keeps; a refill before every read → only when short of bits; a branch in the bit mask; a bit-at-a-time `reverseBits` → `@bitReverse`. Decompress 1.49–1.78× → **1.12–1.28×**. Tried and reverted (no measurable gain): literal runs with locals and a register-resident bit reader (`Fast`) for literals, and for the command header — the bit-reader-aliasing hypothesis did not hold. **Left (P3 → P2):** (1) the encoder, now the worst rows (1.50–1.89×): its hash chain (cache misses walking `prev`, half of `compressWith` at default effort) against google/brotli's bucketed hashers -- an algorithm change that moves compressed sizes, so the effort ↔ quality pairing must be redone; (2) the decoder: **done in part (2026-10-11)** — `decompressInto` decodes into the caller's buffer, and the bench pairs it with the reference's preallocated-buffer decode (the allocating `decompress` stays as an info row, `d_*_alloc`, 1.10–1.23×): **1.02–1.15×**, json and html within P2, text 1.15×. Tried and reverted: a 10-bit root table (1.23× — building the bigger tables costs more than the second lookups it saves). What is left on text is the 16-byte copy's source load (6 %, store forwarding over the previous copy's slack / distant history) and the bit reader's `acc`/`cnt` stored and reloaded around every output store. **Encoder, 2026-10-14:** (1) done — bucketed hashers at all efforts (`3a4ee5a5`), then `.fast` as an algorithm of its own (`FastMatcher`): fast 1.24–1.40× → **0.96–1.12×** at q4 (sizes: json 31 139 / html 17 023 below q4, text 55 580 = q4 + 0.14 %), default 1.00–1.07× (q6), best 0.74–0.92× (q9). **Left (P3 → P2):** the decoder (text 1.19×, html 1.15×, json 1.07×) and `c_fast_html` 1.12×.
-
-
-- ~~**Streaming decoder (`std.Io.Reader`)** *(survey 2026-09-30)*~~ — **DONE 2026-09-30** as `decompressStream` (push: reader in, writer out; see § "Streaming decoder"). Still open: a pull-style `std.Io.Reader` over the decompressed bytes (needs a decoder that suspends mid-command), and giving back the read-ahead bytes after the stream.
-- ~~**Streaming encoder (`std.Io.Writer`)** *(survey 2026-09-30)*~~ → R1 below (survey 2026-10-14).
-- ~~**Encoder quality** *(survey 2026-09-30)*~~ — literal context modelling and distance short codes DONE 2026-09-30; the rest (block splitting, optimal parse, static-dictionary references) → R2 below.
-- ~~**Large-window extension and custom (shared) dictionaries** *(survey 2026-09-30)*~~ → R6–R8 below (RFC 9842 `dcb` made dictionaries matter on the web).
-
-### S3 → S2 — survey 2026-10-14, owner answers the same day
-
-Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 → R2.
-
-- ~~**R1 Streaming encoder**~~ — **DONE 2026-10-14** as `StreamWriter` (§ Streaming encoder): flush / finish / reset, byte-identical to `compressWith` without flushes. Unblocks dynamic `br` in the web-server consumer (gzip + zstd only today). Left: a block's prefix codes still take short-lived allocations per block (also one-shot) — a warm writer is not allocation-free yet. **Done 2026-10-16** (R16): the writer's core keeps the block writer's allocations in an arena across blocks and streams — the next stream after `reset` makes no allocator call at any level (test; one-shot `compressWith` still allocates per block, from `gpa`).
-- ~~**R2 `.max` effort ≈ q10/q11**~~ — **DONE 2026-10-15** (§ Encoder: shortest-path parse, static-dictionary words, distance contexts): `alice29.txt` +0.96 % over q11. Left, none needed for the target: block splitting (literal/command/distance block types), NPOSTFIX/NDIRECT, OMIT_FIRST transforms, a better start for small inputs; ~~`Effort.fromQuality(0..11)` for ports from quality-level APIs~~ done 2026-10-15 with the rename to `.q4`/`.q6`/`.q9`/`.q11` (four levels, not twelve; byte identity is not a goal — owner).
-- **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); ~~`size_hint`~~ **done 2026-10-14** (`StreamOptions.size_hint`: the table sized for the expected length — a short response no longer clears a 1–2 MiB table — and, given the exact length, the stream is `compressWith`'s bytes for any input). ~~`mode`~~ **done 2026-10-16** (owner: every substantial competitor feature; § Encoder `Mode` — google's mode only sets NPOSTFIX/NDIRECT, which the block writer has had since `.q11`'s search). Left, not a parity gap (owner 2026-10-15: parity = the same work in the same time, not every parameter): literal context modelling on/off (an effort choice already: `.fast` has none) — wait for a consumer asking.
-- ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
-- ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
-- ~~**R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing**~~ — **DONE 2026-10-14**: decoder `Options.dictionary` (§ Decoder), encoder `CompressOptions.dictionary` / `StreamOptions.dictionary` (§ Encoder), `brotli.dcb` (header, compress, decompress, `NotDcb`/`DictionaryMismatch`). Left for later: a prepared dictionary shared by many compressions (google's `PrepareDictionary`: today each compression inserts the dictionary's positions anew — O(dictionary) per response). **Measured 2026-10-16** (owner: outside the band?): responses of 4–32 KiB with a raw dictionary of 16–256 KiB (the bench html, TeX Live `doc.html`), window 22, glibc's malloc on both sides, google with the dictionary prepared once and attached to a fresh encoder per response: **`.q4` 1.35–8.25×, `.q6` 0.98–7.03× google's time** (worst: 256 KiB dictionary, 4 KiB response — 1.2 ms vs 0.17 ms), growing with the dictionary; `.q9` 0.21–0.81×, `.q11` 0.85–1.10×. Sizes: `.q4` 8–17 % smaller than q4, `.q6` +5.8 / +8.1 % on the html pairs (1 888 vs 1 746 B at 64 KiB) and +1.2 / +1.9 % on the text, `.q9`/`.q11` −3.8…+2.9 %. **Outside the band at `.q4`/`.q6`** — the `dcb` use (dynamic responses at low quality against one shared dictionary) is exactly this case. Wanted: a `PreparedDictionary` (dictionary positions hashed once, reusable by `compressWith`/`StreamWriter` read-only) and a look at `.q6`'s html size with a dictionary. **Prepared dictionary DONE 2026-10-16** (owner: port google's): `PreparedDictionary` + `CompressOptions.prepared_dictionary` / `StreamOptions.prepared_dictionary` / `dcb.compressPrepared` (§ Encoder "Raw prefix dictionary") — prepared once, `.q4` 0.83–1.02×, `.q6` 0.90–0.97× at q6's size (the html gap was the dictionary's positions competing with the input's in one bucket of 32), `.q9` 0.10–0.16×, `.q11` 0.70–0.85×; `.q1` searches it too (google's q1 does not). (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
-- ~~**R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**~~ — **DONE 2026-10-15** (§ Decoder, "Serialized shared dictionaries"). Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
-- ~~**R8 Large window (RFC 9841)**~~ — **DONE 2026-10-14**: decoder `Options.large_window` (§ Decoder); encoder `window_bits` 25..30 (`max_large_window_bits`) writes the RFC 9841 header and names distances with the large alphabet's first 74 codes (to 2^31), simple distance codes as wide as the 140-symbol alphabet; a copy from 17 MiB back found and blessed by libbrotli (`large_*` entries).
-- ~~**R9 Pull `std.Io.Reader` decoder**~~ — **DONE 2026-10-15** as `Decompressor` (§ Streaming decoder); `decompressStream` is a loop over it. Left: the decoder costs +4–9 % against before R6/R9 (§ Streaming decoder).
-- ~~**R10 Metadata callbacks** in the decoder~~ — **DONE 2026-10-15** (`Options.metadata`).
-- ~~**R12 Binary data ratio (found 2026-10-15, blocks `parity`)**~~ **CLOSED 2026-10-16 (owner: `font_like` +3.8 % vs q11 and `.q4` 6–8 % behind q4 on fonts are comparable — the goal is comparable, not identical)** — on fonts (TTF) every effort does worse work than the paired quality: NotoSansMono-Thin 500 480 B → ours 230 674 / 229 673 / 225 308 (default/best/max) vs q5 219 315 / q9 216 149 / q11 197 771; NotoSansEthiopic 301 464 B → 115 700 / 115 541 / 111 931 vs 113 799 / 112 746 / 98 632; NotoLoopedLao 43 056 B → 21 146 / 21 131 / 20 870 vs 20 969 / 20 779 / 19 817. The bench and interop payloads are all text, so this never showed. Suspects: no block splitting (google splits from q5 up; a binary file's sections differ), MSB6/SIGNED context modes judged on text only, `.max` prices tuned on text. Plan: add a binary payload to the bench (pairing + P), diagnose (smaller `block_size`, MSB6/SIGNED), then block splitting for literals/commands/distances.
-  - *2026-10-15 diagnosis* (bit accounting per part by an instrumented copy of the decoder, ours vs google's streams): the gap at `.default` was all in distances (15.2 bits each vs q5's 12.9). Cause: **a bug** — the encoder's distance ring was `{d, d, d, d}` (`DistRing.update` assigned an array literal in place), so short codes 1–3/10–15 never appeared (q5 uses code 1 3 631× on NotoSansMono). Fixed, plus SIGNED tried and all four ring distances probed: NotoSansMono 222 665 / 221 779 / 216 315, NotoSansEthiopic 111 479 / 111 322 / 108 407, NotoLoopedLao 20 734 / 20 720 / 20 419. `.default`/`.best` now beat q5/q9 on two of three fonts and are within 1.5 % / 2.6 % on the third; **`.max` is still 3–10 % behind q11** — q11 splits blocks (49/17/15 literal/command/distance block types on NotoSansMono, 68 literal codes, NPOSTFIX 2) and leaves fewer literals (146 k vs our 164 k). Next: block splitting.
-  - *2026-10-15 block splitting* at `.best`/`.max` (§ Encoder), context maps with RLE/MTF, and a generated font-shaped payload (`interop_corpus.fontLike`, also an interop shape). Now (ours vs google q5 / q9 / q11): NotoSansMono 221 135 / 208 252 / 202 202 vs 219 315 / 216 149 / 197 771; NotoSansEthiopic 111 148 / 106 706 / 103 706 vs 113 799 / 112 746 / 98 632; NotoLoopedLao 20 669 / 20 423 / 20 077 vs 20 969 / 20 779 / 19 817; font_like 112 488 / 103 651 / 102 341 vs 117 627 / 114 773 / 98 615. **`.best` beats q9 everywhere; `.default` beats q5 but on NotoSansMono (+0.8 %); `.max` is 1.3–5 % behind q11; `.fast` 6–8 % behind q4** (q4 splits blocks too: 128 162 vs 119 121 on font_like). q11 on NotoSansEthiopic leaves 23 k fewer literals (twice our length-3 copies, mostly at the last distance) — the `.max` parse is what is left there; NPOSTFIX/NDIRECT (q10+ searches them) not tried yet. Time (bench, text payloads): `.default` 1.04–1.09× q6, `.best` 0.86–1.06× q9 (was 0.67–0.83×), `.max` 0.49–0.79× q11.
-  - *2026-10-15 bench payload `font`* (200 KB `fontLike`): sizes fast 127 220 / default 112 869 / best 103 645 / max 102 301; time vs the paired quality **`.default` 1.44× q6, `.best` 2.6× q9** (both open: the deep matcher walks every bucket candidate at every literal position — load latency of slots and candidates dominates `Matcher.find`), `.fast` 0.60× q4, `.max` 0.32× q11. Open for R12: `.fast` ratio (q4 splits blocks; ours 7 % larger), `.max` parse (fewer short copies than q11), NPOSTFIX/NDIRECT, `.default` +0.25 % on NotoSansMono vs q5, the two time rows above.
-  - *2026-10-15 time on binary* (bench `font`): **`.best` 2.61× → 1.85× q9, `.default` 1.48× → 1.36× q6**, `.max` 0.27× q11; text rows unchanged or better. (1) Tags in the deep matcher's slots (§ Encoder `Matcher.slots`): the 4096 buckets of `.best` hold mostly hash collisions on a font (66 visited, 11 real per lookup); a block that looks binary skips them by tag. Tried and dropped: tags in a byte array (text +4–7 %, extra cache line), a candidate list built from a SIMD tag compare (text +14–28 %, serialised loads), one loop with a runtime mask (text +25 %, registers), more buckets (2^22 slots: −18 % on NotoSansMono but small inputs +40 % in page faults of the bigger table), skipping long literal runs at `.best` (fonts have none). (2) Exact pruning of literal context modes by an entropy floor. Tried and dropped: clustering only the lowest-floor mode (−2.5 % time, NotoLoopedLao +1.1 % size), 16 or 8 split histograms (±0.7 % size, time not better). Left: per literal block type clustering (~27 % of `.best` on `font`), the Viterbi split (13 %), the matcher (21 %). Note on pairing: on `font` `.best` writes 103 645 B — between q9 (114 773) and q10 (99 834), 10 % smaller than the q9 it is timed against.
-  - *2026-10-16 `.q11` (owner: the next S2 gap)*: **at q11's size on the real fonts** — NotoSansMono 202 202 → 199 463 (q11 197 771, +0.86 %), NotoSansEthiopic 103 706 → 98 537 (98 632), NotoLoopedLao 20 077 → 19 802 (19 817); text below q11 (`alice29.txt` 46 378 vs 46 487). Cause and fix in § Encoder (`.max` parse: google's zopfli start queue — one path per position lost every ring copy of the others), plus NPOSTFIX/NDIRECT and the nearest 2-/3-byte copies. Time 0.40–1.0× q11 (bench). **Left:** the generated `font_like` 101 326 vs q11 97 654 (+3.8 %; it was +3.8 % before too, so not the parse — its sections are uniform random fields, where q11's longer block-type list may be what tells them apart: 49 literal types to our 12 on NotoSansMono); `.q4` 6–8 % behind q4 on fonts (q4 splits blocks).
-- ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
-- **R13 Qualities 0 and 1 (found 2026-10-15, owner: add them)** — **`.q1` DONE, `.q0` added but P open (2026-10-15)**. Before: `Effort.fromQuality(0..3)` gave `.q4`, which took 4.3–6.9× q0's time and 2.6–3.8× q1's (bench, user-mode cycles). Now both are levels of their own (§ Encoder `FragMatcher`/`buildFrag`/`writeFragmentBlock`, own design from RFC 7932): one slot per hash bucket, first match taken, LZ4/Snappy-style growing step, commands resolved by the parse into two-word records with their histograms, literals copied to one buffer, one code per category; the writer knows the block's exact size from the histograms before it writes, and stores a block that would not shrink without writing it. Sizes (ours vs google): q1 json 33 675 / 34 206, html 19 062 / 19 495, text 59 893 / 60 292, font 127 956 / 127 223; q0 34 429 / 41 051, 19 042 / 22 347, 63 301 / 65 795, 132 714 / 131 355. Time (bench, 2 rounds): **q1 0.84–0.97×**, **q0 0.97–1.55×** (font 0.97, json 1.17, text 1.42, html 1.55) — google q0 spends about 155–170 instructions a command, parse and write together; ours about 300 (2026-10-15, callgrind: the record write ~110, the parse ~85, the writer ~90 per command). Dead ends (measured): q0 in one pass with codes from the block's first sixteenth (every symbol floored to a count of one) — no fewer instructions, 7–19 % larger (text 73 092 B, above google's 65 795); a faster step through literal runs (q0 skip 1–2: < 5 % instructions, +2–7 % size); a 2^13/2^14 table (≤ 5 %); a one-compare fast path in `matchLen` (−2 % at q0). Kept from the work: `assignLengths` on the stack with one sort of packed keys and `canonicalCode` from the lengths (no decoder table) — every level, streams unchanged. **`.q0` DONE 2026-10-16 as a port of google/brotli's quality 0** (`compress_fragment.c`, owner: P3 → work on it, MIT code may be ported): the own design was 1.2–1.55× q0's time at about 300 instructions a command (record, parse, writer); the one-pass port, with the same codes and meta-block rules, comes to 1.02–1.07× (bench, 3 rounds: json 1.04, html 1.07, text 1.02, font 0.98) at q0's sizes within ±0.1 % (html 22 335 vs 22 347 B). Two slips on the way, both measured: the literal code limited to 8 bits (google's `max_bits` 8 is a simple code's symbol width; the depth limit is 14) made the length-limiting loop rebuild the tree ten times — a fifth of the time; the next block's command code prepared after the last block, too. The old `.q0` sizes were 0–16 % below q0's; that density is gone with it (at q0's time it was not on offer).
-- **R14 13-context static map for large inputs (2026-10-15, open)** — google/brotli's qualities 5–9 use `kStaticContextMapComplexUTF8` (13 contexts from the UTF8 context id, `ShouldUseComplexStaticContextMap`) when the size hint is ≥ 1 MiB and the sampled entropy says it pays; `greedy_split.chooseStaticContexts` stops at three. Needs the total input length at the block writer (`compressWith` knows it; `StreamWriter` from `size_hint`). No bench payload is that large. **Measured and DONE in part 2026-10-16** (owner: measure against the band). Five natural inputs of 1.3–5.8 MB (`/usr/share`: IEEE `oui.txt`, IANA language-subtag XML, TeX Live `doc.html`, Unicode `NamesList.txt`; 3 MB of Zig std source), glibc's malloc on both sides: before, ours **+1.0…+7.1 %** larger and `.q9` **1.16–1.64×** google's time (`.q6` 0.89–1.11×). google built from source with switches took it apart: at `.q6` the whole gap was the 13-context map plus google's hasher for large inputs (H68: a 5-byte hash, 2^15 buckets) — google without both ≈ ours (oui 1 199 621 vs 1 202 767 B); at `.q9` also our table: 2^20 slots, 4 096 buckets of 256 for 5.8 MB. Done: (1) `chooseStaticContexts(data, quality, size_hint)` ports `ShouldUseComplexStaticContextMap` (`kStaticContextMapComplexUTF8`; the top five bits' entropy under the contexts ≤ 3 bits and ≥ 0.2 below without), `Core.size_hint` = the input (one-shot) or `StreamOptions.size_hint`; google took it on all five; (2) `.q9`'s table cap 2^20 → 2^22 slots (16 MiB, google q9 32 MiB; inputs under 512 KiB unchanged). Now: sizes **−1.3…+4.7 %** (langtag −1.3, names +0.2/+0.3, texdoc +0.9, zigstd +1.8/+0.9, oui +4.7/+4.2), `.q9` time **0.83–1.17×**, `.q6` **0.98–1.25×** over two runs (thirteen contexts cost `.q6` 3–12 %). Found on the way: a block with no literals under two or more static contexts was refused (the one-code price over zero literals had no symbol) and stored — a 16 KiB tail of a 17 MiB input 19 → 16 387 B; fixed, tested. **Left (outside the band, owner to decide):** google's large-input hashers — H68 at `.q6`, H6 at `.q9` (5-byte hash, 2^15 buckets; at `.q6` our matcher was 241 M vs google's 191 M cycles on the 3 MB source, +26 %) — the rest of `oui.txt`'s size (q6 google without H68: 1 171 440) and `.q6`'s 1.11–1.25×. **Owner 2026-10-16: port them. DONE:** `WideMatcher` (`MatcherT(true)`): google's H6 hash of five bytes (`kHashMul64 << 24`) into 2^15 buckets of 2^(quality − 1) slots — `.q6` 32 (4 MiB), `.q9` 256 (32 MiB) — where google's `ChooseHasher` takes H68/H6: a size hint ≥ 1 MiB (one-shot: the input; a stream: `size_hint`) and a window of 19–24 bits (`Core.kindFor`; a large window keeps the four-byte table, google's H65 is not ported; `.q11` keeps it too, google's H10 is a tree). Its slots' tags are compared on text too (five bytes leave fewer false candidates than four; without that, text was 1.06–1.28× at `.q6`). Same five inputs, three calls each, glibc on both sides: sizes **−1.6…+2.8 %** (oui +4.7 → +1.8 % at `.q6`, +4.2 → +2.8 % at `.q9`; zigstd +1.8 → +0.5 %), time `.q6` **0.96–1.11×**, `.q9` **0.89–1.12×** (the 1.11/1.12 are `langtag.xml`, the smallest at 1.3 MB: 0.95/0.86× before; the same kernel time as google's for the table's pages, 1.16× its user cycles). Bench payloads (under 1 MiB) unchanged: 0.38–1.07×.
-- **R15 Static-dictionary words at `.q6`/`.q9` (2026-10-15) — DONE at `.q9`; `.q6` left without (owner, 2026-10-15)** — see § Encoder "Static-dictionary words at `.q9`". At `.q6` the same search cost 5–10 % of its time in the bench (text 1.01 → 1.06–1.09× q6, font 1.03–1.07 → 1.14) for text −0.7 %, html −0.6 %, json −0.25 %, `cp852-utf8` 542 → 501 (q6 482). Switching it on is one comptime flag (`buildCommands(..., words, ...)` in `Core.compressBlock`). google also searches at q4 (H4 hasher, one bucket) — not tried.
-- **R17 ring distances at `.q9` (found 2026-10-16, open)** — google/brotli's qualities 7–8 try 10 and quality 9 tries 16 last distances (the ring's four and their ±1..±3 neighbours, `num_last_distances_to_check` in `ChooseHasher`); `.q9` tries the ring's four. Not measured.
-- **R16 `.q6` on small inputs: fixed cost per call (found 2026-10-15; DONE in part the same day)** — slices of the bench payloads (min of 7, wall clock, `smp_allocator`): 4 KiB `.q6` 0.32–0.40 ms vs q6 0.04–0.17 ms (2.4–8×), 16 KiB 1.35–1.76 vs 0.31–0.59 ms, 64 KiB 2.25–4.25 vs 1.2–2.6 ms. **Cause (perf, page-fault samples):** the match finder's table, one bucket per input byte up to the cap: `.q6` 2 MiB for 16 KiB, `.q9` 4 MiB for 4 KiB, `.q11` 16 MiB; the positions of a small input land on nearly every page, and `smp_allocator` maps a block that big afresh on every call (550–750 faults per call at 16 KiB). google/brotli has the same 2 MiB table (H58, 2^14 × 32 at q6) but glibc's malloc keeps it between calls (3 faults per call); with an arena that keeps ours, `.q6` text was already at google's time. **Fix:** `Effort.slotsLog(size)` — all slots together 2^k per input byte (k = 2 at `.q6`, 3 at `.q9`/`.q11`) up to the old cap, buckets 2^8 at least; one-shot and stream size the table for the input up to the window (`encoder.tableSize`). Sizes ±0.3 %. Now (same measure): `.q6` 4 KiB 0.10–0.21 ms vs 0.04–0.18, 16 KiB 0.46–0.81 vs 0.22–0.59, 64 KiB 1.66–3.06 vs 1.21–2.29 (1.2–2.5×); `.q9` 0.17–0.40 ms at 4 KiB (was 0.32–1.83; google q9 0.34–4.1). Tried and rejected: a shorter bucket at `.q9` for small inputs (depth to 16) — html 64 KiB +0.5…+5 %. **Left:** (a) fresh memory: under `smp_allocator` a 16 KiB `.q6` call is 1.6× its time with retained memory (the table alone is 256 KiB; k = 1 would halve it for +0.1–0.7 % size); (b) compute on binary blocks: font 4–64 KiB +30 % instructions vs q6 (1.4–1.6× with retained memory), text +18 %. **Compute DONE 2026-10-16** (slices of the bench payloads, 4/16/64 KiB, `perf stat` task-clock, 300 calls, both encoders on glibc's malloc — google's own allocator): before 0.93–1.12 on text, 1.36–1.45 on font; **now text 0.87–1.01, font 0.93 / 1.10 / 0.97**. Found by profiling google/brotli built from source with symbols beside ours, function against function (16 KiB font: the match finder was already even): (1) `std.sort.pdq`'s insertion pass swapped `assignLengths`' keys through byte stores, each followed by an 8-byte load of the same slot (store forwarding failed: a fifth of `.q6` on a 16 KiB font) — now google's Shell sort (`sortKeys`), same order; (2) parse: google's literal-run skipping and run-bounded inserts (§ Encoder "`.q6` through literal runs"; alone font 64 KiB 1.40× → 0.96×, but 3 % larger: our lookups found a quarter fewer copies — the missing two-byte copies at the second-last distance, now taken); (3) code headers 3.5× google's on fonts → the smoothed counts above (sizes now at or under google's on fonts); (4) zeroing through byte-wise `@memset`: distance histograms cleared 520 wide for 64 used, `clusterDistances` re-summing per partition (now each set of contexts costed once), command and literal counts — `.q6` font 4 KiB 1.29× → 1.07×; (5) the code-length code built through a decoder table and an allocated item list per code → `canonicalBits` and a stack buffer (`writeComplexCode` 65 k → 32 k cycles a call on 16 KiB); (6) `bitsEntropy` one running sum (an FP add's latency per symbol: twice google's time for the same 33 calls / 8 704 counts) → four sums over a `p·log2 p` table; (7) the context map's best try spliced instead of written a seventh time; (8) `DistRing.shortCode` from google's nibble tables, `.q4` without split-symbol arrays (`.q4` html −3 %, json −2 %). Bench (3 rounds): every row ≤ 1.07× (`c_q0_json`; was 1.10×). Bench payloads (128–200 KB, A/B old/new binaries, min of 5): `.q6` font −30 %, html/json/text −5…−7 %; `.q9` font −10 %, others −0…−4 %; `.q4` ±2 %; `.q11` even. **Left — owner's decision:** under `smp_allocator` the 256 KiB table at 16 KiB is mapped afresh per call (mmap + munmap + the kernel's zeroing: 1.1–2.4× google's time at 4–64 KiB, 1.25–1.4× at 64 KiB). Options: (a) document "pass an allocator that keeps memory (arena, `c_allocator`) for many small calls" — google relies on glibc doing exactly that; (b) k = 1 slot a byte (half the table, +0.1–0.7 % size); (c) a reusable encoder that keeps its tables between calls. **Owner 2026-10-16: (c) + (a). DONE:** `Compressor` (§ Encoder) and its doc comment. Found on the way — **Zig 0.16 `std.heap.smp_allocator` leaks in one thread** (std defect, measured with an instrumented copy of `SmpAllocator.zig`): a thread whose slot has no free block of a size class and no room in its slab moves to the next slot's lists for good (`max_alloc_search` 1), so what it freed before stays in the old slot; a buffer growing through the classes (alloc the bigger, then free the smaller) hops at every class and walks its blocks round the slots, mapping a new 64 KiB slab every call or two. A bare `ArrayList(u8)` grown to 3 KB and freed: +2.3 KB of RSS each time. One-shot `compressWith` under smp: `.q4` +41 KB a call on a 4 KiB input, `.q1` +3.5 KB, `.q0` +0.8 KB on 16 KiB (`.q6`/`.q9`/`.q11` flat or nearly) — since before this change. `Compressor` keeps every buffer it grows (block-writer arena, output buffer: the caller gets a copy), so after its first call it allocates the result and nothing else: flat at every level over 3 000 calls. (An arena per one-shot call leaked more — its own growth walks the classes — so `compressWith` allocates from `gpa` as before.) **Left (R16):** `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× google's time, a fixed cost per call (16 KiB and up 0.44–0.89×), unchanged by `Compressor`.
-- ~~**R17 Clustered literal model for small blocks at `.q6`/`.q9`**~~ **NOT PURSUED 2026-10-15 (owner: the goal is behaviour comparable to the reference within the tolerance bands, not beating it; greedy is within +0.1…+4 % of google q6 on these inputs, R17 would buy density beyond google for +10–60 % time)** *(found 2026-10-15)* — the model these levels had before the greedy port (`chooseLiteralModel`, still `.q11`'s with one block type) is much denser on small blocks: font tail 32 KiB 15 239 B vs greedy 18 984 (q6 18 452), 64 KiB 36 738 vs 44 039 (43 728); text 32 KiB 12 274 vs 12 663 (12 644); `cp852-utf8` 424 vs 501 (482). Cost +10–60 % of the time of such inputs. One condition in `writeCompressedBlock` (`effort == .q6 or .q9` and the block ≥ a threshold) selects it.
-- **Decoder speed (2026-10-15)** — text 1.155× → 1.13×, font 1.14× → 0.98× google's decode into a buffer: literal runs of ≥ 8 decoded checkless as `decode.c` does (bound: input for 15 bits a literal with a refill's margin — the reader's `data` is a many-pointer, so the bound is all that keeps a read inside the input; valgrind probe over damaged streams clean, a loosened bound caught), 8-bit roots everywhere, entries' pointer in the hot loop. Left on text (18 k commands in 152 KB, 95 % of copies under 16 bytes): we run 6.6 % more instructions but 16 % more cycles than google (IPC 2.06 vs 2.23), 37 % more branches; tried without effect: skipping the per-command room checks when the meta-block fits (branch count unchanged), the checkless loop for one-code literals only (text uses contexts). **Debt (H):** the module has a `testing.fuzz` harness but no deterministic driver (`~/.claude/fuzzing.md`); the decoder's hot loop now leans on an arithmetic bound — a driver with planted mutants is the right check. **Second look (same day, text 1.13–1.14× over four bench runs):** the gap is per command — ~18 000 commands a decode, ≈ 12 more instructions and 7–10 more branches each than google's; IPC is lower, not the instruction count (+6 %). Tried, measured with the bench (5 rounds, before/after in one session), all reverted: locals for short inserts (1–7 literals; the § CN aliasing — `self.out`, `len`, `block_length[0]` reloaded per byte) −0.8 % instructions, no cycles, and the bigger `step` cost html +12 %; dropping the never-taken `cnt < 15` check after `top`, the alphabet checks (`cmd < 704`, `code < dist_offset.len` — impossible, a code holds only its alphabet's symbols) and `d > pos`, with one compare for `1..max_distance`: −3.5 % instructions, −12 % branches, cycles within noise (text 1.131 vs 1.137); a second `top` after the command symbol so both extras need no check: +18 % branch misses (`cnt <= 56` there is data-dependent), text 1.19. Between builds of the same code this host moves decode ±5 % (layout), so a gain under that needs the one-binary switch, and the next try is structural: google's preloaded next command symbol (`ReadPreloadedSymbol`) or a ring/`copy` shape closer to `decode.c`. **Third look (2026-10-16): text 1.14× → 1.02×** (bench, 3 rounds; html 1.01, json 0.92, font 1.01). Precise branch-miss samples (`br_misp_retired.all_branches:pp`) put a third of the decoder's misses on `HotBits.top`'s `if (cnt <= 56) refill()` — whether a command header or distance needs a refill is data. `top` is now branch-free (`refill`'s arithmetic does nothing harmful from 57..63 bits and is masked off at 64): misses 3.57 M → 2.40 M per 200 decodes (google 3.2 M), +8 % instructions, −8 % cycles. Also `hotCommands` is a function of its own with `noalias` `self` and output sink — the output buffer is neither, so their fields stay in registers across its stores (−13 % loads, −2 % instructions, 2–3 % of cycles).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **No-panic sweep leftovers (LOW):** the match finders' internals (q0–q11, `block_split`, `greedy_split`)
+  were not swept against arbitrary inputs, only their entry points and `u32` casts. The two documented
+  limits (large-window `window_bits` refused by the default decoder, uncapped `parallel.threads`) are
+  under *DoS / safety posture*.
+- **Zig 0.17: a wide `@bitCast`/`readInt` on a possibly hot path:** 0.17 lowers a `@bitCast` between
+  `[N]u8` (N > 8) and a wider-element type (here `u128`) to a per-byte loop (~8× the instructions; Zig
+  issue #36256): `copy16` (per match copy in the decoder, `src/decoder.zig`). Measure first (cycles and
+  instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through
+  `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+- **Build option: encoder quality cap** (mechanism and checklist in CONVENTIONS §4.2). Measure first (HTTPS
+  size probe or `nm -S --size-sort` on a consumer binary); add a knob only for a measured gain of roughly
+  ≥ 100 KB or a consumer request. The 122 784-byte RFC 7932 dictionary (`src/dictionary.zig`) is needed by
+  the decoder, so it is not a knob; the encoder carries six effort pipelines (q0..q11, zopfli at the top).
+  `.small` would cap quality (e.g. ≤ 9) and refuse a higher one with an error. First verify that a
+  decoder-only consumer does not already avoid the encoder (Sema is lazy): then the knob only helps
+  encoding consumers. Unmeasured.
+- **R17 Ring distances at `.q9`:** google/brotli's qualities 7–8 try 10 and quality 9 tries 16 last distances
+  (the ring's four and their ±1..±3 neighbours, `num_last_distances_to_check` in `ChooseHasher`); `.q9`
+  tries the ring's four. Not measured.
+- **R18 Parallel compression on a quiet host:** `parallel.compress`'s wall time with 1–8 workers on 5–8 MB
+  inputs, measured only under load (1.3–2.4× one pass with 8 workers). Expected near the job count, less
+  the cuts' 0–9 % CPU.
+- **R19 Speed rows outside the bench** (owner: S2 = feature parity + the bench within 1.1×; these rows are
+  Backlog, not a condition): `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (a fixed cost per call; 0.44–0.89× from
+  16 KiB up); one-shot `compressWith` `.q6` on 4–64 KiB under `smp_allocator` 1.10–1.83× (the allocator maps
+  the 256 KiB table afresh per call; `Compressor` 0.89–1.11×, glibc 0.87–1.10×); `Compressor` `.q4` up to
+  1.23×; a raw dictionary prepared per call up to 1.22× (prepared once: in the band); `.q6`/`.q9` on inputs
+  of 1 MiB and more up to 1.11×/1.12× (`langtag`); `.q1` with a dictionary 1.17–1.44× (exempt: google's q1
+  ignores the dictionary, ours is 14–21 % smaller).
+- **R20 Niche features of the field, not implemented** (owner: Backlog): concatenable/appendable streams and
+  `STREAM_OFFSET` stitching (rust-brotli, google), NPOSTFIX/NDIRECT as parameters, several raw dictionaries
+  on the encoder (google: experimental), google 1.2.0's tuning switches (base64 detection, SIMD hasher,
+  H59), a peak-memory estimate, the decoder's no-ring-reallocation switch.
+- **Decoder speed:** the remaining text gap is per command (google's preloaded next command symbol,
+  `ReadPreloadedSymbol`, or a ring/copy shape closer to `decode.c` are the untried structural ideas); the
+  decoder is within the band, so this is an idea, not a task.

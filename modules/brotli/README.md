@@ -15,7 +15,7 @@ Brotli, so an HTTPS server that wants `br` needs this.
   literals, insert-and-copy commands and distances, with literal context
   modelling (`.q6`/`.q9`/`.q11`), block splitting (`.q9`/`.q11`), distance short codes and
   contexts, and an automatic **store-mode fallback** so the output is never meaningfully
-  larger than the input. ~3x on English text (`alice29.txt` 152 089 -> 51 327
+  larger than the input. ~3x on English text (`alice29.txt` 152 089 -> 52 275
   at `.q6`, between reference `brotli` quality 5 and 9; 46 378 at `.q11`,
   0.2 % below quality 11: google's zopfli parse + static-dictionary words).
   Levels are named after the google/brotli quality they stand in for — see `SPEC.md`.
@@ -66,7 +66,8 @@ defer gpa.free(br);
 // maps a quality 0..11.
 // Not byte-identical to the reference, about the same size in about the same time;
 // window_bits 10..24 (default: 16
-// for inputs up to 64 KiB, else 21).
+// for inputs up to 64 KiB, else 21); 25..30 write a large-window stream
+// (RFC 9841) that a decoder accepts only with `.large_window = true`.
 const br_q9 = try brotli.compressWith(gpa, data, .{ .effort = .q9 });
 
 // A raw prefix dictionary (RFC 9841), and Content-Encoding: dcb (RFC 9842):
@@ -88,6 +89,14 @@ defer sw.deinit();
 try sw.writer.writeAll(chunk);
 try sw.writer.flush();
 try sw.finish();
+
+// One encoder for call after call (tables and buffers kept between calls),
+// a dictionary indexed once for many compressions, and one stream cut into
+// jobs on several threads (the same bytes for any worker count):
+var c = brotli.Compressor.init(gpa);
+defer c.deinit();
+const br2 = try c.compress(data, .{ .effort = .q6 });
+const par = try brotli.parallel.compress(gpa, io, big, .{ .effort = .q9 }, .{});
 
 // Errors: brotli.BrotliError (TruncatedInput, InvalidHuffman, InvalidDistance,
 // InvalidDictionary, OutputTooLarge, InvalidPadding, ...).
@@ -125,3 +134,9 @@ google/brotli — which is the point of an anchor.
 The writer's own pieces — the complex-prefix-code header, the `16`/`17` repeat
 chains, length-limited Huffman, and the command/distance code tables — are unit
 tested against the decoder's own `BitReader`, `huffman.zig` and `tables.zig`.
+
+## Not provided
+
+No encoder for serialized shared dictionaries, no `.q6` static-dictionary words, no command-line tool, and no
+byte-identity with google/brotli's streams (the levels promise its size in about its time). The reasons are
+in `SPEC.md` under *What is deliberately not done*; open work is under *Backlog / deferred*.
