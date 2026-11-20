@@ -84,9 +84,9 @@
 //! for the concurrency bound (per-connection response collection is
 //! serialized) and the body-buffering caveat (the reused h2 client
 //! assembles bodies in memory, bounded by `Config.h2_max_body_bytes`,
-//! where the h1 path streams them). Trailers are not forwarded over h2
-//! (the h2 client does not surface them — consistent with the module's
-//! read-only-trailer posture).
+//! where the h1 path streams them). A response trailer section from the
+//! backend is relayed to the client (as a chunked h1 trailer section, or h2
+//! trailers), minus the fields no trailer may carry.
 //!
 //! ## Known gaps (this pass)
 //!
@@ -656,6 +656,14 @@ pub const ProxyHandler = struct {
                 std.ascii.eqlIgnoreCase(f.name, "via")) continue;
             relayField(rw, FieldIter{ .fields = res.headers.fields }, at, f.name, f.value) catch return self.relayFailed(rw, req);
         }
+        // Response trailers (RFC 9113 §8.1): advertised and set before the
+        // body, so the response goes out chunked with the section after it;
+        // a field a trailer section must never carry, or one the writer
+        // cannot take (HEAD, no body), is dropped.
+        if (res.trailers) |tl| {
+            for (tl.fields) |f| rw.declareTrailers(&.{f.name}) catch {};
+            for (tl.fields) |f| rw.setTrailer(f.name, f.value) catch {};
+        }
         // The (buffered) body is copied into the writer, so — as on the h1
         // path — the deferred `res.deinit(gpa)` is not racing an `end()`.
         var body: std.Io.Reader = .fixed(res.body);
@@ -1178,6 +1186,11 @@ fn originHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void
         // managed away by the ResponseWriter — so it really hits the wire).
         try rw.setHeader("Keep-Alive", "timeout=5");
         try rw.writeAll("reflected");
+    } else if (std.mem.eql(u8, req.path, "/trailers")) {
+        try rw.declareTrailers(&.{ "X-Sum", "X-Count" });
+        try rw.writeAll("body with trailers");
+        try rw.setTrailer("X-Sum", "ab12");
+        try rw.setTrailer("X-Count", "18");
     } else if (std.mem.eql(u8, req.path, "/echo")) {
         var buf: [1 << 20]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -1830,6 +1843,18 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
         // Response-side Via injected; backend's hop-by-hop Keep-Alive stripped.
         try testing.expect(std.mem.find(u8, res.header("via").?, "1.1 zig-libs") != null);
         try testing.expectEqual(@as(?[]const u8, null), res.header("keep-alive"));
+    }
+
+    { // A trailer section from the h2 backend reaches the h1 client.
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/trailers", .{proxy_port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("body with trailers", body);
+        try testing.expectEqualStrings("ab12", res.trailer("x-sum").?);
+        try testing.expectEqualStrings("18", res.trailer("x-count").?);
     }
 
     { // POST /echo, large body → exercises h2 send-side flow control.
