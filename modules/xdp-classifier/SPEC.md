@@ -37,18 +37,11 @@ hand-written XDP data plane of the shapers the module is modelled on. Only READM
 **Where we are ahead:** the only path to a verifier-checked XDP classifier without clang, LLVM or a C
 toolchain: a rule set in, program and LPM/CPUMAP/scratch maps out, with a decision
 oracle (`lookupReference`) that tests can compare kernel results against. **Where we are behind:**
-the real shapers classify IPv6 and VLAN-tagged traffic and walk IPv4 options; this module
-sends all of that to the default class (→ Backlog), and it emits nothing on the `tc` side of the pipeline.
-
-**Re-assessed 2026-10-06** (no new survey; the table above is a week old and nothing in it moved).
-VLAN tag skip (0..2 tags, 802.1Q and 802.1ad at either depth) and IPv6 classification (a separate
-20-byte-key LPM trie on the fixed header's source/destination address) landed, in both the
-classifier and the steer program. Against LibreQoS and xdp-cpumap-tc that moves IPv6 and tagged
-links from **behind** to **even** for the address-classification job this module does (their
-parsers' exact limits — tag depth, PPPoE, extension headers — were not read, the sources being
-GPL / unlicensed). Still **behind**: IPv4 options (IHL > 5 falls to default), the `tc` half
-(queue_mapping/class-setting TC program), PPPoE-encapsulated traffic — all Backlog-grade, none
-on the main path of an IPv4/IPv6 edge on a tagged or untagged link. Hence `core`.
+IPv4 options (IHL > 5 falls to the default class), the `tc` half of the pipeline (no queue_mapping/class-setting TC
+program is emitted) and PPPoE-encapsulated traffic; none is on the main path of an IPv4/IPv6 edge on a tagged or
+untagged link, hence `core`. IPv6 and VLAN-tagged links (0..2 tags, 802.1Q and 802.1ad) are classified, which makes this
+module even with LibreQoS and xdp-cpumap-tc for the address-classification job it does (their parsers' exact limits —
+tag depth, PPPoE, extension headers — were not read, the sources being GPL or unlicensed).
 
 ## Tier verdict: no Fable core (full argument)
 
@@ -144,15 +137,7 @@ and silent at the Zig-compile level). Two additions specific to this module:
   check — byte-for-byte the same verdict on every input, including error
   *precedence* when a table has both a duplicate and a structural defect —
   in O(n log n) via a caller-supplied sort scratch buffer instead of the
-  all-pairs scan. Independently re-measured 2026-09-15 (interleaved A/B,
-  same process, worst case — no duplicates, no structural failure, so
-  neither function exits early): 256 rules 1.87ms → 28µs, 16384 rules
-  8.15s → 1.83ms, and the O(n²)-vs-O(n log n) shape holds throughout
-  (`validate`'s ~4.0x-per-doubling ratio unchanged; `validateSorted`'s
-  ratio ~1.8–2.3x per doubling, i.e. linearithmic, not linear — expected,
-  since it still sorts). Absolute numbers are this machine under
-  concurrent campaign load (see F3's measurement note); the *ratio*, not
-  the millisecond count, is what the doubling series demonstrates.
+  all-pairs scan.
 - **The two key encodings (populate-time and runtime) must agree
   byte-for-byte.** `rules.LpmKey.toBytes` (used by `maps.populateRule`) and
   `classifier.buildClassifierProgram`'s in-program key construction (point 4
@@ -194,13 +179,21 @@ file for the general methodology. This module's specific provenance:
 - To re-derive or extend the golden vector, follow `ebpf/SPEC.md`'s
   clang/`llvm-objdump`/`bpftool prog dump xlated` procedure directly — nothing
   about that methodology is specific to `ebpf`'s own three programs.
-- **VLAN / IPv6 (2026-10-06): not clang-cross-checked.** The two-tag golden
+- **VLAN / IPv6: not clang-cross-checked.** The two-tag golden
   (`golden_classifier_vlan2`) is SELF-DERIVED by hand from the documented
   layout. What anchors the new code instead is stronger than an instruction
   shape: the real kernel verifies every variant and then executes it on real
   frames (`BPF_PROG_TEST_RUN`), compared against hand-written classes — see
   the harness section. `.vlan_depth = .none` without an IPv6 map still emits
   the clang-cross-checked program above, byte for byte.
+
+## Storage contract
+
+The builders return a slice into a file-scope buffer (`prog_buf`, 128 instruction slots; `buildCpumapSteerProgram`
+has its own `steer_prog_buf`), as `ebpf.programs.zig`'s builders do: the signature has no allocator, and runtime fd
+values are baked into the `ld_map_fd` immediates. Build, then load: a second `buildClassifierProgram` call overwrites
+the first call's slice, while one classifier and one steer program may be held at once. This is why
+`meta.concurrency` is `single_owner`.
 
 ## CPUMAP steering (`buildCpumapSteerProgram` + `createCpuMap`/`populateCpu`)
 
@@ -240,13 +233,12 @@ BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
   `% cpu_count` reduction keeps the redirect index in `[0, cpu_count)`, which is
   the CPUMAP's range only when `cpu_count <= max_entries` — so
   `CpumapSteerOptions.cpumap_max_entries` is required and a larger `cpu_count`
-  is refused at build (`CpuCountExceedsCpumap`, A1 F2; before, a matched packet
-  past the map was `XDP_ABORTED` while LPM misses passed). A fully populated
+  is refused at build (`CpuCountExceedsCpumap`; a matched packet past the map would be `XDP_ABORTED` while LPM misses pass). A fully populated
   CPUMAP of at least `cpu_count` slots therefore never misses; `redirect_flags` (default 0) may be set to
   `XDP_PASS` on kernels with the redirect-fallback-action feature (≥ 5.15) for a
   defensive fallback on an unpopulated slot — the program never depends on it.
 
-## VLAN and IPv6 (2026-10-06)
+## VLAN and IPv6
 
 Same tier verdict — no Fable core — because both are the existing fixed-offset
 pattern again, not a dynamic offset:
@@ -285,132 +277,105 @@ pattern again, not a dynamic offset:
   for the IPv6 block: 99 at most (pinned), against the verifier's 4096
   unprivileged / 1M privileged instruction limit and a 128-slot builder buffer.
 
-## Verification harness
+## Verification
 
-- **Offline, unprivileged (always runs):** `src/classifier.zig`'s golden
-  byte-exact test; structural invariant tests (every packet-derived read
-  dominated by the bounds check; both map lookups null-checked before
-  deref; exactly one `exit`, last instruction, valid XDP return value; every
-  stack store stays within the 8-byte key region; the class register `r6`
-  never appears in any role but the three expected ones); an edge-case test
-  for a default class `>= 0x8000_0000` (the `@bitCast`-not-`@intCast`
-  correctness point, see `classifier.zig` point on the DEFAULT block).
-  `src/rules.zig`'s rule-table validation tests (well-formed/invalid-prefix/
-  non-canonical/duplicate/over-capacity) plus a seeded hostile sweep across
-  `u6`'s full `prefix_len` range (0..63, so 33..63 deliberately
-  out-of-spec) crossed with pseudo-random address/class bytes and ruleset
-  sizes 0..8 — asserts no panic, any declared error or success is
-  acceptable.
-- **Privileged, CAP_BPF/root-gated (skips otherwise, matching `ebpf`'s own
-  discipline):** `classifier.zig`'s real-load test hands the built program
-  to the live in-kernel verifier via `ebpf.load`; `maps.zig`'s tests create
-  both real map types, populate a rule, and confirm a REAL
-  `bpf_map_lookup_elem` round-trip (both the single-rule and
-  whole-`RuleSet` population paths), cross-checked against
-  `rules.lookupReference`'s userspace prediction for the same ruleset.
-- **CPUMAP steering, offline (always runs):** a byte-exact golden for
-  `buildCpumapSteerProgram` (its parse/lookup prefix reused verbatim from the
-  classifier golden); structural tests (redirect_map with helper id 51,
-  cpumap referenced via a pseudo `ld_map_fd`, key reduced `% cpu_count`, every
-  non-hit path falling through to a single trailing `XDP_PASS`); the
-  `key_field = .dst` offset check; the `cpu_count == 0` build-error check; and a
-  **permanent positive-control test** that corrupts the redirect helper id in a
-  copy of a real program and asserts the structural predicate flips to false
-  (guarding against a vacuous check). The `CpumapVal` size/offset `smoke` test
-  is likewise unprivileged.
-- **CPUMAP steering, CAP_BPF/root-gated:** `createCpuMap` + `populateCpu` +
-  real `bpf_map_lookup_elem` round-trip of a `CpumapVal`; and a real
-  `ebpf.load` of `buildCpumapSteerProgram` against a live CPUMAP fd, asserting
-  the in-kernel verifier accepts it (loaded under `"GPL"` to sidestep any
-  gpl-only-helper ambiguity for `bpf_redirect_map`). Skips cleanly unprivileged.
-- **VLAN / IPv6 packet path, offline (always runs):** `vm.zig`'s interpreter
-  now enforces the verifier's packet-access rule dynamically — a packet read
-  past the largest `data_end`-checked pointer on the executed path fails with
-  `UnprovenPacketRead` regardless of the actual packet length — and models the
-  IPv6 trie. Over all 12 program variants (`vlan_depth` 0..2 × IPv6 on/off ×
-  src/dst): 17 hand-built real frames (untagged / 802.1Q / VID 0 / 802.1ad /
-  QinQ / double-8100 / triple-tagged / `0x9100` / IPv4 IHL 6 / IPv6 untagged,
-  tagged, QinQ, with a Hop-by-Hop header / IPv6 miss / version-4-in-`86DD` /
-  ARP) checked against hand-written classes, then **each truncated at every
-  length** against the hand-written boundary (34 / 54 + 4 per tag); the steer
-  program over the same frames; a 108k-frame seeded sweep and the `testing.fuzz`
-  harness against `packetMatchReference` (rewritten from the README prose for
-  VLAN + IPv6); a byte-exact hand-derived golden for the default (2-tag,
-  IPv4-only) program; a pinned instruction count; and a **positive control**
-  (weaken one tag-level check 34 → 30, or the IPv6 check 54 → 34, and the
-  interpreter rejects the program as an unproven read).
-- **VLAN / IPv6 packet path, CAP_BPF/root-gated (`src/kernel_test.zig`):** the
-  real kernel is the oracle. Every classifier and steer variant is loaded by
-  the in-kernel verifier, also with `BPF_F_STRICT_ALIGNMENT`; then the kernel
-  EXECUTES it (`BPF_PROG_TEST_RUN`) on the same 17 frames truncated at every
-  length from 14 (the kernel's `ETH_HLEN` floor) up, against real `LPM_TRIE`
-  maps filled by `populateRuleSet`/`populateRuleSet6`, and the class read back
-  from the per-CPU scratch map must equal the hand-written answer and the
-  interpreter's (5000+ kernel runs); a 3600-frame random sweep compares kernel,
-  interpreter and reference; the steer variants must return `XDP_REDIRECT`
-  exactly for matched frames. Kernel positive control: the same two weakened
-  programs are REFUSED by the real verifier (`EACCES`). Measured 2026-10-06 on
-  kernel 6.18.44 as root (this development container has `bpf()`): all tests
-  pass in Debug and ReleaseSafe with nothing skipped; an injected off-by-one
-  in the kernel comparison fails it (`got 4, want 3`). On a host without
-  CAP_BPF these SKIP — read such a run as "the kernel never judged this".
-- Green in Debug and `-Doptimize=ReleaseFast`.
+- **Run:** `scripts/modtest xdp-classifier`. The privileged tests (CAP_BPF/root) run in the VM lane,
+  `scripts/test.sh vm xdp-classifier` (real root in a qemu Debian guest, the same lane the sibling `ebpf` uses).
+  On any host without CAP_BPF they SKIP, and a Zig skip is a pass: read a green host run as "the kernel never judged
+  this" (a forced failure injected into a privileged test turns the VM lane red while the host run stays green).
+- **Offline, unprivileged (always runs):** `src/classifier.zig`'s golden byte-exact test; structural invariant tests
+  (every packet-derived read dominated by the bounds check; both map lookups null-checked before deref; exactly one
+  `exit`, last instruction, valid XDP return value; every stack store stays within the 8-byte key region; the class
+  register `r6` never appears in any role but the three expected ones); an edge-case test for a default class
+  `>= 0x8000_0000` (the `@bitCast`-not-`@intCast` correctness point, see `classifier.zig` point on the DEFAULT block).
+  `src/rules.zig`'s rule-table validation tests (well-formed, invalid prefix, non-canonical, duplicate, over capacity,
+  for both address families) plus a seeded hostile sweep across `u6`'s full `prefix_len` range (0..63, so 33..63 are
+  deliberately out of spec) crossed with pseudo-random address/class bytes and ruleset sizes: no panic, any declared
+  error or success is acceptable; `validateSorted` against `validate` on every input, duplicate-heavy tables and
+  sort-key collisions included.
+- **Privileged, CAP_BPF/root-gated (skips otherwise, matching `ebpf`'s own discipline):** `classifier.zig`'s real-load
+  test hands the built program to the live in-kernel verifier via `ebpf.load`; `maps.zig`'s tests create both real map
+  types, populate a rule, and confirm a REAL `bpf_map_lookup_elem` round-trip (single-rule and whole-`RuleSet`
+  population, IPv4 and IPv6 including the /128 key and the refused /129), cross-checked against
+  `rules.lookupReference`'s userspace prediction for the same ruleset; a scratch lookup moves exactly
+  `scratchTransferLen()` bytes, measured against the kernel.
+- **CPUMAP steering, offline (always runs):** a byte-exact golden for `buildCpumapSteerProgram` (its parse/lookup
+  prefix reused verbatim from the classifier golden); structural tests (redirect_map with helper id 51, cpumap
+  referenced via a pseudo `ld_map_fd`, key reduced `% cpu_count`, every non-hit path falling through to a single
+  trailing `XDP_PASS`); the `key_field = .dst` offset check; the `cpu_count == 0` and `cpu_count > cpumap_max_entries`
+  build-error checks; and a **permanent positive-control test** that corrupts the redirect helper id in a copy of a
+  real program and asserts the structural predicate flips to false (guarding against a vacuous check). The
+  `CpumapVal` size/offset `smoke` test is likewise unprivileged.
+- **CPUMAP steering, CAP_BPF/root-gated:** `createCpuMap` + `populateCpu` + real `bpf_map_lookup_elem` round-trip of a
+  `CpumapVal`; and a real `ebpf.load` of `buildCpumapSteerProgram` against a live CPUMAP fd, asserting the in-kernel
+  verifier accepts it (loaded under `"GPL"` to sidestep any gpl-only-helper ambiguity for `bpf_redirect_map`).
+- **VLAN / IPv6 packet path, offline (always runs):** `vm.zig`'s interpreter enforces the verifier's packet-access
+  rule dynamically (a packet read past the largest `data_end`-checked pointer on the executed path fails with
+  `UnprovenPacketRead` regardless of the actual packet length) and models the IPv6 trie. Over every program variant
+  (`vlan_depth` 0..2 × IPv6 on/off × src/dst): hand-built real frames (untagged, 802.1Q, VID 0, 802.1ad, QinQ,
+  double-8100, triple-tagged, `0x9100`, IPv4 IHL 6, IPv6 untagged, tagged, QinQ and with a Hop-by-Hop header, an IPv6
+  miss, version-4-in-`86DD`, ARP) checked against hand-written classes, then **each truncated at every length** against
+  the hand-written boundary (34, or 54 for IPv6, plus 4 per tag); the steer program over the same frames; a seeded
+  sweep and the `testing.fuzz` harness against `packetMatchReference` (rewritten from the README prose for VLAN +
+  IPv6); a byte-exact hand-derived golden for the default (2-tag, IPv4-only) program; a pinned instruction count
+  (38 / +7 per tag / 99 at most); and a **positive control** (weaken one tag-level check 34 → 30, or the IPv6 check
+  54 → 34, and the interpreter rejects the program as an unproven read).
+- **VLAN / IPv6 packet path, CAP_BPF/root-gated (`src/kernel_test.zig`):** the real kernel is the oracle. Every
+  classifier and steer variant is loaded by the in-kernel verifier, also with `BPF_F_STRICT_ALIGNMENT`; then the
+  kernel EXECUTES it (`BPF_PROG_TEST_RUN`) on the same frames truncated at every length from 14 (the kernel's
+  `ETH_HLEN` floor) up, against real `LPM_TRIE` maps filled by `populateRuleSet`/`populateRuleSet6`, and the class read
+  back from the per-CPU scratch map must equal the hand-written answer and the interpreter's; a random-frame sweep
+  compares kernel, interpreter and reference; the steer variants must return `XDP_REDIRECT` exactly for matched
+  frames. Kernel positive control: the same two weakened programs are REFUSED by the real verifier (`EACCES`).
+- **Fuzz** (`XDP_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver): harnesses `xdp-packet` (`vm.zig`: the
+  emitted classifier against the independent reference), `xdp-validate`, `xdp-lookup`, `xdp-validate-sorted` and
+  `xdp-validate6` (`rules.zig`), each with a fixed seed loop that checks it reaches every outcome in every test run.
+- **Mutation:** the schemata runs cover `src/classifier.zig`, `src/rules.zig` and `src/maps.zig`: every constant,
+  operand, skipped emit, jump target and register of both program builders and of the shared parse/lookup emitter; the
+  VLAN/IPv6 loop and dispatch bookkeeping; `VlanDepth`, the key-offset tables, the `Buf`/`MissJumps` patch machinery
+  and the steer build errors; every guard, boundary, error value and sort key of `RuleSet`/`RuleSet6` `validate` and
+  `validateSorted`, `isCanonical`/`hostBitsClear`, both LPM keys and both reference lookups; the BPF_MAP_CREATE attrs,
+  `mapPopulateError` and the scratch-transfer arithmetic. `vm.zig` (the offline interpreter and the reference parser)
+  is the test oracle, not a product source, and is not mutated; its differential and truncation sweeps and the golden
+  vectors are what kill the emitter mutants. What stays unobservable offline is what `createLpmTrieMap` and
+  `createLpm6TrieMap` hand to `bpf(2)`, what `populateRule`/`populateRuleSet`/`populateCpu` and the scratch
+  read-write helpers put into or read from a kernel map, the 1024-CPU stack-buffer guard and the unreadable-sysfs
+  error: they need CAP_BPF or a host with more CPUs, and the VM lane's round-trip tests are what would see them.
+- **Constant time:** n/a — an XDP classifier over public header bytes.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-**Audit 2026-11-17 (whole-module mutation).** 330 schemata mutants over `src/classifier.zig`, `src/rules.zig` and
-`src/maps.zig` (every constant, operand, skipped emit, jump target and register of both program builders and of the
-shared parse/lookup emitter; the VLAN/IPv6 loop and dispatch bookkeeping; `VlanDepth`, the key-offset tables, the
-`Buf`/`MissJumps` patch machinery and the steer build errors; every guard, boundary, error value and sort key of
-`RuleSet`/`RuleSet6` validate and validateSorted, `isCanonical`/`hostBitsClear`, both LPM keys and both reference
-lookups; the BPF_MAP_CREATE attrs, `mapPopulateError` and the scratch-transfer arithmetic), ReleaseSafe, one build per
-round, each mutant under `setsid -w timeout` and `ulimit -v`, baseline first. `vm.zig` (the offline interpreter and the
-reference parser) is the test oracle, not a product source, and is not mutated; its differential sweeps, truncation
-sweeps and the golden vectors are what kill the emitter mutants (291 of 330 in round 1). Round 1: 291 killed, 39
-survived. Seven tests added (76 pass, 17 skip without CAP_BPF): a /128 IPv6 host rule and a case for it in the
-interpreter's fixtures (a lookup key carrying prefixlen 127 finds the covering /64 instead), `validate`/`validateSorted`
-accepting a /32 host rule, a /31 and the /0 default, a sort-key collision table (`(/2, 128.0.0.0)`, `(/3, 0.0.0.0)`,
-`(/2, 128.0.0.0)`: a shift of 31 hides the duplicate from `validateSorted`), `lookupReference` on a /32 host rule next to
-the covering /8, `LpmKey6.fromPrefix` carrying the address, `mapPopulateError` arm by arm, and `scratchTransferLen`
-against the possible-CPU count (8 CPUs make a 4-byte and an 8-byte stride equally divisible, so the old divisibility
-check could not tell them apart). Final: 301 killed, 29 equivalent or unobservable, none surviving. Equivalent (9): the
-`ld_map_fd2` high word of a non-negative fd (4); a descending sort order (3: it still groups equal keys); `isCanonical`
-at /32 (the mask is 0); `hostBitsClear` at `prefix_len == byte_start` (keep is 0 either way). Unobservable here (20): what
-`createLpmTrieMap`/`createLpm6TrieMap` hand to `bpf(2)`, what `populateRule`/`populateRuleSet`/`populateCpu`/the scratch
-read-write helpers put into or read from a kernel map, the 1024-CPU stack-buffer guard and the unreadable-sysfs error all
-need CAP_BPF or a host with more CPUs; the module's VM lane (`scripts/vm/run.sh xdp-classifier`) runs the round-trip tests
-that would see them, and was not run for this audit.
+## What is deliberately not done
 
-## Backlog / deliberately out of scope
+- **More than two VLAN tags, TPIDs other than `0x8100`/`0x88A8`** (legacy `0x9100`/`0x9200` QinQ), **classifying by
+  VID/PCP:** a frame past `vlan_depth` or with another TPID gets the default class; classification is by address on every
+  VLAN.
+- **IPv6 extension-header walking:** not needed for an address key (both addresses sit in the fixed header), and it
+  would be the dynamic-offset, bounded-loop problem the tier verdict names as the Fable-tier step.
+- **A DROP-on-no-match program variant** (README "Scope"): a one-instruction change, not built because it is not what
+  LibreQoS-style classify-then-shape wants by default; the program always returns `XDP_PASS`.
+- **A `bpf_xdp_adjust_meta`-based per-packet metadata handoff** to a downstream `tc` classifier: a different mechanism
+  (passing the class inline in packet metadata instead of steering by CPU).
+- **Per-flow (rather than per-subscriber) output keying** and a flow-keyed output map: the CPU-selection note under
+  *CPUMAP steering* argues against it for a LibreQoS-style shaper; the scratch map is a single slot.
 
-- **IPv6 and VLAN tags are now built** (2026-10-06, "VLAN and IPv6" above).
-  What they deliberately leave out: more than two tags; TPIDs other than
-  `0x8100`/`0x88A8` (`0x9100`/`0x9200` legacy QinQ); classifying by VID;
-  IPv6 extension-header walking (not needed for an address key); IPv4/IPv6
-  inside PPPoE sessions (EtherType `0x8864`, an 8-byte header — a further
-  fixed-offset skip, the same shape as a VLAN tag, and the next candidate if a
-  BNG-side deployment needs it).
-- **Variable-length IPv4 options.** Would need a DYNAMIC, packet-derived
-  pointer offset (IHL nibble × 4, bounds-checked before use) — genuinely a
-  step up in verifier-interaction complexity from anything in this module
-  (dynamic scalar-range-tracked pointer arithmetic vs. this module's fixed
-  compile-time offsets throughout) and the most plausible future Fable-tier
-  candidate if this module is extended, per the tier-verdict section above.
-- **CPUMAP steering is now built** (`buildCpumapSteerProgram`, see the CPUMAP
-  section above) — the production output path that redirects a matched flow to
-  a per-CPU `tc` MQ/HTB tree. Still out of scope: a `bpf_xdp_adjust_meta`-based
-  per-packet metadata handoff to a downstream `tc` classifier (a different
-  mechanism — passing the class inline in packet metadata rather than steering
-  by CPU), and a per-flow (rather than per-subscriber) output keying, which the
-  CPU-selection note above argues against for a LibreQoS-style shaper.
-- A DROP-on-no-match program variant (README "Scope") — a one-instruction
-  change, not built since it's not what LibreQoS-style classify-then-shape
-  wants by default.
+## Backlog / deferred
 
-Survey findings (survey 2026-09-30), ranked; all fit CONVENTIONS §2 and are already described above as additive:
-
-1. ~~**VLAN tag skip (`vlan_depth`)**~~ (survey 2026-09-30) — DONE 2026-10-06.
-2. ~~**IPv6 classification**~~ (survey 2026-09-30) — DONE 2026-10-06.
-3. **IPv4 options (variable IHL)** (survey 2026-09-30) — rare in practice, verifier-hard. Effort: medium-large.
-4. **The `tc` half of the pipeline** (survey 2026-09-30) — xdp-cpumap-tc pairs the cpumap redirect with a TC BPF program that sets `queue_mapping` and the class handle; here that program is not generated (needs `tc` module support for `clsact` and a `bpf` classifier, see the `tc` backlog). Effort: medium. PARTIAL (2026-11-18): `tc` has typed `ingress`/`clsact` qdiscs and a classic-bytecode `bpf` filter since 2026-11-17; attaching an eBPF-object classifier (the program this item wants generated) is still open in `tc`.
+- **Variable-length IPv4 options** (IHL > 5; survey item 3, rare in practice, effort medium-large): needs a DYNAMIC,
+  packet-derived pointer offset (IHL nibble × 4, bounds-checked before use), a step up in verifier-interaction
+  complexity from the fixed compile-time offsets used everywhere else (dynamic scalar-range-tracked pointer
+  arithmetic), and the most plausible future Fable-tier candidate if this module is extended (see the tier verdict).
+- **PPPoE sessions** (EtherType `0x8864`, an 8-byte header): a further fixed-offset skip, the same shape as a VLAN tag;
+  the next candidate if a BNG-side deployment needs it.
+- **The `tc` half of the pipeline** (survey item 4, effort medium): xdp-cpumap-tc pairs the cpumap redirect with a TC
+  BPF program that sets `queue_mapping` and the class handle; this module does not generate it. The `tc` module has
+  typed `ingress`/`clsact` qdiscs and a classic-bytecode `bpf` filter; attaching an eBPF-object classifier, which is
+  what this item wants generated, is still open in `tc`.
+- **Zig 0.17: a wide `readInt(u128)` in the offline interpreter** — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and
+  a wider-element type, and `readInt`/`writeInt(u128)`, to a per-byte loop (about 8× the instructions; codeberg
+  ziglang/zig #36256). The one site is `vm.zig`'s `lpm6Lookup` (the test interpreter; no product path uses `u128`).
+  Measure first (cycles and instructions 0.16 against 0.17, or the cast's share in a profile); fix only if it shows:
+  load/store through `*align(1) uN` with `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
 ## Anchoring
 
@@ -428,19 +393,4 @@ classes (`src/kernel_test.zig`, CAP_BPF-gated; the same comparison runs
 offline against `vm.zig`'s interpreter, which is SELF-anchored). The CAP_BPF kernel-load path — `createLpmTrieMap`
 + `populateRule` + a real lookup round-trip, judged by the kernel's own verifier
 and map implementation — runs in the privileged VM lane and SKIPS everywhere else.
-The rule-compilation and packet-classification layers above it are self-anchored.
-
-**How it got there.** Anchored with: `scripts/test.sh vm xdp-classifier` (real root
-in a qemu Debian guest, the same lane the sibling `ebpf` uses). Closed 2026-08-14.
-It had been recorded as BLOCKED on `kernel.unprivileged_bpf_disabled=2` making
-`bpf()` return EPERM even as mapped-root, and that was wrong twice over: the sysctl
-restricts UNPRIVILEGED bpf and the lane runs as real root, and the lane already
-existed. ⚠ On any host without it the live test SKIPS, and a Zig skip is a pass —
-demonstrated rather than assumed: injecting a forced failure into that test makes
-the VM lane report `36 passed; 0 skipped; 1 failed`, while `zig build
-test-xdp-classifier` on the host stays green with the same mutation in place. Read
-a green host run as "the kernel never judged this".
-
-## Backlog / deferred
-
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `lpm6Lookup` (per IPv6 packet). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+The rule-compilation and packet-classification layers above it are self-anchored. The CAP_BPF-gated tests run in the VM lane (see *Verification*).
