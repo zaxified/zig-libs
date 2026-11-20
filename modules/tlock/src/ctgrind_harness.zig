@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — empirical evidence for `tlock.zig`'s `fp12Pow`
-//! (audit finding "tlock F3", `tlock.zig:230`), the module's own
+//! (audit finding "tlock F3"), the module's own
 //! hand-rolled constant-time `Gt` exponentiation — plus, at the task's
 //! explicit request, the recipient-private-key path through `decrypt`.
-//! Run via `../../../scripts/checks/ctgrind.sh tlock` once the coordinator adds
-//! the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the
-//! bottom of this file (that script REFUSES an unlisted module). NOT
+//! Run via `../../../scripts/checks/ctgrind.sh tlock` (targets `fp12pow` and
+//! `decrypt`; the pinned counts are in `scripts/checks/ctgrind-expected.tsv`). NOT
 //! wired into `zig build test-tlock` — memcheck's context count is
 //! valgrind's own verdict, not something a Zig test can assert on.
 //!
 //! ## Verifying the lead before building on it
 //!
-//! A triage pass (the 2026-09-01 audit ctgrind triage notes)
+//! A triage pass (the audit ctgrind triage notes)
 //! reported "`tlock`/`ibe` both hand-roll a constant-time `Gt`
 //! exponentiation with careful reasoning but no empirical measurement".
 //! Checked directly against this tree: TRUE. `tlock.zig`'s private
-//! `fp12Pow` (line 236) is a real, committed 4-bit fixed-window
+//! `fp12Pow` is a real, committed 4-bit fixed-window
 //! square-and-select-always loop over `Fp12.square`/`.mul`, with a
 //! `fp12CtSelect` table scan (never `table[idx]`) exactly as its own doc
 //! comment (lines 198-272) describes, and the doc comment cites this
-//! exact finding by name ("Audit `tlock` F3 / `ibe` F4", line 230). The
+//! exact finding by name ("Audit `tlock` F3 / `ibe` F4"). The
 //! same triage file's row on `tlock` ALSO says, in its own "Notes"
 //! column: "`decrypt` only takes the ALREADY-PUBLISHED `round_signature`,
 //! which is public by the time decrypt can run — fine on its own." That
@@ -47,7 +46,7 @@
 //! target exists to check empirically: "`r = H3(sigma, M)` is
 //! secret-derived (leaking it leaks `sigma`, hence the message), so the
 //! exponent must be treated exactly like a secret scalar even though
-//! this is 'just' encryption-side randomness" (`tlock.zig:215-218`).
+//! this is 'just' encryption-side randomness".
 //!
 //! Tainting `sigma`/`message` instead of `r` directly also puts
 //! `ciphersuite.h3`'s OWN code on the tainted path — its rejection-
@@ -77,7 +76,7 @@
 //! final branch and the return value differ. `decrypt`'s own doc comment
 //! confirms the FO compare's OUTCOME is meant to be public: "The check's
 //! outcome (accept/reject) is public, so a non-constant-time byte
-//! compare is fine here" (`tlock.zig:424-425`) — which is why a nonzero
+//! compare is fine here" — which is why a nonzero
 //! count AT THAT ONE COMPARE is not read as a defect below.
 //!
 //! **Read this target's zero/nonzero rows against the triage's own
@@ -224,7 +223,7 @@ fn secretRoundSignature(tainted: bool) g1.Affine {
 ///
 /// ⚠ This matters for more than tidiness: `decrypt`'s reject path
 /// `std.crypto.secureZero`s its scratch `message` before returning
-/// `error.FoCheckFailed` (`tlock.zig:434-437`, by design — see that
+/// `error.FoCheckFailed` (by design — see that
 /// function's doc comment) and the public API returns NOTHING else on
 /// that path, so a `ct` that never corresponds to `round_signature` (the
 /// first, simpler version of this harness used exactly that — an
@@ -301,46 +300,3 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
-// generate mechanically — every existing entry carries hand-written
-// reasoning in its own comment; these follow the same shape) ─────────────
-//
-// declare -A TARGETS=(
-//     [tlock]="fp12pow decrypt"
-// )
-// declare -A MODES=(
-//     [tlock]="ReleaseFast"
-// )
-// declare -A PATTERN=(
-//     # ⚠ MEASURED, not guessed: this is wider than "just fp12Pow" on purpose.
-//     # `encrypt`'s step 6 (`U = r*G2gen`, tlock.zig:361) shares the SAME
-//     # tainted `r` fp12Pow's step 7 uses, and driving fp12Pow only through the
-//     # real public `encrypt` API (it is private — see this harness's module
-//     # doc comment) puts step 6 on the tainted path too, whether or not that
-//     # was the intent. fp12Pow/fp12CtSelect/gtToDrandRepr (tlock.zig) +
-//     # h3's rejection-sampling retry (ciphersuite.zig, genuinely tainted —
-//     # Target 1) + the Fp12/Fp6/Fp2/Fp tower fp12Pow's square/mul bottom out
-//     # in AND g2/scalar (step 6's scalarMul+toAffine+toBytesCompressed) —
-//     # all bls12_381, inherited, attributed here rather than delegated as
-//     # "someone else's problem" (same reasoning chachapoly/oscore/bolt8 apply
-//     # to their own delegated files). THE MEASUREMENT: zero of the 8 in-file
-//     # contexts are inside fp12Pow itself — all 8 are step 6 (g2/fp2, 7
-//     # contexts) or h3's retry (ciphersuite.zig/std.crypto.ff, 1 context).
-//     # fp12Pow/fp12CtSelect/gtToDrandRepr measure CLEAN. See the harness
-//     # report for the full file:line breakdown.
-//     [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig'
-//     # decrypt's own file plus the pairing it calls with a tainted G1 point,
-//     # the Fp12 tower gtToDrandRepr uses, ciphersuite's h3 retry + h2/h4
-//     # (SHA-256), and the FO-check's G2 scalarMul+toAffine+toBytesCompressed+
-//     # std.mem.eql (round_signature-derived r_check and U').
-//     # ⚠ pairing.zig makes NO constant-time claim anywhere in this repo (see
-//     # this harness's module doc comment) — the one context inside it
-//     # (Fp12.inv in the final exponentiation's easy part) is expected
-//     # substrate behavior, not a tlock defect.
-//     [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig'
-// )
-// declare -A LABEL=(
-//     [tlock/fp12pow]='tlock encrypt r->fp12Pow (F3, clean)+g2 step6+h3'
-//     [tlock/decrypt]='tlock decrypt sk+bls12_381 pairing (no ct claim)'
-// )

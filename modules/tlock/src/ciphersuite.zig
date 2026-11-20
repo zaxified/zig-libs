@@ -19,7 +19,7 @@
 //! Boneh–Franklin FullIdent scheme in the byte layout drand's network uses —
 //! derived from the scheme and verified against a drand-produced ciphertext and
 //! live beacons, not transcribed from any source file (see `NOTICE`; an
-//! isolated provenance review on 2026-09-30 found no structural match). Where
+//! isolated provenance review found no structural match). Where
 //! each fact was confirmed:
 //!
 //! - DSTs: `github.com/drand/drand/v2/crypto` `schemes.go`,
@@ -167,7 +167,7 @@ pub fn h1(id: [32]u8) g1.Affine {
 /// entirely, which drand's own `tlock.go` never exercises since
 /// `block_bytes` is fixed at 16).
 ///
-/// **Serialization caveat — RESOLVED (2026-07-16 Fable pass,
+/// **Serialization caveat — RESOLVED (Fable pass,
 /// vector-verified):** `gt_bytes` in drand/kyber is
 /// `kilic/bls12-381`'s `GT.ToBytes`, whose byte NESTING is confirmed
 /// IDENTICAL to `bls12_381.Fp12.toBytes` (`c1 || c0` high-to-low at

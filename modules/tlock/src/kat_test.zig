@@ -593,7 +593,7 @@ fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     // was therefore **0 on every replay**, so the loop below never executed
     // once and this harness handed `fromBytes` the PRISTINE ciphertext, every
     // time, for its whole existence. A damage harness that applies no damage.
-    // Measured 2026-09-07 over the corpus above: **0 of 11 scripts flipped a
+    // Measured over the corpus above: **0 of 11 scripts flipped a
     // byte and 1 distinct ciphertext existed before; 10 of 11 flip, 16 flips
     // in total and 11 distinct ciphertexts after.**
     const n: usize = src.slice(&script);
@@ -651,12 +651,12 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
         _ = testDecrypt(subject.round_signature, ct) catch continue;
         decrypted += 1;
     }
-    // Measured 2026-09-07: with the flip count drawn as a ranged value, 0
+    // Measured: with the flip count drawn as a ranged value, 0
     // flips and exactly 1 distinct ciphertext across the whole corpus — the
     // pristine one, eleven times. After:
     try std.testing.expectEqual(@as(usize, 16), flips);
     try std.testing.expectEqual(damage_seeds.len, distinct);
-    // 8 decoded until 2026-10-03; two damaged `U` encodings are on the twist
+    // 8 decoded until; two damaged `U` encodings are on the twist
     // but outside G2, and the checked decoder refuses them before `decrypt`.
     try std.testing.expectEqual(@as(usize, 6), decoded);
     try std.testing.expectEqual(@as(usize, 1), decrypted);

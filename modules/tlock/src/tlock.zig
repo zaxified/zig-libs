@@ -150,9 +150,9 @@ pub const Ciphertext = struct {
     }
 
     /// Inverse of `toBytes`. `g2.fromBytesCompressed` refuses a `U`
-    /// outside `G2` (since 2026-10-03), so the pairing in `decrypt`
-    /// never runs on a torsion point; `decrypt`'s own consistency
-    /// check (`U == r*gen`) stays the scheme-specific guard. REAL.
+    /// outside `G2`, so the pairing in `decrypt` never runs on a
+    /// torsion point; `decrypt`'s own consistency check (`U ==
+    /// r*gen`) stays the scheme-specific guard. REAL.
     pub fn fromBytes(bytes: [encoded_bytes]u8) g2.G2Error!Ciphertext {
         const u = try g2.fromBytesCompressed(bytes[0..g2.compressed_bytes].*);
         return .{
@@ -266,7 +266,7 @@ fn fp12Pow(base: Fp12, exp: Fr) Fp12 {
 /// Converts a `Gt` element from this module's CANONICAL pairing value
 /// to the representation drand actually hashes — the element's CUBE.
 ///
-/// **The interop finding this encodes (root-caused 2026-07-16, this
+/// **The interop finding this encodes (root-caused, this
 /// module's Fable pass — see `SPEC.md`'s "Gt serialization" section):**
 /// drand/kyber's `GT.MarshalBinary` is `kilic/bls12-381`'s
 /// `GT.ToBytes`, whose tower layout and byte nesting are IDENTICAL to
