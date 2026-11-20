@@ -6,7 +6,7 @@
 
 **Scope:** core — pyotp and pquerna/otp (surveyed 2026-09-30); raised from mvp 2026-09-30 with base32 secrets + `otpauth://` parse/format
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/57, 1 eq) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-21 (157/160, 3 eq) · src 718db0c8f588fdba
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OTP_FUZZ) · ct 2026-10-10 (ctgrind: secret through hotp/totp/fmt/verify, SHA-1/256/512, `code` 0 in-file after the truncation fix (was 18); `uri` 0 after base32 went constant-time (was 8))
 **Performance:** not measured
@@ -157,6 +157,7 @@ Format: Google Authenticator "Key Uri Format"
   the last whole-module mutation run and the delta runs after it. Mutants behind the
   comptime `Hmac` type selection cannot be switched at run time; every RFC vector
   pins them.
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 160 mutants over `root.zig` and `otpauth.zig`: truncation, `totpVerify`/`hotpVerify`/`hotpResync` windows and compares, `fmtCode`, `parse`, `format`): 157 killed, 3 equivalent, 0 open. Equivalent: an empty query pair (`pair.len == 0` skip: its empty name matches no known parameter and is ignored anyway); `secret=` with the explicit `value.len == 0` check removed and the `n == 0` check removed (each alone: an empty value decodes to 0 bytes and the other check yields the same `InvalidSecret`; for a non-empty value the decoder never returns 0 bytes, because `=`-only text fails `.padding = .optional`). Not mutated: the comptime `Hmac` type selection (pinned by every RFC vector).
 
 ## Backlog / deferred
 

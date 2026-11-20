@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 9496 decaf448 as in RustCrypto `ed448-goldilocks` (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after the full scalar field — sub/negate/invert/random/wide reduction — and `hash_to_decaf448`/RFC 9497 `HashToScalar` landed)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 (24/24) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-21 (38/42, 1 eq) · src 5c9a49495c1acfd4
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DECAF448_FUZZ; decode at 1/2, group at 1/8, hash at 1/4 of it) · ct 2026-08-11 (ctgrind)
 
@@ -198,6 +198,7 @@ Run: `scripts/modtest decaf448`. `gate.core_implemented` is `true`; with it `fal
   (see *Constant-time note*).
 - **Dead-stack probe:** `stackprobe_test.zig` for `Element.scalarMul`, `scalar.invert` and `scalar.random`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 42 mutants over `element.zig` (sqrt ratio, group ops, `scalarMul`, `equals`, `encode`, `decode` canonicity) and `scalar.zig` (padding, `negate`, `invert`, `reduce`)): 38 killed, 1 equivalent, 3 open. Equivalent: `invert` starting one bit lower (the top bit of l-2 is 0, so the first iteration squares 1). Open: the skipped `secureZero` of the widened scalar and the skipped `burn.stack` calls in `scalarMul` and `invert`; only `stackprobe_test.zig` (ReleaseFast) can see them, and the schemata binary fails that probe's own baseline there, so a verdict needs a hand-mutated ReleaseFast probe run. `hash.zig` and `root.zig` are not covered.
 
 
 ## What is deliberately not done

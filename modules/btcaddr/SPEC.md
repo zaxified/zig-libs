@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core `DecodeDestination`/`EncodeDestination`/`DecodeSecret`/`EncodeSecret` + rust-bitcoin `Address` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 (53/53) · src ?
+**Audit:** review 2026-10-03 · mutation 2026-11-21 (84/84) · src ce7f7a39593384be
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BTCADDR_FUZZ) · ct 2026-10-18 (ctgrind: the WIF private-key round trip, row `wif`; address derivation is public)
 
@@ -126,6 +126,7 @@ helper results, whose expected values were derived independently with Python `ha
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it (template bytes, version-opcode range, network versions / HRP / sets, decode path
   selection, WIF length / flag / key range, helper bounds).
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 84 mutants over `root.zig`: network constants, `classify`, script/address conversion, Base58Check and segwit decode, WIF decode/encode, the constant-time `keyInRange`, public-key and script-size helpers): 84 killed, 0 equivalent, 0 open.
 
 ## Backlog / deferred
 

@@ -6,7 +6,7 @@
 
 **Scope:** mvp — LDK `chan_utils` / lnd `input`+`shachain` / CLN `common` (BOLT#3 implementations) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (26/27, 1 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-21 (30/32, 2 eq) · src 6d4fc1e887f5e085
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-09 (ctgrind)
 
@@ -77,6 +77,7 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
   `shachain_index` targets) under valgrind; the pinned rows are in the ctgrind table of the repository checks.
 - No fuzz harness (no fuzz obligation).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 32 mutants over `root.zig`: hash-to-scalar, the four derivations with their argument order and validation, the shachain loop): 30 killed, 2 equivalent, 0 open. Equivalent (unobservable): the `IdentityElement` error mapping of `derivePublicKey` and `deriveRevocationPublicKey` is reachable only if a SHA-256-derived scalar is zero (about 2^-256 per call), so no test input can reach it.
 
 ## Backlog / deferred
 

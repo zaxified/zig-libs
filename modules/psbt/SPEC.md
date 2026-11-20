@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core `psbt.h`/`rpc_psbt` (BIP174/371) + rust-bitcoin `psbt` (surveyed 2026-09-30, S3 2026-11-13); gaps: no BIP370 (PSBTv2), no Signer, script-path finalize only for `<key> CHECKSIG` / `multi_a` leaves
 
-**Audit:** review 2026-09-10 · mutation 2026-10-05 (56/58, 2 eq) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-21 (206/219, 11 eq) · src 9992e8eb4b0c9359
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PSBT_FUZZ) · ct n/a — public partial transactions (keyword review, 2026-10-07)
 
@@ -197,6 +197,7 @@ Run with `scripts/modtest psbt` (`zig build test-psbt`).
   with no output at the prevout index, and a v1 20-octet program not finalized as P2WPKH.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 219 mutants over `root.zig` map codec, per-key validation, `combine`; `finalize.zig` recognisers, signature selection, SIGHASH_SINGLE refusal, tapscript leaf shapes, UTXO binding, witness-stack codec, extract; `bip371.zig` validators and tree check): 206 killed, 11 equivalent, 2 open. Equivalent: `readBytes` `n >= remaining` and `WITNESS_UTXO` `len <= 8` (the next read reports the same `Truncated`); `parseWitnessProgram`'s `script.len > 42` (implied by the push-length bounds); `parseMultisig`'s `i >= script.len` (`readInstruction` at the end fails) and `m == 0` (`smallInt` never returns 0); `collectMultisigSigs`' `sig_version == .base` (the witness caller passes `allow_single_bug = true`); `parseTapLeaf`'s `o + 34 < len` (an empty tail is refused either way) and the leaf-run `shape.n > 1` (implied by `have > 0` and `have < m`); `spentOutputFor`'s `index > vin.len` (`parse` guarantees one map per input) and `break :blk wu` (equal to `nw` after the agreement check); `treeValueOk`'s shallower-leaf check (a stack that stops increasing can never complete). Open: the two leaf-version checks of `finalizeTaprootScriptPath` (leaf version and control-block version); they need a taproot fixture with a non-0xc0 leaf. `update.zig` setters are not mutated (their output is parsed back through the mutated validators).
 
 ## Threat model / out of scope
 

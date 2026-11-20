@@ -6,7 +6,7 @@
 
 **Scope:** core — python-fido2 2.2.1 `ClientPin` (surveyed 2026-09-30): every clientPIN subcommand of CTAP 2.1 over both protocols, getInfo, CTAPHID framing; the rest of CTAP2 (makeCredential, getAssertion, credential management) is out of this module
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 (84/87, 3 eq) · src ?
+**Audit:** review 2026-10-03 · mutation 2026-11-21 (213/216, 3 eq) · src 7e11eb2b6755fd6a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, CTAP2_FUZZ) · ct 2026-10-10 (ctgrind: PIN + shared secret through PIN rules, padding, hashing, encrypt/MAC; token decrypt + MAC; `pin` 0 / `token` 0 after replacing std's UTF-8 code-point count (was 1))
 **Performance:** not measured
@@ -134,6 +134,7 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   secret through the PIN rules, padding, hashing, encrypt/MAC) and `token` (token decrypt and MAC).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
+- **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 216 mutants over `framing.zig`, `getinfo.zig`, `clientpin.zig` (PIN rules, constant-time UTF-8 count, key-agreement parse, request building, session), `ctaphid.zig`, `status.zig` `check`): 213 killed, 3 equivalent, 0 open. Equivalent: `inRangeMask` shifting by 7 instead of 8 (every range is narrower than 128, so the in-range difference never reaches bit 7); `three` ending at 0xf0 instead of 0xef (0xf0 is already in `four`, and `lead_need` ORs 2 into 3); `Encoder.packetCount` taking the formula instead of the early return at exactly 57 bytes (it gives 1 as well). Not mutated: the comptime status table (its rows are checked against the error set, not against the spec), and the wipes of local PIN buffers (stack only).
 
 ## Non-goals
 
