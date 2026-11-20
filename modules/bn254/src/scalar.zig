@@ -7,7 +7,7 @@
 //!
 //! **Status: implemented** — arithmetic is `montint.Field(r)`: Montgomery
 //! form (`R = 2^256`), built only from montint's constant-time primitives,
-//! the same type `bls12_381.Fr` uses. Until 2026-10-02 this type wrapped
+//! the same type `bls12_381.Fr` uses. Until this type wrapped
 //! `std.crypto.ff` (Montgomery storage over ff's 63-bit limbs, with a
 //! hand-rolled constant-time `toBytes` because ff's `fromMontgomery`
 //! branched). Measured then (ctgrind, ReleaseFast): ff's `montgomeryMul`

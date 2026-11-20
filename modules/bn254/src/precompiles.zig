@@ -11,7 +11,7 @@
 //! calldata padding/truncation and error-vs-success semantics — not
 //! cryptography.
 //!
-//! **Tier: Sonnet, not Fable.** No cryptographic design judgment call is
+//! No cryptographic design judgment call is
 //! made in this file. The one security-relevant decision — that
 //! `ecPairing` MUST reject a `G2` operand that is on-curve but outside
 //! the order-`r` subgroup — is not a judgment call either: it is
@@ -168,7 +168,7 @@ const pair_encoded_bytes = g1.encoded_bytes + g2.encoded_bytes;
 /// existing on-curve check is already sufficient — no separate call
 /// needed) and every decoded `G2` must be on-curve AND additionally
 /// pass `g2.Jacobian.subgroupCheck` — MANDATORY, done inside
-/// `g2.fromBytes` (since 2026-10-03; before, this function called it
+/// `g2.fromBytes` (this function does not call it
 /// explicitly), because `G2`'s nontrivial cofactor means
 /// on-curve does NOT imply subgroup-member (`g2.zig`'s module doc
 /// comment): an attacker-supplied on-curve-but-outside-subgroup `G2`
@@ -363,7 +363,7 @@ test "ecPairingCheck: an off-curve G1 in a batch fails before pairingCheck ever 
 // `empty`/`short_*`/`long_trailing_bytes` in ecAdd and ecMul exercise the
 // short-input zero-padding and long-input truncation rules.
 //
-// Until 2026-10-26 these were go-ethereum's `bn256*.json` tables
+// Until these were go-ethereum's `bn256*.json` tables
 // (LGPL-3.0); they were replaced because copyleft-licensed data may not live
 // in this repository.
 
@@ -646,7 +646,7 @@ test "corpus: the ecPairing seeds reach the decoder, and the counts are pinned" 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

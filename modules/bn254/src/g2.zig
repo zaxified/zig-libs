@@ -25,7 +25,7 @@
 //! `subgroupCheck` (`ψ(Q) == [6x²]Q`, equivalent to `[r]P == O` on the
 //! twist — proof at the function) — implemented below, mandatory before
 //! trusting any externally-supplied `G2` point, and run by `fromBytes`
-//! itself since 2026-10-03 (`fromBytesUnchecked` skips it; an unchecked
+//! itself (`fromBytesUnchecked` skips it; an unchecked
 //! small-subgroup point lets an attacker force a degenerate/predictable
 //! pairing result — same pitfall `bls12_381/src/g2.zig`'s `SPEC.md`
 //! documents for its own `G2`).
@@ -305,7 +305,7 @@ pub const Jacobian = struct {
     /// doc comment): `G2`'s cofactor `h2 > 1`, so `E'(Fp2)` has proper
     /// nontrivial subgroups an attacker-supplied point could land in.
     ///
-    /// Construction (2026-10-03): the twist equation, then
+    /// Construction: the twist equation, then
     /// `ψ(Q) == [6x²]Q`, `ψ` the twisted Frobenius (`endomorphismPsi`),
     /// `x` the BN seed. Proof, for `Q ∈ E'(Fp2)`:
     ///   - `ψ` is the `p`-power Frobenius of `E` carried to `E'` by the
@@ -331,7 +331,7 @@ pub const Jacobian = struct {
         return endomorphismPsi(self).add(mulPublic(self, six_x_squared).negate()).isIdentity();
     }
 
-    /// The pre-2026-10-03 check, `[r]P == O` via the constant-time
+    /// The earlier check, `[r]P == O` via the constant-time
     /// ladder — the definition of the subgroup, kept ONLY as the
     /// reference the differential tests hold `subgroupCheck` against.
     fn subgroupCheckByOrder(self: Jacobian) bool {
@@ -409,7 +409,7 @@ pub fn toBytes(p: Affine) [encoded_bytes]u8 {
 /// `[r]P` ladder). Accepts a runtime-length slice — see `g1.zig`'s
 /// `fromBytes` doc comment for why. All-zero input decodes to the point
 /// at infinity (`(0,0)` is never on-twist for `b' != 0`). Safe on bytes
-/// from a peer (2026-10-03; before, the subgroup check was the caller's
+/// from a peer (before, the subgroup check was the caller's
 /// separate duty — see the module doc comment's pitfall note).
 pub fn fromBytes(bytes: []const u8) G2Error!Affine {
     const p = try fromBytesUnchecked(bytes);
@@ -436,7 +436,7 @@ pub fn fromBytesUnchecked(bytes: []const u8) G2Error!Affine {
     return p;
 }
 
-// ── compressed codec (gnark-crypto convention, added 2026-11-16) ────────
+// ── compressed codec (gnark-crypto convention, added) ────────
 //
 // gnark-crypto's `ecc/bn254` compressed `G2`: 64 bytes, `x.A1 || x.A0`
 // (imaginary first — the same order as this module's `Fp2.toBytes` and
@@ -777,7 +777,7 @@ test "fromBytes rejects an off-curve (x, y) pair" {
     try std.testing.expectError(error.NotOnCurve, fromBytes(&bytes));
 }
 
-// ── ψ subgroup check (2026-10-03): the proof's premises, then a
+// ── ψ subgroup check: the proof's premises, then a
 // differential against the [r]P == O reference ──────────────────────────
 
 fn pInt() u256 {

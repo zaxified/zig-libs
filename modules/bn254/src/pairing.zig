@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The BN254 (alt-bn128) optimal ate pairing: `e: G1 x G2 -> Gt`, `Gt` the
 //! order-`r` cyclotomic subgroup of `Fp12*` (`fp12.zig`) — **Part 4** of
-//! this module's multi-part arc (`README.md`), and this arc's Fable crown
-//! jewel (see `SPEC.md`'s "Tier assessment" for Parts 1-3, which explicitly
-//! deferred the hard tier to here). Two stages, the textbook
+//! this module's multi-part arc (`README.md`). Two stages, the textbook
 //! pairing-construction split (same shape as `bls12_381/src/pairing.zig`'s
 //! Part 2, this module's structural template — see that file's module doc
 //! comment for the shared Miller-loop/final-exponentiation vocabulary this
@@ -32,24 +30,22 @@
 //!      `bls12_381.finalExpHardPart`'s Hayashida-Hayasaka-Teruya chain —
 //!      see `finalExponentiation`'s doc comment.
 //!
-//! **Status: implemented** (Part-4 Fable crypto-core pass, 2026-07-15).
-//! Every structural piece — `Gt`/`PairingPair`, `bn_x`/`bn_ate_loop_param`
-//! (comptime-derived and byte/decimal-pinned against the published `6x+2`
-//! value, never transcribed), `multiMillerLoop`'s real infinity-skipping
-//! product wiring, `pairing`/`pairingCheck`'s real composition wiring, and
-//! every KAT hex vector below (independently sourced — see "KAT sourcing"
-//! below) — was already real from the scaffold pass. The two previously
-//! stubbed IRREDUCIBLE cores are now real too: `millerLoop` (the per-pair
+//! **Status: implemented.** Every structural piece — `Gt`/`PairingPair`,
+//! `bn_x`/`bn_ate_loop_param` (comptime-derived and byte/decimal-pinned
+//! against the published `6x+2` value, never transcribed),
+//! `multiMillerLoop`'s infinity-skipping product wiring,
+//! `pairing`/`pairingCheck`'s composition wiring, and every KAT hex vector
+//! below (independently sourced — see "KAT sourcing" below) — is
+//! independent of the two cores, which are `millerLoop` (the per-pair
 //! `6x+2` binary double-and-add walk with BN's Frobenius-tail addition
 //! steps — see its doc comment) and `finalExponentiation` (the
 //! curve-generic easy part composed with the BN-specific exact-`d`
 //! hard-part addition chain — see `finalExpHardPart`'s doc comment for
 //! the chain choice and its independent numeric re-verification). The
-//! gate (`gate.pairing_core_implemented`, `gate.zig`) is flipped to
-//! `true`, so the full gated test tier below — bilinearity,
-//! non-degeneracy, the `pairingCheck` identities, `e(G1,G2)^r == 1`, and
-//! the three byte-exact py_ecc-derived KAT vectors — now RUNS (13
-//! previously-SKIP tests). `cyclotomicSquare` — the one auxiliary
+//! gate (`gate.pairing_core_implemented`, `gate.zig`) is `true`, so the
+//! full gated test tier below — bilinearity, non-degeneracy, the
+//! `pairingCheck` identities, `e(G1,G2)^r == 1`, and the three byte-exact
+//! py_ecc-derived KAT vectors — runs. `cyclotomicSquare` — the one auxiliary
 //! primitive the hard part needs beyond plain `Fp12` arithmetic — was
 //! already real (`fp12.zig`, built ahead of schedule during Part 3's
 //! field-tower pass, Granger-Scott construction, generic in the tower's
@@ -138,10 +134,9 @@ pub const bn_x: u64 = 4965661367192848881;
 /// function's doc comment) is over.
 pub const bn_ate_loop_param: u128 = 6 * @as(u128, bn_x) + 2;
 
-// ── Miller loop (THE FABLE CORE, part 1 of 2) ──────────────────────────────
+// ── Miller loop (core, part 1 of 2) ──────────────────────────────
 
-/// **REAL (Fable crypto-core pass)** — the construction below,
-/// transcribed exactly; the plain-binary (non-NAF) walk option the
+/// The construction below, transcribed exactly; the plain-binary (non-NAF) walk option the
 /// construction explicitly sanctions is the one implemented (see the
 /// body's comment).
 ///
@@ -153,7 +148,7 @@ pub const bn_ate_loop_param: u128 = 6 * @as(u128, bn_x) + 2;
 /// of a batch is the product of the individual pairs' Miller values,
 /// independent of whether the walk is shared across pairs or not — sharing
 /// is a PERFORMANCE optimization a later pass may add, not a correctness
-/// requirement of this scaffold; see `multiMillerLoop`'s own doc comment).
+/// requirement; see `multiMillerLoop`'s own doc comment).
 ///
 /// Construction (optimal ate, BN family — Vercauteren 2010 / Miller 1986,
 /// specialized to BN curves by Devegili, Scott, Dahab, "Implementing
@@ -220,10 +215,8 @@ pub const bn_ate_loop_param: u128 = 6 * @as(u128, bn_x) + 2;
 /// 9+u` — IDENTICAL shape to `bls12_381`'s tower (only `ξ`'s VALUE
 /// differs) — and the Costello-Lange-Naehrig line-evaluation IDIOM
 /// ("Faster Pairing Computations on Curves with High-Degree Twists",
-/// 2010) carries over, BUT with one genuine, KAT-caught difference this
-/// pass had to resolve (the scaffold's original claim that `bls12_381
-/// .pairing.lineEval`'s exact formula carries over unchanged was
-/// WRONG): BN254's twist constant is `b' = b/ξ` while BLS12-381's is
+/// 2010) carries over, BUT with one genuine, KAT-caught difference (`bls12_381
+/// .pairing.lineEval`'s exact formula does NOT carry over unchanged): BN254's twist constant is `b' = b/ξ` while BLS12-381's is
 /// `b' = b·ξ`, so the untwisting map runs in the OPPOSITE `w`-power
 /// direction here — `ψ(x',y') = (x'·w^2, y'·w^3)`, multiply not divide
 /// — and the sparse line lands in the `(1, w, w^3)` tower slots, not
@@ -338,8 +331,7 @@ fn twistFrobenius(pt: TwistPoint) TwistPoint {
 /// `E'(Fp2)` with slope `lambda` through `(x_ref, y_ref)`, UNTWISTED to
 /// `E(Fp12)` and evaluated at `p ∈ G1` — Costello-Lange-Naehrig 2010
 /// line evaluation, in the SAME role as `bls12_381.pairing.lineEval`
-/// but with a genuinely DIFFERENT sparse shape (a resolved subtlety the
-/// scaffold doc comments glossed over — see the numeric confirmation
+/// but with a genuinely DIFFERENT sparse shape (see the numeric confirmation
 /// note below):
 ///
 /// BN254's twist constant is `b' = b/ξ = 3/ξ` (`g2.zig`'s `twistB`), so
@@ -443,9 +435,8 @@ fn additionStep(t: *TwistPoint, q: TwistPoint, p: g1.Affine) Fp12 {
 /// line-evaluation formulas (undefined at infinity) never run on such a
 /// pair; an all-infinity `pairs` slice returns `Fp12.one` — see this
 /// file's `"multiMillerLoop never touches the stub on an all-infinity
-/// input"` test (named for the scaffold era in which it was the ungated
-/// proof this wiring predated the core; the property it pins is
-/// unchanged).
+/// input"` test (it is the ungated proof that this wiring does not depend on
+/// the core).
 ///
 /// **`// TODO` (deferred performance optimization):** this baseline pays
 /// one FULL, independent Miller walk per live pair — `N` pairs cost `N`
@@ -465,9 +456,9 @@ pub fn multiMillerLoop(pairs: []const PairingPair) Fp12 {
     return f;
 }
 
-// ── final exponentiation (THE FABLE CORE, part 2 of 2) ─────────────────────
+// ── final exponentiation (core, part 2 of 2) ─────────────────────
 
-/// **REAL (Fable crypto-core pass)** — the easy/hard composition below;
+/// The easy/hard composition below;
 /// see `finalExpEasyPart`/`finalExpHardPart` for the two stages and the
 /// hard-part chain's independent numeric re-verification.
 ///
@@ -683,11 +674,10 @@ pub fn pairingCheck(pairs: []const PairingPair) bool {
 
 // ── tests ────────────────────────────────────────────────────────────────
 //
-// Two tiers, a split inherited from the scaffold era (when the two cores
-// were stubs — the split is kept because it documents which tests carry
-// their own weight independent of the pairing core):
+// Two tiers (the split documents which tests carry their own weight
+// independent of the pairing core):
 //
-//   UNGATED (were real even pre-core): type/constant shape checks,
+//   UNGATED: type/constant shape checks,
 //   bn_ate_loop_param's comptime-derivation KAT, multiMillerLoop's
 //   infinity-skip wiring (which never touches millerLoop for an
 //   all-infinity input), and every pinned KAT hex vector's OWN

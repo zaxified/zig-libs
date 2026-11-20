@@ -26,7 +26,7 @@
 //! uncompressed (de)serialization (`(0,0)` = point at infinity — see
 //! `SPEC.md`'s "EIP-196/197 encoding" section). EIP-196/197 has no
 //! compressed point format; gnark-crypto's compressed form is offered
-//! separately as `toBytesCompressed`/`fromBytesCompressed` (2026-11-16).
+//! separately as `toBytesCompressed`/`fromBytesCompressed`.
 
 const std = @import("std");
 const fp = @import("fp.zig");
@@ -310,7 +310,7 @@ pub fn fromBytes(bytes: []const u8) G1Error!Affine {
     return p;
 }
 
-// ── compressed codec (gnark-crypto convention, added 2026-11-16) ────────
+// ── compressed codec (gnark-crypto convention, added) ────────
 //
 // gnark-crypto's `ecc/bn254` compressed form: 32 bytes, the big-endian
 // `x`, with the two MOST significant bits of byte 0 as flags (`p` is

@@ -189,7 +189,7 @@ pub fn verify(vk: VerifyingKey, proof: Proof, public_inputs: []const Fr) Groth16
 // tower and pairing below. The values were copied from those JSON files by
 // script, not by hand.
 //
-// Until 2026-10-26 this KAT was a proof taken from a third-party repository
+// Until this KAT was a proof taken from a third-party repository
 // that carries no licence; it was replaced because data without an
 // MIT-compatible grant may not live in this repository.
 //

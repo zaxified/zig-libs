@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-11-17 whole-module mutation audit: each pins a
+//! Tests added by the whole-module mutation audit: each pins a
 //! behaviour that no earlier test distinguished (a mutant of the guarded
 //! condition survived the whole suite).
 
