@@ -488,6 +488,27 @@ pub fn isHtmlEncoded(s: []const u8) bool {
     return false;
 }
 
+/// Contains an HTML tag as go-playground's `html` does: the unanchored regex
+/// `<[/]?([a-zA-Z]+).*?>` (`hTMLRegexString`), `.` being any character but
+/// "\n". Per line: the first `<`, optional `/`, ASCII letter, and a `>` anywhere
+/// after that letter (the letters may be backtracked into `.*?`). The earliest
+/// opening gives the most room for the `>`, so one pass over the line and its last
+/// `>` decides it, linear (a quadratic scan would be a DoS lever on a 1 MiB
+/// body). Tag syntax is not checked: `<a` + `>` is enough, as in the reference.
+pub fn isHtml(s: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, s, '\n');
+    while (lines.next()) |line| {
+        const last_gt = std.mem.findScalarLast(u8, line, '>') orelse continue;
+        var i: usize = 0;
+        while (std.mem.findScalarPos(u8, line, i, '<')) |p| : (i = p + 1) {
+            var j = p + 1;
+            if (j < line.len and line[j] == '/') j += 1;
+            if (j < line.len and std.ascii.isAlphabetic(line[j])) return last_gt > j;
+        }
+    }
+    return false;
+}
+
 // ── URN (RFC 2141, RFC 8141) ─────────────────────────────────────────────────
 
 fn isPct(s: []const u8, i: usize) bool {
