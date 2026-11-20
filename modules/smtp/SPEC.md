@@ -16,7 +16,7 @@
 **Downstream consumer:** no
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-/NOTICE (this module needs no entry — see "Provenance" below).
+the README's `Provenance:` line (this module needs no NOTICE entry — see "Provenance" below).
 
 ## Compared with
 
@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [lettre/lettre](https://github.com/lettre/lettre) — **reference** | Rust | MIT | 2.3k | v0.11.23 (2026-08-03) | README: message builders, Unicode, "secure delivery with SMTP using encryption and authentication", async; "does not provide (for now): email parsing". Owns TLS (rustls/native-tls) and a connection pool; AUTH PLAIN, LOGIN and XOAUTH2 *(inferred from memory of its API, not re-read)*. This module: same composer + client scope, no TLS, no pool, no XOAUTH2. |
+| [lettre/lettre](https://github.com/lettre/lettre) — **reference** | Rust | MIT | 2.3k | v0.11.23 (2026-08-03) | README: message builders, Unicode, "secure delivery with SMTP using encryption and authentication", async; "does not provide (for now): email parsing". Owns TLS (rustls/native-tls) and a connection pool; AUTH PLAIN, LOGIN and XOAUTH2 *(inferred from memory of its API, not re-read)*. This module: same composer + client scope, plus XOAUTH2/OAUTHBEARER and SCRAM-SHA-256; no TLS, no pool. |
 | [emersion/go-smtp](https://github.com/emersion/go-smtp) | Go | MIT | 2.1k | v0.25.0 (2026-08-13) | README: "ESMTP client & server", AUTH, PIPELINING, UTF-8, LMTP. Has a server side and LMTP; this module is client-only. |
 | Go `net/smtp` ([docs](https://pkg.go.dev/net/smtp)) | Go | BSD-3-Clause | — | Go stdlib (frozen: per go-smtp's README "not getting any new features") | Minimal client: STARTTLS, PLAIN/CRAM-MD5 auth, `SendMail`; no MIME composer, no pipelining *(inferred from memory of the API)*. |
 | [karlseguin/smtp_client.zig](https://github.com/karlseguin/smtp_client.zig) | Zig | MIT | 42 | push 2026-05-23 (no releases) | Its README: PLAIN, LOGIN and CRAM-MD5 auth; TLS built in (via `std`, whose TLS 1.3-only limit it documents; "does not work with Amazon SES"). No MIME composer or attachments, no pipelining *(inferred from README)*. The only other Zig SMTP client found. |
 | [stalwartlabs/mail-send](https://github.com/stalwartlabs/mail-send) | Rust | none stated by the API (crate is Apache-2.0 OR MIT *(inferred)*) | 275 | v0.6.0 (2026-04-13) | Rust client with DKIM signing built in *(inferred)*; source not read. |
 | [curl/curl](https://github.com/curl/curl) (`smtp://`) | C | curl licence (MIT-style; API says NOASSERTION) | 43.0k | curl-8_22_0 (2026-09-02) | The ubiquitous C client: STARTTLS/SMTPS, many SASL mechanisms incl. OAuth2 and SCRAM *(inferred)*. Not read; listed as the C yardstick. |
 
-**Where we are ahead:** among Zig SMTP clients, the only one with a MIME composer (multipart, attachments, RFC 2047/2231), PIPELINING with full reply drain, the STARTTLS downgrade/injection guards, and a transport-agnostic design; verified against a live third-party server, real captures and independent MIME parsers (SPEC "Verification") · **Where we are behind:** SASL beyond PLAIN/LOGIN (XOAUTH2/OAUTHBEARER, SCRAM), DSN parameters, BDAT/CHUNKING, DKIM signing, server side (go-smtp), no TLS of its own by repo policy (→ Backlog).
+**Where we are ahead:** among Zig SMTP clients, the only one with a MIME composer (multipart, attachments, RFC 2047/2231), PIPELINING with full reply drain, the STARTTLS downgrade/injection guards, and a transport-agnostic design; verified against a live third-party server, real captures and independent MIME parsers (SPEC "Verification"); also the only one with SCRAM-SHA-256, XOAUTH2/OAUTHBEARER, DSN parameters and BDAT among them · **Where we are behind:** SASL beyond PLAIN/LOGIN/XOAUTH2/OAUTHBEARER/SCRAM-SHA-256 (no `-PLUS`, no GSSAPI), no `multipart/report` composer, DKIM signing (→ Backlog), server side (go-smtp), no TLS of its own by repo policy (→ *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -41,9 +41,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 |---|---|---|
 | `reply.zig` | RFC 5321 §4.2 multi-line replies + RFC 3463 enhanced codes (`Parser.feed`/`next`) | no |
 | `capabilities.zig` | RFC 5321 §4.1.1.1 / RFC 1869 EHLO keyword set | no |
-| `command.zig` | RFC 5321 §4.1 command serialisation + §4.5.3.1 ceilings + address grammar | no |
+| `command.zig` | RFC 5321 §4.1 command serialisation + §4.5.3.1 ceilings + address grammar, DSN/BDAT parameters | no |
 | `data.zig` | RFC 5321 §4.5.2 dot-stuffing and un-stuffing | no |
-| `auth.zig` | RFC 4954 / RFC 4616 SASL PLAIN + LOGIN | no |
+| `auth.zig` | RFC 4954 / RFC 4616 SASL PLAIN + LOGIN, XOAUTH2, OAUTHBEARER (RFC 7628), SCRAM-SHA-256 | no |
 | `mime.zig` | RFC 5322 folding, RFC 2047 encoded words, QP, base64, dates | no |
 | `message.zig` | the composer: headers, multipart trees, attachments, boundaries | no |
 | `session.zig` | the conversation state machine (`next`/`feedReply`) | no |
@@ -134,6 +134,49 @@ LOGIN's challenge text is advisory: the *order* of the exchange is authoritative
 servers send "Username:", "User Name", or nothing. A challenge that clearly asks for the
 password first is honoured; anything else follows the order.
 
+**XOAUTH2 and OAUTHBEARER (RFC 7628)** are opt-in: they are used only when listed in
+`Credentials.mechanisms` (default `.plain, .login`) **and** advertised by the server, and the first
+listed mechanism the server also offers wins. The bearer token is `Credentials.token` (visible ASCII,
+no spaces; acquiring and refreshing it is the caller's); the mechanism is refused on a plaintext link
+exactly like PLAIN, and every buffer that held the token is wiped. The AUTH line ceiling is raised
+to 12288 octets (RFC 4954 §4) so a long token fits. On a `334` that carries the mechanism's JSON
+error, the session acknowledges it (`oauthbearer_error_ack` for OAUTHBEARER, an empty response for
+XOAUTH2) so the server can send its final failure, and the JSON stays readable through
+`Session.authErrorJson()` / `Client.authErrorJson()`.
+
+**SCRAM-SHA-256 (RFC 5802 / RFC 7677)**, client side only (`auth.ScramClient`), opt-in through
+`Credentials.mechanisms` and `Options.scram_random`: the client nonce must come from a CSPRNG, and
+without one the AUTH fails with `error.ScramNoRandomSource` before any byte is sent
+(`Options.scram_nonce` is a test seam that voids replay protection). No channel binding (`-PLUS` is
+not offered) and no SASLprep: a user name or password that is not printable ASCII is
+`error.NonAsciiCredential`, and a non-empty `authzid` is `error.InvalidCredential` (the GS2 header is
+`n,,`). The server's iteration count must lie in 4096..600000 (`error.ScramIterationsOutOfRange`)
+and the salt is bounded by `scram_max_salt_len`. The server signature is checked in constant time,
+in either the final `334` or the `235` additional data; a wrong or missing one fails the AUTH
+(`error.ServerSignatureMismatch`).
+
+### DSN parameters (RFC 3461)
+
+`Envelope.dsn` (`Dsn`: `ret`, `envid`, `notify`, `orcpt`) adds `RET=` / `ENVID=` to MAIL FROM and
+`NOTIFY=` / `ORCPT=` to each RCPT TO, xtext-encoded by `command.xtext`. They are sent only when the
+server advertised DSN; otherwise `beginTransaction` fails with `error.DsnNotSupported` before any
+byte goes out. `ORCPT` entries are parallel to `Envelope.to` (empty, or exactly one per recipient,
+else `error.InvalidDsnParameter`); an empty or over-long parameter (`ENVID` at most 100 encoded
+characters), `NOTIFY=NEVER` combined with another condition, and an `ORCPT` address type that is not
+an atom are the same error. The RFC 6533 `utf-8` address type is refused, since its encoding is not
+xtext. The null reverse-path `<>` that bounces require is `Envelope.from = null`.
+
+### BDAT / CHUNKING (RFC 3030)
+
+`Options.bdat` (default off: it changes the wire format of every message to such servers) sends the
+body as `BDAT n` chunks of about `Options.bdat_chunk` octets (default 64 KiB, minimum 1), the last as
+`BDAT n LAST`, without dot-stuffing (`data.Stuffer.initChunked` / `finishChunked`), when CHUNKING is
+advertised; otherwise DATA is used. Nothing is pipelined past a chunk: each is answered before the
+next goes out, and a refused chunk ends the stream, sends RSET, consumes its reply and returns the
+server's error. A body that the stuffer would refuse (an over-long line, or a bare LF/CR under
+`.newline = .strict`) is refused before MAIL FROM, because a BDAT stream cannot be replaced by an
+empty body the way a refused DATA body can. BINARYMIME is parsed from EHLO but never sent.
+
 ### DATA transparency, and the SMTP-smuggling shape
 
 `Stuffer` doubles a period that starts a line and guarantees the closing `CRLF.CRLF`;
@@ -212,122 +255,69 @@ terminated. Two cases, both deliberate:
 
 ## Verification
 
+Run `scripts/modtest smtp`. The deterministic fuzz driver is `SMTP_FUZZ=<runs>[,<first seed>]`
+(never `zig build --fuzz`).
+
 ### Live interop — a real, third-party SMTP server
 
-The live test in `client.zig` is gated on `SMTP_TEST_SERVER` (plus optional
+The live test in `client.zig` is gated on `SMTP_TEST_SERVER=host:port` (plus optional
 `SMTP_TEST_USER` / `SMTP_TEST_PASSWORD` / `SMTP_TEST_CAPTURE`). Without it, it is a
 loud, counted `error.SkipZigTest` — shown in the summary as "N skip", never folded
 into "pass" — and prints `SKIPPED:` only when `ZIG_LIBS_VERBOSE_SKIP` is set, the
 pattern used by `netconf`, `ssh` and `tc`.
 
-It was run, and passes, against **Python `aiosmtpd` 1.4.6** (with `atpublic` 7.0.0, on
-CPython 3.14.4) — an independent async SMTP *server* implementation — listening on
-`127.0.0.1:8025`, with a ~40-line handler that writes `envelope.content` verbatim to a
-capture file. What ran, in one session:
-
-1. `EHLO client.example.org` → the server's 7-line 250 (SIZE 33554432, 8BITMIME, SMTPUTF8,
-   AUTH LOGIN PLAIN, PIPELINING, HELP), parsed into the capability set;
-2. `AUTH PLAIN AHRlc3RlcgBzM2NyZXQ=` → `235 2.7.0 Authentication successful`;
-3. `MAIL FROM:<sender@example.com> SIZE=1058` + `RCPT TO:<rcpt@example.net>` + `DATA` **as
-   one pipelined group**, replies read in order;
-4. the message: `multipart/mixed` containing a `multipart/alternative`
-   (`text/plain` + `text/html`, both quoted-printable, both with a line that is **exactly
-   `.`**) and a base64 attachment with an RFC 2231 non-ASCII filename, dot-stuffed and
-   terminated with `CRLF.CRLF` → `250 2.0.0 Message accepted for delivery`;
-5. `QUIT` → `221 Bye`.
-
-The test then reads the file **the server wrote** and asserts it is byte-identical to the
-1058 octets the client produced. The server's own JSON summary confirms the envelope it
-saw: `mail_from='sender@example.com'`, `rcpt_tos=['rcpt@example.net']`,
-`mail_options=['SIZE=1058']`, `authenticated=True`, `auth_user='tester'`,
-`host_name='client.example.org'`, `content_len=1058`.
-
-Reproducing the oracle (no root, high port):
-
-```sh
-python3 -m pip install --target ./pylib aiosmtpd
-# ~40 lines: a handler whose handle_DATA writes envelope.content to CAPTURE, an
-# authenticator accepting one fixed user, and
-#   Controller(Handler(), hostname="127.0.0.1", port=8025,
-#              server_hostname="oracle.example.com",
-#              authenticator=..., auth_require_tls=False,
-#              enable_SMTPUTF8=True, decode_data=False)
-PYTHONPATH=./pylib python3 server.py 127.0.0.1 8025 /tmp/last.eml
-```
-
-`aiosmtpd` does not implement PIPELINING itself; its `handle_EHLO` hook was used to add the
-`250-PIPELINING` line so the RFC 2920 path could be exercised against a real peer (it reads
-commands from an asyncio stream, so a grouped write works). Everything else is stock.
-
-**What was not available on this machine:** no root, so no `postfix`/`exim`; and no TLS, so
-the STARTTLS path was *not* exercised live — it is covered by the in-memory tests only
-(including the plaintext-injection case). That is an honest gap: the STARTTLS state
-transitions are verified, the interaction with a real TLS-terminating MTA is not.
+The oracle is **Python `aiosmtpd` 1.4.6**, an independent async SMTP *server*, on `127.0.0.1:8025`
+with a ~40-line handler that writes `envelope.content` verbatim to the capture file, an authenticator
+accepting one fixed user and `enable_SMTPUTF8=True, decode_data=False, auth_require_tls=False`. The
+session it checks: EHLO (a 7-line 250 parsed into the capability set), `AUTH PLAIN`, `MAIL FROM` with
+`SIZE=` + `RCPT TO` + `DATA` as one pipelined group, a `multipart/mixed` message (a
+`multipart/alternative` of quoted-printable `text/plain` + `text/html`, each with a line that is
+exactly `.`, and a base64 attachment with an RFC 2231 non-ASCII filename), dot-stuffed and
+terminated, then `QUIT`. The test reads the file **the server wrote** and asserts it is
+byte-identical to what the client produced. `aiosmtpd` does not implement PIPELINING itself; its
+`handle_EHLO` hook adds the `250-PIPELINING` line so the RFC 2920 path runs against a real peer.
+The live run does not cover STARTTLS (no TLS in the oracle), the SCRAM / XOAUTH2 / OAUTHBEARER
+mechanisms, DSN parameters or BDAT; those are covered by the in-memory tests against the scripted
+fake server (`FakeServer` in `client.zig`) and the pure `Session` tests.
 
 ### Byte-exact goldens — which are real captures
 
-`live_golden.zig` contains **two verbatim captures of the session above**, recorded by a
-40-line TCP proxy that logged both directions to disk:
+`live_golden.zig` contains **two verbatim captures of the live session**, recorded by a TCP proxy
+that logged both directions: `live_server` (every octet `aiosmtpd` sent, unedited) and
+`live_client` (every octet this module sent, unedited). The only edit anywhere: the server ran with
+`server_hostname="oracle.example.com"` so the transcript carries no local machine name. Three tests
+use them:
 
-| Golden | Origin |
-|---|---|
-| `live_server` (297 octets) | every octet `aiosmtpd` sent, unedited |
-| `live_client` (1202 octets) | every octet this module sent, unedited |
+1. the captured EHLO reply is parsed and every resolved capability asserted — the reply parser fed
+   foreign bytes, including a 7-line reply where only the last line has a space separator;
+2. **the replay test**: the captured server bytes are fed into the *pure* `Session`, the same
+   message is re-composed from the same seed, and the produced wire bytes are compared to
+   `live_client` **octet for octet** (reply parser, capability resolution, AUTH encoding, pipelining
+   grouping, `SIZE=`, MIME composition, encoded words, quoted-printable, boundaries, dot-stuffing);
+   it also asserts every reply in the capture was consumed;
+3. the DATA payload is extracted from the client capture, un-stuffed byte at a time, and compared
+   with a fresh `render`, with an explicit assertion that the wire carried `..` where the document
+   has `.`.
 
-The only edit anywhere: the server was started with `server_hostname="oracle.example.com"`
-so the transcript carries no local machine name.
-
-Three tests use them:
-
-1. the captured EHLO reply is parsed and every resolved capability asserted — the reply
-   parser fed foreign bytes, including a 7-line reply where only the last line has a space
-   separator;
-2. **the replay test**: the captured server bytes are fed into the *pure* `Session`, the
-   same message is re-composed from the same seed, and the produced wire bytes are compared
-   to `live_client` **octet for octet**. Any drift in the reply parser, the capability
-   resolution, the AUTH encoding, the pipelining grouping, the `SIZE=` parameter, the MIME
-   composition, the encoded words, the quoted-printable, the boundaries or the dot-stuffing
-   changes that string. It also asserts every reply in the capture was consumed;
-3. the DATA payload is extracted from the client capture, un-stuffed byte at a time, and
-   compared with a fresh `render` — with an explicit assertion that the wire carried `..`
-   where the document has `.`.
-
-Every other golden in the module is **self-derived** (our own canonical output, pinned
-against accidental change) or **taken from an RFC**: the RFC 4616 §4 / RFC 4954 §4 AUTH
-PLAIN examples, the RFC 2045 §6.7 quoted-printable rules, and the RFC 5322 §3.3 date
+Every other golden in the module is **self-derived** (our own canonical output, pinned against
+accidental change) or **taken from an RFC**: the RFC 4616 §4 / RFC 4954 §4 AUTH PLAIN examples, the
+RFC 7677 SCRAM exchange, the RFC 2045 §6.7 quoted-printable rules, and the RFC 5322 §3.3 date
 format. These are labelled as such in the test names.
 
 ### Independent MIME parser cross-check
 
-The captured `.eml` — the bytes the *server* received — was parsed with **Python's `email`
-module** (`BytesParser(policy=policy.default)`), which is an entirely independent
-implementation of RFC 5322/2045/2047/2231. Result:
-
-```
-Subject : 'Živá zkouška — live interop'          # RFC 2047 B-word decoded
-To      : 'Recipient Ř <rcpt@example.net>'       # RFC 2047 Q-word decoded
-Date    : 'Wed, 22 Jul 2026 12:00:00 +0200'
-defects : []                                     # at every level of the tree
-multipart/mixed
-  multipart/alternative
-    text/plain  cte=quoted-printable  payload='první\r\n.\r\ntřetí\r\n'
-    text/html   cte=quoted-printable  payload='<p>první</p>\r\n<p>.</p>\r\n'
-  text/plain    cte=base64  disp=attachment  filename='účtenka.txt'
-                payload='attachment line 1\n.\nattachment line 3\n'
-```
-
-Both encoded-word forms decode to the intended text, the tree structure and every
-`Content-Type` / `Content-Transfer-Encoding` / `Content-Disposition` match what was
-composed, the RFC 2231 filename decodes to `účtenka.txt`, **zero defects are reported at
-any level**, and each payload — including the line that is exactly `.` — comes back byte
-for byte. That is the strongest available evidence that the composer is not merely
-self-consistent.
+The `.eml` the *server* received was parsed with **Python's `email` module**
+(`BytesParser(policy=policy.default)`), an independent implementation of RFC 5322/2045/2047/2231:
+both encoded-word forms (B in `Subject`, Q in `To`) decode to the intended text, the tree and every
+`Content-Type` / `Content-Transfer-Encoding` / `Content-Disposition` match what was composed, the
+RFC 2231 filename decodes, **zero defects** are reported at any level, and each payload — including
+the line that is exactly `.` — comes back byte for byte. That is the strongest available evidence
+that the composer is not merely self-consistent.
 
 ### Third-party client cross-check
 
-`swaks` (DEVRELEASE), an unrelated SMTP client, was pointed at the same server with the
-same credentials and the same kind of body. It emitted `AUTH PLAIN AHRlc3RlcgBzM2NyZXQ=` —
-byte-identical to ours — and dot-stuffed its `.` line to `..` exactly as we do. A test in
+`swaks`, an unrelated SMTP client, pointed at the same server with the same credentials, emitted
+`AUTH PLAIN` byte-identical to ours and dot-stuffed its `.` line to `..` exactly as we do. A test in
 `live_golden.zig` pins that agreement.
 
 ### Hostile input and fuzzing
@@ -353,18 +343,27 @@ one-byte-at-a-time feed where the layer is incremental:
 | more capability lines than the limit | `error.TooManyCapabilities` |
 | an empty multipart / too-deep nesting / too many recipients | `EmptyMultipart` / `DepthExceeded` / `TooManyRecipients` |
 
-`std.testing.fuzz` targets (also run by the deterministic `SMTP_FUZZ` driver, which adds the `Client` against a scripted server): the reply parser (both bare-LF policies), the capability
-parser, the command builders (asserting no output ever contains a bare CR/LF and no line
-exceeds 512), the dot-stuffer/un-stuffer (asserting `unstuff(stuff(x))` equals an
-*independently computed* canonicalisation of `x`, so the round-trip is not the encoder
-checking itself), the AUTH encoders, the header writers (asserting every CR is followed by
-LF, every LF preceded by CR, and every line within 998), and the whole message renderer
-(asserting the line limit and that the boundary occurs exactly four times — the
-`Content-Type` parameter, two delimiters and the closer).
+`std.testing.fuzz` targets (also run by the deterministic `SMTP_FUZZ` driver): the reply parser (both
+bare-LF policies), the capability parser, the command builders (asserting no output ever contains a
+bare CR/LF and no line exceeds 512), the dot-stuffer/un-stuffer (asserting `unstuff(stuff(x))` equals an
+*independently computed* canonicalisation of `x`, so the round-trip is not the encoder checking
+itself), the AUTH encoders, the header writers (asserting every CR is followed by LF, every LF
+preceded by CR, and every line within 998), and the whole message renderer (asserting the line limit
+and that the boundary occurs exactly four times — the `Content-Type` parameter, two delimiters and
+the closer). The driver's own harness `smtp-client` runs the `Client` against the scripted server
+over four conversations (plain; STARTTLS + AUTH with `tls = .required`; STARTTLS stripped by the
+peer; opportunistic without TLS and credentials), with one server reply damaged, dropped, re-coded,
+replaced by garbage or doubled, delivered in random-sized pieces. Undamaged, the message arrives
+dot-unstuffed and a stripped STARTTLS and plaintext AUTH are refused; whatever the server says, the
+outcome is a typed error or a finished transaction, and neither the AUTH command, the credentials
+nor (TLS required) MAIL FROM ever reach the wire before the TLS upgrade.
 
-`zig build test-smtp` is green in both `Debug` and `--release=fast`. Without a live server,
-the one live test is a counted skip, not a pass (see "Live interop" above); with
-`SMTP_TEST_SERVER` set, it runs for real.
+Constant time: `src/ctgrind_harness.zig` (target `auth`, ReleaseFast, run through
+`scripts/checks/ctgrind.sh smtp`) covers the AUTH PLAIN/LOGIN password path (`b64ct` encoding and the
+masked credential check); the residual in-file contexts are one validity verdict per call (the card's
+`**Hardening:**` line holds the figures).
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it (the card records none for this module).
 
 ## Provenance
 
@@ -378,17 +377,14 @@ citations live here. `aiosmtpd`, `swaks` and Python's `email` module were used p
 black-box compatibility oracles (nothing read from or copied out of them), which
 CONVENTIONS.md §5 also puts outside NOTICE's scope.
 
-## Deferred
+## What is deliberately not done
 
-Honest list of what this module does **not** do:
-
-* **DKIM signing / verification (RFC 6376), ARC, SPF, DMARC.** A `verbatim` header (`Header.verbatim`, A1 F8; `raw` folds and would break DKIM `simple`) lets a caller
+* **DKIM signing / verification (RFC 6376), ARC, SPF, DMARC.** A `verbatim` header (`Header.verbatim`; `raw` folds and would break DKIM `simple`) lets a caller
   attach a signature produced elsewhere; nothing here canonicalises or signs. DKIM's
-  relaxed/simple body canonicalisation plus key management is a module of its own.
-* **DSN (RFC 3461).** The `RET=`/`ENVID=`/`NOTIFY=`/`ORCPT=` parameters are sent (2026-11-16,
-  `Envelope.dsn`, gated on the advertised capability); the null reverse-path `<>` that bounces
-  require is supported. Not done: a `multipart/report` composer, and RFC 6533 `utf-8` ORCPT
-  address types (refused, since their encoding is not xtext).
+  relaxed/simple body canonicalisation plus key management is a module of its own (→ Backlog).
+* **A DSN report composer and RFC 6533 `utf-8` ORCPT address types.** The RFC 3461 parameters are
+  sent and the null reverse-path `<>` is supported; a `multipart/report` composer is not built, and
+  `utf-8` ORCPT address types are refused, since their encoding is not xtext.
 * **BINARYMIME (RFC 3030).** Reported, never sent: `BODY=BINARYMIME` is not offered to
   callers. BDAT itself is implemented (opt-in `Options.bdat`); the body is still normalised
   to CRLF line endings and the 998-octet line limit still applies.
@@ -396,11 +392,11 @@ Honest list of what this module does **not** do:
   tested (it is how the sender is verified), and `reply.zig` would serve a server's writer,
   but nothing here listens or answers.
 * **TLS.** By repo policy (CONVENTIONS.md §2): STARTTLS is negotiated, the handshake is the
-  caller's. Consequently the STARTTLS path has **no live verification** — see above.
+  caller's. Consequently the STARTTLS path has no live verification (→ Open).
   Implicit TLS on port 465 (RFC 8314) needs no code here at all: hand the client an
   already-encrypted `Transport` and set `tls = .disabled`.
-* **SASL beyond PLAIN, LOGIN, XOAUTH2, OAUTHBEARER and SCRAM-SHA-256.** SCRAM-SHA-256 is client side only, without channel binding (no `-PLUS`),
-  and with no SASLprep: a non-ASCII user name or password is refused. No CRAM-MD5 (obsolete and requires storing
+* **SASL beyond PLAIN, LOGIN, XOAUTH2, OAUTHBEARER and SCRAM-SHA-256.** No channel binding (no `-PLUS`),
+  and no SASLprep: a non-ASCII SCRAM user name or password is refused. No CRAM-MD5 (obsolete and requires storing
   password-equivalent material), no SCRAM-SHA-1, no GSSAPI. Token acquisition/refresh for the OAuth
   mechanisms is the caller's. `Capabilities.auth.other`
   reports that the server offered something else so a caller can say why it gave up.
@@ -409,17 +405,21 @@ Honest list of what this module does **not** do:
 * **Name resolution and MX lookup.** The caller connects; the sibling `dns` module has
   `MX` if you need it. No queueing, no retry scheduling, no bounce handling — the
   transient/permanent distinction is surfaced so a caller's queue can make those decisions.
-* **RFC 6531 SMTPUTF8 end to end.** Negotiated, and non-ASCII envelope addresses are
-  permitted once it is, but there is no downgrade path (RFC 6530 §6) and no live test with
-  a UTF-8 mailbox — the live server advertises it, we did not use it.
+* **RFC 6531 SMTPUTF8 downgrade.** Negotiated, and non-ASCII envelope addresses are
+  permitted once it is, but there is no downgrade path (RFC 6530 §6).
 * **`VRFY`/`EXPN`/`HELP`/`TURN`.** `VRFY` has a builder for completeness; the session never
   uses any of them.
 * **Header *parsing*.** `Message` is write-only: there is no RFC 5322 parser, no
   encoded-word decoder outside the tests, and no address-list parser.
-* **A timeout implementation.** By design (see above) — the seam is there, the policy is the
+* **A timeout implementation.** By design (see *Layering*) — the seam is there, the policy is the
   caller's.
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit (2025-09) predates Zig 0.16, so it needs a port or a 0.15 toolchain first.
+## Open
+
+* **STARTTLS against a real TLS-terminating MTA.** The state transitions (including the
+  plaintext-injection case) are verified in memory; the interaction with a real server is not.
+* **SMTPUTF8 with a UTF-8 mailbox against a live server.** The live oracle advertises it; the live
+  test does not use it.
 
 ## Anchoring
 
@@ -432,12 +432,5 @@ Honest list of what this module does **not** do:
 
 ## Backlog / deferred
 
-Survey findings; `## Deferred` above remains the prose list of what is not done.
-
-- **SASL XOAUTH2 / OAUTHBEARER (RFC 7628)** ✅ DONE 2026-11-16 (`auth.xoauth2Response`/`oauthbearerResponse`, `Mechanism.xoauth2`/`.oauthbearer`, `Credentials.token`, 334 error challenge acknowledged and the JSON kept in `Session.authErrorJson`) *(survey 2026-09-30)*. Gmail and Microsoft 365 are retiring password auth, so a mail sender against them cannot log in without it; lettre and curl have it *(inferred)*. Effort: small (one-shot initial response, JSON error round trip); token acquisition stays the caller's. Fits CONVENTIONS §2. Currently `Capabilities.auth.other` only reports it (SPEC "Deferred" lists it as not done).
-- **SCRAM-SHA-256 (RFC 5802/7677)** ✅ DONE 2026-11-16 (`auth.ScramClient`, `Mechanism.scram_sha_256`, `AuthSet.scram_sha_256`, `Options.scram_random`; client side, no channel binding, ASCII credentials only — no SASLprep, `error.NonAsciiCredential`; iteration count 4096..600000; server signature verified in constant time) *(survey 2026-09-30)*. The non-obsolete password-hash mechanism; curl has it *(inferred)*. Effort: small-medium (HMAC/PBKDF2 are in `std`). Fits §2.
-- **DSN parameters `RET`/`ENVID`/`NOTIFY`/`ORCPT` (RFC 3461)** ✅ DONE 2026-11-16 (`Envelope.dsn`, `command.MailParams.ret/envid`, `RcptParams.notify/orcpt`, `command.xtext`, capability-gated) *(survey 2026-09-30)*. Delivery receipts are a normal request from a mail-sending application. Effort: small (MAIL/RCPT parameters; capability already parsed). Fits §2.
-- **BDAT/CHUNKING (RFC 3030)** ✅ DONE 2026-11-16 (`Options.bdat`/`bdat_chunk`, opt-in, used when CHUNKING is advertised; `command.bdat`, `data.Stuffer.initChunked`; each chunk acknowledged, a refused chunk ends the stream and is followed by RSET; BINARYMIME is still not sent) *(survey 2026-09-30)*. Removes dot-stuffing and enables BINARYMIME; rare on the public Internet. Effort: small-medium. Fits §2.
-- **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (SPEC "Deferred" already says so). Fits §2 (RSA/Ed25519 exist in the repo).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (see *What is deliberately not done*). Fits §2 (RSA/Ed25519 exist in the repo).
+- **Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit predates Zig 0.16, so it needs a port or a 0.15 toolchain first.

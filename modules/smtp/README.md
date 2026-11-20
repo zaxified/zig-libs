@@ -214,8 +214,9 @@ With `tls = .required` and no hook, a server that offers STARTTLS gives
   `WriteFailed` / `EndOfStream`. `TlsUpgrade` is the STARTTLS hook.
 - `Options` (session) — `ehlo_domain`, `tls` (`TlsPolicy`), `credentials`,
   `allow_plaintext_auth`, `pipelining`, `announce_size`, `require_all_recipients`,
-  `max_recipients`, plus the command/capability limit structs.
-- `Envelope` — `from` (`null` = `<>`), `to`, `body`, `eight_bit`, `smtputf8`.
+  `max_recipients`, `bdat` / `bdat_chunk`, `scram_random`, plus the `data` newline policy and the
+  command/capability limit structs.
+- `Envelope` — `from` (`null` = `<>`), `to`, `body`, `eight_bit`, `smtputf8`, `dsn`.
   `RecipientStatus` carries each recipient's code and whether it stuck.
 - `Reply` — `.code`, `.enhanced`, `.text`, `.lines`; `check()`, `expectCode()`, `class()`,
   `clone()`. `ReplyParser` = `init(gpa, Limits, Options)`, `feed`, `next`, `atBoundary`.
@@ -247,8 +248,14 @@ SMTP_TEST_CAPTURE=/tmp/last.eml \
                                     #   the file the SERVER wrote equals what we sent
 ```
 
-SPEC.md records which server the live run used, which goldens are real captures, how the
-independent MIME parser cross-check was done, and the deferred list.
+SPEC.md records which server the live run used, which goldens are real captures and how the
+independent MIME parser cross-check was done.
+
+## Not provided
+
+No TLS of its own (STARTTLS is a seam), no server side, no DKIM signing, no SASL beyond PLAIN, LOGIN,
+XOAUTH2, OAUTHBEARER and SCRAM-SHA-256, no message parsing; SPEC.md *What is deliberately not done*
+has the reasons and *Backlog / deferred* what is planned.
 
 Provenance: clean-room from RFC 5321 / 5322 / 1869 / 1870 / 2045 / 2046 / 2047 / 2231 /
 2920 / 3207 / 3461 / 3463 / 4616 / 4954 / 6152 / 6531. No third-party source was ported or
