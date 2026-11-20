@@ -525,7 +525,7 @@ test "corpus: every signature seed reaches verify, and the outcomes are pinned" 
             verified += 1;
         } else |_| {}
     }
-    // Measured 2026-09-07. Before: 1 round, 1 input, octet 0 forced to zero,
+    // Measured. Before: 1 round, 1 input, octet 0 forced to zero,
     // 0 verifications and 0 pristine fields ever seen by `compDecode`.
     try std.testing.expectEqual(@as(usize, 5), nonempty); // the deliberate empty seed is the sixth
     try std.testing.expectEqual(@as(usize, 5 * sig_len - 1), octets);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Boundary and model tests added by the 2026-11-17 whole-module mutation
+//! Boundary and model tests added by the whole-module mutation
 //! audit. Every test here exists because a mutant of the module survived the
 //! KAT, codec and fuzz suites: the verdicts are the ones a KAT cannot reach
 //! (an exact-bound norm, a draw that lands on a rejection threshold, a
