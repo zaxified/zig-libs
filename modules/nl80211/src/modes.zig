@@ -63,14 +63,15 @@ pub fn buildLeaveIbss(gpa: std.mem.Allocator, family_id: u16, seq: u32, ifindex:
 /// Parameters of `MESH join`.
 pub const MeshOptions = struct {
     ifindex: u32,
-    /// The mesh id, 0 to 32 bytes (raw, not NUL-terminated).
+    /// The mesh id, 1 to 32 bytes (raw, not NUL-terminated); the kernel's
+    /// `nl80211_join_mesh` answers an empty one with -EINVAL.
     mesh_id: []const u8,
     channel: config.Channel,
 };
 
 /// Build `NL80211_CMD_JOIN_MESH` (`iw dev <dev> mesh join <id> freq <mhz> …`).
 pub fn buildJoinMesh(gpa: std.mem.Allocator, family_id: u16, seq: u32, opts: MeshOptions) BuildError![]u8 {
-    if (opts.mesh_id.len > uapi.max_ssid_len) return error.InvalidRequest;
+    if (opts.mesh_id.len == 0 or opts.mesh_id.len > uapi.max_ssid_len) return error.InvalidRequest;
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
     const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.JOIN_MESH);
@@ -110,6 +111,7 @@ test "IBSS and MESH builders refuse over-long names and a zero beacon interval" 
     const long: [33]u8 = @splat('a');
     const ch = config.Channel.legacy(2412);
     try testing.expectError(error.InvalidRequest, buildJoinIbss(testing.allocator, 41, 1, .{ .ifindex = 1, .ssid = &long, .channel = ch }));
+    try testing.expectError(error.InvalidRequest, buildJoinMesh(testing.allocator, 41, 1, .{ .ifindex = 1, .mesh_id = "", .channel = ch }));
     try testing.expectError(error.InvalidRequest, buildJoinIbss(testing.allocator, 41, 1, .{ .ifindex = 1, .ssid = "x", .channel = ch, .beacon_interval_tu = 0 }));
     try testing.expectError(error.InvalidRequest, buildJoinMesh(testing.allocator, 41, 1, .{ .ifindex = 1, .mesh_id = &long, .channel = ch }));
     try testing.expectError(error.InvalidRequest, buildJoinMesh(testing.allocator, 41, 1, .{ .ifindex = 1, .mesh_id = "m", .channel = .{ .freq_mhz = 2437, .width = .@"40" } }));

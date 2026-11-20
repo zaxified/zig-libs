@@ -441,7 +441,6 @@ attribution.
 - **Capability decoding beyond HT/VHT/HE bytes:** HE/EHT per-bit accessors (needs a capture from an HE radio; this host's iwlwifi
   is 802.11ac), `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL`, and multi-link (`BSS_MLD_ADDR` / `MLO_LINK_ID`) handling beyond decoding the attributes.
 - **`SET_WIPHY` antenna masks** (channel, tx power, RTS/fragmentation, retry limits and coverage class are built).
-- **An empty mesh id is passed to the kernel unchecked** (`src/modes.zig` rejects only more than 32 bytes).
 - **Parser ceilings as options:** make the fixed ceilings (see § 3, Limits) options only if real hardware ever meets one.
 
 ## Anchoring
