@@ -23,27 +23,27 @@
 
 Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`. tokio-util 0.7.19 and asynchronous-codec 0.7.0 (both MIT) were read from source and run (`tools/oracle`); netty and Go were not read (behaviour from documentation, *(inferred)*). Sibling modules checked: none offers a configurable length-prefix codec (`lnwire` has BigSize, `websocket` its own frame layer, `aeadframe` an AEAD record layer).
 
-**tokio-util `LengthDelimitedCodec` option by option [V]:** `length_field_length` 1-8 → done (`Width` u8..u64 incl. u24/u40/u48/u56); `big_endian`/`little_endian`/`native_endian` → done (`Prefix.endian`; native is the caller's choice of `@import("builtin").cpu.arch.endian()`, rejected as a separate flag); `length_field_offset` → done (`Prefix.offset`, a u8; `writeFrameWithHeader` writes the bytes); `length_adjustment` → done (`Prefix.adjustment`, same sign as tokio's after mapping `includes_prefix`); `num_skip` → done (`Prefix.skip`, limited to 0..head: tokio also accepts more than the head and a frame shorter than the head bytes it keeps, then hands out frames without consuming input — rejected, `BadLength`); `max_frame_length` → done, but it bounds the frame length AFTER the adjustment, tokio bounds the raw field and clamps itself to `2^(8w)-1+adjustment` (by design: the cap protects the allocation, not the wire field); `new_framed`/`new_read`/`new_write` (tokio Framed/stream adapters) → rejected, async runtime types; ours is any `std.Io.Reader`/`Writer` plus the non-blocking `Decoder`. Not in tokio and ours: varint, `readFrameAlloc`, the JSON envelope.
+**tokio-util `LengthDelimitedCodec` option by option [V]:** `length_field_length` 1-8 → done (`Width` u8..u64 incl. u24/u40/u48/u56); `big_endian`/`little_endian`/`native_endian` → done (`Prefix.endian`; native is the caller's choice of `@import("builtin").cpu.arch.endian()`, no separate flag, see *What is deliberately not done*); `length_field_offset` → done (`Prefix.offset`, a u8; `writeFrameWithHeader` writes the bytes); `length_adjustment` → done (`Prefix.adjustment`, same sign as tokio's after mapping `includes_prefix`); `num_skip` → done (`Prefix.skip`, limited to 0..head: tokio also accepts more than the head and a frame shorter than the head bytes it keeps, then hands out frames without consuming input — rejected, see *What is deliberately not done*); `max_frame_length` → done, but it bounds the frame length AFTER the adjustment, tokio bounds the raw field and clamps itself to `2^(8w)-1+adjustment` (by design: the cap protects the allocation, not the wire field); `new_framed`/`new_read`/`new_write` (tokio Framed/stream adapters) → rejected (see *What is deliberately not done*); ours is any `std.Io.Reader`/`Writer` plus the non-blocking `Decoder`. Not in tokio and ours: varint, `readFrameAlloc`, the JSON envelope.
 
 **asynchronous-codec `LengthCodec` [V]:** a fixed u64 big-endian prefix with no cap; a subset of ours. **netty `LengthFieldBasedFrameDecoder` *(inferred)*:** same parameter set plus `failFast` and `lengthFieldEndOffset` arithmetic; `initialBytesToStrip` is `skip`.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [tokio-rs/tokio](https://github.com/tokio-rs/tokio) `tokio-util` `LengthDelimitedCodec` — **reference** | Rust | MIT (LICENSE file) | 33.3k | tokio-1.53.1 (2026-07) | Builder: length field of 1-8 bytes, big or little endian, field offset, length adjustment, bytes to skip, max frame; incremental decode (`Decoder`) over partial reads *(inferred)*. Ours: u32 LE only, blocking-style reader. |
+| [tokio-rs/tokio](https://github.com/tokio-rs/tokio) `tokio-util` `LengthDelimitedCodec` — **reference** | Rust | MIT (LICENSE file) | 33.3k | tokio-1.53.1 (2026-07) | Builder: length field of 1-8 bytes, big or little endian, field offset, length adjustment, bytes to skip, max frame; incremental decode (`Decoder`) over partial reads *(inferred)*. Ours: the same parameter set (`Limits.prefix`: width 1-8 or varint, byte order, offset, adjustment, skip), blocking `readFrame` / `readFrameAlloc` and the non-blocking `Decoder`. |
 | [mxinden/asynchronous-codec](https://github.com/mxinden/asynchronous-codec) `LengthCodec` 0.7.0 — second implementation measured (**fastest** where it beats the reference, see Performance) | Rust | MIT (LICENSE file) | — | 0.7.0 | Fixed u64 big-endian length prefix, no cap, no options [V]. |
 | [netty/netty](https://github.com/netty/netty) `LengthFieldBasedFrameDecoder` / `LengthFieldPrepender` | Java | Apache-2.0 | 35.1k | push 2026-09 | The originator of the same parameter set (offset, width, adjustment, strip) *(inferred)*. |
 | Go `encoding/binary` + `bufio` (no dedicated package) | Go | BSD-3-Clause *(Go stdlib; inferred)* | — | Go stdlib | Users hand-roll the 4-byte prefix with `binary.Read`/`ReadFull`; a proto-delimited variant is `protodelim` (varint prefix) *(inferred)*. |
 | [Zig `std.Io.Reader`/`Writer`](https://ziglang.org/documentation/master/std/#std.Io.Reader) | Zig | MIT | — | Zig std | `takeInt`/`writeInt` in any width and endianness, so a frame is three lines; no size cap, no envelope. |
 
-**Where we are ahead:** over plain `std`: enforced frame cap on both directions before touching the stream, a caller-buffer or allocating reader, and a depth-capped JSON tagged-union envelope · **Where we are behind** (re-checked 2026-11-02): nothing in tokio's builder; no async `Framed` adapter (rejected above, runtime types) and no Netty `failFast`. The general prefix (offset, adjustment, skip, widths 1-8) closed the last gap that held the scope at core.
+**Where we are ahead:** over plain `std`: enforced frame cap on both directions before touching the stream, a caller-buffer or allocating reader, and a depth-capped JSON tagged-union envelope · **Where we are behind:** nothing in tokio's builder; no async `Framed` adapter (rejected, see *What is deliberately not done*) and no Netty `failFast` (see *Backlog / deferred*). The general prefix (offset, adjustment, skip, widths 1-8) closed the last gap that held the scope at core.
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Design & invariants
 
 - **Two layers, one module:** length-prefixed stream framing (`writeFrame`/`readFrame`) plus a
   generic JSON tagged-union envelope codec (`EnvelopeCodec(T)`) on top.
-- **Wire shape:** a 4-byte little-endian `u32` byte length, then that many raw payload bytes. This
+- **Wire shape:** by default a 4-byte little-endian `u32` byte length, then that many raw payload bytes (the prefix is configurable, see below). This
   is length-prefixed, not newline-delimited — a payload may freely contain `\n`, `\r`, `NUL`, or
   any other byte. (The MCP stdio newline-delimited convention is a different framing, served by the
   `mcp` module instead.)
@@ -65,23 +65,32 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **`max_frame` is a runtime parameter** (`Limits{ .max_frame = ... }`, default 1 MiB), not a
   compile-time constant, enforced on both `writeFrame` (before touching the writer) and
   `readFrame` (checked against both the announced length and the caller's buffer capacity).
-- Pure `std` (`std.Io.Writer`/`std.Io.Reader` + `std.json`), no allocation in `writeFrame`/`readFrame`
+- `std` (`std.Io.Writer`/`std.Io.Reader` + `std.json`) and the sibling `jsontext` (the allocation-free depth scan behind `jsonDepthWithin`), no allocation in `writeFrame`/`readFrame`
   (`readFrameAlloc`, `Decoder` and the envelope layer allocate via the caller's `gpa`). Reentrant — no shared/global state.
 
-- **Configurable prefix and `Decoder` (2026-10-04).** `Limits.prefix` (default unchanged, u32-LE)
-  selects width 1/2/4/8 or LEB128 varint, byte order, and `includes_prefix` (the field counts its
-  own bytes; for a varint the prefix length is the fixpoint of its own encoding). A width too
-  narrow for the payload is `FrameTooLarge` on write. Decoding refuses a length field the format
-  cannot produce — a varint longer than 10 bytes, past 64 bits or not minimally encoded (a
-  trailing zero group: the writer never emits one, and accepting it would give a frame two
-  encodings), a self-counting value below its prefix — as `BadLength`. `Decoder` is the
-  non-blocking form: `feed` bytes, `next` until null; the announced length is checked the moment
-  the prefix is complete, errors are sticky (the stream is out of step), and `feed` refuses to
-  buffer past one frame plus prefix of undrained input (`NotDrained`), so memory is bounded by
-  `max_frame` plus one read. Mutation equivalents: masking a varint group with `0xff` instead of
-  `0x7f` (non-final bytes get `0x80` OR-ed in anyway, the final one is < 128); dropping the sticky
-  `failed` check (a failed prefix fails identically on every retry, since `next` never advances
-  past it).
+- **Configurable prefix and `Decoder`.** `Limits.prefix` selects the width (`Width`: u8 … u64 including the odd
+  u24/u40/u48/u56, or LEB128 `varint`), the byte order, `includes_prefix` (the field counts its own bytes; for a
+  varint the prefix length is the fixpoint of its own encoding), and tokio's / Netty's general form: `offset`
+  header bytes before the field (a `u8`; `writeFrame` returns `HeaderRequired`, `writeFrameWithHeader` writes
+  them), a signed `adjustment` (the field is `n - adjustment`, tokio's sign) and `skip` (head bytes dropped from
+  the front of the frame, tokio's `num_skip`; null = the whole head; more than the head, or a frame shorter than
+  the head bytes it keeps, is `BadLength` on decode; the writers refuse any `skip` but null or the whole head
+  with `SkipNotWritable`, because such a frame would not read back under the same `Limits`).
+  `max_frame` bounds `n`, the length after the adjustment, on reader and writer alike; tokio bounds the raw
+  field, and the cap here protects the allocation, not the wire field. A width too narrow for the payload is
+  `FrameTooLarge` on write. Decoding refuses a length field the format cannot produce — a varint longer than 10
+  bytes, past 64 bits or not minimally encoded (a trailing zero group: the writer never emits one, and accepting
+  it would give a frame two encodings), a self-counting value below its prefix — as `BadLength`. `Decoder` is the
+  non-blocking form: `feed` bytes, `next` until null; the announced length is checked the moment the prefix is
+  complete, errors are sticky (the stream is out of step), and `feed` refuses to buffer past one frame plus
+  prefix of undrained input (`NotDrained`), so memory is bounded by `max_frame` plus one read.
+- **`readFrameAlloc`** checks the announced length against `max_frame` before allocating. Up to 16 KiB it
+  allocates exactly the frame; above that the buffer grows (doubling) only as the bytes actually arrive, so a
+  peer that announces `max_frame` and stalls costs one chunk, not `max_frame` per connection. The result is
+  exactly the frame's length, so `gpa.free` of it is valid. How long to wait for the rest is the `Reader`'s
+  business.
+- **`EnvelopeCodec(T).parse`** uses `.alloc_always`: the parsed value never aliases the frame buffer, so the
+  buffer may be reused or freed while the value lives.
 
 ## Threat model / out of scope
 
@@ -95,26 +104,47 @@ codec's concern.
 
 ## Verification
 
-Tests run on a domain-free test-only `union(enum)` (no application types imported): frame round-trip,
-oversize rejection on both the write and read paths (incl. `max_frame` enforced independently of
-buffer size), envelope round-trip (normal + empty payload), an enum-payload variant, a payload
-with embedded newline/`\r\n`/`NUL` bytes (proving the framing is not newline-delimited), a full
-envelope-through-wire-frame round-trip, and oversize rejection through `EnvelopeCodec.writeFramed`.
-Verified green in Debug and ReleaseFast; `zig fmt --check` clean. Run: `zig build test-framing`.
+- **Run:** `scripts/modtest framing`; the benchmark and the differential need the Rust side built by hand
+  (`tools/oracle`, `--release`; run it under `hw run`: tokio hands out empty frames forever when
+  `num_skip + n == 0`).
+- **Tests** (`src/root.zig`, on a domain-free test-only `union(enum)`): frame round-trip, oversize rejection on
+  the write and read paths, exactly-at-`max_frame` and exactly-filling-the-buffer edges, `max_frame` enforced
+  independently of buffer size; envelope round-trip (normal, empty, enum payload, embedded newline / `\r\n` /
+  NUL, through the wire frame, `writeFramed` oversize); the depth cap and its string-aware scan; every prefix
+  format's exact wire bytes derived by hand, varint (`300 = ac 02`, the `includes_prefix` fixpoint), every
+  format through `readFrame`, `readFrameAlloc` and the `Decoder`, malformed lengths, `Decoder` refusing at the
+  prefix and `NotDrained`, golden frames from tokio-util, the header writer and adjustment signs.
+  `src/sweep_test.zig` holds the hostile-input cases (a peer announcing `max_frame` and stalling, allocation
+  failure at every step, `max_frame = maxInt(u32)`, hostile JSON bodies, one-byte-at-a-time hostile streams,
+  extreme offset / adjustment / skip, the #37131 guard in every optimize mode, `SkipNotWritable`).
+- **Fuzz:** testkit's deterministic driver as `FRAMING_FUZZ` (`framing-prefix`): a PRNG-drawn configuration and
+  stream, `Decoder`, `readFrame` and `readFrameAlloc` compared with a literal in-tree model of the format
+  (`modelDecode`), and the writer's output read back by the model; the model shares its author's reading of
+  the format, which the tokio differential is there to catch. Reach checks in every test run; also a 2000-stream
+  PRNG driver test.
+- **Differential:** `tools/diff.zig` generates random encode and decode cases (every width 1-8, both byte
+  orders, offset, adjustment, skip, `max_frame`; well-formed, truncated, bit-flipped and random streams), the
+  Rust program in `tools/oracle` (tokio-util 0.7.19) answers them, and `cmp` compares; a `W` answer marks a
+  by-design refusal that tokio does not share (the `n < head - skip` rule, listed in the header of
+  `tools/diff.zig`) and an `R` answer a refusal by the oracle (declared length past 16 MiB), both not
+  compared. Not a live CI oracle. Varint is not in tokio and stays covered by the protobuf golden values.
+- **Constant time:** n/a (length-prefix framing).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-framing` (after the Rust build) against tokio-util and asynchronous-codec; the
+  figures are the card's Performance line. Only the u64 big-endian path is measured, the one wire all
+  three libraries speak.
+
+## What is deliberately not done
+
+- **tokio's `Framed` / stream adapters** (`new_framed`, `new_read`, `new_write`): async runtime types; the module
+  works on any `std.Io.Reader` / `Writer` and has the non-blocking `Decoder`.
+- **A separate native-endian flag:** the caller passes `@import("builtin").cpu.arch.endian()` as `Prefix.endian`.
+- **`skip` past the head, or a frame shorter than the head bytes it keeps** (tokio accepts both and then hands
+  out frames without consuming input): `BadLength`.
 
 ## Backlog / deferred
 
-- **None substantive** before the survey: `max_frame` is already parameterized and the
-  tag-keyed union behavior is confirmed.
-- **Writers and `skip` (2026-11-03):** `writeFrame`/`writeFrameWithHeader` refuse `Prefix.skip` other than null or the whole head with `error.SkipNotWritable` (the written frame would not read back under the same `Limits`).
-- ~~Configurable length prefix; incremental decoder~~ (survey 2026-09-30) — **done 2026-10-04**. ~~Length-field offset, general `length_adjustment`, `num_skip`, widths 3/5/6/7~~ — **done 2026-11-03** (`Prefix.offset/adjustment/skip`, `Width.u24..u56`, `writeFrameWithHeader`). Still deferred: Netty's `failFast`, a `skip` past the head (tokio allows it; the result is frames that consume no input).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **Netty `failFast`** of `LengthFieldBasedFrameDecoder`: deferred (tokio has no counterpart; `Decoder` already refuses an oversize frame at its prefix, and the error is sticky).
 
 ## Anchoring
 
