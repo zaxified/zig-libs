@@ -45,8 +45,7 @@ are compared by documentation and, where marked, measured as black boxes.
 **Where we are ahead:** a stable sort without an allocator (vs Rust std);
 2–4× std's sorts; a lying comparator gets a permutation back instead of a
 panic. **Where we are behind:** no radix or parallel sort (both separate
-crates in Rust), no `partial_sort` (C++; `selectNth` + `unstable` on the
-prefix does it), C++'s introsort is faster on nearly sorted input with a
+crates in Rust), no `partial_sort` (C++; see *What is deliberately not done*), C++'s introsort is faster on nearly sorted input with a
 random tail (as it is against Rust).
 
 ## What this module is, and what it is not
@@ -67,13 +66,12 @@ Not here, and why:
 - **No index-based `sortContext(a, b, ctx)` (std's `pdqContext` shape).**
   Both sorts move elements through a hole (a saved value and copies), not
   through `swap(i, j)`. A swap-only interface would need a different
-  algorithm. Deferred; std's `pdqContext` covers it.
+  algorithm. Deferred (*Backlog / deferred*); std's `pdqContext` covers it.
 - **No radix sort.** Rust std has none. A radix path for integer keys is
   where a lead over Rust would come from. Deferred (Backlog).
 - **No parallel sort.** Rust's rayon `par_sort` is a separate crate.
   Deferred.
-- **No `sort_by_cached_key`.** In Zig it is a caller-side two-liner
-  (compute the keys into an array, sort indices by them).
+- **No `sort_by_cached_key`**, no `partial_sort` (see *What is deliberately not done*).
 
 ## Algorithm
 
@@ -166,6 +164,26 @@ counts quoted above were taken once by a disposable probe (Rust's closure
 counting next to ours). They are a check of the port's fidelity, not an
 anchor.
 
+## Verification
+
+- **Run:** `scripts/modtest sort` (unit, model and reach tests); `zig build run-example-sort` (the consumer
+  example, leak-checked); `zig build bench-sort` (needs `cargo` and `g++`).
+- **Tests:** `src/test_sort.zig` sweeps element sizes × lengths at every cut × nine input patterns against
+  `std.sort.block` as the model (key for key for `unstable`, byte for byte for `stable`, the k-th key and both
+  sides for `selectNth`), for every entry point and for zero-sized elements; the "lying comparator" tests
+  (every element size, every entry point, always-less / never-less / cyclic) check for a permutation and the
+  comparison bound; `stable` reports `OutOfMemory` with the input a permutation. `src/audit_test.zig` pins the
+  behaviours the model tests left unchecked (each is the kill of a mutation-run survivor, plus the
+  `stableBuffer` empty-items overlap case).
+- **Fuzz:** testkit's deterministic driver as `SORT_FUZZ` (`SORT_FUZZ_ONLY` selects a harness), harness
+  `sort-model` in `src/fuzz_test.zig`: a random element type (1, 4, 8, 17, 100 and 204 bytes), length, value
+  pattern and entry point, an honest comparator against the model and a lying one against the permutation
+  check, with items and scratch against guard pages (see *Memory safety under any comparator*).
+- **Constant time:** n/a (see the card's Hardening line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-sort` (`tools/bench.zig`, with the Rust and C++ sides under `tools/`; JCC-mitigated
+  builds, see `tools/README.md`); the figures are the card's Performance line and the README table.
+
 ## What is deliberately not done
 
 - Rust's `optimize_for_size` variants (heapsort-only unstable, plain merge
@@ -173,19 +191,19 @@ anchor.
   build-option mechanism (CONVENTIONS §4.2) is where it would go.
 - Panicking on a detected order violation, as Rust does. Never: see
   "Algorithm", point 1.
+- **`sort_by_cached_key`.** In Zig it is a caller-side two-liner (compute the keys into an array, sort
+  indices by them).
+- **`partial_sort`** (C++). `selectNth(k)` then `unstable` on `items[0..k]` is the same result.
 
 ## Backlog / deferred
 
-- **Backlog: radix sort for integer keys** (`u32`/`u64`/`i64`/`f64` via a
-  key function). Rust std has none; a measured win over ipnsort on
-  ≥ 10⁴ random integer keys would be an `**Ahead:** speed` claim.
-- **Backlog: candidate consumers** (surveyed 2026-10-25, sort share not yet
-  profiled): zstd dict_builder, tsdb, finstats/metrics/latency-stats
-  percentiles (`selectNth`), tabular, netaddr `IpSetBuilder`, geoindex,
+- **Radix sort for integer keys** (`u32`/`u64`/`i64`/`f64` via a key function). Rust std has none; a measured
+  win over ipnsort on ≥ 10⁴ random integer keys would be an `**Ahead:** speed` claim.
+- **Candidate consumers** (sort share not yet profiled): zstd dict_builder, tsdb,
+  finstats/metrics/latency-stats percentiles (`selectNth`), tabular, netaddr `IpSetBuilder`, geoindex,
   kvtree, kv, trie builder, jinja `sort` filter (stable).
-- **Backlog: measure crumsort/fluxsort and vqsort** as further "fastest"
-  candidates for integer keys (C, Unlicense / C++, Apache-2.0); the card's
-  fastest is over Rust std and C++ libstdc++ only.
-- **Backlog: parallel sort** (rayon `par_sort` shape) over `std.Io` tasks.
-- **Not doing: `partial_sort`.** `selectNth(k)` then `unstable` on
-  `items[0..k]` is the same result.
+- **Measure crumsort/fluxsort and vqsort** as further "fastest" candidates for integer keys (C, Unlicense /
+  C++, Apache-2.0); the card's fastest is over Rust std and C++ libstdc++ only.
+- **Parallel sort** (rayon `par_sort` shape) over `std.Io` tasks.
+- **An index-based `sortContext(a, b, ctx)`** (std's `pdqContext` shape): the sorts move elements through a
+  hole, not `swap(i, j)`, so it needs a different algorithm; std's `pdqContext` covers it today.
