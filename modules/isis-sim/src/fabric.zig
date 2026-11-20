@@ -2496,7 +2496,7 @@ fn sweepLine(link: netsim.LinkConfig, overrides: []const LinkOverride, seeds: u6
 
 test "MEASURED: convergence time and LSP retransmissions grow with the loss rate" {
     const seeds: u64 = 16;
-    // Measured 2026-10-01 (Debug, 16 seeds; permille: drops / lsp_tx /
+    // Measured (Debug, 16 seeds; permille: drops / lsp_tx /
     // last_change mean / max): 0: 0/192/9/9 · 50: 32/220/35/86 ·
     // 100: 91/269/67/129 · 200: 167/338/84/129 · 300: 209/363/92/129.
     // Not printed: the test lanes treat any stderr on a passing run as a FAIL.
@@ -2878,7 +2878,7 @@ test "LAN: SPF routes through the pseudonode and composes with the P2P tail" {
     defer t5.deinit();
     try testing.expectEqual(@as(u64, 20), t5.lookup(systemIdForNode(0)).?.metric);
 
-    // LAN transit (isis-spf, since 2026-09-30): members reach each other in
+    // LAN transit (isis-spf,): members reach each other in
     // one LAN hop at their own metric toward the pseudonode (10), and the tail
     // reaches the far members through member 0: 5 → 4 → 0 → 3 = 30. Until
     // isis-spf gained pseudonode transit this test pinned the opposite (the
