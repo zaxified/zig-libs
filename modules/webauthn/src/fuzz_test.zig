@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for webauthn (added 2026-10-10).
+//! Deterministic fuzz driver for webauthn.
 //!
 //! The existing script-driven harnesses (`parseClientData`,
 //! `parseAuthenticatorData`, `verifyAttestation`, registration binding) keep

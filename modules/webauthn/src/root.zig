@@ -348,10 +348,8 @@ pub const AuthenticatorData = struct {
 /// decoded with `cbor.decodePrefix` to learn where it ends; the extensions
 /// (ED set) must then be exactly one CBOR map, returned raw in `extensions`.
 /// Anything after the last structure the flags announce is
-/// `error.TrailingData`. (Until 2026-09-30 an ED-set input was refused
-/// outright — `ExtensionsNotSupported` — so security keys returning
-/// `credProtect` or `hmac-secret` outputs could not register or sign in.)
-/// `allocator` holds the decoded credential key and transient CBOR trees.
+/// `error.TrailingData`. `allocator` holds the decoded credential key and
+/// transient CBOR trees.
 pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataError!AuthenticatorData {
     if (raw.len < 37) return error.Truncated;
     var rp_id_hash: [32]u8 = undefined;
@@ -422,10 +420,10 @@ fn verifyEcdsaDer(comptime E: type, comptime coord_len: usize, x: []const u8, y:
 }
 
 /// Verify `sig` over `msg` under `key`, per the COSE algorithm identifier
-/// `alg` — the alg is bound tightly to the key's own curve/type (an ES256
-/// `alg` against a P-384 key (or ES384 against a P-256 key), or any `alg` that doesn't match the key's
-/// `kty`/`crv`, is `error.UnsupportedAlgorithm`, never silently coerced —
-/// this is the algorithm-confusion defense).
+/// `alg` — the alg is bound tightly to the key's own curve/type: an ES256
+/// `alg` against a P-384 key (or ES384 against a P-256 key), or any `alg`
+/// that does not match the key's `kty`/`crv`, is `error.UnsupportedAlgorithm`,
+/// never silently coerced — this is the algorithm-confusion defense.
 pub fn verifySignature(key: CoseKey, alg: i64, msg: []const u8, sig: []const u8) SignatureError!void {
     switch (key) {
         .ec2 => |ec2| {
@@ -1222,7 +1220,7 @@ test "corpus: every clientData seed reaches the parser, and the challenge octets
     }
     // One seed is deliberately the empty document.
     try std.testing.expectEqual(entries.len - 1, nonempty);
-    // Measured 2026-09-07: 0 of 21 seeds non-empty, 0 accepted, 0 challenge
+    // Measured: 0 of 21 seeds non-empty, 0 accepted, 0 challenge
     // octets before the draw was fixed.
     try std.testing.expectEqual(@as(usize, 8), accepted);
     try std.testing.expectEqual(@as(usize, 137), challenge_octets);
@@ -1329,7 +1327,7 @@ test "corpus: every authData seed reaches the parser, and the credentials parsed
     }
     // One seed is deliberately empty.
     try std.testing.expectEqual(entries.len - 1, nonempty);
-    // Measured 2026-09-07: 0 of 15 seeds non-empty and every counter 0 before
+    // Measured: 0 of 15 seeds non-empty and every counter 0 before
     // the draw was fixed.
     try std.testing.expectEqual(@as(usize, 7), accepted);
     try std.testing.expectEqual(@as(usize, 3), with_credential);
@@ -1505,7 +1503,7 @@ test "F4: checkAaguidExtension enforces WebAuthn §8.2.1's id-fido-gen-ce-aaguid
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

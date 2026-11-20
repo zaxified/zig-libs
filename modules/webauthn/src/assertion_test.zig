@@ -373,7 +373,7 @@ test "reject: require_user_verification with UV clear -> UserNotVerified" {
     ));
 }
 
-// ── ES384 / ES512 (COSE -35 / -36), 2026-11-16 ─────────────────────────────
+// ── ES384 / ES512 (COSE -35 / -36) ─────────────────────────────
 // No external vector: the W3C §16 set has no P-384/P-521 credential. Keys and
 // signatures are generated in-test through the sibling `p384` / `p521`
 // modules (whose own verifiers are KAT/Wycheproof-anchored there).

@@ -634,7 +634,7 @@ test "corpus: every attestation script builds a distinct object, and what it bui
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(attestation_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 fmt, 1 mode and 0 x5c octets before the draws
+    // Measured: 1 fmt, 1 mode and 0 x5c octets before the draws
     // were restructured — every seed produced the same object.
     try testing.expectEqual(fuzz_formats.len, fmts);
     try testing.expectEqual(@typeInfo(X5cMode).@"enum".field_names.len, modes);
@@ -1273,7 +1273,7 @@ test "the registration fuzz harness reaches an accepted registration (reachabili
     }
 }
 
-// ── drift re-audit 2026-09-02 ───────────────────────────────────────────────
+// ── drift re-audit ───────────────────────────────────────────────
 //
 // Seven of these pin checks that ALREADY existed and that a mutation could
 // delete with the suite green — the corpus is structurally blind to them
@@ -1343,14 +1343,13 @@ test "authData: BE=0 with BS=1 is refused (re-audit F6 — §6.1 / §7.1 step 11
 }
 
 test "authData: extension data (ED) is parsed, and malformed extensions have teeth (re-audit F8)" {
-    // Until 2026-09-30 ED was refused outright (`ExtensionsNotSupported`);
-    // re-audit F8 had found that refusal untested. It is now accepted — so
-    // the teeth are on the malformed cases instead: the extensions must be
-    // exactly one CBOR map, and nothing may follow it.
+    // It is now accepted — so the teeth are on the malformed cases
+    // instead: the extensions must be exactly one CBOR map, and nothing
+    // may follow it.
     //
     // External oracle: both inputs below were produced AND parsed back by
     // Yubico's python-fido2 2.2.1 (`fido2.webauthn.AuthenticatorData.create`
-    // / `AuthenticatorData(bytes)`), a black box, on 2026-09-30:
+    // / `AuthenticatorData(bytes)`), a black box, on:
     //   registration: rpIdHash=SHA-256("example.org"), flags UP|UV|AT|ED
     //     (0xc5), signCount 0, aaguid 00..0f, credential id c1 x16, an ES256
     //     key, extensions {"credProtect": 2, "hmac-secret": True} — python-
@@ -1749,7 +1748,7 @@ test "packed x5c: the attStmt alg must agree with the certificate's own key (re-
 }
 
 test "packed x5c: an attestation certificate below the RSA modulus floor is refused (re-audit F14)" {
-    // The 2026-08-06 audit's F7 put a 2048-bit floor on the CREDENTIAL key
+    // The audit's F7 put a 2048-bit floor on the CREDENTIAL key
     // and not on the attestation certificate's. Nothing recorded that
     // asymmetry as a decision, and the corpus has no undersized attestation
     // key to notice it — so this vector is synthetic (see vectors.zig).
@@ -1772,7 +1771,7 @@ test "packed x5c: an attestation certificate below the RSA modulus floor is refu
     ));
 }
 
-// ── mutation run 2026-10-05: synthetic certificates and keys ───────────────
+// ── mutation run: synthetic certificates and keys ───────────────
 //
 // The W3C corpus has only ES256 attestation certificates, none carrying the
 // id-fido-gen-ce-aaguid extension, so removing the Ed25519/RSA certificate
@@ -1932,7 +1931,7 @@ test "verifySignature: the RS256 credential floor is exactly 2048 bits" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1942,7 +1941,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation run 2026-11-21 ────────────────────────────────────
+// ── whole-module mutation run ────────────────────────────────────
 //
 // 145 mutants over `root.zig`: 32 survived the existing suite. These pin them.
 
