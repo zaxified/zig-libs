@@ -19,7 +19,7 @@
 //! `P256Sha256`/`P384Sha384`/`P521Sha512`/`Decaf448Shake256`/
 //! `Ristretto255Sha512`) returns the namespace, with the same function
 //! names and argument order as the top level. The top level IS
-//! `Ristretto255Sha512`, re-exported, so the pre-2026-11-13 API is
+//! `Ristretto255Sha512`, re-exported, so the earlier API is
 //! unchanged. The NIST suites' RFC 9380 hash-to-curve (simplified SWU) is
 //! `h2c.zig`, built on the `p256`/`p384`/`p521` siblings' public field API.
 //!
@@ -357,7 +357,7 @@ test "blindEvaluate REPORTS NOTHING about a degenerate skS (constant-time)" {
 test "blind/blindEvaluate carry no error a caller could branch on a secret with" {
     // `blindEvaluate` has no error union at all; `blind`'s members are
     // `InvalidInput` (from `hashToGroup`) and `InputTooLong` (the PUBLIC
-    // input length, 2026-11-13), never anything from the multiply.
+    // input length), never anything from the multiply.
     // `InvalidBlind` must NOT be back.
     try std.testing.expect(@typeInfo(@TypeOf(blindEvaluate)).@"fn".return_type.? == Element);
     const blind_err = @typeInfo(@typeInfo(@TypeOf(blind)).@"fn".return_type.?).error_union.error_set;

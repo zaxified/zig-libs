@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for voprf (added 2026-10-10): `VOPRF_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for voprf: `VOPRF_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `voprf-decode` (Element / Proof / scalar decoders: accepted means
 //! canonical, i.e. re-encodes to the input), `voprf-decode-suites` (the same

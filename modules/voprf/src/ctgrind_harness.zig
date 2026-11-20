@@ -62,8 +62,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
     // `server` / `client` / `keygen` drive the default ristretto255-SHA512
-    // suite (the rows pinned since 2026-10-10); `<suite>-<target>` (e.g.
-    // `p256-server`) drives another RFC 9497 §4 suite through the same code.
+    // suite; `<suite>-<target>` (e.g. `p256-server`) drives another RFC 9497
+    // §4 suite through the same code.
     const arg = it.next() orelse return error.MissingTarget;
     const dash = std.mem.findScalar(u8, arg, '-');
     const suite_name = if (dash) |d| arg[0..d] else "ristretto255";

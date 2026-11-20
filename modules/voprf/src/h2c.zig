@@ -182,17 +182,16 @@ pub fn Nist(
         /// `c1 = (p - 3) / 4` of Appendix F.2.1.2.
         const c1 = (p - 3) / 4;
 
-        /// `CMOV(a, b, c)`: `b` if `c == 1`, else `a`, without a branch.
-        /// The sibling's `Fe.cMov` where it launders its mask (`p256`, and
-        /// `p521` since 2026-11-13 — before that `p521`'s compiled to a
-        /// conditional jump on `c` at ReleaseFast, ctgrind
-        /// `voprf/p521-client`). `p384`'s `Fe.cMov` builds its mask from the
-        /// bare bit: it measured clean under ctgrind, but nothing stops LLVM
-        /// from turning it into a jump as it did for `p521`, so for `p384`
-        /// this still selects over the element's bytes with a mask the
-        /// optimizer cannot see through (`launder`). zig-libs request:
-        /// p384 — launder `Fe.cMov`'s mask like p256/p521; then drop
-        /// `own_select`.
+        /// `CMOV(a, b, c)`: `b` if `c == 1`, else `a`, without a branch. The
+        /// sibling's `Fe.cMov` where it launders its mask (`p256`, and
+        /// `p521` — before that `p521`'s compiled to a conditional jump on
+        /// `c` at ReleaseFast, ctgrind `voprf/p521-client`). `p384`'s
+        /// `Fe.cMov` builds its mask from the bare bit: it measured clean
+        /// under ctgrind, but nothing stops LLVM from turning it into a jump
+        /// as it did for `p521`, so for `p384` this still selects over the
+        /// element's bytes with a mask the optimizer cannot see through
+        /// (`launder`). zig-libs request: p384 — launder `Fe.cMov`'s mask
+        /// like p256/p521; then drop `own_select`.
         const own_select = Fe == @import("p384").Fe;
         fn sel(a: Fe, b: Fe, c: u1) Fe {
             var r = a;

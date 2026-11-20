@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! No-panic sweep tests (2026-11-13): every suite, every pub entry point,
+//! No-panic sweep tests: every suite, every pub entry point,
 //! hostile arguments. Test names end with "(sweep <ID>)".
 
 const std = @import("std");
