@@ -283,10 +283,64 @@ test "superblocks into a stable output buffer: at every room near a sub-block's 
     }
 }
 
+/// xorshift32 as the generator script steps it (a zero seed is 1).
+const Xorshift = struct {
+    x: u32,
+
+    fn step(s: *Xorshift) u32 {
+        var v = s.x;
+        v ^= v << 13;
+        v ^= v >> 17;
+        v ^= v << 5;
+        s.x = v;
+        return v;
+    }
+};
+
+/// The generator script's `recipe`: "mix:SEED" and "rle:SEED" (the inputs
+/// that are no layout).
+fn recipeInput(recipe: []const u8) ![]u8 {
+    const colon = std.mem.indexOfScalar(u8, recipe, ':').?;
+    var rng: Xorshift = .{ .x = std.fmt.parseInt(u32, recipe[colon + 1 ..], 10) catch unreachable };
+    if (rng.x == 0) rng.x = 1;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (std.mem.eql(u8, recipe[0..colon], "mix")) {
+        // 2000 random bytes, then 30..199 pieces of 4..39 bytes copied from
+        // them, each after 0..80 fresh random bytes
+        var base: [2000]u8 = undefined;
+        for (&base) |*b| b.* = @truncate(rng.step());
+        try out.appendSlice(gpa, &base);
+        const pieces = 30 + rng.step() % 170;
+        for (0..pieces) |_| {
+            const fresh = rng.step() % 81;
+            for (0..fresh) |_| try out.append(gpa, @truncate(rng.step()));
+            const len = 4 + rng.step() % 36;
+            const from = rng.step() % (2000 - 40);
+            try out.appendSlice(gpa, base[from..][0..len]);
+        }
+    } else {
+        // 4096 random bytes with the high bit set, then 300..1199 copies of
+        // 13 of them, each followed by one 'x'
+        var base: [4096]u8 = undefined;
+        for (&base) |*b| b.* = 0x80 | @as(u8, @truncate(rng.step() & 127));
+        try out.appendSlice(gpa, &base);
+        const pieces = 300 + rng.step() % 900;
+        for (0..pieces) |_| {
+            const from = rng.step() % (4096 - 13);
+            try out.appendSlice(gpa, base[from..][0..13]);
+            try out.append(gpa, 'x');
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// `tools/gen-superblock-goldens.sh`'s input: 1024 bytes per letter of
 /// `layout` (T text, N noise of 64 high byte values, R random, W words; a count
-/// before a letter or a parenthesized group repeats it).
+/// before a letter or a parenthesized group repeats it), or a recipe
+/// ("mix:SEED", "rle:SEED").
 fn superblockInput(layout: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, layout, ':') != null) return recipeInput(layout);
     var kinds: std.ArrayList(u8) = .empty;
     defer kinds.deinit(gpa);
     var i: usize = 0;
@@ -361,6 +415,15 @@ test "superblock goldens: blocks without a sequence, sub-blocks, raw tails, lite
         const hex = std.fmt.bytesToHex(digest, .lower);
         try std.testing.expectEqualStrings(g.sha256, &hex);
         try decodes(dst[0..n], src);
+        if (g.room) |room| {
+            // the least room libzstd succeeds in: its frame there, one byte
+            // less refused (no sub-block asks for room it does not use)
+            const frame = try gpa.dupe(u8, dst[0..n]);
+            defer gpa.free(frame);
+            const at = try c.compress(dst[0..room], src, .{ .level = g.level, .advanced = adv });
+            try std.testing.expectEqualSlices(u8, frame, dst[0..at]);
+            try std.testing.expectError(error.DstSizeTooSmall, c.compress(dst[0 .. room - 1], src, .{ .level = g.level, .advanced = adv }));
+        }
     }
 }
 

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const zstd = @import("root.zig");
+const seq_test = @import("seq_test.zig");
 
 const gpa = std.testing.allocator;
 
@@ -35,6 +36,39 @@ fn roundTrip(comptime n_seq: usize, level: i32) !void {
 test "the sequence count is written in its three forms at every edge (sequences header)" {
     inline for (.{ 1, 2, 126, 127, 128, 129, 254, 255, 256, 257, 0x7EFE, 0x7EFF, 0x7F00, 0x7F01, 0x7FFF }) |n| {
         try roundTrip(n, 3);
+    }
+}
+
+/// `roundTrip`, but the sequences come from a block-level producer and the
+/// block is cut by `targetCBlockSize` (the largest, so a single sub-block
+/// holds all `n_seq` sequences): the sequences header of a sub-block
+/// (ZSTD_compressSubBlock_sequences).
+fn subBlockRoundTrip(comptime n_seq: usize) !void {
+    const len = 4 * n_seq + 4;
+    const src = try gpa.alloc(u8, len);
+    defer gpa.free(src);
+    for (src, 0..) |*b, i| b.* = "abcd"[i % 4];
+    const seqs = try gpa.alloc(zstd.Sequence, n_seq + 1);
+    defer gpa.free(seqs);
+    for (seqs[0..n_seq], 0..) |*s, i| s.* = .{ .offset = 4, .lit_length = if (i == 0) 4 else 0, .match_length = 4 };
+    seqs[n_seq] = .{ .offset = 0, .lit_length = 0, .match_length = 0 };
+    var prod: seq_test.ExampleProducer = .{ .mode = 8192, .list = seqs };
+    const dst = try gpa.alloc(u8, zstd.compressBound(len) + 64);
+    defer gpa.free(dst);
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    const n = try c.compress(dst, src, .{ .level = 3, .advanced = .{ .target_c_block_size = 131072 }, .sequence_producer = prod.producer() });
+    const back = try gpa.alloc(u8, len + 1);
+    defer gpa.free(back);
+    var dec = try zstd.Decompressor.init(gpa, .{});
+    defer dec.deinit();
+    const got = try dec.decompress(back, dst[0..n]);
+    try std.testing.expectEqualSlices(u8, src, back[0..got]);
+}
+
+test "a sub-block's sequence count is written in its three forms at every edge (superblock sequences header)" {
+    inline for (.{ 127, 128, 0x7EFF, 0x7F00, 0x7F01, 0x7FFF }) |n| {
+        try subBlockRoundTrip(n);
     }
 }
 

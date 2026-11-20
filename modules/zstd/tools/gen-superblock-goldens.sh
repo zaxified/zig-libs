@@ -68,7 +68,47 @@ def expand(layout):
 
 words = [b"zero", b"one", b"two", b"three", b"four", b"five", b"six", b"seven"]
 
+def xorshift(seed):
+    """Closure stepping xorshift32 from `seed` (a zero seed is 1)."""
+    x = [seed & 0xFFFFFFFF or 1]
+    def step():
+        v = x[0]
+        v ^= (v << 13) & 0xFFFFFFFF
+        v ^= v >> 17
+        v ^= (v << 5) & 0xFFFFFFFF
+        x[0] = v
+        return v
+    return step
+
+def recipe(name):
+    """The inputs that are no layout: "mix:SEED" (2000 random bytes, then
+    30..199 pieces of 4..39 bytes copied from them, each after 0..80 fresh
+    random bytes: matches whose cost is near their length) and "rle:SEED"
+    (4096 random bytes with the high bit set, then 300..1199 copies of 13 of
+    them, each followed by one 'x': blocks whose only literal is 'x')."""
+    kind, seed = name.split(":")
+    step = xorshift(int(seed))
+    if kind == "mix":
+        base = bytes(step() & 255 for _ in range(2000))
+        out = bytearray(base)
+        for _ in range(30 + step() % 170):
+            for _ in range(step() % 81):
+                out.append(step() & 255)
+            ln = 4 + step() % 36
+            f = step() % (2000 - 40)
+            out += base[f:f + ln]
+        return bytes(out)
+    assert kind == "rle"
+    base = bytes(0x80 | (step() & 127) for _ in range(4096))
+    out = bytearray(base)
+    for _ in range(300 + step() % 900):
+        f = step() % (4096 - 13)
+        out += base[f:f + 13] + b"x"
+    return bytes(out)
+
 def make(layout):
+    if layout.startswith(("mix:", "rle:")):
+        return recipe(layout)
     b = bytearray()
     x = 2463534242
     pending = b""
@@ -125,7 +165,7 @@ def literal_only_blocks(f):
 
 small = "targetCBlockSize=1340,maxBlockSize=1024"
 whole = "targetCBlockSize=1340"
-runs = [  # layout, params, levels, must hold a block without sequences
+runs = [  # layout, params, levels, must hold a block without sequences[, least room checked]
     ("TTNTT", small, (1, 3, 7), True),
     ("NTNTN", small, (1, 3, 7), True),
     ("16(TN)", whole, (1, 3, 7, 19), False),
@@ -154,11 +194,32 @@ runs = [  # layout, params, levels, must hold a block without sequences
     ("16(TN)", "splitAfterSequences=1", (1, 7), False),
     ("8(WNR)", "splitAfterSequences=1", (1, 7, 19), False),
     ("64(WR)", "splitAfterSequences=1", (1, 19), False),
+    # (wave 10, whole-module mutation survivors of superblock.zig)
+    # a literal run above 0xFFFF with a few sequences after it: the long
+    # literal-length code under the predefined table (estimates, cuts)
+    ("68T8(TRT)", whole, (3,), False),
+    # sub-blocks made of matches only (no literal at all) under a coded table
+    ("4W4(NTR)4(TR)W", "targetCBlockSize=1340,maxBlockSize=4096", (19,), False),
+    # blocks whose only literal is 'x': RLE literals sections under sequences
+    ("rle:3", "targetCBlockSize=1340,maxBlockSize=4096", (19,), False),
+    # matches costing about their length: the sub-block's cut falls where the
+    # running cost equals what it decodes to
+    ("mix:19", "targetCBlockSize=2000", (12,), False),
+    ("mix:19", "targetCBlockSize=1340", (12,), False),
+    # a small last sub-block under a big table description: the least room
+    # libzstd succeeds in (the port must not ask for the description again)
+    ("RN2T", whole, (7,), False, True),
 ]
 rows = []
-for layout, params, levels, need_lit_only in runs:
+def capacity(zref, level, src_path, params, cap):
+    """Does libzstd compress into exactly `cap` bytes? (exit 5: dstSize_tooSmall)"""
+    r = subprocess.run([zref, str(level), "0", src_path, "/dev/null", "0", "0", "0", params, "-", str(cap)], capture_output=True)
+    assert r.returncode in (0, 5), r
+    return r.returncode == 0
+
+for layout, params, levels, need_lit_only, *want_room in runs:
     src = make(layout)
-    name = layout.replace("(", "_").replace(")", "_")
+    name = layout.replace("(", "_").replace(")", "_").replace(":", "_")
     open(f"{work}/{name}", "wb").write(src)
     for level in levels:
         dst = f"{work}/{name}.{level}.zst"
@@ -166,15 +227,23 @@ for layout, params, levels, need_lit_only in runs:
         f = open(dst, "rb").read()
         lo = literal_only_blocks(f)
         assert lo > 0 or not need_lit_only, (layout, level, "no compressed block without sequences")
-        rows.append(f'    .{{ .layout = "{layout}", .level = {level}, .params = "{params}", .len = {len(f)}, .literal_only_blocks = {lo}, .sha256 = "{hashlib.sha256(f).hexdigest()}" }},')
+        room = ""
+        if want_room:
+            # the least capacity libzstd succeeds in (searched upward from the
+            # frame's own size; the one below must fail)
+            least = next(c for c in range(len(f), len(f) + 64) if capacity(zref, level, f"{work}/{name}", params, c))
+            assert not capacity(zref, level, f"{work}/{name}", params, least - 1)
+            room = f", .room = {least}"
+        rows.append(f'    .{{ .layout = "{layout}", .level = {level}, .params = "{params}", .len = {len(f)}, .literal_only_blocks = {lo}{room}, .sha256 = "{hashlib.sha256(f).hexdigest()}" }},')
 with open(out, "w") as o:
     o.write(f'''// SPDX-License-Identifier: MIT
 //! GENERATED by modules/zstd/tools/gen-superblock-goldens.sh -- do not edit.
 //! libzstd v1.5.7 ({pin}), `zref` (one-shot ZSTD_compress2, content size in
 //! the header, no checksum) with `params` on the input `layout` names; the
-//! frame's length, its compressed blocks without sequences, its SHA-256.
+//! frame's length, its compressed blocks without sequences, its SHA-256 and,
+//! for some rows, the least destination capacity libzstd succeeds in.
 
-pub const Golden = struct {{ layout: []const u8, level: i32, params: []const u8, len: usize, literal_only_blocks: usize, sha256: *const [64]u8 }};
+pub const Golden = struct {{ layout: []const u8, level: i32, params: []const u8, len: usize, literal_only_blocks: usize, room: ?usize = null, sha256: *const [64]u8 }};
 
 pub const rows = [_]Golden{{
 ''')
