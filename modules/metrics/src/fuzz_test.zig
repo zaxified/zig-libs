@@ -297,6 +297,8 @@ const Check = struct {
     family_kind: []const u8 = "",
     prev_series: u64 = 0,
     prev_count: u64 = 0,
+    /// The last bucket line was `le="+Inf"`: the series ended there.
+    prev_inf: bool = false,
     eof: bool = false,
 
     fn deinit(c: *Check) void {
@@ -368,6 +370,7 @@ const Check = struct {
         c.family_kind = kind;
         c.prev_series = 0;
         c.prev_count = 0;
+        c.prev_inf = false;
     }
 
     /// `{name="value",...}` from just after the `{`; index after the `}`.
@@ -439,7 +442,7 @@ const Check = struct {
         if (gop.found_existing) hit("collector-duplicate-sample");
 
         // cumulative buckets of one series, in order
-        if (!c.dups_ok and std.mem.endsWith(u8, name, "_bucket") and std.mem.eql(u8, c.family_kind, "histogram")) {
+        if (std.mem.endsWith(u8, name, "_bucket") and std.mem.eql(u8, c.family_kind, "histogram")) {
             var h = std.hash.Wyhash.init(0);
             h.update(name);
             var has_le = false;
@@ -454,9 +457,14 @@ const Check = struct {
             if (!has_le) return error.Buckets;
             const key = h.final();
             const cnt = std.fmt.parseInt(u64, value, 10) catch return error.Buckets;
-            if (c.prev_series == key and cnt < c.prev_count) return error.Buckets;
+            // (a repeated series, from a collector, restarts after its +Inf)
+            if (c.prev_series == key and !c.prev_inf and cnt < c.prev_count) return error.Buckets;
             c.prev_series = key;
             c.prev_count = cnt;
+            c.prev_inf = false;
+            for (pairs[0..np]) |p| if (std.mem.eql(u8, p.name, "le") and std.mem.eql(u8, p.value, "+Inf")) {
+                c.prev_inf = true;
+            };
         }
 
         if (i < line.len) {
@@ -708,17 +716,22 @@ fn drawBuckets(d: *Dec, out: *[4]f64) []const f64 {
     return out[0..nb];
 }
 
+fn readF(ctx: ?*anyopaque) f64 {
+    return @as(*const f64, @ptrCast(@alignCast(ctx.?))).*;
+}
+
 fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var raw: [3072]u8 = undefined;
     const n = fill(S, src, &raw);
     var d: Dec = .{ .b = raw[0..n] };
 
     var mc = clock_lib.ManualClock.init(1_000_000_000);
+    var fval: f64 = 0; // read by the callback series; outlives the registry
     var reg = metrics.Registry.init(gpa);
     defer reg.deinit();
     reg.clock = mc.clock();
     reg.max_label_value_len = 48;
-    reg.max_series_per_family = 5;
+    reg.max_series_per_family = 3;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -728,7 +741,7 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     var buckets: [4]f64 = undefined;
 
     for (0..8 + d.below(28)) |_| {
-        const op = d.below(14);
+        const op = d.below(15);
         switch (op) {
             0, 1, 2, 3 => { // register a Vec
                 if (nf == fams.len) continue;
@@ -764,7 +777,8 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
             },
             4, 5, 6, 7 => { // with(values) + record
                 if (nf == 0) continue;
-                const row = &fams[d.below(nf)];
+                // mostly the first two Vecs, so one family fills up to its series cap
+                const row = &fams[d.below(if (d.byte() < 160) @min(nf, 2) else nf)];
                 var vbufs: [3][96]u8 = undefined;
                 var vals: [3][]const u8 = undefined;
                 const nv = if (d.byte() < 210) row.nlabels else d.below(4);
@@ -806,7 +820,7 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 const ne = d.below(5);
                 for (exl[0..ne], enb[0..ne], evb[0..ne]) |*l, *nb, *vb| {
                     // Some values run to the rune cap (128 runes in all) or past it.
-                    const long = d.byte() < 40;
+                    const long = d.byte() < 110;
                     l.* = .{
                         .name = if (d.byte() < 180) pool_labels[d.below(pool_labels.len)] else d.str(nb, &name_vocab),
                         .value = if (long) blk: {
@@ -820,9 +834,11 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 switch (row.vec) {
                     .counter => |vec| if (vec.with(vals[0..row.nlabels])) |c| {
                         if (c.addWithExemplar(1, exl[0..ne], ts)) |_| hit("exemplar-ok") else |_| hit("exemplar-refused");
+                        try scrapeChecked(gpa, &reg, .openmetrics);
                     } else |_| {},
                     .histogram => |vec| if (vec.with(vals[0..row.nlabels])) |h| {
                         if (h.observeWithExemplar(d.f64v(), exl[0..ne], ts)) |_| hit("exemplar-ok") else |_| hit("exemplar-refused");
+                        try scrapeChecked(gpa, &reg, .openmetrics);
                     } else |_| {},
                     else => {},
                 }
@@ -858,8 +874,10 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 var lnb: [metrics.max_labels + 1][16]u8 = undefined;
                 var lvb: [metrics.max_labels + 1][48]u8 = undefined;
                 const nl = d.below(metrics.max_labels + 2);
-                for (lbs[0..nl], lnb[0..nl], lvb[0..nl]) |*l, *nb, *vb| {
-                    l.* = .{ .name = if (d.byte() < 200) pool_labels[d.below(pool_labels.len)] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
+                const start = d.below(pool_labels.len);
+                for (lbs[0..nl], lnb[0..nl], lvb[0..nl], 0..) |*l, *nb, *vb, k| {
+                    // mostly distinct names (a repeat is refused, and then the values are never looked at)
+                    l.* = .{ .name = if (d.byte() < 235) pool_labels[(start + k) % pool_labels.len] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
                 }
                 const bk = drawBuckets(&d, &buckets);
                 switch (d.below(3)) {
@@ -867,6 +885,21 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                     1 => if (reg.gauge(name, "plain", lbs[0..nl])) |g| g.set(d.f64v()) else |_| {},
                     else => if (reg.histogram(name, "plain", lbs[0..nl], bk)) |h| h.observe(d.f64v()) else |_| {},
                 }
+            },
+            14 => { // callback series (counterFunc / gaugeFunc) with labels
+                var nbuf: [48]u8 = undefined;
+                const name: []const u8 = if (d.byte() < 190) pool_names[d.below(pool_names.len)] else d.str(&nbuf, &name_vocab);
+                var lbs: [3]metrics.Label = undefined;
+                var lnb: [3][16]u8 = undefined;
+                var lvb: [3][48]u8 = undefined;
+                const nl = d.below(4);
+                const start = d.below(pool_labels.len);
+                for (lbs[0..nl], lnb[0..nl], lvb[0..nl], 0..) |*l, *nb, *vb, k| {
+                    l.* = .{ .name = if (d.byte() < 235) pool_labels[(start + k) % pool_labels.len] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
+                }
+                fval = d.f64v();
+                const r = if (d.byte() & 1 == 0) reg.counterFunc(name, "fn", lbs[0..nl], &fval, readF) else reg.gaugeFunc(name, "fn", lbs[0..nl], &fval, readF);
+                if (r) |_| hit("func-ok") else |_| {}
             },
             else => try scrapeChecked(gpa, &reg, if (d.byte() & 1 == 0) .text else .openmetrics), // a scrape mid-way
         }
@@ -963,7 +996,7 @@ fn fuzzCollector(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         }
         o.v = d.f64v();
         o.sum = d.f64v();
-        o.count = d.u16le();
+        o.count = if (d.byte() < 200) d.below(30) else d.u16le();
         o.nb = d.below(5);
         var b: f64 = 0;
         var c: u64 = 0;
