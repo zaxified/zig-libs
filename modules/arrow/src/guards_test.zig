@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! The guards the 2026-11-17 mutation audit found no test for: each test below pins a
+//! The guards the mutation audit found no test for: each test below pins a
 //! check or an assignment whose mutant every earlier test let through (boundaries of
 //! the Large switch and of the date range, null slots, short buffers, negative offsets
 //! and indices, shared dictionaries that differ, `max_rows` / `max_cells` sums, the

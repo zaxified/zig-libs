@@ -768,7 +768,7 @@ test "compression: lz4 round trip of every column type, stream and file, one bat
         try expectSameFrame(big, try stream.readStream(a, z, .{}));
     }
     // 0, 1 and 2 are all acceleration 1; -1 is already acceleration 2 (it was 1 here
-    // until 2026-11-17), -64 is 65: faster and looser.
+    // previously), -64 is 65: faster and looser.
     for (sizes[1..3]) |x| try testing.expectEqual(sizes[0], x);
     try testing.expect(sizes[3] > sizes[0]);
     try testing.expect(sizes[4] > sizes[3]);
@@ -881,7 +881,7 @@ test "compression: declared lengths and broken frames are errors" {
     // ZSTD with a declared length of 0: the rest goes to the decoder all the same, as
     // Arrow C++ hands it to `ZSTD_decompressDCtx` (`DecompressBuffer`, ZSTD codec): no
     // bytes, an empty frame or a skippable frame decode to nothing; junk or a frame of
-    // something is an error. (Until 2026-11-17 such a buffer was skipped unread.)
+    // something is an error. (Until such a buffer was skipped unread.)
     var zempty_buf: [32]u8 = undefined;
     const zempty = zempty_buf[0..try zstd.compress(gpa, &zempty_buf, "", .{})];
     for ([_]struct { ok: bool, frame: []const u8 }{
@@ -1000,7 +1000,7 @@ test "lossy: values dataframe cannot hold fail the read by default and read as n
     try testing.expectError(error.Malformed, stream.readStream(a, short, .{ .lossy = true }));
 }
 
-// ── review fixes (2026-11-17) ───────────────────────────────────────────────
+// ── review fixes ───────────────────────────────────────────────
 
 test "utf8: the writer refuses text that is not UTF-8; the reader checks Utf8 unless told not to" {
     const gpa = testing.allocator;
