@@ -784,3 +784,167 @@ fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [uni
     for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
     return buf;
 }
+
+test "the LM-OTS randomizer and the private values are the hashes the derivation names, spelled out" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const id = idOf(0x11);
+    const seed = seedOf(0x22);
+    // C = H(I || u32str(q) || u16str(0xffff) || u8str(0xff) || SEED)
+    var buf: [16 + 4 + 2 + 1 + 32]u8 = undefined;
+    @memcpy(buf[0..16], &id);
+    std.mem.writeInt(u32, buf[16..20], 7, .big);
+    @memcpy(buf[20..22], &[_]u8{ 0xff, 0xff });
+    buf[22] = 0xff;
+    @memcpy(buf[23..], &seed);
+    var want: [32]u8 = undefined;
+    Sha256.hash(&buf, &want, .{});
+    try std.testing.expectEqualSlices(u8, &want, &core.deriveRandomizer(&id, 7, &seed));
+    // x_q[i] = H(I || u32str(q) || u16str(i) || u8str(0xff) || SEED), here i = 3
+    std.mem.writeInt(u16, buf[20..22], 3, .big);
+    Sha256.hash(&buf, &want, .{});
+    var x: [32]u8 = undefined;
+    core.deriveX(&x, &id, 7, 3, &seed);
+    try std.testing.expectEqualSlices(u8, &want, &x);
+}
+
+test "LmsPublicKey.parse: eight bytes are checked for typecodes before the length" {
+    var eight: [8]u8 = undefined;
+    std.mem.writeInt(u32, eight[0..4], 99, .big);
+    std.mem.writeInt(u32, eight[4..8], lms.OtsParamSet.sha256_n32_w4.typecode(), .big);
+    try std.testing.expectError(error.UnsupportedLmsType, lms.LmsPublicKey.parse(&eight));
+    std.mem.writeInt(u32, eight[0..4], lms.ParamSet.sha256_m32_h5.typecode(), .big);
+    std.mem.writeInt(u32, eight[4..8], 99, .big);
+    try std.testing.expectError(error.UnsupportedOtsType, lms.LmsPublicKey.parse(&eight));
+    std.mem.writeInt(u32, eight[4..8], lms.OtsParamSet.sha256_n32_w4.typecode(), .big);
+    try std.testing.expectError(error.InvalidLength, lms.LmsPublicKey.parse(&eight));
+}
+
+/// An HSS signature over `msg` assembled by hand from `n_levels` independent H5/W1
+/// trees (leaf 0 of each, every tree certifying the next one's public key), the way a
+/// signer would produce it. `n_levels` may exceed what `SecretKey` allows.
+fn handBuiltHss(alloc: std.mem.Allocator, n_levels: usize, msg: []const u8, top: *lms.LmsPublicKey) ![]u8 {
+    var trees: [lms.max_levels + 1]lms.Tree = undefined;
+    var built: usize = 0;
+    defer for (trees[0..built]) |*t| t.deinit();
+    for (0..n_levels) |i| {
+        try lms.Tree.init(&trees[i], alloc, .sha256_m32_h5, .sha256_n32_w1, idOf(@intCast(0x40 + i)), &seedOf(@intCast(0x50 + i)));
+        built += 1;
+    }
+    const sl = lms.lmsSignatureLength(.sha256_m32_h5, .sha256_n32_w1);
+    const pk_len = lms.LmsPublicKey.encoded_len;
+    const out = try alloc.alloc(u8, 4 + sl * n_levels + pk_len * (n_levels - 1));
+    errdefer alloc.free(out);
+    std.mem.writeInt(u32, out[0..4], @intCast(n_levels - 1), .big);
+    var off: usize = 4;
+    for (0..n_levels - 1) |i| {
+        const child = trees[i + 1].publicKey().toBytes();
+        trees[i].sign(0, &child, out[off..][0..sl]);
+        off += sl;
+        @memcpy(out[off..][0..pk_len], &child);
+        off += pk_len;
+    }
+    trees[n_levels - 1].sign(0, msg, out[off..][0..sl]);
+    top.* = trees[0].publicKey();
+    return out;
+}
+
+test "HssPublicKey.verify: the level count is exact and capped at eight, even for a signature that is valid for more" {
+    var top8: lms.LmsPublicKey = undefined;
+    const sig8 = try handBuiltHss(gpa, 8, "eight levels", &top8);
+    defer gpa.free(sig8);
+    var top9: lms.LmsPublicKey = undefined;
+    const sig9 = try handBuiltHss(gpa, 9, "nine levels", &top9);
+    defer gpa.free(sig9);
+
+    // Control: the hand-built eight-level signature is a valid one.
+    try std.testing.expect((lms.HssPublicKey{ .levels = 8, .top = top8 }).verify("eight levels", sig8));
+    // The nine-level chain is internally valid, but HSS stops at eight levels and a key that
+    // names eight (or nine) levels must not accept it.
+    try std.testing.expect(!(lms.HssPublicKey{ .levels = 9, .top = top9 }).verify("nine levels", sig9));
+    try std.testing.expect(!(lms.HssPublicKey{ .levels = 8, .top = top9 }).verify("nine levels", sig9));
+    // And a key naming nine levels refuses the eight-level one.
+    try std.testing.expect(!(lms.HssPublicKey{ .levels = 9, .top = top8 }).verify("eight levels", sig8));
+}
+
+test "HSS: the lower trees are a fixed function of the master seed, the level and the path" {
+    // A restored key rebuilds its lower trees from (SEED, I, levels, position) alone, so the
+    // derivation is part of the key format: pinned against an independent computation of the
+    // level-1 tree under parent leaf 0 (SHA-256 over the labelled input, then the H5/W1 tree of
+    // RFC 8554 Appendix A, both written out outside this module).
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(0x5a), idOf(0x5b), null);
+    defer sk.deinit();
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    const sig = try sk.sign("derivation pin", buf);
+    const one = lms.lmsSignatureLength(levels[0].lms, levels[0].ots);
+    const child = sig[4 + one ..][0..lms.LmsPublicKey.encoded_len];
+    var want_id: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_id, "671bd4b4d343c24e2b00684f2969ccbe");
+    var want_root: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_root, "228d67def47eb983948368f1a48e938b29fff8a32e3a24454a47c6d4b8ced7d8");
+    try std.testing.expectEqualSlices(u8, &want_id, child[8..24]);
+    try std.testing.expectEqualSlices(u8, &want_root, child[24..56]);
+
+    // Two keys that differ only in the master seed certify different lower trees.
+    var other: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&other, gpa, &levels, &seedOf(0x5b), idOf(0x5b), null);
+    defer other.deinit();
+    const buf2 = try gpa.alloc(u8, other.signatureLength());
+    defer gpa.free(buf2);
+    const sig2 = try other.sign("derivation pin", buf2);
+    try std.testing.expect(!std.mem.eql(u8, child[8..56], sig2[4 + one ..][8..56]));
+}
+
+test "SecretKey.init: an allocation failure leaves no seed and no tree in the caller's key" {
+    const one = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
+    var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var sk: lms.SecretKey = undefined;
+    try std.testing.expectError(error.OutOfMemory, lms.SecretKey.init(&sk, fa.allocator(), &one, &seedOf(9), idOf(9), null));
+    try std.testing.expect(std.mem.allEqual(u8, &sk.seed, 0));
+    try std.testing.expect(sk.trees[0] == null);
+}
+
+test "SigningKey.init takes ownership: the source key is wiped; SecretKey.deinit leaves nothing built" {
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(3), idOf(3), null);
+    var handle: lms.SigningKey = undefined;
+    lms.SigningKey.init(&handle, &sk, null);
+    defer handle.deinit();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk), 0));
+
+    var plain: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&plain, gpa, &levels, &seedOf(4), idOf(4), null);
+    const buf = try gpa.alloc(u8, plain.signatureLength());
+    defer gpa.free(buf);
+    _ = try plain.sign("m", buf); // builds the level-1 tree and its certificate
+    try std.testing.expectEqual(@as(u8, 2), plain.built);
+    plain.deinit();
+    try std.testing.expectEqual(@as(u8, 0), plain.built);
+    for (plain.trees) |t| try std.testing.expect(t == null);
+    for (plain.sigs) |s| try std.testing.expect(s == null);
+}
+
+test "HSS: a failed rebuild after the path left a parent leaves nothing dangling for deinit to free twice" {
+    const levels = @as([3]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
+    var fa = std.testing.FailingAllocator.init(gpa, .{});
+    var last: lms.Position = .{};
+    last.q[1] = 31;
+    last.q[2] = 31;
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, fa.allocator(), &levels, &seedOf(7), idOf(7), last);
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    _ = try sk.sign("m", buf); // builds both lower trees for the path (0, 31, 31); next is (1, 0, 0)
+    try std.testing.expectEqual(@as(u32, 1), sk.position().q[0]);
+    // The next signature leaves the top tree's leaf 0: both lower trees go, then the rebuild
+    // fails at its first allocation.
+    fa.fail_index = fa.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, sk.sign("m", buf));
+    try std.testing.expectEqual(@as(u8, 1), sk.built);
+    for (sk.trees[1..]) |t| try std.testing.expect(t == null);
+    for (sk.sigs) |s| try std.testing.expect(s == null);
+    sk.deinit(); // a dangling tree or certificate would be freed a second time here
+}

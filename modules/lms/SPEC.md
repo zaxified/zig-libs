@@ -6,7 +6,7 @@
 
 **Scope:** core — cisco/hash-sigs (RFC 8554 reference), pyhsslms, hbs-lms-rust, Bouncy Castle (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 (60/67, 7 eq) · src ?
+**Audit:** review 2026-10-03 · mutation 2026-11-20 (214/221, 7 eq) · src 74a8c38afaad5ca9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `lms-sign-verify` at scale 100 = 2,000 runs and `hss-sign-verify` at scale 200 = 1,000 runs, each a real signature, LMS_FUZZ) · ct 2026-10-10 (ctgrind: seed through LMS H5/W4 and 2-level HSS keygen + sign; `lms` 4 / `hss` 6 in-file = chain lengths from the message digest over the PUBLISHED randomizer C, an artefact)
 **Performance:** not measured
@@ -224,15 +224,22 @@ and every cached node against §5.3's recursive definition.
 - **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (ReleaseFast only), described under
   *Threat notes*.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
-  and the delta runs after it. The mutation run covered `core.zig` and `sign.zig`: coef/Cksm arithmetic, the four
-  domain separators, chain bounds, every verification check, parse limits, cache height, exhaustion and size guards,
-  `Position.next`, `init` validation, `deriveChild`, the tree-reuse test in `ensureTrees`, the persist order and
-  error handling, the copy guard and both locks. The equivalent ones: `cacheHeight` at `h > 14` against `h > 15`
-  (h = 15 gives 0 either way), `i > c` against `i >= c` in `Tree.sign` (a cached node equals the recomputed one),
-  `<=` for `<` in the HSS non-final length check (rejected later by `lmsCandidate`), the order of advancing
-  `LmsSecretKey.q` against `Tree.sign` (single-threaded, cannot fail there), dropping `!pos.exhausted` in
-  `SecretKey.init`, `level` in the `deriveChild` hash (the path length encodes it), `keep < total` in
-  `ensureTrees`.
+  and the delta runs after it. The whole-module run (221 mutants over `core.zig`,
+  `sign.zig` and `params.zig`) covered the hash layouts and the four domain separators, `coef` and the checksum, chain
+  bounds, every verification check (LMS and HSS), the parse limits, the parameter tables, cache height, exhaustion and
+  size guards, `Position.next`, `init` validation, `deriveChild`, the tree-reuse test and `dropFrom` in `ensureTrees`,
+  the persist order and failure, the copy guard and both locks, and the wipes of `deinit`, `init` and
+  `SigningKey.init`. 214 killed, 7 equivalent: `cacheHeight` at `h >= 15` (h = 15 gives 0 either way), `i > c` against
+  `i >= c` in `Tree.sign` (a cached node equals the recomputed one), `<=` for `<` in the HSS non-final length check
+  (rejected later by `lmsCandidate`), `catch break` for `catch return false` on the certified next key (the unadvanced
+  offset leaves a slice longer than any signature of that key), skipping the position check of `SecretKey.init`
+  when `exhausted` is set (a position `next` produced then holds only zeros), and `keep < built` and `keep < total` in
+  `ensureTrees` (`keep` is only compared with `built` afterwards). Not mutated: stack burns and the wipes of internal
+  buffers (visible only to the ReleaseFast probe). Tests added in `src/unit_test.zig`: the randomizer and `deriveX`
+  spelled out, eight-byte public keys, a hand-built nine-level HSS signature against keys naming eight and nine
+  levels, the derived level-1 tree pinned against an independent computation (and its dependence on the master seed),
+  `SecretKey.init` failing its allocation, the source of `SigningKey.init` and `deinit` leaving nothing built, and
+  a failed rebuild after the path left a parent.
 
 ## Backlog / deferred
 
