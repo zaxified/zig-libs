@@ -901,7 +901,7 @@ const fuzz_path_buf_len = 8192;
 // The corpus this replaces was hand-built by a local `fuzzCorpusEntry`
 // helper that prefixed each payload with its length as a little-endian
 // **u64**, which is exactly what `Smith.valueRangeAtMost` reads. Measured
-// 2026-09-07 before the change: **4 of the 5 seeds arrived non-empty,
+// before the change: **4 of the 5 seeds arrived non-empty,
 // carrying 5309 octets** - so unlike every other target in this burn-down
 // this one was NOT running the empty string. What was wrong with it is
 // subtler and worse: the header only worked because 5000 and 300 happen to
@@ -972,7 +972,7 @@ test "corpus: every seed reaches lstatPath, and what it resolves is pinned" {
     }
     // One seed is deliberately the empty path.
     try testing.expectEqual(fuzz_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. The corpus this replaces reached 4 non-empty seeds
+    // Measured. The corpus this replaces reached 4 non-empty seeds
     // and 5309 octets, resolved 0 real inodes and refused 1 embedded NUL.
     // The four that resolve are "/", "/proc/self", "..", and the 300-separator
     // seed, which the kernel collapses to "/" - the 5000-separator one is
@@ -1018,7 +1018,7 @@ fn fuzzLstatPath(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1028,7 +1028,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+// ── whole-module mutation tests ────────────────────────────────
 
 test "FileStat.id and device: major and minor each fill their own 32 bits" {
     const s: FileStat = .{ .mode = 0, .nlink = 1, .size = 0, .blocks = 0, .dev_major = 8, .dev_minor = 17, .ino = 42 };

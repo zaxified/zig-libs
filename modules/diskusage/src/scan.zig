@@ -1187,7 +1187,7 @@ const FailingSink = struct {
     }
 };
 
-// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+// ── whole-module mutation tests ────────────────────────────────
 
 test "scanAt: a path longer than PATH_MAX is NameTooLong, not InvalidPath" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
