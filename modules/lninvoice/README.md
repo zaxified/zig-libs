@@ -8,8 +8,7 @@ encode+sign) and BOLT#12 offers (bech32-*style* TLV, decode) plus signed `invoic
   BOLT#12 offers (bech32-based — a future `lninvoice` module)". It reuses `bech32`'s charset + BCH
   checksum algorithm (reimplemented length-uncapped — BOLT#11 waives BIP173's 90-character
   ceiling), `k256.ecdsa_recover`'s RFC 6979 sign + public-key recovery for BOLT#11's recoverable
-  signature (originally implemented in this module, moved to `k256` once it turned out to be
-  general secp256k1 machinery — see `SPEC.md`), `lnwire`'s generic TLV stream parser (for BOLT#12's
+  signature, `lnwire`'s generic TLV stream parser (for BOLT#12's
   `offer`/`invoice_request`/`invoice` payloads), and `bip340`'s Schnorr sign/verify + tagged
   hashing (for BOLT#12's Merkle-tree signature).
 - **Platform:** any — pure transform over caller-owned strings/bytes, no I/O. Allocator-based
@@ -21,14 +20,11 @@ encode+sign) and BOLT#12 offers (bech32-*style* TLV, decode) plus signed `invoic
 
 Provenance: clean-room from BOLT#11 and BOLT#12 (`lightning/bolts`), a public
 specification whose own worked examples are the byte-exact anchors. No
-third-party Lightning implementation was consulted, so no `NOTICE` entry is
-required (root [`NOTICE`](../../NOTICE) §0).
-
-**Added 2026-08-02:** that disclaimer covers the CODE, which remains
-clean-room. The module now separately vendors `lightning/bolts`' own
-BOLT#12 test-vector DATA (`offers-test.json`/`format-string-test.json`,
-CC-BY 4.0), which does require attribution — see
-[`NOTICE`](./NOTICE), the module-local file where the obligation lives.
+third-party Lightning implementation was consulted, so the module's code needs
+no attribution. The module separately vendors `lightning/bolts`' own BOLT#12
+test-vector DATA (`offers-test.json`/`format-string-test.json`, CC-BY 4.0),
+which does require attribution — see [`NOTICE`](./NOTICE), the module-local
+file where the obligation lives.
 
 ## Scope
 
@@ -40,9 +36,9 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
   when it is. Fail-closed throughout.
 - **BOLT#11 encode** (`encode`) — build + sign a payment request from a field list, either from a
   caller-supplied signature or a private key (RFC 6979 deterministic signing).
-- **Recoverable ECDSA** (`ecdsa_recover.zig`, re-exported at root) — `sign`/`recoverPubkey`/
-  `isLowS`, now implemented in `k256.ecdsa_recover`; this module just re-exports it, usable
-  standalone either way.
+- **Recoverable ECDSA** (`ecdsa_recover.zig`) — `sign`/`recoverPubkey`/`isLowS`, implemented in
+  `k256.ecdsa_recover`; this module re-exports it (`sign`, `recoverPubkey` and `Signature` at the
+  root, all of them under `lninvoice.ecdsa_recover`), usable standalone either way.
 - **BOLT#12 offer decode** (`decodeOffer`) — the `lno1...` checksum-less bech32-style TLV payload,
   every scalar `offer_*` field; and `invoice_request`/`invoice` both ways with BIP-340 Merkle-tree
   signing (`decodeInvoiceRequest`/`encodeSignedInvoiceRequest`, `decodeInvoice`/`encodeSignedInvoice`,
@@ -76,8 +72,6 @@ const fields = [_]lninvoice.TaggedFieldOut{
 const str = try lninvoice.encode(allocator, .{
     .network = .mainnet,
     .amount_msat = 250_000_000,
-    // `std.time.timestamp()` was removed in Zig 0.16 — this snippet used to
-    // call it, so the README's own example did not compile.
     .timestamp = blk: {
         var ts: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.REALTIME, &ts);
@@ -96,9 +90,11 @@ std.debug.print("offer description: {?s}\n", .{offer.description});
 ## Verify
 
 ```
+scripts/modtest lninvoice          # the module's tests (Debug)
 zig build test-lninvoice           # Debug
 zig build test-lninvoice -Doptimize=ReleaseFast
 zig fmt --check modules/lninvoice
+LNINVOICE_FUZZ=<runs>[,<first seed>] zig build test-lninvoice   # deterministic fuzz driver
 ```
 
 Byte-exact against BOLT#11's own official worked examples (donation invoice + node-ID recovery,
@@ -113,3 +109,9 @@ and the key was *recovered* from the signature — which almost always succeeds,
 different key when anything signed was tampered with: 92% of single-symbol tamperings of the
 spec's donation invoice decode fine and return a stranger's key. Compare `verified_pubkey`
 against a node id you already trust; `decode` cannot do that for you.
+
+## Not provided
+
+Typed BOLT#12 blinded paths and payment info (`offer_paths`/`invoice_paths`/`invoice_blindedpay` stay raw), an offer builder
+and the BOLT#12 validity rules a payer needs (currency/amount/quantity/chain matching) are open (SPEC *Backlog / deferred*);
+interpreting `f` (fallback) addresses and `r` (route-hint) semantics beyond BOLT#11's wire layout is left to the caller.

@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | BOLT#11 and BOLT#12 offers *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** BOLT#11 covers every tagged field the spec lists (`p s d h m x c n f r 9`), signature recovery *and* the low-S rule when `n` is present; BOLT#12 core is byte-exact against the spec's own vectors incl. the `payer-proof` invoice; pure Zig with bech32 length cap correctly waived. **Where we are behind:** typed blinded paths / payment info, offer/refund *builders*, invoice_error, semantic validity checks a BOLT#12 payer needs (currency/amount/quantity/chains matching).
+**Where we are ahead:** BOLT#11 covers every tagged field the spec lists (`p s d h m x c n f r 9`), signature recovery *and* the low-S rule when `n` is present; BOLT#12 core is byte-exact against the spec's own vectors incl. the `payer-proof` invoice; pure Zig with bech32 length cap correctly waived. **Where we are behind:** typed blinded paths / payment info, offer builders (refunds are offer-less `invoice_request`s and `invoice_error` has its own codec), semantic validity checks a BOLT#12 payer needs (currency/amount/quantity/chains matching).
 
 ## Design & invariants
 
@@ -42,15 +42,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ecdsa_recover.zig` (a thin re-export of `k256.ecdsa_recover` — see below) · `bolt11.zig` /
   `bolt12.zig` (the wire formats themselves).
 
-- **Recoverable ECDSA now lives in `k256`, not here.** BOLT#11's recoverable-signature scheme
-  (RFC 6979 deterministic sign + standard public-key recovery, `Q = r⁻¹(sR − eG)`) was originally
-  implemented in this module, because at the time `k256/src/sign.zig` shipped only BIP340 Schnorr
-  and plain ECDSA *verify* — no ECDSA *sign*, no *recovery* — and no other consumer needed either.
-  Once it became clear the functionality is general secp256k1 machinery rather than anything
-  BOLT#11-specific, it was moved to `k256/src/ecdsa_recover.zig` (exported as `k256.ecdsa_recover`).
-  `lninvoice/src/ecdsa_recover.zig` is now a thin re-export shim, kept so `bolt11.zig`'s existing
-  `ecdsa.*` call sites and `lninvoice`'s root-level `sign`/`recoverPubkey`/`Signature`/`isLowS`
-  re-exports need no changes.
+- **Recoverable ECDSA lives in `k256`.** BOLT#11's recoverable-signature scheme (RFC 6979 deterministic sign + standard
+  public-key recovery, `Q = r⁻¹(sR − eG)`) is general secp256k1 machinery, so it is `k256.ecdsa_recover`;
+  `src/ecdsa_recover.zig` is a thin re-export (`sign`, `recoverPubkey`, `Signature`, `isLowS`, `SignError`,
+  `RecoverError`, `ecdsa_recover.zig:14-26`) that keeps `bolt11.zig`'s `ecdsa.*` call sites, and the root re-exports
+  `sign`/`recoverPubkey`/`Signature` (`root.zig:63-65`; `isLowS` is reached as `lninvoice.ecdsa_recover.isLowS`).
+
 
 - **Fail-closed throughout, specific typed errors per rejection reason** — `bolt11.DecodeError` is
   a large union covering: bech32-layer failures (`MixedCase`/`NoSeparator`/`InvalidChecksum`/...,
@@ -101,7 +98,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   BOLT#11's — `features` is handed back as an uninterpreted feature vector.
 
 - **`9` (features) is a BIT VECTOR, not a byte string** — the one tagged field where the generic
-  quintet⇄byte pair is the wrong tool, and the source of a real defect fixed 2026-08-08. BOLT#11
+  quintet⇄byte pair is the wrong tool. BOLT#11
   "Feature Bits": *"The field is big-endian. The least-significant bit is numbered 0, which is
   _even_, and the next most significant bit is numbered 1, which is _odd_."* Bit numbering is
   anchored at the **end** of the `data_length × 5`-bit string, so the slack that rounds the vector
@@ -111,7 +108,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `data_length = ceil((highest_set_bit + 1) / 5)`; `encode` omits the field entirely for an
   all-zero vector, per that same rule. `features` is exchanged as a big-endian byte vector with
   bit 0 = least-significant bit of the last byte — the same convention `lnwire` already uses for
-  BOLT#1/#7 feature vectors, so the two modules now agree. Confirmed against every `data_length`
+  BOLT#1/#7 feature vectors, so the two modules agree. Confirmed against every `data_length`
   the spec's examples use (3, 10, 20, 21) in `bitpack.zig`.
 
 - **Amount encoding/decoding is exact integer arithmetic in `u128`**, never floating point: `msat
@@ -123,21 +120,18 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   requirement — verified byte-exact against three of the spec's own amount strings (`2500u`,
   `9678785340p`, `20m`).
 
-- **A zero amount (`lnbc0`, `lnbc0n`) is accepted as `0` msat (decision 2026-11-18, kept).**
-  BOLT#11's reader rules refuse only a non-digit, a trailing character that is not a multiplier,
-  and a `p` amount whose last decimal is not `0`; "positive, no leading 0s" is a *writer*
-  requirement ("MUST encode `amount` as a positive decimal integer with no leading 0s"). Both
-  permissive references accept zero: lnd's `zpay32` (`amountunits.go` `decodeAmount`) parses the
-  digits with `strconv.ParseUint` and `decode.go` stores the result without a zero check, and
-  LDK's `lightning-invoice` (`de.rs`, `RawHrp::from_str`) does `parts.1.parse::<u64>()` and only
-  checks for overflow. A zero-amount invoice is therefore reported as `amount_msat == 0` (not
-  `null`, which means "no amount"); a caller that pays must treat `0` as it sees fit. Note
-  that the module no longer refuses a leading zero on the amount (decision 2026-11-18, owner rule
-  "behave like the references"): `lnbc01u` reads as `lnbc1u` and `lnbc0001u` likewise, exactly as
-  lnd and LDK read them through their integer parsers; the spec only forbids leading zeros for
-  writers. `AmountLeadingZero` is gone from `AmountError`. The writer side is unchanged and
-  pinned: `formatAmount` never emits a leading zero (only the bare `0` of a zero amount). The
-  20-digit width guard counts significant digits (the zeros are skipped first).
+- **A zero amount (`lnbc0`, `lnbc0n`) is accepted as `0` msat, and so is a leading zero on the amount.** BOLT#11's reader
+  rules refuse only a non-digit, a trailing character that is not a multiplier, and a `p` amount whose last decimal is not
+  `0`; "positive, no leading 0s" is a *writer* requirement ("MUST encode `amount` as a positive decimal integer with no
+  leading 0s"). Both permissive references accept both: lnd's `zpay32` (`amountunits.go` `decodeAmount`) parses the digits
+  with `strconv.ParseUint` and `decode.go` stores the result without a zero check, and LDK's `lightning-invoice` (`de.rs`,
+  `RawHrp::from_str`) does `parts.1.parse::<u64>()` and only checks for overflow. A zero-amount invoice is reported as
+  `amount_msat == 0` (not `null`, which means "no amount"); a caller that pays must treat `0` as it sees fit. `lnbc01u` reads
+  as `lnbc1u` and `lnbc0001u` likewise, exactly as lnd and LDK read them through their integer parsers; `AmountError` has no
+  leading-zero member (`bolt11.zig:82-86`) and the zeros are skipped before the width guard (`bolt11.zig:100-105`). The
+  writer side is pinned: `formatAmount` never emits a leading zero (only the bare `0` of a zero amount). The 20-digit width
+  guard counts significant digits.
+
 
 - **`f` (fallback address) and `r` (routing hint) are stored typed but NOT semantically
   interpreted beyond BOLT#11's own wire layout** — `Fallback{ version, program }` (raw witness-
@@ -177,48 +171,44 @@ builds+signs+encodes from caller-supplied ascending signature-free records.
 `Invoice.verify` checks the signature by `invoice_node_id` (type 176).
 `encodeSignedInvoice` builds+signs+encodes.
 
-**Raw (not typed) fields:** `offer_paths`/`invreq_paths`/`invoice_paths` (`blinded_path` entries,
-BOLT#4 route-blinding — a distinct spec), and `invoice`'s optional `invoice_blindedpay`/
-`invoice_fallbacks` sub-structures. These stay in the record stream / `raw` buffer and are not
-decoded; the signed-blob correctness (Merkle root + BIP-340 signature) and mandatory scalar fields
-are modelled fully. **Interop-vector caveat, corrected 2026-07-28:** this section previously said the
-`invoice` (`lni1`) sign/verify path was validated by sign→verify round-trip ONLY, because
-`bolt12/signature-test.json` ships an `invoice_request` worked example but no `invoice` one. That
-was true of `signature-test.json` specifically but the claim was checked against the wrong file: the
-sibling `bolt12/payer-proof-test.json` (`lightning/bolts`) DOES publish a full `invoice` worked
-example (Merkle root, sighash, and BIP-340 signature — its `"full_disclosure"` vector), now wired in
-as an external byte-exact KAT (`bolt12.zig`, "BOLT#12 KAT: invoice Merkle root + signature verify").
-`invoice`'s Merkle+signature core is now externally anchored, same as `invoice_request`'s; only the
-*offer* round-trip (see the BOLT#12 offer note above) remains self-constructed.
+**Raw (not typed) fields:** `offer_paths`/`invreq_paths`/`invoice_paths` (`blinded_path` entries, BOLT#4 route-blinding —
+a distinct spec), and `invoice`'s optional `invoice_blindedpay`/`invoice_fallbacks` sub-structures. These stay in the record
+stream / `raw` buffer and are not decoded; the signed-blob correctness (Merkle root + BIP-340 signature) and mandatory
+scalar fields are modelled fully.
 
-**ENCODE byte-exact anchor, added 2026-08-05:** the Merkle/signature *core* being externally
-anchored (previous paragraph) is a different claim from the full `invoice`/`invoice_request`
-TLV-to-wire-string ENCODE producing the spec's own bytes — that was still round-trip
-(build+decode+verify against itself) only, the exact weakness this module's anchor record (`SPEC.md` § Anchoring)
-named. Closed for both directions: `invoice_request` ENCODE was already checkable against
-`signature-test.json`'s own `"bolt12"` field (a full `lnr1...` string, already used for a decode
-KAT but never fed through `encodeSignedInvoiceRequest`); `invoice` had no such string until
-`payer-proof-test.json`'s `valid_vectors` array turned out to carry one per vector (`input.invoice`)
-— `payer-proof-test.json` had previously only been read for its Merkle-root/signature hex fields,
-never its `input.invoice` bech32 string. Both are now wired as byte-exact `encodeSignedInvoice*`
-KATs in `bolt12.zig`.
+**Signature slot and stream order.** `encodeSignedInvoice`/`encodeSignedInvoiceRequest` assemble the output with the shared
+`appendSignedStream` (`bolt12.zig:536`): the caller's records with type < 240, then the `signature` record, then the records
+with type > 240 (private/experimental fields; every `invreq_*`/`invoice_*` type BOLT#12 defines is < 240), so the stream keeps
+BOLT#12's ascending type order across the signature slot. The signature is computed by `signMerkle` over the unsigned records
+in their original order; the Merkle root excludes the signature range (240–1000) wherever those records sit. The decoder
+(`lnwire.parseTlvStream`, shared with the offer decode) refuses any out-of-order stream with `NotStrictlyIncreasing`, the
+signature slot included (`lnwire/src/tlv.zig:216`).
 
-This anchoring pass found and FIXED a real bug, not just a test gap:
-`payer-proof-test.json`'s `"full_disclosure"` vector carries a private/experimental TLV (type
-3000000001) positioned AFTER the signature (type 240) in the wire stream — legal per BOLT#12's
-ascending-type-order rule (240 < 3000000001). `encodeSignedInvoice`/`encodeSignedInvoiceRequest`
-used to unconditionally append the signature record LAST, after every caller-supplied record;
-for "full_disclosure" that produced `[...176, 3000000001, SIGNATURE]` instead of the required
-`[...176, SIGNATURE, 3000000001]` — a stream BOLT#12 itself forbids, not merely one that failed to
-match the vector's byte layout by convention. Fixed by a shared `appendSignedStream` helper (used
-by both encode functions) that assembles the output as `records with type < 240` ++ `signature` ++
-`records with type > 240`, instead of assuming every caller record precedes the signature; the
-signing computation itself (`signMerkle` over the unsigned records in their original order) is
-unchanged, so the Merkle-root/signature KATs above stay byte-identical. `"full_disclosure"` — the
-vector that actually exercises the fix — is now the byte-exact `invoice` ENCODE anchor;
-`"minimal_disclosure"` (no field above type 240) is kept alongside it as the ordinary-invoice case.
+**Refunds and `invoice_error`.** A refund is an offer-less `invoice_request`: the same `lnr1...` object, so decode, `verify`
+and `encodeSignedInvoiceRequest` handle it, and `invoiceRequestIsRefund` (`bolt12.zig:740`) classifies one (no record of type
+1..79). `invoice_error` (`decodeInvoiceError`/`encodeInvoiceError`, `bolt12.zig:796,826`) is a bare TLV stream (no bech32
+string) with types 1 `erroneous_field` (a minimal `tu64`), 3 `suggested_value` and 5 `error`. It is strict: an unknown even
+type is refused, an unknown odd one ignored, types must be strictly increasing; `error` is mandatory, non-empty and valid
+UTF-8; `suggested_value` is accepted only together with `erroneous_field`; encode refuses what decode refuses, so its output
+always decodes. No external vector exists for either: the tests are hand-built byte fixtures and round trips.
+
+**String handling.** `stripContinuation` (`bech32_raw.zig:207`) removes a `+` (and the whitespace after it) only when it is
+neither the first nor the last character, and a doubled `+` keeps the second one literally, so the string stays invalid.
+BOLT#12's three whole-stream decoders (offer, `invoice_request`, `invoice`) use
+`bitpack.quintetsToBytesMinimal` (`bolt12.zig:144,457,650`), which additionally refuses five or more leftover padding bits
+(`PaddingTooLong`, as the reference `convertbits(5, 8, pad=false)` does); BOLT#11's per-field decode keeps
+`quintetsToBytesStrict` (`bitpack.zig:45`), which can legitimately carry five or more leftover zero bits.
+
 
 ## Verification
+
+Run: `scripts/modtest lninvoice`. `LNINVOICE_FUZZ=<runs>[,<first seed>]` runs the deterministic fuzz driver (`src/fuzz_test.zig`), harnesses: `lninvoice-bech32-decode`
+(arbitrary bytes); `lninvoice-bech32-roundtrip` (`encode` of a drawn HRP and data decodes back, in either case and through the
+no-checksum pair, and a string with one replaced symbol is refused); `lninvoice-bolt11-decode` (well-signed invoices with
+arbitrary tagged-field layouts); `lninvoice-bolt11-sign` (a random key signs a random invoice through `encode`; `decode` returns
+the signer's key, amount and fields; a replaced character or a truncation is refused, and a replaced quintet of the signed region
+is refused or recovers a *different* key); `lninvoice-bolt12` (the BOLT#12 decoders and `merkleRoot` over arbitrary and
+envelope-wrapped streams). Each asserts a typed error or a valid result, never a panic; reach checks run in every test run.
 
 **BOLT#11**, pinned against the spec's own worked examples (`11-payment-encoding.md` "Examples"):
 the donation invoice (no `n` field — full field decode + signature recovery matching the
@@ -235,152 +225,96 @@ signing the donation vector's own hash with its own documented private key repro
 exact `(r, s, recid)` byte-for-byte, and recovering from that freshly-signed signature reproduces
 the spec's node ID — signer and verifier agree end-to-end.
 
-**BOLT#11 ENCODE is byte-exact against the spec's own invoice string as of 2026-08-08** — this
-closes wave-2 audit finding F4, which is now RESOLVED rather than unverifiable. The KAT
-(`bolt11.zig`, "donation invoice ENCODE byte-exact") rebuilds the spec's first worked example from
-its documented field values, signs with the spec's own documented private key (RFC 6979, so the
-signature bytes are deterministic and reproducible), and `expectEqualStrings` against the literal
-`lnbc1pvjluez…9lfyql` the spec prints. Tagged-field bit-packing, `data_length` headers, the
-timestamp's fixed 7 quintets, the HRP and the signature are therefore all pinned by an authority
-other than this module's own `decode()`. Field ORDER (`s`, `p`, `d`, `9`) is an input to that test,
-not something `encode` reconstructs — BOLT#11 leaves writer order free.
+**BOLT#11 ENCODE is byte-exact against the spec's own invoice string.** The KAT (`bolt11.zig`, "donation invoice ENCODE
+byte-exact against the spec's own lnbc1... string") rebuilds the spec's first worked example from its documented field values,
+signs with the spec's own documented private key (RFC 6979, so the signature bytes are deterministic and reproducible), and
+`expectEqualStrings` against the literal `lnbc1pvjluez…9lfyql` the spec prints. Tagged-field bit-packing, `data_length`
+headers, the timestamp's fixed 7 quintets, the HRP and the signature are therefore all pinned by an authority other than this
+module's own `decode()`. Field ORDER (`s`, `p`, `d`, `9`) is an input to that test, not something `encode` reconstructs —
+BOLT#11 leaves writer order free. The `9` field's `data_length` is `ceil((highest_set_bit + 1) / 5)`, which matches every
+`data_length` the spec's examples use (3, 10, 20, 21) (`bitpack.zig`).
 
-**What the earlier `UNVERIFIED:` marker got wrong, recorded because the mistake is instructive.**
-The marker asserted the vector could not be reproduced because the spec's `9` (features) field
-"uses non-minimal bech32 padding this encoder does not bit-for-bit reproduce", and a later attempt
-claimed to have retried with "a different spec vector without a `9` field". Both halves were false:
+**BOLT#12 offer**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` → `bitpack.bytesToQuintets` →
+`bech32_raw.encodeNoChecksum` → `decodeOffer` (independently constructed, not hand-typed hex), `+`-continuation stripping,
+wrong-prefix rejection, and the generic TLV even/odd-unknown-type rules (reusing `lnwire`'s own machinery). Externally
+anchored: `bolt12.zig` decodes real `lno1…` strings byte-for-byte from `lightning/bolts` `bolt12/offers-test.json` ("Minimal
+bolt12 offer", "with description (but no amount)", "with currency" — the last cross-checks `currency`/`amount`/`description`/
+`issuer_id` at once against the JSON's own field list) plus a real invalid vector ("Malformed: unknown even TLV type 78").
 
-1. **The donation vector does have a `9` field** — `9qrsgq`, `data_length` 3. Every one of the 20
-   worked examples in BOLT#11's Examples section carries one.
-2. **The spec's `9` field is perfectly minimal.** `data_length` 3 is exactly
-   `ceil((highest_set_bit + 1) / 5)` for its highest set feature bit, #14 — as it is for all four
-   `data_length` values the spec's examples use (3, 10, 20, 21). The non-minimal encoding was
-   *ours*: `encode` ran the feature vector through the generic byte-string packer, which rounds up
-   to a whole number of bytes first and pads at the wrong end.
+**BOLT#12 offer ENCODE** is anchored the same way: every row of `offers-test.json` is vendored
+(`bolt12_offers_kat_vectors.zig`). The rows carrying a `fields` breakdown (all `"valid": true` rows plus the
+wire-well-formed-but-semantically-invalid ones) are built from those fields via `lnwire.tlv.appendStream` →
+`bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` and asserted BYTE-EXACT against the vector's own published `lno1…`
+string, and the same rows are DECODED and their recovered TLV records compared field by field against the vector's `fields`
+list. The wire-malformed `"valid": false` rows (out-of-order fields, truncated at type / in length / after length / in
+description, a non-32-byte or empty `offer_chains`, TLV type ≥ 80, an unknown even type, TLV type > 1999999999, and five-plus-bit
+bech32 padding) are asserted rejected with the SPECIFIC error each names, not just "some error". The remaining `"valid": false`
+rows exercise UTF-8 validation, `offer_paths`/`blinded_path` internal structure, `offer_issuer_id` curve-point validity,
+`offer_features` bit semantics and reader "MUST NOT respond to the offer" business policy — all out of this module's scope
+(`bolt12.zig` enumerates each in a comment before its Merkle/signature test section) and not asserted against.
+`bolt12/format-string-test.json` (the `+`-continuation / upper-vs-lowercase acceptance rules) is likewise fully vendored and
+driven through `decodeOffer`. The rule on `+` (only between two ordinary characters) and the five-plus-bit padding limit
+are held by these rows.
 
-The divergence was a single field. Encoding the vector against the pre-fix code diverged at the
-191st character of the invoice — the low quintet of the `9` field's own `data_length` header (spec
-`r` = 3, ours `y` = 4) — with the timestamp, `s`, `p` and `d` fields all already byte-exact. The
-same misalignment made `decode` report the donation vector's feature bits {14, 8} as {7, 1}, and
-made `quintetsToBytesStrict` reject any legal `9` field with a set bit inside its low slack bits
-as `error.NonZeroPadding`. Fixed in `bitpack.featureBytesToQuintets` / `quintetsToFeatureBytes`;
-see the `9`-is-a-bit-vector entry above for the governing rules.
-
-`UNVERIFIED:` **BOLT#11 ENCODE is anchored against the specification, not against a second
-implementation.** The KAT above is a genuine external oracle — the spec's own published string —
-but no CLN-, LDK- or eclair-generated invoice has been run through `encode` byte-for-byte. Field
-shapes the spec's examples never exercise on the ENCODE side are therefore still pinned only by
-this module's own `decode()`: `m` (metadata), and `x`/`c` at widths other than those appearing in
-the vectors. `f` and `r` DO appear in the spec's examples, but only the donation vector is driven
-byte-exact through `encode` today, so they are covered on decode only.
-
-**BOLT#12 offer**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` →
-`bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` → `decodeOffer` (independently
-constructed, not hand-typed hex), `+`-continuation stripping, wrong-prefix rejection, and the
-generic TLV even/odd-unknown-type rules (reusing `lnwire`'s own machinery, not re-tested from
-scratch). **Externally anchored as of 2026-07-28**: `bolt12.zig` now also decodes 3 real `lno1…`
-strings byte-for-byte from `lightning/bolts` `bolt12/offers-test.json` ("Minimal bolt12 offer",
-"with description (but no amount)", "with currency" — the last cross-checks `currency`/`amount`/
-`description`/`issuer_id` all at once against the JSON's own field list) plus 1 real invalid vector
-("Malformed: unknown even TLV type 78") proving the even/odd rejection against a genuine malformed
-wire string, not just a self-constructed one.
-
-**BOLT#12 offer ENCODE, externally anchored as of 2026-08-02** (closing the
-gap this section previously flagged — "BOLT12 offer ENCODE round-trip
-self-constructed" in the anchor record in `SPEC.md` — where the only check was feeding
-this module's own encode pipeline back into its own decoder): ALL 53 rows of
-`lightning/bolts` `bolt12/offers-test.json` are now vendored
-(`bolt12_offers_kat_vectors.zig`). The 22 rows carrying a `fields` breakdown
-(all 20 `"valid": true` rows, plus 2 wire-well-formed-but-semantically-invalid
-`"valid": false` rows) are built from those fields via
-`lnwire.tlv.appendStream` → `bitpack.bytesToQuintets` →
-`bech32_raw.encodeNoChecksum` and asserted BYTE-EXACT against the vector's own
-published `lno1…` string — the first time this module's encoder is checked
-against an oracle other than its own decoder. The same 22 rows are also
-DECODED and their recovered TLV records compared field-by-field against the
-vector's `fields` list. 12 more `"valid": false` rows (out-of-order fields,
-truncated-at-type/-in-length/-after-length/-in-description, a non-32-byte
-`offer_chains`, a present-but-empty `offer_chains`, TLV type ≥ 80, unknown
-even type 1000000002, TLV type > 1999999999, and 5-plus-bit bech32 padding)
-are asserted rejected with the SPECIFIC error each names, not just "some
-error". The remaining 21 `"valid": false` rows exercise UTF-8 validation,
-`offer_paths`/`blinded_path` internal structure, `offer_issuer_id`
-curve-point validity, `offer_features` bit semantics, and reader
-"MUST NOT respond to the offer" business policy — all explicitly out of this
-module's documented scope (see `bolt12.zig`'s comment enumerating each, right
-before its Merkle/signature test section) and deliberately not asserted
-against. `lightning/bolts` `bolt12/format-string-test.json` (12 rows, the
-`+`-continuation / upper-vs-lowercase acceptance rules) is likewise fully
-vendored and driven through `decodeOffer`.
-
-Two real bugs surfaced by this sweep, both fixed: `bech32_raw.stripContinuation`
-used to strip EVERY `+` unconditionally, when BOLT#12 only permits removing
-one that sits between two ordinary characters — a leading/trailing/doubled
-`+` was wrongly accepted before the fix (caught by `format-string-test.json`'s
-five "+ must be surrounded by bech32 characters" rows). And
-`bitpack.quintetsToBytesStrict`'s decode never rejected 5-or-more leftover
-padding bits (only a NONZERO remainder), when BOLT#12's checksum-less
-whole-data-part conversion requires leftover < 5 bits regardless of value —
-now split into a new `quintetsToBytesMinimal` (used by BOLT#12's three
-whole-stream decoders) so BOLT#11's per-field decode, which legitimately can
-carry ≥5 leftover zero bits, keeps its original (correct, unchanged)
-behavior. See both functions' own doc comments.
-
-**BOLT#12 signature calculation**, byte-exact against the spec's own vectors
-(`lightning/bolts` `bolt12/signature-test.json`, "Signature Calculation"):
-- **`n1` Merkle roots** (1/2/3 leaves) — `merkleRoot` reproduces `b013756c…`, `c3774abb…`,
-  `ab2e79b1…` exactly.
-- **`invoice_request` worked example** (Alice offer / Bob payer, privkey `0x4242…42`) — the full
-  6-leaf Merkle root `608407c1…`, signature *verify* of the published `b8f83ea3…`, AND byte-exact
-  signature *reproduction* by signing with Bob's key + BIP-340 `aux_rand=0` (matches `b8f83ea3…`
-  to the byte). Also decoded end-to-end from the KAT `lnr1…` string through the
+**BOLT#12 signature calculation**, byte-exact against the spec's own vectors (`lightning/bolts` `bolt12/signature-test.json`,
+"Signature Calculation"):
+- **`n1` Merkle roots** (1/2/3 leaves) — `merkleRoot` reproduces `b013756c…`, `c3774abb…`, `ab2e79b1…` exactly.
+- **`invoice_request` worked example** (Alice offer / Bob payer, privkey `0x4242…42`) — the full 6-leaf Merkle root `608407c1…`,
+  signature *verify* of the published `b8f83ea3…`, AND byte-exact signature *reproduction* by signing with Bob's key + BIP-340
+  `aux_rand=0` (matches `b8f83ea3…` to the byte). Also decoded end-to-end from the KAT `lnr1…` string through the
   bech32/bitpack/TLV path.
-- **`invoice` worked example, externally anchored as of 2026-07-28** (`lightning/bolts`
-  `bolt12/payer-proof-test.json`, "full_disclosure" vector — NOT `signature-test.json`, which has
-  no `invoice` example; see the corrected interop-vector caveat above): Merkle root `cb9e0c81…`
-  reproduced byte-exact from the vector's raw `invoice_hex` TLV stream, and the published
-  `invoice_signature` (`fbb932e6…`) verifies against `invoice_node_id`'s x-only key over
-  `merkleRoot`+`invoice_sig_tag`. Run directly through `merkleRoot`/`verifyMerkle` (not
-  `decodeInvoice`) since the vector carries payer-proof-specific TLV types this module's typed
-  decoder doesn't model.
-- **Reject-teeth**: flipped signature bit → verify `false`; corrupted stream byte → verify `false`;
-  swapped signer pubkey → verify `false`; length-overrun TLV → `error.Truncated`; empty /
-  signature-only stream → `error.EmptyMerkleStream`; signature-TLV-exclusion invariant (a type-240
-  record does not change the root).
-- **Round-trip**: `encodeSignedInvoiceRequest`/`encodeSignedInvoice` → decode → `verify` for both
-  `lnr1`/`lni1`, in addition to (not instead of) the externally-anchored `invoice` Merkle/signature
-  KAT above.
+- **`invoice` worked example** (`lightning/bolts` `bolt12/payer-proof-test.json`, "full_disclosure" vector — `signature-test.json`
+  has no `invoice` example): Merkle root `cb9e0c81…` reproduced byte-exact from the vector's raw `invoice_hex` TLV stream, and
+  the published `invoice_signature` (`fbb932e6…`) verifies against `invoice_node_id`'s x-only key over
+  `merkleRoot`+`invoice_sig_tag`. Run directly through `merkleRoot`/`verifyMerkle` (not `decodeInvoice`) since the vector
+  carries payer-proof-specific TLV types this module's typed decoder doesn't model. `encodeSignedInvoice` is byte-exact against
+  the `lni1` string each `valid_vectors[].input.invoice` carries: `"minimal_disclosure"` is the ordinary-invoice case, and
+  `"full_disclosure"` (a private TLV of type 3000000001 after the signature) exercises the type > 240 split of
+  `appendSignedStream`.
+- **Reject-teeth**: flipped signature bit → verify `false`; corrupted stream byte → verify `false`; swapped signer pubkey →
+  verify `false`; length-overrun TLV → `error.Truncated`; empty / signature-only stream → `error.EmptyMerkleStream`;
+  signature-TLV-exclusion invariant (a type-240 record does not change the root).
+- **Round-trip**: `encodeSignedInvoiceRequest`/`encodeSignedInvoice` → decode → `verify` for both `lnr1`/`lni1`, in addition to
+  (not instead of) the externally-anchored KATs above.
 
-Run: `zig build test-lninvoice` (Debug and `-Doptimize=ReleaseFast`).
+- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (ReleaseFast only; see *Secret residue on the dead
+  stack*).
+- **Constant time:** n/a — the node key is only forwarded by pointer to `k256` and `bip340`, which carry their own ctgrind rows;
+  invoice fields, signatures and node ids are public.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta
+  runs after it.
 
 ## Secret residue on the dead stack
 
-Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): BOLT#11 `encode` with
-`.private_key`, BOLT#12 `signMerkle`, `encodeSignedInvoiceRequest`, `encodeSignedInvoice`, each
-under a painted 256 KiB window. Needles: the private key big-/little-endian and as the scalar
-field holds it; for BOLT#11 the RFC 6979 nonce `k`, `n-k` and `k^-1`, recovered from the published
-signature; for BOLT#12 the BIP340 `t`, `rand`, `k'`, `n-k'` and `n-d`. Each nonce is checked
-against the published `R` before the scan (a wrong needle would make the zero meaningless).
-NEG 0, POS 1; 0 residue as shipped (dirty depth 17-22 KiB, all inside the `k256`/`bip340` burns —
-the signing keys reach this module by pointer since 2026-10-08).
+`src/stackprobe_test.zig` (ReleaseFast only) paints a 256 KiB window and runs BOLT#11 `encode` with `.private_key`, BOLT#12
+`signMerkle`, `encodeSignedInvoiceRequest` and `encodeSignedInvoice` under it. Needles: the private key big-/little-endian and as
+the scalar field holds it; for BOLT#11 the RFC 6979 nonce `k`, `n-k` and `k^-1`, recovered from the published signature; for
+BOLT#12 the BIP340 `t`, `rand`, `k'`, `n-k'` and `n-d`. Each nonce is checked against the published `R` before the scan (a wrong
+needle would make the zero meaningless), and a negative and a positive control sit beside it. Residue is 0: the dirty depth stays
+inside the `k256`/`bip340` burns, because the signing keys reach this module by pointer. `src/burn.zig` burns BOLT#11 `encode`'s
+own frames, probed by `src/stackprobe2_test.zig`.
 
-NOT covered: the caller's own key storage (`SignInput.private_key`, the `bip340.SecretKey`); the
-heap (the encoders allocate only public TLV/bech32 buffers).
+NOT covered: the caller's own key storage (`SignInput.private_key`, the `bip340.SecretKey`); the heap (the encoders allocate only
+public TLV/bech32 buffers).
 
-**Audit 2026-11-17 (whole-module mutation).** 347 mutants over every runtime line of `bech32_raw.zig`, `bitpack.zig`, `bolt11.zig`, `bolt12.zig` and `burn.zig`: the HRP split and its case/range rules, the BCH checksum inputs and constant, `stripContinuation`'s state machine, every quintet/byte/feature-vector/base-32 conversion at its edges (padding bits, the 13-digit `u64` bound, the 9-field's slack bits), the HRP amount grammar (leading zero, 20 digits, each multiplier, the `p` sub-millisatoshi rule, the `u64` ceiling, shortest-form encoding case by case), the network prefixes both ways, the data-part length edges (111 quintets, a 3-quintet header at the signature), every tagged field (first-occurrence-wins, the exact fixed sizes of `p`/`s`/`h`/`n`, minimal `x`/`c`, empty `f`, hop size and every hop field and its byte order, required fields, `d` xor `h`), the preimage, the low-S rule, the declared-node verification and the recovery arguments, every field `decode` hands back, the encoder's tags, route-hint byte order, the all-zero `9` omission and the 1023-quintet cap, and on the BOLT#12 side the offer field checks, the Merkle tree (the 240..1000 exclusion range at its four edges, nonce base, leaf and nonce inputs, truncation), `verifyMerkle`'s error/false split, the minimal-padding rule for all three string kinds, every fixed field length, the signature slot, the refund classification and `invoice_error`. Round 1 (ReleaseSafe, one switch per mutant): 229 killed, 116 survived. The survivors were test gaps, not module defects: 29 tests were added (`bolt11.zig`, `bolt12.zig`, `bech32_raw.zig`, `bitpack.zig`; the BOLT#11 ones build well-signed invoices with arbitrary tagged-field layouts, so duplicates, wrong-size occurrences, stray quintets and missing fields reach the decoder) and killed 103 of them in round 2 (a flawed mutant of mine, leaf hash over the "type only", was in fact the identical expression and was replaced by leaf-over-length-and-value). 15 remain: EQUIVALENT (13) delayed emission in `quintetsToBytesPadded`/`bytesToQuintets` (the final flush emits the same bits), a consumed-then-restored trailing `+`, the redundant `v == 0` early return, exponent 11 (never passed), `msat == maxInt(u64)` (the grammar cannot produce it), 12-hop cap against `/50`, the duplicate-known-type guard in `decodeOffer` (`parseTlvStream` refuses duplicates first; pinned by a test), `nodes.len <= 1` and the swapped `branchHash` children (both unobservable by construction: the tree is never empty and the hash orders its children), a record of type 240 in `appendSignedStream`'s input (the signature slot itself, outside the contract), and types 1 and 79 in the refund classifier (unknown odd types are never returned by the parser); UNOBSERVABLE (2) in `burn.zig`'s `stack` (ReleaseFast stack probe, switch inside the callee: the baseline is clean, but the probe's needle is the private key, which `encode` only ever holds by pointer while `k256`'s `sign` burns its own frames, so neither a skipped nor a half-sized burn changes what the probe sees; it would need a needle that lives in `encode`'s own frames). Not mutated, because the value is a comptime constant: the tag, TLV-type and field-type constants, the `network_matches` table, `encode_burn`, the signature-tag strings. Counts on the card are whole-module.
+## Open
 
-**Delta 2026-11-18 (leading zero in the HRP amount).** The amount parser now skips leading zeros (see the zero-amount decision above). 5 mutants over the new lines (the skip loop's bound and test, skipping it entirely, the 20-digit guard at `>=` and at `> 21`): 4 killed (`01u`/`00`/`000n`, 24 zeros then junk, 21 significant characters), 1 EQUIVALENT (bound `lead < digits.len` instead of `lead + 1 < digits.len`: it only strips the last `0` of an all-zero run, and an empty digit run reads as 0 msat all the same). The card counts are cumulative (old + delta).
-
-## Status
-
-`any (pure codec, no I/O) · codec · reentrant` + deps: `bech32`, `k256`, `lnwire`, `bip340` —
-canonical source is `pub const meta` in `src/root.zig`.
+- **BOLT#11 ENCODE is anchored against the specification, not against a second implementation.** The KAT above is a genuine
+  external oracle — the spec's own published string — but no CLN-, LDK- or eclair-generated invoice has been run through `encode`
+  byte-for-byte. Field shapes the spec's examples never exercise on the ENCODE side are therefore pinned only by this module's own
+  `decode()`: `m` (metadata), and `x`/`c` at widths other than those appearing in the vectors. `f` and `r` appear in the spec's
+  examples, but only the donation vector is driven byte-exact through `encode`, so they are covered on decode only.
+- **`invoice_request` string ENCODE is not compared byte-for-byte with the spec's `lnr1…` string.** The Merkle root, the signature
+  verify and the byte-exact signature reproduction of the `signature-test.json` worked example are anchored, and its `lnr1…` string
+  is decoded end-to-end, but `encodeSignedInvoiceRequest` is exercised only as a build + sign + decode + verify round trip.
 
 ## Backlog / deferred
 
-- **Typed BOLT#12 blinded paths and payment info** *(survey 2026-09-30)* — `offer_paths`/`invoice_paths`/`invoice_blindedpay` are raw; paying an offer over a blinded path needs them decoded (LDK does). Effort: medium (needs BOLT#4 route-blinding structure, sibling `sphinx` gap); fits §2.
-- **Offer builder and BOLT#12 validity rules** *(survey 2026-09-30)* — encode an unsigned `offer`, check that an `invoice_request`/`invoice` matches its offer (currency, amount, quantity, chain, expiry). Users who issue offers need it. Effort: medium; fits §2.
-- **`invoice_error` and refunds** *(survey 2026-09-30)* — ✅ DONE 2026-11-16 (`decodeInvoiceError`/`encodeInvoiceError` over the TLV stream types 1/3/5, strict: `error` mandatory UTF-8, minimal `tu64`, unknown even refused, `suggested_value` only with `erroneous_field`; refunds were already encodable/decodable as offer-less `invoice_request`s, added `invoiceRequestIsRefund`; no external vector exists for either, tests are hand-built byte fixtures + round-trips).
+- **Typed BOLT#12 blinded paths and payment info** *(survey)* — `offer_paths`/`invoice_paths`/`invoice_blindedpay` are raw; paying an
+  offer over a blinded path needs them decoded (LDK does). Effort: medium (needs BOLT#4 route-blinding structure, sibling `sphinx`
+  gap); fits §2.
+- **Offer builder and BOLT#12 validity rules** *(survey)* — encode an unsigned `offer`, check that an `invoice_request`/`invoice`
+  matches its offer (currency, amount, quantity, chain, expiry). Users who issue offers need it. Effort: medium; fits §2.
 
 ## Anchoring
 
@@ -390,5 +324,3 @@ canonical source is `pub const meta` in `src/root.zig`.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** BOLT11 + BOLT12 offer/invoice_request/invoice decode+ENCODE all vs lightning/bolts vectors, byte-exact (NOTICE)
-
-**How it got there.** The anchoring work landed. Unblocked 2026-08-02: bootstrap.bolt12.org was a red herring — official vectors live in lightning/bolts (github, CC-BY 4.0), fetched directly, no host needed; found+fixed 2 real bugs (stripContinuation over-stripping `+`, quintetsToBytesStrict missing the <5-bit padding limit) via the sweep. Closed 2026-08-05: verified the remnant claim first (true — no byte comparison existed for invoice_request/invoice ENCODE), then found signature-test.json's own "bolt12" field already had the lnr1 string (was decode-only anchored) and payer-proof-test.json's valid_vectors[].input.invoice carries lni1 strings (previously only its Merkle-root/signature hex fields were read). Anchoring "full_disclosure" surfaced a real bug, not just a test gap: it has a type>240 TLV (3000000001) after the signature (240), and encodeSignedInvoice/encodeSignedInvoiceRequest always appended the signature last — emitting a stream BOLT#12's own ascending-type-order rule forbids. Fixed: shared appendSignedStream helper splits at type 240 instead of assuming everything precedes it (signing itself unchanged, pre-existing Merkle/signature KATs stay byte-identical). "full_disclosure" is now the anchor (not sidestepped); "minimal_disclosure" kept alongside as the ordinary-invoice case. Decoder (lnwire.parseTlvStream, shared with offer decode) already rejects any out-of-order stream via NotStrictlyIncreasing, signature slot included — no decoder-side gap. See SPEC.md's "ENCODE byte-exact anchor" note + modules/lninvoice/NOTICE.
