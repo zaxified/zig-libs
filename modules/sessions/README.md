@@ -193,29 +193,31 @@ looks at the request method, so calling it on a GET tells you whether that GET
 carried a valid token, not "GET is always fine". Only `Csrf.middleware` treats
 safe methods specially.
 
-## Concurrency & the no-copy cookie buffer
+## Concurrency
 
 A built `Manager`/`Csrf` is immutable and shared across `http.Server`'s
 connection threads. The only mutable state is the `Store`, whose default
 `RamcacheStore` serializes every cache touch behind its **own**
-`std.atomic.Mutex` (`ramcache` is single-owner). Deletion removes the entry: an
-absent key reads as generation 0, so no racing compare-and-swap save (which
-expects `>= 1`) can bring it back, evicted or not. Per-request `Session` state lives
-on the serving thread's stack. The `Set-Cookie` value is staged in a
-**thread-local** buffer: the response writer stores header slices uncopied and
-serializes them lazily at `writeHead`, *after* the handler returns — a stack
-buffer would dangle (task-per-connection makes the thread-local safe). The clock
-is injected (`Options.clock`) so timeout tests are deterministic; only the
-default `.monotonic` clock touches the OS.
+`std.atomic.Mutex` (`ramcache` is single-owner). Per-request `Session` state lives
+on the serving task's stack, and the `Set-Cookie` value is copied into the
+response writer before the call returns, so fibers multiplexed on one thread are
+as safe as a thread per connection.
 
-## Not handled (deferred)
+Two concurrent requests of one session (two tabs): every save is a
+compare-and-swap on a generation the request loaded. A logout (`revoke`) or a
+`regenerate` always wins — a request still in flight cannot save the old session
+back — and between two requests that both wrote data the **first** save wins; the
+later one is dropped, without a `Set-Cookie`. `Manager.persist` returns whether a
+save landed. (A `CookieManager` has no server state: there the last cookie wins.)
+The clock is injected (`Options.clock`) so timeout tests are deterministic.
 
-Distributed `Store` shared by several servers (Redis adapter — implement the `Store` vtable);
-server-side revocation of a `CookieManager` session (by design: no server state); `SameSite=None`
-cross-site flows; CSRF token rotation / synchronizer-token mode and
-`Csrf.key` provisioning/rotation; a user→sessions index (use `iterate`); a typed
-`GetInt`-style getter set; concurrent same-session read-modify-write races (last save wins); automatic
-CSRF body form-field extraction (use `Csrf.verify` from the handler instead).
+## Not provided
+
+What this module refuses to do (a Redis/SQL store, typed getters, a user → sessions
+index, CSRF body-field extraction in the middleware, server-side revocation of a
+`CookieManager` session …) and what is still open (`SameSite=None` flows, CSRF token
+rotation, `iterate` over `RamcacheStore`) are listed, with the reasons, in
+[`SPEC.md`](SPEC.md) under *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 OWASP Session Management and CSRF Prevention Cheat Sheets. No third-party

@@ -23,7 +23,7 @@ Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-dri
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's `Provenance:` line (no NOTICE: clean-room).
 
 ## Compared with
 
@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [actix/actix-extras](https://github.com/actix/actix-extras) (`actix-session`) | Rust | Apache-2.0 | 890 | push 2026-09-25 | Cookie-content and Redis stores. Source not read: not MIT. *(inferred)* |
 | [jetzig-framework/jetzig](https://github.com/jetzig-framework/jetzig) | Zig | MIT | 1.5k | push 2026-06-12 | Web framework with built-in cookie-based sessions; tied to the framework, not a standalone middleware. *(inferred)* |
 
-**Where we are ahead:** fixation defence by construction (`regenerate` kills the old id), CAS-guarded saves so a racing request cannot resurrect a destroyed session, no session stored for a cookieless request unless the handler marks it (as scs, which commits only a modified session), `__Host-` guidance, and CSRF built in and bound to the session — with scs you add a separate package for it. · **Where we are behind:** no `Store` shared by several servers (Redis/SQL) — *rejected*: the `Store` vtable is the seam; zig-libs has no Redis/SQL client, and scs itself ships every store as a separate module, so an adapter is the consumer's ~100 lines over its own client · a persistent store that fsyncs every save — *rejected*: durability is kv's contract (an acknowledged write is on disk), scs's persistent stores also write once per modified request, and batching is writebehind's job · no typed getters (`GetInt`/`GetTime` …) — *rejected*: Zig callers encode their own values; scs needs them because it stores `interface{}` through gob · no `MergeSession`/`SetDeadline` — *rejected*: rare helpers a caller composes from the values API and `iterate`. ~~no key/value/flash layer~~ and ~~no enumerate/logout-everywhere~~, remember-me and hashed ids in the store: **DONE 2026-10-11** (see below and Backlog)
+**Where we are ahead:** fixation defence by construction (`regenerate` kills the old id), CAS-guarded saves so a racing request cannot resurrect a destroyed session, no session stored for a cookieless request unless the handler marks it (as scs, which commits only a modified session), `__Host-` guidance, and CSRF built in and bound to the session — with scs you add a separate package for it. · **Where we are behind:** no `Store` shared by several servers (Redis/SQL), no `KvStore` mode without an fsync per save, no typed getters (`GetInt`/`GetTime` …), no `MergeSession`/`SetDeadline` — each refused, with the reason, under *What is deliberately not done*.
 
 ## Design & invariants
 
@@ -90,23 +90,42 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   token cookie. Body form-field extraction is deliberately *not* done in the middleware — draining
   the streamed body there would steal it from the handler; callers use `Csrf.verify` directly for
   classic hidden-form-field flows.
-- **Concurrency, optimistic-concurrency CAS & the no-copy cookie buffer:** a built `Manager`/`Csrf`
+  `Csrf.presented(req)` is that header-then-query extraction, public; `Csrf.check(req)` is the whole
+  guard minus the 403 (session cookie present, a token presented, and it verifies). `check` never
+  reads `req.method`, so it does **not** apply the middleware's safe-method exemption and cannot
+  make an unchecked GET look valid; the middleware's guarded branch calls `check` itself, so the
+  two cannot drift. `Csrf` has no `init`: `Csrf.validate()` dry-runs the token cookie once
+  (`error.InvalidCookieOptions` for a `cookie_name` a `Set-Cookie` may not carry, or `SameSite=None`
+  without `Secure`); `issue` itself stays best-effort and fails closed (no cookie, so guarded
+  requests are refused).
+- **Concurrency, optimistic-concurrency CAS & the `Set-Cookie` copy:** a built `Manager`/`Csrf`
   is immutable and shared across connection threads. The only mutable state is the `Store`; the
   default `RamcacheStore` serializes every cache touch behind its own lock (`ramcache` itself is
   single-owner). Each stored value is framed `[generation u64 LE] ++ record`; `save` is a
   compare-and-swap against the loaded generation, atomic under that lock, so a stale save from a
-  concurrent request cannot resurrect a destroyed/rotated session (see the cross-request
-  resurrection note below). Deletion is `ramcache.Cache.remove`: an absent key reads as generation
-  0, which no stale save (`expected >= 1`) matches. (Until 2026-10-24 it wrote a tombstone at
-  "current + 1", which after an eviction of the live record reused the stale writer's generation.) The `Set-Cookie` value is staged in a
-  **thread-local** buffer — the response writer stores header slices uncopied and serializes them
-  lazily at `writeHead` *after* the handler returns, so a stack buffer would dangle; task-per-
-  connection makes the thread-local safe. The clock is injected (`Options.clock`) so timeout tests
-  are deterministic; only the default `.monotonic` clock touches the OS.
+  concurrent request cannot resurrect a destroyed/rotated session (see *Cross-request races* below).
+  Deletion is `ramcache.Cache.remove`: an absent key reads as generation 0, which no stale save
+  (`expected >= 1`) matches. `writeCookie` and `Csrf.issue` format the `Set-Cookie` value into a
+  stack local and hand it to `ResponseWriter.addSetCookie`, which copies it into the writer's own
+  header storage (`rw.dupe`) before returning, so nothing outlives the call and any `Io` scheduling
+  model (thread per connection or fibers multiplexed on one thread) is safe. A failed `addSetCookie`
+  is best-effort and fails closed: the store is already authoritative. The clock is injected
+  (`Options.clock`) so timeout tests are deterministic; only the default `.monotonic` clock touches
+  the OS. A stored `created` in the future (a clock stepped back, or a record written by something
+  else) is read as "created now" (`decode`), and the next save writes that back, so the absolute
+  timeout runs from there; a future `last_seen` needs no clamp (never past the idle window,
+  restamped by the save). No reference to follow here — scs and Django store a deadline, which a
+  future-dated record defeats the same way — so the clamp is chosen over "expire it", which would log
+  everybody out after an NTP step back.
+- **Every request with a session saves it.** An unchanged session is saved with `Store.touch` (same
+  generation, `last_seen` rolled), so the idle window is rolling, as in scs v2.9.0 (its `Load` marks
+  every loaded session modified when `IdleTimeout > 0`) and Spring Session. With `KvStore` that is
+  one `kv` write + fsync per session-carrying request; a deployment that cannot afford it uses
+  `RamcacheStore`, a store of its own, or `CookieManager`.
 
-## Values, remember-me, enumerate, hashed store keys (2026-10-11)
+## Values, remember-me, enumerate, hashed store keys
 
-Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2@v2.9.0`).
+The scs v2.9.0 counterparts; file/line cites are into its source (`data.go`, `session.go`).
 
 - **Key/value + flash layer** (`src/values.zig`; scs data.go `Put` 155, `Get` 175, `Pop` 188, `Remove` 207,
   `Clear` 225, `Keys` 256). Methods on `Session` over the existing blob: `putValue`, `getValue`,
@@ -136,11 +155,11 @@ Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2
   `.destroy` goes through `Store.delete` (generation bump), so a request already holding that session cannot
   resurrect it — the CAS guarantee is unchanged (tested). `KvStore` lists the keys under its prefix with
   `db.scanKeys` a page of `KvStore.Config.iterate_page` (default 4096) at a time — memory bounded by the
-  page, not the number of sessions (until 2026-11-19 one `db.keys` snapshot of every key) — and reads each
+  page, not the number of sessions — and reads each
   key like `get`, skipping keys removed in between and non-records; its lock is taken per read, never across
   the callback. Between pages `kv`'s cursor rule holds (kv SPEC § "Paged key scan"): a session live for the
   whole walk is shown exactly once, in key order; one created during the walk is shown iff its key sorts
-  after the cursor and a later page is fetched (one created during the last page is missed; scs's `Iterate` over a store's `All` has no rule for that either). The walk is not one snapshot, and each page is a full pass over the `kv` keydir under its shared lock (writers wait): N sessions cost N / `iterate_page` passes, quadratic in N — hence the 4096 default (independent review 2026-11-19; it was 256). A store that fails mid-walk stops at the next page. `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
+  after the cursor and a later page is fetched (one created during the last page is missed; scs's `Iterate` over a store's `All` has no rule for that either). The walk is not one snapshot, and each page is a full pass over the `kv` keydir under its shared lock (writers wait): N sessions cost N / `iterate_page` passes, quadratic in N — hence the 4096 default. A store that fails mid-walk stops at the next page. `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
   returns `error.Unsupported`. Logout-everywhere for a user whose id the app stored via `putValue("uid", …)`
   is one pass; the test shows 3 sessions of A and 2 of B.
 - **`Options.hash_id_in_store`** (scs `HashTokenInStore`: data.go `hashToken` 627-630, applied in
@@ -152,6 +171,22 @@ Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2
   callback sees is the store key (the 32 hash bytes), not a cookie value** — never write it to a cookie.
   Tested: the raw id is not a key in either store (the hashed key is), create/load/regenerate/destroy
   round-trip, the middleware path, `iterate` shows the hash and destroys through it.
+
+## Stateless sessions (`CookieManager`)
+
+`src/cookiestore.zig`; the counterpart of gorilla `CookieStore`, Rails `CookieStore`, tower-sessions'
+cookie mode. The session is sealed into the cookie with `cookies.private` (AES-256-GCM, cookie name as
+AD), or signed with `cookies.signed` `.bound`. The plaintext is `[1][created+remember u64][last_seen
+i64][id_len][raw id][data]`. Timeouts are inside the sealed value, and key rotation is a key list
+(`keys[0]` seals, every key opens). `Clock.monotonic` is refused. `Session.data_limit` makes an
+oversized `setData`/`putValue` fail in the handler, `dataLimit()` is exact, and a changed session whose
+cookie cannot be written fails the request; a logout whose clearing cookie cannot be written fails
+the request too (`error.SessionNotCleared`). `Csrf.cookie_sessions` binds tokens to the sealed id,
+because the cookie value changes on every response. Deliberate limits, as in every cookie store: no
+server-side revocation (a copy of an old value opens until its timeout), rollback to an older value of
+one's own cookie, last writer wins between concurrent requests, no `iterate`. Default
+`max_cookie_bytes` 3072 < 4096, because `http`'s 4 KiB header copy budget is shared with the
+response's other headers.
 
 ## Persistent store (`KvStore`)
 
@@ -183,21 +218,13 @@ Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2
 
 Security-critical module — server-side session identity and CSRF are the trust boundary for every
 route behind them. In scope: session-id unguessability (CSPRNG, never a weak RNG), session
-fixation (closed via mandatory-on-privilege-change `regenerate`), CSRF via constant-time signed
-double-submit, cookie hardening (HttpOnly/Secure/SameSite by default, opt-out is explicit and
-named). Out of scope / not handled (v1): a distributed `Store` (Redis adapter — implement the
-`Store` vtable); server-side revocation of a stateless `CookieManager` session; `SameSite=None` cross-site
-flows; CSRF token rotation / synchronizer-token mode and `Csrf.key` provisioning/rotation;
-automatic CSRF body form-field extraction (use
-`Csrf.verify` from the handler instead, so the middleware never touches the request body).
-Concurrent same-session writes are **generation/CAS-guarded** (see the cross-request resurrection
-note above): a delete/regenerate always wins over a stale save, and two concurrent data writes are
-first-writer-wins between two DATA writes (a refresh-only save never displaces one) — the store is not a full lost-update-*merging* store, but a stale save can no
-longer silently overwrite a newer write or undo a delete.
+fixation (closed via mandatory-on-privilege-change `regenerate`), logout/rotation that a concurrent
+request cannot undo (below), CSRF via constant-time signed double-submit, cookie hardening
+(HttpOnly/Secure/SameSite by default, opt-out is explicit and named). Out of scope: see *What is
+deliberately not done* and *Backlog / deferred*.
 
-**Cross-request resurrection race — FIXED (store-level optimistic concurrency).** Both the
-same-request case *and* the harder cross-request case are now closed. The same-request case is
-closed structurally (`middlewareRun` does not re-`save` a session that was `revoke()`'d or
+**Cross-request races (store-level optimistic concurrency).** The same-request case is closed
+structurally (`middlewareRun` does not re-`save` a session that was `revoke()`'d or
 `regenerate()`'d during that request — see `Session.revoked` / `Session.regenerated`). The
 **cross-request** case — two genuinely concurrent requests sharing one cookie, e.g. one tab in
 flight while another tab logs out — is closed by a **generation (version) tag + compare-and-swap**
@@ -220,8 +247,7 @@ on the `Store`:
   resets `Session.generation` to 0 so the new id is persisted as a fresh *create*-CAS. So the instant
   a concurrent request destroys or rotates the session, any other in-flight request still holding
   the old generation (`>= 1`) can no longer CAS-match an absent key: **a delete/rotate always wins
-  over a concurrent stale save**, whether or not the cache evicted the live record first (the
-  tombstone this replaced did not, sessions review 2026-10-24). A `revoke()` also happens when the
+  over a concurrent stale save**, whether or not the cache evicted the live record first. A `revoke()` also happens when the
   handler then returns an error.
 
 **Save-CAS-failure policy (fail closed).** A `save` whose CAS loses the race is a **no-op**: nothing
@@ -232,220 +258,102 @@ concurrent *data* writes to a still-live session the policy is **first-writer-wi
 now-stale save is dropped) — last-write-wins is not attempted; the only security-critical guarantee
 is that a delete/regenerate cannot be undone. `Manager.save` returns void (the middleware ignores
 the outcome); `Manager.persist` exposes the CAS result as a `bool` so a handler could observe/retry.
-A future distributed `Store` (Redis) implements the same CAS via a Lua script or `WATCH`/`MULTI` on
-the generation.
-
-**No longer a limitation — the `Set-Cookie` buffer (corrected 2026-09-27).** This section used to
-say `writeCookie` staged the value in a **threadlocal** buffer, unsafe under a fiber `Io` that
-multiplexes connections on one thread. The code no longer does: `writeCookie` and `Csrf.issue`
-format into a stack local and hand it to `ResponseWriter.addSetCookie`, which copies the value into
-the writer's own header storage (`rw.dupe`) before returning. Nothing outlives the call, so any
-`Io` scheduling model is safe. Verified by reading both call sites before the web-server consumer (a fiber-per-
-connection server) built its `Config.sessions` on them.
+A third-party `Store` over a shared database implements the same CAS (for Redis: a Lua script or
+`WATCH`/`MULTI` on the generation).
 
 ## Verification
 
-45 offline tests (plus the 2026-10-11 ones listed at the end of this section) in `scripts/modtest sessions` (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
-core (10): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
-regenerate (old id dead / data carried), **cross-request race — stale save cannot resurrect a
-concurrently destroyed session**, **cross-request race — stale save cannot resurrect a concurrently
-regenerated (rotated) id (and the new id persists)**, **single-owner save succeeds + bumps the
-generation, a second concurrent stale save no-ops (first-writer-wins)**, `min_id_bytes` floor
-accepted at floor/default/ceiling, insecure escape hatch. Middleware (8): hardened Set-Cookie +
-cookie round-trip, **anonymous requests that write nothing store nothing and 300 of them (store
-cap 256) do not evict a logged-in session**, `keep()` persists an unwritten session,
-`persist_untouched_sessions` restores storing every new session, revoke
-expires+evicts, same-request revoke does not get resurrected by the trailing save, same-request
-regenerate persists only the new id (old id stays dead, post-rotation data survives),
-small-buffer early-flush (no cookie-buffer corruption). CSRF (10): token/verify round-trip + tamper,
-per-key distinctness, safe-GET issues a non-HttpOnly cookie, POST 403 without a token / 200 with
-the right one, cross-session token rejected, query-param fallback, **`presented`** (header, query
-fallback, header wins over query, absent), **`check`** (false: no session cookie / wrong token;
-true: matching session cookie + token), **middleware/`check` agreement** (a request the middleware
-lets through also passes `check`; a request the middleware 403s also fails `check`). Plus the
-dark-tests aggregator pulling in `csrf.zig`. Run: `zig build test-sessions`.
+Run: `scripts/modtest sessions`. Tests live in `src/root.zig` (session core, middleware, both stores,
+the values API, iterate, hashed ids, the model test, fuzz harnesses), `src/csrf.zig`,
+`src/values.zig`, `src/cookiestore_test.zig` (`CookieManager`) and `src/stackprobe_test.zig`.
 
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig`, `cookiestore.zig`, `csrf.zig`, `values.zig`, `idhex.zig`, `common.zig`; the 2026-11-06 mutant set re-applied by text fragment to the current source plus new mutants for the `clock` reads, `Store.iterate`, `RamcacheStore.currentGen`, `KvStore`'s failed-write return and `iterateImpl`'s guards; schemata in a detached copy, ReleaseSafe + one ReleaseFast build for the six `secureZero` defers (stackprobe clean at M0), strict verdict, adversarial read while placing mutants): 528 mutants, 484 killed, 44 equivalent, 0 undecided, no defect. The `Csrf` safe-path id wipe survived the instrumented build (frame moved) and was killed by a single-mutation ReleaseFast build (stackprobe residue 1013 B). New tests: `Manager.iterate` over `KvStore` skips junk keys under the prefix and walks on; the first of two entries with the same key wins in `values.locate` (a hand-built blob; the layer never writes one); `CookieManager.init` with a name and path that together outgrow a Set-Cookie line is `InvalidCookieSize` (reachable, not as the 2026-11-06 note said). Equivalent: the 42 of 2026-11-06 re-checked on the current source (logout fail-closed: head sent gives `SessionNotCleared` either way, two layers guard it; `val.len >= max_val_len` only matters for a cap over 65535, every caller uses 4096), the `monotonicNowNs` clamp (292 years of uptime), `iterateImpl`'s early return shadowed by `getImpl`'s `hasFailed`. Cut: `burn.zig`, `ctgrind_harness.zig`, the stackprobe test.
-
-**Delta mutation (2026-11-19, base `04c1315c4`, `KvStore.iterate` over `kv`'s paged scan):** `KvStore.init`'s `iterate_page` and `iterateImpl`; schemata, ReleaseSafe, runner filtered to the `iterate` tests: 8 mutants, 8 killed (one by the 20 s hang cap: the cursor never advancing), 0 equivalent — `Config.iterate_page` ignored (killed by the allocation-count difference between page sizes 2 and 256), the `@max(…, 1)` clamp dropped, a junk key ending the walk, `.stop` ignored, the "no more pages" return dropped, both cursor frees dropped (leaks). Card counts cumulative (494/538, 44 eq + 8/8). **Review fixes (same day):** 2 more mutants, 2 killed — the per-page `hasFailed` check dropped (killed by the mid-walk failure test's allocation count) and the default page back at 256 (killed by the default-page assertion); the field default itself is comptime and not switchable, the `Config` default reaches every caller through `init`. Card: 504/548, 44 eq.
-
-**Audit 2026-10-24 (review + mutation, grade-1 wave).** An independent read-only review found two
-security defects, both fixed: (1) `RamcacheStore.delete` wrote a tombstone at "current + 1"; after
-the cache evicted the live record that was generation 1 again, the generation a concurrent stale
-save held, and the save revived the logged-out session (`delete` now removes the entry); (2) a
-handler that called `revoke()` and then failed skipped the logout (now destroyed on the error path
-too). Also fixed: an unchanged request's refresh made a concurrent data write lose its CAS
-(`Store.touch`, generation kept; `Session.persisted`); `RamcacheStore` reported a write the cache
-dropped as saved; `Max-Age=0` for a sub-second idle timeout. Judged not a defect: the CSRF token is
-issued for whatever session cookie value a safe request carries — a cookie-injecting attacker gets
-a valid pair for a real session of his own anyway; `__Host-` on both cookies is the defence
-(documented on `Csrf.session_cookie`, with the pairing to `Options.cookie_name`). The 2026-10-04
-survivor (the 64-digit length check in `Csrf.verify`) was not equivalent: a longer token verified in
-ReleaseFast — test added. 60 schemata mutants over `root.zig`, `csrf.zig`, `values.zig`, `idhex.zig`
-(both stores' CAS, touch, delete, landed check, `Store.touch` fallback, `persist`'s touch condition,
-the middleware's error path and drop condition, expiry comparisons, cookie attributes, regenerate,
-CSRF verify/presented/guard, the values codec, hex encode/decode): 56 killed, 4 equivalent —
-`KvStore`'s own `hasFailed` check before a write (`kv` poisons the `Db` after a failed write and
-refuses every later one itself), `timing_safe.eql` → `mem.eql` (timing only; ctgrind's job), the
-last-match rule in `values.locate` (keys in a well-formed blob are unique), `val.len > max_val_len`
-→ `>=` (a 65 535-byte value overflows the 4 KiB cap first). Five survivors of the first run got
-tests: `touch` at generation 0 on both stores, the fallback without a `touch` slot, a save the cache
-did not take, and a key aliasing bytes a replace shifts.
-
-**Mutation (2026-10-04,** schemata over a copy of `root.zig` + `csrf.zig`, one ReleaseSafe
-build, the whole suite): 48 mutants — both stores' CAS compare, generation bump and
-tombstone, `KvStore`'s key bound, value framing, fail-closed flag (get/put/set on write
-and delete errors) and TTL write, `setData`'s bound and `kept`, every `Manager.init`
-check, the `Secure`/`HttpOnly` cookie attributes, `lookup`'s record checks, both timeout
-comparisons and the eviction, the rolling refresh, the loaded generation, `persist`'s
-generation advance, `regenerate`'s delete and generation reset, the id length,
-`maxAgeSeconds`, the middleware's revoke/untouched decision, and in `csrf.zig` the token
-length check, the MAC compare, `presented`'s empty-header / empty-query rules, `check`'s
-missing cookie, the guard, the token cookie's `HttpOnly`, `issue_on_safe` and the query
-name match. First run: 32 killed, 16 alive; ten tests added (exact timeout limits and
-the rolling refresh, `setData` at the bound, an oversized record from a foreign `Store`,
-`maxAgeSeconds` with the idle timeout off — RFC 6265 §5.2.2, `Secure` dropped on the
-wire, a regenerate-only new session persisted, a closed `KvStore` with a readable disk,
-a truncated CSRF token, `presented`'s empty/look-alike cases, `check` without a cookie);
-rerun: 45 killed, 2 equivalent, 1 alive. Equivalent: a tombstone served as an empty
-record (`lookup` refuses any record shorter than its 16-byte header), and `KvStore.put`
-on a closed store (`kv` refuses every write once poisoned, so the write fails and returns
-null anyway). Alive: dropping `Csrf.verify`'s 64-digit length check — a shorter even-length
-token leaves the rest of the decode buffer uninitialised, so the outcome depends on stack
-garbage (the added test asserts the contract; it kills the mutant only when the garbage
-differs from the MAC tail, which it did not here). The check stays; it is what makes
-`verify` independent of that garbage. No defect found.
-
-**Model-based differential (2026-10-11).** Test `model: Manager over RamcacheStore and KvStore
-agrees with a naive session model …` runs 200 seeds (60 in Debug) per store, each 60–180 random
-operations on six handles: create + persist (the create CAS), time steps that land exactly on, one
-before and one past the idle edge, `lookup`, `persist` with or without new data, a second handle on
-the same id at an older generation (two racing requests), `regenerate`, `Store.delete`, and for
-`KvStore` a close/reopen of the `Db`. `SessionModel` re-states the documented rules on its own: expiry
-is `now − created > absolute` or `now − last_seen > idle` (strict, 0 disables) and deletes; `persist`
-lands iff the generations match; `delete` bumps the generation and leaves a tombstone in
-`RamcacheStore` but removes the key in `KvStore` (generation reads 0). Every result is compared:
-load outcome, data, `created`, generation, the refreshed `last_seen`, and every CAS verdict and the
-generation it returns. Reach (all must be hit): loaded, absent, expired by idle and by absolute
-timeout, persist won and stale, regenerated, deleted, restarted. Negative controls: idle `>` → `>=`
-fails it (and the exact-limit test); `RamcacheStore.delete` without the generation bump fails it
-(and both cross-request race tests). The model covers the session core; CSRF stays on hand-written
-examples.
-
-**Values, remember-me, iterate, hashed keys (2026-10-11).** `values.zig` has its own tests (put/get/remove in
-insertion order, in-place replace, canonical empty blob, refused puts leave the buffer untouched, a key or
-value aliasing the buffer, eight malformed blobs). In `root.zig`: the `Session` values API incl. the
-modified-marking and flash `BufferTooSmall` retention; raw `setData` + values = `Malformed`; **a random
-operation model against a `StringArrayHashMapUnmanaged`** (put new/replace/overflow/invalid key, remove, flash
-pop incl. too-small buffer, clear, raw-payload `Malformed`; every label must be reached; all entries and their
-order compared after every step); the created-word codec at ±2^62 and the saturation; the three `Set-Cookie`
-shapes **byte for byte** (default, `persist_cookie = false`, `rememberMe(true)`) plus the unchanged clearing
-cookie; the flag through save/load on `RamcacheStore` and `KvStore` (also over a restart and a negative
-clock); the middleware with `persist_cookie = false`; flash read once through the middleware; logout-everywhere
-over `KvStore` (3 of A destroyed, 2 of B kept, a stale in-flight request of A cannot resurrect it, `.stop`,
-expired records skipped, non-session keys skipped) and `Unsupported` over `RamcacheStore`; `hash_id_in_store`
-over both stores (the raw id is not a key, the SHA-256 is; create/load/regenerate/destroy; the middleware;
-`iterate` shows the 32-byte key). Fuzz: `fuzzValuesDecode`/`fuzzValuesMutated` (arbitrary and damaged blobs:
-iterator, `getValue` and `putValue` must agree on `Malformed`, a failed put changes nothing) are in the
-`SESSIONS_FUZZ` driver and the 400-seed reach test, with a corpus guard. Negative controls (what goes red):
-the model test if `put` stopped replacing in place; `persist_cookie…three Set-Cookie shapes` if the flag were
-ignored or `Max-Age` were emitted for `persist_cookie = false`; `rememberMe…KvStore` if bit 63 were dropped
-or the timestamp were not sign-extended; `Manager.iterate…KvStore` if `.destroy` bypassed the generation
-bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if a raw id reached the store.
+- **Session core and middleware:** create/save/load round trip, forged id → absent, idle and absolute
+  expiry at their exact limits, rolling refresh, regenerate (old id dead, data carried, new id
+  persisted), the cross-request races (a stale save cannot resurrect a session destroyed, evicted-then-
+  deleted or rotated by a concurrent request; first-writer-wins between two data writes; a refresh-only
+  `touch` never displaces a data write), anonymous requests that write nothing store nothing (and cannot
+  evict a logged-in session from a bounded store), `keep()`, `persist_untouched_sessions`, revoke on
+  success and on a handler error, `Manager.init` option checks, the three `Set-Cookie` shapes byte for
+  byte (default, `persist_cookie = false`, `rememberMe(true)`) and the clearing cookie.
+- **Stores:** `RamcacheStore` and `KvStore` CAS, `touch`, delete, the fallback for a store without
+  `touch`, a write the cache did not take; `KvStore` fail-closed after an injected write error, restart
+  over a reopened `Db`, junk keys under the prefix, paged `iterate` (page size, `.stop`, mid-walk
+  failure, allocation-failure sweep); `iterate` = `error.Unsupported` over `RamcacheStore`;
+  `hash_id_in_store` over both stores (the raw id is never a key, the SHA-256 is).
+- **Model-based differential** (the card's `**Model:**`): seeded random sequences over both stores —
+  create + persist, time steps on, one before and one past the idle edge, `lookup`, `persist` with or
+  without new data, a second handle on the same id at an older generation (two racing requests),
+  `regenerate`, `Store.delete`, and for `KvStore` a close/reopen of the `Db` — against `SessionModel`, a
+  plain id → {generation, record} map that restates the documented rules (strict timeouts, 0 disables;
+  CAS lands iff generations match and bumps unless it is a `touch`; delete removes the key, so the
+  generation reads 0). Every outcome is compared and every reach label must be hit. The values layer has
+  its own random-operation model against a `StringArrayHashMapUnmanaged`.
+- **CSRF:** token/verify round trip and tamper, per-key distinctness, a token that is not exactly 64 hex digits, a non-hex look-alike,
+  safe-GET issue (non-HttpOnly cookie), POST 403 without / 200 with the token, cross-session token
+  rejected, query fallback, `presented`, `check`, middleware/`check` agreement, `validate` at the exact
+  cookie-line cap.
+- **`CookieManager`:** seal/open in both modes, key rotation, timeouts inside the value, `dataLimit()`
+  exact for both modes, failure to write a changed or cleared cookie fails the request.
+- **Fuzz:** the record decode, the cookie header parse (each also over damaged corpus inputs) and the
+  values decode, run by testkit's deterministic driver as `SESSIONS_FUZZ`, with a fixed-seed reach test
+  in every run.
+- **Constant time:** ctgrind rows `csrf` (CSRF key and token, session id tainted) and `newid` in
+  `scripts/checks/ctgrind-expected.tsv`; dead-stack burn of the HMAC (`src/burn.zig`) checked by
+  `src/stackprobe_test.zig`. The store lookup by id is outside these rows (*Backlog / deferred*).
+- **Audit:** the card's `**Audit:**` line is the current score; the review and mutation record, with the
+  equivalent-mutant arguments and the findings fixed, is [`AUDIT.md`](AUDIT.md).
+- **Comparative tooling** (`tools/`): `bench.zig` against scs (`go_bench/`) and fiber (`go_fast_bench/`);
+  `lead_probe/`, the race probe behind the card's `**Ahead:**` line.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-sessions`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 8.6 %): ref 0.04–0.17×, against 0.04–0.22× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-sessions` (`tools/bench.zig`, ReleaseFast, `BENCH_ROUNDS=5`) against scs v2.9.0 + memstore
+(`tools/go_bench/`) and gofiber/fiber v3.6.1 (`tools/go_fast_bench/`), net of each side's HTTP stack. The current
+figures, with their date, are the card's `**Performance:**` line; they are not repeated here.
+
+## What is deliberately not done
+
+- **A `Store` shared by several servers (Redis/SQL)** — refused: the `Store` vtable is the seam (see
+  *Cross-request races* for the CAS such a store must implement); zig-libs has no Redis/SQL client, and
+  scs itself ships every store as a separate module, so an adapter is the consumer's ~100 lines over its
+  own client.
+- **`KvStore` without an fsync per save** — refused: durability is kv's contract (an acknowledged write is
+  on disk); scs's persistent stores also write once per modified request; batching is writebehind's job.
+- **Skipping the save of an unchanged session for a while** — refused (2026-11-17): it matches no
+  reference. scs v2.9.0 commits every loaded session when `IdleTimeout > 0`; express-session skips the
+  save of an unmodified session but calls the store's `touch`; Spring Session writes `lastAccessedTime` on
+  every request; Django and tower-sessions refresh only a modified session (their idle window is not
+  rolling by default). None skips the refresh for a bounded interval, and doing so would shorten the idle
+  window in a way no reference does. Reopen only if the reference grows such a knob.
+- **Typed getters (`GetInt`/`GetTime` …)** — refused: Zig callers encode their own values; scs needs them
+  because it stores `interface{}` through gob.
+- **`MergeSession` / `SetDeadline`** (scs data.go 310, 584) — refused: rare helpers; a caller composes
+  them from the values API and `iterate`.
+- **A user → sessions index** — refused: an app stores the user id with `putValue` and filters in
+  `Manager.iterate`; `revoke`/`regenerate` act on one session id.
+- **Lost-update merging** of two concurrent data writes (a field-level last-write-wins merge) — not
+  attempted: concurrent data writes are first-writer-wins; the security guarantee is that a
+  delete/regenerate cannot be undone.
+- **Automatic CSRF body form-field extraction in the middleware** — refused: draining the streamed body
+  there would steal it from the handler; a classic hidden-form-field flow calls `Csrf.verify` itself.
+- **Server-side revocation of a `CookieManager` session** — impossible by design (no server state); use
+  `Manager` and a store when a logout must end the session everywhere.
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** ~~`Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses~~ **DONE 2026-11-19**: `Csrf.validate()` is the startup check (Csrf has no `init`; `issue` stays best-effort and fails closed); ~~a stored record whose `created`/`last_seen` lies in the future never expires~~ **DONE 2026-11-19**: `decode` reads a future `created` as now (min with the clock), and the next save writes that back, so the absolute timeout runs from there; a future `last_seen` was already harmless (never past the idle window, restamped by the save). Chosen over "expire it" because a clock stepped back (NTP, documented at `Clock.realtime`) would otherwise log everybody out; scs/Django store a deadline, which a future-dated record defeats the same way, so there is no reference behaviour to follow and the safe, non-breaking clamp is used. `CookieManager` is unchanged: its timestamps are sealed by the server itself; ~~`KvStore.iterate` lists every key in memory~~ **DONE 2026-11-19**: it walks `kv`'s new paged `Db.scanKeys` (`Config.iterate_page` keys per page).
-
-- **ct, not measured (2026-10-09 ct review):** a session is looked up by its secret id through the
-  store (`m.store.get`, `root.zig` ~703 → ramcache `getImpl` / kv `KvStore.key`): hashing and
-  comparing the id there is secret-dependent and lives in those modules, outside this card's
-  ctgrind rows. Same as every hash-keyed session store (Go's, Rails'); worth a look if ramcache/kv
-  get a ct axis.
-  **With `Options.hash_id_in_store` on (2026-10-11) the store lookup compares a hash of the id, not the
-  secret itself** — what ramcache/kv hash and compare is `SHA-256(id)`, which an attacker who could time
-  it learns nothing usable from (it is not the cookie value). The SHA-256 of the id itself runs in this
-  module, on the secret; it is the library's ordinary hash and not part of the ctgrind rows.
-
-- **Reviewed 2026-07-10** (adversarial security pass, alongside `aaa-gate`/`jwt`/`acme`/
-  `snmp.usm`/`kv`/`http`/`sealedbox`/`hashdigest`) — `sessions` is server-side auth-adjacent state
-  (session identity + CSRF): session-fixation and logout-resurrection issues (HIGH) plus an
-  id-entropy floor were found and fixed; the cross-request race was separately resolved via CAS
-  (commit `c1bc3d7`).
-- **Distributed `Store`** (Redis adapter) — implement the `Store` vtable; not built.
-- ~~**Signed-cookie stateless sessions**~~ — **DONE 2026-11-06** (grade probe core gap, gorilla
-  `CookieStore` / tower-sessions / Rails `CookieStore`): `CookieManager` (`src/cookiestore.zig`).
-  The session is sealed into the cookie with `cookies.private` (AES-256-GCM, cookie name as AD),
-  or signed with `cookies.signed` `.bound`. The plaintext is `[1][created+remember u64][last_seen
-  i64][id_len][raw id][data]`. Timeouts are inside the sealed value, and key rotation is a key
-  list. `Clock.monotonic` is refused. `Session.data_limit` makes an oversized `setData`/`putValue`
-  fail in the handler, `dataLimit()` is exact (tested tight for both modes, 4 line limits,
-  3 names, 3 id sizes), and a changed session whose cookie cannot be written fails the request.
-  `Csrf.cookie_sessions` binds tokens to the sealed id, because the cookie value changes on every
-  response. Deliberate limits, as in every cookie store: no server-side revocation, rollback to an
-  older value of one's own cookie, last writer wins, no `iterate`. Default `max_cookie_bytes`
-  3072 < 4096, because `http`'s 4 KiB header copy budget is shared with the response's other
-  headers.
 - **`SameSite=None` cross-site flows** — not supported.
-- **CSRF token rotation / synchronizer-token mode + `Csrf.key` provisioning/rotation** — not built;
-  the key is caller-supplied and static for the process lifetime.
-- ~~**Logout-everywhere**~~ — **DONE 2026-10-11** as `Manager.iterate` (callback sees every live session
-  and may destroy it); there is no user→sessions index, an app stores the user id with `putValue` and
-  filters. `revoke`/`regenerate` still act on one session id.
-- ~~**Cross-request resurrection race / concurrent same-session write CAS**~~ — **DONE.** Store
-  records carry a monotonic `Generation`; `save` is a compare-and-swap against the loaded
-  generation and `delete`/`regenerate` bump it, so a stale concurrent `save` is rejected (fail
-  closed, delete/rotate wins) instead of silently overwriting a newer write or undoing a delete.
-  See the cross-request resurrection note in the Threat-model section above. A full lost-update-
-  *merging* store (last-write-wins field merge) is still not attempted — first-writer-wins for
-  concurrent data writes.
-- **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
-  design notes); callers use `Csrf.verify` directly.
-- ~~**Public `Csrf.presented(req)`**~~ — **DONE 2026-09-28** (requested by the web-server consumer M11.4). The
-  header-then-query token extraction that used to be the private `presentedToken` is now
-  `pub fn presented(c: *const Csrf, req) ?[]const u8` — same extraction order (header, then the
-  query-param fallback), so a caller driving the core `Csrf` API without `router`'s `middleware`
-  no longer has to copy it. Also added `pub fn check(c: *const Csrf, req) bool`: the whole guard
-  minus the middleware's 403 — session cookie present, a token `presented`, and it `verify`s.
-  `check` deliberately does **not** apply the middleware's safe-method exemption (it never reads
-  `req.method`), so it cannot surprise a caller into treating an unchecked GET as valid — only
-  `middleware` special-cases safe methods. `middlewareRun` was refactored to call `c.check`
-  itself for the guarded branch, so the two can no longer drift.
-
-- ~~**Persistent `Store` implementation**~~ (survey 2026-09-30) — **DONE 2026-09-30** as `KvStore` over `kv` (see § "Persistent store"). `seglog` was the other candidate; `kv` fits because a session is a key overwritten in place, which is what a Bitcask keydir is for, and `kv` gained per-key expiry for the backstop.
-- ~~**Skip the save of an unchanged session**~~ *(2026-09-30, from `KvStore`)* — CLOSED 2026-11-17 as "matches the reference; not changed, no knob". Evidence: scs v2.9.0 (the reference) `Load` marks every loaded session Modified when `IdleTimeout > 0`, so `LoadAndSave` commits it on every request and the idle deadline rolls. express-session (`resave: false`) skips the save of an unmodified session but calls the store's `touch` to roll the expiry when the store has one (connect-redis offers `disableTouch`, a store option); Spring Session writes `lastAccessedTime` on every request; Django (`SESSION_SAVE_EVERY_REQUEST` false) and tower-sessions refresh expiry only when the session is modified, so their idle window is not rolling by default. None of them skips the refresh for a bounded interval, and scs has no such knob; skipping would shorten the idle window by up to the interval in a way no reference does. Our unchanged-session save is already the cheap form (`Store.touch`, same generation, since 2026-10-24). Cost note: with `KvStore` every session-carrying request is one `kv` write + fsync (the `last_seen` roll), independent of the idle timeout setting; a deployment that cannot afford it uses `RamcacheStore`, a store of its own, or a `CookieManager`. Reopen only if the reference grows such a knob.
-- ~~**Typed key/value + flash layer over the blob**~~ — **DONE 2026-10-11** (`putValue`/`getValue`/`popValue`/
-  `removeValue`/`valueIterator`/`clearValues`; untyped bytes by design — scs's `GetInt`/`GetTime` exist
-  because it stores `interface{}` through gob).
-- ~~**Enumerate / destroy all sessions of a user**~~ — **DONE 2026-10-11** (`Manager.iterate`).
-- ~~**Remember-me / non-persistent cookie**~~ — **DONE 2026-10-11** (`Options.persist_cookie`, `Session.rememberMe`).
-- ~~**Hash the id in the store (scs `HashTokenInStore`)**~~ — **DONE 2026-10-11** (`Options.hash_id_in_store`).
-- **`RamcacheStore` iterate** — `Manager.iterate` returns `error.Unsupported` over it: needs a ramcache entry
-  iterator (keys + values under the store's lock) that does not exist yet. `KvStore` supports it.
-  Re-checked 2026-11-19 and left: `ramcache` has only `drainDirty` (dirty entries, callback under the
-  cache's walk), and the vtable forbids holding the store lock across `visit`; a bounded walk would need a
-  resumable cursor over an evicting, unordered cache (expiry, reservations, the in-hook guard) — a new
-  `ramcache` API, not a small additive change.
-- **`MergeSession` / `SetDeadline`** (scs data.go 310, 584) — not built: rare helpers; with the values API and
-  `iterate` a caller composes them.
-- **Shared `Store` (Redis/SQL)** — rejected: the `Store` vtable is the seam; zig-libs has no Redis/SQL client,
-  and scs itself ships every store as a separate module — an adapter is the consumer's ~100 lines over its own
-  client.
-- **`KvStore` fsync per save** — rejected: durability is kv's contract (an acknowledged write is on disk); scs's
-  persistent stores also write once per modified request; batching is writebehind's job. (The unchanged-session
-  skip above is the module-side lever.)
-- **Typed getters (`GetInt`/`GetTime` …)** — rejected: Zig callers encode their own values.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · server · threadsafe` + deps: `router`, `http`, `cookies`, `ramcache` — canonical
-source is `pub const meta` in src/root.zig.
+- **CSRF token rotation / synchronizer-token mode, `Csrf.key` provisioning/rotation** — not built; the key
+  is caller-supplied and static for the process lifetime.
+- **`RamcacheStore` iterate** — `Manager.iterate` returns `error.Unsupported` over it (`KvStore` supports
+  it). Needs a `ramcache` entry iterator that does not exist: `ramcache` has only `drainDirty` (dirty
+  entries, callback under the cache's walk), the vtable forbids holding the store lock across `visit`, and
+  a bounded walk would need a resumable cursor over an evicting, unordered cache — a new `ramcache` API,
+  not a small additive change.
+- **ct, not measured: the store lookup by session id.** `m.store.get` hashes and compares the id inside
+  ramcache (`getImpl`) / kv (`KvStore.key`), outside this card's ctgrind rows — as in every hash-keyed
+  session store (Go's, Rails'); worth a look if ramcache/kv get a ct axis. With `Options.hash_id_in_store`
+  the store compares `SHA-256(id)`, which tells a timing attacker nothing usable; the SHA-256 itself runs
+  here, on the secret, with the library's ordinary hash, outside the ctgrind rows.
 
 ## Anchoring
 
