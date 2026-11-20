@@ -18,10 +18,8 @@
 
 **Downstream consumer:** yes
 
-Design + fill-in notes for the next (crypto-implementing) agent. Usage: see
-`./README.md`. Attribution/provenance: see `./NOTICE` (module-local for now —
-mirrors `dtls`'s placement note; fold into the root `NOTICE` before this
-module ships — see that file).
+Design and threat notes below. Usage: see `./README.md`. Attribution/provenance: this
+module's own `./NOTICE` (module-local, as `dtls`'s is).
 
 ## Compared with
 
@@ -36,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ianic/tls.zig](https://github.com/ianic/tls.zig) | Zig | MIT | 174 | pushed 2026-09-01 | Client-side resumption only (`Options.SessionResumption`); no server side (this module's SPEC). The web-server consumer's fork adds server-side tickets and calls `tlsresume` only for sealing/opening. |
 | Zig `std.crypto.tls` | Zig | MIT | — | Zig 0.16.0 | Client only; ignores `NewSessionTicket` (comment in 0.16.0's `tls/Client.zig`). |
 
-**Where we are ahead:** the only Zig code with server-side TLS 1.3 resumption pieces, and engine-agnostic by design (pure functions over caller bytes; bounded fail-closed strike register; constant-time binder compare); binder, NewSessionTicket and the 0-RTT key schedule are byte-exact against RFC 8448 §3/§4, including the real encrypted early-data record. **Where we are behind:** client side (out of scope: the TLS client is `tlsclient`); it is a set of parts rather than a resumption feature, and the engine has to be written around it; live-peer interop only through the consumer `tlsserver` (OpenSSL, Go, BoGo; 2026-10-20), and the web-server consumer does not call `psk`/`select`/`earlydata`/`replay`/`cache` (the web-server consumer's engine has its own binder logic and refuses early data) (→ Backlog). Closed 2026-10-13: scheduled STEK rotation (`RotationPolicy`, `maybeRotate`, `expire`, `openAt`, `depthFor`), TLS 1.2 tickets (`ticket12`), stateful session cache (`SessionCache`).
+**Where we are ahead:** the only Zig code with server-side TLS 1.3 resumption pieces, and engine-agnostic by design (pure functions over caller bytes; bounded fail-closed strike register; constant-time binder compare); binder, NewSessionTicket and the 0-RTT key schedule are byte-exact against RFC 8448 §3/§4, including the real encrypted early-data record. **Where we are behind:** client side (out of scope: the TLS client is `tlsclient`); it is a set of parts rather than a resumption feature, and the engine has to be written around it; live-peer interop through its own oracle (`zig build interop-tlsresume`: OpenSSL and Go clients against `tlsserver` as the engine) and through the consumer `tlsserver`'s interop (OpenSSL, Go, BoGo), and the web-server consumer does not call `psk`/`select`/`earlydata`/`replay`/`cache` (the web-server consumer's engine has its own binder logic and refuses early data). Provided besides the TLS 1.3 parts: scheduled STEK rotation (`RotationPolicy`, `maybeRotate`, `expire`, `openAt`, `depthFor`), TLS 1.2 tickets (`ticket12`), stateful session cache (`SessionCache`).
 
 ## What this is, in one paragraph
 
@@ -64,16 +62,11 @@ touches a socket.
 
 ## Design & invariants
 
-**Layered like `dtls`/`noise` (this repo's other TLS-family modules) — and,
-like them, now fully past that split.** The module landed in two passes:
-codec/bookkeeping first (allocation-light, one correct byte layout each,
-provably matched against a real wire trace), then a dedicated
-crypto-implementation pass (see "Crypto-implementation pass — DONE" below)
-that filled in the AEAD/HKDF/HMAC core with the security-critical judgment
-calls (nonce-reuse policy, constant-time compares, replay-window sizing) a
-first guess would have risked getting wrong. Both passes are done; see
-`root.zig`'s module doc table for the current real (no stub) status per
-file.
+**Layered like `dtls`/`noise` (this repo's other TLS-family modules).** The codecs and bookkeeping
+(`ticket`, `ticket12`, `cache`, `stek` rotation, `replay` arithmetic) are allocation-light with one byte layout each,
+matched against real wire traces; the crypto core (AEAD seal/open, the HKDF/HMAC chains, the strike register,
+selection) carries the security-critical judgment calls (nonce-reuse policy, constant-time compares, replay-window
+sizing). `root.zig`'s module doc table lists each file.
 
 **Engine-agnostic, no owned state machine.** Every function takes
 already-computed bytes (transcript hashes, secrets, wall-clock readings) as
@@ -99,23 +92,38 @@ plaintext this module's own `selectPsk` expects, documented as a REQUIRED
 PREFIX so an engine can append its own extra fields (ALPN, negotiated
 group, early-data limits, ...) after it without breaking `parse`.
 
-## Server-scope additions (2026-10-13)
+## Rotation, TLS 1.2 tickets and the session cache
 
 - **Rotation (`stek.zig`).** `RotationPolicy{period_s = 24 h, lifetime_s = 7 d}` mirrors Go `crypto/tls`
   (rotate daily, accept 7 days) and rustls' `Ticketer`. `needsRotation` is `now - installed >= period`;
   `maybeRotate` rotates with id = previous active `+% 1` (0 for an empty ring) then `expire`s; `expire`
   wipes non-active slots with `installed + lifetime <= now` (the active key is never expired, so a stalled
   rotation cannot leave the server unable to seal); `openAt` also refuses an over-lifetime key still in the
-  ring (including an overdue active key). `rotate` now wipes the evicted slot's key before overwriting.
+  ring (including an overdue active key). `rotate` wipes the evicted slot's key before overwriting.
   `depth` must be at least `depthFor(policy)` (= ⌈lifetime/period⌉ + 1, 8 for the Go defaults) for the grace
   window to be honoured by the ring itself; `DefaultRing` (3) keeps a key for about two periods only.
 - **TLS 1.2 tickets (`ticket12.zig`).** RFC 5077 §3.3 body (`u32 lifetime_hint; opaque ticket<0..2^16-1>`;
   a zero-length ticket is the §3.3 withdrawal, `isWithdrawal`) and the §3.2 extension (type 35). The ticket is a `StekRing.seal` blob; the engine serializes its own 1.2
-  state (master secret, suite, ...) as for 1.3. RFC 5077 §4's CBC+HMAC layout is deliberately not adopted:
-  the ring's `key_id||nonce||ct||tag` is one AES-256-GCM AEAD with the id as AAD.
+  state (master secret, suite, ...) as for 1.3. The ring's `key_id||nonce||ct||tag` is one AES-256-GCM AEAD with the id as
+  AAD (RFC 5077 §4's CBC+HMAC layout is not adopted, see *What is deliberately not done*).
 - **Session cache (`cache.zig`).** Fixed-size entries, one allocation, single owner. O(capacity) scan with a
   full pass and `timing_safe.eql` on padded ids (ids are bearer secrets); oldest-by-insertion eviction;
-  timeout `now - stored >= timeout_s`; `take` is the single-use redemption RFC 8446 §8.1 needs.
+  timeout `now - stored >= timeout_s`; `take` is the single-use redemption RFC 8446 §8.1 needs. Capacity 0 is a
+  disabled cache: `put` stores nothing, every lookup misses.
+
+## Hardening decisions in the API
+
+- `selectPsk`: with a strike register the freshness window applied is at most `strikeFreshnessCap(register window)`
+  (half of it), also when the caller passes none; `identities.len != binders.len` is `error.BinderMismatch`; a ticket
+  that was opened and not selected is wiped from `open_scratch`, the selected one is the caller's to wipe once done with
+  the session.
+- `ticket.NewSessionTicket.encode` returns `error.InvalidField` for a `ticket_lifetime` over 7 days
+  (`max_ticket_lifetime_s`), a nonce over 255 bytes, an empty or over-long ticket, an over-long extension or block, or an
+  extension type twice; `decode` refuses an extension type twice with `error.Malformed` (RFC 8446 §4.2).
+- `StekRing(depth)`: a depth over 256 is a compile error (key ids are `u8`); `findKey` returns the newest key with an
+  id; `wipe()` clears every key (a ring is a plain value: a copy is a copy of the keys).
+- `SessionState.serialize` refuses a nonce over 255 bytes (`NonceTooLong`); an HKDF-Expand-Label context over 255 bytes
+  is a checked panic (`psk.zig`), not a stack overrun.
 
 ## Threat model
 
@@ -150,25 +158,26 @@ group, early-data limits, ...) after it without breaking `parse`.
   itself, so it carries no CSPRNG-quality risk of its own; that
   responsibility sits with the engine, consistent with this repo's
   no-hidden-globals rule (CONVENTIONS.md §2).
-- **Const-time compare, generally.** Every crypto-critical value compare in
-  this module's eventual implementation (binder, and — if the fill-in pass
-  adds it — the AEAD tag inside `stek.open`, though `std.crypto.aead.*`
-  already compares tags in constant time internally) MUST use
-  `std.crypto.timing_safe.eql`, never `std.mem.eql`. `psk.verifyBinder`
-  already does; `stek.open`'s crypto-implementation pass must preserve this
-  for anything it adds beyond the AEAD library call itself.
+- **Const-time compare, generally.** Every crypto-critical value compare in this module uses
+  `std.crypto.timing_safe.eql`, never `std.mem.eql`: the binder (`psk.verifyBinder`) and the session-cache id
+  (`cache.zig`, over padded ids). The AEAD tag verdict is the AEAD's own, inside `stek.open`.
 - **Ticket-age spoofing.** `replay.withinFreshnessWindow` bounds how far a
   client's claimed `obfuscated_ticket_age` may diverge from the server's own
   elapsed-time measurement (RFC 8446 §4.2.11.1) — this is a DoS/early-data
   replay mitigant, not a confidentiality boundary (a client can always claim
   ANY age within the window; the point is bounding how large a replay
   window an attacker gets, not proving a specific age).
+- **Residual risk: one ring for two purposes.** The ticket AAD is the key id alone and `SessionState` does not record
+  its hash length, so one ring shared by TLS 1.2 and 1.3 tickets, or by SHA-256 and SHA-384 sessions, relies on the
+  engine's `Filter` (suite in the tail) to refuse a foreign state; otherwise such a ticket may end in `BinderMismatch`
+  instead of a full handshake (only for the client that offers it). Use one ring per purpose and hash; documented on
+  `seal` and `SessionState`.
+- **Residual risk: full strike register.** A register full of live entries rescans per new identifier (documented on
+  `checkAndMark`).
 
-## Crypto-implementation pass — DONE (all 7 items landed)
+## Implementation notes (`psk`, `stek`, `replay`, `select`)
 
-The formerly-stubbed function bodies are all implemented and their
-previously skip-guarded tests un-guarded and passing. What each turned out
-to be, in the original implementation order:
+What each function does and the decisions it carries:
 
 1. `psk.zig: earlySecret` — RFC 8446 §7.1 `HKDF-Extract(salt = 0^Hash.length,
    IKM = PSK)` via `Hkdf.extract`. KAT: RFC 8448 §4 early_secret.
@@ -189,7 +198,7 @@ to be, in the original implementation order:
 5. `stek.zig: StekRing(depth).seal` / `.open` — AES-256-GCM over the blob
    layout above, with the 1-byte key id authenticated as the AEAD
    associated data (a blob cannot be re-pointed at a different ring slot).
-   Fresh nonce per seal is caller-supplied (no-owned-RNG design); any tag
+   The AEAD is `stek.Aead` = `aesgcm.Aes256Gcm` (the zig-libs `aesgcm` module). Fresh nonce per seal is caller-supplied (no-owned-RNG design); any tag
    mismatch is the typed `error.DecryptionFailed`, never a panic on
    attacker-controlled bytes.
 6. `replay.zig: StrikeRegister.checkAndMark` — RFC 8446 §8/§8.1 single-use
@@ -206,10 +215,9 @@ to be, in the original implementation order:
    forged binder can never consume a real ticket's single-use slot (no
    attacker-driven DoS of the legitimate client's resumption).
 
-## 0-RTT early-data key derivation — implemented (`earlydata.zig`)
+## 0-RTT early-data key derivation (`earlydata.zig`)
 
-A follow-up pass on top of the crypto core above: the early-data branch of
-the RFC 8446 §7.1 key schedule, so a resuming client's 0-RTT records can be
+The early-data branch of the RFC 8446 §7.1 key schedule, so a resuming client's 0-RTT records can be
 protected/opened before the handshake completes.
 
 - `clientEarlyTrafficSecret` = `Derive-Secret(early_secret, "c e traffic",
@@ -246,9 +254,9 @@ internal consistency (manual chain == convenience type, AES-256-GCM
 seal/open round-trip) rather than an external byte-exact target — the same
 honest split `psk.zig`'s SHA-384 test already makes.
 
-## KAT sourcing (RFC 8448, fetched fresh for this module)
+## KAT sourcing (RFC 8448)
 
-`psk.zig`'s, `earlydata.zig`'s, and `replay.zig`'s KAT constants were
+`psk.zig`'s, `earlydata.zig`'s, and `replay.zig`'s KAT constants are
 extracted directly from <https://www.rfc-editor.org/rfc/rfc8448> §3
 ("Simple 1-RTT Handshake", whose NewSessionTicket trace `ticket.zig`
 decodes byte-for-byte) and §4 ("Resumed 0-RTT Handshake", whose
@@ -260,83 +268,57 @@ resumption-PSK chain here diverges from that one exactly at the `"res
 binder"` vs `"ext binder"` label, per RFC 8446 §7.1's two separate PSK
 binder-key derivations.
 
-## Verification status
+## Verification
 
-1. **KAT (done):** the formerly skip-guarded tests in
-   `psk.zig`/`replay.zig`/`stek.zig`/`select.zig` are un-guarded and pass
-   against their byte-exact RFC 8448 targets (Debug and ReleaseFast).
-2. **Live interop (done 2026-10-26, `tools/interop.zig`, see Backlog); the
-   original plan:** stand up `openssl s_server -tls1_3 ...`, complete a
-   full handshake, capture the real `NewSessionTicket` it sends, and open
-   it as a black box (bytes only, obviously not this server's own STEK
-   format) through `ticket.NewSessionTicket.decode` as a second, independent
-   wire-format cross-check beyond the RFC 8448 trace. For the SERVER side
-   specifically (this module's actual target), the natural oracle is an
-   OpenSSL or BoringSSL TLS 1.3 CLIENT resuming against a minimal engine
-   built on top of `tlsresume` + `dtls`'s sibling TLS 1.3 handshake pieces
-   (or any other RFC-8446-compliant client) — not yet stood up in this pass.
-3. **Self-consistency (mirrors `dtls.Connection`'s pattern):** issue a
-   ticket, seal it, "resume" against the SAME process's `selectPsk`, and
-   assert the round-tripped PSK matches what a hypothetical peer would have
-   derived independently from the same `resumption_master_secret` +
-   `ticket_nonce`.
+Run: `scripts/modtest tlsresume`; live oracle: `zig build interop-tlsresume` (`tools/interop.zig`, `tlsserver` as the engine
+through `interop_deps`); deterministic fuzz: `TLSRESUME_FUZZ=<runs>[,<first seed>]`; constant time:
+`scripts/checks/ctgrind.sh tlsresume`.
 
-**Audit 2026-10-26.** Review (an independent read-only pass over every source file, SPEC and README,
-and the `tlsserver` call site): no critical or high finding. Fixed: F1 a strike register with no or an
-equal freshness window let a replay the register had forgotten through → freshness capped at half the
-register's window (`strikeFreshnessCap`); F2 identity/binder counts from the client asserted → `BinderMismatch`;
-F3 opened tickets not selected left the resumption secret in `open_scratch` → wiped; F4 `encode` cast
-over-long fields unchecked and took an empty ticket or a lifetime over 7 days → `InvalidField`; F5 a ring
-over 256 keys could hold two live keys under one u8 id → compile error, `findKey` newest first; F7 no way to
-wipe a ring → `wipe()`; F10 `decode` took an extension type twice → `Malformed`. Documented (Backlog): F6,
-F9; F8 (cache eviction order) is moot with a monotone clock — the oldest entry is the first to expire.
-Mutation (schemata over a copy, one ReleaseSafe build + a ReleaseFast build for the stack-probe and
-byte-scan tests): 246 mutants over every source file; first round 41 survivors → 25 tests (exact-size
-buffers, the 65535-byte extension block, empty-plaintext blobs, `depthFor` at run time, a ticket that opens
-and does not parse, the caller's smaller freshness window under a strike register, cache bounds, ...);
-final 227 killed, 19 equivalent: 17 subsumed bounds/`<=` on lengths rejected by the next check, hygiene
-wipes of slots overwritten at once, stack residue; 2 (`expire`/`wipe` without `secureZero`) unobservable
-in both release modes — storing `null` into the key's optional slot overwrites the payload in this
-codegen, the explicit wipe stays as the guarantee the language does not give.
-
-**Mutation (2026-10-04,** schemata over a copy of `ticket.zig` + `select.zig` + `replay.zig` +
-`psk.zig` + `stek.zig`, one ReleaseSafe build, the whole suite): 37 mutants — every length check
-of `NewSessionTicket.decode` (fixed head, nonce, ticket length/zero/body, extensions block,
-extension header, extension data, scratch capacity, trailing bytes), `maxEarlyDataSize`'s type
-and length test, `encode`'s buffer check, `SessionState.parse`'s two bounds, `selectPsk`'s
-negative-age, freshness, binder, strike and fail-closed checks and the echoed index, the age
-de-obfuscation, the freshness and strike window boundaries, the slot re-arm, capacity and
-eviction, both HKDF labels/inputs, the binder compare, the STEK ring's active slot and key-id
-lookup, and the seal/open buffer checks. First run: 26 killed, 11 alive; four tests added (one
-broken TLS vector prefix per case, RFC 8446 §3.4; `early_data` must be type 42 with a uint32,
-§4.2.10; the strike window is inclusive, a re-armed slot starts a new window, eviction keeps a
-live entry; a future-dated ticket and an allocation-failing strike register both reject);
-rerun: 37 killed. No defect found.
+- **KAT:** RFC 8448 §3 (`NewSessionTicket` wire bytes) and §4 (PSK, early secret, binder key, finished key, binder,
+  the 0-RTT early traffic secret, key/iv and the real encrypted early-data record, opened with the derived key), byte-exact
+  in `ticket`, `psk`, `earlydata`; STEK seal/open; strike-register policy; `selectPsk` end to end. RFC 8448 carries no
+  SHA-384 0-RTT vector, so that test asserts internal consistency (manual chain == convenience type, AES-256-GCM seal/open
+  round trip).
+- **Self-consistency:** issue a ticket, seal it, resume against the same process's `selectPsk`, and assert the PSK
+  equals the one derived independently from the same `resumption_master_secret` and `ticket_nonce`.
+- **Live oracle** (`tools/interop.zig`): OpenSSL 3.5 `s_client` and Go's crypto/tls (`tools/go_peer`) resume against
+  tickets sealed by a `StekRing` this program rotates: both hashes, HelloRetryRequest, 0-RTT taken, replayed (strike
+  register) and refused for age skew, rotation grace and key expiry, the stateful `SessionCache`, and Go's TLS 1.2
+  client against OpenSSL's and Go's TLS 1.2 servers through `ticket12`. `-- --capture` writes `src/interop_vectors.zig`,
+  which `interop_replay_test.zig` replays through `selectPsk`/`EarlyDataContext`/`ticket12` in every lane (real OpenSSL
+  and Go resuming ClientHellos, and a 0-RTT record).
+- **Fuzz:** driver harnesses `tlsresume-ticket` (`NewSessionTicket` decode) and `tlsresume-state` (`SessionState` parse),
+  each with a generated-record overlay (serialize/encode then parse/decode must round-trip; every truncation and a
+  trailing octet must be refused).
+- **Dead-stack rule:** `src/stackprobe_test.zig` probes every entry point (testkit engine).
+- **ctgrind:** `src/ctgrind_harness.zig` (STEK and session state through seal/open, the resumption secret through the
+  PSK/binder chain, the PSK through the 0-RTT key schedule, SHA-256 and SHA-384); the rows are the Hardening line's.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Performance
 
-**2026-10-26** (`zig build bench-tlsresume`, `BENCH_ROUNDS=5`, ReleaseFast, three sides): seal/open
-0.86–0.91× OpenSSL 3.5.5 EVP and 0.88–0.92× aws-lc-rs 1.18.0; the binder chain 0.87× OpenSSL, 1.18× aws-lc-rs
-(ours 5.7 µs, aws-lc 4.9 µs: std's SHA-256 under HMAC against aws-lc's; the chain is generic over the
-caller's `Hkdf`/`Hmac`, so an engine can plug a faster SHA-256). Ours spread ≤ 2 %, the foreign sides up to
-27 % (host load; each side keeps its best round). A first run the same day gave the same ratios.
+`zig build bench-tlsresume` (`tools/bench.zig`, `BENCH_ROUNDS`, ReleaseFast) times AES-256-GCM ticket seal/open and the
+HKDF/HMAC-SHA256 PSK-binder chain against OpenSSL EVP (`tools/c_bench`) and aws-lc-rs (`tools/rust_fast_bench`), the same
+recipe on each; neither has a standalone resumption API. The card's Performance line carries the figures. The binder
+chain is generic over the caller's `Hkdf`/`Hmac`, so an engine can plug a faster SHA-256.
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-tlsresume`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 9.6 %): ref 0.83–0.88× OpenSSL 3.5.5 EVP, against 0.90–1.08× on Zig 0.16.0. The card carries these figures.
+## What is deliberately not done
+
+- **Client-side resumption** — `tlsclient`'s; this module is the server side.
+- **A handshake engine** — no ClientHello parsing, no state machine, no socket, no clock, no RNG: the engine passes
+  bytes in (see *What this is*).
+- **External-PSK binders** (`"ext binder"`) — only the resumption chain (`"res binder"`) is implemented; the sibling
+  case is `dtls.keyschedule.binderKey`.
+- **RFC 5077 §4's recommended CBC+HMAC ticket layout** — the ring's blob is one AES-256-GCM AEAD with the key id as AAD.
+- **A purpose byte in the ticket AAD** (see the residual risk "one ring for two purposes" in the threat model) — it
+  would change every sealed byte and the consumer's captured vectors; a ring per purpose and hash is the documented
+  answer.
 
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- ~~**`select.selectPsk` opens tickets with `ring.open`, not `openAt`** *(audit 2026-10-19, O4)*~~ — DONE 2026-10-20: `selectPsk` takes a `stek.RotationPolicy`, opens with `openAt`, and skips sessions older than 7 days (`select.max_ticket_lifetime_ms`).
-
-- ~~**Live oracle of this module's own** *(2026-10-26)*~~ — DONE 2026-10-26: `tools/interop.zig` (`zig build interop-tlsresume`; `interop_deps = tlsserver` in `build.zig`, the engine around the parts) — OpenSSL 3.5 `s_client` and Go's crypto/tls (`tools/go_peer`) resume against tickets sealed by a `StekRing` this program rotates: both hashes, HRR, 0-RTT taken / replayed (strike register) / refused for age skew, rotation grace and key expiry, the stateful `SessionCache`, and Go's client against OpenSSL's and Go's TLS 1.2 servers through `ticket12`. 20 cases; `--capture` writes `src/interop_vectors.zig`, replayed through `selectPsk`/`EarlyDataContext`/`ticket12` by `interop_replay_test.zig` in every lane.
-- **Audit 2026-10-26, documented, not changed** — F6: the ticket AAD is the key id alone and `SessionState` does not record its hash length, so one ring shared by TLS 1.2 and 1.3 tickets, or by SHA-256 and SHA-384 sessions, relies on the engine's `Filter` (suite in the tail) to refuse a foreign state, else such a ticket may end in `BinderMismatch` instead of a full handshake (only for the client that offers it). A purpose byte in the AAD would change every sealed byte (and `tlsserver`'s captured vectors); documented on `seal` and `SessionState`. F9: a full strike register of live entries rescans per new identifier (documented on `checkAndMark`).
-- ~~**Live interop for `selectPsk` against OpenSSL/BoringSSL clients** *(survey 2026-09-30)*~~ — DONE 2026-10-20 in the consumer: `tlsserver` resumes through `selectPsk`, and its `tools/interop.zig` has OpenSSL 3.5 (`-sess_out/-sess_in`) and Go 1.26 clients save and resume tickets (also after a HelloRetryRequest), replayed byte-exact in its tests; BoringSSL's BoGo resumption server tests run through its shim. On the way `selectPsk` had to change: a bad binder is now fatal (`error.BinderMismatch`, RFC 8446 §4.2.11), an engine `filter`, optional freshness.
-- ~~**Time-driven STEK rotation policy** *(survey 2026-09-30)*~~ — DONE 2026-10-13: `stek.RotationPolicy` (24 h / 7 d, the Go defaults), `StekRing.needsRotation`/`maybeRotate`/`expire`/`openAt`; no clock or RNG inside (caller passes `now_s` and key bytes).
-- ~~**TLS 1.2 session tickets (RFC 5077)** *(survey 2026-09-30)*~~ — DONE 2026-10-13: `ticket12.zig` (NewSessionTicket12 codec, SessionTicket extension classifier); sealing is the unchanged `StekRing` blob.
-- ~~**Stateful session cache**~~ — DONE 2026-10-13: `cache.zig` `SessionCache(max_id_len, max_state_len)` (session-ID resumption, stateful PSK identities).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- `stek.Aead` is `aesgcm.Aes256Gcm` (the Zig 0.17 #36256 move of the AEAD); the bulk seal/open path was not re-measured
+  at that move. The card's Performance figures were measured after it, so this is probably closed: confirm and delete.
 
 ## Anchoring
 

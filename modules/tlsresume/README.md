@@ -21,6 +21,8 @@ See `SPEC.md` for the per-file detail and threat model.
 | `ticket.zig` | `NewSessionTicket` encode/decode (RFC 8446 §4.6.1, incl. the §4.2.10 `early_data`/`max_early_data_size` extension), KAT-validated against the real RFC 8448 §3 wire bytes |
 | `stek.zig` | STEK ring rotation/lookup bookkeeping + AES-256-GCM ticket-blob `seal`/`open` (key id bound as AAD) |
 | `psk.zig` | `derivePsk`/`earlySecret`/`binderKey`/`computeBinder`/`verifyBinder` (RFC 8446 §7.1/§4.2.11.2 HKDF/HMAC chain, byte-exact vs RFC 8448 §4) |
+| `ticket12.zig` | TLS 1.2 tickets (RFC 5077): `NewSessionTicket12` body codec (a zero-length ticket is the §3.3 withdrawal) and the SessionTicket (type 35) extension classifier; the ticket itself is a `StekRing` blob |
+| `cache.zig` | `SessionCache(max_id_len, max_state_len)`: stateful session-ID cache (timeout, oldest-first eviction, single-use `take`; capacity 0 is a disabled cache) |
 | `earlydata.zig` | 0-RTT early-data keys (RFC 8446 §7.1 early branch + §7.3): `clientEarlyTrafficSecret` ("c e traffic") / `earlyExporterMasterSecret` ("e exp master") / `earlyTrafficKeyIv` ("key"/"iv") + `EarlyDataContext` one-call convenience — byte-exact vs RFC 8448 §4's 0-RTT trace, incl. opening its actual encrypted early-data record |
 | `replay.zig` | `obfuscateAge`/`deobfuscateAge`/`withinFreshnessWindow` (RFC 8446 §4.2.11.1) + `StrikeRegister.checkAndMark` (RFC 8446 §8/§8.1 single-use anti-replay — REQUIRED before accepting the early data `earlydata.zig` derives keys for) |
 | `select.zig` | `SessionState(rms_len)` (de)serialization + `selectPsk` (the server-side §4.2.11 selection loop composing everything above) |
