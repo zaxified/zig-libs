@@ -432,8 +432,8 @@ fn readEverything(sim: *SimStorage, opts: seglog.Options, clean: bool, appended:
     var log = Log.open(gpa, sim.storage(), opts) catch |e| switch (e) {
         // L5: a damaged length field in the active segment over
         // `max_record_len` is refused, not cut as a torn tail (root.zig,
-        // `scanTail`). The harness missed it from 2026-09-27 until the
-        // driver's seed 755 found it (2026-10-19, same on Zig 0.16).
+        // `scanTail`). The harness missed it until the
+        // driver's seed 755 found it (same on Zig 0.16).
         error.Corrupt, error.NotFound, error.UnsupportedVersion, error.RecordTooLongForOptions => {
             hit(.open_refused);
             if (clean) return e; // an undamaged log always opens

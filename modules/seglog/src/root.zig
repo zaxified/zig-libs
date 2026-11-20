@@ -4,7 +4,7 @@
 //!
 //! A log is a sequence of **segments**; a segment is one file of
 //! length-prefixed, CRC32C-checked records. The caller names each segment
-//! with a strictly increasing `u64` (the ingest daemon uses the UTC day number), appends
+//! with a strictly increasing `u64` (for example the UTC day number), appends
 //! to the newest one, and deletes old ones whole. Nothing is ever rewritten in
 //! place: a record, once `append` has returned, stays at its `Position` until
 //! its segment is dropped.
@@ -1155,11 +1155,11 @@ pub const Options = struct {
     max_record_len: u32 = 1 << 20,
     /// The clock `append` and `appendMany` stamp records with, and `rotate`
     /// stamps a segment's creation with. Null stamps 0; `appendAt` takes the
-    /// caller's own time. The unit is the caller's (the ingest daemon: epoch seconds).
+    /// caller's own time. The unit is the caller's (for example epoch seconds).
     /// Times need not be monotonic: a seal records their range, not order.
     now: ?*const fn () i64 = null,
     /// How far `append`/`appendAt`/`appendMany`/`appendEntries` trust a
-    /// timestamp (L3, ingest-consumer audit 2026-09-27): one absurd value — a caller's
+    /// timestamp (L3, ingest-consumer audit): one absurd value — a caller's
     /// bug, not necessarily a crash — otherwise becomes the segment's
     /// permanent seal `max_ts`/`min_ts` (a plain running min/max has no way
     /// to un-see it), which makes `seekTime` match that one record for every
@@ -1189,7 +1189,7 @@ pub const Options = struct {
     /// cleanly, the log not poisoned — rather than from a write halfway into
     /// a record. And appends into reserved zeros do not grow the file, so
     /// their sync has no size to record: on ext4 an `.always` append loop
-    /// went from about 305 to about 850 a second (2026-09-27, NVMe). The
+    /// went from about 305 to about 850 a second (NVMe). The
     /// reserved zeros are cut off when the segment is sealed, and a zero
     /// tail on `open` is taken for the end of the data, not for damage. A
     /// backend or filesystem without preallocation simply goes without.
@@ -1204,7 +1204,7 @@ pub const Options = struct {
     /// record gets the one it returns for its payload; without it, 0.
     legacy_ts: ?*const fn (payload: []const u8) i64 = null,
     /// Told after each migrated segment, for a caller that shows progress:
-    /// a large log takes a while (the ingest daemon: 285 MB in about 15 s).
+    /// a large log takes a while (measured: 285 MB in about 15 s).
     on_migration_progress: ?*const fn (ctx: ?*anyopaque, p: MigrationProgress) void = null,
     migration_ctx: ?*anyopaque = null,
     /// Filled by `open` whenever it migrates or refuses to, success or not —
@@ -2034,7 +2034,7 @@ pub const Log = struct {
             if (p.len > self.opts.max_record_len) return error.RecordTooLarge;
             total += rec_header_len + p.len;
         }
-        // ⛔⛔ L3 fix (2026-09-27): `.refuse` checked, and the whole batch
+        // ⛔⛔ L3 fix: `.refuse` checked, and the whole batch
         // refused, before anything (including a possible auto-rotate) has
         // happened — the same "checked before any write" shape as the
         // length check just above. `.clamp`/`.unbounded` need no pre-pass:
@@ -2156,7 +2156,7 @@ pub const Log = struct {
 
         if (self.live.items.len + self.pending.items.len >= max_manifest_ids) return error.TooManySegments;
 
-        // ⛔⛔ L1 fix (2026-09-27): a manifest that was just (re)created empty
+        // ⛔⛔ L1 fix: a manifest that was just (re)created empty
         // by `open` (`Options.create`, no `MANIFEST` on disk — e.g. one lost
         // to a partial backup/restore while every segment file survived) has
         // no `newest()`, so the monotonic checks above let ANY id through,
@@ -2398,7 +2398,7 @@ pub const Log = struct {
         const size = try inner.size(src);
         const after = try self.writeCompressed(inner, src, size);
 
-        // ⛔⛔ L2 fix (2026-09-27): `writeCompressed` only proves the encoder
+        // ⛔⛔ L2 fix: `writeCompressed` only proves the encoder
         // produced a self-consistent stream whose frame checksums match its
         // own bytes -- it does not prove those bytes decode back to what
         // `src` holds. A wrong-but-well-formed stream (an encoder bug, not
@@ -3720,7 +3720,7 @@ pub const Log = struct {
             const raw = switch (try parseAt(&w, self.gpa, self.store, h, off, size, self.opts.max_record_len)) {
                 .record => |r| r,
                 .short, .bad_crc => break,
-                // ⛔⛔ L5 fix (2026-09-27): a length field over this open's
+                // ⛔⛔ L5 fix: a length field over this open's
                 // `max_record_len` is never believed (`parseAt`'s contract),
                 // but treating it as a torn tail here -- like `.short` and
                 // `.bad_crc`, which genuinely can be one -- would TRUNCATE
@@ -4113,7 +4113,7 @@ pub const Iterator = struct {
             const soft = reader and live_tail;
             const raw = switch (try parseAt(&it.window, it.log.gpa, store, h, it.offset, bound, it.log.opts.max_record_len)) {
                 .record => |r| r,
-                // ⛔⛔ L5 fix (2026-09-27): `.too_long` gets its own reason —
+                // ⛔⛔ L5 fix: `.too_long` gets its own reason —
                 // `record_too_long`, not `bad_record` — since a length field
                 // over this open's `max_record_len` is not necessarily
                 // damage: a record legitimately written under a larger
@@ -7502,7 +7502,7 @@ test "compress with any level or frame size refuses or works (sweep clean check)
     };
 }
 
-// ── audit 2026-11-16 (mutation): the internals, tested directly ───────────────
+// ── audit: the internals, tested directly ───────────────
 
 /// A `Storage` over `sim` that counts `pread`s.
 const PreadCount = struct {
@@ -8887,7 +8887,7 @@ test "resync, with no later segment, still passes over a record whose LSN is bey
     try testing.expectEqualStrings("dd", try payloadOf(&it));
 }
 
-// ── 2026-11-16 review fixes (F1-F6) ──────────────────────────────────────────
+// ── review fixes (F1-F6) ──────────────────────────────────────────
 
 fn segSize(sim: *SimStorage, id: u64) !u64 {
     var nb: [seg_name_len]u8 = undefined;
@@ -9268,7 +9268,7 @@ test "F6: an append that would pass LSN 2^62 is refused whole, and the log reope
     try testing.expectError(error.LsnExhausted, log.append("c"));
 }
 
-// ── 2026-11-16 survey gaps (G1, G2) ──────────────────────────────────────────
+// ── survey gaps (G1, G2) ──────────────────────────────────────────
 
 /// Segments 1 (LSN 1-3), 2 (LSN 4-6) and 3 (LSN 7, active), payloads "p1"…"p7".
 fn threeSegments(log: anytype) !void {
@@ -9433,7 +9433,7 @@ fn keyOfPayload(_: void, payload: []const u8) ?[]const u8 {
     return payload;
 }
 
-// ── 2026-11-16 delta mutation audit: manifestDecodes, one check at a time ────
+// ── delta mutation audit: manifestDecodes, one check at a time ────
 
 fn setManifestCrc(m: []u8) void {
     std.mem.writeInt(u32, m[m.len - man_crc_len ..][0..4], crc32c(m[0 .. m.len - man_crc_len]), .little);

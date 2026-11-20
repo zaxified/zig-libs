@@ -505,7 +505,7 @@ test "migration: resuming, a file already converted must be the segment the mani
     try testing.expect(rep.failure.?.reason == .bad_header);
 }
 
-// ── audit 2026-11-16 (mutation) ──────────────────────────────────────────────
+// ── audit ──────────────────────────────────────────────
 
 test "migration: a newest segment torn inside its header is cut, and every byte of it reported" {
     var sim = SimStorage.init(gpa);
