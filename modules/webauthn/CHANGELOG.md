@@ -5,16 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the F7 test now proves webauthn's own 2048-bit RS256 floor with a 1024-bit key (the smallest `rsa` accepts); comments updated.
 - **2026-11-16** — ES384 / ES512 (COSE -35 / -36) credential keys: `verifySignature` (hence `verifyAssertion` and self attestation) verifies ECDSA P-384/SHA-384 and P-521/SHA-512 through the sibling `p384` / `p521` modules; `webauthn` gains `p384` and `p521` dependencies. A crv/alg mismatch stays `UnsupportedAlgorithm`. Packed x5c leaf-certificate verification is unchanged (P-256 only). Previously these keys were `UnsupportedAlgorithm`. No external vector (in-test keys).
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed beyond the codemod).
 - **2026-10-10** — tests: deterministic fuzz driver `WEBAUTHN_FUZZ` (`src/fuzz_test.zig`) over the six W3C §16 ceremonies. `webauthn-assertion`: `verifyAssertion` accepts the genuine vector and refuses a damaged authenticatorData, clientDataJSON, signature or credential public key (0-3 octets, truncation). `webauthn-registration`: `verifyRegistration` accepts the genuine vector; damage to the clientDataJSON is refused wherever the statement signs its hash, damage to the attestationObject wherever the statement signs the authData (self attestation: every octet; `x5c` formats: the authData; `none` and the certificate carried in `x5c` are lenient by design and only required not to crash). 200,000-run verdicts clean. No code change.
 - **2026-10-10** — docs: ct axis recorded as n/a: the module is a WebAuthn relying-party verifier. Signatures, credential public keys, authenticator data, client data and the challenge (sent to the client in clear) are all public, and no private or MAC key is held. The signature checks are the `p256`/`rsa`/std primitives' (code review).
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test signs through rsa's pointer API and builds its
-  key through the out-param `generate` (rsa 2026-10-08).
 - **2026-10-05** — Tests: first dated mutation run (54 mutants, all killed after 7 new tests;
   `SPEC.md` § "Mutation run 2026-10-05"). No defect; the gaps were the attestation-certificate
   arms the W3C corpus never reaches (Ed25519, RSA, P-384 keys; the AAGUID extension), key/alg

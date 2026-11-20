@@ -16,13 +16,13 @@
 **Downstream consumer:** no
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance:
-see this module's README "Provenance" note (clean-room from the W3C spec, so no root
-`/NOTICE` entry) and the module-local `./NOTICE`, which carries the W3C licence condition for the
-§16 vectors reproduced in `src/vectors.zig`.
+see the README's `Provenance:` line (clean-room from the W3C spec) and the module-local
+`./NOTICE`, which carries the W3C licence condition for the §16 vectors reproduced in
+`src/vectors.zig`.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked with `rg` over `src/root.zig` (only `none`, `packed`, `fido-u2f` reach a verifier; `tpm`, `android-key` and unknown formats return `UnsupportedFormat`; `apple`/`android-safetynet` have no code; ED flag set gave `ExtensionsNotSupported` until 2026-09-30; no `ES384`/`ES512`). go-webauthn's format table is from its README, read in this run; the rest are *(inferred)*.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked with `rg` over `src/root.zig` (only `none`, `packed`, `fido-u2f` reach a verifier; `tpm`, `android-key` and unknown formats return `UnsupportedFormat`; `apple`/`android-safetynet` have no code; an ED flag is accepted and the extensions are returned raw; ES256/ES384/ES512/EdDSA/RS256). go-webauthn's format table is from its README, read in this run; the rest are *(inferred)*.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -32,17 +32,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [Yubico/python-fido2](https://github.com/Yubico/python-fido2) | Python | BSD-2-Clause | 547 | 2.2.1 (2026-06-29) | Server (RP) verifier and CTAP client in one; Yubico's own reference *(inferred)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No WebAuthn. |
 
-**Where we are ahead:** of Zig `std`, the only WebAuthn verifier in Zig; anchored byte-exact on W3C WebAuthn Level 3 §16 test vectors and cross-checked against go-webauthn's re-hosting of them; strict duplicate-label and algorithm-confusion handling, and every cert parsed through `x509.safe`, which go and rust ports get from their memory-safe languages but Zig's std parser does not. **Where we are behind:** attestation formats `tpm`, `android-key`, `apple` (and `android-safetynet`, now retired upstream *(inferred)*); no attestation trust-chain or FIDO MDS layer (leaf signature only); authenticator-data extensions are returned raw (no typed `credProtect`/`hmac-secret` decode); no options generation or credential/session model (verification-only by design); RS256/ES256/ES384/ES512/EdDSA only (ES384/ES512 since 2026-11-16).
+**Where we are ahead:** of Zig `std`, the only WebAuthn verifier in Zig; anchored byte-exact on W3C WebAuthn Level 3 §16 test vectors and cross-checked against go-webauthn's re-hosting of them; strict duplicate-label and algorithm-confusion handling, and every cert parsed through `x509.safe`, which go and rust ports get from their memory-safe languages but Zig's std parser does not. **Where we are behind:** attestation formats `tpm`, `android-key`, `apple` (and `android-safetynet`, now retired upstream *(inferred)*); no attestation trust-chain or FIDO MDS layer (leaf signature only); authenticator-data extensions are returned raw (no typed `credProtect`/`hmac-secret` decode); no options generation or credential/session model (verification-only by design); RS256/ES256/ES384/ES512/EdDSA only (see *Backlog / deferred* and *What is deliberately not done* for the rest).
 
 ## Design & invariants
 
 - **Spec-assembly, not new crypto.** Every signature check routes through an existing,
   independently-KAT'd primitive: `p256`'s `EcdsaP256Sha256`/`ecdsaVerify` for ES256,
-  `std.crypto.sign.Ed25519` for EdDSA, `rsa.verifyPkcs1v15` for RS256. Every CBOR/COSE parse
+  `p384`/`p521` for ES384/ES512, `std.crypto.sign.Ed25519` for EdDSA, `rsa.verifyPkcs1v15` for RS256. Every CBOR/COSE parse
   routes through the sibling `cbor`/`cbor.cose` codec. This module contributes only the WebAuthn
   verification *procedure* (W3C WebAuthn Level 3 §7.1/§7.2/§8) — clientData/authData layout,
-  which bytes get hashed/signed, which flags gate what, and dispatch across the three mandated
-  algorithms and three implemented attestation formats.
+  which bytes get hashed/signed, which flags gate what, and dispatch across the five signature
+  algorithms (ES256, ES384, ES512, EdDSA, RS256) and three implemented attestation formats.
 - **RFC 8230 RSA COSE keys, added on top of `cbor.cose`.** The sibling `cbor.cose` module
   deliberately does not model RSA (`kty=3`) or symmetric COSE key types — see its own doc
   comment. `webauthn` is the first consumer that needs RS256, so `parseCredentialKey` extends
@@ -50,21 +50,23 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   parsed locally (`n`=label -1, `e`=label -2, same label *numbers* RFC 9053 reuses for EC2's
   `crv`/`x` — not a collision, RFC 8152's own design). The local arm returns **before**
   `cbor.cose.parseKey`, which is where RFC 9052 §3's label-uniqueness MUST and the
-  `max_map_entries` cap live — so until 2026-09-02 an RSA credential key with two `-1` labels was
-  accepted first-wins here while a `cbor2`/`python-fido2` peer reads it last-wins, a
-  credential-identity split. `parseCredentialKey` now calls `cbor.cose.checkLabels` itself, above
-  the `kty` read so a duplicated `kty` is caught too, and `parseAttestationObject` does the same
-  one layer up.
+  `max_map_entries` cap live, so `parseCredentialKey` calls `cbor.cose.checkLabels` itself, above
+  the `kty` read so a duplicated `kty` is caught too (an RSA key with two `-1` labels would
+  otherwise be read first-wins here and last-wins by a `cbor2`/`python-fido2` peer, a
+  credential-identity split); `parseAttestationObject` does the same one layer up. An AKP
+  (`kty` 7, ML-DSA) key is `UnsupportedKty`: WebAuthn has registered no ML-DSA algorithm.
 - **Algorithm binding, not algorithm negotiation.** `verifySignature` ties `alg` tightly to the
   key's own `crv`/`kty`: an ES256 `alg` against anything but a P-256 EC2 key, or an RS256 `alg`
   against anything but an RSA key, is `error.UnsupportedAlgorithm` — never coerced, never
-  "closest match". This is the algorithm-confusion defense (the same class of bug JWT's `alg:
-  none`/HS-vs-RS confusion made infamous); see `assertion_test.zig`'s
-  "wrong key algorithm family" reject-tooth — which swaps the **key**, and so pinned the
-  `crv`/`kty` half only. The `alg` half is a cross-check (the verification algorithm is derived
-  from the key's own `crv`/`kty`, or the certificate's SPKI, never from the client's `alg`), and
-  it could be deleted in all four places with the suite green until `attestation_test.zig`'s
-  "the attStmt alg must agree with the certificate's own key" was added.
+  "closest match"; ES384 pairs only with P-384 (COSE -35) and ES512 only with P-521 (-36), with no
+  low-S requirement, as for ES256. An RS256 credential key (and an RSA attestation certificate)
+  below 2048 bits is `InvalidKey`: `rsa`'s own 1024-bit floor is a primitive-level bound, not a
+  WebAuthn policy. This is the algorithm-confusion defense (the same class of bug JWT's `alg:
+  none`/HS-vs-RS confusion made infamous); the `alg`
+  half is a cross-check (the verification algorithm is derived from the key's own `crv`/`kty`, or
+  the certificate's SPKI, never from the client's `alg`); `assertion_test.zig`'s "wrong key
+  algorithm family" tooth pins the `crv`/`kty` half and `attestation_test.zig`'s "the attStmt alg
+  must agree with the certificate's own key" the `alg` half.
 - **Certificate PARSING, not chain validation, for `packed`/`fido-u2f` x5c.** `verifyLeafCertSignature`
   uses `std.crypto.Certificate.parse` (the same primitive the sibling `x509` module's chain
   validator builds on) to pull the leaf certificate's own public key and verify `attStmt.sig`
@@ -76,7 +78,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   **not** build or validate a trust chain to a root, check `basicConstraints`/
   `keyUsage`, or check certificate validity dates — those remain deferred, a metadata-service
   (FIDO MDS) / RP-policy concern layered above signature verification (see "Threat model" below).
-  **Since 2026-09-10 it DOES check §8.2.1's `id-fido-gen-ce-aaguid` extension (OID
+  **It does check §8.2.1's `id-fido-gen-ce-aaguid` extension (OID
   1.3.6.1.4.1.45724.1.1.4), when the leaf certificate carries it, against `authData.aaguid`**
   (`checkAaguidExtension`, via `x509.extensions` — std's own `Certificate.parse` never surfaces an
   OID it does not recognize, so this is an independent DER walk, not std's). Absence of the
@@ -91,7 +93,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   chains to a trusted attestation root, which is the `basicConstraints`/`keyUsage`/validity-dates
   gap above.
 - **`authenticatorData`'s CBOR credential public key has no length prefix (WebAuthn §6.5.2) —
-  split with `cbor.decodePrefix` (since 2026-09-30).** The wire format is
+  split with `cbor.decodePrefix`.** The wire format is
   `aaguid(16) ‖ credentialIdLength(2) ‖ credentialId(L) ‖ credentialPublicKey(CBOR, variable)
   ‖ [extensions(CBOR, variable)]`, with no byte count for the key. `cbor.decodePrefix` decodes the
   key and reports the bytes it took; when ED is set the rest must be exactly one CBOR map
@@ -99,27 +101,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `error.InvalidExtensions`), returned raw as `AuthenticatorData.extensions` for the caller to decode
   (`credProtect`, `hmac-secret`, …). Anything after the last structure the flags announce —
   after the key with ED clear, after signCount with AT and ED clear — is `error.TrailingData`: §6.1's
-  layout is exact, and go-webauthn and python-fido2 both refuse it too. Until 2026-09-30 `cbor` had
-  no prefix decode, so an ED-set input was refused outright (`ExtensionsNotSupported`) and every
-  security key returning `credProtect`/`hmac-secret` outputs failed registration and sign-in; the
-  missing-API workaround and the rejection are gone together. Stricter than python-fido2 in one
-  place, deliberately: it accepts an extensions item that is not a map, §6.1 does not.
+  layout is exact, and go-webauthn and python-fido2 both refuse it too.
 
-## Threat model / out of scope
+## Threat model / Limits
 
 This is a security-critical verifier of fully attacker-controlled wire bytes (an assertion or
 attestation response is produced by whatever ran in the browser/authenticator, which an attacker
 fully controls up to the cryptographic binding). Every check below is proven load-bearing by a
 dedicated adversarial test (`assertion_test.zig` / `attestation_test.zig` "reject:" tests) that
 tampers exactly one input and asserts the *specific* typed error, not merely "some error".
-
-⚠ That sentence was **false for three of them** until 2026-09-02, and the reason is worth keeping:
-the §16 corpus is structurally blind in places. Every registration vector has UP set and ED clear,
-none carries an illegal BE/BS pair, and `fuzzRegistrationBinding` only ever feeds real vectors —
-so `verifyRegistration`'s User-Present check, both arms of the (since replaced) extension-data rejection, and the
-`alg` half of the algorithm binding could each be deleted with the suite green. A corpus that
-cannot express the input a check refuses does not pin that check, however genuine the corpus is.
-The synthetic inputs that close them are in `attestation_test.zig`'s re-audit block.
 
 - **Both ceremonies are bound, and the binding lives in one place each.** `verifyAssertion` (§7.2)
   and `verifyRegistration` (§7.1) each run the full clientData + `rpIdHash` + User-Present check
@@ -148,7 +138,7 @@ The synthetic inputs that close them are in `attestation_test.zig`'s re-audit bl
   .none`. `RegistrationOptions.require_attestation` refuses it outright for an RP whose policy
   depends on the authenticator's identity; such an RP must also chain the leaf certificate,
   because `.basic` here means "the statement is internally consistent", not "vouched for" (see
-  "Deferred").
+  *Backlog / deferred*).
 - **Algorithm confusion defense:** see "Design & invariants" above — `verifySignature` refuses to
   verify under a mismatched key/alg pairing.
 - **User Present / User Verified:** `verifyAssertion` always requires the UP flag; UV is required
@@ -162,13 +152,13 @@ The synthetic inputs that close them are in `attestation_test.zig`'s re-audit bl
   authenticators always report `0`) — that stateful comparison is a caller/storage-layer concern,
   not something a stateless verifier function can own.
 - **Out of scope, by design (not silently skipped):**
-  - **`tpm`/`android-key` attestation formats** — see "Deferred" below.
+  - **`tpm`/`android-key` attestation formats** — see *Backlog / deferred* below.
   - **Attestation trust-chain validation / FIDO Metadata Service (MDS) lookups** — this module
     proves the attestation statement's signature is internally consistent (the leaf cert really
     signed this blob with its own key), not that the leaf cert chains to a trusted root or that
     the authenticator model is one the RP is willing to accept. A caller that cares wires the
     returned leaf certificate (`AttestationResult.leaf_cert_der`; intermediates are not exposed — see
-    "Deferred") into the sibling `x509` module's `verifyChain` against its own trust store /
+    *Backlog / deferred*) into the sibling `x509` module's `verifyChain` against its own trust store /
     MDS-derived roots.
   - **Account-recovery / backup codes** — a product-level fallback authentication mechanism
     layered *above* WebAuthn (e.g. "lost your passkey? use a recovery code"), not part of the W3C
@@ -181,111 +171,103 @@ The synthetic inputs that close them are in `attestation_test.zig`'s re-audit bl
     field itself). Not a security regression: `origin` is still checked exactly, so a genuinely
     different top-level site cannot pass.
 
-## Deferred
-
-- **`tpm` attestation (WebAuthn §8.3):** requires parsing TCG's `TPMS_ATTEST`/`TPMT_SIGNATURE`/
-  `TPMT_PUBLIC` wire structs (TPM 2.0 structures, not CBOR/ASN.1 — a third wire format this
-  module would otherwise need to introduce) and validating the `certInfo`/`pubArea` binding back
-  to the credential public key, plus (for full trust) an EK/AIK certificate chain. This is a
-  project of its own, orthogonal to the WebAuthn verification procedure itself — `verifyAttestation`
-  structurally recognizes `fmt == "tpm"` and returns `error.UnsupportedFormat` rather than
-  half-parsing the TPM structures (which would be worse than rejecting: a partially-checked
-  attestation is a false sense of security).
-- **`android-key` attestation (WebAuthn §8.4):** requires parsing the Android Keystore attestation
-  X.509 extension (OID `1.3.6.1.4.1.11129.2.1.17`, itself a nested ASN.1 `KeyDescription`
-  structure with its own `AuthorizationList` semantics — Android-specific, not a general X.509
-  extension `x509`'s `extensions.zig` models) and validating the credential public key /
-  challenge binding inside it. Same call as `tpm`: structurally rejected, not half-verified.
-- **Attestation trust-chain validation / MDS integration** — see "Threat model" above; would
-  layer the sibling `x509`/`rsa` (already a dep) `verifyChain` on top of the leaf cert this module
-  already parses, plus a metadata-lookup seam. Not built because it needs a trust-store/MDS
-  design decision this module shouldn't make unilaterally for every caller.
-- **Backup/recovery codes** — see "Threat model" above; not a WebAuthn concern.
-
 ## Verification
 
-External, byte-exact anchor: the **W3C WebAuthn Level 3 specification's own §16 "Test Vectors"**
-(https://www.w3.org/TR/webauthn-3/#sctn-test-vectors — non-normative but the spec authors' own
-reproducible-by-construction conformance vectors, generated deterministically via
-HKDF-SHA-256/RFC 6979 per the section's preamble). Fetched directly from w3.org and mechanically
-extracted (not hand-transcribed, after an early hand-copy attempt introduced a transcription slip
-that mechanical extraction makes structurally impossible) into `src/vectors.zig`; independently
-cross-checked byte-for-byte against a second, independent re-hosting of the same vectors
-(go-webauthn/webauthn's `specification_vectors_e2e_test.go`, which cites the identical W3C
-section numbers). Covers:
+Run: `scripts/modtest webauthn` (`zig build test-webauthn`). The oracle is external and
+byte-exact: the **W3C WebAuthn Level 3 §16 "Test Vectors"** (non-normative but the spec authors'
+own reproducible-by-construction vectors, generated deterministically via HKDF-SHA-256/RFC 6979
+per the section's preamble), mechanically extracted from the spec text (never hand-transcribed)
+into `src/vectors.zig` and cross-checked byte-for-byte against a second, independent re-hosting of
+the same vectors (go-webauthn/webauthn's `specification_vectors_e2e_test.go`, which cites the same
+section numbers). They cover:
 
-- **Assertion, all three mandated algorithms:** §16.2 (ES256, `none`), §16.3 (ES256, `packed`
-  self-attested), §16.10 (RS256, `packed` x5c), §16.11 (EdDSA, `packed` x5c) — plus §16.16
-  (`fido-u2f`-registered credential, ES256 assertion).
-- **Attestation, all three implemented formats:** §16.2 (`none`), §16.3 (`packed` self), §16.7/
-  §16.10/§16.11 (`packed` x5c/basic — ES256/RS256/EdDSA credentials, all signed by the shared
-  spec-CA's EC P-256 attestation key), §16.16 (`fido-u2f`).
-- **Deferred-format structural rejection:** §16.13 (`tpm`) and §16.14 (`android-key`) real spec
-  vectors fed to `verifyAttestation`, proving `error.UnsupportedFormat` fires on real (not
-  synthetic) inputs.
+- **Assertion:** §16.2 (ES256, `none`), §16.3 (ES256, `packed` self-attested), §16.10 (RS256,
+  `packed` x5c), §16.11 (EdDSA, `packed` x5c) and §16.16 (`fido-u2f`-registered credential, ES256
+  assertion).
+- **Attestation, the three implemented formats:** §16.2 (`none`), §16.3 (`packed` self),
+  §16.7/§16.10/§16.11 (`packed` x5c/basic — ES256/RS256/EdDSA credentials, all signed by the
+  shared spec-CA's EC P-256 attestation key), §16.16 (`fido-u2f`).
+- **Structural rejection of unsupported formats:** §16.13 (`tpm`) and §16.14 (`android-key`) real
+  vectors fed to `verifyAttestation` give `error.UnsupportedFormat`.
+- **Registration ceremony:** all six implemented §16 registration vectors verify through
+  `verifyRegistration` against their own separately-stated `registration_challenge`, `rp_id` and
+  `origin`.
 
-The registration ceremony is anchored on the same corpus: all six implemented §16 registration
-vectors verify through `verifyRegistration` against their own separately-stated
-`registration_challenge`, `rp_id` and `origin`.
+Adversarial reject-teeth (`assertion_test.zig`, `attestation_test.zig`): each tampers exactly one
+input off a real-vector baseline (or, for the ceremony-binding tests, tampers nothing and supplies
+a genuine §16 artefact from the wrong ceremony) and asserts the specific typed error: authenticator
+data byte, signature byte, `clientDataHash`, `rpId`, User Present cleared, User Verified required
+but clear, challenge, origin, `type` (registration clientData replayed as an assertion and the
+reverse), a registration response replayed into a ceremony whose issued challenge was another
+vector's, `require_attestation` against `fmt == "none"` and against `self`, registration User
+Present cleared, extension data (ED) with no map / a non-map / a truncated map / a byte after the
+map, trailing bytes with ED clear after the key and after signCount, BE=0 with BS=1,
+`credentialIdLength` past 1023, duplicate COSE labels in a credential key and duplicate keys in the
+attestation object, a `fido-u2f` `x5c` with two elements or none, an `attStmt.alg` that disagrees
+with the certificate's own key, an attestation certificate below the RSA modulus floor,
+cross-algorithm and cross-credential key swaps, a non-empty `attStmt` on `fmt == "none"`, and an
+unrecognized `fmt`. Two ED-set `authenticatorData` blobs produced and read back by Yubico's
+python-fido2 2.2.1 as a black-box oracle (registration with `credProtect` + `hmac-secret`,
+assertion with `hmac-secret`) pin the extension parse.
 
-Adversarial reject-teeth (`assertion_test.zig`/`attestation_test.zig`, each tampering exactly one
-input off a real-vector baseline — or, for the ceremony-binding tests, tampering *nothing* and
-supplying a genuine §16 artefact from the wrong ceremony): tampered `authenticatorData` byte,
-tampered signature byte, tampered `clientDataHash`, wrong `rpId`, User Present flag cleared, User
-Verified required-but-clear, wrong challenge, wrong origin, wrong `type` (registration clientData
-replayed as an assertion, and §16.2's real assertion clientData replayed as a registration),
-a valid §16.2/§16.7 registration response replayed into a ceremony whose issued challenge was a
-different vector's, `require_attestation` against `fmt == "none"` **and against `self`**
-(which proves nothing about the authenticator and leaves no certificate to chain),
-registration User Present cleared, extension data (ED) with no map, a non-map, a truncated map
-and a byte after the map, trailing bytes with ED clear after the key and after signCount — against
-two ED-set authenticatorData blobs produced and read back by Yubico's python-fido2 2.2.1 as a
-black-box oracle (registration with `credProtect` + `hmac-secret`, assertion with `hmac-secret`),
-BE=0 with BS=1, `credentialIdLength` past 1023, duplicate COSE labels in a credential key and
-duplicate keys in the attestation object, a `fido-u2f` `x5c` with two elements, an empty `x5c`,
-an `attStmt.alg` that disagrees with the certificate's own key, an attestation certificate below
-the RSA modulus floor,
-cross-algorithm key swap (EdDSA key against an ES256 assertion), cross-credential key swap (right
-algorithm, wrong actual key), non-empty `attStmt` on `fmt=="none"`, and an unrecognized `fmt`
-string. Run: `zig build test-webauthn`.
+The §16 corpus is structurally blind in places: every registration vector has UP set and ED clear,
+none carries an illegal BE/BS pair, none has an attestation certificate with the AAGUID extension
+or a non-P-256 key, and `fuzzRegistrationBinding` only feeds real vectors. A corpus that cannot
+express the input a check refuses does not pin that check, so synthetic inputs close those gaps:
+the re-audit block of `attestation_test.zig`; an `authData` with AT set at 53 and 54 octets;
+`verifySignature` with a mismatched curve or algorithm for each key family (EC2 on secp256k1, OKP
+on X25519, RSA under ES256, a valid signature under the wrong `alg`) and the RS256 credential floor
+exactly (2047 bits refused, 2048 verifies); attestation certificates with Ed25519 and RSA-2048 keys
+(accepted with their own `alg`, `UnsupportedAlgorithm` under another, `BadSignature` with one
+flipped octet) and a P-384 key under ES256; the AAGUID extension (a different AAGUID is
+`AaguidExtensionMismatch`, the right octets as a UTF8String are `InvalidCertificate`); `fido-u2f`
+with a non-P-256 credential key (`InvalidKey`, §8.6 step 3). The certificates and RSA keys are
+synthetic: `src/attestation_fixtures.zig`, produced by `tools/gen_attestation_fixtures.py` (python
+`cryptography`; signatures over §16.7's `authData ‖ clientDataHash`). ES384 / ES512 are covered
+with in-test keys generated through `p384` / `p521` (round trip, tampering, curve/alg mismatches,
+wrong-length coordinates, an off-curve point); the W3C set has no P-384/P-521 credential, so there
+is no external vector for them.
 
-### Mutation run 2026-10-05
+- **Fuzz:** `WEBAUTHN_FUZZ` (the deterministic driver; `_ONLY`, `_MS`, `_SEEDFILE`, `_INPUT` as
+  testkit documents; `src/fuzz_test.zig`): `webauthn-assertion` and `webauthn-registration` over the
+  six §16 ceremonies (a genuine one is accepted, damage to the authenticator data, clientDataJSON,
+  signature or COSE key is refused with a typed error; `none` and an unchained `x5c` statement
+  are required only not to crash), plus the script-driven harnesses of `parseClientData`,
+  `parseAuthenticatorData`, `verifyAttestation` and the registration binding, each with reach
+  counters.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Mutant schemata over a copy of `src/` (one ReleaseSafe build with the whole dependency closure,
-74 tests, `setsid -w timeout -s KILL 20` per mutant): **54 mutants, all 54 killed after 7 new
-tests**. Points: the RSA COSE key labels, every `authData` length/limit/flag rule and the
-signCount byte order, `verifySignature`'s curve/alg/length/floor checks and each verifier's
-result, every assertion and registration ceremony check (type, challenge, origin, rpIdHash,
-UP, UV, the clientDataHash input and the signed message order), the AAGUID extension (tag,
-comparison, whether it is consulted), every attestation-certificate arm (curve, alg, floor,
-verifier result), `x5c` cardinality, the `packed` attestation type, `fido-u2f`'s curve and
-reserved byte, `none`'s empty statement, `require_attestation` and `allowed_algorithms`.
+## What is deliberately not done
 
-First pass: 16 survivors. **No defect in the code; all 16 were test gaps** — the W3C §16 corpus
-only has ES256 attestation certificates, none with the AAGUID extension:
+- **Account-recovery / backup codes** — a product-level fallback layered above WebAuthn, not part of
+  the W3C verification procedure; a recovery-code scheme is an ordinary shared-secret/OTP check (the
+  sibling `otp` module has HOTP/TOTP) with its own storage and rate-limiting concerns.
+- **Options generation, credential and session model, FIDO MDS download** — verification-only by
+  design; the caller owns challenge issuance and freshness, credential storage and the metadata
+  fetch.
+- **Signature-count monotonicity (WebAuthn §6.1.1)** — a stateful comparison against the stored
+  value is a caller/storage-layer concern; `signCount` is returned for it.
+- **A `crossOrigin` / `topOrigin` policy** — parsed into `ClientData.cross_origin`, not enforced.
 
-- An `authData` with AT set and 54 octets: with the header check one octet short, reading
-  `credentialIdLength` went past the buffer (`index 55, len 54` in ReleaseSafe; an
-  out-of-bounds read in ReleaseFast). Pinned at 53 and 54 octets.
-- `verifySignature` with a mismatched curve or algorithm for each key family (EC2 on secp256k1,
-  OKP on X25519, RSA under ES256, a valid signature under the wrong `alg`), and the RS256
-  credential floor exactly: 2047 bits refused, 2048 verifies.
-- Attestation certificates with Ed25519 and RSA-2048 keys: accepted with their own `alg` and a
-  valid signature, `UnsupportedAlgorithm` under another, `BadSignature` with one flipped octet;
-  a P-384 key under ES256 is `UnsupportedAlgorithm`.
-- The id-fido-gen-ce-aaguid extension (§8.2.1): a different AAGUID is
-  `AaguidExtensionMismatch`, the right octets as a UTF8String are `InvalidCertificate`.
-- `fido-u2f` with a non-P-256 credential key is `InvalidKey` (§8.6 step 3).
+## Backlog / deferred
 
-The certificates and RSA keys are synthetic: `src/attestation_fixtures.zig`, generated by
-`tools/gen_attestation_fixtures.py` (python `cryptography`; signatures over §16.7's
-`authData ‖ clientDataHash`).
-
-## Status
-
-`extract · any · util · reentrant` + deps `cbor`, `rsa`, `p256`, `x509` — canonical source is
-`pub const meta` in `src/root.zig`. Assertion verify: ES256/EdDSA/RS256, complete. Attestation
-verify: `none`/`packed`/`fido-u2f`, complete; `tpm`/`android-key` deferred (see above).
+- **`apple` anonymous attestation (§8.8), `android-key` (§8.4), then `tpm` (§8.3)** — go-webauthn
+  supports them; an RP that requires direct attestation from Apple, Android or Windows Hello devices
+  cannot use this module. `apple` is small (the nonce extension), `android-key` medium (the Android
+  Keystore X.509 extension, OID `1.3.6.1.4.1.11129.2.1.17`, a nested `KeyDescription` /
+  `AuthorizationList`), `tpm` large (TCG `TPMS_ATTEST`/`TPMT_SIGNATURE`/`TPMT_PUBLIC` structs: a
+  third wire format, plus `certInfo`/`pubArea` binding and an EK/AIK chain for full trust). Until
+  built, `verifyAttestation` recognizes `fmt == "tpm"` / `"android-key"` and returns
+  `error.UnsupportedFormat` instead of half-parsing (a partially checked attestation is a false
+  sense of security). Fits §2.
+- **Attestation trust-chain validation hook** — chain `x5c` to a caller store via
+  `x509.verifyChain` and expose the leaf and intermediates in the result (today only
+  `AttestationResult.leaf_cert_der`, and `.basic` means only "the statement is internally
+  consistent"); go-webauthn plus MDS answers "is this a genuine model". Needs a trust-store/MDS
+  design decision this module should not make unilaterally for every caller (the MDS download itself
+  is the caller's I/O). Effort: medium. Fits §2.
+- **Typed decoders for authenticator extension outputs** (`credProtect`, `hmac-secret`,
+  `credProps`) — returned raw today; add if a consumer wants them.
 
 ## Anchoring
 
@@ -295,13 +277,3 @@ verify: `none`/`packed`/`fido-u2f`, complete; `tpm`/`android-key` deferred (see 
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** W3C sec.16 vectors, cross-checked vs go-webauthn's re-hosting of same vectors
-
-## Backlog / deferred
-
-- ~~**authenticatorData extension data (ED flag) instead of `ExtensionsNotSupported`**~~ (survey 2026-09-30) — **DONE 2026-09-30** with `cbor.decodePrefix` (see "Design & invariants"). Open beside it: typed decoders for `credProtect`/`hmac-secret`/`credProps` outputs, if a consumer wants them.
-- **`apple` anonymous attestation (§8.8) and `android-key` (§8.4), then `tpm` (§8.3)** (survey 2026-09-30). go-webauthn supports them; an RP that requires direct attestation from Apple, Android or Windows Hello devices cannot use this module. `apple` is small (nonce extension), `android-key` medium, `tpm` large (TPM 2.0 structs). Fits §2.
-- **Attestation trust-chain validation hook (chain `x5c` to a caller store via `x509.verifyChain`, expose the leaf and intermediates in the result)** (survey 2026-09-30). Today `.basic` means only "statement is internally consistent"; go-webauthn plus MDS answers "is this a genuine model". Effort: medium. Fits §2 (MDS download itself is the caller's I/O).
-- ✅ DONE 2026-11-16 (`verifySignature` accepts COSE alg -35 with crv 2 (P-384, `p384.EcdsaP384Sha384`) and alg -36 with crv 3 (P-521, `p521.EcdsaP521Sha512`); any crv/alg mismatch is `UnsupportedAlgorithm`, no low-S requirement, same as ES256; in-test keys only, no external vector. Attestation: the packed x5c leaf-certificate path stays P-256-only (SPEC scope is the assertion algorithms), so a P-384 attestation cert is still `UnsupportedAlgorithm`; self-attestation and the credential key go through `verifySignature` and therefore gain ES384/ES512) **ES384 / ES512 (COSE -35/-36) assertion algorithms** (survey 2026-09-30). Registered COSE algorithms some authenticators/policies offer; go-webauthn handles them *(inferred)*. Effort: small (std P-384). Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-

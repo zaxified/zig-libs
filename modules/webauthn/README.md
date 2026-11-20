@@ -9,8 +9,11 @@ CBOR/COSE — not a new crypto implementation.
 
 **Status: assertion verify complete (ES256/ES384/ES512/EdDSA/RS256). Attestation verify
 complete for `none`/`packed`/`fido-u2f`; `tpm`/`android-key` structurally
-DEFERRED (`error.UnsupportedFormat`, not half-implemented).** See `SPEC.md`
-for the full threat model and deferred-work rationale.
+not supported (`error.UnsupportedFormat`, not half-implemented).** See `SPEC.md`
+for the full threat model and *Backlog / deferred*.
+
+**Deps:** `cbor` (CBOR/COSE), `rsa`, `p256`, `p384`, `p521`, `x509` (certificate parsing through
+`x509.safe`, the AAGUID extension walk).
 
 | File | Contents |
 |---|---|
@@ -18,7 +21,9 @@ for the full threat model and deferred-work rationale.
 | `vectors.zig` | W3C WebAuthn Level 3 §16 official test vectors, mechanically extracted from the spec text (not hand-transcribed) |
 | `clientdata_test.zig` | `clientDataJSON` parsing — real-vector + adversarial |
 | `assertion_test.zig` | `verifyAssertion` — real-vector anchors (ES256/EdDSA/RS256) + reject-teeth |
-| `attestation_test.zig` | `verifyAttestation`/`verifyRegistration` — real-vector anchors (`none`/`packed`/`fido-u2f`) + deferred-format + ceremony-binding and statement reject-teeth |
+| `attestation_test.zig` | `verifyAttestation`/`verifyRegistration` — real-vector anchors (`none`/`packed`/`fido-u2f`) + unsupported-format + ceremony-binding and statement reject-teeth |
+| `attestation_fixtures.zig` | synthetic attestation certificates and RSA keys (producer `tools/gen_attestation_fixtures.py`) |
+| `fuzz_test.zig` | `WEBAUTHN_FUZZ` deterministic fuzz harnesses over the §16 ceremonies |
 
 Provenance: clean-room from the W3C WebAuthn Level 3 recommendation, a public
 specification; the §16 test vectors were fetched from w3.org and mechanically
@@ -96,7 +101,7 @@ response carried **no** attestation statement: legitimate (§7.1 step 20, and
 what most platform authenticators send), and accepted by default, but nothing
 about the authenticator was proven — set `require_attestation` to refuse it.
 Even `.basic` only means the statement is internally consistent; no chain is
-built (see `SPEC.md` "Deferred").
+built (see `SPEC.md` *Backlog / deferred*).
 
 If you are splitting the ceremony and have already done those checks
 yourself, `verifyAttestation(allocator, attestation_object, client_data_hash)`
@@ -104,7 +109,7 @@ verifies the attestation **statement** alone. It cannot check the ceremony —
 it never sees the clientDataJSON.
 
 `tpm`/`android-key` attestation objects return `error.UnsupportedFormat` —
-see `SPEC.md` "Deferred" for why, and what it would take to add them.
+see `SPEC.md` *Backlog / deferred* for why, and what it would take to add them.
 
 ### Signature verification alone
 
@@ -118,6 +123,13 @@ try webauthn.verifySignature(key, alg, msg, sig);
 
 Every public function has a named error set (`ClientDataError`,
 `AuthDataError`, `SignatureError`, `AssertionError`, `AttestationError`,
-`KeyError`) — no panics, no OOB reads on attacker-controlled bytes; every
+`RegistrationError`, `KeyError`) — no panics, no OOB reads on attacker-controlled bytes; every
 rejection is a specific typed error, proven by the adversarial test suite
 (see `SPEC.md` "Verification").
+
+## Not provided
+
+Options generation and any credential or session model (verification only), FIDO MDS lookups and
+attestation trust-chain validation, the `tpm` / `android-key` / `apple` attestation formats, a
+signature-counter policy and a `crossOrigin` policy (both returned to the caller). See SPEC *What
+is deliberately not done* and *Backlog / deferred*.
