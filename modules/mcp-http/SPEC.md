@@ -15,13 +15,13 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Only READMEs, docs and the specification text were read: the official SDKs are mid-relicensing MIT→Apache-2.0 (playbook point 4), their source is off limits and was not opened. The spec page read was `modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http`.
 
-**Spec delta (verified from the 2026-07-28 page).** This revision changed Streamable HTTP: the GET stream endpoint, `Mcp-Session-Id` sessions, server-initiated JSON-RPC requests on SSE and `Last-Event-ID` resumption are all removed (a server that supports only 2026-07-28 answers GET/DELETE with 405 and ignores `Mcp-Session-Id` / `Last-Event-ID`). Added: every POST carries `MCP-Protocol-Version` (must match `_meta` in the body, else 400 `HeaderMismatch` -32020), `Mcp-Method` and `Mcp-Name` headers mirrored from the body and validated, optional `Mcp-Param-*` headers from `x-mcp-header` tool-schema annotations, 400 `UnsupportedProtocolVersionError`, 404 with -32601 for an unknown method, `X-Accel-Buffering: no` on SSE (SHOULD), Multi Round-Trip Requests (`InputRequiredResult`) instead of sampling/elicitation requests on the stream, long-lived change notifications via a `subscriptions/listen` SSE response, and closing the response stream as cancellation. This module implements the 2025-06-18 shape (sessions, drain-and-close GET, `Last-Event-ID` replay), which is what 2025-03-26…2025-11-25 clients use.
+**Spec delta between the revisions.** Verified from the 2026-07-28 page: that revision changed Streamable HTTP: the GET stream endpoint, `Mcp-Session-Id` sessions, server-initiated JSON-RPC requests on SSE and `Last-Event-ID` resumption are all removed (a server that supports only 2026-07-28 answers GET/DELETE with 405 and ignores `Mcp-Session-Id` / `Last-Event-ID`). Added: every POST carries `MCP-Protocol-Version` (must match `_meta` in the body, else 400 `HeaderMismatch` -32020), `Mcp-Method` and `Mcp-Name` headers mirrored from the body and validated, optional `Mcp-Param-*` headers from `x-mcp-header` tool-schema annotations, 400 `UnsupportedProtocolVersionError`, 404 with -32601 for an unknown method, `X-Accel-Buffering: no` on SSE (SHOULD), Multi Round-Trip Requests (`InputRequiredResult`) instead of sampling/elicitation requests on the stream, long-lived change notifications via a `subscriptions/listen` SSE response, and closing the response stream as cancellation. This module serves both: the 2026-07-28 rules per POST (see *Design & invariants*) and, next to them, the 2025-06-18 shape (sessions, drain-and-close GET, `Last-Event-ID` replay) that 2025-03-26…2025-11-25 clients use.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [modelcontextprotocol/java-sdk](https://github.com/modelcontextprotocol/java-sdk) | Java | MIT per API (source not read) | 3.7k | v2.0.1 (2026-08-19) | Official Java SDK *(inferred: HTTP transports)*. |
 | [muhammad-fiaz/mcp.zig](https://github.com/muhammad-fiaz/mcp.zig) | Zig | MIT | 39 | 0.0.6 (2026-09-14) | The only Zig MCP library found; HTTP through a separate httpx.zig dependency (per the sibling `mcp` survey, README only). |
 
-**Where we are ahead:** the only Zig Streamable HTTP server that is a `router` middleware over this repo's own `http`/`router`/`mcp`, with no other dependency; the 2025-06-18 contract is anchored to captured bytes of the official Python SDK; Origin allowlist built in, per-session peer scoping so one client cannot answer another's sampling request, bounded replay buffer and session cap, body cap (413), live progress over SSE. **Where we are behind:** since 2026-09-30 the 2026-07-28 transport is served (per-request era, header/body validation incl. `Mcp-Param-*`, MRTR, 400/404 statuses; `X-Accel-Buffering: no` was already sent by `http.sse`, which the survey's search of this module missed). Still behind: `subscriptions/listen` acknowledges nothing and closes at once, because `mcp` emits no change notifications to carry — a held-open listen stream waits on both; closing an SSE response cancels nothing inside a running handler (no cancellation seam in `mcp` yet); the session-era drain-and-close GET is not a held-open stream.
+**Where we are ahead:** the only Zig Streamable HTTP server that is a `router` middleware over this repo's own `http`/`router`/`mcp`, with no other dependency; the 2025-06-18 contract is anchored to captured bytes of the official Python SDK; Origin allowlist built in, per-session peer scoping so one client cannot answer another's sampling request, bounded replay buffer and session cap, body cap (413), live progress over SSE. **Where we are behind:** `subscriptions/listen` acknowledges nothing and closes at once, because `mcp` emits no change notifications to carry — a held-open listen stream waits on both; closing an SSE response cancels nothing inside a running handler (no cancellation seam in `mcp` yet); the session-era drain-and-close GET is not a held-open stream.
 
 ## Design & invariants
 
@@ -41,9 +41,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `application/json` (one result) or, when the client sends `Accept: text/event-stream`, a live
   SSE stream where each JSON-RPC line becomes one `data:` event (tool-call
   `notifications/progress` delivered as they happen); a pure notification → `202`. Clean-room from
-  the MCP "Streamable HTTP" transport spec (2025-06-18) + JSON-RPC 2.0 — see NOTICE. The
-  behavioral contract is verified against a live capture of the official `mcp` Python SDK (see
-  Verification below), superseding an earlier, unbacked claim of parity against a Dart reference.
+  the MCP "Streamable HTTP" transport spec (2025-06-18) + JSON-RPC 2.0 — see the README's
+  `Provenance:` line. The behavioral contract is verified against a live capture of the official
+  `mcp` Python SDK (see Verification below).
 - **Sessions (optional):** an `Mcp-Session-Id` is minted at `initialize` and validated thereafter
   (unknown → 404); `GET /mcp` opens a server→client SSE stream; `DELETE /mcp` tears it down.
 - **`GET` is drain-and-close, not held-open** — io-less handlers can't park a connection on a
@@ -70,16 +70,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   else changes behaviour. Set `Transport.stateless_responses = .single_client` to opt back in where
   the endpoint genuinely serves one client (a loopback bridge, a sidecar); on a multi-client
   endpoint that flag *is* a leak between clients and the transport cannot detect the difference,
-  which is why it is named, explicit and not the default. Before 2026-08-11 the promise "one session
-  cannot consume another's sampling reply" was written without this qualifier while the stateless
-  mode silently shared peer 0 — the promise was true of the configuration it described and false of
-  the default one. Latent, not exploited: only one consumer speaks HTTP/SSE today.
+  which is why it is named, explicit and not the default.
 - **The `application/json` body is exactly one JSON object.** The server may write several lines for
   one message (progress notifications, and now server→client requests) before the response line;
   only the last is the body and the earlier ones are pushed to the session's `GET` queue (dropped on
-  a stateless endpoint, which has no channel for them). Previously the whole capture was returned,
-  so any pre-response line would have concatenated multiple objects into one body — latent before
-  (only reachable via a progressToken in JSON mode), unavoidable once a tool can issue a request.
+  a stateless endpoint, which has no channel for them). Returning the whole capture would concatenate
+  several objects into one body.
+- **Session teardown.** `DELETE /mcp` (204) and `Sessions.close` both end a session; `close` marks it
+  closing, and its next `GET` drains what is queued, ends, and destroys it. Teardown and idle
+  eviction call `mcp.Server.forgetPeer` with the session's peer handle: the server keeps per-peer
+  handshake state and has no other way to learn that a session is gone, so without it dead sessions
+  would walk into `Server.max_peers` and new handshakes would be refused.
 - Built on `http` (streaming `ResponseWriter.flush` + `sse` encoder) + `router`; a `Lock` seam for
   the session store; size-capped bodies.
 - **Two revisions, per POST, decided by the body (`modern.zig`).** A body whose `params._meta` has
@@ -99,7 +100,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   modern-revision header on a session-era body is a mismatch; a session-revision header
   (`2025-06-18`/`2025-11-25`, sent by session clients after `initialize`) keeps the old path.
 - **The legacy fast path cannot be walked around.** Deciding the era needs the body parsed, which the
-  session path used to avoid (see `isInitialize`). A body with no backslash, no literal
+  session path alone avoids (see `isInitialize`). A body with no backslash, no literal
   `io.modelcontextprotocol/protocolVersion` and no modern-claiming header cannot be modern and skips
   the parse; any backslash forces it, because `mcp` decodes `\/` and `\u0070` in keys and would serve
   an escaped key statelessly — a substring test alone would have let such a body skip header
@@ -118,132 +119,128 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   filter, then the graceful-close result); here they are one SSE stream. See `mcp`'s SPEC for why it
   does not hold the stream open.
 
-## Threat model / out of scope
+## Threat model / limits
 
-- **Origin allowlist (DNS-rebinding guard):** `POST`/`GET` are gated by an `Origin` allowlist — the
-  documented MCP mitigation for a browser-based DNS-rebinding attack against a locally-bound
-  server.
-- **No auth of its own** — bearer/OAuth is layered in front by composing `aaa-gate`/`jwt` as
-  earlier middleware; this module does not authenticate callers.
-- **Session ids** are unguessable capability tokens for stream resumption, not an auth boundary;
-  the replay buffer is bounded (old events drop). No cross-process session sharing (single-server).
-  The session **peer handle** derived from them scopes response correlation only — it inherits the
-  session id's trust level and is not an authentication of the answering party.
+- **Origin allowlist (DNS-rebinding guard).** With `Transport.allowed_origins` non-empty, every
+  request to the endpoint path (any method) whose `Origin` header is present but not listed is
+  answered **403** before anything else; a request with no `Origin` (a non-browser client) is
+  allowed, since the attack this blocks is browser-driven. Empty accepts every origin (the dev
+  default; safe only where no browser can reach the port, or with auth in front). This is the
+  documented MCP mitigation for a browser-based attack against a locally-bound server.
+- **No auth of its own.** Bearer/OAuth is layered in front by composing `aaa-gate`/`jwt` as earlier
+  middleware; this module does not authenticate callers.
+- **Session ids are unguessable capability tokens, not an auth boundary.** An id is 128 bits from
+  `getrandom(2)` (`fillRandom`; it panics rather than return weak bytes), hex-encoded by
+  `sidhex.encode` instead of `std.fmt` `{x}`, which indexes a digit table by each secret nibble
+  (the ctgrind target `sid` measures that routine). Possession of the id is the entire gate on a
+  session's `GET`/`POST`/`DELETE`, so peer scoping holds only because an id cannot be guessed. The
+  session **peer handle** derived from it scopes response correlation only; it inherits the id's
+  trust level and is not an authentication of the answering party. Auth in front does not change
+  that: an authenticated tenant B who obtains tenant A's id is still tenant A. The replay buffer
+  is bounded (`replay_depth`, old events drop); there is no cross-process session sharing
+  (single server).
+- **A full session table heals, bounded.** `max_sessions` (10 000) bounds memory. When it is full,
+  `create` reclaims the least-recently-touched session **only if it has been idle past
+  `max_idle_ns`** (30 min), and the transport then calls `mcp.Server.forgetPeer` for it;
+  otherwise the new `initialize` is refused with **429**. Deliberately not a plain LRU: evicting
+  a live session to admit a new one would turn a flood into a cross-client denial, which is worse
+  than the outage an abandoned flood causes and then heals.
+- **Hostile bodies.** The body is capped (`max_body`, default 4 MiB, exactly that many bytes
+  accepted, one more is **413**). The pre-parse scanners (`isInitialize`, `correlatableResponse`)
+  run on unauthenticated bytes and are fuzzed: a member with no value (`{"a":}`) is "not a body",
+  never `Scanner.skipValue`'s `unreachable`.
+- **Not a security promise:** the stateless-endpoint 400 for correlatable responses is the
+  documented cost of the default, not a filter; `stateless_responses = .single_client` on a
+  multi-client endpoint leaks answers between clients and the transport cannot detect the
+  difference (see *Design & invariants*).
 
-  ⚠ *Unguessable* was a claim before it was true. Until 2026-09-02 an id was
-  `monoNs() ^ (@intFromPtr(store) *% K)` in its high half and a plain incrementing counter in its
-  low half, under a comment reading "hard to guess". It was not: bracketing a victim's
-  `initialize` with two of your own pins the counter exactly and cancels the process-constant `K`,
-  leaving the clock delta between two closely-spaced calls — **≈2^20 candidates**, each testable
-  as one `GET`. That was demonstrated end to end: read another session's pending
-  `sampling/createMessage` and answer it with forged content, which is exactly the cross-client
-  delivery the peer-scoping property above forbids. Ids are now 128 bits from `getrandom(2)`.
-  Note what auth in front does **not** buy you here: an authenticated tenant B guessing tenant A's
-  id is still tenant A.
-- **A full session table heals.** `max_sessions` bounds memory, but until 2026-09-02 nothing but
-  an explicit `DELETE` ever freed a session, so `max_sessions` abandoned `initialize`s locked
-  every later client out permanently — the cap turned an exhaustion into an outage that outlived
-  the attacker's connection. `create` may now reclaim the least-recently-touched session **once it
-  has been idle past `max_idle_ns`** (30 min). Deliberately not a plain LRU: evicting a live
-  session to admit a new one would turn a flood into a cross-client denial, which is worse.
-- **Out of scope:** TLS (the server's/a proxy's), rate limiting (`ratelimit`), and the older
-  HTTP+SSE dual-endpoint transport (only Streamable HTTP is implemented).
+## What is deliberately not done
+
+- **TLS** (the server's or a proxy's), **rate limiting** (compose `ratelimit`) and **authentication**
+  (compose `aaa-gate`/`jwt`).
+- **The older HTTP+SSE dual-endpoint transport.** Only Streamable HTTP is implemented.
 
 ## Verification
 
-Offline tests over the `http` server harness: POST→JSON and POST→202, SSE-on-POST progress
-delivery, Origin accept/reject, session assign/validate/unknown-404, GET drain-and-close with
-`Last-Event-ID` replay, `DELETE` teardown, and a `max_sessions` cap rejection (audit MED). Plus, for
-server→client requests: a response POST → 202 with the handler run, cross-session correlation
-refused (session B's answer leaves session A's request pending, and the request lands only on A's
-`GET` stream), the `application/json` body carrying exactly one object while the tool's elicitation
-goes to the session queue, and the SSE ordering (request event precedes the tool result).
-
-The peer-scoping promise is pinned by an **attacker's** test in each configuration, not a
-happy-path one — client A has a request outstanding, client B (who was never asked anything) posts
-a response carrying A's id — with an innocent third party's pending request as a bystander oracle,
-so "still pending" cannot pass for the wrong reason (nothing resolving anything). Session-ful: B's
-answer leaves both A's and C's requests pending, A's own answer resolves only A's. Stateless: B's
-answer is refused with 400 and so is A's, which is the *documented cost* of the default rather than
-a filter that happens to catch attackers; ordinary requests on the same endpoint are unaffected.
-Six mutations, each red on behaviour and attributed to a named test: dropping `mcp`'s peer check
-(session-ful test, on the leak assertion), forcing the transport's peer to a constant (session-ful
-test, on the genuine answer no longer arriving), giving every session the same handle (the
-tag-distinctness precondition — and, with that precondition disabled, the leak assertion itself),
-flipping the stateless default back to `.single_client` (stateless test, leak assertion), making
-the response detector never fire (same), and dropping its `!has_method` term (detector test — this
-one *survived* until a `{"id":1,"method":"tools/list","result":{}}` case was added, the only input
-that separates precision from safety here).
+Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
+`zig build check-examples -Dmodule=mcp-http`. All tests are offline, through a real `router` +
+`http.Server` over the in-memory `runWire` harness (raw HTTP bytes in, raw bytes out, no socket).
+- **Session-era transport:** POST to JSON and to 202; SSE-on-POST with live progress, a
+  notification to 202 with no stream, `stream = .off`; Origin accept / reject / absent; session
+  assign, validate, unknown 404, `DELETE` teardown (which also drops the server's handshake state
+  for that peer); `GET` streaming with `Last-Event-ID` replay, a malformed header replaying
+  everything, the replay depth evicting the oldest event, the heartbeat; the `max_sessions` cap, a
+  table filled by an abandoned flood healing while a busy one still refuses; `close()` ending the
+  session it marks; a session id carrying no counter and no clock; path pass-through and 405;
+  oversize 413 and the exact `max_body` boundary.
+- **Server-to-client requests:** a response POST is 202 with the handler run; the
+  `application/json` body carries exactly one object while a tool's outbound request goes to the
+  session queue; in SSE mode the request event precedes the result. The peer-scoping promise is
+  pinned by an **attacker's** test in each configuration, not a happy-path one: client A has a
+  request outstanding, client B (never asked anything) posts a response carrying A's id, with an
+  innocent third party's pending request as a bystander oracle so "still pending" cannot pass for
+  the wrong reason. Session-ful: B's answer leaves both pending and A's own answer resolves only
+  A's. Stateless: B's answer is refused with 400, and so is A's, the documented cost of the
+  default; `.single_client` really does correlate any client's answer (its cost, pinned too).
+  `correlatableResponse` is pinned to exactly the shapes `mcp` routes to `deliverResponse`, including
+  the `{"id":1,"method":"tools/list","result":{}}` case that separates precision from safety.
+- **Stateless-revision transport** (`src/modern.zig` and the router tests): header/body rules anchored on
+  the specification page's own `execute_sql` request and its Base64 encoding table, every required
+  header dropped, duplicated and changed in turn, the escaped-key and duplicated-version-header
+  bypasses, `Mcp-Param-*` against `x-mcp-header` schemas; over the router: a stateless service with
+  sessions configured, the 400/404/200 statuses, SSE versus a lone-response `application/json`,
+  the `subscriptions/listen` stream, a two-round multi round-trip tool, and the session era
+  unchanged under a session-revision header.
+- **Fuzz:** the deterministic driver `MCP_HTTP_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY` selects
+  a harness) over `mcp-http-pre-parse` (the two JSON scanners) and `mcp-http-wire` (whole raw HTTP
+  requests against a router with two live sessions: a forged session id is 404, a foreign Origin
+  403, `DELETE` takes only its own session, damaged requests are answered or dropped); both also run
+  with a fixed number of seeds in every test run and must reach every outcome.
+- **ctgrind:** `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh mcp-http`, target `sid`
+  (the id bytes through `sidhex.encode`); the row is in `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ### Oracle: a real captured session from the official `mcp` Python SDK
 
-This module's README/NOTICE previously described the behavioral contract as "cross-checked for
-parity against a reference Dart server (`mcp_dart`)" with no captured bytes and no live check
-behind that claim — the worst of the false-anchor shapes, since it told a reader the opposite of
-the truth. Fixed: a single live run of the **official `mcp` Python SDK** (modelcontextprotocol.io,
-package `mcp` 2.0.0) — its real `ClientSession` + `streamable_http_client` talking to its real
-`MCPServer.streamable_http_app()` (via uvicorn) over an actual loopback TCP connection, with a raw
-byte-logging proxy observing (not altering) the exchange — captured `initialize`,
-`notifications/initialized`, `GET` session-stream open, `tools/list`, and two `tools/call`s (one
-with two live `notifications/progress` events), through `DELETE`. Frozen once in
-`oracle_vectors.zig`; `root.zig`'s "oracle:" tests replay those exact request bytes through this
-module's own `Transport` (offline, the same in-memory `runWire` harness every other test uses — no
-socket) and assert:
+The session-era contract is anchored to one live run of the **official `mcp` Python SDK** (package
+2.0.0): its real `ClientSession` + `streamable_http_client` talking to its real
+`MCPServer.streamable_http_app()` (via uvicorn) over a loopback TCP connection, with a raw
+byte-logging proxy observing the exchange. It captured `initialize`, `notifications/initialized`,
+the `GET` session-stream open, `tools/list`, and two `tools/call`s (one with two live
+`notifications/progress` events), through `DELETE`. The bytes are frozen in `src/oracle_vectors.zig`
+(its doc comment holds the full recap); `root.zig`'s `oracle:` tests replay the request bytes
+through this module's own `Transport` and assert:
 
 | Piece | Assertion |
 |---|---|
 | `initialize` | this module's response negotiates the identical `protocolVersion` the real SDK did, and mints a session id |
-| `notifications/initialized` | → `202`, matching the reference server |
+| `notifications/initialized` | -> `202`, matching the reference server |
 | `tools/list` | lists this module's tools, matching the real response's tool names |
 | `tools/call` (`echo`) | `structuredContent` byte-comparable to the real captured value (both use the same `{"result": <value>}` wrapping) |
-| `tools/call` (`work`) | the two `notifications/progress` SSE frames are asserted **as literal substrings of this module's own output** — this module's field order (`jsonrpc, method, params.{progressToken,progress,total,message}`) is identical to the reference server's, so this is a byte-exact match, not merely a parsed-and-compared one |
+| `tools/call` (`work`) | the two `notifications/progress` SSE frames are asserted as literal substrings of this module's own output; the field order (`jsonrpc, method, params.{progressToken,progress,total,message}`) is identical to the reference server's, a byte-exact match |
 
-Two differences the capture surfaced, both confirmed benign (not bugs — recorded because they were
-observed, not assumed): the reference server's `GET` stream never closed on its own (a genuine
-held-open long-poll) where this module is deliberately drain-and-close (documented above — an
-io-less handler cannot park a connection); and `DELETE` got `200 OK` from the reference vs. this
-module's `204 No Content` (both valid 2xx responses; the spec does not mandate one). A third,
-cosmetic-only difference: the reference names every SSE event `event: message` explicitly, this
-module omits `event:` — WHATWG SSE defines the absent case as the same default type, so the two are
-wire-identical to any `EventSource`. See `oracle_vectors.zig`'s doc comment for the full capture
-recap and provenance. `mcp` run as a black-box test oracle needs no root `NOTICE` entry (§0); no
-`mcp_dart`, the official SDK, or any other MCP-transport source was ported or copied.
-
-The suite includes the oracle replays above, tests from the 2026-08-11
-peer-scoping pass, the 2026-09-02 `mcp` per-peer-state follow-on, and the 2026-07-28
-transport (2026-09-30): `modern.zig`'s header/body rules anchored on streamable-http.mdx's own
-`execute_sql` request and its Base64 encoding table (every required header dropped, duplicated and
-changed in turn; the escaped-key and duplicated-version-header bypasses), and eight over the router
-(stateless service with sessions configured, 400/404/200 statuses, SSE vs lone-response JSON, the
-listen stream, a two-round MRTR tool, `Mcp-Param-*`, and the session era under a session-revision
-header). (Test counts are deliberately not kept here; `scripts/lib/dark-tests.sh`
-asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
+Differences the capture surfaced, all benign: the reference server's `GET` stream never closes on its
+own (a held-open long-poll) where this module is deliberately drain-and-close (an io-less handler
+cannot park a connection); `DELETE` got `200 OK` from the reference and `204 No Content` here (both
+valid 2xx); the reference names every SSE event `event: message` explicitly and this module omits
+`event:`, which WHATWG SSE defines as the same default type. The SDK ran as a black-box test
+oracle only: no SDK or other MCP-transport source was ported or copied. The capture is of the
+session-era shape; the stateless-revision transport is anchored to the specification text, not to
+an SDK run (see *Backlog / deferred*).
 
 ## Backlog / deferred
 
-- **Spec revision 2026-07-28 — phase M5 of the `mcp` module's PLAN: DONE 2026-09-30** (see "Design &
-  invariants"). Open from it: a held-open `subscriptions/listen` (needs change notifications in `mcp`
-  and a held-open response in `http`); cancellation reaching a running handler (needs a seam in `mcp`);
-  a differential run against an official SDK client speaking 2026-07-28 (the python-sdk oracle here is
-  the 2025-06-18 capture).
-
-- Reviewed 2026-07-10 (adversarial security pass) as part of the `http` parser-cluster re-audit
-  (body/multipart/mcp-http/webhooksig/cookies/range/conneg) — clean; the cluster's redirect
-  Authorization-stripping and cross-origin Cookie-leak fixes (both HIGH) landed in `http` itself.
-- No functional backlog beyond the explicit out-of-scope list above (module README has no Deferred
-  section).
-
-- ~~(survey 2026-09-30) **Spec 2026-07-28 request metadata**~~ — **DONE 2026-09-30** (M5). Was: validate `MCP-Protocol-Version` (400 `UnsupportedProtocolVersionError` / `HeaderMismatch` -32020), `Mcp-Method` and `Mcp-Name` (incl. the `=?base64?...?=` sentinel decoding) against the body; optional `Mcp-Param-*` from `x-mcp-header`. A client of the current official SDKs sends these on every POST and expects header-body mismatches to be rejected. Effort: small-medium; needs the `mcp` core to read per-request `_meta` (its own backlog). Fits CONVENTIONS §2.
-- ~~(survey 2026-09-30) **Stateless 2026-07-28 mode**~~ — **DONE 2026-09-30** (M5; GET/DELETE stay for session clients when `sessions` is set). Was: no initialize handshake, no sessions, GET/DELETE -> 405 while ignoring `Mcp-Session-Id` / `Last-Event-ID`, MRTR (`InputRequiredResult`) instead of server-initiated requests, closing the response stream = cancellation. Effort: medium-large, mostly in `mcp`. Fits §2. Keep the 2025-06-18 session mode for older clients (the spec's own backward-compat guidance).
-- (survey 2026-09-30) **`subscriptions/listen` long-lived SSE response** — the only push channel in 2026-07-28 (list-changed, resource updates). The io-less handler cannot park a connection today (see *GET is drain-and-close*); needs a held-open response API in `http`. Effort: large; depends on `http`. Fits §2. PARTIAL (2026-09-30): `subscriptions/listen` is acknowledged with its filter and then closed gracefully (the test "subscriptions/listen is the acknowledgment then the graceful close"); the held-open push stream is still missing.
-- ~~(survey 2026-09-30) **`X-Accel-Buffering: no` on SSE responses**~~ — already sent: `http.sse.EventStream.start` sets it on every stream (the survey searched this module only). Pinned by the 2026-07-28 SSE test.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · server · reentrant (session store: Lock seam)` + deps: `router`, `http`, `mcp` —
-canonical source is `pub const meta` in src/root.zig.
+- **Held-open `subscriptions/listen`** (2026-07-28's only push channel: list-changed, resource
+  updates). Today `subscriptions/listen` is acknowledged with its filter and then closed
+  gracefully (test "subscriptions/listen is the acknowledgment then the graceful close"); a
+  held-open stream needs change notifications in `mcp` and a held-open response API in `http` (the
+  io-less handler cannot park a connection today, see *GET is drain-and-close*). Effort: large;
+  depends on `http` and `mcp`.
+- **Cancellation reaching a running handler.** A closed SSE response stops the writes but cannot
+  interrupt the handler; needs a cancellation seam in `mcp`.
+- **A differential run against an official SDK client speaking 2026-07-28.** The python-sdk oracle
+  above is the 2025-06-18 capture; the 2026-07-28 rules are anchored to the specification text.
 
 ## Anchoring
 
@@ -253,5 +250,3 @@ canonical source is `pub const meta` in src/root.zig.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
-
-**How it got there.** The anchoring work landed. DONE 0341464: real MCP Python SDK session; unbacked mcp_dart parity claim RETRACTED

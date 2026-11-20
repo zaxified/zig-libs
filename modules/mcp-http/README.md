@@ -46,7 +46,8 @@ This module does no authentication. Bind to loopback for a local integration,
 or put auth in front: register an `aaa-gate` / `jwt` middleware **before** this
 one (MCP has no read/write method split, so gate every POST). The MCP spec also
 requires validating the `Origin` header against DNS-rebinding for locally-bound
-servers — do that with a dedicated middleware or a reverse proxy.
+servers: set `Transport.allowed_origins` (exact match; a present but unlisted
+`Origin` gets 403, no `Origin` is allowed, empty accepts every origin).
 
 **Server→client answers need a session.** A stateless endpoint cannot attribute
 a client's response to a `sampling`/`elicitation` request — every POST is peer
@@ -63,26 +64,23 @@ as `jwt.Lock`) to serialize `handleMessage`, or run the server single-threaded.
 Body reads and response framing happen outside the lock.
 
 - **Role:** server. **Platform:** any. **Deps:** `router`,
-  `http`, `mcp`.
+  `http`, `mcp`, `clock`.
 
 Provenance: clean-room from the MCP Streamable HTTP transport specification
-(2025-06-18) + JSON-RPC 2.0. Earlier revisions of this note claimed the
-behavioral contract was "cross-checked for parity against a reference Dart
-server (`mcp_dart`)" — no captured bytes or live check ever backed that claim,
-so it is corrected here: this module's Streamable HTTP transport is verified
-against a single live capture of the **official `mcp` Python SDK**
+(2025-06-18 and 2026-07-28) + JSON-RPC 2.0. The session-era transport is
+verified against a single live capture of the **official `mcp` Python SDK**
 (modelcontextprotocol.io, the specification's own reference implementation) —
 its real client and real server, talking over an actual loopback connection —
 frozen offline in `oracle_vectors.zig` and replayed through this module's own
 `Transport` with no socket at test time. See `SPEC.md`'s Verification section
-for exactly what that capture covers and two benign differences it surfaced.
-No `mcp_dart`, the official SDK, or any other MCP-transport source was ported
-or copied; the SDK ran only as a black-box test oracle.
+for exactly what that capture covers and the benign differences it surfaced.
+No SDK or other MCP-transport source was ported or copied; the SDK ran only as
+a black-box test oracle.
 
 ## Verification
 
-`zig build test-mcp-http` (or `scripts/modtest mcp-http`) — offline tests through a real
-`router` + `http.Server.serveStream`, in two groups:
+`scripts/modtest mcp-http` — offline tests through a real `router` +
+`http.Server`, in three groups:
 
 - built from the spec text directly: request/response (initialize,
   tools/list, tools/call, notification → 202), SSE-on-POST (streamed result,
@@ -90,12 +88,14 @@ or copied; the SDK ran only as a black-box test oracle.
   (match/mismatch/absent), sessions (assign + validate + 404 + DELETE, `GET`
   push + `Last-Event-ID` replay + heartbeat, unknown-session 404,
   `max_sessions` cap rejected), path pass-through / 405, oversized → 413.
+- the 2026-07-28 rules: header/body validation, statuses, SSE versus a lone
+  JSON answer, `subscriptions/listen`, multi round-trip requests.
 - tests replaying a real session captured once from the **official `mcp`
   Python SDK** (initialize, `notifications/initialized`, `tools/list`, two
   `tools/call`s — one with live progress notifications — all byte-exact
   against the captured request/response bytes; see `oracle_vectors.zig`).
 
-Green in Debug + ReleaseFast.
+Fuzz: `MCP_HTTP_FUZZ=<runs>`. SPEC *Verification* has the rest.
 
 ## Server→client requests (sampling / elicitation)
 
@@ -167,3 +167,11 @@ session-era clients on the same endpoint:
   session, no `stateless_responses` question. See `mcp`'s README.
 - **`subscriptions/listen`** is acknowledged with an empty filter and closed at
   once: `mcp` emits no change notifications yet.
+
+## Not provided
+
+TLS, rate limiting and authentication (compose `ratelimit`, `aaa-gate` /
+`jwt`; SPEC *What is deliberately not done*), the older HTTP+SSE dual-endpoint
+transport, and, open work (SPEC *Backlog / deferred*), a held-open
+`subscriptions/listen` stream and cancellation of a running handler when the
+client closes the stream.
