@@ -20,7 +20,10 @@ behaviour, exempt per root `NOTICE` §0.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — an
   initialized `Cors` is immutable; no clock, no locks, no hidden globals;
   the only allocation is the init-time join of the configured lists
-  (`deinit` frees it). Hot path reflects borrowed request slices only.
+  (`deinit` frees it). The hot path allocates nothing; the only per-request
+  copy is a client-chosen `Origin` or reflected `Access-Control-Request-Headers`
+  echoed into the response's bounded header store (one that does not fit is no
+  grant / an omitted header, never a failed response).
 - **Deps:** `router` (Middleware/Ctx/Next), `http` (`Request.header`,
   `ResponseWriter` setStatus/setHeader/end).
 
@@ -109,11 +112,6 @@ preflight headers are set (or not, when a gate fails), then the handler chain ru
 `OPTIONS` itself; no 204 is forced. Register an `OPTIONS` route (or the router 405s). A handler that
 sets `Vary` replaces the preflight `Vary`, as for actual requests.
 
-Not offered: rs/cors `Debug` logging (the hot path does no I/O; the pure gates `allowOriginValue`,
-`methodTokenAllowed`, `requestedHeadersAllowed` are public if you want to log a decision yourself) and
-`AllowOriginRequestFunc`/`AllowOriginVaryRequestFunc` (a request-aware origin decision needs its own
-`Vary` bookkeeping; see SPEC.md Backlog).
-
 ## Credentials vs the `*` wildcard (rejected at init)
 
 The Fetch standard forbids `Access-Control-Allow-Origin: *` on responses
@@ -122,9 +120,17 @@ origin while sending `Access-Control-Allow-Credentials: true` — grants
 every website on the internet credentialed access to your API.
 `Cors.init` therefore **rejects** `allowed_origins = .any` combined with
 `allow_credentials = true` with `error.CredentialsWithWildcardOrigin`
-instead of silently downgrading. If you genuinely need reflect-any with
+instead of silently downgrading; the same error is returned for a credentialed
+list (or `patterns.exact`) entry that is `"null"` (the origin of every sandboxed
+frame) or `"*"`. If you genuinely need reflect-any with
 credentials, write a `.predicate` that returns true — an explicit,
 greppable opt-in to the footgun.
+
+The other `init` refusals: `error.EmptyAllowedMethods`, `error.UnnamedAllowedMethod`
+(`.other` in `allowed_methods`: a preflight can only grant named methods),
+`error.InvalidOriginPattern`, `error.UnconditionalWildcardRequiresAnyOrigin`. An
+allowed origin or an allowed/exposed header holding CR/LF/NUL or another control
+byte panics at `init` in every build mode (the values go on the wire unchecked).
 
 ## Unconditional wildcard CORS (`allow_unconditional_wildcard`, opt-in deviation)
 
@@ -178,7 +184,9 @@ reasoning.
   `Origin` is present + allowed **and** the request method is in
   `allowed_methods` (rs/cors gate; `OPTIONS` always passes). `.any` emits
   the literal `*`; a list/predicate match echoes the specific origin and
-  adds `Vary: Origin`. Absent or disallowed `Origin` → nothing is set.
+  adds `Vary: Origin`. Absent or disallowed `Origin` → no CORS grant headers
+  (a list/patterns/predicate policy still sets `Vary: Origin`, so a cache does not
+  hand a header-less answer to an allowed page; `.any` and `.none` do not vary).
 - **Origin matching is an exact byte compare** (list) or your predicate.
   Configure the canonical serialization browsers send: lowercase scheme +
   host, no trailing slash, port only when non-default
@@ -265,30 +273,16 @@ wrap it and nothing to reapply. See SPEC.md "Header timing vs.
 `ResponseWriter.reset()`" for why the ordering itself was not changed
 instead.
 
+## Not provided
+
+rs/cors `Debug` logging (the pure gates `allowOriginValue`, `methodTokenAllowed`, `requestedHeadersAllowed`
+are public if you want to log a decision yourself), a request-aware origin function
+(`AllowOriginRequestFunc`/`AllowOriginVaryRequestFunc`) and `OptionsSuccessStatus` (a status other than 204)
+are not offered; reasons and the one open idea are in SPEC.md *What is deliberately not done* and
+*Backlog / deferred*.
+
 ## Verification
 
-`zig build test-cors` — offline goldens over the socket-free
-`http.Server.serveStream` (byte-exact 204 preflight with the full header
-set + handler-not-invoked proof; `.reflect` echo + absent-ACRH omission;
-each failing gate → 204 with `Vary` and zero CORS headers, including the
-byte-compare case-sensitivity check; preflight interception on would-be
-405 and 404 paths; plain `OPTIONS` routing normally with actual-request
-headers; actual-request echo + `Vary: Origin` + credentials + exposed
-headers; `.any` → `*` without `Vary`; disallowed/absent Origin and `.none`
-passthrough with the handler still running; the actual-request method
-gate; predicate origins on both request shapes; `*`+credentials init
-rejection; `allow_unconditional_wildcard` requires `.any` at init and, once
-set, emits the wildcard on an Origin-absent request and intercepts a bare
-`OPTIONS` with 204 (both sit beside the unchanged default in the same
-test); `max_age_s` 0/max formatting and the join precomputations),
-plus an in-process integration run (`router` + `http.Server` +
-`http.Client` over loopback: preflight `OPTIONS` → 204 + CORS headers with
-the handler never invoked; `GET` with an allowed `Origin` →
-`Access-Control-Allow-Origin` + `Vary`; a disallowed origin → no CORS
-headers) that only skips when loopback binding is unavailable.
-
-Added 2026-10-11 (rs/cors parity): subdomain-pattern matching incl. the evil shapes
-(`example.com.evil.net`, `evil.com/.example.com`, userinfo, scheme/port mismatch), `init` rejection of
-malformed patterns, credentials with patterns, a byte-exact golden for the private-network preflight
-(and the no-grant cases), pass-through of granted and failed preflights, and the pattern matcher in the
-`CORS_FUZZ` gates harness. Comparative benchmark: `zig build bench-cors` (against rs/cors v1.11.1).
+`scripts/modtest cors`. Offline goldens over the socket-free `http.Server.serveStream`, an in-process
+loopback integration run, a headless-Chrome replay (`tools/README.md`) and the `CORS_FUZZ` gates harness; the
+test classes are listed in SPEC.md *Verification*, the score is the card's `**Audit:**` line there.

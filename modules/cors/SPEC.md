@@ -19,7 +19,7 @@
 **Downstream consumer:** yes
 
 Cross-Origin Resource Sharing as a global `router` middleware. Usage: see ./README.md.
-Attribution/provenance: see /NOTICE.
+Provenance: the README's `Provenance:` line.
 
 ## Compared with
 
@@ -33,12 +33,30 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) `middleware.Cors` | Zig | MIT | 1.6k | no release (push 2026-08-26) | Built-in Zig CORS middleware for httpz (origin/methods/headers/max-age strings); tied to httpz *(README; origin handling inferred to be a single configured origin)*. Source not read. |
 | [corydolphin/flask-cors](https://github.com/corydolphin/flask-cors) 6.0.5 | Python | MIT | 933 | 6.0.5 (2026-06-08) | Black-box oracle in this module's tests (8-item divergence ledger judged against Fetch/RFC 9110); its default is the unsafe wildcard+credentials one. |
 
-**Where we are ahead:** the only Zig option that is not tied to one server (any `router`), secure defaults (`.none`, credentials-with-`*` refused at init, `Vary` always correct on intercepted preflights), a comptime `Static` posture that compiles to header slot writes, and an explicit migration hatch for APIs that stamp `*` on everything; wire output anchored to flask_cors with a judged divergence ledger; audited 2026-09-10. **Where we are behind:** ~~no origin wildcard patterns~~ DONE 2026-10-11 (`Origins.patterns`); ~~no `Access-Control-Allow-Private-Network`~~ DONE 2026-10-11 (`allow_private_network`); ~~no pass-through of preflights to the handler~~ DONE 2026-10-11 (`preflight_passthrough`); no debug logging and no request-aware origin function (`AllowOriginRequestFunc`/`AllowOriginVaryRequestFunc`) — both consciously rejected, reasons in Backlog. rs/cors's `OptionsSuccessStatus` (a status other than 204 for legacy clients) is also not offered (Backlog).
+**Where we are ahead:** the only Zig option that is not tied to one server (any `router`), secure defaults (`.none`, credentials-with-`*` refused at init, `Vary` always correct on intercepted preflights), a comptime `Static` posture that compiles to header slot writes, and an explicit migration hatch for APIs that stamp `*` on everything; wire output anchored to flask_cors with a judged divergence ledger. **Where we are behind:** no debug logging and no request-aware origin function (`AllowOriginRequestFunc`/`AllowOriginVaryRequestFunc`), both consciously rejected, and no `OptionsSuccessStatus` (a status other than 204 for legacy clients); the reasons are under *What is deliberately not done*.
 
 ## Design & invariants
 - **Immutable, reentrant:** an initialized `Cors` has no clock, no locks, no hidden globals; the
   only allocation is the init-time join of configured lists (freed by `deinit`). The hot path
-  reflects borrowed request slices only — safe across all connection threads.
+  allocates nothing and only reads the policy — safe across all connection threads.
+- **Header storage:** every value cors owns (methods, configured header lists, max-age,
+  credentials, `Vary`, configured origins) is written with `setHeaderStatic` / `setHeaderBorrowed`
+  and spends none of the response's bounded header-copy store (4 KiB). Only a value taken from the
+  request is copied: a client-chosen `Origin` echoed by `.predicate`/`.patterns`, and a reflected
+  `Access-Control-Request-Headers`. When such an echo does not fit (`error.HeaderBytesExhausted`
+  or `TooManyHeaders`), a request-derived origin counts as not granted (`Vary: Origin` is still
+  set) and a reflected `Access-Control-Allow-Headers` is omitted; the response is never turned into
+  a 500 that skips the handler (`setAllowOrigin`, the `.reflect` branches of
+  `writePreflightHeaders`). Because the borrowed values go on the wire unchecked, `Cors.init`
+  panics (`cors: ...`) in every build mode on a configured origin or header (list, exact patterns,
+  allowed or exposed headers) holding CR/LF/NUL or another control byte (`requireValue`).
+- **Matching details:** allowed methods compare byte for byte (RFC 9110; `fetch()` upper-cases
+  only DELETE/GET/HEAD/OPTIONS/POST/PUT, so a preflight for `patch` is not granted `PATCH`) and
+  `OPTIONS` always passes; configured `allowed_headers` names are trimmed of spaces and tabs before the
+  case-insensitive compare, as the browser reads the joined list.
+- **One pass over the head:** a preflight reads `Origin`, `Access-Control-Request-Method`,
+  `-Headers` and `-Private-Network` in one pass (`PreflightIn.gather`: first occurrence wins,
+  values OWS-trimmed, names case-insensitive, as `req.header`).
 - **Preflight always intercepted:** `OPTIONS` with `Access-Control-Request-Method` gets 204, no
   body, handler never runs — regardless of origin/route validity. CORS headers appear only when
   origin + requested method + requested headers all pass; a failed preflight is still 204 without
@@ -55,7 +73,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `allow_credentials = true` with `error.CredentialsWithWildcardOrigin` rather than silently
   downgrading; a `.predicate` returning true is the explicit, greppable opt-in.
 
-## Origin patterns, private network, pass-through (parity — rs/cors, 2026-10-11)
+## Origin patterns, private network, pass-through (parity — rs/cors)
 
 **Patterns** (`Origins.patterns = .{ .exact, .subdomains }`). rs/cors splits an `AllowedOrigins` entry at
 its first `*` into prefix and suffix and accepts any origin that starts with one, ends with the other and
@@ -138,7 +156,7 @@ The consequence: an *outer* middleware that calls `ResponseWriter.reset()` after
 replace a `text/plain` denial body with JSON — wipes every header `cors` set, `reset` clears the
 header list wholesale, and there is no way for `cors` to see that happen or be asked again
 automatically. `http.Server.ResponseWriter` has no snapshot/restore and no header-read primitive
-(the same gap the `Vary`-clobber hazard above lives on), and that lives in `http`, out of scope here.
+(the same gap the `Vary`-replace hazard in the threat model lives on), and that lives in `http`, out of scope here.
 
 **The fix lives entirely inside `cors`: `applyActual` is `pub`.** A response-rewriting middleware
 calls `your_cors.applyActual(ctx.req, ctx.res)` again immediately after its own `reset()`, before
@@ -175,81 +193,69 @@ the same replace-not-merge hazard for its `Vary`. Subdomain patterns grant every
 named zone: a dangling or user-controllable subdomain of it (takeover, user-content hosts) is then an
 allowed origin, which is the nature of the feature — pattern a zone you control end to end.
 
+## What is deliberately not done
+
+- **Debug logging** (rs/cors `Debug`/`Logger`): rejected. The hot path does no I/O and has no logger
+  dependency; the three pure gates are public, so a caller that wants to log a decision does so around them.
+- **Request-aware origin function** (rs/cors `AllowOriginRequestFunc`, `AllowOriginVaryRequestFunc`):
+  rejected for now. `.predicate` sees only the origin string. A decision that depends on other request
+  headers needs those names added to `Vary` (rs/cors needed a second function type for exactly that), the
+  gates are deliberately request-type-free (`allowOriginValue` is pure), and a caller can already decide per
+  request outside the middleware and call `applyActual`/`applyPreflight` directly. To be revisited when a
+  consumer has a tenant-by-`Host` case.
+- **`OptionsSuccessStatus`** (rs/cors, default 204; a few legacy clients choke on 204): not offered. No
+  consumer, and the pass-through lets a handler pick any status. Tiny to add if asked (one `u16` option).
+- **Applying `applyActual` after `next.run`:** rejected, see *Header timing vs. `ResponseWriter.reset()`*.
+
 ## Verification
-`zig build test-cors`. Offline goldens over the socket-free `http.Server.serveStream`:
-byte-exact 204 preflight + handler-not-invoked proof; `.reflect` echo + absent-ACRH omission; each
-failing gate → 204 with `Vary` and zero CORS headers incl. case-sensitivity; preflight interception
-on would-be 405/404; actual-request echo + `Vary: Origin` + credentials + exposed headers; `.any` →
-`*` without `Vary`; disallowed/absent Origin passthrough; the actual-request method gate; predicate
-origins; `*`+credentials init rejection; `allow_unconditional_wildcard` requires `.any` (init
-rejection) and, once set, emits the wildcard on an Origin-absent actual request and intercepts a
-bare `OPTIONS` with 204 (both cases also golden the default's unchanged behavior alongside);
-`max_age_s` formatting. rs/cors parity (2026-10-11): `patterns:` goldens over the pure gate for the
-granted shapes and 24 refused ones (`example.com.evil.net`, `evil.com/.example.com`, userinfo, empty
-labels, scheme/port mismatch, case), `init` rejection of 19 malformed patterns, credentials with
-patterns, wire echo + `Vary` for a pattern match, a byte golden for the private-network preflight and
-its no-grant cases (option off, header absent / not `true`, origin refused), pass-through of granted
-and failed preflights and the default's unchanged 204; the pattern matcher is reached by the `CORS_FUZZ`
-gates harness (`pattern_granted`/`pattern_refused`, with an independent oracle on every grant).
-Comparative benchmark `tools/bench.zig` (`zig build bench-cors`) against rs/cors v1.11.1. In-process integration (`router` + `http.Server` + `http.Client` over
-loopback): preflight → 204 + CORS headers with handler never invoked; allowed-origin `GET` →
-headers + `Vary`; disallowed origin → no CORS headers — skips only when loopback binding is
-unavailable.
 
-**Review + mutation (2026-10-23,** independent, Sonnet, over everything since `a1cc6e56` and today's
-one-pass preflight gather): no defect. Origin patterns refuse `evil-example.com`, `example.com.evil`,
-scheme and port mismatches; `Vary` is right on every path; `PreflightIn.gather` returns exactly what
-`req.header` did (first occurrence, OWS trim, case-insensitive names). 56 schemata mutants over the
-gates, the gather, `Vary` and the init checks: 44 killed at once, 11 by three new tests (header-name
-case and first-wins in the gather; `.any` without Origin and an empty reflected ACRH; byte-exact
-`patterns.exact` and the scheme prefix when lengths line up), 1 equivalent (`origin.len <= p + s`
-vs `<`: an empty middle splits into one empty label, which `validLabel` refuses either way).
+`scripts/modtest cors`; the browser-oracle re-take is `zig build interop-cors` (needs `bun` and
+`google-chrome`, see `tools/README.md`; the committed answers are replayed in the module's own lane without
+them). Test classes:
 
-**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 36
-mutants — every `init` rejection (credentialed `.any`, list `"null"`/`"*"`, wildcard without
-`.any`, empty methods), the wildcard preflight branch (bare-OPTIONS return, Allow-Methods,
-Max-Age), each preflight gate (origin, method, requested headers), the reflect overflow
-fallback (gated and static), credentials/Max-Age/`Vary` emission, the actual-request method
-gate, `Vary: Origin` (both directions), credentials and expose headers, the origin matcher
-(exact vs. case-folded vs. prefix), predicate and `.none`, OPTIONS always allowed, method and
-header case-insensitivity, the ACRH trim/empty/failure rules, the interception condition
-(both directions), `isPreflight` and the static reflect `Vary`. First run: 34 killed, 2 alive;
-two tests added (a list origin must match the whole serialization — a prefix match would grant
-`https://app.example.evil`; a bare OPTIONS under `allow_unconditional_wildcard` gets no
-preflight grant); rerun: 36 killed. No defect found.
+- **Offline goldens** over the socket-free `http.Server.serveStream`: byte-exact 204 preflight and
+  handler-not-invoked proof; `.reflect` echo and absent-ACRH omission; each failing gate gives 204 with
+  `Vary` and no CORS header, case-sensitivity included; preflight interception on would-be 405/404; actual-request
+  echo, `Vary: Origin`, credentials and exposed headers; `.any` gives `*` without `Vary`; disallowed or absent
+  Origin and `.none` pass through with the handler running; the actual-request method gate; predicate origins;
+  `max_age_s` formatting and the join precomputations.
+- **`init` refusals:** a credentialed `.any`, a credentialed list or exact entry `"null"`/`"*"`, the
+  unconditional wildcard without `.any`, empty and unnamed allowed methods, malformed subdomain patterns.
+- **Opt-in deviations:** `allow_unconditional_wildcard` (wildcard on an Origin-absent actual request, bare
+  `OPTIONS` intercepted, both beside the unchanged default) and the static posture.
+- **rs/cors parity:** `patterns` goldens over the pure gate for the granted shapes and a long list of
+  refused ones (`example.com.evil.net`, `evil.com/.example.com`, userinfo, empty labels, scheme/port mismatch,
+  case), credentials with patterns, wire echo and `Vary` for a pattern match, a byte golden for the
+  private-network preflight and its no-grant cases (option off, header absent or not `true`, origin refused),
+  pass-through of granted and failed preflights beside the default's unchanged 204.
+- **Header budget:** an outer middleware that leaves little of the header-copy store still gets the whole
+  grant on the gated and the wildcard paths; a long echoed `Origin` or reflected ACRH is not granted or omitted
+  rather than failing the response.
+- **Browser oracle:** headless Chrome replay, see *Anchoring*. The `interop (flask_cors oracle)` tests keep the
+  earlier flask_cors comparison.
+- **In-process integration** (`router` + `http.Server` + `http.Client` over loopback): preflight gives 204 and
+  the CORS headers with the handler never invoked; an allowed-origin `GET` gives the headers and `Vary`; a
+  disallowed origin gives no CORS headers. Skips only when loopback binding is unavailable.
+- **Fuzz:** one `gates` harness (`src/fuzz_test.zig`, driver prefix `CORS_FUZZ`): the three pure gates against
+  hostile header bytes, including the subdomain matcher (`pattern_granted`/`pattern_refused`, with an
+  independent oracle on every grant); a 500-seed reach test runs in every test run.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
 ## Performance
 
-**Fastest in the field, 2026-10-23** (`zig build bench-cors`). labstack/echo v5.4.2
-`middleware.CORS` (`tools/go_fast_bench`) and tower-http 0.7.1 `CorsLayer` over httparse
-(`tools/rust_fast_bench`); each side's own `plain` workload is subtracted, so the ratios are net
-of the HTTP stacks. Neither contender checks Access-Control-Request-Method or -Headers on a
-preflight (less work than ours and rs/cors), tower-http answers it 200 (compared as 204), neither
-has the `wildcard` subdomain patterns (that row is rs/cors only). Ours: preflight 1.13–1.23×
-tower-http (1.38× before the one-pass header gather, CHANGELOG), actual 0.50×, disallowed 0.56×;
-echo is slower than rs/cors on every row. The rest of the preflight cost is the HTTP server's
-(parsing the longer head, writing more headers), which tower-http's net pays the same way.
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-cors`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 14.4 %): ref 0.30–0.48×, against 0.23–0.58× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-cors` (`tools/bench.zig`) against rs/cors v1.11.1 (`tools/go_bench`), labstack/echo
+(`tools/go_fast_bench`) and tower-http `CorsLayer` over httparse (`tools/rust_fast_bench`); the card's
+Performance line carries the figures and is authoritative. Each contender's own `plain` workload is subtracted,
+so the ratios are net of the HTTP stacks. Neither echo nor tower-http checks Access-Control-Request-Method or
+-Headers on a preflight (less work than ours and rs/cors), tower-http answers it 200 (compared as 204), and
+neither has subdomain patterns (the `wildcard` row is rs/cors only). The rest of the preflight cost is the HTTP
+server's (parsing the longer head, writing more headers), which tower-http's net pays the same way.
 
 ## Backlog / deferred
-- **No-panic sweep 2026-10-29:** a client-chosen `Origin` (`.predicate`/`.patterns` echo) or reflected `Access-Control-Request-Headers` could exhaust the 4 KiB header-copy store and make a later `setHeader` fail → 500 with the handler skipped (CO-1; R2-1 from the independent review: the "fits but leaves too little" band). Fixed at the root: every value cors owns is stored by `setHeaderStatic`/`setHeaderBorrowed` (no copy budget); only request echoes copy, and a failed echo is no grant / an omitted ACRH. Configured CR/LF/NUL values panic at init in every mode (were Debug-only asserts; release failed each matching response). ✅ DONE 2026-10-29 (every owned value goes through `setHeaderStatic`/`setHeaderBorrowed`, modules/cors/src/root.zig:429-454, commit a318d6378).
-- ~~**`Vary: Origin` missing on actual responses without an allowed Origin**~~ — DONE 2026-10-20: every actual response of a `.list`/`.patterns`/`.predicate` policy carries `Vary: Origin` (granted, refused, no Origin, failed method gate), as rs/cors's `handleActualRequest` ("Always set Vary"); `.any` and `.none` do not vary. Browser-oracle answers re-taken (74 refusal answers gained the field, 504 fetches still agree with Chrome).
 
-
-- ~~**Origin patterns with a subdomain wildcard**~~ DONE 2026-10-11 — `Origins.patterns` (see "Origin patterns, private network, pass-through").
-- ~~**`Access-Control-Allow-Private-Network`**~~ DONE 2026-10-11 — `allow_private_network`.
-- ~~**Preflight pass-through option**~~ DONE 2026-10-11 — `preflight_passthrough`.
-- **Debug logging** (rs/cors `Debug`/`Logger`) — rejected: the hot path does no I/O and has no logger dependency; the three pure gates are public, so a caller that wants to log a decision does so around them.
-- **Request-aware origin function** (rs/cors `AllowOriginRequestFunc`, `AllowOriginVaryRequestFunc`) — rejected for now: the existing `.predicate` sees only the origin string. A decision that depends on other request headers needs those names added to `Vary` (rs/cors needed a second function type for exactly that), the gates are deliberately request-type-free (`allowOriginValue` is pure), and a caller can already decide per request outside the middleware and call `applyActual`/`applyPreflight` directly. Revisit when a consumer has a tenant-by-`Host` case.
-- **`OptionsSuccessStatus`** (rs/cors, default 204; a few legacy clients choke on 204) — not offered: no consumer, and the pass-through lets a handler pick any status. Effort: tiny if asked (one `u16` option).
-- **Single-label `*`** — a pattern mode where `*` may not span dots. Not asked for; rs/cors spans.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · util · reentrant` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **Single-label `*`:** a pattern mode where `*` may not span dots (a possible tightening of
+  `Origins.patterns`). Not asked for; rs/cors spans dots, as `patterns` does.
 
 ## Anchoring
 
@@ -259,5 +265,3 @@ src/root.zig.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
 **What the tests actually contain.** src/browser_oracle_test.zig replays headless Google Chrome 155 (`tools/interop.zig` + `tools/browser_oracle.js`, frozen 2026-10-05, re-taken 2026-10-20 for the `Vary` change below): `fetch()` from two page origins against the middleware under 16 gated configurations (list / any / none origins, method sets, reflected and listed headers, credentials, expose lists incl. `*`, max-age, `allow_unconditional_wildcard`, a list entry with a trailing slash and one with an upper-case scheme) and the 2 static-posture ones, 14 request shapes each (simple GET/POST/HEAD, preflighted PUT/DELETE/PATCH and `patch`, custom headers, JSON `Content-Type`, `Authorization`, credentialed) -- 504 fetches. Chrome's verdict (a response or a network error; could the script read `X-Total` / `X-Secret`) must equal the configured policy, the Fetch Standard's CORS checks applied to the configuration in the driver; and the middleware must still answer every request Chrome sent with the head Chrome judged (status, every `Access-Control-*` and `Vary` field, in order). the `interop (flask_cors oracle)` tests in src/root.zig keep the earlier flask_cors 6.0.5 comparison with its 8-item divergence ledger. Not judged by a browser: `Vary` and `Access-Control-Max-Age` (caching, which no fetch verdict shows -- their bytes are pinned by the replay), the `predicate` origin form (caller code), and the opaque `null` origin.
-
-**How it got there.** DONE 9dee82e: flask_cors oracle; its wildcard+credentials default is the unsafe one. 2026-10-05: the browser oracle. It found two places where the module's answer and the browser's reading of it parted: a preflight for `patch` (which `fetch()` does not upper-case) was granted with `Access-Control-Allow-Methods: ..., PATCH`, which Chrome refuses -- methods now compare byte for byte (RFC 9110); a listed header name with surrounding spaces (`" X-A"`) matched nothing although the browser reads the joined list with the spaces stripped -- configured names are now trimmed.
