@@ -128,24 +128,18 @@ than 206 and can land in a smaller version. It is never larger than the
 single-mode result. It cannot be combined with `mode` or `eci`
 (`error.ModeMismatch`), and `encodeSequence` ignores it.
 
-## Not implemented
+`Options.eci = 26` (UTF-8) writes an ECI designator segment before the byte data
+(the number is as short as its value allows and counts toward the version
+choice), and `decodePart` reports it in `Part.eci`. Only one designator per
+symbol, ahead of the data; mixed-charset symbols are refused.
 
-**Kanji mode.** It encodes Shift-JIS double-byte values, so a caller would have
-to transcode into that encoding before calling; byte mode carries the same text
-as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
+## Not provided
 
-**Micro QR.** Not needed by a caller that wants "put this text in a QR code";
-a separable addition rather than something this design forecloses.
-
-**ECI** is supported: `Options.eci = 26` (UTF-8) writes a designator segment
-before the byte data, and `decodePart` reports it in `Part.eci`. Only one
-designator per symbol, ahead of the data; mixed-charset symbols are refused.
-
-**Reading from an image.** `decode` takes a matrix; producing that matrix from a
-photograph is binarisation, symbol location, perspective correction and grid
-sampling. That is image processing rather than coding, it would drag a pixel
-format and a `platform` tag into a module that has neither, and every mature
-ecosystem ships it separately: here it is the sibling module `qrscan`.
+Kanji mode, Micro QR and FNC1 (the decoder refuses a symbol that uses an
+unimplemented segment mode with `error.BadData`; the encoder never emits one), and
+reading from an image: `decode` takes a matrix, and the sibling module `qrscan`
+produces it from a photograph. Reasons and the open items: `SPEC.md` *What is
+deliberately not done* and *Backlog / deferred*.
 
 Provenance: original work of the zig-libs authors (MIT), clean-room from
 ISO/IEC 18004. Verification, including the external encoder oracle, is in

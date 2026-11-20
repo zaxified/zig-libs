@@ -12,7 +12,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   stopped compiling when ECI support added the error).
 - **2026-11-16** — **ECI segments.** New `Options.eci` (0–999999; implies byte mode) writes the ECI designator (mode 0b0111, 8/16/24-bit assignment number) before the data, counted in version/capacity selection and repeated in every structured-append symbol; new `Error.BadEci`, `max_eci`. `decodePart` now reads ECI instead of returning `BadData` and reports it in the new `Part.eci` field (default null; `decode` drops it). Truncated, reserved (`111xxxxx`), over-999999, repeated or post-data designators are `BadData`. The segno golden oracle does not cover ECI; new tests are spec-derived vectors and round trips.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-10** — tests: deterministic fuzz driver `QR_FUZZ` over the encode, decode, damage and sequence harnesses (generic over their choice source; verdicts at a `.scale` share for the slow ones). The damage harness now also requires that net damage of at most two modules is always recovered. No code change.

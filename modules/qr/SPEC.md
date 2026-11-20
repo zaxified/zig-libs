@@ -29,7 +29,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [skip2/go-qrcode](https://github.com/skip2/go-qrcode) | Go | MIT | 3.0k | pushed 2024-03-01 (no releases) | Encoder producing PNG, four ECC levels; README shows nothing about Kanji/ECI/Micro *(inferred: absent)*. Effectively unmaintained. |
 | [bensengupta/qr](https://github.com/bensengupta/qr) | Zig | MIT | 11 | pushed 2025-09-27 (no releases) | The closest Zig encoder found: a CLI-first encoder with ECC level and quiet-zone options; no decoder *(inferred from README)*. Other Zig hits (`nektro/zig-qrcode`, MPL-2.0, 4 stars; `korabdoroci/qrzig`, AGPL-3.0) are tiny. Zig `std` has no QR code. |
 
-**Where we are ahead:** the only one of these that both encodes and decodes with Reed-Solomon error correction (libqrencode, nayuki, qrcode-rust and go-qrcode are encoders; rqrr needs an image); structured append with a decode-side `decodePart` and `sequenceParity`; SVG and terminal renderers in the box; allocation-free; encoder placement and block structure checked byte-for-byte against segno (51 vectors), decoder against 160 segno grids. **Where we are behind:** Kanji mode, ECI, Micro QR, FNC1 and mixed-mode segments (libqrencode and qrcode-rust have some or all of them).
+**Where we are ahead:** the only one of these that both encodes and decodes with Reed-Solomon error correction (libqrencode, nayuki, qrcode-rust and go-qrcode are encoders; rqrr needs an image); structured append with a decode-side `decodePart` and `sequenceParity`; SVG and terminal renderers in the box; allocation-free; encoder placement and block structure checked byte-for-byte against segno (51 vectors), decoder against 160 segno grids. **Where we are behind:** Kanji mode, Micro QR and FNC1 (libqrencode and qrcode-rust have some or all of them); ECI and mixed-mode segments are in (`Options.eci`, `Options.optimize_segments`).
+
 
 ## Design & invariants
 
@@ -52,6 +53,7 @@ how many are left, so a mistake in the function-pattern layout cannot produce a
 symbol that is internally consistent and wrong. It shows up as a capacity that
 disagrees with the standard's Table 1, which a test checks directly.
 
+
 **Version 32 is an outlier in the standard and is special-cased.** Its tabulated
 alignment centres are 6, 34, 60, 86, 112, 138; even spacing over the same span
 gives 6, 26, 54, 82, 110, 138. No rounding rule reconciles it: version 32 spans
@@ -59,50 +61,29 @@ gives 6, 26, 54, 82, 110, 138. No rounding rule reconciles it: version 32 spans
 table takes 26) — one rounds down, the other up. This is an exception
 transcribed from the standard's own table, not a rule the derivation is
 missing, and it is one of the ten versions in the external-oracle "spread"
-set (`SPEC.md` "Verification"): our encoder's version-32 matrix matches
-segno's independently-computed one byte-for-byte, at four ECC levels, which
-is real (2026-08-18) evidence for the exception rather than the "checked
-against an independent encoder" prose this sentence used to assert with
-nothing behind it. Pinned by a test that also pins versions 31 and 33 as
-*derived*, so the exception cannot quietly widen.
+set (see *Verification*): our encoder's version-32 matrix matches segno's
+independently-computed one byte-for-byte, at four ECC levels. Pinned by a test
+that also pins versions 31 and 33 as *derived*, so the exception cannot quietly
+widen.
 
 **One walk, two directions.** The zigzag that places codewords is a single
 `Walk` used by both the encoder and the decoder. A decoder that re-derived the
 order would be a second chance to get it wrong, and the two would disagree only
 on inputs neither test covers.
 
+
 **A correction that satisfies the locator is still re-checked.** After Forney
 applies the magnitudes, the syndromes are recomputed and a non-zero result
-returns `Uncorrectable`.
-
-⚠ **Corrected 2026-09-11 (A1/qr.md, the audit's open "post-Forney" item):**
-the paragraph used to say this re-check exists because Berlekamp-Massey can
-converge on a locator that "corrects" a block into different wrong data when
-the error count exceeds capability. That miscorrection SHAPE is real (it is
-the classical failure mode of a bounded-distance decoder past its guaranteed
-radius), but it is not what this re-check catches: when Berlekamp-Massey's
-key equation and Chien's root count agree (`l` roots for a degree-`l`
-locator, `rsDecode`'s own `count != l` guard just above), Forney's formula is
-*algebraically derived* to zero every syndrome of the corrected word — that
-identity holds regardless of whether the locator names the block's TRUE
-error positions or a different, equally self-consistent (but wrong) set. A
-genuine miscorrection to another valid codeword is therefore invisible to a
-syndrome check by construction, not just in practice; the audit's own
-3.4-million-block adversarial sweep and this session's own attempt both
-independently found zero inputs that trip this line, which is consistent
-with — not merely unlucky against — that argument.
-
-What the re-check DOES catch, measured directly: an inconsistency introduced
-anywhere between the key equation and the applied correction — i.e. a coding
-BUG in this file, not an adversarial QR symbol. Mutating the magnitude
-formula alone (`gf.mul(num, gf.inverse(den))` → `gf.mul(num, den)`, leaving
-Berlekamp-Massey and Chien untouched and therefore still self-consistent)
-made the re-check fire on the FIRST ordinary correction test that exercises
-it, exactly at this line. That is real, load-bearing protection — defense in
-depth against a regression in the Forney/Chien arithmetic above, the same
-role a re-derived invariant check plays anywhere else in this codebase — it
-is just not a defense against an adversarially chosen RS error pattern, and
-naming it as one overstated what a syndrome check can see.
+returns `Uncorrectable`. This is defence in depth against a coding bug in the
+Forney/Chien arithmetic, not against an adversarial error pattern: when
+Berlekamp-Massey's key equation and Chien's root count agree (`l` roots for a
+degree-`l` locator, the `count != l` guard in `rsDecode`), Forney's formula is
+algebraically derived to zero every syndrome of the corrected word, whether the
+locator names the block's true error positions or a different, equally
+self-consistent set. A genuine miscorrection to another valid codeword is
+therefore invisible to a syndrome check by construction. What the re-check does
+catch is an inconsistency introduced between the key equation and the applied
+correction, i.e. a coding bug in this file rather than an adversarial symbol.
 
 **Rendering is bolted on, not built in.** `writeSvg` and `writeTerminal` live in
 `render.zig`; the codec does not call them and has no pixel format in it. They
@@ -136,9 +117,35 @@ instead is well-formed in every other respect and rejected by every decoder,
 which reads as a masking bug; `Ecc.formatBits` is the one place that mapping
 lives.
 
-### Audit 2026-11-17 (whole-module mutation)
+**Mask penalty rule 4 uses the exact dark share.** `k = |dark*20 - total*10| / total`,
+`score += 10*k` (totals are odd squares, so floor and the ceil-minus-one form agree),
+as ISO/IEC 18004 Table 11, ZXing, nayuki and segno do. An integer percent first
+overstates the deviation below 50% by up to one point. The default output of
+`encode` is whatever this scoring picks; a forced `Options.mask` is never affected.
 
-Mutants: 490 over `root.zig` and `render.zig` non-test code (mode selection, version and capacity search, structured-append arithmetic, the mixed-mode planner, bit writer, block split and interleave, Reed-Solomon encode and decode, function patterns, the data walk, the eight masks and the four penalty rules, format and version information, the decoder's segment parser), schemata build in ReleaseSafe, one run per mutant, 458 killed, 32 equivalent (490). **Finding (fixed, behaviour change):** penalty rule 4 took the dark share as an integer percent first, so below 50% the deviation was overstated by up to one point (45.5% dark scored 10, the exact value is 0); ISO/IEC 18004 Table 11, ZXing, nayuki and segno all use the exact share. It is now `k = |dark*20 - total*10| / total`, `score += 10*k` (totals are odd squares, so floor and the ceil-minus-one form agree). The auto-selected mask can differ for some inputs; every symbol stays valid and the 51 segno goldens (40 spread, 8 masks, 3 modes) did not move. New tests: `penalty` against a naive ISO reference (all four rules, 400 random, striped and finder-planted grids), the first-lowest tie rule of `pickMask`, `planSegments` and `pickMixedVersion` against an exact dynamic-programming oracle (including three texts where unrounded sixth-of-a-bit costs lose one bit), exact-fit and one-bit-over capacity for every version selector, the 16-symbol and version-40 limits of `encodeSequence`, per-symbol version and mode of a sequence, each format-information copy alone and the BCH radius of exactly three, the first long block's extra codeword at full error budget, and `parseSegments` exact-fit buffers, group ranges and the reserved ECI prefix. Equivalent: tie-breaks between equal-cost segmentations, unreachable guards (a zero chunk, the count-field clamp: asserted by tests), module writes made twice (dark module, timing at the finder edge, the bit clear), cost-only code (clean-block RS), degree-bounded Reed-Solomon guards subsumed by the final syndrome re-check, and always-zero ECI prefix bits. One is UNOBSERVABLE: `rsDecode`'s `l > ec_len / 2` needs a received word whose locator splits completely and corrects to a codeword, which damaging a valid symbol does not produce.
+**Mixed-mode segments are opt-in** (`Options.optimize_segments`, default off so the
+default output stays byte-identical). The text is split into numeric / alphanumeric /
+byte segments by an exact dynamic program over the three modes (mode indicator,
+the character-count width of the version range and per-mode data bits all counted;
+the approach of nayuki's `makeSegmentsOptimally`), with the same version-range loop as
+the single-mode path, so it is never larger than the single-mode result. It is
+refused with a forced `mode` or an `eci` (`error.ModeMismatch`), ignored by
+`encodeSequence` (each chunk of a sequence keeps one mode) and by empty text, and
+text beyond 7089 bytes is `error.TooLong`. The decoder reads the segment list.
+Worth using only when a payload bumps a version boundary; the win is at most a few
+percent.
+
+**ECI is one designator ahead of the data** (`Options.eci`, `Part.eci`, `max_eci`).
+`Options.eci` is 0–999999 (larger is `error.BadEci`) and implies byte mode (a forced
+`mode` other than `.byte` is `error.ModeMismatch`); the designator is mode `0b0111`
+plus 8, 16 or 24 bits by value, counted in capacity and version selection, and every
+symbol of a structured-append sequence carries it. The decoder accepts the 1-, 2- and
+3-byte forms and answers `error.BadData` for a truncated, reserved (`111xxxxx`),
+out-of-range, repeated or late designator, so mixed-charset symbols are refused.
+`decodePart` reports the number in `Part.eci` (null when absent, then the reader's
+default applies); `decode` drops it. An unimplemented segment mode (Kanji
+included) is `BadData`, not read as bytes.
+
 
 ## Threat model & out of scope
 
@@ -151,7 +158,7 @@ which matters because a truncated QR code still scans and reads as a shorter
 message.
 
 **"Allocates nothing" moves the cost onto the call stack, and it is not
-small.** Measured (F5, native Debug, `encode`+`decode` at version 40 / ECC
+small.** Measured (native Debug, `encode`+`decode` at version 40 / ECC
 high, one call each on their own thread): a 40 KB thread stack overflows, a
 64 KB one does not. A caller running this on a thread with a small or
 explicitly sized stack — a thread pool, a `wasm32` host with its own limit —
@@ -172,188 +179,90 @@ correction whose syndromes do not clear afterwards is reported rather than
 returned. Two fuzz harnesses cover the surface — one over arbitrary grids, one
 over valid symbols with modules flipped.
 
-⚠ The reason given here used to be "since random noise rarely reaches
-Berlekamp-Massey but real damage does". **Measured, it is the wrong way round:
-81% of arbitrary grids DO reach Berlekamp-Massey** (a random grid's format bits
+Measured, 81% of arbitrary grids reach Berlekamp-Massey (a random grid's format bits
 are within BCH correction distance often enough, and the RS syndromes are then
-non-zero by construction). What random noise essentially never reaches is
-`parseSegments`, at **0%** — because a corrected block almost never spells a
-legal segment header. Both harnesses are still worth having; the sentence
-justified them by a fact that is not true, which is a worse footing than
-justifying them by the measured one. The damage harness also asserts the
-message when decoding succeeds, so "returns confident nonsense" is a fuzz failure
-and not merely a missing panic.
+non-zero by construction), while random noise essentially never reaches
+`parseSegments` (0%): a corrected block almost never spells a legal segment header.
+Both harnesses are worth having. The damage harness also asserts the message when
+decoding succeeds, so "returns confident nonsense" is a fuzz failure and not merely
+a missing panic.
 
 ## Verification
 
-**Corrected 2026-08-18.** This section used to open with "two independent
-oracles, neither of which shares an author with this module" and go on to
-claim specific byte-identical comparisons — 672 matrices, 320 matrices, 84
-symbols read back by an independent decoder, 12 sequences/30 symbols and 120
-symbols cross-checked against a foreign encoder/decoder — concluding "Anchor
-grade: class A · oracle EXTERNAL". None of it was true: `find modules/qr`
-had five files, no `testdata/`, no embedded golden bytes, and grepping the
-module for every one of those numbers and for `oracle`/`independent`/
-`byte-identical` found the same prose and no executable test behind any of
-it. The claim was present verbatim in the module's first commit — it was
-never regression-tested away, because it never had a test. What follows
-replaces it with what the module's tests actually do today, checked by
-reading them.
+- **Run:** `scripts/modtest qr`. Fuzz verdicts come from testkit's deterministic driver, `QR_FUZZ=<runs>[,<first seed>]`.
+- **Self-consistency** (`src/root.zig`, `src/render.zig`; authored alongside the code they check): round trips (every mode and
+  level across the version range, structured append, the renderers), literal pins against the standard's text (the generator
+  polynomial for ten EC codewords, codeword capacity against Table 1, the tabulated alignment centres including the
+  version-32 exception, finder geometry, the field's inverse over all 255 non-zero elements), the auto-selected mask pinned
+  across a spread of inputs, refusal tests (an unimplemented segment mode, a structured-append index past its total,
+  out-of-range numeric/alphanumeric groups, damage beyond capability, `BadFormat`, `BadData`), and tests written against
+  mutation survivors: the mask penalty against a naive ISO reference (all four rules, random, striped and finder-planted
+  grids), the first-lowest tie rule of `pickMask`, `planSegments` and `pickMixedVersion` against an exact dynamic-programming
+  oracle, exact-fit and one-bit-over capacity for every version selector, the 16-symbol and version-40 limits of
+  `encodeSequence`, each format-information copy alone and the BCH radius of exactly three, the first long block's extra
+  codeword at full error budget, and `parseSegments` guards. ECI has spec-derived bit vectors and round trips for the three
+  designator lengths, version selection, option errors, sequences and the decode forms; mixed-mode has an exact bit count by
+  hand and random payloads that must never choose a larger version. A round trip undoes whatever encode did, so a consistent
+  mistake in both halves (the zigzag `Walk` order, the transcribed block-structure table, a masking formula) is invisible to
+  all of this by construction; that is what the external oracle is for.
+- **External oracle, encoder:** `tools/reference.py` drives segno (a pure-Python, independently authored ISO/IEC 18004 encoder)
+  to produce matrices for a fixed (content, mode, version, ecc, mask), and `src/testdata/golden_matrices.zig` freezes the
+  module grids; `src/golden_test.zig` asserts this encoder, forced to the same tuple, reproduces every one byte-for-byte
+  with no Python in the test run. Three sets: *spread* (ten versions 1, 2, 5, 7, 10, 14, 20, 27, 32, 40, each at four ECC
+  levels, numeric, mask 0, content nearly filling each version's tightest capacity; this exercises the block-structure table
+  broadly), *masks* (version 5, level Q, each of the eight masks forced in turn; a swapped mask formula changes nothing a
+  round trip sees) and *modes* (version 3, level M, numeric, alphanumeric and byte, for the mode-indicator and count-field
+  bits). A canary test pins the vector count. The oracle itself has a defect: segno 1.6.6's `write_padding_bits` pads with
+  `8 - (length % 8)` unconditionally, so a stream already byte-aligned after the terminator gains a spurious byte, where
+  ISO/IEC 18004:2015 §7.4.10 adds none. This module matches the standard; `tools/reference.py` monkeypatches a corrected
+  function at generation time, documented there, so the vectors reflect segno's real logic except that one line.
+- **External oracle, decoder:** `src/testdata/decode_vectors.bin` holds 160 grids produced by segno, every version 1-40 at every
+  level with the mode cycling, which `decode` must read back to segno's own input (test `EXTERNAL ORACLE: 160 segno-produced
+  grids decode back to segno's own input`); nothing in it was encoded here. The producer is
+  `scripts/gen/gen-qr-decode-vectors.py`, which emits the full sweep of 960 vectors (all passed when written); keep it, the
+  committed file can otherwise only be trusted, not re-derived.
+- **Still self-consistency only:** error correction beyond what those vectors exercise, structured append, the renderers (checked
+  by parsing the rendered output back into a matrix) and mask selection: every golden vector forces its mask, so `pickMask` is
+  anchored by nothing. A three-way comparison over 1914 tuples measured agreement with qrcodegen at 81.9% and with segno at
+  66.9%, those two agreeing with each other at 64.2%, so this module is not the outlier and mask choice is a quality decision
+  the standard leaves open rather than a correctness one.
+- **Fuzz:** four harnesses (`src/root.zig`, shared plumbing in `src/fuzz_test.zig`): arbitrary encoder input, arbitrary decoder
+  grids, valid symbols with modules flipped, and arbitrary structured-append messages; each checks that untrusted input never
+  panics and that a successful decode is never wrong, and each has a reach check in the ordinary test run.
+- **Constant time:** n/a (see the card's `Hardening` line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
-**The module's own tests are self-consistency: the `root.zig` and `render.zig`
-tests, including four fuzz harnesses, all authored alongside the code they check.** Round trips
-(`root.zig`'s "round trip: every mode, every level, across the version
-range", the structured-append round trip, the renderer round trips) encode
-and then decode with this module's own inverse of whatever it just did, so a
-consistent mistake in **both** halves — the zigzag `Walk` order, the
-transcribed error-correction block-structure table, a masking-formula bug —
-is invisible to them by construction: decode just undoes whatever encode
-did, correctly or not. Literal pins (the generator polynomial for ten EC
-codewords against the standard's printed coefficients, codeword capacity
-against Table 1, the tabulated alignment centres including the version-32
-exception, finder-pattern geometry on the diagonal, the field's
-multiplicative inverse over all 255 non-zero elements) check specific values
-against the spec text, not against an outside implementation. The four fuzz
-harnesses (arbitrary encoder input, arbitrary decoder grids, valid symbols
-with modules flipped, arbitrary structured-append messages) check that
-untrusted input never panics and that a "successful" decode is never wrong
-— solid ground, but none of it is an external oracle, and none of it was
-ever claimed to need one until the paragraph above invented the claim.
+## What is deliberately not done
 
-**A real external oracle, added 2026-08-18, closes part of that gap.**
-`tools/reference.py` drives [segno](https://github.com/heuer/segno) (a
-pure-Python, independently-authored ISO/IEC 18004 encoder; version 1.6.6 at
-capture time) to produce QR matrices for a fixed (content, mode, version,
-ecc, mask) tuple, and `testdata/golden_matrices.zig` freezes the resulting
-module grids as checked-in bytes — genuinely produced by segno's own
-placement and interleaving logic, not by our reading of the spec, and not
-recomputed by python at test time. `golden_test.zig` asserts our own encoder
-reproduces every one of them byte-for-byte, with no python or subprocess
-involved in the test run itself (so it runs in CI, which never has segno
-installed). This is exactly what the encoder-comparison half of the old
-claim described, done for real: forcing the same version/ecc/mask on both
-sides means both implementations are answering the identical question, so
-module-for-module disagreement is a real defect rather than a difference in
-auto-selection heuristics.
+- **Reading from an image.** `decode` takes a matrix; producing it from a photograph is binarisation, symbol location,
+  perspective correction and grid sampling, which would drag a pixel format and a `platform` tag into a module that has
+  neither, and every mature ecosystem ships it separately: here it is the sibling `qrscan`.
+- **Mixed-charset symbols** (more than one ECI designator, or one after the data): the API cannot report a character-set
+  switch mid-message, so the decoder refuses it (`BadData`) and the encoder writes at most one.
+- **Reassembling a structured-append sequence:** holding sixteen decoded fragments needs storage this module does not have;
+  `sequenceParity` is the check that makes the caller's reassembly safe.
 
-**What it covers, and why this is the piece self-consistency structurally
-cannot check:** 51 vectors —
+## Backlog / deferred
 
-- **"spread"** (40 vectors): 10 versions across the 1–40 range (1, 2, 5, 7,
-  10, 14, 20, 27, 32, 40 — including version 32, the documented exception to
-  the alignment-centre spacing rule above) × all 4 ECC levels, numeric mode,
-  mask forced to 0, content sized to nearly fill each version's tightest
-  (H) capacity. Exercises the transcribed error-correction block-structure
-  table broadly: a wrong entry changes the interleave and the matrix stops
-  matching.
-- **"masks"** (8 vectors): version 5, level Q, every one of the 8 mask
-  patterns forced in turn. A masking-formula bug (e.g. two patterns'
-  conditions swapped) does not change what this module's own decoder reads
-  back — unmask always undoes whatever mask encode applied, by construction
-  — so only an oracle that computes the mask pattern independently catches
-  it (proven below).
-- **"modes"** (3 vectors): version 3, level M, one vector each for numeric,
-  alphanumeric and byte mode, exercising the mode-indicator and count-field
-  bits the other two sets (numeric only) do not.
-
-The count is pinned by a canary test (`golden_test.zig`) so the two tables
-cannot silently drift apart.
-
-**Proven able to fail, not merely passing (2026-08-18):** two mutations were
-applied to `root.zig`, the suite run, and the source restored.
-
-| Mutation | Golden test (`golden_test.zig`) | The other self-consistency tests |
-|---|---|---|
-| `Walk.next`: swapped which of the two columns in a pair is visited first (placement order) | **RED** — `spread_v1_l` mismatched at the very first byte the finder pattern doesn't own | all green |
-| `maskAt`: patterns 3 and 4's formula bodies swapped | **RED** — `mask_v5_q_m3` mismatched | all green |
-
-Both mutations were reverted and the suite confirmed green again. In both
-directions, only the golden oracle noticed — every round trip, all four fuzz
-harnesses, and every literal pin passed with the mutation active, which is
-the concrete demonstration of the blind spot described above, not just an
-assertion of it.
-
-**The oracle itself had a real defect, found while building this anchor, and
-that is worth recording rather than quietly routing around.** segno 1.6.6's
-`write_padding_bits` computes the padding-to-byte-boundary amount as
-`8 - (length % 8)` unconditionally, which — per ISO/IEC 18004:2015 §7.4.10 —
-is wrong when the bit stream is *already* byte-aligned after the terminator:
-it should add zero bits, and segno's formula adds a spurious full byte
-instead. The very first capture run of this oracle hit exactly that case (a
-version-5-quartile vector) and disagreed with this module's own encoder in
-roughly a third of the matrix's data-region bytes. Hand-tracing both
-implementations' pre-mask, pre-interleave data codewords isolated the one
-extra byte and confirmed **this module's encoder was the one matching ISO
-7.4.10, not segno** — `pyzbar`/`zbar` decoded both the segno-buggy matrix and
-this module's matrix for that case to the correct message anyway, because a
-lenient decoder never validates padding content, which is exactly why a
-byte-identical golden comparison (and not a decode round-trip against a
-third tool) is what caught this at all. `tools/reference.py` monkeypatches a
-one-line corrected `write_padding_bits` at generation time, documented in
-full there, so the captured vectors reflect segno's real encoding logic and
-not this one bug in it.
-
-**What the external oracle covers, updated 2026-09-04.** It anchors the
-encoder's placement and block-structure/interleave logic — over **10** versions,
-not the 40 a doc comment in `root.zig` claimed had been checked.
-
-**The decoder is now anchored too.** This paragraph used to end "Extending the
-oracle to decoding (e.g. segno's matrices fed to this module's decoder …) is
-future work, not something this pass claims to have done." That work is done:
-`testdata/decode_vectors.bin` holds 160 grids produced by **segno**, spanning
-every version 1–40 at every level, which this module's decoder must read back to
-segno's own input. It is not a round trip — nothing in it was encoded here. The
-generator (`scripts/gen/gen-qr-decode-vectors.py`) emits all 960; all 960 passed
-when this landed.
-
-Still self-consistency only: error correction beyond what those vectors
-exercise, structured append, the renderers, and mask selection — `pickMask` is
-anchored by nothing, because every golden vector FORCES a mask. A three-way vote
-over 1914 tuples put this module against qrcodegen at 81.9% agreement and
-against segno at 66.9%, with those two agreeing with each other only 64.2% — so
-this module is not the outlier, and mask choice is a quality decision the
-standard leaves open rather than a correctness one.
-
-Neither `render.zig`'s renderers nor structured append gained an external
-oracle in this pass; both are still checked by parsing rendered output back
-into a matrix (renderers) or by round trip (structured append).
-
-**A related but separate fix, same day:** `root.zig`'s "damage beyond
-capability is refused, not mis-corrected" test asserted
-`r == DecodeError.Uncorrectable or r == DecodeError.BadData or r ==
-DecodeError.BadFormat` where the specific corruption it applies (a
-contiguous wipe of the data region) only ever reaches `Uncorrectable` — the
-format-information area is untouched, so `BadFormat` is unreachable, and the
-damage is heavy enough that Reed-Solomon fails before `parseSegments` ever
-runs, so `BadData` is unreachable too. An assertion with two dead branches
-is the same class of claim this whole section exists to stop making — it
-reads as "any of three failure modes is exercised here" when only one is.
-The test now asserts `Uncorrectable` alone, and `BadFormat`/`BadData` each
-gained their own dedicated test reaching them with their own input (clearing
-both copies of the format information; feeding `parseSegments` a malformed
-mode indicator directly) — narrowing the original assertion actually
-increased coverage, since neither of the other two errors had a reachable
-test anywhere in the suite before.
+- **Kanji mode** (survey 2026-09-30). 13 bits per Japanese character versus 24 in UTF-8 bytes; matters to Japanese-text users,
+  the original QR audience. Needs a Shift-JIS table (a `charset`-style sibling or an embedded JIS X 0208 table). Effort:
+  medium. Fits §2 if the table is generated/embedded. Not scheduled: a caller would have to transcode into Shift-JIS first,
+  and byte mode carries the same text as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
+- **Micro QR (M1-M4)** (survey 2026-09-30). Small labels; libqrencode (experimental) and qrcode-rust have it. Effort: medium
+  (separate symbol geometry, masks, format info). Fits §2. Not scheduled: not needed by a caller that wants "put this text in
+  a QR code"; a separable addition that the design does not foreclose.
+- **Penalty evaluation cost.** `pickMask` applies, scores and un-applies eight masks over the whole symbol, eight full passes
+  at version 40. Fine for anything interactive; if a consumer ever generates codes in bulk, the scoring can be made
+  incremental.
 
 ## Anchoring
-
-**Mixed.** The module-placement order and the error-correction block
-structure — the two things self-consistency structurally cannot check,
-because a decode that undoes the same wrong order or the same
-mistranscribed table as the encode that produced it still reports success —
-are now anchored against segno, an independently-authored external encoder,
-via checked-in golden matrix bytes (`testdata/golden_matrices.zig`),
-byte-identical, with the failure mode proven both ways (see the mutation
-table above). Decoding, error correction, structured append and rendering
-remain self-consistency: round trips, literal pins against the standard's
-printed values, and four fuzz harnesses. Building this anchor turned up one
-real, independent defect — not in this module, but in the oracle itself
-(segno's `write_padding_bits` boundary bug, above) — which is the concrete
-argument for keeping an external comparison at all rather than trusting
-either side's prose; this module's own version-32 alignment-centre exception
-("Design & invariants" above) is now covered by the same 2026-08-18 oracle
-rather than by the unverified "checked against an independent encoder"
-claim that used to justify it.
+**Mixed.** The module-placement order and the error-correction block structure — the two things
+self-consistency structurally cannot check, because a decode that undoes the same wrong order or the same mistranscribed
+table as the encode that produced it still reports success — are anchored against segno, an independently-authored external
+encoder, via checked-in golden matrix bytes (`src/testdata/golden_matrices.zig`), byte-identical, over ten versions. The decoder
+is anchored by 160 segno-produced grids. Error correction beyond those vectors, structured append and rendering remain
+self-consistency: round trips, literal pins against the standard's printed values, and four fuzz harnesses (see *Verification*).
 
 **Anchor grade:** class A · oracle MIXED
 
@@ -361,28 +270,3 @@ claim that used to justify it.
 - **Oracle MIXED** — anchored for some paths (encoder placement and block structure,
   against segno), self for others (decoding, structured append, rendering) — the
   "Verification" section above names which.
-
-## Backlog
-
-- **Kanji mode, Micro QR** (ECI done 2026-11-16) — separable additions, none foreclosed by this
-  design. See README "Not implemented" for why none is scheduled.
-- ✅ DONE 2026-11-16 (`Options.optimize_segments`) **Segment mixing.** A single mode is chosen for the whole input, so
-  `"HELLO WORLD 2026"` pays alphanumeric rates throughout rather than switching
-  to numeric for the tail. The standard allows mixed segments and the optimal
-  split is a shortest-path problem over three modes; worth doing only if a
-  consumer is bumping a version boundary, since the win is at most a few percent.
-- **Penalty evaluation cost.** `pickMask` applies, scores and un-applies eight
-  masks over the whole symbol, which is eight full passes at version 40. Fine for
-  anything interactive; if a consumer ever generates codes in bulk, the scoring
-  can be made incremental.
-- ✅ DONE 2026-11-16 (opt-in `Options.optimize_segments`: exact three-mode DP, same version-range loop; refused with a forced `mode`/`eci` as `ModeMismatch`, ignored by `encodeSequence`) (survey 2026-09-30) **Mixed-mode segments** — `"HELLO WORLD 2026"` is coded entirely in one mode; libqrencode / nayuki (manual list) / qrcode-rust *(inferred)* can switch mode mid-message. Users notice a larger version for mixed digit/letter payloads (few percent, up to one version). Effort: small-medium (shortest-path over three modes). Fits CONVENTIONS §2 (pure Zig). Already listed above as *Segment mixing*.
-- ✅ DONE 2026-11-16 (`Options.eci` writes the 8/16/24-bit designator before a byte segment, counted in capacity/version choice and in every structured-append symbol; `Part.eci` reports it, decode accepts 1/2/3-byte forms, refuses truncated/reserved/out-of-range/repeated/late designators; the external segno oracle fixtures do not cover ECI, tests are spec-derived bit vectors + round trips) (survey 2026-09-30) **ECI segments** — declare a non-default character set (UTF-8 marker); some readers mis-decode non-ASCII bytes without it. Effort: small (header + decode of the ECI segment, currently `BadData`). Fits §2.
-- (survey 2026-09-30) **Kanji mode** — 13 bits per Japanese character versus 24 in UTF-8 bytes; matters to Japanese-text users, the original QR audience. Needs a Shift-JIS table (a `charset`-style sibling or embedded JIS X 0208 table). Effort: medium. Fits §2 if the table is generated/embedded; README argues it is deliberately not scheduled.
-- (survey 2026-09-30) **Micro QR (M1–M4)** — small labels; libqrencode (experimental) and qrcode-rust have it. Effort: medium (separate symbol geometry, masks, format info). Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`build · any · codec · reentrant` + deps: none — canonical source is
-`pub const meta` in `src/root.zig`.
