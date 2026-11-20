@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
@@ -26,12 +26,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [W3C Trace Context Level 1](https://www.w3.org/TR/trace-context/) and its [conformance suite](https://github.com/w3c/trace-context) — **reference** | spec + Python test suite | W3C Software & Document / 3-clause BSD (GitHub API: `NOASSERTION`; per this module's `NOTICE`) | 509 | suite pushed 2026-06-29 | The wire yardstick. 69 of the suite's 73 transcribed vectors are driven both ways through our middleware (the STRICT_LEVEL 2 tracestate grammar ones included since 2026-10-11); 4 excluded with a reason apiece (stateful multi-request tests, Level 2). |
+| [W3C Trace Context Level 1](https://www.w3.org/TR/trace-context/) and its [conformance suite](https://github.com/w3c/trace-context) — **reference** | spec + Python test suite | W3C Software & Document / 3-clause BSD (GitHub API: `NOASSERTION`; per this module's `NOTICE`) | 509 | suite pushed 2026-06-29 | The wire yardstick. 69 of the suite's 73 transcribed vectors are driven both ways through our middleware (the STRICT_LEVEL 2 tracestate grammar ones included); 4 excluded with a reason apiece (stateful multi-request tests, Level 2). |
 | [open-telemetry/opentelemetry-go](https://github.com/open-telemetry/opentelemetry-go) (`propagation.TraceContext`) | Go | Apache-2.0 (source not read) | 6.6k | v1.46.0 (2026-08-25) | The reference propagator most users meet: extract/inject on a carrier, span context with a parsed `tracestate` (member add/update/delete) *(inferred; not read this run)*. Part of a full tracing SDK. |
 | [open-telemetry/opentelemetry-rust](https://github.com/open-telemetry/opentelemetry-rust) | Rust | Apache-2.0 (source not read) | 2.7k | opentelemetry-0.33.0 (2026-09-18) | Same propagator role *(inferred)*. |
 | [open-telemetry/opentelemetry-zig](https://github.com/open-telemetry/opentelemetry-zig) | Zig | Apache-2.0 (source not read) | 22 | pushed 2026-09-29 (no release listed) | Alpha (its README says so). Its `opentelemetry-sdk` covers traces, metrics, logs, **baggage**, OTLP exporters; the repo tree contains propagation and baggage-propagator files. A full SDK, not a middleware. |
 
-**Where we are ahead:** a small dependency-free HTTP middleware that needs no tracer or SDK: continue-or-start with a fresh span-id per hop, `tracestate` carried through per RFC 9110 header combining, forward-compatible parse of higher `traceparent` versions, a vendored W3C conformance corpus with a count canary, a fuzz target and a never-panics parse on arbitrary bytes. **Where we are behind:** nothing a user of the OpenTelemetry `TraceContext` propagator would miss since 2026-10-11: `tracestate` is parsed by the member grammar with the 32-member cap, members can be read, added (moved to the front), updated and deleted (`TraceState`), and the middleware writes this service's own entry (`Options.state_entry`). Baggage (a separate spec and a separate OTel propagator) is a plain library API (`Baggage`), not part of the middleware; not here, by design: span/tracer/exporter (propagation only), Level 2 (`random-trace-id`; not a recommendation yet). Different from otel where W3C says otherwise: unknown flag bits accepted and zeroed, duplicated `traceparent` restarts, split `tracestate` fields combined, a duplicated `tracestate` key keeps the left one (otel drops the list; the W3C suite requires it kept).
+**Where we are ahead:** a small dependency-free HTTP middleware that needs no tracer or SDK: continue-or-start with a fresh span-id per hop, `tracestate` carried through per RFC 9110 header combining, forward-compatible parse of higher `traceparent` versions, a vendored W3C conformance corpus with a count canary, a fuzz target and a never-panics parse on arbitrary bytes. **Where we are behind:** nothing a user of the OpenTelemetry `TraceContext` propagator would miss: `tracestate` is parsed by the member grammar with the 32-member cap, members can be read, added (moved to the front), updated and deleted (`TraceState`), and the middleware writes this service's own entry (`Options.state_entry`). Baggage (a separate spec and a separate OTel propagator) is a plain library API (`Baggage`), not part of the middleware; not here, by design: span/tracer/exporter (propagation only), Level 2 (`random-trace-id`; not a recommendation yet). Different from otel where W3C says otherwise: unknown flag bits accepted and zeroed, duplicated `traceparent` restarts, split `tracestate` fields combined, a duplicated `tracestate` key keeps the left one (otel drops the list; the W3C suite requires it kept).
 
 ## Design & invariants
 `traceparent` shape: `version-traceid-parentid-flags` — version two lowercase hex (`00`/Level 1 emitted;
@@ -61,6 +61,36 @@ current context is a value in thread-local storage owned by the connection task
 into a thread-local buffer valid until the next request on the thread; config is immutable after init
 (threadsafe). Clean-room from the W3C Trace Context Level 1 recommendation — see NOTICE.
 
+## Baggage (`src/baggage.zig`)
+
+W3C Baggage (`baggage` header), a library API next to `TraceState`, re-exported as `tracecontext.Baggage` (and the
+module as `tracecontext.baggage`). It is **not** wired into the middleware: OpenTelemetry keeps Baggage a separate
+propagator. Text of record: W3C Candidate Recommendation Snapshot 30 May 2024; section numbers are in the source
+comments. Allocation-free; the only storage is a caller-supplied `scratch` buffer for decoded values (at least as
+long as the input, `max_len` always suffices).
+
+- **API:** `Baggage.parse` (strict: `BadMember` / `TooManyMembers` / `TooLong` / `NoSpaceLeft`, never a panic),
+  `parseLenient` (follows §3.5 "MAY remove that entry" and §3.3.2 "MAY drop list-members": malformed members are
+  skipped, whole members past a limit dropped; only a too-short `scratch` is an error), `members` / `get` / `put` /
+  `delete`, `write`, `Member.propertyIterator`, `decodeValue`; limits `max_members = 64`, `max_len = 8192`,
+  `default_header = "baggage"`. Several `baggage` fields are one list (RFC 9110 §5.3): pass the joined value, the
+  limits apply to the combination.
+- **Values** are percent-decoded (§3.3.1.3); an octet sequence that is not UTF-8 becomes U+FFFD, one per offending
+  octet. A `%` not followed by two hex digits is a malformed member. `write` percent-encodes every value octet
+  outside `baggage-octet` and `%` itself, upper-case hex, with no optional whitespace; when the list does not fit in
+  `buf` / `max_len`, whole members are left out from the right, never a partial member (§3.3.2), and the result may
+  be empty (send no header then).
+- **Decisions where the text leaves room** (each also recorded with its OpenTelemetry evidence under *Anchoring*):
+  - an empty property (`a=1;`, `a=1;;p`) is dropped and the member kept, in strict and lenient mode alike, as otel Go
+    does (§3.3.1's grammar has no empty property; §3.5 "MAY remove" allows either);
+  - property values stay wire text (still percent-encoded; `decodeValue` decodes one on request), and a bad `%`
+    escape inside a property value is accepted, because §3.3.1.4 gives property values no meaning and the
+    §3.3.1.3 decoding rule is stated for the list-member value;
+  - duplicate keys are kept in order (§3.3.1.1 "Uniqueness of keys ... is not guaranteed"); `get` and `put` act on
+    the last of equal keys, as all four OpenTelemetry propagators do;
+  - `parseLenient` past 8192 bytes keeps the whole members that end within 8192 bytes (§3.3.2 "SHOULD propagate as
+    much baggage information as is reasonable", "MUST NOT propagate any partial list-members").
+
 ## Threat model / out of scope
 Like `requestid`, the generated ids are **correlation** identifiers, explicitly not unpredictable
 security tokens — do not rely on trace-id/span-id being unguessable; mint your own CSPRNG id and set
@@ -73,74 +103,17 @@ integration (propagation only, not a tracer). An incoming `tracestate` longer th
 combined is dropped whole (W3C asks vendors to document their maximum; this is it), so an upstream
 that sends more loses the whole list here rather than its tail.
 
-A `traceparent` version higher than `"00"` is parsed forward-compatibly (since 2026-08-02), as
+`Options.traceparent_header` and `Options.tracestate_header` must be RFC 9110 tokens, not a header `http`
+manages itself (`Content-Length`, `Transfer-Encoding`, `Trailer`), and differ from each other: `middleware()`
+panics at construction otherwise (every build mode, like `requestid`'s `header_name`), because the echo could never
+set them or would act on the framing. A configuration error, not a data-reachable panic.
+
+A `traceparent` version higher than `"00"` is parsed forward-compatibly, as
 the spec's "Versioning of traceparent" asks: the fixed-position trace-id, parent-id and sampled
 bit are trusted when the header is long enough and correctly delimited, and the rest is ignored;
 version `ff` is invalid. Pinned by the test "a future traceparent version is parsed as its
 Level 1 prefix" and by the W3C suite's `test_traceparent_version_0xcc` vectors in
 `src/w3c_vectors.zig`.
-
-## Verification
-Offline unit tests through `http.Server.serveStream`: valid incoming traceparent carried into the
-child (fresh span-id) with `current()` agreement, absent/malformed inputs start a fresh valid trace,
-duplicated-traceparent rejection, multi-instance `tracestate` combining + OWS handling, `echo=false`,
-parse/write round-trip, invalid inputs rejected (bad version, length, delimiter, uppercase hex,
-all-zero ids), `childOf` plus id uniqueness/non-zero. PLUS a vendored W3C `trace-context`
-conformance corpus (`src/w3c_vectors.zig` + `src/w3c_conformance_test.zig`; provenance in
-this module's `NOTICE`): 73 hand-transcribed request/verdict vectors from the suite's `test/test.py`,
-69 driven both must-accept and must-reject through this module's own middleware, 4 excluded with a
-recorded reason apiece (a count canary fails loudly on unreclassified drift). Run: `zig build
-test-tracecontext`.
-
-**tracestate grammar and own entry (2026-10-11).** The suite's 8 STRICT_LEVEL 2 vectors (illegal key
-characters, `@`-first key, 33 members, 257-character key, `=` in a value, empty value) are asserted
-now, and the 4 duplicated-key vectors expect the left member kept (upstream accepts kept-as-is or
-one discarded). The OpenTelemetry oracle's divergences fell from 27 to 12: the 14 grammar ones agree
-now; left are digit-first keys and `a@=1` (valid by the pinned W3C key grammar, not by otel's) and a
-duplicated key (otel drops the list, W3C keeps it). `TraceState` tests: normalization, dedup, `put`
-moves left, `delete`, the 32-member cap on input and on `put`, the key/value grammar edges, and
-truncation on write (over-128 first — negative control: right-most only fails it). `state_entry`:
-our member first, replacing a stale one, the only member of a new trace, a bad value not added.
-Seeded model-fuzz: 3000 random lists (0–35 members, OWS, empty members, duplicates, bad keys and
-values) against a naive restatement of the grammar, plus write→parse round trip (negative control:
-a 33-member cap crashes it). Generated ids: no duplicate trace-id or span-id among 6400 each from 32
-threads at once (negative control: a thread-local sequence fails it).
-
-**Mutation + review (2026-11-11, whole module,** production part of `root.zig` (lines 1–653), schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 266 mutants, 250 killed (31 by six new tests), 16 decided, 0 undecided, no finding. New tests: every byte against the key-first/key-rest/value/hex sets with nibble values, `write` over all 256 flag bytes, a duplicate counts toward the 32-member cap, `delete` matches the whole key, `mix64` known answers (SplitMix64), `processPrefix` stable and agreed by 16 racing first callers, a duplicated `traceparent` whose first copy is a future version with an extension starts a fresh trace. Equivalent: empty-name guard (`http.h1.isToken` refuses it), `own_first` forced (input ≤ 512 B never grows), the `list.len != 0` guard (only avoids reading an undefined member), `combinedHeader` empty slice vs null (both parse to the empty list), prefix cache fast path (the CAS returns the cached value), `hi<<4|lo` as `+`/`^` (disjoint bits). Unobservable: four seed inputs of the prefix hash (wall/mono clock, address, pid), `@max(hash, 1)` (needs a zero Wyhash). Untestable in-process: the three `middleware()` checked `@panic`s and its same-name compare (NA in the panic sweep).
-
-**Audit 2026-10-04 (mutation).** 22 schemata mutants over `TraceParent.parse` (version
-`ff`, `00` exact length, future-version delimiter, all three field delimiters, zero ids,
-uppercase hex), `write`/`sampled`/`childOf`, the middleware (`trust_incoming`, `sampled`,
-`echo`, tracestate only with a parsed parent, duplicate traceparent) and `isValidState` /
-`combinedHeader`: 22 killed, 0 equivalent, 0 left alive. Four survivors of the first run
-got tests: a non-dash at byte 35 and at byte 52 (W3C Trace Context §3.2.2), a fresh trace
-under `Options.sampled = false` is unsampled, and DEL in a tracestate fails `isValidState`
-(replaced 2026-10-11 by the member grammar; the DEL test now holds `isValidValue`)
-(asserted on the guard itself: `http.Server`'s h1 parser already refuses a header value with
-DEL, so the wire cannot reach it).
-
-**Audit 2026-11-17 (delta mutation).** 181 schemata mutants over `src/baggage.zig` (added the same day), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`, detached copy, baseline first: `isTchar` (each range end and each special character dropped, the neighbours of each range and the delimiters accepted), `isToken`, `isBaggageOctet` (every interval end dropped, the neighbours accepted), `allBaggageOctets`, each of the ten OWS trims (nothing trimmed, or tab not trimmed), `parseProperty`, `validProperties`, `PropertyIterator`, `rawAt` (the `%` guard, length 2/3/4, hex bases, the shift, the cursor), `decodeValue` (the 0x80 boundary, each step of the UTF-8 repair, the space check and both of its sides, the cursor and length), `encodedValueLen`, `writeEncoded`, `Member.encodedLen`, `parse` and `parseLenient` (each guard and both off-by-one sides of the 8192-byte and 64-member limits and of the scratch check), `get`, `put`, `delete`, `write` (the leave-out arithmetic, the separators, the byte cap) and `parseMember`. 173 killed (one by timeout), 8 decided, 0 undecided. 32 survived the existing suite; six new tests killed 24 (every byte against independent token and baggage-octet reference sets; property text kept trimmed by `parse` and `put`; `write` counting `%XX` and property values exactly against the buffer; a scratch one byte short refused by `parse` and `parseLenient`; the lenient 8192-byte limit counting the commas between members and excluding the OWS around the value; `get` matching the whole key). Decided, equivalent: the member-level OWS trim in `parseMember` (every consumer of the member re-trims its own part: key, value and properties), the empty-member guard there (an empty member has no `=`), the empty-list guard in `parseLenient` (an empty piece is a malformed member and skipped), the `len == 0` guard in `propertyIterator` (an empty property text yields one empty piece, which parses to null, as no piece does), the `keep > 0` guard in `write` (`total` reaches 0 before `keep` does, and 0 is never over the limit), and a continuation byte with a bad escape treated as an invalid sequence instead of an error in `decodeValue` (the rest of the input is decoded next and hits the same bad escape). Not observable through the public API: the two `NoSpaceLeft` paths below the scratch check in `parseLenient` and `parseMember` (the scratch check makes them unreachable: decoding never grows a value, so the decoded bytes of the members parsed never exceed the input bytes they came from). Unfiltered ReleaseSafe suite.
-
-## Performance
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-tracecontext`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 6.0 %): ref 0.28–0.42×, against 0.55–0.67× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
-
-## Backlog / deferred
-- **Delta audit 2026-10-29 (TC-1):** 5 mutants on the header-name check (empty name, non-token byte, each of `Content-Length`/`Transfer-Encoding`/`Trailer` dropped): 5/5 killed on the first run, all by the new header-names test; the three `@panic` sites in `middleware()` are checked panics (NA). Unfiltered ReleaseSafe suite.
-- **Delta audit 2026-10-29 (no-panic sweep § GJ):** the only source change is the seed clock's wrapping arithmetic, not observable by a test (seed material): no mutant scored. Unfiltered ReleaseSafe suite.
-- Beyond the survey items below, none beyond the documented Level-2/vendor-tracestate/sampling-logic/
-  tracer-export out-of-scope list above.
-
-- ~~**`tracestate` member handling**~~ — **DONE 2026-10-11** (`TraceState`, `Options.state_entry`; the 8 strict conformance vectors are tests now). Was: *(survey 2026-09-30)* — parse the list into members, enforce the 32-member cap and key/value grammar, and let the caller add or move-to-front its own vendor entry on the outgoing header. Why: any service that takes part in a vendor-neutral trace must be able to write its own `tracestate` entry; today the value is opaque passthrough. Effort: medium (~250 lines; the 15 excluded conformance vectors become tests). Fits §2.
-- **Header-name validation for `Options.traceparent_header` / `tracestate_header`** *(no-panic sweep § GJ TC-1, 2026-10-29)* — unlike requestid's `header_name`, a non-token or framing name (`Connection`, `Content-Length`) is not refused by `middleware()`; the echo then fails quietly (best effort) or acts on the header. Not a crash. Rejecting it with a checked panic changes documented behaviour, so it waits for the owner. Effort: trivial.
-- ~~**W3C Baggage propagation**~~ — ✅ 2026-11-17: `Baggage` (`src/baggage.zig`, re-exported from `root.zig`), a library API next to `TraceState`, not wired into the middleware (OpenTelemetry keeps Baggage a separate propagator). API: `Baggage.parse` (strict; `BadMember` / `TooManyMembers` / `TooLong`), `parseLenient` (skips malformed members per §3.5, drops whole members past a limit per §3.3.2), `members`/`get`/`put`/`delete`, `write` (percent-encoding, whole members left out from the right when over `buf` or 8192 bytes), `Member.propertyIterator`, `decodeValue`; limits `max_members = 64`, `max_len = 8192`. Text of record: W3C CR Snapshot 30 May 2024, section numbers in the source comments. Evidence: spec examples (§3.3.3, §3.4), limits both sides, percent-encoding both ways incl. U+FFFD for non-UTF-8, malformed members, round trip, a `testing.fuzz` target plus a 3000-input structured driver test. External oracle and delta mutation audit: see "Baggage oracle 2026-11-17" and "Audit 2026-11-17 (delta mutation)" below.
-- **Level 2 `random-trace-id` flag** *(survey 2026-09-30)* — set/keep bit 1 once Level 2 is a recommendation. Effort: trivial. Waits on the spec.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
 
 ## Anchoring
 
@@ -149,23 +122,67 @@ src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — every path's expected values come from an implementation that is not ours.
 
-**What the tests actually contain.** src/w3c_conformance_test.zig drives the middleware through 73 vendored W3C trace-context conformance vectors (src/w3c_vectors.zig) in both directions over the real offline wire harness; src/otel_oracle_test.zig replays OpenTelemetry Go's TraceContext propagator (otel v1.46.0, `tools/go_oracle/` → `otel_vectors.zig`) on 498 request-header sets of ours — traceparent shapes incl. future versions (forward-compatible parsing), every single-character substitution of a valid header, duplicated fields, 43 tracestate shapes with and without a parent, split fields — through the same middleware: continue where otel continues (same trace-id, same sampled bit), restart where it restarts, carry the list members it keeps, never send an unknown flag bit, and refuse (400) a field with a control character. 12 listed divergences (27 until the 2026-10-11 member grammar), each decided by the W3C text or its conformance suite (otel refuses unknown flags, reads only the first of duplicated/split fields, accepts `00-…-01-`, drops a list with a duplicated key or a digit-first key). Self only: trace-id/span-id GENERATION (randomness has no outside answer; non-zero and uniqueness are held by the module's own tests); Level 2 is out of scope
+**What the tests actually contain.** src/w3c_conformance_test.zig drives the middleware through 73 vendored W3C trace-context conformance vectors (src/w3c_vectors.zig) in both directions over the real offline wire harness; src/otel_oracle_test.zig replays OpenTelemetry Go's TraceContext propagator (otel v1.46.0, `tools/go_oracle/` → `otel_vectors.zig`) on 498 request-header sets of ours — traceparent shapes incl. future versions (forward-compatible parsing), every single-character substitution of a valid header, duplicated fields, 43 tracestate shapes with and without a parent, split fields — through the same middleware: continue where otel continues (same trace-id, same sampled bit), restart where it restarts, carry the list members it keeps, never send an unknown flag bit, and refuse (400) a field with a control character. 12 listed divergences, each decided by the W3C text or its conformance suite (otel refuses unknown flags, reads only the first of duplicated/split fields, accepts `00-…-01-`, drops a list with a duplicated key or a digit-first key). Self only: trace-id/span-id GENERATION (randomness has no outside answer; non-zero and uniqueness are held by the module's own tests); Level 2 is out of scope
 
-**Baggage oracle 2026-11-17.** `src/otel_baggage_oracle_test.zig` replays OpenTelemetry Go's `baggage.Parse` (otel v1.46.0, the same module as the propagator above; `tools/go_oracle -baggage` → `src/otel_baggage_vectors.zig`, offline, no new download) on 954 `baggage` header values of ours: the spec examples (§3.3.3, §3.4), OWS variants, properties, percent-encoding incl. invalid escapes and non-UTF-8, empty members, duplicate keys, 63/64/65/100 members, 8191 to 8200 bytes, and every single-character substitution (16 characters) and deletion in one valid header. What otel answers (error or not, the members it returned also next to an error, its re-serialization) is compared with `Baggage.parse` (same verdict, same members, values and properties, same `write` text), and with `parseLenient` when otel errors (it drops the bad member and returns the rest). otel keeps its members in a map, so order is not an answer (sorted by key in the vectors). 932 of 954 agree; 22 fall in four listed classes, each decided by the W3C text (CR Snapshot 30 May 2024) and each asserted to still occur. The empty-property class (`a=1;`, `a=1;;p`, 16 cases) was closed on 2026-11-17 by owner decision: the empty property is dropped and the member kept, in strict and lenient mode alike, as otel Go does (§3.3.1's grammar has no empty property, §3.5 "MAY remove" allows either; three of the four otel propagators accept the member). Classes: (1) `property_bad_escape`, 7: otel Go refuses `a=1;p=%zz`; Java, JS and Python keep properties as an opaque string and accept it (Python only checks the characters); W3C §3.3.1.4 gives property values no meaning and the §3.3.1.3 decoding rule is stated for the list-member value, so owner decision 2026-11-17: accepted as wire text. (2) `duplicate_key`, 3: otel keeps the last of equal keys; §3.3.1.1 "Uniqueness of keys ... is not guaranteed" and the order of duplicates SHOULD be preserved: we keep all, in order, and `get` / `put` act on the last of equal keys (owner decision 2026-11-17, as all four otel propagators do). (3) `property_value_decoded`, 11: otel percent-decodes property values (`p=%41` is `A`); we return the wire text, `decodeValue` decodes it on request (§3.3.1.4 as in (1)). (4) `limit_keeps_prefix`, 1: past 8192 bytes otel returns no member, `parseLenient` keeps the whole members that end within 8192 bytes; §3.3.2 "MAY drop list-members until both conditions are met", "SHOULD propagate as much baggage information as is reasonable", "MUST NOT propagate any partial list-members" (met on both sides). No disagreement was found where the W3C text says this module is wrong. Both parsers agree on the limits (64 members pass, 65 fail; 8192 bytes pass, 8193 fail), on U+FFFD for non-UTF-8, on OWS, on `=` inside values and on every control character (refused by the HTTP layer first).
+**Baggage oracle.** `src/otel_baggage_oracle_test.zig` replays OpenTelemetry Go's `baggage.Parse` (otel v1.46.0, the same module as the propagator above; `tools/go_oracle -baggage` → `src/otel_baggage_vectors.zig`, offline, no new download) on 954 `baggage` header values of ours: the spec examples (§3.3.3, §3.4), OWS variants, properties, percent-encoding incl. invalid escapes and non-UTF-8, empty members, duplicate keys, 63/64/65/100 members, 8191 to 8200 bytes, and every single-character substitution (16 characters) and deletion in one valid header. What otel answers (error or not, the members it returned also next to an error, its re-serialization) is compared with `Baggage.parse` (same verdict, same members, values and properties, same `write` text), and with `parseLenient` when otel errors (it drops the bad member and returns the rest). otel keeps its members in a map, so order is not an answer (sorted by key in the vectors). 932 of 954 agree; 22 fall in four listed classes, each decided by the W3C text (CR Snapshot 30 May 2024) and each asserted to still occur. The empty-property class (`a=1;`, `a=1;;p`, 16 cases) is by owner decision: the empty property is dropped and the member kept, in strict and lenient mode alike, as otel Go does (§3.3.1's grammar has no empty property, §3.5 "MAY remove" allows either; three of the four otel propagators accept the member). Classes: (1) `property_bad_escape`, 7: otel Go refuses `a=1;p=%zz`; Java, JS and Python keep properties as an opaque string and accept it (Python only checks the characters); W3C §3.3.1.4 gives property values no meaning and the §3.3.1.3 decoding rule is stated for the list-member value, so by owner decision: accepted as wire text. (2) `duplicate_key`, 3: otel keeps the last of equal keys; §3.3.1.1 "Uniqueness of keys ... is not guaranteed" and the order of duplicates SHOULD be preserved: we keep all, in order, and `get` / `put` act on the last of equal keys (owner decision, as all four otel propagators do). (3) `property_value_decoded`, 11: otel percent-decodes property values (`p=%41` is `A`); we return the wire text, `decodeValue` decodes it on request (§3.3.1.4 as in (1)). (4) `limit_keeps_prefix`, 1: past 8192 bytes otel returns no member, `parseLenient` keeps the whole members that end within 8192 bytes; §3.3.2 "MAY drop list-members until both conditions are met", "SHOULD propagate as much baggage information as is reasonable", "MUST NOT propagate any partial list-members" (met on both sides). No disagreement was found where the W3C text says this module is wrong. Both parsers agree on the limits (64 members pass, 65 fail; 8192 bytes pass, 8193 fail), on U+FFFD for non-UTF-8, on OWS, on `=` inside values and on every control character (refused by the HTTP layer first).
 
 
-**Audit 2026-11-17 (delta mutation, empty properties and last-duplicate lookup).** 23 schemata mutants over the non-test changes to `src/baggage.zig` since the previous audit (`validProperties`, `PropertyIterator.next`, `get`, `put`), ReleaseSafe, one build, detached copy, baseline first, each mutant under `setsid -w timeout`: the empty-piece skip in both places (dropped, `== 1`, no OWS trim, `continue` as `break` / `return null`), the property parse result and the final `return`, the separator, the cursor advance and the end-of-list assignment (the last two hang), `get` (match dropped, first instead of last, the first member skipped) and `put` (the last member skipped, the first skipped, the key test forced and dropped, the assignment and the `return` dropped). First run: 21 killed, 2 survived (an invalid property after an empty one accepted; a whitespace-only piece ending the iteration); one test case each added: 23 killed (2 by timeout), 0 survived. The card's counts are cumulative with the earlier run.
-
-**Baggage divergence classes against the four OpenTelemetry propagators (sources read 2026-11-17: Go v1.46.0, Java, JS and Python `main`).**
+**Baggage divergence classes against the four OpenTelemetry propagators (Go v1.46.0, Java, JS and Python `main`).**
 
 | Class | W3C text | otel Go | Java | JS | Python | ours |
 |---|---|---|---|---|---|---|
-| empty property (`a=1;`, `a=1;;p`) | not in the grammar (§3.3.1); §3.5 "MAY remove" | skips the empty property, keeps the member | accepts (metadata is the opaque text after the first `;`) | accepts (opaque metadata) | drops the member (empty key invalid) | drops the empty property, keeps the member (owner, 2026-11-17) |
-| bad `%` escape in a property value | no meaning given (§3.3.1.4) | refuses the member | accepts (opaque) | accepts (opaque) | accepts (characters checked only, not stored) | accepts as wire text (owner, 2026-11-17) |
-| duplicate keys | not unique, order of duplicates SHOULD be kept (§3.3.1.1) | last wins | last wins | last wins | last wins | keeps all in order; `get`/`put` act on the last (owner, 2026-11-17) |
+| empty property (`a=1;`, `a=1;;p`) | not in the grammar (§3.3.1); §3.5 "MAY remove" | skips the empty property, keeps the member | accepts (metadata is the opaque text after the first `;`) | accepts (opaque metadata) | drops the member (empty key invalid) | drops the empty property, keeps the member (owner decision) |
+| bad `%` escape in a property value | no meaning given (§3.3.1.4) | refuses the member | accepts (opaque) | accepts (opaque) | accepts (characters checked only, not stored) | accepts as wire text (owner decision) |
+| duplicate keys | not unique, order of duplicates SHOULD be kept (§3.3.1.1) | last wins | last wins | last wins | last wins | keeps all in order; `get`/`put` act on the last (owner decision) |
 | property values decoded | no meaning given (§3.3.1.4) | decodes | no (opaque) | no (opaque) | not stored | wire text (`decodeValue` on request) |
 | value past 8192 bytes, lenient | MAY drop members (§3.3.2) | nothing | nothing (header dropped) | keeps the prefix that fits | keeps the prefix that fits | keeps the whole members within 8192 |
 
-**OpenTelemetry oracle 2026-10-05.** One defect, fixed the same day: unknown trace-flags bits were propagated (`childOf` copied the whole byte, so an incoming `…-ff` went out `…-ff`), where W3C requires them zeroed on outgoing requests.
+## Verification
 
-**How it got there.** The anchoring work landed. DONE e269090: 73 W3C vectors; found MUST-not-parse-tracestate bug; 1 gap logged
+Run: `scripts/modtest tracecontext` (the interop program is `zig build interop-tracecontext`, see *Anchoring*).
+
+- **Unit tests** through `http.Server.serveStream`: a valid incoming `traceparent` carried into the child (fresh
+  span-id) with `current()` agreement, absent or malformed input starting a fresh valid trace, a duplicated
+  `traceparent` restarting, multi-instance `tracestate` combining and OWS handling, `echo = false`, parse/write
+  round trip (`write` over all 256 flag bytes), invalid inputs (bad version, length, a non-dash at each delimiter byte,
+  uppercase hex, all-zero ids), future `traceparent` versions read as their Level 1 prefix, `childOf`, the
+  `isUsableHeaderName` refusals, `mix64` known answers (SplitMix64), `processPrefix` stable and agreed by racing
+  first callers, and id uniqueness and non-zero (no duplicate trace-id or span-id among ids drawn from many threads
+  at once).
+- **W3C conformance corpus** (`src/w3c_vectors.zig` + `src/w3c_conformance_test.zig`; provenance in this module's
+  `NOTICE`): request/verdict vectors hand-transcribed from the suite's `test/test.py`, driven both must-accept and
+  must-reject through this module's own middleware, the STRICT_LEVEL 2 `tracestate` grammar vectors included, the
+  duplicated-key vectors expecting the left member kept; the vectors left out each carry a recorded reason, and a count
+  canary fails loudly on unreclassified drift.
+- **OpenTelemetry Go oracle** (`src/otel_oracle_test.zig` over `src/otel_vectors.zig`, generated by `tools/go_oracle`
+  and re-takeable with `tools/interop.zig --check`): see *Anchoring*; every divergence is listed with its reason and
+  asserted to still occur.
+- **`TraceState`:** normalization, dedup, `put` moves left, `delete` matching the whole key, the 32-member cap on input
+  and on `put`, the key/value grammar edges byte by byte, truncation on write (over-128 first), `state_entry` (our
+  member first, replacing a stale one, the only member of a new trace, a bad value not added), and a seeded model-fuzz
+  of random lists (members, OWS, empty members, duplicates, bad keys and values) against a naive restatement of the
+  grammar plus a write → parse round trip.
+- **Baggage:** the spec examples (§3.3.3, §3.4), the limits on both sides, percent-encoding both ways including
+  U+FFFD for non-UTF-8, malformed members, round trip, every byte against independent token and baggage-octet
+  reference sets, property text kept trimmed, `write` counting `%XX` and property values exactly against the buffer,
+  a scratch one byte short refused, a `std.testing.fuzz` target and a structured driver test over a baggage-shaped
+  alphabet, and the external oracle (`src/otel_baggage_oracle_test.zig` over `src/otel_baggage_vectors.zig`,
+  `tools/go_oracle -baggage`; see *Anchoring*).
+- **Fuzz:** driver `TRACECONTEXT_FUZZ=<runs>[,<first seed>]` (harness `tracecontext`, `src/fuzz_test.zig`):
+  `TraceParent.parse` on arbitrary and on traceparent-shaped bytes never panics; the shaped path picks one fault per
+  field with probability 1/4, so about a quarter of shaped inputs are valid headers and `accepted` is a reach label.
+- **Mutation:** the production code of `root.zig` and `baggage.zig`. Not observable or not testable in-process: the
+  seed inputs of the prefix hash (wall and monotonic clock, address, pid), `@max(hash, 1)` (needs a zero Wyhash), and
+  the three checked `@panic`s of `middleware()`.
+- **ctgrind:** n/a, trace ids are not secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Performance
+
+`zig build bench-tracecontext` (`tools/bench.zig`): the reference is OpenTelemetry Go's `TraceContext` propagator
+(`tools/go_bench`), the fastest candidate OpenTelemetry Rust's `TraceContextPropagator` (`tools/rust_fast_bench`). The
+figures are on the card's `**Performance:**` line.
+
+## Backlog / deferred
+
+- **Level 2 `random-trace-id` flag** — set/keep bit 1 once Level 2 is a recommendation. Effort: trivial. Waits on the spec.
