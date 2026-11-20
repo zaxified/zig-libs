@@ -36,7 +36,7 @@ from their own documentation.
 
 **Where we are ahead:** nothing measured. **Where we are behind:** no streaming interface (B1),
 no HC levels (B2), no dictionaries (B3); speed is level with liblz4 when both are measured padded
-against the JCC erratum and up to 1.35× behind in an unlucky code layout (Speed, B6).
+against the JCC erratum and behind in an unlucky code layout (the card's Performance line, Speed, B6).
 
 ## What this module is, and what it is not
 
@@ -96,7 +96,7 @@ frames, the `lz4` command-line program.
 | Match-length nibble of the last token | Ignored | Format (no match follows); liblz4 the same, except at output capacity 0 where it accepts only the byte `0x00`. |
 | Concatenated frames | Read all (`multi_frame = true`) | lz4 CLI and lz4_flex read them. `multi_frame = false` reads the first frame only and makes anything after it `error.TrailingData` (Arrow IPC's "exactly one frame"); python-lz4 reads the first and ignores the rest, which is `multi_frame = false` with `ignore_trailing_garbage = true`. |
 | Junk after the last frame | `error.TrailingData` (`ignore_trailing_garbage` to accept) | lz4 CLI exits with an error (output written); python-lz4 ignores it. |
-| A word over `LZ4_COMPRESSBOUND(8 MiB)` after a legacy frame's blocks | Ends the legacy frame; read again as a magic number, so junk there is `error.TrailingData` (ignored with `ignore_trailing_garbage`) | lz4 CLI 1.10.0 `LZ4IO_decodeLegacyStream`: "Cannot read next block : maybe new stream ?", then `selectDecoder`'s "Stream followed by undecodable data". Until 2026-11-17 it was `error.BlockTooLarge`. |
+| A word over `LZ4_COMPRESSBOUND(8 MiB)` after a legacy frame's blocks | Ends the legacy frame; read again as a magic number, so junk there is `error.TrailingData` (ignored with `ignore_trailing_garbage`) | lz4 CLI 1.10.0 `LZ4IO_decodeLegacyStream`: "Cannot read next block : maybe new stream ?", then `selectDecoder`'s "Stream followed by undecodable data". |
 | Empty input | Empty output | lz4 CLI (exit 0) and lz4_flex; python-lz4 raises. |
 | Skippable frames | Skipped, anywhere | lz4 CLI, liblz4 frame API. |
 | Legacy frames | Read, in any order with other frames | lz4 CLI reads them (and, measured, fails on a legacy frame *after* an LZ4 frame — an artefact of its decoder, not followed); liblz4's frame API, python-lz4 and lz4_flex do not read them. |
@@ -157,27 +157,14 @@ None claimed: the data is public. There is no secret in this module.
 
 ## Speed
 
-Measured 2026-11-17 on an i7-7920HQ shared with other jobs, `tools/bench.zig` (64 KiB independent
-blocks of three 8 MiB payloads against `lz4 -b1 -i2 -B65536`, liblz4 1.10.0 from the distro). Ours
-is the median of 5 timed rounds per run; the cells give the median of 3 runs and the range of the
-3 runs. Ratio = our time / liblz4's (below 1 = faster).
+Bench: `tools/bench.zig` (`zig build bench-lz4`), `compressBlock` / `decompressBlock` over 64 KiB independent blocks of three
+8 MiB payloads against `lz4 -b1 -B65536` (liblz4 from the distro). The figures are the card's `Performance` line
+(ratio = our time / liblz4's, ours padded against the Intel JCC erratum with `-Djcc-safe`, as the card's convention asks for
+ratios near 1.0; the distro `lz4` cannot be padded). Unpadded, the decoder's loop is sensitive to where its branches fall
+against 32-byte boundaries and the same code can be well behind (B6).
 
-| payload | compress before | compress after | decompress before | decompress after |
-|---|---|---|---|---|
-| text | 1.35× (1.33–1.39) | 0.97× (0.96–1.02) | 2.13× (2.13–2.15) | 1.10× (1.07–1.12) |
-| noisy text | 1.39× (1.38–1.41) | 1.04× (1.00–1.06) | 2.12× (2.10–2.20) | 1.07× (1.02–1.08) |
-| runs | 1.34× (1.32–1.40) | 1.01× (1.00–1.05) | 1.80× (1.77–1.83) | 0.94× (0.92–1.00) |
-
-"Before" is the code of 2026-11-17 before this work (unpadded build); "after" is padded against
-the Intel JCC erratum (`-Djcc-safe`, as the card's convention asks for ratios near 1.0; the distro
-`lz4` cannot be). The same final code unpadded, 3 runs: compress 1.03–1.34×, decompress 0.96–1.35×
-(text 1.30×, noisy 1.20–1.35×): the decoder's loop is sensitive to where its branches fall
-against 32-byte boundaries (B6). Instructions (`perf stat -e instructions:u`, ten passes over the
-24 MiB, untimed `bench-lz4 -- ours c|d`): decompression 3 616 M → 1 347 M (liblz4 through
-python-lz4 on its own blocks: 1 197 M), compression 5 445 M → 2 938 M (liblz4: 2 013 M).
-
-What did it, each kept with an instruction-count A/B and a bench run (liblz4's `lz4.c` read as the
-design reference for the techniques, no code copied):
+The techniques, each kept with an instruction-count A/B and a bench run (liblz4's `lz4.c` read as the design reference for
+the techniques, no code copied; see NOTICE):
 
 - **Decoder fast loop with a hand-back.** While more than 16 input bytes and 64 output bytes are
   left, a sequence is copied in whole chunks: 16 literal bytes at once, a match at offset ≥ 16 in
@@ -191,8 +178,7 @@ design reference for the techniques, no code copied):
 - **Long matches out of line.** The rest of a match over 32 bytes is copied by a separate function;
   inlined, its unrolled loop took the registers of the short-match path, which then spilled.
 - **liblz4's `byU16` table for a small block** (`compress` under 65547 bytes): twice the entries in
-  the same 16 KiB. The parse became liblz4's, 13 % fewer sequences on the three payloads, which also makes our
-  blocks faster to decode.
+  the same 16 KiB. The parse is liblz4's, which also makes our blocks faster to decode.
 - **Encoder output without per-byte checks.** A sequence is written unchecked when the room left
   holds its worst case (lengths bounded by `n >> 7`) plus 16 bytes, and through the checked writer
   otherwise (liblz4 drops its checks altogether when the output holds `LZ4_COMPRESSBOUND`).
@@ -203,58 +189,38 @@ design reference for the techniques, no code copied):
   backward extension out of line: inlined, LLVM stepped a dozen values derived from `ip` with its
   loop.
 
-## Mutation
+## Verification
 
-2026-11-17, whole module (new), schemata over `src/block.zig` and `src/frame.zig` (every guard of the
-production code, one mutant per guard × class: drop, flip, off by one, the other arm, skip an
-assignment, error remap): 109 mutants, 97 killed (one of them a HANG: a 0 offset let through spins
-`copyMatch`), 11 equivalent, 1 unobservable, 0 findings. Three survivors of the first run became
-tests (a match ending exactly at the output's end; a match extended to the exact first differing
-byte; `compressInto` with 1..4 bytes too few for a block checksum).
-
-2026-11-17, delta: `decompressInto` (4 schemata mutants: the `dst.len` cap dropped, the `max_output` option
-ignored, `max_output = null` read as 0, the returned length): 4 killed, none equivalent, no finding.
-
-2026-11-17, delta after the independent review (schemata, one ReleaseSafe build): the match length's minimum
-added before the extension bytes (dropped; the extension never read; its trigger off by one; the extension's
-base without the minimum; 4) and the legacy frame ending at a word over `LZ4_COMPRESSBOUND(8 MiB)` (dropped,
-`>` → `>=`, the old `BlockTooLarge` back; 3): 7 killed, none equivalent, no finding.
-
-2026-11-17, delta after the speed work (schemata, one ReleaseSafe build, 41 mutants over the new decoder
-fast loop, `wildMatch`, `copyLong`, the encoder's `matchSequence`, search loop, `backExtend` and the u16
-table switch: every margin and bail-out dropped or off by one, every rewind skipped, the chunk and
-pattern loops cut short, the room check and its worst case weakened, the window and history bounds,
-the probe clamp): 34 killed (23 by a safety panic, 11 by a failing test), 7 equivalent, no finding.
-One of the equivalents was a room check the loop condition already made; it was then deleted.
-
-| Mutant | Verdict |
-|---|---|
-| decoder: skip the fast loop altogether | EQUIVALENT (cost-only: the tail loop takes every sequence with the same rules) |
-| decoder: fast loop entry `out.len − 64` + 1 | EQUIVALENT (cost-only: a short sequence writes at most 46 bytes past `op`, so 63 is still enough) |
-| decoder: no rewind when a literal length runs off the input | EQUIVALENT: `readLength` fails only at the input's end (its overflow needs over 2^64 / 255 input bytes), and the tail loop's first check gives the same `Truncated` |
-| decoder: no rewind when a match length runs off the input | EQUIVALENT: the same |
-| decoder: drop the long literal's `out.len − op < 64` | EQUIVALENT: `op <= out.len − 64` is the loop condition; the check was deleted |
-| encoder: stop the search when the next probe is at `end − 12`, not past it | EQUIVALENT (ratio-only: one probe fewer at the block's end; the output stays valid) |
-| encoder: call `backExtend` with nothing to extend | EQUIVALENT (cost-only: it returns 0) |
-
-| Mutant (before 2026-11-17's speed work) | Verdict |
-|---|---|
-| drop `src.len == 0` | EQUIVALENT: the loop's first check returns the same `error.Truncated` |
-| 16-byte chunk copy guard `>= 16` → `>= 15` | EQUIVALENT: the overshoot is at most 15 bytes, so 15 is enough (cost-only) |
-| literal / match nibble `>= 15` → `>= 16` (the nibble, not the length bytes) | EQUIVALENT ×2: at 15 both arms give nibble 15 |
-| skip entering the first position before the search | EQUIVALENT: the first lookup enters it (cost-only) |
-| drop `cand < ip` | EQUIVALENT: the table only ever holds positions already passed |
-| 8-byte extension loop one step earlier | EQUIVALENT: the byte loop finishes the same match (cost-only) |
-| drop the `ip > match_limit` break after a match | EQUIVALENT: the search loop's first check breaks out on the same condition |
-| skip entering `ip − 2` after a match | EQUIVALENT (ratio-only: the format leaves the parse free; output stays valid) |
-| acceleration clamp 1 → 0 | EQUIVALENT (cost-only: a zero step for 64 probes, then the usual growth) |
-| room `raw.len − 1` → `raw.len` (store a block that does not shrink) | EQUIVALENT: a block compressing to exactly its raw size is valid either way, same length |
-| drop `src.len > max_block_input` | UNOBSERVABLE: needs an input over 2 GiB |
+`scripts/modtest lz4` runs the unit tests and the fuzz harnesses' fixed seeds; `zig build interop-lz4` (needs the `lz4` CLI
+and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are the live comparisons. Test classes (`src/`):
+- **Blocks** (`block.zig`): hand-built sequences, malformed blocks as typed errors, history-prefix reach and the fast loop's
+  offset check, encoder capacity (same bytes or `NoSpaceLeft`, nothing written past the output), the u16 table up to
+  liblz4's 64 KiB limit, `compressBlockBound` against liblz4's macro, round trips over shapes and accelerations, the
+  end-of-block rules the encoder always obeys, the 13-byte minimum and the window edge, acceleration trading size for speed.
+- **Frames** (`frame_test.zig`): stored and compressed blocks, header refusals, content-size agreement, block-size limits
+  per block maximum, block and content checksums, xxHash32 against the values the CLI writes, linked and independent blocks
+  (a match never reaches into the previous frame; every independent block decodes alone), malformed compressed blocks,
+  truncation anywhere, concatenation / skippable frames / trailing data, legacy frames (including a block at exactly
+  `LZ4_COMPRESSBOUND(8 MiB)`), the output cap (exactly one block maximum, a declared size over what is left), content
+  checksums of concatenated frames, `decompressInto`, encoder options and header bits, stored incompressible blocks.
+- **Goldens** (`golden_test.zig`): the CLI's frames replayed against the recorded inputs, and every damaged byte of a
+  checksummed frame caught.
+- **Fuzz** (`fuzz_test.zig`): three harnesses run by testkit's deterministic driver, `LZ4_FUZZ=<runs>[,<first seed>]`
+  (names `lz4-decode`, `lz4-block`, `lz4-roundtrip`): the frame decoder never panics, leaks or hangs and its verdict and
+  bytes (`decompress` and `decompressInto`) equal an independent frame model's; the block decoder agrees with the
+  byte-at-a-time block model; encode then decode is the identity. A fixed set of 3000 seeds runs in every test run and
+  its reach is checked; a separate test cuts blocks at every byte and every output capacity near the end against the model.
+- **Live interop and goldens' producers** (`tools/`): see Anchoring. The block model and the frame model are the
+  re-derived anchor.
+- **Mutation:** schemata over `src/block.zig` and `src/frame.zig`, one mutant per guard and class (drop, flip, off by one,
+  the other arm, skip an assignment, error remap), over the decoder fast loop, `wildMatch`, `copyLong` and the encoder's
+  sequence writer, search loop and back-extension too. The surviving equivalents are cost-only or ratio-only (the fast
+  loop only changes speed; the encoder's parse is free within the format) or unobservable (an input over 2 GiB).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## What is deliberately not done
 
-- **Byte parity with liblz4's compressor** — not claimed: the format leaves the matcher free. Since
-  2026-11-17 a single block under 65547 bytes uses liblz4's hash, table layout, skip and
+- **Byte parity with liblz4's compressor** — not claimed: the format leaves the matcher free. A single block under 65547 bytes uses liblz4's hash, table layout, skip and
   search order, and the bench payloads compress to the same sizes as `lz4 -1` (text and runs equal,
   noisy text 2 bytes longer of 4.6 MB); the last probes before a block's end follow a different
   rule (ours probes every position up to `end − 12`, liblz4 stops when the next one would pass
@@ -270,18 +236,13 @@ One of the equivalents was a room check the loop condition already made; it was 
   block, memory bounded by two blocks).
 - **B2** LZ4 HC levels (hash chains, lazy / optimal parsing).
 - **B3** Dictionaries: compress and decompress with a caller's dictionary (frame dictionary id).
-- **B4** ~~Speed: decompression 1.8–2.6× and compression 1.4–2.0× liblz4's time~~ — done
-  2026-11-17: 0.94–1.10× padded against the JCC erratum (Speed).
 - **B6** Speed, what is left: (a) the decoder's loop is a JCC-erratum layout lottery on
-  Skylake-family hosts (1.07–1.35× unpadded across builds of nearly the same code; 0.94–1.10×
-  padded); crc32c fixed the same thing with its hot loop as one aligned inline-asm block, which
+  Skylake-family hosts (well behind liblz4 unpadded across builds of nearly the same code, level with it
+  padded; the card's Performance line has the figures); crc32c fixed the same thing with its hot loop as one aligned inline-asm block, which
   for a decoder with a dozen bound checks per sequence is a larger and riskier change. (b) Frames
   and blocks of 65547 bytes and more keep the 4-byte hash into 4096 u32 positions; liblz4's
   `byU32` path hashes 5 bytes on 64-bit targets (`LZ4_hash5`), which changes frame output and was
   not measured. (c) No corpus beyond the three generated payloads (no Silesia-like files).
-- **B5** ~~`decompressFrameInto(dst, src)`: decode a frame into a caller's buffer~~ — done
-  2026-11-17 as `decompressInto(src, dst, opts)` (the `compressInto` argument order; `dst.len` caps
-  the output like `max_output`; no allocation). First consumer: Arrow IPC LZ4_FRAME buffers.
 
 ## Open
 

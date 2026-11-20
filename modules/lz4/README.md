@@ -61,10 +61,11 @@ const zn = try lz4.compressBlock(data, &zbuf, .{});
 
 `decompressBlock` may write scratch bytes into `dst` past the decoded length (liblz4 does too).
 
-## Not here
+## Not provided
 
 No LZ4 HC levels (the decoder reads their output), no dictionaries, no streaming
-`std.Io.Reader`/`Writer` (whole buffers only), no `lz4` command-line program. See SPEC.md.
+`std.Io.Reader`/`Writer` (whole buffers only), no writing of legacy frames, no `lz4` command-line program. See SPEC.md
+*What is deliberately not done* and *Backlog / deferred*.
 
 Tests: `zig build test-lz4` (hand-built frames, CLI goldens, a byte-at-a-time block model the
 fuzzer judges against, 3000 fuzz seeds per run); `LZ4_FUZZ=<runs>` runs the deterministic fuzz
