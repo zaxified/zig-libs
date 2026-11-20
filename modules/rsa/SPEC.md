@@ -8,10 +8,6 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-19 (199/235, 36 eq) · src d375b8f1c35f9ba5
 
-*Delta mutation 2026-11-17:* the branch-free INTEGER trim in `marshal.zig` (private-key PEM ctgrind), 8/8 killed — see Backlog "Private-key PEM: a ctgrind target".
-
-*Delta mutation runs 2026-11-13 (restore A1 after the same day's changes):* branch-free `decryptOaepHNoFail` 35 mutants, 33 killed, 2 equivalent (`found_sep` forced to 1 — with no separator `len_ok` is already 0; the `& 1` before `@truncate` — every other term of `valid` is 0/1); bounded `drawBlindingPair` + `BlindingCache.next` 11/11 killed. The whole-module figure on the Audit line is the earlier run; the src hash covers both deltas.
-
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-11-17 (ctgrind; private-key PEM rows `pemenc` 0 / `pemdec` 2 added) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
 **Performance:** ref 0.84–1.08× OpenSSL 3.5.5 · fastest ? (measured 2026-10-18; `.cached` blinding 1.02–1.03× at 2048)
@@ -23,26 +19,22 @@
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
 ./README.md "Provenance" + the module-local `NOTICE`.
 
-
-**Delta mutation, 2026-11-19 (`PublicKey.modulusBitsFromDer`).** 4 schemata mutants over the new function (the sign-bit check, the empty-modulus check, both terms of the bit count): 4 killed, after one killing test (an empty modulus INTEGER, which without the check indexes past an empty slice). The card counts are cumulative (195 + 4 of 231 + 4).
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | Any modulus size, multi-prime keys, PKCS#1 v1.5 encryption, PSS with salt recovery, prehashed-digest signing, encrypted PKCS#8, blinding always on. README measures this module's RSA-2048 verify at 36 µs against OpenSSL 3.5.5's 17.4 µs (2.1×), one host. |
+| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | Any modulus size, multi-prime keys, PKCS#1 v1.5 encryption, PSS with salt recovery, prehashed-digest signing, encrypted PKCS#8, blinding always on. `bench-rsa` compares against it (see *Performance*; the card's `**Performance:**` line carries the figures). |
 | [Go `crypto/rsa`](https://pkg.go.dev/crypto/rsa) | Go | BSD-3-Clause | — | current Go release | PKCS#1 v1.5, PSS (auto salt on verify), OAEP, prehashed `SignPKCS1v15(hash, digest)`, key generation, `Precompute`, key-size checks; sign checks its own result against faults *(inferred)*. |
 | [RustCrypto/RSA](https://github.com/RustCrypto/RSA) | Rust | MIT OR Apache-2.0 (Cargo.toml; API says Apache-2.0) | 673 | pushed 2026-06-01 (v0.10.0-rc.18, a pre-release) | PKCS#1 v1.5 signing/encryption, PSS, OAEP, multi-prime, `pkcs1`/`pkcs8` codecs; upstream documents a timing side channel in earlier releases *(inferred from its advisories)*. |
 | [briansmith/ring](https://github.com/briansmith/ring) | Rust/asm | ISC-style + Apache-2.0 parts (LICENSE read) | 4.1k | pushed 2026-07-23 | PKCS#1 v1.5 and PSS sign/verify only, no OAEP, no encryption *(inferred)*. |
-| Zig `std.crypto.Certificate` (RSA verify) | Zig | MIT | — | Zig 0.16.0 | Internal, non-`pub`, verify-only over certificates: no signing, OAEP, key parsing or generation; this module verifies 10.8× faster (SPEC). |
+| Zig `std.crypto.Certificate` (RSA verify) | Zig | MIT | — | Zig 0.16.0 | Internal, non-`pub`, verify-only over certificates: no signing, OAEP, key parsing or generation; this module verifies more than 10× faster (see *Performance*). |
 
-**Where we are ahead:** the only public pure-Zig RSA with sign, verify, OAEP (including the decoupled-hash and no-fail forms), PSS, key generation, DER/PEM/PKCS#8/OpenSSH parsing and self-signed X.509; constant-time Montgomery modexp (`montint`), CRT fault check (Bellcore) and optional base blinding; RSA-2048 verify 2.1× OpenSSL and 10.8× `std`'s certificate verifier (SPEC figures). **Where we are behind:** moduli above 8192 bits (OpenSSL: 16384); no RSAES-PKCS1-v1_5 (deliberate, protocol modules carry it gated); no multi-prime keys; encrypted PKCS#8 without scrypt; blinding off by default in the deterministic entry points (Go's posture); key construction costs ~450 µs. (Closed 2026-10-13/14: key writing — PKCS#1/PKCS#8/SPKI/PEM, byte-identical to OpenSSL —, encrypted PKCS#8, run-time hash and prehashed sign/verify, PSS salt recovery and decoupled MGF1, 8192-bit moduli, Wycheproof vectors incl. OAEP digest≠MGF1, the on-disk-field check F1.)
-
+**Where we are ahead:** the only public pure-Zig RSA with sign, verify, OAEP (including the decoupled-hash and no-fail forms), PSS, key generation, DER/PEM/PKCS#8/OpenSSH parsing and self-signed X.509; constant-time Montgomery modexp (`montint`), CRT fault check (Bellcore) and optional base blinding; private operations and verify at or near OpenSSL's speed (the card's `**Performance:**` line) and verify well over 10× faster than `std`'s certificate verifier. **Where we are behind:** moduli above 8192 bits (OpenSSL: 16384); no RSAES-PKCS1-v1_5 (deliberate, protocol modules carry it gated); no multi-prime keys; encrypted PKCS#8 without scrypt; blinding off by default in the deterministic entry points (Go's posture); key construction is slow next to a verify (the Montgomery parameters of a fresh key; see *Performance*). The refusals above are argued in *What is deliberately not done*.
 ## Design & invariants
 
-**ALL PHASES (P1–P6) IMPLEMENTED** — no `@panic`/TODO stub remains in `src/root.zig` or
-`src/openssh.zig`. Low-level primitives named after RFC 8017 §5 (`rsaep`/`rsadp`/`rsadpCrt`/
+Low-level primitives named after RFC 8017 §5 (`rsaep`/`rsadp`/`rsadpCrt`/
 `rsasp1`/`rsavp1`) sit under phase-named public schemes:
 
 - **P1** `signPkcs1v15`/`verifyPkcs1v15` (EMSA-PKCS1-v1_5, RFC 8017 §8.2/§9.2, SHA-1/224/256/384/512).
@@ -50,19 +42,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the decoupled-hash variant `encryptOaepH`/`decryptOaepH` (label/digest hash and MGF1 hash may
   differ per RFC 8017 §7.1 — e.g. XML-Encryption `rsa-oaep` with digest=SHA-256, MGF1=SHA-1); the
   coupled forms delegate to the decoupled ones with both hashes equal. **`decryptOaepHNoFail`**
-  (added 2026-09-11, A1 fix campaign, `xmlenc` F3 OAEP arm) is a non-erroring twin of
+  is a non-erroring twin of
   `decryptOaepHBlinded` for a caller that must implement RFC 8017 §7.2.2's classic
   Bleichenbacher-style countermeasure ("always run the same downstream work regardless of
   unwrap success") at the OAEP layer, not just PKCS#1 v1.5: a padding failure is reported as
   `.ok = false` plus the raw RSADP output for the caller's own decoy derivation, never an early
-  `error`. Every existing entry point (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
-  `decryptOaepHBlinded`) is unchanged — additive only, per `QUESTIONS-ROUND-2.md` Q4 ("aditivní
-  nová funkce v `rsa`, dnešní API se nemění").
+  `error`. The erroring entry points (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
+  `decryptOaepHBlinded`) stay as they are; the no-fail form is an addition, and its whole OAEP decode is
+  branch-free (ctgrind row `oaepnf`).
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1, branch-clean verify).
-  Since 2026-10-13 `signPkcs1v15Prehashed`/`signPssPrehashed` sign a digest the caller already holds
-  (a TLS 1.2 CertificateVerify over a running hash), byte-identical to the message entry points.
+  `signPkcs1v15Prehashed`/`signPssPrehashed` and `verifyPkcs1v15Prehashed`/`verifyPssPrehashed` work on a digest
+  the caller already holds (a TLS 1.2 CertificateVerify over a running hash), byte-identical to the message entry
+  points; the `*Digest` forms take the hash as a run-time `HashId` (SHA-1, SHA-2 incl. 512/224 and 512/256,
+  SHA-3). `verifyPssAuto`/`verifyPssAutoPrehashed` recover the salt length, `maxPssSaltLen` gives the largest
+  salt a key and hash allow, and `signPssH`/`verifyPssH` decouple the MGF1 hash from the message hash.
 - **The secret key crosses the API by pointer, and keys are built into the
-  caller's storage (2026-10-08, BREAKING).** Every entry point that uses a
+  caller's storage.** Every entry point that uses a
   secret key — `signPkcs1v15*`, `signPss`, `decryptOaep*`, `rsadp`,
   `rsadpCrt*`, `rsasp1` — takes `*const SecretKey`; every constructor —
   `SecretKey.fromPrimes`/`fromDer`/`fromPem`, `fromPkcs8`, `fromOpenSSH`,
@@ -70,9 +65,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   argument is copied by the ABI **at the call site**, into the CALLER's own
   frame, where neither side can zero it, and a returned key sits in the
   caller's error-union temporary the same way: the dead-stack probe
-  (`src/stackprobe_test.zig`, 2026-10-08) found the whole 11.8 KiB key there
-  on every call. The 2026-09-16 additive `*Ptr` forms (audit B20, `blindrsa`)
-  are folded into the main names. Every entry point also burns the stack its
+  (`src/stackprobe_test.zig`) found the whole 11.8 KiB key there
+  on every call. There are no separate by-pointer forms. Every entry point also burns the stack its
   body used (`burn.zig`): `std.crypto.ff` passes its 4096-bit-capacity
   `Modulus` by value into every operation, and before the burn a signature
   left `p`, `q`, `d`, `dP`, `dQ`, `qInv` and the CRT halves dozens of times.
@@ -81,29 +75,29 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `fromPem`, cleartext PEM only).
 - **P4b** OpenSSH `PROTOCOL.key` private-key parsing (`fromOpenSSH`: unencrypted and
   bcrypt/aes256-ctr/aes256-cbc encrypted, with a from-scratch Blowfish + bcrypt-pbkdf in
-  `openssh.zig`). The cipher/KDF half is public as `opensshDecryptSection` (2026-10-09) so the
+  `openssh.zig`). The cipher/KDF half is public as `opensshDecryptSection` so the
   `ssh` module decrypts ed25519 and ECDSA containers through the same code.
 - **P5** `generate` (keypair generation: probable primes via sieve + Miller-Rabin, FIPS
   186-5-style constraints).
 - **P6** `selfSignedCert` (X.509 v3 self-signed certificate generation, RFC 5280).
 
 All modular exponentiation routes through the sibling `montint` module (a full-radix-2^64,
-Montgomery-resident, constant-time modexp, ~3× faster than `std.crypto.ff` on the portable path —
-see "Speed" below), and since 2026-10-02 so does every other operation on a private-key value:
+Montgomery-resident, constant-time modexp, much faster than `std.crypto.ff` —
+see *Performance*), and so does every other operation on a private-key value:
 the reduction of `c` into the mod-p/mod-q domains, the CRT recombination (Garner), base
 (un)blinding and the F3 re-encryption, all on `montint.DynModint`. `std.crypto.ff`
 (`Modulus`/`Fe`) remains the carrier type of the public API and of key material;
 `dP`/`dQ`/`qInv` cross into montint by a positional limb repack.
-Measured (ctgrind, ReleaseFast, 2048-bit KAT key): `crt` 213 → 2 in-file contexts — both the
-F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` (the compare and the
-`try` that propagates it; one since 2026-10-14) — and `noncrt` 2 → 0. A blinded op adds one
-more: the blinding redraw verdict (`r⁻¹` checked mod the secret p, q, folded into one branch),
-false only for `r ≡ 0 mod p or q`. Since 2026-10-18 that is measured, not inferred: target
-`crtbl` (`.csprng`) = 2 (F3 + redraw), `crtcache` (two `.cached` ops on one cache) = 4 (F3 from
-each call site + the first op's redraw + since 2026-10-20 the cache's key-match branch, which
-folds in the secret first prime `p`; it reveals only whether the key object lists the same prime
-first — the squaring update adds none).
-**Key derivation (2026-10-03)** is montint limb arithmetic too, constant-time in `p`, `q`:
+
+ctgrind (ReleaseFast, 2048-bit KAT key; the counts are pinned in `scripts/checks/ctgrind-expected.tsv`): the CRT op
+`crt` has 1 in-file context, the F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` (the
+compare and the `try` that propagates it are one context), and `noncrt` has 0. A blinded op adds one more: the
+blinding redraw verdict (`r⁻¹` checked mod the secret p, q, folded into one branch), false only for
+`r ≡ 0 mod p or q`: target `crtbl` (`.csprng`) = 2 (F3 + redraw), `crtcache` (two `.cached` ops on one cache)
+= 4 (F3 from each call site, the first op's redraw and the cache's key-match branch, which folds in the secret first
+prime `p`; it reveals only whether the key object lists the same prime first — the squaring update adds none).
+
+**Key derivation** is montint limb arithmetic too, constant-time in `p`, `q`:
 `n` a limb product, `λ = montint.nt.lcm(p−1, q−1)`, `d = e⁻¹ mod λ`, `dP = e⁻¹ mod (p−1)`,
 `dQ = e⁻¹ mod (q−1)` by `DynModint.inverseOfModulus` (inverses modulo even secrets; `dP` IS
 `d mod (p−1)` since `(p−1) | λ`), `qInv` by Fermat on montint with its self-check kept; the
@@ -112,54 +106,89 @@ values are byte-identical to the big-int derivation they replace (the OpenSSL KA
 `keygen` (p, q tainted): no context in the derivation's arithmetic; the ≤ 173 left are the
 `std.crypto.ff` carriers of `p`, `q`, `n` (`sk.p`/`sk.q` are API fields — Backlog), the public
 `n` (tainted by derivation in the harness), length scans and verdicts, each class named in
-`ctgrind-expected.tsv`. The 212 that went were `std.crypto.ff`'s `reduce` (`shiftIn`, the
-compare-and-subtract) and `montgomeryMul` over the secret primes. This module must never
+`ctgrind-expected.tsv`.
+This module must never
 implement its own bignum or a non-constant-time exponentiation over secret data. `rsasp1`/
 `rsadpCrt` are the CRT fast path (RFC 8017 §5.1.2 form (2)); `rsadp`/non-CRT `d` exist as the
 straightforward form and a correctness cross-check. Modeled after RFC 8017 (PKCS#1 v2.2);
 `PublicKey`/`Modulus`/`Fe` shape designed with reference to Zig std's internal
 `std.crypto.Certificate.rsa` (not `pub` — this module is a clean public superset, not a re-export).
 
-**Speed.** The modular-exponentiation hot path (CRT private op mod p / mod q, non-CRT private op
-mod n, public op mod n) is routed through `montint`; the deep audit measured plain `std.crypto.ff`
-at ~29× OpenSSL for the CRT sign, and `montint` closes most of that gap. `MontParams` are
-precomputed once per key at construction, so no per-operation setup cost is paid.
+**Speed.** The modular-exponentiation hot path (CRT private op mod p / mod q, non-CRT private op mod n, public
+op mod n) is routed through `montint`. `MontParams` are precomputed once per key at construction, so no per-operation
+setup cost is paid; see *Performance*.
 
-**Hardening (post-audit).** The CRT private op (`privateOpCrt`)
+**Hardening.** The CRT private op (`privateOpCrt`)
 carries both fault- and side-channel countermeasures: F3 (Bellcore/BDL) — every CRT private op
 re-encrypts the recovered `m` and checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on
 mismatch rather than handing an attacker a faulty value that could factor `n`; F2 (base blinding) —
 with a `Blinding.csprng`, the op runs on `c·r^e` for a fresh random unit `r` mod n and unblinds by
-`r⁻¹`. Since 2026-10-14 both happen in the CRT domain: `r` is drawn mod the public `n` as before,
-reduced mod p and mod q, the two halves are inverted together (`safegcd.Inverter.invert2`, each
+`r⁻¹`. Both happen in the CRT domain: `r` is drawn mod the public `n` as before,
+reduced mod p and mod q, the two halves are inverted together (`montint.safegcd`'s `Inverter.invert2`, each
 inverse checked `r·r⁻¹ ≡ 1`), and the halves are blinded (`(c mod p)·r^e`) and unblinded
 (`m1·(r mod p)⁻¹`) before the CRT recombination — the same values as blinding mod n, at half-size
 cost (`cp^dP = m1·r` since `e·dP ≡ 1 mod p−1`).
 
-**The blinding seam (B6 RNG-seam audit, 2026-08-12).** `privateOpCrt` takes a `Blinding` — a tagged
-union with a `csprng` arm and a payload-free `none` arm (since 2026-10-18 also `cached`, below) —
+**The blinding seam.** `privateOpCrt` takes a `Blinding` — a tagged
+union with a `csprng` arm and a payload-free `none` arm (also `cached`, below) —
 rather than a `?std.Random`. `signPss` blinds unconditionally (it already holds a CSPRNG for the salt).
 The deterministic entry points cannot: std 0.16 removed `std.crypto.random`, so entropy has to be
-an argument, and `signPkcs1v15`/`decryptOaep`/`decryptOaepH`/`rsadpCrt` have none. Until this audit
-that meant they ran unblinded with **no way for a consumer to change it**, which is the actual
-finding — not the default itself. Each now has a `…Blinded` twin taking an explicit `Blinding`; the
+an argument, and `signPkcs1v15`/`decryptOaep`/`decryptOaepH`/`rsadpCrt` have none. Without a seam they would run unblinded with
+**no way for a consumer to change it**. Each has a `…Blinded` twin taking an explicit `Blinding`; the
 unblinded default is unchanged, because turning it on would be a breaking signature change to
-public API with seven in-repo consumers, and because the primary constant-time defence
+public API with many in-repo consumers, and because the primary constant-time defence
 (`montPowSecret`) and the F3 fault check are on either way. Blinding here is defence in depth: what
 it buys is that a residual leak in the constant-time claim is not correlated with an
 attacker-chosen base.
 
-**Cached blinding (2026-10-18, owner decision).** `Blinding.cached: *BlindingCache` keeps the CRT-
+**Cached blinding.** `Blinding.cached: *BlindingCache` keeps the CRT-
 domain pair (`r^e`, `r⁻¹` mod p and mod q) between operations, the OpenSSL/BoringSSL `BN_BLINDING`
 scheme: each op squares the four values (`(r²)^e = (r^e)²`, `(r²)⁻¹ = (r⁻¹)²`) and a fresh `r` is
 drawn and inverted every `BlindingCache.refresh_every` = 32 ops, or when the cache meets a key other
-than the one it last served (compared by the public `n` and `e`). Measured at 2048 bits (standalone
+than the one it last served (compared by the public `n` and `e` and by the key's first CRT prime `p`, which is secret: the comparison is
+branch-free and folded into one verdict that says only whether this key object lists the same prime first, because
+`n` and `e` do not identify the pair when a key lists its primes the other way round). Measured at 2048 bits (standalone
 harness, `decryptOaepBlinded`, instructions/op): `.csprng` +6.0 % over `.none`, `.cached` +0.85 %.
 The keys stay `*const`; the cache is the caller's mutable state, one per thread (no lock). It holds
 key material — `r^e mod p` and `r⁻¹ mod p` give `p` by a gcd with `n` — so it is wiped by `deinit`,
 and the per-op stack burn does not cover it. Consecutive pairs are known squares of each other;
 both stay as secret as `.csprng`'s fresh `r`. ctgrind targets `crtbl` (`.csprng`) and `crtcache`
 (two ops on one cache: draw, then square).
+**Private-key PEM.** The base64 of a private key is written by `marshal.zig` and read by `pemDecodeBody` through the
+constant-time `b64ct` module. The DER INTEGER trim of `d`/`dP`/`dQ`/`qInv` and the primes in `RevWriter.integer` is
+branch-free over the whole field: the leading-zero count and the sign-pad bit, which DER publishes (the INTEGER's length and
+its 0x00 pad), are computed by mask and only then declassified (`makeMemDefined`, a no-op outside Valgrind); the output is
+byte-identical to OpenSSL's. ctgrind rows: `pemenc` (`toPem(.pkcs1)`, secret fields tainted) 0 in-file; `pemdec` (`fromPem`
+with exactly the base64 characters inside the content of `d`/`dP`/`dQ`/`qInv` tainted) 2 in-file, both argued:
+`keycodec`'s scan for the END line's first `-` crosses the body (no base64 character equals `-`, so the outcome is the
+same for every key), and `montint.nt.divExact`'s divisibility verdict inside `checkWireFields` (folded into its single
+verdict, explicitly declassified as the call's result). `p`, `q` stay untainted in `pemdec` on purpose: `fromPem`
+re-derives the key from them through `fromPrimes`, which is row `keygen`'s claim.
+
+**Size limits.** `max_modulus_bits` is 8192 (the build option `rsa-max-modulus-bits`, 4096 under `-Dprofile=small`, see
+*Build options*); 16384, which OpenSSL accepts, is not followed. Because a key above the cap and malformed DER both answer
+`InvalidDer` from `fromDer`, `PublicKey.modulusBitsFromDer` reads the modulus bit length from the structure alone (no cap,
+no key checks; a non-positive modulus is `InvalidDer`), so a caller can apply a key-length policy the same way under every
+build profile. Private keys are refused under `min_private_modulus_bits` (1024), public keys and `generate` under
+`min_modulus_bits` (1024), see *Threat model*.
+
+**`VerifyKey`.** A verify-only key (montint modulus plus a `u32` exponent) with exactly `PublicKey.fromBytes`'s checks
+(1024…8192 bits, odd `n`, odd `3 ≤ e < 2^32`) and the same verify entry points. It skips the `std.crypto.ff` Montgomery
+constants the hot path never uses, so a key that is parsed, used once and dropped (certificate-chain validation) costs
+far less than a `PublicKey`; `PublicKey.n` and the code that reaches it are untouched. The public modulus is built through
+`DynModint.fromLimbsPublic`, which starts `R mod m` at `2^(bits−1)` and so does work that depends on the exact bit
+length: that is only acceptable for a public modulus. The secret CRT primes keep the derivation from 1, because applying
+the shortcut to them put the secret bit length into a loop bound and added ctgrind contexts to `rsa`'s `keygen` row.
+
+**Encrypted keys and OpenSSH containers.** Password-protected PKCS#8 is PBES2 with PBKDF2 and AES-CBC only. The PBKDF2
+iteration count a file names is capped at `max_pbkdf2_iterations` (2^20; more is `KdfIterationsTooLarge`) and the salt at
+`max_pbes2_salt_len` (64). The bcrypt `rounds` of an OpenSSH container are capped at `max_openssh_kdf_rounds` (2048,
+`KdfRoundsTooLarge`), as Go's `x/crypto/ssh` does (`maxRounds = 1 << 11`; OpenSSH sets no bound); without a cap a hostile
+file with `rounds = 2^32-1` pins the KDF for minutes.
+
+**Stack burn.** Each private-key operation runs its body once under one burn of `burn.private_op_burn` (160 KiB, above the
+measured call depth at every key size); key loading burns `burn.key_burn` (384 KiB). The public wrappers call the inner
+`…Unburned` body, so nested calls do not burn at every level.
 
 ## Threat model / out of scope
 
@@ -174,7 +203,7 @@ addressed by the F3 re-encrypt-and-compare check (see "Hardening" above). Minimu
 small-public-exponent sanity checks apply to parsed keys (`fromBytes`/`fromDer`/`fromPkcs8`/
 `fromOpenSSH`).
 
-**Private-key size floor (2026-11-18, owner decision on the 2026-10-30 sweep item REV-RS-2).**
+**Private-key size floor.**
 Every private key built from components or parsed — `SecretKey.fromPrimes`, `fromDer` (PKCS#1),
 `fromPkcs8`, `fromPem`, `fromPemEncrypted`, `fromPkcs8Encrypted`, `fromOpenSSH`, all of which end
 in the one derivation `fromPrimesImpl` — is refused (`error.InvalidPrivateKey`, the struct wiped)
@@ -185,8 +214,8 @@ is `SecretKey.fromPrimesWith(.., .{ .insecure_allow_small_modulus = true })` (th
 p = 61, q = 53 test, the 512-bit KATs, the sweep tests on hand-made primes use it). Tests at 1023
 and 1024 bits (`sweep_test.zig`).
 
-**Public-key and `generate` floor (2026-11-19, the second half of the same Go 1.24 parity).**
-`generate` refuses `bits < min_modulus_bits` = 1024 with `error.InvalidBits` (it used to take 512..8192),
+**Public-key and `generate` floor** (the second half of the same Go 1.24 parity).
+`generate` refuses `bits < min_modulus_bits` = 1024 with `error.InvalidBits`,
 and every public constructor (`PublicKey.fromBytes`/`fromDer`/`fromPem`, `VerifyKey.fromBytes`/`fromDer`;
 `SecretKey.publicKey()` is a struct copy and keeps whatever its key had) refuses a modulus under 1024 bits
 (`InvalidPublicKey`, `InvalidDer` through the DER/PEM wrappers). Basis: Go 1.24 `crypto/rsa` — `GenerateKey`
@@ -200,300 +229,73 @@ on `generateWith(.., GenerateOptions)` and on `PublicKey.fromBytesWith`/`fromDer
 Both floors are public constants. A generated key under 1024 bits (escape only) has a public half that
 loads back only through the `..With` constructors and a private half that no private parser takes
 (private floor, above). The differential test "VerifyKey.fromBytes accepts and refuses exactly what
-PublicKey.fromBytes does" now covers both the default and the escape floor.
-Delta mutation 2026-11-18: 7 schemata mutants (ReleaseSafe) over the floor check (dropped,
-`<=`), the floor `fromPrimesValue` passes (0), the escape in `fromPrimesWith` (never, always), the
-wipe on refusal, and `generate`'s escape (off: `generate(1022)` searches forever) — 6 killed, 1
-HANG (counted killed); 7/7. Not mutated: `fromPrimesWith`'s `burn.stack` (the same burn as
-`fromPrimes`; only a ReleaseFast stack probe of `fromPrimesWith` could observe it, none exists).
-Delta mutation 2026-11-19 (public-key and `generate` floor): 18 schemata mutants (ReleaseSafe, the
-`sweep_test`/generate/PublicKey/VerifyKey/PEM/marshal tests) — the escape ignored, the escape's
-floor 511, the default floor 1023, `<` to `<=` in `PublicKey.fromBytesWith`, `VerifyKey.fromBytesWith` and
-`generateValue`, the options dropped at each of `PublicKey.fromDerWith`/`fromPemWith`, the DER impl,
-`VerifyKey.fromDerWith`, `generateValue`'s final `fromBytesWith` and `generateValue` as a whole, and the
-escape forced on in each default wrapper (`generate`, both `fromBytes`, both `fromDer`, `fromPem`) — 18
-killed, 0 survivors; the card is cumulative (177 + 18 / 213 + 18, 36 eq).
+PublicKey.fromBytes does" covers both the default and the escape floor.
 
-ctgrind 2026-11-18: every rsa row's count unchanged (crt 1, noncrt 0, crtbl 2, crtcache 4, oaepnf 1,
-keygen 118 <= 173, pemenc 0, pemdec 2); only the source pins moved (the new branch on `n.bits()`, a
-public value), re-pinned.
-ctgrind 2026-11-19: `--check rsa` after the public floor: every count unchanged, only the source pins moved (the new `options.minBits()` branches, public values); re-pinned (`--update-digests rsa`, 8 rows), then `--check rsa` clean.
+**Residual risks a consumer relies on.**
+
+- `SecretKey.fromPrimes` trusts `p` and `q` to be prime and does not test it (see Backlog); a composite is caught late
+  (a Carmichael `p` passes the `qInv` Fermat self-check and the sign-time fault check then refuses the key), not at import.
+- `sk.p`/`sk.q` are `std.crypto.ff` `Modulus` carriers whose construction branches on the secret value; this is most of
+  ctgrind `keygen`'s count (Backlog). The prime search's sieve and Miller-Rabin's squaring count are observable for a kept
+  prime (Backlog).
+- A `BlindingCache` holds key material (`r^e mod p` and `r⁻¹ mod p` give `p` by a gcd with `n`): it is wiped by `deinit`, and the
+  per-operation stack burn does not cover it. One cache per thread, no lock.
+- A hostile PBES2 file can cost up to ~0.3–1 s of PBKDF2 (the cap is fixed, Backlog).
 
 ## Verification
 
-`zig build test-rsa` is green across `root.zig` and `openssh.zig`. Anchored
-against OpenSSL-generated known-answer vectors: keys generated with `openssl genpkey -algorithm
-RSA` (OpenSSL 3.5.5, 2026-07-10), components dumped via `openssl pkey -text`, signatures produced
-with `openssl dgst -shaN -sign` for PKCS1-v1.5 (deterministic, so these are byte-exact KATs) and
-`openssl dgst -sigopt rsa_padding_mode:pss` for PSS. `generate`, `selfSignedCert`, and the
-bcrypt-pbkdf inside OpenSSH parsing are additionally cross-checked against `std.crypto.Certificate`
-/ `std.crypto.pwhash.bcrypt.opensshKdf` as independent oracles (not just this module's own code).
-**Wycheproof (2026-10-14)** — `src/wycheproof_test.zig` over C2SP/wycheproof `testvectors_v1`
-(recipe `tools/wycheproof.py`, line-based data in `src/testdata/`, Apache-2.0 test data, see NOTICE):
-PKCS#1 v1.5 verify 1553 tests (2048 SHA-224/256/384, 3072 SHA-256/512, 4096 SHA-512; every vector
-through both `PublicKey` and `VerifyKey`, which must agree), PSS verify 241 (`mgf1_32`, `mgf1_0`,
-`pss_misc` groups with MGF1 hash = digest), OAEP decrypt 418 — including
-`rsa_oaep_2048_sha256_mgf1sha1` and `rsa_oaep_misc`, so the digest≠MGF1 `decryptOaepH`
-configuration now has external vectors. Wycheproof's "acceptable" cases, our reading: MissingNull
-(DigestInfo without the NULL parameter) is rejected — verify re-encodes the full EMSA and compares
-bytes; SmallIntegerCiphertext (OAEP) is accepted — RFC 8017 requires only `c < n` and length `k`.
-Dropped (counted in each data header): 8192-bit keys (over the cap), SHA-512/t, SHA-3/SHAKE, three-
-prime keys, and PSS with MGF1 hash ≠ digest (`verifyPss` takes one hash; Backlog).
+- **Run:** `scripts/modtest rsa` (a heavy module: the generate and 8192-bit tests are long; `-Dprofile=small` and
+  `-Drsa-max-modulus-bits=6144` are covered, see *Build options*). Fuzz verdicts come from the deterministic driver
+  (`RSA_FUZZ=<runs>[,<first seed>]`), never `zig build --fuzz`.
+- **Anchors:** KATs from OpenSSL (keys from `openssl genpkey -algorithm RSA`, components from `openssl pkey -text`,
+  PKCS#1 v1.5 signatures from `openssl dgst -shaN -sign`, which are deterministic and so byte-exact, PSS from
+  `openssl dgst -sigopt rsa_padding_mode:pss`), key writing byte-identical to OpenSSL 3's output for the same key.
+  `generate`, `selfSignedCert` and the bcrypt-pbkdf inside OpenSSH parsing are cross-checked against
+  `std.crypto.Certificate` / `std.crypto.pwhash.bcrypt.opensshKdf` as independent oracles.
+- **Wycheproof:** `src/wycheproof_test.zig` over C2SP/wycheproof `testvectors_v1` (recipe `tools/wycheproof.py`, line-based
+  data in `src/testdata/`, Apache-2.0 test data, see `NOTICE`): PKCS#1 v1.5 verify (2048 SHA-224/256/384, 3072
+  SHA-256/512, 4096 SHA-512; every vector through both `PublicKey` and `VerifyKey`, which must agree), PSS verify (the
+  `mgf1_32`, `mgf1_0` and `pss_misc` groups with MGF1 hash = digest), OAEP decrypt (including `rsa_oaep_2048_sha256_mgf1sha1`
+  and `rsa_oaep_misc`, the external vectors for the digest≠MGF1 `decryptOaepH` configuration). Wycheproof's "acceptable"
+  cases, our reading: MissingNull (DigestInfo without the NULL parameter) is rejected, because verify re-encodes the full
+  EMSA and compares bytes; SmallIntegerCiphertext (OAEP) is accepted, because RFC 8017 requires only `c < n` and length
+  `k`. Dropped (counted in each data header): 8192-bit keys (over the cap), SHA-512/t, SHA-3/SHAKE, three-prime keys, and PSS
+  with MGF1 hash ≠ digest (`verifyPss` takes one hash; `verifyPssH` takes two).
+- **Test classes:** the RFC 8017 primitives and schemes against the KATs; every refusal of the DER/PEM/PKCS#8/OpenSSH
+  readers and the PBES2 limits with one property broken per test; both size floors and the escape option; the F1 on-disk
+  field check; OAEP decode verdicts (the erroring and the no-fail form); the F3 fault check and the F2 unblinding;
+  `BlindingCache` (the pair after a served op is the previous pair squared; a cache moved between keys that differ only in
+  `e`, only in `n`, or only in the order of the primes fails closed); the writers' bounds, minimality and wiping on error
+  (`marshal.zig`, `der_writer.zig`); `src/sweep_test.zig` for the no-panic sweep and the mutation-driven cases.
+- **Fuzz:** seven `RSA_FUZZ` harnesses (`rsa-pubder`, `rsa-secder`, `rsa-pkcs8`, `rsa-pubpem`, `rsa-secpem`, `rsa-pbes2`,
+  `rsa-openssh`), each with a reach check that its inputs get past the parser's first gates.
+- **Dead stack:** `src/stackprobe_test.zig` (no key or CRT residue after signing, decryption and key loading) and
+  `src/stackprobe2_test.zig` (bcrypt_pbkdf and Blowfish leave no passphrase or key), ReleaseFast.
+- **Constant time:** ctgrind rows `crt`, `noncrt`, `crtbl`, `crtcache`, `oaepnf`, `keygen`, `pemenc`, `pemdec` (see
+  *Design & invariants*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
-## Performance — `bench-rsa` against OpenSSL (2026-10-10)
+## Performance
 
-The comparative benchmark behind the card's Performance line; it supersedes the single
-`openssl speed` comparison of the next section for the ratios (that section's key-construction
-analysis still stands: the bench times warm keys only). Reference: OpenSSL 3.5.5, system
-`libcrypto.so.3`, EVP RSA (CRT, base blinding ON by default, `bn_mul_mont` MULX/ADX assembly).
-Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
+`zig build bench-rsa` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`) compares sign, blinded sign, cached-blinding
+sign, verify and OAEP decrypt (with and without blinding) at 2048, 3072 and 4096 bits against OpenSSL's EVP RSA (CRT, base
+blinding on by default), warm key, 32-byte message; each side keeps its best round and the ratio is ours/theirs by user-mode
+cycles. Before timing, an interop check has OpenSSL generate the keys both sides load, its PKCS#1 v1.5 signature must equal
+ours byte for byte, and it must decrypt our OAEP ciphertext. The card's `**Performance:**` line carries the figures.
 
-Method: `zig build bench-rsa` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL generates the 2048/3072/4096-bit keys both sides load; its PKCS#1 v1.5 signature must equal ours byte for byte and it must decrypt our OAEP ciphertext to the message).
+What the figures depend on:
 
-Workloads per key size, warm key, 32-byte message: `sign` = `signPkcs1v15(Sha256)` (this
-module's default: blinding OFF) and `signbl` = `signPkcs1v15Blinded(.csprng)`, both vs
-`SHA256` + `EVP_PKEY_sign` (blinding ON); `verify` = `verifyPkcs1v15` vs `EVP_PKEY_verify`
-(e = 65537); `dec`/`decbl` = `decryptOaep`/`decryptOaepBlinded` (SHA-256, MGF1-SHA-256) vs
-`EVP_PKEY_decrypt`. `BENCH_ROUNDS=5`:
-
-| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
-|---|---:|---:|---:|---:|---:|
-| `sign_2048` | 1210320 | 600158 | 2.015 | 5.8% | 4.5% |
-| `signbl_2048` | 1639761 | 598494 | 2.727 | 2.1% | 1.1% |
-| `verify_2048` | 28091 | 18931 | 1.489 | 1.7% | 5.0% |
-| `dec_2048` | 1206932 | 610870 | 1.990 | 1.3% | 5.0% |
-| `decbl_2048` | 1678805 | 605775 | 2.775 | 0.9% | 6.6% |
-| `sign_3072` | 4307409 | 1829374 | 2.362 | 2.5% | 3.7% |
-| `signbl_3072` | 5125088 | 1820599 | 2.840 | 1.2% | 5.8% |
-| `verify_3072` | 56847 | 37619 | 1.522 | 0.8% | 1.6% |
-| `dec_3072` | 4322490 | 1809155 | 2.352 | 0.8% | 1.4% |
-| `decbl_3072` | 5178647 | 1851241 | 2.819 | 7.2% | 3.3% |
-| `sign_4096` | 7417197 | 4087564 | 1.864 | 6.0% | 1.5% |
-| `signbl_4096` | 8883821 | 4043996 | 2.223 | 9.5% | 6.2% |
-| `verify_4096` | 90867 | 62503 | 1.444 | 1.2% | 1.0% |
-| `dec_4096` | 7470756 | 4045343 | 1.859 | 5.1% | 1.0% |
-| `decbl_4096` | 8841510 | 4016381 | 2.207 | 2.6% | 6.1% |
-
-A first run (3 rounds, heavier load, spreads up to 84 %) gave 1.41–3.29×, worst `decbl_3072`;
-the quieter run above is the card's.
-
-**Reading (first measurement).** The private operation was ~1.9–2.4× OpenSSL with blinding off
-and ~2.2–2.8× with it on (OpenSSL always blinds); worst 2.84× (`signbl_3072`), P4.
-
-### After the 2026-10-10 performance pass (the card's numbers)
-
-Profile first (`perf` on the bench binary): the CRT halves (L = 16/24/32 limbs) ran the PORTABLE
-CIOS at 2048/3072 bits (montint's runtime-`n` asm lost below 2048 bits) and the asm core at 4096
-— `montSqr` + `montMul` ~95 % of an unblinded op; with blinding on, `invModN` (a `std.math.big`
-extended Euclid) was ~25 % of `signbl_2048` on top. Three levers, all measured:
-
-1. **montint fixed-`L` asm kernels** (`asm_core.montMulFixed`/`montSqrFixed`, see montint SPEC):
-   unblinded rows 1.9–2.4× → 1.49–1.55× (2048), 1.50 (3072), 1.49 (4096) in one 3-round run;
-   the dedicated square added ~8–11 % per squaring on top.
-2. **Blinding inverse on a constant-time batched safegcd** (`src/safegcd.zig`, Bernstein–Yang
-   in 59-divstep batches over runtime-length signed-62 vectors) instead of `std.math.big`, and
-   `r` drawn/range-checked as a montint element (no `ff` round trip): blinded rows 2.28/1.96/1.82
-   → 1.68/1.63/1.56× (2048/3072/4096) on top of lever 1. The inverse is verified (`r·r⁻¹ ≡ 1`)
-   before use; any failure redraws `r`.
-3. (none for verify; it rode lever 1: 1.49/1.52/1.44 → 1.15/1.29/1.28×).
-
-Same method, `BENCH_ROUNDS=7`, two full runs (spreads ≤ 3.4 % ours, ≤ 8 % ref):
-
-| workload | ours ns/op (run 2) | ref ns/op | ours/ref run 1 | run 2 |
-|---|---:|---:|---:|---:|
-| `sign_2048` | 867233 | 580726 | 1.522 | 1.496 |
-| `signbl_2048` | 918658 | 577034 | 1.604 | 1.594 |
-| `verify_2048` | 20531 | 17760 | 1.163 | 1.147 |
-| `dec_2048` | 851000 | 577819 | 1.489 | 1.484 |
-| `decbl_2048` | 937240 | 582769 | 1.609 | 1.606 |
-| `sign_3072` | 2468809 | 1736202 | 1.446 | 1.424 |
-| `signbl_3072` | 2623759 | 1735909 | 1.506 | 1.506 |
-| `verify_3072` | 46459 | 35698 | 1.275 | 1.305 |
-| `dec_3072` | 2454902 | 1742957 | 1.426 | 1.420 |
-| `decbl_3072` | 2608336 | 1722903 | 1.521 | 1.505 |
-| `sign_4096` | 5392183 | 3879048 | 1.396 | 1.386 |
-| `signbl_4096` | 5582356 | 3856660 | 1.438 | 1.441 |
-| `verify_4096` | 77094 | 60406 | 1.284 | 1.279 |
-| `dec_4096` | 5374537 | 3889644 | 1.388 | 1.382 |
-| `decbl_4096` | 5643644 | 3908478 | 1.446 | 1.442 |
-
-Worst row 1.61× (`decbl_2048`). At 2048 OpenSSL runs its AVX2 `rsaz_1024` code for the CRT
-halves, which is why that size stays furthest behind.
-
-### After the 2026-10-14 performance pass (the card's numbers)
-
-Profile of the whole op first (`perf`, `bench-rsa`): besides montint's kernels (see montint SPEC
-"8-row block kernels"), `DynModint.reduceLimbs` was ~6 % of a private op (two Montgomery multiplies
-per 64-bit digit — now whole `L`-limb digits, 4 multiplies for the 2048→1024-bit reduction), and the
-blinded rows paid a 2048-bit safegcd inverse mod n (~7 %). Blinding moved into the CRT domain (see
-"Hardening" above): two half-size inverses in lockstep — the two divstep chains as one 2×64-bit
-vector, since as scalars they spilled to the stack (~24 cycles a step) — plus half-size `r^e`,
-blind and unblind. Same method, `BENCH_ROUNDS=5`:
-
-| workload | ours ns/op | ref ns/op | ours/ref |
-|---|---:|---:|---:|
-| `sign_2048` | 607135 | 601799 | 1.002 |
-| `signbl_2048` | 651103 | 606566 | 1.077 |
-| `verify_2048` | 15536 | 18661 | 0.819 |
-| `dec_2048` | 612620 | 612562 | 0.998 |
-| `decbl_2048` | 658704 | 610845 | 1.072 |
-| `sign_3072` | 1792475 | 1810614 | 0.983 |
-| `signbl_3072` | 1872311 | 1818691 | 1.030 |
-| `verify_3072` | 33595 | 37800 | 0.889 |
-| `dec_3072` | 1797908 | 1824613 | 0.987 |
-| `decbl_3072` | 1865306 | 1831182 | 1.018 |
-| `sign_4096` | 3929932 | 4110079 | 0.967 |
-| `signbl_4096` | 4028928 | 4065975 | 1.001 |
-| `verify_4096` | 55794 | 63674 | 0.878 |
-| `dec_4096` | 3962739 | 4091691 | 0.970 |
-| `decbl_4096` | 4083706 | 4126906 | 0.994 |
-
-Worst row 1.08× (`signbl_2048`). What the blinded rows still pay over OpenSSL is the stateless
-design: OpenSSL caches a blinding pair per key and updates it by squaring (two multiplies per op);
-this module's keys are `*const`, so every op draws a fresh `r` and inverts it (~3 % at 2048 bits).
-(The table above supersedes the 2026-10-10 note that OpenSSL runs AVX2 `rsaz_1024` here: on a
-BMI2+ADX CPU OpenSSL's `rsaz_avx2_eligible` declines in favour of its MULX path — inferred from
-OpenSSL's documented dispatch, not measured.)
-
-### After the 8192-bit cap (2026-10-14, the card's numbers)
-
-Raising `max_modulus_bits` to 8192 doubled every capacity-sized object, and work that scaled
-with the capacity instead of the key showed up at 2048 bits: blinded sign/decrypt 1.08 → 1.12×,
-verify 0.83 → 0.91× (A/B against the same tree at 4096: perf put it in `compiler_rt.memset` —
-Zig 0.16 lowers a `@memset` of a few hundred bytes to a byte-wise call (0.17.0's is vectorised, not re-measured) — in volatile byte
-wipes of 1–5 KiB structs, and in 1 KiB compares). Fixed by bounding the work by the key: verify
-on exactly k octets, blinding wipes the slot limbs only and takes `e` as a `u32`; in montint
-`DynModint` results zero only above the slot (vector stores), `elemFromBytesBE` subtracts over
-the slot, `safegcd` touches only its `k` live limbs. `bench-rsa`, 11 rounds, OpenSSL 3.5.5:
-
-| bits | sign | sign blinded | verify | decrypt | decrypt blinded |
-|---|--:|--:|--:|--:|--:|
-| 2048 | 1.029 | 1.083 | 0.843 | 1.022 | 1.097 |
-| 3072 | 0.992 | 1.032 | 0.900 | 0.990 | 1.033 |
-| 4096 | 0.971 | 0.998 | 0.887 | 0.970 | 0.999 |
-
-Worst 1.097× (`decbl_2048`); the remaining blinded gap at 2048 is the stateless blinding above.
-The private-op stack burn grew 200 → 384 KiB (~4 µs more zeroing per op; 160 KiB and one burn per
-call since 2026-10-18, below).
-
-### After the 2026-10-18 pass: one burn, a tighter divstep bound, cached blinding (the card's numbers)
-
-Profile first (`perf` + a standalone ReleaseFast harness looping `decryptOaepBlinded` 2048, min of
-`perf stat` runs): `pow` 84.5 %, then the stack burn 3.1 %, the blinding inverse ~4 % (`invert2` +
-its inlined divsteps), `powPublic` 3.4 % (`r^e` and the F3 check). Three levers:
-
-1. **One stack burn per call, sized for the op.** The nested public calls burned at every level
-   (`decryptOaepBlinded` → `decryptOaepHBlinded`: 2 × 384 KiB; `rsasp1`: 3×), and the op shared the
-   key-loading size. A body now calls the inner BODY (`…Unburned`), and `burn.private_op_burn` is
-   160 KiB (measured depth 121.7–124.9 KiB at every key size; `key_burn` keeps 384 KiB for
-   `fromPrimes` & co.). Burn 2.0 % of cycles → ~0.4 %.
-2. **safegcd trip count** (montint): the half-delta bound `⌊(45907·b + 26313)/19929⌋` instead of
-   Theorem 11.2's — 40 batches instead of 51 for 1024-bit primes.
-3. **`Blinding.cached`** (owner decision 2026-10-18): the pair squared per op, fresh every 32 ops.
-
-Instructions per blinded 2048 decrypt (deterministic): 6 437 680 → 6 334 170 (`.csprng`, levers
-1+2, −1.6 %) → 6 025 060 (`.cached`, −6.4 %); `.none` is 5 974 226. `bench-rsa`, two runs of 7 rounds
-(OpenSSL 3.5.5; ref spreads up to 12 % on single rows, our spreads ≤ 6 % on the blinded rows):
-
-| bits | sign | signbl | signca | verify | dec | decbl | decca |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| 2048 | 1.019 / 1.020 | 1.080 / 1.076 | 1.026 / 1.032 | 0.837 / 0.840 | 1.017 / 1.016 | 1.080 / 1.079 | 1.023 / 1.024 |
-| 3072 | 0.978 / 0.981 | 1.018 / 1.021 | 0.985 / 0.985 | 0.898 / 0.894 | 0.979 / 0.977 | 1.018 / 1.018 | 0.987 / 0.989 |
-| 4096 | 0.973 / 0.973 | 1.002 / 1.000 | 0.976 / 0.977 | 0.892 / 0.888 | 0.967 / 0.967 | 1.003 / 1.001 | 0.978 / 0.974 |
-
-Worst 1.080× (`signbl_2048`/`decbl_2048`, was 1.083–1.097); with `.cached` the blinded rows sit
-within 0.6 % of the unblinded ones, as OpenSSL's do. What is left at 2048 for `.csprng` is the
-stateless draw (the inverse and `r^e`, ~4.7 % of cycles); the modexp itself (`pow`, REDC 54 % of it
-at L = 16) is the next lever and is not touched here.
-
-Re-measured on a quiet host 2026-10-22 (`22733ec8`, Zig 0.17, two runs of 7 rounds; our spreads
-≤ 0.6 %, OpenSSL's up to 6 %): worst 1.088× (`signbl_2048`) / 1.084× (`decbl_2048`), 3072 and 4096
-≤ 1.025×, verify 0.82–0.89×. The P2 bar (≤ 1.10×) holds; the 10-18 "1.12×" was the loaded host.
-
-### 2026-11-15: montint's almost-Montgomery ladder (loaded host)
-
-The L = 16 REDC lever named above was profiled before anything was changed (montint SPEC
-"Almost-Montgomery ladder"). Three findings:
-
-- The `u = w·n0inv` chain does not bind.
-- OpenSSL's CRT halves run its scalar MULX/ADX code here, not `rsaz_avx2`. This was measured
-  (perf + disassembly); the 10-14 entry had only inferred it.
-- Both sides run at the same IPC, and the 1024-bit modexp was already at parity.
-
-The change that paid was in montint's `powMont`: a top-only final subtract and in-place kernels,
-−2.8 % cycles at 1024 bits. `bench-rsa` 2048 compares base `4115cf211` against the new code,
-alternating builds, 5 rounds each. The host was shared with other jobs (spreads 3–17 %), so only
-the second pair is quoted:
-
-| | sign | signbl | signca | verify | dec | decbl | decca |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| base | 0.985 | 1.053 | 1.025 | 0.809 | 0.993 | 1.071 | 1.013 |
-| new | 0.960 | 1.036 | 0.987 | 0.797 | 0.959 | 1.038 | 0.949 |
-
-The first pair agrees on every row it did not lose to noise: new `sign` 0.962, `signbl` 1.007,
-`decbl` 0.993. The blinded `.csprng` rows still carry the stateless draw (the inverse and `r^e`) on
-top of the modexp; `.cached` brings them to the unblinded level.
-
-## Performance posture — measured 2026-09-08, and deliberately not chased further
-
-Numbers are ReleaseFast on one desktop; treat them as ratios. OpenSSL 3.5.5 on the
-same host is the reference (`openssl speed`).
-
-| operation | this module | OpenSSL | ratio |
-|---|---:|---:|---:|
-| RSA-2048 `verifyPkcs1v15`, key already built | **36 µs** | 17.4 µs | **2.1×** |
-| `PublicKey.fromDer` (builds the key) | **~500 µs** (re-measured 2026-09-16: **453 µs**) | — | — |
-
-**The modexp is fine and needs no work.** 2.1× OpenSSL on portable Zig without assembly
-is a good number, and it is recorded here so a future audit does not start optimising
-something already measured good. For contrast, `std.crypto.Certificate.Parsed.verify`
-does the same verification in **388 µs** — 10.8× slower than this module.
-
-**Key construction, not the modexp, is where the time goes**, and it splits in two:
-
-- **~185 µs — `std.crypto.ff.Modulus.fromBytes`**, which computes its own Montgomery
-  constants. The hot path never uses them: the modexp goes through `montint`. The `ff`
-  types are kept for serialization, validation and the `powPublic` fallback.
-- **~315 µs — `montParamsFromModulus`**, dominated by the 64·L doublings that derive
-  `R mod m`. (The other half, `R² mod m`, stopped being 64·L more doublings on
-  2026-09-08 — see `montint`'s changelog. That alone took `fromDer` from 813 µs to
-  ~500 µs.)
-
-### Why neither is being chased
-
-⭐ **Both hot consumers hold a WARM key, so they never pay this.** The web-server consumer builds its
-`SecretKey` once when its certificate store loads and then only signs; `iec62351`'s GOOSE
-verifier carries an already-built `PublicKey` and verifies per frame. The setup cost
-lands only on **cold, one-shot** users — `x509` chain validation, `dtls` handshakes, and
-the token/document modules (`jwt`, `jwe`, `saml`, `xmldsig`, `xmlenc`, `ssh`, `ocsp`,
-`dnssec`, `webauthn`, `blindrsa`) — and none of them is throughput-bound on it today.
-
-Two routes exist and both were measured, not guessed:
-
-1. Skip the `ff` Montgomery constants the hot path does not use (~185 µs). Touches the
-   public field `PublicKey.n`, which 13 modules can reach.
-2. Give `montint` a constructor taking the modulus bit length as an explicitly PUBLIC
-   input, so `R mod m` can start near the modulus instead of at 1 (~315 µs). The cheap
-   form makes the doubling count depend on the modulus size — a secret for a general
-   caller, though not for RSA — so it needs a new contract in a module shared with
-   `paillier`, `threshold_ecdsa` and `vdf`.
-
-**Owner decision, 2026-09-08: neither is done here.** They are optimisations without a
-consumer that feels them, and the consumer who would (the web-server consumer) is expected to solve its own
-performance question first and push the result back. This section exists so that arrives
-as a measurement rather than a rediscovery.
-
-**Superseded 2026-10-11 — both done, for the consumer that now feels them.** The owner's
-maturity goal (2026-10-10: a consumed module grades ≤ 3) made `x509`'s 6.4–7.3× Go chain verify
-the first work item, and the profile put all of it in signature math. (1) The `ff` constants are
-skipped by a new type, `VerifyKey` (montint modulus + `u32` exponent), so `PublicKey.n` and the
-13 modules that reach it are untouched. (2) `montint`'s new `DynModint.fromLimbsPublic` starts
-`R mod m` at `2^(bits−1)`. Its work depends on the exact bit length, so it is used only for the
-public modulus (`PublicKey.fromBytes`, `VerifyKey`); the secret CRT primes and every other
-`DynModint` caller (`paillier`, `threshold_ecdsa`, `ssh`) keep the derivation from 1 — a first
-version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 → 177) and
-`paillier/keygen` (314 → 324), the tainted bit length steering the loop. Result in `x509`:
-0.81–0.92× Go 1.26.0 crypto/x509.
+- The modexp is `montint`'s fixed-length assembly kernels per CRT half; the blinding inverse is `montint.safegcd`'s
+  constant-time batched inverse over the two CRT halves.
+- `.csprng` blinding draws and inverts a fresh `r` per operation (the stateless design); `.cached` keeps the pair and
+  brings the blinded rows to the unblinded level, as OpenSSL's does.
+- At 2048 bits OpenSSL's CRT halves run its scalar MULX/ADX code, not `rsaz_avx2` (measured with perf and disassembly).
+- Key construction, not the modexp, is where the time goes for a cold, one-shot user: the `std.crypto.ff` Montgomery
+  constants of a `PublicKey` (skipped by `VerifyKey`) and `montParamsFromModulus`, dominated by the doublings that derive
+  `R mod m`. A consumer that holds a warm key never pays this; the one-shot users are certificate-chain validation, DTLS
+  handshakes and the token/document modules. The first comparison with `std.crypto.Certificate.Parsed.verify` was 388 µs
+  against this module's 36 µs, before the later speed work.
 
 ## What is deliberately not done
 
@@ -560,210 +362,31 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
   `scripts/checks/small-size-expected.tsv` (ReleaseSmall probe 863 → 437 KB).
 
 ## Backlog / deferred
-- **Delta review 2026-11-02** *(read-only, independent, `bb4efd9a..` of `src/`)* — covered the changes since the recorded audit, not the whole module, with no mutation run, so the `**Audit:**` line stays stale on purpose (A1 needs a mutation run over the current source). Found the `der_writer` tag 31 panic (now a compile error). Open: the `fromPrimes` 4-byte exponent test asserts only `accepted >= 1` over 6 candidates; its reject cases are exact.
 
-- **PEM `aes256-ctr` decryption on Zig 0.17** *(2026-10-20)*: the encrypted-OpenSSH-key path (`src/root.zig`, `std.crypto.core.modes.ctr` over std `Aes256`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap).
-- ~~**Build option across the closure**~~ ✅ 2026-10-17: `modtest <m> -Dprofile=small` green for blindrsa, jwt, jwe, webauthn,
-  xmlenc, xmldsig, saml, x509, tlsclient, acme, dtls, iec62351, opcua, ssh — none needed a change (no test of theirs uses a key
-  above 4096 bits). The `small` CI lane now runs the whole closure. ssh's `gex_max_bits` still keeps its own `DynModint(8192)`
-  (ssh Backlog).
-- **Private-key PEM: a ctgrind target** — ✅ DONE 2026-11-17, two pinned rows. The base64 half
-  since 2026-10-17 (`marshal.zig` encodes and `pemDecodeBody` decodes through the constant-time
-  `b64ct` module). A first single target over `toPem`/`fromPem` (2026-11-17 morning: 227 contexts)
-  mixed three things: the encoder's INTEGER trim, the DER length bytes the harness tainted with the
-  content, and `fromPrimes`' re-derivation (row `keygen`'s residue). Now split:
-  - `pemenc` (`toPem(.pkcs1)`, `d`/`dP`/`dQ`/`qInv` and the primes with their Montgomery params
-    tainted): **0 in-file** (was 8). `RevWriter.integer`'s trim is branch-free over the whole field;
-    the leading-zero count and the sign-pad bit — what DER publishes, the INTEGER's length and its
-    0x00 pad — are computed by mask and only then declassified (`makeMemDefined`, a no-op outside
-    Valgrind). Output byte-identical (the OpenSSL goldens; boundary tests in `marshal.zig`).
-  - `pemdec` (`fromPem` of an untainted key's text with exactly the base64 characters whose six bits
-    all lie in the CONTENT of `d`/`dP`/`dQ`/`qInv` tainted; tags, lengths, armor stay defined):
-    **2 in-file**, both argued: `keycodec`'s scan for the END line's first `-` crosses the body (no
-    base64 character equals `-`, so the outcome is the same for every key), and `montint.nt.divExact`'s
-    divisibility verdict inside `checkWireFields` (folded into its single verdict; constant for a valid
-    key). That single verdict is now declassified explicitly (it is the call's result). `p`, `q` stay
-    untainted on purpose: `fromPem` re-derives the key from them through `fromPrimes`, which is row
-    `keygen`'s claim and would otherwise be counted twice.
-  Delta mutation of the trim: 8 mutants (loop bound, first-byte select, top-byte capture, `seen`,
-  the `z` count, the last-byte arm, the pad bit, the pad emission), 8/8 killed. Original text:
-- ✅ DONE 2026-10-17 (`676fa12e2`: `marshal.zig` and `pemDecodeBody` go through the constant-time `b64ct`; ctgrind rows `rsa/pemenc` and `rsa/pemdec` pinned 2026-11-17, see the ctgrind item above). **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
-  `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
-  alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on
-  2026-10-13 (fixed there with `acme/src/b64ct.zig`). Fix: the same constant-time codec (a 4th copy, or
-  move `b64ct` into a shared module) on the private paths only; add a ctgrind target over
-  `SecretKey.toPem`/`fromPem`. Effort: small. Consumers: acme (RSA keys), jwt, ssh.
-- **Performance levers** — ✅ 2026-10-10: (a) done as montint's fixed-`L` kernels, (c) done
-  differently (a constant-time safegcd inverse per op instead of a cached pair, which would
-  need mutable state in a `*const SecretKey`); (b) not needed (montint's window is already
-  w = 5). Now 1.15–1.61× (SPEC "After the 2026-10-10 performance pass"). Next, by payoff: an
-  AVX2 radix-2^29 kernel for L = 16 (what OpenSSL's `rsaz_1024` does at 2048), and a cached
-  blinding pair if a mutable key context ever exists. Original text:
-  **(bench 2026-10-10: private op 1.9–2.4×, blinded 2.2–2.8×, verify
-  1.4–1.5× OpenSSL 3.5.5; P4 → P3 needs every row ≤ 2×; proposals, none measured):**
-  (a) a MULX/ADX Montgomery multiply/square for `montint` (what `bn_mul_mont`/`rsaz` give
-  OpenSSL; p256's `fast_core` is the in-tree precedent) -- moves every row, verify included;
-  (b) a CT fixed-window exponentiation with a wider window (w = 5–6) and gathered table if
-  the current one is narrower; (c) for the blinded paths, a cached blinding pair updated by
-  squaring per operation (OpenSSL's `BN_BLINDING_update`: two modular multiplications) instead
-  of a fresh `r`, `r^e` and `r^-1` each time -- the +0.35–0.5× the blinded rows carry over the
-  unblinded ones.
-- **Fixed 2026-10-09 — bcrypt `rounds` from the key file capped at 2048** (`max_openssh_kdf_rounds`,
-  `error.KdfRoundsTooLarge`), as Go's x/crypto/ssh does (`maxRounds = 1 << 11`; OpenSSH sets no
-  bound). Found by RSA_FUZZ `rsa-openssh` (HANG, seed 26887: `rounds = 2^32-1` pinned
-  `bcryptPbkdf` > 120 s). Owner: "our ssh qualitatively at the level of the Go implementation".
-- **Review 2026-10-03 (L6):** `fromPrimes` trusts `q` to be prime (documented) and a Carmichael
-  `p` passes the `qInv` Fermat self-check; the sign-time fault check then refuses such a key, so it
-  fails late rather than at import. Paillier's checked path tests primality; rsa could offer the same
-  (`DynModint.isProbablePrime` on both). Also reword the "2^-128 worst case" Miller-Rabin comment
-  (witnesses come from the lower half — montint backlog L2). Effort S.
-
-- ~~The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT~~ ✅ 2026-10-14:
-  Wycheproof `rsa_oaep_*_mgf1sha*` covers it.
-- ~~**`rsa-pbes2` fuzz: 4 damaged inputs accepted in one 2000-run driver pass**~~ *(2026-10-14,
-  unattributed)* ✅ 2026-10-18 closed, not reproduced: the driver at HEAD accepted 0 of 1 685
-  damaged inputs (seeds 0–1999) and 0 of 16 788 (seeds 2000–21999), the same 2000 seeds at
-  `c8a29022` (R5, where it was seen) 0 of 1 685, and an exhaustive probe — every octet of the
-  three PBES2 fixtures XORed with 01/20/80/ff, and every truncation by 1–63 octets — 0 accepted.
-  The 10-14 pass ran on the uncommitted R7 tree with a different seed range (293 pristine vs
-  315 now), so the four inputs cannot be replayed; every one of them had passed the round trip
-  and the F1 field check, so no wrong key came out.
-- **scrypt in PBES2** *(owner, 2026-10-14: not now)*: `std.crypto.pwhash.scrypt.kdf` needs an
-  allocator and this module allocates nothing; OpenSSL writes scrypt only on `-scrypt`. An
-  allocator-taking `fromPkcs8EncryptedScrypt` would close it. Effort S.
-- Anything not covered by the phase list above (there is no known scope gap versus RFC 8017 P1–P6
-  today; flag here if one is found).
-- ~~**Constant-time key generation and import**~~ *(2026-10-02)*: ✅ 2026-10-03 — `fromPrimes`'s
-  derivation on montint (`nt.lcm`, `inverseOfModulus`, Fermat `qInv`), `generate`'s
-  Miller-Rabin on `DynModint.isProbablePrime`; ctgrind `keygen`. Left (each its own item below).
-- **`p`, `q` as `std.crypto.ff` `Modulus` carriers** *(2026-10-03)*: `sk.p`/`sk.q` are public
-  API fields of ff's type, and `Modulus.fromBytes` on them branches on the value (`shrink`,
-  `shiftIn`, `computeRR` — most of ctgrind `keygen`'s ≤ 173). Fix: carry the CRT primes as
-  `DynModint` only (`p_mont`/`q_mont` exist) and keep the ff `Modulus` for public values —
-  breaking for callers that read `sk.p`/`sk.q`. Effort: medium. Fits §2.
-- **Prime search sieve** *(2026-10-03)*: `bytesMod`'s `%` on the candidate (variable-latency
-  division) and Miller-Rabin's squaring count `s = v2(p − 1)` stay observable for a kept
-  prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole table, and
-  `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits §2.
-- ~~**Wycheproof RSA vectors**~~ ✅ 2026-10-14 (`src/wycheproof_test.zig`, 2212 vectors, no mismatch). Original text *(survey 2026-09-30)*: PKCS#1 v1.5 verify (`rsa_signature_*`), PSS verify and OAEP decrypt are where RSA implementations historically fail (BER-lax parsing, padding-check leaks); today's evidence is OpenSSL-generated valid signatures, not malformed ones. Effort: small–medium (test data, three runners). Fits §2.
-- ~~**Moduli above 4096 bits**~~ ✅ 2026-10-14: cap 8192 (owner; 16384 not followed). Original text *(survey 2026-09-30)*: `max_modulus_bits = 4096` is a compile-time constant of `std.crypto.ff.Uint`, so an 8192-bit key (rare, but certificates and OpenSSH keys exist) is rejected at parse. Effort: medium (re-instantiate `Uint`/`Modulus`, check the `montint` limb capacity and the stack cost of a `SecretKey`). Fits §2.
-- ~~**Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)**~~ ✅ sign 2026-10-13, verify + run-time `HashId` forms 2026-10-14. Original text *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.
-- ~~**PSS verify with automatic salt length**~~ ✅ 2026-10-14 `verifyPssAuto` (+ `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`). Original text *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
-
-- **Caller-lowerable PBKDF2 iteration cap** (sweep GP review, 2026-10-30): `max_pbkdf2_iterations` (2^20, ~0.3-1 s per hostile encrypted key) is fixed; minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
-- ~~**`fromPrimes` has no minimum modulus size**~~ **DONE 2026-11-18** (private-key floor 1024, see "Threat model"). Original text (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). A floor would break that test, so none was added. Termination was checked in the GP delta audit (2026-10-30): p=3, q=5, e=3, `rsadpCrtBlinded(.csprng)` returns the right value over 300 seeds/ciphertexts; no hang.
-- ~~**(2) Go-parity floor on generate + public keys**~~ **DONE 2026-11-19** (see "Threat model", "Public-key and `generate` floor"). Dependents adjusted: opcua tests to 1024/1280-bit keys (its `modulus_bits` option now answers `InvalidBits` below 1024), xmlenc's deliberate k = 64 PKCS#1 v1.5 tests through `generateWith`, webauthn F7 rewritten at 1024, dnssec and x509 test keys at 1024.
-
-## Status
-
-`extract · any · util · reentrant` + deps: `montint` (hot-path modexp), `std.crypto.ff` (key
-material/serialization) — canonical source is `pub const meta` in src/root.zig.
+- **`fromPrimes` has no primality test.** `p` and `q` are trusted to be prime; a Carmichael `p` passes the `qInv` Fermat
+  self-check and the sign-time fault check then refuses the key, so it fails late rather than at import. Paillier's checked
+  path tests primality; `rsa` could offer the same with `DynModint.isProbablePrime` on both. Also reword the "2^-128 worst
+  case" Miller-Rabin comment (witnesses come from the lower half; montint backlog). Effort S.
+- **`p`, `q` as `std.crypto.ff` `Modulus` carriers.** `sk.p`/`sk.q` are public API fields of ff's type, and
+  `Modulus.fromBytes` on them branches on the value (`shrink`, `shiftIn`, `computeRR` — most of ctgrind `keygen`'s ≤ 173).
+  Fix: carry the CRT primes as `DynModint` only (`p_mont`/`q_mont` exist) and keep the ff `Modulus` for public values —
+  breaking for callers that read `sk.p`/`sk.q`. Effort: medium. Fits CONVENTIONS §2.
+- **Prime search sieve.** `bytesMod`'s `%` on the candidate (variable-latency division) and Miller-Rabin's squaring count
+  `s = v2(p − 1)` stay observable for a kept prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole
+  table, and `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits CONVENTIONS §2.
+- **scrypt in PBES2** (owner: not now). `std.crypto.pwhash.scrypt.kdf` needs an allocator and this module allocates nothing;
+  OpenSSL writes scrypt only on `-scrypt`. An allocator-taking `fromPkcs8EncryptedScrypt` would close it. Effort S.
+- **Caller-lowerable PBKDF2 iteration cap.** `max_pbkdf2_iterations` (2^20, ~0.3–1 s per hostile encrypted key) is fixed;
+  minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
+- **PEM `aes256-ctr` decryption on Zig 0.17.** The encrypted-OpenSSH-key path (`std.crypto.core.modes.ctr` over std `Aes256`
+  in `src/root.zig`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per
+  key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap).
+- **`fromPrimes` 4-byte exponent test is weak.** The test asserts only `accepted >= 1` over 6 candidates (`src/sweep_test.zig`);
+  its reject cases are exact.
+- **Performance, remaining lever:** the modexp itself (REDC is about 54 % of it at L = 16, i.e. 2048-bit keys); the blinded
+  `.csprng` rows additionally carry the stateless draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes.
 
 ## Anchoring
-
-**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, every non-bench,
-non-fuzz, non-keygen test): 59 mutants on the checks that guard input and state —
-`PublicKey.fromBytes` (size, odd/≥ 3 exponent), the signature-length checks of both
-verifiers, the EMSA-PKCS1-v1_5 length bound, MGF1's counter, `ctEqByte`/`ctSelect`/
-`ctEqMaskUsize`, every OAEP-decode verdict (Y, lHash, stray PS octet, missing separator,
-want-length, buffer preconditions; both the erroring and the no-fail entry point),
-every EMSA-PSS-VERIFY step (pad octet, trailer, top bits, PS, separator, H), the F3
-fault check and the F2 unblinding, `fromPrimes`' validation, the DER walk (child bounds,
-trailing bytes, field counts, OID, BIT STRING unused bits, both version checks), PEM
-(empty body, label length) and the OpenSSH container (string bounds, nkeys, trailing
-bytes, cipher/kdf consistency, kdf options, block alignment, padding, checkints, `n`
-cross-check). First run: 30 killed, 29 alive — most negative tests were refused by an
-earlier, unrelated check (an empty OpenSSH private section fails the first `readU32`,
-whatever the container says). Ten tests added, each breaking ONE property of an
-otherwise valid input with the RFC/PROTOCOL.key clause it cites (block "audit
-2026-10-04" in `root.zig`, incl. a 521-bit key for the emLen = k − 1 case of PSS);
-rerun: 55 killed, 4 equivalent —
-`fromPrimes`' `p == q` (the qInv·q ≡ 1 self-check refuses it too: q mod p = 0) and
-`e < 3` (`DynModint.fromLimbs` refuses an `e` modulus below 3), `decryptOaepHNoFail`'s
-`found_sep` (with no separator `msg_len = db.len − 1 > max_msg_len ≥ want`, so
-`len_ok` is already 0), and `derChild`'s end-of-parent bound (the only nested parent
-is the AlgorithmIdentifier, whose sole child is the fixed rsaEncryption OID; a parent
-end inside it puts the next sibling's tag on an OID octet, none of which is BIT STRING
-or OCTET STRING). No defect found.
-
-**Mutation (2026-10-18,** schemata, same recipe, over a copy; the 2026-10-04 run above
-still stands for the code it covered, this one is the code added since): 87 mutants on
-`marshal.zig` (the back-to-front writer's bounds, length forms, INTEGER minimality and
-sign octet, the tail wipe, error-path zeroing of all six writers, PEM sizing, the
-PBES2 option limits, PKCS#7 padding, the omitted DEFAULT PRF, the PRF OID range),
-`pbes2Params` (every container end, keyLength, PRF parameters, IV, salt, iteration and
-ciphertext limits, `derUint`, `oidUnderArc`), the F1 wire-field check (`n`, `dP`, `dQ`,
-`qInv`, `d` range, the two congruences, adoption of `d`), `pemDecodeBody` (END line
-check, label cap), the `HashId` digest-length checks of all four entry points, three
-DigestInfo table entries, `maxPssSaltLen`, the PSS salt bound and auto-salt arithmetic,
-the decoupled MGF1 hash, the auto-salt prehashed verifiers, and `der_writer.zig`'s
-length octets, INTEGER trimming and tags. 111 tests in the schemata binary (every
-non-bench, non-fuzz, non-corpus, non-keygen test, 99 before this run and 12 added by it).
-First run (88 mutants, before the END-scan change below): 39 killed, 49 alive. The 12 tests (block "audit 2026-10-18" in `root.zig`)
-each break ONE property of an otherwise valid input: a generated `EncryptedPrivateKeyInfo`
-(`Epki`, built with `der_writer`) with one container that does not end where its last
-child ends, a wrong keyLength, a NULL with content, a 15- or 17-octet IV, a 0/65-octet
-salt, a non-minimal or negative iteration INTEGER, a ciphertext of 0, 17 or too many
-octets, PRF arcs 2.6/2.12 and over-long OIDs; a wire `d` = d + φ(n) (congruent, but ≥ n);
-INTEGER minimality over every valid exponent below 301 (and a PKCS#8 whose length is a
-multiple of 16, which takes a whole padding block); wiped tails after DER and PEM success
-and a one-spare-octet buffer; zeroed `out` for every writer failing before the PEM step;
-the inclusive caps (2^20 iterations, 64 salt octets); wrong digest lengths (31/33) at all
-four entry points; the smallest key a hash fits (172-bit modulus, SHA-1, emLen = hLen + 2:
-`maxPssSaltLen` 0 and sign/verify with salt 0); PEM: a 32-octet label is a label and 33 is
-not, an END line before the BEGIN is no block, and two blocks of one label load the first.
-Rerun: 80 killed, 7 equivalent:
-`RevWriter.bytes`' `b.len > pos` (a `>=` reports `BufferTooSmall` one write early; every
-`bytes` call is followed by the enclosing TLV's header, which then fails with the same
-error and the same zeroed `out`) and `integer`'s `width > pos` likewise, `padded.len > pos`
-in `writeEncrypted` likewise (the OCTET STRING header follows), `integer`'s `width == 0`
-(every caller passes a byte length ≥ 1), `pbes2Params`' keyLength `e.end > kp.end` (a
-keyLength that overruns the parameters can only be a one-octet INTEGER ending inside the
-next element, whose first octet is the encryption SEQUENCE tag 0x30 = 48, no AES key
-length, so `kl != keyLength` refuses it; longer contents saturate in `derUint`),
-`checkWireFields`' `d == 0` (d = 0 is below dP ≥ 1, so the borrow of `d − dP` refuses it),
-and its `loadBE` failure flag (an over-long wire field is replaced by zero, which then
-differs from the derived value, or is zero `d`, refused as above). No defect found; one
-behaviour change reported and fixed during the run: `pemDecodeBody`'s backward END search
-made two blocks of one label an `InvalidPem` while the docs promise the first, now an END
-scan from the first `-` after the body (constant time in the body's characters).
-
-**Mutation (2026-10-18, second pass,** `Blinding.cached`, same recipe, over a copy; added
-after the pass above): 20 mutants on `BlindingCache` — each clause of the key check
-`serves` (ops left, limb count, exponent, modulus), the squaring update (skipped whole,
-skipped per field, a q field squared mod p), the refresh count (±1, no decrement), the
-key record on a draw (modulus, limb count, exponent), `deinit` (pair wipe, `left`,
-`n_limbs`), and the `.cached` arm of the private op (no `next`, q blinded by the p factor,
-no unblind). First run: 14 killed, 6 alive. Three were missing tests, now added to
-`root.zig`: the pair after a served op equals the previous pair squared (reusing `r`
-unchanged passed every other check), and a second test switching the cache between keys
-that differ only in `e` (same primes) or only in `n` (same width) — a pair kept for the
-old key fails as `FaultDetected`. Rerun: 17 killed, 3 equivalent: the limb-count clause
-(a stale pair passes the modulus compare over the new width only if the new modulus
-equals a value fixed by earlier keys, which needs its factorisation) and `deinit`'s
-`left = 0` and `n_limbs = 0` (each alone forces the next op to draw). No defect found.
-Combined with the pass above: 97/107, 10 equivalent.
-
-**Mutation delta (2026-11-13,** since `bb4efd9a`: the BlindingCache CRT-prime key, the no-panic sweep, the
-keycodec PEM/PKCS#8/SPKI/OpenSSH readers, `trimStart` and the shared constant-time masks; schemata over a
-detached copy, ReleaseSafe, strict verdict; every touched function whole): 91 mutants in `byteLen`,
-`bigModInverse`, `fromPrimesImpl`, all 15 `trimStart` sites, `BlindingCache` (`deinit`, `serves`, `next`, the
-`p` field), the length guards of `rsaep`/`rsadpUnburned`/`rsadpCrtBlindedUnburned`, `emsaPssEncodeDigest`,
-`publicKeyPartsFromDer`, `pkcs1PublicParts`, `fromPkcs8Impl`, `fromPkcs8EncryptedValue`'s error mapping,
-`pbes2Params`' limits, `pemDecodeBody` and the label guards of `fromPem`, `fromPemEncryptedValue`,
-`fromOpenSSHValue`. **65 killed, 26 equivalent, 0 undecided.** Tests added (`sweep_test.zig`): `bigModInverse`
-with a shared factor; `fromPrimes` with an empty, zero, 1 or even `e`, a composite `p`, `p == q` and a product
-past 8192 bits; leading zeros on `p`, `q`, `e`; a `BlindingCache` shared across keys whose primes agree in their
-low limb; and a 322-bit key against an 85-bit one with equal low limbs — this kills `serves`' limb-count clause,
-which the pass above called equivalent (the earlier keys had the same width). Equivalent: an oversized `p`
-with a small `q` refused by the next line with the same error; even `e` and `e = 1` refused later by
-`MontParams.fromLimbs`; `p == q` caught by the `qInv` check; the inverse of an odd `e` mod `p-1` is never 0;
-any one of the three gcd verdicts is implied by the other two (gcd(e, lcm(p-1, q-1)) = 1 iff it holds for both);
-stripping zeros of a public value is cost-only (4) and OpenSSH's strip is repeated by `fromPrimesImpl` (3);
-`deinit` zeroes `p`, so `same_p` is false regardless (2); the empty-SEQUENCE and spill checks repeated by
-`derChild`, `Element.decode` and `keycodec.parseSpki` (3); `pbes2.decrypt` error arms unreachable after
-`pbes2Params` (3); `max_pkcs8_der_len + 16` is not a multiple of 16; the wipe of `plain` (needs a memory probe).
-No defect found. Combined with the passes above: 162/198, 36 equivalent.
 
 **Anchor grade:** class B · oracle EXTERNAL
 

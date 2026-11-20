@@ -3,10 +3,9 @@
 Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — no bignum
 reimplementation, no libc, no `@cImport`.
 
-**Status: ALL PHASES (P1–P6) IMPLEMENTED.** No `@panic`/TODO stub remains
-in `src/root.zig` or `src/openssh.zig`. `zig build test-rsa` is green across
-`root.zig` and `openssh.zig`, anchored against OpenSSL-generated known-answer
-vectors (see "Verification" below).
+Phases P1–P6 below are all implemented, anchored against OpenSSL-generated known-answer vectors and
+Wycheproof (see *Verification*). Dependencies: `montint` (the modexp hot path), `aescbc` and `aes192` (PBES2 encrypted
+PKCS#8), `b64ct` (constant-time PEM base64 of private keys), `keycodec` (the PEM block walk, PKCS#8 and SPKI readers).
 
 - **P1** — `signPkcs1v15`/`verifyPkcs1v15`: EMSA-PKCS1-v1_5
   signatures (RFC 8017 §8.2, §9.2) — the classic, still most widely deployed
@@ -46,8 +45,8 @@ vectors (see "Verification" below).
   no shared/global state.
 - **Modular exponentiation:** the hot path (CRT private op, non-CRT
   private op, public op) is routed through the sibling `montint` module (a
-  full-radix-2^64, Montgomery-resident, constant-time modexp — ~3× faster
-  than `std.crypto.ff` on the portable path); `std.crypto.ff` (`Modulus`/
+  full-radix-2^64, Montgomery-resident, constant-time modexp, much faster
+  than `std.crypto.ff`); `std.crypto.ff` (`Modulus`/
   `Fe`) remains the carrier for key material, CRT recombination, and
   serialization. This module does not implement its own bignum.
 - **Hardening:** the CRT private op carries fault detection (Bellcore/BDL:
@@ -109,14 +108,28 @@ try rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig);
 See `src/root.zig` for the full P1–P6 API surface, each function documented
 with its RFC 8017 section reference.
 
+## Limits
+
+- **Modulus size:** 1024 to 8192 bits (`max_modulus_bits`; the build option `rsa-max-modulus-bits` lowers the cap to as
+  little as 4096, and `-Dprofile=small` sets 4096). Smaller moduli are refused by every public-key constructor, by
+  `generate` and by every private-key constructor (the testing-only escape is the `insecure_allow_small_modulus` option of
+  the `…With` constructors); larger ones are refused, never truncated.
+- **Blinding is off by default** in the deterministic entry points (`signPkcs1v15`, `decryptOaep*`, `rsadpCrt`); use the
+  `…Blinded` twins when the input is attacker-chosen. The constant-time modexp and the CRT fault check run either way.
+- **`SecretKey.fromPrimes` trusts `p` and `q` to be prime** (it checks structure, not primality); a composite fails late,
+  at the first signature.
+- **Encrypted keys:** PBES2 with PBKDF2 and AES-CBC only (PBKDF2 iterations capped at 2^20), and OpenSSH containers
+  with bcrypt rounds capped at 2048. A `BlindingCache` is one per thread and must be wiped.
+
+## Not provided
+
+RSAES-PKCS1-v1_5 encryption and decryption, multi-prime keys, scrypt/PBES1/legacy `DEK-Info` PEM encryption and moduli above
+8192 bits; see `SPEC.md` *What is deliberately not done* (reasons) and *Backlog / deferred* (scrypt).
+
 ## Verification
 
-`zig build test-rsa` is green across `root.zig` and `openssh.zig`. Anchored
-against OpenSSL-generated known-answer vectors: keys via
-`openssl genpkey -algorithm RSA`, signatures via `openssl dgst -shaN -sign`
-(PKCS1-v1.5) and `openssl dgst -sigopt rsa_padding_mode:pss` (PSS).
-`generate`, `selfSignedCert`, and the OpenSSH bcrypt-pbkdf are additionally
-cross-checked against `std.crypto.Certificate` / `std.crypto.pwhash.bcrypt.
-opensshKdf` as independent oracles. The OAEP decoupled-hash configuration
-(digest≠MGF1) has no external byte-exact vector — only an internal
-round-trip test; see `SPEC.md`'s backlog.
+`scripts/modtest rsa`. The scheme tests are anchored against OpenSSL-generated known-answer vectors (keys from
+`openssl genpkey -algorithm RSA`, signatures from `openssl dgst -shaN -sign`, PSS with `-sigopt rsa_padding_mode:pss`) and
+Wycheproof's RSA vectors (PKCS#1 v1.5 and PSS verify, OAEP decrypt, including the digest≠MGF1 configuration of
+`decryptOaepH`); `generate`, `selfSignedCert` and the OpenSSH bcrypt-pbkdf are cross-checked against `std.crypto.Certificate` /
+`std.crypto.pwhash.bcrypt.opensshKdf`. See `SPEC.md` *Verification*.
