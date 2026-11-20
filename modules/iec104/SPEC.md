@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: this module's `NOTICE` (a record of the test oracle) and the README's `Provenance:` line — clean-room.
 
 ## Compared with
 
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [mzaniolo/iec104](https://github.com/mzaniolo/iec104) | Rust | MIT | 14 | push 2026-08-16 | Small Rust crate; no traction; not read *(features inferred unknown)*. |
 | Zig ecosystem | — | — | — | — | `gh search repos iec104 --language=zig` found nothing. |
 
-**Where we are ahead:** the only Zig implementation, and permissively licensed (MIT) where the C/C#/Java references are GPL; the k/w/t0..t3 machine is pure and time-injected (testable with a fake clock); interop-checked against a live lib60870-C peer and captured traffic (`tools/`); a spec-following outstation (broadcast restricted to the four defined type ids). **Where we are behind:** IEC 101 serial link layer, redundancy groups, file transfer (type ids 120-127) and typed parameter loading (QPM/QPA qualifiers are raw octets); TLS is BYO (→ Backlog items).
+**Where we are ahead:** the only Zig implementation, and permissively licensed (MIT) where the C/C#/Java references are GPL; the k/w/t0..t3 machine is pure and time-injected (testable with a fake clock); interop-checked against a live lib60870-C peer and captured traffic (`tools/`); a spec-following outstation (broadcast restricted to the four defined type ids). **Where we are behind:** IEC 101 serial link layer, redundancy groups, file transfer (type ids 120-127) and typed parameter loading (QPM/QPA qualifiers are raw octets); TLS is BYO (→ Backlog and *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -99,6 +99,45 @@ depends on Zig's bitfield-packing rules.
   the master acknowledges. Without that queue a 60-point interrogation against `k = 3` would fail
   with `SendWindowFull`; with it, the round-trip test asserts exactly 62 ASDUs arrive.
 
+- **Parameter and protection-equipment types.** `P_ME_NA_1`/`P_ME_NB_1` carry a 3-octet `parameter` element (value as
+  raw octets + QPM), `P_ME_NC_1` an R32 short float + QPM = 5 octets (`parameter_float`, `.{ .value = f32, .qpm = u8 }`,
+  IEC 60870-5-101 §7.3.5.3), `P_AC_NA_1` the 1-octet QPA (`asdu.zig:333-337,376,447-449,489`). The
+  protection-equipment events (17–19, 38–40, `M_EP_TA_1` … `M_EP_TF_1`) are one object = a base element with its
+  CP16Time2a, then the CP24 or CP56 tag: 17/38 `SEP`(1) + elapsed(2) (`protection_event`), 18/39 `SPE`(1) + `QDP`(1) +
+  relay duration(2) (`protection_start`), 19/40 `OCI`(1) + `QDP`(1) + relay operating time(2) (`protection_output`), i.e.
+  6/7/7 octets with CP24 and 10/11/11 with CP56 (`asdu.zig:339-344,376-379,416-421`). Bit layouts (`info.zig:294-392`):
+  SEP ES bits 0-1 (coded like a double point), EI bit 3, BL/SB/NT/IV bits 4-7; SPE GS/SL1/SL2/SL3/SIE/SRD bits 0-5; OCI
+  GC/CL1/CL2/CL3 bits 0-3; QDP EI bit 3, BL/SB/NT/IV bits 4-7. Reserved bits are masked on decode and written as zero.
+  The layouts were cross-checked against lib60870-C's headers (read for layout facts only, GPL, no code taken). The type/
+  cause table allows the protection events with cause 3 (spontaneous) only (`TypeId.isSpontaneousOnly`, `asdu.zig:180`),
+  so `emitPoint` drops any interrogated cause (20..41) for them (`outstation.zig:398-404`) while `reportSpontaneous`
+  still sends them (`outstation.zig:213`). The table was read from a vendor interoperability list that reproduces it, not
+  from the standard text; lib60870-C's slave was not checked. The outstation never generates these events on its own.
+- **Global (broadcast) common address (§7.2.4).** The outstation answers a request on the global address only for the four
+  type ids the standard defines it for — station and counter interrogation, clock synchronisation, reset process
+  (`broadcastable`, `outstation.zig:107`); anything else addressed to it, a control-direction command above all, is
+  dropped silently (`outstation.zig:169`), before the unknown-type-id branch, so an unmodelled type id on the global
+  address is dropped too instead of being answered with cause 44. Every reply to a global request carries the station's
+  **own** address, in confirmation, data and termination alike (`replyCa`, `outstation.zig:394`; with two stations behind
+  one server, each answers once under its own address); a request to a common address the station does not serve gets
+  that address echoed back with cause 46. A station configured with the all-ones address itself is refused at `init`
+  (`outstation.zig:132`), because it would switch the broadcast guard off. This matches a captured real RTU for global
+  interrogation, counter interrogation and clock synchronisation.
+- **Behaviour where the module differs from a real RTU on purpose.** After a select-before-operate execute the outstation's
+  `ACTIVATION TERMINATION` echoes the execute element (`outstation.zig:363-368`; the third-party RTU echoed the select
+  element); an unknown type id is answered with cause 44 negative (§7.2.3; the third-party RTU dropped it); a broadcast test
+  command (type 107) is not answered (the third-party RTU answers it and echoes 0xFFFF). The state machine arms t1 on **any**
+  U-format *act*, `STARTDT` included (`armAct`, `state.zig:309-312`); `lib60870-C` does not arm t1 on an outstanding `STARTDT act`
+  (left unconfirmed it waits t3, sends `TESTFR act` and dies t1 after that), so this module hangs up earlier in that scenario.
+  Both fit §5.5's "time-out of send or test APDUs"; ours is the stricter reading, one-way, and changes no frame on the wire.
+- **`transport`.** A buffered `Stream.Reader` can hold a whole APDU that a later `poll(2)` on the raw fd will never report
+  as readable, because the bytes are in the reader's buffer, not in the socket; a read that always polled first would stall on
+  coalesced frames. `TcpTransport.readFn` checks `r.bufferedLen() == 0` before `waitReadable()` (`transport.zig:217`, and the
+  deadline variant at `transport.zig:154`). A paired `Stream.Reader`/`Stream.Writer` on one socket otherwise delivers every
+  write (probed on 0.16 over a loopback pair with `std.Io.Threaded`); the regression test `"TcpTransport delivers
+  write->read->write over a real socket (no env gate)"` (`transport.zig:388`) pins both properties and fails when the guard
+  is removed.
+
 Concurrency: `.single_owner` — one `Client`/`Server` owns one connection's framer, counters and
 buffers; nothing is shared or global, and the clock and any threading are the caller's.
 
@@ -107,157 +146,120 @@ Error policy: every decode entry point (`apci.decode`, `Framer.next`, `asdu.deco
 `Outstation.handle`) returns a typed error on malformed input. Nothing panics, allocates or loops
 unboundedly.
 
+
 ## Verification
+
+Run: `scripts/modtest iec104`. The live interop tests below are gated on an environment variable and, without a peer,
+print `SKIPPED:` and pass. `IEC104_FUZZ=<runs>[,<first seed>]` runs the deterministic fuzz driver.
 
 ### What is third-party-validated
 
-The strongest evidence here is not a hand-written vector — it is **real traffic between two
-independent implementations that are not this module**, plus **live round trips in both
-directions**.
+The strongest evidence here is not a hand-written vector — it is **real traffic between two independent implementations
+that are not this module**, plus **live round trips in both directions**.
 
-**Oracle used:** Python `c104` 2.2.1 (Martin Unkel, Fraunhofer FIT; GPL-3.0) — a binding over the
-`lib60870-C` protocol stack, providing both a controlling and a controlled station plus
-`explain_bytes`, its own decoder. It was installed in a throwaway virtualenv and used **as a black
-box only**: to generate wire traffic, to decode ours, and to act as a live peer. Its source was not
-read, and no design decision here was taken from it. Under CONVENTIONS §5 that is a test oracle,
-not a design reference, so it needs no root `/NOTICE` entry (the module's own `NOTICE` records it) — the same status as diffing against `tar`
-or `nft`.
+**Oracle used:** Python `c104` 2.2.1 (Martin Unkel, Fraunhofer FIT; GPL-3.0) — a binding over the `lib60870-C` protocol
+stack, providing both a controlling and a controlled station plus `explain_bytes`, its own decoder. It is used **as a black
+box only**: to generate wire traffic, to decode ours, and to act as a live peer. Its source was not read, and no design
+decision here was taken from it. Under CONVENTIONS §5 that is a test oracle, not a design reference; the module's own
+`NOTICE` records it — the same status as diffing against `tar` or `nft`.
 
-1. **72 byte-exact captured goldens** (`goldens.zig`). A `c104` controlling station was pointed at a
-   `c104` controlled station through a recording TCP proxy, and every APDU that crossed the wire was
-   logged as hex together with `explain_bytes`'s interpretation. Additional frames (`TESTFR`, the
-   negative confirmation, and the unknown-type/unknown-CA/unknown-IOA/unknown-COT causes) were
-   produced by driving the same third-party server from a raw socket. Three assertions run over the
-   whole table:
+1. **Byte-exact captured goldens** (`goldens.zig`, `captured`). A `c104` controlling station was pointed at a `c104`
+   controlled station through a recording TCP proxy, and every APDU that crossed the wire was logged as hex together with
+   `explain_bytes`'s interpretation. Additional frames (`TESTFR`, the negative confirmation, and the unknown-type/
+   unknown-CA/unknown-IOA/unknown-COT causes) were produced by driving the same third-party server from a raw socket.
+   Three assertions run over the whole table:
    - every frame decodes (APCI, and for I-format also the ASDU under the 3/2/originator profile);
-   - every frame **re-encodes to the identical octets** — and the ASDU is rebuilt from the *decoded
-     objects* through `asdu.Builder`, so the builder is what is being checked, not a memcpy;
-   - a representative subset is asserted field by field against what `c104` said each frame meant
-     (values, causes, sequence numbers, quality, time tags, the S/E bit).
+   - every frame **re-encodes to the identical octets** — and the ASDU is rebuilt from the *decoded objects* through
+     `asdu.Builder`, so the builder is what is being checked, not a memcpy;
+   - a representative subset is asserted field by field against what `c104` said each frame meant (values, causes,
+     sequence numbers, quality, time tags, the S/E bit).
 
-   Coverage of the capture: all six U-format functions; S-format at three different N(R); I-format
-   sequence numbers; `M_SP_NA_1`, `M_DP_NA_1`, `M_ST_NA_1`, `M_BO_NA_1`, `M_ME_NA_1`, `M_ME_NB_1`,
-   `M_ME_NC_1`, `M_IT_NA_1`, `M_SP_TB_1`, `M_DP_TB_1`, `M_ME_TD_1`, `M_ME_TE_1`, `M_ME_TF_1`,
-   `M_IT_TB_1`; `C_SC_NA_1`, `C_DC_NA_1`, `C_RC_NA_1`, `C_SE_NA_1`, `C_SE_NB_1`, `C_SE_NC_1`,
-   `C_SC_TA_1`, `C_SE_TC_1`; `C_IC_NA_1`, `C_CI_NA_1`, `C_RD_NA_1`, `C_CS_NA_1`, `C_TS_TA_1`; a
-   select/execute pair for both `C_SC_NA_1` and `C_SE_NA_1`; an `SQ = 1` frame with **twelve**
-   objects behind one address; and the four error causes. A test asserts the capture really does
-   contain every one of those type ids, so the table cannot silently rot.
+   Coverage of the capture: all six U-format functions; S-format at three different N(R); I-format sequence numbers;
+   `M_SP_NA_1`, `M_DP_NA_1`, `M_ST_NA_1`, `M_BO_NA_1`, `M_ME_NA_1`, `M_ME_NB_1`, `M_ME_NC_1`, `M_IT_NA_1`, `M_SP_TB_1`,
+   `M_DP_TB_1`, `M_ME_TD_1`, `M_ME_TE_1`, `M_ME_TF_1`, `M_IT_TB_1`; `C_SC_NA_1`, `C_DC_NA_1`, `C_RC_NA_1`, `C_SE_NA_1`,
+   `C_SE_NB_1`, `C_SE_NC_1`, `C_SC_TA_1`, `C_SE_TC_1`; `C_IC_NA_1`, `C_CI_NA_1`, `C_RD_NA_1`, `C_CS_NA_1`, `C_TS_TA_1`; a
+   select/execute pair for both `C_SC_NA_1` and `C_SE_NA_1`; an `SQ = 1` frame with **twelve** objects behind one address;
+   and the four error causes. A test asserts the capture really does contain every one of those type ids, so the table
+   cannot silently rot.
 
-2. **The outstation's replies are byte-compared against the recorded RTU's replies.** Feeding
-   `Outstation.handle` the master's captured request frames reproduces the third-party RTU's answers
-   octet for octet for: the general-interrogation confirmation and termination, the
-   counter-interrogation confirmation/counter/termination, the read-command confirmation and value,
-   the clock-synchronisation confirmation, the `C_TS_TA_1` confirmation, the select and execute
-   confirmations of a select-before-operate sequence, and all three error-cause replies.
+2. **The outstation's replies are byte-compared against the recorded RTU's replies.** Feeding `Outstation.handle` the
+   master's captured request frames reproduces the third-party RTU's answers octet for octet for: the general-interrogation
+   confirmation and termination, the counter-interrogation confirmation/counter/termination, the read-command confirmation
+   and value, the clock-synchronisation confirmation, the `C_TS_TA_1` confirmation, the select and execute confirmations of
+   a select-before-operate sequence, and all three error-cause replies.
 
-3. **Live round trip, our client → a third-party outstation** (`client.zig`, gated on
-   `IEC104_TEST_SERVER`). Against a live `c104`/lib60870 server on `127.0.0.1:2404`, CA 47, the run
-   observed: `STARTDT act` confirmed; general interrogation confirmed, **5 monitoring ASDUs**
-   received and decoded, activation termination received; select-before-operate on IOA 301 — select
-   positively confirmed, execute positively confirmed; `STOPDT act` confirmed. Printed output:
-   `live IEC 104: started=true act_con=true act_term=true monitoring_asdus=5` /
-   `select_con=true sent_execute=true execute_con=true` / `STOPDT confirmed`.
+3. **Live round trip, our client → a third-party outstation** (`client.zig`, gated on `IEC104_TEST_SERVER`, with
+   `IEC104_TEST_CA` and `IEC104_TEST_SBO_IOA`). Against a live `c104`/lib60870 server: `STARTDT act` confirmed; general
+   interrogation confirmed with monitoring ASDUs received and decoded and the activation termination received;
+   select-before-operate on one IOA — select and execute both positively confirmed; `STOPDT act` confirmed.
 
-4. **Live round trip, a third-party master → our outstation** (`root.zig`, gated on
-   `IEC104_TEST_LISTEN`). A live `c104`/lib60870 *client* drove `OutstationServer`: it completed
-   `STARTDT`, ran a general interrogation and **read our point values back correctly**
-   (`101 -> True`, `102 -> Double.ON`, `105 -> 3.141590118408203`), ran a counter interrogation, and
-   completed a select-before-operate command (`select+execute C_SC_NA_1: True`). Our side printed
-   `startdt=true interrogation=true commands=2 sco_on=true` — two activations, the second of which
-   actually operated the output.
+4. **Live round trip, a third-party master → our outstation** (`root.zig`, gated on `IEC104_TEST_LISTEN`). A live
+   `c104`/lib60870 *client* drives `OutstationServer`: `STARTDT`, a general interrogation whose point values it reads back
+   correctly, a counter interrogation, and a select-before-operate command whose second activation actually operates the
+   output.
 
-Both live tests passed in Debug and in `--release=fast`, and both print `SKIPPED: …` and pass when
-no peer is present.
+5. **A real outstation driven through the 15-bit sequence-number wrap** (`client.zig`, gated on `IEC104_TEST_WRAP`). A
+   `c104` outstation with `message_timeout=60s`, `send_window_size=100`, `receive_window_size=50` spontaneously reports
+   33,000 `M_ME_NC_1` values, paced (`time.sleep(0.01)` every 40 `point.transmit()` calls: an unpaced burst overruns the
+   reference stack's own internal send queue and it closes the connection, so `lib60870-C` cannot be blasted at application
+   speed). This module's `Client` drains them with an in-process `RawTap` (no external proxy: its added latency was also
+   enough to overrun the peer's queue) recording every raw APCI frame; its own `recv_seq` wraps from 32767 to 0 at exactly
+   the frame where the peer's N(S) did. The last 64 frames (send_seq 32716→32767→0→…→4, the S-format acknowledgements this
+   module sent back, and the wrap itself) are frozen in `goldens.zig`'s `wrap_table` and replayed through a fresh
+   `state.Connection` fast-forwarded to the capture's own starting point (`wrap_start_recv_seq`) — genuinely external
+   sequence numbers driving the state machine, not a hand-picked `recv_seq = 32766` self-test.
 
-5. **A real outstation driven through the 15-bit sequence-number wrap** (`client.zig`, gated on
-   `IEC104_TEST_WRAP`; closes wave-2 F6 — "no third-party stack was ever driven through a rollover").
-   A `c104` 2.2.1 outstation was configured with `message_timeout=60s`, `send_window_size=100`,
-   `receive_window_size=50` and driven to spontaneously report **33,000** `M_ME_NC_1` values (paced
-   — `time.sleep(0.01)` every 40 `point.transmit()` calls — an unpaced burst overruns the
-   reference stack's own internal send queue and it closes the connection, which is itself worth
-   recording: `lib60870-C` cannot be blasted at application speed with no pacing at all). This
-   module's `Client` drained them with an in-process `RawTap` (no external proxy — one was tried
-   first and its added latency was *also* enough to overrun the peer's queue) recording every raw
-   APCI frame. Observed: `monitoring=32773 recv_seq=5 wrapped=true` — this module's own `recv_seq`
-   wrapped from 32767 to 0 at exactly the frame where the peer's own N(S) did. The last 64 frames of
-   that run (real send_seq 32716→32767→0→…→4, the S-format acknowledgements this module sent back,
-   and the wrap itself) are frozen in `goldens.zig`'s `wrap_table` and replayed through a fresh
-   `state.Connection` fast-forwarded to the capture's own starting point — genuinely external
-   sequence numbers driving the state machine, not a hand-picked `c.recv_seq = 32766` self-test.
-   The t1-timeout half of F6 (driving a real peer to an actual acknowledgement timeout) was not
-   attempted in that run; it was done later — see "What is self-derived" below).
+6. **The global (broadcast) common address, captured from a real RTU** (`goldens.zig`'s `global_ca_*` constants; replayed in
+   `outstation.zig`). A `c104` controlling station interrogated a `c104` controlled station on **CA 0xFFFF** through the
+   same recording proxy: every legal broadcast — general interrogation, counter interrogation, clock synchronisation — was
+   answered with the station's **own** address 47 in the confirmation, in the data and in the termination, and with two
+   stations (CA 47 and CA 99) behind one server one global interrogation produced two confirmations and two terminations,
+   none carrying 0xFFFF (IEC 60870-5-101 §7.2.4). The counter-example is frozen too: a request to a common address the RTU
+   does not serve (CA 200) gets that address echoed back with cause 46. Producers: `tools/global_ca_capture.py`,
+   `tools/global_ca_capture2.py`; `tools/live_global_ca_master.py` drives this module's outstation with a real master on
+   CA 0xFFFF.
 
-6. **The global (broadcast) common address, captured from a real RTU** (`goldens.zig`'s
-   `global_ca_*` constants; replayed in `outstation.zig`). A `c104` controlling station interrogated
-   a `c104` controlled station on **CA 0xFFFF** through the same recording proxy. The third-party
-   outstation answered every legal broadcast — general interrogation, counter interrogation, clock
-   synchronisation — with **its own station address 47** in the confirmation, in the data and in the
-   termination alike; `explain_bytes` itself renders the request's address as `GLOBAL` and the
-   confirmation's as `CA 47`. A second run gave the controlled station **two** stations (CA 47 and
-   CA 99): one global interrogation produced two confirmations and two terminations, one per
-   station, and no monitor-direction frame in the whole exchange carried 0xFFFF. That is
-   IEC 60870-5-101 §7.2.4 — an ASDU with the broadcast address in the control direction is answered
-   in the monitor direction with the specific defined common address (the station address).
-
-   This closed a **real defect**: before it, `Outstation` echoed the received address in every
-   confirmation and termination while `emitPoint` used its own, so one global interrogation went out
-   under two station identities. The same run also froze the *counter*-example — a request to a
-   common address the RTU does not serve (CA 200) gets that address echoed back, because cause 46
-   exists to name it — which this module already matched octet for octet and must keep matching.
+7. **A real t1 expiry** (`goldens.zig`, the `t1_*` constants). A `c104`/`lib60870-C` controlling station was driven to an
+   ACTUAL t1 expiry against a deliberately silent endpoint of ours: with its I-frame left unacknowledged it tore the link
+   down 15.03 s later, on a stack whose t1 is 15 s. The run also produced the `STARTDT` divergence described under *Design &
+   invariants*; the measurements and captured frames are pinned in `goldens.zig`.
 
 ### What is self-derived
 
-- Everything not in the capture: the CP24Time2a/CP16Time2a encodings, `M_ME_ND_1`, `M_PS_NA_1`,
-  `C_BO_NA_1`/`C_BO_TA_1`, `C_TS_NA_1`, `C_RP_NA_1`, `C_CD_NA_1`, `M_EI_NA_1`, the group
-  interrogation causes, and the 1-/2-octet address profiles. These are encode/decode round-trip
-  tests against element sizes and bit positions taken from the standard's documented layouts, not
-  against third-party bytes.
-- The **k/w and t0..t3 behaviour** past what item 5 above exercises is still validated against the
-  standard's description with an injected clock, not against a third-party stack's timing —
-  **except t1, which is no longer in this category**. A real `c104` 2.2.1 / `lib60870-C`
-  controlling station was driven to an ACTUAL t1 expiry against a deliberately silent endpoint of
-  ours: with its I-frame left unacknowledged it tore the link down 15.03 s later, on a stack whose
-  t1 is 15 s (`goldens.zig`, "the t1 half of F6"). The 32768-frame sequence-number rollover is
-  likewise closed against a real `lib60870-C` outstation by item 5 above.
-  ⚠ That run also found a **semantic divergence worth knowing about**: `lib60870-C` does not arm t1
-  on an outstanding `STARTDT act` — left unconfirmed, it waited t3 (20 s), sent `TESTFR act`, and
-  died 15 s after *that* (35.06 s total). This module arms t1 on any U-format *act*, `STARTDT`
-  included, so it hangs up 20 s earlier in that scenario. Both fit §5.5's "time-out of send or test
-  APDUs"; ours is the stricter reading, it is one-way, and it changes no frame on the wire. The
-  measurements and the captured frames are pinned in `goldens.zig`.
-- `tshark` is **not** installed in this environment, so the `104apci`/`104asdu` dissector
-  cross-check named in the task was not run. It was not needed: `c104.explain_bytes` (a lib60870
-  decoder) served the same purpose, and the goldens came from a real capture rather than being
-  hand-derived.
+- Everything not in the capture: the CP24Time2a/CP16Time2a encodings, `M_ME_ND_1`, `M_PS_NA_1`, the protection-equipment
+  types, `C_BO_NA_1`/`C_BO_TA_1`, `C_TS_NA_1`, `C_RP_NA_1`, `C_CD_NA_1`, `M_EI_NA_1`, the group interrogation causes, and the
+  1-/2-octet address profiles. These are encode/decode round-trip tests against element sizes and bit positions taken from
+  the standard's documented layouts (hand-built octets in both directions for every protection type), not against
+  third-party bytes.
+- The **k/w and t0..t3 behaviour** beyond what items 5 and 7 exercise is validated against the standard's description with
+  an injected clock, not against a third-party stack's timing; `state.zig` drives a full 32768-frame cycle plus 100 more
+  through both a master and an outstation.
 
 ### Fuzz + hostile input
 
-`std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
-hang":
+The deterministic driver (`IEC104_FUZZ`, `src/fuzz_test.zig`; harness names `iec104-<file>-<function>`) sweeps five
+harnesses, each asserting "typed error or valid result, never a panic and never a hang", with reach counters checked in
+every run:
 
-- `apci.decode` over arbitrary bytes — anything that decodes must re-encode to the identical octets.
-- `apci.Framer` fed arbitrary stream bytes in chunks, with a guard counter that fails the test if
+- `apci.decode` over arbitrary bytes (`iec104-apci-decode`) — anything that decodes must re-encode to the identical octets.
+- `apci.Framer` fed arbitrary stream bytes in chunks (`iec104-apci-framer`), with a guard counter that fails the test if
   `next` ever returns a frame without consuming input (an infinite-loop bug).
-- `asdu.decode` + full object iteration over arbitrary bytes **and arbitrary `Params`** (ioa 1–3,
-  ca 1–2, cot 1–2).
-- `CP56Time2a.decode` — anything that decodes must re-encode and re-decode identically.
-- `Outstation.handle` over arbitrary ASDU bytes against a real point database.
+- `asdu.decode` + full object iteration over arbitrary bytes **and arbitrary `Params`** (`iec104-asdu-asdu`; ioa 1–3, ca 1–2,
+  cot 1–2).
+- `CP56Time2a.decode` (`iec104-info-time`) — anything that decodes must re-encode and re-decode identically.
+- `Outstation.handle` over arbitrary ASDU bytes against a real point database (`iec104-outstation-handle`).
 
-Explicit hostile-input tests (not fuzz) cover: an empty and a one-octet APDU; a wrong start byte; a
-length octet below 4 and above 253; a truncated body; every reserved-bit violation; an object count
-that disagrees with the body in both directions; a zero object count; an out-of-range type id; a
-`CP56Time2a` with minute 60, hour 24, day 0, day 32, month 0, month 13, year 100 and a 60000 ms
-field; an N(S) that is not the next expected; an N(R) beyond the send window (both just past the
-edge and on the far side of the wrap); and an I-frame while data transfer is stopped.
+Explicit hostile-input tests (not fuzz) cover: an empty and a one-octet APDU; a wrong start byte; a length octet below 4 and
+above 253; a truncated body; every reserved-bit violation; an object count that disagrees with the body in both
+directions; a zero object count; an out-of-range type id; a `CP56Time2a` with minute 60, hour 24, day 0, day 32, month 0,
+month 13, year 100 and a 60000 ms field; an N(S) that is not the next expected; an N(R) beyond the send window (both just
+past the edge and on the far side of the wrap); and an I-frame while data transfer is stopped. `src/mutation_test.zig`
+holds the tests that pin boundaries and side effects the original suite could not see (APCI header edges, `Config.validate`
+boundaries, timer arm/clear points, the outstation's broadcast guard and reply queue, the transport sockets).
 
-**Audit 2026-11-17 (whole-module mutation).** 896 mutants over every runtime line of `apci.zig`, `asdu.zig`, `info.zig`, `state.zig`, `client.zig`, `outstation.zig` and `transport.zig`: the APCI header, S/U reserved octets and the 15-bit sequence arithmetic of the decoder and encoder, the framer's compaction and early header checks, `Config.validate` at every boundary, every transition and timer of the k/w/t0..t3 machine (the t1/t2/t3 arm, re-arm and clear points, the duplicate-acknowledgement rule, `nextDeadline`), the whole `shapeOf` table (base kind and time tag of every modelled type id), each element codec's offsets and flag bits, the CP56/CP24/CP16 time tags, the `Builder`, and in the outstation the broadcast guard, QOI group arithmetic, every cause/negative-bit pair, select-before-operate, the reply queue (F6 compaction) and the client's frame builders. Round 1 (ReleaseSafe, one switch per mutant): 689 killed, 201 survived. The survivors were test gaps: tests were added (`mutation_test.zig` plus three `transport.zig` socket tests) and killed all but 22 in round 2 (the P_ME_NC_1 fix added six mutants); one more fell to a stopped-link drain test. 21 remain, all argued: EQUIVALENT (19) the U-function popcount guard (the switch's else returns the same error), a framer position of exactly 1 (positions advance by whole APDUs), t2 armed at `w` (cleared by the tick that sends the acknowledgement), the `closed` guard of `tick` and `unacked_rx > 0` (invariants of `resetLink`/t2 arming), exact-fit scratch checks in `Builder.add` (same `BufferTooSmall`), 60000 ms in a CP56 decode (second 60 is refused by `validate`), the `> maxCa` and own-address-equals-broadcast guards (`init` refuses the broadcast address first), QOI 20 and group 0 (both are the station cause), `echoRaw`'s reply CA (never reached with a broadcast address), an empty read fed to the framer, the queue's high length octet (ASDUs are <= 249 octets), compaction at an exact fit (cost only) and `LoopTransport.read` with nothing buffered; UNOBSERVABLE (2) `waitReadableMs`'s cancel check after a failing `poll(2)` and `writeFailure`'s cancel (they need a failing `poll(2)` and a canceled blocked `send(2)`). Not mutated: the quality/qualifier bit-mask constants (comptime values), the transport VTable plumbing and the live/fuzz harnesses. Counts on the card are whole-module.
-
-**Delta mutation 2026-11-18 (protection-equipment events).** 60 mutants over the new runtime code only: the six shape rows (base kind and time tag of each), `Shape.size` for the three new kinds, the decode and encode offsets of every element octet and of each CP16Time2a, and every bit of `Sep`, `Spe`, `Oci` and `Qdp` in both directions with their reserved-bit masks. 58 killed at once; two survived on the first run and were test gaps (the OV bit leaking out of the SEP/QDP quality mask, which a state value of 1 hid in `Sep.toByte`, and `Qdp.fromByte` reading the reserved low bits as `quality.ov`); the assertions were added and both fell. 60/60 killed, none equivalent; the card counts are cumulative (875 + 60 killed of 896 + 60, 21 equivalent as before).
-
-**Delta mutation 2026-11-18 (spontaneous-only protection events).** 7 mutants over `isSpontaneousOnly` and the interrogated-cause guard of `emitPoint`: 6 killed; one EQUIVALENT, the upper bound 41 -> 36 of the guard, because the only emitters that reach it with a protection point are the station/group interrogation (causes 20..36) and the spontaneous report (3), while the counter interrogation (37) emits counters only. The card counts are cumulative: 941 killed + 22 equivalent of 963.
-
-**Defect found and fixed by the audit.** `P_ME_NC_1` (type 112, parameter of measured value, short float) was given the 3-octet element of the two integer parameter types, so a standard ASDU (R32 + QPM = 5 octets, IEC 60870-5-101 §7.3.5.3) was refused as `ObjectCountMismatch` and a 3-octet one accepted. It now has its own element kind `parameter_float` (`.{ .value = f32, .qpm = u8 }`); the integer types keep `parameter`. Tests carry hand-built standard octets in both directions and the refused old form. Also corrected: this SPEC claimed the protection-event types 17-19/38-40 were in the shape table; they are not (see Deferred).
+- **Constant time:** n/a — an unauthenticated protocol, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
 ## Threat model
 
@@ -281,101 +283,58 @@ containment, not confidentiality or integrity against an active attacker:
   an operational-safety mechanism, **not** a security control — an attacker who can send one
   activation can send two.
 
-## Deferred
+## Known limits
 
-Honest list of what a full IEC 60870-5-104 implementation has and this one does not:
+What a full IEC 60870-5-104 implementation has and this one does not (planned items are under *Backlog / deferred*):
 
-- **File transfer** (type ids 120–127, `F_FR_NA_1`/`F_SR_NA_1`/`F_SC_NA_1`/`F_LS_NA_1`/`F_AF_NA_1`/
-  `F_SG_NA_1`/`F_DR_TA_1`/`F_SC_NB_1`): not modelled at all. Their elements are variable-length, so
-  the fixed (base, tag) shape table cannot express them; they decode as `error.UnsupportedTypeId`.
-- **Parameter loading** (110–113, `P_ME_NA_1`/`P_ME_NB_1`/`P_ME_NC_1`/`P_AC_NA_1`): recognised with
-  the right element width (`P_ME_NC_1` is an R32 short float + QPM = 5 octets, kind `parameter_float`,
-  since 2026-11-17; before that it was wrongly given the 3-octet element of the integer types), but
-  the QPM/QPA qualifier semantics are passed through as raw octets rather than typed, and the
-  outstation has no parameter store.
-- **IEC 62351-3/-5 security**: no TLS on 2404, no certificate handling, no role-based access
-  control. Bring your own terminated stream (see Threat model).
-- **Redundancy groups** (§5.2 / the redundancy annex): multiple connections to one controlled
-  station with exactly one in the `started` state and the rest standing by. Each `Client`/`Server`
-  is one connection; the group-level arbitration is not implemented.
-- **Protection-equipment events** (17–19, 38–40, `M_EP_TA_1` … `M_EP_TF_1`) are modelled since
-  2026-11-18, with this boundary: the decoder, builder and element accessors are complete; the
-  outstation does not generate them on its own, and a point registered with one of these types is
-  never reported by a station, group or counter interrogation: the type/cause table of IEC 60870-5-101 / -104
-  allows them with cause 3 (spontaneous) only, so `emitPoint` drops any interrogated cause (20..41) for
-  them and `reportSpontaneous` still sends them (`TypeId.isSpontaneousOnly`; the table was read from a
-  vendor interoperability list that reproduces it, not from the standard text; lib60870-C's slave
-  was not checked). Layout (IEC 60870-5-101 §7.3.1, one
-  object = base element with its CP16Time2a, then the tag): 17 `SEP`(1) + elapsed(2) + CP24 = 6
-  octets (`protection_event`); 18 `SPE`(1) + `QDP`(1) + relay duration(2) + CP24 = 7
-  (`protection_start`); 19 `OCI`(1) + `QDP`(1) + relay operating time(2) + CP24 = 7
-  (`protection_output`); 38/39/40 are the same bases with CP56Time2a (10/11/11). Bit layouts: SEP
-  ES bits 0-1 (coded like a double point), EI bit 3, BL/SB/NT/IV bits 4-7; SPE GS/SL1/SL2/SL3/SIE/SRD
-  bits 0-5; OCI GC/CL1/CL2/CL3 bits 0-3; QDP EI bit 3, BL/SB/NT/IV bits 4-7. Reserved bits are
-  masked on decode and written as zero. Cross-checked against lib60870-C's headers (field order of
-  the constructors, bit values; read for layout facts only, GPL, no code taken); the tests
-  carry hand-built octets for every type in both directions.
-- **The controlled-station side of `C_CD_NA_1`** (delay acquisition) beyond echoing it, and the
-  background-scan cause (2) as an automatic outstation behaviour.
-- **Timer policy is the caller's.** The module tells the caller *when* something is due
-  (`nextDeadline`) and *what* to do (`tick`), but it does not sleep, and the `TcpTransport` demo
-  adapter blocks on `poll(2)` with a caller-set timeout. A production deployment wires the seam into
-  its own event loop.
-- **lib60870's activation-termination quirk** was deliberately not replicated: after a
-  select-before-operate execute, the observed third-party RTU echoed the *select* element (S/E set)
-  in its `ACTIVATION TERMINATION`; this outstation echoes the execute element, which is what the
-  standard describes. Likewise, that RTU silently dropped an ASDU with an unknown type id where this
-  one replies with cause 44 as §7.2.3 prescribes.
-- **A broadcast *test command* is answered by lib60870-C and dropped here.** On CA 0xFFFF the
-  observed third-party RTU replied to `C_TS_TA_1` (type 107) and echoed 0xFFFF doing it
-  (`goldens.global_ca_test_command_reply`). §7.2.4 lists only type ids **100, 101, 103 and 105** as
-  valid with the global address, so this module answers nothing outside those four — a station that
-  replies to a broadcast the standard does not define for it makes every station on the link reply
-  to one frame. The same reasoning drops an *unmodelled* type id on the global address instead of
-  answering it with cause 44, which is otherwise this module's behaviour (see the entry above).
-- **`tshark` cross-check** — not run (no `tshark` in this environment); see "What is self-derived".
+- **File transfer** (type ids 120–127, `F_FR_NA_1`/`F_SR_NA_1`/`F_SC_NA_1`/`F_LS_NA_1`/`F_AF_NA_1`/`F_SG_NA_1`/`F_DR_TA_1`/
+  `F_SC_NB_1`) is not modelled at all. Their elements are variable-length, so the fixed (base, tag) shape table cannot
+  express them; they decode as `error.UnsupportedTypeId`.
+- **Parameter loading** (110–113) is recognised with the right element width, but the QPM/QPA qualifier semantics are passed
+  through as raw octets rather than typed, and the outstation has no parameter store: a request of those types is answered
+  like any type the outstation does not handle, with cause 44 and the negative bit (`outstation.zig:200-207`).
+- **`C_CD_NA_1` (delay acquisition)** is modelled by the codec, but the outstation has no handler for it (the generic
+  command path covers type ids 45–69 only, `asdu.zig:188-191`), so it is answered with cause 44; the background-scan cause (2)
+  is a name only, never generated by the outstation.
+- **Redundancy groups** (§5.2 / the redundancy annex): each `Client`/`Server` is one connection; the group-level arbitration
+  (exactly one connection of several in the `started` state) is not implemented.
+- **Protection-equipment events** are decoded and built, never generated by the outstation on its own (see *Design &
+  invariants*).
+- **Timer policy is the caller's.** The module tells the caller *when* something is due (`nextDeadline`) and *what* to do
+  (`tick`), but it does not sleep, and the `TcpTransport` demo adapter blocks on `poll(2)` with a caller-set timeout. A
+  production deployment wires the seam into its own event loop.
 
-## Investigated: the "paired Stream.Reader/Writer stops writes" report
+## What is deliberately not done
 
-A prior agent (see `modules/bacnet/src/sc_interop.zig`) reported that creating a
-`std.Io.net.Stream.Reader` on a socket stops subsequent writes through the
-**paired** `std.Io.net.Stream.Writer` from reaching the wire under
-`std.Io.Threaded`: `writeAll`/`flush` report success but nothing arrives. All
-three of `iec104`, `iec61850` and `fleetsim` pair a reader and a writer on one
-stream, so the report put them under suspicion.
+- **IEC 62351-3/-5 security in this module**: no TLS on 2404, no certificate handling, no role-based access control. Bring
+  your own terminated stream (see *Threat model*); the sibling `iec62351` covers the policy parts.
+- **lib60870's activation-termination quirk** (echoing the *select* element in the termination of an execute) and its silent
+  drop of an unknown type id are not replicated; this outstation echoes the execute element and replies with cause 44, as
+  §7.2.3 prescribes.
+- **Answering a broadcast test command.** On CA 0xFFFF the observed third-party RTU replies to `C_TS_TA_1` (type 107) and
+  echoes 0xFFFF (`goldens.global_ca_test_command_reply`). §7.2.4 lists only type ids 100, 101, 103 and 105 as valid with the
+  global address, so this module answers nothing outside those four: a station that replies to a broadcast the standard does
+  not define for it makes every station on the link reply to one frame.
 
-**Finding: not a std bug, and not present in these modules.** Reproduced on
-0.16.0 (x86_64-linux) with four probes over a loopback socket pair under
-`Threaded` — single write→read→write, five such cycles, a reader that over-reads
-a coalesced second message before the next write, and a full-duplex exchange
-with **both** peers buffered — every write reached the peer. The mechanism the
-report proposed cannot hold: `Stream.Reader` and `Stream.Writer` each store
-their own copy of the two-word `Stream` (just a socket handle) and their own
-buffer, so they do not alias; and in `std.Io.Threaded` `netRead`/`netWrite` are
-a plain `readv(2)` / `sendmsg(2)` on the shared fd with no change to its flags.
-The bacpypes/websocket workaround (`std.posix.read` in place of a
-`Stream.Reader`) is therefore unnecessary for write delivery, though it is
-harmless where a hand-rolled frame parser wants the raw descriptor.
+## Open
 
-**The real, adjacent hazard — which these modules already guard against.** A
-buffered `Stream.Reader` can hold a whole APDU that a later `poll(2)` on the raw
-fd will never report as readable, because the bytes are in the reader's buffer,
-not in the socket. A read that always polls before reading would then **stall**
-on coalesced frames. `TcpTransport.readFn` avoids this with the
-`r.bufferedLen() == 0` check before `waitReadable()`; `fleetsim` does the same in
-its serve loops. The regression test
-`"TcpTransport delivers write->read->write over a real socket (no env gate)"`
-in `src/transport.zig` (and the sibling tests in `iec61850` and `fleetsim`)
-pins both properties with no env gate and no external peer: removing the
-`bufferedLen()` guard makes the coalesced second read stall and the test fail.
-This is worth reporting upstream only as documentation — there is no std defect
-to file.
+- The `104apci`/`104asdu` `tshark` dissector cross-check has not been run (no `tshark` was available). `c104.explain_bytes`, a
+  lib60870 decoder, served the same purpose for the goldens, which come from a real capture rather than being hand-derived.
 
-## Status
+## Backlog / deferred
 
-`gap · any (pure codec + state machine; only the optional TcpTransport touches std.Io.net) ·
-both (controlling + controlled station) · single_owner` + deps: none (std only) — canonical source
-is `pub const meta` in src/root.zig.
+- **Read (`C_RD_NA_1`, cause 5) of a protection-equipment point (types 17-19, 38-40)**: the type/cause table allows these types
+  with cause 3 only, yet `onRead` answers such a point with cause 5 like any other. No reference behaviour to copy was found:
+  lib60870-C's slave hands every read to the application's read handler (it only refuses a broadcast address, with cause 46,
+  and a non-request cause, with cause 45) and checks no type; this outstation's own refusals are "wrong request cause" (45,
+  negative) and "unknown IOA" (negative activation confirmation, then 47), and neither fits a point that exists but may not
+  be read. Decide which refusal (if any) is right before changing it; a test with a protection point read is needed either way.
+- **Redundancy groups (CS 104)** *(survey)*: lib60870 has them; utilities run dual-link 104 as standard; medium, fits §2 (state
+  machine + arbitration, no I/O). Ranked first by the survey.
+- **File transfer (type ids 120-127)** *(survey)*: lib60870 file service; needs variable-length elements outside the shape
+  table; medium-large, fits §2.
+- **IEC 101 serial link layer (FT1.2)** *(survey)*: the other half of lib60870's scope; medium; fits §2 (framing pure, port I/O
+  is the caller's).
 
 ## Anchoring
 
@@ -385,12 +344,3 @@ is `pub const meta` in src/root.zig.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** 72 byte-exact goldens captured from real c104/lib60870 traffic (SPEC.md)
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-08 (partial — the rollover half only): drove a real `c104` outstation to spontaneously report 33,000 values (paced to avoid overrunning its own internal send queue — an unpaced burst makes it close the connection, a real lib60870-C limitation worth recording) so this module's `Client` processed a genuine 15-bit sequence-number wrap: `monitoring=32773 recv_seq=5 wrapped=true`, this module's `recv_seq` wrapping 32767→0 at exactly the frame the peer's own N(S) did. Captured via an in-process `RawTap` (client.zig) rather than an external proxy — the proxy's added latency was *also* enough to overrun the peer's queue. Froze the last 64 frames straddling the wrap as `goldens.zig`'s `wrap_table`, replayed through a fresh `state.Connection` fast-forwarded to the capture's own starting point. Mutation-tested: a +1/-1 bias in `apci.decode`/`encode`'s I-frame send_seq extraction, paired so encode(decode(x))==x still holds (self round-trip blind) — `exit 1, 11/121 fail`, including both new wrap tests and, since the bias is a real absolute-value error and not merely a round-trip asymmetry, several pre-existing absolute-value assertions too; reverted. NOT closed: driving a real peer to an actual t1 (acknowledgement) timeout — still open, honestly disclosed in SPEC.md.
-
-## Backlog / deferred
-
-- (2026-11-18) **Read (C_RD_NA_1, cause 5) of a protection-equipment point (types 17-19, 38-40)**: the type/cause table allows these types with cause 3 only, yet `onRead` answers such a point with cause 5 like any other. No reference behaviour to copy was found: lib60870-C's slave hands every read to the application's read handler (it only refuses a broadcast address, with cause 46, and a non-request cause, with cause 45) and checks no type; this outstation's own refusals are "wrong request cause" (45, negative) and "unknown IOA" (negative activation confirmation, then 47), and neither fits a point that exists but may not be read. Decide which refusal (if any) is right before changing it; a test with a protection point read is needed either way.
-- (survey 2026-09-30) **Redundancy groups (CS 104)**: lib60870 has them; utilities run dual-link 104 as standard; medium, fits §2 (state machine + arbitration, no I/O). Already listed as deferred; ranked first by this survey.
-- (survey 2026-09-30) **File transfer (type ids 120-127)**: lib60870 file service; needs variable-length elements outside the shape table; medium-large, fits §2.
-- (survey 2026-09-30) **IEC 101 serial link layer (FT1.2)**: the other half of lib60870's scope; medium; fits §2 (framing pure, port I/O is the caller's).

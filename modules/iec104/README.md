@@ -49,8 +49,10 @@ doubles as a fleet-simulation target.
   information objects. The **SQ bit changes the layout entirely** — `SQ = 0` is
   one address per object, `SQ = 1` is one address followed by bare elements at
   consecutive addresses — and both are encoded and decoded. Type ids modelled:
-  monitoring 1–16, 20, 21, 30–37; control 45–51 and 58–64; system 70 and
-  100–107; parameter 110–113 (recognised, qualifiers passed through as raw octets).
+  monitoring 1–21 and 30–40 (including the protection-equipment events 17–19
+  and 38–40, which the outstation reports only spontaneously); control 45–51
+  and 58–64; system 70 and 100–107; parameter 110–113 (recognised, qualifiers
+  passed through as raw octets).
 - **Address sizing is per system, not per standard.** The information-object
   address (1–3 octets), the common address (1–2) and the originator octet are
   explicit `Params`, never baked-in constants. `default_params` is the
@@ -123,6 +125,7 @@ flow control with your own I/O.
 ## Verify
 
 ```
+scripts/modtest iec104                         # the module's tests (Debug)
 zig build test-iec104                          # Debug
 zig build test-iec104 -Doptimize=ReleaseFast
 zig fmt --check modules/iec104
@@ -134,16 +137,27 @@ gracefully (printing `SKIPPED:` and passing) when no peer is present:
 ```
 IEC104_TEST_SERVER=host:port  IEC104_TEST_CA=47   # our client -> a real RTU
 IEC104_TEST_LISTEN=host:port                      # a real master -> our RTU
+IEC104_TEST_WRAP=host:port                        # a real RTU driven through the 15-bit sequence wrap
+IEC104_FUZZ=<runs>[,<first seed>]                 # the deterministic fuzz driver
 ```
 
-The offline suite includes **72 byte-exact goldens captured from real traffic
+The offline suite includes the **72 byte-exact goldens captured from real traffic
 between two independent third-party implementations** — every one of them
 decodes and re-encodes to the identical octets — plus the k/w and t0..t3 state
 machine driven by a fake clock (including a full 32768-frame sequence-wrap
 cycle), full master↔outstation round trips over an in-memory wire, and
-`std.testing.fuzz` sweeps over the APCI decoder, the stream framer, the ASDU
+deterministic fuzz sweeps over the APCI decoder, the stream framer, the ASDU
 decoder, `CP56Time2a` and the outstation's request handler. See SPEC.md for
-what is third-party-validated versus self-derived, and what is deferred.
+what is third-party-validated versus self-derived.
+
+## Not provided
+
+IEC 101 serial link layer, redundancy groups and file transfer (type ids
+120–127) are open (SPEC *Backlog / deferred*); typed parameter loading (the
+QPM/QPA qualifiers are raw octets, the outstation has no parameter store),
+`C_CD_NA_1` on the outstation and automatic background scan are limits (SPEC
+*Known limits*); TLS is bring-your-own and a few third-party quirks are
+deliberately not copied (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the IEC 60870-5-104 / IEC 60870-5-101 frame
 layouts. No third-party source was consulted; a third-party stack was used as a

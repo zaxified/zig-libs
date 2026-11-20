@@ -5,19 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records that a Read of a protection-equipment point is still answered with cause 5 (not in the type/cause table); no reference refusal was found, so nothing was changed.
 - **2026-11-18** — **Behaviour change:** the outstation no longer reports protection-equipment event points (types 17-19, 38-40) in a station, group or counter interrogation; the type/cause table of IEC 60870-5-101/-104 allows them with cause 3 only. `reportSpontaneous` still sends them. New `TypeId.isSpontaneousOnly`. Only points of those types, which were not representable before today, are affected. Delta mutation: 7 mutants, 6 killed, 1 equivalent (card 941/963, 22 eq).
 - **2026-11-18** — **Protection-equipment events (additive):** types 17-19 and 38-40 (`M_EP_TA_1` … `M_EP_TF_1`) are in the shape table (`TypeId.m_ep_ta_1` … `m_ep_tf_1`), with element kinds `protection_event` (SEP + CP16Time2a), `protection_start` (SPE + QDP + CP16Time2a) and `protection_output` (OCI + QDP + CP16Time2a), the new `info.Sep`/`Spe`/`Oci`/`Qdp`, and the CP24/CP56 tag as the time tag. Before, they decoded as `UnsupportedTypeId`. Tests carry hand-built standard octets for all six in both directions plus the wrong-length refusal. Delta mutation: 60 mutants over the new code, 60 killed (card counts cumulative: 935/956, 21 eq).
 - **2026-11-17** — **Fix (behaviour change):** `P_ME_NC_1` (type 112) now has the standard element, an IEEE short float plus QPM (5 octets), as the new `ElementKind.parameter_float` / `Element.parameter_float = .{ .value, .qpm }`; before, it shared the 3-octet integer-parameter element, so a standard type-112 ASDU was refused as `ObjectCountMismatch` and a 3-octet one accepted. Additive API; 110/111 are unchanged. SPEC no longer claims protection-event types 17-19/38-40 are in the shape table (they decode as `UnsupportedTypeId`; Backlog).
 - **2026-11-17** — Whole-module mutation of `apci`, `asdu`, `info`, `state`, `client`, `outstation` and `transport` (896 mutants, 875 killed, 21 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). Tests added in `src/mutation_test.zig` and `src/transport.zig` (header and reserved-octet edges, `Config.validate` boundaries, timer re-arm/clear points, the whole shape table, element/time-tag bit positions, QOI group edges, cause/negative pairs, reply-queue exact fit and compaction, socket framing); no other behaviour change.
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-10** — tests: deterministic fuzz driver `IEC104_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `apci-decode`, `apci-framer`, `asdu`, `info-time`, `outstation-handle`. Verdict: 200,000 runs each, ReleaseSafe, clean.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
-  test bound the fixed port 15683; its peer now binds port 0 and publishes the port it got. Its
-  1 s listen wait became a 30 s watchdog.
 
 - **2026-09-10** — **A1 fix campaign, F8/F9 (test teeth).** F8: the wrap-replay golden test
   called `state.Connection.tick` for its side effects (`_ = c.tick(now);`) and skipped every
