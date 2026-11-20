@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): loop-freedom invariant under ordered FIB scheduling, netsim fuzzer finds naive-order loop (positive control) (invariant checker, no independent model)
+The card has no model: the tests check the loop-freedom invariant under ordered FIB scheduling, and the netsim fuzzer finds the naive-order loop (positive control). That is an invariant checker, not an independent model.
 
 **Known defects:** none recorded
 
@@ -22,7 +22,7 @@ What the tests check instead of a model (was `**Evidence:** model` until 2026-11
 
 Loop-free reconvergence for a link-state fabric: an ordered-FIB update schedule
 that keeps forwarding acyclic at every step of a topology transition, verified
-in `netsim`. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+in `netsim`. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line (clean-room, so no `NOTICE` file).
 
 ## Compared with
 
@@ -144,36 +144,26 @@ are equivalent — see `fib.zig`).
 
 ## Verification
 
-`zig build test-loopfree-reconv` — green in Debug + ReleaseFast, no leaks:
+`scripts/modtest loopfree-reconv` (or `zig build test-loopfree-reconv`), Debug and ReleaseFast, no leaks.
 
-- **smoke** — no faults, frames flow origin→dest cleanly.
+- **smoke** — no faults, frames flow origin to dest cleanly.
 - **positive control** — `naiveBadOrder` on a single `link_down 1-0 @ t=105`
-  DOES bounce a frame between nodes 1 and 2; the checker raises
+  bounces a frame between nodes 1 and 2; the checker raises
   `error.ForwardingLoop`. Proves the invariant has teeth independent of the
   real ordering.
 - **shrink** — `netsim`'s seeded fuzzer finds a naive-ordering loop across
   seeds and ddmin-minimizes it to a still-reproducing core.
-- **teeth-at-scale** — the headline sweep: 5000 seeds × up to 8 fault events ×
-  a few hundred forwarded frames each, over the REAL `ordered_fable` ordering
-  plus the serializing conductor, finds **no** forwarding loop.
+- **teeth-at-scale** — the headline sweep: 5000 seeds, up to 8 fault events each,
+  a few hundred forwarded frames each, over the real `ordered_fable` ordering
+  plus the serializing conductor, finds no forwarding loop.
 - unit tests for `changedNodes`, `naiveBadOrder`, `buildGraph`/`applyInitialFib`,
   and `applyTopologyChange` scheduling.
-- **Mutation run 2026-10-05** (in-place, Debug, 32 mutants over
-  `changedNodes`, the two-class order and its tie-breaks, the conductor's
-  serialization and spacing, the loop checker's slot ownership, the message
-  and timer guards, `reset`, and the harness's `findFailing`/ddmin): 28
-  killed. The first pass left 13; tests added for an equal-distance shift
-  being class B and ties breaking by ascending id in both classes, a moved
-  distance with an unmoved next hop not being "changed", a reused frame slot,
-  the 3-octet payload and unminted conductor-id guards, `reset` clearing every
-  per-run field, and `findFailing`'s inclusive `end`. Equivalent: the
-  redundant-event early return (old and new trees are equal, the order is
-  empty), skipping the destination check (the destination's next hop is
-  `null`, so the frame is retired as dropped instead — nothing counts
-  deliveries), the shrinker matching only `.violated` (`ForwardingLoop` is
-  the only violation), and not lowering ddmin's granularity after a removal
-  (termination still needs a full pass at `granularity == len`, so the result
-  stays 1-minimal).
+- **Mutation tests** pin: an equal-distance shift is class B; ties break by ascending
+  id in both classes; a moved distance with an unmoved next hop is not "changed";
+  a reused frame slot; the 3-octet payload and unminted conductor-id guards; `reset`
+  clears every per-run field; `findFailing`'s inclusive `end`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
@@ -181,14 +171,8 @@ are equivalent — see `fib.zig`).
   to the explicit apply ordering.
 - Multi-destination scheduling and the control-plane propagation model, if this
   graduates from a property-test jewel into a fabric component.
-- **Per-node delay/rank derivation** (a node computes its own position from its old/new distance, no global list) (survey 2026-09-30). Why: that is how oFIB is deployed in a distributed IGP; the global order alone needs a conductor real networks do not have. Effort: ~2 days. Fits §2: yes.
-- **Multi-destination batching and ECMP-aware ordering** (survey 2026-09-30). Why: an IGP recomputes all destinations per event; per-call single tree makes callers loop and lose cross-destination interaction. Effort: ~1 week. Fits §2: yes.
-
-## Status
-
-`any · util · single_owner` + deps `netsim`, `spf-ect`, model_after
-"ordered-FIB / RPF loop-free convergence (IS-IS/SPB), TTL backstop" — canonical
-source is `pub const meta` in src/root.zig.
+- **Per-node delay/rank derivation** (a node computes its own position from its old/new distance, no global list). Why: that is how oFIB is deployed in a distributed IGP; the global order alone needs a conductor real networks do not have. Effort: ~2 days. Fits §2: yes.
+- **Multi-destination batching and ECMP-aware ordering.** Why: an IGP recomputes all destinations per event; per-call single tree makes callers loop and lose cross-destination interaction. Effort: ~1 week. Fits §2: yes.
 
 ## Anchoring
 

@@ -54,6 +54,10 @@ literature (Francois, Filsfils, Evans & Bonaventure, "Achieving sub-second IGP
 convergence in large IP networks", INFOCOM 2005; RFC 6976). No third-party
 source consulted or copied.
 
+## Not provided
+
+Multi-destination scheduling, ECMP, per-node delay derivation and the control-plane propagation model; see `SPEC.md` *Backlog / deferred* and *Threat model / out of scope*.
+
 ## Verification
 
 `zig build test-loopfree-reconv` — offline tests, green in Debug + ReleaseFast:
