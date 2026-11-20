@@ -71,7 +71,7 @@ U+2028/U+2029 and the bidirectional controls U+202A–U+202E/U+2066–U+2069 of
 `short` finding is always one line. Carets line up across tabs, multi-byte
 UTF-8 and display widths (see "Width, charset, terminal width" below).
 
-### Labels, notes, fix-its, colour (2026-10-04)
+### Labels, notes, fix-its, colour
 
 ```zig
 try diag.append(.{

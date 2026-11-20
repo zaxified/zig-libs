@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-12 (625/675, 50 eq) · src 041febbda9632ede
 
-Audit detail: Mutation delta 2026-11-07 (commits `c65d2d91`, `98cd9b0f`, `58d07a9c`: `Source.location`, `Source.range`, `Range.applyTo`, `Range.label`; schemata, ReleaseSafe, the `Source.location` tests): 31 mutants, 30 killed, 1 equivalent (the binary search's midpoint rounded up instead of down: `hi - lo > 1` keeps `line_starts[lo] <= byte < line_starts[hi]` either way, so both find the same last start in a sorted index). Five survived the first run: byte equal to the first line start of an index that does not start at 0, the `maxInt(u32)` bound on `byte` (both sides), and the `maxInt(u32)` bound on the index length; one test added that stands a PROT_NONE page in for a 4 GiB text and a 2^32-entry index. 2026-11-13: the source changed only by regenerating the Unicode tables for 18.0.0 (data arrays and version constants from the generator; no guard, branch or arithmetic changed), so the mutation run above still covers every guard and no delta mutants exist; the tables themselves are anchored by the oracles in the verification table.
-
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — diagnostic rendering (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no finding; extreme positions/options pinned by a seeded test)
 
 **Performance:** ref 0.42–0.60× codespan-reporting 0.13.1 (rich, ASCII; `zig build bench-diagnostics`: 10k single-label, 2k three-label, 1k five-line diagnostics over a 1 MB file, 200 on a 100 KB line; first 20 outputs byte-identical to codespan before timing) · fastest 0.88–0.94× worst vs the faster of codespan-reporting and annotate-snippets 0.12.17 (measured 2026-10-20)
@@ -23,7 +21,7 @@ Audit detail: Mutation delta 2026-11-07 (commits `c65d2d91`, `98cd9b0f`, `58d07a
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README `Provenance:` note and its own NOTICE (the snippet layout is ported from codespan-reporting, the terminal-width cutting from annotate-snippets, the width table from unicode-width).
 
 ## Compared with
 
@@ -33,26 +31,23 @@ Only READMEs and docs were read (and, for Zig `std`, the MIT source on disk); no
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [brendanzab/codespan](https://github.com/brendanzab/codespan) (`codespan-reporting`) — **reference** | Rust | Apache-2.0 (API; source not read) | 1.3k | codespan=0.13.1 (2025-10-22) | Labels are primary/secondary spans with their own messages, several per diagnostic, across several files (README example: one error, four labelled spans); notes; coloured terminal output via `termcolor`. Ours: one span per finding, one `path`/`suggest` note pair, no colour. |
+| [brendanzab/codespan](https://github.com/brendanzab/codespan) (`codespan-reporting`) — **reference** | Rust | Apache-2.0 (API; source not read) | 1.3k | codespan=0.13.1 (2025-10-22) | Labels are primary/secondary spans with their own messages, several per diagnostic, across several files (README example: one error, four labelled spans); notes; coloured terminal output via `termcolor`. Ours: a primary span plus labels (also across files), notes, the same rich layout, colour on the module's own parts only. |
 | [zesterer/ariadne](https://github.com/zesterer/ariadne) | Rust | MIT | 2.2k | push 2026-03-23 (no releases) | README: arbitrary multi-line spans, per-label colours (`ColorGenerator`), labelled reports. Same gap as above. |
-| [zkat/miette](https://github.com/zkat/miette) | Rust | Apache-2.0 (API; source not read) | 2.6k | v7.1.0 (2024-02-16) | README: diagnostic code URLs, help text, severity, related diagnostics, a screen-reader "narrated" printer, NO_COLOR/CI awareness. Ours has `code` and a suggestion but no URL/related findings. |
-| [rust-lang/annotate-snippets-rs](https://github.com/rust-lang/annotate-snippets-rs) | Rust | Apache-2.0 (API; source not read) | 522 | push 2026-09-22 (no releases) | The renderer rustc itself uses (README not read; inferred). Multi-annotation snippets. |
+| [zkat/miette](https://github.com/zkat/miette) | Rust | Apache-2.0 (API; source not read) | 2.6k | v7.1.0 (2024-02-16) | README: diagnostic code URLs, help text, severity, related diagnostics, a screen-reader "narrated" printer, NO_COLOR/CI awareness. Ours has `code`, a suggestion, `code_url` and related spans (`labels`), but no narrated printer. |
+| [rust-lang/annotate-snippets-rs](https://github.com/rust-lang/annotate-snippets-rs) | Rust | MIT OR Apache-2.0 | 522 | push 2026-09-22 (no releases) | The renderer rustc itself uses (README not read; inferred). Multi-annotation snippets. |
 | Zig `std.zig.ErrorBundle` ([ziglang/zig](https://github.com/ziglang/zig)) | Zig | MIT | 43.3k | 0.16.0 (on disk; GitHub latest release shown 0.15.1) | Compiler-diagnostic container in `lib/std/zig/ErrorBundle.zig` (read): notes per message, reference traces, source line, tty colour on stderr. It is a compiler-internal packed string-table format, not a general collector, and has no JSON or path/code/suggestion fields. |
-| [LSP 3.17 `Diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#diagnostic) | (spec) | (spec) | — | — | The data model this module says it follows: range, severity, code, source, message. Beyond ours: `relatedInformation`, `tags`, `codeDescription`, `data`, and a fourth severity `hint` *(from memory of the spec; inferred)*. |
+| [LSP 3.17 `Diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#diagnostic) | (spec) | (spec) | — | — | The data model this module says it follows: range, severity, code, source, message. Ours writes and reads all of it but `data` (`labels` are `relatedInformation`, `code_url` is `codeDescription`, `tags`, the fourth severity `hint`); `data` is dropped. |
+
 
 **Where we are ahead:** a general, dependency-free collector for Zig with a stable position sort, a JSON writer,
 `file:line:col` one-line output, and a snippet renderer that escapes control characters so untrusted key names cannot
 inject terminal escapes (none of the Rust renderers' READMEs claim this; *inferred*: not checked in their source); tree
 `path` for findings that have no source position, and `expr_off`/`expr_len` for in-expression highlighting.
-**On par since 2026-10-04:** several labelled spans per diagnostic (also across files), colour, `note:`/`help:`
-notes, a code URL and a structured fix-it edit. **Where we are behind** (re-checked 2026-10-04): labels on the
-SAME line as the primary span get their own quoted block instead of sharing one line with several underline rows
-(codespan/ariadne merge them); no multi-line span drawing (a span past its line is underlined to the line end); no
-`hint` severity (→ Backlog, deliberately); no screen-reader "narrated" printer (miette). Byte-range spans (codespan's `start..end`, `Files::location`): `Source.location` / `Source.range` → `Range.applyTo` / `Range.label` (2026-11-05).
+**On par:** several labelled spans per diagnostic (also across files), codespan's rich layout (labels of one line merged, multi-line spans drawn), colour, `note:`/`help:` notes, a code URL, a structured fix-it edit, LSP 3.17 both ways with the `hint` level, and byte-range spans (codespan's `start..end`, `Files::location`): `Source.location` / `Source.range` → `Range.applyTo` / `Range.label`. **Where we are behind:** no per-label colours, no narrated printer (miette), no diff-style suggestion rendering (annotate-snippets `Patch`, see Backlog), codespan's medium style is not ported (our one-line `short` takes its place); at most 64 spans and 16 multi-line spans per file are drawn, the rest are listed as location lines. The rejected items are under *What is deliberately not done*.
 
 ## Design & invariants
 LSP-style structured validation-finding collector: an ordered `Diagnostics` list of `error`/
-`warning`/`info` findings, each with a dot-separated tree path, optional 1-based source line/col
+`warning`/`info`/`hint` findings, each with a dot-separated tree path, optional 1-based source line/col
 (+ end position), an optional in-expression byte offset/length for token highlighting, a
 machine-readable `code`, a `message`, and an optional did-you-mean `suggest`. `append` grows the
 caller-owned list; `count`/`countBySeverity` are the read side (e.g. gate saving on zero errors).
@@ -61,20 +56,27 @@ Allocation: owned by the caller-supplied allocator; the collector holds no owner
 `items` list — all strings referenced by an appended `Diagnostic` (path/message/suggest) are
 expected to outlive the collector, typically because both live in the same arena freed in one shot
 at the validation boundary; callers must dupe strings that need to outlive that arena. Modeled after
-LSP's `Diagnostic` type / rustc diagnostics; original work of the zig-libs authors, the
-structured-finding collector for config/json5/expr validation — no third-party source.
+LSP's `Diagnostic` type / rustc diagnostics; the structured-finding collector for
+config/json5/expr validation. Original work, except the ported parts named in the README's `Provenance:` note.
 
-## Design — labels, notes, fix-its, colour (2026-10-04)
+## Design — labels, notes, fix-its, colour
 
-`Diagnostic` gained four optional fields, all null by default and omitted from JSON when null, so existing
-output (text and JSON) is byte-identical — the 13 pre-existing exact-text tests passed unchanged:
-`labels: ?[]const Label` (secondary spans with a message; `file` null = the diagnostic's file),
-`notes: ?[]const Note` (`note`/`help` lines), `code_url`, `fix: ?Fix` (replace a span with text; an empty
-span inserts). `snippet` quotes each label under ` ::: location` with `-` marks and its message after them
-(one gutter width for every quoted line), then the notes in the order `at`, `notes`, `help` (`suggest`),
-`fix`, `see`. `short` appends them to the one line. `RenderOptions.color` adds ANSI SGR around the module's
-own parts only (severity, header, gutter, arrows, marks); finding text is escaped exactly as without colour,
-so a finding still cannot emit an escape sequence (tested with colour on).
+`Diagnostic` carries optional fields, all null by default and omitted from JSON when null: `labels: ?[]const Label` (secondary spans with a message; `file` null = the diagnostic's file; `Label.primary` draws one as a second primary span), `span_message` (the message next to the primary span; `snippet` only), `notes: ?[]const Note` (`NoteKind` `note` / `help` / `plain`; `plain` is codespan's note, a `\n` starts an aligned continuation line), `code_url`, `fix: ?Fix` (replace a span with text; an empty span inserts) and `tags: ?[]const Tag` (`writeLsp` only). `snippet` quotes the labels in the shared layout below, then writes the notes in the order `notes`, `at` (the path), `help` (`suggest`), `fix`, `see` (`code_url`) (`renderOne`, tested by "a secondary label shares the snippet; our notes follow codespan's, then help, fix, see"). `short` appends labels, notes, fix and URL to the one line. `RenderOptions.color` adds ANSI SGR around the module's own parts only (severity, header, gutter, arrows, marks); finding text is escaped exactly as without colour, so a finding still cannot emit an escape sequence (tested with colour on).
+
+`Severity` has LSP's four levels; `hint` renders like `info` under its own word. Adding it was source-breaking for an exhaustive `switch (d.severity)`. `expr_off`/`expr_len` are data for the consumer: an offset into the expression's own text, drawn by no renderer and not converted by `writeLsp`.
+
+## Design — rendering, JSON, order
+
+`Diagnostic.file` (optional) names the source. `renderOne` / `Diagnostics.render` write `short` (one compiler-style line: `file:line:col: severity[code]: message (at path); suggestion`) or `snippet` (codespan-reporting 0.13.1's "rich" layout, ASCII or box-drawing charset: header, `-->` location, the quoted source lines with carets, the notes). Decisions worth knowing:
+
+- Every string from a finding is written with control characters escaped (`\n`, `\x1b`, C1 controls, U+2028/U+2029 and the bidirectional controls as `\u{NNNN}`, a non-UTF-8 byte as `\xNN`) and a quoted source line shows them as `?`, because findings quote the input under validation and are printed to terminals: an attacker-chosen key name must not carry an escape sequence through, and `short` must stay one line. A leading BOM is not written; a `\r` ending a line is part of its break (codespan's `trim_end_matches`).
+- Positions are 1-based with `col` in bytes; `end_*` is exclusive, LSP-style. Carets line up by display width (`charWidth`: East Asian wide and emoji two columns, combining marks and zero-width characters none, ambiguous one); tabs are shown as spaces up to the next multiple of `RenderOptions.tab_width`. `RenderOptions.column = .char` changes only what the `-->` line prints.
+- Labels of one line share it; a span over several lines is drawn with `/ |` and `\` markers (`start_context_lines` / `end_context_lines` bound what is quoted); `before_label_lines` / `after_label_lines` add context lines and do not widen the gutter. `term_width` cuts long lines around the spans (annotate-snippets 0.12's window algorithm), `...` marking a cut end. At most 64 spans (the primary and the first 63 labels) and 16 multi-line spans per file are drawn; the rest, and any label that cannot be quoted, are `--> location: message` lines, so nothing is lost silently. Rendering allocates nothing.
+- `writeJson` is `std.json.Stringify` over the items with null fields omitted (field names as keys, severity as a string). `sortByPosition` is `std.mem.sort` (stable): `file` (byte order, none last), then `line`, then `col`, each with unknowns last.
+- `Source.line_starts` (`Source.indexLines`) makes a quoted line O(1); without it every quoted line is found by a scan from the top of the text.
+- LSP: `writeLsp` / `writeLspArray` write range, severity 1..4, code, `codeDescription`, source, tags and `relatedInformation` (from `labels`); `fromLsp` reads them back. `PositionEncoding` (`utf8` / `utf16` / `utf32`) says how a `character` is counted (`lspCharacter`, `byteColumn`).
+
+**Width table.** `src/width_table.zig` is generated by `tools/unicode-width/gen.py` from the released crate unicode-width **0.2.3** (crates.io, licence `MIT OR Apache-2.0`; `.crate` archive sha256 `ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557`), whose `src/gen/tables.rs` declares Unicode 18.0.0. The archive is read as data only (the generator parses `tables.rs` and the `match` of `lookup.rs`; nothing of the crate is built or run). The module's Unicode version follows the crate's: a move to a later Unicode waits for a released crate that carries it. U+FF9E / U+FF9F (halfwidth katakana sound marks) are width 1, a decision of the crate. The interop lane's codespan oracle still links unicode-width 0.2.2 (`tools/codespan_bench/Cargo.lock`); the fixed text atoms of its cases have the same width in both versions.
 
 ## Threat model / out of scope
 Not security-sensitive; it is a passive data collector with no I/O, no parsing, and no trust
@@ -84,123 +86,38 @@ never dereferences the referenced strings beyond storing the slice, so a caller 
 message/suggest memory before reading the collector back gets a dangling-slice bug that is the
 caller's responsibility, not this module's.
 
+## Known limits
+
+- Without `Source.line_starts`, `lineIn` scans `text` from the top for every quoted line, so huge context-line options or many diagnostics (`fromLsp` / `writeLspArray`) over a large file cost O(lines × text). Documented on `line_starts`, which makes it O(1); building the index lazily would need an allocator the renderers do not take.
+- `caretPointers` is up to 64 × 64 × line length for one multi-MB line carrying 64 labels with `term_width = null`: linear in the input with a large constant; not measured.
+- The `term_width` cut path walks the whole line (a 100 KB line costs about 3x annotate-snippets; see Backlog).
+
 ## Verification
-Tests cover: rendering in both styles against exact expected text (missing fields left out, caret
-alignment after tabs and multi-byte UTF-8, multi-line and clamped spans, the source picked by file
-or as the only one, control characters escaped), stable sorting with unknown positions, JSON output
-read back by `std.json`; append + count/countBySeverity accounting across severities, the doc-comment usage
-pattern (arena-lifetime append then read), and structural field coverage (path/line/col/end/
-byte-offset/code/message/suggest all round-trip through `items`). Run: `zig build test-diagnostics`.
 
-**Rendering, JSON, order** (2026-09-28, requested by the terminal-UI consumer, which rendered findings itself and
-smuggled the file name into `path` as `file:path`). `Diagnostic.file` (optional) names the source.
-`renderOne`/`Diagnostics.render` write `short` (one compiler-style line: `file:line:col:
-severity[code]: message (at path); suggestion`) or `snippet` (rustc style: header, `-->` location,
-the quoted source line with carets, `= at:`/`= help:` notes). Two decisions worth knowing: every
-string from a finding is written with control characters escaped (`\n`, `\x1b`, ...), and the
-quoted source line shows them as `?`, because findings quote the input under validation and are
-printed to terminals -- an attacker-chosen key name must not carry an escape sequence through, and
-`short` must stay one line; carets are indented by copying the line's tabs and emitting one space per
-UTF-8 code point, so they align on any tab width (double-width glyphs are not measured). Positions
-are 1-based with `col` in bytes; `end_*` is exclusive, LSP-style; a span ending on a later line
-underlines to the end of the quoted one; a column past the line clamps to its end. `writeJson` is
-`std.json.Stringify` over the items with nulls omitted (field names as keys, severity as a string).
-`sortByPosition` is `std.mem.sort` (stable): file, line, col, each with unknowns last.
+Run: `scripts/modtest diagnostics`. The module has no fuzz obligation (the card's Hardening line).
 
-**Width table source (2026-11-13: Unicode 18.0).** `src/width_table.zig` is regenerated by `tools/unicode-width/gen.py` from the released crate unicode-width **0.2.3** (crates.io, published 2026-10-28, licence `MIT OR Apache-2.0` as before; `.crate` archive sha256 `ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557`), whose `src/gen/tables.rs` declares `UNICODE_VERSION = (18, 0, 0)`. The archive is read as data only (the generator parses `tables.rs` and the `match` of `lookup.rs`; nothing of the crate is built or run). The module's Unicode version follows the crate's: a move to a later Unicode waits for a released crate that carries it. Against 0.2.2 (Unicode 17.0.0), 1,029 code points change width: 1,027 assigned in 18.0 (990 to two columns: Jurchen U+18E00-191D2, Khitan U+18CD6-18CDA, Hiragana / Katakana additions, new emoji such as U+1FADD; 37 to zero: new combining marks such as U+1AEC-1AF0, U+10EF0-10EF9, the musical combining symbols) and two old ones, U+FF9E / U+FF9F HALFWIDTH KATAKANA (SEMI-)VOICED SOUND MARK, 0 → 1, a decision of the crate (their UCD data are identical in 17.0 and 18.0: Lm, East_Asian_Width H, Grapheme_Extend). Pinned in `render_test.zig` "charWidth: …". The codespan-reporting oracle of the interop lane still links unicode-width 0.2.2 (`tools/codespan_bench/Cargo.lock`); its fixed text atoms (é ß ж λ 中 文 한 🦀 ｱ → ·) have the same width in both versions.
+- **Tests by area** (`src/root.zig`, `render_test.zig`, `lsp_test.zig`, `codespan_test.zig`): exact-text rendering in both styles (missing fields left out, caret alignment after tabs and multi-byte UTF-8, multi-line and clamped spans, the source picked by file or as the only one); labels, gutter widening, unquotable labels, insertion fixes, escaped label/fix/URL text; colour (stripping every SGR sequence must give the plain output byte for byte, a hostile message stays escaped); stable sorting with unknown positions; JSON read back by `std.json`; `charWidth`, `isShownAsQuestion` and `isWhiteSpace` as exact sets over every code point; `writeEscaped` per byte; `Source.location` / `Source.range` (CRLF, empty text, offsets past the end, a `line_starts` that does not fit the text, the `u32` bounds checked with an unreadable page standing in for a 4 GiB text); LSP position conversion in every encoding, `writeLsp` / `fromLsp` round trips, percent-encoding of every file-name byte, severity and code mapping, type and range guards; exact `term_width` goldens read against the algorithm's rules.
+- **Hostile input:** control characters, C1 controls, bidi controls, invalid UTF-8 and a BOM in the source, the message, labels and notes never reach the output raw (also with colour on); a seeded sweep ("extreme positions and options") pins that extreme line/column values, every `RenderOptions` field at its extreme, up to 70 labels and every LSP encoding neither overflow nor crash and keep the output bounded.
+- **Oracle, codespan-reporting 0.13.1 itself, live:** `zig build interop-diagnostics` (`tools/interop.zig` + `tools/codespan_bench/src/bin/oracle.rs`, built offline and `--locked`; `-- --lead` runs the hostile-key-name comparison) renders seeded random cases on both sides in both charsets and compares byte for byte; cases where codespan's order of three or more equal-range labels is unspecified are not compared. A reverted port fix makes it fail again (the `leadingSpace` Unicode White_Space defect).
+- **Goldens:** codespan's own `insta` snapshots, replayed in-test (`src/codespan_test.zig`) in both charsets; every case is byte-identical (the deviation list is empty). Producer: `tools/codespan-goldens/gen.py` from the vendored snapshots → `src/codespan_vectors.zig` (README beside it).
+- **Width table:** the test "charWidth: every code point equals the width table" pins `charWidth` to `src/width_table.zig`; the table itself is checked against the unicode-width crate's own lookup over every code point (the card's Evidence line; producer `tools/unicode-width/gen.py`).
+- **Speed:** `zig build bench-diagnostics` (`tools/bench.zig` + `tools/codespan_bench`, pinned codespan-reporting and annotate-snippets); the figures are on the card's Performance line.
+- **Mutation:** whole-module over the production part of `root.zig` and the lookup logic of `width_table.zig` (schemata, ReleaseSafe); format-string mutants converted to runtime-selected statements so they run. The equivalent mutants fall in these groups: a group with a multi-line span starts its window at 0; a cut window is at least 7 columns, so its end lies beyond the labels; contained spans leave `max_start`/`max_end` unchanged; loose labels have `sl = el = 0`; `0x80` escapes and displays the same in both branches; bytes at or above 0x80 always print two hex digits; the right-cut `total < 3` vs `<= 3` boundary; `satU32` (needs a line over 4 GiB); the binary search's midpoint rounding in `Source.location`; two `term_width` boundaries (equality yields the same window).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-## Verification — 2026-10-04 additions
+## What is deliberately not done
 
-Exact-text tests derived by hand from the layout rules (secondary label, gutter widening to two digits, an
-unquotable label, an insertion fix, escaped label/fix/URL text), a colour test (stripping every SGR sequence
-from the coloured output must give the plain output byte for byte; a hostile message stays escaped), and JSON
-read back by `std.json` (fields present when set, absent when not). Mutation 2026-10-04 (schemata, 13 mutants
-over the new rendering code): 11 killed at once, 2 killed by a new test (a `help` note rendered as `note`; a
-code URL written raw).
-
-**Mutation + review (2026-11-11/12, whole module,** production part of `root.zig` and the lookup logic of `width_table.zig`, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 675 mutants, 625 killed, 50 equivalent, 0 undecided, no finding. The 2026-11-07 run (81 mutants) was thin: the first full run here left 219 alive. Format-string mutants were converted to runtime-selected statements so they actually ran. New tests (four rounds): exact-set sweeps over every code point for `charWidth`, `isShownAsQuestion`, `isWhiteSpace`; `writeEscaped` for every byte and for truncated/complete UTF-8; percent-encoding of every file-name byte through `writeLsp`; a stable sort with 200 ties; `Source.range` past the end; `Source.indexLines` on a text of exactly `maxInt(u32)` bytes (anonymous `MAP_NORESERVE` read-only mapping, resident in megabytes; skips under an address-space limit, on 32-bit and off Linux); header colour bytes per severity; short-style fixes with hostile text; closing rows and the 64/65 span boundary; locus choice incl. an unquotable primary label; `positionLessThan` called directly; `fromLsp` type/range guards, severity and code mapping, truncated `%4`/`%`; hand-checked `Margin.init` arithmetic; `term_width` goldens chosen by mutation-guided search and read against the rules (window width, `...` ends, caret columns, label order); label messages measured in display columns; an all-blank line; coloured hanging-label pointers and the reset after a caret past the end of a coloured line. Equivalent (main reasons): a group with a multi-line span starts its window at 0; a cut window is at least 7 columns, so `win.be` lies beyond the labels; contained spans leave `max_start`/`max_end` unchanged; loose labels have `sl = el = 0` (the `kind` check in `computeMargin`); `0x80` escapes and displays the same in both branches; bytes ≥ 0x80 always print two hex digits; the right-cut `total < 3` vs `<= 3` (with a left cut the first kept character always has non-zero width, without one `total` ≥ 7); `satU32` bound (needs a line over 4 GiB).
-
-**Audit 2026-10-23.** Independent read-only review (Sonnet) of the 2026-10-20 rewrite at `e1ec64f1`: no HIGH;
-F1 (C1 controls and invalid bytes passed through finding text) and F2 (`%+f` decoded in a URI) fixed, F4
-(trailing CRs) documented as codespan's behaviour, F5 (invalid UTF-8 into JSON) pinned by a test (std
-already escapes), F3/F6 to Backlog; the bidi gap was found beside it while measuring the lead. Mutation:
-50 schemata mutants over `root.zig` at the source above, 47 killed (10 only after new tests: DEL width and
-escaping, U+009F, a BOM on line 2, the empty last line, a far end column, `%f+`, negative/oversize LSP
-positions, U+10000 in UTF-16, a tab in finding text), 3 equivalent: `after_label_lines` past the end
-(`showLine` skips a missing line anyway) and two `term_width` boundaries (`>`→`>=` in `Margin.compute`,
-`<=`→`<` in `Margin.right`: at equality the first branch yields the same window — probed at the boundary).
+- Per-label colours and 24-bit colour, a narrated (screen-reader) printer, an error framework (miette), OSC-8 links and SARIF output.
+- codespan's `medium` display style (our one-line `short` takes its place).
+- Diff-style suggestion rendering (annotate-snippets `Patch`) is listed on the card's Scope line as deliberately not done; the Backlog still carries it as `later` (see there).
 
 ## Backlog / deferred
 
-**No-panic sweep 2026-10-29 (§ GH, blind review, LOW, no crash):** (a) without `Source.line_starts`,
-`lineIn` scans `text` from the top for every quoted line, so huge context-line options or many
-diagnostics (`fromLsp`/`writeLspArray`) over a large file cost O(lines × text) — documented on
-`line_starts`, which makes it O(1); building the index lazily would need an allocator the renderers do
-not take. (b) `caretPointers` is up to 64 × 64 × line length for one multi-MB line carrying 64 labels
-with `term_width = null` — linear in the input, large constant; not measured.
-
-**From the 2026-10-23 review (LOW, no promise broken):** (a) `end_col` without `end_line` is ignored by the
-snippet renderer (one caret) but honoured by `writeLsp`, and a span with `line` but no `col` is one caret at
-column 1 in the snippet but the whole line in LSP — align or document; (b) `term_width`'s margin measures a
-label message raw, so a message with control characters (printed escaped, 2–6 columns each) can place the
-window a few columns off.
-
-**S2 plan — survey 2026-10-20** (Sonnet, read-only; reference codespan-reporting 0.13.1, Apache-2.0;
-also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), annotate-snippets
-(MIT OR Apache-2.0 — the table above says Apache only, wrong), LSP 3.17 metaModel):
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | Several labels on one line merged into one quoted line, sorted (codespan `same_line`/`overlapping`) | M-L | **DONE 2026-10-20** — port of codespan's layout |
-| R2 | Multi-line spans with start/end markers (`/ \|`); non-overlapping first | S-M (L for overlaps) | **DONE 2026-10-20** — overlapping too (`multiline_overlapping` identical) |
-| R3 | LSP both ways: 0-based UTF-16 `character`, relatedInformation, codeDescription, tags, data, source, TextEdit; `fromLsp` | M | **DONE 2026-10-20** — `writeLsp`/`writeLspArray`/`fromLsp`, `lspCharacter`/`byteColumn` (utf8/16/32), `Tag` |
-| R4 | Line index instead of re-splitting the source per label (O(N·F) today, `sourceLine` root.zig:468) | S | **DONE 2026-10-20** — `Source.line_starts` + `Source.indexLines`; without it a memchr scan |
-| R5 | Display width: `tab_width`, East-Asian wide / combining / zero-width | M | **DONE 2026-10-20** |
-| R6 | Line endings: lone CR, U+2028/9, BOM | S | **DONE 2026-10-20** |
-| R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | **DONE 2026-10-20** |
-| R8 | `hint` severity | S + repin | **DONE 2026-10-20** (owner OK) — source-breaking for an exhaustive switch |
-| R9 | Unicode box charset, codespan medium/short styles | S | **DONE 2026-10-20** for the box charset and a one-line `short`; codespan's medium style deliberately not (Scope line; corrected 2026-11-05) |
-| R10 | Context lines before/after | S | **DONE 2026-10-20** |
-| R15 | `term_width` cut path walks the whole line (bench info row: 100 KB line, 3× annotate-snippets) — scan only the window | S | later |
-| R11 | Diff-style suggestion rendering (annotate-snippets `Patch`) | M | later |
-| R13 | `expr_off`/`expr_len` documented but never rendered | S | **DONE** — doc corrected (they index the expression text, not a source line) |
-
-Not doing: per-label colours/24-bit, narrated printer, error framework (miette), OSC-8 links, SARIF.
-Evidence plan (E3 → E2): vendor codespan's `*_no_color` insta snapshots (+ their inputs from tests/term.rs)
-as goldens with a per-case deviation table; a pinned Rust capture (`=0.13.1`) for CRLF/BOM/CJK/long-line
-cases; LSP UTF-16 vectors. Bench: codespan `emit_into_write` NoColor rich vs ours, 10k diagnostics over a
-1 MB file; annotate-snippets as the "fastest" candidate.
-
-The sibling `json5` module additionally intends to formalize its
-`AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
-
-Survey 2026-09-30 — missing and it matters (pure Zig, all fit CONVENTIONS §2):
-
-- ~~Several labelled spans~~, ~~colour~~, ~~secondary notes~~, ~~code URL / structured fix-it~~ — **done
-  2026-10-04**.
-- **`hint` severity** — *not now* (decided 2026-10-04): it adds an enum member, and the build-tool consumer, the main consumer,
-  has four exhaustive `switch (d.severity)` sites that would stop compiling at its next repin, for a level it
-  would render like `info`. Reopen when a consumer needs LSP's fourth level; then coordinate the repin.
-- **Same-line label merging and multi-line span drawing** *(re-check 2026-10-04)*: codespan/ariadne draw
-  several underline rows under one quoted line and box multi-line spans; ours quotes each label on its own.
-  Effort M. Fits §2.
-- (historical) (survey 2026-09-30) **Several labelled spans per diagnostic** (primary + secondary, each with its own message),
-  the headline feature of codespan-reporting/ariadne. Why: "duplicate key defined here / first defined here" is the
-  commonest config-validation shape; today a caller must emit two findings. Effort: medium (new `Label` slice on
-  `Diagnostic`, snippet layout for overlapping/multi-line labels).
-- ✅ (found implemented 2026-11-17: `RenderOptions.color` in `renderOne`, src/root.zig) (survey 2026-09-30) **Colour output** for `renderOne`/`render` (opt-in, ANSI, caller decides by tty/NO_COLOR).
-  Why: every competitor above does it and terminal users expect red/yellow. Effort: small-medium; the escape
-  handling of quoted text must keep working.
-- ✅ (found implemented 2026-11-17: `Diagnostic.notes` / `Note` in src/root.zig) (survey 2026-09-30) **Secondary notes / related findings** (LSP `relatedInformation`, rustc `note:`/`help:`
-  beyond the single `suggest`). Effort: small.
-- (survey 2026-09-30) **`hint` severity** (LSP has four levels; `Severity` has three). Effort: trivial but changes
-  the enum (breaking for exhaustive switches).
-- (survey 2026-09-30) **Code URL / structured fix-it edit** (miette code URL; LSP quick-fix `TextEdit`). Effort:
-  small each; `suggest` is only prose today.
-
-## Status
-`extract · any · util · reentrant` · deps: none — canonical source is `pub const meta` in
-src/root.zig.
+- **R15: the `term_width` cut path walks the whole line** (the bench info row: a 100 KB line costs about 3x annotate-snippets); scan only the window. Effort S.
+- **R11: diff-style suggestion rendering** (annotate-snippets `Patch`). Effort M. Marked `later` in the survey; the card's Scope line lists it as deliberately not done: the owner decides which holds.
+- **`end_col` without `end_line` / `line` without `col`:** the snippet renderer ignores the former (one caret) while `writeLsp` honours it, and a span with `line` but no `col` is one caret at column 1 in the snippet but the whole line in LSP. Align or document (LOW, no promise broken).
+- **`term_width` margin measures a label message raw:** a message with control characters (printed escaped, 2-6 columns each) can place the window a few columns off (LOW).
+- The sibling `json5` module intends to formalize its `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
 ## Anchoring
 
