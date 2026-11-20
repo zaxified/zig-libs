@@ -610,3 +610,28 @@ test "keyInRange (constant-time) agrees with the byte-order comparison it replac
         try t.expectEqual(oracle(&k), keyInRange(&k));
     }
 }
+
+test "Chains.unique names the one chain that is set" {
+    try std.testing.expectEqual(@as(?Network, .mainnet), (Chains{ .mainnet = true }).unique());
+    try std.testing.expectEqual(@as(?Network, .testnet), (Chains{ .testnet = true }).unique());
+    try std.testing.expectEqual(@as(?Network, .signet), (Chains{ .signet = true }).unique());
+    try std.testing.expectEqual(@as(?Network, .regtest), (Chains{ .regtest = true }).unique());
+    try std.testing.expectEqual(@as(?Network, null), (Chains{ .testnet = true, .signet = true }).unique());
+    try std.testing.expectEqual(@as(?Network, null), (Chains{}).unique());
+}
+
+test "hasSegwitPrefix: a string equal to the prefix counts, any case; a short or different one does not" {
+    try std.testing.expect(hasSegwitPrefix("bc1"));
+    try std.testing.expect(hasSegwitPrefix("BC1"));
+    try std.testing.expect(hasSegwitPrefix("tb1"));
+    try std.testing.expect(hasSegwitPrefix("bcrt1"));
+    try std.testing.expect(!hasSegwitPrefix("bc"));
+    try std.testing.expect(!hasSegwitPrefix("bcr1"));
+    try std.testing.expect(!hasSegwitPrefix(""));
+}
+
+test "toScriptPubKey: a Base58Check string with an empty payload is InvalidPayloadLength, not an out-of-bounds read" {
+    var buf: [16]u8 = undefined;
+    const empty = try base58.checkEncode(&.{}, &buf);
+    try std.testing.expectError(error.InvalidPayloadLength, toScriptPubKey(empty));
+}
