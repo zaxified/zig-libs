@@ -319,8 +319,9 @@ pub const JoinSpec = struct {
 /// `JoinSpec.validate`: the sides that must have unique keys.
 pub const JoinValidate = enum { none, one_to_one, one_to_many, many_to_one, many_to_many };
 
-/// `Error` plus the refusal of a `JoinSpec.validate` that does not hold.
-pub const JoinError = Error || error{ValidationFailed};
+/// `Error` plus the refusal of a `JoinSpec.validate` that does not hold and `DuplicateColumn`
+/// for an `indicator` that names a column of the result.
+pub const JoinError = Error || error{ ValidationFailed, DuplicateColumn };
 
 pub const DistinctSpec = struct {
     /// Columns forming the row-identity composite key; empty = every column.

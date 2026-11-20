@@ -788,11 +788,32 @@ fn meltedType(f: Frame, vals: []const usize) ColumnType {
     if (ty == .binary) for (vals[1..]) |vi| if (f.columns[vi].type != .binary) return .text;
     var any_width = dtype.isWidth(ty);
     for (vals[1..]) |vi| any_width = any_width or dtype.isWidth(f.columns[vi].type);
-    if (!any_width) return ty;
+    if (!any_width) {
+        // Numbers of different kinds (Int64 with Float64, say) meet in their supertype, as polars' `unpivot`
+        // casts; with no supertype (text, bool... among them) the first column's type stands.
+        var t = ty;
+        for (vals[1..]) |vi| {
+            if (f.columns[vi].type != t) t = dtype.supertype(t, f.columns[vi].type) orelse return ty;
+        }
+        return t;
+    }
     // No supertype (a text, a bool ... among the numbers): the first column's type as before W11, but the
     // Int64/Float64 of a width, whose array would drop the cells that are not numbers (sweep W11-9).
     for (vals[1..]) |vi| ty = dtype.supertype(ty, f.columns[vi].type) orelse return widthless(f.columns[vals[0]].type);
     return ty;
+}
+
+/// The zone of the melted value column: the one every melted column carries, null when they differ
+/// (the cells are UTC instants either way) or when the column is not a timestamp one.
+fn meltedZone(f: Frame, vals: []const usize, ty: ColumnType) ?[]const u8 {
+    if (vals.len == 0 or ty != .timestamp) return null;
+    const first = f.columns[vals[0]].time_zone;
+    for (vals[1..]) |vi| {
+        const z = f.columns[vi].time_zone;
+        if ((first == null) != (z == null)) return null;
+        if (first != null and !std.mem.eql(u8, first.?, z.?)) return null;
+    }
+    return first;
 }
 
 /// The Int64 / Float64 of a width type (its array would drop cells that are not of the width), any
@@ -831,7 +852,7 @@ fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool
     const cols = try a.alloc(Column, id_idxs.len + 2);
     for (id_idxs, 0..) |ii, i| cols[i] = f.columns[ii];
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
-    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type, .time_zone = if (vals.len > 0) f.columns[vals[0]].time_zone else null };
+    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type, .time_zone = meltedZone(f, vals, value_type) };
     if (arr_first) |c| cols[id_idxs.len + 1] = Column.withShape(cols[id_idxs.len + 1], c);
     try keys.uniqueNames(a, cols);
 
@@ -1184,7 +1205,7 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) 
 pub fn joinChecked(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
     std.debug.assert(spec.validate == .none);
     return joinImpl(a, left, right, spec, true) catch |e| switch (e) {
-        error.ValidationFailed => unreachable, // `validate` is `.none`, the only source
+        error.ValidationFailed, error.DuplicateColumn => unreachable, // `validate` and `indicator` are unset (the verbs built on `join` set neither)
         else => |x| x,
     };
 }
@@ -1198,6 +1219,25 @@ fn commonColumns(a: std.mem.Allocator, left: Frame, right: Frame) Error![]const 
         if (rn.get(c.name) != null) try out.append(a, c.name);
     }
     return out.items;
+}
+
+/// Whether no key of `f` (on `fk`) repeats. With `skip_null` a row with a missing key part
+/// equals nothing, so it cannot repeat one: only the complete keys are compared.
+fn keysUnique(a: std.mem.Allocator, f: Frame, fk: []const usize, other: Frame, ok: []const usize, skip_null: bool) Error!bool {
+    const fl = try lookupKeys(a, f, fk, other, ok, skip_null);
+    if (fl.groups == f.len) return true;
+    if (!skip_null) return false;
+    var present: std.ArrayList(u32) = .empty;
+    defer present.deinit(a);
+    for (0..f.len) |ri| {
+        var missing = false;
+        for (fk) |ci| missing = missing or keys.isMissing(colOf(f, ci).get(ri));
+        if (!missing) try present.append(a, @intCast(ri));
+    }
+    if (present.items.len == f.len) return false;
+    const sub = try takeRows(a, f, present.items);
+    const g = try lookupKeys(a, sub, fk, sub, fk, true);
+    return g.groups == sub.len;
 }
 
 fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpec, typed: bool) sp.JoinError!Frame {
@@ -1219,16 +1259,15 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
     if (lk.len != rk.len) return error.NoSuchColumn;
     const skip_null = spec.null_keys == .no_match;
 
-    if (spec.validate != .none and !cross) {
+    if (spec.validate != .none) {
         const need_left = spec.validate == .one_to_one or spec.validate == .one_to_many;
         const need_right = spec.validate == .one_to_one or spec.validate == .many_to_one;
-        if (need_left) {
-            const fl = try lookupKeys(a, left, lk, right, rk, skip_null);
-            if (fl.groups != left.len) return error.ValidationFailed;
-        }
-        if (need_right) {
-            const fr = try lookupKeys(a, right, rk, left, lk, skip_null);
-            if (fr.groups != right.len) return error.ValidationFailed;
+        if (cross) {
+            // pandas merges a cross join on one constant key: a side is unique only with at most one row.
+            if ((need_left and left.len > 1) or (need_right and right.len > 1)) return error.ValidationFailed;
+        } else {
+            if (need_left and !try keysUnique(a, left, lk, right, rk, skip_null)) return error.ValidationFailed;
+            if (need_right and !try keysUnique(a, right, rk, left, lk, skip_null)) return error.ValidationFailed;
         }
     }
 
@@ -1329,10 +1368,11 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
             const lnone = if (pairs.left_identity) false else l == keys.none;
             c.* = .{ .text = if (lnone) "right_only" else if (pairs.right[i] == keys.none) "left_only" else "both" };
         }
+        // pandas: "Cannot use name of an existing column for indicator column".
+        for (cols) |c| if (std.mem.eql(u8, c.name, name)) return error.DuplicateColumn;
         const ncols = try a.alloc(Column, cols.len + 1);
         @memcpy(ncols[0..cols.len], cols);
         ncols[cols.len] = .{ .name = name, .type = .text };
-        try keys.uniqueNames(a, ncols);
         const ndata = try a.alloc(ColumnData, ncols.len);
         @memcpy(ndata[0..cols.len], data);
         ndata[cols.len] = try fm.columnFromCells(a, cells);
