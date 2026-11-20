@@ -25,15 +25,6 @@ over byte-exact canonical data, so a `.secure` verdict on those vectors is
 itself the byte-exactness proof; the matching tampered cases return `.bogus`.
 See `src/oracle_test.zig` + `src/oracle_vectors.zig`.
 
-**Not (yet) implemented:** RFC 8624 algorithm-downgrade policy. (The RFC 9276
-NSEC3 iteration cap is in: `nsec3.max_nsec3_iterations` = 100.) The plain-NSEC (non-NSEC3) denial proof
-(`nsec.proveDenial`) is implemented and unit-tested against the RFC 4034 §6.1
-canonical ordering plus positive/adversarial cases, but is not yet
-`ldns`-oracle-verified the way the NSEC3 proof is. See SPEC.md "Threat model /
-out of scope". The
-multi-zone-cut resolver that walks the chain root→TLD→… is also out of scope
-(this module is one cut — see `chain.zig`).
-
 - **Model after:** RFC 4033/4034/4035 (DNSSEC core), RFC 5155 (NSEC3),
   RFC 6605 (ECDSA), RFC 8080 (Ed25519/Ed448). Structure cross-checked against Go
   `miekg/dns`'s `dnssec.go` and NLnet Labs' unbound/ldns validator behavior —
@@ -41,7 +32,16 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 - **Deps:** `dns` (this module reads `dns.Record`/`dns.Message`; DNSSEC RR
   types are not in `dns.message.Type`, so they arrive as
   `Record.Data.unknown` raw RDATA — see "Recon notes" below), `rsa` (RSA
-  signature verification; std's own internal RSA verifier is not `pub`), `base32` (base32hex for NSEC3 owner-hash labels).
+  signature verification; std's own internal RSA verifier is not `pub`), `base32` (base32hex for NSEC3 owner-hash labels), `ed448` (Ed448 signature
+  verification, algorithm 16).
+
+## Not provided
+
+No delegation-chain walker from a root trust anchor (this module validates one zone cut, see `chain.zig`), no RFC 5011
+rollover, no zone signing or key generation, and no choice of the strongest algorithm among several signatures
+(RFC 6840 §5.11): the resolver's job. The plain-NSEC denial proof (`nsec.proveDenial`) is unit-tested but not yet
+checked against `ldns` the way the NSEC3 proof is. Details and open work: `SPEC.md` *Threat model*, *Backlog /
+deferred*, *Open*.
 
 ## Layout
 

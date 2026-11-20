@@ -8,11 +8,6 @@
 
 **Audit:** review 2026-09-12 · mutation 2026-11-17 (299/324, 25 eq) · src 72b966b4925b1efa
 
-**Audit 2026-11-17 (whole-module mutation).** 324 mutants = 7 Ed448 delta mutants run earlier (dispatch arm, key-length guard, point check at decode, signature-length guard, non-canonical-S error class, verify context, verify error class; all killed, not re-run) + 317 new over every other source file (`wire`, `ds`, `policy`, `canonical`, `rdata`, `keys`, `root`, `chain`, `nsec`, `nsec3`), one schemata build per round, baseline first. Round 1: 184 killed + 1 hung, 132 survived. 44 tests were added (`src/audit_test.zig`): the RFC 8624 tables row by row, canonical AAAA/CNAME/TXT/SRV/CAA bytes and the 255-octet and 65535-octet limits, wildcard and root owner names, every `validate` and `chain` precondition alone under real Ed25519 signatures, RSA under SHA-1/256/512 with a generated key, longer-than-fixed ECDSA/Ed25519 keys and signatures, NSEC and NSEC3 closest-encloser / next-closer / record-filter / short-next-hash cases, type bit map windows. Round 2 killed 106 of the 132 (3 of those after a mutant list repair: the RSA hash swaps cannot sit on a comptime argument and were redone as whole statements), and one more (NSEC next name equal to the wildcard) after a late test. 25 survive, all EQUIVALENT:
-- redundant defences whose failure returns the very error the next check returns: wire `label overrun` (a label ending exactly at the buffer end then fails `Truncated` on the missing root octet), RRSIG `< 18`, NSEC3 `< 5` and salt bound (all `Truncated`), RSA key `< 1`, long form `< 3`, exponent bound, empty-modulus guard (an empty modulus has 0 bits, under the 512-bit floor), NSEC3 owner-label length and decoded-length checks (`base32.decode` is strict and bounded by the 20-octet output);
-- boundaries that select the same slice or name: `lastLabels` with `keep == total` (canonical and nsec: nothing to drop), a root wildcard written `*.` or `*` (both encode and compare identically; canonical, nsec, nsec3), `isNameOrDescendant`'s length guard (the common suffix cannot exceed the shorter name), `closestEncloser`'s malformed-name guard (`coverNsec` already refused it), `chain`'s `any_matched` (an empty `matched` list falls to `.bogus` anyway), `contains`/iterator end bounds that differ only on a zero-length window, which type bit map parsing refuses;
-- cover comparisons that only see names no record owns: `above_owner`/`o_lt_h` accepting equality (an owner equal to the name would have matched first), and the insecure-delegation `!contains(DS)` term in both proofs (a bitmap holding DS already answers the DS query as bogus on the line before).
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (oracle-validate at 1/5 scale), DNSSEC_FUZZ) · ct n/a — public key verification (keyword review, 2026-10-07)
 
 **Performance:** not measured
@@ -39,30 +34,27 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rthalley/dnspython](https://github.com/rthalley/dnspython) | Python | ISC | 2.7k | v2.8.0 (2025-09-07) | `dns.dnssec` validates RRSIGs and can sign; no chain walking or denial proofs *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std` has no DNSSEC. Only unrelated hit on GitHub search "dnssec language:zig" was a 3-star repo (`jackboykin/hark`, MIT), not a comparable library. Nothing to compare against in Zig. |
 
-**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no zone signing or key generation (miekg/dns, ldns, dnspython have it), no dedicated parser *(searched: `rg -i 'cds|cdnskey|ed448' src/`)* (→ Backlog).
+**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no zone signing or key generation (miekg/dns, ldns, dnspython have it), (*Backlog / deferred*).
 
 ## Design & invariants
 
-**Validation core implemented + oracle-verified.** Real, tested:
-`wire.zig` (uncompressed-name decode + canonical name encoding), `rdata.zig`
-(DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM parsing, Type Bit Maps, key tag),
+**Validation core.** `wire.zig` (uncompressed-name decode + canonical name encoding), `rdata.zig`
+(DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM and CDS/CDNSKEY parsing, Type Bit Maps, key tag),
 `nsec3.zig`'s base32hex + iterated-SHA-1 hash AND its RFC 5155 §8 denial
-proof (`proveDenial`), `keys.zig`'s per-algorithm DNSKEY decode + signature
-verify dispatch, `ds.zig`'s digest computation, `canonical.buildSignedData`
-(RFC 4034 §3.1.8.1), `chain.validateDnskeySet`, and `root.zig`'s
-`rrsigTimeValid` + `validate`. All four protocol-logic pieces
-(`buildSignedData`, `proveDenial`, `validateDnskeySet`, `validate`) are
-validated against an `ldns`-signed, `ldns-verify-zone`-cross-checked oracle
-(algorithms 8/13/14/15; NSEC + NSEC3 + Opt-Out; wildcard; NODATA + NXDOMAIN)
-— see README.md "Validation core" + `src/oracle_test.zig`.
-
-The plain-NSEC (non-NSEC3) denial proof analogous to `nsec3.proveDenial` IS now
-built (`nsec.proveDenial`: RFC 4035 §5.4 gap coverage over the RFC 4034 §6.1
-canonical name order, NODATA, wildcard, and insecure-delegation), unit-tested
-but not yet `ldns`-oracle-verified the way the NSEC3 proof is.
+proof (`proveDenial`), `nsec.zig`'s plain-NSEC denial proof (`proveDenial`:
+RFC 4035 §5.4 gap coverage over the RFC 4034 §6.1 canonical name order,
+NODATA, wildcard and insecure delegation), `keys.zig`'s per-algorithm DNSKEY
+decode + signature verify dispatch, `ds.zig`'s digest computation,
+`canonical.buildSignedData` (RFC 4034 §3.1.8.1), `policy.zig`,
+`chain.validateDnskeySet`, and `root.zig`'s `rrsigTimeValid` + `validate`.
+`buildSignedData`, the NSEC3 `proveDenial`, `validateDnskeySet` and `validate`
+are validated against an `ldns`-signed, `ldns-verify-zone`-cross-checked
+oracle (algorithms 8/13/14/15; NSEC + NSEC3 + Opt-Out; wildcard; NODATA +
+NXDOMAIN) — see README.md "Validation core" + `src/oracle_test.zig`. The
+plain-NSEC proof is unit-tested, not oracle-verified (*Open*).
 
 Out of scope in this module (see "Threat model" below): the
-multi-zone-cut resolver orchestration. (RFC 8624's algorithm policy is `policy.zig`.)
+multi-zone-cut resolver orchestration.
 
 - **Bounds-checked, no panics on attacker input.** `rdata.zig`/`wire.zig`
   follow the same discipline as `dns.message`: malformed RDATA is a typed
@@ -72,8 +64,8 @@ multi-zone-cut resolver orchestration. (RFC 8624's algorithm policy is `policy.z
   stubs remain.
 - **No new cryptographic primitive.** Every signature-verify call routes
   through `std.crypto.sign.ecdsa`/`std.crypto.sign.Ed25519` (public, std
-  0.16) or this repo's own `rsa.verifyPkcs1v15` (std's own RSA verifier,
-  `std.crypto.Certificate.rsa`, is not `pub`). This module's only original
+  0.16), this repo's own `rsa.verifyPkcs1v15` (std's own RSA verifier,
+  `std.crypto.Certificate.rsa`, is not `pub`) or its `ed448` module (std has no Ed448). This module's only original
   logic is DNSSEC's own wire formats (RFC 3110/6605/8080 key encodings, the
   RRSIG/DS/NSEC/NSEC3 RDATA shapes), the canonical signed-data assembly, and
   the denial-of-existence proof — never bignum/ECC/EdDSA math itself.
@@ -87,7 +79,21 @@ multi-zone-cut resolver orchestration. (RFC 8624's algorithm policy is `policy.z
 - **RRSIG time-window uses RFC 1982 serial arithmetic** (`rrsigTimeValid`),
   not a naive integer compare — the 32-bit inception/expiration fields wrap
   in 2106, and a naive compare would silently misvalidate near that
-  boundary. Cheap to get right now, so it is; see the wraparound unit test.
+  boundary (see the wraparound unit test).
+- **RFC 8624 algorithm policy** (`policy.zig`). `Policy` (default `Policy.rfc8624`) is consulted by `validate`
+  (`ValidateOptions.policy`) and by `chain.validateDnskeySetPolicy`. The default refuses exactly the RFC 8624
+  §3.1/§3.3 validation MUST NOT rows (algorithms 0, 1, 3, 6; digest 0) on the caller's trust anchor, which makes
+  the zone `.insecure` (RFC 4035 §5.2), not bogus; it is overridable. `policy.algorithmImplemented` tells which
+  algorithms `keys` can verify, independently of the policy.
+- **CDS / CDNSKEY** (RFC 7344, RFC 8078 §4). `rdata.parseCds` / `parseCdnskey` reuse the DS / DNSKEY decoders (same
+  wire shape, same errors); `isDeleteSignal` recognises the RFC 8078 §4 delete forms (`0 0 0 00` and `0 3 0 AA==`).
+  Parsing only, no trust or policy decision.
+- **Ed448 (algorithm 16, RFC 8080).** `keys.DecodedKey.ed448` dispatches to the sibling `ed448` module's `verify`
+  with the empty context (as OpenSSL, Unbound and BIND do for DNSSEC). Key decode checks the point (RFC 8032
+  §5.2.3), unlike the length-only Ed25519 decode. Anchor: the RFC 8080 §6.2 examples (`src/rfc8080_test.zig`), key
+  tags and DS digests exact, signatures verified over the canonical signed data and cross-checked with OpenSSL 3.5.
+  The RFC's RRSIGs carry Labels = 3 on a 2-label owner, which RFC 4035 §5.3.1 forbids, so `validate` answers bogus
+  for those literal RRSIGs.
 
 ## Threat model / out of scope
 
@@ -105,31 +111,17 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
   Bleichenbacher-style distinguishable-error channel (the underlying
   `rsa.verifyPkcs1v15` already commits to constant-time, full-encoding
   comparison — see `rsa`'s own SPEC.md).
+- **NSEC3 work is bounded** (RFC 9276). `nsec3.proveDenial` rejects (`.insecure`, before any hashing work) any set
+  whose iteration count exceeds `max_nsec3_iterations` (100, RFC 9276 §3.2's recommended ceiling), and a set larger
+  than `max_nsec3_records` is `.bogus`; the owner-hash decode runs once per `proveDenial` call, so the closest-
+  encloser search is O(depth) candidates with an O(1) amortized lookup, not O(depth x set size).
+- **Both denial proofs assume the NSEC/NSEC3 RRs were already signature-validated** (`validate`): they verify the
+  *logic* of the denial, not the RRs' own authenticity.
 - **Still out of scope, must land before production use as a resolver:**
-  - **Algorithm-downgrade resistance (RFC 8624), partly done 2026-11-16.**
-    `policy.zig` refuses MUST NOT algorithms/digests on the caller's trust
-    anchor (zone becomes `.insecure`, RFC 4035 §5.2). Still not done:
-    `validate` verifies the single RRSIG it is handed; it does not reject a
-    weak algorithm when a stronger one is present in the same DNSKEY set
-    (RFC 6840 §5.11 selection is the resolver's job).
-  - ~~NSEC3 iteration-count DoS (RFC 9276).~~ **Fixed.** `nsec3.proveDenial`
-    rejects (`.insecure`, before any hashing work) any set whose iteration
-    count exceeds `max_nsec3_iterations` (100, RFC 9276 §3.2's recommended
-    ceiling) — this bullet used to say "there is no cap"; there has been one
-    since the 07-19 audit round (this file had drifted from the code).
-    ⭐ **Also fixed (audit A1 F2, 2026-09-10):** the closest-encloser search's
-    OTHER amplification axis, record-set size, is now bounded too
-    (`max_nsec3_records`) and the per-candidate owner-hash decode that used to
-    re-run once per closest-encloser candidate now runs once per `proveDenial`
-    call — O(depth) candidates × O(1) amortized lookup instead of O(depth ×
-    |set|). Measured (ReleaseFast, 885 records, 253-octet/127-label qname):
-    22.6 ms → 1.1 ms, ~20×.
-  - **Plain-NSEC denial proof.** `nsec.proveDenial` implements the NSEC-based
-    NXDOMAIN/NODATA/wildcard/insecure-delegation reasoning (the analogue of
-    `nsec3.proveDenial`) over the RFC 4034 §6.1 canonical name order. Like the
-    NSEC3 proof it assumes the NSEC RRs were already signature-validated
-    (`validate`); it verifies the *logic* of the denial, not the RRs' own
-    authenticity. Unit-tested, not yet `ldns`-oracle-verified.
+  - **Algorithm-downgrade resistance beyond the policy.** `policy.zig` refuses MUST NOT algorithms and digests on the
+    caller's trust anchor (zone becomes `.insecure`, RFC 4035 §5.2). `validate` verifies the single RRSIG it is
+    handed; it does not reject a weak algorithm when a stronger one is present in the same DNSKEY set (RFC 6840
+    §5.11 selection is the resolver's job).
   - **Opt-Out** is handled (`proveDenial` downgrades an opt-out NXDOMAIN to
     `.insecure` rather than asserting secure non-existence), but the wider
     "opt-out cannot hide an otherwise-signed delegation" property is the
@@ -155,35 +147,29 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
 
 ## Verification
 
-`zig build test-dnssec` — runs entirely offline (Debug + ReleaseFast, both
-green; `zig fmt --check` clean). Mechanical unit tests over the
-parsers/hashers plus end-to-end known-answer tests. The KATs use a REAL
-offline oracle:
-zones signed by `ldns-signzone`/`ldns-keygen` across algorithms 8/13/14/15
-(RSA-SHA256, ECDSA-P256, ECDSA-P384, Ed25519), with NSEC, NSEC3 and NSEC3
-Opt-Out, a wildcard, and NODATA/NXDOMAIN denial cases — each source zone
-independently accepted by **`ldns-verify-zone`** (an independent reference
-validator, so the KATs are not self-referential). Because a real RRSIG only
-verifies over byte-exact RFC 4034 §3.1.8.1 canonical data, a `.secure`
-verdict is itself the byte-exactness proof; the matching tampered
-(signature/digest byte flipped) cases return `.bogus`. Vectors:
-`src/oracle_vectors.zig`; KATs: `src/oracle_test.zig`.
+Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz driver; `scripts/gen/gen-dnssec-oracle.sh`
+(needs `ldnsutils`) to re-take the oracle material.
 
-⚠ **The reproduction harness was not in the repo.** Both this file and
-`README.md` credited `scratchpad/dnssec-oracle/` (zone + `extract.py`, using
-`dnspython`), and README called it "ephemeral" — accurately: a scratchpad does
-not survive a reboot, so the module's strongest anchor had no re-takeable
-recipe. Same shape as the drift-ranking script this campaign had to move out of
-a session scratchpad. `scripts/gen/gen-dnssec-oracle.sh` now restores the
-provenance CHAIN: it builds a zone, signs it once per algorithm this module
-implements a verifier for (8, 13, 15) plus an NSEC3 pass, and has `ldns` —
-an independent implementation, not this repo — verify each result. What it
-deliberately does NOT do is reproduce the committed vectors byte for byte:
-those were signed with keys that no longer exist. The extraction step (wire
-rdata → the `Vec` literals) is the piece that was lost and is not
-reconstructed.
-Remaining: external RFC 6605/8080 published test vectors as a second
-independent cross-check.
+- **Unit tests** over the parsers, hashers and verifiers: RDATA parsing including a hand-computed RFC 4034 Appendix B
+  key-tag vector, Type Bit Map bounds, base32hex round trips, NSEC3 iterated hash against manual SHA-1 chaining, DS
+  digest against manual hashing, RSA/ECDSA/Ed25519 decode and sign/verify round trips, RFC 1982 time-window
+  wraparound, the NSEC3 iteration and record-count caps, the RFC 8624 policy tables row by row, canonical RR bytes, every `validate` and `chain` precondition alone (`src/audit_test.zig`).
+- **Oracle KATs** (`src/oracle_vectors.zig`, `src/oracle_test.zig`): zones signed by `ldns-signzone` across
+  algorithms 8/13/14/15 (RSA-SHA256, ECDSA-P256, ECDSA-P384, Ed25519) with NSEC, NSEC3 and NSEC3 Opt-Out, a
+  wildcard, and NODATA/NXDOMAIN denial cases, each source zone independently accepted by `ldns-verify-zone`, so the
+  KATs are not self-referential. A real RRSIG only verifies over byte-exact RFC 4034 §3.1.8.1 canonical data, so a
+  `.secure` verdict is itself the byte-exactness proof; the matching tampered (signature or digest byte flipped)
+  cases return `.bogus`; DNSKEY sets validate against a parent DS and go `.bogus` on a tampered digest or
+  self-signature. The recipe `scripts/gen/gen-dnssec-oracle.sh` signs and independently verifies a fresh zone per
+  algorithm; it does not regenerate the committed vectors byte for byte (their keys no longer exist), and the
+  extractor that turned wire rdata into the `Vec` literals is not in the repository.
+- **Published vectors:** the RFC 8080 §6.2 Ed448 examples (`src/rfc8080_test.zig`), the RFC 4034 Appendix B key tag.
+- **Fuzz** (`src/fuzz_test.zig` and the harnesses beside their corpora): the parsers and `validate` under testkit's
+  deterministic driver as `DNSSEC_FUZZ`; a genuine RRset is secure, a damaged signature bogus, damaged wire never
+  panics; fixed-seed reach checks run in every test run.
+- **Constant time:** n/a (public-key verification).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Anchoring
 
@@ -196,9 +182,21 @@ independent cross-check.
 
 ## Backlog / deferred
 
-- **Chain walker root → leaf with a bundled root trust anchor** *(survey 2026-09-30)*. Unbound and Hickory validate the whole delegation chain; here the caller must call `chain.validateDnskeySet` once per cut and keep the DS/DNSKEY state (`chain.zig` header draws the line on purpose). A user of a validating library expects "give me answer + records, get secure/insecure/bogus". Effort: medium (state machine over `dns` messages, ~1–2 sittings). Fits CONVENTIONS §2 (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
-- ✅ DONE 2026-11-16 (`policy.zig`: `Policy` consulted by `validate` and `chain.validateDnskeySetPolicy`, default refuses the RFC 8624 §3.1/§3.3 validation MUST NOT rows, overridable) **RFC 8624 algorithm policy** *(survey 2026-09-30)*.
-- **RFC 5011 trust-anchor rollover** *(survey 2026-09-30)*. In Unbound and Hickory. Effort: medium (state machine with clock). Fits §2.
-- **Zone/RRset signing (`rrsig` creation, DS from DNSKEY, key-tag) for algorithms 8/13/14/15** *(survey 2026-09-30)*. miekg/dns, ldns and dnspython sign; someone building an authoritative tool or a test-zone generator needs it. Effort: medium; std has the ECDSA/Ed25519 signers, RSA signing in the `rsa` sibling *(inferred, not checked)*. Fits §2.
-- ✅ DONE 2026-11-16 (`rdata.parseCds`/`Cds`, `parseCdnskey`/`Cdnskey` reusing the DS/DNSKEY decoders, `isDeleteSignal` for the RFC 8078 §4 forms) **CDS/CDNSKEY (RFC 7344/8078) parsing** (only the type numbers exist, `rdata.zig:359`) *(survey 2026-09-30)*. Same wire shape as DS/DNSKEY; needed for automated DS updates. Effort: small. Fits §2.
-- ✅ DONE 2026-11-17 (`keys.zig` `DecodedKey.ed448` + dispatch to the sibling `ed448` module's `verify`, empty context as OpenSSL/Unbound do; `policy.algorithmImplemented(16)`; anchor: the RFC 8080 §6.2 examples in `rfc8080_test.zig`, key tags and DS digests exact, signatures verified over the canonical signed data and cross-checked with OpenSSL 3.5. The RFC's RRSIGs carry Labels = 3 on a 2-label owner, which RFC 4035 §5.3.1 forbids, so `validate` answers bogus for those literal RRSIGs) **Ed448 (algorithm 16, RFC 8080)**. Key decode checks the point (RFC 8032 §5.2.3), unlike the Ed25519 length-only decode.
+- **Chain walker root to leaf with a bundled root trust anchor** (survey). Unbound and Hickory validate the whole
+  delegation chain; here the caller must call `chain.validateDnskeySet` once per cut and keep the DS/DNSKEY state
+  (`chain.zig` header draws the line on purpose). A user of a validating library expects "give me answer + records,
+  get secure/insecure/bogus". Effort: medium (state machine over `dns` messages, ~1-2 sittings). Fits CONVENTIONS §2
+  (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
+- **RFC 5011 trust-anchor rollover** (survey). In Unbound and Hickory. Effort: medium (state machine with clock).
+  Fits §2.
+- **Zone/RRset signing (`rrsig` creation, DS from DNSKEY, key-tag) for algorithms 8/13/14/15** (survey). miekg/dns,
+  ldns and dnspython sign; someone building an authoritative tool or a test-zone generator needs it. Effort: medium;
+  std has the ECDSA/Ed25519 signers, RSA signing in the `rsa` sibling (inferred, not checked). Fits §2.
+
+## Open
+
+- **Plain-NSEC denial proof not `ldns`-oracle-verified:** `nsec.proveDenial` is unit-tested against the RFC 4034
+  §6.1 ordering and positive/adversarial cases, but its reasoning is not checked against an independent validator the
+  way the NSEC3 proof is.
+- **RFC 6605 published test vectors** as a second independent cross-check of the ECDSA path (the RFC 8080 vectors
+  are in).
