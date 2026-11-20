@@ -44,7 +44,7 @@ Not Linux: `init`, `poll` and `wait` return `error.Unsupported`. Details and ref
 
 ## Not provided
 
-A signal handler, real-time or non-stop signals, several subscribers per signal, disposition control and escalation policy are refused on purpose; sender pid/uid, a non-blocking descriptor option and Windows/macOS support are open. See SPEC *What is deliberately not done* and *Backlog / deferred*.
+A signal handler, real-time or non-stop signals, several subscribers per signal, disposition control and escalation policy are refused on purpose; a non-blocking descriptor option and Windows/macOS support are open. See SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the Linux `signalfd(2)` and `sigprocmask(2)` man pages; the
 API shape follows Go's `os/signal` and tokio's `signal::unix` (public documentation only,

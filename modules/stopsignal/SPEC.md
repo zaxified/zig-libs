@@ -70,6 +70,7 @@ or pre-exec step unblocks `childMask()` there.
   moved from unblocked to blocked, so a signal blocked beforehand stays blocked.
 - A signal ignored at start (`nohup`, a background job) is still queued while blocked, so it
   is delivered to `wait`/`poll`, as with Go's `signal.Notify`; the disposition is never touched.
+- `pollInfo`/`waitInfo` are `poll`/`wait` with the sender: `Info{ signo, pid, uid }` straight from the `signalfd_siginfo` record (for a `kill`/`sigqueue` sender, its pid and real uid; kernel-raised signals carry what the kernel put there, usually 0). `poll`/`wait` are their `.signo`.
 - `wait` returns only signals of the set; a signal outside the set keeps its disposition and
   `wait` blocks (until cancelled, `error.Canceled`) if none arrives.
 - `deinit` from another thread unblocks that thread's mask only and leaves the `init` thread's
@@ -105,7 +106,7 @@ There is no performance axis here, so no row is marked **fastest**.
 | Go `os/signal` — **reference** (`Notify`, `NotifyContext`, `Ignore`, `Reset`, `Stop`) | Go | BSD-3-Clause | Any signal number, many subscribers per signal (each `Notify` channel gets a copy), `NotifyContext` cancels a context on the first signal, `Ignore`/`Reset` change the disposition. Here: the stop set and the cancelable `wait`; one subscriber per instance; no ignore/reset. A signal ignored at start is overridden by `Notify`, as here. |
 | tokio `signal` (`ctrl_c`, `unix::signal(SignalKind)`) | Rust | MIT | `SignalKind` covers every standard and real-time signal (`from_raw`); several `Signal` streams per kind; `ctrl_c()` is portable (Windows console events too). Here: six named signals, Linux only. |
 | signal-hook (`iterator::Signals`, `flag`, `low_level`) | Rust | MIT OR Apache-2.0 | Handler-based: an iterator over arrivals, an `AtomicBool` flag, "second signal terminates" (`register_conditional_shutdown`), async-signal-safe low-level actions, a registration per signal that can be removed. Here: the iterator and flag forms (`wait`, `poll`) without any handler; no conditional shutdown. |
-| nix `sys::signal`, `sys::signalfd::SignalFd` | Rust | MIT | The thin binding to the same `signalfd(2)`: any `SigSet`, `SFD_NONBLOCK`, and the full `siginfo` of each arrival (sender pid/uid, value). Here: only the signal number. |
+| nix `sys::signal`, `sys::signalfd::SignalFd` | Rust | MIT | The thin binding to the same `signalfd(2)`: any `SigSet`, `SFD_NONBLOCK`, and the full `siginfo` of each arrival (sender pid/uid, value). Here: the signal number and the sender's pid/uid (`Info`, `pollInfo`/`waitInfo`). |
 | CPython `signal` (`sigwait`, `set_wakeup_fd`, `pthread_sigmask`) | Python | PSF-2.0 | The same primitives: block, wait synchronously, or have the C handler write the number to an fd. Here: block + signalfd, so no handler and no wakeup byte. |
 | libuv `uv_signal_t` | C | MIT | A handle in the event loop, many handles per signal, any number, one-shot variant, Windows included (SIGINT, SIGBREAK, SIGHUP emulation). Here: `fd()` for the caller's own loop; Linux only. |
 | `std` (Zig) | Zig | MIT | `std.posix.sigaction` and `sigprocmask` only; no signalfd wrapper, no wait/poll, no stop-set. The closest Zig competition is hand-written code (the three consumers this replaced). |
@@ -113,7 +114,7 @@ There is no performance axis here, so no row is marked **fastest**.
 **Where we are ahead:** the only Zig module for this; no handler, no global state, so two components cannot
 trample each other's disposition (Go and signal-hook install a process-wide handler); the arrival is an ordinary
 value (`wait` cancelable through `std.Io`, `poll`, `fd` for epoll). **Where we are behind:** Linux only; a
-closed signal set; one subscriber; no disposition control; no sender information (see *What is deliberately not done* and *Backlog / deferred*).
+closed signal set; one subscriber; no disposition control; (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## What is deliberately not done
 
@@ -169,9 +170,6 @@ the test sends the signal to the test's thread and reads the same signal back.
 
 Each is new API; none is implemented.
 
-- **Sender pid/uid (`signalfd_siginfo.pid/uid`).** nix exposes it; a daemon can log
-  "stopped by pid 1 (systemd)" vs "by a user". Proposed: `waitInfo`/`pollInfo` returning
-  `Info{ signo, pid, uid }`, `wait`/`poll` unchanged. Effort S.
 - **A non-blocking descriptor option (`SFD_NONBLOCK`).** `fd()` is blocking so `wait` can go
   through `std.Io`; a caller's own epoll loop must read only after readiness (which is how
   epoll is used). An `Options.nonblocking` would serve a loop that polls the fd

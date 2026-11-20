@@ -77,6 +77,17 @@ pub const Error = error{
 
 pub const WaitError = Error || error{Canceled};
 
+/// A received signal with the sender the kernel recorded (the
+/// `signalfd_siginfo` fields nix, Go's `siginfo` users and `kill -l` loggers
+/// want): `pid`/`uid` are the sending process and its real uid for a signal
+/// from `kill`/`sigqueue`; a signal raised by the kernel (or by a terminal's
+/// Ctrl-C) carries the values the kernel put there, usually 0.
+pub const Info = struct {
+    signo: Signo,
+    pid: u32,
+    uid: u32,
+};
+
 /// The signals this module can watch.
 pub const Signo = enum {
     term,
@@ -200,6 +211,12 @@ pub const StopSignals = struct {
     /// Non-blocking: the next pending signal, or `null` when none is queued.
     /// The "flag form" for a loop that checks between units of work.
     pub fn poll(self: *const StopSignals) Error!?Signo {
+        const info = try self.pollInfo() orelse return null;
+        return info.signo;
+    }
+
+    /// `poll` with the sender: the next pending signal as `Info`, or `null`.
+    pub fn pollInfo(self: *const StopSignals) Error!?Info {
         if (builtin.os.tag != .linux) return error.Unsupported;
         if (self.fd_ < 0) return error.Unexpected; // after `deinit`
         var pfd = [1]linux.pollfd{.{ .fd = self.fd_, .events = linux.POLL.IN }};
@@ -224,13 +241,18 @@ pub const StopSignals = struct {
                 else => return error.Unexpected,
             }
             if (n != @sizeOf(linux.signalfd_siginfo)) return error.Unexpected;
-            return Signo.fromRaw(info.signo) orelse error.Unexpected;
+            return try toInfo(info);
         }
     }
 
     /// Block until a signal arrives and return it. The read goes through `io`,
     /// so cancelling the task returns `error.Canceled`.
     pub fn wait(self: *const StopSignals, io: std.Io) WaitError!Signo {
+        return (try self.waitInfo(io)).signo;
+    }
+
+    /// `wait` with the sender (`Info`).
+    pub fn waitInfo(self: *const StopSignals, io: std.Io) WaitError!Info {
         if (builtin.os.tag != .linux) return error.Unsupported;
         var info: linux.signalfd_siginfo = undefined;
         var bufs = [1][]u8{std.mem.asBytes(&info)};
@@ -240,7 +262,15 @@ pub const StopSignals = struct {
             else => return error.Unexpected,
         };
         if (n != @sizeOf(linux.signalfd_siginfo)) return error.Unexpected;
-        return Signo.fromRaw(info.signo) orelse error.Unexpected;
+        return toInfo(info);
+    }
+
+    fn toInfo(info: linux.signalfd_siginfo) Error!Info {
+        return .{
+            .signo = Signo.fromRaw(info.signo) orelse return error.Unexpected,
+            .pid = info.pid,
+            .uid = @intCast(info.uid),
+        };
     }
 };
 
@@ -509,6 +539,41 @@ fn pipeFed(bytes: []const u8) !StopSignals {
     if (bytes.len != 0) try testing.expectEqual(bytes.len, linux.write(p[1], bytes.ptr, bytes.len));
     _ = linux.close(p[1]);
     return .{ .fd_ = p[0], .mask = linux.sigemptyset(), .newly_blocked = linux.sigemptyset() };
+}
+
+test "pollInfo and waitInfo carry the sender pid and uid" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rec = record(@backingInt(linux.SIG.USR1));
+    rec.pid = 4242;
+    rec.uid = 1001;
+    var a = try pipeFed(std.mem.asBytes(&rec));
+    const ia = (try a.pollInfo()).?;
+    try testing.expectEqual(Signo.usr1, ia.signo);
+    try testing.expectEqual(@as(u32, 4242), ia.pid);
+    try testing.expectEqual(@as(u32, 1001), ia.uid);
+    _ = linux.close(a.fd_);
+    var b = try pipeFed(std.mem.asBytes(&rec));
+    const ib = try b.waitInfo(testing.io);
+    try testing.expectEqual(Signo.usr1, ib.signo);
+    try testing.expectEqual(@as(u32, 4242), ib.pid);
+    try testing.expectEqual(@as(u32, 1001), ib.uid);
+    _ = linux.close(b.fd_);
+    // A signal the module does not model is still an error, not an Info.
+    const kill = record(@backingInt(linux.SIG.KILL));
+    var c = try pipeFed(std.mem.asBytes(&kill));
+    try testing.expectError(error.Unexpected, c.pollInfo());
+    _ = linux.close(c.fd_);
+}
+
+test "a real kill() reports the sender: pollInfo names this process and its uid" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var st = try StopSignals.init(.{ .term = false, .int = false, .usr1 = true });
+    defer st.deinit();
+    try sendSelf(.USR1);
+    const info = (try st.pollInfo()).?;
+    try testing.expectEqual(Signo.usr1, info.signo);
+    try testing.expectEqual(@as(u32, @intCast(linux.getpid())), info.pid);
+    try testing.expectEqual(@as(u32, @intCast(linux.getuid())), info.uid);
 }
 
 fn record(signo: u32) linux.signalfd_siginfo {
