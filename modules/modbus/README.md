@@ -18,8 +18,8 @@ owned arrays into a simulated field device fleet.
     0x16 Mask Write Register, 0x17 Read/Write Multiple Registers,
     0x2B/0x0E Read Device Identification (`device_id`). Spec quantity limits (2000 bits /
     125 registers read, 1968 bits / 123 registers write, 125/121 for FC 17)
-    are typed errors; exception responses (function | 0x80, codes 1–11) map
-    to a typed error set. Registers big-endian; coil bits LSB-first.
+    are typed errors; exception responses (function | 0x80, codes 0x01–0x0B) map
+    to a typed error set (named codes 0x01–0x08, 0x0A, 0x0B). Registers big-endian; coil bits LSB-first.
   - **Framing:** `tcp` (MBAP: transaction id, protocol id 0, length, unit)
     and `rtu` (address + PDU + CRC-16, poly 0xA001 reflected, low byte first).
     `RtuStream` reassembles RTU frames from a byte stream without t3.5
@@ -36,7 +36,7 @@ owned arrays into a simulated field device fleet.
     length**, so a request outside the window is a real `IllegalDataAddress`
     rather than a silent wrap. Answers every function code the client speaks
     plus 0x07 Read Exception Status, 0x08 Diagnostics (return-query-data,
-    restart, listen-only, clear-counters and the five serial-line counters)
+    restart, listen-only on RTU framing only (over TCP it is `IllegalFunction`: a single frame would mute the server for every master), clear-counters and the five serial-line counters)
     0x11 Report Slave ID and 0x16 Mask Write Register (`Config.mask_write_register`,
     on by default) and 0x2B/0x0E Read Device Identification (basic, regular,
     extended, individual; `Config.device_objects`, off while the table is empty). Spec-correct exception responses
@@ -122,26 +122,9 @@ transaction id, unit id, length, function code, exception code, register
 values, coil bits, the Report Slave ID payload — matched, with no malformed
 packets.
 
-## Deferred
+## Not provided
 
-Honest list of what this module does **not** do:
-
-- **ASCII framing** (Modbus over Serial Line §2.5.2) — not planned; RTU and
-  TCP cover every consumer we have.
-- **FC 0x14/0x15 file records, 0x18 read FIFO** — not implemented on
-  either side.
-- **Modbus Security / TLS** — transport security is entirely the caller's;
-  this module never touches a socket except in the optional `TcpTransport`.
-- **Serial timing** — the RTU t1.5/t3.5 inter-character and inter-frame
-  silences are the transport's concern. The server delimits frames by what it
-  is handed; it does not measure time and owns no clock.
-- The **listen-only** mode set by diagnostics sub-function 0x0004 is
-  implemented as state, but there is no separate "restart communications
-  option" side effect beyond leaving the mode and optionally clearing the
-  counters.
-- The server has **no built-in TCP accept loop**. `handleAdu` is a pure
-  function; running it over `std.Io.net` (or over hundreds of simulated
-  units at once) is the caller's job.
+ASCII framing, TLS / Modbus Security and UDP variants, serial t1.5/t3.5 timing and a built-in TCP accept loop are left out by design, and FC 0x14/0x15 file records and FC 0x18 read FIFO are not implemented on either side; see SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the public Modbus Application Protocol
 Specification V1.1b3 and Modbus over Serial Line Specification V1.02
