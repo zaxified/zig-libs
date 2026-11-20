@@ -349,6 +349,20 @@ pub fn proveIpa(
 /// fold-and-check equation (the single-multi-exponentiation form). Never
 /// panics on a malformed/adversarial `proof` — every structural mismatch
 /// or failed equation simply returns `false`.
+///
+/// ⚠ Fiat–Shamir binding is the caller's. The challenges come from
+/// `transcript` as handed in; this function absorbs only its domain
+/// separator, `n` and each round's `L`/`R` — never `p`, `q` or the
+/// generators. A direct caller MUST absorb the statement (`p`, `q`, and
+/// whatever fixes `g_vec`/`h_vec`) into `transcript` before the call, and
+/// `proveIpa`'s caller the same before its call; otherwise the challenges do
+/// not depend on the statement, the weak Fiat–Shamir of Bernhard, Pereira
+/// and Warinschi ("How not to prove yourself", ASIACRYPT 2012), and a proof
+/// can be fitted to a `p` chosen afterwards. `rangeproof` does this: `V`,
+/// `A`, `S`, `T1`, `T2`, `t_x`, `t_x_blinding` and `e_blinding` are in the
+/// transcript before the call, and `p` and `q = w·B` are computed from them
+/// and from the challenges drawn after them — the way dalek's
+/// `InnerProductProof` relies on its parent protocol's transcript.
 pub fn verifyIpa(
     transcript: *Transcript,
     g_vec: []const Ristretto255,

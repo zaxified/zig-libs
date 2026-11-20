@@ -37,7 +37,7 @@
 //! 9147 §5.9 mandates instead of TLS's `"tls13 "`), `tlsresume` targets
 //! plain TLS 1.3, for which std's hardcoded `"tls13 "` prefix is exactly
 //! correct (RFC 8446 §7.1) — NOT a std gap, see `psk.zig`'s module doc for
-//! the detail. Zig 0.16 ships no AES key-wrap/session-cache/ticket-codec
+//! the detail. std ships no session-cache or ticket-codec
 //! primitives, so `stek.zig`/`ticket.zig` are this module's own.
 //!
 //! Provenance: clean-room from RFC 8446 §4.2.11/§4.2.11.1/§4.2.11.2/§4.6.1/

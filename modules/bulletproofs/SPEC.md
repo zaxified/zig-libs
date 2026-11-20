@@ -6,7 +6,7 @@
 
 **Scope:** core — dalek-cryptography/bulletproofs, single and aggregated proofs, batch verification (surveyed 2026-09-30, aggregation and batching 2026-10-02)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-20 (321/337, 13 eq) · src 0c9734dec9d9e93c
+**Audit:** review 2026-09-15 · mutation 2026-11-20 (321/337, 13 eq) · src c9818b5d4d19b4c8
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BULLETPROOFS_FUZZ; rp-decode at 1/4, prove-verify at 1/40 of it) · ct 2026-09-15 (ctgrind)
 
@@ -364,9 +364,6 @@ cannot see an error both sides share.
 
 ## Backlog / deferred
 
-- **LOW (relation audit):** the standalone `verifyIpa` relies on the caller having
-  absorbed `P` and `Q` into the transcript first (the range proof does); a direct caller who does
-  not gets a weak Fiat–Shamir. Absorb them inside, or document it at the function.
 - **Multi-party aggregation (dalek's dealer/party protocol):** parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
 - **Wider values (`n > 64`):** `v` is a `u64`; a wider variant needs a bignum witness type threaded through
   `prove`'s bit-decomposition step — mechanical widening, no new cryptographic core; no consumer needs it. Effort: medium.

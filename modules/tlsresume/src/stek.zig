@@ -20,7 +20,7 @@
 //! (caller-supplied, since this module owns no RNG). The blob's leading
 //! key id is bound as the AEAD's associated data, so a blob cannot be
 //! re-pointed at a different ring slot without failing tag verification
-//! (std's GCM verifies the tag in constant time internally).
+//! (the AEAD, `aesgcm`, verifies the tag in constant time).
 //!
 //! Ticket blob wire layout (opaque to the TLS engine and to RFC 8446 — this
 //! module's own choice, analogous to the CONVENTIONS.md-cited proven

@@ -8,7 +8,7 @@
 
 **Ahead:** feature — scheduled STEK rotation with a grace lifetime: `maybeRotate` rotates the ticket key every `period_s` and a ticket under a rotated-out key still resumes until `lifetime_s`, then not, the key still in the ring; OpenSSL 3.5 makes one ticket key per `SSL_CTX` at `SSL_CTX_new` (`ssl/ssl_lib.c`) and replaces it only whole (`SSL_CTX_set_tlsext_ticket_keys`: every earlier ticket stops opening at once) or through an application-written ticket-key callback; rows `openssl-grace`, `openssl-expired`, `go-expired`, `openssl-k2-resume` of `zig build interop-tlsresume` (OpenSSL 3.5.5 and Go 1.26.8 clients), replayed in `interop_replay_test.zig` (measured 2026-10-26)
 
-**Audit:** review 2026-10-28 · mutation 2026-10-28 (247/266, 19 eq) · src dc6281645aba9ef2
+**Audit:** review 2026-10-28 · mutation 2026-10-28 (247/266, 19 eq) · src 55598af1eeb4113a
 
 **Hardening:** fuzz 2026-10-26 (200,000 runs per harness clean, every reach label hit, TLSRESUME_FUZZ; the ticket harness now builds distinct extension types and lifetimes up to 7 days, as `encode` requires) · ct 2026-10-26 (re-measured after the audit fixes, counts unchanged, source digests re-pinned; ctgrind: STEK + session state through StekRing seal/open/tampered open, resumption secret through derivePsk/earlySecret/binderKey/computeBinder/verifyBinder, PSK through the 0-RTT key schedule, SHA-256 and SHA-384; 2 in-file = the AES-256-GCM tag verdict in std decrypt, one per open; the PSK/binder chain and the binder compare read 0; select.selectPsk is not a row, see the harness doc) · panic 2026-10-28 (independent sweep of every pub entry point, no data-reachable panic: `SessionCache` capacity 0 asserted then dereferenced null (a disabled cache now), HKDF-Expand-Label contexts over 255 bytes (a stack overrun in ReleaseFast, now a checked panic), `SessionState.serialize` nonce over 255 (`NonceTooLong`), clock and lifetime arithmetic in `StekRing`/`StrikeRegister`/`SessionCache`/`selectPsk` overflow-free, `depthFor` checked; state + ticket 200,000 driver runs clean after it)
 
@@ -317,8 +317,7 @@ chain is generic over the caller's `Hkdf`/`Hmac`, so an engine can plug a faster
 
 ## Backlog / deferred
 
-- `stek.Aead` is `aesgcm.Aes256Gcm` (the Zig 0.17 #36256 move of the AEAD); the bulk seal/open path was not re-measured
-  at that move. The card's Performance figures were measured after it, so this is probably closed: confirm and delete.
+None open.
 
 ## Anchoring
 
