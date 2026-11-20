@@ -12,7 +12,7 @@
 
 **Performance:** not measured
 
-**Evidence:** model — ring_hash vs frozen Python xxhash oracle; membership-churn invariants sweep, random picker checks
+**Evidence:** model — ring_hash owners frozen in the test from a one-off run of Python's `xxhash` package (no tool or testdata file in the module); membership-churn invariants sweep, random picker checks
 **Model:** src/root.zig:Python xxhash oracle
 
 **Known defects:** none recorded

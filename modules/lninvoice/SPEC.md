@@ -323,4 +323,4 @@ public TLV/bech32 buffers).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** BOLT11 + BOLT12 offer/invoice_request/invoice decode+ENCODE all vs lightning/bolts vectors, byte-exact (NOTICE)
+**What the tests actually contain.** BOLT11 decode + encode, BOLT12 offer / invoice_request / invoice decode and `encodeSignedInvoice` vs lightning/bolts vectors, byte-exact; `invoice_request` has the signature reproduced byte-exact but its string ENCODE only round-tripped (see Open) (NOTICE)

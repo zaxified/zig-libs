@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (53/53) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BTCADDR_FUZZ) · ct n/a — public address derivation (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BTCADDR_FUZZ) · ct 2026-10-18 (ctgrind: the WIF private-key round trip, row `wif`; address derivation is public)
 
 **Performance:** not measured
 

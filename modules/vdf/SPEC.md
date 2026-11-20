@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-11 · mutation 2026-11-17 (125/145, 20 eq) · src ac0328d61535d035
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget clean for the codec harness; verify at 1/20 and eval at 1/50 of it (10,000 and 4,000 runs, ~200 and ~80 runs/s), VDF_FUZZ) · ct 2026-09-10 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget clean for the codec harness; verify at 1/20 and eval at 1/50 of it (10,000 and 4,000 runs, ~200 and ~80 runs/s), VDF_FUZZ) · ct n/a — every input is public and the code is not constant-time by design (see Caveats in root.zig); the squarings run on montint's Montgomery core, covered by montint's own ctgrind rows; vdf has no harness or row of its own
 
 **Performance:** not measured
 

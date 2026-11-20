@@ -10,7 +10,7 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 3aff7bfc56c5aa96
 
-**Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct n/a — no auth token, key or crypto; secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
+**Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct n/a — the only secret is the `StateSeal` HMAC-SHA-256 key, whose MAC is compared with `std.crypto.timing_safe.eql`; no ctgrind row covers it yet; the secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
 
 **Performance:** ref 0.03–0.09× modelcontextprotocol/go-sdk v1.8.0 (Go 1.26.8; `zig build bench-mcp`, five stdio sessions of 64 requests; the TypeScript SDK needs Node, not on this host) · fastest 0.44× rmcp 3.7.0 (Rust, tokio current-thread; it validates no schemas on this path, see `tools/rs_field`) (measured 2026-10-24)
 
