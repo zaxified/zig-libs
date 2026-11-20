@@ -40,7 +40,7 @@ fn glibcPrintsDotted(a: Ip) bool {
 }
 
 /// Prefix texts Python reads and this module refuses. Every one is a Python
-/// extension of CIDR syntax; Go's netip.ParsePrefix (asked 2026-10-05, go1.26)
+/// extension of CIDR syntax; Go's netip.ParsePrefix (asked, go1.26)
 /// refuses each of them as we do.
 const prefix_divergences = [_]Divergence{
     .{ .text = "1.2.3.4", .why = "no '/': Python reads a bare address as /32; Go and we require CIDR notation (parseIp reads addresses)" },

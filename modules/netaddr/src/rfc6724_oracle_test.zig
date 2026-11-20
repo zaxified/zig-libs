@@ -208,7 +208,7 @@ test "rfc6724 oracle: destination order as glibc gives it (every ordered pair, t
         unexplained += 1;
     };
     // Most of the evidence must be agreement, not explained difference
-    // (2026-10-05: 5906 of 6240 agree; mapped-v4-scope 266, ipv4-rule9 1,
+    // (5906 of 6240 agree; mapped-v4-scope 266, ipv4-rule9 1,
     // follows-from-pairs 65, not-a-weak-order 2).
     if (unexplained != 0 or agreed * 100 < cases * 90) {
         std.debug.print("{d} unexplained, {d} agreed of {d}; explained:", .{ unexplained, agreed, cases });

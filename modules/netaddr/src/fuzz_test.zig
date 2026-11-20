@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over netaddr's text parsers (added 2026-10-07 with
+//! Deterministic fuzz driver over netaddr's text parsers (with
 //! the single-pass `parseIp4`/`parseIp6`): every parser of untrusted text must
 //! never trap, and whatever parses must survive a round trip — format it, parse
 //! the text again, get the same value back. The round trip is the oracle: a

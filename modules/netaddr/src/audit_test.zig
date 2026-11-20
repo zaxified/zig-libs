@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests added by the 2026-10-25 grade-1 audit (mutant schemata over the
+//! Tests added by the grade-1 audit (mutant schemata over the
 //! non-test source). Each test names what a mutant of the source would have
 //! changed; they pin boundaries the earlier tables and oracles never reached.
 
@@ -352,7 +352,7 @@ test "audit: RFC 6724 corners - unusable pairs, policy row edges, selection ties
     }
 }
 
-// ── no-panic sweep 2026-10-28 ───────────────────────────────────────────────
+// ── no-panic sweep ───────────────────────────────────────────────
 
 /// Three 64-address regions the builder model covers: low v4, the top of v4
 /// and the top of v6 (where `to + 1` would overflow).
@@ -534,7 +534,7 @@ test "no-panic sweep N-4: the log sweep keeps families apart where one ends at t
     try testing.expect(!s.contains(ip("::ffff:ffff"))); // the address before ::1:0:0
 }
 
-// ── 2026-11-07 whole-module mutation run (A1): tests for the survivors ──────
+// ── whole-module mutation run (A1): tests for the survivors ──────
 
 test "A1: multicast scopes 9 and 10 are neither interface-local nor link-local" {
     // `(b[1] & 0x07) == 0x02` would call scope 0xa link-local, `& 0x07 == 0x01` scope 9 interface-local.

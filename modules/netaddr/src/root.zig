@@ -139,11 +139,10 @@ pub const Ip = union(enum) {
     /// v4-mapped addresses are unwrapped first, so `::ffff:10.0.0.1` counts —
     /// a check that missed that is exactly how a filter gets bypassed.
     ///
-    /// Until 2026-10-07 this was RFC 1918 only; it now matches Go (user
-    /// decision, parity). Combining this with loopback, link-local, CGNAT
-    /// `100.64/10`, TEST-NET, broadcast … into one "is this safe to connect
-    /// to" predicate is policy, not addressing, so it stays with the caller
-    /// that has the threat model; `rdap`'s SSRF guard is the worked example.
+    /// Combining this with loopback, link-local, CGNAT `100.64/10`,
+    /// TEST-NET, broadcast … into one "is this safe to connect to" predicate
+    /// is policy, not addressing, so it stays with the caller that has the
+    /// threat model; `rdap`'s SSRF guard is the worked example.
     pub fn isPrivate(ip: Ip) bool {
         return switch (ip.unmap()) {
             .v4 => |q| q[0] == 10 or
@@ -440,7 +439,7 @@ pub fn parseIp6(text: []const u8) ?[16]u8 {
 /// Enough for any output of `formatIp` (matches INET6_ADDRSTRLEN − 1).
 pub const max_ip_text_len = 45;
 
-// F2 (audit 2026-09-04): this constant was not anchored to anything -- a
+// F2: this constant was not anchored to anything -- a
 // caller passing `buf[0..max_ip_text_len]` and a future edit shrinking the
 // constant would silently turn every `catch unreachable` below into UB, and
 // the failure mode is different in every build mode (Debug/ReleaseSafe
@@ -615,7 +614,7 @@ pub const Zone = struct {
     }
 
     /// `len` is a pub field: a hand-set one past `max_zone_len` reads as
-    /// the whole buffer, never past it (no-panic sweep 2026-10-28, N-1).
+    /// the whole buffer, never past it (no-panic sweep, N-1).
     pub fn slice(z: *const Zone) []const u8 {
         return z.buf[0..@min(z.len, max_zone_len)];
     }
@@ -814,7 +813,7 @@ pub fn parseHostPort(text: []const u8) ?HostPort {
     return .{ .host = text[0..colon], .port = port };
 }
 
-// F8 (audit 2026-09-04, tightened per user decision Q2-B 2026-09-11):
+// F8(tightened per user decision Q2-B):
 // `parsePort` used to keep accepting a leading zero ("host:080" read as port
 // 80), unlike every other numeric field in this module (`parseIp4`'s octets,
 // `parsePrefix`'s bits). There is no ambiguous *value* here -- "0080" always
@@ -928,7 +927,7 @@ pub const SubnetIterator = struct {
         const out: Prefix = .{ .addr = ipFromInt(it.family, it.cur), .bits = it.bits };
         // `>=` and the room check, not `==`: the fields are pub, and a
         // hand-built iterator with `cur` past `last` (or `last` not reached
-        // by whole steps) must end, never wrap (mutation run 2026-11-07).
+        // by whole steps) must end, never wrap.
         if (it.cur >= it.last or it.last - it.cur < it.step) it.done = true else it.cur += it.step;
         return out;
     }
@@ -1188,8 +1187,7 @@ pub fn parsePrefix(text: []const u8) ?Prefix {
 /// requirement is checked by the compiler, not by an assert that disappears in
 /// the release modes.
 ///
-/// `p.bits` is clamped to the family width before printing (F6, audit
-/// 2026-09-04): every other `Prefix` operation already clamps internally
+/// `p.bits` is clamped to the family width before printing (F6, audit): every other `Prefix` operation already clamps internally
 /// (`masked`, `netMask`, `hostCount`, ...), but this one printed the raw
 /// field. A hand-built `Prefix{ .addr = v4, .bits = 200 }` -- unreachable
 /// through `parsePrefix`, which rejects `bits > width` up front, but not
@@ -1302,7 +1300,7 @@ pub const AddrIterator = struct {
         if (it.done) return null;
         const ip = ipFromInt(it.family, it.cur);
         // `>=`: a hand-built `cur` past `last` ends instead of overflowing
-        // (no-panic sweep 2026-10-28, N-3).
+        // (no-panic sweep, N-3).
         if (it.cur >= it.last) it.done = true else it.cur += 1;
         return ip;
     }
@@ -1443,7 +1441,7 @@ pub const IpSet = struct {
     }
 
     /// The `i`-th maximal range (`i < rangeCount()`, checked in every build
-    /// mode — no-panic sweep 2026-10-28, N-2), in set order.
+    /// mode — no-panic sweep, N-2), in set order.
     pub fn rangeAt(s: IpSet, i: usize) IpRange {
         if (i >= s.spans.len) @panic("netaddr: IpSet.rangeAt index past rangeCount()");
         const k = s.spans[i];
@@ -1584,7 +1582,7 @@ fn spanEndsBefore(x: RangeKey, y: RangeKey) bool {
 /// removal, the rest is logged in call order and resolved in one sweep
 /// (netipx applies the pending removals on every such switch instead, O(n)
 /// each — quadratic for an alternating list read from untrusted input;
-/// no-panic sweep 2026-10-28, N-4). `IpSetBuilder.empty` is the empty
+/// no-panic sweep, N-4). `IpSetBuilder.empty` is the empty
 /// builder; `deinit` frees it, and it stays usable after `toSet`.
 ///
 /// Errors are returned at the call, not accumulated as netipx does: the
@@ -2241,7 +2239,7 @@ test {
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
     // TEETH for the invariant this module's whole type rests on, and with it
     // the address identity of every module that stores an `Ip`. Measured at
-    // the 2026-09-04 audit pass: making `1.2.3.4` compare equal to
+    // the audit pass: making `1.2.3.4` compare equal to
     // `::ffff:1.2.3.4` left the suite at **47/47 green**.
     //
     // The direction matters and it is deliberate. `Ip` is a tagged union, so
@@ -2361,7 +2359,7 @@ test "parseHostPort" {
     for (bad) |t| try testing.expect(parseHostPort(t) == null);
 }
 
-// F8 (audit 2026-09-04, closed per user decision Q2-B 2026-09-11):
+// F8(closed per user decision Q2-B):
 // `parsePort` used to keep a leading zero, unlike every other numeric field
 // in this module (`parseIp4`'s octets, `parsePrefix`'s bits). Now rejected
 // the same way. This test used to pin acceptance; it is flipped here to pin
@@ -2381,7 +2379,7 @@ test "F8: parsePort's leading zero is rejected, like other numeric fields" {
     try testing.expectEqual(@as(?Prefix, null), parsePrefix("10.0.0.0/08"));
 }
 
-// F4 (audit 2026-09-04): the three numeric sub-parsers (`parseIp4`'s octet,
+// F4: the three numeric sub-parsers (`parseIp4`'s octet,
 // `parseIp6`'s hex group, `parsePort`) each stop overlong digit runs with a
 // length check that runs BEFORE the accumulator loop, so the loop itself
 // never sees enough digits to overflow its accumulator type. That length
@@ -2395,7 +2393,7 @@ test "F8: parsePort's leading zero is rejected, like other numeric fields" {
 // Verified live against a mutant: dropping `parseIp4`'s `part.len > 3`
 // clause (keeping the `v > 255` check) turns an 18-digit octet from a clean
 // `null` into an "integer overflow" panic building `v` -- see the F4
-// disposition in `A1/netaddr.md` for the measured run.
+// disposition in A1 audit for the measured run.
 test "F4: the numeric parsers' length gates fire before their value checks would" {
     // parseIp4: an octet one digit past the 3-digit cap; a 4-digit run this
     // large would overflow the `u16` accumulator (part.len > 3) before `v`
@@ -2416,7 +2414,7 @@ test "F4: the numeric parsers' length gates fire before their value checks would
     try testing.expectEqual(@as(?Prefix, null), parsePrefix("2001:db8::/12800"));
 }
 
-// F4 (audit 2026-09-04): the /30 boundary of the RFC 3021 first/last-host
+// F4: the /30 boundary of the RFC 3021 first/last-host
 // reservation (reserved through /30, not reserved at /31 and /32) had /31
 // and /32 covered but not the last reserved width itself.
 test "F4: firstHost/lastHost reserve network and broadcast through /30, not past it" {
@@ -2427,7 +2425,7 @@ test "F4: firstHost/lastHost reserve network and broadcast through /30, not past
     try testing.expect(!p30.lastHost().eql(p30.broadcast().?));
 }
 
-// F4 + F6 (audit 2026-09-04): `bits > width` is unreachable through
+// F4 + F6: `bits > width` is unreachable through
 // `parsePrefix` (it rejects `v > widthOf(addr)` up front) but not through a
 // hand-built `Prefix{ .bits = 200 }` literal -- and every op that clamps
 // internally needs that clamp exercised at least once from outside
@@ -3133,7 +3131,7 @@ fn fuzzParseIp(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
+    // after it was always 0. Instrumented:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
@@ -3152,7 +3150,7 @@ fn fuzzParsePrefix(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
+    // after it was always 0. Instrumented:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
@@ -3171,7 +3169,7 @@ fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
+    // after it was always 0. Instrumented:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
@@ -3208,7 +3206,7 @@ test "Ip.isPrivate: RFC 1918 + RFC 4193 ranges and their boundaries" {
 }
 
 test "resolveLog: a removal as the first logged operation applies (hand-built log)" {
-    // (no-panic sweep 2026-10-28, N-4) the API never logs a removal first
+    // (no-panic sweep, N-4) the API never logs a removal first
     // (a removal with an empty log goes to `out`), but `log` is a pub field.
     var b: IpSetBuilder = .empty;
     defer b.deinit(std.testing.allocator);
