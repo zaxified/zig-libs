@@ -796,7 +796,7 @@ test "length + KEK validation (16/24/32-byte KEKs only), with positive controls"
     try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..15]));
 
     // Every non-AES KEK width is refused; the three AES widths are accepted
-    // (the 24-byte one since aes192, 2026-10-10).
+    // (the 24-byte one since aes192).
     for ([_]usize{ 0, 8, 15, 17, 20, 23, 25, 31, 33, 48 }) |kl| {
         const bad = @as([48]u8, @splat(0));
         try std.testing.expectError(error.UnsupportedKeyLength, wrap(bad[0..kl], &@as([16]u8, @splat(0)), &buf));
@@ -829,7 +829,7 @@ test "F4 regression: wrap validates KEK width before writing plaintext into `out
     try std.testing.expectEqualSlices(u8, &(@as([24]u8, @splat(0))), &out);
 }
 
-// Mutation run 2026-10-05: with the `% 8` check gone, `wrap` of a 17-octet
+// Mutation run: with the `% 8` check gone, `wrap` of a 17-octet
 // key wrapped 16 octets and left the 17th in the output IN THE CLEAR. No test
 // fed it an unaligned length >= 16. RFC 3394 §2: the key data is n 64-bit
 // blocks, n >= 2.
@@ -851,7 +851,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

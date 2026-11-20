@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for aeskw (added 2026-10-10): `AESKW_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for aeskw: `AESKW_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness name:
 //! `aeskw-unwrap`: a wrapped key (AES-128/192/256 KEK, 2-8 semiblocks) is
 //! unwrapped exactly; ONE flipped bit anywhere, another KEK, a truncation to
