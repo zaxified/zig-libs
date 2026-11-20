@@ -295,15 +295,17 @@ pub const BigDecimal = struct {
     ///
     /// Plain output needing more than `max_align_shift` padding zeros (a huge
     /// positive exponent, or a tiny fraction such as `1E-2000000000`) is
-    /// refused with `error.OutOfMemory` -- by policy, not a failed allocation
+    /// refused with `error.TooLarge` -- by policy, not a failed allocation
     /// (sweep DC-1); use `toSci`/`toEng`, which are exponent-sized.
-    pub fn toStringAlloc(self: BigDecimal, allocator: Allocator) Allocator.Error![]u8 {
+    pub const ToStringError = Allocator.Error || error{TooLarge};
+
+    pub fn toStringAlloc(self: BigDecimal, allocator: Allocator) ToStringError![]u8 {
         if (self.isZero()) return allocator.dupe(u8, "0");
         // The padding guard first where the digit count cannot save the output
         // (sweep DC-6): no conversion work for a refused value.
         // For a negative exponent the padding is at least `frac - max possible digits`.
         if (plainPadding(digitsAtMost(self.coeff.toConst().bitCountAbs()), self.exponent) > max_align_shift)
-            return error.OutOfMemory;
+            return error.TooLarge;
 
         const digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
         defer allocator.free(digits);
@@ -311,7 +313,7 @@ pub const BigDecimal = struct {
         const mag = if (neg) digits[1..] else digits[0..];
         const sign_len: usize = if (neg) 1 else 0;
 
-        if (plainPadding(mag.len, self.exponent) > max_align_shift) return error.OutOfMemory;
+        if (plainPadding(mag.len, self.exponent) > max_align_shift) return error.TooLarge;
 
         if (self.exponent >= 0) {
             const zeros: usize = @intCast(self.exponent);

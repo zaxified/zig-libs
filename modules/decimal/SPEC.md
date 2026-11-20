@@ -157,7 +157,7 @@ in constant time instead of attempting an astronomical allocation. Round-trippin
 **Known limitations (documented, not bugs):**
 - `toStringAlloc`/`{f}` print plain notation, so a huge `exponent` produces a proportionally huge string; `toSci`/`toEng` are the GDA forms and keep a zero's scale (`0.00`, `0E+2`). No signed zero is ever printed.
 - Width caps, all consts and pragmatic safety caps, not General Decimal Arithmetic rules: `max_align_shift` (1,000,000) bounds how large an exponent *difference* `add`/`sub`/widening-`rescale` will materialise as `10^k`; `max_parse_digits` (= `max_result_digits`, 100,000) bounds a parsed significand; `max_coeff_digits` (200,000 = 2 × parse) bounds any coefficient an operation PRODUCES (`add`/`sub`, `mul`, `div`, `rescale`/`quantize`/`roundToIntegral`, `remainder`, `divideInteger`, `remainderNear`, `fromFloat`, `toStringFixed`: `error.Overflow`, decided from the operands' bit lengths before the big work). They guard against a hostile or typo'd exponent forcing unbounded allocation or quadratic conversion (std's decimal conversion, `precision` and division are quadratic: 200,000 digits is about 2.4 s for `toSci`).
-- Plain-notation output is capped at `max_align_shift` padding zeros (`toStringAlloc` -> `error.OutOfMemory` by policy, `toStringFixed` -> `error.Overflow`).
+- Plain-notation output is capped at `max_align_shift` padding zeros (`toStringAlloc` -> `error.TooLarge`, `toStringFixed` -> `error.Overflow`; `format` -> `WriteFailed`).
 - `order`/`eql`/`compareTotal`/`min`/`max` compare signs and adjusted exponents first, so far-apart exponents answer instead of failing the alignment.
 - `normalize` strips all trailing zeros with one bisection on `5^j | (c >> j)`.
 - No GDA context object: precision is per call (`roundToPrecision`, `divPrec`) and returns `{value, inexact, rounded}` instead of a flag register.
@@ -185,7 +185,6 @@ in constant time instead of attempting an astronomical allocation. Round-trippin
 - **Wider or option-sized caps:** `max_coeff_digits`/`max_parse_digits` are consts; a sub-quadratic `toString` (divide and conquer) would let them grow; make them options if a consumer needs wider numbers.
 - **`normalize` division is schoolbook:** 50,000 zeros take 15 ms in Debug and 4x zeros costs about 11x; a divide-and-conquer or Hensel exact division would make it linear.
 - **`toFloat` of a wide in-range value** (200,000 digits) still converts every digit (2.4 s); truncating to about 800 digits plus a sticky bit would make it constant.
-- **A policy refusal of plain output is reported as `error.OutOfMemory`** (`toStringAlloc`; `format` -> `WriteFailed`); a dedicated `error.TooLarge` is an API change.
 
 ## Anchoring
 

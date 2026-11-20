@@ -56,13 +56,13 @@ test "toStringAlloc / format refuse unbounded zero padding (sweep DC-1)" {
     // One zero past the cap first: a missing guard fails here, cheaply.
     var over = try BigDecimal.parse(a, "1e1000001");
     defer over.deinit();
-    try testing.expectError(error.OutOfMemory, over.toStringAlloc(a));
+    try testing.expectError(error.TooLarge, over.toStringAlloc(a));
     var huge = try BigDecimal.parse(a, "1e2000000000");
     defer huge.deinit();
     var tiny = try BigDecimal.parse(a, "1e-2000000000");
     defer tiny.deinit();
-    try testing.expectError(error.OutOfMemory, huge.toStringAlloc(a));
-    try testing.expectError(error.OutOfMemory, tiny.toStringAlloc(a));
+    try testing.expectError(error.TooLarge, huge.toStringAlloc(a));
+    try testing.expectError(error.TooLarge, tiny.toStringAlloc(a));
 
     var w: std.Io.Writer.Allocating = .init(a);
     defer w.deinit();
@@ -309,9 +309,9 @@ test "toFloat and toStringAlloc decide out-of-range values before any digit conv
     try testing.expectEqual(@as(f64, 0.0), try wide.toFloat(fa.allocator()));
     // Plain notation needing more than max_align_shift zeros: refused with no allocation at all.
     wide.exponent = 5_000_000;
-    try testing.expectError(error.OutOfMemory, wide.toStringAlloc(fa.allocator()));
+    try testing.expectError(error.TooLarge, wide.toStringAlloc(fa.allocator()));
     wide.exponent = -1_300_000;
-    try testing.expectError(error.OutOfMemory, wide.toStringAlloc(fa.allocator()));
+    try testing.expectError(error.TooLarge, wide.toStringAlloc(fa.allocator()));
     // No request reached the allocator (a failing allocator does not advance alloc_index).
     try testing.expect(!fa.has_induced_failure);
 }
@@ -476,7 +476,7 @@ test "toStringAlloc: the exact padding is the limit, not the digit-count bound (
     // would let exactly one zero too many through.
     var over = try BigDecimal.parse(a, "64e-1000003"); // 1_000_001 padding zeros
     defer over.deinit();
-    try testing.expectError(error.OutOfMemory, over.toStringAlloc(a));
+    try testing.expectError(error.TooLarge, over.toStringAlloc(a));
     var edge = try BigDecimal.parse(a, "64e-1000002"); // exactly 1_000_000
     defer edge.deinit();
     const s = try edge.toStringAlloc(a);
