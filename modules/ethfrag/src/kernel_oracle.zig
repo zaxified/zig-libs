@@ -67,7 +67,7 @@
 //!   python3 modules/ethfrag/tools/capture.py --print <scenario>
 //! '
 //! ```
-//! **F13 (`A1/ethfrag.md`), closed 2026-09-15:** `capture.py` is now
+//! **F13 (A1 audit), closed:** `capture.py` is now
 //! `modules/ethfrag/tools/capture.py` (`CONVENTIONS.md` Sec.9 -- a foreign
 //! toolchain, so `tools/`, never `src/`) -- it used to not be part of this
 //! repository (a throwaway harness, not shipped code); the bytes and
@@ -75,7 +75,7 @@
 //! `--verify` mode that re-captures every scenario LIVE and checks it
 //! against a recorded expectation, with `--corrupt-offset`/`--corrupt-expect`
 //! flags that prove it actually fails on a wrong answer (see that file's
-//! module doc comment and `A1/ethfrag.md`'s F13 disposition for RED→GREEN
+//! module doc comment and A1 audit's F13 disposition for RED→GREEN
 //! evidence). One new adversarial capture was added with it:
 //! `zero_length_final_duplicate`, see its own comment on `captures` below.
 //!
@@ -107,7 +107,7 @@
 //!     harmless retransmission, distinct from `overlap_same_content`'s
 //!     content-consistent-but-differently-sliced fragment, which it drops
 //!     exactly like a conflicting overlap.
-//!   - `zero_length_final_duplicate` (IPv4 only, added 2026-09-15 for F13):
+//!   - `zero_length_final_duplicate` (IPv4 only, added for F13):
 //!     never delivered, reproduced across 4 separate captures with fresh
 //!     idents. This is NOT the same divergence shape as `duplicate` above --
 //!     a SINGLE, non-duplicated zero-length closing fragment already times
@@ -329,7 +329,7 @@ const captures = [_]Capture{
         // any adversarial shape (all four accept-side comparisons are the
         // same "one clean datagram in three pieces" shape). This is the
         // shape F13 named specifically: a zero-length FINAL fragment (the
-        // A21 case in `A1/ethfrag.md`'s attack table -- `ethfrag`'s F1 fix
+        // A21 case in A1 audit's attack table -- `ethfrag`'s F1 fix
         // rejects a byte-identical repeat of it as `OverlappingFragment`),
         // captured for real via `modules/ethfrag/tools/capture.py
         // --print zero_length_final_duplicate` under `unshare --user
@@ -500,7 +500,7 @@ test "kernel oracle: our Reassembler's verdict vs the real Linux kernel's IPv4/I
     // (in_order, out_of_order, missing_middle, overlap, overlap_same_content
     // -- ×2 families -- + 2 documented divergences from duplicate ×2
     // families), PLUS one adversarial IPv4-only comparison added for F13
-    // (`A1/ethfrag.md`): zero_length_final_duplicate, captured via
+    // (A1 audit): zero_length_final_duplicate, captured via
     // `modules/ethfrag/tools/capture.py`. 11 matches + 2 divergences = 13.
     // This module's own resource-bound policies (max_inflight/
     // max_fragments_per_datagram/timeout_ns) and wire-format-specific

@@ -445,7 +445,7 @@ pub const Reassembler = struct {
     };
 
     /// A reassembler for one peer. An invalid `config` is
-    /// `error.InvalidConfig` (2026-11-16; before, a `@panic` — audit F7 had
+    /// `error.InvalidConfig` (before, a `@panic` — audit F7 had
     /// already replaced the `assert`s that were UB in ReleaseFast).
     pub fn init(allocator: Allocator, config: ReassemblerConfig) InitError!Reassembler {
         if (config.max_inflight < 1) return error.InvalidConfig;
@@ -542,7 +542,7 @@ pub const Reassembler = struct {
     /// The two exhaustion guards return through these, so a fuzz run can say
     /// whether a guard FIRED, not just whether its line was near a seen PC.
     ///
-    /// ⛔ Measured 2026-09-15 (A1 F6): a coverage query on the line
+    /// ⛔ Measured (A1 F6): a coverage query on the line
     /// `return error.TooManyFragments;` stayed HIT in a harness that cannot
     /// reach that guard, because LLVM shares error-return blocks between paths.
     /// A `noinline` function has an entry PC of its own, so
@@ -1173,7 +1173,7 @@ test "A1 F8: repeated overlap-drop churn allocates the fragment's OWN size, not 
     // Audit's own churn shape: the same tiny fragment inserted repeatedly
     // under one frag_id, every other insert an exact duplicate -> dropped
     // as OverlappingFragment -> the entry is torn down and rebuilt fresh
-    // on the next insert. Measured (churn.zig, `A1/ethfrag.md` F8):
+    // on the next insert. Measured (churn.zig, A1 audit F8):
     // 450,000 B of wire traffic (50,000 x 9 B) forced 1,641,675,624 B of
     // allocate-then-immediately-free churn, because every entry ate the
     // full `max_frame_len` (65535 B) regardless of the fragment's own
@@ -1653,7 +1653,7 @@ const seed = tkfuzz.seedHex;
 /// what expires an in-flight datagram; `max_inflight` is 4, so five distinct
 /// `frag_id`s is what exercises the eviction path.
 ///
-/// ⭐ Why the burst kind exists (A1 F6, measured 2026-09-15 through
+/// ⭐ Why the burst kind exists (A1 F6, measured through
 /// `scripts/modtest ethfrag --fuzz`): the `max_fragments_per_datagram` guard
 /// needs 16 accepted, pairwise-disjoint fragments of ONE id with no idle gap
 /// above `timeout_ns`. The structured kind draws `offset` as a full `u16`
@@ -1820,7 +1820,7 @@ fn fuzzReassembler(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     // therefore **0 on every replay**, so the loop below never executed once:
     // the reassembler was constructed, immediately destroyed, and handed
     // NOTHING, and the `inflightCount() <= max_inflight` assertion this test is
-    // named for never ran either. Measured 2026-09-07 over the corpus above:
+    // named for never ran either. Measured over the corpus above:
     // **0 steps run, 0 datagrams completed and a peak in-flight count
     // of 0 before; 81 steps run, 3 datagrams completed and a peak of 4 after.**
     const n: usize = fz.drawInput(S, src, &script, &reassembler_seeds);
@@ -1884,10 +1884,10 @@ test "corpus: every script drives the reassembler, and the counts are pinned" {
             peak_inflight = @max(peak_inflight, r.inflightCount());
         }
     }
-    // Measured 2026-09-07: with the step count drawn as a ranged value, 0
+    // Measured: with the step count drawn as a ranged value, 0
     // steps, 0 completions and a peak in-flight count of 0 — the loop body
     // had never executed. After:
-    // 2026-09-15 (A1 F6): +17 steps from the burst seed; the older seeds'
+    // (A1 F6): +17 steps from the burst seed; the older seeds'
     // numbers are unchanged, which is the check that the burst kind did not
     // change what an existing script means.
     try testing.expectEqual(@as(usize, 81 + 17), steps_run);
@@ -1909,7 +1909,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1919,7 +1919,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── aggregate byte budget and counters (2026-11-16) ─────────────────────────
+// ── aggregate byte budget and counters ─────────────────────────
 
 fn testWire(buf: []u8, id: u16, offset: u16, payload_len: u16, more: bool) []u8 {
     (Header{ .frag_id = id, .offset = offset, .length = payload_len, .more = more }).encode(buf[0..header_len]);
@@ -2040,7 +2040,7 @@ test "init: every invalid config is error.InvalidConfig, never a panic" {
     ok.deinit();
 }
 
-// ── whole-module mutation, 2026-11-17 ───────────────────────────────────────
+// ── whole-module mutation, ───────────────────────────────────────
 
 test "mutation: Header is big-endian at fixed offsets, and fragment() stamps the id" {
     var b: [header_len]u8 = undefined;
