@@ -1941,3 +1941,252 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-21 ────────────────────────────────────
+//
+// 145 mutants over `root.zig`: 32 survived the existing suite. These pin them.
+
+/// `{fmt, attStmt, authData}` with each value chosen by the caller.
+fn encodeAttObject(a: std.mem.Allocator, fmt: cbor.Value, att_stmt: cbor.Value, auth_data: cbor.Value) ![]u8 {
+    const entries = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "fmt" }, .value = fmt },
+        .{ .key = .{ .text = "attStmt" }, .value = att_stmt },
+        .{ .key = .{ .text = "authData" }, .value = auth_data },
+    };
+    return cbor.encode(a, .{ .map = &entries }, .{});
+}
+
+/// A real attestationObject with its `attStmt.x5c` replaced by `x5c`.
+fn withX5c(a: std.mem.Allocator, attestation_object: []const u8, x5c: []const cbor.Value) ![]u8 {
+    const decoded = try cbor.decode(a, attestation_object, .{});
+    var top: std.ArrayList(cbor.MapEntry) = .empty;
+    for (decoded.map) |e| {
+        if (std.meta.activeTag(e.key) == .text and std.mem.eql(u8, e.key.text, "attStmt")) {
+            var st: std.ArrayList(cbor.MapEntry) = .empty;
+            for (e.value.map) |se| {
+                if (std.meta.activeTag(se.key) == .text and std.mem.eql(u8, se.key.text, "x5c")) {
+                    try st.append(a, .{ .key = se.key, .value = .{ .array = x5c } });
+                } else try st.append(a, se);
+            }
+            try top.append(a, .{ .key = e.key, .value = .{ .map = st.items } });
+        } else try top.append(a, e);
+    }
+    return cbor.encode(a, .{ .map = top.items }, .{});
+}
+
+test "attestationObject: fmt, attStmt and authData must each have their CBOR type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const h = clientDataHash(&v.registration_client_data_json);
+    const auth: cbor.Value = .{ .bytes = try extractAuthDataRaw(a, &v.attestation_object) };
+    const empty_map: cbor.Value = .{ .map = &.{} };
+    try testing.expectError(error.WrongType, webauthn.verifyAttestation(a, try encodeAttObject(a, .{ .uint = 1 }, empty_map, auth), h));
+    try testing.expectError(error.WrongType, webauthn.verifyAttestation(a, try encodeAttObject(a, .{ .text = "none" }, .{ .text = "x" }, auth), h));
+    try testing.expectError(error.WrongType, webauthn.verifyAttestation(a, try encodeAttObject(a, .{ .text = "none" }, empty_map, .{ .text = "x" }), h));
+}
+
+test "packed x5c: the chain after the leaf is allowed, a non-byte-string leaf is WrongType" {
+    // §8.2: x5c is the attestation certificate "followed by its certificate
+    // chain"; only fido-u2f (§8.6) demands exactly one element.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const h = clientDataHash(&v.registration_client_data_json);
+    const leaf = try realX5c(a, &v.attestation_object);
+    const chain = [_]cbor.Value{ .{ .bytes = leaf }, .{ .bytes = leaf } };
+    const r = try webauthn.verifyAttestation(a, try withX5c(a, &v.attestation_object, &chain), h);
+    try testing.expectEqual(webauthn.AttestationType.basic, r.attestation_type);
+    try testing.expectEqualSlices(u8, leaf, r.leaf_cert_der.?);
+    const not_bytes = [_]cbor.Value{.{ .uint = 5 }};
+    try testing.expectError(error.WrongType, webauthn.verifyAttestation(a, try withX5c(a, &v.attestation_object, &not_bytes), h));
+}
+
+/// A `fido-u2f` attestation object around `key` (with W3C §16.16's certificate).
+fn u2fObjectWithKey(a: std.mem.Allocator, key: cbor.cose.Ec2Key) ![]u8 {
+    const v = vectors.fido_u2f_es256;
+    const key_bytes = try cbor.encode(a, try cbor.cose.encodeEc2Key(a, key), .{});
+    var auth: std.ArrayList(u8) = .empty;
+    var rp_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("example.org", &rp_hash, .{});
+    try auth.appendSlice(a, &rp_hash);
+    try auth.appendSlice(a, &.{ 0x41, 0, 0, 0, 0 });
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0))));
+    try auth.appendSlice(a, &.{ 0, 16 });
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0xc1))));
+    try auth.appendSlice(a, key_bytes);
+    return buildAttestationObject(a, .{
+        .fmt = "fido-u2f",
+        .alg = cbor.cose.alg_es256,
+        .x5c = try realX5c(a, &v.attestation_object),
+        .sig = &([_]u8{0x30} ++ @as([7]u8, @splat(0))),
+        .auth_data = auth.items,
+    });
+}
+
+test "fido-u2f: a P-256 credential key whose x or y is not 32 octets is InvalidKey" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = clientDataHash(&vectors.fido_u2f_es256.registration_client_data_json);
+    const x32 = @as([32]u8, @splat(0x11));
+    const y32 = @as([32]u8, @splat(0x22));
+    const short_x: cbor.cose.Ec2Key = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = x32[0..31], .y = &y32 };
+    const short_y: cbor.cose.Ec2Key = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &x32, .y = y32[0..31] };
+    try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(a, try u2fObjectWithKey(a, short_x), h));
+    try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(a, try u2fObjectWithKey(a, short_y), h));
+}
+
+test "fido-u2f: an AAGUID extension in the attestation certificate is not checked (§8.6 names none)" {
+    // authData's AAGUID is all zero (U2F); the certificate's extension says 0x22 x16. `packed` refuses that
+    // (§8.2.1), `fido-u2f` must not.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cdh: [32]u8 = undefined;
+    for (&cdh, 0..) |*b, i| b.* = @intCast(i);
+    const key: cbor.cose.Ec2Key = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &fx.u2f_aaguid_ext_x, .y = &fx.u2f_aaguid_ext_y };
+    const key_bytes = try cbor.encode(a, try cbor.cose.encodeEc2Key(a, key), .{});
+    var auth: std.ArrayList(u8) = .empty;
+    var rp_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("example.org", &rp_hash, .{});
+    try auth.appendSlice(a, &rp_hash);
+    try auth.appendSlice(a, &.{ 0x41, 0, 0, 0, 0 });
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0))));
+    try auth.appendSlice(a, &.{ 0, 16 });
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0xc1))));
+    try auth.appendSlice(a, key_bytes);
+    const obj = try buildAttestationObject(a, .{
+        .fmt = "fido-u2f",
+        .alg = cbor.cose.alg_es256,
+        .x5c = &fx.u2f_aaguid_ext_cert_der,
+        .sig = &fx.u2f_aaguid_ext_sig,
+        .auth_data = auth.items,
+    });
+    const r = try webauthn.verifyAttestation(a, obj, cdh);
+    try testing.expectEqual(webauthn.AttestationType.basic, r.attestation_type);
+}
+
+/// `der` (an Ed25519 attestation certificate) with its public key one octet
+/// short: the SPKI BIT STRING, its SEQUENCE and the two enclosing headers are
+/// all shortened by one.
+fn shortenEd25519SpkiKey(a: std.mem.Allocator, der: []const u8) ![]u8 {
+    const spki = [_]u8{ 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00 };
+    const at = std.mem.indexOf(u8, der, &spki) orelse return error.TestFixture;
+    if (der[0] != 0x30 or der[1] != 0x82 or der[4] != 0x30 or der[5] != 0x82) return error.TestFixture;
+    const out = try a.alloc(u8, der.len - 1);
+    const drop = at + spki.len + 31; // the last key octet
+    @memcpy(out[0..drop], der[0..drop]);
+    @memcpy(out[drop..], der[drop + 1 ..]);
+    out[at + 1] = 0x29;
+    out[at + 10] = 0x20;
+    std.mem.writeInt(u16, out[2..4], std.mem.readInt(u16, der[2..4], .big) - 1, .big);
+    std.mem.writeInt(u16, out[6..8], std.mem.readInt(u16, der[6..8], .big) - 1, .big);
+    return out;
+}
+
+test "packed x5c: an Ed25519 certificate with a short key or a wrong-size signature is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cert = try a.dupe(u8, &fx.ed25519_attestation_cert_der);
+    // The unmodified pair verifies (the next two cases differ from it by one octet only).
+    _ = try packedWith(a, cbor.cose.alg_eddsa, cert, &fx.ed25519_attestation_sig);
+    try testing.expectError(error.InvalidSignature, packedWith(a, cbor.cose.alg_eddsa, cert, fx.ed25519_attestation_sig[0..63]));
+    const long_sig = try a.alloc(u8, 65);
+    @memcpy(long_sig[0..64], &fx.ed25519_attestation_sig);
+    long_sig[64] = 0;
+    try testing.expectError(error.InvalidSignature, packedWith(a, cbor.cose.alg_eddsa, cert, long_sig));
+    try testing.expectError(error.InvalidCertificate, packedWith(a, cbor.cose.alg_eddsa, try shortenEd25519SpkiKey(a, cert), &fx.ed25519_attestation_sig));
+}
+
+test "packed x5c: the RSA attestation-certificate floor is exactly 2048 bits (2047 refused)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.InvalidKey, packedWith(a, webauthn.alg_rs256, &fx.rsa2047_attestation_cert_der, &@as([256]u8, @splat(0))));
+}
+
+test "verifyAttestation: the result carries the authenticator's AAGUID, credential id and signCount" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = try cbor.cose.encodeEc2Key(a, .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &(@as([32]u8, @splat(0x11))), .y = &(@as([32]u8, @splat(0x22))) });
+    const key_bytes = try cbor.encode(a, key, .{});
+    var auth: std.ArrayList(u8) = .empty;
+    var rp_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("example.org", &rp_hash, .{});
+    try auth.appendSlice(a, &rp_hash);
+    try auth.appendSlice(a, &.{ 0x41, 0x01, 0x02, 0x03, 0x04 }); // UP | AT, signCount 0x01020304
+    var aaguid: [16]u8 = undefined;
+    for (&aaguid, 0..) |*b, i| b.* = @intCast(0xa0 + i);
+    try auth.appendSlice(a, &aaguid);
+    try auth.appendSlice(a, &.{ 0, 3, 0xde, 0xad, 0xbe });
+    try auth.appendSlice(a, key_bytes);
+    const obj = try encodeAttObject(a, .{ .text = "none" }, .{ .map = &.{} }, .{ .bytes = auth.items });
+    const r = try webauthn.verifyAttestation(a, obj, @splat(0));
+    try testing.expectEqual(@as(u32, 0x01020304), r.sign_count);
+    try testing.expectEqualSlices(u8, &aaguid, &r.aaguid);
+    try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe }, r.credential_id);
+    try testing.expectEqualSlices(u8, &rp_hash, &r.rp_id_hash);
+}
+
+test "dupe and deinit: the leaf certificate and an RSA key are copied and freed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const r = try webauthn.verifyAttestation(a, &v.attestation_object, clientDataHash(&v.registration_client_data_json));
+    try testing.expect(r.leaf_cert_der != null);
+    const owned = try r.dupe(testing.allocator);
+    defer owned.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, r.leaf_cert_der.?, owned.leaf_cert_der.?);
+    try testing.expect(r.leaf_cert_der.?.ptr != owned.leaf_cert_der.?.ptr);
+
+    const rk: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &.{ 1, 2, 3 }, .e = &.{ 1, 0, 1 } } };
+    const copy = try rk.dupe(testing.allocator);
+    defer copy.freeOwned(testing.allocator);
+    try testing.expectEqual(@as(?i64, webauthn.alg_rs256), copy.rsa.alg);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 1 }, copy.rsa.e);
+}
+
+test "verifySignature: malformed keys and signatures are typed errors, never read past" {
+    const msg = "webauthn malformed key/signature";
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const ekp = try Ecdsa.KeyPair.generateDeterministic(@as([Ecdsa.KeyPair.seed_length]u8, @splat(7)));
+    const epub = ekp.public_key.toUncompressedSec1();
+    var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    const der = (try ekp.sign(msg, null)).toDer(&der_buf);
+    const es = cbor.cose.alg_es256;
+    const ec2: webauthn.CoseKey = .{ .ec2 = .{ .alg = es, .crv = cbor.cose.crv_p256, .x = epub[1..33], .y = epub[33..65] } };
+    try webauthn.verifySignature(ec2, es, msg, der);
+    var short_x = ec2;
+    short_x.ec2.x = epub[1..32];
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(short_x, es, msg, der));
+    var short_y = ec2;
+    short_y.ec2.y = epub[33..64];
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(short_y, es, msg, der));
+    try testing.expectError(error.InvalidSignature, webauthn.verifySignature(ec2, es, msg, &([_]u8{0x30} ++ @as([7]u8, @splat(0)))));
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const dkp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
+    const dpub = dkp.public_key.toBytes();
+    const dsig = (try dkp.sign(msg, null)).toBytes();
+    const long_x = dpub ++ [_]u8{0}; // 33 octets: the first 32 are a valid key
+    const okp_long: webauthn.CoseKey = .{ .okp = .{ .alg = cbor.cose.alg_eddsa, .crv = cbor.cose.crv_ed25519, .x = &long_x } };
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(okp_long, cbor.cose.alg_eddsa, msg, &dsig));
+    // A non-canonical encoding (y = 2^255 - 19, i.e. p itself) that std refuses.
+    const bad_point = [_]u8{0xed} ++ @as([30]u8, @splat(0xff)) ++ [_]u8{0x7f};
+    if (Ed25519.PublicKey.fromBytes(bad_point)) |_| return error.TestFixture else |_| {}
+    const okp_bad: webauthn.CoseKey = .{ .okp = .{ .alg = cbor.cose.alg_eddsa, .crv = cbor.cose.crv_ed25519, .x = &bad_point } };
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(okp_bad, cbor.cose.alg_eddsa, msg, &dsig));
+
+    // An RSA key `rsa` itself refuses (512 bits, below its own floor) is InvalidKey,
+    // before the 2048-bit policy and before any signature is looked at.
+    var n512: [64]u8 = @splat(0xc1);
+    n512[63] = 0x01;
+    const rsa_small: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &n512, .e = &.{ 1, 0, 1 } } };
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(rsa_small, webauthn.alg_rs256, msg, &@as([64]u8, @splat(0))));
+}

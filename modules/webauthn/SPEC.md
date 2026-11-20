@@ -6,7 +6,7 @@
 
 **Scope:** core — go-webauthn/webauthn (verification half); tpm/android-key/apple attestation are missing (surveyed 2026-09-30; raised from mvp 2026-09-30 when authenticatorData extensions became accepted)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-05 (54/54) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-20 (143/145, 2 eq) · src 78789b4ce8bef66f
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBAUTHN_FUZZ: `webauthn-assertion` and `webauthn-registration` over the six W3C §16 ceremonies — genuine accepted, a damaged authData / clientDataJSON / signature / COSE key refused; the script-driven parser harnesses are unchanged) · ct n/a — relying-party verifier: every input (signatures, credential public keys, challenges, client data) is public or sent in clear; holds no key, MAC key or secret (review, 2026-10-10)
 **Performance:** not measured
@@ -236,6 +236,11 @@ is no external vector for them.
   `parseAuthenticatorData`, `verifyAttestation` and the registration binding, each with reach
   counters.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+  The last whole-module run put 145 mutants (runtime switches in one ReleaseSafe test build) over `src/root.zig`:
+  143 killed, 2 equivalent (the `authenticatorData` header and credential-id length guards at the exact boundary, where
+  `cbor.decodePrefix` of the empty tail returns the same `Truncated`). 32 survived the first pass; all were test gaps (key and
+  signature length guards, RSA/Ed25519 certificate floors, the packed `x5c` chain, `fido-u2f` coordinate lengths and AAGUID
+  extension, result fields, `dupe`/`deinit`), closed by 12 tests and 5 fixtures (`tools/gen_attestation_fixtures.py`); no code defect.
 
 ## What is deliberately not done
 

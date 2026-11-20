@@ -1514,3 +1514,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "parseCredentialKey: an RSA key's alg, n and e must have their COSE types" {
+    const bytes_v: cbor.Value = .{ .bytes = &.{ 1, 2, 3 } };
+    var entries = [_]cbor.MapEntry{
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 3 } }, // kty RSA
+        .{ .key = .{ .uint = 3 }, .value = .{ .text = "RS256" } }, // alg: not an integer
+        .{ .key = .{ .negint = 0 }, .value = bytes_v }, // -1: n
+        .{ .key = .{ .negint = 1 }, .value = bytes_v }, // -2: e
+    };
+    try std.testing.expectError(error.WrongType, parseCredentialKey(.{ .map = &entries }));
+    entries[1].value = .{ .negint = 256 }; // alg -257
+    const k = try parseCredentialKey(.{ .map = &entries });
+    try std.testing.expectEqual(@as(?i64, alg_rs256), k.rsa.alg);
+    entries[2].value = .{ .uint = 5 };
+    try std.testing.expectError(error.WrongType, parseCredentialKey(.{ .map = &entries }));
+    entries[2].value = bytes_v;
+    entries[3].value = .{ .uint = 5 };
+    try std.testing.expectError(error.WrongType, parseCredentialKey(.{ .map = &entries }));
+}
+
+test "parseAuthenticatorData: a credential id cut short by one octet is Truncated, not read past" {
+    // 37-octet header, AAGUID, credentialIdLength = 5, then only 4 id octets.
+    var raw = @as([59]u8, @splat(0));
+    raw[32] = 0x41; // UP | AT
+    raw[54] = 5;
+    try std.testing.expectError(error.Truncated, parseAuthenticatorData(std.testing.allocator, &raw));
+}

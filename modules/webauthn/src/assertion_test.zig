@@ -470,3 +470,59 @@ test "verifyAssertion: ES384 credential, built assertion accepted; tampered auth
     bad_auth[36] = 8; // signCount changed after signing
     try testing.expectError(error.BadSignature, webauthn.verifyAssertion(a, &bad_auth, cdj, sig, key, opts));
 }
+
+// ── whole-module mutation run: the result fields and a key without an alg ──
+
+/// A self-made ES256 assertion over a chosen authenticatorData flags byte and
+/// signCount; the W3C corpus has every signCount at or near zero and no key
+/// without an `alg`, so the result fields and `MissingAlgorithm` were unpinned.
+fn selfSignedAssertion(a: std.mem.Allocator, flags: u8, sign_count: u32) !struct { auth: []u8, cdj: []const u8, sig: []const u8, key: webauthn.CoseKey } {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([Ecdsa.KeyPair.seed_length]u8, @splat(5)));
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+    const auth = try a.alloc(u8, 37);
+    std.crypto.hash.sha2.Sha256.hash(vectors.rp_id, auth[0..32], .{});
+    auth[32] = flags;
+    std.mem.writeInt(u32, auth[33..37], sign_count, .big);
+    const cdj = try std.fmt.allocPrint(a, "{{\"type\":\"webauthn.get\",\"challenge\":\"AQID\",\"origin\":\"{s}\"}}", .{vectors.origin});
+    const signed = try a.alloc(u8, 69);
+    @memcpy(signed[0..37], auth);
+    std.crypto.hash.sha2.Sha256.hash(cdj, signed[37..69], .{});
+    const dbuf = try a.alloc(u8, Ecdsa.Signature.der_encoded_length_max);
+    const sig = (try kp.sign(signed, null)).toDer(dbuf[0..Ecdsa.Signature.der_encoded_length_max]);
+    return .{
+        .auth = auth,
+        .cdj = cdj,
+        .sig = sig,
+        .key = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = try a.dupe(u8, pub_sec1[1..33]), .y = try a.dupe(u8, pub_sec1[33..65]) } },
+    };
+}
+
+test "verifyAssertion: signCount and the UV flag are reported as the authenticator sent them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const opts: webauthn.AssertionOptions = .{ .rp_id = vectors.rp_id, .expected_challenge = &.{ 1, 2, 3 }, .expected_origin = vectors.origin };
+
+    const uv = try selfSignedAssertion(a, 0x05, 0x01020304); // UP | UV
+    const r1 = try webauthn.verifyAssertion(a, uv.auth, uv.cdj, uv.sig, uv.key, opts);
+    try testing.expectEqual(@as(u32, 0x01020304), r1.sign_count);
+    try testing.expect(r1.user_present);
+    try testing.expect(r1.user_verified);
+
+    const up = try selfSignedAssertion(a, 0x01, 9); // UP only, UV not required
+    const r2 = try webauthn.verifyAssertion(a, up.auth, up.cdj, up.sig, up.key, opts);
+    try testing.expectEqual(@as(u32, 9), r2.sign_count);
+    try testing.expect(r2.user_present);
+    try testing.expect(!r2.user_verified);
+}
+
+test "verifyAssertion: a credential key without an alg is MissingAlgorithm, not a guess" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const opts: webauthn.AssertionOptions = .{ .rp_id = vectors.rp_id, .expected_challenge = &.{ 1, 2, 3 }, .expected_origin = vectors.origin };
+    var s = try selfSignedAssertion(a, 0x01, 1);
+    s.key.ec2.alg = null;
+    try testing.expectError(error.MissingAlgorithm, webauthn.verifyAssertion(a, s.auth, s.cdj, s.sig, s.key, opts));
+}
