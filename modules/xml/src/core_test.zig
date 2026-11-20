@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests for the 2026-10-04 additions: non-UTF-8 input, internal DTD
+//! Tests for the additions: non-UTF-8 input, internal DTD
 //! entities (opt-in) and the writer.
 //!
 //! The oracle is libxml2 (through lxml), driven as a black box by
@@ -310,7 +310,7 @@ test "writer: a deep tree is written without recursion" {
     try testing.expectEqual(@as(usize, 38 + (depth - 1) * 7 + 4), out.len);
 }
 
-// ── tests asked for by the 2026-10-04 mutation run ─────────────────────────
+// ── tests asked for by the mutation run ─────────────────────────
 
 test "encodings: US-ASCII refuses any byte >= 0x80, even one that is valid UTF-8" {
     // US-ASCII is 7-bit: "é" as UTF-8 (C3 A9) is two bytes outside it.

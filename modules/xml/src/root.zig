@@ -376,7 +376,7 @@ pub const Document = struct {
     /// trusting the result — see `xmldsig`'s own `resolveReference`, which
     /// does exactly that and does not rely on this function for it.
     ///
-    /// Takes an allocator (F5-zbytek, audit A1/xml.md): this walk used to
+    /// Takes an allocator (F5-zbytek, audit A1 audit): this walk used to
     /// recurse on the machine stack, one frame per nesting level, and
     /// SIGSEGV'd well inside `Options.max_depth`'s range (same defect class as
     /// `textContent`, fixed earlier as F5). It now walks an explicit heap
@@ -825,7 +825,7 @@ const Parser = struct {
         // nothing at all, leaving the ordinary parseMarkup -> parsePi path to
         // pick it up. XML 1.0 §7 reserves the target name "xml" (any ASCII
         // case) EXACTLY, not every name that merely starts with those three
-        // letters -- libxml2 and expat both agree (audit A1/xml.md F7). The
+        // letters -- libxml2 and expat both agree (audit A1 audit F7). The
         // degenerate exact-target case ("<?xml?>", "<?xml ?>" with no
         // VersionInfo) still ends up rejected: parsePi's own
         // `asciiEqualIgnoreCase(target, "xml")` check catches it once the
@@ -981,7 +981,7 @@ const Parser = struct {
         // `[ ... ]` -- a `>` inside a quoted SYSTEM/PUBLIC literal in the
         // EXTERNAL part (e.g. `SYSTEM "a>b"`) used to end the skip early,
         // same class of bug as the internal-subset one below (audit
-        // A1/xml.md F10). Once `quote` is set here we can only be looking at
+        // A1 audit F10). Once `quote` is set here we can only be looking at
         // that literal's own bytes, so `[`/`>`/comments inside it are never
         // misread as document structure.
         var quote: ?u8 = null;
@@ -1658,11 +1658,11 @@ const Parser = struct {
                 // was already checked as well-formed UTF-8 as a WHOLE (see
                 // `parseCounted`'s `utf8ValidateSlice`), but that is a single
                 // point of enforcement this function used to depend on
-                // entirely without any decode of its own (audit A1/xml.md F9
+                // entirely without any decode of its own (audit A1 audit F9
                 // sub-finding M16) -- and, independently of well-formedness,
                 // a validly-encoded non-ASCII codepoint still has to fall
                 // inside the real NameStartChar ranges, not just be "some
-                // byte >= 0x80" (audit A1/xml.md F4).
+                // byte >= 0x80" (audit A1 audit F4).
                 const len = std.unicode.utf8ByteSequenceLength(c0) catch return error.InvalidName;
                 if (self.i + len > self.src.len) return error.InvalidName;
                 const cp = std.unicode.utf8Decode(self.src[self.i .. self.i + len]) catch return error.InvalidName;
@@ -1735,7 +1735,7 @@ const Parser = struct {
     /// "\r\n" and every remaining literal "\r" in the entity were replaced by
     /// a single "\n", BEFORE any other processing. `parseText`/`parseAttrValue`
     /// already normalize inline as they scan; comment and PI bodies used to
-    /// carry a raw "\r" straight through (audit A1/xml.md F3) -- reachable
+    /// carry a raw "\r" straight through (audit A1 audit F3) -- reachable
     /// downstream through xmldsig's inclusive-with-comments C14N, which reads
     /// straight from these fields and so produced a canonical form one byte
     /// off from libxml2 for any document with a CR inside a comment or PI.
@@ -1795,7 +1795,7 @@ fn isWs(c: u8) bool {
 ///   [#x10000-#xEFFFF]
 /// Takes a decoded codepoint, not a raw byte -- see `parseNameRaw`, which
 /// used to accept ANY byte >= 0x80 here without decoding at all (audit
-/// A1/xml.md F4, F9 sub-finding M16).
+/// A1 audit F4, F9 sub-finding M16).
 pub fn isNameStartChar(cp: u32) bool {
     return switch (cp) {
         ':', 'A'...'Z', '_', 'a'...'z' => true,
@@ -2146,7 +2146,7 @@ test "not-wf: end tag matching local name but not prefix is still a mismatch (F9
     // XML §3 EndTag matches the STag by the full (possibly-prefixed) name,
     // never by local name alone -- `parseEndTag` compares both `.prefix` and
     // `.local`. A mutation limiting that comparison to `.local` survived
-    // audit A1/xml.md's mutation sweep untested (F9 M27); this pins it.
+    // audit A1 audit's mutation sweep untested (F9 M27); this pins it.
     try testing.expectError(
         error.MismatchedTag,
         parse(testing.allocator, "<p:a xmlns:p=\"urn:p\"></a>", .{}),
@@ -2171,7 +2171,7 @@ test "not-wf: duplicate attribute" {
 
 test "not-wf: literal ']]>' in character data is forbidden (XML sec2.4, F9 M15)" {
     // `parseText`'s guard against a bare "]]>" outside a CDATA section
-    // survived audit A1/xml.md's mutation sweep untested (F9 M15); this pins
+    // survived audit A1 audit's mutation sweep untested (F9 M15); this pins
     // it, at the start of the text run and after other content.
     try testing.expectError(error.MalformedCData, parse(testing.allocator, "<a>]]></a>", .{}));
     try testing.expectError(error.MalformedCData, parse(testing.allocator, "<a>x]]>y</a>", .{}));
@@ -2182,7 +2182,7 @@ test "not-wf: literal ']]>' in character data is forbidden (XML sec2.4, F9 M15)"
 }
 
 test "not-wf: a Name longer than max_name_len is rejected at the boundary (F9 M19)" {
-    // `parseNameRaw`'s length guard survived audit A1/xml.md's mutation sweep
+    // `parseNameRaw`'s length guard survived audit A1 audit's mutation sweep
     // untested (F9 M19, "max_name_len doubled and no test noticed"). Pin
     // both sides of the boundary, not just "some long name fails".
     const gpa = testing.allocator;
@@ -2210,7 +2210,7 @@ test "not-wf: a Name longer than max_name_len is rejected at the boundary (F9 M1
 
 test "wf: a reserved PI target is reserved in every ASCII case, not just lowercase (F9 M24)" {
     // `parsePi` compares the target with `asciiEqualIgnoreCase(target, "xml")`,
-    // not a case-sensitive `eql` -- audit A1/xml.md's F9 filed this as M24, a
+    // not a case-sensitive `eql` -- audit A1 audit's F9 filed this as M24, a
     // surviving mutation ("`<?XML ?>` would pass"), but the case-insensitive
     // compare was already there in the module's first commit (c4dafb09); the
     // gap was in test coverage, not in the parser. Pin every case combination
@@ -2234,7 +2234,7 @@ test "wf: a reserved PI target is reserved in every ASCII case, not just lowerca
 
 test "wf: an element may carry more than one distinct ID-typed attribute (F9 M03)" {
     // `registerIds` loops over every attribute and registers each ID-typed
-    // one it finds -- it does not stop after the first. Audit A1/xml.md's F9
+    // one it finds -- it does not stop after the first. Audit A1 audit's F9
     // filed a surviving mutation (M03, "register only the first ID attribute
     // on an element") as untested; this pins that BOTH `xml:id` and a
     // configured `id_attr_names` entry on the SAME element resolve
@@ -2405,7 +2405,7 @@ test "not-wf: line-ending normalization (XML 2.11) applies inside comments and P
     // values. `parseText`/`parseAttrValue` already did this; comment and PI
     // content did not, so xmldsig's inclusive-with-comments C14N produced a
     // canonical form one byte off from libxml2/expat for any document with a
-    // raw CR inside a comment or PI (audit A1/xml.md F3).
+    // raw CR inside a comment or PI (audit A1 audit F3).
     var doc = try parse(testing.allocator, "<a><!--x\r\ny--><?t x\r\ny?></a>", .{});
     defer doc.deinit();
     const kids = doc.root.children;
@@ -2426,7 +2426,7 @@ test "not-wf: line-ending normalization (XML 2.11) applies inside comments and P
 
 test "not-wf: line-ending normalization (XML 2.11) in character data" {
     // The test above pins the comment and PI paths F3 added; this pins the
-    // original one in `parseText`, which nothing held (audit A1/xml.md F11:
+    // original one in `parseText`, which nothing held (audit A1 audit F11:
     // deleting it left the whole suite green).
     var doc = try parse(testing.allocator, "<a>x\r\ny\rz</a>", .{});
     defer doc.deinit();
@@ -2434,7 +2434,7 @@ test "not-wf: line-ending normalization (XML 2.11) in character data" {
 }
 
 test "line-ending normalization (XML 2.11) inside CDATA sections, as libxml2 does" {
-    // Kept the CR until 2026-10-24 (an `OURS` leniency in gen_wf_vectors.py);
+    // Kept the CR earlier (an `OURS` leniency in gen_wf_vectors.py);
     // C14N then digested a different infoset than libxml2-based verifiers.
     var doc = try parse(testing.allocator, "<a><![CDATA[a\rb\r\nc]]><![CDATA[\r]]></a>", .{});
     defer doc.deinit();
@@ -2446,10 +2446,10 @@ test "wf/not-wf: Name characters follow the actual XML NameStartChar/NameChar gr
     // `isNameStartByte` used to accept ANY byte >= 0x80 as a name-start byte
     // without decoding UTF-8 or checking it against the real Unicode
     // NameStartChar production -- so this parser accepted four measured
-    // shapes that both libxml2 and Python's expat reject (audit A1/xml.md
+    // shapes that both libxml2 and Python's expat reject (audit A1 audit
     // F4), and, independently, never validated that a non-ASCII byte
     // sequence inside a name was even well-formed UTF-8 in the first place
-    // (audit A1/xml.md F9 sub-finding M16) -- both close via the same
+    // (audit A1 audit F9 sub-finding M16) -- both close via the same
     // decode-based rewrite of parseNameRaw.
     //
     // U+00B7 MIDDLE DOT is NameChar but never NameStartChar.
@@ -2486,7 +2486,7 @@ test "not-wf: a PI target starting with 'xml' is treated identically at byte 0 a
     // "xml-stylesheet" or "xmlfoo". `parsePi` elsewhere only reserves the
     // EXACT target "xml" (any ASCII case), so the same construct one byte
     // later in the same document was accepted. libxml2 and expat agree with
-    // the permissive reading (audit A1/xml.md F7): only the exact name
+    // the permissive reading (audit A1 audit F7): only the exact name
     // "xml" is reserved, not every name that merely starts with it.
     var byte0 = try parse(testing.allocator, "<?xml-stylesheet href=\"a.xsl\"?><a/>", .{});
     defer byte0.deinit();
@@ -2506,7 +2506,7 @@ test "doctype=.ignore: quote state is tracked outside the internal subset too" {
     // literal in the EXTERNAL part ended the skip early and the rest of the
     // declaration was mis-parsed as document content (typically
     // TrailingContent) instead of being skipped whole, as `.ignore`
-    // promises (audit A1/xml.md F10). libxml2/expat both skip past it.
+    // promises (audit A1 audit F10). libxml2/expat both skip past it.
     const sys_quote = "<!DOCTYPE r SYSTEM \"a>b\"><r/>";
     var doc = try parse(testing.allocator, sys_quote, .{ .doctype = .ignore });
     defer doc.deinit();
@@ -2897,7 +2897,7 @@ test "hardening: Document.findByAttr does not recurse on the machine stack (F5-z
     // an explicit heap stack. `xmldsig`'s own `c14n.zig` test raises
     // `max_depth` to 4008 with a comment claiming it is "safe for `xml`" --
     // true for `parse` itself, and now finally true for this read API too
-    // (audit A1/xml.md F5-zbytek). Depth picked two orders of magnitude past
+    // (audit A1 audit F5-zbytek). Depth picked two orders of magnitude past
     // the default `max_depth` (256), same rationale as the textContent guard
     // above: cheap enough to run on every `modtest xml`, well past where the
     // old recursive body crashed.
@@ -3104,7 +3104,7 @@ test "corpus: every seed reaches the parser unmangled, and the elements built ar
     }
     try testing.expectEqual(parse_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 0), mangled);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds arrived
+    // Measured: with the collapsing draw, 0 of 16 seeds arrived
     // non-empty, 0 were accepted and 0 elements were built. After: 16 / 7 / 12,
     // and `mangled` measured 0 — the biasing loop is confirmed inert on a replay.
     try testing.expectEqual(@as(usize, 7), accepted);
