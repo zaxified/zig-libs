@@ -14,13 +14,11 @@
 //! zig build interop-poseidon                # re-run the peer, diff, no rewrite
 //! ```
 //!
-//! Until 2026-09-06 that comparison ran here, spawning `python3` from inside
-//! `zig build test-poseidon` and skipping loudly without it. A skip is not an
-//! assertion: on every host without sympy — CI included, where the peer install
-//! is `continue-on-error` — the four algorithms had no oracle at all, while
-//! every consumer of the library still carried an embedded 285-line Python
-//! driver. Splitting it puts the anchor's *taking* in `tools/` and its *value*
-//! here, in the lane that runs everywhere.
+//! A skip is not an assertion: on every host without sympy — CI included, where
+//! the peer install is `continue-on-error` — the four algorithms had no oracle
+//! at all, while every consumer of the library still carried an embedded
+//! 285-line Python driver. Splitting it puts the anchor's *taking* in `tools/`
+//! and its *value* here, in the lane that runs everywhere.
 //!
 //! ## What this is worth, stated up front
 //!

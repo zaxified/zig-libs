@@ -167,7 +167,7 @@ const inj_seeds = [_][]const u8{
 };
 
 test "corpus: the injectivity seeds drive slot and delta, and the counts are pinned" {
-    // Measured 2026-09-08. ⛔ Not "the property held" — that was already true
+    // Measured. ⛔ Not "the property held" — that was already true
     // over the single all-zero input and said nothing. These three numbers are
     // the ones the collapsed input could not move: distinct slots perturbed
     // (it was 1), seeds whose DRAWN delta was already non-zero so the `isZero`
