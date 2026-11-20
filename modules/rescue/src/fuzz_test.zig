@@ -133,7 +133,7 @@ const inj_seeds = [_][]const u8{
 };
 
 test "corpus: the injectivity seeds drive slot and delta, and the counts are pinned" {
-    // Measured 2026-09-08. ⛔ Not "the property held" — that was already true
+    // Measured. ⛔ Not "the property held" — that was already true
     // over the single all-zero input and said nothing at all. These are the
     // three numbers the collapsed input could not move: distinct slots
     // perturbed (it was 1 of 12), seeds whose DRAWN delta was already non-zero
@@ -269,7 +269,7 @@ test "corpus: every framing seed reaches the sponge, and the elements absorbed a
             hashed += 1;
         } else |_| empty_refusals += 1;
     }
-    // Measured 2026-09-07. Before the draw was fixed: 1 round, 0 non-empty,
+    // Measured. Before the draw was fixed: 1 round, 0 non-empty,
     // 0 elements absorbed, 1 empty refusal — the whole target.
     try std.testing.expectEqual(framing_seeds.len - 1, nonempty); // the deliberate empty seed
     try std.testing.expectEqual(@as(usize, 1 + 2 + 2 + 7 + 8 + 9 + 16 + 24 + 1), elements);

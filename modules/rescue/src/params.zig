@@ -6,7 +6,7 @@
 //!
 //! It reimplements the algorithm; it does not port the code. That wording
 //! matters: the sage reference is Apache-2.0 with no MIT alternative, and
-//! "line-by-line port" — which this comment said until 2026-08-14 — is the
+//! "line-by-line port" — which this comment said until — is the
 //! phrasing that earns a module a third-party attribution file in this repo.
 //! Nothing here is copied and no number is carried across, which the next
 //! paragraph is the argument for.
