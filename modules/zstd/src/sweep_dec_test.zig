@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Regression tests of the no-panic sweep over the decoder side (SPEC.md,
-//! Backlog; wave GL, findings ZD-*). Each test names its finding and fails
+//! Regression tests of the no-panic sweep over the decoder side (findings ZD-*). Each test names its finding and fails
 //! (panics) without the fix it belongs to.
 
 const std = @import("std");

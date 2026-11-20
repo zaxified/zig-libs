@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `FrameWriter`: a `std.Io.Writer` that compresses into a stream of
-//! one-shot frames (SPEC.md backlog Z1a, the interim before Z1's streaming).
+//! one-shot frames (for callers that do not need `StreamWriter`'s libzstd-identical streaming).
 //!
 //! Input collects in the caller's buffer. Each time the buffer fills, and at
 //! every `flush` and `finish` with something in it, its contents become one
@@ -277,7 +277,7 @@ test "a failing output is WriteFailed with no cause of our own" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

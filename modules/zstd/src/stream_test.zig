@@ -545,7 +545,7 @@ test "stable output: one byte less than the least room libzstd succeeds in is re
 test "stable output: every room below the least libzstd succeeds in is refused (block splitter)" {
     // with the post-block splitter a block goes out as partitions, each
     // checked for its header's room where it lands; libzstd refuses each of
-    // these 32 rooms (zstream, 2026-09-26)
+    // these 32 rooms (zstream)
     const gpa = std.testing.allocator;
     const c = findCase("mix-300000-9");
     const src = try gpa.alloc(u8, c.len);
@@ -562,7 +562,7 @@ test "stable output: where libzstd would write past the end, the block is refuse
     // libzstd's sub-blocks (targetCBlockSize) copy the Huffman table
     // description and the FSE tables unchecked: with this little room
     // AddressSanitizer reports libzstd writing past the output buffer
-    // (zstream built with -fsanitize=address, 2026-09-26). This port
+    // (zstream built with -fsanitize=address). This port
     // stops there, and the raw block does not fit either.
     const gpa = std.testing.allocator;
     for ([_][2][]const u8{
@@ -695,7 +695,7 @@ test "setLevel refuses a level above the highest and keeps the one it has" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

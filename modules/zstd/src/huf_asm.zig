@@ -8,8 +8,7 @@
 //! the table and three scratch registers live across 20 symbol decodes, and
 //! reads a cell's bit count with a load of its own so that the next lookup
 //! of a stream waits for one shift and one load. LLVM spills that loop to the
-//! stack and decodes x-ray's literals in ~1.2× libzstd's cycles (measured
-//! 2026-10-09; two Zig rewrites did not close it).
+//! stack and decodes x-ray's literals in ~1.2× libzstd's cycles (measured; two Zig rewrites did not close it).
 //!
 //! Only the loop body is here: `huf_dec.zig` computes the iteration limit
 //! and checks the cursors exactly as before, then hands over pointers, and

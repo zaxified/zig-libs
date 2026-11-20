@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Dictionary loading tests found by open-mutant batch 2 (2026-11-20): what
+//! Dictionary loading tests found by open-mutant batch 2: what
 //! `cdict.loadDictionaryContent` keeps of a dictionary too large for the
 //! tables or the index range. Each dictionary is random bytes `P` followed
 //! by a long run of zeros: every position of the run hashes to one slot, so

@@ -748,13 +748,12 @@ const decode_ahead = 8;
 /// `prefetch_offset_bits` extra bits or more: offsets of 4 MB and up, past
 /// the caches. libzstd's rule (`ZSTD_getOffsetInfo`): more than 22 bits, 7
 /// 256ths, and only past 16 MB of history -- which never fires for a level
-/// 19 window of 8 MB. Measured 2026-10-07 on the Silesia corpus (SPEC.md,
-/// Z34): level 19 0.94x the plain loop's cycles (webster 0.75, mr 0.79,
-/// dickens 0.87), level 3 unchanged; prefetching every block costs 18 % at
-/// level 3. The predefined table says nothing about the block's offsets
-/// (it lists codes to 28) and never selects it. Re-measured 2026-10-27 over the assembly
-/// sequence loop against "never" and shares 12--32: still the best
-/// (SPEC.md, 2026-10-27).
+/// 19 window of 8 MB. Measured on the Silesia corpus: level 19 0.94x the
+/// plain loop's cycles (webster 0.75, mr 0.79, dickens 0.87), level 3
+/// unchanged; prefetching every block costs 18 % at level 3. The predefined
+/// table says nothing about the block's offsets (it lists codes to 28) and
+/// never selects it. Re-measured over the assembly sequence loop against
+/// "never" and shares 12--32: this share is still the best.
 const prefetch_offset_bits = 22;
 const prefetch_min_share = 7;
 

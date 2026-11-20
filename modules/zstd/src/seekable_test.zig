@@ -359,7 +359,7 @@ test "frames sharing their bytes: refused in memory, read through another source
     // Frames 0 and 1 have a compressed size of 0, so all three start at the
     // same frame and one read decodes it three times: more input than the
     // buffer holds. libzstd's in-memory reader refuses that (seekableIO);
-    // through a file it reads (tools/zseekable.c `d`, 2026-09-28).
+    // through a file it reads (tools/zseekable.c `d`).
     var raw: [1000]u8 = undefined;
     var prng: std.Random.DefaultPrng = .init(1);
     for (&raw) |*b| b.* = 'a' + prng.random().uintLessThan(u8, 26);
@@ -396,7 +396,7 @@ test "frames sharing their bytes: refused in memory, read through another source
 test "a seek table whose frame sizes disagree with the frames is refused, never looped on" {
     // Not libzstd's behaviour: its ZSTD_seekable_decompress restarts a frame
     // that ended before the offset its table promised, forever (found by
-    // seglog's fuzz driver, 2026-09-27). A frame that decodes to more than
+    // seglog's fuzz driver). A frame that decodes to more than
     // its table size would hand its extra bytes out as the next frame's.
     const case = findCase("words-16385");
     const src = try gpa.alloc(u8, case.len);
@@ -432,7 +432,7 @@ test "a seek table whose frame sizes disagree with the frames is refused, never 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

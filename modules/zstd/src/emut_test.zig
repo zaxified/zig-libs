@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Encoder tests found by whole-module mutation (2026-11-19, phase 1): the
+//! Encoder tests found by whole-module mutation (phase 1): the
 //! sequence count in every header form, built through the caller's-sequences
 //! API so that the count is exact. Expectations: RFC 8878 section 3.1.1.3.2.1
 //! and libzstd's `ZSTD_entropyCompressSeqStore` (which `frame.zig` ports).

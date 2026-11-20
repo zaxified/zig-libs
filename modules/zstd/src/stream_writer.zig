@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `StreamWriter`: a `std.Io.Writer` over `Stream` (SPEC.md backlog Z1) --
+//! `StreamWriter`: a `std.Io.Writer` over `Stream` --
 //! one frame for everything written, the bytes libzstd's
 //! `ZSTD_compressStream2` gives for the same calls: the written bytes as
 //! `ZSTD_e_continue`, `flush` as `ZSTD_e_flush`, `finish` as `ZSTD_e_end`.
@@ -471,7 +471,7 @@ test "a warm writer allocates nothing per frame; a static one never" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

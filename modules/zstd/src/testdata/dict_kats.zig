@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Generated for Z2c (2026-09-24) by tools/gen-dict-testdata.sh from libzstd
+// Generated for Z2c by tools/gen-dict-testdata.sh from libzstd
 // 1.5.7 (f8745da6ff1ad1e7bab384bd1f9d742439278e99): a raw-content dictionary,
 // a zstd-format one trained by ZDICT_trainFromBuffer (two, with different
 // dictionary IDs, for the mismatch and multi-dictionary cases), and frames
@@ -23,7 +23,7 @@ pub const frame_raw_l3: []const u8 = &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x60, 0x22, 0x0
 /// ZSTD_compress_usingDict(in2_content, raw_dict, level=5).
 pub const frame_raw_l5: []const u8 = &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x34, 0x5d, 0x01, 0x00, 0xf0, 0x75, 0x6e, 0x72, 0x65, 0x6c, 0x6e, 0x6f, 0x74, 0x20, 0x69, 0x6e, 0x69, 0x6f, 0x6e, 0x61, 0x72, 0x79, 0x20, 0x61, 0x74, 0x20, 0x61, 0x6c, 0x6c, 0x20, 0x31, 0x32, 0x33, 0x34, 0x35, 0x04, 0x00, 0x4d, 0x03, 0x34, 0xe1, 0x56, 0xcd, 0x02, 0x28, 0x50, 0x5a };
 
-// Added for Z2c's multi-dictionary / mutation-sweep follow-up (2026-09-24):
+// Added for Z2c's multi-dictionary / mutation-sweep follow-up:
 // same recipe (tools/gen-dict-testdata.sh), see the entries below for what
 // each one anchors.
 

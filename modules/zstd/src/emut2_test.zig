@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Encoder tests found by whole-module mutation (2026-11-19, group 2:
+//! Encoder tests found by whole-module mutation (group 2:
 //! literals, sequences, FSE, Huffman, superblocks): corners the byte-parity
 //! goldens do not reach. Expectations: libzstd 1.5.7's
 //! `ZSTD_compressLiterals` (the one-byte `cLitSize` that is not a single
@@ -8,7 +8,7 @@
 //! RFC 8878 section 3.1.1.3.1 (literals section header sizes), and
 //! libzstd's own frames for superblocks of blocks without a sequence
 //! (`testdata/superblock_goldens.zig`, `tools/gen-superblock-goldens.sh`;
-//! follow-up of 2026-11-19).
+//! follow-up of).
 
 const std = @import("std");
 const zstd = @import("root.zig");

@@ -532,7 +532,7 @@ inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u
     // ZSTD_VecMask_next(matches)`, depend on that mapping on every target.
     //
     // Zig 0.17: that is what `@bitCast` gives on every target, big-endian
-    // included (re-measured 2026-10-18: a comptime probe compiled for
+    // included (re-measured: a comptime probe compiled for
     // `mips-linux-musl` and `x86_64-linux` both put lane 0 in bit 0). On 0.16 the
     // big-endian result was bit-reversed end to end and a `@bitReverse` undid
     // it; that fix-up must go, or it would now reverse a correct mask.

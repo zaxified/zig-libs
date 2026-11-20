@@ -307,7 +307,7 @@ test "damaged frames give libzstd's verdict (mutation-sweep fixtures)" {
 /// Frames no encoder writes, built byte by byte (Z2 *Anchoring*, the
 /// decoder's three uncovered decisions): each is valid by the format and
 /// libzstd 1.5.7 decodes it (one-shot, and streamed whole and byte by byte
-/// through `tools/zdec.c`, 2026-09-26). The frames are generated here; the
+/// through `tools/zdec.c`). The frames are generated here; the
 /// FNV-1a of each pins the bytes libzstd judged.
 const Crafted = struct {
     frame: []u8,
@@ -665,7 +665,7 @@ test "the assembly sequence loop decodes as the Zig one, valid and damaged frame
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

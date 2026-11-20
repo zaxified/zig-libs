@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Decoder boundary tests found by whole-module mutation (2026-11-18): the
+//! Decoder boundary tests found by whole-module mutation: the
 //! literals section header of a compressed block at every size form and at
 //! the exact edges of the block, built byte by byte. The expectations follow
 //! RFC 8878 section 3.1.1.3.1 and libzstd's `ZSTD_decodeLiteralsBlock`

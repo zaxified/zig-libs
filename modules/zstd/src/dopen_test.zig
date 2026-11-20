@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Decoder tests for the mutants wave 6 left open (2026-11-18, second pass):
+//! Decoder tests for the mutants wave 6 left open (second pass):
 //! the piecewise decoder's state machine, `begin`, the history cursors, raw
 //! dictionaries, the streaming decoder's buffers and resets, the Huffman
 //! tables (every table log, the X2 cell layout) and the four-stream fast

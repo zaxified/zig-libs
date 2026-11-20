@@ -5,7 +5,7 @@
 //! `FSE_normalizeM2` included), `fse.writeNCount` at every room up to the
 //! least libzstd accepts, `huf.optimalTableLog` with and without the
 //! optimal-depth search, `huf.buildCTable` and `huf.writeCTable` likewise.
-//! Found by the encoder's mutation audit (2026-11-19, group 2): the
+//! Found by the encoder's mutation audit (group 2): the
 //! byte-parity goldens never reach these branches with the distributions
 //! real inputs produce.
 
