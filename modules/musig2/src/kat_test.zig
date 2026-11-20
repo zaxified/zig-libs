@@ -276,7 +276,7 @@ test "KAT sign_verify: sign_error_test_cases (5) — secnonce is invalid (nonce 
 test "sign consumes the caller's secnonce: zeroed after a success AND after a failure, a second sign is InvalidSecNonce" {
     // BIP327 `Sign` overwrites secnonce[0:64] and libsecp256k1's
     // `musig_partial_sign` clears it on entry: a SecNonce signs once. Until
-    // the 2026-10-08 audit `sign` took it by value, so the caller's copy
+    // the audit `sign` took it by value, so the caller's copy
     // survived every call and a retry with a different message signed again
     // over the same nonce -- the two-equations key leak.
     const io = std.testing.io;
@@ -351,7 +351,7 @@ test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMis
     try std.testing.expectError(error.SecretKeyMismatch, musig2.sign(&ng.secnonce, &sk_b, ctx));
 }
 
-// Mutation run 2026-10-05: matching the session's pubkey list without the
+// Mutation run: matching the session's pubkey list without the
 // parity prefix left every test green. BIP327 Sign fails unless
 // cbytes(d'·G) is IN the list byte for byte; 02‖x and 03‖x are different
 // keys (P and −P), so a list holding only the other parity must refuse.
@@ -376,7 +376,7 @@ test "sign refuses when the session lists the signer's x with the other parity" 
     try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&ng.secnonce, &sk, ctx));
 }
 
-// Mutation run 2026-10-05: reducing a secnonce scalar mod n instead of
+// Mutation run: reducing a secnonce scalar mod n instead of
 // refusing it left every test green (the official vector only has k1 = 0).
 // BIP327 Sign: fail if k1' or k2' is not in [1, n − 1]. n + 1 would reduce
 // to the valid-looking 1; n would reduce to 0.
@@ -394,7 +394,7 @@ test "SecNonce refuses k1 or k2 of n or n + 1, not only 0" {
     }
 }
 
-// Mutation run 2026-10-05: recognising the infinity encoding by the 32 x
+// Mutation run: recognising the infinity encoding by the 32 x
 // bytes alone left every test green. BIP327 cpoint_ext: infinity is
 // bytes(33, 0) exactly; 02‖0^32 is cpoint's input, and x = 0 is on no
 // secp256k1 point (7 is not a square mod p), so the aggnonce is invalid.
@@ -409,7 +409,7 @@ test "AggNonce: infinity is 33 zero bytes exactly; 02/03 followed by 32 zeros is
     }
 }
 
-// Mutation run 2026-10-05: dropping the `u > 0` guards left every test green.
+// Mutation run: dropping the `u > 0` guards left every test green.
 // BIP327 KeyAgg, NonceAgg and PartialSigAgg all take 0 < u; without the
 // guard keyAgg reports PointAtInfinity, nonceAgg returns an all-zero
 // aggnonce and partialSigAgg returns a "signature" s = e·g·tacc.

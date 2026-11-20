@@ -7,18 +7,16 @@
 //! timing/branch side channel could turn into a nonce-reuse-shaped key
 //! leak") and the secret-key negation `d = g·gacc·d'` ("`d'` is SECRET;
 //! `Scalar.mul` is constant-time", `root.zig`'s `sign` doc comment, step 4).
-//! Run through `zig build ctgrind -Dctgrind-module=musig2
-//! -Dctgrind-valgrind=… -Doptimize=ReleaseFast` plus `valgrind
-//! --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no per-module
-//! TARGETS/MODES/PATTERN/LABEL entry for `musig2` yet; the suggested lines
-//! are at the bottom of this comment for the coordinator to paste in.
+//! Run through `../../../scripts/checks/ctgrind.sh musig2` (target `sign`,
+//! ReleaseFast); the pinned counts are in
+//! `scripts/checks/ctgrind-expected.tsv`.
 //!
 //! NOT wired into `zig build test-musig2` — memcheck's context count is
 //! valgrind's own output, not something a Zig test can assert on. `zig
 //! build check-ctgrind` compiles it so it cannot rot into an unbuildable
 //! recipe.
 //!
-//! ## Measured 2026-09-09 (ReleaseFast, `-fvalgrind`, `--num-callers=20`)
+//! ## Measured (ReleaseFast, `-fvalgrind`, `--num-callers=20`)
 //!
 //! `sign yes` (tainted): 103 contexts. `sign no` (untainted control): 0.
 //! `-fvalgrind=false` trap (tainted, no `-fvalgrind`): 0. Every context is
@@ -190,15 +188,6 @@
 //! reaching it always produces contexts of its own. A non-zero total next
 //! to a small, itemised in-file count is what makes the itemisation mean
 //! "no branch found" rather than "the harness never ran".
-//!
-//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
-//!
-//! ```
-//! TARGETS[musig2]="sign"
-//! MODES[musig2]="ReleaseFast"
-//! PATTERN[musig2/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
-//! LABEL[musig2/sign]='musig2 sign (d,k1,k2)+bip340+k256+std'
-//! ```
 
 const std = @import("std");
 const builtin = @import("builtin");

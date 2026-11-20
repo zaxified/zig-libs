@@ -887,7 +887,7 @@ pub fn sign(secnonce: *SecNonce, sk: *const bip340.SecretKey, ctx: SessionContex
     return result;
 }
 
-/// Audit 2026-10-08 (HIGH). `sign` had no stack burn: measured with
+/// Audit (HIGH). `sign` had no stack burn: measured with
 /// `stackprobe_test.zig` (ReleaseFast), every partial signature left the
 /// secret key `d'` once and each secret nonce `k1'`/`k2'` four times on the
 /// dead stack, and either nonce next to the published `s` and the public
@@ -950,7 +950,7 @@ noinline fn signBurned(secnonce: *SecNonce, sk_ptr: *const bip340.SecretKey, ctx
 }
 
 /// Stack zeroed below `sign`'s frame after the work returns. The probe printed
-/// 16.3 KB dirtied below a `sign` call (2026-10-08, ReleaseFast), self-verify
+/// 16.3 KB dirtied below a `sign` call (ReleaseFast), self-verify
 /// included; `stackprobe_test.zig` fails on any residue and prints the depth.
 const sign_stack_burn = 32 * 1024;
 
@@ -959,11 +959,11 @@ const sign_stack_burn = 32 * 1024;
 /// Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
