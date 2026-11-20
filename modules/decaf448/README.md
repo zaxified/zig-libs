@@ -15,24 +15,19 @@ Consumers: anything layering a prime-order-group protocol on top of the
 or any construction whose security proof assumes a clean prime-order
 group rather than a cofactor-4 curve.
 
-**Status: COMPLETE.** The group-element type, every mechanical group
-operation, the 56-byte scalar wire-width bridge to `ed448.scalar`, the
-RFC 9496 §5.1 implementation constants (self-checked), and a byte-exact
-KAT harness against the official RFC 9496 Appendix B decaf448 vectors
-are all real. The four irreducible decaf-specific field-math cores —
-`sqrtRatioM1`, `Element.encode`, `Element.decode`, and the inner `MAP`
-primitive behind `oneWayMap` — are implemented and the gate is `true`;
-see [SPEC.md](SPEC.md) for the split and each core's full contract.
+The group-element type, every group operation, the RFC 9496 §5.1 constants, the scalar field and hash-to-group /
+hash-to-scalar are implemented and checked byte-exact against the RFC vectors; see [SPEC.md](SPEC.md) for each
+core's contract.
 
 | File | Contents |
 |---|---|
-| `gate.zig` | `core_implemented` — the single switch gating the four stubs' KAT tests |
+| `gate.zig` | `core_implemented` (`true`) — the switch the KAT tests check |
 | `scalar.zig` | The scalar field mod `l` in decaf448's 56-byte encoding: `add`/`sub`/`negate`/`mul`/`invert`, `reduce`/`fromWide`, `random`, bridged to `ed448.scalar`'s 57-byte arithmetic (same order `l == L`) |
 | `hash.zig` | `expandMessageXof` (RFC 9380, SHAKE256), `hashToElement` (`hash_to_decaf448`), `hashToScalar` (RFC 9497 decaf448-SHAKE256) |
 | `hash_kat_test.zig` | RFC 9380 K.6 and RFC 9497 A.2 (decaf448-SHAKE256) vectors, byte-exact |
 | `element.zig` | `Element` (the group type), the RFC 9496 §5.1 constants, `sqrtRatioM1`, `Element.encode`/`.decode`, `oneWayMap` (all implemented) |
 | `kat_vectors.zig` | Official RFC 9496 Appendix B.1/B.2/B.3 decaf448 test vectors |
-| `kat_test.zig` | Byte-exact KAT assertions against `kat_vectors.zig` through the public API, gated |
+| `kat_test.zig` | Byte-exact KAT assertions against `kat_vectors.zig` through the public API |
 
 ## Import
 
@@ -41,7 +36,7 @@ const decaf448 = @import("decaf448");
 const Element = decaf448.Element;
 ```
 
-## Group operations (real today)
+## Group operations
 
 ```zig
 const g = Element.generator;      // RFC 9496 §5: internally 2*B
@@ -57,7 +52,7 @@ two[0] = 2;
 try std.testing.expect(Element.scalarMul(g, &two).equals(p));
 ```
 
-## Wire codec (real)
+## Wire codec
 
 ```zig
 const bytes = Element.encode(g);        // 56-byte RFC 9496 §5.3.2 encoding
@@ -101,14 +96,15 @@ var out: [64]u8 = undefined;
 try decaf448.hash.expandMessageXof(&out, "message", "MyApp-V1-xof");
 ```
 
-The DST must be 1..255 bytes (`error.DstEmpty` / `error.DstTooLong`; an
-oversize DST is not reduced for you) and `expandMessageXof` produces at most
-65535 bytes (`error.OutputTooLong`). These are the RFC 9497
-`HashToGroup`/`HashToScalar` for the decaf448-SHAKE256 suite when given
+An empty DST is refused (`error.DstEmpty`); one over 255 bytes is reduced as RFC 9380 §5.3.3 requires
+(`hash.reduceOversizeDst`, k = 224); `expandMessageXof` produces at most 65535 bytes (`error.OutputTooLong`).
+These are the RFC 9497 `HashToGroup`/`HashToScalar` for the decaf448-SHAKE256 suite when given
 `"HashToGroup-" || contextString` / `"HashToScalar-" || contextString`.
 
-`decaf448.gate.core_implemented` is `true` — the four field-math cores
-are implemented and every KAT runs.
+## Not provided
+
+The RFC 9497 OPRF itself (the `voprf` module), multi-scalar multiplication and precomputed-base speedups.
+See SPEC.md, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Import graph
 
@@ -120,9 +116,7 @@ decaf448 → ed448 (edwards448 Point + Fp448 field, both already real)
 ## Verify
 
 ```
-zig build test-decaf448                          # Debug
-zig build -Doptimize=ReleaseFast test-decaf448   # ReleaseFast
-zig fmt --check modules/decaf448/
+scripts/modtest decaf448
 ```
 
 All tests pass in both Debug and ReleaseFast — the mechanical
@@ -135,4 +129,4 @@ vectors and RFC 9497 A.2's decaf448-SHAKE256 vectors — see [SPEC.md](SPEC.md).
 Provenance: pure clean-room from RFC 9496 (no third-party source
 ported); `std.crypto.ecc.Ristretto255` consulted as a structural design
 reference only (API shape, one curve family down) — see [SPEC.md](SPEC.md)
-and `NOTICE`'s policy §0 for why that needs no root-`NOTICE` entry.
+and the module's `NOTICE` (which covers only the reproduced RFC vectors).

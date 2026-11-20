@@ -19,15 +19,6 @@
 decaf448, the prime-order group over edwards448; see [README.md](README.md)
 for purpose and API.
 
-**Status: COMPLETE.** Wire codec structs, the mechanical
-group-operation layer, the scalar wire-width bridge, and an airtight
-byte-exact KAT harness against the official RFC 9496 vectors are real.
-The four irreducible field-math cores were `@panic`-stubbed by the
-scaffold pass behind `gate.core_implemented`; a Fable pass then
-implemented ONLY those four and flipped the gate — with zero edits to
-`kat_test.zig`/`kat_vectors.zig`, matching `ed448`'s and `bn254`'s own
-scaffold-then-implement track record. All tests now run and pass.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Re-assessed 2026-10-06 (no new survey) after the scalar field and hash-to-group landed.
@@ -39,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cloudflare/circl](https://github.com/cloudflare/circl) `group` | Go | BSD-3-Clause (LICENSE file; the API reports NOASSERTION) | 1.7k | v1.6.5 (2026-08-05) | `group/` holds `ristretto255.go` and `short.go` only — no decaf448 (listed the directory). |
 | Zig `std.crypto.ecc` | Zig | MIT | — | Zig 0.16.0 | `Ristretto255` only; no decaf448 and no 448 curve. |
 
-**Where we are ahead:** the only decaf448 in Zig or Go, pure Zig, all of RFC 9496 Appendix B byte-exact, hash-to-group and the scalar field anchored to RFC 9380 K.6 and RFC 9497 A.2, a recorded security review (Audit line). **Even** with `ed448-goldilocks` (re-assessed 2026-10-06) on what a protocol needs: group law and codec, a full scalar field (`add`/`sub`/`negate`/`mul`/`invert`/`random`/wide reduction) and `hash_to_decaf448`. **Where we are behind:** no multi-scalar multiplication or precomputed-base speedups, and no oversize-DST (`H2C-OVERSIZE-DST-`) reduction in `expand_message_xof` (→ Backlog); scalars are byte arrays with free functions rather than a `Field`-trait-style type.
+**Where we are ahead:** the only decaf448 in Zig or Go, pure Zig, all of RFC 9496 Appendix B byte-exact, hash-to-group and the scalar field anchored to RFC 9380 K.6 and RFC 9497 A.2, a recorded security review (Audit line). **Even** with `ed448-goldilocks` (re-assessed 2026-10-06) on what a protocol needs: group law and codec, a full scalar field (`add`/`sub`/`negate`/`mul`/`invert`/`random`/wide reduction) and `hash_to_decaf448`. **Where we are behind:** no multi-scalar multiplication or precomputed-base speedups; scalars are byte arrays with free functions rather than a `Field`-trait-style type.
 
 ## Design
 
@@ -61,25 +52,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   needs no `sqrt(-1)`-twist branch at all (RFC 9496 §5.2 vs §4.2 — see
   `element.zig`'s `sqrtRatioM1` doc comment for the exact formula
   difference).
-- **Per NOTICE policy §0, this module needs no root-`NOTICE` entry.**
-  RFC 9496 is a public spec (not copyrightable per the merger doctrine);
+- **Provenance.** RFC 9496 is a public spec (not copyrightable per the merger doctrine);
   `std.crypto.ecc.Ristretto255` was studied for algorithm/API SHAPE, not
   source-ported — the same "design reference documented in SPEC.md, no
   NOTICE entry" precedent `ed448`'s own SPEC.md sets for its
   `std.crypto.ecc.Edwards25519`/`libdecaf` field-representation
-  references.
+  references. The module's own `NOTICE` covers only the reproduced RFC test vectors.
 - **Internal representation: `ed448.ed448.Point`, no extra `t`
   coordinate.** RFC 9496 §2 represents every internal point in
   four-coordinate extended Edwards form `(x, y, z, t)`, `t = x*y/z`. This
   module's `Element` stores only `ed448.ed448.Point`'s three coordinates
   (`x, y, z`) — mechanically sufficient because every group operation
-  this scaffold implements for real (`add`/`sub`/`negate`/`scalarMul`,
-  `identity`/`generator`) delegates straight to `Point`'s already-real
+  (`add`/`sub`/`negate`/`scalarMul`, `identity`/`generator`) delegates straight to `Point`'s already-real
   arithmetic, none of which touches `t`, and `equals` (RFC 9496 §5.3.3)
   needs only `x`/`y` (its `z`-scale-invariance is argued in `element.
-  Element.equals`'s own doc comment). Only the four Fable-core stubs
-  reference `t0`/`z0` together; `encode`'s doc comment spells out where a
-  full implementation must derive `t0 = x0*y0*z0^-1` (one `Fe.invert`)
+  Element.equals`'s own doc comment). Only `encode` and `decode` reference
+  `t0`/`z0` together; `encode` derives `t0 = x0*y0*z0^-1` (one `Fe.invert`)
   from the three stored coordinates.
 - **Scalar width bridge (`scalar.zig`), not a full scalar
   reimplementation.** RFC 9496 §5.4: "the scalars for the decaf448 group
@@ -113,7 +101,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `element.zig` implements `ctAbs` directly (ungated), leaving the ONE
   genuinely new primitive as `sqrtRatioM1`.
 
-## Scalar field and hashing (added 2026-10-06)
+## Scalar field and hashing
 
 - `scalar.zig` now carries the whole scalar field on top of the width
   bridge: `negate`/`sub` (byte borrow chain + `ed448.scalar.add`),
@@ -124,14 +112,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   is composed from `ed448.scalar`'s already-validated `add`/`mul`/`reduceWide`.
 - `hash.zig`: `expandMessageXof` (RFC 9380 §5.3.2, SHAKE256),
   `hashToElement` (`hash_to_decaf448`: 112 bytes → `oneWayMap`) and
-  `hashToScalar` (RFC 9497 §4.2: 64 bytes → `scalar.reduce`). DST must be
-  1..255 bytes, output at most 65535 bytes — typed errors, fuzzed.
+  `hashToScalar` (RFC 9497 §4.2: 64 bytes → `scalar.reduce`). An empty DST is
+  refused (`error.DstEmpty`); a DST over 255 bytes is reduced as RFC 9380 §5.3.3
+  requires, `SHAKE256("H2C-OVERSIZE-DST-" || DST, 56)` with k = 224 (`hash.reduceOversizeDst`,
+  applied by `expandMessageXof`); output is at most 65535 bytes (`error.OutputTooLong`).
+  `error.DstTooLong` stays in `HashError` so an exhaustive switch compiles, but is never returned.
+  The reduction is covered by self-consistency tests only: RFC 9380 has no decaf448 oversize vector.
 
 ## The four Fable cores
 
-All four live in `element.zig` (scaffolded as `@panic("TODO(fable/core):
-...")` stubs, now implemented), each with the exact RFC formula in its
-doc comment:
+All four live in `element.zig` each with the exact RFC formula in its doc comment:
 
 1. **`sqrtRatioM1(u: Fe, v: Fe) SqrtRatioResult`** (RFC 9496 §5.2) — the
    shared field-math primitive every other stub is built on. Returns
@@ -154,7 +144,7 @@ doc comment:
 
 ## KAT harness
 
-`hash_kat_test.zig` (added 2026-10-06) holds RFC 9380 Appendix K.6's ten
+`hash_kat_test.zig` holds RFC 9380 Appendix K.6's ten
 `expand_message_xof(SHAKE256)` vectors and RFC 9497 Appendix A.2's
 decaf448-SHAKE256 vectors, recomputed from the RFC's own recipes:
 `DeriveKeyPair` (→ `hashToScalar`, both modes' `skSm`, VOPRF `pkSm`), and
@@ -192,20 +182,25 @@ are constructed by machinery independent of the stub under test.
 
 ## Verification
 
-- `zig build test-decaf448` (Debug) and `zig build test-decaf448
-  -Doptimize=ReleaseFast`: **all tests pass, no skips, no failures, in
-  both modes**. `zig fmt --check modules/decaf448/` is clean.
-- A repo-hygiene grep for developer-machine home-directory paths and
-  personal identifiers over `modules/decaf448/` is empty.
-- **Mutation run 2026-10-05** (in-place, Debug, 24 mutants over `ctAbs`,
-  `sqrtRatioM1`, `encode`, `decode`'s three refusals and formula, `equals`,
-  `sub`, MAP's reduction and CT selects, `oneWayMap`'s split and the scalar
-  bridge): 24 killed. The first pass left 1: MAP's reduction of an input
-  `>= p` (no Appendix B.3 half reaches it) — a test now pins `2^448 - 1 ->
-  2^224` and `p -> 0`. One mutant that failed to compile was rewritten until
-  it built. None equivalent.
+Run: `scripts/modtest decaf448`. `gate.core_implemented` is `true`; with it `false` the KAT tests skip.
 
-## Out of scope
+- **Byte-exact KATs** (`kat_test.zig`, `hash_kat_test.zig`): RFC 9496 Appendix B (encode of `[0]G..[15]G`,
+  decode round-trip, the 21 invalid encodings, the 7 one-way-map pairs), RFC 9380 K.6 `expand_message_xof` and
+  RFC 9497 A.2 decaf448-SHAKE256 vectors (see *KAT harness*). `[k]G` is built by repeated `Element.add`, so the
+  vectors are constructed independently of `encode`.
+- **Mechanical self-checks:** the RFC 9496 §5.1 constants (`SQRT_MINUS_D^2 == -D`, `SQRT_MINUS_D * INVSQRT_MINUS_D == 1`),
+  `sqrtRatioM1`'s four result branches, MAP's reduction of an input `>= p` (`feFromBytesReduced`), the scalar field
+  against a `u1024` big-integer recomputation and algebraic identities, `reduceOversizeDst` self-consistency.
+- **Fuzz:** the deterministic driver, `DECAF448_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), over
+  `decaf448-decode` (accepted encodings re-encode canonically, a damaged one names another element; at 1/2 of
+  the budget), `decaf448-group` (the group law; 1/8) and `decaf448-hash` (typed errors; 1/4).
+- **ctgrind:** `ctgrind_harness.zig` over `Element.scalarMul`; the row is in `scripts/checks/ctgrind-expected.tsv`
+  (see *Constant-time note*).
+- **Dead-stack probe:** `stackprobe_test.zig` for `Element.scalarMul`, `scalar.invert` and `scalar.random`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+
+## What is deliberately not done
 
 - RFC 9497 OPRF itself (Blind/Evaluate/Finalize, proofs, the client and
   server state) — that protocol belongs in `voprf` (its Backlog names the
@@ -214,13 +209,12 @@ are constructed by machinery independent of the stub under test.
   suite's OPRF-mode vectors end to end only as an anchor.
 - Batch verification / multi-scalar-multiplication speedups — `Element.
   scalarMul` is a plain per-call delegation to `ed448.ed448.Point.mul`'s
-  constant-time 4-bit fixed window (it was a double-and-add until ed448
-  F1; no windowing/precomputation of decaf448's own on top).
+  constant-time 4-bit fixed window (no windowing/precomputation of decaf448's own on top).
 
 ## Constant-time note (measured)
 
 *Scope of the measurement below: `Element.scalarMul` only.* The scalar
-operations added 2026-10-06 are constant-time **by construction, not
+operations beyond `scalarMul` are constant-time **by construction, not
 measured**: `negate` is a fixed 57-byte borrow chain plus `ed448.scalar.add`'s
 mask-select; `invert` is square-and-multiply over the PUBLIC exponent `l - 2`
 (its one branch reads a bit of that constant), every step an
@@ -231,7 +225,7 @@ unchanged). The hash functions take public inputs.
 
 
 `Element.scalarMul` is safe for a SECRET scalar, and that is measured
-rather than argued. Since 2026-08-11 the measurement is a **committed
+rather than argued. The measurement is a **committed
 program**, not a number to take on faith:
 [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
 `scripts/checks/ctgrind.sh decaf448`. It marks the scalar
@@ -239,8 +233,8 @@ program**, not a number to take on faith:
 feed the ladder a defined register copy, and drives it through
 `Element.generator.scalarMul`.
 
-**Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64,
-ReleaseFast, 2026-08-11; `in-file` = memcheck CONTEXTS whose stack
+**Full control table** (valgrind memcheck, x86_64,
+ReleaseFast; `in-file` = memcheck CONTEXTS whose stack
 names a `decaf448` or `ed448` source):
 
 | `-fvalgrind` | scalar tainted | total contexts | in decaf448+ed448 | exit |
@@ -268,15 +262,6 @@ Re-attribute the column yourself with
 `scripts/checks/ctgrind.sh decaf448 --pattern 'ed448[.]zig'` (also **0**), or
 read the frames with `--stacks`.
 
-**Teeth, measured 2026-08-11.** Re-introducing a variable-time
-`if (nibble != 0) acc = acc.add(table[nibble]);` inside
-`ed448.Point.mul` moves this table from **6 total / 0 in-file** to
-**4 / 4, exit 99** — the harness genuinely reaches the ladder.
-Reverted; `cmp` against a pre-mutation copy confirmed byte-identical.
-*(An earlier note recorded this mutation as "report 860". That was the
-ERROR count, not the context count — the same run here reports 421
-errors from 4 contexts. The two units are not interchangeable.)*
-
 This module is *not* exposed to the defect that forced `ecvrf`'s move
 to `ct25519`: `std.crypto.ecc.Edwards25519.mul` ends in a
 `rejectIdentity` branch on a scalar-derived value, but `ed448`'s
@@ -285,10 +270,10 @@ no error union at all.
 
 ## Backlog / deferred
 
-- ~~Scalar completeness~~ — landed 2026-10-06: `scalar.sub`/`negate`/`invert`/`random`/`reduce`/`fromWide`.
-- ~~`hash_to_decaf448`~~ — landed 2026-10-06: `hash.expandMessageXof`/`hashToElement`/`hashToScalar`.
-- ✅ **DONE 2026-11-16 (`hash.reduceOversizeDst`, applied by `expandMessageXof` to any DST over 255 bytes, k = 224; self-consistency tests only, RFC 9380 has no decaf448 oversize vector):** **Oversize DST** (RFC 9380 §5.3.3, `H2C-OVERSIZE-DST-`) *(2026-10-06)*: `expandMessageXof` refuses a DST over 255 bytes (`error.DstTooLong`) instead of reducing it, because the reduction needs the suite's `k` and no RFC 9380/9497 suite uses one. Effort: small. Fits §2.
-- **Faster scalar inversion** *(2026-10-06)*: `invert` is ~450 squarings + ~220 multiplications through `ed448.scalar.mul`'s bit-serial reduction. An addition chain or a Montgomery/Barrett `mul` in `ed448.scalar` would cut it several-fold. Effort: small-medium. Fits §2.
+- **Faster scalar inversion:** `invert` is ~450 squarings + ~220 multiplications through `ed448.scalar.mul`'s
+  bit-serial reduction. An addition chain or a Montgomery/Barrett `mul` in `ed448.scalar` would cut it several-fold.
+  Effort: small-medium. Fits §2.
+
 
 ## Anchoring
 
