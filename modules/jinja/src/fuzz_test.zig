@@ -8,13 +8,7 @@
 //! trips a safety check**. Any `error` is a fine outcome; a panic, an
 //! out-of-bounds read or an unbounded allocation is not.
 //!
-//! Run with:
-//!
-//! ```sh
-//! zig build test-jinja --fuzz --release=safe
-//! ```
-//!
-//! Deterministic driver: every harness body is generic over
+//! Run through the deterministic driver: every harness body is generic over
 //! its source of choices, `fn(comptime S, *S, gpa)`; `testing.fuzz` hands it a
 //! `std.testing.Smith` (corpus seeds replay as before), the driver a
 //! `testkit.fuzz.driver.Rng`. `JINJA_FUZZ=<runs>[,<first seed>]` (`_ONLY`
