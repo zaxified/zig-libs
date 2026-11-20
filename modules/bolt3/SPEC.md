@@ -64,32 +64,28 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 
 ## Verification
 
-- BOLT#3 **Appendix E** — all four vectors (key and revocation, public and
-  secret) byte-exact.
-- BOLT#3 **Appendix D** — all five `generate_from_seed` generation vectors
-  byte-exact.
-- Cross-checks: each derived secret's public point equals the independently
-  derived public key; a real shachain secret feeds the revocation derivation.
-- Green in Debug + ReleaseFast.
-- **Mutation run 2026-10-05** (in-place, Debug, 27 mutants over the four
-  derivations' input checks and arithmetic, `hashToScalar` and
-  `perCommitmentSecret`): 20 killed. Six survivors were input refusals no test
-  reached (a bad `per_commitment_point` in `derivePublicKey`, a zero
-  per-commitment secret, a basepoint/revocation secret >= n, each relabelled
-  or skipped); one test now pins them all, and writing it found a bug:
-  `derivePrivateKey` accepted a per-commitment secret >= n (k256's
-  `combMulBase` reduces it), fixed with a regression test. Equivalent:
-  `hashToScalar` without the wide reduction (differs only for a SHA-256 output
-  >= n, probability ~2^-128, no findable input).
+- Run: `scripts/modtest bolt3`. The tests live in `src/root.zig`; the stack-residue probe in `src/stackprobe_test.zig`.
+- BOLT#3 **Appendix E**: all four vectors (key and revocation, public and secret) byte-exact.
+- BOLT#3 **Appendix D**: all five `generate_from_seed` generation vectors byte-exact.
+- Cross-checks: each derived secret's public point equals the independently derived public key; a real shachain secret
+  feeds the revocation derivation.
+- Refusals: invalid points (all-zero), zero secrets and secrets >= n are pinned as `InvalidPoint` / `InvalidSecret`
+  for the four derivations, including the regression that `derivePrivateKey` refuses a per-commitment secret >= n.
+- Hash-to-scalar: the wide reduction differs from a plain reduction only for a SHA-256 output >= n (probability about
+  2^-128), so no test can tell them apart; the mutation run counts that mutant as equivalent.
+- Constant time: `src/ctgrind_harness.zig` drives the secret-input entry points (`derive`, `revocation`, `shachain`,
+  `shachain_index` targets) under valgrind; the pinned rows are in the ctgrind table of the repository checks.
+- No fuzz harness (no fuzz obligation).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **App D storage half** — `RevocationStore`: the O(48)-element compact store of
-  received per-commitment secrets with derived-child consistency validation
-  (BOLT#3 Appendix D *storage* vectors). Smaller crypto, more data structure. *(survey 2026-09-30: missing and it matters — lnd `shachain` and LDK have it; effort small; fits CONVENTIONS §2.)*
-- **Commitment / HTLC transaction construction** — the non-crypto serialization
-  (to_local/to_remote/HTLC outputs, scripts, feerate math). Opus/Sonnet, not a
-  Fable pocket. *(survey 2026-09-30: missing and it matters — this is most of what LDK `chan_utils` offers; effort large; fits CONVENTIONS §2, builds on `bitcointx`/`bitcoinscript`.)*
+- **App D storage half**: `RevocationStore`, the O(48)-element compact store of received per-commitment secrets with
+  derived-child consistency validation (BOLT#3 Appendix D *storage* vectors). Smaller crypto, more data structure.
+  Missing and it matters (lnd `shachain` and LDK have it); effort small; fits CONVENTIONS §2.
+- **Commitment / HTLC transaction construction**: the non-crypto serialization (to_local/to_remote/HTLC outputs,
+  scripts, feerate math). Not a Fable pocket. Missing and it matters (most of what LDK `chan_utils` offers); effort
+  large; fits CONVENTIONS §2, builds on `bitcointx`/`bitcoinscript`.
 
 ## Anchoring
 

@@ -26,11 +26,12 @@ entry point runs under a dead-stack burn (`src/burn.zig`).
 
 ## Scope
 
-- **In:** the four App E key derivations + App D per-commitment secret *generation*.
-- **Out (follow-up):** App D *storage* (`RevocationStore` — compact receipt of
-  revealed secrets with derived-child consistency checks); commitment/HTLC
-  transaction construction and scripts (non-crypto, a later non-Fable pass,
-  mirroring how `ssh` shipped its transport crypto first).
+In: the four Appendix E key derivations and the Appendix D per-commitment secret *generation*.
+
+## Not provided
+
+The Appendix D *storage* half (`RevocationStore`) and commitment/HTLC transaction and script construction are not
+built; see SPEC *Backlog / deferred*.
 
 ## Verification
 
