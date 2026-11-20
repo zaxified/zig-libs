@@ -264,3 +264,98 @@ test "https over TLS: http2 client against an ALPN h2 origin speaks h2" {
 test "https over TLS: http2 client against an http/1.1-only origin stays on HTTP/1.1" {
     try tlsRig(&.{"http/1.1"}, true, false, "http/1.1");
 }
+
+// ── native TLS listener (`Server.Options.tls`) ──────────────────────────────
+
+fn tlsListenerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/big")) {
+        // Several TLS records of body.
+        var chunk: [1000]u8 = undefined;
+        @memset(&chunk, 'x');
+        for (0..40) |_| try rw.writeAll(&chunk);
+        return;
+    }
+    var total: usize = 0;
+    var buf: [4096]u8 = undefined;
+    const r = req.reader();
+    while (true) {
+        const n = r.readSliceShort(&buf) catch return error.ReadFailed;
+        total += n;
+        if (n < buf.len) break;
+    }
+    var out: [64]u8 = undefined;
+    try rw.writeAll(try std.mem.print(&out, "n={d}", .{total}));
+}
+
+fn tlsListenerRig(client_h2: bool) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const kv = comptime tlsserver.testKeyVector("p256-pkcs8");
+    var pair: tlsserver.keys.CertKeyPair = undefined;
+    try tlsserver.keys.CertKeyPair.fromPem(&pair, gpa, kv.cert_pem, kv.key_pem);
+    defer pair.deinit(gpa);
+    const ck = pair.certifiedKey();
+    var prng = std.Random.DefaultPrng.init(0x7154);
+    const cfg: tlsserver.Config = .{
+        .certificate = .{ .fixed = &ck },
+        .random = prng.random(), // replaced per connection by the server
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    };
+
+    var server = Server.init(io, gpa, .{ .handler = tlsListenerHandler, .tls = .{ .config = &cfg } });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.serve() catch {};
+        }
+    }.run, .{&server});
+    defer t.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{
+        .tls = .{ .verify = .insecure_no_verify },
+        .http2 = if (client_h2) .alpn() else null,
+        .connect_timeout_ms = 3000,
+        .total_timeout_ms = 10000,
+    });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    const big_url = try std.mem.print(url_buf[0..], "https://127.0.0.1:{d}/big", .{port});
+
+    // A body spread over several records, both ways.
+    {
+        var res = try client.request(.get, big_url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqual(if (client_h2) http.Client.Proto.http2 else http.Client.Proto.http1_1, res.proto());
+        const body = try res.readAllAlloc(gpa, 100_000);
+        defer gpa.free(body);
+        try testing.expectEqual(@as(usize, 40_000), body.len);
+        try testing.expect(std.mem.allEqual(u8, body, 'x'));
+    }
+    {
+        const upload = try gpa.alloc(u8, 50_000);
+        defer gpa.free(upload);
+        @memset(upload, 'u');
+        var res = try client.request(.post, url, .{ .body = upload });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("n=50000", body);
+    }
+}
+
+test "Server.Options.tls: HTTP/1.1 over TLS, bodies across records both ways" {
+    try tlsListenerRig(false);
+}
+
+test "Server.Options.tls: ALPN h2 serves HTTP/2 over TLS with the same handler" {
+    try tlsListenerRig(true);
+}

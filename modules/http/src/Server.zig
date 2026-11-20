@@ -120,6 +120,7 @@ pub const FileSpool = rebody.FileSpool;
 const datefmt = @import("datefmt");
 const netaddr = @import("netaddr");
 const proxyproto = @import("proxyproto");
+pub const tls_listener = @import("tls_listener.zig");
 const flate = std.compress.flate;
 const net = std.Io.net;
 const Reader = std.Io.Reader;
@@ -556,6 +557,16 @@ pub const Options = struct {
     /// and `on_error` keep reporting the socket peer (the balancer): the
     /// header is read after admission. See `ProxyProtocol`.
     proxy_protocol: ?ProxyProtocol = null,
+    /// Terminate TLS on the listener (HTTPS served directly, Go's
+    /// `ServeTLS`): every accepted connection runs a `tlsserver` handshake
+    /// first, then the HTTP/1.1 loop, or the HTTP/2 one when ALPN chose `h2`.
+    /// Null (default) serves plain HTTP (and h2c with `enable_h2c`). The PROXY
+    /// header, when `proxy_protocol` is set, is read from the raw socket
+    /// before the handshake. Timeouts apply to the handshake as to any read.
+    /// ⚠ `read_buffer_size` and `write_buffer_size` are the HTTP loops'
+    /// buffers; the TLS record buffers are separate (about 16 KiB in, the
+    /// handshake flight out). See `tls_listener.Options`.
+    tls: ?tls_listener.Options = null,
     /// Lend a connection its working memory one request at a time instead of
     /// taking the caller's for the whole connection. Null keeps the buffers
     /// the serving loop allocates per connection, which is what every caller
@@ -1599,6 +1610,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
     };
 
     const o = &s.options;
+    const tls_sess: ?*tls_listener.Session = if (o.tls) |t| tls_listener.Session.create(s.gpa, s.io, t) catch return else null;
+    defer if (tls_sess) |t| t.destroy();
     const total = slabSize(o) orelse return; // refused by `init`; `options` is a pub field
     const slab = s.gpa.alloc(u8, total) catch return; // overloaded: drop the connection
     defer s.gpa.free(slab);
@@ -1647,9 +1660,11 @@ fn connMain(s: *Server, stream: net.Stream) void {
     defer if (watched) s.reaper.remove(s.io, &watch);
     const w: ?*Watch = if (watched) &watch else null;
     var sr = stream.reader(s.io, read_buf[0..0]);
-    var tr: TimeoutReader = .init(&sr, s.io, w, o.read_timeout_ms, o.request_timeout_ms, read_buf);
+    // Under TLS the transport buffers are the TLS record ones (the HTTP
+    // loops get `read_buf` / `write_buf` through the adapters below).
+    var tr: TimeoutReader = .init(&sr, s.io, w, o.read_timeout_ms, o.request_timeout_ms, if (tls_sess) |t| t.in_buf else read_buf);
     var sw = stream.writer(s.io, write_buf[0..0]);
-    var tw: TimeoutWriter = .init(&sw, s.io, w, o.write_timeout_ms, write_buf);
+    var tw: TimeoutWriter = .init(&sw, s.io, w, o.write_timeout_ms, if (tls_sess) |t| t.out_buf else write_buf);
     tr.header_timeout_ms = o.read_header_timeout_ms;
     tr.idle_timeout_ms = o.idle_timeout_ms;
     var control: ConnControl = .{ .server = s, .stream = stream, .tr = &tr, .tw = &tw, .response_timeout_ms = o.response_timeout_ms };
@@ -1682,6 +1697,23 @@ fn connMain(s: *Server, stream: net.Stream) void {
         };
     }
 
+    // TLS: handshake over the raw transport, then the loops read and write
+    // through the adapters.
+    var app_in: *Reader = &tr.reader;
+    var app_out: *Writer = &tw.writer;
+    var tls_h2 = false;
+    if (tls_sess) |t| {
+        const alpn = t.handshake(&tr.reader, &tw.writer, read_buf, write_buf) catch |e| {
+            fireError(o.on_error, o.on_error_ctx, .request_refused, e, 0, stream.socket.address);
+            sum_end = if (tr.timed_out or tw.timed_out) connEnd(&tr, &tw) else .errored;
+            return;
+        };
+        app_in = &t.app_in.reader;
+        app_out = &t.app_out.writer;
+        tls_h2 = if (alpn) |p| std.mem.eql(u8, p, http.alpn_h2) else false;
+    }
+    defer if (tls_sess) |t| t.close();
+
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
     // through to the HTTP/1.1 loop below with nothing consumed. The stall
@@ -1689,8 +1721,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
     // (it has no natural shape on a multiplexed connection) — but the
     // connection as a whole still gets an absolute lifetime cap, armed once
     // below (A1 http F7).
-    if (o.enable_h2c) {
-        const is_h2 = detectH2Preface(&tr.reader) catch { // stalled/reset: drop
+    if ((tls_sess != null and tls_h2) or (tls_sess == null and o.enable_h2c)) {
+        const is_h2 = if (tls_sess != null) true else detectH2Preface(&tr.reader) catch { // stalled/reset: drop
             sum_end = connEnd(&tr, &tw);
             // The peer never got past the protocol peek: no request began, so
             // the reader's phase (still its initial one) says nothing; idle.
@@ -1731,7 +1763,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .limits = o.h2_limits,
                 .stream_request = o.h2_stream_request,
                 .dispatcher = o.h2_dispatcher,
-            }, &tr.reader, &tw.writer);
+            }, app_in, app_out);
             reportTimeout(o, stream, &tr, &tw, true);
             sum_end = connEnd(&tr, &tw);
             sum_phase = timeoutPhase(&tr, &tw, true);
@@ -1762,7 +1794,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .verify_inbound_trailer = o.verify_inbound_trailer,
         .max_requests_per_conn = o.max_requests_per_conn,
         .control = &control,
-    }, &tr.reader, &tw.writer, bufs);
+    }, app_in, app_out, bufs);
     reportTimeout(o, stream, &tr, &tw, false);
     sum_end = connEnd(&tr, &tw);
     sum_phase = timeoutPhase(&tr, &tw, false);

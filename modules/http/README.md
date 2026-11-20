@@ -13,7 +13,7 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `tlsclient` — std'
 - **Platform:** any. **Role:** both.
   **Concurrency:** single-owner handles; the Server runs its own
   per-connection tasks — handlers must be thread-safe if they share state.
-  **Deps:** `netaddr`, `datefmt`, `tlsclient`, `crc32`, `b64ct`, `proxyproto`, `std.Io.net`.
+  **Deps:** `netaddr`, `datefmt`, `tlsclient`, `crc32`, `b64ct`, `proxyproto`, `tlsserver`, `std.Io.net`.
 
 Provenance: original work of the zig-libs authors (MIT); the HTTP/1.1 framing,
 the server, HPACK, HTTP/2 and the reverse proxy are clean-room from the RFCs.
