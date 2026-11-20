@@ -5,25 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** the dns pilot follows `dns.Resolver.lookupIp`'s new result (`Lookup(netaddr.Ip)`, `.items`, `deinit`).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **FIX:** the simulated ICMPv4 checksum (`icmp4ChecksumOk`, `setIcmp4Checksum`) accumulated in `u32` and overflowed past ~131 KB of `0xffff` words; it now uses `icmp.checksum` (`u64` accumulator). Results for smaller messages are identical. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the watchdog's private monotonic read (duplicate-code pass) is replaced by `clock.monotonicNs()`. New dependency: `clock`.
-- **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the dns pilot follows the resolver's parallel A/AAAA default: a dead server costs one budget, and a new pilot pins the two budgets of `parallel_families = false`. Found by full CI 41385098449.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC notes on `socketpair` and Unix datagram sockets re-checked against the 0.17.0 std (unchanged).
 
 - **2026-10-18** — Ported to Zig 0.17.0. Socket stream I/O moved into `vtable.operate` (`net_send`, `net_read`, `net_write`; 0.17 removed the `netSend`/`netRead`/`netWrite` slots) and `netClose` takes `[]const net.Socket`. **Consumer-visible:** a stream read that hits the simulated connection timeout now fails with `error.ConnectionTimedOut` (std's `NetRead.Error` has no `Timeout`; matches Linux ETIMEDOUT); connect and `receiveTimeout` still report `error.Timeout`.
 
 - **2026-10-17** — A socket bound to `0.0.0.0` no longer receives IPv6 traffic (`::` still takes both, the Linux default): std's `HostName.connect` connects to every resolved address at once, and simio resolves a host name to its IPv4 and IPv6 addresses, so one lookup left two connections at an IPv4 listener, and which one the client kept depended on the schedule (the `timeouts` pilot went red after an unrelated http change shifted it; bisected to http `16982eb6`). The `timeouts` pilot's peer drains the request before closing (closing over unread bytes is a reset, which a short read made seed-dependent). Pilot passes for seeds 5–8.
 
-- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** the ssh pilot passes its user key to `ssh.userauth.authenticatePublickey` by pointer (ssh 2026-10-09).
 - **2026-10-07** — **Fixed: on aarch64 a value the compiler kept in `x18` or `x30` across a fiber switch came back as the other fiber's.** `std.Io.fiber.contextSwitch` (and our copy) trusted the clobber list: `x18` is not in it, and a ReleaseSafe build for an SVE CPU kept the current `*Fiber` in `x30` although `x30` is. Seen as a Bus error in `example-simio` on the arm64 runner (tag `2026-10-06` matrix) and, under qemu-aarch64, as a wild `Host` pointer right after `maybeYield` (`cortex-a72`: x18; `neoverse-n2`: x30). The switch now pushes both before saving `sp` and pops them where it resumes. Verified under qemu-aarch64: `example-simio` on cortex-a72, neoverse-n2 and neoverse-v1, and all 145 simio tests on neoverse-n2 (ReleaseSafe). This also retracts the 2026-10-06 note that qemu-user cannot run simio — that was this bug.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the aarch64 context switch is a local copy of `std.Io.fiber.contextSwitch` without `ffr` in its clobber list (`src/fiber.zig`). On an SVE CPU LLVM warns that FFR is a reserved register, and the arm64 CI lanes (tag `2026-10-06`) failed on that warning before any simio test ran; reproduced with `-mcpu=neoverse_v1`, gone with the copy. Runtime on arm64 is still unproven (qemu-user cannot run simio at all, std's original switch included).
 - **2026-10-03** — Re-surveyed against turmoil: Scope `poc` → `core` (the `poc`
@@ -49,8 +41,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   path or abstract name, per host). `socketpair` stays refused, matching std 0.16
   on Linux (an IP family, EOPNOTSUPP) — found by the differential oracle, which now
   also checks a Unix stream.
-- **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** the timeouts pilot also checks
-  `llmclient`'s body deadline (test-only).
 - **2026-10-01** — `pilots/timeouts.zig`: the request timeouts of `modbus`,
   `whois`, `stun`, `ocspcache` and `llmclient` checked to the millisecond in virtual time — the
   timing half of their loopback tests, which stay in the modules.

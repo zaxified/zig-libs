@@ -7,7 +7,7 @@ virtual, and every choice the simulator makes is drawn from one seed. A run is
 a pure function of its seed, so a failure found on seed 1234 is reproduced by
 running seed 1234 again.
 
-- **Status:** all five milestones done (see [SPEC.md](SPEC.md) § Milestones):
+- **Status:** done, with its open items in [SPEC.md](SPEC.md) § Backlog / deferred:
   the scheduler (tasks, groups, cancelation, futex, clocks, sleep, timeouts,
   seeded randomness), the network (streams, datagrams, ICMP echo, Unix-domain
   streams and host names over routed, faulty links), host crash/restart, a file
@@ -15,9 +15,10 @@ running seed 1234 again.
   faults, fault search with shrinking, and pilots against real modules — `sntp`,
   `dns`, `mqtt`, `ssh`, `kv`, `http` (client and server), `icmp`, `staticfiles`
   and the timeouts of `modbus`/`whois`/`stun`/`ocspcache`/`llmclient` — which
-  found and fixed defects in six of them.
+  found and fixed defects in several of them.
 - **Platform:** Linux on x86_64, aarch64 or riscv64 (`std.Io.fiber`).
-- **Deps:** `netsim` (its seeded PRNG; its fault vocabulary from M3).
+- **Deps:** `netsim` (its seeded PRNG, fault-schedule generator and ddmin shrinker), `clock`
+  (the watchdog's monotonic read), `icmp` (ICMP echo wire format).
 - **Model after:** tokio-rs/turmoil, madsim, FoundationDB's simulation testing.
 
 ## Use

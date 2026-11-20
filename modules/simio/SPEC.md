@@ -45,13 +45,6 @@ exists (x86_64, aarch64, riscv64), while turmoil runs wherever tokio does *(infe
 turmoil's simulated `io_uring` has no counterpart here and needs none: in Zig,
 `io_uring` is an `std.Io` implementation, not an API the code under test calls.
 
-**Re-survey 2026-10-03.** The Scope line said `poc` since the M1 commit (`058e1d09`,
-only the scheduler existed) and was never revisited after M2–M5. Against turmoil's
-README (fetched 2026-10-03: multiple hosts on one thread, seeded RNG, latency, drops,
-partitions, crashes, torn writes, simulated net and fs) every user-visible area is
-covered, plus the extras above; review, two mutation runs and the differential oracle
-are done. Not `parity`: the gaps under Backlog are ones a user can hit.
-
 ## Why this module exists
 
 `netsim` model-checks algorithms written as a `Protocol` callback interface. Most
@@ -65,9 +58,9 @@ in one OS thread, under virtual time, over a simulated network and file system, 
 that code **unchanged** — deterministically, as a pure function of a seed, with
 netsim's fault schedule, replay and minimizer on top.
 
-Decided by the user 2026-10-01: "grow our own" rather than point
-consumers at `sb2bg/marionette`; a **new module over netsim** (netsim stays pure and
-platform-free); file system and storage faults **in scope from the start**.
+Built as our own module rather than pointing consumers at `sb2bg/marionette`; a **new module over
+netsim** (netsim stays pure and platform-free); file system and storage faults **in scope from the
+start**.
 
 ## Scope
 
@@ -153,7 +146,8 @@ consumer's to remove.
   in-order byte streams: link loss shows up as delay (retransmission), a partition
   as no progress, a crashed peer as a reset; `read` returns a seeded, possibly short
   prefix of what is buffered (framing bugs surface). Datagrams get loss, duplication,
-  reorder, truncation and corruption (new `FaultKind.corrupt`, netsim backlog item).
+  reorder, truncation and one-bit corruption, each a per-link rate (`corrupt_permille` for corruption);
+  netsim itself has no corruption fault kind.
 - **Storage model** (turmoil-fs / ALICE style). Writes land in a volatile layer;
   `File.sync` makes the file's data durable; a new or renamed directory entry is
   durable only after the parent directory is synced (`.strict`, default — POSIX's
@@ -162,159 +156,111 @@ consumer's to remove.
   prefix of the name journal survives in whole operations (a rename is never half
   done). Injectable faults: `error.InputOutput` on the next read/write/sync,
   `error.NoSpaceLeft` past `HostOptions.disk_bytes`, silent bit rot at rest.
-- **Faults and search.** Fault events extend netsim's (`link down/up`, partitions,
-  drop/duplicate/delay spike, crash/restart, clock jump) with `corrupt` and the
-  storage kinds. `run`/`replay`/`findFailing`/shrink keep netsim's contract: an
+- **Faults and search.** Fault events are netsim's (`link down/up`, partitions,
+  drop/duplicate/delay spike, crash/restart, clock jump) plus two disk kinds (`DiskFault`: a one-shot
+  I/O error on the next read/write/sync, and bit rot). `run`/`replay`/`findFailing`/shrink keep netsim's contract: an
   invariant callback after every event, a byte-exact replay of a concrete trace, ddmin
-  over the trace. Whether netsim's shrinker is reused as is or generalized is an M3
-  decision.
+  over the trace (`shrink` reuses netsim's ddmin, which is generic and exported).
 
-## Milestones
+## Design notes by feature
 
-1. **M1 — scheduler** ✅ 2026-10-01. Fibers, ready queue with seeded choice, virtual clock, timers,
-   `sleep`/`now`/timeouts, `random`/`randomSecure`, futex, async/concurrent/await,
-   cancel + cancel protection, groups. Tests: `Io.Mutex`/`Condition`/`Group`
-   programs; same seed ⇒ same trace; different seeds explore different interleavings
-   (a planted ordering bug is found within a bounded seed range).
-2. **M2 — network** ✅ 2026-10-01. Hosts with IPs (10.0.0.n / fd00::n by default),
-   links (`Sim.link`/`linkAll`/`setLinkUp`), routed shortest paths, TCP-like streams
-   (handshake, SYN retry, RST/refused, FIFO pipes with RTO delay on loss, partition
-   backoff and user timeout, flow-control window, FIN/RST on close, shutdown, seeded
-   short reads), UDP-like datagrams (loss, duplication, reorder, one-bit corruption,
-   receive buffer), ICMP echo answered by the target's stack (ping-socket semantics),
-   `operate`/`Batch` for `receiveTimeout`, `Sim.runFor`. Corruption is a per-link
-   rate here; as a scheduled one-shot fault it comes with M3's fault vocabulary.
-3. **M3 — lifecycle and search** ✅ 2026-10-01. `Sim.crash`/`restart` (tasks stop
-   without unwinding; sockets vanish without FIN/RST; `Host.allocator()` memory is
-   released; `spawnBoot` tasks start again; monotonic clocks restart), directed link
-   failures (`setLinkDirUp`), partitions (`partition`/`heal`), one-shot faults
-   (`Fault`, `scheduleFault`), an invariant hook after every step (`setInvariant`,
-   `Outcome.violated`), and the search layer: `Case`, `run` (netsim's schedule
-   generator, ticks = 1 ms), `replay`, `findFailing`, `shrink` (netsim's ddmin, now
-   generic and exported), `checkDeterminism`. Events due at the current instant fire
-   before the next task step; the fingerprint includes virtual time. Proof: the
-   classic exactly-once-over-UDP bug (no dedup) is found, shrunk to 1–2 faults and
-   replayed; the deduplicating server survives the same search.
-4. **M4 — file system + storage faults** ✅ 2026-10-01. Per-host tree behind
-   `std.Io.Dir`/`File` (create/open/read/write positional and streaming, stat, length,
-   set length, sync, rename/renamePreserve, delete, iteration, `createFileAtomic`,
-   realpath, flock-style locks, captured stdout/stderr); durability: file data as of
-   the last sync plus unsynced writes that survive per sector on a crash; names
-   journaled and durable on a directory sync (`.strict`) or any sync (`.journal`), a
-   crash keeping a prefix of the journal in whole operations; faults: one-shot I/O
-   errors, bit rot, disk capacity. The search draws disk faults too (`FaultConfig.disk`;
-   simio's own `Trace` type, netsim's network faults inside it). Proof: the search
-   finds the torn file of a rename without fsync and silent corruption read without a
-   checksum; the careful variants survive. `Host.putFile`/`readFile`/`console`.
-5. **M5 — pilots** ✅ 2026-10-01 (each with a deliberately broken variant that must trip):
-   - `mqtt` broker + 3 clients under partitions: QoS 1 at-least-once delivery.
-   - `dns` `Resolver`: retry/timeout behaviour under loss.
-   - `http` client/server.
-   - `sntp`: offset/delay computation under asymmetric latency and clock jumps.
-   - `icmp`: needs an `std.Io`-based socket backend in `icmp` first (it uses raw
-     `std.os.linux` syscalls today, outside any `Io`) — a change in `icmp`.
-   - `ssh`: handshake + channel under fragmentation and resets.
-   - `kv`: its real file code under the storage crash model.
-   - Move a set of today's loopback tests (real sockets on `Io.Threaded`) onto simio —
-     done as *their timing* moving, not the tests (see § Pilots, "timeouts").
+- **Hosts and links:** a host's default addresses are 10.0.0.(index+1) and fd00::(index+1)
+  (`HostOptions`); `Sim.link`/`linkAll`/`setLinkUp`, one-way failures with `setLinkDirUp`, partitions
+  with `partition`/`heal`, `Sim.runFor` for servers that never finish. Simulated socket handles start at
+  2^30, so a raw syscall on one fails with `EBADF` instead of touching a descriptor of the test process.
+- **Streams:** handshake with SYN retry, RST/refused, FIFO pipes with a retransmission delay on loss
+  (`tcp_rto_min_ns`..`tcp_rto_max_ns`), partition backoff and a user timeout (a stream read that times
+  out reports `error.ConnectionTimedOut`: the 0.17 `NetRead` error set has no `Timeout`), a flow-control
+  window, FIN/RST on close, shutdown, seeded short reads. Data already received is read before a later
+  reset. A connection to a loopback address comes from 127.0.0.1. `SO_REUSEADDR` follows Linux (both
+  sockets must set it; a listener always conflicts).
+- **Datagrams and ICMP:** a receive buffer drops the overflow; an oversized datagram is truncated and
+  flagged `trunc`; `MSG_PEEK` leaves it queued. ICMP echo is answered by the target's stack (ping-socket
+  semantics); a corrupted ICMPv4 echo request is dropped. `operate`/`Batch` give `receiveTimeout`.
+- **Crash and restart:** `Sim.crash` stops tasks without unwinding, sockets vanish without FIN/RST,
+  `Host.allocator()` memory is released (`Host.liveAllocations`), `spawnBoot` tasks start again, monotonic
+  clocks restart. Events due at the current instant fire before the next task step, and the fingerprint
+  includes virtual time.
+- **File system:** per-host tree behind `std.Io.Dir`/`File` with the durability model above; unsynced
+  data survives per sector, names are journaled; stdio handles refuse positional I/O with `Unseekable` (so
+  std falls back to streaming); `lockStderr` is a per-host lock over the host's stderr writer (into
+  `Host.console`); a directory listing works from a snapshot; symbolic links are followed as POSIX does
+  (`SymLinkLoop` past 40). `resolve_beneath` is ignored, as `std.Io.Threaded` ignores it on Linux.
+  `Host.putFile`/`readFile`/`console` seed and inspect a disk from the test.
+- **Search layer:** `Case` (`setup`, `invariant`, `final`, `reset`, `ctx`, `digest`), `run`, `replay`,
+  `findFailing`, `shrink`, `checkDeterminism`; an optional `Case.final` predicate is checked once after the
+  run (liveness); `FaultConfig.disk` draws disk faults over the same horizon;
+  `Sim.scheduleFault` and `setInvariant` are the lower-level hooks; a root task's error is a violation
+  naming its host.
+- **Group registry:** the simulation keeps a registry of group states, so a group none of whose tasks is
+  alive any more (its owner discarded without unwinding) is still freed by `deinit` or a crash.
 
-## Prior art in our own projects
+## Limits
 
-Checked 2026-10-01 at the user's request ("the router-tool consumer solves similar things — don't reinvent,
-the router-tool consumer can pull it back from the module later"):
+- Runs only where `std.Io.fiber` exists (x86_64, aarch64, riscv64): upstream-bound (std); a 32-bit or
+  other host cannot run a simulation at all.
+- File locks wait by polling, so a lock never released ends the run as `.step_limit`, not `.deadlock`.
+- `MSG_TRUNC` is not reported on request (an oversized datagram is still truncated and flagged).
+- Code that bypasses `std.Io` (raw syscalls, `std.Thread`, a wall-clock read) is invisible to the
+  simulation; `checkDeterminism` reports the resulting nondeterminism.
+- Any in-simulation lock held across a call that suspends is the code under test's bug: an io-less
+  spinlock spins forever when a second task of the same thread calls in. Modules that did this wait
+  through the `Io` when one is known; `ramcache` documents that its callbacks must not suspend, and
+  `h2_server` without `Dispatcher.io` needs its tasks to be OS threads.
 
-- **The router-tool consumer the router-tool consumer's simulator** (branch `demo-fleet-map`): a demo swarm of ~55 virtual devices,
-  one OS thread each, speaking the real device wire to a real router-tool consumer central server over real
-  TCP in real time. Its pieces map onto simio as follows — the routed-path latency
-  model (adopted above), and the reboot/churn "down windows" with reconnect backoff
-  (= simio host crash/restart; same semantics: the session drops, the peer sees a
-  reset, the device re-dials after a delay). It has no fibers, no virtual time and no
-  deterministic `Io`, so the scheduler and vtable are new here.
-- **Pull-back:** once simio has M3, the router-tool consumer can run the swarm plus the central server as simio
-  hosts in one process, deterministically, instead of a thread per device with
-  wall-clock sleeps. That is the router-tool consumer's session's work (zig-libs is a pinned upstream there).
-- `fleetsim` (zig-libs): in-process device responders on netsim — the synthetic-device
-  half of the router-tool consumer's simulator job, already here; complementary, not a substitute for simio.
+## Verification
 
-## Mutation run (2026-10-01)
+Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unavailable). Test classes:
 
-46 mutant schemata over `sched.zig`, `net.zig` and `search.zig`, one ReleaseSafe
-build, every mutant under a 20 s cap. First pass: 33 killed (4 of them as hangs),
-13 survived. Nine survivors were holes and got tests: a futex wait whose expected
-value is stale must return at once; a timeout armed for an earlier wait must not end
-a later one; with preemption off the seed alone must still vary the start order; a
-crash must release live host allocations at once (`Host.liveAllocations`); stream
-reads must sometimes be short; an oversized datagram is truncated and flagged; the
-UDP receive buffer drops the overflow; a root task's error is a violation naming its
-host; `shrink` keeps only subsets reproducing the *same* error. Second pass: 42/46
-killed. The four survivors are equivalent:
+- **Scheduler and `std.Io` contract** (`src/tests.zig`): cancelation delivered once, protection, `recancel`,
+  groups, futex (`Io.Mutex`/`Condition`/`Group` programs), timeouts against skewed clocks, seeded random,
+  one seed replays one schedule, different seeds find a planted lost update that a mutex then prevents,
+  the watchdog.
+- **Network** (`src/net_tests.zig`): streams, datagrams, ICMP, routing, Unix sockets, names.
+- **File system** (`src/fs_tests.zig`): the durability model and per-sector crash survival, links, locks,
+  memory maps; the search finds the torn file left by a rename without fsync and silent corruption read
+  without a checksum, while the careful saver and a checksumming reader survive.
+- **Lifecycle and search** (`src/fault_tests.zig`): crash/restart, one-way failures, partitions, one-shot
+  faults; the exactly-once-over-UDP bug without dedup is found, shrunk and replayed while the deduplicating
+  server survives; `checkDeterminism` catches state and bytes drawn outside the simulation; the data
+  fingerprint and `Case.digest`; a failing root task is a violation naming its host.
+- **Differential oracle** (`src/oracle_tests.zig`): see *Anchoring*.
+- **Pilots** (`src/pilots/`): real modules run on simio, each with a deliberately broken variant that must
+  trip: `sntp`, `dns`, `mqtt`, `ssh`, `kv`, `http` (client and server), `icmp`, `staticfiles`, and
+  `timeouts` (when the timeouts of `modbus`, `whois`, `stun`, `ocspcache` and `llmclient` fire, in virtual
+  time). A pilot is a `test_dep` consumer here, not a test in the piloted module: most piloted modules
+  also target 32-bit Linux, where `std.Io.fiber` does not exist. The piloted modules keep their own
+  loopback tests (the real-kernel half); what moved is the timing those cannot assert.
+- **Mutation:** schemata over `sched.zig`, `net.zig`, `fs.zig` and `search.zig`; the card's `**Audit:**`
+  line is the current score.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-- `futexWake` waking more than `max_waiters`: a spurious wakeup, which the futex
-  contract allows (`Io.Mutex`/`Condition` re-check).
-- No virtual time in the per-step fingerprint mix: every change of time reaches a
-  task through a wake, and wakes mix the time.
-- Arrival not checking that the receiver is up: a down host has no sockets, and
-  anything it would answer is refused by `transit` (a down host cannot send).
-- No `max(at, last_at)` when queueing a segment: a pipe delivers only from its head,
-  so order holds regardless; the `max` keeps timing realistic, not order.
+## What is deliberately not done
 
-### File system (2026-10-01, after M4)
+- **Processes** (`processSpawn*`, `childWait`, `processReplace*`), **DNS on the wire** (a module's own
+  resolver runs against simulated name servers), **`socketpair`**, **Unix datagram sockets**, **terminals
+  beyond stderr**, **preemptive threads** and **the CPU memory model** — an operation simio does not
+  simulate behaves as in `std.Io.failing`; reasons under *Scope*.
+- **Simulated `io_uring`** (turmoil has one) — in Zig `io_uring` is an `std.Io` implementation, not an API
+  the code under test calls.
 
-27 schemata over `fs.zig` and the disk-fault part of `search.zig`. First pass: 18
-killed (2 as hangs), 9 survived, all holes, now tested: a synced overwrite never
-comes back as an older write; strict durability ignores the sync of an unrelated
-directory; a crash never splits a rename; `createFile` truncates by default; bit rot
-survives a crash; a shared lock keeps an exclusive one out; `..` walks up; a directory
-cannot move into its own subtree; an unsynced truncation may or may not survive.
-Second pass: 27/27 killed.
+## Backlog / deferred
 
-### Completion features (2026-10-01, before the first push)
-
-30 schemata over what came after M5: symbolic and hard links, metadata, memory maps,
-Unix sockets, names, the data fingerprint and `Case.digest`, the watchdog. First
-pass: 19 killed (one as a hang), 11 survived; ten were holes, now tested — through
-the differential oracle where the real kernel can confirm the answer (a link over a
-taken name, `readlink` of a file, a hard link to a directory or over a taken name,
-opening a link without following it), and in simio (a file's realpath in `/`, a path
-per host for Unix sockets, leaked bytes on a stream and on a disk). Second pass:
-29/30 killed. The survivor is equivalent: dropping the counter bump in
-`Watchdog.enter` changes nothing, as `leave` bumps it on every switch too.
-
-## Review (2026-10-01)
-
-An independent read of the whole module against the `std.Io` doc comments, before
-the first push. Confirmed by a failing test first, then fixed (tests in
-`fs_tests.zig`, `net_tests.zig`, and the differential oracle where the real kernel
-can say what is right):
-
-- `File.stdout().writer()`/`stdin().reader()` (positional by default) failed:
-  positional I/O on stdio answered `AccessDenied`, not the `Unseekable` that makes
-  std fall back to streaming.
-- `Io.lockStderr`/`unlockStderr`/`File.enableAnsiEscapeCodes` were `unreachable`:
-  now a per-host lock over the host's stderr writer (into `console`), and
-  `NotTerminalDevice`.
-- A stream over a link losing everything retransmitted forever on the scheduler's
-  stack; now the connection times out at the user timeout (a stream read that
-  times out reports `error.ConnectionTimedOut`, the 0.17 `NetRead` error set has no `Timeout`).
-- A `Batch` with two receives on one socket registered the task twice: a double
-  wake (an assertion), then a stale wake cutting a later sleep short.
-- `MSG_PEEK` consumed the datagram (oracle).
-- Data already received was lost behind a later reset; it is now read first.
-- A connection to a loopback address came from the host's LAN address (oracle: the
-  peer is 127.0.0.1).
-- Deleting entries while listing a directory skipped every second one; a listing
-  now works from a snapshot (oracle: six listed, none left).
-- `SO_REUSEADDR` was ignored; Linux's rule (both sockets must set it, a listener
-  always conflicts) now applies (oracle).
-- A SYN delayed past its retry opened a ghost connection after the real one closed.
-- A corrupted ICMPv4 echo request was answered with a fresh checksum; it is dropped.
-- Smaller: a second `Batch` await with undrained completions blocked; a failing
-  `createFileAtomic` leaked its parent handle; a lock wait read a stale wake reason
-  after an allocation failure; two out-of-memory paths could free twice.
-
-Not changed: file locks wait by polling (a lock never released ends as
-`.step_limit`, not `.deadlock`), and MSG_TRUNC is not reported on request (an
-oversized datagram is still truncated and flagged).
+- **File-lock waiters parked like futex waiters:** file locks wait by polling, so the deadlock detector
+  never sees the waiter as blocked. Wanted: waiters parked like futex waiters, so the outcome names the
+  stuck tasks.
+- **`MSG_TRUNC` on request:** a caller asking for the full datagram length (`MSG_TRUNC` in flags) does not
+  get it.
+- **Six modules out of simio's reach:** `fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm` and `opcua`
+  poll or sleep with raw syscalls (`poll`, `clock_gettime`, `nanosleep`) instead of `std.Io`, so their timing
+  cannot be simulated. Each needs its socket waits and clocks moved behind the `Io` it is given — the same
+  change `sntp`, `mqtt` and the `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
+  loopback tests stay as the real-kernel half.
+- **Raw clock reads elsewhere:** about 60 modules read the clock with `clock_gettime` instead of `std.Io`,
+  many only in tests or benchmarks; each is invisible to a simulated `Io` and is fixed when its pilot reaches it.
+- **`kv` `FsStorage`:** `allocate` and `syncData` call `fallocate`/`fdatasync` directly (std.Io has neither)
+  and get `EBADF` under simio; `Db` never calls them.
 
 ## Anchoring
 
@@ -336,153 +282,3 @@ sb2bg/marionette (MIT, README only), FoundationDB/TigerBeetle simulation methodo
 ALICE (OSDI 2014) for the crash-consistency model. The fiber layout follows the
 pattern of Zig's own `std/Io/Uring.zig` (MIT, read as reference) and uses
 `std.Io.fiber` directly.
-
-## Pilots (M5)
-
-Pilots live in `src/pilots/` with the piloted module as a `test_dep`, not in the
-piloted module: most of them also target 32-bit Linux, where `std.Io.fiber` does
-not exist, and a `test_dep` on simio would break their portability. CI still reruns
-a pilot when its module changes (test-only imports are part of the module graph).
-Modules keep their own loopback tests (below, "timeouts").
-
-- **sntp** (2026-10-01): offset and delay exact to the nanosecond on a symmetric
-  path, half the asymmetry on an asymmetric one, a server clock jump, an origin
-  mismatch refused, a lost reply timing out. Needed one fix in `sntp`: `query` read
-  T1/T4 with a direct `clock_gettime`, outside `std.Io`; now `Io.Timestamp.now`.
-- **dns** (2026-10-01): `Resolver` reads `/etc/resolv.conf` from the simulated disk,
-  retries through 25% loss, falls back to TCP on a truncated answer, ignores forged
-  transaction ids. **Found a defect:** `lookupIp` turned every failed query into an
-  empty result, so a dead server read as "no addresses"; fixed in `dns` (Go's
-  behaviour: no address + a failed query = that error), with a regression test there.
-
-- **mqtt** (2026-10-01): the real `TcpServer` + `Broker` and `Client` + `TcpTransport`;
-  QoS 1 at-least-once to two persistent-session subscribers through a 5 s partition,
-  a subscriber crash and restart, and 21 seeds of loss/duplication/partitions; the
-  clean-session-after-restart variant is caught losing messages. Needed `TcpServer`
-  to stop polling the raw socket and reading `clock_gettime` (now a watchdog task per
-  connection and `Io` time).
-- **ssh** (2026-10-01): the real client and server over simulated TCP — key
-  exchange, publickey userauth, one `exec` through a 4 KiB window — with a server
-  crash mid-session, 20 seeds of loss/duplication/partitions/crashes of either
-  side, and a client that gives up after one broken connection caught losing the
-  result. **Found a defect** in the readiness check: ephemeral keys, KEXINIT
-  cookies and padding came from getrandom(2) behind `std.Io`, so the same seed gave
-  a different session. Fixed in `ssh` (`transport.Entropy`, `Transport.entropy =
-  .{ .io = io }`); the pilot asserts an identical exchange hash across runs, for
-  ed25519 and for ECDSA host keys (whose signature length depends on the hash).
-  Also found a simio leak: a group none of whose tasks were alive any more (its
-  owner discarded without unwinding) was freed neither by `deinit` nor by a crash;
-  simio now keeps a registry of group states.
-- **kv** (2026-10-01): `Db` over the real `FsStorage` on simio's disk; 300 puts,
-  deletes and compactions per run, checked after every reopen against what was
-  acknowledged. Holds through 40 seeds of crashes plus I/O errors, and under bit rot
-  never serves a value that was not written; a store whose `sync` does nothing is
-  caught losing acknowledged writes. `allocate`/`syncData` turned out to be unused by
-  `Db`, so the raw `fallocate`/`fdatasync` were never reached. **Found a defect** once
-  disk calls became preemption points (they were instantaneous before, which no real
-  disk is): `Db`'s spinlock, held across `sync`, spun forever when a second task of
-  the same thread called into the store. Fixed in kv (`std.Io.Mutex` when the storage
-  has an `Io`); the pilot's two-task test hangs with the old lock.
-- **http client** (2026-10-01): `Client` (pooling, the stale-connection retry, both
-  timeouts) against a small HTTP/1.1 server in the pilot. Twenty fetches over one
-  pooled connection; a server that closes behind a keep-alive costs a transparent
-  redial each time; `total_timeout_ms` and `connect_timeout_ms` fire at exactly 3000
-  and 2000 ms of virtual time; 20 seeds of loss/partitions/crashes never hand back a
-  wrong body. A caller that does not bound its own body reads (the client documents
-  that it does not) is caught waiting forever on a server stalled mid-body. No
-  defect found.
-- **http Server** (2026-10-01): its stall timeouts and deadlines polled the raw
-  socket and read `clock_gettime`, so under simio it ran with none; rewritten in
-  `http` to arm deadlines that one reaper task per `serve` enforces through
-  `std.Io`. Piloted with the real server and client together (one pooled
-  connection; 20 fault seeds), and with misbehaving clients: a stall mid-head is
-  dropped at 1000–1100 ms, a dribble at the 3000 ms request deadline, a client that
-  stops reading after the write timeout; with the timeouts off, a stalled client
-  holds its connection for the whole run, and the check sees it.
-
-- **icmp** (2026-10-01): the module ran on raw syscalls only; it gained a `std.Io`
-  path (`Config.io`, `IoSocket`: ping sockets from `std.Io.net`, clocks and waits
-  through the `Io`) and is piloted on it. Reachable targets come out alive with an
-  RTT of exactly the path's round trip, a partitioned one dead after its retries;
-  over 30 seeds of rough links (loss, duplication, 300 ms reordering, corruption)
-  and partitions no reply is ever credited with an RTT shorter than the path (what a
-  reply matched to the wrong probe would show), and duplicates count as duplicates.
-  A timeout below the round trip is caught reporting live hosts dead.
-
-- **timeouts** (2026-10-01) — the "move loopback tests" item. A survey of every
-  loopback test that depends on wall-clock timing found the Io-only ones in `dns`,
-  `http`, `modbus`, `whois`, `stun`, `ocspcache`, `llmclient`, `snmp`, `bacnet`; the
-  rest (`fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm`, `opcua`) poll or sleep
-  with raw syscalls and are out of simio's reach until they go through `std.Io`.
-  The loopback tests stay in their modules: they are the real-kernel half, already
-  hardened against load (read cues instead of sleeps, upper bounds of seconds), and
-  CONVENTIONS forbids moving a test out of reach. What moved is what they cannot
-  say — *when*: `pilots/timeouts.zig` checks `modbus` (a silent peer ends at exactly
-  80 ms; with no timeout the caller's cancel lands at exactly 300 ms), `whois` (a
-  slow peer abandoned at 80 ms, not at its 900 ms reply; dialed by host name),
-  `stun.query` (a dark server at exactly 150 ms, an answer after one round trip) and
-  `ocspcache`'s fetch (no body: ends 200 ms after the head) and `llmclient`'s body
-  read (a one-byte-per-50-ms trickle ends 300 ms after the head). `dns` and `http`
-  had their timing moved in their own pilots above. `snmp` and `bacnet` turned out
-  to have no timing left to move: their cancel tests already wait for the request
-  to arrive instead of sleeping.
-
-- **staticfiles** (2026-10-01, after the file system gained links): the real
-  `staticfiles.Handler` behind `http.Server`, fetched by `http.Client` by host name,
-  over a root holding a link inside it, a link out to a secret and a link to an
-  ancestor directory. No response carries a byte from outside the root — by default
-  every link is refused (403), with `follow_symlinks` the inside one is served and the
-  escaping ones still refused, `..` and `%2e%2e` never get out. A handler that only
-  sanitizes the path text and then opens it is caught leaking the secret. No defect
-  found. (`resolve_beneath` is ignored by simio exactly as `std.Io.Threaded` ignores
-  it on Linux, where `O_RESOLVE_BENEATH` does not exist.)
-
-**Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
-(or spin-wait) could be held across a call that suspends under an `Io` running several
-tasks on one thread. Fixed — the lock waits through the `Io` when one is known: `kv`
-(`Db`, `Storage.io`), `sessions` (`KvStore`), `writebehind` (`KvtreeSink`, via
-`kvtree.Lock`/`Db.io()`), `mqtt` (`tx_lock` and teardown, `Transport.io`), `http`
-(`h2_upstream` session/dial locks), `accesslog` (`Sink` waiters, `Options.io`; was `metrics.AccessLog` until 2026-10-06),
-`xmss`/`lms` (`Persist.io`). Documented: `ramcache` (callbacks must not suspend).
-By contract already: `h2_server` (without `Dispatcher.io` its tasks must be OS
-threads). The other ~15 spinlock modules guard memory only.
-
-**Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
-`RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
-some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simulated
-`Io` and gets fixed when its pilot reaches it. What the remaining pilots need first:
-
-- **kv** `FsStorage`: `allocate` and `syncData` still call `fallocate`/`fdatasync`
-  directly (std.Io has neither) and get `EBADF` under simio; `Db` never calls them.
-
-Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` instead
-of touching one of the test process's own descriptors.
-
-## Backlog / deferred
-
-Every in-scope `std.Io` entry is implemented (2026-10-01). Open in simio (re-survey
-2026-10-03, from the review's "Not changed" and the comparison above):
-
-- **A lock never released ends as `.step_limit`, not `.deadlock`:** file locks wait by
-  polling, so the deadlock detector never sees the waiter as blocked. Wanted: lock
-  waiters parked like futex waiters, so the outcome names the stuck tasks.
-- **`MSG_TRUNC` on request:** an oversized datagram is truncated and flagged, but a
-  caller asking for the full length (`MSG_TRUNC` in flags) does not get it.
-- **Architectures:** only where `std.Io.fiber` exists (x86_64, aarch64, riscv64); a
-  32-bit or other host cannot run a simulation at all. Upstream-bound (std); recorded
-  so a consumer is not surprised.
-
-Open, in OTHER modules:
-
-- **Six modules out of simio's reach** (user, 2026-10-01: shift loopback tests toward
-  simulation, so a consumer never needs a namespace or the host's network rules):
-  `fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm` and `opcua` poll or sleep with
-  raw syscalls (`poll`, `clock_gettime`, `nanosleep`) instead of `std.Io`, so their
-  timing cannot be simulated (§ Pilots, "timeouts"). Each needs its socket waits and
-  clocks moved behind the `Io` it is given — the same change `sntp`, `mqtt` and the
-  `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
-  loopback tests stay as the real-kernel half; this repo's lanes run them under
-  `scripts/lib/netns-run`.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 3 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
