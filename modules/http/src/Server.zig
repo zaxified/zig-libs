@@ -3673,6 +3673,12 @@ pub const header_copy_bytes = 4096;
 /// Not movable once `writer` has been handed out — nor once trailers are
 /// declared: the emitted `Trailer` header value points into
 /// `trailer_decl_buf`, i.e. into the writer itself.
+/// `ResponseWriter.on_head`: a function and its context.
+pub const HeadHook = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, rw: *ResponseWriter) void,
+};
+
 pub const ResponseWriter = struct {
     out: *Writer,
     chunk_buf: []u8,
@@ -3752,6 +3758,15 @@ pub const ResponseWriter = struct {
     header_buf: [header_copy_bytes]u8 = undefined,
     header_buf_len: usize = 0,
     sent_head: bool = false,
+    /// Called once, right after the response head has been written (h1 text
+    /// or h2 fields), on the thread that wrote it: when the head is committed
+    /// by a flush, by the body outgrowing the buffer, or by `end` after the
+    /// handler returned. Go's `WriteHeader` moment, for instrumentation
+    /// (`metrics`' time-to-write-header histogram); the hook sees the final
+    /// `status`. A middleware that sets it owns the slot while it runs and
+    /// restores the previous value (calling it from its own hook) before it
+    /// returns: `ctx` must stay valid for as long as the slot holds it.
+    on_head: ?HeadHook = null,
     /// When set, `writeHead` hands the response head over as (name, value)
     /// pairs instead of formatting it into HTTP/1.1 text. That is what the h2
     /// server uses: its framer needs fields, and formatting a head into text
@@ -5055,6 +5070,11 @@ pub const ResponseWriter = struct {
         }
         try out.writeAll("\r\n");
         rw.sent_head = true;
+        rw.fireHeadHook();
+    }
+
+    fn fireHeadHook(rw: *ResponseWriter) void {
+        if (rw.on_head) |h| h.func(h.ctx, rw);
     }
 
     /// RFC 9113 §8.2.1: field names go on the h2 wire lowercase.
@@ -5137,6 +5157,7 @@ pub const ResponseWriter = struct {
             else => null,
         });
         rw.sent_head = true;
+        rw.fireHeadHook();
     }
 
     /// Put the head on the wire and pick the streaming framing. Called on
@@ -7585,6 +7606,57 @@ test "serveStream: trailers on a streamed body arrive after the last chunk" {
     // The body really did stream (multiple chunks), so the head was on the
     // wire well before `setTrailer` ran.
     try testing.expect(std.mem.count(u8, got, "\r\n") > 8);
+}
+
+const HeadHookProbe = struct {
+    calls: u32 = 0,
+    status: u16 = 0,
+    buffered_at_call: usize = 0,
+
+    fn hook(ctx: ?*anyopaque, rw: *ResponseWriter) void {
+        const p: *HeadHookProbe = @ptrCast(@alignCast(ctx.?));
+        p.calls += 1;
+        p.status = rw.status;
+        p.buffered_at_call = rw.out.buffered().len;
+    }
+};
+
+test "ResponseWriter.on_head fires once, as the head is written, with the final status" {
+    // Buffered: the head goes out at `end`.
+    {
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        var probe: HeadHookProbe = .{};
+        rw.on_head = .{ .ctx = &probe, .func = HeadHookProbe.hook };
+        rw.setStatus(201);
+        try rw.writeAll("hi");
+        try testing.expectEqual(@as(u32, 0), probe.calls); // still buffered, nothing written
+        try rw.end();
+        try testing.expectEqual(@as(u32, 1), probe.calls);
+        try testing.expectEqual(@as(u16, 201), probe.status);
+        try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 201"));
+        try testing.expect(probe.buffered_at_call > 0); // the head was already in the writer
+    }
+    // Streaming: the flush commits the head, the later end does not fire again.
+    {
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        var probe: HeadHookProbe = .{};
+        rw.on_head = .{ .ctx = &probe, .func = HeadHookProbe.hook };
+        try rw.writeAll("part");
+        try rw.flush();
+        try testing.expectEqual(@as(u32, 1), probe.calls);
+        try testing.expectEqual(@as(u16, 200), probe.status);
+        try rw.writeAll("more");
+        try rw.end();
+        try testing.expectEqual(@as(u32, 1), probe.calls);
+    }
 }
 
 test "ResponseWriter.bodyBytesSent: chunked and until-close count body octets, not framing" {
