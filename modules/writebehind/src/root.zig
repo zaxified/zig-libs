@@ -76,8 +76,8 @@
 //!     does all cache/WAL bookkeeping.
 //!   * **The `Sink` must tolerate concurrent calls** from multiple worker
 //!     threads (and the coordinator thread during `get` read-through /
-//!     `recover`). The reference `KvtreeSink` / `MapSink` serialize internally
-//!     with a spinlock, since `kvtree` is single-writer.
+//!     `recover`). The reference `KvtreeSink` (with `kvtree.Lock`, since `kvtree` is
+//!     single-writer) and `MapSink` (with a spinlock) serialize internally.
 //!   * **The allocator must be thread-safe** (the worker pool allocates queue
 //!     nodes and job boxes from worker threads — `workerpool`'s documented
 //!     requirement). Use a thread-safe allocator not near exhaustion.
@@ -138,7 +138,7 @@ pub const SimStorage = kvtree.SimStorage;
 /// DL6) implements it. **Thread-safety:** `write`/`delete`/`read` may be called
 /// concurrently from multiple worker threads and the coordinator thread — an
 /// implementation that is not internally thread-safe must synchronize (the
-/// reference adapters use a spinlock).
+/// reference adapters use `kvtree.Lock` and a spinlock).
 pub const Sink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -358,7 +358,7 @@ pub const Options = struct {
     /// **counted and inspectable** (`poisonedCount` / `poisoned`), never silent;
     /// treat a non-zero count as data loss that has already happened.
     ///
-    /// This defaulted to `jobqueue`'s own `max_attempts` of 5 until 2026-07-31,
+    /// This defaulted to `jobqueue`'s own `max_attempts` of 5 until,
     /// which silently dropped an acked write after five rejections while the
     /// SPEC promised the opposite.
     ///
@@ -2416,7 +2416,7 @@ test "one key never has two sink calls in flight (dirty AND orphan selects it tw
     try testing.expect(os.inner.peek("k") == null); // the delete landed last
 }
 
-// Regression (mutation run 2026-10-05). `flushOneSync` read `lease.partition`
+// Regression. `flushOneSync` read `lease.partition`
 // AFTER `ack` had freed it, then leased that key's next record and dropped the
 // lease: the record stayed invisible for the 60 s visibility timeout and
 // `flushAll` gave up with it pending. In safe modes `free` fills the key with
@@ -2450,7 +2450,7 @@ test "meta is well-formed" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -2569,7 +2569,7 @@ test "back-pressure: records of a reopened WAL (not in the cache) are flushed sy
     try testing.expectEqualStrings("3", rig.sink.get("r").?);
 }
 
-// ── whole-module mutation audit (2026-11-18): killing tests ──────────────────
+// ── whole-module mutation audit: killing tests ──────────────────
 
 /// Poll until a worker has published a completion (bounded by wall time). The
 /// task stays on the completion list until the coordinator thread pumps it, so
@@ -3565,7 +3565,7 @@ test "deinitNoFlush discards queued flush jobs: only the running write finishes"
     defer wal_sim.deinit();
     var gs: GateSink = .{ .inner = MapSink.init(testing.allocator), .io = threaded.io() };
     defer gs.inner.deinit();
-    // wbmut-2 (fixed 2026-11-19): the tasks of the jobs the pool drops unrun
+    // wbmut-2: the tasks of the jobs the pool drops unrun
     // (task, key, value: three allocations each) used to leak; the leak-checked
     // allocator now proves `deinitNoFlush` frees them.
     const c = try Coordinator.init(testing.allocator, .{
@@ -3708,7 +3708,7 @@ test "F5b: a key waiting out its retry backoff no longer stalls the synchronous 
     try testing.expect(waitsNow(c, "a"));
     rig.sink.reject_key = null;
     // flushAll's backstop excludes "a" (both of its records) and lands "b";
-    // before 2026-11-19 it did not run at all while "a" waited.
+    // earlier it did not run at all while "a" waited.
     try testing.expectError(error.FlushIncomplete, c.flushAll());
     try testing.expectEqualStrings("2", rig.sink.get("b").?);
     try testing.expect(rig.sink.get("a") == null); // not retried early
@@ -3773,7 +3773,7 @@ test "F5b review: a key whose backoff lapses in the middle of a pass is not writ
     try testing.expect(!c.flushOneSync()); // "a"'s oldest rejected: "a" waits an hour
     rig.sink.reject_key = null;
     // The backoff lapses at the 4th clock reading from here. In the
-    // 2026-11-19 lease-and-release design that fell between the two dequeues
+    // lease-and-release design that fell between the two dequeues
     // of one pass (first record leased as waiting, second one written and
     // acked, then the first released and written over it); now the waiting
     // set is read once per pass, so wherever the jump falls the key's
