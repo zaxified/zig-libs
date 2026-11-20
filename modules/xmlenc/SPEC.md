@@ -262,8 +262,6 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 
 ## What is deliberately not done
 
-- **Encryption** (`encryptData`) — out of scope: we are the receiving party with the private key. (xmlsec encrypts; a user
-  building an IdP or a test peer needs another tool. The survey raised it as a question, the answer so far is the Scope.)
 - **`<xenc:CipherReference>`** (ciphertext by external URI) — dereferencing it is an SSRF / XXE surface. Rejected with
   `error.CipherReferenceUnsupported` before any cryptographic operation.
 - **`ds:Transforms` on the ciphertext** — same dereference/transform surface; not honored (only inline
@@ -276,6 +274,10 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 
 ## Backlog / deferred
 
+- **Encryption (`encryptData`).** The reference encrypts: xmlsec1's `--encrypt` (`xmlSecEncCtxXmlEncrypt` /
+  `xmlSecEncCtxBinaryEncrypt` in its API), so an IdP or a test peer built on this module needs another tool today.
+  Not small: an `EncryptedData`/`EncryptedKey` writer (RSA-OAEP key transport, AES-GCM content, the template
+  serialisation) is a second half of the module. Effort: medium.
 - **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey:** used by newer eIDAS/SAML profiles that avoid
   RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256 ECDH + Concat KDF; check siblings). Low to
   medium priority; fits the module's scope.

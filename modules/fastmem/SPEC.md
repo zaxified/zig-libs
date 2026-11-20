@@ -26,12 +26,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [musl libc](https://git.musl-libc.org/cgit/musl) `memset` — **reference** | C | MIT (COPYRIGHT: "standard MIT license", verified) | — (no GitHub mirror under bminor) | 1.2.x *(inferred)* | The libc `memset` a no-libc Zig binary would otherwise want: same C semantics (returns `dest`, low byte of `c`, length 0 writes nothing) as here. Design named in this module's README as the model (overlapping first/last vector). Measured with `bench-fastmem` (see § Performance; the card has the figures). |
-| Zig `compiler_rt` `memset` (Zig 0.16.0, `lib/compiler_rt.zig`) | Zig | MIT | — | Zig 0.16.0 | What every no-libc Zig binary gets today: a weak export. On Zig 0.16 `memset` was scalar, one byte per iteration, 20-27x slower than this module (README table). On 0.17.0 `memset` is vectorised (`fastMemset`; byte-wise only in ReleaseSmall) and `memcpy` copies element by element with no string move; this module is still 1.0–1.8x faster on `memset` and 1.1–2.0x on `memcpy`. |
+| Zig `compiler_rt` `memset` (Zig 0.16.0, `lib/compiler_rt.zig`) | Zig | MIT | — | Zig 0.16.0 | What every no-libc Zig binary gets today: a weak export. On Zig 0.16 `memset` was scalar, one byte per iteration, 20-27x slower than this module (README table). On 0.17 `memset` is vectorised (`fastMemset`; byte-wise only in ReleaseSmall); `memcpy` (0.17.1 `lib/compiler_rt/memcpy.zig`) has overlapping small cases below 16 B and up to two vectors (`copyLessThan16`, `copy16ToSmallLimit`), then copies one vector element at a time with no string move. On 0.17.1 compiler_rt took 1.0–2.3x this module's time on `memset` and 1.0–2.6x on `memcpy` (`bench-fastmem` 2026-11-20, loaded machine). |
 | [rust-lang/compiler-builtins](https://github.com/rust-lang/compiler-builtins) `mem` | Rust | MIT OR Apache-2.0 (README verified; API says NOASSERTION) | 519 | libm-v0.2.16 (2026-01-24); push 2026-09-29 | Rust's counterpart to compiler_rt: a fallback `memset` for targets without libc, which vector-wide paths on x86 *(inferred, not read)*. Same niche and same opt-in-by-linking story. |
 | Go runtime `memclrNoHeapPointers` ([golang/go](https://github.com/golang/go)) | Go (asm) | BSD-3-Clause | 139k | push 2026-09-29 | A zeroing primitive only (no arbitrary fill byte); the technique this module's README names as a model. Not usable outside Go. |
 | glibc `memset` | C | LGPL-2.1+ (not verified; source not read) | — | — | Per-CPU IFUNC variants (ERMS `rep stosb`, AVX2/AVX-512) *(inferred)*; needs libc, which this module exists to avoid. It, not this module, is faster past a few KiB on ERMS CPUs, which this module lists as deliberately not done. |
 
-**Where we are ahead:** of `compiler_rt` (the only alternative without libc): 20-27x on `memset` at 256 B-16 KiB on Zig 0.16, 1.0–1.8x (`memset`) and 1.1–2.0x (`memcpy`) on 0.17.0, including every `std.crypto.secureZero` and the deflate table clear in std; a strong-symbol export proved by a test that resolves the linked `memset`; a compile error rather than silently interposing when libc is linked. **Where we are behind:** no per-CPU dispatch and no non-temporal path for clears or copies larger than the cache (*What is deliberately not done*; glibc's non-temporal `memcpy` is 1.4–1.6× faster at 4 MiB); `memmove`/`bcmp` are not provided (*What this module is, and what it is not*).
+**Where we are ahead:** of `compiler_rt` (the only alternative without libc): 20-27x on `memset` at 256 B-16 KiB on Zig 0.16, 1.0–2.3x (`memset`) and 1.0–2.6x (`memcpy`) on 0.17.1, including every `std.crypto.secureZero` and the deflate table clear in std; a strong-symbol export proved by a test that resolves the linked `memset`; a compile error rather than silently interposing when libc is linked. **Where we are behind:** no per-CPU dispatch and no non-temporal path for clears or copies larger than the cache (*What is deliberately not done*; glibc's non-temporal `memcpy` is 1.4–1.6× faster at 4 MiB); `memmove`/`bcmp` are not provided (*What this module is, and what it is not*).
 
 ## What this module is, and what it is not
 
@@ -40,8 +40,9 @@ library: each function is here because a profile of a libc-free binary showed
 compiler_rt's one on a hot path. `memcpy` was first refused (compiler_rt's is
 vectorised); `bench-websocket` then showed it at 58 % of a 64 KiB
 frame read, and a probe against glibc found why: compiler_rt copies element by
-element with no string move and no unrolled small cases, 1.6–2.3× glibc at
-64 B–16 KiB and 1.2–1.4× from 256 KiB. `memmove` and `bcmp`
+element with no string move (its overlapping small cases stop at two vectors),
+1.6–2.3× glibc at 64 B–16 KiB and 1.2–1.4× from 256 KiB (Zig 0.17.0; on 0.17.1
+it is 1.0–2.6× this module's `memcpy`). `memmove` and `bcmp`
 are not provided: nothing on a measured hot path reaches them (std's `mem.eql`
 has its own vector loop); add them when a profile shows one.
 
@@ -204,4 +205,4 @@ Why P2 and not P1: the 64 KiB aligned rows sit at 1.00–1.01× musl. At 64 KiB 
 
 - **Performance P2 → P1:** the 64 KiB aligned rows are at 1.00–1.01× musl, which is hardware parity (§ Performance); P1 needs the reference at or below 1.0 on every row.
 - **No-libcall guard.** Nothing checks that the compiled `set`, `copy`, `setLarge`, `copyLarge`, `setSmall` and `copySmall` contain no `call memset` or `call memcpy`. A dropped `volatile` would turn a loop into a self-call, and only the optimised CI lanes would show it, as a hang or a stack overflow. Candidate: a `check-*` step that disassembles a ReleaseFast object and greps it.
-- **Re-check against compiler_rt on each Zig upgrade** (`lib/compiler_rt.zig`, `memset` and `memcpy`), and decide delete or keep. The original trigger (compiler_rt's `memset` vectorised) fired on Zig 0.17.0, but this module is still ahead (1.0–1.8× on `memset`, 1.1–2.0× on `memcpy`), so it stays.
+- **Re-check against compiler_rt on each Zig upgrade** (`lib/compiler_rt.zig`, `memset` and `memcpy`), and decide delete or keep. The original trigger (compiler_rt's `memset` vectorised) fired on Zig 0.17.0, but this module is still ahead (Zig 0.17.1, `bench-fastmem` 2026-11-20 on a loaded machine: compiler_rt 1.0–2.3× slower on `memset`, 1.0–2.6× on `memcpy`, the gap largest at 16–256 B, smallest at 4–64 KiB), so it stays.

@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves) `ed448-goldilocks` | Rust | Apache-2.0 OR MIT (crate manifest + LICENSE-MIT/-APACHE) | 876 (monorepo) | crate 0.14.0-pre.15; no GitHub releases, pushed 2026-09-28 | Pre-release crate whose README says "NOT BEEN AUDITED OR REVIEWED". Exposes the curve, Curve448, Decaf448, RFC 9380 hash-to-curve/hash-to-scalar and an optional signing feature; group-level API (points, scalars), where this module offers the two protocols plus raw `Point`. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No 448-bit curve at all (checked `lib/std/crypto/`: `25519/`, `pcurves/{p256,p384,secp256k1}`, no 448 field or curve). |
 
-**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none; the Ed448 to X448 key conversion (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`) that libdecaf and `std`'s `X25519.KeyPair.fromEd25519` offer. **Where we are behind:** RFC 9380 edwards448 hash-to-curve and batch verification / key blinding that the Rust crate or CIRCL-style toolkits offer as extras (→ *Backlog / deferred*); none of these is part of what OpenSSL offers for Ed448/X448.
+**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none; the Ed448 to X448 key conversion (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`) that libdecaf and `std`'s `X25519.KeyPair.fromEd25519` offer. **Where we are behind:** RFC 9380 edwards448 hash-to-curve that the Rust crate offers (→ *Backlog / deferred*), and batch verification / key blinding that CIRCL-style toolkits offer as extras (→ *What is deliberately not done*); none of these is part of what OpenSSL offers for Ed448/X448.
 
 ## Design
 
@@ -285,6 +285,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Masking a non-canonical `u`** that RFC 7748 §5 permits: `scalarmult` rejects it (see *Threat model*).
 - **A general Montgomery<->Edwards point conversion**: only the one-directional key conversion exists
   (see *Design*).
+- **Ed448 batch verification and key blinding:** the reference, OpenSSL, offers neither for Ed448 (its EVP
+  Ed448 is one-shot sign/verify with context and Ed448ph); `std.crypto.sign.Ed25519`'s `verifyBatch` and
+  `key_blinding` are Ed25519-only conveniences.
 - **`std.crypto.ff.Modulus(448)`** for the field: correct, but it would throw away the Solinas-style
   reduction that `p = 2^448 - 2^224 - 1` was chosen for (see *Design*).
 
@@ -359,7 +362,6 @@ forced-inline `mulI`/`squareI`) are in *Design*.
   ~224 B ≈ 400 KB of table (estimate). `.small` → a smaller comb (fewer teeth or w=4 windowed) — slower keygen/sign, same constant-time
   guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
 - **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
-- **Ed448 batch verification and key blinding** *(survey 2026-09-30)*: `std.crypto.sign.Ed25519` offers `verifyBatch` and a `key_blinding` submodule; neither has an Ed448 analogue here.
 - **`scalar.zig` `condSubL` mask not laundered**: `Fe`'s selects use `field.blackBox`; the same change on the scalar's conditional subtraction made `decaf448`'s `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
 - **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 

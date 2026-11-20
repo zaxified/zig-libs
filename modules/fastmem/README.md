@@ -3,15 +3,16 @@
 **A vectorised `memset` and `memcpy`** that an executable linking no libc can
 export to replace compiler_rt's. Every runtime-length `@memset`/`@memcpy` and
 every `std.crypto.secureZero` in the binary — std's own included — then runs
-through them: on Zig 0.17.0, 1.0–1.8× faster than compiler_rt's `memset` and
-1.1–2.0× than its `memcpy`, level with glibc (the card's Performance line has the ratios). On Zig 0.16,
+through them: on Zig 0.17.1, 1.0–2.3× faster than compiler_rt's `memset` and
+1.0–2.6× than its `memcpy` (closest at 4–64 KiB), level with glibc (the card's Performance line has the ratios). On Zig 0.16,
 whose compiler_rt `memset` stored one byte per iteration, `memset` was 20–27× faster.
 
 - **Status:** gap on Zig 0.16 — without libc, std had no fast `memset` at all.
   **Zig 0.17.0's `compiler_rt.memset` is vectorised** (`fastMemset`; byte-wise only
-  in ReleaseSmall) and its `memcpy` copies element by element with no string
-  move; both were re-measured on 0.17.0 and this module is still ahead (SPEC
-  § Performance; the card has the figures). The speed table below is the
+  in ReleaseSmall) and its `memcpy` has overlapping small cases up to two
+  vectors, then copies element by element with no string move; both were
+  re-measured on 0.17.1 and this module is still ahead (SPEC *Compared with*;
+  the card has the musl/glibc figures). The speed table below is the
   0.16 measurement.
 - **Model after:** musl's and Go's runtime `memclr`: full-width vector stores
   with overlapping unaligned first and last vectors; `rep stosq` for the middle

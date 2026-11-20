@@ -263,6 +263,9 @@ asserts against that convention, with two carved-out groups:
 - **Reviver/replacer, a streaming reader, a comment-preserving round trip.** `std.json` typed decoding
   replaces the reviver; no implementation surveyed has the other two.
 - **`AnnotatedResult` against the `diagnostics` module** — the result stays a raw `{ out, next_id }` pair: using `diagnostics`' line/col/severity type would add a dependency to a module whose references (the json5 crate, JSON5 reference implementation) have no such type, and no consumer asked.
+- **Format-preserving span find/replace** (replace one value in place, keeping the surrounding text and
+  comments). The reference json5/json5 has only `parse`/`stringify` (its README API), and no other
+  implementation surveyed offers it; a consumer that needs it keeps its own span helper.
 
 ## Open
 
@@ -276,9 +279,6 @@ asserts against that convention, with two carved-out groups:
   json-five 0.3.1; Kijewski's pyjson5 2.0.1 (Cython, C++ core) has not been timed — building it from its
   `.pyx` was refused by the session's permission check. Its decoder, read in full, goes character by
   character into a UCS-4 buffer, so a lead is likely; claim `speed —` only after timing it.
-- **Format-preserving span find/replace.** What a terminal-UI consumer's own span helper does (replace one
-  value in place keeping the surrounding text). Not parity (no reference has it); the decision whether it
-  belongs in this module is the owner's. Effort: medium.
 
 ## Anchoring
 

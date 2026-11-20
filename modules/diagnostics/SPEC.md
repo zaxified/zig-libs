@@ -43,7 +43,7 @@ Only READMEs and docs were read (and, for Zig `std`, the MIT source on disk); no
 `file:line:col` one-line output, and a snippet renderer that escapes control characters so untrusted key names cannot
 inject terminal escapes (none of the Rust renderers' READMEs claim this; *inferred*: not checked in their source); tree
 `path` for findings that have no source position, and `expr_off`/`expr_len` for in-expression highlighting.
-**On par:** several labelled spans per diagnostic (also across files), codespan's rich layout (labels of one line merged, multi-line spans drawn), colour, `note:`/`help:` notes, a code URL, a structured fix-it edit, LSP 3.17 both ways with the `hint` level, and byte-range spans (codespan's `start..end`, `Files::location`): `Source.location` / `Source.range` → `Range.applyTo` / `Range.label`. **Where we are behind:** no per-label colours, no narrated printer (miette), no diff-style suggestion rendering (annotate-snippets `Patch`, see Backlog), codespan's medium style is not ported (our one-line `short` takes its place); at most 64 spans and 16 multi-line spans per file are drawn, the rest are listed as location lines. The rejected items are under *What is deliberately not done*.
+**On par:** several labelled spans per diagnostic (also across files), codespan's rich layout (labels of one line merged, multi-line spans drawn), colour, `note:`/`help:` notes, a code URL, a structured fix-it edit, LSP 3.17 both ways with the `hint` level, and byte-range spans (codespan's `start..end`, `Files::location`): `Source.location` / `Source.range` → `Range.applyTo` / `Range.label`. **Where we are behind:** no per-label colours, no narrated printer (miette), no diff-style suggestion rendering (annotate-snippets `Patch`; not in the reference, see *What is deliberately not done*), codespan's medium style is not ported (our one-line `short` takes its place); at most 64 spans and 16 multi-line spans per file are drawn, the rest are listed as location lines. The rejected items are under *What is deliberately not done*.
 
 ## Design & invariants
 LSP-style structured validation-finding collector: an ordered `Diagnostics` list of `error`/
@@ -109,12 +109,13 @@ Run: `scripts/modtest diagnostics`. The module has no fuzz obligation (the card'
 
 - Per-label colours and 24-bit colour, a narrated (screen-reader) printer, an error framework (miette), OSC-8 links and SARIF output.
 - codespan's `medium` display style (our one-line `short` takes its place).
-- Diff-style suggestion rendering (annotate-snippets `Patch`) is listed on the card's Scope line as deliberately not done; the Backlog still carries it as `later` (see there).
+- Diff-style suggestion rendering (annotate-snippets `Patch`): the reference, codespan-reporting, has none (a
+  `Diagnostic` carries labels and notes only; its README and docs); a suggestion here is the structured fix-it edit
+  plus its `help:` text.
 - **Aligning the snippet and LSP readings of a half-given span** — `end_col` with no `end_line` (snippet: one caret, `writeLsp`: ends at it) and `line` with no `col` (snippet: one caret at column 1, `writeLsp`: the whole line) differ on purpose; the snippet goldens are pinned on the former and changing them is a rendering change nobody asked for. Documented on `render`; give both ends for the same span in both.
 
 ## Backlog / deferred
 
-- **R11: diff-style suggestion rendering** (annotate-snippets `Patch`). Effort M. Marked `later` in the survey; the card's Scope line lists it as deliberately not done: the owner decides which holds.
 
 ## Anchoring
 
