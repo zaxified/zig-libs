@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): randomized property tests: monotone cost, recovery uniformity, bounded memory (no reference model)
+What the tests check instead of a model: randomized property tests: monotone cost, recovery uniformity, bounded memory (no reference model)
 
 **Known defects:** none recorded
 
@@ -29,12 +29,7 @@ topology. This estimator combines echo-probe timing with jitter/loss statistics
 **input filter** to the link-state metric: bounded detection latency without
 flap-driven churn.
 
-- **Status:** the core scope (an estimator, not a BFD implementation) is
-  implemented — hysteresis kernel, latency-aware path cost, hysteretic path
-  selector, trace corpus, scoring and property harness; the BFD wire protocol
-  and the rest are under [Backlog / deferred](#backlog--deferred).
-  **Platform:** any — the estimator never reads a wall clock; every `now` is
-  caller-supplied.
+- **Platform:** any — the estimator never reads a wall clock; every `now` is caller-supplied.
 - **Deps:** `netsim`, `latency-stats`.
 - **Model after:** BFD (RFC 5880) liveness + Babel-style metric hysteresis.
 
@@ -45,14 +40,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | RFC 5880 BFD, implemented in [FRRouting/frr](https://github.com/FRRouting/frr) `bfdd` — **reference** | C | GPL-2.0-or-later (README; API: NOASSERTION) | 4.3k | push 2026-09-29 | The wire protocol: sessions, control packets, negotiated intervals, detect multiplier, echo mode, authentication. Our module has none of it, by design: the caller sends probes. *(bfdd feature list: inferred from the RFC)* |
-| [jech/babeld](https://github.com/jech/babeld) | C | MIT | 453 | push 2026-06-20 | Babel routing daemon with link-cost estimation and metric smoothing (README: "provisions for link cost estimation"); the smoothing idea we take, and since 2026-10-06 its RTT penalty (`rtt-min`/`rtt-max`/`max-rtt-penalty`, RFC 9616) and ETX shape for `pathCost()`, with babeld's documented tunnel defaults. Cost estimation is bound to the daemon; babeld also measures loss per direction (Hello/IHU), which an echo prober cannot. |
+| [jech/babeld](https://github.com/jech/babeld) | C | MIT | 453 | push 2026-06-20 | Babel routing daemon with link-cost estimation and metric smoothing (README: "provisions for link cost estimation"); the smoothing idea we take, and its RTT penalty (`rtt-min`/`rtt-max`/`max-rtt-penalty`, RFC 9616) and ETX shape for `pathCost()`, with babeld's documented tunnel defaults. Cost estimation is bound to the daemon; babeld also measures loss per direction (Hello/IHU), which an echo prober cannot. |
 | [hashicorp/memberlist](https://github.com/hashicorp/memberlist) | Go | MPL-2.0 | 4.1k | push 2026-09-29 | SWIM gossip with a probe/suspect/dead failure detector, but for cluster members, not link quality; no metric output *(inferred)*. |
 | [akiradeveloper/phi-detector](https://github.com/akiradeveloper/phi-detector) | Rust | MIT | 10 | push 2024-03 | Phi-accrual detector: a continuous suspicion level from heartbeat inter-arrival times; no asymmetric up/down hysteresis, no cost output *(inferred from the name and description)*. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'bfd protocol' --language zig`: none); sibling `health` is an HTTP health endpoint, unrelated. |
 
 **Where we are ahead:** hysteresis is *scored*, not asserted — detection latency (≤ 1500 ticks) and spurious failovers per simulated week (budget 5) are measured over a replayable trace corpus, and the ordering key `pathCost()` is separated from the damped `state()`; no wall clock, bounded memory (64-probe ring), no allocator. **Even with babeld:** the path cost combines loss (ETX) with a Babel delay-metric RTT penalty, and path choice is damped (`Selector`: margin + hold), as babeld damps route selection. **Where we are behind:** the BFD wire protocol and interval negotiation, echo/one-way modes (loss is round-trip only), and phi-style adaptive thresholds *(→ Backlog)*.
 
-Re-assessed 2026-10-06 (no new web survey; babeld's defaults re-read from its man page): the 2026-09-30 gap a user would hit — a loss-only cost that cannot tell an LTE path from a satellite one — is closed, so the estimator covers its main use cases (detect failure without flapping, order paths by quality, pick one without flapping); what remains is a sibling wire-protocol module and adaptive thresholds, both Backlog-grade.
+The estimator covers its main use cases — detect failure without flapping, order paths by quality, pick one without flapping; what remains is a sibling wire-protocol module and adaptive thresholds, both Backlog-grade.
 
 ## Use
 
@@ -164,15 +159,13 @@ Provenance: clean-room from RFC 5880 (BFD), the published Babel metric
 hysteresis description, RFC 8966 (ETX) / RFC 9616 (RTT penalty) and the
 babeld(8) man page (for the default `rtt-min`/`rtt-max`/`max-rtt-penalty`/
 `rxcost` values) — public specs and documentation, no third-party source
-ported or studied, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+ported or studied, so the module has no `NOTICE` of its own.
 
 ## Backlog / deferred
 
-- ~~(survey 2026-09-30) RTT/jitter in `pathCost()`~~ — done 2026-10-06: ETX loss cost + RFC 9616 RTT penalty, opt-in jitter, `Selector` hysteresis.
-- (2026-10-06) A separate RTT smoothing weight (babeld's `rtt-decay`, default 42/256 ≈ 0.16): the RTT average shares `metric_smoothing` (0.25) today. Effort: small; fits §2.
-- (survey 2026-09-30) A BFD control-packet codec and session state machine (RFC 5880 §4 packet, §6.8 state machine) as a sibling module, feeding this estimator. Users of BFD expect interoperability with FRR/bird peers. Effort: medium; fits §2.
-- (survey 2026-09-30) Adaptive thresholds (phi-accrual style) instead of fixed `down_threshold`/`up_threshold`, for links whose jitter varies by orders of magnitude. Effort: medium; fits §2.
+- A separate RTT smoothing weight (babeld's `rtt-decay`, default 42/256 ≈ 0.16): the RTT average shares `metric_smoothing` (0.25) today. Effort: small; fits §2.
+- A BFD control-packet codec and session state machine (RFC 5880 §4 packet, §6.8 state machine) as a sibling module, feeding this estimator. Users of BFD expect interoperability with FRR/bird peers. Effort: medium; fits §2.
+- Adaptive thresholds (phi-accrual style) instead of fixed `down_threshold`/`up_threshold`, for links whose jitter varies by orders of magnitude. Effort: medium; fits §2.
 
 ## Anchoring
 
