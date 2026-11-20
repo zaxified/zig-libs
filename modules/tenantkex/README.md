@@ -142,13 +142,13 @@ const n3 = try ini.writeMessage3(rng, "", &m3, &keys); // -> s, se; keys
 Lengths: `xxMessage1Len` (32 + payload), `xxMessage2Len` (96 + payload),
 `xxMessage3Len` (64 + payload). The mode is the caller's explicit choice: an IK
 `Initiator`/`Responder` never switches to XX, and IK and XX messages are refused
-across modes. It is not Noise Pipes' `XXfallback` role switch (see SPEC.md §6).
+across modes. It is not Noise Pipes' `XXfallback` role switch (see SPEC.md *Backlog / deferred*).
 
-## Deferred
+## Not provided
 
-Noise Pipes' `XXfallback` (needs `noise`'s `fallback` modifier), rekey/rehandshake
-scheduling (aeadframe's epoch handles in-session rekey; a fresh handshake is a
-new session), handshake-message retransmission/timeout (the transport owns it).
+Rekey/rehandshake scheduling (aeadframe's epoch handles in-session rekey; a fresh handshake is a new
+session), handshake-message retransmission/timeout (the transport owns it), and Noise Pipes' `XXfallback`
+(needs `noise`'s `fallback` modifier): see SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 

@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [WireGuard/wireguard-go](https://github.com/WireGuard/wireguard-go) | Go | MIT | 4.4k | push 2026-05-22 | The deployed `Noise_IKpsk2` user (the design this module cites); handshake + timers + rekey scheduling included, not reusable as a library *(inferred)*. |
 | [spiral-ladder/noiz](https://github.com/spiral-ladder/noiz) | Zig | MIT | 11 | push 2025-06-19 | Zig Noise library; the only Zig Noise alternative found by GitHub search; general patterns, no tenant binding *(inferred)*. |
 
-**Where we are ahead:** the tenant/I-SID/PE-id prologue binding with a permanent positive-control test (a handshake for tenant A fails for tenant B), and the `send_key`/`recv_key` orientation already resolved per role - the split-index footgun is gone; handoff by plain `[32]u8` to `aeadframe`. **Where we are behind:** only `Noise_IK_25519_ChaChaPoly_SHA256`; no rekey/timer scheduling (deferred in SPEC §6); PSK (IKpsk2) since 2026-11-16 and an explicit XX mode since 2026-11-17 (no `XXfallback` role switch — snow lacks it too).
+**Where we are ahead:** the tenant/I-SID/PE-id prologue binding with a permanent positive-control test (a handshake for tenant A fails for tenant B), and the `send_key`/`recv_key` orientation already resolved per role - the split-index footgun is gone; handoff by plain `[32]u8` to `aeadframe`. **Where we are behind:** only `Noise_IK_25519_ChaChaPoly_SHA256`; no rekey/timer scheduling (see *What is deliberately not done*); PSK (IKpsk2) and an explicit XX mode exist (no `XXfallback` role switch — snow lacks it too; *Backlog / deferred*).
 
 ## 1. Model
 
@@ -133,9 +133,6 @@ available.
   peers the same way) — and refuses any other with `error.UnknownInitiator`,
   zeroing the payload and wiping the handshake. A party holding the wrong
   responder static key fails with `error.DecryptionFailed`.
-  ⛔ Until 2026-10-05 this paragraph claimed the initiator side too, and the
-  responder took no initiator key and accepted any (verified: an unprovisioned
-  key completed the handshake with matching session keys).
 * **Tenant isolation.** The prologue binding (§3) makes each completed session
   provably scoped to one `(I-SID, PE-pair)`. This is the whole point: many
   tenants share one WG tunnel, and this layer keeps them cryptographically
@@ -178,36 +175,16 @@ prologue construction and the split→key mapping without duplicating vectors. (
 standalone external vector is impossible: the published IK vectors use a
 different prologue, so their bytes do not apply to tenantkex's transcript.)
 
-## 6. Deferred
+## 6. What is deliberately not done
 
-* **XX for an unprovisioned responder key — DONE 2026-11-17 as an explicit
-  mode, not as Noise Pipes' `XXfallback`.** See § 7. The §10.2 `XXfallback`
-  (an IK msg1 the responder cannot decrypt turns into an XX handshake that
-  reuses the initiator's ephemeral, with the roles switched) stays deferred:
-  the sibling `noise` has no `fallback` modifier, and the module's reference
-  snow ("all features … with the exception of the `fallback` modifier") and
-  flynn/noise do not implement it either; WireGuard has no fallback at all.
 * **Rekey / rehandshake scheduling** — in-session rekey is `aeadframe`'s epoch
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
   transport (the WG-backed channel), not this module.
+* **Noise Pipes' `XXfallback`** (§10.2 role switch) — not built; see *Backlog / deferred*. The XX full handshake
+  exists as an explicit mode (§7), chosen by the caller.
 
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant), run after the initiator-key fix below: **18 mutants, all killed after one more test**.
-Points: the prologue's three fields, `SessionKeys.wipe`, both message-length helpers, the
-split→key mapping, every `wipeHandshake` step, every state guard, and the new initiator-key
-check, payload wipe and failed state (the mutant removing the check is killed by the regression
-test). Gap closed: the wipe test ran after a completed handshake, where `noise` has already
-zeroed the chaining key and spent the ephemeral, so dropping either wipe stayed green — now
-also checked mid-handshake and after an `UnknownInitiator` refusal.
-
-**Review finding while reading for the run (fixed, breaking):** the responder authenticated no
-initiator — see § 5 "Mutual authentication". `Responder.init`/`initEphemeral` take the
-provisioned `initiator_static` key; `readMessage1` refuses any other.
-
-## 7. XX mode (2026-11-17)
+## 7. XX mode
 
 When the initiator has no provisioned static key for the responder, IK cannot
 start (its msg1 encrypts to that key). `XxInitiator`/`XxResponder` run
@@ -252,47 +229,64 @@ msg3:  -> s, se                [+ payload]               64 + payload
 * **Constant time:** ctgrind row `xx` (both statics and every ephemeral
   tainted).
 
-### Mutation run 2026-11-17 (XX mode, delta)
+## 8. PSK mode (`Noise_IKpsk2`)
 
-Schemata over a detached copy (one ReleaseSafe build, the kit's `run.sh`): **27 mutants on the
-XX code, 26 killed, 1 survivor resolved by deleting its line.** Points: the XX prologue label,
-the three length helpers, every state guard and state assignment of both XX types, the learned
-responder key write, both `fillKeys` orientations, the provisioned initiator key, the msg3
-initiator check, the refusal's payload wipe, handshake wipe and failed state, and both `wipe`s.
-Not mutated: the `step.complete` guards (true for `XX` by its token table, unobservable without
-changing `noise`, as for IK) and `initialize`'s comptime pattern/role. Survivor: zeroing the
-`Split()` pair on the `UnknownInitiator` path — a local of the body frame that `burn.run`
-zeroes anyway, so the line was redundant and is gone (no other path zeroed it). One test was
-added before the run (every call refused once both XX sides are done). Card: 18 + 26 = 44/44.
+`Initiator.initPsk` / `initPskEphemeral` and `Responder.initPsk` / `initPskEphemeral` take a 32-byte pre-shared
+secret and run `Noise_IKpsk2` over the same `noise` engine — WireGuard's use of IK with a PSK as a
+post-quantum hedge. It is opt-in: plain `init` stays IK. The prologue carries its own label
+(`prologue_label_psk`), so a PSK handshake can never be confused with a plain one. Both sides must use it with
+the same PSK: a wrong PSK fails the initiator's `readMessage2` (`DecryptionFailed`, the PSK mixes into msg2), a PSK
+on one side only fails the responder's `readMessage1` (different protocol name and prologue). An all-zero PSK is
+a valid PSK, not "absent". The module's copy of the PSK is destroyed by `wipe`; the responder still refuses any
+initiator key but the provisioned one. Correctness is anchored like IK: raw `noise` `Noise_IKpsk2` over the PSK
+prologue gives byte-identical messages and keys.
 
 ## Secret residue on the dead stack
 
-Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): a full IK handshake through the
-public API, one probed call per step, 28 needles (both static and ephemeral private keys raw and
-clamped, `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, `ck`/`k` after each `MixKey`, both session
-keys, a control; NEG 0, POS 1). The `noise` layer below burns its own calls (see `noise/SPEC.md`);
-what was left were the session keys in this module's frame (the transport pair and the
-`SessionKeys` assembly): 12 hits per 3 runs after `writeMessage2` and `readMessage2`. Now the five
-handshake calls (`init`/`initEphemeral`, `writeMessage1`, `readMessage1`, `writeMessage2`,
-`readMessage2`) run their body one frame down and burn 2 KiB (the body frame is 0.4 KiB), key pairs
-travel by `*const KeyPair`, `init` is in place, and the session keys leave through a `*SessionKeys`.
-After: 0 in every probed call.
-
-XX mode (2026-11-17): a second probe drives a full XX handshake (eight calls: both
-`init`s, `writeMessage1`, `readMessage1`, `writeMessage2`, `readMessage2`, `writeMessage3`,
-`readMessage3`) with the same needle classes (statics, ephemerals, `ee`/`es`/`se`, every HKDF
-`temp_key`, `ck`/`k` after each `MixKey`, both session keys, control): 0 in every probed call;
-the XX calls use the same one-frame-down body and 2 KiB burn.
+`src/stackprobe_test.zig` (ReleaseFast only) drives a full IK handshake through the public API, one probed call
+per step, and scans the dead stack for needles: both static and both ephemeral private keys (raw and clamped),
+the four DH outputs `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, the chaining and cipher key after each `MixKey`,
+both session keys, and a control. A zero is read only next to the two controls (NEG: a call that never sees a
+secret finds nothing; POS: a call that parks the control needle in a local finds it). The `noise` layer below
+burns its own calls (see `noise/SPEC.md`); in this module the five handshake calls (`init`/`initEphemeral`,
+`writeMessage1`, `readMessage1`, `writeMessage2`, `readMessage2`) run their body one frame down and burn 2 KiB
+(`burn.hs_burn`; the body frame is 0.4 KiB), key pairs travel by `*const KeyPair`, `init` is in place, and the
+session keys leave through a `*SessionKeys`; the probe finds nothing in any probed call. A second probe drives
+a full XX handshake (both `init`s and the six message calls) with the same needle classes, with the same
+one-frame-down body and 2 KiB burn.
 
 NOT covered: the caller's `KeyPair`, `SessionKeys` and `Initiator`/`Responder` (the caller's to
 wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves more than the 8 KiB
 `noise` burns.
 
+## Verification
+
+- **Run:** `scripts/modtest tenantkex`; for ReleaseFast (the stack probe runs only there)
+  `scripts/modtest tenantkex -Doptimize=ReleaseFast`.
+- **Tests:** mutual handshake and the crossed-key orientation (also through a direct ChaCha20-Poly1305
+  round trip); I-SID and PE-id binding with the positive control (§5); refusals (tampered message, wrong
+  responder key, wrong or missing initiator key, out-of-order calls, `WrongState`); wipes, also mid-handshake;
+  the fixed-width prologue and message-length helpers; PSK mode and XX mode as described in §7 and §8, including
+  the IK/XX crossings refused both ways.
+- **Oracle:** raw `noise` driven with the same injected ephemerals and tenantkex's prologue — IK, IKpsk2 and XX
+  each — byte-identical messages, keys and hash (§5 *KAT anchoring*, §7).
+- **Fuzz:** `TENANTKEX_FUZZ=<runs>[,<seed>]`, harness `tenantkex-handshake` (testkit driver): a whole IK exchange
+  with knob-chosen keys, context and payloads; the genuine exchange agrees, one flipped bit, a wrong context, an
+  unexpected initiator key, damaged copies and out-of-order calls are refused and never panic. Plus
+  never-panic tests of `Responder.readMessage1` and `Initiator.readMessage2` on arbitrary bytes and a corpus test.
+- **Constant time:** `scripts/checks/ctgrind.sh tenantkex`, rows `ik` and `xx` (static keys and ephemerals
+  tainted): the reported in-file contexts are std X25519 identity checks, AEAD verdicts and the pinned-static
+  verdict, none a tenantkex branch on a key.
+- **Dead stack:** the probe of the previous section.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
+
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-16 (`Initiator/Responder.initPsk`/`initPskEphemeral`: opt-in `Noise_IKpsk2`, distinct prologue label `prologue_label_psk`, PSK copy wiped by `wipe`; tests: match, wrong PSK, PSK on one side, moved struct, noise-as-oracle KAT) **IKpsk2 (PSK) mode** *(survey 2026-09-30)* — WireGuard runs IK with a PSK as a post-quantum hedge; `noise` already has the `psk` token. Effort: small; fits §2. (Listed in SPEC §6; survey: worth doing if the fabric wants the hedge.)
-- ✅ DONE 2026-11-17 (`XxInitiator`/`XxResponder`: explicit opt-in `Noise_XX` under `prologue_label_xx`; the initiator reports the learned responder key for the caller to check before msg3, the responder still accepts only the provisioned initiator key; IK never switches; tests: completion + learned key, impostor responder visible, `UnknownInitiator` at msg3, prologue binding, tampered msg2/msg3, IK↔XX crossings refused both ways, state machine, wipe, noise-as-oracle KAT; § 7) **XX fallback** *(survey 2026-09-30)* — for a responder whose static key is not provisioned. Effort: small-medium; fits §2. (SPEC §6.)
-- **Noise Pipes `XXfallback` (§10.2 role switch)** *(2026-11-17)* — an IK attempt with a stale responder key recovering in the same exchange instead of a new XX handshake. Depends on a `fallback` modifier in `noise` (its SPEC: deferred); snow and flynn/noise lack it too. Effort: medium (noise) + small (here).
+- **Noise Pipes `XXfallback` (§10.2 role switch)** — an IK attempt with a stale responder key recovering in the same
+  exchange instead of a new XX handshake. Depends on a `fallback` modifier in `noise` (its SPEC: deferred); snow
+  (which implements every Noise feature except `fallback`), flynn/noise and WireGuard lack it too. Effort: medium
+  (noise) + small (here).
 
 ## Anchoring
 
