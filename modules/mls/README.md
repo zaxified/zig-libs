@@ -52,8 +52,9 @@ and committer-leaf `parent_hash` byte-exact, and is then opened by every one
 of that vector's recorded members — see `SPEC.md`'s "Part 8" section, which
 states per test what is anchored and what is a round trip.
 
-**Status.** Parts 1, 2 and 4 to 9 are built; there is no Part 3 (its scope,
-the §7.3/§10.1 admission validation and X.509 credentials, is open). Every
+**Status.** Parts 1, 2 and 4 to 9 are built; Part 3's scope (§7.3/§10.1
+admission validation) is in `group.zig`, with credential acceptance an
+application hook (`GroupPolicy.credential_validator`). Every
 upstream interop vector the module drives is byte-exact, for each supported
 suite; `SPEC.md`'s "Verification" says what is anchored and what is a round trip.
 What this module can do today: produce and consume real MLS messages other
@@ -67,8 +68,8 @@ the tree are applied, in both directions.
 
 **What it cannot** (details in `SPEC.md`'s "What is deliberately not done" and
 "Backlog / deferred"): follow through on a `ReInit` (§11.2)
-or branch (§11.3), or apply the §10.1/§7.3 admission rules that need a clock, a
-credential authority or an extension registry.
+or branch (§11.3), or decide by itself whether a credential is acceptable (that
+is the application's `credential_validator`).
 
 | File | Provides |
 |---|---|
@@ -87,7 +88,7 @@ credential authority or an extension registry.
 | `secrettree.zig` | Part 4's §9 secret tree (`nodeSecret`/`ratchetBaseSecret`), §9.1 `Ratchet` + the generation-indexed out-of-order `Window`, §6.3.2 `senderDataKeys` |
 | `kat_keyschedule_test.zig` | Part 4's official interop vectors `key-schedule.json` + `psk_secret.json`, driven per-stage byte-exact |
 | `kat_secrettree_test.zig` | Part 4's official `secret-tree.json`, driven byte-exact both forward (`Ratchet`) and out-of-order (`Window`) |
-| `keypackage.zig` | Part 5's §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT + self-signature (`verifySignature`/`sign`), plus Part 8's `create` (assemble and sign one). §10.1's validation rules are Part 3's and are NOT here |
+| `keypackage.zig` | Part 5's §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT + self-signature (`verifySignature`/`sign`), plus Part 8's `create` (assemble and sign one). §10.1's validation rules run in `group.zig` |
 | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) + §12.4 `Commit`/`ProposalOrRef` — wire shape only; no proposal-list validity, no commit processing |
 | `framing.zig` | Part 5's whole of §6: `Sender`/`FramedContent`/`AuthenticatedContent`, §6.1 sign+verify, §6.2 `PublicMessage` + `protectPublic`/`unprotectPublic`, §6.3 `PrivateMessage` + `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `MLSMessage` |
 | `transcript.zig` | Part 5's §8.2 `confirmedTranscriptHash`/`interimTranscriptHash`/`advance` — the gap Part 4 named and could not fill |
@@ -561,11 +562,14 @@ group is left at the previous epoch, untouched, so the same note's "keep
 the secret tree for a short time to decrypt late messages" stays open to the
 caller; `deinit` is the caller's to call, and should be soon.
 
-**What it does not do:** follow through on a `ReInit` (§11.2) or branch (§11.3), or apply the §7.3/§10.1
-admission rules that
-need a clock, a credential authority or an extension registry (Part 3) — the
-two that need only the leaf and the tree are applied, see
-`mls.GroupPolicy`.
+**Admission (§7.3/§10.1).** Every admitted leaf is checked: extensions vs
+capabilities, `required_capabilities`, credential types in use, key
+uniqueness, a KeyPackage's lifetime (`createCommit` against `io`'s clock,
+`processCommit` when given `.now`), and the application's
+`policy.credential_validator` (`error.CredentialRejected`) — switches in
+`mls.GroupPolicy`, all ON.
+
+**What it does not do:** follow through on a `ReInit` (§11.2) or branch (§11.3).
 
 **Memory:** a `Group` keeps an arena per adopted Commit until `deinit` (about
 5 KB per epoch measured in an eight-member group), so a long-lived group's

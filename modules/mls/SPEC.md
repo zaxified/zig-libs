@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, no KeyPackage/LeafNode admission validation beyond the rules a Commit names, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -50,8 +50,8 @@ is listed under *What is deliberately not done* and *Backlog / deferred*.
 
 The sections below are named by the part of the build that introduced each
 area; the numbers are labels, kept because the code and tests cite them. There
-is no Part 3: its scope (§7.3/§10.1 admission validation) is open, see
-*Backlog / deferred*.
+is no Part 3: its scope (§7.3/§10.1 admission validation) is `group.zig`'s,
+see Part 8's *The §7.3/§10.1 rules*.
 
 | Part | Area | Files | RFC 9420 | Upstream vectors |
 |---|---|---|---|---|
@@ -375,9 +375,8 @@ Not here, and not stubbed:
   `group.zig` (§12.2, §12.3, §12.4.1, §12.4.2); `content.zig` only decodes a
   `Commit`.
 - **KeyPackage admission rules** — `keypackage.zig` has the struct and its
-  self-signature check, a pure function of the bytes. The rules that need only
-  the leaf and the tree are `group.zig`'s (see Part 8); the rest is open
-  (*Backlog / deferred*) or the application's (*What is deliberately not done*).
+  self-signature check, a pure function of the bytes. §10.1/§7.3 admission is
+  `group.zig`'s (see Part 8), credential acceptance the application's hook.
 - **Key lookup and member validation.** `unprotect*` hands back a decoded,
   signature-verified `AuthenticatedContent` and the `SenderData.leaf_index` it
   decrypted. Checking that the index names a non-blank leaf (§6.3.2's closing
@@ -659,12 +658,8 @@ are named:
 
 - **`PrivateMessage` is driven by the group** — application data both ways
   and handshakes both ways; see *`PrivateMessage` through the group* below.
-- **No §7.3/§10.1 admission validation beyond what Part 8 lists.**
-  `processCommit` checks the leaf properties §12.4.2 names in its own bullets —
-  `leaf_node_source == commit`, the committer's encryption key actually
-  changing, no `UpdatePath` public key already present in the tree — and
-  verifies the signature on every `LeafNode` it installs. It does not check
-  lifetimes, credential acceptability or capability support.
+- **§7.3/§10.1 admission validation** runs on every admitted leaf — see
+  Part 8's *The §7.3/§10.1 rules*.
 - **Commit processing is transactional.** `processCommit` and `createCommit`
   build a WORKING COPY (`Group.fork`, `group.zig`) and swap it in only after
   the last fallible step (`reserveAdoption`, then the infallible `adopt`), so a
@@ -890,19 +885,9 @@ which live in the receive code:
    section says and stays correct if `parentHash` is called on a tree whose upper
    path an Update or Remove blanked.
 
-### The §7.3/§10.1 boundary
+### The §7.3/§10.1 rules
 
-§7.3's list splits cleanly, and the split is the boundary:
-
-**Stays out of this module** (credential acceptance: *What is deliberately not done*; the rest: *Backlog / deferred*) — each needs something this module does not
-have. "The credential in the LeafNode is valid, as described in §5.3.1" is
-an Authentication Service, i.e. an application. The `lifetime` window needs
-a clock, and this module reads none (`meta.platform = .any`, no I/O in it at
-all). `required_capabilities` compatibility and "the credential type is
-supported by all members" are policy over an extension registry the
-application owns. All of §10.1 is the same shape.
-
-**Taken here** — each needs only the leaf and the tree, and §12.2's closing
+Every §7.3 rule runs here; §12.2's closing
 rule makes a Commit INVALID if "after processing the Commit the ratchet tree
 is invalid, in particular, if it contains any leaf node that is invalid
 according to Section 7.3". A creator that skipped them would emit Commits
@@ -910,14 +895,36 @@ its own receivers must reject, which is not a defensible place for a sender
 to be:
 
 - every extension in `LeafNode.extensions` listed in
-  `capabilities.extensions` (`Policy.check_leaf_extensions_supported`);
+  `capabilities.extensions` (`Policy.check_leaf_extensions_supported`),
+  except §7.2's default types (`application_id`, `ratchet_tree`,
+  `required_capabilities`, `external_pub`, `external_senders`), which a leaf
+  "MUST NOT" list and every client supports — on every Add/Update leaf, every
+  Commit's path leaf, and every leaf of a tree joined from a `Welcome` or a
+  `GroupInfo`;
+- the GroupContext's `required_capabilities` (§11.1) supported by every leaf
+  (§7.2's default extension and proposal types count as supported), and every
+  credential type in use listed in every leaf's `capabilities.credentials`
+  (`Policy.check_capabilities`): checked over the whole tree at every epoch
+  transition and on join, so a GroupContextExtensions proposal introducing a
+  requirement some member cannot meet is refused as well (§12.1.7);
+- a KeyPackage's `lifetime` (`Policy.check_lifetime`): `createCommit` checks
+  every Add against the real-time clock of its `io` (§7.3's MUST for a
+  sender); `processCommit` against `CommitParams.now` when the caller gives
+  it (RECOMMENDED for a receiver, and this module has no clock of its own);
+- §5.3.1's "the credential in the LeafNode is valid": the application's
+  Authentication Service, called through `Policy.credential_validator` for
+  every admitted leaf (`error.CredentialRejected`). An X.509 chain is
+  validated there too — the hook gets the `x509` credential's certificates;
+  OpenMLS and mls-rs likewise hand credentials to an application identity
+  provider rather than validating chains themselves;
 - `signature_key`/`encryption_key` unique across the group, plus
   §12.4.3.1's "the encryption key in the parent node does not appear in any
   other node of the tree" (`Policy.check_key_uniqueness`), swept once per
   epoch transition because it is a property of the finished tree and no
   earlier point can answer it.
 
-Both default ON and both are `Policy` switches.
+Each defaults ON (the hook defaults to accepting) and each is a `Policy`
+switch. All errors are `error.LeafNodeInvalid` except the hook's.
 
 A third rule is taken here, and it is NOT a switch: an
 X25519 HPKE key of small order — a leaf's `encryption_key`, a KeyPackage's
@@ -1479,11 +1486,11 @@ AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
 - **A randomness policy.** The reuse guard (§6.3.1), `psk_nonce` and the
   ephemeral keys of the `*Deterministic` entry points are caller inputs; the real
   entry points take `io: std.Io` for fresh randomness.
-- **Credential acceptance.** "The credential in the LeafNode is valid" (§7.3,
-  §5.3.1), the identity in an external joiner's leaf and §12.2's identifier rule
-  for the Remove of an external Commit are an Authentication Service question and
-  stay the application's. (The lifetime, capability and extension-consistency
-  checks are open work, not refused: *Backlog / deferred*.)
+- **Built-in credential acceptance.** "The credential in the LeafNode is valid"
+  (§7.3, §5.3.1), the identity in an external joiner's leaf and §12.2's
+  identifier rule for the Remove of an external Commit are an Authentication
+  Service question: the module calls the application's
+  `Policy.credential_validator` and decides nothing itself.
 
 - **§12.4.3.2's advice to gate the resync flavor on a `reinit` PSK proposal.**
   §12.1.4 and §11.2/§11.3 make a PreSharedKey proposal with usage `reinit` or
@@ -1553,11 +1560,6 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **Part 3: §7.3/§10.1 LeafNode and KeyPackage admission validation, and X.509
-  credentials.** Lifetime, capability and extension consistency; credential
-  acceptance hooks. Every real deployment needs at least the lifetime and
-  capability checks; X.509 credential support needs the sibling `x509`. Effort:
-  medium.
 - **More cipher suites: 0x0004 and 0x0006 (X448/Ed448).** `ed448` has the
   signature side, but `hpke` has no DHKEM(X448); instantiate both suites when
   that lands.

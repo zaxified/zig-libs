@@ -47,18 +47,16 @@
 //! `createProposal`, `createCommit` and the `UpdatePath` generation under
 //! them, so this object is a complete client and not only a follower.
 //!
-//! **What this object deliberately does NOT own.**
-//!
-//!   * **§7.3 LeafNode validation and §10.1 KeyPackage validation** (Part
-//!     3, still not built). `processCommit` checks the leaf properties
-//!     §12.4.2 names EXPLICITLY in its own bullets — `leaf_node_source ==
-//!     commit`, the committer's encryption key actually changing, no
-//!     UpdatePath public key already present in the tree — and the
-//!     signature on every `LeafNode` it installs. It does not check
-//!     lifetimes, credential acceptability, or capability/extension
-//!     support. It does refuse a small-order X25519 HPKE key wherever one
-//!     enters (`isUnusableHpkeKey`) — not a §7.3 rule, but such a key is
-//!     unusable and would make every later encapsulation to it fail.
+//! **§7.3 LeafNode and §10.1 KeyPackage validation** run on every leaf the
+//! group admits: signature and `leaf_node_source`, extensions listed in the
+//! leaf's capabilities (§7.2 defaults excepted), key uniqueness, the
+//! GroupContext's `required_capabilities` and the credential types in use
+//! against every member, a KeyPackage's lifetime (`createCommit` against
+//! its `io` clock; `processCommit` when given `now`), and §5.3.1's
+//! credential acceptance through `Policy.credential_validator`, which is the
+//! application's decision. A small-order X25519 HPKE key is refused wherever
+//! one enters (`isUnusableHpkeKey`) — not a §7.3 rule, but such a key is
+//! unusable.
 //!
 //! **Atomicity: a Commit is adopted whole, or not at all.** `processCommit`
 //! and `createCommit` run every step that writes group state against a
@@ -161,13 +159,16 @@ pub const Error = error{
     /// The `GroupInfo` carried no `ratchet_tree` extension and no tree was
     /// supplied out of band.
     RatchetTreeUnavailable,
-    /// §7.3: a `LeafNode` broke one of the rules this object owns (see the
-    /// "the §7.3 rules this object CAN own" section) — an extension its own
-    /// `capabilities` do not list — or a `LeafNode`/`KeyPackage` HPKE key
+    /// §7.3: a `LeafNode` broke one of its rules (the "§7.3" section of
+    /// `Group`) — an extension its own `capabilities` do not list, a
+    /// `required_capabilities` entry or a credential type in use that it
+    /// does not support, a KeyPackage outside its lifetime — or a `LeafNode`/`KeyPackage` HPKE key
     /// (`encryption_key`, `init_key`, or any node key of an imported tree)
     /// is a small-order X25519 point, to which no HPKE encapsulation can
     /// succeed (`isUnusableHpkeKey`).
     LeafNodeInvalid,
+    /// §5.3.1: `Policy.credential_validator` refused a leaf's credential.
+    CredentialRejected,
     /// §7.3/§12.4.3.1: two nodes of the ratchet tree carry the same
     /// `encryption_key`, or two leaves the same `signature_key`.
     DuplicateKeyInTree,
@@ -325,7 +326,138 @@ pub const Policy = struct {
     /// that many KDF calls. 1000 is OpenMLS's `maximum_forward_distance`
     /// default (`SenderRatchetConfiguration`).
     maximum_forward_distance: u32 = 1000,
+    /// §7.3: "Verify that the LeafNode is compatible with the group's
+    /// parameters" — every type a GroupContext `required_capabilities`
+    /// extension names is supported by every leaf — and "Verify that the
+    /// credential type is supported by all members of the group ... and
+    /// that the capabilities field of this LeafNode indicates support for
+    /// all the credential types currently in use by other members".
+    /// Checked over the whole tree at every epoch transition and on join,
+    /// so a GroupContextExtensions proposal that adds a requirement some
+    /// member cannot meet is refused too (§12.1.7). The §7.2 default
+    /// extension and proposal types count as supported without being
+    /// listed. OpenMLS and mls-rs both enforce these.
+    check_capabilities: bool = true,
+    /// §7.3: "If the LeafNode appears in a message being sent by the
+    /// client, e.g., a Proposal or a Commit, then the client MUST verify
+    /// that the current time is within the range of the lifetime field."
+    /// `createCommit` reads the real-time clock of its `io` and refuses an
+    /// Add whose KeyPackage is outside its lifetime (`error.LeafNodeInvalid`).
+    /// On receipt the check is only RECOMMENDED and this module has no
+    /// clock there: `processCommit` applies it when `CommitParams.now` is
+    /// given.
+    check_lifetime: bool = true,
+    /// §5.3.1's Authentication Service: "The credential in the LeafNode is
+    /// valid". The application's decision, so a hook: called for every leaf
+    /// admitted — an Add's KeyPackage, an Update, a Commit's path leaf, an
+    /// external joiner's leaf, every leaf of a tree joined through a
+    /// `Welcome` or a `GroupInfo` — and `false` refuses it with
+    /// `error.CredentialRejected`. `null` (the default) accepts every
+    /// credential (mls-rs's `BasicIdentityProvider` likewise accepts any
+    /// basic credential).
+    credential_validator: ?CredentialValidator = null,
 };
+
+/// See `Policy.credential_validator`.
+pub const CredentialValidator = struct {
+    context: ?*anyopaque = null,
+    /// `signature_key` is the leaf's encoded signature public key, which a
+    /// credential is meant to vouch for.
+    validate: *const fn (context: ?*anyopaque, credential: tree.Credential, signature_key: []const u8) bool,
+};
+
+/// RFC 9420 §7.2: the extension types (`application_id`, `ratchet_tree`,
+/// `required_capabilities`, `external_pub`, `external_senders`) and proposal
+/// types (`add` .. `group_context_extensions`) every client supports, which
+/// a leaf "MUST NOT" list in its capabilities.
+const default_extension_types = [_]u16{ 1, 2, 3, 4, 5 };
+const default_proposal_types = [_]u16{ 1, 2, 3, 4, 5, 6, 7 };
+const extension_required_capabilities: u16 = 3;
+
+fn supportsType(listed: []const u16, defaults: []const u16, t: u16) bool {
+    return std.mem.findScalar(u16, defaults, t) != null or std.mem.findScalar(u16, listed, t) != null;
+}
+
+/// RFC 9420 §11.1's `RequiredCapabilities`, as the three raw `u16` vectors.
+const RequiredCapabilities = struct {
+    extension_types: []const u8 = &.{},
+    proposal_types: []const u8 = &.{},
+    credential_types: []const u8 = &.{},
+
+    fn find(extensions: []const tree.Extension) error{Malformed}!?RequiredCapabilities {
+        for (extensions) |e| {
+            if (e.extension_type != extension_required_capabilities) continue;
+            var r = codec.Reader.init(e.extension_data);
+            const out: RequiredCapabilities = .{
+                .extension_types = r.readVector() catch return error.Malformed,
+                .proposal_types = r.readVector() catch return error.Malformed,
+                .credential_types = r.readVector() catch return error.Malformed,
+            };
+            if (!r.atEnd() or out.extension_types.len % 2 != 0 or
+                out.proposal_types.len % 2 != 0 or out.credential_types.len % 2 != 0) return error.Malformed;
+            return out;
+        }
+        return null;
+    }
+
+    fn supportedBy(self: RequiredCapabilities, caps: tree.Capabilities) bool {
+        return allSupported(self.extension_types, caps.extensions, &default_extension_types) and
+            allSupported(self.proposal_types, caps.proposals, &default_proposal_types) and
+            allSupported(self.credential_types, caps.credentials, &.{});
+    }
+
+    fn allSupported(required: []const u8, listed: []const u16, defaults: []const u16) bool {
+        var i: usize = 0;
+        while (i < required.len) : (i += 2) {
+            const t = std.mem.readInt(u16, required[i..][0..2], .big);
+            if (!supportsType(listed, defaults, t)) return false;
+        }
+        return true;
+    }
+};
+
+/// §7.3's two whole-group capability rules over tree `t` under GroupContext
+/// `extensions` (see `Policy.check_capabilities`).
+fn checkTreeCapabilities(policy: Policy, t: *const tree.RatchetTree, extensions: []const tree.Extension) !void {
+    if (!policy.check_capabilities) return;
+    const req = try RequiredCapabilities.find(extensions);
+    // The credential types in use. A handful at most in any real group;
+    // more than the buffer holds is answered by the slow path below.
+    var in_use: [8]u16 = undefined;
+    var n_in_use: usize = 0;
+    var overflow = false;
+    const n = t.nLeaves();
+    for (0..n) |i| {
+        const leaf = t.leafNode(@intCast(i)) orelse continue;
+        const ct = @backingInt(leaf.credential.credentialType());
+        if (std.mem.findScalar(u16, in_use[0..n_in_use], ct) != null) continue;
+        if (n_in_use == in_use.len) {
+            overflow = true;
+        } else {
+            in_use[n_in_use] = ct;
+            n_in_use += 1;
+        }
+    }
+    for (0..n) |i| {
+        const leaf = t.leafNode(@intCast(i)) orelse continue;
+        const caps = leaf.capabilities;
+        if (req) |rc| if (!rc.supportedBy(caps)) return error.LeafNodeInvalid;
+        for (in_use[0..n_in_use]) |ct| if (std.mem.findScalar(u16, caps.credentials, ct) == null) return error.LeafNodeInvalid;
+        if (overflow) for (0..n) |j| {
+            const o = t.leafNode(@intCast(j)) orelse continue;
+            if (std.mem.findScalar(u16, caps.credentials, @backingInt(o.credential.credentialType())) == null)
+                return error.LeafNodeInvalid;
+        };
+    }
+}
+
+/// §7.3's lifetime rule for one KeyPackage leaf at `now` (Unix seconds).
+fn checkLifetime(leaf: tree.LeafNode, now: i64) !void {
+    const lt = leaf.lifetime orelse return error.LeafNodeInvalid;
+    if (now < 0) return error.LeafNodeInvalid;
+    const t: u64 = @intCast(now);
+    if (t < lt.not_before or t > lt.not_after) return error.LeafNodeInvalid;
+}
 
 /// How many skipped-over generations of one sender's ratchet a member keeps
 /// for messages that arrive out of order (§9.2: members "MAY keep unconsumed
@@ -1240,7 +1372,7 @@ pub fn Group(comptime S: type) type {
             try checkGroupInfoVersionAndSuite(S, group_info.group_context);
 
             // ── §12.4.3.3's tree + §12.4.3.1's integrity block.
-            var rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
+            var rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree, params.policy);
             // §7.3's whole-tree uniqueness. The other tree-ingest paths reach
             // it through `checkKeyUniqueness` after their epoch transition;
             // this one has no epoch transition to hang it on, and skipping it
@@ -1348,6 +1480,7 @@ pub fn Group(comptime S: type) type {
             arena: std.mem.Allocator,
             group_info: welcome_mod.GroupInfo,
             out_of_band: ?[]const u8,
+            policy: Policy,
         ) !tree.RatchetTree {
             var rt: tree.RatchetTree = blk: {
                 if (out_of_band) |ext_bytes| {
@@ -1366,6 +1499,13 @@ pub fn Group(comptime S: type) type {
             try treekem.validateParentHashes(S, gpa, &rt);
             try verifyEveryLeafSignature(S, gpa, &rt, group_info.group_context.group_id);
             try rejectLowOrderTreeKeys(S, &rt);
+            // §7.3 for every leaf of the tree being joined ("when a client
+            // validates a ratchet tree"): the leaf-only rules and the
+            // credential hook, then the two whole-group capability rules.
+            for (0..rt.nLeaves()) |i| {
+                if (rt.leafNode(@intCast(i))) |leaf| try checkLeafPolicy(policy, leaf);
+            }
+            try checkTreeCapabilities(policy, &rt, group_info.group_context.extensions);
             const signer_key = try leafSignatureKey(S, &rt, group_info.signer);
             try group_info.verifySignature(S, gpa, signer_key);
             return rt;
@@ -1383,6 +1523,10 @@ pub fn Group(comptime S: type) type {
             proposal_msgs: []const []const u8 = &.{},
             /// External PSKs the application holds.
             external_psks: []const ExternalPsk = &.{},
+            /// The current time (Unix seconds) for §7.3's lifetime check of
+            /// the KeyPackages this Commit adds — RECOMMENDED on receipt,
+            /// and this module has no clock of its own. `null` skips it.
+            now: ?i64 = null,
         };
 
         /// RFC 9420 §12.4.2, bullet by bullet, for BOTH kinds of Commit —
@@ -1594,7 +1738,7 @@ pub fn Group(comptime S: type) type {
             // is a member and has its own history, and letting the receiving
             // application hand in resumption secrets would let it agree with
             // a sender's forged PSK instead of catching it.
-            var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, &.{});
+            var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, &.{}, if (w.policy.check_lifetime) params.now else null);
             defer applied.deinit(gpa);
             const new_extensions = applied.extensions;
             var psk_secret = applied.psk_secret;
@@ -1738,6 +1882,7 @@ pub fn Group(comptime S: type) type {
             // each leaf was installed; this is the half that only the
             // finished tree can answer.
             try w.checkKeyUniqueness();
+            try checkTreeCapabilities(w.policy, &w.ratchet_tree, new_extensions);
 
             // Bullet 13: adopt.
             w.epoch += 1;
@@ -2158,10 +2303,16 @@ pub fn Group(comptime S: type) type {
             const w = &txn.state;
 
             // ── §12.4.1 bullet 3 (§12.3): apply the proposals.
+            // §7.3: a sender MUST check the lifetime of what it sends —
+            // against the real-time clock of its own `io`.
+            const now: ?i64 = if (w.policy.check_lifetime)
+                std.Io.Clock.real.now(params.io).toSeconds()
+            else
+                null;
             var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, switch (mode) {
                 .external => |e| e.resumption_psks,
                 .member => &.{},
-            });
+            }, now);
             defer applied.deinit(gpa);
 
             // ── §12.4.1 bullet 4's FIRST sub-bullet: "If this is an external
@@ -2427,6 +2578,7 @@ pub fn Group(comptime S: type) type {
             errdefer if (welcome_bytes) |wb| allocator.free(wb);
 
             try w.checkKeyUniqueness();
+            try checkTreeCapabilities(w.policy, &w.ratchet_tree, applied.extensions);
 
             // ── adopt. Same list as `processCommit`'s last bullet, plus the
             // two pieces only a committer holds: its new leaf private key
@@ -2640,7 +2792,7 @@ pub fn Group(comptime S: type) type {
             const group_info = gi_msg.group_info;
             try checkGroupInfoVersionAndSuite(S, group_info.group_context);
 
-            const rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
+            const rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree, params.policy);
 
             // ── §8.3's sender half. `external_pub` is the ONLY thing in the
             // GroupInfo that a non-member could not have computed for
@@ -3039,6 +3191,9 @@ pub fn Group(comptime S: type) type {
             /// Commit resolves resumption PSKs from its own history and
             /// nothing else.
             resumption_psks: []const ResumptionPsk,
+            /// §7.3's lifetime check of every added KeyPackage at this time
+            /// (Unix seconds), or `null` for none.
+            now: ?i64,
         ) !Applied {
             var new_extensions = self.extensions;
             for (resolved) |rp| {
@@ -3125,6 +3280,7 @@ pub fn Group(comptime S: type) type {
                     try kp.verifySignature(S, gpa);
                     try verifyLeafSignature(S, gpa, kp.leaf_node, .key_package, null, null);
                     try self.checkLeafSelfConsistent(kp.leaf_node);
+                    if (now) |t| try checkLifetime(kp.leaf_node, t);
                     // The Welcome is encrypted to `init_key`: a low-order
                     // one makes every Commit adding it fail (`DhFailed`).
                     if (isUnusableHpkeKey(S, kp.init_key)) return error.LeafNodeInvalid;
@@ -3552,46 +3708,42 @@ pub fn Group(comptime S: type) type {
             return out;
         }
 
-        // ── the §7.3 rules this object CAN own ────────────────────────────
+        // ── §7.3 ──────────────────────────────────────────────────────────
         //
-        // §7.3's list splits cleanly in two, and the split is where this
-        // module's boundary is drawn rather than at "§7.3 is Part 3's".
-        //
-        // NEEDS SOMETHING THIS MODULE DOES NOT HAVE, and so stays the
-        // caller's (Part 3):
-        //   * "the credential in the LeafNode is valid, as described in
-        //     §5.3.1" — §5.3.1 is an Authentication Service, i.e. an
-        //     application;
-        //   * the `lifetime` window — needs a clock, and this module reads
-        //     none (`meta.platform = .any`, no I/O anywhere in it);
-        //   * `required_capabilities` compatibility and "the credential type
-        //     is supported by all members" — policy over an extension
-        //     registry the application owns.
-        //
-        // NEEDS ONLY THE LEAF AND THE TREE, and so is here:
-        //   * `leaf_node_source` matching the context it arrived in —
-        //     already enforced by `verifyLeafSignature`;
-        //   * every extension in `extensions` listed in
-        //     `capabilities.extensions`;
-        //   * `signature_key`/`encryption_key` unique across the group.
-        //
-        // The second group is not optional bookkeeping: §12.2's closing rule
-        // makes a Commit INVALID if "after processing the Commit the ratchet
-        // tree is invalid, in particular, if it contains any leaf node that
-        // is invalid according to §7.3", so a committer that skips it emits
-        // Commits its receivers must reject. Both are `Policy` switches
-        // defaulting ON.
+        // Per leaf (`checkLeafPolicy`): extensions listed in the leaf's own
+        // capabilities, the §5.3.1 credential hook, unusable HPKE keys.
+        // Whole tree, after it reaches its final shape (`checkKeyUniqueness`,
+        // `checkTreeCapabilities`): key uniqueness, `required_capabilities`,
+        // credential types in use. `leaf_node_source` is enforced by
+        // `verifyLeafSignature`, the lifetime in `applyProposals` (Adds).
+        // §12.2's closing rule makes a Commit INVALID if "after processing
+        // the Commit the ratchet tree is invalid, in particular, if it
+        // contains any leaf node that is invalid according to §7.3", so a
+        // committer that skips these emits Commits its receivers reject.
+        // Each is a `Policy` switch defaulting ON.
 
         /// The §7.3 rules that read the leaf alone, plus this module's own
         /// refusal of a low-order HPKE `encryption_key` (`isUnusableHpkeKey`;
         /// not a `Policy` switch — such a key is unusable, not a policy
         /// choice).
         fn checkLeafSelfConsistent(self: *const Self, leaf: tree.LeafNode) !void {
+            return checkLeafPolicy(self.policy, leaf);
+        }
+
+        /// `checkLeafSelfConsistent` before there is a group (a joined
+        /// tree). §7.2's default extension types are supported without
+        /// being listed — the RFC forbids listing them. Then §5.3.1's
+        /// credential hook.
+        fn checkLeafPolicy(policy: Policy, leaf: tree.LeafNode) !void {
             if (isUnusableHpkeKey(S, leaf.encryption_key)) return error.LeafNodeInvalid;
-            if (!self.policy.check_leaf_extensions_supported) return;
-            for (leaf.extensions) |ext| {
-                if (std.mem.findScalar(u16, leaf.capabilities.extensions, ext.extension_type) == null)
-                    return error.LeafNodeInvalid;
+            if (policy.check_leaf_extensions_supported) {
+                for (leaf.extensions) |ext| {
+                    if (!supportsType(leaf.capabilities.extensions, &default_extension_types, ext.extension_type))
+                        return error.LeafNodeInvalid;
+                }
+            }
+            if (policy.credential_validator) |cv| {
+                if (!cv.validate(cv.context, leaf.credential, leaf.signature_key)) return error.CredentialRejected;
             }
         }
 
@@ -4637,6 +4789,115 @@ test "§7.5: createCommit changes the committer's credential, capabilities, exte
         try a.processCommit(.{ .commit_msg = c.commit });
         try expectSameEpoch(&a, &b);
     }
+}
+
+fn tKeyPackage(arena: std.mem.Allocator, seed: u8, cred: tree.Credential, credentials: []const u16, lifetime: tree.Lifetime) !keypackage_mod.KeyPackage {
+    const sig = try TestSuite.Sig.KeyPair.generateDeterministic(@splat(seed));
+    const init_kp = TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+    const enc_kp = TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+    return keypackage_mod.create(TestSuite, arena, .{
+        .signature_key_pair = &sig,
+        .init_key = init_kp.public_key,
+        .encryption_key = enc_kp.public_key,
+        .credential = cred,
+        .capabilities = .{ .versions = &.{1}, .cipher_suites = &.{1}, .extensions = &.{}, .proposals = &.{}, .credentials = credentials },
+        .lifetime = lifetime,
+    });
+}
+
+test "§7.3: lifetime, credential types in use, required_capabilities and the credential hook" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "caps", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    const forever: tree.Lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) };
+
+    // Lifetime: a sender checks against its clock (an expired KeyPackage),
+    // a receiver only when told the time.
+    const expired = try tKeyPackage(aa, 9, .{ .basic = "old" }, &.{1}, .{ .not_before = 0, .not_after = 1 });
+    try testing.expectError(error.LeafNodeInvalid, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = expired } }} }));
+    try checkLifetime(expired.leaf_node, 1);
+    try testing.expectError(error.LeafNodeInvalid, checkLifetime(expired.leaf_node, 2));
+    try testing.expectError(error.LeafNodeInvalid, checkLifetime(expired.leaf_node, -1));
+
+    // An x509 member that lists only x509 cannot join a group of basic
+    // members (it does not support their credential type), nor can a
+    // basic member join once an x509 one is in that the basic members do
+    // not list.
+    var cert = "der".*;
+    var chain = [_][]const u8{&cert};
+    const x509_only = try tKeyPackage(aa, 10, .{ .x509 = &chain }, &.{2}, forever);
+    try testing.expectError(error.LeafNodeInvalid, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = x509_only } }} }));
+    const x509_both = try tKeyPackage(aa, 11, .{ .x509 = &chain }, &.{ 1, 2 }, forever);
+    try testing.expectError(error.LeafNodeInvalid, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = x509_both } }} }));
+    try testing.expectEqual(@as(u64, 0), a.epoch);
+
+    // The credential hook sees every admitted leaf and can refuse it.
+    const Hook = struct {
+        fn reject_bob(_: ?*anyopaque, cred: tree.Credential, _: []const u8) bool {
+            return !std.mem.eql(u8, cred.basic, "bob");
+        }
+    };
+    a.policy.credential_validator = .{ .validate = Hook.reject_bob };
+    try testing.expectError(error.CredentialRejected, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} }));
+    a.policy.credential_validator = null;
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        // A joiner's hook runs over the whole tree it joins.
+        try testing.expectError(error.CredentialRejected, tFromWelcome(gpa, .{
+            .welcome_msg = c.welcome.?,
+            .key_package_msg = bob.kp_msg,
+            .init_priv = &bob.init_priv,
+            .encryption_priv = &bob.enc_priv,
+            .policy = .{ .credential_validator = .{ .validate = Hook.reject_bob } },
+        }));
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // required_capabilities: a requirement nobody lists is refused when a
+    // GroupContextExtensions proposal introduces it (§12.1.7); default
+    // types count as supported without being listed (§7.2).
+    const req_unmet = [_]u8{ 2, 0xff, 0x01, 0, 0 };
+    const req_defaults = [_]u8{ 2, 0, 1, 2, 0, 7, 2, 0, 1 };
+    try testing.expectError(error.LeafNodeInvalid, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &alice.sig,
+        .proposals = &.{.{ .by_value = .{ .group_context_extensions = &.{.{ .extension_type = 3, .extension_data = &req_unmet }} } }},
+    }));
+    try testing.expectError(error.Malformed, checkTreeCapabilities(.{}, &a.ratchet_tree, &.{.{ .extension_type = 3, .extension_data = &.{ 1, 0 } }}));
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .group_context_extensions = &.{.{ .extension_type = 3, .extension_data = &req_defaults }} } }},
+        });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit, .now = 1_800_000_000 });
+        try expectSameEpoch(&a, &b);
+    }
+    // Disabled, the rule is not applied.
+    try checkTreeCapabilities(.{ .check_capabilities = false }, &a.ratchet_tree, &.{.{ .extension_type = 3, .extension_data = &req_unmet }});
+}
+
+test "§7.2/§7.3: a default extension type in a leaf needs no capabilities entry; any other does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c = try TestClient.init(arena.allocator(), "c", 5);
+    var leaf = c.kp.leaf_node;
+    leaf.extensions = &.{.{ .extension_type = 1, .extension_data = "app-id" }};
+    try Group(TestSuite).checkLeafPolicy(.{}, leaf);
+    leaf.extensions = &.{.{ .extension_type = 0xff00, .extension_data = "" }};
+    try testing.expectError(error.LeafNodeInvalid, Group(TestSuite).checkLeafPolicy(.{}, leaf));
+    try Group(TestSuite).checkLeafPolicy(.{ .check_leaf_extensions_supported = false }, leaf);
 }
 
 test "§6.3/§9.2: a forged generation far ahead is GenerationTooFarAhead, within the bound it decrypts" {
