@@ -2348,7 +2348,7 @@ test "Tunnel: a finished handshake leaves no pending state, and giving up wipes 
     try testing.expectEqual(@as(?usize, null), std.mem.find(u8, std.mem.asBytes(&p.a), &eph));
 }
 
-// ── whole-module mutation audit (2026-11-18): killing tests ─────────────────
+// ── whole-module mutation audit: killing tests ─────────────────
 
 test "Tunnel: a staged packet waiting for its handshake does not make the deadline now" {
     var p: Pair = undefined;

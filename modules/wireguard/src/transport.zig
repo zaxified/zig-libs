@@ -746,7 +746,7 @@ test "constants match the whitepaper" {
 
 // ── the delivered values of the two limits that used to be blind ───────────
 //
-// F4/F5 of the 2026-08-11 re-audit: every test that touched `max_payload` or
+// F4/F5 of the re-audit: every test that touched `max_payload` or
 // `Window.capacity` was written IN TERMS OF the constant (`max_payload + 1`,
 // `highest - counter <= W.capacity`), so the oracle moved with the code and
 // either constant could be cut to a fraction of its documented value with the
@@ -1622,7 +1622,7 @@ fn openHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!voi
     // `SessionExpired`, `BufferTooSmall`, `Replayed` and the AEAD itself were
     // ALL unreachable, and the `orr.len + overhead == msg.len` assertion this
     // target is built around had never once been evaluated. Measured
-    // 2026-09-07 over the corpus above: **0 of 9 seeds non-empty and 0 opened
+    // Over the corpus above: **0 of 9 seeds non-empty and 0 opened
     // before; 9 of 9 non-empty, 3 opened and 64 octets of plaintext, after.**
     const len: usize = smith.slice(&buf);
     const raw = try walkOpen(buf[0..len]);

@@ -205,7 +205,7 @@ test "STACKPROBE: no key residue after conf.parse, formatConfig, formatDevice an
     try sp.skipUnlessOptimized();
     try cpSetup();
     const keys = [_][]const u8{ &cp_priv, &cp_psk, &cp_psk_old, &cp_priv_b64, &cp_psk_b64, &cp_psk_old_b64 };
-    // Bounds from the removed-burn mutants (ReleaseFast, 2026-11-03): with the burn
+    // Bounds from the removed-burn mutants (ReleaseFast): with the burn
     // in place the run starts at parse 143 B, formatConfig 159 B, formatDevice
     // 423 B, sync 143 B; without it parse 1319 B, formatConfig 455 B, formatDevice
     // 575 B (writeKeyLine's burn), sync none (the probe itself goes red).

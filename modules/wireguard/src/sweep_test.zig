@@ -623,7 +623,7 @@ test "two peers with the same key inside one message are two peers, not a merge 
     try testing.expectEqual(@as(usize, 2), dev.peers.len);
 }
 
-// ── wave goal 3, 2026-11-03: conf, uapi, listDevices, limits ────────────────
+// ── wave goal 3: conf, uapi, listDevices, limits ────────────────
 
 const conf = @import("conf.zig");
 const uapi = @import("uapi.zig");

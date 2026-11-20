@@ -2435,8 +2435,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
     // the kernel's rekey timer must fire and re-initiate, and this responder
     // must handle that second initiation as a new handshake. Without that,
     // one lost or late response strands the test for its whole budget — which
-    // is exactly how this test failed 1-in-60 under load (internal audit,
-    // 2026-08-12).
+    // is exactly how this test failed 1-in-60 under load.
     var drop_first_response = true;
 
     // Drive the exchange: initiation in → response out → keepalive in.

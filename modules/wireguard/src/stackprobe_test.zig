@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for `wireguard` (wave 9, 2026-10-09; SPEC §
+//! Dead-stack residue probe for `wireguard` (wave 9; SPEC §
 //! "Secret residue on the dead stack"). Engine as `noise`'s and `bolt8`'s
 //! probes: a painted region below the probe, one call run under a `PAD`-deep
 //! shim, the region scanned for 32-byte needles. ReleaseFast/ReleaseSmall only.

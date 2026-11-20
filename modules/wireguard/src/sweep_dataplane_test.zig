@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for the data plane (handshake/noise/transport), wave GR.
-//! Findings WH-1 .. WH-6, from the 2026-10-29 no-panic sweep of `wireguard-dataplane`.
+//! Findings WH-1 .. WH-6, from the no-panic sweep of `wireguard-dataplane`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -397,7 +397,7 @@ test "ReplayWindow: a counter one past the trailing edge does not mark a future 
     try testing.expect(w.accepts(20094)); // aliases stale's bit; was never seen
 }
 
-// ── wave goal 3, 2026-11-03: peek, static-static, Tunnel ────────────────────
+// ── wave goal 3: peek, static-static, Tunnel ────────────────────
 
 const tun = @import("tunnel.zig");
 

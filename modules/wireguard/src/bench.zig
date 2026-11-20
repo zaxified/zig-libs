@@ -228,7 +228,7 @@ test "bench (opt-in via WIREGUARD_BENCH)" {
     //    (`delegate_max_bytes` / `aead_delegate_max` in `chachapoly/root.zig`)
     //    and no payload size loses: ~1.0x up to 128 bytes because the code
     //    that runs there IS std's, then ~1.1x at 144 rising to 2.4-2.5x at a
-    //    full MTU. (Re-measured 2026-08-11 over four runs: the delegated rows
+    //    full MTU. (Re-measured over four runs: the delegated rows
     //    span 0.87-1.13x run to run — that spread is this single-run timer on
     //    identical machine code, not a threshold moving, which is exactly why
     //    only a MATERIAL drop counts.)
