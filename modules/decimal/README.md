@@ -11,8 +11,9 @@ format path is pure integer (no `f64`/`f128` anywhere except the explicit
 - **Model after:** Java `BigDecimal` / Python `decimal` semantics, but
   fixed-scale like DB `DECIMAL(38,12)`.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
-  **Concurrency:** reentrant (no shared state). **Allocation:** none —
-  `toString` writes into a caller buffer.
+  **Concurrency:** reentrant (no shared state). **Allocation:** none in
+  the `Decimal` core — `toString` writes into a caller buffer; `Decimal.pow`,
+  `toBigDecimal`/`fromBigDecimal` and all of `BigDecimal` take an allocator.
 
 Provenance: original work of the zig-libs authors (MIT); the rounding modes
 (half_even/half_up/half_down/up/down/ceiling/floor/round_05up + rescale/quantize/divRound)
@@ -26,8 +27,10 @@ copied. No third-party test data is reproduced: the test vectors are generated b
 ## Semantics
 
 - **Range:** ±170141183460469231731687303.715884105727(-8), step `1e-12`.
-- **Rounding:** everything rounds **half-away-from-zero** ("school" rounding,
-  what Excel/LibreOffice present): `+ −` are exact; `× ÷` widen to **i256
+- **Rounding:** the classic operations (`mul`, `div`, `round`, `parse`) round
+  **half-away-from-zero** ("school" rounding, what Excel/LibreOffice present);
+  `rescale`, `roundToIntegral`, `quantize`, `divRound` and the other `mode`
+  parameters take an explicit `RoundingMode` (eight GDA modes): `+ −` are exact; `× ÷` widen to **i256
   intermediates** and round the 12th fractional digit; `round(n)` re-quantises
   with the same mode (`ROUND(2.5,0)=3`, `ROUND(-2.5,0)=-3`).
 - **No Inf/NaN, never UB:** any result beyond the i128 range is a clean
@@ -63,6 +66,10 @@ fn mul(a, b) error{Overflow}!Decimal;   // i256 intermediate, half-away rounding
 fn div(a, b) error{ Overflow, DivisionByZero }!Decimal;
 
 fn round(self, n: i32) Decimal;         // re-quantise, half-away-from-zero
+fn rescale(self, new_scale: i32, mode) error{Overflow}!Decimal;
+fn roundToIntegral(self, mode) error{Overflow}!Decimal;
+fn quantize(self, exponent: i32, mode) error{Overflow}!Decimal;
+fn divRound(a, b, result_scale: i32, mode) error{ Overflow, DivisionByZero }!Decimal;
 fn floor(self) Decimal;
 fn ceil(self) Decimal;
 fn trunc(self) i128;                    // integer part, toward zero
@@ -80,7 +87,7 @@ fn rem(a, b) error{DivisionByZero}!Decimal;              // sign of the dividend
 fn divideInteger(a, b) error{ Overflow, DivisionByZero }!i128;   // truncated a // b
 fn remainderNear(a, b) error{DivisionByZero}!Decimal;    // GDA remainder-near, ties to even
 fn roundToMultiple(x, m, mode) error{ Overflow, DivisionByZero }!Decimal;   // the build-tool consumer MROUND, any mode
-fn pow(self, allocator, n: i32) PowError!Decimal;        // exact, rounded once half_even; Overflow / ResultTooLarge
+fn pow(self, allocator, n: i32) PowError!Decimal;        // exact, rounded once half_even; PowError (Overflow, DivisionByZero, ResultTooLarge, OutOfMemory)
 fn sqrt(self) error{NegativeOperand}!Decimal;            // correctly rounded to 12 places, no allocation
 fn toStringFixed(self, buf: []u8, places: u32, mode) error{NoSpaceLeft}![]const u8;  // "2.500", "0.00"
 
@@ -117,7 +124,7 @@ fixed `i128 @ 1e12` can't bound ahead of time: a `std.math.big.int.Managed` sign
 precision-widening branch of `rescale` need no rounding decision (arbitrary precision makes `+ − ×`
 exact). `div` and the precision-*narrowing* branch of `rescale`/`quantize`/`roundToIntegral` route
 through `roundedDivMag`, the one sign-aware rounding primitive — every `RoundingMode`
-(`half_even`/`half_up`/`half_down`/`up`/`down`/`ceiling`/`floor`) resolved at arbitrary precision.
+(all eight, `round_05up` included) resolved at arbitrary precision.
 Generated tables (expected values from Python `decimal`) pin every one of the eight modes, on top of
 this module's own sign-aware round-trip and bridge tests. See SPEC.md's "BigDecimal" section
 for the design and the `std.math.big.int` inventory behind it.
@@ -223,6 +230,13 @@ const g: f64 = try s.toFloat(allocator);                      // only allocation
   zero — like Python's `float(Decimal('1e400'))` and IEEE conversion. `Decimal.toFloat` can hit
   neither edge.
 - Expected values in the tests come from Python's `decimal` module, quoted beside each check.
+
+## Not provided
+
+`Infinity`/`NaN`/signed zero and a GDA context or flag register (typed errors and per-call
+`{inexact, rounded}` instead), a scale carried in `Decimal`, and locale/grouping-aware parsing
+(the caller strips separators). Reasons and the open items: SPEC.md *What is deliberately not
+done* and *Backlog / deferred*.
 
 ## Verify
 
