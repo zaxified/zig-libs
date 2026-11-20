@@ -760,6 +760,13 @@ test "a stray DQUOTE hides no later pair: it opens a span only at a value start,
     try expectPair(&it6, "a", "p;q\"r");
     try expectPair(&it6, "b", "2");
     try testing.expectEqual(@as(?Cookie, null), it6.next());
+
+    // ... also when the next byte is another DQUOTE: it must not open a second span.
+    var it7 = parse("a=\"p;q\"\"x;y\"; b=2");
+    try expectPair(&it7, "a", "\"p;q\"\"x");
+    try expectPair(&it7, "y\"", "");
+    try expectPair(&it7, "b", "2");
+    try testing.expectEqual(@as(?Cookie, null), it7.next());
 }
 
 test "quoted value containing a separator is not split mid-value (audit, python-oracle)" {
