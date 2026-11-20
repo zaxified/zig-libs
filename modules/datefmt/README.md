@@ -158,14 +158,9 @@ zig build test-datefmt -Doptimize=ReleaseFast
 zig fmt --check modules/datefmt
 ```
 
-## DEFER (a spec-complete module would want)
+## Not provided
 
-- **Locale-aware month/day names** — the name tables are English `Jan`…`Dec` /
-  `Mon`…`Sun` only; no locale table or i18n hook. Neither reference has one by
-  default (Go has none; chrono's is the opt-in `unstable-locales` feature).
-- **Timezone-aware formatting/conversion** (IANA tz database, DST rules,
-  offset lookup by zone name) — `ZZ` only carries a raw UTC-offset literal
-  through parse/format; there is no zone database. Intentionally a **separate
-  module** (`tz`), not pulled in here.
-- **Calendar periods** (ISO 8601 `PnYnMnD`) — durations here are exact
-  nanoseconds (Go's `Duration`); a month/year count goes to `addMonths`/`addYears`.
+Locale-aware names (English only), timezone-aware values (the `tz` module gives the offset; `ZZ` only carries a raw
+UTC offset), calendar periods in duration text (`PnYnMnD`: years and months have no fixed length, use
+`addMonths`/`addYears`), space-padded and Sunday-first strftime fields. Reasons in SPEC *What is deliberately not done*;
+open ideas (a lenient HTTP-date option, non-padded numeric fields, strftime `%` directives) in SPEC *Backlog / deferred*.

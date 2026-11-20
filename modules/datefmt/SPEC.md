@@ -21,7 +21,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -36,41 +36,66 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nektro/zig-time](https://github.com/nektro/zig-time) | Zig | MIT | 78 | pushed 2026-09-13, no release | `DateTime` struct with methods returning new values, proleptic Gregorian, `FormatSeq` format table, no leap seconds (README). |
 | Zig `std.time.epoch` | Zig | MIT | — | Zig 0.16.0 | Epoch seconds to year/month/day/time-of-day and back (checked in 0.16.0 `lib/std/time/epoch.zig`); no parsing, no formatting, no arithmetic. |
 
-**Where we are ahead:** the only entry that is both **pre-1970-safe by construction** (signed epoch-day core, tested across leap boundaries) and **strictly validating** (`2024-02-31` is rejected, not rolled into March — the bug this module replaced in `saml`), with one token table shared by `parse` and `format`, calendar arithmetic (`addMonths` day clamping, `startOf*`/`endOf*`, `nthWeekdayOfMonth`) and no allocation outside `format`; it needs no `Io`, no OS and no system tz files, unlike `zeit`. **Where we are behind:** English names only (Go has no locale either; chrono's is an opt-in feature) and no zone-aware value (the sibling `tz` gives the offset, `toUtc`/`partsToUnix` the arithmetic; composing them is left to the caller) — both are module boundaries, not gaps (→ *Threat model / out of scope*). Closed 2026-11-05 (grade probe against chrono 0.4.45 and Go `time`): `DDDD`, `ZZZ`, the trimmed fraction `FFF`, `parseHttpDate` with RFC 9110's obsolete forms, `parsePrefix`, `Layout.formatBuf`, `truncateNs`/`roundNs`, `dayOfYear`/`quarter`. Closed 2026-10-11: the RFC 5322 date (`parseRfc2822`, obsolete forms included, stricter than Go's `net/mail` and Python's `email.utils`), Go's duration text (`parseDuration`/`bufDuration`) and nanosecond Unix time (`partsToUnixNs`).
+**Where we are ahead:** the only entry that is both **pre-1970-safe by construction** (signed epoch-day core, tested across leap boundaries) and **strictly validating** (`2024-02-31` is rejected, not rolled into March — the bug this module replaced in `saml`), with one token table shared by `parse` and `format`, calendar arithmetic (`addMonths` day clamping, `startOf*`/`endOf*`, `nthWeekdayOfMonth`) and no allocation outside `format`; it needs no `Io`, no OS and no system tz files, unlike `zeit`. **Where we are behind:** English names only (Go has no locale either; chrono's is an opt-in feature) and no zone-aware value (the sibling `tz` gives the offset, `toUtc`/`partsToUnix` the arithmetic; composing them is left to the caller) — both are module boundaries, not gaps (→ *What is deliberately not done*). Also present, against chrono 0.4.45 and Go `time`: `DDDD`, `ZZZ`, the trimmed fraction `FFF`, `parseHttpDate` with RFC 9110's obsolete forms, `parsePrefix`, `Layout.formatBuf`, `truncateNs`/`roundNs`, `dayOfYear`/`quarter`; the RFC 5322 date (`parseRfc2822`, obsolete forms included, stricter than Go's `net/mail` and Python's `email.utils`), Go's duration text (`parseDuration`/`bufDuration`) and nanosecond Unix time (`partsToUnixNs`).
 
 ## Design & invariants
 Two layers: a civil core (`ymdToEpochDay`/`epochDayToYmd`/`isoWeekday`, leap-year + days-in-month,
 name tables) using Howard Hinnant's days-from-civil algorithm over signed `i64` epoch-day math —
 correct for dates **before 1970**, unlike a `u64`-seconds-since-epoch core which silently floors any
 pre-1970 date to 1970-01-01; and a token I/O layer (`parse`/`format` over a strftime-like token
-vocabulary shared by both directions). A parse→format reshuffle never round-trips through an epoch
-timestamp, so it has no lower-year limit. Calendar arithmetic (`addDays`/`addMonths`/`addYears`,
+vocabulary shared by both directions). The era adjustment floors (`@divFloor`) and the arithmetic runs in
+`i64`, so dates before 0000-03-01 round-trip too and an out-of-month day extrapolates instead of trapping.
+A parse→format reshuffle never round-trips through an epoch timestamp, so it has no lower-year limit.
+Calendar arithmetic (`addDays`/`addMonths`/`addYears`,
 `diffIn*`, `startOf*`/`endOf*`, `nthWeekdayOfMonth`) is pre-1970 safe by the same epoch-day
-mechanism (and carries the sub-second field through); `addMonths` clamps the day (Jan 31 +1mo → Feb 28/29). Platform: any (pure logic, no OS
+mechanism (and carries the sub-second field through); `addMonths` clamps the day (Jan 31 +1mo → Feb 28/29).
+`epochDayToYmd`/`addDays`/`addYears`/`addMonths`/`diffInMonths` saturate at the i32/i64 edges instead of
+trapping, `diffInYears` too; `isoWeek` and `isoWeekday` are total at those edges; `nthWeekdayOfMonth` refuses
+|n| > 5; `endOfDay`/`endOfMonth`/`endOfYear` carry `.nanosecond = 999_999_999`. Platform: any (pure logic, no OS
 calls, no `std.time` timestamps). Role: util. Concurrency: reentrant (no shared state). Allocation:
 `format`/`formatIsoDate` take an allocator (output is an owned, variable-length string); everything
 else is allocation-free. Modeled after Howard Hinnant's chrono civil algorithms; original work of the
 zig-libs authors — a pure-`std` civil-calendar core (no external dependency) chosen for exactly this
 pre-epoch correctness reason. No third-party source.
 
-**Speed of the token layer (2026-10-10).** `parse`/`format` tokenize the format string on every
+**Numeric fields and strict ISO.** `parse` reads every numeric field as ASCII digits only (no sign, no `_`), so
+`+1` is not month 1 and a `ZZ` hour of `-1` is not a negative hour. `parseIsoDate` ("strict canonical
+`YYYY-MM-DD`") checks the day against the month's length (leap years included) and refuses a sign in any field:
+`2023-02-30` is `InvalidDate`.
+
+**Speed of the token layer.** `parse`/`format` tokenize the format string on every
 call; a `Layout` (`Layout.compile`, comptime-capable) does it once. The tokenizer looks a token up by
 its first character (every token literal is a run of one character, `@compileError` otherwise) instead
 of scanning the 30-entry table per position; a differential test against the table scan covers every
 format up to 4 characters over the token alphabet. `format` renders into a stack buffer sized by an
 upper bound (`max_field_len` = 12 per field, the widest being an extreme `ZZ`) and allocates the
-result once; only a format whose literals push the bound past 256 bytes uses a heap scratch buffer.
-`Layout` has no field defaults: in Zig 0.16 ReleaseFast a defaulted `undefined` array is memset byte
-by byte on every `.{}` -- that alone was 63 % of `format`'s time.
+result once (an allocation failure is `error.OutOfMemory`); only a format whose literals push the bound past
+256 bytes uses a heap scratch buffer. `Layout` has no field defaults: in Zig 0.16 ReleaseFast a defaulted
+`undefined` array is memset byte by byte on every `.{}`, which dominated `format`'s time. The figures are on the card.
 
-**Canned formats (2026-10-11).** `bufRfc3339`, `bufImfFixdate` write into a fixed-size array (`*[rfc3339_max_len]u8`, `*[imf_fixdate_len]u8`) with no format string and no allocator; `formatRfc3339`/`formatImfFixdate` dupe that. Unlike `format` they validate (`validate` plus year 0..9999, offset under a day): a header never carries `???` or a five-digit year. `parseRfc3339` is RFC 3339 proper -- offset required, leap second `InvalidTime` (as Go), result in wall-clock `DateParts` with `off_min`; `parseXsdDateTimeNs` stays the looser XSD grammar folded to an instant. `parseImfFixdate` takes the fixdate only (exact case, `GMT`, the real weekday). Checked against the token engine and `parseXsdDateTimeNs` over 2000 random instants, plus the RFC 9110 / RFC 3339 examples; Go's `time` agrees on the 64 bench instants (result counts).
+**Token vocabulary additions.** `DDDD` (day of year, strftime `%j`), `ZZZ` (offset `±HHMM`), and the trimmed
+fractions `FFF`/`FFFFFF`/`FFFFFFFFF` (a zero fraction drops the `.`/`,` in front; the other separator, as in
+`05,5` against `ss.FFF`, is `InvalidFormat`, never a silent zero fraction with `,5` left over); a zero `FFF`
+written without its separator and followed by a literal that starts with the other separator parses.
+`parsePrefix` (and `Layout.parsePrefix`) returns the parsed parts and the length consumed (chrono's
+`parse_and_remainder`); `Layout.formatBuf` formats without allocating; `truncateNs`/`roundNs` are Go's
+`Time.Truncate`/`Round`; `dayOfYear` and `quarter` read a `DateParts`. The token table is exposed as data
+(`date_tokens`).
+
+**Canned formats.** `bufRfc3339`, `bufImfFixdate` write into a fixed-size array (`*[rfc3339_max_len]u8`, `*[imf_fixdate_len]u8`) with no format string and no allocator; `formatRfc3339`/`formatImfFixdate` dupe that. Unlike `format` they validate (`validate` plus year 0..9999, offset under a day): a header never carries `???` or a five-digit year. `parseRfc3339` is RFC 3339 proper -- offset required, leap second `InvalidTime` (as Go), result in wall-clock `DateParts` with `off_min`; `parseXsdDateTimeNs` stays the looser XSD grammar folded to an instant. `parseImfFixdate` takes the fixdate only (exact case, `GMT`, the real weekday). Checked against the token engine and `parseXsdDateTimeNs` over random instants, plus the RFC 9110 / RFC 3339 examples; Go's `time` agrees on the bench instants (result counts).
+
+**HTTP dates.** `parseHttpDate` accepts RFC 9110 §5.6.7's three forms as a recipient must: the IMF-fixdate
+(`parseImfFixdate`), the obsolete RFC 850 form and C's asctime form (day space-padded or two digits). UTC `DateParts`
+(`off_min` 0); names case-sensitive; the day name must be the date's real weekday in every form (as the httpdate
+crate checks). The RFC 850 two-digit year uses the `YY` pivot (00..69 → 20xx, 70..99 → 19xx, like httpdate)
+instead of RFC 9110's "more than 50 years in the future" rule, which needs a clock. It is strict (see Backlog for a lenient option).
 
 **Fractional seconds.** `DateParts.nanosecond: u32 = 0` (0..999_999_999; `validate` rejects more). Tokens
 `SSS`/`SSSSSS`/`SSSSSSSSS` (3/6/9 digits = ms/µs/ns) are fixed-width in `parse` (digits only, no sign, no
 `_`, else `InvalidTime`; too short gives `InvalidFormat`) and TRUNCATE (never round) in `format`; a
 `nanosecond` ≥ 1e9 makes `format` return `InvalidTime`. `addDays`/`addMonths` preserve it;
-`partsToUnix`/`unixToParts` stay whole-second. `parseXsdDateTime` keeps its `i64` signature (saml) and
-still returns whole seconds; the new `parseXsdDateTimeNs` returns `XsdInstant{ unix, nanosecond }` and
+`partsToUnix`/`unixToParts` stay whole-second. `parseXsdDateTime` keeps its `i64` signature and
+still returns whole seconds; `parseXsdDateTimeNs` returns `XsdInstant{ unix, nanosecond }` and
 accepts any number (≥ 1) of fraction digits, keeping the first 9 and truncating the rest (digits are still
 validated). `nanosecond` is the non-negative fraction of the wall-clock second (floor semantics).
 
@@ -84,128 +109,96 @@ nonexistent week is `InvalidDate`. Without week tokens `e` stays informational. 
 values from Python `datetime.date.isocalendar()` (external oracle) plus a brute-force inverse over
 1900..2100.
 
-**RFC 5322 dates (2026-10-11).** `parseRfc2822` walks §3.3's grammar with the §4.3 obsolete forms through one cursor (`Cfws`) that skips white space, folding and nested comments (a depth counter, not recursion). Where the foreign parsers are lenient it is strict, as chrono is: a wrong day name is `InvalidDate`, trailing text that is not CFWS is `InvalidFormat`, `31 Nov` / hour 24 / an offset of a day are refused (Python takes all of them). Two-digit years follow §4.3 (00-49 → 20xx, 50-99 → 19xx; Go and Python put 50-68 in 20xx); a four-digit `0000` is year 0 (Python reads it as `00`). Military zones and `-0000` give `off_min` 0 -- `DateParts` cannot say "unknown". The output side, `bufRfc2822`, is Go's `RFC1123Z` byte for byte.
+**RFC 5322 dates.** `parseRfc2822` walks §3.3's grammar with the §4.3 obsolete forms through one cursor (`Cfws`) that skips white space, folding and nested comments (a depth counter, not recursion). Where the foreign parsers are lenient it is strict, as chrono is: a wrong day name is `InvalidDate`, trailing text that is not CFWS is `InvalidFormat`, `31 Nov` / hour 24 / an offset of a day are refused (Python takes all of them). Two-digit years follow §4.3 (00-49 → 20xx, 50-99 → 19xx; Go and Python put 50-68 in 20xx); a four-digit `0000` is year 0 (Python reads it as `00`). Military zones and `-0000` give `off_min` 0 -- `DateParts` cannot say "unknown". The output side, `bufRfc2822`, is Go's `RFC1123Z` byte for byte.
 
-**Durations (2026-10-11).** A duration is `i64` nanoseconds (Go's `Duration`, `std.Io.Duration`'s unit), no wrapper type. `parseDuration` is Go's grammar and Go's arithmetic: a fraction is scaled as `f * (unit / scale)` in `f64` and truncated, in Go's order, so `0.3333333333h` gives Go's nanosecond; fraction digits past what `u63` holds are dropped. One deliberate difference: Go sums terms in a `uint64` that two `2^63`-ns terms wrap to 0, which then passes its range check; here the sum is checked. `bufDuration` is `Duration.String` (U+00B5 for µs). **ISO 8601 (2026-11-17).** `parseIsoDuration`/`formatIsoDuration` read and write `[-]P[nW][nD][T[nH][nM][n[.F]S]]` in the same `i64` nanoseconds, over the fixed units only (a week is 7 days, a day 24 hours; years and months have no fixed length and are refused). `parseIsoDurationUnits`/`formatIsoDurationUnits` take a comptime units-per-second (`1_000_000` for microseconds) so a consumer that counts coarser units keeps its range; the formatter writes `P0D` for zero and `[-]PT<s>[.F]S` otherwise, every `i64` reads back. Moved from dataframe, whose tests pinned the behaviour; datefmt adds the negative, overflow and never-a-panic tests.
+**Durations.** A duration is `i64` nanoseconds (Go's `Duration`, `std.Io.Duration`'s unit), no wrapper type. `parseDuration` is Go's grammar and Go's arithmetic: a fraction is scaled as `f * (unit / scale)` in `f64` and truncated, in Go's order, so `0.3333333333h` gives Go's nanosecond; fraction digits past what `u63` holds are dropped. One deliberate difference: Go sums terms in a `uint64` that two `2^63`-ns terms wrap to 0, which then passes its range check; here the sum is checked. `bufDuration` is `Duration.String` (U+00B5 for µs). `parseDurationExt(s, .{ .days, .weeks })` (`DurationExtOptions`, both off by default) accepts `d` (exactly 24 h) and `w` (7 d) on top of Go's grammar, for config values like `7d`; with both off it is `parseDuration`, which stays exactly Go's; overflow of `i64` nanoseconds is `error.InvalidDuration`. Go has no such units, so there is no oracle row: the tests pin the arithmetic and the boundary (106751 d fits, 106752 d does not). **ISO 8601.** `parseIsoDuration`/`formatIsoDuration` read and write `[-]P[nW][nD][T[nH][nM][n[.F]S]]` in the same `i64` nanoseconds, over the fixed units only (a week is 7 days, a day 24 hours; years and months have no fixed length and are refused). Units appear in order and once each, the fraction only on the seconds (`.` or `,`, 1–9 digits, those past the unit truncated), either letter case, a leading `+`/`-`. `parseIsoDurationUnits`/`formatIsoDurationUnits` take a comptime units-per-second (`1_000_000` for microseconds) so a consumer that counts coarser units keeps its range; the formatter writes `P0D` for zero and `[-]PT<s>[.F]S` otherwise, every `i64` reads back; overflow and garbage are `error.InvalidDuration`.
 
-## Threat model / out of scope
+## Threat model / Limits
 Not security-sensitive; the contract is calendar-arithmetic correctness. Malformed format strings
 or out-of-range parse input return typed `ParseError` values (`InvalidFormat`/`InvalidDate`/
 `InvalidTime`/`InvalidFormatString`/`TooManyTokens`), never a panic; `firstInvalidFormatChar` gives a
 diagnostic offset. `parseRfc2822` and `parseDuration` take untrusted text (a mail `Date:` header,
 a config value) and are covered by the mutated/random-input test in `go_oracle_test.zig`. Out of scope:
-locale-aware month/day names (English `Jan`…`Dec`/`Mon`…`Sun` only, no i18n hook -- the CLDR data
-would dwarf the module, and neither reference ships it by default), timezone-aware
-formatting/conversion (no IANA tz database or DST rules — `ZZ` only carries a raw UTC-offset literal;
-that's the separate `tz` module), and calendar periods (`PnYnMnD`; durations are exact nanoseconds,
-month/year counts go to `addMonths`/`addYears`).
+locale names, timezone-aware values and calendar periods (reasons in *What is deliberately not done*).
+
+Known limits a consumer relies on:
+- `parse` is lenient where the canned `parse*` functions are not: trailing input is ignored, `ii` is neither
+  range-checked nor tied to `a` (`13 AM` → 13:00), a weekday name is not checked against the date, `MM`/`DD` are
+  ignored when a week token is present, an unterminated `[` makes the rest literal, `SSSS` is `SSS` plus a literal `S`.
+  Short and long month-name errors differ (`InvalidFormat` vs `InvalidDate`).
+- `format` does not validate fields (hour 99 prints `99`); the canned `buf*`/`format*` forms do.
+- `addDays`/`addMonths` drop `off_min`.
+- `parseXsdDateTime` refuses `24:00:00` and negative years (XSD 1.1 allows both).
+- `Cfws.skip` rejects a trailing `CRLF SP` at the very end of an RFC 2822 date (an error, no crash).
 
 ## Verification
-Civil-core round-trips (epoch-day↔ymd, incl. pre-1970 and leap-year boundaries), token
-parse/format for every documented token incl. 12h AM/PM and `ZZ` offsets, calendar arithmetic
-(`addMonths` day-clamping, `nthWeekdayOfMonth`), strict ISO parse/format, and malformed-format-string
-error paths. Foreign answers, replayed hermetically by `src/go_oracle_test.zig`: Go 1.26 `time.ParseDuration` on 670
-crafted and generated inputs, `Duration.String` on 421 values, `RFC1123Z` on 300 instants with offsets
-(`src/go_time_vectors.zig`, from `tools/go_time_oracle`); Python `email.utils.parsedate_tz` on 75 crafted
-and 400 generated mail dates, each row labelled `agree` / `reject` / `own` with the reason
-(`src/mail_date_vectors.zig`, from `tools/mail_date_oracle.py`). `zig build interop-datefmt -- --check`
-re-takes both. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check
-modules/datefmt`.
-
-**Audit 2026-11-17 (delta mutation).** 74 schemata mutants over the ISO 8601 duration functions moved in from
-`dataframe` the same day (`parseIsoDurationUnits`, `isoDigits`, `isoFraction`, `formatIsoDurationUnits` and the two
-nanosecond wrappers), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the sign and
-`P` prefix handling, the `T` switch and its once-only rule, the digit, fraction and unit steps, every unit's value
-and rank, the duplicate/order and fraction-on-seconds rules, the `any` flag, the `i64` cast, the digit and
-fraction loop bounds and overflow guards, the fraction width and scaling, and in the writer the zero and sign
-cases, the integer/fraction split, the trailing-zero trim and the `.`/`S` bytes. First run: 70 killed, 4
-survived. One test added (junk before the `P` and an unknown unit letter in the date or the time part are
-refused) and killed 2; 2 are EQUIVALENT: skipping the `continue` after the `T` marker (the next iteration, whether
-it starts with `T`, digits or the end, gets the same verdict from the code that follows) and a failed `+ digit`
-in `isoDigits` leaving the digits read so far (a value past `i64` becomes at least 9.2e18 and is multiplied by a
-unit of at least 10, so the `i64` cast refuses it with the same error). `isoUnitDigits` and `max_iso_duration_len`
-are comptime-only (a compile error is their failure mode) and are not mutated. 72 killed + 2 eq = 74; the card's
-counts are cumulative with the 2026-11-15 and earlier runs.
-
-**Audit 2026-11-15 (delta mutation).** 10 schemata mutants over the 2026-11-15 additions, ReleaseSafe, one
-build, each mutant under `setsid -w timeout` and `ulimit -v`: `parseDuration`'s hand-off to `parseDurationExt`
-(each option forced on), the options reaching `durationUnit`, each unit's gate (forced open, forced shut), each
-unit's value (`d` as an hour, `w` as a day) and the unknown-unit result. 9 killed in the first run; 1 survived
-(`parseDuration` accepting `w`: the existing test compared the option-less call only against `d`) and got a test
-(`parseDuration("1d")`/`("1w")` refused); the rerun killed it. 10/10, 0 equivalent.
-
-**Audit 2026-10-04 (mutation).** 51 schemata mutants over the civil core (leap rule,
-`daysInMonth`, `validate`, ISO week-date bounds), the tokenizer cap, `parse` (YY pivot,
-1-2 digit fields, fraction width/scale, `e` range, AM/PM and 12-hour mapping, `ZZ` sign,
-colon and ranges, literals, `[*]` scans, the time-vs-date error split), `format` (negative
-year, offset sign, fraction truncation, noon), `addMonths` clamp, `nthWeekdayOfMonth`
-bounds, `parseIsoDate` and `parseXsdDateTimeNs` (separator, day, leap second, fraction,
-zone colon/ranges/sign, trailing bytes, digit fields) and `firstInvalidFormatChar`: 49
-killed, 2 equivalent, 0 left alive. Equivalent: dropping `n == 0` in `nthWeekdayOfMonth`
-(n = 0 takes the negative branch, `dim - offset + 7 > dim`, so null anyway); accumulating
-fraction digits past the 9th in `parseXsdDateTimeNs` (their weight is already 0). Two defects
-found while reading and fixed: `parse`'s numeric fields went through `std.fmt.parseInt`
-alone, so a fixed-width field took a sign or `_` (`+1` as month 1, a `ZZ` hour of `-1`
-passing the range check as negative); `parseIsoDate`, documented "strict canonical", checked
-`day <= 31` only, so `2023-02-30` was accepted. 22 survivors were test gaps and got tests
-(token edges from `date_tokens`, literals, wildcards, 12 h noon/midnight, `nthWeekdayOfMonth`
-past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKENS`).
+- **Run:** `zig build test-datefmt` (also `-Doptimize=ReleaseFast`; or `scripts/modtest datefmt`), `zig fmt --check modules/datefmt`.
+- **Test classes:** civil-core round-trips (epoch-day↔ymd, incl. pre-1970, before 0000-03-01 and leap-year boundaries);
+  token parse/format for every documented token incl. 12h AM/PM, `ZZ` offsets, `[*]` wildcards and literals; calendar
+  arithmetic (`addMonths` day-clamping, `nthWeekdayOfMonth`, saturation at the type edges); strict ISO parse/format;
+  malformed-format-string error paths; no-panic checks at the i32/i64 edges (`src/audit_test.zig`); the grammar leads
+  over the foreign parsers (`src/lead_test.zig`, `tools/rust_fast_bench --probe`).
+- **Model fuzz:** `src/model_fuzz_test.zig` (the card's Evidence line), run by testkit's deterministic driver as
+  `DATEFMT_FUZZ`, with reach on every label.
+- **Foreign answers**, replayed hermetically by `src/go_oracle_test.zig`: Go 1.26 `time.ParseDuration`, `Duration.String` and
+  `RFC1123Z` (`src/go_time_vectors.zig`, from `tools/go_time_oracle`); Python `email.utils.parsedate_tz` on crafted and
+  generated mail dates, each row labelled `agree` / `reject` / `own` with the reason (`src/mail_date_vectors.zig`,
+  from `tools/mail_date_oracle.py`). `zig build interop-datefmt -- --check` re-takes both. ISO week values come from
+  Python `datetime.date.isocalendar()`.
+- **Constant time:** n/a — date formatting.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it. Mutation covered the production part of `root.zig`; the equivalent classes are `@rem`/`@mod`
+  under divisibility or a non-negative year, the yoe formula at its boundary (exhaustive over the day-of-era range), the
+  `parseDuration` f64 boundary (one-ulp argument, not a proof), unreachable inputs and guards preceded by a zero test;
+  `isoWeek`'s lower clamp is unobservable (it matters only for an out-of-range month at the minimum i32 year, where the
+  contract is no trap).
+- **Bench:** `zig build bench-datefmt` (`tools/bench.zig`, `BENCH_ROUNDS=5`; reference side `tools/go_bench`, fastest-in-field side
+  `tools/rust_fast_bench`).
 
 ## Performance
+`zig build bench-datefmt`, ReleaseFast, against Go `time` (reference, `tools/go_bench`) and, per task, the fastest of
+httpdate, humantime, chrono and jiff (`tools/rust_fast_bench`, pinned by its `Cargo.lock`). The card's Performance line
+carries the figures. The canned RFC 3339 / IMF-fixdate rows are paired with Go's canned RFC 3339 path, and the token
+engine with a layout Go does not special-case (`fmt_rfc3339_tokens`).
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-datefmt`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 4.8 %): ref 0.06–0.91×, against 0.06–0.91× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
-
-**Fastest in the field, 2026-10-25** (`zig build bench-datefmt`, `BENCH_ROUNDS=5`, quiet host): per task, our fastest API against httpdate 1.0.3, humantime 2.4.0, chrono 0.4.45 and jiff 0.2.38 (`tools/rust_fast_bench`, Cargo.lock), ours re-timed beside each. fmt_imf 1.18× jiff (0.58× httpdate), fmt_rfc3339 1.07× chrono, fmt_tokens 0.44× jiff, parse_imf 0.21× jiff, parse_tokens 0.57× jiff, parse_rfc3339 0.95× humantime, parse_rfc3339_frac 0.84× chrono. Reference rows 0.07–0.95× Go 1.26.8.
-
-**Mutation (2026-11-07, whole module,** production part of `root.zig` — civil core, tokenizer, parse/format/render, calendar arithmetic, ISO/RFC 3339/IMF-fixdate/RFC 850/asctime/`parseHttpDate`, `truncateNs`/`roundNs`, RFC 2822 with CFWS, durations, `parseXsdDateTimeNs`; schemata in a detached copy, ReleaseSafe, strict verdict): 810 mutants, 777 killed (20 by 11 new tests), 32 equivalent + 1 unobservable, 0 undecided; no defect. New tests: `epochDayToYmd` past either limit, `parsePrefix` lengths (names, AM/PM, `FFF` with the other separator last), `[*]FFF`/`[*]ZZ`/`[*][*]`, `parseUint` overflow (multiply and add), `FFF` keeping an earlier `SSS` fraction, `FFF` at 999999999 ns, min-year saturation of `addMonths`/`diffInMonths`, `startOfDay` keeps the month, `nthWeekdayOfMonth(…, -5)`, `formatBuf` year 0, RFC 850 trailing bytes and 5-letter day names, RFC 2822 3-digit time fields. Equivalent (invariant per id in the table): `@rem`/`@mod` under divisibility or a non-negative year, the yoe formula at 1459/1460 (exhaustive over doe 0..146096), the `parseDuration` f64 boundary (2640 emulated cases; one-ulp argument, not a proof), unreachable inputs (no empty literal, `min_width >= 1`, longest token 9), same error class on the same inputs, guards preceded by `n == 0`/`om == 0`/`ns == 0`. Unobservable: 42, the `isoWeek` lower clamp, which matters only for an out-of-range month at the minimum i32 year (contract: no trap).
+## What is deliberately not done
+- **Locale-aware month/day names** — English `Jan`…`Dec`/`Mon`…`Sun` only, no i18n hook: the CLDR data would dwarf
+  the module, and neither reference ships it by default (Go has none; chrono's is opt-in).
+- **Timezone-aware formatting/conversion** (IANA database, DST rules) — `ZZ` only carries a raw UTC-offset literal;
+  that is the separate `tz` module (`toUtc`/`partsToUnix` give the arithmetic; composing them is the caller's).
+- **Calendar periods in duration text** (`PnYnMnD`) — durations are exact nanoseconds; month/year counts go to
+  `addMonths`/`addYears`. `TimeDelta` range beyond ±292 years: durations are Go's `i64` nanoseconds.
+- **Space-padded fields and per-field padding modifiers** (`%e`, `%k`, `%l`, Go `_2`, `%-d`, `%_d`), **Sunday-first week
+  numbers** (`%U`, `%W`), 2-digit ISO week-year (`%g`), century (`%C`), Sunday-0 weekday (`%w`), a quarter token (`%q`;
+  `quarter()` exists) — no spelling is free: `_` is a common literal separator (`YYYY_MM_DD`) and format strings reach
+  users through a consumer's expression language, so a new meaning for an existing byte would silently change their
+  output, and an unused letter would be one more token that means nothing to a strftime or Go user, for a feature whose
+  common uses have canned answers (asctime via `parseHttpDate`, syslog RFC 3164 via the `syslog` module). Reopen if a
+  rival user's case appears that neither covers.
+- **Offsets with seconds** (`%::z`, Go `-07:00:00`) — only historical local mean time has them; `off_min` stays minutes.
+- **Lenient `FromStr`, a `Parsed` builder, `%#z` permissive offsets** — the strict grammar is the module's lead (the
+  card's Ahead line); `parse` with a format is the lenient path.
+- **RFC 3339 `AutoSi` (shortest fraction) and a `+00:00` choice** — `bufRfc3339` with `frac_digits`, or
+  `FFFFFFFFF`/`ZZ` in a format, cover both.
+- **Leap-second `:60` in RFC 3339 / RFC 5322** — refused by design (the grammar leads on the card).
 
 ## Backlog / deferred
-
-- ~~**ISO 8601 durations (`PT1H30M`, `P1DT2H`, `-P2W`) — parse and format**~~ ✅ 2026-11-17 *(duplicate-code pass 2026-11-08)*: `parseIsoDuration` / `formatIsoDuration` (nanoseconds, `max_iso_duration_len`) and the `...Units` forms with a comptime units-per-second (a power of ten up to 1e9; dataframe counts microseconds and keeps its ±292 000 year range). Moved out of dataframe unchanged in meaning: only the fixed units `W D H M S` (no years or months, `P1Y`/`P1M` are errors), in order and once each, the fraction on the seconds only (`.` or `,`, 1–9 digits, those past the unit truncated), either letter case, a leading `+`/`-`, `P0D` for zero on output; overflow and garbage are `error.InvalidDuration`. dataframe's `parseDurationCell`/`formatIsoDuration` call them.
-- **HTTP-date leniency** (same pass): `http/src/conditional.zig` keeps its own `parseHttpDate` because it accepts what
-  clients send (no weekday check, second 60) while `datefmt.parseHttpDate` is strict. A `lenient` option here would let
-  http drop its copy.
-
-- **Grade probe 2026-11-05 — rows left open, with the reason**:
-  - Space-padded fields (`%e`, `%k`, `%l`, Go `_2`) and per-field padding modifiers (`%-d`, `%_d`): no spelling is free. `_` is a common literal separator (`YYYY_MM_DD`), and the module's format strings reach users through the build-tool consumer's expression language, so a new meaning for an existing byte would silently change their output. **Deliberately not (decided 2026-11-05, owner delegated):** the readable spellings are taken (`_`, a space) and an unused letter would be one more token that means nothing to a strftime or Go user, against a feature whose only common uses have canned answers: asctime via `parseHttpDate`, syslog RFC 3164 via the `syslog` module. Reopen if a rival user's case appears that neither covers.
-  - Sunday-first week numbers (`%U`, `%W`), 2-digit ISO week-year (`%g`), century (`%C`), Sunday-0 weekday (`%w`), quarter token (`%q`; `quarter()` exists): edge, cheap, each a new letter in the vocabulary. Same spelling question.
-  - Offsets with seconds (`%::z`, Go `-07:00:00`): only historical local mean time has them; `off_min` stays minutes. Deliberate.
-  - `Weekday`/`Month` enums with names and parsing, `WeekdaySet`, `NaiveWeek`: an API change (`u32` fields today); edge.
-  - Lenient `FromStr`, a `Parsed` builder, `%#z` permissive offsets: the strict grammar is the module's lead (`**Ahead:**`); `parse` with a format is the lenient path. Deliberate.
-  - `TimeDelta` range beyond ±292 years: durations are Go's `i64` nanoseconds. Deliberate. ISO 8601 `PT…S` duration text: edge.
-  - RFC 3339 `AutoSi` (shortest fraction) and a `+00:00` choice: `bufRfc3339` with `frac_digits`, or `FFFFFFFFF`/`ZZ` in a format, cover both. Wrapping time-of-day arithmetic: edge.
-
-- **Non-padded numeric fields in `parse`** *(filed 2026-11-07 from `dataframe`'s pandas/polars
-  oracle, 13 `strptime-*` known_diff ids in `modules/dataframe/src/oracle2_test.zig`)*: pandas
-  and polars (chrono) read `2021-3-4`, a one-digit hour, a fraction shorter than its token and a
-  `+hh` offset under a zero-padded format; this parser needs every numeric field at full width.
-  Ideal: a field reads 1..width digits when the next layout byte is not a digit (chrono's rule),
-  strict width behind an option for the fixed-width formats.
-- **strftime `%` directives as an alternative layout syntax** *(filed 2026-11-07 from `dataframe`
-  D2, which works around it in `modules/dataframe/src/dtfn.zig` `translateFormat`)*: chrono, zeit,
-  Python's `strftime`/`strptime` and polars' `to_datetime(format=…)` take `%Y-%m-%d %H:%M:%S`;
-  this module takes only its own token vocabulary, so every consumer that accepts a user's format
-  string translates it. Ideal API: `parseStrftime(fmt, text)` / `formatStrftime(fmt, parts, buf)`
-  (or a `Syntax.strftime` switch on `parse`/`format`) covering the C99 + POSIX directives the
-  token vocabulary can already express, the rest refused by name. The 2026-11-05 spelling question
-  above (`%e`, `%U`, …) is moot inside a strftime string: there the letters already have meanings.
-
-- **No-panic sweep 2026-10-29:** parsers and formatters clean; fixed three edge-of-type traps on caller values — `isoWeek` u32 cast with year at the i32 edge and an out-of-range month (DF-1, also via `format` `GGGG`/`W`), `isoWeekday` `epoch_day + 3` near `maxInt(i64)` (DF-2), `diffInYears` i32 subtraction (DF-3, now saturates like `diffInMonths`). Independent review found nothing further; noted: `Cfws.skip` rejects a trailing `CRLF SP` at the very end of an RFC 2822 date (an error, no crash). ✅ DONE 2026-10-29 (DF-1..3 fixed with tests, modules/datefmt/src/root.zig:165,184,3409,3417, commit abac54a8a).
-- **Audit 2026-10-25 leftovers (LOW, by design or documentation-only)**: `parse` is lenient where `parse*` canned functions are not — trailing input is ignored, `ii` is neither range-checked nor tied to `a` (`13 AM` → 13:00), a weekday name is not checked against the date, `MM`/`DD` are ignored when a week token is present, an unterminated `[` makes the rest literal, `SSSS` is `SSS` plus a literal `S`. Candidate: an opt-in strict mode (end of input, `ii` 1..12, weekday check) rather than a behaviour change. `format` does not validate fields (hour 99 prints `99`). `addDays`/`addMonths` drop `off_min`. Short vs long month-name errors differ (`InvalidFormat` vs `InvalidDate`). `parseXsdDateTime` refuses `24:00:00` and negative years (XSD 1.1 allows both).
-- ~~**Audit 2026-10-25 D1 (HIGH) + MED 1–3**~~ **DONE 2026-10-25**: the civil core combined Hinnant's truncating-division era adjustment with `@divFloor`, so every date before 0000-03-01 was one day off (`unixToParts(partsToUnix(0000-01-01))` = 0000-01-02); the core now floors and computes in i64 (an out-of-month day extrapolates instead of trapping), `epochDayToYmd`/`addDays`/`addYears`/`addMonths`/`diffInMonths` saturate at the i32/i64 edges instead of trapping, `nthWeekdayOfMonth` refuses |n| > 5, and `endOfDay`/`endOfMonth`/`endOfYear` carry `.nanosecond = 999_999_999` (they were earlier than a fractional input). Pinned by `audit_test.zig` (D1a/D1b, MED1–3) and the model fuzz.
-- ~~**Speed: 0.23–18.95× Go 1.26.0 time**~~ **DONE 2026-10-10/11 → 0.06–0.91×** *(`zig build bench-datefmt`, two 5-round runs, worst row `parse_imf` 0.90–0.91×)*: the format string was matched against the whole 30-entry token table at every position, `Tokenized{}` was memset byte by byte (1.5 KB, Zig 0.16 ReleaseFast), and `format` went through `print` into a growing writer. Now: first-character token lookup, no defaulted array, a bounded stack buffer with one allocation, `Layout` to tokenize once, and the canned RFC 3339 / IMF-fixdate functions. The 10-10 row `fmt_rfc3339` (1.7–1.8×) paired our token engine with Go's special-cased RFC 3339 layout; since 10-11 canned meets canned (`formatRfc3339` vs `Format(time.RFC3339)`, 0.53×) and the token engine meets a layout Go does not special-case (`fmt_rfc3339_tokens`, 0.70×).
-
-- ~~**General RFC 2822 parser, durations, nanosecond Unix time**~~ **DONE 2026-10-11** *(survey 2026-09-30, "Where we are behind")*: `parseRfc2822`/`bufRfc2822`, `parseDuration`/`bufDuration` (Go-exact), `partsToUnixNs`/`unixNsToParts`, `toUtc`; anchored on Go and Python (see *Verification*). Locale names, zone-aware values and calendar periods stay out of scope (*Threat model / out of scope*, with the reason).
-- ~~**Day and week units in duration text**~~ **DONE 2026-11-15** *(consumer request 2026-11-15)*: `parseDurationExt(s, .{ .days, .weeks })` accepts `d` (exactly 24 h) and `w` (7 d) on top of Go's grammar, both off by default; `parseDuration` is unchanged and stays exactly Go's. Overflow of `i64` nanoseconds is `error.InvalidDuration`. Go has no such units, so there is no oracle row; the tests pin the arithmetic and the boundary (106751 d fits, 106752 d does not).
-- ~~**Fractional seconds**~~ **DONE 2026-09-30** *(survey 2026-09-30)*: a sub-second field on `DateParts` (defaulted, so existing callers keep compiling) plus `SSS`/`SSSSSS`-style tokens in `parse` and `format`. Why: every chrono/Go/zeit user reads and writes timestamps with milliseconds (logs, JSON APIs, RFC 3339); today `format` cannot emit them and `parseXsdDateTime` throws them away. Effort: small–medium. Fits CONVENTIONS §2 (pure Zig).
-- ~~**ISO week number and week-year**~~ **DONE 2026-09-30** *(survey 2026-09-30)*: `isoWeek(parts) -> {year, week}` and `YYYY-Www-D` parse/format tokens. Why: reporting and scheduling code in Europe keys on ISO weeks; chrono and Go `time.ISOWeek` have it (the latter *(inferred)*). Effort: small (Hinnant-style arithmetic on the existing core). Fits §2.
-- ~~**Canned RFC 3339 and RFC 2822/1123 helpers**~~ **DONE 2026-10-11** *(survey 2026-09-30)*: `bufRfc3339`/`formatRfc3339` (0..9 fraction digits, `Z` or `±hh:mm` from `off_min`), `parseRfc3339` (offset required, kept in `off_min`), `bufImfFixdate`/`formatImfFixdate`/`parseImfFixdate` (RFC 9110 HTTP date, weekday checked). The `buf*` forms take a fixed-size array and never allocate -- what the web-server consumer `access.zig` and `http` `Server.zig` hand-roll today (candidates to switch). Not done: general RFC 2822 (numeric zones, comments, obsolete forms).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 5 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`extract · any · util · reentrant` · deps: none — canonical source is `pub const meta` in
-src/root.zig.
+- **HTTP-date leniency.** The `http` module keeps its own `parseHttpDate` because it accepts what clients send (no
+  weekday check, second 60) while `datefmt.parseHttpDate` is strict. A `lenient` option here would let http drop its copy.
+- **Non-padded numeric fields in `parse`** (from a pandas/polars strptime comparison in the `dataframe` module's oracle):
+  pandas and polars (chrono) read `2021-3-4`, a one-digit hour, a fraction shorter than its token and a `+hh` offset
+  under a zero-padded format; this parser needs every numeric field at full width. Ideal: a field reads 1..width digits
+  when the next layout byte is not a digit (chrono's rule), strict width behind an option for the fixed-width formats.
+- **strftime `%` directives as an alternative layout syntax** (the `dataframe` module's `translateFormat` works around
+  it): chrono, zeit, Python and polars take `%Y-%m-%d %H:%M:%S`; this module takes only its own token vocabulary, so
+  every consumer that accepts a user's format string translates it. Ideal API: `parseStrftime(fmt, text)` /
+  `formatStrftime(fmt, parts, buf)` (or a `Syntax.strftime` switch on `parse`/`format`) covering the C99 + POSIX
+  directives the token vocabulary can already express, the rest refused by name. The space-padding question above is
+  moot inside a strftime string: there the letters already have meanings.
+- **Opt-in strict mode for `parse`** (end of input, `ii` 1..12, weekday check) instead of a behaviour change, for the
+  leniencies listed under Limits. Idea, no consumer yet.
+- **`Weekday`/`Month` enums with names and parsing, `WeekdaySet`, `NaiveWeek`**: an API change (`u32` fields today);
+  edge. **Wrapping time-of-day arithmetic**: edge.
 
 ## Anchoring
 
