@@ -606,3 +606,173 @@ test "Submitter.deinit twice panics instead of wrapping the counter (review R-WP
     const out = try child.run(doubleDeinitChild, .{}, .{ .limit_ms = 5000 });
     try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
 }
+
+// ── blocking submit, timed wait / drain ─────────────────────────────────────
+
+fn awaitEntered(io: std.Io, g: *Gate) void {
+    while (g.entered.load(.seq_cst) == 0) io.futexWaitTimeout(u32, &g.entered.raw, 0, .{ .duration = .{
+        .raw = .fromMilliseconds(5),
+        .clock = .awake,
+    } }) catch {};
+}
+
+const Blocked = struct {
+    pool: *WorkerPool,
+    job: root.Job,
+    /// 0 running, 1 accepted, 2 Shutdown, 3 other error.
+    result: std.atomic.Value(u32) = .init(0),
+    fn run(b: *Blocked) void {
+        b.pool.submitBlocking(b.job) catch |e| {
+            b.result.store(if (e == error.Shutdown) 2 else 3, .seq_cst);
+            return;
+        };
+        b.result.store(1, .seq_cst);
+    }
+};
+
+test "waitTimeout: Timeout while a job runs, true once it finished, waiters back to 0" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    try pool.submit(.{ .func = gatedJob, .ctx = &g });
+    awaitEntered(io, &g);
+    try testing.expectError(error.Timeout, pool.waitTimeout(30 * std.time.ns_per_ms));
+    try testing.expectEqual(@as(usize, 0), pool.waiters.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.parked_waiters.load(.seq_cst));
+    g.release();
+    try testing.expect(try pool.waitTimeout(10 * std.time.ns_per_s));
+    // An idle pool answers at once, even with a zero budget.
+    try testing.expect(try pool.waitTimeout(0));
+}
+
+test "drainTimeout: Timeout leaves a closed, still-running pool that a later call finishes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    try pool.submit(.{ .func = gatedJob, .ctx = &g });
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    awaitEntered(io, &g);
+    try testing.expectError(error.Timeout, pool.drainTimeout(30 * std.time.ns_per_ms));
+    try testing.expect(pool.state.load(.seq_cst) == .draining);
+    try testing.expectError(error.Shutdown, pool.submit(.{ .func = incr, .ctx = &c }));
+    g.release();
+    try pool.drainTimeout(10 * std.time.ns_per_s);
+    try testing.expect(pool.state.load(.seq_cst) == .stopped);
+    try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+    try pool.drainTimeout(0); // a stopped pool: no-op
+}
+
+test "drainTimeout: after a Timeout, plain drain and deinit join the workers" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    {
+        const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+        defer pool.deinit();
+        var g = Gate{ .io = io };
+        try pool.submit(.{ .func = gatedJob, .ctx = &g });
+        awaitEntered(io, &g);
+        try testing.expectError(error.Timeout, pool.drainTimeout(10 * std.time.ns_per_ms));
+        g.release();
+        pool.drain();
+        try testing.expect(pool.state.load(.seq_cst) == .stopped);
+        try testing.expect(pool.drainedCleanly());
+    }
+    {
+        // deinit alone (the gate is open before it, so the job ends).
+        const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+        var g = Gate{ .io = io };
+        try pool.submit(.{ .func = gatedJob, .ctx = &g });
+        awaitEntered(io, &g);
+        try testing.expectError(error.Timeout, pool.drainTimeout(10 * std.time.ns_per_ms));
+        g.release();
+        pool.deinit();
+    }
+}
+
+test "submitBlocking: waits for room on a full queue instead of QueueFull" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    try pool.submit(.{ .func = gatedJob, .ctx = &g });
+    awaitEntered(io, &g); // the worker holds it: the queue is empty again
+    try pool.submit(.{ .func = incr, .ctx = &c }); // fills the one slot
+    try testing.expectError(error.QueueFull, pool.submit(.{ .func = incr, .ctx = &c }));
+
+    var b = Blocked{ .pool = pool, .job = .{ .func = incr, .ctx = &c } };
+    const t = try std.Thread.spawn(.{}, Blocked.run, .{&b});
+    var joined = false;
+    defer if (!joined) {
+        g.release();
+        t.join();
+    };
+    sleepMs(io, 50);
+    try testing.expectEqual(@as(u32, 0), b.result.load(.seq_cst)); // still waiting
+    try testing.expectEqual(@as(usize, 1), pool.space_waiters.load(.seq_cst));
+    g.release();
+    t.join();
+    joined = true;
+    try testing.expectEqual(@as(u32, 1), b.result.load(.seq_cst));
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 2), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.space_waiters.load(.seq_cst));
+}
+
+test "submitBlocking: on room it is submit; an unbounded pool never blocks" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2, .max_queued = 0, .max_submitters = 1 });
+    defer pool.deinit();
+    for (0..100) |_| try pool.submitBlocking(.{ .func = incr, .ctx = &c });
+    var sub = try pool.registerSubmitter();
+    defer sub.deinit();
+    try sub.submitBlocking(.{ .func = incr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 101), c.n.load(.seq_cst));
+}
+
+test "submitBlocking: a caller blocked on a full queue is released with Shutdown by shutdownNow" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    try pool.submit(.{ .func = gatedJob, .ctx = &g });
+    awaitEntered(io, &g);
+    try pool.submit(.{ .func = incr, .ctx = &c });
+
+    var b = Blocked{ .pool = pool, .job = .{ .func = incr, .ctx = &c } };
+    const t = try std.Thread.spawn(.{}, Blocked.run, .{&b});
+    sleepMs(io, 30);
+    try testing.expectEqual(@as(u32, 0), b.result.load(.seq_cst));
+    // shutdownNow joins the worker, which sits in the gated job: run it on a
+    // thread and watch the blocked submitter come back first.
+    const sd = try std.Thread.spawn(.{}, shutdownNowThread, .{pool});
+    const released = pollTrue(io, 5000, &b.result);
+    g.release();
+    sd.join();
+    t.join();
+    try testing.expect(released);
+    try testing.expectEqual(@as(u32, 2), b.result.load(.seq_cst));
+}

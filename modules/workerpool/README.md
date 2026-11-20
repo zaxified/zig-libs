@@ -79,12 +79,13 @@ callable (no per-job-type instantiation, smaller binary); a comptime job type
 would force one concrete `Job`/`run` per pool. The caller owns `ctx` and keeps
 it valid until the job runs.
 
-**Backpressure — bounded by default, never blocking.** The queue grows on demand, so
+**Backpressure — bounded by default.** The queue grows on demand, so
 `submit` never blocks; it fails with `error.SubmitFailed` (allocator exhaustion),
 `error.Shutdown` (pool no longer accepting) or `error.QueueFull`: `Options.max_queued`
 (default 1 Mi) is the most jobs queued-and-not-started, a submit past it allocates and
 counts nothing (the bound is exact under concurrent submitters), and the caller retries
-or sheds. `max_queued = 0` is the explicit unbounded opt-in.
+or sheds, or calls `submitBlocking` to wait for room. `max_queued = 0` is the explicit unbounded opt-in.
+`waitTimeout(ns)` and `drainTimeout(ns)` are `wait` / `drain` with a bound (`error.Timeout`).
 
 ```zig
 const pool = try workerpool.WorkerPool.init(allocator, .{ .io = io, .n_workers = 4, .max_queued = 64 });
@@ -117,9 +118,8 @@ that benchmark; `tools/c_bench/main.c` is our own tooling.
 
 ## Not provided
 
-No blocking submit, no per-job result or future handle (use `std.Io.Group`, or a
-caller-owned slot plus `wait`), no panic isolation, no dynamic resizing and no
-timeout variant of `wait` / `drain`; see SPEC *What is deliberately not done* and
+No per-job result or future handle (use `std.Io.Group`, or a
+caller-owned slot plus `wait`), no panic isolation, and no dynamic resizing; see SPEC *What is deliberately not done* and
 *Backlog / deferred*.
 
 ## Verification

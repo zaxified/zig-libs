@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [kprotty/zap](https://github.com/kprotty/zap) | Zig | MIT | 553 | no release; push 2025-01-02 | Work-stealing Zig thread pool with batch scheduling (its README: "resource efficient", competitive in performance); written for Zig of 2020-21, unmaintained since *(inferred from push date)*; not `Io`-based. |
 | Zig 0.16 `std.Io` (`Io.Group`, `Io.Threaded`) | Zig | MIT | — | Zig 0.16.0 | `std.Thread.Pool` is gone in 0.16 (checked: no `Pool` in `lib/std/Thread.zig`). std's answer is `Group.async`/`concurrent` + `await`/`cancel` on the `Io` implementation: results, cancellation and a wait-for-all are built in, but the queue is the Io's own, unbounded *(inferred)* and not tuned as a bare closure pool. |
 
-**Where we are ahead:** typed, non-panicking failure modes (`SubmitFailed`, `Shutdown`, `TooManySubmitters`); a *lock-free* submit from any thread (`lockfree.SegQueue`, jobs by value, no allocation per job); futex idle wakeup with a gated `futexWake` and an optional pre-park spin (`spin_ns`); `shutdownNow` that frees queued jobs, `drainedCleanly` to make a producer-quiescence violation visible; a watchdog-instrumented real-thread stress suite in Debug and ReleaseFast. **Where we are behind:** nothing a user of the reference (thpool) notices. Consciously out, each with its reason under *What is deliberately not done*: no result/future handle (`std.Io.Group`/`Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget, `wait` covers wait-for-all, a per-job result is a caller-owned slot plus `wait`); no panic isolation (Zig has no recover); no dynamic resizing (ants' `Tune`; fixed size like the reference, a resize is a new pool); no blocking submit yet (a caller retries or sheds on `QueueFull`; see *Backlog / deferred*).
+**Where we are ahead:** typed, non-panicking failure modes (`SubmitFailed`, `Shutdown`, `TooManySubmitters`); a *lock-free* submit from any thread (`lockfree.SegQueue`, jobs by value, no allocation per job); futex idle wakeup with a gated `futexWake` and an optional pre-park spin (`spin_ns`); `shutdownNow` that frees queued jobs, `drainedCleanly` to make a producer-quiescence violation visible; a watchdog-instrumented real-thread stress suite in Debug and ReleaseFast. **Where we are behind:** nothing a user of the reference (thpool) notices. Consciously out, each with its reason under *What is deliberately not done*: no result/future handle (`std.Io.Group`/`Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget, `wait` covers wait-for-all, a per-job result is a caller-owned slot plus `wait`); no panic isolation (Zig has no recover); no dynamic resizing (ants' `Tune`; fixed size like the reference, a resize is a new pool).
 
 
 ## Performance
@@ -285,7 +285,9 @@ only follow a reservation (a dequeue follows its enqueue, which follows its rese
 counter cannot underflow. The counter sits beside the queue, not in it, so `lockfree.BoundedQueue`
 is not needed.
 
-There is no blocking submit: a caller that wants to wait retries after `QueueFull` or sheds (see *Backlog / deferred*).
+`submitBlocking` (also on `Submitter`) is `submit` that waits for room instead of returning `QueueFull` (ants' `Submit` on a full pool; thpool has no bound at all): the caller registers in `space_waiters`, snapshots `space_gen`, tries to enqueue and parks; `releaseSlot` (a worker's dequeue or a rollback) bumps the generation and wakes one waiter when any is registered (the `wait` lost-wakeup argument, with the slot CAS as the check), and `drain`/`shutdownNow` wake all so a blocked caller returns `Shutdown`. It panics when it would block inside a job of its own pool. A paused pool with a full queue blocks it until `resume`.
+
+`waitTimeout(ns)` is `wait` with a bound (`error.Timeout`), and `drainTimeout(ns)` is `drain` with one (ants' `ReleaseTimeout`): it closes the pool, waits for the accepted jobs, then joins; on `Timeout` the pool stays closed and running with `drain_pending` set, so a later `drain`, `drainTimeout` or `deinit` joins the workers (`shutdownNow` is a no-op then).
 
 **Producer-quiescence contract.** `submit`/`Submitter.submit` may run from any
 threads concurrently; the lifecycle calls (`drain`/`shutdownNow`/`deinit`) may
@@ -372,11 +374,8 @@ loud, bounded failure; `std.testing.allocator` catches leaks and double frees.
 
 ## Backlog / deferred
 
-- **Blocking submit** — a `submit` that blocks on a full queue; today a caller retries or sheds on
-  `error.QueueFull`.
 - **Priority / fairness** — a single FIFO queue today; a multi-queue or work-stealing variant
   (crossbeam-deque style) is deferred until a consumer needs it.
-- **R-WP-6: a timeout variant of `wait` / `drain`** — none today.
 
 ## Anchoring
 

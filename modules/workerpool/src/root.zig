@@ -31,7 +31,7 @@
 //! shutdown that raced between the empty-observation and the park bumps the
 //! generation and makes the park return immediately (see `Worker.run`).
 //!
-//! **Backpressure — bounded by default (1 Mi queued jobs), never blocking.**
+//! **Backpressure — bounded by default (1 Mi queued jobs), `submit` never blocks (`submitBlocking` waits for room).**
 //! The queue grows on demand, so `submit` never blocks; it fails with a typed
 //! error on allocator exhaustion (`error.SubmitFailed`), after shutdown
 //! (`error.Shutdown`) and with `error.QueueFull` once `Options.max_queued`
@@ -252,6 +252,17 @@ pub const WorkerPool = struct {
     /// nonzero, so a waiter that is spinning costs the workers no syscall.
     parked_waiters: std.atomic.Value(usize) = .init(0),
 
+    /// `submitBlocking` callers blocked (or about to block) on `space_gen`;
+    /// `releaseSlot` and the shutdown calls bump the generation and wake one
+    /// (all, on shutdown) only when this is nonzero. Same registration order
+    /// as `waiters`: register, snapshot `space_gen`, try to enqueue, park.
+    space_waiters: std.atomic.Value(usize) = .init(0),
+    space_gen: std.atomic.Value(u32) = .init(0),
+    /// A `drainTimeout` ran out of time: the pool is `draining` and its
+    /// workers are still to be joined by the next `drain`/`drainTimeout`/
+    /// `deinit`.
+    drain_pending: std.atomic.Value(bool) = .init(false),
+
     /// Build and start the pool. Returns a heap-owned `*WorkerPool` so worker
     /// threads can hold a stable back-pointer (a by-value pool would move on
     /// return, dangling those pointers). `deinit` frees it.
@@ -319,8 +330,33 @@ pub const WorkerPool = struct {
     /// usual harmless no-op, from a job too.
     pub fn drain(self: *WorkerPool) void {
         self.assertNotOwnJobWouldJoin("drain");
-        if (self.state.cmpxchgStrong(.running, .draining, .seq_cst, .seq_cst) != null) return;
-        self.wakeAll();
+        if (self.state.cmpxchgStrong(.running, .draining, .seq_cst, .seq_cst) == null) {
+            self.wakeAll();
+            self.wakeSubmitters();
+        } else if (current_pool == self or !self.drain_pending.swap(false, .seq_cst)) return;
+        for (self.workers) |*w| w.thread.join();
+        self.state.store(.stopped, .seq_cst);
+    }
+
+    /// `drain` with a bound on the wait: stops accepting work, waits up to
+    /// `timeout_ns` nanoseconds for every accepted job to finish, then joins
+    /// the workers. `error.Timeout` when jobs were still queued or running at
+    /// the deadline (ants' `ReleaseTimeout`): the pool stays closed to new
+    /// work and keeps running its jobs; finish with `drain` (or `deinit`,
+    /// which does), or call `drainTimeout` again. A paused pool with queued
+    /// jobs times out (`drain` overrides a pause only for the workers, which
+    /// start jobs again at once, so this is rare). Same preconditions as
+    /// `drain`; do not call `shutdownNow` after a timeout (it is then a no-op).
+    pub fn drainTimeout(self: *WorkerPool, timeout_ns: u64) error{Timeout}!void {
+        self.assertNotOwnJobWouldJoin("drainTimeout");
+        if (self.state.cmpxchgStrong(.running, .draining, .seq_cst, .seq_cst) == null) {
+            self.wakeAll();
+            self.wakeSubmitters();
+        } else if (current_pool == self or !self.drain_pending.swap(false, .seq_cst)) return;
+        _ = self.waitUntil(self.deadlineIn(timeout_ns)) catch {
+            self.drain_pending.store(true, .seq_cst);
+            return error.Timeout;
+        };
         for (self.workers) |*w| w.thread.join();
         self.state.store(.stopped, .seq_cst);
     }
@@ -334,6 +370,7 @@ pub const WorkerPool = struct {
         self.assertNotOwnJobWouldJoin("shutdownNow");
         if (self.state.cmpxchgStrong(.running, .stopping_now, .seq_cst, .seq_cst) != null) return;
         self.wakeAll();
+        self.wakeSubmitters();
         for (self.workers) |*w| w.thread.join();
         self.dropQueued();
         self.state.store(.stopped, .seq_cst);
@@ -404,6 +441,38 @@ pub const WorkerPool = struct {
     /// completion will (`submitted` only falls on a `SubmitFailed` rollback,
     /// which wakes by itself).
     pub fn wait(self: *WorkerPool) bool {
+        return self.waitUntil(null) catch unreachable;
+    }
+
+    /// `wait` with a bound: `error.Timeout` when the pool was still busy
+    /// `timeout_ns` nanoseconds later (the jobs keep running). Otherwise as
+    /// `wait` (`true` idle, `false` after `shutdownNow`).
+    pub fn waitTimeout(self: *WorkerPool, timeout_ns: u64) error{Timeout}!bool {
+        return self.waitUntil(self.deadlineIn(timeout_ns));
+    }
+
+    /// Absolute `awake`-clock deadline `timeout_ns` from now.
+    fn deadlineIn(self: *const WorkerPool, timeout_ns: u64) i96 {
+        return std.Io.Timestamp.now(self.io, .awake).nanoseconds + @as(i96, timeout_ns);
+    }
+
+    /// Park on `word` (snapshot `gen`) until woken or `deadline` (absolute,
+    /// `null` = forever) passes; false when the deadline had already passed.
+    fn parkUntil(self: *WorkerPool, word: *std.atomic.Value(u32), gen: u32, deadline: ?i96) bool {
+        const dl = deadline orelse {
+            self.io.futexWaitUncancelable(u32, &word.raw, gen);
+            return true;
+        };
+        const left = dl - std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        if (left <= 0) return false;
+        self.io.futexWaitTimeout(u32, &word.raw, gen, .{ .duration = .{
+            .raw = .fromNanoseconds(left),
+            .clock = .awake,
+        } }) catch {};
+        return true;
+    }
+
+    fn waitUntil(self: *WorkerPool, deadline: ?i96) error{Timeout}!bool {
         self.assertNotOwnJob("wait");
         _ = self.waiters.fetchAdd(1, .seq_cst);
         defer _ = self.waiters.fetchSub(1, .seq_cst);
@@ -429,8 +498,9 @@ pub const WorkerPool = struct {
                 if (wait_seam.load(.seq_cst)) |f| f();
             }
             _ = self.parked_waiters.fetchAdd(1, .seq_cst);
-            self.io.futexWaitUncancelable(u32, &self.done_gen.raw, gen);
+            const parked = self.parkUntil(&self.done_gen, gen, deadline);
             _ = self.parked_waiters.fetchSub(1, .seq_cst);
+            if (!parked) return error.Timeout;
         }
     }
 
@@ -440,7 +510,7 @@ pub const WorkerPool = struct {
     /// would be freed under the running worker).
     pub fn deinit(self: *WorkerPool) void {
         self.assertNotOwnJob("deinit");
-        if (self.state.load(.seq_cst) == .running) self.drain();
+        if (self.state.load(.seq_cst) == .running or self.drain_pending.load(.seq_cst)) self.drain();
         // Defensive: drop anything still queued (nothing after a graceful
         // drain or a `shutdownNow`; a second, empty pass is safe).
         self.dropQueued();
@@ -458,6 +528,29 @@ pub const WorkerPool = struct {
     /// (allocator exhaustion) or `QueueFull` (`max_queued` reached; never with 0).
     pub fn submit(self: *WorkerPool, job: Job) SubmitError!void {
         return self.enqueueJob(job);
+    }
+
+    /// `submit` that waits for room instead of failing with `QueueFull`: the
+    /// calling thread blocks until a worker has taken a job off a full queue
+    /// (ants' `Submit` on a full pool), then enqueues. Errors: `Shutdown`
+    /// (also when `drain`/`shutdownNow` begins while it waits) and
+    /// `SubmitFailed`; never `QueueFull`. On a pool with `max_queued = 0` it
+    /// is `submit`. A paused pool with a full queue blocks until `resume`.
+    ///
+    /// **Never call it from a job of the same pool**: the queue may only
+    /// drain through this very worker (a deadlock). Detected when it would
+    /// block, and panics, as `wait` does. Same producer-quiescence contract
+    /// as `submit`: the lifecycle calls may not run concurrently with it
+    /// (a blocked caller is released with `Shutdown` as a courtesy only).
+    pub fn submitBlocking(self: *WorkerPool, job: Job) SubmitError!void {
+        _ = self.space_waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.space_waiters.fetchSub(1, .seq_cst);
+        while (true) {
+            const gen = self.space_gen.load(.seq_cst);
+            if (self.enqueueJob(job)) |_| return else |e| if (e != error.QueueFull) return e;
+            self.assertNotOwnJob("submitBlocking");
+            self.io.futexWaitUncancelable(u32, &self.space_gen.raw, gen);
+        }
     }
 
     /// Claim a `Submitter` handle; release it with `Submitter.deinit`.
@@ -587,7 +680,20 @@ pub const WorkerPool = struct {
 
     /// Give back a slot `reserveSlot` took (bounded pools only).
     fn releaseSlot(self: *WorkerPool) void {
-        if (self.max_queued != 0) _ = self.queued.fetchSub(1, .seq_cst);
+        if (self.max_queued == 0) return;
+        _ = self.queued.fetchSub(1, .seq_cst);
+        // A `submitBlocking` caller registered before it looked at `queued`
+        // sees the bump (the `wait` argument, with `space_waiters`).
+        if (self.space_waiters.load(.seq_cst) > 0) {
+            _ = self.space_gen.fetchAdd(1, .seq_cst);
+            self.io.futexWake(u32, &self.space_gen.raw, 1);
+        }
+    }
+
+    /// Release every `submitBlocking` caller so it re-checks the state.
+    fn wakeSubmitters(self: *WorkerPool) void {
+        _ = self.space_gen.fetchAdd(1, .seq_cst);
+        self.io.futexWake(u32, &self.space_gen.raw, std.math.maxInt(u32));
     }
 
     /// Worker-side dequeue: the job is counted as started before its slot is
@@ -672,6 +778,11 @@ pub const Submitter = struct {
 
     pub fn submit(self: *Submitter, job: Job) SubmitError!void {
         return self.pool.enqueueJob(job);
+    }
+
+    /// The pool's `submitBlocking`.
+    pub fn submitBlocking(self: *Submitter, job: Job) SubmitError!void {
+        return self.pool.submitBlocking(job);
     }
 
     /// Release the handle. Exactly once per `registerSubmitter`: a second
