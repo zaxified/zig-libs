@@ -70,16 +70,29 @@ test "STACKPROBE: no key residue after the encrypted-key entry points" {
         const einfo = try kc.parseEncryptedInfo(try eb.decode(&info_der));
         var dk_buf: [32]u8 = undefined;
         const dk = dk_buf[0..einfo.cipher.keyLen()];
+        // PBKDF2's whole T blocks (RFC 8018 §5.2): the key is a prefix of
+        // them, but std's frame holds each block in full -- the tail of T_1
+        // past a 32-byte key (HMAC-SHA-512) or of T_2 past 12 octets
+        // (HMAC-SHA-1) is secret too. T_i does not depend on the output
+        // length, so a longer derivation computes the same blocks.
+        var t_buf: [64]u8 = undefined;
+        var t_blocks: []const u8 = &.{};
         switch (einfo.kdf) {
             .pbkdf2 => |k| switch (k.prf) {
-                inline else => |p| try std.crypto.pwhash.pbkdf2(dk, c.password, einfo.salt, @intCast(k.iterations), p.Type()),
+                inline else => |p| {
+                    const h_len = p.Type().mac_length;
+                    const t_len = std.mem.alignForward(usize, dk.len, h_len);
+                    try std.crypto.pwhash.pbkdf2(t_buf[0..t_len], c.password, einfo.salt, @intCast(k.iterations), p.Type());
+                    @memcpy(dk, t_buf[0..dk.len]);
+                    t_blocks = t_buf[0..t_len];
+                },
             },
             .scrypt => |s| {
                 var fba: std.heap.FixedBufferAllocator = .init(&key_work);
                 try std.crypto.pwhash.scrypt.kdf(fba.allocator(), dk, c.password, einfo.salt, .{ .ln = s.log2_n, .r = @intCast(s.r), .p = @intCast(s.p) });
             },
         }
-        const secrets = &[_][]const u8{ plain, dk };
+        const secrets: []const []const u8 = if (t_blocks.len != 0) &[_][]const u8{ plain, dk, t_blocks } else &[_][]const u8{ plain, dk };
         const opts: kc.DecryptOptions = .{ .scrypt_work = &scrypt_work };
 
         _ = try P.run("parseEncryptedPrivateKeyPem", kc.parseEncryptedPrivateKeyPem, .{ c.pem, c.password, &dec_buf, opts }, secrets, .{});

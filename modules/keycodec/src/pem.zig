@@ -233,9 +233,12 @@ pub fn encode(out: []u8, label: []const u8, der: []const u8) (Error || error{NoS
 
 /// `encode` with RFC 1421 header lines (Go's `pem.Block.Headers`; OpenSSL's
 /// `Proc-Type` / `DEK-Info`) between the BEGIN line and the body, followed by
-/// an empty line. A `Proc-Type` header goes first wherever it stands in
-/// `headers` (RFC 1421 requires it); the others keep the caller's order (Go
-/// sorts a map, a slice has an order of its own). A header name is a
+/// an empty line. A `Proc-Type` header goes first and a `DEK-Info` header
+/// second wherever they stand in `headers` (RFC 1421 §4.6.1.1 and
+/// §4.6.1.3 require that order; OpenSSL writes it); the others keep the
+/// caller's order (Go sorts a map, a slice has an order of its own). Header
+/// lines are written unfolded and uncapped, as Go and OpenSSL write them.
+/// A header name is a
 /// non-empty token of letters, digits and '-' -- exactly what `Iterator`
 /// reads back as a header -- and a value holds no control byte but a tab
 /// (no line break, NUL or DEL); either one breaking that is `InvalidPem`. Leading and trailing blanks of a value do
@@ -255,16 +258,19 @@ pub fn encodeWithHeaders(out: []u8, label: []const u8, headers: []const Header, 
     var w: std.Io.Writer = .fixed(out);
     w.print("-----BEGIN {s}-----\n", .{label}) catch unreachable; // sized above
     if (headers.len != 0) {
-        for (headers) |h| if (std.mem.eql(u8, h.name, "Proc-Type")) {
-            w.print("{s}: {s}\n", .{ h.name, h.value }) catch unreachable;
-            break; // one is first; a second one is written in its place below
-        };
-        var skipped = false;
-        for (headers) |h| {
-            if (!skipped and std.mem.eql(u8, h.name, "Proc-Type")) {
-                skipped = true;
-                continue;
-            }
+        // The first `Proc-Type`, then the first `DEK-Info`; a repeated one
+        // is written in its place among the rest.
+        const lead = [_][]const u8{ "Proc-Type", "DEK-Info" };
+        var lead_at: [lead.len]?usize = @splat(null);
+        for (lead, &lead_at) |name, *at| {
+            for (headers, 0..) |h, i| if (std.mem.eql(u8, h.name, name)) {
+                w.print("{s}: {s}\n", .{ h.name, h.value }) catch unreachable;
+                at.* = i;
+                break;
+            };
+        }
+        for (headers, 0..) |h, i| {
+            if (i == lead_at[0] or i == lead_at[1]) continue;
             w.print("{s}: {s}\n", .{ h.name, h.value }) catch unreachable;
         }
         w.writeAll("\n") catch unreachable;
@@ -453,4 +459,26 @@ test "headers: a second Proc-Type keeps its place, the first goes first; control
     _ = try encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = " x y~\t!" }}, &der);
     try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\x1fy" }}, &der));
     try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "\x01" }}, &der));
+}
+
+test "headers: DEK-Info goes second (after Proc-Type) wherever it stands; a repeat keeps its place" {
+    const der = [_]u8{ 0, 1, 2, 3, 4 };
+    var buf: [256]u8 = undefined;
+    const hs = [_]Header{
+        .{ .name = "Comment", .value = "c" },
+        .{ .name = "DEK-Info", .value = "d1" },
+        .{ .name = "A", .value = "1" },
+        .{ .name = "Proc-Type", .value = "p1" },
+        .{ .name = "DEK-Info", .value = "d2" },
+    };
+    const text = try encodeWithHeaders(&buf, "K", &hs, &der);
+    try t.expectEqualStrings("-----BEGIN K-----\nProc-Type: p1\nDEK-Info: d1\nComment: c\nA: 1\nDEK-Info: d2\n\nAAECAwQ=\n-----END K-----\n", text);
+    try t.expectEqual(encodedLenHeaders("K", &hs, der.len), text.len);
+    // Without a Proc-Type, DEK-Info leads.
+    const no_pt = [_]Header{ .{ .name = "A", .value = "1" }, .{ .name = "DEK-Info", .value = "d" } };
+    try t.expectEqualStrings("-----BEGIN K-----\nDEK-Info: d\nA: 1\n\nAAECAwQ=\n-----END K-----\n", try encodeWithHeaders(&buf, "K", &no_pt, &der));
+    // A long value is written on one line, unfolded (as Go and OpenSSL do).
+    const long: [100]u8 = @splat('x');
+    const lt = try encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = &long }}, &der);
+    try t.expectEqualStrings(&long, (try find(lt, "K")).?.header("A").?);
 }

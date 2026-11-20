@@ -352,6 +352,11 @@ test "hostile and unusual PBES2 structures" {
     // Wider than 64 bits: N a power of two only up to 2^63; the rest is malformed or too large.
     try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &(@as([40]u8, @splat(0x7f))), .scrypt_rp = .{ &.{2}, &.{1} } }, sw, error.MalformedKey);
     try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{ 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0 }, .scrypt_rp = .{ &.{2}, &.{1} } }, sw, error.KdfParamsTooLarge); // N = 2^63
+    // N = 2^64, a power of two one bit past u64: saturates, malformed (OpenSSL's 64-bit read fails too).
+    try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{ 0x01, 0, 0, 0, 0, 0, 0, 0, 0 }, .scrypt_rp = .{ &.{2}, &.{1} } }, sw, error.MalformedKey);
+    // keyLength that is not an INTEGER (an OCTET STRING, a BOOLEAN) where the scrypt parameters end: malformed.
+    try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{0x10}, .scrypt_rp = .{ &.{2}, &.{1} }, .kp_trailing = &.{ 0x04, 0x01, 0x20 } }, sw, error.MalformedKey);
+    try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{0x10}, .scrypt_rp = .{ &.{2}, &.{1} }, .kp_trailing = &.{ 0x01, 0x01, 0xff } }, sw, error.MalformedKey);
     // A time cap below the work, with memory to spare.
     try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{0x20}, .scrypt_rp = .{ &.{2}, &.{4} } }, .{ .scrypt_work = &small_work, .max_scrypt_cost = 0x20 * 8 - 1 }, error.KdfParamsTooLarge);
     try expectDecrypt(a, .{ .kdf_oid = &sc, .iter = &.{0x20}, .scrypt_rp = .{ &.{2}, &.{4} } }, .{ .scrypt_work = &small_work, .max_scrypt_cost = 0x20 * 8 }, error.IncorrectPasswordOrCorrupt);

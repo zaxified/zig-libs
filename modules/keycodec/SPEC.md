@@ -106,7 +106,8 @@ refuse that form, as `tlsserver` does); the RSA numbers (the `rsa` module).
   letters, digits and `-`, then `:`), and a one-line PEM (body on the BEGIN
   line, as CI secret stores keep keys). Writing takes optional RFC 1421 header
   lines (`pem.Header`: a name of letters, digits and `-`, a value without a line
-  break; `Proc-Type` first, the rest in the caller's order, then an empty line);
+  break; `Proc-Type` first and `DEK-Info` second as RFC 1421 §4.6.1 orders them, the rest in the caller's order,
+  each unfolded and uncapped as Go and OpenSSL write them, then an empty line);
   `Block.header(name)` reads one back, trimmed. A `-----BEGIN ` that does not start a
   well-formed BEGIN line is skipped, as Go's `pem.Decode` skips it; a
   well-formed BEGIN without its END line is `InvalidPem`. Only the first
@@ -175,7 +176,8 @@ same holds for OpenSSL, Go's legacy reader and RustCrypto).
   before any hashing. Models: OpenSSL accepts up to 2^31 − 1 and RustCrypto
   has no cap, so a file can burn minutes there; 2^20 is 512× OpenSSL's default
   and above OWASP's 600 000 for SHA-256; raise it per call. A count of zero is
-  `MalformedKey`; counts wider than 64 bits saturate to "too large".
+  `MalformedKey`; counts wider than 64 bits saturate to "too large". A scrypt N wider than 64 bits saturates to a
+  value that is not a power of two: `MalformedKey`, as OpenSSL's 64-bit read of N is a decode error.
 - scrypt: memory is the caller's buffer, `DecryptOptions.scrypt_work` (size it
   with `pbes2.scryptWorkLen`), so the module still allocates nothing: an empty
   buffer means scrypt is off (`UnsupportedEncryption`), a file whose
@@ -327,11 +329,5 @@ never), no explicit EC parameters (never). Each of these is refused with its rea
 
 ## Backlog / deferred
 
-- **scrypt N wider than 64 bits** saturates and reads as `MalformedKey`, not `KdfParamsTooLarge` (the doc comment of
-  `pbes2.parse` says values wider than 64 bits saturate without noting it).
-- **`rsa.fromPkcs8Encrypted`** answers `InvalidDer` for a scrypt file with malformed scrypt parameters and
-  `UnsupportedEncryption` for an `otherSource` salt; malformed input only.
-- **PEM header encoding:** no header line-length cap on encode, and `DEK-Info` is not forced second (only
-  `Proc-Type` goes first).
-- **Stack probe:** its secrets omit PBKDF2's T blocks.
-- **Tests:** a non-INTEGER scrypt `keyLength` is not tested.
+None open.
+

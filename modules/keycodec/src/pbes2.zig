@@ -230,7 +230,11 @@ pub const Info = struct {
 ///       SEQUENCE { aes-CBC OID, iv OCTET STRING(16) } } },
 ///     encryptedData OCTET STRING }
 /// Checked as the RFCs require; no limit on iteration counts or scrypt cost
-/// here (`decrypt` applies those), values wider than 64 bits saturate.
+/// here (`decrypt` applies those). An iteration count, `r` or `p` wider than
+/// 64 bits saturates (and `decrypt` then refuses it as `KdfParamsTooLarge`);
+/// a scrypt `N` wider than 64 bits saturates to a value that is not a power
+/// of two and is `MalformedKey` here, as OpenSSL's 64-bit read of it is a
+/// decode error.
 pub fn parse(bytes: []const u8) InfoError!Info {
     var top = der.Reader.init(bytes);
     var epki = try top.sub(0x30);
@@ -282,8 +286,10 @@ pub fn parse(bytes: []const u8) InfoError!Info {
         const p = try uint(try kp.expect(0x02));
         if (kp.peekTag() == 0x02) key_len = try uint(try kp.expect(0x02));
         try kp.end();
-        // RFC 7914 §6: N > 1, a power of two; r and p positive. A value
+        // RFC 7914 §6: N > 1, a power of two; r and p positive. An r or p
         // beyond 32 bits is far past any limit: reported as such by `decrypt`.
+        // An N beyond 64 bits saturated in `uint` and fails the power-of-two
+        // test: `MalformedKey`.
         if (n < 2 or !std.math.isPowerOfTwo(n) or r == 0 or p == 0) return error.MalformedKey;
         kdf = .{ .scrypt = .{
             .log2_n = @intCast(@ctz(n)),
