@@ -147,7 +147,7 @@ test "sec_n8192_logq218 validates and has the documented shape" {
     for (sec_n8192_logq218.primes) |p| q *= p;
     // ── the security claim is the (N, log q) PAIR, so BOTH ends are pinned ──
     // N is load-bearing and nothing else in this file constrains it. Measured
-    // 2026-08-11: cutting N to 1024 while leaving log q = 218 left the ENTIRE
+    // cutting N to 1024 while leaving log q = 218 left the ENTIRE
     // suite at exit 0. Every other assertion here is N-independent — `log2 q`,
     // `q mod t` and `bits(Δ)` do not mention N, `validate()` still passes
     // (1024 is a power of two and 2·1024 divides p−1 because 2·8192 does), and
@@ -194,7 +194,7 @@ test "validate rejects malformed sets" {
 }
 
 test "validate rejects n = 0, an empty chain, a prime >= 2^62 and a prime = 1 mod N only" {
-    // Audit 2026-11-18 (whole-module mutation): four refusals had no test.
+    // Audit (whole-module mutation): four refusals had no test.
     try testing.expectError(error.DegreeNotPowerOfTwo, (Params{ .n = 0, .t = 4, .primes = &.{17} }).validate());
     try testing.expectError(error.EmptyPrimeChain, (Params{ .n = 8, .t = 4, .primes = &.{} }).validate());
     try testing.expectError(error.PrimeTooLarge, (Params{ .n = 8, .t = 4, .primes = &.{@as(u64, 1) << 62} }).validate());

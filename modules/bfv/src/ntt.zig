@@ -335,7 +335,7 @@ test "larger degree N=1024 round-trip + mul cross-check" {
 }
 
 test "init refuses q = 2^62 as PrimeTooLarge, before the primality test" {
-    // Audit 2026-11-18 (whole-module mutation): with the bound relaxed to `>`
+    // Audit (whole-module mutation): with the bound relaxed to `>`
     // or dropped, 2^62 fell through to `isPrime` and came back as NotPrime.
     try testing.expectError(error.PrimeTooLarge, Ntt(8).init(@as(u64, 1) << 62));
 }

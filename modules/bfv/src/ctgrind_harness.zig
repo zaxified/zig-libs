@@ -84,7 +84,7 @@
 //! conditional jump, and a non-finding if LLVM turns it into a `cmov`/`sbb`
 //! at `-Doptimize=ReleaseFast`.
 //!
-//! MEASURED 2026-09-09 (zig 0.16.0, x86_64, this exact harness): inlined into
+//! MEASURED (zig 0.16.0, x86_64, this exact harness): inlined into
 //! `decrypt`'s call site, `reconstruct`'s `Modulus.reduce`/`csub` compiles to
 //! `cmp`+`cmova`/`cmovae`+`sbb` — a `cmov`, not a jump — and correspondingly
 //! this exact line did NOT appear as a flagged context with `sk` tainted.
@@ -157,7 +157,7 @@
 //! small, itemised in-file count is what makes the itemisation mean "no
 //! branch found", not "the harness never ran".
 //!
-//! ## Measured 2026-09-09 (zig 0.16.0 / x86_64 / ReleaseFast / this harness)
+//! ## Measured (zig 0.16.0 / x86_64 / ReleaseFast / this harness)
 //!
 //! Claim rows (tainted), errors/contexts from `valgrind --tool=memcheck
 //! --error-exitcode=99 --num-callers=20`; every UNTAINTED control and every

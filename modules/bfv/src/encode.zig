@@ -144,7 +144,7 @@ test "mulRef folds X^N = -1 (constant polys and a wrap case)" {
 }
 
 test "decodeUint reports Overflow from the multiply and from the final add" {
-    // Audit 2026-11-18 (whole-module mutation): both checked operations could
+    // Audit (whole-module mutation): both checked operations could
     // be made wrapping without a test noticing.
     // Multiply: 16 digits of 2^16 - 1 is 2^256 - 1.
     const P16 = Plaintext(16);

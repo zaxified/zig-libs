@@ -34,7 +34,7 @@
 //!
 //! This is the ungated, fully-real backbone the `ntt`/`rns`/`ring` layers
 //! build on. Every function here is deterministic and unit-tested; none is
-//! part of the gated Fable core.
+//! part of the gated `mul` core.
 
 const std = @import("std");
 
@@ -54,7 +54,7 @@ pub const max_prime_bits = 62;
 /// microarchitecture. It removes the *written* data-dependent control flow;
 /// it is not a verified-codegen guarantee.
 ///
-/// The mask goes through `blackBox` (2026-11-18): on baseline x86-64
+/// The mask goes through `blackBox`: on baseline x86-64
 /// (`-mcpu=x86_64`) LLVM did rematerialise it, as `cmp`/`jb` inside the Shoup
 /// NTT butterflies of `RnsPoly.mul` on the secret key (ctgrind `bfv keygen` 292
 /// in-file, `decrypt` 194). Unconditional, every target.
@@ -396,7 +396,7 @@ test "primitive2NthRoot has exact order 2N" {
 }
 
 test "invMod refuses every multiple of q, not only zero" {
-    // Audit 2026-11-18 (whole-module mutation): `a % q == 0` -> `a == 0` survived;
+    // Audit (whole-module mutation): `a % q == 0` -> `a == 0` survived;
     // a nonzero multiple of q would have "inverted" to powMod(0, ...) = 0.
     try std.testing.expectError(error.NotInvertible, invMod(97, 97));
     try std.testing.expectError(error.NotInvertible, invMod(3 * 97, 97));

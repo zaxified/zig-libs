@@ -817,7 +817,7 @@ test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget
     }
 }
 
-// ── Audit 2026-11-18 (whole-module mutation): killing tests ──────────────────
+// ── Audit (whole-module mutation): killing tests ──────────────────
 // Each test below was written for a mutant that survived the first round.
 
 test "init runs validate: t = 1 is refused although nothing else would trip on it" {

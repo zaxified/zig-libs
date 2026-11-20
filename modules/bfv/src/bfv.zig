@@ -20,7 +20,7 @@
 //!     `encrypt`, `decrypt` — textbook RLWE; the `Δ`-scale decrypt is anchored
 //!     by a deterministic noiseless-ciphertext KAT + the enc/dec round-trip and
 //!     homomorphic-add end-to-end tests.
-//!   - **REAL (Part 3, Fable — `fable_core_implemented`):** `mul` (exact
+//!   - **REAL (`fable_core_implemented`):** `mul` (exact
 //!     integer tensor + `⌊t/q·…⌉` rescale), `genRelinKey`/`relinearize`
 //!     (base-`w` gadget key-switch for `s²`), `noiseBudget` — the
 //!     noise-management core. Anchored by the mul+relin and multiply-DEPTH
@@ -99,7 +99,7 @@
 //! and the guard's own message ("Production code must use the `std.Io` entry
 //! point of the same name") would be pointing at a function it had just
 //! destroyed. That is not hypothetical; it is what this module shipped until
-//! 2026-08-13, invisible to CI because `builtin.is_test` is true for the whole
+//! invisible to CI because `builtin.is_test` is true for the whole
 //! of `zig build test-bfv`, so the deny branch never compiled.
 //!
 //! Hence the shape below: a PRIVATE `…Inner(random: std.Random)` holds the
@@ -823,7 +823,7 @@ pub fn Bfv(comptime P: params.Params) type {
             return out;
         }
 
-        // ── Fable core (Part 3 — noise management) ───────────────────────────
+        // ── gated core (noise management) ───────────────────────────
         //
         // Correctness story (SPEC.md "Part-3 noise budget"): write the exact
         // integer identity `ct(s) = c0 + c1·s = Δ·m + v + q·r` (centered
@@ -1548,7 +1548,7 @@ test "instance builds and exposes real ring add on ciphertext components" {
 }
 
 test "gate state after Part 3: both scheme cores ON" {
-    // Part 2 turned on keyGen/encrypt/decrypt; Part 3 turned on the Fable
+    // Both flags are on: keyGen/encrypt/decrypt/add and the
     // mul/relinearize/noiseBudget noise-management core.
     try testing.expect(gate.scheme_core_implemented);
     try testing.expect(gate.fable_core_implemented);

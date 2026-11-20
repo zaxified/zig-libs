@@ -12,7 +12,7 @@
 //! integer → residues decomposition, and **exact** base conversion
 //! (reconstruct-then-reduce). The *fast/approximate* base conversion used to
 //! implement the BFV multiply's `⌊t/q·…⌉` rescale is noise-sensitive and lives
-//! with the gated Fable core (see `bfv.zig` / SPEC.md), NOT here.
+//! with the gated `mul` core (see `bfv.zig` / SPEC.md), NOT here.
 
 const std = @import("std");
 const ma = @import("modarith.zig");

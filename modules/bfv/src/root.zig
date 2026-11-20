@@ -3,7 +3,7 @@
 //! bfv — leveled BFV homomorphic encryption over `Z_q[X]/(X^N+1)`, in RNS.
 //!
 //! **Fully Homomorphic Encryption, Part 1 (arithmetic backbone + scheme
-//! scaffold).** FHE lets you compute on ciphertexts: `Dec(f(Enc(x))) = f(x)`.
+//! layer).** FHE lets you compute on ciphertexts: `Dec(f(Enc(x))) = f(x)`.
 //! BFV (Fan-Vercauteren 2012) is the cleanest EXACT-integer scheme — no
 //! CKKS-style approximate rescaling — and matches Microsoft SEAL's default
 //! parameter/NTT design, which makes it cross-checkable **in principle**
@@ -38,7 +38,7 @@
 //! construction is the kind an external byte-exact KAT could validate, NOT
 //! that a SEAL KAT has actually been run — see "Verification" below and
 //! `gate.zig`) and `mul`/`relinearize`/`noiseBudget` as
-//! `fable_core_implemented` (Part 3, the genuine-Fable noise-management
+//! `fable_core_implemented` (Part 3, the noise-management
 //! core). See `gate.zig`, `SPEC.md`. (Byte codecs for the key/ciphertext
 //! types are a deferred backlog item.)
 //!

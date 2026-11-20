@@ -156,7 +156,7 @@ test "ring multiply via NTT == schoolbook per limb" {
 }
 
 test "fromCoeffs reduces every limb into [0, q_i); eql compares the domain tag" {
-    // Audit 2026-11-18 (whole-module mutation): neither the reduction nor the
+    // Audit (whole-module mutation): neither the reduction nor the
     // domain check of `eql` had a test of its own.
     const R = RnsPoly(2, 2);
     const ps = [_]u64{ 17, 97 };
