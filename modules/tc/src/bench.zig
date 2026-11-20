@@ -6,7 +6,7 @@
 //!
 //! ## Why this file exists
 //!
-//! Written 2026-09-15 to price the F10 fix: `qdisc.appendHtbClassOptions`
+//! Written to price the F10 fix: `qdisc.appendHtbClassOptions`
 //! called `ratespec.calcRateTable` twice per request (once for `rate`, once
 //! for `ceil`), and the A1 audit measured that single 256-entry loop at
 //! ~98-100% of the whole request's cost. When `ceil`'s clamped rate and

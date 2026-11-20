@@ -168,7 +168,7 @@ pub const Psched = struct {
     /// them unchecked. `rate * ticks * tick_den` overflows `u128` once
     /// `tick_den` (derived from this host's `/proc/net/psched`) grows past
     /// roughly `2^30`: `std.math.mul` here saturates the SAME way
-    /// `calcXmitTime` already does, rather than trapping. F11 in A1/tc.md.
+    /// `calcXmitTime` already does, rather than trapping. F11 in the A1 audit.
     pub fn calcXmitSize(ps: Psched, rate: u64, ticks: u32) u64 {
         if (ps.tick_num == 0) return 0;
         const num = blk: {
@@ -247,7 +247,7 @@ fn billedSize(size: u32, mpu: u32, linklayer: LinkLayer) u32 {
 /// multiply). One past that, at `cell_log >= 32`, the shift amount's
 /// `@intCast` to `u5` panics outright instead. `checkCellLog` rejects both;
 /// `deriveCellLog` below just never produces more than this on its own. See
-/// F2/F7 in A1/tc.md.
+/// F2/F7 in the A1 audit.
 pub const max_cell_log: u8 = 23;
 
 /// Pick the cell shift the way iproute2 does when the caller did not force
@@ -275,7 +275,7 @@ pub fn deriveCellLog(mtu_in: u32) u8 {
 /// `>= 32` panicked in `calcRateTable`'s `@intCast` to the shift amount's
 /// `u5` — in ReleaseSafe that is `integer does not fit in destination
 /// type`, reachable straight from `buildClassSet`/`buildQdiscSet`/
-/// `buildFilterSetWith` with no privilege needed. F2 in A1/tc.md.
+/// `buildFilterSetWith` with no privilege needed. F2 in the A1 audit.
 pub fn checkCellLog(v: ?u8) error{InvalidCellLog}!void {
     if (v) |cl| {
         if (cl > max_cell_log) return error.InvalidCellLog;

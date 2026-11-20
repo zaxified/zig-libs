@@ -535,7 +535,7 @@ pub const Socket = struct {
                             // `errdefer` above, and freeing twice is a
                             // double-free (ArrayList.deinit leaves the
                             // receiver `undefined`, so the second call frees
-                            // a garbage pointer) -- see F1 in A1/tc.md.
+                            // a garbage pointer) -- see F1 in the A1 audit.
                             if (attempt < max_dump_attempts) {
                                 out.deinit(self.gpa);
                                 continue :retry;
@@ -679,7 +679,7 @@ pub const Socket = struct {
         return dumpVia(&self.nl, self.gpa, T, parseFn, msg_type, reply_type, ifindex, parent, mode);
     }
 
-    /// The dump engine's actual body, generic over `transport` (F6, A1/tc.md):
+    /// The dump engine's actual body, generic over `transport` (F6, A1 audit):
     /// production passes `&self.nl` (a `*netlink.Socket`, which already
     /// offers exactly this shape); tests pass a scripted fixture so the
     /// retry-attempt cap and the `reply_type` filter can be exercised
@@ -726,7 +726,7 @@ pub const Socket = struct {
                             // give-up path must leave it for the `errdefer`
                             // -- freeing here too is a double-free, since
                             // `ArrayList.deinit` sets the receiver to
-                            // `undefined` (F1 in A1/tc.md).
+                            // `undefined` (F1 in the A1 audit).
                             if (attempt < max_dump_attempts) {
                                 out.deinit(gpa);
                                 continue :retry;
@@ -1156,7 +1156,7 @@ fn fuzzDumpParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     // so `len` was 0 for every seed and the target parsed an EMPTY slice with
     // the reply sitting unread in `raw`.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 10 seeds non-empty,
     // 0 messages framed, 0 records classified and 0 kinds read before; 10 of
     // 10 non-empty, 15 messages framed, 6 records, 5 kinds and 7 control
     // verdicts (done / failed / malformed / overrun / restart) after.**
@@ -1745,7 +1745,7 @@ test "integration (netns/root): the kernel's extended ACK reaches lastErrorMessa
 
 // ── F6: a scripted transport for the dump engine ────────────────────────────
 //
-// `Socket.dump`'s retry-attempt cap and its `reply_type` filter (A1/tc.md
+// `Socket.dump`'s retry-attempt cap and its `reply_type` filter (A1 audit
 // F6) had no test: exercising them for real needs a kernel that keeps
 // answering `NLM_F_DUMP_INTR` on demand, or a foreign-type record mixed into
 // a real dump — neither is reachable through `openOrSkip`'s live socket.

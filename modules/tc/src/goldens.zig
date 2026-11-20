@@ -1912,7 +1912,7 @@ test "action goldens re-parse: the standalone table messages" {
     }
 }
 
-// ── matchall and bpf classifiers (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`;
+// ── matchall and bpf classifiers (captured, iproute2-6.19.0, `unshare -rn`;
 // setup `tc qdisc add dev lo root handle 1: htb default 10`) ──────────────────────────
 
 // ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=64
@@ -2255,7 +2255,7 @@ test "bpf: an empty or over-long program is refused; an empty matchall is an emp
     try testing.expectEqual(@as(usize, 36 + 16 + 4), bare.len);
 }
 
-// ── classic qdiscs: prio, pfifo/bfifo, sfq, codel, fq (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`) ──
+// ── classic qdiscs: prio, pfifo/bfifo, sfq, codel, fq (captured, iproute2-6.19.0, `unshare -rn`) ──
 
 // ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=76
 // tc qdisc add dev lo root handle 1: prio
@@ -2952,7 +2952,7 @@ test "delta tests: codel and fq round trip with a distinct value in every field"
     try testing.expect(ow.priomap == null and ow.weights == null and ow.horizon_drop == null);
 }
 
-// ── hfsc and red (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`) ──
+// ── hfsc and red (captured, iproute2-6.19.0, `unshare -rn`) ──
 
 // ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893788 len=56
 // tc qdisc add dev lo root handle 1: hfsc

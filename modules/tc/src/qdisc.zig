@@ -2111,7 +2111,7 @@ test "appendHtbClassOptions rejects cell_log/ccell_log >= 32 instead of panickin
 test "parseHtbClassOptions rejects a TCA_HTB_PARMS attribute shorter than tc_htb_opt_len (F3)" {
     // Wave-3 audit's F3: this bound (root.zig-era line "qdisc.zig:546") was
     // named as untested fault-injection surface — the fuzz corpus that was
-    // fixed 2026-09-07 exercises this parser with real-shaped payloads, but
+    // fixed exercises this parser with real-shaped payloads, but
     // "never crashes" is not the same claim as "rejects a truncated PARMS
     // attribute" (a short attribute here doesn't panic, it silently reads
     // fewer fields than the wire format promises — a correctness bug, not a
@@ -2594,7 +2594,7 @@ fn fuzzParseOptions(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     // so `len` was 0 for every seed and all eight parsers were handed an EMPTY
     // slice with the payload sitting unread in `raw`.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 19 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 19 seeds non-empty,
     // 0 netem options parsed, 0 qdisc kinds read and 0 optional cake/fq_codel/
     // tbf/htb fields decoded before; 19 of 19 non-empty, 8 netem, 8 kinds and
     // 65 optionals after.** And **5 of the 8 parsers *succeeded* on that empty
@@ -2851,7 +2851,7 @@ test "stats: fq_codel TCA_XSTATS (qdisc half) decodes, a short or class-typed on
     try testing.expect((try parseQdisc(m3.items)).fq_codel_xstats == null);
 }
 
-// ── statistics decoding: delta mutation audit 2026-11-17 ────────────────────
+// ── statistics decoding: delta mutation audit ────────────────────
 // The tests below were added for survivors: hardware counters, the 64-bit rate
 // estimator, attribute order, exact minimum sizes, short attributes, the
 // STATS2 -> STATS fallback, a class carrying only the legacy attribute, every

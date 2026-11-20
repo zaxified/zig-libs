@@ -142,7 +142,7 @@ fn appendKind(
     // only trips past 65 KiB (`codec.appendAttrString`'s `u16` length
     // field), but a caller COULD hit that -- it used to `unreachable` there,
     // i.e. a reachable safety-build panic straight from a public entry
-    // point with no privilege needed. F8 in A1/tc.md. (A `kind` this module
+    // point with no privilege needed. F8 in the A1 audit. (A `kind` this module
     // can decode back is bounded far tighter, at `qdisc.kind_max` = 16 --
     // but this function only builds the wire request, so it stays
     // permissive and lets the request-decode round-trip mismatch stand as

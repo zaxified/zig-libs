@@ -989,7 +989,7 @@ test "flower rejects a port match the protocol cannot carry" {
 }
 
 test "u32 rejects an oversized key list" {
-    // F5 in A1/tc.md: pin the shipped limit literally before deriving
+    // F5 in the A1 audit: pin the shipped limit literally before deriving
     // `many`'s length from the same symbol (see the equivalent action.zig
     // pins for `max_actions`/`max_cookie_len`/`max_actions_decoded`).
     try testing.expectEqual(@as(usize, 255), u32_max_keys);
@@ -1005,7 +1005,7 @@ test "u32 rejects an oversized key list" {
 
 test "parseU32Options rejects a TCA_U32_SEL attribute shorter than tc_u32_sel_len (F3)" {
     // Wave-3 audit's F3 named this bound as untested fault-injection surface.
-    // The 2026-09-07 fuzz-corpus fix already feeds `parseU32Options` a
+    // The fuzz-corpus fix already feeds `parseU32Options` a
     // shorter-than-16-byte SEL (`u32_short` in the corpus below), which
     // proves the parser doesn't CRASH on it — but a too-short SEL here reads
     // `a.data[0]`/`a.data[2]` inside bounds and just silently produces a
@@ -1221,7 +1221,7 @@ fn fuzzParseFilter(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     // so `len` was 0 for every seed and all three parsers were handed an EMPTY
     // slice with the filter sitting unread in `raw`.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 12 seeds non-empty,
     // 0 u32 keys decoded, 0 flower fields decoded and 0 kinds read before;
     // 12 of 12 non-empty, 3 keys, 18 flower fields and 3 kinds after.**
     // `parseU32Options` and `parseFlowerOptions` both SUCCEED on the empty

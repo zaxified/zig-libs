@@ -313,7 +313,7 @@ pub const EncodeError = std.mem.Allocator.Error || error{
 /// Non-exhaustive, like `Verdict`: the value is read off the wire, and a
 /// newer kernel (or a hostile peer) may send one this module predates.
 /// `@enumFromInt` on an exhaustive enum panicked there (found by the
-/// 2026-10-10 fuzz driver, seed 202).
+/// Fuzz driver, seed 202).
 pub const ProbType = enum(u16) {
     /// `PGACT_NONE`.
     none = 0,
@@ -1218,13 +1218,12 @@ test "action attribute constants agree with the kernel UAPI" {
 }
 
 test "action.copyKind: kind_max is the delivered 16-byte TCA_KIND budget, and the boundary is exact" {
-    // F5 in A1/tc.md: `copyKind` exists twice, character-for-character
-    // identical, in `qdisc.zig` (pinned by an equivalent test there since
-    // 2026-08-11) and here in `action.zig` -- and this one had NO dedicated
-    // test, so mutating ITS bound (`s.len > kind_max`) went undetected.
-    // 16 pinned literally, same reasoning as the qdisc.zig test: a change to
-    // the constant must be caught here, not read off the symbol it is
-    // checked against.
+    // F5 in the A1 audit: `copyKind` exists twice, character-for-character
+    // identical, in `qdisc.zig` and here in `action.zig` -- and this one had
+    // NO dedicated test, so mutating ITS bound (`s.len > kind_max`) went
+    // undetected. 16 pinned literally, same reasoning as the qdisc.zig test:
+    // a change to the constant must be caught here, not read off the symbol
+    // it is checked against.
     try testing.expectEqual(@as(usize, 16), kind_max);
 
     var buf: [kind_max]u8 = undefined;
@@ -1354,7 +1353,7 @@ test "an empty action list appends nothing" {
 }
 
 test "action list rejects more than TCA_ACT_MAX_PRIO entries" {
-    // F5 in A1/tc.md: pinned literally FIRST, so a change to `max_actions`
+    // F5 in the A1 audit: pinned literally FIRST, so a change to `max_actions`
     // itself is caught here rather than only read back off the symbol the
     // rest of this test derives `many`'s length from (a self-referential
     // `max_actions + 1` moves both sides of the comparison together).
@@ -1881,7 +1880,7 @@ fn fuzzParseAction(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     // so `len` was 0 for every seed and all four parsers were handed an EMPTY
     // slice with the action sitting unread in `raw`.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 12 seeds non-empty,
     // 0 kinds read, 0 list entries walked and 0 statistics counters decoded
     // before; 12 of 12 non-empty, 7 kinds, 6 list entries, 8 statistics
     // counters and 2 actions iterated out of an RTM_NEWACTION after.**
