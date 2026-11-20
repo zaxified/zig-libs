@@ -207,6 +207,8 @@ const DupPlan = struct {
                 try sink.gauge(0, &.{ "ab", "c" }, 2);
                 try sink.gauge(0, &.{ "", "bc" }, 3);
                 try sink.gauge(0, &.{ "a", "" }, 3);
+                try sink.gauge(0, &.{ "x", "y" }, 3); // same lengths as "a","b", other bytes
+                try sink.gauge(0, &.{ "a", "b" }, 3);
                 try sink.counter(1, &.{ "a", "bc" }, 4);
                 try sink.histogram(2, &.{}, &.{1}, &.{1}, 1, 1);
                 try sink.summary(3, &.{"x"}, &.{}, &.{}, 1, 1);

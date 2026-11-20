@@ -5054,6 +5054,27 @@ test "OpenMetrics: only a counter's _total suffix is dropped from the announced 
     try testing.expectEqualStrings("# HELP level_total h\n# TYPE level_total gauge\nlevel_total 2.0\n# EOF\n", w.buffered());
 }
 
+test "collector: Sink reports an allocation failure of its duplicate set as WriteFailed" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try reg.registerCollector(&.{.{ .name = "oom", .help = "h", .kind = .gauge, .label_names = &.{"k"} }}, .{ .collect = struct {
+        fn f(_: ?*anyopaque, _: *Sink) anyerror!void {}
+    }.f });
+    // A value bigger than any arena chunk in hand, so each step of `begin`
+    // (the arena's first chunk, the key's growth, the set) must allocate.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'v');
+    for (0..3) |fail_at| {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var sink = Sink.init(fa.allocator(), &w, reg.families.items[0].collector.?, .text);
+        defer sink.deinit();
+        try testing.expectError(error.WriteFailed, sink.gauge(0, &.{big}, 1));
+    }
+}
+
 test "collector: Sink refuses desc == len, non-finite or equal bounds, malformed quantile lists" {
     const Noop = struct {
         fn collect(_: ?*anyopaque, _: *Sink) anyerror!void {}
