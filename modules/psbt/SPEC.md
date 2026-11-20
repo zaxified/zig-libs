@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core `psbt.h`/`rpc_psbt` (BIP174/371) + rust-bitcoin `psbt` (surveyed 2026-09-30, S3 2026-11-13); gaps: no BIP370 (PSBTv2), no Signer, script-path finalize only for `<key> CHECKSIG` / `multi_a` leaves
 
-**Audit:** review 2026-09-10 · mutation 2026-11-21 (206/219, 11 eq) · src 9992e8eb4b0c9359
+**Audit:** review 2026-09-10 · mutation 2026-11-21 (206/219, 11 eq) · src 77bc521d541ef75e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PSBT_FUZZ) · ct n/a — public partial transactions (keyword review, 2026-10-07)
 
