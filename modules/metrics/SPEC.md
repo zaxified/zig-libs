@@ -75,7 +75,12 @@ sorted; `error.InvalidBuckets` instead of silent strip/panic.
 - **Collectors** (`Registry.registerCollector`, `Desc`, `Collector`, `Sink`; client_golang `Collector`): families are
   described up front and their samples computed once per scrape, from the scraping thread with the registry lock not
   held (so `collect` must be thread-safe: concurrent scrapes run it concurrently). `Sink` checks what registration checks
-  (description index and kind, descs order, value count, UTF-8, bucket and quantile ranges). A collector that fails, or
+  (description index and kind, descs order, value count, UTF-8, bucket and quantile ranges) and refuses a label-value tuple
+  emitted twice for one desc in a scrape with `Sink.Error.DuplicateSample`. Reference: client_golang's `Gather` reports
+  "collected metric ... was collected before with the same name and label values" and drops the repeat; here the sample is
+  an error like every other refused one, so the scrape fails (promhttp's default `HTTPErrorOnError` = 500) and the cause is
+  `lastCollectorError()`, instead of serving a scrape Prometheus would reject whole. A family cannot repeat either: descs
+  are emitted in order (`OutOfOrder`) and a repeated name is refused at registration. A collector that fails, or
   emits what its descriptions do not allow, fails the whole scrape with `error.WriteFailed` (promhttp's default); the
   cause stays readable through `Registry.lastCollectorError()` and is not cleared by a later good scrape.
   `ProcessCollector` is client_golang's process collector over `procnet` (Linux `/proc`): the nine `process_*` families
@@ -259,7 +264,7 @@ scraping twice (byte-identical).
 | `Format.negotiate(accept)`, `Endpoint` (path, method, `Accept`) | the scraping peer | `metrics-negotiate`, `metrics-wire` | an independent model of the Accept rule (well-formed clauses), a valid answer for raw damage; the `Content-Type` the wire answer carries |
 | `RequestMetrics` middleware, `approxRequestSize` (method, target, header names/values, declared `Content-Length` up to 2^64-1) | the requesting peer | `metrics-wire` (the whole request goes through `http.Server.serveStream`) | no panic or overflow, a valid exposition after it, the `on_request` hook reached |
 | `Vec.with` / `delete` label values (request-derived by design), exemplar labels, plain-instrument and callback labels, metric/label names, HELP | the application, often from request data | `metrics-registry` | a tuple the registry accepted is UTF-8, within `max_label_value_len` and `max_series_per_family`, and is found in the exposition escaped by an independent rule; a refused registration leaves no family; a valid exposition in both formats |
-| `Sink` samples of a `Collector` (values, bounds, counts, quantiles) | the collector's author | `metrics-collector` | a refused sample is an error, never bad output; the rest as above |
+| `Sink` samples of a `Collector` (values, bounds, counts, quantiles) | the collector's author | `metrics-collector` | a refused sample (a repeated label-value tuple is `DuplicateSample`; reach label `collector-duplicate-sample`) is an error, never bad output; every scrape that succeeds passes the checker's no-repeated-sample rule; the rest as above |
 | float observations, bucket helpers, summary windows and clock jumps | the application (latencies, sizes) | `metrics-numeric` | cumulative buckets, count never goes backwards, `fill*Buckets` output is accepted by registration or refused with `InvalidBuckets`, valid exposition |
 | `ProcessCollector` (pid, namespace) | the application | `metrics-process` | a registered collector scrapes to a valid exposition for any pid |
 
@@ -269,12 +274,9 @@ target) take those bytes; this module consumes the typed numbers they return and
 read. Thread safety is not a byte-level property: the stress tests (8-thread shared instruments, concurrent get-or-register, scrape
 racing `delete`) cover it. The exposition is only ever emitted, never parsed: a scrape parser would need its own harness.
 
-**Edges the harnesses found (kept as they are).** (1) A `Collector` can emit the same label-value tuple twice in one family:
-`Sink` does not look for it, so the scrape carries a repeated sample, which Prometheus refuses for the whole scrape (client_golang's
-`Gather` reports it as an error). Keeping tuples unique is the collector author's contract (the collector harness is
-the one place the checker tolerates a repeated sample); a `Sink` check is a possible follow-up. (2) An exemplar on a counter named without `_total` is
+**Edges the harnesses found (kept as they are).** (1) An exemplar on a counter named without `_total` is
 written on a sample the OpenMetrics text declares `unknown`; prometheus/common's `expfmt` does the same and Prometheus' parser takes
-it, so it is kept (reference behaviour). (3) An exemplar with an empty label set is written as `# {} v`; `expfmt`'s writer
+it, so it is kept (reference behaviour). (2) An exemplar with an empty label set is written as `# {} v`; `expfmt`'s writer
 skips an exemplar without labels. Both are valid OpenMetrics.
 
 **Harness check.** 22 planted defects (escaping of `\`, newline and `"`; each UTF-8 gate of labels, HELP and `Sink`; the

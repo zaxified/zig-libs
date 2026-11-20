@@ -191,6 +191,112 @@ test "Sink: equal cumulative counts, a bucket equal to count, quantiles 0 and 1 
     try testing.expectEqual(@as(?anyerror, null), reg.lastCollectorError());
 }
 
+// ── Sink: repeated series (client_golang Gather's duplicate check) ──────────
+
+const DupPlan = struct {
+    /// Which sample list to emit: see `collect`.
+    case: u8,
+
+    fn collect(ctx: ?*anyopaque, sink: *metrics.Sink) anyerror!void {
+        const p: *const DupPlan = @ptrCast(@alignCast(ctx.?));
+        switch (p.case) {
+            // distinct tuples, an ambiguous split ("a","bc" vs "ab","c"),
+            // the empty value, and the same tuple under another desc: all fine
+            0 => {
+                try sink.gauge(0, &.{ "a", "bc" }, 1);
+                try sink.gauge(0, &.{ "ab", "c" }, 2);
+                try sink.gauge(0, &.{ "", "bc" }, 3);
+                try sink.gauge(0, &.{ "a", "" }, 3);
+                try sink.counter(1, &.{ "a", "bc" }, 4);
+                try sink.histogram(2, &.{}, &.{1}, &.{1}, 1, 1);
+                try sink.summary(3, &.{"x"}, &.{}, &.{}, 1, 1);
+            },
+            1 => {
+                try sink.gauge(0, &.{ "a", "b" }, 1);
+                try sink.gauge(0, &.{ "x", "y" }, 1);
+                try sink.gauge(0, &.{ "a", "b" }, 2);
+            },
+            2 => {
+                try sink.counter(1, &.{ "a", "bc" }, 1);
+                try sink.counter(1, &.{ "a", "bc" }, 1);
+            },
+            3 => {
+                try sink.histogram(2, &.{}, &.{1}, &.{1}, 1, 1);
+                try sink.histogram(2, &.{}, &.{5}, &.{0}, 1, 1);
+            },
+            4 => {
+                try sink.summary(3, &.{"x"}, &.{}, &.{}, 1, 1);
+                try sink.summary(3, &.{"x"}, &.{}, &.{}, 2, 2);
+            },
+            // the same tuple twice with a desc in between is OutOfOrder
+            // (a family's header cannot be written twice), not a quiet pass
+            else => {
+                try sink.gauge(0, &.{ "a", "b" }, 1);
+                try sink.counter(1, &.{ "a", "b" }, 1);
+                try sink.gauge(0, &.{ "a", "b" }, 1);
+            },
+        }
+    }
+};
+
+const dup_descs = [_]metrics.Desc{
+    .{ .name = "dup_g", .help = "g", .kind = .gauge, .label_names = &.{ "p", "q" } },
+    .{ .name = "dup_c_total", .help = "c", .kind = .counter, .label_names = &.{ "p", "q" } },
+    .{ .name = "dup_h", .help = "h", .kind = .histogram },
+    .{ .name = "dup_s", .help = "s", .kind = .summary, .label_names = &.{"p"} },
+};
+
+fn dupScrape(case: u8) !?anyerror {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var plan: DupPlan = .{ .case = case };
+    try reg.registerCollector(&dup_descs, .{ .ctx = &plan, .collect = DupPlan.collect });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    if (reg.writeText(&aw.writer)) |_| {
+        return null;
+    } else |e| {
+        try testing.expectEqual(error.WriteFailed, e);
+        return reg.lastCollectorError();
+    }
+}
+
+test "Sink: distinct tuples (including ambiguous concatenations) are not duplicates" {
+    try testing.expectEqual(@as(?anyerror, null), try dupScrape(0));
+}
+
+test "Sink: a repeated label-value tuple of a desc fails the scrape with DuplicateSample" {
+    // gauge, counter, histogram and summary alike; not only back to back
+    for ([_]u8{ 1, 2, 3, 4 }) |case| {
+        try testing.expectEqual(@as(?anyerror, error.DuplicateSample), try dupScrape(case));
+    }
+}
+
+test "Sink: a family cannot be emitted twice (desc order), nor described twice" {
+    try testing.expectEqual(@as(?anyerror, error.OutOfOrder), try dupScrape(5));
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const Noop = struct {
+        fn collect(_: ?*anyopaque, _: *metrics.Sink) anyerror!void {}
+    };
+    try testing.expectError(error.AlreadyRegistered, reg.registerCollector(&.{
+        .{ .name = "twice", .help = "h", .kind = .gauge },
+        .{ .name = "twice", .help = "h", .kind = .gauge },
+    }, .{ .collect = Noop.collect }));
+}
+
+test "Sink: the duplicate set restarts for each scrape" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var plan: DupPlan = .{ .case = 0 };
+    try reg.registerCollector(&dup_descs, .{ .ctx = &plan, .collect = DupPlan.collect });
+    for (0..3) |_| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try reg.writeText(&aw.writer);
+    }
+}
+
 // ── process collector ───────────────────────────────────────────────────────
 
 test "ProcessCollector: each family carries its own value" {

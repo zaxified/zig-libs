@@ -287,9 +287,9 @@ fn runesOf(pairs: []const Pair) usize {
 const Check = struct {
     gpa: std.mem.Allocator,
     om: bool,
-    /// A `Collector` is caller code and `Sink` does not look for a repeated
-    /// label-value tuple (client_golang's Gather does): only the collector
-    /// harness sets this.
+    /// Retained as an option, but no harness sets it any more: `Sink` refuses
+    /// a repeated label-value tuple (`error.DuplicateSample`), so a scrape
+    /// that succeeds never carries one.
     dups_ok: bool = false,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     typed: std.StringHashMapUnmanaged(void) = .empty,
@@ -439,7 +439,6 @@ const Check = struct {
 
         const gop = try c.seen.getOrPut(c.gpa, line[0..series_end]);
         if (gop.found_existing and !c.dups_ok) return error.Duplicate;
-        if (gop.found_existing) hit("collector-duplicate-sample");
 
         // cumulative buckets of one series, in order
         if (std.mem.endsWith(u8, name, "_bucket") and std.mem.eql(u8, c.family_kind, "histogram")) {
@@ -1076,9 +1075,10 @@ fn fuzzCollector(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
             if (std.mem.find(u8, w.written(), "col_h_bucket") != null) hit("collector-histogram");
             if (std.mem.find(u8, w.written(), "quantile=") != null) hit("collector-summary");
             if (std.mem.find(u8, w.written(), "col_g{") != null) hit("collector-gauge");
-            try scrapeCheckedOpt(gpa, &reg, f, true, true);
+            try scrapeCheckedOpt(gpa, &reg, f, false, true);
         } else |_| {
             hit("collector-refused");
+            if (reg.lastCollectorError().? == error.DuplicateSample) hit("collector-duplicate-sample");
             if (reg.lastCollectorError() == null) return error.CollectorErrorNotKept;
         }
     }

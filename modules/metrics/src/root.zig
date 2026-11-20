@@ -1482,7 +1482,8 @@ pub const Registry = struct {
                 // call); run it once, at its first family still registered.
                 if (ce != last_collector) {
                     last_collector = ce;
-                    var sink: Sink = .{ .w = bw, .entry = ce, .format = format };
+                    var sink = Sink.init(gpa, bw, ce, format);
+                    defer sink.deinit();
                     ce.collector.collect(ce.collector.ctx, &sink) catch |e| {
                         r.collector_error.store(@intFromError(e), .monotonic);
                         return error.WriteFailed;
@@ -1555,13 +1556,29 @@ const CollectorEntry = struct {
 /// index into the `descs` given to `registerCollector`; `values` are in that
 /// desc's label-name order. Each call checks what the registry checks at
 /// registration (value count, UTF-8, kind, order) — a violation is an error
-/// the collector should return, failing the scrape.
+/// the collector should return, failing the scrape. A label-value tuple
+/// emitted twice for one desc is `DuplicateSample`: client_golang's `Gather`
+/// refuses it too ("was collected before with the same name and label
+/// values"), because the exposition parser rejects the whole scrape on a
+/// repeated series.
 pub const Sink = struct {
     w: *std.Io.Writer,
     entry: *CollectorEntry,
     format: Format,
     /// The desc whose header was written last.
     current: ?usize = null,
+    /// Label-value tuples (length-prefixed) already emitted for `current`;
+    /// samples arrive in desc order, so one desc's set is all that is kept.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(gpa: Allocator, w: *std.Io.Writer, entry: *CollectorEntry, format: Format) Sink {
+        return .{ .w = w, .entry = entry, .format = format, .arena = .init(gpa) };
+    }
+
+    fn deinit(s: *Sink) void {
+        s.arena.deinit();
+    }
 
     pub const Error = std.Io.Writer.Error || error{
         /// `desc` is out of range, or of another kind than the call.
@@ -1574,6 +1591,9 @@ pub const Sink = struct {
         /// Histogram bounds not finite and strictly increasing, counts not
         /// one per bound, or not cumulative.
         InvalidBuckets,
+        /// The same label values were already emitted for this `desc` in
+        /// this scrape (a repeated series).
+        DuplicateSample,
     };
 
     /// A counter sample (float, like client_golang's `MustNewConstMetric`
@@ -1633,8 +1653,18 @@ pub const Sink = struct {
         if (@atomicLoad(bool, &fam.removed, .monotonic)) return null;
         if (s.current != desc) {
             s.current = desc;
+            s.seen = .empty;
+            _ = s.arena.reset(.retain_capacity);
             try writeHeader(s.w, fam.name, fam.help, fam.kind, s.format);
         }
+        const a = s.arena.allocator();
+        var key: std.ArrayList(u8) = .empty;
+        for (values) |v| {
+            key.appendSlice(a, std.mem.asBytes(&@as(u32, @intCast(v.len)))) catch return error.WriteFailed;
+            key.appendSlice(a, v) catch return error.WriteFailed;
+        }
+        const gop = s.seen.getOrPut(a, key.items) catch return error.WriteFailed;
+        if (gop.found_existing) return error.DuplicateSample;
         return fam;
     }
 };
@@ -4562,7 +4592,8 @@ test "collector: Sink refuses wrong kind, value count, UTF-8 and buckets" {
     try reg.registerCollector(&test_descs, .{ .ctx = &tc, .collect = TestCollector.collect });
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var sink: Sink = .{ .w = &w, .entry = reg.families.items[0].collector.?, .format = .text };
+    var sink = Sink.init(testing.allocator, &w, reg.families.items[0].collector.?, .text);
+    defer sink.deinit();
     try testing.expectError(error.InvalidDesc, sink.gauge(0, &.{"x"}, 1));
     try testing.expectError(error.InvalidDesc, sink.gauge(9, &.{}, 1));
     try testing.expectError(error.LabelMismatch, sink.counter(0, &.{}, 1));
@@ -5032,7 +5063,8 @@ test "collector: Sink refuses desc == len, non-finite or equal bounds, malformed
     try reg.registerCollector(&test_descs, .{ .collect = Noop.collect });
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var sink: Sink = .{ .w = &w, .entry = reg.families.items[0].collector.?, .format = .text };
+    var sink = Sink.init(testing.allocator, &w, reg.families.items[0].collector.?, .text);
+    defer sink.deinit();
     try testing.expectError(error.InvalidDesc, sink.gauge(test_descs.len, &.{}, 1));
     try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 1, std.math.inf(f64) }, &.{ 1, 2 }, 0, 2));
     try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 1, 1 }, &.{ 1, 2 }, 0, 2));
@@ -5043,7 +5075,8 @@ test "collector: Sink refuses desc == len, non-finite or equal bounds, malformed
     try reg2.registerCollector(&.{.{ .name = "cs", .help = "h", .kind = .summary }}, .{ .collect = Noop.collect });
     var buf2: [1024]u8 = undefined;
     var w2: std.Io.Writer = .fixed(&buf2);
-    var sink2: Sink = .{ .w = &w2, .entry = reg2.families.items[0].collector.?, .format = .text };
+    var sink2 = Sink.init(testing.allocator, &w2, reg2.families.items[0].collector.?, .text);
+    defer sink2.deinit();
     const q5: Objective = .{ .quantile = 0.5, .epsilon = 0 };
     const q9: Objective = .{ .quantile = 0.9, .epsilon = 0 };
     try testing.expectError(error.InvalidBuckets, sink2.summary(0, &.{}, &.{ q5, q9 }, &.{1}, 1, 1));
