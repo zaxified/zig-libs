@@ -6,7 +6,7 @@
 
 **Scope:** mvp — OpenMLS v0.9.0, RFC 9420 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src 1c40c20aa02a09bc
+**Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src b7fe37e50bdfd4ca
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
 **Performance:** not measured
@@ -173,9 +173,8 @@ is index bookkeeping built on `treemath.zig`'s `direct_path` (find-or-extend a
 blank leaf; blank a direct path; truncate a now-empty right subtree), with no
 resolution or parent-hash algorithm involved. It is byte-exact against
 `tree-operations.json` (resulting tree bytes and both tree hashes). The
-harness pulls the leaf out of the vector's proposal bytes with its own minimal
-parser (`kat_treekem_test.zig`'s `applyProposal`/`LocalProposalType`), see
-*Backlog / deferred*.
+harness decodes an Add's KeyPackage with `keypackage.KeyPackage` and reads the
+`Update`/`Remove` bodies itself (`kat_treekem_test.zig`'s `applyProposal`).
 
 **`unmerged_leaves` is sorted and bounds-checked.** §7.1 requires the list to
 be sorted in increasing order, so `ParentNode.withAppendedUnmerged` inserts in
@@ -1519,11 +1518,6 @@ Gaps that are unverified rather than unbuilt:
   `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so only that one mapping is
   duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have
   `Context` carry its own suite id.
-- **`kat_treekem_test.zig` carries a test-local `KeyPackage` parser**
-  (`applyProposal`, `LocalProposalType`) written to reach `tree-operations.json`'s
-  Add proposals. Switching it to `keypackage.KeyPackage` would delete duplicated
-  parsing and give that vector a second consumer; `tree.decodeExtensionList`'s
-  doc comment names this.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.
 - **Appendix C's `common_ancestor_semantic`/`common_ancestor_direct` in
   `treemath.zig`.** Not ported: `tree-math.json` does not publish them

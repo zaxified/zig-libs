@@ -874,10 +874,8 @@ pub fn applyUpdatePath(
     sender_leaf_index: usize,
     update_path: UpdatePath,
 ) Error!void {
-    // Step 3's parent hashes are the suite's hash. Until 2026-11-17 this
-    // took no suite and hashed with `suite.default`'s SHA-256, which every
-    // suite then wired shared; a SHA-384/SHA-512 suite rejected every
-    // genuine path (treekem.json, suites 0x0005/0x0007).
+    // Step 3's parent hashes are the suite's hash (`S`), not a fixed SHA-256:
+    // a SHA-384/SHA-512 suite would reject every genuine path otherwise.
     const sender_node = 2 * sender_leaf_index;
     if (sender_node >= t.nodes.len) return error.InvalidLeafIndex;
     if (update_path.leaf_node.leaf_node_source != .commit) return error.Malformed;

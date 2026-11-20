@@ -16,11 +16,10 @@
 //!   * `tree-operations.json`'s whole Add/Update/Remove-application run —
 //!     REAL, ungated (§7.7/§12.1.1-§12.1.3 tree-editing is mechanical, NOT
 //!     one of the five Fable cores — see `tree.zig`'s module doc comment).
-//!     Uses a MINIMAL test-local `Proposal`/`KeyPackage` parser (full
-//!     `KeyPackage`/`Proposal` types are Part 3/5's public API per
-//!     `SPEC.md` — this Part only needs to pull a `LeafNode`/leaf-index
-//!     out of the wire bytes to drive `RatchetTree.addLeaf`/`updateLeaf`/
-//!     `removeLeaf`).
+//!     Uses a MINIMAL test-local `Proposal` parser (the `Add` body is decoded
+//!     by `keypackage.KeyPackage`; this Part only needs to pull a
+//!     `LeafNode`/leaf-index out of the wire bytes to drive
+//!     `RatchetTree.addLeaf`/`updateLeaf`/`removeLeaf`).
 //!   * `treekem.json` (the UpdatePath/path-secret/commit-secret vector) —
 //!     GATED in full (`processUpdatePath` Fable core).
 //!
@@ -32,6 +31,7 @@ const std = @import("std");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const tree = @import("tree.zig");
+const keypackage = @import("keypackage.zig");
 const treehash = @import("treehash.zig");
 const treekem = @import("treekem.zig");
 const wire = @import("wire_lists.zig");
@@ -303,21 +303,17 @@ fn parentHashes(comptime S: type) !void {
 
 const LocalProposalType = enum(u16) { add = 1, update = 2, remove = 3, _ };
 
-/// Test-local, minimal `Proposal`/`KeyPackage` decode — see this file's
-/// module doc comment for why this isn't part of `tree.zig`'s public API.
+/// Test-local, minimal `Proposal` decode (the `Add` body is a real
+/// `keypackage.KeyPackage`) — see this file's module doc comment for why the
+/// `Proposal` type isn't part of `tree.zig`'s public API.
 fn applyProposal(allocator: std.mem.Allocator, t: *tree.RatchetTree, proposal_bytes: []const u8, sender: u32) !void {
     var r = codec.Reader.init(proposal_bytes);
     const ptype = try r.readEnum(LocalProposalType);
     switch (ptype) {
         .add => {
-            _ = try r.readU16(); // KeyPackage.version
-            _ = try r.readU16(); // KeyPackage.cipher_suite
-            _ = try r.readVector(); // KeyPackage.init_key
-            const leaf = try tree.LeafNode.decode(allocator, &r);
-            const kp_exts = try tree.decodeExtensionList(allocator, &r); // KeyPackage.extensions
-            allocator.free(kp_exts);
-            _ = try r.readVector(); // KeyPackage.signature
-            _ = try t.addLeaf(leaf);
+            const kp = try keypackage.KeyPackage.decode(allocator, &r);
+            allocator.free(kp.extensions); // the tree keeps only the leaf node
+            _ = try t.addLeaf(kp.leaf_node);
         },
         .update => {
             const leaf = try tree.LeafNode.decode(allocator, &r);

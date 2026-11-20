@@ -64,17 +64,9 @@
 //! `group.Error.PrivateHandshakeNotSupported` (a Commit or proposal framed
 //! as a `PrivateMessage` — the §9 secret tree exists but this object does
 //! not drive it per epoch). It is not a gate: it is a permanent, documented
-//! property of what these parts own. There used to be a second one,
-//! `group.Error.GroupPoisoned` — a Commit that failed after the tree was
-//! mutated left the object unusable, and `createCommit` was non-atomic on
-//! the same terms. Both Commit paths are transactional since 2026-09-11
-//! and the error is gone; see `group.zig`'s doc comment on atomicity.
-//!
-//! Note that Part 5's one named refusal,
-//! `error.WireFormatNotInThisPart`, is GONE: Part 6 supplied the
-//! `Welcome`/`GroupInfo` payloads it stood for, so
-//! `framing.MLSMessage.decode` now handles every §17.2 wire format and the
-//! error would have no reachable return site.
+//! property of what these parts own. Both Commit paths are transactional
+//! (see `group.zig`'s doc comment on atomicity) and `framing.MLSMessage.decode`
+//! handles every §17.2 wire format.
 //!
 //! The switch is retained (rather than deleted) so the ratchet-tree data/
 //! codec/tree-hash/tree-editing layer stays independently testable should a
