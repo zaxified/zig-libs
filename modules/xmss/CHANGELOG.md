@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
 
 - **2026-10-10** — tests: deterministic fuzz driver `XMSS_FUZZ` (`xmss-verify`, `xmss-pubkey`, `xmss-sign-verify`, new `src/fuzz_test.zig`; the Smith harnesses in `root.zig` are unchanged), XMSS-SHA2_10_256: key / message / signature each intact or damaged -- only the intact triple verifies, wild triples never; `PublicKey.fromBytes` re-encodes what it accepts; signatures from a stateful key verify, and a flipped octet, a truncation, an extension, another message, another root or seed do not. No change in `src/` outside tests.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `sign`, ReleaseFast): `SK_SEED` and `SK_PRF` are tainted through `keyGen` and five `sign`s, including the BDS updates, at tree height 4. The 2 in-file contexts are the WOTS chain loop, whose count comes from `H_msg` over `r = PRF(SK_PRF, idx)`. `r` is published in the signature, so this is a tainting artefact, not a leak. No code change.
@@ -43,7 +42,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
   ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
   probe still reads 0.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with no longer says no LMS/HSS module exists — it points to the sibling `lms` module (grade 2).
 - **2026-10-05** — Mutation run: 23 of 24 killed, 1 equivalent; 1 test extended
   (the external-vector KAT rejects 2048 tampered randomizers, so `verify`'s
   root comparison must cover every byte). No code change.

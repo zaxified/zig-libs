@@ -42,14 +42,25 @@ updated key *before* releasing the signature; never sign from a restored
 backup or from two copies of the key. If you cannot guarantee that, use
 the stateless sibling module `slhdsa` instead. See SPEC.md.
 
-**Not implemented:** XMSS^MT (multi-tree), SHA-512/SHAKE suites.
+`SigningKey` is an opt-in hardened handle for exactly these hazards: it runs the
+whole exhaustion check → persist → sign → advance sequence under a lock (so
+concurrent signers never repeat a leaf), refuses to sign from a copied or moved
+handle (`error.KeyHandleCopied`), and calls your `Persist.write` hook with the
+next index *before* any signature byte is produced (`error.PersistFailed` leaves
+the leaf unconsumed). Initialise it in place with `SigningKey.init(&handle, &sk,
+persist)`. A bare `SecretKey` is not thread-safe: two racing `sign` calls are a
+memory-safety hazard, not only an index-reuse one.
+
+**Not provided:** XMSS^MT (multi-tree), SHA-512/SHAKE suites, a serialisation of the secret key (see SPEC.md
+*Backlog / deferred* and *What is deliberately not done*).
 
 **Auth-path traversal is BDS (Buchmann–Dahmen–Schneider), not a naive
 recompute:** `sign` emits the current leaf's auth path from `SecretKey.bds`
 and advances it in ~O(h) hashing per signature (about verify cost), instead
 of rebuilding the whole path in O(2^h) — cheap even at h = 20. An
 out-of-band `idx` jump (index partitioning, a restored key) auto-resyncs
-the BDS state in O(2^h) before that one signature, then stays O(h) again.
+the BDS state in O(target·h) leaf generations before that one signature (hours
+at h = 20), then stays O(h) again.
 See SPEC.md for how this is validated (differential against a from-scratch
 reference at every leaf for two heights, plus a dedicated resync test).
 
@@ -58,17 +69,14 @@ reference at every leaf for two heights, plus a dedicated resync test).
   Fills a real std gap: Zig 0.17 `std.crypto` has no stateful hash-based
   signature (RFC 8391 XMSS / RFC 8554 LMS — the NIST SP 800-208 pair).
 - **Deps:** none (std only — `std.crypto.hash.sha2.Sha256`).
-- **Consumer:** SCADA firmware signing (IEC 62443-style code-signing
+- **Intended use:** firmware signing (IEC 62443-style code-signing
   chains standardize on SP 800-208 stateful HBS).
 
 Provenance: clean-room from RFC 8391, a public IRTF specification, **with one
-stated exception**: `src/root.zig` and SPEC.md both say the BDS auth-path
-traversal is *ported* from the reference `xmss_core_fast.c` (parameter k = 0).
-Until 2026-09-03 this paragraph and the module `NOTICE` said instead that "no
-source was read or ported" — two files in one directory making opposite claims
-about the same ~200 lines. Corrected to the code's own statement. xmss-reference
-is **CC0** (public domain), so the port carries no licence condition either way;
-what was wrong was the record, not the act. Everything outside the BDS traversal
-is clean-room from the RFC, and the reference was otherwise exercised only as a
-**black-box KAT oracle** — built, run, and its output diffed against ours. Detail in this module's own [`NOTICE`](NOTICE); it carries no
-condition beyond zig-libs' MIT license.
+stated exception**: the BDS auth-path traversal is *ported* from the reference
+`xmss_core_fast.c` (parameter k = 0), as `src/root.zig` and SPEC.md both say.
+xmss-reference is **CC0** (public domain), so the port carries no licence
+condition. Everything outside the BDS traversal is clean-room from the RFC, and
+the reference was otherwise exercised only as a **black-box KAT oracle** — built,
+run, and its output diffed against ours. Detail in this module's own
+[`NOTICE`](NOTICE); it carries no condition beyond zig-libs' MIT license.

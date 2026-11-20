@@ -57,22 +57,22 @@ len_1 = 64, len_2 = 3, len = 67):
 - **Wire formats** (§4.1.7, §4.1.8, §B.3): public key
   `OID(4) || root(32) || SEED(32)`; signature
   `idx(4) || r(32) || sig_ots(67*32) || auth(h*32)`.
+
 - **WOTS+ key derivation** (§3.1.7 / §4.1.11 leave this
   implementation-defined; interop-neutral): the NIST SP 800-208 /
   xmss-reference scheme — chain i start value =
   `SHA-256(toByte(4, 32) || SK_SEED || SEED || ADRS)` with ADRS = the OTS
   address with chainAddress = i, hashAddress = 0, keyAndMask = 0. The
   private key's **secret material** is therefore 4 seeds + a 4-byte index;
-  one-time keys are derived on demand and never stored. ⚠ That is not the same
-  as `SecretKey`'s **layout**, and an earlier revision of this line said
-  "the private key is therefore 4 seeds + a 4-byte index" without the
-  distinction — which is the direct cause of the 2026-09-03 F1 finding, because
-  a caller who restores exactly those fields leaves `bds` default-constructed.
-  Since the BDS rewrite `SecretKey` also carries the traversal state: measured
-  `@sizeOf` is **676 B at h=4, 1424 B at h=10, 2176 B at h=16, 2676 B at h=20**
+  one-time keys are derived on demand and never stored. That is not the same
+  as `SecretKey`'s **layout**: `SecretKey` also carries the BDS traversal state, so a
+  caller who restores only the seeds and the index leaves `bds` default-constructed
+  (a resync, see below; test "a key restored at index 0 resyncs…").
+  `@sizeOf(SecretKey)` is **676 B at h=4, 1424 B at h=10, 2176 B at h=16, 2676 B at h=20**
   (of which `BdsState` is 544 / 1292 / 2044 / 2544 B) against the 132-byte RFC
-  private key. There is deliberately **no serialisation API**; a caller that
-  invents one must persist the whole struct, or accept the O(target·h) resync.
+  private key. There is deliberately **no serialisation API** (see *What is deliberately
+  not done*); a caller that invents one must persist the whole struct, or accept the
+  O(target·h) resync.
 
 **Not implemented:** XMSS^MT (§4.2 multi-tree — different OID space and
 hypertree signing); the SHA-512 and SHAKE suites (§5 OPTIONAL; RFC only
@@ -110,14 +110,13 @@ emits the current leaf's precomputed auth path and advances the state to
 the next leaf in ~O(h) hashing (about verify cost) instead of rebuilding
 the whole path in O(2^h). The BDS state tracks `covered_idx` in lockstep
 with `sk.idx`; a caller that jumps `idx` out of band (index partitioning,
-a restored key) triggers an automatic resync so the emitted signature is
-still byte-exact. That resync is **O(target·h) leaf generations, not O(2^h)** —
-`root.zig` says so correctly and this line understated it by a factor of h.
-Measured at h=10 in ReleaseFast: keyGen 1696 ms, an in-sequence sign 2.55 ms,
-and a sign after jumping to leaf 1023 **8335 ms — 4.9x the cost of generating
-the key**. Extrapolated to h=20 that is hours, silently, on the very workflow
-this section recommends (index partitioning). `keyGen` remains O(2^h) (it now also seeds
-the initial BDS state) — only per-signature auth-path cost is reduced.
+a restored key) triggers an automatic resync (`rebuildStateTo`) so the emitted signature is
+still byte-exact. That resync is **O(target·h) leaf generations, not O(2^h)**: at h=10 a
+sign after a jump to the last leaf costs several times the key generation, and at
+h=20 it takes hours, silently, on the very workflow this section recommends
+(index partitioning). `keyGen` remains O(2^h) (it also seeds the initial BDS state);
+only the per-signature auth-path cost is reduced. `buildAuth` is the naive O(2^h) recompute,
+kept as the from-scratch reference the traversal is tested against.
 
 ## Statefulness — the key hazard
 
@@ -134,83 +133,21 @@ scheme's security argument collapses per-index, not per-signature.
   a restored/older copy; partition index ranges if a key must be shared
   across signers.
 
-## Validation — what is byte-exact vs round-trip
+- **`SigningKey`** is the opt-in hardened handle around a `SecretKey` (bare `SecretKey` + `sign` keep working for
+  callers that own the state discipline). It defends three hazards the value-type key cannot:
+  1. *Concurrent `sign` on one key*: the whole exhaustion-check → persist → sign → advance sequence runs under a
+     lock (a local spin lock, or an `std.Io.Mutex` when `Persist.io` is set so that signers sharing one thread
+     do not starve one suspended in `write`), so every leaf index is handed out once.
+  2. *Struct copy*: the handle records the address `init` ran at; a copy or move lands elsewhere and `sign` returns
+     `error.KeyHandleCopied` instead of forking the counter. This is why `init` writes through `*SigningKey`.
+  3. *Crash between signing and persisting*: the optional `Persist.write` hook is called with the NEXT index before
+     any signature byte is produced; a failure returns `error.PersistFailed` with the leaf unconsumed, and exhaustion
+     is checked before persisting, so a rejected sign does not move the durable index either (NIST SP 800-208 §7
+     makes this the deployer's obligation; the hook is where it attaches).
 
-Oracle: the official XMSS reference implementation
-(github.com/XMSS/xmss-reference @ HEAD 2026-07, built unmodified against
-OpenSSL's SHA-256), driven with fixed deterministic inputs — generator
-conventions documented in `src/kat_vectors.zig`.
-
-Byte-exact against the oracle (committed test suite):
-
-1. **Primitives:** PRF, the F chain step (thash_f), RAND_HASH (thash_h),
-   H_msg — each on independent fixed inputs.
-2. **WOTS+:** full pkGen (67×32 B), full sign (67×32 B), and
-   pkFromSig(sig) == pk round-trip, on the reference's own test inputs.
-3. **XMSS keygen + sign at h = 4** (reduced height, same suite/code
-   path, test-only OID): public key and two complete wire signatures
-   (leaf 0 and leaf 11) match the reference bit-for-bit.
-4. **XMSS-SHA2_10_256 verify interop:** two reference-generated 2 500-B
-   signatures (leaf 0 and leaf 517) verify under the reference's h = 10
-   public key — a real external (pk, msg, sig) triple; 10 tamper/negative
-   variants (bit flips in idx/r/WOTS/auth/message, grafted index,
-   out-of-range index, truncation, wrong root) all reject.
-
-Verified out-of-band (not in the committed suite — a Debug-mode h = 10
-keygen costs ~40 s): `XmssSha2_10_256.keyGen` on the reference seed
-reproduces the reference public-key root byte-exactly. h = 16/20 are the
-same comptime code path, exercised only at h ≤ 10.
-
-5. **h = 2 sequential stateful walk, byte-exact against the oracle for
-   leaves 0-2:** the same fixed keypair seed as the h = 4/h = 10 vectors,
-   signed leaf-by-leaf (idx 0, then 1, then 2 — a plain in-order advance,
-   which nothing above exercises: the h = 4 vectors cover idx = 0 and an
-   out-of-band jump to idx = 11, never idx -> idx+1 -> idx+2). Leaf 3
-   (idx = 2^h - 1, the last one-time key) is deliberately NOT byte-anchored:
-   capturing it exposed a bug in the reference implementation itself —
-   `xmssmt_core_sign` wipes the secret key's index field to all-0xFF
-   *before* copying it into the outgoing signature when
-   `idx >= 2^h - 1`, so the reference's own emitted signature for the
-   final leaf carries a corrupted index word and the reference's own
-   `xmss_core_sign_open` rejects it (confirmed empirically while capturing
-   these vectors: leaves 0-2 round-trip through the reference's own
-   verifier, leaf 3 does not). This module's `sign` has no such bug — it
-   writes the correct idx at every leaf, including the last, which the
-   h = 4/h = 6 exhaustive BDS sweeps already check byte-for-byte against
-   an independent from-scratch auth-path build — so leaf 3 stays a
-   behavioral check (signs, verifies, then `KeyExhausted` on the 5th
-   attempt) rather than an external byte anchor. See kat_vectors.zig for
-   the full provenance note.
-
-**BDS traversal, differential against a from-scratch reference (no
-external oracle for this — RFC 8391 leaves it implementation-defined, so
-there is no third-party BDS vector to match; the reference oracle instead
-is this module's own naive `buildAuth`, a full O(2^h) recompute):** the
-h = 4 exhaustive sweep signs and verifies every one of the 16 leaves,
-byte-comparing the BDS-produced auth path against `buildAuth` at each
-index; the h = 6 sweep does the same for all 64 leaves, with the
-differential re-run at the boundary indices around the 2^(h-1)
-left/right-subtree transition (the part of BDS most likely to be
-mis-ported); a dedicated test jumps `idx` out of band (skipping several
-leaves, and landing exactly on the h = 6 transition leaf) and confirms
-the auto-resync still reproduces the from-scratch auth path byte-exactly.
-
-**Mutation run 2026-10-05** (in-place, ReleaseSafe, 24 mutants over both
-exhaustion checks, the index advance and the BDS `covered_idx`/resync
-bookkeeping, the `SigningKey` copy guard and persist hook, `verify`'s
-length check, tree walk and root comparison, the public-key OID check,
-base-w and the checksum, the L-tree carry, the chain and tree bitmasks,
-`H_msg`'s index, the per-leaf `r`, `zeroize`, and BDS's round bound and
-treehash restart): 23 killed. Not advancing `idx` (index reuse) fails two
-tests outright; two exhaustion loops never end under it and were stopped
-by hand. The first pass left 2; the external-vector test now also checks
-2048 tampered randomizers, because a root compared in one byte was
-accepted by every existing rejection (each gives an unrelated root, which
-matches one byte 1 time in 256). One mutant that failed to compile was
-rewritten until it built. Equivalent: BDS's `startidx < 2^h` as `<=`
-(`startidx == 2^h` needs `leaf + 1 = 2^h − 3·2^i` while `2^tau` divides
-`leaf + 1` for some `tau > i`, and that number's 2-adic valuation is
-exactly `i`).
+  Errors: `KeyExhausted`, `KeyHandleCopied`, `PersistFailed`. It does not stop a caller from also holding a
+  `*SecretKey` into `handle.sk`, or from restoring an old serialised key: rollback across process lifetimes is a
+  storage property, not an API one. `SigningKey.init` copies the `SecretKey` (seeds by pointer): zeroize the original.
 
 ## Threat notes
 
@@ -220,27 +157,25 @@ exactly `i`).
 - **sign/keyGen** are not constant-time hardened. Hash-based schemes have
   no secret-dependent branching in the algorithm itself beyond hashing
   secret chain values; still, treat timing as out of scope.
+
 - **No internal RNG:** keyGen takes caller-supplied `sk_seed`, `sk_prf`
   (secret) and `pub_seed` (public but MUST be high-entropy, §4.1.3) —
-  bring a CSPRNG (std removed `std.crypto.random` in 0.16; still absent in 0.17). Everything is
+  bring a CSPRNG (`std.crypto.random` is absent in 0.16 and 0.17). Everything is
   deterministic, which is what makes the KATs byte-exact.
-- **No allocation, no I/O:** all buffers are fixed-size (largest: `BdsState`
-  itself, 2544 B at h=20 — bigger than the 67x32 B WOTS+ arrays this line used
-  to name as the largest).
+- **No allocation, no I/O:** all buffers are fixed-size (the largest is `BdsState`
+  itself, 2544 B at h=20).
 - **`keyGen`, `sign` and `buildAuth` zero the stack their computation used.**
   WOTS+ chain values — of the leaf just signed, and of every leaf `keyGen` or a
-  traversal step computes — used to survive on the dead stack in callee frames
+  traversal step computes — would otherwise survive on the dead stack in callee frames
   no name reaches. Possession of leaf *k*'s chain values permits forging a
   message at index *k*, so neither a spent nor an unused index is harmless.
-  Measured at ReleaseFast before the fix (A1 F3): `keyGen` left 49 chain
-  values, `sign` 47 per call at leaf 0 and 49 after a jump to leaf 5 — the
-  same on the audited tree. Each entry point now runs its computation one
+  Each entry point runs its computation one
   frame down (`burn.zig`) and zeroes 16 KiB below it (the call trees reach
   5.9 / 8.4 / 5.9 KiB for `keyGen` / `sign` / `buildAuth` at h=4); a probe
   (`stackprobe_test.zig`) asserts zero residue of the seeds and of every
   chain value beside a negative and a positive control. `zeroize` still wipes
   only the two seeds.
-- **No secret crosses the API by value** (dead-stack sweep, 2026-10-09).
+- **No secret crosses the API by value.**
   `keyGen` writes the `KeyPair` through `*KeyPair` and takes the seeds as
   `*const`; `prfKeygen`/`wotsSkGen` write through an out-param; `chain` and
   `chainStep` update a chain value in place; `SigningKey.init` takes
@@ -248,39 +183,101 @@ exactly `i`).
   only because their results are public. They, and the other raw WOTS+
   primitives, do not burn: a caller using them directly owns that stack. A
   `SecretKey` the caller copies is the caller's copy: `zeroize` it.
-- **Bare `SecretKey` is not thread-safe, and since the BDS rewrite the hazard
+- **Bare `SecretKey` is not thread-safe, and the hazard
   is memory-unsafety, not just index reuse.** Two racing `sign` calls drive
   `bds.stackoffset` to 0 while `stackusage > 0`; `stackoffset - 1` underflows a
   `u32`. Debug: integer-overflow panic. **ReleaseFast: SIGSEGV.** Use
   `SigningKey`, whose interlock covers the whole exhaustion-check → persist →
   sign → advance section.
-- **OID discipline:** `PublicKey.fromBytes` rejects foreign OIDs; the
+- **OID discipline:** `PublicKey.fromBytes` rejects foreign OIDs (`error.UnsupportedOid`); the
   reduced-height test instantiations use private-range OIDs
   (0xDDDDDDDD–0xFFFFFFFF are never IANA-assigned).
+
+## What is deliberately not done
+
+- **No serialisation of the secret key.** `SecretKey` carries the BDS state as well as the seeds and the index, so a
+  hand-rolled encoding that keeps only the RFC's fields silently costs a resync, and one that is stale reuses a
+  leaf. Only the public key has a wire form (`PublicKey.toBytes` / `fromBytes`).
+- **No internal RNG and no I/O:** seeds come from the caller; persistence is the caller's, through the `SigningKey`
+  hook.
+
+## Verification
+
+- **Run:** `scripts/modtest xmss` (the module is `heavy`).
+- **Oracle:** the official XMSS reference implementation (github.com/XMSS/xmss-reference, built unmodified
+  against OpenSSL's SHA-256), driven with fixed deterministic inputs; the generator conventions are documented in
+  `src/kat_vectors.zig`. Byte-exact against it (`src/kat_test.zig`):
+  1. **Primitives:** PRF, the F chain step (thash_f), RAND_HASH (thash_h), H_msg — each on independent fixed inputs.
+  2. **WOTS+:** full pkGen (67×32 B), full sign (67×32 B), and pkFromSig(sig) == pk round-trip, on the reference's
+     own test inputs.
+  3. **XMSS keygen + sign at h = 4** (reduced height, same suite/code path, test-only OID): public key and two
+     complete wire signatures (leaf 0 and leaf 11) match the reference bit-for-bit.
+  4. **XMSS-SHA2_10_256 verify interop:** two reference-generated 2 500-B signatures (leaf 0 and leaf 517) verify
+     under the reference's h = 10 public key — a real external (pk, msg, sig) triple; tamper/negative variants (bit
+     flips in idx/r/WOTS/auth/message, grafted index, out-of-range index, truncation, wrong root, and a sweep of
+     tampered randomizers, since a root compared in one byte accepts one in 256 unrelated roots) all reject.
+  5. **h = 2 sequential stateful walk, byte-exact for leaves 0-2:** the same fixed keypair seed as the h = 4/h = 10
+     vectors, signed leaf by leaf (idx 0, then 1, then 2 — a plain in-order advance, which nothing above exercises:
+     the h = 4 vectors cover idx = 0 and an out-of-band jump to idx = 11). Leaf 3 (idx = 2^h − 1, the last one-time
+     key) is deliberately NOT byte-anchored: `xmssmt_core_sign` in the reference wipes the secret key's index field
+     to all-0xFF *before* copying it into the outgoing signature when `idx >= 2^h − 1`, so the reference's own
+     emitted signature for the final leaf carries a corrupted index word and its own `xmss_core_sign_open` rejects
+     it (leaves 0-2 round-trip through the reference's verifier, leaf 3 does not). This module writes the correct
+     idx at every leaf, including the last, which the h = 4/h = 6 exhaustive BDS sweeps check byte-for-byte
+     against an independent from-scratch auth-path build; leaf 3 stays a behavioural check (signs, verifies, then
+     `KeyExhausted` on the next attempt). `src/kat_vectors.zig` has the full provenance note.
+- **BDS traversal** has no external oracle (RFC 8391 leaves it implementation-defined, so there is no third-party
+  BDS vector to match); the oracle is this module's own naive `buildAuth`, a full O(2^h) recompute. The h = 4
+  exhaustive sweep signs and verifies every leaf, byte-comparing the BDS auth path against `buildAuth` at each index;
+  the h = 6 sweep does the same for every leaf, with the differential re-run at the boundary indices around the
+  2^(h-1) left/right-subtree transition (the part of BDS most likely to be mis-ported); a dedicated test jumps `idx`
+  out of band (skipping several leaves, and landing exactly on the h = 6 transition leaf) and confirms the
+  auto-resync reproduces the from-scratch auth path byte-exactly; a restored key at index 0 resyncs instead of
+  signing an all-zero auth path.
+- **State discipline** (`src/root.zig`): sign advances `idx`, never repeats, fails closed when exhausted;
+  `SigningKey` refuses a copied handle, writes the durable index before the signature and burns no leaf on a failed
+  write, never repeats a leaf under concurrent signers (spin lock and `Persist.io` variants); `SecretKey.zeroize`
+  wipes the seeds only.
+- **Wire parsers:** `PublicKey` round trip and OID rejection, base-w and checksum example, RFC 8391 sizes.
+- **Fuzz:** driver prefix `XMSS_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`): `verify` and `PublicKey.fromBytes`
+  never panic on arbitrary bytes, and `xmss-sign-verify` (scaled to a small run count, each a real signature);
+  reach tests pin the outcomes.
+- **Dead-stack probes:** `src/stackprobe_test.zig` (no seed or chain value after `keyGen` and `sign`, with negative
+  and positive controls, at h = 4) and `src/stackprobe2_test.zig` (the raw WOTS+ building blocks); ReleaseFast only.
+- **ctgrind:** `src/ctgrind_harness.zig`; row `sign` in `scripts/checks/ctgrind-expected.tsv`: `SK_SEED` and
+  `SK_PRF` tainted through `keyGen` and five signs at h = 4; the 2 in-file contexts are WOTS chain lengths derived by
+  `H_msg` over the PUBLISHED randomizer, an artefact.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
+## Open
+
+- **`keyGen` at h = 10 on the reference seed is not in the suite.** It reproduces the reference public-key root
+  byte-exactly when run out of band (a Debug-mode h = 10 keygen costs about 40 s). h = 16 and 20 are the same
+  comptime code path, exercised only at h <= 10.
 
 ## Backlog / deferred
 
 - **SHA-512 and SHAKE256 suites (RFC 8391 OIDs 4–12) and SP 800-208's 24-byte
-  (SHA-256/192, SHAKE256/192) sets** *(survey 2026-09-30)*. The reference and
+  (SHA-256/192, SHAKE256/192) sets**. The reference and
   go-xmssmt offer all of them; a deployment whose policy fixes another hash, or an
   SP 800-208 profile that uses the 192-bit sets, cannot use this module. Moderate:
   `n = 32` and SHA-256 are module-level constants (`root.zig` `n`, `hashF`…), so
   the whole file would need a hash/`n` parameter; needs a hash/`n` parameter and one
   cross-checked KAT per suite from the reference. Fits CONVENTIONS §2 (pure Zig).
-- **XMSS^MT (RFC 8391 §4.2)** *(survey 2026-09-30)*. The way to get more than 2^20
+- **XMSS^MT (RFC 8391 §4.2)**. The way to get more than 2^20
   signatures per key with a bounded key-generation time; the reference and go-xmssmt
   ship it. The module's SPEC lists it as "Not implemented" and notes CNSA 2.0
   excludes the multi-tree variants, which is a policy reason for a CNSA user but
   not a general refusal. Large (hypertree signing, another OID space, BDS across
   layers). Pure Zig.
-- **Fast restore of a BDS state after a restart** *(survey 2026-09-30)*. An index
-  jump or restored key re-syncs in O(target·h) leaf generations — measured 8.3 s at
-  h = 10, hours at h = 20 (see *Design & invariants*). A user who restarts a signer
+- **Fast restore of a BDS state after a restart**. An index
+  jump or restored key re-syncs in O(target·h) leaf generations — hours at
+  h = 20 (see *Design & invariants*). A user who restarts a signer
   hits this on every restart. Moderate; needs a documented BDS-state encoding,
   which conflicts with the stated no-serialisation choice, so it is a decision for
   the maintainer rather than a plain to-do. Pure Zig.
-
-- **Stack hygiene beyond the entry points** *(dead-stack sweep 2026-10-09)*. The
+- **Stack hygiene beyond the entry points**. The
   probe's needles are the raw seeds and the unmasked chain values; the masked value
   `x XOR bitmask` that `chainStep` feeds to F, and SHA-256 block buffers holding it,
   are not needles (the mask is public, so they are as secret as the chain value).
@@ -297,5 +294,3 @@ exactly `i`).
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** core hashes/WOTS+/sig vs real XMSS reference(EXTERNAL); h=2 stateful walk is round-trip only
-
-**How it got there.** The anchoring work landed. DONE 5938bfc: h=2 anchored on XMSS/xmss-reference; leaf 3 = BUG IN THE REFERENCE
