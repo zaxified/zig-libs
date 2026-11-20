@@ -1966,6 +1966,25 @@ test "ARI: a failed poll waits like a successful one: Retry-After (at most a wee
     }
 }
 
+test "checkPair: an RSA leaf with its key in PKCS#8 and PKCS#1, and the mismatches" {
+    const rfx = @import("testdata/manager_fixtures_rsa.zig");
+    const gpa = testing.allocator;
+    const t = day0 + 30 * day;
+    const chain = rfx.rsa_crt ++ "\n" ++ rfx.ca_pem ++ "\n";
+    const names: []const []const u8 = &.{"r.example"};
+    // PKCS#8 `PRIVATE KEY` holding RSA: `privateKeyFromPem` refuses it, the RSA
+    // path takes it. PKCS#1 `RSA PRIVATE KEY` goes to the RSA path directly.
+    const ok = try Manager.checkPair(gpa, names, chain, rfx.rsa_key_pkcs8, t, &.{});
+    try testing.expectEqual(day0, ok.not_before);
+    _ = try Manager.checkPair(gpa, names, chain, rfx.rsa_key_pkcs1, t, &.{});
+    // An EC key for the RSA leaf, and the RSA key for an EC leaf.
+    try testing.expectError(error.KeyMismatch, Manager.checkPair(gpa, names, chain, fx.a1_key, t, &.{}));
+    try testing.expectError(error.KeyMismatch, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), rfx.rsa_key_pkcs8, t, &.{}));
+    try testing.expectError(error.KeyMismatch, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), rfx.rsa_key_pkcs1, t, &.{}));
+    // Another RSA key: same type, other modulus.
+    try testing.expectError(error.KeyMismatch, Manager.checkPair(gpa, names, chain, rfx.rsa_other_key, t, &.{}));
+}
+
 test "checkPair: a certificate valid only from more than a day ahead is refused" {
     const gpa = testing.allocator;
     // a1 starts at day0: exactly one day ahead is skew, one second more is not.

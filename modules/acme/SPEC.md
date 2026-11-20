@@ -260,7 +260,8 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
   scheduled point with `replaces`, restart from storage, back-off and `Retry-After`, issuer fallback and order,
   ARI window handling, another node's lock, wildcard lookup, `unmanage` (also during an issuance), on-demand (policy,
   rate limit, back-off, threads asking for one name), failing storage (`storage_failed`), HTTP-01 through the solver and
-  middleware, TLS-ALPN-01 shared through storage, `checkPair` against wrong keys, uncovered names, expiry, a missing
+  middleware, TLS-ALPN-01 shared through storage, `checkPair` against wrong keys (EC and RSA, the RSA leaf's key in PKCS#8 and PKCS#1;
+  `src/testdata/manager_fixtures_rsa.zig`, `tools/gen_manager_fixtures.sh --rsa`), uncovered names, expiry, a missing
   CA, a wrong anchor and a future `notBefore`. `src/storage.zig`: one contract run against both backends (replace,
   delete, key validation, lock exclusivity / re-entry / expiry / release), `DirStorage` modes, a garbled lock, eight
   racing nodes on one stale lock with exactly one winner.
@@ -309,7 +310,6 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
   entries are never evicted today, and `maintain` scans them linearly.
 - **Suspended hosts:** `run()` sleeps on the awake clock in steps of at most an hour, so a suspended host renews late
   by up to an hour.
-- **Manager test gap:** an RSA PKCS#8 key pair through `checkPair`.
 - **Typed directory `meta`:** it is parsed into a `std.json.Value` (at most about 30-50x the 1 MiB body, bounded and
   freed); typing it would also change the deliberate tolerance of a `meta` of any shape, so it is not a small change.
 

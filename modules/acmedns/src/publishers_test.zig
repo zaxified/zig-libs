@@ -335,7 +335,7 @@ test "AcmeDns.register: the request, 200 and 201 accepted, anything else refused
     const url = try peer.url(&ub, "/");
     {
         var got = try publishers.AcmeDns.register(io, testing.allocator, url, httpOpts(), &.{});
-        defer got.deinit();
+        defer publishers.AcmeDns.deinitRegistration(&got);
         try testing.expectEqualStrings("p", got.value.password);
         try testing.expectEqualStrings("f.auth.test", got.value.fulldomain);
     }
@@ -686,4 +686,47 @@ test "Exec: argv of both modes, exit codes, stderr tail, timeout" {
     const mp = m.publisher();
     try testing.expectError(error.PublishFailed, mp.present(mp.ctx, &rec));
     try testing.expectEqualStrings("the program could not be started", m.note);
+}
+
+test "AcmeDns.deinitRegistration: the password is wiped before the arena goes back to the allocator" {
+    // ReleaseFast only (CONVENTIONS §2.1): in Debug/ReleaseSafe `free`
+    // scrubs a freed block itself, so a scanner sees nothing there.
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const FreeScanner = struct {
+        child: std.mem.Allocator,
+        needle: []const u8,
+        leaked: bool = false,
+        frees_seen: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (m.len >= self.needle.len) {
+                self.frees_seen += 1;
+                if (std.mem.find(u8, m, self.needle) != null) self.leaked = true;
+            }
+            self.child.rawFree(m, a, ra);
+        }
+    };
+    const password = "pbAXVjlIOE01xbut7YnAbkhMQIkcwoHO0ek2j4Q0";
+    const reply = "{\"username\":\"u\",\"password\":\"" ++ password ++ "\",\"fulldomain\":\"f.auth.test\",\"subdomain\":\"s\"}";
+    var scan: FreeScanner = .{ .child = testing.allocator, .needle = password };
+    var got = try publishers.AcmeDns.parseRegistration(scan.allocator(), reply);
+    try testing.expectEqualStrings(password, got.value.password);
+    publishers.AcmeDns.deinitRegistration(&got);
+    try testing.expect(scan.frees_seen >= 1);
+    try testing.expect(!scan.leaked);
 }

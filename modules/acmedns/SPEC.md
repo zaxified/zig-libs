@@ -83,7 +83,13 @@ acme-dns API key, basic auth — and send it only to the configured endpoint (no
 choice. The DNS answers this module reads (CNAME, SOA, NS, TXT) are unauthenticated: a spoofed
 answer can only misdirect where the record is published or make the wait end early or late — the
 CA validates on its own, so no certificate is issued on our word. `Exec` passes the record as
-argv, never through a shell.
+argv, never through a shell; in RAW mode that argv carries the key authorization, which any local
+user can read in `/proc/<pid>/cmdline` while the program runs (lego's RAW exec does the same). The
+key authorization is the token plus the account key's thumbprint — public by the time the CA
+validates, and no key material — so the exposure is a local observer learning the challenge early.
+`AcmeDns.register`'s password (the account's API key) is wiped from the reply body before it is
+freed and, through `AcmeDns.deinitRegistration`, from the result; a plain `Parsed.deinit` frees it
+unwiped, and the `http` client's buffers are not wiped.
 
 ## Anchoring
 
@@ -135,9 +141,6 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
 ## Backlog / deferred
 
 - **L2** `presentFn` maps `Canceled` to `SolverFailed` (acme's `SolverError` has no `Canceled`).
-- **N3** RAW `Exec` puts the key authorization in argv (visible in `/proc`, as lego RAW) — add a
-  threat-model sentence.
-- **N4** `AcmeDns.register`'s password is freed unwiped by `Parsed.deinit` — document.
 - **N5** publisher notes are not surfaced through the solver (`solver.note` says only that the publisher
   failed).
 - **Zone walks on hostile replies** are not fuzzed (only the `/register` reply and the TXT match are).

@@ -10,7 +10,7 @@ setup without a vendor API:
 | publisher | what it does | the same thing elsewhere |
 |---|---|---|
 | `Rfc2136` | RFC 2136 dynamic update to the zone's primary, TSIG-signed (`dns.update`, `dns.tsig`) | lego `rfc2136`, certbot `dns-rfc2136`; BIND, Knot, PowerDNS, Windows DNS |
-| `AcmeDns` | joohoi/acme-dns: `POST /update` with `X-Api-User`/`X-Api-Key`; `AcmeDns.register` for a new account | lego `acme-dns`, certbot `acme-dns-auth` |
+| `AcmeDns` | joohoi/acme-dns: `POST /update` with `X-Api-User`/`X-Api-Key`; `AcmeDns.register` for a new account (free it with `AcmeDns.deinitRegistration`, which wipes the key) | lego `acme-dns`, certbot `acme-dns-auth` |
 | `HttpReq` | `POST <endpoint>/present` and `/cleanup`, JSON `{fqdn, value}` or RAW `{domain, token, keyAuth}`, optional basic auth | lego `httpreq` |
 | `Exec` | runs `<program> present|cleanup <fqdn.> <value>` (or RAW `-- <domain> <token> <keyAuth>`), exit 0 = done | lego `exec` |
 

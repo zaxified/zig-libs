@@ -201,7 +201,10 @@ pub const AcmeDns = struct {
 
     /// `POST /register` — a new acme-dns account (lego registers on first
     /// use). `allow_from` is acme-dns's optional CIDR allow-list. The
-    /// strings are owned by the result; `deinit` it.
+    /// strings are owned by the result; free it with `deinitRegistration`,
+    /// which wipes the password (the account's API key) first. The reply
+    /// body is wiped before it is freed; the `http` client's own buffers are
+    /// not this module's to wipe.
     pub fn register(
         io: std.Io,
         gpa: std.mem.Allocator,
@@ -223,9 +226,20 @@ pub const AcmeDns = struct {
         // Bounded in time as well as size: `total_timeout_ms` ends at the head,
         // so a server that sends its head and stalls would park this call.
         const body = try res.readAllAllocTimeout(gpa, 64 * 1024, http_options.total_timeout_ms);
-        defer gpa.free(body);
+        defer {
+            std.crypto.secureZero(u8, body); // holds the password
+            gpa.free(body);
+        }
         if (res.status != 201 and res.status != 200) return error.RegistrationRefused;
         return parseRegistration(gpa, body);
+    }
+
+    /// Wipe the password of a `register` / `parseRegistration` result, then
+    /// free it (`std.json.Parsed.deinit` frees its arena unwiped).
+    pub fn deinitRegistration(parsed: *std.json.Parsed(Registration)) void {
+        // `.alloc_always`: the string lives in the result's own arena.
+        std.crypto.secureZero(u8, @constCast(parsed.value.password));
+        parsed.deinit();
     }
 
     /// The `/register` reply: four strings, anything else ignored. Hostile
