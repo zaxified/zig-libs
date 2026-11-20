@@ -21,9 +21,10 @@ encoding specification is a public specification (CONVENTIONS.md §5 merger doct
 entry); clean-room, no third-party source ported. The Python `protobuf` package is executed as a
 black-box compatibility oracle only, which CONVENTIONS.md §5 explicitly says needs no entry.
 
+
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date (scope re-assessed 2026-10-04 after `oneof`, `map` and the well-known types were built; rows not re-fetched). A protobuf user's yardstick is the
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. A protobuf user's yardstick is the
 whole toolchain (`protoc`, generated code, `.proto` grammar, JSON mapping); this module deliberately implements only the
 proto3 **wire format** with comptime-derived schemas, so the comparison is against each project's wire-format codec.
 
@@ -42,12 +43,11 @@ proto3 **wire format** with comptime-derived schemas, so the comparison is again
 bytes present, nesting cap, duplicate-field merge rule, UTF-8 enforcement, bounded memory, panicking (not asserting) size
 checks — with an oracle that runs the reference (Python `protobuf`) live in both directions plus a replayed corpus;
 opt-in unknown-field preservation that forwards byte-exact; an allocation-free `encodeInto`; ordinary Zig structs
-with the cardinality in the Zig type (no wrapper types, no generated code, no `protoc` dependency). Since 2026-10-04 a
+with the cardinality in the Zig type (no wrapper types, no generated code, no `protoc` dependency). A
 proto3 schema can be declared faithfully: `oneof` as a Zig tagged union, `map<K, V>` with the reference's duplicate-key
 rule, and the well-known types (Timestamp, Duration, Empty, wrappers, FieldMask, Any, Struct/Value/ListValue) as
-ordinary messages — each checked against the reference's bytes and parse verdicts. **Where we are behind** (re-checked
-2026-10-04): no `.proto` compiler or generator (a decision, see *Decisions*), no canonical JSON or text mapping, no
-proto2 (groups, extensions, required), no reflection/descriptors, no streaming decode.
+ordinary messages — each checked against the reference's bytes and parse verdicts. **Where we are behind:** no `.proto` compiler or generator (a decision, see *Decisions*), no canonical JSON or text mapping (*Backlog / deferred*), no
+proto2 (groups, extensions, required), no reflection/descriptors, no streaming decode (*What is deliberately not done*).
 
 ## Decisions
 
@@ -103,7 +103,7 @@ what it originally wrote.
 `reject_unknown_fields` exists for the opposite posture — a receiver that must not forward what it
 cannot validate.
 
-### `oneof` is a tagged union, and its members are fields of their own (2026-10-04)
+### `oneof` is a tagged union, and its members are fields of their own
 
 The Zig field is `?U`, `U` a `union(enum)` that declares `pb_fields` for its variants; the
 message's own `pb_fields` names the group with the marker `protobuf.oneof`. `schema.infos` turns
@@ -119,7 +119,7 @@ end like any other merged submessage; any other member in between resets that bu
 `c{x:1}, a=7, c{y:5}` reads `c{y:5}`. A message member is held by value (no boxing; a recursive
 type recurses through a slice, as `Struct`/`Value` do).
 
-### `map<K, V>` is a repeated entry message with two extra rules (2026-10-04)
+### `map<K, V>` is a repeated entry message with two extra rules
 
 The encoding spec defines a map's wire form as `repeated MapEntry { key = 1; value = 2; }`, so the
 codec needs no new wire path: `MapEntry(..)` is an ordinary message that declares
@@ -152,14 +152,15 @@ public because a gRPC framer needs exactly that number.
 The failure mode of two passes is that they disagree. It is made loud: the buffer is sized from
 pass one, every emitter write checks it fits, and pass two checks it filled the buffer
 **exactly**, so any divergence aborts in the first test that runs rather than emitting a truncated
-message. (Mutation M6 below confirms the check fires.)
+message.
 
-The checks are real `@panic`s (`wire.size_mismatch_message`), not `std.debug.assert`s — audit F8,
-2026-09-14. An assert does not exist in ReleaseFast/ReleaseSmall, where the same disagreement wrote
-past the buffer and died with SIGSEGV. Measured cost of the per-write check, ReleaseFast, a
-`Repeated` message with 1 024 varints and three strings, three runs of seven rounds each: best
-round 8 207–8 260 ns/op before, 8 327–8 359 ns/op after — about 1–2 %, inside the run-to-run
-spread (up to 6 % between runs).
+The checks are real `@panic`s (`wire.size_mismatch_message`), not `std.debug.assert`s. An assert does not
+exist in ReleaseFast/ReleaseSmall, where the same disagreement wrote past the buffer and died with SIGSEGV. The
+per-write check was measured at about 1–2 % of encode time in ReleaseFast, inside the run-to-run spread.
+
+### `encodeAlloc` caches submessage sizes only for deep messages
+
+The emit pass needs each nested submessage's size again, and recomputing it makes encoding O(depth squared). `encodeInto` (the allocation-free path) has nowhere to put a cache without an allocator and stays O(depth x fields); staying allocator-free is the reason the module has two encode entry points. `encodeAlloc`'s first sizing pass tracks the deepest nesting it saw (free: `depth` is already threaded through) and only at `size_cache_min_depth` (8, `encode.zig`) builds a `SizeTree`, one node per submessage, in a throwaway arena over its own `gpa`, freed before the function returns, and consults it during emit. Below the threshold emit recomputes as it always did, so a typical shallow gRPC message (depth 1 to 4) pays no extra allocation. Always caching was measured and rejected: it made depth 1 to 4 slower (the cache's own arena cost), crossing to a net win only around depth 8, which is the chosen threshold; deep messages gain several-fold at depth 16 and more beyond (about 25x at 255 levels). The figures are not repeated here; the card's Performance line is authoritative.
 
 ## Threat model
 
@@ -194,8 +195,7 @@ off-by-one boundary in both directions (a length one past the end fails; the exa
 Embedded messages recurse and the input decides how deep. `DecodeOptions.max_depth` (default 64;
 protoc's own is 100) caps it. About three bytes of input buy one stack frame, so a 7 KiB message
 is a 2000-deep recursive descent — the `hostile: the classic nesting bomb` test builds exactly
-that and requires `error.DepthExceeded`. Removing the cap turns that test into a segfault (mutation
-M7), which is the evidence that the cap is doing work rather than decorating the code.
+that and requires `error.DepthExceeded`. Without the cap that test segfaults, which is the evidence that the cap is doing work rather than decorating the code.
 
 The encoder is bounded by the same option for the same reason: a boxed self-recursive value built
 at run time can be arbitrarily deep.
@@ -247,14 +247,14 @@ Bullets 1 and 2 above stop a hostile *length* and a hostile *depth*. Neither sto
 be concatenated before decoding (`decode.zig`'s `MergeBuf`), and that concatenation happens again at
 every level a submessage is nested. A message with `k` parallel occurrences of the same field at
 each of `d` levels needs wire bytes proportional to `k + d` but arena bytes proportional to `k * d`
-— wave-3 audit finding `protobuf` F1 measured a *legal* 3.68 MiB message (comfortably under gRPC's
+— a measurement found a *legal* 3.68 MiB message (comfortably under gRPC's
 own 4 MiB default `max_recv_message_size`) driving the decode arena to 501.4 MiB, **136×**, and the
 ratio scales with `max_depth`.
 
 `DecodeOptions.max_arena_bytes` (default `default_max_arena_bytes`, 64 MiB) closes this the same way
 `max_depth` closes rule 2: a hard total on bytes the decode arena may be granted, checked on every
 allocation through a wrapping `CappedAllocator` (not just in `MergeBuf`, so it also covers the
-smaller, non-merge amplification the audit measured — packed scalars and empty repeated
+smaller, non-merge amplification the measurement showed — packed scalars and empty repeated
 submessages/strings widening 20–55× just from Zig's in-memory representation being wider than the
 wire form). Exceeding it surfaces as `error.OutOfMemory`, indistinguishable from a real allocator
 exhaustion — deliberately: a caller that already handles OOM handles this. `grpc`, the one in-repo
@@ -266,7 +266,7 @@ existing as a separate number an operator has to think about.
 Honesty about precision: the cap bounds bytes *requested from the arena*, not the arena's own
 backing allocation, which grows in geometrically-sized chunks and can therefore ask its parent
 allocator for somewhat more than the logical total once a chunk boundary is crossed mid-request —
-measured at roughly 1.5–1.6× in the reproduction above (a 64 MiB logical cap stopped an unbounded
+measured at roughly 1.5–1.6× in that reproduction (a 64 MiB logical cap stopped an unbounded
 attack at ~101 MiB of real backing memory, not exactly 64 MiB). That overhead is itself bounded (an
 arena's growth strategy cannot compound the way unmerged nesting depth did before this fix), so the
 result is still O(cap), not O(input) — the property that matters is that a small wire message can no
@@ -286,8 +286,7 @@ longer trade a small amount of attacker effort for an unbounded amount of memory
   on the tag's raw bytes (`_decoders_by_tag[tag_bytes]`), so a non-minimal tag never matches a
   known field there and is read as unknown — reading it by field number instead (this codec's old
   behaviour) let one byte string name two different fields to two readers, and for `proto3
-  optional` a different *presence* verdict too (wave-3 audit finding `protobuf` F3, 32/32 tested
-  variants disagreed with the reference). No conforming encoder, including this module's own,
+  optional` a different *presence* verdict too (32/32 tested variants disagreed with the reference). No conforming encoder, including this module's own,
   ever emits a non-minimal tag, so nothing legitimate is lost. ⚠ Honesty about scope: this was
   checked against the pure-Python reference only — `upb` (upstream C++) was not available to
   verify against, and reportedly dispatches by field number, which would agree with the old
@@ -304,13 +303,20 @@ longer trade a small amount of attacker effort for an unbounded amount of memory
 Two sweeps back the above: decoding every prefix of a valid message, and a byte-flip sweep over
 every offset x five patch values, both requiring a *typed error* and never a panic. In a Debug or
 `ReleaseSafe` build that is also an assertion that no safety check trips (CONVENTIONS.md §7.1).
+- **New-path costs.** Oneof gathering copies each payload at most once (a switch abandons the buffer in the capped arena, so the cost stays linear in the input); map dedupe allocates `5n` bytes through the cap; a `Struct`/`Value` document recurses only through messages, so `max_depth` bounds it on both sides; map keys of kind `string` are UTF-8-checked like any `string`. The encoder still does not validate UTF-8 (the documented asymmetry).
 
 ## Verification
+
+Run: `scripts/modtest protobuf` (`zig build test-protobuf`). The suite is hermetic: no python3, no subprocess, no skip path.
 
 Four layers, in increasing order of what they can prove.
 
 1. **Round trip.** Necessary, and close to worthless alone. The strongest defects in this format
-   are *consistent* between encoder and decoder and stay completely invisible to it.
+   are *consistent* between encoder and decoder and stay completely invisible to it: a zigzag
+   transform dropped on both sides, a negative `int32` not sign-extended, default packing turned
+   off all keep a self-round-trip green; only an outside implementation sees them, and for the
+   sign extension only the *byte-level* comparison does (the reference's own decoder reads the
+   wrong bytes back correctly). That is the argument for anchoring on bytes and not on values.
 2. **Golden bytes hand-derived from the spec** (`codec_test.zig`), including the canonical
    `08 96 01`, the ten-byte negative `int32`, zigzag vectors, little-endian fixed widths, and both
    packing forms.
@@ -329,25 +335,20 @@ Four layers, in increasing order of what they can prove.
      — packing flipped in both directions, and a message reassembled out of preserved unknown
      fields.
 
-   Since 2026-09-06 this layer is a PROGRAM, not a test: it is never built by `test-protobuf` and
-   never by `zig build`, so the module ships no foreign source and the suite needs no python3.
-   Before that it was `src/reference_interop.zig`, a test that spawned `python3` and skipped when
-   it was absent — which is every CI run, since nothing in this repository depends on a Python
-   package at build time. A skip is not a failure, but it is also not an anchor: the mess was paid
-   for and the evidence still might not be taken. It is now a pre-release check
-   (`zig build interop-protobuf`), whose findings reach every machine through layer 4.
-4. **Frozen reference bytes** (`golden_test.zig` + `testdata/golden_bytes.zig`, and
-   `interop_replay_test.zig` + `testdata/interop_vectors.zig`), which closes that gap. The bytes in
+   This layer is a PROGRAM, not a test: it is never built by `test-protobuf` and never by
+   `zig build`, so the module ships no foreign source and the suite needs no python3. It is a
+   pre-release check (`zig build interop-protobuf`, needs `pip install protobuf`), whose findings
+   reach every machine through layer 4; `zig build check-interop` compiles it so it cannot rot.
+4. **Frozen reference bytes** (`golden_test.zig` + `src/testdata/golden_bytes.zig`, and
+   `interop_replay_test.zig` + `src/testdata/interop_vectors.zig`). The bytes in
    `golden_bytes.zig` are not hand-derived — they are `msg.SerializeToString(deterministic=True)`
    output that the Python `protobuf` package actually produced, captured by
    `zig build interop-protobuf -- --capture` and committed. `interop_vectors.zig` is the other half:
    the reference's own parse of each non-canonical input, re-serialized canonically, so the packing
    flip, the `MergeFrom` rule and `string`-field UTF-8 rejection are replayed from a foreign
-   parser's verdict rather than re-checked against ourselves. Every
-   case in layer 3's tables is checked against them, both directions, with no subprocess and no
-   skip path: our encoder must reproduce the frozen bytes, and our decoder must recover the
-   matching value from them. This is what layer 3 degrades to when python3 or the package is
-   absent — the same external anchor, minus the ability to re-derive the bytes fresh each run. A
+   parser's verdict rather than re-checked against ourselves. Every case in layer 3's tables is
+   checked against them, both directions, with no subprocess and no skip path: our encoder must
+   reproduce the frozen bytes, and our decoder must recover the matching value from them. A
    comptime lookup (`@compileError` if a case has no frozen counterpart) and a count-canary test
    keep the two tables from silently drifting apart.
 
@@ -357,88 +358,24 @@ Four layers, in increasing order of what they can prove.
    the whole point was a foreign judgment call. `codec_test.zig` covers the same shapes offline via
    independently hand-derived bytes instead.
 
-### Mutation testing
+- **`oneof`, `map`, well-known types:** `src/testdata/core_vectors.zig` freezes the reference's bytes and parse verdicts (recipe `tools/gen_core_vectors.py`), replayed by `core_test.zig` without Python (`core_vectors.zig` also pins the oneof and map decode rules case by case). The live interop program does not cover them.
+- **Adversarial and sweeps:** `adversarial.zig` (4 GiB length claims, off-by-one boundaries, the nesting bomb, duplicate-field merge shapes); decoding every prefix of a valid message and a byte-flip sweep over every offset x five patch values, both requiring a typed error, never a panic.
+- **Fuzz:** `fuzz_test.zig`, deterministic driver `PROTOBUF_FUZZ=<runs>[,<seed>]` (testkit; 300 seeds run in every test run), over random maps/oneofs/`Struct` documents damaged at tags, lengths and duplicated fields: no crash, hang or leak, intact input round-trips byte for byte, every accepted input is a fixed point after one re-encode, no decoded map keeps a duplicate key.
+- **Differential rig:** `tools/README.md` describes the live side-by-side rig (`probe.zig`, `oracle.py`, the `camp*.py` campaigns) against the reference over well-formed and hostile bytes; not wired into `zig build`.
+- **ctgrind:** n/a, a data codec.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Each mutation was applied to the implementation, the suite run, and the source restored. Every one
-was caught; what matters is *by which layer*.
+## What is deliberately not done
 
-| # | Mutation | Caught by | Round trip alone? |
-|---|---|---|---|
-| M1 | zigzag transform dropped in **both** encoder and decoder | zigzag unit vectors, golden bytes, 3 reference tests | **NO — stayed green** |
-| M2 | negative `int32` not sign-extended (naive `i32`→`u32`, 5 bytes not 10) | golden bytes, 2 reference tests, 2 frozen-golden tests (`golden_test.zig`, needs no python) | **NO — stayed green** (the reference decoder truncates to 32 bits, so even *their* parser reads the right value back; only the byte comparison sees it) |
-| M3 | proto3 default packing turned off | schema derivation test, golden bytes, 2 reference tests | **NO — stayed green** |
-| M4b | one specific **non-default** scalar value wrongly treated as the default and omitted | golden bytes, 2 reference tests | no |
-| M5 | declared length allowed to overrun the buffer by one | off-by-one adversarial test; truncation sweep aborts | n/a |
-| M6 | unknown fields captured but never re-emitted | the two-pass size/emit assertion fires (3 tests abort) | n/a |
-| M6b | decoder never captures unknown fields | 3 unknown-field tests + the reference proxy test | n/a |
-| M7 | decoder depth cap removed | depth test fails; the nesting bomb **segfaults** | n/a |
-| M8 | decoder rejects the alternate packing form | "accepts both forms" test, repeated round trip, reference | partly |
-| M9 | fixed-width fields written big-endian | golden bytes, 2 round trips, 3 reference tests | yes |
+- **`.proto` compiler / code generator:** a separate project (decision, *Decisions*); consumers with existing `.proto` files hand-write structs plus `pb_fields`.
+- **Groups (wire types 3/4), proto2 extensions and `required`:** removed in proto3; groups are recognised and refused (*Decisions*).
+- **Descriptors/reflection.**
+- **Streaming decode:** the API takes a complete buffer. gRPC frames arrive length-prefixed, so the framing layer above this one is the natural place for it.
+- **Canonical JSON and text mapping:** deferred, see *Backlog / deferred*.
 
-M1, M2 and M3 are the point of the table: three real, shipping-grade defects that a complete
-self-round-trip suite passes with a clean conscience. Only an outside implementation sees them,
-and for M2 only the *byte-level* comparison does — the reference's own decoder is happy with the
-wrong bytes. That is the concrete argument for anchoring on bytes and not on values.
+## Backlog / deferred
 
-## Not implemented
-
-- ~~**`map<k, v>`**~~, ~~**`oneof`**~~, ~~**`Any` and the well-known types**~~ — done 2026-10-04 (see
-  *Decisions*).
-- **The canonical JSON mapping** (and with it the WKTs' JSON forms: RFC 3339 timestamps, `"1.5s"`
-  durations, `Struct` as an object, `Any` with `@type`) and the text format. A layer above the wire
-  format that needs per-field JSON names (`json_name`, lowerCamelCase), int64-as-string and base64
-  rules, enum names, and a resolver for `Any` — none of which the comptime schema carries today.
-- ~~A per-message size cache.~~ **Implemented 2026-09-15 for `encodeAlloc`, as a HYBRID (F6,
-  A1/protobuf.md; first cut reviewed and rejected by the coordinator for regressing the common
-  case, see below).** `encodeInto` (the allocation-free path — see encode.zig's module doc
-  comment) is unchanged and still O(depth × fields): it has nowhere to put a cache without an
-  allocator, and staying allocator-free is the entire reason this module has two encode entry
-  points. `encodeAlloc`'s first (allocation-free) sizing pass now also tracks the deepest nesting
-  it actually saw, for free (`depth` is already threaded through every recursive call); only once
-  that reaches `size_cache_min_depth` (8, the measured wash point below) does a `SizeTree` get
-  built at all — one node per submessage, in a throwaway arena over its own `gpa`, freed before
-  the function returns — and consulted during emit instead of recomputing. Below the threshold,
-  emit recomputes exactly as it always did, so a typical shallow gRPC message (depth 1–4) pays
-  what it always paid: zero extra allocation, zero extra arena.
-
-  **First cut (no threshold, always cached) — rejected.** Measured (ReleaseFast, `smp_allocator`,
-  interleaved A/B, min of 25 reps): a self-recursive chain 255 levels deep dropped from 3.45ms to
-  118µs (29×); at the module's own `max_depth` default (64, also `grpc.Stream.sendInner`'s),
-  213µs → 31µs (6.9×). But for shallow messages (depth 1–4, the common case for most gRPC traffic
-  and the confirmed hot path) the cache's own arena/allocation overhead made `encodeAlloc`
-  measurably SLOWER than before: depth 1 818ns → 950ns, depth 2 1078ns → 1587ns, depth 4 1860ns →
-  2481ns (reproduced across separate runs, not noise) — crossing to a net win only around depth
-  8. The coordinator's call: fixing a pathological case (depth 64+) at a guaranteed cost on the
-  common case (depth 1–4) is a bad trade for a hot path.
-
-  **Hybrid — measured against all three states (before F6 = `646d54a5`, F6-only = `1e818b21`,
-  hybrid), ReleaseFast, `smp_allocator`, interleaved, min of 9 reps, reproduced across two
-  separate runs:**
-
-  | depth | before (min) | F6-only (min) | hybrid (min) | hybrid/before | hybrid/F6-only |
-  |---:|---:|---:|---:|---:|---:|
-  | 1 | 948–1068 ns | 983–1142 ns | 940–1036 ns | **0.97–0.99×** | 0.91–0.96× |
-  | 2 | 1204–1336 ns | 1632–1940 ns | 1204–1345 ns | **1.00–1.01×** | 0.69–0.74× |
-  | 4 | 2024–2051 ns | 2585–2642 ns | 2046–2072 ns | **1.01×** | 0.78–0.79× |
-  | 8 | 4871–4986 ns | 4533–4649 ns | 4945–5000 ns | **1.00–1.02×** | 1.08–1.09× |
-  | 16 | 15539–15926 ns | 8657–8875 ns | 10364–10579 ns | 0.66–0.67× | 1.19–1.20× |
-  | 64 | 215760–222394 ns | 31698–32451 ns | 38917–39297 ns | 0.18× | 1.21–1.23× |
-  | 255 | 3.49–3.92 ms | 123.9–140.7 µs | 152.4–156.7 µs | 0.04× | 1.11–1.23× |
-
-  Depths 1–4 land within a percent or two of `before` — the regression is gone, not just
-  shrunk — while 16/64/255 stay dramatically faster than `before` (5.5×–25×) and within ~10–23%
-  of `F6-only`'s pure-cache cost (the difference is the hybrid's extra O(depth) probing pass,
-  cheap next to what it decides). Depth 8 (the threshold) sits at parity either way, as expected
-  at a boundary chosen to be a wash. Threshold picked from these numbers, not guessed: the
-  crossover in the first-cut data sat between depth 4 and depth 16, and depth 8 was where old and
-  new were within noise of each other.
-- **Self-review 2026-10-04 (new paths).** Oneof gathering copies each payload at most once
-  (a switch abandons the buffer in the capped arena, so the cost stays linear in the input); map
-  dedupe allocates `5n` bytes through the cap; a `Struct`/`Value` document recurses only through
-  messages, so `max_depth` bounds it on both sides; map keys of kind `string` are UTF-8-checked like
-  any `string`. The encoder still does not validate UTF-8 (the documented asymmetry).
-- **Streaming decode.** The API takes a complete buffer. gRPC frames arrive length-prefixed, so
-  the framing layer above this one is the natural place for that.
+- **Canonical proto3 JSON mapping** (and with it the well-known types' JSON forms: RFC 3339 timestamps, `"1.5s"` durations, `Struct` as an object, `Any` with `@type`) and the text format. zig-protobuf ships it (beta); gRPC-gateway and REST users need it. A layer above the wire format: the comptime schema carries no JSON names (`json_name`, lowerCamelCase), int64-as-string and base64 rules, enum names, or a resolver for `Any`, and JSON is a second codec over every kind with its own conformance suite. Effort large; `std.json` is in std (see also the sibling `jsonshape`).
 
 ## Anchoring
 
@@ -447,28 +384,9 @@ wrong bytes. That is the concrete argument for anchoring on bytes and not on val
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
+
 **What the tests actually contain.** codec goldens hand-transcribed from spec; python-protobuf oracle skips if missing
 
-**Note 2026-10-04:** `testdata/core_vectors.zig` adds frozen reference output for `oneof`, `map` and the well-known
+`src/testdata/core_vectors.zig` adds frozen reference output for `oneof`, `map` and the well-known
 types (bytes and parse verdicts, `tools/gen_core_vectors.py`); the replay needs no Python. The live interop program
-(`tools/interop.zig` + `tools/reference.py`, `zig build interop-protobuf`) is unchanged and does not cover them yet.
-
-**How it got there.** The anchoring work landed. DONE e080479: live python oracle frozen into committed goldens, survives CI
-
-## Backlog / deferred
-
-
-**Missing and it matters** *(survey 2026-09-30)* — the *Not implemented* section above already lists `map`, `oneof`, `Any`/WKT/JSON
-and streaming decode; the survey ranks them by what a typical protobuf user hits:
-
-**2026-10-04:** items 1–3 are done (see *Decisions*); item 4 stays deferred with the reason in *Not implemented* —
-the schema carries no JSON names, and JSON is a second codec over every kind with its own conformance suite; item 5 is
-decided (not this module). Mutation 2026-10-04: 24 mutants over the new code, all killed (three by the tests they asked
-for: two message members of one oneof, bool-key order, `Any` with a multi-segment URL).
-
-1. ~~**`oneof` (as a Zig tagged union)**~~ *(survey 2026-09-30)*: extremely common in real schemas (gRPC and API messages);
-   prost and nanopb both support it, and without it a message cannot be declared faithfully. Effort: medium (the SPEC says the hooks are small; presence interaction needs a test surface). Fits §2: yes.
-2. ~~**`map<k, v>` as a first-class kind**~~ *(survey 2026-09-30)*: common in configuration-style messages; workable today as a repeated message but the caller re-implements the map and its duplicate-key rule. Effort: medium. Fits §2: yes.
-3. ~~**Well-known types (`Timestamp`, `Duration`, `Empty`, `wrappers`, `Struct`) and `Any`**~~ *(survey 2026-09-30)*: needed to interoperate with almost any public Google-style API. Effort: small-medium each, as structs over the existing codec. Fits §2: yes.
-4. **Canonical proto3 JSON mapping** *(survey 2026-09-30)*: zig-protobuf ships it (beta); gRPC-gateway and REST users need it. Effort: large. Fits §2: yes (`std.json` is in std; see also sibling `jsonshape`).
-5. **A `.proto` → Zig struct generator on top of this module** *(survey 2026-09-30)*: **decided 2026-09-30 (user): not this module — a separate project.** a design decision in the SPEC, not a gap, but the survey's competitor list shows the whole Zig field ships one (zig-protobuf) and consumers with existing `.proto` files must hand-write structs plus `pb_fields`. Raised as a question in the report; no effort estimate committed.
+(`tools/interop.zig` + `tools/reference.py`, `zig build interop-protobuf`) does not cover them yet.

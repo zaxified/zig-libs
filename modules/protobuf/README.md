@@ -194,22 +194,23 @@ zig build interop-protobuf -- --capture    # re-freeze the fixtures from it
 `tools/interop.zig` builds descriptors at run time from `descriptor_pb2` + `descriptor_pool` +
 `message_factory` (no `.proto` file, no `protoc`), compares our bytes with the reference's byte for
 byte, decodes the reference's bytes with ours, and hands the reference shapes it would never emit
-itself. `--capture` writes what it observed into two committed fixtures — `testdata/golden_bytes.zig`
-(the reference's encoder output for all 36 canonical cases) and `testdata/interop_vectors.zig` (the
-reference's parser verdict on the 8 non-canonical byte strings) — and `golden_test.zig` +
+itself. `--capture` writes what it observed into two committed fixtures — `src/testdata/golden_bytes.zig`
+(the reference's encoder output for the canonical cases) and `src/testdata/interop_vectors.zig` (the
+reference's parser verdict on the non-canonical byte strings) — and `golden_test.zig` +
 `interop_replay_test.zig` replay both. `zig build check-interop` compiles the program without
 running it, so it cannot rot unnoticed.
 
-`tools/gen_core_vectors.py` (2026-10-04) freezes the reference's bytes and parse verdicts for
-`oneof`, `map` and the well-known types into `testdata/core_vectors.zig` (replayed by
+`tools/gen_core_vectors.py` freezes the reference's bytes and parse verdicts for
+`oneof`, `map` and the well-known types into `src/testdata/core_vectors.zig` (replayed by
 `core_test.zig`). `fuzz_test.zig` is a deterministic fuzz driver (`PROTOBUF_FUZZ=<runs>[,<seed>]`,
 testkit) over random maps/oneofs/`Struct` documents damaged at tags, lengths and duplicated
 fields: no crash, hang or leak, intact input round-trips byte for byte, every accepted input is a
 fixed point after one re-encode, no decoded map keeps a duplicate key. 300 seeds run in every
 test run.
 
-## Not implemented
+## Not provided
 
-Groups (wire types 3/4, removed in proto3), proto2 extensions and `required`, the canonical JSON
-and text mappings (including the well-known types' JSON forms), descriptors/reflection, streaming
-decode, and `.proto`-to-Zig code generation (a separate project, by decision). See SPEC.md for why each, and for the threat model.
+Groups (wire types 3/4, removed in proto3), proto2 extensions and `required`, descriptors/reflection,
+streaming decode, and `.proto`-to-Zig code generation (a separate project, by decision) are refused;
+the canonical JSON and text mappings (including the well-known types' JSON forms) are deferred. See
+SPEC.md *What is deliberately not done* and *Backlog / deferred* for why each, and for the threat model.
