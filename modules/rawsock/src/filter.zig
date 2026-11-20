@@ -627,6 +627,7 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     var p: Parser = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = @as(i32, @intCast(opts.link.headerLen())) - 14 };
     var ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
+    if (p.too_complex) return error.FilterTooComplex;
     // The ancillary form tells the kernel's metadata from the packet's tag, and
     // libpcap then shifts the later primitives' offsets by a run-time amount
     // (`ldx M[1]`): alone it is the plain form above, combined with other
@@ -641,6 +642,7 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
         p = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = 0, .live = true };
         ast = try p.parseExpr();
         if (try p.lex.peek() != null) return error.Syntax;
+        if (p.too_complex) return error.FilterTooComplex;
         live = p.dyn_used;
     }
 
@@ -1036,6 +1038,12 @@ const Parser = struct {
     /// bound stops `a and a and a ...` from growing the tree without limit.
     /// See sweep RS1.
     leaves: usize = 0,
+    /// `leaves` passed `max_insns`: parsing goes on (so a `Syntax` error further
+    /// on is still reported as `Syntax`) but builds no more nodes; `compileOpts`
+    /// returns `FilterTooComplex` once the whole expression has parsed.
+    too_complex: bool = false,
+    /// The one stand-in node every leaf past the cap returns.
+    cap_node: ?*const Node = null,
     opts: Options = .{},
     /// A `vlan` primitive was seen, and how many leaves it made.
     saw_vlan: bool = false,
@@ -1070,13 +1078,24 @@ const Parser = struct {
         return ptr;
     }
 
+    fn capNode(p: *Parser) !*const Node {
+        if (p.cap_node) |n| return n;
+        const n = try p.node(.{ .vlan_live = null });
+        p.cap_node = n;
+        return n;
+    }
+
     fn both(p: *Parser, kind: enum { @"and", @"or" }, l: *const Node, r: *const Node) !*const Node {
+        if (p.too_complex) return l;
         return p.node(if (kind == .@"and") .{ .@"and" = .{ l, r } } else .{ .@"or" = .{ l, r } });
     }
 
     fn t(p: *Parser, c0: Test) !*const Node {
         p.leaves += 1;
-        if (p.leaves > max_insns) return error.FilterTooComplex;
+        if (p.leaves > max_insns) {
+            p.too_complex = true;
+            return p.capNode();
+        }
         var c = c0;
         if (p.live_x and !c.fixed and !c.len and c.off < ancillary_base) {
             c.dyn = true;
@@ -1308,7 +1327,10 @@ const Parser = struct {
             // The first tag of a live program: kernel metadata or still in the frame
             // (run-time shift in M[0]); the primitives after it load through X.
             p.leaves += 1;
-            if (p.leaves > max_insns) return error.FilterTooComplex;
+            if (p.leaves > max_insns) {
+                p.too_complex = true;
+                return p.capNode();
+            }
             p.saw_vlan = true;
             p.live_x = true;
             return p.node(.{ .vlan_live = id });
@@ -2953,12 +2975,19 @@ test "Parser: the leaf cap sits exactly at max_insns terms (sweep audit GS-A2)" 
         @memcpy(src[0..2], "ip");
         for (0..n - 1) |i| @memcpy(src[2 + i * 7 ..][0..7], " and ip");
         var p: Parser = .{ .a = a, .lex = .{ .src = src } };
-        if (n == max_insns) {
-            _ = try p.parseExpr();
-        } else {
-            try testing.expectError(error.FilterTooComplex, p.parseExpr());
-        }
+        _ = try p.parseExpr();
+        try testing.expectEqual(n != max_insns, p.too_complex);
+        try testing.expectEqual(n, p.leaves);
     }
+}
+
+test "compile: a filter past the comparison cap is FilterTooComplex only if it parses, else Syntax" {
+    const gpa = testing.allocator;
+    const over = "ip" ++ strRepeat(" and ip", max_insns); // max_insns + 1 terms
+    try testing.expectError(error.FilterTooComplex, compile(gpa, over));
+    try testing.expectError(error.Syntax, compile(gpa, over ++ " and"));
+    try testing.expectError(error.Syntax, compile(gpa, over ++ " bogus"));
+    try testing.expectError(error.Syntax, compile(gpa, over ++ " or ("));
 }
 
 fn mk(code: u16, k: u32) BpfInsn {
