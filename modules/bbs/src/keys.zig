@@ -273,3 +273,36 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "a failed SecretKey.fromBytes / keyGen leaves the output zeroed, not holding whatever it held" {
+    var sk: SecretKey = undefined;
+    @memset(std.mem.asBytes(&sk), 0xaa);
+    const too_big: [SecretKey.encoded_bytes]u8 = @splat(0xff); // >= r
+    try testing.expectError(error.NonCanonical, SecretKey.fromBytes(&sk, &too_big));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk), 0));
+
+    @memset(std.mem.asBytes(&sk), 0xaa);
+    try testing.expectError(error.KeyMaterialTooShort, keyGen(&sk, "short", "", null));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk), 0));
+    @memset(std.mem.asBytes(&sk), 0xaa);
+    const big_info: [65536]u8 = @splat('a');
+    try testing.expectError(error.KeyInfoTooLong, keyGen(&sk, strRepeat("0", 32), &big_info, null));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk), 0));
+}
+
+test "keyGen: the derive-input bound is exact, and key_dst selects the hash-to-scalar domain" {
+    const material = strRepeat("k", 32);
+    const fits: [max_derive_input_len - 32 - 2]u8 = @splat('i');
+    _ = try testKeyGen(material, &fits);
+    const one_more: [max_derive_input_len - 32 - 2 + 1]u8 = @splat('i');
+    try testing.expectError(error.DeriveInputTooLong, testKeyGen(material, &one_more));
+
+    var by_default: SecretKey = undefined;
+    try keyGen(&by_default, material, "info", null);
+    var by_name: SecretKey = undefined;
+    try keyGen(&by_name, material, "info", cs.Sha256.keygen_dst);
+    var other: SecretKey = undefined;
+    try keyGen(&other, material, "info", "some other domain");
+    try testing.expectEqualSlices(u8, &testSkBytes(&by_default), &testSkBytes(&by_name));
+    try testing.expect(!std.mem.eql(u8, &testSkBytes(&by_default), &testSkBytes(&other)));
+}

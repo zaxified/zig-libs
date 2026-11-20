@@ -765,3 +765,140 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+fn testIpaStatement(gens: anytype, a: []const [32]u8, b: []const [32]u8, q: Ristretto255) !Ristretto255 {
+    const ip = try scalarvec.innerProduct(a, b);
+    const term_ab = try scalarvec.multiScalarMul(a, gens.g_vec);
+    const term_bh = try scalarvec.multiScalarMul(b, gens.h_vec);
+    return term_ab.add(term_bh).add(scalarvec.mulCt(q, ip));
+}
+
+test "verifyIpa: refuses an identity L or R even when the statement holds (zero witness)" {
+    // a = b = 0 makes every L and R the identity and P the identity: the
+    // equation holds, so only the identity refusal (dalek's) rejects it.
+    const generators = @import("generators.zig");
+    const gens = try generators.Generators.init(std.testing.allocator, 4);
+    defer gens.deinit(std.testing.allocator);
+    const zeros: [4][32]u8 = @splat(scalarvec.zero);
+    const q = gens.g;
+    var tp = Transcript.init(transcript_domain);
+    const proof = try proveIpa(std.testing.allocator, &tp, gens.g_vec, gens.h_vec, q, &zeros, &zeros);
+    defer proof.deinit(std.testing.allocator);
+    for (proof.l_vec, proof.r_vec) |l, r| {
+        try std.testing.expect(l.equivalent(scalarvec.identity_point));
+        try std.testing.expect(r.equivalent(scalarvec.identity_point));
+    }
+    var tv = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&tv, gens.g_vec, gens.h_vec, q, scalarvec.identity_point, proof));
+
+    // Only L identity / only R identity: a proof whose witness makes one of
+    // the two vanish in round 0 (a_lo = b_hi = 0 -> L = c_L*Q with c_L = 0;
+    // R involves a_hi, b_lo which are non-zero).
+    var a = [_][32]u8{ scalarvec.zero, scalarvec.zero, scalarvec.one, scalarvec.two };
+    var b = [_][32]u8{ scalarvec.one, scalarvec.two, scalarvec.zero, scalarvec.zero };
+    const p = try testIpaStatement(gens, &a, &b, q);
+    var tp2 = Transcript.init(transcript_domain);
+    const proof2 = try proveIpa(std.testing.allocator, &tp2, gens.g_vec, gens.h_vec, q, &a, &b);
+    defer proof2.deinit(std.testing.allocator);
+    try std.testing.expect(proof2.l_vec[0].equivalent(scalarvec.identity_point));
+    try std.testing.expect(!proof2.r_vec[0].equivalent(scalarvec.identity_point));
+    var tv2 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&tv2, gens.g_vec, gens.h_vec, q, p, proof2));
+    // Swap the roles: b_lo = a_hi = 0 makes R the identity.
+    a = .{ scalarvec.one, scalarvec.two, scalarvec.zero, scalarvec.zero };
+    b = .{ scalarvec.zero, scalarvec.zero, scalarvec.one, scalarvec.two };
+    const p3 = try testIpaStatement(gens, &a, &b, q);
+    var tp3 = Transcript.init(transcript_domain);
+    const proof3 = try proveIpa(std.testing.allocator, &tp3, gens.g_vec, gens.h_vec, q, &a, &b);
+    defer proof3.deinit(std.testing.allocator);
+    try std.testing.expect(proof3.r_vec[0].equivalent(scalarvec.identity_point));
+    try std.testing.expect(!proof3.l_vec[0].equivalent(scalarvec.identity_point));
+    var tv3 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&tv3, gens.g_vec, gens.h_vec, q, p3, proof3));
+}
+
+test "verifyIpa: an honest proof verifies, and a changed P, a, b, L or R does not" {
+    const generators = @import("generators.zig");
+    const gens = try generators.Generators.init(std.testing.allocator, 4);
+    defer gens.deinit(std.testing.allocator);
+    const a = [_][32]u8{ scalarvec.one, scalarvec.two, .{3} ++ @as([31]u8, @splat(0)), .{5} ++ @as([31]u8, @splat(0)) };
+    const b = [_][32]u8{ .{7} ++ @as([31]u8, @splat(0)), scalarvec.one, .{9} ++ @as([31]u8, @splat(0)), scalarvec.two };
+    const q = gens.g;
+    const p = try testIpaStatement(gens, &a, &b, q);
+    var tp = Transcript.init(transcript_domain);
+    var proof = try proveIpa(std.testing.allocator, &tp, gens.g_vec, gens.h_vec, q, &a, &b);
+    defer proof.deinit(std.testing.allocator);
+    const l0 = proof.l_vec[0];
+    const r1 = proof.r_vec[1];
+    var t0 = Transcript.init(transcript_domain);
+    try std.testing.expect(verifyIpa(&t0, gens.g_vec, gens.h_vec, q, p, proof));
+
+    var t1 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t1, gens.g_vec, gens.h_vec, q, p.add(gens.g), proof));
+    const keep = proof;
+    proof.a = scalar.add(keep.a, scalarvec.one);
+    var t2 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t2, gens.g_vec, gens.h_vec, q, p, proof));
+    proof = keep;
+    proof.b = scalar.add(keep.b, scalarvec.one);
+    var t3 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t3, gens.g_vec, gens.h_vec, q, p, proof));
+    proof = keep;
+    proof.l_vec[0] = proof.l_vec[0].add(gens.g);
+    var t4 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t4, gens.g_vec, gens.h_vec, q, p, proof));
+    proof.l_vec[0] = l0;
+    proof.r_vec[1] = proof.r_vec[1].add(gens.g);
+    var t5 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t5, gens.g_vec, gens.h_vec, q, p, proof));
+    proof.r_vec[1] = r1;
+
+    // Shapes: each vector-length guard, one at a time.
+    var t6 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t6, gens.g_vec, gens.h_vec[0..3], q, p, proof));
+    var t7 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t7, gens.g_vec[0..3], gens.h_vec[0..3], q, p, proof));
+    var short_l = proof;
+    short_l.l_vec = proof.l_vec[0..1];
+    var t8 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t8, gens.g_vec, gens.h_vec, q, p, short_l));
+    var short_r = proof;
+    short_r.r_vec = proof.r_vec[0..1];
+    var t9 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t9, gens.g_vec, gens.h_vec, q, p, short_r));
+    // A width that is not a power of two (n = 3, one round): refused, not folded.
+    var one_round = proof;
+    one_round.l_vec = proof.l_vec[0..1];
+    one_round.r_vec = proof.r_vec[0..1];
+    var t11 = Transcript.init(transcript_domain);
+    try std.testing.expect(!verifyIpa(&t11, gens.g_vec[0..3], gens.h_vec[0..3], q, p, one_round));
+    var t10 = Transcript.init(transcript_domain);
+    try std.testing.expect(equationSides(&t10, gens.g_vec, gens.h_vec, &[_][32]u8{ scalarvec.one, scalarvec.one, scalarvec.one }, q, p, proof) == null);
+}
+
+test "proveIpa: each of the three length relations is checked on its own" {
+    const generators = @import("generators.zig");
+    const gens = try generators.Generators.init(std.testing.allocator, 4);
+    defer gens.deinit(std.testing.allocator);
+    const four: [4][32]u8 = @splat(scalarvec.one);
+    var t = Transcript.init(transcript_domain);
+    // a != b
+    try std.testing.expectError(error.LengthMismatch, proveIpa(std.testing.allocator, &t, gens.g_vec, gens.h_vec, gens.g, &four, four[0..2]));
+    // a != g (and b == a)
+    try std.testing.expectError(error.LengthMismatch, proveIpa(std.testing.allocator, &t, gens.g_vec[0..2], gens.h_vec[0..2], gens.g, &four, &four));
+    // g != h
+    try std.testing.expectError(error.LengthMismatch, proveIpa(std.testing.allocator, &t, gens.g_vec, gens.h_vec[0..2], gens.g, &four, &four));
+    // a == b == g == h but not a power of two, and empty.
+    const three: [3][32]u8 = @splat(scalarvec.one);
+    try std.testing.expectError(error.NotPowerOfTwo, proveIpa(std.testing.allocator, &t, gens.g_vec[0..3], gens.h_vec[0..3], gens.g, &three, &three));
+    try std.testing.expectError(error.NotPowerOfTwo, proveIpa(std.testing.allocator, &t, gens.g_vec[0..0], gens.h_vec[0..0], gens.g, four[0..0], four[0..0]));
+}
+
+test "InnerProductProof.fromBytesAlloc: 31 rounds decode, 32 do not (dalek's bound)" {
+    const rounds_ok = 31;
+    const buf: [(2 * 32 + 2) * 32]u8 = @splat(0); // identity points, zero scalars (canonical)
+    const ok_len = (2 * rounds_ok + 2) * 32;
+    const p = try InnerProductProof.fromBytesAlloc(std.testing.allocator, buf[0..ok_len]);
+    p.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, &buf));
+}

@@ -543,3 +543,45 @@ test "multiScalarMulVartime: length mismatch rejected" {
     const points = [_]Ristretto255{g};
     try std.testing.expectError(error.LengthMismatch, multiScalarMulVartime(&scalars, &points));
 }
+
+test "hadamard/addVec/subVec/scaleVec: each length guard refuses on its own" {
+    const a3: [3][32]u8 = @splat(one);
+    const b3: [3][32]u8 = @splat(two);
+    var out3: [3][32]u8 = undefined;
+    var out2: [2][32]u8 = undefined;
+    const a2 = a3[0..2];
+    // out and a agree, b differs; then out differs, a and b agree.
+    try std.testing.expectError(error.LengthMismatch, hadamard(&out2, a2, &b3));
+    try std.testing.expectError(error.LengthMismatch, hadamard(&out3, &a3, b3[0..2]));
+    try std.testing.expectError(error.LengthMismatch, hadamard(&out2, &a3, &b3));
+    try std.testing.expectError(error.LengthMismatch, addVec(&out2, a2, &b3));
+    try std.testing.expectError(error.LengthMismatch, addVec(&out3, &a3, b3[0..2]));
+    try std.testing.expectError(error.LengthMismatch, addVec(&out2, &a3, &b3));
+    try std.testing.expectError(error.LengthMismatch, subVec(&out2, a2, &b3));
+    try std.testing.expectError(error.LengthMismatch, subVec(&out3, &a3, b3[0..2]));
+    try std.testing.expectError(error.LengthMismatch, subVec(&out2, &a3, &b3));
+    try std.testing.expectError(error.LengthMismatch, scaleVec(&out2, &a3, two));
+    try std.testing.expectError(error.LengthMismatch, scaleVec(&out3, a2, two));
+}
+
+test "multiScalarMulVartime: 256-bit scalars (top bits set) at every window width agree with the naive sum" {
+    // The bucket loop must cover bit 255 for every window width, not only
+    // for scalars below L < 2^253 (the callers' usual range).
+    var pts: [400]Ristretto255 = undefined;
+    var sc: [400][32]u8 = undefined;
+    var p = Ristretto255.basePoint;
+    for (&pts, &sc, 0..) |*pt, *s, i| {
+        pt.* = p;
+        p = p.dbl().add(Ristretto255.basePoint);
+        s.* = @splat(0xff);
+        s[0] = @truncate(i);
+        s[31] = 0x80 | @as(u8, @truncate(i >> 1));
+    }
+    // 16 -> window 3, 40 -> 4, 100 -> 5, 400 -> 6.
+    for ([_]usize{ 16, 40, 100, 400 }) |n| {
+        var want = identity_point;
+        for (sc[0..n], pts[0..n]) |s, pt| want = want.add(mulCt(pt, s));
+        const got = try multiScalarMulVartime(sc[0..n], pts[0..n]);
+        try std.testing.expect(got.equivalent(want));
+    }
+}

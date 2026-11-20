@@ -6,7 +6,7 @@
 
 **Scope:** core — draft-irtf-cfrg-bbs-signatures -12 and zkryptium (draft-10) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the pin moved to -12 and the SHAKE-256 suite landed, both suites byte-exact on the draft's vectors)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 (19/19) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (133/136, 1 eq) · src 13f4108587f2da69
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify oracles at scale 200 = 1,000 runs each (a sign or proof plus up to five pairing checks per run), BBS_FUZZ) · ct 2026-10-06 (ctgrind)
 
@@ -174,6 +174,14 @@ Every line below holds for both suites (the §8.3/D.1 vectors mirror §8.4/D.2).
   `bbs-proof` (decoders), `bbs-sign-verify`, `bbs-proof-verify`.
 - **Stack hygiene:** `src/stackprobe_test.zig` (ReleaseFast) fails when a secret body outgrows its burn.
 - **Constant time:** `scripts/checks/ctgrind.sh bbs` (`src/ctgrind_harness.zig`): `sign` and `proofgen` rows.
+- **Mutation:** whole module, 136 mutants over `bbs.zig`, `ciphersuite.zig` and `keys.zig` (every challenge, domain
+  and `e` absorption, `computeB`, the `proofVerifyInit` terms, the `proofGen` blinding and response algebra, the
+  verify and proofVerify pairing inputs, each index, count and length guard, the codecs, `keyGen`): 133 killed,
+  1 equivalent, 2 unobservable. The tests added for it: a zero `m^` and a zero `c` in a proof, a failed
+  `SecretKey.fromBytes` / `keyGen` leaving the output zeroed, the exact `keyGen` derive-input bound, and `key_dst`
+  selecting the hash-to-scalar domain. Equivalent: the MSM crossover (`msmLoop` and Pippenger give the same
+  point; the F4 oracle pins it). Unobservable: `sign` accepting an identity `A` and `keyGen` accepting a zero key
+  (each needs a hash or a message set that lands on a discrete-log relation, probability about `2^-255`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 

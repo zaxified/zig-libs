@@ -6,7 +6,7 @@
 
 **Scope:** parity — RFC 9497 as implemented by CIRCL `oprf` and facebook/voprf: all five §4 ciphersuites × OPRF/VOPRF/POPRF, batched proofs and batch finalize, per-role client/server objects (surveyed 2026-09-30, gaps closed 2026-11-13); left out with a reason: an internal RNG (module policy, caller-supplied randomness), serde-style encodings beyond the RFC's byte strings
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (251/256, 3 eq) · src d7146c378f5aae65
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 21/19/6 and p256 59/27/12 since the sibling fixes (ed448 `Fe.ctSelect`, p256 `isBasePointRepr`; were 38/34/9 and 61/29/12), what remains is verdicts, the siblings' canonical-range decode verdicts on values that always pass, and on the server the variable-time `mulPublic` on the public composite scalars; p384 30/15/3, p521 26/7/3 the same; the NIST hash-to-curve selects with the siblings' laundered `Fe.cMov` (p256, p521) and its own laundered byte select for p384; itemised in `scripts/checks/ctgrind-expected.tsv`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert)
 **Performance:** ref 0.18–0.86× CIRCL v1.6.1 `oprf` (stand-in for RFC 9497, whose reference is Sage; 4 suites × OPRF/VOPRF/POPRF, batch 1; POPRF blind and finalize counted as their sum, see § Performance; no decaf448 in CIRCL) · fastest ? (measured 2026-11-14)
@@ -282,6 +282,24 @@ Run: `scripts/modtest voprf`. Tests sit beside the code (`kat_test.zig`, `suite_
 - **Constant time:** `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh voprf`, 15 targets
   (5 suites × server/client/keygen); the pinned table is `scripts/checks/ctgrind-expected.tsv` and the
   card's Hardening line summarises it. The ristretto255 multiply itself is checked in `ct25519`.
+- **Edge tests** (`edge_test.zig`): the generic layer over a toy prime-order group (`Toy`: integers mod `2^61 - 1`,
+  not secure, only algebraically a group) so a 65 535-element batch is cheap and a test decides what the hashes
+  return: the batch bound is exact (65 535 proves and verifies, 65 536 is refused with the outputs untouched), a
+  `HashToGroup` that lands on the identity, `DeriveKeyPair` through counter 255 and its zero-key refusal, an empty or
+  mismatched proof batch, every batch finalizer's length checks one argument at a time, a 65 536-byte batch
+  input or `finalizePoprfUnverified` info; and per suite: `wipe` zeroes the key in every role, the identity is refused
+  on decode, a zero public multiple is an error, a degenerate encode is all zero, NIST prefixes other than
+  `0x02`/`0x03` are refused.
+- **Mutation:** whole module, 256 mutants over `protocol.zig`, `groups.zig`, `h2c.zig` and the ristretto255 expander in
+  `root.zig` (every hash-input part of the DLEQ seed, composite, challenge, finalize and `DeriveKeyPair` framings,
+  both composite computations, prover and verifier, each length and bound check, the wipes, the group backends'
+  scalar and decode paths, the XMD/XOF expanders and the simplified-SWU map statement by statement): 251 killed,
+  3 equivalent, 2 unobservable. Equivalent: the non-canonical-`c` check in `verifyProof` (the recomputed challenge is
+  canonical, so a non-canonical `c` fails the comparison anyway), the NIST `0x02`/`0x03` prefix check (the sibling's
+  `fromSec1` refuses every other prefix) and the NIST identity check after it (a decoded compressed point is never
+  the identity). Unobservable: the two `expandMessageXmd` DST-length panics (a Zig test cannot expect a panic).
+  The `burn.zig` constants and the `secureZero` calls on dead stack are not mutated here: only the ReleaseFast
+  stack probe observes them.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
 

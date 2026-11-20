@@ -6,7 +6,7 @@
 
 **Scope:** core — dalek-cryptography/bulletproofs, single and aggregated proofs, batch verification (surveyed 2026-09-30, aggregation and batching 2026-10-02)
 
-**Audit:** review 2026-09-15 · mutation 2026-10-02 (14/15, 1 eq) · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-20 (321/337, 13 eq) · src 0c9734dec9d9e93c
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BULLETPROOFS_FUZZ; rp-decode at 1/4, prove-verify at 1/40 of it) · ct 2026-09-15 (ctgrind)
 
@@ -344,9 +344,22 @@ cannot see an error both sides share.
   in-file; see *Caveats*.
 - **Dead stack:** `stackprobe_test.zig` asserts zero residue for `v`, `v_bytes`, `gamma`, `z^2*gamma` and every
   random scalar `prove` drew, beside a negative and a positive control.
-- **Mutation:** schemata runs over the aggregation code and over `verifyBatch` (coefficients, weights,
-  shape and replay checks); survivors were killed by new tests or are equivalent (the `m`-is-a-power-of-two
-  check in `verifyMultiple` is defence in depth: `ipa.equationSides` refuses such a length on its own).
+- **Mutation:** whole module, 337 mutants over `rangeproof.zig`, `ipa.zig`, `transcript.zig`, `scalarvec.zig` and
+  `generators.zig` (every transcript absorption in the prover, the verifier and the batch replay, the range-proof
+  relation terms, the `P` reconstruction, the batch coefficients and weights, the IPA fold, the codecs and every
+  shape guard): 321 killed, 13 equivalent, 3 unobservable. The tests added for it: a scripted `std.Io` that makes
+  `S`, `T_1` or `T_2` an identity point in an otherwise valid proof (`verifyMultiple` and `verifyBatch` must refuse
+  it), a draw-count test for the prover's blinding, an IPA statement whose witness makes `L` or `R` the identity,
+  standalone `verifyIpa` tamper and shape tests, each `proveIpa` length relation on its own, the 31/32-round
+  decoder bound, the `verifyBatch` generator-set and width guards, and a 256-bit-scalar Pippenger differential at
+  every window width. The 13 equivalent ones: the `l_vec`/`r_vec` length check in `verifyMultiple`, the `n == 0` and
+  `n`/`m`-is-a-power-of-two checks in `verifyMultiple`, the `n == 0` and `m == 0` checks in `verifyBatch`, the empty-batch
+  short cut, `equationSides`' `n == 0`, `RangeProof.fromBytesAlloc`'s `<` on the fixed length (the nested decoder
+  refuses an empty tail), the unused STROBE `K` flag, and the two cost-only Pippenger mutants (the `n == 0` return
+  and the below-16-terms crossover). In each case a second check or an identical result sits behind the removed one.
+  The 3 unobservable: an identity `A` (in `verifyMultiple` and `verifyBatch`; a valid proof with `A = O` would
+  give a discrete-log relation among the NUMS generators) and `verifyBatch` ignoring `replayChallenges`' identity
+  refusal (a valid range proof with an identity `L`/`R` cannot be made; the unrefused replay leaves the challenges undefined and the equation fails).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred

@@ -290,6 +290,7 @@ test {
     _ = @import("h2c_test.zig");
     _ = @import("suite_kat_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("edge_test.zig");
 }
 
 test "wire sizes match RFC 9497 §4.1" {

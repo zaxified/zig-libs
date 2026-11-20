@@ -1952,3 +1952,22 @@ test "bench (opt-in via BBS_BENCH): computeB-shape loop vs Pippenger MSM crossov
         std.debug.print("{d:>6} | {d:>14} | {d:>14} | {s:>8}\n", .{ n, loop_ns, pip_ns, if (pip_ns < loop_ns) "MSM" else "loop" });
     }
 }
+
+test "Proof.fromBytes refuses a zero m^ and a zero c, as it does a zero e^/r1^/r3^" {
+    const kp = try testKeyPair();
+    const messages = [_][]const u8{ "a", "b", "c" };
+    const sig = try sign(testing.allocator, &kp.sk, kp.pk, "h", &messages);
+    const random_scalars = cs.mockedRandomScalars(7, "zero scalar refusals");
+    const proof = try proofGen(testing.allocator, kp.pk, &sig, "h", "", &messages, &.{0}, &random_scalars);
+    defer testing.allocator.free(proof);
+    (try Proof.fromBytes(testing.allocator, proof)).deinit(testing.allocator);
+    const bad = try testing.allocator.dupe(u8, proof);
+    defer testing.allocator.free(bad);
+    const head = Proof.floor_bytes - Fr.encoded_bytes; // everything before the m^ vector, c excluded
+    // Two undisclosed messages: m^ at `head`, `head + 32`; c is the last scalar.
+    for ([_]usize{ head, head + Fr.encoded_bytes, bad.len - Fr.encoded_bytes }) |off| {
+        @memcpy(bad, proof);
+        @memset(bad[off..][0..Fr.encoded_bytes], 0);
+        try testing.expectError(error.InvalidProofEncoding, Proof.fromBytes(testing.allocator, bad));
+    }
+}
