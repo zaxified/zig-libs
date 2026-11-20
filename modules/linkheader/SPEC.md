@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -48,7 +48,7 @@ ext-values are refused (RFC 8187 reserves them). Built since the survey: every p
 - **Allocation-free both ways.** The builder writes into a caller buffer (`bufPrint`) or any
   `*std.Io.Writer` (`write`); the parser is a forward-only `Iterator` whose yielded `Link`s borrow
   the input header (string fields point into it — the header must outlive them). Reentrant, no
-  shared state. Clean-room from RFC 8288 (Web Linking) — see NOTICE.
+  shared state. Clean-room from RFC 8288 (Web Linking) — see the README's `Provenance:` line.
 - **Modelled param set:** `rel` (required), `anchor`, `title`, `title*` (`title_star`, raw
   ext-value), `type`, `hreflang`, `media`; first occurrence of each wins (RFC 8288 §3.3/§3.4).
   **Every** param — modelled, unknown or repeated (`hreflang` may legally repeat) — is reachable on a
@@ -61,7 +61,7 @@ ext-values are refused (RFC 8187 reserves them). Built since the survey: every p
   RFC 8187 ext-value. The parser tracks escapes while scanning (so a quoted `,`/`;`/`>` never ends a
   link early) but returns the quoted content verbatim, escapes included, with `Param.quoted` set;
   `unquote(out, value)` removes them (in place allowed; a lone trailing `\` is dropped).
-- **Builder refusals (`error.InvalidLink`, breaking error-set change 2026-10-04).** Checked by
+- **Builder refusals (`error.InvalidLink`).** Checked by
   `validate` before any byte of that link — not even its `", "` separator — is written: empty `rel`;
   a URI byte that is a control, SP, DEL, `<`, `>` or `"` (none is legal in a URI-Reference, `>`
   would end it, CR/LF would split the header); a quoted value with a control byte other than HTAB
@@ -100,75 +100,54 @@ concerns; every scan is linear in the header and bounded by it.
 
 ## Verification
 
-Build: single link, multiple joined with `", "`, all optional params in order, quote/backslash
-escaping, `NoSpaceLeft` on a tiny buffer, growable writer. Parse: single and multi links with all
-params, bare-token values, surrounding/inter-token whitespace, commas inside the URI and
-commas+semicolons inside quoted values (no early split), unknown params without desync,
-first-occurrence-wins, case-insensitive names, malformed-segments-skipped, empty/whitespace input,
-unterminated `<`. A build→parse round-trip, and `find`/`pagination` coverage (incl. a rel-list
-token match). Run: `zig build test-linkheader`.
+Run: `scripts/modtest linkheader`; the fuzz driver is `LINKHEADER_FUZZ=<runs>[,<first seed>]` (testkit's
+deterministic driver, harnesses `linkheader-parse`, `linkheader-roundtrip`, `linkheader-helpers`; never
+`zig build --fuzz`).
 
-**2026-10-04 (mvp → core).** RFC 8187 §3.2.3's three ext-value examples and RFC 8288 §3.5's
-`title*` example (both fetched from rfc-editor.org; the decoded texts are the RFCs' own readings,
-cross-checked through Python's `email.utils.decode_rfc2231` + `urllib.parse.unquote` as a black
-box) decode, and `encodeExtValue` reproduces RFC 8187's encodings; all 42 rows of RFC 3986 §5.4.1
-and §5.4.2 resolve (Python's `urljoin`, driven as a black box over the same table, agrees on 41
-and takes the non-strict reading on `http:g`, which §5.4.2 allows only for backward
-compatibility); one test per refused builder byte class (`>`, `<`, `"`, SP in a URI; CR, LF, NUL,
-DEL, ESC in a quoted value; malformed ext-values; bad names) checks that nothing of the refused link
-reaches the writer, with positive controls that the same links without the bad byte round-trip.
-**Seeded corrupt-input sweep** (deterministic PRNG, always on, ~0.1 s): 20 000 headers built from
-grammar pieces and then damaged (separators, quotes, escapes, CR/LF, random bytes, truncation)
-must terminate, borrow every slice from the input, and survive `params()`, `unquote`,
-`decodeExtValue`, `preferredTitle` and `resolve`; reach is pinned (measured: 11 414 links, 30 732
-params, 10 580 quoted, 2 886 with escapes, 1 900 ext-values decoded / 20 585 refused). Its oracle
-half builds 3 000 random valid links (separators, quotes, backslashes, HTAB, UTF-8 `title*`) twice
-per header and requires every field back equal through `unquote`/`decodeExtValue`.
-**Mutation 2026-10-04:** 41 mutants (schemata, ReleaseSafe), 34 killed by the existing and new
-tests, 7 survived: 6 killed by tests added with a stated reason (a lone `*` is a token; repeated
-`anchor` keeps the first; `preferredTitle` on a short buffer errs; an escaped quote inside a skipped
-segment; an empty name is no param; a non-hex `%zz` ext-value is refused by the builder), 1
-equivalent (testing for the link's own `,` before resyncing — `skipToNextLink` at a `,` consumes
-exactly it), so that branch was removed.
+- **Build:** single link, several joined with `", "`, all optional params in order, `extra` params, quote and
+  backslash escaping, `NoSpaceLeft` on a tiny buffer, a growable writer; one test per refused byte class (`>`, `<`,
+  `"`, SP in a URI; CR, LF, NUL, DEL, ESC in a quoted value; malformed ext-values; bad `extra` names) checks that
+  `error.InvalidLink` is returned and nothing of the refused link reaches the writer, with positive controls that
+  the same links without the bad byte write and parse back; a lone `*` is an ordinary token name.
+- **Parse:** single and multi links with all params, bare-token values, whitespace, commas inside the URI and
+  commas/semicolons inside quoted values (no early split), unknown params without desync, first occurrence wins
+  (also for `anchor`), case-insensitive names, malformed segments skipped (including an escaped quote inside a
+  skipped segment), empty and whitespace-only input, an unterminated `<`; `params()` over every param in header
+  order with repeats, the raw region stopping at the link's own comma, an empty name is no param.
+- **Round trip and helpers:** build then parse; `find` (including a rel-list token match); `pagination`; `unquote`;
+  `preferredTitle` (title* preferred, title the fallback, a too-small buffer is an error); `decodeExtValue`
+  refusals and `encodeExtValue`'s upper-case hex.
+- **Oracles (external):** RFC 8288 §3.5's own worked `Link:` examples transcribed byte-for-byte (see Anchoring);
+  RFC 8187 §3.2.3's three ext-value examples and RFC 8288 §3.5's `title*` example, decoded and re-encoded;
+  all 42 rows of RFC 3986 §5.4.1/§5.4.2 through `resolve` (Python's `urljoin` as a black box agrees on all but
+  `http:g`, where it takes the non-strict reading §5.4.2 allows only for backward compatibility).
+- **Seeded corrupt-input sweep** (deterministic PRNG, always on, sub-second): thousands of headers built from
+  grammar pieces and then damaged (separators, quotes, escapes, CR/LF, random bytes, truncation) must terminate,
+  borrow every slice from the input and survive `params()`, `unquote`, `decodeExtValue`, `preferredTitle` and
+  `resolve`; its reach is pinned. Its oracle half builds random valid links twice per header and requires every
+  field back equal through `unquote`/`decodeExtValue`.
+- **Fuzz:** the parse harness lives in `src/root.zig` beside its corpus; `src/fuzz_test.zig` holds the shared
+  plumbing, the round-trip oracle (what `write` issued parses back to the same links) and the RFC 8187 / RFC 3986
+  helper harness; every test run replays a fixed seed loop with reach checks.
+- **Constant time:** n/a — nothing is secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-**External anchor:** five fixtures are transcribed byte-for-byte from RFC 8288 §3.5's own worked
-`Link:` examples (fetched from rfc-editor.org, not recalled from memory), with expected `rel`/`title`
-readings taken from the RFC's own prose — the previous-chapter example, an extension relation
-expressed as a full URI, an unmodeled `anchor` param tolerated without desync, a multi-relation-type
-`rel` list, and the comma-joined-equals-two-header-lines equivalence. The RFC 8288 errata list was
-checked (2026-08-01): none of the four errata (5319, 5878, 5168, 5169) touch §3, §3.3, §3.4 or §3.5,
-so none affect these fixtures. The further §3.5 example — the `title*=UTF-8'de'...` RFC 8187
-extended-notation title — is covered since 2026-10-04 by the `title*` example test (`decodeExtValue` / `preferredTitle`). Public-spec test
-data under NOTICE policy §0 — needs no attribution entry.
+## What is deliberately not done
+
+- **Validating or percent-decoding a URI on parse, percent-encoding it on build** — the URI passes through verbatim
+  (the builder refuses only the bytes that would break the header: control bytes, SP, `<`, `>`, `"`);
+  percent-encoding is the caller's.
+- **Parsing the whole `Link:` header line** — the module works on the header value.
 
 ## Backlog / deferred
 
-No deferred-gap note existed before the 2026-09-30 survey; its findings follow.
-
-
-**Missing and it matters** *(survey 2026-09-30)*:
-
-**2026-10-04:** the first two items are **done** (`params()`/`param()`, `anchor`/`media`/`title*`
-fields, `extra`, `decodeExtValue`/`encodeExtValue`/`preferredTitle`, `unquote`) and so is the third
-(`resolve`, RFC 3986 §5.2 through `std.Uri`). Still deferred: a keyed-by-rel map (needs an
-allocator or a caller-sized table; `find` covers the use without either), Language-Tag (RFC 5646)
-structure checks, and ext-value charsets other than UTF-8 (RFC 8187 reserves them).
-
-- ✅ (found implemented 2026-11-17: `Link.params`/`ParamIterator` in src/root.zig) **Surface every parameter (an iterator over `name`/`value` pairs on `Link`, or at least `anchor`, `media`, `as`, `rev`)** *(survey 2026-09-30)*:
-  the parser recognises them for grammar purposes (`Iterator`, `src/root.zig:124`) and throws them away. Web-Linking users
-  read `as`/`crossorigin` (preload hints), `anchor`, `media`, and API-specific parameters; requests' `links` and
-  parse-link-header return them all. Effort: small-medium (a borrowed param iterator keeps the allocation-free contract). Fits §2: yes.
-  (Searched: `rg -n 'media|anchor' modules/linkheader/src/root.zig` finds them in doc comments and tests only, never in `Link`.)
-- **`title*` extended notation (RFC 8187) and a helper to unescape quoted values** *(survey 2026-09-30)*: RFC 8288 §3.4.1's
-  encoded title (non-ASCII text) is not decoded, and `\"` escapes stay in the returned slice. Effort: small (percent-decode into a caller buffer). Fits §2: yes.
-  ✅ DONE 2026-11-16 (already built 2026-10-04, backlog line was stale: `decodeExtValue(out, raw)` percent-decodes UTF-8 ext-values into a caller buffer (`InvalidExtValue`/`InvalidUtf8`/`NoSpaceLeft`; other charsets are `UnsupportedCharset`, RFC 8187 §3.2.1), `unquote(out, value)` removes quoted-string `\` escapes, `Link.preferredTitle(out)` combines both; tests at `src/root.zig` "unquote", "RFC 8187", "preferredTitle").
-- **Relative-reference targets** *(survey 2026-09-30)*: URIs pass through verbatim and are never resolved against a base
-  (RFC 8288 §3.1); a client following `rel="next"` must resolve by hand, likely with `http`/a URI module. Effort: depends on a URI-resolution module in the catalog (not checked). Low priority.
-
-## Status
-
-`gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
-src/root.zig.
+- **A keyed-by-rel map** (requests' `links` shape): needs an allocator or a caller-sized table; `find` and the
+  iterator cover the use without either.
+- **Language-Tag (RFC 5646) structure checks** on `hreflang` and the language of an ext-value (only the alphabet
+  ALPHA/DIGIT/`-` is checked today).
+- **Ext-value charsets other than UTF-8** (`UnsupportedCharset`): RFC 8187 §3.2.1 reserves them and requires
+  recipients to support only UTF-8.
 
 ## Anchoring
 
@@ -178,5 +157,3 @@ src/root.zig.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** the "RFC 8288 §3.5" tests in src/root.zig reconstruct RFC 8288 §3.5's own worked examples byte-for-byte from the RFC (errata list checked) and asserts the RFC's own stated reading of each; the build direction and every other parse fixture in the file are hand-authored
-
-**How it got there.** The anchoring work landed. DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked
