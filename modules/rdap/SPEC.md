@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — greenfield, clean-room from public RFCs).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the module's own `NOTICE` and the README's `Provenance:` line (greenfield, clean-room from public RFCs).
 
 ## Compared with
 
@@ -24,11 +24,11 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot, wh
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openrdap/rdap](https://github.com/openrdap/rdap) — **reference** | Go | MIT | 414 | v0.10.2 (2026-09-04) | Its README: CLI plus library; query types ip, domain, autnum, nameserver, entity, help, url and the **search** family (domain, nameserver, entity, by nameserver / by IP / by handle); "automatic server detection for ip/domain/autnum/entities", object tags, optional **bootstrap cache** (XDG), X.509 client authentication, text/JSON/WHOIS-style output. This module: the five direct queries, bootstrap parsing and lookup, typed model; the caller fetches and caches the bootstrap file. |
+| [openrdap/rdap](https://github.com/openrdap/rdap) — **reference** | Go | MIT | 414 | v0.10.2 (2026-09-04) | Its README: CLI plus library; query types ip, domain, autnum, nameserver, entity, help, url and the **search** family (domain, nameserver, entity, by nameserver / by IP / by handle); "automatic server detection for ip/domain/autnum/entities", object tags, optional **bootstrap cache** (XDG), X.509 client authentication, text/JSON/WHOIS-style output. This module: the five direct queries plus `help` and TLD queries, bootstrap parsing and lookup with a caller-driven `BootstrapCache` over the caller's `Fetcher`, typed model. |
 | [icann/icann-rdap](https://github.com/icann/icann-rdap) | Rust | Apache-2.0 | 461 | v1.0.0 (2026-09-16) | Its README: CLI with domain, TLD, IP and CIDR queries, RIR search, ASN, GeoFeed, direct URL; client, common and server crates, SemVer policy. Broader (TLD queries, RIR search, GeoFeed, a server implementation). |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | `std` has none; GitHub search `rdap language:zig` returned no repository on 2026-09-30. |
 
-**Where we are ahead:** the only RDAP client in Zig (search above); offline-testable by design (Fetcher seam), a `DestinationPolicy` SSRF gate on the primary URL, the `related` hop and every redirect (default-deny special-use space, https only), which neither README above mentions · **Where we are behind:** search queries (deliberate non-goal, see Threat model), `help` and TLD queries, no built-in bootstrap fetch/cache (the caller downloads the IANA file), no client-certificate auth, no output formatters (→ Backlog).
+**Where we are ahead:** the only RDAP client in Zig (search above); offline-testable by design (Fetcher seam), a `DestinationPolicy` SSRF gate on the primary URL, the `related` hop and every redirect (default-deny special-use space, https only), which neither README above mentions · **Where we are behind:** search queries and client-certificate auth (deliberate non-goals, *What is deliberately not done*), no output formatters, no on-disk bootstrap cache (the caller owns the file cache; `BootstrapCache.load` primes a slot from its bytes).
 
 ## Design & invariants
 
@@ -43,9 +43,7 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot, wh
   typed `RdapError`. Bootstrap (`parseBootstrap`) reads an IANA registry file; `lookupDomain`/
   `lookupIp` (longest-prefix CIDR match via `netaddr`)/`lookupAsn` resolve the authoritative base
   URL. `Client.query` = build URL → fetch → parse, optionally following one `rel:"related"` link
-  (registry → registrar). Clean-room from RFCs 7480/7482/7483/7484/9224/9537 (plus the 9082/9083
-  renumberings) — no third-party RDAP implementation consulted; no NOTICE entry (greenfield,
-  original work).
+  (registry → registrar).
 - **Fetch seam:** I/O goes through a `Fetcher` ("GET url → status + body"); `HttpFetcher` adapts the
   `http.Client` for real use — the only network-touching code. Concurrency: reentrant, no shared
   state.
@@ -65,6 +63,29 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot, wh
   wire bounds nesting depth, and 8 is generous for anything a real registry has been observed to
   emit (the real captured golden nests exactly one level).
 
+- **`help` and TLD queries.** `QueryType.help` builds path `help` and ignores the value; `QueryType.tld` builds
+  `domain/<tld>` for a root server and drops one leading dot (`.com` becomes `com`). Both are covered by the
+  `buildPath` / `buildUrl` goldens. Reference: openrdap (`help`) and icann-rdap (TLD queries).
+- **`secureDNS`** (RFC 9083 §5.3). `Object.secure_dns: ?SecureDns` carries `zone_signed`, `delegation_signed`,
+  `max_sig_life`, `ds_data[]` (key tag, algorithm, digest, digest type, events, links) and `key_data[]` (flags,
+  protocol, public key, algorithm, events, links). Lenient like the rest of the model: a wrong-typed or
+  out-of-`u32`-range member reads as null, a non-object entry is skipped, and each record list is capped at
+  `max_secure_dns_records` (64), records past it silently dropped.
+- **Bootstrap cache** (`BootstrapCache`, `RegistryKind`, `Bootstrap.publication`). Reference: openrdap's bootstrap
+  client (MIT; `bootstrap/client.go`, `bootstrap/cache/disk_cache.go`): one file per registry
+  (`dns`/`ipv4`/`ipv6`/`asn.json`), a default lifetime of 24 hours, a refresh once it expires, and the expired copy
+  kept in use when the refresh fails; RFC 9224 §3 makes `publication` the file's timestamp and sets no cache
+  lifetime. Here it is a transport-agnostic helper: it fetches through the caller's `Fetcher` (no HTTP client, no
+  clock, no thread, no file I/O of its own) and the caller passes `now_s` to every call. `ttl_s` defaults to 86400;
+  a copy is fresh while `0 <= age < ttl_s` (a clock that went backwards counts as expired); the stale copy answers
+  when the refresh fails with a transport error, a non-200, an unparseable body or an empty registry
+  (`error.Canceled` and `error.OutOfMemory` always propagate); a first fetch's failure is the error. `load` primes
+  a slot from the caller's own disk cache; `publication(kind)` exposes the file's timestamp;
+  `lookupDomain`/`lookupIp`/`lookupAsn` do get + lookup (the IP family picks `ipv4.json` or `ipv6.json`). Not
+  thread-safe; returned URL slices die with the next refresh of that registry. The cache dials only `base_url`
+  (default `https://data.iana.org/rdap/`, caller configuration, not registry content), so `DestinationPolicy` does
+  not gate it; the URLs it returns are still untrusted input for `Client`'s policy.
+
 ## Threat model / out of scope
 
 Trust rests on **TLS to the RDAP server** (via the `http` client / `Fetcher`); this module does no
@@ -73,29 +94,26 @@ attack surface, and its guarantee is that **hostile/oversized/wrong-typed JSON f
 server never panics** — arena-owned, tolerant parsing with a caller-bounded body buffer. The
 `related`-link follow is capped at **one hop**, and **every** URL this module dials goes through the
 same `checkDestination` gate: the primary query, the `related` hop, and each redirect `Location`.
-That third one is why the gate moved: `http.Client` follows up to ten `Location` hops itself and
-accepts an absolute cross-origin one verbatim, so a check on the address we *asked for* bounded
-nothing — one response from any server bounced the client anywhere, and the "one hop" cap above was
-true only of RDAP hops. `HttpFetcher` now follows redirects itself (`follow_redirects = false` on
-the client, `max_redirects` here) so each hop is checked before it is dialed.
+`http.Client` follows up to ten `Location` hops itself and accepts an absolute cross-origin one
+verbatim, so a check on the address we *asked for* would bound nothing: `HttpFetcher` follows
+redirects itself (`follow_redirects = false` on the client, `max_redirects` here, default 5) so each hop is
+checked before it is dialed.
 
 `DestinationPolicy` has two terms and both default to **deny**: `deny_special_use` refuses
 loopback/RFC 1918/link-local/unique-local/unspecified/multicast/documentation space and the
-`localhost` name — including its ABSOLUTE spelling `localhost.`, which every resolver treats
-identically and which the string compare used to miss (`getent hosts localhost.` answers `::1` on
-the machine this was found on) — and `require_https` refuses plaintext, because the sentence above
-says trust rests on TLS to the RDAP server and a `related` href naming `http://` walks the whole
-exchange off it. A refused `related` hop falls back to the first document; a refused primary is
-`error.BlockedDestination`. The primary is gated because it is not automatically the caller's own
-choice: the documented way to obtain one is `Bootstrap.lookupDomain`, which returns service URLs
-parsed straight out of an untrusted registry file. A hostname other than `localhost` is still not
-classified here and relies on the `Fetcher`'s own resolver. RDAP data is registrant-supplied and unauthenticated beyond the transport
-— callers must not treat fields as verified. Out of scope: RDAP search queries, RDAP-over-HTTP
-conformance/authentication extensions, and JSON schema validation beyond the tolerant model.
+`localhost` name, including its absolute spelling `localhost.` (which every resolver treats
+identically), and `require_https` refuses plaintext, because trust rests on TLS to the RDAP server
+and a `related` href naming `http://` would walk the whole exchange off it. A refused `related` hop
+falls back to the first document; a refused primary is `error.BlockedDestination`. The primary is
+gated because it is not automatically the caller's own choice: the documented way to obtain one is
+`Bootstrap.lookupDomain`, which returns service URLs parsed straight out of an untrusted registry
+file. A hostname other than `localhost` is still not classified here and relies on the `Fetcher`'s
+own resolver. RDAP data is registrant-supplied and unauthenticated beyond the transport — callers
+must not treat fields as verified.
 
 ## Verification
 
-Offline tests (`scripts/modtest rdap`), `src/root.zig` plus the golden-fixture tests in `src/goldens.zig`
+Run: `scripts/modtest rdap` (offline), `RDAP_FUZZ=<runs>` for the fuzz driver. Tests are in `src/root.zig` plus the golden-fixture tests in `src/goldens.zig`
 (no test reaches the public network; two bind a **loopback** socket — the
 cancellation test and the redirect-gate test): `buildPath` KATs for all query types +
 percent-encoding, Accept-header check, base-join with/without trailing slash; response KATs for
@@ -107,24 +125,33 @@ malformed/wrong-top-level, and wrong-typed-member (degrade-not-panic) cases; boo
 `isSpecialUseHost` classification; end-to-end client tests over a canned fetcher (domain query,
 404→NotFound, `status_out` carrying the real HTTP status on `error.HttpStatus` (429 vs. 500 vs.
 403), related-link follow and its fallback when the second hop fails or when the `related` href
-names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
+names a loopback/RFC 1918 host — never dialed).
 
-**Audit 2026-11-17 (whole-module mutation).** 462 mutants = the 19 delta mutants over `BootstrapCache` (all killed; not re-run) + 443 over every non-test line of `src/root.zig` (URL building and percent-encoding, the response mapper and every JSON key it reads, bootstrap parsing, longest-match domain / IP-prefix / ASN lookup, `BootstrapCache`, `Client` status handling and error mapping, `DestinationPolicy`, `isSpecialUseHost` / `inet_aton` parsing, `HttpFetcher` redirects and body reading), one schemata build per round, baseline first. Round 1: 319 killed + 1 hung, 123 survived. 30 tests were added: overflow stage and error code of every `buildPath` / `buildUrl` write, one-character values and bases, every percent-encoded class, `OutOfMemory` (never `InvalidJson`) from `checkAllAllocationFailures` over `parseResponse` and `parseBootstrap`, keys no other test read (nameserver `unicodeName`, link `value`/`title`, redacted `replacementPath`/`pathLang`, `keyData` events/links), the `keyData` cap at 63/64/65, jCard edge shapes, longest-match with the long key first, first-wins ties, `/0` `/32` `/128` and invalid prefix lengths, family mismatches, ASN endpoints and malformed range keys, a saturating clock, HTTP 200 only for a bootstrap file, `Client` status classes 1xx..3xx, `status_out` untouched by the related hop, URL scheme spelling, `inet_aton` forms and bounds, documentation-net boundaries, and loopback tests for `HttpFetcher` (each of 301/302/303/307/308 followed with the base advancing, non-redirects with a `Location` returned, the redirect cap and a too-long `Location`, exact / short / oversize bodies, and a cancel during the exact-fit probe read). Round 2 killed 112 of the 124 (one more by a hang); round 3 killed the last one (an empty key is the root). 10 do not die: 9 EQUIVALENT (`queryValue` `.help` value unused; `number_string` only arises where `parseInt(i64)` fails; domain length compare for keys of non-empty labels differ by 0 or >= 2; `0x` invalid by either branch; leading 0 of an octal part; empty digits fail in `parseInt`; `room < 32` redundant with the part cap; `isUniqueLocal` subsumed by `isPrivate`; the always-probe read is cost-only) and 1 UNOBSERVABLE (`http.Url.parse` failing on a URL the client has just fetched). Comptime-only constants (`max_url_len`, `max_entity_depth`, field defaults) cannot be switched at run time; a test pins their values. Counts on the card are whole-module.
+- **`BootstrapCache`:** fresh / stale / expired / clock-backwards copies, refresh failure falling back to the stale
+  copy (transport error, non-200, unparseable body, empty registry), cancellation and `OutOfMemory` propagating,
+  `load`, `publication`, and the IP family choosing `ipv4.json` or `ipv6.json`.
+- **`HttpFetcher` over loopback:** each of 301/302/303/307/308 followed with the base advancing, a non-redirect with a
+  `Location` returned as is, the redirect cap and a too-long `Location`, exact / short / oversize bodies, and a
+  cancel during the exact-fit probe read.
+- **Allocation failure:** `OutOfMemory` (never `InvalidJson`) from `checkAllAllocationFailures` over `parseResponse`
+  and `parseBootstrap`.
+- **Fuzz** (`src/fuzz_test.zig`): the parsers and client under testkit's deterministic driver as `RDAP_FUZZ`;
+  fixed-seed reach checks run in every test run.
+- **Pinned constants:** `max_url_len`, `max_entity_depth` and field defaults are comptime-only and cannot be switched
+  at run time in a mutation run; a test pins their values.
+- **Constant time:** n/a (public registry queries).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
+## What is deliberately not done
+
+- **RDAP search queries** (domain, nameserver, entity searches), **RDAP-over-HTTP conformance/authentication
+  extensions** (including client-certificate auth) and **JSON schema validation** beyond the tolerant model: out of
+  scope, not v1 gaps.
 
 ## Backlog / deferred
 
-- **`secureDNS` (delegationSigned/dsData, RFC 9083 §5.3)** ✅ DONE 2026-11-16 (see the `secureDNS` model line below).
-- Otherwise none beyond the explicit out-of-scope list above (RDAP search, auth extensions, full
-  schema validation are deliberate non-goals, not v1 gaps).
-
-- **Bootstrap fetch + cache helper — done 2026-11-17** (`BootstrapCache`, `RegistryKind`, `Bootstrap.publication`). Reference: openrdap/rdap v0.10.2 (MIT; `bootstrap/client.go` and `bootstrap/cache/disk_cache.go`, read 2026-11-17) downloads each of `asn`/`dns`/`ipv4`/`ipv6.json` once, caches it with a default lifetime of 24 hours, re-downloads once expired, and keeps using the expired copy when the download fails; RFC 9224 §3 makes `publication` the file's timestamp and sets no cache lifetime. Same here, as a transport-agnostic helper: it fetches through the caller's `Fetcher` (no HTTP client of its own, no clock, no thread, no file I/O); the caller passes `now_s` to every call, `ttl_s` defaults to 86400, a copy is fresh while `0 <= age < ttl_s` (a clock that went backwards counts as expired), the stale copy answers when the refresh fails with a transport error, a non-200, an unparseable body or an empty registry (`Canceled` and `OutOfMemory` always propagate), a first fetch's failure is the error. `load` primes a slot from the caller's own disk cache; `publication(kind)` exposes the file's timestamp. `lookupDomain`/`lookupIp`/`lookupAsn` do get + lookup (the IP family picks `ipv4.json`/`ipv6.json`). Not thread-safe; returned URL slices die with the next refresh of that registry. The cache dials only `base_url` (default `https://data.iana.org/rdap/`, caller configuration, not registry content), so `DestinationPolicy` does not gate it; the URLs it returns are still untrusted input for `Client`'s policy. Delta mutation 19 mutants, 19 killed (2 by the allocator leak report).
-- **`help` query and TLD query (`domain/<tld>` on the root server)** *(survey 2026-09-30)*. In openrdap (`help`) and icann-rdap (TLD queries); low use. Effort: small (`QueryType` variants). Fits §2. ✅ DONE 2026-11-16 (`QueryType.help` -> path `help`, value ignored; `QueryType.tld` -> `domain/<tld>`, one leading dot dropped, for a root server; `buildPath`/`buildUrl` goldens)
-- **`secureDNS` model** *(survey 2026-09-30)*. Already recorded above (kept as "legitimate future addition"); it matters to anyone showing DNSSEC posture from RDAP. Effort: small-medium. Fits §2. ✅ DONE 2026-11-16 (`Object.secure_dns: ?SecureDns` with zone_signed/delegation_signed/max_sig_life, `ds_data[]` (key_tag/algorithm/digest/digest_type + events/links) and `key_data[]` (flags/protocol/public_key/algorithm + events/links); lenient like the rest: wrong-typed or out-of-u32-range members read as null, non-object entries skipped, each record list capped at `max_secure_dns_records` = 64; goldens + hand-built tests)
-
-## Status
-
-`gap · any (logic over a Fetcher seam; HttpFetcher uses http) · client · reentrant` + deps: `http`,
-`netaddr` — canonical source is `pub const meta` in src/root.zig.
+None open.
 
 ## Anchoring
 
@@ -133,6 +160,4 @@ names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities, publicIds, nameserver glue addresses) — **and nothing else**: it holds exactly one constant. An earlier revision of this line also claimed "plus the real IANA bootstrap file", which was never true; `goldens.zig`'s own doc comment says the bootstrap file was deliberately checked rather than captured. The remaining client fixtures in root.zig are hand-authored.
-
-**How it got there.** The anchoring work landed in two passes. DONE ea2d000: captured the real registry response, which surfaced the GDPR-redacted handle and nested-entities shapes as gaps (asserted then as documented limitations). DONE 2026-08-22 (competitive survey against `icann-rdap`/`openrdap`): closed those gaps — `Entity.entities`, `Object.redacted`/`public_ids`/`rdap_conformance`, nameserver handle/status/glue addresses — and re-anchored the same golden fixture's assertions against the new, not the old, behavior.
+**What the tests actually contain.** src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities, publicIds, nameserver glue addresses) — **and nothing else**: it holds exactly one constant. The remaining client fixtures in root.zig are hand-authored.
