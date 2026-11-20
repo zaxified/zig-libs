@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-18** — **API change (owner no-panic policy, security triage):** `dhcp.BuildError` gains `InvalidOptionCode` and `InvalidAddressList`. `dhcp.Builder.addOption` with code 0 or 255 and `addRouters`/`addDnsServers`/`addNtpServers` with an empty or non-multiple-of-4 list return them instead of a checked `@panic` (the builder is left untouched). A caller that matched `BuildError` exhaustively needs the two new arms. `Mac.format`, `Ip4List.at` and `Rdnss.at` keep their documented checked panics (accessors, see SPEC backlog). Delta mutation of the changed lines: 9 mutants, 9 killed. Card A1 again (cumulative 43/43).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nd.checksum`, `cdp.compute` and `cdp.verify` (duplicate-code pass) use `icmp.checksum` instead of private sums; same results. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-11-04** — **BREAKING (accessors added in this cycle, untagged):** `cdp.Frame.mtu`, `powerConsumptionMw`, `systemName`, `extendedTrust`, `untrustedCos`, `voipVlanReply`, `location` return `ParseError!?T`: a wrong size is `BadTlvValue`, no longer null, a walk error is no longer null, a repeated TLV is the last one as in `parse`. `dhcp6.Builder.end` removes the open option on `OptionTooLong`. Card: oracle counts, README's error sentence.
@@ -26,7 +25,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-31** — **BREAKING (small):** no-panic sweep + blind review (§ GX). `arp.Packet.encode` returns the new `arp.EncodeError = error{BufferTooSmall, InvalidLength}` instead of a panic (a parsed hlen=0 packet with a swapped-in MAC reached it); `Mac.format`, `nd.Rdnss.at`, `dhcp.Ip4List.at` and the `dhcp.Builder` router/DNS/NTP adders check caller input with a documented `@panic("l2disco: …")` (was `assert`/unchecked index), `dhcp.Builder.addOption` refuses codes 0 and 255 the same way; `dhcp.Builder.finish` checks `pad_to` before it changes state; the CDP checksum sums in u64 (u32 overflowed past 128 KiB); every option/TLV iterator (dhcp, cdp, nd, lldp) ends after its first error, so a `catch continue` loop terminates.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. tests: `EnumSet.initEmpty()/initFull()` -> `.empty/.full`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — tests: deterministic fuzz driver `L2DISCO_FUZZ` over the existing harnesses (DHCP, LLDP, ARP, CDP parsers, each also over damaged corpus entries).

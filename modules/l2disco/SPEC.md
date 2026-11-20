@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-11-18 (43/43) · src 355ec18526b53865
 
-Delta audit 2026-11-04 (independent read of the 2026-11 production diff, 154 mutants: 150 killed, 50 of them by 9 tests it added, 4 equivalent): no panic, out-of-bounds read, data-driven allocation or quadratic walk found on hostile bytes. Changed after it, each with a test, no mutants: CDP accessors of this wave return `BadTlvValue` for a wrong size and take the last of a repeated TLV as `parse` does; `dhcp6.Builder.end` removes the option on `OptionTooLong`. Reading only for 32-bit; gopacket's source not compared for the parity claim. Not a whole-module score, so the Audit line stays as it is.
-
 **Hardening:** fuzz 2026-11-04 (`L2DISCO_FUZZ=200000` run directly on the final test binary: lldp, cdp, arp, dhcp, dhcp6 and their damaged-corpus twins plus the dhcp6 Builder harness, 200000 runs each, clean; `nd` has no harness) · ct n/a — LLDP/CDP codec (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: caller-input asserts → checked panics, `arp.Packet.encode` → `EncodeError`, iterators end after the first error, CDP checksum u64; delta audit 28/29 + 1 eq)
 
 **Performance:** ref 0.38–0.56× Go gopacket v1.7.5 (`zig build bench-l2disco -Djcc-safe`, decode only, 9 rounds, spreads up to 15 % on a shared host; like for like, reused-layer decode, same facts summed, default configuration: arp 0.40, dhcp4 0.38, dhcp6 0.50, nd_ra 0.56; reported apart and outside the range, library path against ours, not parser-for-parser, since gopacket builds a packet object, strings and a second Info layer per frame and ours slices and allocates nothing: lldp 0.04, cdp 0.02) · fastest ? (nothing measured beat the reference; insomniacslk/dhcp, measured on the two DHCP rows, is slower than gopacket there, doing more work per message; no encode row) (measured 2026-11-04)
@@ -36,24 +34,33 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
 
 **Where we are ahead:** the only Zig LLDP+CDP+ARP+DHCPv4+DHCPv6 codec we found — allocation-free, builders as well as parsers, strict-by-default with opt-in tolerance that reports what was dropped, and checked against 15 real frames from tcpdump's dissector suite including four upstream crash reproducers. **Where we are behind** (re-checked 2026-11-04): the DCBX ETS configuration / recommendation subtypes, 802.1Qbg, Profinet and Cisco-OUI PoE org TLVs (not built: budget), the vendor CDP TLVs tcpdump does not decode, the other vendor discovery protocols (EDP/FDP/SONMP) and builders for most org TLVs. Built since the survey: LLDP-MED, 802.3 power, DHCPv4 options 42/43/60/66/67/82/119/121, ICMPv6 Neighbor Discovery (2026-10-04); DHCPv6 (RFC 8415), LLDP-MED location content, 802.1 link aggregation / protocol identity / VID digest / management VID, DCBX PFC and application priority and nine more CDP TLVs (2026-11-04).
 
-**Survey verdicts 2026-11-04** (gopacket v1.7.2/v1.7.5 `layers` and insomniacslk/dhcp read at the feature-list level; every feature a user would notice). *Done:* DHCPv6 (`dhcp6`: ids, IA_NA/TA/PD, IAADDR, prefix, prefix exclude, status, Client FQDN with partial names, every Vendor and User Class option, reconfigure, DNS/SNTP/domain list, relay); LLDP-MED location content (coordinate, civic, ELIN); 802.1 link aggregation (and the deprecated 802.3 copy), protocol identity, VID usage digest, management VID; IEEE 802.1Qaz DCBX PFC and application priority (anchored by tcpdump); CDP VoIP VLAN reply, power consumption, MTU, extended trust, untrusted CoS, system name, management addresses, location (all anchored by tcpdump 4.99.6). *Not built: budget (this round), spec exists:* DCBX ETS configuration and recommendation (IEEE 802.1Qaz is a public standard, but tcpdump 4.99.6 prints these two subtypes as hex only, so there is no anchor yet), 802.1Qbg, Profinet and Cisco-OUI PoE (tcpdump's decode of these was not checked this round). *Rejected, with the reason:* CDP power requested / available (0x19, 0x1a), spare-pair PoE (0x1f) and EnergyWise (0x1d): tcpdump 4.99.6 prints them as "unknown field type", so there is neither a spec nor an oracle to check a decode against, and gopacket's own reading is not evidence; CDP VLAN query, IP prefixes, hello and SysOID: not decoded by tcpdump either (the VLAN query probe was printed as malformed); EDP/FDP/SONMP (lldpd only, vendor protocols retired by their owners); MLD, STP, VRRP, EAPOL and the other 100+ gopacket layers (not neighbour discovery; no sibling module exists). *Sibling-owned:* Ethernet/IP/UDP header peeling (the caller; this is a payload codec), address text (`netaddr`). The typed DHCPv6 options in insomniacslk/dhcp beyond those above (boot file URL, ARCH type, SIP, NTP etc.) pass through `Message.option` raw: each is a flat value with no framing beyond the option header.
+**Survey verdicts** (read 2026-11-04: gopacket v1.7.2/v1.7.5 `layers` and insomniacslk/dhcp read at the feature-list level; every feature a user would notice). *Done:* DHCPv6 (`dhcp6`: ids, IA_NA/TA/PD, IAADDR, prefix, prefix exclude, status, Client FQDN with partial names, every Vendor and User Class option, reconfigure, DNS/SNTP/domain list, relay); LLDP-MED location content (coordinate, civic, ELIN); 802.1 link aggregation (and the deprecated 802.3 copy), protocol identity, VID usage digest, management VID; IEEE 802.1Qaz DCBX PFC and application priority (anchored by tcpdump); CDP VoIP VLAN reply, power consumption, MTU, extended trust, untrusted CoS, system name, management addresses, location (all anchored by tcpdump 4.99.6). *Not built: budget (this round), spec exists:* DCBX ETS configuration and recommendation (IEEE 802.1Qaz is a public standard, but tcpdump 4.99.6 prints these two subtypes as hex only, so there is no anchor yet), 802.1Qbg, Profinet and Cisco-OUI PoE (tcpdump's decode of these was not checked this round). *Rejected (reasons under *What is deliberately not done*):* CDP power requested / available, spare-pair PoE and EnergyWise TLVs; CDP VLAN query, IP prefixes, hello and SysOID; EDP/FDP/SONMP; MLD, STP, VRRP, EAPOL and the other 100+ gopacket layers. *Sibling-owned:* Ethernet/IP/UDP header peeling (the caller; this is a payload codec), address text (`netaddr`). The typed DHCPv6 options in insomniacslk/dhcp beyond those above (boot file URL, ARCH type, SIP, NTP etc.) pass through `Message.option` raw: each is a flat value with no framing beyond the option header.
 
 ## Design & invariants
 
-- **Five submodules, one MAC helper:** `lldp` (802.1AB LLDPDU 7-bit-type/9-bit-length TLV stream:
+- **Seven submodules, one MAC helper:** `lldp` (802.1AB LLDPDU 7-bit-type/9-bit-length TLV stream:
   mandatory Chassis ID / Port ID / TTL / End, optional descriptions/capabilities/management
-  address, org-specific type-127 with 802.1 + 802.3 decoding), `cdp` (version/holdtime/checksum
+  address, org-specific type-127 with 802.1 + 802.3 + LLDP-MED decoding), `cdp` (version/holdtime/checksum
   header + type/length TLVs, RFC 1071 checksum compute/verify), `arp` (RFC 826 generic `Packet` +
   typed Ethernet+IPv4 `EthIpv4` request/reply/gratuitous/probe), `dhcp` (RFC 2131 header + magic
-  cookie + RFC 2132 options), `mac` (48-bit EUI-48 parse/format + broadcast/multicast/local
-  predicates). Modeled after IEEE 802.1AB, Cisco CDP (reverse-engineered reference), RFC 826, RFC
-  2131/2132 — see NOTICE for clean-room provenance.
+  cookie + RFC 2132 options), `dhcp6` (RFC 8415), `nd` (RFC 4861 Neighbor Discovery) and `mac` (48-bit EUI-48
+  parse/format + broadcast/multicast/local predicates). Modeled after IEEE 802.1AB, Cisco CDP
+  (reverse-engineered reference), RFC 826, RFC 2131/2132, RFC 8415, RFC 4861 — see NOTICE for clean-room provenance.
 - **Allocation-free hot path:** parse iterators slice the input buffer (values borrow it); builders
   write into a caller-provided buffer. No sockets, no syscalls — codec only.
 - **Forward-compatible parsing:** unknown optional TLVs/options pass through raw and never fail the
   parse; every length is bounds-checked against the buffer.
 - **Concurrency:** reentrant — no shared state; safe if instances are not shared.
-- **Error policy:** malformed or truncated input is a typed error, never a panic.
+- **Error policy:** malformed or truncated input is a typed error, never a panic. Builder
+  caller-contract violations are `BuildError` members too: `dhcp.BuildError.InvalidOptionCode`
+  (`addOption` with code 0 Pad or 255 End) and `InvalidAddressList` (`addRouters`/`addDnsServers`/
+  `addNtpServers` with an empty list or a length not a multiple of 4), both returned before the
+  buffer is touched; `arp.Packet.encode` returns `EncodeError.InvalidLength` for inconsistent
+  address lengths. Three non-builder accessors are checked `@panic`s with an `l2disco:` message in
+  every build mode, deliberately: `Mac.format` (short buffer), `dhcp.Ip4List.at` and
+  `nd.Rdnss.at` (index out of range), since an out-of-range index on a slice-like accessor is a
+  programming error in every comparable API (Go slices, gopacket accessors) and a typed return would
+  burden every call.
 - **Opt-in tolerance, strict by default:** `lldp.ParseOptions.tolerant_optionals` and
   `cdp.ParseOptions.tolerant_trailing_tlv` (both default `false`) let a caller keep a frame whose
   data loss is confined to a TLV that was never load-bearing for identifying the neighbour, instead
@@ -69,21 +76,39 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
   which motivated them was itself "the module silently threw away a good neighbour" — the fix must
   not create the same failure mode in the other direction for a caller that cares.
 
-## LLDP-MED, DHCP options, ND (2026-10-04)
+## Design notes by feature
 
 - **LLDP-MED / power** decode in `OrgSpecific.decode` under OUI 00-12-BB (TIA-1057 subtypes 1-11)
   and 00-12-0F subtype 2 (power via MDI; the 802.3at fields are read only when all 5 extra octets
   are present — a shorter TLV is the 802.3ab form, not a truncated 802.3at one). A TLV too short
   for its fixed fields stays undecoded (null), never an error: org TLVs are optional and vendors
   pad them oddly. Network policy's 24-bit field is unpacked as U(1) T(1) X(1) VLAN(12) prio(3)
-  DSCP(6).
+  DSCP(6). Location content: `MedLocation.coordinate()` (RFC 3825; all 34 bits are returned, also
+  below the stated resolution, as the tcpdump-checked frame needs), `civic()` (RFC 4776 elements)
+  and `elin()`; each returns null for another location format and a `LocationError`
+  (`BadLength`, `OutOfRange`) for a malformed one. Civic has no foreign decoder in the oracle
+  (tcpdump 4.99.6 prints nothing for it); its layout is checked against RFC 4776 §3.1 by hand-built
+  vectors only.
+- **CDP accessors** for the typed TLVs (VoIP VLAN reply, power consumption, MTU, trust, CoS,
+  system name, management addresses, location) return `BadTlvValue` for a wrong size and take the last of
+  a repeated TLV, as `parse` does.
 - **DHCP 82, 119 and 121** are validated lazily, by their iterators (sub-option framing; RFC 3442
   width 0-32 and the significant-octet count; RFC 1035 labels), never by `Message.parse`: a
   malformed sub-structure must not hide the rest of the message — the router-tool consumer's rogue-DHCP check needs the
-  server id of an OFFER whose option 121 is garbage (a review finding against this change's first
-  draft, which failed the whole parse). `DomainSearchIterator`'s whose compression pointers must point strictly
-  backwards (no loop is possible) and whose names are bounded at 253 characters (255 octets on the wire, RFC 1035 §2.3.4; the bound was 254 before 2026-11-04). The builders
-  never compress (every receiver must accept uncompressed names).
+  server id of an OFFER whose option 121 is garbage. `DomainSearchIterator`'s compression pointers
+  must point strictly backwards (no loop is possible) and its names are bounded at
+  `max_name_len` = 253 characters (255 octets on the wire, RFC 1035 §2.3.4). The builders
+  never compress (every receiver must accept uncompressed names). Repeated long options are not
+  concatenated (RFC 3396): typed fields keep the last occurrence and the raw options stay
+  reachable via `optionIterator`.
+- **DHCPv6** (`dhcp6`, RFC 8415): client/server and relay headers; option framing is checked at
+  parse; typed DUID, IA_NA / IA_TA / IA_PD with IA Address and IA Prefix (prefix exclude), status
+  code, option request, DNS and SNTP servers, domain list, Client FQDN, Vendor and User Class,
+  Reconfigure; `Message.unwrap(max_depth)` peels relay chains iteratively and fails with
+  `error.TooDeep` past the limit; `Builder` with nested options (`begin`/`end`; `end` on
+  `OptionTooLong` removes the open option and everything added since). Other options
+  (including vendor-specific information, 17) pass through raw via `option(code)`. A DHCPv6
+  Authentication check is the caller's, like the other protocols' authenticity.
 - **ND** validates option framing at parse (length 0 is an error, RFC 4861 §4.6) and leaves the
   checksum to `checksum(src, dst, msg)` because it needs the IPv6 addresses; the hop-limit-255 rule
   is the caller's (it lives in the IPv6 header).
@@ -98,54 +123,63 @@ protocols, so a parsed neighbour/lease is a claim, not a verified fact (ARP-spoo
 detection is the caller's policy). Out of scope: packet capture/injection (AF_PACKET, BPF), the
 transmit scheduling of LLDP/CDP, DHCP state machines, and the checksum-secured integrity of any
 protocol beyond the CDP checksum it computes.
+`Builder.buf` and `.len` are pub: a consumer who sets `len` past `buf.len` gets a panic in the
+builder, which is misuse only.
 
 ## Verification
 
-Each protocol has golden-byte KATs transcribed from the specs asserting the parsed typed model and
-round-tripping build → parse, plus malformed/truncated-input negatives and a 1000-iteration
-garbage-sweep (never panics). Run: `zig build test-l2disco`.
+Run: `scripts/modtest l2disco` (the module's tests; the Go benchmark is `zig build bench-l2disco`).
 
-**2026-10-04:** an LLDP-MED phone advertisement, a DHCPACK carrying options 42/43/60/66/67/82/
-119/121 and four ND messages (NS, NA, RA with MTU/prefix/RDNSS, RS) were built for the tests and
-decoded by tcpdump 4.99.6 (`-vvv`); every expected value in the tests is what tcpdump printed
-(and tcpdump's "icmp6 sum ok" anchors the ND checksum). Where tcpdump has no decoder — option 119
-and the 802.3at power extension — the test cites RFC 3397 §2's own example and IEEE 802.3at
-§79.3.2's layout instead. The builders reproduce the tcpdump-checked bytes. Mutation: 34 mutants (final set),
-all killed, 4 of them only after new tests (reserved label types with enough bytes behind them,
-width 33 with enough bytes, the full 4-bit MED priority, RA preference bits).
+- Each protocol has golden-byte KATs transcribed from the specs asserting the parsed typed model and
+  round-tripping build → parse, plus malformed/truncated-input negatives and garbage-sweep tests
+  (`src/sweep_test.zig`; never panics, and the checked-panic and contract-error cases above).
+- Foreign anchors: real frames from tcpdump's dissector suite (`src/capture_test.zig`) and the frames
+  of `tools/tcpdump_oracle.py` with the facts tcpdump 4.99.6 printed for them
+  (`src/tcpdump_oracle_test.zig`); see *Anchoring*. Where tcpdump has no decoder (DHCP option 119,
+  the 802.3at power extension, LLDP-MED civic location) the test cites the RFC / IEEE layout
+  instead (RFC 3397 §2's example, IEEE 802.3at §79.3.2, RFC 4776 §3.1).
+- Fuzz: `src/fuzz_test.zig`, deterministic driver `L2DISCO_FUZZ=<runs>[,<first seed>]` (testkit's
+  fuzz driver): lldp, cdp, arp, dhcp, dhcp6 and their damaged-corpus twins, plus the dhcp6 Builder
+  harness; `nd` has no harness (see *Open*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+- **Relaxing LLDP mandatory-TLV ordering** (Chassis ID, Port ID, TTL first, in that order). A
+  consumer that asked for `lldp.ParseOptions.tolerant_optionals` separately flagged ordering as
+  something it could imagine wanting relaxed too, but called it out as its own, distinct decision.
+  Revisit only on a fresh, explicit ask; do not fold it into `tolerant_optionals`.
+- **CDP power requested / available (0x19, 0x1a), spare-pair PoE (0x1f) and EnergyWise (0x1d):**
+  tcpdump 4.99.6 prints them as "unknown field type", so there is neither a spec nor an oracle to
+  check a decode against, and gopacket's own reading is not evidence.
+- **CDP VLAN query, IP prefixes, hello and SysOID:** not decoded by tcpdump either (the VLAN query
+  probe was printed as malformed).
+- **EDP/FDP/SONMP:** lldpd only; vendor protocols retired by their owners.
+- **MLD, STP, VRRP, EAPOL and the other 100+ gopacket layers:** not neighbour discovery; no
+  sibling module exists.
+- **Packet capture/injection, transmit scheduling, DHCP state machines, Ethernet/IP/UDP header
+  peeling:** out of scope (the caller's; this is a payload codec).
+
+## Open
+
+- Fuzz reach: label `.reconfigure` is shared by the Reconfigure Message and Accept paths, DUID EN
+  and UUID are not reached positively, and the dhcp6 Builder harness checks only what
+  `Message.parse` checks, not IA, domain-list or FQDN content; unit tests pin those limits.
+- RFC text on the `coordinate()` bits below the stated resolution was not compared.
+- `nd` has no fuzz harness.
 
 ## Backlog / deferred
 
-- (delta audit 2026-11-04) Fuzz reach: label `.reconfigure` is shared by the Reconfigure Message and Accept paths, DUID EN and UUID are not reached positively, and the Builder harness checks only what `Message.parse` checks, not IA, domain-list or FQDN content; unit tests pin those limits (mutants 36, 51, 55, 77). `Builder.buf` and `.len` are pub: a consumer who sets `len` past `buf.len` panics in `room`/`finish`, misuse only. `coordinate()` returns all 34 bits, also below the stated resolution, as the tcpdump-checked frame needs; RFC text on those bits not compared.
-- **Not built: budget (2026-11-04):** DCBX ETS configuration and recommendation org TLVs (IEEE 802.1Qaz; no tcpdump decode to anchor), 802.1Qbg EVB/CDCP, Profinet and Cisco-OUI PoE org TLVs (tcpdump decode unchecked), an encode benchmark row, a paired bench row in which ours also decodes the IAs and DUIDs (so that insomniacslk/dhcp could be compared like for like).
-- **DONE 2026-11-18 (owner no-panic policy; no-panic sweep GX 2026-10-31):** the builder caller-contract violations are `BuildError` members now: `dhcp.BuildError.InvalidOptionCode` (`addOption` with code 0 Pad or 255 End) and `InvalidAddressList` (`addRouters`/`addDnsServers`/`addNtpServers` with an empty list or a length not a multiple of 4), both returned before the buffer is touched; `arp.Packet.encode` already returned `EncodeError.InvalidLength`. Still checked `@panic`s with an `l2disco:` message, deliberately: the non-builder accessors `Mac.format` (short buffer) and `dhcp.Ip4List.at` / `nd.Rdnss.at` (index out of range), since an out-of-range index on a slice-like accessor is a programming error in every comparable API (Go slices, gopacket accessors) and a typed return would burden every call. Not done: RFC 3396 concatenation of repeated long DHCP options (typed fields keep the last occurrence; the raw options stay reachable via `optionIterator`).
-
-None recorded — no deferred-gap note beyond the general Linux-only-members-accepted
-scope note (raw-syscall nature, not a functional gap), and the module README has no Deferred
-section.
-
-**Deliberately out of scope:** relaxing LLDP mandatory-TLV *ordering* (Chassis ID, Port ID, TTL
-must appear first, in that order). A consumer that asked for `lldp.ParseOptions.tolerant_optionals`
-separately flagged ordering as something it could imagine wanting relaxed too, but called it out as
-its own, distinct decision rather than bundling it into the optional-TLV finding — so it was left
-alone here. Revisit only on a fresh, explicit ask; do not fold it into `tolerant_optionals` as a
-"while we're at it."
-
-- **2026-10-04:** the three survey items below are **done**, except DHCPv6 (deferred: a separate
-  message format and option space, roughly the size of the DHCPv4 codec; no consumer asks — the router-tool consumer's
-  rogue-DHCP check is DHCPv4). Also deferred: LLDP-MED location content (civic-address CAtypes,
-  coordinate LCI) — returned as `format` + bytes; builders for power/location/inventory TLVs
-  (`Builder.addOrgSpecific` takes the raw info).
-- ~~**LLDP-MED (TIA-1057) and 802.3at power-via-MDI decoding**~~ **DONE 2026-10-04** *(survey 2026-09-30)* — the org TLVs a VoIP-phone/PoE-switch neighbour advertises (capabilities, network policy, location, inventory, power). Small-medium (tables + bounds checks). Fits §2.
-- ~~**More typed DHCPv4 options**~~ **DONE 2026-10-04** *(survey 2026-09-30)* — relay agent information (82), classless static routes (121), domain search (119), vendor-specific/class id (43/60), TFTP/boot file (66/67), NTP (42), plus `Builder` support for them. Small each. Fits §2.
-- ~~**DHCPv6 and ICMPv6 Neighbor Discovery codecs**~~ **DONE** *(survey 2026-09-30)* — ND 2026-10-04 (`nd`), DHCPv6 2026-11-04 (`dhcp6`, RFC 8415: header and relay header, option framing at parse, DUID, IA_NA/IA_TA/IA_PD with IA Address and IA Prefix, status code, option request, DNS/SNTP servers, domain list, `unwrap` for relay chains, `Builder`).
-- ~~**LLDP-MED location content**~~ **DONE 2026-11-04** — `MedLocation.coordinate()` (RFC 3825), `civic()` (RFC 4776 elements) and `elin()`. Civic has no foreign decoder in our oracle (tcpdump 4.99.6 prints nothing for it); its layout is checked against RFC 4776 §3.1 by hand-built vectors only.
-- **Deferred (2026-11-04):** DHCPv6 prefix-delegation exclude (67), vendor options (17) and Client FQDN (39) stay raw through `option(code)`; typed LLDP org TLV builders (power, location, inventory); RFC 3396 long-option concatenation for DHCPv4. A DHCPv6 *Authentication* (11) check is the caller's, like the other protocols' authenticity.
-
-## Status
-
-`gap · any · codec · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
-src/root.zig.
+- **Not built: budget.** DCBX ETS configuration and recommendation org TLVs (IEEE 802.1Qaz is a public
+  standard, but tcpdump 4.99.6 prints these two subtypes as hex only, so there is no anchor yet),
+  802.1Qbg EVB/CDCP, Profinet and Cisco-OUI PoE org TLVs (tcpdump's decode unchecked), an encode
+  benchmark row, a paired bench row in which ours also decodes the IAs and DUIDs (so that
+  insomniacslk/dhcp could be compared like for like).
+- Typed LLDP org TLV builders for power, location and inventory (`Builder.addOrgSpecific` takes the
+  raw info; capabilities, network policy and port VLAN have typed adders).
+- RFC 3396 long-option concatenation for DHCPv4 (typed fields keep the last occurrence).
+- A typed accessor for DHCPv6 vendor-specific information (option 17), raw through `option(code)` today.
 
 ## Anchoring
 
@@ -156,4 +190,3 @@ src/root.zig.
 
 **What the tests actually contain.** src/capture_test.zig runs 15 real LLDP/CDP/ARP/DHCP frames vendored from tcpdump's own dissector test suite (4 of them upstream crash reproducers) through these decoders (and the ARP encoder writes the real request back); since 2026-10-06 `src/tcpdump_oracle_test.zig` replays `tools/tcpdump_oracle.py`: 20 LLDP / CDP / DHCP / DHCPv6 frames built from the standards to reach every shape the decoders model (all chassis/port subtype families, TTL 0, IPv4+IPv6 management addresses, 802.1 PVID/PPVID/VLAN name, 802.3 MAC/PHY/power/max frame, LLDP-MED capabilities/policy/location/extended power/7 inventory fields, CDPv1+v2, DHCPv6 (message types, DUID-LLT/LL, IA_NA/IA_PD with addresses and prefixes, status, DNS/SNTP, domain list, option request, relay nesting), DHCP header fields and options 1/3/6/12/15/42/50-55/60/61/66/67/82/119/121) with 180 facts parsed out of tcpdump 4.99.6's own decode (2026-11-04: three DHCPv6 frames -- Solicit, a Reply with IA_NA/IA_PD/DNS/domain list, a relay-forward around a Solicit -- and an LLDP-MED coordinate LCI, whose 34-bit fields tcpdump prints unsigned) (option 119, which tcpdump leaves undecoded, from dnspython) -- the decoders must render the same facts, and the LLDP / CDP / DHCP Builders must reproduce the frames byte for byte. Not anchored: the CDP checksum of odd-length frames (tcpdump does not verify CDP checksums; the documented Cisco deviation stays as stated)
 
-**How it got there.** The anchoring work landed. DONE 941bbfe: 15 tcpdump-suite frames incl. 4 upstream crash reproducers

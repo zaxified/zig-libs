@@ -5,26 +5,28 @@ wire formats a host or switch uses to announce and learn about its
 neighbours. It is a codec only: it works on frame-payload byte buffers and
 never opens a socket (raw capture via AF_PACKET / BPF is a separate module).
 
-Status: **gap** — no spec-complete pure-Zig LLDP (or combined L2-discovery)
-library exists; this fills it. Feeds network-discovery tooling that
-previously only faked these frames.
+Scope: a spec-complete pure-Zig LLDP / CDP / ARP / DHCPv4 / DHCPv6 / ICMPv6 ND codec;
+it feeds network-discovery tooling that previously only faked these frames.
 
 ## What's in it
 
 | Sub | Protocol | Coverage |
 |-----|----------|----------|
 | `lldp` | IEEE 802.1AB LLDPDU | 7-bit-type / 9-bit-length TLV stream; mandatory Chassis ID (MAC / network-address / interface-name subtypes), Port ID, TTL, End-of-LLDPDU; optional Port Description, System Name/Description, System Capabilities (+ enabled), Management Address; org-specific (type 127) with IEEE 802.1 (port VLAN, port+protocol VLAN, VLAN name, protocol identity, VID usage digest, management VID, link aggregation, DCBX PFC and application priority), 802.3 (MAC/PHY, power via MDI incl. 802.3at, link aggregation, max frame size) and LLDP-MED / TIA-1057 (capabilities, network policy = voice VLAN, location (with `MedLocation.coordinate()`, `civic()`, `elin()`, which return an error for a malformed LCI and null for another format), extended power, inventory) decoding; unknown TLVs pass through raw. Typed `Lldpdu` model + iterators + `Builder`. |
-| `cdp` | Cisco Discovery Protocol | version/holdtime/checksum header + type/length TLVs (Device ID, Addresses, Port ID, Capabilities, Software Version, Platform, VTP domain, Native VLAN, Duplex, and since 2026-11-04 VoIP VLAN reply, power consumption, MTU, trust, CoS, system name, management addresses, location); RFC 1071 checksum compute/verify; unknown TLV passthrough. Typed `Frame` + `Builder`. |
+| `cdp` | Cisco Discovery Protocol | version/holdtime/checksum header + type/length TLVs (Device ID, Addresses, Port ID, Capabilities, Software Version, Platform, VTP domain, Native VLAN, Duplex, VoIP VLAN reply, power consumption, MTU, trust, CoS, system name, management addresses, location); RFC 1071 checksum compute/verify; unknown TLV passthrough. Typed `Frame` + `Builder`. |
 | `arp` | RFC 826 | generic `Packet` (variable hardware/protocol address lengths) plus the typed Ethernet+IPv4 `EthIpv4` request/reply/gratuitous/probe case. |
 | `dhcp` | RFC 2131 + options RFC 2132 | fixed header + magic cookie + options TLV list (message type, requested IP, server id, lease time, subnet mask, routers, DNS servers, domain/host name, parameter request list, client id, NTP servers (42), vendor-specific (43), vendor class (60), TFTP server / bootfile (66/67), relay agent info (82, sub-option iterator), domain search (119, RFC 1035 compression), classless static routes (121, RFC 3442), End/Pad); option-overload surfaced; unknown option passthrough. Typed `Message` + `Builder`. |
 | `dhcp6` | DHCPv6 (RFC 8415) | client/server and relay headers; option framing checked at parse; typed DUID (LLT/EN/LL/UUID), elapsed time, preference, rapid commit, status code, IA_NA / IA_TA / IA_PD with IA Address and IA Prefix, option request, DNS and SNTP servers, domain list, Client FQDN (partial names flagged), Vendor and User Class (all instances), Reconfigure Message / Accept, IA prefix exclude; `Message.unwrap` peels relay chains iteratively with a depth limit; `Builder` with nested options (`begin`/`end`). Other options pass through raw. |
 | `nd` | IPv6 Neighbor Discovery (RFC 4861) | RS/RA/NS/NA/redirect bodies, option walk (source/target link-layer address, prefix information, MTU, RDNSS), the ICMPv6 checksum, solicited-node address + its multicast MAC, and NS/RS builders — the IPv6 counterpart of `arp`. |
 | `mac` | — | small 48-bit EUI-48 helper: `aa:bb:cc:dd:ee:ff` parse/format + broadcast/multicast/locally-administered predicates. |
 
-Everything is bounds-checked, never a panic: malformed or truncated input is
-a typed error, except `lldp.OrgSpecific.decode`, which returns null for a value
-it cannot read as well as for one it does not recognize. Parsing allocates nothing (iterators slice the input
-buffer); builders write into a caller-provided buffer.
+Everything is bounds-checked: malformed or truncated input is a typed error,
+except `lldp.OrgSpecific.decode`, which returns null for a value it cannot read as
+well as for one it does not recognize. Builder contract violations are typed
+errors too (`dhcp.BuildError.InvalidOptionCode` / `InvalidAddressList`,
+`arp.EncodeError.InvalidLength`); the only checked panics are an out-of-range index in
+`dhcp.Ip4List.at` / `nd.Rdnss.at` and a short buffer in `Mac.format`. Parsing allocates
+nothing (iterators slice the input buffer); builders write into a caller-provided buffer.
 
 **`cdp.Frame.parse` verifies the RFC 1071 checksum by default.** That is correct — this codec
 should catch corrupted or spoofed traffic — but a lot of real gear, and virtually every hand-rolled
@@ -50,10 +52,17 @@ real loss too. Two options exist for that, both opt-in, both defaulting to the s
   produces once the TLV walk reaches it — stops the walk and returns what parsed instead of failing
   the whole frame; `Frame.trailing_tlv_truncated` reports whether this happened.
 
+## Not provided
+
+DCBX ETS, 802.1Qbg, Profinet and Cisco-OUI PoE org TLVs, typed builders for most org TLVs, RFC 3396
+long-option concatenation, and the vendor discovery protocols (EDP/FDP/SONMP): see SPEC.md
+*What is deliberately not done* and *Backlog / deferred*.
+
 ## Depends on
 
 - `netaddr` — `Ip` parse/format for LLDP/CDP management, ARP and DHCP
   addresses.
+- `icmp` — the RFC 1071 checksum for CDP and the ICMPv6 ND checksum.
 
 ## Test
 
@@ -76,5 +85,5 @@ attribution, and that file is where the obligation lives. No third-party dissect
 (Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. `src/testdata/tcpdump_facts.zig`
 (`tools/tcpdump_oracle.py`) holds frames built from the standards and the facts the `tcpdump`
 program printed for them — observed output of a black-box tool, exempt per root `NOTICE` §0.
-DHCPv6 and the LLDP-MED location decoders (2026-11-04) are clean-room from RFC 8415, RFC 3646, RFC 4075, RFC 3825 and RFC 4776; the gopacket v1.7.2/v1.7.5 and insomniacslk/dhcp sources (both BSD-3-Clause) were read for their feature lists only and nothing was ported. `tools/go_bench/` holds a Go benchmark program written for this repository (BSD-3-Clause header); its `go.mod` names gopacket v1.7.5 and insomniacslk/dhcp c6bb46ad3f3a, and its `go.sum` was produced on 2026-11-04 by `go build -mod=mod` against proxy.golang.org with the checksum database on (so the hashes are the sum database's), after the sources were swept for exec, cgo, net/http and init.
+DHCPv6 and the LLDP-MED location decoders are clean-room from RFC 8415, RFC 3646, RFC 4075, RFC 3825 and RFC 4776; the gopacket v1.7.2/v1.7.5 and insomniacslk/dhcp sources (both BSD-3-Clause) were read for their feature lists only and nothing was ported. `tools/go_bench/` holds a Go benchmark program written for this repository (BSD-3-Clause header); its `go.mod` names gopacket v1.7.5 and insomniacslk/dhcp c6bb46ad3f3a, and its `go.sum` was produced on 2026-11-04 by `go build -mod=mod` against proxy.golang.org with the checksum database on (so the hashes are the sum database's), after the sources were swept for exec, cgo, net/http and init.
 License: MIT.
