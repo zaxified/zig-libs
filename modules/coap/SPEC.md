@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nmeum/zoap](https://github.com/nmeum/zoap) | Zig | AGPL-3.0 | 10 | push 2024-12-30 | Bare-metal server; its README: "the majority of the CoAP standard is not implemented", Zig 0.13. |
 | [cvik/coap](https://github.com/cvik/coap) | Zig | MIT | 0 | push 2026-03-21 | Unadopted; not read *(inferred: scope unknown)*. |
 
-**Where we are ahead:** the most complete Zig CoAP: reliability, dedup, Block1/Block2 assembler and observe registry with RFC 7641 §7 notification budget (libcoap-style `COAP_OBS_MAX_NON` default), zero allocation, and real aiocoap datagram anchors; the only Zig CoAP found with observe and block-wise (cvik/coap not read: *(inferred)*). **Where we are behind:** no CoAP over TCP/TLS/WebSockets (RFC 8323), no multicast group helpers (RFC 7390), combined Block1+Block2 (→ Backlog items). Since 2026-11-13 the resource registry/dispatcher, CoRE link-format builder/parser with `.well-known/core` discovery, the named PATCH/FETCH/iPATCH codes, Echo/Request-Tag/No-Response options and RFC 8974 extended tokens are covered (see "Resources, link-format and RFC extras").
+**Where we are ahead:** the most complete Zig CoAP: reliability, dedup, Block1/Block2 assembler and observe registry with RFC 7641 §7 notification budget (libcoap-style `COAP_OBS_MAX_NON` default), zero allocation, and real aiocoap datagram anchors; the only Zig CoAP found with observe and block-wise (cvik/coap not read: *(inferred)*). **Where we are behind:** no CoAP over TCP/TLS/WebSockets (RFC 8323), no multicast group helpers (RFC 7390), combined Block1+Block2 (→ Backlog items). The resource registry/dispatcher, CoRE link-format builder/parser with `.well-known/core` discovery, the named PATCH/FETCH/iPATCH codes, Echo/Request-Tag/No-Response options and RFC 8974 extended tokens are covered (see "Resources, link-format and RFC extras").
 
 ## Design & invariants
 - **Layered, each independently testable:** `root` (C1) message codec — header/token/delta-encoded
@@ -54,46 +54,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Error policy:** malformed datagrams (bad TKL 9..15, option-number overflow, truncation, reserved
   SZX, oversized NUM) are typed errors, never panics.
 
-## Resources, link-format and RFC extras (2026-11-13)
-
-- **`linkformat` (RFC 6690).** `Writer` appends links to a caller buffer (`link(uri, attrs)` for any
-  attributes, `resource(uri, Params{rt, if_, ct, sz, obs, title, extra})` for the typed ones in the
-  order of the RFC 6690 §5 examples); a link that does not fit leaves the document unchanged
-  (`BufferTooSmall`). Values that are not a plain `ptoken` are written as a quoted-string with
-  `\"` / `\\` escapes. `Parser.next` validates a whole link (`<uri>` then `;name[=ptoken|"quoted"]`
-  attributes, blanks tolerated around `, ; =`, empty list elements skipped) and returns `Link`; its
-  `attrs()` iterator then cannot fail. `ParsedAttr` has `eql`, `hasToken` (blank-separated values),
-  `unescape`. `Filter.parse("rt=temp*")` / `matches(link)` implement §4.1: complete value or
-  prefix with trailing `*`, empty prefix = attribute exists, `href` filters the target URI,
-  multi-valued attributes match value by value. No percent-decoding (Uri-Query options already
-  carry decoded octets). RFC 6690 does not say how several filter parameters combine; the
-  dispatcher ANDs them.
-- **`resource` (RFC 7252 §5.8 routing, RFC 6690 §4 discovery).** `Registry` over caller storage:
-  `add` (validates the path: absolute, non-empty segments, no trailing `/`, not the reserved
-  `/.well-known/core`; `DuplicatePath`, `RegistryFull`, `BadPath`), `remove`, `find`. A `Resource` is
-  path + `Handler` (`fn (ctx, Message) Reply`) + `Methods` mask (GET/POST/PUT/DELETE/FETCH/PATCH/iPATCH,
-  default GET) + link `Params` + `hidden`. `Registry.dispatch(req, *ReplyBuf, doc_buf, .{multicast})`
-  returns the piggybacked response: 4.04 unknown path, 4.05 method not accepted, `/.well-known/core`
-  (GET only; Accept other than 40 is 4.06; a document that does not fit `doc_buf` is 5.00; an unmatched
-  discovery on a multicast request is not answered, §4.1), and RFC 7967 No-Response (a suppressed NON
-  answer is null, a suppressed CON answer is the empty ACK). Not a request: null. For a NON request the
-  caller re-sends the fields through `Server.separate(.., false)`; dedup stays before `dispatch`.
-- **Named RFC extras.** `Code.fetch/patch/ipatch` (RFC 8132 §6: 0.05/0.06/0.07), `conflict` 4.09,
-  `precondition_failed` 4.12, `unprocessable_entity` 4.22, `Code.hasRequestBody`; content formats 51
-  (json-patch) and 52 (merge-patch); options `number.echo` 252 / `request_tag` 292 (RFC 9175) with
-  `options.echo` (1..40 octets) and `requestTags` (repeatable, 0..8), `number.no_response` 258 (RFC
-  7967) with `no_response.*` bit constants, `suppresses(value, code)` and `noResponse`. RFC 8974:
-  `parseExtended` / `serializeExtended` / `encodedLenExtended` accept TKL 13 (+1 octet, length 13+x)
-  and TKL 14 (+2 octets, 269+x) after the Message ID, up to 65804 octets; lengths 9..12 have no
-  encoding; TKL 15 is a format error. Plain `parse`/`serialize` still refuse TKL 9..15 — a peer must
-  be known to support RFC 8974 (on UDP only by trial and error, §2.2.2), so the extended form is
-  opt-in. The RFC 8974 CSM Extended-Token-Length option (signalling code 7.01, number 6) belongs to
-  RFC 8323 and waits for it.
-- **Verification.** RFC examples as goldens: RFC 6690 §5 documents (writer exact bytes, parser), §4.1
-  filter examples; RFC 8132 §6, RFC 9175 Table, RFC 7967 §2.1 values and 8974 §2.1 encodings. Fuzz
-  harnesses `coap-linkformat-parse` (parser + filter + writer round-trip model) and
-  `coap-resource-dispatch` (datagram → parse → dispatch → serialize), reach tests in the suite.
-  Mutation of the new code is not run.
+## Resources, link-format and RFC extras
 
 ## Threat model / out of scope
 CoAP itself is unauthenticated/unencrypted on the wire. This module is transport-agnostic — the
@@ -110,24 +71,22 @@ block size, and rejects a mid-transfer SZX change with a typed error rather than
 
 Four items are attacker-triggerable **on an unauthenticated, connectionless UDP transport**. The
 first two are **bounded (admission hook + DTLS seam)**, the third is **NOT bounded here**, and the
-fourth is bounded by a per-subscription budget the push path consults (since 2026-09-13; before
-that it was recorded as unbounded). Saying so is the point — the 2026-09-03 drift audit found this section enumerating two items and
-calling them addressed, which reads as though the UDP surface had been enumerated. It had not:
+fourth is bounded by a per-subscription budget the push path consults:
 
 1. **Message-ID dedup window** (§4.5, `reliability.Dedup`) — caller-storage-bounded; an attacker who
    can inject packets can flood it with distinct message IDs to evict a legitimate exchange's entry
    before its retransmission window elapses, after which a replayed/retransmitted message with that
    ID is no longer recognized as a duplicate and is reprocessed. `Dedup`'s table size (the caller's
-   storage slice) and remembered-duration (`lifetime_ms`) were already caller-configurable — a
+   storage slice) and remembered-duration (`lifetime_ms`) are caller-configurable — a
    deployment sizes both for its expected authenticated-peer/exchange count — but sizing alone
    doesn't change what kind of control this is: **`Dedup` is a reliability control (duplicate
    suppression), not a replay-security control.** It becomes a security boundary only once the
    *source* is authenticated, i.e. run over the DTLS seam above, so that flooding one peer's window
    requires being that peer. See `reliability.zig`'s `Dedup` doc comment.
 2. **Observe subscription registry** (§C7, `observe.Registry`) FIFO-evicts the oldest subscription
-   when full. `Registry` now offers an **admission hook**: `admit_fn`/`admit_ctx` (type
+   when full. `Registry` offers an **admission hook**: `admit_fn`/`admit_ctx` (type
    `observe.AdmitFn`, a plain function pointer + opaque context — no allocation, no closures) plus
-   an optional **per-source cap** (`max_per_source`), both consulted by the new `Registry.tryRegister`
+   an optional **per-source cap** (`max_per_source`), both consulted by the `Registry.tryRegister`
    entry point (the unconditional `register` primitive is unchanged, for callers that gate admission
    themselves or trust their transport). A hook that returns `false`, or a source at its cap, is
    rejected *before* the table is touched — no eviction of any existing entry. `source_id` is the
@@ -149,7 +108,7 @@ calling them addressed, which reads as though the UDP surface had been enumerate
    MUST be interspersed with confirmable messages." `Registry`'s two admission controls —
    `admit_fn` and `max_per_source` — bound **how many rows of the table one source occupies**, not
    what a registration costs, which is the stream of notifications that follows it. That stream is
-   now bounded by `Registry.Entry.non_since_ack` + `last_ack_ms` and the push-path decision point
+   bounded by `Registry.Entry.non_since_ack` + `last_ack_ms` and the push-path decision point
    `Registry.notificationType`: after `max_non_between_acks` non-confirmable notifications
    (default 5, libcoap's `COAP_OBS_MAX_NON` — §7 names no number) it returns `.confirmable` and
    keeps doing so until the caller reports an ACK through `Registry.acknowledged`; it also returns
@@ -157,14 +116,14 @@ calling them addressed, which reads as though the UDP surface had been enumerate
    `max_non_between_acks = null` switches the budget off, which §7 permits only for an
    authenticated client. The module still never sends anything: a caller that ignores
    `notificationType` is not bounded, which is why the push-path contract is in `observe.zig`'s
-   module doc comment. Recorded as unbounded by the 2026-09-03 audit, fixed 2026-09-13 (A1).
+   module doc comment.
    Note also §7's closing sentence — "an attacker
    may still spoof the acknowledgements if the confirmable messages are sufficiently predictable".
    The confirmable messages it means are the server's notifications, and their ACK is normally an
    empty message echoing only the **Message ID** — so what has to be unpredictable is
    `server.Server.init`'s `seed_mid`, not the client's token (in the amplification attack the
-   spoofer chose the token itself). Until the 2026-10-06 review this paragraph credited
-   `client.Client.init`'s token seed; `Server.init` now carries the CSPRNG requirement. The
+   spoofer chose the token itself); `Server.init` and `Registry.acknowledged` state the CSPRNG
+   requirement, and nothing here can test a seed's entropy. The
    registry also does not check that a CON was outstanding when `acknowledged` is called: binding
    the ACK to the CON's Message ID is the caller's (documented) job, not enforced here.
 
@@ -173,88 +132,28 @@ hook and cap bound what an *admitted* or *uncapped* misbehaving source can do, b
 an untrusted network is DTLS (peer authentication) terminated by the caller, feeding a real
 `source_id` and `admit_fn` policy into `Registry.tryRegister`.
 
-**Review 2026-10-06 (adversarial, post-2026-09-03 code).** Scope: the RFC 7641 §7 notification
-budget (2026-09-13: `Registry.notificationType`/`acknowledged`, `Entry.non_since_ack`/`last_ack_ms`,
-the §4.5 24-hour rule) and the 2026-09-07 `fuzzParse` rewrite, plus every claim of this threat model
-against the code. Checked: budget arithmetic (saturating counter, saturating clock difference, a
-budget lowered at run time below the live count, `0` and `null`), that a refresh neither resets the
-budget nor the 24-hour clock while a fresh slot starts both, eviction/cancel moving the new fields
-with their entry, `tryRegister`'s reject-before-touch, and that the fuzz harness's round-trip
-assertion holds (the option-nibble encoding is canonical, so `serialize` of any accepted datagram
-reproduces it). No memory-safety, panic or allocation defect found. Findings: **M1** (doc/contract,
-fixed in docs) — this section and `Client.init` attributed §7's ACK-predictability warning to the
-client's token seed; the ACK that resets the budget echoes only the server notification's Message
-ID, which came from an undocumented `Server.init(seed_mid)` counter, so a constant seed let an
-off-path spoofer forge the ACK and defeat the budget. `Server.init` and `acknowledged` now state the
-requirement; nothing here can test a seed's entropy. **L1** (not fixed, API change) — `acknowledged`
-resets the budget whether or not a confirmable notification was outstanding; enforcing it needs the
-CON's Message ID in the registry (a signature change). **L2** (not fixed, not peer-reachable) —
-`register`/`tryRegister` silently truncate a token longer than 8 octets and `find` then never
-matches it, so such an entry can be neither notified, acknowledged nor cancelled; `parse` rejects
-TKL > 8, so only a caller can supply one. **L3** (fixed) — README's `tryRegister` signature lacked
-`now_ms` since 2026-09-03.
+Known limit: `Registry.register`/`tryRegister` truncate a token longer than 8 octets to 8 (`coap.max_token_len`), so
+`find` never matches such an entry and it can be neither notified, acknowledged nor cancelled;
+`parse` rejects TKL > 8, so only a caller can supply one.
 
 ## Verification
-**External anchor (`external_goldens.zig`, +8 tests).** README/SPEC previously described this
-module as clean-room from RFC 7252 with no third-party CoAP source consulted — true, but every
-golden datagram and both end-to-end block/observe tests above were self-authored AND
-self-round-tripped, which cannot catch a convention that is wrong the same way on both sides of a
-pair (see the teeth-check on `Block.encode`/`decode`'s byte order in the file's own doc comment: a
-mutation invisible to every hand-built test here, including this file's own multi-byte-NUM
-round-trip, since it never leaves this module's own encoder/decoder pair). This anchor uses real
-`aiocoap` (0.4.17) datagrams from two independent real endpoints: a real `aiocoap-client` and a real
-`aiocoap.resource.Site` server — a plain GET, a full real 3-block Block2 GET reassembly, a real
-Block1 PUT with a genuine chained Block1+Size1 option delta, a real Observe registration followed by
-two genuinely live-pushed notifications (driving this module's own `Registry`/`Sequence` with the
-real sequence numbers), and a real multi-byte (2-byte) Block value from a 17-block transfer.
-⚠ **"Two independent real endpoints" means two endpoints of ONE implementation** — `aiocoap-client`
-and `aiocoap.resource.Site`, one version, one codec. A misreading of RFC 7252 *inside* aiocoap is
-invisible to this anchor in exactly the way a self-round-trip would be; what the anchor rules out is
-a defect private to *this* module, which is what the byte-order example above is. ⚠ And every
-capture is a well-formed loopback CON/ACK exchange with TKL 2: **no golden exercises a refusal
-path**, so every `ParseError`, `Block.DecodeError` and `FormatError` branch is anchored by
-hand-authored tests alone. A real,
-reported (non-bug) finding: `aiocoap-client` elides `Uri-Host` for a destination-matching IP literal
-(RFC 7252 §6.4 SHOULD); this module's `options.optionsFromUri` never elides it. See the file's doc
-comment for what was captured and the attribution (root `NOTICE` §0 — black-box oracle, no source
-consulted). ⚠ That doc comment is a NARRATIVE, not a recipe: it names no command, no server
-resource definitions and no ports, and `aiocoap` is not installed on the audit host — so the bytes
-are frozen and cannot currently be re-taken by following what is written. Recorded, not fixed
-(2026-09-03); closing it means committing the capture client + server script.
 
-`scripts/modtest coap` — offline tests. Codec: golden-byte CON GET round-trip, extended
-option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error
-matrix, `encodedLen` agreement. Options: class bits, uint codec boundaries + round-trip, typed
-accessors, URI↔options mapping (percent-encoding, coaps, bad-scheme, a hostile Uri-Host escaped
-rather than emitted verbatim). Reliability: retransmit schedule (jitter, full backoff to
-`timed_out`, `ack`/`onReset`, custom `max_retransmit`), dedup window (fresh/duplicate/expiry/eviction,
-zero-length storage never panics). Client/server: request assembly + counter advance,
-`Exchange.match` across all five reply kinds, `isRequest` gating, response builders, an end-to-end
-client→server→client round-trip. Block-wise/Observe: Block codec edge cases, `split` boundary +
-`Assembler` completion (in-order assembly, a lone high-`num` final block rejected rather than
-reported complete, a mid-stream gap rejected, a mid-transfer SZX change rejected), two end-to-end
-block transfers (byte-exact 3000-byte Block2 GET reassembly; Block1 PUT with `2.31 Continue`),
-Sequence wrap + lollipop comparison, Registry (freshness-checked notify, FIFO eviction, re-register
-refresh), `Registry.tryRegister` admission policy (no-hook/no-cap parity with `register`, a rejected
-hook neither registers nor evicts, an admitted source registers even table-full, a per-source cap
-bounds one source's share without evicting), end-to-end observe register→notify→stale-reject→cancel,
-CON-notification-timeout/RST cancellation glue. Green in Debug + ReleaseFast.
-
-**Audit 2026-11-17 (whole-module mutation).** 644 mutants over every runtime line of the nine source files: the codec (header fields, TKL 9..15 and the RFC 8974 extended forms at 12/13/268/269 and at the maximum 269 + 65535, option delta/length nibbles and their 13/14 extension bytes, the u16 option-number ceiling, payload marker, every exact-fit buffer boundary in `parse`/`serialize`/`encodedLen`), the option layer (class bits, uint codec, accessor length limits, the URI-to-options mapping: scheme case, authority end, IPv6 brackets, default ports, host lowering, scratch accounting, option-array capacity, empty path and query segments, and every byte of the three percent-encoding sets), retransmission (jitter clamp, saturation, deadline at the poll instant, the retransmit budget) and message-ID dedup (expiry at the instant, tie and soonest-to-expire eviction, compaction), Block1/Block2 (value codec, `split` edges, assembler gap, SZX change, exact buffer), client correlation and token bytes, the server helpers, Observe (the RFC 1982 half-space edges, the 128 s and 24 h rules, the admission hook and per-source cap, FIFO eviction, `cancel` shifting), link-format writer/parser/filter (every `attr-char` and `ptokenchar`, quoting and escaping, blanks, rollback) and the resource registry/dispatcher (method matrix, path rules, No-Response, option buffers, discovery filters). Round 1 (ReleaseSafe, one switch per mutant): 467 killed, 177 survived. 34 tests were added across the files; they killed 163 of the survivors in round 2, and two more (a live entry followed by an expired one in `Dedup`, an upper-case host as the only scratch user in `buildRequest`) in a third pass after those tests were sharpened. 12 remain, each with its reason. EQUIVALENT (8): `parse` of TKL 13/14 whose extension byte is the last byte (2 mutants; Truncated either way), `decodeUint` over more than 8 bytes (u64 `<<` drops the shifted-out bytes silently), `firstOption`'s early exit (cost-only on sorted options), `Dedup`'s `keep == 0` test (slot 0 was just written), `usedScratch`'s `tail > end` (scratch is handed out in option order, so the last scratch-backed value is the furthest), `scanAttr`'s lone backslash at the end (Malformed either way), `Filter.matches`' flag-attribute skip (a flag has no tokens). UNOBSERVABLE (4): the port's scratch advance (a later percent-decode window starts on the port bytes, but the backwards decoder only fills `window[2k..]` for k >= 1 escapes and a port is at most two bytes: observable only with a forward decoder), the two `Assembler.accept` overflow codes (a `usize` product of a `u32` and at most 1024, or a sum with a slice length, cannot overflow on the module's 64-bit target; a 32-bit `usize` build would reach them), and the discovery loop's unparseable-link branch (the link was just written by `Writer.resource`, which validates it). Not mutated, because the value is a comptime constant (a runtime switch cannot reach it): the option numbers, content-format ids, `default_max_age`, the default ports, `max_num`, `Methods.all`, the `Params` defaults. One pinned quirk: a non-default `Uri-Port` asks for an 8-byte scratch window although its value needs at most two bytes (tests pin 8 accepted, 7 refused). Counts on the card are whole-module.
+- **Run:** `scripts/modtest coap` (offline).
+- **Test classes:** codec (golden-byte CON GET round-trip, extended option nibbles at the 13/269 boundaries, payload-marker edge cases, the full parse/serialize error matrix, `encodedLen` agreement, the RFC 8974 extended forms); options (class bits, uint codec boundaries and round-trip, typed accessors, URI-to-options mapping with percent-encoding, `coaps`, bad scheme, a hostile Uri-Host escaped rather than emitted verbatim); reliability (retransmit schedule with jitter and full backoff to `timed_out`, `ack`/`onReset`, custom `max_retransmit`, the dedup window: fresh/duplicate/expiry/eviction, zero-length storage never panics); client/server (request assembly and counter advance, `Exchange.match` across all five reply kinds, `isRequest` gating, response builders, an end-to-end client-server-client round trip); block-wise (value codec edges, `split` boundary and `Assembler` completion, a lone high-`num` final block and a mid-stream gap rejected, a mid-transfer SZX change rejected, byte-exact 3000-byte Block2 GET reassembly, Block1 PUT with `2.31 Continue`); Observe (`Sequence` wrap and lollipop comparison, freshness-checked notify, FIFO eviction, re-register refresh, the `tryRegister` admission policy, the notification budget, end-to-end register/notify/stale-reject/cancel, CON-notification timeout and RST cancellation glue); link-format and resources (RFC 6690 §5 documents as exact writer bytes and parser input, the §4.1 filter examples, RFC 8132 §6, RFC 9175 table, RFC 7967 §2.1 and RFC 8974 §2.1 encodings as goldens, the dispatcher's method matrix and discovery).
+- **External anchor** (`src/external_goldens.zig`): datagrams captured from real `aiocoap` 0.4.17 endpoints (an `aiocoap-client` and an `aiocoap.resource.Site` server) through a byte-logging UDP proxy: a plain GET, a full 3-block Block2 GET reassembly, a Block1 PUT with a chained Block1+Size1 option delta, an Observe registration followed by two live-pushed notifications (driving this module's `Registry`/`Sequence` with the real sequence numbers), and a multi-byte Block value from a 17-block transfer. This catches a convention wrong the same way on both sides of a self-round-trip (the `Block.encode`/`decode` byte order is the example in the file's doc comment). Limits of the anchor: both endpoints are one implementation, so a misreading of RFC 7252 inside `aiocoap` is invisible to it; every capture is a well-formed loopback CON/ACK exchange with TKL 2, so no golden exercises a refusal path (every `ParseError`, `Block.DecodeError` and `FormatError` branch is anchored by hand-authored tests alone); the captures are frozen bytes, and the file's doc comment is a narrative, not a recipe (see Backlog). Observed difference, not a bug: `aiocoap-client` elides `Uri-Host` for a destination-matching IP literal (RFC 7252 §6.4 SHOULD); `options.optionsFromUri` never elides it. Attribution: root `NOTICE` §0 (black-box oracle, no source consulted).
+- **Fuzz:** deterministic driver prefix `COAP_FUZZ` (`COAP_FUZZ=<runs>[,<first seed>]`; harness names `coap-<file>-<function>`): `coap-root-parse` (parse then serialize round-trip: the option-nibble encoding is canonical, so `serialize` of any accepted datagram reproduces it), `coap-linkformat-parse` (parser, filter and writer round-trip model) and `coap-resource-dispatch` (datagram, parse, dispatch, serialize); reach tests in the suite.
+- **Mutation:** the whole-module run covers every runtime line of the nine source files. Not mutated, because the value is a comptime constant a runtime switch cannot reach: the option numbers, content-format ids, `default_max_age`, the default ports, `max_num`, `Methods.all`, the `Params` defaults. One pinned quirk: a non-default `Uri-Port` asks for an 8-byte scratch window although its value needs at most two bytes (tests pin 8 accepted, 7 refused).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
-Combined Block1+Block2 in one exchange (RFC 7959 §3.3) and SZX renegotiation mid-transfer — both
-documented in `block.zig`, not built.
 
+- Combined Block1+Block2 in one exchange (RFC 7959 §3.3) and SZX renegotiation mid-transfer — both documented in `block.zig`, not built (the assembler tolerates only a constant block size and rejects a mid-transfer SZX change with a typed error).
 - (2026-11-13) **Discovery over Block2**: a `/.well-known/core` document larger than the caller's `doc_buf` is 5.00, not a block-wise answer; the dispatcher also has no Observe/Block hooks per resource (callers wire `observe`/`block` in handlers). RFC 6690 `rel`/`anchor`/`rev` semantics (context URI resolution) are not interpreted, only parsed.
-- (2026-11-13) **Mutation run of `linkformat`, `resource` and the RFC 8974 paths** (a new-code delta run, owner rule 2026-11-12).
 - (survey 2026-09-30) **CoAP over TCP/TLS (RFC 8323)** framing + CSM signalling: needed for firewalled/cloud gateways; libcoap and go-coap have it; medium, fits §2 (framing is pure; TLS is the BYO seam).
 - (2026-11-13) **RFC 9175 Echo/Request-Tag server logic** (freshness challenge state, Request-Tag block-operation tracking) is not built; only the options' numbers and typed accessors are.
 - (survey 2026-09-30) **Multicast (RFC 7390) group helpers**: response-delay/NON handling for discovery; small-medium, fits §2.
-
-## Status
-`gap · any · util(codec)+client+server · reentrant` + deps: none (std only) — canonical source is
-`pub const meta` in src/root.zig.
+- **Bind `Registry.acknowledged` to the outstanding CON's Message ID** (review 2026-10-06, L1): today it resets the budget whether or not a confirmable notification was outstanding; enforcing it needs the CON's Message ID in the registry (a signature change). Until then the caller's contract (documented in `observe.zig`) is to report only a matching ACK.
+- **Commit the capture recipe of the external goldens** (the capture client and server script, the resource definitions and ports): `aiocoap` is not installed on the audit host, so the frozen bytes cannot currently be re-taken by following the file's doc comment (recorded 2026-09-03).
 
 ## Anchoring
 
@@ -265,4 +164,3 @@ documented in `block.zig`, not built.
 
 **What the tests actually contain.** src/external_goldens.zig replays real aiocoap 0.4.17 client<->server datagrams captured through a byte-logging UDP proxy (plain GET, the full 3-pair Block2 transfer, Block1 PUT with a real Uri-Path/Block1/Size1 delta chain, a live Observe push, multi-byte Block NUM); options/reliability/server scheduling in root.zig stay hand-authored
 
-**How it got there.** The anchoring work landed. DONE 0b466d6: real aiocoap block-wise + observe; self-consistent endianness mutation caught

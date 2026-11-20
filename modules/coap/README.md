@@ -2,8 +2,9 @@
 
 CoAP (RFC 7252) **message codec** — the binary wire format of the Constrained
 Application Protocol, the REST-over-UDP protocol used by constrained / IoT
-devices. This is the message layer (C1): `parse` and `serialize` a CoAP message
-— header, token, **delta-encoded options** and payload.
+devices. The message layer (C1) is `parse` and `serialize` of a CoAP message
+— header, token, **delta-encoded options** and payload; the layers above it
+are listed below.
 
 Zero-allocation and transport-agnostic: `parse` fills a caller-provided option
 array from a datagram (values borrow the datagram); `serialize` writes a message
@@ -119,9 +120,7 @@ same caller-driven, borrow-the-buffer style:
 - Also: response codes `2.31 Continue` / `4.08 Request Entity Incomplete` and the
   `block1` / `block2` / `size2` option numbers.
 
-**Deferred** (documented in `block.zig`, not built): combined Block1+Block2 in a
-single exchange (RFC 7959 §3.3), and SZX renegotiation mid-transfer (the
-assembler tolerates a constant block size only).
+The assembler tolerates a constant block size only (see *Not provided* below).
 
 ## Observe (`coap.observe`)
 
@@ -163,45 +162,34 @@ server pushes a notification on each change (C7):
   itself is unchanged and still admits unconditionally, for callers that gate
   admission themselves.
 
-## Scope
+## Resources, link-format and RFC extras
 
-Done: the full client/server stack — message codec (C1), typed options / URI
-mapping (C2), the §4 reliability layer (C3), the §5 client (C4) / server (C5),
-plus block-wise transfer (C6, RFC 7959) and Observe (C7, RFC 7641). Deferred
-within C6: combined Block1+Block2 in one exchange (RFC 7959 §3.3) and SZX
-renegotiation mid-transfer.
+- **`coap.linkformat`** (RFC 6690) — `Writer` appends links to a caller buffer
+  (`link`, and `resource` with the typed `Params`), `Parser` validates and
+  iterates a link-format document, `Filter` implements the §4.1 query filter.
+- **`coap.resource`** — a `Registry` over caller storage routes a request by
+  Uri-Path to a `Handler` (method mask GET/POST/PUT/DELETE/FETCH/PATCH/iPATCH),
+  answers 4.04 / 4.05, serves `/.well-known/core` (filtered discovery; a
+  multicast request with no match is not answered) and applies RFC 7967
+  No-Response; `Registry.dispatch` returns the piggybacked response.
+- **Named RFC extras** — the RFC 8132 codes (`Code.fetch/patch/ipatch`), a few
+  more named codes and content formats, the RFC 9175 Echo / Request-Tag
+  options with typed accessors, RFC 7967 No-Response, and RFC 8974 extended
+  token lengths (`parseExtended` / `serializeExtended` / `encodedLenExtended`,
+  opt-in: plain `parse`/`serialize` refuse TKL 9..15).
 
-## Verification
+## Not provided
 
-`scripts/modtest coap` — offline tests. Block-wise / Observe: the Block
-value codec (field packing, SZX sizes, minimal encoding, reserved-SZX / too-long
-/ over-large-NUM errors), `split` boundary + `Assembler` completion, and two
-end-to-end block transfers (a 3000-byte Block2 GET loop reassembled and compared
-byte-for-byte; a Block1 PUT with `2.31 Continue` per non-final block); the
-Observe `Sequence` wrap, `isNewer` lollipop comparison, value round-trip, the
-`Registry` (freshness-checked notify, FIFO eviction, re-register refresh),
-`Registry.tryRegister` admission policy (no-hook/no-cap parity with `register`,
-a rejected hook neither registers nor evicts an existing entry, an admitted
-source still registers when the table is full, a per-source cap bounds one
-source's share without evicting), an end-to-end observe register →
-notifications → stale-reject → cancel, and the CON-notification-timeout / RST
-cancellation glue. Client/server: `buildRequest`
-option assembly + counter advance, `Exchange.match` across all five reply
-kinds, NON typing, `isRequest` gating, `piggyback`/`ackOnly`/`separate`
-builders, and an end-to-end client→server→client round-trip. Reliability: the retransmit
-schedule (jitter selection, the full 4-retransmit backoff to `timed_out`,
-`ack`/`onReset`, custom `max_retransmit`) and the dedup window (fresh/duplicate,
-expiry-from-first-sight, independence, full-storage eviction). Codec: a hand-built CON GET
-datagram round-trips to exact bytes; extended option nibbles across the 13/269
-boundaries; payload marker + lone `0xFF`; the full parse/serialize error matrix;
-`encodedLen` agreement. Options: class bits, `decodeUint`/`encodeUint`
-boundaries + no-leading-zeros round-trip, the typed accessors, and
-`optionsFromUri`/`uriFromOptions` (host/port/path/query, percent-en/decoding,
-coaps, bad-scheme, URI round-trips). Original codec details: a hand-built CON GET datagram with a
-token and repeated Uri-Path options round-trips to exact bytes; the extended
-option nibble forms across the 13 and 269 boundaries (incl. option number 300 →
-`0xE1 0x00 0x1F`); payload marker parse/serialize + a lone `0xFF` → EmptyPayload;
-the full parse-error matrix (TooShort / BadVersion / BadTokenLength / Truncated /
-BadOption / TooManyOptions) and serialize errors (OptionsNotSorted /
-BadTokenLength / BufferTooSmall); `encodedLen` agreement; `Code` helpers. Green
-in Debug + ReleaseFast.
+CoAP over TCP/TLS/WebSockets (RFC 8323), multicast group helpers (RFC 7390),
+combined Block1+Block2 in one exchange and mid-transfer SZX renegotiation, the
+RFC 9175 server-side Echo/Request-Tag logic, and block-wise discovery answers:
+see `SPEC.md` "Backlog / deferred". Congestion control beyond the §4.8
+transmission parameters is out of scope (`SPEC.md` "Threat model").
+
+## Verify
+
+`scripts/modtest coap` runs the offline tests: the codec error matrix and golden
+bytes, options and URI mapping, reliability, client/server round trips,
+block-wise and Observe end to end, link-format and dispatch goldens from the
+RFC examples, and real `aiocoap` datagrams (`src/external_goldens.zig`).
+Fuzz harnesses run under `COAP_FUZZ`; see `SPEC.md` "Verification".
