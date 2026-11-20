@@ -10948,6 +10948,9 @@ test "export: string lists and a literal pattern are stated only where the modul
         try expectExportLacks(&.{.{ .field = "f", .kind = k, .one_of = &.{"a"}, .ignore_case = true }}, "x-oneOfIgnoreCase");
         try expectExportLacks(&.{.{ .field = "f", .kind = k, .none_of = &.{"a"}, .ignore_case = true }}, "x-noneOfIgnoreCase");
     }
+    // A literal beside a non-literal in `patterns`: only the literal is left out.
+    try expectExportLacks(&.{.{ .field = "f", .kind = .int, .patterns = &.{ lit, .{ .prefix = "a" } } }}, "\"const\"");
+    try expectExportHas(&.{.{ .field = "f", .kind = .int, .patterns = &.{ lit, .{ .prefix = "a" } } }}, "\"allOf\":[{\"pattern\":\"^a\"}]");
     // Kept where they are enforced.
     try expectExportHas(&.{.{ .field = "f", .kind = .string, .pattern = lit }}, "\"const\":\"x\"");
     try expectExportHas(&.{.{ .field = "f", .kind = .any, .pattern = lit }}, "\"const\":\"x\"");
