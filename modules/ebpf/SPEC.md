@@ -651,7 +651,7 @@ section *types* and never needed a name.
 | `.BTF` / `.BTF.ext` | the type graph; per-section `func_info`/`line_info`/`core_relo` |
 | `.rodata*`, `.data*`, `.bss*` | one internal single-entry `ARRAY` map each |
 | `.rel<section>` | `SHT_REL` relocations (note: **no dot** between `.rel` and the section name — `kprobe/x`'s live in `.relkprobe/x`) |
-| `.text` | sub-programs — `error.SubprogramCallsUnsupported` if referenced |
+| `.text` | sub-programs, split at their `STT_FUNC` symbols; linked into every program that calls them (below) |
 
 ### The two indirections that are easy to get wrong
 
@@ -678,6 +678,23 @@ section *types* and never needed a name.
    `sym.st_value + insn[0].imm`. Both halves matter — clang emits the offset
    in `st_value` for a named global (`tag` at byte 8 of `.rodata`) and in
    `insn.imm` for an `STT_SECTION` symbol.
+
+### Sub-programs are linked at `open`
+
+A non-inlined helper (`static __noinline`, or a global function) compiles to a function in `.text`, reached by an
+`R_BPF_64_32` call relocation; a callback handed to `bpf_loop`/a timer is an `LD_IMM64` against `.text`; a call between
+two functions of one section has no relocation at all (its `imm` is already relative). `open` resolves all three the way
+libbpf does: the callee is `st_value / 8 + imm + 1` instructions into its section (a global function's symbol is the
+function and `imm` is -1; a static one's symbol is the section and `imm` carries the offset), it must be the start of a
+function (`error.UnresolvedRelocation` otherwise), and every program that reaches it, directly or through another
+sub-program, gets its own copy appended after its instructions. Calls become `BPF_PSEUDO_CALL` with the relative offset,
+callback addresses `BPF_PSEUDO_FUNC`; a callee's map and data relocations, CO-RE relocations, `func_info` and
+`line_info` come along with their instruction indices shifted, so `relocateProgram`, `applyCoreRelos` and `load` see
+one ordinary instruction stream with one `func_info` record per function (what the kernel demands). A callee is appended
+once per program, so recursion terminates (the kernel refuses it at verification); a program over `max_program_insns`
+after linking is `error.ProgramTooLarge`. A call inside one function's own range with no relocation is left alone.
+Not verified against a live kernel here (no `CAP_BPF` on the development machine): the golden checks are structural
+(every call lands on a `func_info` start, every relocation on an `LD_IMM64`).
 
 ### Order of operations in `load`
 
@@ -716,8 +733,7 @@ big the log would have been. `Object.verifier_log` and
 ### Refused, not half-done
 
 Every one is a typed error naming the symbol or section:
-`error.SubprogramCallsUnsupported` (an `R_BPF_64_32` call relocation, or a
-`LD_IMM64` against `.text`), `error.ExternSymbolUnsupported` (any
+`error.ExternSymbolUnsupported` (any
 `SHN_UNDEF` symbol: kfunc, extern kconfig, weak extern),
 `error.MapInMapUnsupported` (a `values` member),
 `error.PinningUnsupported`, `error.UnknownMapMember`,
@@ -934,10 +950,6 @@ guards, and bitfield-of-array members clang never emits. The privileged lane (th
 The object loader's gaps (CO-RE kinds, sub-program calls, externs, map-in-map, pinning) are typed errors naming the
 symbol, never a mis-load; the attach and API gaps are simply absent.
 
-- **Sub-program (`.text`) call linking.** A program calling a non-inlined helper function of its own compiles to an
-  `R_BPF_64_32` call relocation into `.text`; loading it means concatenating the callee's instructions onto the caller's,
-  fixing the call's relative offset, merging `func_info`/`line_info` and re-running the callee's own relocations. Refused
-  with `error.SubprogramCallsUnsupported`.
 - **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
   `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
   parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.

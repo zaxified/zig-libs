@@ -414,8 +414,7 @@ global-data relocations, per-program `func_info`/`line_info` slicing with
 grown from `log_true_size` so it is never truncated.
 
 What it refuses with a typed error naming the symbol, rather than emitting a
-silently broken program: `error.SubprogramCallsUnsupported` (a
-`R_BPF_64_32` call into `.text`), `error.ExternSymbolUnsupported` (kfuncs,
+silently broken program: `error.ExternSymbolUnsupported` (kfuncs,
 extern kconfig/ksym), `error.MapInMapUnsupported` (a `values` member),
 `error.PinningUnsupported`.
 

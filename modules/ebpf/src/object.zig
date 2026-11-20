@@ -405,6 +405,31 @@ pub const Relo = struct {
     sym_name: []const u8,
 };
 
+/// What a call-site relocation refers to.
+pub const CallSiteKind = enum {
+    /// `call` with `src_reg == BPF_PSEUDO_CALL`: `imm` becomes the relative
+    /// instruction offset of the sub-program.
+    call,
+    /// `LD_IMM64` of a sub-program's address (a callback handed to
+    /// `bpf_loop`, a timer, ...): becomes `BPF_PSEUDO_FUNC`.
+    func_addr,
+};
+
+/// A reference from one function to another, resolved by `open` (it appends
+/// the callee to the program and patches the instruction); empty afterwards.
+pub const CallSite = struct {
+    kind: CallSiteKind,
+    /// Index into the referring function's instruction slice.
+    insn_idx: u32,
+    /// The callee: its ELF section and its byte offset inside it.
+    sec_idx: usize,
+    sec_byte_off: u64,
+};
+
+/// Ceiling on the instruction count of one program after sub-programs are
+/// linked in (the kernel's own limit for a privileged load is 1M).
+pub const max_program_insns: usize = 1 << 20;
+
 /// One program: an instruction range of one program section, named by the
 /// `STT_FUNC` symbol that covers it.
 pub const ProgramSpec = struct {
@@ -430,6 +455,9 @@ pub const ProgramSpec = struct {
     func_info: []btfext.FuncInfo,
     line_info: []btfext.LineInfo,
     core_relos: []btfext.CoreRelo,
+    /// Sub-program references still to be resolved (always empty on an
+    /// `Object` returned by `open`).
+    call_sites: []CallSite = &.{},
     /// `-1` until `Object.load` loads it.
     fd: linux.fd_t = -1,
 
@@ -454,8 +482,9 @@ pub const ParseError = error{
     UnsupportedRelocation,
     /// A relocation naming a map/section that does not exist.
     UnresolvedRelocation,
-    /// `R_BPF_64_32` / a `BPF_PSEUDO_CALL` into `.text`.
-    SubprogramCallsUnsupported,
+    /// A program that, with its sub-programs linked in, exceeds
+    /// `max_program_insns`.
+    ProgramTooLarge,
     /// An `SHN_UNDEF` symbol — kfunc, extern kconfig, or weak extern.
     ExternSymbolUnsupported,
     /// The object has no `.symtab`, so nothing can be relocated.
@@ -721,6 +750,7 @@ fn parseImage(
     // ── pass 1: classify sections ──
     var prog_secs: std.ArrayList(usize) = .empty;
     var data_secs: std.ArrayList(usize) = .empty;
+    var text_secs: std.ArrayList(usize) = .empty;
     var unknown: std.ArrayList([]const u8) = .empty;
     var maps_btf_sec: ?usize = null;
     var maps_legacy_sec: ?usize = null;
@@ -766,7 +796,10 @@ fn parseImage(
             (s.sh_flags & elfsym.SHF_ALLOC) != 0 and
             s.sh_type == elfsym.SHT_PROGBITS and s.sh_size != 0;
         if (!executable) continue;
-        if (std.mem.eql(u8, name, ".text")) continue;
+        if (std.mem.eql(u8, name, ".text")) {
+            text_secs.append(a, i) catch return error.OutOfMemory;
+            continue;
+        }
         if (classifySection(name) == null) {
             unknown.append(a, name) catch return error.OutOfMemory;
             continue;
@@ -799,14 +832,27 @@ fn parseImage(
 
     // ── pass 4: programs ──
     var progs: std.ArrayList(ProgramSpec) = .empty;
-    for (prog_secs.items) |i| try splitProgramSection(&obj, a, i, &progs);
+    for (prog_secs.items) |i| try splitProgramSection(&obj, a, i, classifySection(obj.image.sectionName(i)).?, &progs);
     obj.programs = progs.toOwnedSlice(a) catch return error.OutOfMemory;
+    // `.text` holds the sub-programs: functions that are not entry points.
+    var subs: std.ArrayList(ProgramSpec) = .empty;
+    for (text_secs.items) |i| try splitProgramSection(&obj, a, i, .{
+        .def = .{ .prefix = ".text", .prog_type = .unspec },
+        .target = "",
+    }, &subs);
 
     // ── pass 5: relocations + .BTF.ext slices ──
     for (obj.programs) |*p| {
         try collectRelocations(&obj, a, p);
         try sliceBtfExt(&obj, a, p);
     }
+    for (subs.items) |*p| {
+        try collectRelocations(&obj, a, p);
+        try sliceBtfExt(&obj, a, p);
+    }
+
+    // ── pass 6: link sub-programs into every program that calls them ──
+    try linkSubprograms(a, obj.programs, subs.items);
     return obj;
 }
 
@@ -1018,13 +1064,12 @@ fn addInternalMap(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std.
 
 // ── program splitting ───────────────────────────────────────────────────────
 
-fn splitProgramSection(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std.ArrayList(ProgramSpec)) ParseError!void {
+fn splitProgramSection(obj: *Object, a: std.mem.Allocator, sec_idx: usize, info: SectionKindInfo, out: *std.ArrayList(ProgramSpec)) ParseError!void {
     const s = obj.image.sections[sec_idx];
     if (s.sh_size % 8 != 0) return error.UnalignedInstructionSection;
     const data = obj.image.sectionData(sec_idx) catch return error.MalformedElf;
     if (data.len != s.sh_size) return error.MalformedElf;
     const sec_name = obj.image.sectionName(sec_idx);
-    const info = classifySection(sec_name) orelse return; // filtered earlier
 
     // Every `STT_FUNC` symbol in this section is an entry point.
     const Range = struct { off: u64, size: u64, name: []const u8 };
@@ -1105,23 +1150,24 @@ fn splitProgramSection(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: 
 fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) ParseError!void {
     // `.rel<section>` — note there is NO dot between `.rel` and the section
     // name, so `kprobe/x`'s relocations live in `.relkprobe/x`.
-    const rel_idx = blk: {
+    var relos: std.ArrayList(Relo) = .empty;
+    var calls: std.ArrayList(CallSite) = .empty;
+    const lo = prog.sec_byte_off;
+    const hi = lo + prog.insns.len * 8;
+
+    const rel_idx: ?usize = blk: {
         for (obj.image.sections, 0..) |s, i| {
             if (s.sh_type != elfsym.SHT_REL) continue;
             if (s.sh_info != prog.sec_idx) continue;
             break :blk i;
         }
-        return; // no relocations at all
+        break :blk null;
     };
-
-    var relos: std.ArrayList(Relo) = .empty;
-    const count = obj.image.relocationCount(rel_idx) catch return error.MalformedElf;
-    const lo = prog.sec_byte_off;
-    const hi = lo + prog.insns.len * 8;
+    const count = if (rel_idx) |ri| obj.image.relocationCount(ri) catch return error.MalformedElf else 0;
 
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const rel = obj.image.relocation(rel_idx, i) catch return error.MalformedElf;
+        const rel = obj.image.relocation(rel_idx.?, i) catch return error.MalformedElf;
         if (rel.r_offset < lo or rel.r_offset >= hi) continue; // another function
         if (rel.r_offset % 8 != 0) return error.RelocationOutOfRange;
         const insn_idx: u32 = @intCast((rel.r_offset - lo) / 8);
@@ -1129,15 +1175,31 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
         const sym = obj.image.symbol(obj.symtab_idx, rel.sym) catch return error.MalformedElf;
         const sym_name = obj.image.symbolName(obj.symtab_idx, sym);
 
-        // A call relocation: a sub-program, or a kfunc.
-        if (rel.type == R_BPF_64_32) return error.SubprogramCallsUnsupported;
-        if (rel.type != R_BPF_64_64) return error.UnsupportedRelocation;
+        if (rel.type != R_BPF_64_64 and rel.type != R_BPF_64_32) return error.UnsupportedRelocation;
 
         // An undefined symbol is an extern: kfunc, kconfig, or ksym.
         if (!sym.hasSection()) return error.ExternSymbolUnsupported;
 
         const insn = prog.insns[insn_idx];
-        if (insn.code == CALL_CODE) return error.SubprogramCallsUnsupported;
+
+        // A call to a sub-program. For a global function the symbol is the
+        // function and the call's `imm` is -1; for a static one the symbol is
+        // the section and `imm` holds the offset in instructions, less one.
+        // Both are `st_value / 8 + imm + 1`.
+        if (rel.type == R_BPF_64_32) {
+            if (insn.code != CALL_CODE or insn.src != BPF_PSEUDO_CALL) return error.UnsupportedRelocation;
+            if (sym.st_shndx >= obj.image.sections.len) return error.MalformedElf;
+            const at: i64 = std.math.cast(i64, sym.st_value / 8) orelse return error.RelocationOutOfRange;
+            const tgt = at + @as(i64, insn.imm) + 1;
+            if (tgt < 0) return error.RelocationOutOfRange;
+            calls.append(a, .{
+                .kind = .call,
+                .insn_idx = insn_idx,
+                .sec_idx = sym.st_shndx,
+                .sec_byte_off = std.math.mul(u64, @intCast(tgt), 8) catch return error.RelocationOutOfRange,
+            }) catch return error.OutOfMemory;
+            continue;
+        }
         if (insn.code != LD_IMM64_CODE) return error.UnsupportedRelocation;
         if (insn_idx + 1 >= prog.insns.len) return error.RelocationOutOfRange;
 
@@ -1173,12 +1235,156 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
                 .sym_name = if (sym_name.len != 0) sym_name else target_name,
             }) catch return error.OutOfMemory;
         } else if (std.mem.eql(u8, target_name, ".text")) {
-            return error.SubprogramCallsUnsupported;
+            // The address of a sub-program (a callback): the byte offset is
+            // `st_value` for a global function, the instruction's `imm` for a
+            // static one (a section symbol).
+            const off = sym.st_value +% @as(u64, @bitCast(@as(i64, insn.imm)));
+            calls.append(a, .{
+                .kind = .func_addr,
+                .insn_idx = insn_idx,
+                .sec_idx = target_sec,
+                .sec_byte_off = off,
+            }) catch return error.OutOfMemory;
         } else {
             return error.UnsupportedRelocation;
         }
     }
+    // A call between two functions of one section has no relocation: its
+    // `imm` is already relative. A target inside the function itself is left
+    // alone (a hand-written object); one in a sibling function is a call site.
+    var relocated: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    for (calls.items) |c| relocated.put(a, c.insn_idx, {}) catch return error.OutOfMemory;
+    for (prog.insns, 0..) |insn, k| {
+        if (insn.code != CALL_CODE or insn.src != BPF_PSEUDO_CALL) continue;
+        if (relocated.contains(@intCast(k))) continue;
+        const tgt = @as(i64, @intCast(lo / 8 + k)) + insn.imm + 1;
+        if (tgt >= @as(i64, @intCast(lo / 8)) and tgt < @as(i64, @intCast(hi / 8))) continue;
+        if (tgt < 0) return error.RelocationOutOfRange;
+        calls.append(a, .{
+            .kind = .call,
+            .insn_idx = @intCast(k),
+            .sec_idx = prog.sec_idx,
+            .sec_byte_off = @as(u64, @intCast(tgt)) * 8,
+        }) catch return error.OutOfMemory;
+    }
     prog.relos = relos.toOwnedSlice(a) catch return error.OutOfMemory;
+    prog.call_sites = calls.toOwnedSlice(a) catch return error.OutOfMemory;
+}
+
+const SubKey = struct { sec: usize, off: u64 };
+
+/// Append every sub-program a program calls (transitively) after its own
+/// instructions, patch each call to the relative offset, and carry the
+/// callee's map relocations, CO-RE relocations, `func_info` and `line_info`
+/// along with their instruction indices shifted. Each callee is appended once
+/// per program; the original arrays are never mutated (a callee may itself be
+/// an entry point of another program).
+fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const ProgramSpec) ParseError!void {
+    var any = false;
+    for (progs) |p| {
+        if (p.call_sites.len != 0) any = true;
+    }
+    if (!any) return;
+
+    const snap = a.alloc(ProgramSpec, progs.len + subs.len) catch return error.OutOfMemory;
+    @memcpy(snap[0..progs.len], progs);
+    @memcpy(snap[progs.len..], subs);
+    var by_start: std.AutoHashMapUnmanaged(SubKey, u32) = .empty;
+    for (snap, 0..) |f, k| {
+        // The first function at a given place wins (an entry point before a
+        // same-named sub-program, which cannot be at the same place anyway).
+        _ = by_start.getOrPutValue(a, .{ .sec = f.sec_idx, .off = f.sec_byte_off }, @intCast(k)) catch return error.OutOfMemory;
+    }
+
+    for (progs, 0..) |*p, pi| {
+        if (p.call_sites.len == 0) continue;
+        var insns: std.ArrayList(Insn) = .empty;
+        var relos: std.ArrayList(Relo) = .empty;
+        var finfo: std.ArrayList(btfext.FuncInfo) = .empty;
+        var linfo: std.ArrayList(btfext.LineInfo) = .empty;
+        var cores: std.ArrayList(btfext.CoreRelo) = .empty;
+        const Placed = struct { idx: u32, base: u32 };
+        var queue: std.ArrayList(Placed) = .empty;
+        var placed: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+
+        const Local = struct {
+            fn append(
+                al: std.mem.Allocator,
+                f: ProgramSpec,
+                base: u32,
+                i: *std.ArrayList(Insn),
+                r: *std.ArrayList(Relo),
+                fi: *std.ArrayList(btfext.FuncInfo),
+                li: *std.ArrayList(btfext.LineInfo),
+                cr: *std.ArrayList(btfext.CoreRelo),
+            ) ParseError!void {
+                i.appendSlice(al, f.insns) catch return error.OutOfMemory;
+                for (f.relos) |x| {
+                    var y = x;
+                    y.insn_idx += base;
+                    r.append(al, y) catch return error.OutOfMemory;
+                }
+                for (f.func_info) |x| {
+                    var y = x;
+                    y.insn_off += base;
+                    fi.append(al, y) catch return error.OutOfMemory;
+                }
+                for (f.line_info) |x| {
+                    var y = x;
+                    y.insn_off += base;
+                    li.append(al, y) catch return error.OutOfMemory;
+                }
+                for (f.core_relos) |x| {
+                    var y = x;
+                    y.insn_off += base;
+                    cr.append(al, y) catch return error.OutOfMemory;
+                }
+            }
+        };
+        try Local.append(a, snap[pi], 0, &insns, &relos, &finfo, &linfo, &cores);
+        placed.put(a, @intCast(pi), 0) catch return error.OutOfMemory;
+        queue.append(a, .{ .idx = @intCast(pi), .base = 0 }) catch return error.OutOfMemory;
+
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const cur = queue.items[qi];
+            for (snap[cur.idx].call_sites) |cs| {
+                const callee = by_start.get(.{ .sec = cs.sec_idx, .off = cs.sec_byte_off }) orelse
+                    return error.UnresolvedRelocation;
+                const cbase: u32 = if (placed.get(callee)) |b| b else blk: {
+                    const f = snap[callee];
+                    if (insns.items.len + f.insns.len > max_program_insns) return error.ProgramTooLarge;
+                    const b: u32 = @intCast(insns.items.len);
+                    try Local.append(a, f, b, &insns, &relos, &finfo, &linfo, &cores);
+                    placed.put(a, callee, b) catch return error.OutOfMemory;
+                    queue.append(a, .{ .idx = callee, .base = b }) catch return error.OutOfMemory;
+                    break :blk b;
+                };
+                const at: i64 = @as(i64, cur.base) + cs.insn_idx;
+                const rel = @as(i64, cbase) - at - 1;
+                const ins = &insns.items[@intCast(at)];
+                switch (cs.kind) {
+                    .call => {
+                        ins.src = BPF_PSEUDO_CALL;
+                        ins.imm = std.math.cast(i32, rel) orelse return error.RelocationOutOfRange;
+                    },
+                    .func_addr => {
+                        ins.src = BPF_PSEUDO_FUNC;
+                        ins.imm = std.math.cast(i32, rel) orelse return error.RelocationOutOfRange;
+                    },
+                }
+            }
+        }
+        p.insns = insns.items;
+        p.relos = relos.items;
+        p.func_info = finfo.items;
+        p.line_info = linfo.items;
+        p.core_relos = cores.items;
+        p.call_sites = &.{};
+    }
+    // Sub-programs that nothing links (and entry points with no calls) keep
+    // an empty set too, so `call_sites` is empty everywhere on return.
+    for (progs) |*p| p.call_sites = &.{};
 }
 
 fn findMapIdx(obj: *Object, name: []const u8) ?usize {
@@ -1703,6 +1909,7 @@ const fx_ringbuf_map = @embedFile("testdata/ringbuf_map.bpf.o");
 const fx_legacy_map = @embedFile("testdata/legacy_map.bpf.o");
 const fx_core_reloc = @embedFile("testdata/core_reloc.bpf.o");
 const fx_two_progs = @embedFile("testdata/two_progs.bpf.o");
+const fx_subprog = @embedFile("testdata/subprog.bpf.o");
 
 test "section table: every prefix resolves, longest match wins" {
     // The exact-vs-target rule.
@@ -3532,10 +3739,10 @@ test "relocations: every refusal and the two accepted shapes" {
     const ld = [4][8]u8{ I_LD64, I_LD64_HI, I_MOV0, I_EXIT };
     const cases = [_]Case{
         .{ .code = ld, .want = null }, // map_fd relocation
-        .{ .code = ld, .rtype = 10, .want = error.SubprogramCallsUnsupported },
+        .{ .code = ld, .rtype = 10, .want = error.UnsupportedRelocation }, // a call relocation on a non-call
         .{ .code = ld, .rtype = 2, .want = error.UnsupportedRelocation },
         .{ .code = ld, .sym_shndx = 0, .want = error.ExternSymbolUnsupported },
-        .{ .code = .{ I_CALL, I_LD64_HI, I_MOV0, I_EXIT }, .want = error.SubprogramCallsUnsupported },
+        .{ .code = .{ I_CALL, I_LD64_HI, I_MOV0, I_EXIT }, .want = error.UnsupportedRelocation }, // a map relocation on a call
         .{ .code = .{ I_MOV0, I_LD64_HI, I_MOV0, I_EXIT }, .want = error.UnsupportedRelocation },
         .{ .code = .{ I_MOV0, I_MOV0, I_MOV0, I_LD64 }, .r_off = 24, .want = error.RelocationOutOfRange }, // ldimm64 is last
         .{ .code = ld, .r_off = 4, .want = error.RelocationOutOfRange }, // misaligned
@@ -3634,10 +3841,11 @@ test "data-section relocations: symbol value + instruction addend, bounds, unres
             try testing.expectError(e, openObj(&b, .{}));
         }
     }
-    // a relocation against .text is a sub-program call, not "unsupported"
+    // a relocation against .text is the address of a sub-program: it is linked in,
+    // after the program, and the load becomes a BPF_PSEUDO_FUNC to it
     var b = ObjB.init(gpa);
     defer b.deinit();
-    const code = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+    var code = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
     const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
     const t = try b.sec(.{ .name = ".text", .ty = 1, .flags = ObjB.EXEC, .data = &code });
     const sidx = try b.sym(.{ .name = "sub", .info = FUNC_SYM, .shndx = t });
@@ -3645,7 +3853,18 @@ test "data-section relocations: symbol value + instruction addend, bounds, unres
     std.mem.writeInt(u64, rel[0..8], 0, .little);
     std.mem.writeInt(u64, rel[8..16], (@as(u64, sidx) << 32) | 1, .little);
     _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
-    try testing.expectError(error.SubprogramCallsUnsupported, openObj(&b, .{}));
+    {
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        const pr = o.programs[0];
+        try testing.expectEqual(@as(usize, 6), pr.insns.len);
+        try testing.expectEqual(@as(u4, BPF_PSEUDO_FUNC), pr.insns[0].src);
+        try testing.expectEqual(@as(i32, 2), pr.insns[0].imm); // 0 + 1 + 2 = 3, the appended copy
+        try testing.expectEqual(@as(usize, 0), pr.call_sites.len);
+    }
+    // an address that is not a function start is refused, not guessed
+    std.mem.writeInt(i32, code[4..8], 4, .little);
+    try testing.expectError(error.UnresolvedRelocation, openObj(&b, .{}));
     // and against any other section it is "unsupported"
     b.secs.items[1].name = "other";
     try testing.expectError(error.UnsupportedRelocation, openObj(&b, .{}));
@@ -4343,4 +4562,66 @@ test "applyCoreRelos: type-based relocations patch `r = value` and map absence t
     relos[1].kind = 10; // ENUMVAL_EXISTS
     try testing.expectEqual(@as(usize, 2), try applyCoreRelos(&prog, &local, &none));
     try testing.expectEqual(@as(i32, 0), insns[0].imm);
+}
+
+test "sub-programs: a clang object's static and global calls and a callback address are linked into each program" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_subprog, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 2), o.programs.len);
+    const main = o.findProgram("xdp_main").?;
+    const other = o.findProgram("xdp_other").?;
+
+    // xdp_main (20 insns) + cb (6) + bump (15) + global_helper (7), each once
+    try testing.expectEqual(@as(usize, 48), main.insns.len);
+    // xdp_other (3) + global_helper (7) + bump (15): the callee's own call is followed
+    try testing.expectEqual(@as(usize, 25), other.insns.len);
+    try testing.expectEqual(@as(usize, 0), main.call_sites.len);
+
+    for ([_]*ProgramSpec{ main, other }) |pr| {
+        // the function starts are exactly the func_info records, ascending from 0
+        try testing.expect(pr.func_info.len >= 3);
+        try testing.expectEqual(@as(u32, 0), pr.func_info[0].insn_off);
+        for (pr.func_info[1..], 0..) |f, i| try testing.expect(f.insn_off > pr.func_info[i].insn_off);
+        var starts: [8]u32 = undefined;
+        for (pr.func_info, 0..) |f, i| starts[i] = f.insn_off;
+        // every pseudo call / pseudo func lands on one of them
+        var calls: usize = 0;
+        var k: usize = 0;
+        while (k < pr.insns.len) : (k += 1) {
+            const ins = pr.insns[k];
+            const is_call = ins.code == 0x85 and ins.src == BPF_PSEUDO_CALL;
+            const is_func = ins.code == 0x18 and ins.src == BPF_PSEUDO_FUNC;
+            if (!is_call and !is_func) continue;
+            calls += 1;
+            const tgt: u32 = @intCast(@as(i64, @intCast(k)) + ins.imm + 1);
+            var hit = false;
+            for (starts[0..pr.func_info.len]) |st| hit = hit or st == tgt;
+            try testing.expect(hit);
+        }
+        try testing.expect(calls >= 2);
+        // line_info is rebased the same way: ascending, inside the program
+        for (pr.line_info, 0..) |l, i| {
+            try testing.expect(l.insn_off < pr.insns.len);
+            if (i > 0) try testing.expect(l.insn_off >= pr.line_info[i - 1].insn_off);
+        }
+        // the callee's map and global-data relocations came along, on LD_IMM64s
+        var maps: usize = 0;
+        var vals: usize = 0;
+        for (pr.relos) |r| {
+            try testing.expectEqual(@as(u8, 0x18), pr.insns[r.insn_idx].code);
+            switch (r.kind) {
+                .map_fd => maps += 1,
+                .map_value => vals += 1,
+            }
+        }
+        try testing.expect(maps >= 1 and vals >= 1);
+    }
+    try testing.expectEqual(@as(usize, 4), main.func_info.len);
+    try testing.expectEqual(@as(usize, 3), other.func_info.len);
+
+    // and the whole thing goes through the real map relocation with synthetic fds
+    for (o.maps, 0..) |*m, i| m.fd = @intCast(10 + i);
+    try relocateProgram(main, o.maps);
+    for (main.relos) |r| try testing.expect(main.insns[r.insn_idx].imm >= 10);
 }
