@@ -1109,7 +1109,7 @@ test "corpus: every zone name reaches find, and the hit count is pinned" {
     }
     // One seed IS the empty name, a legal member of a refusal corpus.
     try testing.expectEqual(zone_name_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draws, exactly 1 distinct name
+    // Measured: with the collapsing draws, exactly 1 distinct name
     // ("Africa/Abidjan", the first table entry) and 1 hit, twelve times over.
     try testing.expectEqual(@as(usize, 6), hits);
     try testing.expectEqual(zone_name_seeds.len, distinct);
@@ -1205,7 +1205,7 @@ test "corpus: every footer reaches offsetAt, and the generator actually varies" 
     }
     // One seed IS the empty footer, a legal member of the corpus.
     try testing.expectEqual(posix_footer_corpus.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draws, all twelve footers
+    // Measured: with the collapsing draws, all twelve footers
     // arrived as "" — 0 DST, 0 non-zero offsets — and the generator emitted
     // exactly 1 distinct string. After:
     try testing.expectEqual(@as(usize, 3), dst_seen);
@@ -1225,7 +1225,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

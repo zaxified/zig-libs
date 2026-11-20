@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over tz's two existing `testing.fuzz` harnesses
-//! (`find`, and the POSIX-TZ footer grammar through `offsetAt`; added
-//! 2026-10-09). The bodies live here, generic over their source of choices
+//! (`find`, and the POSIX-TZ footer grammar through `offsetAt`; added). The bodies live here, generic over their source of choices
 //! (`fn(comptime S, *S, gpa)`); `root.zig`'s `testing.fuzz` tests feed them
 //! through the cursor adapter below, the driver feeds them a PRNG.
 //!
