@@ -450,3 +450,125 @@ test "config boundary: horizon 0 is rejected, not silently collapsed to t=0" {
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.events.len);
 }
+
+test "generate: configuration switches and topology limits are honoured" {
+    const gpa = std.testing.allocator;
+    const links = [_]Link{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 0 } };
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) {
+        // empty topology: nothing can be expressed
+        var empty = try generate(gpa, seed, .{ .node_count = 0, .links = &.{} }, .{ .max_events = 30 });
+        defer empty.deinit();
+        try std.testing.expectEqual(@as(usize, 0), empty.events.len);
+        // one node: no partition
+        var one = try generate(gpa, seed, .{ .node_count = 1, .links = &.{} }, .{ .max_events = 30 });
+        defer one.deinit();
+        for (one.events) |e| try std.testing.expect(e.kind != .partition);
+        // switches off
+        var off = try generate(gpa, seed, .{ .node_count = 3, .links = &links }, .{ .max_events = 30, .enable_crash = false, .enable_clock_jump = false, .enable_partition = false });
+        defer off.deinit();
+        for (off.events) |e| switch (e.kind) {
+            .crash_node, .restart_node, .clock_jump, .partition, .heal => return error.DisabledFaultGenerated,
+            else => {},
+        };
+    }
+}
+
+test "generate: shape of the faults — repairs follow, cuts are proper, ids unique, jumps and delays non-zero" {
+    const gpa = std.testing.allocator;
+    const links = [_]Link{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 } };
+    var pos: usize = 0;
+    var neg: usize = 0;
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) {
+        var tr = try generate(gpa, seed, .{ .node_count = 3, .links = &links }, .{ .max_events = 30, .repair_permille = 1000 });
+        defer tr.deinit();
+        var ids: [64]u32 = undefined;
+        var nid: usize = 0;
+        for (tr.events) |e| switch (e.kind) {
+            .partition => |p| {
+                try std.testing.expect(p.cut.len > 0 and p.cut.len < 3);
+                for (p.cut) |member| try std.testing.expect(member < 3);
+                for (ids[0..nid]) |old| try std.testing.expect(old != p.id);
+                ids[nid] = p.id;
+                nid += 1;
+            },
+            .clock_jump => |j| {
+                try std.testing.expect(j.delta != 0);
+                if (j.delta > 0) pos += 1 else neg += 1;
+            },
+            .delay_once => |d| try std.testing.expect(d.extra >= 1),
+            else => {},
+        };
+        // repair_permille 1000: every fault that can be repaired has a strictly later repair
+        for (tr.events) |e| switch (e.kind) {
+            .link_down => |l| {
+                var found = false;
+                for (tr.events) |u| switch (u.kind) {
+                    .link_up => |m| if (m.a == l.a and m.b == l.b and u.time > e.time) {
+                        found = true;
+                    },
+                    else => {},
+                };
+                try std.testing.expect(found);
+            },
+            .crash_node => |c| {
+                var found = false;
+                for (tr.events) |u| switch (u.kind) {
+                    .restart_node => |m| if (m.node == c.node and u.time > e.time) {
+                        found = true;
+                    },
+                    else => {},
+                };
+                try std.testing.expect(found);
+            },
+            .partition => |p| {
+                var found = false;
+                for (tr.events) |u| switch (u.kind) {
+                    .heal => |h| if (h.id == p.id and u.time > e.time) {
+                        found = true;
+                    },
+                    else => {},
+                };
+                try std.testing.expect(found);
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(pos > 0 and neg > 0);
+}
+
+test "generate: events at the same time keep their generation order (stable sort), and cuts vary" {
+    const gpa = std.testing.allocator;
+    var varied = false;
+    var seed: u64 = 0;
+    while (seed < 100) : (seed += 1) {
+        var tr = try generate(gpa, seed, .{ .node_count = 4, .links = &.{} }, .{ .max_events = 40, .horizon = 1, .enable_crash = false, .enable_clock_jump = false });
+        defer tr.deinit();
+        var last_id: ?u32 = null;
+        for (tr.events) |e| if (e.kind == .partition) {
+            if (last_id) |l| try std.testing.expect(e.kind.partition.id > l);
+            last_id = e.kind.partition.id;
+            if (e.kind.partition.cut.len > 1 or e.kind.partition.cut[0] != 0) varied = true;
+        };
+    }
+    try std.testing.expect(varied);
+}
+
+test "generate: partitions are drawn twice as often as clock jumps (weights 2 and 1)" {
+    const gpa = std.testing.allocator;
+    const links = [_]Link{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 } };
+    var parts: usize = 0;
+    var jumps: usize = 0;
+    var seed: u64 = 0;
+    while (seed < 1500) : (seed += 1) {
+        var tr = try generate(gpa, seed, .{ .node_count = 3, .links = &links }, .{ .max_events = 30 });
+        defer tr.deinit();
+        for (tr.events) |e| switch (e.kind) {
+            .partition => parts += 1,
+            .clock_jump => jumps += 1,
+            else => {},
+        };
+    }
+    try std.testing.expect(parts > jumps * 3 / 2);
+}

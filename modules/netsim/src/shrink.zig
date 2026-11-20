@@ -347,3 +347,155 @@ test "findFailing: a hook crash produces a reproducer instead of killing the who
     try testing.expectEqual(sim.RunOutcome.violated, r.outcome);
     try testing.expectEqual(error.ProtocolBlewUp, r.violation.?.err);
 }
+
+const Needs = struct {
+    required: []const usize,
+    calls: usize = 0,
+    fn keeps(self: *Needs, subset: []const usize) Allocator.Error!bool {
+        self.calls += 1;
+        for (self.required) |r| {
+            if (std.mem.indexOfScalar(usize, subset, r) == null) return false;
+        }
+        return true;
+    }
+};
+
+test "ddmin: finds exactly the required set for every size and a pseudo-random choice of it" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xDD);
+    const rnd = prng.random();
+    var n: usize = 1;
+    while (n <= 24) : (n += 1) {
+        var round: usize = 0;
+        while (round < 12) : (round += 1) {
+            var req: [24]usize = undefined;
+            var k: usize = 0;
+            for (0..n) |i| if (rnd.boolean()) {
+                req[k] = i;
+                k += 1;
+            };
+            var need: Needs = .{ .required = req[0..k] };
+            const got = try ddmin(gpa, n, &need);
+            defer gpa.free(got);
+            try testing.expectEqualSlices(usize, req[0..k], got);
+        }
+    }
+}
+
+test "ddmin: the number of probes for fixed cases is pinned (complement-only ddmin, ceiling chunks, granularity doubling)" {
+    const gpa = testing.allocator;
+    const Case = struct { n: usize, req: []const usize, calls: usize };
+    const cases = [_]Case{
+        .{ .n = 16, .req = &.{ 3, 11 }, .calls = 20 },
+        .{ .n = 13, .req = &.{ 2, 9 }, .calls = 19 },
+        .{ .n = 11, .req = &.{ 0, 10 }, .calls = 15 },
+    };
+    for (cases) |c| {
+        var need: Needs = .{ .required = c.req };
+        const got = try ddmin(gpa, c.n, &need);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(usize, c.req, got);
+        try testing.expectEqual(c.calls, need.calls);
+    }
+}
+
+fn twoErrors(_: *anyopaque, s: *const sim.Sim) anyerror!void {
+    if (s.nodes.items[0].crashed and s.nodes.items[1].crashed) return error.BothDown;
+    if (s.nodes.items[0].crashed) return error.A;
+    if (s.nodes.items[1].crashed) return error.B;
+}
+
+fn needBoth(_: *anyopaque, s: *const sim.Sim) anyerror!void {
+    if (s.nodes.items[0].crashed and s.nodes.items[1].crashed) return error.BothDown;
+}
+
+fn crashEvent(time: sim.Time, node: NodeId) fault.FaultEvent {
+    return .{ .time = time, .kind = .{ .crash_node = .{ .node = node } } };
+}
+
+test "shrink: keeps the faults that reproduce the SAME error, copies subsets faithfully, and clones partition cuts" {
+    const gpa = testing.allocator;
+    var unused: usize = 0;
+    const template = sim.Case{
+        .seed = 0,
+        .scenario = twoNodeScenario,
+        .protocol = .{ .ctx = &unused, .onMessageFn = noopOnMessage, .checkFn = twoErrors, .resetFn = noReset },
+        .until = 100,
+    };
+    // crash 1 first (error B), then crash 0 (error A would follow): only the first fault reproduces B
+    const events = [_]fault.FaultEvent{ crashEvent(10, 1), crashEvent(20, 0) };
+    var trace = try cloneSubset(gpa, &events, &.{ 0, 1 });
+    var failing = Failing{ .case = template, .trace = trace, .err = error.B };
+    defer failing.deinit();
+    var res = try shrink(gpa, &failing);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 1), res.after);
+    try testing.expectEqual(@as(NodeId, 1), res.trace.events[0].kind.crash_node.node);
+    // three faults, two of them needed together: the third goes (needs the subset copied element by element)
+    const ev3 = [_]fault.FaultEvent{ crashEvent(10, 0), .{ .time = 15, .kind = .{ .clock_jump = .{ .node = 0, .delta = 1 } } }, crashEvent(20, 1) };
+    var tr3 = try cloneSubset(gpa, &ev3, &.{ 0, 1, 2 });
+    var f3 = Failing{ .case = template, .trace = tr3, .err = error.A };
+    defer f3.deinit();
+    var r3 = try shrink(gpa, &f3);
+    defer r3.deinit();
+    try testing.expectEqual(@as(usize, 1), r3.after); // crash of 0 alone gives A
+    // both faults are needed for BothDown, the third (a clock jump) is dropped: needs every subset copied faithfully
+    var both_case = template;
+    both_case.protocol.checkFn = needBoth;
+    var f4 = Failing{ .case = both_case, .trace = try cloneSubset(gpa, &ev3, &.{ 0, 1, 2 }), .err = error.BothDown };
+    defer f4.deinit();
+    var r4 = try shrink(gpa, &f4);
+    defer r4.deinit();
+    try testing.expectEqual(@as(usize, 2), r4.after);
+    // a subset whose replay itself fails (a node that does not exist) never counts as reproducing the error
+    const bad = [_]fault.FaultEvent{ crashEvent(10, 0), crashEvent(20, 9) };
+    var f5 = Failing{ .case = template, .trace = try cloneSubset(gpa, &bad, &.{ 0, 1 }), .err = error.A };
+    defer f5.deinit();
+    var r5 = try shrink(gpa, &f5);
+    defer r5.deinit();
+    try testing.expectEqual(@as(usize, 1), r5.after);
+    try testing.expectEqual(@as(NodeId, 0), r5.trace.events[0].kind.crash_node.node);
+    // a partition's cut is copied, not shared
+    const pev = [_]fault.FaultEvent{.{ .time = 1, .kind = .{ .partition = .{ .id = 0, .cut = &.{ 0, 1 } } } }};
+    var pt = try cloneSubset(gpa, &pev, &.{0});
+    defer pt.deinit();
+    try testing.expect(pt.events[0].kind.partition.cut.ptr != pev[0].kind.partition.cut.ptr);
+    _ = &trace;
+    _ = &tr3;
+}
+
+fn failsOnlyForSeed9(ctx: *anyopaque, s: *const sim.Sim) anyerror!void {
+    const target: *const u64 = @ptrCast(@alignCast(ctx));
+    if (s.prng.state == target.*) return error.Seed9;
+}
+
+fn oneTimerScenario(s: *sim.Sim) anyerror!void {
+    _ = try s.addNode(.{});
+    try s.setTimer(0, 1, 0);
+}
+
+test "findFailing: both ends of [start, end] are searched, and a capped run is not a failure" {
+    const gpa = testing.allocator;
+    var target: u64 = @import("prng.zig").Prng.init(9).state;
+    const template = sim.Case{
+        .seed = 0,
+        .scenario = twoNodeScenario,
+        .protocol = .{ .ctx = &target, .onMessageFn = noopOnMessage, .checkFn = failsOnlyForSeed9, .resetFn = noReset },
+        .until = 100,
+    };
+    var f = (try findFailing(gpa, template, .{}, 1, 9)) orelse return error.ExpectedFailure; // last seed of the range
+    defer f.deinit();
+    try testing.expectEqual(@as(u64, 9), f.case.seed);
+    var g = (try findFailing(gpa, template, .{}, 9, 9)) orelse return error.ExpectedFailure; // a one-seed range
+    defer g.deinit();
+    try testing.expectEqual(@as(u64, 9), g.case.seed);
+    var unused: usize = 0;
+    const capped = sim.Case{
+        .seed = 0,
+        .scenario = oneTimerScenario,
+        .protocol = .{ .ctx = &unused, .onMessageFn = noopOnMessage, .resetFn = noReset },
+        .until = 100,
+        .max_events_cap = 0,
+    };
+    try testing.expect((try findFailing(gpa, capped, .{}, 1, 3)) == null);
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — tokio-rs/turmoil 0.7.2, TigerBeetle VOPR methodology, protocol-level; real `std.Io` code and disk faults are the sibling `simio` (surveyed 2026-10-05)
 
-**Audit:** review 2026-09-15 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-20 (164/166, 2 eq) · src f41e551754b5f5fa
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — network simulation (keyword review, 2026-10-07)
 
@@ -135,8 +135,14 @@ harness with no teeth is the failure mode this module exists to avoid, so each
 consumer ships a deliberately-broken positive control that MUST trip its
 checker (see `raft`'s `BrokenRaft`).
 
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
-  run and the delta runs after it.
+- **Mutation:** one whole-module run over `sim.zig`, `fault.zig`, `shrink.zig` and `prng.zig` (166 mutants), 164 killed, 2 equivalent
+  (`<` versus `<=` inside an `!=` branch of the event order, a second violation capture that the start loop's early break makes
+  unreachable), none open. The earlier suite left 80 survivors, now tests: every field of the log fingerprint, the once-faults
+  (drop, duplicate, delay) acting once, `link_up`, crashed nodes and restarts, unknown-node faults, the PRNG draws of a plain
+  link, jitter and reorder reaching their top value, live-byte charging of a duplicate, the shape of the generated fault
+  trace (switches, repairs, proper cuts, unique ids, weights, stable order) and the exact probe sequence of `ddmin`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over that whole-module run and the delta runs
+  after it.
 
 Provenance: original work of the zig-libs authors (MIT) — the deterministic
 seeded discrete-event simulator, the failure-schedule fuzzer, the byte-exact

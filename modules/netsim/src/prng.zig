@@ -141,3 +141,17 @@ test "Prng.next is splitmix64 (known answers for state 0)" {
     try std.testing.expectEqual(@as(u64, 0xe220a8397b1dcdaf), p.next());
     try std.testing.expectEqual(@as(u64, 0x6e789e6aa1b965f4), p.next());
 }
+
+test "Prng: init decorrelates the seed, a zero rate draws nothing, a rate below 1000 can miss" {
+    try std.testing.expect(Prng.init(0).state != 0);
+    var a = Prng.init(5);
+    var b = Prng.init(5);
+    try std.testing.expect(!a.permille(0));
+    try std.testing.expectEqual(b.next(), a.next());
+    var p = Prng.init(9);
+    var misses: usize = 0;
+    for (0..200_000) |_| {
+        if (!p.permille(999)) misses += 1;
+    }
+    try std.testing.expect(misses > 0);
+}

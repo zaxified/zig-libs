@@ -1499,3 +1499,341 @@ test "build: Case.max_live_bytes reaches the Sim it builds (audit F11)" {
     const result = try replay(gpa, roomy_case, &.{}, null);
     try testing.expectEqual(RunOutcome.ok, result.outcome);
 }
+
+// ── whole-module mutation audit 2026-11: engine details the survivors asked for ──
+
+const Rec = struct {
+    started: usize = 0,
+    timers: usize = 0,
+    delivered: usize = 0,
+    times: [64]Time = undefined,
+    nt: usize = 0,
+    sends_at: Time = 1,
+    sends: usize = 2,
+    fail_start_at: ?NodeId = null,
+    msg_fails: bool = false,
+    check_after_delivery_fails: bool = false,
+
+    fn self(ctx: *anyopaque) *Rec {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn onStart(ctx: *anyopaque, s: *Sim, node: NodeId) anyerror!void {
+        const r = self(ctx);
+        r.started += 1;
+        if (node == 0) try s.setTimer(0, r.sends_at, 0);
+        if (r.fail_start_at == node) return error.StartBroken;
+    }
+    fn onTimer(ctx: *anyopaque, s: *Sim, node: NodeId, _: u64) anyerror!void {
+        const r = self(ctx);
+        r.timers += 1;
+        for (0..r.sends) |_| try s.send(node, 1, "x");
+    }
+    fn onMessage(ctx: *anyopaque, s: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {
+        const r = self(ctx);
+        r.delivered += 1;
+        if (r.nt < r.times.len) {
+            r.times[r.nt] = s.now;
+            r.nt += 1;
+        }
+        if (r.msg_fails) return error.MsgBroken;
+    }
+    fn check(ctx: *anyopaque, _: *const Sim) anyerror!void {
+        const r = self(ctx);
+        if (r.check_after_delivery_fails and r.delivered >= 1) return error.CheckBroken;
+    }
+    fn protocol(r: *Rec) Protocol {
+        return .{ .ctx = r, .onStartFn = onStart, .onMessageFn = onMessage, .onTimerFn = onTimer, .checkFn = check, .resetFn = noReset };
+    }
+};
+
+fn mkSim(gpa: Allocator, log: *Log, r: *Rec, link: LinkConfig) !Sim {
+    var s = Sim.init(gpa, 1, r.protocol(), log, 1000, 100_000);
+    errdefer s.deinit();
+    _ = try s.addNode(.{});
+    _ = try s.addNode(.{});
+    try s.addBiLink(0, 1, link);
+    return s;
+}
+
+fn fev(time: Time, kind: fault.FaultKind) fault.FaultEvent {
+    return .{ .time = time, .kind = kind };
+}
+
+test "Log: eql compares the length and every entry; copyFrom replaces the previous content" {
+    const gpa = testing.allocator;
+    var a = Log{};
+    defer a.deinit(gpa);
+    var b = Log{};
+    defer b.deinit(gpa);
+    try a.entries.append(gpa, .{ .tag = .start, .a = 1 });
+    try b.entries.append(gpa, .{ .tag = .start, .a = 1 });
+    try testing.expect(a.eql(&b));
+    try b.entries.append(gpa, .{ .tag = .drop });
+    try testing.expect(!a.eql(&b));
+    try a.entries.append(gpa, .{ .tag = .deliver });
+    try testing.expect(!a.eql(&b)); // same length, different second entry
+    var c = Log{};
+    defer c.deinit(gpa);
+    try c.copyFrom(gpa, &a);
+    try c.copyFrom(gpa, &b);
+    try testing.expectEqual(@as(usize, 2), c.entries.items.len);
+    try testing.expect(c.eql(&b));
+}
+
+test "foldFingerprint: every field of an entry moves the fingerprint" {
+    const base: LogEntry = .{ .time = 1, .seq = 2, .tag = .deliver, .a = 3, .b = 4, .c = 5 };
+    const f0 = foldFingerprint(7, base);
+    inline for (.{ "tag", "time", "seq", "a", "b", "c" }) |field| {
+        var e = base;
+        if (comptime std.mem.eql(u8, field, "tag")) e.tag = .drop else @field(e, field) += 9;
+        try testing.expect(foldFingerprint(7, e) != f0);
+    }
+}
+
+test "addLink: permille 1000 is valid, 1001 is not, for loss, duplication and reordering" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var r: Rec = .{};
+    var s = try mkSim(gpa, &log, &r, .{});
+    defer s.deinit();
+    try s.addLink(0, 1, .{ .loss_permille = 1000 });
+    try s.addLink(0, 1, .{ .dup_permille = 1000 });
+    try s.addLink(0, 1, .{ .reorder_permille = 1000 });
+    try testing.expectError(error.InvalidPermille, s.addLink(0, 1, .{ .loss_permille = 1001 }));
+    try testing.expectError(error.InvalidPermille, s.addLink(0, 1, .{ .dup_permille = 1001 }));
+    try testing.expectError(error.InvalidPermille, s.addLink(0, 1, .{ .reorder_permille = 1001 }));
+}
+
+test "isNodeInCut: out-of-range nodes are never in the cut; clock adds the skew" {
+    const gpa = testing.allocator;
+    var set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, 4);
+    defer set.deinit(gpa);
+    set.set(3);
+    try testing.expect(isNodeInCut(&set, 3));
+    try testing.expect(!isNodeInCut(&set, 4) and !isNodeInCut(&set, 100));
+    var log = Log{};
+    defer log.deinit(gpa);
+    var r: Rec = .{};
+    var s = try mkSim(gpa, &log, &r, .{});
+    defer s.deinit();
+    _ = try s.addNode(.{ .clock_skew = -3 });
+    s.nodes.items[0].clock_offset = 10;
+    s.now = 5;
+    try testing.expectEqual(@as(i64, 15), s.clock(0));
+    try testing.expectEqual(@as(i64, 2), s.clock(2));
+}
+
+test "EventHeap: pops in (time, seq) order after random pushes" {
+    const gpa = testing.allocator;
+    var h: EventHeap = .{};
+    defer h.deinit(gpa);
+    var prng = Prng.init(77);
+    for (0..300) |i| try h.push(gpa, .{ .time = prng.belowWide(40), .seq = i, .kind = .{ .timer = .{ .node = 0, .timer_id = 0 } } });
+    var prev: ?Event = null;
+    while (h.items.items.len > 0) {
+        const ev = h.pop();
+        if (prev) |p| try testing.expect(eventLess(p, ev));
+        prev = ev;
+    }
+}
+
+test "once-faults act once: drop, duplicate and delay" {
+    const gpa = testing.allocator;
+    // drop_once: the first of two sends is lost
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{ .latency = 3 });
+        defer s.deinit();
+        try s.injectFaults(&.{fev(0, .{ .drop_once = .{ .a = 0, .b = 1 } })});
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 1), r.delivered);
+    }
+    // dup_once: the first of two sends arrives twice, the copy one tick after the original
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{ .latency = 3 });
+        defer s.deinit();
+        try s.injectFaults(&.{fev(0, .{ .dup_once = .{ .a = 0, .b = 1 } })});
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 3), r.delivered);
+        try testing.expectEqual(@as(Time, 4), r.times[0]);
+        try testing.expectEqual(@as(Time, 4), r.times[1]);
+        try testing.expectEqual(@as(Time, 5), r.times[2]);
+    }
+    // delay_once: only the first send is late; the log carries the arrival time and the length
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{ .latency = 3 });
+        defer s.deinit();
+        try s.injectFaults(&.{fev(0, .{ .delay_once = .{ .a = 0, .b = 1, .extra = 1 } })});
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 2), r.nt);
+        try testing.expectEqual(@as(Time, 4), r.times[0]);
+        try testing.expectEqual(@as(Time, 5), r.times[1]);
+        var seen = false;
+        for (log.entries.items) |e| if (e.tag == .deliver) {
+            seen = true;
+            try testing.expectEqual(@as(Time, 4), e.time);
+            try testing.expectEqual(@as(i64, 1), e.c);
+            break;
+        };
+        try testing.expect(seen);
+    }
+}
+
+test "link and node faults: link_up restores a link, a crashed node has no timers, restart starts it again" {
+    const gpa = testing.allocator;
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .sends_at = 10, .sends = 1 };
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try s.injectFaults(&.{ fev(0, .{ .link_down = .{ .a = 0, .b = 1 } }), fev(5, .{ .link_up = .{ .a = 0, .b = 1 } }) });
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 1), r.delivered);
+    }
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .sends_at = 10 };
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try s.injectFaults(&.{fev(5, .{ .crash_node = .{ .node = 0 } })});
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 0), r.timers);
+    }
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try s.injectFaults(&.{ fev(2, .{ .crash_node = .{ .node = 1 } }), fev(4, .{ .restart_node = .{ .node = 1 } }) });
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 3), r.started);
+    }
+}
+
+test "faults naming a node that does not exist are errors, an out-of-range cut member is ignored" {
+    const gpa = testing.allocator;
+    const bad = [_]fault.FaultKind{
+        .{ .crash_node = .{ .node = 2 } },
+        .{ .restart_node = .{ .node = 2 } },
+        .{ .clock_jump = .{ .node = 2, .delta = 1 } },
+    };
+    for (bad) |k| {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try s.injectFaults(&.{fev(1, k)});
+        try testing.expectError(error.UnknownNode, s.drive());
+    }
+    var log = Log{};
+    defer log.deinit(gpa);
+    var r: Rec = .{};
+    var s = try mkSim(gpa, &log, &r, .{});
+    defer s.deinit();
+    try s.injectFaults(&.{fev(1, .{ .partition = .{ .id = 0, .cut = &.{ 0, 2, 99 } } })});
+    _ = try s.drive();
+    try testing.expectEqual(@as(usize, 0), r.delivered); // 0 is cut from 1
+}
+
+test "start and checks: a crashed node is not started, a start failure stops the bootstrap, the first violation stays" {
+    const gpa = testing.allocator;
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        s.nodes.items[1].crashed = true;
+        _ = try s.drive();
+        try testing.expectEqual(@as(usize, 1), r.started);
+    }
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .fail_start_at = 0 };
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try testing.expectEqual(RunOutcome.violated, try s.drive());
+        try testing.expectEqual(@as(usize, 1), r.started);
+    }
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .msg_fails = true, .check_after_delivery_fails = true, .sends = 1 };
+        var s = try mkSim(gpa, &log, &r, .{});
+        defer s.deinit();
+        try testing.expectEqual(RunOutcome.violated, try s.drive());
+        try testing.expectEqual(error.MsgBroken, s.violation.?.err);
+        var violations: usize = 0;
+        for (log.entries.items) |e| {
+            if (e.tag == .violation) violations += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), violations);
+    }
+}
+
+test "send: no PRNG draw for a plain link, jitter and reorder reach their top value, bandwidth 0 is no limit, dup is charged" {
+    const gpa = testing.allocator;
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{};
+        var s = try mkSim(gpa, &log, &r, .{ .bandwidth = 0 });
+        defer s.deinit();
+        const before = s.prng.state;
+        try s.send(0, 1, "x");
+        try testing.expectEqual(before, s.prng.state);
+        try s.send(2, 0, "x"); // a sender just outside the topology: logged as a drop, not a crash
+        try testing.expectEqual(LogEntry.Tag.drop, log.entries.items[log.entries.items.len - 1].tag);
+    }
+    const cfgs = [_]LinkConfig{ .{ .latency = 3, .jitter = 1 }, .{ .latency = 3, .reorder_extra = 1, .reorder_permille = 1000 } };
+    for (cfgs) |cfg| {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .sends = 50 };
+        var s = try mkSim(gpa, &log, &r, cfg);
+        defer s.deinit();
+        _ = try s.drive();
+        var top: Time = 0;
+        for (r.times[0..r.nt]) |t| top = @max(top, t);
+        try testing.expectEqual(@as(Time, 5), top); // 1 + latency + 1
+    }
+    {
+        var log = Log{};
+        defer log.deinit(gpa);
+        var r: Rec = .{ .sends = 1 };
+        var s = try mkSim(gpa, &log, &r, .{ .dup_permille = 1000 });
+        defer s.deinit();
+        s.max_live_bytes = 1;
+        try testing.expectError(error.LiveBytesExceeded, s.drive());
+    }
+}
+
+test "run: the generating run keeps no log" {
+    const gpa = testing.allocator;
+    var r: Rec = .{};
+    const Sc = struct {
+        fn build(s: *Sim) anyerror!void {
+            _ = try s.addNode(.{});
+            _ = try s.addNode(.{});
+            try s.addBiLink(0, 1, .{});
+        }
+    };
+    resetLogEntriesStoredForTesting();
+    var gr = try run(gpa, .{ .seed = 3, .scenario = Sc.build, .protocol = r.protocol(), .until = 100 }, .{});
+    defer gr.trace.deinit();
+    try testing.expectEqual(@as(usize, 0), logEntriesStoredForTesting());
+}
