@@ -27,11 +27,10 @@
 //! sent on: Phase 5 checks `Σ R̄_j = G` (so `R = k⁻¹·G` for the `k` inside the
 //! ciphertexts), Phase 6 checks `Σ S_j = X` (so the `σ_j` add up to `k·x`).
 //! Once both hold the signature is guaranteed to verify, which is what makes
-//! releasing `s_i` safe — an `s_i` released against a wrong `R` would leak
-//! the signer's key share (paper §4.3). The in-process driver this replaced
-//! (`signing.signWithShares` before 2026-10-02) had neither check; it relied
-//! on the final self-check, which is enough only when one process holds
-//! every share.
+//! releasing `s_i` safe — an `s_i` released against a wrong `R` would leak the
+//! signer's key share (paper §4.3). The in-process driver this replaced had
+//! neither check; it relied on the final self-check, which is enough only when
+//! one process holds every share.
 //!
 //! ## Identifiable abort
 //!
@@ -116,7 +115,7 @@ pub const SessionId = [32]u8;
 
 // Dead-stack burns of the public entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 // A round decrypts with the Paillier secret key and runs the Paillier proofs.
 const round_stack_burn = 288 * 1024;
@@ -158,7 +157,7 @@ pub const open_round: u8 = 8;
 /// The echo of the openings (`Party.echoOpenings`): an empty broadcast whose
 /// attestation block carries the round-8 openings as its sender received
 /// them, so a signer who showed different signed openings to different
-/// peers is named before anyone judges an opening (review 2026-10-03 F5).
+/// peers is named before anyone judges an opening (review F5).
 pub const open_echo_round: u8 = 9;
 
 /// `SHA-256(body)` and the sender's signature over `signedBytes(header, that
@@ -215,7 +214,7 @@ fn writeAttestation(a: Attestation, out: *[attestation_entry_length]u8) void {
 /// block's sender (`from`) lied about what it received. An entry whose hash
 /// matches is taken without checking its signature: the block is a hash
 /// echo for this comparison, not evidence to forward to anyone else
-/// (review 2026-10-03 F8).
+/// (review F8).
 fn checkAttestations(sid: SessionId, round: u8, signers: []const u32, keys: []const Ed25519.PublicKey, mine: []const Attestation, block: []const u8, from: u32) ?Abort {
     for (signers, keys, mine, 0..) |idx, key, m, pos| {
         const entry = readAttestation(block[pos * attestation_entry_length ..][0..attestation_entry_length]);
@@ -263,7 +262,7 @@ pub const Fault = enum {
     /// No validly signed message for a slot. Messages that are not signed by
     /// their claimed sender for this round of this session are dropped as
     /// transport noise, so this also covers a sender whose message was
-    /// mangled, forged or misrouted on the way (review 2026-10-03 F3).
+    /// mangled, forged or misrouted on the way (review F3).
     missing_message,
     /// A peer's published Paillier key or aux tuple failed the checks every
     /// prover runs before committing a secret under it (audit F1/F2/F3).
@@ -453,7 +452,7 @@ pub const Party = struct {
     /// signer position, its own included: attested at the head of the next
     /// round's messages and compared with every peer's (the in-protocol
     /// substitute for the reliable broadcast GG20 assumes; review F1,
-    /// 2026-10-02 — signed since 2026-10-03, so the equivocator is named).
+    /// — signed, so the equivocator is named).
     last_bc: []Attestation,
     /// Attestation of this party's own broadcast of the current round.
     own_bc: Attestation = undefined,
@@ -536,7 +535,7 @@ pub const Party = struct {
         // signers configured with a different set, or holding different
         // Paillier/ring-Pedersen/message keys for someone (a split refresh),
         // fail at the first header instead of later, at a proof that blames a
-        // peer (review F7; the table since review 2026-10-03 F9).
+        // peer (review F7; the table since review F9).
         var h = Sha256.init(.{});
         h.update(session_domain);
         h.update(&sid);
@@ -611,7 +610,7 @@ pub const Party = struct {
 
     /// Gives up a pending §4.3 opening — its round timed out, or the caller
     /// will not identify: wipes the nonce material and key-share copy kept
-    /// for it now rather than at `deinit` (review 2026-10-03 F11). The abort
+    /// for it now rather than at `deinit` (review F11). The abort
     /// stays unattributed. No effect in any other state.
     pub fn abandon(self: *Party) void {
         if (self.state != .opening and self.state != .echo and self.state != .identify) return;
@@ -683,7 +682,7 @@ pub const Party = struct {
     /// addressed to all or to this party, is evidence against that sender.
     /// Anything else — garbage, a forged header, a bad signature, another
     /// session's or round's message, a copy of a message already taken — is
-    /// transport noise and is dropped (review 2026-10-03 F3: a forged
+    /// transport noise and is dropped (review F3: a forged
     /// `from = A` header used to abort the session naming honest A). If the
     /// sender's real message never arrives, `missing_message` names it, as
     /// for any loss.
@@ -786,7 +785,7 @@ pub const Party = struct {
     /// (review F3), its secrets are canonical scalars and `random` cannot
     /// fail — so a refused key, tuple, floor or a Paillier operation that
     /// fails can only come from `j`'s published key, tuple or ciphertext
-    /// (review 2026-10-03 F15: checked, kept). The parameter is the provers'
+    /// (review F15: checked, kept). The parameter is the provers'
     /// error sets, not `anyerror`, so a new error variant there has to be
     /// placed here deliberately.
     fn proveFailed(self: *Party, j: u32, err: ProverError) Error {
@@ -1241,7 +1240,7 @@ pub const Party = struct {
     ///   from the opened values (`σ_i` itself would reveal `w_i`). The
     ///   signer's own masks `ν'` as Bob stay secret: `μ'_ji = k_j·w_i + ν'`
     ///   is public now and `k_j` too, so a published `ν'` would hand out
-    ///   `w_i = (μ'_ji − ν')/k_j` (review 2026-10-03 F1 — the first version
+    ///   `w_i = (μ'_ji − ν')/k_j` (review F1 — the first version
     ///   did exactly that). Everyone derives `ν'·G = μ'_ji·G − k_j·W_i`
     ///   instead; `μ'_ji` alone hides `k_j·w_i` behind `ν' < q⁵`.
     ///
@@ -1363,7 +1362,7 @@ pub const Party = struct {
     /// Checks every peer's echo (round 9) against the openings this party
     /// received — two signed versions of one opening name the signer who made
     /// them (`equivocation`), so honest signers judge the same openings
-    /// (review 2026-10-03 F5) — then every opening, and names the culprit:
+    /// (review F5) — then every opening, and names the culprit:
     /// the first signer, in signer order of the checks below, whose opening
     /// contradicts its earlier signed messages or the values it broadcast.
     /// Returns the verdict (also in `abort`); the party is done afterwards,
@@ -1481,7 +1480,7 @@ pub const Party = struct {
         const n = self.peers.len;
         for (openings, self.peers, 0..) |o, p, i| if (!self.checkNonce(o, i)) return p.index;
         // Every Alice's decryption first, so a lie in one is named before
-        // any σ is derived from it (review 2026-10-03 F2).
+        // any σ is derived from it (review F2).
         const mu = try self.allocator.alloc(Scalar, n * n);
         defer self.allocator.free(mu);
         for (0..n) |a| for (0..n) |b| {
@@ -1769,7 +1768,7 @@ pub const Presignature = struct {
     /// store must keep them encrypted at rest. CONSUMES the presignature: on
     /// success it is marked used and `k_i`, `σ_i` are wiped, so the bytes are
     /// the only copy left and the in-memory one can no longer sign (review
-    /// 2026-10-03 F11 — before, a caller could encode, keep the original and
+    /// F11 — before, a caller could encode, keep the original and
     /// sign with both, which reveals the key). Restoring the same bytes twice
     /// does the same — go through `PresignaturePool`, whose `take` hands a
     /// stored presignature out at most once. Refuses a used presignature.
@@ -1829,7 +1828,7 @@ pub const Presignature = struct {
     /// canonical scalars, ascending signers holding `index`, decodable keys,
     /// the seed matching this signer's key) and the relations a finished
     /// session leaves between them: `r = R.x mod q`, `Σ R̄_j = G`,
-    /// `Σ S_j = X`, `k·R = R̄_i`, `σ·R = S_i` (review 2026-10-03 F4: a
+    /// `Σ S_j = X`, `k·R = R̄_i`, `σ·R = S_i` (review F4: a
     /// damaged record would otherwise release a share against an `R` its
     /// `k` does not belong to). Not a substitute for authenticated
     /// encryption at rest: whoever can write a record can write a coherent
@@ -2036,7 +2035,7 @@ pub const PresignaturePool = struct {
 /// process. Wipes what it holds on `deinit`. Not synchronised: one thread
 /// only, or the caller's lock around every `put`/`take` — two concurrent
 /// `take`s of one id could both get the record, and a presignature used
-/// twice reveals the key share (review 2026-10-03 F12).
+/// twice reveals the key share (review F12).
 pub const MemoryPresignatureStore = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
@@ -2135,7 +2134,7 @@ const Case = enum {
     /// The cheater's round-4 messages carry a signed body shorter than the
     /// attestation block that must head them.
     short_body,
-    /// Mutation audit 2026-11-17: a signed round-1 broadcast shorter than its
+    /// Mutation audit: a signed round-1 broadcast shorter than its
     /// commitment, a round-1 broadcast and a round-2 p2p payload with one byte
     /// too many.
     r1_short,
@@ -2171,7 +2170,7 @@ const Case = enum {
     open7_late_strip,
     open7_late_round2,
     open5_late_mask,
-    /// Mutation audit 2026-11-17 (wave 3). `sigma_shift`; the LAST signer opens, for signer 0,
+    /// Mutation audit (wave 3). `sigma_shift`; the LAST signer opens, for signer 0,
     /// a round-2 message that signer 0 really signed (it is re-signed by signer 0 here) but
     /// that is not the one it sent to the opener: another round, another sender, another
     /// recipient, another session, a payload too short for the attestation block, a payload
@@ -2732,7 +2731,7 @@ fn expectStrictOpeningParser(allocator: std.mem.Allocator, parties: []Party, ope
     try testing.expect(parseOpening(copy, fault, n - 1, sections[0..n]) == null);
 }
 
-/// Review 2026-10-03 F1: a type-7 opening published every signer's Bob
+/// Review F1: a type-7 opening published every signer's Bob
 /// mask `β'` of the `k_a·w_b` MtA next to Alice's `μ' = k_a·w_b + β'` and
 /// `k_a` — enough for anyone to compute `w_b`. For every pair, rebuilds that
 /// `β'` from the secrets and asserts its encoding is in no opening.
@@ -2999,7 +2998,7 @@ test "presign: §4.3 opening — a forged round-2 message or a decryption lifted
     try expectOpeningNamesLiar(opening_cases[7..]);
 }
 
-/// Mutation audit 2026-11-17 (wave 3): the checks `openedRound2`, `round2Fields` and the
+/// Mutation audit (wave 3): the checks `openedRound2`, `round2Fields` and the
 /// type-5 first loop make before any other judgement of an opening.
 const opening_cases_w3 = [_]OpeningCase{
     .{ .open7_r2_round, .s_sum },
@@ -3355,7 +3354,7 @@ test "presign: init refuses a bad signer set" {
     t3.t = 3;
     try testing.expectError(error.InvalidParameters, Party.init(allocator, &t3, &[_]u32{ 1, 2 }, sid, &scratch));
     // A one-signer session is refused even when the share claims t = 1 (the
-    // `signers.len < 2` guard stands on its own; mutation audit 2026-11-17).
+    // `signers.len < 2` guard stands on its own; mutation audit).
     var t1 = share;
     t1.t = 1;
     try testing.expectError(error.InvalidParameters, Party.init(allocator, &t1, &[_]u32{1}, sid, &scratch));

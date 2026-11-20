@@ -16,11 +16,10 @@
 //!
 //! `ctx_i` is the caller's `session id || u32-BE i`, the same shape the
 //! signing proofs use: a proof can be neither replayed into another session
-//! nor claimed by another party. That includes the ring-Pedersen proofs
-//! (Πprm/Πmod over `Ñ`, `aux_proofs.proveWellFormedBound`, since
-//! 2026-10-02): a party that copies another's `Ñ` together with its proofs
-//! fails `verifyAnnouncement` under its own context. `findDuplicate` stays as
-//! the second line (two announcements sharing a modulus are refused even if
+//! nor claimed by another party. That includes the ring-Pedersen proofs: a
+//! party that copies another's `Ñ` together with its proofs fails
+//! `verifyAnnouncement` under its own context. `findDuplicate` stays as the
+//! second line (two announcements sharing a modulus are refused even if
 //! someone re-proved a copied one — impossible without its trapdoor).
 //!
 //! Why each check (CGGMP21 §4, the BitForge disclosure): a Paillier `N`
@@ -241,7 +240,7 @@ pub fn findDuplicate(all: []const Announcement) ?struct { usize, usize } {
 /// `N` or ring-Pedersen `Ñ` equal to either of `old`'s moduli, or the same
 /// message key. A key refresh must refuse it — renewed shares under a
 /// Paillier key or `Ñ` that was already exposed are not renewed (review
-/// 2026-10-03 F14; `dkg.EcdsaRefresh` checks every announcement against
+/// F14; `dkg.EcdsaRefresh` checks every announcement against
 /// every entry of the old table).
 pub fn reusesMaterial(new: Announcement, old: root.PartyPublicKeys) bool {
     if (std.mem.eql(u8, &new.message_key, &old.message_key)) return true;
@@ -289,7 +288,7 @@ pub const AssembleError = error{
 /// distinct-moduli check, and each peer's Πfac made for `me`. Only
 /// `verified` turns it into the `Verified` that `assembleKeyShare` takes, so
 /// a key share cannot be assembled from announcements nobody checked
-/// (review F5, 2026-10-03; it used to be a doc-comment precondition).
+/// (review F5; it used to be a doc-comment precondition).
 pub const AnnouncementSet = struct {
     all: []Announcement,
     me: u32,
@@ -363,7 +362,7 @@ pub const Verified = struct {
     me: u32,
     /// The address of a declaration private to this file, set only by
     /// `AnnouncementSet.verified`: a `Verified` cannot be written by hand
-    /// from outside (review 2026-10-03 F13 — the old `enum { checked }` seal
+    /// from outside (review F13 — the old `enum { checked }` seal
     /// took any `.checked` literal). `assembleKeyShare` refuses another.
     seal: *const u8,
 };
@@ -458,7 +457,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const generate_stack_burn = 16 * 1024;
 const assemble_key_share_stack_burn = 576 * 1024;
@@ -568,8 +567,8 @@ test "aux_info: announcements survive the codec, verify, and are bound to their 
         try testing.expectError(error.InvalidEncoding, Announcement.fromBytes(weak));
     }
     // Bound to its sender: party 2 cannot present party 1's announcement as
-    // its own — the Ñ proofs refuse first (bound since 2026-10-02), and the
-    // Πmod(N) on its own refuses too.
+    // its own — the Ñ proofs refuse first, and the Πmod(N) on its own
+    // refuses too.
     try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(anns[0], &ctxFor(2), random));
     try testing.expect(!aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(2), anns[0].paillier_proof));
     try testing.expect(aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(1), anns[0].paillier_proof));
@@ -693,7 +692,7 @@ test "aux_info: a copied Ñ with its proofs fails under the copier's context; fi
     try verifyAnnouncement(ann_b, &ctxFor(2), random);
     ann_b.aux = ann_a.aux;
     ann_b.aux_proof = ann_a.aux_proof;
-    // Was the gap until 2026-10-02 (the Ñ proofs were unbound): now the
+    // Was the gap earlier (the Ñ proofs were unbound): now the
     // copied proofs are bound to party 1's context, not party 2's.
     try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(ann_b, &ctxFor(2), random));
     try verifyAnnouncement(ann_a, &ctxFor(1), random);

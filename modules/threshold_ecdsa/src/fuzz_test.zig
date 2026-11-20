@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for threshold_ecdsa's deterministic fuzz driver (added
-//! 2026-10-10, the jwt pattern). The harness BODIES stay beside their corpora in
+//! Shared plumbing for threshold_ecdsa's deterministic fuzz driver (added, the jwt pattern). The harness BODIES stay beside their corpora in
 //! `root.zig`, `zkproofs.zig`, `aux_proofs.zig`, `ecproofs.zig` and
 //! `presign.zig`; each is generic over its source of choices
 //! (`fn(comptime S, *S, gpa)`), `testing.fuzz` hands it a `std.testing.Smith`

@@ -13,12 +13,9 @@
 //! transport is a loop. It exists for tests, for simulations, and for the
 //! single-operator case where one host legitimately holds every share.
 //!
-//! Until 2026-10-02 this file was its own, separate implementation of the
-//! protocol: one function computing every party's values side by side,
-//! without GG20's Phase 5/6 checks (`Σ R̄_j = G`, `Σ S_j = X`) and without
-//! culprit naming. One process holding every share made that safe for
-//! itself, but nothing of it carried over to separate signers. It now drives
-//! the state machine, so there is one implementation, tested both ways.
+//! One process holding every share made that safe for itself, but nothing of
+//! it carried over to separate signers. It now drives the state machine, so
+//! there is one implementation, tested both ways.
 //!
 //! Zig std GAP: none — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`,
 //! `std.crypto.ecc.Secp256k1` and `std.Thread` are all this file needs.

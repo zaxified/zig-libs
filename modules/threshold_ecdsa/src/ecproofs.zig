@@ -37,7 +37,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const pedersen_commit_stack_burn = 24 * 1024;
 const prove_pedersen_stack_burn = 24 * 1024;

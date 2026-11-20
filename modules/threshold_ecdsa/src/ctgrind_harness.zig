@@ -19,17 +19,14 @@
 //! so it cannot rot into an unbuildable recipe; that compile is not a
 //! measurement (see `scripts/checks/ctgrind.sh`'s own header).
 //!
-//! ## What it drives (rewritten 2026-10-02)
+//! ## What it drives (rewritten)
 //!
-//! Until 2026-10-02 the targets drove `signing.signWithShares`, then a single
-//! function computing every party's values, and tainted draws from the one
-//! `random` it took. `signWithShares` is now a loop over `presign.Party`
-//! state machines, each drawing from its own CSPRNG seeded up front — a
-//! wrapper around the caller's `random` would see only the seeds. So the
-//! harness runs the parties itself (`runProtocol`, the same routing
-//! `signWithShares` does), handing each party its own wrapped PRNG, and
-//! taints at the source of every secret draw. `t = n = 2`: 2 parties,
-//! 2 ordered pairs.
+//! `signWithShares` is now a loop over `presign.Party` state machines, each
+//! drawing from its own CSPRNG seeded up front — a wrapper around the
+//! caller's `random` would see only the seeds. So the harness runs the
+//! parties itself (`runProtocol`, the same routing `signWithShares` does),
+//! handing each party its own wrapped PRNG, and taints at the source of every
+//! secret draw. `t = n = 2`: 2 parties, 2 ordered pairs.
 //!
 //! The secret-scalar `mul` sites this reaches are all in `presign.zig`,
 //! `ecproofs.zig` and `zkproofs.zig` (`γ_i·G`, `k_i·R`, `σ_i·R`, the
@@ -45,7 +42,7 @@
 //! `k256` module. That claim does not survive reading `k256`'s own harness
 //! doc comment: `k256`'s `Secp256k1.mul`/`combMulBase`
 //! (`modules/k256/src/group.zig:277`/`:346`) end in `try
-//! q.rejectIdentity()` too, and MEASURED (`k256`'s own table, 2026-08-13)
+//! q.rejectIdentity()` too, and MEASURED (`k256`'s own table)
 //! that this produces exactly the SAME shape of small, expected, non-zero
 //! context count as std's. Confirmed directly for THIS module by reading
 //! std's own source: `std.crypto.ecc.Secp256k1.mul`
@@ -70,7 +67,7 @@
 //!   `β' ∈ [0, q⁵)` (audit F5), `2·t(t−1)` = 4 at `t = 2` — one MtA and one
 //!   MtAwc per ordered pair. The count is checked before the result is
 //!   printed (`TaintBetaPrime`). Positive control, measured on the old
-//!   driver (2026-09-15): a `testb`/`je` on `β'[100]` inserted after the draw
+//!   driver: a `testb`/`je` on `β'[100]` inserted after the draw
 //!   added exactly 2 contexts, both on the inserted line, one per caller.
 //!
 //! Every target runs the REAL `keygenTrustedDealer` first (a genuine
@@ -251,7 +248,7 @@ const TaintScalars = struct {
 
 // ── target "betaprime": taint every draw of Bob's MtA blind β' ────────────
 
-/// Since audit F5 (2026-09-16), Bob's blind `β'` is a uniform `[0, q⁵)` draw
+/// Since audit F5, Bob's blind `β'` is a uniform `[0, q⁵)` draw
 /// of `zkproofs.beta_prime_bytes` = 160 bytes (`mta.sampleBetaPrime`). This
 /// wrapper taints EVERY draw of exactly that width, and nothing else: scalars
 /// are 48 bytes, the proof masks are `q³` (96), `q⁷` (224) or `q·Ñ`-wide,
@@ -333,7 +330,7 @@ fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: 
 
 // ── target "fac": taint the Paillier factors through Πfac's prover ───────
 //
-// Dealer-free keygen (2026-10-02): every party proves its Paillier `N` has
+// Dealer-free keygen: every party proves its Paillier `N` has
 // no small factor (`fac_proof.prove`), the one place outside `paillier`
 // where the factors `p`, `q` are arithmetic inputs. Real 2048-bit material:
 // tss-lib party 1's safe primes, party 2's ring-Pedersen tuple. Only `p`,
@@ -384,7 +381,7 @@ fn runFac(tainted: bool) !void {
 // ── target "pimod": taint the Paillier factors through Πmod's prover ─────
 //
 // `aux_proofs.Pimod.provePaillier` over tss-lib's 2048-bit N, `p`/`q`
-// tainted. Since 2026-10-02 the per-round work (Legendre symbols, 4th roots,
+// tainted. The per-round work (Legendre symbols, 4th roots,
 // CRT, q⁻¹ mod p) runs on montint.DynModint modulo the secret primes; what
 // stays variable-time is the big-integer setup (φ, d = Ñ⁻¹ mod φ by extended
 // Euclid) — the classified residue in the tsv.
@@ -414,7 +411,7 @@ fn runPimod(allocator: std.mem.Allocator, tainted: bool) !void {
 //
 // `aux_proofs.Piprm.proveBound` over tss-lib's 2048-bit Ñ, `p̃`, `q̃` and
 // `λ` tainted (tss-lib's α = log_h1 h2, not this module's log_h2 h1: the
-// proof it yields does not verify, and the timing does not care). Since 2026-10-03 φ is a limb product and the
+// proof it yields does not verify, and the timing does not care). φ is a limb product and the
 // responses `a_i + e_i·λ mod φ` one masked subtraction; what branches is the
 // nonce draw's accept verdict (`a_i < φ`).
 fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
@@ -467,7 +464,7 @@ fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
 // `root.auxParamsWithTrapdoorFromSafePrimes` over tss-lib's 1024-bit safe
 // primes `p̃`, `q̃`, tainted: Ñ = p̃·q̃ and ord = p'·q' as montint limb
 // products, λ drawn below 2^(bits−2) and kept on the borrow of λ − ord,
-// h1 = h2^λ. Since 2026-10-03 (was std.math.big.int and a big-int compare
+// h1 = h2^λ. (was std.math.big.int and a big-int compare
 // against ord). Ñ itself is PUBLIC but computed from the tainted primes, so
 // its parse into `AuxModulus` (ff) and h2's draw mod Ñ count as class (a).
 fn runAuxgen(allocator: std.mem.Allocator, tainted: bool) !void {
@@ -531,8 +528,8 @@ fn runPrime(tainted: bool) !void {
     if (tainted) std.valgrind.memcheck.makeMemUndefined(&p);
     std.mem.doNotOptimizeAway(&p);
     var prng = std.Random.DefaultPrng.init(0x7072_696d_65); // "prime"
-    // The search's path for the candidate that becomes the prime (since
-    // 2026-10-03): the constant-time sieve, then Miller-Rabin from bytes.
+    // The search's path for the candidate that becomes the prime: the
+    // constant-time sieve, then Miller-Rabin from bytes.
     const sieved = root.sieveRejects(&p);
     const verdict = root.isProbablePrimeBE(&p, 1024, prng.random());
     // Both verdicts on a prime's path are constants, so they carry no taint;

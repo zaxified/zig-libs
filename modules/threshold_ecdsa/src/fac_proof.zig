@@ -44,7 +44,7 @@
 //! `q`, the masks) meet only `zkproofs.powSecret` (montint's constant-time
 //! windowed pow, chunked) with fixed-width exponents and the fixed-trip-count
 //! byte arithmetic below — not `std.crypto.ff`'s pow, whose table select
-//! LLVM compiles to a branch (ctgrind, 2026-10-02). The verifier is
+//! LLVM compiles to a branch (ctgrind). The verifier is
 //! variable-time over public values.
 
 const std = @import("std");
@@ -57,7 +57,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const prove_stack_burn = 240 * 1024;
 
@@ -687,7 +687,7 @@ test "Πfac TEETH: N0 = 3·X — the equations accept, the range check refuses" 
     try testing.expect(bitLen(proof.z2.bytes()) > ell_bits + epsilon_bits + 1024 + 1);
 
     // The same with the factors swapped: now z1 is the oversized one, and
-    // only the z1 half of the range check can refuse it (mutation audit 2026-11-17).
+    // only the z1 half of the range check can refuse it.
     const swapped = try proveUnchecked(n0, &x, &[_]u8{3}, st.aux, ctx_a, random, true);
     try testing.expect(verifyInner(n0, st.aux, ctx_a, swapped, false));
     try testing.expect(!verify(n0, st.aux, ctx_a, swapped));

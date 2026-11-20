@@ -41,7 +41,7 @@
 //! is the load-bearing sign choice: `α` carries `+β'` (it decrypts
 //! `a·b + β'`), so `β` must carry `−β'` for the two to cancel.
 //!
-//! **The blind must dominate `a·b` (audit F5, 2026-09-16).** Alice decrypts
+//! **The blind must dominate `a·b` (audit F5).** Alice decrypts
 //! the integer `α'` and knows `a`, so `β'` is the only thing hiding `b` from
 //! her. It used to be drawn from `Zq`: a `~q` blind over `a·b ≈ q²`, and
 //! `α'/a` gave `b` back. `mtaBobResponse` now draws `β'` from `Z_N` (GG18
@@ -106,7 +106,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const mta_alice_init_stack_burn = 112 * 1024;
 const mta_alice_init_checked_stack_burn = 112 * 1024;
@@ -202,7 +202,7 @@ pub const BobResponse = struct {
 ///
 /// Send `result.c_b` to Alice; keep `result.beta`.
 ///
-/// **Why `β'` spans `Z_N` (audit F5, 2026-09-16).** Alice decrypts the
+/// **Why `β'` spans `Z_N` (audit F5).** Alice decrypts the
 /// integer `α' = a·b + β'` and knows `a`. With `β' < q` (as this used to
 /// sample) `α'/a` IS `b` up to a few units — measured: Alice recovered `b` in
 /// 4 of 4 trials. Uniform over `Z_N`, `α'` carries no information about `b`.
@@ -347,7 +347,7 @@ fn finalizeLift(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey, centered
 }
 
 /// `α' mod q` for the CENTERED representative of `α' ∈ [0, N)`: `α'` itself
-/// when `2α' ≤ N`, else `α' − N` (negative). Relation audit 2026-10-03,
+/// when `2α' ≤ N`, else `α' − N` (negative). Relation audit,
 /// LOW 3: the range proof bounds Bob's `β'` only to `|β'| ≲ q⁷`, so a Bob may
 /// send a NEGATIVE `β'`; with the plain `[0, N)` lift, `a·b + β' < 0` wraps
 /// to `N + a·b + β'`, Alice's share is off by `N mod q`, the session aborts,
@@ -570,7 +570,7 @@ pub const BobResponseChecked = struct {
 /// either output identically — but only THIS version's `result.r_b` is a
 /// real witness for `zkproofs.proveBobMta`.
 ///
-/// **`β' ∈ [0, q⁵)` (audit F5, 2026-09-16)** — tss-lib's range, the widest
+/// **`β' ∈ [0, q⁵)` (audit F5)** — tss-lib's range, the widest
 /// the `t1 <= q⁷` bound of Bob's proof admits with honest slack. It used to
 /// be a `Zq` scalar: Alice, who knows `a`, recovered Bob's `b` (`γ_j`, or the
 /// Lagrange-weighted key share `w_j` in MtAwc) from `α'/a` in 3 of 4 trials.
@@ -1022,7 +1022,7 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, &kp.secret, kp.public, aux, test_ctx, &scratch));
 }
 
-// ── audit F5 (2026-09-16): the plaintext Alice decrypts must hide Bob's b ──
+// ── audit F5: the plaintext Alice decrypts must hide Bob's b ──
 
 fn bigFromBytesTest(allocator: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
     var x = try std.math.big.int.Managed.initCapacity(allocator, bytes.len / @sizeOf(std.math.big.Limb) + 2);

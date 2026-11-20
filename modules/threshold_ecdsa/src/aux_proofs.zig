@@ -39,15 +39,10 @@
 //! `root.generateAuxParams`'s construction). Concretely: `s := aux.h1`,
 //! `t := aux.h2`.
 //!
-//! ⚠ The direction is the security property. `h1 ∈ ⟨h2⟩` makes
-//! `h1^x·h2^ρ = h2^{λx+ρ}`, which `ρ` masks. Until 2026-10-03 this module
-//! had it reversed (`h2 = h1^λ`, proving `h2 ∈ ⟨h1⟩`), which a dishonest
-//! tuple owner satisfies with `h2 = h1^M` for a smooth `M | ord(h1)`: the
-//! commitment then fixes `x mod M` whatever `ρ` is, and Pohlig–Hellman
-//! reads it off (Alpha-Rays/TSSHOCK class). Πmod does not stop it — Blum
-//! primes may have smooth `(p̃−1)/2`. Every doc comment below uses `s`/`t` when quoting the
-//! paper's equations and `h1`/`h2` when referring to this module's fields
-//! — they are the SAME values.
+//! ⚠ The direction is the security property. `h1 ∈ ⟨h2⟩` makes `h1^x·h2^ρ = h2^{λx+ρ}`,
+//! which `ρ` masks. Πmod does not stop it — Blum primes may have smooth `(p̃−1)/2`. Every
+//! doc comment below uses `s`/`t` when quoting the paper's equations and `h1`/`h2` when
+//! referring to this module's fields — they are the SAME values.
 //!
 //! ## Soundness parameter
 //!
@@ -59,10 +54,6 @@
 //! cheating prover with probability `>= 1/2` — `(1/2)^128` for both).
 //! Rounds of a 1-bit challenge rather than one wide challenge, since the
 //! challenge cannot be widened past 1 bit/round without leaking structure.
-//! Until 2026-10-03 `m` was CGGMP21's and tss-lib's `80`: a non-interactive
-//! proof is GRINDABLE (the prover can re-roll its commitments offline until
-//! the derived bits suit a false statement), so `2^-80` was an 80-bit
-//! security level under a module that otherwise reads as ~128 (review F7).
 //!
 //! Zig std GAP: none new — `std.crypto.ff` (via `root.AuxModulus`/
 //! `root.AuxFe`) and `std.crypto.hash.sha2.Sha256` (via `zkproofs
@@ -80,7 +71,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const piprm_prove_stack_burn = 640 * 1024;
 const piprm_prove_bound_stack_burn = 640 * 1024;
@@ -868,12 +859,11 @@ pub const Piprm = struct {
         _ = allocator; // kept in the signature; nothing here allocates since 2026-10-03
 
         // φ(n_tilde) = (p̃−1)(q̃−1) from the trapdoor, on montint limbs: the
-        // primes are SECRET and nothing below branches on them (until
-        // 2026-10-03 this was std.math.big.int — `divFloor` on φ and λ,
-        // a byte compare in the rejection loop). Degenerate factors are
-        // substituted fail-closed by `BlumCt.init` — the resulting proof is
-        // garbage a correct verifier rejects; an aux/trapdoor mismatch is a
-        // caller bug per this function's contract.
+        // primes are SECRET and nothing below branches on them. Degenerate
+        // factors are substituted fail-closed by `BlumCt.init` — the
+        // resulting proof is garbage a correct verifier rejects; an
+        // aux/trapdoor mismatch is a caller bug per this function's
+        // contract.
         var pb = BlumCt.init(trapdoor.p, nt);
         defer pb.wipe();
         var qb = BlumCt.init(trapdoor.q, nt);
@@ -1175,12 +1165,10 @@ pub const Pimod = struct {
         // Per-factor constant-time contexts: the primes are SECRET moduli
         // (montint.DynModint), and every step below — φ and d, the Legendre
         // symbols, square roots, the CRT — runs on them without a branch on
-        // their value. (Until 2026-10-02 this was big-int Jacobi symbols and
-        // division plus std.crypto.ff pow modulo the secret factor; until
-        // 2026-10-03 φ and d were big-int extended Euclid.) A degenerate
-        // factor is substituted fail-closed inside `BlumCt.init` (garbage
-        // proof a correct verifier rejects, never a panic/hang); an
-        // aux/trapdoor mismatch is a caller bug per the contract.
+        // their value. A degenerate factor is substituted fail-closed inside
+        // `BlumCt.init` (garbage proof a correct verifier rejects, never a
+        // panic/hang); an aux/trapdoor mismatch is a caller bug per the
+        // contract.
         var pb = BlumCt.init(p_secret, nt);
         defer pb.wipe();
         var qb = BlumCt.init(q_secret, nt);
@@ -1349,7 +1337,7 @@ pub const Pimod = struct {
     fn verifyCore(nt: root.AuxModulus, binding: ModBinding, proof: ModProof) bool {
         // The smallest Paillier-Blum modulus is 3·7 = 21 (5 bits). Below it
         // the Miller-Rabin witness range [2, N−2] is empty for N = 3 and
-        // `randomWitness` would never return (review 2026-10-03 F2).
+        // `randomWitness` would never return (review F2).
         if (nt.bits() < 5) return false;
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
         nt.toBytes(&nt_buf, .big) catch return false;
@@ -1358,7 +1346,7 @@ pub const Pimod = struct {
         // 1. n_tilde must be an odd composite. Odd is structural (ff
         //    rejects even moduli); composite = Miller-Rabin with witnesses
         //    drawn from a PRNG seeded by H(n_tilde) — `verify` takes no
-        //    CSPRNG parameter. Audit F9 (2026-09-10 doc fix): the witnesses
+        //    CSPRNG parameter. Audit F9 (doc fix): the witnesses
         //    are NOT outside the modulus-crafter's control — H(n_tilde) is
         //    a public, deterministic function of a candidate the crafter
         //    already holds, so nothing stops computing them offline for
@@ -2070,7 +2058,7 @@ test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and st
     try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered, random));
 }
 
-// ── audit F4(b)/(c) (2026-09-16): the two input guards no per-round
+// ── audit F4(b)/(c): the two input guards no per-round
 //    equation stands in for. Each test builds a proof whose every round
 //    holds, so deleting the guard is the only way it can be accepted. ──
 
@@ -2151,11 +2139,8 @@ fn toyPrmProof(aux: root.AuxParams, base: u64, log: u64) PrmProof {
 }
 
 test "review 2026-10-03 F1: Πprm proves h1 ∈ ⟨h2⟩ — a proof of h2 ∈ ⟨h1⟩ over a tuple with [⟨h1⟩:⟨h2⟩] = 5 is refused" {
-    // Ñ = 187: 3 has order 80, 3^5 = 56 has order 16. The tuple (h1 = 3,
-    // h2 = 56) is the attack shape: h2 = h1^5, h1 ∉ ⟨h2⟩. Until 2026-10-03
-    // the verifier checked h1^{z} = A·h2^{e} and accepted the owner's proof
-    // of it (λ = 5) — while every commitment c = h1^x·h2^ρ gives x mod 5
-    // away: c^16 = h1^{16x} (ord h2 = 16) and h1^16 has order 5.
+    // Ñ = 187: 3 has order 80, 3^5 = 56 has order 16. The tuple (h1 = 3, h2
+    // = 56) is the attack shape: h2 = h1^5, h1 ∉ ⟨h2⟩.
     const n: u64 = 187;
     for (0..80) |x| for (0..16) |rho| {
         const c = powModSmall(3, x, n) * powModSmall(56, rho, n) % n;

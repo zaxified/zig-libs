@@ -28,9 +28,9 @@
 //!
 //! ## Threat model — why the "reject" tests matter more than the "accept" ones
 //!
-//! Both proofs exist to close the EXACT gap `mta.zig`'s module doc comment
-//! flags as `TODO(2c)`: without them, `mtaBobResponse`/`mtaAliceFinalize`
-//! (Phase 2b) are secure only against a passive adversary. A MALICIOUS
+//! Both proofs exist to close the EXACT gap `mta.zig`'s semi-honest core
+//! leaves: without them, `mtaBobResponse`/`mtaAliceFinalize` are secure only
+//! against a passive adversary. A MALICIOUS
 //! party can feed an out-of-range multiplicative input (`a`, `b`, or `β'`)
 //! and, over the O(t²) MtA instances a real signing round runs, extract
 //! bits of the counterparty's secret share — this is the general shape of
@@ -75,7 +75,7 @@
 //!     hardening that also bounds Bob's additive blind, closing the
 //!     unbounded-`β'` degree of freedom the Alpha-Rays class of attack
 //!     abuses. This module's checked-MtA wiring samples `β' ∈ Z_{q⁵}`,
-//!     exactly tss-lib's range (audit F5, 2026-09-16: it used to sample
+//!     exactly tss-lib's range (audit F5: it used to sample
 //!     `β' ∈ Z_q`, which passed the proof but let Alice recover `b` from
 //!     `α'/a`); the bound is strictly STRONGER than the paper's). The wider
 //!     `tau ∈ Z_{q³·N_tilde}` follows so `t2 = e·sigma + tau` remains
@@ -191,7 +191,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const prove_alice_range_stack_burn = 240 * 1024;
 const prove_pdl_stack_burn = 240 * 1024;
@@ -259,7 +259,7 @@ const q7_bytes = comptimeIntBytes(224, q_int * q_int * q_int * q_int * q_int * q
 /// Width of Bob's MtA blind `β'` as the provers take it (big-endian).
 pub const beta_prime_bytes = 160;
 /// `q⁵` — the range Bob draws `β'` from (tss-lib `BobMid`/`BobMidWC`,
-/// `GetRandomPositiveInt(q5)`). Audit F5 (2026-09-16): `β'` used to be a
+/// `GetRandomPositiveInt(q5)`). Audit F5: `β'` used to be a
 /// `Zq` scalar, and a `~q` blind over `a·b ≈ q²` let Alice read `b` off her
 /// own decryption (`α'/a`). Over `q⁵`, `a·b` shifts the distribution by at most
 /// `q²/q⁵ = q⁻³`, and honest `t1 = e·β' + gamma < q⁶ + q⁷` still passes the
@@ -326,7 +326,7 @@ fn mulBytes(a: []const u8, b: []const u8, out: []u8) void {
 /// byte position unconditionally — the tail loop below runs a FIXED number
 /// of steps (`pos` is a function of `e.len`/`x.len`/`i`, all public per call
 /// site, never of `carry`) instead of stopping early once the secret-derived
-/// carry settles (A1 threshold_ecdsa R2, 2026-09-15: the early exit compiled
+/// carry settles (A1 threshold_ecdsa R2: the early exit compiled
 /// to a `cmp $0x100`/`jb` over the tainted running sum).
 fn mulAddBytes(e: []const u8, x: []const u8, addend: []const u8, out: []u8) []u8 {
     std.debug.assert(out.len >= e.len + x.len + 1 and out.len >= addend.len + 1);
@@ -421,20 +421,19 @@ fn sampleNonzeroBelow(random: std.Random, bound: []const u8, out_buf: []u8) []u8
 // `std.crypto.ff` modexps — the ~7–8× hot spot the audit's N1 finding measured
 // (per-signature multi-second at production key sizes, `ff`'s schoolbook O(n²)
 // Montgomery). They route through the sibling `montint` module, on
-// `montint.DynModint` since 2026-10-02 (a private copy of the slot recipe
-// before). Two moduli flow through here at runtime — Ñ (`root.AuxModulus`,
-// ~2048-bit) and Paillier N²/N (`paillier.Modulus`, up to ~4096-bit) — so the
-// helpers are generic over the `ff.Modulus`/`ff.Fe` pair; the montint modulus
-// is built per call (these generic choke points are not handed a key struct).
-// Every Fiat-Shamir transcript, sampling range, verifier bound and
-// serialization is byte-identical: the montint result comes back as the SAME
-// `ff.Fe` value.
+// `montint.DynModint` (a private copy of the slot recipe before). Two moduli
+// flow through here at runtime — Ñ (`root.AuxModulus`, ~2048-bit) and Paillier
+// N²/N (`paillier.Modulus`, up to ~4096-bit) — so the helpers are generic over
+// the `ff.Modulus`/`ff.Fe` pair; the montint modulus is built per call (these
+// generic choke points are not handed a key struct). Every Fiat-Shamir
+// transcript, sampling range, verifier bound and serialization is
+// byte-identical: the montint result comes back as the SAME `ff.Fe` value.
 //
 // CONSTANT-TIME: secret witness exponents (the prover's masks `m, alpha, rho,
 // gamma, sigma, tau`, secret Paillier randomness `r_a`, aux trapdoor `lambda`)
 // go through `powSecret` → montint's windowed ladder (all `L·64` exponent
 // bits, branchless table gather), chunked to the modulus width. Since
-// 2026-10-02 the PRODUCTS over secret factors (`pedersenCt`, `mulCt`) and the
+// The PRODUCTS over secret factors (`pedersenCt`, `mulCt`) and the
 // moves of a secret between moduli (`rebase`, `feFromSecretBytes`) are montint
 // too, and values cross to and from `ff` by a positional limb repack, not by
 // `ff`'s `toBytes`/`fromBytes` — `ff`'s `mul`/`reduce`/`fromBytes` branch on
@@ -483,7 +482,7 @@ fn powCt(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
 /// of `e.len` and the modulus width only.
 ///
 /// Use this, not `std.crypto.ff`'s `powWithEncodedExponent`, for a secret
-/// exponent: ctgrind measured (2026-10-02, `fac` target) that LLVM turns the
+/// exponent: ctgrind measured (`fac` target) that LLVM turns the
 /// latter's constant-time table select back into a conditional jump in
 /// ReleaseFast — the 4-bit windows of the exponent leak.
 pub fn powSecret(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
@@ -707,7 +706,7 @@ fn chunkScalar(chunk: []const u8) Scalar {
 /// silently changing the absorbed bytes means a stale proof fails as a plain
 /// verification failure, never as a subtly-mismatched challenge.
 ///
-/// **BREAKING, v2 → v3 (relation audit 2026-10-03, LOW 1).** The range,
+/// **BREAKING, v2 → v3 (relation audit, LOW 1).** The range,
 /// MtA and MtAwc transcripts absorb the caller's `context` (session id and
 /// prover index, as `PdlProof` and `ecproofs` always did) first, so a proof
 /// made in one session, or by one prover, does not verify in another.
@@ -1996,7 +1995,7 @@ fn verifyBobInner(
     if (proof.z.isZero() or proof.z1.isZero() or proof.t.isZero() or
         proof.w.isZero() or proof.s.isZero() or proof.v.c.isZero()) return false;
     if (c_a.c.isZero() or c_b.c.isZero()) return false;
-    // Units only, as Alice's range proof (relation audit 2026-10-03, LOW 2):
+    // Units only, as Alice's range proof (relation audit, LOW 2):
     // with `c_b` and `s` units of `Z*_N`, equation 5 makes `v` one too.
     // Defence in depth — a Bob who does not know Alice's factors cannot
     // produce a non-unit, and `paillier.decrypt` refuses one — but the
@@ -2115,8 +2114,7 @@ pub const MtaProofWc = struct {
         errdefer base.deinit(allocator);
 
         // Exact length, as PdlProof requires: trailing octets after the
-        // point made two encodings of one proof (malleable; fuzz wave I,
-        // 2026-10-10).
+        // point made two encodings of one proof (malleable; fuzz wave I).
         if (bytes.len != offset + root.Ne) return error.InvalidEncoding;
         const u1_point = try root.Element.fromBytes(bytes[offset..][0..root.Ne].*);
 
@@ -2450,8 +2448,7 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
 // -- honest accept / reject: the real Phase-2c security net --
 
-/// `p²` as an `Fe` canonical mod `n²` (paillier's `CrtParams.p_sq_fe` until
-/// 2026-11-17, deleted there as unused; rebuilt from `crt.p_sq`, `p² < n²`).
+/// `p²` as an `Fe` canonical mod `n²` (paillier's `CrtParams.p_sq_fe`, deleted there as unused; rebuilt from `crt.p_sq`, `p² < n²`).
 fn pSqFe(nsq: anytype, p_sq: anytype) !@TypeOf(nsq).Fe {
     var buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try p_sq.toBytes(&buf, .big);
@@ -3490,8 +3487,7 @@ fn buildDecoderFixture() DecoderFixture {
     return .{ .n_tilde = n_tilde, .alice_pk = kp.public };
 }
 
-/// Bit-for-bit copy of `mulAddBytes` AS IT WAS BEFORE the A1 R2 fix
-/// (2026-09-15): the carry-propagation tail exits as soon as `carry` hits
+/// Bit-for-bit copy of `mulAddBytes` AS IT WAS BEFORE the A1 R2 fix: the carry-propagation tail exits as soon as `carry` hits
 /// zero, instead of walking every remaining byte unconditionally. Kept only
 /// here, in the test, as the "old" side of the differential below — the
 /// production function must never regain this shape.
@@ -3819,8 +3815,7 @@ test "powSecret: equals ff's public-exponent pow for exponents shorter than, equ
 
 /// The Fiat-Shamir transcript spelled out independently of `Transcript`:
 /// SHA-256 over the domain, then each part as a big-endian u32 length and
-/// its bytes, the digest reduced into the scalar field (mutation audit
-/// 2026-11-17: a field dropped from a challenge changes nothing an honest
+/// its bytes, the digest reduced into the scalar field (mutation audit: a field dropped from a challenge changes nothing an honest
 /// proof or a tampered one can show; only the layout itself can).
 const HandTranscript = struct {
     h: Sha256,
@@ -3993,7 +3988,7 @@ test "mut 527: verify-side key checks refuse proofs that are otherwise valid: no
     const p_s = try proveAliceRangeInner(allocator, &a_bytes, r_s, spk, aux, test_ctx, null, random);
     defer p_s.proof.deinit(allocator);
     try testing.expect(!verifyAliceRange(p_s.proof, c_s, spk, aux, test_ctx));
-    // …and Bob's (mutation audit 2026-11-17, mutant 527: `verifyBobInner` had no test for its own N floor).
+    // …and Bob's (mutation audit, mutant 527: `verifyBobInner` had no test for its own N floor).
     const r_bs = testPaillierRandomness(spk, random);
     const c_bs = buildCb(spk, c_s, &a_bytes, &bp, r_bs);
     const b_s = try proveBobInner(allocator, &a_bytes, &bp, r_bs, c_s, c_bs, spk, aux, test_ctx, null, random);

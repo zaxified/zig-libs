@@ -67,13 +67,13 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const keygen_trusted_dealer_stack_burn = 64 * 1024;
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const split_secret_key_stack_burn = 16 * 1024;
 const reconstruct_secret_stack_burn = 4 * 1024;
@@ -638,13 +638,12 @@ pub const AuxParams = struct {
     ///   - **F2 — key-size floor, Ñ > q⁷.** Below this the GG18 `t1 <= q⁷`
     ///     range bound is vacuous (audit F2); see `nTildeMeetsFloor`.
     ///
-    /// **TODO(Πprm/Πmod):** the full fix is a GG20/CMP zero-knowledge
-    /// proof-of-correct-generation broadcast alongside the tuple (that `Ñ` is
-    /// a product of two safe primes and `h1 = h2^λ` for a known `λ`) — the
-    /// larger, deliberately-deferred item (`generateAuxParamsInternal`
-    /// already returns the `λ` such a prover would need). This structural
-    /// validation is the cheap, always-enforced floor beneath it, not a
-    /// replacement.
+    /// The full check is the zero-knowledge proof-of-correct-generation
+    /// broadcast alongside the tuple (`aux_proofs.Piprm` / `Pimod`: that `Ñ`
+    /// is a product of two safe primes and `h1 = h2^λ` for a known `λ`; its
+    /// prover needs the `λ` that `generateAuxParamsInternal` returns). This
+    /// structural validation is the cheap, always-enforced floor beneath it,
+    /// not a replacement.
     pub fn validate(self: AuxParams, random: std.Random) ValidateError!void {
         const nt = self.n_tilde;
         const one = nt.one();
@@ -664,7 +663,7 @@ pub const AuxParams = struct {
         if (!auxFeJacobiIsOne(gpa, nt, self.h1)) return error.InvalidAuxParams;
         if (!auxFeJacobiIsOne(gpa, nt, self.h2)) return error.InvalidAuxParams;
 
-        // Audit F1 (2026-09-10 fix, user decision: cheap floor now, Πprm/
+        // Audit F1 (fix, user decision: cheap floor now, Πprm/
         // Πmod deferred as a separate task): reject a generator of ORDER 2.
         // `h2 = Ñ-1` slips past every check above whenever Ñ ≡ 1 (mod 4)
         // (e.g. both prime factors ≡ 3 mod 4, which `generateSafePrime`
@@ -680,7 +679,7 @@ pub const AuxParams = struct {
         // too: an order-2 h1 analogously collapses z^2 down to a function of
         // `rho` alone. This is the "cheap, always-enforced floor" the doc
         // comment above already promised, not the full Πprm/Πmod
-        // proof-of-correct-generation (SPEC.md A6, TODO) -- it closes the
+        // proof-of-correct-generation (SPEC.md A6) -- it closes the
         // MAXIMUM of the residual gap that floor can reach without one.
         if (nt.sq(self.h1).eql(one) or nt.sq(self.h2).eql(one)) return error.InvalidAuxParams;
 
@@ -783,7 +782,7 @@ const sieve_recips = blk: {
 /// true quotient or one less (the error is `< x / 2^32 < 1`), and one masked
 /// subtraction fixes the remainder. Constant time in the bytes: a hardware
 /// or compiler-rt division takes value-dependent time, and the sieve runs
-/// on the secret candidate that ends up being the prime (2026-10-03; was
+/// on the secret candidate that ends up being the prime (was
 /// `u128 % u64`).
 fn bytesModCt(bytes: []const u8, d: u64, m: u64) u64 {
     var r: u64 = 0;
@@ -837,14 +836,14 @@ fn setBitBe(buf: []u8, bit: usize) void {
 ///
 /// Constant-time in `m`'s value along the path a PRIME takes: this runs on
 /// the secret candidates of `generateSafePrime`/`generateBlumPrime`. Since
-/// 2026-10-03 it is `montint.DynModint.isProbablePrime` (the recipe this
-/// function introduced on 2026-10-02, moved into montint so `rsa` and
+/// it is `montint.DynModint.isProbablePrime` (the recipe this
+/// function introduced on, moved into montint so `rsa` and
 /// `paillier` share it): montint ladder modulo the secret `m`, witnesses
 /// below `2^(bits−1)` (no compare against `m`), `m − 1 = d·2^s` by masked
 /// shifts, a round's verdicts OR-ed before the one branch. Variable-time
-/// still: the squaring count `s` (`= 1` for every candidate here, all
-/// `≡ 3 mod 4`). The callers' sieve is `sieveRejects` (constant-time since
-/// 2026-10-03) and they test bytes directly (`isProbablePrimeBE`).
+/// still: the squaring count `s` (`= 1` for every candidate here, all `≡ 3
+/// mod 4`). The callers' sieve is `sieveRejects` and they test bytes
+/// directly (`isProbablePrimeBE`).
 pub fn isProbablePrime(m: AuxModulus, n_bits: usize, random: std.Random) bool {
     const D = montint.DynModint(aux_modulus_bits);
     var mv = D.elemFromFf(&m.v);
@@ -1152,9 +1151,7 @@ fn deriveAuxFromSafePrimes(p_be: []const u8, q_be: []const u8, bits: usize, rand
     const n_len = byteLen(bits);
     // 2. N_tilde = p̃·q̃ and ord = p'·q' (p' = (p̃−1)/2, q' = (q̃−1)/2, the
     //    squares-subgroup order) on montint limbs: the primes are SECRET and
-    //    nothing below branches on them (until 2026-10-03 this was
-    //    std.math.big.int, and the λ rejection loop compared against ord
-    //    with a big-int `order`).
+    //    nothing below branches on them.
     const D = montint.DynModint(aux_modulus_bits);
     var p_l = D.loadBE(p_be) catch unreachable; // ≤ aux_modulus_bytes
     defer std.crypto.secureZero(u64, &p_l);
@@ -1238,9 +1235,7 @@ pub const AuxTrapdoor = struct {
     p: []const u8,
     /// `q̃` (big-endian, owned — free via `deinit`). SECRET.
     q: []const u8,
-    /// `log_{h2} h1 mod p'·q'`, canonical mod `n_tilde`. SECRET. Until
-    /// 2026-10-03 this was `log_{h1} h2` and Πprm proved the wrong
-    /// direction (see `aux_proofs.Piprm`).
+    /// `log_{h2} h1 mod p'·q'`, canonical mod `n_tilde`. SECRET.
     lambda: AuxFe,
 
     pub fn deinit(self: AuxTrapdoor, allocator: std.mem.Allocator) void {
@@ -1384,13 +1379,10 @@ fn generateAuxParamsWithTrapdoorByValue(allocator: std.mem.Allocator, random: st
 /// party — not to know `lambda = log_{h2} h1`, and this party never acts as
 /// a prover under its own tuple, so retaining `lambda` buys nothing and only
 /// widens the secret's exposure. It is therefore zeroed with the rest of the
-/// safe-prime material before return. **TODO(2c):** if a later phase adds
-/// the ZK proof of *correct aux-param generation* (a "Πprm"/"Πmod"-style
-/// proof that `h1 = h2^lambda` for a known `lambda`, which some GG20/CMP
-/// variants broadcast alongside the tuple), that proof's PROVER step needs
-/// `lambda` retained during setup — expose it then via
-/// `generateAuxParamsInternal` (which already returns it) rather than
-/// discarding. This Phase-2b pass produces no such proof.
+/// safe-prime material before return. A caller that proves correct
+/// aux-param generation (`aux_proofs.Piprm`: `h1 = h2^lambda` for a known
+/// `lambda`) needs `lambda` during setup and takes it from
+/// `generateAuxParamsInternal`, which returns it, instead of this function.
 ///
 /// `random` MUST be cryptographically secure for real parameters. `bits`
 /// must be even and >= `min_aux_hard_bits`; a real deployment uses
@@ -1401,7 +1393,7 @@ fn generateAuxParamsWithTrapdoorByValue(allocator: std.mem.Allocator, random: st
 /// **Const-time:** the safe-prime *search* is inherently variable-time (how
 /// long it took reveals nothing about the primes kept); the secret exponent
 /// `lambda`'s use in `h1 = h2^lambda mod N_tilde` is the constant-time
-/// `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
+/// `zkproofs.powSecret`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
 /// step. All secret buffers are `secureZero`'d.
 pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
     const result = generateAuxParamsUnburned(random, bits);
@@ -1593,7 +1585,7 @@ pub const PartyPublicKeys = struct {
 /// Decodes a message key: canonical, and not of small order. `presign`
 /// verifies message signatures with `verifyStrict`, but a small-order key
 /// is still refused at the door: under cofactored verification anyone could
-/// sign for it, and no honest key is one (review 2026-10-03 F10).
+/// sign for it, and no honest key is one (review F10).
 pub fn decodeMessageKey(bytes: [32]u8) error{InvalidEncoding}!std.crypto.sign.Ed25519.PublicKey {
     const key = std.crypto.sign.Ed25519.PublicKey.fromBytes(bytes) catch return error.InvalidEncoding;
     const p = std.crypto.ecc.Edwards25519.fromBytes(bytes) catch return error.InvalidEncoding;
@@ -1881,7 +1873,7 @@ pub const KeyShare = struct {
         const public_keys = try PublicKeys.fromBytesAlloc(allocator, pubkeys_bytes);
         errdefer allocator.free(public_keys.entries);
 
-        // Audit F2 (HIGH, 2026-09-10 fix): reject a tuple whose own `index`
+        // Audit F2 (HIGH fix): reject a tuple whose own `index`
         // is missing from `public_keys` -- `signing.signWithShares` looks
         // itself up via `public_keys.get(index)`, and a `KeyShare` that
         // decodes cleanly here but lacks its own entry used to make that
@@ -2967,7 +2959,7 @@ const Corpus = struct {
         // ── KeyShare: reuses the SAME real `key_shares[0]` built for the
         //    PublicKeys section above, plus the audit F2 (HIGH) shape --
         //    the "own index missing from public_keys" tuple that used to
-        //    panic/UB in `signWithShares` (2026-09-10 fix) -- as a fuzz
+        //    panic/UB in `signWithShares` (fix) -- as a fuzz
         //    corpus seed, not just the standalone regression test at
         //    "KeyShare.fromBytesAlloc rejects a tuple whose own index is
         //    missing...". Audit F8: this decoder was one of 12 public
@@ -3544,7 +3536,7 @@ test "PublicKeys.fromBytesAlloc refuses a small-order message key (mutation audi
     try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, bad));
 }
 
-// ── killing tests for the 2026-11-17 whole-module mutation survivors ─────────
+// ── killing tests for the whole-module mutation survivors ─────────
 // (test names carry the mutant ids so the survivor table can be mapped back)
 
 fn mutIsPrimeU64(x: u64) bool {
