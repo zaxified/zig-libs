@@ -13,9 +13,11 @@ the design and threat model.
 | File | Contents |
 |---|---|
 | `hash.zig` | `taggedHash`/`taggedHasher` (BIP340's `SHA256(SHA256(tag)‖SHA256(tag)‖msg)`, all three domain tags, comptime-midstate-optimized) + `taggedHashRuntime`/`taggedHasherRuntime` (same construction for tags only known at runtime, e.g. BOLT#12's per-stream nonce-leaf tag) |
-| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `xonlyBytesOf` (structural 33-or-32-byte point field → 32-byte x-only view), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `sign`, `signWithKeyPair`, `verify`, `verifyBatch` |
+| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `LiftedPublicKey` (lift once), `xonlyBytesOf` (structural 33-or-32-byte point field → 32-byte x-only view), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `SignOptions`, `sign`, `signWithKeyPair`, `verify`, `verifyLifted`, `BatchItem`, `verifyBatch` |
 | `kat_vectors.zig` | The 19 official BIP340 test vectors, embedded |
 | `kat_test.zig` | Full KAT assertions (codecs, derivation, sign round-trip, verify accept/reject) + batch-verification correctness tests |
+| `burn.zig` | dead-stack burn for the key-construction entry points (see SPEC *Stack hygiene*) |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `stackprobe2_test.zig`, `ctgrind_harness.zig` | fuzz driver harness (`BIP340_FUZZ`), dead-stack residue probes (ReleaseFast), the constant-time harness for `sign` |
 
 ## Import
 
@@ -92,8 +94,8 @@ const xonly = try bip340.XOnlyPublicKey.fromBytes(xonly_bytes); // validates on-
 ## Verify
 
 ```
-zig build test-bip340                       # Debug
-zig build test-bip340 -Doptimize=ReleaseFast # ReleaseFast
+scripts/modtest bip340                      # Debug
+scripts/modtest bip340 -Doptimize=ReleaseFast
 zig fmt --check modules/bip340/
 ```
 
@@ -103,5 +105,9 @@ pubkey parse/lift on all 19 pubkeys, signature range-check parsing on all
 round-trip on those same 8, and the full verify accept/reject matrix (1
 verify-only TRUE + 10 FALSE vectors). Batch verification is cross-checked
 against single verification (no official batch vectors exist).
+
+## Not provided
+
+Key-pair tweaking (BIP341) is in `taproot`, multi-party signing in `musig2` and `frost`; the SPEC's *What is deliberately not done* and *Backlog / deferred* list the rest.
 
 Provenance: see [NOTICE](NOTICE).

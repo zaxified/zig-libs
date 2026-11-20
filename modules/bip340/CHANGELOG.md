@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit recorded (117 mutants, 89 killed, 28 decided, 8 new tests); ctgrind source pins refreshed (tests only); a test comment no longer names a private report path.
 - **2026-11-14** — tests only: stale-audit restore (whole-module mutation run, 117 mutants over `root.zig`) found guards no test pinned. New tests: `lift`/`LiftedPublicKey.fromXOnly` reject `x ≥ p` and non-liftable `x` when hand-built; `LiftedPublicKey.point` rejects a non-canonical `x` and an odd `y`; `SecretKey.fromBytesInto` copies on success and rejects zero; `KeyPair.fromSecretKey` zeroes `out` on error; `sign` with `self_verify` over 40 messages; the step-10 self-check refuses an odd-twin result (`s' = 2ed − s`), a result whose `R'` is the identity, and an endomorphism image `(βx, y)` of the claimed point; `verifyLifted`/`verifyBatch` refuse a signature forged for `G` when the key itself is rejected; `verifyBatch` is `false` when `randomSecure` fails. No code change.
 - **2026-11-13** — no-panic sweep of every pub entry point (SPEC card `**Hardening:**`). One LOW fix: `verifyBatch` drew a non-zero randomizer in an unbounded loop, so an `io` whose `randomSecure` returns zeros forever hung it; it now gives up after 8 draws and returns `false` (an honest CSPRNG fails a draw with probability ~2^-256). New tests: degenerate RNG, hand-built `LiftedPublicKey`/`KeyPair`/`BatchItem` garbage, a 300-item batch. No API change.
 - **2026-11-13** — docs: SPEC § Performance re-measured after k256's weak-field `ecmult`: verify 0.99–1.01× libsecp256k1 v0.8.0 (was 1.12–1.16×), keypair 0.69–0.72×, sign 0.78–0.79×; Backlog updated. No code change in this module.
@@ -55,10 +54,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   day, bench-bip340 now reads keypair 1.31×, sign 4.32× (with keypair), verify 1.76×
   libsecp256k1 (was 1.56 / 7.37 / 2.56×). ctgrind `sign` 80 → 82, all in the self-check's
   variable-time verify (see `ctgrind-expected.tsv`).
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `BIP340_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only.
 - **2026-09-15** — A1 F2. Security fix, no API change: `sign` left the effective
   signing scalar `d` and the nonce (`rand`, both `k` candidates) on the dead
   stack — measured on the audited tree at ReleaseFast, `d` ×2 and the nonce
@@ -83,15 +78,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `catch unreachable` in the same commit (round-2 Q4: a one-sided fix here
   would have turned lninvoice's silent acceptance of a malformed BOLT#12
   `invreq_payer_id`/`invoice_node_id` into a process panic on wire data).
-- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F9 (LOW):
-  `verifyBatch(&.{}, io) == true` was flagged as an open question ("vacuous
-  truth or fail-closed?"). Resolved by reading BIP340 §"Batch Verification"
-  itself: its algorithm is a loop "for i = 1..u" that runs zero times when
-  u=0, so no check can ever fail, and "return success iff no failure
-  occurred" returns success — the spec's own literal definition, not a
-  permissive choice this module made. Doc comment on `verifyBatch` and the
-  existing empty-batch test now cite this instead of just asserting
-  "vacuously true"; no code changed.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
   mandatory step-10 self-check (fault-injection guard) had no way to be
   regression-tested without either duplicating `sign`'s arithmetic in a
@@ -107,35 +93,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   not a copy of it — rejects it; because the check now lives on the one
   path both production and the test go through, deleting or defeating it
   is caught (measured: both mutations turn the test red).
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F7 (MED):
-  verified the core defect (the fuzz harness's ranged first draw always
-  returning the corpus's own minimum, so it never actually corrupted a
-  signature) was already fixed 2026-09-07 (see that entry below). Added
-  the one piece F7 asked for that was still missing: a comment stating
-  plainly that random 64-octet draws can only ever reach `verify`'s FALSE
-  (reject) outcomes -- finding a valid signature by chance is exactly what
-  Schnorr's security rules out -- so the harness's TRUE (accept) coverage
-  stays with the KAT tests, not fuzzing, by construction rather than by
-  oversight.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F3/F10 (MED/LOW,
-  docs only). F3: `verifyBatch`'s doc comment and `SPEC.md` claimed it
-  "only forgoes part of the batching speedup" versus a real multi-scalar
-  multiply; measured (2026-09-04, ReleaseFast, both arms interleaved in one
-  process), it is measurably SLOWER than a plain `verify` loop at every
-  tested batch size (u=1,2,8,32,64: 1.03x-1.12x, never below 1.0) and costs
-  `u-1` extra `getrandom` syscalls per batch. Corrected both to state this
-  and to recommend a `verify` loop until a real MSM path exists (P2: code
-  and docs disagreed, and here the code -- or rather its performance
-  reality -- is what the docs must track; no code change, since there is no
-  cheap correct-and-faster alternative within this module's current `k256`
-  dependency, per the audit's own effort note). F10: `SPEC.md`'s "std
-  recon" section said the module computes `d*G`/`k'*G` via
-  `Secp256k1.basePoint.mul` (`std.crypto.ecc.Secp256k1`'s own API); the
-  module actually calls `k256`'s `Secp256k1.combMulBase` at all three call
-  sites (`root.zig:163,322,517`) -- `meta.deps`/the top-of-file import
-  already reflect the `k256` migration, SPEC.md did not. Corrected (P2,
-  code was right, doc was stale).
 
 - **2026-09-10** — **VERIFIED ALREADY FIXED, no change needed:** A1 audit
   F8 (MED: example's release-mode checks were `std.debug.assert`, compiled
@@ -146,23 +104,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   them found", 2026-09-06), an ancestor of this branch predating this
   session's work on the module.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F4 (MED). Added
-  four tests that hand-construct a `Signature`/`XOnlyPublicKey` directly
-  (bypassing `fromBytes`'s own range/on-curve checks, the way
-  `taproot.TweakedPublicKey.asXOnly` already does in this repo) and assert
-  `verify`/`verifyBatch` reject `r == p`, `s == n`, an off-curve pubkey x
-  (BIP340 vector 5's), and `verifyBatch`'s own `s == n` check — none of
-  which any existing test reached, since all 19 official vectors go through
-  `fromBytes` first, which filters those cases out before `verify`'s own
-  re-checks ever run. Mutation-tested two of the four: removing the `r < p`
-  re-check and substituting `pubkey.lift() catch basePoint` for the lift
-  failure both left the suite green, and both turned out to be
-  **provably non-exploitable given BIP340's own equation structure**, not
-  untested-but-fragile — see the F4 disposition in `A1/bip340.md` for why
-  (the final `x(R) == r` equality can never match non-canonical `r`, and the
-  challenge hash binds `pubkey.x` so a garbage x can never both fail to lift
-  and match the x a real signature was made against). The tests are kept as
-  coverage/regression pins regardless.
 
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F1/F2 (HIGH). F1:
   added a regression test that crafts a cancelling forged pair (two
@@ -183,7 +124,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-09** — **BEHAVIOURAL, not breaking:** `KeyPair.fromSecretKey`'s BIP340 step-3 even-y normalization (`d = d'` if `has_even_y(P)` else `n − d'`) is now a **constant-time masked byte select**, the same shape `sign`'s step-7 nonce normalization has used all along. It was a plain `if` on `xy.y.isOdd()`, so one bit — whether the stored secret is `d` or `n − d` — was observable in timing, while the structurally identical nonce-parity bit 140 lines below was carefully hardened. ⚠ **That bit is worthless to an attacker** (both representations sign identically, so it narrows a search from 2^256 to 2^255); it is hardened for consistency and because it is free, not because a leak was dangerous. Measured: ctgrind in-file contexts **80 → 79**, the signature `out_sha` unchanged, and 3+3 timing runs of `fromSecretKey` whose **spreads overlap** (38.7–39.5 µs vs 39.3–39.5 µs) — no cost this machine can resolve. ⭐ Also switched `scalar.neg(sk.bytes, .big) catch unreachable` to the non-failing `d.neg()`: the byte-slice form's `catch` is itself a branch memcheck reports, even though the input was validated a line earlier and it can never be taken. ⭐ For the record, the reference implementation branches here (`secp256k1_schnorrsig_sign_internal`) and its constant-time CI passes only because `secp256k1_keypair_load` declassifies the pubkey — a defence that does not transfer, since libsecp256k1's keypair exposes the full 33-byte pubkey while this module's is x-only.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 80**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ 63 of the 80 come from the MANDATORY step-10 self-verify re-running the deliberately variable-time `verify` on the signature about to be returned; the real secret path (steps 1–9) is 15, none of it a class-1 leak. **The step-7 masked parity select measured ZERO contexts**, confirming SPEC.md's "no branch on `R.y`'s parity" for the first time. ⚠ One line is disputed and left open: `root.zig:165`'s even-Y normalisation in `KeyPair.fromSecretKey` is a plain `if`/`else`, not a masked select. This module's harness classified it as branching on the public key's parity; `taproot`'s agent classified it as a real leak and brought an experimental control (a second secret with an even-Y point dropped its count 12→11, because `neg` and its canonicality check appear only on the negating branch). BIP-340 public keys are x-only, so the parity is not published and `d`/`n−d` give the same `P` — "it's public" is false as stated. Recorded as an open question, not decided.
 
 - **2026-09-07** — Fuzz reach: `fuzzVerify` never corrupted a signature. Its flip loop
   opened `smith.valueRangeAtMost(u8, 0, 6)` as the harness's FIRST draw; a `Smith` ranged

@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-14 (89/117, 28 eq) · src bd9aa2fd2c7afd84
 
-*Whole-module mutation run 2026-11-14* (about 35 % of root.zig's production lines had changed: self-verify opt-in, `LiftedPublicKey`/`verifyLifted`, the `challengePoint` rewrite, bounded `verifyBatch` draws, the burn rework): 117 mutants, ReleaseSafe plus a ReleaseFast stack-probe lane for the burns; 89 killed (18 only after 8 new tests, 9 burn mutants only by the stack probe). 28 decided: 16 equivalent (subsumed by a later guard or a group property -- no point has y = 0, `recoverY` output is on the curve, `combMulBase(0)` maps to the same error, a non-canonical r never equals canonical x(R) bytes, an empty batch sums to the identity), 6 unobservable without a seam that supplies `e` (e >= n or e = 0, s < 2^129), 6 local wipes the enclosing dead-stack burn already covers. hash.zig unchanged since the audit, not mutated.
-
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind) · panic 2026-11-13 (sweep of every pub entry point: decoders, hand-built `KeyPair`/`LiftedPublicKey`/`BatchItem`, `sign`/`verify`/`verifyLifted`/`verifyBatch`; one LOW: `verifyBatch` redrew a randomizer forever from an all-zero `io.randomSecure`, now `false` after 8 draws)
 
 **Performance:** ref 0.69–1.01× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-11-13)
@@ -27,13 +25,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | Reference: `schnorrsig` module (sign, verify, keypair, x-only keys); constant-time by construction and by valgrind CI. Also has `sign_custom` for non-32-byte messages, which `sign` here covers because `msg` is a slice. No batch verification in the library *(inferred)*; this module has `verifyBatch`. **Measured 2026-10-07** (`zig build bench-bip340`, ReleaseFast vs v0.8.0 compiled with `zig cc -O3`, x86-64 asm, upstream default tables; signatures cross-verified and byte-identical first): ours/libsecp256k1 keypair 2.00, verify 3.39, sign 9.30 (ours verifies its own signature before returning and derives the public key per call); after the k256 field add/`mulSmall` change the same day: keypair 1.56, verify 2.56, sign 7.37. |
+| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | Reference: `schnorrsig` module (sign, verify, keypair, x-only keys); constant-time by construction and by valgrind CI. Also has `sign_custom` for non-32-byte messages, which `sign` here covers because `msg` is a slice. No batch verification in the library *(inferred)*; this module has `verifyBatch`. Speed against it: the card's Performance line (§ Performance names the bench). |
 | [rust-bitcoin/rust-secp256k1](https://github.com/rust-bitcoin/rust-secp256k1) | Rust (C FFI) | CC0-1.0 | 431 | push 2026-08-17 | Bindings to libsecp256k1 — same semantics, links C. |
 | [btcsuite/btcd (`btcec/v2/schnorr`)](https://github.com/btcsuite/btcd/tree/master/btcec) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Pure Go BIP340 sign/verify. |
 | [paulmillr/noble-curves (schnorr)](https://github.com/paulmillr/noble-curves) | TypeScript | MIT | 960 | 2.4.0 (push 2026-09-08) | Pure-JS BIP340 sign/verify *(inferred; README not read)*. |
 | [Zig `std.crypto`](https://ziglang.org/documentation/master/std/#std.crypto) | Zig | MIT | — | Zig 0.16.0 | `ecc.Secp256k1` and ECDSA over secp256k1 only; no Schnorr/BIP340 (checked: `rg -il 'schnorr|musig'` over 0.16.0 `lib/std` finds nothing). |
 
-**Where we are ahead:** the only pure-Zig BIP340; all 19 official vectors; batch verification; `taggedHash` with comptime midstate and a runtime-tag variant; constant-time parity selects where libsecp branches (see Threat model). **Where we are behind:** signing speed is `std`/`k256` arithmetic, not libsecp's hand-tuned field code *(inferred; not measured in this survey)*; no key-pair tweak API here (→ `taproot`).
+**Where we are ahead:** the only pure-Zig BIP340; all 19 official vectors; batch verification; `taggedHash` with comptime midstate and a runtime-tag variant; constant-time parity selects where libsecp branches (see Threat model). **Where we are behind:** no key-pair tweak API here (→ `taproot`); the speed ratio is on the card (it is at the reference on verify, ahead on keypair and sign, see § Performance).
 
 ## Design
 
@@ -95,9 +93,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   for a tag that is only known at runtime (no comptime midstate to cache —
   the tag hash is recomputed per call); `tag` is taken as a slice of parts
   so a tag built by concatenation (e.g. BOLT#12's `"LnNonce" ‖ first_tlv`)
-  needs no intermediate allocation. Added for DRY: BOLT#12's `lninvoice`
-  module had hand-rolled this exact construction because its tag varies per
-  TLV stream.
+  needs no intermediate allocation. It exists so a caller whose tag varies
+  per message (BOLT#12's `lninvoice`, per TLV stream) need not hand-roll the construction.
 - **x-only public key / `lift_x`** (`XOnlyPublicKey`): parse rejects a
   non-canonical x (`x ≥ p`, `Fe.fromBytes`'s built-in check) and an x with
   no valid y (`recoverY`'s `error.NotSquare`). `lift()` always resolves to
@@ -141,9 +138,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   must get right, which is why BIP340 recommends a self-verification step
   before `sign` returns (catches a large class of such bugs and induced
   faults, though not a broken RNG; BIP340 allows omitting it when the cost
-  is prohibitive). **Here it is opt-in since 2026-11-13**
-  (`SignOptions.self_verify`, default off as in libsecp256k1 — owner
-  decision, reversing the 2026-10-07 one to always run it): it costs about
+  is prohibitive). **Here it is opt-in** (`SignOptions.self_verify`, default
+  off as in libsecp256k1; see *What is deliberately not done*): it costs about
   one `verify`, more than the signing itself.
 - **x-only / even-y convention**: every public key and every nonce point
   `R` is committed to the curve with an *implicit*, always-even y. This
@@ -168,9 +164,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   itself adds around it, e.g. any early-return based on secret bits).
   **Both even-y normalizations are constant-time masked selects**: step 7's
   nonce parity (`root.zig`, `sign`) and step 3's KEY parity
-  (`KeyPair.fromSecretKey`). ⭐ The second one was a plain `if` until
-  2026-09-09 — two structurally identical bits treated two different ways in
-  one file — and the audit that found it is why they now match.
+  (`KeyPair.fromSecretKey`). ⭐ The two are treated the same on purpose: two
+  structurally identical bits handled two different ways in one file would be
+  an inconsistency nobody could justify.
   ⚠ **What the key-parity bit is, so it does not get "simplified" back:** it
   says whether the STORED secret is `d` or `n − d`. Both sign identically, so
   leaking it narrows a search from 2^256 to 2^255 — worthless to an attacker.
@@ -195,105 +191,124 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   signatures — reusing/predicting them lets a forger craft a batch that
   passes despite containing an individually-invalid signature.
 
-## TODO(fable) — done (crypto pass completed)
+## Signing, verification and batch verification
 
-All three formerly-stubbed cores are implemented and KAT-validated
-(byte-exact against all 19 official vectors, Debug + ReleaseFast):
-
-1. **`sign`** — BIP340 "Default Signing", all 10 steps; step 10, the
-   self-verify-before-return, runs with `SignOptions.self_verify` (opt-in
-   since 2026-11-13, see Threat model; it fails closed with
-   `error.SignatureVerificationFailed` instead of emitting a maybe-bad
-   signature). Nonce/challenge hashes stream via `hash.taggedHasher`
-   (the comptime tag midstate + `update` per part — no concatenation
-   buffer). The step-7 `k ← n − k'` even-y normalization of the nonce is
-   a constant-time masked byte select between the two candidate scalars
-   (no branch on `R.y`'s parity, which is one bit derived from the
-   secret nonce hash); all scalar arithmetic (`k + e·d mod n`) is
-   `Secp256k1.scalar`'s constant-time field ops. `int(hash) mod n` is a
-   REDUCING conversion (`Scalar.fromBytes48` over a zero-widened 48-byte
-   value) — `Scalar.fromBytes` would reject instead of reduce.
-2. **`verify`** — the `s*G − e*P` equation exactly as the recon note
-   above prescribes: `mulDoubleBasePublic(basePoint, s, P, −e mod n,
-   .big)`, then identity (vectors 9/10), `R.y` parity (vector 6), and
-   `bytes(x(R)) == sig[0..32]` (vectors 7/8/11 — note 11 needs no
-   explicit `lift_x(r)` in single verification: a computed `x(R)` can
-   never byte-equal an r that is not a valid x-coordinate). Returns
-   `false` on every failure path, never panics/errors, and re-runs the
-   lift/range checks itself so it is safe on hand-constructed values.
-3. **`verifyBatch`** — the random-linear-combination equation with `a_1
-   = 1` and `a_2..a_u` drawn from `io.randomSecure` (std's
-   `Scalar.random` loop inlined around the fail-closed draw: wide
-   reduction, non-zero by rejection sampling) after the whole `items`
-   slice is bound. The randomizers are a SOUNDNESS input — predictable
-   `a_i` let an attacker pass a batch of individually-invalid signatures
-   whose errors cancel — so an entropy failure returns `false` (batch not
-   verified) rather than checking against a degraded draw. The RHS
-   is evaluated, since 2026-10-07, as ONE sum that must vanish,
-   `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O`, through k256's
-   multi-base Straus multiply (`Secp256k1.mulMultiBasePublic`: one
-   doubling chain per 8 items, all-mixed additions, G once). Same equation
-   and acceptance set. Measured 2026-10-07 (`zig build bench-bip340`,
-   64-item batch): 51.3 µs per signature against 59.2 µs for one `verify`
-   (0.87×); before, 79.3 µs (1.34×). Each item still lifts BOTH `R_i` and
-   `P_i` (two square roots, ~12 µs), so for one or two items a batch is
-   expected to lose to `verify` *(inferred, not measured)*. History: A1
-   audit F3 (2026-09-04) had measured the old per-item form 1.03–1.12×
-   SLOWER than a `verify` loop at every size `u = 1..64`, plus `u−1`
-   extra `getrandom(2)` syscalls per batch (still true). A chunk whose
-   partial sum is the identity contributes nothing; the batch accepts
-   iff the whole sum is the identity. Validated by cross-check against
-   `verify` (all-valid batch accepts incl. the empty batch; corrupting any
-   single signature/message/pubkey, or injecting vector 11's
-   non-lifting `r`, rejects) and across chunk boundaries (sizes 1–25, a
-   bad item in the first, second or last chunk rejects).
-
-The two formerly-`error.SkipZigTest` KAT tests in `kat_test.zig` are
-re-enabled, plus the new batch-correctness test. Design references: none
-beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
-(see `NOTICE`).
+- **`sign`** — BIP340 "Default Signing", all ten steps, byte-exact against all
+  19 official vectors. Step 10, the self-verify before return, runs with
+  `SignOptions.self_verify` (off by default; it fails closed with
+  `error.SignatureVerificationFailed` instead of emitting a maybe-bad
+  signature) and is a projective check (`selfCheck`: the expected point is
+  `(r, r_y)`, so no inversion). Steps 1–9 run in `computeUnverified`, and
+  `signImpl` takes that computation as a parameter and always runs the
+  self-check on whatever it returns, so a test that feeds it a corrupted
+  computation exercises the production path itself. Nonce and challenge
+  hashes stream via `hash.taggedHasher` (comptime tag midstate, `update` per
+  part, no concatenation buffer). The step-7 `k ← n − k'` normalization is a
+  constant-time masked byte select between the two candidate scalars (no
+  branch on `R.y`'s parity, one bit derived from the secret nonce hash); the
+  scalar arithmetic `k + e·d mod n` is `Secp256k1.scalar`'s constant-time ops.
+  `int(hash) mod n` is a REDUCING conversion (`reduceToScalar`: `Scalar.fromBytes48`
+  over a zero-widened 48-byte value); `Scalar.fromBytes` would reject instead of
+  reduce. `signWithKeyPair` takes a ready `KeyPair` and skips the `d·G` multiply and its
+  inversion. `KeyPair`'s fields are public, so a pair can be forged: a scalar `≥ n` is
+  always `error.InvalidSecretKey`; with `self_verify` every other mismatch (a `public` that is
+  not `secret·G`, the odd-y `d'`, a zero scalar) fails the self-check with
+  `error.SignatureVerificationFailed`; without it such a pair yields a signature that does not
+  verify under `key_pair.public`, and leaks nothing more than an honest one, because the nonce hash
+  commits to `public`.
+- **`verify`** — the `s*G − e*P` equation as the recon note above prescribes:
+  `mulDoubleBasePublic(basePoint, s, P, −e mod n, .big)` (`s < n` and `−e mod n`
+  as plain integers, everything is public), then identity (vectors 9/10), `R.y`
+  parity (vector 6), and `bytes(x(R)) == sig[0..32]` (vectors 7/8/11 — vector 11
+  needs no explicit `lift_x(r)` in single verification: a computed `x(R)` can
+  never byte-equal an `r` that is not a valid x-coordinate). It returns `false`
+  on every failure path, never panics or errors, and re-runs the lift and range
+  checks itself, so it is safe on hand-constructed values.
+- **`LiftedPublicKey` / `verifyLifted`** — `lift_x` (a square root, about a tenth of
+  a `verify`) done once: `LiftedPublicKey.fromXOnly` / `fromBytes` store `x` and the
+  even `y`, as libsecp256k1's parsed x-only key does, and `verifyLifted` gives
+  `verify`'s verdict without the square root. The fields are public, so
+  `verifyLifted` re-checks that `y` is the even root of `x³ + 7` (two field
+  multiplies) and rejects a hand-built or corrupted value like a bad key.
+- **`verifyBatch`** — the random-linear-combination equation with `a_1 = 1` and
+  `a_2..a_u` drawn from `io.randomSecure` (std's `Scalar.random` loop inlined
+  around the fail-closed draw: wide reduction, non-zero by rejection sampling)
+  after the whole `items` slice is bound. The randomizers are a SOUNDNESS input
+  (predictable `a_i` let an attacker pass a batch of individually-invalid
+  signatures whose errors cancel), so an entropy failure returns `false` (batch not
+  verified) rather than checking against a degraded draw, and a randomizer that is
+  still zero after `max_draws` (8) draws, as a degenerate all-zero `io` gives, also
+  returns `false` instead of looping. The check is ONE sum that must vanish,
+  `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O`, through k256's multi-base
+  Straus multiply (`Secp256k1.mulMultiBasePublic`): one doubling chain per
+  `batch_chunk` (8) items, all-mixed additions, G once, on the last chunk. A chunk
+  whose partial sum is the identity contributes nothing; the batch accepts iff the
+  whole sum is the identity. Each item lifts BOTH `R_i` and `P_i` (two square roots),
+  so for one or two items a batch is expected to lose to `verify` *(inferred, not
+  measured)*; the 64-item figure is in the bench (§ Performance). The empty batch
+  returns `true`: BIP340's batch algorithm is a loop over `i = 1..u` that checks
+  nothing for `u = 0` and returns success, so this is the spec's own literal
+  definition, not a permissive choice. A forged pair of individually-invalid
+  signatures whose errors cancel is rejected (the randomizers are what stop it).
+- **Stack hygiene** — a secret on the dead stack is the failure class this module
+  defends against. `sign` holds no key copy in its own frame: the key enters
+  `signFromSecretKey`/`signImpl` one frame down (a pointer union, `SignKey`, so building it
+  copies no key), the steps 1–9 computation is `noinline`, and `computeAndBurn`
+  zeroes `sign_stack_burn` (16 KiB) at that depth with volatile 16-byte vector
+  stores, on the error path too. `KeyPair.fromSecretKey` does the same: `derive` runs
+  one frame down and `burnKeyPairStack` zeroes `keypair_stack_burn` (8 KiB), and its
+  `effective` and `negated` (`n − d`) copies are `secureZero`d before return;
+  `signWithKeyPair` zeroes its copy of the pair. The other key-construction entry points
+  (`SecretKey.fromBytes`/`fromBytesInto`, `PublicKey.fromSecretKey`) run their body one frame down
+  through `burn.zig` (`run`) and burn the stack that body dirtied. The burn sizes are held by
+  `stackprobe_test.zig` and `stackprobe2_test.zig`, which go red when a call tree outgrows them.
 
 ## Verification
 
-### Mutation run 2026-10-08
+- **Run:** `scripts/modtest bip340` (add `-Doptimize=ReleaseFast` for the optimized lane, where the stack probes run); `zig fmt --check modules/bip340`.
+- **KAT oracle:** the official BIP340 test vectors (`bip-0340/test-vectors.csv` from
+  `bitcoin/bips`, source in `NOTICE`), embedded verbatim in `src/kat_vectors.zig`: 19 rows,
+  8 with a known secret key (indices 0–3 and 15–18; the last four cover variable-length messages
+  of 0/1/17/100 bytes) and 11 verify-only (indices 4–14: one must verify TRUE, ten FALSE).
+- **Exercised** (`src/kat_test.zig`): `XOnlyPublicKey.fromBytes`/`lift` on all 19 public keys (two
+  must fail: index 5 not on the curve, index 14 exceeds the field size); `Signature.fromBytes`'s
+  range checks on all 19 signatures (two must fail parse-level: index 12 `r == p`, index 13
+  `s == n`; index 11 must NOT, it fails only at `verify`); `KeyPair`/`PublicKey` derivation on the
+  8 secret-key vectors; a full `sign` round-trip (each secret-key vector yields exactly the
+  published 64 bytes, which transitively KATs the nonce derivation, both even-y normalizations and
+  the challenge hash); `verify` accept/reject on all 19 rows including the ten negative ones;
+  `verifyBatch` against `verify` (an all-valid batch and the empty batch accept; corrupting any
+  single signature, message or public key, or injecting vector 11's non-lifting `r`, rejects the
+  whole batch; batch sizes across the chunk boundary with a bad item in the first, second or last
+  chunk).
+- **Other test classes** (`src/root.zig`, `src/hash.zig`): `SignOptions.self_verify` through a
+  corrupted computation fed to `signImpl`; hand-constructed `Signature`/`XOnlyPublicKey`/`KeyPair`/
+  `LiftedPublicKey` values; a cancelling forged pair that `verifyBatch` must reject; a degenerate
+  all-zero `randomSecure` that ends `verifyBatch` in `false` after a bounded number of draws;
+  tagged-hash midstate equals the plain construction.
+- **Stack probes** (`src/stackprobe_test.zig`, `src/stackprobe2_test.zig`): no key or nonce residue
+  on the dead stack after `sign`, `signWithKeyPair` and `KeyPair.fromSecretKey`; they run in
+  ReleaseFast and skip in Debug/ReleaseSafe.
+- **Fuzz:** `BIP340_FUZZ` (`src/fuzz_test.zig`, testkit's deterministic driver; a forgery check),
+  plus a fixed-seed run with reach checks in every test run.
+- **Constant time:** `src/ctgrind_harness.zig` taints the secret key through `sign`
+  (`zig build check-ctgrind` compiles it; the valgrind run is the ctgrind lane). `verify` and
+  `verifyBatch` handle only public values and are excluded by design.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Bench:** `zig build bench-bip340` (`tools/bench.zig`; see `tools/README.md`).
 
-17 mutants as schemata (ReleaseSafe + ReleaseFast for the burns): `verify`'s parity and
-challenge sign, `verifyBatch` (G per chunk, chunk flush, both randomized scalars' signs, all
-`a_i = 1`, the final verdict), the step-10 self-check, `KeyPair`'s parity select and zero
-check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `computeAndBurn`'s),
-`lift`'s parity, `Signature.fromBytes`'s `r < p`. **15/17 killed, 2 explained**:
-- `derive` without its `d == 0` check: equivalent — `combMulBase(0)` is `IdentityElement`,
-  mapped to the same `InvalidSecretKey`.
-- `sign` calling `signImpl` directly again (the R1 shape, the inverse of the fix): survived in
-  the schemata binary, whose frame layout differs — no key copy lands in the scanned window
-  there. The same shape in the module's own ReleaseFast binary was the red F2 probe that found
-  R1 (one copy per signature), so the probe does catch it where the layout puts it; a layout
-  that hides it is the limit of a stack probe, not a test gap that a test could close.
+## What is deliberately not done
 
-- KAT oracle: the official BIP340 test vectors, `bip-0340/
-  test-vectors.csv` from `bitcoin/bips` (see `NOTICE` for the fetch
-  source), embedded verbatim in `src/kat_vectors.zig` — 19 rows: 8 with a
-  known secret key (indices 0–3, 15–18; the last four added 2022-12 to
-  cover variable-length messages of size 0/1/17/100 bytes) and 11
-  verify-only (indices 4–14; one must verify TRUE, ten must verify
-  FALSE).
-- Exercised (`src/kat_test.zig`): `XOnlyPublicKey.fromBytes`/`lift` on all
-  19 public keys (2 must fail: index 5 not on the curve, index 14 exceeds
-  the field size); `Signature.fromBytes`'s range checks on all 19
-  signatures (2 must fail parse-level: index 12 `r == p`, index 13 `s ==
-  n`; index 11 must NOT fail parse-level, only later at `verify`);
-  `KeyPair`/`PublicKey` derivation from secret key on all 8 secret-key
-  vectors, checked against the vector's published public key; full `sign`
-  round-trip (each of the 8 secret-key vectors produces the exact 64
-  published signature bytes — which transitively KATs the nonce
-  derivation, both even-y normalizations, and the challenge hash); full
-  `verify` accept/reject (all 19 rows match their `verification result`
-  column exactly, including all 10 negative ones); `verifyBatch`
-  cross-checked against `verify` (all-valid batch + empty batch accept;
-  any single corrupted signature/message/pubkey, or a non-lifting `r`,
-  rejects the whole batch).
-- Both `zig build test-bip340` (Debug) and `-Doptimize=ReleaseFast` pass;
-  no `error.SkipZigTest` remains in the module.
+- **A mandatory self-verify in `sign`.** BIP340 recommends it and allows omitting it when the cost is
+  prohibitive; it costs about one `verify`, more than the signing itself. Opt-in
+  (`SignOptions.self_verify`, default off), as in libsecp256k1 (owner decision).
+- **Branching second folds in the weak-field `ecmult`.** A branching form is ~4 % faster but adds ~50
+  ctgrind contexts to `adaptor/presign`, whose self-check verifies secret-derived values; the shipped
+  form masks them.
+- **A wider G window (12 instead of 10).** Read inside the host's noise and would quadruple the 32 KiB table.
+- **A product-scanning (Comba) field multiply.** Inside the noise against the limb multiply.
+- **A key-pair tweak API** (BIP341 taproot tweaking): lives in `taproot`.
 
 ## Anchoring
 
@@ -306,48 +321,27 @@ check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `comput
 
 ## Performance
 
-**Measured 2026-11-13, after k256's weak-field `ecmult`** (Zig 0.17.1, `zig build bench-bip340`, ReleaseFast, best of five per row, two runs on a host shared with other agents' jobs; libsecp256k1 v0.8.0 `zig cc -O3`, x86-64 asm, default tables). The card carries the range over both runs.
+`zig build bench-bip340` (always ReleaseFast, from the repository root) runs keypair, sign (default
+options, from a ready key pair), verify (a `LiftedPublicKey` parsed once outside the loop) and
+`verifyBatch` per signature on a 64-signature batch against libsecp256k1 v0.8.0 compiled with `zig cc -O3`
+(x86-64 asm, default tables); signatures are cross-verified first. The card's `**Performance:**` line
+carries the ratios and the measurement date; it is authoritative.
 
-| row | what it measures (both sides) | ours ns/op | libsecp256k1 ns/op | ours/ref |
-|---|---|--:|--:|--:|
-| keypair | secret key → x-only key (`KeyPair.fromSecretKey` / `keypair_create` + `keypair_xonly_pub`) | 14 663 – 14 980 | 20 928 – 21 283 | 0.69 – 0.72 |
-| sign | 32-byte message from a ready key pair, default options (`signWithKeyPair(…, .{})` / `schnorrsig_sign32`); neither side self-verifies | 17 559 – 17 806 | 22 582 – 22 647 | 0.78 – 0.79 |
-| verify | one signature under a key parsed once outside the loop (`LiftedPublicKey` + `verifyLifted` / `xonly_pubkey_parse` + `schnorrsig_verify`) | 35 374 – 35 580 | 35 200 – 35 561 | 0.99 – 1.01 |
-| verifyBatch | per signature, 64-signature batch (ours only) | ~39 000 | — | — |
+What made it fast, all of it in `k256` (so its numbers move with `k256`):
 
-Before k256's weak-field change, the same day: verify 41 412 – 41 786 ns against 36 141 – 37 110 (1.12 – 1.16×), keypair 0.68 – 0.71×, sign 0.69 – 0.77×. Earlier the same day the reference side read 33.3–35.8 µs for verify (ratio 1.16–1.25 for our 40.4–41.9 µs), so the verify ratio's spread is mostly the host's.
+- constant-time safegcd inversion (libsecp's `modinv64`) in every secret `affineCoordinates`;
+- a w = 6 affine comb with constant-time Jacobian mixed additions for every `k·G`;
+- a limb-level Zig field multiply, inlined, instead of an asm block with a `memory` clobber;
+- integer GLV split and zero-run wNAF in the double-base multiply;
+- weak field elements (`< 2^256` between operations) in `ecmult` and libsecp's `gej_double`; the
+  second folds are masked selects (see *What is deliberately not done*).
 
-Baseline before this work (same host, same day): keypair 27.3 µs (1.33×), sign 82.1 µs (3.58×, with the then-mandatory self-verify), verify 52.7 µs (1.44×, lifting the key on every call). What moved it:
-
-- **Self-verify opt-in** (owner decision 2026-11-13, `SignOptions.self_verify`, default off as in libsecp256k1): sign no longer pays a `verify`. When on, the check is projective (no inversion).
-- **k256, constant-time safegcd inversion** (libsecp's `modinv64`) replacing the Fermat chain in every secret `affineCoordinates`: about −5 µs on keypair and sign.
-- **k256, w = 6 affine comb** with constant-time Jacobian mixed additions (`p256`'s layout): 43 additions instead of 65 for every `k·G`. With the inversion: keypair 27 → 15 µs.
-- **k256, limb-level Zig field multiply, inlined**, instead of the asm block with a `memory` clobber: verify 52.8 → 41.9 µs.
-- **k256, integer GLV split + zero-run wNAF**, **bip340, integer `s`/`−e` in verify**, **`verifyLifted`**: verify 41.9 → ~40.4 µs.
-- Tried and dropped: a product-scanning (Comba) multiply (40.2 vs 40.4 µs, inside the noise).
-- **k256, weak field elements in `ecmult` + libsecp256k1's doubling** (later 2026-11-13): the verifier's double-base multiply keeps field values `< 2^256` instead of `< p` between operations (add/sub fold only the carry out of 2^256; the multiply skips its canonicalising select), and doubles with `gej_double` (3M + 4S, six additions + one halving, instead of 2M + 5S with eleven additions): verify 1.12–1.16× → 0.99–1.01×. A form with branches on the rare second folds measured 0.95–0.97× but added ~50 ctgrind contexts to `adaptor/presign` (its self-check verifies secret-derived values), so the shipped form masks them. A G window of 12 instead of 10 read 0.95× vs 0.97× in one pair of runs — inside the host's spread, not kept (it would quadruple the 32 KiB table).
+In this module: verify computes `s` and `−e` as plain integers, `verifyLifted` skips the square
+root, and `sign` is not charged a `verify` unless `self_verify` is set.
 
 ## Backlog / deferred
 
-- **verify 0.99–1.01× libsecp256k1 since 2026-11-13** (was 1.12–1.16×; P2 met, every row ≤ 1.1×). Left, all in k256: the masked second folds of the weak form cost ~4 % against a branching form (rejected for its ctgrind contexts, see § Performance); a wider G table (libsecp's window 15, ours 10; 12 was inside the noise); the limb multiply's instruction count (~2× a hand-scheduled MULX/ADX body).
-
-- **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07
-  speed work: `signWithKeyPair`, the multi-base `verifyBatch`, `affineCoordinatesPublic` in
-  `verify`). Two HIGH findings, both the A1 F2 class (a secret on the dead stack), fixed:
-  - **R1 (HIGH, fixed 2026-10-08)**: `sign` held a copy of the secret key in its OWN frame —
-    first the `SignKey` union built by value (`359a678d`), then, with the union made of pointers,
-    the copy Zig makes of a parameter whose address is taken — above the region
-    `computeAndBurn` zeroes. The F2 probe went red on it (one key copy per signature,
-    ReleaseFast); it was not seen because the probe skips in Debug/ReleaseSafe and no
-    ReleaseFast lane ran between `359a678d` and this review. Fix: `sign` holds nothing; the
-    key enters `signFromSecretKey` one frame down and `sign` burns after the return.
-  - **R2 (HIGH, fixed 2026-10-08)**: `KeyPair.fromSecretKey` zeroed no stack: `d` once per call.
-    Harmless while it only ran inside `sign`'s burn; `signWithKeyPair` made the caller's own
-    call the documented path. Fix: `derive` one frame down + `keypair_stack_burn`.
-  - New probes: `signWithKeyPair` (pair built outside the window) and `KeyPair.fromSecretKey`.
-  - Checked clean: `signWithKeyPair` on forged pairs (zero, `≥ n`, wrong parity, wrong public —
-    never a signature; KAT test), its zeroing of the pair copy; `verifyBatch` signs
-    (`a·s·G − a·R − a·e·P`), G's scalar only in the last chunk, an identity partial sum
-    contributes nothing, randomizers from `randomSecure` drawn after the batch is fixed;
-    `verify` with `affineCoordinatesPublic` (public inputs only).
-- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). ⚠ Reversed by the owner 2026-11-13: the self-verification is opt-in (`SignOptions.self_verify`, default off, as in libsecp256k1); see § Performance. The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`; with safegcd the same night verify 1.57×, sign 3.99×, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
+- **k256-side speed, all in `k256`** (verify is already 0.99–1.01× libsecp256k1, P2 met): the masked
+  second folds of the weak form (~4 % against a branching form, rejected, see *What is deliberately not done*);
+  a wider G table (libsecp's window 15, ours 10); the limb multiply's instruction count (~2× a hand-scheduled
+  MULX/ADX body).
