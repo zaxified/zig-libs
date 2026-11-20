@@ -5,32 +5,18 @@
 //! header explains the two traps (silent no-op without `-fvalgrind`, and a
 //! counting rule that must classify every context or fail).
 //!
-//! ## SPEC.md already says this module "should not get one" — read that first
+//! ## What the row means
 //!
-//! `SPEC.md`'s "Threat model / limits" section (§ Keygen + sign) states
-//! plainly: "Why this module has no in-repo ctgrind harness, and should not
-//! get one. ... `sampler`'s reject loop iterates a *value-dependent* number
-//! of times and `berExp` keeps one data-dependent early break, both copied
-//! deliberately from the reference ... the constant-time argument there is
-//! Bernoulli decorrelation, not a fixed trip count. ctgrind measures exactly
-//! what those two constructs do — branch on tainted data — so an in-repo row
-//! for `falcon` would be a permanent red that measures the reference design
-//! rather than a defect, and pinning it green would require excluding the
-//! one primitive the whole gate exists to watch. A red that measures nothing
-//! is worse than no row."
-//!
-//! That argument is about what `--check`'s green/red verdict is worth here,
-//! not about whether the measurement itself has value. This file exists
-//! anyway, on explicit instruction, for a narrower reason: `gaussian.zig`'s
-//! own module doc already admits "no machine-checked constant-time
-//! verification (dudect / ctgrind / binsec) has been run on the compiled
-//! artifact" — that sentence had no measurement behind it at all, same gap
-//! `oscore`'s harness closed for F8. Running it once, reading the actual
-//! context count and source lines, and recording them is strictly more
-//! honest than leaving the claim unmeasured. The coordinator, not this
-//! file, decides whether `scripts/checks/ctgrind-expected.tsv` gets a permanent
-//! (DEFECT-style, like `hqc`'s sampler row) entry for it or whether
-//! `SPEC.md`'s "should not get one" stands as written.
+//! The row is pinned as a bound (`scripts/checks/ctgrind-expected.tsv`), not
+//! as an exact count, because `sampler`'s reject loop iterates a
+//! *value-dependent* number of times and `berExp` keeps one data-dependent
+//! early break, both copied deliberately from the reference: the
+//! constant-time argument there is Bernoulli decorrelation, not a fixed trip
+//! count, and ctgrind measures exactly what those two constructs do — branch
+//! on tainted data. Only the direction (the count must not grow) is
+//! load-bearing; `SPEC.md`'s "Threat model / limits" section states what
+//! that does and does not establish. See also `gaussian.zig`'s
+//! "CONSTANT-TIME STATUS".
 //!
 //! ## What is tainted
 //!

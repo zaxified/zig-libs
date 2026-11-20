@@ -30,8 +30,9 @@
 //! branchless INTEGER emulation of binary64 (see `fpr.zig`) — no native
 //! FP instruction (in particular no variable-latency divide/sqrt) ever
 //! touches secret-derived data. Remaining gate before production signing:
-//! no machine-checked constant-time verification (dudect / ctgrind /
-//! binsec) has been run on the compiled artifact.
+//! the in-repo ctgrind row (`ctgrind_harness.zig`) still reports
+//! secret-dependent branches (pinned as a bound), and no dudect / binsec run
+//! on the compiled artifact exists.
 
 const std = @import("std");
 const fpr = @import("fpr.zig");
