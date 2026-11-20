@@ -137,12 +137,11 @@ caller decides whether to wait again or give up. `SshTransport` is the un-timed
 reference implementation of the same seam.
 
 ⚠ If `Transport.read` returns 0 without actually waiting — the shape a buggy or hostile
-implementation of the recipe above can produce — `Client.receive`'s loop used to call it
-again immediately, forever: measured at 116,275,395 reads/second, 100% of a CPU core, with
-no timeout of its own to blame (2026-09-10 audit, `A1/netconf.md` N2). `Options.max_idle_reads`
-(default 300000) now bounds consecutive zero-byte reads with `error.IdleTimeout`; a
-correctly-implemented `Transport.read`, which returns 0 only after an actual bounded wait,
-would need thousands of real wait cycles to ever reach it.
+implementation of the recipe above can produce — `Client.receive`'s loop would call it again
+immediately, forever (measured at 116,275,395 reads/second, 100% of a CPU core, with no timeout
+of its own to blame). `Options.max_idle_reads` (default 300000) bounds consecutive zero-byte
+reads with `error.IdleTimeout`; a correctly-implemented `Transport.read`, which returns 0 only
+after an actual bounded wait, would need thousands of real wait cycles to ever reach it.
 
 ### Capability checking
 
@@ -225,8 +224,14 @@ NETCONF_TEST_USER=admin NETCONF_TEST_PASSWORD=admin \
 
 Note that OpenSSH alone does **not** provide a `netconf` subsystem — a NETCONF server
 (netopeer2, sysrepo, yuma123 `netconfd`, or a Python `netconf`/paramiko server) has to be
-running behind it. SPEC.md records exactly which server the live run was verified against,
-which goldens come from which RFC section, and the deferred list.
+running behind it. SPEC.md records exactly which server the live run was verified against
+and which goldens come from which RFC section.
+
+## Not provided
+
+No server side, no TLS transport or Call Home, no YANG model or XPath evaluation, no out-of-order reply
+dispatcher, no typed builders for `:partial-lock` or NMDA (reachable through `Rpc.raw`): SPEC *What is
+deliberately not done* gives the reasons and *Backlog / deferred* the open items.
 
 Provenance: clean-room from RFC 6241 / RFC 6242 / RFC 5277. No third-party source was
 ported or studied, so there is no `/NOTICE` entry — the RFC citations live in SPEC.md.

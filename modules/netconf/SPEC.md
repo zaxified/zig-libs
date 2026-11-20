@@ -16,8 +16,8 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-/NOTICE (this module needs no entry — see "Provenance" below).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the
+README's `Provenance:` line and "Provenance" below (this module needs no NOTICE entry).
 
 ## Compared with
 
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jiegec/netconf-rs](https://github.com/jiegec/netconf-rs) | Rust | MIT | 4 | push 2026-01-30 | Its description: "a rust library for NETCONF (RFC 6241)". Tiny; no leading Rust NETCONF crate found in a `netconf language:rust` search (best hit `mechubsec/rustnetconf`, MIT, 4 stars, a platform with YANG codegen — not comparable). |
 | [etnt/zinc](https://github.com/etnt/zinc) | Zig | MPL-2.0 | 0 | push 2025-01-25 | Its README: a NETCONF client CLI over TCP and SSH, NETCONF 1.0/1.1, hello / get-config with filter. The only Zig NETCONF client found; an application, not a library, and far narrower. |
 
-**Where we are ahead:** the only Zig NETCONF library found; RFC 6242 framing with both dialects and the hostile-input discipline, RFC 5277 notifications queued between reply and request, and typed builders for get, get-config, edit-config (all operations and test/error options), copy/delete-config, lock/unlock, commit incl. confirmed and persist, discard, validate, kill/close-session, create-subscription; XML via the sibling `xml` module with DOCTYPE refused · **Where we are behind:** no TLS transport or Call Home (libnetconf2), no server side, no vendor helpers (ncclient), no typed builder for `:partial-lock`, NMDA `get-data`/`edit-data` (all reachable through `Rpc.raw`), no out-of-order reply dispatcher (SPEC "Deferred") (→ Backlog).
+**Where we are ahead:** the only Zig NETCONF library found; RFC 6242 framing with both dialects and the hostile-input discipline, RFC 5277 notifications queued between reply and request, and typed builders for get, get-config, edit-config (all operations and test/error options), copy/delete-config, lock/unlock, commit incl. confirmed and persist, discard, validate, kill/close-session, create-subscription; XML via the sibling `xml` module with DOCTYPE refused · **Where we are behind:** no TLS transport or Call Home (libnetconf2), no server side, no vendor helpers (ncclient), no typed builder for `:partial-lock`, NMDA `get-data`/`edit-data` (all reachable through `Rpc.raw`), no out-of-order reply dispatcher (→ Backlog; see *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -86,13 +86,12 @@ one-byte-at-a-time feed:
 | assembled message > `Limits.max_message` | `error.MessageTooLarge` |
 | un-terminated input > `Limits.max_pending` | `error.PendingTooLarge` |
 
-⚠ Three of the rows above do not have independent teeth of their own — a neighbouring
-guard in the same code path fires first, so deleting them changes nothing measurable
-today (2026-09-10 audit, `A1/netconf.md` N12):
+Three of the rows above do not have independent teeth of their own: a neighbouring
+guard in the same code path fires first, so deleting one changes nothing measurable.
 
 * Zero chunk-size (row 1) is unreachable on its own: a zero-length `chunk-size` always
   starts with the digit `'0'`, so the leading-zero guard (row 2) always fires first. The
-  two rows above are backed by ONE code branch (`framing.zig`'s leading-zero check), not
+  two rows are backed by ONE code branch (`framing.zig`'s leading-zero check), not
   two independent ones.
 * `size > max_chunk_size_rfc` (row 5, the RFC's own 4294967295 cap) never fires at the
   default `Limits.max_chunk = 4 MiB` — the smaller default rejects first. It only has
@@ -103,10 +102,8 @@ today (2026-09-10 audit, `A1/netconf.md` N12):
   fires first.
 
 They stay in the code and in this table as **defence in depth**, not because each is
-independently exercised — a future change to the leading-zero rule or the digit-count
-check would silently remove the others' coverage too, and nothing here would notice
-(mutation-tested: deleting/weakening each of the three individually still leaves the
-suite green — see the audit record for the specific mutations).
+independently exercised: a future change to the leading-zero rule or the digit-count
+check would silently remove the others' coverage too, and nothing here would notice.
 
 On the send side, `writeMessage(.end_of_message, payload)` refuses a payload containing
 `]]>]]>` (`error.DelimiterInPayload`) — RFC 6242 §4.1 is explicit that the sequence *can*
@@ -121,9 +118,7 @@ only:
    peer that wrote `]]>]]>\n` is skipped — but only an LF that is *followed by another
    LF*, which can never be the LF that starts a real header. This re-arms at the start of
    **every** message in the session (`in_message`/`got_chunk` reset in `Framer.finish`),
-   not only the first chunked message after the hello exchange — this paragraph and the
-   matching code comment used to say "the first chunk header", corrected 2026-09-10
-   (`A1/netconf.md` N12; the behaviour itself was already right). Real implementations do
+   not only the first chunked message after the hello exchange. Real implementations do
    print the delimiter on its own line, and the alternative is failing every such message
    with the stray LF, not just the first.
 2. `Framer.next` hands out a slice into an internal buffer that is valid until the next
@@ -169,47 +164,89 @@ would be a new, unaudited attack surface for no gain.
 
 ⚠ **`xml`'s structural limits bound elements, not memory, and this module's own
 `Limits.max_message` bounds wire bytes, not elements — the two are unrelated ceilings.**
-Before 2026-09-10 all three `xml.parse` call sites (`capabilities.parseHello`,
-`reply.parseReply`, `reply.parseNotification`) left `max_elements` at `xml`'s own default
-(`1 << 20`), so a 4.00 MiB `<a/>`-repeated `<rpc-reply>` — comfortably under the 16 MiB
-`max_message` default — cost **529.2 MiB of live bytes, a 132x amplification over the
-wire** (`A1/netconf.md` N1). All three call sites now pass `capabilities.default_max_elements`
-(65536) instead, which keeps the worst case in the same order of magnitude as
-`Limits.max_message`'s own default rather than two orders above it. The value is a fixed
-guard constant, not a per-session option: there is no consumer today to need a different
-number, and threading an `xml.Options` through three public parse functions is a signature
-change reserved for when one does.
+All three `xml.parse` call sites (`capabilities.parseHello`, `reply.parseReply`,
+`reply.parseNotification`) pass `capabilities.default_max_elements` (65536) instead of `xml`'s
+own default (`1 << 20`): measured with the default, a 4.00 MiB `<a/>`-repeated `<rpc-reply>`
+— comfortably under the 16 MiB `max_message` default — cost **529.2 MiB of live bytes, a 132x
+amplification over the wire**; the lower constant keeps the worst case in the same order of
+magnitude as `Limits.max_message`'s own default rather than two orders above it. The value
+is a fixed guard constant, not a per-session option: there is no consumer today to need a
+different number, and threading an `xml.Options` through three public parse functions is a
+signature change reserved for when one does.
+
+### Schema discovery (RFC 6022)
+
+`Rpc.get_schema` (`GetSchema{identifier, version, format}`) writes `<get-schema>` in the
+`ietf-netconf-monitoring` namespace; the three parameters are XML-escaped and `version` and
+`format` are left out when null. `Client.getSchema` returns the text of the reply's `<data>`
+through `reply.parseSchemaText`: `<data>` in the base namespace or in the monitoring namespace
+(RFC 6022 §4.2's examples use the latter) is accepted; text and CDATA are XML-unescaped and
+concatenated and not trimmed; content that is itself XML (an `xsd`) is returned as its inner
+markup, byte for byte. An `<rpc-error>` is `error.RpcError` (RFC 6022 §3.1: an unknown schema
+is `invalid-value`, an ambiguous one `data-not-unique`), a reply with no `<data>` is
+`error.UnexpectedReply`.
+
+`Client.listSchemas` is a `<get>` with `rpc.schemas_filter` (the subtree selecting
+`/netconf-state/schemas`) parsed by `reply.parseSchemaList` into a `SchemaList` of
+`Schema{identifier, version, format, namespace, locations}`; the list has its own arena and
+outlives the `Reply`. `Schema.viaGetSchema` is true when a location is the literal `NETCONF`
+or when the entry has no locations (RFC 6022 makes `location` optional and `get-schema` is
+keyed by the three key leaves). Hostile or odd replies: elements outside the monitoring
+namespace and unknown children are skipped, a `<schema>` without a non-empty `<identifier>` is
+skipped, an absent `<netconf-state>`/`<schemas>` is an empty list, DOCTYPE and entities are
+refused by `parseReply`. The list is bounded by `reply.max_schemas` (8192 entries) and
+`reply.max_locations` (64 per entry): beyond either is `error.TooManyEntries` (the other bound
+is `parseReply`'s 65536-element cap).
+
+Decisions. Neither call is gated on a capability: the advertised URI carries
+`?module=…&revision=…`, so the peer answers with an `<rpc-error>` if it lacks the module.
+Two `<data>` in one reply, in either namespace or one in each, are `error.AmbiguousReply` from
+`parseReply`: RFC 6241 §4.2 allows a single `<data>`; the references differ (ncclient's
+`GetSchemaReply` reads the first and says nothing; libnetconf2 hands the reply to libyang, where
+the output's single `data` leaf cannot repeat), so the module's base-namespace rule is applied
+uniformly. RFC text note: §4.2's example requests spell the element `identifer`; the module's
+YANG (§5) and §3.1 say `identifier`, which is what is sent. Limit: the rest of `/netconf-state`
+(sessions, statistics, datastores, the capabilities list) has no typed reader.
+
+### `cancel-commit` and the `with-defaults` parameter
+
+`Rpc.cancel_commit` (`CancelCommit{persist_id}`, `Client.cancelCommit`) writes `<cancel-commit/>`,
+with a `<persist-id>` when one is given (needed to cancel a persistent confirmed commit started by
+another session); `Client.send` requires the peer's `:confirmed-commit:1.1` (with the default
+`Options.check_capabilities`). RFC 6243's
+`with_defaults: ?WithDefaults` on `Get`, `GetConfig` and `CopyConfig` (applied to the `<source>`
+when that is a datastore) emits `<with-defaults>` in the RFC 6243 namespace with `report-all`,
+`trim`, `explicit` or `report-all-tagged`, and `Client.send` requires `:with-defaults` (same option). The
+advertised `basic-mode` / `also-supported` parameters are not checked: the peer decides.
 
 ## Verification
 
+`scripts/modtest netconf` (`zig build test-netconf`). The live tests in `client.zig` are gated on
+`NETCONF_TEST_SERVER` / `NETCONF_TEST_USER` / `NETCONF_TEST_PASSWORD` and are a counted `error.SkipZigTest`
+without them (`SKIPPED:` is printed only when `ZIG_LIBS_VERBOSE_SKIP` is set; the pattern used by `ssh` and
+`tc`).
+
 ### Live interop — a real, third-party NETCONF server
 
-The live tests in `client.zig` are gated on `NETCONF_TEST_SERVER` / `NETCONF_TEST_USER` /
-`NETCONF_TEST_PASSWORD` and are a counted `error.SkipZigTest` without them (`SKIPPED:` is printed only when
-`ZIG_LIBS_VERBOSE_SKIP` is set; the pattern used by `ssh` and `tc`).
-
-They were run, and pass, against a **third-party NETCONF server**: the Python `netconf`
-2.1.0 package (Christian Hopps' implementation) on `sshutil` 1.5.0 + `paramiko` 3.5.1,
-Python 3.14.4, serving a small static configuration on `127.0.0.1:8300`. That server is an
-independent implementation of RFC 6241/6242 — including its own chunked framer — and it
-advertises both `:base:1.0` and `:base:1.1`, which is what makes the dialect test below
-meaningful. The full path exercised is our `ssh` module's transport handshake + RFC 4252
+The live tests run against the Python `netconf` 2.1.0 package (Christian Hopps' implementation) on `sshutil`
+1.5.0 + `paramiko` 3.5.1, serving a small static configuration. That server is an independent implementation of
+RFC 6241/6242, including its own chunked framer, and it advertises both `:base:1.0` and `:base:1.1`, which is
+what makes the dialect test meaningful. The path exercised is the `ssh` module's transport handshake + RFC 4252
 password auth + RFC 4254 `subsystem("netconf")` request, then this module on top.
 
 Two live tests run, differing only in what **we** advertise:
 
 | Test | We advertise | Negotiated framing | What ran |
 |---|---|---|---|
-| chunked | `:base:1.0` + `:base:1.1` | `.chunked` (asserted) | hello (session-id + 5 peer capabilities) → `get-config` (129 B of `<data>`) → `get` → unsupported op → `close-session` |
+| chunked | `:base:1.0` + `:base:1.1` | `.chunked` (asserted) | hello (session-id + peer capabilities) → `get-config` → `get` → unsupported op → `close-session` |
 | end-of-message | `:base:1.0` only | `.end_of_message` (asserted) | same sequence, legacy framing |
 
-The unsupported-operation step sends `<no-such-operation/>` through the `raw` escape hatch
-and asserts the peer's real `<rpc-error>` parses: the live server answers
-`error-tag=operation-not-supported`, `error-type=protocol`. So the error path, the
-correlation (`expectMessageId(1..3)`) and both framers are validated against foreign
-bytes, not only against our own encoder.
+The unsupported-operation step sends `<no-such-operation/>` through the `raw` escape hatch and asserts the peer's
+real `<rpc-error>` parses (`error-tag=operation-not-supported`, `error-type=protocol`), so the error path, the
+correlation (`expectMessageId`) and both framers are validated against foreign bytes, not only against our own
+encoder.
 
-Reproducing the server used here (no root needed):
+Reproducing the server (no root needed):
 
 ```sh
 python3 -m pip install --target ./pylib netconf 'paramiko==3.5.1'
@@ -218,79 +255,25 @@ python3 -m pip install --target ./pylib netconf 'paramiko==3.5.1'
 PYTHONPATH=./pylib python3 ncserver.py 8300 hostkey_rsa
 ```
 
-**What is not available on this machine:** no `netopeer2-server` and no `sysrepo` are
-packaged for this distribution, and OpenSSH's `sshd` provides only an `sftp` subsystem, so
-"ssh -s localhost netconf" cannot work by itself. yuma123's `netconfd` **is** packaged and
-was extracted and run unprivileged, but its `netconf-subsystem` bridge ignores
-`--ncxserver-sockname` and its sessions died immediately after `New session created OK`
-without emitting a server `<hello>`; that path was abandoned in favour of the Python
-server above rather than faked.
+OpenSSH's `sshd` alone provides only an `sftp` subsystem, so a NETCONF server must run behind it.
 
-### External-anchor investigation: frozen bytes from the live server (2026-08-01, done)
+### Frozen bytes from that server (offline, no socket, no env var)
 
-The live tests above prove interop but are gated: without `NETCONF_TEST_SERVER`
-they are counted skips and the byte-level detail of what actually crossed the
-wire is never asserted when no operator supplies a server. To close that gap
-per the governing rule ("run the foreign thing once, freeze its bytes, assert
-offline"), the Python `netconf` 2.1.0 package was actually stood up using the
-recipe already documented above, and this module's own `Client`/`buildRpc`
-were driven against it for real, exactly once.
+Without a server the live tests are skips and the byte-level detail of what crossed the wire would never be
+asserted. Three exchanges from a live `.chunked` session against the same server (its `<get-config>` body uses a
+deliberately *prefixed* namespace, which no RFC-literal golden here exercises, and the replies carry a real XML
+prolog) are permanent offline tests:
 
-**One environment wrinkle, worked around without installing anything.**
-`sshutil` 1.5.0 (2016-era) unconditionally does `import paramiko.dsskey`;
-paramiko 5.0.0 (what is actually installed) dropped DSS/DSA key support and
-the module no longer exists, so `import netconf.server` raised
-`ModuleNotFoundError` outright — the tool did not work out of the box and
-needed to be re-verified before anything was built on it. Since only an RSA
-host key is used (`from_private_key_file` tries RSA first), a two-line stub
-module (`sys.modules["paramiko.dsskey"] = <a dummy class that only exists to
-satisfy the import>`) let `netconf.server` import cleanly. Nothing was
-installed; nothing in the stub is ever called.
+- the server's real `<hello>` — `capabilities.zig`, `live_netconf_2_1_0_server_hello` through `parseHello`;
+- a real `<rpc-reply>` to our `get-config` — `reply.zig`, `live_netconf_2_1_0_get_config_reply`;
+- a real `<rpc-error>` (`operation-not-supported`/`protocol`) to an unsupported operation sent through `raw` —
+  `reply.zig`, `live_netconf_2_1_0_rpc_error_reply`;
+- the exact request bytes `buildRpc` produced for both requests, which the server accepted — `rpc.zig`, the
+  test "external anchor: buildRpc output is exactly what a real NETCONF server accepted".
 
-**What ran.** A throwaway RSA host key (`ssh-keygen`, discarded after), a
-~40-line script subclassing `netconf.server.NetconfMethods` with
-`rpc_get`/`rpc_get_config` returning a static `<probe:top>` element (a
-deliberately *prefixed* namespace, `xmlns:probe="urn:example:probe"` — unlike
-every RFC-literal golden below, which uses default namespaces, this exercises
-the parser's prefixed-namespace path for real), served via
-`netconf.server.NetconfSSHServer` on `127.0.0.1:8300`. This module's own
-existing (env-gated) live test in `client.zig` was then pointed at it
-(`NETCONF_TEST_SERVER=127.0.0.1:8300 NETCONF_TEST_USER=probe
-NETCONF_TEST_PASSWORD=probe-pw`) and ran for real, both dialects: hello →
-`get-config` → `get` → an intentionally unsupported operation → `close-session`.
-All 65 tests passed, live, including the two normally-skipped ones.
-
-**What was frozen.** `Client.receive`/`sendRaw` were temporarily instrumented
-(one `std.debug.print` each, `client.zig`, reverted immediately after — no
-trace of it remains) to print the exact unframed message bytes crossing the
-transport, in both directions, for the whole session. From the `.chunked`
-session (session-id 3) three exchanges were captured and are now permanent
-offline tests (no socket, no env var):
-
-  - the server's real `<hello>` — `capabilities.zig`, `live_netconf_2_1_0_server_hello`
-  - a real `<rpc-reply>` to our own `get-config` request (source `running`,
-    no filter), including the prefixed-namespace `<probe:top>` body —
-    `reply.zig`, `live_netconf_2_1_0_get_config_reply`
-  - a real `<rpc-error>` (`operation-not-supported`/`protocol`) answering a
-    deliberately unsupported operation sent through the `raw` escape hatch —
-    `reply.zig`, `live_netconf_2_1_0_rpc_error_reply`
-  - the exact request bytes `buildRpc` produced for both of the above, which
-    the server accepted — `rpc.zig`, "external anchor: buildRpc output is
-    exactly what a real NETCONF server accepted"
-
-Together these are strictly stronger than the RFC-literal goldens below: not
-"structurally what RFC 6241 describes" (`expectSameStructure`) but "byte-for-
-byte what an independent implementation neither authored by nor consulted
-during this module's development actually parsed, acted on, and emitted" —
-including a real XML prolog (`<?xml version="1.0" encoding="UTF-8"?>`) and a
-real prefixed namespace, neither of which any hand-typed RFC excerpt here
-happens to exercise. **No disagreement was found**: every byte this module
-sent was accepted, and every byte the server sent parses exactly as intended.
-
-No `/NOTICE` entry: exactly the black-box-oracle relationship root `NOTICE`
-§0 already describes for `protobuf`/`syslog`/`opcua`/`wireguard`/`xmlsec1` —
-the `netconf` package's own behavior was observed, nothing was read from or
-copied out of its source.
+These are byte-for-byte what an independent implementation, neither authored by nor consulted during this module's
+development, parsed, acted on and emitted; the RFC-literal goldens below are "structurally what RFC 6241 describes".
+The server is a black-box oracle: nothing was read from or copied out of its source.
 
 ### Byte-exact goldens, and which RFC section each comes from
 
@@ -347,35 +330,17 @@ are byte-exact in the strong sense.
   reply. It exercises the client state machine; it uses this module's own framer, so it is
   a state-machine oracle, **not** an independent-implementation oracle — that role belongs
   to the live server above.
-* Three `std.testing.fuzz` targets: the framer (both dialects, arbitrary bytes),
-  `parseHello`, and `parseReply`/`parseNotification`/`classify`.
+* **Fuzz.** `std.testing.fuzz` targets for the framer (both dialects, arbitrary bytes), `parseHello`,
+  `parseReply`/`parseNotification`/`classify`, and the two driver harnesses of `src/fuzz_test.zig` and `client.zig`,
+  run by the deterministic driver (`NETCONF_FUZZ=<runs>[,<first seed>]`; never `zig build --fuzz`):
+  `netconf-wire` (genuine `<hello>`, `<rpc-reply>` and `<notification>` documents and their framing in both
+  dialects, delivered in random pieces and damaged: undamaged they parse to what was written, damaged they never
+  panic) and `netconf-client` (a whole session whose peer bytes are damaged, truncated, garbled or doubled at one
+  read: each call ends in a typed error or in a reply for the message-id that was sent). Each has a reach test
+  that asserts every outcome class is hit.
 
-Without a live server, the live tests are counted skips (not passes); with
-`NETCONF_TEST_SERVER` set, they all run for real. Green in both `Debug` and
-`--release=fast`.
-
-**Audit 2026-11-17 (delta mutation).** 79 schemata mutants over the RFC 6022 code added the same day, ReleaseSafe,
-one build, each mutant under `setsid -w timeout` and `ulimit -v`: in `rpc.zig` the `get-schema` writer (the
-namespace, escaping of each of the three parameters, dropping the optional `version` and `format`, the element
-names, the closing tag); in `client.zig` the capability arm for `get_schema` (a forced requirement), the
-parameters handed to the call, the `schemas_filter` handed to `get`, and the two `deinit`s; in `reply.zig`
-`Schema.viaGetSchema` (empty list, the `NETCONF` compare, the loop, the fall-through), `leafText` (the zero and
-one node shortcuts, the trim, text and CDATA counted and joined), `parseSchemaList` (the data guard, the
-namespace and local-name test at each of the four levels and on the leaves, the identifier rules, each leaf's
-assignment, both caps with drop, `>` and `- 1`, the location and entry appends) and `parseSchemaText` (the error
-guard, the `data` name and the two accepted namespaces, `break`, the element test, the first and last child
-bounds and the slice, the text and CDATA join). First run: 59 killed, 20 survived. Three tests and one fake-peer
-mode added (a schema list whose every level, and every leaf, is a decoy in the wrong namespace or under the wrong
-name; leaves trimmed and joined across text and CDATA nodes, and a CDATA-only leaf; two
-`<data>` (monitoring namespace, since 2026-11-17 refused, see Backlog) and an XML body is returned byte for byte, untrimmed; `getSchema` against a
-peer that echoes the request's parameters, so a dropped `version` or `format` shows) killed 18; 2 are EQUIVALENT:
-`leafText` with no text node falling through to the join (an empty list trimmed is `""`, no allocation) and
-without the one-node shortcut (the join of one node, trimmed, is the shortcut's value; cost-only). 77 killed
-+ 2 eq = 79. Not mutated: `monitoring_ns` and `schemas_filter` (comptime constants, a compile-time switch cannot
-reach them; the filter's bytes are pinned by `schemas_filter selects /netconf-state/schemas`) and the
-`data_element orelse` in `parseSchemaList` (`expectData` has already returned for a reply with no `<data>`, and
-`data` and `data_element` are set together in `parseReply`, so it is unreachable). The card's counts are
-cumulative; no earlier mutation run existed. Delta mutation of the later `<data>` change in `parseReply` (2026-11-17, ReleaseSafe, one schemata build, 9 mutants, measured): the monitoring-namespace compare and the `data` compare each forced true, the counter skipped, the counter assigned `1` instead of incremented, `>1` as `>2`, the monitoring term dropped from the sum, the base `data_count` term dropped, and a single `<data>` of either namespace refused (`>0`): 8 killed. The ninth, the `break` in `parseSchemaText`, survives and is EQUIVALENT: at most one `<data>` in the base or monitoring namespace can reach that loop (a second is `AmbiguousReply` in `parseReply`; a foreign-namespace `<data>` fails the namespace test), so "first wins" and "last wins" agree. Cumulative: 84 killed + 3 equivalent = 87 (the earlier run's `break` kill was against the code before the change and now counts as equivalent).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Provenance
 
@@ -386,9 +351,9 @@ entry** — the RFC citations live here. The Python `netconf` server used in the
 a black-box compatibility oracle only (nothing was read from or copied out of it), which
 CONVENTIONS.md §5 also puts outside NOTICE's scope.
 
-## Deferred
+## What is deliberately not done
 
-Honest list of what this module does **not** do:
+What this module does **not** do, with the reason:
 
 * **Server side.** Client only. A `<hello>` *can* be written with a `<session-id>`
   (`capabilities.writeHello`) and the framer is symmetric, so a server is a small addition,
@@ -397,22 +362,21 @@ Honest list of what this module does **not** do:
   SSH subsystem transport is wired; the `Transport` seam takes anything, but no other
   transport is implemented or tested.
 * **YANG.** No schema model, no validation, no `ietf-netconf-monitoring` beyond the
-  schema list and `get-schema` (RFC 6022, below), no XPath evaluation. Filters and `<config>` bodies are opaque XML fragments; a
+  schema list and `get-schema` (RFC 6022, *Schema discovery*), no XPath evaluation. Filters and `<config>` bodies are opaque XML fragments; a
   YANG layer belongs above this module, not inside it.
 * **`:url` scheme validation, `:partial-lock` (RFC 5717),
   NMDA `<get-data>`/`<edit-data>` (RFC 8526).** `Rpc.raw` reaches all of them; none has a
   typed builder.
 * **Notification replay bookkeeping.** `create-subscription` (incl. `startTime`/`stopTime`)
   is built and `<notification>` is parsed and queued, but nothing tracks subscription
-  state, `<replayComplete>`/`<notificationComplete>`, or the `:interleave` rules. This was
-  the optional item in the task and it **is** implemented to that depth, no further.
+  state, `<replayComplete>`/`<notificationComplete>`, or the `:interleave` rules.
 * **Pipelining depth.** `send`/`receiveReply` allow more than one outstanding request, but
   `receiveReply` waits for one specific id and treats any other reply as a mismatch, so
   true out-of-order pipelining needs a small dispatcher on top.
 * **Chunk-size tuning on send.** `writeMessage(.chunked, …)` emits one chunk;
   `writeChunked(w, payload, n)` splits at `n` but nothing in the client picks a smaller
   `n`. A peer with a modest input buffer might want that.
-* **A timeout implementation.** By design (see above) — the seam is there, the policy is
+* **A timeout implementation.** By design (see *Layering*) — the seam is there, the policy is
   the caller's.
 
 ## Anchoring
@@ -424,13 +388,9 @@ Honest list of what this module does **not** do:
 
 **What the tests actually contain.** framing.zig RFC 6242 literal examples EXTERNAL; rpc.zig own golden SELF; py oracle skips
 
-**How it got there.** The anchoring work landed. DONE 0bbcefe: real python-netconf server; hello/rpc-reply/rpc-error frozen
-
 ## Backlog / deferred
 
-Survey findings; `## Deferred` above remains the prose list of what is not done.
+Open survey findings; *What is deliberately not done* is the prose list of what is not done.
 
-- ✅ DONE 2026-11-17 (`1df804629`: `Rpc.get_schema`, `Client.getSchema`, `Client.listSchemas`; `rpc.zig`, `client.zig`). **`get-schema` and `ietf-netconf-monitoring` helpers (RFC 6022)** *(survey 2026-09-30)*. Discovering what a device supports (`<get>` of `/netconf-state/schemas`, then `get-schema`) is the first thing ncclient users do against an unknown device; today they hand-write it through `Rpc.raw`. Effort: small (two builders, one reply-shape reader). Fits CONVENTIONS §2. SPEC "Deferred" lists YANG as not done, which is about a schema *model*; these two RPCs are not. ✅ 2026-11-17: `Rpc.get_schema` / `GetSchema{identifier, version, format}` (namespace `ietf-netconf-monitoring`, parameters escaped) and `Client.getSchema` returning the `<data>` text (XML-unescaped, CDATA included; XML content such as an `xsd` is returned verbatim; `<data>` accepted in the base namespace or, as RFC 6022 §4.2's examples have it, the monitoring namespace); `rpc.schemas_filter` + `Client.listSchemas` + `reply.parseSchemaList` giving `SchemaList` of `Schema{identifier, version, format, namespace, locations}` (own arena, outlives the `Reply`). Hostile replies: no `<data>` is `UnexpectedReply`, `<rpc-error>` is `RpcError`, a `<schema>` without a non-empty `<identifier>` and foreign-namespace/unknown elements are skipped, an absent `<schemas>` is an empty list, DOCTYPE/entities are refused by `parseReply`; **new caps** `reply.max_schemas` = 8192 entries and `max_locations` = 64 per entry give `TooManyEntries` (the pre-existing bound was only `parseReply`'s 65536-element cap). Not gated on a capability (the advertised URI carries `?module=…&revision=…`; the peer answers `rpc-error` if it lacks the module). Not done: the rest of `/netconf-state` (sessions, statistics, datastores, capabilities list). Two `<data>` in a reply are `AmbiguousReply` from `parseReply` in either namespace (or one in each), decided 2026-11-17 (until then two monitoring-namespace ones were accepted and the first won): RFC 6241 §4.2 allows a single `<data>`; ncclient (`GetSchemaReply`, `root.find`) reads the first and says nothing, libnetconf2 hands the reply to libyang where the output's single `data` leaf cannot repeat, so one reference tolerates, one refuses, and the module's existing base-namespace rule is applied uniformly. RFC text note: §4.2's example requests spell the element `identifer`; the module's YANG (§5) and §3.1 say `identifier`, which is what is sent.
-- **Typed `cancel-commit` and `:with-defaults` (RFC 6243) parameters** *(survey 2026-09-30)*. `commit` already models `confirmed`/`persist`/`persist-id`, but cancelling a persistent confirmed commit needs `Rpc.raw`. Effort: small. Fits §2. ✅ DONE 2026-11-16 (`Rpc.cancel_commit` / `Client.cancelCommit` with optional `persist-id`, gated on `:confirmed-commit:1.1`; `with_defaults: ?WithDefaults` on `Get`/`GetConfig`/`CopyConfig` emitting `<with-defaults>` in the RFC 6243 namespace with report-all/trim/explicit/report-all-tagged, gated on `:with-defaults`; the advertised basic-mode/also-supported parameters are not checked).
 - **NETCONF over TLS (RFC 7589) and Call Home (RFC 8071)** *(survey 2026-09-30)*. Provided by libnetconf2; used by devices managed by a controller that accepts inbound sessions. The `Transport` seam already takes any byte stream; the missing piece is TLS client-cert wiring from the `tlsclient` sibling and the reverse-connect listener. Effort: medium. Fits §2 (TLS is a sibling module, not a dependency of this one).
-- **Reply dispatcher for true pipelining** *(survey 2026-09-30)*. Listed under Deferred; a controller polling many RPCs on one session wants it. Effort: small-medium. Fits §2.
+- **Reply dispatcher for true pipelining** *(survey 2026-09-30)*. Listed under *What is deliberately not done*; a controller polling many RPCs on one session wants it. Effort: small-medium. Fits §2.
