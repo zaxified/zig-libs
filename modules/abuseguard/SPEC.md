@@ -22,11 +22,11 @@
 **Downstream consumer:** yes
 
 IP reputation + connection-abuse defense for a directly internet-facing `http.Server`. Usage: see
-./README.md. Attribution/provenance: see /NOTICE.
+./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Scope re-assessed 2026-10-04 after the survey's "missing and it matters" items were built (table rows not re-fetched), and again 2026-10-11 against the fail2ban jail.conf(5) / fail2ban-client(1) manuals and the nginx `limit_conn` docs: the remaining behaviour a user of either reaches for — `bantime.increment`/`maxtime`, ban actions, `unban --all`, `limit_conn_dry_run` — was built (below).
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Scope re-assessed against the fail2ban jail.conf(5) / fail2ban-client(1) manuals and the nginx `limit_conn` docs: the behaviour a user of either reaches for — `bantime.increment`/`maxtime`, ban actions, `unban --all`, `limit_conn_dry_run` — is built (below).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jpillora/ipfilter](https://github.com/jpillora/ipfilter) | Go | MIT | 400 | v1.5.6 (2026-09-23) | Allow/block by IP, CIDR and country; no strike logic. *(inferred)* |
 | Zig `std` and ecosystem | Zig | — | — | — | Nothing comparable found in `std` or a GitHub search for Zig IP-reputation / connection-abuse libraries. *(inferred)* |
 
-**Where we are ahead:** the only in-language piece that unifies accept-time connection caps, decaying strikes with escalation, bounded fail-closed store and a router auto-strike hook, drivable without HTTP with an injected clock; a rejected peer costs the attacker a handshake and writes no bytes. · **Where we are behind:** no shared reputation across processes or nodes (in-process only; bans persist only through the caller-stored `snapshot`/`restore` file); no country or ASN lists. Default-deny (ipfilter `BlockByDefault`: `Options.default_deny`, verdict `.not_allowed`) and the trusted-proxy key closed 2026-11-05. Allowlist, per-prefix keying, range bans and ban persistence closed 2026-10-04; growing greylists, ban/unban events (fail2ban actions), `unbanAll` and dry run closed 2026-10-11. Not taken, with reason: fail2ban `bantime.rndtime` (random extra ban time against bots that time their retries — our greylist is per key and accept-time, a jitter adds nothing a caller cannot add in the event hook), log parsing (filters/failregex — the app calls `record` instead, by design), nginx `limit_conn_status`/`log_level` (we drop at TCP, no status; logging is the event hook's job).
+**Where we are ahead:** the only in-language piece that unifies accept-time connection caps, decaying strikes with escalation, bounded fail-closed store and a router auto-strike hook, drivable without HTTP with an injected clock; a rejected peer costs the attacker a handshake and writes no bytes. · **Where we are behind:** no shared reputation across processes or nodes (in-process only; bans persist only through the caller-stored `snapshot`/`restore` file); no country or ASN lists. Built, from the same surveys: default-deny (ipfilter `BlockByDefault`: `Options.default_deny`, verdict `.not_allowed`), the trusted-proxy key, the allowlist, per-prefix keying, range bans, ban persistence, growing greylists, ban/unban events (fail2ban actions), `unbanAll` and dry run. Not taken (fail2ban `bantime.rndtime`, log parsing, nginx `limit_conn_status`/`log_level`, shared reputation, geo lists): see *What is deliberately not done*.
 
 ## Design & invariants
 - **Layered:** `Guard` — reputation store + admission engine (`admit`/`connClosed`,
@@ -47,8 +47,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   denials + the router's own 404/405.
 - **Strikes (fail2ban shape):** `record(ip, weight)` decays as a leaky bucket (one strike per
   `strike_decay_ms` ≈ findtime; whole strikes drain, the sub-interval remainder is kept while strikes
-  are left, and a balance that drained out restarts its interval at the next strike — fixed
-  2026-10-11, it used to keep the idle remainder and drain up to one interval early); reaching `ban_threshold` (≈ maxretry) resets the balance and
+  are left, and a balance that drained out restarts its interval at the next strike); reaching `ban_threshold` (≈ maxretry) resets the balance and
   greylists for `greylist_ttl_ms` (≈ bantime); reaching `ban_after_offenses` escalates to a
   permanent ban (≈ the recidive jail). `greylist_ttl_growth` / `greylist_ttl_max_ms` grow the
   auto-greylist per offense (`bantime.increment` / `bantime.maxtime`): the n-th offense lasts
@@ -68,9 +67,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   one /64, RFC 6177) / `ipv4_key_bits` (32), stored in 16-byte mapped form — an IPv4-mapped IPv6 peer
   and its plain IPv4 form are one entry, and so are all addresses of one /64. Invariant: every
   per-key state (live count, strikes, ban, greylist, offenses) is per masked key, and every public
-  `ip` argument is masked the same way. The /64 default is a deliberate behaviour change
-  (2026-10-04): the per-key conn cap is now per /64 for IPv6; `ipv6_key_bits = 128` restores
-  per-address.
+  `ip` argument is masked the same way. The /64 default is deliberate: the per-key conn cap is per /64 for IPv6; `ipv6_key_bits = 128` gives
+  per-address keys.
 - **Allowlist (`Options.allow`):** matched on the unmapped peer (not the key); a member is never
   rejected for reputation (entry ban/greylist, prefix ban) and `record`/auto-strike are no-ops
   creating no entry; caps (per-key, total, store_full) still apply. Manual `ban`/`greylist` of a
@@ -87,13 +85,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   <ms>`) → `parseSnapshotLine` (strict) → `restore`. Strikes and offenses are not persisted.
   `restore` validates every record first (`InvalidRecord` = malformed only), then applies: a
   `range` record is always a range ban (an operator's `banPrefix` stays durable and unevictable,
-  even at exactly key width — review A1); a plain ban of key width is a key ban, of any other
+  even at exactly key width); a plain ban of key width is a key ban, of any other
   width an exact range; a greylist lands on the key covering its prefix, or is skipped when the
   prefix is wider than a key. So a file written under other `*_key_bits` restores instead of
-  failing whole (review A2). `snapshot`/`restore` run under the guard's lock — admissions wait
-  for them; call them at startup/shutdown, not on a hot path. Middleware can key on `ratelimit`'s trusted-XFF chain instead
-  for behind-proxy deployments: `middleware_key = .{ .forwarded_ip_trusted = … }` takes the headers
-  only from a trusted peer; `.forwarded_ip` believes them from any peer.
+  failing whole. Records are applied last to first (`snapshot` writes the most recently touched first),
+  so an overfull `restore` evicts the oldest first; it answers `StoreFull` for a ban or greylist the
+  full store cannot track. `snapshot`/`restore` run under the guard's lock — admissions wait
+  for them; call them at startup/shutdown, not on a hot path.
+- **Middleware key:** the socket peer by default. For behind-proxy deployments
+  `middleware_key = .{ .forwarded_ip_trusted = proxies }` (`ratelimit.TrustedProxies`) delegates to
+  `ratelimit.clientIp`: the forwarding headers are believed only from a trusted peer and the chain is
+  walked past trusted hops; `.forwarded_ip` believes them from any peer, so a direct client picks its own
+  strike bucket. Admission is always keyed on the socket peer.
+- **Per-key cap exemption (`Options.per_ip_cap_exempt`):** members skip only the `per_ip_cap` check in
+  `admit`; they stay counted in `total_conns` / `max_conns_total` and in their entry's live count, and every
+  reputation path is unchanged (exempting that too is `allow`). Borrowed slice, linear scan, shares
+  `inPrefixes` with `allow`; meant for a trusted reverse proxy that carries every client (nginx `limit_conn`
+  with `geo` exemptions).
+- **Options validation:** `Guard.init` returns `error.InvalidOptions` for an `Options` outside its
+  documented range (zero `max_tracked_ips`, `ban_threshold`, `greylist_ttl_ms`, caps below 1, key widths
+  outside 1..128 / 1..32, `greylist_ttl_growth` below 1, `greylist_ttl_max_ms` below the base TTL).
 - **Bounded, fail-closed store:** at most `max_tracked_ips` entries; fully-lapsed entries swept from
   the LRU tail on insert; live-connection entries never evicted; banned entries evicted only as a
   last resort. When nothing is evictable, new IPs are **rejected** (nginx zone-exhausted semantics,
@@ -106,7 +117,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ratelimit`); clock injected (default posix `clock_gettime`), never read internally, so every
   ban/greylist/decay test is deterministic.
 
-## Threat model / out of scope
+## Threat model / Limits
 Per-instance, in-memory only: no shared reputation across processes/nodes; a restart clears all
 state except what the caller persists via `snapshot`/`restore` (bans and greylists, not strikes).
 The allowlist is trusted configuration: it is matched on the socket peer, so a client behind a
@@ -127,83 +138,69 @@ connection). Known edge: if `http.Server` drops an admitted connection before se
 memory stays bounded regardless). Not encryption or authentication — complements but does not replace
 TLS/auth; does not inspect request bodies or protocol content.
 
+Residual risks kept as designed: (a) bans are evicted as a last resort, so an attacker holding
+`max_tracked_ips` live sockets from rotating keys can make the guard forget the oldest bans (each one an
+`.evicted` event) — never evicting bans would turn a store full of bans into a permanent `store_full`;
+`banPrefix` holds an operator's range bans outside the store. (b) An untracked close can take a tracked
+slot of the same address (documented on `connClosed`; the server hook cannot know the verdict). (c) The
+clock is read before the lock, so a racing thread can apply a timestamp a few ns older than an entry's
+mark; saturating arithmetic keeps it harmless. (d) `snapshot`/`restore`/`unbanAll` are O(n) under the
+spinlock. (e) A hook wired without its context panics with a message (`onConnect` without
+`onConnectCtx`, `onConnState` without `onConnStateCtx`); `admit` refuses instead of overflowing when one
+key holds `maxInt(u32)` live connections. (f) With `on_store_full = .admit_untracked` and no
+`max_conns_total` nothing bounds untracked admissions; the check is the consumer's configuration
+validation (see *What is deliberately not done*). `ban` and `greylist` answer `error.StoreFull` when a
+full store cannot track the key; `dry_run`'s events still enforce through a firewall-mirroring hook
+(documented on `Options.dry_run`).
+
 ## Verification
-`zig build test-abuseguard` — offline deterministic (injected clock): greylist growth + ceiling, dry run (each verdict, store-full → untracked), event delivery after unlock (a re-entering hook), `.evicted` events, `unbanAll`; ban/greylist add +
-TTL expiry, strike accumulation → greylist → ban on repeat, exact decay, per-IP counter inc/dec via
-the hook pair, per-IP + global caps, LRU eviction (live-pinning + banned-last + empty-sweep),
-v4-mapped unification, fail-closed OOM, an 8-thread admission race and an exact-threshold concurrent
-`record` race; allowlist (v4 /24 member, v4-mapped match, record/ban/greylist/prefix-ban exempt, cap
-not exempt, middleware no-op); prefix keying (two v6 in one /64 share strikes → ban, 128 bits does
-not, per-/64 conn cap, v4 /24 key); `banPrefix`/`unbanPrefix` (members rejected, bound, idempotent,
-no entry created, no untracked bypass); snapshot → text → parse → `restore` into a fresh Guard
-(same peers rejected, greylist expiry at the exact instant, rounded up) plus every malformed line,
-invalid-record and bound case. Middleware goldens over socket-free `http.Server.serveStream` (4xx/429 weights,
-zero-weight opt-out, forwarded-IP keying). Two loopback integrations (skip only when loopback binding
-is unavailable): (1) concurrent keep-alive conns, next rejected at accept, close→re-admit, manual
-ban/unban, greylist TTL re-admit, record-driven escalation; (2) router auto-strike middleware
-escalating a 404 path scanner to accept-time rejection, then TTL re-admits; (3) a socket parked on
-an unfinished request header holds the per-IP slot (the nginx `limit_conn` probe's shape).
 
-Audit 2026-11-15 (delta mutation): 9 schemata mutants over the new code, ReleaseSafe, one build, each mutant under
-`setsid -w timeout` (20 s) and `ulimit -v`. `per_ip_cap_exempt`'s check in `admit` (the exemption ignored, its
-verdict flipped, the `allow` list read in its place) and the shared `inPrefixes` helper (the unmap skipped,
-`canonicalPrefix` skipped, the match returned inverted, the no-match result inverted, the list scanned as empty), plus
-`isAllowed` reading the exempt list instead of `allow`. 9/9 killed on the first run (2 as hangs: an inverted result
-that never refuses a connection), 0 equivalent, 0 survivors; the earlier whole-module run (440/455) is unchanged for
-the code this wave did not touch.
+Run `scripts/modtest abuseguard` (loopback tests skip where binding is unavailable). The tests are offline and
+deterministic (injected clock) except the loopback integrations and the thread races:
 
-Audit 2026-10-23: Sonnet review (11 findings) + 57 schemata mutants over admit/close, reconcile,
-strike decay and escalation, TTL growth, ban/unban/unbanAll, prefix bans, the three-list store,
-snapshot/restore and the middleware's XFF choice — 57/57 killed after two tests were added (two XFF
-headers; two greylists on one key). Fixed from the review: eviction was O(`max_tracked_ips`) under
-the lock once the store was full of live entries (now three LRU lists, O(1)); `ban`/`greylist`
-dropped the ban silently on a full store (now `error.StoreFull`); an overfull `restore` evicted the
-newest bans first (now applied last to first); `init`'s option checks were debug-only asserts (now a
-panic in every mode); dry run's events still enforce through a firewall-mirroring hook (documented
-on `Options.dry_run`). Not changed, with reason → Backlog.
+- **Admission and store:** per-key and global caps through the `onConnect`/`onConnState` hook pair, every
+  verdict, dry run (each verdict, store-full to untracked), LRU eviction (live entries pinned, banned last,
+  empty-entry sweep), v4-mapped unification, fail-closed OOM, counter saturation at `maxInt(u32)`, `reconcile`,
+  `per_ip_cap_exempt`, `Options` range guards (`InvalidOptions`), an 8-thread admission race and an
+  exact-threshold concurrent `record` race.
+- **Reputation:** ban/greylist with TTL expiry, strike accumulation, exact decay, escalation to a ban,
+  greylist growth and its ceiling, `unban`/`unbanAll`, allowlist (v4 member, v4-mapped match, `default_deny`,
+  reputation exempt, caps not exempt), prefix keying and `banPrefix`/`unbanPrefix` (bound, idempotent, no entry
+  created, no untracked bypass).
+- **Events:** delivery after unlock (a re-entering hook), `.evicted`, exact order.
+- **Persistence:** snapshot to text to `parseSnapshotLine` to `restore` into a fresh Guard (same peers refused,
+  greylist expiry at the exact instant, rounded up), every malformed line, invalid-record and bound case,
+  `StoreFull` on `restore`.
+- **Middleware:** goldens over the socket-free `http.Server.serveStream` (4xx/429 weights, the exact 400..499
+  range, zero-weight opt-out, forwarded-IP and trusted-proxy keying).
+- **Loopback integrations:** concurrent keep-alive connections with the next one refused at accept, close then
+  re-admit, manual ban/unban, greylist TTL re-admit, record-driven escalation; the router auto-strike
+  middleware escalating a 404 path scanner to accept-time rejection; a socket parked on an unfinished request
+  header holding its per-IP slot (the shape of the nginx `limit_conn` probe).
+- **Model-fuzz:** the seeded test described under *Anchoring*, over the whole public API.
+- **Oracle:** `tools/nginx_probe/run.sh` runs Ubuntu's nginx as a black box and produces the evidence on the
+  card's `**Ahead:**` line (see `tools/README.md`).
+- **Fuzz:** none under check-fuzz (the card's `**Hardening:**` line); the model-fuzz is an ordinary seeded test.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
-**Mutation + review (2026-11-12, whole module,** `root.zig` production code incl. every `clock.now()` read at 0 and at maxInt, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 455 mutants, 440 killed (25 by timeout, 5 by abort), 15 equivalent, 0 undecided, no defect. Counters saturate and are guarded, pending events never exceed two per operation, the offense/TTL growth loop is bounded, the snapshot parser and `restore` validate before applying. New tests: `restore` answers `StoreFull` for a greylist the full store cannot track, as for a ban; the middleware's 4xx range is exactly 400..499 (399 never strikes, 499 does). Equivalent (re-checked on the current source): `-|=` on `total_conns` under total == Σ active + untracked (three sites), reconcile at `live == active_conns`, the decay-0 strike mark, `keyBits` without unmap, a fresh entry's mark, `entryIsEmpty` on the idle list (settle invariant), the decay-0 `decayedStrikes` shortcut, the `bits >= 96` and `.v6` guards in `canonicalPrefix`, an empty ms token (`parseInt` refuses it), the middleware's `weight == 0` return (`record` has the same guard), the `X-Real-IP` trim (`http.h1` already trims OWS; the XFF per-element trim is not dead and is killed). Cut: the hook-without-context `@panic`s, asserts, OOM propagation, trivial wrappers.
+## What is deliberately not done
 
-**Mutation (2026-11-07, whole module,** `root.zig` production code, schemata in a detached copy, ReleaseSafe, strict verdict): 377 mutants, 362 killed, 15 equivalent, 0 undecided; no finding in the admission logic (total/per-IP caps, default_deny/allow precedence, prefix bans incl. IPv4-mapped IPv6, store_full `.reject`/`.admit_untracked`, dry run, counter underflow and reconcile, strike decay and escalation, greylist TTL growth, snapshot/restore, eviction never taking a live entry, `forwarded_ip_trusted`). The earlier 61-mutant run was thin: the first run left 47 alive, closed by 13 tests (clock units, `init` range guards and boundaries, documented `Options` defaults pinned, an older clock reading than an entry's marks, a failing `map.put`, snapshot order, restore prefix length and banned-list placement, saturating offense/TTL growth, a 400 strikes and a 500 does not, rightmost of three XFF elements, cap rejections at the hook, `_` in a snapshot ms count). Equivalent: clock_gettime(MONOTONIC) on a valid pointer (3), `-|=` on `total_conns` under total == Σ active + untracked (93, 100, 104), reconcile at `live == active_conns` (101), the decay-0 strike mark (116, 304), keyBits without unmap (callers pass unmapped, 254), a fresh entry's mark (284), `entryIsEmpty` on the idle tail (297, 298), the `bits >= 96` guard implied by `masked()` (316), an empty ms token (335), `record(ip, 0)` (352), a second OWS trim (365). **API change from the run:** the nine `init` range guards panicked — consumer-reachable — and are now `error.InvalidOptions`, pinned by an `expectError` test. Cut: the hook-without-ctx `@panic`s (same trap as `ctx.?`), asserts, trivial wrappers, OOM propagation of `try append`.
+- **Shared reputation across processes or nodes; country or ASN lists** — fail2ban (the reference) is per host
+  as well, and a shared blocklist is CrowdSec's ecosystem, not a library feature. `on_event` is the seam for
+  feeding one; geo lists need a GeoIP database this module should not own, and `banPrefix` takes the ranges
+  such a list yields.
+- **fail2ban `bantime.rndtime`** — the greylist is per key and accept-time; a jitter adds nothing a caller
+  cannot add in the event hook.
+- **Log parsing (filters/failregex)** — the app calls `record` instead, by design.
+- **nginx `limit_conn_status` / `log_level`** — a reject is a TCP drop with no status; logging is the event
+  hook's job.
+- **An init assertion for `max_conns_total = null` with `.admit_untracked`** — a deployment may run exactly
+  that on purpose; an assert would turn it into a crash.
 
 ## Backlog / deferred
-- ~~**Trusted-proxy key**~~ **DONE 2026-11-05**: `MiddlewareKey.forwarded_ip_trusted: ratelimit.TrustedProxies` delegates to `ratelimit.clientIp` (abuseguard now depends on `ratelimit`). *(2026-10-31, follow-up of ratelimit's `forwarded_ip_trusted`)* — the
-  middleware's `.forwarded_ip` key mirrors `ratelimit.clientKey` and trusts `X-Forwarded-For`
-  from any peer, so a deployment reachable both through its proxy and directly lets a direct
-  client choose its strike bucket. ratelimit now has `TrustedProxies` + `clientIp` (headers only
-  from a trusted peer, walked past trusted hops). Ideal: `.forwarded_ip_trusted: TrustedProxies`
-  here with the same semantics — shared code would need the type in `http` or `netaddr`, since
-  abuseguard does not depend on ratelimit.
-- **No-panic sweep 2026-10-28:** nothing data-reachable; fixed `admit` overflow after `reconcile(ip, maxInt(u32))` with no per-IP cap (AG-2) and a checked panic for a hook wired without its context (AG-1). ✅ DONE 2026-10-28 (AG-2 test "reconcile to maxInt(u32) with no per-IP cap", modules/abuseguard/src/root.zig:1768, commit 9f657f2e6).
-- ~~Fail-closed store as a lockout~~ — **done 2026-09-29**: `Options.on_store_full =
-  .admit_untracked` (the web-server consumer research register H5). No init assertion when `max_conns_total` is null
-  with `.admit_untracked` — **rejected 2026-10-04**: the web-server consumer's default runs exactly that way on
-  purpose (documented in its config, H5), so an assert would turn a deliberate deployment
-  choice into a crash; the check stays the consumer's configuration validation.
-- Otherwise none found beyond the pre-public security/similarity review pass (repo-wide, not
-  abuseguard-specific).
-- **Review 2026-10-23, kept as designed:** (a) bans are evicted as a last resort, so an attacker
-  holding `max_tracked_ips` live sockets from rotating keys can make the guard forget the oldest
-  bans (each one an `.evicted` event) — the alternative, never evicting bans, turns a store full
-  of bans into a permanent `store_full`; `banPrefix` holds an operator's range bans outside the
-  store. (b) An untracked close can take a tracked slot of the same address (documented on
-  `connClosed`; the server hook cannot know the verdict). (c) The clock is read before the lock,
-  so a racing thread can apply a timestamp a few ns older than an entry's mark; saturating
-  arithmetic keeps it harmless. (d) `snapshot`/`restore`/`unbanAll` are O(n) under the spinlock
-  (documented: start-up/shutdown/operator calls).
 
-- ~~**Allowlist (fail2ban `ignoreip`) with CIDR**~~ — **done 2026-10-04** (`Options.allow`). Was: (survey 2026-09-30) — nothing exempts a health checker, an office range or a peer proxy; one burst of 4xx from it and it is greylisted or banned. The first thing any fail2ban user configures. Effort: small (`netaddr.Prefix.contains`, like `ratelimit`'s `ConnectionLimiter`). Fits §2: yes.
-- ~~**CIDR / IPv6-/64 ban and greylist**~~ — **done 2026-10-04** (`ipv6_key_bits`/`ipv4_key_bits`, `banPrefix`). Was: (survey 2026-09-30) — v6 attackers rotate addresses inside a /64 (the module's own doc notes 65 536 keys per free /48); reputation is per single address. Effort: small-medium. Fits §2: yes.
-- ~~**Growing greylists, ban events, unban-all, dry run**~~ — **done 2026-10-11** (`greylist_ttl_growth`/`greylist_ttl_max_ms`, `on_event`/`Event`, `unbanAll`, `dry_run`). Was: the 2026-10-11 parity pass against fail2ban (`bantime.increment`, actions, `unban --all`) and nginx (`limit_conn_dry_run`).
-- **Shared reputation across processes / nodes; country or ASN lists** — not planned: fail2ban (the reference) is per host as well, and a shared blocklist is CrowdSec's ecosystem, not a library feature. The `on_event` hook is the seam for feeding one. Geo lists need a GeoIP database this module should not own; `banPrefix` takes the ranges such a list yields.
-- ~~**Persist / restore bans**~~ — **done 2026-10-04** (`snapshot`/`restore`/`writeSnapshot`/`parseSnapshotLine`). Was: (survey 2026-09-30) — a restart clears every ban; fail2ban keeps a ban DB. Effort: small (export/import of the ban list, caller stores it). Fits §2: yes.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **DONE 2026-11-15 — per-IP connection-cap exemption (`Options.per_ip_cap_exempt`).** Members skip only the `per_ip_cap` check (`admitLocked`); they stay counted in `total_conns` / `max_conns_total` and in their entry's live count, and every reputation path is unchanged — it did not exempt the strike/ban path (that is `allow`). Shares `inPrefixes` with `allow`. Was: **Per-IP connection-cap exemption (consumer request 2026-11-15; effort S).** `Options.allow` lifts reputation only ("resource caps still apply", `src/root.zig` Options.allow, `per_ip_cap` deny at the `active_conns >= max` check), so a loopback or otherwise trusted reverse proxy that carries every client is held to `max_conns_per_ip`; a consumer has to bypass the guard for that peer and keep its own global cap. Expected: nginx `limit_conn` with `geo`/`map` exemptions, HAProxy ACL-exempted `sc_conn_cur`; a proxy in front is the common deployment. Proposed: `Options.per_ip_cap_exempt: []const netaddr.Prefix = &.{}` (borrowed, linear scan like `allow`); members skip only the `per_ip_cap` check and stay counted against `max_conns_total`. Decide whether it should also exempt the strike/ban path (no: that is `allow`).
-
-## Status
-`gap · posix · server · threadsafe` + deps `http`, `netaddr`, `router` — canonical source is
-`pub const meta` in src/root.zig.
+None open.
 
 ## Anchoring
 
@@ -212,6 +209,6 @@ on `Options.dry_run`). Not changed, with reason → Backlog.
 - **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
-**Model-fuzz test.** `test "model-fuzz: Guard == naive per-key reference model (300 seeds, injected clock)"` (src/root.zig, `agCase`) drives the public `Guard` API with 300 seeded `DefaultPrng` sequences of 100-350 operations over 10 peer addresses (plain v4, v4-mapped, two /64s) and a random configuration (per-key and total caps, tracked-store size 1..4096 with both `on_store_full` policies, threshold, decay, greylist TTL, offense escalation, allowlist, key widths, prefix-ban bound). The reference model (`AgModel`) is an ordered array of per-key records (front = most recently touched) with integer strikes and absolute-nanosecond deadlines, a linear range-ban list and a linear allowlist; addresses are re-implemented as (family, 16 bytes) with a bit-loop mask, and `total_conns` is recomputed as the sum of live counts plus untracked. Each step compares the `admit` verdict, `unbanPrefix`/`banPrefix` results, and afterwards `connCount`, `isBanned`, `isGreylisted`, `totalConns`, `untrackedConns` and `trackedCount` for every peer; a periodic check compares `snapshot()` as a multiset with the model, checks `writeSnapshot` -> `parseSnapshotLine` is the identity and that `restore` into a fresh Guard reproduces every ban and live greylist. Time advances aim exactly at greylist deadlines, strike-drain boundaries and one nanosecond either side. Reach classes (each must occur at least once, else the test fails): all seven `AdmitVerdict`s, ban by entry and by range, allowlist overriding a stored verdict, deadline-boundary advances, strike decay, offense greylist and ban escalation, LRU eviction (also of a banned entry as last resort) and empty-entry sweep, `unban` dropping an entry, `TooManyPrefixBans`, `unbanPrefix` true/false, untracked-close fallback, unmatched close, `reconcile`, snapshot and restore round trips. Negative control (2026-10-11): `admit`'s greylist test `now_ns < e.greylisted_until_ns` changed to `<=` makes this test fail (seed 188041832615937, step 92) as well as several hand-written ones; reverted. Not modelled: allocator failure, concurrency (covered by the existing race tests), the http middleware.
+**Model-fuzz test.** `test "model-fuzz: Guard == naive per-key reference model (300 seeds, injected clock)"` (src/root.zig, `agCase`) drives the public `Guard` API with 300 seeded `DefaultPrng` sequences of 100-350 operations over 10 peer addresses (plain v4, v4-mapped, two /64s) and a random configuration (per-key and total caps, tracked-store size 1..4096 with both `on_store_full` policies, threshold, decay, greylist TTL, offense escalation, allowlist, key widths, prefix-ban bound). The reference model (`AgModel`) is an ordered array of per-key records (front = most recently touched) with integer strikes and absolute-nanosecond deadlines, a linear range-ban list and a linear allowlist; addresses are re-implemented as (family, 16 bytes) with a bit-loop mask, and `total_conns` is recomputed as the sum of live counts plus untracked. Each step compares the `admit` verdict, `unbanPrefix`/`banPrefix` results, and afterwards `connCount`, `isBanned`, `isGreylisted`, `totalConns`, `untrackedConns` and `trackedCount` for every peer; a periodic check compares `snapshot()` as a multiset with the model, checks `writeSnapshot` -> `parseSnapshotLine` is the identity and that `restore` into a fresh Guard reproduces every ban and live greylist. Time advances aim exactly at greylist deadlines, strike-drain boundaries and one nanosecond either side. Reach classes (each must occur at least once, else the test fails): all seven `AdmitVerdict`s, ban by entry and by range, allowlist overriding a stored verdict, deadline-boundary advances, strike decay, offense greylist and ban escalation, LRU eviction (also of a banned entry as last resort) and empty-entry sweep, `unban` dropping an entry, `TooManyPrefixBans`, `unbanPrefix` true/false, untracked-close fallback, unmatched close, `reconcile`, snapshot and restore round trips. Not modelled: allocator failure, concurrency (covered by the existing race tests), the http middleware.
 
 **What the tests actually contain.** internal rate-limit/gate store; nginx/fail2ban are design refs only, no wire format

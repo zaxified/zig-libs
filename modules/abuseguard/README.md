@@ -16,7 +16,8 @@ nothing (the server's documented `on_connect` posture; no polite 503).
   std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only) — this is the std `SmpAllocator`
   pattern, same as `ratelimit`).
 - **Deps:** `http` (the Phase-2.1 server hooks), `netaddr` (IP keying),
-  `router` (the optional auto-strike middleware).
+  `router` (the optional auto-strike middleware), `ratelimit` (the trusted-proxy
+  client address), `clock` (the default monotonic clock).
 
 Provenance: original work of the zig-libs authors (MIT) — no third-party code. Design
 references: nginx `limit_conn` (BSD-2-Clause; documented behavior only) and
@@ -183,8 +184,9 @@ var guard2: abuseguard.Guard = .init(gpa, .{ .on_event = .{ .run = Fw.run } });
 - **Persistence:** `snapshot` returns the bans, range bans and live
   greylists (remaining time rounded up); strikes and offense counts are not
   kept. `restore` puts a key-width record back as a key ban/greylist and a
-  ban of another width as a range ban; a greylist of another width is
-  `InvalidRecord`. The text codec is one line per record, `#` comments and
+  ban of another width as a range ban; a greylist lands on the key covering
+  its prefix and is skipped when the prefix is wider than a key. `InvalidRecord`
+  means a malformed record only. The text codec is one line per record, `#` comments and
   blank lines ignored on read.
 - **Bounded store (the store must not be an abuse vector itself):** at most
   `max_tracked_ips` entries. Fully-lapsed entries (no live connections, no
