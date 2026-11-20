@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for filestore (wave GW). No finding required a code
 //! change; these pin the "clean" verdicts of
-//! the 2026-10-29 no-panic sweep of `filestore` against hostile files
+//! the no-panic sweep of `filestore` against hostile files
 //! under `base`.
 const std = @import("std");
 const t = std.testing;

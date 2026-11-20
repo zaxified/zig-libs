@@ -15,7 +15,7 @@
 //! The temp is `fsync`ed BEFORE the rename and the directory `fsync`ed
 //! after it, so a `putBytes` that returned survives a power loss — without
 //! those two, temp-then-rename buys tear avoidance only, and this module
-//! issued neither until 2026-09-03 while calling itself durable (measured
+//! issued neither previously while calling itself durable (measured
 //! on its own example with `strace`: 5 renames, 0 fsyncs; now 5 and 10).
 //!
 //! **Path safety.** `kind` and `key` are each validated by `segmentSafe`
@@ -415,7 +415,7 @@ pub const Store = struct {
         const path = try self.recordPath(&pbuf, kind, key);
         // A directory, symlink, FIFO … is not a record: a moved directory
         // would become a key `list` hides and `getBytes` refuses, a moved
-        // symlink could dangle (review 2026-11-01).
+        // symlink could dangle (review).
         const st = try src_dir.statFile(self.io, src_path, .{ .follow_symlinks = false });
         if (st.kind != .file) return error.NotAFile;
         if (opts.move) moved: {
@@ -478,7 +478,7 @@ pub const Store = struct {
         };
         errdefer f.close(self.io);
         // A directory at a record path is not a record: `error.IsDir`, the
-        // same answer `getBytes` gives (review 2026-11-01).
+        // same answer `getBytes` gives (review).
         if ((try f.stat(self.io)).kind == .directory) return error.IsDir;
         return f;
     }
@@ -539,7 +539,7 @@ pub const Store = struct {
     ///
     /// Durable, same as `putBytes`: the directory is `fsync`ed after the
     /// `unlinkat`(s), so a `delete` that returned survives a power loss too.
-    /// Before 2026-09-10 this synced nothing — `putBytes`' 2026-09-03 fsync
+    /// Before this synced nothing — `putBytes`' fsync
     /// fix covered the write path only, and a deleted record could come back
     /// after a crash (measured: 20 `delete`s -> 40 `unlinkat`, 0 `fsync`).
     pub fn delete(self: Store, kind: []const u8, key: []const u8) !bool {
@@ -557,7 +557,7 @@ pub const Store = struct {
         const dir = try self.kindDir(&dbuf, kind);
         // A kind that was never created has nothing to delete and nothing to
         // sync: `false`, not the directory open's `FileNotFound` (sweep GW
-        // backlog; found again by the model fuzz harness 2026-11-01).
+        // backlog; found again by the model fuzz harness).
         self.syncDir(dir) catch |e| switch (e) {
             error.FileNotFound => if (!existed) return false else return e,
             else => return e,
@@ -617,7 +617,7 @@ pub const Store = struct {
     /// A key is `lockKey`'d only once it looks like a candidate (an
     /// unlocked `isExpired` pre-check says so) — a `sweep` over keys with no
     /// TTL, or a live one, creates no `.lock` file for them at all. Before
-    /// 2026-09-10 every listed key got a lock file up front regardless, so a
+    /// every listed key got a lock file up front regardless, so a
     /// `sweep` that reaped nothing still left one `.lock` per key behind
     /// forever (nothing ever cleans a held-then-released lock file — see
     /// `lockKey`'s doc comment). The deadline is still re-checked *after*
@@ -675,7 +675,7 @@ pub const Store = struct {
     /// A corrupt `.expiry` sidecar (truncated, non-numeric, overflowing —
     /// anything `readExpiry`'s `parseInt` rejects) is treated as "no TTL",
     /// the same as a missing sidecar, rather than propagating the parse
-    /// error up through `getBytes`. Before 2026-09-10 it did the latter: one
+    /// error up through `getBytes`. Before it did the latter: one
     /// bad byte in the *sidecar* made an otherwise-healthy record
     /// unreadable through `getBytes`/`get`/`listTyped`, an error neither
     /// `Error` nor `getBytes`' doc comment ever named — and it was
@@ -1011,7 +1011,7 @@ pub const AtomicWriteOptions = struct {
 /// name pointing at blocks that were never written; without an `fsync` of
 /// the DIRECTORY after it, the rename itself is not durable, so a write that
 /// RETURNED can be missing after a power loss. This module issued neither
-/// until 2026-09-03 while calling itself durable (measured with `strace` on
+/// previously while calling itself durable (measured with `strace` on
 /// its own example: 5 renames, 0 fsyncs).
 ///
 /// `error.InvalidName`: the last component is empty, `.` or `..`.
@@ -1085,7 +1085,7 @@ fn nextUniq(buf: []u8) []const u8 {
 ///
 /// PID + process-local counter: makes the temp name unique across processes
 /// too, not only within one — see the F2 disposition in the audit record.
-/// Before 2026-09-10 this was the counter alone, and every process's atomic
+/// Before this was the counter alone, and every process's atomic
 /// starts at 0: two processes `putBytes`ing the same key concurrently
 /// produced identical `.rec-0.part` / `.rec-1.part` / ... temp paths, so the
 /// loser's `rename` target was already gone (`error.FileNotFound`) instead
@@ -1754,7 +1754,7 @@ test "ttl=false: getBytes never opens the .expiry sidecar (observable via a corr
     try store.putBytes("sessions", "s1", "alive");
 
     // Write a sidecar directly (bypassing putWithTTL) as a DIRECTORY, not a
-    // file — not a merely non-numeric string, because F6 (2026-09-10) made a
+    // file — not a merely non-numeric string, because F6 made a
     // corrupt-but-parseable-shape sidecar (non-numeric text, overflow, …)
     // tolerated as "no TTL" rather than erroring (see the F6 test below), so
     // that shape no longer distinguishes "opened and tolerated" from "never
@@ -2068,7 +2068,7 @@ test "casPutBytes actually blocks on a lock held by another thread (real cross-h
     try t.expectEqualStrings("cas-write", got);
 }
 
-// ── A1 fix campaign, 2026-09-10 ─────────────────────────────────────────
+// ── A1 fix campaign, ─────────────────────────────────────────
 
 test "F1: delete durably syncs the directory, not just unlinkat — putBytes still syncs its own dir too" {
     // `test_sync_dir_calls` is a single process-wide counter shared by every
@@ -2087,7 +2087,7 @@ test "F1: delete durably syncs the directory, not just unlinkat — putBytes sti
 
     const before_delete = test_sync_dir_calls.load(.monotonic);
     try t.expect(try store.delete("devices", "dev-1"));
-    // RED before the 2026-09-10 fix: this delta was 0 (delete never called
+    // RED before the fix: this delta was 0 (delete never called
     // syncDir at all — measured externally via strace as 40 unlinkat, 0
     // fsync across 20 deletes). GREEN now: exactly 1, same shape as putBytes.
     try t.expectEqual(@as(u32, 1), test_sync_dir_calls.load(.monotonic) - before_delete);
@@ -2198,7 +2198,7 @@ test "F4: crash between putWithTTL's two writes is fail-closed (no record), not 
     // exactly the state a real crash would leave on disk, without needing
     // to actually kill the process mid-call.
     //
-    // New (fixed) order: sidecar first. A crash after only the sidecar
+    // New order: sidecar first. A crash after only the sidecar
     // write leaves no record at all.
     try store.writeExpiryAt("sessions", "crash-key", clk.now_ns +| 500);
     try t.expect((try store.getBytes(gpa, "sessions", "crash-key")) == null);
@@ -2308,7 +2308,7 @@ test "F6: a corrupt .expiry sidecar is treated as no-TTL, not propagated as a re
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

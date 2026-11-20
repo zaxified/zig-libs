@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Model-based fuzz harness for `Store` (added 2026-11-01): random sequences
+//! Model-based fuzz harness for `Store`: random sequences
 //! of every public operation on one store, each answer compared with an
 //! in-memory model of what the store must hold — record bytes per key, the
 //! `.expiry` deadline per key, a manual clock. The model encodes the
