@@ -108,7 +108,29 @@ pub const FilterTarget = struct {
     eth_type: u16 = filter.ETH_P.ALL,
     /// The filter handle (`handle 800::800`); `unspec` lets the kernel pick.
     handle: Handle = Handle.unspec,
+    /// `chain N` — the filter chain (`TCA_CHAIN`); null is chain 0, which `tc`
+    /// sends as no attribute at all.
+    chain: ?u32 = null,
 };
+
+/// Which chain a chain request addresses (`tc chain add|del|get`).
+pub const ChainTarget = struct {
+    ifindex: u32,
+    /// The attach point (`ingress`, `clsact`'s `Handle.ingress`, a block …).
+    parent: Handle,
+    chain: u32,
+};
+
+/// The template a chain is created with (`tc chain add … protocol ip flower
+/// ip_proto tcp`): which keys every filter of the chain must use.
+pub const ChainTemplate = struct {
+    eth_type: u16 = filter.ETH_P.ALL,
+    spec: filter.FilterSpec,
+};
+
+pub const RTM_NEWCHAIN: u16 = 100;
+pub const RTM_DELCHAIN: u16 = 101;
+pub const RTM_GETCHAIN: u16 = 102;
 
 // ── primitives ──────────────────────────────────────────────────────────────
 
@@ -280,10 +302,72 @@ pub fn buildFilterSetWith(
     const hdr = try codec.appendHeader(gpa, &list, RTM_NEWTFILTER, op.flags(), seq, 0);
     const info = filter.makeInfo(target.prio, target.eth_type);
     try appendTcmsg(gpa, &list, target.ifindex, target.handle, target.parent, info);
+    if (target.chain) |c| try codec.appendAttrU32(gpa, &list, qdisc.TCA.CHAIN, c);
     try appendKind(gpa, &list, spec.kind());
     const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
     try spec.appendOptionsWith(gpa, &list, ps);
     codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build an `RTM_NEWCHAIN` request (`tc chain add dev X ingress chain N
+/// [protocol P TEMPLATE]`). The optional template pins which keys the
+/// chain's filters may use.
+pub fn buildChainAdd(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    target: ChainTarget,
+    template: ?ChainTemplate,
+    ps: Psched,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, RTM_NEWCHAIN, Create.add.flags(), seq, 0);
+    const info = if (template) |t| filter.makeInfo(0, t.eth_type) else 0;
+    try appendTcmsg(gpa, &list, target.ifindex, Handle.unspec, target.parent, info);
+    try codec.appendAttrU32(gpa, &list, qdisc.TCA.CHAIN, target.chain);
+    if (template) |t| {
+        try appendKind(gpa, &list, t.spec.kind());
+        const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
+        try t.spec.appendOptionsWith(gpa, &list, ps);
+        codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
+    }
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build an `RTM_DELCHAIN` request (`tc chain del dev X ingress chain N`).
+pub fn buildChainDel(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    target: ChainTarget,
+) std.mem.Allocator.Error![]u8 {
+    return buildChainRef(gpa, seq, RTM_DELCHAIN, codec.NLM_F_REQUEST | codec.NLM_F_ACK, target);
+}
+
+/// Build an `RTM_GETCHAIN` request for one chain (`tc chain get dev X ingress
+/// chain N`): `NLM_F_REQUEST | NLM_F_ECHO`, answered by one `RTM_NEWCHAIN`.
+pub fn buildChainGet(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    target: ChainTarget,
+) std.mem.Allocator.Error![]u8 {
+    return buildChainRef(gpa, seq, RTM_GETCHAIN, codec.NLM_F_REQUEST | codec.NLM_F_ECHO, target);
+}
+
+fn buildChainRef(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    msg_type: u16,
+    flags: u16,
+    target: ChainTarget,
+) std.mem.Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, msg_type, flags, seq, 0);
+    try appendTcmsg(gpa, &list, target.ifindex, Handle.unspec, target.parent, 0);
+    try codec.appendAttrU32(gpa, &list, qdisc.TCA.CHAIN, target.chain);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -309,6 +393,7 @@ pub fn buildFilterDel(
     );
     const info = filter.makeInfo(target.prio, target.eth_type);
     try appendTcmsg(gpa, &list, target.ifindex, target.handle, target.parent, info);
+    if (target.chain) |c| try codec.appendAttrU32(gpa, &list, qdisc.TCA.CHAIN, c);
     if (kind) |k| try appendKind(gpa, &list, k);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);

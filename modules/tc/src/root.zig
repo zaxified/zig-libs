@@ -107,6 +107,8 @@ pub const qdisc = @import("qdisc.zig");
 pub const filter = @import("filter.zig");
 pub const action = @import("action.zig");
 pub const message = @import("message.zig");
+/// Notifications (`tc monitor`): `RTNLGRP_TC` socket and event decoder.
+pub const monitor = @import("monitor.zig");
 
 /// `major:minor` handle arithmetic (hexadecimal, like `tc`).
 pub const Handle = handle.Handle;
@@ -272,6 +274,8 @@ pub const parseActionList = action.parseActionList;
 
 /// Request construction (message types, targets, builders).
 pub const Create = message.Create;
+pub const ChainTarget = message.ChainTarget;
+pub const ChainTemplate = message.ChainTemplate;
 pub const QdiscTarget = message.QdiscTarget;
 pub const ClassTarget = message.ClassTarget;
 pub const FilterTarget = message.FilterTarget;
@@ -545,6 +549,28 @@ pub const Socket = struct {
         const req = try message.buildActionDel(self.gpa, seq, refs);
         defer self.gpa.free(req);
         return self.nl.requestAck(req, seq);
+    }
+
+    /// Create a chain (`tc chain add`), optionally with a template.
+    pub fn chainAdd(self: *Socket, target: message.ChainTarget, template: ?message.ChainTemplate) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildChainAdd(self.gpa, seq, target, template, self.psched);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Delete a chain (`tc chain del`).
+    pub fn chainDel(self: *Socket, target: message.ChainTarget) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildChainDel(self.gpa, seq, target);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// The chains at one attach point (`tc chain show`): one `Filter` per
+    /// chain with `chain` set (and the template's `kind` when it has one).
+    pub fn chains(self: *Socket, ifindex: u32, parent: Handle) DumpError![]Filter {
+        return self.dump(Filter, filter.parseFilter, message.RTM_GETCHAIN, message.RTM_NEWCHAIN, ifindex, parent, .exact);
     }
 
     /// Delete every shared-table action of one kind
@@ -1738,6 +1764,40 @@ test "integration (root, init userns): the shared action table (add, ls, get, de
         error.NotFound => {},
         else => return e,
     }
+}
+
+test "integration (netns/root): the monitor sees a qdisc being added and removed" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    var mon = monitor.Monitor.open(testing.allocator) catch return skip("tc monitor open");
+    defer mon.close();
+    mon.nl.setRecvTimeout(2000) catch return skip("tc monitor timeout");
+    const lo = try loIndex(&sock);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(6, 0), .parent = Handle.root },
+        .{ .tbf = .{ .rate = 125_000, .burst = 4096, .latency_us = 400_000 } },
+    ) catch |e| switch (e) {
+        error.AccessDenied => return skip("tc monitor qdisc add"),
+        else => return e,
+    };
+    defer sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+
+    var seen = false;
+    var rounds: usize = 0;
+    while (!seen and rounds < 8) : (rounds += 1) {
+        var events = try mon.recv();
+        while (try events.next()) |ev| {
+            switch (ev.body) {
+                .qdisc => |q| if (ev.added and std.mem.eql(u8, q.kind(), "tbf")) {
+                    seen = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try testing.expect(seen);
 }
 
 test "integration (netns/root): tbf shaping qdisc round-trip" {

@@ -1740,6 +1740,9 @@ pub const Filter = struct {
     /// entries (`act_list.total` reports the true count). Reach it through
     /// `actions()`.
     act_list: ActionList = .{},
+    /// `TCA_CHAIN` — the chain the filter (or the chain template) lives in;
+    /// null on chain 0, where the kernel sends none.
+    chain: ?u32 = null,
 
     pub fn kind(f: *const Filter) []const u8 {
         return f.kind_buf[0..f.kind_len];
@@ -1785,6 +1788,7 @@ pub fn parseFilter(payload: []const u8) codec.Error!Filter {
             f.kind_len = @intCast(s.len);
         },
         TCA.OPTIONS => options_data = a.data,
+        TCA.CHAIN => f.chain = readScalar(u32, a.data, native_endian),
         else => {},
     };
     if (options_data) |opt| {

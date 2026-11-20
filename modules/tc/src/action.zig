@@ -228,6 +228,12 @@ pub const tcamsg_len = 4;
 
 // ── verdicts ────────────────────────────────────────────────────────────────
 
+/// `TC_ACT_JUMP` and `TC_ACT_GOTO_CHAIN`: the opcode bits of the composite
+/// verdicts, and `TC_ACT_EXT_VAL_MASK`, the bits that carry their operand.
+pub const tc_act_jump: u32 = 0x10000000;
+pub const tc_act_goto_chain: u32 = 0x20000000;
+pub const tc_act_ext_val_mask: u32 = 0x0fffffff;
+
 /// `TC_ACT_*` — what an action returns to the classifier that ran it.
 ///
 /// * `.ok` / `.shot` — accept / drop the packet, ending the list.
@@ -255,6 +261,32 @@ pub const Verdict = enum(i32) {
 
     pub fn raw(v: Verdict) i32 {
         return @backingInt(v);
+    }
+
+    /// `TC_ACT_GOTO_CHAIN | chain` — `tc … action goto chain N`: continue
+    /// classification in chain `chain` (a 28-bit index; higher bits are
+    /// dropped).
+    pub fn gotoChain(chain: u32) Verdict {
+        return fromRaw(@bitCast(tc_act_goto_chain | (chain & tc_act_ext_val_mask)));
+    }
+
+    /// `TC_ACT_JUMP | count` — `tc … action jump N`: skip `count` actions.
+    pub fn jump(count: u32) Verdict {
+        return fromRaw(@bitCast(tc_act_jump | (count & tc_act_ext_val_mask)));
+    }
+
+    /// The chain a `gotoChain` verdict names, or null for any other verdict.
+    pub fn chainIndex(v: Verdict) ?u32 {
+        const r: u32 = @bitCast(v.raw());
+        if (r & ~tc_act_ext_val_mask != tc_act_goto_chain) return null;
+        return r & tc_act_ext_val_mask;
+    }
+
+    /// The count of a `jump` verdict, or null for any other verdict.
+    pub fn jumpCount(v: Verdict) ?u32 {
+        const r: u32 = @bitCast(v.raw());
+        if (r & ~tc_act_ext_val_mask != tc_act_jump) return null;
+        return r & tc_act_ext_val_mask;
     }
 
     pub fn fromRaw(v: i32) Verdict {

@@ -4960,3 +4960,191 @@ const g_cls_cgroup_meta =
     "00000800030003000000300001002c0001000900010067616374000000001c000280180002000000000000000000020000" ++
     "000000000000000000";
 const seq_cls_cgroup_meta: u32 = 1795218795;
+
+// ── chains ──────────────────────────────────────────────────────────────────
+
+test "golden: gact goto chain and jump (composite verdicts)" {
+    // tc filter add dev lo parent 1: protocol ip prio 150 u32 match ip src 10.0.2.50/32 flowid 1:10 action goto chain 5
+    var a = try actionGolden(g_u32_gact_goto_chain, seq_u32_gact_goto_chain, 50, .{ .gact = .{
+        .action = action.Verdict.gotoChain(5),
+    } });
+    try testing.expectEqual(@as(i32, 0x20000005), a.gen.action.raw());
+    try testing.expectEqual(@as(?u32, 5), a.gen.action.chainIndex());
+    try testing.expectEqual(@as(?u32, null), a.gen.action.jumpCount());
+    // tc filter add dev lo parent 1: protocol ip prio 151 u32 match ip src 10.0.2.51/32 flowid 1:10 action jump 2
+    a = try actionGolden(g_u32_gact_jump, seq_u32_gact_jump, 51, .{ .gact = .{
+        .action = action.Verdict.jump(2),
+    } });
+    try testing.expectEqual(@as(?u32, 2), a.gen.action.jumpCount());
+    try testing.expectEqual(@as(?u32, null), a.gen.action.chainIndex());
+    // The plain verdicts are neither.
+    try testing.expectEqual(@as(?u32, null), action.Verdict.shot.chainIndex());
+    try testing.expectEqual(@as(?u32, null), action.Verdict.unspec.jumpCount());
+    // The operand is 28 bits wide.
+    try testing.expectEqual(@as(?u32, 0x0fffffff), action.Verdict.gotoChain(0xffffffff).chainIndex());
+}
+
+test "golden: a filter on a chain (TCA_CHAIN before the kind)" {
+    // tc filter add dev lo parent 1: protocol ip prio 5 chain 3 flower ip_proto tcp
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_chain_filter_add,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 5, .eth_type = ETH_P.IP, .chain = 3 },
+        .{ .flower = .{ .eth_type = ETH_P.IP, .ip_proto = IPPROTO.TCP } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_chain_filter_add, req);
+    const codec = @import("netlink").codec;
+    var it: codec.MessageIterator = .{ .buf = req };
+    const f = try filter.parseFilter((try it.next()).?.payload);
+    try testing.expectEqual(@as(?u32, 3), f.chain);
+    try testing.expectEqualStrings("flower", f.kind());
+    // tc filter del dev lo parent 1: protocol ip prio 5 chain 3
+    const del = try message.buildFilterDel(gpa, seq_chain_filter_del, .{
+        .ifindex = lo,
+        .parent = Handle.init(1, 0),
+        .prio = 5,
+        .eth_type = ETH_P.IP,
+        .chain = 3,
+    }, null);
+    defer gpa.free(del);
+    try expectGolden(g_chain_filter_del, del);
+}
+
+test "golden: tc chain add, del, get and show" {
+    const target: message.ChainTarget = .{ .ifindex = lo, .parent = Handle.init(1, 0), .chain = 5 };
+    // tc chain add dev lo parent 1: chain 5 protocol ip flower ip_proto tcp
+    const add_t = try message.buildChainAdd(gpa, seq_chain_add_template, target, .{
+        .eth_type = ETH_P.IP,
+        .spec = .{ .flower = .{ .eth_type = ETH_P.IP, .ip_proto = IPPROTO.TCP } },
+    }, ps);
+    defer gpa.free(add_t);
+    try expectGolden(g_chain_add_template, add_t);
+    // tc chain add dev lo parent 1: chain 5
+    const add = try message.buildChainAdd(gpa, seq_chain_add, target, null, ps);
+    defer gpa.free(add);
+    try expectGolden(g_chain_add, add);
+    // tc chain del dev lo parent 1: chain 5
+    const del = try message.buildChainDel(gpa, seq_chain_del, target);
+    defer gpa.free(del);
+    try expectGolden(g_chain_del, del);
+    // tc chain get dev lo parent 1: chain 5
+    const get = try message.buildChainGet(gpa, seq_chain_get, target);
+    defer gpa.free(get);
+    try expectGolden(g_chain_get, get);
+    // tc chain show dev lo parent 1:
+    const dump = try message.buildDump(gpa, seq_chain_dump, message.RTM_GETCHAIN, lo, Handle.init(1, 0));
+    defer gpa.free(dump);
+    try expectGolden(g_chain_dump, dump);
+    // The reply of a chain add decodes through parseFilter: chain, kind, template.
+    const codec = @import("netlink").codec;
+    var it: codec.MessageIterator = .{ .buf = add_t };
+    const f = try filter.parseFilter((try it.next()).?.payload);
+    try testing.expectEqual(@as(?u32, 5), f.chain);
+    try testing.expectEqual(@as(?u8, IPPROTO.TCP), f.flower.?.ip_proto);
+}
+
+// ── captured request bytes: chains ──────────────────────────────────────────
+
+// ### type=44 flags=0x605 seq=1795218943 len=84
+// tc filter add dev lo parent 1: protocol ip prio 5 chain 3 flower ip_proto tcp
+const g_chain_filter_add =
+    "540000002c000506ffdd006b00000000000000000100000000000000000001000800050008000b00030000000b00010066" ++
+    "6c6f77657200001c000200050009000600000008001600000000000600080008000000";
+const seq_chain_filter_add: u32 = 1795218943;
+
+// ### type=45 flags=0x5 seq=1795218943 len=44
+// tc filter del dev lo parent 1: protocol ip prio 5 chain 3
+const g_chain_filter_del =
+    "2c0000002d000500ffdd006b00000000000000000100000000000000000001000800050008000b0003000000";
+const seq_chain_filter_del: u32 = 1795218943;
+
+// ### type=100 flags=0x605 seq=1795218943 len=84
+// tc chain add dev lo parent 1: chain 5 protocol ip flower ip_proto tcp
+const g_chain_add_template =
+    "5400000064000506ffdd006b00000000000000000100000000000000000001000800000008000b00050000000b00010066" ++
+    "6c6f77657200001c000200050009000600000008001600000000000600080008000000";
+const seq_chain_add_template: u32 = 1795218943;
+
+// ### type=100 flags=0x605 seq=1795218943 len=44
+// tc chain add dev lo parent 1: chain 5
+const g_chain_add =
+    "2c00000064000506ffdd006b00000000000000000100000000000000000001000000000008000b0005000000";
+const seq_chain_add: u32 = 1795218943;
+
+// ### type=101 flags=0x5 seq=1795218943 len=44
+// tc chain del dev lo parent 1: chain 5
+const g_chain_del =
+    "2c00000065000500ffdd006b00000000000000000100000000000000000001000000000008000b0005000000";
+const seq_chain_del: u32 = 1795218943;
+
+// ### type=102 flags=0x9 seq=1795218943 len=44
+// tc chain get dev lo parent 1: chain 5
+const g_chain_get =
+    "2c00000066000900ffdd006b00000000000000000100000000000000000001000000000008000b0005000000";
+const seq_chain_get: u32 = 1795218943;
+
+// ### type=102 flags=0x301 seq=1795218943 len=36
+// tc chain show dev lo parent 1:
+const g_chain_dump =
+    "2400000066000103ffdd006b000000000000000001000000000000000000010000000000";
+const seq_chain_dump: u32 = 1795218943;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218958 len=140
+// tc filter add dev lo parent 1: protocol ip prio 150 u32 match ip src 10.0.2.50/32 flowid 1:10 action goto chain 5
+const g_u32_gact_goto_chain =
+    "8c0000002c0005060ede006b00000000000000000100000000000000000001000800960008000100753332006000020008" ++
+    "00010010000100300007002c0001000900010067616374000000001c000280180002000000000000000000050000200000" ++
+    "0000000000002400050001000100000000000000000000000000ffffffff0a0002320c00000000000000";
+const seq_u32_gact_goto_chain: u32 = 1795218958;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218958 len=140
+// tc filter add dev lo parent 1: protocol ip prio 151 u32 match ip src 10.0.2.51/32 flowid 1:10 action jump 2
+const g_u32_gact_jump =
+    "8c0000002c0005060ede006b00000000000000000100000000000000000001000800970008000100753332006000020008" ++
+    "00010010000100300007002c0001000900010067616374000000001c000280180002000000000000000000020000100000" ++
+    "0000000000002400050001000100000000000000000000000000ffffffff0a0002330c00000000000000";
+const seq_u32_gact_jump: u32 = 1795218958;
+
+// ── notifications ───────────────────────────────────────────────────────────
+
+test "monitor: a datagram of qdisc, filter, chain and action messages decodes into events" {
+    const monitor = @import("monitor.zig");
+    // The goldens are complete messages in the shape the kernel notifies with.
+    var buf: [8192]u8 = undefined;
+    var n: usize = 0;
+    inline for (.{ g_htb_qdisc_add, g_flower_filter_add, g_chain_add_template, g_chain_del, g_filter_del }) |hex| {
+        const bytes = try std.fmt.hexToBytes(buf[n..][0 .. hex.len / 2], hex);
+        n += bytes.len;
+    }
+    var it = monitor.EventIterator.init(buf[0..n]);
+    const q = (try it.next()).?;
+    try testing.expect(q.added);
+    try testing.expectEqualStrings("htb", q.body.qdisc.kind());
+    const f = (try it.next()).?;
+    try testing.expect(f.added);
+    try testing.expectEqualStrings("flower", f.body.filter.kind());
+    const c = (try it.next()).?;
+    try testing.expect(c.added);
+    try testing.expectEqual(@as(?u32, 5), c.body.chain.chain);
+    const cd = (try it.next()).?;
+    try testing.expect(!cd.added);
+    try testing.expectEqual(@as(?u32, 5), cd.body.chain.chain);
+    const fd = (try it.next()).?;
+    try testing.expect(!fd.added);
+    try testing.expect(fd.body == .filter);
+    try testing.expectEqual(@as(?monitor.Event, null), try it.next());
+}
+
+test "monitor: messages of other types are skipped" {
+    const monitor = @import("monitor.zig");
+    var buf: [128]u8 = undefined;
+    // An NLMSG_DONE-shaped 16-byte message and nothing else.
+    @memset(&buf, 0);
+    std.mem.writeInt(u32, buf[0..4], 16, native_endian);
+    std.mem.writeInt(u16, buf[4..6], 3, native_endian);
+    var it = monitor.EventIterator.init(buf[0..16]);
+    try testing.expectEqual(@as(?monitor.Event, null), try it.next());
+}
