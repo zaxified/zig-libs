@@ -61,7 +61,12 @@ allocator at all — fixed-size stack buffers). Nine files:
 - `inventory.zig` — `inv_vect` (+ the shared `inv`/`getdata`/`notfound` payload shape), the shared
   `getblocks`/`getheaders` block-locator shape, and `headers`.
 - `block.zig` — `tx`/`block`, reusing `bitcointx` directly (see "Reuse of `bitcointx`" below).
-- `housekeeping.zig` — `ping`/`pong`, `addr`/`getaddr`, `reject`.
+- `housekeeping.zig` — `ping`/`pong`, `addr`/`getaddr`, `reject`. `reject` (BIP61) is implemented but
+  deprecated: Bitcoin Core deprecated it in v0.18.0, disabled it by default in v0.19 and removed it in
+  v0.20.0 (github.com/bitcoin/bitcoin PR #15437) over the fingerprinting/bandwidth concerns BIP61
+  itself documents, so no mainline peer sends it today. It stays because the wire format is simple and
+  well specified and some non-Core implementations or very old peers may still emit it; a caller must
+  not expect one back from a modern Core node nor build handshake logic that waits on it.
 - `relay.zig` — the feature/relay-policy messages around the handshake: `sendheaders`, `wtxidrelay`,
   `sendaddrv2`, `mempool` (payload-less, checked by `expectEmpty`), `feefilter`, `sendcmpct`.
 
@@ -138,38 +143,6 @@ both layers of this defense target.
 header's declared `length` *before* that length is ever used to slice `bytes`, independent of (and
 prior to) the ordinary truncation check against `bytes.len`.
 
-### What's deliberately not implemented, and why
-
-- **`addrv2` (BIP155)** — a materially different, wider address format (variable-length network-ID
-  + address, for Tor v3/I2P/CJDNS peers) layered over `addr`'s role. Genuinely new surface, not a
-  small delta on `NetAddr`; deferred rather than half-built — **and a gap a crawler hits** (see
-  Compared with and Backlog). `sendaddrv2` itself is implemented (`relay.zig`).
-- ~~**`mempool`, `sendheaders`, `feefilter`**~~ — implemented 2026-09-30 in `relay.zig`, with
-  `wtxidrelay`, `sendaddrv2` and `sendcmpct`.
-- **BIP152 compact blocks** (`cmpctblock`/`getblocktxn`/`blocktxn`; `sendcmpct` is implemented) —
-  its own protocol extension (differential index encoding + SipHash short transaction IDs); Backlog.
-- **BIP157 compact-filter messages** — Backlog (the modern light-client protocol).
-- **BIP37 bloom filters** (`filterload`/`filteradd`/`filterclear`/`merkleblock`) — deliberately not
-  doing: Bitcoin Core has served them only with `-peerbloomfilters` (off by default) since v0.19
-  *(inferred)*, and BIP157 replaces them for light clients.
-- **`checkorder`/`submitorder`/`reply`** — "This message was used for IP Transactions. As IP
-  transactions have been deprecated, it is no longer used" (wiki, verbatim, for all three). Dead
-  since before this module's scope was drawn; never implemented.
-- **`alert`** — never implemented, and never will be: Bitcoin Core's alert system was retired after
-  a signature-forgery weakness was found in its trust model, and the signing key was deliberately
-  burned. There is no key left to verify an alert against, so a codec for it has nothing meaningful
-  to check.
-- **`reject` (BIP61)** — implemented (see `housekeeping.zig`), but flagged: Bitcoin Core deprecated
-  it in v0.18.0, disabled it by default in v0.19, and removed it entirely in v0.20.0 (2020,
-  github.com/bitcoin/bitcoin PR #15437) over the fingerprinting/bandwidth concerns BIP61 itself
-  documents. No mainline peer on the network today sends this message. It's implemented anyway
-  because the wire format is simple, well-specified, and some non-Core implementations or very old
-  peers may still emit it — but a caller of this module should not expect one back from a modern
-  Bitcoin Core node, and should not build handshake logic that waits on it.
-- **Legacy pre-BIP31 `ping`** (zero-length payload, no `pong` reply at all) — predates every
-  protocol version any peer on the network negotiates today; trivially representable as an empty
-  byte slice if ever needed, so it isn't given its own type.
-
 ### Connection-lifecycle concerns explicitly NOT this module's job
 
 (See README.md's "Scope: a codec, not a node" for the summary; this is the auditor-level detail.)
@@ -183,62 +156,60 @@ bytes, get a typed value or a typed error, with no memory of any previous call.
 
 ## Verification
 
-- **Envelope** — `envelope.zig`'s tests decode the Bitcoin wiki's own published `verack` hex dump
-  and the modern-(60002)-`version` hex dump's envelope (magic/command/length/checksum) byte-exact,
-  both fetched directly from en.bitcoin.it/wiki/Protocol_documentation (not hand-transcribed from
-  memory) — plus an in-house cross-check that `sha256d("")`'s first 4 bytes really do equal the
-  wiki's published `verack` checksum, not just "this module agrees with itself".
-- **`version`** — `handshake.zig`'s `decodeVersion` test reproduces the wiki's field-by-field
-  breakdown of the same modern-(60002) example (`version`/`services`/`timestamp`/both `net_addr`
-  fields/`nonce`/`user_agent`/`start_height`) byte-exact, then re-serializes and checks the result
-  matches the original payload bytes exactly.
-- **`net_addr`/`addr`** — `net_addr.zig` and `housekeeping.zig` reproduce the wiki's own
-  "Hexdump example of Network address structure" and "Hexdump example of addr message" byte-exact.
-- **`block_header`/`block`** — `block_header.zig` and `block.zig` decode the real, published
-  genesis-block raw bytes (en.bitcoin.it/wiki/Genesis_block, "Raw block data", fetched directly)
-  end to end: the 80-byte header, the CompactSize transaction count, and the one coinbase
-  transaction (via `bitcointx.deserializePartial`) — then re-serialize and check the result matches
-  the original raw bytes exactly, and independently reproduce the genesis block's well-known hash
-  (`000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f`, cross-checked live against
-  blockstream.info's and mempool.space's `/api/block-height/0`) from the decoded header.
-- **`relay.zig`** (2026-09-30) — the four payload-less messages' complete 24-byte wire frames are
-  pinned in hex (their checksum `5df6e0e2` is the wiki `verack` dump's); `feefilter`/`sendcmpct`
-  layouts, the `MAX_MONEY` range, Bitcoin-`bool` semantics and exact lengths are **in-house**
-  vectors from the BIP133/BIP152 field layouts, not external captures.
-- **`inv`/`getdata`/`notfound`/`getblocks`/`getheaders`/`headers`/`reject`** — the wiki documents
-  every field and (for `reject`) the CCode table, but publishes no standalone hex dump for these;
-  their tests are labeled **in-house** (hand-built from the documented field layout, not an
-  external byte-for-byte source) alongside encode→decode **self round-trips**. Every hostile-input
-  test in this group is likewise in-house (there is no external "here is what a malformed `inv`
-  looks like" vector to anchor to).
-- **Fuzzing** — every `decode*` entry point in this module has a `std.testing.fuzz` harness
-  (`envelope.decodeMessage`, `message.Reader.varBytes`/`compactSize`, `NetAddr.decode`,
-  `handshake.decodeVersion`, `block_header.BlockHeader.decode`, `inventory.decodeInventoryList`/
-  `decodeBlockLocator`/`decodeHeaders`, `block.decodeBlock`, `housekeeping.decodeAddr`/
-  `decodeReject`, and since 2026-09-30 `relay.decodeFeeFilter`/`decodeSendCmpct`/`expectEmpty`) modeled on `modules/http/src/body.zig`'s shape and `bitcointx.tx`'s own harness:
-  arbitrary bytes, with a length/count-shaped byte occasionally biased toward small values so the
-  fail-fast-bound code paths get real traffic alongside fully random inputs. None found a crash or
-  an unbounded allocation in this pass — the two-layer defense described above (documented maximum
-  where one exists, remaining-bytes bound always, incremental-growth loop as the actual safety net)
-  held.
-- **Mutation run 2026-10-05** (in-place, Debug, 41 mutants over the envelope's
-  check order and `IsCommandValid`, the reader's bounds, every count cap and
-  remaining-bytes guard, `MIN_TX_LEN`, `version`'s user-agent cap and relay
-  byte, `feefilter`/`sendcmpct` ranges and exact lengths, `NetAddr.ipv4`):
-  31 killed. Six tests added for the ten survivors: the printable-range edges
-  (0x1f/0x7f refused, 0x20/0x7e accepted), a 12-byte command, a declared
-  length of exactly `MAX_PAYLOAD_LENGTH`, encoder `PayloadTooLarge`,
-  `consumed` across two back-to-back frames, the `MAX_INV_ENTRIES` cap
-  isolated from the remaining-bytes guard and its edge, exactly
-  `MAX_ADDR_ENTRIES` entries, a block with one `MIN_TX_LEN`-octet
-  transaction. Equivalent: none.
+Run: `scripts/modtest btcp2p`. Tests sit beside the code in each `src/*.zig`.
 
-Run: `zig build test-btcp2p` (Debug and `-Doptimize=ReleaseFast`).
+- **Envelope** (`envelope.zig`): the Bitcoin wiki's own published `verack` hex dump and the envelope of the
+  modern-(60002)-`version` dump (magic/command/length/checksum) byte-exact, both taken from
+  en.bitcoin.it/wiki/Protocol_documentation rather than transcribed from memory, plus an in-house
+  cross-check that `sha256d("")`'s first 4 bytes equal the wiki's published `verack` checksum; the
+  check order, the printable-range edges of a command, a declared length of exactly
+  `MAX_PAYLOAD_LENGTH`, encoder `PayloadTooLarge`, and `consumed` across two back-to-back frames.
+- **`version`** (`handshake.zig`): the wiki's field-by-field breakdown of the same modern example
+  (`version`/`services`/`timestamp`/both `net_addr` fields/`nonce`/`user_agent`/`start_height`)
+  byte-exact, then re-serialized and compared with the original payload.
+- **`net_addr`/`addr`** (`net_addr.zig`, `housekeeping.zig`): the wiki's "Hexdump example of Network
+  address structure" and "Hexdump example of addr message" byte-exact.
+- **`block_header`/`block`** (`block_header.zig`, `block.zig`): the real, published genesis-block raw bytes
+  (en.bitcoin.it/wiki/Genesis_block) end to end (the 80-byte header, the CompactSize transaction count,
+  the coinbase transaction via `bitcointx.deserializePartial`), re-serialized byte-exact, and the
+  well-known genesis hash `000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f`
+  reproduced from the decoded header.
+- **`relay.zig`:** the four payload-less messages' complete 24-byte wire frames pinned in hex (their
+  checksum `5df6e0e2` is the `verack` dump's); the `feefilter`/`sendcmpct` layouts, the `MAX_MONEY`
+  range, Bitcoin-`bool` semantics and exact lengths are **in-house** vectors from the BIP133/BIP152
+  field layouts, not external captures.
+- **`inv`/`getdata`/`notfound`/`getblocks`/`getheaders`/`headers`/`reject`:** the wiki documents every
+  field (and, for `reject`, the CCode table) but publishes no standalone hex dump for these; their
+  tests are labeled **in-house** (hand-built from the documented field layout) alongside encode-decode
+  **self round-trips**. Every hostile-input test in this group is likewise in-house.
+- **Limits:** the `MAX_INV_ENTRIES` cap isolated from the remaining-bytes guard and at its edge, exactly
+  `MAX_ADDR_ENTRIES` entries, a block with one `MIN_TX_LEN`-octet transaction, the user-agent cap.
+- **Fuzz:** every decoder has a harness generic over its choice source, run by `std.testing.fuzz` and by
+  the deterministic driver `BTCP2P_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver, shared plumbing
+  in `src/fuzz_test.zig`). Harnesses: `btcp-envelope`, `btcp-relay`, `btcp-block`, `btcp-netaddr`,
+  `btcp-header`, `btcp-varbytes`, `btcp-addr`, `btcp-reject`, `btcp-inv`, `btcp-locator`,
+  `btcp-headers`, `btcp-version`. Inputs are corpus frames with a few damaged or truncated octets, with
+  length/count-shaped bytes biased toward small values so the fail-fast bound code gets real traffic;
+  reach tests run a fixed number of seeds in the ordinary test binary and fail unless every outcome
+  label is hit. The two-layer defense (documented maximum where one exists, remaining-bytes bound
+  always, incremental-growth loop as the actual safety net) is what these harnesses exercise.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-## Status
+## What is deliberately not done
 
-`gap · any (pure codec, no I/O, no connection state) · codec · reentrant` + deps: `bitcointx` —
-canonical source is `pub const meta` in src/root.zig.
+- **BIP37 bloom filters** (`filterload`/`filteradd`/`filterclear`/`merkleblock`) — Bitcoin Core has served
+  them only with `-peerbloomfilters` (off by default) since v0.19 *(inferred)*, and BIP157 replaces them
+  for light clients. Listed so the absence is a decision, not an oversight.
+- **`checkorder`/`submitorder`/`reply`** — "This message was used for IP Transactions. As IP
+  transactions have been deprecated, it is no longer used" (wiki, verbatim, for all three). Dead since
+  before this module's scope was drawn.
+- **`alert`** — never, not merely not yet: Bitcoin Core's alert system was retired after a
+  signature-forgery weakness was found in its trust model, and the signing key was deliberately burned.
+  There is no key left to verify an alert against, so a codec for it has nothing meaningful to check.
+- **Legacy pre-BIP31 `ping`** (zero-length payload, no `pong` reply at all) — predates every protocol
+  version any peer negotiates today; trivially representable as an empty byte slice if ever needed, so
+  it is not given its own type.
 
 ## Anchoring
 
@@ -251,23 +222,23 @@ canonical source is `pub const meta` in src/root.zig.
 
 ## Backlog / deferred
 
-- ~~**Modern handshake/relay messages: `sendheaders`, `wtxidrelay`, `sendaddrv2`, `feefilter`, `sendcmpct`, `mempool`**~~ — **DONE 2026-09-30** (`relay.zig`; user decision): payload-less ones via `expectEmpty` (strict: a byte is refused), `feefilter` with Core's money range, `sendcmpct` with Bitcoin `bool` semantics; the four empty messages' wire bytes pinned (checksum `5df6e0e2` of the empty payload). Was: (survey 2026-09-30) — every current Core peer sends these at connect; the SPEC calls them "not in the task's requested message set" (a reason of scope, not of principle). Effort S total (bare commands + fixed-width fields). Fits §2.
-- **`addrv2` (BIP155) decoder/encoder** (survey 2026-09-30; re-ranked first 2026-10-05) — Core
-  relays Tor v3/I2P/CJDNS addresses only in `addrv2`; Tor alone is ~63% of reachable nodes *(inferred,
-  Bitnodes via search)*, so a crawler on legacy `addr` misses most of the network, and a caller that
-  sends this module's `sendaddrv2` receives a message it cannot decode. Needs the BIP155 network-ID
-  table with per-network address lengths (refuse a known ID with the wrong length), CompactSize
-  `services`, the 1000-entry cap, and the BIP155 512-byte address bound. Effort M (S–M of code, the
-  rest is vectors). Fits §2. **This plus the next item is what stands between `mvp` and `core`.**
-- **BIP157 compact-filter messages** (`getcfilters`/`cfilter`/`getcfheaders`/`cfheaders`/
-  `getcfcheckpt`/`cfcheckpt`) (survey 2026-09-30; split out 2026-10-05) — the light-client protocol
-  Core serves with `-peerblockfilters`; without it a light client must download full blocks. The
-  messages are fixed fields + hash lists (effort S–M); decoding/matching the BIP158 Golomb-coded
-  filter itself is a separate M (possibly its own module). Fits §2.
-- **BIP152 compact blocks** (`cmpctblock`/`getblocktxn`/`blocktxn`) (survey 2026-09-30) — the
-  efficient block relay; optional for a client (Core falls back to `inv`/`headers` + full `block`
-  when `sendcmpct` is not negotiated), so Backlog-grade. Differential index encoding + SipHash-2-4
-  short IDs (`std` has SipHash). Effort M. Fits §2.
-- **BIP324 v2 encrypted transport** (survey 2026-09-30) — Core's default outbound transport; needs ElligatorSwift (secp256k1) + ChaCha20-Poly1305 (`std` has the AEAD). Effort L; a separate `bip324` module is the likelier home. Backlog-grade while Core still accepts v1 *(inferred)*. Fits §2.
-- **BIP37 bloom messages** — deliberately not doing (off by default in Core since v0.19 *(inferred)*;
-  superseded by BIP157). Listed so the absence is a decision, not an oversight.
+- **`addrv2` (BIP155) decoder/encoder** — a materially different, wider address format (variable-length
+  network-ID + address, for Tor v3/I2P/CJDNS peers) layered over `addr`'s role; genuinely new surface,
+  not a small delta on `NetAddr`. Core relays those addresses only in `addrv2`; Tor alone is ~63% of
+  reachable nodes *(inferred, Bitnodes via search)*, so a crawler on legacy `addr` misses most of the
+  network, and a caller that sends this module's `sendaddrv2` receives a message it cannot decode.
+  Needs the BIP155 network-ID table with per-network address lengths (refuse a known ID with the wrong
+  length), CompactSize `services`, the 1000-entry cap and the BIP155 512-byte address bound. Effort M
+  (S-M of code, the rest is vectors). **This plus the next item is what stands between `mvp` and
+  `core`.**
+- **BIP157 compact-filter messages** (`getcfilters`/`cfilter`/`getcfheaders`/`cfheaders`/`getcfcheckpt`/
+  `cfcheckpt`) — the light-client protocol Core serves with `-peerblockfilters`; without it a light
+  client must download full blocks. The messages are fixed fields + hash lists (effort S-M);
+  decoding/matching the BIP158 Golomb-coded filter itself is a separate M (possibly its own module).
+- **BIP152 compact blocks** (`cmpctblock`/`getblocktxn`/`blocktxn`; `sendcmpct` is implemented) — the
+  efficient block relay; optional for a client (Core falls back to `inv`/`headers` + full `block` when
+  `sendcmpct` is not negotiated), so backlog-grade. Differential index encoding + SipHash-2-4 short
+  transaction IDs (`std` has SipHash). Effort M.
+- **BIP324 v2 encrypted transport** — Core's default outbound transport; needs ElligatorSwift
+  (secp256k1) + ChaCha20-Poly1305 (`std` has the AEAD). Effort L; a separate `bip324` module is the
+  likelier home. Backlog-grade while Core still accepts v1 *(inferred)*.

@@ -5,8 +5,9 @@ handshake, the inventory/data-request messages, `tx`/`block` payload messages (r
 `bitcointx`'s existing transaction codec), and connection housekeeping.
 
 - This repo has a substantial Bitcoin/Lightning stack (`bitcointx`, `bitcoinscript`, `psbt`,
-  `bech32`, `bip32`, `bip340`, `taproot`, `musig2`, plus the Lightning side) but, until now, no
-  peer-to-peer network layer — `btcp2p` is that missing wire-format piece.
+  `bech32`, `bip32`, `bip340`, `taproot`, `musig2`, plus the Lightning side) but no
+  peer-to-peer network layer — `btcp2p` is its wire-format piece.
+- **Deps:** `bitcointx`. **Concurrency:** reentrant.
 - **Platform:** any — every function is a pure transform over caller-owned byte slices/values, no
   I/O, no socket, no connection state.
 - **Model after:** the Bitcoin Developer Reference / wiki protocol documentation
@@ -53,13 +54,13 @@ See `SPEC.md` for the full design/threat-model writeup and exactly what's deferr
 - **Relay negotiation** (`relay.zig`) — `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool`
   (payload-less, checked by `expectEmpty`), `feefilter`, `sendcmpct`.
 
-Not yet implemented (SPEC.md Backlog): `addrv2` (BIP155 — so a caller that sends `sendaddrv2` cannot
-yet decode the reply), BIP157 compact-filter messages, the rest of BIP152 compact blocks
-(`cmpctblock`/`getblocktxn`/`blocktxn`), BIP324 v2 transport. Deliberately out of scope (SPEC.md has
-the full rationale): BIP37 bloom filters (`filterload`/`filteradd`/`filterclear`/
-`merkleblock`), the retired IP-Transactions messages (`checkorder`/`submitorder`/`reply`), and
-`alert` (retired after a signature-forgery vulnerability; the signing key was burned — never
-implement).
+## Not provided
+
+`addrv2` (BIP155, so a caller that sends `sendaddrv2` cannot yet decode the reply), BIP157 compact-filter
+messages, the rest of BIP152 compact blocks (`cmpctblock`/`getblocktxn`/`blocktxn`) and BIP324 v2
+transport are open (SPEC.md § Backlog / deferred). BIP37 bloom filters, the retired IP-Transactions
+messages (`checkorder`/`submitorder`/`reply`), `alert` and the legacy pre-BIP31 `ping` are deliberately
+left out (SPEC.md § What is deliberately not done).
 
 ## Reusing `bitcointx`
 
@@ -115,9 +116,7 @@ defer allocator.free(wire);
 ## Verify
 
 ```
-zig build test-btcp2p           # Debug
-zig build test-btcp2p -Doptimize=ReleaseFast
-zig fmt --check modules/btcp2p
+scripts/modtest btcp2p
 ```
 
 Byte-exact against the Bitcoin wiki's own published hex dumps (protocol documentation page,
