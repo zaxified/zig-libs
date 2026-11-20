@@ -13,7 +13,7 @@ instead of the raw `FsStorage`.
 Provenance: original work of the zig-libs authors (MIT). LMDB's mmap'd pages and
 Postgres' `shared_buffers` are named as conceptual analogues of the
 buffer-pool *pattern*; neither was consulted as an implementation, so no
-`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0). `tools/scan_probe`
+`NOTICE` entry is required (the module has none). `tools/scan_probe`
 runs SQLite (public domain) as a black-box oracle through Python's `sqlite3`;
 it commits no data, its numbers are produced at run time by our own tooling.
 
@@ -57,6 +57,9 @@ an eviction candidate while the borrow is outstanding, so `resident_pages` can
 exceed `max_pages` by the number of live borrows (`borrowed_pages`). kvtree's
 read descent takes this path automatically when the store can lend.
 
+**Concurrency:** single owner (one thread), fiber-reentrant on that thread.
+**Deps:** `kvtree`, `ramcache`.
+
 Works over `SimStorage` too (set `sim.allow_overwrite = true`, since kvtree
 overwrites its meta pages in place).
 
@@ -67,7 +70,8 @@ overwrites its meta pages in place).
   meta-page commit — its crash-safety — is preserved exactly. Write-back is
   deliberately rejected (it would reorder/delay durable writes).
 - **Bounded by `ramcache` (W-TinyLFU).** Pages are keyed by
-  `(handle, page-index)`; the budget is a fixed page count. Constantly re-read
+  `(file id, page-index)` (one file id per open path, shared by its handles); the
+  budget is a fixed page count. Constantly re-read
   meta pages stay hot and pinned; churning leaf pages are evicted by recent
   frequency; a cold scan can't flush the hot set.
 - **Transparent.** A `Db` over `PageCache(inner)` is byte-for-byte equivalent
@@ -77,12 +81,19 @@ overwrites its meta pages in place).
 See [SPEC.md](SPEC.md) for the full write-through argument, the ramcache-vs-
 custom decision, the keying/invalidation details, and the validation matrix.
 
+## Not provided
+
+No write-back, no sharing across threads or processes (single owner; wrap it in
+your own lock), one page size per cache. See SPEC *What is deliberately not
+done* and *Backlog / deferred*.
+
 ## Tests
 
-`zig build test-pagecache` (and `-Doptimize=ReleaseFast`) — transparency
+`scripts/modtest pagecache` (and `-Doptimize=ReleaseFast`) — transparency
 (identical scans vs raw backend), bounding (budget never exceeded, eviction +
 cold refetch), durability (fresh-cache reopen over `FsStorage` recovers
-committed data), in-place meta overwrite, and pass-through of non-page I/O.
+committed data), in-place meta overwrite, pass-through of non-page I/O, borrow
+seam, read-ahead, fiber re-entrancy and a model-fuzz against a naive byte model.
 
 Catalog line:
 

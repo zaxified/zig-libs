@@ -39,7 +39,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | bbolt / LMDB (mmap) | Go / C | MIT / OpenLDAP PL 2.8 | — | — | Skip the problem by mmapping and letting the OS page cache decide; no hard RAM cap. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No buffer pool or page cache. |
 
-**Where we are ahead:** scan-resistant over an injectable `Storage`, measured against SQLite's LRU pcache1 (`**Ahead:**` line, `tools/scan_probe`: 0 vs 100 backend reads re-reading a 100-page hot set after one full scan); also the only page cache for a Zig store with a hard resident-page cap, transparent to durability (write-through, byte-equivalent scans vs raw backend), zero-copy borrow seam wired into `kvtree`'s descent. **Where we are behind:** write-through only (no write-back/batching), fixed page size, no shared/multi-process pool (→ Backlog items). Several handles per path and per-file invalidation on `rename`/`delete`/`create_truncate` closed 2026-10-12.
+**Where we are ahead:** scan-resistant over an injectable `Storage`, measured against SQLite's LRU pcache1 (`**Ahead:**` line, `tools/scan_probe`: 0 vs 100 backend reads re-reading a 100-page hot set after one full scan); also the only page cache for a Zig store with a hard resident-page cap, transparent to durability (write-through, byte-equivalent scans vs raw backend), zero-copy borrow seam wired into `kvtree`'s descent. **Where we are behind:** write-through only (no write-back/batching), one page size per cache, no shared/multi-process pool (all by design, see *What is deliberately not done*). Several handles per path and per-file invalidation on `rename`/`delete`/`create_truncate` are supported.
 
 ## Problem
 
@@ -105,7 +105,7 @@ always issues those); any other-shaped access bypasses the cache entirely.
 
 ### Invalidation
 
-`ramcache` now exposes `remove(key)` and `removeMatching(prefix)`, so
+`ramcache` exposes `remove(key)` and `removeMatching(prefix)`, so
 invalidation is as narrow as its scope:
 
 - **`close`** unmaps the handle (the backend recycles handle numbers); the
@@ -118,41 +118,39 @@ invalidation is as narrow as its scope:
   a *failed* truncate (media state unknown) sweeps the handle's prefix. A
   growing truncate removes nothing: no resident page can lie past the old end.
   A borrow of a removed page keeps its bytes (ramcache's doomed-entry rule).
-- **Non-page-aligned writes and their failure** drop the written file's
-  pages (prefix sweep); a failed full-page write still removes just that page.
+- **Non-page-aligned writes and their failure** drop only the pages the write's
+  span touches (a span of `4 * max_pages` pages or more sweeps the file by prefix);
+  a failed full-page write still removes just that page.
 - **`create_truncate` open** drops exactly the opened path's file's pages
-  (shared with its other open handles, so none can serve pre-truncation bytes).
+  (shared with its other open handles, so none can serve pre-truncation bytes),
+  BEFORE its fallible steps, so an allocation failure cannot leave the other
+  handles serving pre-truncation bytes as hits.
+- **A write landing while a `truncate` is parked** could cache a page past the
+  old end that the narrow drop missed: the write epoch moved, so the truncate
+  sweeps the file.
 - **`rename(a, b)`**: the file at `a` keeps its pages (same file, new name) and
   its table entry is re-bound to `b`; the file `b` named before is orphaned and
   its pages dropped. **`delete(p)`** orphans `p`'s file and drops its pages. An
   orphan keeps its open handles (the backends have inode semantics: an open
   handle follows its file) but no later `open` can reach it, so a reopen of
   `p` after the delete is a new file and reads fresh bytes. Files not named
-  are untouched: nothing clears the whole cache any more.
-
-⚠ **What made `close` narrow before 2026-09-03 was a side table** of every
-page index each handle had ever touched. It was populated best-effort, so a
-page whose tracking allocation failed survived the close and was served for
-the next file on the recycled handle number; and it grew with the **store**,
-not with the cache — measured at ~12 B live and ~18 B peak per distinct page
-touched, so a 4-page (16 KiB) budget over 200 000 pages held 2.4 MB of
-metadata, 145× the cache's own ceiling. The budget assertions held throughout:
-the cap was real and bounded the wrong quantity. Sweeping the resident set is
-bounded by `max_pages` by construction and cannot fail to allocate.
-
-⚠ **A resident page is *not* stale-proof merely because `put` replaces in
-place.** That was the old argument here, and `ramcache.put` cannot report
-failure: when its value dupe failed it left the OLD value in the map, so the
-write-through refresh — which runs *after* the durable write has landed — left
-the cache serving pre-write bytes as a hit, indefinitely. `ramcache` now drops
-the key instead: absent is a miss, stale is corruption.
+  are untouched: nothing clears the whole cache.
+- **Whole-file invalidation is a prefix sweep** of the resident set
+  (`ramcache.removeMatching`): bounded by `max_pages` by construction, so it
+  cannot fail to allocate. There is no side table of the pages a handle has
+  touched: such a table grows with the store, not with the cache, and a page
+  whose tracking allocation failed would survive a close and be served for the
+  next file on a recycled handle number.
+- **The write-through refresh cannot leave stale bytes.** It runs after the
+  durable write has landed, and `ramcache.put` drops the key when it cannot
+  store the new value: absent is a miss, stale is corruption.
+- `Storage.allocate`, `syncData` and `tryLockShared` are forwarded to the inner
+  `Storage` as themselves.
 
 ### Several handles per path
 
 Handles on one path share a file id, hence one set of pages: a write, truncate
-or truncating open through any of them is visible through all. (Before
-2026-10-12 the key was `(handle, page_index)` and the precondition was "at most
-one open handle per path".) **Residual precondition:** the cache learns file
+or truncating open through any of them is visible through all. **Residual precondition:** the cache learns file
 identity from the path string given to `open`/`rename`/`delete`, so a file must
 be opened under one spelling ("x" vs "./x" are two files to the cache), and the
 file must not be renamed or deleted behind the cache's back (through the raw
@@ -181,8 +179,16 @@ Therefore `PageCache` is strictly **write-through**:
 - No dirty buffering, no deferred flush, no reordering. The cache **only**
   bounds RAM and elides redundant inner reads.
 
-This is the safe default the task calls for; write-back is explicitly rejected
-because it cannot preserve kvtree's ordered-commit durability.
+Write-back is rejected because it cannot preserve kvtree's ordered-commit
+durability (see *What is deliberately not done*).
+
+**Concurrency.** Single-owner means one thread, not one call at a time: the
+module is fiber-reentrant on one thread. Every inner call is made with the cache
+in a state a second caller may see: a write reaches media before the cache is
+touched, and a page being read into its slot is a miss for everyone else until it
+is filled (`ramcache` hides unfilled reservations), so a second fiber reads it
+for itself and never sees the unfilled bytes. A shared deployment across threads
+wraps the owner in its own lock (inherited from `ramcache` and `kvtree`).
 
 ## Transparency invariant
 
@@ -195,43 +201,25 @@ RSS. It never changes what is durable and never changes an observable result.
 A resident page is always the latest written bytes (write-through updates it in
 place); an absent page is always refetched from the authoritative inner store.
 
-## Validation (tests, Debug + ReleaseFast, all green)
+## Verification
 
-1. **Transparency** — an identical 1500-op put/get/delete/commit workload runs
-   through `kvtree.Db` over `PageCache(Sim)` and over raw `Sim`; the two stores
-   are asserted **byte-identical** on a full ordered cursor scan and on
-   point-reads across the whole key space. The cache registers real hits and
-   never exceeds its budget.
-2. **Bounding** — a 4-page budget against a working set far larger than 4
-   pages: `resident_pages <= budget` and `resident_bytes <= budget*page_size`
-   are asserted throughout, eviction is confirmed (`evictions > 0`,
-   `misses > budget`), meta pages are served from RAM (`hits > 0`), and every
-   key still reads back the exact expected value (cold pages refetched).
-3. **Durability** — write + commit through `PageCache(FsStorage)`
-   (`std.testing.tmpDir`), tear the whole cache down, then reopen with a
-   **fresh empty cache** and a fresh `FsStorage`: all committed data
-   (including an overwrite and a delete) survives, proving the write-through
-   writes reached disk and the cache masked nothing. Cleaned up via
-   `tmp.cleanup()`.
-4. **In-place meta overwrite** — with `SimStorage.allow_overwrite = true` (as
-   kvtree's own harness runs), 50 commits repeatedly overwrite the meta pages
-   at the same offset through the cache; every latest-committed key reads back
-   correctly (a stale cached meta page would point at an old root and lose
-   keys).
-5. **Pass-through** — sub-page / unaligned reads bypass the cache and return
-   exact inner bytes without registering as page hits/misses.
-6. **Multiple handles per path** — two handles on one path see each other's
-   writes/truncates as cache hits (one resident page, not one per handle);
-   closing one keeps the pages, the last close drops them. `rename`, `delete`
-   and `create_truncate` over a mix of open files leave the other paths' pages
-   resident (asserted through `stats().hits` and `resident_pages`), drop only
-   the affected file's, a reopen after `delete` reads a fresh empty file while
-   the old handles still read the old bytes, and a rename over an open file
-   drops the replaced file's pages only. The model-fuzz (below) does the same
-   with up to two handles per path and rename/delete/create_truncate across
-   open handles.
+Run `scripts/modtest pagecache` (Debug, and `-Doptimize=ReleaseFast`).
 
-## Zero-copy reads: the borrow seam (wave-2 audit F3, implemented)
+- **Transparency.** An identical put/get/delete/commit workload runs through `kvtree.Db` over `PageCache(Sim)` and over raw `Sim`; the two stores are asserted byte-identical on a full ordered cursor scan and on point reads across the whole key space, and the cache registers real hits and never exceeds its budget.
+- **Bounding.** A 4-page budget against a working set far larger: `resident_pages <= budget` and `resident_bytes <= budget * page_size` throughout, eviction confirmed, meta pages served from RAM, every key still reading back exactly (cold pages refetched).
+- **Durability.** Write and commit through `PageCache(FsStorage)` (`std.testing.tmpDir`), tear the cache down, reopen with a fresh empty cache and a fresh `FsStorage`: all committed data (an overwrite and a delete included) survives, proving the write-through writes reached disk and the cache masked nothing.
+- **In-place meta overwrite.** With `SimStorage.allow_overwrite = true` (as kvtree's own harness runs), repeated commits overwrite the meta pages at the same offset through the cache; every latest-committed key reads back (a stale cached meta page would point at an old root and lose keys).
+- **Pass-through.** Sub-page and unaligned reads bypass the cache and return exact inner bytes without registering as page hits or misses; a page not fully present on media is never cached.
+- **Multiple handles per path.** Two handles on one path see each other's writes and truncates as cache hits (one resident page, not one per handle); closing one keeps the pages, the last close drops them. `rename`, `delete` and `create_truncate` over a mix of open files leave the other paths' pages resident (asserted through `stats().hits` and `resident_pages`), drop only the affected file's, a reopen after `delete` reads a fresh empty file while the old handles still read the old bytes, and a rename over an open file drops the replaced file's pages only.
+- **Invalidation edges.** Narrowed truncate (a huge span falls back to the prefix sweep; a borrow outstanding across it stays valid), sub-page and failed writes (a torn page is never masked), a failed write never leaves the cache holding bytes media does not have, a truncating open that fails after the backend emptied the file, a write landing during a parked truncate, a recycled backend handle number, a file id never reusing a live one after the counter wraps, odd page sizes (1 and 7 bytes), every page borrowed.
+- **Borrow seam.** A borrowed page is unevictable and survives pressure that discards every other page; a write to a borrowed page neither corrupts the borrow nor leaves the cache stale; the invalidation guards empty the cache with a borrow outstanding; only a backend that really holds the bytes advertises lending; kvtree's read descent, `getRef` and cursor take the borrow and read identically to the copying path.
+- **Fiber-reentrancy.** A read of a page whose fill is in flight gets the page, never the unfilled slot; kvtree reads the committed version at every point a commit parks (`YieldStorage` interleaves a second caller at every inner call); a write, truncating open or close landing during a parked read is never overtaken by older bytes and leaves no orphan page.
+- **Read-ahead.** A sequential scan makes fewer inner reads and returns identical bytes, off = no read-ahead, random access triggers none, never past end of file, a partial tail page never cached, a failed or short inner read falls back, writes during the inner read are never overwritten by older prefetched bytes, a budget of one page holds, a borrowed page is not evicted by read-ahead, transparency of kvtree over `PageCache` with read-ahead.
+- **Model-fuzz** (`root.zig`, `mfCase`): see Anchoring.
+- **Scan-resistance probe** (`tools/scan_probe`, README there): one workload on both sides. N = 2000 pages, a cache of C = 200 pages, a hot set of H pages read `passes` times, ONE sequential scan of all N, then the hot set once more; the number is backend reads in that last phase. pagecache runs over a counting `Storage` on `SimStorage`; SQLite runs with `cache_size=200` pages, `mmap_size=0`, 4096-byte pages, one row per leaf page, `pread64` counted with strace (the per-statement 16-byte change-counter reads excluded; its figures include a few interior B-tree pages). The claim is about eviction policy only: the pagecache side uses an in-memory backend, so times are not comparable, and SQLite's own pcache1 is internal and was driven through its public SQL API. The figures are on the card's `**Ahead:**` line.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. Mutants cover the page arithmetic, invalidation (`dropFrom`, `dropFile`, last close, rename/delete/orphan, truncating open), the epoch guards, read-ahead, the stale-handle and file-id paths and the forwarded calls; the equivalent ones are the read-ahead tail rounding of `avail_pages`, `writeAll`'s entry epoch bump, `known = true` on a failed truncate and the epoch bumps in `rename`/`delete` (neither changes a file's bytes).
+
+## Zero-copy reads: the borrow seam
 
 The copying `pread` seam costs a whole-page `@memcpy` on a **hit**
 (`@memcpy(buf, cached)` into the caller's buffer) and **two** page copies on a
@@ -240,7 +228,7 @@ storage). LMDB, the named C reference, hands the caller a pointer straight into
 the mapped page: 0 copies. That gap is inherent to `Storage.pread(h, buf, off)`,
 which hands the *caller* the destination — so `PageCache` has no way to answer
 "here is my copy" instead. The fix is therefore a seam addition, not a local
-optimisation, and it is now in place:
+optimisation:
 
 ```zig
 // kv.Storage, optional vtable slots (default null = "cannot lend")
@@ -264,11 +252,9 @@ pub const Ref = struct { bytes: []const u8, token: *anyopaque };
 
 ### How the pin lifetime is enforced
 
-The earlier version of this note flagged the hard part correctly: *"any pin held
-across a `writeAll`/`truncate`/`close` on the same page turns write-through's
-in-place `ramcache.put` or the coarse `clear()` guards into a use-after-free —
-and 'invalidated while pinned' has no answer in the current write-through
-model."* It has one now, and it is structural rather than documentary:
+The hard part is a pin held across a `writeAll`/`truncate`/`close` on the same
+page, which would turn write-through's in-place `ramcache.put` or an invalidation
+into a use-after-free. The answer is structural rather than documentary:
 
 1. **A borrowed entry is not an eviction candidate.** `pin` removes the entry's
    index node from `ramcache`'s region-LRU and expiry heaps. Victim selection
@@ -280,39 +266,37 @@ model."* It has one now, and it is structural rather than documentary:
 2. **A write or invalidation over a borrowed page *parks* it.** `put`, `remove`,
    `clear` and lazy TTL expiry on a pinned entry unlink it from the map — so it
    can never be served again, and `clear()`'s contract ("resident pages drop to
-   0", which the six invalidation guards of F2 rest on) stays literally true —
+   0", which the invalidation guards rest on) stays literally true —
    while the value bytes move to the node, which owns them until the last
    `release`. The borrower keeps reading the snapshot it was handed; the next
    reader sees the new bytes. Doing only one of those two is the bug: freeing
-   the bytes is `ocspcache` F4's use-after-free, and refusing the write is a
-   stale hit, which is precisely what a write-through cache exists to prevent.
+   the bytes is a use-after-free, and refusing the write is a stale hit, which is
+   precisely what a write-through cache exists to prevent.
    The parking slot's capacity is reserved *at pin time*, so parking can never
    fail partway and be forced to free memory somebody is still reading.
 
 ### Who uses it
 
-`kvtree`'s read descent (`lookup`, behind `Db.get`/`Txn.get`/`Snapshot.get`)
-takes the borrow when the store can lend: it is the one tree path that only
-*reads* its pages and holds exactly one at a time. The copy-on-write write path
-and the `Cursor`'s root-to-leaf frame stack keep their own page copies on
-purpose — they mutate or outlive their pages, and a borrow is read-only.
+`kvtree`'s read descent (`lookup`, behind `Db.get`; `Db.getRef`, `Txn.getRef`,
+`Snapshot.getRef` lend the value in place) takes the borrow when the store can
+lend, and so does the `Cursor`: its root-to-leaf frame stack borrows each page
+when the store lends (a copy otherwise), holds no more than its depth, and hands
+a page back when its frame is left, the cursor is re-seeked or deinitialised.
+The copy-on-write write path keeps its own page copies on purpose: it mutates
+its pages, and a borrow is read-only.
 
-### Measured (see `src/bench.zig`, `PAGECACHE_BENCH=1`, ReleaseFast, 4 KiB pages)
+## Performance
 
-| access | copies | allocs | ns/access |
-|--------|--------|--------|-----------|
-| hit, `pread` | 1 | 0 | 116–171 |
-| hit, `preadRef` | **0** | 0 | **93–102** |
-| miss, `pread` | 2 | 3 | 1612–1727 |
-| miss, `preadRef` | **1** | 3 | 1585–1951 |
+`src/bench.zig` (`PAGECACHE_BENCH=1`, ReleaseFast, 4 KiB pages; its header gives the exact command) measures access shapes and a read-ahead sweep that counts reads only. The structural result, which does not move with the machine:
 
-Read the two shapes differently. The **hit** is a real, repeatable win — one
-whole-page `memcpy` removed, ~20–45 % off the access. The **miss** is a wash:
-allocations are the same three either way (key dup, page buffer, index node —
-the copying path's second buffer is the *caller's*, not the cache's), and the
-~40 ns the removed copy saves is about what `pin`+`reserve`+`release` costs in
-extra index work over `get`+`put`. Its claim is one fewer copy, not fewer
-nanoseconds; against a real `read(2)` both are noise.
+| access | copies | allocs |
+|--------|--------|--------|
+| hit, `pread` | 1 | 0 |
+| hit, `preadRef` | **0** | 0 |
+| miss, `pread` | 2 | 3 |
+| miss, `preadRef` | **1** | 3 |
+
+The hit is a real win (one whole-page `memcpy` removed). The miss is a wash in time: the allocations are the same three either way (key dup, page buffer, index node; the copying path's second buffer is the caller's, not the cache's), and the removed copy costs about what `pin`+`reserve`+`release` add in index work over `get`+`put`. Its claim is one fewer copy, not fewer nanoseconds; against a real `read(2)` both are noise. The card's `**Performance:**` line is `n/a` (no drop-in reference); the scan-resistance figures are on the `**Ahead:**` line (`tools/scan_probe`).
 
 ## Read-ahead
 
@@ -338,63 +322,22 @@ Why this is sound:
   the read, and the extras are dropped if it moved. Pinned by a test that writes a
   prefetched page from inside the inner `pread`.
 
-Not claimed: any speedup. The in-memory `SimStorage` makes an inner read a memcpy;
-`bench.zig` prints a read-ahead sweep for the read count only.
+Only the copying `pread` path prefetches: a `preadRef` miss records the access but does not read ahead (its slot is a single reservation). Not claimed: any speedup. The in-memory `SimStorage` makes an inner read a memcpy; `bench.zig` prints a read-ahead sweep for the read count only.
 
-## Audit 2026-10-23
+## What is deliberately not done
 
-Sonnet review (9 findings + 6 test gaps) and 42 schemata mutants over the page arithmetic,
-invalidation (`dropFrom`, `dropFile`, last close, rename/delete/orphan, truncating open), the
-epoch guards, read-ahead, the stale-handle and file-id paths and the forwarded calls. 37 killed
-after eleven tests were added; the five survivors are equivalent: the tail rounding of
-read-ahead's `avail_pages` (`got` rounds down anyway), `writeAll`'s ENTRY epoch bump (its exit
-bump and the following `put`/`remove` decide every interleaving), `known = true` on a failed
-truncate (a truncate cannot change bytes below `len`), and the epoch bumps in `rename`/`delete`
-(neither changes a file's bytes; an orphan keeps its pages for its open handles). Fixed from the
-review: a truncating `open` dropped the other handles' pages only after its fallible steps, so an
-allocation failure left them serving pre-truncation bytes as hits (now dropped first); a write
-landing while a `truncate` was parked could cache a page past the old end that the narrow drop
-missed (now: the epoch moved → sweep); `max_pages * page_size` wrapped in ReleaseFast into a tiny
-budget (now a named panic); whole-file invalidation was quadratic in resident pages inside
-`ramcache.removeMatching` (now batched, `ceil(matches / 512)` scans); `Storage.allocate` was not
-forwarded (kvtree's append-and-sync preallocation silently off behind the cache). Kept, with
-reason: a `rename` that cannot allocate the new name orphans the file (documented above); the
-read-ahead sequence table is not reset by a recycled handle number (one wrong read-ahead decision
-at most).
+- **Write-back / dirty buffering.** Incompatible with kvtree's ordered-commit durability model: it would reorder or delay the durable writes (SQLite's pcache, by contrast, writes back under a journal).
+- **Cross-thread sharing and a shared/multi-process pool** (PostgreSQL `shared_buffers`). The module inherits `single_owner` from `ramcache` and `kvtree`; a shared deployment wraps the owner in its own lock.
+- **A silent fall-back from `preadRef` to a copying read.** `null` / `canLend() == false` is the answer for a backend that holds no bytes, for an access that is not exactly one aligned page and for a page not fully present, so "did the fast path engage?" stays answerable.
+- **Caching non-page-shaped accesses.** Only page-aligned, exactly-`page_size` accesses are cached; anything else passes through.
+- **A `rename` that cannot allocate the new name** orphans the file (pages dropped, the old name no longer resolves to it): the one place the several-handles guarantee gives way to the out-of-memory path.
 
-## Scan-resistance probe (2026-10-24)
+## Backlog / deferred
 
-`tools/scan_probe` (README there) runs one workload on both sides: N=2000 pages, cache C=200 pages,
-hot set H pages read `passes` times, ONE sequential scan of all N, then the hot set once more; the
-number is backend reads in that last phase. pagecache (counting `Storage` over `SimStorage`):
-H=100 -> 0 (passes 10 and 2), H=180 -> 2. SQLite 3.46.1 (`cache_size=200` pages, `mmap_size=0`,
-4096-byte pages, one row per leaf page, `pread64` counted with strace; the per-statement 16-byte
-change-counter reads are excluded): H=100 -> 100 (both pass counts), H=180 -> 184. SQLite's figures
-include a few interior B-tree pages. The claim is about eviction policy only: the pagecache side uses
-an in-memory backend, so times are not comparable and none are claimed; SQLite's own pcache1 is
-internal and was driven through its public SQL API, not called directly.
-
-## Backlog / non-goals
-
-- **Delta audit 2026-10-29 (no-panic sweep § GI):** 3 mutants over `dropSpan` (empty-span return dropped, span cut to its first page, always the whole-file sweep): 3/3 killed on the first run. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI), left as LOW**: R-pagecache-2 a last close / truncating open / rename / delete runs ramcache `removeMatching`, a scan of the resident map; R-pagecache-3 read-ahead's scratch buffer is up to the cache budget per sequential miss (caller option, documented); R-pagecache-4 `findByPath`/`findById` are linear in open files; R-pagecache-5 a double `releasePage` or one after `deinit` is undetected (ramcache assert; documented on `preadRef`, a generation token would close it).
-- ~~Not fiber-reentrant: a reserved page is visible before it is filled~~ -- **fixed 2026-09-29**
-  (the web-server consumer H4): ramcache now treats an unfilled reservation as a miss for `get`/`pin`/`drainDirty`; the
-  module doc states the contract ("fiber-reentrant on one thread") and two tests interleave a
-  second caller at every inner call (`YieldStorage`), including a kvtree commit running while a
-  reader is parked mid-fill of the root page.
-- ~~**Narrowing the remaining `clear()`s.**~~ **DONE 2026-09-29.** `truncate` and
-  sub-page/failed writes are narrowed to the handle (truncate: only pages at or past the new
-  length); `create_truncate` open, `rename` and `delete` stayed whole-cache at the time (**superseded 2026-10-12**: per-file invalidation by file id, see Invalidation above; was: see
-  Invalidation: handle -> path was opaque, so other handles on the same file could not be found).
-- **Write-back / dirty buffering.** Deliberately excluded — incompatible with
-  kvtree's ordered-commit durability model.
-- ~~**Prefetch / read-ahead.**~~ **DONE 2026-09-29**, opt-in (`Options.read_ahead_pages`, default 0 =
-  unchanged behaviour; see Read-ahead above). Only the copying `pread` path prefetches; a
-  `preadRef` miss records the access but does not read ahead (its slot is a single reservation).
-- **Cross-thread sharing.** Inherits `single_owner` from both `ramcache` and
-  `kvtree`; a shared deployment must wrap the owner in its own lock.
-- ~~**Multiple handles per path (path-keyed cache)**~~ — DONE 2026-10-12: pages are keyed by a per-path file id (assigned at `open`, refcounted across handles, handle -> id map); `rename`/`delete`/`create_truncate` invalidate only the affected files' pages, no whole-cache `clear()` remains.
+- **A whole-file invalidation scans the resident map** (last close, truncating open, `rename`, `delete` run `ramcache.removeMatching`) — LOW, bounded by `max_pages`. (R-pagecache-2)
+- **Read-ahead's scratch buffer is up to the cache's own byte budget per sequential miss** — LOW, a caller option and documented on `Options.read_ahead_pages`. (R-pagecache-3)
+- **`findByPath`/`findById` are linear in the open files** — LOW, kvtree holds two. (R-pagecache-4)
+- **A double `releasePage`, or one after `deinit`, is undetected** (a `ramcache` assert; documented on `preadRef`); a generation token would close it. (R-pagecache-5)
 
 ## Anchoring
 
@@ -403,6 +346,6 @@ internal and was driven through its public SQL API, not called directly.
 - **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
-**Model-fuzz test.** `test "model-fuzz: PageCache over SimStorage == naive per-file byte model (300 seeds)"` (src/root.zig, `mfCase`) drives the public `Storage` vtable and `preadRef`/`releasePage` of a `PageCache` (page size 16 B, `max_pages` in {1,2,3,5,8}, read-ahead 0/2/4) over `SimStorage` with 300 seeded `DefaultPrng` sequences of 80-300 operations. From 2026-10-12 it opens up to two handles per path and runs `rename`/`delete`/`create_truncate` with handles open; names are per path and bytes per file (a handle follows its file across `rename`/`delete`, like the backend), with extra reach classes (second handle, shared read after another handle's write, rename/delete/create_truncate with open handles, I/O on a nameless file) and a check that the handle table matches the open handles. The reference model (`MfModel`) is one byte array per file written from the `Storage` contract alone (a write overlays and zero-fills a gap, truncate shrinks, a read is short at EOF) and knows nothing of pages, residency or eviction. After every step it asserts: each `pread`/`size` equals the model, the inner media equals the model (write-through, also after a failed or torn write), a borrow keeps the snapshot it was handed and is lent only for a fully present page, `resident_pages <= max_pages + borrowed_pages`, and `hits + misses` / `ref_hits + ref_misses` equal the calls issued. Eviction order is not modelled (implementation choice). Reach classes, each required to occur at least once or the test fails: hit, miss, eviction, ref hit/miss/null, read-ahead, over-cap by borrow, borrow outliving an overwrite, short and EOF reads, unaligned write, failed and torn write, read-only denial, truncate, close/reopen, `create_truncate`, rename, delete, open errors. Negative control (2026-10-11): `dropFrom`'s `first = len / page_size` changed to `+ 1` makes this test fail (seed 169800638660609, step 135) as well as the existing narrowing tests; reverted. The test syncs before `truncate` to avoid an unrelated `SimStorage.dropUnsyncedAbove` free-length bug (kv module).
+**Model-fuzz test.** `test "model-fuzz: PageCache over SimStorage == naive per-file byte model (300 seeds)"` (src/root.zig, `mfCase`) drives the public `Storage` vtable and `preadRef`/`releasePage` of a `PageCache` (page size 16 B, `max_pages` in {1,2,3,5,8}, read-ahead 0/2/4) over `SimStorage` with 300 seeded `DefaultPrng` sequences of 80-300 operations. It opens up to two handles per path and runs `rename`/`delete`/`create_truncate` with handles open; names are per path and bytes per file (a handle follows its file across `rename`/`delete`, like the backend), with extra reach classes (second handle, shared read after another handle's write, rename/delete/create_truncate with open handles, I/O on a nameless file) and a check that the handle table matches the open handles. The reference model (`MfModel`) is one byte array per file written from the `Storage` contract alone (a write overlays and zero-fills a gap, truncate shrinks, a read is short at EOF) and knows nothing of pages, residency or eviction. After every step it asserts: each `pread`/`size` equals the model, the inner media equals the model (write-through, also after a failed or torn write), a borrow keeps the snapshot it was handed and is lent only for a fully present page, `resident_pages <= max_pages + borrowed_pages`, and `hits + misses` / `ref_hits + ref_misses` equal the calls issued. Eviction order is not modelled (implementation choice). Reach classes, each required to occur at least once or the test fails: hit, miss, eviction, ref hit/miss/null, read-ahead, over-cap by borrow, borrow outliving an overwrite, short and EOF reads, unaligned write, failed and torn write, read-only denial, truncate, close/reopen, `create_truncate`, rename, delete, open errors. The test syncs before `truncate` to avoid an unrelated `SimStorage.dropUnsyncedAbove` free-length bug (kv module).
 
 **What the tests actually contain.** internal buffer-pool page cache, no wire, LMDB/Postgres named as concept analogues only
