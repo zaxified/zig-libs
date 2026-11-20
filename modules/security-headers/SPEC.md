@@ -26,14 +26,14 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [helmetjs/helmet](https://github.com/helmetjs/helmet) — **reference** | TypeScript | MIT | 10.7k | v8.3.0 (2026-07-11) | Structured CSP builder (`directives` objects, defaults merged, **per-request functions such as nonces**), typed `Strict-Transport-Security` with a preload check, one flag per legacy header. Defaults per its README, which this module now matches header for header (see Scope parity below); no `Clear-Site-Data` helper (the earlier claim was wrong). |
+| [helmetjs/helmet](https://github.com/helmetjs/helmet) — **reference** | TypeScript | MIT | 10.7k | v8.3.0 (2026-07-11) | Structured CSP builder (`directives` objects, defaults merged, **per-request functions such as nonces**), typed `Strict-Transport-Security` with a preload check, one flag per legacy header. Defaults per its README, which this module matches header for header (see Scope parity below); no `Clear-Site-Data` helper. |
 | [unrolled/secure](https://github.com/unrolled/secure) | Go | MIT | 2.4k | v1.17.0 (2024-10-22) | Go middleware: HSTS, frame options, content-type nosniff, CSP with **per-request nonce**, SSL redirect and proxy-header handling, host allow-list. Wider than headers alone; the **fastest candidate** for the performance reference (per-request `Process`, Go; MIT, so its source may be read and ported with NOTICE). *(survey 2026-10-17)* |
 | [gin-contrib/secure](https://github.com/gin-contrib/secure) | Go | MIT | 138 | push 2026-10-03 | Port of unrolled/secure for Gin: the same options (HSTS, frame deny, nosniff, CSP, SSL redirect, allowed hosts). *(survey 2026-10-17; release not checked)* |
 | [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/) | (catalog) | Apache-2.0 (`mainsite/` files, per this module's NOTICE) | — | continuously updated | Not a library: the recommended header set and example values; this module's four external anchors come from it and from RFC 7034/6797. |
 | [tower-rs/tower-http](https://github.com/tower-rs/tower-http) (`SetResponseHeaderLayer`) | Rust | MIT (`tower-http/LICENSE`) | 919 | tower-http-0.7.1 (2026-08-31) | Generic set-header layers with if-not-present semantics; no security-header curation. *(inferred)* |
 | Zig ecosystem | Zig | — | — | — | No dedicated security-headers package found: httpz has only CORS as built-in middleware (README); Zig `std` has none. A Zig user hand-writes `setHeader` calls. *(searched README/docs; no repository found)* |
 
-**Where we are ahead:** secure defaults ahead of helmet's (`X-Frame-Options: DENY`, COOP/CORP `same-origin`), a `csp_api` deny-everything posture for JSON APIs next to helmet's own default, a comptime `applyStatic` that compiles to slot writes, precomputed immutable headers with no allocation or lock on the hot path, and header values byte-anchored to RFC 7034/6797 and OWASP examples; the only such module in Zig. Closed value sets checked at `init` and at compile time (`InvalidPolicyValue`, helmet 8.3.0's sets plus COOP/COEP report-to parameters, 2026-11-05). **Where we are behind:** no request-time directive callbacks (the nonce is an explicit call, `applyCspNonce`, not a function in the policy), no CSP hash helper, no SSL redirect / host allow-list (not response headers), and the 500/431/414/413 replies `http.Server` builds itself carry the headers only when they are handed to `error_headers` (`staticHeaders` at compile time, `headerList` at run time) — Express's `finalhandler` keeps helmet's headers on its error replies on its own.
+**Where we are ahead:** secure defaults ahead of helmet's (`X-Frame-Options: DENY`, COOP/CORP `same-origin`), a `csp_api` deny-everything posture for JSON APIs next to helmet's own default, a comptime `applyStatic` that compiles to slot writes, precomputed immutable headers with no allocation or lock on the hot path, and header values byte-anchored to RFC 7034/6797 and OWASP examples; the only such module in Zig. Closed value sets checked at `init` and at compile time (`InvalidPolicyValue`, helmet 8.3.0's sets plus COOP/COEP report-to parameters). **Where we are behind:** no request-time directive callbacks (the nonce is an explicit call, `applyCspNonce`, not a function in the policy), no CSP hash helper, no SSL redirect / host allow-list (not response headers), and the 500/431/414/413 replies `http.Server` builds itself carry the headers only when they are handed to `error_headers` (`staticHeaders` at compile time, `headerList` at run time) — Express's `finalhandler` keeps helmet's headers on its error replies on its own.
 
 ## Design & invariants
 
@@ -71,147 +71,126 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
   configured. Two ready-made postures ship as constants: `csp_api` (deny-everything, for pure
   JSON/binary APIs) and `csp_helmet_default` (helmet's browser-app default). COEP (`require-corp`)
   is off by default, matching helmet — it blocks every embedded cross-origin resource that doesn't
-  opt in via CORP/CORS. The five legacy/cluster defaults are ON, as in helmet; this changes the
-  emitted bytes of `.{}` relative to earlier versions (5 more header lines, 125 bytes of the
-  response header budget with `apply`, none with `applyStatic`). `api_options` (2026-10-18) is the posture for a pure API: the same defaults without those
-  five browser-document headers (six headers, the pre-parity set); the default itself stays helmet's.
+  opt in via CORP/CORS. The five legacy/cluster defaults are ON, as in helmet. `api_options` is the posture for a pure API: the same defaults without those
+  five browser-document headers (six headers); the default itself stays helmet's.
+- **Header byte budget (`init`):** `apply` copies only the HSTS value and `extra` into the response's
+  fixed header-byte buffer (`http.Server.ResponseWriter.header_buf`, 4096 bytes); every other configured value
+  is lent (`setHeaderBorrowed` / `setHeaderStatic`), so a large CSP cannot be starved by bytes another
+  middleware copied first. `init` still checks the whole configured set against that budget,
+  conservatively (lent values counted too), and refuses it with `InitError.HeaderBudgetExceeded` in every
+  build mode, as it does for more distinct header names than `http`'s 32 response-header slots. It also refuses
+  a value holding CR, LF, NUL or any byte `http` refuses in a field value (`InvalidHeaderValue`, every knob and
+  `extra`), an `extra` name that is not an RFC 9110 token or is a framing name `http` acts on (`Connection`,
+  `Content-Length`, `Transfer-Encoding`, `Trailer`: `InvalidExtraHeaderName`), a closed-set knob outside its set
+  (`InvalidPolicyValue`; `applyStatic` reports each as a compile error). The configured slices are lent, so
+  they must outlive the middleware.
+- **Error replies:** `staticHeaders(comptime options)` and `SecurityHeaders.headerList(out)` give the set
+  `apply` leaves on a response, in `apply`'s order, one entry per name (an `extra` named like a built-in or
+  an earlier `extra` replaces it in place, with its own spelling and value, as `setHeader` does; `staticPut`
+  and `listPut` dedupe identically, pinned by a parity test over the default, `api_options`, an all-on set
+  and an all-off set). `out` of `max_header_list_len` entries always suffices; `headerList` lends `sh`'s
+  slices and HSTS buffer, so `sh` must stay alive and in place while the list is in use. Feed either to
+  `error_headers` of `http.Server` or `h2_server`. Reference: Express's `finalhandler`, the error path of
+  helmet's users, keeps every header middleware set and sends each once; Go's `net/http` writes its own
+  400/431 bare, so unrolled/secure users get none there. This module follows the reference.
+- **Nonce rendering:** a nonce policy rendered again over an earlier one on the same response reuses the
+  earlier header's bytes (`http`'s `putHeader` rewrites a replaced header's own copy when the new value fits
+  or it is the last one stored); the configured policy is lent, so the first render is a single copy.
+  `renderNonce` refuses a `csp.Nonce` text outside the CSP base64-value alphabet (a hand-built `Nonce` has a
+  public `text`) and a `nonce_in` directive that is not a source list or whose list is `'none'`
+  (`NonceDirectiveInvalid`), or is absent from the policy (`NonceDirectiveMissing`).
+- **CSP builder caller lists are linear:** `csp.build` / `render` / `renderNonce` track `remove`, `nonce_in`
+  and the per-directive checks with bitmaps over the closed `Name` enum, so a repeated name in `remove` or
+  `nonce_in` is idempotent (set semantics) and a `directives` list naming a directive twice is
+  `DuplicateDirective`, exactly as helmet 8.3.0's `parseDirectives` throws on a duplicate (it keeps a `Set` of
+  names seen; helmet has no `remove` list or nonce list, a directive set to `null` is its removal).
 
-## Threat model / out of scope
+
+## Threat model / Limits
 
 Not a WAF or input validator: it only sets response headers, it never inspects or blocks requests.
-Error replies: when a handler *errors*, `http.Server` resets the response to build its own automatic
-500, and the server's own 400/431/414/413 replies bypass the router; both carry this module's headers
-only through `http.Server.Options.error_headers`, fed from `staticHeaders` (a comptime `Options`) or
-`SecurityHeaders.headerList` (a runtime-built one, 2026-11-17).
-HSTS is meaningful only over HTTPS — browsers ignore it over plain HTTP, so shipping it is harmless
-there, but deploying it on a host not actually served via TLS is a caller misconfiguration this
-module cannot detect (and once cached, browsers refuse plain-HTTP access for `max-age`, so `preload`
-is opt-in and effectively permanent). The CSP nonce is only as good as its use: it must be fresh per
-response (`applyCspNonce` draws one per call), must not be served from a cache shared between users
-and must not be put into attacker-controllable markup; the builder cannot check any of that.
+
+- **Error replies.** When a handler *errors*, `http.Server` resets the response to build its own automatic
+  500, and the server's own 400/431/414/413 replies bypass the router; both carry this module's headers only
+  through `http.Server.Options.error_headers`, fed from `staticHeaders` (a comptime `Options`) or
+  `SecurityHeaders.headerList` (one built at run time).
+- **HSTS** is meaningful only over HTTPS: browsers ignore it over plain HTTP, so shipping it is harmless
+  there, but deploying it on a host not actually served via TLS is a caller misconfiguration this module
+  cannot detect (and once cached, browsers refuse plain-HTTP access for `max-age`, so `preload` is opt-in and
+  effectively permanent). RFC 6797 §7.2 says an HSTS host must not send the header over plain HTTP; the module
+  does not know the transport (see Backlog).
+- **The CSP nonce** is only as good as its use: it must be fresh per response (`applyCspNonce` draws one per
+  call), must not be served from a cache shared between users and must not be put into attacker-controllable
+  markup; the builder cannot check any of that.
+- **`init`'s byte check is strict.** It counts lent values too, so a configuration over the 4 KiB copy budget
+  (a very large CSP) is refused even though the lent values would fit on the wire. Decided (owner delegated,
+  safe default): it stays strict; a documented opt-out is added only if a consumer needs a CSP over 4 KiB.
+- **CSP builder checks are partial.** Any quoted token passes (`'selff'`, an empty `'nonce-'`), `'none'`
+  beside other sources is accepted, and a directive outside the `Name` enum needs the raw string (see Backlog).
 
 ## Verification
 
-Offline goldens over the socket-free `http.Server.serveStream`: byte-exact default header
-set, per-header disable + all-off bare response, per-header value overrides, CSP/Report-Only
-opt-in, COEP opt-in, HSTS value for every flag combination including the `maxInt(u64)` buffer bound,
-handler-override precedence with no duplicate header, `Server` replacement over the auto value,
-404/405 fallback coverage, bare `ResponseWriter.apply`. Parity items (2026-10-17): the five legacy
-defaults byte-exact in the golden and each disabled alone; HSTS preload errors at the boundaries;
-`csp.build(.{})` == helmet 8.3.0's default CSP (comptime) and `csp_helmet_default`; comptime and
-runtime rendering equal; override/remove/append order; every unquoted keyword, unbalanced quotes
-and injection characters refused; nonce KATs (bytes → base64), 64 distinct `secure` nonces, nonce
-rendered into script-src/style-src through the middleware chain and echoed by the handler, one
-CSP header only; `applyStatic` fed a comptime-built policy. In-process integration (`router` +
-`http.Server` + `http.Client` over loopback): a normal 200 carries the full default set and no
-opt-in headers; a handler that sets its own `X-Frame-Options` wins — skips only when loopback
-binding is unavailable.
+Run: `scripts/modtest security-headers`.
 
-**External anchor, added 2026-08-01**: every test above compares this module's own output
-against string literals this module's own author wrote — an in-house re-derivation, not an
-external anchor (running `helmet.js` and diffing was considered but is blocked: `node`/`npm`
-are not installed on the reference machine). Instead, four goldens compare our precomputed
-default/opt-in header VALUES byte-for-byte against short literal example lines copied verbatim
-from published third-party documents (not derived from this module): RFC 7034 §2.2.1's own
-`X-Frame-Options: DENY` example, RFC 6797 §6.2's own `max-age=31536000` example (the numeric
-token; the RFC's own separate `max-age=0; includeSubDomains` example independently proves the
-no-space-before-semicolon `includeSubDomains` form is RFC-illustrated, not this module's
-invention), and the OWASP Secure Headers Project's own example lines for
-`X-Content-Type-Options`, `Referrer-Policy`, `Cross-Origin-Resource-Policy`,
-`Cross-Origin-Opener-Policy`, and `Cross-Origin-Embedder-Policy` (`mainsite/01_headers.md`,
-Apache-2.0 — see `modules/security-headers/NOTICE`). This is a genuine external anchor for the
-headers it covers. **Not covered**: `Content-Security-Policy` — neither RFC 7034/6797 nor the
-OWASP page publish a single recommended CSP value string comparable to `csp_helmet_default`
-(OWASP's own CSP example is the generic `script-src 'self'`), so at that date `csp_helmet_default` was self-anchored (superseded: the 2026-10-05 browser oracle,
-see Anchoring, now judges it; `helmet.js` itself was never run, `node`/`npm` are missing).
-
-Run: `zig build test-security-headers`.
-
-**Audit 2026-10-24 (review + mutation, grade-1 wave).** An independent read-only review found no
-HIGH and no injection path (`http` re-validates names and values). Fixed: `init`'s value check was a
-Debug-only assert, so a ReleaseFast build with a CR/LF/NUL value failed every request instead of
-failing `init` (now `InvalidHeaderValue` in every mode, every knob and `extra` value); `extra` took
-the framing names `http` acts on instead of emitting (`Connection`, `Content-Length`,
-`Transfer-Encoding`, `Trailer` — every connection closed, a declared body length), now
-`InvalidExtraHeaderName` as `applyStatic` already refused at compile time; the docs still called the
-server's error replies bare although `error_headers` + `staticHeaders` covers them for a comptime
-`Options`. Documented + Backlog: a nonce replace over a large configured CSP spends the header budget
-twice (`http` does not reclaim), HSTS over plain HTTP (RFC 6797 §7.2; transport unknown here),
-closed value sets for the string knobs, CSP builder keyword/`'none'` checks. 88 schemata mutants over
-the run-time code (every `init` check incl. each framing name, `validFieldName` classes, the preload
-rule and boundary, HSTS formatting, the budget check, each `appliedHeaderBytes` term, each `apply`
-emission, the CSP builder's checks/separators/nonce text, the nonce alphabet/length/RNG): 87 killed,
-1 equivalent — dropping `secureZero` of the raw nonce bytes (a stack local no black-box test can
-observe). Two survivors of the first run got tests: every named value knob is now poisoned one at a
-time. The comptime-only paths (`staticHeaders`, `hstsStaticValue`, `csp.build`) are covered by the
-2026-10-18 compile-time mutation below and the `applyStatic == apply` parity tests.
-
-**Mutation (2026-11-17, delta: `headerList`)** — schemata, ReleaseSafe, the whole suite per mutant: each of the 17 emissions dropped, `listPut`'s replace-by-name (dropped, keeping the old spelling) and its capacity check (dropped): 20/20 killed on the first run (the parity test against the response table `apply` leaves, over four configurations incl. an `extra` overriding a built-in in another spelling; the capacity mutant panics on the exact-fit buffer). The 2026-11-17 `applyCspWithNonce` change is documentation only (the reuse lives in `http`, mutated there).
-
-**Mutation (2026-11-07, whole module,** `csp.zig` + `root.zig`, schemata in a detached copy, ReleaseSafe, strict verdict — a pass/skip change is not a kill): 399 run-time mutants (463 ids, 64 unused padding ids in the token-set blocks), 35 compile-time clones (`staticHeaders`, `hstsStaticValue`, `api_options`, checked by a dispatch test against the `applyStatic == apply` option sets and the api_options golden) and 12 keyword typos: 442 killed, 4 equivalent, 0 undecided. The first run left 84 alive; five new tests closed them (every directive follows its class, every byte value classified, the CSP keywords spelled out independently of the table, `apply` copies only the HSTS value and `extra`, `appliedHeaderSlots` cut-off; closed-set whitespace/case/`;` variants and every Referrer-Policy token). Equivalent: `checkValue` falling through after the quote block (no keyword holds a quote), the `remove` absent-guard (an absent name is not in `order`), `renderImpl`'s `nonce != null` forced true (private; `build`/`render` pass `null` only with `&.{}`), `Nonce.secure`'s `secureZero` of a stack local already copied out. **Correction:** the 2026-10-18 paragraph's equivalence of `isSourceList(.require_trusted_types_for)` was wrong — the flip lets a nonce into `require-trusted-types-for`; now pinned. Finding (LOW, fixed `2a0cdabc`): a hand-built `Nonce` (public `text`) reached the header unvalidated; `renderNonce` now refuses anything outside the base64-value alphabet — that post-run guard is pinned by its own test, every bad byte and every alphabet class. Cut: `@compileError` branches (their run-time twins are mutated), constants/defaults (pinned by the byte-exact goldens and boundary tests), `staticHeaders` emission order, `browser_oracle_*`.
-
-**Mutation (2026-10-18,** the helmet-parity code: `csp.zig` and `root.zig`, schemata over a copy, one ReleaseSafe build, the whole suite except the loopback `integration:` test): 72 run-time mutants + 13 compile-time ones. Run-time: `checkValue` (empty, every control/space/`;`/`,`/DEL boundary, quote balance, quote inside, keyword case), `isSourceList` (six non-source-list directives), `isFlag`/`mayBeEmpty`, `Out.put`/`putName` buffer boundaries and `_`→`-`, `renderImpl` (defaults, remove, override position, duplicate, `ConflictingRemove`, `NoDirectives`, every nonce check, `EmptyDirective`, `UnexpectedValues`, separators, the nonce text), the default directives, `Nonce.fromBytes`, `preloadValid` (both bounds, `include_subdomains`), `validFieldName` (empty, digits, `.`), the two `init` errors, the budget boundary, eight `appliedHeaderBytes` terms, ten `apply` emissions, `applyCspWithNonce`'s two switches and the middleware call. First run: 55 killed, 17 alive. The survivors were all one gap: the CSP builder's **run-time** path was pinned only by `comptime` goldens, and a `comptime` evaluation cannot see a run-time defect. New tests (`csp.zig`: `render (runtime): override position, append and remove…`, `…flags and sandbox…`, `validation: report-to / report-uri…`, `render: a buffer that fits exactly…`, `renderNonce: an empty source list…`; `root.zig`: `init accepts every RFC 9110 token character…`) killed 15; 2 are equivalent: `isSourceList(.require_trusted_types_for)` (the only valid value `'script'` passes both paths; the mutant differs only on input invalid for that directive) and the `if (!present[i]) continue` guard in `remove` (removing an absent directive leaves `order` and `count` unchanged). Compile-time (`api_options` fields, `staticHeaders`/`hstsStaticValue` emissions, the preload minimum): not reachable by an env switch, so applied as one source edit per group on a copy — the `api_options` flips fail the byte-exact test at compile time; the others failed `applyStatic: …` and the new `applyStatic == apply: every optional header on…` (added because `Permissions-Policy`, COEP and the Report-Only name in `staticHeaders` were pinned by nothing).
-
-**Mutation (2026-10-04, before the 2026-10-17 parity code; not rerun on it,** schemata over a copy, one ReleaseSafe build, the whole suite): 26
-mutants — `validFieldName` (empty, `:`/SP), the extra-name check, both HSTS flags, the budget
-comparison (boundary and removal), seven terms of `appliedHeaderBytes` and every one of
-`apply`'s twelve emissions. First run: 22 killed, 4 alive — `appliedHeaderBytes` terms
-(Report-Only CSP, COEP, Server, Permissions-Policy) the budget tests never summed; one test
-added that checks the sum against the bytes `apply` actually serialized with every header
-enabled; rerun: 26 killed. No defect found.
+- **Goldens** over the socket-free `http.Server.serveStream`: the byte-exact default header set; per-header
+  disable and the all-off bare response; per-header value overrides; CSP and Report-Only opt-in; COEP opt-in;
+  the HSTS value for every flag combination including the `maxInt(u64)` buffer bound; handler-override
+  precedence with no duplicate header; `Server` replacement over the automatic value; 404/405 fallback
+  coverage; a bare `ResponseWriter.apply`; the five legacy defaults byte-exact and each disabled alone.
+- **Init and closed sets:** HSTS preload errors at the boundaries; every closed-set knob value and typo;
+  every `extra` framing name; every named knob poisoned with a CR/LF/NUL value one at a time; the budget and
+  slot boundaries; `applyStatic == apply` for every optional header on; `staticHeaders == headerList` parity.
+- **CSP builder** (`src/csp.zig`): `csp.build(.{})` equals helmet 8.3.0's default CSP and `csp_helmet_default`
+  (comptime); comptime and run-time rendering equal; override, remove and append order; every unquoted keyword,
+  unbalanced quote and injection character refused; run-time path pinned separately from the comptime goldens
+  (a `comptime` evaluation cannot see a run-time defect); exact-fit buffers; nonce known answers (bytes to
+  base64), distinct `secure` nonces, nonce rendered into `script-src` / `style-src` through the middleware
+  chain and echoed by the handler, one CSP header only; every bad nonce byte and alphabet class; set
+  semantics and 5000-entry caller lists.
+- **Loopback integration** (`router` + `http.Server` + `http.Client`): a normal 200 carries the full default
+  set and no opt-in header; a handler that sets its own `X-Frame-Options` wins. Skips only when loopback
+  binding is unavailable.
+- **External anchors:** four goldens compare the precomputed values byte for byte against short literal
+  example lines copied from published third-party documents, not derived from this module: RFC 7034 §2.2.1's
+  `X-Frame-Options: DENY`, RFC 6797 §6.2's `max-age=31536000` (its `max-age=0; includeSubDomains` example
+  independently shows the no-space `includeSubDomains` form), and the OWASP Secure Headers Project's example
+  lines for `X-Content-Type-Options`, `Referrer-Policy`, `Cross-Origin-Resource-Policy`,
+  `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` (`mainsite/01_headers.md`, Apache-2.0, see
+  `NOTICE`). No such published literal exists for `Content-Security-Policy`; `csp_helmet_default` is judged by
+  the browser oracle instead (see Anchoring); `helmet.js` itself is never run.
+- **Browser oracle** (`src/browser_oracle_test.zig`, vectors in `src/browser_oracle_vectors.zig`): replays
+  what headless Chrome did with this middleware's headers; retaking it needs `bun` and `google-chrome`
+  (`tools/README.md`, `zig build interop-security-headers`).
+- **Fuzz:** none; the card's fuzz entry is n/a (no fuzz obligation under check-fuzz).
+- **Compile-time code** (`staticHeaders`, `hstsStaticValue`, `api_options`, `csp.build`) is covered by the
+  byte-exact goldens and the `applyStatic == apply` parity tests.
+- **Bench / lead probe:** `zig build bench-security-headers` (`tools/bench.zig`, against unrolled/secure) and
+  `tools/lead_probe` (the card's `**Ahead:**` claims); see `tools/README.md`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-security-headers`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 9.5 %): ref 0.01–0.73×, against 0.01–0.77× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-security-headers` against unrolled/secure (header work only, no HTTP stack) and
+`tools/go_fast_bench` against gofiber/fiber helmet; the figures are the card's `**Performance:**` line.
+
+## What is deliberately not done
+
+- **Reporting-Endpoints / Report-To.** helmet 8.3.0 has none either; reachable through `extra`. Rejected for
+  parity.
+- **Request-time directive callbacks, SSL redirect, host allow-list** (see Compared with): the nonce is an
+  explicit call, and the others are not response headers.
 
 ## Backlog / deferred
-- **Delta audit 2026-10-29 (no-panic sweep § GJ):** 6 mutants (old CR/LF/NUL predicate, slot check dropped, built-in and repeated-extra dedupe dropped, CSP copied instead of lent, every built-in counted): 6/6 killed on the first run; the RID-1 test gained a CSP-only case first, because the default set alone freed enough room to hide a copied CSP. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GJ):** (a) `init`'s byte check still counts the lent values, so it is now conservative: a CSP larger than the 4 KiB copy budget would work on the wire but is refused. **Decided: stays strict (owner delegated 10-29, safe default)** — a documented opt-out only if a consumer ever needs a > 4 KiB CSP. (b) SH-3 (LOW) — **closed 2026-11-17:** `renderImpl`'s scans over caller lists (`remove`, `nonce_in`, the `remove`-vs-`directives` conflict check, the per-directive nonce lookup) were O(list × names). They are now linear: name sets are bitmaps over the closed `Name` enum. Behaviour is unchanged: a repeated name in `remove` or `nonce_in` is idempotent (set semantics), and a `directives` list that names a directive twice — which any list longer than the 26 names must — is still `DuplicateDirective`, exactly as helmet 8.3.0's `parseDirectives` throws `received a duplicate directive` (it keeps a `Set` of names seen; helmet has no `remove` list or nonce list to compare, a directive set to `null` is its removal). Tested at 5000-entry lists and a 60-entry directive list (`caller lists: repeated names are set-idempotent…`); delta mutation 12 mutants, 9 killed, 3 equivalent (the `count != 0` guard around an empty loop, the already-set `continue` in the nonce loop — cost only, `nonce != null` in `with_nonce` — private, `render` passes a null nonce only with `&.{}`).
 
-- **DONE 2026-11-17 — headers on server-generated error replies for a RUNTIME config** *(survey
-  2026-09-30; comptime path via `http.Server.Options.error_headers` + `staticHeaders`)* —
-  `SecurityHeaders.headerList(out)` writes the set `apply` leaves on a response (its order, one entry
-  per name, an overriding `extra` replacing in place) into a caller array of `max_header_list_len`,
-  lending `sh`'s slices; the result feeds `error_headers` of `http.Server` / `h2_server`. `http` needed
-  no change: `error_headers` was already a run-time slice. Reference behaviour: Express's
-  `finalhandler` (the error path helmet's users get) keeps every header middleware set and only
-  overrides CSP/nosniff and the content headers (`pillarjs/finalhandler` `send`, read 2026-11-17);
-  Go's `net/http` writes its own 400/431 bare, so unrolled/secure users get none there. We follow the
-  reference. (`staticHeaders`' duplicate-name gap, noted here at the time, is closed by the next item.)
-- **DONE 2026-11-17 — `staticHeaders` repeated a name `extra` overrides** *(found 2026-11-17, LOW)* —
-  the comptime list now dedupes exactly like `headerList` (`staticPut`: case-insensitive name match,
-  the overriding entry replaces in place with its own spelling and value, repeated `extra`s likewise;
-  no new semantics). Reference: `apply` (`setHeader` replaces by name) and Express's `finalhandler`
-  error path, which sends each header once. Test "staticHeaders == headerList: one entry per name…"
-  (parity over the default, `api_options`, an all-on set with a re-spelled and a repeated `extra`, and
-  an all-off set, plus the concrete order/spelling/value).
-  Delta mutation (clone per mutant, comptime code): 5 of 5 killed (the name match never true, case-sensitive
-  match, replace at index 0 instead of the match, the replaced entry keeping its old name, keeping its
-  old value), all by the new parity test.
-- **DONE 2026-11-17 — a replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s
-  `putHeader` now rewrites a replaced header's own copy when the new value fits there or the copy is
-  the last one in the store (and no other entry borrows its bytes), so a nonce policy rendered again
-  over an earlier one reuses its bytes (test "applyCspWithNonce: a large nonce policy set again
-  reuses its header bytes…"). Since 2026-10-29 the configured policy is lent by `apply`, not copied,
-  so the first nonce render was already a single copy; the double spend that remained was a second
-  render on the same response.
-- **HSTS only over a secure transport** *(review 2026-10-24)* — RFC 6797 §7.2: an HSTS host MUST NOT
-  send the header over plain HTTP. The module does not know the transport (no `is_tls` on the
-  request); a predicate option (`fn (*const router.Ctx) bool`) would need that flag from `http`.
-- **CSP builder: quoted keywords and `'none'`** *(review 2026-10-24)* — any quoted token passes
-  (`'selff'`, an empty `'nonce-'`), `'none'` beside other sources is accepted, and directives outside
-  the `Name` enum (`fenced-frame-src`, `webrtc`) need the raw string.
-- **CSP hash helper (`'sha256-…'` of an inline block)** *(2026-10-17)* — values can be given by hand
-  today; a helper would hash at comptime. Not in helmet 8.3.0. Low priority.
-- **Reporting-Endpoints / Report-To** *(survey 2026-10-17)* — helmet 8.3.0 has none either; reachable
-  via `extra`. Rejected for parity.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · util · reentrant` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **HSTS only over a secure transport** — RFC 6797 §7.2: an HSTS host MUST NOT send the header over plain HTTP.
+  The module does not know the transport (no `is_tls` on the request); a predicate option
+  (`fn (*const router.Ctx) bool`) would need that flag from `http`.
+- **CSP builder: quoted keywords and `'none'`** — any quoted token passes (`'selff'`, an empty `'nonce-'`),
+  `'none'` beside other sources is accepted, and directives outside the `Name` enum (`fenced-frame-src`,
+  `webrtc`) need the raw string.
+- **CSP hash helper (`'sha256-…'` of an inline block)** — values can be given by hand today; a helper would
+  hash at comptime. Not in helmet 8.3.0. Low priority.
 
 ## Anchoring
 

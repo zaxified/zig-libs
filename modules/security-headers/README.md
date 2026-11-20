@@ -119,8 +119,10 @@ automatic `Server:` header.
 Error replies: when a handler *errors*, `http.Server` resets the response
 to build its automatic 500, and its own 400/431/414/413 replies bypass the
 router. Pass `staticHeaders(options)` (comptime `Options`) as
-`http.Server.Options.error_headers` and those replies carry the same set;
-a runtime-built `SecurityHeaders` cannot feed that list.
+`http.Server.Options.error_headers` and those replies carry the same set; for
+a `SecurityHeaders` built at run time, `sh.headerList(&buf)` (a
+`[SecurityHeaders.max_header_list_len]http.Header` buffer) gives the same list,
+lending `sh`'s slices, so `sh` must stay alive while the server runs.
 
 ## HSTS is HTTPS-only
 
@@ -215,16 +217,16 @@ high-resolution timers); off by default, matching helmet.
 that go through the middleware. Middleware cannot *remove* it — to drop the
 header entirely, configure `http.Server` with `.server_name = null`.
 
+## Not provided
+
+No request-time directive callbacks (the nonce is the explicit
+`applyCspNonce`), no CSP hash helper, no SSL redirect or host allow-list, no
+`Reporting-Endpoints` helper (use `extra`); see SPEC *What is deliberately
+not done* and *Backlog / deferred*.
+
 ## Verification
 
-`zig build test-security-headers` — offline goldens over the socket-free
-`http.Server.serveStream` (byte-exact default header set, per-header
-disable + all-off bare response, per-header value overrides, CSP/Report-Only
-opt-in, COEP opt-in, HSTS value for every flag combination incl. the
-maxInt(u64) buffer bound, handler-override precedence with no duplicate
-header, Server replacement over the auto value, 404/405 fallback coverage,
-bare-`ResponseWriter` `apply`), plus an in-process integration run
-(`router` + `http.Server` + `http.Client` over loopback: a normal 200
-carries the full default set and no opt-in headers; a handler that sets its
-own `X-Frame-Options` wins) that only skips when loopback binding is
-unavailable.
+`scripts/modtest security-headers` — offline goldens over the socket-free
+`http.Server.serveStream`, the CSP builder's tests, a loopback integration run
+and the browser-oracle replay; the classes are listed in SPEC *Verification*.
+The card's `**Audit:**` line in SPEC is the current score.
