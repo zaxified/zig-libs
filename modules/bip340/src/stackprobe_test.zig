@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for `sign` (A1/bip340.md F2), kept in the module
+//! Dead-stack residue probe for `sign` (A1 audit F2), kept in the module
 //! per `CONVENTIONS.md` §9: the instrument that checks one module lives with
 //! that module, not in an audit note.
 //!
-//! Method (2026-10-08): the direct-region engine of `p256`'s probe (painted
+//! Method: the direct-region engine of `p256`'s probe (painted
 //! region below the probe, call under a `PAD`-deep shim, snapshot scanned for
 //! 32-byte needles) — the earlier "scan a local buffer" form was
 //! blind to the top few hundred bytes of the measured call. ReleaseFast/
@@ -26,7 +26,7 @@
 //! `expectNoResidue` is shared: this file checks the public `sign`, and
 //! `root.zig` checks `computeAndBurn` alone — with no step-10 `verify` after
 //! it, whose frames overwrite the same region and would hide a missing burn
-//! (they did hide the original residue from 2026-09-11 on).
+//! (they did hide the original residue).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -71,7 +71,7 @@ fn keyEndingIn(last: u8) [32]u8 {
     return sk;
 }
 
-// ── the measured region (2026-10-08) ────────────────────────────────────────
+// ── the measured region ────────────────────────────────────────
 //
 // Direct-region engine, as `p256`'s probe: the region lies `PAD` bytes below
 // the probe's own stack position and the measured call runs as `shim(call)`

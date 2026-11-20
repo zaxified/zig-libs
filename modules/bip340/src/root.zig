@@ -104,7 +104,7 @@ pub const XOnlyPublicKey = struct {
 /// `invoice_node_id (33)`, both verified x-only per BIP340's forced-even-y
 /// convention, so the parity prefix byte is not consulted for SIGN, only
 /// checked to be a real SEC1 marker — `0x02`/`0x03` — before being dropped).
-/// A1 audit F11 (2026-09-11): the 33-byte branch used to accept ANY leading
+/// A1 audit F11: the 33-byte branch used to accept ANY leading
 /// byte (`0x04`, `0x00`, anything), so a structurally-invalid SEC1 point
 /// would silently pass through as if it were a real one. Still purely
 /// structural beyond that one check: it does not validate that the
@@ -235,8 +235,8 @@ pub const KeyPair = struct {
     secret: [32]u8,
     public: XOnlyPublicKey,
 
-    /// The key by pointer, the pair into `out` (zeroed on error; BREAKING
-    /// 2026-10-08): by value and returned in an error union, the caller's
+    /// The key by pointer, the pair into `out`:
+    /// by value and returned in an error union, the caller's
     /// frame kept the key, `d` and `n − d` (`stackprobe_test.zig`,
     /// direct-region engine).
     pub fn fromSecretKey(out: *KeyPair, sk: *const SecretKey) SecretKeyError!void {
@@ -250,7 +250,7 @@ pub const KeyPair = struct {
         out.* = try derive(sk);
     }
 
-    /// Review 2026-10-08 R2 (HIGH). `fromSecretKey` had no burn of its own:
+    /// Review R2 (HIGH). `fromSecretKey` had no burn of its own:
     /// it ran inside `sign`'s burned frame only, until `signWithKeyPair`
     /// made the caller's own `fromSecretKey` call the documented way to
     /// sign. Measured with `stackprobe_test.zig` (ReleaseFast): the
@@ -303,11 +303,11 @@ pub const KeyPair = struct {
     /// for the same reason as `burnSignStack`.
     noinline fn burnKeyPairStack() void {
         // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-        // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+        // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
         // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
         // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
         // between the buffer top and the saved frame pointer unzeroed -- a callee's
-        // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+        // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
         // the buffer alone did not stop it). At 16 the frame needs no realignment and
         // the buffer ends at the saved frame pointer.
         const V = @Vector(2, u64);
@@ -316,7 +316,7 @@ pub const KeyPair = struct {
         for (0..buf.len) |i| p[i] = @splat(0);
     }
 
-    /// `derive`'s call tree reached 1.8 KiB in ReleaseFast (2026-10-08);
+    /// `derive`'s call tree reached 1.8 KiB in ReleaseFast;
     /// `stackprobe_test.zig` goes red when it outgrows this.
     const keypair_stack_burn = 8 * 1024;
 
@@ -416,7 +416,7 @@ pub const SignError = error{
 /// does not consume `io`.
 ///
 /// Step 10 runs only with `opts.self_verify` (see `SignOptions`; off by
-/// default since 2026-11-13, as in libsecp256k1).
+/// default, as in libsecp256k1).
 pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io, opts: SignOptions) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
     const result = signFromSecretKey(secret_key, msg, aux_rand, opts);
@@ -424,7 +424,7 @@ pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io:
     return result;
 }
 
-/// Review 2026-10-08 R1 (HIGH). Whatever `sign`'s own frame holds sits ABOVE
+/// Review R1 (HIGH). Whatever `sign`'s own frame holds sits ABOVE
 /// the region `computeAndBurn` zeroes, and since `359a678d` it held a copy of
 /// the secret key: first the `SignKey` union built by value, then — with the
 /// union made of pointers — the copy Zig makes of a parameter whose address is
@@ -443,8 +443,8 @@ pub const SignOptions = struct {
     /// (`error.SignatureVerificationFailed`) if it does not. It guards against
     /// FAULT attacks — a glitched computation whose wrong signature would leak
     /// the key — and costs about one `verify` (more than the signing itself).
-    /// Off by default, as in libsecp256k1 (owner decision 2026-11-13, which
-    /// reversed the 2026-10-07 one to always run it); turn it on where an
+    /// Off by default, as in libsecp256k1 (owner decision, which
+    /// reversed the one to always run it); turn it on where an
     /// attacker can induce faults (hardware wallets, signers on shared or
     /// untrusted hardware).
     self_verify: bool = false,
@@ -482,13 +482,12 @@ const SignKey = union(enum) { secret: *const SecretKey, pair: *const KeyPair };
 /// compare `s·G − e·P` with `R` projectively, without an inversion.
 const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey, r_y: Fe };
 
-/// A1 F5, round-2 follow-up (2026-09-11): the first version of this seam
+/// A1 F5, round-2 follow-up: the first version of this seam
 /// split `sign` into `computeUnverified` + a standalone `selfCheck`, and a
 /// test called both directly — but that only proved `selfCheck` can reject
 /// a bad signature; it said nothing about whether `sign`'s own body still
 /// CALLS it. Measured: deleting `sign`'s `try selfCheck(...)` line left
-/// every test green (`feedback_n_copies_of_one_invariant_is_one_
-/// unverifiable_guard` — the guard and the thing verifying it were two
+/// every test green (the guard and the thing verifying it were two
 /// separate, independently-deletable places).
 ///
 /// Fixed by moving the seam to where the fault can be injected BEFORE the
@@ -498,12 +497,11 @@ const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey, r_y: Fe };
 /// (public, unchanged signature) is a one-line call into `signImpl` with
 /// the real computation (`computeUnverified`); a permanent test calls
 /// `signImpl` with a deliberately corrupted computation and confirms THIS
-/// function — not a copy of its logic (`feedback_a_test_that_
-/// reimplements_the_code_cannot_fail`) — rejects it. Because the check now
+/// function — not a copy of its logic — rejects it. Because the check now
 /// lives on the one path both production and the test go through, deleting
 /// it (or defeating it) is caught: the corrupted-input test starts
 /// returning the corrupted signature instead of an error. Measured three
-/// ways in the fix commit's dispozice (`A1/bip340.md`): today's tree
+/// ways in the fix commit's audit notes (A1 audit): today's tree
 /// (GREEN), the self-check CALL deleted from `signImpl` (RED), and the
 /// self-check's own verdict ignored/short-circuited (RED) — plus a
 /// positive control (an honest computation still succeeds).
@@ -520,7 +518,7 @@ fn signImpl(
 }
 
 /// Step 10: BIP340 verification of `computed.sig` under `computed.pubkey`,
-/// with the last step done projectively (2026-11-13). `verify` converts
+/// with the last step done projectively. `verify` converts
 /// `R' = s·G − e·P` to affine (one inversion) to test `x(R') == r` and
 /// `y(R')` even; here the expected point is known — `(r, r_y)` — so after
 /// checking that `r_y` is the even root of `r³ + 7` (making `(r, r_y)` THE
@@ -541,7 +539,7 @@ fn selfCheck(computed: *const ComputeResult, msg: []const u8) bool {
 /// Run steps 1-9, then zero the stack region they used before anything reads
 /// their result — on the error path too.
 ///
-/// A1/bip340.md F2. Zeroing named locals is not enough: steps 1-9 leave the
+/// A1 audit F2. Zeroing named locals is not enough: steps 1-9 leave the
 /// effective scalar `d` and the nonce in dead callee frames the source has no
 /// name for. Measured with `stackprobe_test.zig`'s method on the audited tree
 /// (`22e1aa5c`, ReleaseFast, 48 KiB below the call, four keys of both
@@ -580,11 +578,11 @@ const sign_stack_burn = 16 * 1024;
 /// green. Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -762,12 +760,12 @@ pub const BatchItem = struct {
 /// cannot deliver, the batch is reported unverified (`false`) rather than
 /// checked against predictable randomizers.
 ///
-/// Implementation (2026-10-07): the equation is evaluated as one sum that
+/// Implementation: the equation is evaluated as one sum that
 /// must vanish, `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O`, by k256's
 /// multi-base Straus multiply (`Secp256k1.mulMultiBasePublic`): one doubling
 /// chain per `batch_chunk` items instead of one per item, every addition a
 /// mixed one, and G once per batch. Same equation, same acceptance set.
-/// Until then (A1 audit F3, 2026-09-04) each item ran its own double-base
+/// Until then (A1 audit F3) each item ran its own double-base
 /// multiply and the batch was 1.03–1.12× SLOWER than a loop over `verify`;
 /// see `SPEC.md` for the numbers now.
 const batch_chunk = 8;
@@ -985,7 +983,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
     try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, on, corruptRy));
 }
 
-// ── no-panic sweep 2026-11-13 (B340) ────────────────────────────────────────
+// ── no-panic sweep (B340) ────────────────────────────────────────
 
 /// An `Io` whose `randomSecure` always yields zeros (a degenerate CSPRNG) and
 /// counts the draws; every other operation is `inner`'s.
@@ -1141,14 +1139,14 @@ noinline fn stackprobeComputeAndBurn(sk: *const SecretKey, aux: *const [32]u8) v
 
 // A1 F2: `sign`'s own probe cannot see a missing burn, because the step-10
 // `verify` that follows `computeAndBurn` overwrites the same stack region —
-// that is exactly how the residue went unseen from 2026-09-11 on. This one
+// that is exactly how the residue went unseen. This one
 // calls `computeAndBurn` with nothing after it, so the burn is the only thing
 // between steps 1-9 and the scan.
 test "STACKPROBE (A1 F2): computeAndBurn alone leaves no key or nonce residue on the dead stack" {
     try @import("stackprobe_test.zig").expectNoResidue("computeAndBurn, no step-10 verify after it", stackprobeComputeAndBurn);
 }
 
-// ── delta-audit 2026-11-14 (stale-src restore): tests asked for by surviving mutants ──
+// ── delta-audit (stale-src restore): tests asked for by surviving mutants ──
 
 /// `e = int(taggedHash(challenge, r || P || msg)) mod n`, the challenge a test
 /// needs to build signatures that are wrong in one chosen way.

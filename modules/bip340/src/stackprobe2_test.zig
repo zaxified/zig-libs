@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for the key
-//! construction entry points burned in the 2026-10-09 sweep:
+//! construction entry points burned in the sweep:
 //! `SecretKey.fromBytesInto`, `SecretKey.fromBytes` (residue only: it returns
 //! the key by value, which is the caller's frame by contract) and
 //! `PublicKey.fromSecretKey`. Signing and `KeyPair.fromSecretKey` stay covered

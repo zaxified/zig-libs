@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over bip340's existing `testing.fuzz` harnesses
-//! (added 2026-10-07). The harness bodies stay where they were, now generic
+//! Deterministic fuzz driver over bip340's existing `testing.fuzz` harnesses.
+//! The harness bodies stay where they were, now generic
 //! over their source of choices (`fn(comptime S, *S, gpa)`); this file adds the
 //! cursor adapter `testing.fuzz` feeds them through, the driver tests, and a
 //! 500-seed in-suite run with a reach check.

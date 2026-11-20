@@ -304,7 +304,7 @@ test "KAT: hexAlloc helper decodes variable-length messages (sanity for the sign
 // verified the pristine, valid vector-0 signature — which the KAT tests two
 // screens up already assert — and not one corrupted byte ever reached the
 // `r < p` / `s < n` range checks or the curve-equation check the comment
-// says the budget is spent near. Measured 2026-09-07: 1 round, 1 input, 0
+// says the budget is spent near. Measured: 1 round, 1 input, 0
 // bytes flipped, 0 refusals from `Signature.fromBytes`.
 //
 // The flip loop is gone. A signature is 64 octets off the wire, so the
@@ -458,7 +458,7 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
         accepted += 1;
         if (bip340.verify(pk, &msg_buf, sig)) verified += 1;
     }
-    // Measured 2026-09-07. Before: 1 round, 1 input, 0 refusals, 1
+    // Measured. Before: 1 round, 1 input, 0 refusals, 1
     // verification — of the pristine vector the KATs already assert.
     try std.testing.expectEqual(sig_seeds.len - 1, nonempty); // the deliberate empty seed
     try std.testing.expectEqual(@as(usize, 3), refused);
@@ -468,7 +468,7 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
 
 // ── F1: verifyBatch's randomizers are what a mutation test needs to see ────
 //
-// A1 audit F1 (2026-09-01): the random
+// A1 audit F1: the random
 // linear-combination coefficients `a_2..a_u` are the ONLY thing standing
 // between `verifyBatch` and an attacker who submits a batch of individually
 // INVALID signatures whose errors are crafted to cancel. Before this test,
