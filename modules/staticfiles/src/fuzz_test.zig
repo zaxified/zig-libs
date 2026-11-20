@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over staticfiles' `sanitizePath` traversal-safety
-//! harness (added 2026-10-09). The body is generic over its source of choices
+//! harness. The body is generic over its source of choices
 //! (`fn(comptime S, *S, gpa)`). The first draw is one `slice` of bytes (the
 //! request path, as `std.testing.fuzz` seeds it), then `allow_dotfiles`; a
 //! ranged draw picks a SHAPE: 0 = the bytes as the path (random octets nearly

@@ -105,8 +105,8 @@ pub const meta = .{
     .role = .server,
     // A `Handler` is created once and shared read-only across the server's
     // connection threads; it holds no mutable state, so `serve` is safe to
-    // call concurrently. The per-request scratch is threadlocal (one request
-    // per thread, as elsewhere in the http stack).
+    // call concurrently. Per-request scratch lives in the request's own
+    // frames.
     .concurrency = .shared_read,
     .model_after = "Go net/http FileServer / http.Dir (root-confined open + index) + nginx static handler (Range/conditional/Cache-Control); traversal defense modeled on openat-relative resolution with O_NOFOLLOW",
     .deps = .{"http"},
@@ -626,14 +626,14 @@ fn verifyContainedDir(root: Dir, io: Io, d: Dir) error{Escaped}!void {
 /// Never called after `error.NameTooLong`: such a segment cannot be a
 /// symlink, and zig 0.16's Linux `dirStatFile` treats `ENAMETOOLONG` as a
 /// programmer bug -- a Debug build PANICS on `/dir/<256 bytes>/x` (Go's
-/// net/http oracle, 2026-10-05; Release maps it to `Unexpected`).
+/// net/http oracle; Release maps it to `Unexpected`).
 fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
     const st = parent.statFile(io, seg, .{ .follow_symlinks = false }) catch return false;
     return st.kind == .sym_link;
 }
 
 /// `openFile` of a name to serve, refusing a FIFO, device or socket BEFORE
-/// the open (review 2026-10-24 M3): a blocking `open(O_RDONLY)` of a FIFO
+/// the open (review M3): a blocking `open(O_RDONLY)` of a FIFO
 /// with no writer never returns, so one request per FIFO pinned a connection
 /// thread forever, and the `st.kind != .file` check after the open never ran.
 /// std 0.17 has no `O_NONBLOCK` open on Linux (`lock_nonblocking` only sets
@@ -697,7 +697,7 @@ pub fn resolveFile(root: Dir, io: Io, raw_path: []const u8, opts: Options) (Sani
 /// drops that slash, and without this a regular file answered at
 /// `/secret.txt/` as at `/secret.txt` -- a rule matching the exact path in
 /// front of the server is walked around by one character (Go's net/http
-/// oracle, 2026-10-05: Go redirects, nginx/Apache/POSIX say not found).
+/// oracle: Go redirects, nginx/Apache/POSIX say not found).
 /// Undecodable input answers false; `sanitizePath` refuses it anyway.
 fn namesDirectory(raw: []const u8) bool {
     var buf: [max_path_bytes]u8 = undefined;
@@ -752,7 +752,7 @@ pub const Handler = struct {
                 // From here the answer depends on `Accept`, and the 404 says
                 // so as the fallback's 200 does: without it a shared cache
                 // keeps one client's 404 for a later navigation to the same
-                // URL (review 2026-10-24 L6).
+                // URL (review L6).
                 if (!acceptsHtml(req)) {
                     try sendStatus(rw, 404);
                     rw.setHeader("Vary", "Accept") catch {};
@@ -853,7 +853,7 @@ pub const Handler = struct {
         var avail = [codings.len]bool{ pc.br, pc.zstd, pc.gzip };
         // No index: a DIRECTORY named like a variant (`app.js.br/`) is not
         // one, rather than its index.html served as Brotli (review
-        // 2026-10-24 L7).
+        // L7).
         var vopts = h.options;
         vopts.index = "";
         while (pickCoding(ae, avail)) |c| {
@@ -1260,7 +1260,7 @@ fn isStrongLastModified(io: Io, mtime: Io.Timestamp) bool {
 /// at 16 hex digits each. DERIVED rather than picked, because `bufPrint`'s
 /// failure here is `catch unreachable` — a buffer one byte short would not be
 /// an error, it would be a crash on the first large file. It was a bare 48
-/// until 2026-08-12, which happened to be enough; shrinking it to 24 broke no
+/// until, which happened to be enough; shrinking it to 24 broke no
 /// test, since nothing exercised a size or mtime big enough to need the room.
 /// +2 for `W/` (A1 F5, round-2 Q8) on top of that same 24.
 const etag_max = 2 + 2 + 1 + 2 * 16;
@@ -1315,7 +1315,7 @@ fn sendStatus(rw: *http.Server.ResponseWriter, status: u16) Writer.Error!void {
 /// wrong place.
 fn redirectTrailingSlash(req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
     var buf: [max_path_bytes + 1 + max_path_bytes]u8 = undefined;
-    // The leading `/` run collapsed to one (review 2026-10-24 M1): empty
+    // The leading `/` run collapsed to one (review M1): empty
     // segments are dropped, so `//docs` names the directory `docs`, but
     // `Location: //docs/` is a protocol-relative URL -- an open redirect to
     // the host `docs` (Go answers with a relative Location, nginx merges
@@ -1420,7 +1420,7 @@ fn fallbackPath(req: *const http.Server.Request, allow_dotfiles: bool) bool {
 
 /// Does `req`'s `Accept` list `text/html` with a non-zero weight? (Not
 /// `*/*`: an API client's catch-all is not a navigation; `text/html;q=0`
-/// refuses HTML, review 2026-10-24 L10.)
+/// refuses HTML, review L10.)
 fn acceptsHtml(req: *const http.Server.Request) bool {
     const header = req.header("accept") orelse return false;
     var it = http.conneg.accept(header);
@@ -1447,7 +1447,7 @@ pub const SnapshotOptions = struct {
     /// follows a symlink, never lists a directory and has no SPA fallback:
     /// `follow_symlinks`, `directory_listing` or `fallback` set is
     /// `error.Unsupported` (a fallback used to be ignored silently -- a
-    /// broken SPA deploy with nothing said, review 2026-10-24 L8).
+    /// broken SPA deploy with nothing said, review L8).
     serve: Options = .{},
     precompressed: Precompressed = .{},
     /// Most regular files held -- one open descriptor each. A larger tree is
@@ -1945,7 +1945,7 @@ pub const Live = struct {
         // that read `side`, stalled across a whole publish and only then
         // counted itself on the old side would be invisible to the next
         // publisher, which waits on the other side -- and that one frees
-        // the generation this reader is about to hold (review 2026-10-24 M2).
+        // the generation this reader is about to hold (review M2).
         // Seen again after the increment, `side` proves the publisher that
         // flips it next reads the count first.
         const side = while (true) {
@@ -2597,9 +2597,7 @@ test "serve: a Content-Type that cannot be set answers 500, never a sniffable bo
     // `X-Pad:` with the colon, as it goes on the wire. This is the ONLY
     // assertion here that distinguishes `failUnsafeResponse` from a bare
     // `sendStatus(rw, 500)`: everything else above is equally true of a 500
-    // composed on top of the upstream middleware's headers. Until 2026-08-13
-    // the needle was `X-Pad-`, which the writer can never emit, so dropping
-    // the `rw.reset()` left this test green.
+    // composed on top of the upstream middleware's headers.
     try testing.expect(mem.find(u8, resp, "X-Pad:") == null);
     // And above all: not one byte of the file.
     try testing.expect(mem.find(u8, resp, "hello world") == null);
@@ -3450,14 +3448,14 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
 
     // The same over-long name as a DIRECTORY component: its failed openDir
     // used to go on to a no-follow statFile, which zig 0.16 panics on in
-    // Debug for ENAMETOOLONG (Go net/http oracle, 2026-10-05).
+    // Debug for ENAMETOOLONG (Go net/http oracle).
     var wire_buf3: [1024]u8 = undefined;
     const wire3 = std.mem.print(&wire_buf3, "GET /sub/{s}/x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
     try testing.expectEqual(@as(u16, 404), statusOf(runRequest(&h, wire3, &out)));
 }
 
 test "serve: a file asked for as a directory (/hello.txt/) is 404, never the file" {
-    // Go net/http oracle, 2026-10-05: `sanitizePath` drops a trailing slash,
+    // Go net/http oracle: `sanitizePath` drops a trailing slash,
     // so `/hello.txt/` was served as `/hello.txt` -- an exact-path rule in
     // a proxy in front is walked around by one character. POSIX (ENOTDIR),
     // nginx and Apache say not found; Go redirects to the file.
@@ -3740,7 +3738,7 @@ fn extractHeader(resp: []const u8, prefix: []const u8) ?[]const u8 {
 //    half of the module at all — scoped down per campaign policy; our
 //    existing in-house tests are the only anchor for 412 and stay as-is.
 //
-// 5. `If-Range` — FIXED 2026-08-02, was a real gap this comparison found.
+// 5. `If-Range` — FIXED, was a real gap this comparison found.
 //    Neither `http.range` nor this module read `If-Range` at all, so a
 //    `Range` was honored unconditionally. A client resuming a download
 //    ("if the file changed, send me the whole thing instead of a stale
@@ -5516,7 +5514,7 @@ test "fallback + precompressed: the fallback's sibling is negotiated, and Vary n
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -5526,7 +5524,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation run (2026-11-11): tests for what survived ──────────
+// ── whole-module mutation run: tests for what survived ──────────
 
 /// Descriptors this process holds right now (Linux: `/proc/self/fd`). The
 /// directory handle that iterates it is in both of two readings.
