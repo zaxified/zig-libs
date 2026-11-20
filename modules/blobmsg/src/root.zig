@@ -628,7 +628,7 @@ pub const Client = struct {
                 // The closing STATUS is the daemon's verdict: a non-zero code
                 // is NOT "an empty, complete listing" (`ubus list nosuch`
                 // fails with "Not found"). A real ubusd's closing STATUS of a
-                // LOOKUP always carries its code (captured 2026-11-04: 0 after
+                // LOOKUP always carries its code (captured: 0 after
                 // the entries, 4 for no match), so one without it, or with an
                 // attr too short to hold it, is a `BadMessage`, not "0". A
                 // wildcard that matched nothing may be answered NOT_FOUND

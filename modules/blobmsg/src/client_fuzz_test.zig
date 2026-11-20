@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Scripted-peer fuzz harness for the client's reply state machines (rounds 2
-//! and 3, 2026-11-03): `list`, `invoke`/`invokeReply`, `sendEvent`, `waitFor`,
+//! and 3): `list`, `invoke`/`invokeReply`, `sendEvent`, `waitFor`,
 //! `subscribe` and `EventStream.poll`, driven over a socketpair (a unix
 //! listener for `subscribe`, which opens its own connection) by a PRNG-written
 //! peer script. Half the scripts are a coherent conversation whose frames are

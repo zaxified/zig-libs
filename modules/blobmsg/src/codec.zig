@@ -96,7 +96,7 @@ pub const MSG = struct {
     pub const LOOKUP: u8 = 4;
     pub const INVOKE: u8 = 5;
     pub const ADD_OBJECT: u8 = 6;
-    // Seen on the wire in testdata/ubusd_capture.zig (2026-11-04); the NAMES are recalled
+    // Seen on the wire in testdata/ubusd_capture.zig; the NAMES are recalled
     // interface names, not read from any header: the numbers' use is what the capture shows.
     pub const SUBSCRIBE: u8 = 8;
     pub const UNSUBSCRIBE: u8 = 9;
@@ -115,7 +115,7 @@ pub const ATTR = struct {
     pub const SIGNATURE: u32 = 6;
     pub const DATA: u32 = 7;
     // NO_REPLY, TARGET, ACTIVE and SUBSCRIBERS: the ids are seen in captured frames of a real ubusd
-    // (INVOKE, SUBSCRIBE, NOTIFY, 2026-11-04) and their use is what the frames show, but the NAMES
+    // (INVOKE, SUBSCRIBE, NOTIFY) and their use is what the frames show, but the NAMES
     // are recalled interface names, unverified: no CLI output shows them (SUBSCRIBERS is an 8-byte
     // attr of a notifier's answer, ACTIVE a 1-byte attr of a subscription notice). Only USER and
     // GROUP are confirmed ("user"/"group" in the real CLI's monitor output), as are the attr names
@@ -1106,7 +1106,7 @@ test "blobmsg header + scalar validation" {
     var uf = FieldIterator.init(buf.items);
     try testing.expectError(error.BadLength, uf.next());
     // id 0 (BLOBMSG_TYPE_UNSPEC) is NOT: this asserted a rejection until
-    // 2026-10-06, but libubox writes UNSPEC for a JSON null and prints it as
+    // but libubox writes UNSPEC for a JSON null and prints it as
     // null (libubox_oracle_test.zig).
     buf.clearRetainingCapacity();
     try appendField(testing.allocator, &buf, 0, "u", &.{});
@@ -1616,7 +1616,7 @@ test "corpus: every seed reaches the walkers, and the attrs walked are pinned" {
     }
     // The first seed is deliberately the empty image, so it is `len - 1`.
     try testing.expectEqual(entries.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw every seed arrived empty —
+    // Measured: with the collapsing draw every seed arrived empty —
     // 0 attrs, 0 fields, 0 refusals. After: 10 attrs / 5 fields / 7 refusals.
     try testing.expectEqual(@as(usize, 10), attrs);
     try testing.expectEqual(@as(usize, 5), fields);
@@ -1816,9 +1816,9 @@ test "corpus: every JSON seed reaches encodeArgs, and the octets encoded are pin
         octets += buf.len;
     }
     try testing.expectEqual(encode_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 / 0 / 0 / 0 before — every seed arrived empty and
+    // Measured: 0 / 0 / 0 / 0 before — every seed arrived empty and
     // `std.json` rejected it. After: 12 non-empty / 9 parsed / 6 encoded / 196 octets.
-    // 2026-10-06: 7 encoded / 240 octets -- the seed carrying a JSON null now
+    // 7 encoded / 240 octets -- the seed carrying a JSON null now
     // encodes (to UNSPEC, as libubox does) instead of being refused.
     try testing.expectEqual(@as(usize, 9), parsed_ok);
     try testing.expectEqual(@as(usize, 7), encoded_ok);
@@ -2412,7 +2412,7 @@ test "real capture count canary: nine frozen messages, byte lengths unchanged" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

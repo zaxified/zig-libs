@@ -1027,7 +1027,7 @@ test "monitor: a repeated attr id in the message is a malformed frame, never a d
     try testing.expectEqual(@as(u32, 2), ms.malformed);
 }
 
-// ── delta audit (dbm, 2026-11-04): handshake filtering of the own-connection verbs ──────────
+// ── delta audit (dbm): handshake filtering of the own-connection verbs ──────────
 
 test "delta audit: subscribeObject - stragglers (other seq, other type) in the handshake are skipped; a short OBJID is BadMessage (dbm)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

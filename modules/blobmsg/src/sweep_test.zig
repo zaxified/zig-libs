@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GY), findings BM-1 .. BM-5; from
-//! the 2026-10-29 no-panic sweep of `blobmsg`.
+//! the no-panic sweep of `blobmsg`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -755,7 +755,7 @@ test "EventStream.poll: EOF in the middle of a frame breaks the stream (sweep au
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-// ── goal-3 pass (2026-11-03): status codes are verdicts, a failed read is not absence ──
+// ── goal-3 pass: status codes are verdicts, a failed read is not absence ──
 
 fn feedMsg(fd: i32, mtype: u8, seq: u16, status: ?u32, objid: ?u32) !void {
     const gpa = testing.allocator;
@@ -909,7 +909,7 @@ test "Client.list / invoke: a LOOKUP closing STATUS without a code is BadMessage
     defer _ = linux.close(fds[1]);
     var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
     try feedMsg(fds[1], codec.MSG.STATUS, 1, null, null);
-    // Captured 2026-11-04: a real ubusd's closing STATUS always carries its code (0 or 4),
+    // Captured: a real ubusd's closing STATUS always carries its code (0 or 4),
     // so one without it is no verdict.
     try testing.expectError(error.BadMessage, c.list(null));
     // invoke of a missing object: NotFound, and the daemon's code is kept
@@ -1131,7 +1131,7 @@ test "subscribeObject / monitor: bad input and a broken client are refused befor
     try testing.expectError(error.Connect, c.subscribeObject("obj"));
 }
 
-// ── delta audit (dbm, 2026-11-04): gaps the mutant run found in the 2026-11 client code ──
+// ── delta audit (dbm): gaps the mutant run found in the 2026-11 client code ──
 
 fn feedRaw(fd: i32, mtype: u8, seq: u16, peer: u32, children: []const u8) !void {
     const fr = try codec.encodeMessage(testing.allocator, mtype, seq, peer, children);
