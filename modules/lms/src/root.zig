@@ -87,6 +87,7 @@ pub const SigningKey = sign.SigningKey;
 pub const Position = sign.Position;
 pub const Persist = sign.Persist;
 pub const SignError = sign.SignError;
+pub const TreeSignError = sign.TreeSignError;
 pub const HssError = sign.HssError;
 pub const InitError = sign.InitError;
 

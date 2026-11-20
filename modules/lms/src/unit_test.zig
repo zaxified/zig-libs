@@ -112,6 +112,26 @@ test "LMS: OutputTooSmall consumes no leaf" {
     try std.testing.expectEqual(@as(u32, 0), sk.q);
 }
 
+test "Tree.sign refuses a leaf past 2^h and a short buffer, writes nothing, accepts a longer one" {
+    var t: lms.Tree = undefined;
+    try lms.Tree.init(&t, gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(7), &seedOf(8));
+    defer t.deinit();
+    const len = lms.lmsSignatureLength(.sha256_m32_h5, .sha256_n32_w8);
+    var buf: [lms.max_lms_signature_length]u8 = @splat(0xa5);
+    try std.testing.expectError(error.LeafOutOfRange, t.sign(32, "m", buf[0..len]));
+    try std.testing.expectError(error.LeafOutOfRange, t.sign(std.math.maxInt(u32), "m", buf[0..len]));
+    try std.testing.expectError(error.OutputTooSmall, t.sign(31, "m", buf[0 .. len - 1]));
+    const rnd: [32]u8 = @splat(3);
+    try std.testing.expectError(error.LeafOutOfRange, t.signWithRandomizer(32, "m", &rnd, buf[0..len]));
+    try std.testing.expectError(error.OutputTooSmall, t.signWithRandomizer(0, "m", &rnd, buf[0 .. len - 1]));
+    for (buf) |b| try std.testing.expectEqual(@as(u8, 0xa5), b);
+    // The last leaf, into a longer buffer: the returned slice is exactly the signature.
+    const sig = try t.sign(31, "m", &buf);
+    try std.testing.expectEqual(len, sig.len);
+    try std.testing.expect(lms.lmsVerify(&t.publicKey().toBytes(), "m", sig));
+    try std.testing.expectEqual(@as(u8, 0xa5), buf[len]);
+}
+
 test "tree cache height changes cost, never the signature" {
     var full: lms.Tree = undefined;
     try lms.Tree.initCached(&full, gpa, .sha256_m32_h5, .sha256_n32_w1, idOf(5), &seedOf(6), 0);
@@ -126,8 +146,8 @@ test "tree cache height changes cost, never the signature" {
         try std.testing.expectEqualSlices(u8, &full.root(), &t.root());
         try std.testing.expectEqual((@as(usize, 1) << (5 - c + 1)) - 1, t.nodes.len);
         for ([_]u32{ 0, 1, 6, 17, 31 }) |q| {
-            full.sign(q, "msg", a[0..len]);
-            t.sign(q, "msg", b[0..len]);
+            _ = try full.sign(q, "msg", a[0..len]);
+            _ = try t.sign(q, "msg", b[0..len]);
             try std.testing.expectEqualSlices(u8, a[0..len], b[0..len]);
         }
     }

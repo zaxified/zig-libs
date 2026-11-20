@@ -83,6 +83,10 @@ computation).
   leaf, so it is unpredictable to an attacker and, because each leaf signs once,
   never repeated across messages. `Tree.signWithRandomizer` exists so the KATs can feed
   the RFC's `C`.
+- **`Tree` checks its arguments.** The stateless `Tree.sign` / `signWithRandomizer` return
+  `TreeSignError` — `LeafOutOfRange` for `q >= 2^h`, `OutputTooSmall` for a short `out` (nothing
+  written) — and the signature slice `out[0..lmsSignatureLength]`. There is one, checked, form,
+  as in cisco/hash-sigs, whose `lm_ots_generate_signature` returns `false` on a short buffer.
 - **Tree storage and cost.** A `Tree` caches every public node at height `>= c`, where
   `c = max(0, h - 15)`: at most `2^16 - 1` nodes (2 MiB). The `c` lowest levels of the
   authentication path are rebuilt per signature from sibling subtrees (`2^c - 1`
@@ -270,10 +274,6 @@ and every cached node against §5.3's recursive definition.
   its seeds and stale position do not linger, but `deinit` on the zeroed source is still not a no-op the type
   system prevents. A stricter shape would build the `SecretKey` in place inside the handle
   (`SigningKey.initInPlace(dst, gpa, levels, seed, id, restore_at, persist)`).
-- **`Tree.sign` / `signWithRandomizer` preconditions are `std.debug.assert` only** (INFO): `q >= 2^h` or `out.len != lmsSignatureLength` is a panic in ReleaseSafe and
-  undefined behaviour in ReleaseFast. `Tree` is the stateless building block (`LmsSecretKey` /
-  `SecretKey` check both before calling it); a checked variant returning an error would be an
-  API addition.
 - **W1/W2 external vectors:** the RFC has none; a foreign implementation's output (as
   oracle) would give them.
 

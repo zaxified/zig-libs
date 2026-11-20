@@ -91,14 +91,14 @@ test "Test Case 2: both public keys regenerate from the RFC's SEED and I (Append
     const sig0 = tc2_sig[4..][0..2508];
     const c0: [32]u8 = sig0[8..40].*;
     var out0: [2508]u8 = undefined;
-    t0.signWithRandomizer(3, l1, &c0, &out0);
+    _ = try t0.signWithRandomizer(3, l1, &c0, &out0);
     try std.testing.expectEqualSlices(u8, sig0, &out0);
 
     // final_signature: leaf 4 of the level-1 tree signs the message.
     const fin = tc2_sig[4 + 2508 + 56 ..];
     const c1: [32]u8 = fin[8..40].*;
     var out1: [1292]u8 = undefined;
-    t1.signWithRandomizer(4, &tc2_msg, &c1, &out1);
+    _ = try t1.signWithRandomizer(4, &tc2_msg, &c1, &out1);
     try std.testing.expectEqualSlices(u8, fin, &out1);
 }
 

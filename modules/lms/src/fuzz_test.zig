@@ -196,7 +196,7 @@ fn fuzzLmsSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!v
     const q = src.valueRangeAtMost(u32, 0, 31);
     const sig_len = core.lmsSignatureLength(.sha256_m32_h5, ots_sets[which]);
     var sig: [core.max_lms_signature_length]u8 = undefined;
-    tree.sign(q, msg, sig[0..sig_len]);
+    _ = try tree.sign(q, msg, sig[0..sig_len]);
     const pk = tree.publicKey().toBytes();
     if (!core.lmsVerify(&pk, msg, sig[0..sig_len])) return error.GenuineSignatureRefused;
     SignMark.mark(.genuine_accepted);
@@ -208,7 +208,7 @@ fn fuzzLmsSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!v
     if (core.lmsVerify(&pk, msg, sig[0..src.index(sig_len)])) return error.TruncatedSignatureVerified;
     SignMark.mark(.truncated_refused);
 
-    tree.sign(q, msg, sig[0..sig_len]);
+    _ = try tree.sign(q, msg, sig[0..sig_len]);
     var m2: [41]u8 = undefined;
     @memcpy(m2[0..ml], msg);
     m2[ml] = src.value(u8);

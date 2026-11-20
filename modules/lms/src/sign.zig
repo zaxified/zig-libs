@@ -66,6 +66,16 @@ pub const SignError = error{
     OutputTooSmall,
 };
 
+/// `Tree.sign` / `signWithRandomizer`: the stateless building block checks its
+/// arguments and returns an error, as cisco/hash-sigs' `lm_ots_generate_signature`
+/// and `lms_generate_signature` return `false`.
+pub const TreeSignError = error{
+    /// `q >= 2^h`: the tree has no such leaf.
+    LeafOutOfRange,
+    /// `out` is shorter than `lmsSignatureLength`.
+    OutputTooSmall,
+};
+
 /// One LMS tree with the secret seed and a cache of its public nodes. It has
 /// **no** signing state: `sign` takes the leaf index and does not remember
 /// it. Use `LmsSecretKey` or HSS `SecretKey` for the stateful discipline.
@@ -168,10 +178,26 @@ pub const Tree = struct {
         return stack[0];
     }
 
-    /// Write the LMS signature (§5.4) of `msg` under leaf `q` to `out`
-    /// (`out.len == lmsSignatureLength`). Does not touch any state: signing
-    /// one leaf twice with different messages breaks the scheme.
-    pub fn sign(self: *const Tree, q: u32, msg: []const u8, out: []u8) void {
+    /// Write the LMS signature (§5.4) of `msg` under leaf `q` to `out` and
+    /// return `out[0..lmsSignatureLength]`. `q >= 2^h` is
+    /// `error.LeafOutOfRange`, a short `out` `error.OutputTooSmall` (nothing
+    /// written). Does not touch any state: signing one leaf twice with
+    /// different messages breaks the scheme.
+    pub fn sign(self: *const Tree, q: u32, msg: []const u8, out: []u8) TreeSignError![]u8 {
+        const sig = try self.checkedOut(q, out);
+        self.signUnchecked(q, msg, sig);
+        return sig;
+    }
+
+    fn checkedOut(self: *const Tree, q: u32, out: []u8) TreeSignError![]u8 {
+        if (q >= self.lms.leaves()) return error.LeafOutOfRange;
+        const len = core.lmsSignatureLength(self.lms, self.ots);
+        if (out.len < len) return error.OutputTooSmall;
+        return out[0..len];
+    }
+
+    /// `sign` for callers that checked `q` and `out.len == lmsSignatureLength`.
+    fn signUnchecked(self: *const Tree, q: u32, msg: []const u8, out: []u8) void {
         burn.run(burn.sign_burn, void, signDerived, .{ self, q, msg, out });
     }
 
@@ -182,9 +208,11 @@ pub const Tree = struct {
 
     /// `sign` with a caller-chosen LM-OTS randomizer `C` — for known-answer
     /// tests, where the RFC's `C` is fixed. `C` must be unpredictable to an
-    /// attacker (§7.1); prefer `sign`.
-    pub fn signWithRandomizer(self: *const Tree, q: u32, msg: []const u8, rnd: *const [n]u8, out: []u8) void {
-        burn.run(burn.sign_burn, void, signBody, .{ self, q, msg, rnd, out });
+    /// attacker (§7.1); prefer `sign`. Same checks and result as `sign`.
+    pub fn signWithRandomizer(self: *const Tree, q: u32, msg: []const u8, rnd: *const [n]u8, out: []u8) TreeSignError![]u8 {
+        const sig = try self.checkedOut(q, out);
+        burn.run(burn.sign_burn, void, signBody, .{ self, q, msg, rnd, sig });
+        return sig;
     }
 
     fn signBody(self: *const Tree, q: u32, msg: []const u8, rnd: *const [n]u8, out: []u8) void {
@@ -252,7 +280,7 @@ pub const LmsSecretKey = struct {
         if (out.len < len) return error.OutputTooSmall;
         const q = self.q;
         self.q += 1; // advanced before any signature byte exists
-        self.tree.sign(q, msg, out[0..len]);
+        self.tree.signUnchecked(q, msg, out[0..len]);
         return out[0..len];
     }
 };
@@ -457,7 +485,7 @@ pub const SecretKey = struct {
                 return e;
             };
             const child_pub = tree.publicKey();
-            self.trees[i - 1].?.sign(d[i - 1], &child_pub.toBytes(), buf);
+            self.trees[i - 1].?.signUnchecked(d[i - 1], &child_pub.toBytes(), buf);
             self.pubs[i] = child_pub;
             self.sigs[i - 1] = buf;
             self.path[i - 1] = d[i - 1];
@@ -498,7 +526,7 @@ pub const SecretKey = struct {
             off += LmsPublicKey.encoded_len;
         }
         const bl = core.lmsSignatureLength(self.levels[last].lms, self.levels[last].ots);
-        self.trees[last].?.sign(d[last], msg, out[off..][0..bl]);
+        self.trees[last].?.signUnchecked(d[last], msg, out[off..][0..bl]);
         std.debug.assert(off + bl == total);
         return out[0..total];
     }
