@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | `address.toBase58Check`/`fromBech32`/`toOutputScript`: script <-> address in one call *(inferred)*. |
 | [The-King-of-Toasters/zig-bech32](https://github.com/The-King-of-Toasters/zig-bech32) | Zig | MIT | 5 | push 2023-05-15 | Zig bech32 only (as listed); stale since 2023. Zig `std` has no bech32 or base58 (checked: `rg -il bech32` over 0.16.0 `lib/std` finds nothing). |
 
-**Where we are ahead:** the only maintained pure-Zig bech32/bech32m + base58check codec in one module; BIP350 variant rule enforced with one typed error per rejection reason; complete BIP173/BIP350 vector appendices and 21 Core base58 vectors; fixed-size, allocation-free, secrets wiped in the base58 scratch. **Where we are behind:** no bech32 error location (→ Backlog). The address layer (parse any address string, detect network, scriptPubKey <-> address, WIF, P2SH helpers) lives in the sibling `btcaddr` module, not here.
+**Where we are ahead:** the only maintained pure-Zig bech32/bech32m + base58check codec in one module; BIP350 variant rule enforced with one typed error per rejection reason; complete BIP173/BIP350 vector appendices and 21 Core base58 vectors; fixed-size, allocation-free, secrets wiped in the base58 scratch. **Where we are behind:** no bech32 error location (→ Backlog / deferred). The address layer (parse any address string, detect network, scriptPubKey <-> address, WIF, P2SH helpers) lives in the sibling `btcaddr` module, not here.
 
 ## Design & invariants
 
@@ -55,37 +55,36 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **`base58.decode`'s `BufferTooSmall` guard is load-bearing, and it is pinned.** `max_encoded_len`
   admits a 180-character string on purpose, and 180 leading `1`s decode to 180 zero bytes — more
   than `checkDecode`'s 132-byte staging buffer. The `total > out.len` check is the only thing
-  between that paste and a write past the end: measured 2026-09-06 with the check deleted, Debug
-  panics and **ReleaseFast writes 48 bytes past the buffer and hands a wallet a 180-byte slice
-  into its 8-byte array**. The 2026-08-08 ledger cited that guard as its proof of a PASS while no
-  test asserted it; "BufferTooSmall is the only wall…" in `base58.zig` does now, on both
+  between that paste and a write past the end: with the check deleted, Debug panics and
+  **ReleaseFast writes 48 bytes past the buffer and hands a wallet a 180-byte slice
+  into its 8-byte array**. "BufferTooSmall is the only wall…" in `base58.zig` asserts it, on both
   directions and on the Base58Check envelope (whose payload bound is `max_payload_len - 4`, so the
   envelope `encode` sees stays within `max_payload_len` instead of failing one copy later).
 
-- **`base58` carries secrets and wipes its scratch; it is NOT constant-time.** WIF and `xprv`
+- **`base58` carries secrets and wipes its scratch; its plain pair is NOT constant-time.** WIF and `xprv`
   are Base58Check payloads and `bip32` is the in-tree caller. Every scratch buffer that holds the
   payload or its base-58 digits is a CONVENTIONS.md §2.1 Z1 site and is wiped on every exit
   (`encode`'s `b58`, `decode`'s `b256`, both Base58Check staging buffers) — without the wipes,
   one literal copy of a 32-byte secret after `checkEncode` and two after `checkDecode` survived on
-  the dead stack in ReleaseFast even though the caller had zeroed its own buffer (2026-09-06; a
+  the dead stack in ReleaseFast even though the caller had zeroed its own buffer (a
   stack wipe is justified by §2.1's rule, not by a regression test, which §2.1 says cannot see
   it). Timing: `encode`/`decode`/`checkEncode`/`checkDecode` are NOT constant-time —
   `alphabet[d]` is indexed by the payload's base-58 digits and the carry loops run a
   value-dependent number of iterations — and stay so for public data (addresses, xpub).
-  **Key material goes through `checkEncodeSecret`/`checkDecodeSecret` (2026-10-18)**: the same
+  **Key material goes through `checkEncodeSecret`/`checkDecodeSecret`**: the same
   strings, payloads and errors (pinned against the variable-time pair as the oracle: random
   fixed-length payloads at every leading-zero count, every byte value at four positions, the
   fuzz driver checks the verdict on every input), with time and addresses depending only on the
   public lengths. Every input byte/character goes through every position of a fixed-width
   accumulator (`maxEncodedLenFor(n)` digits / 132 bytes); digit <-> character is computed by
-  masks, never a table (`geBit`'s bit laundered through an asm barrier since 2026-11-18: on baseline x86-64, `-mcpu=x86_64`, LLVM compiled `digitChar`'s `7 * geBit`/`6 * geBit` into `cmp`/`jae` on the secret digit, portable ctgrind `bip32 xprv` and `btcaddr wif` 2 -> 0 in-file); leading zeros/`1`s are counted with a running mask and the string is
+  masks, never a table (`geBit`'s bit is laundered through an asm barrier: on baseline x86-64, `-mcpu=x86_64`, LLVM otherwise compiles `digitChar`'s `7 * geBit`/`6 * geBit` into `cmp`/`jae` on the secret digit); leading zeros/`1`s are counted with a running mask and the string is
   moved into place by a masked barrel shifter (its mask laundered through an empty asm, else
-  LLVM unswitched the loop on it: 1 context at `encodeSecret (base58.zig:0)` measured). Public
+  LLVM unswitches the loop on it). Public
   by contract and declassified through `public`: the payload and string lengths, the decoded
   length (for a valid string of a fixed-length format it is the format's length) and the
   accept/reject verdict. Measured by `bip32`'s ctgrind `xprv` target (serialize + parse of an
-  xprv with the scalar tainted): **12 in-file before (all in `encode`), 0 after**, witness 2
-  (before: 0 — the table load made the string "defined", hiding the decode side). `encodeSecret`
+  xprv with the scalar tainted) and `btcaddr`'s `wif` target: 0 contexts in-file in both, `xprv`
+  witness 2. `encodeSecret`
   needs `out.len >= maxEncodedLenFor(n)` up front (WIF 51/52, xprv 112) and zero-fills the bytes
   past the returned slice. `bech32.zig`/`segwit.zig` hold no secret at all.
 
@@ -129,12 +128,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   internally consistent with the variant rule this module enforces (same v0 addresses,
   corrected checksums for the v1+ ones).
 
-- **BIP173's own "invalid segwit addresses" list IS used** (`invalid_segwit_bip173`, 10 vectors,
-  audit A1 L5, 2026-09-14). Nothing there is superseded: an address BIP173 calls invalid is still
+- **BIP173's own "invalid segwit addresses" list IS used** (`invalid_segwit_bip173`, 10 vectors).
+  Nothing there is superseded: an address BIP173 calls invalid is still
   invalid under BIP350, so the reason for dropping the valid list does not apply. Three entries
   (`bc1rw5uspcuh`, `bc10w508…`, `bc1zw508…` — witness versions 3, 15, 2 with a plain-bech32
   checksum) are rejected as `InvalidVariant` rather than the BIP173 reason (program length,
   padding): BIP350's variant rule is checked first. Two entries also sit in BIP350's list.
+
+- **Length-uncapped callers can't use `encode`/`decode` themselves** (both enforce BIP173's
+  90-character total ceiling via fixed stack buffers), but `polymod`, `charValue`, `toLower` and
+  `hrpExpandInto` — the BCH-checksum/charset primitives underneath them — are
+  length-generic (plain slices, no internal cap) and are `pub`, exported through `root.zig`, for
+  exactly this case. `lninvoice`'s allocator-owned BOLT#11/#12 codec (`bech32_raw.zig`) uses them
+  instead of carrying its own copy — see that module's SPEC for
+  what still has to differ (the HRP length cap, buffer ownership).
 
 - Reentrant, no shared state, no heap allocation. `deps`: `ripemd160` (`hash160` for the
   P2PKH/P2WPKH helpers) + `std.crypto.hash.sha2.Sha256` (base58check's double-SHA256).
@@ -152,65 +159,55 @@ a deliberate forgery by an attacker who can freely compute SHA-256, only against
 transmission errors; `checkDecode`'s bit-flip-detection test exercises exactly that error-detection
 property, not cryptographic unforgeability.
 
+## What is deliberately not done
+
+- **Bitcoin script-level address type detection** (P2SH-wrapped segwit, decoding a full `scriptPubKey`
+  end-to-end): out of scope. This module handles the two address *encodings* (bech32/bech32m and base58check), not
+  Bitcoin Script; the address layer (any address string, network detection, scriptPubKey <-> address, WIF, P2SH
+  helpers) is the sibling `btcaddr` module.
+- **A dedicated non-Bitcoin bech32 wrapper** (Lightning invoices' bech32 layer, other chains' bech32m formats): not
+  built; `bech32.encode`/`decode` are reusable directly, and no concrete consumer inside this repo has asked for one.
+  Callers that need more than 90 characters use the length-generic primitives (see Design).
+
 ## Verification
 
-`zig build test-bech32` (headless; **Debug by default** — pass `-Doptimize=ReleaseFast` to
-also run the same suite in ReleaseFast; the bare command does not run both on its own). Anchors: the complete BIP173 "Test
-vectors" appendix (7 valid + 12 invalid generic bech32 strings) and BIP350's bech32m analogue (7
-valid + 14 invalid), each invalid vector asserted against its specific documented typed error;
-BIP350's "Test vectors for v0-v16 native segregated witness addresses" (8 valid, checked
-witver+program byte-exact against the vectors' own scriptPubKey hex, plus a re-encode round-trip;
-15 invalid, each against its typed error) — see `kat_vectors.zig`'s doc comment for the
-machine-transcription method (a Python re-implementation of both `decode` and `decodeSegwit` was
-run over every vector and cross-checked against the BIP's stated reason before any Zig code was
-written, catching one hand-transcription typo in the process). `base58.zig` carries a known
-mainnet P2PKH vector (`1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH` <-> version `0x00` + hash160
-`751e76e8199196d454941c45d1b3a323f1433bd6`, independently derived via a Python stdlib bignum
-base58 decode while authoring this module — notably the same hash160 as BIP173's own segwit
-test-vector address, since both encode the same 20-byte pubkey hash via the two different
-Bitcoin address schemes) plus a single-bit-flipped-checksum positive control (both for the
-segwit bech32m-variant path and for base58check). `segwit.zig` additionally covers the
-convertBits round-trip over all program lengths 2..40 and the oversized-data-section
-no-overflow case described above.
-
-## Audit 2026-11-17 (whole-module mutation)
-
-336 mutants over every non-test line of `src/bech32.zig`, `src/segwit.zig` and `src/base58.zig`: the BCH checksum (start value, shifts, masks, the five generator conditions and constants), HRP expansion, `toLower`, `charValue`, the encoding constants and their detection, every `decode` / `encode` guard (length, case mixing, separator, HRP length and byte range, data length, charset, the lowered HRP in the checksum), the 5/8-bit regrouping in both directions with its padding rules, every `decodeSegwit` / `encodeSegwit` check (HRP, empty data, version, variant, program range, the v0 20/32 rule), and in `base58`: both bignum loops, every length gate and exact-size buffer test, the Base58Check envelope and checksum compare, `maxEncodedLenFor`, the constant-time pair (`encodeSecret`, `checkEncodeSecret`, `checkDecodeSecret` and the mask helpers `geBit`, `inRange`, `isZeroBit`, `digitChar`, `charDigit`), and the P2PKH / P2WPKH helpers. One ReleaseSafe schemata build; two further compile-error attempts failed in under a second and are not counted as builds.
-
-300 mutants died on the existing suite (one as a hang), 36 survived the first round. 12 of them are argued below; for the other 24, `src/mutation_test.zig` (8 tests) and one test at the end of `src/base58.zig` were added, and with them every one dies: the single lowercase letter `a` / `z` against an uppercase one is `MixedCase`; HRP bytes 33 and 126 are accepted by `encode` and `decode` (the range ends); `encode` checksums the lowered HRP (`BC` equals `bc`); `encodeSegwit` refuses program lengths 0, 1, 41 and 42; exact-size output buffers work and one byte less is `BufferTooSmall` (`encode`, `decode`, `checkDecode`, `checkDecodeSecret`, `encodeSecret`); a 200-byte payload is `PayloadTooLarge` in `checkEncode` / `checkEncodeSecret` (without the guard it overflows the staging buffer); `encodeSecret` zeroes the bytes past the returned string and the barrel shift is exercised; `isZeroBit` is exactly 1 for 0 and 0 otherwise; `encodeP2PKH` of the compressed generator key gives the well-known address, with the version byte carried (the earlier test composed `checkEncode` by hand and never called it). No codec rule survives: no checksum constant, charset, length limit, case rule or witness-program rule can be changed unnoticed.
-
-12 do not die, none of them a defect:
-
-- 8 EQUIVALENT: `|` for `^` in `polymod` (`chk << 5` has its low five bits clear and `v` is a `u5`); leading zero bytes converted as digits in `base58.encode` (they meet `length == 0` and `carry == 0`, the loop body never runs); the `j > 0` bound of the carry loop in `encode` and `decode` (128 bytes need at most 175 of the 180 digits; n digits never hold more than n bytes); the `checkEncode` bound without the checksum (a payload of 125..128 bytes then fails inside `encode` with the same `PayloadTooLarge`); three constants of `maxEncodedLenFor` (ratio one lower, ratio one higher, bias one lower) that the exhaustive big-integer test over every accepted length 0..128 cannot tell apart (they differ only beyond the accepted range); `geBit` shifting by 14 instead of 15 (its argument `b - 1 - a` lies in -256..44, where bits 14 and 15 agree); `inRange` shifting by 7 instead of 8 (`charDigit` is compared with the table over all 256 inputs and the mutant passes: the masks truncate to the same byte).
-- 2 UNOBSERVABLE: the overflow flag of `checkDecodeSecret` (never recorded, or ignored): 58^180 < 256^132, so no string within the 180-character limit overflows the 132-byte accumulator; the injection would be a longer length limit.
-
-Not mutated: the comptime constants (`max_hrp_len`, `max_len`, `max_payload_len`, `max_encoded_len`, the generator table, the charset and alphabet strings, the `charset_rev` / `alphabet_rev` tables; a schemata switch cannot reach comptime values), pinned by the BIP173/BIP350 and Bitcoin Core vectors; the `std.debug.assert` in `quintetsToProgram` (it guards a slice index that safe builds check anyway); the `Z1` wipes of the scratch buffers (`secureZero` defers; the module has no stack-residue probe, so the wipes are unobservable in a test and stay as audited by the 2026-09-06 measurement); `public()` and `blackBox` (identity at runtime, ctgrind-only). Counts on the card are whole-module.
+- **Run:** `scripts/modtest bech32` (Debug by default; `-Doptimize=ReleaseFast` runs the same suite optimised).
+- **Anchors** (`src/kat_test.zig`, `src/kat_vectors.zig`): the complete BIP173 "Test vectors" appendix (valid and
+  invalid generic bech32 strings) and BIP350's bech32m analogue, each invalid vector asserted against its specific
+  documented typed error; BIP350's "Test vectors for v0-v16 native segregated witness addresses" (valid ones checked
+  witver+program byte-exact against the vectors' own scriptPubKey hex plus a re-encode round-trip; invalid ones each
+  against its typed error); BIP173's own invalid segwit list (see Design); a test that the vector counts match the
+  appendices. `kat_vectors.zig`'s doc comment describes the transcription method (a Python re-implementation of
+  `decode` and `decodeSegwit` run over every vector and cross-checked against the BIP's stated reason before any Zig
+  was written).
+- **Base58** (`src/base58.zig`, `src/base58_vectors.zig`): Bitcoin Core's `base58_encode_decode.json` vectors
+  (external; see `NOTICE`; the one over-long payload is asserted rejected consistently in both directions), a known
+  mainnet P2PKH address independently derived, a single-bit-flipped-checksum positive control, every checksum byte
+  compared, the `BufferTooSmall` guard on both directions, and the `ct base58` tests that hold the constant-time
+  pair to the variable-time one (see Design).
+- **Segwit** (`src/segwit.zig`): `programToQuintets`/`quintetsToProgram` round trip over every program length
+  2..40, whole-HRP comparison, padding rules, v0 length rule from the decoder, and the oversized-data-section
+  no-overflow case.
+- **Boundary tests** (`src/mutation_test.zig` and tests in the three codec files): exact-size output buffers and one
+  byte less, HRP byte range ends, lowered-HRP checksum, program lengths just outside 2..40, `encodeSecret`'s zeroed
+  tail, `encodeP2PKH` through a real public key.
+- **Fuzz:** driver prefix `BECH32_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`; `_ONLY` selects a harness):
+  `bech32-decode`, `base58-decode`, `segwit-decode` (never panic on arbitrary text) and `bech32-roundtrip`,
+  `base58-roundtrip`, `segwit-roundtrip` (a string this module issued is accepted and decodes to what was encoded; a
+  damaged copy is refused), each with a reach test.
+- **ctgrind:** the constant-time `base58` pair is exercised by `bip32`'s `xprv` row and `btcaddr`'s `wif` row in
+  `scripts/checks/ctgrind-expected.tsv` (re-run `--check bip32` and `--check btcaddr` after an edit of `base58.zig`);
+  the module has no harness of its own, and `bech32.zig`/`segwit.zig` hold no secret.
+- **Not mutated:** comptime constants (pinned by the vectors), the `std.debug.assert` in `quintetsToProgram`, the
+  Z1 scratch wipes (no stack-residue probe exists, so they are unobservable in a test), and the identity helpers
+  `public()` / `blackBox`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Backlog / deferred
 
-- ~~**No constant-time Base58 (found again 2026-10-18 pre-tag sweep; documented in `base58.zig`'s header)**: WIF (`btcaddr` `wifDecodeBody`/`wifEncode`) and xprv (`bip32` `serializePrivBody`/`parseExtended`) put private keys through the table + carry loops.~~ **DONE 2026-10-18:** `base58.checkEncodeSecret`/`checkDecodeSecret` (+ `encodeSecret`, `maxEncodedLenFor`), fixed iteration over public lengths, arithmetic alphabet mapping, masked leading-zero handling and barrel shift; WIF and xprv switched. ctgrind bip32 `xprv`: 12 -> 0 in-file (see the constant-time bullet above).
-- **Bitcoin script-level address type detection** (P2SH-wrapped segwit, decoding a full
-  `scriptPubKey` end-to-end) is out of scope — this module handles the two address *encodings*
-  (bech32/bech32m and base58check), not Bitcoin Script.
-- **Non-Bitcoin bech32 consumers** (Lightning invoices' bech32 layer, other chains' bech32m
-  address formats) can reuse `bech32.encode`/`decode` directly today; no dedicated wrapper is
-  built since no concrete consumer inside this repo has asked for one yet.
-- **Length-uncapped callers can't use `encode`/`decode` themselves** (both enforce BIP173's
-  90-character total ceiling via fixed stack buffers), but `polymod`, `charValue`, `toLower` and
-  `hrpExpandInto` — the BCH-checksum/charset primitives underneath them — are already
-  length-generic (plain slices, no internal cap) and are `pub`, exported through `root.zig`, for
-  exactly this case. `lninvoice`'s allocator-owned BOLT#11/#12 codec (`bech32_raw.zig`) uses them
-  instead of carrying its own copy (M6, `A1/bech32.md`, 2026-09-15) — see that module's SPEC for
-  what still has to differ (the HRP length cap, buffer ownership).
-- ~~**Address layer: parse any address string, scriptPubKey <-> address**~~ — done in the sibling `btcaddr` module (`toScriptPubKey`/`fromScriptPubKey`, network detection).
-- ~~**WIF encode/decode and P2SH address helper**~~ — done in `btcaddr` (`wifEncode`/`wifDecode`, `p2shOfRedeemScript` and friends).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · codec · reentrant` + deps: `ripemd160` — canonical source is `pub const meta` in
-src/root.zig.
+- **bech32 error location** (Bitcoin Core's `bech32.cpp` reports where a mistyped character is; see *Compared
+  with*): not built; no consumer has asked.
 
 ## Anchoring
 
@@ -220,5 +217,3 @@ src/root.zig.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** BIP173/BIP350 test vectors fetched directly from bitcoin/bips repo
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-08: imported all 21 of Bitcoin Core's official plain-base58 EncodeBase58/DecodeBase58 vectors (fetched from `master`, transcribed by script into base58_vectors.zig, byte-exact-verified against the source JSON programmatically) — the module's base58 layer's first check against anything other than itself. 20 of 21 round-trip through `encode`/`decode`; the 21st (a 256-byte stress payload Core's suite carries but no real Bitcoin base58 payload ever approaches — max is 78 bytes, xprv/xpub) exceeds this module's documented `max_payload_len`/`max_encoded_len` scope headroom and is asserted to be rejected consistently by both directions rather than silently dropped. Mutation-tested: swapping two characters in `alphabet` (a change `encode`/`decode` share, so the pre-existing self-round-trip test stays green) makes the new external-vector test fail (`exit 1, 1/41 fail`) while the round-trip test does not — the exact "nothing would notice a mistyped value" gap this closes. `modules/bech32/NOTICE` added (Bitcoin Core test-case data, MIT); the root NOTICE list this once updated was retired 2026-09-06 — the obligation lives in the module file.

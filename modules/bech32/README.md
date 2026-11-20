@@ -110,17 +110,17 @@ bytes — generous headroom over P2PKH/WIF/xprv/xpub), `InputTooLong` (`decode`'
 
 ## Tests
 
-`zig build test-bech32` (headless; green in Debug and `-Doptimize=ReleaseFast`). Anchors: the
+`scripts/modtest bech32` (headless; `-Doptimize=ReleaseFast` runs the same suite optimised). Anchors: the
 complete official BIP173 + BIP350 valid/invalid test-vector appendices (generic bech32/bech32m
 strings and v0-v16 segwit addresses), each invalid vector checked against its specific typed
-error; a known mainnet P2PKH base58check vector (independently derived, not from this module's own
-code); single-bit-flipped-checksum positive controls for both bech32m-variant mismatch and
-base58check. See `SPEC.md` for the full verification breakdown and design rationale (including why
-BIP173's own older segwit test-vector list isn't used verbatim).
+error; Bitcoin Core's base58 vectors; a known mainnet P2PKH base58check vector (independently derived, not from
+this module's own code); single-bit-flipped-checksum positive controls for both bech32m-variant mismatch and
+base58check; a deterministic fuzz driver (`BECH32_FUZZ`). See `SPEC.md` for the full verification breakdown and
+design rationale (including why BIP173's own older segwit test-vector list isn't used verbatim).
 
-## Deferred (not implemented)
+## Not provided
 
-- Bitcoin Script-level address-type detection (P2SH-wrapped segwit, full `scriptPubKey` parsing)
-  — out of scope; this module handles the two address *encodings*, not Script.
-- A dedicated non-Bitcoin bech32 wrapper (e.g. Lightning invoices) — `bech32.encode`/`decode` are
-  already reusable directly; no concrete in-repo consumer has asked for a wrapper yet.
+Bitcoin Script-level address-type detection (P2SH-wrapped segwit, full `scriptPubKey` parsing: the `btcaddr`
+module has the address layer), a dedicated non-Bitcoin bech32 wrapper, and bech32 error location; see `SPEC.md`
+*What is deliberately not done* and *Backlog / deferred*. The generic `encode`/`decode` cap strings at BIP173's 90
+characters; longer strings use the `pub` primitives `polymod`, `charValue`, `toLower` and `hrpExpandInto`.
