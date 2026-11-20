@@ -21,7 +21,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's `Provenance:` line (no NOTICE: clean-room).
 
 ## Compared with
 
@@ -36,14 +36,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rafael-piovesan/go-rocket-ride](https://github.com/rafael-piovesan/go-rocket-ride) | Go | MIT | 161 | pushed 2022-06-08 — stale | A worked example of Stripe's "rocket rides" idempotency design over Postgres; not a reusable library *(inferred from name/description)*. |
 | Go / Rust / Zig ecosystems | — | — | — | — | Searched GitHub 2026-09-30 for a maintained reusable Idempotency-Key middleware in Go, Rust and Zig: none found with meaningful adoption (results were TypeScript/PHP/C# and one 0-star Go repo). No Zig one. |
 
-**Where we are ahead:** the only Zig implementation; all of the draft's failure statuses (400 bad key, 400 missing key under `require_key`, 409 in-flight, 422 body mismatch, 413 over-cap) with a constant-time SHA-256 body fingerprint, per-caller key namespaces (`principal`), scope by method+path, a bounded W-TinyLFU store with an injected clock, and an in-flight reservation proven by a reentrant test. **Where we are behind:** no bundled cross-process backend (the `Backend` seam takes one — a Redis/SQL adapter is the caller's; `KvBackend` is durable but single-process); a body over `max_body_bytes` (16 KiB default) is refused with 413 rather than streamed into the hash.
+**Where we are ahead:** the only Zig implementation; all of the draft's failure statuses (400 bad key, 400 missing key under `require_key`, 409 in-flight, 422 body mismatch, 413 over-cap) with a constant-time SHA-256 body fingerprint, per-caller key namespaces (`principal`), scope by method+path, a bounded W-TinyLFU store with an injected clock, and an in-flight reservation proven by a reentrant test. **Where we are behind:** no bundled cross-process backend (the `Backend` seam takes one — a Redis/SQL adapter is the caller's; `KvBackend` is durable but single-process); a body over `max_body_bytes` (16 KiB default) is refused with 413 unless the caller opts into `Options.spool`, which fingerprints it through a caller-provided spool instead of an in-memory buffer.
 
 ## Design & invariants
 The **middleware** owns replay (look up the key on entry; on a hit, write the cached
-status/`Content-Type`/headers/body, stamp `Idempotent-Replayed: true`, short-circuit — the handler
-genuinely never runs). Recording is **transparent** by default (`Options.capture = .all`,
-2026-11-06): after a guarded handler returns without error and without having called `respond`,
-the middleware reads status, the headers set inside the guard (`Current.headers_mark`) and the body
+status/`Content-Type`/headers/body, stamp `Idempotent-Replayed: true` (`Options.replay_header`, empty = none; the key header is `Options.header_name`, default `Idempotency-Key`), short-circuit — the handler
+genuinely never runs). Recording is **transparent** by default (`Options.capture = .all`): after a guarded handler returns without error and without having called `respond`,
+the middleware reads status, the headers set inside the guard (`Current.headers_mark`; transfer-level headers and `Set-Cookie`, which is the first caller's, are never recorded) and the body
 off `ctx.res` and records them — before the server's `end()` puts a buffered response on the wire,
 so a dropped client still leaves the record. The interposition seam is `http`'s
 `ResponseWriter.BodyTap` (`body_tap` field, observed in `drainFn` only, i.e. only once a body
@@ -60,8 +59,8 @@ over capture in every mode (`Current.recorded`). Key scoping (`Options.scope`, d
 client's key namespaced by `"<METHOD> <path>"`, so the same key value on two endpoints cannot
 cross-replay; `.key_only` keys on the client value alone. Method gating: only POST/PUT/PATCH
 (configurable) are deduplicated by default; any other method, or a gated method with no key header,
-bypasses and runs normally. Key validation: non-empty, ≤ `max_key_len` (255) bytes, printable
-non-space ASCII, else 400; a scoped key exceeding 1 KiB degrades to running normally (no dedup)
+bypasses and runs normally unless `Options.require_key` (default off) is set, which answers a guarded request without the key 400 `Idempotency-Key required` (draft rev 07 §2.7). Key validation: non-empty, ≤ `max_key_len` (255) bytes, printable
+non-space ASCII, else 400 (the draft's sf-string form `"abc"` is parsed and is the same key as the bare token `abc`; two `Idempotency-Key` field lines are 400, since which key is meant would be ambiguous); a scoped key exceeding 1 KiB degrades to running normally (no dedup)
 rather than erroring. Body-fingerprint verification: a same-key, same-target request is only a
 valid retry if its body also matches — the middleware buffers the body (bounded by
 `Options.max_body_bytes`, default 16 KiB) and SHA-256-fingerprints it, recording the digest
@@ -71,7 +70,8 @@ stored digest across retries) on every subsequent same-key request. A mismatch a
 running the handler; a body over the cap cannot be safely fingerprinted and fails closed with 413
 rather than silently letting the check be skipped. The buffered body is re-exposed to the handler
 via the `req.decoded` override seam (the same one inbound gzip decoding uses), so a cooperating
-handler that reads the body still sees it. Bounds via `ramcache`: TTL (default 24h via
+handler that reads the body still sees it. The fingerprint is the body's SHA-256, and a request with a query string folds it in (`fingerprintDigest`: SHA-256 of digest, 0x01, query), so the same body sent to a different query is a 422.
+`Options.spool` (default null) is the opt-in for bodies past `max_body_bytes`: the first `max_body_bytes` stay in memory, the rest goes to a spool the caller's `http.Server.SpoolSource` opens per request (`http.Server.FileSpool` over a caller-opened temp file is the ready one), the body is hashed in the same pass (`http.Server.RequestBodyTap`) and the handler reads it back from byte 0 (`http.Server.RewindableBody`, installed on the request). `Options.max_spooled_body_bytes` caps the whole body (413 above it); a spool failure is a server error, never the 413, and reserves nothing; the spool's storage holds the request body and is the caller's security boundary. It is opt-in because the decision (replay, 422, 409 or run) needs the COMPLETE digest before the handler is chosen and that handler must still read the same bytes, so one streaming pass cannot serve both; the references do not stream either (Stripe compares parsed parameters, node-idempotency hashes the parsed body, IdempotentAPI the buffered payload), so the bounded fail-closed 413 stays the default. Bounds via `ramcache`: TTL (default 24h via
 `Store.ttl_ns`), byte cap, entry cap, W-TinyLFU admission/eviction. Concurrency: the `ramcache` store sits behind an internal
 spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std `SmpAllocator` pattern); cached bytes are
 copied out under the lock and written to the socket lock-free. The scoped key travels
@@ -83,144 +83,106 @@ F2). Records are one namespace for every caller unless `Options.principal` names
 `Store`/`Idempotency` must outlive the `Router` at stable addresses. The clock is injected
 (`Store.clock`) for deterministic TTL tests. Clean-room from the Idempotency-Key pattern (Stripe's
 public docs + `draft-ietf-httpapi-idempotency-key-header`); built on sibling `ramcache`/`router`/
-`http` — see NOTICE.
+`http`; provenance is the README's `Provenance:` line.
 
-## Threat model / out of scope
-**Concurrent first-flights of the same key ARE handled**, via an in-flight reservation set
-(`Store.in_flight`, a `StringHashMapUnmanaged(void)`): the first request to see a miss reserves the
-key for the duration of its handler; a second same-key request arriving before the first completes
-sees the reservation and is answered **409** (`begin` returns `.in_flight`) rather than running the
-handler a second time — proven by a reentrant test that fires the duplicate *from inside* the first
-handler while it is still executing (`"concurrent first-flight of the same key does not double-run
-(in-flight 409)"`). This closes the true concurrent-retry race for requests routed through the same
-process; it does not span multiple processes/machines (the reservation set is in-process state, not
-shared via `ramcache`). **Request-fingerprint mismatch IS detected**: a client reusing a key with a
-different request body gets **422**, not the originally recorded response — the body is
-SHA-256-fingerprinted (bounded by `Options.max_body_bytes`, fail-closed 413 over the cap) and the
-digest checked against the one recorded for the key, constant-time. Not a general response cache
-(only ever serves the byte-for-byte original response back to the *same key*, and only when its body
-fingerprint matches), and not a security boundary — a key is whatever the client sends, with no
-authentication tying it to a caller identity.
+## Threat model / Limits
+
+- **Concurrent first-flights of the same key are handled** by an in-flight reservation: the first
+  request to see a miss reserves the key for the duration of its handler (`Store.in_flight`, a
+  `StringHashMapUnmanaged(void)`; with a `Backend` the backend's `lookupOrReserve` holds it, bounded by
+  `Store.lease_ns`), and a second same-key request arriving before the first completes sees the
+  reservation and is answered 409 (`begin` returns `.in_flight`) instead of running the handler a
+  second time. The reentrant test fires the duplicate from inside the first handler while it is still
+  executing. The default reservation set is in-process state, not shared through `ramcache`: it closes
+  the race within one process, and across processes only through a shared `Backend`.
+- **A key reused with a different request body is detected** (422), constant-time, with a fail-closed
+  413 over `max_body_bytes` (see Design). A different query string counts as a different request.
+- **Not a general response cache** (it only ever serves the byte-for-byte original response back to the
+  same key, and only when its body fingerprint matches) and **not a security boundary**: a key is whatever
+  the client sends, with no authentication tying it to a caller identity unless `Options.principal` names
+  one. With `principal` null all callers share one namespace.
+
+### Known limits (decisions kept as designed)
+
+- Every status is recorded under the default `capture = .all`, 5xx included (Stripe does the same); a
+  handler that must not have a transient error replayed sets `capture = .success` (2xx only) or `.off`.
+- An undecodable stored record (only a foreign writer to the store can make one) re-runs the handler
+  without a reservation.
+- The body is buffered up to `max_body_bytes` per in-flight request before the 409/422 decision;
+  `maxInt` (unlimited) is the caller's explicit choice.
+- The scoped key uses the path as sent: `/orders` and `//orders` are two keys, and a retry repeats the
+  same spelling. A scoped key over 1 KiB (`max_scoped_key`) runs without deduplication.
+- A `KvBackend` lease takeover lets the stale holder's `release` free the new holder early, which the
+  lease contract allows.
+- The spinlock around the default `ramcache` store spans allocator and cache calls (short sections).
+- A streamed response (one past the server's response buffer) whose socket write fails mid-handler
+  surfaces as a handler error and is not recorded: the write happens inside the handler, before the
+  middleware gets control. A buffered response, and any response written through `respond`, is recorded
+  before the write.
+- Transparent capture refuses a response it could not replay faithfully (counted in
+  `Store.capture_refused`): a streamed body over `max_capture_bytes` (an incomplete record would replay a
+  truncated answer), upgrade / tunnel / detach, a failed response, HEAD, declared trailers, a declared
+  length the body does not match, a handler-set `Content-Encoding`, an event stream.
 
 ## Verification
-Offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
-the handler once and a replay returns the cached response without re-running (hit-counter
-asserted), a concurrent same-key duplicate fired from inside the first handler is rejected 409
-in-flight without a second handler run, a different key runs again, a non-idempotent method (GET)
-bypasses, a POST with no key bypasses, an invalid key → 400, target-scope isolation across paths,
-TTL expiry re-runs the handler (injected clock), encode/decode round-trip (digest included), a
-different body under the same key answers 422 and leaves the original entry replayable (graduated
-from the `GAP:` test pinned in commit 71540f3), a same-key/same-body retry with a real request body
-still replays, `.key_only` scope still cross-replays across endpoints when the body matches, and the
-body-cap boundary (exactly at the cap fingerprints normally, one byte over answers 413).
 
-**Mutation (2026-11-17, delta: `Options.spool` branch of `middlewareRun` and `fingerprintDigest`,** schemata over `src/root.zig` in a detached copy, ReleaseSafe plus a ReleaseFast build for the wipe): 18 mutants (the memory limit passed to the body, both `+1` and `-1`; `max_spooled_body_bytes` dropped; the tap dropped; `spooled_live` never set and the `deinit` guard; the 413 mapping and the other-error mapping; the final digest; `install` skipped; the query dropped from the fingerprint; the `decoded` restore; the owned-body hand-over and its wipe; the three steps of `fingerprintDigest`). 18 killed, 0 equivalent. New tests: the boundary at `max_body_bytes` (at it nothing opens, one past it the spool opens) and the query as part of the fingerprint on the spooled path (a different query is 422). Chunked, cut-short (Content-Length unmet, chunked without its end: not 413, no handler, nothing reserved) and over-long bodies were added first. No defect.
+Run: `scripts/modtest idempotency`.
 
-**Mutation + review (2026-11-12, whole module,** `root.zig` production lines 114–1123 + `kvbackend.zig`, schemata in a detached copy, ReleaseSafe and ReleaseFast builds, strict verdict, adversarial read while placing mutants): 335 mutants, 329 killed (5 wipe mutants on the ReleaseFast build, where the wipe tests run), 6 equivalent, 0 undecided, no finding. New tests: a fingerprint differing in any single byte is `.mismatch` (ramcache and `KvBackend`), two bodies sharing a long prefix give 422, an unencodable record (status bit 15, content type over 65535 bytes) is dropped without a panic, `Clock.monotonic` advances and never goes back, high bytes and UTF-8 in a quoted key are refused, a sink failing part-way under a handler that swallows the error is refused and counted (the 2026-11-07 `failed`-term equivalent no longer holds: `drainFn` now sets `rw.failed`), `Options.header_name` and `replay_header` are honoured. Equivalent: the 4-byte tail, growth at `need == capacity`, `max(need, limit)`, the `.off` arm of `captureRecord`, `handed_over`, the tail-vs-limit refusal (as 2026-11-07). Cut: lock acquisition, the `block_len32` cast, comptime defaults (pinned by literal tests), `meta`.
+- **Middleware tests** (`src/root.zig`) through `http.Server.serveStream` with a real `router` and
+  `ramcache`: the first key runs the handler once and a replay returns the cached response without
+  re-running it (hit-counter asserted); a concurrent same-key duplicate fired from inside the first
+  handler is 409 without a second run; bypass classes (other method, no key); the 400 class (empty,
+  oversized, high-byte or UTF-8 quoted, repeated key) and `require_key`; target-scope isolation and
+  `.key_only` cross-replay; TTL expiry on the injected clock including the edge; 422 on a different body
+  (the original entry still replays), a same-body retry, a different query, and the body cap boundary
+  (exactly at the cap fingerprints, one over is 413); `Options.spool` boundary, chunked, cut-short and
+  over-long bodies; `header_name` and `replay_header`; a handler that fails releases the reservation.
+- **Transparent capture:** a handler that never calls `respond` is recorded and replayed with status,
+  `Location`, `Content-Type` and exact `Content-Length`; `.off`, `.success`, `.all`; a body streamed past
+  the response buffer replays whole; `max_capture_bytes` one under refuses and counts, exactly at keeps;
+  each refusal class counted and re-run; a handler error records nothing; `respond` wins over capture; the
+  record is the plain body under gzip; `Set-Cookie` is never replayed. The `http` seam has its own tests
+  (the tap sees a streamed h1 and h2 body in order, tapped bytes plus `bufferedBody()` equal the wire body).
+- **Record codec:** encode/decode round trip (digest, header block), u16 length edges, an unencodable record
+  (status bit 15, content type over 65535 bytes) dropped without a panic, truncation and lied lengths in the
+  decoder, fingerprint known answers and any-single-byte-differs, allocation-failure sweeps of `begin`,
+  `beginBackend` and `KvBackend`. Wipe tests (replay copy, capture buffers, owned body) are visible only
+  without runtime safety (`Allocator.free` poisons the block first), so they skip in safe builds and run
+  in ReleaseFast.
+- **`Backend` / `KvBackend`** (`src/kvbackend_test.zig`): a record replays after the `kv` file is closed and
+  reopened (status, content type, body), 422 for another body, gone after its TTL on kv's clock; 409 while a
+  reservation is held, released by `finish`; lease takeover only past `lease_ns`; one rotted byte on the media
+  answers 409 (kv's CRC re-check) with `read_errors` counted and no reservation left; a logging backend pins
+  the call order through the real middleware.
+- **Model-fuzz** (seeded `std.Random.DefaultPrng`, fixed seeds, no `<M>_FUZZ` driver; the card's fuzz entry is
+  n/a): sequences of requests through the middleware over `ramcache` and again over `KvBackend` on
+  `kv.SimStorage`, compared on status, body, `Idempotent-Replayed`, replayed `Content-Type` and handler
+  call count with a linear-scan model of the documented decision order (bypass, 400, bypass without caller,
+  413, 422, replay, run-and-record, expiry); keys absent, invalid, quoted and 255 bytes, bodies around the
+  cap, scope and principal on/off, `capture` per sequence, half of the operations verbatim retries. Reach
+  counters fail the test unless every class is hit. A record whose age equals `ttl_ns` is left to the cache
+  (kv is live while age < ttl, `ramcache` while age <= ttl, by design); the harness nudges the clock off the
+  edge. Pure helpers (`validKey`, `parseKey`, `scopeKey`, `principalTag`, `decode`) run on random inputs
+  against models.
+- **Lead probe:** `tools/lead_probe/run.sh` (needs `curl`, `openssl`, `bun`) reproduces the card's
+  `**Ahead:**` claim against `@node-idempotency/core`; see `tools/README.md`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-**Mutation (2026-11-07, whole module,** `root.zig` production lines + `kvbackend.zig`, schemata in a detached copy, ReleaseSafe and ReleaseFast builds, strict verdict): 298 mutants, 291 killed, 7 equivalent, 0 undecided. The earlier 49-mutant run was thin: the first run left 70 alive, closed by 30 new tests (refusal answers with type and body, transfer-level header names, u16 length edges of `encode`, `Capturer` limit/growth/wipe, scoped key at 1024, literal two-sided pins of the 24 h / 16 KiB / 1 MiB defaults, TTL at age == ttl, key parsing edges, fingerprint KATs, allocation-failure sweeps of `begin`/`beginBackend`/`KvBackend`). Wipe mutants are visible only without runtime safety (`Allocator.free` poisons the block first), so those tests skip in safe builds and were decided on the ReleaseFast schemata build. Equivalent: a 4-byte tail with `block_len >= 1` (the next check returns null), growing at `need == capacity` (same-size reallocation), `max(need, limit)` where both callers check `need <= limit` first, the `.off` arm of `captureRecord` (unreachable: `middlewareRun` returns before `captureRun`), `handed_over` (set only with `detached`), `failed` (set only by `end()` refusals or an encoder-begin failure serveStream refuses — unreachable through serveStream, argued not proven), the final `body.len > limit` (refuses and counts identically). Findings, fixed `74b1feb3`: F1 `HeaderIterator.next` summed `4 + nl` in u16 — a recorded header name of 65532..65535 bytes panicked on replay (test at the u16 edge); F2 the middleware's replay copy of a stored record was freed unwiped (ReleaseFast test, verified failing without the wipe). Cut: lock acquisition (dropping it trips the paired unlock assert; races are not deterministic), the u32 `block_len32` cast (> 4 GiB of headers), clock code, `meta`, the comptime defaults beyond the literal pins (the defaults-shifted build was not run).
+## What is deliberately not done
 
-**Audit 2026-10-23.** Sonnet review (12 items) + 47 schemata mutants over `begin`/`finish`,
-`respond`, encode/decode with the header block, the middleware's decision order, `parseKey`,
-`validKey`, `scopeKey`, the fingerprint and `KvBackend`'s lease — 47/47 killed after six tests
-were added (stale request binding, the skipped transfer headers, a flagged status refused, quoted
-key bytes and length, the lease boundary and the taker's fresh lease). Fixed from the review:
-`respond` recorded AFTER writing, so a write that failed (a dropped client) left no record and the
-retry ran the side effect again; a replay carried only status/`Content-Type`/body — now also the
-headers the guarded chain set (`Location`, `ETag`, … — IdempotentAPI's parity item), stored in a
-flagged block so older records still decode; the draft's sf-string key (`"abc"`) is parsed and is
-the same key as the bare token; two `Idempotency-Key` field lines are 400. The decoder's
-model-fuzz covers the header block (truncation, lied lengths, entry-boundary block lengths); the
-sequence model-fuzz has quoted and malformed keys in its pool.
-`zig fmt --check` clean. Run: `zig build test-idempotency`.
-
-**Transparent capture (2026-11-06).** Tests through `serveStream` + `router` with a handler that
-never calls `respond`: recorded and replayed with status, `Location`, `Content-Type`, exact
-`Content-Length`, handler run once; `.off` re-runs; `.success` leaves a 500 out (not counted),
-`.all` replays it; a 6000-byte body streamed past the 4 KiB buffer replays whole (de-chunked
-compare); `max_capture_bytes` one under refuses and counts, exactly at keeps; refusals (upgrade,
-detach, event stream, handler-coded body, trailers) each counted twice and re-run; a handler error
-records nothing and is not counted; `respond` then extra bytes replays only what `respond`
-recorded; under gzip (buffered and streamed) the record is the plain body — a replay without
-`Accept-Encoding` is identity with its own `Content-Length`, one with gzip is coded afresh and
-gunzips to the plain body. The sequence model-fuzz draws `capture` per sequence; its `/raw`
-handler (no `respond`) answers 500 on every fifth call and the model records it per mode (reach:
-`raw_captured`, `raw_5xx_not_captured`, `raw_rerun` under `.off`). `http` tests: the tap sees a
-streamed h1 body in order with splats, tapped ++ `bufferedBody()` equals what was written; a
-compressed body is observed plain; an h2 response of 10 000 bytes is observed whole and equals the
-wire body.
-
-**`Backend` / `KvBackend` (2026-10-12), `src/kvbackend_test.zig`.** A record put through a `Store`
-over `KvBackend` replays after the `kv` file is closed and reopened (status, content type, body),
-answers 422 to another body, and is gone after its TTL on kv's clock; 409 while a reservation is
-held, released by `finish` (with and without a request binding), lease takeover only past
-`lease_ns`; one rotted byte of the record on the media answers 409 (kv's CRC re-check) with
-`read_errors` counted and no reservation left. A logging backend through the real middleware pins
-the call order (lookup, put, release; a replay is one lookup and no handler run). The sequence
-model-fuzz runs a second time over `KvBackend` on `kv.SimStorage` (same model, kv's clock driven by
-the same ticks) — its first run found a gap in the HARNESS: the clock nudge off the TTL edge was
-applied once, so a second record recorded 1 ns later could sit exactly on the edge, where kv
-(live while age < ttl) and `ramcache` (live while age ≤ ttl) differ by design; the nudge now
-repeats. Negative controls: `KvBackend` never returning a found record, and never releasing a
-reservation — both killed (the fuzz and three of the backend tests).
-
-**Model-fuzz (2026-10-11).** Two seeded tests (`std.Random.DefaultPrng`, fixed seeds). (1) 80
-sequences of 80 requests through `http.Server.serveStream` with a real `router` + `ramcache`,
-random scope (`.target` / `.key_only`), principal on/off, injected clock (ttl 1000 ns, deltas
-around the boundary), `max_body_bytes` 32, methods POST/PUT/PATCH/GET/DELETE over `/orders`,
-`/refunds` and `/raw` (a handler that bypasses `respond`), keys absent / invalid (space, 256
-bytes, empty) / valid (including exactly 255 bytes), bodies around the cap, half of the operations
-verbatim retries of the previous one. The model is a list of recorded responses and the decision
-order from the module doc (bypass, 400, bypass without caller, 413, 422, replay, run-and-record,
-expiry); it is compared on status, body, `Idempotent-Replayed`, replayed `Content-Type` and the
-handler call count, and the handler also echoes the body it can read (re-exposure through
-`req.decoded`). One instant is left to the cache, not modelled: a record whose age equals `ttl_ns`
-exactly (the clock is nudged 1 ns off it); ages `ttl-1` and `ttl+1` are checked. Reach counters fail
-the test unless every class is hit (each bypass kind, 400, 255-byte key, 413, body at the cap,
-422, replay, cross-endpoint replay, expiry re-run, `/raw` re-run, target- and caller-isolated
-misses, record, TTL edge ages). The 409 in-flight path stays with the reentrant test (requests here
-are sequential). (2) 3000 random inputs for `validKey`, `scopeKey` (hand-built string; null exactly
-when the buffer is too small), `principalTag` (first 16 bytes of SHA-256 in hex) and `decode`
-(blob built field by field, truncated or with a lying length). Negative control: disabling the
-fingerprint comparison in `Store.begin` (`if (false and ...)`) made the new sequence test fail
-(seq 0, step 42) as well as the existing 422 test.
+- **A one-pass streaming body hash as the default.** The decision needs the complete digest before the
+  handler is chosen, and the handler must still read the same bytes; the references buffer or hash the
+  parsed body too. The default stays the bounded fail-closed 413, and `Options.spool` is the opt-in.
+- **Excluding 5xx from the record by default.** Stripe keeps them; `capture = .success` is the choice for a
+  handler that must not have a transient error replayed.
 
 ## Backlog / deferred
 
-**Delta audit 2026-10-29 (no-panic sweep § GH):** 2 mutants (the plain lease subtraction back, the `deinit` early return dropped) on the unfiltered ReleaseSafe suite, 2/2. Not scored: `cacheOrPanic` (checked panic), the u32 header-block check before the allocation (needs > 4 GiB of headers).
+- **A bundled shared backend** — e.g. over a `kv` server or a SQL store, closing the first-flight race
+  across processes. Today: implement `Backend` over the shared store (contract on the type; `lease_ns` for
+  crashed holders). Effort: medium, needs a shared store in zig-libs first. Fits §2.
 
-None. The one explicit non-goal previously noted here (request-fingerprint verification) is closed —
-see "Request-fingerprint mismatch" above. In-flight reservation is still single-process only; a
-multi-process/multi-machine deployment sharing one `ramcache`-backed store would still need a
-distributed lock to close the same race across processes.
-
-- ~~**Pluggable / shared store**~~ *(survey 2026-09-30)* — DONE 2026-10-12: `Backend` (atomic `lookupOrReserve` with `lease_ns`, `put`, `release`) through `Store.backend`, the `ramcache` path unchanged as the default, and `KvBackend` (durable records over `kv.Db`; reservations in memory, since a `kv` file is single-process). A backend shared by several processes is an adapter over a shared database, written against the same contract.
-- **A bundled shared backend** (2026-10-12) — e.g. over a `kv` server or a SQL store, closing the first-flight race across processes. Today: implement `Backend` over the shared store (contract on the type; `lease_ns` for crashed holders). Effort: medium, needs a shared store in zig-libs first. Fits §2.
-- ~~**Transparent response capture**~~ *(survey 2026-09-30)* — DONE 2026-11-06: `Options.capture` (`Capture.off` / `.success` / `.all`, default `.all`), `Options.max_capture_bytes`, `Store.capture_refused`, `Store.Current.recorded`; seam in `http`: `ResponseWriter.BodyTap` + `body_tap` + `bufferedBody()` (additive; `router` unchanged). Anchored on node-idempotency (`onResponse` records what the framework sent), IdempotentAPI (filter caches status/headers/body; `CacheOnlySuccessResponses`) and Stripe (server-side, 5xx kept). **Partial scope, factual reason:** a *streamed* response (past the server's response buffer) whose socket write fails mid-handler surfaces as a handler error and is not recorded — the write happens inside the handler, before the middleware gets control; a buffered response, and any response written through `respond`, is recorded before the write. Streamed bodies over `max_capture_bytes` are refused (counted), since an incomplete record would replay a truncated answer.
-- **Review 2026-10-23, kept as designed:** (a) every status is recorded, 5xx included — Stripe
-  does the same; since 2026-11-06 (transparent capture) a handler that must not have a transient
-  error replayed sets `capture = .success` (2xx only) or `.off` instead of bypassing `respond`; (b) an undecodable stored record (only a foreign writer to the store can make one)
-  re-runs the handler without a reservation; (c) the body is buffered up to `max_body_bytes` per
-  in-flight request before the 409/422 decision — `maxInt` (unlimited) is the caller's explicit
-  choice; (d) the scoped key uses the path as sent (`/orders` vs `//orders` are two keys; a retry
-  repeats the same spelling); (e) a `KvBackend` lease takeover lets the stale holder's `release`
-  free the new holder early, which the lease contract allows; (f) the spinlock spans allocator and
-  cache calls (short sections).
-- ✅ DONE 2026-11-17 (`Options.spool` over `http.Server.RewindableBody`: the first `max_body_bytes` in memory, the rest in a caller spool, hashed in the same pass, the handler reads the body back from byte 0; `max_spooled_body_bytes` caps it; default unchanged) — **Streaming fingerprint for large bodies** *(survey 2026-09-30)* — hash the body incrementally so `max_body_bytes` is not a hard 413 for uploads. Effort: small-medium (needs the body-reader seam). Fits §2. Low priority.
-  *Analysis 2026-11-17 (blocked on a seam in `http`, not started):* hashing incrementally is the easy half; the
-  decision (replay, 422, 409 or run) needs the COMPLETE digest before the handler is chosen, and the handler that
-  then runs must still read the same bytes, so a one-pass stream cannot serve both. The module buffers today for
-  exactly that reason (`req.decoded` re-exposes the buffer). Dropping the cap therefore needs the request body to be
-  spooled or rewindable (a `Request` body source that can be read twice, or a spool-to-file reader), which is an
-  `http` addition. The references do not stream either: Stripe compares the parsed parameters, node-idempotency
-  hashes the already-parsed body (BLAKE2s of `JSON.stringify(body)`), IdempotentAPI hashes the buffered payload, so the
-  bounded fail-closed 413 stays the default; the owner chose (2026-11-17) to build the `http` seam anyway, opt-in.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache`, `kv` — canonical source is `pub
-const meta` in src/root.zig.
 
 ## Anchoring
 

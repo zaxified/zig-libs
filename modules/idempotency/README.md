@@ -35,7 +35,7 @@ fn createOrder(ctx: *router.Ctx) anyerror!void {
 ## The contract (read this)
 
 The middleware records the guarded handler's answer **transparently**
-(`Options.capture`, default `.all` since 2026-11-06): a handler that just
+(`Options.capture`, default `.all`): a handler that just
 writes `ctx.res` is deduplicated like one that calls `store.respond` — the
 node-idempotency / IdempotentAPI / Stripe behaviour. `store.respond` stays the
 cooperative path and wins when a handler uses it. Details and limits are under
@@ -66,7 +66,7 @@ cooperative path and wins when a handler uses it. Details and limits are under
 
 When the guarded handler returns without error and did not call `respond`, the
 middleware records the status, the headers set inside the guard (`Location`,
-`ETag`, …; transfer headers excluded) and the body, read off the `http`
+`ETag`, …; transfer headers and `Set-Cookie`, which is the first caller's, are never recorded) and the body, read off the `http`
 writer **before** the server puts a buffered response on the wire. A body
 that outgrows the server's response buffer (4 KiB by default) streams; its
 bytes are collected through the `http.Server.ResponseWriter.BodyTap` seam, as
@@ -116,9 +116,18 @@ every same-key request. A mismatch answers **422** without running the
 handler (the IETF Idempotency-Key draft's SHOULD). A body over the cap cannot
 be safely fingerprinted, so it fails closed with **413** instead of silently
 falling back to no check — the whole point is that a check that can be
-dodged is not a check. The buffered bytes are re-exposed to the handler
+dodged is not a check. The query string is part of the fingerprint: the same
+body sent to a different query is a 422 too. The buffered bytes are re-exposed to the handler
 transparently (via the same `req.decoded` seam inbound gzip decoding uses),
 so a handler that reads the body still sees it.
+
+`Options.spool` (default null) lifts the cap for uploads: the first
+`max_body_bytes` stay in memory, the rest goes to a spool the caller opens per
+request (`http.Server.FileSpool` over a temp file is the ready one), the body
+is hashed in the same pass and the handler reads it back from byte 0.
+`Options.max_spooled_body_bytes` caps the whole body (413 above it); a spool
+failure is a server error and reserves nothing. The spool's storage holds the
+request body, so it is the caller's security boundary.
 
 ### Bounds & retention
 
@@ -163,7 +172,7 @@ it cannot read a record — never a second run.
 ## Attributes
 
 - **Role:** server. **Platform:** any. **Deps:** `router`,
-  `http`, `ramcache`, `kv`. **Concurrency:** threadsafe — the `ramcache` store sits
+  `http`, `ramcache`, `kv`, `clock`. **Concurrency:** threadsafe — the `ramcache` store sits
   behind an internal spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std
   SmpAllocator pattern), so `respond` and the middleware may race across all
   connection threads; the cached bytes are copied out under the lock and
@@ -181,19 +190,15 @@ copied; built on the sibling `ramcache`, `router` and `http` modules.
 (MIT, read in full before running) as a black-box oracle; no data of it is
 committed.
 
+## Not provided
+
+No bundled cross-process store (the `Backend` seam takes one) and no one-pass
+streaming body hash by default (bounded 413, or the opt-in `Options.spool`);
+see SPEC *What is deliberately not done* and *Backlog / deferred*.
+
 ## Verification
 
-`zig build test-idempotency` — offline tests through `http.Server.serveStream`
-with a real `router` + `ramcache`: first key runs the handler once and a replay
-returns the cached response without re-running (hit-counter asserted), a
-concurrent same-key duplicate fired from inside the first handler is rejected
-409 in-flight rather than double-running it, a different key runs again, a
-non-idempotent method (GET) bypasses, a POST with no key bypasses, an invalid
-key → 400, target-scope isolation across paths, TTL expiry re-runs the handler
-(injected clock), encode/decode round-trip (now including the digest), a
-different body under the same key answers 422 without running the handler
-(and the original entry still replays afterward, untouched), a same body
-retry with a real request body still replays, `.key_only` scope still
-cross-replays across endpoints when the body genuinely matches, and the body
-cap boundary (exactly at the cap fingerprints normally, one byte over answers
-413). `zig fmt --check` clean.
+`scripts/modtest idempotency` — offline tests through
+`http.Server.serveStream` with a real `router` and `ramcache`, `Backend` /
+`KvBackend` tests, and seeded model-fuzz; the classes are listed in SPEC
+*Verification*. The card's `**Audit:**` line in SPEC is the current score.
