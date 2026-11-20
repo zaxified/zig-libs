@@ -10,7 +10,8 @@ BLAKE3) goes through `hex`/`MultiHasher`/`hashFile`.
 - **Model after:** Go `crypto/sha256` streaming. Thin over
   `std.crypto.hash` and the sibling `sha2` module; BLAKE2b-256 is this module's own vectorised form, tested byte-for-byte against std.
 - **Platform:** any (file path uses `std.Io`). **Role:** util.
-  **Concurrency:** one-shot fns pure; `Hasher` single-owner. **Allocation:** none.
+  **Concurrency:** one-shot fns pure; `Hasher` / `MultiHasher` single-owner. **Allocation:** none, except the
+  caller-allocator helpers `hexAlloc` and `MultiHasher.finalHexAlloc`. **Deps:** `sha2` (x86-64 SHA-2 engine).
 
 Provenance: original work of the zig-libs authors (MIT); modeled after Go
 `crypto/sha256` streaming ergonomics. The constructions are public standards
@@ -70,4 +71,8 @@ hd.blake3DeriveKey("my app v1 session", ikm, &long);
 
 `blake2b256` runs on this module's own row-vectorised BLAKE2b-256 (`src/blake2b.zig`) when the build has AVX2 (std's otherwise),
 byte-identical to `std.crypto.hash.blake2.Blake2b256` (tested on every length 0..600
-and random chunkings). On x86-64 SHA-2 comes from the sibling `sha2` module, elsewhere from std (measured, SPEC Performance). `verifyAll` refuses absolute and `..` names and non-regular files unless told otherwise. Checksum-file parsing is fuzzed (`HASHDIGEST_FUZZ=<runs>`).
+and random chunkings). On x86-64 SHA-2 comes from the sibling `sha2` module, elsewhere from std (measured, SPEC Performance). File hashing has no size or time limit unless you pass `max_bytes` (`hashFileMax`, `sha256FileMax`, `checksum.Options.max_file_bytes`), and even then a FIFO whose writer stays silent blocks. `verifyAll` refuses absolute and `..` names and non-regular files unless told otherwise. Checksum-file parsing is fuzzed (`HASHDIGEST_FUZZ=<runs>`).
+
+## Not provided
+
+MD5, SHA-1, further algorithms, HMAC/HKDF and a writer adapter are refused or left to sibling modules and std; BLAKE2b keyed / variable-size output is not built. See SPEC *What is deliberately not done* and *Backlog / deferred*.

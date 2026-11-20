@@ -16,13 +16,15 @@
 
 **Downstream consumer:** yes
 
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
+
 ## Compared with
 
 Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first survey 2026-09-30); stars and activity as of 2026-09-30, not re-queried. Licences below are from the projects' published terms; **no foreign source was read** (docs, man pages and black-box runs only; `sha256sum`/`b2sum` from GNU coreutils and Python `hashlib` were run as oracles). Marks: [V] verified in this session, [I] inferred.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `crypto/sha256`](https://pkg.go.dev/crypto/sha256) + [`crypto/sha512`, `sha3`](https://pkg.go.dev/crypto) + `encoding/hex` — **reference** | Go | BSD-3-Clause *(Go stdlib; [I])* | — | Go 1.26.8 [V: ran it] | `New()`/`Write`/`Sum`, `Sum256`, `hash.Hash` as `io.Writer`; SHA-3 incl. SHAKE; MD5/SHA-1. We have one-shot, incremental, file, hex, checksum files, XOF and a runtime multi-algorithm layer; no writer adapter of our own (std's `Io.Writer.Hashed` does it), no MD5/SHA-1 (refused, below). |
+| [Go `crypto/sha256`](https://pkg.go.dev/crypto/sha256) + [`crypto/sha512`, `sha3`](https://pkg.go.dev/crypto) + `encoding/hex` — **reference** | Go | BSD-3-Clause *(Go stdlib; [I])* | — | Go 1.26.8 [V: ran it] | `New()`/`Write`/`Sum`, `Sum256`, `hash.Hash` as `io.Writer`; SHA-3 incl. SHAKE; MD5/SHA-1. We have one-shot, incremental, file, hex, checksum files, XOF and a runtime multi-algorithm layer; no writer adapter of our own (std's `Io.Writer.Hashed` does it), no MD5/SHA-1 (refused, see *What is deliberately not done*). |
 | [OpenSSL](https://github.com/openssl/openssl) 3.5.5 EVP — **fastest** (SHA-2, SHA-3) | C | Apache-2.0 [I] | 30.9k | 2026-09 | Run-time CPU dispatch to AVX2/SHA-NI assembly [V: timed via `libcrypto.so.3`]. Speed yardstick only; not a Zig option. |
 | [libsodium](https://github.com/jedisct1/libsodium) 1.0.18 `crypto_generichash` — **fastest** (BLAKE2b-256) | C | ISC [I] | — | — | AVX2 BLAKE2b [V: timed via `libsodium.so.23`]. |
 | [RustCrypto/hashes](https://github.com/RustCrypto/hashes) (`sha2`, `sha3`, `blake2`, …) | Rust | MIT OR Apache-2.0 *(per-crate; [I])* | 2.3k | push 2026-09 | Dozens of algorithms behind the `Digest` trait, `io::Write`, keyed/variable-size BLAKE2, SHAKE. Far wider algorithm list. |
@@ -33,17 +35,16 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first survey 2026-09-30); stars an
 
 **Survey verdicts** (every gap a user would notice):
 - **Checksum-file parse/verify** — done (`checksum`), against real coreutils output.
-- **XOF / keyed modes** — done: `xof` (SHAKE128/256, BLAKE3), `blake3Keyed`, `blake3DeriveKey`. BLAKE2b keyed / variable output size: not done, no consumer (-> Backlog).
-- **Bulk SHA-2 speed** — done by routing SHA-2 through the sibling `sha2` module (`modules/sha2`, exists): 1.32-1.40x Go before, 0.84-0.89x now. **This adds a production dependency (`deps = sha2`), approved by the coordinator on condition that 32-bit targets keep working: `sha2` is used only on x86-64, std's engines elsewhere (see Performance, target section).**
-- **BLAKE2b-256 speed** — done in-module (`src/blake2b.zig`, `@Vector(4, u64)` rows), used when the build has AVX2: 1.21x Go before, 1.00x now. On baseline x86-64 (SSE2 only) it was 1.25x Go, slower than std's, so there std's is used.
-- **`std.Io.Writer` adapter** — std's `Io.Writer.Hashed`/`Hashing` own it (checked 2026-09-30 in `lib/std/Io/Writer.zig`).
-- **MD5 / SHA-1 / CRC and other legacy digests** — refused: collision-broken (MD5, SHA-1) or not digests; `crc32`/`crc32c` are sibling modules (exist).
-- **More algorithms (Whirlpool, BLAKE2s, SHA-512/224, Keccak...)** — refused as breadth without a consumer; `ripemd160` is a sibling module (exists); adding an `Algorithm` is a one-line `Impl` row when a consumer asks.
-- **HMAC / HKDF** — sibling `webhooksig` (HMAC) and std's `Hmac`/`Hkdf` over `sha2`'s types; not a digest-helper concern.
+- **XOF / keyed modes** — done: `xof` (SHAKE128/256, BLAKE3), `blake3Keyed`, `blake3DeriveKey`. BLAKE2b keyed / variable output size: not done, no consumer (*Backlog / deferred*).
+- **Bulk SHA-2 speed** — done by routing SHA-2 through the sibling `sha2` module (`modules/sha2`, exists); figures: the card's `**Performance:**` line. **This is a production dependency (`deps = sha2`), approved by the coordinator on condition that 32-bit targets keep working: `sha2` is used only on x86-64, std's engines elsewhere (see *Design notes by feature*, engines by target).**
+- **BLAKE2b-256 speed** — done in-module (`src/blake2b.zig`, `@Vector(4, u64)` rows), used when the build has AVX2. On baseline x86-64 (SSE2 only) it is slower than std's, so there std's is used.
+- **`std.Io.Writer` adapter** — std's `Io.Writer.Hashed`/`Hashing` own it (*What is deliberately not done*).
+- **MD5 / SHA-1 / CRC and other legacy digests** — refused (*What is deliberately not done*); `crc32`/`crc32c` are sibling modules (exist).
+- **More algorithms (Whirlpool, BLAKE2s, SHA-512/224, Keccak...)** — refused (*What is deliberately not done*); `ripemd160` is a sibling module (exists).
+- **HMAC / HKDF** — sibling `webhooksig` (HMAC) and std's `Hmac`/`Hkdf` over `sha2`'s types; not a digest-helper concern (*What is deliberately not done*).
 
-**Where we are ahead:** over plain `std`: `/proc`-safe file hashing (reads to EOF, not stat size), runtime-selected algorithm (`MultiHasher`, `hex`, `hashFile`), constant buffers (`HexOf`, `max_hex_len`), junk-tolerant `matches`, `sha256sum -c` in one call, SHA-2 and BLAKE2b-256 faster than std on x86-64 without SHA-NI · **Where we are behind:** algorithm list is 9 (RustCrypto has dozens), no keyed/variable-size BLAKE2b.
+**Where we are ahead:** over plain `std`: `/proc`-safe file hashing (reads to EOF, not stat size), runtime-selected algorithm (`MultiHasher`, `hex`, `hashFile`), constant buffers (`HexOf`, `max_hex_len`), junk-tolerant `matches`, `sha256sum -c` in one call, SHA-2 and BLAKE2b-256 faster than std on x86-64 without SHA-NI · **Where we are behind:** algorithm list is 9 (RustCrypto has dozens), no keyed/variable-size BLAKE2b (*Backlog / deferred*).
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Design & invariants
 Three shapes: one-shot (`sha256Hex`/`hex`), incremental (`Hasher`/`MultiHasher` — `update` then
@@ -51,11 +52,47 @@ Three shapes: one-shot (`sha256Hex`/`hex`), incremental (`Hasher`/`MultiHasher` 
 to EOF rather than trusting `stat` size, so `/proc`/`/sys` pseudo-files (which report size 0) hash
 correctly. `Algorithm` enum with `digestLength`/`hexLength`; comptime `HexOf` for fixed-size hex
 buffers; runtime `MultiHasher` for algorithm chosen at runtime. Allocation discipline: the one-shot
-and incremental hashing paths are allocation-free; only the `*Alloc` hex helpers and file reads use
-the caller's allocator/reader (via `std.Io`). Reentrant for the pure one-shot fns; `Hasher`/
+and incremental hashing paths and the file hashers are allocation-free (the file hashers use two 64 KiB
+stack buffers and `std.Io`); only the `hexAlloc` / `MultiHasher.finalHexAlloc` helpers take the caller's
+allocator. Reentrant for the pure one-shot fns; `Hasher`/
 `MultiHasher` instances are single-owner. A thin, ergonomic layer over `std.crypto.hash` and `sha2`, with one in-module engine (`blake2b.zig`), modeled
 after Go `crypto/sha256` streaming ergonomics generalized to multi-algorithm; original work of the
 zig-libs authors — the constructions are public standards (RFC 7693 for BLAKE2b, written from the RFC; the streaming layout follows std's, MIT), so no NOTICE entry.
+
+## Design notes by feature
+
+- **Engines by target.** `sha2` (SHA-224/256/384/512, SHA-512/256) is used only on x86-64, where it dispatches at run
+  time to SHA-NI/AVX2; every other target uses std's engines and the `sha2` import is never analysed there
+  (`src/root.zig:58-59`). The in-module BLAKE2b-256 is compiled in only when the build has AVX2 (`src/root.zig:60`):
+  on baseline x86-64 it is slower than std's. Neither engine helps on MIPS32 / ARM32 (smaller and faster with std's
+  there; both pass the module's tests under qemu), so `sha2`'s `.targets` stays `linux64`.
+- **BLAKE2b-256 engine** (`src/blake2b.zig`): four `@Vector(4, u64)` rows, G applied to columns, then to diagonals via
+  lane shuffles; written from RFC 7693, streaming layout as std's. Unkeyed, 256-bit only (`Options` is empty,
+  `src/blake2b.zig:18`); byte-identical to `std.crypto.hash.blake2.Blake2b256`.
+- **`finalHex` finalises a copy of the state** (`Hasher.finalHex` `src/root.zig:110`, `MultiHasher.finalHex`
+  `src/root.zig:302`) and wipes the copy, so `update` may continue and `finalHex` may repeat (finalising in place
+  panics in std's SHA-3 on a later `update`).
+- **Checksum files** (`checksum`, `src/checksum.zig`): `Iterator` / `parseLine` read GNU lines (`hex  name`, `hex *name`),
+  BSD tags (`ALGO (name) = hex`, tag table `tags`, `tagOf`), `\`-escaped names (`\\`, `\n`, `\r`), `#` comments, blank lines
+  and CRLF; a bad line is `BadLine` / `UnknownTag` and the iterator continues with the next line. A BSD tag overrides the
+  caller's default algorithm; the GNU form carries none. The BLAKE2b-512 tag `b2sum` writes by default is `UnknownTag`
+  (make the file with `b2sum -l 256`). `verifyEntry` / `verifyAll` hash the named file with `hashFileIn` (digest
+  compared case-insensitively), count `ok` / `mismatch` / `unreadable` / `unsafe_name` / `too_large` / `malformed`
+  in `Summary`, and `Summary.allOk` additionally needs at least one verified entry. Names are limited to
+  `max_name_len` (4096) bytes (`NameTooLong`). Format reference: GNU coreutils 9.7 and uutils 0.10 output (black box).
+- **Bounded file hashing.** `hashFileMax` / `hashFileInMax` / `sha256FileMax` take `max_bytes: ?u64` and return
+  `error.FileTooLarge` once the file delivers more (exactly `max_bytes` passes; the read stops within one 64 KiB chunk
+  of the cap, `src/root.zig:353-358`); `checksum.Options.max_file_bytes` feeds it into `verifyEntry` / `verifyAll`
+  as `Status.too_large` / `Summary.too_large` (`src/checksum.zig:187-198`). The **default stays unlimited**, by the
+  reference rule: `sha256sum`, `shasum`, `b3sum`, Go's `io.Copy(hash, f)` and Python's `hashlib.file_digest` have no
+  cap, and a silent default cap would turn a legitimate multi-GB image check into an error; a caller hashing untrusted
+  paths sets it.
+- **XOF and BLAKE3 modes.** `xof` (SHAKE128, SHAKE256, BLAKE3: any output length including 0), `blake3Keyed`
+  (32-byte key) and `blake3DeriveKey` (context string + key material) go through std's engines (`src/root.zig:381-405`).
+  The two BLAKE3 entry points wipe the key copy and the state and run a 16 KiB dead-stack burn (`stack_burn`,
+  `src/root.zig:417`), checked by `src/stackprobe_test.zig` (8 KiB left residue for 3000 bytes of derive material).
+- **`Algorithm`.** Nine members (`src/root.zig:163`); `sha512_256` is NIST SHA-512/256 (distinct IV), not plain
+  truncation. `Algorithm.Impl` names the engine type of each.
 
 ## Threat model / out of scope
 Provides integrity/fingerprinting, **not authentication** — a bare digest is not a MAC; an attacker
@@ -63,72 +100,80 @@ who can change the data can change the digest. Use `webhooksig` (HMAC) or a sign
 authenticated integrity. Algorithm choice is the caller's: MD5/SHA-1 are **not** offered (only
 collision-resistant families); still, don't use a plain digest where a KDF or MAC is required. Out
 of scope: HMAC, general KDFs (only BLAKE3's own keyed and derive-key modes are offered), streaming over a network, and constant-time digest comparison
-(a digest is public; compare with `std.mem.eql` — unlike a secret MAC).
+(a digest is public; compare with `std.mem.eql` — unlike a secret MAC). `blake3Keyed`'s key goes only into std's BLAKE3 and is wiped after; it is not ctgrind-checked.
+
+**File hashing is bounded by bytes at most, never by time.** `sha256File` / `hashFile` have no size or time limit by
+default: a path that never reaches EOF (`/dev/zero`, a FIFO whose writer stays open) blocks forever. The `*Max` forms
+cap the bytes, but a FIFO whose writer stays open and silent still blocks (`std.Io` offers no read deadline here). Use
+them, or hash only paths you trust.
+
+**Checksum-file verification is hygiene, not confinement.** `verifyAll` refuses absolute and `..` names
+(`unsafe_name`; `Options.allow_unsafe_names` lifts it) and hashes regular files only (a FIFO, device or directory is
+`unreadable`, decided by a stat before the open). Symlinks are followed, and the stat-then-open pair is not atomic: a
+name swapped for a FIFO between the two can still hang the call, and `std.Io.Dir` offers no non-blocking open or
+fd-based stat to close that. A caller verifying an untrusted checksum file must confine `dir` itself (a directory the
+attacker cannot write to, a sandbox).
+
+`matches` / `matchesAlgo` compare with `std.mem.eql`, not in constant time (a digest is public).
 
 ## Performance
 
-Measured 2026-11-02 by `zig build bench-hashdigest` (`BENCH_ROUNDS=5`, ReleaseFast, Zig 0.17.0; `tools/bench.zig` driving `tools/go_bench/main.go` and `tools/c_bench/foreign_bench.c`), with the `sha2` and vectorised-BLAKE2b engines (x86-64 with AVX2). Pairing: **both sides do the same work** — one-shot digest of the message plus lowercase hex encoding — ours `hashdigest.hex(algo, msg, out)`; reference Go 1.26.8 one-shot `Sum*` + `hex.Encode` (`crypto/sha256`, `crypto/sha512`, `crypto/sha3`, `golang.org/x/crypto` v0.57.0 `blake2b`); fastest in the field OpenSSL 3.5.5 EVP digests (digest fetched and `EVP_MD_CTX` allocated once) + the same hex loop, and libsodium 1.0.18 `crypto_generichash` for BLAKE2b-256 (OpenSSL has only BLAKE2b-512). Both are measured for every row and the faster is `fast`. BLAKE3 is not compared (no reference library on this host). Host: Intel Core i7-7920HQ (Kaby Lake, 4C/8T; AVX2, BMI2, no SHA-NI/AVX-512), Linux 7.0, shared with other agents' jobs (the 7.3% spread below is that). Before timing, every foreign hex digest of the 64 KiB message must equal ours.
+Bench: `zig build bench-hashdigest` (`tools/bench.zig`, driving `tools/go_bench/main.go` and `tools/c_bench/foreign_bench.c`).
+Both sides do the same work: a one-shot digest plus lowercase hex encoding (ours `hashdigest.hex(algo, msg, out)`); the
+reference is Go `crypto/sha256`, `crypto/sha512`, `crypto/sha3` with `encoding/hex` (BLAKE2b: `golang.org/x/crypto`), the
+fastest in the field is OpenSSL EVP (digest fetched and context allocated once) and, for BLAKE2b-256, libsodium
+`crypto_generichash`; both are measured on every row and the faster is `fast`. Rows are 64 B and 64 KiB messages for
+every algorithm but BLAKE3 (no reference library on the host). Before timing, every foreign hex digest of the 64 KiB message
+must equal ours. Each side doubles its batch past 100 ms, keeps the best of five and alternates with the other for
+`BENCH_ROUNDS` rounds; ratios are by wall time. The card's `**Performance:**` line carries the figures and is
+authoritative; P1 needs ref <= 1.0 and fastest <= 1.25 on a quiet host, and a single noisy run is not claimed as that.
 
-Method: each side doubles its batch past 100 ms and keeps the best of five; per workload the sides alternate for 5 rounds and each keeps its best; **ratios by wall time**; spread = (worst round - best round) / best round.
-
-| workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `sha256_64` | 356 | 440 | 440 | 0.809 | 0.809 | 4.8% | 2.8% | 3.3% |
-| `sha256_65536` | 148304 | 169439 | 148220 | 0.875 | 1.001 | 0.9% | 1.1% | 1.7% |
-| `sha224_64` | 361 | 445 | 423 | 0.811 | 0.852 | 1.4% | 2.8% | 2.9% |
-| `sha224_65536` | 148155 | 166813 | 150025 | 0.888 | 0.988 | 4.6% | 3.1% | 4.2% |
-| `sha384_64` | 285 | 354 | 378 | 0.806 | 0.806 | 0.7% | 2.1% | 6.2% |
-| `sha384_65536` | 96446 | 114552 | 99987 | 0.842 | 0.965 | 7.3% | 1.4% | 4.2% |
-| `sha512_64` | 295 | 375 | 406 | 0.786 | 0.786 | 2.3% | 3.5% | 3.0% |
-| `sha512_65536` | 97764 | 112390 | 99518 | 0.870 | 0.982 | 2.9% | 7.1% | 1.4% |
-| `sha512_256_64` | 264 | 334 | 358 | 0.791 | 0.791 | 2.9% | 3.0% | 3.6% |
-| `sha512_256_65536` | 98008 | 114629 | 100033 | 0.855 | 0.980 | 1.3% | 2.9% | 1.4% |
-| `sha3_256_64` | 435 | 509 | 513 | 0.855 | 0.855 | 1.8% | 2.4% | 3.5% |
-| `sha3_256_65536` | 191810 | 203828 | 183216 | 0.941 | 1.047 | 1.9% | 3.0% | 1.7% |
-| `sha3_512_64` | 456 | 546 | 564 | 0.835 | 0.835 | 0.5% | 4.5% | 2.6% |
-| `sha3_512_65536` | 364037 | 387061 | 341971 | 0.941 | 1.065 | 2.0% | 1.6% | 1.8% |
-| `blake2b256_64` | 174 | 202 | 203 | 0.864 | 0.864 | 1.1% | 1.9% | 4.8% |
-| `blake2b256_65536` | 66087 | 66376 | 59910 | 0.996 | 1.103 | 1.7% | 2.5% | 3.5% |
-
-Worst row against the reference: 0.996x (`blake2b256_65536`); against the fastest: 1.103x (BLAKE2b-256 vs libsodium) -> P2 at least on the 1.1x rule (the card is generated; P1 needs ref <= 1.0 and fastest <= 1.25 on a quiet host, and one noisy run is not claimed as that).
-
-**Before** (2026-10-20, std's SHA-2 and BLAKE2b): ref 0.85-1.41x, fastest 1.60x; bulk SHA-2 1.32-1.40x Go, BLAKE2b-256 1.21x. Two changes closed it, measured separately on 2026-11-02: SHA-2 through `sha2` (BLAKE2b still std's: 64 KiB rows 0.85-0.87x Go for SHA-2, BLAKE2b-256 1.15x), then the vectorised BLAKE2b (0.97x in a BLAKE2b-only run, 0.996x in the table above).
-
-**Reading.** SHA-3 is std's and was already level or ahead. SHA-2 is `sha2`'s CRYPTOGAMS SHA-NI/AVX2 path (run-time dispatch, see that module's NOTICE). BLAKE2b-256 is `src/blake2b.zig`: four `@Vector(4, u64)` rows, G applied to columns then to diagonals via lane shuffles; the generated code was not inspected. Correctness of that engine: equal to `std.crypto.hash.blake2.Blake2b256` on every length 0..600 and random chunkings (test), equal to Go/libsodium on the 64 KiB message (bench precondition), equal to Python hashlib on 18 lengths (golden test).
-
-### Other targets and CPUs (measured 2026-11-02)
-
-- **Baseline x86-64** (`-Dcpu=x86_64`, no AVX2; bench rows sha256/sha512 64 KiB and blake2b, shared host, spreads up to 22%): `sha256_65536` 0.85x Go, `sha512_65536` 0.84x Go (`sha2` dispatches at run time, so it keeps its edge), but `blake2b256_65536` **1.25x Go, 1.38x libsodium** with the vectorised BLAKE2b (std's is about 1.21x on the same host), so the vectorised engine is compiled in only when the build has AVX2.
-- **MIPS32 big-endian, soft-float** (`mips-linux-musl`, `-mcpu mips32+soft_float`, run under `qemu-mips`): `scripts/modtest`-style `zig build test-hashdigest -fqemu` passed 41 of 43 tests (2 skipped: the fuzz driver and the optimized-only stack probe); an earlier run with the `sha2` and vectorised engines forced on also exited 0. 32-bit ARM (`arm-linux-musleabi`, qemu) passed the same 41. Size, ReleaseSmall, stripped, one 64-byte digest in `main`: std SHA-256 30,016 B, `sha2` SHA-256 37,136 B (+7,120 B); std BLAKE2b-256 44,592 B, vectorised 46,656 B (+2,064 B); empty `main` 1,872 B. Speed under qemu-user (wall time, a proxy for instruction count, not hardware): 917,504 bytes, best of three, `sha2` 0.025 s vs std 0.023 s (+9%), vectorised BLAKE2b 0.032 s vs std 0.027 s (+19%). So neither engine has an advantage on MIPS32: **x86-64 uses `sha2` (and the vectorised BLAKE2b with AVX2), every other target uses std's engines, and the `sha2` import is never analysed there.** `sha2`'s own tests do not compile for 32-bit targets (not investigated), so its `.targets` stays `linux64`.
+`sha2` is CRYPTOGAMS SHA-NI/AVX2 under run-time dispatch (that module's NOTICE); SHA-3 and BLAKE3 are std's. Correctness of
+the in-module BLAKE2b-256 engine: equal to std's on every length 0..600 and random chunkings (test), equal to Go and
+libsodium on the 64 KiB message (bench precondition), equal to Python `hashlib` on 18 lengths (golden test).
 
 ## Verification
-Official empty-string and `"abc"` known-answer vectors for all 9 algorithms; incremental-equals-one-shot; the `/proc`-style size-0 file read; **cross-implementation goldens**: `src/testdata/golden.tsv` (180 digests, every algorithm but BLAKE3, plus SHAKE128/256 with 100 output bytes, 18 message lengths straddling the block edges, from Python `hashlib`/OpenSSL; recipe `tools/gen_golden.py`); **`src/testdata/blake3_vectors.tsv`**: 24 rows (hash, keyed_hash, derive_key at lengths 0, 1, 63, 64, 65, 1024, 1025, 8193, 131 output bytes) sliced from BLAKE3-team/BLAKE3 `test_vectors/test_vectors.json` at commit f55849f8 (CC0-1.0, alternatively Apache-2.0), asserted through `xof`, `blake3Keyed`, `blake3DeriveKey`, and each row also checks that the wrong-order variant (keyed in place of plain, derive in place of keyed, context and material swapped) gives a different answer; **`src/testdata/sums.txt`**: 140 lines written by **GNU coreutils 9.7** (`gnusha256sum`, `gnusha512sum`, `gnub2sum`) and **uutils coreutils 0.10** (the plain names on this host), plain, `--binary`, `--tag`, over 10 names with space, backslash, newline, CR, tab, `*`, ` = `; every line verifies after the test recreates the files. Tamper/missing/malformed/unsafe-name/non-regular-file statuses; empty-file `allOk` is false; the vectorised BLAKE2b against std. Run: `scripts/modtest hashdigest`. Fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] scripts/modtest hashdigest -Doptimize=ReleaseSafe`. Burn: `src/stackprobe_test.zig` (ReleaseFast: `scripts/modtest --file modules/hashdigest/src/stackprobe_test.zig -OReleaseFast --dep testkit --dep sha2 -Mroot=modules/hashdigest/src/stackprobe_test.zig -Mtestkit=modules/testkit/src/root.zig -Msha2=modules/sha2/src/root.zig`); with the `defer burnStack();` lines deleted in a copy it reports `DeadStackResidue` and 18 needle hits (2026-11-02), and at an 8 KiB burn `blake3DeriveKey` over 3000 bytes of material left 411 B of residue, hence 16 KiB.
 
-**Audit 2026-10-04 (mutation).** 11 schemata mutants over lowercase hex output, `matches` /
-`matchesAlgo` (length guard, exact comparison), the file hashers (byte totals, the update
-loop, the up-front buffer check) and the `ShortBuffer` checks of `hex` and
-`MultiHasher.finalHex`: 9 killed, 2 equivalent, 0 left alive. Equivalent: the
-`announced.len != …` guards in `matches` and `matchesAlgo`. The new code (`checksum`, `blake2b`, `xof`, keyed modes) has had **no mutation run**.
+Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] scripts/modtest hashdigest -Doptimize=ReleaseSafe`.
 
-**Audit 2026-11-19 (whole-module mutation).** 130 schemata mutants over `root.zig`, `checksum.zig` and `blake2b.zig`: hex case, the length and short-buffer checks, the file streaming loop and `max_bytes`, the XOF / keyed / derive selection, `finalHex` finalizing a copy; the whole checksum-file parser, verifier and summary; the BLAKE2b-256 streaming boundaries, counter, last-block flag, message schedule, diagonal shuffles, rotations and feed-forward. Five of them are burn-site mutants measured in a ReleaseFast schemata build with the switch inside the callee (the stack probe's baseline is clean). Result: 123 killed (4 by a hang), 7 equivalent, 0 open, 0 not run. The card's `123/130` replaces the earlier counts (`src ?`). Not mutated: the `sigma` and IV tables and the 12-round `inline for` bound (comptime; any change breaks the comparison against std), `nativeToLittle` (the identity on little-endian hosts), the `secureZero` of the state copy in `Hasher.finalHex` and `MultiHasher.finalHex` (public-digest states, no stack probe) and the body of `burnStack`. The first run left 28 survivors; tests added: `parseLine` on an empty line, an empty BSD name, an empty digest, a wrong separator and a wrong mode; the BSD binary flag; unescaped names keep their backslashes and fit an exact buffer; `isUnsafeName` on empty and `..x` names; every failure counter of `Summary.allOk`; a BSD tag overriding the default algorithm; case-insensitive digest comparison; a bad escape as `BadLine`; an unreadable regular file as `unreadable`; and `hashFileIn` one byte short.
+- **Known answers:** official empty-string and `"abc"` vectors for all nine algorithms; incremental equals one-shot; the
+  size-0 `/proc` file read; hex buffers one byte short are `ShortBuffer`.
+- **Cross-implementation goldens** (`src/testdata/`, frozen): `golden.tsv` (every algorithm but BLAKE3, plus SHAKE128/256
+  with 100 output bytes, messages of lengths straddling the block edges, from Python `hashlib`/OpenSSL; recipe
+  `tools/gen_golden.py`); `blake3_vectors.tsv` (hash, keyed_hash and derive_key rows sliced from the official BLAKE3
+  `test_vectors.json`, asserted through `xof`, `blake3Keyed`, `blake3DeriveKey`; each row also checks that the
+  wrong-order variant gives a different answer); `sums.txt` (lines written by GNU coreutils 9.7 and uutils coreutils
+  0.10: plain, `--binary`, `--tag`, over names with space, backslash, newline, CR, tab, `*`, ` = `; every line verifies
+  after the test recreates the files).
+- **Checksum files:** parse and verify cases (tampered, missing, malformed, unsafe-name, non-regular file statuses; empty-file
+  `allOk` false; every failure counter of `Summary.allOk`; a BSD tag overriding the default; case-insensitive digests; bad escapes).
+- **Bounded hashing:** the cap is exact, over it is `FileTooLarge`, null is unlimited; a path with no end (`/dev/zero`)
+  stops at the cap; `Options.max_file_bytes` makes `too_large`.
+- **BLAKE2b engine:** against std on every length 0..600 and random chunkings.
+- **Fuzz:** one harness over the checksum parser and verifier (driver prefix `HASHDIGEST_FUZZ`, `src/fuzz_test.zig`) with
+  a reach check that every outcome label is hit.
+- **No-panic sweep:** `src/sweep_test.zig` (hostile paths, update after `finalHex`, `xof`/BLAKE3 with empty and long
+  outputs, hostile checksum text and names).
+- **Burn:** `src/stackprobe_test.zig` (ReleaseFast: `scripts/modtest --file modules/hashdigest/src/stackprobe_test.zig -OReleaseFast --dep testkit --dep sha2 -Mroot=modules/hashdigest/src/stackprobe_test.zig -Mtestkit=modules/testkit/src/root.zig -Msha2=modules/sha2/src/root.zig`); the probe reports residue when the `defer burnStack();` lines are removed in a copy.
+- **Constant time:** n/a — digests of public data; `blake3Keyed` is not ctgrind-checked.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-hashdigest` (see Performance).
 
-Equivalent (7): the length pre-checks of `matches` and `matchesAlgo` (`eql` compares lengths); in `parseLine` the guards `s.len < hex_end + 3` and `name.len == 0`, each redundant given the other (a name is at least one byte whenever the length guard passes); and the three wipes inside `blake3Keyed` / `blake3DeriveKey` (`secureZero` of the key copy and of the state, twice): the `defer burnStack()` that runs after them overwrites the same frame region, so the probe cannot see them go (dropping the burn itself is killed by the probe).
+## What is deliberately not done
+
+- **MD5, SHA-1 and CRC / other legacy digests:** collision-broken (MD5, SHA-1) or not digests; `crc32` / `crc32c` are sibling modules.
+- **More algorithms (Whirlpool, BLAKE2s, SHA-512/224, Keccak, ...):** breadth without a consumer; `ripemd160` is a sibling module. Adding one is a one-line `Impl` row when a consumer asks.
+- **HMAC / HKDF:** sibling `webhooksig` (HMAC) and std's `Hmac` / `Hkdf` over `sha2`'s types; not a digest-helper concern.
+- **A `std.Io.Writer` adapter:** not needed; `std.Io.Writer.Hashed` / `Hashing` already give the `io.Copy(h, r)` idiom over any `std.crypto` hasher.
+- **A default size cap on file hashing:** see *Design notes by feature* (the reference tools have none).
 
 ## Backlog / deferred
-- **`verifyEntry` stats, then opens (2026-11-03):** a name swapped for a FIFO between the two can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here.
-- (survey 2026-11-02) **BLAKE3 vectors cover 8 lengths of the official file** (not all 35) and XOF only at 131 bytes; the keyed path through `std` is not ctgrind-checked.
-- (survey 2026-11-02) **BLAKE2b keyed / salt / personal / variable output size**: the in-module engine is unkeyed 256-bit only; std's `Blake2b` has the options. Only if a consumer asks.
-- (survey 2026-11-02) **SHA-2 SHA-NI/AVX2 parity on arm64**: `sha2` has no NEON path of its own; hashdigest inherits that. Not measured here (x86-64 host only).
-- ~~(no-panic sweep GS, 2026-10-30, HD-3) **Bounded file hashing**~~ — **DONE 2026-11-19 (additive).** `hashFileMax`/`hashFileInMax`/`sha256FileMax` take `max_bytes: ?u64` and return `error.FileTooLarge` once the file delivers more (exactly `max_bytes` passes; the read stops within one 64 KiB chunk of the cap); `checksum.Options.max_file_bytes` feeds the same into `verifyEntry`/`verifyAll` as `Status.too_large` / `Summary.too_large` (counted by `allOk`). **Default stays unlimited**, decided by the reference rule: `sha256sum`/`shasum`/`b3sum` and Go's `io.Copy(hash, f)` / Python's `hashlib.file_digest` have no cap, and a silent default cap would turn a legitimate multi-GB image check into an error; a caller hashing untrusted paths sets it (no cap-by-default means no behaviour change). Delta mutation 2026-11-19: 9 mutants (cap comparison x4, status mapping, `allOk`, summary counter, option pass-through, the unlimited wrapper), 9 killed (one after a new test: `allOk` with one ok and one too-large file); the card counts are cumulative (old + 9); `src ?` stays, the earlier run's source is not recorded. The cap bounds bytes, not time: a FIFO whose writer stays open and silent still blocks (non-regular files are already refused by `verifyAll`). Not taken: a time limit (`std.Io` offers no read deadline here). `verifyAll` refuses absolute and `..` names and non-regular files by default (`Options.allow_unsafe_names` lifts the name rule); symlinks are followed and stat-then-open is not atomic, so a caller verifying an untrusted checksum file must still confine `dir` itself.
-- (stack burn) the 16 KiB burn is probe-checked for 20000-byte inputs on x86-64 only; MIPS/ARM (std engines, other frame sizes) are not probed.
-- ~~bulk SHA-2 / BLAKE2b-256 speed~~ — done 2026-11-02 (see Performance).
-- ~~`sha256sum`-style checksum-file parse/verify~~ — done 2026-11-02 (`checksum`).
-- ~~XOF / keyed modes~~ — done 2026-11-02.
-- ~~`std.Io.Writer` adapter~~ — not needed: `std.Io.Writer.Hashed` / `Hashing` already give the `io.Copy(h, r)` idiom over any `std.crypto` hasher.
 
-## Status
-`extract · any · util · reentrant` · deps: `sha2` (`std.crypto` for the rest) — canonical source is `pub
-const meta` in src/root.zig.
+- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here.
+- **BLAKE3 vectors cover 8 lengths of the official file** (not all 35) and XOF only at 131 bytes; the keyed path through `std` is not ctgrind-checked.
+- **BLAKE2b keyed / salt / personal / variable output size:** the in-module engine is unkeyed 256-bit only; std's `Blake2b` has the options. Only if a consumer asks.
+- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only).
+- **Stack burn on other targets:** the 16 KiB burn is probe-checked for 20000-byte inputs on x86-64 only; MIPS/ARM (std engines, other frame sizes) are not probed.
 
 ## Anchoring
 
