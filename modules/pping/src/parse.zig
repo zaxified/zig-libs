@@ -506,3 +506,13 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "parseTcpTimestamps: a length of 1 ends the walk; kind 8 with a longer length is opaque" {
+    // Linux stops at an option length below 2 (tcp_parse_options: `if (opsize < 2) return`)
+    const bad = [_]u8{ 2, 1, 1, 8, 10, 0, 0, 0, 5, 0, 0, 0, 6 };
+    try testing.expectEqual(@as(?Timestamps, null), parseTcpTimestamps(&bad));
+    const long = [_]u8{ 8, 12, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA } ++ [_]u8{ 8, 10, 0, 0, 0, 7, 0, 0, 0, 8 };
+    const ts = parseTcpTimestamps(&long).?;
+    try testing.expectEqual(@as(u32, 7), ts.tsval);
+    try testing.expectEqual(@as(u32, 8), ts.tsecr);
+}

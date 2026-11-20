@@ -169,3 +169,14 @@ test "KAT: retransmission of the same TSval does not reset its first-seen time" 
     try testing.expect(sample != null);
     try testing.expectEqual(@as(u64, 40), sample.?.rtt); // 40 - 0, not 40 - 30
 }
+
+test "KAT: a full TCP table evicts its oldest TSval for a new one" {
+    var est = try Estimator.init(testing.allocator, .{ .capacity = 2, .max_age = 1_000_000 });
+    defer est.deinit(testing.allocator);
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 1, .tsecr = 0, .now = 10 });
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 2, .tsecr = 0, .now = 20 });
+    _ = est.observe(.{ .dir = .a_to_b, .tsval = 3, .tsecr = 0, .now = 30 });
+    try testing.expectEqual(@as(usize, 2), est.tableCount(.a_to_b));
+    try testing.expectEqual(@as(?root.RttSample, null), est.observe(.{ .dir = .b_to_a, .tsval = 100, .tsecr = 1, .now = 40 }));
+    try testing.expectEqual(@as(u64, 20), est.observe(.{ .dir = .b_to_a, .tsval = 101, .tsecr = 3, .now = 50 }).?.rtt);
+}

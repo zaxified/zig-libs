@@ -337,3 +337,12 @@ test "TsTable: bounded-memory property — capacity is never exceeded across a l
     }
     try testing.expectEqual(@as(usize, 8), t.entries.len); // allocation never grew
 }
+
+test "TsTable: on equal first-seen times the earliest inserted entry is the oldest" {
+    var t = try TsTable.init(testing.allocator, 3);
+    defer t.deinit(testing.allocator);
+    try t.insert(1, 100);
+    try t.insert(2, 100);
+    try t.insert(3, 200);
+    try testing.expectEqual(@as(?usize, 0), t.oldestIndex());
+}

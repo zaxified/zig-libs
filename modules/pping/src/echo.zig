@@ -517,3 +517,62 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11: the exact edges of the length checks ──
+
+test "parseIpEcho: IPv4 length edges — 19 bytes is truncated at any IHL, a bare header is judged by its protocol" {
+    var b: [28]u8 = undefined;
+    const icmp = [8]u8{ 8, 0, 0, 0, 0, 1, 0, 1 };
+    const short = ipv4Echo(&b, 4, 28, 0, 1, icmp); // IHL 4 would be BadHeaderLength once 20 bytes are there
+    try testing.expectError(error.Truncated, parseIpEcho(short[0..19]));
+    const bare = ipv4Echo(&b, 5, 20, 0, 6, std.mem.zeroes([8]u8)); // TCP, header only: not an echo, not an error
+    try testing.expectEqual(@as(?IpEcho, null), try parseIpEcho(bare[0..20]));
+}
+
+test "parseIpEcho: every IPv6 packet shorter than 40 bytes is truncated" {
+    var b: [128]u8 = undefined;
+    ipv6Base(&b, 8, 58);
+    b[40..48].* = .{ 128, 0, 0, 0, 0, 1, 0, 1 };
+    for (0..40) |n| try testing.expectError(error.Truncated, parseIpEcho(b[0..n]));
+}
+
+test "parseIpEcho: payload length 0 reads to the end of the packet, 1 does not" {
+    var b: [128]u8 = undefined;
+    const req = [8]u8{ 128, 0, 0, 0, 0, 1, 0, 1 };
+    ipv6Base(&b, 0, 58);
+    b[40..48].* = req;
+    try testing.expectEqual(Kind.request, (try parseIpEcho(b[0..48])).?.echo.kind);
+    ipv6Base(&b, 1, 58);
+    b[40..48].* = req;
+    try testing.expectError(error.Truncated, parseIpEcho(b[0..48]));
+}
+
+fn destinationOptionsChain(b: []u8, k: usize) []const u8 {
+    ipv6Base(b, @intCast(8 * k + 8), 60);
+    for (0..k) |i| {
+        b[40 + 8 * i] = if (i + 1 == k) 58 else 60;
+        b[41 + 8 * i] = 0;
+    }
+    b[40 + 8 * k ..][0..8].* = .{ 128, 0, 0, 0, 0, 1, 0, 1 };
+    return b[0 .. 48 + 8 * k];
+}
+
+test "parseIpEcho: eight extension headers are walked, the ninth is refused" {
+    var b: [128]u8 = undefined;
+    try testing.expectEqual(Kind.request, (try parseIpEcho(destinationOptionsChain(&b, max_ipv6_extension_headers))).?.echo.kind);
+    try testing.expectError(error.TooManyExtensionHeaders, parseIpEcho(destinationOptionsChain(&b, max_ipv6_extension_headers + 1)));
+}
+
+test "parseIpEcho: an extension header that ends exactly at the packet end, and the Fragment reserved bits" {
+    var b: [128]u8 = undefined;
+    // Hop-by-Hop (8 octets) with No Next Header, filling the payload exactly: nothing to see, not truncated
+    ipv6Base(&b, 8, 0);
+    b[40] = 59;
+    try testing.expectEqual(@as(?IpEcho, null), try parseIpEcho(b[0..48]));
+    // a first fragment whose reserved bits are set: RFC 8200 4.5 says receivers ignore them
+    ipv6Base(&b, 16, 44);
+    b[40] = 58;
+    b[42..44].* = .{ 0x00, 0x07 }; // offset 0, reserved 11, M 1
+    b[48..56].* = .{ 128, 0, 0, 0, 0, 1, 0, 1 };
+    try testing.expectEqual(Kind.request, (try parseIpEcho(b[0..56])).?.echo.kind);
+}

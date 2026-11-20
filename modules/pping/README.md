@@ -6,7 +6,7 @@
 
 **Scope:** core — pollere/pping TCP-timestamp technique, one flow per estimator (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after ICMP/ICMPv6 echo RTT matching landed)
 
-**Audit:** review 2026-07-19 · mutation 2026-08-13 · src ?
+**Audit:** review 2026-07-19 · mutation 2026-11-20 (125/128, 3 eq) · src 3417b81c760956fb
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PPING_FUZZ) · ct n/a — passive ping (keyword review, 2026-10-07)
 
@@ -149,6 +149,13 @@ replies, cross-pinging hosts, table pressure, aging and refused mixing.
 
 Fuzz: the deterministic driver `PPING_FUZZ=<runs>[,<seed>]` runs three harnesses (`pping-tcp-options`,
 `pping-ip-echo`, `pping-estimator`). The card's `**Audit:**` line is the current mutation and review score.
+
+Mutation: one whole-module run over `match.zig`, `parse.zig`, `table.zig`, `echo.zig` and the estimator in `root.zig` (128 mutants),
+125 killed, 3 equivalent (the last byte of a TCP option list cannot yield a result; an IPv4 header length is a multiple of 4;
+an IPv6 extension header that ends two bytes after its start falls through to the same truncation), none open. The parsers' length
+checks had test gaps, not defects: a 19-byte IPv4 packet, every IPv6 packet below 40 bytes, a bare IPv4 header of another
+protocol, payload length 0 versus 1, the extension-header cap at exactly 8 and 9, an extension header filling the packet, the
+Fragment reserved bits, a TCP option of length 1, and the TCP table's eviction are now tests.
 
 Provenance: the passive-RTT technique (match a TCP TSecr back to the TSval
 that produced it, seen earlier in the opposite direction) and its

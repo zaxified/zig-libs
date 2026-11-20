@@ -291,3 +291,13 @@ test "scenario: TCP samples keep the default .tcp_timestamps tag" {
     _ = est.observe(.{ .dir = .a_to_b, .tsval = 1, .tsecr = 0, .now = 0 });
     try testing.expectEqual(root.Proto.tcp_timestamps, est.observe(.{ .dir = .b_to_a, .tsval = 2, .tsecr = 1, .now = 4 }).?.proto);
 }
+
+test "scenario: a request repeated after max_age is a fresh probe, and a reply stamped before its request gives rtt 0" {
+    var est = try Estimator.init(testing.allocator, .{ .max_age = 100 });
+    defer est.deinit(testing.allocator);
+    _ = est.observeEcho(.{ .dir = .a_to_b, .echo = req(1, 1), .now = 0 });
+    _ = est.observeEcho(.{ .dir = .a_to_b, .echo = req(1, 1), .now = 1000 }); // the first one aged out of its own table
+    try testing.expectEqual(@as(u64, 10), est.observeEcho(.{ .dir = .b_to_a, .echo = rep(1, 1), .now = 1010 }).?.rtt);
+    _ = est.observeEcho(.{ .dir = .a_to_b, .echo = req(1, 2), .now = 2000 });
+    try testing.expectEqual(@as(u64, 0), est.observeEcho(.{ .dir = .b_to_a, .echo = rep(1, 2), .now = 1950 }).?.rtt); // clock stepped back
+}
