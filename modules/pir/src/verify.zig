@@ -931,7 +931,7 @@ test "ATTACK: BOTH servers zeroing everything is rejected — the presence word 
     }
     try testing.expectError(error.AnswerRejected, tampered.reconstruct(&got));
 
-    // The same transcript on the wire path(the
+    // The same transcript on the wire path (the
     // presence check dropped from `reconstructFromBytes` alone survived).
     const zv: [2 * 4]u8 = @splat(0);
     const zt: [3 * V.tag_word_len]u8 = @splat(0);
