@@ -356,6 +356,15 @@ pub const Connection = struct {
     /// one record holds (`peek`, `take…` beyond it; `peekGreedy(1)` /
     /// `buffered` / `toss` never ask that). Runs the handshake first if
     /// needed. `self` must not move while it is in use.
+    ///
+    /// std's delimiter helpers (`takeDelimiterInclusive`,
+    /// `peekDelimiterExclusive`, ...) search what is buffered, which is at
+    /// most one record: with nothing buffered (a fresh connection, a record
+    /// read to its end) the first call loads the next record and still
+    /// returns `error.StreamTooLong` (std's exit when its buffer has no spare
+    /// capacity); a delimiter the record does not hold is `StreamTooLong`
+    /// too. Call `peekGreedy(1)` first, then the helper answers from that
+    /// record.
     pub fn reader(self: *Connection) *std.Io.Reader {
         return &self.app_in;
     }

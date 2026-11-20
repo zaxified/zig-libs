@@ -82,7 +82,9 @@ application-data record does not (BoringSSL `kMaxKeyUpdates`, `src/server.zig`).
 and resumes them (below). With `Config.client_auth` it asks for a client certificate, verifies
 the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with clientAuth) and the
 client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. The seams the web-server consumer's zero-copy codecs need are in:
-one send buffer, `Connection.reader()` / `writer()` in place, `Server.writeSlot` / `commitWrite`.
+one send buffer, `Connection.reader()` / `writer()` in place, `Server.writeSlot` / `commitWrite`. `reader()`'s buffer is
+one record, so std's delimiter helpers search one record: with nothing buffered the first call loads a record and returns
+`StreamTooLong` (std's exit for a full buffer); `peekGreedy(1)` first makes them answer (doc comment, tested).
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS itself (the
 record keys can be handed over to it: `Server.extractSecrets`) and post-handshake client authentication (*What is deliberately not
@@ -982,10 +984,6 @@ records (the per-record 4 KiB burn).
 - **`Config.check()`.** A config the server accepts but cannot serve fails per handshake with `InternalError` — a group `kex`
   does not compute (an HRR for it first), an empty `ClientAuth.schemes`, `Quic.transport_parameters` or `authorities` over
   64 KiB, a `compressed_certificates` mismatch. One up-front check would refuse them at `init`.
-- **`Connection.reader()` and std's delimiter helpers.** On a fresh connection `takeDelimiterInclusive` returns
-  `StreamTooLong` through std's failing-writer path (no panic); document or prefill.
-- **Clock arithmetic in `tlsresume`.** `now_ms - session.issued_at_ms` traps on an extreme caller clock; `tlsserver`'s own two
-  subtractions saturate.
 - **Second ClientHello unchanged.** RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
   the listed changes; only the suite, the group's share, SNI and `early_data` are compared (rustls compares less). Comparing the
   first hello's other extensions (kept as a hash of their octets) would refuse a reordered or altered one with

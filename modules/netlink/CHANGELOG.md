@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — New `Filter.max_records` (default null = `max_dump_records`): a lower dump cap for `addresses`/`routes`/`neighbors`/`rules`, counted as the default cap is; past it the dump is `error.TooManyMessages`. Additive.
 - **2026-11-08** — **NEW:** `codec.appendAttrU64` (host-order u64 rtattr), next to `appendAttrU32`; tc and devlink had private copies (duplicate-code pass).
 - **2026-11-02** — **ADDITIVE:** `netlink.builders.*` (the request builders as pure functions: address, route, linkSet, linkAdd, linkDel, rule, neighbor, routeGet, linkGet); `tools/bench.zig` + `tools/go_bench` (ours/Go vishvananda/netlink 0.06-0.12x); SPEC survey 2026-11-02 (Scope parity), README section; uid-range live test uses the one uid the test namespace maps.
 - **2026-11-03** — **CONSUMER-VISIBLE (review fixes):** extra-detail attributes no longer fail a record (see SPEC "Dump tolerance"); `ext.appendMultipath` validates its hops (weight 0/257 and odd gateway lengths were a panic); `getOver` ends on `NLMSG_DONE` (`NotFound`) and refuses an unasked-for type; nexthop FDB groups are accepted and `nexthops(.{ .family })` keeps groups; fuzz harnesses `netlink-ext` (every kind, wrapped in real LINKINFO/rtmsg/ifaddrmsg/rule payloads) and `netlink-lookup`; builder sweep; constants checked against the system headers.

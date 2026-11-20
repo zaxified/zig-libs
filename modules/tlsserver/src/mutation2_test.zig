@@ -2,8 +2,7 @@
 
 //! Tests added by wave 2 of the whole-module mutation run of 2026-11-06:
 //! each decides a mutant of wave 1 that survived (guards, error mappings and
-//! size arithmetic of the record layer; the handshake engine's are in
-//! `mutation3_test.zig`).
+//! size arithmetic of the record layer).
 
 const std = @import("std");
 const testing = std.testing;

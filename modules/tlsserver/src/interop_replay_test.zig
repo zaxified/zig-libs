@@ -676,6 +676,34 @@ test "reader(): more contiguous octets than one record holds is RecordBoundary" 
     try testing.expectEqualStrings("ping\n", r.buffered());
 }
 
+test "reader(): std's delimiter helpers answer from the buffered record; with none buffered the first call is StreamTooLong" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const r = h.conn.reader();
+        // Fresh: std's buffer has no spare capacity, so it asks `stream` with a
+        // failing writer -- the record is loaded, the call says StreamTooLong.
+        try testing.expectError(error.StreamTooLong, r.takeDelimiterInclusive('\n'));
+        try testing.expectEqualStrings("ping\n", r.buffered());
+        // Now it answers from the record.
+        try testing.expectEqualStrings("ping\n", try r.takeDelimiterInclusive('\n'));
+    }
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const r = h.conn.reader();
+        // `peekGreedy(1)` first: a record is buffered, the helper finds the line.
+        _ = try r.peekGreedy(1);
+        try testing.expectEqualStrings("ping", try r.peekDelimiterExclusive('\n'));
+        // A delimiter the record does not hold: StreamTooLong, nothing consumed.
+        try testing.expectError(error.StreamTooLong, r.takeDelimiterInclusive('x'));
+        try testing.expectEqualStrings("ping\n", r.buffered());
+    }
+}
+
 test "a recording with one octet of OpenSSL's flipped is refused" {
     // The client's Finished sits in the last records before the
     // application data; flipping the final octet of the recording hits

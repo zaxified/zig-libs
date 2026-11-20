@@ -58,7 +58,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, // aes192: the AES-192 block cipher (std 0.16 has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, // aes192: the AES-192 block cipher (std has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────
@@ -896,15 +896,22 @@ fn gatherSignificant(alloc: std.mem.Allocator, el: *const xml.Element, out: []u8
 }
 
 /// Decode a base64 element's text into `out` (small, fixed buffers only — for
-/// the OAEP label). Returns a subslice of `out`.
+/// the OAEP label). Returns a subslice of `out`. The significant characters
+/// are gathered straight from the text nodes (`countSignificant` /
+/// `gatherSignificant`, the walk `textContent` makes) into a fixed buffer, so
+/// a label decodes up to `out.len` octets; more, or a text that cannot be
+/// one, is `MalformedStructure`.
 fn readBase64Text(el: *const xml.Element, out: []u8) Error![]const u8 {
-    var buf: [512]u8 = undefined;
-    const raw = if (el.children.len == 0) "" else blk: {
-        // textContent needs an allocator; the label is tiny, so gather inline.
-        var fbs = std.heap.FixedBufferAllocator.init(&buf);
-        break :blk el.textContent(fbs.allocator()) catch return error.MalformedStructure;
-    };
-    return decodeBase64Fixed(raw, out);
+    var compact: [512]u8 = undefined; // 4 * ceil(256 / 3) = 344 characters for a 256-octet label
+    // The walk's stack of child lists: one entry per open element.
+    var stack_mem: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_mem);
+    var n: usize = 0;
+    countSignificant(fba.allocator(), el, compact.len, &n) catch return error.MalformedStructure;
+    fba.reset();
+    var w: usize = 0;
+    gatherSignificant(fba.allocator(), el, compact[0..n], &w) catch return error.MalformedStructure;
+    return decodeBase64Fixed(compact[0..w], out);
 }
 
 /// Whitespace-strip + base64-decode into a fixed buffer (for the tiny OAEP

@@ -1984,7 +1984,7 @@ fn labelRoundTrip(a: std.mem.Allocator, kp: rsa.KeyPair, label: []const u8, labe
     return xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
 }
 
-test "rsa-oaep-mgf1p: OAEPparams is the OAEP label, decoded from base64 with any XML whitespace, up to what the scratch buffer holds" {
+test "rsa-oaep-mgf1p: OAEPparams is the OAEP label, decoded from base64 with any XML whitespace, up to 256 octets" {
     const a = std.testing.allocator;
     const kp = try makeKey();
 
@@ -1999,20 +1999,31 @@ test "rsa-oaep-mgf1p: OAEPparams is the OAEP label, decoded from base64 with any
     defer a.free(ws);
     try std.testing.expectEqualStrings(plaintext_assertion, ws);
 
-    // The label text is gathered in a 512-octet scratch buffer
-    // (`readBase64Text`), whose list growth admits fewer octets than the
-    // 256-octet decode buffer (measured: 64 octets pass, 128 do not): a long
-    // label is refused, never overrun. 64 are accepted, 256 are refused.
+    // Labels up to the 256-octet decode buffer pass (the text is gathered
+    // from the text nodes, not through `textContent`, whose list growth in a
+    // fixed buffer refused 128 octets); 257 are refused, never overrun.
     const l64: [64]u8 = @splat(0x4C);
+    const l200: [200]u8 = @splat(0x4D);
     const l256: [256]u8 = @splat(0x4C);
-    const t64 = try b64(a, &l64);
-    defer a.free(t64);
+    const l257: [257]u8 = @splat(0x4C);
+    inline for (.{ &l64, &l200, &l256 }) |l| {
+        const t = try b64(a, l);
+        defer a.free(t);
+        const got = try labelRoundTrip(a, kp, l, t);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(plaintext_assertion, got);
+    }
+    const t257 = try b64(a, &l257);
+    defer a.free(t257);
+    try std.testing.expectError(error.MalformedStructure, labelRoundTrip(a, kp, &l257, t257));
+    // A long label split over whitespace lines decodes the same.
     const t256 = try b64(a, &l256);
     defer a.free(t256);
-    const big = try labelRoundTrip(a, kp, &l64, t64);
-    defer a.free(big);
-    try std.testing.expectEqualStrings(plaintext_assertion, big);
-    try std.testing.expectError(error.MalformedStructure, labelRoundTrip(a, kp, &l256, t256));
+    const split = try std.mem.concat(a, u8, &.{ t256[0..100], "\n  ", t256[100..200], "\r\n\t", t256[200..] });
+    defer a.free(split);
+    const got_split = try labelRoundTrip(a, kp, &l256, split);
+    defer a.free(got_split);
+    try std.testing.expectEqualStrings(plaintext_assertion, got_split);
 }
 
 test "decryptDataToDocument: the recovered tree indexes ID attributes" {

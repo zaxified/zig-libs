@@ -421,7 +421,7 @@ Measured with `@sizeOf`:
 | `Address` | 56 | 235 MB |
 | `Nexthop` | 104 | 436 MB |
 
-(`ArrayList` growth can briefly hold twice that.) The records come from the kernel, not from a peer, and a real full table is ~1 M routes (190 MB); an allocation failure stays `error.OutOfMemory`. A lower, configurable cap (`Filter.max_records`) would be additive and is **not built** (Backlog).
+(`ArrayList` growth can briefly hold twice that.) The records come from the kernel, not from a peer, and a real full table is ~1 M routes (190 MB); an allocation failure stays `error.OutOfMemory`. A caller who wants a lower bound sets `Filter.max_records` (counted as `max_dump_records` is: every payload message of the dump, and the items kept; a value above `max_dump_records` is `max_dump_records`), for the dumps that take a `Filter` (addresses, routes, neighbours, rules); the dump then ends with `error.TooManyMessages`.
 
 ## Protocol-parameterised transport
 
@@ -535,7 +535,6 @@ rule's `rule_del`. Plus: a monitor socket opens unprivileged on the host.
 
 ## Backlog / deferred
 
-- **`Filter.max_records`** — a lower, configurable dump cap (additive; see *Memory per dump record*).
 - **P "fastest" row** — rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked (the reference, Go, was). A cargo bench under `tools/` would settle it.
 
 ## Anchoring

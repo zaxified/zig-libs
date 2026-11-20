@@ -259,6 +259,8 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
   `NETLINK_GET_STRICT_CHK` (Linux ≥ 4.20 opt-in). Dump requests carry the
   full fixed header (ifinfomsg/ifaddrmsg/rtmsg/ndmsg), not the legacy 1-byte
   rtgenmsg, for strict-check compatibility — same as modern iproute2.
+  `Filter.max_records` lowers the dump cap (`max_dump_records`, 4 Mi) for a
+  caller that bounds the memory one dump may take.
 - **IPv4 addresses** prefer `IFA_LOCAL` over `IFA_ADDRESS` (the peer on
   point-to-point links), matching iproute2's display semantics.
 - **Writes are ACKed, never fire-and-forget.** Each `RTM_NEW*`/`RTM_DEL*`

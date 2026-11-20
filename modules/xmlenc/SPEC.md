@@ -143,10 +143,10 @@ CEK length must match the content algorithm's key size, else
   plus the plaintext buffer it borrows from); the tree's arena is backed by the shared `wipealloc` `WipingAllocator`,
   and `deinit(alloc)` releases the tree, then wipes and frees the plaintext. The recovered octets parse under
   `Options.max_elements` (default 65 536). `decryptData` runs under a 64 KiB dead-stack burn (`src/burn.zig`).
-- **OAEPparams size.** `readBase64Text` gathers the label text in a 512-octet scratch buffer, and the list growth of
-  `textContent` admits fewer base64 characters than the 256-octet decode buffer holds (measured: 64-octet labels pass,
-  128 do not). Labels of that size are refused with `MalformedStructure`: fail-closed and rare (see *Backlog /
-  deferred*).
+- **OAEPparams size.** `readBase64Text` gathers the label's significant characters straight from the text nodes into a
+  512-octet buffer and decodes them into a 256-octet one: labels up to 256 octets are read, a longer one is refused with
+  `MalformedStructure` (xmlsec has no cap; a label is a few octets in every profile seen, and the cap keeps the walk
+  allocation-free).
 
 ## Constant-time posture
 
@@ -276,8 +276,6 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 
 ## Backlog / deferred
 
-- **OAEPparams label size:** decode the label without `textContent` so labels above about 64 octets pass instead of being
-  refused with `MalformedStructure` (see *Security posture*). Not done: rare and fail-closed; do it if a peer sends one.
 - **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey:** used by newer eIDAS/SAML profiles that avoid
   RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256 ECDH + Concat KDF; check siblings). Low to
   medium priority; fits the module's scope.

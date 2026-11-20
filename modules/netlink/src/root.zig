@@ -736,6 +736,13 @@ pub const Neighbor = struct {
 pub const Filter = struct {
     family: ?u8 = null,
     ifindex: ?u32 = null,
+    /// A lower dump cap than `max_dump_records`: the dump ends with
+    /// `error.TooManyMessages` once it brings more payload messages than this
+    /// (counted before the client-side `ifindex` filter, as the
+    /// `max_dump_records` cap is) or keeps more items. Bounds the memory one
+    /// dump may take (see SPEC *Memory per dump record*). A value above
+    /// `max_dump_records` is `max_dump_records`.
+    max_records: ?u32 = null,
 };
 
 // ── payload parsers (pure, offline-testable, fuzzed) ────────────────────────
@@ -3423,7 +3430,8 @@ fn dumpOver(
         attempt += 1;
         const seq = try transport.sendDumpRequest(msg_type, fixed_len, filter.family orelse AF.UNSPEC);
         out.clearRetainingCapacity();
-        switch (try collectDumpPass(T, Filter, rec, gpa, transport, &out, seq, reply_type, filter, max_dump_records)) {
+        const cap = @min(filter.max_records orelse max_dump_records, max_dump_records);
+        switch (try collectDumpPass(T, Filter, rec, gpa, transport, &out, seq, reply_type, filter, cap)) {
             .done => return out.toOwnedSlice(gpa),
             .restart => if (attempt >= max_dump_attempts) return error.InconsistentDump,
         }
@@ -6756,6 +6764,42 @@ test "a dump of exactly max_records items is complete, one more trips the cap (s
     defer out.deinit(testing.allocator);
     try testing.expectEqual(DumpPass.done, try collectDumpPass(Link, void, one, testing.allocator, &t, &out, 42, RTM_NEWLINK, {}, 10));
     try testing.expectEqual(@as(usize, 10), out.items.len);
+}
+
+test "Filter.max_records: a dump of exactly the cap is complete, one more message is TooManyMessages" {
+    var ok: [ifinfomsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, ok[4..8], 1, native_endian);
+    const gpa = testing.allocator;
+    const m = try lookupDatagram(gpa, RTM_NEWLINK, 42, 7, &ok);
+    defer gpa.free(m);
+    const done = try lookupDatagram(gpa, codec.NLMSG_DONE, 42, 7, &.{});
+    defer gpa.free(done);
+    var script: [5][]const u8 = undefined;
+    for (script[0..4]) |*x| x.* = m;
+    script[4] = done;
+    {
+        var t: ScriptedTransport = .{ .script = &script, .pid = 7, .seq = 42 };
+        const got = try dumpOver(Link, parseLink, matchLink, gpa, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{ .max_records = 4 });
+        defer gpa.free(got);
+        try testing.expectEqual(@as(usize, 4), got.len);
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &script, .pid = 7, .seq = 42 };
+        try testing.expectError(error.TooManyMessages, dumpOver(Link, parseLink, matchLink, gpa, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{ .max_records = 3 }));
+    }
+    // Messages the client-side ifindex filter drops still count, as for the
+    // default cap: 4 messages, none kept, cap 3.
+    {
+        var t: ScriptedTransport = .{ .script = &script, .pid = 7, .seq = 42 };
+        try testing.expectError(error.TooManyMessages, dumpOver(Link, parseLink, matchLink, gpa, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{ .max_records = 3, .ifindex = 99 }));
+    }
+    // null and a value above the default both mean the default.
+    inline for (.{ @as(?u32, null), @as(?u32, std.math.maxInt(u32)) }) |cap| {
+        var t: ScriptedTransport = .{ .script = &script, .pid = 7, .seq = 42 };
+        const got = try dumpOver(Link, parseLink, matchLink, gpa, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{ .max_records = cap });
+        defer gpa.free(got);
+        try testing.expectEqual(@as(usize, 4), got.len);
+    }
 }
 
 test "the interrupted dump may end in an NLMSG_ERROR that carries DUMP_INTR (sweep audit GV-B4)" {

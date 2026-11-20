@@ -53,9 +53,8 @@ pub const record_burn = 4 * 1024;
 /// and HKDF below them burn their own. The steps reach 10.2 KiB below the
 /// burn's top in ReleaseFast (`interop_replay_test.zig`'s handshake probe
 /// with this burn off: full, hybrid, HRR, resumed, RSA, P-384, Ed25519;
-/// 2026-10-21); ~1.6x. Was 32 KiB, a margin — which the steps outgrew by
-/// 3 KiB while the ClientHello's two 8 KiB duplicate bitsets sat inlined in
-/// `onClientHello`'s frame (out of line since).
+/// 2026-10-21); ~1.6x. The ClientHello's two 8 KiB duplicate bitsets stay
+/// out of `onClientHello`'s frame (out of line) to keep it so.
 pub const handshake_burn = 16 * 1024;
 
 /// `keys.CertKeyPair.fromPem`: the PEM and DER walk, the Ed25519 seed
