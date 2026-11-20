@@ -64,6 +64,11 @@ WHAT COUNTS AS A "CODE LINE", AND WHY EACH EXCLUSION IS THERE
   found by brace-balancing from a `test` header in the file's own post-image
   (or pre-image, for removed lines), the same shape `check-skip-as-pass.py`
   uses.
+* **A `*_test.zig` file does not count at all** (2026-11-20, CONVENTIONS §8:
+  a commit that changes only tests owes no entry). Such a file holds tests and
+  the helpers they share outside any `test` block (models, fuzz harnesses,
+  fixtures); brace-balancing sees those helpers as code, and a `pub` helper
+  there tripped trigger 1. No consumer imports a `_test.zig` file.
 * **`example/`, `README.md`, `SPEC.md`, `NOTICE` are not looked at at all.**
   Only `modules/<m>/src/` is measured. An example is a consumer, not the
   module; SPEC.md is documentation with its own gate.
@@ -244,6 +249,12 @@ def git(*args, check=True):
     return p.stdout.decode("utf-8", errors="replace")
 
 
+def is_test_file(path):
+    """A file of tests only (`modules/<m>/src/**/*_test.zig`): none of its lines
+    count, the helpers outside its `test` blocks included."""
+    return path is not None and path.endswith("_test.zig")
+
+
 def test_block_lines(text):
     """Line numbers (1-based) inside a `test` block, brace-balanced.
 
@@ -354,7 +365,7 @@ def src_churn(rng, module):
     def consider(line, body, is_test):
         nonlocal count
         s = body.strip()
-        if not s or s.startswith("//") or is_test:
+        if not s or s.startswith("//") or is_test or is_test_file(new_path if new_path != "/dev/null" else old_path):
             return
         count += 1
         if PUB_RE.match(s):
@@ -381,7 +392,7 @@ def src_churn(rng, module):
             old_ln += 1
 
     for f in rng.untracked(prefix + "/"):
-        if not f.endswith(".zig"):
+        if not f.endswith(".zig") or is_test_file(f):
             continue
         body = Path(f).read_text(errors="replace")
         tests = test_block_lines(body)

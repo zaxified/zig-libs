@@ -184,6 +184,19 @@ for ((i = 0; i < 200; i++)); do echo "const x$i = $i;"; done > modules/demo/exam
 git add modules
 "$HOOK" >/dev/null 2>&1; check "200 lines in example/ only -> allow" 0 $?
 
+# 16b: a `*_test.zig` file is tests only (CONVENTIONS §8, 2026-11-20): its
+# helpers outside `test` blocks, `pub` ones included, owe no entry. Its
+# positive control is case 9 (the same volume in root.zig is refused).
+git reset -q --hard >/dev/null
+{ echo 'pub fn model(x: u32) u32 {'
+  echo '    var a: u32 = x;'
+  for ((i = 0; i < 60; i++)); do echo "    a = a +% $i;"; done
+  echo '    return a;'
+  echo '}'
+} > modules/demo/src/model_test.zig
+git add modules
+"$HOOK" >/dev/null 2>&1; check "60 helper lines + pub in a _test.zig -> allow" 0 $?
+
 # 17: VACUITY GUARD. Every "-> allow" case above would also pass if the
 # changelog check were never reached at all -- a typo in the path, a
 # non-executable bit, a python3 that is not there. Remove the script and the
