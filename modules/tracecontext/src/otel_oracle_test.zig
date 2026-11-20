@@ -37,9 +37,9 @@ const divergences = [_]Divergence{
     .{ .id = "dup_diff", .why = "as dup_same" },
     .{ .id = "dup_bad_second", .why = "as dup_same" },
     .{ .id = "state_split", .why = "tracestate in two fields: otel reads only the first; W3C: 'they MUST be combined into a single header' (RFC 9110 §5.3), as we do -- a=1,b=2" },
-    // Member grammar: since 2026-10-11 both sides discard an invalid list
-    // whole. Left: what the pinned W3C text allows and otel's (Level 1
-    // tenant@system) grammar does not, and duplicates.
+    // Member grammar: both sides discard an invalid list whole. Left:
+    // what the pinned W3C text allows and otel's (Level 1 tenant@system)
+    // grammar does not, and duplicates.
     .{ .id = "state12", .why = "key starts with a digit: the W3C key is (lcalpha / DIGIT) 0*255(keychar); otel drops the list" },
     .{ .id = "state17", .why = "empty system id ('a@=1'): '@' is a plain keychar in the W3C key grammar; otel drops the list" },
     .{ .id = "state27", .why = "duplicated key: otel drops the whole list; the W3C suite (test_tracestate_duplicated_keys) requires it inherited with one of them -- we keep the left (most recent)" },
@@ -147,7 +147,7 @@ test "otel oracle: the middleware continues, restarts and carries state as OpenT
     };
     if (bad != 0) std.debug.print("{d} differ; {d} continued, {d} restarted as otel does, {d} refused\n", .{ bad, continued, restarted, refused });
     try testing.expectEqual(@as(usize, 0), bad);
-    // 2026-10-05: most evidence is agreement -- 140+ continued, 340+
+    //: most evidence is agreement -- 140+ continued, 340+
     // restarted as otel does.
     try testing.expect(continued >= 120 and restarted >= 300 and refused == 4);
 }

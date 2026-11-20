@@ -180,8 +180,7 @@ pub const TraceParent = struct {
 /// and "Vendors MUST set all unparsed / unknown trace-flags to 0 on outgoing
 /// requests" (W3C Trace Context §3.2.2.5 / processing model). An incoming
 /// `...-ff` is still accepted (the spec forbids rejecting it), it just goes
-/// out as `...-01`. Until 2026-10-05 every bit was copied through (found by
-/// the OpenTelemetry Go oracle, `otel_oracle_test.zig`).
+/// out as `...-01`.
 pub fn childOf(parent: TraceParent, span_id: [8]u8) TraceParent {
     return .{ .trace_id = parent.trace_id, .parent_id = span_id, .flags = parent.flags & flag_sampled };
 }
@@ -310,7 +309,7 @@ pub const TraceState = struct {
     /// `write`, but with `keep_first` the first member is left out only if
     /// it does not fit on its own — the middleware's own `state_entry`
     /// (just put in front) is never the one dropped for a long carried
-    /// member (review 2026-10-24).
+    /// member.
     pub fn writeKeeping(ts: *const TraceState, buf: []u8, keep_first: bool) []const u8 {
         var keep: [max_members]bool = @splat(true);
         var total: usize = 0;
@@ -491,9 +490,9 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     if (opt.echo) {
         // Plain local: `setHeader` copies the bytes (`ResponseWriter.header_buf`),
         // so this buffer only has to outlive the call, not the response. It was
-        // a `threadlocal` until 2026-08-12 for the latter reason.
+        // a `threadlocal` for the latter reason.
         // Best effort: a header table already filled by other middleware
-        // must not turn tracing into a failed request (review 2026-10-24).
+        // must not turn tracing into a failed request.
         var out_buf: [TraceParent.header_len]u8 = undefined;
         ctx.res.setHeader(opt.traceparent_header, hop.write(&out_buf)) catch {};
         if (current_state) |ts| ctx.res.setHeader(opt.tracestate_header, ts) catch {};
@@ -566,10 +565,6 @@ pub fn newTraceId() [16]u8 {
 /// two processes differ unless their prefixes do. Never the all-zero
 /// (invalid) id. Not a CSPRNG — a correlation id, not a secret.
 ///
-/// Until 2026-10-11 the input was the monotonic clock, a thread-address
-/// nonce and a per-thread counter, which could repeat across connection
-/// threads (TLS blocks sit at a fixed stride; every thread's counter started
-/// at 1; see requestid's same fix).
 fn fillId(dst: []u8) void {
     const prefix = processPrefix();
     var x = mix64(next_seq.fetchAdd(1, .monotonic) +% prefix);
@@ -819,7 +814,7 @@ test "tracestate is carried through unchanged" {
 test "traceparent: every field delimiter is checked; a fresh trace honours Options.sampled; DEL in tracestate is dropped" {
     // W3C Trace Context §3.2.2: `version "-" trace-id "-" parent-id "-"
     // trace-flags` -- a non-dash at byte 35 or 52 is no traceparent.
-    // Mutation 2026-10-04: dropping either delimiter check survived (the
+    // Mutation: dropping either delimiter check survived (the
     // vectors only break the first one).
     const tid = "4bf92f3577b34da6a3ce929d0e0e4736";
     const pid = "00f067aa0ba902b7";
@@ -841,7 +836,7 @@ test "traceparent: every field delimiter is checked; a fresh trace honours Optio
     }
 
     // `isValidValue`: printable ASCII only; DEL (0x7f) is a control
-    // character. Mutation 2026-10-04 (on the old whole-value guard):
+    // character. Mutation (on the old whole-value guard):
     // admitting 0x7f survived (only 0x01 was tested). Checked on the
     // grammar itself: `http.Server` already refuses a header value carrying
     // DEL, so over the wire it never gets this far -- the grammar is what
@@ -1040,7 +1035,7 @@ test "TraceState: normalizes, dedupes, put moves left, delete, 32-member cap" {
 }
 
 test "TraceState.write truncates whole members: over 128 characters first, then from the right" {
-    // Negative control 2026-10-11: dropping the long-members-first pass
+    // Negative control: dropping the long-members-first pass
     // (right-most first only) failed the first expectation (it keeps the
     // 150-character member and drops `c`, `b`).
     var ts: TraceState = .{};
@@ -1124,7 +1119,7 @@ test "state_entry: our member goes first, replaces our old one, starts a new tra
 }
 
 test "generated ids: no duplicate trace-id or span-id across many threads at once" {
-    // Negative control 2026-10-11: a threadlocal sequence instead of the
+    // Negative control: a threadlocal sequence instead of the
     // process-wide one failed this (every thread minted the same ids).
     const n_threads = 32;
     const per_thread = 200;
@@ -1311,7 +1306,7 @@ test "TraceContext echo: traceparent header survives the caller's dead frame" {
     // traceparent into `out_buf`, a plain local that dies once
     // `middlewareRun` returns -- well before `end()` runs (`writeHead` runs
     // inside `end()`, which both servers call only after the whole handler
-    // chain has returned). `out_buf` was `threadlocal` until 2026-08-12
+    // chain has returned). `out_buf` was `threadlocal` earlier
     // specifically so it would outlive the response regardless of copying;
     // now that it is a plain local (see the module doc's "Memory /
     // concurrency" section), this module leans entirely on `http`'s
@@ -1652,7 +1647,7 @@ const fuzzseed = @import("testkit").fuzz;
 /// so every seed took the "pure arbitrary bytes" branch, `smith.bytes(&raw)`
 /// ate the rest of the header, and the ranged length after it found nothing
 /// left and returned 0. **All five headers arrived at the parser as the empty
-/// string.** Measured 2026-09-07: 0 of 5 seeds carried an octet and 0 parsed.
+/// string.** Measured: 0 of 5 seeds carried an octet and 0 parsed.
 ///
 /// The seeds are now scripts. Octet 0 selects: `0x00` means "the rest of this
 /// seed IS the header, verbatim" — which is what lets a real W3C example be a
@@ -1725,7 +1720,7 @@ test "corpus: every traceparent seed reaches the parser, and what it accepts is 
     }
     // One seed is deliberately the empty header.
     try testing.expectEqual(traceparent_corpus.len - 1, nonempty);
-    // Measured 2026-09-07. The corpus this replaces handed the parser 0
+    // Measured. The corpus this replaces handed the parser 0
     // octets and got 0 headers parsed, from five real W3C header strings.
     try testing.expectEqual(@as(usize, 791), octets);
     try testing.expectEqual(@as(usize, 3), accepted);
@@ -1736,7 +1731,7 @@ test "corpus: every traceparent seed reaches the parser, and what it accepts is 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1746,7 +1741,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation run 2026-11-11: the tests its survivors asked for ──
+// ── whole-module mutation run: the tests its survivors asked for ──
 
 test "grammar sets are exact over every byte: key first / key rest / value, and lowercase hex digits" {
     // Every one of the 256 byte values is checked against an independent

@@ -36,7 +36,7 @@ const Class = enum {
     /// OpenTelemetry Java, JS and Python keep properties as an opaque string and
     /// accept it. §3.3.1.4 gives property keys and values "no specific meaning"
     /// and §3.3.1.3's decoding rule is stated for the list-member value only.
-    /// Owner decision 2026-11-17: accept it, as wire text (`decodeValue` decodes
+    /// Owner decision: accept it, as wire text (`decodeValue` decodes
     /// one on request).
     property_bad_escape,
     /// `a=1,a=2`: otel keeps the last of equal keys (a map). §3.3.1.1: "Uniqueness
@@ -267,7 +267,7 @@ test "otel baggage oracle: strict, lenient and write agree with OpenTelemetry Go
     };
     if (bad != 0) std.debug.print("{d} unexplained; agree {d}, hits {any}\n", .{ bad, agree, hits });
     try testing.expectEqual(@as(usize, 0), bad);
-    // 2026-11-17: the evidence is agreement (932 of 954); 22 cases fall in
+    //: the evidence is agreement (932 of 954); 22 cases fall in
     // the four classes below (property_bad_escape 7, duplicate_key 3,
     // property_value_decoded 11, limit_keeps_prefix 1).
     try testing.expectEqual(@as(usize, 954), vectors.cases.len);

@@ -16,7 +16,7 @@
 //!
 //!   (The suite's STRICT_LEVEL >= 2 tracestate grammar vectors -- illegal
 //!   key/value characters, the 256-char key cap, the 32-member cap -- were
-//!   excluded here until 2026-10-11, while this module only guarded the
+//!   excluded here until, while this module only guarded the
 //!   whole value's byte class. `TraceState.parse` enforces the member
 //!   grammar now, and they are asserted like the rest.)
 //!   - session/connection-repetition tests (`AdvancedTest`): these assert

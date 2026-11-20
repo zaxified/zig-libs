@@ -2,7 +2,7 @@
 
 //! Deterministic fuzz driver over tracecontext's existing `testing.fuzz`
 //! harness (`TraceParent.parse` on arbitrary or traceparent-shaped bytes,
-//! added 2026-10-09). The body lives here, generic over its source of choices
+//! added). The body lives here, generic over its source of choices
 //! (`fn(comptime S, *S, gpa)`); `root.zig`'s `testing.fuzz` test feeds it
 //! through the cursor adapter below, the driver feeds it a PRNG.
 //!
@@ -10,8 +10,7 @@
 //! uppercase digit, an arbitrary octet) with probability 1/4 and otherwise
 //! writes clean lowercase hex, so about a quarter of shaped inputs are valid
 //! headers and `accepted` is a label. (A per-octet fault needed ~50 clean
-//! digits in a row and never produced one under the driver: measured
-//! 2026-10-09, 0 accepted in 200k runs.)
+//! digits in a row and never produced one under the driver: measured, 0 accepted in 200k runs.)
 //!
 //! Driver: `TRACECONTEXT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver;
 //! `_MS`, `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
