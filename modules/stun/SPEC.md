@@ -6,7 +6,7 @@
 
 **Scope:** parity — pion/stun v3.1.6 (client side: codec, Binding client with RFC 8489 retransmission, integrity incl. SHA-256, fingerprint, STUN/TURN URIs, RFC 5780/ICE/TURN attribute types, hostile-input rejects) (surveyed 2026-11-02, gaps closed 2026-11-03)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (512/522, 10 eq) · src 534b24f999f190d1
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (512/522, 10 eq) · src 174de2f623f4ebc5
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STUN_FUZZ) · ct 2026-11-03 (ctgrind: MESSAGE-INTEGRITY key, MESSAGE-INTEGRITY-SHA256 key and long-term password tainted, `mi` + `mi256` + `ltkey`, 0 in-file; `longTermKeySha256`, `userhash`, `bindingResponse` are not ctgrind targets) · panic 2026-10-31 (sweep + blind review: attribute value/region u16 guards, deadline clamp, RFC 8489 §14.5 covered region via `findCovered`; delta audit 21/22 + 1 eq)
 

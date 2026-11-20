@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — Go 1.26 `regexp` refuses the 46 multi-word script names it documents (`\p{Old_Persian}`, `\p{SignWriting}`: an underscore or an inner capital); here they match their scripts (test `go oracle: crafted syntax cases and random patterns answer as Go regexp`, GO_DEFECT 46) (measured 2026-10-28) · feature — Rust's grammar, its bytes mode and `RegexSet` beside Go's whole API (Unicode `\b \w`, `\b{start}`, class set operations, `\p{scx=…}` and binary properties, non-UTF-8 haystacks, many patterns in one pass), none of which Go has; Rust has no POSIX leftmost-longest and no reader API (tests `rust oracle: the crate's answers to the Rust grammar`, `rust oracle: bytes mode (regex::bytes)`, `rust oracle: RegexSet`) (measured 2026-10-28) · feature — Unicode 18.0 classes and case folding where Go 1.26 has 15.0 and Rust `regex` 1.13.1 16.0: `\p{Lo}` matches U+323B0 (CJK Extension J) here, not in Go (test `go oracle: …`, UNICODE_VERSION 17) (measured 2026-10-28; count re-pinned 2026-11-13 on 18.0) · feature — compile-time compilation: `comptimeCompile` turns a bad pattern into a compile error and matches with no allocator, where Go's `MustCompile` panics at run time (test `fullMatch takes any way through, comptimeCompile matches compile`) (measured 2026-10-28)
 
-**Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src 43c51d2aca2cf42f
+**Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src cfe7ff1f2bcb581f
 
 **Hardening:** fuzz 2026-10-28 (240,000 runs clean (REGEX_FUZZ), ReleaseSafe) · ct n/a — regex engine (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point, 2 MED fixed in `b2b6086e`)
 

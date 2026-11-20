@@ -8,7 +8,7 @@
 
 **Ahead:** feature — RFC 6724 destination ordering (§6) and source selection (§5), which neither Go net/netip nor netipx exposes, checked against glibc `getaddrinfo`'s order and the Linux kernel's source choice on every ordered pair (tests `rfc6724 oracle: destination order as glibc gives it …`, `rfc6724 oracle: IPv6 source as the kernel chooses it`; `tools/rfc6724_oracle.py`) (measured 2026-10-25) · correctness — netipx v0.0.0-20260823151212 `RemoveFreePrefix` answers ok with an invalid prefix in 227 of the oracle's cases; ours never does (test `netip oracle: IPSetBuilder ops, Prefixes, Ranges, probes, RemoveFreePrefix, Overlaps, Equal`; `tools/go_netip_oracle`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-15 (796/838, 42 eq) · src 750a5f950146d2ef
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (796/838, 42 eq) · src 3b354a866b6aa0e6
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, NETADDR_FUZZ, round-trip oracle) · ct n/a — IP address types (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: no data-reachable panic; `IpSetBuilder` alternation O(n log n), `Zone.slice`/`AddrIterator.next` total, `IpSet.rangeAt` checked)
 

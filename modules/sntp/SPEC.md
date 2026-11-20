@@ -6,7 +6,7 @@
 
 **Scope:** parity — beevik/ntp v1.6.0 (Go SNTP client library) (surveyed 2026-11-02)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (243/245, 2 eq) · src 6d0ef98f9f55aa29
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (243/245, 2 eq) · src 7a7479e81f94e210
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SNTP_FUZZ) · ct n/a — time protocol (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `fromUnixNanos` saturation, `query` checks the nonce first and discards spoofed/short replies incl. forged KoD; delta audit 11/11)
 

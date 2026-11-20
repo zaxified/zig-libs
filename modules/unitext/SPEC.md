@@ -6,7 +6,7 @@
 
 **Scope:** core — CPython `str` + `unicodedata`, Rust std (`str::to_lowercase`, `to_uppercase`) + `unicode-normalization`, Go `golang.org/x/text` (`unicode/norm`, `cases`, `runes`), ICU (surveyed 2026-11-09 from their documentation, not by reading their source; CPython and Rust were then RUN over the module's inputs, see Anchoring). What a pandas / polars string column user needs is here; what a Go or ICU user also expects and is missing (language-tailored case, word-boundary titlecase, `unicodedata.name`/`numeric`, segmentation) is under Backlog with reasons.
 
-**Audit:** review 2026-11-09 · mutation 2026-11-20 (169/193, 24 eq) · src 6e7e0324b04728a7
+**Audit:** review 2026-11-09 · mutation 2026-11-20 (169/193, 24 eq) · src dbe811339f00fd41
 
 **Hardening:** fuzz 2026-11-09 (300,000 runs clean in ReleaseSafe after the UR-1 fix, `UNITEXT_FUZZ`, 15 s; the harness is described under Anchoring; no planted-mutant check yet, see Open) · ct n/a — no secret: the module transforms caller-supplied text · panic 2026-11-09 (independent sweep of every pub entry point, `src/unit_test.zig` "sweep: …": per-code-point functions clamp any `u21` (surrogates, above U+10FFFF) to the default record before indexing; every string form decodes through `utf8.step`, whose reads are guarded by `i + k >= s.len`; the 256-byte emitter block is checked before each append; `ListOut` checks `bytes.len > cap - len` with `len <= cap` by construction; the normalization working buffer is capped by `max_segment` and the output by `max_output`, zero caps give `error.TooLarge` or an empty result; sort and compose are linear or n log n, Final_Sigma look-ahead crosses each case-ignorable run at most once; no finding, no `unreachable`/`assert` on a caller value)
 

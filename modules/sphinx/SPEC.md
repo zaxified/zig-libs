@@ -6,7 +6,7 @@
 
 **Scope:** mvp — lightning-onion (lnd's `sphinx`) / LDK `onion_utils` (BOLT#4) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-17 (68/73, 5 eq) · src 2fd5438dcea75fcc
+**Audit:** review 2026-09-09 · mutation 2026-11-17 (68/73, 5 eq) · src 616dd99a59dd0d48
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `sphinx-packet` at `.scale` 2 = 100,000 runs, `sphinx-route` at `.scale` 4 = 50,000, `sphinx-forged` 200,000, SPHINX_FUZZ) · ct 2026-10-06 (ctgrind)
 

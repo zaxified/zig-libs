@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (163/165, 2 eq) · src 98ffa870f4938061
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (163/165, 2 eq) · src 0f0672f24ef0dcd9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 

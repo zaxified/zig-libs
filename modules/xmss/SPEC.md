@@ -6,7 +6,7 @@
 
 **Scope:** mvp — xmss-reference (RFC 8391 reference code), go-xmssmt (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-20 (190/202, 12 eq) · src e24d7cfc25f4561b
+**Audit:** review 2026-09-11 · mutation 2026-11-20 (190/202, 12 eq) · src 6a6c265f2624f3aa
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `xmss-sign-verify` at scale 200 = 1,000 runs, each a real signature, XMSS_FUZZ) · ct 2026-10-10 (ctgrind: SK_SEED/SK_PRF through keyGen + 5 signs at h=4; 2 in-file = WOTS chain lengths from H_msg over the PUBLISHED r, an artefact)
 **Performance:** not measured

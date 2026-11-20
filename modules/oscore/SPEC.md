@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 8613 MTI suite; libOSCORE, aiocoap (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-17 (274/292, 18 eq) · src 90716b8c5ad89f95
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (274/292, 18 eq) · src 02201765b462de69
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OSCORE_FUZZ; exchange at 1/2 of it) · ct 2026-09-08 (ctgrind)
 

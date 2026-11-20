@@ -6,7 +6,7 @@
 
 **Scope:** core — BoringSSL `spake2plus` and the Matter SDK's SPAKE2+ (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-21 (103/110, 7 eq) · src 96b0b675024c357f
+**Audit:** review 2026-09-09 · mutation 2026-11-21 (103/110, 7 eq) · src a89120f09bc25fb1
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SPAKE2PLUS_FUZZ; exchange at 1/20 of it) · ct 2026-09-09 (ctgrind)
 

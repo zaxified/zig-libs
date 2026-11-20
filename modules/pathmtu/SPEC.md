@@ -6,7 +6,7 @@
 
 **Scope:** parity — iputils tracepath 20250605: destination PMTU (cache read and DF search), per-hop MTU (`probeHops`), black-hole detection, v4 and v6, unprivileged and RAW sockets (surveyed 2026-11-02, gaps closed 2026-11-03)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (349/396, 47 eq) · src 525ff811ef9a877a
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (349/396, 47 eq) · src b0fcb32e1ad20674
 
 **Hardening:** fuzz 2026-11-03 (PATHMTU_FUZZ=200000, ReleaseSafe: classify, classify-mutated, hops, errq, all clean, every reach label hit) · ct n/a — PMTU probing (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: error-queue drain stops the POLLERR busy-spin, `retries = 255` no longer wraps; delta audit 9/9)
 

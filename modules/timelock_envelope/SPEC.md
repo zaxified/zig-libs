@@ -6,7 +6,7 @@
 
 **Scope:** core — drand `tle` / age (time-lock and hybrid-PQ file encryption); no equivalent AND-of-locks envelope exists (surveyed 2026-09-30; mvp -> core 2026-10-06 after the streaming format landed)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-20 (113/130, 17 eq) · src f9566cc82b035ad6
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (113/130, 17 eq) · src 6e6503cf9b4012b5
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 10 = 20,000 runs per harness — a run is a pairing plus an HQC decapsulation, TLE_FUZZ) · ct 2026-10-10 (ctgrind: lock secrets through the KDFs 0; seal/open with randomness, plaintext and HQC dk tainted 8 in-file, all in tlock/HQC/AEAD reached through the envelope, none in this module)
 **Performance:** not measured

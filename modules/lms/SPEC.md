@@ -6,7 +6,7 @@
 
 **Scope:** core — cisco/hash-sigs (RFC 8554 reference), pyhsslms, hbs-lms-rust, Bouncy Castle (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-11-20 (214/221, 7 eq) · src 74a8c38afaad5ca9
+**Audit:** review 2026-10-03 · mutation 2026-11-20 (214/221, 7 eq) · src 32409fa9c08b9790
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `lms-sign-verify` at scale 100 = 2,000 runs and `hss-sign-verify` at scale 200 = 1,000 runs, each a real signature, LMS_FUZZ) · ct 2026-10-10 (ctgrind: seed through LMS H5/W4 and 2-level HSS keygen + sign; `lms` 4 / `hss` 6 in-file = chain lengths from the message digest over the PUBLISHED randomizer C, an artefact)
 **Performance:** not measured

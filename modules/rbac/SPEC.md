@@ -6,7 +6,7 @@
 
 **Scope:** core — Casbin v3.11.0 (RBAC + ABAC) (surveyed 2026-09-30); raised from mvp 2026-09-30 with revoke/remove
 
-**Audit:** review 2026-08-06 · mutation 2026-11-21 (84/86, 2 eq) · src 4b0ac7c1bc841583
+**Audit:** review 2026-08-06 · mutation 2026-11-21 (84/86, 2 eq) · src f1801933fd8c0942
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — role permissions, no keys (keyword review, 2026-10-07)
 

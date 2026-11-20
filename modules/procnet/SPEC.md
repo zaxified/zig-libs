@@ -6,7 +6,7 @@
 
 **Scope:** parity — prometheus/procfs v0.21.1 (surveyed 2026-10-17)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-19 (192/214, 22 eq) · src 0edda69de76bebde
+**Audit:** review 2026-11-13 · mutation 2026-11-19 (192/214, 22 eq) · src 88a293d61550b1a9
 
 **Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: no crash found; `max_total_fds` bounds the socket-owner walk, `find`/`findAll` O(log n); delta audit 13/15 + 1 eq)
 

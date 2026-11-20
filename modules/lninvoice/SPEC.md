@@ -6,7 +6,7 @@
 
 **Scope:** core — LDK `lightning-invoice` + `offers` (BOLT#11 and BOLT#12) / lnd `zpay32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (336/352, 16 eq) · src 61f6155ab3ec7ed7
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (336/352, 16 eq) · src 256f2146d6897dd8
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`lninvoice-bolt11-sign` at its scale, 10,000), LNINVOICE_FUZZ) · ct n/a — the node key is only forwarded by pointer to `k256` (BOLT#11 ECDSA) and `bip340` (BOLT#12 Schnorr), which carry their own ctgrind rows; invoice fields, signatures and node ids are public (review, 2026-10-10)
 **Performance:** not measured

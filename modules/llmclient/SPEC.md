@@ -6,7 +6,7 @@
 
 **Scope:** core — official Anthropic SDKs (Python v1.9.0 / Go v1.76.0) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after image/document blocks, the `system` block array, `anthropic-beta` and `count_tokens` landed)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (355/364, 9 eq) · src eccaf87cc1bbd807
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (355/364, 9 eq) · src c691ef3fbeaf79ac
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, LLMCLIENT_FUZZ) · ct n/a — the API key is an opaque header value copied verbatim into `x-api-key`; no key derivation, MAC or compare in the module (review, 2026-10-10)
 

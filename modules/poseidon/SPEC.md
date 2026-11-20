@@ -6,7 +6,7 @@
 
 **Scope:** parity — iden3 circomlib / circomlibjs Poseidon (BN254, x^5, circom parameters) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-14 (113/128, 15 eq) · src 7359e3bebe344fd7
+**Audit:** review 2026-08-06 · mutation 2026-11-14 (113/128, 15 eq) · src 3098fac768d7d959
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, POSEIDON_FUZZ) · ct n/a — public-input hash (keyword review, 2026-10-07) · panic 2026-11-14 (sweep of every pub entry point: typed `Fr` and comptime widths leave no data path; LOW `mds_security.Checks` took a runtime `t` that indexed past fixed buffers above `n_max` and underflowed at 0, now a checked panic at all 9 entry points; LOW `grain.derive` looped forever on a zero modulus and dropped bits above 256, now `@compileError`)
 

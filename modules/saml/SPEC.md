@@ -6,7 +6,7 @@
 
 **Scope:** core — python3-saml v1.16.0 (OneLogin toolkit family) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after SP metadata generation, multi-key IdP rollover and the AuthnRequest ForceAuthn/IsPassive/RequestedAuthnContext/AttributeConsumingServiceIndex/ProtocolBinding options)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-18 (407/438, 31 eq) · src cf2859b0cac10db4
+**Audit:** review 2026-09-15 · mutation 2026-11-18 (407/438, 31 eq) · src 6fbd176baad34c42
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SAML_FUZZ) · ct 2026-11-13 (ctgrind: SP RSA key signing, sign 45 in-file = 1 rsa verdict + 44 base64 of the public signature; the decryption path is xmlenc's row, see the harness header) · panic 2026-11-13 (sweep of every pub entry point: saturating clock/skew arithmetic; the xmldsig canonical-output cap reaches it through `verify`; every Document-returning or Document-borrowing path checked for lifetime)
 

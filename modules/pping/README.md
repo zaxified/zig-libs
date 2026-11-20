@@ -6,7 +6,7 @@
 
 **Scope:** core — pollere/pping TCP-timestamp technique, one flow per estimator (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after ICMP/ICMPv6 echo RTT matching landed)
 
-**Audit:** review 2026-07-19 · mutation 2026-11-20 (125/128, 3 eq) · src 3417b81c760956fb
+**Audit:** review 2026-07-19 · mutation 2026-11-20 (125/128, 3 eq) · src 68f6daef329bc26e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PPING_FUZZ) · ct n/a — passive ping (keyword review, 2026-10-07)
 

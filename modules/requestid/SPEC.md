@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — go-chi/chi v5.3.2 `middleware.RequestID`, the reference, adopts an incoming `X-Request-Id` of any shape and hands it unchanged to `GetReqID` and so to every log line that prints it: an 8 192-byte value, `x","level":"admin` (structured-log metacharacters), `a=1 b=2` and obs-text bytes 0x80–0xFF were all adopted verbatim (`tools/lead_probe`; `middleware/request_id.go` checks only for the empty string); this module adopts only 1–200 bytes of `[A-Za-z0-9._-]` and generates a fresh ID for each of those (tests "isAdoptable: only the token-safe charset is adopted (F1 regression)", "adopt length boundary: exactly max_adopt_len is adopted, one over is regenerated", "model-fuzz: isAdoptable matches the documented charset/length rule on random bytes") (measured 2026-10-24)
 
-**Audit:** review 2026-11-11 · mutation 2026-11-11 (74/83, 9 eq) · src 2a64e5e82668b43f
+**Audit:** review 2026-11-11 · mutation 2026-11-11 (74/83, 9 eq) · src 0aeb4f15ef218fbc
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — request id generation (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: the echo is best effort when an outer middleware filled the header table or byte budget; monotonic seed clock wraps)
 

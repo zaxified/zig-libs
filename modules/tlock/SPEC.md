@@ -6,7 +6,7 @@
 
 **Scope:** core — drand/tlock v1.2.0 (`tle`, Go) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the age layer landed and a whole Go-`tle` file decrypts byte-exactly)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-17 (44/48, 4 eq) · src c0947035e088ba5d
+**Audit:** review 2026-09-09 · mutation 2026-11-17 (44/48, 4 eq) · src bccbc092cca69e42
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `tlock-age-file` at scale 100 = 2,000 runs, one pairing-heavy encrypt plus up to four decrypts each, TLOCK_FUZZ) · ct 2026-10-02 (ctgrind)
 

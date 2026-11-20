@@ -6,7 +6,7 @@
 
 **Scope:** mvp — zxing-cpp 3.1.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation 2026-11-21 (60/67, 6 eq) · src 2b9d01270a7d83ea
+**Audit:** review 2026-09-04 · mutation 2026-11-21 (60/67, 6 eq) · src 2723322466baf122
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QRSCAN_FUZZ) · ct n/a — QR decoding (keyword review, 2026-10-07)
 

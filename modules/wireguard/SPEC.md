@@ -6,7 +6,7 @@
 
 **Scope:** parity — configuration plane: wg(8) + wgctrl-go (netlink, the userspace protocol, the configuration file, listing); data plane: boringtun `noise::Tunn` / wireguard-go's per-peer state machine, sans-IO. The TUN + UDP daemon is deliberately not here (surveyed 2026-11-02)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-18 (656/764, 108 eq) · src d9848121b690f861
+**Audit:** review 2026-09-02 · mutation 2026-11-18 (656/764, 108 eq) · src 02631027228efeef
 
 **Hardening:** fuzz 2026-11-03 (`WIREGUARD_FUZZ=200000 scripts/modtest wireguard -Doptimize=ReleaseSafe`, clean over all seven harnesses incl. the new `wireguard-conf`, `wireguard-uapi` (200,000 each), `wireguard-tunnel` (÷32, mac1 computed, so `peekInitiation`, `acceptInitiation` and `consumeResponse` are reached: REACH peek_bad_static, accept_bad_timestamp, accept_ok, response_forged, data_forged) and `wireguard-tunnel-sim` (÷64)) · ct 2026-11-03 (`ctgrind.sh --check wireguard`: key base64 and hex codecs, the whole handshake, seal/open, cookies, `Tunnel`; 1/1/4/1/0/9 in-file, every one a verdict or the inner IP header, none on a key byte) · panic 2026-11-03 (the GR sweep of 2026-10-30, extended over `Tunnel`, `conf`, `uapi`, `peekInitiation`, `listDevices`; GR: sweep + 2 blind reviews: second deriveTransportKeys from the wiped chaining key (HIGH, public keys) and role mismatch → checked panics, replayed initiation on a used handshake → AlreadyStarted, CookieChecker.wipe zero-key cookies, response receiver index checked before DH, cookie reply replay, kernel reply loops bounded (TooManyMessages, interrupted dumps restarted), linear peer merge; delta audit 45/45 + 34/34)
 

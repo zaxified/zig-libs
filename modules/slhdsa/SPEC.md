@@ -6,7 +6,7 @@
 
 **Scope:** parity — FIPS 205 as shipped in liboqs 0.16.0 (slhdsa-c) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-07-18 · mutation 2026-11-20 (223/227, 4 eq) · src a3d4174bd99e2adf
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (223/227, 4 eq) · src 02e23825c4b3f8dc
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind; `prf` 9 in-file since Zig 0.17.0, 2026-10-18, was 8: `xmssPkFromSig`'s auth-path direction test on `idx_leaf` at one more unrolled address -- the index is fixed by R, which the signature publishes) · panic 2026-10-30 (sweep + blind review: nothing to fix (every verify total); pin tests only)
 

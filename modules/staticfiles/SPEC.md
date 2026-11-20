@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — Go 1.26.8 `net/http` `ServeContent`, the reference, answers `Range: bytes=-0` (a zero suffix length, unsatisfiable per RFC 9110 §14.1.1) with a 206 carrying the invalid `Content-Range: bytes 100-99/100`; this module answers 416 (`src/go_oracle_vectors.zig` range shape `bytes=-0`, re-taken by `tools/interop.zig --check`) (measured 2026-10-24) · correctness — Go's `http.FileServer(http.Dir(root))` serves a file OUTSIDE the root through a symlink inside it, directly or through a symlinked directory; this module refuses it (403) by default and verifies containment when following (oracle cases p59, p60) (measured 2026-10-24) · feature — `Snapshot`/`Live` serve with zero syscalls per request from held descriptors and a strong SHA-256 content `ETag` (resumable `If-Range`), republished lock-free with bounded retirement; Go and nginx open, stat and read per request and tag by size+mtime (measured 2026-10-24) · speed — faster than every measured implementation: 0.11–0.55× Go `net/http` `FileServer`, the fastest measured (tower-http 0.7.1 `ServeDir` is slower than Go on every row) (`tools/bench.zig`, `tools/rust_fast_bench`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-19 (64/78, 14 eq) · src 7fc043c63946e2a3
+**Audit:** review 2026-11-12 · mutation 2026-11-19 (64/78, 14 eq) · src cddddfb0fbfed0e6
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STATICFILES_FUZZ) · ct n/a — static file serving (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: unbounded fingerprint hashing, uncounted directories and unbounded listings capped, Live assert/wrap/intCast made checked)
 

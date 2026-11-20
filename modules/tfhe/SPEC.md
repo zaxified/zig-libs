@@ -6,7 +6,7 @@
 
 **Scope:** core — tfhe-rs 1.8.1 `boolean` API and TFHE-lib (surveyed 2026-10-05)
 
-**Audit:** review 2026-10-02 · mutation 2026-11-17 (424/441, 17 eq) · src 41d006464d64dadb
+**Audit:** review 2026-10-02 · mutation 2026-11-17 (424/441, 17 eq) · src 970166939b532e52
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget clean, TFHE_FUZZ) · ct 2026-10-02 (ctgrind)
 

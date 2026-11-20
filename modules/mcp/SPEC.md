@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — the Go SDK v1.8.0 (the speed reference) answers `prompts/get` for a prompt whose argument is declared required, with that argument left out, by calling the handler anyway and returning what it renders (`"Hello, !"`); prompts.mdx "Error Handling" says servers SHOULD answer missing required arguments with -32602, which this module does without calling the handler (test "lead: prompts/get without a required argument is -32602", probe `tools/go_lead`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 45c06e750dce9601
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 6bb9553a3e0f5eb0
 
 **Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, MCP_FUZZ; 5 harnesses incl. schema_check and uri_template, ReleaseSafe) · ct 2026-11-21 (ctgrind, the `StateSeal` HMAC-SHA-256 key tainted: seal 16 in-file = the public MAC through std base64url, open 4 = the `timing_safe.eql` accept/reject verdict that `open` returns by contract, unattributed 0, positive control flags; itemised in `scripts/checks/ctgrind-expected.tsv`); the secret-field check is on schema names (code review, 2026-10-09) · panic 2026-10-28 (independent sweep of every pub entry point: JSON nesting capped at `max_json_depth` before every parse, discarded schema branches build no strings, `page_size` / `StateSeal` / id / priority overflow and non-finite cases closed)
 

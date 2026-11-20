@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — the reference's tcp prober resolves a name, keeps ONE address of the preferred family (ip6 by default) and dials only it: blackbox_exporter 0.26.0 reports `localhost:P` down (`probe_success 0` after its 2 s timeout, log `Resolved target address ip=::1` … `dial tcp6 [::1]:P: i/o timeout`) while the service answers on 127.0.0.1:P, the IPv6 path being a black hole (control `127.0.0.1:P`: `probe_success 1`; `tools/blackbox_probe/run.sh`, Ubuntu's 0.26.0-2 package); `PosixConnector` races the resolved addresses RFC 8305 style and reports up, with the winning connect as the RTT (tests "race: a black-holed first address does not starve a listening second one (RFC 8305)", "race: the reported RTT is the winning connect, not the wait behind a black hole") (measured 2026-10-23)
 
-**Audit:** review 2026-11-11 · mutation 2026-11-11 (188/208, 20 eq) · src 55b3b05b0b794bc3
+**Audit:** review 2026-11-11 · mutation 2026-11-11 (188/208, 20 eq) · src 7936ab49100ac6ac
 
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: poll-timeout round-up saturates; `monoNs` total on a failed `clock_gettime`; `probeMany` attempts capped by `max_attempts`)

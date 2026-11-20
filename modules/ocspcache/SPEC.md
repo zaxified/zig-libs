@@ -6,7 +6,7 @@
 
 **Scope:** core — CertMagic OCSP stapling and nginx `ssl_stapling` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (105/106, 1 eq) · src b011f558d30b3516
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (105/106, 1 eq) · src e999a43b4e019ad1
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OCSPCACHE_FUZZ) · ct n/a — public response cache (keyword review, 2026-10-07)
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — miden-crypto 0.28.1 `Rpo256` and the RPO reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-20 (141/142, 1 eq) · src 8309ba104adb20e3
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (141/142, 1 eq) · src 945553a34e817335
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RESCUE_FUZZ) · ct n/a — public-input hash (keyword review, 2026-10-07)
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — pires/go-proxyproto v0.16.0 (surveyed 2026-11-15)
 
-**Audit:** review 2026-11-16 · mutation 2026-11-16 (234/238, 4 eq) · src e1291f8c93334597
+**Audit:** review 2026-11-16 · mutation 2026-11-16 (234/238, 4 eq) · src 8ca4f7a9c6590a04
 
 **Hardening:** fuzz 2026-11-15 (40,000,000 runs, clean, PROXYPROTO_FUZZ, all 17 reach labels hit) · ct n/a — the header is public data, no secret · panic 2026-11-15 (no-panic sweep, `tests.zig`: 20,000 hostile inputs through every pub entry point, safety checks on; plus the fuzz harness)
 

@@ -10,7 +10,7 @@ Purpose, API and use: [README.md](README.md).
 
 **Ahead:** feature — a stable sort without an allocator: `stableBuffer` sorts on caller scratch and `stable` returns `error.OutOfMemory`; Rust's `slice::sort` lives in `alloc`, aborts the process when the allocation fails and does not exist at all under `no_std` without an allocator (tests "stable matches std.sort.block exactly" `.min_buffer`, "stable reports OutOfMemory") (measured 2026-10-25)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (125/199, 74 eq) · src 8bb0e5761bae1708
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (125/199, 74 eq) · src 859e421b72c1c0d5
 
 **Hardening:** fuzz 2026-10-25 (8×200 000 seeds, reach 100 %) · ct n/a — sorts caller data by a caller comparator; no secret is held, and the comparison sequence depends on the data by design · panic 2026-10-30 (sweep + blind review: stableBuffer empty-items overlap false positive fixed; delta audit 1/1)
 

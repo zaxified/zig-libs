@@ -6,7 +6,7 @@
 
 **Scope:** core — ncclient 0.7.1 (client) and libnetconf2 4.4 (C, client+server) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-20 (92/95, 3 eq) · src a54cfbcaafbae60a
+**Audit:** review 2026-09-10 · mutation 2026-11-20 (92/95, 3 eq) · src 7b2f8b855d791579
 
 **Hardening:** fuzz 2026-10-10 (`netconf-wire` 200,000-run budget clean; `netconf-client` at `.scale` 2 = 100,000 runs — a whole session whose peer bytes are tampered at one read; NETCONF_FUZZ; the hello and framer harnesses are unchanged) · ct n/a — the SSH password is handed straight to `ssh.userauth`; framing/RPC carry no key, MAC or compare (review, 2026-10-10)
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSH 10.x (client/server), Go `x/crypto/ssh` as library yardstick (surveyed 2026-09-30; re-assessed 2026-10-06)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (876/1005, 129 eq) · src e618fadd8301aaa6
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (876/1005, 129 eq) · src b729ffd3030c1ebe
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 

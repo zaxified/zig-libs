@@ -6,7 +6,7 @@
 
 **Scope:** parity — jedisct1/minisign 0.12 (file format and crypto; the CLI is out of scope by design) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-20 (122/135, 13 eq) · src 2618645a5a912fed
+**Audit:** review 2026-09-10 · mutation 2026-11-20 (122/135, 13 eq) · src b496920531014da7
 
 **Hardening:** fuzz 2026-10-07 (500,000 runs clean per harness, MINISIGN_FUZZ) · ct 2026-10-20 (ctgrind: Ed25519 seed (sign), seed + password (seal), password (open) tainted; sign 2 in-file = std `rejectIdentity` on R, seal 2 = std scrypt ROMix index (RFC 7914 by design), open 6 = scrypt 2 + the `timing_safe.eql` WrongPassword verdict + 3 on the public key derived from the seed (std `rejectIdentity`, `PublicKey.fromBytes`, the NonCanonical verdict; since § GP 2026-10-30); no minisign branch on a secret; itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-30 (sweep + blind review: scrypt cost from the key file capped (SecretKeyLimits, libsodium *_SENSITIVE), seal refuses what open would, mem_limit < 1024 → WeakParameters, public half checked in every mode; delta audit 13/14 + 1 eq)
 

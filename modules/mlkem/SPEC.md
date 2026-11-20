@@ -8,7 +8,7 @@
 
 **Ahead:** speed — 0.48–0.76× aws-lc-rs 1.18.0 (AWS-LC / mlkem-native AVX2 assembly) on keygen, encaps and decaps for all three parameter sets, in portable Zig (measured 2026-11-01)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (517/556, 39 eq) · src 2d3ce9f6468e1217
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (517/556, 39 eq) · src 9d0873c9a4c1e270
 
 
 **Hardening:** fuzz 2026-11-01 (960,000 runs clean, MLKEM_FUZZ, 8 jobs × 40,000 × 3 sets, every reach label hit; std as the differential oracle) · ct 2026-11-01 (ctgrind keygen/encaps/decaps × 3 sets: d‖z, m, dk and the ciphertext tainted, 0 in-file; ρ declassified as public) · panic 2026-11-01 (blind review of every pub entry point: no arithmetic or index panic reachable; the entropy abort of std's infallible `generate`/`encaps` shape has `tryGenerate`/`tryEncaps` twins; keccak4's length asserts moved to comptime)

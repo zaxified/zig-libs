@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libsignal v0.103.1 and the Signal specifications (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (81/86, 5 eq) · src cf5c7f2be177c80b
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (81/86, 5 eq) · src ae072e351aa27433
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `signal-ratchet` / `signal-x3dh` at `.scale` 2 = 100,000 runs, `signal-xeddsa` 200,000, `signal-state` (ratchet state codec) 10,000 runs at `.scale` 2 on 2026-11-17, SIGNAL_FUZZ) · ct 2026-09-09 (ctgrind)
 

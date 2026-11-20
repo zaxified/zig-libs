@@ -6,7 +6,7 @@
 
 **Scope:** core — libqrencode 4.1.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-17 (458/490, 32 eq) · src 05e1c43e117fe5a6
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (458/490, 32 eq) · src 8429b9ca030e2128
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QR_FUZZ) · ct n/a — QR encoding (keyword review, 2026-10-07)
 
