@@ -81,7 +81,7 @@ test "BIP-32 official Test Vector 5 — every invalid extended key is rejected" 
 
 test "BIP-32 Test Vector 1 master on TESTNET — tprv/tpub byte-exact, and each network refuses the other's key" {
     // BIP-32 publishes vectors for mainnet only. These two strings were made
-    // OUTSIDE this module (2026-09-13): Test Vector 1's official master
+    // OUTSIDE this module: Test Vector 1's official master
     // xprv/xpub, Base58Check-decoded by an independent Python implementation
     // (checksum verified, mainnet strings re-encoded identically), version
     // bytes replaced with BIP-32's testnet 0x04358394 / 0x043587CF, re-encoded.

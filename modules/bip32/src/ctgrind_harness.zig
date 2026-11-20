@@ -21,11 +21,11 @@
 //!   split, wordlist lookup, checksum). SPEC.md still names the word SPLIT
 //!   (locating spaces in the raw text) as not constant-time; `wordIndex`
 //!   itself was rewritten from a binary search to a branchless linear scan
-//!   (finding M6-CT, 2026-09-16) — the row records how much either side
+//!   (finding M6-CT) — the row records how much either side
 //!   changes, so a regression in either direction is visible.
 //! * `xprv`     — the master PRIVATE SCALAR through `serializePriv` and back
 //!   through `parseExtended` (the Base58Check text of an `xprv` is the secret
-//!   in another radix, so the string is tainted end to end). Added 2026-10-18
+//!   in another radix, so the string is tainted end to end). Added
 //!   with the constant-time Base58 (`bech32.base58.checkEncodeSecret` /
 //!   `checkDecodeSecret`); the header fields (version, depth, fingerprint,
 //!   child number, chain code) are public and not tainted at the source.

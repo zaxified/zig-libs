@@ -101,7 +101,7 @@ noinline fn mnemonicToEntropyBody(mnemonic: []const u8, out: []u8) Error![]const
     // canonical spelling — while `mnemonicToSeed` below hashes the raw bytes
     // of whatever text it is given, unmodified. Two different ideas of "the
     // phrase" from the same input silently produced two different wallets
-    // (audit finding `bip32` H1, 2026-09-06). An empty segment is not a
+    // (audit finding `bip32` H1). An empty segment is not a
     // wordlist entry, so `wordIndex("")` already refuses it below — this is
     // the same non-canonical-spelling defense `parsePath` already applies
     // (wave-2 finding F5): a derivation path and a mnemonic are both an
@@ -218,7 +218,7 @@ noinline fn mnemonicToSeedBody(mnemonic: []const u8, passphrase: []const u8, out
 
 // ── internal helpers ─────────────────────────────────────────────────────
 
-/// Review 2026-10-08 (HIGH). Measured with `stackprobe_test.zig`
+/// Review (HIGH). Measured with `stackprobe_test.zig`
 /// (ReleaseFast): `entropyToMnemonic`, `mnemonicToEntropy` and
 /// `validateMnemonic` each left the entropy — the wallet itself — in a dead
 /// frame, and `mnemonicToSeed` the SHA-512 of the mnemonic, which is the
@@ -227,11 +227,11 @@ noinline fn mnemonicToSeedBody(mnemonic: []const u8, passphrase: []const u8, out
 /// then `stack_burn` bytes at that depth are zeroed.
 noinline fn burnStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -240,8 +240,8 @@ noinline fn burnStack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-/// The deepest body (`mnemonicToSeed`) dirtied 3.5 KiB in ReleaseFast
-/// (2026-10-08); `stackprobe_test.zig` goes red when it outgrows this.
+/// The deepest body (`mnemonicToSeed`) dirtied 3.5 KiB in ReleaseFast;
+/// `stackprobe_test.zig` goes red when it outgrows this.
 const stack_burn = 8 * 1024;
 
 /// Read an 11-bit big-endian group starting at absolute bit `bit_pos` from
@@ -490,7 +490,7 @@ test "mnemonicToSeed rejects an over-long passphrase" {
     try testing.expectError(error.PassphraseTooLong, mnemonicToSeed("abandon", &too_long, &got));
 }
 
-// ── whole-module mutation tests (2026-11-17) ─────────────────────────────
+// ── whole-module mutation tests ─────────────────────────────
 
 test "mutation: entropyToMnemonic fits exactly or reports BufferTooSmall at every size" {
     inline for (.{ 16, 20, 32 }) |n| {

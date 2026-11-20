@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for the key-handling entry points (review
-//! 2026-10-08), kept in the module per `CONVENTIONS.md` §9. Method
-//! (2026-10-08): the direct-region engine of `p256`'s `stackprobe_test.zig`
+//! Dead-stack residue probe for the key-handling entry points,
+//! kept in the module per `CONVENTIONS.md` §9. Method:
+//! the direct-region engine of `p256`'s `stackprobe_test.zig`
 //! (painted region below the probe, call under a `PAD`-deep shim, snapshot
 //! scanned for 32-byte needles) — the earlier "scan a local buffer"
 //! form was blind to the top few hundred bytes of the measured call.
@@ -68,7 +68,7 @@ fn wordImage(be: [32]u8) [32]u8 {
     return out;
 }
 
-// ── the measured region (2026-10-08) ────────────────────────────────────────
+// ── the measured region ────────────────────────────────────────
 //
 // Direct-region engine, as `p256`'s probe: the region lies `PAD` bytes below
 // the probe's own stack position and the measured call runs as `shim(call)`
@@ -294,7 +294,7 @@ noinline fn callMnemonicToSeed() void {
 /// compiler keeps that copy out of the dead stack; in the mutation-schemata
 /// build (same logic, different code shape) it does not. A burn on `neuter`
 /// does not remove it (a by-value return is copied into the wrapper's frame;
-/// tried 2026-11-18); `neuterInto` (out-pointer, since 2026-11-18) is the variant without it and is held to every needle. Every other
+/// tried); `neuterInto` (out-pointer,) is the variant without it and is held to every needle. Every other
 /// needle, the private key in all its images, still applies to `neuter`.
 const probes = [_]struct { name: []const u8, call: *const fn () void, skip: []const u8 = "" }{
     .{ .name = "masterFromSeed", .call = callMasterFromSeed },

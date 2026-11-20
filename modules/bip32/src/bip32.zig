@@ -278,7 +278,7 @@ pub const CkdError = error{
 
 /// Derive the compressed SEC1 pubkey `k·G` for a private scalar `k`.
 /// By pointer: in ReleaseSmall (`pubkeyFromPriv` not inlined) a by-value key
-/// was a copy in the caller's frame, above every burn (`neuter`, 2026-10-19).
+/// was a copy in the caller's frame, above every burn (`neuter`).
 fn pubkeyFromPriv(priv: *const [32]u8) std.crypto.errors.IdentityElementError![33]u8 {
     const point = try Secp256k1.combMulBase(priv.*, .big);
     return point.toCompressedSec1();
@@ -424,7 +424,7 @@ fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdE
 /// which is not the private key but is the ingredient that turns one leaked
 /// non-hardened child key into the parent key, see `ExtendedPubKey.deinit`)
 /// is copied through the return path: in a ReleaseSmall build a copy stays on
-/// the dead stack below the call (stack probe, 2026-10-19). A caller that
+/// the dead stack below the call (stack probe). A caller that
 /// wants no such residue uses `neuterInto`, which writes the caller's own
 /// storage and keeps no copy.
 pub fn neuter(priv: *const ExtendedPrivKey) std.crypto.errors.IdentityElementError!ExtendedPubKey {
@@ -477,7 +477,7 @@ noinline fn serializePrivBody(k: *const ExtendedPrivKey, version: u32, out: []u8
     writeHeader(&payload, version, k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     payload[45] = 0x00;
     @memcpy(payload[46..78], &k.privkey);
-    // Constant-time Base58Check (2026-10-18): the string is the key in
+    // Constant-time Base58Check: the string is the key in
     // another radix. `out` needs `maxEncodedLenFor(82)` = 112 bytes.
     return bech32.base58.checkEncodeSecret(&payload, out);
 }
@@ -576,7 +576,7 @@ const order_be: [32]u8 = blk: {
     break :blk o;
 };
 
-/// `1 <= k < n` in constant time (2026-10-18; was std's
+/// `1 <= k < n` in constant time (was std's
 /// `rejectNonCanonical` + `std.mem.allEqual`, which exits at the first
 /// non-zero byte): the borrow out of `k - n` over all 32 bytes, ANDed with
 /// "some byte is non-zero". Only the verdict is public.
@@ -605,7 +605,7 @@ noinline fn parseExtendedBody(s: []const u8, rule: VersionRule, out: *ParsedKey)
     // scalar of a malformed xprv (bad length, unknown version, xpub version
     // byte over private payload) sitting in the frame.
     defer std.crypto.secureZero(u8, &buf);
-    // Constant-time Base58Check (2026-10-18), for xpub too: which one the
+    // Constant-time Base58Check, for xpub too: which one the
     // string is is not known before it is decoded, and the cost is a few µs.
     const payload = try bech32.base58.checkDecodeSecret(s, &buf);
     if (payload.len != serialized_payload_len) return error.InvalidLength;
@@ -753,7 +753,7 @@ noinline fn derivePathBody(master: *const ExtendedPrivKey, path: []const u32, ou
 
 // ── dead-stack burn ──────────────────────────────────────────────────────
 
-/// Review 2026-10-08 (HIGH). Zeroing named buffers (Z1) did not keep keys off
+/// Review (HIGH). Zeroing named buffers (Z1) did not keep keys off
 /// the stack: measured with `stackprobe_test.zig` (ReleaseFast), every entry
 /// point that touches a private key left it in dead callee frames the source
 /// has no name for — `masterFromSeed` the seed and the master key (big- and
@@ -767,11 +767,11 @@ noinline fn derivePathBody(master: *const ExtendedPrivKey, path: []const u32, ou
 /// load-bearing.
 noinline fn burnStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -781,7 +781,7 @@ noinline fn burnStack() void {
 }
 
 /// The deepest body (`ckdPriv`, with `k256`'s own 8 KiB burn under it)
-/// dirtied 8.9 KiB in ReleaseFast (2026-10-08); `stackprobe_test.zig` goes
+/// dirtied 8.9 KiB in ReleaseFast; `stackprobe_test.zig` goes
 /// red when a call tree outgrows this.
 const stack_burn = 16 * 1024;
 
@@ -1258,7 +1258,7 @@ fn fuzzParseExtended(_: void, smith: *std.testing.Smith) !void {
     // so `len` was 0 for every input and `parseExtended` was handed "", which
     // fails the Base58 length check before touching the checksum, the version
     // bytes or the key material, with the xprv sitting unread in `buf`.
-    // Measured 2026-09-07 over the corpus above: **0 of 8 seeds non-empty and
+    // Measured over the corpus above: **0 of 8 seeds non-empty and
     // 0 keys parsed before, 7 of 8 non-empty (one seed IS the empty string)
     // and 3 parsed after.**
     const len: usize = smith.slice(&buf);
@@ -1303,7 +1303,7 @@ test "corpus: every xkey seed reaches parseExtended, and the parsed count is pin
     }
     // One seed IS the empty string, a legal member of a refusal corpus.
     try testing.expectEqual(seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 private,
+    // Measured: with the collapsing draw, 0 non-empty, 0 private,
     // 0 public and 0 checksum failures — one empty string eight times, all
     // eight rejected on length. After:
     try testing.expectEqual(@as(usize, 2), privates);
@@ -1331,7 +1331,7 @@ const path_seeds = [_][]const u8{
     pathSeed("/m/0"), // InvalidPathSegment: leading slash
     pathSeed("m" ++ strRepeat("/0", 33)), // PathTooDeep: 33 segments against max_path_depth = 32
     // The charset knob, one `u64` word per octet it is meant to decide.
-    // ⛔ Measured 2026-09-08: over the fifteen seeds above, `boolWeighted(1, 4)`
+    // ⛔ Measured: over the fifteen seeds above, `boolWeighted(1, 4)`
     // was drawn 159 times and returned `true` **zero** times, because the byte
     // draw leaves nothing behind and an exhausted `Smith` returns the weight
     // minimum. The alphabet-bending loop had never executed its body. These
@@ -1394,7 +1394,7 @@ fn fuzzParsePath(_: void, smith: *std.testing.Smith) !void {
     var buf: [96]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length — same defect and same measurement as `fuzzParseExtended` above.
-    // Measured 2026-09-07 over the corpus above: **0 of 15 seeds non-empty and
+    // Measured over the corpus above: **0 of 15 seeds non-empty and
     // 0 paths parsed before, 14 of 15 non-empty and 5 parsed after.**
     const len: usize = smith.slice(&buf);
     // ⚠ Under `--fuzz` this biases raw bytes toward the path alphabet. On a
@@ -1403,7 +1403,7 @@ fn fuzzParsePath(_: void, smith: *std.testing.Smith) !void {
     // octet after the frame. That is deliberate: a seed that IS a real path
     // wants to reach `parsePath` verbatim, and the two `bentPathSeed` entries
     // are there so the loop body is not dead in the ordinary lane. Measured
-    // 2026-09-08: 0 bent octets in 159 draws before, 7 in 168 after.
+    // 0 bent octets in 159 draws before, 7 in 168 after.
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = path_alphabet[c.* % path_alphabet.len];
     }
@@ -1446,12 +1446,12 @@ test "corpus: every path reaches parsePath, and the counts are pinned" {
     }
     // One seed IS the empty path, a legal member of a refusal corpus.
     try testing.expectEqual(path_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed,
+    // Measured: with the collapsing draw, 0 non-empty, 0 parsed,
     // 0 levels and 0 hardened indices — one empty string fifteen times.
     try testing.expectEqual(@as(usize, 7), parsed);
     try testing.expectEqual(@as(usize, 18), levels);
     try testing.expectEqual(@as(usize, 9), hardened);
-    // ⛔ The knob after the byte draw. Measured 2026-09-08: 0 of 159 draws
+    // ⛔ The knob after the byte draw. Measured: 0 of 159 draws
     // returned `true` before the two `bentPathSeed` entries were added, so the
     // alphabet-bending branch was dead in the ordinary lane. Pinned as a pair
     // — `bend_draws` moves if a seed is shortened, `bent` if a tail is lost.
@@ -1463,7 +1463,7 @@ test "corpus: every path reaches parsePath, and the counts are pinned" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1473,7 +1473,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation tests (2026-11-17) ─────────────────────────────
+// ── whole-module mutation tests ─────────────────────────────
 
 fn mutTestMaster() !ExtendedPrivKey {
     const seed = @as([32]u8, @splat(0x2b));
