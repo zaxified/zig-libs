@@ -40,8 +40,13 @@ this party's Shamir share `x_j`, the group key `Q = x·G`, and its verifying sha
 (which attaches each party's independently-generated Paillier keypair + ring-Pedersen aux
 params). `EcdsaKeygen` / `EcdsaRefresh` wrap the same machine into a full dealer-free
 `threshold_ecdsa` keygen / refresh that first exchanges the aux material with its
-correctness proofs (see `SPEC.md`). Out of scope: CGGMP21 signing-phase **identifiable abort** and distributed
-**aux-parameter** generation. See `SPEC.md`.
+correctness proofs (see `SPEC.md`).
+
+## Not provided
+
+CGGMP21 signing-phase identifiable abort, jointly generated aux parameters, resharing with
+aux refresh, a FROST-style DKG with a proof of knowledge, and any `n < 2t − 1` (refused). See
+`SPEC.md`: *What is deliberately not done* and *Backlog / deferred*.
 
 ## Echo broadcast over point-to-point
 
@@ -119,7 +124,7 @@ const rc: dkg.ReshareConfig = .{ .old = .{ .t = 2, .n = 3 }, .new = .{ .t = 3, .
     .dealers = &.{ 1, 3 }, .group_public_key = q, .old_verifying_shares = xs };
 
 // An old party deals its share ...
-var dealer = try dkg.ReshareDealer.init(allocator, my_old_output, rc.new, random);
+var dealer = try dkg.ReshareDealer.init(allocator, &my_old_output, rc.new, random);
 try dealer.start(); // broadcast -> every new party; party(j) -> new party j
 // ... a new party collects (recv.handle takes a role-tagged `dkg.ReshareSender`:
 // `.dealer = OLD id`, or `.receiver = NEW id` for complaints).

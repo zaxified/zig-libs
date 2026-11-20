@@ -21,17 +21,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — Ported to Zig 0.17.0. Enum/struct reflection moved to `field_names` / `field_values` / `field_types` (wire.zig `kindFromByte`, stackprobe_test.zig). No behaviour change.
-- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the refresh tests share one protocol keygen fixture
-  instead of each running its own, and the fault test is split in three; one test doing keygen + refresh
-  exceeded CI's 3-minute `--test-timeout` under a full crypto lane.
 - **2026-10-10** — tests: deterministic fuzz driver `DKG_FUZZ` (dkg now has `testkit` in `test_deps`; the local seed copies in `types.zig` are kept): `dkg-pedersen-decode`, `dkg-feldman-decode`, `dkg-sharemsg-decode` (corpus frame / genuine message with 0-3 octets damaged; what decodes re-encodes to the same octets), `dkg-participant-handle` and `dkg-reshare-receiver-handle` (captured real frames of every round, damaged, into a party brought to that round; a refused frame leaves the phase where it was; the party stays drivable). The two handlers run at their scale (5,000 of the 200,000 budget). No source change.
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** follows `threshold_ecdsa.messagePublicKey` taking its seed by pointer (internal call site in `assembleKeyShares`).
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`, five tests: every GJKR participant call, every reshare dealer
   and receiver call, every ECDSA keygen and refresh call, the commitment/share-check/driver
@@ -45,7 +37,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `commit.randomScalar(random, out)`, `commit.evalPoly(coeffs, x, out)`,
   `pedersenEvalShare`/`feldmanEvalShare` (shares by pointer). `takeKeyShare(out) bool` now also
   wipes the copy it keeps (setting the optional to null left it in the struct). 0 residues after.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Out of scope" no longer calls the GJKR recovery branch a hard error — it landed 2026-10-01, as the Backlog already records.
 - **2026-10-04** — `EcdsaRefresh` refuses new aux material that repeats a modulus or the
   message key of the old table — this party's own at `start`, a peer's in the announce round
   (`StaleAuxMaterial`; review 2026-10-03 F14).
@@ -135,7 +126,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Not done: GJKR's public-reconstruction branch (a QUAL dealer failing the Feldman check still aborts, now
   with `culprit()` set), distributed aux generation.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **coeffs 98 / combine 5**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. No constant-time claim exists in `SPEC.md` or `README.md`; none was added — this is evidence looking for a sentence to attach to. ⭐ `combineKeyShare`'s own summation over the accepted shares measures **zero**, which is the concrete answer to the question this was built for. ⚠⚠ **45% of `coeffs`' 98 contexts are an over-taint artifact of simulating every party in one process**: `evalCommitmentAt` and `deriveGroupPublicKey` re-decode commitments that this process built moments earlier from tainted coefficients, whereas in the real protocol those bytes arrive over the wire at a party that never held the secret. That limit applies to every multi-party harness in this campaign and none of their numbers were adjusted for it. ⭐ The author also self-corrected before reporting: a first version tainted a whole `[3]?Scalar` and three of eight contexts turned out to be the OPTIONAL'S PRESENCE DISCRIMINANT, not the payload; narrowing the taint took it 8→5. Taint the payload, not the wrapper.
 
 - **2026-09-07** — Test-only, no production change: both broadcast fuzz targets replayed a
   single input. `fuzzPedersenBroadcastDecode` and `fuzzFeldmanBroadcastDecode` each opened

@@ -14,16 +14,6 @@
 
 **Known defects:** none recorded
 
-The 2026-10-02 review and mutation run (5/5 killed) covered `ecdsa_keygen`; the
-rest of the module was reviewed and mutated on 2026-10-01.
-
-The 2026-10-01 review covered the per-participant layer (`participant.zig`, `wire.zig`,
-`reshare.zig`, 2026-09-30) — the code that parses frames from the network. It found that a
-cheating QUAL dealer could leave some honest parties `.done` with a key nobody can sign for
-while the others aborted, and could veto a `Q` by withholding its Feldman commitments; and
-that configurations with `n < 2t − 1` gave one dealer `Q` outright. Both are fixed (GJKR
-step 4; `NoHonestMajority`).
-
 **Downstream consumer:** no
 
 Secure Distributed Key Generation (GJKR) for `threshold_ecdsa` over secp256k1.
@@ -41,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Pedersen/Gennaro DKG among many primitives; no longer maintained. |
 | Zig ecosystem (GitHub search "distributed key generation", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does, and for `threshold_ecdsa` a full refresh (`EcdsaRefresh`, 2026-10-03: new shares plus new proven Paillier, ring-Pedersen and message keys) — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term and no echo-broadcast helper (the caller must supply reliable broadcast, as GJKR assumes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is generated per party, not jointly — but `EcdsaKeygen` (2026-10-02) exchanges it with its correctness proofs (Πmod, Πprm, Πfac) before the shares are dealt, as tss-lib v2+ and CGGMP21 do; the older `assembleKeyShares` path still attaches unproven material; no persistence format for an in-flight run (a party that restarts mid-protocol starts over); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
+**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does, and for `threshold_ecdsa` a full refresh (`EcdsaRefresh`: new shares plus new proven Paillier, ring-Pedersen and message keys) — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term, and reliable broadcast is the caller's (as GJKR assumes; `EchoBroadcast` checks that every party saw the same bytes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is generated per party, not jointly — but `EcdsaKeygen` exchanges it with its correctness proofs (Πmod, Πprm, Πfac) before the shares are dealt, as tss-lib v2+ and CGGMP21 do; the older `assembleKeyShares` path still attaches unproven material; an in-flight run snapshots to plain bytes whose protection at rest is the caller's (as in frost-core and tss-lib); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
 
 ## Goal
 
@@ -191,13 +181,14 @@ dealer's Pedersen commitments (it is the committed share) and not the Feldman on
 reliable broadcast every honest party therefore exposes the same dealers — those with a valid
 complaint or no Feldman broadcast at all — reveals its own shares of them, and rebuilds their
 polynomials from `t` Pedersen-verified shares. By Pedersen binding those are the polynomials
-the dealers committed to before QUAL was fixed, so the key is the one a clean run gives. Until
-2026-10-01 a mismatch was a local abort: a dealer whose commitments agreed with fewer than `t`
-honest shares left those parties `.done` with a `Q` nobody can sign for while the rest aborted
-(neither half knowing), and withholding the commitments aborted the run — a veto a rushing
-dealer could use, after seeing the others' `A_i0`, to redraw `Q` on a restart. A reconstructed
-coefficient of zero contributes the identity, which cannot travel as an `Element`; it is
-summed as such rather than refused.
+the dealers committed to before QUAL was fixed, so the key is the one a clean run gives. A
+local abort on a mismatch would be unsound: a dealer whose commitments agreed with fewer than
+`t` honest shares would leave those parties `.done` with a `Q` nobody can sign for while the
+rest aborted (neither half knowing), and withholding the commitments would abort the run — a
+veto a rushing dealer could use, after seeing the others' `A_i0`, to redraw `Q` on a restart.
+A reconstructed coefficient of zero contributes the identity, which cannot travel as an
+`Element`; it is summed as such rather than refused. `advance` names a dealer it cannot rebuild
+with `ReconstructionFailed` (`culprit()`).
 
 Randomness is caller-supplied and drawn once in `init`, in the same order as the lockstep
 driver, so the same seed gives byte-identical outputs from `Dkg.run` and from `Participant`s
@@ -208,7 +199,7 @@ leaves the party `.aborted`: a half-done round transition is never retried, so n
 queued twice. Deviation from Fig. 2: a dealer who is complained about defends *all* its
 complainants in one round.
 
-## Dealer-free ECDSA keygen (`ecdsa_keygen.zig`, 2026-10-02)
+## Dealer-free ECDSA keygen (`ecdsa_keygen.zig`)
 
 `EcdsaKeygen` is one party of a full dealer-free `threshold_ecdsa` keygen,
 sans-I/O like `Participant`, which it wraps:
@@ -229,11 +220,13 @@ parties: a missing or failing announcement or Πfac aborts with `culprit()`
 naming the party; a duplicate modulus aborts without one (who copied whom is
 not visible in the bytes). The GJKR rounds keep their own rules. Every
 frame, the inner GJKR ones included, starts with a 16-byte run tag
-(`runTag`: protocol keygen/refresh, session id, `t`, `n`); a frame with
-another tag is `WrongSession` (review 2026-10-03 F7 — before, the Feldman,
-complaint and defense frames were bound to a run by the transport alone, so
-an aborted run's frames could be replayed into the retry). `EcdsaRefresh`
-ends with a key-confirmation round (`ecdsa_confirm`, F6): every party
+(`runTag`: protocol keygen/refresh, session id, `t`, `n`), checked before anything else; a
+frame with another tag is `WrongSession` (without the tag the Feldman, complaint and
+defense frames would be bound to a run by the transport alone, so an aborted run's frames
+could be replayed into the retry). The bare `Participant` and `Reshare*` machines leave run
+binding to the transport (documented in `wire.zig`): a caller using them directly keeps runs
+apart itself. `EcdsaRefresh`
+ends with a key-confirmation round (`ecdsa_confirm`): every party
 broadcasts `SHA-256` over its new share's public part (group key, `t`, `n`,
 the whole public-key table) and reaches `.done` — and hands out the share —
 only when every digest equals its own; the old share is erased only after
@@ -250,6 +243,13 @@ another party's id is refused with that id named; a missing announcement
 names the absent party. The test material uses Blum (not safe) primes for
 `Ñ` so a run takes seconds, not minutes; the proofs and checks are the
 production ones.
+The announcement's Ñ proofs (Πprm, Πmod) are bound to `session id || index`, so a copied `Ñ`
+with its proofs fails `verifyAnnouncement`; `findDuplicate` is the second line. `EcdsaRefresh`
+also refuses reused aux material: `start` refuses this party's own new material when it
+repeats a modulus or the message key of the old table, and the announce round refuses a
+peer's (`StaleAuxMaterial`, culprit named), via `threshold_ecdsa.aux_info.reusesMaterial`
+against every old entry. A party whose last confirmations are lost aborts while the others
+finish (it keeps the old share; rerun to bring it in) — inherent to any final round.
 
 ## Resharing (`reshare.zig`)
 
@@ -272,120 +272,149 @@ of `x = F(0)`:
 
 Plain Feldman VSS suffices (no Pedersen phase): the dealt secrets are fixed, there is no key
 to bias. Roles are separate state machines with separate id spaces (dealer ids = old ids,
-receiver ids = new ids; `ReshareReceiver.handle`'s `from` is an old id except for
-`reshare_complaint`); the module doc in `reshare.zig` has the routing table.
+receiver ids = new ids). `ReshareReceiver.handle` takes a role-tagged `ReshareSender`:
+`.dealer` (an OLD id) for `reshare_broadcast`, `reshare_share` and `reshare_defense`,
+`.receiver` (a NEW id) for `reshare_complaint`; a frame whose kind does not match the role
+is `UnknownSender`, so new party `j` cannot pass a broadcast off as old dealer `j`. The module
+doc in `reshare.zig` has the routing table.
 
 What it does NOT do: revoke old shares — `t` old shares still reconstruct `x` among
 themselves, so the guarantee is proactive (an adversary needs `t` shares of ONE epoch) and
 depends on old holders erasing them. A dealer refuses to defend once `t'` distinct parties
 complain, since `t'` public openings would reveal its share.
 
-## Verification harness (the teeth)
+## Echo broadcast (`echo.zig`)
 
-- **Secret residue on the dead stack** (sweep 2026-10-08,
-  `src/stackprobe_test.zig`, five tests covering every participant, reshare, ECDSA keygen and
-  refresh call and the free functions; since 2026-11-17 also `toBytes` / `fromBytes` of every
-  mid-run `Participant` (after round 1) and `ReshareReceiver` (after the shares);
-  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
-  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
-  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
-  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
-  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
-  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
-  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
-  results go to an out-parameter, because the copy a by-value argument or result makes lives in
-  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
-  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
-  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
-  from its `std.Random` (published bytes excluded); negative and positive controls in the same
-  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
-  Every residue found (the polynomials, the shares, the output share, the assembled
-  `KeyShare`) is gone; `takeKeyShare` also wipes the copy it kept. Stack cost: ~2 MiB below
-  `EcdsaKeygen.start`/`EcdsaRefresh.start` (the aux proofs).
-  2026-11-17: `takeKeyShare` (both machines) had no burn. The plain ReleaseFast build was
-  clean, but the mutation audit's schemata build (same logic, slightly different code shape)
-  left `x_i` and the message seed of the moved `KeyShare` on the dead stack (367 B deep):
-  codegen-fragile residue. Both now run their body one frame down and burn 2 KiB, like
-  every other entry point; the probe is clean in both builds.
+`EchoBroadcast` is a caller-slot accumulator (`init`, `addReceived`, `missing`, `digest`,
+`check`, `firstMismatch`; no allocation): after a broadcast round it takes the bytes received
+from each sender, produces a domain-separated SHA-256 transcript digest, and compares the
+digests other parties echo. `error.Equivocation` means some sender gave different parties
+different bytes; it names the disagreeing peer, not necessarily the equivocator.
 
-- **End-to-end anchor (best teeth).** Run the DKG → `assembleKeyShares` (attach
-  Paillier/aux) → `threshold_ecdsa.signWithShares` → verify with std ECDSA under
-  `Q`. A DKG whose key yields a valid std-verifiable signature is correct and
-  usable; this needs no external vector. Runs against the real core.
-- **Correctness invariants** (`checks.zig`): all honest parties output the same
-  `Q` (`allSameQ`); any `t` shares Lagrange-reconstruct `x` with `x·G == Q`
-  (`reconstructsToQ`); each `X_j == x_j·G` (`verifyingShareConsistent`).
-- **Adversarial (Byzantine) tests.** A dealer that sends a share inconsistent
-  with its Pedersen commitment must be detected (complaint), and — if it cannot
-  defend — disqualified from QUAL; a defended (transient) bad share is tolerated
-  and the receiver adopts the revealed opening. Runs against the real core.
-- **Positive control (runs today, no gated code).** `BrokenDkg` skips the
-  share-vs-commitment verification and naively sums every wire share. Fed a
-  Byzantine bad share, it emits an unusable key, and `reconstructsToQ` catches
-  it (`x·G != Q`) for any subset including the poisoned party while a clean
-  subset still reconstructs — proving the checker discriminates, not blanket-
-  fails, before the core exists.
+## In-flight snapshots (`snapshot.zig`)
 
-- **Per-participant equivalence.** For n in 2..7 and every t with `n ≥ 2t − 1`, `Participant`s driven over
-  an in-memory router produce byte-identical `DkgShareOutput`s to `Dkg.run` for the same seed;
-  the joint Feldman commitments re-derive every `X_j`.
-- **Adversarial, at the message level.** A tampered share (defended -> same key as the clean
-  run; undefended -> QUAL excludes the dealer), a silent dealer, a crashed party, more than `t`
-  defended complaints; a wrong or a withheld Feldman broadcast (the dealer is exposed and
-  rebuilt: byte-identical outputs to the clean run); the review's split attack (`n=5,t=3`,
-  Feldman commitments bent through parties 1 and 2 only: all five finish with the clean key);
-  refused Feldman complaints (about an honest dealer, with a share that is not the committed
-  one); `NoHonestMajority` for `n < 2t − 1`; and the refusals: malformed
-  lengths/points/scalars, lying commitment counts, wrong sender, wrong recipient, replay, wrong
-  round, unsolicited defense, after finish.
-- **Resharing.** `n=3,t=2 -> n'=5,t'=3` keeps `Q`; every 3-subset of the new shares
-  reconstructs the same secret; below `t'` and old+new mixes do not; refresh changes every
-  share; bad dealers are defended/excluded; `InsufficientDealers`, `CommitmentMismatch`,
-  `GroupKeyMismatch`.
-- **Signing.** DKG over frames -> `threshold_ecdsa.signWithShares` -> refresh -> sign again
-  under the same `Q`, both verified by `std` ECDSA.
-- **Independent recomputation.** `tools/gjkr_oracle.py` (plain Python integers, written from
-  the paper) generates and re-checks `src/transcript_vectors.zig`: 5 parties `t=3` with every
-  secret coefficient revealed, and a `t'=2`, `n'=3` resharing. Two Zig tests replay it through
-  `Participant`/`ReshareDealer` (explicit coefficients) and assert equality of every frame's
-  commitments and shares, every `x_j`, `X_j`, `Q`, `F'`, and the Lagrange coefficients.
-- **Parser fuzz.** `Participant.handle` and `ReshareReceiver.handle` are fuzzed in every round
-  against a deterministic world; the corpus is real frames captured per round. The DKG world
-  has a defended bad share and a dealer with bent Feldman commitments, so it passes through
-  the Feldman-complaint and reveal rounds too.
-- **Mutation run 2026-10-01** (schemata, ReleaseSafe, 31 mutants over the recovery branch,
-  the frame handlers, `advance`'s abort-on-error, `interpolate`, the honest-majority check,
-  `core`'s share verification and rule (b), and resharing's exclusion/`B_0`/`Q` checks): 29
-  killed. The first pass left six; four tests were added (a Feldman complaint about a
-  dealer outside QUAL — without the check it would crash the reveal round —, an allocation
-  failure inside `advance`, and both sides of resharing's `t'`-complaints rule, each of which
-  hid the other). Two are equivalent: the check that our own share lies on a reconstructed
-  polynomial, and resharing's `x'_j·G == Σ F'_k j^k`; both follow from shares verified
-  against the commitments (binding, linearity) and stay as assertions.
+`Participant` and `ReshareReceiver` have `encodedLength()` / `toBytes(out)` /
+`fromBytes(allocator, bytes)`. Format: `version(1)=1 || kind(1) 1|2 || group(1)=1 (secp256k1)
+|| body`, integers big-endian, optional values behind a 0/1 flag; the body holds the whole
+machine (own polynomials, per-dealer commitments and shares, complaint and defense
+bookkeeping, reveal table, the pending outgoing frames so a crash between snapshot and send
+loses none, the result, the public commitments). The caller buffer API follows `signal`
+`ratchet.State.toBytes`; there is no static maximum (the size grows with `n^2` reveal slots),
+so `encodedLength()` sizes the buffer.
 
-- **Audit 2026-11-17 (whole-module mutation).** 715 schemata mutants = the 154 of the same
-  day's snapshot-codec delta (128 killed, 26 equivalent / unobservable; not re-run) + 561 over
-  every other production file (`core`, `commit`, `participant`, `reshare`, `wire`, `types`,
-  `echo`, `protocol`, `checks`, `ecdsa_keygen`, `ecdsa_refresh`, `root`), generated one per
-  condition x class (guard drop per disjunct / conjunct, ordering boundary, skipped counter,
-  skipped assignment, flipped boolean return, skipped wipe) with stable ids; 30 more that the
-  generator placed in test fixtures (the reshare `Rig`, the ECDSA tests' `quickLocal` and
-  routers, the e2e anchor's aux helpers) are excluded. ReleaseSafe for the logic, one per-file
-  test filter per group (the ECDSA suites alone take minutes); the wipe class also in a
-  ReleaseFast build under the stack probe. Result: 477 killed (1 hang), 84 argued: 28
-  equivalent (deinit poisoning, checks subsumed by an earlier one, the lockstep driver's
-  untampered openings, cost-only boundaries) and 56 unobservable (heap wipes right before
-  `free`, which need an allocator that checks freed blocks; stack wipes the ReleaseFast probe
-  does not see in this code shape because a caller's or callee's burn overlaps them; two
-  2^32-sized boundaries; an OOM inside `drainInner`). About 90 survivors of the first round
-  became tests: `allReceived` in every round, every id-range and duplicate refusal of the
-  frame handlers, `initWithPolynomials`/`ReshareDealer`/`ReshareConfig` refusals, dealer-1
-  exposure and self-exposure, a run on dirty allocations, the receiver's last-round aborts,
-  the confirmation round's refusals, no frame addressed to oneself, `untag` and
-  `keygenContext` edges. One kill (a missing confirmation naming its party) is by
-  construction of a test added after the last schemata build, not measured. Finding: the
-  `takeKeyShare` residue above (fixed, `take_key_share_stack_burn`); both new burns are killed
-  by the probe.
+Followed: frost-core 3.0.0 `keys::dkg` (`round1::SecretPackage`, `round2::SecretPackage`:
+identifier, coefficients or share, commitment, min/max signers; "MUST NOT be sent to other
+participants") and bnb-chain/tss-lib `ecdsa/keygen/save_data.go` (`LocalPartySaveData`, finished
+data only). Both leave protection at rest to the caller and neither wraps or encrypts, so ours
+does not either (owner rule: behave like the reference): every byte of a snapshot is secret
+material, the `toBytes` doc says so, and the caller stores it like a key and zeroes the buffer.
+Neither reference tags its package with a version or ciphersuite or checks consistency on load;
+ours is stricter, which costs a caller nothing.
+
+`fromBytes` is fail-closed (`error.InvalidState`): version / kind / group tag, every length
+proved to fit before anything is allocated, strict flags, canonical scalars, on-curve points,
+trailing bytes, party ids, complaint pairs, pending frames (exact length and addressing per
+kind), and a phase-vs-contents check (no qualified set before the Feldman round, no reveals
+before the reveal round, own dealing recomputed from the secret polynomials, finished result vs.
+the public commitments, `used` = the included dealers). Secrets of a half-built state are wiped
+on every error path. A snapshot is only as fresh as its call: restoring an older one replays
+rounds, so the caller keeps exactly the latest.
+
+## Secret hygiene on the stack (`burn.zig`)
+
+Wiping named buffers does not keep secrets off the stack: compiler copies, by-value parameters
+and results, and callee frames leave them in dead stack memory. So, as in `bip32` / `k256`:
+(1) every public entry point that touches a secret runs its body one frame down (`noinline`) and
+then zeroes, at that depth, a region a little deeper than the body was measured to reach
+(`burn.zig`: volatile 32-byte vector stores into a 16-aligned buffer; a 32-aligned one left up
+to 56 bytes of a realigned frame unzeroed); (2) a secret never crosses the API by value: secret
+parameters are pointers, secret results go to an out-parameter, because the copy a by-value
+argument or result makes lives in the CALLER's frame, where no burn of the callee reaches.
+`takeKeyShare` (both machines) runs its body one frame down and burns 2 KiB
+(`take_key_share_stack_burn`). Stack cost: ~2 MiB below `EcdsaKeygen.start` /
+`EcdsaRefresh.start` (the aux proofs).
+
+## Limits and residual risks
+
+- Transport: reliable broadcast with identical bytes to every receiver, confidential `share`
+  frames and an authenticated `from` are the caller's (see *Per-participant API*).
+- Honest majority: `n ≥ 2t − 1` is required for a DKG (`NoHonestMajority`); resharing does not
+  need it.
+- Run binding: only `EcdsaKeygen` / `EcdsaRefresh` carry a run tag; the bare `Participant` and
+  `Reshare*` machines leave it to the transport.
+- Resharing does not revoke old shares (see *Resharing*); old holders must erase them.
+- Final-round loss in `EcdsaRefresh`: a party whose last confirmations are lost aborts while the
+  others finish.
+- Snapshots are plain secret bytes and replay rounds if stale (see *In-flight snapshots*).
+- `assembleKeyShares` attaches caller-supplied, unproven Paillier / ring-Pedersen material;
+  `EcdsaKeygen` / `EcdsaRefresh` exchange it with its proofs.
+- The module makes no constant-time claim (`src/ctgrind_harness.zig`; rows in
+  `scripts/checks/ctgrind-expected.tsv`).
+
+## Verification
+
+Run with `scripts/modtest dkg`; the ECDSA keygen / refresh suites alone take minutes (the test
+material uses Blum, not safe, primes for `Ñ`; the proofs and checks are the production ones).
+
+- **End-to-end anchor (best teeth).** DKG → `assembleKeyShares` (attach Paillier/aux) →
+  `threshold_ecdsa.signWithShares` → verify with std ECDSA under `Q`. A DKG whose key yields a
+  valid std-verifiable signature is correct and usable; this needs no external vector. Also
+  DKG over frames → sign → refresh → sign again under the same `Q`.
+- **Correctness invariants** (`checks.zig`): all honest parties output the same `Q`
+  (`allSameQ`); any `t` shares Lagrange-reconstruct `x` with `x·G == Q` (`reconstructsToQ`);
+  each `X_j == x_j·G` (`verifyingShareConsistent`).
+- **Positive control.** `BrokenDkg` skips the share-vs-commitment verification and naively sums
+  every wire share. Fed a Byzantine bad share, it emits an unusable key, and `reconstructsToQ`
+  catches it for any subset including the poisoned party while a clean subset still
+  reconstructs: the checker discriminates, not blanket-fails.
+- **Adversarial (Byzantine), lockstep and at the message level.** A share inconsistent with its
+  Pedersen commitment is detected and, if undefended, the dealer leaves QUAL; a defended
+  (transient) bad share is tolerated and the receiver adopts the revealed opening; a silent
+  dealer, a crashed party, more than `t` defended complaints; a wrong or a withheld Feldman
+  broadcast (the dealer is exposed and rebuilt: byte-identical outputs to the clean run); the
+  split attack (`n=5,t=3`, Feldman commitments bent through parties 1 and 2 only: all five
+  finish with the clean key); refused Feldman complaints (about an honest dealer, with a share
+  that is not the committed one); `NoHonestMajority`; and the frame refusals (malformed
+  lengths / points / scalars, lying commitment counts, wrong sender, wrong recipient, replay,
+  wrong round, unsolicited defense, after finish).
+- **Per-participant equivalence.** `Participant`s driven over an in-memory router produce
+  byte-identical `DkgShareOutput`s to `Dkg.run` for the same seed over a range of `(n, t)` with
+  `n ≥ 2t − 1`; the joint Feldman commitments re-derive every `X_j`.
+- **ECDSA keygen / refresh.** 2-of-3 over frames → `KeyShare`s → every signer pair signs → std
+  ECDSA verifies under the joint key; a tampered Πfac aborts the receiver with the prover
+  named; an announcement replayed under another party's id is refused with that id named; a
+  missing announcement names the absent party; a transport that hides one dealer from one party
+  in the confirmation round leaves nobody finished and nobody handing out a share.
+- **Resharing.** `n=3,t=2 → n'=5,t'=3` keeps `Q`; every 3-subset of the new shares reconstructs
+  the same secret; below `t'` and old+new mixes do not; refresh changes every share; bad
+  dealers are defended / excluded; `InsufficientDealers`, `CommitmentMismatch`,
+  `GroupKeyMismatch`; role-tagged senders in both directions.
+- **Snapshots.** Resume at every round boundary (also through complaint, defense, exposure and
+  reconstruction) gives the uninterrupted run's key; every truncation, trailing byte, bad tag
+  and unreachable state is refused; every allocation failure of `fromBytes` frees everything.
+- **Independent recomputation.** `tools/gjkr_oracle.py` (plain Python integers, written from the
+  paper) generates and re-checks `src/transcript_vectors.zig`: 5 parties `t=3` with every secret
+  coefficient revealed, and a `t'=2`, `n'=3` resharing. Two Zig tests replay it through
+  `Participant` / `ReshareDealer` (explicit coefficients) and assert equality of every frame's
+  commitments and shares, every `x_j`, `X_j`, `Q`, `F'`, and the Lagrange coefficients. See
+  *Anchoring*.
+- **Dead-stack probe** (`src/stackprobe_test.zig`, ReleaseFast): paints a window of the dead
+  stack, makes one call (every participant, reshare, ECDSA keygen and refresh call, the free
+  functions, `takeKeyShare`, and `toBytes` / `fromBytes` of mid-run machines), and looks for
+  every 16-byte window of every secret's big-endian, little-endian and in-memory image and of
+  every byte the call drew from its `std.Random` (published bytes excluded), with negative and
+  positive controls in the same binary. `verbose = true` prints each call's depth, to resize a
+  burn after a change.
+- **Fuzz.** `Participant.handle` and `ReshareReceiver.handle` in every round against a
+  deterministic world whose corpus is real frames captured per round (the DKG world has a
+  defended bad share and a dealer with bent Feldman commitments, so it passes through the
+  Feldman-complaint and reveal rounds), and the snapshot decoders; run by the deterministic
+  driver with the `DKG_FUZZ` prefix (`DKG_FUZZ=<seeds> scripts/modtest dkg`; check that the
+  summary shows counts).
+- **ctgrind.** `src/ctgrind_harness.zig` records the module's constant-time posture (it makes no
+  claim); rows in `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Why a synchronous round-driver, not `netsim`
 
@@ -400,17 +429,13 @@ and lets the checker read QUAL and every output directly. `netsim` remains the
 right host for a future *asynchronous* DKG variant and is deliberately not used
 here.
 
-## Out of scope (later increments)
+## What is deliberately not done
 
-- **CGGMP21 signing-phase identifiable abort** (naming a culprit during signing)
-  — a separate increment on top of `threshold_ecdsa` signing.
-- **Distributed aux-parameter generation** (jointly producing the ring-Pedersen
-  `(Ñ, h1, h2)` and Paillier moduli). Here those are per-party local key material
-  attached by `assembleKeyShares`.
-- ~~**Public reconstruction of a QUAL dealer that fails the Feldman check**~~ (GJKR
-  Fig.2 step 4's recovery branch) — done 2026-10-01: no longer a hard protocol error;
-  `feldman_complaint` + `reveal` rounds rebuild the exposed dealer's polynomial (see
-  "Per-participant API").
+- **`n`-of-`n` and any `n < 2t − 1`**: refused (`NoHonestMajority`), because GJKR needs an
+  honest majority; a FROST-style DKG with a proof of knowledge takes any `t ≤ n` (see Backlog).
+- **Revoking old shares on resharing**: not possible by construction; the guarantee is proactive.
+- **Encrypting or wrapping snapshots**: the references do not either; protection at rest is the
+  caller's.
 
 ## Meta
 
@@ -427,33 +452,19 @@ here.
 
 **What the tests actually contain.** The replay of the recorded transcript against the Python recomputation (public outputs only), the lockstep-equivalence tests, the end-to-end signature under `std` ECDSA, and self-consistency/adversarial tests (reconstruction, refusals, complaints, resharing invariants).
 
-**How it got there.** No external oracle exists for what remains. The transcript is deterministic (coefficients hashed from labels), regenerated by `python3 tools/gjkr_oracle.py --write` and re-verified from the committed file by `--check`.
+The transcript is deterministic (coefficients hashed from labels), regenerated by
+`python3 tools/gjkr_oracle.py --write` and re-verified from the committed file by `--check`.
 
 ## Backlog / deferred
 
-- ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
-- ~~**Role-tagged sender for `ReshareReceiver`**~~ (review 2026-10-01, F7) ✅ 2026-10-02: `handle(from: ReshareSender, …)` — `.dealer`/`.receiver`; a frame whose kind does not match the role is `UnknownSender`, so new party `j` can no longer pass a broadcast off as old dealer `j` (tested both ways).
-- ~~**Key confirmation after `EcdsaRefresh`**~~ (review 2026-10-03 F6) ✅ 2026-10-04: round
-  `confirm` (`ecdsa_confirm`, digest of the new share's public part); `.done` and `takeKeyShare`
-  only after every digest matches (`ConfirmationMismatch` names the first differing peer). Tested
-  with a transport that hides one dealer from one party: nobody finishes, nobody hands out a share.
-  Left: a party whose last confirmations are lost aborts while the others finish (it keeps the
-  old share; rerun to bring it in) — inherent to any final round.
-- ~~**Session id in the Feldman/complaint/defense frames**~~ (review 2026-10-03 F7) ✅
-  2026-10-04, in the ECDSA wrappers: every `EcdsaKeygen`/`EcdsaRefresh` frame starts with the run
-  tag (protocol, session id, `t`, `n`), checked before anything else (`WrongSession`). The bare
-  `Participant` and `Reshare*` machines still leave run binding to the transport (documented in
-  `wire.zig`); a caller using them directly must keep runs apart itself.
-- ~~**Refresh with the old aux material**~~ (review 2026-10-03 F14) ✅ 2026-10-04: `start`
-  refuses this party's own new material when it repeats a modulus or the message key of the old
-  table, and the announce round refuses a peer's (`StaleAuxMaterial`, culprit named) —
-  `threshold_ecdsa.aux_info.reusesMaterial` against every old entry. Keygen frames are kept out of
-  a refresh by the run tag (F7); the announcement's proof context keeps one format for both.
-- **Echo-broadcast helper** (2026-09-30) ✅ DONE 2026-11-16 (`echo.EchoBroadcast`: caller-slot accumulator `init/addReceived/missing/digest/check/firstMismatch`, domain-separated SHA-256 transcript digest; a mismatch names the disagreeing peer, not necessarily the equivocator).
-- **Serialisable in-flight state** (2026-09-30) ✅ DONE 2026-11-17 (`snapshot.zig`: `Participant` and `ReshareReceiver` `encodedLength` / `toBytes(out)` / `fromBytes(allocator, bytes)`). Sources and decisions: frost-core 3.0.0 `keys::dkg` (`round1::SecretPackage`: identifier, secret-polynomial coefficients, public commitment, min/max signers; `round2::SecretPackage`: identifier, commitment, own secret share, min/max signers; serde, `deny_unknown_fields`, `Zeroize` on drop, "MUST NOT be sent to other participants") and bnb-chain/tss-lib `ecdsa/keygen/save_data.go` (`LocalPartySaveData`: plain structs, finished data only). **Both leave protection at rest to the caller and neither wraps or encrypts, so ours does not either** (owner rule 2026-11-17: behave like the reference): every byte of a snapshot is secret material, the `toBytes` doc says so, and the caller stores it like a key and zeroes the buffer. (Neither reference tags SecretPackage with a version or ciphersuite and neither checks consistency on load; ours is stricter, which costs a caller nothing.) Format: `version(1)=1 || kind(1) 1|2 || group(1)=1 (secp256k1) || body`, integers big-endian, optional values behind a 0/1 flag; the body holds the whole machine (own polynomials, per-dealer commitments and shares, complaint and defense bookkeeping, reveal table, the PENDING outgoing frames so a crash between snapshot and send loses none, the result, the public commitments). The caller buffer API follows `signal` `ratchet.State.toBytes`; there is no static maximum (the size grows with `n^2` reveal slots), so `encodedLength()` sizes the buffer. `fromBytes` is fail-closed (`error.InvalidState`): version / kind / group tag, every length proved to fit before anything is allocated, strict flags, canonical scalars, on-curve points, trailing bytes, party ids, complaint pairs, pending frames (exact length and addressing per kind), and a phase-vs-contents check (no qualified set before the Feldman round, no reveals before the reveal round, own dealing recomputed from the secret polynomials, finished result vs. the public commitments, `used` = the included dealers). Secrets of a half-built state are wiped on every error path. A snapshot is only as fresh as its call: restoring an older one replays rounds (the caller keeps exactly the latest).
-- ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).
-- ~~**Context-bound Πprm/Πmod over Ñ**~~ ✅ 2026-10-02 (in `threshold_ecdsa`: `proveWellFormedBound`/`verifyWellFormedBound`, own FS domains): the announcement's Ñ proofs are bound to `session id || index`, so a copied `Ñ` with its proofs fails `verifyAnnouncement`; `findDuplicate` is now the second line.
-- **Resharing with aux refresh** (2026-09-30): a membership change needs new parties' Paillier/ring-Pedersen material; today it is attached by the caller.
-- **A FROST-flavoured DKG (Pedersen DKG with proof of knowledge, RFC 9591 ciphersuite)** (survey 2026-09-30): sibling `frost` has only a trusted dealer, and frost-core ships a DKG; the `commit.zig`/`core.zig` pieces are curve-generic in spirit but bound to secp256k1 `Element`/`Scalar` from `threshold_ecdsa`. Effort: medium; belongs with the `frost` module. Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Resharing with aux refresh**: a membership change needs new parties' Paillier / ring-Pedersen
+  material; today it is attached by the caller.
+- **A FROST-flavoured DKG (Pedersen DKG with proof of knowledge, RFC 9591 ciphersuite)**: sibling
+  `frost` has only a trusted dealer, and frost-core ships a DKG; the `commit.zig` / `core.zig`
+  pieces are curve-generic in spirit but bound to secp256k1 `Element` / `Scalar` from
+  `threshold_ecdsa`. Effort: medium; belongs with the `frost` module. Fits §2.
+- **CGGMP21 signing-phase identifiable abort** (naming a culprit during signing): a separate
+  increment on top of `threshold_ecdsa` signing.
+- **Distributed aux-parameter generation** (jointly producing the ring-Pedersen `(Ñ, h1, h2)`
+  and Paillier moduli): here those are per-party local key material attached by
+  `assembleKeyShares`.
