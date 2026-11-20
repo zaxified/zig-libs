@@ -6,7 +6,7 @@
 
 **Scope:** core — xmlsec 1.3.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-10-05 (24/25, 1 eq) · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-20 (153/157, 4 eq) · src e0ecef013059a685
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLDSIG_FUZZ) · ct n/a — public-key verification only: the key, document and signature are public; the one secret-adjacent buffer, a decrypted assertion canonicalized by `verify`, is wiped on release, not branched on · panic 2026-11-13 (sweep of every pub entry point: canonical-output cap against exclusive-C14N namespace re-rendering, O(1) rendered-namespace lookups, PrefixList cost per declaration)
 
@@ -221,6 +221,16 @@ element, prolog/epilog PIs and comments under `URI=""`, `#` and empty ids, uniqu
   (C14N normalizes both). Reach counters with an in-suite check fail the run when a label never fires; the
   harness also runs as a `std.testing.fuzz` corpus target.
 - **ctgrind:** none; public-key verification, nothing secret is branched on (card, Hardening line).
+- **Mutation:** whole module, 157 mutants over `verify`, reference validation (transform chain, mode and PrefixList,
+  prolog/epilog guard, digest compare), reference resolution and `countByAttr`, the digest and signature dispatch of every
+  method (RSA PKCS#1 v1.5 SHA-1/256/384/512, ECDSA P-256/384/521, RSA-PSS, HMAC; key-type, length and salt checks) and
+  `c14n.zig` (depth and output bounds, namespace rendering in both families, `xml:*` inheritance, escaping, ordering,
+  the rendered-namespace stack): 153 killed, 4 equivalent. Equivalent: `countByAttr`'s saturation at 2 (the only question
+  asked is "exactly one", so the exact count of a larger total changes nothing), and three of the canonical-output cap checks
+  (after a start tag, a text run, a CDATA run): output only grows and the end-tag check of the same element enforces the same
+  bound, so the verdict is identical and only the point of abort (peak memory, one element's output beyond the cap) moves.
+  Mutants over compile-time arguments (digest and hash types) are written as whole-expression runtime alternatives; a
+  runtime switch inside a `comptime` argument is inert.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 

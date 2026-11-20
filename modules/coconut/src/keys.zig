@@ -455,6 +455,10 @@ test "SecretKey/SecretKeyShare.deinit zeroes the secret Fr material" {
     try std.testing.expectEqual(@as(u64, 7), share.index); // public field untouched
 }
 
+test "aggregateVerificationKeys: an empty subset is refused" {
+    try std.testing.expectError(error.NotEnoughShares, aggregateVerificationKeys(std.testing.allocator, &.{}));
+}
+
 fn commitFr(v: u32) Fr {
     var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, buf[28..32], v, .big);

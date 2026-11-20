@@ -6,7 +6,7 @@
 
 **Scope:** core — rustls `quic` API and ngtcp2_crypto (surveyed 2026-09-30); raised from mvp 2026-09-30 with Retry integrity + QUIC v2
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 (22/23, 1 eq) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (95/96, 1 eq) · src 25de1e019e54a249
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QUIC_CRYPTO_FUZZ: header-protection remove / round trip, packet protection genuine-opened / flipped-refused for 3 AEADs, Initial secrets + key chain + Retry tag) · ct 2026-10-10 (ctgrind: 1-RTT traffic secret through key derivation, key update, seal/open and header protection; `aes` / `chacha` 4 in-file each — the RFC-mandated packet-number-length read in `remove` and the AEAD verdict, none a branch on a key)
 **Performance:** not measured
@@ -245,6 +245,13 @@ never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh quic-crypto
 - **Dead stack:** `src/stackprobe_test.zig` over every entry point.
 - **Not tested:** a live wire interop run (ngtcp2 / quiche / msquic Initial packets): it belongs to the eventual
   `quic` transport consumer, since this module has no socket or packet framing to drive one.
+- **Mutation:** whole module, 96 mutants over `version.zig` (wire map, salts, labels, Retry key/nonce, both versions' type bits
+  both ways), `initial.zig`, `keyschedule.zig`, `protection.zig` (nonce construction, every buffer and length check, the AEAD
+  arguments), `retry.zig` (pseudo-packet limits and layout, tag compute and verify) and `headerprot.zig` (AES and ChaCha20
+  masks, `apply`/`remove` bounds, the packet-number length read, the first-byte masks): 95 killed, 1 equivalent. Equivalent: the
+  empty-packet check in `apply` (an empty packet is refused by the packet-number window check right after it, since the
+  window length is at least 1). Stack burns are the dead-stack probe's and are not mutated. The AES-256 header-protection
+  mask is pinned against an OpenSSL value (RFC 9001 has no AES-256 vector).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 

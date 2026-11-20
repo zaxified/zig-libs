@@ -121,6 +121,8 @@ test "coefficientAtZero: rejects bad inputs" {
     const idx2 = [_]u64{ 1, 2, 3 };
     try std.testing.expectError(error.NotAnIndex, coefficientAtZero(&idx2, 9));
     try std.testing.expectError(error.InvalidIndex, coefficientAtZero(&idx2, 0));
+    // No nodes at all: InvalidIndex, not NotAnIndex.
+    try std.testing.expectError(error.InvalidIndex, coefficientAtZero(&[_]u64{}, 5));
     // A zero among the OTHER nodes (mutation run 2026-10-05: survived).
     const idx3 = [_]u64{ 0, 1, 2 };
     try std.testing.expectError(error.InvalidIndex, coefficientAtZero(&idx3, 1));

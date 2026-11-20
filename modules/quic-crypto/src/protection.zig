@@ -354,6 +354,10 @@ test "Protection.open: App. A.3 round-trip + tamper->DecryptionFailed" {
     // Ciphertext shorter than the tag is a typed error, not a slice panic.
     const tiny = [_]u8{ 1, 2, 3 };
     try testing.expectError(error.PacketTooShort, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &tiny, &back));
+
+    // An output buffer one byte short of the plaintext is a typed error too.
+    var short_out: [rfc_server_payload.len - 1]u8 = undefined;
+    try testing.expectError(error.BufferTooShort, P.open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_ct, &short_out));
 }
 
 test "Protection.open: App. A.5 ChaCha20-Poly1305 round-trip + tamper->DecryptionFailed" {

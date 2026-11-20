@@ -595,6 +595,10 @@ test "canonicalize: nesting past max_depth is a typed error, not a stack overflo
     defer a.free(ok);
     try std.testing.expect(ok.len > 0);
 
+    // The deepest element sits at depth `deep - 1`: a bound of exactly that works.
+    const edge = try canonicalize(a, doc.root, .{ .mode = .exclusive, .max_depth = deep - 1 });
+    defer a.free(edge);
+
     // One level short of it: refused by name rather than by crashing.
     try std.testing.expectError(
         error.MaxDepthExceeded,
@@ -977,4 +981,43 @@ test "canonicalize: whole-list scan and per-declaration PrefixList agree on rand
         checked += 1;
     }
     try testing.expect(checked > 300);
+}
+
+test "canonicalize: text nodes escape & < > (and nothing else of the attribute set)" {
+    try expectC14n("<a>&amp;&lt;&gt;\"'</a>", "a", .{ .mode = .inclusive }, "<a>&amp;&lt;&gt;\"'</a>");
+}
+
+test "canonicalize: exclusive-with-comments is exclusive (unused ancestor namespaces pruned)" {
+    try expectC14n("<r xmlns:p=\"urn:p\"><b/></r>", "b", .{ .mode = .exclusive_with_comments }, "<b></b>");
+    try expectC14n("<r xmlns:p=\"urn:p\"><b/></r>", "b", .{ .mode = .inclusive_with_comments }, "<b xmlns:p=\"urn:p\"></b>");
+}
+
+test "canonicalize: a PrefixList token of \"\" or \"#default\" renders a redeclared default below the apex" {
+    const src = "<p:r xmlns:p=\"urn:p\"><p:x xmlns=\"urn:d2\"/></p:r>";
+    try expectC14n(src, "r", .{ .mode = .exclusive }, "<p:r xmlns:p=\"urn:p\"><p:x></p:x></p:r>");
+    for ([_][]const u8{ "", "#default" }) |tok| {
+        try expectC14n(src, "r", .{ .mode = .exclusive, .inclusive_prefixes = &.{tok} }, "<p:r xmlns:p=\"urn:p\"><p:x xmlns=\"urn:d2\"></p:x></p:r>");
+    }
+}
+
+test "canonicalize: a default undeclaration is written once, not again where it already holds" {
+    try expectC14n("<a xmlns=\"urn:d\"><b xmlns=\"\"><c/></b></a>", "a", .{ .mode = .exclusive }, "<a xmlns=\"urn:d\"><b xmlns=\"\"><c></c></b></a>");
+    try expectC14n("<a xmlns=\"urn:d\"><b xmlns=\"\"><c xmlns=\"\"/></b></a>", "a", .{ .mode = .inclusive }, "<a xmlns=\"urn:d\"><b xmlns=\"\"><c></c></b></a>");
+}
+
+test "canonicalize: inclusive apex inherits xml:lang unless it carries its own, whatever else it carries" {
+    try expectC14n("<r xml:lang=\"en\"><a xml:lang=\"de\"/></r>", "a", .{ .mode = .inclusive }, "<a xml:lang=\"de\"></a>");
+    try expectC14n("<r xml:lang=\"en\"><a id=\"1\"/></r>", "a", .{ .mode = .inclusive }, "<a id=\"1\" xml:lang=\"en\"></a>");
+}
+
+test "canonicalize: CDATA line endings are normalised to LF" {
+    try expectC14n("<a><![CDATA[x\r\ny\rz]]></a>", "a", .{ .mode = .inclusive }, "<a>x\ny\nz</a>");
+    // The parser already normalises (XML 1.0 section 2.11), so reach the
+    // serializer's own rule with a node edited after parsing.
+    var doc = try xml.parse(testing.allocator, "<a><![CDATA[x]]></a>", .{});
+    defer doc.deinit();
+    @constCast(doc.root.children)[0].content = .{ .cdata = "x\r\ny\rz\r" };
+    const got = try canonicalize(testing.allocator, doc.root, .{ .mode = .inclusive });
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("<a>x\ny\nz\n</a>", got);
 }

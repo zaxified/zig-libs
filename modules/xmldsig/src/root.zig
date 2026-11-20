@@ -2791,3 +2791,344 @@ test "verify: HMAC-SHA256 round-trips; wrong key, tampering, truncation, HMACOut
     defer a.free(asrsa);
     try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, asrsa, .{ .hmac = secret }));
 }
+
+// ── whole-module mutation run: the survivors' tests ──────────────────────────
+// A flexible RSA fixture (any SignedInfo / reference canonicalization, transform
+// children, digest and signature hash, prolog/epilog) so each verify decision
+// has a document whose only difference is that decision.
+
+const HashKind = enum { sha1, sha256, sha384, sha512 };
+
+fn hashUri(k: HashKind) []const u8 {
+    return switch (k) {
+        .sha1 => dig_sha1,
+        .sha256 => dig_sha256,
+        .sha384 => dig_sha384,
+        .sha512 => dig_sha512,
+    };
+}
+
+fn rsaSigUri(k: HashKind) []const u8 {
+    return switch (k) {
+        .sha1 => sig_rsa_sha1,
+        .sha256 => sig_rsa_sha256,
+        .sha384 => sig_rsa_sha384,
+        .sha512 => sig_rsa_sha512,
+    };
+}
+
+fn digestB64Of(a: std.mem.Allocator, k: HashKind, msg: []const u8) ![]u8 {
+    var out: [64]u8 = undefined;
+    const n: usize = switch (k) {
+        inline else => |kk| blk: {
+            const H = switch (kk) {
+                .sha1 => std.crypto.hash.Sha1,
+                .sha256 => std.crypto.hash.sha2.Sha256,
+                .sha384 => std.crypto.hash.sha2.Sha384,
+                .sha512 => std.crypto.hash.sha2.Sha512,
+            };
+            H.hash(msg, out[0..H.digest_length], .{});
+            break :blk H.digest_length;
+        },
+    };
+    const enc = std.base64.standard.Encoder;
+    const buf = try a.alloc(u8, enc.calcSize(n));
+    return @constCast(enc.encode(buf, out[0..n]));
+}
+
+fn rsaSignB64Of(a: std.mem.Allocator, sk: *const rsa.SecretKey, k: HashKind, msg: []const u8) ![]u8 {
+    var sig_buf: [256]u8 = undefined;
+    const sig = switch (k) {
+        .sha1 => try rsa.signPkcs1v15(sk, std.crypto.hash.Sha1, msg, &sig_buf),
+        .sha256 => try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf),
+        .sha384 => try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha384, msg, &sig_buf),
+        .sha512 => try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha512, msg, &sig_buf),
+    };
+    const enc = std.base64.standard.Encoder;
+    const buf = try a.alloc(u8, enc.calcSize(sig.len));
+    return @constCast(enc.encode(buf, sig));
+}
+
+const DocOpts = struct {
+    prolog: []const u8 = "",
+    env_open: []const u8 = "<Envelope xmlns=\"urn:demo\">",
+    epilog: []const u8 = "",
+    si_c14n: []const u8 = alg_exc_c14n,
+    si_mode: c14n.Mode = .exclusive,
+    /// Transform children after the enveloped-signature transform.
+    transforms: []const u8 = "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+    ref_mode: c14n.Mode = .exclusive,
+    ref_prefixes: []const []const u8 = &.{},
+    digest: HashKind = .sha256,
+    sig: HashKind = .sha256,
+};
+
+fn assembleDoc(a: std.mem.Allocator, o: DocOpts, digest_b64: []const u8, sig_b64: []const u8) ![]u8 {
+    return a.print("{s}{s}<Data>custom</Data>" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"{s}\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"{s}\"/>" ++
+        "<ds:Reference URI=\"\"><ds:Transforms>" ++
+        "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>{s}" ++
+        "</ds:Transforms><ds:DigestMethod Algorithm=\"{s}\"/>" ++
+        "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference></ds:SignedInfo>" ++
+        "<ds:SignatureValue>{s}</ds:SignatureValue></ds:Signature></Envelope>{s}", .{
+        o.prolog,          o.env_open, o.si_c14n, rsaSigUri(o.sig), o.transforms,
+        hashUri(o.digest), digest_b64, sig_b64,   o.epilog,
+    });
+}
+
+fn buildDoc(a: std.mem.Allocator, o: DocOpts) ![]u8 {
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
+    defer sk.deinit();
+    const empty = try assembleDoc(a, o, "", "");
+    defer a.free(empty);
+    var d1 = try xml.parse(a, empty, .{});
+    defer d1.deinit();
+    const ref_canon = try c14n.canonicalize(a, d1.root, .{
+        .mode = o.ref_mode,
+        .inclusive_prefixes = o.ref_prefixes,
+        .omit = childByName(d1.root, "Signature").?,
+    });
+    defer a.free(ref_canon);
+    const digest_b64 = try digestB64Of(a, o.digest, ref_canon);
+    defer a.free(digest_b64);
+    const with_digest = try assembleDoc(a, o, digest_b64, "");
+    defer a.free(with_digest);
+    var d2 = try xml.parse(a, with_digest, .{});
+    defer d2.deinit();
+    const si_canon = try c14n.canonicalize(a, childByName(childByName(d2.root, "Signature").?, "SignedInfo").?, .{ .mode = o.si_mode });
+    defer a.free(si_canon);
+    const sig_b64 = try rsaSignB64Of(a, &sk, o.sig, si_canon);
+    defer a.free(sig_b64);
+    return assembleDoc(a, o, digest_b64, sig_b64);
+}
+
+fn verifyDoc(a: std.mem.Allocator, src: []const u8, weak: bool, max_c14n: usize) VerifyError!Result {
+    var doc = xml.parse(a, src, .{}) catch unreachable;
+    defer doc.deinit();
+    const pk = rsa.PublicKey.fromPem(test_rsa_pub_pem) catch unreachable;
+    return verify(a, &doc, childByName(doc.root, "Signature").?, .{
+        .key = .{ .rsa = pk },
+        .allow_weak_sha1 = weak,
+        .max_c14n_output_len = max_c14n,
+    });
+}
+
+fn expectDocValid(a: std.mem.Allocator, o: DocOpts) !void {
+    const src = try buildDoc(a, o);
+    defer a.free(src);
+    var r = try verifyDoc(a, src, true, 64 << 20);
+    defer r.deinit(a);
+    try testing.expect(r.references[0].digest_valid);
+    try testing.expect(r.valid);
+}
+
+test "verify: every digest method and every RSA PKCS#1 hash verifies, each with its own hash" {
+    const a = testing.allocator;
+    for ([_]HashKind{ .sha1, .sha256, .sha384, .sha512 }) |k| {
+        try expectDocValid(a, .{ .digest = k });
+        try expectDocValid(a, .{ .sig = k });
+    }
+}
+
+test "verify: a SignedInfo canonicalized inclusively, and the Result names both methods" {
+    const a = testing.allocator;
+    const src = try buildDoc(a, .{ .si_c14n = alg_c14n, .si_mode = .inclusive });
+    defer a.free(src);
+    // The Result's URIs borrow from the document, so it stays alive here.
+    var parsed = try xml.parse(a, src, .{});
+    defer parsed.deinit();
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    var r = try verify(a, &parsed, childByName(parsed.root, "Signature").?, .{ .key = .{ .rsa = pk } });
+    defer r.deinit(a);
+    try testing.expect(r.valid);
+    try testing.expectEqualStrings(sig_rsa_sha256, r.signature_method_uri);
+    try testing.expectEqualStrings(alg_c14n, r.canonicalization_method_uri);
+}
+
+test "verify: the output cap bounds the SignedInfo canonical form too" {
+    const a = testing.allocator;
+    const src = try buildDoc(a, .{});
+    defer a.free(src);
+    // The reference's canonical form is ~56 bytes, SignedInfo's several hundred.
+    try testing.expectError(error.OutputTooLarge, verifyDoc(a, src, false, 200));
+    var r = try verifyDoc(a, src, false, 64 << 20);
+    r.deinit(a);
+}
+
+test "verify: a reference without a c14n transform canonicalizes inclusively (the XML-DSig default)" {
+    try expectDocValid(testing.allocator, .{
+        .env_open = "<Envelope xmlns=\"urn:demo\" xmlns:foo=\"urn:foo\">",
+        .transforms = "",
+        .ref_mode = .inclusive,
+    });
+}
+
+test "verify: InclusiveNamespaces PrefixList is read from ec:InclusiveNamespaces only, and only its PrefixList" {
+    const a = testing.allocator;
+    const env = "<Envelope xmlns=\"urn:demo\" xmlns:foo=\"urn:foo\" xmlns:zz=\"urn:zz\">";
+    const head = "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">";
+    const ec = "xmlns:ec=\"http://www.w3.org/2001/10/xml-exc-c14n#\"";
+    // The list is honoured: `foo` is rendered inclusively.
+    try expectDocValid(a, .{ .env_open = env, .ref_prefixes = &.{"foo"}, .transforms = head ++ "<ec:InclusiveNamespaces " ++ ec ++ " PrefixList=\"foo\"/></ds:Transform>" });
+    // A sibling element of another name in the same namespace is not the list.
+    try expectDocValid(a, .{ .env_open = env, .transforms = head ++ "<ec:Other " ++ ec ++ " PrefixList=\"foo\"/></ds:Transform>" });
+    // InclusiveNamespaces without PrefixList names no prefix.
+    try expectDocValid(a, .{ .env_open = env, .transforms = head ++ "<ec:InclusiveNamespaces " ++ ec ++ "/></ds:Transform>" });
+}
+
+test "verify: an epilog comment is outside the digest only when the mode drops comments" {
+    const a = testing.allocator;
+    try expectDocValid(a, .{ .epilog = "<!--e-->" });
+    const wc = "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#WithComments\"/>";
+    const src = try buildDoc(a, .{ .epilog = "<!--e-->", .transforms = wc, .ref_mode = .exclusive_with_comments });
+    defer a.free(src);
+    try testing.expectError(error.UriNotResolved, verifyDoc(a, src, false, 64 << 20));
+}
+
+fn expectDocError(a: std.mem.Allocator, src: []const u8, want: anyerror) !void {
+    try testing.expectError(want, verifyDoc(a, src, false, 64 << 20));
+}
+
+test "verify: each missing or unmapped structural piece is MalformedSignature, with its own check" {
+    const a = testing.allocator;
+    const base = try buildDoc(a, .{});
+    defer a.free(base);
+    const cases = [_][2][]const u8{
+        .{ "SignedInfo>", "Zzz>" },
+        .{ "SignatureValue>", "Zzz>" },
+        .{ "<ds:CanonicalizationMethod ", "<ds:Zzz " },
+        .{ "<ds:CanonicalizationMethod Algorithm=", "<ds:CanonicalizationMethod Algo=" },
+        .{ "<ds:SignatureMethod ", "<ds:Zzz " },
+        .{ "<ds:SignatureMethod Algorithm=", "<ds:SignatureMethod Algo=" },
+        .{ "<ds:Reference URI=", "<ds:Reference Uri=" },
+        .{ "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped", "<ds:Transform Algo=\"http://www.w3.org/2000/09/xmldsig#enveloped" },
+        .{ "<ds:DigestMethod ", "<ds:Zzz " },
+        .{ "<ds:DigestMethod Algorithm=", "<ds:DigestMethod Algo=" },
+        .{ "DigestValue>", "Zzz>" },
+        .{ "<ds:SignatureValue>", "<ds:SignatureValue>***" },
+    };
+    for (cases) |c| {
+        const doc = try std.mem.replaceOwned(u8, a, base, c[0], c[1]);
+        defer a.free(doc);
+        try expectDocError(a, doc, error.MalformedSignature);
+    }
+    // An algorithm URI that maps to nothing is UnsupportedAlgorithm, not Malformed.
+    const bad_c14n = try std.mem.replaceOwned(u8, a, base, "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"", "<ds:CanonicalizationMethod Algorithm=\"urn:zzz\"");
+    defer a.free(bad_c14n);
+    try expectDocError(a, bad_c14n, error.UnsupportedAlgorithm);
+    const bad_sig = try std.mem.replaceOwned(u8, a, base, sig_rsa_sha256, "urn:zzz");
+    defer a.free(bad_sig);
+    try expectDocError(a, bad_sig, error.UnsupportedAlgorithm);
+    const bad_dig = try std.mem.replaceOwned(u8, a, base, "<ds:DigestMethod Algorithm=\"" ++ dig_sha256, "<ds:DigestMethod Algorithm=\"urn:zzz");
+    defer a.free(bad_dig);
+    try expectDocError(a, bad_dig, error.UnsupportedAlgorithm);
+}
+
+test "verify: a non-Transform child of ds:Transforms is skipped, not read as a transform" {
+    const a = testing.allocator;
+    const base = try buildDoc(a, .{});
+    defer a.free(base);
+    const doc = try std.mem.replaceOwned(u8, a, base, "</ds:Transforms>", "<ds:Other Algorithm=\"urn:zzz\"/></ds:Transforms>");
+    defer a.free(doc);
+    var r = try verifyDoc(a, doc, false, 64 << 20);
+    defer r.deinit(a);
+    // The reference digest is unaffected; SignedInfo changed, so the signature is not.
+    try testing.expect(r.references[0].digest_valid);
+    try testing.expect(!r.valid);
+}
+
+test "verify: a digest that differs in its first byte only is invalid (every byte is compared)" {
+    const a = testing.allocator;
+    const base = try buildDoc(a, .{});
+    defer a.free(base);
+    const needle = "<ds:DigestValue>";
+    const at = std.mem.find(u8, base, needle).? + needle.len;
+    const doc = try a.dupe(u8, base);
+    defer a.free(doc);
+    doc[at] = if (doc[at] == 'A') 'B' else 'A';
+    var r = try verifyDoc(a, doc, false, 64 << 20);
+    defer r.deinit(a);
+    try testing.expect(!r.references[0].digest_valid);
+}
+
+test "verify: ds:Signature in another namespace is not a signature" {
+    const a = testing.allocator;
+    const base = try buildDoc(a, .{});
+    defer a.free(base);
+    const doc = try std.mem.replaceOwned(u8, a, base, "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"", "xmlns:ds=\"urn:other\"");
+    defer a.free(doc);
+    var parsed = try xml.parse(a, doc, .{});
+    defer parsed.deinit();
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(error.MalformedSignature, verify(a, &parsed, firstLocal(parsed.root, "Signature").?, .{ .key = .{ .rsa = pk } }));
+}
+
+test "verify: an id_attr reference that names no element is UriNotResolved" {
+    const a = testing.allocator;
+    const base = try buildDoc(a, .{});
+    defer a.free(base);
+    const doc = try std.mem.replaceOwned(u8, a, base, "<ds:Reference URI=\"\"", "<ds:Reference URI=\"#missing\"");
+    defer a.free(doc);
+    var parsed = try xml.parse(a, doc, .{});
+    defer parsed.deinit();
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(error.UriNotResolved, verify(a, &parsed, childByName(parsed.root, "Signature").?, .{ .key = .{ .rsa = pk }, .id_attr = "ID" }));
+}
+
+fn withSignatureValue(a: std.mem.Allocator, doc: []const u8, b64: []const u8) ![]u8 {
+    const open = "<ds:SignatureValue>";
+    const i = std.mem.find(u8, doc, open).? + open.len;
+    const j = std.mem.find(u8, doc, "</ds:SignatureValue>").?;
+    return std.mem.concat(a, u8, &.{ doc[0..i], b64, doc[j..] });
+}
+
+test "verify: an ECDSA SignatureValue shorter than r||s is a mismatch for P-384 and P-521" {
+    const a = testing.allocator;
+    {
+        const E = p384.EcdsaP384Sha384;
+        const kp = try E.KeyPair.generateDeterministic(@splat(0x31));
+        const doc = try buildSignedWith(a, sig_ecdsa_sha384, "", EcSigner(E){ .kp = kp });
+        defer a.free(doc);
+        const short = try withSignatureValue(a, doc, "AAAA");
+        defer a.free(short);
+        const pub_u = kp.public_key.toUncompressedSec1();
+        try testing.expect(!try verifyBuilt(a, short, .{ .ecdsa_p384_sec1 = &pub_u }));
+    }
+    {
+        const E = p521.EcdsaP521Sha512;
+        const kp = try E.KeyPair.generateDeterministic(@splat(0x41));
+        const doc = try buildSignedWith(a, sig_ecdsa_sha512, "", EcSigner(E){ .kp = kp });
+        defer a.free(doc);
+        const short = try withSignatureValue(a, doc, "AAAA");
+        defer a.free(short);
+        const pub_u = kp.public_key.toUncompressedSec1();
+        try testing.expect(!try verifyBuilt(a, short, .{ .ecdsa_p521_sec1 = &pub_u }));
+    }
+}
+
+fn PssSignerOf(comptime H: type, comptime salt: usize) type {
+    return struct {
+        sk: *const rsa.SecretKey,
+        fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+            var prng = std.Random.DefaultPrng.init(7);
+            return rsa.signPss(self.sk, H, prng.random(), msg, salt, buf) catch unreachable;
+        }
+    };
+}
+
+test "verify: RSA-PSS with SHA-384 and SHA-512 round-trips (salt length = digest length)" {
+    const a = testing.allocator;
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
+    defer sk.deinit();
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    const d384 = try buildSignedWith(a, sig_rsa_pss_sha384, "", PssSignerOf(std.crypto.hash.sha2.Sha384, 48){ .sk = &sk });
+    defer a.free(d384);
+    try testing.expect(try verifyBuilt(a, d384, .{ .rsa = pk }));
+    const d512 = try buildSignedWith(a, sig_rsa_pss_sha512, "", PssSignerOf(std.crypto.hash.sha2.Sha512, 64){ .sk = &sk });
+    defer a.free(d512);
+    try testing.expect(try verifyBuilt(a, d512, .{ .rsa = pk }));
+}

@@ -392,6 +392,12 @@ test "sanity: receive-side ordering — pn_len read from unmasked first byte (Ap
     try testing.expectEqual(@as(usize, 3), (first & 0x03) + 1);
 }
 
+test "computeMaskAes: a 32-byte key is AES-256-ECB (value from OpenSSL)" {
+    // The A.5 hp key and sample under AES-256-ECB, first five bytes: computed
+    // with OpenSSL (python `cryptography`), not by this module's code path.
+    try testing.expectEqualSlices(u8, &hexTo(5, "e58ceeaf9d"), &computeMaskAes(&rfc_a5_hp, rfc_a5_sample));
+}
+
 test "computeMaskAes: App. A.2 client + A.3 server" {
     try testing.expectEqualSlices(u8, &rfc_client_mask, &computeMaskAes(&rfc_client_hp, rfc_client_sample));
     try testing.expectEqualSlices(u8, &rfc_server_mask, &computeMaskAes(&rfc_server_hp, rfc_server_sample));

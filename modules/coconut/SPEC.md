@@ -6,7 +6,7 @@
 
 **Scope:** mvp — asonnino/coconut, public-attribute issuance only (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (30/36, 6 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-20 (143/145, 2 eq) · src 8a51c4f53b53c609
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`coconut-protocol` at its scale, 200), COCONUT_FUZZ) · ct 2026-09-09 (ctgrind)
 
@@ -210,6 +210,17 @@ Run: `scripts/modtest coconut` (heavy: pairing arithmetic; ReleaseSafe is the us
 - **Dead-stack probe:** `src/stackprobe_test.zig` for `keygen`, the key-share derivations, `psSignWithSecret`,
   `signPartial` and `proveCredential` (the `Entropy.io` arm is not probed; it differs from the seeded arm only
   in `Fr.random`, swept in `bls12_381`).
+- **Mutation:** whole module, 145 mutants over `credential.zig` (codecs, signing exponent, `psVerifyPlain`, every item of the
+  show-challenge transcript, `signPartial`, `aggregateCredential`, `proveCredential`, `verifyCredential` guards and equations),
+  `keys.zig` (threshold checks, Shamir evaluation, key aggregation, deinit and polynomial wipes), `lagrange.zig` and
+  `params.zig`: 143 killed, 2 equivalent; the four heap wipes (`SecretKey`/`SecretKeyShare.deinit`, the keygen polynomials,
+  the prover's `m~`) are killed only by the ReleaseFast dead-stack probe (`stackprobe_test.zig`) and were run in a
+  ReleaseFast build. Stack burns (`burn.run`) are the probe's and are not mutated. Equivalent: the `G2` subgroup check on
+  `κ` in `verifyCredential` (`inG2`, two mutants): the pairing alone already rejects a `κ` with an order-13 cofactor
+  component even when the Sigma protocol accepts it (premise asserted in the "kappa outside G2" test), so only a `GT`
+  collision could get one through. The transcript is pinned byte for byte (`showChallenge` over fixed inputs) because
+  prover and verifier share the function and no round trip sees a dropped item; the attribute-generator and common-base
+  derivations are pinned the same way (no external vector covers them).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 

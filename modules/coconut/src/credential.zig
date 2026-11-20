@@ -1048,6 +1048,225 @@ test "verifyCredential refusals: extra disclosed values, a swapped mask, sigma1'
     }
 }
 
+test "showChallenge: the transcript layout is pinned byte for byte" {
+    // Prover and verifier call the same function, so an item dropped from (or
+    // added to) the hash is invisible to every round-trip test. A digest over
+    // fixed inputs is the only thing that sees it; the layout is versioned by
+    // `show_challenge_dst`, so a deliberate change re-pins this value.
+    const allocator = std.testing.allocator;
+    const p = try Parameters.generate(allocator, 3);
+    defer p.deinit(allocator);
+    const g1j = g1.Jacobian.fromAffine(g1.Affine.generator);
+    const g2j = g2.Jacobian.fromAffine(g2.Affine.generator);
+    var betas = [3]g2.Affine{
+        g2j.scalarMul(frOf(3)).toAffine(),
+        g2j.scalarMul(frOf(5)).toAffine(),
+        g2j.scalarMul(frOf(7)).toAffine(),
+    };
+    const vk = VerificationKey{ .alpha = g2j.scalarMul(frOf(2)).toAffine(), .betas = &betas };
+    const mask = [3]bool{ true, false, true };
+    const values = [2]Fr{ frOf(11), frOf(12) };
+    const c = showChallenge(
+        p,
+        vk,
+        g1j.scalarMul(frOf(13)).toAffine(),
+        g1j.scalarMul(frOf(17)).toAffine(),
+        g2j.scalarMul(frOf(19)).toAffine(),
+        g1j.scalarMul(frOf(23)).toAffine(),
+        g2j.scalarMul(frOf(29)).toAffine(),
+        g1j.scalarMul(frOf(31)).toAffine(),
+        &mask,
+        &values,
+        "ctx",
+    );
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "02fc69b597fbb074bca91934ff0b556bf6b18690392f1deda5d499e378cb89a3");
+    try std.testing.expectEqualSlices(u8, &want, &c.toBytes());
+}
+
+test "ShowProof.fromBytes refuses a non-canonical challenge, response_r and hidden response" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.init(allocator, 0xA007);
+    defer f.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(0xA107);
+    const disclosed = [_]bool{ true, false, false };
+    const proof = try proveCredentialSeededForTest(allocator, prng.random(), f.p, f.kk.master_vk, f.cred, &f.attrs, &disclosed, "");
+    defer proof.deinit(allocator);
+    const wire = try proof.toBytes(allocator);
+    defer allocator.free(wire);
+    const bad = try allocator.dupe(u8, wire);
+    defer allocator.free(bad);
+    // q:u16 | mask[3] | sigma1 | sigma2 | kappa | nu | challenge | response_r | responses_m
+    const challenge_off = 2 + 3 + 2 * g1.compressed_bytes + g2.compressed_bytes + g1.compressed_bytes;
+    for ([_]usize{ challenge_off, challenge_off + 32, challenge_off + 64, challenge_off + 96 }) |off| {
+        @memcpy(bad, wire);
+        @memset(bad[off..][0..32], 0xff); // >= r
+        try std.testing.expectError(error.InvalidEncoding, ShowProof.fromBytes(allocator, bad));
+    }
+}
+
+test "proveCredential and verifyCredential refuse inconsistent arguments with the documented errors" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.init(allocator, 0xA008);
+    defer f.deinit(allocator);
+    const vk = f.kk.master_vk;
+    const short_vk = VerificationKey{ .alpha = vk.alpha, .betas = vk.betas[0..2] };
+    var prng = std.Random.DefaultPrng.init(0xA108);
+    const rnd = prng.random();
+    const disclosed = [_]bool{ true, false, false };
+
+    try std.testing.expectError(error.MismatchedAttributes, proveCredentialSeededForTest(allocator, rnd, f.p, vk, f.cred, f.attrs[0..2], &disclosed, ""));
+    try std.testing.expectError(error.MismatchedAttributes, proveCredentialSeededForTest(allocator, rnd, f.p, short_vk, f.cred, &f.attrs, &disclosed, ""));
+    try std.testing.expectError(error.InvalidDisclosure, proveCredentialSeededForTest(allocator, rnd, f.p, vk, f.cred, &f.attrs, disclosed[0..2], ""));
+
+    const proof = try proveCredentialSeededForTest(allocator, rnd, f.p, vk, f.cred, &f.attrs, &disclosed, "");
+    defer proof.deinit(allocator);
+    const values = [_]Fr{f.attrs[0]};
+    try std.testing.expect(try verifyCredential(allocator, f.p, vk, proof, &disclosed, &values, ""));
+
+    try std.testing.expectError(error.MismatchedAttributes, verifyCredential(allocator, f.p, short_vk, proof, &disclosed, &values, ""));
+    // The proof's own mask is not of length q (the verifier's is).
+    var short_mask = proof;
+    short_mask.disclosed = proof.disclosed[0..2];
+    try std.testing.expectError(error.InvalidDisclosure, verifyCredential(allocator, f.p, vk, short_mask, &disclosed, &values, ""));
+    // One response too many for the verifier's mask (q - revealed = 2).
+    var long_resp = proof;
+    var extra = [_]Fr{ proof.responses_m[0], proof.responses_m[1], Fr.one };
+    long_resp.responses_m = &extra;
+    try std.testing.expectError(error.InvalidDisclosure, verifyCredential(allocator, f.p, vk, long_resp, &disclosed, &values, ""));
+}
+
+test "aggregateCredential refuses partials whose bases differ only in x or only in the infinity flag" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.init(allocator, 0xA009);
+    defer f.deinit(allocator);
+    const a = try signPartial(&f.kk.sk_shares[0], f.cred.h, &f.attrs);
+    const b = try signPartial(&f.kk.sk_shares[1], f.cred.h, &f.attrs);
+    _ = try aggregateCredential(allocator, &.{ a, b }, 2);
+    var bx = b;
+    bx.h.x = bx.h.x.add(bls.Fp.one);
+    try std.testing.expectError(error.InconsistentBase, aggregateCredential(allocator, &.{ a, bx }, 2));
+    var binf = b;
+    binf.h.infinity = true;
+    try std.testing.expectError(error.InconsistentBase, aggregateCredential(allocator, &.{ a, binf }, 2));
+}
+
+/// An honest Sigma protocol over a real credential `(h, s)` for the claim
+/// "attribute 0 is disclosed, 1 and 2 are hidden", with the caller's
+/// perturbed `sigma2` / `kappa` / `nu`. Returns the proof; `resp` is the
+/// caller's storage for the responses, `mask` for the mask.
+fn forgeShow(
+    f: *const Fixture,
+    sigma2: g1.Affine,
+    kappa: g2.Affine,
+    nu: g1.Affine,
+    r: Fr,
+    r_t: Fr,
+    m_t: [2]Fr,
+    resp: *[2]Fr,
+    mask: *[3]bool,
+) ShowProof {
+    const vk = f.kk.master_vk;
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    const disclosed = [3]bool{ true, false, false };
+    const aw = g2gen.scalarMul(r_t).add(g2.Jacobian.fromAffine(vk.betas[1]).scalarMul(m_t[0])).add(g2.Jacobian.fromAffine(vk.betas[2]).scalarMul(m_t[1])).toAffine();
+    const bw = g1.Jacobian.fromAffine(f.cred.h).scalarMul(r_t).toAffine();
+    const c = showChallenge(f.p, vk, f.cred.h, sigma2, kappa, nu, aw, bw, &disclosed, &.{f.attrs[0]}, "");
+    resp.* = .{ m_t[0].add(c.mul(f.attrs[1])), m_t[1].add(c.mul(f.attrs[2])) };
+    mask.* = disclosed;
+    return .{ .sigma1 = f.cred.h, .sigma2 = sigma2, .kappa = kappa, .nu = nu, .challenge = c, .response_r = r_t.add(c.mul(r)), .responses_m = resp, .disclosed = mask };
+}
+
+test "verifyCredential refuses a sigma2 outside G1 (the pairing cannot see it)" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.init(allocator, 0xA00A);
+    defer f.deinit(allocator);
+    const vk = f.kk.master_vk;
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    const r = frOf(7);
+    const kappa = g2.Jacobian.fromAffine(kappaPlain(vk, &f.attrs)).add(g2gen.scalarMul(r)).toAffine();
+    const nu = g1.Jacobian.fromAffine(f.cred.h).scalarMul(r).toAffine();
+    const disclosed = [_]bool{ true, false, false };
+    var resp: [2]Fr = undefined;
+    var mask: [3]bool = undefined;
+
+    // Control: the honest forgery harness accepts the genuine sigma2.
+    const ok = forgeShow(&f, f.cred.s, kappa, nu, r, frOf(41), .{ frOf(42), frOf(43) }, &resp, &mask);
+    try std.testing.expect(try verifyCredential(allocator, f.p, vk, ok, &disclosed, &.{f.attrs[0]}, ""));
+
+    // sigma2' = s + T, T of order 3: the prover hashes whatever it sends, so
+    // the Sigma protocol passes, and the pairing is blind to T.
+    const bad_s2 = g1.Jacobian.fromAffine(f.cred.s).add(g1.Jacobian.fromAffine(order3Point())).toAffine();
+    const bad = forgeShow(&f, bad_s2, kappa, nu, r, frOf(41), .{ frOf(42), frOf(43) }, &resp, &mask);
+    const s2nu = g1.Jacobian.fromAffine(bad_s2).add(g1.Jacobian.fromAffine(nu));
+    try std.testing.expect(bls.pairing.pairingCheck(&.{
+        .{ .p = bad.sigma1, .q = bad.kappa },
+        .{ .p = s2nu.negate().toAffine(), .q = g2.Affine.generator },
+    }));
+    try std.testing.expect(!try verifyCredential(allocator, f.p, vk, bad, &disclosed, &.{f.attrs[0]}, ""));
+}
+
+/// `c mod 13` of the canonical big-endian integer.
+fn frMod13(c: Fr) u32 {
+    var acc: u32 = 0;
+    for (c.toBytes()) |b| acc = (acc * 256 + b) % 13;
+    return acc;
+}
+
+test "verifyCredential refuses a kappa outside G2 (order-13 component)" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.init(allocator, 0xA00B);
+    defer f.deinit(allocator);
+    const vk = f.kk.master_vk;
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    // [r * h2 / 13^2] Q for a twist point Q outside G2 lies in the 13-primary part
+    // (13^2 exactly divides the cofactor h2); one more [13] brings an order-169 point to 13.
+    var k_be: [96]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&k_be, "0004005449cda731a7136c440a0c65b728ba1c1fa6b6708356f3b9bdc84396cab33907d71557a7d33677f5d45f7cedb8cfdac10ff1fc5b48d6461e907737d78e96568f2d18c750b4b3ca5c33c3fd8ff8a70629888281914529f4e3380941cfdd");
+    var t13: g2.Jacobian = undefined;
+    var x: u8 = 1;
+    while (true) : (x += 1) {
+        var enc = @as([g2.compressed_bytes]u8, @splat(0));
+        enc[0] = 0x80;
+        enc[g1.compressed_bytes - 1] = 1; // c1 = 1
+        enc[g2.compressed_bytes - 1] = x; // c0 = x
+        const q = g2.fromBytesCompressedUnchecked(enc) catch continue;
+        t13 = g2.Jacobian.fromAffine(q).scalarMulBytes(&k_be);
+        if (t13.isIdentity()) continue;
+        if (!t13.scalarMulBytes(&[_]u8{13}).isIdentity()) t13 = t13.scalarMulBytes(&[_]u8{13});
+        break;
+    }
+    try std.testing.expect(t13.isOnCurve() and !t13.subgroupCheck());
+    try std.testing.expect(t13.scalarMulBytes(&[_]u8{13}).isIdentity());
+
+    const r = frOf(7);
+    const kappa_real = g2.Jacobian.fromAffine(kappaPlain(vk, &f.attrs)).add(g2gen.scalarMul(r));
+    const kappa = kappa_real.add(t13).toAffine();
+    const nu = g1.Jacobian.fromAffine(f.cred.h).scalarMul(r).toAffine();
+    const disclosed = [_]bool{ true, false, false };
+    var resp: [2]Fr = undefined;
+    var mask: [3]bool = undefined;
+    // Recomputed Aw' = Aw - [c] T13, equal to Aw whenever c = 0 (mod 13):
+    // search the prover's nonces for such a challenge.
+    var seed: u64 = 1;
+    while (true) : (seed += 1) {
+        const proof = forgeShow(&f, f.cred.s, kappa, nu, r, frOf(1000 + seed), .{ frOf(2000 + seed), frOf(3000 + seed) }, &resp, &mask);
+        if (frMod13(proof.challenge) != 0) continue;
+        // Premise 1: the Sigma protocol alone accepts (the torsion cancels).
+        try std.testing.expect(t13.scalarMul(proof.challenge).isIdentity());
+        // Premise 2, why the answer is "refused" with or without verify's own
+        // subgroup check: the pairing is NOT blind to this torsion (its Miller
+        // loop is not bilinear off G2), so the check is defence in depth.
+        const s2nu = g1.Jacobian.fromAffine(proof.sigma2).add(g1.Jacobian.fromAffine(proof.nu));
+        try std.testing.expect(!bls.pairing.pairingCheck(&.{
+            .{ .p = proof.sigma1, .q = proof.kappa },
+            .{ .p = s2nu.negate().toAffine(), .q = g2.Affine.generator },
+        }));
+        try std.testing.expect(!try verifyCredential(allocator, f.p, vk, proof, &disclosed, &.{f.attrs[0]}, ""));
+        break;
+    }
+}
+
 test "Credential / PartialCredential codec round-trips" {
     const allocator = std.testing.allocator;
     const p = try Parameters.generate(allocator, 2);

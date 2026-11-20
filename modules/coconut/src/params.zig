@@ -120,6 +120,23 @@ test "params: commonBase is deterministic + attribute-sensitive; rejects q=0" {
     try std.testing.expectError(error.NoAttributes, Parameters.generate(allocator, 0));
 }
 
+test "params: attribute generators and the common base are pinned (the derivation is part of the wire)" {
+    // No external vector covers either derivation (SPEC Anchoring), so a changed
+    // DST, tag or hashed encoding is a silent incompatibility with every
+    // credential issued before it: pin the bytes.
+    const allocator = std.testing.allocator;
+    const p = try Parameters.generate(allocator, 2);
+    defer p.deinit(allocator);
+    var want: [48]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "a101efa9fbf4317ac3a5012851c9607fe2cddf986b51a4bfda072dacb95b77bc9da624dd32de2e395bcafd3457debd3b");
+    try std.testing.expectEqualSlices(u8, &want, &g1.toBytesCompressed(p.hs[0]));
+    _ = try std.fmt.hexToBytes(&want, "89f8626da930d1bd5729d0945abee5dbaeba1c485f3bd8b8099a62bc4e00ad89fba7e9d83692dded5536c9a32049250a");
+    try std.testing.expectEqualSlices(u8, &want, &g1.toBytesCompressed(p.hs[1]));
+    const attrs = [_]Fr{ frOf(11), frOf(22) };
+    _ = try std.fmt.hexToBytes(&want, "a6123e26057a17b979fbd3aade20b89565f3771988bb985ec166d6a9a96e81e84305dd5233fab3f5e73fba88c8618240");
+    try std.testing.expectEqualSlices(u8, &want, &g1.toBytesCompressed(p.commonBase(&attrs)));
+}
+
 fn frOf(v: u64) Fr {
     var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], v, .big);

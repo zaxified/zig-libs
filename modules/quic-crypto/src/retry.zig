@@ -123,6 +123,19 @@ test "RFC 9001 App. A.4: v1 Retry tag is recomputed byte-exact" {
     try testing.expectEqualSlices(u8, &hexTo(16, "04a265ba2eff4d829058fb3f0f2496ba"), &tag);
 }
 
+test "verifyRetryTag: a tag-only packet fails integrity, a shorter one is too short" {
+    const tag_only = rfc9001_a4_retry[rfc9001_a4_retry.len - tag_length ..];
+    try testing.expectError(error.IntegrityFailed, verifyRetryTag(.v1, &rfc_odcid, tag_only));
+    try testing.expectError(error.PacketTooShort, verifyRetryTag(.v1, &rfc_odcid, tag_only[0 .. tag_length - 1]));
+}
+
+test "computeRetryTag: 255 octets is the longest ODCID the length byte can carry" {
+    const longest: [255]u8 = @splat(0xab);
+    _ = try computeRetryTag(.v1, &longest, "retry");
+    const one_more: [256]u8 = @splat(0xab);
+    try testing.expectError(error.PacketTooLong, computeRetryTag(.v1, &one_more, "retry"));
+}
+
 test "RFC 9001 App. A.4: the published v1 Retry packet verifies" {
     try verifyRetryTag(.v1, &rfc_odcid, &rfc9001_a4_retry);
 }
