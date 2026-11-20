@@ -52,55 +52,24 @@ and committer-leaf `parent_hash` byte-exact, and is then opened by every one
 of that vector's recorded members — see `SPEC.md`'s "Part 8" section, which
 states per test what is anchored and what is a round trip.
 
-**Status: Part 1 COMPLETE, entirely Sonnet-tier. Part 2 COMPLETE** — the
-data/codec/tree-hash/tree-editing pieces are Sonnet-tier (mechanical
-composition + exact conformance to the official RFC 9420 interop test
-vectors); the five Fable-tier tree-algorithm cores are implemented and
-KAT-pinned (all 14 trees' resolutions, 275 single-byte parent-hash tamper
-rejections, 62 UpdatePath processings across 328 receiver views, and 62
-merges reproducing `tree_hash_after`) behind `gate.treekem_core_implemented`
-(now `true`). **Part 4 COMPLETE** (Sonnet-tier) — including §8.3's
-external initialization, which Part 7 added. **Part 5 COMPLETE**
-(Sonnet-tier) — and it closed §8.2, the other gap Part 4 had left open.
-**Part 6 COMPLETE for the Welcome path** (Sonnet-tier). **Part 7 COMPLETE
-for the FOLLOWER** (Sonnet-tier) — and it is the first part of this arc
-whose vectors did NOT match on the first run: replaying recorded sessions
-found three real defects in Parts 1/2/4 (a fixed 512-byte label scratch
-that overflowed for any realistically sized group, an over-constrained PSK
-width that rejected legal 14-byte input, and an `unmerged_leaves` insert
-that did not keep §7.1's required sort order) plus one specification
-misreading, RFC 9420 §7.5's rule that members added by the same Commit are
-excluded from the `UpdatePath` resolutions — which Part 8 then found had
-been applied one step too far, to §4.1.2's filtered direct path as well.
-See `SPEC.md`'s "Part 7".
-**Part 8 COMPLETE for regular Commits** (Sonnet-tier) — and building the
-SEND half found three problems on the RECEIVE side that 200 replayed
-Commits could not reach, because a passive client never generates anything:
-a §7.5 MISREADING Part 7 had introduced (applying the same-Commit-Add
-exclusion to §4.1.2's filtered direct path and not only to the resolution,
-which produces trees that fail §7.9.2's parent-hash validity), a joiner's
-path-secret chain that consumed a derivation step at nodes the committer had
-filtered out, and a member with no way to adopt the private key of an Update
-it had published itself. Every upstream vector passes under either reading
-of §7.5, so only creating Commits could expose it. See `SPEC.md`'s
-"Part 8".
-Part 9 then added §12.4.3.2's external Commits, in both directions. Part 3
-(the rest of §7.3/§10.1 VALIDATION + Credential) and §11.2/§11.3
-(reinit/branch) remain; see `SPEC.md`'s "Arc breakdown".
+**Status.** Parts 1, 2 and 4 to 9 are built; there is no Part 3 (its scope,
+the §7.3/§10.1 admission validation and X.509 credentials, is open). Every
+upstream interop vector the module drives is byte-exact, for each supported
+suite; `SPEC.md`'s "Verification" says what is anchored and what is a round trip.
 What this module can do today: produce and consume real MLS messages other
 implementations accept byte-for-byte, CREATE a group, JOIN one from a
-`Welcome`, FOLLOW it through Commits — validated against recorded sessions
-from another implementation, one of them 200 Commits long — and now SPEAK:
-create proposals, create Commits with a full `UpdatePath`, and produce the
-`Welcome` and `GroupInfo` that go with them. A two-way client is complete.
-Both ways INTO a group are built: by invitation (§12.4.3.1's `Welcome`) and
-by §12.4.3.2's external Commit, which needs nobody already inside to be
-online.
-What it cannot: send or accept `PrivateMessage` handshakes, follow through
-on a `ReInit` (§11.2) or branch (§11.3), or apply the §10.1/§7.3
-admission rules that need a clock, a credential authority or an extension
-registry — the two §7.3 rules that need only the leaf and the tree ARE
-applied, in both directions.
+`Welcome` or by an external Commit (§12.4.3.2, which needs nobody already inside
+to be online), FOLLOW it through Commits — validated against recorded sessions
+from another implementation, one of them 200 Commits long — and SPEAK: create
+proposals, create Commits with a full `UpdatePath`, and produce the `Welcome`
+and `GroupInfo` that go with them. The two §7.3 rules that need only the leaf and
+the tree are applied, in both directions.
+
+**What it cannot** (details in `SPEC.md`'s "What is deliberately not done" and
+"Backlog / deferred"): send or accept `PrivateMessage` handshakes, encrypt or
+decrypt application data per group epoch, follow through on a `ReInit` (§11.2)
+or branch (§11.3), or apply the §10.1/§7.3 admission rules that need a clock, a
+credential authority or an extension registry.
 
 | File | Provides |
 |---|---|
@@ -138,10 +107,19 @@ applied, in both directions.
   does not specify a transport, so owning one here would be an invention).
   **Concurrency:** reentrant — every type is a plain caller-owned value.
 - **Deps:** `hpke` (the sibling module supplies every suite's DHKEM and
-  HPKE machinery via `sealBase`/`openBase`), `aesgcm`, and `p256`/`p384`/
-  `p521` for the ECDSA suites' signatures; MLS's own `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a
-  SEPARATE wire encoding from HPKE's own labeling, see `crypto.zig`'s
-  module doc comment).
+  HPKE machinery via `sealBase`/`openBase`/`setupBaseS`/`setupBaseR`, and the
+  ChaCha20-Poly1305 AEAD of suite `0x0003`), `aesgcm`, and `p256`/`p384`/
+  `p521` for the ECDSA suites' signatures. MLS's own
+  `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a SEPARATE wire encoding from
+  HPKE's own labeling, see `crypto.zig`'s module doc comment.
+
+## Not provided
+
+No transport, no `PrivateMessage` handshakes and no per-epoch application-message
+send/receive on a `Group`, no ReInit or branch, no credential authority, no
+suite negotiation inside a group (the suite is a compile-time parameter). The
+reasons are in `SPEC.md`'s "What is deliberately not done"; what is planned is
+in its "Backlog / deferred".
 
 ## Import
 
@@ -257,12 +235,13 @@ var up = try treekem.UpdatePath.decode(allocator, &r2);
 defer up.deinit(allocator);
 
 // receiver derives commit_secret + path secrets from the UpdatePath
-const processed = try treekem.processUpdatePath(S, allocator, &rt, receiver, sender_index, up, group_context);
+// (the last argument is §7.5's excluded set: leaf indices added by the same Commit)
+const processed = try treekem.processUpdatePath(S, allocator, &rt, receiver, sender_index, up, group_context, &.{});
 // commit_secret == path_secret[n+1] (RFC §12.4.2); byte-exact vs treekem.json
 
 // every member merges the public tree state (blank direct path, adopt keys,
 // recompute parent hashes, enforce the committer leaf's parent-hash validity)
-try treekem.applyUpdatePath(arena_allocator, &rt, sender_index, up);
+try treekem.applyUpdatePath(S, arena_allocator, &rt, sender_index, up);
 ```
 
 ## API surface (Part 4 — key schedule + secret tree)
@@ -566,6 +545,12 @@ need a clock, a credential authority or an extension registry (Part 3) — the
 two that need only the leaf and the tree are applied, see
 `mls.GroupPolicy`.
 
+**Memory:** a `Group` keeps an arena per adopted Commit until `deinit` (about
+5 KB per epoch measured in an eight-member group), so a long-lived group's
+retained memory grows with its epoch count; a refused Commit keeps nothing.
+
+
+
 ## API surface (Part 8 — speaking)
 
 The sender half lives on the same `Group(S)`, because a committer has to
@@ -794,7 +779,9 @@ to differ. Beyond that, creation is round-trip tested against this module's
 own (externally anchored) receive path — including Commits created on group
 states restored from the `passive-client-*` sessions, the 200-Commit one
 included. `SPEC.md`'s "Part 8" states which is which per test.
-Green in Debug and ReleaseFast.
+Every official vector file the module drives for suite `0x0001` runs once per
+supported suite (`tree-operations.json` and `passive-client-random.json` exist
+upstream for `0x0001` only). Green in Debug and ReleaseFast.
 
 ## Provenance
 

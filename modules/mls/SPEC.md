@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src 1c40c20aa02a09bc
 
-Audit detail: the 2026-11-17 mutation run is a delta over the cipher-suite work (11 mutants, 11 killed; the signature/public-key codecs, `hpkeSuiteId`, the NIST private-key refusals), added to the 2026-10-06 whole-module run (40/41, 1 eq). See "Cipher suites 0x0002/0x0003/0x0005/0x0007".
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
 **Performance:** not measured
 
@@ -35,33 +33,37 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## What this is, in one paragraph
 
-RFC 9420 Messaging Layer Security: a scalable-group-messaging protocol
-built around TreeKEM (a ratchet tree of HPKE keypairs, one per group
-member, that lets the whole group agree on a shared epoch secret in
-O(log n) messages per membership change instead of Signal-style pairwise
-sessions). This module (`mls`) is a multi-part arc; **Part 1** builds only
-the FOUNDATION every later part needs: the mandatory cipher suite
-(`suite.zig`), the seven labeled-crypto primitives RFC 9420 §5/§8/§9.1
-define (`crypto.zig`), the ratchet tree's pure integer math
-(`treemath.zig`), and the TLS-presentation-language wire codec
-(`codec.zig`). Part 1 deliberately builds NO group state, NO TreeKEM
-key-derivation-along-a-path, NO KeyPackage/Proposal/Commit message types,
-and NO key schedule — those are later parts (see "Arc breakdown" below).
-**Part 2** (TreeKEM), **Part 4** (key schedule + secret tree), **Part 5**
-(message framing, RFC 9420 §6 + §8.2) and **Part 6**'s Welcome path
-(§12.4.3/§12.4.3.1/§12.4.3.3) have since landed. With Part 5 the module can
-produce and consume real MLS messages that other implementations accept
-byte-for-byte: a Proposal, a Commit or application data, framed and signed
-as a `PublicMessage` or fully encrypted as a `PrivateMessage`. With Part 6
-it can also ENTER a group from a `Welcome`, arriving at the same epoch
-secrets and transcript hashes as every existing member. What is still
-missing before this is a CLIENT was Part 3's KeyPackage/LeafNode validation,
-the external-Commit join (§12.4.3.2/§8.3 — since built, see "Part 9"),
-and the group-state object that would tie an epoch's tree, transcript and
-key schedule together so the module could FOLLOW a group after joining
-(since built: Parts 7-8) — none of which is a wire format, all of which is
-policy and state machinery over what Parts 1-6 already compute. Part 3
-remains open (see "Arc breakdown").
+RFC 9420 Messaging Layer Security: a scalable group-messaging protocol built
+around TreeKEM (a ratchet tree of HPKE keypairs, one per member, so the whole
+group agrees on a shared epoch secret in O(log n) messages per membership
+change instead of Signal-style pairwise sessions). The module is a complete
+two-way client over caller-supplied bytes and keys and owns no transport: the
+labeled-crypto primitives, tree math and wire codec; TreeKEM; the key schedule
+and secret tree; message framing; joining by `Welcome`; and the group state
+machine, which creates a group, creates proposals and Commits with a full
+`UpdatePath`, produces `Welcome`s and `GroupInfo`s, processes Commits, and
+joins by `Welcome` or by an external Commit. It produces and consumes real MLS
+messages that other implementations accept byte for byte. What it does not do
+is listed under *What is deliberately not done* and *Backlog / deferred*.
+
+## Parts of the module
+
+The sections below are named by the part of the build that introduced each
+area; the numbers are labels, kept because the code and tests cite them. There
+is no Part 3: its scope (§7.3/§10.1 admission validation) is open, see
+*Backlog / deferred*.
+
+| Part | Area | Files | RFC 9420 | Upstream vectors |
+|---|---|---|---|---|
+| 1 | cipher suite, labeled crypto, tree math, codec | `suite.zig`, `crypto.zig`, `treemath.zig`, `codec.zig` | §2.1, §5, §8, App. C | `tree-math.json`, `crypto-basics.json` |
+| 2 | TreeKEM: ratchet tree, tree hash, tree edits, resolution, parent hash, UpdatePath | `tree.zig`, `treehash.zig`, `treekem.zig`, `wire_lists.zig` | §4.1, §7, §12.1.1-3 | `tree-validation.json`, `tree-operations.json`, `treekem.json` |
+| 4 | key schedule, PSKs, exporter, secret tree and ratchets | `keyschedule.zig`, `secrettree.zig` | §8, §9, §6.3.2 | `key-schedule.json`, `psk_secret.json`, `secret-tree.json` |
+| 5 | message framing, proposal/commit/KeyPackage wire formats, transcript hashes | `framing.zig`, `content.zig`, `keypackage.zig`, `transcript.zig` | §6, §8.2, §10, §12.1, §12.4 | `messages.json`, `message-protection.json`, `transcript-hashes.json` |
+| 6 | joining by Welcome | `welcome.zig` | §12.4.3, §12.4.3.1, §12.4.3.3 | `welcome.json` |
+| 7 | group state machine, receiving half; §8.3 external init | `group.zig`, `keyschedule.zig` | §12.2, §12.3, §12.4.2, §8.3 | `passive-client-*.json` |
+| 8 | creating Commits, Welcomes, KeyPackages | `group.zig`, `treekem.zig`, `keypackage.zig`, `tree.zig` | §7.4, §7.5, §10, §11, §12.1, §12.4.1 | `treekem.json` driven in the send direction |
+| 9 | external Commits, both directions | `group.zig`, `tree.zig` | §12.4.3.2 | none upstream |
+| suites | cipher suites 0x0002/0x0003/0x0005/0x0007 | `suite.zig` and every file above | §17.1 | every file above, per suite |
 
 ## Design & invariants
 
@@ -113,12 +115,7 @@ input as a whole, not incrementally), so they assemble their
 `KDFLabel`/`SignContent`/`EncryptContext` into a fixed 512-byte
 `label_scratch_len` stack buffer (matching `hpke.suite.labeledExpand`'s
 own 512-byte constant) and return `error.LabelTooLong` rather than
-silently truncating or panicking on overflow. Every label/context/content
-this Part or the KAT vectors use is a handful to a few dozen bytes, so
-512 is comfortable headroom; a LATER part deriving a secret from a
-multi-kilobyte `GroupContext` (with extensions) may need a larger bound
-or a caller-supplied scratch slice instead — tracked below in Backlog,
-not a gap for anything this Part actually exercises.
+silently truncating or panicking on overflow. Every label/context/content of the Part 1 primitives and the KAT vectors is a handful to a few dozen bytes, so 512 is comfortable headroom. Call sites whose argument has no realistic bound (a `GroupContext` with extensions, an `encrypted_group_info` carrying a ratchet tree, a `FramedContentTBS` for a Commit) use the exact-sized variants instead: `kdfLabelLen`/`ExpandWithLabelScratch`, `encryptContextLen`/`EncryptWithLabelScratch`/`DecryptWithLabelScratch`, `signContentLen`/`SignWithLabelAlloc`/`VerifyWithLabelAlloc` (`crypto.zig:144-155`, `279-301`, `344-370`). The fixed-buffer functions stay as the convenience for bounded callers.
 
 **`treemath.zig` returns `null`, never panics, where the RFC's own Python
 raises an exception.** RFC 9420 Appendix C's reference `left`/`right`
@@ -137,58 +134,23 @@ deeper-than-64 path for).
 **Ed25519 signing is deterministic (RFC 8032) — `SignWithLabel` calls
 `std.crypto.sign.Ed25519.KeyPair.sign(msg, null)` with `noise = null`,
 never hedged/randomized signing.** This is a stronger-than-required KAT
-property the vector format doesn't ask for explicitly (the task brief
-expected only a verify-round-trip, appropriate for a RANDOMIZED scheme
-like ECDSA) — because Ed25519 is deterministic, `kat_test.zig` re-signs
+property the vector format doesn't ask for explicitly (a verify-round-trip is all a RANDOMIZED scheme like ECDSA allows) — because Ed25519 is deterministic, `kat_test.zig` re-signs
 the vector's own `(priv, label, content)` and checks the produced
 signature is byte-IDENTICAL to the vector's published `signature` field,
 which is a strictly stronger check than "verifies successfully" (a buggy
 sign that happened to produce a different-but-still-valid signature would
 pass a verify-only check but fail this one).
 
-## Arc breakdown (Part 1 done; later parts, tier-tagged)
-
-Honest tiering per the task brief: this Part is **100% Sonnet** —
-mechanical composition (wire encoding, HKDF/Ed25519/HPKE calls exactly as
-specified, integer-arithmetic tree math ported from the RFC's own
-pseudocode) with an authoritative byte-exact conformance oracle (the
-official interop vectors) for every function. Nothing here required a
-novel security-property judgment call the way, say, TreeKEM's
-parent-hash validation logic does (see Part 2 below).
-
-| Part | Scope | Tier | RFC-vector components |
-|---|---|---|---|
-| **1 (this part)** | Cipher suite, labeled crypto, tree math, codec | **Sonnet** | `tree-math.json`, `crypto-basics.json` |
-| **2 — TreeKEM** | `LeafNode`/`ParentNode`/`Node`/`RatchetTree` + wire codec + tree-shape edits (§7.1/§7.2/§7.7/§12.1.1-3) + tree-hash (§7.8) — Sonnet, DONE. `resolution` (§4.1), `parentHash`+chain validation (§7.9), path-secret-derivation-and-UpdatePath (§7.4-§7.6) — **IMPLEMENTED + KAT-pinned 2026-07-16, Fable**. Whole part **COMPLETE**. | Split tier: the data/codec/tree-hash/tree-editing is mechanical (Sonnet, KAT'd byte-exact); the five cores are the genuinely hard piece the task brief flags — subtle recursive tree-validation logic with real security consequences if wrong (a forged parent-hash or a wrong resolution set can let a malicious member inject an unauthorized key into another member's derived path) — the "hardest TIER, not crypto-only" bar this repo's Fable pool applies, now pinned byte-exact | `tree-operations.json` (real), `tree-validation.json` (tree-hash/leaf-signature + resolution + parent-hash accept/tamper), `treekem.json` (`processUpdatePath` + `applyUpdatePath`) — all byte-exact, gate now `true`; see "Part 2 — TreeKEM" below |
-| **3 — LeafNode / KeyPackage / Credential VALIDATION** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) validation. NOTE: §10's WIRE FORMAT was taken by Part 5 (`keypackage.zig`) because §12.1.1's `Add` cannot be decoded without it; what remains for Part 3 is §10.1's and §7.3's admission RULES | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
-| **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** (§8.3 external init, left open here, was added later by Part 7); §8.2's transcript hashes were the other gap and Part 5 closed them (`transcript.zig`), and Part 6 added the joiner's entry point into the same chain (`deriveEpochFromJoiner`) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
-| **5 — Message framing** | ALL of §6 (`FramedContent`/`AuthenticatedContent`/§6.1 TBS+auth/§6.2 `PublicMessage`+`membership_tag`/§6.3 `PrivateMessage`+§6.3.1 content encryption+§6.3.2 sender data/`MLSMessage`), the §12.1 `Proposal` and §12.4 `Commit` WIRE FORMATS framing carries, the §10 `KeyPackage` wire format `Add` carries, and §8.2's transcript hashes — **DONE 2026-07-29**, whole part **COMPLETE**. Commit PROCESSING (§12.2/§12.3/§12.4.1/§12.4.2) is explicitly NOT here — see "Part 5" below for where that boundary falls and why | **Sonnet** — mechanical composition over Parts 1/2/4's primitives with an authoritative byte-exact oracle for every path. No new cryptography: every derivation it performs was already built and vector-pinned by an earlier part | `messages.json`, `message-protection.json`, `transcript-hashes.json` — all byte-exact; see "Part 5" below |
-| **6 — Joining a group (Welcome), then external Commit / reinit** | §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `Welcome`/`GroupSecrets`/`EncryptedGroupSecrets` + both encryption layers + the joiner's procedure, §12.4.3.3's `ratchet_tree`/`external_pub` extensions and the tree-hash binding, and §8's chain entered at `joiner_secret` — **DONE 2026-07-29**, the WELCOME path **COMPLETE**. §12.4.3.2 external Commits + §8.3 external init landed later, in Part 9; §11.2/§11.3 reinit/branch remain | **Sonnet** — no new cryptography at all: the group-info layer is a plain AEAD under a key `keyschedule.zig` already derived, and the per-member layer is `crypto.EncryptWithLabel` unchanged. The judgment calls were scope ones, not crypto ones | `welcome.json` + `messages.json`'s Part 6 fields — byte-exact; see "Part 6" below |
-| **7 — Group state machine** | `Group(S)`: the state a member carries between epochs, §12.2's proposal-list validation, §12.3's application order, §12.4.2's whole Commit-processing procedure, and §12.4.3.1's join run to completion (`fromWelcome`) — **DONE 2026-07-29**, COMPLETE for the FOLLOWER. Also §8.3 external init, which Part 6 listed as unbuilt. NOT here: Commit/proposal CREATION (no sender half of §7.5), `PrivateMessage` handshakes, §12.4.3.2 external Commits, §11.2/§11.3 reinit/branch | **Sonnet** — still no new cryptography, but the first part of this arc whose vectors did NOT match on the first run. Three coding defects in Parts 1/2/4 and one specification MISREADING surfaced here and nowhere else; see "Part 7" below | `passive-client-welcome.json`, `passive-client-handling-commit.json`, `passive-client-random.json` — whole recorded sessions replayed Commit by Commit against `epoch_authenticator`; see "Part 7" below |
-| **8 — Creating Commits** | The sender half of everything Part 7 could only receive: §11 group creation, §12.1 proposal creation, §7.4/§7.5's `UpdatePath` GENERATION (`treekem.stageUpdatePath`/`sealUpdatePath`), §12.4.1's Commit creation, §12.4.3.1's `Welcome` production, and §10's `KeyPackage` construction — **DONE 2026-07-29**, COMPLETE for REGULAR Commits. Also the two §7.3 rules that need only the leaf and the tree, applied in both directions. NOT here: §12.4.3.2 external Commits (the stated boundary — see "Part 8"), `PrivateMessage` handshakes, §11.2/§11.3, committer-chosen leaf content | **Sonnet** — no new cryptography; the mirror image of Part 7 over Parts 1-6's primitives. The judgement calls were about what can be ANCHORED when the output has three random inputs, and about which half of §7.3 belongs here. Building the send half found three RECEIVE-side problems that 200 replayed Commits could not reach — including a §7.5 misreading Part 7 introduced and no upstream vector can see | `treekem.json` driven in the SEND direction (a generation seeded from the vector's own `path_secret[0]` reproduces its node public keys, `commit_secret` and committer-leaf `parent_hash` byte-exact, then faces its recorded members); Commits created on states restored from `passive-client-handling-commit.json`/`passive-client-random.json`. See "Part 8" for what is anchored and what is a round trip |
-
-**Where TreeKEM/Fable lands, restated plainly:** it's Part 2, specifically
-the path-secret-derivation-along-the-copath + parent-hash-chain
-validation logic — NOT the crypto primitives (HPKE seal/open is already
-done, here, via `EncryptWithLabel`/`DecryptWithLabel`; HKDF derivation is
-already done, via `ExpandWithLabel`/`DeriveTreeSecret`) but the TREE
-ALGORITHM binding them together correctly under adversarial tree state
-(a malicious member's LeafNode, a stale/forked view of the tree, a
-resolution set computed over unmerged leaves). This matches the task
-brief's own expectation exactly.
-
-## Part 2 — TreeKEM (2026-07-16)
+## Part 2 — TreeKEM
 
 **Files:** `tree.zig` (`LeafNode`/`ParentNode`/`Node`/`RatchetTree`, wire
 codec, leaf-signature verification, `addLeaf`/`updateLeaf`/`removeLeaf`),
 `treehash.zig` (`treeHash`/`rootHash`), `treekem.zig` (`HPKECiphertext`/
-`UpdatePathNode`/`UpdatePath` wire structs, plus the five now-implemented
-cores `resolution`/`parentHash`/`validateParentHashes`/
-`processUpdatePath`/`applyUpdatePath`), `gate.zig`
-(`treekem_core_implemented = true`), `wire_lists.zig`
-(shared variable-length-vector encode/decode helpers, factored out of
-`tree.zig` so `treekem.zig`'s `UpdatePathNode`/`UpdatePath` reuse the
-same shape), `kat_treekem_test.zig` (the KAT harness).
+`UpdatePathNode`/`UpdatePath` wire structs and the TreeKEM cores below),
+`gate.zig` (`treekem_core_implemented = true`, the switch of the TreeKEM-core
+tests), `wire_lists.zig` (shared variable-length-vector encode/decode helpers,
+so `treekem.zig`'s `UpdatePathNode`/`UpdatePath` reuse the shape `tree.zig`
+uses), `kat_treekem_test.zig` (the KAT harness).
 
 **Design choice: allocator-owned, unlike Part 1.** `codec.zig`'s
 `Writer`/`Reader` are zero-allocation (Part 1's primitives are fixed-size
@@ -202,87 +164,43 @@ destination buffer by pure arithmetic — no scratch buffer, no growable
 writer — since every field bottoms out in an already-in-memory byte slice
 or fixed-width int (`wire_lists.zig`'s module doc comment).
 
-**`treeHash` (§7.8) implemented for real, not stubbed** — the task brief
-explicitly left this as a judgment call ("prefer implementing it, it's not
-the hard part"), and it is indeed mechanical recursive hashing over
-already-real `LeafNode`/`ParentNode` encodings, with no adversarial-tree-
-state judgment call the way VALIDATING a tree (`treekem.zig`'s stubs)
-needs. Byte-exact against all 14 suite-`0x0001` entries of
-`tree-validation.json`'s `tree_hashes` field, every node index (300+
-checks), ungated.
+**`treeHash` (§7.8)** is recursive hashing over the `LeafNode`/`ParentNode`
+encodings, byte-exact against the `tree_hashes` field of `tree-validation.json`
+for every node index.
 
-**Tree-shape editing (`addLeaf`/`updateLeaf`/`removeLeaf`, §7.7/
-§12.1.1-§12.1.3) implemented for real, not stubbed** — also a deliberate
-judgment call: applying an Add/Update/Remove PROPOSAL to a tree (find-or-
-extend a blank leaf; blank a direct path; truncate a now-empty right
-subtree) is mechanical index bookkeeping built on `treemath.zig`'s
-already-real `direct_path`, with no resolution/parent-hash ALGORITHM
-involved — distinct from the four Fable cores (which are specifically
-about which KEYS a path secret gets encrypted to and how a key's
-provenance is cryptographically proven, not about which array slots move
-where). Byte-exact against all 5 suite-`0x0001` entries of
-`tree-operations.json` (`tree_hash_before`/`tree_after` bytes/
-`tree_hash_after`, all three fields checked, ungated).
+**Tree-shape editing (`addLeaf`/`updateLeaf`/`removeLeaf`, §7.7/§12.1.1-§12.1.3)**
+is index bookkeeping built on `treemath.zig`'s `direct_path` (find-or-extend a
+blank leaf; blank a direct path; truncate a now-empty right subtree), with no
+resolution or parent-hash algorithm involved. It is byte-exact against
+`tree-operations.json` (resulting tree bytes and both tree hashes). The
+harness pulls the leaf out of the vector's proposal bytes with its own minimal
+parser (`kat_treekem_test.zig`'s `applyProposal`/`LocalProposalType`), see
+*Backlog / deferred*.
 
-One real bug this KAT caught during scaffolding: `removeLeaf`'s
-truncation loop originally sliced the tree's right subtree at
-`nodes[left_idx+1..]`, confusing the LEFT CHILD's array index
-(`treemath.left(root)` — the root of the left subtree, sitting in the
-MIDDLE of that subtree's own index span) with the left subtree's
-BOUNDARY (`2*left_idx+1` — see `tree.zig`'s `removeLeaf` doc comment for
-the derivation). `tree-operations.json`'s one `remove` vector whose
-truncation crosses more than one tree-size halving (16 leaves → 8 leaves)
-caught this immediately (`tree_hash_after` mismatched even though the
-byte-trimmed `tree_after` output happened to still match, since Part 1's
-`encode`'s OWN trailing-blank-trim independently arrived at the same
-final byte count) — exactly the kind of bug a byte-exact KAT is supposed
-to catch that a "does it look right" review would not.
+**`unmerged_leaves` is sorted and bounds-checked.** §7.1 requires the list to
+be sorted in increasing order, so `ParentNode.withAppendedUnmerged` inserts in
+sorted position (an Add that reuses a blank leaf to the LEFT of an existing
+unmerged leaf would break an append-only list silently, until a `resolution`
+hands a path secret to the wrong node or a tree hash diverges). On decode,
+`RatchetTree.validateUnmergedLeaves` (`tree.zig:633`, `652`) refuses an entry
+that is not a leaf index of the tree or does not strictly increase
+(`error.Malformed`). This is a memory-safety boundary: the wire type is a bare
+`u32`, `treekem.resolution` doubles it into a node index that callers
+subscript `nodes` with, so an unchecked entry is an attacker-chosen subscript
+reachable from a `Welcome` before any signature is checked; and the §7.9.2
+link criterion compares the list as a set against a resolution, so duplicates
+would change which trees are judged valid.
 
-**KAT sourcing.** `mlswg/mls-implementations`, same repo/license posture
-as Part 1's `NOTICE` entry documents (no explicit OSS license, public
-interop conformance DATA not copyrightable expression). Fetched
-2026-07-16 from `main` (repo HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`,
-same commit Part 1 cites — the repo hadn't moved). Per-file last-modified
-commits: `tree-validation.json` → `9ea691fee9464aaeee9eadf9757963f1be88f5dd`
-(2023-02-20), `tree-operations.json` → `89134d5de0222bd99598ba5849003d2e85e63116`
-(2025-11-30), `treekem.json` → `112c2d3960a558663280a1bbb18258766fea9d0d`
-(2023-03-01). **Filtered to cipher suite `0x0001` BEFORE embedding**
-(unlike Part 1's `crypto-basics.json`, embedded verbatim and filtered at
-test-time) — the unfiltered files are 1.3 MB/51 KB/1.97 MB (7 cipher
-suites); filtering to suite `0x0001` alone (this module's only wired
-suite) shrinks them to 115 KB/49 KB/164 KB (14/5/11 entries respectively)
-before `@embedFile`, avoiding a 3.4 MB `@embedFile` + `std.json` parse of
-mostly-irrelevant-suite data on every test run. Filtered with `jq -c
-'[.[] | select(.cipher_suite==1)]'`, entry ORDER within each file
-preserved from upstream.
+**KAT sourcing.** The vectors are `mlswg/mls-implementations`' interop files;
+the source commit, the redistribution terms and which files keep only the
+records of the wired suites are recorded in `NOTICE`. The suite-filtered files
+are filtered BEFORE embedding (the unfiltered `tree-validation.json`/
+`treekem.json` are megabytes of mostly-irrelevant-suite data that every test
+run would `@embedFile` and parse), in upstream order, records unmodified.
 
-**What's gated vs. real, and why:**
-
-- `tree-validation.json`: tree-hash (all node indices) and leaf-signature
-  verification (all 161 suite-`0x0001` leaves across the 14 trees) —
-  REAL, ungated, byte-exact/verify-exact. `resolution`/
-  `validateParentHashes` checks — GATED (need the Fable cores).
-- `tree-operations.json`: the WHOLE vector (Add/Update/Remove application
-  + resulting tree bytes + both tree hashes) — REAL, ungated (see above).
-  Uses a MINIMAL test-local `Proposal`/`KeyPackage` parser
-  (`kat_treekem_test.zig`'s `applyProposal`/`LocalProposalType`) rather
-  than a public `tree.zig` API — full `KeyPackage`/`Proposal` types are
-  Part 3/5's job per the Arc breakdown table above; this Part only needs
-  to pull a `LeafNode`/leaf-index out of the wire bytes to drive
-  `RatchetTree.addLeaf`/`updateLeaf`/`removeLeaf`.
-- `treekem.json`: driven in full behind the (now-`true`) gate — THE vector
-  that proves the path-secret+resolution+UpdatePath logic. `processUpdatePath`
-  reproduces each update path's `commit_secret` + first path secret across
-  all 62 update paths / 328 receiver views (under the provisional
-  GroupContext, `tree_hash = tree_hash_after`), and `applyUpdatePath`
-  merges each of the 62 to reproduce `tree_hash_after` — all byte-exact.
-  The gated tests followed this repo's `bn254`/`df-elect`/`pping` gate-flag
-  precedent while stubbed; the gate is now flipped and they run.
-
-**The five cores** (`treekem.zig`), each with its own rich doc-contract
-citing exact RFC §-refs and wire facts — see that file directly rather
-than duplicating the contracts here (SPEC.md's non-overlap rule,
-`CONVENTIONS.md` §5):
+**The cores** (`treekem.zig`), each with its own doc-contract citing exact RFC
+§-refs and wire facts — see that file directly rather than duplicating the
+contracts here (SPEC.md's non-overlap rule, `CONVENTIONS.md` §5):
 
 - `resolution(allocator, tree, index) Error![]usize` — §4.1.
 - `parentHash(comptime S, allocator, tree, index) Error![S.Hash.digest_length]u8` — §7.9.
@@ -290,15 +208,14 @@ than duplicating the contracts here (SPEC.md's non-overlap rule,
 - `resolutionExcluding(allocator, tree, index, excluded) Error![]usize` — §4.1 narrowed by §7.5's same-Commit-Add exclusion. For the CIPHERTEXT lists only, never for the §4.1.2 filter — see `filteredDirectPath`.
 - `filteredDirectPath(allocator, tree, leaf_node_index) Error![]FdpEntry` — §4.1.2, a property of the tree alone.
 - `processUpdatePath(comptime S, allocator, tree, receiver: PrivateLeafState, sender_leaf_index, update_path, group_context, added_this_commit) Error!ProcessedUpdatePath` — §7.4/§7.5/§7.6 (receiver side; yields `commit_secret`).
-- `applyUpdatePath(allocator, tree, sender_leaf_index, update_path) Error!void` — §7.5 (public-side merge).
+- `applyUpdatePath(comptime S, allocator, tree, sender_leaf_index, update_path) Error!void` — §7.5 (public-side merge). It takes the suite because the parent hashes use the suite's hash (a SHA-256-only version rejects every genuine `0x0005`/`0x0007` UpdatePath as `Malformed`).
 - `stageUpdatePath(comptime S, allocator, tree, sender_leaf_index, params: StageParams(S)) !Staged(S)` — Part 8: §7.4's derivation + §7.5's first block (sender side; mutates the tree, returns the signed leaf and every path secret).
 - `sealUpdatePath(comptime S, allocator, io, tree, staged, group_context, added_this_commit) !UpdatePath` — Part 8: §7.5's second block (encrypt to the copath resolutions). Split from `stageUpdatePath` because the `group_context` it needs contains the tree hash the first half produces.
 
 `group_context` is accepted as ALREADY-ENCODED bytes rather than a typed
-`GroupContext` — that type is Part 4's (Key Schedule) job per the Arc
-breakdown table; Part 2 doesn't build it just to pass a parameter through.
+`GroupContext` — that type is `keyschedule.zig`'s.
 
-## Part 4 — Key Schedule + Secret Tree (2026-07-28)
+## Part 4 — Key Schedule + Secret Tree
 
 **Files:** `keyschedule.zig` (RFC 9420 §8's epoch chain, §8.1's
 `GroupContext`, §8.4's `PreSharedKeyID`/`PSKLabel`/`psk_secret`, §8.5's
@@ -307,23 +224,6 @@ breakdown table; Part 2 doesn't build it just to pass a parameter through.
 ratchets and the out-of-order `Window`, §6.3.2's sender-data key/nonce),
 `kat_keyschedule_test.zig`, `kat_secrettree_test.zig`. Two small additions
 to Part 1's files were needed and are described below.
-
-### What it is verified against
-
-| Vector | Drives | Checked |
-|---|---|---|
-| `key-schedule.json` | `GroupContext.encode`/`decode`, `joinerSecret`, `welcomeSecret`, `epochSecret`, `deriveEpoch`, `externalKeyPair`, `mlsExporter` | Every stage of a five-epoch chain, per stage and per Table 4 row, byte-exact — including the encoded `GroupContext` itself, in both directions |
-| `psk_secret.json` | `PreSharedKeyId.encode`, `PskLabel`, `pskSecret` | Chains of 0 through 10 PSKs, byte-exact, including the empty-list case (§8.4's all-zero `psk_secret_[0]`) |
-| `secret-tree.json` | `nodeSecret`, `ratchetBaseSecret`, `Ratchet`, `Window`, `senderDataKeys` | 1/8/32-leaf trees; every named generation of both ratchets of every leaf, byte-exact, driven twice (forward through `Ratchet`, in reverse through `Window`) |
-
-Every vector matched on the first run — no stage needed adjusting, and no
-vector was edited. The harness's teeth were then confirmed the only way
-that means anything: one byte was flipped in each of the three files
-(`key-schedule.json`'s epoch-0 `joiner_secret`, `secret-tree.json`'s leaf-0
-generation-0 `application_key`, `psk_secret.json`'s one-PSK `psk_secret`)
-and each produced a failure naming that exact stage; the files were then
-restored and re-verified by SHA-256 against the fetched originals (hashes
-recorded in `NOTICE`).
 
 ### The one genuine ambiguity in §8, and how it was resolved
 
@@ -345,16 +245,14 @@ Note that the KAT is what makes this decidable at all — both readings
 produce well-distributed output, and no round-trip or self-consistency test
 could tell them apart.
 
-### Changes to Part 1's files
+### Additions to Part 1's files
 
-- **`crypto.kdfLabelLen` + `crypto.ExpandWithLabelScratch`** (new). Part 1's
-  Backlog predicted that a `GroupContext` with extensions would outgrow
-  `ExpandWithLabel`'s fixed 512-byte scratch, and the key schedule is that
-  consumer: it feeds an encoded `GroupContext` in as `Context` twice per
-  epoch. Rather than widening the constant to some new arbitrary number,
-  the caller can now size the scratch exactly. `ExpandWithLabel` is
-  unchanged for everyone else — it simply delegates. This closes that
-  Backlog item.
+- **`crypto.kdfLabelLen` + `crypto.ExpandWithLabelScratch`** (new). A `GroupContext` with
+extensions outgrows `ExpandWithLabel`'s fixed 512-byte scratch, and the key
+schedule feeds an encoded `GroupContext` in as `Context` twice per epoch.
+Rather than widening the constant to some new arbitrary number, the caller
+sizes the scratch exactly; `ExpandWithLabel` delegates to it for everyone
+else.
 - **`suite.CipherSuite.Mac` / `.Nm`** (new). RFC 9420 §17.1's text under
   Table 7: the non-GREASE suites use HMAC with the suite's hash as their
   MAC. Derived from `Hash`, never independently declared, so a suite's
@@ -380,32 +278,27 @@ rather than attacker-driven growth.
 
 ### Scope boundary, stated precisely
 
-When Part 4 landed, two of §8's subsections were not implemented, in both
-cases for a missing input rather than a missing algorithm:
+- **§8.2 transcript hashes are `transcript.zig`, not `keyschedule.zig`.** They
+  hash an encoded `AuthenticatedContent`, a `framing.zig` structure, and
+  `framing.zig` imports `keyschedule.zig`, so §8.2 living in `keyschedule.zig`
+  would be an import cycle.
+- **§8.3 external initialization** is `keyschedule.externalInitSender`/
+  `externalInitReceiver` (`keyschedule.zig:532`), over the sibling `hpke`'s
+  `setupBaseS`/`setupBaseR`/`Context.exportSecret`. It is the only
+  derivation in `keyschedule.zig` with no external MLS vector: it is pinned by
+  a sender/receiver round trip plus RFC 9180's own KATs one layer down, and
+  its export-context string and HPKE `suite_id` are pinned as literals
+  separately (a round trip alone passes for ANY label both sides agree on).
+  The tests also pin that the derived `init_secret` is bound to the group's
+  external key and to the `kem_output`, and that decapsulating with the wrong
+  private key yields a DIFFERENT secret rather than an error, since X25519
+  decap cannot fail on a well-formed point: what makes an external Commit
+  safe is the `confirmation_tag`, not §8.3's exchange.
+- **`confirmation_tag`/`membership_tag`** are implemented here, over Part 4's
+  keys, but take already-encoded bytes; `framing.membershipTag`
+  (`framing.zig:581`) assembles the `AuthenticatedContentTBM` for them.
 
-- **§8.2 transcript hashes** hash an encoded `AuthenticatedContent`
-  (`ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput`), which is a
-  Part 5 framing structure. The upstream vector for it
-  (`transcript-hashes.json`) supplies a serialized `AuthenticatedContent`
-  and therefore could not be driven before Part 5 either.
-  **CLOSED 2026-07-29 by Part 5** — `transcript.zig`, vector-pinned; see
-  "Part 5" below. It is a separate file rather than an addition to
-  `keyschedule.zig` only because `framing.zig` imports `keyschedule.zig`,
-  so §8.2 living there would be an import cycle.
-- **§8.3 external initialization** needs an HPKE `SetupBaseS`/`SetupBaseR`
-  context (the sibling `hpke` module exposes `sealBase`/`openBase` but not
-  a bare setup returning a `Context`), and is only reachable through Part
-  6's external-commit flow. **STILL OPEN.**
-
-Both were named in `keyschedule.zig`'s module doc comment so the omission
-was discoverable from the code, not only from here; that comment now points
-at `transcript.zig` for §8.2 and still names §8.3. `confirmation_tag` and
-`membership_tag` themselves were implemented in Part 4 — they consume Part
-4's keys — but their inputs are assembled by Part 5, so they take
-already-encoded bytes, and `framing.membershipTag` is the function that
-assembles the `AuthenticatedContentTBM` for them.
-
-## Part 5 — Message framing (2026-07-29)
+## Part 5 — Message framing
 
 **Files:** `framing.zig` (all of RFC 9420 §6), `content.zig` (§12.1's seven
 `Proposal` types + §12.4's `Commit`/`ProposalOrRef`), `keypackage.zig`
@@ -433,21 +326,6 @@ here anyway (as `content.zig`) because a framing layer that cannot decode
 them can decode nothing but application data. §10's `KeyPackage` follows for
 the same reason one level down: §12.1.1's `Add` is `struct { KeyPackage
 key_package; }`.
-
-### What it is verified against
-
-| Vector | Drives | Checked |
-|---|---|---|
-| `message-protection.json` | `protectPublic`/`unprotectPublic`, `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `signFramedContent`/`verifyFramedContent`, `membershipTag`, and Part 4's `secrettree` ratchets underneath | `PrivateMessage` for all three content types and `PublicMessage` for the two handshake types, byte-exact **in both directions** — plus the §6 refusal of application content as a `PublicMessage`, which is why that pairing is absent rather than untested. See below |
-| `transcript-hashes.json` | `transcript.confirmedTranscriptHash`/`interimTranscriptHash`/`advance`, `AuthenticatedContent.encode`/`decode`, and Part 4's `verifyConfirmationTag` | Both §8.2 hashes byte-exact, the `AuthenticatedContent` re-encode byte-exact, and the Commit's own `confirmation_tag` verified against the confirmed hash it produces |
-| `messages.json` | Every §12.1 proposal body, §12.4 `Commit`, §10 `KeyPackage`, and the §6 `MLSMessage` wire formats | decode → re-encode byte-exact for every embedded field per entry. **Part 6 widened this**: the four fields Part 5 projected away (`mls_welcome`/`mls_group_info`/`ratchet_tree`/`group_secrets`) are now embedded and driven too, so the filter is a plain entry prefix — see `NOTICE` item 6 |
-
-Every vector matched on the first run — no stage needed adjusting, no
-vector was edited, and no code was changed in response to a divergence
-because there was none. That is a weaker statement than it looks (this part
-introduces no new cryptography; every derivation under it was pinned by
-Parts 1/2/4 first), but it does mean the §6 wire shapes and the two TBS/TBM
-framings were read correctly off the RFC the first time.
 
 ### The protect direction is pinned byte-exact, which upstream does not ask for
 
@@ -483,37 +361,37 @@ ends with it, rather than assuming a constant.
 ### Where the boundary falls, stated precisely
 
 Implemented: every wire structure in §6, §12.1, §12.4 and §10, plus §8.2.
+`framing.MLSMessage.decode` handles all five §17.2 wire formats (`mls_welcome`
+and `mls_group_info` bodies are `welcome.zig`'s). `content.zig` has no
+standalone `Add`/`Update`/`Remove`/`PreSharedKey`/`ExternalInit`/
+`GroupContextExtensions` types: each §12.1 body is a `Proposal` union arm
+holding the type it wraps (none of those RFC structs has a second field), so
+`kat_messages_test.zig` drives the bare `*_proposal` vector fields through the
+wrapped types, prepending the §17.4 type value where the vector has none; an
+extension proposal type that needs a real struct is when to split them out.
 
-NOT implemented, and not stubbed either:
+Not here, and not stubbed:
 
-- **§12.2 proposal-list validity / §12.3 application order / §12.4.1
-  Creating a Commit / §12.4.2 Processing a Commit.** `content.zig` decodes
-  a `Commit`; nothing in this part decides whether its proposal list is
-  legal, applies it to a ratchet tree, or advances an epoch. That is a
-  state machine over Part 2's tree editing and Part 4's key schedule, and
-  it needs a group-state object this module does not have yet.
-- **§10.1 KeyPackage validation and §7.3 LeafNode validation.**
-  `keypackage.zig` has the struct and its self-signature check — a pure
-  function of the bytes — and none of the admission rules (lifetime
-  freshness, capability/extension consistency, `leaf_node_source ==
-  key_package`, init-key/encryption-key distinctness, uniqueness within a
-  Commit). Those stay Part 3's.
-- **`Welcome` / `GroupInfo`.** Part 5 refused wire formats 3 and 4 with a
-  NAMED `error.WireFormatNotInThisPart`, deliberately distinct from the
-  `error.Malformed` an unregistered value gets, so a caller could tell "not
-  built yet" from "not a thing". **Part 6 supplied them and the error is
-  gone** — `framing.MLSMessage.decode` now handles all five §17.2 wire
-  formats, so it had no reachable return site left. See "Part 6" below.
+- **Proposal-list validity, application order and Commit processing** are
+  `group.zig` (§12.2, §12.3, §12.4.1, §12.4.2); `content.zig` only decodes a
+  `Commit`.
+- **KeyPackage admission rules** — `keypackage.zig` has the struct and its
+  self-signature check, a pure function of the bytes. The rules that need only
+  the leaf and the tree are `group.zig`'s (see Part 8); the rest is open
+  (*Backlog / deferred*) or the application's (*What is deliberately not done*).
 - **Key lookup and member validation.** `unprotect*` hands back a decoded,
-  signature-verified `AuthenticatedContent` and the `SenderData.leaf_index`
-  it decrypted. Checking that the index names a non-blank leaf (§6.3.2's
-  closing MUST) needs a `RatchetTree`; choosing which leaf's ratchet and
-  which generation to try needs a per-leaf `secrettree.Window`. Both are
-  the caller's, and `framing.zig`'s doc comment says so.
+  signature-verified `AuthenticatedContent` and the `SenderData.leaf_index` it
+  decrypted. Checking that the index names a non-blank leaf (§6.3.2's closing
+  MUST) needs a `RatchetTree`; choosing which leaf's ratchet and which
+  generation to try needs a per-leaf `secrettree.Window`. Both are the
+  caller's, and `framing.zig`'s doc comment says so. Decryption is two-phase
+  (§6.3.2's sender data names the key §6.3.1's content needs), so the three
+  stages `decryptSenderData`/`decryptContent`/`parsePrivateContent` are exposed
+  separately rather than behind one `unprivateMessage` callback.
 - **Randomness.** §6.3.1 requires a fresh random four-byte reuse guard per
-  message; `ProtectPrivateParams.reuse_guard` is a caller input. Same
-  posture as `keyschedule.PreSharedKeyId.psk_nonce` — this module never
-  owns a randomness policy.
+  message; `ProtectPrivateParams.reuse_guard` (`framing.zig:709`) is a caller
+  input, as `keyschedule.PreSharedKeyId.psk_nonce` is: this module never owns a
+  randomness policy.
 
 ### Three §6 details that are easy to get wrong, and are load-bearing
 
@@ -564,53 +442,27 @@ strict prefix of the latter, differing by exactly the trailing tag.
   set — which would change the contract every current caller relies on —
   the new one has an inferred error set and an otherwise identical body.
 
-### Teeth
-
-Each of the three new vectors was corrupted by ONE byte, the suite re-run,
-and the failure confirmed to name the diverging stage; then restored and
-re-verified by SHA-256 against the fetched originals (hashes in `NOTICE`):
-
-| Corruption | Failure |
-|---|---|
-| `messages.json` entry 0's `public_message_commit`, 2nd hex digit | `'public_message_commit (§6.2)' re-encode diverged at entry 0 (want 428 bytes, got 428)` |
-| `message-protection.json` suite-1 `application`, 3rd hex digit | `'application_priv -> application body' diverged (want 42 bytes, got 42)` |
-| `message-protection.json` suite-1 `membership_key`, 3rd hex digit | `'proposal_pub membership_tag (§6.2)' failed: MacMismatch` |
-| `transcript-hashes.json` suite-1 `interim_transcript_hash_before`, 3rd hex digit | `'confirmed_transcript_hash_after' diverged (want 32 bytes, got 32)` |
-
-The membership-key case is why both harnesses name the stage on an ERROR as
-well as on a byte mismatch: every iteration of an `inline for` shares one
-source line, so a bare `error.MacMismatch` would not have said which
-content type or which of the two tags produced it.
-
-Beyond the vectors, three in-file negative controls exist because a
-positive-only harness would pass without them: a tampered ciphertext byte
-must fail the content AEAD; a wrong reuse guard must fail it too (proving
-the XOR is actually reaching the nonce); and the Commit's `confirmation_tag`
-must NOT verify against the interim hash or the previous interim hash
-(proving §8.2's two same-width hashes are not being confused).
-
-## Part 6 — Joining a group (2026-07-29)
+## Part 6 — Joining a group
 
 **Files:** `welcome.zig` (RFC 9420 §12.4.3, §12.4.3.1, §12.4.3.3),
 `kat_welcome_test.zig`. Two additions elsewhere: `keyschedule
 .deriveEpochFromJoiner` (§8 entered one step lower) and the two new
 `MLSMessage` arms in `framing.zig`.
 
-### Where the RFC actually puts this, because the brief for this part got it wrong
+### Where the RFC puts this
 
 There is no top-level "Welcome" section. Everything lives under §12.4.3
-("Adding Members to the Group"), which is itself a sub-subsection of §12.4
-("Commit"):
+("Adding Members to the Group"), itself a sub-subsection of §12.4 ("Commit"):
 
 | Section | Contents |
 |---|---|
 | §12.4.3 (body) | `GroupInfo`, `GroupInfoTBS` — NOT in a numbered subsection of their own |
 | §12.4.3.1 Joining via Welcome Message | `PathSecret`, `GroupSecrets`, `EncryptedGroupSecrets`, `Welcome`, the `welcome_key`/`welcome_nonce` derivation, and the twelve-step receiving procedure |
-| §12.4.3.2 Joining via External Commits | `ExternalPub`, the external-Commit rules — **built, see Part 9** (this row read "NOT in scope" while Part 6 was the newest part) |
+| §12.4.3.2 Joining via External Commits | `ExternalPub`, the external-Commit rules — Part 9 |
 | §12.4.3.3 Ratchet Tree Extension | the `optional<Node> ratchet_tree<V>` encoding and its closing tree-hash MUST |
 
-The two supporting facts that are elsewhere: §17.2 assigns `mls_welcome` =
-3 and `mls_group_info` = 4, and §17.3 assigns `ratchet_tree` = 0x0002 and
+The two supporting facts that are elsewhere: §17.2 assigns `mls_welcome` = 3
+and `mls_group_info` = 4, and §17.3 assigns `ratchet_tree` = 0x0002 and
 `external_pub` = 0x0004.
 
 ### The construction, and the one binding that is easy to drop
@@ -637,7 +489,7 @@ and the HPKE open must fail.
 A joiner cannot recompute `joiner_secret`: it has neither the previous
 epoch's `init_secret` nor the Commit's `commit_secret`, which is precisely
 why §8's chain has to be enterable one step lower (`deriveEpochFromJoiner`;
-`deriveEpoch` is now literally `joinerSecret` followed by it, so the two
+`deriveEpoch` is literally `joinerSecret` followed by it, so the two
 paths cannot drift). What redeems the trust is the ORDER of the remaining
 steps: derive the epoch from that `joiner_secret` and the signed
 `GroupContext`, then verify the `GroupInfo`'s `confirmation_tag` with the
@@ -645,17 +497,6 @@ steps: derive the epoch from that `joiner_secret` and the signed
 belonging to a different epoch produces a `confirmation_key` that does not
 verify the tag it also signed. `join` runs the steps in that order and
 fails closed.
-
-### What it is verified against
-
-| Vector | Drives | Checked |
-|---|---|---|
-| `welcome.json` | `Welcome`/`GroupInfo`/`GroupSecrets` codecs, `findSecret` (and therefore §5.2's `MakeKeyPackageRef`), `decryptGroupSecrets`, `welcomeSecret`, `welcomeKeyNonce`, `encryptGroupInfo`/`decryptGroupInfo`, `GroupInfo.verifySignature`, `deriveEpochFromJoiner`, `verifyConfirmationTag`, `interimTranscriptHash`, and `join` end to end | Every layer staged and byte-exact in the RECEIVE direction, plus the vector's own `encrypted_group_info` reproduced in the SEND direction (below). The one-call `join` is then required to agree with the hand-staged path field by field |
-| `messages.json` (widened) | `Welcome`/`GroupInfo`/`GroupSecrets` wire codecs, the bare §12.4.3.3 `ratchet_tree`, `GroupInfo.extension`/`ratchetTree`/`externalPub` | decode → re-encode byte-exact; plus a cross-check that the `ratchet_tree` EXTENSION body inside `mls_group_info` is byte-identical to the vector's independently-generated standalone `ratchet_tree` field |
-
-Both matched on the first run — no stage needed adjusting, no vector was
-edited, and no code was changed in response to a divergence because there
-was none.
 
 ### One layer is byte-exact in the send direction and one cannot be
 
@@ -691,61 +532,31 @@ test in the module still passed. `GroupInfo.decode` therefore records the
 two raw byte ranges (`GroupInfo.raw`) from the reader's own consumption,
 and both steps use them. `keyschedule.GroupContext`'s doc comment had
 already named this hazard as the reason `joinerSecret`/`epochSecret` take
-`[]const u8`; this is the field that supplies them. The teeth table below
-includes a case that flips a byte in the raw plaintext specifically to
+`[]const u8`; this is the field that supplies them. A test flips a byte in the raw plaintext specifically to
 prove the verification reads received bytes.
 
 ### Where the boundary falls, stated precisely
 
-**In.** `GroupInfo`/`GroupInfoTBS` + sign/verify; `PathSecret`/
-`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome` codecs; both encryption
-layers in both directions; `findSecret`; the PSK-list identity check; the
-epoch derivation from `joiner_secret`; the `confirmation_tag` check; §8.2's
-interim hash for the joined epoch; the `ratchet_tree`/`external_pub`
-extension accessors; `verifyTreeHash`; both new `MLSMessage` arms.
+**In.** `GroupInfo`/`GroupInfoTBS` + sign/verify; `PathSecret`/`GroupSecrets`/
+`EncryptedGroupSecrets`/`Welcome` codecs; both encryption layers in both
+directions; `findSecret`; the PSK-list identity check; the epoch derivation from
+`joiner_secret`; the `confirmation_tag` check; §8.2's interim hash for the
+joined epoch; the `ratchet_tree`/`external_pub` extension accessors;
+`verifyTreeHash`; both `MLSMessage` arms.
 
-**Out, and why.**
+**Not in `welcome.zig`.**
 
-- **§12.4.3.2 external Commits and §8.3 external initialization.** SCOPED
-  OUT — and it is worth recording that the reason they were scoped out no
-  longer holds. This batch was briefed on the understanding that §8.3's
-  `ExternalInit` needs HPKE's `SetupBaseS`/`SetupBaseR` context setup and
-  that the sibling `hpke` module exported only the single-shot
-  `sealBase`/`openBase` wrappers. It exports the whole RFC 9180 §5.1 setup
-  layer — `hpke.setupBaseS`/`setupBaseR`/`Setup`/`Context.exportSecret` —
-  so the dependency is satisfied. What remains is the work itself: §8.3 is
-  two functions (`SetupBaseS` then `Context.export("MLS 1.0 external init
-  secret", KDF.Nh)`, plus the receiver mirror over `SetupBaseR`), and
-  §12.4.3.2 on top of it additionally needs the commit processing this
-  module does not have. Neither has an upstream interop vector, so both
-  would land round-trip-anchored only — which is why neither was bolted
-  onto a batch whose whole claim is byte-exact external anchoring. The
-  `ExternalPub` extension a `GroupInfo` carries for this purpose IS read
-  here (a joiner must be able to parse a `GroupInfo` that has one);
-  nothing uses it yet.
-- **The `passive-client-*.json` vectors.** These replay a whole recorded
-  session — join, then apply a Commit per epoch and match an
-  `epoch_authenticator` each time. They need §12.2 proposal-list validity,
-  §12.3 application order and §12.4.2 commit processing, none of which
-  exist in this module. Attempting them would have meant either a
-  half-built commit processor or a harness that skipped the epochs, and
-  a finished, vector-pinned Welcome is worth more than either. They are
-  not fetched or embedded (see `NOTICE` item 7).
-- **§12.4.3.1's tree-integrity block beyond the tree hash.** The
-  parent-hash chain is Part 2's `treekem.validateParentHashes` (present,
-  but running it is a caller step because it needs the tree) and per-leaf
-  validation is §7.3, which is Part 3's and absent. `verifyTreeHash` is the
-  one check this part owns, because it is what binds a tree to the SIGNED
-  `GroupContext` and therefore the precondition for the other two meaning
-  anything.
-- **Installing the joiner's private keys from `path_secret`.** The
-  `path_secret` is decoded and returned; deriving node keys up the tree
-  from it needs a mutable group-state object this module deliberately does
-  not have — the same call `framing.zig` makes about `SenderData
-  .leaf_index`.
-- **Group-id uniqueness, and §12.4.3.1's closing reinit/branch rules.**
-  Both are checks against state outside this module (the client's other
-  groups; the previous group's last Commit).
+- **§12.4.3.1's tree-integrity block beyond the tree hash.** The parent-hash
+  chain is `treekem.validateParentHashes` and per-leaf validation is §7.3;
+  `verifyTreeHash` is the one check `welcome.zig` owns, because it binds a tree
+  to the SIGNED `GroupContext` and is therefore the precondition for the other
+  two meaning anything. `Group.fromWelcome` runs all of them (Part 7).
+- **Installing the joiner's private keys from `path_secret`.** `welcome.zig`
+  decodes and returns the `path_secret`; deriving node keys up the tree needs
+  the mutable group state, which is `Group.fromWelcome`'s.
+- **Group-id uniqueness and §12.4.3.1's closing reinit/branch rules.** Both are
+  checks against state outside this module (the client's other groups; the
+  previous group's last Commit).
 
 ### The PSK-list check is stricter than "resolve what you have"
 
@@ -760,40 +571,7 @@ names it at the point it happens. Comparing encoded bytes rather than
 field-by-field means a future `PreSharedKeyID` arm cannot be added and
 silently skipped by the comparison.
 
-### Teeth
-
-Each new vector was corrupted by ONE byte, the suite re-run, and the
-failure confirmed to name the diverging stage; then restored and
-re-verified by SHA-256 against the fetched originals (hashes in `NOTICE`):
-
-| Corruption | Failure |
-|---|---|
-| `welcome.json` suite-1 `welcome`, last hex digit (inside `encrypted_group_info`) | `'GroupSecrets HPKE open (§12.4.3.1)' failed: DecryptionFailed` — and note WHICH layer names it: the group-info blob is the per-member layer's `EncryptWithLabel` context, so corrupting it breaks the HPKE open first |
-| `welcome.json` suite-1 `signer_pub`, last hex digit | `'GroupInfo signature (§12.4.3 GroupInfoTBS)' failed: SignatureVerificationFailed` |
-| `messages.json` entry 3's `group_secrets`, the `optional<PathSecret>` presence octet | `'group_secrets (§12.4.3.1)' failed to decode at entry 3: Malformed` |
-
-A fourth attempt is worth recording as a NEGATIVE result: flipping the last
-data byte of `messages.json`'s `group_secrets` (inside a `psk_nonce`)
-changed nothing, because a decode → re-encode check cannot see a payload
-byte change — it decodes and re-encodes identically. That is not a hole in
-this harness so much as a restatement of what `messages.json` is for (a
-wire-format anchor; see `kat_messages_test.zig`'s doc comment), and it is
-why the corruption that DOES bite is a length/presence octet.
-
-Beyond the vectors, `welcome.zig` and `kat_welcome_test.zig` carry negative
-controls a positive-only harness would pass without: an unknown
-`KeyPackageRef` must be `error.NoMatchingKeyPackage` rather than a decrypt
-attempt against `secrets[0]`; a `Welcome` naming another cipher suite must
-be refused before any decryption; a caller with no PSKs must not be able to
-join a Welcome that names one; a correctly-signed `GroupInfo` carrying a
-`confirmation_tag` from a different epoch must fail; one flipped bit of
-`joiner_secret` must be caught by the CONFIRMATION TAG specifically (not by
-a signature or an AEAD — that is the check proving the joiner's epoch is
-pinned to the group's); a `GroupContext` with a bumped epoch must derive a
-different `confirmation_key`; and a tree whose root hash is not the signed
-`tree_hash` must fail `verifyTreeHash`.
-
-## Part 7 — The group state machine (2026-07-29)
+## Part 7 — The group state machine
 
 `group.zig` — `Group(S)`, the object that turns Parts 1-6's codecs and
 derivations into a client that can FOLLOW a group: RFC 9420 §12.2 (proposal
@@ -802,43 +580,11 @@ Commit), and §12.4.3.1's joining procedure run all the way to a usable
 state. Plus §8.3's external initialization in `keyschedule.zig`, which Part
 6 listed as unbuilt.
 
-### What it is verified against
+### Where the RFC actually puts commit processing
 
-The three official `passive-client-*.json` vectors, which are a different
-kind of evidence from everything else this module embeds. Every other vector
-pins one derivation, one codec or one message — it proves a FUNCTION is
-right. These replay a whole recorded session: a client is added to a real
-group by another implementation, then follows that group through a sequence
-of Commits made by other members, with the `epoch_authenticator` compared at
-every single step.
-
-| Vector | What it drives | Result |
-|---|---|---|
-| `passive-client-welcome.json` | 8 recorded joins (suite `0x0001`), spanning both §12.4.3.3 tree sources and both PSK cases. **No Commits at all** — its `epochs` array is empty in every entry | green |
-| `passive-client-handling-commit.json` | 13 recorded sessions of 2 Commits each, every one injecting an external PSK; the epochs span empty, single and multi-proposal Commits, including one carrying an Add, a Remove, two PSKs and a GroupContextExtensions together | green |
-| `passive-client-random.json` | ONE recorded session of **200 consecutive Commits**, growing the group until an `UpdatePath` spans seven levels | green |
-
-The `epoch_authenticator` is `DeriveSecret(epoch_secret, "authentication")`,
-and `epoch_secret` depends on the `GroupContext` — hence on the tree hash
-and on the entire transcript — and on the previous epoch's `init_secret`.
-There is no way for the state machine to resynchronize: one wrong bit
-anywhere makes that epoch and every later one wrong. A session that reaches
-epoch 200 has had 200 independent chances to fail.
-
-**None of these matched on the first run.** That is the first time in this
-arc that has happened, and it is the whole reason the part was worth doing:
-four separate defects were hiding behind vectors that were all too small to
-expose them. See "What the replays found" below.
-
-### Where the RFC actually puts commit processing, because the brief for this part was incomplete
-
-The brief named §12.2, §12.3 and §12.4.2 as "the neighbourhood", and those
-three are indeed the spine — §12.2's validity rules, §12.3's fixed
-application order, §12.4.2's eleven ordered bullets. They are correct as far
-as they go.
-
-But the single rule that decides whether a Commit can be processed AT ALL is
-in **§7.5**, which the brief did not mention and which contains no other
+§12.2 (proposal-list validity), §12.3 (a fixed application order) and §12.4.2
+(eleven ordered bullets) are the spine. But the single rule that decides
+whether a Commit can be processed AT ALL is in **§7.5**, which contains no other
 Commit-processing text:
 
 > Any new member (from an Add proposal) added in the same Commit MUST be
@@ -846,89 +592,44 @@ Commit-processing text:
 
 A member added by the same Commit that carries the `UpdatePath` must not
 receive the path secrets through it — it gets its state from the `Welcome`
-instead. So the committer builds one fewer ciphertext than "the resolution
-of the copath node" suggests.
+instead. So the committer builds one fewer ciphertext than "the resolution of
+the copath node" suggests, and a receiver that misses it computes a resolution
+one entry too long, sees the wrong ciphertext count and rejects the Commit
+outright. This is why `treekem.resolutionExcluding` exists and why
+`processUpdatePath`/`applyUpdatePath` take an `added_this_commit` argument.
 
-> **Correction, Part 8.** This section originally continued: "and, because
-> the §4.1.2 filter is defined in terms of resolution EMPTINESS, a copath
-> subtree containing only same-Commit additions drops out of the filtered
-> direct path entirely, making the whole `UpdatePath` one node shorter."
-> That second half is wrong, and Part 8 removed it —
-> `treekem.filteredDirectPath` no longer takes an excluded set at all.
-> §7.5 places the exclusion inside the ENCRYPTION step, applying it to "this
-> resolution", while the loop is over §4.1.2's filtered direct path, which
-> is defined purely on the tree. The node stays and carries an
-> `UpdatePathNode` with zero ciphertexts. Dropping it instead leaves it
-> blank, which puts the new member's leaf into the resolution of a blank
-> node and breaks §7.9.2's `P.unmerged_leaves ∩ subtree(C) == resolution(C)
-> \ {D}` criterion — a tree this module's own `validateParentHashes`
-> rejects. Every upstream vector passes under either reading, so the error
-> was invisible until Commit CREATION made the distinguishing case
-> constructible. See "Part 8".
+**The exclusion applies to the ENCRYPTION step only, not to §4.1.2's filter.**
+§7.5 places it inside "this resolution", while the loop is over §4.1.2's
+filtered direct path, which is defined purely on the tree
+(`treekem.filteredDirectPath` takes no excluded set, `treekem.zig:441`). A node
+whose copath subtree holds only same-Commit additions therefore stays on the
+path and carries an `UpdatePathNode` with ZERO ciphertexts. Dropping it would
+leave it blank, put the new member's leaf into the resolution of a blank node
+and break §7.9.2's `P.unmerged_leaves ∩ subtree(C) == resolution(C) \ {D}`
+criterion. Every upstream vector passes under either reading; only Commit
+CREATION makes the distinguishing case constructible (Part 8). §12.1.1's
+leftmost-blank-leaf placement is unchanged and DOES reuse a leaf vacated by a
+Remove in the same Commit.
 
-This is not a subtle key divergence that shows up later as a wrong secret.
-A receiver that misses it computes a resolution one entry too long, the
-ciphertext count does not match, and the Commit is rejected outright. It is
-the reason `treekem.resolutionExcluding` exists and why
-`processUpdatePath`/`applyUpdatePath` now take an `added_this_commit`
-argument.
+### Constraints the replays established
 
-### What the replays found
+Recorded sessions from another implementation exposed these; each is a design constraint of the code.
 
-Four defects, each invisible to every previously embedded vector. Three are
-coding bugs in Parts 1/2/4; one is a specification misreading in this part.
-
-1. **`crypto`'s 512-byte label scratch overflowed for any realistically
-   sized group — Parts 1/6, real bug.** `EncryptWithLabel`'s `Context` and
-   `SignWithLabel`'s `Content` have no upper bound in RFC 9420's own uses of
-   them: §12.4.3.1 seals each member's `GroupSecrets` with the WHOLE
-   `encrypted_group_info` as the context (which contains the ratchet tree),
+1. **Exact-sized scratch for unbounded labeled crypto.** §12.4.3.1 seals each
+   member's `GroupSecrets` with the WHOLE `encrypted_group_info` as the context,
    §7.5 opens each `UpdatePathNode` under the serialized `GroupContext`,
-   `GroupInfoTBS` contains a `GroupContext` plus the `ratchet_tree`
-   extension, and `FramedContentTBS` for a Commit contains a whole
-   `UpdatePath`. All four are kilobytes for a real group. `welcome.json`'s
-   group was small enough to fit; the passive-client groups are not, and
-   every one of them failed. Fixed by mirroring the existing
-   `kdfLabelLen`/`ExpandWithLabelScratch` precedent:
-   `crypto.encryptContextLen` + `EncryptWithLabelScratch`/
-   `DecryptWithLabelScratch`, and `crypto.signContentLen` +
-   `SignWithLabelAlloc`/`VerifyWithLabelAlloc`, with every call site that
-   can see an unbounded argument (and that already allocates its TBS buffer)
-   switched over.
-   **A second defect was hiding behind the first:**
-   `welcome.decryptGroupSecrets` mapped every error from
-   `DecryptWithLabel` to `error.DecryptionFailed`, so a buffer-size bug was
-   reported as a wrong-key one. Sizing the scratch exactly makes
-   `error.LabelTooLong` unreachable there, so the surviving `catch` can only
-   mean a genuine AEAD/decap failure.
-2. **`keyschedule.PreSharedKey.secret` was width-constrained to `[Nh]u8` —
-   Part 4, real bug.** RFC 9420 §8.4's first step is
-   `psk_extracted = KDF.Extract(0, psk)`: the PSK is HKDF *input keying
-   material*, which has no required width. The passive-client vectors'
-   external PSKs are **14 bytes**, and were rejected outright.
-   `psk_secret.json`'s suite-`0x0001` entries all happen to be 32 bytes,
-   which is exactly why no earlier vector caught it. Now `[]const u8`.
-3. **`ParentNode.withAppendedUnmerged` appended instead of inserting in
-   sorted position — Part 2, real bug.** RFC 9420 §7.1: "The entries in the
-   unmerged_leaves vector MUST be sorted in increasing order." Appending is
-   correct only while leaves are added strictly rightward, which is all Part
-   2 could produce. An Add that reuses a blank leaf to the LEFT of an
-   existing unmerged leaf breaks the invariant, and the damage is silent
-   until a `resolution` — which reads the list in order — hands a path
-   secret to the wrong node or a tree hash diverges.
-4. **§7.5's same-Commit-Add exclusion, described above — a misreading, not a
-   bug.** The first implementation applied §12.3's order literally and
-   computed resolutions over the post-Add tree. Worth recording how it was
-   resolved, because the wrong fix was very plausible: the observed
-   ciphertext counts `[1, 1, 3]` were ALSO consistent with "the Add must not
-   reuse a leaf vacated by a Remove in the same Commit, so extend the tree
-   instead". That hypothesis was implemented, and it failed differently (the
-   filtered direct path became one node too LONG), which is what sent the
-   search back to the RFC until §7.5's sentence turned up. §12.1.1's
-   leftmost-blank-leaf placement is unchanged and DOES reuse a
-   just-vacated leaf — the recorded sessions confirm it. **Part 8 then
-   found that the fix had been applied one step too far** — to §4.1.2's
-   filter as well as to the resolution — see the correction box above.
+   `GroupInfoTBS` carries a `GroupContext` plus the `ratchet_tree` extension and
+   `FramedContentTBS` for a Commit carries a whole `UpdatePath` — all kilobytes
+   in a real group, so those call sites use the exact-sized variants (see
+   *Design & invariants*). Because exact sizing makes `error.LabelTooLong`
+   unreachable in `welcome.decryptGroupSecrets` (`welcome.zig:690`), its `catch`
+   to `error.DecryptionFailed` can only mean a genuine AEAD or decap failure.
+2. **A PSK is input keying material of any width.** `keyschedule.PreSharedKey`'s
+   `secret` is `[]const u8` (`keyschedule.zig:796`): §8.4's first step is
+   `psk_extracted = KDF.Extract(0, psk)`, which has no required width (the
+   passive-client vectors' external PSKs are 14 bytes).
+3. **`unmerged_leaves` is kept sorted** (Part 2).
+4. **§7.5's exclusion applies to the resolution only** (above).
 
 ### The three orderings that are load-bearing
 
@@ -953,36 +654,42 @@ how the order drifts. Three places in it produce perfectly well-formed
 
 ### Where the boundary falls, stated precisely
 
-`Group(S)` is a complete PASSIVE client and a complete FOLLOWER. It is not a
-complete client, and the gaps are named rather than implied:
+`Group(S)` is a complete client: a follower (this part), a sender (Part 8) and
+both ways into a group (Part 6's `Welcome`, Part 9's external Commit). The gaps
+are named:
 
-- **No Commit or proposal CREATION.** There is still no sender half of §7.5
-  (`treekem.zig` does not generate an `UpdatePath`), and no `Welcome`
-  production. This is the receiving half only.
-- **No `PrivateMessage` handshakes** — `error.PrivateHandshakeNotSupported`.
-  `secrettree.zig` owns §9's ratchets, but this object does not drive them
-  per epoch; that has its own generation and deletion policy. The
-  passive-client vectors contain only `PublicMessage`s, and
-  `kat_passive_test.zig` ASSERTS that, so the boundary stays an honest one
-  rather than an untested claim.
-- **No §7.3/§10.1 admission validation** (Part 3). `processCommit` checks
-  the leaf properties §12.4.2 names in its own bullets —
+- **No `PrivateMessage` handshakes** — `error.PrivateHandshakeNotSupported`
+  (`group.zig:1151`, `2481`). `secrettree.zig` owns §9's ratchets, but the group
+  object does not drive them per epoch; that has its own generation and deletion
+  policy. The passive-client vectors contain only `PublicMessage`s, and
+  `kat_passive_test.zig` ASSERTS that, so the boundary is not an untested claim.
+- **No §7.3/§10.1 admission validation beyond what Part 8 lists.**
+  `processCommit` checks the leaf properties §12.4.2 names in its own bullets —
   `leaf_node_source == commit`, the committer's encryption key actually
   changing, no `UpdatePath` public key already present in the tree — and
   verifies the signature on every `LeafNode` it installs. It does not check
   lifetimes, credential acceptability or capability support.
-- **No external Commits (§12.4.3.2)** — at the time of Part 7. Built in
-  Part 9; see there.
-- **Not atomic — at the time of Part 7.** A failure after the tree was
-  mutated poisoned the object (`error.GroupPoisoned`) instead of rolling
-  back. Transactional since 2026-09-11; see the Backlog entry.
+- **Commit processing is transactional.** `processCommit` and `createCommit`
+  build a WORKING COPY (`Group.fork`, `group.zig:608`) and swap it in only after
+  the last fallible step (`reserveAdoption`, then the infallible `adopt`), so a
+  refused or failed Commit leaves the group at its old epoch, still able to take
+  the same Commit. This matters because an external Commit is signed with a key
+  it carries itself: a stranger holding a published `GroupInfo` reaches
+  §12.4.2's confirmation-tag bullet, and a poisoned group would be disabled for
+  every member that received the message. What a Commit's tree edits write or
+  free is the tree's CONTAINERS (node array, leaf lists, `unmerged_leaves`),
+  never its byte fields, so `cloneTree` (`group.zig:413`) copies exactly those
+  into an arena of its own and the bytes stay aliased. Every arena the group
+  owns wipes its memory on release, so a refused Commit also leaves no copy of
+  the path secret it decrypted. The cheap refusals still happen before the copy
+  is made: the whole §12.2 validation and every Add's KeyPackage signature.
 
 Two §12.2 rules are explicitly application-defined by the RFC ("multiple Add
-proposals that ... represent the same client according to the application,
-for example, identical signature keys"). They are implemented on the RFC's
-own parenthetical reading and exposed as `group.Policy`, defaulting ON,
-because the failure they prevent — a group silently containing two leaves
-for one client — is not detectable afterwards.
+proposals that ... represent the same client according to the application, for
+example, identical signature keys"). They are implemented on the RFC's own
+parenthetical reading and exposed as `group.Policy` (`group.zig:305`),
+defaulting ON, because the failure they prevent — a group silently containing
+two leaves for one client — is not detectable afterwards.
 
 ### `fromWelcome` re-sequences the join rather than calling `welcome.join`
 
@@ -1004,46 +711,18 @@ re-encoded form, would silently diverge from the first.
 
 ### Memory model
 
-One arena for retained state, the caller's allocator for scratch. This
-module's decoders alias their input buffers, and a group's tree accumulates
-leaves aliasing a DIFFERENT buffer per epoch (the Welcome's `GroupInfo`,
-then each Commit's `UpdatePath`, then each Add's `KeyPackage`).
-Deep-copying every `LeafNode` would mean a second implementation of
-`tree.zig`'s decode layer, so `Group` copies each message it retains state
-from into its own arena and decodes from that copy. Group state is retained
-wholesale and dropped wholesale, which is how MLS treats it too. The cost is
-recorded in the Backlog: the arena grows monotonically with session length.
+One arena for retained state, the caller's allocator for scratch. This module's
+decoders alias their input buffers, and a group's tree accumulates leaves
+aliasing a DIFFERENT buffer per epoch (the Welcome's `GroupInfo`, then each
+Commit's `UpdatePath`, then each Add's `KeyPackage`). Deep-copying every
+`LeafNode` would mean a second implementation of `tree.zig`'s decode layer, so
+`Group` copies each message it retains state from into its own arena
+(`epoch_arenas`, one per adopted Commit; a REFUSED Commit keeps nothing) and
+decodes from that copy. Group state is retained wholesale and dropped wholesale,
+which is how MLS treats it too. The cost is a limit stated under *Threat model*:
+the arenas grow monotonically with session length until `deinit`.
 
-### Teeth
-
-Each of the three vectors was corrupted by ONE hex nibble and the failure
-checked to name the stage that diverged, then restored:
-
-- one byte inside `passive-client-welcome`'s first `welcome` blob →
-  `fromWelcome failed: DecryptionFailed` (the group-info AEAD layer);
-- one byte inside `passive-client-handling-commit`'s entry-0 epoch-1
-  `commit` → `entry 0, epoch index 1: processCommit failed: MacMismatch`
-  (the `membership_tag`, i.e. §12.4.2's second bullet, before anything is
-  applied);
-- one byte of the EXPECTED `epoch_authenticator` at epoch 150 of the
-  200-Commit session → `entry 0, epoch index 150: epoch_authenticator
-  diverged`, with the differing bytes printed.
-
-Every diagnostic names the vector, the entry and the epoch index, because a
-failure at epoch 137 of 200 that says only "slices differ" is not
-actionable.
-
-Beyond the vectors, `keyschedule.zig`'s §8.3 tests pin the export-context
-string's exact bytes and the HPKE `suite_id`'s exact bytes as literals
-(a round trip alone passes for ANY label both sides agree on), and check
-that the derived `init_secret` is bound to the group's external key and to
-the `kem_output` — including the fact that decapsulating with the wrong
-private key yields a DIFFERENT secret rather than an error, since X25519
-decap cannot fail on a well-formed point. What makes an external Commit safe
-is therefore the `confirmation_tag`, not §8.3's exchange, and the test says
-so.
-
-## Part 8 — Creating Commits (2026-07-29)
+## Part 8 — Creating Commits
 
 **Files:** `treekem.zig` (`stageUpdatePath`/`sealUpdatePath` — the sender
 half of §7.5, and the first consumer `treekem.zig`'s own merge machinery has
@@ -1058,27 +737,21 @@ deliberately the SAME object: `createCommit` and `processCommit` are two
 methods on one `Group(S)`, over one tree and one transcript, because a
 committer must land in exactly the state its receivers land in.
 
-### What the RFC actually calls these, because the brief for this part was
-### wrong twice
+### Section map, and one RFC self-contradiction
 
-The brief for this batch located `UpdatePath` generation via
-"`treemath.common_ancestor_*`, which has never had a consumer". Neither half
-is right. `treemath.zig` has never contained `common_ancestor_semantic` or
-`common_ancestor_direct` at all — RFC 9420 Appendix C does publish them, and
-`SPEC.md`'s own Backlog has recorded them as NOT ported since Part 1. And
-the operation they name already had a consumer before this part started:
-Part 7's `group.commonAncestor` (a direct-path intersection, not a port of
-Appendix C) has been serving §12.4.3.1's private-key installation step since
-`fromWelcome` landed. That Backlog entry was stale in the other direction
-too — it said the two would "arrive together or not at all" with the
-group-state object, and the group-state object arrived without them.
+Commit creation is **§12.4.1**; §12.4.2 is processing. The two are NOT mirror
+images: §12.4.1 has bullets §12.4.2 has no counterpart for (constructing the
+`GroupInfo`, deriving the per-member path secret, building the `Welcome`), and
+it specifies the ORDER in which a Commit and its Welcome are produced.
 
-The brief also cited §12.4.2 for Commit creation. Creation is **§12.4.1**;
-§12.4.2 is processing, which Part 7 built. The distinction matters here
-because the two sections are NOT mirror images: §12.4.1 has bullets §12.4.2
-has no counterpart for (constructing the `GroupInfo`, deriving the per-member
-path secret, building the `Welcome`), and it is the section that specifies
-the ORDER in which a Commit and its Welcome are produced.
+`treemath.zig` has no `common_ancestor_semantic`/`common_ancestor_direct`
+(RFC 9420 Appendix C publishes them; see *Backlog / deferred*).
+§12.4.3.1's private-key installation step uses `group.commonAncestor` (a
+direct-path intersection, `group.zig:3493`), and the send side needs something
+Appendix C does not compute: the lowest node OF THE COMMITTER'S FILTERED DIRECT
+PATH covering a leaf, `treekem.Staged.pathSecretFor` (`treekem.zig:1028`).
+
+One section disagrees with itself, and a creator has to pick a side:
 
 One more section disagrees with itself, and a creator has to pick a side:
 
@@ -1094,21 +767,11 @@ One more section disagrees with itself, and a creator has to pick a side:
 > implementation that recorded them does not emit a Commit the two readings
 > would classify differently.
 
-### What it is verified against
+### What it is anchored against
 
-`kat_commit_test.zig`, and the file is explicit about which of its claims
-are anchored and which are round trips, because creation cannot be fully
-anchored by anything:
-
-| Claim | Kind | Against what |
-|---|---|---|
-| Every `node_pub[n]` of a generated `UpdatePath`, in order | **ANCHORED** | `treekem.json`'s `update_path.nodes[n].encryption_key`, byte-exact, for all 62 update paths |
-| The generated `commit_secret` | **ANCHORED** | `treekem.json`'s `commit_secret`, byte-exact, all 62 |
-| The committer leaf's `parent_hash` | **ANCHORED** | `treekem.json`'s `update_path.leaf_node.parent_hash`, byte-exact, all 62 |
-| The per-node ciphertext COUNT, and the node COUNT | **ANCHORED** | the lengths of `update_path.nodes` and of each `encrypted_path_secret` |
-| Every recorded member opens the generated `UpdatePath` and recovers its own recorded path secret and the recorded `commit_secret` | round trip through this module's decap, over the vector's tree, the vector's private keys and the vector's expected plaintexts | `treekem.json`'s `leaves_private` + `path_secrets` |
-| A Commit created on a state restored from a recorded session lands a new member on the committer's `epoch_authenticator` | round trip, from an externally-produced starting state | `passive-client-handling-commit.json`, `passive-client-random.json` (after all 200 Commits) |
-| Two to four `Group(S)` objects run a group through Commits in both directions and agree on epoch, tree hash, confirmed transcript hash and `epoch_authenticator` at every step | round trip | `group.zig`'s own tests |
+`kat_commit_test.zig` is explicit about which of its claims are anchored and
+which are round trips, because creation cannot be fully anchored by anything
+(the claim table is under *Verification*).
 
 **How the first three become anchored at all.** A Commit has three random
 inputs — §7.4's `path_secret[0]`, §7.5's fresh leaf key pair, and one HPKE
@@ -1134,76 +797,50 @@ Two properties make that stronger than it first looks:
   parent's own stored `parent_hash`, so a matching hash at the leaf implies
   a matching hash at every node above it, all the way to the root.
 
-### What building the send half found on the RECEIVE side
+### Constraints the send half established
 
-A passive client never generates anything, so Part 7's replays exercised
-every receive path and no send path. Three problems surfaced here that all
-live in Part 7's code, and one change that is faithfulness rather than a
-fix. Each is listed with what actually covers it, because two of them are
-not visible to any upstream vector at all.
+A passive client never generates anything, so the recorded sessions exercise
+every receive path and no send path. Building the send half established these,
+which live in the receive code:
 
-1. **§7.5's exclusion applied to the §4.1.2 FILTER, not only to the
-   resolution** — a specification misreading, corrected in
-   `treekem.filteredDirectPath`, which no longer takes an excluded set.
-   The full argument is in that function's doc comment and in the
-   correction box in "Part 7" above; the short form is that dropping the
-   node leaves it blank, which puts a same-Commit-added leaf into the
-   resolution of a blank node and breaks §7.9.2's third criterion.
-   *Covered by* the "adding a member into the committer's OWN sibling leaf"
-   scenario, whose final step is the new member JOINING — `fromWelcome`
-   runs `validateParentHashes`, which returns `error.Malformed` under the
-   old reading. Reverting the fix also breaks four other tests including
-   `treekem.json`'s `processUpdatePath` KAT.
-2. **A joiner's path-secret chain that stepped through filtered-out nodes.**
-   `group.derivePathSecretsUp` walked the joiner's UNFILTERED direct path
-   from the common ancestor and applied one `DeriveSecret(., "path")` per
-   node. §7.4's chain runs along the committer's FILTERED direct path, so
-   every node above a filtered-out one was off by a derivation step. The
-   failure mode is the quiet kind: `adoptPathSecrets` validates each stored
-   secret against the node's public key and silently drops the ones that do
-   not match, so nothing fails at join time — it surfaces epochs later as a
-   Commit the member cannot decrypt. Now skips blank nodes, which on a
-   just-merged tree is exactly "the committer's filtered direct path".
-   *Covered by* a purpose-built scenario: three members removed so that a
-   whole copath subtree is blank, then a joiner added below it, then an
-   assertion that the joiner holds a path secret for BOTH surviving nodes
-   of its direct path. No recorded session reaches this shape — the first
-   version of this test did not either, and the fix was verified uncovered
-   before the test was written to cover it.
-3. **No way to adopt the private key of one's own Update.** §12.3 applies
-   Update proposals BEFORE the `UpdatePath` is decrypted, so by the time
-   `processUpdatePath` runs, the updating member's leaf in the tree already
-   carries the Update's NEW `encryption_key` — and the committer sealed a
-   ciphertext to exactly that key. A member still holding its old private
-   key fails with a bare AEAD rejection several layers down. `Group` now
-   retains `pending_updates` (public key → private key, epoch-scoped) and
-   swaps the key in as the Update is applied, whoever committed it.
-   *Covered by* the three-member scenario, which is shaped the way it is
-   (carol proposes, dave commits by reference) because that is the only
-   legal shape — §12.2 forbids an Update generated by the committer. This
-   is the one that fired first, and it fired as an unexplained
-   `AuthenticationFailed` inside HPKE.
+1. **§7.5's exclusion applies to the resolution only, not to §4.1.2's filter**
+   (Part 7). Covered by the scenario where a member is added into the
+   committer's OWN sibling leaf and then JOINS: `fromWelcome` runs
+   `validateParentHashes`, which returns `error.Malformed` under the wrong
+   reading.
+2. **A joiner's path-secret chain skips blank nodes.** §7.4's chain runs along
+   the committer's FILTERED direct path, so `group.derivePathSecretsUp`
+   (`group.zig:3529`, the `t.nodes[node] == null` skip) takes no
+   `DeriveSecret(., "path")` step at a filtered-out node; on a just-merged tree
+   the blank nodes are exactly the filtered-out ones. The failure mode is quiet:
+   `adoptPathSecrets` (`group.zig:3219`) validates each stored secret against the
+   node's public key and drops the ones that do not match, so nothing fails at
+   join time and it surfaces epochs later as a Commit the member cannot decrypt.
+   No recorded session reaches this shape; a purpose-built scenario (three
+   members removed so a whole copath subtree is blank, then a joiner added below
+   it) asserts the joiner holds a path secret for both surviving nodes of its
+   direct path.
+3. **A member adopts the private key of its own Update.** §12.3 applies Update
+   proposals BEFORE the `UpdatePath` is decrypted, so by then the updating
+   member's leaf already carries the Update's NEW `encryption_key` and the
+   committer sealed a ciphertext to exactly that key. `Group` retains
+   `pending_updates` (public key to private key, epoch-scoped, `group.zig:510`)
+   and swaps the key in as the Update is applied, whoever committed it. The only
+   legal shape is proposer != committer (§12.2 forbids an Update generated by
+   the committer).
+4. **`parentHash` walks §7.9.1's "next non-blank parent node" as written**
+   (`nextNonBlankAncestor`, `treekem.zig:389`) rather than via §4.1.2's filter.
+   §7.9.1 gives both descriptions as one thing, and at every call site they are
+   one thing (`parentHash` is called on a leaf whose direct path was just
+   merged). No test distinguishes the two; it is kept because it is what the
+   section says and stays correct if `parentHash` is called on a tree whose upper
+   path an Update or Remove blanked.
 
-And the faithfulness change, labelled as such rather than as a find:
+### The §7.3/§10.1 boundary
 
-4. **§7.9.1's "next non-blank parent node" is now walked as written**
-   (`nextNonBlankAncestor`), where the old code walked §4.1.2's filter
-   instead. §7.9.1 gives both descriptions as one thing, and at every call
-   site they provably ARE one thing: `parentHash` is only called on a leaf
-   whose direct path was just merged, and the merge blanks that path and
-   re-fills exactly the filtered part. **No test distinguishes the two, and
-   reverting this change leaves the suite green** — that was checked, not
-   assumed. It is kept because it is what the section says and because it
-   stays correct if `parentHash` is ever called on a tree whose upper path
-   an Update or Remove blanked, where a blank node can sit above a
-   non-empty copath resolution.
+§7.3's list splits cleanly, and the split is the boundary:
 
-### The §7.3/§10.1 boundary, decided rather than deferred
-
-The brief asked whether §10.1/§7.3's admission rules belong here. §7.3's
-list splits cleanly, and the split is the boundary:
-
-**Stays the caller's (Part 3)** — each needs something this module does not
+**Stays out of this module** (credential acceptance: *What is deliberately not done*; the rest: *Backlog / deferred*) — each needs something this module does not
 have. "The credential in the LeafNode is valid, as described in §5.3.1" is
 an Authentication Service, i.e. an application. The `lifetime` window needs
 a clock, and this module reads none (`meta.platform = .any`, no I/O in it at
@@ -1228,78 +865,32 @@ to be:
 
 Both default ON and both are `Policy` switches.
 
-Since 2026-10-06 a third rule is taken here, and it is NOT a switch: an
+A third rule is taken here, and it is NOT a switch: an
 X25519 HPKE key of small order — a leaf's `encryption_key`, a KeyPackage's
 `init_key`, an UpdatePath node's key, any node key of a tree imported whole
 — is refused at admission (`error.LeafNodeInvalid`; an UpdatePath parent
 node's key `error.InvalidUpdatePath`). RFC 9420 does not name it, but such a
 key is unusable rather than a policy choice: every HPKE encapsulation to it
 fails (RFC 9180 §7.1.4), so admitting one only defers the failure to every
-later Commit that must encrypt to it. See the Backlog's Done list. Both run in BOTH directions,
+later Commit that must encrypt to it. For the NIST-curve suites (0x0002/0x0005/0x0007) the same admission points refuse a key that `hpke`'s `validatePublicKey` refuses (not an uncompressed SEC1 point, non-canonical, off the curve), with the same `error.LeafNodeInvalid` (`isUnusableHpkeKey`, `group.zig:3453`). The test for the X25519 case is std's own: X25519 with a fixed clamped scalar returns `error.IdentityElement` exactly for the small-order points. All of these run in BOTH directions,
 and all three `passive-client-*.json` sessions replay green with them on —
 which is itself a small piece of evidence that the reading is the same one
 the reference implementation uses.
 
-### Where the boundary fell, and where it moved to
+### Where the send half stops
 
-§12.4.3.2 was NOT in Part 8, on the ground that it is a second substantial
-piece rather than a few lines on top of `createCommit`, and that a
-half-built external Commit next to a finished regular one would make it
-impossible to tell which of the two a failing test was about. Part 9 below
-builds it, in both directions at once, for exactly that reason.
-
-### Everything else this part does NOT do
-
-- **No `PrivateMessage` handshakes**, in either direction. Unchanged from
-  Part 7: `error.PrivateHandshakeNotSupported`.
-- **`createCommit` was not atomic** at the time of Part 8, on exactly the
-  terms `processCommit` was not. Transactional since 2026-09-11 (Backlog).
-  The cheap refusals still happen first — the whole §12.2 validation and
-  every Add's KeyPackage signature are checked before the working copy is
-  made — so the common rejection cases cost no tree copy.
+- **No `PrivateMessage` handshakes**, in either direction (Part 7).
 - **No committer-chosen leaf content.** §7.5 allows a Commit to change the
   committer's credential, capabilities or extensions ("The application MAY
-  specify other changes to the leaf node"); `createCommit` carries the
-  current leaf's content over and rotates only the keys §7.5 requires.
-  Supporting the rest means deep-copying caller-owned credential and
-  capability data into the group's arena, which is plumbing this batch did
-  not add. `treekem.StageParams` already exposes the seam for a caller that
-  wants to do it by hand.
-- **No `ReInit` follow-through** (§11.2) and no branching (§11.3). A
-  `ReInit` proposal can be committed — §12.2's "a ReInit proposal together
-  with any other proposal" rule is enforced — but nothing creates the
-  successor group.
+  specify other changes to the leaf node"); `createCommit` carries the current
+  leaf's content over and rotates only the keys §7.5 requires. `treekem.StageParams`
+  already exposes the seam for a caller that wants to do it by hand (*Backlog /
+  deferred*).
+- **No `ReInit` follow-through** (§11.2) and no branching (§11.3). A `ReInit`
+  proposal can be committed — §12.2's "a ReInit proposal together with any other
+  proposal" rule is enforced — but nothing creates the successor group.
 
-### Teeth
-
-- **The anchored generation test has a negative control.** The same
-  generation run from a path secret that is one bit off must differ from the
-  vector in every anchored field — node public keys, `commit_secret` and the
-  leaf's `parent_hash` — while still producing a path of the SAME length,
-  since the §4.1.2 filter is a property of the tree and not of the secrets.
-  Without that control, a comparison against a value the test itself
-  computed would look identical to a comparison against the vector.
-- **A Commit corrupted in one byte is rejected** by a receiver that
-  otherwise accepts it (`MacMismatch`, §12.4.2's second bullet), and the
-  receiver does not advance; the uncorrupted Commit is then accepted and
-  both sides match. A `Welcome` corrupted in one byte fails
-  `DecryptionFailed` and produces no member.
-- **`createCommit` refuses the lists a receiver would reject** — a Remove of
-  the committer, two Adds with the same signature key, an inline
-  ExternalInit — and the group is still usable afterwards.
-- **The zero-ciphertext `UpdatePathNode` is tested, not assumed away.** A
-  one-member group adding a second member produces an `UpdatePath` whose one
-  node carries NO ciphertexts, because its only copath child is the leaf
-  that same Commit added and §7.5 excludes it from the resolution. That is
-  the first Commit of every group's life; the test asserts the node count,
-  the empty ciphertext vector, and that the joiner is nonetheless merged at
-  that node via §12.4.3.1's `path_secret`.
-- **Every claimed fix was sabotage-checked (earlier, 2026-07-29).** Each of the three defects
-  above was re-introduced and the suite re-run, and the SPEC records which
-  tests catch it. The one change no test catches (§7.9.1's wording) says so
-  in the same list rather than being presented alongside the others.
-
-## Part 9 — External Commits (2026-07-29)
+## Part 9 — External Commits
 
 RFC 9420 §12.4.3.2: the second way into a group. A newcomer turns a
 published `GroupInfo` into a Commit that adds itself, and no existing
@@ -1308,21 +899,13 @@ member has to be online for it. Both directions land together —
 `processCommit` — because there is no upstream vector for either, so the
 only thing that can anchor one is the other.
 
-### What the earlier decomposition got right, and the two things it missed
+### Requirements outside §12.2
 
-The four-part decomposition recorded at the end of Part 8 held up against
-the RFC and against the code. §12.2's second, whitelist-shaped procedure;
-a `new_member_commit` branch with no `membership_tag` and the signature key
-read out of `commit.path.leaf_node`; leaf assignment on both sides; §8.3's
-`init_secret` substituted for the previous epoch's — all four are real, all
-four are what the work consisted of. Every symbol it claimed already
-existed does exist and has the shape it needed
-(`keyschedule.externalInitSender`/`externalInitReceiver`,
-`welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
-`content.Proposal.external_init`, `createCommit`'s `include_external_pub`).
-
-It missed two REQUIREMENTS, both stated in §12.4.3.2 rather than in §12.2,
-and both of which a receiver has to enforce:
+§12.2's second, whitelist-shaped procedure, a `new_member_commit` branch with no
+`membership_tag` and the signature key read out of `commit.path.leaf_node`, leaf
+assignment on both sides, and §8.3's `init_secret` substituted for the previous
+epoch's are what the work consists of. Two REQUIREMENTS are stated in §12.4.3.2
+rather than in §12.2, and a receiver has to enforce both:
 
 - **"The Commit MUST NOT include any proposals by reference, since an
   external joiner cannot determine the validity of proposals sent within
@@ -1336,9 +919,8 @@ and both of which a receiver has to enforce:
   two rules coincide today — but they are independent rules and only one of
   them is unconditional. Both are spelled out.
 
-It also under-described the leaf assignment slightly. It said "the leftmost
-blank leaf node in the new ratchet tree", which is §12.4.1's wording;
-§12.4.2's wording for the receiving side is "add a blank leaf to the right
+**Leaf assignment.** §12.4.1 says "the leftmost blank leaf node in the new
+ratchet tree"; §12.4.2's wording for the receiving side is "add a blank leaf to the right
 side of the new ratchet tree" where §12.4.1 says "expand the tree to the
 right as defined in Section 7.7". These describe the same operation, and
 `tree.RatchetTree.assignBlankLeaf` implements §7.7's doubling — the same
@@ -1468,10 +1050,10 @@ the choice, and no vector exercises it.
   follows it literally rather than inventing a rule for values a future
   document may define.
 - **A resumption `PreSharedKeyID` is matched on `psk_group_id` AND
-  `psk_epoch`, not the epoch alone.** This was a live defect until
-  2026-07-29: `resolvePsksFromIds` matched a resumption id against the
-  group's `resumption_history` by epoch number only, so an id naming ANY
-  `psk_group_id` resolved to this group's own secret for that epoch. It is
+  `psk_epoch`, not the epoch alone.** Matching on the epoch alone
+  (as `resolvePsksFromIds` once did) a resumption id against the
+  group's `resumption_history` by epoch number only, would resolve an id naming ANY
+  `psk_group_id` to this group's own secret for that epoch. It is
   the kind of bug no round trip can find — sender and receiver applied the
   same wrong rule to the same id, agreed on the `psk_secret`, and the Commit
   went through. What exposes it is the external-join path, where one side's
@@ -1499,65 +1081,8 @@ the choice, and no vector exercises it.
   KeyPackage supplies the identity half of its leaf and §7.5 samples the
   encryption key; nothing else is settable.
 
-### Teeth
+## Cipher suites 0x0002/0x0003/0x0005/0x0007
 
-- **The round trip is a genuine one.** Three parties — one of whom was a
-  stranger a moment earlier — end on the same `epoch_authenticator`, which
-  is `DeriveSecret(epoch_secret, "authentication")` and therefore
-  downstream of the §8.3 secret, the tree hash, the whole transcript and a
-  leaf index that appears nowhere on the wire. The two sides reach that
-  secret by OPPOSITE halves of §8.3 (`SetupBaseS` on the joiner,
-  `SetupBaseR` on each member), so agreement is not two copies of one
-  computation. The group is then driven one further Commit BY the newcomer
-  and processed by the founder, because a join that produced a state which
-  cannot take another Commit would satisfy every other assertion.
-- **The leftmost-blank rule is pinned by index, not by agreement.** A
-  three-member group with bob removed leaves TWO blanks (leaf 1 and leaf
-  3); the joiner must land at 1. This matters because sender and receiver
-  call the SAME function: a leftmost→rightmost change keeps them agreeing
-  and the round trip alone would pass. The other branch — a full tree,
-  §7.7 expansion, "the leftmost NEW blank leaf" — is pinned in the round
-  trip test.
-- **The whitelist is enforced END TO END, against a hostile joiner.** The
-  reject tests re-sign a real external Commit with the joiner's own
-  signature key after swapping its proposal list — which is exactly what an
-  attacker can do, since §6.1 verifies a `new_member_commit` with the key
-  in `commit.path.leaf_node`. So a receiver cannot reject a bad list by
-  signature check, and these tests reach §12.4.2's bullet 4 rather than
-  failing at bullet 3. Four distinct typed errors: an Add
-  (`ProposalNotAllowedInExternalCommit`), no ExternalInit
-  (`MissingExternalInit`), two (`MultipleExternalInit`), two Removes
-  (`MultipleRemoveInExternalCommit`), plus a by-reference proposal that
-  resolves correctly and is still refused
-  (`ProposalByReferenceInExternalCommit`). Each leaves the group unchanged
-  and at its old epoch, and the unspoiled Commit is then accepted — which
-  is what makes the refusals about the list and not about the fixture.
-- **Both halves of "no `membership_tag`" are checked.** On the wire, a tag
-  appended to the message is trailing input and `processCommit` refuses to
-  decode it (`error.Malformed`) rather than ignoring it. In the struct,
-  `rejectExternalCommitFraming` returns `UnexpectedMembershipTag`.
-- **Mutation-tested (earlier, 2026-07-29).** Three deliberate defects were introduced and
-  reverted, and the SPEC records which tests caught each:
-  `assignBlankLeaf` returning the RIGHTMOST blank — caught ONLY by the
-  leftmost test, with the round trip still green, which is the point of
-  that test existing; `processCommit` keeping the previous epoch's
-  `init_secret` instead of §8.3's — caught by all five external-Commit
-  tests with `MacMismatch` at §12.4.2's `confirmation_tag` bullet; and the
-  whitelist's `else` arm made permissive — caught by both whitelist tests,
-  with the sender-side one showing that `joinByExternalCommit` would
-  otherwise happily emit a Commit smuggling an Add.
-- **One thing NO test catches, stated rather than glossed:** deleting the
-  `rejectExternalCommitFraming` CALL from `processCommit`. No decode path
-  can produce a `PublicMessage` with a `new_member_commit` sender and a
-  non-null `membership_tag`, so the call site is unreachable through the
-  public API; the guard is defensive against a future path (a
-  `PrivateMessage` unprotect, a caller-built struct) and its doc comment
-  says so. The function itself is tested directly.
-
-## Cipher suites 0x0002/0x0003/0x0005/0x0007 (2026-11-17)
-
-`suite.supported` lists the five instantiated suites in registry order:
-`0x0001`, `0x0002` (P-256/AES-128-GCM/SHA-256/ECDSA-P256), `0x0003`
 (X25519/ChaCha20-Poly1305/SHA-256/Ed25519), `0x0005` (P-521/AES-256-GCM/
 SHA-512/ECDSA-P521) and `0x0007` (P-384/AES-256-GCM/SHA-384/ECDSA-P384). Every
 primitive is a sibling's. The KEMs are `hpke`'s, the AEADs `aesgcm`'s and
@@ -1573,10 +1098,9 @@ What crosses the wire is checked against `S` exactly as before:
 - a `Welcome` or `GroupInfo` of another suite is `error.CipherSuiteMismatch`;
 - an Add whose KeyPackage names another suite or protocol version is
   `error.KeyPackageMismatch` on both `createCommit` and `processCommit`
-  (RFC 9420 §10.1 MUST). The check already existed but had no test. A
-  `0x0003` KeyPackage has the same widths as a `0x0001` group's, so this
-  comparison is the only thing that separates them; it is now pinned in
-  `group.zig`.
+  (RFC 9420 §10.1 MUST). A `0x0003` KeyPackage has the same widths as a
+  `0x0001` group's, so this comparison is the only thing that separates them;
+  tests in `group.zig` pin it.
 
 **Signature encodings are the suite's (RFC 9420 §5.1.1/§5.1.2).** EdDSA keys
 are raw 32 bytes and signatures the fixed 64-byte `R || S`. ECDSA public keys
@@ -1586,28 +1110,23 @@ signatures are DER `Ecdsa-Sig-Value`s, and anything else (raw `r || s`, a
 truncated DER) is also `error.WrongKeyLength`. That is the error every
 verifier here already returned for a signature it cannot parse.
 `S.encodeSignature`/`decodeSignature`/`encodePublicKey`/`decodePublicKey`/
-`signatureKeyPair` are the only places that know the difference. `Nx` is now
-the maximum signature width, and `Nspk`/`Nssk` are the public and private
+`signatureKeyPair` are the only places that know the difference. `Nx` is the maximum signature width, and `Nspk`/`Nssk` are the public and private
 signature key widths.
 
 **Private keys handed in.** `Group.create`/`fromWelcome` rebuild the KEM key
-pair from a caller's private key with `hpke`'s new `Kem.keyPairFromSecret`.
-X25519 used std's `generateDeterministic`, which the NIST KEMs do not have. A
+pair from a caller's private key with `hpke`'s `Kem.keyPairFromSecret`
+(std's X25519 `generateDeterministic` has no NIST counterpart). A
 NIST scalar outside `[1, n-1]` is `error.PrivateKeyMismatch`, the error a
 wrong key already got.
 
-**Two findings on the way.** First, `treekem.applyUpdatePath` took no suite
-and hashed parent hashes with `suite.default`'s SHA-256. That was invisible
-while every wired suite used SHA-256, but every genuine `0x0005`/`0x0007`
-UpdatePath was rejected as `Malformed`. It now takes `comptime S`
-(BREAKING for direct callers; `Group` passes its suite). Second, the upstream
-P-521 vectors write private keys as minimal big-endian integers (65 bytes when
-the top byte is zero). The KAT harnesses left-pad them to the 66-byte scalar
-the API takes. The API itself stays fixed-width, as RFC 9180's
-`SerializePrivateKey` is.
+**Two facts.** `treekem.applyUpdatePath` takes `comptime S` because parent hashes
+use the suite's hash (see Part 2). The upstream P-521 vectors write private
+keys as minimal big-endian integers (65 bytes when the top byte is zero); the
+KAT harnesses left-pad them to the 66-byte scalar the API takes. The API itself
+stays fixed-width, as RFC 9180's `SerializePrivateKey` is.
 
-**What the vectors cover.** Every official vector file the module drove for
-`0x0001` now runs once per supported suite: crypto-basics, key-schedule,
+**What the vectors cover.** Every official vector file the module drives for
+`0x0001` runs once per supported suite: crypto-basics, key-schedule,
 psk_secret, secret-tree, message-protection, transcript-hashes, welcome,
 tree-validation, treekem, passive-client-welcome and
 passive-client-handling-commit, plus the commit-generation KATs over treekem
@@ -1622,85 +1141,6 @@ and signature both verify, and `protectPrivate`'s output decrypts with the
 same keys to the vector's body under a verifying signature. The suite-filtered
 embedded files are re-filtered from the same upstream commit to suites
 {1, 2, 3, 5, 7} (`NOTICE`), in upstream order, with records unmodified.
-
-**Delta mutation 2026-11-17 (NIST HPKE key admission):** 2 mutants on
-`isUnusableHpkeKey`'s new branch (the length guard dropped: killed by an
-index-out-of-bounds panic on the short key; a refused key reported usable:
-killed by the admission test), 2/2; the `@hasDecl` branch is comptime and has
-the second mutant's effect. Card cumulative 53/54, 1 equivalent.
-
-**Delta mutation 2026-11-17** over the non-test changes: 11 mutants, 11
-killed, 0 equivalent. They cover the signature and public-key codecs
-(`encodeSignature` for both families, `decodeSignature`'s length guard,
-`encodePublicKey`, `decodePublicKey`'s length and `0x04` guards,
-`signatureKeyPair`'s ECDSA arm), `hpkeSuiteId`'s KDF id, and the three
-`keyPairFromSecret → PrivateKeyMismatch` mappings in `create`/`fromWelcome`.
-Two new tests close what the KATs could not reach. The first is
-`hpkeSuiteId` against the RFC 9180 registry ids written out per suite (a
-SHA-256-only KDF id passes every round trip). The second is the NIST
-private-key refusal on `create` and both `fromWelcome` keys. The
-`applyUpdatePath` fix has no runtime mutant, because the suite is a
-comptime parameter. The treekem.json vectors of `0x0005`/`0x0007` are what
-fail without it. Cumulative with the 2026-10-06 run: 51/52, 1 eq.
-
-**Not done.** The X25519 low-order key refusal (`isUnusableHpkeKey`) has no
-NIST analogue. A KeyPackage whose P-256/P-384/P-521 `init_key` or
-`encryption_key` is not a curve point is admitted, and later fails at
-encapsulation (`hpke`'s `DeserializeError`), exactly as a low-order X25519
-key did before 2026-10-06. Backlog: refuse it at admission, which needs a
-public point-validation entry in `hpke` or the curve siblings.
-
-## Mutation run 2026-10-06
-
-**Mutation run 2026-10-06** (in-place, Debug, 41 mutants over the security
-core: framed-content signature, membership- and confirmation-tag
-verification, the epoch checks on Commits and proposals, the secret tree's
-forward-jump bound, replay and exhaustion guards, varint and protocol-version
-decode refusals, every `processCommit` path rule, §12.2's list rules for both
-procedures, §12.1.4's PSK rules, and the joiner's tree-hash, signature,
-key-uniqueness and PSK-list checks): 40 killed. The first pass left 18, and
-the shape of the gap is the finding: the framed-content signature could be
-skipped on every path (member Commit, external Commit, proposal), and every
-`processCommit` path rule could be deleted, without one test failing —
-because a forged message also breaks the confirmation tag, so the receiver
-still refused, just later and with `MacMismatch`. The tests added therefore
-forge as an INSIDER (re-signing and re-tagging with keys a member holds) and
-assert each rule's OWN error: a bad signature under a valid membership tag,
-a dropped path, a non-`commit` leaf source, a bad leaf signature, a reused
-path key, a forged leaf `parent_hash`; proposals handed to `processCommit`
-with a bad tag, signature or epoch; an external Commit's bad signature; and,
-through `createCommit`, the committer's own Update, two GroupContextExtensions,
-a duplicated PSK, an Add of an existing member, and a second leaf with
-another's encryption key. Also added: `join` with a same-width but different
-PSK list, and a `parent_hash` tamper against `applyUpdatePath` itself for
-every `treekem.json` path. **Bug found and fixed:** a Commit naming one PSK
-twice made `validateProposalList` free its scratch encoding twice (an
-explicit free before a `return` its own `errdefer` also covered) — on the
-receive path too, after authentication, so any member could trigger it.
-Equivalent: the "committer's encryption key must change" check
-(`rejectReusedPathKeys` runs right after it over a tree that still holds the
-committer's old leaf, and refuses the same message with the same error).
-
-**The run's leak hint — RESOLVED 2026-10-06, no leak.** The mutants that
-deleted the committer's-own-Update, two-GroupContextExtensions and
-duplicate-PSK checks made `testing.allocator` report leaks, read at the
-time as missing `errdefer`s on `createCommit`'s later failure paths.
-Reproduced: with those checks gone `createCommit` SUCCEEDS, and the leaked
-buffers are the returned `commit`/`group_info`, which the test's
-`expectError` received as an unexpected success and never freed — a test
-artifact, not a library path. Checked anyway on clean code with
-`std.testing.checkAllAllocationFailures` over whole sessions under one
-failing allocator (`create`, `createCommit`, `fromWelcome`,
-`processCommit`, `updateLeaf`/`createProposal`, `joinByExternalCommit`;
-six shapes: empty full Commit, Add with `external_pub` and extra GroupInfo
-extensions, external PSK, by-reference Update, path omitted, external join
-with a PSK — 148 to 296 failure points each, 1339 in all): every point
-clean. Non-OOM failures after validation are covered too: `DuplicateKeyInTree`
-and `PskNotAvailable` by existing tests, and an HPKE failure midway through
-the Welcome slots and midway through the UpdatePath ciphertexts by a new
-one (an all-zero X25519 key, which admission now refuses — the test seats
-it through a test-only hook; see Backlog, Done). Both instruments were shown to
-fire by deleting one `errdefer` each.
 
 ## Threat model
 
@@ -1778,11 +1218,12 @@ fire by deleting one `errdefer` each.
   does NOT check, and the caller MUST, is listed in its doc comment — most
   importantly that `GroupInfo.signer` names a non-blank leaf whose
   `signature_key` is the one passed in, and the tree-integrity block.
-- **A low-order HPKE key from a peer.** A KeyPackage, LeafNode, UpdatePath
+- **A low-order or invalid HPKE key from a peer.** A KeyPackage, LeafNode, UpdatePath
   or imported tree carrying a small-order X25519 key would make every later
   encapsulation to it fail — one member wedging every path Commit that
   reaches its leaf. Refused at admission (`error.LeafNodeInvalid`, or
-  `error.InvalidUpdatePath` for an UpdatePath parent key) since 2026-10-06.
+  `error.InvalidUpdatePath` for an UpdatePath parent key). A NIST-suite key that
+  is not a valid curve point is refused the same way (Part 8).
 - **A ratchet tree from an untrusted source (Part 6).** §12.4.3.3 permits
   the tree to arrive out of band precisely because `verifyTreeHash` binds
   it to the SIGNED `GroupContext`. That check is exposed as its own
@@ -1797,198 +1238,237 @@ fire by deleting one `errdefer` each.
   round-trips `EncryptWithLabel`→`DecryptWithLabel` through the real
   `io`-backed path to confirm the non-deterministic entry point itself
   works, not just the deterministic-input decrypt half.
+- **Retained memory of a long-lived `Group`.** Every adopted Commit keeps its
+  own arena (`epoch_arenas`, `group.zig:444`) until `deinit`, because the tree
+  aliases those bytes (`tree.zig`'s stated convention). Measured on a receiver in
+  an eight-member group taking Update-only Commits: about 5.2 KB per epoch (21.7
+  KB at epoch 1, 335 KB at epoch 61); each small arena's unused tail is the
+  difference from a single shared arena, because `std.heap.ArenaAllocator` grows
+  every new chunk to half again the previous one plus the request. Irrelevant for
+  the 200-Commit vector; for a long-lived group it is a leak in all but name. A
+  REFUSED Commit keeps nothing. The plan is under *Backlog / deferred*.
+- **`createCommit` and `processCommit` are not a transport-level
+  authentication.** The identity in a joiner's leaf and the credential in any
+  `LeafNode` are vouched for by nothing in this module (§5.3.1's
+  Authentication Service is the application's; see *What is deliberately not
+  done*).
 
-## Backlog
+## Verification
 
-- **`kat_treekem_test.zig` still carries a test-local `KeyPackage` parser.**
-  It predates `keypackage.zig` (Part 5) and was written only to reach
-  `tree-operations.json`'s Add proposals. Switching it to
-  `keypackage.KeyPackage` would delete duplicated parsing and give that
-  vector a second consumer; left alone in this pass to avoid touching a
-  passing Part 2 KAT for a cosmetic win. `tree.decodeExtensionList`'s doc
-  comment names this.
-- **`content.zig` has no standalone `Add`/`Update`/`Remove`/`PreSharedKey`/
-  `ExternalInit`/`GroupContextExtensions` types** — each §12.1 body is a
-  `Proposal` union arm holding the type it wraps (`Add` is a `KeyPackage`,
-  `Remove` is a `u32`, …), since none of those RFC structs has a second
-  field. The consequence is that `kat_messages_test.zig` drives the bare
-  `*_proposal` vector fields through the WRAPPED types, prepending the
-  §17.4 type value where the vector has none. If a future extension
-  proposal type needs a real struct, that is when to split them out.
-- **`createCommit` cannot change the committer's leaf CONTENT.** §7.5 allows
-  a Commit to carry a new credential, capabilities or extensions for the
-  committer's leaf; Part 8 carries the current content over and rotates only
-  the keys. The blocker is plumbing, not design: caller-owned credential and
-  capability data would have to be deep-copied into the group's arena the
-  way `dupExtensions` does for GroupContext extensions.
-  `treekem.StageParams` already exposes the seam.
-- **`framing.zig` exposes no single `unprotectPrivate`.** Decryption is
-  genuinely two-phase (§6.3.2's sender data names the key that §6.3.1's
-  content needs), and the key lookup between the phases is the caller's, so
-  the three stages are exposed separately rather than behind a callback.
-  Part 7's group object did NOT make the lookup internal, because it does
-  not drive the §9 secret tree per epoch — see
-  `group.Error.PrivateHandshakeNotSupported`. Revisit together with that.
-- **`group.Group`'s retained state grows monotonically with session
-  length.** Every adopted Commit keeps its own arena (`epoch_arenas`) —
-  the message copy the tree's new leaves alias, and what was decoded from
-  it — until `deinit`, because the tree aliases those bytes (`tree.zig`'s
-  stated convention). A REFUSED Commit keeps nothing since 2026-09-11.
-  Measured on a receiver in an eight-member group taking Update-only
-  Commits: about 2.8 KB per epoch with the one shared arena this module
-  had until 2026-09-11, about 5.2 KB per epoch with an arena per Commit
-  (21.7 KB at epoch 1, 335 KB at epoch 61). The difference is each small
-  arena's own unused tail: `std.heap.ArenaAllocator` grows every new chunk
-  to half again the previous one plus the request. For the 200-Commit
-  vector this is irrelevant; for a long-lived group it is a leak in all but
-  name. The fix is still owning leaf bytes rather than aliasing them, which
-  would let an epoch's arena go once nothing in the tree points into it.
-- **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret`
-  takes one as a parameter, but `schedule.suiteIdOf` is private, so
-  `keyschedule.hpkeSuiteId` restates the `Aead` -> `aead_id` mapping in
-  order to call it. `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so
-  only that one mapping is duplicated, and it `@compileError`s rather than
-  guessing for an unregistered AEAD. The clean fix is upstream in `hpke`
-  (export `suiteIdOf`, or have `Context` carry its own suite id); this
-  batch was scoped out of that module.
-- **§12.4's `pathRequiredTypes` and §12.4.2's own bullet disagree**, and
-  this module follows §12.4 (the section that defines §17.4's "Path
-  Required" registry column). §12.4.2 names only Update, Remove and an empty
-  list; §12.4 adds `external_init` and `group_context_extensions`. Following
-  the broader rule can only reject Commits a §12.4.2-literal implementation
-  would accept — no recorded session in `passive-client-*.json` contains
-  one, so the disagreement is unobservable against the vectors available. If
-  it ever becomes observable, the receive side is the one to relax, not the
-  send side.
-- **The secret tree's non-power-of-two tree shape is not vector-covered.**
-  `secrettree.nodeSecret` walks `treemath`'s truncated tree, which is what
-  §9 requires ("the same structure as the group's ratchet tree"), but
-  `secret-tree.json` only publishes trees of 1, 8 and 32 leaves — all
-  powers of two. The truncated-tree path is therefore reasoned-correct (it
-  reuses Part 1's already-vector-pinned `treemath`) rather than
-  externally anchored. A later part that builds a real group of, say, 5
-  members exercises it for free.
-- **`treemath.zig`'s `common_ancestor_semantic`/`common_ancestor_direct`**
-  (RFC 9420 Appendix C also publishes these) are NOT implemented here —
-  not required by `tree-math.json`'s published fields (`root`/`left`/
-  `right`/`parent`/`sibling` only). **This entry was stale as written, and
-  is corrected 2026-07-29.** It predicted the two would arrive with the
-  group-state object; the group-state object arrived in Part 7 without
-  them. §12.4.3.1's private-key installation step is served by
-  `group.commonAncestor`, a direct-path intersection written where it is
-  used rather than a port of Appendix C, and Part 8's send side needs
-  something the RFC's `common_ancestor_*` does not compute at all — "the
-  lowest node OF THE COMMITTER'S FILTERED DIRECT PATH covering this leaf",
-  which is `treekem.Staged.pathSecretFor`. Porting Appendix C's two
-  functions is therefore now a completeness item with no consumer, not a
-  prerequisite for anything.
-- **`ParentNode.unmerged_leaves` sorted-increasing invariant (RFC 9420
-  §7.1) is not decode-time validated** — `tree.zig`'s `ParentNode.decode`
-  accepts any order; a later part (or the Fable pass's
-  `validateParentHashes`) may want to check this explicitly if a vector
-  ever exercises a violation (none of Part 2's KATs do).
-- **Group-level application messages: per-epoch secret-tree driver and `protectApplication`/`unprotect`** *(survey 2026-09-30)*: the everyday operation of an MLS client. `rg -i 'application|protectPrivate' modules/mls/src/group.zig` shows the group object never encrypts or decrypts application data; `group.zig`'s header calls it a scope boundary. OpenMLS/mls-rs expose it as the main call. Effort: medium (generation/deletion policy for the ratchets per epoch, out-of-order window already in `secrettree.Window`). Fits §2.
-- **`PrivateMessage` handshake messages (proposals/commits)** *(survey 2026-09-30)*: the common wire-format policy in deployments encrypts handshakes too; here `processCommit` returns `PrivateHandshakeNotSupported`. Effort: medium, done together with the item above (needs the secret tree). Fits §2.
-- **More cipher suites** *(survey 2026-09-30)*: **Done 2026-11-17** for 0x0002, 0x0003, 0x0005 and 0x0007 (see "Cipher suites 0x0002/0x0003/0x0005/0x0007"). Open: 0x0004/0x0006 (X448/Ed448). `ed448` has the signature side, but `hpke` has no DHKEM(X448) (its Backlog); instantiate both suites when that lands.
-- **Part 3: §7.3/§10.1 LeafNode and KeyPackage validation and X.509 credentials** *(survey 2026-09-30)*: lifetime, capability and extension consistency, credential acceptance; existing README/SPEC list it as "still not built". Every real deployment needs at least the lifetime and capability checks; X.509 credential support needs sibling `x509`. Effort: medium. Fits §2.
-- **ReInit and subgroup branch (§11.2/§11.3)** *(survey 2026-09-30)*: named in README as remaining. Effort: small-medium once resumption PSKs (already done) are used. Fits §2.
+Run: `scripts/modtest mls` (Debug and `-Doptimize=ReleaseFast`),
+`zig fmt --check modules/mls`. Every official vector file the module drives for
+suite `0x0001` runs once per `suite.supported` suite (`tree-operations.json` and
+`passive-client-random.json` exist upstream for `0x0001` only); ECDSA signatures
+carry the signer's nonce, so for the ECDSA suites the byte-exact *sign* checks
+become verify checks (see the cipher-suites section). A test summary without
+counts means nothing ran.
 
-### Done (kept for the record, not open)
+**Official vectors** (`src/data/`, source and terms in `NOTICE`; every one is
+driven by a `kat_*_test.zig`):
 
-- **A low-order X25519 key at admission — FIXED 2026-10-06** *(found the
-  same day by the mutation run's leak work)*. An all-zero (or any other
-  small-order) `init_key` or leaf `encryption_key` was well-formed, signed
-  fine, and passed every §12.2/§10.1 check; once seated, every path Commit
-  whose resolution reached it failed for the committer (`DhFailed` from the
-  Welcome, `Malformed` from `treekem.sealUpdatePath`) until a Remove took it
-  out. Now refused where keys enter, in both directions:
-  `checkLeafSelfConsistent` (Add and Update proposals for `createCommit` and
-  `processCommit`, the external joiner's own KeyPackage), the Add arm of
-  `applyProposals` for `init_key`, `processCommit`'s UpdatePath (leaf and
-  parent-node keys) and `verifiedTreeFromGroupInfo` (every node of a tree
-  `fromWelcome` or `joinByExternalCommit` imports). The test is std's own:
-  X25519 with a fixed clamped scalar returns `error.IdentityElement`
-  exactly for the small-order points (`isUnusableHpkeKey`; X25519-KEM
-  suites only). Tests: the detector over all eight small-order encodings;
-  `createCommit` refusing both KeyPackages with and without a path;
-  `processCommit` refusing a genuine Commit from a non-checking committer
-  and four insider forgeries (Add swapped for either KeyPackage, path leaf
-  key, path node key); a Welcome whose tree carries such a leaf. RED before
-  (`DhFailed`, accepted, `Malformed`, joined), and each of the four
-  admission points was deleted in turn to show a test fails without it.
+| Vector | Drives | Checked |
+|---|---|---|
+| `tree-math.json`, `crypto-basics.json` | `treemath`, the labeled-crypto primitives, the codec | byte-exact; `SignWithLabel` re-signs the vector's `(priv, label, content)` and must equal the published signature (Ed25519 is deterministic) |
+| `tree-validation.json` | tree hash (every node index), leaf-signature verification, `resolution`, `validateParentHashes` | byte-exact / verify-exact; `validateParentHashes` accepts every tree and rejects every single-byte parent-hash tamper |
+| `tree-operations.json` | `addLeaf`/`updateLeaf`/`removeLeaf` | resulting tree bytes and both tree hashes |
+| `treekem.json` | `processUpdatePath` (commit secret + first path secret for every receiver view, under the provisional GroupContext with `tree_hash = tree_hash_after`), `applyUpdatePath` (reproduces `tree_hash_after`) | byte-exact |
+| `key-schedule.json` | `GroupContext.encode`/`decode`, `joinerSecret`, `welcomeSecret`, `epochSecret`, `deriveEpoch`, `externalKeyPair`, `mlsExporter` | every stage of a five-epoch chain, per Table 4 row, including the encoded `GroupContext` in both directions |
+| `psk_secret.json` | `PreSharedKeyId.encode`, `PskLabel`, `pskSecret` | chains of 0 through 10 PSKs, including the empty list |
+| `secret-tree.json` | `nodeSecret`, `ratchetBaseSecret`, `Ratchet`, `Window`, `senderDataKeys` | 1/8/32-leaf trees; every named generation of both ratchets of every leaf, driven forward through `Ratchet` and in reverse through `Window` |
+| `message-protection.json` | `protectPublic`/`unprotectPublic`, `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `signFramedContent`/`verifyFramedContent`, `membershipTag` | `PrivateMessage` for all three content types and `PublicMessage` for the two handshake types, byte-exact in BOTH directions (the send direction is reproduced from the reuse guard, generation and padding recovered from the decrypted vector); application content as a `PublicMessage` is checked to be refused (§6), which is why that pairing is absent |
+| `transcript-hashes.json` | `transcript.confirmedTranscriptHash`/`interimTranscriptHash`/`advance`, `AuthenticatedContent` re-encode, `verifyConfirmationTag` | both §8.2 hashes byte-exact; the Commit's own `confirmation_tag` verifies against the confirmed hash it produces |
+| `messages.json` | every §12.1 proposal body, §12.4 `Commit`, §10 `KeyPackage`, §6 `MLSMessage`, and §12.4.3.1's `Welcome`/`GroupInfo`/`GroupSecrets`, §12.4.3.3's bare `ratchet_tree` | decode then re-encode byte-exact per embedded field; the `ratchet_tree` extension body inside `mls_group_info` is cross-checked against the standalone `ratchet_tree` field. A decode-then-re-encode check cannot see a payload byte change, only a length or presence octet: it is a wire-format anchor |
+| `welcome.json` | `Welcome`/`GroupInfo`/`GroupSecrets` codecs, `findSecret`, `decryptGroupSecrets`, `welcomeSecret`, `welcomeKeyNonce`, `encryptGroupInfo`/`decryptGroupInfo`, `GroupInfo.verifySignature`, `deriveEpochFromJoiner`, `verifyConfirmationTag`, `interimTranscriptHash`, `join` | every layer staged and byte-exact in the RECEIVE direction, the vector's own `encrypted_group_info` reproduced in the SEND direction, and the one-call `join` required to agree with the hand-staged path field by field |
+| `passive-client-welcome.json` | recorded joins spanning both §12.4.3.3 tree sources and both PSK cases | `fromWelcome` lands on the recorded `epoch_authenticator`; no Commits in this file |
+| `passive-client-handling-commit.json` | recorded two-Commit sessions, each injecting an external PSK; the epochs span empty, single and multi-proposal Commits, including one with an Add, a Remove, two PSKs and a GroupContextExtensions together | `processCommit` per Commit, `epoch_authenticator` compared at every epoch |
+| `passive-client-random.json` | ONE recorded session of 200 consecutive Commits, growing the group until an `UpdatePath` spans seven levels | same; `epoch_authenticator` depends on the GroupContext (tree hash, the whole transcript) and on the previous `init_secret`, so one wrong bit anywhere makes that epoch and every later one wrong |
 
-- **§8.3 external init — DONE 2026-07-29** (`keyschedule.externalInitSender`/
-  `externalInitReceiver`), and honestly labelled: it is the only derivation
-  in `keyschedule.zig` with no external MLS anchor, so it is pinned by a
-  sender/receiver round trip plus RFC 9180's own KATs one layer down, not
-  by a byte-exact interop vector. Its export-context string and HPKE
-  `suite_id` are pinned as literals separately, because a round trip alone
-  cannot catch a label both sides get wrong the same way.
-- **External Commits (§12.4.3.2) — DONE 2026-07-29 (Part 9).** Both
-  directions in one batch (`Group(S).joinByExternalCommit` and
-  `processCommit`'s `new_member_commit` branch), because with no upstream
-  external-commit vector the only thing that can anchor one direction is
-  the other. The four-part decomposition recorded here beforehand held up;
-  it missed §12.4.3.2's "MUST NOT include any proposals by reference" and
-  its "MUST contain a path field", both of which are receiver-enforced
-  rules that live outside §12.2. See "Part 9" for what anchors it and for
-  what it deliberately leaves out (the resync case where the RECEIVER is the
-  removed member). Resumption PSKs in an external join were left out here
-  and closed on 2026-07-29 via `ExternalJoinParams.resumption_psks`; closing
-  them turned up a §8.4 lookup defect (epoch-only matching) and a genuine
-  contradiction between §12.4.3.2 and §12.1.4 — both under "Part 9" above.
-- **`passive-client-*.json` — CLAIMED and green 2026-07-29** (Part 7). All
-  three replay end to end, including the 200-Commit session. See "Part 7".
-- **`processCommit`/`createCommit` atomicity — DONE 2026-09-11.** It was
-  not "a backlog item and not a defect", as this entry used to say: an
-  external Commit is signed with a key it carries itself, so a stranger
-  holding a published `GroupInfo` reached §12.4.2's confirmation-tag
-  bullet, and the `error.GroupPoisoned` it left behind disabled the group
-  for every member that received the message, with `deinit` as the only
-  way out. Both Commit paths now build a WORKING COPY (`Group.fork`) and
-  swap it in only after the last fallible step (`reserveAdoption`, then the
-  infallible `adopt`); `error.GroupPoisoned` and `Group.poisoned` are gone.
-  The copy did NOT need the deep clone this entry predicted. What a
-  Commit's tree edits write or free is the tree's CONTAINERS — the node
-  array, the leaf lists, `unmerged_leaves` — never its byte fields, so
-  `cloneTree` copies exactly those into an arena of their own (the
-  "second arena" option) and the bytes stay aliased. Measured by
-  allocation-failure sweeps with one fresh object per failure point:
-  member `processCommit` — 34 points, 24 left the group changed, 28 left
-  it unable to take the same Commit — now 40 points, 0 and 0; external
-  `processCommit` 26/19/21 → 31/0/0; `createCommit` 64/53/57 → 68/0/0.
-  Every arena the group owns wipes its memory on release, so a refused
-  Commit also leaves no copy of the path secret it decrypted (scanned:
-  1 live copies → 0). The sweeps also found 17 leaked
-  allocations on `createCommit`'s failure paths — `treekem.sealUpdatePath`
-  released only its outer array, `buildWelcome` lost a ciphertext when the
-  `dupe` after it failed — fixed in the same change.
-- **Scratch-buffer size (512 bytes) — RESOLVED 2026-07-28** by the second
-  of the two options this item listed: `crypto.ExpandWithLabelScratch` takes
-  a caller-supplied slice and `crypto.kdfLabelLen` sizes it exactly, while
-  `ExpandWithLabel` keeps the fixed-buffer convenience for the bounded
-  callers. `keyschedule.zig` uses it for the two `GroupContext`-carrying
-  derivations; a regression test drives a 4 KB context through both entry
-  points and asserts the fixed one refuses rather than truncates.
-- **Part 2 (TreeKEM) vector fetch/audit — DONE 2026-07-16**, see "Part 2 —
-  TreeKEM" above (was previously listed here as not-yet-done).
-- **Part 2's five Fable cores are DONE 2026-07-16** —
-  `resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/
-  `applyUpdatePath` (`treekem.zig`) are implemented and the gate
-  (`gate.treekem_core_implemented`) is `true`. `tree-validation.json`'s
-  resolution/parent-hash-chain checks and the whole `treekem.json` vector
-  (`kat_treekem_test.zig`) now run byte-exact. NB: the in-repo harness had
-  two owner-fixed defects the Fable pass correctly refused to hack around
-  (it proved correctness via a scratch driver instead) — the gated
-  `processUpdatePath` test seeded `group_context = ""`/empty path secrets
-  (every decrypt fails `AuthenticationFailed` regardless of correctness),
-  and the parent-hash negative control indexed `tampered[0]` on the root's
-  zero-length hash (an OOB panic); both were rewritten to the official
-  `test-vectors.md` procedure (provisional GroupContext with
-  `tree_hash = tree_hash_after`; tamper only non-empty hashes) with every
-  assertion kept byte-exact.
+Each reduced file's coverage is guarded by assertions (`kat_passive_test.zig`),
+so a future re-filter that drops a case fails rather than passing quietly.
+Every diagnostic names the vector, entry and epoch index.
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 4 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+**What cannot be byte-anchored, and what stands in.** The per-member HPKE layer
+of a `Welcome` and the `GroupInfo` signature are receive-direction only against
+`welcome.json` (HPKE draws a fresh ephemeral keypair and the vector publishes
+only the public `kem_output`; it publishes `signer_pub` and no private key);
+`welcome.zig`'s own tests round-trip them. External Commits and §8.3 have no
+upstream vector. Creation (`kat_commit_test.zig`) is anchored where it can be:
+
+| Claim | Kind | Against what |
+|---|---|---|
+| Every `node_pub[n]` of a generated `UpdatePath`, in order | **ANCHORED** | `treekem.json`'s `update_path.nodes[n].encryption_key`, byte-exact, for every update path |
+| The generated `commit_secret` | **ANCHORED** | `treekem.json`'s `commit_secret`, byte-exact |
+| The committer leaf's `parent_hash` | **ANCHORED** | `treekem.json`'s `update_path.leaf_node.parent_hash`, byte-exact |
+| The per-node ciphertext COUNT, and the node COUNT | **ANCHORED** | the lengths of `update_path.nodes` and of each `encrypted_path_secret` |
+| Every recorded member opens the generated `UpdatePath` and recovers its own recorded path secret and the recorded `commit_secret` | round trip through this module's decap, over the vector's tree, private keys and expected plaintexts | `treekem.json`'s `leaves_private` + `path_secrets` |
+| A Commit created on a state restored from a recorded session lands a new member on the committer's `epoch_authenticator` | round trip, from an externally-produced starting state | `passive-client-handling-commit.json`, `passive-client-random.json` (after all 200 Commits) |
+| Two to four `Group(S)` objects run a group through Commits in both directions and agree on epoch, tree hash, confirmed transcript hash and `epoch_authenticator` at every step | round trip | `group.zig`'s own tests |
+
+A negative control drives the same generation from a path secret one bit off and
+requires every anchored field to differ while the path length stays the same
+(the §4.1.2 filter is a property of the tree, not of the secrets).
+
+**Test classes beyond the vectors** (in `group.zig`, `welcome.zig`,
+`framing.zig`, `secrettree.zig`, `keyschedule.zig`, `transcript.zig`):
+
+- **Negative controls on every layer.** A corrupted byte must fail the stage it
+  belongs to (content AEAD, signature, MAC, confirmation tag); a wrong reuse
+  guard must fail the content AEAD (the XOR reaches the nonce); the Commit's
+  `confirmation_tag` must NOT verify against the interim hash or the previous
+  interim hash; a flipped byte of the per-member HPKE context must fail the open;
+  an unknown `KeyPackageRef` is `NoMatchingKeyPackage`; another cipher suite is
+  refused before any decryption; a `GroupInfo` with another epoch's
+  `confirmation_tag`, or a flipped bit of `joiner_secret`, is caught by the
+  CONFIRMATION TAG specifically; a tree whose root hash is not the signed
+  `tree_hash` fails `verifyTreeHash`.
+- **Insider forgeries.** Because a forged message also breaks the confirmation
+  tag, a receiver refuses it later with `MacMismatch` even when the rule under
+  test is deleted; so the handshake rules are tested by forging as an INSIDER
+  (re-signing and re-tagging with keys a member holds) and asserting each rule's
+  OWN error: a bad signature under a valid membership tag, a dropped path, a
+  non-`commit` leaf source, a bad leaf signature, a reused path key, a forged
+  leaf `parent_hash`, proposals handed to `processCommit` with a bad tag,
+  signature or epoch, an external Commit's bad signature, and, through
+  `createCommit`, the committer's own Update, two GroupContextExtensions, a
+  duplicated PSK, an Add of an existing member, and a second leaf with another's
+  encryption key. External-Commit whitelist tests re-sign a real external Commit
+  with the joiner's own key after swapping its proposal list (which is what an
+  attacker can do), so they reach §12.4.2's bullet 4 rather than failing at the
+  signature: each typed error (`ProposalNotAllowedInExternalCommit`,
+  `MissingExternalInit`, `MultipleExternalInit`, `MultipleRemoveInExternalCommit`,
+  `ProposalByReferenceInExternalCommit`) leaves the group unchanged and at its
+  old epoch, and the unspoiled Commit is then accepted.
+- **Pinned by index, not by agreement.** Sender and receiver call the same
+  `assignBlankLeaf`, so a leftmost-to-rightmost change keeps them agreeing and a
+  round trip alone would pass: a three-member group with a member removed leaves
+  two blanks and the joiner must land at the leftmost; the full-tree §7.7
+  expansion case is pinned in the round-trip test. `hpkeSuiteId` is tested
+  against the RFC 9180 registry ids written out per suite (a SHA-256-only KDF id
+  passes every round trip). The `suite_id` and the §8.3 export-context string are
+  literals.
+- **Round trip that is genuine.** An external join of a stranger ends on the same
+  `epoch_authenticator` as the founder, reached by OPPOSITE halves of §8.3
+  (`SetupBaseS` on the joiner, `SetupBaseR` on each member), and the group is then
+  driven one further Commit BY the newcomer and processed by the founder.
+- **Allocation failure.** `std.testing.checkAllAllocationFailures` sweeps whole
+  sessions under one failing allocator (`create`, `createCommit`, `fromWelcome`,
+  `processCommit`, `updateLeaf`/`createProposal`, `joinByExternalCommit`; shapes
+  including an empty full Commit, an Add with `external_pub` and extra GroupInfo
+  extensions, an external PSK, a by-reference Update, a path omitted, an external
+  join with a PSK; `group.zig:7353`): every failure point leaves the group
+  unchanged and able to take the same Commit, and no allocation leaks. A
+  test-only hook seats a key admission would refuse so an HPKE failure midway
+  through the Welcome slots and the UpdatePath ciphertexts is covered.
+- **Zero-ciphertext `UpdatePathNode`.** A one-member group adding a second member
+  produces an `UpdatePath` whose one node carries no ciphertexts (the only copath
+  child is the leaf the same Commit added); the test asserts the node count, the
+  empty ciphertext vector, and that the joiner is merged at that node via
+  §12.4.3.1's `path_secret`.
+
+**Fuzz** — deterministic driver, never `zig build --fuzz`: `MLS_FUZZ=<runs>[,<first
+seed>]` (`src/fuzz_test.zig`, `.scale` 8, so a run is a whole group exchange).
+`mls-decode` runs KeyPackage / Welcome / Commit `MLSMessage`s of a real exchange,
+damaged, through the decoders and the joiner; `mls-group` is a two-member group
+in which a genuine Welcome joins and a genuine Commit advances the member, every
+flipped Welcome/Commit bit is refused, and a refused Commit leaves the member
+able to take the genuine one.
+
+**Constant time** — `src/ctgrind_harness.zig` (suite `0x0001`, ReleaseFast,
+targets `ks`/`tree`/`priv`): `ks` taints the init, commit and PSK secrets through
+`deriveEpoch`; `tree` taints the encryption secret through every node secret, the
+ratchet base, `Ratchet` and `Window`; `priv` taints the content key/nonce,
+sender-data secret and signing key through `protectPrivate`, `decryptSenderData`
+and `decryptContent`. The `priv` in-file contexts are std's Ed25519 signing
+internals and the AES-GCM tag-verify outcome; expected counts are in
+`scripts/checks/ctgrind-expected.tsv` (native and `cpu=x86_64` rows). TreeKEM
+path secrets and HPKE are the `hpke` module's rows.
+
+**Dead-stack probes** — `src/stackprobe_test.zig` (ReleaseFast) probes every
+public entry point that handles secrets for residue on the dead stack
+(`src/burn.zig` zeroes it); 0 residues expected.
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
+
+**Known gaps in the evidence** (see *Open*): the resync case where the RECEIVER
+is the removed member; the secret tree's non-power-of-two shape against a
+vector; deleting the `rejectExternalCommitFraming` call from `processCommit`
+(`group.zig:1184`) turns no test red, because no decode path can produce a
+`PublicMessage` with a `new_member_commit` sender and a non-null
+`membership_tag`: the call site is defensive against a future path (a
+`PrivateMessage` unprotect, a caller-built struct), its doc comment says so, and
+the function itself is tested directly (`group.zig:5364`); and `parentHash`'s
+§7.9.1 wording (Part 8), which no test distinguishes.
+
+## Performance
+
+No benchmark exists; the card's `**Performance:**` line is authoritative. The
+AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
+#36256); the bulk `PrivateMessage` path has not been measured (*Backlog / deferred*).
+
+## What is deliberately not done
+
+- **A transport or Delivery Service.** Framing returns BYTES to send and takes
+  bytes received; MLS does not specify a transport (§2's Delivery Service is an
+  architectural role, not a protocol), so owning one would be an invention
+  (`meta.role = .util`, `src/root.zig:387`).
+- **Suite negotiation inside a group.** The suite is a compile-time parameter
+  (`comptime S`); a `Welcome`/`GroupInfo` of another suite is
+  `error.CipherSuiteMismatch`, an Add naming another suite or version
+  `error.KeyPackageMismatch`. The references bind one suite per group too
+  (OpenMLS a `Ciphersuite` from its crypto provider, mls-rs a
+  `CipherSuiteProvider` per group).
+- **A randomness policy.** The reuse guard (§6.3.1), `psk_nonce` and the
+  ephemeral keys of the `*Deterministic` entry points are caller inputs; the real
+  entry points take `io: std.Io` for fresh randomness.
+- **Credential acceptance.** "The credential in the LeafNode is valid" (§7.3,
+  §5.3.1), the identity in an external joiner's leaf and §12.2's identifier rule
+  for the Remove of an external Commit are an Authentication Service question and
+  stay the application's. (The lifetime, capability and extension-consistency
+  checks are open work, not refused: *Backlog / deferred*.)
+
+- **§12.4.3.2's advice to gate the resync flavor on a `reinit` PSK proposal.**
+  §12.1.4 and §11.2/§11.3 make a PreSharedKey proposal with usage `reinit` or
+  `branch` a flat MUST-be-invalid outside those flows; §12.4.3.2's paragraph is
+  non-normative advice ("can choose to"), so `validatePskProposal` enforces the
+  MUST unconditionally (`error.ResumptionPskUsageNotAllowed`). Usage
+  `application` demonstrates presence in a prior epoch as well: only a client that
+  held that epoch's `resumption_psk` can produce a Commit the members accept.
+- **§12.2's "same PreSharedKeyID" rule in the external procedure.** That
+  procedure is a closed list that does not repeat the regular one's rule;
+  `validateExternalProposalList` follows it literally and permits a repeated
+  `PreSharedKeyID` (§8.4's chain is position-dependent and both sides derive the
+  same `psk_secret`). Nothing depends on the choice and no vector exercises it.
+- **Resumption PSKs in a `Welcome` join.** `fromWelcome` resolves the
+  `GroupSecrets` PSK list with no resumption source: the client has lived through
+  no epoch of the group it is only now joining. (§11.2/§11.3 reinit and branch
+  would need it: *Backlog / deferred*.)
+- **Group-id uniqueness and §12.4.3.1's closing reinit/branch rules**, which are
+  checks against state outside the module.
+- **Following §12.4.2's bullet over §12.4 for "path required".** Not a refusal but
+  a decision recorded under Part 8: the module follows §12.4's `pathRequiredTypes`.
+
+## Open
+
+Gaps that are unverified rather than unbuilt:
+
+- The resync flavor of an external Commit where the RECEIVER is the removed
+  member (§12.2's "at most one Remove"): the Remove is applied by the shared
+  `applyProposals` before the leaf is assigned, so the joiner can land in the
+  leaf its own old appearance just vacated, but the receiver-is-removed case is
+  not tested.
+- The secret tree's non-power-of-two shape. `secrettree.nodeSecret` walks
+  `treemath`'s truncated tree, which is what §9 requires ("the same structure as
+  the group's ratchet tree"), but `secret-tree.json` publishes only 1-, 8- and
+  32-leaf trees. The truncated-tree path is reasoned-correct (it reuses the
+  vector-pinned `treemath`), and any group of, say, 5 members exercises it
+  without an external anchor.
+- §12.4's `pathRequiredTypes` and §12.4.2's own bullet disagree and the module
+  follows §12.4 (the section that defines §17.4's "Path Required" column).
+  Following the broader rule can only reject Commits a §12.4.2-literal
+  implementation would accept; no recorded session contains one, so the
+  disagreement is unobservable against the vectors available. If it ever becomes
+  observable, the receive side is the one to relax, not the send side.
 
 ## Anchoring
 
@@ -2001,6 +1481,60 @@ fire by deleting one `errdefer` each.
 
 ## Backlog / deferred
 
-- **Done 2026-11-17: NIST-curve HPKE keys are validated at admission.** `isUnusableHpkeKey` (was `isLowOrderHpkeKey`) also refuses, for suites 0x0002/0x0005/0x0007, a KeyPackage `init_key` or an `encryption_key` that `hpke`'s new `validatePublicKey` refuses (not SEC1 uncompressed, non-canonical, off the curve), at the same admission points and with the same `error.LeafNodeInvalid` as an X25519 low-order key; test "NIST-curve HPKE keys: an off-curve init_key or encryption_key is refused at admission, every ECDSA suite".
-
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
+- **Group-level application messages: a per-epoch secret-tree driver and
+  `protectApplication`/`unprotect`.** The everyday operation of an MLS client:
+  `group.zig` never encrypts or decrypts application data (its header calls it a
+  scope boundary), while OpenMLS and mls-rs expose it as the main call. Effort:
+  medium (generation/deletion policy for the ratchets per epoch; the
+  out-of-order window already exists in `secrettree.Window`). Fits the scope.
+- **`PrivateMessage` handshake messages (proposals/commits).** The common
+  wire-format policy in deployments encrypts handshakes too; `processCommit`
+  returns `PrivateHandshakeNotSupported`. Effort: medium, together with the item
+  above (needs the secret tree).
+- **A single `unprotectPrivate` in `framing.zig`.** Decryption stays three stages
+  because the key lookup between them is the caller's; revisit together with the
+  two items above, once the group object drives the secret tree per epoch.
+- **Part 3: §7.3/§10.1 LeafNode and KeyPackage admission validation, and X.509
+  credentials.** Lifetime, capability and extension consistency; credential
+  acceptance hooks. Every real deployment needs at least the lifetime and
+  capability checks; X.509 credential support needs the sibling `x509`. Effort:
+  medium.
+- **More cipher suites: 0x0004 and 0x0006 (X448/Ed448).** `ed448` has the
+  signature side, but `hpke` has no DHKEM(X448); instantiate both suites when
+  that lands.
+- **ReInit and subgroup branch (§11.2/§11.3).** Effort: small-medium; the
+  resumption PSKs they need exist.
+- **`createCommit` cannot change the committer's leaf CONTENT** (a new
+  credential, capabilities or extensions, §7.5). The blocker is plumbing, not
+  design: caller-owned credential and capability data would have to be
+  deep-copied into the group's arena the way `dupExtensions` does for
+  GroupContext extensions. `treekem.StageParams` already exposes the seam.
+- **`Group`'s retained state grows with session length** (Threat model). The fix
+  is owning leaf bytes rather than aliasing them, which would let an epoch's
+  arena go once nothing in the tree points into it.
+- **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret` takes one
+  as a parameter, but `schedule.suiteIdOf` (`hpke/src/schedule.zig:534`) is
+  private, so `keyschedule.hpkeSuiteId` (`keyschedule.zig:478`) restates the
+  `Aead` to `aead_id` mapping (`@compileError` for an unregistered AEAD).
+  `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so only that one mapping is
+  duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have
+  `Context` carry its own suite id.
+- **`kat_treekem_test.zig` carries a test-local `KeyPackage` parser**
+  (`applyProposal`, `LocalProposalType`) written to reach `tree-operations.json`'s
+  Add proposals. Switching it to `keypackage.KeyPackage` would delete duplicated
+  parsing and give that vector a second consumer; `tree.decodeExtensionList`'s
+  doc comment names this.
+- **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.
+- **Appendix C's `common_ancestor_semantic`/`common_ancestor_direct` in
+  `treemath.zig`.** Not ported: `tree-math.json` does not publish them
+  (`root`/`left`/`right`/`parent`/`sibling` only) and no code needs them, since
+  `group.commonAncestor` and `treekem.Staged.pathSecretFor` serve the two uses.
+  A completeness item with no consumer.
+- **Standalone `Add`/`Update`/`Remove`/`PreSharedKey`/`ExternalInit`/
+  `GroupContextExtensions` types in `content.zig`** (each is a `Proposal` union
+  arm today): split them out when an extension proposal type needs a real struct.
+- **The secret tree's non-power-of-two shape has no upstream vector** (see
+  *Open*); a vector, or a differential oracle over a 5-member group, would anchor
+  it.
+- **§12.4 versus §12.4.2 on "path required"** (see *Open*): relax the receive side
+  if the disagreement ever becomes observable against a recorded session.

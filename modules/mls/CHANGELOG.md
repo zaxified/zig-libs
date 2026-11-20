@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the NIST HPKE key admission check (2/2 killed); Audit card cumulative 53/54, 1 eq.
 - **2026-11-17** — Behaviour change: in the NIST-curve suites (0x0002/0x0005/0x0007) a KeyPackage `init_key` or a leaf / path `encryption_key` that is not a valid P-256/P-384/P-521 point is refused at admission (`error.LeafNodeInvalid`, the X25519 low-order refusal's points: `createCommit`, `processCommit`, a Welcome's tree, an external join) instead of being admitted and failing at the first encapsulation to it. Uses `hpke`'s new `validatePublicKey`.
 - **2026-11-17** — Cipher suite `0x0005` (`MLS_256_DHKEMP521_AES256GCM_SHA512_P521`) is instantiated: `suite.Mls256P521Aes256GcmSha512P521` (`hpke.P521Kem`, `aesgcm.Aes256Gcm`, HKDF/HMAC-SHA512, ECDSA from the `p521` module — new dep) and added to `suite.supported`, which now holds five of the seven registry suites (X448/Ed448 wait for an X448 KEM in `hpke`). The suite-filtered vector files are re-filtered to suites {1, 2, 3, 5, 7}. The upstream P-521 vectors write private keys as minimal integers (65 bytes), and the KAT harnesses left-pad them. SPEC: new "Cipher suites" section; delta mutation 11/11 killed (card 51/52, 1 eq); ctgrind counts unchanged, source pins re-pinned.
 - **2026-11-17** — Cipher suite `0x0007` (`MLS_256_DHKEMP384_AES256GCM_SHA384_P384`) is instantiated: `suite.Mls256P384Aes256GcmSha384P384` (`hpke.P384Kem`, `aesgcm.Aes256Gcm`, HKDF/HMAC-SHA384, ECDSA from the `p384` module — new dep) and added to `suite.supported`. The suite-filtered vector files are re-filtered to suites {1, 2, 3, 7}.
@@ -34,18 +33,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `Policy` switch. 4 tests added (detector, `createCommit`, `processCommit` genuine + 4
   insider forgeries, Welcome tree), RED before. Closes the SPEC Backlog item of the same day.
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** no leak on `createCommit`'s failure paths;
-  the mutation run's leak hint was a test artifact. With the committer's-own-Update,
-  two-GroupContextExtensions or duplicate-PSK check deleted, `createCommit` SUCCEEDS, and the
-  "leaked" buffers were the returned `commit`/`group_info` that the test's `expectError`
-  discarded. Checked on clean code anyway: 6 tests drive whole sessions (`create`,
-  `createCommit`, `fromWelcome`, `processCommit`, by-reference Update, `joinByExternalCommit`;
-  empty Commit, Add with `external_pub`, external PSK, path omitted) through
-  `std.testing.checkAllAllocationFailures` — 1339 failure points, all clean — and 1 test fails
-  an HPKE encapsulation midway through the Welcome slots and midway through the UpdatePath
-  ciphertexts: clean. Each instrument was shown to fire by deleting one `errdefer`. Found on
-  the way (SPEC Backlog, not fixed): an Add whose KeyPackage carries an all-zero X25519 key is
-  accepted, after which every path Commit reaching that leaf fails until it is removed.
 
 - **2026-10-06** — **Fixed a double free reachable from a received Commit.** A Commit whose
   proposal list names the same PreSharedKeyID twice made `validateProposalList` free its
