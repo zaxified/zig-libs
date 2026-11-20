@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the public WOTS+ building
-//! blocks burned 2026-10-09: `prfKeygen`, `wotsSkGen`, `wotsPkGen`,
+//! blocks burned: `prfKeygen`, `wotsSkGen`, `wotsPkGen`,
 //! `wotsSign`, `genLeaf` (`keyGen` / `sign` are in `stackprobe_test.zig`).
 //! `prfKeygen` / `wotsSkGen` are per-chain calls: tight burn (`prf_burn`); the
 //! others are one-shot (`burn_size`). ReleaseFast only (`skipUnlessOptimized`).
