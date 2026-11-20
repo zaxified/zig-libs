@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 AES-GCM (EVP), against Go `crypto/cipher`, RustCrypto `aes-gcm`, ring and `std.crypto.aead.aes_gcm` (surveyed 2026-10-10)
 
-**Audit:** review 2026-10-04 · mutation 2026-09-28 (31/31) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (140/160, 20 eq) · src 94532c8312b07304
 
 **Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192 and eight nonce/tag shapes) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict) · panic 2026-10-30 (sweep of every pub entry point + blind review: length contract a checked panic in every mode, over-limit ciphertext → AuthenticationFailed + zeroed m, test seams behind test_hooks; delta audit 10/11 + 2 call sites reachable only above 64 GiB)
 
@@ -321,16 +321,18 @@ review, as §2.1 says they must be.
   deterministic driver, never `zig build --fuzz`.
 - **Constant time:** the ctgrind rows (`ctx`, `stateless`, `generic`) of *Constant-time contract*; the tag
   comparison is also pinned by `scripts/checks/check-ct-compare.py`.
-- **Mutation:** schemata over the kernel — reduction constant and second phase, a dropped middle product,
-  the counter lane, a wrong H power in the batch, the delayed and the read-ahead GHASH, the tail padding,
-  swapped lengths, the tag check bypassed, no wipe on failure (both backends), the H·x carry, rcon and the
-  AES-256 odd step, the stateless power count, H⁵ and H⁸, the tail counter, the batch counter advance,
-  where `acc` enters a batch, the AD partial block, J0's counter, the CPUID mask, the length block's byte
-  order and its loss, the short path's AD offset, hashing plaintext in the decrypt tail — all killed.
-  Moving the short/long threshold or the fold-in-the-length-block threshold is equivalent (the longer
-  path is also correct) and is not counted. The length-contract checks were covered by a later delta run
-  (10 of 11 mutants killed; the two call-site survivors matter only above 2^36 − 32 bytes, where the
-  helpers are pinned instead).
+- **Mutation:** whole module, schemata over all of `src/root.zig`, ReleaseSafe (160 mutants: the length contract
+  and its helpers, the GHASH power counts, dispatch, the generic backend's J0, GCTR split, GHASH framing and tag
+  check, the kernel's key expansion for all three key sizes, the H powers, the stitched batch, both tails and both
+  bodies, and the tag compare as a whole, on its first byte only and on its last byte only); 140 killed. The 20 `eq`
+  are 9 equivalent (the 128-byte fold-in thresholds, where the other path computes the same value; a second GCTR
+  part over an empty slice; GHASH block counts that only size std's precomputation; `noncePowers` at exactly 128)
+  and 11 unobservable here: the checked-panic arms and the call-site length checks (the over-limit path needs a
+  64 GiB buffer, the mismatch path a panic harness), the CPUID mask and the `initWith` availability guard (only a CPU
+  without AES-NI reaches them), and the stateless std path's zeroing on failure (only the generic backend reaches
+  it). The dispatch mutants were measured in a second schemata build at `-Dcpu=x86_64` (run-time CPUID). Wipes and
+  stack burns belong to the stack probe, timing to the ctgrind rows: a functional run cannot see `mem.eql` standing
+  in for `timing_safe.eql`.
 - **Platforms:** natively in ReleaseSafe, ReleaseFast and Debug (self-hosted backend), in ReleaseSafe with
   `-Dcpu=x86_64` (run-time CPUID, legacy SSE encodings, `pshufb` by assembly) and `-Dcpu=x86_64_v2`
   (run-time CPUID, compiler `pshufb`), and on aarch64 under `qemu-aarch64` with the generic CPU and with
