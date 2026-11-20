@@ -32,15 +32,13 @@ exempt per root `NOTICE` §0; no Prometheus source or test corpus is reproduced.
   snapshot the family/children pointers (O(number of families)), then
   formats from that snapshot with the lock released, so a large registry's
   formatting cost is not paid while blocking concurrent registrations or
-  other scrapers (module's audit F2, fixed 2026-09-15) — this is not
-  amortized by a cache, so the O(series) formatting work itself is still
-  paid on every scrape. The middleware's
+  other scrapers — this is not amortized by a cache, so the O(series)
+  formatting work itself is still paid on every scrape. The middleware's
   **default** (`.status = .class`) steady-state hot path is lock-free
   (atomic per-method/class caches); `.status = .code` always takes the
-  (now O(1), previously linear-in-registry-size) locked registry lookup —
-  see below.
+  O(1) locked registry lookup — see below.
 - **Deps:** `router` (Middleware/Ctx/Next), `http` (`Server.ResponseWriter`,
-  `Method`).
+  `Method`, content negotiation), `procnet` (`ProcessCollector`), `clock` (`Clock`).
 
 ## Usage
 
@@ -63,7 +61,7 @@ var ep = metrics.Endpoint{ .registry = &reg }; // .path defaults to "/metrics"
 
 var r = router.Router.init(gpa);
 defer r.deinit();
-try r.use(rm.middleware()); // default order (audit F12): scrapes ARE counted
+try r.use(rm.middleware()); // default order: scrapes ARE counted
 try r.use(ep.middleware()); // swap the two lines to opt out and keep scrapes uncounted instead
 try r.get("/api/thing", handler);
 ```
@@ -99,10 +97,8 @@ Prometheus's index. This is why the middleware:
 
 - labels status as a **class** (`code="2xx"`…) by default —
   `.status = .code` opts into exact codes (still bounded series count,
-  ~×10; the per-request lookup cost is now O(1) regardless of how many
-  *other*, unrelated families the registry holds — before the registration
-  index was added this was linear in total registry size, see the module's
-  audit F1/F7);
+  ~×10; the per-request lookup cost is O(1) regardless of how many
+  *other*, unrelated families the registry holds);
 - does **not** label by path. A route-pattern label (`/users/:id`, bounded)
   is not wired in yet (`router` now exposes `Ctx.matchedPattern()`, so it
   can be); labeling by raw path would be the footgun above.
@@ -142,8 +138,7 @@ streams, 0 for HEAD/204/304, the octets sent so far for a chunked or compressed 
 
 **Access log:** use the `accesslog` module — `req`/`res` give it every field
 (client address, User-Agent, Referer, …) and its `Sink` writes whole lines from
-many threads into one file. (This module's own `AccessLog` writer moved there
-as `accesslog.Sink` on 2026-10-06.)
+many threads into one file.
 
 ```zig
 fn logRequest(ctx: ?*anyopaque, e: metrics.AccessEntry) void {
@@ -172,6 +167,14 @@ Label values escape `\`, `"` and newline. Specials render as `+Inf` /
 `Content-Type: text/plain; version=0.0.4; charset=utf-8` on `GET`/`HEAD`
 (anything else on the path → 405 + `Allow`), other paths pass through.
 
+With `Endpoint.open_metrics = true` a scraper that asks for OpenMetrics in
+`Accept` gets it (`Format.negotiate`; `Registry.writeOpenMetrics` writes it
+directly, exemplars included). Besides `Counter`/`Gauge`/`Histogram` the
+registry has `Summary` (`Registry.summary`, `summaryVec`), callback series
+(`counterFunc`/`gaugeFunc`), scrape-time collectors (`registerCollector`,
+`ProcessCollector`) and per-series removal (`Vec.delete`/`reset`,
+`Registry.unregister`); see `SPEC.md` *Design notes by feature*.
+
 Deviations from client_golang (noted in doc comments):
 
 - **Counters are integer-valued** (`u64` `inc`/`add`) — monotonic and never
@@ -189,6 +192,15 @@ Deviations from client_golang (noted in doc comments):
   close over a Registry. `Endpoint` (an intercepting middleware, the `cors`
   pattern) is the ready-made replacement; `Registry.respond(res)` covers
   hand-written handlers that reach the Registry via their own `ctx.state`.
+
+## Not provided
+
+Native histograms and the protobuf exposition, label currying, `Gatherers`,
+the Go-runtime collector, a push gateway / remote-write, float counters (use
+`counterFunc`), UTF-8 metric names, authentication of `/metrics` (put
+`aaa-gate` in front), a route-pattern label on the request middleware and
+`_created` samples. Reasons and the open items: `SPEC.md` *What is
+deliberately not done* and *Backlog / deferred*.
 
 ## Verification
 

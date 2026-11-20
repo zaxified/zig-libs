@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the module's `NOTICE` and the README's `Provenance:` line.
 
 ## Compared with
 
@@ -26,7 +26,7 @@ Surveyed 2026-09-30, re-surveyed 2026-10-17 per `SURVEY-PLAYBOOK.md` (report: th
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [prometheus/client_golang](https://github.com/prometheus/client_golang) — **reference** | Go | Apache-2.0 | 6.0k | v1.24.1 (2026-07-24) | Same model: Counter/Gauge/Histogram/Summary + `*Vec` (with/delete/reset), `CounterFunc`/`GaugeFunc`, `Collector`s, unregister, process collector, exemplars, text 0.0.4 + OpenMetrics negotiation, in-flight limit, request instrumentation. Not here: native histograms + protobuf exposition, label currying, `Gatherers`/`WrapRegistererWith`, Go-runtime collector, push gateway, float `Counter.Add` (see Backlog for each verdict). |
+| [prometheus/client_golang](https://github.com/prometheus/client_golang) — **reference** | Go | Apache-2.0 | 6.0k | v1.24.1 (2026-07-24) | Same model: Counter/Gauge/Histogram/Summary + `*Vec` (with/delete/reset), `CounterFunc`/`GaugeFunc`, `Collector`s, unregister, process collector, exemplars, text 0.0.4 + OpenMetrics negotiation, in-flight limit, request instrumentation. Not here: native histograms + protobuf exposition, label currying, `Gatherers`/`WrapRegistererWith`, Go-runtime collector, push gateway, float `Counter.Add` (see *What is deliberately not done* for each verdict). |
 | [VictoriaMetrics/metrics](https://github.com/VictoriaMetrics/metrics) — **fastest** | Go | MIT | 710 | v1.44.1 (2026-09-28) | "Lightweight alternative to client_golang": counters, callback gauges, vmrange + Prometheus histograms, summaries, push; label-in-name API; metadata off by default. Measured 2026-10-25 (`tools/go_fast_bench`): the fastest on `counter_vec` (lookup by a pre-joined name; ours 1.03×), slower on the rest; drops negative histogram observations. |
 | [prometheus/client_rust](https://github.com/prometheus/client_rust) | Rust | Apache-2.0 | 608 | v0.25.1 (2026-09-01) | Official Rust client: typed label sets, families, exemplars, OpenMetrics-first (and protobuf). Measured 2026-10-25 (`tools/rust_fast_bench`): the fastest on `scrape` (ours 0.98×); writes label values and HELP unescaped. |
 | [tikv/rust-prometheus](https://github.com/tikv/rust-prometheus) | Rust | Apache-2.0 | 1.2k | pushed 2025-12-31 (no releases) | client_golang port: vecs, process collector, push. |
@@ -36,7 +36,8 @@ Surveyed 2026-09-30, re-surveyed 2026-10-17 per `SURVEY-PLAYBOOK.md` (report: th
 | [karlseguin/metrics.zig](https://github.com/karlseguin/metrics.zig) | Zig | MIT | 85 | pushed 2026-10-10 (no releases) | The Zig alternative: counter/gauge/histogram + vecs with comptime-typed labels, `remove`, comptime noop mode; no registry type, endpoint, OpenMetrics or summaries. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No metrics facility. |
 
-**Where we are ahead:** in Zig, a ready-made `router`+`http` integration (request counter/latency/size histograms, in-flight gauge, `/metrics` endpoint with OpenMetrics negotiation and an in-flight cap, a per-request hook that hands the request to `accesslog`); exposition byte-identical to client_golang's in both formats; removed series are memory-safe against a concurrent scrape (freed by the last scrape out); 0.05–0.71× client_golang's time on every bench row and within 1.03× of the fastest contender on each (VictoriaMetrics/metrics, client_rust; 2026-10-25); the only exposition of the three measured libraries with no scrape-decided error in the lead's six rows. **Where we are behind:** the Backlog items below, each with its verdict.
+**Where we are ahead:** in Zig, a ready-made `router`+`http` integration (request counter/latency/size histograms, in-flight gauge, `/metrics` endpoint with OpenMetrics negotiation and an in-flight cap, a per-request hook that hands the request to `accesslog`); exposition byte-identical to client_golang's in both formats; removed series are memory-safe against a concurrent scrape (freed by the last scrape out); 0.05–0.71× client_golang's time on every bench row and within 1.03× of the fastest contender on each (VictoriaMetrics/metrics, client_rust; 2026-10-25); the only exposition of the three measured libraries with no scrape-decided error in the lead's six rows. **Where we are behind:** the items under *Backlog / deferred* and *What is deliberately not done*, each with its verdict.
+
 
 ## Design & invariants
 `Registry` owns metric families; `counter`/`gauge`/`histogram` are get-or-register — first call
@@ -52,12 +53,11 @@ are single atomics (`.monotonic`, no cross-instrument ordering needed); registra
 documented spinlock (`std.atomic.Mutex` + `spinLoopHint`) with string-compare-sized critical
 sections; `writeText` holds the lock only to snapshot the family/children pointers
 (O(number of families)) and formats from that snapshot with the lock released, so
-formatting a large registry no longer blocks concurrent registrations or other
-scrapers (no cache, so the O(series) formatting cost itself is still paid on every
-scrape — see the module's audit, F2, fixed 2026-09-15).
-Access logging is not this module's: the group-commit writer that lived here as `AccessLog`
-(audit F4, fixed 2026-09-16) moved to `accesslog.Sink` on 2026-10-06, with its tests and its
-JSON-path oracle, and its two narrow formats were dropped for `accesslog`'s full ones.
+formatting a large registry does not block concurrent registrations or other
+scrapers (there is no cache, so the O(series) formatting cost is paid on every
+scrape).
+Access logging is not this module's: the `on_request` hook of `RequestMetrics` hands the request to the
+`accesslog` module (`accesslog.Sink`, see the README example).
 `RequestMetrics` middleware (request counter by method+status-class, latency histogram, in-flight
 gauge, optional `on_request` hook whose `AccessEntry` carries the live `req`/`res` for
 `accesslog.entryFromRequest`) wraps `next` so 404/405/429/503 short-circuits are
@@ -65,16 +65,74 @@ measured; series-creation OOM skips recording but never fails the request. Expos
 from client_golang (documented, all still valid to scrape): registration-order emission, not
 sorted; `error.InvalidBuckets` instead of silent strip/panic.
 
+## Design notes by feature
+
+- **Callback series** (`Registry.counterFunc` / `gaugeFunc`, `ValueFn`; client_golang `CounterFunc` / `GaugeFunc`): the
+  value is read by every scrape, from the scraping thread, so the function must be thread-safe and fast; its `ctx` must
+  stay valid until `deinit`, because a scrape that started before an `unregister`/`delete`/`reset` may still call it.
+  Registering the same series twice, or asking a callback family for an ordinary series (or the reverse), is
+  `error.AlreadyRegistered`.
+- **Collectors** (`Registry.registerCollector`, `Desc`, `Collector`, `Sink`; client_golang `Collector`): families are
+  described up front and their samples computed once per scrape, from the scraping thread with the registry lock not
+  held (so `collect` must be thread-safe: concurrent scrapes run it concurrently). `Sink` checks what registration checks
+  (description index and kind, descs order, value count, UTF-8, bucket and quantile ranges). A collector that fails, or
+  emits what its descriptions do not allow, fails the whole scrape with `error.WriteFailed` (promhttp's default); the
+  cause stays readable through `Registry.lastCollectorError()` and is not cleared by a later good scrape.
+  `ProcessCollector` is client_golang's process collector over `procnet` (Linux `/proc`): the nine `process_*` families
+  with client_golang's names, help, types and values (CPU and start time at USER_HZ 100, an unlimited limit as 2^64-1,
+  network bytes from the process's own namespace), an optional `<namespace>_` prefix, and a file that cannot be read
+  drops its families from that scrape.
+- **Derived sample names.** Both registration paths (ordinary and collector) guard the same per-kind set
+  (`Registry.derivedSuffixes`): a histogram writes `_bucket`/`_sum`/`_count`, a summary `_sum`/`_count`, a counter or gauge
+  nothing. The rule is the exact set of sample names a family writes, not a stricter one (reference: client_golang
+  refuses only what `Gather` finds duplicated, pinned by `go_register_test`): a summary `s` beside a family `s_bucket` is
+  accepted, and so is a counter `x_total` beside a family `x`, which OpenMetrics announces under the same name
+  (client_python's registry would refuse that pair; the Go reference wins). There is no `info` kind and no `_created` sample.
+- **Summary** (`Registry.summary` / `summaryVec`, `SummaryOptions`, engine in `src/summary.zig`; client_golang `Summary`
+  with `Objectives`): CKMS targeted quantiles over `age_buckets` rotating streams, every observation inserted into every
+  stream as client_golang does; `_sum`/`_count` are cumulative, the quantiles cover a sliding window of `max_age_ns`.
+  Time is injected: each series captures `Registry.clock` when it is created (set it before registering summaries), and the
+  window starts at the first call that carries a time. Deviations: a NaN counts toward `_count` and poisons `_sum` as in Go
+  but is not inserted into the streams; the buffer flush runs inline in the observing thread; an observation whose stream
+  insert fails for lack of memory is not recorded in the quantile streams (`Summary.droppedInserts`), `_sum`/`_count` still
+  update. Limits: at most `max_objectives` (16) objectives, `epsilon` below `min_epsilon` (1e-4) is refused with
+  `error.InvalidObjectives`, not clamped (a series fed from request traffic would otherwise keep nearly every observation
+  of its window); `quantile` is a reserved label name on summaries. The engine is checked bit-for-bit against beorn7/perks
+  (see Verification).
+- **OpenMetrics** (`Registry.writeOpenMetrics`, `Registry.write(w, Format)`, `Registry.respondFormat`, `Format.negotiate`,
+  `Endpoint.open_metrics`, `content_type_openmetrics`): output is byte-identical to prometheus/common `expfmt` for the same
+  registry. A counter's family is announced without `_total` while its sample keeps it, a counter without the suffix is
+  `unknown`, HELP escapes `"` too, floats are OpenMetrics floats, the output ends in `# EOF`. No `_created` samples
+  (client_golang's default). `Format.negotiate` follows `NegotiateIncludingOpenMetrics`: `Accept` clauses by descending
+  `q`, a concrete type before `*` on ties, only the `version` parameter compared; deviation: a `q=0` clause is skipped (RFC
+  9110). `Endpoint.open_metrics` is off by default, like promhttp's `EnableOpenMetrics`.
+- **Exemplars** (`Counter.addWithExemplar` / `incWithExemplar`, `Histogram.observeWithExemplar`; client_golang
+  `AddWithExemplar` / `ObserveWithExemplar`): the last exemplar of each sample is kept with its label block pre-rendered;
+  only the OpenMetrics exposition shows it. The caller passes the timestamp (the module reads no clock). Limits as
+  client_golang: label names `[a-zA-Z_][a-zA-Z0-9_]*`, not repeated, values UTF-8, at most `max_exemplar_runes` (128) runes
+  in all; otherwise `error.InvalidExemplar` and the instrument is not updated. Storage is allocated on first use; a bare
+  `Counter{}` made outside a registry answers `error.NoExemplarStorage`. An exemplar on a counter without `_total` is written
+  as expfmt writes it (the sample is `unknown` in OpenMetrics).
+- **Removal and scrape safety** (`Vec.delete` / `reset`, `Registry.unregister`; client_golang `DeleteLabelValues`, `Reset`,
+  `Unregister`): unlike Go, the removed series' memory is given back. A scrape takes a ticket (`scrape_seq`) between its
+  snapshot and the end of formatting; a removed series is parked in `Registry.retired` with the counter of its removal and
+  freed as soon as the scrapes with older tickets have ended, so scrapers that overlap without a gap cannot keep it
+  alive. A family `RequestMetrics` records into is pinned: `delete`/`reset`/`unregister` on it return false. `unregister`
+  leaves the family allocated and off the exposition until `deinit`, so a `*Vec` handle that outlives it keeps working, as in
+  client_golang.
+- **Cardinality limits.** `Registry.max_label_value_len` (default 4096 B) and `Registry.max_series_per_family` (default
+  10 000) refuse a new series with `error.LabelValueTooLong` / `error.TooManySeries` (checked on a lookup miss only, so
+  existing series keep working; `delete` frees a slot).
+
 ## Threat model / out of scope
 Not a security primitive — does not authenticate scrapers; front `Endpoint` with your own
 auth/network policy if `/metrics` must be gated. The cardinality footgun is the real hazard: every
 distinct label-value combination is a permanent time series, so label values must come from a
 small fixed set (method, status class, route pattern) — never raw path/user id/query/IP, or the
-registry becomes an unbounded memory leak. Since 2026-10-29 the registry caps it: `max_label_value_len` (4096 B) and `max_series_per_family` (10 000) refuse a new series with an error; existing series keep working. This is why the middleware defaults to status classes,
+registry becomes an unbounded memory leak. The registry caps it: `max_label_value_len` (4096 B) and `max_series_per_family` (10 000) refuse a new series with an error; existing series keep working. This is why the middleware defaults to status classes,
 not raw path. No push-gateway / remote-write — text exposition only.
 
-Deliberately **not** a `metrics`-owned auth wrapper (wave-2 audit F2's finding, resolved as a doc
-pointer rather than new code): this module has no business knowing about bearer tokens, sessions or
+Deliberately **not** a `metrics`-owned auth wrapper: this module has no business knowing about bearer tokens, sessions or
 API keys, and `zig-libs` already has a module for exactly that — `aaa-gate` (bearer/API-key auth as
 a `router.Middleware`, fail-closed by default, RFC 6750). Bolting a second, metrics-specific auth
 implementation onto this module would duplicate `aaa-gate` and give the two constructions a chance
@@ -95,151 +153,96 @@ If `/metrics` must share a router with unauthenticated public routes instead of 
 listener, scope the gate with `router.Router.group("/metrics")` (or the equivalent internal-only
 network policy) rather than gating the whole router with `.all`.
 
+**Known limits** (what a consumer relies on):
+
+- A `*Metric` from `Vec.with` must not be used after `delete`/`reset`/`unregister` of its series (documented on `delete`);
+  a concurrent scrape is safe, a retained pointer is not.
+- `delete` is O(series in the family) under the registry lock (find, then ordered remove): it keeps registration order, and
+  client_golang sorts every family's series on every scrape.
+- When the parking list for a removed series cannot grow (out of memory), the series is leaked rather than freed under a
+  scrape that may still read it.
+- Summary options are the caller's to bound: `buf_cap` and `age_buckets` have no upper bound and each series allocates
+  its buffers eagerly (see Backlog).
+
 ## Verification
-`zig build test-metrics` covers: counter monotonicity + get-or-register identity, gauge
-set/inc/dec/add/sub, histogram cumulative buckets (inclusive `le`, `_sum`/`_count`,
-empty-bucket-list, NaN), name/label/bucket validation errors, input-copy proof, golden exact-bytes
-exposition (escaping, `le="+Inf"`), an 8-thread stress on shared instruments with exact totals plus
-a concurrent get-or-register convergence stress; middleware tests over socket-free
-`http.Server.serveStream`; an in-process `router`+`http.Server`+`http.Client` loopback integration
-run (mixed 2xx/3xx/4xx/5xx traffic → scrape asserts exact values).
 
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` and `summary.zig`, schemata in a detached copy under `unshare -rn`, ReleaseSafe, strict verdict, adversarial read while placing mutants): 629 mutants, 599 killed, 30 equivalent or unobservable, 0 undecided, no defect. The first run left 58 alive; 17 new tests (`mutation_test.zig`, `summary.zig`): an OpenMetrics exemplar with two labels, `setToCurrentTime` keeps the fraction, one-element `fillLinear`/`fillExponential`, the default 4096 B label-value and 10 000-series limits for `counter`/`counterFunc`/`Vec.with`, `counterVec` over `max_labels`, summary options refused at registration (NaN quantile/epsilon, no family left behind) and 1 ns buckets accepted, `Sink.summary` quantile range, a histogram desc colliding with a `<name>_bucket` sibling, `Accept` negotiation, `-0` in OpenMetrics, the 405 body, `RequestMetrics.init` name checks and up-front series, `process_virtual_memory_max_bytes` with an unlimited address space; summary: NaN epsilon, a one-sample query, an early `snapshot` anchoring the window, saturating times at the u64 top. Equivalent: the `Exemplars.get` fast path (`cmpxchg` returns the winner), exemplar `labels.len >= 128` (128 distinct names exceed 128 runes), the exemplar UTF-8 pre-check, `@divFloor`/`@divTrunc` after the fraction, `fillExponentialBucketsRange`'s `len == 1` shortcut, the exposition size hint, a `continue` after a childless family, the OpenMetrics default version, the `1`/`-1` float special cases (same bytes), `status >= 100`, the never-populated `.code` cache, `floatMax` vs `1e300` (widths ≤ 2^53), the flush thresholds `>=`/`==` (length never exceeds capacity), the `sorted` flag, `merge`'s index after the first append, `compress` on a non-empty list, `observe`'s early flush, `snapshot`'s no-stream guard, the `*/<type>` clauses of `acceptMatches` (`http.conneg.parseElement` refuses `*/<concrete>`), `Family.desc_index` (written, never read — dead state). Unobservable without privileges: the unlimited-fds arm of `process_max_fds`, the rx/tx swap (equal on a loopback-only netns). Cut: comptime constants (their guards are mutated), `lockSpin` timing, OOM paths.
-
-**Mutation + review, run 2 (2026-11-12, whole module, after dropping the dead `Family.desc_index`,** production code of `root.zig` and `summary.zig`, a fresh operator generator (comparison flips, and/or operands, ±1 literals, arithmetic, bool, dropped assignments/calls/defers/returns, negated conditions) plus ~70 hand-placed mutants on multi-line spots incl. the fixed `registerCollector` region; schemata in a detached copy under `unshare -rn`, ReleaseSafe, strict verdict, M0 controls interleaved in every runner): 1457 mutants, 1309 killed (435 by panic, 42 by hang), 69 equivalent, 56 inert (container-level comptime constants and field defaults the runtime switch cannot reach; their guards are mutated), 23 unobservable, 0 undecided, no defect. 5 new tests for gaps the first run's mutant set did not reach: `registerCollector` refuses a bad name, a bad label and a duplicate label and leaves nothing registered; a summary leaves a sibling `x_bucket` free; quantiles 0 and 1 on a small sample; the under-limit GET of an `Endpoint` with `max_in_flight`; the 405's `Content-Type`; `requestRun`'s status after a late vs an early handler error. Equivalent (new beyond the first run's list): hash seed and accumulation (`eql` decides identity), `eqlShort` fast paths, `break` after `orderedRemove` (unique entry), `ensureUnusedCapacity` +1, the objective sort comparator (duplicates refused before it), `sameSummaryOptions` for non-summary kinds, `setStatus(200)`, the exponent sign test where `exp != 0`. Unobservable: errdefer bookkeeping on allocation-failure paths in `Registry.childLocked`/`getOrRegisterFamily`/`Summary.init`, the lost-cmpxchg free in `Exemplars.get`, `deinit`'s `= undefined`, the null `/proc/net/dev` fallback.
-
-**Mutation (2026-10-18,** schemata over a copy of `src/` (`root.zig` + `summary.zig`), one ReleaseSafe
-build of the whole suite behind a `ZL_MUT` switch, each mutant run under `setsid -w timeout -s KILL 20`):
-139 mutants in the code added since the 2026-09-11 run -- exemplar label checks and bucket choice,
-the runtime bucket fills, `validateDescriptor`'s summary rules (objective count and range, epsilon,
-`buf_cap`, `max_age`), `sameSummaryOptions` field by field, `registerFunc` and `registerCollector`
-refusals, `derivedCollision`'s three conjuncts, `childLocked`'s guards, the ticketed reaping
-(`retireLocked`, `reapLocked`'s bound and oldest-ticket scan, `scrape_seq`), `Vec` pin and index
-handling, `unregister`, the `write` loop (empty families, one `collect` per scrape, `lastCollectorError`,
-`# EOF`), every `Sink` check (`InvalidDesc`, `OutOfOrder`, `LabelMismatch`, `InvalidUtf8`,
-`InvalidBuckets` for histograms and summaries), `Format.negotiate`'s ordering and `q=0` rule,
-`announcedName`/`writeHeader`, `goShortestG`'s exponent edges, the exemplar printer, `Endpoint`'s
-`max_in_flight` bound and slot release, `approxRequestSize`, `ProcessCollector`'s start-time and
-network guards, and in `summary.zig` the CKMS invariant, `compress`, `query`, rotation arithmetic
-(`steps`, `resets`), `anchor`, the buffer bounds and `init`'s validation. First run: 99 killed, 40
-alive. Eleven tests added (an exemplar on a value equal to a bound; `min == max` bucket ranges; a
-refused summary descriptor leaving no family, `max_objectives` and quantile 1 accepted, options compared
-field by field; callback refusals; repeated names and look-alike names in one `registerCollector`; a
-gauge named `x_total` in OpenMetrics; every remaining `Sink` bound; tie-breaking and foreign ranges in
-`negotiate`; the request size with a `Content-Length`; no start-time sample without a boot time; wrong-length
-`delete` lookups, which reach the tuple comparison through the map's 7-bit fingerprint; `retire`/`reap`
-against a hand-built ticket list) plus two in `summary.zig` (the upper edges of `init`, a two-sample
-`compress`). Rerun: 135 killed, 4 equivalent. Equivalent: the UTF-8 pre-check of an exemplar value
-(`utf8CountCodepoints` fails on the same bytes with the same error), the `out.len == 1` shortcut of
-`fillExponentialBucketsRange` (`pow(x, 1/0 = inf)` then `pow(growth, 0) = 1` yields `min` anyway), the
-length prefix in `hashValues` (the hash only picks a slot; `eqlValues` still tells the tuples apart), and
-`observe`'s `now_ns >= expires_ns` flush (an early flush pushes the same values into the same streams,
-rotation still waits for `>`). Found while reading, not by a mutant: ordinary registration
-(`checkSuffixCollisionLocked`) guards a histogram's `_bucket`/`_sum`/`_count` names but not a summary's
-`_sum`/`_count`, while `registerCollector` guards both -- client_golang accepts both, so this is a
-consistency question, not a defect.
-
-### External-anchor investigation: `prometheus_client` (2026-08-01, done)
-
-The in-house grammar checker (`validateExpositionText`) and the frozen published-example
-excerpt (both above) close the "is this syntactically valid exposition format" gap but were,
-until now, the only oracle — self-consistency, not independent verification. A real
-independent parser is now available: `prometheus_client`'s
-`parser.text_string_to_metric_families`, the same reader library code that talks to a
-Prometheus server, run in a throwaway venv (`~/.cache/zig-libs-metrics`). It was run once,
-offline, feeding it the exact byte string this module's own `writeText` produces for a
-representative registry (counter + gauge + histogram, covering backslash/quote/newline
-escaping and cumulative buckets) — see `src/root.zig`, "external anchor: exposition text
-independently parsed by prometheus_client", for the full quoted parse and the frozen text.
-**No disagreement was found**; every value, label and escape was extracted correctly. One
-finding, not a bug: `prometheus_client` strips the `_total` counter suffix at the *family*
-level (`api_requests`, not `api_requests_total`) while samples keep it — a real client-library
-convention this module's own checker has no notion of either way, confirmed rather than
-assumed. Per the governing rule the tool was run once and its verdict frozen as a permanent
-offline test; no `/NOTICE` entry (black-box parsing oracle, root NOTICE §0 — the module's
-existing NOTICE for the vendored documentation excerpt is unrelated and unaffected).
+- **Run:** `scripts/modtest metrics`. The oracle replays run offline; to re-take them: `zig build interop-metrics`
+  (`-- --check` compares with the committed vectors; needs `go` with the modules in its cache, see `tools/README.md`).
+- **Instruments and registry** (`src/root.zig`, `src/audit_test.zig`, `src/mutation_test.zig`, `src/sweep_test.zig`): counter
+  monotonicity and get-or-register identity, gauge set/inc/dec/add/sub, histogram cumulative buckets (inclusive `le`,
+  `_sum`/`_count`, empty bucket list, NaN), name/label/bucket validation errors, input-copy proof, golden exact-bytes
+  exposition (escaping, `le="+Inf"`), an 8-thread stress on shared instruments with exact totals and a concurrent
+  get-or-register convergence stress, removal racing concurrent scrapes, summary, collector, callback, exemplar, process
+  collector and `Format.negotiate` classes, the cardinality and epsilon limits at both edges, and the no-panic sweep cases
+  (saturating request size, total bucket accessors, short snapshot slices).
+- **Middleware and endpoint:** over socket-free `http.Server.serveStream` (per-method/class counts incl. 404/405/handler-error
+  500, injected-clock deterministic latency buckets, in-flight observed mid-request, `.code` granularity, custom
+  names/buckets, hook fields incl. `req`/`res`, scrape-not-counted proof, endpoint goldens, HEAD, 405, pass-through, custom
+  path), plus an in-process `router` + `http.Server` + `http.Client` loopback run (mixed 2xx/3xx/4xx/5xx traffic, the scrape
+  asserts exact values) that skips only when loopback binding is unavailable.
+- **Oracles** (answers frozen in the repo, replayed with no Go): the client_golang oracle (`src/go_oracle_test.zig`,
+  `src/go_oracle_vectors.zig`, produced by `tools/interop.zig` + `tools/go_oracle`): seeded operation scripts run on this
+  registry and on client_golang, the exposition judged by prometheus/common `expfmt` and the Prometheus server's own scrape
+  parser (`model/textparse`); one class, EMPTY_BUCKETS (client_golang turns an empty bucket list into `DefBuckets`, this module
+  keeps only `+Inf`). The registration oracle (`src/go_register_test.zig`, `src/go_register_vectors.zig`): get-or-register
+  sequences at every name/label edge, refusals and collisions, judged by client_golang. The summary oracle
+  (`tools/go_summary_oracle`, `src/summary_oracle_vectors.zig`): the CKMS engine bit-exact with beorn7/perks. Exposition bytes
+  are also pinned by goldens printed by client_golang itself (`tools/go_golden`).
+- **External parse:** a frozen test (`external anchor: exposition text independently parsed by prometheus_client`) holds what the
+  `prometheus_client` parser extracted from this module's own `writeText` bytes. It found no disagreement; that parser strips
+  the `_total` suffix at the family level while samples keep it, a client-library convention rather than a defect.
+- **Lead:** `src/lead_test.zig` (`tools/go_field_probe`) holds the six scrape-decided rows behind the card's `**Ahead:**` line.
+- **Fuzz / constant time:** n/a (see *Fuzz exemption* and the card's `Hardening` line).
+- **Bench:** `zig build bench-metrics` (`tools/bench.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
 ## Performance
 
-**Fastest in the field, 2026-10-25** (`zig build bench-metrics`, `BENCH_ROUNDS=5`, ReleaseFast, load average ~1.5): ours over the faster contender per row — counter_inc 0.99× VictoriaMetrics (both one locked add), observe 0.58× VictoriaMetrics, counter_vec 1.03× VictoriaMetrics, scrape 0.98× client_rust. `counter_vec` was 2.1× VictoriaMetrics before `hashValues` went from streaming Wyhash (43 % of `Vec.with`: buffer copies for short values) to one-shot Wyhash per value chained through the seed, and label values were compared with overlapping word loads instead of an out-of-line `std.mem.eql` (18 %): 66 → 33 ns per `with(...).inc()`. Reference rows the same run: 0.05–0.71× client_golang.
+`zig build bench-metrics` (`tools/bench.zig`, with `tools/go_bench` for client_golang and `tools/go_fast_bench` /
+`tools/rust_fast_bench` for the fastest-in-the-field side, skipped with `BENCH_FAST=0`) measures `counter_inc`, `observe`,
+`counter_vec` and `scrape`. The card's Performance line carries the figures.
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-metrics`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 6.1 %): ref 0.05–0.94×, against 0.06–0.79× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+## What is deliberately not done
+
+- **Native/sparse histograms and the protobuf exposition**: only useful together; Prometheus scrapes text fine.
+- **Label currying**: rare.
+- **`Gatherers` / `WrapRegistererWith`**: a program owns its registries here; `writeText` of several registries concatenates.
+- **The Go-runtime collector**: there is no GC or goroutines; allocator statistics go through a `Collector`.
+- **Push gateway, remote-write**: batch jobs only; text exposition only.
+- **Float `Counter.add`**: counters are integers by design; float counters exist through `counterFunc` / `Sink.counter`.
+- **UTF-8 metric names**: the legacy charset is kept (`go_register_test` classifies it).
+- **More than `max_labels` (8) labels**: a cardinality guard.
+- **`metrics.handler(registry) -> router.Handler`**: not implementable, a stateless fn pointer cannot close over a `Registry`;
+  `Endpoint` is the replacement and `Registry.respond` covers hand-written handlers.
+- **A metrics-owned auth wrapper**: `aaa-gate` is the module for that (see *Threat model*).
 
 ## Backlog / deferred
-- **FIXED 2026-11-12 (field removed) — LOW, dead state (mutation run 2026-11-12):** `Family.desc_index` is written in `registerCollector` and never read; drop it with the next metrics source change.
 
-- **Delta audit 2026-10-29 (no-panic sweep § GH):** 7 mutants over the sweep diff on the unfiltered ReleaseSafe suite; 6 killed on the first run, the survivor (the long-name collision scan without its suffix compare) became a test that a same-length name with another suffix does not collide. 7/7. Not scored: the saturating header-length sum (bounded by the head limit), the exemplar count boundary (128 distinct names already exceed 128 runes).
-- **Delta audit 2026-10-29 (limits R1-1, R1-2):** 8 schemata mutants over `5cc7e669` (each check dropped, both boundaries shifted, the pre-lock length checks of `getOrRegister`/`registerFunc` dropped) on the unfiltered ReleaseSafe suite: 8/8 killed on the first run, each by its own test.
-- **Closed 2026-10-29 (owner decisions after the § GH review):** ME-4 / R1-2 summary `epsilon` below
-  `min_epsilon` (1e-4) is refused at registration (402 stream entries after 200k observations at the
-  minimum, pinned in `summary.zig`); R1-1 cardinality is bounded by `Registry.max_label_value_len` /
-  `max_series_per_family` with defaults on. Still open from that review: R1-3 summary `buf_cap` /
-  `age_buckets` without an upper bound (caller options, eager per-series allocation), R1-5 `delete` is
-  O(series) under the registry lock.
-- **Audit 2026-10-25 leftovers** (M1 summary
-  `_sum`/`_count` collision and M2 `familyLocked` atomicity were fixed the same day):
-  **M3** a `*Metric` from `Vec.with` dangles after a concurrent `delete`/`reset` of that series when
-  no scrape holds it (documented on `delete`; a refcount would close it, cost unmeasured);
-  **L1** `unregister`/`retireLocked` leak the family/series when their parking-list append fails
-  (deliberate: leaking beats freeing memory a scrape may read; count it?); **L2**
-  `Summary.droppedInserts` counts a failed 500-value flush as 1; **L3** `RequestMetrics.init`
-  leaves the families it already registered when a later size-histogram name collides; **L4**
-  `Histogram.cumulativeBucket(i)` panics for `i >= upper_bounds.len` (assert vs error).
-
-- **Review LOWs of the 2026-10-17 wave (metrics part, L4–L9)** — closed 2026-10-18:
-  **L4** (`process_start_time_seconds` from `btime = 0`) and **L6** (suffix collision between two
-  descs of one collector) were already fixed by 9cf15487; **L5** (a) `retired` grew without bound
-  while scrapes overlapped with no gap — fixed: each scrape takes a ticket and each removed series
-  the ticket counter of its removal, and a series is freed once the scrapes older than its removal
-  have ended (test with overlapping scrapes, negative control = the old "last scrape out" rule),
-  (b) `delete` is O(n) in the family's series (find + ordered remove) — kept: it keeps registration
-  order, and client_golang sorts every family's series on every scrape; **L7** (an exemplar on a
-  counter without `_total`, typed `unknown` in OpenMetrics) — kept: prometheus/common v0.71 expfmt
-  writes the exemplar the same way (measured 2026-10-18 with `tools/go_golden` plus such a
-  counter); **L8** (`droppedInserts` under-reporting) — no longer true, it counts every value a
-  stream lost; **L9** (a collector's error collapsed into `WriteFailed`) — `Registry.lastCollectorError()`.
-- ~~**Registration's suffix guard is narrower than the collector's**~~ *(found by the 2026-10-18
-  mutation run)* — DONE 2026-11-19. The summary half was fixed 2026-10-25 (audit M1); what was
-  left was `registerCollector`'s own `derivedCollision`, which guarded `_bucket`/`_sum`/`_count`
-  for a summary too. Both paths now take the one per-kind set (`Registry.derivedSuffixes`:
-  histogram `_bucket`/`_sum`/`_count`, summary `_sum`/`_count`; counter and gauge derive nothing).
-  **Decision (owner rule, reference = client_golang):** the exact set of sample names a family
-  writes, not a stricter one — a summary writes no `_bucket`, so `s` beside `s_bucket` is
-  accepted on both paths (client_golang refuses only what `Gather` finds duplicated;
-  `go_register_test` pins it). Considered and rejected: a counter `x_total` vs a family `x`
-  (OpenMetrics announces the counter as family `x`): client_golang's registry accepts the pair
-  (`go_register_vectors`, histogram `h` + counter `h_total`) and so do we; client_python's
-  registry (`Counter._get_names`: `x`, `x_total`, `x_created`) would refuse it, the Go reference
-  wins. No `info` kind and no `_created` samples exist here. Tests: `sweep_test.zig`, every
-  kind x suffix on the collector and the registry path.
-- **Still open from that review's follow-ups:** `_created` samples (client_golang's default is
-  none, so not a parity gap), VictoriaMetrics/metrics as the bench's `fastest`, a Go differential of
-  the process collector's values.
-
-- ~~**`AccessLog` `.combined` is not CLF any tool reads**~~ *(found 2026-10-06)* — RESOLVED
-  2026-10-06 by removing `AccessLog`: access logging is the `accesslog` module's (`Sink`,
-  goaccess-anchored Combined), fed from the `on_request` hook (`AccessEntry.req`/`.res`).
-
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/metrics.zig` renders Prometheus text. Register the same counters, gauges and histograms (including label values that need escaping) in both and diff the exposition output byte by byte. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-A bounded route-pattern label for the request middleware; `router` now exposes the matched
-pattern (`Ctx.matchedPattern()`), so it can be wired in (currently deliberately not labeled by raw path — cardinality risk). `metrics.handler(registry)
-→ router.Handler` from the original brief is not implementable (a stateless fn pointer cannot close
-over a `Registry`); `Endpoint` is the shipped replacement. No push-gateway/remote-write planned.
-
-- ~~Callback gauge / collector, process collector, unregister/remove, Summary, OpenMetrics (`# EOF`, exemplars)~~ *(survey 2026-09-30)* — DONE 2026-10-17 (`CounterFunc`/`GaugeFunc`, `Collector`+`Sink`, `ProcessCollector`, `*Vec.delete/reset` + `unregister`, `Summary`, `writeOpenMetrics` + `Format.negotiate`, `*WithExemplar`).
-- **Deliberately not doing** (survey 2026-10-17): native/sparse histograms and the protobuf exposition (only useful together; Prometheus scrapes text fine), label currying (rare), `Gatherers`/`WrapRegistererWith` (a program owns its registries here; `writeText` of several registries concatenates), the Go-runtime collector (no GC/goroutines; allocator stats go through a `Collector`), push gateway (batch jobs only), float `Counter.add` (integer counters by design; float counters exist through `counterFunc` / `Sink.counter`), UTF-8 metric names (legacy charset, `go_register_test` classifies it), `max_labels` = 8 (cardinality guard).
-- **`_created` samples** in OpenMetrics — client_golang's are opt-in (`EnableOpenMetricsTextCreatedSamples`); needs a creation timestamp per series from a wall clock. Effort S–M.
-- **Time-to-write-header** request histogram (promhttp `InstrumentHandlerTimeToWriteHeader`) — `http` has no hook when the head goes out. SIB `http`.
-- **Exact request size** — `approxRequestSize` follows promhttp (declared `Content-Length`); the bytes a handler read are not exposed by `http.Server.Request`. SIB `http`.
-- **`fastest`** — a VictoriaMetrics/metrics side in the bench (P1 needs it).
-- **Process collector differential** — run client_golang's process collector and ours on the same pid and compare (today: shape test + RLIMIT cross-check).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · posix · util · threadsafe` + deps: `router`, `http`, `procnet` — canonical source is `pub const meta`
-in src/root.zig.
+- **A bounded route-pattern label for the request middleware.** `router` exposes the matched pattern
+  (`Ctx.matchedPattern()`), so it can be wired in; today the middleware deliberately does not label by raw path
+  (cardinality).
+- **`_created` samples in OpenMetrics.** client_golang's are opt-in (`EnableOpenMetricsTextCreatedSamples`); needs a creation
+  timestamp per series from a wall clock. Effort S-M.
+- **Time-to-write-header request histogram** (promhttp `InstrumentHandlerTimeToWriteHeader`): `http` has no hook when the
+  head goes out. Sibling `http`.
+- **Exact request size.** `approxRequestSize` follows promhttp (the declared `Content-Length`); the bytes a handler read are
+  not exposed by `http.Server.Request`. Sibling `http`.
+- **Process collector differential**: run client_golang's process collector and ours on the same pid and compare (today: a
+  shape test and an RLIMIT cross-check).
+- **Differential oracle against karlseguin/metrics.zig** (idea, not scheduled): register the same counters, gauges and
+  histograms (label values that need escaping included) in both and diff the exposition byte by byte; it would live in
+  `tools/` as a differential oracle (CONVENTIONS section 9); the library is MIT and targets Zig 0.16.
+- **Summary `buf_cap` / `age_buckets` without an upper bound** (caller options, eager per-series allocation).
+- **`delete` is O(series) under the registry lock** (see Known limits): open as the worry that a very large family stalls
+  registrations.
+- **A `*Metric` from `Vec.with` dangles after a concurrent `delete`/`reset`** of that series when no scrape holds it; a
+  refcount would close it, cost unmeasured.
+- **Parking-list leak on out-of-memory:** `unregister`/`retireLocked` leak the family/series when the append to the parking
+  list fails (deliberate: leaking beats freeing memory a scrape may read); open question whether to count it.
+- **`Summary.droppedInserts`** counts a failed 500-value stream flush as 1 value.
+- **`RequestMetrics.init` leaves the families it registered** when a later registration is refused by a collision with an
+  existing family (refusals found by validation, before any registration, leave the registry untouched).
 
 ## Fuzz exemption
 
@@ -249,9 +252,9 @@ Produces the Prometheus text exposition format; it never parses it. Its
 three byte-accepting public functions (`Registry.counter`/`gauge`/`histogram`)
 take metric NAME, HELP and label strings that our own callers author in Zig
 source — there is no path from a socket to any of them. Wire bytes (an h2
-`:path` is unvalidated — audit F3) reach only the `on_request` hook, which
+`:path` is unvalidated) reach only the `on_request` hook, which
 passes them on untouched; the access-log writer that used to EMIT them here
-moved to `accesslog` (2026-10-06), whose escaping obligations it took along.
+moved to `accesslog`, whose escaping obligations it took along.
 Overturn this exemption the moment a scrape PARSER lands.
 
 ## Anchoring
@@ -262,5 +265,3 @@ Overturn this exemption the moment a scrape PARSER lands.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** src/root.zig:1411 -- the test is literally named `external anchor: exposition text independently parsed by prometheus_client` -- freezes what that independent parser extracted from this module's own writeText bytes (families, labels, escapes, cumulative buckets); :1282 additionally accepts Prometheus's published exposition example. The in-house grammar checker was demoted to a syntax check; registry/scrape paths stay self src/go_oracle_test.zig replays the client_golang oracle (`tools/interop.zig` + `tools/go_oracle`, frozen 2026-10-05): 163 operation scripts (160 generated, 3 crafted) -- counter/gauge/histogram families with 0-3 labels, label values and HELP text carrying quotes, backslashes, newlines, UTF-8 and empties, every gauge special (NaN, ±Inf, -0, max, subnormal), observations on and beside every bucket bound, counters past 2^53 -- run on this Registry and on client_golang v1.24.1; prometheus/common v0.71.0 expfmt parsed our exposition into the same families client_golang gathered (help, type, series by label set, values, cumulative buckets, sum, count), and the Prometheus server's own scrape parser (prometheus v0.315.0 model/textparse) read the same samples without error. The replay requires the very bytes judged. One class: EMPTY_BUCKETS (client_golang turns an empty bucket list into DefBuckets, this module keeps only `+Inf`; compared without buckets, 21 scripts). Since 2026-10-06 the registration rules too: src/go_register_test.zig replays `go_oracle register` -- 101 get-or-register calls in 79 sequences (metric and label names at every charset edge, `le`/`quantile`, repeated and too many labels, invalid UTF-8, re-registration with other help/labels/order/kind/buckets, histogram-derived name collisions both ways, bucket lists) run on client_golang v1.24.1 (Register, WithLabelValues, then Gather and a textparse scrape, so a call that is accepted but breaks the scrape counts as refused), names judged by prometheus/common's legacy rules (the module keeps the text-0.0.4 charset; client_golang itself now takes UTF-8 names). Classes: TOO_MANY_LABELS, BUCKETS_DIFFER, NONFINITE_BUCKET, LABEL_ORDER, EMPTY_BUCKETS (in `go_oracle/register.go`). Two defects found: a repeated label name was accepted (Prometheus refuses `m{a="1",a="2"}` and the scrape with it); `quantile` was refused on the claim that client_golang does (it reserves it for summaries only). Not anchored, and not wire behaviour: which series `RequestMetrics` records (method + status class or code, latency by method, in flight) -- this module's choice; promhttp's instrumenters choose other label conventions.
-
-**How it got there.** The anchoring work landed. DONE 0bbcefe: prometheus_client parser is now the anchor; in-house checker demoted 2026-10-05: the client_golang + expfmt + textparse oracle over the registry and its exposition -- no defect found; a mutated exposition (one sample changed, one series duplicated) is caught by expfmt and by textparse respectively.
