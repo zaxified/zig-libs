@@ -209,11 +209,11 @@ test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384, ct255
     // std has no P-521: DHKEM(P-521, HKDF-SHA512) runs on the `p521` module.
     try std.testing.expectEqualStrings("p521", meta.deps[3]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[4]);
-    // P-384 (DHKEM and MLKEM1024-P384) on the `p384` module since 2026-10-31.
+    // P-384 (DHKEM and MLKEM1024-P384) on the `p384` module.
     try std.testing.expectEqualStrings("p384", meta.deps[5]);
-    // X25519 (DHKEM(X25519), X-Wing) on `ct25519` since 2026-11-01.
+    // X25519 (DHKEM(X25519), X-Wing) on `ct25519`.
     try std.testing.expectEqualStrings("ct25519", meta.deps[6]);
-    // ML-KEM (all PQ and hybrid KEMs) on `mlkem` since 2026-11-01.
+    // ML-KEM (all PQ and hybrid KEMs) on `mlkem`.
     try std.testing.expectEqualStrings("mlkem", meta.deps[7]);
 }
 

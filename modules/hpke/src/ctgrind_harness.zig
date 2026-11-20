@@ -49,8 +49,8 @@
 //!   perf-specialized sibling exists for P-384 — see `dhkem.zig`'s module
 //!   doc comment).
 //!
-//! * `p521_decap` / `p521_authdecap` — DHKEM(P-521, HKDF-SHA512)
-//!   (2026-10-10), whose group arithmetic is this repo's `p521` module
+//! * `p521_decap` / `p521_authdecap` — DHKEM(P-521, HKDF-SHA512),
+//! whose group arithmetic is this repo's `p521` module
 //!   (`ecdhInto`; its own harness pins the multiply at 0 in-file).
 //!
 //! RFC 9180 also registers an X448 DHKEM; this module does not implement it.
@@ -413,7 +413,7 @@ const Target = enum {
     p384_authdecap,
     p521_decap,
     p521_authdecap,
-    // draft-ietf-hpke-pq (2026-10-31): pq KEM decapsulation, one row per family.
+    // draft-ietf-hpke-pq: pq KEM decapsulation, one row per family.
     mlkem768_decap,
     mlkem1024_decap,
     xwing_decap,

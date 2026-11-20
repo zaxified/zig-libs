@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for `suite.labeledExtract` and
-//! `suite.labeledExpand`, burned 2026-10-09 (the KEM / key-schedule entry
+//! `suite.labeledExpand`, burned (the KEM / key-schedule entry
 //! points are in `stackprobe_test.zig`). Per-derivation calls: tight burn
 //! (`kdf_burn`). ReleaseFast only (`skipUnlessOptimized`).
 

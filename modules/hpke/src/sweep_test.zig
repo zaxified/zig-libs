@@ -371,7 +371,7 @@ test "every KEM entry point zeroes its out parameter on error (sweep REV-hpke-1)
     }
 }
 
-// ── blind review 2026-10-31: the expanded AES key never goes stale ──────────
+// ── blind review: the expanded AES key never goes stale ──────────
 
 test "Context built from undefined, then fields set, seals like the literal-built one (review MED-1)" {
     var a = testCtx();

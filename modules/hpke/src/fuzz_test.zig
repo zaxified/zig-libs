@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for hpke's deterministic fuzz driver (added 2026-10-09),
+//! Shared plumbing for hpke's deterministic fuzz driver,
 //! and the whole-suite harness (`hpke-seal-open`).
 //!
 //! The DHKEM harness BODIES stay in `dhkem.zig` beside their corpora; each is

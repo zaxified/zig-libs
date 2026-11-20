@@ -45,7 +45,7 @@ const burn = @import("burn.zig");
 // random`/`scalar.rejectNonCanonical`), just not asm-accelerated.
 const P256 = @import("p256").P256;
 // P-384 from the `p384` module (constant-time `mul`, fixed-base comb for key
-// generation; std's P-384 made keygen 2.7x and setupS 1.24x Go, bench 2026-10-31).
+// generation; std's P-384 made keygen 2.7x and setupS 1.24x Go, bench).
 const P384 = @import("p384").P384;
 // P-521 (std has none): the `p521` module — constant-time `ecdhInto` for
 // every DH with a secret scalar, `mulInto` for the key derivation.
@@ -1730,7 +1730,7 @@ test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
 // implementation on earth.
 //
 // The width checks below are NOT sufficient on their own, and the re-audit of
-// 2026-08-11 proved it by measurement: `Nsecret` is a separately-declared
+// proved it by measurement: `Nsecret` is a separately-declared
 // constant that `extractAndExpand` takes as its own comptime parameter, and
 // `labeledExpand` expands to whatever length it is asked for — so swapping this
 // KEM's `HkdfSha384` for `HkdfSha256` (or `HkdfSha512`) still yields a 48-byte
@@ -1794,7 +1794,7 @@ test "P384Kem's internal KDF is HKDF-SHA384: shared_secret matches an independen
     try testing.expectEqualSlices(u8, &want, &got.shared_secret);
 }
 
-// ── validatePublicKey (admission check, 2026-11-17) ─────────────────────────
+// ── validatePublicKey (admission check) ─────────────────────────
 
 /// For one NIST KEM: a real key passes; each class of bad encoding is refused,
 /// and refused exactly where `encapDeterministic` refuses it (the claim is

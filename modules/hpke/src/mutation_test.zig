@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-10-31 mutation audit of `hpke` (suite, kdf, dhkem,
+//! Tests added by the mutation audit of `hpke` (suite, kdf, dhkem,
 //! schedule, pq): each one kills a mutant the pre-existing tests let survive.
 //! The comment above a test names the line it pins.
 
@@ -170,7 +170,7 @@ test "DHKEM NIST encap with a zero ephemeral scalar is DhFailed" {
     }
 }
 
-// 2026-11-01 delta audit (ct25519 X25519 in dhkem): AuthDecap's FIRST DH is
+// delta audit (ct25519 X25519 in dhkem): AuthDecap's FIRST DH is
 // x(skR, enc). A low-order `enc` with a valid pkS must be DhFailed, not another
 // error -- the sweep only fed the low-order point as pkS (second DH).
 test "DHKEM X25519 AuthDecap: a low-order enc with a valid pkS is DhFailed" {

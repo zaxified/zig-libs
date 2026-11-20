@@ -119,7 +119,7 @@ pub const KeyScheduleError = error{
     /// supplied (RFC 9180 §5.1 "VerifyPSKInputs").
     InconsistentPsk,
     /// A psk-bearing mode was given a PSK shorter than 32 bytes
-    /// (`psk_min_len`, for every KDF; until 2026-10-10 it was `Nh`, which
+    /// (`psk_min_len`, for every KDF; previously it was `Nh`, which
     /// refused RFC 9180 A.6's own vectors at HKDF-SHA512). RFC 9180
     /// §5.1.2: "The PSK MUST have at least 32 bytes of entropy and SHOULD
     /// be of length Nh bytes or longer." A PSK shorter than 32 BYTES
@@ -197,7 +197,7 @@ fn ContextOf(comptime Aead: type, comptime Kdf: type) type {
         /// from (`aead_key`, compared in constant time on every message), so
         /// a `Context` built field by field — even from `undefined` — or one
         /// whose `key` is rewritten never runs on a stale or garbage key
-        /// schedule (blind review 2026-10-31, MED-1/MED-2). A copy of a
+        /// schedule (blind review, MED-1/MED-2). A copy of a
         /// used `Context` carries its own copy of the expanded key: wipe both.
         pub const AeadState = if (@hasDecl(Aead, "Context")) Aead.Context else void;
 
@@ -228,7 +228,7 @@ fn ContextOf(comptime Aead: type, comptime Kdf: type) type {
         /// The per-message call. `aesgcm` through the expanded state, its
         /// working state left to this entry point's burn; an AEAD with
         /// `encryptInto` (`chachapoly`) burns its own message state, so the
-        /// entry point does not burn twice (`aesgcm` decision 2026-10-09);
+        /// entry point does not burn twice (`aesgcm` decision);
         /// std's types under the entry point's burn.
         const self_burning = AeadState == void and @hasDecl(Aead, "encryptInto");
 
@@ -265,7 +265,7 @@ fn ContextOf(comptime Aead: type, comptime Kdf: type) type {
             if (out.len != pt.len + Aead.tag_length) return error.InvalidLength;
             // A plaintext past the AEAD's message limit (AES-GCM 2^36 - 32
             // bytes, NIST SP 800-38D) is refused, not handed to the AEAD, which
-            // panics on it (blind review 2026-10-31, LOW-1).
+            // panics on it (blind review, LOW-1).
             if (pt.len > max_message_len) return error.InvalidLength;
             // Fail closed BEFORE producing any ciphertext: if `seq` could
             // not be advanced past this message, returning a ciphertext
@@ -1237,7 +1237,7 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fa
     // would reject the spec's own test vectors.
     try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", (@as([32]u8, @splat(0xcd)))[0..32], "some id");
     // The floor is 32 bytes at Nh = 48 and 64 too (the RFC's MUST; Nh is
-    // only its SHOULD): 31 refused, 32 accepted. Before 2026-10-10 the floor
+    // only its SHOULD): 31 refused, 32 accepted. Before the floor
     // was Nh, which refused RFC 9180 A.6.2/A.6.4's own 32-byte PSK.
     const psk31 = (@as([32]u8, @splat(0xcd)))[0..31];
     const psk32 = (@as([32]u8, @splat(0xcd)))[0..32];

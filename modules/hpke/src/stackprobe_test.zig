@@ -6,7 +6,7 @@
 //! schedule (`setup*`), `Context.seal`/`open`/`exportSecret` and the single-shot
 //! `seal*`/`open*`. Kept in the module per `CONVENTIONS.md` §9.
 //!
-//! Engine as `p256`'s probe (2026-10-08 form): the measured region is
+//! Engine as `p256`'s probe: the measured region is
 //! addressed directly `PAD` below the probe and the call runs under a
 //! `PAD`-deep `shim`, so even the caller-side frames of the call (a by-value
 //! key copy, a returned secret's temporary) are seen. ReleaseFast/ReleaseSmall
@@ -132,7 +132,7 @@ const Hits = [32]usize;
 // no instrument frame overlaps the region, so even the call's shallowest
 // frames (a wrapper's by-value copies) are seen. The earlier form claimed an
 // uninitialised buffer at the call's depth instead, and the claiming frame's
-// own header and locals hid the top few hundred bytes (2026-10-08: a stale
+// own header and locals hid the top few hundred bytes (a stale
 // negative-control hit there, and a positive control that went blind when
 // the scan function grew a local).
 const PAD = 2048;
@@ -218,7 +218,7 @@ noinline fn callLeaky() void {
 /// Zero the callee-saved registers before a measured call: they still hold
 /// the TEST's values — needles it just computed — and the call's prologue
 /// spills them into its frame, where the scan credits them to the call
-/// (2026-10-08: a negative-control "hit" of `x mod q` between two saved stack
+/// (a negative-control "hit" of `x mod q` between two saved stack
 /// pointers in `callInnocent`'s frame, gone when the setup code changed). The
 /// compiler saves and restores the probe's own values around the asm.
 inline fn scrubCalleeSaved() void {
@@ -232,7 +232,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (2026-10-08).
+/// `runProbe` computed.
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
