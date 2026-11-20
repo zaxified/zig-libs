@@ -142,7 +142,8 @@ asserts it disagrees with the correct one — so a regression to lowest-wins wou
 RED.
 
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party IS-IS
-implementation (frrouting, IOS, Junos) was ported or studied. No NOTICE entry is required (public spec). License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
+implementation (frrouting, IOS, Junos) was ported or read; FRR isisd (GPL-2.0-or-later) was used only as a
+black-box live anchor and through its documentation. No NOTICE entry is required (public spec). License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
 
 ## Anchored against FRR (capture-and-freeze)
 
