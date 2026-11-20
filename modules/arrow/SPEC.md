@@ -16,97 +16,6 @@
 
 **Downstream consumer:** no
 
-<!-- The card a consumer reads first, and the one the README catalog's Grade
-     column is computed from. Everything but the Grade line is yours; the Grade
-     line is generated from them plus the anchor grade below (CONVENTIONS.md §8,
-     "Maturity"). The grade is the WORST axis; the profile beside it (S E A H P)
-     shows every axis, so a 3 says what would make it a 2.
-
-     Scope (S) — how much of what a user expects this module covers, against the
-                 reference implementation and the notable Rust/Go/C ones. Set only
-                 by a survey (SURVEY-PLAYBOOK.md), never by feel:
-                 `ahead — <reference, version> (surveyed YYYY-MM-DD)` parity AND a
-                   measured lead, stated on an `**Ahead:**` line (below) → 1;
-                 `parity — …` nothing a user would notice is missing → 2;
-                 `core — …` the main use cases, gaps listed under Backlog → 3;
-                 `mvp — …` the happy path, gaps a user will hit → 4;
-                 `poc — …` a demonstration, finish it before anyone consumes it → 5.
-                 `unsurveyed` until then — the grade then carries a `?`, and so
-                 does a survey older than a year.
-     Ahead     — only with scope `ahead`, refused without it. One or more claims,
-                 separated by ` · `, each `<kind> — <claim> (measured YYYY-MM-DD)`:
-                 `speed` — faster than the FASTEST implementation in the field (not
-                   merely the reference); `**Performance:**` must show `fastest <y>×`
-                   with y < 1, from a bench kept in `tools/` (CONVENTIONS.md §9);
-                 `correctness` — a defect in the reference found by our oracle, with
-                   the case that reproduces it;
-                 `feature` — something a user notices that the reference lacks.
-                 A lead older than 180 days counts as parity until re-measured.
-     Audit (A) — the latest `review` (a security/adversarial audit of THIS module
-                 whose findings or verdict are recorded) and the latest `mutation`
-                 run over its tests: YYYY-MM-DD, `?` when it happened but the date
-                 is lost, `none`. After the mutation date, its score:
-                 `(<killed>/<total>, <n> eq)` — survivors not shown equivalent keep
-                 the audit at 2. `src` is the hash of the Zig sources the audit
-                 read (`zig build maturity-report`, column `src now`); once the code
-                 changes the audit is STALE and counts 2. Carrying a hash over a
-                 purely mechanical change (a Zig migration, `zig fmt`) is allowed;
-                 the commit that does it says so.
-                 Which run restores it (2026-11-12): a WHOLE-MODULE run — every
-                 guard of the production code — when the module has none yet, when
-                 the code changed since the last one exceeds ~20 % of the
-                 production lines, or when that run is over 12 months old.
-                 Otherwise a DELTA run restores it: mutants over every function
-                 the change touched (the whole function, not only its changed
-                 lines) and over the guards elsewhere that read state the change
-                 writes; same strict verdict, 0 undecided; its score goes on the
-                 Audit line and the Mutation paragraph names the base commit. A
-                 delta REVIEW without mutants never refreshes `src`.
-                 Mutant set: one mutant per guard and operator class (flip, drop,
-                 off-by-one, swap arm, skip assignment, error remap) — not every
-                 literal ±1; none on arid code (logging, declarations, comptime
-                 constants and field defaults, asserts, test helpers). A mutant
-                 that changes only cost (a fast path, a cache, a sort choice) is
-                 equivalent, noted "cost-only".
-                 1 = both dated, scored clean, over the current src · 2 = both, but
-                 stale/unscored · 3 = one of them, or a `?` · 4 = neither.
-     Hardening (H) — `fuzz`: when the deterministic fuzz driver last ran this
-                 module's harnesses (`YYYY-MM-DD (<seeds>, reach <r>%)`); `ct`: when
-                 ctgrind last checked its secret-dependent code. Each is a date,
-                 `?` (done, not recorded), `none`, or `n/a — <why>` (refused for
-                 fuzz when the module has a harness). 1 = every applicable item
-                 dated · 3 = some · 4 = none · all n/a = no cap.
-                 Optional third item `panic <YYYY-MM-DD [(…)]|n/a — <why>>`: the
-                 no-panic sweep (CONVENTIONS.md §8) — data and limits are errors
-                 at the API boundary, a caller-contract check is never an
-                 `assert`/`unreachable`. Required for grade 1–2: without it
-                 the H axis is 3 at best, and `maturity-report` lists the
-                 module as `not swept`.
-     Performance (P) — worst-workload time ratios, ours/theirs, lower is better:
-                 `ref <x>× <impl> · fastest <y>× <impl> (measured YYYY-MM-DD)`;
-                 `fastest ?` when the fastest in the field is not measured,
-                 `fastest ref` when the reference IS the fastest. A range `a–b` is
-                 read as b. `not measured`, or `n/a — <why>` where speed is not
-                 what a user picks this module for.
-                 1 = x ≤ 1 and y ≤ 1.25 · 2 = x ≤ 1.1 · 3 = x ≤ 2, or not
-                 measured · 4 = x > 2. (P2's 10 % is the noise of a worst-of-N
-                 ratio at parity; it holds only for a bench that alternates
-                 the sides and keeps each one's best of several rounds —
-                 CONVENTIONS.md §9, kind 3.)
-     Evidence (E) — class C/D only (no outside truth; class A/B take E from the
-                 anchor grade below — EXTERNAL with a live `tools/interop.zig`
-                 oracle 1, frozen EXTERNAL 2, MIXED 3, REDERIVED 4, SELF 5):
-                 `model-fuzz — <model>` an independent reference model the fuzz
-                   driver compares against → 1;
-                 `model — <model>` a reference model or a checked invariant → 2;
-                 `kat — <what>` hand-computed values only → 3; `unclassified` → 3.
-                 Delete the line for a class A/B module.
-     Known defects (D) — an open defect that makes the module unsafe to rely on.
-                 Any text other than `none recorded` sets the grade to 5.
-     Downstream consumer — `yes` if a project outside this repo depends on it.
-                 A consumed module must grade 3 or better; check-catalog-table
-                 fails otherwise. -->
-
 ## Compared with
 
 Surveyed 2026-11-17 per `SURVEY-PLAYBOOK.md`; stars and dates from the GitHub API as of that day. Licences were
@@ -142,7 +51,7 @@ deterministic fuzz driver, with a read that ends in an error and never in a cras
 (arrow-rs does too; C++ makes it a separate `Validate` call *(inferred)*); the anchor is the Arrow integration
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
 ZSTD and LZ4_FRAME built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
-**Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Union,
+**Where we are behind** (→ *Backlog / deferred*, *What is deliberately not done*): the types the format has and `dataframe` has no column for (Union,
 Interval) are refused; Map is read as a list of its entries struct, so a write-back loses the "map" tag (Arrow C++,
 arrow-rs and polars 2.x keep a map type of their own); the view types, RunEndEncoded, Map and Decimal32/64/256 are
 read but never written; LZ4_FRAME is written only at LZ4's fast levels (liblz4's
@@ -176,14 +85,14 @@ Decimal256 as `decimal`; none of them is written.
 Apache Arrow columnar format 1.x, metadata version V5: `Schema.fbs`, `Message.fbs` (FlatBuffers, `src/fb.zig`,
 `src/schema.zig`), the encapsulated message framing (continuation marker `0xFFFFFFFF`, metadata length, metadata
 padded to 8, body; `src/ipc.zig`) and the stream format: `Schema`, then the `DictionaryBatch`es, then the
-`RecordBatch`es, then the end-of-stream marker (`src/stream.zig`). The file format (wave A4) is `ARROW1` and two
+`RecordBatch`es, then the end-of-stream marker (`src/stream.zig`). The file format is `ARROW1` and two
 zero bytes, the same stream, then a `Footer` table (`File.fbs`: version, schema, a `Block` per dictionary and per
 record batch — offset of the message's framing, framing + padded metadata length, body length; 24-byte structs),
 its `int32` length and `ARROW1`; `openFile` reads the footer's schema, decodes the dictionaries and checks every
 batch's metadata, and `File.readBatch(i)` decodes one batch on demand. Buffers are written 64-byte aligned and padded;
 any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 when the array has no null.
 
-**Body compression (wave A5).** `Message.fbs` `BodyCompression`, method BUFFER: each buffer of a record or
+**Body compression.** `Message.fbs` `BodyCompression`, method BUFFER: each buffer of a record or
 dictionary batch is compressed on its own and starts with its uncompressed length as a little-endian `int64`; -1
 means the bytes after it are stored raw; a buffer of length 0 stays empty. `WriteOptions.compression = .zstd`
 (level `compression_level`, 0 = zstd's 3) compresses every non-empty buffer with the collection's `zstd` module,
@@ -195,17 +104,16 @@ context per read) after checking each declared length against `zstd.decompressBo
 buffer the declared length sized, both after checking the whole read's total against `ReadOptions.max_body_bytes`.
 A non-empty buffer declaring 0 bytes is still decoded, with either codec, as Arrow C++ 26.0.1 hands it to the codec
 whatever the length (`reader.cc` `DecompressBuffer`; ZSTD: `ZSTD_decompressDCtx` over the rest, so no bytes, an
-empty frame or a skippable frame are 0 bytes, junk or a frame holding data is an error — `error.Malformed`; until
-2026-11-17 a ZSTD buffer declaring 0 was skipped unread).
+empty frame or a skippable frame are 0 bytes, junk or a frame holding data is an error — `error.Malformed`).
 
-**LZ4_FRAME (2026-11-17)**, as Arrow C++ 26.0.1 `util/compression_lz4.cc` `Lz4FrameCodec` does it (behaviour read,
+**LZ4_FRAME**, as Arrow C++ 26.0.1 `util/compression_lz4.cc` `Lz4FrameCodec` does it (behaviour read,
 no code taken). Write: one frame per buffer with liblz4's zeroed `LZ4F_preferences_t` (C++'s
 `DefaultPreferences`): 64 KB linked blocks, no content size in the header, no block or content checksum — exactly
 the `lz4` module's `EncodeOptions` defaults (checked in `src/stream_test.zig` on every frame written, and by the
 lz4 1.10.0 CLI and python-lz4 4.4.5 decoding each buffer frame of a three-column 200 000-row stream at two levels:
 24 frames, byte-equal). `compression_level` is liblz4's `compressionLevel` as C++ passes it: negative = the fast
 mode with acceleration `1 - level` (liblz4 1.10.0 `lz4frame.c` `LZ4F_compressBlock` / `_continue`:
-`acceleration = (level < 0) ? -level + 1 : 1`; until 2026-11-17 it was `-level` here, so -1 gave 1), 0..2 = LZ4's
+`acceleration = (level < 0) ? -level + 1 : 1`), 0..2 = LZ4's
 default level (acceleration 1), 3 and up = LZ4 HC, `error.Unsupported` here (no HC in
 `lz4`; its Backlog B2). Read: exactly one LZ4 frame per buffer (C++ `Decompress`: "more than one frame" and "less
 than one frame" are errors), so a legacy or skippable frame, a second frame or a trailing byte is
@@ -213,7 +121,7 @@ than one frame" are errors), so a legacy or skippable frame, a second frame or a
 `decompress_lz4`: fewer is an error, more is an error), a content size or checksum in the frame is honoured. The
 declared length sizes the output buffer (`lz4.decompressInto`), so a frame that would expand past it stops there.
 
-**Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
+**Type mapping.** The writer maps the column's DECLARED `ColumnType` and reads the cells through
 `ColumnData.get`, so storage of another kind that holds values of the declared type is written too:
 
 | `dataframe` | Arrow written | Arrow also read |
@@ -237,7 +145,7 @@ declared length sizes the output buffer (`lz4.decompressInto`), so a frame that 
 | `text` / `binary` / `list` | — | Utf8View / BinaryView (inline or variadic-buffer views, copied) / ListView, LargeListView (offsets + sizes, copied) |
 | `list` of `struct` (key, value) | — | Map: a list of its entries struct under the file's own field names (`entries` / `key` / `value` when canonical), `keysSorted` dropped; written back as a List of Struct (the "map" tag is lost) |
 
-**Map (2026-11-17, owner decision).** `dataframe` has no map column, so a Map reads as what it physically is,
+**Map (owner decision).** `dataframe` has no map column, so a Map reads as what it physically is,
 `list<struct<key, value>>` — what polars read it as until 1.39 (`DataType::List` of the entries field;
 polars-core `datatypes/field.rs`) and still does without its `dtype-map` feature, and what pandas gets from
 pyarrow (a list of `(key, value)` tuples). Arrow C++ (`MapType`), arrow-rs (`DataType::Map`) and polars 2.x
@@ -250,7 +158,7 @@ here: a Map field without exactly one child, entries that are not a struct of tw
 dictionary-encoded), a nullable entries or key field, and a batch whose entries or keys hold a null (a non-zero
 null count on either node).
 
-**Run-end encoded metadata (2026-11-17).** `ReadOptions.metadata` reports a RunEndEncoded field in the shape of
+**Run-end encoded metadata.** `ReadOptions.metadata` reports a RunEndEncoded field in the shape of
 the column it reads as: the field's own pairs, and as its children the `values` field's children (through
 nested run-end fields); the `run_ends` and `values` fields' own pairs are dropped. Arrow C++'s IPC reader does
 the same — it rebuilds the type from the two children's TYPES only (`ipc/metadata_internal.cc`,
@@ -259,14 +167,14 @@ survives a read there either; the values' own children (a struct's fields) keep 
 `WriteOptions.field_metadata` taken from a read always fits the frame: a run-end encoded struct's child metadata
 lands on the struct's own fields, never on the `run_ends` / `values` pair.
 
-**Dictionaries (2026-11-17).** A dictionary over a non-text type (Int64 values, say) is read as a plain column of
+**Dictionaries.** A dictionary over a non-text type (Int64 values, say) is read as a plain column of
 that type. A dictionary may sit anywhere in the schema: in a list or struct (a `list` / `struct` of `categorical`),
 shared by several fields, and inside another dictionary's values (the `nested_dictionary` golden: a dictionary of
 lists whose items are dictionary-encoded reads as a `list` of `categorical`) — the inner one is decoded first, as
 Arrow C++ resolves it. Deltas (`isDelta`) extend a dictionary; a delta for a dictionary not yet sent is
 `error.Malformed` (Arrow C++ `DictionaryMemo::AddDictionaryDelta` and arrow-rs `update_dictionaries` refuse it).
 A record batch whose dictionary-encoded column has a valid (non-null) index before any `DictionaryBatch` for that
-id is `error.Malformed` (2026-11-17; it used to be read against the first dictionary that came later): Arrow C++
+id is `error.Malformed`: Arrow C++
 26.0.1 refuses every record batch before the initial dictionaries (`reader.cc`, "IPC stream did not have the
 expected number (N) of dictionaries at the start of the stream"), arrow-rs 60.1.0 stands in an empty dictionary
 (`reader.rs`, "dictionary batches may be omitted when all values in the column are null") whose bounds check then
@@ -287,11 +195,46 @@ it adds no category; a read with no record batch keeps the first dictionary's. A
 merging: each row reads its value from its own generation. In a FILE replacement is forbidden ("The IPC File format
 does not support dictionary replacement, i.e. only one non-delta dictionary batch can be emitted for a given
 dictionary ID", Columnar.rst, "Deviations from the IPC Streaming Format"), and Arrow C++'s file reader fails with
-`Status::Invalid` ("Unsupported dictionary replacement in IPC file"): `error.Malformed` here (before 2026-11-17 a
-replacement was `Unsupported` in both formats). Every generation's entries are kept and charged (see Limits), so N
+`Status::Invalid` ("Unsupported dictionary replacement in IPC file"): `error.Malformed` here. Every generation's entries are kept and charged (see Limits), so N
 replacements of a dictionary cost N dictionaries.
 
 Each dictionary-encoded column gets its own id, its whole dictionary written once before the first record batch.
+
+**Run-end encoded.** The column reads as its values' type, each batch's runs expanded. The `run_ends` child is signed
+Int16, Int32 or Int64 with no nulls, no children and no dictionary; the parent has no nulls; a batch has as many
+values as run ends; every run end is positive and greater than the one before; and the last is at least the batch's
+length — greater for a sliced array, as the columnar spec allows, and then only the batch's rows are expanded. Any
+other shape is `error.Malformed`. Every run end is checked before the expansion is sized, and the expansion is
+checked against `max_cells` before its selectors are allocated. The run-end field's own metadata is reported in the
+shape of the column it reads as (see above).
+
+**View types and ListView (read only).** BinaryView / Utf8View read as `binary` / `text`, ListView / LargeListView as
+`list`, each valid row copied out. A record batch's `variadicBufferCounts` must have one entry per view field
+(pre-order) and its buffers must number the fixed ones plus the sum of the counts (`error.Malformed`). Each valid
+row's view is checked against the batch's variadic buffers — buffer index, offset and length in range, the 4-byte
+prefix equal to the start of the data — and the bytes copied; every copied byte is charged to `max_cells` before the
+copy is allocated (views may share bytes). Utf8View is UTF-8 checked, and a Utf8View dictionary reads as a
+categorical. A list view's offset and size must lie within its batch's child (`Malformed`); its selectors are
+checked against `max_cells` before they are allocated, and an all-null child's elements are charged without a copy.
+Null rows' views, offsets and sizes are not looked at. The writer stays Utf8 / Binary / List.
+
+**Key/value metadata.** `dataframe.Frame` has no slot for it, so `ReadOptions.metadata` is an out parameter (the
+read functions keep their signatures): a `Metadata` with the schema's pairs, a `FieldMetadata` tree parallel to the
+frame's columns (and to the projection when one is given) and a file footer's pairs, copied into the read's arena,
+its bytes charged against the schema decode budget like names. `WriteOptions.schema_metadata`, `field_metadata` (by
+position; the entry's `name` is not looked at; more entries than columns is `error.Unsupported`; more `children`
+than a field has are dropped, the field's own metadata kept) and `footer_metadata` (`writeFile` only) write them.
+Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced nor
+written.
+
+**Column projection.** `ReadOptions.columns` picks top-level columns by name or by index, in the order given: the
+frame's columns and `Metadata.fields` follow it. A name must name exactly one field, an index must exist, a column
+may be selected once (`error.UnknownColumn` otherwise). The other columns' buffers are neither decompressed nor
+decoded and not charged to `max_cells` / `max_body_bytes`, but their node and buffer counts and lengths are still
+checked; the same holds through `File.readBatch`. A dictionary that only unprojected columns use is skipped, not
+validated: its batches' metadata is checked (id known, counts, `max_rows`, replacement) and its body is not read —
+decoding it would cost what projection saves, and a defect in it is as invisible to the frame as one in an
+unprojected column's buffers. A view field's variadic buffers are skipped with its views.
 
 ## Limits and refusals
 
@@ -336,8 +279,10 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   (`error.InvalidUtf8`) unless `ReadOptions.validate_utf8 = false`.
 - **Decimal precision**: the writer declares Decimal128(p, 12) with p the digits of the column's widest value (at
   least 12, so scale ≤ precision); a value of 39 digits (an i128 can hold it, Decimal128 cannot) is
-  `Unsupported`. The reader refuses a declared precision outside 1–38 (`Malformed`), and a value with more digits
-  than its declared precision, or with more than 38 once at 12 fractional digits, like an inexact scale.
+  `Unsupported`. The reader refuses a declared precision outside its width's range (Decimal32 1–9, Decimal64 1–18, Decimal128 1–38,
+  Decimal256 1–76; `Malformed`), and a value with more digits than its declared precision, or with more than 38 once
+  at 12 fractional digits, like an inexact scale; a Decimal256 outside the i128 range is refused like any value
+  `dataframe` cannot hold.
 - **Shared dictionaries**: two fields may name one dictionary id when their value types agree (type, zone,
   children, and the children's own dictionary encodings: id, index type, order); each keeps its own index type.
   Different value types are `Malformed`; one dictionary with two `isOrdered` flags is `Unsupported`. A dictionary
@@ -350,19 +295,22 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   default: a Decimal128 that does not fit 12 fractional digits in an i128 (or the precision rules above); a time of
   day outside `[0, 24h)`; a date outside the years 0000–9999; s/ms timestamps or durations whose microseconds
   overflow i64; a nanosecond timestamp, duration or time with digits past the microsecond; a Date64 that is not on
-  a day boundary. `ReadOptions.lossy = true` reads the first four as null cells, TRUNCATES the last two toward
-  zero (so −1 ns reads as 0 µs and a Date64 of −1 ms as 1970-01-01 — the day of the truncated count, not the
-  calendar day of the instant), and reads a timestamp zone `tz` does not know as a naive column. Nothing else
+  a day boundary. `ReadOptions.lossy = true` reads the first four as null cells, TRUNCATES nanosecond values toward
+  zero (so −1 ns reads as 0 µs), FLOORS a Date64 to the calendar day that contains the instant (−1 ms is
+  1969-12-31), and reads a timestamp zone `tz` does not know as a naive column. Nothing else
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
+- **View types:** a `variadicBufferCounts` list or buffer count that does not fit the view fields, a view outside
+  its batch's variadic buffers or whose 4-byte prefix is not the data's start, and a list view's offset or size outside
+  its batch's child are `error.Malformed` (see *View types and ListView*).
 - Refused on read (`Unsupported`): Interval, Union,
-  tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
+  tensors, big-endian data. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
 
 ## Anchoring
 
-**External anchor (2026-11-17):** the apache/arrow-testing integration golden files written by Arrow C++,
+**External anchor:** the apache/arrow-testing integration golden files written by Arrow C++,
 committed under `src/testdata/` (Apache-2.0 data, see `NOTICE`; commit `5a26d357`), read by
 `src/golden_test.zig`. Each set's `.stream` and `.arrow_file` is compared field by field and cell by cell with
 its Arrow integration JSON (`.json.gz`), through an oracle written from the JSON's own encoding (units, decimal
@@ -388,151 +336,66 @@ and python-lz4 (see "LZ4_FRAME").
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-**Audit 2026-11-17 (mutation, whole module).** 325 schemata mutants over `src/fb.zig`, `src/schema.zig`,
-`src/ipc.zig` and `src/stream.zig`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and
-`ulimit -v` (the coverage-guided `testing.fuzz` entry point is skipped in the mutation copy: outside the build
-runner it never returns; the golden files, `hostile_test.zig` and the corpus harness stay in). One mutant per
-guard × operator class: the FlatBuffers reader (every bounds check of `readInt`, `follow`, `Table.at`,
-`field`, strings, vectors and elements, enum values; 25) and builder (padding and alignment, offsets, lengths,
-vtable fields, slot reset, defaults omitted; 20); schema decoding (budget and its boundary, depth and its
-boundary, per-table and per-byte charges, endianness, every type table's parameter checks and defaults, the
-NONE id, message version and body length; 25) and encoding (every field, type parameter and header written;
-24); IPC framing (end of stream, continuation, metadata and body lengths and their exact fit, the position
-advance, padding, node and buffer checks, the compression method and codec, 64-byte buffer alignment; 24); the
-writer (type mapping and the Large switch at its boundary, declarations against storage, the categorical
-dictionary, compression choices, validity and null counts, decimal precision, time range, batches, the file
-footer and blocks; 58); the reader (planning of every type and its buffer counts, shared dictionaries,
-`max_rows` / `max_cells` / `max_body_bytes` at every place they are checked, inflation, every column kind's
-buffer-length, offset, index, validity and null-slot rule, lossy and strict conversions, the date range,
-categorical remapping, list identity and the u32 offset cap, `gather`'s charges, stream message order, the
-file's marks, footer length, blocks and their spans; 149).
-First run: 205 killed (2 by a hang: the position never advancing, `rows_per_batch = 0` taken literally),
-120 survived. The deterministic fuzz driver (`ARROW_FUZZ=20000`) over the survivors killed 5 more, all also
-pinned by a test since. New tests (`src/guards_test.zig` and beside each layer in `fb.zig`, `schema.zig`,
-`ipc.zig`) kill 92: hand-built vtables, field offsets, enums, strings without NUL and short vectors; builder
-alignment and `tbl_len`; exact `max_depth` (63 levels pass, 64 do not) and decode-budget boundaries; shared
-metadata and a shared zone charged per use; big-endian schemas, bad type parameters, absent type tables, a
-`Message` without a version; a stream without the end marker and a last message flush with the end; metadata
-and body padding; a negative null count and a compression method other than BUFFER; the Large switch at
-exactly `large_from`; declarations the storage cannot meet with every cell null, an `array_width` past i32, a
-time of 24:00, `.boxed` storage; struct children declared by name; a categorical stored as text written once
-per distinct text, sorted; a Null array's null count; null slots read as 0 / false / nothing and a null row's
-dictionary index unread; null dictionary entries; short bool / FixedSizeBinary / offset buffers, negative
-offsets and indices, a struct child of another length, a FixedSizeList child too short, a time whose unit and
-width disagree; list children cut to what the rows use and offsets not from 0; shared dictionaries differing
-in kind, unit, width, child name or child dictionary; the years 0000 / 9999 and either side; an all-null
-struct; index signs past 2^15 and 2^31 (null dictionaries); a decimal scale past 38 digits of rescaling;
-compressed buffers declaring -2 or more than their frame holds; `max_rows` over column-less batches, at
-`openFile` and over a list child's batches, `max_cells` over dictionary copies, the u32 list offsets over 33
-batches; a first message that is not a schema, a second schema; the leading mark, a footer reaching into it, a
-batch block naming the schema message.
-25 equivalent: `follow`'s and `Table.at`'s upper bounds (×3; every consumer reads through `readInt`, which
-bounds-checks); the vtable slot bound by one (vt_len and slot ends are both even); `ensure` growing at an exact
-fit (cost-only); `min_align` tracking and `finish` aligning to `min_align` without the floor of 8 (every
-alignment pushed is at most 8, and an item is aligned relative to the buffer's end, so the buffer padded to
-its largest alignment keeps every item aligned; `writeMessage` pads to 8); a node's negative length (implied
-by `null_count >= 0` and `null_count <= length`); `+|` against `+` for a buffer's end (both < 2^63); the
-writer's own depth limit (the schema encoder refuses every depth it would admit) and the reader's (the schema
-decoder already refuses it); the categorical planner's and the dictionary writer's non-text refusals (each
-refuses the cells the other would); the struct writer's cell check (only struct and null storage reach it);
-`cellAt`'s `none` (a row past the end reads as null); `finishDicts`' and `checkBatch`'s `max_rows` (decode and
-`frame` / `openFile` sum the same lengths again); the frame-size bound before decompression (cost-only: a
-frame producing fewer bytes than declared fails the length check after); clearing `compression` after
-inflation (nothing reads it); the date loop's null skip (a null slot holds day 0, a valid date); `dateText`'s
-year check (decode dropped those years); `allNull` of zero rows (a bitmap exists only once a row is null);
-`rescale`'s shortcut at scale 12 (cost-only); an empty compressed buffer written as an 8-byte raw marker
-(cost-only: every reader reads it as empty); `gather`'s text-null rule (the reader's text storage has
-consistent offsets, so `at` is null exactly when the row is not valid).
-3 unobservable: the builder's 4 GiB offset cap, a categorical of more than 2^31 distinct texts, and a Utf8
-batch past 2 GiB, each needing that many bytes in memory. No finding.
+## Verification
 
-**Audit 2026-11-17 (delta mutation, read gaps).** 98 schemata mutants over the non-test code the read-gap wave
-changed since the whole-module audit (metadata, projection, Decimal32/64/256, RunEndEncoded incl. the sliced
-last run end, the view types, the `field_metadata` children rule, and the review's all-null ListView charge):
-`ipc.zig` variadic counts (2), `schema.zig` metadata charges and footer budget, new type ids both ways (9),
-the writer's metadata placement (6), and in the reader `afford` and its boundary, every new plan rule (decimal
-precision per width, dictionary of views, view / list-view / run-end planning), projection (selection,
-ambiguity, repeats, node and buffer ranges, dictionary use), dictionary batches and replacement, `checkBatch`'s
-variadic counts and charges, `prepare`'s buffer reordering and projection mask, `inflate`'s skipped buffers,
-Decimal256 narrowing, run-end checks and expansion, view bounds / prefix / UTF-8 / charges, list-view bounds,
-the u32 cap and charges, and metadata copying (81). Same method as above, one ReleaseSafe build per run.
-First run 83 killed / 13 survived; new tests kill 9: metadata keys charged like values, the footer metadata's
-own budget (a file footer of 256 shared 64 KiB entries), a Utf8View dictionary read as categorical, run ends
-with a dictionary, compressed (raw-prefixed) view batches read whole and projected past broken view buffers
-(both halves of `prepare`'s mask), a views buffer and a list view's offsets short of the rows, 2^32 list-view
-elements against the u32 cap, the exact `max_cells` of a list view (`afford` at its boundary). Second run (with
-the review fix's 2 mutants) 94/98 killed.
-4 equivalent: `finishDicts` skipping an unused dictionary (it has no chunks: `takeDict` returns before
-appending, and no picked column reads it; cost-only); the Decimal256 precision check dropped or off by one (for
-precision ≤ 38 the decimal path repeats `|x| < 10^p`; past 38 a value of 10^p or more has over 38 digits, which
-the i128 cast or the 38-digit check drops the same way); the all-null ListView branch (without it `afford`
-refuses the same `total` before the selectors are allocated and `gather` charges it; cost-only). No finding.
+Run: `scripts/modtest arrow`. The example (`example/main.zig`) writes a zstd-compressed file to disk, reads it back and
+reads one batch on its own.
 
-**Audit 2026-11-17 (delta mutation, Map on read and run-end metadata).** Base `7ef45b844`. 19 schemata mutants over
-the non-test code the change touched: `schema.zig` the Map type id both ways, `keysSorted` decoded, defaulted
-and encoded (4); in the reader's `plan` the Map branch — the branch taken, the entries' type, field count,
-dictionary and nullability, the key's nullability, the flag, the offset width (8); `decode`'s Map null checks
-— taken, the entries' count, the key's count, the key's node (4); the metadata fold — dropped, one level only,
-the other child (3). Same method as above, one ReleaseSafe build per run. First run 14 killed / 5 survived;
-new tests kill all 5 (`keysSorted` through a schema round trip and its default without a type table; entries of
-an Int type with two children and a struct of three fields). Second run 19/19. No equivalent, no finding.
-
-**Audit 2026-11-17 (delta mutation, dictionary replacement and nested dictionaries).** Base `922fd86bb`. 33
-schemata mutants over the non-test code the change touched: `RDict.genAt` (the empty case, the `<=` bound, the
-arms, the loop bound; 4); `plan`'s dictionary branch (the cycle check, `planning` set and cleared, post-order
-append, the counter kept; 5); `markUsed` (the guard, the recursion into values; 2); `takeBatch`'s and `takeDict`'s
-sequence stamps (2); `takeDict` (delta with no dictionary, replacement refused only in a file — both halves, the
-sequence step, the generation base, `max_rows` over the generations and its `used` half, the length and
-generation-length updates, the unused-dictionary return; 10); `finishDicts`' `used` (1); `dictColumn` (the
-batch-less fallback, live marking, the index bound against the batch's generation, the generation base; 4);
-`categorical` (the remap reset, both `live` filters; 3); `sameValueType`'s child dictionary check (1);
-`readStream`'s `replace` (1). Same method as above, one ReleaseSafe build. 28 killed (two assertions added before
-the run: the categories of a batch-less read and of an ordered dictionary replaced before any batch).
-5 equivalent: the cycle check dropped and `planning` never set (a dictionary inside its own values is a field
-inside its own value type, and a finite type tree never equals its own proper subtree, so `sameValueType`
-refuses it as `Malformed` first); `markUsed` recursing into an already used dictionary (cost-only: no cycle
-survives planning); `takeDict`'s `max_rows` over the generations (decode sums the same chunks' lengths against
-`max_rows` before allocating; cost-only); `finishDicts` decoding an unused dictionary (it has no chunks;
-cost-only, as in the whole-module audit). No finding.
-
-**Audit 2026-11-17 (delta mutation, LZ4_FRAME and the dictionary-before-batch rule).** Base `9ffad6308`. 17
-schemata mutants over the non-test code the change touched: `emit`'s codec choice (compress when `lz4o` is set,
-the codec written; 2); `compressBody`'s bound (1); `write`'s level mapping (the HC bound off by one and dropped,
-`< 0` → `<= 0`, the acceleration ignored, `lz4o` never set; 5); `RDict.genAt` (the before-the-first-generation
-case dropped and `>` → `>=`; 2); `inflate` (LZ4_FRAME refused, the declared-0 frame skipped, the short-buffer and
-magic checks, `multi_frame`, the output cap, the length check; 7). Same method as above, one ReleaseSafe build.
-14 killed, 2 equivalent, 1 unobservable, no finding: zstd's `compressBound` for an LZ4 buffer (EQUIVALENT,
-cost-only: it is never below LZ4's frame bound, `n + 63` or more against `n + 15 + 4` per 64 KiB block);
-level `< 0` → `<= 0` (EQUIVALENT: level 0 then gives acceleration 0, which `lz4` clamps to 1); the LZ4 decode cap
-`null` → `lz4.default_max_output` (UNOBSERVABLE here: the declared length caps the output first unless one
-buffer declares more than 256 MiB, which a test cannot afford). Not mutated: `compressInto`'s error mapped to
-`Unsupported` (only a buffer over 4 GiB reaches it) and `decompressInto`'s error mapped to `Malformed` (arid:
-every error is the same verdict).
-
-**Audit 2026-11-17 (delta mutation, the lz4 review fixes).** Two schemata mutants, one ReleaseSafe build: the
-LZ4 acceleration `1 - level` back to `-level`, and a ZSTD buffer declaring 0 bytes skipped unread again. Both
-killed, no finding.
+- **Golden files** (`src/golden_test.zig`): the external anchor above, compared with the integration JSON through an
+  oracle written from the JSON's own encoding; stream and file read equal; the frame written back (plain, zstd, lz4,
+  stream and file) reads equal, metadata included; projection checked on every set (all columns reversed, then each
+  alone).
+- **Round trips and refusals** (`src/stream_test.zig`): every type of the mapping table both ways, every refusal,
+  `lossy` and the inexact time conversions, the metadata version, "targeted corruptions" and "every truncation and byte
+  flip" over written streams and files, LZ4 frame checks on every frame written.
+- **Hostile structure** (`src/hostile_test.zig`): metadata built with `fb.Builder` to cost the reader far more than its
+  size (a DAG of shared FlatBuffers tables, one name behind thousands of fields, columns whose rows cost no body bytes,
+  one repeated byte compressed over many batches, dictionary entries copied into many rows, footer blocks naming one
+  message twice or lying about their lengths), each read under a byte-capped allocator: the read must end in its error,
+  never in the cap.
+- **Dictionaries** (`src/dict_test.zig`): hand-built streams for replacement, deltas, a batch before its dictionary,
+  nested and shared dictionaries, cycles, projection over a replaced dictionary.
+- **Guards** (`src/guards_test.zig`, and beside each layer in `fb.zig`, `schema.zig`, `ipc.zig`): boundaries and short
+  or negative inputs that the mutation runs showed no other test pins (the `max_depth` and decode-budget boundaries,
+  the Large switch at `large_from`, null slots, short buffers, shared dictionaries that differ, the file's leading mark
+  and footer).
+- **Fuzz:** `ARROW_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver), harness `read`
+  (`src/fuzz_test.zig`): `readStream` and `openFile` + `File.readBatch` / `readAll` over a valid golden file or a frame
+  this module wrote (plain, zstd, lz4, one batch and many) damaged where it matters (a framing length, a FlatBuffers
+  offset or vtable field, a node length or null count, a buffer location, a compressed buffer's length prefix, the file
+  footer and its blocks, or plain bytes, then maybe truncated), also read with one column projected and with the
+  metadata asked for; every input ends in an error or a frame, and a frame the reader makes is one the writer takes and
+  reads back equal. A test pins that every corpus entry reads and rewrites undamaged, and reach labels count the
+  golden inputs (Decimal32/256, RunEndEncoded, the view types, Map, custom metadata, nested and shared dictionaries,
+  LZ4 goldens) and a replacement stream. The card's Hardening line holds the last run. Resource shapes the driver
+  cannot make are in `src/hostile_test.zig`.
+- **Constant time:** n/a — data files, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it (schemata over `fb.zig`, `schema.zig`, `ipc.zig`, `stream.zig`; the coverage-guided
+  `testing.fuzz` entry point is skipped in the mutation copy).
+- **Bench:** none; Performance is `not measured` (→ Backlog).
 
 ## What is deliberately not done
 
-- **Zero-copy reading — not now.** The reader copies every buffer into `dataframe` storage, which has its own
-  layout (u32 list offsets, usize text offsets, 64-bit validity words); views over the input would need a second
-  column representation. Revisit only with a consumer that reads files larger than memory.
-- **The C data interface, Flight, compute kernels — never here.** Separate concerns (in-process FFI, RPC,
-  compute) for separate modules if a consumer ever needs them.
+- **Zero-copy and memory-mapped reading — not now.** The reader copies every buffer into `dataframe` storage, which has
+  its own layout (u32 list offsets, usize text offsets, 64-bit validity words); views over the input would need a
+  second column representation. polars and pyarrow both offer it. Revisit only with a consumer that reads files larger
+  than memory.
+- **The C data interface, tensors / sparse tensors, Flight, compute kernels — never here.** Separate concerns
+  (in-process FFI, RPC, compute) for separate modules if a consumer ever needs them.
+- **Feather V1** — deprecated upstream since 25.0; not planned.
 - **LZ4 HC levels (liblz4 3..12) on write — superseded by something external:** `error.Unsupported` until the
   `lz4` module has HC (its Backlog B2); the fast levels are written.
-- **Reading the types `dataframe` has no column for — never as such.** Interval and Union would need new
-  `dataframe` column kinds first. (RunEndEncoded, the view types and Map are read, but only as the plain columns
-  they encode — Map as a list of its entries struct; writing them would need column kinds of their own.)
+- **Reading the types `dataframe` has no column for, as themselves.** Interval and Union stay `Unsupported` until
+  `dataframe` has column kinds for them (→ Backlog). RunEndEncoded, the view types and Map are read only as the plain
+  columns they encode — Map as a list of its entries struct; writing them would need column kinds of their own.
 
 ## Open
 
 - The writer is anchored only through our own reader: no foreign implementation reads our bytes (a live pyarrow
-  round trip needs a venv + wheel — owner decision).
-- The reader copies every buffer (no zero-copy views over the input).
+  round trip needs a venv + wheel — owner decision). Its LZ4 buffer frames have been decoded by the lz4 CLI and
+  python-lz4.
 - `openFile` reads the schema from the footer only; it does not compare it with the stream schema at offset 8.
-- Performance not measured.
 - RunEndEncoded requires `values.length == run_ends.length` per batch (Arrow C++ is believed to refuse only
   fewer values than runs). Relaxing it needs a per-batch values base in the run index, or another batch's
   values would be picked silently.
@@ -540,125 +403,26 @@ killed, no finding.
   differential oracle should carry one metadata case, footer included.
 - Compressed view batches (`prepare` splitting variadic buffers before an `inflate`) are tested only with
   raw-prefixed (-1) buffers: the writer never emits views and the `cpp-21.0.0` view goldens are uncompressed.
-- Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced
-  nor written; only schema, field and footer metadata are.
-
-## Plan
-
-Oracle: the apache/arrow-testing integration golden files with their JSON descriptions (data only, Apache-2.0); a live
-pyarrow round trip is an owner decision. Out: the C data interface, Flight, compute kernels.
-
-| Wave | Content | Status |
-|---|---|---|
-| A1 | FlatBuffers layer; Schema / Field / type tables, the Message envelope | done 2026-11-16 |
-| A2 | Type mapping `dataframe` ↔ Arrow (table above); `boxed` refused | done 2026-11-16 |
-| A3 | IPC stream: framing, Schema / DictionaryBatch / RecordBatch, end of stream, `rows_per_batch`; `writeStream` / `readStream` | done 2026-11-16 |
-| A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch; `writeFile` / `readFile` / `openFile` | done 2026-11-16 |
-| A5 | ZSTD body compression read and write (`WriteOptions.compression`); LZ4_FRAME read and write after the `lz4` module (2026-11-17) | done 2026-11-17 |
-| A6 | Golden oracle (done 2026-11-17), `ReadOptions.lossy` (done), fuzz driver (done 2026-11-17), example (done); no-panic sweep, mutation, survey | part 1 done 2026-11-17 |
-| A6.1 | Independent review 2026-11-17 (1 HIGH, 4 MED, 8 LOW) fixed: schema decode budget, read-wide `max_body_bytes` and `max_cells`, footer blocks checked and disjoint, UTF-8 both ways, inexact times refused, metadata version, decimal precision, shared dictionaries; structural hostile tests | done 2026-11-17 |
+- Performance is not measured (→ Backlog).
 
 ## Backlog / deferred
 
-From the 2026-11-17 scope survey (`## Compared with`). **Propose to implement** = substantial for a user of the
-competing libraries and cheap enough to finish in one wave; none of them is started.
-
-**Propose to implement**
-
-- ✅ 2026-11-17 **View types and ListView on read.** Done as sketched. A message's `variadicBufferCounts` must
-  have one entry per view field (pre-order) and the buffers must number the fixed ones plus their sum
-  (`Malformed`); each valid row's view is checked against its batch's variadic buffers (index, offset and length
-  in range, the 4-byte prefix equal to the data's start) and copied, every copied byte charged to `max_cells`
-  before the copy is allocated (views may share bytes); Utf8View is UTF-8 checked; a Utf8View dictionary reads
-  as a categorical. A list view's offset and size must lie within its batch's child; its selectors are checked
-  against `max_cells` before allocation. Null rows' views, offsets and sizes are not looked at. Projection
-  skips a view field's variadic buffers with its views. Anchored on the `cpp-21.0.0` `binary_view` and
-  `list_view` goldens. Was: BinaryView / Utf8View (16-byte views, ≤ 12 bytes inline, else a buffer
-  index and offset into the variadic data buffers) read into `binary` / `text`; ListView / LargeListView (offsets
-  plus sizes, any order, overlap allowed) read into a `list` by copying each row's slice. Why: C++, arrow-rs and
-  polars write the view encoding (polars chooses by `compat_level`), so a file from them is `Unsupported` today.
-  Sketch: new `Kind`s in the reader's `plan`, bounds-checked per view against the data buffers and
-  `max_cells`; the writer stays Utf8 / Binary / List. Effort: ~1 wave.
-- ✅ 2026-11-17 **LZ4_FRAME bodies, read and write.** Done with the `lz4` module: `Compression.lz4`, the reader
-  dispatches on `BodyCompression.codec` next to zstd with the same `max_body_bytes` charge from each buffer's
-  declared length, decoding into the buffer it sized (`lz4.decompressInto`); see "LZ4_FRAME" under Wire format.
-  The sketch's "a frame without a content size is `Malformed`" was wrong: Arrow C++ writes none, and arrow-rs reads
-  by the declared length. Anchored on the `lz4` and `uncompressible_lz4` goldens. Was: pyarrow's Feather writer
-  defaults to LZ4, so this was the commonest refusal a user met.
-- ✅ 2026-11-17 **Schema and field key/value metadata.** Done: `ReadOptions.metadata` (an out parameter, so
-  `readStream` / `readFile` / `openFile` keep their signatures) is filled with a `Metadata` — the schema's pairs,
-  a `FieldMetadata` tree parallel to the frame's columns, a file footer's pairs — copied into the read's arena;
-  `WriteOptions.schema_metadata` / `field_metadata` (by position) / `footer_metadata` write them (more entries
-  than columns is `Unsupported`; more `children` than a field has are dropped, the field's own metadata kept; a
-  run-end encoded field's children are reported as its values' since 2026-11-17, so a read's metadata always
-  fits). Anchored on the
-  `custom_metadata` and `extension` goldens (every set's metadata is compared with its JSON, then written back
-  and read again). Was: `arrow.schema` decodes `KeyValue`s (and the writer's schema encoder
-  takes them) but the frame has no slot, so Pandas metadata, extension type names (`ARROW:extension:name`) and
-  provenance tags are dropped on read and absent on write; the footer's `custom_metadata` likewise. Sketch: a
-  side result (`readStreamMeta` returning the frame plus `schema.Schema.metadata`, or an out parameter on
-  `ReadOptions`) and `WriteOptions.schema_metadata` / `field_metadata`; no `dataframe` change. Effort: ~0.5 wave.
-- ✅ 2026-11-17 **Decimal32 / Decimal64 / Decimal256 on read.** Done as sketched: the precision must suit the
-  width (1–9, 1–18, 1–38, 1–76, else `Malformed`); a Decimal256 past its declared precision or outside i128 is
-  refused like any value `dataframe` cannot hold. Anchored on the `cpp-21.0.0` `decimal32`, `decimal64` and
-  `decimal256` goldens (the old `1.0.0` `decimal256.stream`, a refusal fixture, is dropped). Was: the first two widen into the existing Decimal128 rescale path
-  unchanged; Decimal256 (32-byte little-endian two's complement) is read when the value fits an i128 at 12
-  fractional digits and is `Unsupported` (null under `lossy`) otherwise. Why: the format lists all three and the status matrix shows Decimal256 in every
-  implementation *(doc)*. Effort: ~0.5 wave. Writing stays
-  Decimal128.
-- ✅ 2026-11-17 **Map on read as `list<struct<key, value>>`** — done by default (owner decision: behave like the
-  frame libraries without a map type), see "Map" under the type mapping: file's field names, `keysSorted`
-  dropped, null entries or keys and non-conforming map schemas `Malformed`, anchored on the `map` and
-  `map_non_canonical` goldens. Was: owner call on fidelity (a `lossy`-only option the conservative form).
-- **Keep the "map" tag** — needs a map column kind in `dataframe` (or a tag on a `list` column); then a Map would
-  read into it and be written back as a Map, as Arrow C++, arrow-rs and polars 2.x round-trip it. Today the
-  write-back is a List of Struct. Waits for `dataframe`.
-- ✅ 2026-11-17 **RunEndEncoded on read.** Done as sketched: the column reads as its values' type, each batch's
-  runs expanded (run ends signed Int16/32/64, positive, strictly increasing, the last AT LEAST the batch length —
-  greater for a sliced array, as the columnar spec allows; only the batch's rows are expanded — no nulls on the
-  run ends or the parent: `Malformed` otherwise); the expansion is checked against `max_cells`
-  before its selectors are allocated and then charged per row and copied byte. Anchored on the `cpp-21.0.0`
-  `run_end_encoded` golden. Was: expanded into a plain column (`run_ends` Int16/32/64 must be strictly increasing and
-  end at the length; the expansion is charged to `max_cells`). Effort: ~0.5 wave.
-- ✅ 2026-11-17 **Column projection.** Done: `ReadOptions.columns` picks top-level columns by name or by index,
-  in the order given (`error.UnknownColumn` for a name no field or two fields have, an index past the last, a
-  repeat); the other columns' buffers are neither decompressed nor decoded nor charged to `max_cells` /
-  `max_body_bytes` (their node and buffer counts and lengths are still checked), through `File.readBatch` too. A
-  dictionary that only unprojected columns use is SKIPPED, not validated: its batches' metadata is checked (id
-  known, counts, `max_rows`, replacement), its body is not read — decoding it would cost what projection saves,
-  and a defect in it is as invisible to the frame as one in an unprojected column's buffers. Anchored on every
-  golden set (all columns reversed, then each alone, equal to the full read). Was: `ReadOptions.columns` (names), decoding and decompressing only those fields' buffers,
-  also through `File.readBatch`; the others are skipped by the buffer index. Why: every implementation compared
-  has it for files and it is what makes a wide file affordable. Effort: ~0.5 wave.
-- ✅ 2026-11-17 **Dictionary replacement in a stream.** Done as sketched, see "Dictionaries": each batch indexes the
-  dictionary current when it was read; a categorical's categories are the union of the dictionaries its rows use
-  (pyarrow `to_pandas` unification: first appearance, sorted when unordered); a replacement in a file is
-  `Malformed` (the spec forbids it, Arrow C++ `Invalid`). Was: a second non-delta `DictionaryBatch` for an id was
-  `Unsupported`; pyarrow writes one when the chunks of a dictionary column carry different dictionaries.
-- ✅ 2026-11-17 **A dictionary inside another dictionary's values** (the `nested_dictionary` golden) — read; the
-  inner dictionary is decoded first, the outer one's values hold its categoricals (a `list` / `struct` of
-  `categorical`, which `dataframe` holds; a dictionary in a plain list or struct was already read). Was deferred as
-  needing a categorical inner column in `dataframe`, which it already had.
-
-**Deferred, with the reason**
-
-- **Union (dense and sparse)** — needs a `dataframe` column kind (`boxed` has no stable meaning on the wire); same
-  for the writer. Not here until `dataframe` has one.
-- **Interval (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO)** — no `dataframe` column; reading as an int or a struct would
-  lose the type. Needs a column kind first.
-- **Zero-copy and memory-mapped reads** — the reader copies into `dataframe`'s own layout (see "What is
-  deliberately not done"); a second column representation is the prerequisite, revisit with a consumer whose files
-  exceed memory. polars and pyarrow both offer it.
-- **Incremental IO over `std.Io.Reader` / `std.Io.Writer`** (a batch-at-a-time reader, a `StreamWriter` that
-  takes frames as they are produced) — the reader holds the whole input and the writer returns a `[]u8`; a
-  streaming shape changes `Reader` (it borrows `bytes` for dictionaries and footers) and needs dictionary-delta
-  bookkeeping on the writer. Own design wave; do it with a consumer that needs files larger than memory.
-- **Big-endian streams (byte swap on read)** — C++, Go and nanoarrow convert; the producer is s390x-class hardware
-  only and the case is refused as `Unsupported` today. Cheap but nobody on common hardware writes it.
-- **Feather V1** — deprecated upstream since 25.0; not planned.
-- **The C data interface, tensors / sparse tensors, Flight** — out of scope for this module (see "What this
-  module is, and what it is not"); a separate module if a consumer needs the first.
-- **A foreign reader over our bytes** — the writer is anchored through our own reader only (pyarrow round trip,
-  owner decision, see Open).
-- **Performance** — never measured; a bench against arrow-rs `arrow-ipc` and pyarrow (alternating sides, best of
+- **Keep the "map" tag.** Needs a map column kind in `dataframe` (or a tag on a `list` column); then a Map would read
+  into it and be written back as a Map, as Arrow C++, arrow-rs and polars 2.x round-trip it. Today the write-back is a
+  List of Struct. Waits for `dataframe`.
+- **Union (dense and sparse).** Needs a `dataframe` column kind (`boxed` has no stable meaning on the wire); same for
+  the writer. Not here until `dataframe` has one.
+- **Interval (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO).** No `dataframe` column; reading as an int or a struct would lose
+  the type. Needs a column kind first.
+- **Incremental IO over `std.Io.Reader` / `std.Io.Writer`** (a batch-at-a-time reader, a `StreamWriter` that takes
+  frames as they are produced). The reader holds the whole input and the writer returns a `[]u8`; a streaming shape
+  changes `Reader` (it borrows `bytes` for dictionaries and footers) and needs dictionary-delta bookkeeping on the
+  writer. Own design wave; do it with a consumer that needs files larger than memory.
+- **Big-endian streams (byte swap on read).** C++, Go and nanoarrow convert; the producer is s390x-class hardware only
+  and the case is refused as `Unsupported`. Cheap but nobody on common hardware writes it.
+- **A foreign reader over our bytes.** The writer is anchored through our own reader only (pyarrow round trip, owner
+  decision, see Open).
+- **Performance.** Never measured; a bench against arrow-rs `arrow-ipc` and pyarrow (alternating sides, best of
   several rounds, `tools/`) is the prerequisite for any `fastest` claim and for Performance leaving `not measured`.
+- **No-panic sweep** (CONVENTIONS §8) of every public entry point: not recorded; the card's Hardening line has no
+  `panic` item, which caps the Hardening axis.
