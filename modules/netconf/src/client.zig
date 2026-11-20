@@ -102,7 +102,7 @@ pub const Options = struct {
     /// RFC 5277 §3.1's `:notification`. Before this existed, the ten
     /// booleans `capabilities.Capabilities` parses out of the peer's
     /// `<hello>` were read by nothing in this module: they were "parsed,
-    /// stored, never compared" (2026-09-10 audit, `A1/netconf.md` N8) — a
+    /// stored, never compared" (audit, A1 audit N8) — a
     /// server that never advertised `:candidate` still got a
     /// `lock(.candidate)` sent at it, and the only sign anything was wrong
     /// was whatever `<rpc-error>` it chose to send back over the wire.
@@ -124,7 +124,7 @@ pub const Options = struct {
     /// `Limits.max_message` in size, so the worst-case queue footprint is
     /// `max_queued_notifications * Limits.max_message` (16 GiB at both
     /// defaults). Lower `Limits.max_message` if a tighter byte bound matters
-    /// more than queue depth (2026-09-10 audit, `A1/netconf.md` N7).
+    /// more than queue depth (audit, A1 audit N7).
     max_queued_notifications: usize = 1024,
     /// Refuse to buffer more than this many out-of-order replies (see
     /// `Client.receiveReply`'s reply queue); beyond it a `receiveReply` call
@@ -142,7 +142,7 @@ pub const Options = struct {
     /// readable, measured 116,275,395 reads/second at ReleaseFast: not a
     /// blocked wait, a 100%-CPU spin, because every "nothing this round"
     /// answer costs a full loop iteration and nothing bounds how many of
-    /// those a session may see (2026-09-10 audit, `A1/netconf.md` N2).
+    /// those a session may see (audit, A1 audit N2).
     ///
     /// A correctly implemented `Transport.read` returns 0 only after actually
     /// waiting some nonzero wall-clock time per call, so a legitimate stall
@@ -468,8 +468,8 @@ pub const Client = struct {
                     // up queue slots and memory, only to fail with
                     // `error.NotANotification` much later -- at whatever
                     // unrelated `nextNotification`/`awaitNotification` call
-                    // happened to dequeue it (2026-09-10 audit,
-                    // `A1/netconf.md` N10). Validating before queueing makes
+                    // happened to dequeue it (audit,
+                    // A1 audit N10). Validating before queueing makes
                     // this fail at the point the bad message actually
                     // arrived, the same way `.hello`/`.rpc`/`.unknown` below
                     // already do.
@@ -1682,7 +1682,7 @@ test "live interop: end-of-message framing (:base:1.0 only) against a real NETCO
     try liveRoundTrip(&.{capabilities.cap_base_1_0}, .end_of_message);
 }
 
-// ── deterministic fuzz driver (NETCONF_FUZZ, added 2026-10-10) ──────────────
+// ── deterministic fuzz driver (NETCONF_FUZZ, added) ──────────────
 //
 // A whole session against the scripted `FakePeer`, its bytes on the way to the
 // client damaged at ONE read: the 0-3 octets of that read altered, the read

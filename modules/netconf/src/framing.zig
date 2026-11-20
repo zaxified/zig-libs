@@ -270,7 +270,7 @@ pub const Framer = struct {
             // so this tolerance re-arms at every message boundary of the
             // session, not once per session (the doc comment here and in
             // SPEC.md used to say "the first chunk header", which reads as
-            // session-scoped; corrected 2026-09-10, `A1/netconf.md` N12 --
+            // session-scoped; corrected, A1 audit N12 --
             // the behaviour itself was already right, and stays covered by
             // the "stray LF" test below). Skipping LFs that are *followed by
             // another LF* can never consume the LF that starts a real
@@ -666,7 +666,7 @@ test "N3(a): max_message is CUMULATIVE across chunks, not checked against the la
     // still 0 the moment the bound is checked -- a guard weakened from
     // `msg.items.len + n > max_message` to plain `n > max_message` passes it
     // exactly the same way the correct guard does, and the weakening
-    // survives green. Measured 2026-09-10 (`A1/netconf.md` N3(a)): 32 chunks
+    // survives green. Measured (A1 audit N3(a)): 32 chunks
     // of 4 MiB each assembled to 128 MiB against a 16 MiB `max_message`, with
     // the weakened guard never firing. This test instead uses two chunks,
     // each individually under the cap, whose SUM is not.
@@ -690,7 +690,7 @@ test "N3(b): max_pending is CUMULATIVE across feeds, not checked against the lat
     // from `pending.items.len + bytes.len > max_pending` to plain
     // `bytes.len > max_pending` never fires as long as every individual
     // `feed` call stays under the cap, no matter how much unconsumed
-    // `pending` has already piled up. Measured 2026-09-10 (`A1/netconf.md`
+    // `pending` has already piled up. Measured (A1 audit
     // N3(b)): 128 MiB fed in 64 KiB reads against a 32 MiB `max_pending`,
     // the weakened guard never firing.
     const gpa = testing.allocator;
@@ -855,7 +855,7 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every input and both framers were fed the empty
     // slice, which yields `null` immediately, with the stream sitting unread
-    // in `raw`. Measured 2026-09-07 over the corpus above: **0 of 16 seeds
+    // in `raw`. Measured over the corpus above: **0 of 16 seeds
     // non-empty and 0 messages framed before, 16 of 16 non-empty and 4 framed
     // after.**
     const len: usize = smith.slice(&raw);
@@ -905,7 +905,7 @@ test "corpus: every framer seed is fed, and the framed-message count is pinned" 
         }
     }
     try testing.expectEqual(framer_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds non-empty,
+    // Measured: with the collapsing draw, 0 of 16 seeds non-empty,
     // 0 messages framed and 0 typed errors — 32 empty feeds. After:
     try testing.expectEqual(@as(usize, 4), framed);
     try testing.expectEqual(@as(usize, 14), typed_errors);

@@ -130,8 +130,8 @@ pub const ParseError = error{
     MalformedReply,
     /// RFC 6241 §4.2: `<rpc-reply>` content is exactly one of `<ok/>`, a
     /// single `<data>`, or one-or-more `<rpc-error>`. The server sent more
-    /// than one of those three, or more than one `<ok/>`/`<data>` (2026-09-10
-    /// audit, `A1/netconf.md` N6/N17 -- before this, `<ok/>`+`<rpc-error>`
+    /// than one of those three, or more than one `<ok/>`/`<data>` (
+    /// audit, A1 audit N6/N17 -- before this, `<ok/>`+`<rpc-error>`
     /// set both `Reply.ok = true` AND `Reply.hasErrors() = true`, and two
     /// `<data>` elements made `Reply.body` and `Reply.expectData()` silently
     /// point at DIFFERENT elements).
@@ -600,7 +600,7 @@ pub fn classify(source: []const u8) MessageKind {
     // function while `parseReply` parsed it without complaint --
     // `Client.receiveReply` trusts `classify` exclusively, so the session
     // died on `error.UnexpectedMessage` over a reply the module could
-    // actually read (2026-09-10 audit, `A1/netconf.md` N5).
+    // actually read (audit, A1 audit N5).
     if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) i = 3;
     while (i < source.len) {
         // Skip whitespace.
@@ -976,7 +976,7 @@ test "parseReply: N4 (error-info site) -- session-id with a digit separator is r
 test "parseReply: N1 -- element count is bounded independent of Limits.max_message" {
     // `xml.parse`'s own default (`Options.max_elements = 1 << 20`) let a
     // small, well-under-`max_message` document balloon to hundreds of MiB of
-    // live bytes (2026-09-10 audit, `A1/netconf.md` N1: a 4.00 MiB
+    // live bytes (audit, A1 audit N1: a 4.00 MiB
     // `<a/>`-repeated reply cost 529.2 MiB, a 132x amplification, with
     // `Limits.max_message` never engaging at all -- it bounds wire bytes, not
     // element count, and the two are unrelated in this module).
@@ -1069,7 +1069,7 @@ test "classify: routes the four message kinds without a full parse" {
     try testing.expectEqual(MessageKind.unknown, classify("<!--"));
 }
 
-// External anchor (2026-08-01): the same real, independent NETCONF server as
+// External anchor: the same real, independent NETCONF server as
 // `capabilities.zig`'s live-hello anchor — the Python `netconf` 2.1.0 package.
 // These two replies are byte-for-byte what it put on the wire in the same
 // session (session-id 3, `.chunked` framing) that produced the hello frozen
@@ -1175,7 +1175,7 @@ fn fuzzReply(_: void, smith: *std.testing.Smith) !void {
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every input, `classify` was handed "" (→ .unknown)
     // and both parsers refused with `error.NoRootElement` before reading a
-    // byte, with the document sitting unread in `raw`. Measured 2026-09-07
+    // byte, with the document sitting unread in `raw`. Measured
     // over the corpus above: **0 of 16 seeds non-empty, 0 replies parsed and 0
     // classified as anything but .unknown before; 16 of 16 non-empty, 6 replies
     // parsed, 1 notification parsed and 15 classified after.**
@@ -1227,7 +1227,7 @@ test "corpus: every reply seed reaches the parsers, and the counts are pinned" {
         } else |_| {}
     }
     try testing.expectEqual(reply_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds non-empty,
+    // Measured: with the collapsing draw, 0 of 16 seeds non-empty,
     // 0 replies, 0 notifications, 0 classified and 0 rpc-errors — one empty
     // string sixteen times. After:
     try testing.expectEqual(@as(usize, 6), replies);

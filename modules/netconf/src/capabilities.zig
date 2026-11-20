@@ -68,7 +68,7 @@ pub const default_client_capabilities = [_][]const u8{
 /// additionally retains `raw` and `Client` a third copy) — a 132x amplification
 /// over the wire, and entirely decoupled from `framing.Limits.max_message`,
 /// which this module advertises as its hostile-input ceiling but which bounds
-/// bytes, not element count (2026-09-10 audit, `A1/netconf.md` N1). None of the
+/// bytes, not element count (audit, A1 audit N1). None of the
 /// three `xml.parse` call sites in this module set `max_elements`, so they all
 /// inherited the 1<<20 default.
 ///
@@ -185,7 +185,7 @@ fn baseOf(uri: []const u8) []const u8 {
 /// digit string — `<session-id>1_0</session-id>` parsed as **10**, not a
 /// rejection, and the same text feeds `Client.sessionId()` (what a caller
 /// passes to `killSession`) and `RpcError.info_session_id` (what a caller
-/// reads to decide whose lock to break) (2026-09-10 audit, `A1/netconf.md`
+/// reads to decide whose lock to break) (audit, A1 audit
 /// N4). Returns null for anything that is not `1*DIGIT`, including empty
 /// input and overflow past `u32`.
 pub fn parseSessionIdDigits(text: []const u8) ?u32 {
@@ -245,7 +245,7 @@ pub fn parseHello(gpa: std.mem.Allocator, source: []const u8, expect: Role) Hell
                 // `negotiate` -- `<session-id>` a few lines below already
                 // checks its namespace the same way `<capabilities>` does a
                 // few lines above; `<capability>` was the one inconsistent
-                // branch (2026-09-10 audit, `A1/netconf.md` N11).
+                // branch (audit, A1 audit N11).
                 if (!std.mem.eql(u8, cap.local, "capability") or !std.mem.eql(u8, cap.uri, base_ns))
                     return error.MalformedHello;
                 const text = try cap.textContent(gpa);
@@ -514,7 +514,7 @@ test "writeHello round-trips through parseHello" {
     try testing.expect(h2.capabilities.candidate);
 }
 
-// External anchor (2026-08-01): a real, independent NETCONF server — the
+// External anchor: a real, independent NETCONF server — the
 // Python `netconf` 2.1.0 package (Christian Hopps' implementation), the same
 // one the live interop tests in `client.zig` dial. Unlike the RFC-literal
 // goldens above (hand-copied from the spec text), this `<hello>` is byte-for-
@@ -587,7 +587,7 @@ fn fuzzHello(_: void, smith: *std.testing.Smith) !void {
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every input and `parseHello` was handed the empty
     // string, returning `error.NoRootElement` before it read a byte, with the
-    // document sitting unread in `raw`. Measured 2026-09-07 over the corpus
+    // document sitting unread in `raw`. Measured over the corpus
     // above: **0 of 12 seeds non-empty and 0 hellos parsed before, 12 of 12
     // non-empty and 2 parsed after.**
     const len: usize = smith.slice(&raw);
@@ -621,7 +621,7 @@ test "corpus: every hello seed reaches parseHello, and the counts are pinned" {
         } else |_| {}
     }
     try testing.expectEqual(hello_seeds.len, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 of 12 seeds non-empty,
+    // Measured: with the collapsing draw, 0 of 12 seeds non-empty,
     // 0 parsed and 0 capabilities — the same empty string twelve times. After:
     try testing.expectEqual(@as(usize, 2), parsed);
     try testing.expectEqual(@as(usize, 5), capabilities);

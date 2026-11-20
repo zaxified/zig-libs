@@ -1070,7 +1070,7 @@ test "raw escape hatch keeps the correlated envelope" {
     , got);
 }
 
-// External anchor (2026-08-01): both requests below are exactly what this
+// External anchor: both requests below are exactly what this
 // module's own `buildRpc` produced during a real session against the Python
 // `netconf` 2.1.0 package (a real, independent NETCONF server implementation)
 // — captured on the wire by temporarily instrumenting `Client.sendRaw` — and
