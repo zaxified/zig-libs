@@ -17,7 +17,7 @@
 **Downstream consumer:** no
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-./README.md "Provenance" + /NOTICE.
+./README.md "Provenance" (no module NOTICE).
 
 ## Compared with
 
@@ -32,26 +32,25 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.ff` | Zig | MIT | — | Zig 0.16.0 | Bigint primitives only; no Paillier. |
 | sibling [`threshold_ecdsa`](../threshold_ecdsa/README.md) | Zig | this repo | — | — | Where the proofs (Alice/Bob range, MtA, Πprm/Πmod) and safe-prime aux generation live; not in this module by design. |
 
-**Where we are ahead:** the only Zig Paillier found (search "paillier", language Zig, 2026-09-30, returned nothing); constant-time ladder for the secret exponent (`montint`, ctgrind harness with recorded residuals); Paillier-CRT decrypt when the key carries its factors (~3.4x on top of the Montgomery speedup, per SPEC); `fromPrimes` validates primality and prime closeness and refuses `gcd(n, φ(n)) != 1`; `fromBytes` refuses moduli under 512 bits; value-exact cross-check against `phe` at toy size and a differential Python oracle at 512 bits (`tools/oracle_paillier.py`, 0 mismatches); mutation run 2026-09-10. **Where we are behind:** no ciphertext re-randomisation helper (`phe` `obfuscate`; workable today as `addCiphertexts(c, encryptRandom(0))`, → Backlog); plaintexts are raw residues `Fe`, with the signed helpers (`negate`, `subCiphertexts`, `fromSigned`/`toSigned` in `phe`'s `n // 3 - 1` convention) but no fixed-point/float encoding as in `phe`; no packed encoding (rust-paillier); no JSON/structured key format (bytes codecs only, by design); no ZK proofs (deliberately in `threshold_ecdsa`).
+
+**Where we are ahead:** the only Zig Paillier found (search "paillier", language Zig, 2026-09-30, returned nothing); constant-time ladder for the secret exponent (`montint`, ctgrind harness with recorded residuals); Paillier-CRT decrypt when the key carries its factors (~3.4x on top of the Montgomery speedup, per SPEC); `fromPrimes` validates primality and prime closeness and refuses `gcd(n, φ(n)) != 1`; `fromBytes` refuses moduli under 512 bits; value-exact cross-check against `phe` at toy size and a differential Python oracle at 512 bits (`tools/oracle_paillier.py`, 0 mismatches); `rerandomize` (`phe`'s `obfuscate`). **Where we are behind:** plaintexts are raw residues `Fe`, with the signed helpers (`negate`, `subCiphertexts`, `fromSigned`/`toSigned` in `phe`'s `n // 3 - 1` convention) but no fixed-point/float encoding as in `phe`; no packed encoding (rust-paillier, → Backlog); no JSON/structured key format (bytes codecs only, by design); no ZK proofs (deliberately in `threshold_ecdsa`).
 
 ## Design & invariants
 
-**IMPLEMENTED (I2 Phase 1 complete).** `PublicKey` (`n`, `n_sq`, `g`), `SecretKey` (`n`,
-`n_sq`, `lambda`, `mu`), and `Ciphertext` (`c`) with real `fromBytes`/`toBytes`
-serialization, plus the full number-theoretic core: `fromPrimes` (n = p·q, λ = lcm(p−1,q−1),
-g = n+1, μ = L(g^λ mod n²)⁻¹ mod n with L(x) = (x−1)/n exact), `generate` (sieve +
-Miller-Rabin probable-prime search mirroring `rsa.generate`, minus its `e`-coprimality
-filter), `encrypt`/`decrypt`, and the three homomorphic ops. `std.crypto.ff`
-(`Uint`/`Modulus`/`Fe` at `max_bits = 4096`) carries every value across the API and does
-keygen and serialization; every operation on a secret — since 2026-10-02 including the
-CRT/Garner recombination, the L-function and the `g^m` products — runs on
-`montint.DynModint`, and the modular-exponentiation hot paths (`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, and
-`mulPlaintext`'s `c^k mod n²`) are routed through the sibling `montint` module instead
-(full-radix-2^64 Montgomery modexp, sized to the actual key width — ~3–4× faster than
-`ff` on `decrypt`/`encrypt`, plus a further ~3.4× for `decrypt` from Paillier-CRT when the
-key carries its factors). `std.math.big.int` is used only for the PUBLIC `n² = n·n` and
-`g = n + 1` of `PublicKey.fromBytes`/`SecretKey.fromBytes`; `fromPrimes`'s derivation runs on
-montint limbs (`montint.nt`, `DynModint.inverse`) since 2026-10-03.
+`PublicKey` (`n`, `n_sq`, `g`), `SecretKey` (`n`, `n_sq`, `lambda`, `mu`, and the CRT block when the
+key carries its factors), and `Ciphertext` (`c`) with `fromBytes`/`toBytes` serialization, plus the
+full number-theoretic core: `fromPrimes` (n = p·q, λ = lcm(p−1,q−1), g = n+1, μ = λ⁻¹ mod n — for
+`g = n+1`, `L(g^λ mod n²) = λ` exactly, so no `g^λ` is computed), `generate` (sieve +
+Miller-Rabin probable-prime search mirroring `rsa.generate`, minus its `e`-coprimality filter),
+`encrypt`/`decrypt`, and the homomorphic ops (`addCiphertexts`, `addPlaintext`, `mulPlaintext`),
+`rerandomize` and the signed helpers. `std.crypto.ff` (`Uint`/`Modulus`/`Fe` at `max_bits = 4096`)
+carries every value across the API and does the serialization; key derivation and every operation on
+a secret — the modular exponentiations, the CRT/Garner recombination, the L-function and the `g^m`
+products — run on `montint.DynModint` (full-radix-2^64 Montgomery, sized to the actual key width;
+~3–4× faster than `ff` on `decrypt`/`encrypt`, plus a further ~3.4× for `decrypt` from Paillier-CRT
+when the key carries its factors). The hot paths are `encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`
+and `mulPlaintext`'s `c^k mod n²`. `std.math.big.int` is used only for the PUBLIC `n² = n·n` and
+`g = n + 1` of `PublicKey.fromBytes`/`SecretKey.fromBytes`.
 
 **The `g = n+1` binomial shortcut.** For the standard generator the binomial theorem
 collapses `(1+n)^m = Σ C(m,k)·n^k ≡ 1 + m·n (mod n²)` (every k ≥ 2 term carries an n²
@@ -98,70 +97,48 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
 
 **Constant-time discipline.** Mirrors `rsa`'s stance:
 
-- `decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` are routed through the
-  sibling `montint` module (`montModexpSecret`, a full-radix-2^64 constant-time
-  Montgomery ladder sized to the key's actual width) — `λ` is secret-key material, `k`
-  may be a secret scalar. When the key carries its factors (`SecretKey.crt`, the
-  `fromPrimes`/`generate` case), `decrypt` additionally splits into the Paillier-CRT
-  path: two half-width constant-time `montint` modexps (`c^dp mod p²`, `c^dq mod q²`)
-  Garner-recombined — see "CRT decrypt" below. `fromPrimes` no longer computes `g^λ mod n²`
-  at all (2026-10-03: for `g = n+1`, `L(g^λ mod n²) = λ` exactly, so `µ = λ⁻¹ mod n`).
-  `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take
-  `g^m` through `montint` since 2026-10-02 (it was ff's pow, leaking the plaintext's windows).
-  Constant-time in the secret exponent/scalar's *value*. `mulPlaintext`'s
-  `if (k.isZero())` short-circuit — a direct branch on `k` before the modexp, found by the
-  ctgrind harness — is gone (2026-10-02): montint's ladder yields `c^0 = 1` itself, so
-  `k = 0` still returns the encryption of 0 with no special case (`mul` row: 0 in-file).
-- **CRT decrypt's own variable-time surface — closed 2026-10-02.** The Garner
-  recombination (`decryptCrtX`) was `ff` field arithmetic — `reduce` of `c` into the
-  mod-p²/q² domains, `mul`/`sub`/`add` — and ff branches there in ReleaseFast (`reduce`'s
-  `shiftIn`/compare, `montgomeryMul`'s extra-reduction bit; measured 2026-10-02). It runs on
-  `montint.DynModint` now, values crossing from the `ff` carrier by a positional limb
-  repack (`feToElem`/`elemToFe`). ctgrind `crt`: 325 → 2 in-file contexts, the two being
-  `decrypt`'s rejections (`x = 0`, `x − 1` not a multiple of `n`); `noncrt`: 133 → 3 (the
-  same two plus the malformed-key `λ = 0` check). History: `feFromMontBytes` — which turned each CRT half's raw modexp output
-  (`x_p`/`x_q`, both secret-derived) back into a canonical `Fe` — used to run that value
-  through `stripLeadingZeros` first, a `while` loop whose iteration count depended on the
-  secret-derived value's leading zero bytes; measured (wave-3 audit, ctgrind + callgrind)
-  at ~0.113% of a decrypt's instructions. **Fixed (2026-09-11, F4):** the strip was never
-  load-bearing — `Fe`'s backing `Uint(max_bits)` is one comptime type shared by `n`,
-  `n_sq`, `p_sq` and `q_sq`, so `Fe.fromBytes`'s length gate checks the caller's byte slice
-  against the *global* `Fe.encoded_bytes = max_bits/8`, never against the specific modulus
-  `m`'s own (narrower) width, and `res.len` (a `montint.Modint` slot capped at
-  `mont_max_limbs`) never exceeds that global bound regardless of which modulus produced
-  it. `feFromMontBytes` now passes `res` straight to `Fe.fromBytes`, removing the
-  data-dependent scan entirely.
-- `encrypt`'s `r^n` term uses `montint` too (the same `pk.n_sq_mont` params `mulPlaintext`
-  now shares), sized to the public modulus `n`'s width; the base `r` may be secret
-  (semantic security depends on it, see below) and the ladder does not branch on it.
-- **`fromPrimes`'s key derivation is constant-time in p, q (2026-10-03)** — it was
-  `std.math.big.int` (gcd, divFloor, extended Euclid) and `ff`'s pow. Now: `n`, `n²`, `p²`,
-  `q²` limb products; `λ = montint.nt.lcm(p−1, q−1)`; `µ = λ⁻¹ mod n` (`DynModint.inverse`,
-  closed form of `L(g^λ mod n²)⁻¹` for `g = n+1` — byte-identical; the old L-exactness
-  check could never fail for this `g`, and the inversion's verdict is the `gcd(n, φ(n)) = 1`
-  check); CRT exponents `λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p)` (`nt.divExact` by the even
-  `p − 1`); Garner `(p²)⁻¹ mod q²` (`inverse`); factor checks by montint Miller-Rabin and a
-  borrow-based closeness compare. ctgrind `keygen` (p, q tainted): no context in that
-  arithmetic; the ≤ 314 left (294 until montint's 2026-10-06 witness draw, which reads a
-  64-bit-longer string over the same tainted length) are the `ff` carriers of `p²`, `q²` and of the public `n`, `n²`
-  (Backlog), the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve
-  and its factor-keyed witness stream, length verdicts and the reject verdicts — each class
-  named in `ctgrind-expected.tsv`.
-- **The L-function is constant-time (2026-10-02).** `decrypt`'s exact `(x−1)/n` used to
-  drop to `std.math.big.int`'s `divFloor`, variable-time in `x`, whose quotient is
-  `m·λ mod n` — the plaintext and the key (wave-3 audit: most of `decrypt`'s contexts sat
-  on it). It is now `DynModint.divExact`: Hensel division, `q = (x−1)·n⁻¹ mod 2^(64·L)`,
-  then `q·n = x − 1` checked over the full width — the same quotient when the division is
-  exact, the same `error.InvalidCiphertext` when it is not, no branch on either value.
+- `decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` run on montint's constant-time
+  Montgomery ladder sized to the key's actual width — `λ` is secret-key material, `k` may be a
+  secret scalar. When the key carries its factors (`SecretKey.crt`, the `fromPrimes`/`generate`
+  case), `decrypt` additionally splits into the Paillier-CRT path: two half-width constant-time
+  montint modexps (`c^dp mod p²`, `c^dq mod q²`) Garner-recombined (`decryptCrtX`, `root.zig:1227`).
+  `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take `g^m` through montint as well.
+  Everything is constant-time in the secret exponent/scalar's *value*. `mulPlaintext` has no `k = 0`
+  short-circuit: montint's ladder yields `c^0 = 1` itself, so `k = 0` still returns the encryption of 0
+  with no branch on `k`.
+- **CRT decrypt has no variable-time arithmetic of its own.** The Garner recombination, the `reduce` of
+  `c` into the mod-p²/q² domains and the `mul`/`sub`/`add` run on `montint.DynModint`, values crossing
+  from the `ff` carrier by a positional limb repack (`feToElem`/`elemToFe`, `root.zig:184`, `:191`):
+  `ff` field arithmetic branches in ReleaseFast (`reduce`'s `shiftIn`/compare, `montgomeryMul`'s
+  extra-reduction bit). The ctgrind rows for `decrypt` (`crt`, `noncrt`) therefore hold only
+  `decrypt`'s own rejection verdicts (`x = 0`, `x − 1` not a multiple of `n`, and for `noncrt` the
+  malformed-key `λ = 0` check). `feFromMontBytes` passes each CRT half's raw modexp output straight to
+  `Fe.fromBytes`: `Fe`'s backing `Uint(max_bits)` is one comptime type shared by `n`, `n_sq`, `p_sq` and
+  `q_sq`, so its length gate checks against the global `Fe.encoded_bytes = max_bits/8` and a
+  leading-zero strip (a loop whose iteration count would depend on the secret-derived value) is
+  never needed.
+- `encrypt`'s `r^n` term uses montint too (the `pk.n_sq_mont` params `mulPlaintext` shares), sized to
+  the public modulus `n`'s width; the base `r` may be secret (semantic security depends on it, see
+  below) and the ladder does not branch on it.
+- **`fromPrimes`'s key derivation is constant-time in p, q.** `n`, `n²`, `p²`, `q²` are limb products;
+  `λ = montint.nt.lcm(p−1, q−1)`; `µ = λ⁻¹ mod n` (`DynModint.inverse`; the inversion's verdict is the
+  `gcd(n, φ(n)) = 1` check); CRT exponents `λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p)` (`nt.divExact` by
+  the even `p − 1`); Garner `(p²)⁻¹ mod q²` (`inverse`); factor checks by montint Miller-Rabin and a
+  borrow-based closeness compare. The ctgrind `keygen` target (p, q tainted) has no context in that
+  arithmetic; what is left is the `ff` carriers of `p²`, `q²` and of the public `n`, `n²` (Backlog),
+  the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve and its factor-keyed
+  witness stream, length verdicts and the reject verdicts — each class named in
+  `ctgrind-expected.tsv`.
+- **The L-function is constant-time.** `decrypt`'s exact `(x−1)/n` is `DynModint.divExact`: Hensel
+  division, `q = (x−1)·n⁻¹ mod 2^(64·L)`, then `q·n = x − 1` checked over the full width — the same
+  quotient when the division is exact, the same `error.InvalidCiphertext` when it is not, no branch
+  on either value (a variable-time big-int division would run on `m·λ mod n`: the plaintext and the key).
 - Prime generation (`generate`) is variable-time in how *long* the search takes (every
   implementation's is), which is about rejected candidates; all candidate buffers are
   `secureZero`ed. Along a kept prime's path Miller-Rabin is `DynModint.isProbablePrime`
-  (constant-time in the value since 2026-10-03); observable: `s = v2(p − 1)` and the sieve's
-  `%` (Backlog).
-- **This section now has an instrument, not just prose** —
-  `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
-  `mul`/`addm`); previously none of the sentences above had a measurement behind them
-  (wave-3 audit F3).
+  (constant-time in the value); observable: `s = v2(p − 1)` and the sieve's `%` (Backlog).
+- The instrument is `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets
+  `crt`/`noncrt`/`mul`/`addm`/`keygen`).
 
 **Semantic security relies on the randomness `r`.** Paillier is IND-CPA secure only because
 each encryption draws a fresh, uniform `r` coprime to `n`; `encrypt` accepts a caller-supplied
@@ -174,7 +151,7 @@ nonce would for a symmetric AEAD.
 from `[1, n)` without verifying it is coprime to `n`; for `n = p*q` with large random primes
 the probability a uniform `r` collides with a factor is `~1/p + 1/q`, i.e. negligible, and
 this matches common reference implementations (including `phe`/python-paillier, which this
-module's KAT vectors are cross-checked against — see `NOTICE`). Documented here rather than
+module's KAT vectors are cross-checked against — see the README's Provenance). Documented here rather than
 silently assumed.
 
 ## Signed plaintexts
@@ -193,53 +170,47 @@ computation) and `rust-paillier`'s `Rerandomize` trait; it equals
 fail and checks nothing about `c` (as `addCiphertexts`). Constant-time policy as
 `encrypt`: `r` is the secret, it is the base of `powPublic` (public exponent `n`, montint
 multiply); `r` and all intermediates are wiped and the dead stack burnt
-(`rerandomize_stack_burn`, the stack probe measures 0 residue in ReleaseFast); the
-ctgrind rows are unchanged (counts identical, source digests re-pinned). Not mutated:
-the wipes and the burn (observable only to the ReleaseFast stack probe, which passes).
-Delta mutation 2026-11-19: 7 mutants (the `r^n` factor, either multiplicand, a constant
-`r`, the exponent length, the returned element, the operand read), 7 killed.
+(`rerandomize_stack_burn`, `root.zig:68`; the stack probe reads zero residue in ReleaseFast). The ctgrind
+rows are unchanged by it.
 
 ## Threat model / out of scope
 
-- **Secret residue on the dead stack** (sweep 2026-10-08, `src/stackprobe_test.zig`,
-  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
-  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
-  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
-  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
-  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
-  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
-  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
-  results go to an out-parameter, because the copy a by-value argument or result makes lives in
-  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
-  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
-  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
-  from its `std.Random` (published bytes excluded); negative and positive controls in the same
-  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
-  Before: 122 copies over 10 entry points (`generate` 78, CRT `decrypt` 26); after: 0.
+- **Secret residue on the dead stack** (`src/stackprobe_test.zig`, ReleaseFast). Wiping named buffers
+  does not keep secrets off the stack: compiler copies, by-value parameters and results, and callee
+  frames leave them in dead stack memory. So, as `bip32`/`k256`: (1) every public entry point that
+  touches a secret runs its body one frame down (`noinline`) and then zeroes, at that depth, a region a
+  little deeper than the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a
+  16-aligned buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half
+  a secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
+  results go to an out-parameter, because the copy a by-value argument or result makes lives in the
+  CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one call,
+  copies the uninitialised window at the same depth and looks for every 16-byte window of every
+  secret's big-endian, little-endian and in-memory image and of every byte the call drew from its
+  `std.Random` (published bytes excluded); negative and positive controls in the same binary.
+  `verbose = true` prints each call's depth, to resize a burn after a change.
 - **Key strength = factoring `n`,** exactly like RSA. `generate` draws two `bits/2`-bit
   probable primes (top two bits set → `n` is exactly `bits` bits; 64 Miller-Rabin rounds →
   ≤ 2⁻¹²⁸ worst-case acceptance error per prime; FIPS 186-5 §A.1.3 top-100-bits closeness
   guard against Fermat factorization — all inherited from `rsa`'s search). A weak or
   attacker-influenced `random` breaks everything; the API takes `std.Random` and trusts it.
-- **`fromPrimes` checks its factors (audit F7, 2026-09-14).** It used to trust them: the
-  derivation's self-checks (odd `n`, L-exactness of `g^λ`, invertibility of `μ`) reject random
-  composites but accepted 24 of 32 base-2 strong-pseudoprime pairings, and such a key silently
-  decrypts some plaintexts wrong (`2047 × 17`: 2 of 20). Now each factor must be prime —
-  exact trial division up to 32 bits, above that the prime-search sieve plus 64-round
-  Miller-Rabin with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor (deterministic,
-  no `random` parameter; a composite built to pass still faces 4⁻⁶⁴ per attempt) — and
-  `|p − q| > 2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) whenever `nlen/2 > 100`, the closeness rule
-  `generate` enforces with `topBitsMatch`. Both refusals are `error.InvalidPrimes`; an oversized
-  product is still `Overflow`, checked first. `generate` skips the repeat (its factors already
-  passed both). Deterministic construction remains for KATs/round-tripping stored keys.
+- **`fromPrimes` checks its factors.** The derivation's own self-checks (odd `n`, invertibility of `μ`)
+  reject random composites but accept some base-2 strong-pseudoprime pairings, and such a key would
+  silently decrypt some plaintexts wrong (`2047 × 17`). So each factor must be prime — exact trial
+  division up to 32 bits, above that the prime-search sieve plus 64-round Miller-Rabin
+  with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor (`factorIsPrime`, `root.zig:922`;
+  deterministic, no `random` parameter; a composite built to pass still faces 4⁻⁶⁴ per attempt) —
+  and `|p − q| > 2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) whenever `nlen/2 > 100`, the closeness rule
+  `generate` enforces with `topBitsMatch` (`factorsTooClose`, `root.zig:955`). Both refusals are
+  `error.InvalidPrimes`; an oversized product is `Overflow`, checked first. `generate` skips the repeat
+  (its factors already passed both). Deterministic construction remains for KATs/round-tripping stored keys.
 - **`fromPrimes` also requires `gcd(n, φ(n)) = 1`** (equivalently `gcd(λ, n) = 1`), a
   second precondition independent of primality — `generate`'s same-length prime search
   satisfies it by construction, but a caller-supplied genuinely-prime pair can violate it
   (e.g. `p=5, q=11`: `n=55`, `λ=20`, `5 | gcd(20,55)`). Rejected via the `μ`-invertibility
-  self-check above, under the same `error.InvalidPrimes` as every other rejection reason —
-  the error name does not say which precondition failed (paillier F9, wave-3 audit).
+  check, under the same `error.InvalidPrimes` as every other rejection reason —
+  the error name does not say which precondition failed.
 - **Timing:** see "Constant-time discipline" above (secret-exponent modexps, decrypt's
-  L-division and — since 2026-10-03 — key derivation constant-time; documented residue).
+  L-division and key derivation constant-time; documented residue).
 - **Malicious-ciphertext robustness is NOT provided.** `decrypt` rejects the cheaply
   detectable garbage (`c = 0`, non-units mod `n`, anything failing `x ≡ 1 (mod n)`), but
   Paillier ciphertexts are malleable *by design* (that's the feature) — nothing here
@@ -255,36 +226,32 @@ Delta mutation 2026-11-19: 7 mutants (the `r^n` factor, either multiplicand, a c
 GG20/CMP threshold-ECDSA does not use raw Paillier ciphertexts directly — it wraps every
 encryption/homomorphic-combination step in a zero-knowledge proof so a malicious co-signer
 can't inject a crafted ciphertext (out-of-range plaintext, wrong-key ciphertext, etc.) into
-the protocol. None of that is in this module:
+the protocol. None of that is in this module; the sibling `threshold_ecdsa` module provides the
+range proofs and MtA (and `dkg` builds on both):
 
 - **Proof of correct Paillier encryption** (that a given ciphertext really does encrypt a
-  plaintext the prover knows, in-range) — Phase 2.
-- **Range proofs** bounding a plaintext/randomness to a claimed interval — Phase 2.
+  plaintext the prover knows, in-range).
+- **Range proofs** bounding a plaintext/randomness to a claimed interval.
 - **MtA (multiplicative-to-additive)** — the protocol that composes `addPlaintext` +
   `mulPlaintext` + `addCiphertexts` (plus the proofs above) into a secure two-party share
-  conversion — Phase 2, and the actual reason threshold-ECDSA wants Paillier in the first
-  place.
-
-These belong in a separate module that depends on this one (`paillier`), not here — the
-sibling `threshold_ecdsa` module now provides the range proofs and MtA; see
-`// TODO(phase2)` in `src/root.zig`.
+  conversion, and the actual reason threshold-ECDSA wants Paillier in the first place.
 
 ## Verification
 
-`zig build test-paillier` is **green in Debug and ReleaseFast** (CONVENTIONS.md §7
-"pure logic" harness: unit tests + round-trip + property tests). The Debug run takes ~20 s,
-almost all of it the full 2048-bit `generate` round-trip test (ReleaseFast runs in ~1 s).
-
-Paillier has no official RFC/standard KAT vectors (unlike `rsa`'s RFC 8017 worked examples).
-The correctness anchors, in order of strength:
-
+- **Run:** `scripts/modtest paillier` (heavy: the full 2048-bit `generate` round-trip dominates a
+  Debug run; ReleaseFast is the quick mode).
+- Paillier has no official RFC/standard KAT vectors (unlike `rsa`'s RFC 8017 worked examples).
+  The correctness anchors, in order of strength:
 - **phe cross-check (value-exact):** a small fixed key (`p=11, q=17`, `n=187` —
   intentionally toy-sized, NOT secure, chosen only to be hand-verifiable) whose derived
   `λ=80`/`g=188`/`μ=180` and concrete `(m, r) -> ciphertext` vectors (incl. `m = 0` and
   `m = n−1`, and every intermediate ciphertext of the homomorphic-property test) were
   independently cross-checked against `phe` (python-paillier) 1.5.0's
   `PaillierPublicKey.raw_encrypt`/`PaillierPrivateKey.raw_decrypt` (same `g = n+1`
-  standard variant) — see `NOTICE`. No ciphertext value was fabricated.
+  standard variant) — see the README's Provenance. No ciphertext value was fabricated.
+- **Differential oracle at real key sizes:** `tools/probe_vectors.zig` drives the public API and
+  `tools/oracle_paillier.py` recomputes every line from `n`/`g`/`lambda`/`mu` with `pow(x, y, m)` alone
+  (recipe in `tools/README.md`; run by hand, not wired into `zig build`).
 - **Exhaustive toy round-trip:** every residue `m ∈ [0, 187)` encrypts and decrypts back
   (with `r` cycled through fixed units mod 187 — for a toy `n` a *uniform* `r` collides
   with a factor with probability ~1/p + 1/q ≈ 15%, in which case `decrypt` correctly
@@ -293,33 +260,36 @@ The correctness anchors, in order of strength:
 - **Self-checking homomorphic properties:** `decrypt(addCiphertexts(E(m1), E(m2))) ==
   (m1+m2) mod n` (incl. wrap-around and the exact `E(n−1)+E(1) -> 0` case), same for
   `addPlaintext` (incl. `m = 0` identity) and `mulPlaintext` (incl. `k = 0 -> E(0)`,
-  `k = 1` identity, wrap-around).
+  `k = 1` identity, wrap-around); `rerandomize` pinned as `addCiphertexts(c, encrypt(0, r))` for every
+  unit `r` of the toy key; the signed helpers against `phe`'s documented convention, including the
+  boundary values.
 - **Real-size keygen:** `generate` at 512 bits (fast, every-run) and at the full
   2048 bits (slow) both round-trip encrypt/decrypt + a homomorphic op, and `n` lands on
   exactly the requested bit width.
-- **Negative tests:** `fromPrimes` rejects `p == q`/degenerate/oversized factors;
-  `decrypt` rejects `c = 0`, `c = n`, `c = p`; `generate` rejects invalid bit sizes.
+- **Negative tests:** `fromPrimes` rejects `p == q`/degenerate/oversized factors, composites and
+  too-close factors; `decrypt` rejects `c = 0`, `c = n`, `c = p`; `generate` rejects invalid bit sizes;
+  the loaders refuse short moduli and non-canonical lambda/mu/ciphertext.
+- **Fuzz:** `PAILLIER_FUZZ=<runs>[,<first seed>]` (deterministic driver in `src/fuzz_test.zig`; the
+  `paillier-roundtrip` harness is slow, so its budget is scaled down).
+- **ctgrind:** `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets
+  `crt`/`noncrt`/`mul`/`addm`/`keygen`).
+- **Dead-stack probe:** `src/stackprobe_test.zig` (ReleaseFast; negative and positive controls).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+- **Zero-knowledge proofs, range proofs and MtA** are not here: they live in the sibling
+  `threshold_ecdsa` module (see *Phase-2 boundary*).
+- **No malicious-ciphertext robustness**: ciphertexts are malleable by design (see *Threat model*).
 
 ## Backlog / deferred
 
-- ~~**Key generation off `std.crypto.ff`**~~ *(2026-10-02)*: ✅ 2026-10-03 — derivation,
-  factor checks and Miller-Rabin on montint (see "Constant-time discipline"). Left: the
-  `ff` `Modulus` carriers of `p²`, `q²` (`crt.p_sq`/`crt.q_sq`, used to reduce `c`
-  before the montint path — replaceable by `p_sq_mont`/`q_sq_mont` alone; Effort S–M) and
-  the sieve's `bytesMod` `%` plus the observable `s` (as `rsa`'s Backlog item). Fits §2.
-- Phase 2 (separate module, depends on this one): proof of correct encryption, range
-  proofs, MtA — now in the sibling `threshold_ecdsa` module; see "Phase-2 boundary" above.
-
-- ✅ DONE 2026-11-19 (`rerandomize`, SPEC § Re-randomisation). **`rerandomize(pk, c, random)` helper** (survey 2026-09-30): `phe`'s `obfuscate` is the routine way to stop a re-sent or homomorphically combined ciphertext being linkable; today the caller composes `addCiphertexts(c, encryptRandom(0))`, which works but is not documented as the idiom. Effort: trivial. Fits CONVENTIONS §2.
-- **Signed-integer helper** — DONE 2026-11-17: `negate`, `subCiphertexts`, `fromSigned`, `toSigned`, `maxSigned`; see "Signed plaintexts".
+- **Key generation: the last `std.crypto.ff` carriers and the sieve.** The `ff` `Modulus` carriers of
+  `p²`, `q²` (`crt.p_sq`/`crt.q_sq`, used to reduce `c` before the montint path — replaceable by
+  `p_sq_mont`/`q_sq_mont` alone; Effort S–M) and the sieve's `bytesMod` `%` plus the observable `s`
+  (as `rsa`'s Backlog item) remain. Fits §2.
 - **Packed encoding of several small values in one ciphertext** (survey 2026-09-30): in rust-paillier; an efficiency feature for vector-valued aggregation (federated learning style), not needed by `threshold_ecdsa`. Effort: small-medium. Fits §2. Add only on request.
-
-## Status
-
-`gap · any · util · reentrant` + deps: none (`std.crypto.ff` only) — canonical source is
-`pub const meta` in `src/root.zig`. ("`gap`" is this repo's catalog-maturity vocabulary for
-a std-gap module built from scratch, same as `rsa`'s SPEC.md — see CONVENTIONS.md's `meta`
-tag vocabulary discussion for why there's no separate dedicated "status" tag.)
 
 ## Anchoring
 
@@ -328,12 +298,5 @@ tag vocabulary discussion for why there's no separate dedicated "status" tag.)
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**Audit 2026-11-17 (whole-module mutation).** 103 mutants in total: the 22 of the delta below and 81 over the rest of the non-test code of `root.zig`, ReleaseSafe, one schemata build per round, each mutant under `setsid -w timeout` and `ulimit -v`. Areas: the loaders (`PublicKey`/`SecretKey`/`Ciphertext.fromBytes`: leading-zero trimming, the length caps, the `min_modulus_bits` floor, which modulus lambda, mu and the ciphertext are canonical against), `SecretKey.deinit` (each zeroing), `fromPrimes` (p == q, the below-3 test, the size cap, the primality and closeness verdicts, `g = n + 1`, `p - 1`/`q - 1`, the lcm, the mu inversion verdict, the CRT exponent and Garner arguments), `generatePrime` and the closeness guard (`topBitsMatch` windows, the bound, the borrow), `generate`'s size checks and closeness loop, `encrypt`/`encryptRandom` (the `r = 0` refusal, the factors of the product, the rejection against `n`), `decrypt` (lambda = 0, the CRT recombination, each verdict, the decrement), the homomorphic operations and `maxSigned`. First run: 34 survived, 7 hung (counted killed). The survivors that were missing tests got 12: `p = 3` is valid, `gcd(n, phi(n)) != 1` with genuine primes (5/11, 3/7) is refused, a prime whose low limb is 1, a product in the 33rd limb is `Overflow` rather than a truncated key, `|p - q|` just above the bound is accepted (the exact-boundary test only pinned the refusal), `topBitsMatch` at byte 11, `generate` yields exactly the requested bits at 512/514/522, a key whose `n` is 11 bits, leading-zero padding of every loader input, lambda in `[n, n^2)` accepted and mu `>= n` refused, `decrypt` under lambda = 0, and `sampleNonzeroLtN` redrawing a draw equal to `n` and to zero (a scripted `Random`). Second run: 62 of the 81 killed, 19 survive, all argued below.
-
-- **Equivalent (19).** (1) Redundant defences: `n` longer than `modulus_bytes` or empty (the first ends in `squareModulus` overflowing, the second in the `min_modulus_bits` floor; 3 mutants), `p == q` and the Garner inverse (each refuses `p == q` when the other is removed; 2), the explicit below-3 refusal (p = 2 makes `n` even, p = 0/1 fail the primality verdict, `generate`'s factors are never below 3; 1), `c = 0` and `x = 0` in `decrypt` (`x = 0` only for a multiple of `n`, then `x - 1` wraps to `2^(64 L) - 1`, which `divExact` refuses unless the order of 2 modulo `n` divides `64 L`; 2). (2) `Fe.fromBytes` already skips leading zeros of the lambda, mu, `g` and ciphertext input, so the explicit trim in front of it changes nothing (4; the trim in front of `n` is observable and killed). (3) Cost only: the sieve in `generatePrime`, the forced top bit and the mask of the candidate (`isProbablePrimeLimbs` refuses a wrongly sized value anyway; 2) and the mask in `sampleNonzeroLtN` (a redraw instead; 1), `gPow`'s shortcut for the standard generator (`g^m` by `pow` is the same value; 1). (4) `n_bits / 2 <= 100` as `< 100`: at exactly 100 the bound is `2^0 + 1` and two distinct odd primes are at least 2 apart (1). (5) `CrtParams.p_sq_fe` was computed and stored but nothing read it, so a wrong value was unobservable (1); the field was deleted afterwards, so that mutant no longer exists and the counts above stay as measured.
-- **Not mutated.** The stack-burn calls and the `secureZero` defers inside `encrypt`/`decrypt`/`fromPrimes` (arid for a test run: the ReleaseFast-only stack probe and ctgrind are their evidence), the pass-through serializers, `bigFromBytes`/`bigFromFe`/`bigFromModulus`/`feFromBig` (mechanical, every signed mutant above goes through them), and the CRT/non-CRT choice in `decrypt` (cost only: the two paths agree byte for byte, which a test already pins).
-- Card: `mutation 2026-11-17 (84/103, 19 eq)`.
-
-**Audit 2026-11-17 (delta mutation, signed helpers).** 22 schemata mutants over the signed-plaintext code (`maxSignedBig`: the divisor, the subtrahend, the skipped `- 1`; `fromSigned`: the bound compare flipped to `>=`, the overflow refusal dropped, the sign test forced, the zero special case dropped, `n - x` with the wrong operand, the wrong value returned; `toSigned`: the `x < n` compare at its boundary and dropped, the positive-bound compare at its boundary, the sign flag flipped on both arms, the gap bound at its boundary and dropped, its `n - max` operand, the magnitude operand; `negate`: the `- 1`, the exponent; `subCiphertexts`: negation dropped, first operand swapped), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: 22 killed, 0 survived. Not mutated: the serialization helpers `bigFromFe`/`bigFromModulus`/`feFromBig` (mechanical; every mutant above passes through them and a wrong value fails its test), `maxSigned` (a one-line wrapper pinned by the toy-key value 61 and the 512-bit boundary test). The 2026-09-10 run was never itemized, so the whole-module run below covers everything else and the card counts both.
 
 **What the tests actually contain.** cross-checked against phe (python-paillier) 1.5.0 real library output

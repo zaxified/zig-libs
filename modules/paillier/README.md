@@ -1,18 +1,18 @@
 # paillier
 
 Pure-Zig Paillier additively-homomorphic public-key cryptosystem (Paillier
-1999). `std.crypto.ff` carries every value and does keygen, serialization,
-and the CRT/Garner recombination; the modular-exponentiation hot paths
-(`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, `mulPlaintext`'s
-`c^k mod n²`) are routed through the sibling `montint` module instead (a
-faster constant-time Montgomery ladder — see SPEC.md "Design &
-invariants"). No libc, no `@cImport`.
+1999). `std.crypto.ff` carries every value across the API and does the
+serialization; key derivation, the modular exponentiations (`encrypt`'s
+`r^n mod n²`, `decrypt`'s `c^λ mod n²`, `mulPlaintext`'s `c^k mod n²`) and the
+CRT/Garner recombination run on the sibling `montint` module (a faster
+constant-time Montgomery ladder — see SPEC.md "Design & invariants").
+No libc, no `@cImport`. **Deps:** `montint`.
 
 **Status: IMPLEMENTED (I2 Phase 1 complete).** Keygen (`generate` with a
 Miller-Rabin probable-prime search, `fromPrimes` for deterministic/KAT
 construction), `encrypt`/`decrypt`, and the homomorphic ops
 (`addCiphertexts`/`addPlaintext`/`mulPlaintext`) are all real.
-`zig build test-paillier` is green in Debug and ReleaseFast,
+`scripts/modtest paillier` runs the suite,
 cross-checked value-exact against `phe` (python-paillier) 1.5.0 toy-key
 vectors plus self-checking round-trip/homomorphic-property tests and real
 512-/2048-bit `generate` round trips — see SPEC.md "Verification".
@@ -27,8 +27,8 @@ the sibling `threshold_ecdsa` module — see SPEC.md "Phase-2 boundary".
   Degree Residuosity Classes", EUROCRYPT 1999 — the standard `g = n+1`
   variant. Values are `std.crypto.ff` types (`Uint`/`Modulus`/`Fe`, the same
   fixed-width constant-time modular-arithmetic primitive this repo's `rsa`
-  module uses); the modexp hot paths run through the sibling `montint`
-  module instead (see above).
+  module uses); the secret-dependent arithmetic runs through the sibling
+  `montint` module instead (see above).
 - **Platform:** any. **Role:** util (pure computation, no I/O of its own).
   **Concurrency:** reentrant — `PublicKey`/`SecretKey`/`Ciphertext` are plain
   value types, no shared/global state.
@@ -100,7 +100,9 @@ how the `m = 0`/`k = 0` valid-plaintext cases are handled around `ff`'s
 the binomial identity `g^m ≡ 1 + m·n (mod n²)`, which needs no exponent at
 all — see SPEC.md).
 
-## Backlog
+## Not provided
 
-- Phase 2 (GG20/CMP zero-knowledge proofs and MtA on top of this core PKE):
-  provided by the sibling `threshold_ecdsa` module, not here.
+The zero-knowledge proofs and MtA that GG20/CMP threshold-ECDSA builds on this
+core PKE are in the sibling `threshold_ecdsa` module, not here; no
+malicious-ciphertext robustness, no packed or fixed-point/float encoding. See
+SPEC *What is deliberately not done* and *Backlog / deferred*.

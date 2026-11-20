@@ -7,17 +7,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-11-19** — added `rerandomize(pk, c, random)`: `c * r^n mod n²` with a fresh `r` in `[1, n)` (`phe`'s `obfuscate`); same plaintext, unlinkable ciphertext; infallible, constant-time policy and wipes as `encrypt`, covered by the ReleaseFast stack probe. Delta mutation: 7 mutants, 7 killed. Card A1 again (cumulative 91/110, 19 eq). ctgrind rows: counts unchanged, source digests re-pinned.
 - **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: the unused `CrtParams.p_sq_fe` field (computed and stored, never read) is deleted; the ctgrind rows of paillier re-pinned to the new source digest (counts unchanged).
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: whole-module mutation (the 2026-09-10 run was never itemized): 81 more mutants over the non-test code of `root.zig`, 34 survived the first run and 12 tests were added (`p = 3`, genuine primes with `gcd(n, phi(n)) != 1`, a prime with low limb 1, a product in the 33rd limb, `|p - q|` just above the closeness bound, `topBitsMatch` byte 11, exact bit length of `generate` at 512/514/522, an 11-bit `n`, leading-zero padding of the loaders, the canonical ranges of lambda/mu, `decrypt` under lambda = 0, a scripted `sampleNonzeroLtN`). Card counts are the whole module (84/103, 19 eq). Source of the non-test code is unchanged, tests only.
 - **2026-11-17** — signed-integer helpers: `negate`, `subCiphertexts`, `fromSigned`, `toSigned`, `maxSigned` and the `Signed` result type, in python-paillier's convention (`-x` as `n - x`, `max = n // 3 - 1`, overflow gap refused with `error.Overflow`). Additive; no existing behaviour changes. Tests: toy-key decode range and boundaries, round trip, a value pin of `negate` against `c^(n-1)`, signed differences, a signed sum at a 512-bit key.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
 - **2026-10-10** — tests: deterministic fuzz driver `PAILLIER_FUZZ` over the four existing harnesses (`paillier-pubkey`, `paillier-seckey`, `paillier-ciphertext`, `paillier-decrypt-agree`; under the driver the fields are the real 512-bit key material with 0-3 octets damaged, and toy-key ciphertexts sit around 0 / shared factors / n squared) plus new `paillier-roundtrip` (decrypt(encrypt(m)) = m and the three homomorphisms at a real 512-bit key). The decrypt-agree harness builds its toy keys once per process (163 to 26,900 runs/s). New `src/fuzz_test.zig`. No change in `src/` outside tests.
 - **2026-10-09** — **BREAKING (source-compatible for method calls):** `SecretKey.nByteLen` and `SecretKey.nToBytes` take `self: *const SecretKey` (was by value, which copied `lambda`/`mu`/the CRT block into the caller's frame). `key.nToBytes(&buf)` call syntax is unchanged; only explicit `SecretKey.nToBytes(copy, …)` callers must pass a pointer. `nToBytes` reads only the public modulus (`secret-api-ok` marker). No new burn, no new probe.
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the new ReleaseFast stack
   probe (`src/stackprobe_test.zig`) found 122 copies of secrets in dead stack frames over 10 entry
   points (`generate` 78: the factors, `λ`, `μ`, the CRT block; `decrypt` 26 with CRT; `encrypt`
@@ -54,14 +48,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   claims for the Garner step and the keygen pow corrected (extra-reduction
   residual, variable-time keygen); Backlog entry for the rest.
 
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** test only (audit F14). A spliced `std.Random`
-  feeds `generate` a Fermat-close `q` as its first candidate and pins the `topBitsMatch` call in
-  the search loop, the only closeness guard on that path.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** comment in `decrypt` corrected
-  (threshold_ecdsa F5). It said the key never reaches the `divFloor` in `L(x)`; the quotient is
-  `m·λ mod n`, so it does. It also left open whether the `Zq`-masked MtA plaintext was exploitable;
-  that plaintext leaked `b` outright and `threshold_ecdsa` now draws `β'` from `Z_N` / `Z_{q⁵}`.
 
 - **2026-09-14** — **BEHAVIOURAL (refuses more):** audit F8, user decision (floor on the byte
   loaders only). `PublicKey.fromBytes` accepted any odd `n` that fit `modulus_bytes` — a prime
@@ -228,7 +215,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - Touches `src/root.zig` again — same stale-ctgrind-pin note as the
     wave-3 entry above applies to these edits too.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **crt 331 / noncrt 141 / mul 12 / addm 10**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ Confirms both leads `threshold_ecdsa` raised indirectly, and CORRECTS one: the L-function's variable-time `divFloor` is real on every run, but at `root.zig:1253`, not the `:1205`/`:1213` that report cited — `:1205` is the PUBLIC ciphertext check and correctly never fires under taint. `mulPlaintext`'s `if (k.isZero())` at `root.zig:1304` is confirmed exactly, is a direct branch on a raw secret exponent, and is **not mentioned anywhere in SPEC.md** — an undocumented gap rather than a contradicted claim. ⭐ SPEC's binomial-shortcut claim ("a possibly-secret plaintext `m` never enters a bit-scanned exponent path") is true of this module's own control flow but NOT end to end: `std.crypto.ff.Modulus.mul`'s Montgomery machinery branches on `m`, **verified by disassembly to be a real `test`/`jne` and not a `cmov`** — the first agent in this campaign to settle that question by instruction rather than argument.
 
 - **2026-09-07** — The three byte-loader fuzz targets had never parsed a field. Every draw
   went through `fuzzedFieldBytes`, which opened with `smith.bytes(buf)` and then took its
