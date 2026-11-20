@@ -24,7 +24,7 @@ specifications. No third-party XML-Enc implementation was consulted, so no
   a KEK is supplied.
 - **Content:** `aes128-cbc`, `aes192-cbc`, `aes256-cbc`, `aes128-gcm`,
   `aes192-gcm`, `aes256-gcm` (AES-192 via the `aes192`/`aesgcm` modules; std
-  0.16 has none). GCM and OAEP are the safe, preferred paths.
+  ships only AES-128/256). GCM and OAEP are the safe, preferred paths.
 
 Anything off the list → `error.UnsupportedAlgorithm`.
 
@@ -58,11 +58,10 @@ then wipes and frees the plaintext. The recovered octets are parsed under
 
 Decrypts attacker-influenced ciphertext. All cryptographic failures collapse to
 a single generic `error.DecryptionError`, and a failed key unwrap still
-decrypts the content with a decoy CEK so the two outcomes cost the same work —
-collapsing the error VALUE is not the same as collapsing the WORK, and only the
-first of those used to be true (see SPEC.md §Constant-time posture for the arm
-that is still open); `rsa-1_5`
-and AES-CBC carry the documented Bleichenbacher / padding-oracle caveats; the
+decrypts the content with a decoy CEK (every key transport: OAEP, PKCS#1 v1.5, AES-KW)
+so the two outcomes cost the same work — collapsing the error VALUE is not the same
+as collapsing the WORK (see SPEC.md §Constant-time posture for what is verified);
+`rsa-1_5` and AES-CBC carry the documented Bleichenbacher / padding-oracle caveats; the
 safe composition is **decrypt → signature-verify**. The recovered CEK is
 zeroized after use. Never panics. Full detail in `SPEC.md`.
 

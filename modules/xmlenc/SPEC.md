@@ -39,23 +39,15 @@ RSA-OAEP with decoupled digest/MGF1 (incl. the SHA-256 + MGF1-SHA-1 shape real I
 off by default, AES-KW, AES-128/256 CBC and GCM; generic error collapse plus a decoy CEK against unwrap-side timing
 (measured, see *Constant-time posture*); ciphertext cap; CipherReference refused before any crypto. **Where we are
 behind:** decrypt only (by design), no
-3DES, no ECDH-ES key agreement.
+3DES, no ECDH-ES key agreement (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## Scope
 
 Decryption only. We are the receiving party with the private key. Encryption /
 ciphertext generation is **out of scope**.
 
-Also out of scope, and actively rejected:
-
-- **`<xenc:CipherReference>`** (ciphertext by external URI) — dereferencing it
-  is an SSRF / XXE surface. Rejected with `error.CipherReferenceUnsupported`
-  before any cryptographic operation.
-- **`ds:Transforms` on the ciphertext** — same dereference/transform surface;
-  not honored (only inline `<xenc:CipherValue>` base64 is read).
-- Super-encryption, EncryptedData referencing external key material by
-  RetrievalMethod, and any KeyInfo *trust* — the caller supplies the key
-  (`sk` / `Options.kek`); KeyInfo inside the EncryptedKey is never consulted.
+Everything else a decryptor could be asked to dereference or trust is refused; the list and the reasons are in
+*What is deliberately not done*. The caller supplies the key (`sk` / `Options.kek`).
 
 ## Algorithm allow-list (reject everything else → `UnsupportedAlgorithm`)
 
@@ -67,11 +59,11 @@ Also out of scope, and actively rejected:
 | `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256, SHA-384, SHA-512} and MGF ∈ {MGF1-SHA-1, MGF1-SHA-256, MGF1-SHA-384, MGF1-SHA-512} resolved **independently** — MGF defaults to MGF1-SHA1 when absent, whatever the digest is (RFC 8017 treats them as separate parameters, and real xenc11 configs pair SHA-256 with MGF1-SHA-1) | default |
 | `…2001/04/xmlenc#rsa-1_5` | RSAES-PKCS#1 v1.5 | **gated** by `allow_weak_rsa15` |
 | `…2001/04/xmlenc#kw-aes128` | RFC 3394 AES-128 key wrap | needs `Options.kek` (16 B) |
-| `…2001/04/xmlenc#kw-aes192` | RFC 3394 AES-192 key wrap (since 2026-10-10) | needs `Options.kek` (24 B) |
+| `…2001/04/xmlenc#kw-aes192` | RFC 3394 AES-192 key wrap | needs `Options.kek` (24 B) |
 | `…2001/04/xmlenc#kw-aes256` | RFC 3394 AES-256 key wrap | needs `Options.kek` (32 B) |
 
 The kw-aes* unwrap is delegated to the shared `aeskw` module (`aeskw.unwrap`,
-RFC 3394 §2.2.2) — xmlenc no longer carries its own key-unwrap core; any
+RFC 3394 §2.2.2) — xmlenc carries no key-unwrap core of its own; any
 `aeskw` error (bad length, unsupported KEK length, integrity-check failure)
 collapses to this module's generic `DecryptionError`.
 
@@ -87,8 +79,7 @@ for MGF, **including a mismatched pair** (e.g. DigestMethod=SHA-256 with
 MGF1=SHA-1 — a real-world interop shape some IdPs emit). Only a genuinely
 unrecognized digest or MGF algorithm URI (not one of the SHA-1/256/384/512 digests or MGF1 variants) returns `UnsupportedAlgorithm`.
 When xenc11 `rsa-oaep` omits the `MGF` element, the MGF defaults to the
-xenc11-spec default MGF1-SHA1 (not "assumed to match the digest" — that
-assumption is no longer needed now that the hashes are decoupled).
+xenc11-spec default MGF1-SHA1 (not "assumed to match the digest").
 OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
 
 ### Content (data) encryption (the EncryptedData EncryptionMethod)
@@ -96,10 +87,10 @@ OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
 | URI | Mode | Key |
 |-----|------|-----|
 | `…2001/04/xmlenc#aes128-cbc` | AES-128-CBC | 16 B |
-| `…2001/04/xmlenc#aes192-cbc` | AES-192-CBC (since 2026-10-10) | 24 B |
+| `…2001/04/xmlenc#aes192-cbc` | AES-192-CBC | 24 B |
 | `…2001/04/xmlenc#aes256-cbc` | AES-256-CBC | 32 B |
 | `…2009/xmlenc11#aes128-gcm` | AES-128-GCM | 16 B |
-| `…2009/xmlenc11#aes192-gcm` | AES-192-GCM (since 2026-10-10) | 24 B |
+| `…2009/xmlenc11#aes192-gcm` | AES-192-GCM | 24 B |
 | `…2009/xmlenc11#aes256-gcm` | AES-256-GCM | 32 B |
 
 - **GCM** (preferred): ciphertext = `IV(12) ‖ ciphertext ‖ tag(16)`, AAD empty;
@@ -107,14 +98,14 @@ OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
 - **CBC**: ciphertext = `IV(16) ‖ ciphertext`; XML-Enc padding — the final byte
   `N` (1..16) is the pad length, the preceding `N-1` pad bytes are arbitrary.
   The raw CBC core and the XML-Enc unpad are both delegated to the shared
-  `aescbc` module (`aescbc.decrypt` + `aescbc.unpadXmlEnc`) — xmlenc no longer
-  carries its own CBC loop or unpad logic; any `aescbc` error (misaligned
+  `aescbc` module (`aescbc.decrypt` + `aescbc.unpadXmlEnc`) — xmlenc carries
+  no CBC loop or unpad logic of its own; any `aescbc` error (misaligned
   input, invalid pad) collapses to this module's generic `DecryptionError`.
 
-**AES-192 (`aes192-cbc`/`aes192-gcm`, and `kw-aes192`) since 2026-10-10:**
+**AES-192 (`aes192-cbc`/`aes192-gcm`, and `kw-aes192`):**
 std 0.17 ships only `Aes128`/`Aes256`, so CBC runs `aescbc` over the `aes192`
 module's `Aes192` and GCM is `aesgcm.Aes192Gcm`; the key wrap is `aeskw`'s
-24-byte KEK arm. Before that date all three were `UnsupportedAlgorithm`. The
+24-byte KEK arm. The
 CEK length must match the content algorithm's key size, else
 `DecryptionError`.
 
@@ -148,164 +139,151 @@ CEK length must match the content algorithm's key size, else
   (default 4 MiB). The recovered CEK is `secureZero`'d after use; RSA EM /
   OAEP scratch buffers are zeroized. Never panics — all failures are typed
   errors.
+- **The recovered plaintext tree wipes what it frees.** `decryptDataToDocument` returns a `DecryptedDocument` (the tree
+  plus the plaintext buffer it borrows from); the tree's arena is backed by the shared `wipealloc` `WipingAllocator`,
+  and `deinit(alloc)` releases the tree, then wipes and frees the plaintext. The recovered octets parse under
+  `Options.max_elements` (default 65 536). `decryptData` runs under a 64 KiB dead-stack burn (`src/burn.zig`).
+- **OAEPparams size.** `readBase64Text` gathers the label text in a 512-octet scratch buffer, and the list growth of
+  `textContent` admits fewer base64 characters than the 256-octet decode buffer holds (measured: 64-octet labels pass,
+  128 do not). Labels of that size are refused with `MalformedStructure`: fail-closed and rare (see *Backlog /
+  deferred*).
 
 ## Constant-time posture
 
-⚠ **Scope corrected 2026-09-03: it is `decryptData`, not one callee.** This
-section used to scope itself to `rsaPkcs1v15Unwrap` and name its residual risk
-as compiler-dependent branch lowering *inside* that function. The dominant leak
-was one frame up and had nothing to do with lowering: a failed key unwrap
-returned before the content was touched at all, so a whole AES pass over an
-attacker-sized ciphertext ran on exactly one side of the conformance decision.
-Measured in ReleaseFast over a 3 MiB CBC content ciphertext, interleaved
-A/B/C: min-of-8 queries with a fixed threshold classified conforming vs
-non-conforming **194/200 = 97.0%**, with `error.DecryptionError` fully collapsed
-throughout — orders of magnitude louder than anything the mask arithmetic below
-was written to suppress, and with a strength the attacker picks, since it comes
-from the content size, which is their input.
+The unit of analysis is `decryptData`, not one callee. A failed key unwrap does not return before the content is touched:
+it returns a **decoy CEK** of the content algorithm's key length (`Unwrapped` in `root.zig`) and the content is decrypted
+either way; the answer is the validity mask, not what the content decryption happened to do. (Without it a whole AES pass
+over an attacker-sized ciphertext ran on exactly one side of the conformance decision: measured over a 3 MiB CBC content
+in ReleaseFast, a fixed threshold on the min-of-8 query time classified conforming against non-conforming 194/200 =
+97.0% of the time with `DecryptionError` fully collapsed.) The decoy is derived from secret material, because a
+predictable decoy would let the peer craft content that authenticates under it and read the bit back out of the
+success/failure answer: the raw RSA block for PKCS#1 v1.5 and for OAEP, the KEK for AES-KW, through one `decoyCek` helper
+(SHA-256 over a domain tag and the secret, truncated to the key length, zero-extended past 32 octets). The content
+key-length check is part of the unwrap's mask for the same reason. All three RSA key transports (`rsa-oaep`,
+`rsa-oaep-mgf1p`, `rsa-1_5`) reach the downstream AES pass unconditionally.
 
-**The fix, and its limit.** A failed unwrap now returns a **decoy CEK** of the
-content algorithm's key length (`Unwrapped` in `root.zig`) and the content is
-decrypted either way; the answer is the validity mask, not what the content
-decryption happened to do. The decoy is derived from secret material — the raw
-RSA block for PKCS#1 v1.5 and now OAEP, the KEK for AES-KW — because a
-predictable decoy would let the peer craft content that authenticates under it
-and read the bit back out of the success/failure answer. The content
-key-length check moved into the unwrap's mask for the same reason.
+OAEP's decode is the `rsa` module's: `rsa.decryptOaepHNoFail` shares `decryptOaepHBlinded`'s RSADP and branch-free
+MGF1/lHash/separator-scan decode and reports a padding failure as `{.ok = false, .raw = <the RSADP output>}` instead of an
+`error`; `rsaOaepUnwrap` derives its decoy from `.raw`. `rsaPkcs1v15Unwrap` is the one place in this module with its own
+secret-dependent arithmetic. (GCM tag comparison is std's inside `aesgcm`; AES-KW integrity uses
+`std.crypto.timing_safe.eql`; algorithm-URI comparisons are over public strings.)
 
-✅ **OAEP fixed 2026-09-11 (A1 fix campaign round 2, `QUESTIONS-ROUND-2.md`
-Q4, one commit with `rsa`).** The blocker this section used to describe —
-closing it needed either a second, drifting OAEP-decode implementation
-inside `xmlenc`, or a change to `rsa`'s surface — is resolved by the
-latter, additively: `rsa.decryptOaepHNoFail` shares `decryptOaepHBlinded`'s
-exact RSADP + branch-free MGF1/lHash/separator-scan decode and the same
-want-length fold, but reports a padding failure as `{.ok = false, .raw =
-<the RSADP output>}` instead of an `error`. `rsaOaepUnwrap` now derives its
-decoy from `.raw` with the SAME `decoyCek` helper the PKCS#1 v1.5 arm
-already uses, so all three key-transport algorithms (`rsa-oaep`,
-`rsa-oaep-mgf1p`, `rsa-1_5`) share one decoy-derivation function and reach
-`decryptData`'s downstream AES pass unconditionally. Every existing `rsa`
-OAEP entry point (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
-`decryptOaepHBlinded`) is unchanged.
+**What `rsaPkcs1v15Unwrap` does.**
 
-What follows is the older, narrower analysis, which remains accurate about
-`rsaPkcs1v15Unwrap`'s own arithmetic — the one place in this module that makes
-a secret-dependent decision of its own with its own hand-written masking
-(OAEP's equivalent masking now lives in `rsa.decryptOaepHNoFail`, reused
-rather than duplicated). (GCM tag comparison is std's; AES-KW integrity uses
-`std.crypto.timing_safe.eql`; algorithm-URI comparisons are over public
-strings.)
-
-**What the code does.**
-
-- Every validity check — leading `00`, block type `02`, the `00` separator's
-  existence, PS ≥ 8, the message-length bounds — is an all-ones/all-zeros mask
-  produced by `ctEqByteMask` / `ctEqMaskUsize` / `ctGeMaskUsize`, which are pure
-  integer arithmetic (`|`, `&`, `~`, `-%`, shift). No comparison operator is
-  applied to a secret-derived value.
-- The separator scan always walks the whole block. The message extraction tries
-  every *public* separator position under a mask instead of reading `em` at the
-  secret offset `sep_idx + 1`, so the memory-access pattern is a function of the
-  modulus length only.
-- The write into the caller's CEK buffer is a fixed 64-byte masked copy on every
-  path. A rejected block leaves the buffer all-zero; it is neither skipped nor
-  sized by `msg_len`, and no recovered plaintext survives there.
-- **One** branch on secret-derived data remains: the final accept/reject. It is
-  the outcome itself and nothing follows it but the return. Both outcomes
-  collapse to the same `error.DecryptionError` at every caller, and `saml`
-  collapses them again into `AssertionDecryptionFailed`.
+- Every validity check — leading `00`, block type `02`, the `00` separator's existence, PS ≥ 8, the message-length
+  bounds — is an all-ones/all-zeros mask produced by `ctEqByteMask` / `ctEqMaskUsize` (`rsa.ctEqMaskUsize`) /
+  `ctGeMaskUsize`, which are pure integer arithmetic (`|`, `&`, `~`, `-%`, shift). No comparison operator is applied to a
+  secret-derived value.
+- The separator scan always walks the whole block. The message extraction tries every *public* separator position under a
+  mask instead of reading `em` at the secret offset `sep_idx + 1`, so the memory-access pattern is a function of the
+  modulus length only. LLVM lowered that masked loop to a branch on the separator position although the source has none;
+  a `blackBox` barrier on the mask prevents it, and the `rsa15` ctgrind row is the regression test.
+- The write into the caller's CEK buffer is a fixed 64-byte masked copy on every path. A rejected block leaves the buffer
+  all-zero; it is neither skipped nor sized by `msg_len`, and no recovered plaintext survives there.
+- **One** branch on secret-derived data remains: the final accept/reject. It is the outcome itself and nothing follows it
+  but the return. Both outcomes collapse to the same `error.DecryptionError` at every caller, and `saml` collapses them
+  again into `AssertionDecryptionFailed`.
 
 **What is verified, and what is not.**
 
-- *Verified by the suite:* the fixed-length, unconditional, zero-on-reject shape
-  of the message copy (two `TEETH (F3)` tests in `src/root.zig`, both of which go
-  red against the previous `@memcpy(out[0..msg_len], em[sep_idx + 1 ..])` behind
-  an early `return error`); and the mask helpers, exhaustively over all 65 536
-  byte pairs plus a boundary table for the `usize` forms. The helpers are
+- *Verified by the suite:* the fixed-length, unconditional, zero-on-reject shape of the message copy (two `TEETH (F3)`
+  tests in `src/root.zig`, which go red against a `@memcpy(out[0..msg_len], em[sep_idx + 1 ..])` behind an early
+  `return error`); that a failed unwrap still decrypts the content (`TEETH (F3)`: both outcomes cost the same); and the
+  mask helpers, exhaustively over all 65 536 byte pairs plus a boundary table for the `usize` forms. The helpers are
   load-bearing — a wrong mask turns the RFC 8017 §7.2.2 teeth tests red.
-- *Measured 2026-11-13 (ctgrind, `src/ctgrind_harness.zig`, ReleaseFast, key / KEK
-  tainted, `decryptData` driven end to end; rows in `scripts/checks/ctgrind-expected.tsv`):*
-  - `oaep` 3 in-file: rsa `privateOpCrtPtr` F3 fault-check verdict (1), xmlenc `rsaOaepUnwrap`'s
-    `if (!r.ok)` (the one accept/reject branch, choosing the decoy CEK — the same class as
-    `rsaPkcs1v15Unwrap`'s `if (good == 0)` below), aesgcm tag verdict (1). It read 5 until rsa's
-    `decryptOaepHNoFail` became branch-free on 2026-11-13 (its two verdict-branch contexts are
-    gone; rsa now has its own `oaepnf` ctgrind row, 0 contexts in the unpadding).
-  - `cbc` 14 (16 before the same rsa fix): the same two rsa/xmlenc contexts, `aescbc.unpadXmlEnc`
-    verdict, and xmlenc's `aesCbcDecrypt` `alloc(plain_len)` / `memcpy(plain_len)` — the plaintext
-    LENGTH, which the API returns to the caller by contract.
-  - `rsa15` 3: rsa F3 verdict, xmlenc `rsaPkcs1v15Unwrap`'s `if (good == 0)` (the one
-    accept/reject branch above), aesgcm tag verdict. **It read 4 before 2026-11-13:** the
-    masked message-extraction loop (`ctEqMaskUsize(s, sep_idx)`) was lowered by LLVM to a
-    branch on the separator position although the source has none — exactly the compiler
-    risk named in the next bullet. A `blackBox` asm barrier on the mask fixed it
-    (measured, 4 -> 3); the ctgrind row is the regression test.
-  - `kw` 3: aeskw integrity-check verdict, aesgcm tag verdict (accept and reject).
-- *Still NOT verified:* that the emitted machine code is branch-free **on other targets,
-  Zig versions and optimize modes** (the rows are x86-64, Zig 0.17.1, ReleaseFast). No
-  unit test in this repo measures timing, and none can: a unit test cannot see a conditional
-  move, cannot time a cache miss, and cannot prevent a future compiler from
-  lowering the mask arithmetic into a branch. The ctgrind lane (valgrind, above) is the
-  measurement; a dudect-style statistical timing harness is not wired into this repo.
-  Outside the measured configuration, treat the property as *argued from the source*.
-- The residual risk is therefore compiler-dependent, which is one more reason
-  `allow_weak_rsa15` stays off by default. Migrating the IdP off `rsa-1_5`
-  remains the only complete answer.
+- *Measured by ctgrind* (`src/ctgrind_harness.zig`, ReleaseFast, key / KEK tainted, `decryptData` driven end to end; rows
+  in `scripts/checks/ctgrind-expected.tsv`, x86-64, Zig 0.17.1):
+  - `oaep`: rsa `privateOpCrtPtr`'s F3 fault-check verdict, xmlenc `rsaOaepUnwrap`'s `if (!r.ok)` (the one accept/reject
+    branch, choosing the decoy CEK; the same class as `rsaPkcs1v15Unwrap`'s `if (good == 0)`), the aesgcm tag verdict.
+    The OAEP unpadding itself has no context (rsa's own `oaepnf` row).
+  - `cbc`: those two rsa/xmlenc contexts, the `aescbc.unpadXmlEnc` verdict, and xmlenc's `aesCbcDecrypt`
+    `alloc(plain_len)` / `memcpy(plain_len)` — the plaintext LENGTH, which the API returns to the caller by contract.
+  - `rsa15`: rsa's F3 verdict, `rsaPkcs1v15Unwrap`'s `if (good == 0)`, the aesgcm tag verdict.
+  - `kw`: the aeskw integrity-check verdict and the aesgcm tag verdict (accept and reject).
+  - The portable lane (`scripts/test.sh ctgrind-portable`, `cpu=x86_64` variant rows) adds the std soft-AES key schedule
+    (loads at tainted indices) and the memcpy size classes of the documented plaintext-length copy; no xmlenc branch on a
+    key. Itemised in `ctgrind-expected.tsv`.
+- *Still NOT verified:* that the emitted machine code is branch-free **on other targets, Zig versions and optimize
+  modes**. No unit test in this repo measures timing, and none can: a unit test cannot see a conditional move, cannot time
+  a cache miss, and cannot prevent a future compiler from lowering the mask arithmetic into a branch. The ctgrind lane
+  (valgrind, above) is the measurement; a dudect-style statistical timing harness is not wired into this repo. Outside the
+  measured configuration, treat the property as *argued from the source*.
+- The residual risk is therefore compiler-dependent, which is one more reason `allow_weak_rsa15` stays off by default.
+  Migrating the IdP off `rsa-1_5` remains the only complete answer.
 
-## Validation
+## Verification
+
+Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first seed>]`; constant time:
+`scripts/checks/ctgrind.sh xmlenc` (rows `oaep`, `cbc`, `rsa15`, `kw`).
 
 - **Byte-exact / KAT-anchored:**
-  - AES-CBC core cross-checked against **NIST SP800-38A** (F.2.5, AES-256-CBC
-    and F.2.1, AES-128-CBC), byte-exact — now anchored in the shared `aescbc`
-    module's own tests (single source of truth); this module's CBC coverage
-    comes from the round-trip tests exercising the full `aesCbcDecrypt` path.
-  - AES key unwrap cross-checked against **RFC 3394 §4.1, §4.3, §4.5, §4.6**,
-    byte-exact — anchored in the shared `aeskw` module's own tests, plus a
-    local §4.1 byte-exact test here exercising this module's `aesKwUnwrap`
-    wrapper.
-  - RSA OAEP/v1.5 primitives (including the decoupled-hash `decryptOaepH`
-    path) inherit the sibling `rsa` module's own OpenSSL/RFC KATs.
-- **Constructed round-trips** (`test_roundtrip.zig`): a locally generated
-  1024-bit RSA key encrypts a CEK (OAEP-SHA1, OAEP-SHA256, OAEP with a
-  mismatched SHA-256-digest/MGF1-SHA1 pair, PKCS1-v1.5, or kw-aes256) and a
-  plaintext `<saml:Assertion>` (AES-128/256 GCM and CBC); the public decrypt
-  path recovers the exact plaintext. These are self-consistency /
-  interop-shape tests, **not** external byte-exact vectors.
-- **EXTERNAL anchor** (`test_external.zig`): a real `<xenc:EncryptedData>`
-  produced ONCE, offline, by `xmlsec1 --encrypt` (C, OpenSSL backend — a
-  genuinely independent XML-Enc implementation) against a freshly-generated
+  - AES-CBC core cross-checked against **NIST SP800-38A** (F.2.5, AES-256-CBC and F.2.1, AES-128-CBC), byte-exact —
+    anchored in the shared `aescbc` module's own tests (single source of truth); this module's CBC coverage comes from the
+    round-trip tests exercising the full `aesCbcDecrypt` path.
+  - AES key unwrap cross-checked against **RFC 3394 §4.1, §4.3, §4.5, §4.6**, byte-exact — anchored in the shared `aeskw`
+    module's own tests, plus a local §4.1 byte-exact test here exercising this module's `aesKwUnwrap` wrapper.
+  - RSA OAEP/v1.5 primitives (including the decoupled-hash `decryptOaepH` path) inherit the sibling `rsa` module's own
+    OpenSSL/RFC KATs.
+- **Constructed round-trips** (`test_roundtrip.zig`): a locally generated 1024-bit RSA key encrypts a CEK (OAEP-SHA1,
+  OAEP-SHA256, OAEP with a mismatched SHA-256-digest/MGF1-SHA1 pair, the SHA-384/512 digest and MGF pairings, PKCS1-v1.5,
+  or kw-aes256) and a plaintext `<saml:Assertion>` (AES-128/256 GCM and CBC; AES-192 in both content modes under kw-aes192
+  and rsa-oaep); the public decrypt path recovers the exact plaintext. These are self-consistency / interop-shape tests,
+  **not** external byte-exact vectors (the SHA-384/512 OAEP pairings have no external vector at all).
+- **EXTERNAL anchor** (`test_external.zig`): a real `<xenc:EncryptedData>` produced ONCE, offline, by
+  `xmlsec1 --encrypt` (C, OpenSSL backend — a genuinely independent XML-Enc implementation) against a freshly-generated
   2048-bit RSA keypair, committed as a literal fixture:
-  - RSA-OAEP-mgf1p key transport + AES-256-GCM content — decrypts to the exact
-    plaintext.
-  - xenc11 `rsa-oaep` (DigestMethod=SHA-256, **MGF element omitted** — a real
-    interop shape that exercises the xenc11-spec MGF1-SHA1 default, not merely
-    an explicit MGF value) + AES-256-CBC content — decrypts to the exact
-    plaintext.
-  - A tampered copy (one base64 char flipped in the content `CipherValue`)
-    that `xmlsec1 --decrypt` itself refuses is refused here too
-    (`error.DecryptionError`).
-  `xmlsec1 --decrypt` independently confirmed all three outcomes on these exact
-  bytes before they were pasted in. The reverse direction ("xmlsec1 decrypts
-  what we produce") does not apply: this module is decrypt-only by design (see
-  README "Scope") and has no encrypt API to hand xmlsec1 anything.
-- **Teeth (with positive controls):** GCM tag tamper → `DecryptionError`; CBC
-  corrupted block → `DecryptionError`; unknown content/key algorithm →
-  `UnsupportedAlgorithm`; (AES-192 round-trips since 2026-10-10: both content
-  modes under kw-aes192 and rsa-oaep); `rsa-1_5` without
-  opt-in → `WeakRsa15NotAllowed`; wrong private key → `DecryptionError`;
-  CipherReference → `CipherReferenceUnsupported`; non-base64 CipherValue →
-  `MalformedStructure`; kw-aes* without KEK → `KekNotProvided`; a genuinely
-  unrecognized xenc11 MGF algorithm URI → `UnsupportedAlgorithm` (the positive
-  control confirming the allow-list gate still holds now that digest != MGF
-  is otherwise accepted).
+  - RSA-OAEP-mgf1p key transport + AES-256-GCM content — decrypts to the exact plaintext.
+  - xenc11 `rsa-oaep` (DigestMethod=SHA-256, **MGF element omitted** — a real interop shape that exercises the xenc11-spec
+    MGF1-SHA1 default, not merely an explicit MGF value) + AES-256-CBC content — decrypts to the exact plaintext.
+  - A tampered copy (one base64 char flipped in the content `CipherValue`) that `xmlsec1 --decrypt` itself refuses is
+    refused here too (`error.DecryptionError`).
 
-## Status
+  `xmlsec1 --decrypt` independently confirmed all three outcomes on these exact bytes before they were pasted in. The
+  reverse direction ("xmlsec1 decrypts what we produce") does not apply: this module is decrypt-only by design and has no
+  encrypt API to hand xmlsec1 anything.
+- **Teeth (with positive controls):** GCM tag tamper → `DecryptionError`; CBC corrupted block → `DecryptionError`; unknown
+  content/key algorithm → `UnsupportedAlgorithm`; `rsa-1_5` without opt-in → `WeakRsa15NotAllowed`; wrong private key →
+  `DecryptionError`; CipherReference → `CipherReferenceUnsupported`; non-base64 CipherValue → `MalformedStructure`;
+  kw-aes* without KEK → `KekNotProvided`; a genuinely unrecognized xenc11 MGF algorithm URI → `UnsupportedAlgorithm`
+  (the positive control that the allow-list gate holds while digest != MGF is accepted); the structural gates (root name
+  and namespace, EncryptedKey/KeyInfo namespaces, wrapper), the exact content and key caps, every XML whitespace octet in
+  a CipherValue, empty GCM plaintext, one-block CBC, every kw algorithm against a KEK of another length, OAEPparams as the
+  OAEP label, the decoy derivation (`decoyCek` KAT, dependence on every octet of the secret), and a content that
+  authenticates under the decoy key and is still refused (the mask decides, not the AES pass).
+- **Fuzz:** the `decryptData` harness: a genuine encrypted document decrypts to the exact plaintext, an AES-GCM one with
+  1-3 octets flipped fails (or yields the same plaintext); the algorithm lists include `aes192-gcm` and `kw-aes192`.
+- **Wipe / dead stack:** `src/stackprobe_test.zig` probes the three entry points over fixtures (OAEP, `rsa-1_5`,
+  `kw-aes256`, a failing `kw-aes256` wrap, `decryptAssertion` / `decryptDataToDocument`) with the CEK, the OAEP encoded
+  message, the PKCS#1 v1.5 block, the KEK, the decoy digest and the RSA key components as needles; ReleaseFast
+  free-scanner tests check that the plaintext `decryptDataToDocument` frees, including that of a document that fails to
+  parse, is wiped.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
-`extract` — implemented and tested (green in Debug and ReleaseFast).
-Decryption side only. Depends on `xml` (structure walk), `rsa` (OAEP / v1.5 /
-RSADP, including decoupled-hash OAEP), `aescbc` (CBC core + XML-Enc unpad),
-`aeskw` (RFC 3394 key unwrap), and `aes192` + `aesgcm` (AES-192 and AES-GCM content) — this module no longer carries any local
-hand-rolled CBC or key-wrap implementation; those are single-sourced in their
-respective sibling modules. Base64 remains from std.
+## What is deliberately not done
+
+- **Encryption** (`encryptData`) — out of scope: we are the receiving party with the private key. (xmlsec encrypts; a user
+  building an IdP or a test peer needs another tool. The survey raised it as a question, the answer so far is the Scope.)
+- **`<xenc:CipherReference>`** (ciphertext by external URI) — dereferencing it is an SSRF / XXE surface. Rejected with
+  `error.CipherReferenceUnsupported` before any cryptographic operation.
+- **`ds:Transforms` on the ciphertext** — same dereference/transform surface; not honored (only inline
+  `<xenc:CipherValue>` base64 is read).
+- **Super-encryption, EncryptedData referencing external key material by RetrievalMethod, and any KeyInfo *trust*** — the
+  caller supplies the key (`sk` / `Options.kek`); KeyInfo inside the EncryptedKey is never consulted.
+- **3DES (`tripledes-cbc`)** — decision (user, 2026-09-30): a 64-bit block cipher (Sweet32), disallowed by NIST
+  SP800-131A for encryption since 2024; a legacy IdP that still sends it is refused (`UnsupportedAlgorithm`), not
+  decrypted.
+
+## Backlog / deferred
+
+- **OAEPparams label size:** decode the label without `textContent` so labels above about 64 octets pass instead of being
+  refused with `MalformedStructure` (see *Security posture*). Not done: rare and fail-closed; do it if a peer sends one.
+- **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey:** used by newer eIDAS/SAML profiles that avoid
+  RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256 ECDH + Concat KDF; check siblings). Low to
+  medium priority; fits the module's scope.
+- **Bulk path after the move to `aesgcm`:** AES-GCM decryption runs on the `aesgcm` module (Zig 0.17 #36256); the bulk
+  path was not re-measured at that move. The card says Performance is not measured, so this stays open until a bench
+  exists.
 
 ## Anchoring
 
@@ -315,40 +293,3 @@ respective sibling modules. Base64 remains from std.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** primitives anchored (NIST/RFC3394/rsa sibling); XML-Enc framing itself is constructed round-trip only
-
-**How it got there.** The anchoring work landed. DONE 9f9d238: real xmlsec1 EncryptedData incl. xenc11 omitted-MGF default path
-
-## Audit 2026-11-17 (whole-module mutation)
-
-208 mutants over every non-test line of `src/root.zig` and the burn wiring of `src/burn.zig`, one build with every mutant behind a runtime switch (ReleaseSafe), run once per mutant; the wipe and burn mutants were also run in a ReleaseFast build, where the Z1 free-scanner tests and the stack probe execute. One mutant per condition and class: each structural gate (root element, namespace of every looked-up child, CipherReference, second CipherData/CipherValue), the algorithm allow-list (content mode and key length per URI, the OAEP digest and MGF URIs and their defaults, every kw-aes* arm and its KEK length), each key-transport check (`allow_weak_rsa15`, the RSA length, the RFC 8017 §7.2.2 mask terms one by one: leading 0x00, block type, separator search, PS >= 8, message length against the content algorithm, the fixed-shape extraction, the publish mask), the AES-KW size and length bounds, the decoy derivation (domain tag, which secret octets it binds, zero extension), the GCM and CBC framing (IV, tag, minimum sizes, alignment), the base64 reader (character cap, decoded cap, each whitespace octet, the label buffer) and the constant-time mask helpers. Not mutated: the comptime constants and `Options` defaults, `meta`, the `blackBox` barrier (value-preserving; only ctgrind sees it), `ctgrind_harness.zig`.
-
-127 mutants died on the existing suite, 80 survived the first round, and the new tests kill 47 more of them (174 in ReleaseSafe, plus 4 wipe mutants in ReleaseFast): a root of another name or namespace and an EncryptedKey/KeyInfo of another namespace, a wrapper that is not an EncryptedAssertion, the content cap and the EncryptedKey cap at their exact value, the character cap through the error that tells it from the base64 length (`CiphertextTooLarge` against `MalformedStructure`), every XML whitespace octet in a CipherValue, an empty GCM plaintext and a 27-octet blob, a one-block CBC ciphertext, kw-aes128 and every kw algorithm against a KEK of another length, an OAEP `rsa-oaep` without DigestMethod and MGF (SHA-256 digest, MGF1-SHA1), OAEPparams as the OAEP label, ID attributes of `decryptDataToDocument`, the KAT of `decoyCek` and its zero extension, the key-length bound of both unwrappers, the AES-KW size bounds, a decoy that depends on every octet of the KEK and the blob (and of the RSA block, over 64 rejected ciphertexts), a v1.5 block with zeros in the message, a zero as the first PS octet, a rejected block that publishes nothing past the decoy, a modulus whose bit length is not a multiple of 8, and a content that authenticates under the decoy key and is still refused (the mask decides, not the AES pass). A ReleaseFast test checks that the plaintext discarded after a failed unwrap is wiped before it is freed.
-
-The 27 that do not die are not defects: 19 EQUIVALENT and 8 more equivalent through the burn (below). 2026-11-18: 181 killed.
-
-- 19 EQUIVALENT: the recovered key length of an accepted OAEP block is `want` by construction (`out[0..want]` against `out[0..r.msg.len]`); the `em.len < 11` test (the modulus is at least 64 octets); the PKCS#1 search starting at index 1 (index 1 is 0x02 in a conforming block) and at index 3 for the extraction, the missing-separator test (`sep_idx` stays 0 and the PS >= 8 test rejects it), the empty-message test and the two buffer-bound tests (the message length is compared with `want`, at most 32, which is below the 64-octet buffer), the extraction range (`s + 2`, `s` one too far, a copy of 63 octets: an accepted message has at most 32 octets); the IV-only CBC blob and the misaligned CBC length (`aescbc` and the unpadding refuse both with the same `DecryptionError`), `unpadXmlEnc` over `buf[0..ct.len]` (the same bytes); a lone carriage return in a CipherValue (the XML parser normalises line ends, so it never arrives); a base64 text of exactly the character cap (always a valid length that decodes past `max_len`, so `n > max_len` refuses it with the same error); the OAEPparams label size test and the compact-buffer bound (the 512-octet scratch buffer of `readBase64Text` admits fewer base64 characters than the 256-octet decode buffer holds, measured: 64-octet labels pass, 128 do not).
-- 8 EQUIVALENT through the burn (first recorded as 11 UNOBSERVABLE: the ReleaseFast stack probe had only the RSA key components as needles). Re-measured 2026-11-18 in a ReleaseFast schemata build with the probe extended (below): three of the eleven are now **killed**: `decryptData` without its burn (mutant 2) and `burn.run` without the burn after the call (206), both by the probe's residue check, and the plaintext of a failed parse not wiped (17) by a new ReleaseFast free-scanner test (a document whose unwrap succeeds and whose plaintext is not XML). The other eight survive and are equivalent: the CEK buffer, the OAEP message and raw RSADP buffers, the v1.5 EM buffer and message scratch, the AES-KW decoy secret and the decoy digest are locals of frames below an entry point whose burn zeroes them afterwards, so removing either the local wipe or the burn leaves the dead stack clean (only both together leave residue; the burn mutants are killed, so the double fault is guarded), and `burn.stack` with half its buffer (207): `decrypt_burn` is 64 KiB, the first guess its doc comment names, and no frame of the body dirties the 32..64 KiB band (the 200 KiB private-key burn of `rsa` lies below and zeroes its own region), so half the burn is still deep enough. The probe now has the CEK, the OAEP encoded message and the PKCS#1 v1.5 block (recomputed from the RSA private operation / the test's block), the KEK and the decoy digest as needles, over five fixtures (OAEP, `rsa-1_5`, `kw-aes256`, a failing `kw-aes256` wrap that yields the decoy, and `decryptAssertion`/`decryptDataToDocument`); it is clean at baseline in plain and schemata ReleaseFast. The unreachable `aes192` `UnsupportedAlgorithm` line after the 192-bit branches in `classifyContent` was removed (the two branches above it return for exactly the URIs it tested).
-
-`scripts/checks/ctgrind.sh --check xmlenc` moved only the source digests (the in-file counts 3 / 14 / 3 / 3 are unchanged); `--update-digests xmlenc` was run. Counts on the card are whole-module.
-
-## Backlog / deferred
-- ✅ DONE 2026-11-18 (wave 6) ~~**Portable ctgrind (`CTGRIND_CPU=x86_64`)**~~ *(2026-11-18)*: xmlenc runs in `scripts/test.sh ctgrind-portable` with `cpu=x86_64` variant rows (cbc 72 with control/trap 16, kw 182 with control/trap 5; oaep and rsa15 equal their plain rows). `publish`'s copy was the HARNESS, not the module: compiler_rt's baseline memcpy dispatches on the size class of the CBC plaintext length (tainted in the claim, and left undefined untainted by std soft AES's `undefined` batch padding, cause A2), symbolised at line 0, so neither witness nor module. The harness now copies / prints the length of the plaintext it encrypted, checked against the returned one under `-fvalgrind`. The rest: +56 cbc / +180 kw std soft-AES key schedule (A1, loads at tainted indices), +2 the memcpy size classes of aesCbcDecrypt's copy of the documented plaintext length (S). No xmlenc branch on a key. Itemised in ctgrind-expected.tsv.
-- **OAEPparams label size** *(2026-11-17)*: `readBase64Text` gathers the label text in a 512-octet scratch buffer, and the list growth of `textContent` admits fewer base64 characters than the 256-octet decode buffer holds (measured: 64-octet labels pass, 128 do not). Labels of that size are refused with `MalformedStructure`. Not changed (rare, fail-closed); fix by decoding without `textContent` if a peer sends one.
-
-- ✅ DONE 2026-11-18 (owner decision, security triage): `WipingAllocator` was a private copy in `xmlenc`, `xmldsig`, `wireguard`, `bbs` and `minisign` -- the same adapter five times; all five now use the new `wipealloc` module (`mls` keeps its own `Wiper`, which forwards grow-in-place resizes, so it is not a copy).
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-**Missing and it matters** *(survey 2026-09-30)*:
-
-- ✅ DONE 2026-11-16 (DigestMethod sha384/sha512 and MGF mgf1sha384/mgf1sha512 URIs, all 16 pairings, via `rsa.decryptOaepHNoFail`; no external vector, round trips only) **OAEP with SHA-384/512 digest and MGF1-SHA384/512** *(survey 2026-09-30)*: xmlenc11 allows them and xmlsec
-  implements them *(inferred)*; today `UnsupportedAlgorithm` (see *Key transport* table). Sibling `rsa.decryptOaepH`
-  takes a `LabelHash`/`MgfHash` pair — check that it covers 384/512 first. Effort: small. Fits §2: yes.
-- **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey** *(survey 2026-09-30)*: used by newer
-  eIDAS/SAML profiles that avoid RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256
-  ECDH + Concat KDF; check siblings). Fits §2: yes. Low-medium priority.
-- ~~**AES-192 CBC/GCM**~~ *(survey 2026-09-30)* — done 2026-10-10 over the `aes192`/`aesgcm` modules, `kw-aes192` too (see *Content encryption*).
-- **Encryption side (`encryptData`)** *(survey 2026-09-30)*: xmlsec encrypts; here a user building an IdP or a test peer cannot.
-  The SPEC's Scope section makes this a scope decision, not a gap: raised as a question. Effort: medium. Fits §2: yes.
-
-**Deliberately not done** (given above under *Scope* / *Security posture*): CipherReference, `ds:Transforms` on the
-ciphertext, RetrievalMethod / KeyInfo trust, super-encryption; 3DES is not listed and is a legacy algorithm — **deliberately absent (decision 2026-09-30, user)**: a 64-bit block cipher (Sweet32), disallowed by NIST SP 800-131A for encryption since 2024; a legacy IdP that still sends `tripledes-cbc` is refused, not decrypted.
