@@ -2985,7 +2985,7 @@ fn tsyncWorker(ready: *std.atomic.Value(bool), release: *std.atomic.Value(bool))
 /// syscall ABI every other architecture uses (arm64 included) has no
 /// `SYS_alarm` at all, so `linux.syscall1(.alarm, …)` is not a portability
 /// wart — it fails to COMPILE on arm64 with "enum 'Arm64' has no member named
-/// 'alarm'". Caught by the arm64 lane on, the first run of this
+/// 'alarm'". Caught by the arm64 lane, the first run of this
 /// module on anything but x86_64. `setitimer(ITIMER_REAL, …)` is the portable
 /// spelling and is what glibc's `alarm()` itself calls there.
 ///
@@ -3045,8 +3045,7 @@ test "seccomp(2)+TSYNC: filter installed on main thread also kills a pre-existin
 // Audit S16: `ThreadSyncFailed`'s whole reason to exist — a POSITIVE return
 // from the TSYNC syscall, which `linux.errno()` decodes as `.SUCCESS` because
 // it only recognizes values in `(-4096, 0)` as errors — had no witness.
-// Reproduced by probe (`.zig-cache/probe/tsync_probe2.zig`, since
-// discarded): TSYNC fails for a sibling thread whose OWN filter chain has
+// Reproduced by a probe: TSYNC fails for a sibling thread whose OWN filter chain has
 // already diverged from the caller's — concretely, a worker that installed
 // its own single-thread filter via `install()` BEFORE the main thread calls
 // `installTsync()`. Measured raw: `seccomp(TSYNC)` returned the worker's tid
