@@ -431,8 +431,19 @@ pub const Sharded = struct {
     /// once it reads zero. `key` borrows the leader's argument for the same
     /// span; `value`/`err` are written before `done` is released and read only
     /// after it is acquired.
+    ///
+    /// A caller whose `cur_gen` differs from the flight's replaces it in
+    /// `inflight` (`superseded`, under the lock): the old flight still serves
+    /// the waiters it already has, but no new ones, and its leader neither
+    /// stores its value nor touches `inflight` when it finishes.
     const Flight = struct {
         key: []const u8,
+        /// The generation the leader looked the key up at. Only callers with
+        /// the same `cur_gen` share this load.
+        cur_gen: u64,
+        /// Set under the shard lock when a caller with another `cur_gen`
+        /// took over the `inflight` slot; read by the leader under the lock.
+        superseded: bool = false,
         done: std.atomic.Value(bool) = .init(false),
         waiters: std.atomic.Value(u32) = .init(0),
         err: ?LoadError = null,
@@ -643,7 +654,12 @@ pub const Sharded = struct {
     ///   (declined by admission, or evicted at once) is loaded again by the
     ///   next caller — single-flight, not memoisation.
     /// * `cur_gen` is the generation the lookup is made at; `ttl_ns` and `gen`
-    ///   describe the entry written on a miss.
+    ///   describe the entry written on a miss. Only callers with the same
+    ///   `cur_gen` share a load: a caller with another `cur_gen` that finds a
+    ///   load in flight starts its own and takes the key's flight slot over
+    ///   (later callers with its generation wait on it). The earlier load
+    ///   still answers the waiters it already had, but its value is not
+    ///   stored, so it cannot replace the newer generation's entry.
     ///
     /// Waiting uses the shard lock's discipline (a bounded spin, then
     /// `Thread.yield`), never an `Io`; a waiter is therefore stuck for as long
@@ -659,8 +675,10 @@ pub const Sharded = struct {
     /// Behaviour anchored on Go singleflight as otter uses it: first caller
     /// loads (otter `singleflight.go:98-112`), the result and error are shared
     /// with everyone waiting on that call (`:114-132`, `cache_impl.go:766-791`).
-    /// Not taken: otter forgets a call when the key is invalidated mid-load; here
-    /// a `clear` during a load does not cancel it, its result is stored after.
+    /// A generation change is treated as otter treats an invalidation
+    /// mid-load: the call is forgotten for new callers, its waiters keep its
+    /// result. Not taken: a `clear` during a load does not cancel it, its
+    /// result is stored after.
     ///
     /// The same-thread check identifies OS threads. Under a cooperative `Io`
     /// that runs several tasks on one thread, a different task on the
@@ -694,33 +712,47 @@ pub const Sharded = struct {
                 s.lock.unlock();
                 return error.LoadFailed;
             }
-            _ = f.waiters.fetchAdd(1, .monotonic);
-            s.lock.unlock();
-            waitFor(&f.done);
-            // The decrement is the release that lets the leader reclaim `f`;
-            // nothing of `f` may be touched after it.
-            defer _ = f.waiters.fetchSub(1, .release);
-            if (f.err) |e| return e;
-            return gpa.dupe(u8, f.value);
+            if (f.cur_gen == cur_gen) {
+                _ = f.waiters.fetchAdd(1, .monotonic);
+                s.lock.unlock();
+                waitFor(&f.done);
+                // The decrement is the release that lets the leader reclaim `f`;
+                // nothing of `f` may be touched after it.
+                defer _ = f.waiters.fetchSub(1, .release);
+                if (f.err) |e| return e;
+                return gpa.dupe(u8, f.value);
+            }
+            // Loaded at another generation: its value is not this caller's.
+            // Take the slot over (below) and load at `cur_gen`.
         }
-        // Leader. Reserve the table slot before running anything.
-        var flight: Flight = .{ .key = key, .leader = std.Thread.getCurrentId() };
-        s.inflight.put(self.alloc, key, &flight) catch {
+        // Leader. Reserve the table slot before running anything. `put`
+        // replaces both the key slice and the flight of a superseded slot: the
+        // old key borrows the old leader's argument, which may go out of scope
+        // before this flight ends.
+        var flight: Flight = .{ .key = key, .cur_gen = cur_gen, .leader = std.Thread.getCurrentId() };
+        const slot = s.inflight.getOrPut(self.alloc, key) catch {
             s.lock.unlock();
             return error.OutOfMemory;
         };
+        // Marked only once the slot is ours: on OOM above the old flight
+        // still owns it and must still remove itself.
+        if (slot.found_existing) slot.value_ptr.*.superseded = true;
+        slot.key_ptr.* = key;
+        slot.value_ptr.* = &flight;
         s.lock.unlock();
 
         const loaded: LoadError![]u8 = loader.load(loader.ctx, gpa, key);
 
         lockAcquire(&s.lock);
         if (loaded) |v| {
-            s.cache.putKey(k, v, now_ns, ttl_ns, gen);
+            // A superseded load is shared with its own waiters only; the slot
+            // and the cache belong to the newer generation's flight.
+            if (!flight.superseded) s.cache.putKey(k, v, now_ns, ttl_ns, gen);
             flight.value = v;
         } else |e| {
             flight.err = e;
         }
-        _ = s.inflight.remove(key);
+        if (!flight.superseded) _ = s.inflight.remove(key);
         flight.done.store(true, .release);
         s.lock.unlock();
 
@@ -2117,6 +2149,86 @@ test "getOrLoad: a loader failure reaches every waiter, and they do not retry" {
     }
     var buf: [16]u8 = undefined;
     try testing.expect(sc.getBuf("hot", 1, 0, &buf) == .miss);
+}
+
+/// A loader that returns `val` and, when `hold` is set, keeps its load open
+/// until `release` is set or a caller is parked on a flight of generation
+/// `hold_gen` (what a waiter that wrongly joined would do), so the test below
+/// orders the two calls by construction, not by timing.
+const GenLoadCtx = struct {
+    sc: *Sharded,
+    val: []const u8,
+    hold: bool = false,
+    hold_gen: u64 = 0,
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn parkedOn(self: *GenLoadCtx, key: []const u8) bool {
+        const s = &self.sc.shards[self.sc.shardIndex(key)];
+        lockAcquire(&s.lock);
+        defer s.lock.unlock();
+        const f = s.inflight.get(key) orelse return false;
+        return f.cur_gen == self.hold_gen and f.waiters.load(.monotonic) > 0;
+    }
+
+    fn load(ctx: ?*anyopaque, gpa: Allocator, key: []const u8) LoadError![]u8 {
+        const self: *GenLoadCtx = @ptrCast(@alignCast(ctx.?));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        self.entered.store(true, .release);
+        var spins: usize = 0;
+        while (self.hold and spins < 2_000_000 and !self.release.load(.acquire) and !self.parkedOn(key)) : (spins += 1) {
+            std.Thread.yield() catch {};
+        }
+        return gpa.dupe(u8, self.val);
+    }
+
+    fn loader(self: *GenLoadCtx) root.Loader {
+        return .{ .ctx = self, .load = load };
+    }
+};
+
+const GenLoadThread = struct {
+    sc: *Sharded,
+    lc: *GenLoadCtx,
+    cur_gen: u64,
+    out: ?[]u8 = null,
+
+    fn run(t: *GenLoadThread) void {
+        t.out = t.sc.getOrLoad(testing.allocator, "k", 0, t.cur_gen, 0, t.cur_gen, t.lc.loader()) catch null;
+    }
+};
+
+test "getOrLoad: a caller at another generation does not take the in-flight load's value, and that load does not overwrite its entry" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var old: GenLoadCtx = .{ .sc = &sc, .val = "old", .hold = true, .hold_gen = 1 };
+    var new: GenLoadCtx = .{ .sc = &sc, .val = "new" };
+
+    // A load at generation 1 is in flight ...
+    var t: GenLoadThread = .{ .sc = &sc, .lc = &old, .cur_gen = 1 };
+    const th = try std.Thread.spawn(.{}, GenLoadThread.run, .{&t});
+    var spins: usize = 0;
+    while (!old.entered.load(.acquire) and spins < 2_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(old.entered.load(.acquire));
+
+    // ... when the caller has moved on to generation 2: it loads for itself.
+    const got = sc.getOrLoad(testing.allocator, "k", 0, 2, 0, 2, new.loader());
+    old.release.store(true, .release);
+    th.join();
+    defer if (t.out) |o| testing.allocator.free(o);
+    const v = try got;
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("new", v);
+    try testing.expectEqual(@as(u32, 1), new.calls.load(.monotonic));
+    // The generation-1 caller still gets its own load's value.
+    try testing.expectEqualStrings("old", t.out.?);
+    try testing.expectEqual(@as(u32, 1), old.calls.load(.monotonic));
+    // The superseded load finished last but stored nothing over generation 2.
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("new", sc.getBuf("k", 1, 2, &buf).ok);
+    for (sc.shards) |*s| try testing.expectEqual(@as(usize, 0), s.inflight.count());
+    try expectInvariants(&sc);
 }
 
 test "idle_ttl_ns through the shards: a read refreshes the deadline, silence expires the entry, and it counts as expired" {

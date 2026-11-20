@@ -86,8 +86,8 @@ never moves its window.
 
 **Read-through:** `getOrLoad` returns the cached value or loads it. `Sharded.getOrLoad`
 is single-flight: on a miss one caller per key runs the loader (without the shard lock),
-every other caller for that key waits and gets a copy of the same value, or the same
-error. `Cache.getOrLoad` has the same signature without the concurrency.
+every other caller for that key at the same `cur_gen` waits and gets a copy of the same
+value, or the same error (a caller at another generation loads for itself). `Cache.getOrLoad` has the same signature without the concurrency.
 
 ```zig
 fn loadUser(ctx: ?*anyopaque, gpa: std.mem.Allocator, key: []const u8) ramcache.LoadError![]u8 {

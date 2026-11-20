@@ -106,7 +106,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   in the table, wait on `done` with the shard lock's spin-then-yield discipline, copy the value
   (own `gpa`) or take the leader's error, and decrement `waiters` last. The leader leaves its frame
   only when `waiters` reads 0 — after the removal the count can only fall, so the stack object
-  cannot dangle. Waiters never retry; every caller's result is the leader's. A loader that re-enters `getOrLoad` for the key it is loading, on its own thread,
+  cannot dangle. Waiters never retry; every caller's result is the leader's. Only callers with the
+  flight's `cur_gen` (kept in `Flight`) join it: a caller at another generation takes the table slot
+  over (marking the old flight `superseded` once the slot is its own) and loads itself; the
+  superseded flight still answers its existing waiters but neither stores its value nor touches the
+  table, so a load begun before a generation bump never answers or overwrites a later generation
+  (otter forgets an in-flight call on invalidation the same way). A loader that re-enters `getOrLoad` for the key it is loading, on its own thread,
   gets `error.LoadFailed` back instead of waiting for itself.
   Anchor: Go singleflight as otter uses it (`singleflight.go:98-132`, `cache_impl.go:766-791`).
 - **Victim selection is O(1).** An intrusive doubly linked queue per region (Caffeine's
@@ -276,7 +281,9 @@ threads, everything else injects `now_ns`/generation, so no real clock), `zig bu
   key run the loader once (the loader holds the load open until the waiters are registered, read
   from the in-flight table under the shard lock, so single-flight is exercised by construction)
   and every caller gets its own copy; with a failing loader one call is made and every caller gets
-  `LoadFailed`.
+  `LoadFailed`; a caller at another generation while a load is in flight loads for itself and gets
+  its own value, the old caller gets the old one, and the superseded load stores nothing (the held
+  loader lets go when a caller is parked on its flight, so the pre-fix behaviour fails, not hangs).
 - **Borrow seam.** The model-fuzz harness below, plus `pin`/`reserve`/`commit`/`discard`/`release`
   unit tests (unevictable while borrowed, parking on overwrite/remove/clear/expiry, a refused borrow
   counted as a miss, forged or repeated `release` refused).
@@ -360,9 +367,6 @@ Closing it is the P1 item under *Backlog / deferred*.
 
 - **`drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set.**
   Candidates: `drainDirtyMax`/copy-out, a ticket lock.
-- **`Sharded.getOrLoad` waiters take the leader's value whatever their own `cur_gen`** (MED), so a caller that bumped
-  the generation can receive a value loaded under the previous one. Fix: keep `cur_gen` in `Flight` and let a
-  waiter with another generation load for itself, or document it.
 - **Smaller leftovers (LOW):** `reserve` reserves no expiry-heap slot and `release` ignores `expPush` OOM (the entry
   then loses expired-first priority); an expired-first eviction counts in `evictions`, not `expired`, against the
   `idle_ttl_ns` doc; `getOrLoad` stamps the entry with the call's `now_ns`, not the load's completion.
