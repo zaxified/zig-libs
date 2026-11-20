@@ -72,6 +72,7 @@ pub const Aes192EncryptCtx = struct {   // = std's AesEncryptCtx(Aes) shape
     pub fn xor(ctx, dst: *[16]u8, src: *const [16]u8, counter: [16]u8) void;
     pub fn encryptWide(ctx, comptime n: usize, dst: *[16 * n]u8, src: *const [16 * n]u8) void;
     pub fn xorWide(ctx, comptime n: usize, dst, src, counters: [16 * n]u8) void;
+    pub fn ctr(ctx, dst: []u8, src: []const u8, iv: [16]u8) void;  // = std modes.ctr(.big); dst.len < src.len panics
     pub fn wipe(ctx: *Aes192EncryptCtx) void;
 };
 

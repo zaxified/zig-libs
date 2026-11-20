@@ -8,10 +8,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-11-18 (25/26, 1 eq) · src 2f95976c38fc3693
 
-*Source moved without a production change (2026-11-14):* the test-only `fromHex` helper became `testkit.hex.bytes` (used inside `test` blocks only) and a test-file header comment changed — no production line, no mutant applies.
-
-Audit detail: the 2026-11-01 review is a delta over `stackprobe_test.zig` only (full-CI fix: `initEncInto`'s probe no longer lists the still-zero `dec` schedule as a secret); library source unchanged since the mutation run.
-
 **Hardening:** fuzz 2026-10-20 (200,000 runs clean, AES192_FUZZ, every reach label hit; on `-Dcpu=x86_64`, the bitsliced backend — 2026-10-10 on AES-NI) · ct 2026-10-20 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; bitsliced: key + batch tainted through packKeys and both directions, 0 in-file) · panic 2026-10-30 (sweep + blind review: `ctr` short dst is a checked panic (was OOB in ReleaseFast); delta audit 3/3)
 
 **Performance:** ref 0.83–1.01× OpenSSL 3.5.5 EVP AES-192 · fastest ? (measured 2026-10-20)
@@ -28,9 +24,9 @@ README.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29); measured 3.5.5 | AES-192 in every mode through EVP, AES-NI/VAES kernels, a constant-time SSSE3 software path *(inferred, from its documented `vpaes` code)*. `zig build bench-aes192` (2026-10-11, *Performance*): level on bulk work (ECB both ways, CBC chained, CTR: 0.97–1.01×), ahead on key setup (0.74–0.81×, EVP's per-call overhead included on its side). |
+| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29); measured 3.5.5 | AES-192 in every mode through EVP, AES-NI/VAES kernels, a constant-time SSSE3 software path *(inferred, from its documented `vpaes` code)*. `zig build bench-aes192` (*Performance*; figures on the card): level on bulk work (ECB both ways, CBC chained, CTR), ahead on key setup (EVP's per-call overhead included on its side). |
 | [Go `crypto/aes`](https://pkg.go.dev/crypto/aes) | Go | BSD-3-Clause | 139k | go1.27.2 | 24-byte keys through `NewCipher`; the docs say the software path is **not** constant time, only AES-NI (amd64) and MSA (s390x) are — the same posture as this module. |
-| [RustCrypto/block-ciphers](https://github.com/RustCrypto/block-ciphers) `aes` | Rust | Apache-2.0 OR MIT | 786 | crate 0.9.3 (2026-08-28); pushed 2026-10-06 | `Aes192` with runtime AES-NI detection and a bitsliced constant-time software fallback — the same posture as this module since 2026-10-20; one NCC Group audit (README). Not measured. |
+| [RustCrypto/block-ciphers](https://github.com/RustCrypto/block-ciphers) `aes` | Rust | Apache-2.0 OR MIT | 786 | crate 0.9.3 (2026-08-28); pushed 2026-10-06 | `Aes192` with runtime AES-NI detection and a bitsliced constant-time software fallback — the same posture as this module; one NCC Group audit (README). Not measured. |
 | Zig `std.crypto` 0.16.0, Zig ecosystem | Zig | MIT | — | Zig 0.16.0 | std has `Aes128`/`Aes256` only (its context asserts `key_bits == 128 or 256`); GitHub search (`aes`, language Zig) found modes over std's AES, no AES-192. This module is the only one. |
 
 **Where we are ahead:** the only Zig AES-192, std-shaped so std's generic modes take it unchanged;
@@ -44,8 +40,8 @@ The AES-192 block cipher, as the third member of std's `Aes128`/`Aes256` family.
 usage: [README.md](README.md).
 
 **Not here:** any mode of operation (CBC, GCM, KW, …) other than plain CTR, which the
-encryption context carries as `ctr` (*Design*). Those live in `aescbc`, `aesgcm`, `aeskw`, `jwe`, `xmlenc`, `ssh`; giving
-them a 192-bit key is phase 2 (*Open*). No own round implementation and no own S-box either —
+encryption context carries as `ctr` (*Design*). Those live in `aescbc`, `aesgcm`, `aeskw`, `jwe`, `xmlenc`, `ssh`; each of them takes a 192-bit
+key through this module. No own round implementation and no own S-box either —
 deliberately (*Design*).
 
 ## Algorithm
@@ -83,7 +79,7 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   needs no change beyond accepting the third type (test: SP 800-38A CTR through
   `std.crypto.core.modes.ctr`). std's own `AesEncryptCtx` cannot be reused: it asserts
   `key_bits == 128 or 256`, and its `KeySchedule` is private.
-- **`Aes192EncryptCtx.ctr` (2026-10-20)** is `std.crypto.core.modes.ctr(…, .big)` byte for
+- **`Aes192EncryptCtx.ctr`** is `std.crypto.core.modes.ctr(…, .big)` byte for
   byte (tests: SP 800-38A F.5.5/F.5.6 through both; every length over two wide batches and the
   half-carry / full-wrap counters against std; fuzz `ctr_mode`/`ctr_carry`). It exists because
   Zig 0.17 lowers std's per-block `mem.writeInt(u128, …, .big)` byte by byte (#36256): std's
@@ -94,12 +90,11 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   (`has_hardware_support` re-exported).
 - **Dead stack** (`CONVENTIONS.md` §2.1.1): `init`/`initInto` of both contexts (and the
   `Aes192.init*` forwards) run under a 512-byte burn (the body dirties ≤ 256 B in ReleaseFast;
-  512 is the probe's minimum zero run; 4 KiB until 2026-10-11, when it was half of `init`'s time); the by-value `initEnc`/`initDec`/`init`
+  512 is the probe's minimum zero run); the by-value `initEnc`/`initDec`/`init`
   are the std-shaped surface, with `*Into` twins. Per-block calls do not burn (§2.1 Z3: the
   burn belongs to the mode's entry point that owns key and message). `stackprobe_test.zig`
   (ReleaseFast) holds the burn deep enough. On the bitsliced backend the burn is 8 KiB: the
-  body also builds the packed keys by value (7071 B dirtied, ReleaseFast `-Dcpu=x86_64`,
-  2026-10-20).
+  body also builds the packed keys by value (7071 B dirtied, ReleaseFast `-Dcpu=x86_64`).
 - **Zeroization:** a context is caller-owned storage (§2.1 Z2): `wipe()` on each zeroes the
   whole context (round keys and, on the bitsliced backend, the packed keys), documented,
   tested (`wipe zeroes the round keys`). The 52-word expansion buffer is Z3 (a key schedule),
@@ -116,7 +111,7 @@ Secret: the key (hence every round key) and the data blocks.
   contexts are the harness's printed results (witness). ARMv8 is not measured under valgrind
   here (no arm64 host); the claim there rests on the code being std's `aese`/`aesd` sequences.
 - **Software backend** (`has_hardware_support == false`): **level with std's
-  `Aes128`/`Aes256` on Zig 0.17** (since 2026-10-20; audit 2026-10-19, O5-1). When
+  `Aes128`/`Aes256` on Zig 0.17**. When
   `std.options.side_channels_mitigations != .none` (default `.medium`) — the condition std's
   soft contexts use — every encrypt/decrypt/`*Wide`/`xor*` call runs `src/bitsliced.zig`, a
   copy of std 0.17's `bitsliced.zig` ("no data-dependent memory access"; std does not export
@@ -128,14 +123,12 @@ Secret: the key (hence every round key) and the data blocks.
   `bitslicedBlocks` adds only two `@memcpy`s. With `.none` the rounds are std's unmasked
   tables, as std's. Still level, not better: the **key expansion** reaches std's masked
   `sbox_lookup` through `subWord` (a secret-indexed load per S-box byte, cache-line masked),
-  exactly as std's own soft `expandKey` — once per key, not per block. Before 2026-10-20 the
-  rounds were std's soft `Block` lookups (`enc` 356 / `dec` 349 in-file loads under
-  `CTGRIND_CPU=x86_64`). Since 2026-11-18 the portable lane measures this backend: `enc` 128, `dec` 304 and `bitsliced` 128 in-file, all in the key expansion's masked S-box, are pinned as `cpu=x86_64` rows, and the bitsliced batch's padding lanes are zeroed, so the untainted control reads 0 (it read 2: memcheck carried the `undefined` padding into the real lanes). Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`):
+  exactly as std's own soft `expandKey` — once per key, not per block. The portable lane (`CTGRIND_CPU=x86_64`) measures this backend: `enc` 128, `dec` 304 and `bitsliced` 128 in-file, all in the key expansion's masked S-box, are pinned as `cpu=x86_64` rows, and the bitsliced batch's padding lanes are zeroed, so the untainted control reads 0. Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`):
   x86-64 without AES-NI **or without AVX** (0.17 requires both — e.g. Atom/Goldmont/Tremont-class
   router and NAS CPUs that have AES-NI but no AVX, and any `-Dcpu=baseline` /
   `x86_64` / `x86_64_v2` build), arm64 without the Crypto Extensions (e.g. Cortex-A72 as in
   a Raspberry Pi 4), and every other architecture. Tested there by running the whole suite,
-  the stack probe and the model fuzz with `-Dcpu=x86_64` (2026-10-20); a native run also
+  the stack probe and the model fuzz with `-Dcpu=x86_64`; a native run also
   drives the core directly (test "the bitsliced core at 12 rounds …").
 
 ## Limits and refusals
@@ -160,35 +153,48 @@ Key exactly 24 bytes (by type). Block exactly 16 bytes (by type). No runtime err
 
 **Anchor grade:** class B · oracle EXTERNAL
 
+## Verification
+
+Run: `scripts/modtest aes192` (the module's tests); `AES192_FUZZ=<runs>` for the fuzz driver; `scripts/checks/ctgrind.sh aes192`
+for the constant-time rows; `zig build bench-aes192` for the benchmark.
+
+- **Anchored tests** (`src/root.zig`): every external and re-derived anchor of *Anchoring* (FIPS-197 C.2 and A.2, the
+  CAVP AESAVS vectors both ways, SP 800-38A ECB and CTR, the S-box for all 256 inputs).
+- **Differential and shape tests** (`src/root.zig`): `ctr` equals std's `modes.ctr` at every length over two wide
+  batches and across the half-carry and the full-wrap counters; the wide and `xor` paths equal the one-block path for
+  every width 1..9; the `*Into` twins equal the by-value constructors; `wipe` zeroes the round keys; the bitsliced core
+  at 12 rounds agrees with the round-primitive path; `invMixColumns` through the round primitives equals std's
+  `Block.invMixColumns`.
+- **Model** (`src/model_test.zig`): the textbook AES-192, itself anchored before it judges, against the module on
+  derived keys and blocks, key schedule included.
+- **Fuzz** (`src/fuzz_test.zig`): one harness (random key and blocks, every path against the model, `ctr` against std)
+  under testkit's deterministic driver as `AES192_FUZZ`; a fixed 300-seed run in every test run checks that every reach
+  label is hit.
+- **Panic** (`src/sweep_test.zig`): a `ctr` call with a `dst` shorter than `src` dies with a checked panic.
+- **Dead stack** (`src/stackprobe_test.zig`, ReleaseFast only): no key or round-key residue below the `initEncInto` /
+  `initDecInto` burns, on both burn sizes (hardware and bitsliced backend).
+- **Software backend:** the whole suite, the stack probe and the model fuzz also run with `-Dcpu=x86_64`, where std
+  falls back to software and this module to the bitsliced core.
+- **Constant time:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh aes192`: rows `enc`, `dec` and
+  `bitsliced` in `ctgrind-expected.tsv`, and the `cpu=x86_64` variant rows for the software backend (*Constant-time
+  contract*).
+- **Bench:** `tools/bench.zig` against OpenSSL EVP AES-192 (*Performance*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aes192`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average ~4.2 from other sessions, largest spread 9.3 %): ref 0.83–1.01× OpenSSL 3.5.5 — `ecb_enc` 0.997, `ecb_dec` 1.010, `cbc_enc` 1.001, `ctr` 0.959, `key_enc` 0.896, `key_dec` 0.833. On 0.17 the `ctr` row first read **2.32×**: it timed std's `modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256; 45 % of the loop's cycles). The row now times `Aes192EncryptCtx.ctr` (*Design*), byte-identical output; a first cut with scalar `u64` counter halves still read 1.16×, the vector byte swap brought it to 0.96×. The table below is the 0.16.0 measurement (its `ctr` row was std's `modes.ctr` then).
+`zig build bench-aes192` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`, the shared alternating driver of the
+crypto benches) times, against OpenSSL's EVP AES-192 (system `libcrypto`, the AES-NI kernels), `encryptWide` and
+`decryptWide` at `optimal_parallel_blocks`, chained CBC encryption (latency), `Aes192EncryptCtx.ctr` and key setup
+(`init`, burn included). Each side takes the best of `BENCH_ROUNDS` rounds and ratio = ours/theirs by user-mode cycles;
+before timing, OpenSSL's ECB, CBC and CTR outputs of the 16 KiB message must equal ours byte for byte and our ECB
+decryption must invert it. The card's Performance line holds the current figures; the grade is P2 (worst row within
+`p2_ref_tolerance`, fastest in the field not measured).
 
-Measured 2026-10-11 against OpenSSL 3.5.5 (system `libcrypto.so.3`, EVP AES-192: the AES-NI
-`aesni_*` kernels). Host: Intel Core i7-7920HQ (Kaby Lake; AES-NI, no VAES), Linux 7.0, Zig
-0.16.0 ReleaseFast against `zig cc -O3 -march=native`, load average ~2.7 (other sessions).
-
-Method: `zig build bench-aes192` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`,
-the shared alternating driver of the crypto benches; ratio = ours/theirs by user-mode cycles,
-each side's best of `BENCH_ROUNDS=5`). Before timing, OpenSSL's ECB, CBC and CTR outputs of the
-16 KiB message must equal ours byte for byte, and our ECB decryption must invert it.
-
-| workload | what | ours ns/op | ref ns/op | ours/ref |
-|---|---|---:|---:|---:|
-| `ecb_enc_16384` | `encryptWide` at `optimal_parallel_blocks` vs EVP ECB | 3460 | 3506 | 0.997 |
-| `ecb_dec_16384` | `decryptWide` vs EVP ECB | 3536 | 3451 | 1.013 |
-| `cbc_enc_16384` | chained `encrypt` (latency) vs EVP CBC | 14533 | 14581 | 1.004 |
-| `ctr_16384` | `std.crypto.core.modes.ctr` (0.16.0; `ctr` since 2026-10-20) vs EVP CTR | 3474 | 3614 | 0.965 |
-| `key_enc` | `Aes192EncryptCtx.init` (burn included) vs `EVP_EncryptInit_ex` with the key | 69 | 86 | 0.805 |
-| `key_dec` | `Aes192DecryptCtx.init` vs `EVP_DecryptInit_ex` with the key | 69 | 93 | 0.741 |
-
-A first run (before the key-setup change) agreed on the bulk rows (0.96–1.01×).
-
-**Reading.** The rounds are the same AES-NI instructions on both sides, so bulk work meets at
-1.00× ± 1.5 %. Key setup was 1.65–1.81× before 2026-10-11: half of it a 4 KiB dead-stack burn
-for a body that dirties 256 B, half the expansion compiled to byte operations from `[4]u8`
-words; with a 512-byte burn and `u32` words it is 0.74–0.81×. Grade: worst row 1.01× (within
-`p2_ref_tolerance`), fastest in the field not measured, so P2.
+The rounds are the same AES-NI instructions on both sides, so bulk work meets at 1.00x within noise. Key setup is ahead
+of EVP because the burn is 512 bytes and the expansion works on `u32` words (*Design*). The `ctr` row times
+`Aes192EncryptCtx.ctr`, not std's `modes.ctr` (*Design*: the per-block `writeInt` lowering).
 
 ## What is deliberately not done
 
@@ -201,18 +207,14 @@ words; with a 512-byte burn and `u32` words it is 0.74–0.81×. Grade: worst ro
 
 ## Backlog / deferred
 
-- **Software key expansion through the bitsliced core** *(2026-10-20)*: `subWord` still runs
-  std's masked S-box on the software backend (level with std's own soft `expandKey`). Running
-  SubWord through `bitsliced.Wide.encrypt`'s S-box instead would make the expansion constant
-  time too — better than std, at the cost of a bitsliced batch per SubWord (8 per key). Not done:
-  no consumer asked, and the masked lookup is once per key.
+- **Software key expansion through the bitsliced core:** `subWord` still runs std's masked S-box on the software
+  backend (level with std's own soft `expandKey`). Running SubWord through `bitsliced.Wide.encrypt`'s S-box instead
+  would make the expansion constant time too, better than std, at the cost of a bitsliced batch per SubWord (8 per
+  key). Open: no consumer asked, and the masked lookup runs once per key.
+- **Performance P2 to P1:** P1 needs `fastest <= 1.25x` and only OpenSSL is measured. Candidates: aws-lc / BoringSSL,
+  Go `crypto/aes` (as an `alt` side in `tools/bench.zig`).
 
 ## Open
 
-- **Phase 2:** done — 192-bit keys in `aescbc`, `aeskw` (A192KW), `aesgcm`, `jwe`
-  (A192KW/A192GCM/A192CBC-HS384), `xmlenc` (aes192-cbc, kw-aes192), `ssh` (`aes192-ctr`).
-- **Performance P2 → P1: measure the fastest in the field** *(bench 2026-10-11)*: P1 needs
-  `fastest ≤ 1.25×` and only OpenSSL is measured. Candidates: aws-lc / BoringSSL, Go
-  `crypto/aes` (as an `alt` side in `tools/bench.zig`).
-- **ARMv8 backend under ctgrind:** not measured (no arm64 valgrind host); tested only for
-  correctness under qemu (`-Dtarget=aarch64-linux-musl -Dcpu=cortex_a72 -fqemu`).
+- **ARMv8 backend under ctgrind:** not measured (no arm64 valgrind host); tested only for correctness under qemu
+  (`-Dtarget=aarch64-linux-musl -Dcpu=cortex_a72 -fqemu`).
