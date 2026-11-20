@@ -301,7 +301,7 @@ pub const Mapping = enum {
     /// One value per row, at the row's place (the default; polars `group_to_rows`).
     group_to_rows,
     /// Each row gets the partition's whole result as a list, in the partition's
-    /// (`order_by`) order (polars `join`). The column is `.list`.
+    /// (`order_by`) order (polars `join`). The column is `.list`, its element column declared.
     join,
     /// The rows come out partition by partition (first-seen order of the partitions; polars
     /// does not promise an order of groups and showed another one under `order_by`), each
@@ -325,8 +325,10 @@ pub const WindowSpec = struct {
     order_descending: bool = false,
     /// Run each partition from its last row to its first (polars `cum_sum(reverse=True)` and
     /// the other `cum_*`; for the other operations the usual `x[::-1]` idiom): the result
-    /// is put back at the rows' places. Not read by `transform`.
+    /// is put back at the rows' places. Not read by `transform`; with a time-based operation
+    /// (`rolling_time`, `ewm_by`, a `times_col`/`time_col`) it is `error.BadOption`.
     reverse: bool = false,
+    /// `transform` takes only `group_to_rows` (`error.BadOption` otherwise).
     mapping: Mapping = .group_to_rows,
 };
 
@@ -483,6 +485,10 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
     const oidx = try a.alloc(usize, spec.order_by.len);
     defer a.free(oidx);
     for (spec.order_by, oidx) |name, *ix| ix.* = f.columnIndex(name) orelse return error.NoSuchColumn;
+    // `transform` broadcasts an aggregate: it has no partition list or reordered rows to map.
+    if (spec.op == .transform and spec.mapping != .group_to_rows) return error.BadOption;
+    // The time-based operations read the rows in time order: a reversal has no meaning for them.
+    if (spec.reverse and time_ci != null) return error.BadOption;
     const reorder = spec.order_by.len > 0 or spec.reverse;
     // The typed kernels know neither an order, a reversal nor a mapping.
     const plain_layout = !reorder and spec.mapping == .group_to_rows;
@@ -562,6 +568,9 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         // not per partition (each is up to `max_window_points` Bessel/cos evaluations).
         var win_weights: ?[]f64 = null;
         defer if (win_weights) |w| a.free(w);
+        // An empty table has no partition to run the operation on: run it on no rows, so a bad option
+        // is refused all the same.
+        if (fac.groups() == 0) try computeOne(a, &.{}, .{ .out_ty = out_type }, op, int_col or wint, &time_work, &.{});
         for (0..fac.groups()) |g| {
             if (win_weights == null and op == .rolling) {
                 const r = op.rolling;
@@ -691,7 +700,10 @@ fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, m
     const res = try a.alloc(Value, f.len);
     defer a.free(res);
     for (perm, cells) |ri, c| res[ri] = c;
-    return withColumn(a, f, .{ .name = spec.out, .type = .list }, try fm.columnFromCells(a, res));
+    // The list declares its element column (the result's type and zone), as `implode` does.
+    const inner = try a.alloc(Column, 1);
+    inner[0] = Column.withShape(.{ .name = "", .type = out_type, .time_zone = zone }, src);
+    return withColumn(a, f, .{ .name = spec.out, .type = .list, .inner = inner }, try fm.columnFromCells(a, res));
 }
 
 fn timeColName(op: WindowOp) ?[]const u8 {
@@ -2111,6 +2123,8 @@ pub fn windowWeights(a: std.mem.Allocator, wt: WinType, m: usize) Error![]f64 {
     const blackman = [_]f64{ 0.42, 0.50, 0.08 };
     const bh = [_]f64{ 0.35875, 0.48829, 0.14128, 0.01168 };
     const nuttall = [_]f64{ 0.3635819, 0.4891775, 0.1365995, 0.0106411 };
+    // The kaiser normaliser is one number: its series is summed once, not per point.
+    const kaiser_norm: f64 = if (wt == .kaiser) besselI0(wt.kaiser.beta) else 1;
     const flattop = [_]f64{ 0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368 };
     for (w, 0..) |*x, i| {
         const n: f64 = @floatFromInt(i);
@@ -2148,7 +2162,7 @@ pub fn windowWeights(a: std.mem.Allocator, wt: WinType, m: usize) Error![]f64 {
             .general_gaussian => |p| @exp(-0.5 * std.math.pow(f64, @abs((n - centre) / p.sig), 2 * p.p)),
             .kaiser => |p| blk: {
                 const r = (n - centre) / centre;
-                break :blk besselI0(p.beta * @sqrt(@max(0, 1 - r * r))) / besselI0(p.beta);
+                break :blk besselI0(p.beta * @sqrt(@max(0, 1 - r * r))) / kaiser_norm;
             },
         };
     }
