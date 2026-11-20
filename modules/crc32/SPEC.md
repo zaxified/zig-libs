@@ -33,8 +33,7 @@ measured by this survey; the only measured comparison is with `std.hash.Crc32` (
 **Where we are ahead:** of the Zig alternative (`std`), ~50x from 1 KiB (22.9 vs 0.45 GB/s on the measured
 i7-7920HQ) and the only `combine`; PCLMULQDQ folding and the ARMv8 `crc32x` path are chosen at run time without C or
 libc, with the folding constants derived at compile time; verified against zlib's `crc32` (CPython) and the reveng
-check value. **Where we are behind:** no precomputed combine operator for many equal-length blocks (zlib's
-`crc32_combine_gen`/`_op`), no AVX-512 / VPCLMUL (deliberately, see *What is deliberately not done*), and the arm64 path
+check value. **Where we are behind:** no AVX-512 / VPCLMUL (deliberately, see *What is deliberately not done*), and the arm64 path
 is checked under qemu only.
 
 ## What this module is, and what it is not
@@ -83,6 +82,10 @@ conditioning; `extend(c, b) = ~reg(b, ~c)`.
 - **`combine(a, b, n)`** = `multModP(x^(8n) mod P, a) ⊕ b`, as zlib ≥ 1.2.12.
   `x^(2^k)` is tabled for k < 32 and indexed mod 32, which is valid because
   x^(2^32) ≡ x mod P for this polynomial (tested).
+- **`combineGen(n)`** returns that operator, x^(8n) mod P, and **`combineOp(a, b, op)`** =
+  `multModP(op, a) ⊕ b` (zlib's `crc32_combine_gen` / `crc32_combine_op`): for many joins of equal-length
+  blocks the length walk is paid once. `op = 0` (never a power of x, so never made by `combineGen`) returns `b`
+  instead of looping in `multModP`; any other foreign `op` gives a meaningless but bounded result.
 
 **Dispatch.** If the build target has `pclmul` (x86-64) or `crc` (aarch64),
 that backend is fixed at compile time. Otherwise the first call detects it —
@@ -138,58 +141,26 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
 
 **Anchor grade:** class B · oracle EXTERNAL
 
-### Audit 2026-10-03
+## Verification
 
-Reviewed `src/root.zig` whole (722 lines): the GF(2) arithmetic (`multModP`,
-`xPowShifted`, the `x2n` period-32 indexing), slicing-by-8, the PCLMUL kernel's
-slice bounds at every threshold (32, 48, 64, 16-byte tail), the ARMv8 three-way
-split and its tail steps, dispatch and the atomic cache, and the table/constant
-derivations against the module's own comments and zlib's documented
-`crc32_combine`. No defect found; no constant-time claim is made. INFO only:
-`multModP(0, b)` would loop forever, unreachable because every first argument is
-a power of x (never 0); the dispatch test compared `cpuidPclmul` with itself
-and `.table` availability was never asserted (both fixed below).
-
-Mutation run (schemata, ReleaseSafe; 53 mutants on x86-64 built `-mcpu=x86_64`
-so that run-time dispatch is live, 12 more on the ARMv8 path built
-`-target aarch64-linux -mcpu=generic` and run under `qemu-aarch64 -cpu max`):
-**65 mutants, 54 killed, 9 equivalent, 2 real (killed after the fix)**.
-Covered: `multModP` start bit, early exit, reduction and add; `x2n` indexing,
-`xPowShifted` start/stride, the unit exponents of `xPow8n`/`xPow`; every
-slicing-by-8 table index and the tail; `zeros4`; the kernel's `pclmul_min`,
-every length threshold, seed XOR, fold constants and their pairing, the
-immediates, the reduction steps and tail; dispatch cache, CPUID bit,
-`available`, `hashWith`, `extend`, `Crc32.update`, `combine`; the ARM stream
-joins, thresholds, tail steps and HWCAP bit. Not mutated: the comptime constant
-tables (`x2n` seed, `fold_consts` exponents, `tables`), which tests recompute
-bit by bit.
-
-Equivalent:
-- `pclmul_min` 33, and 16 (the kernel is correct from 16 bytes; 32 is a speed
-  threshold only).
-- Slicing loop `>= 9` instead of `>= 8`; kernel lanes `>= 49` instead of `>= 48`,
-  fold loop `>= 65` instead of `>= 64`, one-lane loop `> 16` instead of `>= 16`;
-  ARM `>= 3 * n` as `> 3 * n`: each only moves the last full block to the next,
-  slower loop or to the table tail, which yields the same register.
-- `available(.armv8)` as `arch == .aarch64 or backend() == .armv8`, and
-  `available(.pclmul)` with `or`: on the machine that runs them both sides agree
-  (they differ only on a CPU lacking the feature, which this lane cannot supply).
-
-Real survivors, now killed:
-- `available(.table)` false: every comparison test skips an unavailable backend,
-  so `.table` silently left all of them. Test `the table backend is always
-  available and gives the catalogue value`.
-- `cpuidPclmul` reading another bit: the dispatch test compared detection with
-  itself. Test `run-time detection agrees with the kernel's CPU flags` (reads
-  `/proc/cpuinfo`; skips where unreadable).
+- **Tests** (`src/root.zig`): the external anchors above; every backend against `std.hash.Crc32` at every length
+  and alignment; streaming, `extend`, `combine` and `combineGen`/`combineOp` against the whole-input checksum;
+  the re-derived constants and shift tables; backend selection and run-time CPU detection (against
+  `/proc/cpuinfo`, skipped where unreadable).
+- **Fuzz:** one harness (every backend, `extend` and `combine` against std on arbitrary bytes), run by testkit's
+  deterministic driver as `CRC32_FUZZ` (`src/fuzz_test.zig`), with a fixed seed loop and reach checks in every test
+  run.
+- **Constant time:** n/a — a checksum over public data, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score; the review and mutation record, with the
+  equivalent-mutant arguments, is [`AUDIT.md`](AUDIT.md).
+- **Bench:** `zig build bench-crc32` (`tools/bench.zig`) against zlib `crc32_z` and Go `hash/crc32`.
 
 ## Speed
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-crc32`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.07–0.17×, against 0.07–0.17× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
-
-See README. The folding kernel reaches ~10× std from 1 KiB up; below
-`pclmul_min` its fixed cost (the two reduction multiplies) loses to the
-table.
+Against zlib 1.3.1 `crc32_z`: ref 0.07–0.17× (lower is faster; `zig build bench-crc32`, `BENCH_ROUNDS=5`,
+ReleaseFast, measured on Zig 0.17.0, 2026-10-20 — the figures on the card). The fastest implementation in the field
+is not measured. Against `std.hash.Crc32` see the README table: the folding kernel is far ahead from 64 bytes up;
+below `pclmul_min` its fixed cost (the two reduction multiplies) loses to the table, which therefore runs there.
 
 ## What is deliberately not done
 
@@ -199,6 +170,10 @@ table.
 - **PMULL folding on arm64.** The three-stream `crc32x` path is simple and
   already at instruction throughput; PMULL would add a second arm64 kernel
   for a gain only on long inputs.
+- **A check that builds the module with the self-hosted x86_64 backend** (rejected by the owner, 2026-09-29). Every
+  gate and CI lane builds with LLVM; the self-hosted backend is for the edit loop only. A Debug build of a baseline
+  x86-64 target once failed to encode the run-time PCLMULQDQ path (fixed: see *Dispatch*, `pclmul_emittable`);
+  that class of failure can come back unnoticed, and only in a self-hosted Debug build that emits a binary.
 - **VEX-encoded (`vpclmulqdq`) forms on AVX targets.** The legacy-SSE
   encoding runs everywhere the CPUID bit is set; on AVX-capable CPUs the
   compiler's `vzeroupper` at function boundaries keeps it free of
@@ -206,32 +181,10 @@ table.
 
 ## Open
 
-- A caller wanting to force the table path (benchmarks, bit-exact audits)
-  uses `hashWith(.table, …)`; there is no global override.
+- A caller wanting to force the table path (benchmarks, bit-exact audits) uses `hashWith(.table, …)`; there is no
+  global override.
+- The arm64 path is verified under `qemu-aarch64` only: correct there, its speed unmeasured on hardware.
 
 ## Backlog / deferred
 
-- ~~**Baseline x86_64 Debug build fails**~~ — **FIXED 2026-09-29** (the
-  PCLMUL path exists only where the backend can emit it, see *Dispatch*;
-  crc32c's SSE4.2 path and aesgcm's AES-NI kernel had the same defect and the
-  same fix). The check half is REJECTED (user, 2026-09-29): the self-hosted
-  backend is for the edit loop only, every gate and CI lane builds with LLVM,
-  so no lane will build under it. The class can come back unnoticed; it only affects a Debug
-  build that emits a binary with the self-hosted backend. Measured 2026-09-29
-  over the 13 modules with inline asm: only these three failed. Was:
-- **Baseline x86_64 Debug build fails (found 2026-09-29 by the web-server consumer's
-  `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
-  chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline
-  `pclmulqdq` is compiled for every x86_64 target; Zig 0.16's self-hosted
-  x86_64 backend (Debug; not re-checked on 0.17) cannot encode it for a CPU model without `pclmul`
-  (`error(x86_64_encoder): no encoding found for: none pclmulqdq`). LLVM
-  builds are unaffected. Fix: compile the runtime-dispatched PCLMUL path only
-  where the backend can emit it (`builtin.zig_backend != .stage2_x86_64`, or
-  the target already has `pclmul`), else the table -- and add a Debug
-  `-Dtarget=x86_64-linux` build of the module to its checks.
-
-- ✅ **DONE 2026-11-16 (`combineGen` / `combineOp`):** **Precomputed combine operator** *(survey 2026-09-30)*: zlib ≥ 1.2.12 offers `crc32_combine_gen(len)` /
-  `crc32_combine_op(a, b, op)` so a parallel or chunked checksummer that joins many equal-length blocks pays the
-  `x^(8n)` computation once. `combine(a, b, n)` here recomputes it per call (log-time, cheap), so this only matters
-  for hot join loops. Effort: small (expose the `x^(8n) mod P` value and its multiply). Fits §2: yes. Low priority.
-  (Searched: `rg -i 'combine_gen|combineOp|operator' src/root.zig` finds only a test name.)
+None open.
