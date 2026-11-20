@@ -421,6 +421,9 @@ Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
 
+`ebpf.discoverUsdt(gpa, path)` finds the USDT (SystemTap) probes of an ELF
+file and returns each one's uprobe file offset and semaphore (`ref_ctr_offset`).
+
 `ebpf.Map` / `ebpf.TypedMap(K, V)` drive a map fd (lookup/update/delete/iterate,
 the batch commands, per-CPU values with the right stride), and `ebpf.devmapSet`
 / `cpumapSet` attach an `xdp/devmap` / `xdp/cpumap` program through a map entry.

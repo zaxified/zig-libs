@@ -201,6 +201,19 @@ with `name@VERSION` suffixes matched by their bare name. Every count read out
 of the file (`e_shnum`, `sh_size`, …) is bounded, so a corrupt object is a
 typed error rather than a multi-gigabyte allocation.
 
+### USDT probe discovery (`usdt.zig`)
+
+`usdt.discover(gpa, path)` reads the `NT_STAPSDT` notes of `.note.stapsdt` (descriptor: `pc`, `base`, `semaphore` as three
+64-bit words, then provider, name and argument descriptor as NUL-terminated strings; name and descriptor each padded to 4
+bytes) and returns every probe **site**: a probe in an inlined function has several, `find(provider, name)` yields all.
+`pc` and `semaphore` are link-time addresses; the difference between the `.stapsdt.base` section's current address and the
+note's recorded `base` is added to both (prelink moves sections without rewriting notes), and each address is turned into a
+file offset through the allocated, file-backed section holding it (`error.UnmappedAddress` for `.bss` or nowhere). The
+offsets are exactly what `UprobeOptions` takes: `Probe.file_offset` is the uprobe offset and `Probe.semaphore_offset` the
+`ref_ctr_offset`. `argIter()` splits the argument descriptor into `{ size, signed, location }` (`-4@%edi`: four bytes,
+signed); decoding the location text is architecture-specific and left to the caller. `testdata/usdt_probe` is a real
+gcc/ld executable whose notes `readelf -n` confirms byte for byte (recipe in `usdt_probe.c`).
+
 ### tracepoints vs. raw tracepoints
 
 A `PERF_TYPE_TRACEPOINT` attachment hands the program the **formatted trace
@@ -1031,9 +1044,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the
   running kernel's BTF verifier predates them. Here `BPF_BTF_LOAD` simply fails and `LoadOptions.load_btf = false` is the
   escape hatch.
-- **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the semaphore a USDT probe needs, but finding it means
-  parsing the `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the argument descriptor string), a
-  separate parser on top of `elfsym`.
 
 ### Priority order
 

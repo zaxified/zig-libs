@@ -245,6 +245,12 @@ pub const MapUpdateFlags = map.UpdateFlags;
 pub const devmapSet = map.devmapSet;
 pub const cpumapSet = map.cpumapSet;
 
+pub const usdt = @import("usdt.zig");
+/// USDT / SystemTap probe discovery: `ebpf.usdt.discover(gpa, "/path/to/bin")`.
+pub const UsdtProbe = usdt.Probe;
+pub const UsdtProbeSet = usdt.ProbeSet;
+pub const discoverUsdt = usdt.discover;
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;
