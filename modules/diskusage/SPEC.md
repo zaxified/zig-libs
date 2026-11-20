@@ -283,8 +283,8 @@ who wants both would otherwise walk the tree twice.
 easiest thing to get wrong here. `du --apparent-size -B1` reports `0` for an
 empty ext4 directory whose `st_size` is 4096, and uutils' `du` agrees;
 symlinks, FIFOs and regular files are all counted by their `st_size` in the
-same run. Neither tool documents it. Including directories (the obvious first
-implementation, and the one this module shipped for about an hour) makes every
+same run. Neither tool documents it. Including directories (the obvious
+implementation) makes every
 apparent-size total disagree with `du` by the sum of every directory's
 `st_size` in the tree. `allocated_bytes` does include directories: a directory
 really does occupy the blocks it occupies.
@@ -306,25 +306,15 @@ them, because following them is not `du`'s question and a followed symlink to
 an ancestor makes the traversal non-terminating. The fixture carries a
 `loop.lnk -> ..` for exactly that reason.
 
-⚠ **Until the first audit (2026-09-04) this sentence was true of the `lstat`
-and false of the `openat` one line later.** The descent decision is made from
-`stat.lstatAt`, which carries `AT_SYMLINK_NOFOLLOW`; the descent itself was
-`std.Io.Dir.SelectiveWalker.enter`, which calls `openDir(..., .{ .iterate =
-true })` — and `OpenOptions.follow_symlinks` defaults to **true**, so that
-`openat` carried no `O_NOFOLLOW`. A directory renamed away and a symlink
-renamed into its place between the two calls steered the walk out of the scan
-root, and `one_file_system` did not help, because the boundary had been
-evaluated on the entry that no longer existed.
-
-Measured against an attacker looping `renameat2(RENAME_EXCHANGE)`: the scan
-escaped its root on **1108 of 4000 runs (27 %)**, reporting 17,297,408 bytes
-for a 512,000-byte tree, with `Report.errors` at **0** throughout. std offers
-`enter` no `OpenOptions` seam, so `scanAt` now re-identifies what was actually
-opened — `(dev, ino)` of the opened fd against the `lstat` the decision was
-made on, the same answer GNU `fts` reaches in `fts_safe_changedir` — and
-reports `error.DirectoryChanged` on a mismatch. Re-measured after the fix:
-**0 escapes in 4000 runs**, 1119 reported errors, and with no attacker
-present 0 errors and a byte-identical total.
+The descent decision is made from `stat.lstatAt`, which carries `AT_SYMLINK_NOFOLLOW`; the descent
+itself is `std.Io.Dir.SelectiveWalker.enter`, which opens the directory with `follow_symlinks`
+defaulting to **true** and offers no `OpenOptions` seam. A directory renamed away and a symlink
+renamed into its place between the two calls would therefore steer the walk out of the scan root,
+and `one_file_system` would not help, because the boundary was evaluated on the entry that no longer
+existed. `scanAt` re-identifies what was actually opened — `(dev, ino)` of the opened fd against the
+`lstat` the decision was made on, the answer GNU `fts` reaches in `fts_safe_changedir` — and reports
+`error.DirectoryChanged` through `on_error` (counted in `Report.errors`) on a mismatch. The parallel
+walk opens with `O_NOFOLLOW` and makes the same re-check.
 
 **One filesystem (`du -x`): excluded entirely, not merely not descended.**
 ⚠ **The two reference implementations disagree here.** Measured on a fixture
@@ -334,7 +324,7 @@ root needed):
 * a cross-device *directory* — GNU and uutils both drop it completely: no
   output line, and its own 4096 bytes excluded from the parent's total. An
   implementation that only declines to descend, and still counts the mount
-  point, disagrees with both. This module's first attempt did exactly that.
+  point, disagrees with both.
 * a cross-device *file* (a bind-mounted file, the only way to make one) — GNU
   `du -x` drops it too (total 4096 where the plain run said 65536); uutils
   keeps it, applying the boundary to directories only.
@@ -367,24 +357,16 @@ Not applicable — no secret material is handled anywhere in this module.
   it. `toPosixPath` itself only `assert`s the absence of one — a crash in a
   safety-checked build, and in `ReleaseFast`, where `assert` compiles away, a
   silent truncation to whatever precedes the NUL: a caller would be told
-  about a shorter path than the one it actually gave. See the "Fuzzing"
-  subsection below.
+  about a shorter path than the one it actually gave. Each of the two entry
+  points carries its own check (see *Verification*).
 - Traversal depth is bounded only by memory: one frame per open directory,
   plus one owned path copy per open directory **only when a sink can read
-  it** (`on_directory` or `on_error` set).
-  ⚠ That last clause is the first audit's correction. `entry.path` is
-  relative to the scan root, so its LENGTH grows with depth: `n` frames x
-  O(n) bytes each is O(n^2) live bytes held simultaneously, and the old
-  sentence bounded the COUNT of copies while saying nothing about their
-  size — the bounds-the-wrong-quantity shape again. Measured with no sinks
-  at all (ReleaseFast, peak RSS): depth 5000 45 MB, 10000 144 MB, 20000
-  491 MB, 30000 **1021 MB** — 8.3x the 123 MB tree being measured. With the
-  copy skipped when nothing can read it: 11 / 21 / 42 MB at 5000 / 10000 /
-  20000, i.e. linear.
-- Every total saturates rather than wraps (`+|=`) — held by tests at every
-  accumulation site since the first audit, which found the claim true only of
-  `FileStat.allocatedBytes`: turning both `Totals.add` and `Totals.addEntry`
-  to `+%=` had left the suite green, and `entries` was a plain `+=` besides.
+  it** (`on_directory` or `on_error` set). `entry.path` is relative to the
+  scan root, so its LENGTH grows with depth: `n` frames x O(n) bytes each
+  would be O(n^2) live bytes held simultaneously, which is why the copy is
+  skipped when nothing can read it, leaving memory linear in depth.
+- Every total saturates rather than wraps (`+|=`): `FileStat.allocatedBytes`,
+  `Totals.add`, `Totals.addEntry` and the `entries` counter, each held by a test.
   A negative `st_size` or
   `st_blocks` from a corrupt or hostile filesystem is clamped to 0 rather than
   `@bitCast` into an astronomically large unsigned value that would dominate a
@@ -465,65 +447,6 @@ host that anchors `X8664Stat` and nothing else — the other eight families have
 no kernel here to run against, and the test says so in a comment rather than
 letting a green run imply more than it proves.
 
-**Mutation-proven.** Eight mutations were applied one at a time, each observed
-against the tests and then reverted and observed green again: hard-link
-de-duplication disabled; apparent size including directories; allocated size
-read from `st_size`; `AT_SYMLINK_NOFOLLOW` dropped; an unreadable directory
-made fatal; the one-filesystem comparison disabled; `decodeDev`'s major shift
-wrong by four bits; and — the one that matters most, given the missing `sz`
-check — `X8664Stat`'s `st_blksize` and `st_blocks` swapped *with the size
-assert kept satisfied*, so that only the `@offsetOf` half of the comptime
-assert and the live `statx` cross-check stand between it and silent wrong
-numbers.
-
-Two of the eight did not behave as a plain red:
-
-- **Dropping `AT_SYMLINK_NOFOLLOW` fails two tests and THEN hangs.** ⚠ This
-  entry used to read "does not fail a test; it hangs", and that is the
-  sentence a reader would use to decide whether the guard is covered by an
-  ordinary red. Re-run at the first audit, dropping the flag from `statxAt`:
-  `stat.test."lstatPath: does not follow the final symlink"` FAILs, then
-  `stat.test."both backends agree, field for field"` FAILs (expected 16749,
-  found 41471), and only then does the first `scan.zig` test hang. The
-  fixture carries `syms/loop.lnk -> ..`, so following the final symlink turns
-  the traversal into an unbounded descent through the fixture root. Killed at
-  240 s. A recorded mutation result needs its exact site and a re-run
-  command, or it ages into a claim nobody can check. That is the strongest available statement of why there is no
-  follow-symlinks option: the failure mode is non-termination and unbounded
-  memory growth, not a wrong number.
-- ⚠ **Disabling the one-filesystem check SURVIVED the first run**, and the
-  reason was a defect in the test rather than in the module. The `/sys/fs`
-  boundary test guarded itself with "if the scan reports nothing skipped,
-  `error.SkipZigTest`" — a precondition read off the very mechanism under
-  test, so the mutation made the test *skip*, and a skip is a pass. The guard
-  now counts boundary children with `stat.lstatAt` directly, independently of
-  `scanAt`, and the same mutation turns it red. A precondition may never be
-  read off the mechanism under test.
-
-**Fuzzing.** `lstatPath`'s `path` is not this module's wire format — it is
-handed straight to the kernel — so `stat.zig` carries a `testing.fuzz(`
-harness on it with a narrower contract than a decoder's: never panic, and
-never act on a different path than the bytes actually given, for arbitrary
-byte content (embedded NUL, non-UTF8 bytes, a path past `PATH_MAX`, one that
-is all slashes). It found `StatError.InvalidPath` above — the harness is what
-turned up the `toPosixPath` assert/truncate hazard, not an audit reading the
-source. `scan.scanAt` does **not** get a second harness: one would have to
-walk the real filesystem on fuzzer-controlled input, exactly the
-unbounded-traversal risk the symlink mutation above already demonstrates.
-⚠ Nor is it covered by `lstatPath`'s — an earlier revision of this paragraph
-claimed `scanAt` "shares the same entry point", and it does not: `scanAt`
-carries its own copy of the NUL check and its own `toPosixPath` call, then
-goes straight to `stat.lstatAt`, so no input to the harness can ever reach
-`scan.zig`'s guard. Measured, *before* the test named below existed: making
-the check in `scanAt` unreachable left `zig build test-diskusage` at exit 0,
-while the same treatment of `stat.zig`'s `lstatPath` gave exit 1 (the fuzz
-harness aborting on `toPosixPath`'s assert). What covers the duplicate
-is a duplicate test — `scan.zig`'s "a path with an embedded NUL is refused,
-not scanned as its prefix", which calls `scanAt` directly with a NUL whose
-prefix is a real directory in the fixture (the shape a truncating build
-answers *successfully* about). Both guards are mutation-proven, each against
-its own test: removed, red; restored, green.
-
 ## What is deliberately not done
 
 - **Following symlinks (`du -L`/`-D`).** Not `du`'s default, not this
@@ -543,47 +466,64 @@ its own test: removed, red; restored, green.
   extension when a consumer needs one.
 - **`statfs`, mount tables, filesystem type.** That is `diskfree`. Neither
   module imports the other.
+- **A `sparc64` `fstatat` fallback.** Two independent measurements agree that
+  syscall 289 (`fstatat64`) fills the **`stat64`** shape there, which is
+  field-for-field `X8664Stat`: the header oracle (`struct stat` 104 bytes with
+  `blocks` at 80; `struct stat64` 144 bytes with `blocks` at 64) and a
+  raw-buffer dump under qemu-sparc64. `family` stays `.none` anyway, because the
+  only live oracle available **truncates `st_dev`** (the same qemu artifact as
+  i386), and `st_dev` is half of the `(dev, ino)` identity that hard-link
+  de-duplication and the `-x` boundary both turn on: a wrong `dev` is silent and
+  changes totals. Mapping it on offsets alone would trade a loud
+  `error.Unsupported` for a quiet wrong number. 32-bit `sparc` is untouched by
+  either measurement; `m68k` fails to build (compiler_rt) and `xtensa` has no
+  Zig backend.
 
-## Audit 2026-11-17 (whole-module mutation)
+## Verification
 
-350 mutants over every non-test line of `src/stat.zig`, `src/scan.zig` and `src/parallel.zig`: the `FileStat` identity and kind tests, `detect`, both stat backends (flags, errno, mask check, every copied field), `decodeDev`, `mapErrno`, `clampNonNegative`, `Totals`, the sequential walk (root and file handling, error counting and reporting, the one-filesystem boundary, the prune predicate, hard-link de-duplication, frames and subtotals, the identity re-check of the descent, `classify`), and the parallel walk (the node and reference accounting, completion folding, abort and discard mode, counters merge, worker loop, open and identity re-check, listing, path building, queueing). Five schemata builds (one of them an unmutated compile after a kit input error).
+Run: `scripts/modtest diskusage` (the module's tests, in `src/stat.zig`, `src/scan.zig`, `src/parallel.zig`);
+`zig build example-diskusage` builds the du-shaped demo that the oracle diffs run against.
 
-257 mutants died on the existing suite (3 as hangs), 90 survived the first round. Tests added at the end of each file: `FileStat.id`/`device` with distinct major and minor, `detect` against an independent probe, `clampNonNegative(1)`, every `mapErrno` arm, a path beyond PATH_MAX, a plain-file scan through the sink, `currentPath`, an entry that vanishes after it was listed (the first `should_descend` call deletes its siblings, so the outcome is the same for any listing order) in sequential and parallel scans, `should_descend` and `on_directory` and `on_error` each alone (root-relative paths and depths), the one-filesystem boundary in a parallel scan, descriptors closed after a parallel scan, `mergeCounters` saturation, a one-shot failing allocator (`OnceFailing`: exactly one allocation fails, then normal service, so a site that swallows the failure is not rescued by a later one, unlike `std.testing.FailingAllocator`, which keeps failing) for both walks, and the TOCTOU swap made deterministic: `should_descend` runs between the `lstat` and the open, and renames the directory away and puts a new one (or a symlink) in its place, so the identity re-check, its error path, and the parallel open's `O_NOFOLLOW` are exercised without any timing window. 312 mutants die in total.
-
-38 do not die, none of them a defect:
-
-- 20 EQUIVALENT: `|` for `^` in the device key and `decodeDev` (disjoint bits); the two backends swapped or overridden (they are specified to agree); clamp of 0; cost-only link-set guards (`nlink > 1`, `!isDir`); dead stores after the last use (`n.dir`, the finished node's `pending`); a name never freed that `processNode` has already freed; the 256-byte name buffer bound (NAME_MAX is 255); `oom` break after an abort already set; spurious or missing wake-ups and a missing extra worker (cost only); an aborted run continuing to open directories (its Report is discarded).
-- 18 UNOBSERVABLE: a kernel without `statx`, an automount point, a filesystem declining a stat field, a filesystem reporting `d_type` unknown, two devices with colliding inode numbers, a getdents failure inside a walk (6 mutants: error counting, reporting, `currentPath` use, frame paths of an `on_error`-only scan, the parallel listing error), a name beyond NAME_MAX, a second worker aborting mid-listing (2), cancelation of the calling task (2), and the root's `follow_symlinks` (the identity re-check refuses whatever it opens).
-
-Not mutated: the per-architecture `fstatat` structs and their comptime layout asserts, the `family` table and `fstatat_available` (comptime; the x86-64 layout is exercised by the backend-agreement test), mutex lock/unlock pairs, doc comments. Counts on the card are whole-module.
-
-## Backlog / deferred
-
-None open. Both 2026-09-30 survey items — parallel traversal and a prune
-predicate — are built (see "Parallel traversal" and "Pruning" under
-Wire format / algorithm).
+- **Stat layer** (`src/stat.zig`): `FileStat` identity and kind tests (distinct major and minor), `detect`
+  against an independent probe, both backends agreeing field for field on the same paths, every `mapErrno`
+  arm, `decodeDev`, `clampNonNegative`, `lstatPath` (final symlink not followed, a path beyond `PATH_MAX`,
+  embedded NUL), and the per-family `@sizeOf`/`@offsetOf` comptime asserts.
+- **Sequential walk** (`src/scan.zig`): a fixture tree (sparse file, hard-linked pair, valid and dangling
+  symlink, a `loop.lnk -> ..`, unreadable directory, FIFO, empty file, nest), root and plain-file scans, error
+  counting and reporting, the one-filesystem boundary, hard-link de-duplication, frames and subtotals,
+  `should_descend` and each sink alone (root-relative paths and depths), an entry that vanishes after it was
+  listed, a path beyond `PATH_MAX`, saturation at each accumulation site, the TOCTOU swap made deterministic
+  (`should_descend` renames the directory away and puts a new one or a symlink in its place, so the identity
+  re-check and the parallel open's `O_NOFOLLOW` run without a timing window), and a one-shot failing allocator
+  (exactly one allocation fails, then normal service) for both walks.
+- **Parallel walk** (`src/parallel.zig`): differential tests against the sequential walk (every `Report`
+  counter and, without cross-directory hard links, every subtotal) on a generated tree at 2, 3, 8 and
+  one-per-CPU workers; post-order; an unreadable directory; a failing sink; an allocation-failure sweep;
+  descriptors closed afterwards; counter-merge saturation; the one-filesystem boundary; the worker cap.
+- **Oracles** (see *Anchoring*): `du -B1` of GNU coreutils and uutils on tmpfs and ext4 (the demo diffed
+  byte for byte), `tools/stat-layout-probe.sh` (kernel UAPI headers compiled per architecture), and
+  `tools/qemu-runtime-oracle.sh` (the module's API run under `qemu-<arch>` and diffed field for field against
+  `stat(1)`, covering all nine `fstatat` families across 17 architectures; qemu-i386 truncates `st_dev` to
+  the 16-bit form, a qemu artifact the comparison recognises).
+- **Fuzz:** the driver harness `diskusage-lstat` (`DISKUSAGE_FUZZ=<runs>[,<first seed>]`, shared plumbing in
+  `src/fuzz_test.zig`) feeds `lstatPath` arbitrary bytes — an embedded NUL, non-UTF8, a path past `PATH_MAX`,
+  all slashes — and requires that it never panics and never acts on a path other than the bytes given.
+  `scanAt` has no harness of its own: one would walk the real filesystem on fuzzer-controlled input, the
+  unbounded-traversal risk the no-follow decision exists to avoid. Its own copy of the NUL check is covered by
+  a dedicated test ("a path with an embedded NUL is refused, not scanned as its prefix"), which calls `scanAt`
+  with a NUL whose prefix is a real directory in the fixture, the shape a truncating build would answer
+  successfully.
+- **Mutation:** not mutated: the per-architecture `fstatat` structs and their comptime layout asserts, the
+  `family` table and `fstatat_available` (comptime; the x86-64 layout is exercised by the backend-agreement
+  test), mutex lock/unlock pairs, doc comments. Unobservable classes (a kernel without `statx`, an automount
+  point, a filesystem declining a stat field or reporting `d_type` unknown, colliding inode numbers across
+  devices, a `getdents` failure inside a walk, a name beyond `NAME_MAX`, cancelation of the calling task)
+  need an environment the tests cannot construct.
+- **ctgrind:** n/a, no secret material.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Open
 
-- ~~Eight of the nine `fstatat` struct families have no live kernel here to
-  syscall against.~~ **CLOSED by the first audit (2026-09-04), by qemu-user.**
-  `qemu-arm`/`qemu-mips`/`qemu-i386`/`qemu-aarch64` and their siblings thunk
-  guest syscalls through their own independent transcription of each
-  architecture's `struct stat` — a foreign implementation of exactly what
-  this module hand-transcribed. **199 field-set comparisons across 17
-  architectures covering all nine families**, diffed against `stat(1)`.
-
-  The oracle was itself checked for the failure it exists to catch: with the
-  struct and its `comptime` assert mutated *together* (`blocks` at 4096
-  instead of 16 — compiles clean, suite green, which is the one class the
-  size pin structurally cannot see), the qemu comparison catches it. Five
-  mismatches out of 199 are one documented artifact, confirmed by raw buffer
-  dump to be qemu's rather than this module's: **qemu-i386 truncates `st_dev`
-  to the 16-bit `old_encode_dev` form**.
-
-  There is still **no `EINVAL` safety net** here, unlike `diskfree`'s
-  `statfs64` wrapper — `fstatat` has no size argument, so a layout error
-  stays silent. That is why this anchor matters more here than there.
 - `Generic32Stat64` is probe-verified through **hexagon** (and, redundantly,
   riscv32, which has no `fstatat` to use it with). It is also mapped to
   **arc, arceb, csky and or1k**, which this toolchain cannot target — those
@@ -592,30 +532,16 @@ Wire format / algorithm).
   alignment is taken on trust rather than measured. `diskfree`'s
   `NaturalGeneric32` carries the same caveat for the same reason; unlike it,
   this one has no `EINVAL` net.
-- `sparc`/`sparc64`, `m68k`, `xtensa`, `x32` and mips64 n32 have no fallback
-  (`family = .none`) — see "Architectures that get no fallback". On those, a
-  pre-4.11 kernel yields `error.Unsupported`.
-
-  ⚠ **sparc64's pairing is now answered, and deliberately not acted on.** Two
-  independent measurements at the first audit agree that syscall 289
-  (`fstatat64`) fills the **`stat64`** shape, which is field-for-field
-  `X8664Stat`: the header oracle (`struct stat` 104 bytes with `blocks` at 80;
-  `struct stat64` 144 bytes with `blocks` at 64) and a raw-buffer dump under
-  qemu-sparc64 (`nlink` at +016, `mode` at +024, `size` at +048, `blocks` at
-  +064, big-endian). `SYS.fstatat64 = 289` exists in Zig 0.16's `Sparc64`
-  table. It stays `.none` anyway, because the only live oracle available
-  **truncates `st_dev`** (the same qemu artifact as i386), and `st_dev` is
-  half of the `(dev, ino)` identity that hard-link de-duplication and the
-  `-x` boundary both turn on: a wrong `dev` is silent and changes totals.
-  Mapping it on offsets alone would trade a loud `error.Unsupported` for a
-  quiet wrong number. 32-bit `sparc` is untouched by either measurement;
-  `m68k` fails to build (compiler_rt) and `xtensa` has no Zig backend.
 - The `-x` divergence between GNU and uutils on a cross-device *file* is
   recorded as measured behaviour of both; nothing here establishes which is
   the intended one. This module follows GNU.
 - `du`'s "directories contribute 0 to apparent size" rule is likewise measured
   from two implementations, not read from either one's documentation or
   source.
+
+## Backlog / deferred
+
+None open.
 
 ## Provenance
 

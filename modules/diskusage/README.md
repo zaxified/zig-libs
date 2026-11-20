@@ -18,8 +18,7 @@ the two tools it mirrors.
 Provenance: clean-room from `du(1)`'s observable behaviour, `statx(2)`, and
 the kernel UAPI headers (`include/uapi/asm-generic/stat.h` plus the
 per-architecture overrides in `arch/{x86,arm,mips,powerpc,s390}/include/uapi/
-asm/stat.h`) — no third-party source ported, so no `NOTICE` entry is required
-(root [`NOTICE`](../../NOTICE) §0). GNU coreutils' `du` and uutils' `du` are
+asm/stat.h`) — no third-party source ported, so the module has no `NOTICE`. GNU coreutils' `du` and uutils' `du` are
 used purely as black-box compatibility oracles, which needs no entry either
 (CONVENTIONS.md §5). The one committed non-source file, `tools/stat-layout-probe.sh`,
 is our own tooling: it holds no data, and the layout numbers it reports are generated
@@ -190,17 +189,8 @@ that knows that ABI and prints the `sizeof`/`offsetof` numbers that must match
 `src/stat.zig`'s `assertLayout` calls. SPEC.md says why that oracle is
 load-bearing here in a way it is not for `diskfree`.
 
-## DEFER (beyond this module's current scope)
+## Not provided
 
-- Following symlinks (`du -L`/`-D`) — not `du`'s default, and an invitation to
-  a non-terminating traversal.
-- `--threshold`, `--separate-dirs`, `--inodes`, `--time` and `--exclude`'s
-  pattern language — reporting and filtering policy a caller can express over
-  `DirSink` and `Report` (pruning itself is `should_descend`).
-- Human-readable / block-size formatting: exact bytes only, for the same
-  reason `diskfree` computes no use-percentage.
-- A per-entry sink (`du -a`) — a small symmetric extension, deferred until a
-  consumer needs it.
-- An `fstatat` layout for sparc/sparc64, m68k, xtensa, x32 and mips64 n32.
-  Those are `statx`-only and return `error.Unsupported` on a pre-4.11 kernel,
-  rather than guessing at a struct with no loud-failure mode.
+Following symlinks, `du`'s reporting and filtering flags, block-size formatting, a per-file sink and
+`statfs`/mount queries are left out on purpose; `statx`-only architectures return `error.Unsupported`
+on a pre-4.11 kernel. SPEC.md *What is deliberately not done* has each reason.
