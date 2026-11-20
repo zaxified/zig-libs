@@ -109,6 +109,12 @@ seed (passphrase `"TREZOR"`) → BIP-32 master xprv, every step byte-exact,
 including a round-trip back to entropy and a checksum-tamper positive
 control.
 
+## Not provided
+
+English wordlist only and no NFKD normalisation of mnemonic or passphrase (a non-ASCII passphrase must be
+pre-normalised by the caller), no BIP-44 purpose-field policy in `parsePath`, no WIF or address derivation
+(see `btcaddr`). See SPEC *What is deliberately not done* and *Backlog / deferred*.
+
 Provenance: see [SPEC.md](SPEC.md) (public-spec merger-doctrine note; no
 attribution is required for the BIP-39/BIP-32 algorithms themselves) and
 [NOTICE](NOTICE) for the third-party test vectors embedded in `src/`.

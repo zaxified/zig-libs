@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd (`btcutil/hdkeychain`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | HD keychain with network params; BIP39 lives in third-party `go-bip39` (not surveyed). |
 | [vrischmann/zig-bip39, loftafi/bip39](https://github.com/loftafi/bip39) | Zig | MIT | 0–1 | 2022-12 / 2025-04 | Mnemonic-only Zig packages, one push each and little activity. Zig `std` has neither BIP32 nor BIP39. |
 
-**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement. **Where we are behind:** English wordlist only, no NFKD normalisation of passphrase/mnemonic, (SLIP-132 ypub/zpub prefixes added 2026-11-19), no WIF export here (WIF lives in the sibling `btcaddr` module).
+**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement; SLIP-0132 prefixes (`ypub`/`zpub`/…) as a separate pair of calls. **Where we are behind:** English wordlist only and no NFKD normalisation of passphrase/mnemonic (both open, see *Backlog / deferred*), no WIF export here (WIF lives in the sibling `btcaddr` module).
 
 ## Design
 
@@ -93,7 +93,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `error.MaximumDepthExceeded` from `ckdPriv`, `ckdPrivWithParentPub`, `ckdPub` and
   `derivePath` (a path crossing 255 fails as a whole, `out` untouched) — the
   behaviour of rust-bitcoin (`MaximumDepthExceeded`), bitcoinjs (`Depth too large!`)
-  and btcd (`ErrDeriveBeyondMaxDepth`); before 2026-11-17 the depth wrapped to 0.
+  and btcd (`ErrDeriveBeyondMaxDepth`); a wrapped depth would yield a child with depth 0 and a
+  non-zero parent fingerprint, which `parseExtended` itself refuses.
   **One deliberate over-conservative deviation**: `IL ≡ 0 (mod n)` on the
   public-derivation path is treated as an `InvalidChildKey` rejection
   (because `combMulBase` errors on a zero scalar), whereas a strict reading
@@ -129,23 +130,64 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   84/86 purpose-field policy is enforced — this module derives whatever path
   string it's given; a wallet layer building on this owns purpose-field
   validation.
+- **`neuter` / `neuterInto`**: `neuter(priv)` returns the `ExtendedPubKey` by value, as rust-bitcoin's
+  `Xpub::from_xpriv` and bitcoinjs's `neutered()` do. The by-value result is copied through the return
+  path, so a copy of the chain code (public to the caller, but the ingredient that turns one leaked
+  non-hardened child key into the parent key) can stay on the dead stack below the call; see the
+  *Threat model*. `neuterInto(priv, *out)` is the security-first form: it writes the caller's own
+  storage, writes `out` only on success and keeps no copy; `neuter` is a thin wrapper over it.
+- **Network is explicit**: `serializePriv`/`serializePub`/`parseExtended` take a `Network`
+  (`.mainnet` = `0x0488ADE4`/`0x0488B21E`, `.testnet` = `0x04358394`/`0x043587CF`, BIP-32 §
+  "Serialization format"). `parseExtended` accepts only the requested network; the other network's
+  version bytes are `error.WrongNetwork`, anything else `error.UnknownVersion`. BIP-32 has no testnet
+  vectors, so the testnet KAT is Test Vector 1's master re-encoded with testnet version bytes by an
+  independent Python Base58Check implementation (see `kat_test.zig`).
+- **SLIP-0132 prefixes**: `slip132_table` holds the ten Bitcoin rows of SLIP-0132
+  (`xpub/ypub/zpub/Ypub/Zpub`, `tpub/upub/vpub/Upub/Vpub` and the private
+  counterparts; version words and prefixes as published); `slip132Entry(network, script)`
+  and `slip132Find(version)` look them up. `serializePrivSlip132`/`serializePubSlip132`
+  write a chosen prefix; `parseSlip132` accepts every registered word on either network
+  and returns the row (network and script type; public/private is the tag of the
+  parsed key), any other word is `error.UnknownVersion`, every other check is
+  `parseExtended`'s. Reference behaviour: the SLIP-0132 registry itself; of the surveyed
+  libraries the reference (rust-bitcoin `Xpub::decode`) takes only the BIP-32 pair, while
+  bitcoinjs/bip32 (`fromBase58(str, network)`) and scure-bip32 (`fromExtendedKey(str,
+  versions)`) take the version words from the caller — so the default entry points,
+  `serializePriv`/`serializePub`/`parseExtended`, accept only the BIP-32 pair (a `ypub` is
+  `UnknownVersion` there) and SLIP-0132 is a separate pair of calls, never implied by a
+  network. The script type is a label the sender chose; the key bytes are an ordinary
+  BIP-32 key under any prefix and nothing here derives an address. Other coins'
+  rows of the registry are not included (their words collide with Bitcoin's).
+  KATs: the registry's own test vectors (mnemonic `abandon ... about`, accounts
+  `m/44'/0'/0'`, `m/49'/0'/0'`, `m/84'/0'/0'`, six strings derived and compared) and the
+  `m/84'/0'/0'` key under all ten pairs (the eighteen strings the registry does not
+  publish were made by an independent Base58Check implementation from the published
+  zpub/zprv by swapping the version word; each string's four-letter prefix is asserted
+  against the registry).
 
 ## Threat model / scope caveats
 
-- **Secret residue on the dead stack** (review 2026-10-08, `src/stackprobe_test.zig`,
-  ReleaseFast). Wiping named buffers did not keep secrets off the stack: before the fix every
-  secret-handling entry point left its secret in dead callee frames (seed, master key and chain
-  code ×1-2 per call in big-/little-endian and SHA-512 word image; `ckdPriv` the parent key and
-  the child key ×4; `parseExtended` the parsed key; the bip39 functions the entropy or
-  `SHA-512(mnemonic)`). Fix, in two parts measured separately: (1) every public entry point
-  runs its body one frame down (`noinline`) and then zeroes `stack_burn` bytes (16 KiB bip32,
-  8 KiB bip39, volatile vector stores) at that depth — that removed all but one copy of the
-  RESULT key per call; (2) that last copy sat in the caller's own frame (the inlined wrapper's
-  error-union temporary, seen in the disassembly), so secret results go to an out-parameter
-  and `ExtendedPrivKey` parameters are pointers. After both: 0 residues in 30 needles over
-  11 entry points × 3 calls, negative control 0, positive control 1. The probe asserts it in
-  the ReleaseFast lane (skips in Debug/ReleaseSafe, where `undefined` is filled). What it does
-  not cover: the caller's own `ExtendedPrivKey` (its `deinit` is the caller's), and registers.
+- **Secret residue on the dead stack** (`src/stackprobe_test.zig`, ReleaseFast). Wiping named buffers
+  does not by itself keep secrets off the stack: a secret-handling entry point leaves its secrets in
+  dead callee frames. Every public entry point therefore runs its body one frame down (`noinline`) and
+  then zeroes `stack_burn` bytes (16 KiB bip32, 8 KiB bip39; volatile vector stores) at that depth,
+  and secret results go to an out-parameter with `ExtendedPrivKey` parameters as pointers, because the
+  last copy of a result otherwise sits in the caller's own frame (the inlined wrapper's error-union
+  temporary). The probe holds every secret the module derives (seed, master key and chain code,
+  derived keys, a parsed key, entropy, `SHA-512(mnemonic)`; each in its big-/little-endian and
+  SHA-512 word images) to zero residue after the entry points, with a negative and a positive
+  control, and asserts in the ReleaseFast lane (it skips in Debug/ReleaseSafe, where `undefined` is
+  filled). What it does not cover: the caller's own `ExtendedPrivKey` (its `deinit` is the caller's),
+  and registers. The exception is `neuter`: it returns its `ExtendedPubKey` by value, so a copy of
+  the chain code stays on the dead stack below the call (a `noinline` body plus `burnStack` does not
+  remove it; the copy sits above the burn), and the probe does not hold `neuter` to the plain
+  chain-code needle (the private key and the SHA-512 word image of the chain code still apply). It
+  is a copy of an output the caller holds, not private-key material; a caller that needs it off the
+  dead stack uses `neuterInto`, which the probe holds to every needle. Entry points that take or
+  return public extended keys by value without a burn (`ckdPub`, `serializePub`, `fingerprint`)
+  handle only public data and are not probed; the SLIP-0132 entry points are not probed either (they
+  share `serializePrivBody` / `parseExtendedBody` with the covered `serializePriv` / `parseExtended`).
+  The ReleaseSmall variant of the probe runs in no CI lane.
 - **Secret-material handling**: every stack buffer this module allocates
   that can hold private-key-derived bytes (`HMAC-SHA512` outputs in
   `masterFromSeed`/`ckdPriv`, the hardened-derivation `0x00 ‖ privkey ‖
@@ -153,29 +195,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   raw Base58Check-decoded payload in `parseExtended` after the private
   scalar has been copied out) is `secureZero`'d before the owning function
   returns. `ExtendedPrivKey.deinit` zeros the long-lived struct's `privkey`
-  + `chain_code`; `ExtendedPubKey.deinit` zeros its `chain_code` (see the
-  "public-parent + private-child" note below for why that field, though not
-  itself secret, is worth wiping) — call the relevant one once a derived key
-  is no longer needed. This module does **not** claim full constant-time
-  hardening against microarchitectural side channels beyond what `k256`'s
-  own field/group/scalar operations already provide, and that qualifier
-  matters more here than the phrase "the same posture as this repo's other
-  Bitcoin/Lightning modules riding `k256`" used to suggest: `bip32.zig`'s own
-  CKD control flow (the hardened-vs-normal branch on `index`) is public
-  information anyway, so it costs nothing to leave unhardened — but
-  `bip39.zig`'s mnemonic path calls **no `k256` code at all**. `wordIndex`
-  (audit 2026-09-06: a binary search branching and indexing the table on the
-  secret mnemonic word at every step, 601 valgrind/memcheck-flagged ERRORS on
-  `validateMnemonic` alone) was rewritten 2026-09-16 (finding M6-CT) into a
-  full linear scan over all 2048 entries with a branchless masked select —
-  see the `mnemonic` row below. The word SPLIT (locating spaces in the raw
-  mnemonic text) is unchanged and still leaks word boundaries; see that row's
-  notes.
+  + `chain_code`; `ExtendedPubKey.deinit` zeros its `chain_code` (not itself
+  secret, but see the "watch-only `xpub`" note below for why it is worth wiping)
+  — call the relevant one once a derived key is no longer needed. This module
+  does **not** claim full constant-time hardening against microarchitectural side
+  channels beyond what `k256`'s own field/group/scalar operations already
+  provide. `bip32.zig`'s own CKD control flow (the hardened-vs-normal branch on
+  `index`) is public information anyway, but `bip39.zig`'s mnemonic path calls
+  **no `k256` code at all**: `wordIndex` is a full linear scan over all 2048
+  entries with a branchless masked select (a binary search would branch and
+  index the table on the secret mnemonic word at every step); see the
+  `mnemonic` row below. The word SPLIT (locating spaces in the raw mnemonic
+  text) still leaks word boundaries; see that row's notes.
 
-  **Measured by the ctgrind gate since 2026-09-16** (audit finding M6):
-  `src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh bip32`. zig 0.16.0, x86_64,
-  ReleaseFast; every untainted control and no-`-fvalgrind` trap is 0,
-  unattributed 0.
+  **Measured by the ctgrind gate** (`src/ctgrind_harness.zig`,
+  `scripts/checks/ctgrind.sh bip32`; x86_64, ReleaseFast; every untainted
+  control and no-`-fvalgrind` trap is 0, unattributed 0):
 
   | target | tainted | total | in-file | witness |
   |---|---|---|---|---|
@@ -185,84 +220,47 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   | `mnemonic` — `mnemonicToEntropy` | mnemonic | 5 | **3** | 2 |
   | `xprv` — `serializePriv` + `parseExtended` | master private scalar | 2 | **0** | 2 |
 
-  - `xprv` (new 2026-10-18): measured first on the old variable-time
-    `checkEncode`/`checkDecode` — 12 in-file, all in `bech32`'s base58
-    `encode` (`alphabet[d]` and the carry loops), witness 0 because the
-    table load left the string "defined" and hid the decode side. On
-    `checkEncodeSecret`/`checkDecodeSecret`, with the public header
-    declassified and the scalar range checked by `scalarInRange`: 0, and the
+  - `xprv` runs on `checkEncodeSecret`/`checkDecodeSecret` with the public header
+    declassified and the scalar range checked by `scalarInRange`: 0 in-file, and the
     taint reaches the printed key (witness 2). The row's source digest covers
     `bip32.zig` only; re-run `--check bip32` after a `bech32` base58 edit.
-
-  - `master` 1 and `derive`'s `bip32.zig:275`: the `IL == 0` / child-key
-    `== 0` tests (`std.mem.allEqual`), each compiled to one `vptest; je` —
-    a verdict of a check that fails with probability ~2^-127, not a branch
-    per byte (disassembly, 2026-09-16).
-  - `derive`'s other 4: `k256`'s `combMulBase` identity rejection on the
-    PARENT PUBLIC KEY (`group.zig:380`, 2 addresses) and std's canonicity
-    verdict on the scalars `scalar.add` parses (`common.zig:75`, 2) — the
-    classes `k256`'s own rows already document. The contexts of all five
-    derivation steps share these addresses.
-  - Re-measured 2026-10-08 after the dead-stack fix: `master` 2 is the same
-    `IL == 0` test (`bip32.zig:181`) inlined into `masterFromIL` and compiled
-    to two branches; `derive` 25 is the same five source contexts reached
-    from five return addresses (LLVM unrolled `derivePathBody`'s loop in the
-    harness build, so memcheck stops merging the five steps). No new source
-    line; context diff in `scripts/checks/ctgrind-expected.tsv`.
-  - Re-measured 2026-11-13 after `k256`'s affine comb (G4 wave): `derive` 25 → 20. The comb's
-    endpoint identity check is now `rejectIdentityOneBranch`, one address instead of two, in each
-    of the five unrolled steps; no `bip32` source changed.
+  - `master` 2: the `IL == 0` test (`std.mem.allEqual`) inlined into `masterFromIL`
+    and compiled to two branches — a verdict of a check that fails with probability
+    ~2^-127, not a branch per byte (disassembly).
+  - `derive` 20: the child-key `== 0` test of the same kind, `k256`'s `combMulBase`
+    identity rejection on the PARENT PUBLIC KEY (`rejectIdentityOneBranch`, one
+    address) and std's canonicity verdict on the scalars `scalar.add` parses — the
+    classes `k256`'s own rows document. They are the same few source contexts
+    reached from five return addresses: LLVM unrolls `derivePathBody`'s loop in
+    the harness build, so memcheck does not merge the five steps. Context diff in
+    `scripts/checks/ctgrind-expected.tsv`.
   - `seed`: PBKDF2-HMAC-SHA512 over the mnemonic is branch-free.
-  - `mnemonic` 3 in-file, 2 witness (2026-09-16, finding M6-CT — `wordIndex`
-    rewritten from a binary search to a full 2048-entry linear scan with a
-    branchless `0 -% @intFromBool(cond)` mask-select, the same idiom
-    `ed448`'s `ctSelectPoint`/`Fe.ctSelect` use): the count did **not** drop
-    to 0 — it changed COMPOSITION. Before: `findScalarPos`
-    (`bip39.zig:100`, word split, unchanged) + `wordIndex`'s own binary
-    search (`std.mem.order`, old `bip39.zig:219`, 2 addresses — the search
-    PATH and which table entry got compared depended on the word: the actual
-    cache/branch-timing channel this finding named). After: `findScalarPos`
-    (unchanged, out of this finding's scope — see the paragraph above) +
-    `wordIndex`'s own found/not-found verdict (`bip39.zig:267`) +
-    `mnemonicToEntropy`'s checksum verdict (`bip39.zig:155`, M9). Both new
-    lines are `if` statements deciding the function's OWN return value
-    (`WordNotInList` / `InvalidChecksum` vs. success) — information the
-    caller already gets from the return value regardless of timing, same
-    "verdict is public, the path to it is not" class M9's own fix
-    established; `mnemonicToEntropy`'s entropy-bit-assembly loop
-    (`bip39.zig:129`) was rewritten branchless in the same change so `idxs`
-    — now genuinely secret-dependent DATA, where the old binary search's
-    result was accidentally clean under this memcheck-based tool (an
-    artifact of NOT tracking control-flow-only/implicit taint, not a real
-    guarantee) — does not open a NEW branch there. The 2 witness contexts
-    are the harness's own `entropy={x}` print (the declassification-free
-    propagation witness, expected). Positive control (2026-09-16, this fix):
-    reverting `wordIndex` to the old binary search reproduces the exact old
-    3 in-file / 0 witness split at the exact old lines (`bip39.zig:100`,
-    `:219`×2).
+  - `mnemonic` 3 in-file, 2 witness: the word split (unchanged, out of scope of the
+    masked `wordIndex`), `wordIndex`'s own found/not-found verdict and
+    `mnemonicToEntropy`'s checksum verdict. The last two are `if` statements
+    deciding the function's OWN return value (`WordNotInList` / `InvalidChecksum`
+    vs. success) — information the caller gets from the return value regardless of
+    timing: the verdict is public, the path to it is not. `mnemonicToEntropy`'s
+    entropy-bit-assembly loop is branchless, so `idxs` — genuinely secret-dependent
+    DATA, accidentally clean under this memcheck-based tool, which does not track
+    control-flow-only taint — opens no new branch there. The 2 witness contexts
+    are the harness's own `entropy={x}` print (the propagation witness, expected).
 
-  Positive control (harness-level, 2026-09-16 creation): one branch on a
-  secret byte inserted into each target's function adds exactly one context
-  (`master` 1 → 2, `derive` 5 → 6, `seed` 0 → 1) — not re-verified for
-  `mnemonic` after the M6-CT rewrite above; that row's own before/after
-  revert (above) is its positive control instead.
+  Positive controls: one branch on a secret byte inserted into the target's
+  function adds exactly one context for `master`, `derive` and `seed`; the
+  `mnemonic` row's control is reverting `wordIndex` to a binary search, which
+  reproduces the old 3 in-file / 0 witness split at the old lines.
 - **BIP-39 checksum comparison: constant iteration count, not a constant-time
-  proof**: `mnemonicToEntropy` used to return `error.InvalidChecksum` as soon
-  as it found a mismatching checksum bit, so the number of loop iterations
-  executed leaked how many of the candidate phrase's leading checksum bits
-  agreed with the real one — bit-by-bit feedback on a 24-word phrase's 8-bit
-  checksum instead of one 1-in-256 result, against an interface
-  (recovery-phrase validation) users are routinely invited to run on
-  attacker-influenced input. The comparison now XORs every bit into an
-  accumulator and checks it once after the loop, so the loop always runs
-  `cs_bits` iterations regardless of where a mismatch is. That closes the
-  iteration-COUNT oracle this finding named; it is not by itself a proof
-  that the compiled code takes uniform time. **Measured by the `mnemonic`
-  ctgrind row above since M6-CT (2026-09-16)**: the loop itself (a
-  bit-for-bit XOR-accumulate) is branch-free — flagged instead is the single
-  `if (mismatch != 0)` verdict after it (`bip39.zig:155`), which decides
-  `error.InvalidChecksum` vs. success, exactly the accept/reject bit this
-  comment already says the function is allowed to reveal.
+  proof**: `mnemonicToEntropy` XORs every checksum bit into an accumulator and
+  checks it once after the loop, so the loop always runs `cs_bits` iterations
+  regardless of where a mismatch is (an early return would leak how many of a
+  candidate phrase's leading checksum bits agree, bit-by-bit feedback on an
+  interface users are invited to run on attacker-influenced input). That closes
+  the iteration-COUNT oracle; it is not by itself a proof that the compiled code
+  takes uniform time. The `mnemonic` ctgrind row above measures the loop as
+  branch-free: what it flags is the single `if (mismatch != 0)` verdict after it,
+  which decides `error.InvalidChecksum` vs. success, exactly the accept/reject
+  bit the function is allowed to reveal.
 - **A watch-only `xpub` plus ONE leaked non-hardened child private key
   recovers the PARENT private key** — this is a property of BIP-32 itself,
   not an implementation defect (`k_parent = k_child − HMAC(chain_code,
@@ -283,42 +281,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   pre-normalize it themselves. Multi-language wordlists (BIP-39 defines ten)
   are out of scope entirely — English only.
 - **`parsePath` is not a BIP-44 purpose-field validator** — see above.
-- **SLIP-0132 prefixes (2026-11-19).** `slip132_table` holds the ten Bitcoin rows of
-  SLIP-0132 (`xpub/ypub/zpub/Ypub/Zpub`, `tpub/upub/vpub/Upub/Vpub` and the private
-  counterparts; version words and prefixes as published); `slip132Entry(network, script)`
-  and `slip132Find(version)` look them up. `serializePrivSlip132`/`serializePubSlip132`
-  write a chosen prefix; `parseSlip132` accepts every registered word on either network
-  and returns the row (network and script type; public/private is the tag of the
-  parsed key), any other word is `error.UnknownVersion`, every other check is
-  `parseExtended`'s. Reference behaviour: the SLIP-0132 registry itself; of the surveyed
-  libraries the reference (rust-bitcoin `Xpub::decode`) takes only the BIP-32 pair, while
-  bitcoinjs/bip32 (`fromBase58(str, network)`) and scure-bip32 (`fromExtendedKey(str,
-  versions)`) take the version words from the caller — so the default entry points,
-  `serializePriv`/`serializePub`/`parseExtended`, are unchanged (a `ypub` is still
-  `UnknownVersion` there) and SLIP-0132 is a separate pair of calls, never implied by a
-  network. The script type is a label the sender chose; the key bytes are an ordinary
-  BIP-32 key under any prefix and nothing here derives an address. Other coins'
-  rows of the registry are not included (their words collide with Bitcoin's).
-  KATs: the registry's own test vectors (mnemonic `abandon ... about`, accounts
-  `m/44'/0'/0'`, `m/49'/0'/0'`, `m/84'/0'/0'`, six strings derived and compared) and the
-  `m/84'/0'/0'` key under all ten pairs (the eighteen strings the registry does not
-  publish were made by an independent Base58Check implementation from the published
-  zpub/zprv by swapping the version word; each string's four-letter prefix is asserted
-  against the registry). Not covered: the new entry points are not in the ReleaseFast
-  stack probe (they share `serializePrivBody` / `parseExtendedBody` with the covered
-  `serializePriv` / `parseExtended`). Delta mutation 2026-11-19: 14 mutants, 14 killed.
-- **Network is explicit** (A1 L7, 2026-09-13): `serializePriv`/`serializePub`
-  /`parseExtended` take a `Network` (`.mainnet` = `0x0488ADE4`/`0x0488B21E`,
-  `.testnet` = `0x04358394`/`0x043587CF`, BIP-32 § "Serialization format").
-  Before, serialization always wrote mainnet bytes, whatever the key was for.
-  `parseExtended` accepts only the requested network; the other network's
-  version bytes are `error.WrongNetwork`, anything else `error.UnknownVersion`.
-  BIP-32 has no testnet vectors, so the testnet KAT is Test Vector 1's master
-  re-encoded with testnet version bytes by an independent Python Base58Check
-  implementation (see `kat_test.zig`).
 
 ## Verification
 
+- **Run:** `scripts/modtest bip32` (tests, including the dead-stack probe in a ReleaseFast
+  run); ctgrind `scripts/checks/ctgrind.sh bip32` (rows in *Threat model*); deterministic fuzz
+  driver `BIP32_FUZZ=<runs>[,<first seed>]` (testkit's driver, never `zig build --fuzz`).
 - **BIP-32 official Test Vectors 1, 2, 3, 4** (`bip32_vectors.zig`, from
   `bitcoin/bips/bip-0032.mediawiki`): every chain link's serialized xprv
   AND xpub asserted byte-exact against the published strings, covering
@@ -337,14 +305,34 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - A positive control (`bip39.zig`) tampers a mnemonic's checksum-carrying
   word and asserts `error.InvalidChecksum`, proving the checksum check has
   teeth rather than silently accepting any wordlist-valid phrase.
+- **Network and SLIP-0132:** the testnet KAT, and the SLIP-0132 registry vectors and all ten
+  version pairs (`slip132_test.zig`), see *Design*.
+- **Mutation-driven tests** (`test "mutation: …"` and the neighbours in `bip32.zig`/`bip39.zig`):
+  `deinit` wipes, every `isMaster` field, the exact error of each malformed xprv header and of the
+  `*FromIL` seams, `parsePath` roots/digits/leading zeros/`out` length and `max_path_depth`,
+  exact-fit buffers of `entropyToMnemonic`/`mnemonicToEntropy`, every single checksum bit for all
+  five entropy lengths, a 256-byte passphrase, the depth 254 to 255 round trip and the refusal from
+  255.
+- **Fuzz** (`src/fuzz_test.zig`, `BIP32_FUZZ`): `bip32-parse` (`parseExtended` never panics, and
+  what it accepts re-serializes to the same text) and `bip32-derive` (`ckdPub(neuter(parent), i)`
+  against the private side, serialization round trip; scaled to half the budget), each with a
+  reach test that every outcome is hit.
+- **Dead-stack probe** (`src/stackprobe_test.zig`): see *Threat model*; it needs a ReleaseFast
+  build and is usable in a schemata ReleaseFast build.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
-### Stack probe in the schemata build (2026-11-18)
+## What is deliberately not done
 
-In a ReleaseFast schemata build with every mutant off (the original logic, a different code shape) the stack probe was red: `neuter` left the master chain code on the dead stack, 6 hits in 3 calls, 182..447 B below the call. Same class as the `takeKeyShare` residue of `dkg`, but the value is the chain code of the `ExtendedPubKey` that `neuter` returns by value, so it is a copy of an output the caller holds, not private-key material (every needle that is key material, in all its images, is clean, as is every key-returning entry point). A `noinline` body plus `burnStack` on `neuter` did not remove it and made the plain ReleaseFast build red as well (the by-value result is copied into the wrapper's own frame, above the burn; every other entry point returns through an out-pointer). Decision: `neuter` stays unburned; the probe no longer holds `neuter` to the big-endian chain-code needle (and only that one; the private key and the SHA-512 word image of the chain code still apply). If a consumer ever needs the xpub's chain code off the dead stack, the fix is the out-pointer variant `neuterInto` (added 2026-11-18, see Backlog). Entry points that take or return public extended keys by value without a burn (`ckdPub`, `serializePub`, `fingerprint`) handle only public data and are not probed.
-
-### Audit 2026-11-17 (whole-module mutation)
-
-Mutants: 265 over `bip32.zig` and `bip39.zig` non-test code (BIP-32 derivation, serialization and parsing, `scalarInRange`, `parsePath`, BIP-39 encode/decode/checksum/seed, `wordIndex`, wipes, burns), schemata build in ReleaseSafe, one run per mutant. First pass: 203 of 263 killed, 60 survivors. **Finding (fixed, behaviour change):** `ckdPriv`/`ckdPub` wrapped the depth at 255 (`+%`) to a child with depth 0 and a non-zero parent fingerprint, which the module's own `parseExtended` refuses; rust-bitcoin, bitcoinjs and btcd all refuse the derivation, so it is now `error.MaximumDepthExceeded`. New tests: `deinit` wipes, every `isMaster` field, exact error codes of each malformed xprv header and of the `*FromIL` seams, `parsePath` roots/digits/leading zeros/`out`-length and `max_path_depth` limits, exact-fit buffers of `entropyToMnemonic`/`mnemonicToEntropy`, every single checksum bit for all five entropy lengths, a 256-byte passphrase, depth 254 to 255 round trip and refusal from 255. Final: **244 killed, 21 equivalent** (265). Equivalent: `checkEncodeSecret`/`checkDecodeSecret` against the variable-time forms (same output, constant-time only, ctgrind-covered); an empty path segment and a char below `'0'` (`std.fmt.parseUnsigned` refuses both with the same error); the word-loop bound `total_bits` and the checksum byte divisor in `readBits11` (same loop count and same byte for all five lengths). 16 are dead-stack wipes and burns (`masterFromSeed`, `ckdPriv`, `serializePriv`, `parseExtended`, `derivePath`, `validateMnemonic`, `mnemonicToSeed`, both `burnStack`); first recorded UNOBSERVABLE because only `stackprobe_test.zig` (ReleaseFast) sees them and the schemata baseline of that probe was red. Re-measured 2026-11-18 in a ReleaseFast schemata build with the probe fixed (below): both `burnStack` mutants (nothing burnt) are **killed**; the other 14 (a local buffer or HMAC output not wiped in the body) **survive and are equivalent**: every such local lives in the frame of a body that its entry point burns afterwards (`stack_burn`), so removing either the local wipe or the burn leaves the dead stack clean, only both together leave residue (a double fault; the two single faults are what the mutants model, and the burn mutants are killed).
+- **BIP-44/49/84/86 purpose-field policy**: `parsePath`/`derivePath` take whatever path string they
+  are given; purpose validation belongs to a wallet layer (*Design*, *Threat model*).
+- **Retry / reseed on an invalid master key** (`IL >= n` or `IL == 0`, probability ~2^-127):
+  `error.InvalidMasterKey` is returned; the policy is the caller's.
+- **Resolving `IL ≡ 0 (mod n)` on the public path to `K_i = K_par`**: it is rejected as
+  `InvalidChildKey` (see *Design*).
+- **Other coins' SLIP-0132 rows**: their version words collide with Bitcoin's.
+- **WIF and addresses**: WIF lives in the sibling `btcaddr` module; a SLIP-0132 script type is a
+  label only and nothing here derives an address.
 
 ## Anchoring
 
@@ -355,11 +343,7 @@ Mutants: 265 over `bip32.zig` and `bip39.zig` non-test code (BIP-32 derivation, 
 
 **What the tests actually contain.** official BIP-32 Test Vectors 1/2/3/4/5 in bip32_vectors.zig
 
-**How it got there.** The anchoring work landed. CLOSED 2026-08-08: imported BIP-32's official Test Vector 4 (seed, master xprv/xpub, m/0H and m/0H/1H xprv/xpub), fetched from `bitcoin/bips` `master` and verified byte-exact against the source `.mediawiki` programmatically before transcribing into `bip32_vectors.zig`. Wired as a new test in `kat_test.zig`. This implementation stores `privkey`/`chain_code` as fixed `[32]u8` throughout (no bignum trimming), so Vector 4 exercises the same code path as the already-present Vector 3, not a distinct one — closes an external-coverage gap (BIP-32's own published answer this module had never actually been run against), not a newly-found latent bug. Mutation-tested by corrupting the last character of the imported `master_xprv` literal: `exit 1, 1/26 fail`; reverted.
-
 ## Backlog / deferred
 
-- **DONE 2026-11-18 (owner decision) — ReleaseSmall: `neuter` leaves the master chain code on the dead stack** (2026-10-19, `stackprobe_test.zig`, ReleaseSmall only; ReleaseFast green) — once per call, 166 B below it: the copy of the returned `ExtendedPubKey` in `neuter`'s own frame, above every burn. The key itself no longer leaks (`pubkeyFromPriv` by pointer). The chain code is part of the value the caller receives, so this is a copy of an output, not of an input the caller did not get. A `noinline` body + `burnStack` did NOT remove it (tried 2026-10-19 and 2026-11-18). Resolution: the out-pointer `neuterInto(priv, *ExtendedPubKey)` is added (the probe holds it to every needle, ReleaseFast and ReleaseSmall green); `neuter` is a thin wrapper over it, documented as leaving a copy, and stays exempt from the chain-code needle in the probe. rust-bitcoin's `Xpub::from_xpriv` and bitcoinjs's `neutered()` return the public key by value, so the wrapper is the like-the-reference shape; the out-pointer is the security-first option beside it. ReleaseSmall tests run in no CI lane.
 - **BIP39 wordlists for the nine other languages** (survey 2026-09-30) — a user with a Japanese, Spanish, … seed cannot restore it; rust-bip39 and bitcoinjs both ship them. Effort S per language (2048 words data each, machine-transcribed from `bitcoin/bips`, embedded). Fits §2.
 - **NFKD normalisation of mnemonic and passphrase (BIP39)** (survey 2026-09-30) — a non-ASCII passphrase silently derives a different seed than every other wallet; today the caller must pre-normalise (see Threat model). Needs Unicode NFKD tables (`rg -i 'nfkd|unicode'` over `README.md` catalog finds no sibling). Effort M (generated tables + tests). Fits §2 if the tables are generated Zig data.
-- ✅ DONE 2026-11-19 (`slip132_table`, `serializePrivSlip132`/`serializePubSlip132`/`parseSlip132`, SPEC § Serialization notes). **SLIP-132 version prefixes (ypub/zpub/…)** (survey 2026-09-30).
