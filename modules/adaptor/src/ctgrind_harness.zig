@@ -6,10 +6,9 @@
 //! branch on the parity bit itself"), as an actual committed program. Run
 //! it through `zig build ctgrind -Dctgrind-module=adaptor
 //! -Dctgrind-valgrind=<true|false> -Doptimize=ReleaseFast` plus `valgrind
-//! --tool=memcheck --error-exitcode=99 --num-callers=20` by hand —
-//! `scripts/checks/ctgrind.sh` has no per-module TARGETS/MODES/PATTERN/LABEL entry
-//! for `adaptor` yet; the suggested lines are at the bottom of this comment
-//! for the coordinator to paste in.
+//! --tool=memcheck --error-exitcode=99 --num-callers=20` by hand, or
+//! through `scripts/checks/ctgrind.sh adaptor` (expected rows in
+//! `scripts/checks/ctgrind-expected.tsv`).
 //!
 //! NOT wired into `zig build test-adaptor` — memcheck's context count is
 //! valgrind's own verdict, not something a Zig test can assert on. `zig
@@ -121,23 +120,6 @@
 //! its own. A non-zero total next to a small, itemised in-file count is
 //! what makes the itemisation mean "no branch found" rather than "the taint
 //! never arrived".
-//!
-//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
-//!
-//! ```
-//! TARGETS[adaptor]="presign adapt extract"
-//! MODES[adaptor]="ReleaseFast"
-//! PATTERN[adaptor/presign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
-//! PATTERN[adaptor/adapt]='root[.]zig|common[.]zig'
-//! PATTERN[adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
-//! LABEL[adaptor/presign]='adaptor preSign (sk+nonce)+bip340+k256 comb'
-//! LABEL[adaptor/adapt]='adaptor adapt (t)+std scalar'
-//! LABEL[adaptor/extract]='adaptor extract (t out)+k256 comb+std scalar'
-//! ```
-//! ⚠ `root[.]zig` in every pattern above matches BOTH `adaptor/src/root.zig`
-//! and `bip340/src/root.zig` (see "own vs delegate" above) — read the
-//! qualified symbol name, not just the bucket, when attributing a specific
-//! context.
 
 const std = @import("std");
 const builtin = @import("builtin");
