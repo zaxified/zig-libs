@@ -59,8 +59,8 @@
 //!    says: std probing for an OPTIONAL sibling at a boundary reads an empty
 //!    `00 00` TLV out of the padding instead of off the end. It is *not* a
 //!    defence against a hostile length, which is an attacker-chosen 32-bit
-//!    number no bounded amount of padding can absorb — layer 2 is. Since
-//!    2026-10-10 layer 2 also requires the trailing signatureValue, which is
+//!    number no bounded amount of padding can absorb — layer 2 is. Layer 2
+//!    also requires the trailing signatureValue, which is
 //!    what keeps every boundary probe inside the buffer even without the
 //!    padding (`validateForStdParse`); the padding stays as defence in depth.
 //!
