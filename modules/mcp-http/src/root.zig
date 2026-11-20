@@ -345,11 +345,6 @@ pub const Sessions = struct {
         return tag;
     }
 
-    /// Record that a request named this session. Caller holds the lock.
-    fn touch(self: *Sessions, id: []const u8) void {
-        if (self.map.get(id)) |s| s.last_seen_ns = monoNs();
-    }
-
     fn exists(self: *Sessions, id: []const u8) bool {
         return self.tagOf(id) != null;
     }
