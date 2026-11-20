@@ -6,7 +6,7 @@
 
 **Scope:** core — BoringSSL `spake2plus` and the Matter SDK's SPAKE2+ (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (30/33, 2 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-21 (103/110, 7 eq) · src 96b0b675024c357f
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SPAKE2PLUS_FUZZ; exchange at 1/20 of it) · ct 2026-09-09 (ctgrind)
 
@@ -388,6 +388,7 @@ modules/spake2plus/`; constant time `scripts/checks/ctgrind.sh spake2plus --chec
 - **ctgrind.** Targets `w0w1`, `computel`, `proverstart`, `verifierstart`, `proverfinish`, `verifierfinish`, each with an
   untainted control and a no-`-fvalgrind` trap; a `CT discipline` test in `root.zig` forbids the variable-time `mul`
   variants on secrets.
+- **Mutation.** A whole-module strict schemata run over `root.zig`: 110 mutants on the transcript (field order, 8-octet length prefix, `M`/`N` slots, the wipe before `free`), the key-schedule split and info strings, every scalar canonicality and identity check of the six entry points, the `Z`/`V` routes and their point and scalar choices, both confirmation compares (whole, first half only, last half only), the MAC keys and inputs, the `computeW0W1` length check, halves and wide reduction, and the error-path zeroing of `out`. 103 are killed by the suite (the transcript wipe only by the ReleaseFast test) and 7 are equivalent: the two identity-share checks after `X = x*P + w0*M` and `Y = y*P + w0*N` (reaching the identity needs the discrete logarithm of `M` or `N`, unknown by construction, RFC 9383 section 4) and the five `rejectIdentity` guards after `P256.fromSec1` on a fixed 65-octet share or `L` (that decoder refuses the affine marker `(0, 1)` by the curve equation and takes the identity only as a single octet, so the guard is defence in depth that no input reaches). Not mutated: the dead-stack burns and stack-only wipes (the stack probes own them) and the ciphersuite constants (pinned byte-exact by the RFC vector).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## What is deliberately not done
