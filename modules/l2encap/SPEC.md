@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): round-trip property over generated fields + golden KAT; fuzz decode never-panics
+What the tests check instead of a model: round-trip property over generated fields + golden KAT; fuzz decode never-panics
 
 **Known defects:** none recorded
 
@@ -22,7 +22,7 @@ What the tests check instead of a model (was `**Evidence:** model` until 2026-11
 
 Design + threat notes for auditors. Usage, API and the field-by-field wire
 diagram: see [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from public
+Attribution/provenance: see the README's `Provenance:` line — none needed here (clean-room from public
 specs: IEEE 802.1ah PBB I-TAG, RFC 7348 VXLAN, RFC 8926 Geneve, IEEE 802.1aq SPB;
 a public spec is not a copyrightable work, and no third-party source or dissector
 was ported or studied).
@@ -37,7 +37,7 @@ overlay-encapsulation codec (VXLAN, Geneve) gets. Stars are for the repository, 
 |---|---|---|--:|---|---|
 | RFC 7348 VXLAN / RFC 8926 Geneve as coded in [gopacket/gopacket](https://github.com/gopacket/gopacket) `layers/vxlan.go`, `geneve.go` (file names verified) — **reference** | Go | BSD-3-Clause | 316 | v1.7.2 (2026-09-15) | Decode/encode of the tunnel header only (VNI, flags; Geneve TLV options), for packet analysis. No TTL, no split-horizon, no loop policy *(contents inferred from the file names and the RFCs)*. Carried inside UDP, so interoperable with kernel `vxlan`/`geneve` devices — this module's header is not. |
 | [JulianSchmid/etherparse](https://github.com/JulianSchmid/etherparse) | Rust | Apache-2.0 | 409 | v0.21.0 (2026-07-21) | Zero-copy Ethernet/VLAN/MACsec/IP/TCP/UDP header slices and writers; its README lists 802.1Q and MACsec, no VXLAN/Geneve/PBB found *(README search; inferred)*. |
-| Linux kernel `vxlan` / `geneve` drivers | C | GPL-2.0 (behaviour only; source not read) | — | mainline | The data-plane implementations: FDB learning, ECMP entropy in the UDP source port, BUM replication — the things this codec leaves to the fabric (SPEC "Deliberately deferred"). |
+| Linux kernel `vxlan` / `geneve` drivers | C | GPL-2.0 (behaviour only; source not read) | — | mainline | The data-plane implementations: FDB learning, ECMP entropy in the UDP source port, BUM replication — the things this codec leaves to the fabric (SPEC *What is deliberately not done*). |
 | Zig ecosystem / `std` | Zig | — | — | — | None found: no overlay-encapsulation codec. |
 
 **Where we are ahead:** the only Zig overlay codec, and the only one of those above that carries
@@ -85,6 +85,17 @@ decoder cannot be told a length that disagrees with the bytes present, because i
 is never told a length at all. Carrier-level length/MTU integrity is owned by the
 downstream fragmenter (`ethfrag`), which is the correct separation of concerns.
 
+**Not VXLAN or Geneve on the wire.** Both real encapsulations carry the 24-bit VNI at bytes 4-6, big-endian
+(captured from the kernel's own `vxlan` and `geneve` devices); here the I-SID sits at bytes 2-4 (`writeHeader`), behind a
+version byte neither protocol has, and the TTL and ingress-PE bytes have no counterpart in either. So the 24-bit width and
+endianness follow the VNI convention, but the bytes are not parseable by a VXLAN or Geneve decoder, nor the reverse; there
+is no external fixture to anchor against and the golden bytes are hand-authored (see *Anchoring*).
+
+**Frame ceiling.** `max_frame_len` (65535, the number `ethfrag` uses for its input, taken as a constant instead of an
+import) bounds the whole encoded frame: `encode` and `encodeAlloc` return `FrameTooLarge` when `encodedLen(payload)` exceeds
+it, `encode` returns `BufferTooSmall` for a short caller buffer, and `decode` returns `FrameTooLarge` for input longer
+than the ceiling.
+
 ## Loop prevention & split-horizon — precise semantics
 
 Two mechanisms, both of which this module only *supplies the inputs and the
@@ -130,11 +141,6 @@ one. The relay is closed in `l2forward`, by classifying the frame's arrival
 (core-received ⇒ `local_only`); see its SPEC, and the 4-PE composition test that
 pins it.
 
-(An earlier revision of this paragraph named only the *transient reconvergence*
-loop as the residual risk, and that misdirected the reader: the dominant failure
-mode was in the steady state, needed no reconvergence, no misconfiguration and
-no malformed frame, and it was ours.)
-
 **What is still not closed anywhere in the data plane:** a transient forwarding
 loop among PEs during control-plane reconvergence, when member sets disagree.
 That requires a loop-free BUM distribution tree and a reverse-path-forwarding
@@ -178,7 +184,7 @@ ingress-PE id injected *inside* an authenticated WireGuard session is bounded by
 the same fabric trust as any other in-tunnel byte — this codec does not add, and
 does not claim, per-frame authentication (see deferred list).
 
-## Deliberately deferred (out of scope by design, not oversight)
+## What is deliberately not done
 
 - **FIB / forwarding table** and the actual next-hop selection.
 - **BUM replication** (ingress replication or P2MP tree fan-out) — this module
@@ -196,114 +202,30 @@ does not claim, per-frame authentication (see deferred list).
 
 ## Verification
 
-Offline only — pure codec, no live-interop surface. `zig build test-l2encap`:
-golden byte-layout KAT (BUM + unicast/I-SID-0/empty-payload variants) pinning
-every field's offset and endianness; a 500-iteration seeded encode→decode
-property test (I-SID incl. 0 and `max_isid`, both frame types, empty..4 KiB
-payloads); a permanent positive-control test that reverses the I-SID bytes and
-proves the golden/decode would go red on a little-endian bug; semantics tests for
-TTL decrement + drop-at-zero, split-horizon (own-PE BUM dropped, other-PE BUM and
-all unicast accepted), and I-SID isolation; encode buffer-too-small and
-caller-buffer≡alloc equivalence; decode truncation-at-every-length,
-wrong-version, and reserved-bit rejection; and the `std.testing.fuzz` target.
-Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean.
+Offline only: a pure codec has no live-interop surface. Run `scripts/modtest l2encap`.
 
-### External-anchor investigation: kernel VXLAN/Geneve capture (2026-08-01, refuted)
-
-An audit task asked whether the kernel's real VXLAN and Geneve encapsulation
-(created in a throwaway unprivileged `unshare --user --net` namespace, a veth
-pair as underlay so the frames are genuine off-the-wire traffic rather than a
-loopback-local shortcut, a static ARP entry to avoid resolution flakiness) could
-anchor this module's outer-header/VNI-placement/flags bytes against the kernel
-instead of against our reading of RFC 7348 / RFC 8926. It was actually run — a
-real `vxlan` interface (VNI 424242, i.e. `0x067932`) and a real `geneve`
-interface (same VNI) were built and a frame captured off each via a plain
-`AF_PACKET` socket (no `tcpdump`, so no `-Z` risk) — and it disproves its own
-premise: **this module's 8-byte header is not VXLAN or Geneve on the wire**, so
-there is nothing shared to anchor.
-
-The real kernel bytes captured, decoded field-by-field:
-
-```
-VXLAN  (dst UDP 4789): 08 00 00 00 06 79 32 00
-                        ^^ flags(I=1)  ^^^^^^ VNI=0x067932  ^^ reserved
-                        byte0          bytes4-6            byte7
-Geneve (dst UDP 6081): 00 00 65 58 06 79 32 00
-                        ^^ ^^ ver/opt  ^^^^^ ^^^^^^ VNI=0x067932  ^^ reserved
-                        |  proto-type=0x6558 (transparent Ethernet bridging)
-                        ver=0,optlen=0
-```
-
-versus this module's own header (`writeHeader`, `src/root.zig`):
-
-```
-l2encap: 01 01 0A BB CC 40 12 34
-         ^^ version  ^^^^^^^^ I-SID (bytes 2-4)  ^^ TTL  ^^^^^ ingress-PE (6-7)
-            ^^ flags (byte 1, bum bit)
-```
-
-Both real encapsulations put the 24-bit VNI at **bytes 4‥6**, confirming the
-"Model-after" table's claim that the 24-bit tenant-scope width is the real VXLAN
-VNI / Geneve VNI convention (both, independently, big-endian) — that part of the
-provenance claim is now kernel-verified, not merely RFC-read. But `l2encap`
-carries the same-width **I-SID at bytes 2‥4**, has a **version byte** neither
-protocol has, and has **no counterpart at all** for VXLAN's flags byte, Geneve's
-ver/optlen/protocol-type bytes, or its own TTL/ingress-PE bytes in either real
-protocol. Byte-for-byte, `l2encap` frames are not parseable by a VXLAN or Geneve
-decoder and vice versa — exactly what the module doc comment and this SPEC's
-design section already say ("that single omission is the whole 'lean over-WG'
-claim"; no payload-length field; WireGuard replaces backbone MAC addressing).
-
-Consequently no golden test was added here: a "golden" built from real VXLAN/
-Geneve bytes would assert nothing about `encode`/`decode`, which never produce
-or consume that wire format — the mandate is to assert real content against
-code under test, not to freeze an unrelated protocol's bytes next to code that
-doesn't speak it. The genuine, narrower fact this capture *does* establish
-(24-bit VNI at a fixed offset, big-endian, in both real sibling protocols) is
-recorded above as design-provenance confirmation, not as a code anchor. No
-`/NOTICE` entry: this was a black-box run of the kernel's own network stack —
-observed behavior only, no source or design consulted beyond the two RFCs
-already cited (root `NOTICE` §0).
-
-## Mutation run 2026-10-04
-
-First mutation-schemata run (one ReleaseSafe test binary, 34 mutants behind a
-runtime switch, baseline first): 34 mutants, 34 killed, 0 equivalent. Covered:
-every `writeHeader` field (version, bum bit, reserved-bit leak, I-SID shift and
-endianness, TTL, ingress-PE endianness), the `max_frame_len` / buffer-size
-comparisons in `encode`, `encodeAlloc` and `decode` (`>` vs `>=`, `<` vs `<=`),
-the `Truncated` boundary, the version check, each reserved-flag bit in
-`decode`, every field offset and endianness in `decode`, the payload start,
-`decrementTtl` (expiry boundary, step), `droppedBySplitHorizon` (and/or,
-equality, bum guard) and the `looksLikeEthernet` threshold.
-
-One mutant survived the existing tests: dropping reserved bit 7 from the
-decode mask (the tests only set bit 1 and the all-bits value 0xFE, where the
-other bits still trip the check). It was killed by a new test that sets each
-reserved bit 1..7 alone, with and without the bum bit. Expected result comes
-from the wire-format doc comment (bits 1..7 reserved, MUST be zero, `decode`
-rejects any nonzero one); the format is this module's own, so there is no
-external fixture. No source defects found.
+- **Golden bytes:** three hand-authored byte literals (BUM frame; a second set of distinct asymmetric field values; unicast,
+  I-SID 0, empty payload) pin every field's offset and endianness; a permanent positive-control test shows that a
+  little-endian I-SID disagrees with the golden.
+- **Round trip:** a seeded encode-then-decode property (I-SID including 0 and `max_isid`, both frame types, empty to 4 KiB
+  payloads); `encodedLen` matches what `encode` writes; `encodeAlloc` equals the caller-buffer `encode`.
+- **Boundaries and refusals:** `BufferTooSmall`; exactly `max_frame_len` accepted and one byte more `FrameTooLarge` for
+  both `encode` and `decode`; truncation at every length below `header_len`; wrong version; each reserved flag bit 1..7
+  alone, with and without the BUM bit.
+- **Semantics:** TTL decrement and drop at zero; split-horizon drops a reflected BUM frame, accepts BUM from another PE and
+  all unicast, and cannot see a relayed copy; I-SID isolation; `looksLikeEthernet` as a pure length check.
+- **Fuzz:** `L2ENCAP_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `fuzzDecode` — never panics,
+  payload stays inside the input — and a corpus test pins that every seed reaches the decoder and every outcome; the
+  `std.testing.fuzz` target is the same property under `Smith`.
+- **Oracles:** none; the format is this module's own (class D, see *Anchoring*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-Survey 2026-09-30 found nothing that a user of an overlay codec would miss and that this module has not
-already refused by design (FIB, BUM replication, control plane, MAC learning, fragmentation, encryption: see
-"Deliberately deferred"). Two optional items, low priority, both fit CONVENTIONS §2:
+Two optional, low-priority items, both within CONVENTIONS §2:
 
-- **Header-flags extension point (survey 2026-09-30)** — Geneve's option TLVs are how its users add per-tenant metadata; the header here has 7 reserved flag bits and a version byte, so an extension would be a v2. Only if a consumer asks. Effort: small.
-- **Optional VXLAN/Geneve header codec (survey 2026-09-30)** — for gateways that must speak to kernel `vxlan` devices; a separate module rather than a change to this one. Effort: small.
-
-No Fable-tier piece was needed: the header is a clean-room layout from published
-overlay specs and the two decision helpers are total pure functions. The genuinely
-hard part of the fabric — loop-free BUM-tree reconvergence and designated-forwarder
-election under partition — is intentionally **not** here; it lives in the
-`loopfree-reconv` / `df-elect` modules, which this codec feeds.
-
-## Status
-
-`gap · any · codec · reentrant` · deps: none (std only) — canonical source is
-`pub const meta` in `src/root.zig`.
+- **Header-flags extension point** — Geneve's option TLVs are how its users add per-tenant metadata; the header here has 7 reserved flag bits and a version byte, so an extension would be a v2. Only if a consumer asks. Effort: small.
+- **Optional VXLAN/Geneve header codec** — for gateways that must speak to kernel `vxlan` devices; a separate module rather than a change to this one. Effort: small.
 
 ## Anchoring
 
@@ -313,5 +235,3 @@ election under partition — is intentionally **not** here; it lives in the
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** golden byte-layout KAT hand-authored from this module's own wire diagram; round trips; strict-decoder rejections (reserved bits, version). No live-interop surface exists.
-
-**How it got there.** Reclassified A → D on 2026-09-30 (maturity task A5). The class-A grade assumed an outside wire format to agree with; the 2026-09-30 survey confirmed what a58d626 had already found — the 8-byte header is this repository's own (PBB/VXLAN/Geneve are design references, not wire formats it speaks), so nothing else implements it and no external oracle can exist. Grading its oracle SELF invented anchor debt that could never be paid; its correctness is carried by the invariants and the strict decoder, as for any class-D module.

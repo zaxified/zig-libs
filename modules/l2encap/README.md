@@ -72,7 +72,7 @@ The ingress-PE id + TTL are the **necessary inputs** to loop mitigation, and TTL
 alone bounds any loop to a finite length. Full loop-freedom of the BUM
 distribution tree (reverse-path-forwarding check, tree computation, MAC
 learning, actual replication) is a **control-plane** responsibility layered on
-top — see [SPEC.md](SPEC.md)'s deferred list.
+top — see [SPEC.md](SPEC.md) *What is deliberately not done*.
 
 ## Pipeline
 
@@ -88,11 +88,14 @@ customer frame ──l2encap.encode──▶ [hdr|frame] ──ethfrag.fragment�
 ## API
 
 - `encode(fields, customer_frame, out) ![]u8` — zero-alloc, into a caller
-  buffer; `encodedLen(payload_len)` sizes it.
-- `encodeAlloc(allocator, fields, customer_frame) ![]u8` — owned-bytes variant.
+  buffer; `encodedLen(payload_len)` sizes it. `BufferTooSmall` if `out` is short;
+  `FrameTooLarge` if the encoded frame would exceed `max_frame_len` (65535).
+- `encodeAlloc(allocator, fields, customer_frame) ![]u8` — owned-bytes variant
+  (same `max_frame_len` ceiling).
 - `decode(bytes) !Decoded` — `{ fields, payload }`; `payload` is a subslice of
   the input (no copy, no allocation). Truncated / wrong-version /
-  reserved-bit-dirty input is a typed `DecodeError`, never a panic.
+  reserved-bit-dirty / longer-than-`max_frame_len` input is a typed `DecodeError`
+  (`Truncated`, `UnsupportedVersion`, `InvalidHeader`, `FrameTooLarge`), never a panic.
 - `decrementTtl(fields) !Fields` — per-hop TTL step, `TtlExpired` on 0.
 - `droppedBySplitHorizon(fields, this_pe) bool` — the split-horizon test.
 - `looksLikeEthernet(payload) bool` — advisory-only payload sniff (`decode`
@@ -105,7 +108,7 @@ zig build test-l2encap
 ```
 
 A hand-verified golden byte layout pins the wire format field-by-field; a
-500-iteration seeded property test round-trips encode → decode (I-SID incl. 0 and
+seeded property test round-trips encode → decode (I-SID incl. 0 and
 max, both frame types, empty..4 KiB payloads); a permanent positive-control test
 proves the golden catches a little-endian I-SID bug; semantics tests cover TTL
 drop-at-zero, split-horizon, and I-SID isolation; and a `std.testing.fuzz` target
