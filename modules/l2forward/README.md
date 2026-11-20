@@ -119,7 +119,7 @@ unknown-unicast case is decided inside `forward` against the FDB.
   Total worst-case memory is `max_isids × max_macs_per_isid` FDB entries plus
   `max_isids × max_pes_per_isid` membership entries — never unbounded, but at
   the shipped defaults that ceiling is at least ~500 MiB before hashmap
-  bookkeeping overhead (see `SPEC.md` §"Deliberately generous defaults") —
+  bookkeeping overhead (see `SPEC.md` § *Capacity / DoS bound*) —
   size `max_isids`/`max_macs_per_isid` down for a memory-constrained edge PE.
 
 ## Time-injection contract
@@ -146,6 +146,9 @@ order — both pinned by permanent tests.
   never-aged, never quarantined; `forget(isid, mac) bool` — delete.
 - `moveCount(isid, mac) u8` / `isQuarantined(isid, mac) bool` — MAC-mobility
   state.
+- `learnStats() LearnStats` / `resetLearnStats()` — saturating totals of every `learn` outcome (`LearnStats.count`)
+  and refusal (`invalid_source_mac`, `unknown_isid`, `fdb_full`, `out_of_memory`), for an operator who does not log
+  every `LearnOutcome`.
 - `lookup(isid, mac, now) ?PeId` — the PE a known unicast would take, or null.
 - `forward(isid, dst, ingress, now, out) !Decision` — the forward decision;
   `replicationSet(isid, ingress, out) ![]const PeId` — the replication set
@@ -155,6 +158,13 @@ order — both pinned by permanent tests.
 - `tick(now)` — reclaim aged entries. `fdbCount(isid)` / `isidCount()` — sizes.
 - `isBroadcast(mac)` / `isMulticast(mac)` / `isBumAddress(dst)` — pure BUM
   classification helpers.
+
+## Not provided
+
+A `Table` is `single_owner`: one thread or loop owns it and there is no internal lock, so two threads must not call
+into one table. Designated-forwarder election, loop-free BUM trees, inter-PE MAC-mobility signalling, ARP/ND
+suppression, port state and the frame itself are out of scope by design; a local-port dimension and IGMP/MLD snooping
+are open. See SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 ## Test
 

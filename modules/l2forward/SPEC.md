@@ -8,12 +8,6 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-11-17 (111/115, 4 eq) · src 9e71de955ebb91e7
 
-**Audit 2026-11-17 (whole-module mutation).** 115 mutants over every non-test line of `src/root.zig` (the BUM / zero-address predicates, `learn` and its outcome and statistics bookkeeping, the move window and quarantine arithmetic, `learnStatic`, `forget`, `lookup`, `forward` and `replicationSet`, ageing and `tick`, the FDB iterator, the I-SID and member caps, the futile-prune throttle, `removeMember` / `removeIsid`), one schemata build per round, baseline first. Round 1: 102 killed, 13 survived. 5 tests were added: the address predicates read every octet, `max_mac_moves = 0` quarantines on the first move (as documented), an allocator failure inside `learn` is returned and counted, `forget` on an unknown I-SID is false and `learnStatic` over an existing MAC at the FDB cap overwrites instead of failing with `FdbFull`, and a move at a clock earlier than the window start stays inside the window without underflow. Round 2 killed 9 of the 13 (one of the 13 had been a harness defect: a comptime `lessThan` argument cannot take the runtime switch, so it was re-mutated at statement level and killed by the existing ordering test). 4 survive, all EQUIVALENT:
-- the three clamp boundaries `now >= learned_at` / `now < learned_at` / `now >= move_window_start` -> `>` / `<=` / `>` in `isExpired`, the iterator's `age` and `sinceWindowStart` (at equality both arms yield 0);
-- `last_futile_prune` recorded after a productive sweep (`else null` -> `else now`): a productive sweep removed every expired entry, so a second sweep in the same tick would be futile anyway; only the diagnostic `prune_sweeps` differs (cost-only).
-
-Not mutated: the `Options` field defaults (comptime constants cannot take a runtime switch; the two RFC 7432 defaults are pinned by a test), the `fuzz_test.zig` harness. Counts on the card are whole-module.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, L2FORWARD_FUZZ) · ct n/a — L2 forwarding (keyword review, 2026-10-07)
 
 **Performance:** not measured
@@ -49,8 +43,8 @@ switches and overlay daemons. Only docs/READMEs were read.
 **Where we are ahead:** an embeddable, allocation-bounded, clock-injected E-LAN table that gives what the
 fabrics above keep inside their daemons: per-tenant (I-SID) isolation, learning refused for tenants the data plane did not
 provision, a per-tenant MAC cap that degrades to flooding, and EVPN-style move quarantine. **Where we are behind:**
-no local-port dimension (only remote PEs are learned; access-side delivery is the caller's), no FDB
-enumeration/dump or notifications, no ARP/ND suppression or IGMP snooping (→ Backlog; ARP/ND suppression is deferred by design in SPEC).
+no local-port dimension (only remote PEs are learned; access-side delivery is the caller's), no event hook
+(the per-call `LearnOutcome`, the `learnStats` totals and `fdbIterator` are what exists), no ARP/ND suppression or IGMP snooping (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## Data model
 
@@ -65,16 +59,19 @@ tenant's isolated forwarding state:
   single-PE I-SID), `addMember` and `learnStatic` create an `IsidEntry`;
   `removeIsid` drops one. The data-plane entry point `learn` **cannot**: an
   I-SID the caller never configured is refused with `error.UnknownIsid` and
-  allocates nothing. Before 2026-08-07 `learn` called `getOrCreateIsid`
-  unconditionally, which contradicted the sentence above it and let an attacker
-  with no control-plane access walk the `max_isids` budget from received frames
-  alone (audit finding F3).
+  allocates nothing, so an attacker with no control-plane access cannot walk the
+  `max_isids` budget from received frames alone.
 - **fdb** — `AutoHashMapUnmanaged(Mac, FdbEntry)`, the 802.1D-style learning
   table. `FdbEntry = { pe: PeId, learned_at: Time, move_window_start: Time,
   moves: u8, static: bool, duplicate: bool }`. Ageing is
   *derived* from `learned_at` versus the caller-supplied `now` (a comparison,
   never an owned countdown), exactly the pattern the sibling `isis-lsdb` /
   `ramcache` use for time-injected freshness.
+
+`learn` also refuses a source MAC that is a group address (broadcast or multicast) or all-zero
+(`error.InvalidSourceMac`; 802.1D learning and the Linux bridge refuse such frames too): such an entry would be
+unreachable by `forward`, which classifies a group destination as BUM before any lookup, and would only spend the
+tenant's `max_macs_per_isid`. Removing a member (`removeMember`) purges the FDB entries behind that PE.
 
 Plain field widths deliberately match `l2encap` so the two agree without a
 conversion layer: `Isid = u24`, `PeId = u16`, `Mac = [6]u8`, `Time = u64`.
@@ -93,6 +90,11 @@ remote PE `pe`):
 2. Else look `dst` up in `isid`'s FDB. A **fresh hit** → `Decision.unicast(pe)`.
    A **miss or an over-age entry** → unknown-unicast → BUM.
 3. For any BUM case → `Decision.flood(set)`, `set` = `replicationSet`.
+
+A fresh hit is honoured only if the learned PE is still a **member** of the I-SID; otherwise it is treated as
+unknown-unicast and floods. The source PE reaches `learn` from `l2encap`'s unauthenticated `ingress_pe` header field, so
+without this binding one spoofed frame could point a victim's unicast flow at a PE outside the tenant. `learn` itself
+stays permissive (membership is control-plane and may converge after learning); the binding is made at the decision.
 
 Classification order matters: an address is BUM by *shape* (broadcast/multicast)
 independent of any table; only the individual-address case consults the FDB.
@@ -120,27 +122,20 @@ decision non-deterministic across equivalent tables. Sorting a set bounded by
 small for the set is `error.BufferTooSmall`; sizing `out` to `max_pes_per_isid`
 makes that unreachable.
 
-**Superseded rule (kept so the change is legible).** This module previously
-returned *members − `src_pe`* for every BUM frame, and `forward` had no way to
-say a frame came from the core. That is not a weaker split horizon, it is a
-relay: with N members, hop k carries `(N−1)(N−2)^(k−1)` copies of one broadcast
-— at N=4, `3·2^63` frames, stopped only when `l2encap`'s TTL (default 64) runs
-out. `l2encap.droppedBySplitHorizon` cannot catch the relayed copies either,
-because `ingress_pe` is stamped once at ingress and preserved across
-`decrementTtl`, so a third PE never recognises a copy as relayed. Pinned by the
-4-PE composition test in `src/root.zig`.
+**Why not "members minus the source".** Returning *members − `src_pe`* for every BUM frame would not be a weaker
+split horizon but a relay: with N members, hop k carries `(N−1)(N−2)^(k−1)` copies of one broadcast — at N=4,
+`3·2^63` frames, stopped only when `l2encap`'s TTL (default 64) runs out. `l2encap.droppedBySplitHorizon` cannot catch
+the relayed copies either, because `ingress_pe` is stamped once at ingress and preserved across `decrementTtl`, so a
+third PE never recognises a copy as relayed. Pinned by the 4-PE composition test in `src/root.zig` and by a permanent
+positive-control test that the *members − `src_pe`* set is a non-empty relay where the rule demands nothing.
 
 ### Honest scope of the loop claim (do not overclaim)
 
 The failure mode this rule *does* close is the **steady-state core relay** in a
 fully converged fabric — the exponential duplication described above. It needs no
 reconvergence, no misconfiguration and no malformed frame: it is what a faithful
-`l2forward` + `l2encap` integration did on every broadcast. That is now
+`l2forward` + `l2encap` integration did on every broadcast. That is
 prevented by construction, because a core-received frame yields `local_only`.
-(An earlier revision of this paragraph named only the *transient reconvergence*
-loop as the residual risk. That was the wrong failure mode: the dominant one was
-in the steady state, and it was ours.)
-
 What is still **not** closed here: a transient forwarding loop among PEs during
 control-plane reconvergence, when the member sets of different PEs disagree.
 That needs a loop-free BUM distribution tree and a reverse-path-forwarding
@@ -152,8 +147,7 @@ This module supplies the *necessary inputs* (the member set + the ingress
 classification); the finite-loop guarantee is TTL's, and true loop-freedom is
 the control plane's. `l2forward` therefore performs **ingress replication to the
 full member set**, not tree-pruned replication; a loop-free tree is out of scope
-by design (deferred list). `l2encap`'s SPEC carried the same "honest scope"
-paragraph and was corrected alongside this one.
+by design (see *What is deliberately not done*).
 
 ## MAC-move policy (EVPN RFC 7432 §15)
 
@@ -161,10 +155,8 @@ Re-learning a MAC already present and **dynamic** behind a *different* PE is a
 **move**. It is one entry, not a second. A move is not an anti-flap/stability
 concern here, it is a **security** one: the frame that causes it is
 unauthenticated data-plane input, so a spoofed source MAC redirects a station's
-entire unicast flow to the attacker's PE. Until 2026-08-07 `learn` was plain
-last-writer-wins returning `void` — no counter, no limit, no notification — so
-one hostile frame stole a binding permanently and silently (audit finding F5).
-The policy now:
+entire unicast flow to the attacker's PE. `learn` is therefore not plain
+last-writer-wins: a move is counted, limited and reported. The policy:
 
 - **`learn` returns a `LearnOutcome`**, never `void`: `.learned`, `.refreshed`,
   `.moved`, `.duplicate_detected`, `.denied_duplicate`, `.static_pinned`. A move
@@ -173,8 +165,7 @@ The policy now:
   same state for inspection.
 - **Moves are counted** per entry over a **fixed (tumbling)** window, not a
   sliding one: `move_window_start` is set once when a window opens and is not
-  advanced while moves accumulate inside it. Earlier revisions of this line said
-  "sliding", which it never was. The move that reaches
+  advanced while moves accumulate inside it. The move that reaches
   `Options.max_mac_moves` (default 5) within `Options.mac_move_window` (default
   180 — RFC 7432 §15's stated N/M defaults) is **refused**, and the MAC is
   **quarantined**.
@@ -232,14 +223,10 @@ spraying novel source MACs to exhaust memory. Bounds, all hard:
   never evict or starve another tenant's **entries** (tenant isolation extends to
   the DoS bound). ⚠ That is a claim about entries and **not about the forwarding
   thread**, which the accepted production shape gives one of, owning every I-SID.
-  Until 2026-09-03 a full tenant made every frame carrying a novel source MAC pay
-  a complete O(table) reclamation scan that reclaimed nothing and still returned
-  `FdbFull` — 77.6 us per rejected frame against 21 ns for a normal one at the
-  shipped 8192-entry default, so 6.6 Mbit/s of 64-byte frames saturated one core,
-  and the CPU burned rejecting tenant A's flood was CPU not spent forwarding
-  tenant B's traffic. The kernel bridge does the equivalent as an O(1) counter
-  test with reclamation on a periodic workqueue; this had moved the sweep onto
-  the attacker-controlled path. Now at most one sweep per tick.
+  The forwarding thread is shared, though: a rejected learn on a full tenant reclaims at most once per tick
+  (`last_futile_prune`), because a complete O(table) scan on every frame carrying a novel source MAC — reclaiming
+  nothing and still returning `FdbFull` — put the cost of rejecting tenant A's flood on the CPU that forwards tenant B's
+  traffic (the kernel bridge does the equivalent as an O(1) counter test with reclamation on a periodic workqueue).
 - **The quarantine's cost is the operator's to weigh.** A quarantined MAC floods
   to every member PE until its window lapses, and the flood *is* the safe answer —
   but it is attacker-triggerable on demand and indefinitely: 5 spoofed frames per
@@ -247,12 +234,11 @@ spraying novel source MACs to exhaust memory. Bounds, all hard:
   to all N members, and the victim cannot heal it (its own frames are refused
   while quarantined). That is N-fold amplification on the core **and** exposure of
   the victim's frames to every remote site in the I-SID, where the hijack it
-  replaced exposed them to one. Sound as a trade; not free, and previously
-  described here as if it were.
+  replaced exposed them to one. Sound as a trade; not free.
 - **No port state.** There is no STP / blocking / learning-only concept: every
   frame handed to `learn` is learned and every `forward` decides. In the L2VPN
   framing (membership is control-plane, `Ingress` is access-vs-core) that is
-  coherent, but the kernel bridge has it and this omission was not written down.
+  coherent, but the kernel bridge has it.
 - **`max_isids`** bounds the number of distinct tenants that may hold state, and
   **`max_pes_per_isid`** bounds membership per tenant (and thus the maximum flood
   fan-out / replication-buffer size). A new I-SID beyond the cap →
@@ -283,17 +269,17 @@ operator sets, never a function of received traffic.
 trusts the frames the fabric hands it; an attacker who can inject authenticated
 in-tunnel frames can poison learning (a spoofed source MAC learned behind the
 wrong PE) within the same fabric trust as any other in-tunnel byte. Per-frame
-authentication is the caller's / control plane's concern (deferred list). What
+authentication is the caller's / control plane's concern (see *What is deliberately not done*). What
 this table does owe such an attacker is that the damage is **bounded and
 visible** rather than unlimited and silent — hence: no tenant creation from the
 data plane, per-tenant FDB caps, counted moves reported through `LearnOutcome`,
 and duplicate-MAC quarantine. MAC-pinning *policy* on top of those signals
 (which MACs to `learnStatic`, when to alarm) stays the caller's.
 
-## Concurrency ceiling (wave-2 audit F7)
+## Concurrency ceiling
 
 `meta.concurrency = .single_owner`: one thread/loop owns a `Table` and it
-holds no internal lock (`root.zig:119`) — a plain `AutoHashMapUnmanaged`, no
+holds no internal lock — a plain `AutoHashMapUnmanaged`, no
 atomics, no RCU. Correct and cheap in that shape, but it is a real ceiling
 against the named C reference, not a nicety: the Linux kernel bridge FDB
 (`net/bridge/br_fdb.c`) is RCU-protected with per-bucket locking, so lookups
@@ -303,9 +289,7 @@ forward at line rate across N cores against ONE `Table` needs an external
 lock serialising the read path the kernel deliberately keeps parallel, which
 gives up exactly the throughput scaling `br_fdb_find_rcu` provides.
 
-**This module confirmed sits on a real L2VPN data-plane path** (F1, the
-split-horizon fix, is what makes that concrete — this is not a hypothetical
-consumer), so the ceiling is worth stating rather than leaving implicit:
+**This module sits on a real L2VPN data-plane path**, so the ceiling is stated rather than left implicit:
 
 - **What is NOT provided:** cross-thread scaling of `forward`/`learn` over
   one shared `Table`. Two threads calling into the same `Table` concurrently
@@ -329,7 +313,9 @@ consumer), so the ceiling is worth stating rather than leaving implicit:
   perf-gate rule this repo already applies: no speculative concurrency
   investment without a measured, named consumer).
 
-## Deliberately deferred (out of scope by design, not oversight)
+## What is deliberately not done
+
+Out of scope by design, not oversight:
 
 - **Designated-forwarder (DF) election** — which PE forwards BUM into a
   multi-homed site; that is the separate `df-elect` module, which the caller
@@ -340,114 +326,71 @@ consumer), so the ceiling is worth stating rather than leaving implicit:
 - **MAC-mobility *arbitration* across PEs** — the EVPN MAC-mobility extended
   community's sequence number, i.e. deciding which PE's advertisement wins in the
   *control plane*. Local duplicate-MAC detection (RFC 7432 §15's N-moves-in-M
-  rule) is **not** deferred any more — it is implemented, see the MAC-move policy
-  above. What remains out of scope is the inter-PE signalling that carries the
+  rule) is implemented, see the MAC-move policy above. Out of scope is the inter-PE signalling that carries the
   verdict, plus flap dampening of the control-plane churn itself.
 - **ARP/ND suppression & proxy-ARP** — answering ARP/ND from the FDB to cut BUM
   flooding is a higher-layer optimization, not modelled.
 - **The frame itself** — encap/decap, TTL, fragmentation, encryption are
   `l2encap` / `ethfrag` / `wireguard`; this module returns a decision, not bytes,
   and imports none of them.
+- **Event hook / FDB-change notifications** — the kernel bridge and EVPN daemons notify on FDB change; here the per-call
+  `LearnOutcome` is the notification and `learnStats` the totals an operator exports. No callback is built in.
+- **Port state (STP / blocking / learning-only)** — every frame handed to `learn` is learned and every `forward` decides;
+  membership is control-plane and `Ingress` is access-vs-core.
+- **Reject-not-evict at the cap, and a flat quarantine** — see *Capacity / DoS bound*; the alternatives are refused there
+  with their reasons.
+- **Per-frame authentication** — the caller's / control plane's concern; see the boundary note in *Capacity / DoS bound*.
 - **Control-plane distribution** — I-SID↔tenant binding, PE-id assignment, and
   membership import are the caller's; this table only stores the membership the
   caller hands it.
 
 ## Verification
 
-Offline only — pure logic, no live-interop surface. `zig build test-l2forward`
-(Debug + `-Doptimize=ReleaseFast`): BUM classification; known-unicast
-learn→forward + unknown-unicast fallback; full-mesh split horizon (access BUM →
-all of `{2,3,4}` ascending; core BUM → nobody; `BufferTooSmall`); a hostile-peer
-test that no claimed `ingress_pe` — member, non-member or edge value — buys a
-relay; a 4-PE fabric composition test that one access broadcast produces exactly
-3 copies and stops at hop 1; tenant
-isolation; MAC move (accepted, one entry); a MAC-hijack regression test — a move
-is reported as `.moved` and counted, a flapping MAC is quarantined at
-`max_mac_moves` (the refused move is *not* installed, the MAC floods to every
-member instead, sending more neither extends the quarantine nor lets ageing
-reclaim it, and the window's expiry re-opens learning); a tenant-provisioning
-regression test — 100 unconfigured I-SIDs presented from the data plane are each
-refused with `UnknownIsid` while `isidCount()` stays 0, and `addIsid` /
-`addMember` / `learnStatic` / `removeIsid` open and close the door; ageing (boundary fresh/expired,
-lazy miss + `tick` reclaim, re-learn refresh) and static-entry immunity; the
-per-tenant MAC-flood bound (`FdbFull` after reclaim, existing entries + moves
-still served) and I-SID/member caps; determinism (identical `(ops, now)` →
-identical decisions, insertion-order-independent sorted flood set); a permanent
-positive-control test proving that the superseded "members − src_pe" set is a
-non-empty relay where the rule demands nothing (so a regression there goes red);
-and a `testing.allocator` leak
-check that `deinit` frees every nested membership + FDB map. `zig fmt --check`
-clean; `zig build check-catalog` green.
-
-### External-anchor investigation: a real Linux bridge FDB (2026-08-01, partly)
-
-An audit task asked whether a real Linux bridge's FDB, observed in a namespace,
-could anchor this module's MAC-learning/ageing/flooding semantics against the
-kernel instead of against our reading of 802.1D. **This module never touches a
-real interface or a raw frame** — `Table` operates on abstract `{Isid, PeId,
-Mac, Time}` values the caller already parsed, so there is no wire format or
-socket for a kernel bridge to share with it; the literal request ("capture what
-the kernel's FDB does... and freeze those observations") cannot become a golden
-byte test the way `l2encap`'s frames might have. What the live kernel *can*
-validate is whether this module's documented semantic model — learn on receipt,
-flood unknown, age out — actually matches a conformant 802.1D device, which is a
-design-fidelity check, not a wire anchor.
-
-That check was run: a 3-port bridge (`br0` + 3 veth pairs, one port used to
-inject/observe each side) in an unprivileged `unshare --user --net` namespace
-(no `tcpdump`/`-Z`; a small `AF_PACKET` Python script sent/observed raw frames).
-Findings, with the exact commands/output:
-
-- **The real kernel default `ageing_time` is 300 s** — `ip -d link show br0`
-  (freshly created, nothing configured) reported `ageing_time 30000`
-  (centiseconds). This is a genuine, freezable numeric fact and is now a golden
-  test (`external anchor: our default aging_ticks matches...`, `src/root.zig`):
-  `Options{}.aging_ticks == 300` is pinned against this real, live-captured
-  kernel default, not merely against the 802.1D document.
-- **Learn-on-receipt.** A crafted frame (`src=02:00:00:00:00:01`, broadcast
-  dst) sent into port `veth1a` immediately produced, in `bridge fdb show br0`:
-  `02:00:00:00:00:01 dev veth1a master br0` — learned before any forwarding
-  decision, matching `learn`'s contract.
-- **Flood on unknown/broadcast destination.** The same broadcast frame was
-  observed (via raw sockets) arriving at *both* other ports (`veth2b` and
-  `veth3b`) — matching `forward`'s BUM → flood-to-all-members path for an
-  access-ingress frame.
-- **Learned unicast is not flooded.** After also learning
-  `02:00:00:00:00:02` behind the second port, a frame from the first port
-  addressed to that MAC arrived *only* at the port it was learned behind
-  (`veth2b`), not the third (`veth3b`) — matching known-unicast's single-PE
-  `Decision.unicast`, distinct from flood.
-- **Age-out.** With `ageing_time` lowered to `200` (2 s, for a practical test
-  window — the *default* 300 s was confirmed separately above, not used for
-  this timed part), the learned entry present in `bridge fdb show` right after
-  learning was gone from `bridge fdb show` after waiting past the window —
-  matching `tick`'s reclaim-after-expiry contract.
-
-All four match this module's documented contract exactly; **no disagreement
-was found**. None of the three behavioral findings (learn/flood/age-out) is
-wired into the automated suite: `learn`/`flood` have no real-frame counterpart
-in this module to assert against (there is nothing here that consumes a MAC
-learned from an actual received Ethernet frame — the caller already extracts
-`src_mac` before calling `learn`), and the age-out timing is real-wall-clock and
-therefore exactly the kind of flaky, non-reproducible assertion this audit was
-told to avoid pinning byte-for-byte. Only the one genuinely freezable number
-(the 300 s default) was promoted to an automated, offline, kernel-anchored test.
-No `/NOTICE` entry: black-box kernel behavior only, no source or design
-consulted (root `NOTICE` §0).
-
-## Status
-
-`gap · any · util · single_owner` · deps: none (std only) — canonical source is
-`pub const meta` in `src/root.zig`.
+Offline only — pure logic, no live-interop surface. `scripts/modtest l2forward`. Test classes (`src/root.zig`):
+- **Classification and decisions:** BUM by address shape (a group or all-zero source is never learned); known-unicast
+  learn→forward and the unknown-unicast fallback; a unicast decision names a member of the I-SID; tenant isolation.
+- **Split horizon:** full-mesh (access BUM floods every member ascending, core BUM nobody, `BufferTooSmall`); a hostile
+  peer whose claimed `ingress_pe` (member, non-member or edge value) cannot buy a relay; a 4-PE fabric composition test
+  that one access broadcast produces exactly the member copies and stops at hop 1; a permanent positive control that the
+  *members − `src_pe`* set is a non-empty relay.
+- **MAC move and quarantine:** a move is accepted as one entry and reported as `.moved`; a flapping MAC is quarantined at
+  `max_mac_moves` (the refused move is not installed, the MAC floods, sending more neither extends the quarantine nor lets
+  ageing reclaim it, the window's expiry re-opens learning; the cost per cycle is flat and repeatable); the window
+  boundary is inclusive; `max_mac_moves = 0` quarantines on the first move; a clock earlier than the window start does
+  not underflow.
+- **Tenant provisioning:** unconfigured I-SIDs presented from the data plane are each refused with `UnknownIsid` while
+  `isidCount()` stays 0; `addIsid` / `addMember` / `learnStatic` / `removeIsid` open and close the door; removing a
+  member purges its FDB entries.
+- **Ageing and static entries:** boundary fresh/expired, the clock-skew clamp, lazy miss plus `tick` reclaim, re-learn
+  refresh, static immunity, `learnStatic` pinning a dynamic entry and reclaiming expired ones at the cap.
+- **Capacity:** the per-tenant MAC-flood bound (`FdbFull` after reclaim, existing entries and moves still served), the
+  once-per-tick futile sweep, the I-SID and member caps, the documented default footprint (`SELF` test), an allocator
+  failure inside `learn` returned and counted.
+- **Observation:** `fdbIterator` (every entry once with `pe` / `age` / `static` / `quarantined` / `expired`; empty and
+  unknown I-SID) and `learnStats` counting every outcome and refusal.
+- **Determinism and leaks:** identical `(ops, now)` give identical decisions with a sorted flood set; a
+  `testing.allocator` check that `deinit` frees every nested map.
+- **Fuzz:** one harness (`l2forward-ops`, a random operation stream: no cap broken, no leak, a core frame never relays),
+  run by testkit's driver `L2FORWARD_FUZZ=<runs>[,<first seed>]`; an in-suite check pins that its corpus reaches every
+  outcome and that every op script runs its ops.
+- **Anchoring tests:** the default `aging_ticks` against a real Linux bridge's `ageing_time` and the MAC-move defaults
+  against RFC 7432 §15.1's N and M (see Anchoring).
+- **Kernel bridge fidelity (not automated):** the module never touches an interface or a frame, so a live kernel bridge
+  cannot be a wire anchor. Learn-on-receipt, flood of broadcast, no flood of a learned unicast and age-out were observed
+  once on a namespaced 3-port bridge to match the documented model; the age-out timing is wall-clock and is not pinned
+  in the suite, only the kernel's default ageing time (300 s) is.
+- **Not mutated:** the `Options` field defaults (comptime constants cannot take a runtime switch; the two RFC 7432
+  defaults are pinned by a test) and the `fuzz_test.zig` harness. Equivalent mutants of the last whole-module run are
+  clamp boundaries at equality (both arms yield 0) and the cost-only `last_futile_prune` bookkeeping.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-Survey findings (survey 2026-09-30), all fit CONVENTIONS §2 (pure, allocation-bounded); SPEC "Deliberately deferred" above stays authoritative for what is refused by design.
-
-- **FDB enumeration (survey 2026-09-30)** ✅ DONE 2026-11-16 (`Table.fdbIterator(isid, now)`, allocation-free, `{mac, pe, age, static, quarantined, expired}`) — an iterator or `dump(isid, out)` over `{mac, pe, age, static}`; the Linux bridge exposes this as `bridge fdb show` and every operator/debug tool needs it (today only point `lookup`, `fdbCount` exist). Effort: small.
-- ✅ **DONE 2026-11-16 (counters: `Table.learnStats()` / `resetLearnStats()`, one total per `LearnOutcome` plus each refusal; no event hook — the per-call `LearnOutcome` already is one):** **Learn/move/quarantine counters or event hook (survey 2026-09-30)** — the bridge and EVPN daemons notify on FDB change; here only the per-call `LearnOutcome` reports it. Effort: small.
-- **Local-port dimension (survey 2026-09-30)** — learning which *access* port a MAC sits behind, so a PE with several customer ports can unicast locally instead of delivering to all access circuits; a bridge does this natively. Effort: medium; changes the `Decision` shape (ask before starting).
-- **IGMP/MLD snooping (survey 2026-09-30)** — multicast currently floods like broadcast (`isBumAddress`); snooping limits it to interested PEs. Effort: large; probably belongs in a separate module.
+- **Local-port dimension** — learning which *access* port a MAC sits behind, so a PE with several customer ports can
+  unicast locally instead of delivering to all access circuits; a bridge does this natively. Effort: medium; changes the
+  `Decision` shape (ask before starting).
+- **IGMP/MLD snooping** — multicast currently floods like broadcast (`isBumAddress`); snooping limits it to interested
+  PEs. Effort: large; probably belongs in a separate module.
 
 ## Anchoring
 
@@ -456,6 +399,4 @@ Survey findings (survey 2026-09-30), all fit CONVENTIONS §2 (pure, allocation-b
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** narrow and only over defaults: src/root.zig:1304 pins aging_ticks to a live kernel bridge's observed ageing_time (30000 centiseconds) and :1436 pins the MAC-move defaults to RFC 7432 §15.1's stated N=5/M=180. Every FDB/learn/flood/split-horizon DECISION is still graded by this module's own tests; the live bridge's qualitative agreement was not wired in (timing-dependent, SPEC.md)
-
-**How it got there.** The anchoring work landed. DONE a58d626: aging default pinned to live kernel bridge 300s; rest is timing-dependent
+**What the tests actually contain.** narrow and only over defaults: the test `external anchor: our default aging_ticks matches a live kernel bridge's default ageing_time` pins aging_ticks to a live kernel bridge's observed ageing_time (30000 centiseconds) and `external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and M` pins the MAC-move defaults to N=5/M=180. Every FDB/learn/flood/split-horizon DECISION is still graded by this module's own tests; the live bridge's qualitative agreement was not wired in (timing-dependent, SPEC.md)
