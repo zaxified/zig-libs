@@ -5,15 +5,15 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `tlsclient` — std'
 - HTTP/1.1 **and HTTP/2** client + server, plus a reverse-proxy handler and
   an opt-in multicore (SO_REUSEPORT thread-per-core) accept engine.
 - **Model after:** `lalinsky/dusty` (1.1 client shape) + Go `net/http`
-  (redirect/header semantics, Server shape); `nghttp2` + h2spec later for
-  HTTP/2.
+  (redirect/header semantics, Server shape); h2spec and curl/nghttp2 are the
+  HTTP/2 oracles.
 - **Why:** a native client instead of shelling `curl` or depending on the
   churny `std.http` (explicit non-dependency). `dns` (DoH), `rdap` and the
   REST cluster (`router` → `ratelimit` → …) sit on this.
 - **Platform:** any. **Role:** both.
   **Concurrency:** single-owner handles; the Server runs its own
   per-connection tasks — handlers must be thread-safe if they share state.
-  **Deps:** `netaddr`, `datefmt`, `tlsclient`, `crc32`, `std.Io.net`.
+  **Deps:** `netaddr`, `datefmt`, `tlsclient`, `crc32`, `b64ct`, `std.Io.net`.
 
 Provenance: original work of the zig-libs authors (MIT); the HTTP/1.1 framing,
 the server, HPACK, HTTP/2 and the reverse proxy are clean-room from the RFCs.
@@ -824,8 +824,10 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   connections (Go multiplexes them on one — SPEC Backlog). A request with
   `Connection: Upgrade` + `Upgrade` always goes over HTTP/1.1.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304
-  responses get an empty body reader; HTTP/1.1 chunked trailers are
-  consumed and discarded.
+  responses get an empty body reader; an HTTP/1.1 chunked trailer section
+  is captured behind the head: `Response.trailer(name)` answers on h1 as on
+  h2, and `trailersTruncated()` says when lines past `max_head_bytes` were
+  dropped.
 
 ## Submodules
 

@@ -10,51 +10,6 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-19 (235/260, 24 eq) · src 426673ca3d838822
 
-**Audit 2026-11-19 (delta: wave-9 backlog batch).** 32 schemata mutants over the new non-test code (ReleaseSafe, one build of the module with its tests, each mutant under `setsid -w timeout` and `ulimit -v`, the whole suite per mutant): `Request.bodyOverCap` (its three conditions and the final `false`), the two `exceeded` pointers' wiring on h1 and h2, `bodyFramingFailed` (the call, each of the three arms, the status 400), `GunzipBody`'s end latch (the `done` and `failed` arms, the `failed` answer, both `ended` stores), `h2_client`'s refused-head path (the `malformed` guards in `processEvents` and `waitHead`, `fieldsValid` in the head and the trailer branch, its pseudo-field skip, the name-token, value and uppercase tests, the stored flag, `rst`, the sent RST_STREAM, `end`), and `multipart`'s part-body buffer (the buffer pointer, `seek`, `end` resets). 26 killed in the first pass; 2 more killed by tests added for the survivors (a refused stream holds none of its DATA; the `failed` answer of the latch). 3 EQUIVALENT: dropping the latch's `failed` arm and not storing `failed` at all (the second `end()` re-reads the already consumed trailer as the zero padding, which fails the CRC/ISIZE check again, and `refuseTruncated` is sticky, so every failing body fails again on every poll; the latch only stops the re-read), and `processEvents`' `if (p.malformed)` guard for a second HEADERS block on a refused stream (the block becomes `p.headers`, but `waitHead` tests `malformed` first and `deinit` frees it: nothing observable). 1 OPEN: `p.end` set by an invalid head that carries END_STREAM; the test for it (`an invalid head that carries END_STREAM is refused too`) was added after the last schemata build and is not re-run against that mutant (killed by construction: the mutant makes `ended` true). The audit found one defect, fixed in the same batch: `GunzipBody.end()` was not idempotent, so a VALID gzip request body read with `readSliceShort` (std's `readVec` swallows the first `EndOfStream` and the caller polls again) failed with `ReadFailed` and a 500 when `verify_inbound_trailer` was on (307 of 360 probe cases) -- found by the new `http-gzip-body` fuzz harness's first run. Other `Reader` wrappers checked for the same shape: `Client.Gunzip` (latched `done` / `failure`), `h1.ChunkedReader` (`.done`, sticky `fail_reason`), `ContentLengthReader` (`remaining == 0`), `RequestBody.Capped` (probe is repeatable), `multipart.Reader` (state-driven), `gzip.PaddedSource` (zeros forever): none has it.
-
-**Audit 2026-11-18 (delta: h2 OS-thread wait parking + WINDOW_UPDATE coalescing).** 38 schemata mutants over the new code in `h2_server.zig` (ReleaseSafe, one build of the module with its tests, the `h2_server` tests per mutant through the kit's runner, `setsid -w timeout` 25 s, `ulimit -v`): `announce` (sequential guard, the progress bump, the wake guard forced off and on), `waitForPeer` (the io path's `Closed`, the OS path's leading and trailing `gone` checks, the deadline latch, `>=` dropped and `>`, `Stalled` as `Closed`, the timeout dropped, the futex replaced by a yield, the `parked` decrement), the connection task's drain (its announce, its `parked` registration, its futex), the hoisted `stall_ms`, `emit`'s clock restart, `grantJob` (staged ignored, the open-stream guard, `avail` forced 0, the window doubled, the reset of `unsent`, the flush), `creditConn` (the zero guard, the add, the send test forced, the window doubled, the reset), `shouldSendCredit` (all four comparisons), and the flushes after `creditConn` in `onData`, `grantJob`'s no-job path and `removeJob`. 25 killed (17 by the hang cap), 12 EQUIVALENT, 1 UNOBSERVABLE (counted with the equivalents above): cost-only — the wake forced on, `announce` in sequential mode, a `parked` left raised, the drain spinning instead of parking; redundant — the trailing `gone` check (the caller loops back to the leading one), `now > deadline` (at equality the next round, one zero-length futex wait later, stalls), `avail < 0` (at 0 the second rule's `unsent >= 0` holds), the zero guard in `creditConn` (a zero credit only re-tests the rule earlier), the doubled window at both call sites (the peer's-room rule subsumes the half-window one except at the floor, 32 767 against 32 768), the flush after a discard in `onData` (`pump` flushes after `processEvents`), `grantJob`'s no-job path (unreachable: both callers hold the job); UNOBSERVABLE — the drain's announce, needed only when a worker parks in the few instructions between `pump`'s last announce and `gone.store` (needs a scheduler hook). Tests added during the audit because the first pass left three alive: a fiber handler waiting for credit released when the connection task leaves (the io path's `Closed`), connection credit flushed by the worker while its handler keeps running (`grantJob`'s staged), and retirement credit flushed (made deterministic: in the first run it read in 4 KiB batches, so the handler could retire before every DATA frame had arrived, and the three hangs it produced were re-run after the fix: one stayed killed, two are the equivalents above). No defect.
-
-Audit detail (2026-11-13, client interceptors): a delta mutation run over every function commit `1a338774` touched — the dispatch at the top of `request`/`requestPlain`, `requestIntercepted`, `Chain.proceed`, `checkDeadline`, `totalDeadline` (schemata, ReleaseSafe, strict verdict): 29 mutants, 28 killed (6 by the hang cap), 1 equivalent (`checkDeadline`'s `<= 0` → `< 0`, different only at a remainder of exactly 0 ns — needs an injectable clock). Seven tests were added first, because the existing ones let mutants through: with a budget set, `runBounded` cancels a retrying chain before `Chain.proceed`'s own deadline check is ever needed, so that check is now pinned under `inline_blocking`, where it is the only bound; also method/url/options reaching the exchange incl. an interceptor rewriting them, an outer retry re-running inner interceptors, no budget keeping the chain on the caller's thread, `request` on the TLS-capable and `requestPlain` on the http-only exchange, invalid options refused before any interceptor runs, an interceptor's error crossing the bounded path. No defect. The 2026-11-13 HPACK delta and the 2026-11-12 halves below still cover the rest.
-
-Audit detail (2026-11-12): the SERVER half (Server, h2_server, h1, body, form, multipart, servecontent, sse, problem, crossorigin, hostguard, bufpool, zeroize) had a new whole-file run — 3827 mutants, ReleaseSafe schemata plus a ReleaseFast build for the `zeroize` sites, strict verdict: 3667 killed, 101 equivalent, 59 unobservable (bind/listen/accept errno mapping, the reader's expired-flag re-tests, clearing `control.tr`/`tw` after the loop — each needs fault or race injection), 0 undecided, no defect; four former line-range "equivalents" in `h1.zig` were not and are now killed. The CLIENT half changed by ~15 production lines since the clean 2026-11-07 run (h2 raw-buffer wipes, the proxy credential wipe, `url.hexVal`), so it had a DELTA run over the touched functions: 45 mutants, 44 killed (wipes in ReleaseFast with a test that counts freed blocks still holding header bytes; the h2 guards on an h2-only binary with a clean subset baseline), 1 equivalent (`beginAssembly` appends to an empty list: no old block to free), 0 undecided. A partial extra run over the client files (1635 of 5200 mutants) left 52 open test-gap candidates — Backlog. 2026-11-13: the HPACK decoded-value wipe (decoder storage growth and shrink, `HeaderList.deinit`, dynamic-table eviction and deinit, the two new `zeroize` helpers) had a DELTA run, 31 mutants in a ReleaseFast schemata build: 25 killed, 6 equivalent (cost-only growth boundaries, the `len == capacity` fast path, a double wipe of an empty result, a zero-length `alloc`), 0 undecided; one survivor of the first pass was a real test gap (an in-place shrink to zero freed the block unwiped) and is now killed. The 52 test-gap candidates of the partial client run are decided (Backlog). Comments citing a private audit path were reworded.
-
-**Audit 2026-11-17 (delta: header-copy reuse + HPACK position hints).** 39 schemata mutants over the new code (ReleaseSafe, one build of the whole module with its tests, each mutant under `setsid -w timeout` and `ulimit -v`, the whole suite per mutant): `putHeader`'s call into `replaceInPlace`; in `replaceInPlace` the sharing check, the tail flag (forced false and true), the fit test (`>`→`>=`, `<=`→`<`, the tail conjunct dropped, the whole test dropped), the name compare (forced different, forced equal), the name's `copiedAt` and sharing guards, the name copy, the value move, the store-end update, the stored length; `copiedAt`'s three bounds (incl. `>`→`>=`); `shared`'s self-skip, its name operand, its return, both overlap comparisons (`<`→`<=`); in the HPACK `Encoder` the `recent_len` guard, `recall`'s none/static/dynamic split, both static compares, the eviction check, both dynamic compares, `remember`'s static bound and eviction term, the hint's use, the two slot writes, the insert-fits bound and the inserted sequence. 37 killed (1 by the hang cap). 2 EQUIVALENT: `shared` checking only other entries' values, not names — no API puts another entry's NAME into a header copy (`putHeader`/`addHeader` copy their own, `setHeaderStatic`/`setHeaderBorrowed` take a comptime name), so a name never overlaps a value's copy; and skipping the `recall` hit (always running `findField`) — cost-only, the very speed-up, measured in Backlog (5 565 → 2 867 instructions per block). Tests added BEFORE the run so the first pass was strict: a respelled name adjacent to another header's copy, an empty tail copy growing in place, a same-spelling replacement over a static name, a value lent from past the store's used end (would be overwritten by the next copy), `www-authenticate: ""` (static index 61, the bound of `remember`), and the hint slot values incl. after an eviction. No defect.
-
-**Audit 2026-11-17 (delta: `RewindableBody` and `FileSpool`, `src/rebody.zig`).** 64 schemata mutants over the non-test code (a `rebody.zig`-rooted test binary in ReleaseSafe plus a ReleaseFast build for the wipes, each mutant under `setsid -w timeout` and `ulimit -v`): the fill loop's growth guard, doubling, the `limit` cap and the 256 floor, the short-read exits (`<` to `<=`), the no-spool probe, `took`'s total, `max_total` boundary and the empty-slice guard, the tap, `grow`'s copy and wipe, `deinit`'s four wipes, spool release and state resets, `len`/`spooled`, every reset in `reader()`, every branch and offset of `stream` (the `pos`/`mem_len` split, the limit, the staging refill, the latch, `got == 0`, `got > want`), and `FileSpool`'s append offset and length, `readAt`'s end and cap, its error mapping, `deinit`'s truncate, length reset, close and destroy, and `create`'s ownership. 61 killed (9 by the hang cap; the two `deinit`/`grow` memory-wipe mutants only on the ReleaseFast build, where `Allocator.free` does not poison first). 3 EQUIVALENT: `readAt` with `offset > len` instead of `>=` (the empty read at the end returns 0 either way), and the two short-read exits written as `n == 0` instead of `n < want` (a reader that returned fewer bytes than asked has ended, so the extra read returns 0 and the same return follows). Tests added BEFORE the final runs because the first pass left eight alive: a non-power-of-two `memory_limit` (the doubling overshot it), the tap never handed an empty slice, a spool opened once per body, a spool that comes up short or reports more than it was asked for (read failure, latched until the next rewind), the staging and reader buffers wiped after `deinit` and a second `deinit` releasing nothing, `readAt` over a file that already holds bytes, one `FileSpool` reused for two bodies, a file opened without read or write access, and `create`'s descriptor closing. h2 request bodies (buffered and streaming server modes) re-read identically through the same code. No defect.
-
-**Audit 2026-11-15 (gap-wave delta).** 27 schemata mutants over `ConnSummary.timeout_phase` (ReleaseSafe, one build of the
-whole module with its tests, each mutant under `setsid -w timeout` and `ulimit -v`): the summary field's guard (dropped,
-inverted, arms swapped), the `sum_phase` initialiser, the three `timeoutPhase` call sites (skipped, `is_h2` flipped: the
-protocol-peek failure, the h2 path, the h1 path), and `timeoutPhase` itself (the write test dropped or returning another
-phase, the not-timed-out guard dropped and inverted, the h2 early return dropped or returning another phase, each of
-the three reader-phase arms returning another phase), plus the refactored `reportTimeout` (the `orelse return`, the
-`ResponseTimeout`/`WriteTimeout` choice and its deadline test, the h2 `ReadTimeout`, the keep-alive `IdleTimeout` /
-`NoRequestTimeout` choice, and the head and body error names). 25 killed. 2 are EQUIVALENT: the summary guard
-`sum_end == .timed_out` dropped, and `sum_phase` initialised to `.idle` instead of null. `sum_phase` is set only by
-the three sites that set `sum_end` from `connEnd`, and `timeoutPhase` is non-null exactly when `connEnd` is
-`.timed_out` (both read `tr.timed_out` / `tw.timed_out`); every other exit leaves `sum_end == .refused` with the null
-initial value, so the guard never changes the value. The first run also had 2 survivors that a test could reach
-(`timeoutPhase` without its not-timed-out guard, and `reportTimeout` without its `orelse return`): the summary's guard
-hid both, but `on_error` then reported `.timed_out` for every connection; each got a test (a connection that ends
-without a deadline, closed by the server or by the client, reports no `timed_out`), and the rerun killed both.
-The Audit line is cumulative: 59/60 with 1 eq + 25/27 with 2 eq.
-
-Audit detail (2026-11-15, `on_conn_closed`): a delta mutation run over the connection summary, 31 schemata mutants,
-ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the accept-failure refusal (hook
-skipped, requests, duration, end), `connMain`'s summary defer (start stamp, default end, requests, peer, the
-duration's subtraction and value, end, hook presence), each of the four assignments of `end`/`requests` (h2c preface
-failure, h2 exit, h1 exit), every arm of `connEnd` (read and write `timed_out`, read and write `errored`, the
-`canceled` exclusions, the `normal` result), and the request counter in `serveLoop` and `h2_server`'s `serveJob`
-(skipped, counted twice). 29 killed in the first run; 2 survived: a read or write that ended in cancelation was not
-tested to be `normal` rather than `errored` (the `!canceled` guards). The first attempt to reach them (cancel `serve`
-while blocked in accept) was consumed by the accept; cancelling after `shutdown` reaches the connection tasks, and the
-new test killed both. The first-run tests were also tightened (duration bounded by the test's own span and by the
-deadline, the h2c pre-preface timeout and reset, a write stall against a reset during the write, the slab-size
-refusal in `connMain`). 31/31, 0 equivalent. Not mutated: the defer ordering (summary after `.closed`), structural
-rather than a value.
-
-Audit detail: the 2026-11-07 mutation run is a WHOLE-MODULE run in four waves, mutant schemata over every production file in ReleaseSafe, burns judged in ReleaseFast on uninstrumented or single-mutant builds. 3148 mutants: 2927 killed, 221 equivalent (invariant per id in the tables: perf-only thresholds, defensive duplicates, ns-granularity and single-listener paths, hpack collision-only paths, `min`/re-check fast paths, unreachable-by-construction states), NOT counted and NOT mutated: 36 hpack comptime-table conditions (not mutable at runtime) and 36 former contract-panic guards. Wave 1 excluded those guards because a panic cannot be observed in-process; during the run they became error returns (no `@panic` is left in production code), and each one is pinned by a direct `expectError` test rather than a mutant. Defects the run found and fixed: unbounded streaming h2 body growth, `Detached.push` on a closed stream, a second GOAWAY raising last-stream-id, client trailers without END_STREAM, `delHeader("Trailer")` leaving set values, request bytes freed unzeroed on buffer growth/free (`zeroize.appendSliceWiped`), the base64 proxy credentials left on the stack. The earlier delta (2026-11-01, 60 mutants over `HostGuard`, bind mapping, timeouts) is subsumed.
-
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, HTTP_FUZZ) · ct n/a — HTTP codec; creds pass through (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point in four file groups: an Accept-Language range overflowed conneg's u8 subtag count; setHeader let a reflected control byte reach the h2 framer's assert, now refused like the inbound parser does; dispatched h2 streams shared one deflate state; buffered h2 request and upstream response bodies were unbounded by default, now capped; u31 stream ids and the request counter no longer overflow; interim 1xx heads capped at 8; caller-contract asserts → checked panics; HTTP_FUZZ after it; 2026-11-07 the h2 encoder/window/role, ChunkedWriter, ProxyHandler, normalizePathInto and initCompress contract panics, then every remaining one (Server/Client options checked at bind/request, bind/serve order, BYO stream buffers, pools, cleanPath, readBody, proxy credentials) → errors at the API boundary; no `@panic` left in production code) · wipe 2026-11-15 (h1 half: `serveStep` zeroes the used prefix of the request head, request-body scratch and trailer buffer on every exit before a `buffers_provider` slab is released or caller-owned buffers are reused; h2 half 2026-11-13; the gunzip scratch and the caller's own `Reader` buffer are not covered)
 
 **Performance:** ref 0.12–0.27× Go 1.26.8 net/http · fastest 0.68× hyper 1.11.0 (measured 2026-10-25)
@@ -63,7 +18,9 @@ Audit detail: the 2026-11-07 mutation run is a WHOLE-MODULE run in four waves, m
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
+
+Design + threat notes for auditors. Usage: see ./README.md. Provenance and design references: the module's [`NOTICE`](NOTICE) (a provenance note).
 
 ## Compared with
 
@@ -79,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server yet (Go, dusty, zzz have one; here it is the caller's, and the web-server consumer does exactly that — planned over the sibling `tlsserver` module, see Backlog), no HTTP/3, no PROXY-protocol parsing (→ Backlog; Go's stdlib has neither). The client cookie jar (`Client.Options.cookie_jar`, sibling `cookies.Jar` with the public-suffix list, 2026-10-05) and an outbound proxy (forward and `CONNECT`, Go's environment rules, 2026-10-05) are in. The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (Backlog); still behind Go: one exchange per h2 client connection (no multiplexing) and no CONNECT over h2.
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server yet (Go, dusty, zzz have one; here it is the caller's, and the web-server consumer does exactly that — planned over the sibling `tlsserver` module, see Backlog), no HTTP/3, no PROXY-protocol parsing on the accept path (the sibling `proxyproto` parses it; → Backlog; Go's stdlib has neither). The client has a cookie jar (`Client.Options.cookie_jar`) and an outbound proxy (forward and `CONNECT`, Go's environment rules). The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (*Design notes by feature*); still behind Go: one exchange per h2 client connection (no multiplexing) and no CONNECT over h2.
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -183,7 +140,7 @@ on an unstripped build of the plaintext-only probe shows zero
 TLS-capable probe, for contrast). See README.md's "Plaintext-only client"
 section and `sizeprobe/README.md` for the full numbers and methodology.
 
-**Auto-header suppression now agrees between the socket and socket-free
+**Auto-header suppression agrees between the socket and socket-free
 paths.** `StreamOptions.server_name`/`.now` were always `?[]const u8`/`?Now`
 (null = omit), because `serveStream` is the composable codec layer a caller
 can drive with no `Server` at all. `Server.Options.server_name` was
@@ -197,7 +154,7 @@ plain bool rather than exposing `StreamOptions.Now` on `Options`, since
 `Server` only ever wants "the server's own clock, or nothing" and never a
 caller-supplied clock source at this layer.
 
-**`Server.bind` no longer discards the underlying failure.** `BindError`
+**`Server.bind` keeps the underlying failure.** `BindError`
 stays the two-tag `{ BadAddress, ListenFailed, Canceled }` shape (unchanged,
 so no exhaustive `switch` breaks), but the `std.Io.net` error each tag
 collapsed — `IpAddress.parse`'s `ParseError` or `IpAddress.listen`'s
@@ -206,7 +163,7 @@ read via `bindErrorName()`. Same shape as `probe.ConnectOutcome.err_name`
 and for the same reason: `std.Io.net` reports an `anyerror`, not an errno,
 so there is no numeric code to carry, only `@errorName`'s static string.
 
-**Re-readable request body (2026-11-17, `src/rebody.zig`).** `Server.RewindableBody`
+**Re-readable request body (`src/rebody.zig`).** `Server.RewindableBody`
 drains `Request.reader()` once and hands out readers from byte 0 any number of times;
 `install(req)` points `req.reader()` at one through the `Request.decoded` seam (the
 one gzip decoding and `idempotency` already use), so no server path, `Request` field
@@ -224,6 +181,173 @@ file the CALLER opened (`http` keeps no path policy; an unlinked / `O_TMPFILE` f
 the intended use); its `deinit` truncates the file to 0. `RewindableBody.deinit`
 wipes the memory part and the staging buffers — the spool's storage is the caller's
 security boundary.
+
+## Design notes by feature
+
+What each feature is and the decisions behind it. When each landed is in `CHANGELOG.md`; how it was verified is in
+*Verification* and `AUDIT.md`.
+
+**Server lifecycle, timeouts, hooks (Go `net/http` parity, the S2 survey's R1, R2, R5).**
+- *Graceful lifecycle:* `shutdownGraceful(timeout_ms)`, `close`, `isDraining`, `setKeepAlivesEnabled`,
+  `registerOnShutdown` (8 hooks). Every socket connection registers a `ConnControl` with an atomic
+  `active/idle/closing` state; the loop publishes `idle` then reads `draining`, the shutdown sets `draining` then
+  claims `idle`, so neither side can miss the other. An idle claim shuts only the read side, so h2 can still send
+  its GOAWAY. h2: GOAWAY(NO_ERROR) once draining, streams above its last-stream-id refused. `Connection: close` is
+  decided when the head is written, as Go does.
+- *Timeouts:* `read_header_timeout_ms`, `idle_timeout_ms`, `response_timeout_ms` are ABSOLUTE phase deadlines (a
+  peer dribbling one byte per period defeats an inactivity timer); `Request.setReadDeadline` / `setWriteDeadline`
+  (Go `ResponseController`). The connection's phase (idle → head → body) lives in `TimeoutReader`, moved by
+  `StreamOptions.deadlines`. `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout`.
+- *`on_error`* (Go `ErrorLog`) on `Options`/`StreamOptions`/`h2_server.Options`, `ErrorKind` {handler_failed,
+  request_refused, server_failed, accept_failed}; fired through one `noinline` call so the serving frame stays
+  inside its stack budget.
+- *Connection summary:* `Options.on_conn_closed(ctx, ConnSummary{peer, requests, duration_ns, end, timeout_phase})`,
+  `ConnEnd = normal | timed_out | errored | refused`, fired once per admitted connection from `connMain` after
+  `.closed` and `reportTimeout` (so a deadline is `timed_out`); `errored` = the socket failed with no deadline
+  (not a cancelation); `refused` = admitted but never served. `requests` counts h1 requests whose first byte
+  arrived and h2 streams handed to the handler. `timeout_phase: ?TimeoutPhase` (`idle | head | body | write`) is
+  set exactly when `end == .timed_out`, from the same helper that names `on_error`'s timeout, so the two agree
+  (an h2 `ReadTimeout` is `idle`: h2 has no head/body phase at the connection level). A second callback rather than
+  a change to `ConnStateFn`, which would break every user (references: Go `ConnState`, nginx
+  `$connection_requests`, envoy connection logs). Not covered: `serveStream` driven by a caller (no socket).
+
+**Handler surface (R3, R4, R9, R10 and the survey's optional items).**
+- *Helpers:* `addHeader`/`getHeader`/`delHeader`, `redirect`, `writeError`/`notFound`, `Request.headerAll`,
+  `basicAuth` (+ client `basicAuthHeader`), `Server.BodyLimit` (Go `MaxBytesReader`; caller-owned, so neither
+  `Request` nor the serving frame grows). A redirect location resolving to `/\host` is refused (Go writes it).
+- *`http.form`:* `form.Form.parse(arena, req, limits)` (Go `ParseForm` + `ParseMultipartForm`;
+  `value`/`postValue`/`values`/`file`) and the client encoder `form.encode`/`encodeAlloc`/`escape`.
+  `body.checkMediaType` is Go's strict `mime.ParseMediaType` verdict. Hard failures (body over cap, broken
+  multipart, missing boundary) are errors, not Go's half-filled form; no temp files (the whole multipart body
+  must fit `max_multipart_bytes`); a `;` stays a byte and quoted-printable parts are not decoded.
+- *Every method token reaches the handler:* `Method` has `.connect`, `.trace`, `.other` (`Request.method_token` /
+  `methodName()`), `Method.fromToken`; no 501 for an unknown method on h1 or h2. h1 CONNECT is authority-form
+  (RFC 9112 §3.2.3, `*` refused), needs no Host, `req.path` empty; `ResponseWriter.tunnel(2xx)` answers without
+  framing (RFC 9110 §9.3.6) and hands the connection over through `Request.upgraded`. Client:
+  `RequestOptions.method_token` for `.other` (a 301-303 rewrites it to GET, as Go), `.connect` refused. The
+  reverse proxy relays the token and answers CONNECT 501. RFC 9112 §3.2.3/§3.2.4 forms Go dispatches anyway
+  (`GET x:443`, `PURGE *`, `CONNECT *` …) are refused.
+- *Upgrade and tunnels:* `ResponseWriter.upgrade`; `Request.upgraded` (Go `Hijack`: the connection's
+  reader/writer after a 101 or a 2xx to CONNECT, HTTP timeouts lifted).
+- *Lazy `100 Continue` on h1:* sent by `Request.reader` on the first body read (Go's `expectContinueReader`; RFC
+  9110 §10.1.1 allows either); a handler that answers without reading never sends it, and the response closes
+  the connection.
+- *`Request.bodyOverCap()`* (h1 and h2): true when the body crossed `max_body_bytes` or
+  `max_decompressed_request_bytes`, read from the `Capped`/`StreamBody`/`GunzipBody` `exceeded` flags through two
+  pointers on `Request`, so a middleware logs the 413 the server answers.
+- *A body framing failure answers 400* (`bodyFramingFailed`: a `ChunkedReader.fail_reason` or a short
+  Content-Length, checked after the 413 cases) when the handler fails and nothing was sent; nginx answers 400 for
+  a malformed chunked body, Go leaves the status to the handler.
+- *Re-readable body:* `Server.RewindableBody` (see *Design & invariants*).
+- *Test recorder:* `http.httptest.record(gpa, StreamOptions, wire, Config)` (Go `httptest.NewRecorder` +
+  `Result()`) runs `serveStream` over canned request bytes and parses what the server wrote into
+  `Recording.responses` (status, head, decoded body, trailers, each response's own wire bytes, `complete`) and
+  `tunnel`. Bodiless answers follow the request (HEAD off the wire, 1xx/204/304 by status); interim 1xx are
+  listed, `only()` skips them; output bounded by `max_output_bytes` (`error.OutputTooLarge`, never a cut
+  recording). h1 only.
+- *Content helpers:* `serveByAlpn` (Go `ServeTLS`'s h2-or-h1 choice over a terminated connection),
+  `sniff.detectContentType` (Go `DetectContentType`; WHATWG MIME Sniffing tables, clean-room from the standard),
+  `serveContent` (Go `ServeContent` for an in-memory representation: `conditional` + `range` + `sniff`, with a
+  range set bounded by the representation's size), `CrossOriginProtection` (Go 1.25; bypass patterns are a
+  predicate, routing being `router`'s).
+- *URL components:* `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),
+  `QueryIterator`, `decodeComponent`, and a strict `decodePath` that refuses a decoded `/` or NUL and any
+  malformed escape, so an encoded separator can never reach a router. A malformed escape is refused in a query
+  component too (as Go's `url.ParseQuery`), unlike the lenient WHATWG body decoder `body.urlencoded`. Caller
+  buffers, no allocation. `router` matches raw bytes by design.
+- *Multipart:* any parameter named twice (case-insensitive) drops the whole disposition, as `mime.ParseMediaType`
+  does; `name`/`filename` are unescaped in place (`parse` takes `[]u8`), `body.ContentType.paramUnescaped` copies;
+  only a backslash before a tspecial escapes, as Go. `multipart.Reader` reads a `*std.Io.Reader` part by part,
+  each part body a reader that ends at the next delimiter (Go's `mime/multipart.Reader` shape), same grammar,
+  limits and refusals as `parse`, except that a header block over the cap that never ends is `HeadersTooLarge`
+  (`MalformedBody` to `parse`). `StreamPart.body` has a `body_buf_len` (64-octet) buffer: `peek`/`take` work up to
+  that size; a longer one is std's assert, as for any reader of that capacity.
+- *HTTP/1.0 `Connection: keep-alive`* is honoured, echoed, and the connection closed when the body has no known
+  length (RFC 9112 §9.3).
+
+**Response encoding.** `Server.EncoderProvider` (`acquire`/`release` per response, no codec linked here) in
+`Options`, `StreamOptions` and `h2_server.Options` as `encoder_provider`: `preferredBy` is the q-value choice
+against gzip (a tie goes to the provider, an absent header admits nothing); acquired only past the eligibility
+gate, released when the request is over; none free → gzip or identity. Inbound gzip on h2 uses the same
+`GunzipBody`, cap and 413 as h1 (`h2_server.Options.max_decompressed_request_bytes` / `verify_inbound_trailer`,
+forwarded by `connMain`; working memory from the stream's arena only for a gzip request).
+
+**HTTP/2 server engine.**
+- *Dispatcher waits:* with `Dispatcher.io` the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park
+  on a `std.Io.Condition` (`Session.moved`) that `pump`, a retiring handler and the connection task's exit
+  broadcast; a `progress` counter sampled under the lock makes the wait immune to a wakeup between unlock and wait.
+  Without `io` a waiting handler parks its OS thread on a futex over `progress` (`std.Io.Threaded.global_single_threaded`;
+  `announce` wakes it, the `parked` count skips the syscall when nobody waits) and gives up after
+  `Dispatcher.stall_timeout_ms` (default 60 s; null = no deadline) without its stream moving: a response write
+  ends the stream with RST_STREAM(CANCEL), a body read fails. Reference: nginx `send_timeout` /
+  `client_body_timeout` (60 s between two successive operations, h2 streams included); Go `x/net/http2`'s
+  per-stream write deadline resets with INTERNAL_ERROR, this module keeps CANCEL for every abandoned wait.
+- *WINDOW_UPDATE coalescing* (`Session.shouldSendCredit`): credit is sent once it is at least half the window
+  (nghttp2 `nghttp2_should_send_window_update`, h2o's connection window) or at least the peer's remaining room
+  (Go `x/net/http2` `inflow.add`, h2o's stream window); Go's extra 4 KiB floor is not taken (nghttp2 and h2o have
+  none). Unsent stream credit of an ended stream is dropped; unsent connection credit stays owed.
+- *Frames on a stream we reset* (the last 32): ignored (RFC 9113 §5.1/§6.9), a trailer block there still
+  HPACK-decoded, and discarded DATA credited back to the connection window on every path.
+- *HPACK encoder hint:* `Encoder.recent` keeps, per block position (the first 32), the static index or the
+  dynamic-table SEQUENCE where that position's field was found or inserted in the previous block; `encodeField`
+  checks that one candidate with `mem.eql` against the TABLE entry's bytes (never the caller's previous slices, so
+  a refilled buffer at the same address is no false hit) plus a live-sequence check, and runs `findField` only on a
+  miss. Byte-identical output: a live exact pair has exactly one answer, since a pair is inserted only when no live
+  entry holds it. Measured (instructions per block, `:status` + 11 security headers): 5 565 → 2 867; adversarial
+  rotation (every hint misses): 6 049 → 6 685.
+
+**Client.**
+- *Interceptors:* `Client.Options.interceptors: []const Interceptor` wraps `request` and `requestPlain` (auth,
+  retry, tracing). Reference shape: Go `RoundTripper` as users wrap it and OkHttp's application `Interceptor` /
+  `Chain.proceed`: `Interceptor{ctx, intercept(ctx, *Chain) Error!Response}`, `Chain{client, method, url, options}`
+  (a copy the interceptor may replace before `proceed`). The first entry is the outermost; `proceed` 0 times
+  short-circuits (`error.Intercepted`), n times retries (the interceptor `deinit`s every `Response` it drops). Each
+  interceptor gets its own `Chain` copied from the previous one, so a chain can neither run past the list nor
+  recurse deeper. Redirects and the stale-connection retry stay inside one `proceed`. `total_timeout_ms` bounds the
+  whole chain, retries included (Go's `Client.Timeout`). Not intercepted: `requestStreaming*` / `putFile*` (a
+  streamed body cannot be replayed) and `H2Session`.
+- *h2 via ALPN:* `Client.Options.http2 = .alpn()` (a function pointer like `decompress`, so a client without it
+  links no h2 code). Every `https://` dial offers `h2`,`http/1.1`; when the server picks h2 the exchange runs as a
+  stream on that connection — redirects, streaming, `decompress`, the cookie jar, `max_conns_per_host` and the
+  timeouts alike. The request head is rendered by the h1 head writer and split back into fields (one rule for
+  cookies, credentials on a cross-origin hop, `User-Agent`, `Accept-Encoding`, a caller's `Host` →
+  `:authority`); a response field that is not a lowercase token or carries a byte h1 cannot is
+  `MalformedResponse`. `Response.proto()`, `Response.trailer`, `error.StreamReset`; a body closed early resets the
+  stream (CANCEL) and pools the connection, as Go. A request asking to upgrade dials without h2. One exchange per
+  connection (multiplexing: *Backlog*).
+- *`h2_client` validates response fields:* a final response head whose field has an uppercase or non-token name or
+  a CR/LF/NUL value is a stream error (RST_STREAM PROTOCOL_ERROR, RFC 9113 §8.1.1/§8.2.1) and the waiting call
+  fails `MalformedResponse`; an invalid trailer block is dropped like one with a pseudo-header.
+- *Transparent gzip:* `Client.Options.decompress = .gzip(max_bytes)` (null = off; `max_bytes` a decoded-size cap
+  Go lacks; a function pointer because a runtime flag cost every client +23 KB in the size probe, this +1 KB).
+  Go's rules for asking (no caller `Accept-Encoding`, no `Range`, not HEAD) and for decoding (`Content-Encoding:
+  gzip` exactly, a response that may have a body; a 204 or `Content-Length: 0` answer is left alone); the
+  response hides `Content-Encoding`/`Content-Length` (`Response.uncompressed`); every member's CRC-32/ISIZE is
+  checked, members are decoded back to back, anything else after them is `error.CorruptGzip`; a cut stream is
+  refused. `identity` is sent on HEAD and Range where Go sends nothing; the header's FHCRC is skipped.
+- *`PoolOptions.max_conns_per_host`* (0 = unlimited, Go's default) counts an origin's dialing, in-use and idle h1
+  connections. At the cap a request takes an idle connection, else parks on a futex until one is pooled or
+  closed, bounded by `total_timeout_ms`; a stale-connection retry evicts the origin's oldest idle connection
+  rather than wait. h2 sessions are not counted.
+- *h1 response trailers:* `setupBody` captures a chunked body's trailer section into the tail of `head_buf`
+  behind the head (`Conn.head_len`), so `Response.trailer` answers on h1 as on h2; a section past that space drops
+  its excess lines (still read, the connection still pools) and says so through `Response.trailersTruncated()`.
+- *CA bundle sharing:* `Client.loadCaBundle()` loads eagerly; `Client.CaBundle` (bundle + its own lock) is shared
+  through `Options.shared_ca`, borrowed and never freed by a client — a shared object because `tlsclient` may
+  write a platform-verified root into it under its lock.
+- *`Options.inline_blocking`* runs every blocking phase on the calling thread (the module doc says the blocking
+  phases otherwise run on the `Io`'s pool: make the `Io` after the sandbox). std's `HostName.connect` starts the
+  lookup and one connect per address as tasks, so with the option the client calls `HostName.lookup` directly
+  into a 256-entry local queue and tries the addresses one at a time (`connectHostInline`); std's parallel
+  connect is lost, and the timeouts cannot interrupt a blocked phase. Residual: *Known limits*.
+- *Cookie jar:* `Client.Options.cookie_jar`, consulted on every request and redirect hop; the sibling
+  `cookies.Jar` with the public-suffix list.
+
+**Reverse proxy (R7).** `Config.flush` (`.auto` = Go: SSE or an undeclared length flushed per read;
+`.immediate`). Hooks `rewrite`/`modify_response`/`error_handler` (Go `Rewrite`+`SetXForwarded`/`ModifyResponse`/
+`ErrorHandler`), one failure path `fail` for everything before the head; the default 502 page has a body (Go's is
+empty). A client's own `X-Forwarded-Proto`/`-Host` are not relayed in front of ours. Upgrade passthrough:
+client `Response.upgraded` + `Connection: Upgrade` passed on, spliced in two `Io` tasks, HTTP timeouts lifted.
 
 ## Threat model / out of scope
 Hardened for direct internet exposure (no reverse proxy required):
@@ -257,8 +381,8 @@ Hardened for direct internet exposure (no reverse proxy required):
   keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
   comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
   zip-bomb-capped (`max_decompressed_request_bytes` → 413, h1 and h2c alike). **Inbound gzip trailer verification**
-  (`Options.verify_inbound_trailer`, off by default — DONE 2026-09-28, see backlog strikethrough
-  below): std's `flate.Decompress` reads the RFC 1952 trailer but never checks its CRC-32/ISIZE, so
+  (`Options.verify_inbound_trailer`, off by default, because it refuses bodies that were accepted before it
+  existed; zlib, Go's `compress/gzip` and Python's `gzip` all refuse a bad trailer): std's `flate.Decompress` reads the RFC 1952 trailer but never checks its CRC-32/ISIZE, so
   a corrupt-trailer body decodes and reaches the handler as long as the deflate stream itself
   parses. When on, `Server.GunzipBody` decodes `.raw` deflate instead (`gzip.skipGzipHeader` parses
   the header itself — FEXTRA/FNAME/FCOMMENT/FHCRC skipped in RFC order, a reserved FLG bit or a
@@ -295,6 +419,15 @@ Hardened for direct internet exposure (no reverse proxy required):
   before this a connection kept "productive" by the protocol layer's own accounting — one stream
   fed an occasional single byte, which resets every no-progress and per-stall budget in its path —
   ran unbounded (A1 http F7).
+- **Credentials in memory and timing:** request bytes, raw h2 header blocks, decoded HPACK storage, dynamic-table
+  entries and the proxy credentials are zeroed before every free (`zeroize`), so they do not survive a `free` in
+  ReleaseFast; the h1 request head, request-body scratch and trailer buffer are wiped on every exit before a
+  `buffers_provider` slab is released (the card's `wipe` record; the gunzip scratch and a caller's own `Reader`
+  buffer are not covered). The h1 field-value check is vector/SWAR, never a table indexed by a header byte; the
+  HPACK encoder emits `authorization`, `cookie`, `proxy-authorization` and a caller list
+  (`Encoder.Options.default_sensitive`) as raw never-indexed literals (RFC 7541 §7.1.3). The HPACK **decoder**
+  still walks a Huffman-coded secret per bit — RFC-mandated input that cannot be refused (low-medium: a local cache
+  side channel).
 - **Header injection:** outbound header names/values reject CR/LF/NUL (response-splitting guard) and every other control byte (RFC 9110 §5.5, the inbound parser's predicate — a value `setHeader` accepts is valid on h1 and h2 alike).
 - **Redirect hops (client):** on an origin change the client drops `Authorization`, `Cookie` and
   `Proxy-Authorization` and replaces a caller-supplied `Host` with the hop's authority (A1 G3/G4,
@@ -321,133 +454,73 @@ Hardened for direct internet exposure (no reverse proxy required):
   normalization beyond what `router` does.
 
 ## Verification
-HPACK vs RFC 7541 Appendix C vectors (bytes + decoded fields + dynamic-table state per step); h2
-offline scripted client↔server pipe exchanges + h2spec-style negatives; h2 DoS attack-sim tests
-(rapid-reset proves no handler runs); serveStream goldens for conditional/range/multipart/content-
-neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Over ↔ serveStream).
-Auto-header suppression: byte-exact `serveStream` goldens for `server_name = null`, `now = null`
-and both together, plus a live-loopback `Server` pair proving `Options` defaults put both headers
-on the wire and `Options{ server_name = null, emit_date = false }` produces a head byte-identical
-to the socket-free suppressed golden — the agreement between the two entry points is the assertion,
-not either suppression alone. `bind`: a forced `AddressInUse` (second listener on an already-bound
-port) pins `bindErrorName()` to the exact underlying tag; a forced parse failure asserts a name
-survives without pinning which std tag it is.
-**Trailers are anchored against a live third party, not only against ourselves**
-(`src/curl_interop.zig`): a real `Server` on loopback answered by `curl` 8.18 / nghttp2 1.68 on both
-`--http1.1` and `--http2-prior-knowledge`, asserting curl's own header dump carries the trailer
-fields *after* the head — i.e. curl parsed a trailer section, rather than our bytes merely containing
-those strings. Self-interop cannot catch a shared misreading of the framing (the writer and reader
-agree on the same mistake); mutation testing confirms the difference — emitting the h1 trailer block
-before the last-chunk line fails curl outright (exit 56), and leaving END_STREAM on the last h2 DATA
-frame makes curl/nghttp2 *silently discard* the trailer frame and still exit 0, so on h2 the
-load-bearing assertion is the surfacing check rather than the exit code. Offline byte goldens pin the
-h1 wire layout and the h2 END_STREAM placement; the forbidden-field policy has its own rejection
-tests for both gates. **h2 server streaming is anchored against curl too**, which is the right
-direction here (curl is the client): a 256 KiB upload consumed incrementally — it cannot complete at
-all unless the consumption-driven WINDOW_UPDATEs are accounted right, since nghttp2 simply stops at
-the 65 535-octet initial window — a complete response produced from the first 8 octets of that
-upload (§8.1 + RST_STREAM(NO_ERROR), which curl accepts, exit 0, surfacing the early body), and a
-256 KiB flushed response whose END_STREAM rides an empty DATA frame, a framing only the streaming
-engine emits. Offline, the load-bearing assertions are about the frames actually on the wire: the
-handler answering a stream that NEVER carried END_STREAM (dispatch timing), and the split of
-returned window credit between the stream and connection windows — the only observable that
-distinguishes consumption-driven from arrival-driven crediting, since the *totals* agree either way.
-9 mutations were run and each turned tests red; the sharpest is arrival-driven crediting on the
-streaming surface (8 tests red, 2 of them curl's). h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
-large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
-backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
-buffer-pool reuse/bounded proofs. Run: `zig build test-http`.
 
-**Client interceptors (`Options.interceptors`, `src/interceptor_test.zig`, 2026-11-13):** loopback `Server` origin, no foreign oracle (nothing to compare byte for byte; the reference shape is Go's `RoundTripper` / OkHttp's `Interceptor`). Tests: order (first in the list is outermost, `A>B>B<A<`), a header added by an interceptor reaching the server on `request` and `requestPlain`, a retry on a 503 returning the second `Response` (and the last 503 when the budget ends) under `std.testing.allocator` (no leak), short-circuit with `error.Intercepted` (nothing dialed), a 2-hop redirect chain inside ONE interceptor call (3 server hits, injected credential kept on same-origin hops), `requestStreaming*` not intercepted, an interceptor that retries forever ended by `total_timeout_ms` (`Timeout`) on both entry points, and an empty list changing nothing.
+Run: `scripts/modtest http` (offline suite); `zig build interop-http` for the live oracles (needs `go`, `curl`,
+h2spec and the oracle venv; a module spawns no foreign toolchain, CONVENTIONS §9). The anchors themselves are listed
+under *Anchoring*.
 
-**Plaintext-only client (`requestPlain`/`requestStreamingPlain`/`putFilePlain`):**
-a Zig test proves the *behavioral* half — `error.UnsupportedScheme` on
-`https://` (direct or via redirect) with `dialCount()` staying 0, i.e. no
-socket is ever opened for it — plus loopback functional tests (GET, POST,
-PUT-a-real-file, pooling) proving the plaintext path works, not just rejects.
-What no Zig test can show — a symbol's *absence* from a differently-scoped
-binary is not an observable of any already-linked test binary — is proved
-separately by `modules/http/sizeprobe/` (not wired into `zig build`): two
-minimal executables per target, one calling only the TLS-capable entry
-points and one calling only the plaintext-only ones, `nm`'d for zero
-`tls.Client`/`Certificate`/curve/hash symbols and compared for size. See
-`sizeprobe/README.md` for the measured numbers (last run: 324 888 B saved on
-x86-64-musl/ReleaseSmall, 685 328 B on mips-linux-musleabi/ReleaseSmall,
-static).
-
-**Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
-"typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/
-`ChunkedReader` (request/status line, header block, chunked framing), `body.ContentType.parse`/
-`urlencoded` (Content-Type + form body), `proxy.relayHead` (a backend head through the reverse
-proxy: no hop-by-hop field relayed), `form.parseSource` (a whole form over method, type, query
-and body), `multipart.parse` (form-data boundary/part parse) and
-`multipart.Reader` (the streaming parser, fuzzed differentially against `parse` over arbitrary read
-sizes and buffer lengths: same parts, same end),
-`range.parse` (Range header), `hpack.Decoder.decodeBlock` (HPACK header-block decode), and
-`h2.parseFrame`/`h2.Connection.recv` (HTTP/2 frame decode, both pre- and post-handshake). They run
-as a deterministic empty-input smoke test under plain `zig build test` and as real continuous fuzzing
-under `zig build test-http --fuzz`; verified green in both Debug and `-Doptimize=ReleaseFast`. The
-same pattern covers `jwt.parse`/`jwt.parseJwks` (compact-token + JWKS parse, `modules/jwt`) and
-`x509.extensions.findExtensions`/the extension-value parsers + `x509.chain.parsePssParams`
-(`modules/x509`) — see those modules' own test files. **Deferred, not fuzzed:** any path that calls
-into `std`'s own parser on attacker bytes without this collection's bounds-safety wrapper around it —
-namely `std.crypto.Certificate.parse` (used by `x509.chain`'s per-link verify once a certificate is
-accepted for path building; `x509`'s own `extensions`/`parsePssParams` DER walks are fuzzed instead,
-see `x509/root.zig`'s doc comment) and `std.compress.flate.Decompress` (`gzip.zig`'s inbound
-request-body decompression, size-capped by `max_decompressed_request_bytes` but not itself
-fuzz-verified here). These are std's parsers, not ours, to fix or fuzz-harness directly; ReleaseSafe
-(below) is exactly the mitigation for that residual, un-fuzzed surface.
-
-**h2 server conformance against h2spec** (2026-10-04, `tools/interop.zig`, `zig build
-interop-http -- --h2spec PATH`): summerwind/h2spec 2.0.0, all 145 cases, run twice — against the
-real `Server` with h1 and h2c prior knowledge on one port, and against `h2_server.serveStream` alone
-(the ALPN "h2" entry point). Both 145/145. On the shared port case 3.5/2 ("invalid connection
-preface") is allowed either way: those bytes are a malformed HTTP/1.1 request there, answered 400 as
-Go's h2c handler does, and whether h2spec reads the 400 or the close first is timing; the h2-only
-phase holds the engine to it. The first run failed 3.8/1 and 7/1: after the client's GOAWAY the
-session returned without a GOAWAY of its own, and the socket was closed with the client's next
-PING unread, so the kernel reset the connection. Fixed (GOAWAY(NO_ERROR) once the peer's streams
-are served; `Server` closes h2c connections lingering: write side shut, ≤ 64 KiB read and dropped,
-then close), each with a regression test that fails without its half (mutation-checked; the
-lingering one deterministic: a GOAWAY followed by 32 KiB of PINGs, `ConnectionResetByPeer` 3 of 3
-without it). The suite needs no fixture: it is the oracle, run before a release.
-
-**Go's standard library as a differential oracle** (2026-10-05, `tools/go_oracle/` → committed
-`src/go_oracle_vectors.zig` → replayed by `src/go_oracle.zig`, no Go at test time). The cases are
-ours; go1.26 answers them through its public API only: a real `net/http.Server` on loopback for h1
-(which requests reach the handler, with what method, target and body, and whether the server
-refuses itself), `http.ServeContent` for preconditions + ranges (status, `Content-Range`, the parts
-of a `multipart/byteranges`), `url.ParseQuery`/`QueryUnescape`/`PathUnescape`, and
-`multipart.Reader.NextRawPart` + `mime.ParseMediaType`, and `http.Transport.RoundTrip` against a
-loopback peer that answers canned bytes (the client area; ours is `Client.requestPlain` against the
-same peer). Every disagreement is in a per-area table
-with the RFC rule, which side is off it, and what WE answer -- a case that diverges without an
-entry fails, and so does an entry whose case agrees again or diverges differently. 489 cases; the
-tables hold 17 (h1), 25 (serve), 7 (url), 14 (multipart), 7 (client), 4 (proxy), most of them us being stricter than Go
-where the RFC allows it (obs-fold, bare LF, CL+TE, invalid Range ignored rather than 416) or Go off
-the RFC (`bytes=-0` → 206 `bytes 100-99/100`, an unknown range unit answered 416, Range honoured on
-POST, a sign accepted in a range position). It found six defects here, all fixed the same day with
-tests that fail without the fix (13 schemata mutants over the fixes, 13 killed):
-`Transfer-Encoding` split over two field lines was judged line by line, so `gzip` + `chunked`
-framed as chunked while the same list on one line was refused (TE.TE desync); an HTTP/1.0 request
-with `Transfer-Encoding` was decoded as chunked instead of refused (RFC 9112 §6.1 MUST); a comma
-inside an entity-tag split the tag (`If-Match: "x,"v1"` matched `"v1"`); `*` asked for an ETag
-rather than for a representation, so a resource with only `Last-Modified` let `If-None-Match: *`
-through; `31 Feb` parsed as 2 March; a malformed or folded part header in multipart was skipped,
-so a folded `Content-Disposition` lost its `name`. The client area (added the same day) found two
-more: a response `Transfer-Encoding` other than the sole `chunked` was framed as chunked anyway (or
-read to close) and handed over still coded, HTTP/1.0 + TE was decoded; and obs-fold in a response
-was refused where RFC 9112 §5.2 makes a user agent unfold it (6 mutants, 6 killed).
-`zig build interop-http -- --phase go`
-re-takes the oracle and fails when a fresh run differs from the committed vectors.
-
-**The client over real TLS + ALPN against Go** (2026-10-12, `interop-http -- --phase alpn`, in
-every full run; needs `go`): `go_oracle -h2tls` serves two httptest TLS listeners, one offering h2,
-one HTTP/1.1 only. `Client` with `Options.http2` must land on h2 and on HTTP/1.1 respectively, read
-trailers, decode gzip, follow a redirect, stream an upload and keep one connection on the h2
-listener; and the request Go's server saw from us must equal the one it saw from Go's own Transport
-(`/go`), `User-Agent` aside. No TLS server exists in this module, so this is where ALPN itself is
-tested; the unit tests drive the same h2 exchange over h2c prior knowledge.
+- **Codec and serving loop, offline:** HPACK against RFC 7541 Appendix C (bytes, decoded fields, dynamic-table state
+  per step); scripted h2 client↔server pipe exchanges and h2spec-style negatives; h2 DoS attack simulations
+  (rapid-reset proves no handler runs; the shipped default limits are pinned, not only the mechanisms);
+  `serveStream` goldens for conditional/range/multipart/conneg; smuggling, timeout and size negatives; a BYO-TLS
+  in-memory dogfood (`connectH2Over` ↔ `serveStream`). Auto-header suppression: byte-exact `serveStream` goldens
+  for `server_name = null`, `now = null` and both, plus a loopback `Server` pair whose suppressed head is
+  byte-identical to the socket-free golden (the agreement of the two entry points is the assertion). `bind`: a
+  forced `AddressInUse` pins `bindErrorName()` to the exact tag.
+- **Trailers and h2 streaming against curl** (`src/curl_interop.zig`): a real `Server` on loopback answered by curl
+  / nghttp2 on `--http1.1` and `--http2-prior-knowledge`, asserting curl's own header dump carries the trailer
+  fields after the head (curl parsed a trailer section, not merely received the bytes). h2 server streaming: a
+  256 KiB upload consumed incrementally (it cannot complete unless consumption-driven WINDOW_UPDATEs are right,
+  since nghttp2 stops at the 65 535-octet initial window), a complete response from the first 8 octets of an
+  upload (§8.1 + RST_STREAM(NO_ERROR)), and a 256 KiB flushed response whose END_STREAM rides an empty DATA frame.
+  Offline the load-bearing assertions are the frames on the wire: a handler answering a stream that never carried
+  END_STREAM, and the split of returned credit between stream and connection windows (the only observable that
+  tells consumption- from arrival-driven crediting). Offline byte goldens pin the h1 trailer layout and the h2
+  END_STREAM placement; the forbidden-field policy has rejection tests for both gates.
+- **Reverse proxy and h2 upstream:** loopback h1-proxy → h2c-backend end to end (forwarded headers, hop-by-hop
+  strip, large-body flow control, concurrent clients over one shared upstream connection, 502 on a dead backend);
+  pool-level multiplexing (two streams in flight on one connection), sequential reuse, buffer-pool reuse and
+  bounds.
+- **Client:** loopback `Server` origins for redirects, pooling, `max_conns_per_host`, gzip, h1 and h2 trailers,
+  `inline_blocking` (an `Io` whose vtable counts task starts: 0 with the option); interceptors
+  (`src/interceptor_test.zig`: order, header injection on `request` and `requestPlain`, retry with no leak,
+  short-circuit with nothing dialed, a redirect chain inside one call, `requestStreaming*` not intercepted, a
+  never-ending retry ended by `total_timeout_ms`, an empty list changing nothing). The plaintext-only client:
+  `error.UnsupportedScheme` on `https://` (direct or by redirect) with `dialCount()` 0, plus loopback GET/POST/PUT-
+  a-file/pooling; the symbol-absence half is `sizeprobe/` (not wired into `zig build`; method and figures in
+  `sizeprobe/README.md`).
+- **Live interop oracles** (`zig build interop-http`, `tools/interop.zig`, `tools/oracles.zig`): **h2spec**
+  (`--h2spec PATH`), the whole suite against the real `Server` with h1 and h2c prior knowledge on one port and
+  against `h2_server.serveStream` alone (the ALPN "h2" entry point), all passing; on the shared port case 3.5/2
+  ("invalid connection preface") is allowed either way, since those bytes are a malformed HTTP/1.1 request there
+  (answered 400, as Go's h2c handler does) and which arrives first is timing; the h2-only phase holds the engine
+  to it. **Go's standard library** (`--phase go`): our cases answered by go1.26 through its public API only (a
+  real `net/http.Server` on loopback, `http.ServeContent`, `net/url`, `mime/multipart`, `http.Transport` against a
+  canned loopback peer, `httputil.ReverseProxy`, `DetectContentType`, `CrossOriginProtection`, the R3/R4/R8 areas),
+  frozen into `src/go_oracle_vectors.zig` and replayed by `src/go_oracle.zig` with no Go at test time; every
+  disagreement is a per-area table entry with the RFC rule, which side is off it and what we answer — a case that
+  diverges without an entry fails, and so does an entry whose case agrees again; a fresh `--phase go` run fails
+  when it differs from the committed vectors. **TLS + ALPN against Go** (`--phase alpn`): two Go httptest TLS
+  listeners (h2, and HTTP/1.1 only); `Client` with `Options.http2` must land on each, read trailers, decode gzip,
+  follow a redirect, stream an upload and keep one connection, and the request Go's server sees from us must
+  equal the one from Go's own Transport (`User-Agent` aside). This is where ALPN itself is tested, since this
+  module has no TLS server. The Python phases (`--phase problem|sse`) are under *Anchoring*.
+- **Fuzz:** every untrusted-wire parser has a harness asserting "typed error or valid result, never a panic", run by
+  testkit's deterministic driver as `HTTP_FUZZ` with fixed-seed reach tests in every run: the h1 request head,
+  response head and chunked framing, Content-Type and urlencoded bodies, forms, buffered and streaming multipart
+  (the streaming parser differentially against `parse` over arbitrary read sizes), Range, HPACK blocks and
+  Huffman, h2 frame parse and `recv` (cold and warm), the proxy's head relay (no hop-by-hop field relayed), the
+  h1 dispatch (`http-server-dispatch`), sniffing, the handler helpers, the client's gunzip and h2 head, the
+  outbound proxy selection, and inbound gzip bodies through the serving loop (`http-gzip-body`: a drawn plaintext
+  compressed, 0–3 octets flipped and maybe cut; with the trailer check on, a 200 carries exactly the plaintext).
+  **Not fuzzed here:** `std.crypto.Certificate.parse` (reached from `x509.chain`) and std's flate decoder as such —
+  std's parsers, reached only through the bounded wrappers above; ReleaseSafe (below) is the mitigation for that
+  residual surface.
+- **Constant time:** n/a on the card (an HTTP codec; credentials pass through). The h1 field-value check is
+  vector/SWAR (no table indexed by header bytes) and the HPACK encoder never indexes or Huffman-codes credentials
+  (*Threat model*).
+- **Audit:** the card's `**Audit:**` line is the current, cumulative score; the review and mutation record — every
+  run, the equivalent-mutant arguments, the defects found and fixed — is [`AUDIT.md`](AUDIT.md).
 
 ## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
 This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
@@ -468,406 +541,9 @@ directly-exposed parser.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-http`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 20.5 %): ref 0.13–0.29×, against 0.13–0.32× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
-
-## Backlog / deferred
-
-- **DONE 2026-11-13 — client interceptors (grade-probe gap "RoundTripper", 2026-11-05):** `Client.Options.interceptors: []const Interceptor` wraps `request` and `requestPlain` (auth, retry, tracing). Reference shape: Go `net/http.RoundTripper` as users wrap it, and OkHttp's *application* `Interceptor` / `Interceptor.Chain` (`chain.proceed`), translated: `Interceptor{ctx, intercept(ctx, *Chain) Error!Response}`, `Chain{client, method, url, options}` (a copy the interceptor may replace before `proceed`). The first entry is the outermost; `proceed` 0 times short-circuits (`error.Intercepted` is the one new `Error` member, free for an interceptor to return), n times retries (the interceptor `deinit`s every `Response` it drops). Each interceptor gets its own `Chain` made from a copy of the previous one, so a chain can neither run past the list nor recurse deeper than it. Redirects and the stale-connection retry stay inside one `proceed` (the interceptor sees one call per request). `total_timeout_ms` bounds the whole chain, retries included (Go's `Client.Timeout`): one bounded task for the chain, a deadline check before every `proceed`. NOT intercepted: `requestStreaming*` / `putFile*` (a streamed body cannot be replayed by a retrying interceptor) and `H2Session`. Deliberately NOT done, deferred: (a) OkHttp's per-hop *network interceptors* / a per-hop `RoundTripper` replacement: the hop loop in `requestInner` is entangled with pooling and a `Response` owns its connection, so a hop seam would have to expose the connection; the application seam covers auth, retry and tracing; (b) a test transport / fake `Response` (Go's `RoundTripper` returning a canned `*Response`): a `Response` owns a pooled connection, so an interceptor cannot build one; tests use a loopback `Server` or `httptest`; revisit together with (a) if a consumer needs it. The bearer-token and tracing interceptors are test-only examples (`src/interceptor_test.zig`), not module API.
-- **DONE 2026-11-13 (decoded HPACK storage, `HeaderList.deinit` and dynamic-table entries are now zeroed before every free; `zeroize` gained `ensureUnusedCapacityWiped`/`toOwnedSliceWiped`; ReleaseFast freed-block tests in `hpack.zig`).** Was: **FINDING (LOW-MED, defence in depth, 2026-11-12 delta run): decoded HPACK values are freed unwiped.** `zeroize.zig` states that header blocks and credentials must not survive a `free` in ReleaseFast, and the raw h2 header-block buffers are wiped — but `hpack.Decoder.decodeBlock`'s `storage` (every decoded name and value, `Authorization` and cookies included) grows by plain `appendSlice`, is shrunk by `toOwnedSlice` (a failed remap moves it and frees the old block as is), and `HeaderList.deinit` frees it without a wipe; dynamic-table entries evicted or freed at `deinit` are not wiped either. Fix: wiped growth and shrink for `storage`, `zeroize` in `HeaderList.deinit` and on dynamic-table eviction/`deinit`, with the freed-block test of `h2.zig` extended to decoded values; then a delta mutation run.
-- **52 open test-gap candidates of the 2026-11-12 partial client-half run: decided 2026-11-13 — 19 killed, 33 equivalent, 0 findings.** Killed by new or already-present tests (16, proven by a schemata run: each mutant fails the new test): the stale-pooled-connection retry with TWO stale idle connections must dial fresh (`request` and `requestPlain`), `trailersTruncated` (head filling `max_head_bytes`, no trailer, dropped trailer line, non-chunked body, h2), `Member` flush and `drain` byte count, `initCompress` resetting a dirty `history_end_unhashed`, `PaddedSource` room checks, `conditional` list elements (a malformed element before a tag, the empty tag `""`), `redirectLocation` trailing slash and an empty path part, and the existing one-digit-port test for `client_proxy`; three more (`gzip.initCompress`'s comptime field check) are killed at compile time, since the mutant does not build. Equivalent, each with its invariant: `= undefined` poison writes (3), initial values always overwritten before a read (`reused` x2, `Gunzip` crc/size x4), `owned = false` before a `continue` with no fallible step (x2), a retry `h1_only` read only behind `take_idle` (x1), an unreachable `trailer_bytes_seen == 3`, a `Member.writer = .failing` that std's `Compress.finish` already implies, `decode_out_len`/`decode_in_len` +-1 (buffer granularity only, x4), `setEvalBranchQuota` headroom and the field-check's `@compileError` body (comptime, a std change is the needed injection), `conditional` callers' range guarantees (x3), and in `cleanPath` the skipped-slash and `..` bookkeeping variants (x9) plus `resolvePath`'s one-byte-path `trailing`. Table kept by the auditor; the next whole run needs none of these.
-
-- **No-panic sweep 2026-10-28 — deferred, none a panic or unbounded memory**:
-  - **DONE 2026-11-18** *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`):
-    a waiting handler now parks its thread on a futex over `progress` (the OS futex through
-    `std.Io.Threaded.global_single_threaded`, the same choice as `zstd`'s pools; `announce` wakes
-    it, the `parked` count skips the syscall when nobody waits), and gives up after
-    `Dispatcher.stall_timeout_ms` (default 60 s; null = no deadline) without its stream moving: a
-    response write ends the stream with RST_STREAM(CANCEL), a body read fails — what a canceled
-    wait does with `io`. Reference: nginx's `send_timeout` / `client_body_timeout` (60 s, "between
-    two successive" operations, applied to its h2 streams too); Go's `x/net/http2` per-stream
-    write deadline resets with INTERNAL_ERROR, the module keeps its own CANCEL for every abandoned
-    wait. The connection task's final drain parks the same way. The `Dispatcher.io` path is
-    unchanged.
-  - **DONE 2026-11-18** *1-byte DATA frames cost two WINDOW_UPDATEs each* (`onData`/`grantJob`):
-    credit is coalesced per window (`Session.shouldSendCredit`): sent once it is at least half the
-    window (nghttp2 `nghttp2_should_send_window_update`, h2o's connection window) or at least the
-    peer's remaining room (Go `x/net/http2` `inflow.add`, h2o's stream window). Go's extra
-    4 KiB floor is not taken (nghttp2 and h2o have none). Unsent stream credit of a stream that
-    ended is dropped; unsent connection credit stays owed. 40 000 one-octet frames: 2 updates
-    instead of 80 000.
-  - **DONE 2026-11-19** *~46 KiB per connection before the first byte*, no built-in connection cap (`on_connect` is the
-    control) — now a paragraph in the README's posture section ("Memory per connection").
-  - **DONE 2026-11-19** *Inbound gzip relies on std flate for crafted dynamic blocks* (harness `http-gzip-body` in `Server.zig`: a drawn plaintext, three shapes, compressed, 0-3 octets flipped and maybe cut, served through the loop with the trailer check on and off; with it on, a 200 must carry exactly the plaintext). Was:: truncation is guarded
-    (`PaddedSource`), but no http-level deterministic driver feeds random deflate streams through
-    `GunzipBody`.
-  - **DONE 2026-11-19** *`multipart.StreamPart.body` has a zero-capacity reader* (it now has a `body_buf_len` = 64 octet buffer: `peek`/`take`/`takeByte`/`takeDelimiter` work up to that size; a longer `peek`/`take` is std's assert, as for any reader of that capacity). Was:: `stream`/`readSliceShort`/`discard`
-    work, `peek`/`take` reach std's assert (documented). A small buffer would make it total.
-  - **DONE 2026-11-19** *`h2_client` does not validate response field names/values*: a final response head whose field has an uppercase or non-token name or a CR/LF/NUL value is a stream error (RST_STREAM PROTOCOL_ERROR, RFC 9113 §8.1.1/§8.2.1) and the waiting call fails `MalformedResponse`; an invalid trailer block is dropped like one with a pseudo-header. Was: (`processEvents`): `Client.h2glue`
-    does and the proxy's `setHeader` refuses them (→ 502), but a direct `h2_client` user sees the
-    raw bytes.
-
-- **DONE 2026-11-19 — `Request.bodyOverCap() bool`** (h1 and h2; reads the `Capped`/`StreamBody`/`GunzipBody` `exceeded` flags through two pointers on `Request`). Was: **A middleware cannot see that a gzip request body crossed `max_decompressed_request_bytes`**
-  *(2026-10-25, from the accesslog review)* — the serving loop answers that 413 from its own
-  local `GunzipBody.exceeded` (`Request.decoded` points at its reader, the flag stays private), so `accesslog.Logger` logs 500
-  for it (a chunked body over `max_body_bytes` it does read: `body.capped.exceeded`). Ideal API:
-  `Request.bodyOverCap() bool`, true in both cases, so a middleware logs what the server answers.
-
-- **Threaded h2: a worker's `.close` does not wake the connection's blocking read** *(audit
-  2026-10-19 S10-1, low; owner decision 2026-10-20: FIX — Go closes the connection after GOAWAY
-  instead of waiting on the peer)*. In Dispatcher mode a worker returning `.close` (e.g. 413 over
-  the cap + GOAWAY, `h2_server.zig` ~920-926, 998, 1094) only sets `closing`; the connection task
-  stays parked in `pump`'s blocking read until the peer sends or the read times out (forever with a
-  BYO reader without a timeout). Sequential mode returns at once. Fix: the worker shuts the socket
-  down (`shutdown(RD)` or a cancel of the read) — the connection owns the socket, so this needs an
-  ownership seam (a "wake" callback in the Dispatcher contract). No memory-safety effect.
-- **DONE 2026-11-19 — a body framing failure answers 400** (`bodyFramingFailed`: `ChunkedReader.fail_reason` set, or `ContentLengthReader.truncated`; checked after the 413 cases; nginx is the reference, Go leaves the status to the handler). Was: **A body framing failure answers 400, not 500** *(audit 2026-10-19 O1, owner decision
-  2026-10-20: FIX — nginx answers 400 for a malformed chunked body; Go leaves the status to the
-  handler)*. Since O1-1 a refused chunk line is final and the connection closes, but the status is
-  the generic 500 for a handler error. Fix: when a handler fails while the request body reader
-  holds a framing error (`ChunkedReader` failed, Content-Length short) and nothing was sent yet,
-  answer 400 (client fault) instead of 500.
-
-- ~~**Constant time: header bytes go through tables**~~ — DONE 2026-10-18 for the h1 value check (vector/SWAR, faster than the table) and the HPACK encoder (credentials never indexed + raw by default, `Encoder.Options.default_sensitive`); the HPACK **decoder** still walks a Huffman-coded secret per bit — RFC-mandated input, cannot be refused, documented. Was (found 2026-10-18, pre-tag sweep; owner decision — hot path): `h1.zig` `isValidFieldValue` indexes a 256-entry table by every header-value byte (h1.zig ~221/246), and HPACK's Huffman encoder indexes `huff_codes[b]` by each byte and its decoder walks a tree per bit (hpack.zig ~342-373, ~410-426, ~511-514) — both over `Authorization`, `Cookie` and API-key values (llmclient's `x-api-key` too). Options: an arithmetic range check in `isValidFieldValue` (cost to measure on the h1 bench); for HPACK, emit sensitive fields (`authorization`, `cookie`, `proxy-authorization`, a caller list) as raw never-indexed literals (RFC 7541 §7.1.3 recommends never-indexed for them; Huffman stays for the rest) — the decoder side cannot be helped the same way. Severity low-medium (local cache side channel).
-- **DONE 2026-11-17 — HPACK encoder: fast path for a field repeated from the previous block.** `Encoder.recent`
-  keeps, per block position (the first 32), a hint naming the static index or the dynamic-table SEQUENCE where that
-  position's field was found or inserted in the previous block; `encodeField` checks that one candidate with
-  `mem.eql` against the TABLE entry's bytes (never against the caller's previous slices, so a refilled buffer at the
-  same address is no false hit) and a live-sequence check, and only on a miss runs `findField`. Byte-identical: a
-  live exact pair has exactly one answer, because a pair is inserted only when no live entry holds it; pinned by a
-  differential test against the old scan with positional repeats, in-place refills, swaps, sensitivity toggles,
-  eviction and table-size changes (`encoder hint: …`). No `static` flag on `Field` was added: the one compare is the
-  whole cost left, and the flag would need plumbing through `ResponseWriter`. Measured (instructions, `perf stat -e
-  instructions:u`, ReleaseFast, 200 000 blocks of `:status` + the 11 default security headers incl. a helmet CSP,
-  values copied into a reused buffer per block): 5 565 → 2 867 per block (−48 %, cycles about −55 %); adversarial
-  rotation (every position changes every block, all hints miss): 6 049 → 6 685 (+10.5 %). Was:
-  **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, the web-server consumer repin A/B)* —
-  static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,
-  `error_headers`) are the same `(name.ptr, value.ptr)` on every response of a connection, yet `Encoder.findField`
-  re-derives the index each time: `static_names` lookup, `hashName` + `hashPair` over the bytes, then `mem.eql`
-  verification. Measured in the web-server consumer over h2/TLS (perf, security layer armed with 11 headers vs bare): `findField` +
-  `mem.eql` ≈ +4000 cycles/request, ~450 per header that ends up as a ONE-byte §6.1 index. Idea: remember per
-  encoder the last block's field `i` -> table seq and, when field `i` of the next block matches it and the seq is
-  still in the table (eviction check is O(1) on `seq`), emit the index without the map probes. ⚠ Pointer identity
-  alone is NOT proof for a runtime buffer (same address, new bytes): trust it only for fields the writer knows are
-  immutable (`setHeaderStatic`'s rodata -- a `static` flag on `hpack.Field`), verify anything else with one
-  `mem.eql` against the cached entry (still no hashing). Misses take today's path, so the output is
-  byte-identical (RFC 7541 vectors + h2spec stay the anchors). Measure with instruction counts (callgrind or the web-server consumer's h2sat `instructions/req`), not req/s. Effort: small.
-**`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — DONE 2026-10-07 (`GOTOOLCHAIN=go1.26.0` in the environment `tools/interop.zig` hands the Go oracle; h2spec v2.2.1 and the SSE venv installed by ci-environment's interop role; the CI interop lane re-took all three phases green, probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
-
-- **From the Go oracle (2026-10-05), judged** — each was a recorded divergence in
-  `src/go_oracle.zig`. (a) ~~a duplicate `Content-Disposition` parameter took the first~~ fixed
-  2026-10-12 (owner: "jako Go"): any parameter named twice (case-insensitive) drops the whole
-  disposition, as `mime.ParseMediaType` does — the part has no `name`/`filename`, so a front end
-  and this parser cannot read two field names out of one header. (b) ~~quoted-pairs not
-  unescaped~~ fixed 2026-10-12: `multipart` unescapes `name`/`filename` in place (`parse` takes
-  `[]u8` now — source-breaking for a `[]const u8` caller, none outside tests), and
-  `body.ContentType.paramUnescaped` copies; only a backslash before a tspecial escapes, as Go
-  (oracle case `name-escaped-letter`). (c) ~~client-side TE leniency~~ fixed 2026-10-05.
-  (d) RFC 850 two-digit years use a fixed 70 pivot; RFC 9110 §5.6.7 wants "more than 50 years
-  ahead is the past", which needs a clock -- `69` is right today, `70`-`76` already are not. Kept:
-  an obsolete format nobody sends. (e) ~~HTTP/1.0 `Connection: keep-alive` never honoured~~ fixed
-  2026-10-12: honoured, echoed as `Connection: keep-alive`, closed when the body has no known
-  length (RFC 9112 §9.3). Methods outside `Method` got 501 → fixed 2026-10-12 (R9 below): every
-  token reaches the handler, as Go.
-
-**S3 → S2 plan (survey 2026-10-11, `go doc` of net/http + httputil + cookiejar + httptest; owner
-decisions the same day: every gap a Go user notices is implemented, TLS server planned separately).**
-- R1 graceful lifecycle — DONE 2026-10-12: `shutdownGraceful(timeout_ms)`, `close`, `isDraining`,
-  `setKeepAlivesEnabled`, `registerOnShutdown` (8 hooks). Every socket connection registers a
-  `ConnControl` (renamed from R2's `Deadlines`) with an atomic `active/idle/closing` state; the loop
-  publishes `idle` then reads `draining`, the shutdown sets `draining` then claims `idle` — the web-server consumer's
-  `Conns` ordering, so neither side can miss the other. Idle claims shut only the read side, so h2
-  can still send its GOAWAY. h2: GOAWAY NO_ERROR once draining, streams above its last-stream-id
-  refused (before, `goaway_sent` was recorded but never enforced — a peer could keep a closing
-  connection alive with new streams). `Connection: close` is decided when the head is written,
-  as Go does (a test caught the read-time decision missing a shutdown that began in the handler).
-  h2spec 145/145 both phases; negative controls: no idle sweep → the graceful test times out, no
-  GOAWAY → the h2c test fails.
-- R2 timeouts Go has — DONE 2026-10-12: `read_header_timeout_ms`, `idle_timeout_ms`,
-  `response_timeout_ms` as ABSOLUTE phase deadlines (a peer dribbling one byte per period defeats an
-  inactivity timer; the web-server consumer measured 75 s against a 10 s one), `Request.setReadDeadline` /
-  `setWriteDeadline` (Go `ResponseController`). The connection's phase (idle → head → body) lives in
-  `TimeoutReader`, moved by `StreamOptions.deadlines` (`Deadlines`). Behaviour change:
-  `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout` — counting the
-  keep-alive wait made a short request budget close every idle connection. Each new deadline has an
-  integration test that fails when its arming is removed (checked).
-- R3 handler helpers — DONE 2026-10-12: `addHeader`/`getHeader`/`delHeader`, `redirect`,
-  `writeError`/`notFound`, `Request.headerAll`, `basicAuth` (+ client `basicAuthHeader`) and
-  `Server.BodyLimit` (Go `MaxBytesReader`; caller-owned, so neither `Request` nor the serving frame
-  grows). Go oracle area `helpers` (37 redirect, 7 error, 21 BasicAuth cases): one judged divergence,
-  a location resolving to `/\host` is refused. Go's `Error` keeps `Content-Encoding`/`Etag`/
-  `Last-Modified` (the survey assumed it drops them; the oracle says no), and writes the redirect
-  body with two newlines.
-- R4 `http.form` — DONE 2026-10-12: `form.Form.parse(arena, req, limits)` (Go `ParseForm` +
-  `ParseMultipartForm`; `value`/`postValue`/`values`/`file` = `FormValue`/`PostFormValue`/
-  `Form[k]`/`FormFile`) and the client encoder `form.encode`/`encodeAlloc`/`escape` (Go
-  `Values.Encode`/`QueryEscape`). `body.checkMediaType` is Go's strict `mime.ParseMediaType` verdict;
-  `multipart` now drops a disposition on any of its errors (valueless or unterminated parameter) and
-  keeps one that repeats a parameter with the same value, as Go does. Go oracle area `form` (64
-  requests, 12 escapes; negative control: dropping `filepath.Base`, the multipart precedence or the
-  Content-Type flag each fails it): two judged divergences, a `;` stays a byte (as in `url`) and
-  quoted-printable parts are not decoded. Hard failures (body over cap, broken multipart, missing
-  boundary) are errors, not Go's half-filled form; no temp files (the whole multipart body must fit
-  `max_multipart_bytes`). Fuzz harness `http-form`.
-- R5 `on_error` hook (Go `ErrorLog`) — DONE 2026-10-12: `Options`/`StreamOptions`/`h2_server.Options`
-  `.on_error`, `ErrorKind` {handler_failed, request_refused, server_failed, accept_failed}; fired
-  through one `noinline` call so the serving frame stays inside its budget (checked in ReleaseSafe).
-- R6 oracle divergences (a)(b)(e) above — DONE 2026-10-12.
-- R7 reverse proxy — DONE 2026-10-12. Flush: the h1 relay never flushed (a test with an origin
-  holding its second SSE event until the client has the first failed, then passed; negative control
-  done) — `Config.flush` (.auto = Go: SSE or undeclared length flushed per read; .immediate). Hooks
-  `rewrite`/`modify_response`/`error_handler` (Go `Rewrite`+`SetXForwarded`/`ModifyResponse`/
-  `ErrorHandler`), one failure path `fail` for everything before the head; Go oracle area
-  `rproxy_hooks` (9 profiles; one judged divergence: the default 502 page has a body, Go's is
-  empty; negative control: 3 mutants, 5 cases fail). Upgrade passthrough: `Request.upgraded`
-  (Go `Hijack`: the connection's reader/writer after a 101, HTTP timeouts lifted), client
-  `Response.upgraded` + `Connection: Upgrade` passed on (Go Transport), splice in two `Io` tasks;
-  integration test idles past the proxy's read timeout (negative control: without the lift it
-  fails). FIX found on the way: the default path relayed a client's own `X-Forwarded-Proto`/`-Host`
-  in front of ours. Fuzz harness `http-proxy-relay` (no hop-by-hop field relayed; negative control
-  caught). The `websocket` module adopted `Request.upgraded` on 2026-10-12
-  (`handshake.respondUpgraded`); its loopback test runs its client against its server directly
-  and behind this proxy, idle past both read timeouts (negative control: without the timeout lift
-  it fails).
-- R8a client transparent gzip — DONE 2026-10-12: `Client.Options.decompress = .gzip(max_bytes)`
-  (null = off as before; on = Go's `DisableCompression: false`, `max_bytes` a decoded-size cap that
-  Go lacks). A function pointer, not a flag: the plaintext size probe measured +23 KB for every
-  client with a runtime flag, +1 KB this way (the decoder links only where `gzip` is called). Go's rule for asking (no caller `Accept-Encoding`, no `Range`, not HEAD) and for
-  decoding (`Content-Encoding: gzip` exactly, a response that may have a body); `Response.header`
-  hides `Content-Encoding`/`Content-Length`, `Response.uncompressed`; every member's CRC-32/ISIZE
-  checked, members decoded back to back, anything else after them `error.CorruptGzip`; the body
-  reader is std's padded decoder, so a cut stream is refused, never aborts. Go oracle area
-  `client_gzip` (26 cases, compress/gzip fixtures): three judged divergences (`identity` sent where
-  Go sends no field, on HEAD and Range; the header's FHCRC is skipped where Go checks it). The oracle
-  corrected the design once: Go leaves a 204 or `Content-Length: 0` answer undecoded. Negative
-  control: 13 mutants (trailer, padding, multistream, Range/HEAD, header hiding, cap, error mapping,
-  request field), all caught.
-- R8b `max_conns_per_host` — DONE 2026-10-12: `PoolOptions.max_conns_per_host` (0 = unlimited, Go's
-  default) counts an origin's dialing, in-use and idle h1 connections, pooling on or off. At the cap
-  a request takes an idle connection, else parks on a futex until one is pooled (takes it) or
-  closed (dials), bounded by `total_timeout_ms` — by cancelation under `runBounded`, by the wait's
-  own deadline inline. A stale-connection retry wants a fresh dial: at the cap it evicts the
-  origin's oldest idle connection rather than wait (a wait there could only end on that connection).
-  h2 sessions are not counted. Go oracle area `max_conns` (6 cases: keep-alive, `DisableKeepAlives`,
-  `Connection: close`; peer-side max in flight + accepts). Negative control: 10 mutants (cap, both
-  wakes, waiter count, eviction, slot release on failed dial / close, deadline), all caught; the
-  oracle alone catches an ignored cap.
-- R8 rest, h2 via ALPN — DONE 2026-10-12: `Client.Options.http2 = .alpn()` (null = off; a function
-  pointer like `decompress`, so a client without it links no h2 code). Every `https://` dial offers
-  `h2`,`http/1.1`; when the server picks h2 the exchange runs as a stream on that connection —
-  `request`, redirects, `requestStreaming` (DATA frames), `decompress`, the cookie jar,
-  `max_conns_per_host` and the timeouts alike. The request head is rendered by the h1 head writer
-  and split back into fields (one rule for cookies, credentials on a cross-origin hop, `User-Agent`,
-  `Accept-Encoding`, a caller's `Host` → `:authority`); the response head becomes an
-  `h1.ResponseHead` over the same fields, a field that is not a lowercase token or carries a byte h1
-  cannot is `MalformedResponse` (fuzz `http-client-h2-head`: the block reads back as exactly the
-  fields). New `Response.proto()` (`Proto.text()` = Go's `HTTP/2.0`), `Response.trailer`, `error.StreamReset`;
-  a body closed early resets the stream (CANCEL) and pools the connection, as Go. A request asking
-  to upgrade dials without h2 and skips h2 connections (Go's `requiresHTTP1`; here any upgrade, not
-  only WebSocket). Owner decision: one exchange per connection, no multiplexing yet (Backlog).
-  Verified live: interop phase `alpn` against Go net/http over TLS (h2 listener, h1-only listener,
-  Go's Transport's request beside ours as Go's server sees them, `User-Agent` aside; negative
-  control: off, the phase fails 8 checks). FIX found on the way, `h2.Connection` (both roles): DATA
-  for a stream WE had reset was answered with another RST_STREAM and its connection-window charge
-  never returned — one abandoned h2 download shut the connection window and stalled every other
-  stream until the server's 10 s stall timeout cut the connection (13 % of runs of the client test);
-  now §5.1/§6.9: frames on a stream we reset (last 32) are ignored, a trailer block there is still
-  HPACK-decoded, and discarded DATA is credited back on every path. h2spec 145/145 both phases.
-- **Client h2 multiplexing** *(R8, deferred by the owner 2026-10-12)*: `Options.http2` checks an h2
-  connection out for one exchange like an h1 one, so concurrent requests to one origin open several
-  connections where Go's Transport shares one. Needs `h2_client.Session` driven by more than one
-  task — a leader that reads without holding the session while the others wait on progress (a lock
-  around the blocking engine deadlocks: the holder blocks on the socket while the stream whose
-  unread data shut the window waits for the lock).
-- ~~**Client HTTP/1.1 response trailers**~~ — DONE 2026-10-12: `setupBody` captures a chunked
-  body's trailer section into the tail of `head_buf` behind the head (`Conn.head_len`), so
-  `Response.trailer` answers on h1 as on h2 (Go fills `Response.Trailer` on both); a section past
-  that space drops its excess lines (still read, the connection still pools) and says so through
-  `Response.trailersTruncated()`. Negative control: capture off → the test fails.
-- R9 every method token reaches the handler — DONE 2026-10-12: `http.Method` gained `.connect`,
-  `.trace` and `.other` (any other token; `Request.method_token` / `methodName()`, Go's
-  `Request.Method`), `Method.fromToken`; the 501 for an unknown method is gone on h1 and h2. h1
-  CONNECT: authority-form (RFC 9112 §3.2.3, a bare `isValidHost` authority, `*` refused —
-  `isValidHost` alone passed it, the new test caught it), no Host needed (Go), `req.path` empty;
-  `ResponseWriter.tunnel(2xx)` answers without framing (RFC 9110 §9.3.6) and hands the connection
-  over through `Request.upgraded` (now keyed on a `handed_over` flag, not on status 101). Client:
-  `RequestOptions.method_token` for `.other` (h1 and h2, a 301-303 rewrites it to GET as Go),
-  `.connect` refused; `h2_client` `StreamOptions/RequestOptions.method_token`; `h2_upstream`
-  `RequestParts.method_token`; the reverse proxy relays the token and answers CONNECT 501
-  (`ForwardError.MethodNotSupported`). Go oracle h1 area: 3 divergences flipped
-  (lowercase/extension method, CONNECT authority) + 15 new wires, 5 judged (Go dispatches
-  `GET x:443`, `PURGE *`, `CONNECT *`, `CONNECT x:443/p`, `CONNECT u@x:443`; RFC 9112 §3.2.3/§3.2.4
-  refuse them). New fuzz harness `http-server-dispatch` (the h1 dispatch had none: method,
-  target form, tunnel promises checked inside the handler). Mutants 19/19 (2 survivors on the h2
-  client path → tests). The survey's "8 breaking switch sites" all had an `else` arm; what broke
-  was `idempotency.scopeKey` (now takes the method name: two extension methods must not share a
-  key) and `cors` (`.other` in `allowed_methods` is `error.UnnamedAllowedMethod`); `router`
-  leaves `.other` out of `Allow` and out of `any` (chi: 405); `openapi` leaves CONNECT/`.other`
-  routes out of the document (no 3.1 Path Item field).
-- **h2 CONNECT** *(R9, not planned)*: answered 501 per stream. RFC 9113 §8.5 makes the stream the
-  tunnel (DATA both ways, no :scheme/:path); Go's h2 server hands it to the handler. Needs a
-  full-duplex handler surface on `h2_server` (request DATA read while response DATA is written);
-  RFC 8441 extended CONNECT (WebSocket over h2) builds on the same.
-- R10 test recorder — DONE 2026-10-12: `http.httptest.record(gpa, StreamOptions, wire, Config)`
-  (Go `httptest.NewRecorder` + `Result()`) runs `serveStream` over canned request bytes and parses
-  what the server wrote into `Recording.responses` (status, `h1.ResponseHead`, decoded body,
-  trailers, each response's own wire bytes, `complete` = false for a body cut short) and `tunnel`
-  (bytes after a 101 or a 2xx to CONNECT). Bodiless answers follow the request: HEAD is read off
-  the wire, 1xx/204/304 by status; interim 1xx are listed, `only()` skips them. Working memory
-  from `gpa` with the serving loop's default sizes, gzip scratch when `opts` asks for it; output
-  bounded (`max_output_bytes`, overrun = `error.OutputTooLarge`, never a cut recording). h1 only.
-  Negative control: HEAD given a body, chunked left undecoded, tunnel ignored — each fails a test.
-  Consumers' hand-rolled `runWire`/`headerValue`/`bodyOf` helpers (sessions, idempotency,
-  ratelimit, throttle, aaa-gate, router, the web-server consumer) can move to it at their own pace.
-- The survey's "optional, not S2" items — DONE 2026-10-12 (owner: what the competition has gets
-  implemented): `serveByAlpn` (Go `ServeTLS`'s h2-or-h1 choice over a terminated connection),
-  `sniff.detectContentType` (Go `DetectContentType`; WHATWG MIME Sniffing tables, clean-room from
-  the standard), `serveContent` (Go `ServeContent` for an in-memory representation, composed from
-  `conditional` + `range` + `sniff`; unlike the bare composition it bounds a range set by the
-  representation's size, as Go), `CrossOriginProtection` (Go 1.25; bypass patterns are a predicate,
-  routing being `router`'s). Go oracle areas `sniff` (247 inputs: every signature and its near
-  misses, every C0 byte, the 512-byte window, the MP4 box rules) and `crossorigin` (58 `Check`
-  cases, 20 `AddTrustedOrigin` inputs, the default 403), and the 114 `serve` cases replayed through
-  `serveContent` as well — no divergence in any of them. Go facts the oracle settled: a trusted
-  origin may carry user info, a percent-escape of an ASCII byte in a host is an error, `//host`
-  and `ftp://host` origins match on the host alone. Negative controls: a tab accepted as a tag
-  terminator, a case-insensitive Host compare, `range.apply` in place of the bounded one — each
-  fails its area. Fuzz harness `http-sniff` (200k clean). Rejected: `parseHttpDateAt(s, now)`
-  (RFC 9110's 50-year window for two-digit years) — no competitor implements it (Go reads 69 as
-  1969, Python 69 as 1969, curl and nginx pivot at 70), see (d) above.
-
-- ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
-  / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request
-  body (buffered and `stream_request`), same cap and 413, working memory from the stream's arena
-  only for a gzip request. Was: h1 decoded a gzip request, h2 answered the same request 415.
-
-- ~~**Inbound gzip: verify the trailer**~~ — **DONE 2026-09-28** (found the same day wiring
-  `crc32` into `gzip.zig`). std's `flate.Decompress` reads the gzip trailer but never checks its
-  CRC-32 or ISIZE, so a request body with a corrupt trailer was accepted as long as the deflate
-  stream itself parsed. zlib, Go's `compress/gzip` and Python's `gzip` all refuse it
-  (`ErrChecksum`). Landed as `Options.verify_inbound_trailer` (not `Compression` — that struct is
-  the response-*encoding* config; the inbound decode knobs live flat on `Options`/`StreamOptions`
-  next to `max_decompressed_request_bytes`, so the new one joined them there), off by default (a
-  behaviour change — refuses bodies accepted before this). See the design note above and
-  `gzip.skipGzipHeader` / `gzip.checkTrailer`.
-
-- ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from the web-server consumer M11.5b). The
-  buffered `parse` needs the whole body in memory; `Reader` reads a `*std.Io.Reader` part by part,
-  each part body a reader that ends at the next delimiter (Go's `mime/multipart.Reader` shape).
-  Same grammar, limits and refusals as `parse` — one pair differs by design: a header block over the
-  cap that never ends is `HeadersTooLarge` (the reader stops at the cap), `MalformedBody` to `parse`.
-
-- ~~**Lazy `100 Continue` on h1**~~ — **DONE 2026-09-27** (`Request.reader` sends it; unread → the response closes). Was: (from the web-server consumer M11.5a, 2026-09-27) — `Server.serveStream` writes
-  `HTTP/1.1 100 Continue` right after the head checks, before the handler runs
-  (`Server.zig`, the `head.expect_continue` block after the 415 check). A handler that refuses the
-  request on its own terms — a per-route body cap below `max_body_bytes`, auth, a 415 of its own —
-  then answers after the client was already invited to send the body. Go's `net/http` sends it on
-  the handler's first body read (`expectContinueReader`); do the same: the request body reader
-  writes the interim line on its first read, and a handler that answers without reading never
-  sends it (RFC 9110 §10.1.1 allows either). The web-server consumer works around nothing today — its small-route 413
-  on a declared length follows the interim 100 (the web-server consumer's `src/stream_test.zig` pins `interim == 1`,
-  comment `zig-libs request: http — lazy 100-continue`).
-
-~~**zstd/br negotiated by the serving loops**~~ — DONE 2026-09-26 (found by the web-server consumer):
-`Server.EncoderProvider` (`acquire`/`release` per response, no codec linked here) in `Options`,
-`StreamOptions` and `h2_server.Options` as `encoder_provider`; `preferredBy` is the q-value choice
-against gzip (a tie goes to the provider, absent header admits nothing); acquired only past the
-eligibility gate, released when the request is over, none free → gzip or identity. README
-"The serving loops negotiate one themselves".
-
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for the web-server consumer's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-**Query-string parameters and path percent-decoding** — DONE 2026-09-28 (found by the web-server consumer,
-2026-09-22): `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),
-`QueryIterator` (every raw pair, nothing decoded), `decodeComponent`, and a strict `decodePath`
-that refuses a decoded `/` or NUL and any malformed escape, so an encoded separator can never
-reach a router. A malformed escape is refused in a query component too (as Go's
-`url.ParseQuery` does), unlike the lenient WHATWG body decoder `body.urlencoded`, which a router
-never sees. Caller buffers, no allocation. `router` still matches raw bytes by design (its own
-SPEC); if it ever decodes, `decodePath` is the rule to use. `validate.parseQueryLeaky` keeps its
-own lenient decoder for now.
-
-**PROXY protocol v1/v2 (server side)** — MOVED 2026-11-15 to the planned module `proxyproto`
-(root `NEW-MODULES.md`, which carries the scope and parity bar; decided: own module, `http` takes it
-as an optional dependency of its accept path). Original item 2026-09-24: a server behind a load
-balancer learns the real client only from the PROXY header the balancer prepends; nginx, Go
-(`pires/go-proxyproto`) and HAProxy parse it on accept, and nothing in zig-libs did.
-
-**HTTP Upgrade from a handler** — DONE 2026-09-24 (the web-server consumer plan M5.3): `ResponseWriter.upgrade`.
-
-**h2 server concurrency for fibers** — DONE 2026-09-23 (the web-server consumer plan M4.7a): `Dispatcher.io`. With it
-set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
-(`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
-`progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
-caller's unlock and its wait. `null` parks OS threads on a futex over the same counter (since
-2026-11-18; it was a yield-spin), bounded by `Dispatcher.stall_timeout_ms`. Tested under `BatonIo` (OS threads, one
-runner at a time, the baton handed over only inside a blocking `Io` call = the fiber rule), because
-`std.Io.Evented` did not compile in Zig 0.16.0 (not re-checked on 0.17); without `io` the first such test hangs, and a `pump`
-that does not broadcast hangs the flow-control one (both measured).
-
-**h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*
-surface, so it (a) buffers request/response bodies in memory (bounded) rather than streaming like
-the h1 path — no longer an engine limitation since `h2_client` grew `openStream`/`sendData`/
-`readBody`, just work not yet done in `h2_upstream`/`proxy` — (b) does not
-forward trailers, and (c) serializes response collection per upstream connection under a mutex —
-genuinely parallel in-flight streams across OS threads would need a dedicated per-connection reader
-task (a larger async redesign), deferred to avoid forking a second h2 stack. A shared *server*-side
-`ResponseWriter` buffer pool (across connections) is still open; the *client*-side one now exists
-(`bufpool`). WebSocket and an MQTT broker are noted (see the Non-goals section of /README.md) as
-candidate consumers layered on top of `http`'s server template, not gaps in `http` itself. TLS
-termination stays BYO (reverse proxy today)
-pending a native std TLS server.
-
-- ~~**`Client`: hand a CA bundle loaded earlier to another client**~~ — DONE 2026-09-28 (from the web-server consumer
-  M11.8): `Client.loadCaBundle()` loads eagerly; `Client.CaBundle` (bundle + its own lock, `load`,
-  `deinit`) is shared through `Options.shared_ca`, borrowed and never freed by a client. A shared
-  object rather than the `*const Bundle` first sketched, because `tlsclient` may write a
-  platform-verified root into the bundle under its lock.
-- ~~**`Client`: say that the blocking phases run on the `Io`'s pool**~~ — DONE 2026-09-28 (same
-  source): the module doc says so ("make the `Io` after the sandbox"), and
-  `Options.inline_blocking` runs every blocking phase on the calling thread (the timeouts then
-  cannot interrupt a blocked phase).
-
-- ~~**BUG: `Options.inline_blocking` does not keep the work on the calling thread**~~ — FIXED
-  2026-09-28 (found by the web-server consumer's jwks hardening probe: a Landlocked refresh thread still resolved a
-  name it had no `/etc/hosts` grant for). std's `Io.net.HostName.connect` starts the lookup and one
-  connect per address as tasks (`io.async` + `Io.Group`), so skipping `runBounded` was not enough.
-  With `inline_blocking` the client now calls `HostName.lookup` directly — `Threaded`'s resolver
-  is synchronous — into a 256-entry local queue and tries the addresses one at a time
-  (`connectHostInline`). Lost: std's parallel connect. Residual: std documents that `lookup`
-  does not block with a 16-entry queue, but its hosts-file reader puts one result per matching
-  line uncapped, so a name on more than 255 hosts lines would block the caller (nothing drains the
-  queue while `lookup` runs on the same thread). Pinned by `inline_blocking: resolving and
-  connecting a host name starts no task on the Io` (an `Io` whose vtable counts every task start:
-  0 with the option, >0 without; 4 before the fix).
-
-- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or web-server-consumer-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; the web-server consumer's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-19; replaces the 2026-10-11 plan):** not an S2 blocker (the BYO-TLS seam is the design). The server comes from a new zig-libs module `tlsserver` -- our own TLS 1.3 server built from the TLS 1.3 parts `dtls`, `tlsclient` and `tlsresume` already have, with the web-server consumer's ianic/tls fork as a differential oracle and as a source of ported pieces (MIT, with NOTICE). Work starts after the web-server consumer's move to Zig 0.17; this module then gets a TLS listener over `serveStream` + ALPN. **Status 2026-11-05:** `tlsserver` exists and the web-server consumer runs it; the listener here is not wired yet.
-- ~~**Client cookie jar**~~ — DONE 2026-10-05 (`Client.Options.cookie_jar`, consulted on every request and redirect hop; the implementation is the sibling `cookies.Jar` with a public-suffix list). This line said "exists in neither" until the 2026-10-11 survey caught it.
-- **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed only so the gap is on record. Effort: very large; pure Zig possible but no consumer. Not a priority.
-- **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(the web-server consumer R4, 2026-09-30)* — the writer is
-  ~6 KB, 4 KiB of it `header_buf`, of which a small response touches a few dozen bytes. On a
-  fiber-per-connection server the untouched tail sits between touched frames and costs a stack
-  page per connection: measured in the web-server consumer h1 saturation, `header_copy_bytes` 4096 -> 512 took
-  `serveStep`'s frame 10,232 -> 6,648 B and the resident stack 8 -> 7 pages (-4 KiB/conn). The h2
-  side is fixed differently (writer in the stream arena, 2026-09-30). Shape of a fix: the copy
-  budget as a caller-provided slice (e.g. from `StreamBuffers` / the pool slab) instead of an
-  inline array -- an API change to every `ResponseWriter` constructor, for one page. ⚠ Moving the
-  WHOLE writer into the pool slab was tried and lost (see `PooledBuffers.slabSize`). Effort: small-
-  medium. Deferred: small gain.
-  **Re-assessed 2026-09-30, likely zero net:** the page does not vanish, it moves. In a pool slab
-  (`PooledBuffers`) it is paid per in-flight request, and at saturation in-flight ~= connections
-  (the `slabSize` note: +14 KiB slab cost +18 KiB/conn), so -1 stack page +1 slab page (the copy
-  region's first page is always touched). Per-connection `StreamBuffers` storage is worse: that
-  page stays resident while the connection idles. A real win needs storage whose page is touched
-  anyway (e.g. bump-allocating from a buffer the request already dirtied); none is obvious.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 5 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **DONE 2026-11-15 — connection summary (`Options.on_conn_closed`, `ConnSummary{peer, requests, duration_ns, end}`, `ConnEnd = normal | timed_out | errored | refused`; `ConnStateFn` unchanged).** Fired once per admitted connection from `connMain` after `.closed` and `reportTimeout`, so a deadline is `timed_out`; `errored` = the socket failed with no deadline (reset, not a cancelation); `refused` = admitted but never served (no slab, no task; also the accept-loop fallback). `requests` counts h1 requests whose first byte arrived and h2 streams handed to the handler (`ConnControl.requests`). Not covered: `serveStream` driven by a caller (no socket, no summary). Was: **Connection summary on `.closed` (consumer request 2026-11-15; effort S-M).** `ConnState` (`src/Server.zig`) is a bare enum and `on_conn_state` gets `(ctx, peer, state)` only, so an observer that logs "connection closed: N requests, M ms, reason" keeps its own per-connection map plus a thread-local to join `.closed` with a later `ErrorKind.timed_out` (which fires after `.closed`). Expected: Go `http.Server.ConnState` + `ConnContext`, nginx `$connection_requests` / `$request_time`, envoy connection access logs. Proposed: either a second callback `on_conn_closed(ctx, ConnSummary{ requests, duration_ns, end: enum{ normal, timed_out, errored } })` (keeps `ConnStateFn` source-compatible) or deliver `timed_out` before `.closed`. Prefer the second callback; changing `ConnStateFn` breaks every user.
-- **DONE 2026-11-15 — `ConnSummary.timeout_phase: ?TimeoutPhase`** (`TimeoutPhase = idle | head | body | write`), set exactly when `end == .timed_out`, null otherwise. It comes from the same helper that picks `on_error`'s `ErrorKind.timed_out` error name, so the two agree: `idle` = `NoRequestTimeout`/`IdleTimeout` and an h2 `ReadTimeout` (h2 has no head/body phase at the connection level), `head` = `HeadTimeout`, `body` = `BodyTimeout`, `write` = `WriteTimeout`/`ResponseTimeout`. A consumer joining the summary with the timeout needs no thread-local.
-
-## Status
-`extract+gap · any · both · single_owner` · deps: `netaddr`, `datefmt`, `tlsclient`, `crc32` (+ `std.Io.net`,
-`std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
+`zig build bench-http` (ReleaseFast, `BENCH_ROUNDS=5`): the h1 server codec against Go `net/http`'s request reader
+(`tools/go_bench`) and hyper (`tools/rust_fast_bench`), the bench's wire over an in-memory stream. The current
+figures, with their date, are the card's `**Performance:**` and `**Ahead:**` lines; they are not repeated here.
 
 ## Known limits a consumer should size for
 
@@ -906,11 +582,76 @@ not a default-configuration trap, and that is why it is recorded rather than
 fixed. Related: `max_set_cookie_bytes` is unreachable even on an empty response,
 because the cookie name and attributes come out of the same budget.
 
-**Still unbounded after the 2026-08-13 timeout work**, deliberately: reading the
+**Still unbounded, deliberately:** reading the
 response body (the caller drives it and owns the deadline), `H2Session` once the
 dial has completed, and an `Io` with no free unit of concurrency. The connect and
 request phases ARE bounded; do not read that as the whole client being bounded.
 
+**`inline_blocking` and the hosts file.** std documents that `HostName.lookup` does not block with a 16-entry
+queue, but its hosts-file reader puts one result per matching line uncapped; with the client's 256-entry queue, a
+name on more than 255 hosts lines would block the caller (nothing drains the queue while `lookup` runs on the
+same thread).
+
+## What is deliberately not done
+
+- **RFC 9110 §5.6.7's 50-year window for RFC 850 two-digit years** (`parseHttpDateAt(s, now)`) — refused: it needs a
+  clock, and no competitor implements it (Go and Python read `69` as 1969, curl and nginx pivot at 70). A fixed 70
+  pivot is used; `69` is right today, `70`-`76` already are not — an obsolete format nobody sends.
+- **A pool of per-connection h2 request-arena spares** — tried and removed (see *Design & invariants* and
+  `CHANGELOG.md` before proposing it again).
+- **WebSocket and an MQTT broker** are candidate consumers layered on `http`'s server (see the root README's
+  Non-goals), not gaps in `http`.
+- **Auth, rate limiting, routing-level path normalization** — the sibling modules' (`aaa-gate`/`jwt`, `ratelimit`,
+  `router`); see *Threat model / out of scope*.
+
+## Backlog / deferred
+
+- **Native TLS-terminating listener** *(survey 2026-09-30; planned, owner 2026-10-19)* — Go, dusty and zzz serve
+  HTTPS directly; here TLS is the caller's (`serveStream` + ALPN, or `serveByAlpn`), so a user without a fronting
+  proxy or TLS layer cannot deploy the server alone. Plan: a TLS listener over the sibling `tlsserver` module (our
+  own TLS 1.3 server, which exists and has a consumer) + `serveStream` + ALPN; not wired yet. Not an S2 blocker
+  (the BYO-TLS seam is the design).
+- **Threaded h2: a worker's `.close` does not wake the connection's blocking read** *(audit 2026-10-19 S10-1, low;
+  owner decision 2026-10-20: fix — Go closes the connection after GOAWAY instead of waiting on the peer)*. In
+  Dispatcher mode a worker returning `.close` (e.g. 413 over the cap + GOAWAY) only sets `closing`; the connection
+  task stays parked in `pump`'s blocking read until the peer sends or the read times out (forever with a BYO reader
+  without a timeout). Sequential mode returns at once. Fix: the worker shuts the socket down (`shutdown(RD)` or a
+  cancel of the read), which needs an ownership seam (a "wake" callback in the Dispatcher contract). No
+  memory-safety effect.
+- **Client h2 multiplexing** *(deferred by the owner 2026-10-12)*: `Options.http2` checks an h2 connection out for
+  one exchange like an h1 one, so concurrent requests to one origin open several connections where Go's Transport
+  shares one. Needs `h2_client.Session` driven by more than one task — a leader that reads without holding the
+  session while the others wait on progress (a lock around the blocking engine deadlocks: the holder blocks on the
+  socket while the stream whose unread data shut the window waits for the lock).
+- **h2 CONNECT** *(not planned)*: answered 501 per stream. RFC 9113 §8.5 makes the stream the tunnel (DATA both
+  ways, no :scheme/:path); Go's h2 server hands it to the handler. Needs a full-duplex handler surface on
+  `h2_server`; RFC 8441 extended CONNECT (WebSocket over h2) builds on the same.
+- **Client interceptors, the parts deferred** (revisit if a consumer needs them): (a) OkHttp's per-hop network
+  interceptors / a per-hop `RoundTripper` replacement — the hop loop in `requestInner` is entangled with pooling and
+  a `Response` owns its connection, so a hop seam would have to expose the connection; (b) a test transport / fake
+  `Response` (Go's `RoundTripper` returning a canned `*Response`) — for the same reason an interceptor cannot build
+  one; tests use a loopback `Server` or `httptest`.
+- **h2 upstream forwarding** reuses `h2_client.Session`'s buffered surface, so it (a) buffers request/response
+  bodies in memory (bounded, `h2_max_body_bytes`) where the h1 path streams — `h2_client` has
+  `openStream`/`sendData`/`readBody` now, so this is work not yet done in `h2_upstream`/`proxy`; (b) does not forward
+  h2 upstream trailers; (c) serializes response collection per upstream connection under a mutex — parallel
+  in-flight streams across OS threads would need a per-connection reader task.
+- **A shared server-side `ResponseWriter` buffer pool** across connections (the client-side one is `bufpool`).
+- **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(deferred: small gain, likely zero net)* — the writer is
+  ~6 KB, 4 KiB of it `header_buf`, of which a small response touches a few dozen bytes; on a fiber-per-connection
+  server the untouched tail costs a stack page per connection (measured: `header_copy_bytes` 4096 → 512 took
+  `serveStep`'s frame 10 232 → 6 648 B, resident stack 8 → 7 pages). A caller-provided copy slice would change every
+  `ResponseWriter` constructor, and the page only moves: in a pool slab it is paid per in-flight request (≈
+  connections at saturation), in per-connection `StreamBuffers` it stays resident while idle. Moving the WHOLE
+  writer into the slab was tried and lost (`PooledBuffers.slabSize`). A real win needs storage whose page is
+  touched anyway; none is obvious.
+- **PROXY protocol v1/v2 on the accept path** — parsing lives in the sibling `proxyproto` module (decided
+  2026-11-15: own module, an optional dependency of `http`'s accept path); `http` does not use it yet.
+- **Differential oracle against karlseguin/http.zig (httpz)** — an idea (owner review 2026-09-24, not scheduled):
+  feed the same raw request bytes to both h1 parsers and compare accept vs reject (smuggling-shaped framing,
+  obs-fold, bad chunk sizes, over-long headers), as a `tools/` oracle (MIT, Zig 0.16).
+- **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed so the
+  gap is on record. Effort very large, no consumer, not a priority.
 
 ## Anchoring
 
@@ -920,5 +661,3 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114, through the bare composition and through `serveContent`), content sniffing vs `DetectContentType` (247), `CrossOriginProtection` (58 checks, 20 trusted-origin validations, the denial; 2026-10-12), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49), the client's response framing vs `http.Transport` (64, loopback peer), outbound proxy selection vs `ProxyFromEnvironment` (63), the reverse proxy's header rewriting vs `httputil.ReverseProxy` (37, raw client + raw backend; 2026-10-06). Closed 2026-10-06, the last self-only paths: **conneg** vs Werkzeug 3.1.9 + python-mimeparse 2.0.0 (`src/conneg_oracle.zig`, 104 cases frozen by `tools/conneg_oracle/gen.py`; RFC 9110 §12.5.1's own table decides where they disagree); **gzip response encoding** decoded LIVE by curl/zlib and gzip(1) at levels 1/6/9 on HTTP/1.1 and h2c (`src/gzip_interop.zig`, teeth: flipped CRC-32/ISIZE refused); **problem+json** parsed by CPython `json.loads` with U+FFFD substitution held to CPython's `decode("utf-8", "replace")` over 225 inputs and default titles to `http.HTTPStatus`; **SSE** streamed by our server through curl and dispatched by sseclient-py and httpx-sse, held to the WHATWG §9.2.6 parsing rules (teeth: a merged event is caught). The Python oracles are phases of `zig build interop-http` (`tools/oracles.zig`, `--phase problem|sse`; CONVENTIONS §9: a module spawns no foreign toolchain); what they accepted is frozen in `src/problem_oracle_vectors.zig` / `src/sse_oracle_vectors.zig` and replayed byte for byte by `src/problem_oracle.zig` / `src/sse_oracle.zig`. Venv for `--phase sse`: `~/.local/share/zig-libs/oracle-venvs/http`.
-
-**How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
