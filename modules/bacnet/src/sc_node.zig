@@ -1431,7 +1431,7 @@ fn driveNode(comptime S: type, smith: *S, run: *NodeRun) !void {
         // `Smith.bytes` ate the whole remaining seed on the FIRST of these
         // eight iterations, so the ranged length was 0 here and in the seven
         // after it, and the clock never moved either: the node was handed eight
-        // empty frames at t=0. Measured on 2026-09-06 over `node_seeds`
+        // empty frames at t=0. Measured over `node_seeds`
         // (4 seeds x 8 iterations = 32 frames): **0 of 32 non-empty, 0
         // decodable, and the clock never leaving 0 ms before; 32 of 32
         // non-empty, 24 decodable as BVLC-SC, and the clock advancing

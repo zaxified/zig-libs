@@ -1459,7 +1459,7 @@ fn fuzzServices(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
     // finds fewer than eight bytes left and returns the range MINIMUM — so the
     // length was 0 for every seed and all ten decoders below were handed the
-    // empty body. Measured on 2026-09-06 over the corpus above: **0 of 19
+    // empty body. Measured over the corpus above: **0 of 19
     // non-empty before, 19 of 19 after; 16 of the 19 are now accepted by at
     // least one of the ten decoders.**
     //
@@ -1608,7 +1608,7 @@ fn fuzzServiceIntegers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
     // for every input and `which` — a range whose minimum is 0 — was 0. This
     // harness tested a single one-octet integer in a single arm. `slice` gives
     // the width from the seed, and `value(u64)` is full-range so every input
-    // word survives the reduction. Measured on 2026-09-06 over the corpus
+    // word survives the reduction. Measured over the corpus
     // above: **3 distinct (width, arm) pairs before, 19 after — 8 widths across
     // all 19 arms.** Three, not one, because the seeds here are longer than
     // `digits`: `bytes` stops at 8 octets and the ranged draw then finds a full

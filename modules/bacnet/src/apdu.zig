@@ -796,7 +796,7 @@ fn fuzzApdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
     // finds fewer than eight bytes left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever decoded the empty
-    // APDU. Measured on 2026-09-06 over the corpus above: **0 of 13 non-empty
+    // APDU. Measured over the corpus above: **0 of 13 non-empty
     // and 0 decoded before, 13 of 13 non-empty and 11 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &apdu_seeds);
     fuzzApduMark.mark(.ran);

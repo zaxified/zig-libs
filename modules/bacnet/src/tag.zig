@@ -1795,7 +1795,7 @@ fn fuzzSkip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length; the
-    // ranged length was 0 for every seed. Measured on 2026-09-06 over
+    // ranged length was 0 for every seed. Measured over
     // `tag_seeds`: **0 of 13 non-empty and 0 whose first tag `skip` accepted
     // before; 13 of 13 non-empty and 11 accepted after.**
     const len: usize = fz.drawInput(S, src, &buf, &tag_seeds);
@@ -1919,8 +1919,7 @@ fn fuzzHeaderRoundTrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
     var buf: [max_header_len]u8 = undefined;
     // ⚠ See `fuzzSkip`. This one takes `header_seeds`, not `tag_seeds`:
     // `Smith.slice` returns 0 when the seed's declared length exceeds the
-    // destination buffer, and `buf` is only `max_header_len` octets. Measured
-    // on 2026-09-06: **0 of 10 non-empty and 0 headers decoded before, 10 of 10
+    // destination buffer, and `buf` is only `max_header_len` octets. Measured: **0 of 10 non-empty and 0 headers decoded before, 10 of 10
     // non-empty and 10 decoded after** — and `tag_seeds`' 11-octet entry fed
     // into this 7-octet buffer arrives empty, which is why the corpus is
     // separate rather than shared.

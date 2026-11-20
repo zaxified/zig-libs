@@ -1321,7 +1321,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
     // finds fewer than eight bytes left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever decoded the empty
-    // frame. Measured on 2026-09-06 over the corpus above: **0 of 17 non-empty
+    // frame. Measured over the corpus above: **0 of 17 non-empty
     // and 0 decoded before, 17 of 17 non-empty and 12 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &sc_seeds);
     fuzzDecodeMark.mark(.ran);
@@ -1380,7 +1380,7 @@ fn fuzzOptions(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     _ = gpa;
     var buf: [128]u8 = undefined;
     // ⚠ See `fuzzDecode`: `bytes` then a ranged length always yielded 0.
-    // Measured on 2026-09-06 over `option_seeds`: **0 of 11 non-empty and 0
+    // Measured over `option_seeds`: **0 of 11 non-empty and 0
     // lists walked before, 11 of 11 non-empty and 9 walked after.**
     const len: usize = fz.drawInput(S, src, &buf, &option_seeds);
     fuzzOptionsMark.mark(.ran);

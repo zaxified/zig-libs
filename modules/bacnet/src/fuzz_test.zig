@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for bacnet's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for bacnet's deterministic fuzz driver.
 //!
 //! The harness BODIES stay beside their corpora; each is generic over its
 //! source of choices, `fn(comptime S, *S, gpa)`, and `testing.fuzz` hands it

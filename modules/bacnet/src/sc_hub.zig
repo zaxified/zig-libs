@@ -1045,7 +1045,7 @@ fn driveHub(comptime S: type, smith: *S, run: *HubRun) !void {
         // eight iterations, so the ranged length was 0 here and in the seven
         // iterations after it: the hub was handed eight empty frames and every
         // later draw in this loop — the connection choice, the clock step —
-        // was its own minimum too. Measured on 2026-09-06 over `hub_seeds`
+        // was its own minimum too. Measured over `hub_seeds`
         // (3 seeds x 8 iterations = 24 frames): **0 of 24 non-empty, 0
         // decodable, and the clock never leaving 0 ms before; 24 of 24
         // non-empty, 18 decodable as BVLC-SC, and the clock advancing

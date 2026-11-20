@@ -652,7 +652,7 @@ fn fuzzBvlc(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed and a ranged draw then
     // reads fewer than eight bytes and returns the range MINIMUM, so the length
     // was 0 for every seed and this harness decoded the empty datagram, once.
-    // Measured on 2026-09-06 over the corpus above: **0 of 12 non-empty and 0
+    // Measured over the corpus above: **0 of 12 non-empty and 0
     // decoded before, 12 of 12 non-empty and 9 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &bvlc_seeds);
     fuzzBvlcMark.mark(.ran);
