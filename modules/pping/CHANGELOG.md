@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `PPING_FUZZ`: `pping-tcp-options` (checked against an independent reading of the option grammar; a genuine Timestamps option behind NOPs/MSS is found with its exact values, behind END it is not), `pping-ip-echo` (a genuine IPv4/IPv6 Echo packet decodes to its identifier, sequence, kind and addresses) and a new `pping-estimator` stream harness (bounded tables, first echo consumed once, sample fields and RTT bounds against a send-time model, genuine round trip yields exactly its RTT, a clock stepping backwards never panics, echo/TCP mixing refused). No source change.
 - **2026-10-06** — ADDED: ICMP / ICMPv6 Echo RTT. `parseIpEcho` (IPv4 or IPv6
@@ -25,7 +24,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   SELF-DERIVED and tcpdump-checked (`tools/icmpv6_crosscheck.py`). New
   `testing.fuzz` harness on `parseIpEcho`. Scope mvp -> core. The `root.zig`
   "Status: complete" wording is replaced by the scope it implements.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: README "Status" reworded from "complete" to the mvp scope it implements; Anchoring names the leftover `gate.fable_core_implemented` switch precisely.
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

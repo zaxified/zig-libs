@@ -33,11 +33,7 @@ carries the same identifier and sequence number back the other way, so the
 ping traffic crossing a router is measured as well. Samples come out as the
 same `RttSample`, tagged with which rule produced them.
 
-- **Status:** the core scope is implemented — TCP Timestamps and ICMP / ICMPv6
-  Echo, one flow per estimator: both decoders, the bounded table, and both
-  matching rules. QUIC spin bit and a multi-flow table are under
-  [Backlog / deferred](#backlog--deferred).
-  **Platform:** any — no sockets, no wall-clock read; `now` is caller-supplied.
+- **Platform:** any — no sockets, no wall-clock read; `now` is caller-supplied.
 - **Deps:** none (std only).
 - **Model after:** Kathleen Nichols' *pping* (Pollere LLC) passive-RTT
   technique, over RFC 7323 TSval/TSecr; echo matching over RFC 792 / RFC 4443
@@ -54,7 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [EricssonResearch/spindump](https://github.com/EricssonResearch/spindump) | C | BSD-3-Clause | 65 | push 2026-07-30 (no releases) | Latency monitor with a small library under it: TCP, QUIC spin bit, CoAP, DNS, ICMP, SCTP, aggregation and anonymisation (its README). Also says it is a research tool and "CURRENTLY NOT ACTIVELY MAINTAINED". |
 | [LibreQoE/LibreQoS](https://github.com/LibreQoE/LibreQoS) | Rust + eBPF | GPL-2.0 | 718 | v2.2 (2026-08-18) | Uses the pping approach inside its shaper for per-circuit RTT (named in pollere's README); an application, not a library. |
 
-Re-assessed 2026-10-06 (no new survey; the table above is unchanged): ICMP / ICMPv6 echo matching landed, which was the gap a user pointing this at a router would hit first. Against the xdp-project pping, the maintained successor of the reference: **even** on the RTT techniques (TCP timestamps and ICMP echo, both with first-match-and-consume and bounded state), **behind** on what surrounds them — capture, a flow table, flow events and output formats — which this module leaves to the caller by design. Spindump's QUIC spin bit and DNS remain Backlog-grade.
+Against the xdp-project pping, the maintained successor of the reference: **even** on the RTT techniques (TCP timestamps and ICMP echo, both with first-match-and-consume and bounded state), **behind** on what surrounds them — capture, a flow table, flow events and output formats — which this module leaves to the caller by design. Spindump's QUIC spin bit and DNS remain Backlog-grade.
 
 **Where we are ahead:** the only Zig implementation (GitHub search on 2026-09-30 found none) and the only one that is a linkable estimator core besides Spindump's C library: no libpcap, no eBPF, no clock read (`now` is caller-supplied), fixed allocation per flow, and hostile-input tests on the option parser; usable in a simulator or a replay tool as-is. **Where we are behind:** QUIC spin bit and DNS (Spindump); no capture, flow table or output format (the caller demultiplexes to one `Estimator` per flow, by design — see `FlowKey`) (→ Backlog).
 
@@ -146,10 +142,13 @@ reads out of bounds. The table is tested for insert / lookup / remove / aging /
 capacity eviction and for bounded memory under a long stream. The matching core
 is pinned by the property harness: duplicate and delayed echoes must produce
 **no** second sample, and a bounded table must not invent one. The echo decoder
-has header-walk tests for every branch, a 20k-trial hostile-input test and a
+has header-walk tests for every branch, a hostile-input test and a
 `testing.fuzz` harness; the echo pipeline runs on real `ping` captures (see
 Anchoring) and on scenarios for duplicates, unmatched replies, out-of-order
 replies, cross-pinging hosts, table pressure, aging and refused mixing.
+
+Fuzz: the deterministic driver `PPING_FUZZ=<runs>[,<seed>]` runs three harnesses (`pping-tcp-options`,
+`pping-ip-echo`, `pping-estimator`). The card's `**Audit:**` line is the current mutation and review score.
 
 Provenance: the passive-RTT technique (match a TCP TSecr back to the TSval
 that produced it, seen earlier in the opposite direction) and its
@@ -169,9 +168,9 @@ from iputils `ping` with `tools/capture_icmp_echo.sh`; the IPv6 ones are built b
 
 ## Backlog / deferred
 
-- **Multi-flow table, flow events, output formats** (survey 2026-09-30, re-assessed 2026-10-06): xdp pping ships them; here the caller demultiplexes to one `Estimator` per flow, by design. A bounded flow map keyed by 5-tuple / address pair would save every caller writing one. Effort S–M. Fits §2.
-- **A real ICMPv6 capture** (2026-10-06): the kernel the IPv4 goldens were captured on has no IPv6, so the ICMPv6 packets are self-built and tcpdump-checked. Re-run `tools/capture_icmp_echo.sh` on a host with IPv6; it records the `ping -6` run automatically.
-- **QUIC spin-bit RTT** (survey 2026-09-30): Spindump does; TCP timestamps are optional and QUIC is a growing share of traffic, so this is where the technique goes next. Effort M. Fits §2. Only one unmaintained project ships it, so "nobody does this well" is possible.
+- **Multi-flow table, flow events, output formats:** xdp pping ships them; here the caller demultiplexes to one `Estimator` per flow, by design. A bounded flow map keyed by 5-tuple / address pair would save every caller writing one. Effort S–M. Fits §2.
+- **A real ICMPv6 capture:** the kernel the IPv4 goldens were captured on has no IPv6, so the ICMPv6 packets are self-built and tcpdump-checked. Re-run `tools/capture_icmp_echo.sh` on a host with IPv6; it records the `ping -6` run automatically.
+- **QUIC spin-bit RTT:** Spindump does; TCP timestamps are optional and QUIC is a growing share of traffic, so this is where the technique goes next. Effort M. Fits §2. Only one unmaintained project ships it, so "nobody does this well" is possible.
 
 ## Anchoring
 
@@ -181,5 +180,3 @@ from iputils `ping` with `tools/capture_icmp_echo.sh`; the IPv6 ones are built b
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/parse.zig:207-224 anchors the TCP Timestamps option parser on 2 real SYN/SYN-ACK captures taken with tcpdump off a genuine loopback handshake, including the tsecr<-tsval echo. Everything above the parser is NOT anchored today: match.matchEcho is implemented (`gate.fable_core_implemented` in src/gate.zig, a switch left from when the core was a stub, is `true`), so the 8 KATs in src/kat.zig run and assert; their expected RTT sequences are hand-built scenarios (our own values, not an external capture). ICMP echo (2026-10-06), src/echo_kat.zig: **EXTERNAL** for IPv4 — 10 real IP packets from iputils `ping` on loopback, captured by tcpdump with nanosecond timestamps (`tools/capture_icmp_echo.sh`), including a real 65535 -> 0 sequence wrap; the expected RTTs are the capture-timestamp differences, each checked to be positive and no larger than the `time=` ping printed. **SELF-DERIVED** for IPv6 — six packets built by `tools/icmpv6_crosscheck.py`, decoded by `tcpdump -vv` with "[icmp6 sum ok]", made-up timestamps — and for the echo scenarios.
-
-**How it got there.** The anchoring work landed. DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored
