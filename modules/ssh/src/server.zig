@@ -199,7 +199,7 @@ pub const HostKey = union(enum) {
             const n_wire = pk_cur.string() catch return error.InvalidOpenSSH;
             const pk = rsa.PublicKey.fromBytes(n_wire, e_wire) catch return error.InvalidOpenSSH;
             // Cross-check: the public blob's (n, e) must be the secret key's.
-            // n alone was checked until; SSH_FUZZ `ssh-keyload`
+            // Checking `n` alone is not enough: SSH_FUZZ `ssh-keyload`
             // found a container whose public `e` was damaged (65537 ->
             // 0x018101) load as a host key advertising a public key its own
             // signatures do not verify under.
@@ -357,7 +357,7 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 // ── openssh-key-v1 container parsing (ed25519 + type dispatch) ──────────────
 
 /// Decode the base64 body of the first `-----BEGIN OPENSSH PRIVATE KEY-----`
-/// PEM block in `text` into `out`, through `keycodec.pem` (since; until then a copy of the same walk): a body is crossed by a
+/// PEM block in `text` into `out`, through `keycodec.pem`: a body is crossed by a
 /// scan for its END line's first '-', never a Boyer-Moore-Horspool search
 /// over key text, and decoded by `b64ct` in constant time straight into
 /// `out` (the caller wipes it). `InvalidPem` for a missing or garbled END
