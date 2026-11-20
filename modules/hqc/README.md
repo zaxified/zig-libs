@@ -6,14 +6,14 @@ ML-KEM. `std.crypto` ships ML-KEM and ML-DSA, both lattice-based; HQC's
 hardness assumption is unrelated (quasi-cyclic syndrome decoding, not
 lattices), so it's a genuine gap this repo didn't previously cover.
 
-**The arc is complete — this is a usable KEM.** `Hqc128`/`Hqc192`/
+**This is a usable KEM.** `Hqc128`/`Hqc192`/
 `Hqc256` (see "Usage" below) expose `keypair`/`encaps`/`decaps`,
-byte-exact against the official NIST KAT. Part 2's codec (both ENCODE and
+byte-exact against the official NIST KAT. The codec (both ENCODE and
 the two DECODE cores — RS Berlekamp-Massey + additive-FFT root-finding +
-Forney, RM fast Hadamard transform, the genuinely hard part of the whole
-arc) and Part 3's PKE/KEM composition (pure wiring over Parts 1-2, no new
+Forney, RM fast Hadamard transform, the hardest part of the module)
+and the PKE/KEM composition (pure wiring over the ring, PRNG and codec, no new
 algorithm) are both implemented and tested — see "What's here" below and
-SPEC.md's "Part 2"/"Part 3" sections and "Arc plan".
+SPEC.md's *Codec* and *PKE and KEM composition* sections.
 
 ## What's here
 
@@ -48,9 +48,8 @@ SPEC.md's "Part 2"/"Part 3" sections and "Arc plan".
 - **`code`** — the concatenation: `Code(params, generator).encode`
   (byte-exact-KAT'd end to end) and `.decode` (composes the two real
   decoders above).
-- **`gate`** — `decoder_core_implemented` (now `true`): the switch that
-  turns on the decode-correctness tests; kept as a single named toggle
-  documenting that the decoder core is the Fable-hard part of the arc.
+- **`gate`** — `decoder_core_implemented` (`true`): the switch that
+  turns on the decode-correctness tests, kept as a single named toggle.
 - **`pke`** — the HQC public-key encryption scheme: `Pke(params,
   generator).keygen`/`.encrypt`/`.decrypt`. Pure composition over
   `gf2x`/`prng`/`code` — no new algorithm (see pke.zig's module doc).
@@ -85,7 +84,7 @@ hqc.Hqc128.decaps(&ss, &kp.dk, &ct);
 // ss == ss_enc
 ```
 
-Lower-level access (the ring/PRNG primitives Parts 1-2 build on) is still
+Lower-level access (the ring/PRNG primitives the codec and KEM build on) is still
 available directly:
 
 ```zig
@@ -101,6 +100,11 @@ hqc.prng.sampleVect(&xof, P.n, &h); // the public generator vector
 `Hqc128`/`Hqc192`/`Hqc256` each get their own `Elem`/key/ciphertext types
 — sized exactly, no runtime allocation anywhere in this module.
 
+**Stack.** `keypair`/`encaps`/`decaps` run their secret-handling body under a dead-stack burn, so they need stack
+proportional to the parameter set, up to `Kem.stack_bytes` (128 / 256 / 384 KiB for HQC-128 / 192 / 256, plus the
+caller's frames). Run them on a thread with at least `stack_bytes + 64 KiB`; a 128 KiB musl default thread stack is
+not enough.
+
 ## Verify
 
 ```
@@ -108,16 +112,16 @@ zig build test-hqc --summary all                        # Debug
 zig build test-hqc --summary all -Doptimize=ReleaseFast  # ReleaseFast
 ```
 
-All tests pass (Debug + ReleaseFast): Part 1's parameter-table
+The tests cover (Debug + ReleaseFast): the parameter-table
 cross-checks, `gf2x` algebraic identities, and `prng`'s `Xof`/`Prng`/
 `hashI`/`hashG`/sampler chain reproduced byte-exact against the reference
-implementation's own intermediate-value dump; Part 2's `gf256` field-axiom
+implementation's own intermediate-value dump; the `gf256` field-axiom
 + self-derived-table tests, `reedsolomon`/`reedmuller`/`code` encode
 reproduced byte-exact against the reference's own C source (compiled and
 run locally — see `kat_vectors_code.zig`), plus decode-correctness tests
 (zero-error round-trip, at-capacity δ-symbol-error correction, exhaustive
 RM `decodeSymbol`) across all three parameter sets — including hqc-192/256's
-PARAM_FFT=5 additive-FFT `radixBig` path; Part 3's `Kem`/`Pke` reproduced
+PARAM_FFT=5 additive-FFT `radixBig` path; `Kem`/`Pke` reproduced
 byte-exact against the official NIST KAT (`kem_kat_test.zig`: pk/sk/ct/ss
 for the first 3 `count`s × 3 parameter sets, plus decaps-agrees, random-
 coins round-trip, and implicit-rejection tests). See SPEC.md's

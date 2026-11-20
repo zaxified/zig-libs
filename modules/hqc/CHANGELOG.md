@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-10-30 (the `@compileError` guards are in modules/hqc/src/prng.zig:188,224,225,275 and gf2x.zig, commit c8c1463c6).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GT). Caller-contract asserts in `gf2x.Ring.toBytes`/`setBit`/`getBit` and `prng.sampleVect` are checked panics; `Ring.truncate` is total; comptime guards reject custom parameter sets with `n % 64 == 0`, `weight > n` or `threshold == 0`. Docs: `keypair`/`encaps`/`decaps` need up to `stack_bytes` (128/256/384 KiB) of stack. Tests: `src/sweep_test.zig`.
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `Pke.keygen(out: *KeyPair, seed)` returns its pair through `out` (was `keygen(seed) KeyPair`; `kem.keypair` is the only in-tree caller and zeroes its copy); it runs under the KEM-keypair-sized burn. `prng.Xof.init` and `prng.hashI` now run under a 4 KiB burn (`burn.prng_burn`). New `src/stackprobe2_test.zig` probes the three.
 
@@ -22,17 +20,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     `encaps(ct_out: *Ciphertext, ss_out: *SharedSecret, ek: *const EncapsKey, coins)`;
     `decaps(ss_out: *SharedSecret, dk: *const DecapsKey, ct: *const Ciphertext)`;
     new `KeyPair.wipe`.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `HQC_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only.
 - **2026-10-04** — Tests: mutation run (29 mutants, 26 killed, 3 equivalent). New tests pin
   the implicit-rejection key to `J(H(ek), sigma, c)` (dropping sigma from `J` used to pass)
   and the rejection sampler's refusal of a draw equal to its threshold. No behaviour change.
-- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The opt-in,
-  print-only dead-stack probe `src/zeroize_probe_test.zig` (A1 H4,
-  `HQC_ZEROIZE_SCAN`) is deleted: it asserted nothing, and CONVENTIONS.md §9
-  does not keep a one-finding probe.
 
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE, every KEM operation roughly twice as fast:** the
   CLMUL ring multiply in `gf2x.zig` (A1 M4). The Karatsuba base-case leaf carries each partial
@@ -46,12 +36,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   noise) and an xmm-accumulated leaf (−33 to −49 % on its own, but 2-4 % slower than the carry
   leaf once the zeroing is gone). Control flow still depends only on public, comptime lengths.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** new opt-in profiling workload in `bench.zig`
-  (`HQC_PROFILE=1`, skipped otherwise), for A1 M4. keypair, encaps and decaps each loop 4000 times
-  inside their own `noinline` wrapper, so a sampling profile can attribute time per operation
-  even though ReleaseFast inlines everything beneath. It is driven by `scripts/vm/run.sh hqc`:
-  ReleaseFast, `-mcpu native` (so the `pclmul` path is the one profiled), under `perf record` as
-  root in the guest. Not in any ctgrind pattern.
 
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** `gf2x.zig`'s internal `reduceProduct`
   (the mod-`(X^n-1)` fold at the end of every ring multiply) now folds the extended

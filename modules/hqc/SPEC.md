@@ -16,28 +16,27 @@
 
 **Downstream consumer:** no
 
-A multi-part HQC arc, now **complete**. Part 1 (ring + PRNG foundation) is
-done. Part 2 (concatenated Reed-Muller/Reed-Solomon codec) is complete:
-encode is byte-exact-KAT'd and both decoders are implemented (exact ports
-of the v5.0.0 reference) with decode-correctness tests. Part 3 (PKE + FO
-KEM composition) is complete: `Hqc128`/`Hqc192`/`Hqc256` are a usable KEM,
-byte-exact against the official NIST KAT (see "Part 3" and "Arc plan"
-below). See [README.md](README.md) for purpose and API.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [gitlab.com/pqc-hqc/hqc](https://gitlab.com/pqc-hqc/hqc) (authors' reference) — **reference** | C | public domain (grant reproduced in this module's `NOTICE`) | — | v5.0.0 (2025-08-26); default branch `next-release` has moved on | The yardstick, and this module's oracle (`tools/oracle_hqc.c`, `compare_kat.py`). Three parameter sets, `keypair`/`encaps`/`decaps`; also builds AVX2/AVX-512 paths. Upstream `next-release` already changed the sampler and the GF(2^8) polynomial, so a future tag will not match this module's bytes (see *Spec version*). **Measured 2026-10-07** (`zig build bench-hqc`, ReleaseFast, `zig cc -O3` of the v5.0.0 sources, pk/sk/ct/ss from one seed equal in both lanes first): ours/`ref` lane 0.04–0.07 (about 14–25× faster; keygen 0.04–0.05, encaps 0.04–0.05, decaps 0.04–0.07); ours/`x86_64/avx256` lane (`-mavx -mavx2 -mbmi -mpclmul`, the authors' fastest) 2.28–3.39 (hqc-1 2.3–2.8, hqc-3 2.6–3.3, hqc-5 2.7–3.4), i.e. the authors' AVX2 code is 2.3–3.4× faster than ours; `-Dcpu=native` gave 2.21–3.65. |
+| [gitlab.com/pqc-hqc/hqc](https://gitlab.com/pqc-hqc/hqc) (authors' reference) — **reference** | C | public domain (grant reproduced in this module's `NOTICE`) | — | v5.0.0 (2025-08-26); default branch `next-release` has moved on | The yardstick, and this module's oracle (`tools/oracle_hqc.c`, `compare_kat.py`). Three parameter sets, `keypair`/`encaps`/`decaps`; also builds AVX2/AVX-512 paths. Upstream `next-release` already changed the sampler and the GF(2^8) polynomial, so a future tag will not match this module's bytes (see *Spec version*). Speed against it: the card's **Performance:** line (`zig build bench-hqc` builds the reference sources with `zig cc -O3`, checks pk/sk/ct/ss from one seed equal in both lanes first, then times the `ref` lane and the `x86_64/avx256` lane, `-mavx -mavx2 -mbmi -mpclmul`, the authors' fastest). |
 | [open-quantum-safe/liboqs](https://github.com/open-quantum-safe/liboqs) | C | MIT (its `LICENSE.txt`; API says NOASSERTION); HQC code public domain per its docs | 3.1k | 0.16.0 (2026-07-09) | HQC-1/-3/-5 built from the authors' 2025-08-22 code with run-time CPU dispatch; its docs list HQC at OQS support tier 2, upstream maintenance "TBD". Same key/ciphertext sizes as here. |
 | [PQClean/PQClean](https://github.com/PQClean/PQClean) | C | per scheme (mixed) | 955 | archived; last push 2026-08-04 | Was the old clean-C home of the round-4 HQC (RMRS) — not the 2025 spec; archived, so no longer a live competitor *(inferred for HQC content)*. |
 | [cloudflare/circl](https://github.com/cloudflare/circl) | Go | BSD-3-Clause (`LICENSE`); API: NOASSERTION | 1.7k | v1.6.5 (2026-08-05) | `kem/` lists frodo, kyber, mlkem, sike, xwing, hybrid — no HQC (listing checked 2026-09-30). |
 | Rust ecosystem | Rust | — | — | — | No established HQC crate found; a GitHub search returned only 0–2-star personal projects (e.g. `NicsTr/hqc-kem`, MIT, not read). |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | ML-KEM only; no code-based KEM. |
 
-**Where we are ahead:** the only HQC in pure Zig; byte-exact to the authors' v5.0.0 KAT for all three sets, with no allocation anywhere, and the codec ported without C. Std has nothing comparable. **Where we are behind:** no run-time CPU dispatch (the CLMUL multiply is comptime-gated on `x86_64 + pclmul`, `gf2x.zig:17`; every other target runs the portable code); ctgrind is only partially clean (see Threat model — an anchor/audit matter, not scope); the module is pinned to a tag that upstream has already left, and NIST has not published its HQC standard yet (→ Backlog items).
+**Where we are ahead:** the only HQC in pure Zig; byte-exact to the authors' v5.0.0 KAT for all three sets, with no allocation anywhere, and the codec ported without C. Std has nothing comparable. **Where we are behind:** no run-time CPU dispatch (the CLMUL multiply is comptime-gated on `x86_64 + pclmul`, `clmul_supported`, `gf2x.zig:51-55`; every other target runs the portable code); ctgrind is only partially clean (see *Threat model / limits* — an anchor/audit matter, not scope); the module is pinned to a tag that upstream has already left, and NIST has not published its HQC standard yet (→ *Backlog / deferred*).
+
+## Structure
+
+A complete HQC KEM in three layers, with no allocation anywhere: the ring and PRNG foundation (`gf2x`, `prng`,
+`params`), the concatenated Reed-Muller/Reed-Solomon codec (`gf256`, `reedsolomon`, `reedmuller`, `code`), and the
+PKE with the salted Fujisaki-Okamoto KEM over it (`pke`, `kem`; `Hqc128`/`Hqc192`/`Hqc256` in `root.zig:129-133`),
+byte-exact against the official NIST KAT. See [README.md](README.md) for purpose and API.
 
 ## Spec version + why this one
 
@@ -63,25 +62,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the 2026 sixth PQC standardization conference cycle); when it does,
   expect the same kind of revision Falcon saw going from Round-3 to
   FN-DSA (header/domain-separation changes, not ring/decoder math
-  changes) — Part 3's KAT reproduction targets `v5.0.0` and should be
+  changes) — the KEM KAT reproduction targets `v5.0.0` and should be
   revisited if/when a FIPS draft KAT appears.
 
-  ⭐ **This module is deliberately pinned to the `v5.0.0` TAG, not to
-  upstream's `main`/default branch (audit A1 finding `hqc` L4, noted
-  2026-09-10).** `gitlab.com/pqc-hqc/hqc`'s default branch is
-  `next-release`, which as of 2026-08-27 (`2e531c26`, 4 commits past
-  `v5.0.0`) had already changed the fixed-weight sampler ("Update
-  sampling (#15)") and the GF(2^8) polynomial ("Update polynomial used in
-  GF(2^8)") — changes with their own KAT vectors: against that HEAD, only
-  9 of 36 `.rsp` seeds still produce matching pk/sk/ct/ss for this module.
-  A reader who clones upstream without `git checkout v5.0.0` gets vectors
-  that will not match this module and will read as a bug here — it is
-  not one; this module targets the tagged release, and `next-release` is
-  presumably itself heading toward whatever the eventual NIST FIPS draft
-  becomes, which is the revision anticipated above. `zig-libs`'s own
-  `model_after` field in `root.zig`'s `meta` names the tag explicitly for
-  exactly this reason.
-- **KAT source for Part 3**: `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
+  ⭐ **This module is deliberately pinned to the `v5.0.0` TAG, not to upstream's `main`/default branch.**
+  `gitlab.com/pqc-hqc/hqc`'s default branch is `next-release`, which at `2e531c26` (4 commits past `v5.0.0`) had
+  already changed the fixed-weight sampler ("Update sampling (#15)") and the GF(2^8) polynomial ("Update polynomial
+  used in GF(2^8)") — changes with their own KAT vectors: against that HEAD, only 9 of 36 `.rsp` seeds still
+  produce matching pk/sk/ct/ss for this module. A reader who clones upstream without `git checkout v5.0.0` gets
+  vectors that will not match this module and will read as a bug here — it is not one; this module targets the
+  tagged release, and `next-release` is presumably itself heading toward whatever the eventual NIST FIPS draft
+  becomes, which is the revision anticipated above. `zig-libs`'s own `model_after` field in `root.zig`'s `meta`
+  names the tag explicitly for exactly this reason (`root.zig:98`).
+- **KAT source**: `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
   (fetched via `curl`, not a paraphrasing tool — see
   `kat_vectors_kem.zig`) — the `.rsp` files ship count=0..99
   keypair/ciphertext/shared-secret vectors each (standard NIST `.rsp`
@@ -116,154 +109,52 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   onto [0, n−2] (X^{n+j} ≡ X^j; `reduceProduct`, shared by both multiply
   paths below).
 
-  ⭐ **CORRECTED 2026-09-10 (audit A1 finding `hqc` M1): this section
-  described a schoolbook-only `mul` that was replaced by `3dc73616`
-  (2026-07-19), more than seven weeks before this correction landed. What
-  actually ships is CLMUL+Karatsuba, not schoolbook** — the paragraph
-  below described `mulPortable` as if it were the only path, and the
-  follow-up work it flagged had already been done. There are now two
-  multiply paths, both in `gf2x.zig`, both producing bit-identical output
-  (pinned by a differential test, see Verification below):
-  - **`mulClmul`** (comptime-selected whenever `x86_64 + pclmul`, i.e. on
-    every host this module actually ships on): a recursive Karatsuba
-    multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
-    multiply (`clmulKar`/`clmul64`), same structural shape as the
-    reference's own word-aligned Toom-Cook/Karatsuba + `pclmul` elementary
-    multiply (§3.3, Table 2) — O(L^1.58) CLMULs instead of O(L²). This is
-    what every KAT, benchmark and ctgrind measurement in this document
-    exercises. Since A1 M4 (2026-09-16) the recursion is specialised on the
-    comptime limb count, and the base-case leaf carries each partial product's
-    high half into the next limb. It no longer zeroes its output and then
-    XOR-stores two limbs per product. Same products in the same order: the
-    change is bit-identical and measured at −48 to −60 % per KEM operation.
-  - **`mulPortable`** — the schoolbook shift-and-mask-xor multiply this
-    section used to describe as the only path. It is still here, as the
-    fallback for non-x86_64/non-pclmul targets and, on this host, as the
-    correctness oracle `mulClmul` is pinned against (`gf2x.zig`'s
-    differential test). O(n²/64), but that is no longer the performance
-    story for the path that ships on this host — see §4/M4 of the audit
-    record for the actual `mulClmul` cost breakdown.
-- **Constant-time posture**: both `mul` paths are branch-free by
-  construction. `mulPortable` iterates over every bit position of `a`
-  unconditionally (never skips a zero bit) and selects each contribution
-  via an arithmetic mask (`0 -% bit`), never a branch — mirroring the
-  spec's explicit requirement (§3.3: "Multiplications ... are performed
-  without taking account of the sparsity ... in order to avoid potential
-  leakage of information"). `mulClmul`'s Karatsuba recursion depth, split
-  points and loop trip counts depend only on the PUBLIC limb count, never
-  on operand values, and `pclmulqdq` itself is a fixed-latency instruction
-  (see `gf2x.zig`'s CLMUL section doc comment). The reduction fold is
-  likewise branch-free (bit extraction + shift, no `if` on the bit's
-  value), shared by both paths. The fixed-weight samplers' duplicate-
-  rejection scans (`prng.zig`) are full linear scans with no early exit,
-  matching the reference's `vect_generate_random_support{1,2}` access
-  pattern.
+- **`mul`** implements the spec's convolution product w_k = Σ_{i+j≡k mod n} u_i·v_j (§3.3), reduced mod (X^n − 1)
+  by folding bits [n, 2n−2] back onto [0, n−2] (X^{n+j} ≡ X^j; `reduceProduct`, shared by both multiply paths,
+  folding a `u64` word at a time). There are two multiply paths in `gf2x.zig`, producing bit-identical output (pinned
+  by differential tests, see Verification):
+  - **`mulClmul`**, comptime-selected whenever the target is `x86_64 + pclmul` (`clmul_supported`, `Ring.mul`,
+    `gf2x.zig:51-55,405`): a recursive Karatsuba multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
+    multiply (`clmul64`, `karatsuba_base = 8`), the same structural shape as the reference's word-aligned
+    Toom-Cook/Karatsuba + `pclmul` elementary multiply (§3.3, Table 2): O(L^1.58) CLMULs instead of O(L²). The
+    recursion is specialised on the comptime limb count, and the base-case leaf carries each partial product's high
+    half into the next limb (one store per limb per row).
+  - **`mulPortable`**, the schoolbook shift-and-mask-xor multiply, O(n²/64): the path on every other target and the
+    correctness oracle `mulClmul` is pinned against.
+- **Constant-time posture.** Both `mul` paths are branch-free by construction. `mulPortable` iterates over every bit
+  position of `a` unconditionally (never skips a zero bit) and selects each contribution via an arithmetic mask
+  (`0 -% bit`), never a branch — mirroring the spec's explicit requirement (§3.3: "Multiplications ... are performed
+  without taking account of the sparsity ... in order to avoid potential leakage of information"). `mulClmul`'s
+  Karatsuba recursion depth, split points and loop trip counts depend only on the PUBLIC limb count, never on operand
+  values, and `pclmulqdq` itself is a fixed-latency instruction (see `gf2x.zig`'s CLMUL section doc comment). The
+  reduction fold is likewise branch-free (bit extraction + shift, no `if` on the bit's value), shared by both paths.
+  The fixed-weight samplers' duplicate-rejection scans (`prng.zig`) are full linear scans with no early exit,
+  matching the reference's `vect_generate_random_support{1,2}` access pattern.
 
-  ⚠ "Branch-free in the source" and "compiled branch-free" are different
-  claims — see the ctgrind findings immediately below, which is exactly
-  where that gap was actually found (in `prng.writeSupportToVector`, not
-  in either `mul` path).
+  ⚠ "Branch-free in the source" and "compiled branch-free" are different claims: LLVM recognised several masked
+  selects as identities and rewrote them back into branches. ctgrind (memcheck with the secret tainted,
+  `src/ctgrind_harness.zig`, driven by `scripts/checks/ctgrind.sh hqc`, pinned in
+  `scripts/checks/ctgrind-expected.tsv`) is what says what the compiled code does. Four places are held branch-free
+  against the compiler, each load-bearing (deleting it moves a pinned count and turns `ctgrind.sh --check` red):
+  - `prng.writeSupportToVector`: the mask of the scatter into the bit vector is laundered through
+    `asm volatile ("" : "+r" (mask))` (`prng.zig:318,341`). It is a masked select with no `if` in the source, and
+    LLVM turned it back into a branch that loads `bit_tab[k]` only on the taken path, over the long-term secret
+    vector, on every decapsulation (adjudicated in the disassembly as real `je`/`jne`/`jb`). The barrier costs about
+    6-8 % per KEM operation (measured keypair +6.9 %, encaps +8.4 %, decaps +6.2 %, ReleaseFast, `-Dcpu=native`),
+    an accepted trade for removing the module's hottest secret-dependent branches; re-derive with `src/bench.zig`
+    (`HQC_BENCH=1`).
+  - `gf256.mul`/`inverse` do not index the `exp`/`log` tables: `mul` is the reference's own carryless multiply plus
+    fixed-tap reduction (eight masked shift-and-xor steps, then eight masked folds), `inverse` is `a^254` by
+    square-and-multiply over a comptime exponent (`gf256.zig:135-175`). The table form was the only secret-INDEXED
+    table load found in the repository. The tables remain (`reedsolomon.zig` indexes them at PUBLIC positions).
+  - `sampleFixedWeightBiased`'s duplicate fixup blends under an arithmetic mask instead of `if (found)`
+    (`prng.zig:289-299`): the scan had no early exit, but the decision still branched on a value derived from the
+    secret support.
+  - `reedsolomon`'s `maskNonzero` and Berlekamp-Massey's `mask12` are laundered through the same kind of barrier
+    (`reedsolomon.zig:33,357,427`).
 
-  ⛔⛔ **That sentence is about the duplicate SCAN, and it left the louder
-  thing unsaid: the rejection LOOP's trip count.**
-  `sampleFixedWeightRejection` redraws until a 24-bit value falls below
-  the threshold, so the number of XOF draws depends on the values drawn.
-  `decaps` re-derives the long-term secret `y` from `seed_dk` on **every
-  call** (the spec fixes `|dkKEM|` at a seed-sized 2321 bytes, so a
-  compact key means re-derivation, not storage), which puts that
-  data-dependent loop on the per-decapsulation path. Measured:
-  `prng.zig:216` and `:223`, 2 of `decaps`' 8 remaining contexts.
-
-  ⚠ **And masking it would be worse than leaving it.** `:223` (the accept
-  decision) could be turned into a blend, and the context would disappear
-  from the table — but the signal would not, because it is the ENCLOSING
-  loop's trip count, not the branch. That is a prettier measurement of the
-  same defect, and this file has a rule against those.
-
-  ⚠ **Nor is it fixable here.** Spec §3.5 mandates the split —
-  `SampleFixedWeightVect$` (rejection, unbiased) for keygen's `x`/`y`,
-  `SampleFixedWeightVect` (biased, constant draw count) for the
-  ciphertext randomness — so sampling `y` the cheap way would produce a
-  different key from the same seed and stop being HQC v5.0.0. Removing
-  this leak is a specification question, not an implementation one. It is
-  recorded here rather than left to be rediscovered.
-
-  ⛔⛔ **AND THE COMPILER UNDOES IT. The structural match above is real and
-  it is not enough — measured 2026-09-08.** The caveat that used to stand
-  here said no machine-checked verification had been run. It has been now,
-  and it does not agree with the paragraph above it.
-  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig) is committed and
-  `scripts/checks/ctgrind.sh hqc` drives it; `scripts/checks/ctgrind-expected.tsv`
-  carries the four rows as a **recorded defect**, which is what this
-  repository does with a non-zero nobody can account for.
-
-  ⭐ **The scatter defect is FIXED as of 2026-09-09.** The counts below are
-  post-fix; the pre-fix ones were 52 / 26 / 33 / 2.
-
-  | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
-  |---|---|---:|---:|---:|---:|
-  | `decaps` | `dk_pke ‖ sigma` | 16 | **14** | 0 | 0 |
-  | `keygen` | the seed | 6 | **4** | 0 | 0 |
-  | `encaps` | `m` (the FO secret) | 8 | **6** | 0 | 0 |
-  | `sampler` | the sampler seed | 4 | **2** | 0 | 0 |
-
-  Attribution on `decaps` (14): `gf256.zig:114` 4×, `gf256.zig:113` 3×,
-  `prng.zig:268` 3×, `reedsolomon` 2× (inlined, no line info),
-  `prng.zig:216` and `:223` 1× each. `keygen` (4) is `prng.zig:216` ×2 and
-  `:223` ×2; `encaps` (6) is `prng.zig:268` ×3, `gf256.zig:114` ×2 and
-  `reedsolomon` ×1.
-
-  **What was removed, and how.** `prng.zig:289` was **38 of the old 52**:
-  `val |= btab & mask` in `writeSupportToVector`, a masked select with **no
-  `if` in the source**. LLVM recognised the identity and rewrote it back
-  into a branch that loads `bit_tab[k]` only on the taken path — adjudicated
-  in the disassembly as real `je`/`jne`/`jb`, not the known `cmov` false
-  positive. The mask is now laundered through
-  `asm volatile ("" : "+r" (mask))`: an opaque identity the compiler must
-  assume may have changed the value, so it can no longer prove the select.
-  The barrier is load-bearing — deleting it puts all 38 back — and
-  `scripts/checks/ctgrind.sh --check` pins the count, so a deletion turns that red
-  instead of passing quietly.
-
-  **What it cost.** Measured before it was applied, min of 200 calls,
-  ReleaseFast `-Dcpu=native`, three alternating runs per arm; the spread
-  inside each arm was ≤1 %, so the gap is far outside the noise:
-
-  | op | without barrier | with barrier | delta |
-  |---|---:|---:|---:|
-  | `keypair` | 141 175 ns | 150 978 ns | **+6.9 %** |
-  | `encaps` | 274 923 ns | 298 035 ns | **+8.4 %** |
-  | `decaps` | 442 039 ns | 469 334 ns | **+6.2 %** |
-
-  Re-derive with [`src/bench.zig`](src/bench.zig) (`HQC_BENCH=1`), which was
-  written for this measurement. The trade taken: 38 secret-dependent branch
-  contexts out of the module's hottest secret path, for ~7 % on a PQ KEM.
-
-  Two independent checks that the barrier changed no VALUE: the full KAT
-  suite passes byte-exact in Debug, ReleaseSafe and ReleaseFast, and the
-  ctgrind table's output pin (`out_sha`, the harness's own printed bytes) is
-  unchanged for all four targets.
-
-  What remains — `gf256.zig:113` (`if (a == 0 or b == 0)`) and `:114`
-  (`if (s >= 255) s -= 255`), branches on secret field elements in the
-  GF(256) multiply, plus the rejection loop's own comparisons at
-  `prng.zig:216/223/268` — is untouched by this fix and is still a recorded
-  defect.
-
-  ⚠ **It is STILL WORSE in the mode a cautious consumer deploys, and the
-  barrier does not fix that.** Measured on `decaps`: ReleaseFast **14**,
-  **ReleaseSafe 92** (was 130 before the barrier). The remaining ~78 are in
-  `reedmuller.decodeSymbol`, where the overflow checks on `expanded[…] += …`
-  and the butterfly become branches on secret-derived data — a different
-  defect in the same module. Only ReleaseFast is pinned, because a second
-  mode doubles the rows for a claim of the same shape.
-
-  ⚠ **Honest bound.** memcheck says "Conditional jump **or move**"; these
-  were adjudicated as real jumps. Whether a key is *practically* extractable
-  from them was not measured — that is different and far more expensive
-  work. The finding is "the stated property does not hold and nothing was
-  testing it", not "the key is out". And memcheck sees branches and
-  addresses, not cache timing.
+  What is left in every pinned target is `sampleFixedWeightRejection`'s loop and accept decision (see *Threat model /
+  limits*).
 - **PRNG/XOF** (`prng.zig`): two independent SHAKE256 instantiations
   (spec Table 1, §3.1), distinguished only by a trailing domain-separator
   byte absorbed after the payload:
@@ -311,235 +202,51 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   comptime/runtime numeric args) rather than requiring a `Ring` type
   parameter, which would otherwise force an awkward import cycle with
   `gf2x.zig`.
+- **Dead-stack burn.** `Kem.keypair`, `encaps` and `decaps` take secrets by pointer and return through out-params,
+  run their body one frame down (`burn.run`, a `never_inline` call) and then zero the stack that body dirtied at that
+  depth (`burn.zig`), so no seed, sigma, `m`, `K`, `theta` or `K_bar` is left on the dead stack; `Pke.keygen`,
+  `Xof.init` and `hashI` run under their own burn (`burn.prng_burn`). `stackprobe_test.zig` and
+  `stackprobe2_test.zig` go red when a body outgrows its burn. The cost is stack: see *Threat model / limits*.
 
-## Threat model / limits
+## Codec (RS/RM concatenated)
 
-- Part 1 has **no side-channel machine verification from Part 1 itself**
-  — see "ctgrind" measurements further up this document and in
-  `ctgrind_harness.zig`/`ctgrind-expected.tsv` for the actual machine-
-  checked (and only partially clean) picture, added 2026-09-08/09.
-- ⭐ **CORRECTED 2026-09-10 (M1): `gf2x.mul` is no longer schoolbook-only.**
-  `3dc73616` (2026-07-19) added `mulClmul` (CLMUL+Karatsuba), which is the
-  path this module actually uses on every x86_64+pclmul host; `mulPortable`
-  (the schoolbook algorithm this bullet used to describe as the whole
-  story) is now the fallback/oracle path only. See "Design" above for the
-  current split and Verification below for the differential test pinning
-  them equal.
-- `sampleFixedWeightBiased` and `hashH`/`hashJ` are transcribed from the
-  reference's C source with the same care as everything else here, but —
-  unlike `Xof`, `Prng`'s construction, `hashI`, `hashG`, and
-  `sampleFixedWeightRejection`/`sampleVect` — they are **not**
-  independently numeric-KAT-pinned (see Verification below for exactly
-  why: the reference's public `intermediates_values` fixture doesn't
-  print r1/r2/e or exercise H/J directly). They're still believed correct
-  (unambiguous C source, same construction pattern as the pinned
-  primitives) but carry a lower confidence tier — flagged honestly rather
-  than silently treated as equally verified.
-- ⭐ **CORRECTED 2026-09-10 (audit A1 finding `hqc` M2): this bullet is
-  Part-1-scoped and stale.** It originally read "No key generation,
-  encryption, decryption, or KEM operations exist in Part 1 — nothing here
-  is usable as a KEM yet", written when this file described only Part 1.
-  Left standalone under a section a reader consults to check what's safe
-  to deploy, it directly contradicted `README.md`'s "the arc is complete —
-  this is a usable KEM" and `root.zig`'s "Part 3 completes the arc". **Part
-  3 supersedes this**: `pke.zig`/`kem.zig` exist, and `Hqc128`/`Hqc192`/
-  `Hqc256` are a usable KEM, byte-exact against the official NIST KAT (see
-  "Part 3" below). This bullet is kept, corrected, rather than deleted, as
-  the record of what Part 1 alone did NOT provide.
+`gf256.zig` (GF(2^8)), `reedsolomon.zig` (the outer [n1,k,delta] code), `reedmuller.zig` (the inner duplicated
+RM(1,7) code) and `code.zig` (their concatenation, spec §3.4). Encode and both decode cores are exact ports of the
+v5.0.0 reference; `gate.decoder_core_implemented = true` (`gate.zig`) turns on the decode-correctness tests. See
+`RS(p,g).decode` and `RM(p).decodeSymbol` doc comments for the step-by-step contract each satisfies: for RS,
+syndromes → constant-time Berlekamp-Massey → Gao-Mateer additive-FFT root-finding (with the `radixBig` recursion for
+hqc-192/256's PARAM_FFT=5) → Forney; for RM, expand-and-sum → fast Hadamard transform → find_peaks (maximum
+likelihood over the duplicated code, spec §3.4.3).
 
-## Verification
+Reference source read, tag `v5.0.0` (`gitlab.com/pqc-hqc/hqc`): `src/ref/gf.c`/`gf.h`, `src/ref/reed_solomon.c`/
+`reed_solomon.h`, `src/ref/reed_muller.c`, `src/common/reed_muller.h`, `src/common/fft.c`/`fft.h` (the
+additive-FFT root-finder lives under `src/common/`, not `src/ref/`), `src/common/code.c`/`code.h` and
+`src/ref/data_structures.h` (`rm_codeword_t`). v5.0.0's `alpha_ij_pow` syndrome tables and FFT root-finder have no
+shortened-RS index offsets (an older HQC draft did); `reedsolomon.zig`'s `decode` doc comment is the reference for
+the real steps.
 
-**Per-primitive tier** (most → least verified):
+**GF(2^8).** `gf256.mul`/`inverse` use the reference's own carryless-multiply-then-reduce construction, not a table
+lookup (see *Constant-time posture* above for why). Equivalence with the `exp`/`log` table product is tested
+exhaustively (every byte pair and every `inverse` input).
 
-| Primitive | Tier | Evidence |
-|---|---|---|
-| `Xof` (construction + `getBytes` quirk) | Numeric-KAT-pinned | kat_test.zig: chained y-then-x sampling reproduces the reference's `intermediates_values` exactly; this specifically caught the 8-byte-rounding quirk (an unaligned-length-squeeze bug reproduced `y` but not chained `x` until fixed) |
-| `Prng` construction | Source-matched + KAT-source-confirmed | `packaging/utils/helpers/main_kat.c` shows it IS the NIST KAT DRBG in this release (see "Spec version" above); not separately numeric-pinned in Part 1 since Part 1 has no full keygen to run against a `.rsp` vector yet (that's Part 3) |
-| `hashI` | Numeric-KAT-pinned | kat_test.zig: `I(seed_pke) == seed_dk ‖ seed_ek` exactly |
-| `hashG` | Numeric-KAT-pinned | kat_test.zig: `G(H(ek_kem), m, salt) == K ‖ theta` exactly |
-| `sampleVect` | Numeric-KAT-pinned | kat_test.zig: reproduces the reference's `h` exactly, including the top-word mask |
-| `sampleFixedWeightRejection` + `writeSupportToVector` | Numeric-KAT-pinned | kat_test.zig: reproduces the reference's `y` and `x` (chained) exactly |
-| `gf2x.mul`/`add`/`weight`/codecs | Algebraic self-test + differential (CLMUL vs. schoolbook) | No official gf2x-level KAT is published (the reference ships no isolated multiply vectors — checked `tests/unit/test_vector.c`, it's property-based, no fixed multiply I/O); pinned via hand-verifiable monomial-wraparound cases (`X^i · X^j = X^{(i+j) mod n}`, including the mod-reduction wraparound) plus commutativity/distributivity/identity-element/weight-bound checks — **and**, since `3dc73616` added the CLMUL+Karatsuba path, a differential test requiring `mulClmul(a,b) == mulPortable(a,b)` bit-for-bit on 64 random pairs + zero/monomial/all-ones edge operands per parameter set (`gf2x.zig`'s `testClmulDifferential`) |
-| `hashH`, `hashJ` | Source-matched only | Transcribed from `symmetric.c`; not independently numeric-pinned (see Limits above) |
-| `sampleFixedWeightBiased` | Source-matched + property-tested | Transcribed from `vector.c`'s `vect_generate_random_support2`; self-tested for exact weight / no duplicates / in-range, not numeric-KAT-pinned |
-| `gf256.exp`/`log` tables | Numeric-KAT-pinned (self-derived) | `gf256.zig`: `generateTables` independently re-derives both tables from `poly` via the reference's own `gf_generate` recurrence; matches the transcribed `gf.h` tables byte-exact |
-| `gf256.mul`/`square`/`inverse` | Algebraic + provably-equivalent | Field-axiom tests (associativity, distributivity, multiplicative inverse) plus the argument that GF(2^8) multiplication is representation-unique (see "Part 2" section below) — not a different-algorithm-vs-reference numeric pin, since this module doesn't port the reference's carryless-multiply algorithm at all |
-| `reedsolomon.RS(p,g).encode` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `reed_solomon_encode` for 4 message patterns × 3 parameter sets (`kat_vectors_code.zig`) |
-| `reedmuller.RM(p).encodeBlock`/`encodeSymbol` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `encode`+duplication for 8 byte values × 3 parameter sets |
-| `code.Code(p,g).encode` | Numeric-KAT-pinned (hqc-128 full; hqc-192/256 zero-message only) | `code_kat_test.zig`: byte-exact vs. the reference's `code_encode`; full-codeword vectors for 3 message patterns on hqc-128, zero-message only on hqc-192/256 (see `kat_vectors_code.zig`'s coverage note) |
-| `reedsolomon.RS(p,g).decode`, `reedmuller.RM(p).decodeSymbol` | Decode-correctness tested (all 3 sets) | `code_kat_test.zig` (gated by `gate.decoder_core_implemented = true`): zero-error round-trip `decode(encode(m)) == m`, at-capacity (exactly δ symbol errors) correction at both the concatenated-code and bare-RS layers, and exhaustive 256-value RM `decodeSymbol` — covering hqc-128 (PARAM_FFT=4 unrolled radix) and hqc-192/256 (PARAM_FFT=5 `radixBig`). Exact ports of the reference; not a fresh numeric intermediate-value pin (no such fixture ships for this layer) |
-| `Pke(p,g).keygen`/`.encrypt`/`.decrypt` | Numeric-KAT-pinned (via `Kem`) | `kem_kat_test.zig`: `Kem.keypair`/`encaps`/`decaps` — which call these directly, unwrapped — reproduce the official NIST `.rsp` pk/sk/ct/ss byte-exact for all 3 parameter sets (first 3 `count`s each) |
-| `Kem(p,g).keypair`/`.encaps`/`.decaps` | Numeric-KAT-pinned | `kem_kat_test.zig`: byte-exact pk/sk/ct/ss vs. `kat_vectors_kem.zig` (official NIST `.rsp`, first 3 `count`s × 3 parameter sets), plus `decaps` on the genuine ciphertext recovering the same `ss` — reproducing `main_kat.c`'s own internal self-check. Additionally: random-coins round-trip property tests and a decaps-failure/implicit-reject test (corrupted ciphertext → deterministic `J`-derived rejection value, ≠ real `ss`, no crash) |
+**Decoder constant-time posture.** The two decode cores port the reference's constant-time structure: masked
+branch-free selects in Berlekamp-Massey (`compute_elp`), a data-independent additive-FFT access pattern,
+constant-access-pattern Forney bookkeeping (`compute_error_values`), and a branch-free `find_peaks`; there is no
+secret-indexed table load left. The compiler undoing two of those masks was found by ctgrind and is held with the
+barriers listed under *Constant-time posture*.
 
-**How the numeric pins were obtained** (for future auditing): the
-reference's `kats/ref/hqc-1/intermediates_values` file (shipped in the
-same `v5.0.0` tag as the KAT `.rsp` files, produced by the reference's
-"verbose" build mode) was downloaded via `curl` (not through any
-summarizing/paraphrasing tool — hex transcription errors from an LLM
-intermediary were an explicit risk considered and avoided this way) and
-cross-verified independently in Python (`hashlib.sha3_512`/`shake_256`)
-*before* being ported into `kat_vectors.zig`. That file is a standalone
-illustrative run, not tied to the `.rsp`'s own count=0 `seed` — confirmed
-by checking that `intermediates_values`' `K`/`ss` don't match the `.rsp`
-count=0 vector's `ss`, ruling out an assumed-but-false seed relationship.
-That's immaterial to what it's used for here: it's the reference's own
-recorded output for *some* seed, and reproducing it byte-exact proves
-this module's primitives match the reference's, independent of which
-seed started the chain.
+## PKE and KEM composition
 
-**What Part 1 could NOT pin** (now closed by Part 3): end-to-end `.rsp`
-keypair/ciphertext/shared-secret reproduction, since that requires the
-full PKE (`gf2x.mul` composed with the Part-2 decoder) — see "Part 3"
-section below for how `kem_kat_test.zig` closes this.
-
-### Mutation run 2026-10-04
-
-Mutant schemata over a copy (one ReleaseSafe build of every test, 84 run,
-`setsid -w timeout -s KILL 20` per mutant): **29 mutants, 26 killed, 3
-equivalent**. Points: `vectCompare` (start value, coverage), the decaps
-select, `J`'s inputs (ciphertext, sigma), the rejection blend; RM decoding
-(tie-break, entry-0 correction, sign bit, copies summed); RS decoding
-(corrections applied, Berlekamp-Massey length and degree test, the Z
-polynomial, Forney's mask and product, syndromes); Barrett reduction,
-`sampleVect`'s mask, the rejection sampler's threshold and duplicate check,
-the biased sampler's collision pass and offset, `writeSupportToVector`;
-`Ring.fromBytes`/`truncate`/`reduceProduct`.
-
-- **Tests added.** (1) The rejection key: nothing pinned `K_bar = J(H(ek),
-  sigma, c)` — with sigma dropped from `J` (a rejection key anyone can
-  compute) and with `J` taken over `c'` instead of the received `c`, every test
-  stayed green, because they only asked the rejection value to differ from the
-  real key and from sigma. New test recomputes `J` per the spec and requires a
-  changed sigma to change the rejection key and nothing else. (2) The
-  rejection sampler accepting a draw equal to its threshold `t`: a
-  probability-2^-24 event no KAT reaches, but it changes the support (and so
-  the key pair) against the reference for such seeds. New test uses a seed,
-  found by search, whose first draw is exactly `t`.
-- **Equivalent:** RM's sign test `> 0` vs `>= 0` (the winning entry is 0 only
-  if the whole transform is 0, impossible for the odd multiplicities 3 and 5:
-  every summed entry is odd, so the vector is non-zero and so is its
-  transform); Forney's `i < delta_real_value` vs `<=` (`e_j` past the error
-  count is never read — the last pass assigns only `delta_real_value` values);
-  `truncate`'s partial-word mask (n1·n2 is a multiple of 64 in all three
-  parameter sets).
-
-## Part 2 (RS/RM concatenated codec) — status
-
-Part 2 adds `gf256.zig` (GF(2^8)), `reedsolomon.zig` (the outer [n1,k,delta]
-code), `reedmuller.zig` (the inner duplicated RM(1,7) code), and `code.zig`
-(their concatenation). **Encode is fully real and byte-exact-KAT'd; both
-decode cores are now real implementations too** (Fable pass, exact ports of
-the v5.0.0 reference), with `gate.decoder_core_implemented = true`
-(`gate.zig`) — see `reedsolomon.zig`'s `RS(p,g).decode` and
-`reedmuller.zig`'s `RM(p).decodeSymbol` doc comments for the full
-step-by-step algorithm each satisfies (syndromes → constant-time
-Berlekamp-Massey → Gao-Mateer additive-FFT root-finding → Forney, for RS;
-expand-and-sum → fast Hadamard transform → find_peaks, for RM). The decode
-cores are pinned by `code_kat_test.zig`'s correctness tests: zero-error
-round-trip and at-capacity (exactly δ symbol errors) correction at both the
-concatenated-code and bare-RS layers, plus exhaustive RM `decodeSymbol`,
-across all three parameter sets — including hqc-192/256's PARAM_FFT=5
-`radixBig` additive-FFT path.
-
-**Reference source consulted**: same tag as Part 1, `v5.0.0`
-(`gitlab.com/pqc-hqc/hqc`) — specifically `src/ref/gf.c`/`gf.h`,
-`src/ref/reed_solomon.c`/`reed_solomon.h`, `src/ref/reed_muller.c`,
-`src/common/reed_muller.h`, `src/common/fft.c`/`fft.h` (the additive-FFT
-root-finder — note this file lives under `src/common/`, not `src/ref/`,
-unlike its caller `reed_solomon.c`), `src/common/code.c`/`code.h`, and
-`src/ref/data_structures.h` (`rm_codeword_t`). Fetched via the GitLab
-raw-file endpoint and the repository-tree API (`per_page`/`recursive`),
-not through any summarizing/paraphrasing tool, same care as Part 1's
-`intermediates_values` fetch.
-
-**Corrects an earlier (pre-fetch) note**: an earlier draft of this
-document's "Arc plan" claimed the RS/RM composition needed "shortened-RS
-index offsets (RS-S1/S2/S3 subtract 209/199/165 from the standard RS-1/2/3
-tables)". Having now actually fetched and read the v5.0.0 reference
-source, this does not match what's there — v5.0.0's `alpha_ij_pow` syndrome
-tables and additive-FFT root-finder have no such offset constants; that
-note appears to describe an older/different HQC draft and should be
-treated as superseded by `reedsolomon.zig`'s `decode` doc comment (which
-documents the six real decode steps as read directly from this tag's
-source), not as additional truth to reconcile.
-
-**KAT strategy for Part 2's real (encode) code**: no `.rsp`-style official
-fixture covers the RS/RM/code layer in isolation (checked: this tag's
-`kats/ref/hqc-*/intermediates_values` files only cover the PKE/KEM layer's
-PRNG-derived values). Byte-exact vectors were instead obtained by
-compiling and running the reference's own unmodified encode-side C files
-locally (`gf.c`+`reed_solomon.c`+`reed_muller.c`+`code.c`+`fft.c`+
-`crypto_memset.c`, `gcc -O0`, one build per parameter set's own
-`parameters.h`) and transcribing stdout mechanically via a small Python
-script (no hand transcription, no LLM-summarized hex) — see
-`kat_vectors_code.zig`'s module doc for the full provenance and exactly
-which vectors are pinned at full depth (hqc-128) vs. lighter depth
-(hqc-192/256).
-
-**GF(2^8) note**: ⭐ **CORRECTED 2026-09-10 — this paragraph described a
-table lookup that no longer exists.** It used to say this module's `mul`
-"uses a discrete-log table lookup, NOT the reference's carryless-multiply-
-then-reduce", i.e. the opposite of what `gf256.zig` does since audit A1
-finding `hqc` L2 was fixed (`110f4190`, 2026-09-09): `gf256.mul`/`inverse`
-were rewritten off the `exp`/`log` tables onto the reference's own
-carryless-multiply-then-reduce construction (eight masked shift-and-xor
-steps, then eight masked folds for `mul`; `a^254` via square-and-multiply
-for `inverse`) — the table lookup this paragraph described was a genuine,
-measured, secret-indexed cache-timing channel (the only one found anywhere
-in this repository; `A1/hqc.md` L2), not a benign algorithm choice, and it
-is gone. The `exp`/`log` tables still exist in `gf256.zig` (`reedsolomon.zig`
-indexes them at PUBLIC positions) but the secret-operand path no longer
-touches them. Equivalence between the two `mul` implementations was proven
-exhaustively before the table path was removed: all 65536 byte pairs and
-all 256 `inverse` inputs, table method vs. carryless, see `gf256.zig`'s
-tests.
-
-**Constant-time posture of the decoders**: the two decode cores
-(`RS(p,g).decode`, `RM(p).decodeSymbol`) add **no new secret-dependent
-branches or memory indices** — they port the reference's constant-time
-structure directly: masked branch-free selects in Berlekamp-Massey
-(`compute_elp`), a data-independent additive-FFT access pattern,
-constant-access-pattern Forney bookkeeping (`compute_error_values`), and a
-branch-free `find_peaks`. ⭐ **CORRECTED 2026-09-10: the caveat that used to
-stand here (`gf256.mul`/`inverse` as secret-indexed table loads) was FIXED
-2026-09-09** (`110f4190`, audit A1 finding `hqc` L2) — `gf256` now uses the
-same table-free carryless-multiply-then-reduce construction as the
-reference, so this decoder pair has no known secret-indexed memory access
-left. What ctgrind machine verification (added 2026-09-08/09, see the
-"Constant-time posture" ctgrind table further up this document) actually
-found in this area was different from what this paragraph predicted: not
-the table load (that was found and fixed independently, see above), but
-ordinary conditional branches over secret-derived data in the rejection
-sampler (`prng.zig:216/223/268`) and a couple of `reedsolomon`/`gf256`
-comparisons — see the ctgrind table and `CHANGELOG.md`'s Unreleased section
-for the current, measured (not by-construction) picture. Machine
-verification here is no longer absent, and it disagreed with the earlier
-"no new secret-dependent branches" claim on several specific lines, all
-now tracked as recorded defects rather than closed silently.
-
-## Part 3 (PKE + FO KEM composition) — status
-
-Part 3 adds `pke.zig` (the HQC public-key encryption scheme: `Pke(p,g).
-keygen`/`.encrypt`/`.decrypt`) and `kem.zig` (the Fujisaki-Okamoto
-implicit-rejection KEM transform over it: `Kem(p,g).keypair`/`.encaps`/
-`.decaps`), plus `root.zig`'s `Hqc128`/`Hqc192`/`Hqc256` convenience
-instantiations. **This is pure composition, confirmed not Fable-hard**:
-every operation is direct wiring over Parts 1-2's already-real
-primitives — `gf2x.Ring(n).{add,mul,truncate,fromBytes,toBytes}` for all
-ring arithmetic, `prng`'s `Xof`/`Prng`/samplers/I·G·H·J hashes for every
-randomness-derivation and hash step, `code.Code(p,g).{encode,decode}` for
-the error-correcting layer. No new algorithm is introduced anywhere in
-Part 3 — the same posture this repo's bn254 precompiles/Groth16
-composition work carried (see zig_libs project memory). The only design
-decisions Part 3 makes are (a) taking `seed`/`coins` as explicit caller-
-supplied byte arrays rather than owning a stateful global PRNG (keeps the
-module free of hidden state; the reference's `main_kat.c` harness still
-gets reproduced exactly by driving `prng.Prng` manually in the KAT test —
-see `kem_kat_test.zig`) and (b) reproducing the reference's
-`vect_compare`-based constant-time mask trick for implicit rejection
-bit-for-bit (`kem.zig`'s `vectCompare`) rather than a higher-level
-`std.crypto.timing_safe` helper, to stay byte-and-structure-faithful to
-the reference the same way every other primitive in this arc is.
+`pke.zig` is the HQC public-key encryption scheme (`Pke(p,g).keygen`/`.encrypt`/`.decrypt`) and `kem.zig` the
+Fujisaki-Okamoto implicit-rejection transform over it (`Kem(p,g).keypair`/`.encaps`/`.decaps`), plus the
+`Hqc128`/`Hqc192`/`Hqc256` instantiations in `root.zig`. This is pure composition over the layers above — `gf2x.Ring(n)`
+for ring arithmetic, `prng`'s `Xof`/`Prng`/samplers and the I/G/H/J hashes for every derivation, `code.Code(p,g)`
+for the error-correcting layer — and introduces no algorithm of its own. The transform is the updated salted
+`SFO^L_m` with implicit rejection (spec §3.5/§3.6), not the older `FO^L`. Two design decisions: `seed`/`coins` are
+caller-supplied byte arrays rather than a stateful global PRNG (no hidden state; the reference's `main_kat.c`
+harness is reproduced by driving `prng.Prng` manually in the KAT test), and the reference's `vect_compare`-based
+constant-time mask is reproduced bit for bit for the implicit-rejection select (`kem.zig`'s `vectCompare`) instead
+of a `std.crypto.timing_safe` helper.
 
 **Byte layout, matched against the reference exactly** (`src/ref/hqc.c`,
 `src/common/kem.c`, `src/ref/parsing.c`, `src/common/symmetric.c`, all
@@ -551,8 +258,8 @@ read directly):
   the reference's `hqc_dk_pke_from_string`). `ek_kem = ek_pke` verbatim;
   `dk_kem = ek_kem ‖ dk_pke ‖ sigma ‖ seed_kem`.
 - Keygen's `(y, x)` are sampled off **one** `Xof(seed_dk)` context, y then
-  x, chained (same load-bearing `Xof.getBytes` ordering dependency Part 1
-  flagged for the ring-vector samplers). Encrypt's `(r2, e, r1)` — note
+  x, chained (the same load-bearing `Xof.getBytes` ordering dependency as the
+  ring-vector samplers). Encrypt's `(r2, e, r1)` — note
   this order, not `(r1, r2, e)` — are sampled off one `Xof(theta)`
   context, all three biased-sampler draws chained.
   `s = y·h + x`; `u = r2·h + r1`; `v = C.encode(m) ⊕ Truncate(s·r2 + e)`;
@@ -573,95 +280,155 @@ read directly):
   0→0xFF/1→0x00, then `(K'[i] & mask) ^ (K_bar[i] & ~mask)` per byte) —
   not a source-level `if`.
 
-**Reference source consulted** (same tag, `v5.0.0`): `src/ref/hqc.c`
+**Reference source read** (same tag, `v5.0.0`): `src/ref/hqc.c`
 (`hqc_pke_keygen`/`_encrypt`/`_decrypt`), `src/ref/parsing.c`
 (`hqc_ek_pke_from_string`/`hqc_dk_pke_from_string`/
 `hqc_c_kem_to_string`/`_from_string`), `src/common/kem.c`
 (`crypto_kem_keypair`/`_enc`/`_dec`), `src/common/symmetric.c` (hash/PRNG
-domain wiring, already Part 1 territory), `src/ref/vector.c`
-(`vect_compare`, `vect_truncate` — already Part 1 territory),
+domain wiring), `src/ref/vector.c`
+(`vect_compare`, `vect_truncate`),
 `packaging/utils/helpers/main_kat.c` (the KAT harness's DRBG-seeding
-sequence). Fetched via the GitLab raw-file endpoint, same care as Parts
-1-2 (no summarizing/paraphrasing tool).
+sequence). Fetched via the GitLab raw-file endpoint, same care as the rest
+(no summarizing/paraphrasing tool).
 
-**KAT strategy for Part 3**: the official `kats/ref/hqc-{1,3,5}/
-PQCkemKAT_{2321,4602,7333}.rsp` files (100 vectors each, standard NIST
-`seed`/`pk`/`sk`/`ct`/`ss` format) were fetched via `curl` and parsed by a
-small Python script (no hand transcription, no LLM-summarized hex); the
-first 3 `count`s per parameter set are embedded in `kat_vectors_kem.zig`.
-`kem_kat_test.zig` seeds `prng.Prng` from each vector's 48-byte `seed`
-exactly as `main_kat.c` does, draws `seed_kem` then `coins` off that one
-continuing stream, and asserts `keypair`'s `(ek, dk)`, `encaps`'s
-`(ct, ss)`, and `decaps(dk, ct)`'s recovered `ss` are all byte-exact
-against the vector — the definitive end-to-end check for the whole arc.
-Also present: a random-coins round-trip property test (all three
-parameter sets) and a decaps-failure/implicit-reject test (corrupted
-ciphertext → decaps returns the deterministic `J`-derived rejection
-value, not a crash, and different from the real shared secret).
+## Threat model / limits
 
-## Arc plan
+- **The decapsulation key is re-derived from its seed on every `decaps`, and the sampler that does it has a
+  data-dependent trip count.** `sampleFixedWeightRejection` redraws until a 24-bit value falls below the threshold,
+  so the number of XOF draws depends on the values drawn. `decaps` re-derives the long-term secret `y` from
+  `seed_dk` on every call (the spec fixes `|dkKEM|` at a seed-sized 2321 bytes, so a compact key means
+  re-derivation, not storage), which puts that loop on the per-decapsulation path. It is the only thing ctgrind
+  still reports in `decaps` and `keygen` (and in the `sampler` target); the duplicate scan is branch-free, the loop
+  is not.
+- **It is not fixable here, and masking it would be worse than leaving it.** Spec §3.5 mandates the split —
+  `SampleFixedWeightVect$` (rejection, unbiased) for keygen's `x`/`y`, `SampleFixedWeightVect` (biased, constant
+  draw count) for the ciphertext randomness — so sampling `y` the cheap way would produce a different key from the
+  same seed and stop being HQC v5.0.0; removing the leak is a specification question. The accept comparison could
+  be turned into a blend and its context would vanish from the ctgrind table, but the signal is the enclosing
+  loop's trip count, not the branch: a prettier measurement of the same defect.
+- **ReleaseSafe is worse than ReleaseFast.** Only ReleaseFast is pinned (a second mode doubles the rows for a claim
+  of the same shape; Debug cannot be measured at all). In ReleaseSafe the overflow checks on `expanded[…] += …` and
+  the butterfly in `reedmuller.decodeSymbol` become branches on secret-derived data, which measured at several times
+  the ReleaseFast count on `decaps`; that count predates the later constant-time fixes and was not re-measured.
+- **Honest bound.** memcheck reports "Conditional jump **or move**"; the contexts were adjudicated as real jumps.
+  Whether a key is *practically* extractable from them was not measured. The finding is "the stated property does
+  not hold for the rejection sampler", not "the key is out"; memcheck sees branches and addresses, not cache timing.
+- **Stack.** `keypair`/`encaps`/`decaps` use stack proportional to the parameter set, up to `Kem.stack_bytes` (the
+  dead-stack burn buffer is the peak: 128 / 256 / 384 KiB for decaps of HQC-128 / 192 / 256, plus the caller's
+  frames; `kem.zig:78-79,115-121`, `sweep_test.zig` pins the three sizes). Run them on a thread with at least
+  `stack_bytes + 64 KiB`; a 128 KiB musl default thread stack is not enough.
+- **Custom parameter sets.** `gf2x.Ring(n)` and `prng.sampleVect` are `@compileError`s for `n % 64 == 0` (every real
+  HQC `n` is prime: 17669 / 35851 / 57637); `sampleFixedWeightRejection` and `sampleFixedWeightBiased` are
+  `@compileError`s for `weight > n`, and the rejection one for `threshold == 0` (each would loop forever or wrap)
+  (`gf2x.zig:193`, `prng.zig:188,224,225,275`). Only a custom `params.Params` reaches them; the real sets compile.
+  Caller-contract violations in `Ring.toBytes`/`setBit`/`getBit` and `prng.sampleVect` (a short output, a position
+  `>= n`) are checked panics; `Ring.truncate` is total (`sweep_test.zig`).
+- **Verification tier of the hashes and the biased sampler.** `hashJ` is the least pinned primitive: it is used only
+  on the rejection path, so the NIST KAT never reaches it; a test recomputes `K_bar = J(H(ek), sigma, c)` per the
+  spec over the received ciphertext (`kem_kat_test.zig:197`), but there is no external numeric pin for it. `hashH`
+  and `sampleFixedWeightBiased` are pinned end to end by the KEM KAT (`hashH` feeds `G` in `encaps`,
+  `kem.zig:197`; the biased sampler draws `r2`, `e`, `r1` in `Pke.encrypt`, `pke.zig:171-181`; any difference moves
+  the ciphertext bytes), though not individually: the reference's public `intermediates_values` dump prints neither
+  `r1`/`r2`/`e` nor `H`/`J`.
 
-- **Part 1** — ring + PRNG foundation. Tier: Sonnet (mechanical
-  constant-structure bit arithmetic + exact PRNG-construction matching).
-  **No part of Part 1 is genuinely Fable-hard** — the closest candidate,
-  `gf2x.mul`'s constant-time structure, is a known, mechanical
-  transformation (branch → mask) of an already-fully-specified reference
-  algorithm, not an open algorithmic problem.
-- **Part 2 (this module) — concatenated Reed-Muller/Reed-Solomon codec**
-  (spec §3.4): the [n1n2, k] code C, built by concatenating an
-  [n1,k,delta] Reed-Solomon code over GF(2^8) (outer) with a duplicated
-  first-order Reed-Muller code RM(1,7) = [128,8,64] (inner, replicated 3×
-  for hqc-128 or 5× for hqc-192/256 — `params.rm_multiplicity`). Encode
-  (both halves + the concatenation) is Sonnet-tier and DONE. **The two
-  decoders are the genuinely Fable-hard core of the HQC arc and are now
-  implemented** (Fable pass): RM decoding via the fast Hadamard transform
-  (maximum-likelihood over the duplicated code, "Green machine" per spec
-  §3.4.3) and RS decoding via a constant-time Berlekamp-Massey
-  error-locator polynomial plus an *additive* FFT (Gao-Mateer, with
-  Bernstein/Chou/Schwabe's radix optimizations, including the `radix_big`
-  recursion for hqc-192/256's PARAM_FFT=5) for root-finding over GF(2⁸) —
-  additive FFTs are a meaningfully harder primitive than the
-  multiplicative NTTs this repo already has (falcon, bls12_381). Both are
-  exact ports of the v5.0.0 reference (`reedsolomon.zig`/`reedmuller.zig`),
-  with `gate.decoder_core_implemented = true` and decode-correctness KATs
-  driving them across all three parameter sets. Tier: **Fable** (decode
-  only; encode already shipped as Sonnet work, see "Part 2 status" above).
-- **Part 3 — HQC-PKE + HQC-KEM, byte-exact vs NIST KAT. DONE.** Composed
-  Part 1 (ring `mul`, samplers) with Part 2 (`C.Encode`/`C.Decode`) into
-  `Pke(p,g).{keygen,encrypt,decrypt}` and the salted-FO-transform
-  `Kem(p,g).{keypair,encaps,decaps}` (spec §3.5/§3.6 — this is the
-  updated `SFO^L_m` transform with implicit rejection, not the older
-  `FO^L`; see the spec's 2025/08/22 and 2023/04/30 changelog entries).
-  Verified byte-exact against `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
-  (first 3 counts per parameter set pinned; see "Part 3" section above)
-  using `Prng` as the KAT DRBG (see "Spec version" above — no AES
-  needed). Tier: **Sonnet**, confirmed — pure composition/wire-format
-  work over Parts 1-2's already-real primitives, no new algorithm; the
-  wire-format parsing itself (`ekKEM`/`dkKEM`/`cKEM` byte layouts) is
-  mechanical struct-packing per spec §3.5/§4.2 and this module's already-
-  verified byte sizes (params.zig). **The whole HQC arc is now complete
-  and usable as a KEM** (`root.zig`'s `Hqc128`/`Hqc192`/`Hqc256`).
+## Verification
+
+Run: `scripts/modtest hqc` (`zig build test-hqc`; add `-Doptimize=ReleaseFast` for the optimized mode).
+
+**Per-primitive tier** (most → least verified):
+
+| Primitive | Tier | Evidence |
+|---|---|---|
+| `Xof` (construction + `getBytes` quirk) | Numeric-KAT-pinned | `kat_test.zig`: chained y-then-x sampling reproduces the reference's `intermediates_values` exactly; this specifically caught the 8-byte-rounding quirk (an unaligned-length-squeeze bug reproduced `y` but not chained `x` until fixed) |
+| `Prng` construction | Source-matched + pinned end to end | `packaging/utils/helpers/main_kat.c` shows it IS the NIST KAT DRBG in this release (see *Spec version*); `kem_kat_test.zig` seeds from it exactly as `main_kat.c` does, so every `.rsp` field depends on it |
+| `hashI` | Numeric-KAT-pinned | `kat_test.zig`: `I(seed_pke) == seed_dk ‖ seed_ek` exactly |
+| `hashG` | Numeric-KAT-pinned | `kat_test.zig`: `G(H(ek_kem), m, salt) == K ‖ theta` exactly |
+| `hashH` | Pinned end to end | feeds `G` in `encaps`; the KEM KAT's `ss` and `ct` depend on it (see *Threat model / limits*) |
+| `hashJ` | Spec-recomputed only | `kem_kat_test.zig`: the rejection key equals `J(H(ek), sigma, c)` over the received ciphertext, and a changed sigma changes it and nothing else; no external numeric pin |
+| `sampleVect` | Numeric-KAT-pinned | `kat_test.zig`: reproduces the reference's `h` exactly, including the top-word mask |
+| `sampleFixedWeightRejection` + `writeSupportToVector` | Numeric-KAT-pinned | `kat_test.zig`: reproduces the reference's `y` and `x` (chained) exactly; `prng.zig`: a seed found by search whose first draw equals the threshold shows that such a draw is refused |
+| `sampleFixedWeightBiased` | Pinned end to end + property-tested | transcribed from `vector.c`'s `vect_generate_random_support2`; ciphertext bytes in the KEM KAT depend on it; self-tested for exact weight / no duplicates / in range |
+| `gf2x.mul`/`add`/`weight`/codecs | Algebraic self-test + differential (CLMUL vs. schoolbook) | No official gf2x-level KAT is published (the reference ships no isolated multiply vectors: `tests/unit/test_vector.c` is property-based); pinned via hand-verifiable monomial-wraparound cases (`X^i · X^j = X^{(i+j) mod n}`, including the mod-reduction wraparound), commutativity/distributivity/identity-element/weight-bound checks, a differential test requiring `mulClmul(a,b) == mulPortable(a,b)` bit for bit on random pairs plus zero/monomial/all-ones edge operands per parameter set (`testClmulDifferential`), a limb-level differential against a bit-at-a-time reference at every split shape, and a differential of the word-batched `reduceProduct` against the bit-at-a-time fold |
+| `gf256.exp`/`log` tables | Numeric-KAT-pinned (self-derived) | `gf256.zig`: `generateTables` independently re-derives both tables from `poly` via the reference's own `gf_generate` recurrence; matches the transcribed `gf.h` tables byte-exact |
+| `gf256.mul`/`square`/`inverse` | Algebraic + exhaustive equivalence | Field-axiom tests plus equality with the table product for every byte pair and every `inverse` input |
+| `reedsolomon.RS(p,g).encode` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `reed_solomon_encode` for four message patterns × three parameter sets (`kat_vectors_code.zig`) |
+| `reedmuller.RM(p).encodeBlock`/`encodeSymbol` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `encode`+duplication for eight byte values × three parameter sets |
+| `code.Code(p,g).encode` | Numeric-KAT-pinned (hqc-128 full; hqc-192/256 zero-message only) | `code_kat_test.zig`: byte-exact vs. the reference's `code_encode`; full-codeword vectors for three message patterns on hqc-128, zero-message only on hqc-192/256 (see `kat_vectors_code.zig`'s coverage note) |
+| `reedsolomon.RS(p,g).decode`, `reedmuller.RM(p).decodeSymbol` | Decode-correctness tested (all three sets) | `code_kat_test.zig` (gated by `gate.decoder_core_implemented`): zero-error round trip `decode(encode(m)) == m`, at-capacity (exactly δ symbol errors) correction at the concatenated-code and bare-RS layers, exhaustive RM `decodeSymbol` over all 256 values, covering hqc-128 (PARAM_FFT=4 unrolled radix) and hqc-192/256 (PARAM_FFT=5 `radixBig`); an independent syndrome oracle (`S_i = Σ c_j·α^{(i+1)j}`, computed apart from the module's `computeSyndromes`), a closed-form single-error Peterson anchor (a different construction than BM/FFT/Forney), and a beyond-capacity determinism check. Exact ports of the reference; not a numeric intermediate-value pin (no such fixture ships for this layer) |
+| `Pke(p,g).keygen`/`.encrypt`/`.decrypt` | Numeric-KAT-pinned (via `Kem`) | `kem_kat_test.zig`: `Kem.keypair`/`encaps`/`decaps`, which call these directly, reproduce the official NIST `.rsp` pk/sk/ct/ss byte-exact for all three parameter sets (first three `count`s each) |
+| `Kem(p,g).keypair`/`.encaps`/`.decaps` | Numeric-KAT-pinned | `kem_kat_test.zig`: byte-exact pk/sk/ct/ss vs. `kat_vectors_kem.zig`, plus `decaps` on the genuine ciphertext recovering the same `ss` (`main_kat.c`'s own self-check); random-coins round-trip property tests; implicit-reject tests: a corrupted ciphertext gives a deterministic `J`-derived value ≠ the real `ss` that is not the raw sigma, depends on which byte was corrupted, and covers every ciphertext component (`u`, `v`, salt) |
+
+**Other classes.** Parameter tables are cross-checked against the spec (`params.zig`: n1n2 against Table 5, byte
+sizes against Table 6, threshold and Barrett `mu` well-formed). Sweep tests (`sweep_test.zig`) cover the checked
+panics, total `truncate` and the `stack_bytes` sizes. Dead-stack probes (`stackprobe_test.zig`,
+`stackprobe2_test.zig`) scan the stack after every KEM operation for seed, sigma, `m`, `K`, `theta` and `K_bar`
+residue. ctgrind: `src/ctgrind_harness.zig`, rows in `scripts/checks/ctgrind-expected.tsv` (a recorded defect, see
+*Threat model / limits*; each row carries an untainted control and a no-`-fvalgrind` trap, and encaps' row carries
+an output pin so its zero means something). Fuzz: `HQC_FUZZ=<runs>[,<seed>]` (testkit's deterministic driver,
+`fuzz_test.zig`) over arbitrary-ciphertext `decaps` (never panics), round trip and implicit reject, with reach
+counted; seeds also run in every ordinary test run. Bench: `src/bench.zig` (opt-in, `HQC_BENCH=1`) and
+`tools/bench.zig` (`zig build bench-hqc`).
+
+**Foreign oracle** (`tools/`, needs a C compiler, CMake and Python, so not part of `zig build`; see
+`tools/README.md`): `compare_kat.py` checks the vectors pinned in `kat_vectors_kem.zig` against the reference's own
+`.rsp` files; `oracle_hqc.c` (built by `oracle.sh`) recomputes the C reference's answer for any seed in both its
+lanes (`ref`, `avx256`).
+
+**How the numeric pins were obtained.** The reference's `kats/ref/hqc-1/intermediates_values` file (shipped in the
+same `v5.0.0` tag as the KAT `.rsp` files, produced by the reference's "verbose" build mode) was downloaded via `curl`
+(not through any summarizing/paraphrasing tool — hex transcription errors from an LLM intermediary were an explicit
+risk considered and avoided this way) and cross-verified independently in Python (`hashlib.sha3_512`/`shake_256`)
+*before* being ported into `kat_vectors.zig`. That file is a standalone illustrative run, not tied to the `.rsp`'s own
+count=0 `seed` — confirmed by checking that `intermediates_values`' `K`/`ss` don't match the `.rsp` count=0 vector's
+`ss`, ruling out an assumed-but-false seed relationship. That is immaterial to what it is used for: it is the
+reference's own recorded output for *some* seed, and reproducing it byte-exact proves this module's primitives match
+the reference's, independent of which seed started the chain.
+
+**KAT strategy, codec.** No `.rsp`-style official fixture covers the RS/RM/code layer in isolation (the tag's
+`kats/ref/hqc-*/intermediates_values` files cover only the PKE/KEM layer's PRNG-derived values). Byte-exact vectors
+were obtained by compiling and running the reference's own unmodified encode-side C files locally (`gf.c`+
+`reed_solomon.c`+`reed_muller.c`+`code.c`+`fft.c`+`crypto_memset.c`, `gcc -O0`, one build per parameter set's own
+`parameters.h`) and transcribing stdout mechanically via a small Python script (no hand transcription) — see
+`kat_vectors_code.zig`'s module doc for the provenance and which vectors are pinned at full depth (hqc-128) vs.
+lighter depth (hqc-192/256).
+
+**KAT strategy, KEM.** The official `kats/ref/hqc-{1,3,5}/PQCkemKAT_{2321,4602,7333}.rsp` files (100 vectors each,
+standard NIST `seed`/`pk`/`sk`/`ct`/`ss` format) were fetched via `curl` and parsed by a small Python script (no hand
+transcription); the first three `count`s per parameter set are embedded in `kat_vectors_kem.zig`.
+`kem_kat_test.zig` seeds `prng.Prng` from each vector's 48-byte `seed` exactly as `main_kat.c` does, draws
+`seed_kem` then `coins` off that one continuing stream, and asserts `keypair`'s `(ek, dk)`, `encaps`'s `(ct, ss)` and
+`decaps(dk, ct)`'s recovered `ss` are all byte-exact against the vector — the end-to-end check for the whole module.
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-hqc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.04–0.07×, fastest 2.46–3.52×, against 0.04–0.07× before. The card carries these figures.
+Bench: `zig build bench-hqc` (`tools/bench.zig`, ReleaseFast, the authors' code in two lanes as the yardstick; see
+*Compared with*). The card's `**Performance:**` line carries the figures.
+
+## What is deliberately not done
+
+- **Other HQC revisions.** The module targets the 22/08/2025 spec as released in `v5.0.0` only: not the round-4 (RMRS)
+  snapshot, whose parameters and byte counts differ, and not upstream's `next-release` branch (see *Spec version*).
+  Following a future NIST standard is an open item in *Backlog / deferred*, not a hedge built in now.
+- **No AES-256-CTR-DRBG.** The reference's KAT harness replaces it with SHAKE256 (`Prng`), so `std.crypto`'s SHAKE is
+  all that is needed.
+- **No stateful global PRNG.** `keypair` and `encaps` take their randomness as explicit arguments.
 
 ## Backlog / deferred
 
-- **Comptime guards of the parameter helpers (no-panic sweep GT, 2026-10-30).** `gf2x.Ring(n)` and `prng.sampleVect` are `@compileError`s for `n % 64 == 0` (every real HQC `n` is prime); `sampleFixedWeightRejection` / `sampleFixedWeightBiased` are `@compileError`s for `weight > n`, and the rejection one for `threshold == 0` (each would loop forever or wrap). Only a custom `params.Params` reaches them; the real sets compile, so no runtime test is possible or needed. ✅ DONE 2026-10-30 (the `@compileError` guards are in modules/hqc/src/prng.zig:188,224,225,275 and gf2x.zig, commit c8c1463c6).
-- **Close the gap to the authors' AVX2 lane (2.3–3.4× slower)** *(measured 2026-10-07, `zig build bench-hqc`)*. Against the `ref` lane we are 14–25× faster, against `x86_64/avx256` 2.28–3.39× slower for keygen/encaps/decaps of all three sets. Likely sources: the GF(2)[x] multiply (CLMUL here, AVX2 in the authors' lane) and the RS/RM decoder vectorisation; profile before choosing. Pure Zig, fits CONVENTIONS §2.
-- **Follow the standard once NIST publishes HQC (draft FIPS)** *(survey 2026-09-30)*.
-  Upstream `next-release` already differs from `v5.0.0` in sampler and GF(2^8)
-  polynomial (see *Spec version*), and liboqs will move with it; a consumer that
-  interoperates with liboqs after that point needs the new bytes. Effort: moderate
-  (constants and sampler, plus new KATs), pure Zig, fits CONVENTIONS §2. Blocked on
-  the published standard/tag, not on us.
-- **Run-time CPU dispatch (CLMUL on/off)** *(survey 2026-09-30)*. liboqs picks its
-  accelerated paths at run time; here the choice is at compile time, so a portable
-  build never gets CLMUL. Same Zig limitation as `zstd`'s Z22. Small once Zig allows
-  it; pure Zig.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Close the gap to the authors' AVX2 lane.** Against the `ref` lane we are far faster, against `x86_64/avx256`
+  slower (figures: the card's `**Performance:**` line) for keygen/encaps/decaps of all three sets. Likely sources:
+  the GF(2)[x] multiply (CLMUL here, AVX2 in the authors' lane) and the RS/RM decoder vectorisation; profile before
+  choosing (`HQC_PROFILE=1` workload in `src/bench.zig`). Pure Zig, fits CONVENTIONS §2.
+- **Follow the standard once NIST publishes HQC (draft FIPS).** Upstream `next-release` already differs from
+  `v5.0.0` in sampler and GF(2^8) polynomial (see *Spec version*), and liboqs will move with it; a consumer that
+  interoperates with liboqs after that point needs the new bytes. Effort: moderate (constants and sampler, plus new
+  KATs), pure Zig, fits CONVENTIONS §2. Blocked on the published standard/tag, not on us.
+- **Run-time CPU dispatch (CLMUL on/off).** liboqs picks its accelerated paths at run time; here the choice is at
+  compile time, so a portable build never gets CLMUL. Same Zig limitation as `zstd`'s Z22. Small once Zig allows it;
+  pure Zig.
 
 ## Anchoring
 
