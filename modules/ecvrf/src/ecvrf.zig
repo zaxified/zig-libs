@@ -406,8 +406,8 @@ pub fn validateKey(pk_string: PublicKey) Error!Edwards25519 {
 /// under one key should use `KeyPair.prove`, which does not recompute `Y`.
 ///
 /// Burned (`burn.zig`): the per-frame wipes of A1 E4 left the nonce `k` and
-/// the seed on the dead stack in the callees' frames (`stackprobe_test.zig`,
-/// 2026-10-08) — `k` beside the proof's `s` and `c` is the secret scalar.
+/// the seed on the dead stack in the callees' frames
+/// — `k` beside the proof's `s` and `c` is the secret scalar.
 pub fn prove(sk: *const SecretKey, alpha_string: []const u8) Proof {
     const r = proveUnburned(sk, alpha_string);
     burn.stack(burn.prove_burn);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the entry points burned
-//! 2026-10-09: `secretScalar`, `nonceGenerationString`, `nonceGeneration`
+//! `secretScalar`, `nonceGenerationString`, `nonceGeneration`
 //! (the other entry points are in `stackprobe_test.zig`). One-shot calls,
 //! SHA-512 only: key-sized burn. ReleaseFast only (`skipUnlessOptimized`).
 

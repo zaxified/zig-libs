@@ -21,7 +21,7 @@
 //! (`Gamma = x*H`, the nonce `k`, `k*B`, `k*H`, `s = k + c*x`).
 //!
 //! ⭐ `Y` is DECLASSIFIED between the two calls (`MAKE_MEM_DEFINED`), because
-//! it is the published public key. Until 2026-09-16 this harness called the
+//! it is the published public key. Until this harness called the
 //! one-shot `prove(sk, alpha)`, which recomputes `Y` from `sk` internally, so
 //! there was no seam at which `Y` could be declassified and every branch on a
 //! function of `Y` was reported as if it were a branch on `sk`: `encodeToCurve`'s
@@ -48,7 +48,7 @@
 //!
 //! ⛔ It does NOT prove what an earlier audit finding asked for. That finding named the mutation
 //! "`timing_safe.eql` → `std.mem.eql`" as green in every gate; measured
-//! 2026-09-16, that mutation is green HERE too — 7 / 7, same lines — because
+//! that mutation is green HERE too — 7 / 7, same lines — because
 //! both forms end in one branch on a tainted equality at the same call site,
 //! and memcheck counts contexts by address. The proof and key are computed
 //! untainted first; the verdict is declassified before the harness branches
@@ -56,7 +56,7 @@
 //!
 //! ⭐ The gate that DOES catch it is `scripts/checks/check-ct-compare.py`, which pins
 //! `modules/ecvrf/src/ecvrf.zig` at one `timing_safe` comparison and zero
-//! plain `std.mem` ones. Measured on that mutation 2026-09-16: the module's
+//! plain `std.mem` ones. Measured on that mutation: the module's
 //! own suite is 31/31 green in both release modes, this harness's counts do
 //! not move, and that gate fails naming the file and the direction (1 → 0 on
 //! the left, 0 → 1 on the right). ctgrind's own red there is the SOURCE

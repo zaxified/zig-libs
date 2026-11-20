@@ -242,7 +242,7 @@ test "negative: a small-order public key is rejected by verify, not a crash" {
     // and DO decode as distinct, non-identity points; only cofactor-clearing
     // first exposes them as low-order. Without these, a mutation that drops
     // `clearCofactor()` from `validateKey` passes this test file green while
-    // accepting 7 of these 10 points (measured: `A1/ecvrf.md` E3).
+    // accepting 7 of these 10 points (measured: A1 audit E3).
     // RFC 9381 §5.4.5's own low-order point list, hex-encoded.
     const order4_pk_a = try hex32("0000000000000000000000000000000000000000000000000000000000000000"); // y = 0, sign 0
     try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order4_pk_a, alpha, pi));
@@ -277,7 +277,7 @@ test "negative: N random (c, s) forgery attempts against a valid Gamma all rejec
     // existing tamper test red. What those tests cannot see is an EXISTENTIAL
     // forgery: a random `(c, s)` pair against a real `Gamma`, which a
     // narrowed comparison accepts roughly once every 2^(8*narrowed_width)
-    // tries. Measured (`A1/ecvrf.md` E2, 200000 trials): base 0 accepted,
+    // tries. Measured (A1 audit E2, 200000 trials): base 0 accepted,
     // comparing only `c[0..1]` 768 accepted (1 in ~260), comparing only
     // `c[15..16]` 786 accepted. This test drives a smaller N (fast enough for
     // every optimize mode, including Debug) against the real, unmutated
@@ -320,7 +320,7 @@ test "negative: decodeProof rejects a Gamma that is not a valid point encoding; 
     // return error.InvalidProof` had no test of its own; without it, two
     // `catch unreachable`s downstream (`proofToHash`, `verify`) are undefined
     // behaviour in ReleaseFast on exactly this input. Measured
-    // (`A1/ecvrf.md` E5): 50057/100000 random 32-byte strings are not valid
+    // (A1 audit E5): 50057/100000 random 32-byte strings are not valid
     // point encodings, so this is a hot path, not a corner case.
     const Edwards25519 = std.crypto.ecc.Edwards25519;
     const vec = v.vectors[0];
