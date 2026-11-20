@@ -281,7 +281,7 @@ pub fn Stable(comptime T: type, comptime Ctx: type, comptime lessThanFn: fn (Ctx
             const nl = st.num_left;
             // A loop, not `@memcpy`: without libc that is compiler_rt's
             // `memcpy`, a call that cost 13 % of a stable sort of 16
-            // distinct keys (2026-10-25); the loop vectorizes in place.
+            // distinct keys; the loop vectorizes in place.
             if (@sizeOf(T) <= 16) {
                 for (v[0..nl], scratch[0..nl]) |*d, x| d.* = x;
             } else @memcpy(v[0..nl], scratch[0..nl]);
@@ -289,7 +289,7 @@ pub fn Stable(comptime T: type, comptime Ctx: type, comptime lessThanFn: fn (Ctx
             // Small elements eight at a time through a fixed-size block (a
             // 32-byte record measured slower this way), which LLVM turns
             // into vector loads and lane shuffles (Rust's loop vectorizes on
-            // its own; ours stayed scalar, written either way, 2026-10-25).
+            // its own; ours stayed scalar, written either way).
             var src = scratch + len;
             var dst = v + nl;
             const stop = scratch + nl;

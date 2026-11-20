@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests added by the 2026-10-25 mutation audit: each pins a behavior the
+//! Tests added by the mutation audit: each pins a behavior the
 //! model tests in `test_sort.zig` left unchecked (a mutant survived there).
 //! Values are compared against `std.sort.block` / `std.mem.order` models or
 //! against the documented formulas.

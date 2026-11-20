@@ -7,7 +7,7 @@
 //! Why not std: `std.sort.pdq` partitions with branches the CPU cannot
 //! predict on random input and `std.sort.block` pays for its in-place
 //! stability; Rust's `sort_unstable` (ipnsort, Rust ≥ 1.81) beats both by
-//! 1.3–1.9× on the same keys (measured 2026-10-25, netaddr's `sort_mixed`).
+//! 1.3–1.9× on the same keys (measured, netaddr's `sort_mixed`).
 //! This module is that algorithm, ported.
 //!
 //! Contract shared by every entry point: the comparator is a strict weak
@@ -141,7 +141,7 @@ fn isBytes(comptime T: type) bool {
 /// `std.mem.order(u8, a, b) == .lt`, comparing eight bytes at a time as
 /// big-endian words. `std.mem.order` walks byte by byte, and inlined into a
 /// sort's branch-free loops it costs 1.7× Rust's `memcmp`-based slice order
-/// on short strings (measured 2026-10-25, 100 000 strings of 4–24 bytes);
+/// on short strings (measured, 100 000 strings of 4–24 bytes);
 /// this one sorts the same strings 0.93× Rust.
 pub inline fn bytesLess(a: []const u8, b: []const u8) bool {
     const n = @min(a.len, b.len);

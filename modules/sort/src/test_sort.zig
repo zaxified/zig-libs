@@ -507,7 +507,7 @@ test "asc/desc over byte strings sort lexicographically" {
     for (v[0 .. v.len - 1], v[1..]) |x, y| try testing.expect(std.mem.order(u8, x, y) != .lt);
 }
 
-// ── more broken orders, zero-sized types (review 2026-10-25) ────────────────
+// ── more broken orders, zero-sized types ────────────────
 
 const LiarKind = enum { always, never, cyclic };
 
