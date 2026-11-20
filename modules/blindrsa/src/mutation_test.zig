@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-11-17 whole-module mutation of `root.zig`: the
+//! Tests added by the whole-module mutation of `root.zig`: the
 //! boundaries the RFC 9474 vectors do not reach (the PSS salt-length gate,
 //! an over-long blinded message, `finalize`'s context check at the largest
 //! modulus, and the two non-canonical inputs that must stay

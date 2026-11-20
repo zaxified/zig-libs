@@ -3,7 +3,7 @@
 //! Dead-stack residue probe for `blind` (audit findings B6 and B9), kept in
 //! the module per `CONVENTIONS.md` §9.
 //!
-//! Method as `p256`'s `stackprobe_test.zig` (direct region, 2026-10-08: the
+//! Method as `p256`'s `stackprobe_test.zig` (direct region,: the
 //! earlier "scan a local buffer at the call's depth" form was blind to the top
 //! few hundred bytes of the measured call): paint a stack region below the
 //! probe, run one call under a `PAD`-deep shim, snapshot the region into a
@@ -18,7 +18,7 @@
 //! `DeadStackFixedRandom` pins every random draw to the RFC's `r` (the salt
 //! draw takes its last 48 bytes), so the blinding factor is that value and
 //! `t = m·r mod n` — the operand `blind`'s inverse runs on — is computable
-//! here without instrumenting the module. Until 2026-11-13 the needles were
+//! here without instrumenting the module. Until the needles were
 //! `r` and the masked `v = r·u = r²` of the big-int Euclid `blind` used then.
 
 const std = @import("std");
@@ -243,7 +243,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r, no m·r and no r⁻¹ on the d
     }
 
     // `blindSign` is the other half of B6: the §7.2 blinding factor `b`
-    // (drawn inside `rsa.rsadpCrtBlinded` since 2026-11-13) and the CRT
+    // (drawn inside `rsa.rsadpCrtBlinded`) and the CRT
     // private op on the key itself. Under the fixed random `b` is again
     // `kat.r`, so the `r` needles apply.
     // `p`/`q` are measured too -- they belong to `rsa`, not here; the

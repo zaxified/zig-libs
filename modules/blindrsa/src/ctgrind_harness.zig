@@ -14,7 +14,7 @@
 //!    Euclid on `v = x·u mod n` for a fresh uniform secret mask `u` … and
 //!    unmasks with one more constant-time `mul`."
 //!
-//! ⚠ 2026-11-13: that paragraph (and the walk-through below) describes the
+//! ⚠: that paragraph (and the walk-through below) describes the
 //! `std.crypto.ff` + masked big-int Euclid path as it was. `blind` now runs
 //! on `rsa.PublicKey.n_mont` (montint: `sampleElem`, the constant-time
 //! safegcd `DynModint.inverse` of `m·r`, `powPublic`, `mul`), with no mask

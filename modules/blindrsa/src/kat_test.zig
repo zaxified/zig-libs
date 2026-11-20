@@ -893,7 +893,7 @@ pub fn verifyHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     // harness verified RFC 9474's pristine signature, unaltered, every single
     // time. A damage harness that applied no damage; and its own comment's
     // promise about "lengths that don't match the 512-byte modulus" was never
-    // kept, because `bytes` was a fixed-size array. Measured 2026-09-07 over
+    // kept, because `bytes` was a fixed-size array. Measured over
     // the corpus above: **0 of 9 scripts changed a byte, 1 distinct signature
     // and 1 distinct length before; 5 of 9 flip, 17 flips in total, 9 distinct
     // signatures and 3 distinct lengths after.**
@@ -969,7 +969,7 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
             }
         }
     }
-    // Measured 2026-09-07: with the flip count drawn as a ranged value, 0
+    // Measured: with the flip count drawn as a ranged value, 0
     // flips, 1 distinct signature and 1 distinct length across the whole
     // corpus — RFC 9474's pristine one, nine times. After:
     try testing.expectEqual(@as(usize, 17), flips);
@@ -980,7 +980,7 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
 
 /// A KAT `inv` (the key's `modulus_len` bytes) as `Context.r_inv`: the
 /// meaningful bytes first, the rest of `max_modulus_len` zero (the field is
-/// sized by rsa's cap, 8192 bits since 2026-10-14; the RFC 9474 keys are 4096).
+/// sized by rsa's cap, 8192 bits; the RFC 9474 keys are 4096).
 fn rInv(inv: []const u8) [blindrsa.max_modulus_len]u8 {
     var out = @as([blindrsa.max_modulus_len]u8, @splat(0));
     @memcpy(out[0..inv.len], inv);

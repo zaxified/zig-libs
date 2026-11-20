@@ -44,7 +44,7 @@
 //! The one primitive RFC 9474 needs that `std.crypto.ff` does not provide
 //! is a modular INVERSE over a composite modulus (Fermat inversion
 //! `x^(n-2)` needs a PRIME modulus, and the client doing the inverting does
-//! not know `n`'s factorization). Since 2026-11-13 it is
+//! not know `n`'s factorization). Since it is
 //! `montint.DynModint.inverse` on the `n_mont` every `rsa.PublicKey`
 //! already carries: a batched Bernstein–Yang safegcd, constant-time in the
 //! operand and in the modulus value, and the same engine `rsa`'s private-op
@@ -113,7 +113,7 @@ fn byteLen(bits: usize) usize {
 // Every client-side operation here — the blinding factor, the composite-
 // modulus inverse, `r^e`, the blinding and unblinding products — runs on the
 // `montint.DynModint` that `rsa.PublicKey` already carries for `n`
-// (`pk.n_mont`, built once when the key is parsed). Until 2026-11-13 this
+// (`pk.n_mont`, built once when the key is parsed). Until this
 // layer was `std.crypto.ff` plus an extended Euclid over `std.math.big`
 // (`rsa.bigModInverse`) behind a multiplicative mask, and a second big-int
 // gcd for RFC 9474's coprimality check: variable-time, masked to compensate,
@@ -331,7 +331,7 @@ pub const BlindError = PssEncodeError || error{
 /// A1 B6/B9: the secrets that survive `blind()` are not copies this module
 /// holds. Every `Elem` and byte buffer on the path is `secureZero`'d
 /// already; the residue lives in the callees' own temporaries (montint's
-/// Montgomery and safegcd scratch; until 2026-11-13 `std.crypto.ff`'s and
+/// Montgomery and safegcd scratch; previously `std.crypto.ff`'s and
 /// `std.math.big`'s), which no `secureZero` this module can write reaches. So
 /// the stack those callees used is zeroed wholesale instead, the technique
 /// `bip340` (F2), `xmss` (F3) and `bulletproofs` (B12) close the same class
@@ -358,11 +358,11 @@ const sign_stack_burn = 512 * 1024;
 /// Volatile stores keep the dead store.
 noinline fn burnStack(comptime bytes: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -403,7 +403,7 @@ pub fn blind(
 ///
 /// Production clients should call `blind`: this form takes `r` from the
 /// caller, does not burn the stack afterwards, and keeps the PSS salt as a
-/// parameter (RFC 9474 §7.4, see `blind`). Since 2026-11-13 its arithmetic
+/// parameter (RFC 9474 §7.4, see `blind`). Since its arithmetic
 /// is the same constant-time montint path as `blind`'s (until then it ran
 /// the variable-time Euclid inverse on `r` unmasked). `r`'s uniformity
 /// requirements (SPEC.md) still apply — a biased or reused `r` breaks
@@ -566,7 +566,7 @@ pub const BlindSignError = error{
 /// CRT halves run on `m·b^e` instead of `m`, and each half is unblinded by
 /// `b⁻¹` — `s = (m·b^e)^d · b⁻¹ = m^d (mod n)` — so the private-key
 /// operation never runs on attacker-chosen input directly. The output is
-/// bit-identical to the unblinded computation. Until 2026-11-13 this module
+/// bit-identical to the unblinded computation. Until this module
 /// built the same construction itself, mod `n` on `std.crypto.ff` with a
 /// masked big-int Euclid for `b⁻¹`; `rsa` does it in the CRT domain on
 /// montint (two half-size constant-time safegcd inverses, interleaved).
@@ -694,7 +694,7 @@ pub fn finalize(pk: rsa.PublicKey, comptime Hash: type, blind_sig: []const u8, c
         return error.InvalidContext;
 
     // Step 2: z = OS2IP(blind_sig), fail-closed on z >= n. On `pk.n_mont`
-    // (montint) like `blind`; `std.crypto.ff` until 2026-11-13.
+    // (montint) like `blind`; `std.crypto.ff` previously.
     const z = np.elemFromBytesBE(blind_sig) catch return error.SignatureVerificationFailed;
     // ctx.r_inv was written by blind/blindWithFactor as a canonical value
     // < n; a corrupted/foreign ctx fails closed here too.
@@ -994,7 +994,7 @@ test "sampleElem: always in [1, n), even for a modulus with few top-byte bits" {
 // test, 42/42 green: `m7b` (top-byte mask one bit too narrow, so every draw
 // lands in the LOWER HALF `[1, 2^(bits-1))`) and `m6` (drop the `isZero`
 // rejection). These two tests close that gap (written for `sampleFe`, the
-// `std.crypto.ff` sampler `sampleElem` replaced on 2026-11-13).
+// `std.crypto.ff` sampler `sampleElem` replaced).
 
 test "B2: sampleElem is not biased toward the lower half of the modulus (audit mutation m7b)" {
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
