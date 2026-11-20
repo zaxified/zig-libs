@@ -11,7 +11,7 @@
 //!   unchanged (the DA is not rewritten hop-by-hop). Given the route table and a
 //!   caller-supplied **system-id → B-MAC map** (each node's B-MAC lives in its
 //!   SPBM-SI sub-TLV, RFC 6329 §3.5.4 — the caller extracts it; see `isis/spb`),
-//!   `Fib.build` re-keys every reachable destination by its **destination B-MAC**
+//!   `build` re-keys every reachable destination by its **destination B-MAC**
 //!   and resolves the next-hop system-id to the **next-hop's B-MAC** (which
 //!   selects the egress adjacency, not the DA). SPB installs exactly ONE path per
 //!   destination — the single congruent ECT path `isis-spf` already selected —
@@ -20,7 +20,7 @@
 //!
 //!   ⚠ **"Congruent" is a precondition on the CALLER, not something this module
 //!   or `isis-spf` enforces by default.** `isis-spf` became a directed engine on
-//!   2026-08-07 — one arc per admitted direction, at its own advertised metric —
+//! — one arc per admitted direction, at its own advertised metric —
 //!   so forward and reverse paths are congruent only on a symmetric-metric
 //!   fabric, which is what 802.1aq requires and what nothing checks unless asked:
 //!   `isis_spf.Options.reject_asymmetric` defaults to `false`, and the plain
@@ -31,7 +31,7 @@
 //!   `isis_spf.computeWith(..., .{ .reject_asymmetric = true })`.** Fed an
 //!   asymmetric database instead, the forward and reverse B-MAC paths need not
 //!   be congruent, which is precisely what SPB's reverse-path forwarding check
-//!   assumes. Noted here 2026-09-03: this module's code did not change — the
+//!   assumes. Noted here: this module's code did not change — the
 //!   guarantee underneath it did.
 //!
 //!   **Part B — the SPBM group multicast-DA.** A BUM frame for an I-SID uses a
@@ -79,7 +79,7 @@ pub const BMac = [6]u8;
 
 /// One `(system-id, B-MAC)` binding — the caller extracts each node's B-MAC from
 /// its SPBM-SI sub-TLV (RFC 6329 §3.5.4; see `isis/spb.SpbmServiceId.b_mac`) or
-/// from configuration, and passes the set to `Fib.build`. Order is irrelevant
+/// from configuration, and passes the set to `build`. Order is irrelevant
 /// (the FIB is deterministic regardless); a repeated `system_id` keeps the FIRST
 /// binding and ignores later ones (documented, so the result is independent of
 /// input order).
