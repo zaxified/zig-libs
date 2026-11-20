@@ -24,73 +24,41 @@
 A frozen prefix index for instant autocomplete over a large, static string set.
 Build from `(key, value)` pairs → freeze to a flat byte buffer → query that
 buffer zero-copy from a read-only / mmap'd slice.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Competitor claims come from their READMEs read in this run; source of none was read. Scope re-assessed 2026-10-04 after format version 2, range / common-prefix / reverse lookup and the streaming build were built (table rows not re-fetched).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [BurntSushi/fst](https://github.com/BurntSushi/fst) — **reference** | Rust | MIT OR Unlicense (LICENSE-MIT present; API says Unlicense) | 2.1k | no GitHub release; crate 0.4; push 2024-09 | Ordered set/map as a minimized finite-state transducer, mmap-able, "compact"; range queries and automaton search (regex via `regex-automata`, Levenshtein) and set operations *(inferred from docs.rs, README names range queries, fuzzy search)*. Since 2026-10-04 this module also has `range`, common-prefix search, reverse lookup and a streaming sorted build, and since 2026-10-13 automaton search (`Frozen.search`) and set operations (`opIterator`); it keeps a larger frozen buffer (24.6 B/key on the RÚIAN address index in version 2, un-minimized) and `u32` values. |
-| [s-yata/marisa-trie](https://github.com/s-yata/marisa-trie) | C++ | NOASSERTION in API; README not read for licence, BSD-2/LGPL dual *(inferred)* | 633 | v0.3.1 (2025-07-20) | Static, space-efficient (its README: 50.8 MB for 9.8 M keys vs darts-clone 376 MB); lookup, **reverse lookup** (key from id), **common-prefix search**, predictive search. This module has predictive search (`prefixIterator`), lookup, and since 2026-10-04 common-prefix search (`prefixesOf`/`longestPrefix`) and reverse lookup (`ordinal`/`keyAt`). |
+| [BurntSushi/fst](https://github.com/BurntSushi/fst) — **reference** | Rust | MIT OR Unlicense (LICENSE-MIT present; API says Unlicense) | 2.1k | no GitHub release; crate 0.4; push 2024-09 | Ordered set/map as a minimized finite-state transducer, mmap-able, "compact"; range queries and automaton search (regex via `regex-automata`, Levenshtein) and set operations *(inferred from docs.rs, README names range queries, fuzzy search)*. This module also has `range`, common-prefix search, reverse lookup and a streaming sorted build, automaton search (`Frozen.search`) and set operations (`opIterator`); it keeps a larger frozen buffer (24.6 B/key on the RÚIAN address index in version 2, un-minimized) and `u32` values. |
+| [s-yata/marisa-trie](https://github.com/s-yata/marisa-trie) | C++ | NOASSERTION in API; README not read for licence, BSD-2/LGPL dual *(inferred)* | 633 | v0.3.1 (2025-07-20) | Static, space-efficient (its README: 50.8 MB for 9.8 M keys vs darts-clone 376 MB); lookup, **reverse lookup** (key from id), **common-prefix search**, predictive search. This module has predictive search (`prefixIterator`), lookup, and common-prefix search (`prefixesOf`/`longestPrefix`) and reverse lookup (`ordinal`/`keyAt`). |
 | [s-yata/darts-clone](https://github.com/s-yata/darts-clone) | C++ | BSD-2-Clause | 161 | v0.32h (2025-05-17) | Compacted double-array trie: fast exact and common-prefix search; large. Same gaps as above. |
 | [armon/go-radix](https://github.com/armon/go-radix) | Go | MIT | 946 | no release; push 2024-07 | Mutable in-memory radix tree, ordered walk-prefix; not frozen, not serializable, no ranking. This module is ahead on frozen zero-copy load and top-N. |
 | [hedzr/trie.zig](https://github.com/hedzr/trie.zig) | Zig | Apache-2.0 | 1 | push 2025-04 | The only Zig trie found by `gh search` (few stars, others 0): in-memory, not frozen, no untrusted-buffer story *(inferred from name and description; source not read)*. Zig `std` has no trie. |
 
-**Where we are ahead:** the only frozen, zero-copy, self-describing (magic, version, CRC) trie in Zig found; **top-N by stored score with a node budget** (`max_visited`) and an `after` cursor for the next page, which none of the above offers; a proven never-panic/never-loop loader over untrusted buffers (corrupt-buffer fuzz, seeded v2 sweep, bounded iterators). **On par since 2026-10-04:** range iteration (fst's `range`), common-prefix and longest-prefix search (marisa/darts), reverse lookup key ↔ rank (marisa, via optional per-edge counts), a streaming build from sorted input to any writer (fst's build model). **On par since 2026-10-13:** automaton search over the index with the fst built-ins (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`, `Intersection`, `Complement`) or any caller type that satisfies the `automaton` interface; union / intersection / difference / symmetric difference over up to 64 indexes with the contributing values per key. **Where we are behind** (re-checked 2026-10-13): nothing a fst user notices beyond two consciously rejected items — no suffix minimization (version 2's path compression brought the RÚIAN address index from 140 to 24.6 B/key, still several times marisa's ~5 B/key; rejected, see Design decision A and Deliberately deferred) and `u32` values only (fst stores `u64`; rejected, below). Regular expressions and Levenshtein distance are not built-in automata: Levenshtein is the sibling `fuzzysearch` module, which already walks this index with its own Levenshtein automaton (`fuzzysearch/src/search.zig`); the `regex` module exposes no byte-stepping DFA state to plug in, so a regex automaton has to wait for one (any type with the five `automaton` functions is searched as is).
+**Where we are ahead:** the only frozen, zero-copy, self-describing (magic, version, CRC) trie in Zig found; **top-N by stored score with a node budget** (`max_visited`) and an `after` cursor for the next page, which none of the above offers; a never-panic/never-loop loader over untrusted buffers (corrupt-buffer fuzz, seeded sweep, bounded iterators). **On par:** range iteration (fst's `range`), common-prefix and longest-prefix search (marisa/darts), reverse lookup key ↔ rank (marisa, via optional per-edge counts), a streaming build from sorted input to any writer (fst's build model), automaton search over the index with the fst built-ins (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`, `Intersection`, `Complement`) or any caller type that satisfies the `automaton` interface, and union / intersection / difference / symmetric difference over up to 64 indexes with the contributing values per key. **Where we are behind:** nothing a fst user notices beyond two consciously rejected items, no suffix minimization (still several times marisa's ~5 B/key) and `u32` values only (fst stores `u64`); both are named, with their reasons, in *What is deliberately not done*. Regular expressions and Levenshtein distance are not built-in automata: Levenshtein is the sibling `fuzzysearch` module, which already walks this index with its own Levenshtein automaton (`fuzzysearch/src/search.zig`); the `regex` module exposes no byte-stepping DFA state to plug in, so a regex automaton has to wait for one (any type with the five `automaton` functions is searched as is).
 
-## Performance (2026-10-13)
+## Performance
 
-**Lean version-3 lookup, 2026-10-24** (`zig build bench-trie`, `BENCH_ROUNDS=7`
-for build and the lookup / iteration rows, 3 for search, union and load;
-ReleaseFast, same host, load ~1.5): ours / the fastest: lookup hit **1.02** and
-miss **1.15** (darts-clone), prefix iteration 1.02 (marisa-fast), build 0.56
-(marisa-fast); ours / fst build 0.30, lookup hit 0.56, miss 0.43, prefix
-iteration 0.25, range 0.26, subsequence search 0.28, union 0.25. Largest
-spread 8 % (darts' miss row). Only `lookup` and the shared vector helpers changed (Deliberately
-deferred says how the gap was found).
-
-**Format version 3, 2026-10-24** (`zig build bench-trie`, `BENCH_ROUNDS=7` for build
-and the lookup / iteration rows, 3 for search, union and load; ReleaseFast, same
-host, other sessions' load 1–2): ours / fst build 0.31, lookup hit 0.61, lookup
-miss 0.50, prefix iteration 0.24, range 0.27, subsequence search 0.28, union
-0.24; ours / the fastest: lookup hit **1.07** and miss **1.35** (darts-clone),
-prefix iteration 1.00 (marisa-fast), build 0.57 (marisa-fast). Frozen size
-19.5 B/key (was 23.1). The lookup rows moved from 1.61 / 2.13; the rest is
-memory (Deliberately deferred). A direct A/B of one subsequence search over the
-same keys frozen as v2 and v3 differs by 5 %, inside the run-to-run spread of
-the search row.
-
-**Fastest in the field, 2026-10-23** (`zig build bench-trie`, which now also times
-`tools/cpp_bench`: s-yata/darts-clone 0.32h and s-yata/marisa-trie 0.3.1, default
-and `MARISA_MIN_NUM_TRIES | MARISA_HUGE_CACHE`, g++ -O3 -march=native -flto; the
-foreign sources are fetched at pinned commits into `tools/trie-cpp-vendor/`).
-Ours / the fastest per row: build 0.57 (marisa-fast), lookup hit **1.61**
-(darts-clone), lookup miss **2.13** (darts-clone), prefix iteration 0.80
-(marisa-fast); range, subsequence search and union are fst-only (0.18–0.19).
-Every side agreed on every checksum. The run's spread reached 32 % on the
-foreign rows because a 27 s job ran beside it; a standalone ReleaseFast lookup
-harness on a quiet host gave the same picture (hit 56 ms vs darts 40 ms = 1.40×,
-miss 40 ms vs 17.7 ms = 2.27×), so the verdict — P2, over 1.25× the fastest —
-does not hang on the noise. Why: `perf` puts 40 % of a lookup on the first load
-of each child node (DRAM) and ~30 % on the per-node edge-order check plus the
-binary search; a 26-edge v2 node spans three cache lines, darts-clone's
-double array is one 4-byte probe per byte. Closing it needs a lookup-oriented
-node layout (Deliberately deferred).
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-trie`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 5.1 %): ref 0.17–0.92×, against 0.18–0.89× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
-
-`zig build bench-trie` (`tools/bench.zig` against `tools/rust_bench`, fst 0.4.7, LTO), 1 000 000
-keys, 3 rounds, ratio ours/fst by wall time: build 0.30, lookup hit 0.89, lookup miss 0.88, prefix
-iteration 0.18, range 0.19, subsequence search 0.20, union of two indexes 0.22 (load is O(1) on
-both sides, info only). Every row agrees on count and value sum. The frozen buffer is 23.1 B/key
-against fst's 13.3 B/key (fst minimizes suffixes; design decision A below says why this one does
-not).
+`zig build bench-trie` (`tools/bench.zig`, always ReleaseFast) times this module against
+BurntSushi/fst 0.4.7 (`tools/rust_bench`, LTO) and, beside it, s-yata/darts-clone and
+s-yata/marisa-trie (`tools/cpp_bench`, `g++ -O3 -march=native -flto`; the foreign
+sources are fetched at pinned commits into `tools/trie-cpp-vendor/`, git-ignored). Both
+sides generate the same deterministic 1 000 000 keys and queries; the rows are build,
+lookup hit and miss, prefix iteration, range, subsequence search and a union of two
+indexes (the last three against fst only), plus `load` (O(1) on both sides of the fst comparison, information
+only) and the frozen size. Every row's result is a checksum that all sides must agree on
+before a time counts. The card's `**Performance:**` line carries the figures and is
+authoritative; the bench prints the spread of its rounds, and a row measured under host
+load is to be repeated. What bounds exact lookup is the first load of each child node
+(DRAM) and the per-node instruction count, which is what the version-3 node layout
+attacks (*Frozen wire format (version 3)*); a dense table for the first levels would
+cut further (*Backlog / deferred*).
 
 ## Design decision — A (byte-labelled trie) vs B (minimized FST/DAFSA)
 
 **Chosen: A — a byte-labelled trie with per-node `subtree_best` pruning,
-serialized to a flat buffer; since format version 2 (2026-10-04)
+serialized to a flat buffer; since format version 2
 path-compressed (a radix / Patricia trie).**
 
 Each node stores its terminal flag + value, the maximum stored value among its
@@ -115,7 +83,7 @@ automaton merges common *suffixes* to shrink memory, but
 
 So A trades some memory for a **robust, trivially bounds-checkable frozen format
 over untrusted input** and a simpler, obviously-correct top-N. Suffix
-minimization is a documented deferred optimization (below) that can be added
+minimization is deliberately not done (*What is deliberately not done*); it could be added
 behind the same query API and a bumped `format_version` without changing callers.
 
 **Version 2 keeps A and adds path compression** — a non-terminal node with one
@@ -124,7 +92,7 @@ That removes the per-byte cost of unshared suffixes (the whole difference
 between 140 and 24.6 B/key on RÚIAN) WITHOUT sharing nodes: every node still
 has exactly one parent, so the bounds-checking and termination argument is
 unchanged in kind (offsets strictly monotone along every edge). Suffix
-minimization (B) would still shrink it further and is still deferred for the
+minimization (B) would still shrink it further and is still not done, for the
 reasons above.
 
 ### Cost model (structure A, format version 1)
@@ -139,7 +107,7 @@ reasons above.
 - **`prefixIterator`:** borrows a small traversal stack from an allocator
   (typically a reused arena); the frozen index itself is never copied.
 
-## Frozen wire format (version 3 — the default since 2026-10-24)
+## Frozen wire format (version 3 — the default)
 
 Version 3 is version 2 below with one change, inside the node: the edge count
 and the labels come right after the two leading bytes, ahead of the tail and the
@@ -151,15 +119,14 @@ version 3"). Why: an exact lookup used to binary-search labels 5 bytes apart
 across up to three cache lines, each probe waiting for the one before, and
 re-checked their order byte by byte on every decode; now the labels share the
 node's first cache line, are matched and order-checked 16 at a time, and the one
-distance needed is a single load. Distances also cut the index by 16 % (23.1 →
-19.5 B/key on the benchmark keys). `SortedBuilder` writes version 2 on request
-(`Options.version = .v2`) for a reader older than 2026-10-24; every reader since
-reads versions 1, 2 and 3. `lookup` walks version 3 in its own loop
+distance needed is a single load. Distances also cut the index by 16 % on the benchmark keys (the card's
+performance line names the bench). `SortedBuilder` writes version 2 on request
+(`Options.version = .v2`) for a reader that predates version 3; this module reads versions 1, 2 and 3. `lookup` walks version 3 in its own loop
 (`Frozen.lookupV3`, the node checks of `format.nodeAtV3` repeated without
 building a node view); a differential test holds it to the shared decoder walk on
 thousands of damaged, re-sealed buffers.
 
-## Frozen wire format (version 2 — the default 2026-10-04 … 2026-10-23)
+## Frozen wire format (version 2)
 
 Field by field in `src/format.zig` ("Format version 2"). In short, all
 integers little-endian:
@@ -234,6 +201,51 @@ Each node:
 Edges sorted by label allow a binary search in `findEdge` and make lexicographic
 DFS a straight left-to-right edge walk.
 
+## Design notes by feature
+
+- **Range and prefix search.** `Frozen.range(gpa, Range, max_visited)` iterates the
+  keys between two optional bounds (`Range.lo` inclusive and `hi` exclusive by
+  default, each switchable; `query.zig:84`, `:334`); positioning on the lower bound costs
+  O(lo.len) node decodes. `prefixesOf(text)` yields the stored keys that are prefixes
+  of `text`, shortest first, and `longestPrefix(text)` the last of them
+  (`query.zig:368`, `:373`).
+- **Rank ↔ key.** `ordinal(key)` and `keyAt(i, key_buf)` (`query.zig:383`, `:408`)
+  need the per-edge `before` counts, written when the builder option `ordinals` is
+  set (`stream.zig:32`; four bytes per edge); a buffer without them returns
+  `error.NoOrdinals` (`OrdinalError`, `query.zig:45`), and version 1 never has them.
+  The rank is the 0-based position in sorted key order.
+- **Cursor.** `QueryOptions.after` makes `topN` consider only completions ranked
+  strictly after the given one, so the last item of a page is the cursor of the next;
+  each page is a fresh walk under the same `max_visited` (`query.zig:61`).
+- **Streaming build.** `SortedBuilder` (`stream.zig:106`) takes keys in ascending
+  order (equal keys allowed, the later value wins; a smaller key is `error.Unsorted`)
+  and writes to any `std.Io.Writer`, holding only the current key's path.
+  `Builder.freezeTo(writer, opts)` (`builder.zig:213`) walks the in-memory trie in key
+  order into it; `freeze` is `freezeTo` into a growing buffer.
+- **Automaton search.** `Frozen.search(gpa, A, &aut, max_visited)` returns a
+  `SearchIterator` over every key the automaton accepts, in ascending order
+  (`query.zig:354`). An automaton is any type with `State`, `start`, `isMatch`,
+  `canMatch`, `willAlwaysMatch` and `accept`, checked at compile time
+  (`automaton.zig:43`); the built-ins are `Str`, `Subsequence`, `AlwaysMatch`,
+  `StartsWith`, `Union`, `Intersection`, `Complement` and the helpers `startsWith`,
+  `unionOf`, `intersectionOf`, `complementOf` (`automaton.zig:75`–`:281`). `canMatch`
+  false prunes a subtree (also in the middle of a compressed edge); `willAlwaysMatch`
+  true stops feeding bytes below the point. The contract follows fst 0.4.7's
+  `Automaton` (`src/automaton.zig` cites file and line; the source was read for
+  behaviour, nothing copied).
+- **Set operations.** `opIterator(gpa, indexes, SetOp, max_visited)` merges up to
+  `max_op_indexes` (64, `ops.zig:49`) frozen indexes in key order for `SetOp`
+  `union`, `intersection`, `difference` and `symmetric_difference` (`ops.zig:39`,
+  `:59`); each item lists the contributing indexes and their values
+  (`IndexedValue`, `OpItem`). The budget is the total over all inputs. The output is
+  in key order, so a union can be written straight into a `SortedBuilder`.
+- **Version 3 lookup.** `Frozen.lookup` walks version 3 in its own loop
+  (`lookupV3`, `query.zig:179`) which repeats the node checks of `format.nodeAtV3`
+  without building a node view; the labels of a node are matched and order-checked
+  16 lanes at a time, a run of 17..32 labels in one masked 32-byte compare (`format.zig:482`–`:531`) and the one child distance needed is a
+  single load (`readDistance`, `format.zig:470`). A differential test holds it to the
+  shared decoder walk on damaged, re-sealed buffers.
+
 ## DoS / bounded-work model
 
 The exposed autocomplete surface is `topN(prefix, …, opts)`. A short prefix
@@ -270,7 +282,7 @@ operations grow their path on the heap instead, bounded by `max_visited` (one
 node per byte at most); give untrusted buffers a budget. Addresses are far
 shorter.
 
-Errors and retries (review 2026-10-23): `error.KeyTooLong` from `next` because
+Errors and retries: `error.KeyTooLong` from `next` because
 `key_buf` is too small, and `ValuesBufferTooSmall` from `OpIterator.next`, leave
 the iterator on that key — the same call with a bigger buffer returns it. Every
 other error (`Corrupt*`, `TooComplex`, `OutOfMemory`, a key past `max_depth` in
@@ -294,6 +306,28 @@ A frozen buffer may come from a file outside the process trust boundary
   (increasing in v1, decreasing in v2), not on trusting `edge_count`, `tail_len`
   or any length field — a corrupt length can only make a node decode fail
   bounds-checking, never over-read. A v2 root carrying a tail is `Corrupt`.
+- **The `max_visited == 0` ("unbounded") forms stop at the buffer's length.**
+  `prefixIterator`, `range`, `search`, `topN` and `opIterator` with budget 0 return
+  `error.Corrupt` after `buf.len` node decodes (`query.zig:33`, `:574`, `:762`): a
+  tree buffer (one parent per node, which the builders guarantee) has fewer nodes
+  than bytes, while a hostile buffer in which edges share children (a DAG: under
+  1 KB can enumerate 2^60 keys) hits the cap. The proof is by construction (one
+  parent per node, design decision A), not by a validating pass; a future
+  minimized format with suffix sharing would have to replace the `buf.len` cap
+  with an explicit budget. An explicit caller cap keeps `TooComplex` / truncation.
+- **The builders refuse what the query side cannot walk.** `Builder.insert` and
+  `SortedBuilder.insert` return `error.KeyTooLong` for a key over `max_key_len`
+  (default `max_depth`, 4096; `builder.zig:113`, `stream.zig:120`), and
+  `freezeFromPairs*` the same (`builder.zig:47`). A `SortedBuilder` whose `insert`
+  failed after it began changing state is poisoned: every later `insert` or
+  `finish` returns `error.Finished` (`stream.zig:114`, `:158`).
+- **`Header.verifyBody` refuses a buffer cut before the footer** (`Truncated`,
+  `format.zig:181`), so `Frozen.buf`, which is cut to the node region, is not
+  re-verifiable and `loadVerified` takes the whole buffer.
+- **The public `trie.format` is curated** (`root.zig:64`): the header, the node
+  decoder and the error sets that sibling modules need; the byte-level helpers
+  are not public. `Header.encode` and `Header.verifyBody` stay reachable through
+  it.
 
 CRC-32 is an integrity check against accidental corruption / bit-rot, **not** a
 security MAC; it does not authenticate a deliberately-forged buffer. A buffer
@@ -303,92 +337,52 @@ file at a higher layer if producer authenticity matters.
 
 ## Verification
 
+Run `scripts/modtest trie`; `zig build bench-trie` is the performance instrument, not a test.
+
 - **Differential oracle:** a naive sorted `[]const []const u8` + binary-search /
-  linear-prefix-scan reference in the tests answers the same `lookup` / prefix /
-  top-N queries; a randomized differential over generated key sets must agree
-  exactly, including top-N ordering and tie-break.
-- **Adversarial key sets:** empty key, prefix-of-another, duplicates
-  (last-write-wins), single-byte, very long, long shared prefixes, multi-byte
-  UTF-8 (Czech diacritics), keys differing only in the last byte.
-- **Corrupt-buffer fuzz:** the loader + query path are hammered with truncated /
-  bit-flipped / wrong-magic buffers and must only ever return a typed error.
-- **Positive controls:** hand-malformed buffers and deliberately-broken variants
-  demonstrate the differential / robustness checks go RED, proving they have
-  teeth.
+  linear-prefix-scan reference (`Oracle`, `root.zig:135`) answers the same `lookup` /
+  prefix / top-N queries; a randomized differential over generated key sets must agree
+  exactly, including top-N ordering and tie-break, over every format the writers
+  produce (`all_formats`, `root.zig:373`: version 1, 2 and 3, with and without ordinals).
+  It also checks range (random bounds and inclusivity), common prefixes, rank ↔ key and
+  `topN` pages chained by `after`.
+- **Adversarial key sets:** empty key, prefix-of-another, duplicates (last-write-wins),
+  single-byte, very long, long shared prefixes, multi-byte UTF-8 (Czech diacritics), keys
+  differing only in the last byte.
 - **Round-trip:** in-memory answers == answers after build → freeze → load.
-- **Both formats everywhere:** the differential runs over v1, v2 and v2 with
-  ordinals, and also checks range (random bounds and inclusivity), common
-  prefixes, rank ↔ key, and `topN` pages chained by `after` against the oracle.
-- **Format 2 by hand:** a golden byte layout derived from the spec (not from the
-  writer), one targeted damage per load/decode check, and a seeded
-  corrupt-buffer sweep with re-sealed CRCs whose reach is pinned (2026-10-04:
-  ~2 800 of 4 000 damaged buffers load, the walks answer on ~2 000 and report
-  `Corrupt` on ~800); a 2 × 300 000-seed run of the same sweep was clean.
-- **Automaton search and set operations (2026-10-13):** the same oracle checks
-  `search` for nine automata (the three plain built-ins and six
-  compositions with `StartsWith`, union, intersection and complement) against a NAIVE per-key
-  evaluation of the automaton (run it byte by byte over every oracle key: no
-  trie, no pruning), over v1, v2 and v2 + ordinals, with a random small budget
-  that must yield a prefix of the answer and report `truncated()` exactly when it
-  stopped early; a counting automaton shows that `canMatch` prunes (fewer nodes,
-  a budget the pruned walk fits and the unpruned one does not) and that
-  `willAlwaysMatch` stops the `accept` calls. `opIterator` is checked over 1–5
-  random indexes in each format against a naive merge of the per-index oracles
-  for all four operations (key set, ascending index order, the value of each
-  contributing index), plus hand-computed three-index cases, the zero / one /
-  empty-input and 64 / 65 index edges, retry after `KeyTooLong` /
-  `ValuesBufferTooSmall`, the shared budget (exactly the measured need suffices,
-  one less is cut and the total stays within it) and a union fed straight into
-  `SortedBuilder`. The corrupt-buffer sweep and both fuzz harnesses
-  (`runQueries`) also drain `search` (four automata) and all four operations on
-  the damaged buffers.
-- **Real data (2026-10-04):** The web-server consumer's RÚIAN address index (2 835 455 keys) converted
-  v1 → v2 by `SortedBuilder`; every key's `lookup` and `ordinal` and every 97th
-  `keyAt` agree, and `topN` on 1 416 sampled prefixes returns the same ranking
-  (mean 315 µs v1 → 76 µs v2).
-- **Review 2026-10-23** (independent, Sonnet, over everything since `72162be2`:
-  automaton search, set operations, `nextValue`/`hard_stop`): no panic, OOB, loop
-  or wrong result reachable from a loadable buffer. Fixed from it: `search` and
-  `prefixIterator` skipped the key a `KeyTooLong` refused, so a retry with a
-  bigger buffer lost it (now both stay on it, as `OpIterator` already did); a
-  failed allocation between label and tail left a stray byte in the path (the
-  path is reserved first now); a hard error now finishes an `OpIterator`; the
-  automaton contract says `canMatch` false covers the empty continuation;
-  `max_depth` applies to `search` and `topN` only (§ above). Deferred: the
-  differential set operations stop at 5 inputs (64 only with copies of one
-  index); `drainSearch`'s guard loop cannot tell a typed error from a cap.
-- **Mutation 2026-10-24** (schemata, 38 mutants over the format-version-3 code, the card's run): the
-  v3 node decoder `nodeAtV3` (each bound and flag check, the width field, the `before` offset),
-  `readDistance` (mask, slow path), the 16-wide `strictlyAscending`/`strictlyAscendingIn`/`findLabelIn`
-  (comparison, step clamp, live-lane mask), `NodeView.edge` on v3, `lookupV3` (each check it repeats
-  from the decoder, the root-tail rule, the terminal gate, `d == 0`, the ordinals stride), `eqlShort`
-  (each word half) and the v3 writer (`distanceWidth` at each boundary, distance bytes, `before`): 38
-  killed, 0 equivalent. Four survivors of the first run got tests: a tail differing from the key only
-  in its first or last byte at every length 1-23 (`eqlShort` compared one word of a 5-16 byte tail),
-  and `distanceWidth` at 0xff/0x100/0xffff/0x1_0000/0xff_ffff/0x100_0000 (no test trie reaches 64 KiB
-  back; the writer's width choice is now that pure function). The 2026-10-23 run below covers
-  `automaton` and `ops`, unchanged since.
-- **Mutation 2026-10-23** (schemata, 34 mutants over `automaton`, `ops` and the
-  `search` / `hard_stop` code in `query`): 22 killed at once; the 11 survivors
-  were the promises nothing pinned — `search` pruning at the root, inside a
-  compressed edge and after `willAlwaysMatch`, its budget to the node and its
-  state after a cut, the `max_depth` boundary, intersection / difference
-  stopping at the input that ends them, a key that fits `key_buf` exactly, the
-  shared budget when one input spends all of it — and five new tests kill all
-  of them. 1 equivalent: `Union.willAlwaysMatch` with `and` instead of `or` is
-  only slower (the contract allows false too often).
-- **Mutation 2026-10-04** (schemata, 38 mutants over the v2 code in `format`,
-  `stream`, `query`, `builder` and `fuzzysearch`'s walk): 27 killed at once,
-  10 killed by the tests above, 1 equivalent (`close`'s `!f.terminal` in the
-  merge condition: a terminal frame never holds a child, because holding
-  requires a non-terminal parent and the terminal flag is set before any child
-  closes).
-- Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
-  `zig build check-catalog` exit 0.
+- **Corrupt-buffer fuzz:** `std.testing.fuzz` harnesses with seed corpora over the loader
+  and query path (`root.zig:1144`, `:1249`; pinned to version-1 offsets), and a
+  deterministic seeded sweep over version-2 and version-3 buffers (`sweepV2`,
+  `root.zig:1356`, test `root.zig:1391`) that RE-SEALS both CRCs on most inputs so the
+  damage reaches the node walk instead of dying at the footer check, with its reach
+  (loaded / verified / answered / `Corrupt`) pinned. These are in-test sweeps; the module
+  has no `<M>_FUZZ` driver run.
+- **Positive controls:** hand-malformed buffers and a corrupted stored value
+  (`root.zig:947`) show the differential / robustness checks go RED.
+- **Formats by hand:** a golden byte layout derived from the spec (not from the writer),
+  one targeted damage per load / decode check for version 2 and for version 3
+  (`root.zig:1487`, `:1563`), and a reproduction of fst's `corrupt` experiment against
+  this module (`root.zig:1423`): damaged and re-sealed buffers are refused or answered,
+  never a panic.
+- **Automaton search and set operations:** the oracle checks `search` for nine automata
+  (the three plain built-ins and six compositions with `StartsWith`, union, intersection
+  and complement) against a NAIVE per-key evaluation of the automaton (`evalKey`, run
+  byte by byte over every oracle key: no trie, no pruning), with a random small budget
+  that must yield a prefix of the answer and report `truncated()` exactly when it stopped
+  early; a counting automaton shows that `canMatch` prunes and `willAlwaysMatch` stops
+  the `accept` calls. `opIterator` is checked over 1–5 random indexes in each format
+  against a naive merge of the per-index oracles for all four operations, plus
+  hand-computed three-index cases, the zero / one / empty-input and 64 / 65 index edges,
+  retry after `KeyTooLong` / `ValuesBufferTooSmall`, the shared budget (exactly the
+  measured need suffices, one less is cut and the total stays within it) and a union fed
+  straight into `SortedBuilder`. The corrupt-buffer sweep and both fuzz harnesses also
+  drain `search` and all four operations on the damaged buffers.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Build-time memory profile (measured)
 
-**Since 2026-10-04** `freeze` walks the in-memory trie in key order and feeds
+`freeze` walks the in-memory trie in key order and feeds
 `SortedBuilder`, which writes version 2 holding only the current key's path
 (per depth: one open node, at most one held child with ≤ 256 edges and ≤ 255
 tail bytes). `freezeTo(writer)` therefore adds nothing beyond the builder's
@@ -422,15 +416,6 @@ Measured on this repo's host, synthetic address-like keys:
 ≈ 80–300 B build RSS per key (GPA … arena), frozen output ≈ 40 B/key in
 version 1 on these synthetic keys.
 
-**History:** an earlier builder held two grow-by-doubling arrays *per node*
-(child labels + child ids). That was ~1 KB transient/key under an arena and
-**pathological under a debug/safety allocator** — per-allocation metadata over
-millions of tiny allocations inflated RSS ~10× and OOM-killed a ≥1 M-key
-benchmark at 22 GB. The two-pool sibling-list build above replaced it, cutting
-the arena path ~3.6× (1095 → 304 B/key) and turning the safety-allocator path
-from an OOM into the *leanest* path (82 B/key, no leaks). Query API and frozen
-format are unchanged (the differential oracle tests pass identically).
-
 ## API sharp edge — `topN` key buffer sizing
 
 `topN` shares one `key_buf` across all `results.len` output slots, slicing it
@@ -439,67 +424,38 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
 **`results.len × longest-expected-completion`**, not just one key. (The single
 `prefixIterator` `next(buf)` path has no such multiplier — one key at a time.)
 
-## Deliberately deferred
+`topN` also needs about 0.46 MB of the caller's stack per call (a `max_depth` array of
+frames and two `max_depth` byte arrays), whatever the input (`query.zig:285`); do not call
+it on a small thread stack.
 
-- ~~**Exact lookup within 1.25× darts-clone** (P1)~~ — **done 2026-10-24**
-  (miss 1.15×, hit 1.02×). Format version 3 took the rows from 1.61 / 2.13× to
-  1.07 / 1.35×; the rest was instructions, not memory. The same counters on
-  darts-clone's `exactMatchSearch` (its lookup inlined in `main`) gave ~2.2
-  LLC misses and ~1.5 page walks per miss lookup — more than ours (1.6, 1.1)
-  — at ~270 instructions against our ~1 060. Timing keys cut to their first k
-  bytes put ~390 TSC ticks on the one DRAM node (level 5) and ~50 on each
-  cache-resident node above it, where 145 instructions per node, not the
-  load chain, set the pace. Cutting checks to one per node, the 32-lane label
-  match (the 16-lane loop's exit was 75 % of the branch misses) and a
-  prefetch of the line below the next node took a miss to ~880 instructions,
-  −13 % cycles. Still open if the row ever matters again: a dense table for
-  the first levels (they cost ~300 of the ~690 ticks of a miss).
-- **Suffix minimization (DAFSA/FST)** — **rejected 2026-10-13**, kept listed: design decision A (one parent per node is what makes an untrusted buffer provably safe to walk); size is the price, 24.6 B/key on RÚIAN, measured (fst: 13.3 B/key on the benchmark's synthetic keys, `tools/bench.zig`). Version 2's path compression took the
-  RÚIAN index to 24.6 B/key; minimization (shared suffix nodes) would go further
-  — marisa reports ~5 B/key — but every node would then have many parents, and
-  the bounds-checking argument for an untrusted buffer would have to be rebuilt
-  on something other than "one parent, monotone offsets". Deferrable behind the
-  same query API and a bumped `format_version`.
-- **Columnar / SIMD edge scan.** Edges are a sorted `{label,offset}` array; a
-  wide first-byte fan-out at the root could use a 256-entry dense jump table.
-- **Approximate / typo-tolerant matching** — that is the sibling `fuzzysearch`
-  module's job, not this one; `trie` stays exact-prefix.
-- **Value payloads wider than `u32`** (fst stores `u64`) — **rejected
-  2026-10-13**. Widening `insert`, `Completion.value` and the node value is a
-  breaking API change for every caller, and the dense rank from `ordinal`
-  already gives a caller a key to its own wider table.
-- ~~Automaton search~~ — **done 2026-10-13**: `Frozen.search` +
-  `automaton.zig` (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`,
-  `Intersection`, `Complement`, any conforming type). In-trie Levenshtein stays
-  `fuzzysearch`'s; a regex automaton waits for a byte-stepping DFA in `regex`.
-- ~~Set operations over several indexes~~ — **done 2026-10-13**: `opIterator`
-  (`SetOp`: union, intersection, difference, symmetric difference; ≤ 64
-  indexes; values per contributing index).
-- ~~Range iteration and common-prefix search~~ — **done 2026-10-04**: `range`,
-  `prefixesOf`, `longestPrefix`.
-- ~~Reverse lookup~~ — **done 2026-10-04**: `ordinal` / `keyAt` over the
-  optional per-edge `before` counts (`.ordinals = true`).
-- ~~Streaming build from sorted input / on-disk build~~ — **done 2026-10-04**:
-  `SortedBuilder` (any `std.Io.Writer`), `Builder.freezeTo`.
-- ~~Ranked-prefix cursor / pagination~~ — **done 2026-10-04**:
-  `QueryOptions.after`.
+## What is deliberately not done
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed)** —
-  T-1 to T-3 and T-5 to T-11
-  are fixed in `src/` (implicit `buf.len` work cap for `max_visited == 0`,
-  `KeyTooLong` on both builders, a poisoned `SortedBuilder` after a failed
-  `insert`, a curated `trie.format`).
-  - **T-4: `topN` stack use** — about 0.46 MB per call (a `max_depth` array of
-    `Frame` plus two `max_depth` byte arrays), documented on `topN`. Fix later
-    by shrinking the frame (offset instead of a `NodeView`) or by taking caller
-    scratch.
-  - **`Header.encode` / `Header.verifyBody` stay reachable** through
-    `trie.format.Header` (fuzzysearch tests use `encode`); only the byte-level
-    helpers left the public surface.
-  - **Tree-buffer proof for the implicit cap** is by construction (one parent
-    per node, design decision A), not by a validating pass; a future minimized
-    format (suffix sharing) would have to replace the `buf.len` cap with an
-    explicit budget.
+- **Suffix minimization (DAFSA/FST).** Design decision A: one parent per node is what
+  makes an untrusted buffer provably safe to walk (monotone offsets, termination), and
+  every minimized node would have many parents, so that argument would have to be rebuilt
+  on something else. Size is the price: 24.6 B/key on a real address index in version 2
+  (fst: 13.3 B/key on the benchmark's synthetic keys; marisa reports ~5 B/key); path
+  compression (version 2) took that index from 140 B/key. It could be added behind the same
+  query API and a bumped `format_version`. Rejected for this design, not an oversight.
+- **Value payloads wider than `u32`** (fst stores `u64`). Widening `insert`,
+  `Completion.value` and the node value is a breaking API change for every caller, and the
+  dense rank from `ordinal` already gives a caller a key to its own wider table.
+- **Approximate / typo-tolerant matching.** That is the sibling `fuzzysearch` module's
+  job; `trie` stays exact-prefix (an automaton can be searched, but no Levenshtein
+  automaton is built in).
+- **A regex automaton.** Waits for a byte-stepping DFA in the `regex` module (any type with
+  the five `automaton` functions is searched as is).
+
+## Backlog / deferred
+
+- **Dense table for the first levels** of a lookup (idea): the first levels cost a large
+  share of a miss lookup's time (measured on the version-3 layout); a 256-entry jump table at the root and the next level
+  would cut it. Only if lookup speed against darts-clone ever matters again.
+- **`topN` stack use** (LOW): about 0.46 MB per call; shrink the frame (an offset instead
+  of a `NodeView`) or take caller scratch.
+- **Set-operation differential beyond 5 inputs:** the differential checks 1–5 inputs
+  (64 only with copies of one index).
+- **`drainSearch`'s guard loop** (test helper) cannot tell a typed error from a cap.
 
 ## Anchoring
 
