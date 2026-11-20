@@ -925,7 +925,7 @@ fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
     // the loop, so `while (off < len)` never ran a single pass and
     // `parseFrame` was **never called at all**, while the comment above
     // promises multi-frame streams and `.need_more` retries. `check-fuzz-reach`
-    // only learned to see that shape on. Measured over the corpus
+    // only learned to see that shape. Measured over the corpus
     // above: **0 of 18 seeds reached `parseFrame` and 0 frames were parsed
     // before, 18 of 18 and 7 frames after.**
     const len: usize = smith.slice(&buf);
