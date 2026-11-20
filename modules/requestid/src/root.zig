@@ -129,7 +129,7 @@ threadlocal var current_id: []const u8 = &.{};
 /// access log registered *outside* the middleware reads it once the chain
 /// returns) until the next request the middleware runs for, so a request
 /// that bypasses the middleware sees the previous one's ID: register it
-/// first. The bytes are always this thread's own copy — before 2026-10-24 an
+/// first. The bytes are always this thread's own copy — earlier an
 /// adopted ID pointed into the request head, which the next request on the
 /// connection overwrites.
 pub fn current() ?[]const u8 {
@@ -227,7 +227,7 @@ pub fn isAdoptable(v: []const u8) bool {
 /// unlike `current()`: it touches only process-wide atomics and the
 /// caller-owned `buf`, nothing request-scoped.
 pub fn generateInto(buf: *[generated_len]u8) []const u8 {
-    // A process-wide counter, as chi's RequestID keeps. The 2026-10-04
+    // A process-wide counter, as chi's RequestID keeps. The earlier
     // design (monotonic ns + a thread-address nonce + a per-thread counter)
     // could repeat across connection threads: TLS blocks sit at a fixed
     // stride (128 distinct nonces over 300 threads), two threads read the
@@ -276,8 +276,7 @@ const Writer = std.Io.Writer;
 
 test "current() is null on a thread no middleware has run on" {
     // `current` doc: "or null if no `RequestId` middleware has run on this
-    // thread yet". A fresh thread has fresh thread-locals. Mutation
-    // 2026-10-04: returning the empty slice instead of null survived.
+    // thread yet". A fresh thread has fresh thread-locals. Mutation: returning the empty slice instead of null survived.
     const T = struct {
         fn run(out: *bool) void {
             out.* = current() == null;
@@ -291,7 +290,7 @@ test "current() is null on a thread no middleware has run on" {
 
 test "generateInto: same prefix, the last 16 hex digits are a sequence that steps by one" {
     // `generateInto` doc: "16 hex of a per-process prefix · 16 hex of a
-    // process-wide sequence number". Mutation 2026-10-04: a frozen counter
+    // process-wide sequence number". Mutation: a frozen counter
     // survived the first test set. Test blocks run one at a time, so no
     // other caller takes a number between the two calls.
     var a: [generated_len]u8 = undefined;
@@ -308,8 +307,7 @@ test "generateInto: same prefix, the last 16 hex digits are a sequence that step
 test "generateInto: no duplicate across many threads (the 2026-09-30 survey gap)" {
     // The old id (ns · thread-address nonce · per-thread counter starting at
     // 1) repeated across connection threads. Every thread takes ids at once
-    // after a shared start flag, the case that collided. Negative control
-    // 2026-10-11: a threadlocal sequence instead of the process-wide one
+    // after a shared start flag, the case that collided. Negative control: a threadlocal sequence instead of the process-wide one
     // made this fail (same prefix, same sequence 0 on every thread).
     const n_threads = 32;
     const per_thread = 200;
@@ -323,8 +321,7 @@ test "generateInto: no duplicate across many threads (the 2026-09-30 survey gap)
     defer testing.allocator.free(ids);
     var go: std.atomic.Value(bool) = .init(false);
     var threads: [n_threads]std.Thread = undefined;
-    // Every thread races the FIRST prefix computation too (mutation
-    // 2026-10-24: a cmpxchg loser returning its own value survived, the
+    // Every thread races the FIRST prefix computation too (mutation: a cmpxchg loser returning its own value survived, the
     // prefix having been cached by an earlier test).
     prefix_cache.store(0, .monotonic);
     for (&threads, ids) |*th, *out| th.* = try std.Thread.spawn(.{}, T.run, .{ &go, out });
@@ -554,7 +551,7 @@ fn fillHeaderBytes(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror
 }
 
 test "echo is skipped, not a 500, when an outer middleware spent the header byte budget" {
-    // Mutation 2026-11-11: re-propagating `HeaderBytesExhausted` survived --
+    // Mutation: re-propagating `HeaderBytesExhausted` survived --
     // only the table-full case (`TooManyHeaders`) was exercised.
     var ri = RequestId{};
     var r = router.Router.init(testing.allocator);
@@ -583,7 +580,7 @@ const HeadSentOuter = struct {
 };
 
 test "an echo failure other than the budget errors propagates (head already sent)" {
-    // Mutation 2026-11-11: swallowing every other error survived. The only
+    // Mutation: swallowing every other error survived. The only
     // reachable one is `HeadersSent`, an outer middleware that flushed first.
     var ri = RequestId{};
     var r = router.Router.init(testing.allocator);
@@ -602,7 +599,7 @@ test "middleware() panics on a header name the echo could never set (child proce
     // `middleware()` @panics, in every build mode. A panic cannot be caught
     // in-process, so the test re-runs this test binary with the bad name in
     // the environment; the child takes the first branch and must die with
-    // the panic message. Mutation 2026-11-11: dropping the check survived.
+    // the panic message. Mutation: dropping the check survived.
     if (testing.environ.getPosix("REQUESTID_PANIC_CHILD")) |name| {
         var ri = RequestId{ .options = .{ .header_name = name } };
         _ = ri.middleware();
@@ -625,7 +622,7 @@ test "middleware() panics on a header name the echo could never set (child proce
 }
 
 test "isAdoptable: every single byte value, alone and inside an id, against the charset" {
-    // An exhaustive companion of the random model-fuzz: mutation 2026-11-11
+    // An exhaustive companion of the random model-fuzz: mutation
     // survivors accepted `[`, `{` and `/`, which random bytes rarely hit.
     var c: usize = 0;
     while (c < 256) : (c += 1) {
@@ -641,7 +638,7 @@ test "isAdoptable: every single byte value, alone and inside an id, against the 
 }
 
 test "generateInto: a prefix with leading zero digits is still 32 hex characters" {
-    // Mutation 2026-11-11: space padding on the prefix field survived (a real
+    // Mutation: space padding on the prefix field survived (a real
     // prefix has a leading zero nibble only one time in sixteen).
     prefix_cache.store(0xab, .monotonic);
     defer prefix_cache.store(0, .monotonic);
@@ -653,7 +650,7 @@ test "generateInto: a prefix with leading zero digits is still 32 hex characters
 }
 
 test "processPrefix: a fresh computation differs from an earlier one (it is not a constant)" {
-    // Mutation 2026-11-11: a constant prefix survived every other test.
+    // Mutation: a constant prefix survived every other test.
     // Reset the cache and compute twice with the monotonic clock advanced
     // in between: the hash mixes the clocks, so the values must differ.
     defer prefix_cache.store(0, .monotonic);
@@ -687,7 +684,7 @@ test "custom header name" {
 }
 
 test "header_name: tokens only, framing headers refused (middleware() panics on them)" {
-    // Review 2026-10-24: a non-token name or Content-Length made every echo
+    // Review: a non-token name or Content-Length made every echo
     // fail (http parses Content-Length as a number), Transfer-Encoding was
     // dropped silently.
     try testing.expect(isUsableHeaderName(default_header));
@@ -702,7 +699,7 @@ test "header_name: tokens only, framing headers refused (middleware() panics on 
 }
 
 test "an adopted ID is this thread's copy, still current() for an outer middleware after the chain" {
-    // Review 2026-10-24: `current()` returned a slice of the request head,
+    // Review: `current` returned a slice of the request head,
     // which the next request on the connection overwrites. An access log
     // registered outside the middleware reads it after `next.run`.
     const Outer = struct {
@@ -775,7 +772,7 @@ test "generator: a custom scheme is used, echoed and seen by current(); incoming
 }
 
 test "customId: a result must lie inside buf at both ends (the whole of buf is fine)" {
-    // Mutation 2026-10-24: `<` for `<=` on the end bound and dropping the end
+    // Mutation: `<` for `<=` on the end bound and dropping the end
     // bound survived -- no generator filled buf or ran past it. `big` holds
     // `buf` in its middle so the overrunning results are real memory.
     var big: [3 * max_adopt_len]u8 = @splat('a');
@@ -796,7 +793,7 @@ test "customId: a result must lie inside buf at both ends (the whole of buf is f
 test "generator: a result breaking the contract falls back to the built-in id" {
     // Each case: (bad output, copy it into buf first?). Copied cases fail on
     // shape (isAdoptable); the literal case fails on "not inside buf".
-    // Negative control 2026-10-11: dropping the `isAdoptable` call in
+    // Negative control: dropping the `isAdoptable` call in
     // `customId` failed this test (an empty id went out as the header).
     const cases = [_]struct { bad: []const u8, copy: bool }{
         .{ .bad = "", .copy = true },
