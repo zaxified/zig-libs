@@ -35,6 +35,6 @@ clocks (including a 4-thread advance race).
 Provenance: original work of the zig-libs authors, written against the Linux `clock_gettime(2)` man page
 and the Windows QueryPerformanceCounter / RtlGetSystemTimePrecise documentation. No third-party source was
 consulted or copied, so no `NOTICE` entry is required. The comparative benchmark under `tools/`
-(`bench.zig` and its `rust_bench/` reference side, 2026-11-08) is our own tooling; it drives Rust std only
+(`bench.zig` and its `rust_bench/` reference side) is our own tooling; it drives Rust std only
 through its public API. DATA: none — `tools/rust_bench/main.rs` is source code of that benchmark, generated
 by our own tooling; no captured or third-party data is committed.

@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-11-08 · mutation 2026-11-08 (42/47, 1 eq) · src 41edb1b68ed4a09f
 
-**Audit detail:** review (adversarial, every pub entry point; Zig 0.17.0 std checked for the `timespec` field types: `isize` on every Linux target here, so `i32` on mips-linux-musl, `i64` on x86_64/aarch64; Windows `LARGE_INTEGER` is `i64`) found no panic, UB or wrong-unit path and changed no behaviour. It did move the saturating arithmetic of `realtimeNs` (the `timespec` and the Windows FILETIME branches) out of the OS-only branches into pure helpers (`unixNsFromTimespec`, `unixNsFromFiletime`, `nsToMs`, `nsToS`) so the Windows epoch constant and every saturation can run in the Linux test binary, and replaced the two `@intCast`s on the `timespec` fields by implicit widening (nothing left that can trap on a 32-bit `time_t`). Mutation (47 schemata mutants in one ReleaseSafe build, run per mutant under `setsid -w timeout -s KILL 20`): every `*|`/`+|`/`-|` to its wrapping form, `@divFloor` to `@divTrunc`, the clock id (MONOTONIC to REALTIME, COARSE to MONOTONIC and back, REALTIME to MONOTONIC), the Windows epoch constant and its saturating ops (through the pure helper), the `freq == 0` guard, the u128 product, the `maxInt` saturation, the `elapsedNs`/`since` operand order, each thunk's clock, ms/s unit swaps, `set`/`advance`, the lock (acquire loop condition, store value, unlock, no-lock `advance` on both manual clocks). The review wrote the first batch of tests before the run (the mutants below were chosen to probe them):  `monotonic` vs `coarse` thunks (a precise clock returns a new value on every read, a coarse one repeats within a tick: 2 000 back-to-back reads), a negative second with positive nanoseconds, the pure-helper edges (32-bit fields, both saturation ends, the epoch), a `ManualWallClock` concurrent-advance test. The first run still left `ManualWallClock.advance` without its lock alive (the race test covered only `ManualClock`), and after that test was added it was killed only 2 runs in 5: the spawned threads ran one after another, so a start barrier and 200 000 iterations went into both race tests (then 5 of 5). Survivors (coordinator's verdict, 2026-11-08): one equivalent — `spinLoopHint` removed (a pure CPU hint). Four NOT equivalent, only unobservable on the x86-64 test host, so they stay counted as survivors (A2): acquire/release downgraded to monotonic (x86-64 is TSO; the orderings matter on aarch64/mips), `get` without the lock (an aligned 64-bit load is atomic on x86-64, torn on mips32 `.linux32`), `put` without the lock (a `set` racing an `advance` can be lost: `advance` writes back its read-plus-delta over the unlocked store — a real lost update no x86 test schedule here exposed). Killing them needs a weak-memory or 32-bit test host (qemu mips/aarch64 under load) — Backlog. Not executable here (not counted as killed): the Windows branches of `monotonicNs`/`monotonicCoarseNs`/`realtimeNs`, `windowsQpcNs` (the `toBool()` guards and the `@bitCast`s) and the non-Linux `posixNs` fallback; their arithmetic is the pure `qpcToNs`/`unixNsFromFiletime`, covered above, and they compile for `x86_64-windows-gnu` and `mips-linux-musl` (`zig build portable-clock-windows portable-clock-linux32`).
-
 **Hardening:** fuzz n/a — no parser or untrusted input: every function is a total map from an OS reading or two integers · ct n/a — no secret is read or computed · panic 2026-11-08 (sweep of every pub entry point: `monotonicNs`/`monotonicCoarseNs`/`realtimeNs`/`Ms`/`S` read an OS clock and convert with saturating or widening arithmetic only (a failed read returns 0, a negative field maps to 0, the QPC path divides by a guarded non-zero in `u128`, `@divFloor` by a positive constant cannot trap); `elapsedNs`/`Clock.since` saturate; `Clock`/`WallClock.now*` call the stored function, which is a required field; `ManualClock`/`ManualWallClock` `init`/`now`/`advance`/`set`/`clock` saturate and take a bounded spin lock whose critical sections are two instructions. No allocation, no loop on input, no recursion; the only unbounded wait is the spin lock, held for two instructions by a test fixture)
 
 **Performance:** ref 0.61–0.70× Rust std Instant::now/SystemTime::now · fastest ? (measured 2026-11-08)
@@ -22,7 +20,7 @@
 **Downstream consumer:** no
 
 Design notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of the
-zig-libs authors (MIT).
+zig-libs authors (MIT); the README's `Provenance:` line.
 
 ## Compared with
 
@@ -41,7 +39,7 @@ zig-libs authors (MIT).
 
 - Every read is **total**: no error, no panic, no allocation. A failed `clock_gettime` (Linux documents
   `EINVAL` for an unknown clock id only) or a failed QPC call returns 0 — what every one of the 18 private
-  copies this module replaced (2026-11-08) returned. A caller that must tell "no clock" from "time 0"
+  copies this module replaced returned. A caller that must tell "no clock" from "time 0"
   never had that distinction before either.
 - Conversions saturate: a negative monotonic `timespec` field maps to 0, `sec * 1e9 + nsec` saturates
   at `maxInt(u64)` / the `i64` range, QPC uses a `u128` product and refuses a zero frequency.
@@ -62,37 +60,42 @@ zig-libs authors (MIT).
   space is the bug quanta documents for VMs.
 - **A duration type and formatting** — integer nanoseconds are what the consumers store; human-readable
   durations are `datefmt.bufDuration`'s.
-- **`CLOCK_BOOTTIME` (time including suspend)** — not now: no consumer in the collection needs it; add
-  it as `boottimeNs` when one does (one more `posixNs` call).
 - **Timers, sleep, deadlines** — `std.Io` owns waiting.
 
 ## Verification
 
-`zig build test-clock` — invariants (monotonic never decreases over 10 000 reads, a 20 ms sleep is seen
-as ≥ 20 ms and < 2 s), cross-checks against `std.Io.Clock.awake`/`.real`, the pure conversion helpers at
-their edges (negative fields, `maxInt`, zero QPC frequency, 32-bit `timespec` fields, the Windows epoch and both
-FILETIME saturation ends), coarse-vs-precise granularity (a coarse clock repeats within a tick), `ManualClock` saturation, set-back and
-a barrier-started 4-thread advance race (and the same for `ManualWallClock` with signed deltas), `ManualWallClock` floor division before the epoch.
-`zig build portable-clock-linux32 portable-clock-windows` compile the module for `mips-linux-musl` and `x86_64-windows-gnu`.
+- **Run:** `scripts/modtest clock`; `zig build portable-clock-linux32 portable-clock-windows` compile the module
+  for `mips-linux-musl` and `x86_64-windows-gnu`.
+- **Tests** (`src/root.zig`): invariants (monotonic never decreases over 10 000 reads, a 20 ms sleep is seen as
+  >= 20 ms and < 2 s); cross-checks against `std.Io.Clock.awake` / `.real`; the pure conversion helpers
+  (`unixNsFromTimespec`, `unixNsFromFiletime`, `nsToMs`, `nsToS`, `qpcToNs`) at their edges (negative fields,
+  `maxInt`, zero QPC frequency, 32-bit `timespec` fields, the Windows epoch, both FILETIME saturation ends);
+  coarse-vs-precise granularity (a coarse clock repeats within a tick); `ManualClock` saturation, set-back and a
+  barrier-started 4-thread advance race, the same for `ManualWallClock` with signed deltas; `ManualWallClock`
+  floor division before the epoch.
+- **Not executable on the Linux test host:** the Windows branches of `monotonicNs` / `monotonicCoarseNs` /
+  `realtimeNs`, `windowsQpcNs` and the non-Linux `posixNs` fallback; their arithmetic is the pure helpers
+  above, and they compile for the two portable targets.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The surviving mutants are
+  the lock orderings and unlocked `get` / `put` in `Locked`, which only a weak-memory or 32-bit host exposes
+  (see *Backlog / deferred*); the unlocked `put` is a real lost-update window that no x86-64 test schedule
+  reaches.
+- **Fuzz / constant time:** n/a (see the card's Hardening line).
+- **Bench:** `zig build bench-clock` (`tools/bench.zig`, with a Rust std reference under `tools/rust_bench/`).
 
 ## Performance
 
-**2026-11-08** (`zig build bench-clock`, ReleaseFast, Zig 0.17.0, rustc 1.93.1 `-O`; load average ~4 from
-other sessions, so absolute numbers are noisy, the ratio less so): `monotonicNs` 17.9 ns vs `Instant::now`
-25.6 ns (0.70×), `realtimeNs` 19.0 ns vs `SystemTime::now` 31.4 ns (0.61×); `monotonicCoarseNs` 8.0 ns
-(no Rust std counterpart). Both sides reach the vDSO; Rust's extra cost is its `Instant`/`Duration`
-normalisation. Reference = Rust std because it is the closest shape (one clock per call); Go's
-`time.Now` reads two clocks per call and is not like for like.
+Reference is Rust std, the closest shape (one clock per call); Go's `time.Now` reads two clocks per call and is
+not like for like. Both sides reach the vDSO, so the difference is Rust's `Instant` / `Duration` normalisation.
+The figures are the card's Performance line (`zig build bench-clock`, ReleaseFast).
 
 ## Backlog / deferred
 
-- Mutants 32/33/37/38 of the 2026-11-08 audit (lock orderings, unlocked `get`/`put` in `Locked`) survive only because the test host is x86-64: run the race tests under qemu-mips / an aarch64 runner to kill them, then A1.
-
-- `boottimeNs` (see above) when a consumer needs it.
-
-## Status
-
-`util · any · threadsafe` + no deps — canonical source is `pub const meta` in src/root.zig.
+- Mutants 32/33/37/38 of the whole-module run (lock orderings downgraded to monotonic, unlocked `get` / `put`
+  in `Locked`) survive only because the test host is x86-64 (TSO, atomic aligned 64-bit loads): run the race
+  tests under qemu-mips / an aarch64 runner to kill them, then A1.
+- `boottimeNs` (`CLOCK_BOOTTIME`, time including suspend): no consumer in the collection needs it; add it
+  when one does (one more `posixNs` call).
 
 ## Anchoring
 
