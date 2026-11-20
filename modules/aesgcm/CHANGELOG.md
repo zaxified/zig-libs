@@ -5,11 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (10/11 mutants killed; the 2 call-site survivors only matter above 2^36 − 32 bytes, their helpers are pinned). New test: a length mismatch wins over too-long on the input side too.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). The length contract of `encrypt`/`decrypt` (stateless and `Context`) was `std.debug.assert` (out-of-bounds write or a wrapped 32-bit GCM counter in ReleaseFast) and is now a checked panic in every build mode for `c.len != m.len` and for encrypting more than 2^36 − 32 bytes; decrypting a ciphertext longer than that zeroes `m` and returns `error.AuthenticationFailed` (no message can be that long). `max_message_len` is public and documented. Tests: `src/sweep_test.zig`.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 
 - **2026-10-18** — Zig 0.17 codegen: LLVM 22 lowers a byte-array <-> wider-lane vector `@bitCast` byte by byte; `load`/`store` (16-byte block <-> `@Vector(2, u64)`) now goes through `@Vector(n, u8)` and a vector -> vector `@bitCast` (one vector move, same little-endian-logical meaning on every target). Spelling only: no new branch or index, no API change.
 - **2026-10-18** — Test fix: the `Context` size bounds in the backend test apply only when std's AES key schedule is plain round keys; on targets with software AES (s390x, mips) the schedule is 3-4 KiB, so the bound measured std, not this module. No source change.
@@ -30,8 +26,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-aesgcm`) against OpenSSL 3.5.5 EVP AES-GCM; card Performance filled (0.23–1.00×, fastest not measured) and a SPEC "Performance" section with the raw table.
 - **2026-10-10** — AES-192: new `Aes192Gcm` (same API). Generic backend and stateless generic path over the new `aes192` module (dep added; std 0.16 has no AES-192); the x86-64 stitched kernel runs it with Nr = 12 and its own `aesenclast` Nk = 6 key expansion (checked against `aes192`). Anchors: McGrew–Viega 7–10, 17 OpenSSL long-message rows, Wycheproof's 64 AES-192 tests (37 valid, 27 forged); differential, bit-flip, inc32 and fuzz harnesses cover all three sizes. ctgrind rows 4 → 6 in-file (the tag-check verdict for the third key size).
 - **2026-10-09** — tests: deterministic fuzz driver `AESGCM_FUZZ` over the existing harnesses (the harness also checks that the genuine tag is accepted and decrypts to the message).
-- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** documented why `Context.encrypt`/`decrypt` carry
-  no dead-stack burn (keyed-transform state, §2.1 Z3; the owning protocol entry point burns).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). `Context.init`/`initWith`,
   `AesGcm.init`/`initWith` and the stateless `encrypt`/`decrypt` now run under a 4 KiB per-message
   burn (`src/burn.zig`). Their `key: [N]u8` by-value surface is kept (std shape) with new pointer
@@ -39,24 +33,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `encryptInto(..., *const key)`, `decryptInto(..., *const key)` -- no key copy and no `Context`
   in the caller's frame. Additive, no existing signature changed. `stackprobe_test.zig` probes the
   twins in ReleaseFast.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `aes_gcm_test.json` anchors the module
-  (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 79 valid vectors encrypt and decrypt
-  exactly on every backend and the stateless path, 54 modified tags are refused with the output
-  zeroed. No defect. The vectors are Apache-2.0 data: the module now carries a `NOTICE`.
 
-- **2026-10-04** — **NO CONSUMER-VISIBLE CHANGE:** independent review of the
-  whole module (tag check, failure wiping, length block, inc32, GHASH power
-  count, in-place overlap, constant-time posture); no defect found. Recorded
-  in SPEC § Anchoring.
 - **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
   or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
   backend cannot encode the run-time-dispatched AES-NI kernel for such a CPU. That build now uses
   `.generic`; LLVM builds and targets that have the instruction are unchanged. Found by the web-server consumer's
   portability check.
-- **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** a ctgrind harness
-  (`src/ctgrind_harness.zig`, a separate program, not part of the API)
-  measures the constant-time claim: with key and plaintext tainted, the only
-  secret-dependent branch on every backend is the tag check's pass/fail.
 - **2026-09-28** — New module: AES-GCM (AES-128/256, 96-bit nonce) as a
   drop-in for `std.crypto.aead.aes_gcm` (`encrypt`/`decrypt`, `key_length`,
   `nonce_length`, `tag_length`, `error.AuthenticationFailed`) plus a stateful

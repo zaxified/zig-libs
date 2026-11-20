@@ -22,7 +22,7 @@ development machine (table below).
   target, arm64 included, runs std's AES/GHASH primitives (hardware on arm64
   when the target has `aes`) with the key schedule cached. **Role:** codec.
   **Concurrency:** reentrant; a `Context` is read-only after `init` and may be
-  shared by threads. **Allocation:** none.
+  shared by threads. **Allocation:** none. **Deps:** `aes192` (the AES-192 block cipher of the generic backend).
 
 ```zig
 const aesgcm = @import("aesgcm");
@@ -51,8 +51,9 @@ _ = aesgcm.backend(); // .aesni or .generic
   kernel decrypts in the same pass as it authenticates, so plaintext was
   written); in place, the ciphertext is gone with it — as with std, whose
   output is `undefined` then.
-- **Lengths:** `c.len == m.len` and `m.len ≤ 2³⁶ − 32` bytes are asserted, as
-  std asserts them.
+- **Lengths:** `c.len == m.len` and `m.len ≤ 2³⁶ − 32` bytes (`max_message_len`): a violation is a
+  checked panic in every build mode; decrypting a longer ciphertext zeroes the output and returns
+  `error.AuthenticationFailed`.
 - **Other nonce and tag lengths:** `aesgcm.AesGcm(256, .{ .nonce_length = 8,
   .tag_length = 12 })` has the same API with `[8]u8` nonces and `[12]u8` tags
   (as Go's `NewGCMWithNonceSize` / `NewGCMWithTagSize`). Any nonce of one byte
@@ -70,8 +71,8 @@ _ = aesgcm.backend(); // .aesni or .generic
 MB/s, ReleaseFast, pinned to one core (`taskset -c 1`) of the development
 notebook (i7-7920HQ, Kaby Lake: AES-NI, PCLMULQDQ, AVX2, no VAES), best of 25
 interleaved rounds, 13-byte AD; OpenSSL 3.5.5 `openssl speed -evp -bytes N`,
-best of 5, same core, same session (2026-09-28, a loaded machine — read the
-ratios). Encryption unless marked.
+best of 5, same core, same session (a loaded machine — read the ratios; the module card's
+Performance line is the current OpenSSL ratio, measured by `zig build bench-aesgcm`). Encryption unless marked.
 
 | | bytes | std | `Gcm.encrypt` (stateless) | `Context.encrypt` | `Context.decrypt` | OpenSSL |
 |---|---:|---:|---:|---:|---:|---:|

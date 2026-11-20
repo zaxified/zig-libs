@@ -42,27 +42,25 @@ nonce and a 128-bit tag, the two TLS 1.2/1.3 AES-GCM suites and std's
 `aes192-gcm`). `AesGcm(key_bits, .{ .nonce_length = n, .tag_length = t })`
 takes any nonce of one byte or more and the tag lengths of SP 800-38D
 §5.2.1.2 (16, 15, 14, 13, 12; 8 and 4 under its Appendix C limits). A
-stateful `Context` per key, plus std's stateless shape. It is **not**:
+stateful `Context` per key, plus std's stateless shape.
 
-- ~~**other nonce or tag lengths.**~~ Done 2026-10-10 (`Options`). Refused
-  until then because std and TLS use neither; taken because formats that
-  fixed another shape exist (8-byte IVs in older IPsec/CMS profiles, 12-byte
-  tags in Go's and JOSE-adjacent code) and every compared library but ring
-  serves them. A non-96-bit nonce is hashed into J0 by GHASH (§7.1), which
-  is the construction's weak spot — two nonces can collide in J0 — so 12
-  stays the default and the doc comment on `Options` says to prefer it. Tag
-  lengths outside SP 800-38D's set (OpenSSL accepts 1–3, 5–7, 9–11) are a
-  compile error. Appendix C's limits for 8- and 4-byte tags (message length
-  and invocation count per key) are the caller's: the module cannot count
-  invocations across contexts.
-- ~~**AES-192.**~~ Done 2026-10-10 (`Aes192Gcm`). std has no AES-192, so the
-  generic backend and the stateless generic path take the block cipher from
-  the sibling `aes192` module (std's round primitive, own FIPS-197 key
-  expansion) and recompose GCM from std's `modes.ctr` and `Ghash` exactly as
-  for the other sizes; there is no std AEAD to delegate to. The x86-64 kernel
-  is parametrised by Nr alone (12 here) and gets its own `aesenclast`-based
-  Nk = 6 expansion, so a baseline-CPU build that detects AES-NI at run time
-  never expands the key through std's software tables. Not a TLS suite.
+**Nonce and tag lengths** (`Options`). Std and TLS use neither, but formats that fixed another shape exist
+(8-byte IVs in older IPsec/CMS profiles, 12-byte tags in Go's and JOSE-adjacent code) and every compared
+library but ring serves them. A non-96-bit nonce is hashed into J0 by GHASH (§7.1), which is the
+construction's weak spot — two nonces can collide in J0 — so 12 stays the default and the doc comment on
+`Options` says to prefer it. Tag lengths outside SP 800-38D's set (OpenSSL accepts 1–3, 5–7, 9–11) are a
+compile error. Appendix C's limits for 8- and 4-byte tags (message length and invocation count per key)
+are the caller's: the module cannot count invocations across contexts.
+
+**AES-192** (`Aes192Gcm`). std has no AES-192, so the generic backend and the stateless generic path take
+the block cipher from the sibling `aes192` module (std's round primitive, own FIPS-197 key expansion) and
+recompose GCM from std's `modes.ctr` and `Ghash` exactly as for the other sizes; there is no std AEAD to
+delegate to. The x86-64 kernel is parametrised by Nr alone (12 here) and gets its own `aesenclast`-based
+Nk = 6 expansion, so a baseline-CPU build that detects AES-NI at run time never expands the key through
+std's software tables. Not a TLS suite.
+
+It is **not**:
+
 - **a streaming (incremental) AEAD.** Refused: GCM's decrypt must not release
   plaintext before the tag is checked, so a streaming decrypt is an unsafe API
   shape; records are the unit here.
@@ -182,35 +180,30 @@ tag, and whether the tag verified.
   (x86-64 with `aes`+`avx` in the target, arm64 with `aes`); on other targets
   std's software AES and GHASH, whose side-channel posture is std's.
 
-**Measured** (re-measured 2026-10-10 after the nonce/tag lengths: same counts, same two tag-check lines) with valgrind/memcheck (`scripts/checks/ctgrind.sh aesgcm`,
-harness `src/ctgrind_harness.zig`, ReleaseFast, 2026-09-28, valgrind 3.26,
-i7-7920HQ). The key AND the plaintext are marked undefined, so round keys, H
+**Measured** with valgrind/memcheck (`scripts/checks/ctgrind.sh aesgcm`, harness `src/ctgrind_harness.zig`,
+ReleaseFast). The key AND the plaintext are marked undefined, so round keys, H
 and its powers, keystream, ciphertext, `E(K, J0)` and the tag are all
 secret-derived to memcheck; nonce, AD and lengths stay defined. Each target
-seals, opens the genuine record and opens a forged one, for AES-128 and
+seals, opens the genuine record and opens a forged one, for AES-128, AES-192 and
 AES-256, at lengths reaching every path (short single group, AD-then-tail,
 one batch plus delayed GHASH, the stitched loop with a partial block):
 
-| target | what | in-file | witness | untainted | no `-fvalgrind` |
-|---|---|---:|---:|---:|---:|
-| `ctx` | `Context` on `.aesni` | 4 | 4 | 0 | 0 |
-| `stateless` | `Gcm.encrypt/decrypt(…, key)` on `.aesni` | 4 | 4 | 0 | 0 |
-| `generic` | `Context` on `.generic` (std's AES/CTR/GHASH counted as ours) | 4 | 4 | 0 | 0 |
+| target | what | in-file |
+|---|---|---:|
+| `ctx` | `Context` on `.aesni` | 6 |
+| `stateless` | `Gcm.encrypt/decrypt(…, key)` on `.aesni` | 6 |
+| `generic` | `Context` on `.generic` (std's AES/CTR/GHASH counted as ours) | 6 |
 
-All four in-file contexts of a row are ONE source line — the tag-check branch
+All six in-file contexts of a row are ONE source line — the tag-check branch
 `if (!timing_safe.eql(computed, tag))` (`NiKey.open`, resp. `Generic.open`),
 reached from the harness's genuine and forged `open` for each key size. That
 branch is the pass/fail bit the API returns; nothing else — key schedule,
 stitched batch, tail, GHASH, `seal` — branches on or indexes by a secret.
-The witness contexts are the harness printing the tags (proof the taint
-arrived). Pinned in `scripts/checks/ctgrind-expected.tsv` (counts, source and
-output digests); `--check` is green.
+The harness also prints the tags as a witness that the taint arrived. Counts, source and
+output digests are pinned in `scripts/checks/ctgrind-expected.tsv`; `--check` is the gate.
 
-**Positive controls** (injected, measured, reverted): a branch on a keystream
-byte inside the stitched `batch` plus one on a plaintext byte in `sealTail`
-took `ctx`/`stateless` from 4 to 54 in-file; a branch on a ciphertext byte in
-`Generic.seal` took `generic` from 4 to 6. Replacing `timing_safe.eql` with
-`mem.eql` does *not* move the count — LLVM compiles a fixed 16-byte `mem.eql`
+Replacing `timing_safe.eql` with
+`mem.eql` does *not* move the ctgrind count — LLVM compiles a fixed 16-byte `mem.eql`
 to one vector compare and one branch — which is why the comparison is also
 pinned by `scripts/checks/check-ct-compare.py`, not by ctgrind.
 
@@ -228,13 +221,14 @@ review, as §2.1 says they must be.
 
 ## Limits and refusals
 
-- `m.len ≤ 16·(2³² − 2)` bytes (SP 800-38D §5.2.1.1 with a 96-bit IV: the
-  32-bit counter starts at 2): asserted, as std asserts it, for every nonce
-  length. With a 96-bit nonce the counter therefore never wraps through the
-  API; with any other it can, and does in the CounterWrap anchors (below).
+- `m.len ≤ 16·(2³² − 2)` bytes (`max_message_len`; SP 800-38D §5.2.1.1 with a 96-bit IV: the
+  32-bit counter starts at 2), for every nonce length. Encrypting more is a checked panic in every build
+  mode; decrypting a longer ciphertext zeroes `m` and returns `error.AuthenticationFailed` (no message can
+  be that long). With a 96-bit nonce the counter therefore never wraps through the API; with any other it
+  can, and does in the CounterWrap anchors (below).
 - `nonce_length ≥ 1` and `tag_length ∈ {16, 15, 14, 13, 12, 8, 4}`: compile
   errors otherwise.
-- `c.len == m.len`: asserted.
+- `c.len == m.len`: a checked panic in every build mode otherwise (a mismatch wins over too-long).
 - AD length: unbounded in practice (the length block is 64-bit bits).
 - `Context`: ≤ 320 bytes (AES-128) / ≤ 384 bytes (AES-256) — pinned by test
   `backend picks AES-NI when the CPU has it`, because a TLS server holds two per
@@ -251,16 +245,12 @@ review, as §2.1 says they must be.
   without a partial block (test `long messages agree with OpenSSL`). Recipe:
   `tools/openssl_kat.py`, output `src/testdata/openssl_kat.zig` (tag and
   SHA-256 of the ciphertext; inputs are regenerated from a formula).
-  A third set is **Wycheproof** `aes_gcm_test.json` (2026-10-06; 192-bit
-  groups added 2026-10-10, JSON sha256 985e5ecc…dfe7, the 128/256 rows
-  unchanged): its 197 tests with a 128/192/256-bit key, 96-bit IV and 128-bit
+  A third set is **Wycheproof** `aes_gcm_test.json` (JSON sha256 985e5ecc…dfe7): its 197 tests with a 128/192/256-bit key, 96-bit IV and 128-bit
   tag — 116 valid, which
   every backend and the stateless path must encrypt and decrypt exactly, and
   81 with a modified tag, which each must refuse with the output zeroed
   (test `Wycheproof aes_gcm_test.json …`; recipe `tools/wycheproof.py`,
-  Apache-2.0 data, see NOTICE). No defect; a one-byte change in a kept
-  vector fails the test (negative control, 2026-10-06).
-  Since 2026-10-10 also its **113 tests with other IV lengths** (1 … 257
+  Apache-2.0 data, see NOTICE). Also its **113 tests with other IV lengths** (1 … 257
   bytes: SmallIv, LongIv, Pseudorandom and the 12 CounterWrap tests per key
   size, whose J0 ends in ffffffff, fffffffe, … so the counter wraps inside
   a 40-byte message), each through `AesGcm(bits, .{ .nonce_length = n })` on
@@ -271,10 +261,7 @@ review, as §2.1 says they must be.
   16, 60 and 128 bytes and three Wycheproof CounterWrap key/nonce pairs over
   seven lengths up to 19 999 bytes, so the counter wraps inside the stitched
   eight-block loop and in the generic backend's split CTR (test `nonces
-  other than 96 bits agree with OpenSSL …`). Negative controls (2026-10-10):
-  the generic split one block late fails the Wycheproof and OpenSSL wrap
-  tests; the kernel's nonce length block with its halves swapped fails five
-  tests, the fuzz harnesses among them.
+  other than 96 bits agree with OpenSSL …`).
 - **Tag lengths** — every shorter tag is the leading bytes of the full one
   (SP 800-38D's MSB_t, the full tag anchored above), for both nonce paths
   and every backend, and each of its bits flipped is refused with the
@@ -290,40 +277,11 @@ review, as §2.1 says they must be.
 - **Rejection** — every single-bit change of tag, ciphertext and AD refused,
   with the output zeroed, for message lengths 0, 1, 17, 130 and 300, per
   backend (and the stateless path at a stride); a wrong nonce refused.
-- **Mutation** (2026-09-28, schemata over a copy, one ReleaseSafe build): 31
-  mutants — reduction constant and second phase, a dropped middle product, the
-  counter lane, a wrong H power in the batch, the delayed and the read-ahead
-  GHASH, the tail padding, swapped lengths, the tag check bypassed, no wipe on
-  failure (both backends), the H·x carry, rcon and the AES-256 odd step, the
-  stateless power count (short and long), H⁵ and H⁸, the tail counter, the
-  batch counter advance, where `acc` enters a batch, the AD partial block,
-  J0's counter, the CPUID mask, the length block's byte order and its loss,
-  the short path's AD offset, hashing plaintext in the decrypt tail — all
-  killed. (Moving the short/long threshold or the fold-in-the-length-block
-  threshold is equivalent — the longer path is also correct — and was not
-  counted.)
 - Run natively in ReleaseSafe, ReleaseFast and Debug (self-hosted backend), in
   ReleaseSafe with `-Dcpu=x86_64` (run-time CPUID, legacy SSE encodings,
   `pshufb` by assembly) and `-Dcpu=x86_64_v2` (run-time CPUID, compiler
   `pshufb`), and on aarch64 under `qemu-aarch64` with the generic CPU and with
   `+aes` (the generic backend, x86-only tests skipped).
-
-- **Review** (2026-10-04, independent, whole `root.zig` + SPEC + README): no
-  defect found. Checked: the tag comparison is `timing_safe.eql` on both
-  backends and both shapes; a failed decrypt zeroes all of `m` on both
-  backends (the `.aesni` one after having written plaintext there, the
-  `.generic` one before `ctr` runs); the length block is `[len(A)]₆₄ ‖
-  [len(C)]₆₄` in bits, in the byte-reversed lane order (`lengths`); the
-  counter is inc32 (`ctrAdd` adds to the low dword only) and cannot wrap
-  through the API because of the `max_message_len` assert; `powersFor` covers
-  every power the short path, the AD groups (`ghashBytes`) and the tail group
-  (`finishGhash` with `n` = 8) read; every in-place step loads input block j
-  before it stores output at or below it; no table, no secret-indexed
-  address, no secret branch other than the pass/fail bit. Notes, not defects:
-  the length bounds are asserts (as in std), so a ReleaseFast build does not
-  check them — unreachable for TLS records (≤ 2¹⁴ + 256 bytes); `Context` is
-  returned by value, so the caller's copies of it are the caller's to wipe
-  (§2.1 Z2). No code changed, so no new mutation round.
 
 **Anchor grade:** class B · oracle EXTERNAL
 
@@ -348,62 +306,64 @@ review, as §2.1 says they must be.
   clarity): the construction is from the published papers above; the code is
   original.
 
+## Verification
+
+- **Run:** `scripts/modtest aesgcm` (`zig build test-aesgcm`); the bench is a separate program,
+  `zig build bench-aesgcm`.
+- **Tests** (`src/root.zig`, `src/sweep_test.zig`, `src/stackprobe_test.zig`): the external anchors
+  above, differentials against std, rejection by single-bit change, in-place and overlap shifts, the
+  wipe test, backend selection and the `Context` size bounds; `sweep_test.zig` pins the length
+  contract (`max_message_len`, mismatch vs too-long, the decrypt refusal that zeroes `m`);
+  `stackprobe_test.zig` probes that no key or round-key residue is left on the stack after any entry point.
+- **Fuzz:** `AESGCM_FUZZ=<runs>[,<seed>]` drives a harness (`agreeHarness`) in which every backend agrees with std on arbitrary
+  key, nonce, AD and message, other nonce/tag shapes agree among themselves, genuine tags are accepted and
+  forged ones refused; a reach test checks that 300 seeds hit every label. Verdicts come from the
+  deterministic driver, never `zig build --fuzz`.
+- **Constant time:** the ctgrind rows (`ctx`, `stateless`, `generic`) of *Constant-time contract*; the tag
+  comparison is also pinned by `scripts/checks/check-ct-compare.py`.
+- **Mutation:** schemata over the kernel — reduction constant and second phase, a dropped middle product,
+  the counter lane, a wrong H power in the batch, the delayed and the read-ahead GHASH, the tail padding,
+  swapped lengths, the tag check bypassed, no wipe on failure (both backends), the H·x carry, rcon and the
+  AES-256 odd step, the stateless power count, H⁵ and H⁸, the tail counter, the batch counter advance,
+  where `acc` enters a batch, the AD partial block, J0's counter, the CPUID mask, the length block's byte
+  order and its loss, the short path's AD offset, hashing plaintext in the decrypt tail — all killed.
+  Moving the short/long threshold or the fold-in-the-length-block threshold is equivalent (the longer
+  path is also correct) and is not counted. The length-contract checks were covered by a later delta run
+  (10 of 11 mutants killed; the two call-site survivors matter only above 2^36 − 32 bytes, where the
+  helpers are pinned instead).
+- **Platforms:** natively in ReleaseSafe, ReleaseFast and Debug (self-hosted backend), in ReleaseSafe with
+  `-Dcpu=x86_64` (run-time CPUID, legacy SSE encodings, `pshufb` by assembly) and `-Dcpu=x86_64_v2`
+  (run-time CPUID, compiler `pshufb`), and on aarch64 under `qemu-aarch64` with the generic CPU and with
+  `+aes` (the generic backend, x86-only tests skipped).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aesgcm`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 7.8 %): ref 0.25–1.01× OpenSSL 3.5.5, against 0.23–1.00× on Zig 0.16.0. The card carries these figures; the tables below are the 0.16.0 measurement.
+`zig build bench-aesgcm` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`) times this module
+against OpenSSL's system `libcrypto` EVP AES-GCM (the AES-NI/PCLMULQDQ stitched `aesni_gcm` assembly); the
+card's Performance line carries the current figures (the card is authoritative). Method: each side doubles
+its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for
+`BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst
+round − best round) / best round per side. Before timing, an interop check (OpenSSL's AES-256-GCM
+ciphertext and tag of the 16 KiB message must equal ours byte for byte). Workloads: AES-128/256-GCM
+encrypt and decrypt of 64 B, 1420 B and 16 KiB with 13 bytes of AD, key set up once on both sides
+(`Context` vs an `EVP_CIPHER_CTX` keyed once, nonce set per op).
 
-Measured 2026-10-10 against OpenSSL 3.5.5 (system `libcrypto.so.3`, EVP AES-GCM: the
-AES-NI/PCLMULQDQ stitched `aesni_gcm` assembly). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
-
-**On Zig 0.17.0 (2026-10-18, migration check; the figures here are the 0.16.0 measurement).**
-0.17 lowered the `[16]u8` <-> `@Vector(2, u64)` `@bitCast` in `load`/`store` byte by byte
-(probe: 6 -> 51 / 7 -> 63 instructions per block; `bench-aesgcm` ref 0.29–2.03× OpenSSL
-against the card's 0.23–1.00×). Both now go through `@Vector(16, u8)` and a vector-to-vector
-`@bitCast`: `load` 52 -> 6 instructions, and `bench-aesgcm` on 0.17 reads ref 0.25–1.04×
-OpenSSL (loaded machine, spread up to 108 %). A loaded-machine check, not a re-measurement
-of the card.
-
-Method: `zig build bench-aesgcm` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL's AES-256-GCM ciphertext and tag of the 16 KiB message must equal ours byte for byte).
-
-Workloads: AES-128/256-GCM encrypt and decrypt of 64 B, 1420 B and 16 KiB with 13 bytes of
-AD, key set up once on both sides (`Context` vs an `EVP_CIPHER_CTX` keyed once, nonce set per
-op). `BENCH_ROUNDS=5`:
-
-| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
-|---|---:|---:|---:|---:|---:|
-| `aes128_enc_64` | 57 | 252 | 0.230 | 19.7% | 30.4% |
-| `aes128_enc_1420` | 348 | 568 | 0.621 | 31.0% | 53.1% |
-| `aes128_enc_16384` | 3499 | 3481 | 1.000 | 40.3% | 29.6% |
-| `aes128_dec_64` | 56 | 236 | 0.239 | 47.1% | 73.5% |
-| `aes128_dec_1420` | 327 | 509 | 0.634 | 40.5% | 84.4% |
-| `aes128_dec_16384` | 3090 | 3225 | 0.992 | 49.4% | 24.9% |
-| `aes256_enc_64` | 60 | 219 | 0.275 | 1.4% | 9.2% |
-| `aes256_enc_1420` | 412 | 563 | 0.728 | 1.9% | 26.6% |
-| `aes256_enc_16384` | 4052 | 4171 | 0.972 | 1.7% | 2.6% |
-| `aes256_dec_64` | 60 | 197 | 0.303 | 1.2% | 90.9% |
-| `aes256_dec_1420` | 394 | 555 | 0.710 | 15.1% | 64.7% |
-| `aes256_dec_16384` | 4202 | 4140 | 0.990 | 35.7% | 49.4% |
-
-A first run (3 rounds, heavier load) agreed: worst 0.997–1.000 on the 16 KiB rows, 0.23–0.30
-on 64 B, 0.64–0.72 on 1420 B.
-
-**Reading.** At 16 KiB both sides run the same class of stitched AES-NI/PCLMULQDQ kernel and
-meet at 0.97–1.00×; below that OpenSSL's per-call EVP overhead (nonce re-init, AD update, tag
-ctrl: ~150 ns) dominates and this module's context path is 1.4–4× faster. Grade: worst row
-1.00× ≤ 1.0, but the fastest implementation in the field (BoringSSL/aws-lc's AES-GCM, Go's
-`crypto/cipher`) is not measured, so P2.
+Reading: at 16 KiB both sides run the same class of stitched AES-NI/PCLMULQDQ kernel and meet at about
+1.0×; below that OpenSSL's per-call EVP overhead (nonce re-init, AD update, tag ctrl) dominates and this
+module's context path is faster. P2, because the fastest implementation in the field (BoringSSL/aws-lc's
+AES-GCM, Go's `crypto/cipher`) is not measured. On Zig 0.17 the `load`/`store` between a 16-byte block and
+the vector go through `@Vector(16, u8)` and a vector-to-vector `@bitCast`, because LLVM lowers a
+byte-array to wider-lane vector `@bitCast` byte by byte.
 
 ## Backlog / deferred
 
-- **Generic backend's GCTR on Zig 0.17** *(2026-10-20)*: `Generic.gctr` (`src/root.zig`, the non-AES-NI path) runs std's `crypto.core.modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256) — measured on `aes192`'s bench: 2.32× OpenSSL at 16 KiB, against 0.96× for `Aes192EncryptCtx.ctr`'s two-`u64`, vector-byte-swap counter. Port that counter (inc32 only: the low 32 bits) when the generic path is next measured; the stitched AES-NI kernel is unaffected.
-- **Performance P2 → P1: measure the fastest in the field** *(bench 2026-10-10)*: ours is
-  0.97–1.00× OpenSSL 3.5.5 at 16 KiB and faster below; P1 needs `fastest ≤ 1.25×`, and no
-  other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
+- **Generic backend's GCTR on Zig 0.17**: `Generic.gctr` (`src/root.zig`, the non-AES-NI path) runs std's `crypto.core.modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256) — measured on `aes192`'s bench: 2.32× OpenSSL at 16 KiB, against 0.96× for `Aes192EncryptCtx.ctr`'s two-`u64`, vector-byte-swap counter. Port that counter (inc32 only: the low 32 bits) when the generic path is next measured; the stitched AES-NI kernel is unaffected.
+- **Performance P2 → P1: measure the fastest in the field**: ours is about 1.0× OpenSSL 3.5.5 at 16 KiB and
+  faster below; P1 needs `fastest ≤ 1.25×`, and no other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
   family as OpenSSL, plus VAES paths), Go `crypto/cipher`. Add them as an `alt` side in
   `tools/bench.zig` when one is installable on the host.
-- ~~**Wycheproof AES-GCM vectors**~~ — DONE 2026-10-06 (see Anchoring); its IV-size and CounterWrap groups too since 2026-10-10, with the nonce lengths.
-- ~~**Nonce and tag lengths**~~ — DONE 2026-10-10 (`Options`; scope core → parity).
-- **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch** *(survey 2026-09-30)*: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Already listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
+- **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch**: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
 
 ## Open
 
