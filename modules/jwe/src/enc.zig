@@ -6,15 +6,14 @@
 //!
 //! REAL: `A128GCM`/`A256GCM` — the `aesgcm` module's `Aes128Gcm`/`Aes256Gcm`;
 //! `A192GCM` — its `Aes192Gcm` (Zig 0.16's std has no
-//! AES-192 at all; `aesgcm` runs it over the `aes192` block cipher), since
-//! 2026-10-10.
+//! AES-192 at all; `aesgcm` runs it over the `aes192` block cipher), since.
 //!
 //! REAL (see the `cbc_hmac` namespace): `A128CBC-HS256`/`A256CBC-HS512`
 //! (RFC 7518 §5.2) — AES-CBC (raw block-chaining + PKCS#7 padding from the
 //! shared `aescbc` module) + HMAC-SHA-2 "encrypt-then-MAC" with the §5.2.2
 //! key split, AAD-bit-length encoding, and verify-before-decrypt ordering;
-//! byte-exact against RFC 7518 Appendix B. `A192CBC-HS384` (since
-//! 2026-10-10) runs its CBC half over the `aes192` module's `Aes192`,
+//! byte-exact against RFC 7518 Appendix B. `A192CBC-HS384`
+//! runs its CBC half over the `aes192` module's `Aes192`,
 //! byte-exact against B.2.
 
 const std = @import("std");
@@ -482,8 +481,8 @@ test "A256GCM real round-trip + tamper detection" {
     try std.testing.expectError(error.AuthenticationFailed, gcm.decrypt(.A256GCM, &key, &iv, aad, &ct, &tag, &recovered));
 }
 
-// Was "A192GCM is a documented std gap" (UnsupportedKeyLength) until
-// 2026-10-10. RFC 7520 has no A192GCM example; McGrew–Viega test case 10
+// Was "A192GCM is a documented std gap" (UnsupportedKeyLength) until.
+// RFC 7520 has no A192GCM example; McGrew–Viega test case 10
 // (AES-192, 60-byte P, 20-byte AAD) is the external anchor instead.
 test "A192GCM: McGrew–Viega GCM test case 10, both directions, tamper refused" {
     const hexb = struct {
@@ -544,7 +543,7 @@ test "RFC 7518 B.3 (A256CBC-HS512): byte-exact E and T, both directions" {
 
 test "RFC 7518 B.2 (A192CBC-HS384): byte-exact E and T, both directions" {
     // Was a typed-unsupported check of the CBC half plus a byte-exact HMAC
-    // half, until the `aes192` module (2026-10-10). B.2 reuses B.1's
+    // half, until the `aes192` module. B.2 reuses B.1's
     // P/IV/A; only K/E/T differ.
     const b1 = cbc_hmac.kat.b1;
     const b2 = cbc_hmac.kat.b2;

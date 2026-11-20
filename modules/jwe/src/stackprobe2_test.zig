@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the entry points burned
-//! 2026-10-09: `alg.pbes2DeriveKek` and `decryptCompact` for a `dir` token
+//! `alg.pbes2DeriveKek` and `decryptCompact` for a `dir` token
 //! (the ECDH-ES paths are in `stackprobe_test.zig`). One-shot calls:
 //! `kdf_burn` / `content_burn`. ReleaseFast only (`skipUnlessOptimized`).
 

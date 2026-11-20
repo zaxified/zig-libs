@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! No-panic sweep (2026-11-13): one test per finding, named "(sweep JWE-n)".
+//! No-panic sweep: one test per finding, named "(sweep JWE-n)".
 
 const std = @import("std");
 const testing = std.testing;

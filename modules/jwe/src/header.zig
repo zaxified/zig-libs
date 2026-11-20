@@ -444,7 +444,7 @@ const header_fuzz_buf_len = 1 + 64;
 /// `{"alg":"PBES2-HS256+A128KW","enc":"A128GCM"}` with **no optional members
 /// at all** — so `optionalBase64`, `optionalUint` and `optionalEpk`, named in
 /// that same comment as "the paths where the parse errors actually live",
-/// were still never entered. Measured 2026-09-07: 0 of 1 inputs carried a
+/// were still never entered. Measured: 0 of 1 inputs carried a
 /// `p2s`, a `p2c`, a `kid` or an `epk`.
 ///
 /// Octet 0 is a bitmask over the optional members; the rest is the payload
@@ -599,7 +599,7 @@ test "corpus: every header seed reaches the parser, and the optional members dec
     }
     // One seed is deliberately empty.
     try std.testing.expectEqual(header_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. The one input the old harness ran produced a
+    // Measured. The one input the old harness ran produced a
     // header with 0 of each optional member, and parsed 0 blobs.
     try std.testing.expectEqual(@as(usize, 15), parsed_headers);
     try std.testing.expectEqual(@as(usize, 4), with_p2c);
@@ -639,7 +639,7 @@ test "TEETH: any crit header is refused (RFC 7516 s5.2 step 5)" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

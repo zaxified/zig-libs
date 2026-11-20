@@ -13,7 +13,7 @@
 //!     over `Alg || 0x00 || p2s`; the KEK it produces feeds `aeskw`.
 //!   - `aeskw` (re-export) — RFC 3394 AES Key Wrap: AxxxKW (§4.4) directly,
 //!     every PBES2-* variant indirectly. Byte-exact against RFC 3394 §4.1;
-//!     see the shared `aeskw` module (all three KEK widths since 2026-10-10).
+//!     see the shared `aeskw` module (all three KEK widths).
 //!   - `ecdhes` (re-export) — ECDH-ES key agreement (§4.6): ephemeral-static
 //!     ECDH (P-256/X25519) + the Concat KDF. Direct mode derives the CEK
 //!     itself; `ECDH-ES+AxxxKW` derives a KEK that feeds `aeskw`. Byte-exact
@@ -289,7 +289,7 @@ test "GCMKW A256 (32-byte KEK): every byte of the KEK is load-bearing, not just 
     try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&kek_b, iv, tag_a, &ct_a, &recovered));
 }
 
-// Was "GCMKW A192 (24-byte KEK) is a documented std gap" until 2026-10-10.
+// Was "GCMKW A192 (24-byte KEK) is a documented std gap" previously.
 test "GCMKW A192: McGrew–Viega GCM test case 8 as a key wrap, round trip, wrong KEK refused" {
     // TC 8: K = 0^192, IV = 0^96, P = 0^128, no AAD -- exactly GCMKW's shape
     // (a 16-byte CEK, empty AAD).

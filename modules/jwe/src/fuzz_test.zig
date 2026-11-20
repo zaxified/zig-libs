@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for jwe's deterministic fuzz driver (added 2026-10-09).
+//! Shared plumbing for jwe's deterministic fuzz driver.
 //!
 //! The harness BODIES stay in `root.zig` and `header.zig` beside their
 //! corpora and private items; each is generic over its source of choices,

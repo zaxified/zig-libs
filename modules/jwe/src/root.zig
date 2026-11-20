@@ -36,7 +36,7 @@
 //!     the CEK itself (empty Encrypted Key segment); the `+AxxxKW` modes
 //!     derive a KEK feeding the RFC 3394 wrap.
 //!
-//! AES-192 (every `A192*` above) since 2026-10-10: std 0.16 has no AES-192;
+//! AES-192 (every `A192*` above): std 0.16 has no AES-192;
 //! the block cipher is the `aes192` module's, GCM is `aesgcm`'s.
 //!
 //! ## Usage
@@ -736,7 +736,7 @@ fn unwrapCek(
             // Encryption carries no Encrypted Key. The segment is not in the
             // AAD, so without this anyone could splice bytes into it and the
             // token would still decrypt — a second, different token for the
-            // same message (found 2026-10-05, mutation-run review).
+            // same message (found, mutation-run review).
             if (encrypted_key.len != 0) return error.MalformedToken;
             _ = try alg.dirCek(shared, cek_len, cek);
         },
@@ -1112,7 +1112,7 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
 
 // Was "ECDH-ES+A192KW is the documented AES-192 std gap" (expected
 // UnsupportedKeyLength) until aeskw gained the 24-byte KEK arm over the
-// `aes192` module, 2026-10-10. RFC 7520 has no ECDH-ES+A192KW example, so the
+// `aes192` module,. RFC 7520 has no ECDH-ES+A192KW example, so the
 // anchor is aeskw's RFC 3394 §4.2/§4.4 KATs plus this round trip.
 test "ECDH-ES+A192KW real round-trip (P-256), through aeskw's AES-192 KEK" {
     var recipient: ecdhes.EphemeralKeyPair = undefined;
@@ -1367,7 +1367,7 @@ test "corpus: every token seed reaches decryptCompact, and how far each gets is 
     }
     // One seed is deliberately the empty script.
     try std.testing.expectEqual(token_seeds.len - 1, nonempty);
-    // Measured 2026-09-07. The single input this target used to run was one
+    // Measured. The single input this target used to run was one
     // flip at offset 0 to 0x00 — `InvalidBase64`, a framing refusal, so
     // `past_framing` was 0 for every run it ever made.
     try std.testing.expectEqual(@as(usize, 11), distinct_tokens);
@@ -1668,7 +1668,7 @@ fn rewriteP2c(gpa: std.mem.Allocator, token: []const u8, p2c: u32) ![]u8 {
     return gpa.print("{s}.{s}", .{ new_h, rest });
 }
 
-// ── mutation run 2026-10-05 ─────────────────────────────────────────────────
+// ── mutation run ─────────────────────────────────────────────────
 //
 // 35 mutants, 18 survivors on the first pass. Each test below names the rule
 // it pins and why its expected value is the right one.
@@ -1702,7 +1702,7 @@ fn tokenWithCek(a: std.mem.Allocator, header_json: []const u8, ek: []const u8, c
 }
 
 test "dir refuses a non-empty encrypted_key segment (RFC 7516 §5.2 step 10)" {
-    // Review finding 2026-10-05: only ECDH-ES checked this. The segment is
+    // Review finding: only ECDH-ES checked this. The segment is
     // outside the AAD, so a dir token with bytes spliced into it decrypted
     // to the same plaintext — the malleability the ECDH-ES test names.
     const key = @as([16]u8, @splat(0x2b));
@@ -1910,7 +1910,7 @@ test "KAT: PBES2-HS256+A128KW against RFC 7517 Appendix C.4/C.5" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
