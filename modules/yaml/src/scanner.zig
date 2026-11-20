@@ -193,9 +193,9 @@ pub const Scanner = struct {
         // the Unicode ceiling U+10FFFF, whose leading byte is 0xF4). 0xF5-0xFF
         // can never start a valid UTF-8 sequence (RFC 3629 §3) — treating them
         // as width 4 anyway swallowed up to three trailing bytes that were not
-        // part of any encoded character, structural or not (A1/yaml.md F4:
+        // part of any encoded character, structural or not (A1 audit F4:
         // one 0xF5-0xFF byte silently consumed a following `:` or `\n` and
-        // changed the shape of the document). Since F11 (2026-09-17) an
+        // changed the shape of the document). Since F11 an
         // invalid byte never gets this far: `fetchStreamStart` rejects the
         // whole stream first. The one-byte width stays as the safe answer.
         if (b < 0xF5) return 4;
@@ -625,7 +625,7 @@ pub const Scanner = struct {
             // scanner only ever reads UTF-8. Before this check, one of those
             // BOMs was not recognised as a BOM at all: it fell through as
             // ordinary (invalid) content bytes, and the document silently
-            // folded into one nonsense scalar instead of failing (A1/yaml.md
+            // folded into one nonsense scalar instead of failing (A1 audit
             // F6 — `get("enabled")` on the wrong root returns `null`, a
             // silent fallback to whatever default the caller has, not an
             // error the caller can see). Rejecting it outright is a strict
@@ -636,7 +636,7 @@ pub const Scanner = struct {
         }
         // YAML 1.2 §5.2: the stream is UTF-8; §5.1: it holds only `c-printable`
         // characters. Checked once, over the whole input, before the first
-        // token (A1/yaml.md F11): the scanner below stays byte-transparent and
+        // token (A1 audit F11): the scanner below stays byte-transparent and
         // relies on this, so an invalid byte can no longer reach a scalar.
         if (firstInvalidChar(self.src)) |bad| {
             return self.failAt(bad.msg, markOf(self.src, bad.index));
@@ -1472,7 +1472,7 @@ fn scanAll(arena: std.mem.Allocator, src: []const u8) Error!void {
     }
 }
 
-// F5 (A1/yaml.md): before this, nothing in the suite exercised `max_depth`
+// F5 (A1 audit): before this, nothing in the suite exercised `max_depth`
 // (4096) at all -- the composer's OWN, separate, lower `Options.max_depth`
 // (default 1024, see compose.zig) rejects any realistic input long before a
 // caller could reach this constant, so the boundary was invisible even to a
@@ -1528,12 +1528,12 @@ test "block-nesting cap: max_depth levels of '- ' scan clean, max_depth + 1 fail
     try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
 }
 
-// F5 (A1/yaml.md), mutation ID `W04_scanner_depth`: the audit's mutation
+// F5 (A1 audit), mutation ID `W04_scanner_depth`: the audit's mutation
 // changed `max_depth`'s VALUE (4096 -> 1_000_000) rather than removing the
 // check that reads it. The two tests above construct their input by reading
 // the live `max_depth` symbol, so they retarget themselves to whatever value
 // it holds and can never see a change to the value itself -- a fixer
-// confirmed this by hand 2026-09-10 (temporarily setting `max_depth = 5000`
+// confirmed this by hand (temporarily setting `max_depth = 5000`
 // and watching both tests keep passing). The fix is a THIRD test that reads
 // the literal `4096`/`4097`, never the symbol: it still passes today (the
 // literal and the symbol agree), but stops matching production behaviour --
@@ -1556,7 +1556,7 @@ test "block-nesting cap is pinned to the literal 4096, not just whatever `max_de
     try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
 }
 
-// F5 (A1/yaml.md), mutation ID `W03_simplekey_cap`: the audit's mutation
+// F5 (A1 audit), mutation ID `W03_simplekey_cap`: the audit's mutation
 // widened `staleSimpleKeys`'s 1024-character simple-key span (YAML 1.2 §7.4,
 // "the total number of characters that key can span is 1024") to 1_000_000
 // and 10 of 20 mutations, this one included, left the suite green -- nothing
@@ -1586,7 +1586,7 @@ test "simple-key cap: a required implicit key over 1024 characters is rejected, 
     try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_long.items));
 }
 
-// F5 (A1/yaml.md), mutation ID `W11_tab_indent`: nothing in the suite drove a
+// F5 (A1 audit), mutation ID `W11_tab_indent`: nothing in the suite drove a
 // tab into a position where it would have to serve as indentation, so the
 // `rollIndent` guard below ("a tab is never indentation", YAML 1.2 §6.1) went
 // untested. The three forms come straight from that guard's own comment.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests for the 2026-10-04 additions: the emitter and the typed mapping
+//! Tests for the additions: the emitter and the typed mapping
 //! (merge keys are checked against PyYAML in `suite_test.zig`). Expected
 //! text is derived by hand from YAML 1.2 (§7.3 quoted scalars, §8 block
 //! collections, §10.2 core schema), as each test says.
@@ -232,7 +232,7 @@ test "typed: no leak on any allocation failure" {
     }.f, .{});
 }
 
-// ── tests asked for by the 2026-10-04 mutation run ─────────────────────────
+// ── tests asked for by the mutation run ─────────────────────────
 
 test "emit: a node shared exactly twice is anchored once and aliased once" {
     const a = testing.allocator;
@@ -302,7 +302,7 @@ test "emit: an aliased KEY keeps a space before ':' (an alias name may contain '
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

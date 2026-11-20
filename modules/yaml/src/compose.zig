@@ -154,7 +154,7 @@ const PtrPair = struct { a: usize, b: usize };
 ///     `account()` already enforces on composition) and returns
 ///     `error.TooDeep` past it, so a document whose *value* depth is huge
 ///     because of alias chaining — syntactically shallow, semantically deep,
-///     see `A1/yaml.md` F3 — cannot exhaust the Zig call stack the way plain
+///     see A1 audit F3 — cannot exhaust the Zig call stack the way plain
 ///     recursion did (measured: SIGSEGV at n≈20 000 in Debug).
 ///  2. **Memoization.** Two sub-trees are compared **at most once** per
 ///     distinct pointer pair, cached in `memo`. Without this, comparing two
@@ -327,7 +327,7 @@ pub const Options = struct {
     /// Reject a mapping that repeats a key instead of composing it.
     ///
     /// YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique
-    /// (fetched and read 2026-08-07, https://yaml.org/spec/1.2.2/#3211-nodes:
+    /// (fetched and read, https://yaml.org/spec/1.2.2/#3211-nodes:
     /// "The content of a mapping node is an unordered set of key/value node
     /// pairs, with the restriction that each of the keys is unique"), and the
     /// de-facto reference implementation for Go agrees in practice, not just
@@ -439,7 +439,7 @@ const Budget = struct {
 /// Hard ceiling this module enforces on `Options.max_depth`, regardless of
 /// what a caller configures.
 ///
-/// A1/yaml.md F10: `composeNode` recurses one native call frame per nesting
+/// A1 audit F10: `composeNode` recurses one native call frame per nesting
 /// level, and `account()` only ever compares `depth` against whatever the
 /// caller put in `Options.max_depth` -- nothing stopped a caller from
 /// raising it past `scanner.max_depth` (4096). That field looks like a
@@ -562,7 +562,7 @@ const Composer = struct {
     /// `DupTracker`/`dupEql` steps across the whole document — see
     /// `DupTracker.checkAndInsert`'s doc comment. Same purpose as
     /// `anchor_probes`: a regression test pins the complexity class of the
-    /// duplicate-key check (F1/F2/F3 in A1/yaml.md) on a deterministic
+    /// duplicate-key check (F1/F2/F3 in the A1 audit) on a deterministic
     /// number instead of a stopwatch.
     dup_probes: usize = 0,
     nodes: usize = 0,
@@ -608,7 +608,7 @@ const Composer = struct {
     }
 
     /// The recursion ceiling actually enforced: the caller's `max_depth`,
-    /// clamped so it can never exceed `max_safe_depth` (A1/yaml.md F10).
+    /// clamped so it can never exceed `max_safe_depth` (A1 audit F10).
     /// `@min` only ever tightens a caller's setting, never loosens it.
     fn effectiveMaxDepth(self: *const Composer) usize {
         return @min(self.options.max_depth, max_safe_depth);
@@ -1434,7 +1434,7 @@ test "F1 (A1/yaml.md): two DISTINCT alias chains that agree everywhere but the b
     // path) has to bound. Before the fix: composeAll still returned OK (not
     // a duplicate), but only after ~2^n redundant re-comparisons of the same
     // (a{i}, b{i}) pair (measured: 3.75 s at n=28, 1218 bytes, via
-    // `A1/repro/yaml/bomb2.zig`'s `succeed` mode).
+    // 's `succeed` mode).
     const gpa = testing.allocator;
     const n = 20;
     var src: std.ArrayList(u8) = .empty;
@@ -1486,7 +1486,7 @@ test "F3 (A1/yaml.md): the duplicate-key check does not stack-overflow on a synt
     // time with n well past `max_depth` (1024) -- large enough that the OLD
     // unbounded `valueEql` recursion crashed (measured: SIGABRT/SIGSEGV,
     // stack overflow inside `valueEql`, at n=200 000 in this environment;
-    // A1/yaml.md reports the same signature at n=20 000 on the audit
+    // A1 audit reports the same signature at n=20 000 on the audit
     // machine). `dupEql`'s depth bound turns that crash into a clean,
     // ordinary error instead.
     const gpa = testing.allocator;
@@ -1649,7 +1649,7 @@ test "a malformed document still fails as a parse error" {
     try testing.expectError(error.InvalidYaml, single("[\n"));
 }
 
-// F5 (A1/yaml.md): the suite had zero tests on any of the module's DoS
+// F5 (A1 audit): the suite had zero tests on any of the module's DoS
 // bounds other than the ones F1-F3 just fixed (`reject_duplicate_keys`,
 // `Options.max_depth`, `Options.max_nodes`). The alias table's exact-match
 // lookup was another: a mutation that added a "try one character shorter"
@@ -1823,7 +1823,7 @@ fn fuzzComposeNeverPanics(_: void, smith: *testing.Smith) !void {
     // when fewer remain, so `n` was 1 and `smith.index` was 0 for that one
     // byte: the composer saw the single character `'-'`, and nothing else,
     // ever. Drawing the bytes directly also stops the generator burning eight
-    // input octets per output character. Measured 2026-09-07 over the corpus
+    // input octets per output character. Measured over the corpus
     // above: **1 document composed before, from the single character `-`,
     // under the one budget (1, 1, false); 19 of 20 seeds non-empty, 12
     // composed, 3 AliasCycles and 13 distinct budgets after.**
@@ -1905,7 +1905,7 @@ test "corpus: every document reaches composeAll, and the counts are pinned" {
     }
     // One seed IS the empty document, a legal member of the corpus.
     try testing.expectEqual(compose_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draws, the composer saw the
+    // Measured: with the collapsing draws, the composer saw the
     // single character `-` twenty times, under one budget, (1, 1, false).
     try testing.expectEqual(@as(usize, 12), composed);
     try testing.expectEqual(@as(usize, 11), nodes);
@@ -1969,7 +1969,7 @@ fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
     // one entry, no alias, no cycle, on every single run — and its whole
     // stated purpose is to GUARANTEE anchors, aliases and sometimes a cycle,
     // because random bytes never spell them. It guaranteed an anchor and
-    // nothing else. Measured 2026-09-07 over the corpus above: **1 distinct
+    // nothing else. Measured over the corpus above: **1 distinct
     // document, 0 aliases and 0 cycles before; 7 distinct documents, 19
     // aliases and 2 cycles after.**
     const n: usize = smith.slice(&script);
@@ -2092,7 +2092,7 @@ test "corpus: the anchor/alias generator actually varies, and the counts are pin
             distinct += 1;
         }
     }
-    // Measured 2026-09-07: with the choices drawn from `smith`, the generator
+    // Measured: with the choices drawn from `smith`, the generator
     // emitted `[&a0 42]` — one entry, no alias, no cycle — for every input.
     try testing.expectEqual(@as(usize, 7), distinct);
     try testing.expectEqual(@as(usize, 19), aliases);
@@ -2104,7 +2104,7 @@ test "corpus: the anchor/alias generator actually varies, and the counts are pin
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -362,7 +362,7 @@ test "arbitrary input never panics" {
     //
     // The alphabet used to be pure ASCII indicators/letters -- structurally
     // rich but blind to an entire class this module actually has (F4,
-    // A1/yaml.md): a single invalid-UTF-8 lead byte or a raw control
+    // A1 audit): a single invalid-UTF-8 lead byte or a raw control
     // character changes `charWidth`'s/the scanner's behavior in ways no
     // ASCII byte can trigger. `compose.zig`'s two `testing.fuzz` harnesses
     // stopped being alphabet-restricted already (`97583a0a`, an unrelated

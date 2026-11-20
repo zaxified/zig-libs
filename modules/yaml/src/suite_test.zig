@@ -407,7 +407,7 @@ test "yaml-test-suite: every case reaches exactly its ledger outcome" {
     var ev_pass: usize = 0;
     var js_pass: usize = 0;
     var js_total: usize = 0;
-    // 2026-10-04: the emitter rides on Part 2 (see below).
+    //: the emitter rides on Part 2 (see below).
     var emit_ok: usize = 0;
     var emit_bad: usize = 0;
 
@@ -623,7 +623,7 @@ test "in.json may hold several documents" {
     try testing.expect(docs[2] == .null);
 }
 
-// ── merge keys against PyYAML (2026-10-04) ─────────────────────────────────
+// ── merge keys against PyYAML ─────────────────────────────────
 
 test "merge keys: PyYAML's verdicts (tools/gen_merge_vectors.py)" {
     const gpa = testing.allocator;
