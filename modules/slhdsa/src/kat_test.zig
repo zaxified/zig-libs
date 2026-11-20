@@ -391,3 +391,37 @@ test "pre-hash: digest entry points check lengths; sign(digest) == sign(msg); si
     try std.testing.expect(!Scheme.verifyPrehash(a[0 .. sig_len - 1], msg, kp.pk, "c", .sha3_384));
     try std.testing.expect(!Scheme.verifyPrehash("", msg, kp.pk, "c", .sha3_384));
 }
+
+test "pre-hash digest entry points: a 255-byte context is accepted, a signature over a wrong-length digest never verifies" {
+    var seed: [48]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @truncate(i *% 11 + 5);
+    var kp: Scheme.KeyPair = undefined;
+    Scheme.keyGen(&kp, &seed);
+    const ph = Scheme.PreHash.sha3_384;
+    var dbuf: [64]u8 = undefined;
+    const digest = ph.hash("digest message", &dbuf);
+    try std.testing.expectEqual(@as(usize, 48), digest.len);
+
+    // 255 is the largest context: the digest entry points take it on both sides.
+    const ctx255: [255]u8 = @splat(0xAB);
+    var sig: [sig_len]u8 = undefined;
+    try Scheme.signPrehashDigest(&sig, digest, &kp.sk, &ctx255, ph, null);
+    try std.testing.expect(Scheme.verifyPrehashDigest(&sig, digest, kp.pk, &ctx255, ph));
+
+    // M' = 0x01 || len(ctx) || ctx || OID || digest', signed by hand with a digest' that is one
+    // octet too short, then one too long: valid signatures over those messages, which the
+    // verifier must still refuse because the digest is not the length its PH names.
+    const oid = ph.oid();
+    var mp: [3 + oid.len + 64]u8 = undefined;
+    mp[0] = 0x01;
+    mp[1] = 1;
+    mp[2] = 'c';
+    @memcpy(mp[3..][0..oid.len], &oid);
+    for ([_]usize{ 47, 49 }) |dl| {
+        @memset(mp[3 + oid.len ..][0..dl], 0x5A);
+        const m = mp[0 .. 3 + oid.len + dl];
+        Scheme.signInternal(&sig, m, &kp.sk, null);
+        try std.testing.expect(Scheme.verifyInternal(&sig, m, kp.pk));
+        try std.testing.expect(!Scheme.verifyPrehashDigest(&sig, m[3 + oid.len ..], kp.pk, "c", ph));
+    }
+}

@@ -6,7 +6,7 @@
 
 **Scope:** parity — FIPS 205 as shipped in liboqs 0.16.0 (slhdsa-c) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-05 (11/11) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-20 (223/227, 4 eq) · src a3d4174bd99e2adf
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind; `prf` 9 in-file since Zig 0.17.0, 2026-10-18, was 8: `xmssPkFromSig`'s auth-path direction test on `idx_leaf` at one more unrolled address -- the index is fixed by R, which the signature publishes) · panic 2026-10-30 (sweep + blind review: nothing to fix (every verify total); pin tests only)
 
@@ -167,7 +167,19 @@ Run: `scripts/modtest slhdsa`; fuzz: `SLHDSA_FUZZ=<runs>[,<first seed>]`
   `SLH-DSA-sigVer-FIPS205`, `internalProjection.json` from the ACVP-Server repository), the corpus NIST uses for
   FIPS 205 validation testing; frozen vectors only, no interop program.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
-  and the delta runs after it.
+  and the delta runs after it. The whole-module run (227 mutants, one schemata build over
+  `engine.zig`, `address.zig` and `prehash.zig`) covered base_2^b, both hash instantiations (the PK.seed prefix, the
+  compressed and the full ADRS, F/H/T_l, H_msg with its MGF1 loop, PRF_msg), the WOTS+ chains and checksum, XMSS
+  node / sign / pkFromSig, the hypertree layer and index handling, FORS, every ADRS setter and its byte offset, the
+  key codecs, the pure and pre-hash message prefixes, the 255-byte context bound and the signature and digest length
+  guards of every entry point, and the OID and digest-length tables. 223 killed, 4 equivalent: `j < d - 1` in the
+  hypertree (cost-only: the last layer's root is never read), the `setTreeHeight(0)` in `forsNode` (the clear in
+  `setTypeAndClear` already zeroed that word), and the `- 1` in `(index - 1) / 2` on the right-child branch of
+  `xmssPkFromSig` and `forsPkFromSig` (the index is odd there, so `(odd - 1) / 2 == odd / 2`). Not mutated:
+  `params.zig`, the `PreHash` hash switch and `tree_mask` (comptime, which a runtime switch cannot reach; Table 2
+  and the ACVP vectors pin them) and the stack burns (visible only to the ReleaseFast probe). Two tests came out of
+  it, both in `src/kat_test.zig`: a 255-byte context through `signPrehashDigest` / `verifyPrehashDigest`, and a
+  signature over a wrong-length digest built with `signInternal`, which `verifyPrehashDigest` must refuse.
 
 ## Performance
 
