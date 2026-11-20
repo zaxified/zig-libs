@@ -19,7 +19,7 @@ Hybrid two-lock sealed envelope — see [README.md](README.md) for purpose
 and API. This document is the auditor-facing design + threat model: the
 construction, the field-by-field wire format, what each lock guarantees,
 what an attacker recording the ciphertext today can and cannot do,
-malformed-input handling, and the deliberately deferred list.
+malformed-input handling, and what is deliberately not done.
 
 **Status: REAL — composition only.** No cryptographic primitive is
 implemented here. The three locks are `tlock`, `hqc`, and `chachapoly`
@@ -40,14 +40,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [thibmeu/tlock-rs](https://github.com/thibmeu/tlock-rs) (`tlock_age`) | Rust | MIT | 39 | push 2026-07-13 | README read: age Identity/Recipient for tlock, ASCII armor, interoperable with the Go and JS implementations. |
 | [KhoaNguyen55/zage](https://github.com/KhoaNguyen55/zage) | Zig | MIT | 6 | v0.7.0 (2025-08-13) | Zig age; no time lock *(inferred)*. |
 
-**Where we are ahead:** the only envelope found that requires BOTH a drand time lock AND a post-quantum KEM secret (HQC), bound into the key by HKDF and proven by positive-control tests; pure Zig. **Where we are behind:** one-shot only (`pt_len` is u32, whole plaintext buffered), one recipient, no age/armor interchange (a file sealed here is not readable by `tle`/`age`), a single suite, the time lock itself is not post-quantum (documented).
+**Where we are ahead:** the only envelope found that requires BOTH a drand time lock AND a post-quantum KEM secret (HQC), bound into the key by HKDF and proven by positive-control tests; pure Zig. **Where we are behind:** one recipient, no age/armor interchange (a file sealed here is not readable by `tle`/`age`; deliberate, see *What is deliberately not done*), a single suite, the time lock itself is not post-quantum (documented). The version-1 wire is one-shot (`pt_len` is u32, whole plaintext buffered); the streaming format (wire version 2, `sealStream`/`openStream`, any size in about 128 KiB) covers files of any size.
 
-**Re-assessed 2026-10-06** (no new web survey): the streaming format (wire
-version 2, `sealStream`/`openStream`, any size in ~128 KiB) landed, so a
-`tle`/age user's main use — encrypting a file of any size — is covered; the
-"one-shot only" point above is superseded. Still **behind** (Backlog-grade):
-one recipient, no age/armor interchange (deliberate), a single suite. Scope
-`mvp` → `core`.
 
 ## The construction
 
@@ -137,7 +131,7 @@ parentheses; `hqc_ct` and total scale with the HQC parameter set.
   output itself is authenticated.
 - **Overhead** (`Envelope128`) = 19 + 128 + 4433 + 16 = 4596 bytes.
 
-## Version 2: the streaming format (`stream.zig`, 2026-10-06)
+## Version 2: the streaming format (`stream.zig`)
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
@@ -159,7 +153,9 @@ parentheses; `hqc_ct` and total scale with the HQC parameter set.
   keys apart even for the same lock secrets.
 - **Payload.** `tlock.age.PayloadStream`: per chunk ChaCha20-Poly1305 under
   `K`, nonce `BE88(counter) ‖ last_flag`, empty AD — age's STREAM, the code
-  `tlock`'s Go-`tle` whole-file KAT runs. The sealer reads one byte ahead to
+  `tlock`'s Go-`tle` whole-file KAT runs. Not `aeadframe`: its counter nonce and
+  replay window are a record layer, while age's STREAM with the last-chunk flag is
+  what defeats truncation, and `tlock` already carries a Go-anchored copy. The sealer reads one byte ahead to
   decide whether a full chunk is the last; the opener does the same on the
   wire. Truncation at a chunk boundary (the new final chunk was sealed as
   non-last), reordering, dropping or appending all fail a tag; no payload or
@@ -172,6 +168,14 @@ parentheses; `hqc_ct` and total scale with the HQC parameter set.
   on an error (age has the same property). Pinned by a test.
 - **Memory.** One allocation of about two chunks (~128 KiB) per call, plus
   the prefix on the stack (≤ ~14.6 KiB for HQC-256).
+
+- **Header peek.** `Envelope.peekHeader(prefix)` returns `Header{ version, round }` for either wire
+  from its first `stream.stream_header_bytes` (15) bytes, the prefix both versions share (magic,
+  version, suite, flags, round), so a caller can fetch the beacon signature or show the unlock time
+  before opening (`Envelope.parse` answers `UnsupportedVersion` for a stream). Only the framing is
+  checked (`Truncated` under 15 bytes, `BadMagic`, `UnsupportedVersion` for any version but 1 and 2,
+  `SuiteMismatch`); nothing is authenticated, `open` / `openStream` still check everything. The
+  `timecapsule` example app uses it, seals the stream wire, and still opens version-1 capsules.
 
 Version 1 stays as it is: compact for small secrets, one tag, `pt_len` ≤
 `u32`. Version 2 is for files.
@@ -235,63 +239,19 @@ authenticity failure to `AuthFailed`. A `std.testing.fuzz` harness drives
 `open` with both random and mutated-valid inputs and asserts it never
 panics and never returns a wrong plaintext (see `security_test.zig`).
 
-## Verification
 
-- Round-trip against **real** drand quicknet data: seal to round 1000
-  with quicknet's master public key, open with the published round-1000
-  signature (the same pairing-verified vector `tlock`'s KAT pins). This
-  obtains the round secret deterministically with no live drand.
-- Round-trip across all three HQC parameter sets (`Envelope128/192/256`).
-- The three AND negatives: wrong/absent round signature →
-  `TimeGateClosed`; wrong HQC secret key → `AuthFailed`; different-round
-  signature → `TimeGateClosed`.
-- Per-region tamper: flipping a byte in the round field, `tlock_ct`,
-  `hqc_ct`, tag, or content each fails with a typed error; corrupting
-  magic/version/suite fails at parse; truncation is rejected.
-- Positive controls: an s_pq-dropping KDF is shown to make the
-  wrong-PQ-key attack succeed (so the negative is a real detector), while
-  the real key demonstrably depends on both `s_time` and `s_pq` (and on
-  round/suite/version).
-- **Version 2 (streaming), 2026-10-06** (`stream_test.zig`): round trips at
-  0, 1, 64 KiB ± 1, 128 KiB and 128 KiB + 5 bytes at exactly
-  `streamSealedLen`, and across all three HQC sets. **Anchored:** the
-  payload is byte-exactly `tlock.age.sealPayload` under the key recomputed
-  from the documented derivation, and opens with `tlock.age.openPayload` —
-  the whole-buffer STREAM that decrypts drand's Go-`tle` file. `deriveStreamKey`
-  against a Python HKDF recomputation. Negatives: wrong signature, wrong HQC
-  key, a flipped byte in every header field / both locks / payload, truncation
-  inside the prefix, at each chunk boundary and inside the last chunk, no
-  payload, an appended byte, swapped and dropped chunks, cross-version and
-  cross-suite refusal, allocation failure. **Mutation run 2026-10-06**
-  (schemata, ReleaseSafe, 10 mutants over `stream.zig`: the lookahead bound
-  in sealer and opener, the carried byte, the transcript hash, `round` in
-  `info`, the version/suite/length refusals, the error mapping): 10 killed.
-- **Mutation run 2026-10-05** (in-place, Debug, 19 mutants over
-  `deriveKeys`' ikm/salt/info/key-nonce split, `seal`'s guard, header and
-  AAD, `parse`'s refusals and `open`'s error mapping and KDF input): 19
-  killed. The first pass left 6; tests were added for `deriveKeys` against
-  a Python HKDF recomputation (the salt, the version byte and the nonce
-  offset each survived the "separates" tests, and version — a constant —
-  cannot be varied by them), a trailing byte past the declared length, an
-  undecodable `U` mapped to `MalformedTimeLock` (the tamper test accepts
-  any error), and `PlaintextTooLarge` (a 2³²-byte slice over one byte,
-  never read on the refusal path). Four mutants first written did not
-  compile (an unused parameter) and were rewritten to compile; all four
-  were then killed.
-
-## Deliberately deferred (out of scope)
+## What is deliberately not done
 
 - **Streaming in version 1.** `seal`/`open` stay one-shot (`pt_len` is a
   `u32`); large payloads use version 2 (`sealStream`/`openStream`).
 - **`age`-file / armored interchange format.** This module ships its own
   compact binary envelope, not `filippo.io/age` stanza framing. Interop
-  with drand's `tle` file format is not a goal.
+  with drand's `tle` file format is not a goal (the question is kept under *Backlog / deferred*).
 - **Beacon operation and signature verification.** No drand node, no DKG,
   and no `sig_R`-vs-`p_pub` pairing check (caller's responsibility, as in
   `tlock`).
-- **Multiple recipients / threshold PQ locks.** A single HQC recipient
-  per envelope; N-of-M or multi-recipient KEM wrapping is not modelled
-  yet (multiple recipients: see Backlog).
+- **Threshold PQ locks.** A single HQC recipient
+  per envelope; N-of-M KEM wrapping is not modelled (multiple recipients: see Backlog).
 - **Key/parameter agility beyond the three HQC sets and the single
   ChaCha20-Poly1305 / HKDF-SHA256 suite.** `version`/`suite_id` leave
   room to add suites later; only the shipped one is implemented.
@@ -299,13 +259,43 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
   clear (authenticated, not encrypted) — the envelope hides content, not
   the fact that it targets round `R`.
 
+## Verification
+
+Run `scripts/modtest timelock_envelope`.
+
+- **Real drand data:** round trip against drand quicknet — seal to round 1000 with quicknet's master public key, open
+  with the published round-1000 signature (the same pairing-verified vector `tlock`'s KAT pins), so the round secret is
+  obtained deterministically with no live drand; round trips across all three HQC parameter sets
+  (`Envelope128/192/256`).
+- **The AND negatives:** wrong or absent round signature → `TimeGateClosed`; wrong HQC secret key → `AuthFailed`;
+  different-round signature → `TimeGateClosed`.
+- **Tamper and malformed input:** a flipped byte in the round field, `tlock_ct`, `hqc_ct`, tag or content fails with a
+  typed error; corrupted magic/version/suite fails at parse; truncation, a trailing byte, an undecodable `U`
+  (`MalformedTimeLock`) and `PlaintextTooLarge` are refused; `peekHeader` over either wire's prefix.
+- **Positive controls:** an s_pq-dropping KDF makes the wrong-PQ-key attack succeed (so the negative is a real detector),
+  while the real key demonstrably depends on both `s_time` and `s_pq` (and on round, suite and version); `deriveKeys`
+  is held against a Python HKDF recomputation.
+- **Version 2 (`src/stream_test.zig`):** round trips at 0, 1, 64 KiB ± 1, 128 KiB and 128 KiB + 5 bytes at exactly
+  `streamSealedLen`, and across all three HQC sets. Anchored: the payload is byte-exactly `tlock.age.sealPayload` under
+  the key recomputed from the documented derivation, and opens with `tlock.age.openPayload` — the whole-buffer STREAM
+  that decrypts drand's Go-`tle` file; `deriveStreamKey` against a Python HKDF recomputation. Negatives: wrong signature,
+  wrong HQC key, a flipped byte in every header field / both locks / payload, truncation inside the prefix, at each chunk
+  boundary and inside the last chunk, no payload, an appended byte, swapped and dropped chunks, cross-version and
+  cross-suite refusal, allocation failure; the streaming-release caveat is pinned by a test.
+- **Fuzz:** `TLE_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `tle-open` and `tle-stream`
+  (a once-built genuine envelope / stream against a damaged copy: only a byte-identical copy is accepted, and whatever a
+  stream released before a refusal is a prefix of the genuine plaintext); a run is a pairing plus an HQC decapsulation, so
+  the harnesses run at `.scale`.
+- **Dead stack and constant time:** `src/stackprobe_test.zig` (ReleaseFast) scans the dead stack after `seal`, `open`,
+  `sealStream`, `openStream`; `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh timelock_envelope`) taints both lock
+  secrets through the KDFs and the seal/open randomness, plaintext and HQC decapsulation key through the envelope.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 ## Backlog / deferred
 
-- ~~**Streaming / chunked AEAD framing**~~ — DONE 2026-10-06: wire version 2 (`stream.zig`), age STREAM via `tlock.age.PayloadStream` (not `aeadframe`: its counter nonce and replay window are a record layer, while age's STREAM with the last-chunk flag is what defeats truncation, and `tlock` already carries a Go-anchored copy).
-- ~~**`timecapsule` example on version 2**~~ — DONE 2026-10-06: the app seals the stream wire and still opens version-1 capsules (a genuine v1 capsule is a smoke fixture).
-- ✅ **DONE 2026-11-16 (`Envelope.peekHeader`: version and round of either wire from the shared 15-byte prefix; `timecapsule` uses it):** **Header parser for the version-2 wire** — `Envelope.parse` answers `UnsupportedVersion` for a stream, so a caller that wants the round before opening (to fetch the beacon signature, or to show the unlock time) reads the shared 15-byte prefix by hand; `timecapsule` does (`readHead` in `example-apps/timecapsule/src/main.zig`). Ideal: `Envelope.parseStreamHeader(prefix: []const u8) OpenError!StreamHeader` (round, suite) over the first `stream_header_bytes`, or one `peekHeader` answering for both versions. Effort: small.
-- **age-format interop (stanza + armor)** *(survey 2026-09-30)* — lets `tle` decrypt the time-lock half and gives users armored files. Effort: medium; fits §2. Question: the SPEC says interop is "not a goal" — deliberate, so kept as a question, not a plan.
-- **Multiple recipients** *(survey 2026-09-30)* — age's core feature. Effort: medium; fits §2.
+- **age-format interop (stanza + armor):** lets `tle` decrypt the time-lock half and gives users armored files. Effort: medium; fits §2. Question: interop is deliberately "not a goal" (see *What is deliberately not done*), so this is kept as a question, not a plan.
+- **Multiple recipients:** age's core feature. Effort: medium; fits §2.
+
 
 ## Anchoring
 
@@ -315,5 +305,3 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** drand quicknet vector real+pairing-checked; envelope AND-composition only round-tripped
-
-**How it got there.** No external oracle exists for what remains. AND-composition is this module's own addition on drand; no third party publishes it

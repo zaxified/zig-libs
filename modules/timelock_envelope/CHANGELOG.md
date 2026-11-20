@@ -8,7 +8,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-16** — `Envelope.peekHeader(prefix)` → `Header{version, round}`: the framing and round of a version-1
   envelope or a version-2 stream from their shared 15-byte prefix, before anything is opened (nothing authenticated).
   The `timecapsule` example app drops its hand-rolled prefix reader for it.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README: the `--fuzz` blocker is labelled as a 0.16 finding, not re-run on 0.17.
 - **2026-10-10** — tests: deterministic fuzz driver `TLE_FUZZ` (`src/fuzz_test.zig`): `tle-open` and `tle-stream` open a once-built genuine envelope / stream (real drand quicknet material): the genuine one opens to the exact plaintext; one flipped bit, a truncation (also at a chunk boundary), trailing bytes, a wrong round signature (`TimeGateClosed`), a wrong recipient key and a damaged copy are refused, and what the stream released before refusing is a prefix of the genuine plaintext. ReleaseSafe, clean.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `kdf`, `env`, ReleaseFast). `kdf` taints both lock secrets through `deriveKeys` and `stream.deriveStreamKey` and has 0 in-file contexts. `env` runs `Envelope128.seal`/`open` with the seal randomness, plaintext and HQC decapsulation key tainted. Its 8 in-file contexts are in the dependencies reached through envelope frames: `tlock.encrypt` arithmetic and the compressed encoding of the public ciphertext point, HQC's fixed-weight rejection sampling in `dkParse`, and the AEAD verdict. None is in this module's own code. No code change.
 - **2026-10-09** — **BREAKING, HIGH: the envelope left its secrets in its callers' frames.**
@@ -36,7 +35,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   error. Version 1's `parse`/`open` refuse version 2 (`UnsupportedVersion`) and vice versa.
   Anchored: the payload is byte-exactly `tlock.age.sealPayload`'s (Go-`tle`-proven). Mutation
   run 10/10 killed. Scope mvp -> core.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: streaming and multiple recipients in "Deliberately deferred" now point to their Backlog items ("not yet").
 - **2026-10-05** — Mutation run: 19 of 19 killed, 0 equivalent; 4 tests added
   (`deriveKeys` against a Python HKDF recomputation, trailing bytes refused by
   `parse`, an undecodable time-lock point is `MalformedTimeLock`,

@@ -45,6 +45,7 @@ recording the ciphertext now can and cannot do.
 | `envelope.zig` | The construction: `Envelope(Kem)` generic (`seal`/`open`/`parse`), the HKDF `deriveKeys`, wire constants, error sets; wire-framing + KDF-binding unit tests |
 | `stream.zig` | Wire version 2: `Envelope(Kem).sealStream` / `.openStream` (age STREAM, any size) |
 | `security_test.zig` | Acceptance harness — round-trip vs real quicknet data, the three AND negatives, per-region tamper, malformed-input fuzz, positive controls |
+| `stream_test.zig`, `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | Wire version 2 tests, the deterministic fuzz driver (`TLE_FUZZ`), the dead-stack probe, the constant-time harness |
 
 ## Import
 
@@ -87,6 +88,10 @@ signature), `AuthFailed` (wrong HQC key, or tampered content/header),
 `MalformedTimeLock` / `BadMagic` / `UnsupportedVersion` / `SuiteMismatch`
 / `Truncated` / `LengthMismatch` (malformed wire buffer).
 
+`Env.peekHeader(prefix)` reads the version (1 or 2) and the target round from the first 15 bytes of either wire,
+before anything is opened (framing checked, nothing authenticated), e.g. to fetch the beacon signature or show the
+unlock time; `Env.streamSealedLen(len)` is the total wire size of a version-2 stream.
+
 ### Streaming — files of any size (wire version 2)
 
 ```zig
@@ -105,8 +110,8 @@ Same two locks and the same AND; the content is an age-style STREAM
 `tlock`'s Go-`tle` decryptor runs) under a key that also binds a SHA-256
 of the header and both locks. Truncation, reordering, dropped or appended
 chunks all fail a tag. `openStream` errors: those of `open`, plus
-`MalformedPayload` (no payload / malformed last chunk); `LengthMismatch`
-does not exist here. Version 1 (`seal`/`open`) and version 2 each refuse
+`MalformedPayload` (no payload / malformed last chunk) and the reader's / writer's
+`ReadFailed` / `WriteFailed`; `LengthMismatch` does not exist here. Version 1 (`seal`/`open`) and version 2 each refuse
 the other's wire with `UnsupportedVersion`.
 
 ### Randomness
@@ -161,12 +166,15 @@ zig build test-timelock_envelope -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/timelock_envelope/
 ```
 
-Run `scripts/modtest timelock_envelope` for the module's tests. (The fuzz test's
-body runs deterministically in normal test mode; interactive `--fuzz`
-mode was blocked by an unrelated Zig 0.16 `test_runner` bug (a `StackTrace` type
-mismatch under `-ffuzz`, repo-wide; 0.17.0's `test_runner.zig` no longer mentions
-`StackTrace`, but `--fuzz` was not re-run on 0.17).)
+Run `scripts/modtest timelock_envelope` for the module's tests. Fuzzing is the deterministic driver,
+`TLE_FUZZ=<runs>[,<first seed>]` (harnesses `tle-open` and `tle-stream`); see SPEC.md *Verification*.
 
 Provenance: this module is a clean-room composition; the drand quicknet
 KAT vector it reuses for its timelock round-trip is `tlock`'s, whose
 provenance is in `modules/tlock/NOTICE`. See [SPEC.md](SPEC.md).
+
+## Not provided
+
+Multiple recipients, `age`-file / armored interchange (a file sealed here is not readable by `tle`/`age`), beacon
+operation and `sig_R` verification (the caller's job, as in `tlock`), more than one suite, metadata privacy
+(`round`, `suite_id` and `pt_len` are in the clear): see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
