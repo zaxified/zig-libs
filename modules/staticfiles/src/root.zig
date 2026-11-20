@@ -1259,9 +1259,9 @@ fn isStrongLastModified(io: Io, mtime: Io.Timestamp) bool {
 /// Widest this can produce: `W/` plus two quotes, a separator, and two u64s
 /// at 16 hex digits each. DERIVED rather than picked, because `bufPrint`'s
 /// failure here is `catch unreachable` — a buffer one byte short would not be
-/// an error, it would be a crash on the first large file. It was a bare 48
-/// until, which happened to be enough; shrinking it to 24 broke no
-/// test, since nothing exercised a size or mtime big enough to need the room.
+/// an error, it would be a crash on the first large file. A bare 48
+/// happened to be enough, and shrinking it to 24 broke no test, since nothing
+/// exercised a size or mtime big enough to need the room.
 /// +2 for `W/` (A1 F5, round-2 Q8) on top of that same 24.
 const etag_max = 2 + 2 + 1 + 2 * 16;
 
