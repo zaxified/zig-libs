@@ -726,8 +726,14 @@ pub const default_client_auth_schemes = [_]u16{ 0x0503, 0x0403, 0x0807, 0x0806, 
 pub const Tickets = struct {
     ticketer: Ticketer,
     clock: Clock,
-    /// NewSessionTickets after each handshake (rustls `send_tls13_tickets`).
+    /// NewSessionTickets after each handshake (rustls `send_tls13_tickets`)
+    /// for a client that sends no RFC 9149 `ticket_request`.
     count: u8 = 2,
+    /// The most NewSessionTickets a client's RFC 9149 `ticket_request` gets
+    /// (its `new_session_count`, or `resumption_count` on a resumption,
+    /// capped here; rustls `Tls13Tickets::max`, default 2 as there). The
+    /// count is echoed in the EncryptedExtensions' `ticket_request`.
+    max_requested: u8 = 2,
     /// The `ticket_lifetime` advertised, in seconds (at most 7 days, RFC
     /// 8446 §4.6.1); an older ticket is not resumed. rustls: 12 hours. 0
     /// issues no tickets (a lifetime of 0 tells the client to discard it).
@@ -1330,7 +1336,7 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
     var tickets: usize = 0;
     if (cfg.tickets) |tk| {
         const one = 4 + 4 + 4 + 1 + 1 + 2 + maxTicketLen(cfg) + 2 + 4 + @as(usize, if (cfg.early_data != null) 8 else 0);
-        tickets = tk.count * one;
+        tickets = @as(usize, @max(tk.count, tk.max_requested)) * one;
         tickets += (tickets / frag + 1) * (record.header_len + 1 + record.tag_len);
     }
     // The request may add a record when fragments are small.
@@ -1361,7 +1367,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     const hrr: usize = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
     const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
-        (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4 + 6) + // EncryptedExtensions
+        (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4 + 5 + 6) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
     // Each message may end a record of its own: one more than the content
     // needs per message (HRR, SH, CCS ×2, EE, Certificate, CV, Finished).
@@ -2864,7 +2870,13 @@ pub const Server = struct {
             }
             const modes = ch.psk_key_exchange_modes orelse "";
             if (std.mem.indexOfScalar(u8, modes, psk_dhe_ke) != null) {
-                self.tickets_due = if (tk.lifetime_s == 0) 0 else tk.count;
+                // RFC 9149 §4: the client's wish, within the server's cap
+                // (rustls `Tls13Tickets::resolve`).
+                const want: u8 = if (ch.ticket_request) |r|
+                    @min(if (selected != null) r.resumption_count else r.new_session_count, tk.max_requested)
+                else
+                    tk.count;
+                self.tickets_due = if (tk.lifetime_s == 0) 0 else want;
                 if (selected != null) psk = psk_buf[0 .. suite.hashLen() orelse unreachable];
             } else selected = null;
         }
@@ -3423,7 +3435,7 @@ pub const Server = struct {
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [8]messages.Extension = undefined;
+        var exts: [9]messages.Extension = undefined;
         var n_exts: usize = 0;
         // RFC 9849 §7.1: an offer declined (or a second hello's offer after
         // none on the first) gets the retry configs.
@@ -3468,6 +3480,14 @@ pub const Server = struct {
         // RFC 6066 §3: not when resuming (rustls).
         if (self.sni_len != null and psk == null) {
             exts[n_exts] = .{ .type = 0, .data = "" };
+            n_exts += 1;
+        }
+        // RFC 9149 §3: a server that uses the client's ticket_request says
+        // how many tickets to expect (rustls sends it whenever asked).
+        var expected_count: [1]u8 = undefined;
+        if (cfg.tickets != null and ch.ticket_request != null) {
+            expected_count[0] = self.tickets_due;
+            exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.ticket_request), .data = &expected_count };
             n_exts += 1;
         }
         // RFC 8446 §4.2.10: the early data is taken.
@@ -9496,4 +9516,59 @@ test "peerCertificates: the whole chain the client sent with setPeerChainBuffer,
     s.peer_chain_buf = chain_buf[0 .. 3 + chain_certs.inter_cert.len];
     try testing.expect(try s.onHandshake(handshakeMessage(&msg)) == null);
     try testing.expectEqual(@as(u32, 3 + chain_certs.inter_cert.len), s.peer_chain_len);
+}
+
+test "RFC 9149: ticket_request picks the ticket count within max_requested, echoed in the EncryptedExtensions (rustls)" {
+    const none: u8 = 0;
+    var tickets: Tickets = .{ .ticketer = .{ .ctx = &none, .seal = NoTickets.seal, .open = NoTickets.open }, .clock = .{ .now_ms = NoTickets.now }, .count = 3 };
+    const Case = struct { req: ?[2]u8, max: u8, due: u8 };
+    const cases = [_]Case{
+        .{ .req = null, .max = 2, .due = 3 }, // none asked: `count`
+        .{ .req = .{ 1, 0 }, .max = 2, .due = 1 },
+        .{ .req = .{ 0, 4 }, .max = 2, .due = 0 }, // a full handshake reads new_session_count
+        .{ .req = .{ 5, 1 }, .max = 2, .due = 2 }, // capped
+        .{ .req = .{ 5, 1 }, .max = 8, .due = 5 },
+    };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var msgs: [32 * 1024]u8 = undefined;
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        tickets.max_requested = c.max;
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &tickets };
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const extra = [_]struct { u16, []const u8 }{.{ 58, if (c.req) |*r| r else "" }};
+        const rec = try buildRecord(testing.allocator, .{ .psk_modes = &.{1}, .extra = if (c.req != null) &extra else &.{} });
+        defer testing.allocator.free(rec);
+        const n = try openFirstFlight(&s, rec, &msgs);
+        try testing.expectEqual(c.due, s.tickets_due);
+        const ee = msgs[0 .. 4 + std.mem.readInt(u24, msgs[1..4], .big)];
+        const echoed = std.mem.indexOf(u8, ee, &.{ 0, 58, 0, 1, c.due }) != null;
+        try testing.expectEqual(c.req != null, echoed);
+        try testing.expect(n > ee.len);
+    }
+    // A request of the wrong length is decode_error.
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &tickets };
+    const r = try refuse(.{ .psk_modes = &.{1}, .extra = &.{.{ 58, &.{1} }} }, cfg);
+    try testing.expectEqual(error.DecodeError, r.err);
+}
+
+test "RFC 9149: a resumption takes resumption_count" {
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    for ([_][2]u8{ .{ 2, 1 }, .{ 0, 2 }, .{ 1, 0 } }) |req| {
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{1}, .extra = &.{.{ 58, &req }} }, &t, 0, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expect(r2.s.isResumed());
+        try testing.expectEqual(req[1], r2.s.tickets_due);
+    }
 }

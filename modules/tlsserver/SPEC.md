@@ -157,6 +157,10 @@ is wiped at that moment. `close` queues close_notify and keeps reading.
 **Resumption** (RFC 8446 §2.2, §4.2.11, §4.6.1; rustls 0.23 rules, `Config.tickets`). After
 the client's Finished the server sends `Tickets.count` (2) NewSessionTickets packed into one
 record — none when the client did not offer `psk_dhe_ke`, the only mode served (no `psk_ke`).
+A client's RFC 9149 `ticket_request` sets the count instead: its `new_session_count` after a full
+handshake, its `resumption_count` after a resumption, at most `Tickets.max_requested` (2), and the
+EncryptedExtensions echo the count in their own `ticket_request` (rustls `Tls13Tickets`, which
+resolves and echoes it the same way); a request that is not two octets is `decode_error`.
 Each ticket is a `Ticketer` blob (`StekTicketer`: `tlsresume`'s AES-256-GCM STEK ring, key id
 as AAD, keys past the rotation policy's lifetime refused) over `tlsresume.select.SessionState`
 (resumption master secret over the transcript through the client's Finished, a one-octet nonce
@@ -1000,7 +1004,6 @@ records (the per-record 4 KiB burn).
   `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
   are unobservable today.
 - **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
-- **Ticket count request** (RFC 9149).
 
 ## Open
 

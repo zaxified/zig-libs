@@ -57,6 +57,7 @@ pub const ExtensionType = enum(u16) {
     signature_algorithms_cert = 50,
     key_share = 51,
     quic_transport_parameters = 57,
+    ticket_request = 58,
     renegotiation_info = 0xff01,
     encrypted_client_hello = 0xfe0d,
     _,
@@ -143,6 +144,10 @@ pub const ClientHello = struct {
     /// plaintext (TLS 1.3: content and its type octet) the client takes;
     /// 64 or more (less is `illegal_parameter`).
     record_size_limit: ?u16 = null,
+    /// RFC 9149 `ClientTicketRequest`: the NewSessionTickets the client
+    /// wants after a full handshake (`new_session_count`) and after a
+    /// resumption (`resumption_count`).
+    ticket_request: ?struct { new_session_count: u8, resumption_count: u8 } = null,
     /// RFC 9345 `SignatureScheme signature_algorithms<2..2^16-2>` of
     /// `delegated_credential`: the CertificateVerify schemes the client
     /// takes from a delegated credential.
@@ -325,6 +330,10 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
                 // RFC 8449 §4: below 64 is illegal_parameter.
                 if (v < 64) return error.IllegalParameter;
                 ch.record_size_limit = v;
+            },
+            .ticket_request => {
+                if (data.len != 2) return error.DecodeError;
+                ch.ticket_request = .{ .new_session_count = data[0], .resumption_count = data[1] };
             },
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
