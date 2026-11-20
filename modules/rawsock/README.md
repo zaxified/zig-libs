@@ -98,7 +98,7 @@ const prog = try rawsock.filter.compile(gpa, "udp port 67 or udp port 68");
 defer gpa.free(prog);
 const sock = try rawsock.Socket.open(rawsock.eth_p.all, .{ .filter = prog, .timestamps = true });
 const f = try sock.recv(&buf);            // f.timestamp_ns = kernel receive time
-try rawsock.pcap.writeRecord(&w, .nano, f.timestamp_ns.?, @intCast(f.wire_len), f.bytes);
+try rawsock.pcap.writeRecord(&w, .nano, rawsock.pcap.default_snaplen, f.timestamp_ns.?, @intCast(f.wire_len), f.bytes);
 try sock.joinFanout(7, .hash, .{});       // spread one capture over N sockets
 ```
 

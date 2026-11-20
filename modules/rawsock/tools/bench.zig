@@ -143,7 +143,7 @@ fn once(c: *Ctx) u64 {
         .pcap_write => {
             var w: std.Io.Writer = .fixed(c.out);
             pcap.writeHeader(&w, .{}) catch @panic("bench-rawsock: header");
-            for (c.frames) |f| pcap.writeRecord(&w, .micro, f.ts_ns, @intCast(f.data.len), f.data) catch @panic("bench-rawsock: record");
+            for (c.frames) |f| pcap.writeRecord(&w, .micro, pcap.default_snaplen, f.ts_ns, @intCast(f.data.len), f.data) catch @panic("bench-rawsock: record");
             return w.buffered().len;
         },
         .pcapng_read => {
@@ -340,7 +340,7 @@ pub fn main(init: std.process.Init) !u8 {
         const data = try makeFrame(arena, r);
         const ts_ns = (1_700_000_000 + i) * std.time.ns_per_s + r.uintLessThan(u64, 1_000_000) * 1000;
         f.* = .{ .ts_ns = ts_ns, .data = data };
-        try pcap.writeRecord(&pcap_out.writer, .micro, ts_ns, @intCast(data.len), data);
+        try pcap.writeRecord(&pcap_out.writer, .micro, pcap.default_snaplen, ts_ns, @intCast(data.len), data);
         try pcapng.writeRecord(&ng_out.writer, .nano, ts_ns, @intCast(data.len), data);
     }
     try dir.writeFile(io, .{ .sub_path = "frames.pcap", .data = pcap_out.written() });

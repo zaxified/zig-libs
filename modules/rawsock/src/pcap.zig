@@ -61,17 +61,21 @@ pub fn writeHeader(w: *std.Io.Writer, opts: HeaderOptions) std.Io.Writer.Error!v
 }
 
 pub const RecordError = std.Io.Writer.Error || error{
-    /// More bytes captured than the frame had on the wire, or more than a
-    /// record length field can hold.
+    /// More bytes captured than the frame had on the wire, a time past 2106,
+    /// or more bytes than `Reader` accepts for the file (`max(snaplen,
+    /// default_snaplen)`).
     InvalidRecord,
 };
 
 /// Write one record. `ts_ns` is nanoseconds since the Unix epoch; a µs file
 /// stores it truncated to microseconds (what libpcap does with a kernel ns
 /// timestamp). `orig_len` is the length on the wire (`Frame.wire_len`),
-/// `data` what was captured (`Frame.bytes`, possibly shorter).
-pub fn writeRecord(w: *std.Io.Writer, precision: Precision, ts_ns: u64, orig_len: u32, data: []const u8) RecordError!void {
-    if (data.len > orig_len) return error.InvalidRecord;
+/// `data` what was captured (`Frame.bytes`, possibly shorter). `snaplen` is
+/// the one given to `writeHeader`: a record longer than `max(snaplen,
+/// default_snaplen)` is refused (`InvalidRecord`) because `Reader` (like
+/// libpcap's own reader) would refuse the file at that record.
+pub fn writeRecord(w: *std.Io.Writer, precision: Precision, snaplen: u32, ts_ns: u64, orig_len: u32, data: []const u8) RecordError!void {
+    if (data.len > orig_len or data.len > @max(snaplen, default_snaplen)) return error.InvalidRecord;
     const sec = ts_ns / std.time.ns_per_s;
     if (sec > std.math.maxInt(u32)) return error.InvalidRecord;
     const sub = ts_ns % std.time.ns_per_s;
@@ -248,7 +252,7 @@ test "writeHeader + writeRecord reproduce tcpdump's files byte for byte" {
         while (try r.next()) |rec| : (i += 1) {
             // Always from the ns times: the µs writer must truncate them the
             // way libpcap did.
-            try writeRecord(&w, c[0], tcpdump_ns_times[i], rec.orig_len, rec.data);
+            try writeRecord(&w, c[0], default_snaplen, tcpdump_ns_times[i], rec.orig_len, rec.data);
         }
         try testing.expectEqualSlices(u8, c[1], w.buffered());
     }
@@ -293,11 +297,34 @@ test "Reader: big-endian files, truncation, corrupt lengths, foreign magic" {
 test "writeRecord refuses a capture longer than the frame and a time past 2106" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try testing.expectError(error.InvalidRecord, writeRecord(&w, .micro, 0, 1, &.{ 1, 2 }));
-    try testing.expectError(error.InvalidRecord, writeRecord(&w, .micro, (@as(u64, std.math.maxInt(u32)) + 1) * std.time.ns_per_s, 0, &.{}));
+    try testing.expectError(error.InvalidRecord, writeRecord(&w, .micro, default_snaplen, 0, 1, &.{ 1, 2 }));
+    try testing.expectError(error.InvalidRecord, writeRecord(&w, .micro, default_snaplen, (@as(u64, std.math.maxInt(u32)) + 1) * std.time.ns_per_s, 0, &.{}));
     // The last representable second still writes.
-    try writeRecord(&w, .micro, @as(u64, std.math.maxInt(u32)) * std.time.ns_per_s, 0, &.{});
+    try writeRecord(&w, .micro, default_snaplen, @as(u64, std.math.maxInt(u32)) * std.time.ns_per_s, 0, &.{});
     try testing.expectEqual(@as(usize, record_header_len), w.buffered().len);
+}
+
+test "writeRecord refuses a record the Reader would refuse (snaplen)" {
+    const big = try testing.allocator.alloc(u8, default_snaplen + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0x5a);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // At the default cap and a smaller snaplen: the last accepted size is
+    // default_snaplen, one more byte is refused, and the file reads back.
+    try writeHeader(&out.writer, .{ .snaplen = 64 });
+    try writeRecord(&out.writer, .micro, 64, 1, @intCast(big.len), big[0..default_snaplen]);
+    try testing.expectError(error.InvalidRecord, writeRecord(&out.writer, .micro, 64, 1, @intCast(big.len), big));
+    var r = try Reader.init(out.written());
+    try testing.expectEqual(@as(usize, default_snaplen), (try r.next()).?.data.len);
+    try testing.expectEqual(@as(?Record, null), try r.next());
+    // A larger file snaplen raises the bound exactly as Reader does.
+    var out2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out2.deinit();
+    try writeHeader(&out2.writer, .{ .snaplen = default_snaplen + 1 });
+    try writeRecord(&out2.writer, .micro, default_snaplen + 1, 1, @intCast(big.len), big);
+    var r2 = try Reader.init(out2.written());
+    try testing.expectEqual(@as(usize, default_snaplen + 1), (try r2.next()).?.data.len);
 }
 
 // ── fuzz: the savefile reader ────────────────────────────────────────────────
@@ -356,7 +383,7 @@ fn fuzzPcap(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
         const base = @intFromPtr(file.ptr);
         try testing.expect(@intFromPtr(rec.data.ptr) >= base and @intFromPtr(rec.data.ptr) + rec.data.len <= base + len);
         if (rec.orig_len >= rec.data.len and n_kept < kept.len) {
-            writeRecord(&w, r.header.precision, rec.ts_ns, rec.orig_len, rec.data) catch continue;
+            writeRecord(&w, r.header.precision, r.header.snaplen, rec.ts_ns, rec.orig_len, rec.data) catch continue;
             kept[n_kept] = .{ rec.ts_ns, rec.orig_len, rec.data };
             n_kept += 1;
         }
