@@ -33,11 +33,11 @@ Surveyed 2026-11-18 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## What this module is, and what it is not
 
-`WipingAllocator` is a 60-line `std.mem.Allocator` adapter: `alloc` forwards,
+`WipingAllocator` is a small `std.mem.Allocator` adapter: `alloc` forwards,
 `free` calls `std.crypto.secureZero` over the whole block before `rawFree`,
 `resize` returns `false`, `remap` returns `null`. It was five identical private
 copies (xmlenc, xmldsig, wireguard `wipe.zig`, bbs `burn.zig`, minisign
-`burn.zig`) until the 2026-11 security triage (row xmlenc:338) asked for one.
+`burn.zig`) and is the one place they now share.
 
 Reference behaviour: OpenSSL `OPENSSL_clear_free` and libsodium `sodium_free`
 cleanse a block before releasing it; neither offers an in-place shrink that
@@ -78,18 +78,25 @@ Our own reading of the contract.
 
 ## What is deliberately not done
 
-- **No allocation tracking, no quarantine, no guard pages** (libsodium's `sodium_malloc`
-  does these): this wipes on free and nothing else. **Never.**
-- **No in-place growth** (`mls`'s variant): **not now**; a second allocator type in
-  this module if a second consumer needs it.
+- **No allocation tracking and no quarantine** (libsodium's `sodium_malloc` does
+  these): this wipes on free and nothing else. **Never.** Guard pages / `mlock` and
+  the in-place growth variant are deferred, not refused: see *Backlog / deferred*.
+
+## Verification
+
+- **Run:** `scripts/modtest wipealloc`.
+- **Tests** (`src/root.zig`): a spying child allocator sees an all-zero block on `free`; `resize` and `remap` are refused
+  for growth, shrink and same size; `realloc` growth and shrink wipe the old block and keep the data; the wipe covers
+  the whole block at every alignment and a zero-length free is harmless; an `ArrayList` that grows behind the adapter
+  leaves no secret in the child's freed blocks; `init` and the struct literal are the same adapter and an
+  allocation failure passes through.
+- **Fuzz / constant time:** n/a (see the card's `Hardening` line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Backlog / deferred
 
-- (survey 2026-11-18) **Locked, guard-paged secure heap** (`sodium_malloc`, `OPENSSL_secure_malloc`) — **not now**, a separate allocator; effort medium; no consumer asks.
-- (survey 2026-11-18) **In-place growth variant** (what `mls`'s private `Wiper` does under its arena) — **not now**; see above.
-
-## Open
-
-No survey yet (scope `unsurveyed`) and no independent review (`review none`).
-
-Mutation 2026-11-18 (whole module, schemata, ReleaseSafe): 8 mutants — child allocation dropped, alignment lost on `alloc` and on `free`, `resize` returning true, `remap` returning a pointer, the wipe skipped, the wipe one byte short, `rawFree` skipped — 8 killed, 0 equivalent, 0 survivors (two killed by the child allocator's own alignment checks).
+- **Locked, guard-paged secure heap** (`sodium_malloc`, `OPENSSL_secure_malloc`): deferred, a separate allocator; effort
+  medium; no consumer asks.
+- **In-place growth variant** (what `mls`'s private `Wiper` does under its arena: grow-in-place `resize` forwarded, shrink
+  and `remap` refused): deferred, a second allocator type in this module if a second consumer needs it.
