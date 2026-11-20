@@ -186,15 +186,30 @@ a published construction with vectors) and the oracle may not be `n/a`. Class C/
 means none exists — an internal algorithm, or our own design — and the oracle must
 be `n/a`, because grading one invents anchor debt that cannot be paid.
 
+## Verification
+
+The CURRENT state, for an auditor: how to run the tests (`scripts/modtest <name>`, interop steps), the test classes
+by area, the oracles and goldens (or a pointer to *Anchoring*), the fuzz driver (its prefix and what the harnesses
+cover), the ctgrind rows, and one line saying the card's `**Audit:**` line is the current review/mutation score.
+No dates and no test counts here: they go stale, and the history of how the module got verified is git and
+`CHANGELOG.md`, never a dated diary in this file (CONVENTIONS.md §5).
+
 ## What is deliberately not done
 
 Decisions to refuse work, with the reason. This is the section that stops the
 same proposal arriving every few months — and the one whose absence made a
 separate archive necessary until 2026-08-13. Distinguish **not now** from
 **never** from **superseded by something external**; they are not the same and
-get confused constantly.
+get confused constantly. Every refused item lives here once, with its reason; *Compared with* and
+*Backlog / deferred* point here instead of restating it.
 
 ## Open
 
 What is known to be missing or unverified. An honest gap here is worth more
 than a claim that does not hold.
+
+## Backlog / deferred
+
+Open items only: tasks, deferred work, plans, ideas — each with why it is open and what doing it needs. A finished
+item leaves (its record is `CHANGELOG.md` and git; its design moves into the sections above or the README); a
+refused one goes to *What is deliberately not done*. `None open.` when there is nothing.

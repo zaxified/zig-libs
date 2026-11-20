@@ -421,6 +421,10 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | the catalog's Platform cell | `meta.platform_note` in the module's `src/root.zig` | same — generated |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |
+| what is open (tasks, deferred, planned) | `## Backlog / deferred` of `modules/<m>/SPEC.md` — open items only | finished work is CHANGELOG + git; its design lives in SPEC's design sections or the README, never as a struck or "DONE" Backlog item |
+| what is refused, and why | `## What is deliberately not done` of `modules/<m>/SPEC.md` — once | *Compared with* names the refusal and points there; README's `## Not provided` names it in one line |
+| how the module is verified | `## Verification` of `modules/<m>/SPEC.md` — the CURRENT test classes, oracles, fuzz drivers, ctgrind rows; no dates, no test counts | the card's `**Audit:**` line carries the current review/mutation score; README's `## Verification` says how to run |
+| audit history (dated reviews, mutation runs, equivalent-mutant arguments, first-run findings) | nowhere in this repository: git history and the module CHANGELOG | SPEC states only the current state and the card's score — a dated diary in SPEC is how a reader lost the current state (doc audit, 2026-11-20) |
 | license attribution / provenance | `modules/<m>/NOTICE` — the root `NOTICE` answers only whether the library AS A WHOLE is still plain MIT, and names no module | README/SPEC only point to it, never restate the terms |
 | which modules have a LIVE external peer | `.live` on the `module_list` entry | `zig build module-graph` publishes it; the shell scripts derive theirs from that, never a list of their own |
 | which modules have a constant-time harness | `modules/<m>/src/ctgrind_harness.zig` **existing** | derived — build.zig scans for it, `module-graph` publishes it, `scripts/checks/ctgrind.sh` reads it from there |
@@ -502,7 +506,9 @@ Running an installed third-party binary purely as a black-box compatibility
 test oracle (e.g. diffing output against `tar`/`nft`) is neither of the above and needs no entry.
 
 **Non-overlap rule:** README answers "how do I use this" (consumer altitude); SPEC
-answers "how/why was this built, and what could go wrong" (auditor altitude). A module's
+answers "how/why was this built, and what could go wrong" (auditor altitude). README keeps no
+deferred, backlog or roadmap list of its own (one `## Not provided` line pointing at SPEC), and SPEC keeps no
+`Status` section restating `meta` (both drifted in every module that had one). A module's
 purpose is a full paragraph in the README and only a title + link back to the README in
 SPEC. Seed/provenance detail lives in `NOTICE`; README/SPEC merely reference it (a short
 `Provenance:` line pointing at the NOTICE entry, not a restatement of it).
@@ -844,10 +850,13 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   backwards: widening a return type is one line every consumer must recompile against, and
   re-flowing a match is 200 lines nobody can observe; the `test` exclusion is load-bearing here
   because tests live in `src/` (§7), so without it a batch of regression tests reads as a
-  rewrite. The comparison is the base ref against the tree — CI passes the push or PR base and
+  rewrite; a `*_test.zig` file does not count at all (its helpers outside `test` blocks are test code too). The comparison is the base ref against the tree — CI passes the push or PR base and
   that run is the authority; the pre-commit hook asks the same question of one commit and is
-  early, not authoritative. **A change that genuinely cannot be seen from outside the module
-  still writes the bullet**, in the same dated form, marked `**NO CONSUMER-VISIBLE CHANGE:**` —
+  early, not authoritative. **A src change the gate counts that genuinely cannot be seen from outside
+  the module still writes the bullet**, in the same dated form, marked `**NO CONSUMER-VISIBLE CHANGE:**`
+  (a refactor, a Zig migration). **A commit that changes only tests, mutation records, the card, SPEC,
+  README or tools writes no bullet** (owner, 2026-11-20): its record is git; about 1270 such bullets, a
+  fifth of all entries, had buried the ones a consumer reads. That marker is the escape —
   there is no exemption flag, no allow-list and no per-module table, for the same reason the
   `**BREAKING` index and `FUZZ-EXEMPT.tsv` were both retired on 2026-08-14, and the gate names
   every module that used the escape on every run so it is counted rather than hidden. The root
