@@ -542,5 +542,5 @@ foreign SA master computes the same.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** goldens.zig: live captured sessions vs real opendnp3 peer, both directions
+**What the tests actually contain.** `src/goldens.zig` replays complete data-link frames captured from live TCP sessions with a real opendnp3 3.1.x peer, both directions (each golden is labelled CAPTURED or SELF-DERIVED; the sessions are ordered and stateful, replayed on an injected clock). Secure Authentication has no live foreign peer: `src/secure_auth.zig` pins a whole exchange against vectors derived outside the module by `tools/sa_outstation_kat.py` (see the *Anchoring* paragraph under Secure Authentication). The remaining codec paths are self-tested.
 

@@ -156,7 +156,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all state is caller-held values
-    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 and P256-SHA256 configurations, 3DH AKE, internal-keying Envelope (§4.1), KSF = pluggable (default Identity, see Ksf); OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
+    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 and P256-SHA256 configurations, 3DH AKE, internal-keying Envelope (§4.1), KSF = pluggable and mandatory, no default (Identity only for the RFC vectors, see Ksf); OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
     .deps = .{ "voprf", "ct25519" },
 };
 

@@ -232,4 +232,4 @@ None open.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/kernel_oracle.zig grades this module's Reassembler verdict against the real Linux kernel's own IPv4/IPv6 fragment reassembly, 6 scenarios x {v4,v6} = 12 captured comparisons; the emit/fragmentation side and the overlap policy beyond those scenarios stay self
+**What the tests actually contain.** src/kernel_oracle.zig grades this module's Reassembler verdict against the real Linux kernel's own IPv4/IPv6 fragment reassembly, 6 scenarios x {v4,v6} = 12 captured comparisons plus one IPv4-only adversarial capture (`zero_length_final_duplicate`) = 13 (11 matches, 2 documented divergences); the emit/fragmentation side and the overlap policy beyond those scenarios stay self

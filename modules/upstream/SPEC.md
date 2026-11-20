@@ -114,8 +114,8 @@ responsibility, not this module's.
   breaker trip, skip and re-admission after the cooldown; bulkhead-full skipping; `call()` failover (`max_tries`,
   last error, `NoHealthyUpstream`); `healthTick` marking down/up, interval gating, and the breaker walking
   `open → half_open → closed`; per-upstream and pool stats.
-- **Ring oracle:** ring owners are held to Python's `xxhash` package driven as a black box (the expected values
-  are frozen in the test, which builds the same ring by the documented rule), plus the key distribution over
+- **Ring oracle:** ring owners are held to Python's `xxhash` package driven as a black box in a one-off run (the expected values
+  are frozen in the test, which builds the same ring by the documented rule; no tool is kept in the module), plus the key distribution over
   weights 1:2:3. Invariants: removal moves only the removed member's keys, an added member takes keys only for
   itself, a down owner's keys walk on while everyone else's stay, a key spelled like a point lands on that
   point's member, the ring bound.

@@ -1582,8 +1582,9 @@ pub const seccomp = struct {
         /// match; fine for tens of rules, and the smallest program.
         linear,
         /// Binary search over the distinct syscall numbers (like libseccomp's
-        /// optimize level 2): about `2·log2(n) + 2` instructions to reach a
-        /// syscall's rules, however many there are. Rules of one number keep
+        /// optimize level 2): about `log2(n) + 4` instructions to reach a
+        /// syscall's rules (a counting interpreter in the tests measures
+        /// at most 15 for 256 numbers, over 250 linear), however many there are. Rules of one number keep
         /// their order, so the decision is the same as `.linear`'s — only the
         /// path to it differs. The program is a little longer (two
         /// instructions per number); opt in for lists past ~50 numbers.

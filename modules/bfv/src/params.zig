@@ -8,8 +8,8 @@
 //! The `test_tiny` set (`N=8`) is for exhaustive/byte-exact KAT and pins the
 //! same primes the external Python re-derivation used. The `bfv_toy` set is a
 //! small-but-realistic RLWE dimension for property tests once the scheme core
-//! lands. Security-grade sets (`N≥4096`, ~128-bit) are a later increment —
-//! Part 1 does not claim any security level (see SPEC.md "Security status").
+//! lands. Only `sec_n8192_logq218` claims a security level (see SPEC.md
+//! "Security status"); the other sets are correctness-only toys.
 
 const std = @import("std");
 const ma = @import("modarith.zig");

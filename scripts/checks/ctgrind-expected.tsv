@@ -152,24 +152,24 @@
 #
 # ⚠ EVERY NON-ZERO BELOW IS NAMED, and none of them is a leak. In order:
 #   dh 1        `q.rejectIdentity()` at the end of k256's constant-time ladder
-#               (group.zig:278) -- a branch on "the product was the identity",
+#               (k256 group.zig, `mulInner`) -- a branch on "the product was the identity",
 #               reachable only for k == 0 mod n. Same class k256's own table
 #               already accounts for.
 #   keygen 3    the invalid-secret rejections of `generateDeterministic`:
-#               scalar canonicality (common.zig:75 via scalar.zig:87),
-#               `if (d.isZero())` in bolt8's own dh.zig:80, and the same
-#               `rejectIdentity` inside `combMulBaseWithTable` (group.zig:347).
+#               scalar canonicality (std pcurves `common.zig`, via `scalar.zig`),
+#               `if (d.isZero())` in bolt8's own `dh.zig`, and the same
+#               `rejectIdentity` inside `combMulBaseWithTable` (k256 group.zig).
 #               All three reject a key that would be discarded anyway.
-#   act3 6      2x std's `if (!verify)` tag check (chacha20.zig:713) -- branching
+#   act3 6      2x std's `if (!verify)` tag check (std chacha20 decrypt) -- branching
 #               on the ANSWER is the API, and the comparison producing it is
 #               std's constant-time one; plus 4 from decompressing the peer's
-#               static key (group.zig:116/123/124, field.zig:162, sqrt at
-#               field.zig:306) and one ECDH `mul`. `rs` is the peer's PUBLIC key,
+#               static key (k256 `recoverY` and its field reduction and
+#               square root) and one ECDH `mul`. `rs` is the peer's PUBLIC key,
 #               but it arrives by decryption under a tainted key, so memcheck
 #               cannot know that -- an artefact of the taint model, stated
 #               rather than patched around.
 #   transport 3 2x the same tag check, and `if (c.len != out.len + 16)` in
-#               bolt8's transport.zig:149. The length came from `recvLength`,
+#               bolt8's `recvMessage` in transport.zig. The length came from `recvLength`,
 #               i.e. from a decryption under a tainted key; a BOLT#8 message
 #               length is a public property of the frame.
 #
@@ -403,20 +403,25 @@ ed448	ReleaseFast	ladder	1	0	4cff9e0393290913	43db8426e0d6c6e7
 #   written for this measurement. The trade taken: 38 secret-dependent branch
 #   contexts out of the module's hottest secret path, for ~7% on a PQ KEM.
 #
-# Attribution, ReleaseFast, decaps (14) — `prng.zig:289`, which was 38 of the
-# old 52, is GONE; everything below is what it always was:
-#   gf256.zig:114   4   `if (s >= 255) s -= 255` — log-table reduction.
-#   gf256.zig:113   3   `if (a == 0 or b == 0)` — GF(256) multiply short-circuit.
-#   prng.zig:268    3   `if (found) support[idx] = …` — duplicate fixup.
+# Attribution, ReleaseFast, decaps (14) — the scatter in `prng.zig` (38 of the
+# old 52) is GONE; everything below is what it always was (the counts are those
+# of the 14 / 4 / 6 state; the later fixes below reduced them):
+#   gf256 `mul`/`inverse`  4+3  the log-table reduction `if (s >= 255) s -= 255`
+#                               and the multiply short-circuit `if (a == 0 or b == 0)`
+#                               of the exp/log-table form (since replaced by the
+#                               carryless multiply, see the 2026-09-09 fixes below).
+#   `sampleFixedWeightBiased` 3 `if (found) support[idx] = …` — duplicate fixup.
 #   reedsolomon     2   inlined, no line info (computeElp and encode).
-#   prng.zig:216    1   `if (val < threshold) break` — rejection sampling.
-#   prng.zig:223    1   `if (s == val) dup = true` — duplicate detection.
+#   `sampleFixedWeightRejection` 1+1  `if (val < threshold) break` (rejection
+#                               sampling) and `if (s == val) dup = true`
+#                               (duplicate detection).
 #
-#   keygen (4): prng.zig:216 ×2, prng.zig:223 ×2 — the rejection loop only.
-#   encaps (6): prng.zig:268 ×3, gf256.zig:114 ×2, reedsolomon ×1.
+#   keygen (4): the rejection loop and the duplicate detection of
+#               `sampleFixedWeightRejection`, ×2 each.
+#   encaps (6): the duplicate fixup ×3, the log-table reduction ×2, reedsolomon ×1.
 #
 # `sampler` is 2, not 40, ON PURPOSE: that target drives the fixed-weight
-# rejection sampler only (prng.zig:216 and :223) and never reaches the scatter,
+# rejection sampler only (`sampleFixedWeightRejection`) and never reaches the scatter,
 # which runs later when the support is turned into a bit vector. It isolates
 # the loop so a change there is attributable; it is not a smaller measurement
 # of the same thing. It is unchanged by the barrier, which is the expected
@@ -446,9 +451,9 @@ ed448	ReleaseFast	ladder	1	0	4cff9e0393290913	43db8426e0d6c6e7
 # The last three cost nothing measurable; the 7.3% is the algorithm swap alone.
 #
 # ⭐ Everything left, in EVERY target, is `sampleFixedWeightRejection`
-# (prng.zig:216 the rejection loop, :223 the accept decision). Spec v5.0.0 §3.5
+# (the rejection loop and the accept decision). Spec v5.0.0 §3.5
 # REQUIRES that sampler for keygen's x/y, and decaps re-derives y from the seed
-# on every call because the spec fixes a seed-sized dkKEM. ⛔ Do NOT mask :223 to
+# on every call because the spec fixes a seed-sized dkKEM. ⛔ Do NOT mask the accept decision to
 # make this number smaller: the leak is the ENCLOSING loop's trip count, so the
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
@@ -1283,9 +1288,9 @@ cookies	ReleaseFast	topen	1	2	d911f7fe96de42e9	c63e696876bcc630
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.
 #
 # ⛔ Both rows are pinned at 1 and a 0 would be WRONG on both.
-#  * `query` 1 = `pir.zig:146` `if (index >= domain_size)`, a contract check on
+#  * `query` 1 = `Pir.query`'s opening `if (index >= domain_size)`, a contract check on
 #    a PUBLIC bound whose outcome the caller already knows (it chose the index).
-#  * `reconstruct` 1 = `verify.zig:453` `if (diff != 0) return AnswerRejected`,
+#  * `reconstruct` 1 = the `if (diff != 0) return error.AnswerRejected` at the end of `verify.zig`'s reconstruct,
 #    which SPEC.md calls "the protocol's own public output" -- the abort is
 #    visible by definition.
 # What the claim forbids is a branch revealing WHICH word mismatched, and the
@@ -2113,29 +2118,29 @@ aaa-gate	ReleaseFast	basic	2	2	5b16b73ae1b353b6	3e1202ab86ba6261
 # kex *_shared: sharedSecret from a tainted private key; *_server: serverExchange with a
 # tainted random source (the draws ARE the ephemeral private key / ML-KEM `m`).
 #   x25519, p384, mlkem1024_server, x25519mlkem768_server: 0.
-#   p256_shared 3 / p256 half of p256mlkem768_shared (+3): p256 module ecdh.zig:55 and :56
-#     (identity / on-curve verdicts) and group.zig:567 `mulCtWindowed` (the same context as
+#   p256_shared 3 / p256 half of p256mlkem768_shared (+3): p256 module `ecdh.zig`'s two
+#     checks (identity / on-curve verdicts) and group.zig's `mulCtWindowed` (the same context as
 #     hpke p256_decap's), all in the p256 module's code.
 #   *_server on a NIST curve (p256 6, p384 2, p256mlkem768 6, p384mlkem1024 2):
-#     "rejection-sampling verdict" (kex.zig generateNistAt :301/:302: a candidate >= n or
+#     "rejection-sampling verdict" (kex.zig `generateNistAt`: a candidate >= n or
 #     zero is redrawn; reveals only that a discarded draw was out of range, p ~ 2^-32 / 2^-190),
-#     plus for p256 the same p256 module contexts as above and group.zig:694
+#     plus for p256 the same p256 module contexts as above and group.zig's
 #     `combMulBaseFastWithTable`.
-#   ML-KEM groups *_shared (37 / 40 / 65 / 65): std ml_kem.zig:1950 `sampleUniformRejection`
+#   ML-KEM groups *_shared (37 / 40 / 65 / 65): std ml_kem.zig `sampleUniformRejection`
 #     (36 / 36 / 64 / 64 contexts: the public matrix A is sampled from rho, which is derived
 #     from the TAINTED keygen seed; rho is public in the encapsulation key) + 1 std `ctneq`
-#     FO verdict (ml_kem.zig:1429); the p256 hybrid adds the 3 p256 contexts above.
+#     FO verdict (std ml_kem.zig `ctneq`); the p256 hybrid adds the 3 p256 contexts above.
 #     std's, all of them: tls13 re-expands the compact seed per FIPS 203.
 # sign_*: certverify.sign with the key tainted. p384 / p521: 0 (the modules declassify the
 # signature; ctgrind_key= prints are the taint-arrival witness). p256 23: the p256 module's
 # signer (std deterministicScalar rejection/Field.fromBytes, ecdsa finalizePrehashed r/s == 0
 # verdicts, combMulBaseFastWithTable) + `rawToDer`/memcpy of the signature, which that module does
 # not declassify: branches on the published signature. ed25519 4: std Ed25519 `pcMul16`
-# edwards25519.zig:269 (x2: the seed -> public key derivation and the nonce commitment), std
-# ed25519.zig:376 (mem.eql of two public keys) and certverify.zig:726 (OUR code: the verdict of
+# edwards25519.zig (x2: the seed -> public key derivation and the nonce commitment), std
+# ed25519.zig (mem.eql of two public keys) and certverify.zig's `sign` (OUR code: the verdict of
 # the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
-# the key is inconsistent). rsa 2: rsa module root.zig:1206 (blinding pair redraw verdict,
-# ~2^-1023) and :1296 (Bellcore fault-check verdict `m^e == c`); both are the rsa module's.
+# the key is inconsistent). rsa 2: rsa module's blinding pair redraw verdict
+# (~2^-1023) and its Bellcore fault-check verdict `m^e == c`; both are the rsa module's.
 tls13	ReleaseFast	ks256	1	0	7dc93487f16296dd	18a96cec5170f807
 tls13	ReleaseFast	ks384	1	0	7dc93487f16296dd	db1fe2ab079078cc
 tls13	ReleaseFast	x25519_shared	1	0	ed80464b8e0301c2	d94c3e5680258153

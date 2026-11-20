@@ -3,16 +3,16 @@
 //! arrow — Apache Arrow IPC (stream and file format) for `dataframe.Frame`.
 //!
 //! `writeStream` / `readStream` turn a whole frame into an Arrow IPC stream and
-//! back (waves A2 + A3 of the plan in SPEC.md). Underneath: the FlatBuffers layer
+//! back. Underneath: the FlatBuffers layer
 //! (`fb`) Arrow's metadata is written in, the schema tables (`schema`) and the
 //! message framing (`ipc`). `writeFile` / `readFile` / `openFile` do the same for the
-//! IPC file format (wave A4), with random access to a record batch, and ZSTD and
-//! LZ4_FRAME body compression both ways (wave A5; `WriteOptions.compression`).
+//! IPC file format, with random access to a record batch, and ZSTD and
+//! LZ4_FRAME body compression both ways (`WriteOptions.compression`).
 
 const std = @import("std");
 
 pub const meta = .{
-    .doc = "Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD and LZ4_FRAME body compression; hardening in progress)",
+    .doc = "Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD and LZ4_FRAME body compression)",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,

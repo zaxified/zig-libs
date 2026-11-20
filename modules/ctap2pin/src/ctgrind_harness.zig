@@ -6,9 +6,8 @@
 //! `timing_safe.eql`/`verify` claim ("both `verify`s compare MACs in
 //! constant time and fail closed"), as an actual committed program instead
 //! of a paragraph nobody re-runs. Run it through
-//! `../../../scripts/checks/ctgrind.sh ctap2pin` once the coordinator adds this
-//! module's config block to that shared script (the suggested
-//! TARGETS/MODES/PATTERN lines are below); until then, by hand:
+//! `../../../scripts/checks/ctgrind.sh ctap2pin`, which holds this module's
+//! TARGETS/MODES/PATTERN config; by hand:
 //!
 //!     zig build ctgrind -Dctgrind-module=ctap2pin -Dctgrind-valgrind=true  -Doptimize=ReleaseFast
 //!     zig build ctgrind -Dctgrind-module=ctap2pin -Dctgrind-valgrind=false -Doptimize=ReleaseFast   # the no-`-fvalgrind` trap row
@@ -20,17 +19,6 @@
 //! build check-ctgrind` (module-wide, not filterable by `-Dctgrind-module`)
 //! still compiles this file at Debug so it cannot rot into an unbuildable
 //! recipe; that compile proves nothing about any one context count.
-//!
-//! Suggested `scripts/checks/ctgrind.sh` config (added here as a comment only —
-//! that script is coordinator-owned, per this task's instructions):
-//!
-//!     TARGETS[ctap2pin]="ecdh one two token"
-//!     MODES[ctap2pin]="ReleaseFast"
-//!     PATTERN[ctap2pin/ecdh]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig'
-//!     PATTERN[ctap2pin/one]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|sha2[.]zig'
-//!     PATTERN[ctap2pin/two]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|hkdf[.]zig|sha2[.]zig'
-//!     PATTERN[ctap2pin/token]='root[.]zig|hmac[.]zig|sha2[.]zig'
-//!     LABEL[ctap2pin]="ctap2pin ECDH+PIN/token"
 //!
 //! ## The four targets
 //!
@@ -105,7 +93,7 @@
 //! `p256`'s round-1 `sign` harness already measured (1 context, std's
 //! `crypto/pcurves/common.zig:75`): expect the same negligible-probability
 //! shape here, not a new finding, and it is why `common[.]zig`/`scalar[.]zig`
-//! are in this harness's suggested PATTERN rather than left to fall into
+//! are in the PATTERN in ctgrind.sh rather than left to fall into
 //! `unattr`.
 //!
 //! ## The second p256 path: `mulCtWindowed`

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for the readers (wave A6): `readStream`, and
+//! Deterministic fuzz driver for the readers: `readStream`, and
 //! `openFile` + `File.readBatch` / `readAll`, over hostile input.
 //!
 //! The harness is generic over its source of choices (testkit's fuzz driver

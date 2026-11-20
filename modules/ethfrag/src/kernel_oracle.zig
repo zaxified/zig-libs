@@ -38,7 +38,7 @@
 //! reassembled this", not a claim about the kernel's actual multi-second
 //! reassembly-queue expiry).
 //!
-//! ## Capture recipe (six scenarios × {IPv4, IPv6} = 12 captures)
+//! ## Capture recipe (six scenarios × {IPv4, IPv6} = 12 captures, plus one IPv4-only adversarial capture)
 //! A 32-byte UDP payload (`8 + 32 = 40`-byte UDP datagram, split into three
 //! chunks at offsets 0/16/32 -- all multiples of 8, satisfying IPv4's
 //! 8-byte fragment-offset granularity and IPv6's identical Fragment

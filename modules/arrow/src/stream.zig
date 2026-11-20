@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! A whole `dataframe.Frame` to and from the Arrow IPC stream format: the type
-//! mapping (wave A2) and the stream writer and reader (wave A3).
+//! mapping and the stream writer and reader.
 //!
 //! Writer: one `Schema` message, one `DictionaryBatch` per dictionary-encoded
 //! column (the whole dictionary, before any record batch), the rows in

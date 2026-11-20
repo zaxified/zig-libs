@@ -70,8 +70,8 @@ gates — `testPolynomial`, `bootstrap`/`PreparedBootstrapKey.bootstrapBig`,
 | Bytes | `codec.zig` | header + tfhe-rs-ordered payload for ciphertexts, client/server/bootstrap/key-switch keys |
 
 Speed (ReleaseFast, one core, `tfhers_default`): a gate ≈ 0.25 s, MUX ≈ 0.5 s,
-key generation ≈ 2 s. tfhe-rs's f64 FFT with SIMD is roughly 20× faster per
-gate; this module trades that for exact integer arithmetic and no floating point
+key generation ≈ 2 s (the module's own `src/bench.zig`). tfhe-rs's f64 FFT with SIMD is expected to be
+faster per gate (not measured here, so the card has no ratio); this module trades that for exact integer arithmetic and no floating point
 in the evaluation path (see `SPEC.md`).
 
 ## Verify

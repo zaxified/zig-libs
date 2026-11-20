@@ -284,7 +284,7 @@ algorithms and for a file larger than the CLI's 64 KiB streaming chunk size
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** byte-exact vs real minisign 0.12 binary, README
+**What the tests actually contain.** `src/kat_vectors.zig` holds public key, signature and secret key files generated with the real minisign 0.12 binary (prehashed and legacy signatures, an unencrypted and a password-protected key), each verified by `minisign -V` before it was transcribed; `src/kat_test.zig` checks this module parses and verifies them byte-exactly. The rest (negative cases, the key-file KDF limits) is self-tested.
 
 ## Performance
 

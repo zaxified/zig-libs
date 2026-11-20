@@ -497,11 +497,14 @@ pub const SecurityHeaders = struct {
         return sh;
     }
 
-    /// Sum of every header's name+value byte length `apply` would copy into
-    /// `http.Server.ResponseWriter.header_buf` for `sh.options` — mirrors
-    /// `apply`'s own field list and conditions exactly (same order doesn't
-    /// matter here, only the same *set*), so it cannot drift out of sync
-    /// with what `apply` actually does short of editing both in lockstep.
+    /// Sum of every header's name+value byte length `apply` emits for
+    /// `sh.options` — mirrors `apply`'s own field list and conditions exactly
+    /// (same order doesn't matter here, only the same *set*), so it cannot
+    /// drift out of sync with what `apply` actually does short of editing
+    /// both in lockstep. It counts the lent and static values too, although
+    /// `apply` copies only HSTS and `extra` into `header_buf`: `init`'s check
+    /// against `header_buf`'s size is therefore a conservative upper bound,
+    /// and `apply` itself can only fail on the copied part.
     fn appliedHeaderBytes(sh: *const SecurityHeaders) usize {
         const o = &sh.options;
         var total: usize = 0;
