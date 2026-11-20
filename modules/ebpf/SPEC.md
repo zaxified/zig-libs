@@ -306,6 +306,23 @@ likewise semantic, not cosmetic: it decides whether a descendant cgroup may
 attach a program of the same type and whether it *replaces* or *adds to*
 this one. The default (neither flag) is exclusive ownership of the slot.
 
+### Multi-target and chain-ordered links (`bpflink.zig`)
+
+`linkCreateKprobeMulti` / `linkCreateUprobeMulti` attach ONE program to many kernel functions (5.18) or file offsets
+(6.6) in a single `BPF_LINK_CREATE`. The kernel takes **either** symbol names **or** addresses for kprobes (never
+both, never neither), a cookie array that is empty or exactly as long as the targets, and at most 2^20 of them; the
+builders refuse the rest as `error.InvalidOptions` before the syscall. The attr is built zeroed and copied into (`WideCreateAttr`,
+64 bytes): the kernel requires every byte after the last field it knows to be zero, and a union copied by value can
+carry undefined tail bytes. `selectKprobeSymbols(gpa, listing, glob)` picks names from a tracefs
+`available_filter_functions` listing (`*` and `?`; duplicates removed, `[module]` suffixes dropped), the form libbpf's
+`attach_kprobe_multi_opts(pattern)` resolves a glob into; reading that file is the caller's. `linkCreateTcx` /
+`linkCreateNetkit` (6.6 / 6.7) take an ifindex, `MprogOptions.placement` (`default`, `first`, `last`, `before`/`after` a
+program or link given by fd or id: the kernel's `BPF_F_BEFORE/AFTER/ID/LINK` flag combinations) and an
+`expected_revision` (read it with `bpfsys.progQuery`; the attach fails with `EAGAIN` when the chain changed). The
+relative fd and id are one union in the kernel at attr offset 16 (the earlier `CreateExtra.tcx` declared them as two
+fields, putting the id at the wrong offset). Layouts are pinned against `<linux/bpf.h>`. Not verified against a live
+kernel here.
+
 ## Ring-buffer consumer: ABI and barrier discipline
 
 ### mmap layout
@@ -1014,11 +1031,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the
   running kernel's BTF verifier predates them. Here `BPF_BTF_LOAD` simply fails and `LoadOptions.load_btf = false` is the
   escape hatch.
-- **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the `kprobe_multi`/`uprobe_multi` union arms):
-  attaching one program to thousands of symbols in a single call. The attr arms are declared in `bpflink.CreateExtra`; the
-  symbol/address array marshalling and the kallsyms-glob resolution are not.
-- **`tcx` / `netkit` attach**: declared in `CreateExtra` (including the `relative_fd`/`expected_revision` ordering fields)
-  but not driven by an entry point; needs 6.6+/6.7+ and has no consumer here yet.
 - **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the semaphore a USDT probe needs, but finding it means
   parsing the `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the argument descriptor string), a
   separate parser on top of `elfsym`.

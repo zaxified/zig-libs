@@ -195,6 +195,20 @@ pub const linkCreateCgroup = bpflink.linkCreateCgroup;
 pub const linkCreateXdp = bpflink.linkCreateXdp;
 pub const linkCreateNetns = bpflink.linkCreateNetns;
 pub const linkCreateTracing = bpflink.linkCreateTracing;
+/// One program on many kernel functions / file offsets in one call.
+pub const linkCreateKprobeMulti = bpflink.linkCreateKprobeMulti;
+pub const linkCreateUprobeMulti = bpflink.linkCreateUprobeMulti;
+pub const KprobeMultiOptions = bpflink.KprobeMultiOptions;
+pub const UprobeMultiOptions = bpflink.UprobeMultiOptions;
+/// `tcx` / `netkit` links, with chain placement.
+pub const linkCreateTcx = bpflink.linkCreateTcx;
+pub const linkCreateNetkit = bpflink.linkCreateNetkit;
+pub const MprogOptions = bpflink.MprogOptions;
+pub const MprogPlacement = bpflink.Placement;
+pub const MprogRelative = bpflink.Relative;
+/// Pick the symbols of a tracefs `available_filter_functions` listing by glob.
+pub const selectKprobeSymbols = bpflink.selectSymbols;
+pub const globMatch = bpflink.globMatch;
 pub const linkUpdate = bpflink.linkUpdate;
 pub const linkDetach = bpflink.linkDetach;
 pub const linkGetFdById = bpflink.linkGetFdById;

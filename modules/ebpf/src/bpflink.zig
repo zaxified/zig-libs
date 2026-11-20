@@ -25,6 +25,8 @@
 //! | `xdp` | 5.9 |
 //! | `netns` (flow dissector / sk_lookup) | 5.7 / 5.9 |
 //! | `perf_event` (kprobe / uprobe / tracepoint) | **5.15** |
+//! | `kprobe_multi` | 5.18 |
+//! | `uprobe_multi` | 6.6 |
 //! | `tcx`, `netkit` | 6.6 / 6.7 |
 //!
 //! An older kernel answers `EINVAL` — which is **indistinguishable from
@@ -125,10 +127,13 @@ pub const CreateExtra = extern union {
         _pad: u32 = 0,
         cookie: u64 = 0,
     },
-    /// `BPF_TCX_INGRESS`/`_EGRESS` ordering against an existing link.
+    /// `BPF_TCX_INGRESS`/`_EGRESS` (and `BPF_NETKIT_*`) ordering against an
+    /// existing program or link: `relative` is a fd, or an id when
+    /// `BPF_F_ID` is in the link flags (the kernel's `relative_fd` /
+    /// `relative_id` are one union at this offset).
     tcx: extern struct {
-        relative_fd: u32 = 0,
-        relative_id: u32 = 0,
+        relative: u32 = 0,
+        _pad: u32 = 0,
         expected_revision: u64 = 0,
     },
     /// `BPF_NETFILTER`.
@@ -187,6 +192,7 @@ pub fn buildCreateAttr(
 const AttrBuf = extern union {
     base: BPF.Attr,
     link_create: CreateAttr,
+    wide: WideCreateAttr,
     link_update: BPF.LinkUpdateAttr,
     get_id: BPF.GetIdAttr,
     info: BPF.InfoAttr,
@@ -475,6 +481,310 @@ pub fn perfLinkSupport() Support {
     };
 }
 
+// ── the wide arms: kprobe_multi, uprobe_multi, tcx, netkit ──────────────────
+
+/// The multi-target link builders' errors: the ordinary `LinkError`s, plus
+/// `InvalidOptions` for options that cannot describe a link (no symbols, both
+/// symbols and addresses, a cookie array of the wrong length, too many
+/// targets), refused before any syscall.
+pub const MultiLinkError = LinkError || error{InvalidOptions};
+
+/// `bpf_attr.link_create` out to `uprobe_multi.pid` (+ padding): 16 bytes of
+/// header and the 48-byte arm area. Built zeroed and copied into, never by
+/// value from a union, so no byte the kernel's "tail must be zero" check
+/// looks at can be left undefined.
+pub const WideCreateAttr = extern struct {
+    prog_fd: i32,
+    target: i32,
+    attach_type: u32,
+    flags: u32,
+    arm: [48]u8,
+};
+
+/// `link_create.kprobe_multi` (offsets 16..48 of the attr).
+pub const KprobeMultiArm = extern struct {
+    flags: u32 = 0,
+    cnt: u32 = 0,
+    syms: u64 = 0,
+    addrs: u64 = 0,
+    cookies: u64 = 0,
+};
+
+/// `link_create.uprobe_multi` (offsets 16..64 of the attr).
+pub const UprobeMultiArm = extern struct {
+    path: u64 = 0,
+    offsets: u64 = 0,
+    ref_ctr_offsets: u64 = 0,
+    cookies: u64 = 0,
+    cnt: u32 = 0,
+    flags: u32 = 0,
+    pid: u32 = 0,
+    _pad: u32 = 0,
+};
+
+/// `BPF_F_KPROBE_MULTI_RETURN` / `BPF_F_UPROBE_MULTI_RETURN`.
+pub const F_MULTI_RETURN: u32 = 1;
+/// The kernel's `MAX_KPROBE_MULTI_CNT` / `MAX_UPROBE_MULTI_CNT`.
+pub const max_multi_targets: usize = 1 << 20;
+
+/// `bpf_mprog` placement flags (`link_create.flags` for tcx/netkit).
+pub const F_REPLACE: u32 = 1 << 2;
+pub const F_BEFORE: u32 = 1 << 3;
+pub const F_AFTER: u32 = 1 << 4;
+pub const F_ID: u32 = 1 << 5;
+pub const F_LINK: u32 = 1 << 13;
+
+fn buildWide(prog_fd: linux.fd_t, target: i32, attach_type: BPF.AttachType, flags: u32, arm: []const u8) WideCreateAttr {
+    var out = std.mem.zeroes(WideCreateAttr);
+    out.prog_fd = prog_fd;
+    out.target = target;
+    out.attach_type = @backingInt(attach_type);
+    out.flags = flags;
+    @memcpy(out.arm[0..arm.len], arm);
+    return out;
+}
+
+fn createWide(attr: WideCreateAttr, attach_type: BPF.AttachType) LinkError!LinkHandle {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("ebpf.bpflink is Linux-only (bpf() raw syscall)");
+    var buf: AttrBuf = .{ .wide = attr };
+    const rc = linux.bpf(.link_create, @ptrCast(&buf), @sizeOf(WideCreateAttr));
+    switch (linux.errno(rc)) {
+        .SUCCESS => return .{ .fd = @intCast(rc), .attach_type = attach_type },
+        else => |e| return errnoToLinkError(e),
+    }
+}
+
+/// What a `kprobe_multi` link attaches to: **either** symbol names **or**
+/// absolute addresses (the kernel takes exactly one), each with an optional
+/// cookie the program reads with `bpf_get_attach_cookie()`.
+pub const KprobeMultiOptions = struct {
+    symbols: []const [*:0]const u8 = &.{},
+    addrs: []const u64 = &.{},
+    /// Empty, or one per target.
+    cookies: []const u64 = &.{},
+    /// A return probe (`kretprobe.multi`).
+    return_probe: bool = false,
+};
+
+/// Pure: the attr `BPF_LINK_CREATE` sends for a kprobe-multi link. The
+/// arrays in `opts` must outlive the syscall.
+pub fn buildKprobeMultiAttr(prog_fd: linux.fd_t, opts: KprobeMultiOptions) MultiLinkError!WideCreateAttr {
+    const by_name = opts.symbols.len != 0;
+    const by_addr = opts.addrs.len != 0;
+    if (by_name == by_addr) return error.InvalidOptions; // none, or both
+    const cnt = if (by_name) opts.symbols.len else opts.addrs.len;
+    if (cnt > max_multi_targets) return error.InvalidOptions;
+    if (opts.cookies.len != 0 and opts.cookies.len != cnt) return error.InvalidOptions;
+    const arm: KprobeMultiArm = .{
+        .flags = if (opts.return_probe) F_MULTI_RETURN else 0,
+        .cnt = @intCast(cnt),
+        .syms = if (by_name) @intFromPtr(opts.symbols.ptr) else 0,
+        .addrs = if (by_addr) @intFromPtr(opts.addrs.ptr) else 0,
+        .cookies = if (opts.cookies.len != 0) @intFromPtr(opts.cookies.ptr) else 0,
+    };
+    return buildWide(prog_fd, 0, .trace_kprobe_multi, 0, std.mem.asBytes(&arm));
+}
+
+/// Attach one program (loaded from a `kprobe.multi`/`kretprobe.multi`
+/// section, expected attach type `trace_kprobe_multi`) to many kernel
+/// functions in ONE call. Needs kernel >= 5.18; older kernels answer
+/// `error.LinkNotSupported`.
+pub fn linkCreateKprobeMulti(prog_fd: linux.fd_t, opts: KprobeMultiOptions) MultiLinkError!LinkHandle {
+    return createWide(try buildKprobeMultiAttr(prog_fd, opts), .trace_kprobe_multi);
+}
+
+/// What a `uprobe_multi` link attaches to: `offsets` into the file at `path`,
+/// each with an optional USDT semaphore (`ref_ctr_offsets`) and cookie.
+pub const UprobeMultiOptions = struct {
+    path: [*:0]const u8,
+    /// File offsets (not virtual addresses: see SPEC "uprobes").
+    offsets: []const u64,
+    /// Empty, or one per offset.
+    ref_ctr_offsets: []const u64 = &.{},
+    /// Empty, or one per offset.
+    cookies: []const u64 = &.{},
+    /// 0 = every process that maps the file.
+    pid: u32 = 0,
+    return_probe: bool = false,
+};
+
+/// Pure: the attr for a uprobe-multi link.
+pub fn buildUprobeMultiAttr(prog_fd: linux.fd_t, opts: UprobeMultiOptions) MultiLinkError!WideCreateAttr {
+    const cnt = opts.offsets.len;
+    if (cnt == 0 or cnt > max_multi_targets) return error.InvalidOptions;
+    if (opts.ref_ctr_offsets.len != 0 and opts.ref_ctr_offsets.len != cnt) return error.InvalidOptions;
+    if (opts.cookies.len != 0 and opts.cookies.len != cnt) return error.InvalidOptions;
+    const arm: UprobeMultiArm = .{
+        .path = @intFromPtr(opts.path),
+        .offsets = @intFromPtr(opts.offsets.ptr),
+        .ref_ctr_offsets = if (opts.ref_ctr_offsets.len != 0) @intFromPtr(opts.ref_ctr_offsets.ptr) else 0,
+        .cookies = if (opts.cookies.len != 0) @intFromPtr(opts.cookies.ptr) else 0,
+        .cnt = @intCast(cnt),
+        .flags = if (opts.return_probe) F_MULTI_RETURN else 0,
+        .pid = opts.pid,
+    };
+    return buildWide(prog_fd, 0, .trace_uprobe_multi, 0, std.mem.asBytes(&arm));
+}
+
+/// Attach one program (expected attach type `trace_uprobe_multi`, sections
+/// `uprobe.multi`/`uretprobe.multi`) to many offsets of one file. Kernel >= 6.6.
+pub fn linkCreateUprobeMulti(prog_fd: linux.fd_t, opts: UprobeMultiOptions) MultiLinkError!LinkHandle {
+    return createWide(try buildUprobeMultiAttr(prog_fd, opts), .trace_uprobe_multi);
+}
+
+/// Something a tcx/netkit attach is ordered against.
+pub const Relative = union(enum) {
+    prog_fd: linux.fd_t,
+    link_fd: linux.fd_t,
+    prog_id: u32,
+    link_id: u32,
+};
+
+/// Where in the hook's chain the new program goes.
+pub const Placement = union(enum) {
+    /// The kernel's default: after the existing ones.
+    default,
+    first,
+    last,
+    before: Relative,
+    after: Relative,
+};
+
+pub const MprogOptions = struct {
+    placement: Placement = .default,
+    /// The chain's `revision` read earlier (`bpfsys.progQuery`): the attach
+    /// fails with `EAGAIN` when it has changed since, so a read-modify-write
+    /// is not racy. 0: no check.
+    expected_revision: u64 = 0,
+};
+
+/// Pure: `link_create.flags` and the arm for an mprog (tcx/netkit) attach.
+pub fn buildMprog(opts: MprogOptions) struct { flags: u32, arm: CreateExtra } {
+    var flags: u32 = 0;
+    var rel: ?Relative = null;
+    switch (opts.placement) {
+        .default => {},
+        .first => flags |= F_BEFORE,
+        .last => flags |= F_AFTER,
+        .before => |r| {
+            flags |= F_BEFORE;
+            rel = r;
+        },
+        .after => |r| {
+            flags |= F_AFTER;
+            rel = r;
+        },
+    }
+    var value: u32 = 0;
+    if (rel) |r| switch (r) {
+        .prog_fd => |fd| value = @bitCast(fd),
+        .link_fd => |fd| {
+            flags |= F_LINK;
+            value = @bitCast(fd);
+        },
+        .prog_id => |id| {
+            flags |= F_ID;
+            value = id;
+        },
+        .link_id => |id| {
+            flags |= F_ID | F_LINK;
+            value = id;
+        },
+    };
+    return .{ .flags = flags, .arm = .{ .tcx = .{ .relative = value, .expected_revision = opts.expected_revision } } };
+}
+
+/// An `tcx` link on `ifindex` (kernel >= 6.6): the classifier-style program
+/// (`tcx/ingress`, `tcx/egress`) that replaces `tc` qdisc filters.
+pub fn linkCreateTcx(prog_fd: linux.fd_t, ifindex: u32, egress: bool, opts: MprogOptions) LinkError!LinkHandle {
+    const at: BPF.AttachType = if (egress) .tcx_egress else .tcx_ingress;
+    const m = buildMprog(opts);
+    return createWide(buildWide(prog_fd, @bitCast(ifindex), at, m.flags, std.mem.asBytes(&m.arm.tcx)), at);
+}
+
+/// A `netkit` link on `ifindex` (kernel >= 6.7); `peer` selects the peer
+/// device's hook instead of the primary's.
+pub fn linkCreateNetkit(prog_fd: linux.fd_t, ifindex: u32, peer: bool, opts: MprogOptions) LinkError!LinkHandle {
+    const at: BPF.AttachType = if (peer) .netkit_peer else .netkit_primary;
+    const m = buildMprog(opts);
+    return createWide(buildWide(prog_fd, @bitCast(ifindex), at, m.flags, std.mem.asBytes(&m.arm.tcx)), at);
+}
+
+// ── kprobe_multi symbol selection ───────────────────────────────────────────
+
+/// Shell-style glob over a symbol name: `*` (any run), `?` (one byte); every
+/// other byte is literal. The same two wildcards libbpf's
+/// `bpf_program__attach_kprobe_multi_opts(pattern)` honours.
+pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and (pattern[p] == '?' or (pattern[p] != '*' and pattern[p] == text[t]))) {
+            p += 1;
+            t += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if (star) |s| {
+            p = s + 1;
+            mark += 1;
+            t = mark;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+/// Symbol names selected from a tracefs `available_filter_functions` listing
+/// (one `name` or `name [module]` per line), as NUL-terminated strings ready
+/// for `KprobeMultiOptions.symbols`.
+pub const SymbolList = struct {
+    gpa: std.mem.Allocator,
+    storage: []u8,
+    ptrs: [][*:0]const u8,
+
+    pub fn deinit(self: *SymbolList) void {
+        self.gpa.free(self.storage);
+        self.gpa.free(self.ptrs);
+        self.* = undefined;
+    }
+};
+
+/// Pure: pick every name of `listing` that matches `pattern`, once each (the
+/// listing repeats a name that exists in several places; the kernel refuses
+/// duplicates in one link). Order is the listing's.
+pub fn selectSymbols(gpa: std.mem.Allocator, listing: []const u8, pattern: []const u8) error{OutOfMemory}!SymbolList {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    var storage: std.ArrayList(u8) = .empty;
+    errdefer storage.deinit(gpa);
+    var offs: std.ArrayList(usize) = .empty;
+    defer offs.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        const end = std.mem.findAny(u8, line, " \t") orelse line.len;
+        const name = line[0..end];
+        if (!globMatch(pattern, name)) continue;
+        if (seen.contains(name)) continue;
+        const at = storage.items.len;
+        try storage.appendSlice(gpa, name);
+        try storage.append(gpa, 0);
+        try offs.append(gpa, at);
+        try seen.put(gpa, storage.items[at..][0..name.len], {});
+    }
+    const bytes = try storage.toOwnedSlice(gpa);
+    errdefer gpa.free(bytes);
+    const ptrs = try gpa.alloc([*:0]const u8, offs.items.len);
+    for (offs.items, 0..) |o, i| ptrs[i] = @ptrCast(bytes[o..].ptr);
+    return .{ .gpa = gpa, .storage = bytes, .ptrs = ptrs };
+}
+
 /// Map a `bpf()` errno onto `LinkError`. `EINVAL`/`EOPNOTSUPP` deliberately
 /// collapse to `LinkNotSupported` — see this file's header for why they are
 /// not distinguishable from "old kernel".
@@ -523,8 +833,7 @@ test "CreateAttr matches the kernel's bpf_attr.link_create layout" {
     try testing.expectEqual(@as(usize, 0), @offsetOf(@FieldType(CreateExtra, "perf_event"), "bpf_cookie"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(@FieldType(CreateExtra, "tracing"), "target_btf_id"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(@FieldType(CreateExtra, "tracing"), "cookie"));
-    try testing.expectEqual(@as(usize, 0), @offsetOf(@FieldType(CreateExtra, "tcx"), "relative_fd"));
-    try testing.expectEqual(@as(usize, 4), @offsetOf(@FieldType(CreateExtra, "tcx"), "relative_id"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(@FieldType(CreateExtra, "tcx"), "relative"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(@FieldType(CreateExtra, "tcx"), "expected_revision"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(@FieldType(CreateExtra, "netfilter"), "pf"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(@FieldType(CreateExtra, "netfilter"), "flags"));
@@ -742,4 +1051,136 @@ test "LinkHandle.detach closes the fd once and forgets it" {
     const fd2 = h2.fd;
     h2.close();
     try testing.expect(linux.errno(linux.fcntl(fd2, linux.F.GETFD, 0)) != .SUCCESS);
+}
+
+test "wide arms match <linux/bpf.h> (tools/uapi_layout.c)" {
+    try testing.expectEqual(@as(usize, 64), @sizeOf(WideCreateAttr));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(WideCreateAttr, "arm"));
+    // offsets are relative to the attr: arm offset + 16
+    try testing.expectEqual(@as(usize, 16 - 16), @offsetOf(KprobeMultiArm, "flags"));
+    try testing.expectEqual(@as(usize, 20 - 16), @offsetOf(KprobeMultiArm, "cnt"));
+    try testing.expectEqual(@as(usize, 24 - 16), @offsetOf(KprobeMultiArm, "syms"));
+    try testing.expectEqual(@as(usize, 32 - 16), @offsetOf(KprobeMultiArm, "addrs"));
+    try testing.expectEqual(@as(usize, 40 - 16), @offsetOf(KprobeMultiArm, "cookies"));
+    try testing.expectEqual(@as(usize, 16 - 16), @offsetOf(UprobeMultiArm, "path"));
+    try testing.expectEqual(@as(usize, 24 - 16), @offsetOf(UprobeMultiArm, "offsets"));
+    try testing.expectEqual(@as(usize, 32 - 16), @offsetOf(UprobeMultiArm, "ref_ctr_offsets"));
+    try testing.expectEqual(@as(usize, 40 - 16), @offsetOf(UprobeMultiArm, "cookies"));
+    try testing.expectEqual(@as(usize, 48 - 16), @offsetOf(UprobeMultiArm, "cnt"));
+    try testing.expectEqual(@as(usize, 52 - 16), @offsetOf(UprobeMultiArm, "flags"));
+    try testing.expectEqual(@as(usize, 56 - 16), @offsetOf(UprobeMultiArm, "pid"));
+    try testing.expectEqual(@as(usize, 32), @sizeOf(KprobeMultiArm));
+    try testing.expectEqual(@as(usize, 48), @sizeOf(UprobeMultiArm));
+    try testing.expectEqual(@as(usize, 24 - 16), @offsetOf(@FieldType(CreateExtra, "tcx"), "expected_revision"));
+}
+
+test "kprobe_multi attr: golden bytes and every refusal" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const syms = [_][*:0]const u8{ "vfs_read", "vfs_write" };
+    const cookies = [_]u64{ 1, 2 };
+    const a = try buildKprobeMultiAttr(5, .{ .symbols = &syms, .cookies = &cookies, .return_probe = true });
+    try testing.expectEqual(@as(i32, 5), a.prog_fd);
+    try testing.expectEqual(@as(i32, 0), a.target);
+    try testing.expectEqual(@as(u32, @backingInt(BPF.AttachType.trace_kprobe_multi)), a.attach_type);
+    try testing.expectEqual(@as(u32, 0), a.flags);
+    const b = std.mem.asBytes(&a);
+    try testing.expectEqual(@as(u32, F_MULTI_RETURN), std.mem.readInt(u32, b[16..20], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, b[20..24], .little));
+    try testing.expectEqual(@intFromPtr(&syms), std.mem.readInt(u64, b[24..32], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, b[32..40], .little));
+    try testing.expectEqual(@intFromPtr(&cookies), std.mem.readInt(u64, b[40..48], .little));
+    // the tail past the arm is zero (the kernel checks it)
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), b[48..64]);
+    // by address instead
+    const addrs = [_]u64{ 0xffff_0000, 0xffff_1000, 0xffff_2000 };
+    const c = try buildKprobeMultiAttr(5, .{ .addrs = &addrs });
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, std.mem.asBytes(&c)[20..24], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, std.mem.asBytes(&c)[24..32], .little));
+    // none, both, or a cookie array of the wrong length
+    try testing.expectError(error.InvalidOptions, buildKprobeMultiAttr(5, .{}));
+    try testing.expectError(error.InvalidOptions, buildKprobeMultiAttr(5, .{ .symbols = &syms, .addrs = &addrs }));
+    try testing.expectError(error.InvalidOptions, buildKprobeMultiAttr(5, .{ .symbols = &syms, .cookies = cookies[0..1] }));
+}
+
+test "uprobe_multi attr: golden fields and refusals" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const offs = [_]u64{ 0x1000, 0x2000 };
+    const refs = [_]u64{ 0x30, 0x38 };
+    const a = try buildUprobeMultiAttr(9, .{ .path = "/bin/true", .offsets = &offs, .ref_ctr_offsets = &refs, .pid = 77, .return_probe = true });
+    const b = std.mem.asBytes(&a);
+    try testing.expectEqual(@as(u32, @backingInt(BPF.AttachType.trace_uprobe_multi)), a.attach_type);
+    try testing.expect(std.mem.readInt(u64, b[16..24], .little) != 0); // path
+    try testing.expectEqual(@intFromPtr(&offs), std.mem.readInt(u64, b[24..32], .little));
+    try testing.expectEqual(@intFromPtr(&refs), std.mem.readInt(u64, b[32..40], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, b[40..48], .little)); // no cookies
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, b[48..52], .little));
+    try testing.expectEqual(@as(u32, F_MULTI_RETURN), std.mem.readInt(u32, b[52..56], .little));
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, b[56..60], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b[60..64], .little));
+    try testing.expectError(error.InvalidOptions, buildUprobeMultiAttr(9, .{ .path = "/x", .offsets = &.{} }));
+    try testing.expectError(error.InvalidOptions, buildUprobeMultiAttr(9, .{ .path = "/x", .offsets = &offs, .cookies = refs[0..1] }));
+    try testing.expectError(error.InvalidOptions, buildUprobeMultiAttr(9, .{ .path = "/x", .offsets = &offs, .ref_ctr_offsets = refs[0..1] }));
+}
+
+test "tcx / netkit placement: flags and the relative union" {
+    const d = buildMprog(.{});
+    try testing.expectEqual(@as(u32, 0), d.flags);
+    try testing.expectEqual(@as(u32, F_BEFORE), buildMprog(.{ .placement = .first }).flags);
+    try testing.expectEqual(@as(u32, F_AFTER), buildMprog(.{ .placement = .last }).flags);
+    const bp = buildMprog(.{ .placement = .{ .before = .{ .prog_fd = 12 } }, .expected_revision = 9 });
+    try testing.expectEqual(@as(u32, F_BEFORE), bp.flags);
+    try testing.expectEqual(@as(u32, 12), bp.arm.tcx.relative);
+    try testing.expectEqual(@as(u64, 9), bp.arm.tcx.expected_revision);
+    const al = buildMprog(.{ .placement = .{ .after = .{ .link_fd = 13 } } });
+    try testing.expectEqual(@as(u32, F_AFTER | F_LINK), al.flags);
+    try testing.expectEqual(@as(u32, 13), al.arm.tcx.relative);
+    const bi = buildMprog(.{ .placement = .{ .before = .{ .prog_id = 4242 } } });
+    try testing.expectEqual(@as(u32, F_BEFORE | F_ID), bi.flags);
+    try testing.expectEqual(@as(u32, 4242), bi.arm.tcx.relative);
+    const li = buildMprog(.{ .placement = .{ .after = .{ .link_id = 7 } } });
+    try testing.expectEqual(@as(u32, F_AFTER | F_ID | F_LINK), li.flags);
+    // golden: a tcx ingress attach to ifindex 3, first in the chain
+    if (native_endian == .little) {
+        const m = buildMprog(.{ .placement = .first, .expected_revision = 5 });
+        const w = buildWide(8, 3, .tcx_ingress, m.flags, std.mem.asBytes(&m.arm.tcx));
+        const b = std.mem.asBytes(&w);
+        try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, b[0..4], .little));
+        try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, b[4..8], .little));
+        try testing.expectEqual(@as(u32, @backingInt(BPF.AttachType.tcx_ingress)), std.mem.readInt(u32, b[8..12], .little));
+        try testing.expectEqual(@as(u32, F_BEFORE), std.mem.readInt(u32, b[12..16], .little));
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b[16..20], .little));
+        try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, b[24..32], .little));
+    }
+}
+
+test "globMatch: * and ? only, backtracking, no regex surprises" {
+    try testing.expect(globMatch("vfs_*", "vfs_read"));
+    try testing.expect(globMatch("*", ""));
+    try testing.expect(globMatch("*_read", "vfs_read"));
+    try testing.expect(globMatch("v?s_read", "vfs_read"));
+    try testing.expect(globMatch("*fs*re*", "vfs_read"));
+    try testing.expect(globMatch("a*b*c", "aXbYbZc")); // needs to backtrack over the first b
+    try testing.expect(!globMatch("vfs_", "vfs_read"));
+    try testing.expect(!globMatch("vfs_?", "vfs_read"));
+    try testing.expect(!globMatch("vfs_read?", "vfs_read"));
+    try testing.expect(!globMatch("", "x"));
+    try testing.expect(globMatch("", ""));
+    try testing.expect(globMatch("[abc]", "[abc]")); // brackets are literal
+    try testing.expect(!globMatch("[abc]", "a"));
+}
+
+test "selectSymbols: module suffixes, duplicates and the pattern" {
+    const gpa = testing.allocator;
+    const listing =
+        "vfs_read\nvfs_write\nvfs_read\nvfs_fsync [ext4]\nkmalloc\n\n  vfs_open\r\nnot_vfs\n";
+    var l = try selectSymbols(gpa, listing, "vfs_*");
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 4), l.ptrs.len);
+    try testing.expectEqualStrings("vfs_read", std.mem.span(l.ptrs[0]));
+    try testing.expectEqualStrings("vfs_write", std.mem.span(l.ptrs[1]));
+    try testing.expectEqualStrings("vfs_fsync", std.mem.span(l.ptrs[2]));
+    try testing.expectEqualStrings("vfs_open", std.mem.span(l.ptrs[3]));
+    var none = try selectSymbols(gpa, listing, "zzz*");
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.ptrs.len);
 }
