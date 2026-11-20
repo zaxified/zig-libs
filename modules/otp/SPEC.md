@@ -21,7 +21,7 @@ HOTP (RFC 4226) + TOTP (RFC 6238) one-time passwords; see
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module: `rg -i 'otpauth|base32'` over `src/` finds nothing and the catalogue has no base32 module (only `dnssec` carries base32hex privately for NSEC3); the module's own example states it has no `otpauth://` form. karlseguin/otp.zig's feature list is from its README, read in this run; the rest are *(inferred)* from prior knowledge of public docs.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. karlseguin/otp.zig's feature list is from its README, read in this run; the rest are *(inferred)* from prior knowledge of public docs.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -31,13 +31,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [pyca/cryptography](https://github.com/pyca/cryptography) `hazmat.primitives.twofactor` | Python | Apache-2.0 OR BSD-3-Clause (API: NOASSERTION; source not read) | 7.8k | push 2026-09-29 | HOTP and TOTP primitives with `verify` and SHA-1/256/512; no URI helper *(inferred)*. Closest in scope to this module. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | Only HMAC; no OTP, no base32. |
 
-**Where we are ahead:** of the other Zig OTP library, both HOTP and TOTP, SHA-1/256/512, a checked bounded-window `totpVerify` that evaluates every step in constant HMAC count with a constant-time compare, and every RFC 4226 Appendix D and RFC 6238 Appendix B vector asserted byte-exact (including the intermediate digests). **Where we are behind (updated 2026-09-30):** ~~no base32 / `otpauth://`~~ — both added the same day (`base32` module, `otpauth.zig`); ~~no HOTP look-ahead/resync~~ (added 2026-11-16), no replay guard (last accepted step; the caller's storage by design).
+**Where we are ahead:** of the other Zig OTP library, both HOTP and TOTP, SHA-1/256/512, a checked bounded-window `totpVerify` that evaluates every step in constant HMAC count with a constant-time compare, and every RFC 4226 Appendix D and RFC 6238 Appendix B vector asserted byte-exact (including the intermediate digests). **Where we are behind:** no replay guard (last accepted step; the caller's storage by design).
 
 ## Design
 
 - **Source of truth**: RFC 4226 (HOTP + dynamic truncation, HMAC-SHA-1)
   and RFC 6238 (TOTP time-step mapping; extends HOTP to HMAC-SHA-256 and
-  HMAC-SHA-512, §1.2). The module adds nothing beyond the two RFCs.
+  HMAC-SHA-512, §1.2). The HOTP/TOTP core adds nothing beyond the two RFCs (verification helpers and the URI form are below).
 - **std recon (0.16.0)**: everything needed is in std —
   `std.crypto.auth.hmac.HmacSha1`, `.sha2.HmacSha256`, `.sha2.HmacSha512`
   (`create(out, msg, key)`, arbitrary key length per RFC 2104, digest
@@ -66,6 +66,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   instruction; the explicit form keeps a refactor from reintroducing a branch). The real defense
   for low-entropy, short-lived, online-submitted codes is still server-side rate limiting
   (RFC 4226 §7.3).
+- **HOTP verification** (`hotpVerify`, `hotpResync`; RFC 4226 §7.4–7.5): `hotpVerify`
+  checks a code against `counter .. counter + window` (`window = 0` is the exact
+  counter) and returns the matched counter; the caller stores `matched + 1`. The
+  window is capped at `max_hotp_window` (1000, `error.WindowTooLarge`) so a caller
+  cannot ask for an unbounded sweep. Like `totpVerify` the whole window is always
+  evaluated, each code is compared with `timing_safe.eql` and the matched counter is
+  picked by mask; the lowest of several matches wins. The counter `maxInt(u64)` is
+  never a candidate (so `matched + 1` cannot overflow). `hotpResync` is the §7.5
+  two-consecutive-codes helper: it finds `c` in the window with `HOTP(c) == code1`
+  and `HOTP(c + 1) == code2` and returns `c + 1`, with the same bounds and
+  constant-time behaviour.
+- **Dead stack:** the code functions funnel through `dynamicTruncate`'s burn
+  (`src/burn.zig`, 4 KiB), as do the `KeyUri` methods and `otpauth.format`;
+  `src/stackprobe_test.zig` probes them in ReleaseFast.
 
 ## `otpauth://` provisioning URIs (`otpauth.zig`)
 
@@ -108,79 +122,46 @@ Format: Google Authenticator "Key Uri Format"
   (table lookup, see its SPEC) and sits in the caller's buffer, which the caller
   should clear.
 
-Verification: the Google wiki's two example URIs and its label grammar
-examples; the pyotp README outputs for TOTP and HOTP; ~45 rejection cases, each
-with the exact error; boundaries (digits 6..8, period 1/86400, counter
-`u64` max, URI cap); parse -> format -> parse on a fixed corpus and format ->
-parse over 300 random field sets; and codes computed from a parsed URI equal the
-RFC 6238 Appendix B (SHA-1/256/512, T=59) and RFC 4226 Appendix D values.
-Caveat: `pyotp` was not importable in the authoring environment, so the pyotp
-strings are recalled from its documentation, not produced by running it.
-A fuzz harness checks that `parse` never panics and that anything it accepts
-re-formats and re-parses.
-
 ## Out of scope
 
-- (Was out of scope until 2026-09-30.) Base32 secret decoding and
-  `otpauth://` URIs now live in `otpauth.zig` on top of the `base32` module.
-  Still out of scope: random secret generation (`entropy`'s job), QR rendering
-  (`qr`), Steam/other OTP variants, `image`/`lock` and other vendor parameters.
+- Random secret generation (`entropy`'s job), QR rendering (`qr`), Steam/other OTP
+  variants, `image`/`lock` and other vendor parameters.
 - Server-side throttling/lockout state, last-accepted-step persistence
   (replay prevention) — policy and storage, not primitive.
-- The RFC 4226 §7.5 resynchronization protocol for HOTP counter drift.
 
-## Validation
+## Verification
 
-`kat_test.zig` asserts, in Debug and ReleaseFast:
+`scripts/modtest otp` (or `zig build test-otp`), Debug and ReleaseFast.
 
-- RFC 4226 Appendix D, counts 0..9: the intermediate HMAC-SHA-1 digests
-  (hex-exact), the pre-modulo truncated integers, the 6-digit codes, and
-  the zero-padded ASCII forms.
-- RFC 6238 Appendix B, all 6 times × 3 hashes (18 codes, 8 digits): the
-  time-step counters (`T` column) and every code; the leading-zero code
-  `07081804` checked as a formatted string.
-- `totpVerify`: exact-step accept; ±1/±2 window accept/reject in both
-  directions; wrong-code reject across a window; underflow clamp at `t0`;
-  non-default `t0`.
-
-## Mutation run 2026-10-04
-
-57 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run) over `root.zig` and
-`otpauth.zig`: dynamic-truncation offset mask, offset byte, sign mask and counter endianness;
-`fmtCode` buffer check; `timeStep` origin; every comparison and the accumulator of `totpVerify`
-(window width, underflow skip, window origin, OR vs last-wins); `parse` URI cap, scheme, `#`,
-type case, `%3`/`%3A`/`%3a` separator detection, `%20` skipping, second colon, leading space,
-escape bounds, buffer-overflow bound, C0/DEL checks, decimal parsing (length cap, overflow),
-digits and period bounds, duplicate and empty secret, base32 case, issuer colon and mismatch,
-missing counter, algorithm mapping, defaults; `format` label/secret/digits/period checks,
-unreserved set, hex case, 40-byte chunk, parameter elision, `WrongKind`.
-First run: 48 killed, 9 survived. Survivors and verdicts:
-
-- Equivalent: empty `secret=` without the explicit `value.len == 0` check (the decoder returns
-  0 bytes and the following `n == 0` check yields the same `InvalidSecret`).
-- Test gaps, now killed: `%3` truncated at the end of a label (out-of-bounds read in the
-  separator scan), `0x1F` and DEL in label/issuer, a decimal that overflows `u64` only in the
-  multiply, a buffer that fits the decoded fields exactly, `format` of `period = 86400` and of
-  the unreserved `~`.
-
-Mutants that cannot be compiled behind a runtime switch (the comptime `Hmac` type selection)
-were not included; every RFC 4226 / 6238 vector pins them. Tests added: 5, all in
-`otpauth.zig`, each with its reason in a comment. No findings. Final: 56 killed, 1 equivalent.
+- `kat_test.zig`: RFC 4226 Appendix D, counts 0..9 (the intermediate HMAC-SHA-1
+  digests hex-exact, the pre-modulo truncated integers, the 6-digit codes and
+  their zero-padded ASCII forms); RFC 6238 Appendix B, all 6 times × 3 hashes
+  (8 digits: the time-step counters and every code; the leading-zero code
+  `07081804` as a formatted string); `totpVerify` exact-step accept, window
+  accept/reject in both directions, wrong-code reject, underflow clamp at `t0`,
+  non-default `t0`; `hotpVerify` and `hotpResync` including the window cap.
+- `otpauth.zig`: the Google wiki's two example URIs and its label grammar examples;
+  the pyotp README outputs for TOTP and HOTP (recalled from its documentation, not
+  produced by running it); about 45 rejection cases, each with its exact error;
+  boundaries (digits 6..8, period 1 and 86400, counter `u64` max, the URI cap);
+  parse, format, parse over a fixed corpus and over 300 random field sets; codes
+  computed from a parsed URI equal the RFC 6238 Appendix B (SHA-1/256/512, T=59) and
+  RFC 4226 Appendix D values.
+- **Fuzz:** `OTP_FUZZ=<runs>[,<seed>]` (testkit's deterministic driver), two
+  harnesses: `otp-uri` (`parse` never panics; anything it accepts re-formats and
+  re-parses) and `otp-code`. `hotp`/`totp` take only a provisioned key.
+- **ctgrind:** `scripts/checks/ctgrind.sh otp`, rows `code` (the secret through
+  hotp/totp/fmt/verify, SHA-1/256/512) and `uri` (`otpauth.format` and `totpCode`).
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. Mutants behind the
+  comptime `Hmac` type selection cannot be switched at run time; every RFC vector
+  pins them.
 
 ## Backlog / deferred
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/otp.zig`. Beyond the RFC 4226/6238 vectors, generate random secrets, counters, times, digit counts and algorithms, then require identical codes from both. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/otp.zig`. Beyond the RFC 4226/6238 vectors, generate random secrets, counters, times, digit counts and algorithms, then require identical codes from both. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
-- ✅ **DONE 2026-09-30** — **Base32 (RFC 4648) codec for shared secrets** (survey 2026-09-30). Authenticator apps and every stored TOTP secret are base32; pyotp, pquerna and karlseguin's library all handle it. The catalogue has no base32 module (`rg -il base32` finds only `dnssec`'s private NSEC3 base32hex), and Zig `std` has none. Best home: a small standalone `base32` (or an addition to `encoding`), used here and by `dnssec`. Effort: small. Fits §2. *(owner session: filed straight into this backlog.)*
-- ✅ **DONE 2026-09-30** — **`otpauth://` provisioning-URI builder (and parser)** (survey 2026-09-30). The enrollment step of 2FA; pyotp `provisioning_uri`, pquerna `Key.URL`. The SPEC lists it as out of scope "for a thin layer above", but no such layer exists in the catalogue. Effort: small (percent-encoding of issuer/account, parameters `secret`, `algorithm`, `digits`, `period`). Fits §2.
-- ✅ DONE 2026-11-16 (`hotpVerify` look-ahead window capped at `max_hotp_window`, returns the matched counter; `hotpResync` two-consecutive-codes helper; constant HMAC count, constant-time compares) — **HOTP look-ahead / counter resynchronisation (RFC 4226 §7.4–7.5)** (survey 2026-09-30). A hardware-token user whose counter drifted cannot verify here; only TOTP has a window helper (`totpVerify`). Effort: small. Fits §2.
-
-## Fuzz
-
-The former fuzz exemption (EMIT-ONLY, 2026-08-14) no longer holds: since
-2026-09-30 `otpauth.parse` decodes an attacker-reachable string. It has a harness
-(`fuzz: parse never panics ...` in `src/otpauth.zig`); `hotp`/`totp` themselves
-still take only a provisioned `key`.
 
 ## Anchoring
 
