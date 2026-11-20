@@ -330,7 +330,7 @@ const Relay = struct {
     /// The header a MIX may act on: it decodes, and names this node as the
     /// mix of its current hop. Anything else is dropped and counted — a mix
     /// that trusted `hop` would index `route[hop + 1]` past the route on the
-    /// way out (review 2026-10-04, L-02: an all-zero header has n_hops 0).
+    /// way out (review, L-02: an all-zero header has n_hops 0).
     fn acceptAtMix(self: *Relay, node: NodeId, payload: []const u8) ?MixHeader {
         const hdr = MixHeader.decode(payload) catch {
             self.malformed += 1;
@@ -377,7 +377,7 @@ const Relay = struct {
             cfg.providerOf(cfg.clientIndex(hdr.recipient)) == node)
         {
             // Only out of the last layer, only to this provider, only for one
-            // of ITS clients (review 2026-10-04, L-10).
+            // of ITS clients (review, L-10).
             try self.mailboxes[cfg.clientIndex(hdr.recipient)].append(self.gpa, hdr);
         } else self.malformed += 1;
     }
@@ -410,8 +410,7 @@ const Relay = struct {
             self.malformed += 1;
             return;
         };
-        // Exactly once, and only to the client the sender addressed (review
-        // 2026-10-04, L-08/L-09: counts alone let a loss and a duplicate
+        // Exactly once, and only to the client the sender addressed (review, L-08/L-09: counts alone let a loss and a duplicate
         // cancel out).
         if (node != s.recipient or hdr.hop != hdr.n_hops or self.delivered.contains(hdr.id)) {
             self.misdelivered += 1;
@@ -1106,7 +1105,7 @@ test "end-to-end: the sender of every real packet stays hidden through all layer
         nc_worst_set = @min(nc_worst_set, n.min_sender_set);
         if (!n.holds(bound)) nc_failed += 1;
     }
-    // Measured 2026-10-04 (see `SenderBound`): real 5.78 / 0.286, FIFO link
+    // Measured (see `SenderBound`): real 5.78 / 0.286, FIFO link
     // 1.00, no-cover set 2.00. Genuine margin on the passing side too:
     try testing.expect(worst_set >= bound.min_sender_set + 1.0);
     try testing.expect(worst_link <= bound.max_link_prob - 0.1);

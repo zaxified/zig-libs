@@ -204,7 +204,7 @@ pub fn measure(
             // Posterior mass on the true match. Departures sharing its exact
             // timestamp are indistinguishable, so the true one gets its fair
             // share of their combined mass: (k·w / total) / k = w / total.
-            // (Review 2026-10-04, L-01: this used to divide by k a second
+            // (Review, L-01: this used to divide by k a second
             // time — 1/k² — so a batch mix releasing k at once scored as if
             // it hid each packet among k² departures.)
             std.debug.assert(true_coincident >= 1);

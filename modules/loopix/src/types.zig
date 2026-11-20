@@ -108,7 +108,7 @@ pub const LoopixConfig = struct {
     pub const ConfigError = error{InvalidConfig};
 
     /// The ranges every field must be in for the header, the casts and the
-    /// mailboxes to be sound (review 2026-10-04, L-14).
+    /// mailboxes to be sound (review, L-14).
     pub fn validate(self: LoopixConfig) ConfigError!void {
         if (self.layers == 0 or self.layers > max_layers) return error.InvalidConfig;
         if (self.width == 0 or self.clients == 0) return error.InvalidConfig;
@@ -204,7 +204,7 @@ pub const LoopixConfig = struct {
 /// The bound sits with genuine margin below the correct mix and far above both
 /// broken controls on BOTH clauses — it is NOT tuned to let the correct mix
 /// squeak by. `min_effective_set` (the cover-traffic guarantee) is the binding,
-/// robustly-separating clause (2.80 vs 1.00/1.06); `max_link_prob` (the
+/// robustly-separating clause (3.88 vs 1.00/1.06); `max_link_prob` (the
 /// memoryless-hold guarantee) is a second guard both controls also violate.
 pub const AnonymityBound = struct {
     min_effective_set: f64 = 2.0,
@@ -217,7 +217,7 @@ pub const AnonymityBound = struct {
 /// (Serjantov–Danezis `2^H`, at most the client count) and put at most
 /// `max_link_prob` on the true sender. Tuned like `AnonymityBound`, against
 /// `PROVIDER_CFG` (8 clients) over 20 clean seeds, steady-state window,
-/// measured 2026-10-04 — worst real packet over all seeds:
+/// measured — worst real packet over all seeds:
 ///
 ///     correct Poisson mix : min_sender_set 5.78 of 8, max_link_prob 0.286
 ///     FIFO control        : max_link_prob 1.00 (traced straight back)
@@ -568,7 +568,7 @@ fn fuzzMixHeaderDecode(comptime S: type, smith: *S, _: std.mem.Allocator) anyerr
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every input and `decode` refused on its
     // `payload.len < wire_len` line before reading a field, with the header
-    // sitting unread in `buf`. Measured 2026-09-07 over the corpus above:
+    // sitting unread in `buf`. Measured over the corpus above:
     // **0 of 10 seeds non-empty and 0 headers decoded before, 9 of 10
     // non-empty (one seed IS the empty payload) and 4 decoded after.**
     const len: usize = fz.drawInput(S, smith, &buf, &header_seeds);
@@ -615,7 +615,7 @@ test "corpus: every header reaches decode, and the decoded count is pinned" {
     }
     // One seed IS the empty payload, a legal member of a refusal corpus.
     try testing.expectEqual(header_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 decoded
+    // Measured: with the collapsing draw, 0 non-empty, 0 decoded
     // and 0 hops — the same empty slice ten times. After:
     try testing.expectEqual(@as(usize, 5), decoded);
     try testing.expectEqual(@as(usize, 15), hops);

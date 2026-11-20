@@ -13,7 +13,7 @@
 //! and model-checks that strategy inside `netsim`.
 //!
 //! **Status: core, as a simulator/analysis library.** Phase 1 built the
-//! per-mix invariant and the Poisson core; Phase 2 (2026-10-04) added
+//! per-mix invariant and the Poisson core; Phase 2 added
 //! providers with mailboxes (`PROVIDER_CFG`, constant-size pulls),
 //! sender-chosen delays as deployed, END-TO-END sender anonymity
 //! (`measureEndToEnd`, `SenderBound`), n−1 detection from loop cover against a
