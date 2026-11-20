@@ -8,12 +8,14 @@ scheduled visibility (`delay_ns` / `run_at`).
 - No production pure-Zig background-job queue exists.
 - **Model after:** Faktory / Sidekiq (lease + retry + DLQ) over a Bitcask-style
   log; the injected-`Clock` pattern from the `resilience` / `jwt` siblings.
-- **Platform:** `posix` — the OS-default wall/monotonic clocks use
-  `clock_gettime` (both injectable; everything else is pure logic + `kv`).
+- **Platform:** `posix` — the OS-default wall/monotonic clocks come from the
+  sibling `clock` module (`clock_gettime`; both injectable; everything else is
+  pure logic + `kv`).
 - **Role:** both. **Concurrency:** `single_owner` — one owner drives the queue
   and the caller-driven maintenance sweep; the in-memory index is not locked.
 - **Deps:** `kv` (its `Storage` seam is passed straight through, so production
-  uses `kv.FsStorage` and tests use `kv.SimStorage`).
+  uses `kv.FsStorage` and tests use `kv.SimStorage`) and `clock` (the default
+  clocks).
 
 Provenance: original work of the zig-libs authors (MIT), greenfield over `kv`
 — no third-party source consulted line-level or copied. The
@@ -27,7 +29,7 @@ exponential-jitter-backoff shapes follow the `resilience` sibling.
 ## Why an in-memory index over `kv`
 
 `kv` is a point store — `put` / `get` / `delete` by key, plus a key listing
-(`Db.keys(prefix)`, since 2026-09-30) but no record scan (private keydir). A queue must *enumerate* ready work, so jobqueue
+(`Db.keys(prefix)`) but no record scan (private keydir). A queue must *enumerate* ready work, so jobqueue
 keeps its own index (a `jobs` map, the ready pair described below, a `leased`
 table, a `dlq` set) and uses `kv` purely as the durable record of truth,
 rebuilt on `open`.
@@ -144,21 +146,10 @@ reaped/re-leased, or it was released) cannot `ack`/`nack`/`release` — it gets
 `error.StaleLease`. Make your
 consumer **idempotent**.
 
-## Deferred (v1 non-goals)
+## Not provided
 
-- **Durable / cross-process leases** — v1 leases live in memory (single-process
-  worker model); no cross-process lock exists in `kv`.
-- **Exactly-once** — this is at-least-once; the idempotent consumer is the
-  app's job.
-- **Rate-limited dispatch** — compose the `ratelimit` module later.
-- **Since 2026-10-04:** job cancel (`cancel`), dead-letter retry
-  (`requeueDead`), lease heartbeat (`extendLease`), unique jobs
-  (`EnqueueOptions.unique_key`, `findUnique`) and `status` — no longer
-  deferred.
-- **Cron-expression schedules** — v1 has only `delay_ns` + `run_at`; no
-  `* * * * *` parsing.
-- **A background maintenance thread & compaction-trigger policy** — the
-  visibility sweep (`reapExpiredLeases`) is caller-driven; `kv.compact` is the
-  caller's to schedule.
-- **Fair-share / weighted dispatch across partitions** — dispatch is strict
-  priority; there is no round-robin or weighting over partitions (see above).
+Exactly-once delivery and rate-limited dispatch (compose `ratelimit`) are
+refused (SPEC *What is deliberately not done*). Cross-process leases, cron
+schedules, a worker runtime, a background maintenance thread, fair-share /
+weighted dispatch across partitions and a TTL on unique keys are open work
+(SPEC *Backlog / deferred*); dispatch is strict priority (see above).

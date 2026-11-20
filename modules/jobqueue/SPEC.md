@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [taskforcesh/bullmq](https://github.com/taskforcesh/bullmq) | TypeScript | MIT | 9.5k | v6.3.10 (2026-09-29) | Redis queue with delays, priorities, rate limits, repeatable/cron jobs, flows *(inferred)*. |
 | Zig ecosystem | Zig | MIT | 0-17 | 2022-2026 | `zig-gamedev/zjobs` (MIT, 17 stars) is an in-memory thread-pool job queue, not durable; `seemsindie/pidgn_jobs` (MIT, 1 star; "job queues with flexible storage backends, retry strategies, cron scheduling, and telemetry", per README) is the only durable-style peer. Neither has partitions. Zig `std` has no job queue. |
 
-**Where we are ahead:** the only durable, single-file (no server, no Redis, no Postgres) background queue in pure Zig with lease/retry/DLQ, a durable id counter with crash-safe enqueue, per-partition FIFO under a priority override, scheduled visibility and injected wall and monotonic clocks so retries, backoff and lease expiry are testable under `kv.SimStorage`; `enqueue` returns only after fsync. **Where we are behind** (re-checked 2026-10-04): single process only (leases are in memory), no worker runtime (concurrency, graceful shutdown, handler registry) or web UI, no cron/repeating schedules, no weighted queues, no unique-key TTL (a key is held until ack/cancel, Asynq's can expire). Built since the survey: job cancel, dead-letter requeue, lease heartbeat (`extendLease`), unique jobs, `status`.
+**Where we are ahead:** the only durable, single-file (no server, no Redis, no Postgres) background queue in pure Zig with lease/retry/DLQ, a durable id counter with crash-safe enqueue, per-partition FIFO under a priority override, scheduled visibility and injected wall and monotonic clocks so retries, backoff and lease expiry are testable under `kv.SimStorage`; `enqueue` returns only after fsync. **Where we are behind:** single process only (leases are in memory), no worker runtime (concurrency, graceful shutdown, handler registry) or web UI, no cron/repeating schedules, no weighted queues, no unique-key TTL (a key is held until ack/cancel, Asynq's can expire); each is in *Backlog / deferred*. Also built: job cancel, dead-letter requeue, lease heartbeat (`extendLease`), unique jobs, `status`, lease `release`, `dequeue` partition exclusion.
 
 ## Design & invariants
 
@@ -45,7 +45,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   scheduled visibility (`delay_ns`/`run_at`). Greenfield over `kv`; the partition-FIFO dispatch
   shape is original design work; Faktory/Sidekiq (lease/reserve, retry-with-backoff, dead-letter)
   and the `resilience`/`jwt` sibling clock-injection pattern are behavioral/design references only.
-- **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key (plus `Db.keys(prefix)` since 2026-09-30; no record scan, and the id-counter replay below does not use it); a
+- **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key (plus a key listing, `Db.keys(prefix)`; no record scan, and the id-counter replay below does not use it); a
   queue must *enumerate* ready work, so jobqueue keeps its own index (`jobs`, the ready pair
   `pending`/`parts`, `leased`, `dlq`) and uses `kv` purely as the durable record of truth,
   rebuilt on `open`.
@@ -81,7 +81,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   sweep (`reapExpiredLeases`, like `kv`'s caller-driven `compact`); the in-memory index is not
   internally locked.
 
-- **Operator tools (2026-10-04).** `cancel(id)`: a ready, scheduled or dead job is deleted
+- **Operator tools.** `cancel(id)`: a ready, scheduled or dead job is deleted
   durably (`kv.delete`, as `ack`) and its unique key released; a leased one is
   `error.JobLeased` (the worker owns it until ack/nack/lapse). The dispatch heaps have no removal
   by id, so a cancelled ready job leaves a **tombstone** entry: `migrateDue` and `dequeue` drop an
@@ -90,7 +90,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   persists the job as ready (attempts reset to 0, or kept one short of the limit) at `run_at`
   (default now) before touching the index. `extendLease(lease, t)` sets the monotonic deadline to
   `now + t` for the current lease only (`StaleLease` otherwise). `status(id)` reads the index.
-- **Lease release (2026-11-19).** `release(lease, .{ .delay_ns })` hands a lease back without
+- **Lease release.** `release(lease, .{ .delay_ns })` hands a lease back without
   counting an attempt: the job returns to `pending` with its attempts, priority and id unchanged,
   never dead-letters, and keeps its `unique_key`. With `delay_ns == 0` it rejoins its partition
   heap at its old FIFO place at once; with a delay it is invisible until then, so newer jobs of the
@@ -107,7 +107,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ChangeMessageVisibility` to 0 (SQS is the outlier: its receive count still grows). Majority:
   a (lease, delay) call that consumes no attempt; the name follows beanstalkd (and Laravel's
   `release($delay)`). Sidekiq/Asynq have no worker-side equivalent (a job re-enqueues itself).
-- **Dequeue with exclusions (2026-11-19).** `DequeueOptions.exclude` lists partitions to pass
+- **Dequeue with exclusions.** `DequeueOptions.exclude` lists partitions to pass
   over: `bestReady` skips their heaps, so nothing of an excluded partition is leased, popped or
   changed (a tombstone at its top stays until a dequeue that does not exclude it). A `partition`
   filter that is excluded gives null. Empty = the plain dequeue (the loop over the list does not
@@ -130,105 +130,91 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   non-empty, `max_attempts ≥ 1`, `attempts ≤ max_attempts`, a ready job below its limit — the
   rest is `CorruptRecord` (a dead record with `max_attempts` 0 would underflow in `requeueDead`).
 - **Recovery ownership.** Every slot (`jobs`, unique index, pending/dlq) is reserved before a
-  recovered job is indexed, so an allocation failure frees the job once; before 2026-10-04 an
-  OOM after `jobs.put` freed it here and again in `open`'s `freeIndex`.
+  recovered job is indexed, so an allocation failure frees the job once.
 
-## Threat model / out of scope
+
+## Threat model / limits
 
 Not a security boundary — durability/correctness, not adversarial hardening:
 - **At-least-once delivery, explicitly not exactly-once.** A lease is an in-memory, single-process
   reservation (`kv` has no cross-process lock); a crash re-exposes every un-acked job as ready on
-  the next `open`. A stale lease (timeout lapsed, job reaped/re-leased) cannot `ack`/`nack` — it
-  gets `error.StaleLease`. The consumer must be idempotent; this module does not enforce that.
+  the next `open`. A stale lease (timeout lapsed, job reaped/re-leased, released) cannot
+  `ack`/`nack`/`extendLease`/`release` — it gets `error.StaleLease`. The consumer must be idempotent;
+  this module does not enforce that.
 - **`max_payload` cap** (default 1 MiB) bounds per-job memory; large blobs should be referenced out
-  of band (e.g. via `blobstore`), not inlined.
-- **Out of scope:** cross-process/durable leases (v1 is single-process, in-memory), rate-limited
-  dispatch (compose `ratelimit` separately), cron-expression schedules (only `delay_ns`/`run_at`).
+  of band (e.g. via `blobstore`), not inlined. `job_type`, `partition` and `unique_key` are capped
+  at `max_field_len` (4096).
+- **Damaged stored records** are refused with `error.CorruptRecord` (or decode to a job that keeps
+  every invariant), never a panic; `open` refuses a store that holds two live jobs with one
+  `unique_key`.
+- **Not provided:** cross-process leases and cron-expression schedules (see *Backlog / deferred*),
+  exactly-once and rate-limited dispatch (see *What is deliberately not done*).
+
+## What is deliberately not done
+
+- **Exactly-once delivery.** The queue is at-least-once; the idempotent consumer is the
+  application's job (see *Threat model*).
+- **Rate-limited dispatch inside the queue.** Compose the `ratelimit` module around `dequeue`.
 
 ## Verification
 
-Tests run over the `kv.SimStorage` fault-injecting fake covering enqueue/dequeue/ack/nack lifecycle,
-lease expiry + `reapExpiredLeases`, retry backoff + DLQ transition, partition-FIFO ordering under
-priority, `run_at`/`delay_ns` visibility gating, `StaleLease` rejection, and crash-recovery replay
-of the durable id-counter/orphan-record invariant. The dispatch order is pinned specifically by:
-priority within one partition; cross-partition independence (an all-`critical` partition must not
-reorder another partition's FIFO); a `critical` job that is *not* returned before its schedule even
-though it outranks everything visible; that same job winning once it is due; deterministic FIFO
-among equal priorities across partitions; and a wall-clock step backwards re-hiding an
-already-eligible job. The `run_at` boundary is pinned **from both sides at nanosecond
-granularity** — invisible at `run_at - 1`, dispatched at exactly `run_at`, and re-hidden by a
-clock step back of a single nanosecond — because both the migration gate and the pop-time
-re-check compare at ns granularity, and a millisecond-scale test cannot tell an off-by-one
-there. Run: `zig build test-jobqueue`.
-
-**2026-10-04 (mvp → core).** Class C (no wire format of its own), so the oracle is a model:
-tests for cancel in every state (incl. the tombstone skipped by `dequeue` and a scheduled one
-dropped at its time, durable across a crash), `requeueDead` with and without a reset (durable),
-the heartbeat boundary (an extended deadline is inclusive, a reaped lease can neither extend nor
-ack), unique keys across ack / cancel / dead / reopen, and that keyless jobs are still version-1
-records. **Seeded corrupt-record sweep** (2 × 20 000 damaged v1/v2 encodings: length fields,
-version, state/priority, attempt counts, truncation, random bytes): `CorruptRecord` or a job that
-keeps the invariants, never a panic — measured 6 732 decoded (2 865 v2), 33 268 refused.
-**Seeded model sweep** (60 seeds × 250 ops: enqueue with keys/delays/priorities, dequeue, ack,
-nack, extend, reap with clock moves, cancel, requeueDead, crash-reopen) comparing every job's
-status and all four counts with a model after every step — measured 588 acks, 683 cancels, 53
-requeues, 1 212 refused duplicates, 1 226 crashes (since 2026-11-19 the op mix also has `release`
-with a random delay, which must never dead-letter, and dequeues with an exclusion list: the
-only partition excluded must lease nothing, an unknown one changes nothing). **Mutation 2026-10-04:** 23 mutants
-(schemata, ReleaseSafe), 3 survived the first run, each killed by a crafted-record test with its
-reason (a keyless v2 record; a dead record with `max_attempts` 0; two live jobs with one key in a
-store); 0 surviving. The dependent `writebehind` passes its modtest.
-
-**Delta mutation 2026-11-19 (`release`).** 10 mutants over the new `release` (schemata, ReleaseSafe,
-baseline first): validation skipped, the ready-slot reservation skipped, the delay test forced
-true / false, the delay not added, the rollback of `run_at` and the error return after a failed
-persist skipped, the lease not removed, the epoch not bumped, the commit skipped. 9 killed (the
-reservation by `appendAssumeCapacity`'s assertion, with a test that takes the schedule heap's
-spare room away first), 1 EQUIVALENT: not bumping the epoch — `leased.remove` alone already makes
-the released lease stale (`validate` needs the id leased), and the next `dequeue` bumps the epoch
-itself before it hands out a new lease. Card cumulative: 23 + 10 mutants, 23 + 9 killed, 1
-equivalent.
-
-**Delta mutation 2026-11-19 (`DequeueOptions.exclude`).** 5 mutants: the exclusion of a filtered
-partition and of an unfiltered one dropped, the match never / always true, the list not passed
-to `bestReady`. 5/5 killed. Card cumulative: 33 + 5 mutants, 32 + 5 killed, 1 equivalent.
+Run: `scripts/modtest jobqueue`; the example (`example/main.zig`) is built by
+`zig build check-examples -Dmodule=jobqueue`. Class C (no wire format of its own), so the oracle is
+a model, not a foreign implementation. The tests run on `kv.SimStorage` (the fault-injecting
+fake) with fake wall and monotonic clocks, so crashes, lease expiry and the schedule are
+deterministic.
+- **Lifecycle and recovery:** enqueue -> lease -> ack (never reappears), the visibility timeout
+  with `reapExpiredLeases` (attempt bumped), nack backoff and the exponential `computeBackoff`
+  (capped, deterministic without jitter), dead-letter after `max_attempts`, crash recovery (acked
+  stays gone, leased-not-acked returns ready, a dead job stays dead, no duplicate or loss, the
+  orphan-record invariant of the durable id counter), the payload and field caps.
+- **Dispatch order**, pinned specifically by: partition FIFO (the taskqueue-fold oracle),
+  priority within one partition, a high job ahead of an earlier low, the FIFO tiebreak among
+  equals, cross-partition independence (an all-`critical` partition must not reorder another
+  partition's FIFO), deterministic FIFO among equal priorities across partitions, a `critical` job
+  that is not returned before its schedule even though it outranks everything visible, that same
+  job winning once due, and a wall-clock step backwards re-hiding an already-eligible job. The
+  `run_at` boundary is pinned from both sides at nanosecond granularity (invisible at `run_at - 1`,
+  dispatched at `run_at`, re-hidden by a one-nanosecond step back), because the migration gate and
+  the pop-time re-check both compare at nanosecond granularity.
+- **Operator tools and later additions:** `cancel` in every state (including the tombstone skipped
+  by `dequeue`, a scheduled one dropped at its time, durable across a crash), `requeueDead` with
+  and without a reset, the heartbeat boundary (an extended deadline is inclusive; a reaped lease
+  can neither extend nor ack), unique keys across ack / cancel / dead / reopen, `status`,
+  `release` (no attempt counted, never dead-letters, keeps its FIFO place without a delay, a stale
+  released lease, a delay survives a reopen and without one nothing is written, the unique key stays
+  held), `DequeueOptions.exclude` (other partitions served in order, an excluded one untouched,
+  an excluded tombstone stays put), and records: keyless jobs are still version-1, `decodeJob`
+  refuses what the module never writes (a keyless v2 record, a dead job with `max_attempts` 0),
+  `open` refuses two live jobs with one key.
+- **Seeded sweeps:** a damaged-record sweep over `decodeJob` (v1 and v2 encodings with length
+  fields, version, state/priority, attempt counts, truncation and random bytes damaged: always
+  `CorruptRecord` or a job that keeps the invariants, with floors on how many inputs decode and how
+  many are refused), and a model sweep (many seeds of random operations: enqueue with keys, delays
+  and priorities, dequeue with and without an exclusion list, ack, nack, extend, reap with clock
+  moves, cancel, `requeueDead`, `release` with a random delay, crash-and-reopen) that compares
+  every job's status and all the counts with a model after every step.
+- **Fuzz:** the card records no fuzz obligation (the seeded sweeps above are ordinary tests, not an
+  `JOBQUEUE_FUZZ` driver).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
+- **Dependents:** `writebehind` builds on this module; run its modtest after a change here.
 
 ## Backlog / deferred
 
-- **Durable/cross-process leases** — v1 leases live in memory (single-process worker model); no
-  cross-process lock exists in `kv`.
-- **Exactly-once** — this is at-least-once; the idempotent consumer is the app's job.
-- **Rate-limited dispatch** — compose the `ratelimit` module later.
-- **Cron-expression schedules** — v1 has only `delay_ns`/`run_at`; no `* * * * *` parsing.
-- ✅ (done 2026-11-19, see "Lease release" under Design) **Release a lease without counting an
-  attempt** (from writebehind, F5b).
-- **A background maintenance thread & compaction-trigger policy** — the visibility sweep
+- **Durable, cross-process leases.** Leases live in memory (single-process worker model); several
+  worker processes would need a shared queue and a cross-process lock in `kv`. Effort: large.
+- **Cron / repeating schedules.** Only `delay_ns`/`run_at` exist; no `* * * * *` parsing. Needs a
+  cron-expression parser (check for a sibling module first; a caller can enqueue the next run with
+  `run_at`, and a scheduler is a separate module's job). Effort: medium.
+- **Worker runtime** (concurrency, graceful shutdown, handler dispatch by job type): Sidekiq and
+  Asynq ship it; here the caller writes the loop (`workerpool` exists as a sibling). Likely a
+  separate module composing `jobqueue` + `workerpool`. Effort: medium.
+- **A background maintenance thread and compaction-trigger policy.** The visibility sweep
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
-- **Fair-share / weighted dispatch across partitions** — dispatch is strict priority; there is no
-  round-robin or weighting over partitions. Pin a worker to a partition if you need isolation.
-- An early id-arithmetic priority hack (from an earlier design iteration) silently clobbered
-  records — jobqueue's real `priority` field replaces it (already fixed, not an open gap).
-
-**2026-10-04:** dead-letter requeue / discard (`requeueDead`, `cancel`), job cancel, lease
-extension and unique jobs are **done**. Still deferred: cron (needs a cron-expression parser —
-no sibling module exists; a caller can enqueue the next run with `run_at`, and a scheduler is a
-separate module's job), durable cross-process leases (needs a cross-process lock in `kv`), the
-worker runtime (a separate module composing `jobqueue` + `workerpool`), weighted partitions, and a
-TTL on unique keys (no consumer asked; ack/cancel release them).
-
-- ✅ (found implemented 2026-11-17: `Queue.cancel`/`Queue.requeueDead` in src/root.zig) (survey 2026-09-30) **Dead-letter requeue / discard and job cancel** — every peer lets an operator retry a dead job from the UI or API; here `deadLetterList` is read-only. Effort: small. Fits CONVENTIONS §2.
-- ✅ (found implemented 2026-11-17: `Queue.extendLease` in src/root.zig) (survey 2026-09-30) **Lease extension (heartbeat)** — a job that outlives its visibility timeout is re-leased while still running (`StaleLease` on ack); Sidekiq/Asynq handle long jobs with timeouts and extension. Effort: small. Fits §2.
-- ✅ (found implemented 2026-11-17: `EnqueueOptions.unique_key` in src/root.zig) (survey 2026-09-30) **Unique / de-duplicated jobs** — asynq README lists it as a headline feature; here a double enqueue is two jobs. Effort: small-medium (key index in the in-memory map). Fits §2.
-- (survey 2026-09-30) **Cron / repeating schedules** — `apalis-cron`, BullMQ repeatables, Sidekiq's scheduler; listed above as deferred. Effort: medium (needs a cron-expression parser; check for a sibling module first). Fits §2.
-- (survey 2026-09-30) **Durable, cross-process leases** — multiple worker processes need a shared queue; a lease is in-memory, single-process (listed above). Effort: large (needs a cross-process lock in `kv`). Fits §2.
-- (survey 2026-09-30) **Worker runtime (concurrency, graceful shutdown, handler dispatch by job type)** — Sidekiq/Asynq ship it; here the caller writes the loop (`workerpool` exists as a sibling). Effort: medium, likely a separate module composing `jobqueue` + `workerpool`. Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · posix · both · single_owner` + deps: `kv` — canonical source is `pub const meta` in
-src/root.zig.
+- **Fair-share / weighted dispatch across partitions.** Dispatch is strict priority; there is no
+  round-robin or weighting over partitions. Pin a worker to a partition for isolation.
+- **A TTL on unique keys.** A key is held until ack/cancel; Asynq's can expire. No consumer asked.
 
 ## Anchoring
 
