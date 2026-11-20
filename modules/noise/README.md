@@ -6,7 +6,7 @@ DH/cipher/hash `Suite`, reusable for any Noise-based protocol — unlike the
 `wireguard` module's `noise.zig`/`handshake.zig`, which hard-wire
 WireGuard's fixed `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` instantiation and
 already implement its KDF. This module has **zero dependency** on
-`wireguard`; its only sibling dependency is `chachapoly` (the AEAD).
+`wireguard`; its only sibling dependencies are `chachapoly` and `aesgcm` (the AEADs).
 
 **Status: implemented.** The `CipherState` / `SymmetricState` /
 `HandshakeState` methods (spec §5) run for real over the

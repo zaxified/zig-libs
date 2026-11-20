@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [spiral-ladder/noiz](https://github.com/spiral-ladder/noiz) | Zig | MIT | 11 | pushed 2025-06-19 | The Zig peer: work-in-progress; README: every rev-34 primitive except Curve448, cacophony vectors. Zig 0.14, stale. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | Provides the primitives (X25519, ChaCha20-Poly1305, AES-GCM, SHA-2, BLAKE2) but no Noise framework. |
 
-**Where we are ahead:** current (Zig 0.17), zero dependencies beyond std, comptime suite with no vtable, and six noise-c vectors checked byte-exact including the handshake hash. **Where we are behind** (re-checked 2026-10-04): no `fallback` modifier (snow lacks it too), no X448 bound by default (std has none; a caller plugs the `ed448` sibling's X448 in by `noise_name`), no runtime-selected suite (types are comptime; `Suite.matches` checks a parsed name against the binding), no hybrid/PQ handshakes. Built since the survey: all 38 patterns, PSK modifiers, protocol-name parsing, pluggable DH/AEAD/hash naming, the checked `init`.
+**Where we are ahead:** current (Zig 0.17), no dependency beyond std and the sibling AEAD modules `chachapoly` and `aesgcm`, comptime suite with no vtable, and 87 snow cacophony vectors (every catalog pattern) plus six noise-c vectors checked byte-exact including the handshake hash. **Where we are behind** (re-checked 2026-10-04): no `fallback` modifier (snow lacks it too), no X448 bound by default (std has none; a caller plugs the `ed448` sibling's X448 in by `noise_name`), no runtime-selected suite (types are comptime; `Suite.matches` checks a parsed name against the binding), no hybrid/PQ handshakes. Built since the survey: all 38 patterns, PSK modifiers, protocol-name parsing, pluggable DH/AEAD/hash naming, the checked `init`.
 
 ## Design
 
@@ -75,79 +75,52 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (`Hash.digest_length`) — matching spec §5.1/§5.2 verbatim rather than
   deriving `k`'s width from `Cipher.key_length`.
 
-## Status
-
-**Implemented.** Every §5 method — `CipherState.{initializeKey, hasKey,
-setNonce, encryptWithAd, decryptWithAd, rekey}`, `SymmetricState.
-{initializeSymmetric, mixKey, mixHash, mixKeyAndHash, getHandshakeHash,
-encryptAndHash, decryptAndHash, split}`, `HandshakeState.{initialize,
-writeMessage, readMessage}` — is real: no `@panic`/TODO stub remains in
-`state.zig`. DH exchange, AEAD seal/open, and the HKDF/HMAC ratchet are
-all wired up over the comptime-bound `Suite(DH, Cipher, Hash)`.
-
-The implementation follows the plan that used to live in this section
-(§5.1 nonce encoding for `CipherState`, a from-scratch HKDF ratchet for
-`SymmetricState` generic over `Hash` — not imported from `wireguard`,
-since this module has zero deps — and the §5.3 `WriteMessage`/
-`ReadMessage` token-by-token pseudocode for `HandshakeState`).
+- **Scope of the implementation.** Every §5 method (`CipherState`, `SymmetricState`, `HandshakeState`) runs over the
+  comptime-bound `Suite`; the HKDF/HMAC ratchet is this module's own over the bound `Hash` (nothing is imported from
+  `wireguard`). The sibling `bolt8` does not use `HandshakeState`: it builds on `Suite.SymmetricState` with its
+  secp256k1 DH adapter and drives its own handshake.
 
 ## Verification
 
-Per `CONVENTIONS.md` §7's "Protocol codecs" tier: golden/known-answer
-vectors anchor this module. `state.zig` embeds six official noise-c
-vectors (the `cacophony` JSON format, from rweather/noise-c's `vectors/`
-directory), transcribed as byte literals and run end-to-end through
-`HandshakeState`/`CipherState`: `Noise_NN_25519_ChaChaPoly_SHA256`,
-`Noise_NK_25519_ChaChaPoly_SHA256`, `Noise_XX_25519_ChaChaPoly_SHA256`
-(covers both `es` and `se` token directions), `Noise_IK_25519_ChaChaPoly_
-SHA256` (covers `es`+`ss`+`se`), `Noise_XX_25519_ChaChaPoly_BLAKE2s` (a
-second hash function), and `Noise_IK_25519_ChaChaPoly_SHA512` (HASHLEN=64
-truncation to 32-byte keys). Each vector checks every transport-message
-ciphertext AND the final `handshake_hash`, byte-exact. Beyond the KATs:
-`SymmetricState`'s HKDF is checked against RFC 5869 HKDF with empty info;
-self-consistency round-trips exercise all four patterns with generated
-(non-vector) ephemerals; a tampered-message test asserts AEAD auth
-failure; a fuzz test asserts `HandshakeState.readMessage` never panics on
-arbitrary bytes. Also exercised indirectly end-to-end by the sibling
-`bolt8` module, whose BOLT#8 appendix vectors run over this framework.
+Run: `scripts/modtest noise`; fuzz: `NOISE_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver, harnesses
+`noise-handshake` and `noise-transport`; never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh noise`.
 
-**2026-10-04 (mvp → core).** noise-c's vector files predate the rev-34 PSK
-modifiers (they carry the old `NoisePSK_` scheme), so the new anchor is snow's
-`tests/vectors/cacophony.txt` (the cacophony format for rev 34): 87 vectors,
-copied verbatim into `src/testdata/cacophony-subset.json` by
-`tools/extract-vectors.py` — every `Noise_*_25519_ChaChaPoly_SHA256` vector (all
-15 fundamental and 23 deferred patterns, 21 PSK variants) plus IK, KK1, NNpsk0,
-XXpsk3 under the other seven 25519 suites. Each is resolved by the run-time name
-parser, opened with the checked `init` and run byte-exact (every handshake and
-transport message, the handshake hash), ChaChaPoly ones under both AEADs (158
-runs); a test asserts every catalog pattern is anchored. The deferred patterns'
-token lists were written from the spec and matched the vectors first time.
-Further: `init` refusals per class; a `noise_name` adapter reproduces the std
-transcript and a different name changes it. **Seeded sweeps** (deterministic):
-10 000 random token patterns with random key sets — whatever `init` accepts for
-both sides completes, both agree on the handshake hash and keys (measured 372
-accepted, 91 with PSKs, 9 628 refused); 2 400 handshakes of XX/IK/KK1/NX/XXpsk3/
-NNpsk0 with one message bit-flipped, truncated or extended — refused at once
-(2 072) or, only for an unkeyed first message, accepted and then caught by the
-next message every time (328/328); 20 000 hostile names — parse or refuse, never
-panic. **Mutation 2026-10-04:** 25 mutants over parser, PSK placement, `init`,
-suite matching, nonce layout and the PSK `e` rule; 5 survived the first run: 4
-equivalent (longest-prefix choice, lower-case filter vs longest, the explicit
-`fallback` branch, the DH-needs-own-static check) — the redundant branches were
-removed; 1 killed by a new test (a pre-message `e` without the key). 0 surviving.
-Dependents `tenantkex` and `bolt8` pass their modtests.
+- **Known-answer vectors.** `src/vectors_test.zig` runs 87 vectors from snow's `tests/vectors/cacophony.txt` (the
+  cacophony format for rev 34), copied verbatim into `src/testdata/cacophony-subset.json` by
+  `tools/extract-vectors.py` (attribution in `NOTICE`): every `Noise_*_25519_ChaChaPoly_SHA256` vector (all fundamental
+  and deferred patterns, the PSK variants) plus IK, KK1, NNpsk0 and XXpsk3 under the other 25519 suites. Each is
+  resolved by the run-time name parser, opened with the checked `init` and run byte-exact (every handshake and
+  transport message, the handshake hash); ChaChaPoly vectors run under both AEADs. A test asserts every catalog
+  pattern is anchored. `src/state.zig` also embeds six official noise-c vectors (NN, NK, XX, IK over SHA-256, XX over
+  BLAKE2s, IK over SHA-512) as byte literals, checking every transport ciphertext and the final handshake hash.
+- **Primitives.** `SymmetricState`'s HKDF against RFC 5869 with empty info; the nonce layout, auth failure leaving
+  `n` unchanged, `rekey` against the spec formula, `initializeSymmetric` padding and hashing.
+- **Refusals.** `init` per class (missing keys, PSK count, invalid pattern, a pre-message `e` without its key); a
+  tampered or truncated handshake message fails cleanly; an identity-point remote static key is rejected; the PSK
+  modifier placement and refusals; the protocol-name parser on the spec §8 examples.
+- **Pluggable names.** A primitive declaring `noise_name` joins a suite and the name reaches the transcript; std's
+  `Aes256Gcm` and `aesgcm`'s are identified alike.
+- **Seeded sweeps** (deterministic): random token patterns with random key sets (whatever `init` accepts for both
+  sides completes and both agree on the handshake hash and keys); handshakes with one message bit-flipped, truncated
+  or extended (refused at once or, for an unkeyed first message, caught by the next); random hostile protocol names
+  (parse or refuse, never panic).
+- **Fuzz.** `noise-transport` (damage, replay, reorder and rekey of the transport `CipherState`s) and
+  `noise-handshake` (every catalog pattern plus XXpsk3 and IKpsk2 with one message damaged, at `.scale` 3), with
+  reach checks; `HandshakeState.readMessage` on arbitrary bytes.
+- **Constant time:** `src/ctgrind_harness.zig` (XXpsk3 statics, ephemerals and PSK, and the transport keys, tainted);
+  the verdicts are the card's Hardening line.
+- **Dead stack:** `src/stackprobe_test.zig`, ReleaseFast/ReleaseSmall only (see *Secret residue on the dead stack*).
+- **Dependents:** `tenantkex` and `bolt8` (BOLT#8 appendix vectors over `Suite.SymmetricState`) run on this module.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Secret residue on the dead stack
 
-Reviews 2026-10-08 (`bolt8`'s probe) and 2026-10-09 (this module's `src/stackprobe_test.zig`,
-ReleaseFast only; a full `XXpsk3` handshake on `DefaultSuite`, 41 needles: both static and both
-ephemeral private keys raw and as X25519 clamps them, `ee`/`es`/`se`, the PSK, every HKDF
-`temp_key`, `ck` and `k` after each `MixKey`, the `MixKeyAndHash` output, both transport keys,
-plus a control needle; NEG 0, POS 1). Before: residue in `HandshakeState.init`/`initialize` (the
-static key, 12 per 3 runs), in `writeMessage`/`readMessage` (the ephemeral key, the transport keys
-on the completing calls: i2r 12 / r2i 9) and in `SymmetricState.mixKey`/`mixKeyAndHash`/`split`
-(`ck`, `k`, the split keys). Depth measured: `writeMessage`/`readMessage` 3.2 KiB, `init`
-2.6 KiB, the HKDF steps 1.3 KiB. After: 0 in every probed call.
+A probe (`src/stackprobe_test.zig`, ReleaseFast only) runs a full `XXpsk3` handshake on `DefaultSuite` and scans
+the dead stack below each entry point for needles: both static and both ephemeral private keys, raw and as X25519
+clamps them, `ee`/`es`/`se`, the PSK, every HKDF `temp_key`, `ck` and `k` after each `MixKey`, the `MixKeyAndHash`
+output, both transport keys, plus a control needle (a zero is readable only next to the negative and positive
+controls). Every probed call must leave no residue.
 
 What is burned (`src/burn.zig`, one frame down, then volatile vector stores): the three keyed
 `CipherState` calls, `SymmetricState.mixKey`/`mixKeyAndHash`/`split`, `HandshakeState.init`/
@@ -156,7 +129,7 @@ What is burned (`src/burn.zig`, one frame down, then volatile vector stores): th
 `initialize` take `*const Keys` and initialize the state in place; `split` and `writeMessage`/
 `readMessage` write the transport pair to an out-parameter (`Step` is `{ len, complete }`).
 
-Burn sizes are per suite (2026-10-09): `Suite.burns` = `burn.Sizes.of(dh, cipher, hash)`, from the
+Burn sizes are per suite: `Suite.burns` = `burn.Sizes.of(dh, cipher, hash)`, from the
 stack each primitive dirties (`state.stack_bytes`; measured ReleaseFast x86_64: X25519 1.8 KiB,
 std ChaChaPoly 0.5, AES-256-GCM 1.4, HMAC-SHA256 0.8, -SHA512 1.5, -BLAKE2s 0.6, -BLAKE2b 1.0 KiB;
 `chachapoly` counts 0, it burns its own tree), doubled, plus this module's frames, with the
@@ -164,9 +137,8 @@ default suite's sizes as floors (cipher 1 KiB, HKDF 4 KiB, init 4 KiB, handshake
 primitive outside std declares `pub const noise_stack_bytes`; without it the fallback is DH
 40 KiB, AEAD/hash 4 KiB. The probe checks (a) each std primitive within its claimed size (red
 when a std release grows one) and (b) each burned entry point's dirty depth within its burn +
-512 B, on all twelve std suites (X25519 × 3 AEADs × 4 hashes) and a P-384 adapter (11.3 KiB;
-declared 16 KiB → handshake burn 33 KiB; undeclared → 81 KiB). (b) compares depths, not
-needles: needles run on the default suite only.
+512 B, on all twelve std suites (X25519 × 3 AEADs × 4 hashes) and a P-384 adapter, declared and
+undeclared. (b) compares depths, not needles: needles run on the default suite only.
 
 NOT covered, honestly:
 - a non-std primitive that declares a `noise_stack_bytes` smaller than what it dirties, or dirties
@@ -179,21 +151,19 @@ NOT covered, honestly:
 - `getHandshakeHash`, `mixHash`, `encryptAndHash`/`decryptAndHash` (the keyed work happens in the
   already burned `CipherState` calls; the transcript hash is public).
 
+## What is deliberately not done
+
+- **A runtime-chosen suite** — Zig binds primitives at comptime; dispatching over a closed set of suites is a few
+  lines of the caller's `inline for`, as `vectors_test.zig` does. `Suite.matches` checks a parsed name against the
+  binding.
+- **X448 by default (Curve448 DH)** — std has none; the `ed448` sibling's X448 plugs in through `noise_name` as an
+  adapter type in the caller, so `noise` takes no dependency on it.
+
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-**2026-10-04:** the catalog, PSK modifiers with name parsing, and pluggable DH naming are **done**.
-Still deferred: the `fallback` modifier (Noise Pipes, §10.2 — a role switch mid-session; snow omits
-it too, no consumer), X448 by default (std has none and this module depends only on `chachapoly`;
-the `ed448` sibling's X448 plugs in through `noise_name` in the caller), a runtime-chosen suite
-(Zig binds primitives at comptime; dispatching over a closed set of suites is a few lines of the
-caller's `inline for`, as `vectors_test.zig` does).
-
-- ~~**The rest of the §9 pattern catalog as data**~~ **DONE 2026-10-04** (see the line above; the text below is the 2026-09-30 survey as written): (NX, XN, XK, KN, KK, KX, IN, IX, one-way N/K/X, deferred and PSK-modified variants) *(survey 2026-09-30)*: snow, noise-c and flynn/noise ship them; `patterns.zig` says only NN/NK/XX/IK are done and "add entries following the same shape". `HandshakePattern` is public data, so a caller can define one, but the common named patterns should be shipped. Effort: small (token lists, KATs in noise-c's vector set). Fits §2.
-- ~~**Pluggable DH (and name derivation) instead of a type lookup**~~ **DONE 2026-10-04** (see the line above; the text below is the 2026-09-30 survey as written): *(survey 2026-09-30)*: `state.zig` `dhName` is a chain of `T == std.crypto.dh.X25519` and otherwise `@compileError`; `hashName`/`cipherName` are the same. The sibling `bolt8` (secp256k1) documents that it could not use `HandshakeState` for exactly this reason (`bolt8/src/handshake.zig` header). Effort: small (a decl such as `pub const noise_name` on the DH/cipher/hash type, or a name parameter). Fits §2.
-- ~~**PSK and fallback modifiers with pattern-name parsing**~~ **DONE 2026-10-04 except `fallback`** (see the line above; the text below is the 2026-09-30 survey as written): (`Noise_XXpsk3_...`) *(survey 2026-09-30)*: the `psk` token is implemented in `HandshakeState` but no PSK-modified pattern is defined and no `psk<n>` modifier is applied; snow supports all modifiers but `fallback`. Effort: small-medium. Fits §2.
-- **Curve448 DH** *(survey 2026-09-30)*: noise-c has it, noiz omits it because std lacks it; sibling `ed448` provides X448. Effort: small once DH is pluggable. Note: `noise` depends only on `chachapoly`, so X448 is an adapter type in the caller (declaring `noise_name`), not a dependency.
+- **The `fallback` modifier** (Noise Pipes, §10.2 — a role switch mid-session): deferred, no consumer; snow omits it
+  too. It is refused today as `UnsupportedModifier`.
+- **AES-GCM bulk path not re-measured** since the cipher moved to the `aesgcm` module (Zig 0.17 #36256).
 
 ## Anchoring
 
@@ -202,4 +172,4 @@ caller's `inline for`, as `vectors_test.zig` does).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** official cacophony vectors from rweather/noise-c, byte-exact incl. handshake hash
+**What the tests actually contain.** official cacophony vectors from rweather/noise-c and snow's 87-vector `cacophony.txt` subset, byte-exact incl. handshake hash
