@@ -8,10 +8,8 @@
 //! parity, which is one bit derived from the secret nonce hash)"), as an
 //! actual committed program instead of a sentence nobody re-checks. Run it
 //! through `zig build ctgrind -Dctgrind-module=bip340 -Dctgrind-valgrind=…`
-//! plus `valgrind --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no
-//! per-module TARGETS/MODES/PATTERN/LABEL entry for `bip340` yet; the
-//! suggested lines are at the bottom of this comment for the coordinator to
-//! paste in.
+//! plus `valgrind --tool=memcheck` by hand, or through `scripts/checks/ctgrind.sh
+//! bip340` (expected rows in `scripts/checks/ctgrind-expected.tsv`).
 //!
 //! NOT wired into `zig build test-bip340` — memcheck's context count is
 //! valgrind's own output, not something a Zig test can assert on. `zig build
@@ -78,19 +76,6 @@
 //! it always produces contexts of its own. A non-zero total next to a small,
 //! itemised in-file count is what makes the itemisation mean "no branch
 //! found" rather than "the harness never ran".
-//!
-//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
-//!
-//! ```
-//! TARGETS[bip340]="sign"
-//! MODES[bip340]="ReleaseFast"
-//! PATTERN[bip340/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
-//! LABEL[bip340/sign]='bip340 sign+k256 comb+std scalar'
-//! ```
-//! `common[.]zig` in the pattern is std's `crypto/pcurves/common.zig`, reached
-//! through `k256/src/scalar.zig`'s verbatim re-export of std's scalar field —
-//! see the per-line breakdown for why that file is named rather than folded
-//! into "unattr".
 
 const std = @import("std");
 const builtin = @import("builtin");
