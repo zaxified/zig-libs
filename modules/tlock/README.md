@@ -15,7 +15,7 @@ targeting the League of Entropy's **quicknet** beacon
 (`beaconId`/`h1`/`h2`/`h3`/`h4`) and the `Ciphertext` wire struct +
 byte codec are implemented and tested for real — including a byte-exact
 pairing sanity check against a GENUINE, live-fetched quicknet round
-signature (see [SPEC.md](SPEC.md)'s "KAT plan"). The two irreducible
+signature (see [SPEC.md](SPEC.md)'s "Known answers"). The two irreducible
 cryptographic cores, `encrypt`/`decrypt` (the BF-IBE FullIdent
 assembly + the Fiat-Shamir-Okamoto CCA consistency check + a
 module-local constant-time `fp12Pow`), are implemented behind
@@ -121,7 +121,7 @@ Anchoring: the stanza body is checked byte-exact against the genuine
 `tle` fixture's, and drand/tlock's own whole armored `.tle` file decrypts
 here to its published plaintext byte-exactly (so header MAC, STREAM and
 armor agree with Go); round trips and the age specification cover the rest
-(see [SPEC.md](SPEC.md)'s KAT plan).
+(see [SPEC.md](SPEC.md)'s "Known answers").
 
 ## Randomness
 
@@ -156,7 +156,7 @@ zig build test-tlock -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/tlock/
 ```
 
-With `gate.core_implemented = true` (current): all tests PASS,
+With `gate.core_implemented = true`: all tests PASS,
 no skips — the ciphersuite/hash/pairing-sanity/`Ciphertext`-codec tests,
 the `fp12Pow` algebraic-law tests, the gated `encrypt`/`decrypt`
 round-trip and tamper/FO-rejection tests, and the byte-exact drand

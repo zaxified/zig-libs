@@ -20,14 +20,6 @@ drand-style timelock encryption (Boneh-Franklin IBE over
 `bls12_381`) — see [README.md](README.md) for purpose and API.
 Provenance: see [NOTICE](NOTICE).
 
-**Status: REAL — interop-verified.** `ciphersuite.zig` (hashes/DSTs),
-`tlock.Ciphertext` (wire struct + codec), and `tlock.encrypt`/
-`tlock.decrypt` (the BF-IBE FullIdent core, implemented 2026-07-16)
-are all real and tested; `gate.core_implemented = true`. Both cores
-are byte-exact-verified against a GENUINE ciphertext produced by
-drand's own Go implementation (see "KAT plan" below — the interop
-vector caught and fixed a real Gt-representation divergence).
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
@@ -40,9 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) `encrypt/ibe` | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BF-IBE library `drand/tlock` uses. Its `LICENSE` file is the MPL-2.0 text (the module NOTICE calls it Apache-2.0/MIT dual: see the survey report); this module is validated byte-exact against a genuine `tle` ciphertext. |
 | Zig ecosystem | Zig | — | — | — | No Zig timelock/drand-encryption repository found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; armor is whole-buffer only (the age layer, arbitrary-length payloads and streaming encrypt/decrypt of the binary file have landed, see the 2026-10-06 and 2026-11-17 notes below).
-
-**Re-assessed 2026-10-06** (no new web survey): the age layer landed (`age.zig`: `tlock` stanza, header HMAC, STREAM payload, armor, any length) and is now **interop-proven**: drand/tlock's own whole-file fixture (`src/testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`, Go-`tle`-produced, armored) decrypts here to its published plaintext byte-exactly, so armor, header MAC and STREAM agree with Go, not just with the age spec. **Even** with `drand/tlock` and `tlock_age` on the quicknet file format. Still **behind** (Backlog-grade) on the G2-signature testnet scheme and BN254, and on streaming I/O (whole buffers only). Scope `mvp` → `core`.
+**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; armor is whole-buffer only (the age layer, arbitrary-length payloads and streaming encrypt/decrypt of the binary file exist; see *The age layer* and *Streaming encrypt/decrypt*).
 
 ## Scheme variant pinned: quicknet / `SigsOnG1ID`
 
@@ -51,8 +41,8 @@ drand runs four schemes; two are usable for timelock encryption at all
 digest, so its "identity" for a future round is unknowable ahead of
 time — `drand/tlock`'s own `TimeLock`/`TimeUnlock` `switch` excludes
 it). Of the two usable ones this module targets **quicknet**'s
-`SigsOnG1ID` (`"bls-unchained-g1-rfc9380"`) — confirmed live
-(2026-07-16) against `https://api.drand.sh/v2/beacons/quicknet/info`
+`SigsOnG1ID` (`"bls-unchained-g1-rfc9380"`) — confirmed
+against quicknet's chain-info endpoint (`https://api.drand.sh/v2/beacons/quicknet/info`)
 returning exactly that scheme name — NOT the older, deprecated
 `ShortSigSchemeID` (`"bls-unchained-on-g1"`, which reuses the `G2` DST
 for `G1` hashing, a known RFC-9380 non-conformance kept only for
@@ -75,19 +65,19 @@ Setup (external, caller-supplied):
   P_pub ∈ G2                              — beacon master public key
   σ_round ∈ G1, e(σ_round,G2gen)==e(H1(id),P_pub) — round signature == IBE private key
 
-id = beaconId(round) = SHA-256(BigEndian64(round))     — REAL (ciphersuite.zig)
-Qid = H1(id) = hashToCurveG1(id, dst_g1)                — REAL
+id = beaconId(round) = SHA-256(BigEndian64(round))     (ciphersuite.zig)
+Qid = H1(id) = hashToCurveG1(id, dst_g1)
 
-encrypt(P_pub, round, &M, &sigma):      [FABLE CORE — tlock.encrypt]
+encrypt(P_pub, round, &M, &sigma):      [tlock.encrypt]
   Gid   = pairing(Qid, P_pub) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
   U     = r · G2_generator ∈ G2
-  gid_r = Gid^r ∈ Gt                    (Gt SCALAR EXPONENTIATION — see the `Gt` scalar exponentiation section below)
+  gid_r = Gid^r ∈ Gt                    (Gt SCALAR EXPONENTIATION — see the next section)
   V     = sigma XOR H2(gid_r)
   W     = M XOR H4(sigma)
   return (U, V, W)
 
-decrypt(out, σ_round, (U,V,W)):         [FABLE CORE — tlock.decrypt]
+decrypt(out, σ_round, (U,V,W)):         [tlock.decrypt]
   gid_r = pairing(σ_round, U) ∈ Gt      (ONE pairing call — bilinearity gives gid_r for free)
   sigma = V XOR H2(gid_r)
   M     = W XOR H4(sigma)
@@ -101,24 +91,30 @@ decrypt(out, σ_round, (U,V,W)):         [FABLE CORE — tlock.decrypt]
 exact byte layout, including the one little-endian counter inside
 `H3`'s rejection-sampling loop, everything else being big-endian).
 
-## `Gt` (`Fp12`) scalar exponentiation — RESOLVED (option 1 taken)
+## `Gt` (`Fp12`) scalar exponentiation
 
-`encrypt` needs `Gid^r`; `bls12_381.Fp12` exports no `pow`. **Decision
-(2026-07-16 Fable pass): option 1** — a module-local `fp12Pow` in
-`tlock.zig`: a constant-time square-and-multiply-ALWAYS loop over
-`Fp12.square`/`.mul` and a component-wise `Fp2.ctSelect` lift (the
-same branchless idiom `g1`/`g2.scalarMulBytes` use; `r = H3(sigma, M)`
-is secret-derived, so the exponent is treated like a secret scalar).
-No `bls12_381` change — mirrors how `vdf`'s `pow2Mod` is module-local.
-Its exponentiation law is pinned ungated against pairing bilinearity
-(`e(P,Q)^r == e(rP,Q)`) in `tlock.zig`'s tests. Option 2 (an upstream
-`Fp12.pow`) remains open as a future `bls12_381` refactor if a second
-consumer appears.
+`encrypt` needs `Gid^r`; `bls12_381.Fp12` exports no `pow`, so `fp12Pow` is
+module-local in `tlock.zig` (mirroring how `vdf`'s `pow2Mod` is module-local;
+`src/tlock.zig:228`). It is a big-endian fixed-window (4-bit) exponentiation over
+the exponent's canonical 32-byte encoding: a table of `base^0 … base^15` (the base
+is `Gid`, a pairing of public points, so building it needs no protection), then per
+window exactly four squarings and one multiplication, unconditionally, with no
+leading-zero skip (which would leak the exponent's bit length). The window digit
+selects its table entry through a scan of all 16 entries with `fp12CtSelect`, never
+a `table[idx]`, so there is no secret-dependent branch and no secret-dependent
+memory access. `r = H3(sigma, M)` is secret-derived (leaking it leaks `sigma`,
+hence the message), so the exponent is treated like a secret scalar even though
+this is encryption-side randomness. Windowing costs the same 256 squarings as a
+square-and-multiply-always loop but 64 + 15 multiplications instead of 256, about
+1.7x faster per exponentiation. Its law is pinned against pairing bilinearity
+(`e(P,Q)^r == e(rP,Q)`), ungated, in `tlock.zig`'s tests.
 
-## `Gt` serialization — RESOLVED (byte-exact-verified, one real divergence found)
+An upstream `Fp12.pow` in `bls12_381` is the alternative; it is a Backlog item.
 
-The scaffold flagged this as the critical unverified footgun. The
-interop vector proved the flag right, in an unexpected place:
+## `Gt` serialization
+
+This is the critical footgun of the construction, and a self-consistent round trip
+cannot find it; only a genuine drand ciphertext can:
 
 - **Byte nesting: identical, as predicted.** kilic/bls12-381's
   `GT.ToBytes` layout (`c1||c0` per tower level, `c2||c1||c0` inside
@@ -139,7 +135,7 @@ interop vector proved the flag right, in an unexpected place:
   generated directly by `kilic/bls12-381`; vector `n` equals
   `canonical^(3n²)` byte-for-byte in `Fp12.toBytes` layout, checked
   against `ethereum/py_ecc` ground truth for multiple `n`), and
-  (b) the real drand decrypt vector below, which rejects without the
+  (b) the real drand decrypt vector (*Known answers*), which rejects without the
   cube and decrypts byte-exactly with it.
 - **Fix:** `tlock.zig`'s private `gtToDrandRepr` (`gt -> gt³`) applied
   to the pairing/`fp12Pow` output before every `ciphersuite.h2` call
@@ -148,111 +144,128 @@ interop vector proved the flag right, in an unexpected place:
   definition itself is untouched — the caller supplies the element in
   drand's representation.
 
-## KAT plan
+## Known answers
 
-- **Hashes/`H1` (REAL, ungated, done)**: `beaconId` byte-exact against
-  an independently (Python) computed SHA-256 digest;
-  `h1(beaconId(round))` checked on-curve + in-subgroup; and — the
-  strongest check achievable WITHOUT the IBE core —
-  `kat_test.zig`'s pairing-sanity test verifies
-  `e(σ_1000, G2gen) == e(h1(beaconId(1000)), P_pub)` against GENUINE,
-  live-fetched quicknet production data (chain hash
-  `52db9ba7...c84e971`, round 1000 — see `NOTICE`). This is a REAL
-  interop check: `beaconId`'s digest construction and `h1`'s DST are
-  BOTH confirmed correct against an actual published beacon round,
-  using only `bls12_381`'s already-real `hash_to_curve`/`pairing`.
-- **`Ciphertext` codec (REAL, ungated, done)**: round-trip +
-  malformed-`G2`-rejection.
-- **drand interop, byte-exact (GATED, done — the primary vector)**:
-  a GENUINE Go-`tle`-produced ciphertext, decrypted byte-exactly.
-  Source: `github.com/drand/tlock` commit `7ceb44a598293f10c43d2291df
-  9e669c4251fe24`, `testdata/lorem-tle-testnet-quicknet-t-2024-01-17-
-  15-28.tle` — encrypted to testnet beacon quicknet-t (chain
-  `cc9c3984...41a9a5`, scheme `"bls-unchained-g1-rfc9380"`, IDENTICAL
-  to mainnet quicknet's), round 5423142. The age file's `tlock` stanza
-  body is the raw 128-byte `(U,V,W)`; the round signature was fetched
-  live from `https://pl-us.testnet.drand.sh` (2026-07-16) and is
-  pinned by an ungated pairing-sanity test against the quicknet-t
-  public key. The expected plaintext (the 16-byte age file key)
-  recovered by `decrypt` was INDEPENDENTLY verified outside Zig: it
-  authenticates the fixture's age header (HKDF-SHA256/HMAC-SHA256,
-  byte-exact MAC) and its ChaCha20-Poly1305 payload decrypts to a
-  byte-identical copy of the same commit's `testdata/lorem.txt`.
-  `encrypt` is interop-pinned by the same vector: re-encrypting the
-  recovered `(filekey, sigma)` reproduces the Go ciphertext's 128
-  bytes exactly. Gated tests in `kat_test.zig` section 3
-  (decrypt byte-exact, re-encrypt byte-exact, cross-beacon FO
-  rejection).
-- **Round-trip against a real quicknet round signature (GATED,
-  done)**: `encrypt` a fixed `(message, sigma)` under the REAL
-  mainnet quicknet `P_pub`, `decrypt` with the REAL round-1000
-  signature — `kat_test.zig`'s "round trip" test, now running.
-- **`encrypt` determinism with fixed `sigma` (GATED, done)**.
-- **Soundness/CCA (GATED, done)**: tampered `V`/`W`, a wrong-round
-  signature, and a cross-beacon signature all return
-  `error.FoCheckFailed`, never a garbage plaintext (four tests).
-- **`fp12Pow` law (ungated, done)**: `base^0/base^1`, exponent
-  additivity, and the bilinearity cross-check `e(P,Q)^r == e(rP,Q)`.
-- **age envelope (`age.zig`, 2026-10-06).** EXTERNAL: `encrypt` with
-  the fixture's recovered `(filekey, sigma)` writes a stanza line and
-  base64 body whose decoded bytes are the genuine `tle` fixture's 128-byte
-  stanza body, and the file opens under the genuine round-5423142
-  signature. SELF-DERIVED (from the age spec, C2SP `age.md`): the header
-  MAC, the STREAM payload and the armor — round trips at 0, 1, 64 KiB±1,
-  128 KiB and 128 KiB+5 bytes, binary and armored; MAC tampering and a
-  re-spelled stanza line (`HeaderMacMismatch`); a flipped second chunk,
-  truncation at a chunk boundary, inside a tag and inside the nonce, and a
-  changed nonce (all refused, the opened first chunk wiped); 23 typed
-  header refusals, the stanza and size caps, and 11 armor refusals. The
-  primitives are anchored where they live (`chachapoly`: RFC 8439; std's
-  HKDF/HMAC). A `testing.fuzz` harness drives `Header.parse`, `dearmor`
-  and the STREAM opener. A whole Go-produced `.tle` file (drand/tlock's
-  armored fixture) is decrypted end-to-end in `kat_test.zig` (see Backlog).
-- **Mutation run 2026-10-05** (in-place, Debug, 16 mutants over
-  `Ciphertext.fromBytes`, the FO check, `fp12Pow`'s window and
-  constant-time lookup, `gtToDrandRepr`, and every hash's tag, DST,
-  endianness, masking and truncation): 14 killed, by the drand interop
-  vector, the FO-rejection tests, the `fp12Pow` reference and the
-  `beaconId` vector. No test added. Equivalent: the lookup's `== idx` as
-  `<= idx` (entries are merged in ascending order, so the last one taken is
-  still `table[idx]`, and every entry is still read), and dropping the wipe
-  of `message` on the FO-reject path (a stack local the caller never sees
-  once `decrypt` returns the error — hygiene, not observable by value).
+- **Hashes and `H1`:** `beaconId` byte-exact against an independently (Python)
+  computed SHA-256 digest; `h1(beaconId(round))` on-curve and in-subgroup; and,
+  the strongest check achievable without the IBE core, `kat_test.zig`'s
+  pairing-sanity test verifies `e(σ_1000, G2gen) == e(h1(beaconId(1000)), P_pub)`
+  against genuine, live-fetched quicknet production data (chain hash
+  `52db9ba7...c84e971`, round 1000; see `NOTICE`). `beaconId`'s digest
+  construction and `h1`'s DST are both confirmed against an actual published
+  beacon round, using only `bls12_381`'s `hash_to_curve` and `pairing`.
+- **`Ciphertext` codec:** round trip and malformed-`G2` rejection.
+- **drand interop, byte-exact (the primary vector):** a genuine Go-`tle`-produced
+  ciphertext, decrypted byte-exactly. Source: `github.com/drand/tlock` commit
+  `7ceb44a598293f10c43d2291df9e669c4251fe24`,
+  `testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`, encrypted to testnet
+  beacon quicknet-t (chain `cc9c3984...41a9a5`, scheme `"bls-unchained-g1-rfc9380"`,
+  identical to mainnet quicknet's), round 5423142. The age file's `tlock` stanza
+  body is the raw 128-byte `(U,V,W)`; the round signature was fetched live from
+  `https://pl-us.testnet.drand.sh` and is pinned by an ungated pairing-sanity test
+  against the quicknet-t public key. The expected plaintext (the 16-byte age file
+  key) recovered by `decrypt` was independently verified outside Zig: it
+  authenticates the fixture's age header (HKDF-SHA256/HMAC-SHA256, byte-exact MAC)
+  and its ChaCha20-Poly1305 payload decrypts to a byte-identical copy of the same
+  commit's `testdata/lorem.txt`. `encrypt` is interop-pinned by the same vector:
+  re-encrypting the recovered `(filekey, sigma)` reproduces the Go ciphertext's 128
+  bytes exactly. Tests in `kat_test.zig` section 3 (decrypt byte-exact, re-encrypt
+  byte-exact, cross-beacon FO rejection).
+- **Whole-file interop:** both files of that commit are committed under
+  `src/testdata/` (MIT OR Apache-2.0); `kat_test.zig` decrypts the armored `.tle`
+  end-to-end with the pinned round-5423142 signature and compares with `lorem.txt`
+  (so armor, header MAC and STREAM agree with Go, not just with the age spec),
+  refuses it under another chain hash, and refuses a flipped payload byte.
+- **Round trip against a real quicknet round signature:** `encrypt` a fixed
+  `(message, sigma)` under the real mainnet quicknet `P_pub`, `decrypt` with the real
+  round-1000 signature (`kat_test.zig`'s round-trip test); `encrypt` is
+  deterministic with a fixed `sigma`.
+- **Soundness/CCA:** tampered `V`/`W`, a wrong-round signature and a cross-beacon
+  signature all return `error.FoCheckFailed`, never a garbage plaintext.
+- **`fp12Pow` law:** `base^0`/`base^1`, exponent additivity, and the bilinearity
+  cross-check `e(P,Q)^r == e(rP,Q)`.
+- **age envelope (`age.zig`).** EXTERNAL: `encrypt` with the fixture's recovered
+  `(filekey, sigma)` writes a stanza line and base64 body whose decoded bytes are
+  the genuine `tle` fixture's 128-byte stanza body, and the file opens under the
+  genuine round-5423142 signature. SELF-DERIVED (from the age spec, C2SP `age.md`):
+  the header MAC, the STREAM payload and the armor: round trips at 0, 1, 64 KiB±1,
+  128 KiB and 128 KiB+5 bytes, binary and armored; MAC tampering and a re-spelled
+  stanza line (`HeaderMacMismatch`); a flipped second chunk, truncation at a chunk
+  boundary, inside a tag and inside the nonce, and a changed nonce (all refused, the
+  opened first chunk wiped); the typed header refusals, the stanza and size caps,
+  and the armor refusals. The primitives are anchored where they live (`chachapoly`:
+  RFC 8439; std's HKDF/HMAC).
 
 ## Constant-time measurement (ctgrind)
 
-Two targets run under memcheck with the secret tainted; their context counts
-are pinned in `scripts/checks/ctgrind-expected.tsv`.
+Two targets run under memcheck with the secret tainted; their context counts are
+pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
-| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | in `tlock.zig`'s `encrypt`: the `H3` step and the `U = r·G2` scalar multiplication, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit (2026-10-02) |
-| `decrypt` | the round signature handed to `pairing.pairing` | 8 | in `tlock.zig`'s `decryptBody`: the pairing, the `H3` re-derivation and the `U` re-encryption, + the FO compare (`std.mem.eql`) ×2 and the output points' `toAffine`/compression (2026-10-02) |
+| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | in `tlock.zig`'s `encrypt`: the `H3` step and the `U = r·G2` scalar multiplication, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit |
+| `decrypt` | the round signature handed to `pairing.pairing` | 8 | in `tlock.zig`'s `decryptBody`: the pairing, the `H3` re-derivation and the `U` re-encryption, + the FO compare (`std.mem.eql`) ×2 and the output points' `toAffine`/compression |
 
 ⛔ These numbers are **not** a constant-time claim about the pairing.
 `bls12_381/src/pairing.zig` makes none, and `decrypt`'s contexts sit on top of
-that substrate. What the pins hold in place is this module's OWN posture: the
-windowed `Gt` ladder of "option 1" above (audit F3) scans its table without a
-data-dependent skip, and going back to one would move `fp12pow` off 2.
+that substrate. What the pins hold in place is this module's own posture: the
+windowed `Gt` ladder above scans its table without a data-dependent skip, and going
+back to a secret-indexed table would move `fp12pow` off its pinned count.
 
-⚠ **Re-pinned 2026-09-16** — `fp12pow` was 8, `decrypt` was 11. Nothing in this
-module changed. The sibling's Miller loop stopped inverting once per step
-(`bls12_381` `32e751ad` dropped `two_y.inv()` and `t.x.sub(q.x).inv()` from the
-line evaluation), so those branches vanished from underneath. A count that only
-falls looks the same as a harness that stopped reaching the module, so that was
-checked separately: the run still prints a real recovered plaintext.
+The counts also depend on the sibling field code: a change in `bls12_381` (the
+inversion-free Miller loop made them fall, a branchless `Fp.ctSelect` made them
+rise, because memcheck tracks data flow, not control flow, and a compiler-made jump
+on a scalar bit drops the taint) moves them with no change here. A count that only
+falls looks the same as a harness that stopped reaching the module, so after any
+re-pin check separately that the run still prints a real recovered plaintext, and
+read the contexts with `--stacks`.
 
-⚠ **Re-pinned 2026-10-02 — the rise is the sibling's fix, not a regression.**
-`bls12_381`'s `Fp.ctSelect` had no optimization barrier, so inside its ladders
-LLVM lowered the select to a jump on the scalar bit; memcheck tracks data flow,
-not control flow, so that jump dropped the taint and everything downstream of
-`[k]P` looked public. With the select branchless (and `Fr` off
-`std.crypto.ff`) the taint survives and these rows see more of the module:
-`toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
-canonical accept/reject, and `decrypt`'s FO re-encryption compare
-(`std.mem.eql`; accept/reject is public, per the code). Read with `--stacks`.
+## The age layer
 
-## Streaming encrypt/decrypt (2026-11-17)
+`tle` does not ship the raw 128-byte ciphertext: it wraps a random 16-byte file key
+in it as an age `tlock` stanza and encrypts the file itself with age's STREAM, so a
+file of any length can be timelocked. `age.zig` reads and writes that format,
+written from the public age specification (C2SP `age.md`, `age-encryption.org/v1`);
+no age source was read (`src/age.zig:1`).
+
+```
+age-encryption.org/v1
+-> tlock <round> <chain hash, 64 lowercase hex>
+<base64 of U||V||W, no padding, 64 columns per line, last line shorter>
+--- <base64 of HMAC-SHA-256, no padding>
+<16-byte nonce><STREAM payload>
+```
+
+- **File key:** 16 random bytes; the stanza body is `tlock.encrypt(p_pub, round,
+  file_key, sigma)`, and the round signature recovers it.
+- **Header MAC:** `HMAC-SHA-256` keyed with `HKDF-SHA-256(ikm = file_key, salt = "",
+  info = "header")` over every header byte up to and including `---`, compared in
+  constant time (`macEql`, `src/age.zig:290`) before any payload byte is opened.
+- **Payload:** `payload_key = HKDF-SHA-256(ikm = file_key, salt = nonce, info =
+  "payload")`; the plaintext is cut into 64 KiB chunks (`chunk_bytes`), each sealed
+  with ChaCha20-Poly1305 (`chachapoly`, empty AD) under the 12-byte nonce
+  `BE88(counter) || last_flag`. The last chunk may be full; it is empty only when the
+  whole plaintext is.
+- **Armor** (`tle -a`): standard padded base64 of the whole binary file in 64-column
+  lines between `-----BEGIN AGE ENCRYPTED FILE-----` and `-----END AGE ENCRYPTED
+  FILE-----`. Whole-buffer only.
+- **Randomness** is explicit: `age.Randomness` holds the file key, `sigma` and the
+  nonce, so a fixed set reproduces a file byte-exactly; `Randomness.draw` takes all
+  three from `entropy.fill` (fail-closed) and `wipe` zeroes the secrets.
+- **Decryption order:** header syntax, chain hash (if given), the stanza
+  (`FoCheckFailed` on a wrong signature), the header MAC (`HeaderMacMismatch`), then
+  the payload chunk by chunk (`PayloadAuthenticationFailed`; every plaintext byte
+  already written is wiped).
+- **Hostile input:** every parser is fail-closed with a typed error and bounded: the
+  header is capped at `max_header_bytes` (16 KiB) and `max_stanzas` (64); stanza
+  bodies, MAC lines and armor lines must be canonical base64 (std's decoder refuses
+  non-zero trailing bits); nothing past the input is ever read.
+- **Limits:** it opens `tlock`-wrapped files only: a file with no `tlock` stanza is
+  `NoTlockStanza`; other stanzas (an X25519 recipient alongside) are parsed,
+  MAC-covered and skipped; two `tlock` stanzas are `MultipleTlockStanzas` (`tle`
+  never writes that).
+
+## Streaming encrypt/decrypt
 
 `age.encryptStream(gpa, w, r, p_pub, round, chain_hash, rnd)` and `age.decryptStream(gpa, w, r, round_signature, opts)` move a binary age file between a `std.Io.Reader` and a `std.Io.Writer` one 64 KiB STREAM chunk at a time (one allocation of about 128 KiB, wiped before it is freed; the header and keys are small stack values, the call runs under the same dead-stack burn as `encrypt`). **Reference:** drand/tlock (Go) `tlock.New(network).Encrypt(dst io.Writer, src io.Reader, roundNumber)` and `.Decrypt(dst io.Writer, src io.Reader)`: a Writer and a Reader, the binary age file (armor is a separate writer in `tle`). Differences, all forced by the caller owning the I/O: the randomness is an explicit `Randomness` (as in `encrypt`), the round signature is an argument (this module never fetches), and an allocator is taken for the chunk buffer.
 
@@ -261,13 +274,13 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 - **What a stream cannot keep from `decrypt`.** The header is read up to its MAC line (at most `max_header_bytes`) before it is parsed, so a bad header reports `HeaderTooLarge`/`MalformedHeader` where `decrypt` names the first bad line (a bad FIRST line is `NotAgeFile` at once). The payload length is unknown until the end, so a payload that is too short is `MalformedPayload` after the FO check and the MAC. Every chunk is authenticated before it is written, but chunks written are written: a tampered or truncated file fails at its bad chunk or at its end and the plaintext before that point has reached `w` (the age reference reader behaves the same); a caller that must not act on unverified output buffers it until the call returns. `w` is not flushed, `r` is not closed.
 - **Not streamed.** Armor (`encryptAlloc`/`decryptAlloc` keep it).
 
-## Out of scope
+## What is deliberately not done
 
 - age recipients other than `tlock` (X25519, scrypt, plugins): a header
   may carry them and they are MAC-covered and skipped, but `age.zig`
   only opens the `tlock` stanza. A general age implementation is not
   this module's job.
-- PQ-hybrid composition (see `root.zig`'s "Honest limitations" —
+- PQ-hybrid composition (see `root.zig`'s "Honest limitations":
   gating a `hqc` KEM ciphertext alongside this module's IBE layer for
   long-term confidentiality) — a consumer-side decision, not this
   module's job.
@@ -278,16 +291,20 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
   module, not `bls12_381`); a separate module extension, not in scope
   here.
 
-## Audit 2026-11-17 (delta mutation, streaming)
+## Verification
 
-32 schemata mutants over `encryptStream`/`decryptStream` (the header write, the lookahead read and its carry, the last-chunk test at its boundary and the chunk size, the last flag, each write, the payload key's nonce, the header read: the end test, the cap at its boundary, the line-start tracking, the first-line version check, the `---` test; the chain check, the MAC check and what it covers, the nonce shortfall; the too-short chunk guard, the `last` flag of `openChunk`), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: 30 killed, 2 survive, both equivalent. (1) `h.len != n` after `Header.parse`: the parser stops at the first line starting with `---`, exactly where the read loop stopped, so the two lengths cannot differ; defensive. (2) The nonce read's `EndOfStream` arm: without it the call goes on with an unread nonce, but the reader is at its end, so the first payload read returns 0 bytes and the same `MalformedPayload` is raised (the key derived from the unread nonce is never used). The card counts are cumulative with the 2026-10-05 run (14/16, 2 eq): 44/48, 4 eq. After the run the two `timing_safe.eql` call sites were folded into one helper (`macEql`, the repo's constant-time-compare pin stays at 1); the mutant at the MAC check applies unchanged to its call sites. Not mutated: `writeHead` (the old `encryptBody` header code moved unchanged; every in-memory test pins its bytes).
+- **Run:** `scripts/modtest tlock`; the fuzz driver is `TLOCK_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver).
+- **Known answers:** the drand interop vector, the whole-file Go fixture and the live quicknet pairing sanity check, as listed under *Known answers*.
+- **Test classes:** the ciphersuite hashes, the `Ciphertext` codec, `encrypt`/`decrypt` round trips and FO/tamper rejection, the `fp12Pow` law, the age layer (header parser, armor, STREAM payload, typed refusals) and streaming (byte equality with the whole-buffer functions through readers that hand out a few bytes at a time, chunk-boundary lengths, the Go fixture de-armored), and a stack-probe test for the dead-stack burn around the secret-bearing calls.
+- **Fuzz:** three harnesses (`tlock-age-decoders`, `tlock-age-file`, `tlock-ciphertext`), run by the deterministic driver; `tlock-age-file` runs at a reduced scale because each run is one pairing-heavy encrypt plus up to four decrypts. The card's Hardening line has the run.
+- **ct:** ctgrind with two targets (`fp12pow`, `decrypt`), see *Constant-time measurement*; the pins are `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The mutation runs covered `Ciphertext.fromBytes`, the FO check, `fp12Pow`'s window and constant-time lookup, `gtToDrandRepr`, every hash's tag, DST, endianness, masking and truncation, and the streaming functions (the header write, the lookahead read and its carry, the last-chunk test at its boundary, the last flag, the payload key's nonce, the header read's end test and cap, the chain and MAC checks, the nonce shortfall). Equivalent mutants: the table lookup's `== idx` as `<= idx` (entries are merged in ascending order, so the last one taken is still `table[idx]` and every entry is still read); dropping the wipe of `message` on the FO-reject path (a stack local the caller never sees once `decrypt` returns the error: hygiene, not observable by value); `h.len != n` after `Header.parse` in the stream header read (the parser stops at the first line starting with `---`, exactly where the read loop stopped, so the two lengths cannot differ; defensive); the nonce read's `EndOfStream` arm (without it the call goes on with an unread nonce, but the reader is at its end, so the first payload read returns 0 bytes and the same `MalformedPayload` is raised). Not mutated: `writeHead` (the whole-buffer header code, every in-memory test pins its bytes).
 
 ## Backlog / deferred
 
-- ~~age stanza + armor layer for arbitrary-length payloads~~ — DONE 2026-10-06 (`age.zig`).
-- ~~**Whole-file interop KAT for the age layer**~~ — **DONE 2026-10-06**: both files committed under `src/testdata/` (drand/tlock commit `7ceb44a5…`, MIT OR Apache-2.0); `kat_test.zig` decrypts the armored file end-to-end with the pinned round-5423142 signature and compares with `lorem.txt`, refuses it under another chain hash, and refuses a flipped payload byte.
-- ~~**Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer`~~ — DONE 2026-11-17: `age.encryptStream` / `age.decryptStream`, see "Streaming encrypt/decrypt" below. Streaming ARMOR stays open (armor is whole-buffer; `tle` itself armors through a separate writer).
-- **G2-signature scheme (`bls-unchained` testnet variant)** *(survey 2026-09-30)* — supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits §2.
+- **G2-signature scheme (`bls-unchained` testnet variant).** Supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits CONVENTIONS section 2.
+- **Streaming armor.** Armor is whole-buffer (`encryptAlloc`/`decryptAlloc` keep it); `tle` itself armors through a separate writer.
+- **An upstream `Fp12.pow` in `bls12_381`.** `fp12Pow` is module-local (see *`Gt` scalar exponentiation*) and `ibe` carries its own copy, so the second consumer that would justify the refactor now exists; the shared version must keep the constant-time table scan.
 
 ## Anchoring
 

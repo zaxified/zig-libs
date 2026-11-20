@@ -6,10 +6,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-17** — streaming encrypt/decrypt: `age.encryptStream` and `age.decryptStream` over `std.Io.Reader`/`std.Io.Writer`, the binary age file one 64 KiB STREAM chunk at a time (one allocation of about 128 KiB), after drand/tlock's `Encrypt(dst io.Writer, src io.Reader, round)` / `Decrypt(dst, src)`. Output is byte-equal to `encrypt` for the same `Randomness`; the Go-`tle` fixture decrypts through it. Additive; the private header writer was split out of `encryptBody` with no change in output. Plaintext of chunks before a failing chunk has already reached the writer (each chunk is authenticated first). Armor stays whole-buffer. Delta mutation: 32 mutants, 30 killed, 2 equivalent; card counts cumulative (44/48, 4 eq).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` is now `inline fn`: a runtime call made `headerText`'s `++` result a dangling stack temporary (Header.parse tests failed). New regression test pins the header bytes.
 - **2026-10-10** — tests: deterministic fuzz driver `TLOCK_FUZZ` (`tlock-age-decoders`, `tlock-age-file`, `tlock-ciphertext`). New oracles: a payload this module sealed opens and one flipped octet refuses; a genuine age file (real quicknet round-1000 key and signature) decrypts while a flipped octet, a truncation and an appended octet are refused (all 10,000 flips refused, header MAC included); the pristine ciphertext decrypts and no damaged one does. No change in `src/` outside tests.
@@ -33,11 +31,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   last)` refusing chunk-shape violations with `MalformedPayload`, `wipe`), for callers that
   stream (`timelock_envelope`'s version 2). `age.sealPayload` / `age.openPayload` (whole-buffer)
   are now public and are loops over it, so the Go-`tle` whole-file KAT covers the chunk code.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the age layer is now interop-proven against
-  Go: drand/tlock's whole-file fixture (`testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`
-  and `lorem.txt`, commit `7ceb44a5…`, MIT OR Apache-2.0) is committed under `src/testdata/` and
-  `kat_test.zig` decrypts it end-to-end to the published plaintext (armor, header MAC, STREAM),
-  refuses it under another chain hash and refuses a flipped payload byte. Scope mvp → core.
 
 - **2026-10-06** — ADDED: `tlock.age`, the age v1 envelope drand/tlock's `tle` writes —
   the `tlock` stanza, the HKDF/HMAC-SHA-256 header MAC, the ChaCha20-Poly1305 STREAM payload
@@ -47,13 +40,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (this repo). The stanza body is byte-exact against the genuine `tle` fixture; the MAC,
   STREAM and armor are spec-derived and round-trip-tested, not yet checked against a whole
   Go-produced file. Fuzz harness on the header, armor and payload decoders. Not breaking.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the age stanza/armor layer moves from "never" to "not yet — see Backlog" in Out of scope.
 - **2026-10-05** — Mutation run: 14 of 16 killed, 2 equivalent; 0 tests added (the
   `fp12Pow` lookup's `<=` twin and the reject-path wipe of `message`, see SPEC).
   No code change.
 - **2026-10-03** — `Ciphertext.fromBytes` refuses a `U` outside `G2` (`bls12_381`'s
   checked decoder, `error.NotInSubgroup`), so `decrypt`'s pairing never sees a torsion point.
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **fp12pow 8 / decrypt 11**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ The audit's `tlock` F3 lead is CONFIRMED to exist and then answered in the module's favour: `fp12Pow`'s hand-written 4-bit windowed exponentiation and its `fp12CtSelect` full-table scan produce **ZERO contexts of their own**. Everything non-zero is inherited `bls12_381`/`std.crypto.ff` substrate or this module's own already-documented "fine to leak" comparisons. ⚠ The `decrypt` target is measured but means little: a `round_signature` is drand's published per-round threshold signature, public by the time `decrypt` can run, so this is not a defect — recorded so a reader does not conclude otherwise. Its contexts do show that `bls12_381`'s `pairing.zig` branches on what it is given, and that file carries no constant-time claim anywhere in the repository.
 
 - **2026-09-09** — LICENSE ELECTION stated: MIT. The drand upstreams this module models are
   dual-licensed Apache-2.0 OR MIT and the NOTICE named the dual licensing without ever saying
