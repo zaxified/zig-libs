@@ -391,3 +391,66 @@ test "supportsPinWithPermissions / supportsUvWithPermissions need both options" 
     uv.options.pin_uv_auth_token = true;
     try testing.expect(uv.supportsUvWithPermissions());
 }
+
+// ── tests: whole-module mutation run additions ──────────────────────────────
+
+test "parse: each of the 14 option ids fills its own field and no other" {
+    const a = testing.allocator;
+    const aaguid = @as([16]u8, @splat(0));
+    const b = baseEntries(&aaguid);
+    const ids = [_][2][]const u8{
+        .{ "plat", "plat" },
+        .{ "rk", "rk" },
+        .{ "clientPin", "client_pin" },
+        .{ "up", "up" },
+        .{ "uv", "uv" },
+        .{ "pinUvAuthToken", "pin_uv_auth_token" },
+        .{ "noMcGaPermissionsWithClientPin", "no_mc_ga_permissions_with_client_pin" },
+        .{ "largeBlobs", "large_blobs" },
+        .{ "bioEnroll", "bio_enroll" },
+        .{ "uvBioEnroll", "uv_bio_enroll" },
+        .{ "authnrCfg", "authnr_cfg" },
+        .{ "uvAcfg", "uv_acfg" },
+        .{ "credMgmt", "cred_mgmt" },
+        .{ "setMinPINLength", "set_min_pin_length" },
+    };
+    try testing.expectEqual(std.meta.fieldNames(Options).len, ids.len);
+    for (ids) |id| {
+        const opts = [_]cbor.MapEntry{.{ .key = .{ .text = id[0] }, .value = .{ .bool = true } }};
+        const entries = [_]cbor.MapEntry{ b[0], b[1], .{ .key = .{ .uint = 4 }, .value = .{ .map = &opts } } };
+        const bytes = try enc(a, .{ .map = &entries });
+        defer a.free(bytes);
+        const info = try parse(a, bytes);
+        inline for (comptime std.meta.fieldNames(Options)) |name| {
+            const want: ?bool = if (std.mem.eql(u8, name, id[1])) true else null;
+            try testing.expectEqual(want, @field(info.options, name));
+        }
+    }
+}
+
+test "Info accessors: pinState reads clientPin; the permission accessors need both options present and true" {
+    var info: Info = .{};
+    try testing.expectEqual(@as(?bool, null), info.pinState());
+    info.options.client_pin = false;
+    try testing.expectEqual(@as(?bool, false), info.pinState());
+    info.options.client_pin = true;
+    try testing.expectEqual(@as(?bool, true), info.pinState());
+
+    // An absent option is "not supported", not "supported".
+    var only_token: Info = .{};
+    only_token.options.pin_uv_auth_token = true;
+    try testing.expect(!only_token.supportsPinWithPermissions());
+    try testing.expect(!only_token.supportsUvWithPermissions());
+    var only_pin: Info = .{};
+    only_pin.options.client_pin = true;
+    try testing.expect(!only_pin.supportsPinWithPermissions());
+    var only_uv: Info = .{};
+    only_uv.options.uv = true;
+    try testing.expect(!only_uv.supportsUvWithPermissions());
+    var both: Info = .{};
+    both.options.client_pin = true;
+    both.options.uv = true;
+    both.options.pin_uv_auth_token = true;
+    try testing.expect(both.supportsPinWithPermissions());
+    try testing.expect(both.supportsUvWithPermissions());
+}

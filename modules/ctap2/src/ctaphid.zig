@@ -729,6 +729,16 @@ test "Channel.open: another client's INIT response on the broadcast channel is s
     try testing.expectEqual(hid.cid, ch.cid);
 }
 
+test "Channel.open: a foreign INIT response that is only a nonce (8 bytes) is skipped too" {
+    const a = testing.allocator;
+    var hid: FakeHid = .{ .a = a };
+    defer hid.queue.deinit(a);
+    // The skip needs the 8 nonce bytes, not a full 17-byte response.
+    try hid.push(broadcast_cid, .init, &[_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 });
+    const ch = try Channel.open(hid.dev(), .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try testing.expectEqual(hid.cid, ch.cid);
+}
+
 // ── fuzz: a hostile authenticator on the HID side ───────────────────────────
 
 const fz = @import("fuzz_test.zig");

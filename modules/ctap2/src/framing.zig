@@ -238,3 +238,17 @@ test "Transport.transact: a transport that claims more bytes than the buffer hol
     var buf: [4]u8 = undefined;
     try std.testing.expectError(error.ResponseBufferTooSmall, t.transact(&.{0x04}, &buf));
 }
+
+test "Transport.transact: a response that fills the buffer exactly is accepted" {
+    const Exact = struct {
+        fn transact(_: *anyopaque, _: []const u8, response: []u8) TransportError!usize {
+            @memset(response, 0x7e);
+            return response.len;
+        }
+    };
+    var dummy: u8 = 0;
+    const t: Transport = .{ .ctx = &dummy, .transactFn = Exact.transact };
+    var buf: [4]u8 = undefined;
+    const got = try t.transact(&.{0x04}, &buf);
+    try std.testing.expectEqual(@as(usize, 4), got.len);
+}
