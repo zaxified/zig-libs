@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `Frame` storage: `FrameBuilder` picks the storage `columnFromCells` picks for the same
 //! cells, and every accessor gives each row's cell back, on tables built to reach each
-//! storage kind and each move between them (until step R, 2026-11-08, the other side was
+//! storage kind and each move between them (until step R,, the other side was
 //! `dataset`'s `Frame`, which this one was taken from). Then what only this module promises: hand-built frames read as
 //! null past their arrays, the builder's failure is sticky, `big_block_allocator`.
 
@@ -17,7 +17,7 @@ const Frame = fm.Frame;
 // ── generated tables (test-only) ────────────────────────────────────────────
 
 /// A table as rows of cells, the shape the generated tests build. It was `dataset`'s
-/// `Dataset` until step R retired that module (2026-11-08); the cells are this module's.
+/// `Dataset` until step R retired that module; the cells are this module's.
 pub const Rows = struct {
     columns: []const Column,
     rows: []const []const Value,

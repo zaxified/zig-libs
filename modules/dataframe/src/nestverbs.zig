@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The frame verbs over list and struct columns (S3 step 3, 2026-11-08): `explode`
+//! The frame verbs over list and struct columns (S3 step 3): `explode`
 //! (pandas and polars `explode`: one row per element) and `unnest` (polars `unnest`:
 //! a struct column's fields as columns). The per-cell functions are in `listfn.zig`.
 //! Original work of the zig-libs authors (MIT).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! dataframe parity close (2026-11-10), agent Z2: aggregations and order-dependent operations
+//! dataframe parity close, agent Z2: aggregations and order-dependent operations
 //! over a list's own elements inside `list.eval` / `list.filter` (`Expr.element_op`, polars
 //! `pl.element().sum()`, `.rank()`, `.cum_sum()`, ...). Every expected value was answered by
 //! polars 2.1 (`list.eval(<expr>)` on the same lists); the probe script and its output are

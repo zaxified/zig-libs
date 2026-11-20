@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Findings of the independent review of 2026-11-07, one test each, named by the
+//! Findings of the independent review, one test each, named by the
 //! finding (MED1..MED3, L4..L8). Each was seen red before its fix, except where the
 //! test says otherwise. MED1 is last: before its fix it panicked, which ends the run.
 

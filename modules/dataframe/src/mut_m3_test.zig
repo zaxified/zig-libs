@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! S3 steps 3 and 4 mutation run (group M3, 2026-11-08): `listfn.zig`, `nestverbs.zig`,
+//! S3 steps 3 and 4 mutation run (group M3): `listfn.zig`, `nestverbs.zig`,
 //! `callback.zig` and the step 3/4 parts of `expr.zig`, `core.zig`, `verbs.zig`,
 //! `window.zig`. One test per surviving mutant that is not equivalent. Test names end
 //! "(mut <id>)"; each id is a mutant of `s3-mut-m3`, killed by its test.

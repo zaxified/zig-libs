@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The binary column type (`ColumnType.binary`, cells `Value.text` holding bytes) and
-//! `Expr.bin`, 2026-11-10. Expected values are polars 2.1's (probe run on the day; each test
+//! `Expr.bin`,. Expected values are polars 2.1's (probe run on the day; each test
 //! names the call it quotes); where polars refuses (CSV, JSON, `==` against a text) the
 //! answer is this module's own decision B1-B6 and the test says so. The sweep runs the public
 //! verbs over a frame that holds a binary column.

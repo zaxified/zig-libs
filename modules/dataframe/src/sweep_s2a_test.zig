@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The S2 no-panic sweep, agent A's files (`expr window listfn callback catfn nestverbs corr
-//! exprfn colfn strfn names ranges`; 2026-11-10): each finding's trigger, pinned. Names end
+//! exprfn colfn strfn names ranges`): each finding's trigger, pinned. Names end
 //! "(sweep A-<n>)".
 
 const std = @import("std");

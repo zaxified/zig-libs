@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The S2 no-panic sweep, agent B (2026-11-10): the dataframe code added since the D5 sweep in
+//! The S2 no-panic sweep, agent B: the dataframe code added since the D5 sweep in
 //! `jsonread csvchunk ndjsonchunk csvio jsonio render textio dtfn frameops more verbs value frame
 //! root structure reshape analysis spec core keys`. Each finding's trigger, pinned; then the
 //! clean probes (hypotheses that did not crash). Names end "(sweep B-<n>)" or "(sweep B clean probe)".

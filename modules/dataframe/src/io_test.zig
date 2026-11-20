@@ -294,7 +294,7 @@ test "format: aligned text, elided rows and columns" {
 }
 
 test "readCsv: a wide first row of long text over short rows reserves within the input" {
-    // Review 2026-11-07 H1: each text column reserved min(1 MiB, first cell x rows), so
+    // Review H1: each text column reserved min(1 MiB, first cell x rows), so
     // 2000 columns of 1 KiB first cells over 100 rows asked ~200 MB for a 2 MB input.
     var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
     var arena = std.heap.ArenaAllocator.init(counting.allocator());
@@ -317,7 +317,7 @@ test "readCsv: a wide first row of long text over short rows reserves within the
 }
 
 test "readCsv reads back a writeCsv cell of many lines" {
-    // Review 2026-11-07 M1: csvstream's 64-line look-ahead made a 100-line cell
+    // Review M1: csvstream's 64-line look-ahead made a 100-line cell
     // UnterminatedQuote under strict quotes.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

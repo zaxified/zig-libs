@@ -387,7 +387,7 @@ test "Value.order: float limits, negative fractions and the 2^-76 shift boundary
 }
 
 // ── properties over awkward cells ───────────────────────────────────────────
-// (Until step R, 2026-11-08, this section also compared order, eql, the coercions, every
+// (Until step R,, this section also compared order, eql, the coercions, every
 // cast and the ISO helpers with `dataset`'s; that module is retired, the vectors and the
 // tests above anchor them.)
 

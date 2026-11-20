@@ -175,7 +175,7 @@ pub const CsvReadOptions = struct {
     max_rows: usize = 1 << 26,
     max_cells: usize = 1 << 26,
 
-    // ── added 2026-11-09 (dataframe S2, input options) ──
+    // ── added (dataframe S2, input options) ──
     /// A byte that groups digits in numbers, dropped before an int/float/decimal cell is
     /// read (pandas `thousands`; polars has none). `0` = none. `1,234` with `thousands = ','`
     /// (the cell quoted, or another delimiter) is the int 1234; a column that is not all
@@ -1413,13 +1413,14 @@ pub const CsvWriteOptions = struct {
     /// `float_precision`; at most 22, more is 22); `null`: the shortest digits that read back exactly.
     float_precision: ?u8 = null,
 
-    // ── added 2026-11-09 (dataframe S2, output options) ──
+    // ── added (dataframe S2, output options) ──
     /// A `%` layout (pandas `date_format`, polars `date_format`) for `.date` columns instead of
     /// ISO `YYYY-MM-DD`. A `.timestamp` column that is not `datetime_format`ed ignores it.
     date_format: ?[]const u8 = null,
     /// A `%` layout (pandas `date_format`, polars `datetime_format`) for `.timestamp` columns
-    /// instead of `YYYY-MM-DD HH:MM:SS[.fff]` (the cell is UTC). There is no time-of-day column
-    /// type here, so pandas' and polars' `time_format` has nothing to apply to.
+    /// instead of `YYYY-MM-DD HH:MM:SS[.fff]` (the cell is UTC). A `.time` (time-of-day) column is
+    /// always written in the fixed `formatTimeOfDay` layout: pandas' and polars'
+    /// `time_format` has no counterpart here.
     datetime_format: ?[]const u8 = null,
     /// Floats in scientific notation (polars `float_scientific=True`, Rust's `1.2345e2`, with
     /// `float_precision` digits when set), or never (`false`: `0.00001`, `2` for 2.0, no exponent). `null`: Python's `repr` (pandas, polars' automatic choice).

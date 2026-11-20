@@ -673,7 +673,7 @@ pub const DescribeSpec = struct {
     cols: []const []const u8 = &.{},
     /// The quantile rows, each in [0, 1] (pandas `percentiles`). Exactly these rows, as
     /// pandas 3.1 prints them (its documentation says the median is always added; the
-    /// release does not, checked 2026-11-09), ascending and distinct, named as pandas
+    /// release does not, checked), ascending and distinct, named as pandas
     /// does: `25%`, `7.5%`.
     percentiles: []const f64 = &.{ 0.25, 0.5, 0.75 },
     /// Every column (pandas `include="all"`).
@@ -1683,7 +1683,7 @@ fn binIntervalsImpl(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinE
             }
             for (out, 1..) |*o, i| {
                 // A float column, or an int-declared one whose storage holds another kind (a
-                // hand-built or mixed column: fuzz, 2026-11-10, `mn.asFloat().?` panicked on a
+                // hand-built or mixed column: fuzz, `mn.asFloat().?` panicked on a
                 // non-numeric cell): the float edges, or `error.NotOrderable`.
                 if (dtype.isFloat(ty) or mn != .int or mx != .int) {
                     const lo = mn.asFloat() orelse return error.NotOrderable;

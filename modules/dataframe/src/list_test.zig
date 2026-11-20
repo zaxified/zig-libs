@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! S3 step 3 (2026-11-08): the `list` and `struct` namespaces in `Expr`
+//! S3 step 3: the `list` and `struct` namespaces in `Expr`
 //! (`listfn.zig`), the list and record results of the text functions, `explode`,
 //! `unnest` and the `implode` aggregation (`nestverbs.zig`, `core.accumulateImplode`).
 //! Expected values are worked by hand from polars' documented behaviour (pandas has no
@@ -473,7 +473,7 @@ test "list and nested verbs: every allocation failure is an error, never a panic
     } else return error.TestUnexpectedResult; // the sweep never reached a clean run
 }
 
-// ── review R2 (2026-11-08) ──────────────────────────────────────────────────
+// ── review R2 ──────────────────────────────────────────────────
 
 test "R2 H1: implode in a window transform is capped before it builds m^2 elements" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

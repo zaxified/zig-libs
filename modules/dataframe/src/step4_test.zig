@@ -194,7 +194,7 @@ fn nullsList(_: void, _: std.mem.Allocator, _: Value) Value {
 
 test "callback results: a hand-made list view past its storage is an error (fuzz seed 35)" {
     // It claimed 2^32 elements over three: the check walked, and the copy would have
-    // copied, four billion of them (a hang the fuzz driver reported, 2026-11-08).
+    // copied, four billion of them (a hang the fuzz driver reported).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

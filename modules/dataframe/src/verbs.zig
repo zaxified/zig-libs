@@ -672,7 +672,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
 
     var out: Frame = .{ .columns = cols, .data = data, .len = n };
     // No group columns: the one result row has no key to be missing, and a subset of
-    // none would mean every column (found in review 2026-11-07; `tabular` has it too).
+    // none would mean every column (found in review; `tabular` has it too).
     if (spec.drop_missing_keys and gidx.len > 0) out = try dropna(a, out, .{ .subset = spec.group_by });
     if (spec.sort_groups and gidx.len > 0) {
         const then = try a.alloc(sp.SortKey, gidx.len - 1);

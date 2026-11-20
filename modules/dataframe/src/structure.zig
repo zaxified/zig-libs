@@ -124,7 +124,7 @@ pub fn gatherEvery(a: std.mem.Allocator, f: Frame, step: usize, offset: usize) E
     try checkRows(f);
     if (step == 0) return error.BadArgument;
     const start = @min(offset, f.len);
-    // Not `(rest + step - 1) / step`: that overflows for a step near maxInt (review 2026-11-07, HIGH 2).
+    // Not `(rest + step - 1) / step`: that overflows for a step near maxInt (review, HIGH 2).
     const rest = f.len - start;
     const count = if (rest == 0) 0 else (rest - 1) / step + 1;
     const rows = try a.alloc(u32, count);
@@ -178,7 +178,7 @@ pub fn hstack(a: std.mem.Allocator, f: Frame, series: []const Series) Error!Fram
     if (series.len == 0) return f;
     // One validation pass and one allocation: inserting one series at a time
     // copied the column arrays per series and scanned names linearly, O(n^2)
-    // time and arena memory (review 2026-11-07, MED 6).
+    // time and arena memory (review, MED 6).
     const len = if (f.columns.len == 0) series[0].len else f.len;
     for (series) |s| if (s.len != len) return error.LengthMismatch;
     const w = std.math.add(usize, f.columns.len, series.len) catch return error.TooLarge;
@@ -600,7 +600,7 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
     const n_cells = std.math.mul(usize, m, f.len) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
     // The output is `f.len` columns wide whatever `m` is: with no value
-    // columns the cell cap above does not bound it (review 2026-11-07, LOW 7).
+    // columns the cell cap above does not bound it (review, LOW 7).
     if (f.len > max_transpose_width) return error.TooLarge;
     if (skip == null and spec.names.len != 0 and spec.names.len != f.len) return error.LengthMismatch;
 

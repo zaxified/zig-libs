@@ -105,7 +105,7 @@ const Verb = enum {
     rolling_map,
     map_groups,
     filter_groups,
-    // ── W10 and the 2026-11-10 parity verbs ──
+    // ── W10 and the parity verbs ──
     unstack,
     wide_to_long,
     bin_intervals,

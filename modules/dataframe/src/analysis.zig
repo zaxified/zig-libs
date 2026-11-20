@@ -967,7 +967,7 @@ pub fn qcutEdges(a: std.mem.Allocator, f: Frame, spec: QcutSpec) (Error || more.
     if (vals.items.len == 0) return error.BadEdges;
     // Sorted once, each edge then read by index: a selection per edge was
     // O(bins x rows), a hang at 2^20 bins over a million rows (review
-    // 2026-11-07, MED 5). Same type-7 formula as `core.quantileInPlace`.
+    // MED 5). Same type-7 formula as `core.quantileInPlace`.
     std.mem.sort(f64, vals.items, {}, std.sort.asc(f64));
     var edges: std.ArrayList(f64) = .empty;
     for (probs) |p| {

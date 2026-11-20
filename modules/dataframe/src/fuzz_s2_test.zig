@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Regression tests for what the dataframe fuzz driver found after it learned the `Expr` and
-//! window arms of dataframe S2 waves W2-W5 and W8 (2026-11-10). Each test is one finding.
+//! window arms of dataframe S2 waves W2-W5 and W8. Each test is one finding.
 
 const std = @import("std");
 const testing = std.testing;

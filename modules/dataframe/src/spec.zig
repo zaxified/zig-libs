@@ -79,7 +79,7 @@ pub const MapSpec = struct {
 
 /// `sum`/`mean`/`count` count every row of the group (a null or non-numeric
 /// cell adds 0 to `sum` and 1 to `count` — historical behaviour, unlike
-/// pandas' skip-NA). The statistics added 2026-10-04 skip MISSING values
+/// pandas' skip-NA). The statistics added skip MISSING values
 /// (null, non-numeric, NaN), as pandas does by default. Everything numeric here goes
 /// through f64 except `sum_exact`: an int `sum` is a float and loses past 2^53, where
 /// pandas and polars keep int64:
@@ -92,7 +92,7 @@ pub const MapSpec = struct {
 ///   `sum_exact` — i128 sum at `decimal_scale`, output `.decimal`:
 ///     `.decimal` cells exactly, `.int` cells exactly (× scale), `.float` cells
 ///     through `Value.cast(.decimal)`; null if the total overflows i128.
-/// Added 2026-11-02, all skipping missing values whatever `skip_na` says (except
+/// Added, all skipping missing values whatever `skip_na` says (except
 /// `size`, which is the row count):
 ///   `size` rows of the group; `prod` product (1 when empty); `any`/`all` truth of
 ///   non-missing cells (a number is true when non-zero, text when non-empty);
@@ -100,7 +100,7 @@ pub const MapSpec = struct {
 ///   sample skewness (null below 3 values) and excess kurtosis (below 4);
 ///   `mode` the most frequent value, a tie going to the smallest; `arg_min`/`arg_max`
 ///   the row position (in the input) of the first smallest/largest value.
-/// Added 2026-11-08: `implode` the group's cells as one list, in row order, missing
+/// Added: `implode` the group's cells as one list, in row order, missing
 ///   cells kept (polars `implode` / a bare column in `agg`, pandas `agg(list)`).
 pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact, size, prod, any, all, sem, skew, kurt, mode, arg_min, arg_max, implode };
 

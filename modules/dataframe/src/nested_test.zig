@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! List and struct columns (S3 step 2, 2026-11-08): the model (`ListColumn`,
+//! List and struct columns (S3 step 2): the model (`ListColumn`,
 //! `StructColumn`, `Value.list`/`.record`), every structural verb carrying them, keys
 //! over them, `readJson` building them from nested values, the writers and the
 //! rendering, and the nesting-depth bound on hand-built storage.

@@ -56,7 +56,7 @@ fn roundF(x: f64, mode: RoundMode) f64 {
 
 /// `10^n` correctly rounded, as Python's `10.0 ** n` that numpy's `round` scales by:
 /// `std.math.pow` multiplies its way there and is off by ulps above 1e22
-/// (1e308 came out 1.0000000000000006e308; review 2026-11-07). Past 1e308: inf.
+/// (1e308 came out 1.0000000000000006e308; review). Past 1e308: inf.
 fn pow10f(n: u32) f64 {
     return if (n < pow10_f64.len) pow10_f64[n] else std.math.inf(f64);
 }
@@ -81,7 +81,7 @@ fn roundFloat(x: f64, d: i32, mode: RoundMode) f64 {
         return roundF(y, mode) / p;
     }
     // `d < -308`, not `-d > 330`: negating minInt(i32) traps, and past 1e308
-    // `p` is inf and `0 * inf` NaN (review 2026-11-07, HIGH 1).
+    // `p` is inf and `0 * inf` NaN (review, HIGH 1).
     if (d < -308) return std.math.copysign(@as(f64, 0), x);
     const p = pow10f(@intCast(-d));
     return roundF(x / p, mode) * p;
@@ -102,7 +102,7 @@ fn roundExact(x: i128, k: u32, mode: RoundMode) ?i128 {
     if (mode == .toward_zero) return @divTrunc(x, p) * p; // |result| <= |x|: no overflow
     const q = @divFloor(x, p);
     // `@mod`, not `x - q * p`: near minInt(i128) `q * p` leaves i128 (review
-    // 2026-11-07, MED 4); the result is formed with checked arithmetic below.
+    // MED 4); the result is formed with checked arithmetic below.
     const r = @mod(x, p); // 0 <= r < p
     const twice = @as(u128, @intCast(r)) * 2;
     const up = if (twice > @as(u128, @intCast(p)))

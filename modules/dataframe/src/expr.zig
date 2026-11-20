@@ -3279,7 +3279,7 @@ fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
         },
         .list => |l| switch (l.op) {
             // A column's element only: `shapeOf` over any other operand has no step budget, and
-            // this runs before `go` charges its visits (review H1, 2026-11-10: a shared
+            // this runs before `go` charges its visits (review H1,: a shared
             // `if_else` DAG under `list.first` was a 2^depth walk at compile).
             .get, .first, .last, .min, .max, .item => if (l.x.* != .col) .unknown else if (elementColumn(f, l.x)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
             else => .unknown,
@@ -3313,7 +3313,7 @@ fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
 
 /// Two branches of one value (`if_else`, `coalesce`, `min`/`max`): binary beside binary, an
 /// unknown, a text or a null is Binary (polars' supertype of Binary and String; probed
-/// 2026-11-10: `when(c).then(bin).otherwise(str)` is Binary).
+/// `when(c).then(bin).otherwise(str)` is Binary).
 fn binMix(f: Frame, l: *const Expr, lk: BinKind, r: *const Expr, rk: BinKind) BinKind {
     if (lk == .yes and (rk != .no or binAddOperand(f, r))) return .yes;
     if (rk == .yes and (lk != .no or binAddOperand(f, l))) return .yes;
@@ -3372,7 +3372,7 @@ fn refuseBinaryOperand(f: Frame, e: *const Expr) Error!void {
             }
         },
         .concat_str => |c| for (c.parts) |*p| if (binTypeOf(f, p) == .yes) return error.BadExpr,
-        // A binary branch beside a text, number or bool one (review M2, 2026-11-10: the
+        // A binary branch beside a text, number or bool one (review M2,: the
         // column was typed text and held bytes that are no UTF-8); polars refuses the mix.
         .if_else => |c| {
             const t = binTypeOf(f, c.then);
@@ -4123,7 +4123,7 @@ pub fn argWhere(a: std.mem.Allocator, f: Frame, e: *const Expr) Error![]const u3
         n += @intFromBool(v == .bool and v.bool);
     }
     // A failed shrink keeps the whole buffer: the caller frees what it was given, so the
-    // result must be the allocation itself (review L1, 2026-11-10: `kept[0..n]` freed a
+    // result must be the allocation itself (review L1,: `kept[0..n]` freed a
     // shorter slice than was allocated).
     if (a.remap(kept, n)) |r| return r;
     const out = try a.dupe(u32, kept[0..n]);

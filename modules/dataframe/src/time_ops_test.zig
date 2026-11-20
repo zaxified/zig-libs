@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Operations over the time-of-day column (`ColumnType.time`, cells `Value.int` microseconds
-//! since midnight), 2026-11-10. Expected values are polars 2.1's where the module's own
+//! since midnight),. Expected values are polars 2.1's where the module's own
 //! decision list quotes them (hour/minute/second parts, `mean`/`median` of times, `time_range`,
 //! `strftime("%H-%M-%S%.f")`, `str.to_time("%I.%M%p")`, `time - time`); the rest are
 //! hand-checked. The sweep runs the public verbs over a frame that holds a time column.

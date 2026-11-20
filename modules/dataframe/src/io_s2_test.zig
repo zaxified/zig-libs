@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Input/output options added in dataframe S2 (2026-11-09): `readCsv`'s number, bool, null,
+//! Input/output options added in dataframe S2: `readCsv`'s number, bool, null,
 //! row and date options, `writeCsv`'s formats, `writeJsonOpts` and the JSON orients, `toHtml`,
 //! `glimpse`. Where pandas or polars define the answer the vectors are in
 //! `oracle3_io_test.zig`; the hand-written cases here pin the documented behaviour.
@@ -507,7 +507,7 @@ test "readCsv: two layout-parsed date columns of one row keep their own values" 
     try expectInt(h, 0, "b", 1643673600000000);
 }
 
-// ── review fixes: jsonread / jsonio (2026-11-09) ────────────────────────────
+// ── review fixes: jsonread / jsonio ────────────────────────────
 
 test "readJson .table: the zone name is the frame's own copy, not a slice of the input" {
     var ar = arena();

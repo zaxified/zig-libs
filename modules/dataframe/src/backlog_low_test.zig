@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The LOW items of SPEC § Backlog closed by the 2026-11-10 triage (the S2 review and
-//! sweep bullets of 2026-11-09/10): each test names its bullet as "(<file> <letter>)".
+//! The LOW items of SPEC § Backlog closed by the triage (the S2 review and
+//! sweep bullets): each test names its bullet as "(<file> <letter>)".
 
 const std = @import("std");
 const testing = std.testing;

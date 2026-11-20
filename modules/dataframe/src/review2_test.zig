@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The independent review of the D2 verbs (2026-11-07): every consumer-reachable
+//! The independent review of the D2 verbs: every consumer-reachable
 //! trap, hang or quadratic cost it found, each pinned with the argument that
 //! triggered it.
 

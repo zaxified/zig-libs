@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The limits of `more.zig`'s verbs on hand-built frames. Until step R (2026-11-08) this
+//! The limits of `more.zig`'s verbs on hand-built frames. Until step R this
 //! file also ran each verb against `tabular`'s row verb of the same name; that module is
 //! retired, and the verbs' anchors are the pandas/polars vectors, the `*Cells` reference
 //! paths and the fuzz driver.

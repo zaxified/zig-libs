@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! dataframe parity, agent Z1 (2026-11-10): `interpolate` methods `quadratic`, `cubic`,
+//! dataframe parity, agent Z1: `interpolate` methods `quadratic`, `cubic`,
 //! `pchip`, `akima` (pandas 3.1 `Series.interpolate` through SciPy 1.18.1), `toLatex`
 //! `column_format` / `longtable` / `position` (pandas `to_latex`) and `binary + binary`
 //! (polars). Every expected value was produced by running the engine
-//! (the 2026-11-10 parity probes z1, z2, z3); hostile inputs
+//! (the parity probes z1, z2, z3); hostile inputs
 //! must give an error or a value and never a panic.
 
 const std = @import("std");
@@ -699,7 +699,7 @@ test "binary + binary: an x + x tower is walked in linear time (Z3 regression)" 
 test "interpolate slinear, nearest, zero never extrapolate (pandas 3.1, SciPy interp1d)" {
     // pandas: Series([nan, 1, nan, 3, nan, nan]).interpolate(method=m, limit_direction=d) for
     // d in forward/backward/both: slinear [nan, 1, 2, 3, nan, nan], nearest and zero
-    // [nan, 1, 1, 3, nan, nan] (probed 2026-11-10); `linear` both: [1, 1, 2, 3, 3, 3].
+    // [nan, 1, 1, 3, nan, nan] (probed); `linear` both: [1, 1, 2, 3, 3, 3].
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

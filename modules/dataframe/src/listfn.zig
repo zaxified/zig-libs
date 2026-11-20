@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The cell functions of the `list` and `struct` namespaces (S3 step 3, 2026-11-08):
+//! The cell functions of the `list` and `struct` namespaces (S3 step 3):
 //! polars' `list.*` and `struct.field`, the constructors `concat_list` and `struct`, and
 //! the text functions whose result is a list (`str.split`, regex `extract_all`/`split`)
 //! or a record (regex `extract_groups`). pandas has no list namespace of its own (its

@@ -2,7 +2,7 @@
 //! `.binary` cell functions (polars `Expr.bin`, `Binary`): a cell is `Value.text` holding bytes with
 //! no UTF-8 promise; every function here reads bytes and never assumes text.
 //!
-//! polars 2.1 is the reference for each rule (probe run 2026-11-10): `contains`, `starts_with`,
+//! polars 2.1 is the reference for each rule (probe run): `contains`, `starts_with`,
 //! `ends_with` (an empty pattern is true), `size` (UInt32 for bytes, Float64 for the larger
 //! units), `get` (negative from the end), `head`/`tail`/`slice` (negative counts and offsets
 //! count from the end), `encode` and `reinterpret` (the cell must be exactly the width's

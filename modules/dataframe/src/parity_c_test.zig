@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! dataframe parity close, agent C (2026-11-10): the plural ranges (`dateRanges`,
+//! dataframe parity close, agent C: the plural ranges (`dateRanges`,
 //! `datetimeRanges`, `linearSpaces`), `toLatex` and `argWhere`. The polars examples
 //! (`date_ranges`, `datetime_ranges`, `linear_spaces`) and pandas' `to_latex` layout are the
 //! vectors; the rest is hostile input, which must give an error and never a panic.
@@ -180,7 +180,7 @@ test "toLatex: escape, na_rep, empty frames, hostile text" {
     const empty: Frame = .{ .columns = cols, .data = data, .len = 0 };
     try testing.expectEqualStrings("\\begin{tabular}{l}\n\\toprule\nx\\_y \\& \xff \\\\\n\\midrule\n\\bottomrule\n\\end{tabular}\n", try df.toLatex(a, empty, .{ .escape = true }));
     // pandas 3.1 `pd.DataFrame({"a": []}).iloc[:, 0:0].to_latex(index=False)` has no header line
-    // (probe the 2026-11-10 parity generator z2, case "zerocols-plain"; parity_z1_test.zig)
+    // (probe the parity generator z2, case "zerocols-plain"; parity_z1_test.zig)
     const none: Frame = .{ .columns = &.{}, .data = &.{}, .len = std.math.maxInt(usize) };
     try testing.expectEqualStrings("\\begin{tabular}{}\n\\toprule\n\\midrule\n\\bottomrule\n\\end{tabular}\n", try df.toLatex(a, none, .{}));
 }

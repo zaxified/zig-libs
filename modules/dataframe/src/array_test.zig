@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The fixed-size array column (`ColumnType.array`, polars `Array(inner, n)`), 2026-11-10:
+//! The fixed-size array column (`ColumnType.array`, polars `Array(inner, n)`),:
 //! cast between list and array, the `arr` operations and their result types, `arr.dot` and
 //! `list.dot`, `concat_arr`, `arr.to_struct`, JSON read and write, display, the verbs, and
 //! hostile columns. Expected values are polars 2.1's (probe_arr2.py, probe_arr3.py in the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! dataframe parity close (2026-11-10): `jsonDecode` (polars `str.json_decode`, survey row 97).
+//! dataframe parity close: `jsonDecode` (polars `str.json_decode`, survey row 97).
 //! Expected values are polars 2.1's documented `json_decode` example and hand-checked cases;
 //! the inference rules are `readNdjson`'s (`jsonread_test.zig` covers them in depth).
 
@@ -125,7 +125,7 @@ test "jsonDecode: refusals" {
 
 // ── time of day (`.time`), the core: text, cast, CSV, JSON, display ─────────
 // Expected values: polars 2.1 (`pl.Time`) and pandas 3.1 (`datetime.time`), probed
-// 2026-11-10 with the oracle venv (tools/README.md).
+// with the oracle venv (tools/README.md).
 
 test "time: parseTimeOfDay / formatTimeOfDay" {
     const ok = [_]struct { []const u8, i64 }{

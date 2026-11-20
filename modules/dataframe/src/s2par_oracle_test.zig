@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Replays `oracle2k_vectors.json` (dataframe parity additions of 2026-11-10): what polars 2.1 and
+//! Replays `oracle2k_vectors.json` (dataframe parity additions): what polars 2.1 and
 //! pandas 3.1 answered for `str.extract_many` / `str.find_many`, `read_fwf`, `date_ranges` /
 //! `datetime_ranges` / `linear_spaces`, `to_latex(index=False)`, `str.json_decode` and the
 //! time-of-day (`pl.Time`) core (`tools/oracle2k.py` asked the engines; no line of this module is

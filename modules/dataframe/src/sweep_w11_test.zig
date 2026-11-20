@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The no-panic sweep of wave W11 (real dtype widths Int8..UInt64, Float32), 2026-11-10:
+//! The no-panic sweep of wave W11 (real dtype widths Int8..UInt64, Float32),:
 //! hostile frames, extreme cells, hostile text and every public verb that touches a width
 //! column. Expected everywhere: an error or a defined value, never a panic or a hang, and a
 //! result whose width columns hold their own arrays (`frame.widthsConform`). Findings are
@@ -1065,7 +1065,7 @@ test "replace over a width column whose replacement does not fit leaves a confor
     try testing.expectEqual(@as(i64, -7), r.columnAt(0).get(2).int);
 }
 
-// ── the independent review's findings (2026-11-10), each pinned (sweep W11-9) ────
+// ── the independent review's findings, each pinned (sweep W11-9) ────
 
 fn cellAt(f: Frame, name: []const u8, i: usize) Value {
     return f.columnAt(f.columnIndex(name).?).get(i);

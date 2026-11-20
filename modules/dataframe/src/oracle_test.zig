@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Replays `oracle_vectors.json`: what pandas and polars answered over generated
-//! tables, for the verbs this module has: since 2026-11-07 all of them, every case of
+//! tables, for the verbs this module has: all of them, every case of
 //! `tabular`'s frozen vectors (`tools/filter_vectors.py`, the recipe that copies them;
 //! `tabular`'s `tools/oracle.py` asked the engines). The expected rows come from the engines alone,
 //! so a failure here is a difference from them, never a restatement of this module.

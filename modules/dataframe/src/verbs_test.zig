@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The verbs over generated tables of every column shape and over hand-built frames:
 //! shared columns, oversized work refused, bitmaps and arrays shorter than `len`, typed
-//! paths and their limits. Until step R (2026-11-08) this file also ran every verb
+//! paths and their limits. Until step R this file also ran every verb
 //! against `tabular`'s row verb of the same name; that module is retired, and the
 //! anchors are the pandas/polars vectors (`oracle_test.zig`, `oracle2_test.zig`), the
 //! `*Cells` reference paths (`d4*_test.zig`, the fuzz driver) and the tests here.

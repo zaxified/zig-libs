@@ -469,25 +469,25 @@ pub fn columnFromCells(a: std.mem.Allocator, cells: []const Value) std.mem.Alloc
 
 /// A child for an `ArenaAllocator` that holds big frames: a block of 2 MiB or more comes
 /// aligned to that, everything else is `page_allocator`. A fresh arena's 4 KiB page faults
-/// are most of what a columnar verb costs on a big table: measured in `tabular`'s bench,
+/// are most of what a columnar verb costs on a big table: measured on a bench of the verb,
 /// `mutate` over 1 M rows 2.47 to 0.82x pandas with huge pages.
 ///
 /// Huge pages come two ways. With `transparent_hugepage/enabled = always` the kernel gives
 /// an aligned block huge pages by itself. The block is advised `MADV_HUGEPAGE` only where
 /// `transparent_hugepage/defrag` is `defer` or `never`: under `always`, `madvise` (the
 /// usual distribution default) and `defer+madvise` the advice makes every fault in the block
-/// compact memory directly, and on a fragmented host that stalls. Measured 2026-11-08
+/// compact memory directly, and on a fragmented host that stalls. Measured
 /// (31 GB, 4 GB free, `enabled=madvise`, `defrag=madvise`): 1 GiB touched through an
 /// advised arena took 2.1-5.6 s against 0.54-0.61 s for `page_allocator`, with 2472
 /// compaction stalls, every one failed, and 822 of 1024 huge-page faults falling back
-/// anyway; up to 3.9 s for one 0.2 s verb on 2026-11-04. The setting is read once, on the
+/// anyway; up to 3.9 s for one 0.2 s verb. The setting is read once, on the
 /// first big block. Off Linux, or where it cannot be read, no advice. Safe from any thread.
 pub const big_block_allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &big_block_vtable };
 
 /// `big_block_allocator` that advises every block of 2 MiB or more `MADV_HUGEPAGE`
 /// whatever `transparent_hugepage/defrag` says — numpy's policy, so pandas' (numpy
 /// advises its large allocations by default). Faster where huge pages are at hand: the
-/// 2026-11-08 bench rows that write big fresh outputs (`cumsum`, `melt`, `concat`,
+/// bench rows that write big fresh outputs (`cumsum`, `melt`, `concat`,
 /// `filter`, `distinct`, joins) ran 1.1-3x faster with it on the bench host. On a
 /// fragmented host under `defrag=madvise` it is the stall `big_block_allocator`'s
 /// comment measures (2.1-5.6 s for 1 GiB against 0.55 s). The choice is the caller's:

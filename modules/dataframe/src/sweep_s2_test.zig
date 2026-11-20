@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The D5 no-panic sweep over `expr exprfn window more analysis csvio jsonio textio render
-//! dtfn seriesfn` (2026-11-08): each finding's trigger, pinned. Names end "(sweep <ID>)".
+//! dtfn seriesfn`: each finding's trigger, pinned. Names end "(sweep <ID>)".
 
 const std = @import("std");
 const testing = std.testing;

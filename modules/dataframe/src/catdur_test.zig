@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Categorical and duration columns (survey rows 100, 101). Expected values from
-//! polars 2.1.0 and pandas 3.1.0 run on the same cells (2026-11-08): polars' JSON
+//! polars 2.1.0 and pandas 3.1.0 run on the same cells: polars' JSON
 //! duration text (`PT93784.5S`, `-PT90S`, `P0D`) and display (`1d 2h 3m 4s 500ms`),
 //! pandas' CSV timedelta text (`1 days 02:03:04.500000`, `-1 days +23:58:30`), pandas'
 //! `cat.codes` (lexical categories, null -1 there, null here), both engines' lexical
@@ -158,7 +158,7 @@ test "categorical through take, filter, sort, concat, group, join and the writer
 
     // A frame declaring a column categorical over plain text storage (`FrameBuilder`):
     // `concat`'s typed path stacks the text, then encodes it as the cell path does (the
-    // fuzz driver found the typed path leaving it text, 2026-11-08, seed 5426).
+    // fuzz driver found the typed path leaving it text,, seed 5426).
     const decl = try st.mk(a, &.{.{ .name = "c", .type = .categorical }}, &.{ &.{txt("y")}, &.{txt("x")} });
     try testing.expect(decl.column("c").? == .text);
     const both = try df.concat(a, &.{ decl, decl }, .vertical);
