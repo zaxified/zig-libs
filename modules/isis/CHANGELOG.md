@@ -5,11 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind harness for the authentication code (`md5`, `sha256` targets; 0 in-file contexts native and portable x86_64); card Hardening `ct` recorded.
 - **2026-11-18** — **ADDITIVE:** Authentication TLV #10 (`auth`): typed decode of cleartext (type 1), HMAC-MD5 (RFC 5304, type 54) and RFC 5310 generic crypto (type 3, Key ID + HMAC-SHA-1/224/256/384/512); `addPlaceholder`, `sign` (zero/Apad digest, LSP Remaining Lifetime and Checksum hashed as zero, checksum re-stamped) and a constant-time `verify` against a key set. Plain RFC 2104 keying by default like holo, FRR, IOS XR and EOS; `Key.strict_rfc5310` for RFC 5310 §3.3 key preparation. 13 KATs from an independent Python recipe (`tools/auth_kat.py`); the fuzz harness parses every TLV value as #10 and checks sign-then-verify. Delta mutation 68/68. Decoding still verifies nothing; the receive policy lives in `isis-adj`/`isis-lsdb`.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the codec (521 mutants, 509 killed, 12 EQUIVALENT; the card now carries whole-module counts and the source hash). `src/mutation_test.zig` (33 tests) pins exact-fit buffers, truncated bodies, the Length Indicator in both directions, Maximum Area Addresses, trailing bytes after the PDU Length, field byte orders and offsets, flag bits and masks, record counts at their limits and the level-2 dispatch arms. No source change.
 - **2026-10-10** — tests: deterministic fuzz driver `ISIS_FUZZ` over the decode harness (header/TLV/typed views/PDU bodies), now generic over its choice source, with reach labels per PDU kind and an LSP-checksum oracle (a stamped LSP grades good, one flipped bit in the checksummed region does not). No source change.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: ID length, Auth #10, MT and typed IP reachability in "Deliberately deferred" now read "not yet — see Backlog", matching the 2026-09-30 survey.
 - **2026-09-14** — **BREAKING (error set, enum) + BEHAVIOURAL:** audit F2/F3, round-2 decision Q5
   (the newer norm wins; ISO/IEC 10589:2002, no switch). Two reserved-field rules the codec had
   backwards against RFC 1142 §9.5-§9.9 (the ISO/IEC 10589:2002 text itself was not checked):

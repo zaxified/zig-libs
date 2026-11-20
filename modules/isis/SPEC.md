@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireshark/wireshark](https://github.com/wireshark/wireshark) dissector | C | GPL-2.0 — used only as a black-box oracle (`sharkd`), source not read | 9.9k | pushed 2026-09-29 | Decodes everything, encodes nothing. Grades five of this module's PDU bodies and the Fletcher checksum. |
 | [openss7/pbbr](https://github.com/openss7/pbbr) | C | no LICENSE file in the repository (not readable; not read) | 36 | pushed 2019-04-18 | Claims IEEE 802.1aq SPBM for the Linux kernel; unmaintained since 2019. The only open SPB implementation found. |
 
-**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** no typed IP/IPv6 reachability (#128/#130/#135/#232/#236) — what every IP IS-IS user carries; no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (`rg 'ip_reach|ipv6|purge_originator' isis/src` finds no typed decoder; only the `ip_interface_address` code constant exists) (→ Backlog). Authentication (#10, RFC 5304/5310) is at parity with holo since 2026-11-18, plus FRR's opt-in `strict-rfc5310` keying and SHA-224, which holo does not configure.
+**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** no typed IP/IPv6 reachability (#128/#130/#135/#232/#236) — what every IP IS-IS user carries; no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (`rg 'ip_reach|ipv6|purge_originator' isis/src` finds no typed decoder; only the `ip_interface_address` code constant exists) (→ Backlog). Authentication (#10, RFC 5304/5310) is at parity with holo, plus FRR's opt-in `strict-rfc5310` keying and SHA-224, which holo does not configure.
 
 ## Scope
 
@@ -124,6 +124,10 @@ entry) were taken from the verbatim RFC 6329 figures and are pinned in the LSP
 golden. No number here is a guess; where a sub-TLV is not modeled it is named in
 the raw-only list, not invented.
 
+## Fletcher checksum
+
+`checksum.compute(bytes, csum_off)` and `checksum.verify(bytes)` are the ISO 8473 Annex C / RFC 905 Annex B Fletcher checksum (`compute` returns `error{ChecksumFieldOutOfRange}!u16`). The LSP framing is in `pdu.lspChecksumRegion`, `computeLspChecksum`, `checkLspChecksum`, `stampLspChecksum` and `LspBuilder.finishStamped`: per ISO 10589 §7.3.11 the checksum covers all fields of the LSP after the Remaining Lifetime field. `Lsp.decode` carries the raw 16-bit field and validates nothing, so the zero-allocation decode contract is untouched. A zero field means "not computed" (`ChecksumStatus.not_present`); the receive policy built on that (§7.3.14.2's discard) belongs to the update process (`isis-lsdb`). The §7.3.11 hardware-failure precaution is not implemented (see *What is deliberately not done*).
+
 ## Threat model / untrusted decode
 
 `decode` consumes bytes off an untrusted link (a hostile or buggy peer, or an
@@ -154,18 +158,17 @@ attacker who can inject frames). The central hazard of a TLV codec is an
   ignored" — and `CircuitType` has no member a builder could emit it with.
   The quoted sentences are RFC 1142's (§9.1, §9.5-§9.9), the IETF republication
   of the ISO draft; the ISO/IEC 10589:2002 text itself has not been checked
-  against them. The module used to reject the reserved PDU-type bits and accept
-  Circuit Type 0, against that text.
+  against them.
 
 **Authentication (#10) — the codec signs and verifies, the policy is the caller's.**
-Since 2026-11-18 `auth` types the Authentication TLV and computes/verifies it
+`auth` types the Authentication TLV and computes/verifies it
 over a whole PDU (`src/auth.zig`); decoding a PDU still does NOT verify
 anything — `decode` carries #10 like any TLV, and a PDU is authenticated only
 where a caller runs `auth.verify` on it (`isis-adj` for IIHs, `isis-lsdb` for
 LSPs and SNPs, each when a key is configured). SPB integrity (RFC 6329 digest
 exchange) stays out of scope. See § Authentication below.
 
-## Authentication (2026-11-18)
+## Authentication
 
 **Wire.** Authentication Type octet, then: type 1 the cleartext password
 (ISO 10589 §9.5); type 54 a 16-octet HMAC-MD5, TLV length exactly 17 (RFC
@@ -227,133 +230,33 @@ Python `hmac`/`hashlib`, its own ISO 8473 checksum. The module's builders plus
 could not be run here, so the holo cross-check is by reading (same segments,
 same Apad, same plain keying), not by execution.
 
-**ctgrind.** `src/ctgrind_harness.zig`, targets `md5` and `sha256` (plain and
-strict RFC 5310 key preparation), key tainted, ReleaseFast: 0 contexts in module
-files on x86_64 native and on the portable `CTGRIND_CPU=x86_64` build
-(2026-11-19). The harness also has a `clear` arm (cleartext password), which is
-not a ctgrind target: its taint reaches no reported context (total 0, the
-witness does not fire), so a row would measure nothing, and a cleartext password
-travels in the PDU anyway.
-
 ## Verification
 
-Offline only — pure codec, no live-interop surface in this environment.
-`zig build test-isis`:
+Offline only: a pure codec with no live-interop surface here. Run: `scripts/modtest isis`.
 
-- **Goldens** (`goldens.zig`): **nine** goldens, pinned byte-for-byte.
-  ⚠ This bullet used to say "a P2P IIH and an SPB-carrying L1 LSP … **no live
-  capture was available** — stated honestly". That sentence was deleted from
-  `goldens.zig` as stale and left standing here, where it contradicts the
-  Anchoring section of this same file ("Wireshark sharkd validated 5 PDU
-  bodies + TLVs incl. L2 CSNP/PSNP"). One document, both claims. What is true:
-  the goldens are hand-assembled field-by-field per ISO 10589 / RFC 6329, and
-  five of the PDU bodies have since been graded by an INDEPENDENT dissector
-  (`sharkd`), which is a stronger anchor than the hand assembly alone. Three directions: the
-  builders reproduce the golden bytes, the decoders recover every field, and
-  `encode(decode(golden)) == golden`. The Length-Indicator/PDU-Length constants
-  (20 / 27 / 37 / 60) are an independent cross-check on the hand assembly.
-- **Round-trip:** encode↔decode over empty TLV sets, max-length (255) and
-  zero-length TLVs, repeated same-code TLVs, and the raw escape hatch (an
-  unmodeled type re-emits verbatim).
-- **Bounds-safety units:** truncated headers, overrunning TLV lengths, lying
-  body PDU-Length, oversize builder values, partial trailing records in every
-  typed iterator, and the SPB sub-length lies.
-- **Positive control (permanent):** `tlv.zig` proves a length-trusting walk
-  *would* over-read (`2 + declared_len > buf.len`) where the safe walk returns
-  `TruncatedTlv` — so the test goes red the moment the guard is removed.
-- **Fuzz:** a `std.testing.fuzz` target driving arbitrary bytes through the
-  dispatch decoder + raw and sub-TLV walks and the typed sub-decoders,
-  asserting never-panic, walk termination, and value-within-input.
-  ⚠ Until 2026-09-03 this target reached a decoded PDU **body** exactly never:
-  its header bias set three bytes and left the Length Indicator, the ID Length,
-  the PDU-type octet and the whole PDU-Length field random, so `checkCommon`
-  refused every draw (measured: two million coverage-guided runs, zero bodies).
-  Every fixed-offset body read, `tlvRegion`, and the entire `checksum.zig`
-  surface were unfuzzed while `check-fuzz` reported the module covered — a
-  gate that asks whether a harness EXISTS cannot ask whether it reaches
-  anything. `root.zig` now biases a full modeled header and a consistent
-  PDU-Length field, drives the LSP checksum entry points, and carries a
-  non-fuzz test asserting the bias reaches a body (red without the
-  PDU-Length write).
-- **Checksum KAT:** `checksum.zig` is anchored on Wireshark's own Fletcher
-  implementation — the same octets graded `Good`/0xaee7 and `Bad`/0x1111 by
-  `sharkd`. This is the strongest external anchor the module has and was
-  missing from this section entirely.
+- **Goldens** (`src/goldens.zig`): PDUs pinned byte for byte in three directions: the builders reproduce the golden bytes, the decoders recover every field, and `encode(decode(golden)) == golden`. They are hand-assembled field by field from ISO 10589 / RFC 6329; five of the PDU bodies (including the L2 CSNP and PSNP) are also graded by an independent dissector (Wireshark's `sharkd`), whose verdicts the file records. The Length-Indicator / PDU-Length constants (20 / 27 / 37 / 60) are a cross-check on the hand assembly.
+- **Checksum:** `checksum.zig` is anchored on Wireshark's own Fletcher implementation: the same octets graded `Good` (0xaee7) and `Bad` (0x1111) by `sharkd`. This is the strongest external anchor the module has.
+- **Round trip:** encode and decode over empty TLV sets, max-length (255) and zero-length TLVs, repeated same-code TLVs, and the raw escape hatch (an unmodeled type re-emits verbatim).
+- **Bounds safety:** truncated headers, overrunning TLV lengths, a lying body PDU-Length, oversize builder values, partial trailing records in every typed iterator, the SPB sub-length lies. Permanent positive control: `tlv.zig` proves a length-trusting walk would over-read where the safe walk returns `TruncatedTlv`, so the test goes red when the guard is removed.
+- **Fuzz:** deterministic driver `ISIS_FUZZ=<runs>[,<first seed>]` (harness `isis-decode`, `src/fuzz_test.zig`; also a `std.testing.fuzz` target) over the dispatch decoder, the raw and sub-TLV walks, the typed sub-decoders and the LSP checksum entry points, asserting never-panic, walk termination and value-within-input. The input draw biases a full modeled header and a consistent PDU-Length field, because random bytes alone are refused by `checkCommon`; a non-fuzz test ("fuzz harness: decode, 500 seeds, reaches every outcome") asserts the harness reaches a PDU body and every outcome.
+- **Authentication:** `src/auth_kat_test.zig` against KATs produced by `tools/auth_kat.py` (see Authentication, Anchor); strict and plain key preparation, the key-selection and cross-algorithm refusals.
+- **Mutation:** whole-module over every non-test line of `checksum.zig`, `header.zig`, `tlv.zig`, `tlvs.zig`, `pdu.zig`, `spb.zig` and the dispatch in `root.zig` (one mutant per condition and class; not mutated: comptime constants, the `catch unreachable` after a checked length, formatting, doc comments), plus a delta run over `auth.zig`. `src/mutation_test.zig` holds the tests added to kill survivors (exact-fit and one-short buffers, the fixed-header edge, byte orders, flag bits, partial trailing records, dispatch arms). The equivalent mutants: an exact 255-octet scratch fit no loop value can reach, redundant area-length tests, an iterator end test on a position that never exceeds the length, the PDU-length zeroing writes in the builders' `init` (`finish` overwrites the field), a byte-order mutant on a value only compared with zero, two guards in `encodeSpbInstance` that the builder repeats. No survivor sits in the checksum arithmetic, `verify`, the zero-checksum test or any auth or length check.
+- **ctgrind** (`src/ctgrind_harness.zig`): targets `md5` and `sha256` (plain and strict RFC 5310 key preparation), key tainted, ReleaseFast: 0 contexts in module files on x86_64 native and on the portable build; rows in `scripts/checks/ctgrind-expected.tsv`. The harness also has a `clear` arm (cleartext password) that is not a ctgrind target: its taint reaches no reported context, so a row would measure nothing, and a cleartext password travels in the PDU anyway.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
-`zig build check-catalog` exit 0.
+## What is deliberately not done
 
-## Audit 2026-11-17 (whole-module mutation)
-
-521 mutants over every non-test line of `src/checksum.zig`, `header.zig`, `tlv.zig`, `tlvs.zig`, `pdu.zig`, `spb.zig` and the dispatch in `root.zig`, one build with every mutant behind a runtime switch, run once per mutant (ReleaseSafe). One mutant per condition and class: each bound (`<`, `<=`, dropped), each length and offset (one octet early or late, the record size off by one), each endianness (every multi-byte read and write), each flag bit (wrong bit, inverted), each mask, each skipped write, each dispatch arm, each builder guard and backfill, the Fletcher arithmetic (moduli, signs, which accumulator, the fold of Y, the zero normalisation) and the receive-side grading (`checkLspChecksum`: zero test, `verify` forced true or false). Not mutated: the comptime constants, the `catch unreachable` after a checked length, formatting and doc comments.
-
-421 mutants died on the existing suite, 100 survived the first round, and `src/mutation_test.zig` (33 tests) kills 88 of them: exact-fit and one-short buffers for every builder and every `add*` TLV helper (the 255-octet TLV value limit reached from each side), the fixed-header decode at exactly its fixed length and one octet below (`TruncatedBody`, which differs from `BadPduLength`), the Length Indicator one below and one above, a non-default Maximum Area Addresses written by each builder and read back, bytes after the PDU Length field (not in the TLV region, not in the checksum region), the byte order of the LSP checksum, sequence and lifetime fields, `stampLspChecksum`'s return value, each `LspFlags` bit on its own, distinct metrics and ids in IS Neighbours, CSNP and SPB records (the old tests used symmetric values), each VID tuple flag and the 12/20-bit masks, the I-SID and tuple counts at their limit, partial trailing records fed straight to the two fixed-record iterators, the level-2 dispatch arms and `.other` keeping its bytes.
-
-The 12 that do not die are not defects: 4 on the TLV helpers (an exact 255-octet scratch fit that no loop value can reach: 255 is not a multiple of 6 or 16; an area over 254 octets already fails the scratch bound, which makes two area-length tests redundant), 1 iterator end test (`>=` for `==` on a position that never exceeds the length), 4 PDU-length zeroing writes in the builders' `init` (`finish` always overwrites the field, an unfinished builder is not an output), 1 byte-order mutant on a value that is only compared with zero, 2 redundant guards in `encodeSpbInstance` (the builder repeats the buffer test with the same error; 255 tuples already exceed a TLV value). No survivor sits in the checksum arithmetic, `verify`, the zero-checksum test or any auth or length check: forcing `checkLspChecksum` to report every checksum good or every checksum bad is killed. Counts on the card are whole-module.
-
-## Audit 2026-11-18 (delta mutation, `src/auth.zig`)
-
-68 mutants over every non-test line of `src/auth.zig`, one per condition and class: each Authentication Type and digest length (each algorithm's L one off), the `parse` bounds (empty value, MD5 exactly 17, RFC 5310 at least type + Key ID), the placeholder (cleartext length limit and total, zero vs Apad fill, Key ID byte order, the 3-octet header), each PDU kind's fixed length and the LSP flag in `find`, the TLV-code test and the value/PDU-length offsets, the strict key preparation (`>` vs `>=` L, the flag, the RFC 5310-only gate), each zeroed LSP field and its bounds, the replacement block and the tail, `sign`'s key checks (algorithm, Key ID, length, cleartext password), the digest write and the checksum re-stamp, `verify`'s per-type key selection, the any-key verdict, each compare forced true and its offsets, and `ctEql`'s length test, fold and result. Not mutated: the comptime Apad table and `declassified` (a memcheck client request, no value change).
-
-63 died on the first run; the 5 survivors became 2 tests in `src/auth_kat_test.zig`: strict keying with a key of exactly L octets and with HMAC-MD5 must equal plain keying (the `>`/`>=` boundary and the RFC 5310-only gate), and a key of another algorithm is never used — an HMAC key whose secret equals a cleartext password, and an HMAC-MD5 key on an RFC 5310 TLV that happens to carry a 16-octet digest and Key ID 0 (in `sign` and in `verify`). 68/68 killed, 0 equivalent. The card adds them to the 2026-11-17 whole-module counts.
-
-## Deliberately deferred (out of scope by design, not oversight)
-
-- **All protocol state**: adjacency FSM (up/init/down), the LSP database,
-  flooding (SRM/SSN flags, CSNP/PSNP-driven synchronization *logic* — the PDUs
-  are modeled, the exchange algorithm is not), SPF/route computation, and the
-  SPB shortest-path-tree / ECT computation. This module supplies the bytes those
-  consumers exchange.
-- ~~**ISO Fletcher checksum** compute/verify~~ — **now implemented**, additively:
-  `checksum.{compute,verify}` (ISO 8473 Annex C / RFC 905 Annex B) plus the LSP
-  framing in `pdu.{lspChecksumRegion, computeLspChecksum, checkLspChecksum,
-  stampLspChecksum}` and `LspBuilder.finishStamped`, per ISO 10589 §7.3.11 ("The
-  checksum shall be computed over all fields in the LSP which appear after the
-  Remaining Lifetime field"). `Lsp.decode` is unchanged — it still carries the
-  raw 16-bit field and validates nothing, so the wire behaviour and the
-  zero-allocation decode contract are untouched. A zero field means "not
-  computed" (`ChecksumStatus.not_present`); the receive **policy** built on that
-  — ISO §7.3.14.2's discard — belongs to the update process (`isis-lsdb`), not
-  here.
-- **§7.3.11's hardware-failure precaution for checksum generation** ("start
-  with C0/C1 initialised to what they would be after computing for the
-  systemID portion … stored when the Network entity is enabled and whenever
-  systemID changes"): a redundancy check against a corrupted in-memory
-  systemID, requiring persistent state this pure codec does not hold. The
-  wire value is unaffected — resuming from a cached prefix that matches the
-  actual prefix bytes is arithmetically identical to `checksum.compute`'s one
-  continuous pass — so this is a robustness feature for a stateful generator,
-  not a decode/encode correctness gap. Full citation: `pdu.lsp_checksum_base`.
-- **Non-default ID lengths** in the typed bodies — not yet (only 6 is wired; the
-  raw TLV walk is id-length-independent); see Backlog.
-- ~~**Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310)~~ —
-  **implemented 2026-11-18** (§ Authentication). SPB digest (RFC 6329)
-  integrity stays out of scope.
-- **Multi-Topology topologies** beyond carrying the MT-ID — MT-ISN (#222), the
-  MT-aware reachability set — not yet, see Backlog.
-- **The long tail of the IANA TLV registry** (IP reachability #128/#130/#135,
-  IP Interface Address #132, TE sub-TLVs, segment-routing, etc.) and the
-  un-modeled SPB sub-TLVs (SPB-Inst-Opaque, SPBV, SPB-MCID, SPB-Digest,
-  SPB-B-VID) — all reachable and byte-exact through the raw escape hatch;
-  modeling any is additive. Typed IP reachability (#128/#130/#132/#135/#236) is
-  not yet modeled — see Backlog; the rest of the tail stays raw.
-
-## Status
-
-`gap · any · codec · reentrant` · deps: none (std only) — canonical source is
-`pub const meta` in `src/root.zig`.
+- **All protocol state:** the adjacency FSM, the LSP database, flooding (SRM/SSN; the CSNP/PSNP PDUs are modeled, the exchange algorithm is not), SPF and the SPB tree / ECT computation. This module supplies the bytes those consumers exchange.
+- **ISO 10589 §7.3.11's hardware-failure precaution for checksum generation** (start from C0/C1 stored when the Network entity is enabled and whenever the systemID changes): a redundancy check against a corrupted in-memory systemID that needs persistent state this stateless codec does not hold. The wire value is unaffected, since resuming from a matching cached prefix equals one continuous pass. Full citation: `pdu.lsp_checksum_base`.
+- **The SPB digest (RFC 6329) integrity exchange.**
+- **The long tail of the IANA TLV registry** (IP Interface Address #132, TE sub-TLVs, segment routing, and so on) and the unmodeled SPB sub-TLVs (SPB-Inst-Opaque, SPBV, SPB-MCID, SPB-Digest, SPB-B-VID): reachable and byte-exact through the raw escape hatch; modeling any is additive. The ones that matter are in the Backlog.
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
-
-- **Typed IP reachability TLVs** (#135 extended IPv4, #236 IPv6, legacy #128/#130, #132 address iterator, #232 IPv6 address) with prefix sub-TLVs (survey 2026-09-30). Why: the first thing an IP IS-IS user decodes from an LSP; holo/FRR/goisis all type them. Effort: ~2–3 days, same iterator shape as #22. Fits CONVENTIONS §2: yes (pure codec).
-- ~~**Authentication TLV #10 with HMAC compute/verify (RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family)**~~ — **closed 2026-11-18** (`auth`, § Authentication; security triage row isis:270 done). (survey 2026-09-30). Why: production IS-IS runs authenticated; holo (`auth.rs`) and goisis have it, and the siblings `isis-adj`/`isis-lsdb` list it as deferred because the codec has no primitive to call. Effort: ~3 days (`std.crypto.auth.hmac` exists; no dependency needed). Fits §2: yes.
-- **Purge Originator Identification (#13, RFC 6232) and Extended Sequence Number (#229, RFC 7602)** (survey 2026-09-30). Why: FRR and holo emit/consume them; a purge without #13 cannot be traced. Effort: ~1 day. Fits §2: yes.
-- **Non-default ID length in typed bodies (ISO 10589 ID Length 1–8)** (survey 2026-09-30). Why: interop with the rare non-6 deployment; the deferred list above points here. Effort: ~2 days, touches every fixed-offset read. Fits §2: yes. Priority low.
-- **MT TLVs #222 / #235 / #237** (survey 2026-09-30). Why: multi-topology IS-IS (RFC 5120) in FRR/holo; the MT-ID is already parsed in #143/#144. Effort: ~2 days. Fits §2: yes. Priority low.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Typed IP reachability TLVs** (#135 extended IPv4, #236 IPv6, legacy #128/#130, #132 address iterator, #232 IPv6 address) with prefix sub-TLVs. Why: the first thing an IP IS-IS user decodes from an LSP; holo, FRR and goisis all type them. Effort: ~2-3 days, same iterator shape as #22. Fits CONVENTIONS §2: yes (pure codec).
+- **Purge Originator Identification (#13, RFC 6232) and Extended Sequence Number (#229, RFC 7602).** Why: FRR and holo emit and consume them; a purge without #13 cannot be traced. Effort: ~1 day.
+- **Non-default ID length in typed bodies (ISO 10589 ID Length 1-8).** Today only 6 is wired and the rest return `UnsupportedIdLength`; the raw TLV walk is id-length-independent. Why: interop with the rare non-6 deployment. Effort: ~2 days, touches every fixed-offset read. Priority low.
+- **MT TLVs #222 / #235 / #237** (multi-topology IS-IS, RFC 5120; only the MT-ID of #143/#144 is parsed today). Effort: ~2 days. Priority low.
 
 ## Anchoring
 
@@ -363,5 +266,3 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** Wireshark sharkd validated 5 PDU bodies + TLVs incl. L2 CSNP/PSNP (goldens.zig); long-tail raw-TLV escape hatch stays self-tested
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — not modeled (IP-reach and non-default id-lengths are Backlog items). Auth #10 (2026-11-18) is anchored on an independent Python recipe (`tools/auth_kat.py`, § Authentication), not on a dissector, so there is no typed content for Wireshark to validate

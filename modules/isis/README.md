@@ -16,7 +16,7 @@ validates nothing, though the checksum itself is now available — `checksum.
 framing in `pdu.{computeLspChecksum, checkLspChecksum, stampLspChecksum}` and
 `LspBuilder.finishStamped`; the long tail of the IANA TLV registry stays
 reachable through the raw escape hatch.
-See `SPEC.md` for the deliberately-deferred list.
+See `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*) for what is left out.
 
 Model after: ISO/IEC 10589 (IS-IS), RFC 1195 / 5301 / 5305 (IP/hostname/TE
 TLVs), and RFC 6329 + RFC 6165 (SPB / MT-Capability). Type numbers are from the
@@ -126,10 +126,10 @@ against replay.
 zig build test-isis
 ```
 
-Golden P2P-IIH and SPB-carrying LSP PDUs pinned byte-for-byte (builder
-reproduces them, decoder recovers every field), encode↔decode round-trips
-including the raw escape hatch, per-TLV bounds-safety unit tests, the
-`std.testing.fuzz` target, and 13 authentication KATs computed by an
+Golden PDUs pinned byte-for-byte (builders reproduce them, decoders recover
+every field; five bodies are also graded by Wireshark's `sharkd`), encode↔decode
+round-trips including the raw escape hatch, per-TLV bounds-safety unit tests, the
+`std.testing.fuzz` target and its deterministic driver (`ISIS_FUZZ`), and the authentication KATs computed by an
 independent Python recipe (`tools/auth_kat.py`, `hmac`/`hashlib`). Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from the public specifications above; no third-party
