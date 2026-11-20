@@ -23,7 +23,7 @@
 //!
 //!   zig build interop-protobuf -- --capture
 //!
-//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-11
+//! Reference: google.protobuf 4.21.12 on Python 3.14.4
 
 pub const Verdict = struct {
     name: []const u8,

@@ -217,14 +217,14 @@ test "round trip: every scalar kind at its extremes" {
     }
 }
 
-// A1/protobuf.md F12: the case list above stops at `-1.5e300` / `3.5` — no
+// A1 audit F12: the case list above stops at `-1.5e300` / `3.5` — no
 // NaN, no +-Inf, no denormal anywhere in the suite. Compared bit-for-bit,
 // not by value: NaN != NaN under `==`, so `testing.expectEqual` on the
 // float itself (as the block above does) cannot even express this case.
 // `-0.0` is deliberately excluded: `isDefault` treats it as the type
 // default (`-0.0 == 0` is true in IEEE 754), so proto3 implicit presence
 // never puts it on the wire at all — that is a documented, intentional
-// elision (A1/protobuf.md F12's own writeup), not something a round trip
+// elision (A1 audit F12's own writeup), not something a round trip
 // through an implicit-presence field can observe either way.
 test "F12: float pathology (NaN payload, +-Inf, denormal) round-trips bit-exact" {
     const gpa = testing.allocator;
@@ -561,7 +561,7 @@ test "a 40-field message compiles and round-trips (28 was the old ceiling)" {
 
 // ── F6: encodeAlloc's size cache agrees with encodeInto's recompute ────────
 //
-// A1/protobuf.md F6: `encodeAlloc` now sizes every submessage exactly once
+// A1 audit F6: `encodeAlloc` now sizes every submessage exactly once
 // (a `SizeTree` built alongside the sizing pass) instead of recomputing a
 // nested size on every level it is under. `encodeInto` still recomputes —
 // it has no allocator to cache with, and that is its whole point (see

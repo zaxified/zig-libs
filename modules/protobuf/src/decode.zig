@@ -621,7 +621,7 @@ const testkit = @import("testkit");
 /// false, and the shape word 0 — meaning `Repeated`, `Keeps` and `Chain` would
 /// never be selected however many message seeds were added.
 const DecodeCorpus = struct {
-    // audit F14 (2026-09-11): `Presence` -- the one schema shape with
+    // audit F14: `Presence` -- the one schema shape with
     // OPTIONAL fields (`?i32`/`?[]const u8`, proto3 explicit presence) --
     // was never one of the four shapes this harness could select, so no
     // amount of `--fuzz` time could reach whatever `decode.zig` does
@@ -791,7 +791,7 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
         };
         if (ok) accepted += 1;
     }
-    // audit F14 (2026-09-11): counts below re-derived after adding the
+    // audit F14: counts below re-derived after adding the
     // `Presence` shape (`conformance.presence_cases`, 5 entries, all
     // nonempty and all legal). See the comment on the pre-`Presence`
     // numbers this replaced in git history for the "37 of 40" trap this

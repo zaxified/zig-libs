@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Deterministic-PRNG corrupt-input harness for the 2026-10-04 decode paths
+//! Deterministic-PRNG corrupt-input harness for the decode paths
 //! — `oneof` gathering, `map` dedupe, the well-known `Struct`/`Value` tree —
 //! alongside the existing shapes (`Wide`, `Repeated`, `Keeps`, `Chain`).
 //!

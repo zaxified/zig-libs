@@ -16,7 +16,7 @@
 //! two filled it **exactly**, so any divergence trips an assertion in the
 //! very first test that runs, instead of emitting a truncated message.
 //!
-//! Cost note (F6, A1/protobuf.md): a submessage `depth` levels deep used to
+//! Cost note (F6, A1 audit): a submessage `depth` levels deep used to
 //! cost O(depth^2) to ENCODE, not because sizing itself is expensive (a
 //! single top-down `messageSize` call is O(depth), like any tree walk) but
 //! because the EMIT pass asked `messageSize` to recompute each nested
@@ -87,7 +87,7 @@ pub fn encodeInto(buf: []u8, value: anytype, options: Options) (Error || error{N
 }
 
 /// Below this nesting depth, `encodeAlloc` skips the size cache entirely and
-/// costs exactly what it did before F6 (A1/protobuf.md): a plain, allocation-
+/// costs exactly what it did before F6 (A1 audit): a plain, allocation-
 /// free sizing pass plus an emit pass that recomputes nested sizes as it
 /// goes. Chosen from F6's own hybrid A/B (see SPEC.md): the crossover where
 /// the cache's fixed arena/allocation overhead stops outweighing what it
@@ -108,7 +108,7 @@ var cache_path_calls_for_testing: usize = 0;
 
 /// Encode into a freshly allocated, exactly-sized buffer owned by the caller.
 ///
-/// Hybrid (F6 + coordinator review, A1/protobuf.md): a first, allocation-free
+/// Hybrid (F6 + coordinator review, A1 audit): a first, allocation-free
 /// sizing pass (the SAME one `encodedSize`/`encodeInto` use, `.plain`) also
 /// tracks the deepest nesting it actually saw, for free -- `depth` is already
 /// threaded through every recursive call, so this is one extra comparison
@@ -328,7 +328,7 @@ fn valueSize(
 // ── emit pass ───────────────────────────────────────────────────────────────
 
 fn emitMessage(comptime T: type, value: T, e: *wire.Emitter, options: Options, depth: u8, cache: ?*Consume) Error!void {
-    // A1/protobuf.md F10: no depth check here. `encodeInto`/`encodeAlloc`
+    // A1 audit F10: no depth check here. `encodeInto`/`encodeAlloc`
     // always call `messageSize` (via `encodedSize`) first, threading the
     // exact same `depth` through the exact same recursion shape — so
     // `messageSize`'s own check (above) has already rejected any value deep

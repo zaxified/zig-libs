@@ -5,14 +5,12 @@
 //! (`tools/interop.zig`) work from.
 //!
 //! It exists as its own file, reachable from `root.zig`, for one structural
-//! reason. Until 2026-09-06 the case tables lived in `src/reference_interop.zig`
-//! — inside the module, spawning `python3` from inside `test-protobuf`. That
-//! file is now a standalone program under `tools/`, and a program cannot
-//! `@import` a path outside its own module root. The tables have to live
+//! reason. That file is now a standalone program under `tools/`, and a program
+//! cannot `@import` a path outside its own module root. The tables have to live
 //! somewhere BOTH can reach, and the only such place is the module itself.
-//! Keeping one table is the point: the live run and the frozen replay must
-//! judge the same cases, or the replay quietly stops covering what the live
-//! run covers.
+//! Keeping one table is the point: the live run and the frozen replay must judge
+//! the same cases, or the replay quietly stops covering what the live run
+//! covers.
 //!
 //! Nothing here is part of the codec API. `root.zig` exposes it as
 //! `protobuf.conformance` purely so the interop program can import it.
@@ -256,7 +254,7 @@ pub const Msg = enum { wide, repeated, presence, chain };
 /// reference that changes its mind fails the capture instead of being
 /// silently written into the record.
 ///
-/// `reject_stricter` is audit F13's addition (2026-09-11): SPEC.md's
+/// `reject_stricter` is audit F13's addition: SPEC.md's
 /// "Smaller hardening" section names byte strings where THIS decoder is
 /// deliberately stricter than the reference (rejects what the reference
 /// accepts-as-unknown) — `FieldNumberOutOfRange`, `NonMinimalTag`. Before

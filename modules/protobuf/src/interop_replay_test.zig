@@ -9,12 +9,9 @@
 //! Those are exactly the rules a round trip through our own codec cannot
 //! settle, because our decoder would only ever mirror our own encoder.
 //!
-//! Until 2026-09-06 they were settled by spawning `python3` from inside
-//! `test-protobuf`, which meant the anchor ran only where the reference was
-//! installed — never in CI, whose peer install is `continue-on-error`. The
-//! live run now lives in `tools/interop.zig`; `--capture` freezes its verdicts
-//! into `testdata/interop_vectors.zig`, and this file holds the same ground
-//! with no python3 anywhere.
+//! The live run now lives in `tools/interop.zig`; `--capture` freezes its
+//! verdicts into `testdata/interop_vectors.zig`, and this file holds the same
+//! ground with no python3 anywhere.
 //!
 //! The frozen verdict is the reference's own parse, re-serialized canonically
 //! (`SerializeToString(deterministic=True)`). So each replay below is: decode

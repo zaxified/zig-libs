@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests for `oneof`, `map<K, V>` and the well-known types (2026-10-04).
+//! Tests for `oneof`, `map<K, V>` and the well-known types.
 //!
 //! Every expected byte string comes from the reference implementation
 //! (Python `protobuf`, driven as a black box by `tools/gen_core_vectors.py`,
@@ -322,7 +322,7 @@ test "oneof/map decode allocates nothing that escapes the arena (allocation fail
     }.f, .{});
 }
 
-// ── tests asked for by the 2026-10-04 mutation run ─────────────────────────
+// ── tests asked for by the mutation run ─────────────────────────
 
 const TwoMsgs = struct {
     pick: ?Pick = null,
