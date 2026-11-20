@@ -13,7 +13,7 @@ as the server. No `@panic` stubs remain in this module.
   `diffie-hellman-group-exchange-sha256` (RFC 4419) /
   `diffie-hellman-group14-sha256` / `-group16-sha512` key
   exchange, the RFC 4253 §6 Binary Packet Protocol,
-  `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
+  `chacha20-poly1305@openssh.com` / `aes{128,192,256}-ctr` with `hmac-sha2-256`/`-512` (plain and `-etm`) /
   `aes{128,256}-gcm@openssh.com` ciphers, and host-key *verification* (client)
   / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
   and ecdsa-sha2-nistp256 / -nistp384 / -nistp521. Once a handshake completes, `Transport.negotiated`
@@ -46,7 +46,7 @@ as the server. No `@panic` stubs remain in this module.
   RFC 4254 §5.2 window/flow control, `CHANNEL_DATA` / `_EXTENDED_DATA`
   (stderr) / `_EOF` / `_CLOSE`; `"exec"` / `"subsystem"` / `"shell"` /
   `"pty-req"` / `"env"` / `"window-change"` / `"signal"` requests and
-  `exit-status` / `exit-signal` — both roles; **several channels per
+  `exit-status` — both roles (the client also records a peer's `exit-signal`; the server never sends one); **several channels per
   connection** (`connection.Connection` client-side, `serveConnection`
   server-side); client **TCP/IP forwarding** both ways (`direct-tcpip`,
   `tcpip-forward` → `forwarded-tcpip`).
@@ -72,11 +72,12 @@ no skips.
 - **Deps:** `rsa` (this repo's own module) — for `rsa-sha2-256`/`rsa-sha2-512`
   (RFC 8332) signature verify/sign, as host keys and as user keys; `montint`
   (DH group exchange / group14/16 modexp); `p521` (ecdsa-sha2-nistp521 and
-  ecdh-sha2-nistp521); `aes192` (`aes192-ctr`); `b64ct` (constant-time base64 of
-  the host-key PEM).
+  ecdh-sha2-nistp521); `aes192` (`aes192-ctr`); `keycodec` (the host-key PEM
+  block walk and its constant-time base64); `aesgcm` (`aes{128,256}-gcm@openssh.com`
+  packets).
 - **Crypto:** Zig `std.crypto` — X25519 + ML-KEM-768 (KEX), Ed25519/P-256/P-384
   (signatures), ChaCha20-Poly1305 / AES-CTR (ciphers; AES-GCM via the `aesgcm` module), SHA-2 /
-  HMAC-SHA2-256.
+  HMAC-SHA2-256/512.
 
 ## Provenance
 
@@ -217,7 +218,8 @@ fn runCommand(
     return 0; // exit status
 }
 
-const host_key = try ssh.server.HostKey.fromOpenSSH(openssh_key_v1_text, null);
+var host_key: ssh.server.HostKey = undefined; // holds the private key: load it in place
+try ssh.server.HostKey.fromOpenSSH(&host_key, openssh_key_v1_text, null);
 var st = try ssh.server.accept(&reader, &writer, gpa, .{
     .host_keys = &.{host_key},
     // RFC 8308 `server-sig-algs`, sent to any client that offered `ext-info-c`.
@@ -317,16 +319,14 @@ name-list constants, `Algorithms`, `KexInit`, `exchangeVersions`, `Packet`/`Ciph
 parts 2 and 3, and `SPEC.md` for the design/threat notes and what is
 deferred.
 
-## What is deliberately not implemented
+## Not provided
 
-`hostbased` authentication, the password-*change* sub-protocol, agent
-forwarding, OpenSSH certificate key types, X11 forwarding, server-side TCP/IP
-forwarding (the server never opens or listens on sockets), SFTP, compression,
-and legacy algorithms (`ssh-rsa`/SHA-1, CBC, HMAC-SHA1). Server handlers are
-one-shot callbacks, so a `"shell"` served here is batch input → output, not a
-pty driving a process. Requests for any of these are answered
-`SSH_MSG_CHANNEL_FAILURE` / `SSH_MSG_CHANNEL_OPEN_FAILURE` /
-`SSH_MSG_REQUEST_FAILURE` rather than mishandled. See SPEC.md → Backlog.
+SFTP, compression, SSH certificates, `ssh-agent`, X11/agent forwarding, server-side TCP/IP forwarding
+(the server never opens or listens on sockets), `hostbased` and password-change authentication, legacy
+algorithms (`ssh-rsa`/SHA-1, CBC, HMAC-SHA1), and a server that streams a handler's stdin/stdout (a served
+`"shell"` is batch input to output). Requests for them are answered `SSH_MSG_CHANNEL_FAILURE` /
+`SSH_MSG_CHANNEL_OPEN_FAILURE` / `SSH_MSG_REQUEST_FAILURE`, never mishandled. SPEC.md has the reasons
+(*What is deliberately not done*) and the planned items (*Backlog / deferred*).
 
 ## Tests
 

@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's Provenance section (no NOTICE: clean-room).
 
 ## Compared with
 
@@ -31,9 +31,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cataggar/sshz](https://github.com/cataggar/sshz) | Zig | MIT | 1 | push 2026-09-11 (no releases) | The closest competitor and Zig 0.16: its README lists client and server, keyboard-interactive, publickey/password/none, "multiple channels, sessions, port forwarding, and agent forwarding", rekeying, delayed compression, interop with OpenSSH, Dropbear and libssh. Newer and much broader than this module; source not read. |
 | [ringtailsoftware/misshod](https://github.com/ringtailsoftware/misshod) | Zig | MIT | 32 | push 2025-01-06 | Its README: "not secure, should not be used in real world systems"; exactly one algorithm of each kind. Narrower than this module. |
 
-**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519, NIST ECDH P-256/P-384/P-521, DH group-exchange and DH group14/16, rsa-sha2 and P-256/P-384/P-521 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no legacy SHA-1/CBC opt-ins yet (the non-legacy algorithm menu matches Go's since 2026-10-10), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (SPEC "Backlog / deferred"); sshz advertises agent forwarding and Dropbear/libssh interop besides.
 
-**Re-assessed 2026-10-06** (no new web survey): the survey's "missing and it matters" items for the main uses are in — rekeying both roles (with OpenSSH strict KEX and SSH_MSG_UNIMPLEMENTED), several channels per connection both roles (`connection.Connection` / `serveConnection`), `pty-req`/`shell`/`env`/`window-change`/`signal`/`exit-signal`, client TCP/IP forwarding both directions (`direct-tcpip`, `tcpip-forward`), and `keyboard-interactive` both roles — each live-tested against OpenSSH 10.2p1 (and Go `x/crypto/ssh` for keyboard-interactive). What remains behind is the list above. Scope `mvp` → `core`.
+**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519, NIST ECDH P-256/P-384/P-521, DH group-exchange and DH group14/16, rsa-sha2 and P-256/P-384/P-521 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no legacy SHA-1/CBC opt-ins yet (the non-legacy algorithm menu matches Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (see *What is deliberately not done* and *Backlog / deferred*); sshz advertises agent forwarding and Dropbear/libssh interop besides.
 
 ## Design & invariants
 
@@ -62,7 +61,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   length fails `readSliceAll` and is freed by the `errdefer` — so it is bounded, not
   unbounded. Stated because an invariant an auditor is invited to rely on should not have a
   silent exception in the first message of every connection. (`transport.zig`'s `SliceReader` and `server.zig`'s `WireCursor`
-  are now aliases of it, not copies.)
+  are aliases of it, not copies.)
 - **Wire-format codec (`messages.zig`):** `writeString`/`readString` (RFC 4251 §5 length-prefixed
   byte string), `writeMpint`/`readMpint` (§5 mpint, including the high-bit-set-implies-leading-
   zero-byte rule), `writeNameList`/`readNameList` (§5 comma-joined name-list), the RFC 4253 §12 /
@@ -71,7 +70,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   pair, same shape as the sibling `opcua` module's `Connection` — this module never opens a socket
   itself, and never spawns a process (see the server-side `CommandHandler` seam below).
 - **Algorithm lists are runtime-configurable (Go `Config.KeyExchanges/Ciphers/MACs`,
-  `ClientConfig.HostKeyAlgorithms`; 2026-10-09).** `transport.Algorithms` (`kex`, `host_keys`,
+  `ClientConfig.HostKeyAlgorithms`).** `transport.Algorithms` (`kex`, `host_keys`,
   `ciphers`, `macs`, most-preferred first) sits on `Transport.algorithms` (client: set before
   `clientHandshake`) and `ServerConfig.algorithms` (server); every exchange of the connection,
   re-exchanges included, offers and negotiates from it. Defaults are `kex_algorithms`
@@ -153,14 +152,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   **rsa-sha2-512** (RFC 8332 — the signature algorithm name differs from the `ssh-rsa` key-blob
   type, and the module enforces that pairing), **ecdsa-sha2-nistp256/384/521** (RFC 5656). Bare `ssh-rsa`
   (SHA-1) is deliberately **not** accepted.
-- **A key is never copied (2026-10-09).** `HostKey` holds the private key by value (rsa ≈ 12 KiB),
+- **A key is never copied.** `HostKey` holds the private key by value (rsa ≈ 12 KiB),
   so it lives in the caller's storage and every API takes `*const HostKey`; `fromOpenSSH` and the
   container parsers write through an out-param (zeroed on error). The rsa-sha2 hash chosen from
   `server-sig-algs` is passed beside the key (`signWithHash`/`algorithmNameFor`), not by re-tagging
   a copy. Signing and loading run one frame down and zero the stack they dirtied (`burn.zig`);
   `stackprobe_test.zig` (ReleaseFast) checks every key type for 0 residue.
-- **Auth orchestration is a state machine in each role, shaped after Go `x/crypto/ssh`
-  (2026-11-15).** *Server* (`serveUserauth`): the enabled methods of the current step are an
+- **Auth orchestration is a state machine in each role, shaped after Go `x/crypto/ssh`.** *Server* (`serveUserauth`): the enabled methods of the current step are an
   `Active` set — each method either a yes/no hook (`AuthConfig.authorized_key`/`password`/
   `keyboard_interactive`, unchanged) or a deciding callback (`AuthConfig.callbacks`, Go's
   `ServerAuthCallbacks`) returning a `Decision`: `.reject`, `.accept` with `Permissions`, or
@@ -224,6 +222,38 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   consumed. On receipt both §5.2 limits are enforced: data beyond the granted window is
   `error.WindowOverrun` and a chunk larger than the advertised `maximum packet size` is
   `error.PacketTooLarge` — refused, not buffered.
+- **The Ed25519 seed is checked against the public key in every optimize mode.** `parseEd25519Body`
+  derives the pair with `Ed25519.KeyPair.generateDeterministic(seed)` and compares its public key with
+  the container's copy; std's `KeyPair.fromSecretKey` re-derives it only under runtime safety, so in
+  ReleaseFast/ReleaseSmall it would compare the container's copy with itself. A seed that does not
+  derive the container's public key is `error.InvalidPrivateKey`.
+- **The host-key PEM is walked and decoded without secret-dependent branches.** `pemDecodeOpensshBlock`
+  walks the blocks with `keycodec.pem` (a malformed block of another label before the key is skipped,
+  as Go's `pem.Decode` does; a broken `OPENSSH PRIVATE KEY` block is `InvalidPem` even when a good one
+  follows; the first block in the text is used) and decodes the body with `b64ct` straight into the
+  caller's wiped buffer: no skip table, no alphabet table, no stripped copy on the stack. Errors:
+  `MissingPemBlock`, `InvalidPem` (also for a body that decodes past the 16 KiB buffer).
+- **The DH exponent goes through montint, not `std.crypto.ff`.** `dhPowModPrime` is montint's `powMont`
+  (fixed 5-bit windows, branchless table gather) with a branchless exponent loader: `ff`'s window select
+  compiles to a conditional jump in ReleaseFast, which leaked the exponent's windows. Group exchange
+  (`gexPow`) uses the same kernel on `GexMod`.
+- **Secrets do not stay on the stack.** The per-method KEX entry points take `out: *KexResult` and burn
+  their bodies (std's X25519, ML-KEM and modexp frames included); the KEX rounds, `installCipher`,
+  `deriveKeys` and `writePacket`/`readPacket` burn theirs (`burn.zig`). `stackprobe_test.zig` and
+  `stackprobe2_test.zig` probe each method and role and a whole handshake per role for residue.
+- **Public keys and `known_hosts` (`keys.zig`, `knownhosts.zig`).** `PublicKey.parse`/`verify`/`eql`,
+  `fingerprintSha256`/`fingerprintMd5` (byte-equal to `ssh-keygen -lf`), the `authorized_keys` line
+  parser (quoted options), `AuthorizedKeysIterator`, `findAuthorizedKey` and `writeAuthorizedKey` work
+  over text the caller read. RSA keys above the `rsa` module's 4096-bit cap are skipped as unusable
+  (OpenSSH goes to 16384). `knownhosts.check` decides in OpenSSH's order: `@revoked` -> accept ->
+  same-type mismatch -> unknown; wildcards, negation, `[host]:port` and hashed `|1|` entries
+  (byte-equal to `ssh-keygen -H`) are matched; `writeLine` writes a plain or hashed line. A
+  `@cert-authority` line is parsed and never treated as a host key.
+- **Algorithm menu.** Besides the defaults above, the cipher/MAC set is Go's non-legacy set; host and
+  user keys cover ed25519, rsa-sha2-256/512 and ecdsa nistp256/384/521 (loading, signing, verifying;
+  passphrase-protected ed25519 and ecdsa-p256 OpenSSH keys load; a wrong or missing passphrase is refused). Group exchange: the client takes any
+  server prime of 2048..8192 bits (the build option below caps it), the server answers from the fixed
+  group14/group16 primes as Go's does.
 
 ## Threat model / out of scope
 
@@ -276,10 +306,10 @@ so the security properties below are in effect, not aspirational.
 ### Known limits of the userauth path (audited, deliberately not "fixed" here)
 
 - **`AuthConfig.max_attempts` is a credential budget, not a time or packet budget.** Only a
-  *rejected credential* consumes it (default 6 since 2026-11-15, was 20). The RFC 4252 §7
+  *rejected credential* consumes it (default 6). The RFC 4252 §7
   signature-less `publickey` *query* (answered SSH_MSG_USERAUTH_PK_OK — by definition not an
-  attempt) and a partial success do not, but since 2026-11-15 every USERAUTH_REQUEST counts
-  against `max_auth_requests` (128, Go's backstop), so a peer can no longer loop on queries
+  attempt) and a partial success do not, but every USERAUTH_REQUEST counts
+  against `max_auth_requests` (128, Go's backstop), so a peer cannot loop on queries
   forever. SSH_MSG_IGNORE and SSH_MSG_DEBUG still cost nothing, so an unauthenticated peer can
   hold the pre-auth state machine open for as long as it keeps sending bytes. There is deliberately no
   OpenSSH-style `LoginGraceTime`: this module never owns the socket (see the transport-agnostic
@@ -300,184 +330,87 @@ so the security properties below are in effect, not aspirational.
   with `undefined` (0xaa) and hides any omission; in ReleaseFast/ReleaseSmall that memset is
   elided and the scrub is the only thing standing between a successful login and the password
   persisting verbatim in freed heap. The regression test says so in its own comment.
+- **`languages_client_to_server`/`languages_server_to_client` and `reserved` are decoded and never
+  read.** Per RFC 4253 §7.1 the language name-lists are advisory (this module sends them empty) and
+  `reserved` is "for future extension", sent as 0. Named here only because "decoded and discarded" is
+  otherwise indistinguishable from an oversight.
+- **Re-exchanges are not rate-limited.** A peer may start them as often as it likes, before
+  authentication too (a CPU cost per exchange, as with OpenSSH).
 
 ## Verification
 
-`zig build test-ssh` — **all passing, Debug and ReleaseFast native, no skips** in an
-environment with OpenSSH installed.
+Run `scripts/modtest ssh` (Debug) or `zig build test-ssh`; the live-interop tests need `sshd`, `ssh` and
+`ssh-keygen` and report `error.SkipZigTest` without them (they pick a random loopback port, so a port
+collision can turn one live test into a skip on an individual run: a run with no skips is the one that
+proves interop). `zig build interop-ssh` drives the Go `x/crypto/ssh` oracle (`tools/go_kbdint`, fetched by
+`go run`, never vendored).
 
-- **Wire codec:** `messages.zig` round-trips (string incl. empty, mpint incl. the high-bit
-  zero-pad rule and zero, name-list incl. empty) plus `Cursor` bounds tests — a `0xffffffff`
+- **Wire codec:** `messages.zig` round-trips (string incl. empty, mpint incl. the high-bit zero-pad rule
+  and zero, name-list incl. empty and the iterator over it) and `Cursor` bounds tests: a `0xffffffff`
   string length, an off-by-one length and a truncated length prefix are each `error.ProtocolError`.
-- **Transport:** KEXINIT encode/decode, KDF-formula, per-cipher packet round-trips + tamper
-  detection, RFC 3526 prime bit-lengths, degenerate-DH-value rejection.
-- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519, rsa, and ecdsa-p256 — the third
-  closes A1/examples/ssh.md S4+S5, `K_S` byte-compared against `ssh-keygen`'s `.pub`), ecdsa
-  signature wire shape, error paths (including a curve other than nistp256 inside an otherwise
-  well-formed ecdsa container).
-- **Userauth units:** `signedBlob` field-order/framing assertion, session-id-changes-the-message,
-  the algorithm↔key-blob-type pairing table, an ed25519 signature that verifies under its own
-  session id and fails under another, the borrow-not-copy `sessionId` regression, two crafted-
-  wire server tests (oversize peer string, oversize packet length → typed errors), and the
-  freed-scratch password-scrub regression (see Known limits for the mode caveat).
-- **Loopback self-interop (headline, `connection.zig`)** — our client ↔ our server over a real
-  loopback TCP socket, full stack each time: transport KEX → `publickey` userauth → session-channel
-  open → `exec` → stdout/stderr/`exit-status` → close. Cases: two-phase publickey, direct-signature
-  publickey (no query phase), `password`, and 100 KB of output squeezed through a 16 KB window
-  (so window-adjust blocking actually happens, both directions).
-- **Reject-teeth, each alongside the positive control that runs through the same harness:** a
-  signature bound to a *different* session id → USERAUTH_FAILURE; an unauthorized public key →
-  USERAUTH_FAILURE; SSH_MSG_CHANNEL_OPEN before authenticating → server `error.ProtocolError` +
-  DISCONNECT; a channel request after CLOSE → `error.ChannelClosed`; a peer overrunning the
-  advertised window → `error.WindowOverrun`; a chunk over the advertised maximum packet size →
-  `error.PacketTooLarge`; a request for a channel that was never opened →
-  `error.ChannelClosed`; a `direct-tcpip` open → SSH_MSG_CHANNEL_OPEN_FAILURE with reason
-  `unknown_channel_type` (byte-asserted on the wire).
-- **Live interop against real OpenSSH 10.2p1, both directions, now covering auth + exec** (gated on
-  `sshd`/`ssh`/`ssh-keygen`; `error.SkipZigTest` otherwise):
-  - transport-only, as before: our client ↔ a spawned real `sshd` across 7 kex×cipher
-    combinations, and a real `ssh` client ↔ our server across 9;
-  - **our client → real `sshd`: `publickey` authentication with an `ssh-keygen`-generated key in
-    `authorized_keys`, then `exec` of a shell command, asserting stdout `hello`, stderr `oops` and
-    `exit-status` 7** — the session-id binding has to be byte-exact or OpenSSH rejects the
-    signature;
-  - **real `ssh` client → our server: the real client's `publickey` signature verified by our
-    `serveUserauth`, then `exec` served by our `serveSession`**, asserting the client's captured
-    stdout and the exit status it reports (3);
-  - **the two RFC 8308 lanes, which are the only tests here a foreign peer's *algorithm choice*
-    can break.** (a) A real `ssh` with an **RSA** user key against our server: `ssh-ed25519` and
-    `ecdsa` user keys each have exactly one signature algorithm, so a client can offer them
-    knowing nothing about the server, and every other lane above is blind to `server-sig-algs`.
-    (b) **Our client** with an RSA user key against a real `sshd` run with
-    `PubkeyAcceptedAlgorithms=rsa-sha2-512` — an oracle for the client half, because
-    `AuthKey.fromOpenSSH` hands us that key pinned to `rsa-sha2-256`, so a client that does not
-    read the extension signs with a hash this `sshd` refuses. Each lane was mutation-checked
-    against the *other* half of the feature and stayed green, so neither is standing in for the
-    other: removing the server's `EXT_INFO` send fails only (a) (`EndOfStream` — the real client
-    leaves without ever sending a credential), and making the client ignore `server-sig-algs`
-    fails only (b) (`AuthenticationFailed`).
-
-- **Live interop, 2026-10-06 additions (`src/interop_test.zig`, gated like the rest):** fixtures
-  `Sshd` (a real `sshd`, our client connected) and `SshClient` (a real `ssh`, our server). Strict
-  KEX agreed with `sshd` and the non-strict path with it switched off (both decided by `sshd`'s
-  MAC check); `sshd` answering our message 254 with UNIMPLEMENTED naming its sequence number;
-  re-exchanges started by `sshd` (`RekeyLimit=32K`, 300 KB read), by our client (16 KiB limit,
-  200 KB sent), by `rekey()` twice (session id unchanged), by a real `ssh` (`RekeyLimit=32K`, 3 MB
-  from our server) and by our server against `ssh`; three concurrent sessions to `sshd` through
-  `Connection`; pty-req + window-change (`stty size` reads the resized terminal); shell; env with
-  `AcceptEnv` (an unaccepted name refused); signal TERM → exit-signal TERM; `direct-tcpip`
-  through `sshd` to a local echo peer (and a refused open to a dead port); `tcpip-forward` on a
-  port `sshd` picks, a dialer connecting to it, `forwarded-tcpip` both ways; a real `ssh`
-  ControlMaster running three sessions (two concurrently) over one connection to our
-  `serveConnection`; `ssh -tt` (pty-req reaching the handler), `SetEnv` filtered by `accept_env`,
-  a stdin-fed shell; keyboard-interactive our client ↔ our server over loopback (accepted; a wrong
-  code refused), against Go `x/crypto/ssh` in the interop program (`zig build interop-ssh`,
-  `tools/go_kbdint`: two rounds, then exec; a wrong second answer refused), and from a real `ssh` answering our prompts
-  through `SSH_ASKPASS_REQUIRE=force` (accepted; a wrong code refused with `wrong_answers`).
-- **Offline transport units:** `recvPacket` answers an unrecognized number with UNIMPLEMENTED
-  naming sequence 0 and reads on, absorbs IGNORE/DEBUG, records a peer's UNIMPLEMENTED; KEX
-  messages outside an exchange are refused; queued packets come back in order with their
-  sequence numbers; a re-exchange refuses a different host key; the guessing-server test now
-  sends an encrypted packet after NEWKEYS (sequence 4; mutation-checked: without counting the
-  discarded guess it fails).
-
-- **Auth orchestration (2026-11-15).** Canned-stream units in `userauth.zig`, server: partial
-  success (password) → two keyboard-interactive rounds → `Permissions` on the result, the wire
-  checked (FAILURE partial=TRUE listing only `keyboard-interactive`, two INFO_REQUESTs, SUCCESS);
-  a wrong second-round answer; the user changing after a partial success (`ProtocolError`); an
-  abandoned keyboard-interactive served as the next request with no FAILURE between; `none`
-  under `no_client_auth`, its callback, the free first probe, a second probe charged, and `none`
-  refused after a partial success; `max_auth_requests` ending a stream of 130 queries;
-  `InvalidAuthConfig` for an empty config, a method set twice, a `partial` to nothing. Client:
-  none probe → partial success → keyboard-interactive (requests on the wire: none, password,
-  keyboard-interactive); the caller's order among listed methods; `retryable` (asked twice,
-  capped at `max_tries`, a plain method not retried, nested `retryable` refused); several keys
-  with only the PK_OK'd one signed, a PK_OK for another blob not signed, a server dropping
-  `publickey` ending the key walk. Loopback (`interop_test.zig`, our client ↔ our server over
-  TCP): an unauthorized key, the authorized one (partial), two keyboard-interactive rounds, a
-  `force-command` permission; the second factor wrong; `no_client_auth`; `max_attempts` = 3 ending
-  a retrying client (4 rejections: the free `none` + 3). **Live OpenSSH 10.2p1:** our client with
-  an unknown key first, then `sshd`'s; `sshd AuthenticationMethods=publickey,publickey` (partial
-  success, then the second key, then exec); `AuthenticationMethods=publickey,password` (partial
-  after the key, `password` tried because `sshd` now lists it — a non-root `sshd` without PAM
-  cannot check it, so the step fails as expected); a real `ssh` through our two-step server
-  (publickey → partial → two keyboard-interactive rounds via askpass, `force-command` reaching
-  the exec handler's `RequestInfo`). **Go `x/crypto/ssh`** (`zig build interop-ssh`,
-  `tools/go_kbdint partial <fingerprint>`): Go's `PublicKeyCallback` returns
-  `PartialSuccessError{Next: keyboard-interactive}`; our `authenticateWith` offers an unknown key
-  first, gets the partial success, answers two rounds, runs exec (Go's own log of the wrong-token
-  case: `no auth passed yet, unknown key, authenticated with partial success, wrong token`);
-  0 of 4 cases disagreed. **Fuzz:** `ssh-userauth` now drives both roles over the same stream
-  (server with a partial-success password, two-round keyboard-interactive and a `none` callback;
-  client `authenticateWith` with key/password/keyboard-interactive), corpus +5 entries (pinned:
-  17 payloads, 3 server logins, 456 reply octets), reach labels `client_failed`/
-  `client_authenticated`; verdict 4 × 60,000 runs (ReleaseSafe, SSH_FUZZ) clean.
-
-  Both live tests were confirmed to actually execute (not silently skip) by poisoning their
-  assertions and observing the failures. Caveat inherited from the pre-existing live-test harness:
-  each picks a random loopback port and reports `error.SkipZigTest` if the spawned `sshd` never
-  listens, so a port collision can turn one live test into a skip on an individual run (observed
-  once in ~10 runs); a run that reports no skips is the one that proves interop.
-
-- **Audit 2026-11-18 (whole-module mutation).** 992 mutants over the non-test code of
-  `transport`, `server`, `userauth`, `connection`, `messages`, `keys`, `knownhosts`: 905 N with
-  the switch in the caller (10 hand-written for multi-line conditions) and 87 W wipe/burn sites
-  switched inside `burn.zig`, plus 8 constant-time mutants measured with ctgrind. Two passes
-  (2026-11-17/18): six ReleaseSafe and four ReleaseFast schemata builds; W sites in ReleaseFast
-  against the stack probes and the full suite. Result: **869 killed** (31 by timeout, 4 by
-  ctgrind), **131 equivalent or unobservable** (108 equivalent, 8 unobservable, 11 excluded as
-  comptime-only, 4 constant-time), 0 open. Every survivor became a killing test (about 160 over
-  both passes) or an argued verdict. No defect was found in a MAC, signature, host-key,
-  strict-KEX, userauth or `known_hosts` check.
-  W sites: 27 are killed by new tests. Those tests check that `out` is zeroed on every
-  `fromOpenSSH`/parser error, that the `zeroize` methods clear every byte, and that no secret is
-  left in freed client userauth buffers or in the keyboard-interactive scratch between rounds.
-  New ReleaseFast probes cover the three container parsers called directly, `writePacket` under
-  chacha20-poly1305 and AES-GCM, `deriveKeys`, the server's keyboard-interactive hook and the
-  client's prompted password. The remaining W sites are covered by another protection, and this
-  was measured: the site's bytes are probe needles and the probe stays clean with it skipped,
-  while the covering burn skipped alone is killed. Sites that cover each other were switched off
-  together (`SSH_WSET`): the client round burn with the install burn (the `connectInto` probe
-  finds the installed keys), the server gex burn with its `y`/`K` wipes, and the
-  keyboard-interactive burn with the reply's record burn.
-  The KEX-round heap scratch wipes and the server round burn, unobservable at first, were
-  measured on 2026-11-18 (wave 6, residue follow-up) with a replay harness
-  (`stackprobe2_test.zig`): with deterministic entropy both sides of a handshake are pure
-  functions of what they read, so both transcripts are built by alternating single-threaded
-  passes and the measured side replays its peer's transcript from a fixed reader (no thread, no
-  blocking read; the earlier socketpair mirror of the `connectInto` probe deadlocked because its
-  peers stopped before the SERVICE_REQUEST `serverHandshake` waits for). The round scratch only
-  ever holds public KEX packets, except the packet a wrong `first_kex_packet_follows` guess makes
-  the round read and discard: each transcript ends with a re-exchange whose "guess" is
-  CHANNEL_DATA, and the receiving round's scratch must not keep it (both wipes killed; channel
-  data queued during a re-exchange goes through `Transport.rekey`'s own buffer, not this one).
-  The server round burn is covered by the install burn, as the client's is: skipped alone, the
-  new residue-rule probes of `serverHandshake` and of `serverKexRound` alone stay clean; skipped
-  with the install burn, the `serverKexRound` probe finds the installed keys (24 needles). The
-  `serverHandshake` probe stays clean even then: the record burns of the EXT_INFO and
-  SERVICE_ACCEPT packets sent after the round cover its frames too.
-  Constant time: `dh` and `gex` see an exponent stripped of its leading zero bytes. The `ecdh`
-  row was blind to an early-exit zero test in `fromScalar`: that branch replaced the one counted
-  context (memcheck put it on the loop instead of the `if`), so the count stayed 22.
-  `fromScalar` now declassifies only its zero verdict (`declassified`); the row is 20 (the three
-  zero-test contexts gone, P-256's public `rejectNonCanonical` verdict now counted apart) and the
-  early exit reads 22. The packet-MAC compares have no ctgrind target (unobservable). Two LOW
-  findings. A userauth banner of exactly `max_banner_len` (8 KiB) could not be sent
-  (`writePacket`'s 8 KiB frame: `PacketTooLarge`); fixed 2026-11-18. OpenSSH sends any banner a
-  packet holds (sshd reads a banner file of up to 1 MiB, `auth2_read_banner`) and Go's
-  `SendAuthBanner` checks no length; this module's send frame is 8 KiB by design
-  (`transport.write_frame_len`, under a 16 KiB record burn), so the server's bound is lowered to
-  what one packet carries under every cipher: `userauth.max_sent_banner_len` = 8098
-  (`transport.max_write_payload` 8107 less the message's 9 bytes), refused up front with
-  `NameTooLong`. A client still accepts banners up to `max_banner_len`. `messages.NameList.iterator`
-  yielded one empty name for an empty list although its doc comment promises none; fixed
-  2026-11-18 to yield nothing (RFC 4251 §5: "zero or more names", the empty list encoded as a
-  zero length; Go's `parseNameList` returns no names for it). Delta mutation of both fixes
-  (2026-11-18): 5 mutants (the empty-list guard dropped and its assignment skipped; the banner
-  bound `>=`, dropped, and back at `max_banner_len`), all killed; the two `pub const` bounds are
-  comptime (no runtime switch) and pinned by literal tests. The card counts these 5 and the
-  three re-measured W sites (two scratch wipes killed, the server round burn equivalent). Two kills first seen only in live
-  interop tests (889, 984) were re-measured without them and are killed by their own tests.
+- **Transport:** KEXINIT encode/decode, KDF formula, per-cipher packet round-trips and tamper detection,
+  RFC 3526 prime bit-lengths, degenerate DH values, queued packets during a re-exchange and their
+  sequence numbers, a re-exchange refusing a different host key, UNIMPLEMENTED handling, KEX messages
+  outside an exchange refused, the guessing-server case (a discarded guess still counts a sequence
+  number), the group-exchange cap (`gexGroupBitsOk` at the cap and one bit over).
+- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519, rsa, ecdsa P-256/384/521, and
+  passphrase-protected ed25519 and ecdsa-p256) with `K_S` byte-compared against `ssh-keygen`'s `.pub`, ecdsa signature wire shape, error paths
+  (a curve other than the expected one inside a well-formed ecdsa container, an Ed25519 seed that does
+  not derive the container's public key, run in ReleaseFast), `out` zeroed on every parser error, the
+  `zeroize` methods, fingerprints and `known_hosts` (hashed entries, `writeLine`) against `ssh-keygen`.
+- **Userauth units:** `signedBlob` field order and framing, session-id sensitivity, the algorithm <->
+  key-blob-type pairing table, the borrow-not-copy `sessionId` regression, crafted-wire oversize
+  rejections, the freed-scratch password-scrub regression (observable only in unsafe optimize modes,
+  see Known limits), and canned-stream units for both roles of the auth state machines (partial
+  success, multi-round keyboard-interactive, abandoned dialogue, `none` under `no_client_auth`,
+  `max_auth_requests`, `InvalidAuthConfig` cases, caller order, `retryable`, several keys with only the
+  PK_OK'd one signed).
+- **Loopback self-interop (`connection.zig`, `interop_test.zig`):** our client <-> our server over a real
+  loopback socket, full stack: KEX, `publickey` (two-phase and direct), `password`, keyboard-interactive,
+  partial-success chains, session channel, `exec`, stdout/stderr/`exit-status`, and bulk output squeezed
+  through a small window so window-adjust blocking happens in both directions.
+- **Reject-teeth, each with a positive control through the same harness:** a signature bound to another
+  session id, an unauthorized key, CHANNEL_OPEN before authentication (`ProtocolError` + DISCONNECT), a
+  request after CLOSE, a window overrun, a chunk over the maximum packet size, a request for a channel
+  never opened, a `direct-tcpip` open to the server (OPEN_FAILURE `unknown_channel_type`, byte-asserted),
+  a second-factor mismatch, `max_attempts` ending a retrying client.
+- **Live interop against OpenSSH, both directions:** our client against a spawned `sshd` and a real `ssh`
+  against our server across the kex x cipher menu; publickey + `exec` (stdout, stderr and exit status
+  asserted); the two RFC 8308 lanes, which are the only tests a foreign peer's algorithm choice can break
+  (a real `ssh` with an RSA user key against our server, and our client with an RSA key against an
+  `sshd` restricted to `rsa-sha2-512`; each fails only for its own half of the feature); strict KEX on
+  and off, UNIMPLEMENTED, re-exchanges started by either side and by `rekey()`, concurrent sessions
+  through `Connection`, pty-req + window-change, shell, `env` with `AcceptEnv`, signal -> exit-signal,
+  `direct-tcpip`, `tcpip-forward` + `forwarded-tcpip`, a real `ssh` ControlMaster over one connection to
+  `serveConnection`, `ssh -tt`, `SetEnv` filtered by `accept_env`; `AuthenticationMethods` chains
+  (`publickey,publickey`, `publickey,password`); a real `ssh` answering our keyboard-interactive prompts
+  through `SSH_ASKPASS_REQUIRE=force`; the Go oracle for keyboard-interactive and for
+  `PartialSuccessError`, with a wrong second answer refused.
+- **Fuzz** (`SSH_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, ReleaseSafe; never
+  `zig build --fuzz`): `ssh-readstring`, `ssh-readmpint`, `ssh-kexinit`, `ssh-readpacket`,
+  `ssh-keyload`, `ssh-pubkey`, `ssh-userauth` (both roles over one stream, with corpus seeds and reach
+  labels) and `ssh-session`. The card's Hardening line has the budget.
+- **Constant time (ctgrind):** rows `dh` (the montint kernel; the remaining contexts are the mpint length
+  of `e`/`K`, inherent to RFC 4251), `gex`, `ecdh` (`fromScalar` declassifies only its zero verdict) and
+  `pem` (the host-key PEM decode on the ed25519 fixture), with positive controls `ffpow` (the old
+  `std.crypto.ff` path) and `pemstd` (the old std base64 path) that must keep finding contexts; rows,
+  counts and attribution live in `scripts/checks/ctgrind-expected.tsv`. The packet-MAC compares have no
+  ctgrind target (unobservable).
+- **Stack residue:** `stackprobe_test.zig` (ReleaseFast) checks every key type and every KEX method and
+  role for zero residue; `stackprobe2_test.zig` replays a peer's transcript from a fixed reader to measure
+  `connectInto`, `serverHandshake` and `serverKexRound`, the container parsers, `writePacket` under
+  chacha20-poly1305 and AES-GCM, `deriveKeys`, and the keyboard-interactive and prompted-password paths.
+  A burn site covered by another burn is measured by switching both off together.
+- **Mutation:** whole-module mutants over `transport`, `server`, `userauth`, `connection`, `messages`,
+  `keys` and `knownhosts` (N mutants behind a runtime switch, W wipe/burn sites switched in `burn.zig`,
+  constant-time mutants measured with ctgrind); every survivor became a killing test or an argued
+  equivalent/unobservable verdict. No defect was found in a MAC, signature, host-key, strict-KEX, userauth
+  or `known_hosts` check.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **No curve25519 KAT:** RFC 8731 publishes no curve25519-sha256 test vectors (its §5 is IANA
+  considerations only), so there is no independent known-answer test to wire; the KEX is anchored by the
+  live interop lanes.
 
 ## Build options
 
@@ -498,140 +431,62 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
   file goes to 8192; a server picks the group closest to the client's preferred 2048, so this is rare). `curve25519`,
   `ecdh-*`, `mlkem768x25519` and the fixed MODP groups are unaffected.
 
+## What is deliberately not done
+
+- **Compression** (`none` only), and TLS-anything: SSH does not use TLS. Transport concerns below the
+  `std.Io.Reader`/`Writer` seam are the caller's.
+- **X11 forwarding, agent forwarding, server-side TCP/IP forwarding** (`direct-tcpip` opens and
+  `tcpip-forward` global requests are refused with `unknown_channel_type` / REQUEST_FAILURE): honouring
+  them means the server opening or listening on sockets, which this module never does. A server-side
+  `signal` is acknowledged and dropped (a one-shot handler has nothing to deliver it to) and the server
+  never sends `exit-signal`.
+- **Server-side stdin as a pipe.** `CommandHandler` is a one-shot function, so `ServeConfig.stdin_mode`
+  chooses between buffering CHANNEL_DATA until the client's EOF (`.collect_until_eof`, the default) and
+  running at once with empty stdin (`.ignore`); streaming would need a different handler shape (see the
+  Go-parity item in the Backlog).
+- **A `LoginGraceTime`:** the module never owns the socket, so a read deadline can only be imposed by the
+  caller that created the reader and writer.
+- **RFC 8308 extensions sent by the client.** The client advertises `ext-info-c` and accepts a server's
+  `SSH_MSG_EXT_INFO` but sends none: `delay-compression` needs compression, `no-flow-control`
+  contradicts the §5.2 window accounting, and `elevation` is Windows-specific.
+- **Bare `ssh-rsa` (SHA-1) and the other legacy algorithms** (CBC, HMAC-SHA1, DSA) as defaults: legacy
+  names would be explicit opt-ins in the `supported_*` lists, never on by default (see Backlog).
+- **`@cert-authority` known_hosts lines as trust anchors** (they need certificates), Go's
+  `KeyError.Want` host-key-algorithm preference and the `CheckHostIP` second lookup by address.
+
 ## Backlog / deferred
 
-- **`-Dprofile=small` stopped shrinking the size probe** *(found 2026-10-31 by `small-sizes.sh --measure` while adding dns's knob)*: probe default 185 448 B (was 184 720), small **159 120 B (was 29 440)**, gain 26 328 < floor 77 000 -- the `small` lane fails on ssh. The small side regressed, the default did not: montint's looped kernel / the 4096 cap no longer reach `GexMod`, or a new path instantiates the 8192 slot list. Suspects since the last green full lane (10-19): montint `5d28ab67` (R^2 from doublings), the GT no-panic sweep `7b0ba4b2`. Bisect with `scripts/checks/small-sizes.sh --measure`.
-- **`aes*-ctr` one block at a time** *(2026-10-20)*: `aesCtrXor` (`src/transport.zig`) encrypts one block per call and carries the counter byte by byte — no `encryptWide`, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (2026-10-20, 0.96× OpenSSL EVP CTR at 16 KiB) is the shape to use for aes192, and the same counter over std's `AesEncryptCtx` for aes128/256 (std's own `modes.ctr` is 2.3× on Zig 0.17, #36256). Needs a packet-rate bench first.
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; per-direction cached `aesgcm` context since the same day (no per-packet key expansion).
-
-- ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
-  — **fixed 2026-10-18**: `parseEd25519Body` derives the pair with `Ed25519.KeyPair.generateDeterministic(seed)`
-  and compares its public key with the container's (std `fromSecretKey` (0.16, unchanged in 0.17.0: `ed25519.zig:358`) re-derives only under runtime
-  safety, so the old check compared the container's copy with itself). Test `parseEd25519Body: a seed that does
-  not derive the container's public key is refused in every mode`, run in ReleaseFast; the old derivation fails it.
-- ~~**Constant time: the OpenSSH host-key PEM is decoded with std's table base64**~~ — **fixed
-  2026-10-18**: `pemDecodeOpensshBlock` finds the END line as the first `'-'` after the body
-  (`std.mem.indexOfScalarPos`; base64 has no `'-'`, so the scan stops at the body's public length)
-  and checks the END line starts there, then decodes straight into the caller's (wiped) buffer with
-  `b64ct.standard.decodeIgnoring(out, body, b64ct.pem_whitespace)` (new dep `b64ct`) — no
-  Boyer-Moore-Horspool skip table, no alphabet table, no per-character whitespace branch, and no
-  stripped base64 copy left on the stack. The first block in the text is used (as rsa's). Error set
-  unchanged (`MissingPemBlock`, `InvalidPem` — also for a body that decodes past the 16 KiB buffer).
-  ctgrind targets `pem` (`HostKey.fromOpenSSH` on the ed25519 fixture, the base64 characters that
-  carry only seed bits tainted): **1** in-file context — `findScalarPos`'s early exit
-  (mem.zig:1298 from `server.zig:382`), whose outcome is public because a key character is never
-  `'-'` — plus the 2-context witness; and `pemstd`, the positive control (the replaced
-  `indexOfPos` + `std.base64` decoder on the same tainted body): 18 contexts in `mem.zig` /
-  `base64.zig`, must stay ≥ 1. Rows and attribution in `scripts/checks/ctgrind-expected.tsv`.
-  Later the same day `pem` 1 → **3** with the seed-check fix below it in this list: the derived public
-  key's `rejectIdentity` in std's `pcMul16` and its compare with the container's copy — both decide on the
-  public key (tainted to memcheck only because it is derived from the seed).
-- ~~**Build option: `ssh-gex-max-bits`**~~ ✅ DONE 2026-10-18 — see § Build options. Was (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
-  is the SAME type as rsa's `DynModint(8192)`, so lowering rsa alone saves nothing for an ssh consumer: both must drop together.
-  `.small` → 4096 (RFC 8270 floor is 2048; a server offering a bigger group than the cap fails the kex loudly — check it does, with a
-  test). Measured on the HTTPS sizeprobe (native CPU, ADX/BMI2): `DynModint(8192)` 5.37 MB vs 1.77 MB at 4096. Note for montint's
-  slot-policy change (montint Backlog): GEX primes are 2048/3072/4096/6144/8192 — the key-size slot list must include 6144.
-- ~~**Dead stack of the key exchange**~~ — **fixed 2026-10-09**: per-method KEX entry points take
-  `out: *KexResult` and burn their bodies (std's X25519 / ML-KEM / modexp frames included), the
-  KEX rounds, `installCipher`, `deriveKeys` and `writePacket`/`readPacket` burn theirs; probed per
-  method and role plus a full handshake per role (`stackprobe_test.zig`, 0 residue; CHANGELOG has
-  the numbers). Remaining: the AES-GCM / aes256-ctr record paths and a rekey are covered by the
-  same burns but not driven by the probe (the cipher and KEX menus are fixed constants, so a
-  handshake cannot select them).
-- ~~DH exponent through `std.crypto.ff`'s pow~~ — **fixed 2026-10-02**: `dhPowModPrime` is montint's `powMont` with a branchless exponent loader (ff's window select compiles to a jump in ReleaseFast — measured). ctgrind target `dh` (0 contexts in montint; 4 on the mpint length of `e`/`K`, inherent to RFC 4251) with the old ff path kept as the `ffpow` positive control.
-Parts 1-3 are implemented. What is *not* here yet (not now ≠ never: the dated survey items
-after this list file most of these as tasks; the fixed algorithm menu stays a policy question
-for the owner):
-
-- **Userauth methods:** `hostbased` (RFC 4252 §9), the §8 password-*change* sub-protocol
-  (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), SSH agent forwarding /
-  `ssh-agent` client support, and OpenSSH certificate key types (`*-cert-v01@openssh.com`).
-  (Multi-round server-side `keyboard-interactive` is in since 2026-11-15: `KbdCallback`.)
-  Not here from Go's server: a per-connection `BannerCallback` (the banner is a static
-  `AuthConfig.banner`), `AuthLogCallback` for successes (`on_rejected` covers refusals),
-  `VerifiedPublicKeyCallback`, `PreAuthConnCallback`, and the `source-address` check (the module
-  never sees the peer address).
-- **Channel requests and types not served:** X11 forwarding, agent forwarding, and server-side
-  TCP/IP forwarding (`direct-tcpip` opens and `tcpip-forward` global requests are refused with
-  `unknown_channel_type` / REQUEST_FAILURE): honouring them means the server opening or listening
-  on sockets, which this module never does. A server-side `signal` is acknowledged and dropped —
-  a one-shot handler has nothing to deliver it to — and the server never sends `exit-signal`.
-- **Server-side stdin is batch, not a pipe.** `CommandHandler` is a one-shot function, so
-  `ServeConfig.stdin_mode` chooses between buffering CHANNEL_DATA until the client's EOF and then
-  running (`.collect_until_eof`, the default) or running immediately with empty stdin
-  (`.ignore`). Streaming a handler's stdin/stdout as it runs would need a different handler shape.
-- **The client sends no RFC 8308 extensions of its own.** It advertises `ext-info-c` (which is what
-  makes the server send `server-sig-algs`) and accepts a server's `SSH_MSG_EXT_INFO`, but sends
-  none itself: `delay-compression` needs compression, `no-flow-control` contradicts the §5.2 window
-  accounting, and `elevation` is Windows-specific.
-- **`languages_client_to_server`/`languages_server_to_client` are decoded and never read**, and the
-  `reserved` `uint32` likewise. Both are per RFC 4253 §7.1: the language name-lists are advisory
-  (this module sends them empty) and `reserved` is "for future extension", to be sent as 0. Named
-  here only because "decoded and discarded" is otherwise indistinguishable from an oversight.
-- **No curve25519 KAT.** (The algorithm lists became runtime-configurable 2026-10-09.) RFC 8731 publishes no curve25519-sha256 test
-  vectors anywhere — its §5 is IANA Considerations only, and the RFC as a whole has no
-  vectors/examples section — so there is no independent KAT to wire for it; this was a
-  misstatement in an earlier revision of this note, not an open task.
-
-- ~~**Rekeying (RFC 4253 §9)**~~ — DONE 2026-10-06, live-tested against OpenSSH 10.2p1 (see Verification).
-- ~~**Multiplexed channels (client `openSession` more than once, server channel table)**~~ — DONE 2026-10-06, live-tested against OpenSSH 10.2p1 (see Verification).
-- ~~**`pty-req`, `shell`, `env`, `window-change`, `signal`/`exit-signal`**~~ — DONE 2026-10-06, live-tested against OpenSSH 10.2p1 (see Verification).
-- ~~**Port forwarding (`direct-tcpip`, `tcpip-forward`) (RFC 4254 §7)**~~ — DONE 2026-10-06, live-tested against OpenSSH 10.2p1 (see Verification).
-- ~~**`keyboard-interactive` (RFC 4256)**~~ — DONE 2026-10-06, live-tested against OpenSSH 10.2p1 (see Verification).
-- **SFTP client (draft-ietf-secsh-filexfer-02 v3)** *(survey 2026-09-30)*. File transfer is the other reason people use SSH from a library (russh, libssh2 have it). Would be its own module on top of `subsystem`; no sibling exists (`ls modules | rg -i sftp` empty). Effort: large. Fits §2.
-- **Review 2026-10-06 (adversarial review of the mvp → core diff), left open, LOW:** `Server.sendData`
-  notices SSH_MSG_DISCONNECT only while it waits for window space (a client that disconnects
-  mid-stream is seen at the next read); a handler returning `error.CommandFailed` ends the whole
-  `serveConnection`, not just its channel; the client `Session` accepts data after the peer's EOF
-  and keeps a channel whose OPEN_CONFIRMATION named a zero maximum packet size open at the peer;
-  a peer may start re-exchanges as often as it likes, before authentication too (a CPU cost per
-  exchange, as with OpenSSH — no rate limit here). Fixed in the same review: a double free when
-  the OPEN_CONFIRMATION send failed (H1), messages after our CLOSE ending the connection (M1), a
-  freed `Connection` channel's late traffic failing other channels (M2, zombie ids), the rekey
-  queue bounded by packet count too and popped without shifting (M3), unaccepted
-  `forwarded-tcpip` channels capped at `max_unaccepted_forwards` (M4), a 256 KiB rekey scratch
-  (L1), `.ignore` stdin no longer buffered (L3), a consistent forwarded queue on error (L5),
-  `rekey_limit_* = 0` no longer looping (L6), `Transport.deinit` wiping the traffic keys (L7).
-  The mutation run (2026-08-22) predates the new code; a schemata run over the rekey, multiplexer
-  and keyboard-interactive paths is the next audit step.
-- **▶ Go x/crypto/ssh parity — owner's goal (2026-10-09: "our ssh qualitatively at the level of the
-  Go implementation").**
-  (the owner's workspace). This settles the two policy items below: the algorithm menu widens to Go's set and
-  becomes configurable, legacy algorithms come as explicit opt-ins (Go's `Insecure*`: DSA, CBC/3DES,
-  RC4, DH-sha1, `ssh-rsa` SHA-1; off by default), GSSAPI is in scope. Phases:
-  P1 ~~encrypted ed25519/ecdsa OpenSSH keys~~ (done 2026-10-09), ~~configurable algorithm lists~~
-  (done 2026-10-09, `transport.Algorithms`), ~~aes128-ctr, hmac-sha2-512 and `-etm` MACs~~ (done
-  2026-10-10), ~~ecdh-sha2-nistp256/384~~ (done 2026-10-10, std's curves, live OpenSSH interop both
-  roles), ~~ecdh-sha2-nistp521~~ (done 2026-10-10 over the new `p521` module), ~~ecdsa-nistp384~~ (done
-  2026-10-10: host and user keys, loading, signing, verifying; live OpenSSH interop both roles),
-  ~~ecdsa-nistp521~~ (done 2026-10-10, host and user keys) — **P1 complete**;
-  ~~DH group-exchange~~ (done 2026-10-10: client takes any server prime of 2048..8192 bits on
-  montint's `DynModint`, server answers from the fixed group14/group16 primes as Go's does); ~~`aes192-ctr`~~
-  (done 2026-10-10 over the new `aes192` module; live OpenSSH interop both roles);
-  ~~P2 public-key layer~~ (done 2026-10-10: `keys.zig` — `PublicKey.parse`/`verify`/`eql`,
-  `fingerprintSha256`/`fingerprintMd5` byte-equal to `ssh-keygen -lf`, `authorized_keys` line parser
-  with quoted options + `AuthorizedKeysIterator` + `findAuthorizedKey`, `writeAuthorizedKey`,
-  `HostKeyInfo.publicKey`; fuzz `ssh-pubkey` 200k clean; RSA keys above the `rsa` module's 4096-bit cap
-  are skipped as unusable, OpenSSH goes to 16384), ~~known_hosts~~ (done 2026-10-10: `knownhosts.zig` — `check`
-  in OpenSSH's order revoked → accept → same-type mismatch → unknown, wildcards/negation/`[host]:port`,
-  hashed `|1|` entries byte-equal to `ssh-keygen -H`, `writeLine` plain or hashed, `KnownHosts` and
-  `FixedHostKey` verifiers; not done: `@cert-authority` (needs certificates, P3), Go's `KeyError.Want`
-  host-key-algorithm preference, the CheckHostIP second lookup by address), ~~auth
-  orchestration~~ (done 2026-11-15: client `authenticateWith` — none probe, the server's list in
-  the caller's order, several keys, partial success, `retryable`; server `AuthConfig.callbacks` →
-  `Decision` with `Permissions` and partial success, multi-round keyboard-interactive,
-  `no_client_auth`, `max_attempts` 6, `max_auth_requests`; live OpenSSH `AuthenticationMethods`
-  both roles, Go `PartialSuccessError`) — **P2 complete**;
-  P3 server API in Go's shape (channels and requests to the app), streamlocal, Signer + ssh-agent,
-  certificates, GSSAPI, legacy opt-ins.
-- **Legacy-compat algorithms (`aes128-ctr`, `hmac-sha2-512`, `ecdsa-sha2-nistp384/521`, `curve25519` variants, `ssh-rsa` opt-in)** *(survey 2026-09-30)*. Older network gear offers only CTR ciphers/HMAC-SHA1; russh offers "opt-in legacy". **Settled by the owner 2026-10-09** (Go parity item above): widen to Go's set, legacy as explicit opt-ins; the lists are configurable since 2026-10-09.
-- **OpenSSH user certificates (`*-cert-v01@openssh.com`), `ssh-agent` client** *(survey 2026-09-30)*. Certificates and agent already listed as not done (Go parity P3). `known_hosts` parsing is done (2026-10-10, `knownhosts.zig`); the file itself stays the caller's to read and write. Effort: small-medium each. Fit §2.
-
-## Status
-
-`gap · any · both · single_owner` + deps: `rsa`, `montint`, `aes192`, `p521` — canonical source is `pub const meta` in
-`src/root.zig`. ("`gap`" follows this repo's catalog-maturity vocabulary for "no existing
-extraction source — built fresh to fill a catalog gap", not a completion status.)
+- **`-Dprofile=small` stopped shrinking the size probe.** `scripts/checks/small-sizes.sh --measure` found
+  the probe at 185 448 B by default and 159 120 B under `small` (it was 29 440), a gain below the floor in
+  `scripts/checks/small-size-expected.tsv`, so the `small` lane fails on ssh. The small side regressed:
+  montint's looped kernel or the 4096 cap no longer reach `GexMod`, or a new path instantiates the 8192
+  slot list. Suspects: montint's R^2-from-doublings change and the no-panic sweep. Not re-measured since;
+  bisect with `scripts/checks/small-sizes.sh --measure`.
+- **`aes*-ctr` one block at a time.** `aesCtrXor` (`src/transport.zig`) encrypts one block per call and
+  carries the counter byte by byte, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (0.96x
+  OpenSSL EVP CTR at 16 KiB) is the shape for aes192, and the same counter over std's `AesEncryptCtx` for
+  aes128/256 (std's own `modes.ctr` is 2.3x slower on Zig 0.17, #36256). Needs a packet-rate bench first.
+- **Go `x/crypto/ssh` parity, phase P3** (owner goal: "our ssh qualitatively at the level of the Go
+  implementation"): a server API in Go's shape (channels and requests handed to the application, which
+  also lifts the batch-handler and server-side `signal`/`exit-signal` limits), streamlocal, a `Signer` +
+  `ssh-agent` client, OpenSSH certificates (`*-cert-v01@openssh.com`, user and host; `@cert-authority`
+  in `known_hosts` follows), GSSAPI, and the legacy opt-ins (Go's `Insecure*`: DSA, CBC/3DES, RC4,
+  DH-sha1, `ssh-rsa` SHA-1; the lists are runtime-configurable and a legacy name would live only in the
+  `supported_*` ceiling, off by default). Older network gear that offers only CTR/HMAC-SHA1 is the use
+  case. Effort: small-medium for certificates and the agent client, each.
+- **Userauth methods and callbacks not provided:** `hostbased` (RFC 4252 §9), the §8 password-change
+  sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), and from Go's server a
+  per-connection `BannerCallback` (the banner is a static `AuthConfig.banner`), `AuthLogCallback` for
+  successes (`on_rejected` covers refusals), `VerifiedPublicKeyCallback`, `PreAuthConnCallback` and the
+  `source-address` check (the module never sees the peer address).
+- **SFTP client** (draft-ietf-secsh-filexfer-02 v3). File transfer is the other reason people use SSH from a
+  library (russh and libssh2 have it). It would be its own module on top of `subsystem`; no sibling exists.
+  Effort: large. Fits the scope.
+- **Left open from the adversarial review of the mvp -> core diff (all LOW):** `Server.sendData` notices
+  SSH_MSG_DISCONNECT only while it waits for window space (a client that disconnects mid-stream is seen at
+  the next read); a handler returning `error.CommandFailed` ends the whole `serveConnection`, not just its
+  channel; the client `Session` accepts data after the peer's EOF and keeps a channel whose
+  OPEN_CONFIRMATION named a zero maximum packet size open at the peer.
 
 ## Anchoring
 
@@ -643,3 +498,4 @@ extraction source — built fresh to fill a catalog gap", not a completion statu
 **What the tests actually contain.** self loopback client<->server baseline; live OpenSSH interop (both roles) and Go x/crypto/ssh (keyboard-interactive) — skip when the peer is absent
 
 **How it got there.** No external oracle exists for what remains. self-loopback can't be anchored by construction; real anchor already lives in OpenSSH interop
+
