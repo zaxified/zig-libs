@@ -18,7 +18,7 @@
 
 Auditor/design reference. The consumer-facing purpose, effects API, defaults and
 API sketch live in `README.md`; this document is the state machine, the wire
-logic, the mismatch rules, and the deferred list.
+logic, the mismatch rules, and what is left out.
 
 ## Compared with
 
@@ -31,14 +31,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | LAN + P2P, HMAC auth of hellos, RFC 5306 graceful-restart *helper*; BFD and MT deferred (README). |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | `Circuit` runs one P2P adjacency over the RFC 5303 three-way handshake plus an Ethernet transport (Linux `AF_PACKET`); LAN and auth not covered (README). The closest like-for-like, and it does I/O, which this module deliberately does not. |
 
-**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no LAN adjacency (IS-Neighbours #6 SNPA two-way check, per-neighbour hold timers) — `rg -i 'lan_hello|LanHello' isis-adj/src` finds nothing, and `isis-dis` takes the neighbour set as input rather than forming it; no graceful-restart helper (goisis has it); no Protocols-Supported (#129) / IP-address compatibility check (`rg -i 'protocols_supported|nlpid' isis-adj/src` empty); no BFD trigger (→ Backlog). IIH authentication (TLV #10, RFC 5304/5310) is at parity with holo and FRR since 2026-11-18 (§5 "Authentication").
+**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no LAN adjacency (IS-Neighbours #6 SNPA two-way check, per-neighbour hold timers) — `rg -i 'lan_hello|LanHello' isis-adj/src` finds nothing, and `isis-dis` takes the neighbour set as input rather than forming it; no graceful-restart helper (goisis has it); no Protocols-Supported (#129) / IP-address compatibility check (`rg -i 'protocols_supported|nlpid' isis-adj/src` empty); no BFD trigger. The LAN adjacency, graceful restart and the #129 check are in the Backlog. IIH authentication (TLV #10, RFC 5304/5310) is at parity with holo and FRR (§5 "Authentication").
 
 ## 1. Scope
 
 One **point-to-point** IS-IS adjacency (ISO/IEC 10589 §8.2) using the
 **RFC 5303** three-way handshake. Pure, time-injected, single-owner: the caller
 supplies `now`, feeds received P2P IIH PDUs (types decoded by `isis`), and reacts
-to the returned `Effect`. Out of scope for this increment: everything in §6.
+to the returned `Effect`. Out of scope: everything under *What is deliberately not done* and *Backlog / deferred*.
 
 ## 2. What `isis` provides, and what this module adds
 
@@ -70,17 +70,7 @@ So the well-formed value lengths are **1, 5, 11, 15**; anything else is
 Down = 2** (RFC 5303) — the reverse of intuitive order; an unassigned byte is
 `error.BadState`. `ThreeWayState.fromByte` refuses an illegal `@enumFromInt`.
 
-> **CORRECTION (Wireshark-anchored, filed under the anchor task for this
-> module):** this section originally said the neighbour block was all-or-
-> nothing and that only 1/5/15 were legal — that was wrong. RFC 5303 §3.1
-> defines `Length` as "1 to 17 octets" and gives the Neighbour System ID and
-> Neighbour Extended Local Circuit ID fields independent "if known" presence
-> conditions, not a single combined one. Wireshark 4.6.4's IS-IS dissector
-> (`packet-isis-hello.c`, `dissect_hello_ptp_adj_clv`) hardcodes exactly four
-> cases — `1`, `5`, `11`, `15` — and decodes the 11-octet form as the Neighbour
-> System ID present WITHOUT the Neighbour Extended Local Circuit ID. See
-> `three_way.zig`'s file docs and `fsm.zig`'s `echoed` computation for the fix
-> and how the FSM still treats that shape as an unconfirmed echo.
+RFC 5303 §3.1 defines `Length` as "1 to 17 octets" and gives the Neighbour System ID and the Neighbour Extended Local Circuit ID independent "if known" presence conditions. Wireshark 4.6.4's IS-IS dissector (`packet-isis-hello.c`, `dissect_hello_ptp_adj_clv`) hardcodes exactly four cases, `1`, `5`, `11`, `15`, and decodes the 11-octet form as the Neighbour System ID present without the Neighbour Extended Local Circuit ID; the codec follows it. See `three_way.zig`'s file docs and `fsm.zig`'s `echoed` computation for how the FSM treats that shape as an unconfirmed echo.
 
 ## 4. The state machine
 
@@ -177,10 +167,9 @@ Implemented (cheap, and they gate adjacency formation):
   when the incumbent's hold genuinely expires (`tick` → Down clears the
   neighbour). **It does not apply at Initializing**: a candidate heard but not
   proven is replaced by the next hello from a different system (ISO 10589 / FRR
-  semantics). The A1 audit (F2) showed why the earlier "lock on first hello"
-  rule was worse than the flap it replaced — one unauthenticated frame with
-  `holding_time = 65535` kept the real neighbour out for 65 535 units (1998/1998
-  of its hellos rejected). A stranger now has to keep transmitting to keep
+  semantics). Locking on the first hello would be worse than the flap: one
+  unauthenticated frame with `holding_time = 65535` would keep the real
+  neighbour out for 65 535 units. A stranger has to keep transmitting to keep
   displacing the candidate, and the genuine neighbour's next echoing hello goes
   to Up and engages the lock. Trade-off stated plainly: at Up we keep the
   incumbent (FRR lets the newcomer take over, which is spoofable teardown); at
@@ -190,15 +179,15 @@ Implemented (cheap, and they gate adjacency formation):
 - **Neighbour-block mismatch** — RFC 5303 §3.2: a TLV 240 whose neighbour block
   names another system, or our system with another extended local circuit id
   (a parallel circuit's handshake), is discarded whole →
-  `rejected = .neighbor_mismatch`, before any mutation. The earlier code let such
-  a PDU through as "not an echo" and processed it: one frame naming a third
-  system dropped an Up adjacency to Initializing, set the hold to the sender's
-  `holding_time` and overwrote the recorded extended circuit id (A1 audit F1).
+  `rejected = .neighbor_mismatch`, before any mutation. Processing such a PDU as
+  "not an echo" would let one frame naming a third system drop an Up adjacency
+  to Initializing, set the hold to the sender's `holding_time` and overwrite the
+  recorded extended circuit id.
 - **Stale Up** — at local Down, a received three-way state of Up →
   `rejected = .neighbor_up_while_down` (RFC 5303 table, (Down, Up) = Down,
-  "Neighbor restarted"). One replayed or live "Up + echoes you" frame used to
-  take a fresh circuit straight to Up — a unidirectional link after our restart
-  declared functional (A1 audit F3).
+  "Neighbor restarted"). Accepting one replayed or live "Up + echoes you" frame
+  on a fresh circuit would take it straight to Up: a unidirectional link after
+  our restart declared functional.
 - **Maximum Area Addresses mismatch** — the IIH's common-header Maximum Area
   Addresses (ISO 10589 §9.6) differs from `Config.max_area_addresses` →
   `rejected = .max_area_mismatch` (ISO 10589 §8.2). Always enforced; there is
@@ -206,7 +195,7 @@ Implemented (cheap, and they gate adjacency formation):
   compared local value is *normalized*: `Config.max_area_addresses = 0` is the
   same wire shorthand for 3 that `isis.header.decode` already normalizes on
   receive, so a locally configured 0 does not reject every real (3-advertising)
-  neighbour (A1 audit F16); a genuine non-shorthand disagreement is still
+  neighbour; a genuine non-shorthand disagreement is still
   rejected.
 - **Area-address mismatch (Level 1 only)** — ISO 10589 §8.2.2/§7.2.4: a Level 1
   adjacency requires the neighbour's Area Addresses (#1) TLV to name at least
@@ -221,17 +210,17 @@ Implemented (cheap, and they gate adjacency formation):
   absent Area Addresses TLV on an enforced circuit is treated as "no shared
   area" (fail closed), not skipped. A neighbour may split its announced areas
   across more than one #1 TLV; `rxHelloBytes` walks the whole stream and
-  consults every instance (up to 8; beyond that, fail closed rather than open —
-  A1 audit F8), not just the first `findFirst` would have returned.
+  consults every instance (up to 8; beyond that, fail closed rather than open),
+  not just the first `findFirst` would have returned.
 
 - **Holding time too short** — `rx.holding_time < Config.min_neighbor_holding_time`
-  → `rejected = .holding_time_too_short`, before any mutation (A1 audit F13). A
-  hold of 0 took the adjacency Up and expired it at the same instant. Neither
+  → `rejected = .holding_time_too_short`, before any mutation. A hold of 0
+  would take the adjacency Up and expire it at the same instant. Neither
   RFC 5303 nor FRR has a floor, so this is local policy: the default 1 refuses
   only 0, a caller may raise it, 0 disables it. A shorter hold than before
   (31 → 3) stays legal — a neighbour may reconfigure.
 
-- **Authentication (2026-11-18)** — with `Config.auth_keys` non-empty,
+- **Authentication** — with `Config.auth_keys` non-empty,
   `rxHelloBytes` runs `isis.auth.verify` on the whole PDU right after the
   decode and the full TLV walk, before any field is read or any state
   touched: no Authentication TLV (#10) → `rejected = .auth_missing`; a digest
@@ -260,141 +249,41 @@ a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`
 TLV walk surfaces `tlv.Error` — the WHOLE stream is walked (`isis.tlv.count`),
 not just the prefix up to the TLVs this module reads, so a TLV lying about its
 length behind the 240 fails the PDU exactly as it does in a sibling that walks
-it all (A1 audit F6); a bad 240 surfaces `BadLength`/`BadState`. In
+it all; a bad 240 surfaces `BadLength`/`BadState`. In
 every error case the FSM mutates nothing (the decode happens before any state
 change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 "errored ⇒ state unchanged" invariant.
 
-## 6. Deferred (with hooks)
+## Verification
 
-- **LAN adjacency** — this module is P2P-only; the LAN Hello (types 15/16)
-  adjacency logic is a separate FSM. `isis` already decodes the LAN Hello body,
-  so it is additive. The DIS election itself is the sibling `isis-dis` module.
-- **Area-address matching for `.level1_2` circuits** — implemented for pure
-  `.level1` circuits (see §5); a `.level1_2` circuit still forms regardless of
-  area, since this FSM has no split L1/L2 sub-state to selectively reject only
-  the L1 half. Splitting the state would need to be a separate increment.
-- ~~**Authentication**~~ — TLV #10 / RFC 5304 / 5310 validation of the IIH: **implemented 2026-11-18** (§5).
-- **Graceful restart** (RFC 5306) and **adjacency-SID** (segment routing).
-- **MTU / padding negotiation** beyond the basics, and full ISO 10589 §8.2
-  timer/counter accounting (adjacencyStateChange counters, etc.).
+Run: `scripts/modtest isis-adj`. The module is pure logic, so the tests are unit and round-trip, plus an external anchor for the one wire format it owns.
 
-## 7. Verification
+- **External anchor, TLV 240:** Wireshark 4.6.4 (`sharkd`, headless, via `scripts/gen/dissect.py`). PDUs produced by this module's own `start()` / `rxHelloBytes()` / `helloFields()` / `buildHello` were fed through Wireshark's real IS-IS dissector and the frozen bytes and its printed output are pinned in `root.zig`'s golden tests and `three_way.zig`'s 11-octet golden. This covers the state byte (Up / Initializing / Down) and the 5-, 11- and 15-octet shapes through this module's own code paths. The 1-octet (state-only) form is never emitted by `helloFields()` (the module always advertises at least its own extended local circuit id), so it is anchored in the reverse direction: a bare length-1 TLV 240 was fed to both Wireshark's dissector and this module's `decode`, and the two readings agree (`three_way.zig`'s golden quotes the command and the output). The P2P Hello header framing is the sibling `isis` codec's anchored surface: this module calls `isis`'s real builder and decoder, so no separate anchor is owed for it.
+- **Mutual drive** (the core proof): two `Adjacency` instances fed only each other's `isis`-serialized IIH bytes converge to Up on both, asserting the exact transition sequence Down, Initializing, Up and the completed on-wire 240 echo.
+- **Hold-timer boundary:** bring Up; `tick` just before the deadline stays Up; a refreshing hello moves the deadline; a `tick` at the deadline drops to Down with `hold_expired`.
+- **Three-way guard:** a neighbour whose 240 omits the neighbour block, or gives only a bare system-id (the 11-octet shape), holds us at Initializing; only a full echo (system-id plus extended circuit id, neighbour past Down) reaches Up. Permanent positive control: with the guard dropped (`three_way_required = false`) the half-open hello wrongly reaches Up, so removing the guard in `rxHello` turns the test red.
+- **Rejects and errors:** loopback, level mismatch, not started, third neighbour, neighbour-block mismatch, stale Up, Maximum Area Addresses, area mismatch (a missing or malformed Area Addresses TLV, a shared area only in the third #1 TLV, no matching on L2 and L1/L2 circuits), holding-time floor, circuit-id change; the 1/5/11/15-octet 240 forms round-trip, `encode` refuses a buffer one octet short of every form; malformed bytes and a bad-length 240 are typed errors with the state unchanged; a TLV lying about its length behind the 240 fails the PDU; `tick` does nothing before `start` or after `stop`. Determinism: identical `(event, now)` streams yield identical transitions.
+- **Authentication** (`src/auth_test.zig`): two keyed adjacencies reach Up through the real encode and `rxHelloBytes` path for every algorithm (cleartext, HMAC-MD5, HMAC-SHA-1/224/256/384/512) and with strict RFC 5310 keying on both sides; a keyed receiver refuses an unauthenticated hello and mutates nothing; an unkeyed one accepts an authenticated hello; a wrong secret, Key ID, algorithm, cleartext password or keying mode is refused; a key rollover; one flipped octet anywhere is refused; a malformed or private-type #10 is `auth_failed` while a broken TLV stream stays a decode error; an unsigned copy of the neighbour's hello carrying holding time 65535 does not refresh an Up adjacency's hold; `buildHello` needs room for #10 and refuses an oversize password.
+- **Fuzz:** `ISIS_ADJ_FUZZ` (deterministic driver, `src/fuzz_test.zig`; harnesses `isis-adj-rx` and `isis-adj-handshake`, each with a reach test) and `std.testing.fuzz` targets: hostile bytes through `rxHelloBytes` never panic, the walk terminates, an errored decode is inert ("errored implies state unchanged"); two adjacencies handshake to Up while damaged frames never corrupt the FSM. The rx corpus is seeded with Wireshark-anchored hellos plus a foreign-neighbour-block and a stale-Up PDU, because unseeded runs never produced a TLV 240.
+- **Mutation:** the TLV 240 codec's length and state checks, `start` / `stop` / `tick`, every `rxHello` refusal path, the three-way decision, `applyState`, the defaulted options, and the authentication lines of `fsm.zig`. The equivalent mutants: dropping `tlv.count` (the Area Addresses walk right after it iterates the whole stream with `try` and fails the same PDU with the same error), the circuit-id-change check's `state != .down` and its `hold_deadline = 0` (every way into Down clears the recorded neighbour and a Down hold is never consulted), and the echo's extended-circuit-id equality (a block naming another id was already discarded as `neighbor_mismatch`). Not mutated: the `UnsupportedPduType` arm and the `else` propagation after it (the PDU already decoded), and `buildHello`'s `sign` error mapping (own PDU, own key).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-**CORRECTION (this task's finding):** this section previously claimed "no
-external oracle needed... the wire format is validated end-to-end against the
-sibling `isis` codec, which is itself golden-tested." That does not hold: a
-sibling's anchor does not transfer — `isis` being golden-tested says nothing
-about whether *this* module's adjacency-specific content (the TLV 240 codec,
-the states it advertises) is correct, since `isis` treats 240 as an opaque raw
-TLV and never looks inside it. The content that is specific to this module —
-TLV 240's field layout and the three-way state byte values — needed its own
-outside oracle, and (see below) finding one turned up a real bug (§3's
-11-octet shape).
+## Provenance
 
-Per CONVENTIONS §7 this is pure logic → unit + property/round-trip **plus**,
-for the TLV 240 wire format specifically, Wireshark 4.6.4 (sharkd, headless,
-via `scripts/gen/dissect.py`) as an external anchor: PDUs produced by this
-module's own `start()`/`rxHelloBytes()`/`helloFields()`/`buildHello` were fed
-through Wireshark's real IS-IS dissector and the frozen bytes + Wireshark's
-printed output are pinned in `root.zig`'s golden tests and `three_way.zig`'s
-11-octet golden. This covers the state byte (Up/Initializing/Down) and the
-5-/11-/15-octet TLV 240 shapes, all three exercised through this module's own
-code paths, not hand-derived. NOT externally covered: the 1-octet (state-only)
-form via this module's own encoder — `helloFields()` never emits it (this
-module always advertises at least its own extended-local-circuit-id), so
-there is nothing of our own construction to hand to Wireshark for that shape.
-Stale as of the wave-2 audit (F5): the 1-octet form HAS since been
-independently re-run, the other direction — a bare length-1 TLV 240 was fed
-to both Wireshark's dissector and this module's own `decode`, and the two
-independent readings agree (`three_way.zig`'s golden for the shape, with the
-`scripts/gen/dissect.py` command and Wireshark's printed output quoted inline).
-The P2P Hello *header* framing (length-indicator, PDU length, circuit-type
-bits, holding-time, local-circuit-id) is the sibling `isis` codec's own
-already-anchored surface (see this module's anchor record (`SPEC.md` § Anchoring)) — that part
-legitimately IS the sibling's job, since this module calls `isis`'s real
-builder/decoder rather than re-implementing it, so no separate anchor is owed
-for it here.
+Clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party implementation ported. For authentication, holo-isis `pdu.rs` (MIT) was read for where it validates and what it drops; FRR only through its documentation. No NOTICE entry is required (public specs, root `NOTICE` §0).
 
-- **Mutual drive** (the core proof): two `Adjacency` instances fed only each
-  other's `isis`-serialized IIH bytes converge to Up on both, asserting the exact
-  transition sequence Down → Init → Up and the completed on-wire 240 echo.
-- **Hold-timer boundary**: bring Up, `tick` just before the deadline stays Up, a
-  refreshing hello moves the deadline, a `tick` at the deadline drops to Down with
-  `hold_expired`.
-- **Three-way guard**: a neighbour whose 240 omits the neighbour block, or gives
-  only a bare system-id with no extended-local-circuit-id (the 11-octet shape),
-  holds us at Initializing; only a full echo (system-id + extended-circuit-id,
-  and neighbour past-Down) reaches Up.
-- **Loopback + level-mismatch + not-started** rejects; **round-trip** of the
-  1/5/11/15-octet 240 forms; **malformed** bytes and a bad-length 240 as typed
-  errors with state unchanged.
-- **Determinism**: identical `(event, now)` streams yield identical transitions.
-- **Positive control** (permanent): the FSM run with the three-way guard dropped
-  (`three_way_required = false`) wrongly reaches Up on the half-open hello — so if
-  the guard in `rxHello` were removed, the three-way-guard test would go RED.
-- **Fuzz**: `std.testing.fuzz` over `rxHelloBytes` — hostile bytes never panic,
-  the walk terminates, an errored decode is inert. Seeded with the three
-  Wireshark-anchored hellos plus a foreign-neighbour-block and a stale-Up PDU,
-  because 200 010 unseeded runs never produced a TLV 240 (A1 audit F9).
-- **A1 audit regressions (2026-09-06)**: a neighbour block naming a third
-  system on an Up adjacency changes nothing; a stale Up on a fresh circuit is
-  refused five times running and the handshake then completes from
-  Initializing; a stranger heard first no longer locks the circuit for its
-  `holding_time`; the hold expires at Initializing; a missing or malformed
-  Area Addresses TLV on an enforced L1 circuit is a mismatch; a TLV lying about
-  its length behind the 240 fails the PDU.
-- **Mutation run 2026-10-05** (in-place, Debug, 44 mutants over the TLV 240
-  codec's length and state checks, `start`/`stop`/`tick`, every `rxHello`
-  refusal path, the three-way decision, `applyState` and the defaulted
-  options): 40 killed. The first pass left 8; four tests added (`encode`
-  refuses a buffer one octet short of every form; `tick` does nothing before
-  `start` or after `stop` and makes no Down→Down transition while hunting; a
-  shared area in the THIRD wire Area Addresses TLV; area matching skipped on
-  L2 and L1/L2 circuits). Equivalent: dropping `tlv.count` (the Area
-  Addresses walk right after it iterates the whole stream with `try` and
-  fails the same PDU with the same error), the circuit-id-change check's
-  `state != .down` and its `hold_deadline = 0` (every way into Down clears
-  the recorded neighbour, and a Down hold is never consulted), and the echo's
-  extended-circuit-id equality (a block naming another id was already
-  discarded as `neighbor_mismatch`).
+## What is deliberately not done
 
-- **Authentication 2026-11-18** (`src/auth_test.zig`, 11 tests): two keyed
-  adjacencies reach Up through the real encode → `rxHelloBytes` path for every
-  algorithm (cleartext, HMAC-MD5, HMAC-SHA-1/224/256/384/512) and with strict
-  RFC 5310 keying on both sides; a keyed receiver refuses an unauthenticated
-  hello and mutates nothing; an unkeyed one accepts an authenticated hello;
-  wrong secret, Key ID, algorithm, cleartext password and keying mode are
-  refused; a key rollover; one flipped octet anywhere is refused; a malformed
-  or private-type #10 is `auth_failed` while a broken TLV stream stays a
-  decode error; an Up adjacency's hold is not refreshed by an unsigned copy of
-  the neighbour's hello carrying holding time 65535; `buildHello` needs room
-  for #10 and refuses an oversize password. **Delta mutation 2026-11-18** (9
-  mutants over the new lines of `fsm.zig`: the key check skipped or forced,
-  each reject reason swapped, `helloFields`' key dropped or the last one
-  taken, the placeholder or the signature skipped, the returned length):
-  9/9 killed. Not mutated: the `UnsupportedPduType` arm and the `else`
-  propagation after it (the PDU already decoded, so unreachable) and
-  `buildHello`'s `sign` error mapping (own PDU, own key). The card adds them to
-  the 2026-10-05 counts.
-
-Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
-green; the sibling `isis` test suite unaffected.
-
-Provenance: clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party
-implementation ported. For authentication (2026-11-18) holo-isis `pdu.rs`
-(MIT) was read for where it validates and what it drops; FRR only through its
-documentation. No NOTICE entry is required (public
-specs, root `NOTICE` §0).
+- **Anything but one point-to-point adjacency per `Adjacency`:** the caller owns timers, sockets and the circuit set; the FSM is time-injected and single-owner.
+- **Area-address matching on `.level1_2` circuits:** this FSM tracks one combined state per circuit, so rejecting a `.level1_2` circuit on an area mismatch would also block the L2 component ISO 10589 says must still form regardless of area. Matching is enforced only on pure `.level1` circuits with `Config.local_areas` set.
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
-
-- **LAN adjacency FSM** (LAN IIH types 15/16: IS-Neighbours #6 two-way check, per-neighbour hold, priority tracking feeding `isis-dis`) (survey 2026-09-30). Why: every FRR/holo/goisis user runs broadcast circuits; without it `isis-dis` has no producer of its candidate set anywhere in the stack. Effort: ~1 week. Fits §2: yes.
-- ~~**IIH authentication (TLV #10, RFC 5304/5310)**~~ — **closed 2026-11-18** (§5 "Authentication"; security triage row isis-adj:349 done). (survey 2026-09-30). Why: without it the module has to defend against spoofed hellos with heuristics (SPEC §5 "other_neighbor" lock). Blocked on the codec-level HMAC (see `isis` backlog). Effort: ~2 days after that. Fits §2: yes.
-- **Protocols-Supported (#129) NLPID and IP-subnet compatibility check** (survey 2026-09-30). Why: RFC 1195 adjacencies must refuse a neighbour with no common protocol; FRR/holo do. Irrelevant for pure-SPB. Effort: ~1 day. Fits §2: yes. Priority low.
-- **Graceful-restart helper (RFC 5306)** (survey 2026-09-30). Why: keeps adjacencies up across a neighbour's planned restart; goisis has the helper half. Effort: ~3 days. Fits §2: yes. Already in the module's deferred list.
+- **LAN adjacency FSM** (LAN IIH types 15/16: IS-Neighbours #6 two-way check, per-neighbour hold, priority tracking feeding `isis-dis`). Why: every FRR/holo/goisis user runs broadcast circuits; without it `isis-dis` has no producer of its candidate set anywhere in the stack. The LAN Hello body is already decoded by `isis`, so it is additive; the DIS election itself is `isis-dis`. Effort: ~1 week. Fits CONVENTIONS §2: yes.
+- **Protocols-Supported (#129) NLPID and IP-subnet compatibility check.** Why: RFC 1195 adjacencies must refuse a neighbour with no common protocol; FRR and holo do. Irrelevant for pure SPB. Effort: ~1 day. Priority low.
+- **Graceful-restart helper (RFC 5306)** and **adjacency-SID** (segment routing). Why: keeps adjacencies up across a neighbour's planned restart; goisis has the helper half. Effort: ~3 days.
+- **MTU / padding negotiation** beyond the basics, and full ISO 10589 §8.2 timer/counter accounting (adjacencyStateChange counters and so on).
+- **Split L1/L2 sub-states** (would allow the area check on `.level1_2` circuits, see *What is deliberately not done*): a separate increment.
 
 ## Anchoring
 
@@ -404,5 +293,3 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** Wireshark sharkd validated TLV 240 three-way adjacency, all wire states; found+fixed 11-octet BadLength bug
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: the 1-octet (state-only) TLV240 form is never emitted by this module's own API, so the anchor runs the reverse direction — a hand-built 1-octet value fed to sharkd AND to ThreeWayTlv.decode independently, confirmed to agree (three_way.zig, mutation-tested); Wireshark's dissector does model this length explicitly, so this is a real (if reverse-direction) anchor, not an unanchorable shape. TLV 6/IS-Neighbours and Area-Addresses (#1) do not apply — this module is P2P-only (LAN Hello + DIS election is a separate deferred module per SPEC §6); the generic P2P Hello header framing (length-indicator, PDU length, circuit-type, holding-time, local-circuit-id) is the sibling isis codec's own already-anchored surface, legitimately not re-anchored here since this module calls isis's real builder/decoder rather than reimplementing it

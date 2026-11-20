@@ -12,7 +12,7 @@ Status: **gap** — first increment. Implements the P2P three-way FSM + the
 hold/hello timing + TLV 240 (the RFC 5303 Three-Way Adjacency TLV, which `isis`
 does not model typed). LAN adjacency (the DIS election is the sibling
 `isis-dis`), graceful-restart, and area-address matching on L1/L2 circuits
-are deliberately deferred — see `SPEC.md`.
+are left out — see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 
 **Authentication** (TLV #10, RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family,
 cleartext): set `Config.auth_keys` and `rxHelloBytes` refuses an IIH without
@@ -150,8 +150,9 @@ Initializing), loopback + level-mismatch rejects, a `std.testing.fuzz` target
 over `rxHelloBytes` (hostile bytes never panic; a rejected PDU is inert), a
 determinism test, and a permanent **positive control** (dropping the three-way
 guard wrongly reaches Up on the half-open hello — proving the guard has teeth).
-Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from the public specifications above; no third-party
-IS-IS implementation (frrouting, IOS, Junos) was ported or studied. No NOTICE
-entry is required (public specs, root `NOTICE` §0). License: MIT.
+IS-IS implementation (frrouting, IOS, Junos) was ported. For authentication,
+holo-isis `pdu.rs` (MIT) was read for where it validates and what it drops, and
+FRR only through its documentation. No NOTICE entry is required (public specs,
+root `NOTICE` §0). License: MIT.
