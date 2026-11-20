@@ -7,7 +7,7 @@ link-state database) + `isis-flood` (the flooding transmit scheduler), with
 fabric, and asserts the two properties that matter: the fabric **converges**
 (every node's LSDB synchronises to the same set of LSPs) and **reconverges**
 after a link failure. It is the end-to-end proof that the five-layer stack
-(`isis` codec → `isis-lsdb` → `isis-flood` → `isis-spf`, driven over `netsim`)
+(`isis` codec → `isis-lsdb` → `isis-flood` → `isis-spf`, plus `isis-dis` for LAN election, driven over `netsim`)
 works **together**, not just per-module.
 
 Status: **integration harness** — flooding + LSDB convergence, SPF route
@@ -16,9 +16,8 @@ consistency, one mid-run link-fail **reconvergence**, **partition** detection, a
 with the convergence cost measured) and **LSP aging, refresh and purge** (a dead
 originator's LSP ages out and SPF drops it) and **LAN (broadcast) circuits** (DIS
 election via `isis-dis`, pseudonode LSPs, CSNP/PSNP repair over a lossy LAN), on a
-small (≤ 6-node) **static-adjacency** fabric. Deliberately deferred: the adjacency
-FSM (`isis-adj`), restart of a crashed node, LAN hellos, the SPB data-plane, scale/perf,
-and topology fuzzing — see `SPEC.md`.
+small (≤ 6-node) **static-adjacency** fabric, optionally keyed with RFC 5304/5310
+**authentication** (`Options.auth`).
 
 Model after: **`netsim`'s `Protocol` seam** (the VOPR-style discrete-event
 network simulator) driving the **ISO/IEC 10589** IS-IS control plane already
@@ -41,11 +40,11 @@ pseudonode LSP of every LAN it is the DIS of.
 | Hook | What the harness does |
 |------|-----------------------|
 | **onStart(node)** | Originate the node's own LSP — one Extended IS Reachability (#22) entry per currently-up neighbour, sequence 1 — and `lsdb.insert` it self-originated (`arrival_iface = null` → SRM on every circuit). Arm the first flooding poll; pre-arm one timer per scheduled link failure this node terminates. |
-| **onMessage(node, from, payload)** | `isis.decode` the PDU: an **LSP** → `lsdb.insert(bytes, arrival_iface, now)` (sets SRM to flood onward + SSN to ack); a **CSNP/PSNP** → `lsdb.reconcileCsnp`/`reconcilePsnp`. Then arm a flooding poll so the next `poll` drains the freshly-set flags. |
-| **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_timer_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
+| **onMessage(node, from, payload)** | `isis.decode` the PDU: an **LSP** → `lsdb.insert(bytes, arrival_iface, now)` (sets SRM to flood onward + SSN to ack); a **CSNP/PSNP** → `lsdb.reconcileCsnpBytes`/`reconcilePsnpBytes` (the bytes forms, which verify the authentication TLV when the fabric is keyed). Then arm a flooding poll so the next `poll` drains the freshly-set flags. |
+| **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id 1 = *cold restart* (`Fabric.restart`): drop the LSDB and flooding state, re-originate at a bumped sequence number. id ≥ `fail_timer_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. id ≥ `1 << 40` = a scheduled LAN event (a DIS priority change, a crashed member declared dead). |
 | **check** | Safety invariants run after every event: no node's LSDB holds more than `node_count` (+ pseudonode) LSP-IDs (a runaway/corruption tripwire), and no stored sequence goes backwards / no live LSP vanishes (router and pseudonode LSPs). |
 
-## The three proofs
+## The proofs
 
 - **Convergence.** A 4-node line `A-B-C-D` and a 5-node cyclic topology run to a
   quiesced steady state within the step cap; **every** node's LSDB then holds all
@@ -112,10 +111,25 @@ PSNP requests repair loss: 16/16 lossy seeds agree with CSNPs, 0/16 without
 SPF routes through the pseudonode (`isis-spf` LAN transit). Two harness-side
 workarounds for sibling gaps are recorded in SPEC §12.
 
+## Authentication
+
+```zig
+// Every node signs with keys[0] and verifies what it receives; one node gets other keys.
+var fab = try sim.Fabric.initWithOptions(gpa, topo, seed, .{ .auth = .{
+    .keys = &keys,
+    .auth_snp = true, // false: only LSPs are keyed (an FRR-default fabric)
+    .mismatched = .{ .node = 3, .keys = &other_keys }, // negative control
+} });
+```
+
+A refused PDU is counted in `Stats.auth_refused` and dropped; it is not a failure. With a mismatched
+node there is no hello exchange to refuse, so "adjacency refused" is every PDU on that link refused and the
+node stays isolated (SPEC §13). Without `Options.auth` nothing changes.
+
 ## Termination & quiescence
 
 `runToConvergence(max_steps)` drives `netsim.replay` under a **hard step cap**
-(`until` time bound + a fixed `max_events_cap` event bound), so it **always
+(`until` time bound + the `Options.max_events_cap` event bound, default 200 000), so it **always
 terminates**. Afterwards it inspects the context: the fabric is **quiescent** when
 no node has any SRM (flood) or SSN (ack) flag set on an *up* circuit — flooding
 has fully drained and a further poll would send nothing. Quiescence within the cap
@@ -180,6 +194,11 @@ schedule → identical final LSDBs); a permanent **positive control** (breaking 
 flood-drain wiring leaves far nodes ignorant — convergence goes RED); and
 `std.testing.allocator` leak checks. Green in Debug and ReleaseFast; `zig fmt`
 clean.
+
+## Not provided
+
+The adjacency FSM (`isis-adj`), LAN hellos, restart of a crashed node, the SPB data-plane, scale and topology
+fuzzing are not modelled (SPEC *What is deliberately not done*); open items are in SPEC *Backlog / deferred*.
 
 Provenance: composes the sibling modules over `netsim`; pure spec-only
 clean-room (ISO/IEC 10589), no third-party source ported — no `/NOTICE` entry.

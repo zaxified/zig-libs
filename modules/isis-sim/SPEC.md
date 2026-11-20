@@ -14,8 +14,6 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): convergence/determinism invariants checked across a lossy-medium seed sweep, with control run
-
 **Known defects:** none recorded
 
 **Downstream consumer:** no
@@ -23,7 +21,7 @@ What the tests check instead of a model (was `**Evidence:** model` until 2026-11
 Auditor/design reference. The consumer-facing purpose, API and proof summary live
 in `README.md`; this file records the node-state model, the netsim wiring, the
 convergence/quiescence invariants, the reconvergence + partition handling, the
-determinism argument, and the deferred list. Meta tags live in `src/root.zig`.
+determinism argument, and what is deliberately not done. Meta tags live in `src/root.zig`.
 
 ## Compared with
 
@@ -36,9 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) interop suite | Go | Apache-2.0 — README only | 0 | v0.9.0 (2026-09-25) | "Continuous interop against FRR" (README) — tests a real daemon against a real peer, not a model. |
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` tests | Rust | MIT | 541 | v0.9.0 | Packet-level and northbound conformance tests; no in-process multi-node simulator found *(inferred from the source listing)*. |
 
-**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, so a wrong key shows as refused LSPs/SNPs, not a refused hello — §13; and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer (SPF routing *through* a pseudonode works since 2026-09-30, `isis-spf`'s `addLanArcs` — SPEC §12). It proves the composition works; it is not a lab a user configures.
-
-**Audit 2026-11-19 (delta mutation, `Options.auth`).** 19 mutants over the authentication code in `fabric.zig` (the placeholder and the signing in each LSP-making path, the per-node key choice and the wrong-key node, the signed-or-not LAN PSNP, the `auth_snp` plumbing into the LSDB and the scheduler, the three refusal counters), one schemata build, baseline first: 19 killed, 0 survivors. Two were first survivors (the LAN PSNP and the scheduler's `auth_snp` forwarded as "signed"): both are bytes a netsim receiver with `auth_snp` off accepts unchecked, so they needed a test that reads the queued payloads (`queuedAuth`); the scheduler one was re-run by hand-mutating the build tree and is killed by that test alone. The first-pass mutant `auth_snp` on the LSDB side, run with the wrong arm of the `if`, was a no-op (the `else` arm is reached only without keys) and was corrected. The 2026-10-05 line had counts, so the card is cumulative (38/40 + 19/19).
+**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, so a wrong key shows as refused LSPs/SNPs, not a refused hello — §13; and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer (SPF routes *through* a pseudonode, `isis-spf`'s `addLanArcs` — SPEC §12). It proves the composition works; it is not a lab a user configures.
 
 ## 1. What this module is
 
@@ -215,10 +211,11 @@ originator permanently ignorant of it — the convergence assertion (`lsdbsAgree
 and "D lacks A's LSP") goes RED. If the flood-propagation wiring regressed into
 always working regardless, this test would stop failing.
 
-## 8. Deferred (explicit non-scope)
+## 8. What is deliberately not done
 
 - **Adjacency FSM (`isis-adj`).** A netsim link is the adjacency; no hello /
-  three-way handshake / hold-timer. This is the one stack layer the capstone omits.
+  three-way handshake / hold-timer. This is the one stack layer the capstone omits
+  (wiring it in is the first *Backlog* item).
 - **Node crash / restart.** A control-plane cold restart *is* modelled
   (`Fabric.restart`, above) because it is the only way to exercise CSNP resync,
   and a permanent transport-level crash is modelled (`Fabric.crash`, §11) because
@@ -226,14 +223,14 @@ always working regardless, this test would stop failing.
   `restart_node`), and the purge/refresh-on-restart races that follow, remain out
   of scope — they need a restarted node to re-learn a sequence number from its
   neighbours' copies of its own LSP.
-- **LSP purge & aging races.** In scope since §11 (P2P, lossless and lossy):
+- **LSP purge & aging races.** Modelled in §11 (P2P, lossless and lossy):
   refresh, MaxAge purge, ZeroAgeLifetime removal. Not modelled: a node that
   *purges its own* LSP on purpose (graceful shutdown), sequence-number
   exhaustion, and Remaining-Lifetime decrement in transit.
-- **LAN / pseudonodes.** In scope since §12 (DIS election, pseudonode LSP, CSNP/PSNP). Not
+- **LAN / pseudonodes.** Modelled in §12 (DIS election, pseudonode LSP, CSNP/PSNP). Not
   modelled: LAN hellos (membership is static, changed only by scheduled events), a
-  restarting DIS, multi-level DIS, LAN and P2P between the same node pair. SPF routing
-  *through* the pseudonode works since 2026-09-30 (`isis-spf` LAN transit, asserted in §12).
+  restarting DIS, multi-level DIS, LAN and P2P between the same node pair. SPF routes
+  *through* the pseudonode (`isis-spf` LAN transit, asserted in §12).
 - **SPB data-plane.** Control-plane convergence only; no `l2forward`/PBB
   forwarding.
 - **Scale / performance.** Fabrics are ≤ 6 nodes with a fixed set of golden
@@ -241,38 +238,6 @@ always working regardless, this test would stop failing.
 - **Topology fuzzing.** A fixed set of golden topologies + one golden fault
   schedule; property-based topology/fault fuzzing (which `netsim`'s own
   `run`/`shrink` could drive) is not wired here.
-
-## 9. Verification
-
-`zig build test-isis-sim`, `zig fmt` clean. The tests are the golden-topology
-convergence + SPF-consistency + reconvergence + partition + quiescence +
-determinism proofs plus the positive control, the lossy-medium `MEASURED:` sweep
-(§10) and the aging scenarios with their negative control (§11), all under
-`std.testing.allocator` (leak-checked). See `README.md` for the per-test summary.
-Provenance: composes sibling modules over `netsim`; clean-room from ISO/IEC 10589,
-no third-party source ported — no `/NOTICE` entry.
-
-**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the challenge
-handling (LSP and SNP, router and pseudonode), the LAN SNP acceptance and send
-rules, the DIS election/membership/pseudonode paths, both sequence-regression
-checks and the count tripwire, extra fragments, the poll re-arm and horizon
-gates, `requestFromCsnp`, `quiescent`, `isDead`, `agreeOn` and the crash
-hold): 38 killed. The first pass left 20 — most of them paths no scenario
-drives (no node ever loses its sequence number, so nobody is ever challenged)
-or differences visible only in traffic. Eight tests added, four of them driving
-the callbacks one PDU at a time against a real `netsim.Sim` (`Direct`): a CSNP
-from a non-DIS member and a PSNP to one are ignored; challenges by LSP and by
-SNP land above the challenger (and one naming another circuit touches
-nothing); only the DIS sends CSNPs, the DIS sends no PSNP, a member requests
-only what it lacks in PDUs of at most 15; the pseudonode regression check,
-`isDead`'s horizon and every extra fragment; a non-DIS member crash (noticed
-only after `lan_hold_time`, dropped from the pseudonode, sent nothing
-afterwards); the horizon is inclusive for aging ticks and flooding wakeups; a
-truncated poll re-arms; a pending SSN alone is not quiescent. Equivalent:
-requesting a placeholder's "copy" in `requestFromCsnp` (its view — sequence 0,
-lifetime 0, checksum 0 — is exactly the default request entry), and
-`agreeOn`'s sequence comparison (the byte comparison after it covers the
-sequence field).
 
 ## 10. Lossy medium
 
@@ -460,14 +425,11 @@ dead DIS's pseudonode and router LSPs age out and are removed within 4000 ticks.
 (c)/(d) above. A per-pair override drops on exactly that pair; a LAN run with a
 preemption replays byte-for-byte and a re-run of the same `Fabric` reproduces it.
 
-**SPF through the pseudonode.** `isis-spf` gained LAN transit on 2026-09-30
+**SPF through the pseudonode.** `isis-spf` has LAN transit
 (its `addLanArcs`: members listed by the pseudonode and listing it back reach
 each other at their own metric). The LAN test asserts it: member 1 reaches
 member 2 in one LAN hop at 10, the tail node reaches member 3 through 4 and 0 at
-30, and the pseudonode never appears as a destination. The first revision of
-this section pinned the opposite as a GAP, which is how the sibling's gap was
-found.
-
+30, and the pseudonode never appears as a destination. 
 **Modelled vs real.** No LAN hellos / adjacency states; the election view is
 schedule driven and all members react on the same tick (real: within one hello
 interval, so a transient double DIS is possible and not exercised); the
@@ -476,7 +438,7 @@ periodic cadence of `isis-flood` covers it); a cold restart of a DIS re-asserts
 its pseudonode LSP from its old sequence counter; L1 only; one LSP fragment per
 pseudonode. A frame to a crashed member is counted in `net_dropped` like any drop.
 
-## 13. Authentication (`Options.auth`, 2026-11-19)
+## 13. Authentication (`Options.auth`)
 
 `Options.auth = .{ .keys, .auth_snp = true, .mismatched = null }` keys the whole
 fabric with the RFC 5304/5310 machinery of the siblings; without it nothing
@@ -503,15 +465,43 @@ dropped; the harness does not treat it as a failure.
   nothing, the right key is accepted. `auth_snp = false` converges and its SNPs
   really leave unsigned while LSPs stay signed.
 
+## Verification
+
+`scripts/modtest isis-sim` (`zig build test-isis-sim`), `zig fmt` clean. Every test runs under
+`std.testing.allocator` (leak-checked). The oracle is invariants, not a foreign implementation (see
+*Anchoring*): there is no reference simulator to compare a convergence run with.
+
+- **Golden-topology proofs** (`src/fabric.zig`): convergence and `lsdbsAgree` on a line and a cyclic
+  topology, SPF consistency (exact next hops and metrics), reconvergence after a mid-run link failure,
+  partition detection, quiescence, and determinism (two independent `Fabric`s with the same inputs hold
+  the same sequence maps).
+- **Controls and teeth:** the permanent positive control `broken_no_drain` (§7), `ignore_snp` and the
+  `MEASURED:` restart test (§3), the `TEETH:` tests for `check` (the count tripwire and its bound, a
+  sequence that goes backwards, a live LSP that vanishes with aging on, a byte-level divergence at equal
+  sequence numbers, the event ceiling reported as a runaway, pseudonode regression), the aging negative control
+  `Aging{ .refresh = false }` (§11) and the LAN negative control `Options.lan_csnp = false` (§12).
+- **Measured scenarios:** the lossy-medium sweep (§10), the aging scenarios (§11), the LAN scenarios and the
+  lossy-LAN comparison (§12). They assert the direction of every measured effect (drops strictly grow with
+  the loss rate, convergence slows, the control stays behind), not only that the run converges.
+- **Direct-drive tests** (`Direct`): the protocol callbacks called one PDU at a time against a real
+  `netsim.Sim`, for the paths no scenario reaches by itself (own-LSP challenges by LSP and by SNP, a CSNP
+  from a non-DIS member, the DIS-only CSNP rule, `isDead`'s horizon, extra fragments, the poll re-arm).
+- **Authentication** (§13): keyed P2P, aging and LAN fabrics, `auth_snp = false`, a wrong-key node with the
+  exact refusal count, and direct injection of unsigned and wrong-key CSNPs/PSNPs (`queuedAuth` reads the
+  queued payloads, because a receiver with `auth_snp` off accepts unsigned SNPs unchecked).
+- **Fuzz:** none; the card's Hardening line says why (no fuzz obligation).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+
+Provenance: composes sibling modules over `netsim`; clean-room from ISO/IEC 10589, no third-party source
+ported (the README's `Provenance:` line).
+
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
-
 - **Wire `isis-adj` into the fabric** (real hello exchange, hold-timer failure detection instead of the scheduled re-origination shim) (survey 2026-09-30). Why: removes the biggest caveat of the harness (SPEC §3) and exercises the adjacency layer under loss. Effort: ~2–3 days. Fits §2: yes.
-- **Arbitrary topology and fault-schedule input, larger fabrics** (survey 2026-09-30; the *lossy medium* part of this item is done, §10). Why: a user cannot describe their own fabric today; `netsim` already offers `run`/`shrink`. Effort: ~2 days. Fits §2: yes.
-- ~~**`isis-spf`: route through LAN pseudonodes**~~ — done 2026-09-30 in `isis-spf`; §12 asserts the routes.
-- **`isis-flood`: broadcast-circuit mode** (SRM cleared on transmit, CSNP only from the DIS, PSNP only from non-DIS) and **`isis-lsdb`: SSN request on a broadcast circuit from a CSNP** — both are done harness-side in §12 and belong in the siblings (2026-09-30, A9). Fits §2: yes.
-- ~~Aging, purge and refresh in the run~~ — done 2026-09-30, §11. What is left of it: graceful self-purge, restart of a crashed node, sequence exhaustion.
+- **Arbitrary topology and fault-schedule input, larger fabrics** (survey 2026-09-30). Why: a user cannot describe their own fabric today; `netsim` already offers `run`/`shrink`. Effort: ~2 days. Fits §2: yes.
+- **`isis-flood`: broadcast-circuit mode** (SRM cleared on transmit, CSNP only from the DIS, PSNP only from non-DIS) and **`isis-lsdb`: SSN request on a broadcast circuit from a CSNP.** Both are done harness-side in §12 and belong in the siblings. Fits §2: yes.
+- **Graceful self-purge, restart of a crashed node, sequence exhaustion** in the aging run (§8 lists them as not modelled).
 
 ## Anchoring
 

@@ -6,9 +6,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-19** — New `Options.auth` (RFC 5304/5310 keys, `auth_snp`, a `mismatched` wrong-key node) and `Stats.auth_refused`: the whole fabric signs what it originates (LSPs, pseudonode LSPs and purges, LAN PSNP requests) and verifies what it receives through `isis-lsdb` / `isis-flood`. Without `auth` nothing changes. SPEC §13; 10 tests: keyed convergence (P2P, aging with refresh and a dead originator's signed purge, LAN DIS preemption), `auth_snp = false`, a wrong-key node kept apart with the exact refusal count, direct injection of unsigned / wrong-key CSNPs and PSNPs.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-10-18** — Ported to Zig 0.17.0. `InterfaceSet.initEmpty()` -> `.empty` (fabric.zig). No behaviour change.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with and §8 no longer say `isis-spf` skips pseudonodes — LAN transit works since 2026-09-30 (§12).
 - **2026-10-05** — Mutation run: 38 of 40 killed, 2 equivalent; 8 tests added (LAN SNP
   acceptance; LSP/SNP challenges of router and pseudonode LSPs; LAN send rules and
   `requestFromCsnp`; pseudonode regression check, `isDead` horizon, extra fragments;
