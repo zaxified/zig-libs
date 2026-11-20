@@ -8,7 +8,7 @@
 //! `(f, g)` and `(d, e)`. It is `p256/src/modinv.zig` with the limb count
 //! made a runtime (public) value and the modulus a runtime value.
 //!
-//! Moved here from `rsa` on: `DynModint.inverse` runs on it, and
+//! Moved here from `rsa`: `DynModint.inverse` runs on it, and
 //! `rsa` imports it as `montint.safegcd`.
 //!
 //! ## Why this exists

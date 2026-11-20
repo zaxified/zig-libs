@@ -784,7 +784,7 @@ inline fn blackBox(x: u64) u64 {
 }
 
 /// `condSub` at a comptime `L`: `z ← z − m` iff `top·B^L + z ≥ m` (the
-/// value is `< 2m`, `top ∈ {0, 1}`), in asm since. The Zig form
+/// value is `< 2m`, `top ∈ {0, 1}`), in asm. The Zig form
 /// (`condSubFixedZig`, kept as the test oracle) needed a laundered mask —
 /// fully unrolled, LLVM recovers `smask ∈ {0, ~0}` and hoists pass 2 behind a
 /// branch on the secret borrow — and even laundered it compiled to ~240
