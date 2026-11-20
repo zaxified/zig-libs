@@ -371,11 +371,6 @@ pattern again, not a dynamic offset:
   BPF program that sets `queue_mapping` and the class handle; this module does not generate it. The `tc` module has
   typed `ingress`/`clsact` qdiscs and a classic-bytecode `bpf` filter; attaching an eBPF-object classifier, which is
   what this item wants generated, is still open in `tc`.
-- **Zig 0.17: a wide `readInt(u128)` in the offline interpreter** — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and
-  a wider-element type, and `readInt`/`writeInt(u128)`, to a per-byte loop (about 8× the instructions; codeberg
-  ziglang/zig #36256). The one site is `vm.zig`'s `lpm6Lookup` (the test interpreter; no product path uses `u128`).
-  Measure first (cycles and instructions 0.16 against 0.17, or the cast's share in a profile); fix only if it shows:
-  load/store through `*align(1) uN` with `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
 ## Anchoring
 
