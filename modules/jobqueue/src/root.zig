@@ -1672,7 +1672,7 @@ test "computeBackoff: exponential progression, capped, deterministic without jit
     try testing.expectEqual(@as(u64, 1000), q.computeBackoff(60)); // overflow-safe
 }
 
-// ── core (2026-10-04): cancel, dead-letter requeue, heartbeat, unique jobs ──
+// ── core: cancel, dead-letter requeue, heartbeat, unique jobs ──
 
 test "cancel: ready, scheduled and dead jobs go, durably; a leased one refuses" {
     var h: Harness = undefined;
@@ -2067,7 +2067,7 @@ test "sweep: damaged job records decode or refuse, never panic, never break an i
             try testing.expect(job.job_type.len + job.partition.len + job.payload.len + job.unique_key.len <= len);
         }
     }
-    // Measured 2026-10-04: 6 732 decoded (2 865 of them v2), 33 268 refused,
+    // Measured: 6 732 decoded (2 865 of them v2), 33 268 refused,
     // 13 564 length-field hits.
     try testing.expect(reach.ok > 5000);
     try testing.expect(reach.corrupt > 15000);
@@ -2235,7 +2235,7 @@ test "sweep: random operations and crashes agree with a model" {
             reach.dead += dead;
         }
     }
-    // Measured 2026-10-04 (before `release` and `exclude` joined the op mix, which shifts
+    // Measured (before `release` and `exclude` joined the op mix, which shifts
     // every later draw): 588 acks, 683 cancels, 53 dead-letter requeues,
     // 1 212 refused duplicates, 1 226 crashes, 15 439 dead job-steps.
     try testing.expect(reach.cancels > 300);
@@ -2248,7 +2248,7 @@ test "sweep: random operations and crashes agree with a model" {
     try testing.expect(reach.excluded > 300);
 }
 
-// ── tests added for mutation survivors (2026-10-04) ─────────────────────────
+// ── tests added for mutation survivors ─────────────────────────
 
 test "decodeJob refuses what this module never writes: a keyless v2, a dead job with max_attempts 0" {
     // Canonical encoding: a job has exactly one record. A version-2 record
@@ -2299,7 +2299,7 @@ test "open refuses a store with two live jobs holding one unique key" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
