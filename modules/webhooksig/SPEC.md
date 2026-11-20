@@ -24,9 +24,9 @@ against the provider SDKs and the Standard Webhooks spec that Svix maintains.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [svix/svix-webhooks](https://github.com/svix/svix-webhooks) — **reference** (with the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) spec) | Rust | MIT | 3.4k | v2.6.0 (2026-09-29) | Multi-language libraries that verify the Standard Webhooks scheme: signed content is `msg_id.timestamp.payload`, timestamp checked against a tolerance for replay *(spec text read: it requires signing id + timestamp + body; base64 v1 header and tolerance details inferred)*. Here: body-only HMAC, no timestamp, hex only. |
-| [standard-webhooks/standard-webhooks](https://github.com/standard-webhooks/standard-webhooks) | Java (spec repo, libraries in many languages) | Apache-2.0 | 1.8k | v1.0.2 (2026-02-18) | The spec: HMAC-SHA256 symmetric and Ed25519 asymmetric variants (spec text read). Neither scheme is implemented here. |
-| [stripe/stripe-go](https://github.com/stripe/stripe-go) (`webhook` package) | Go | MIT | 2.6k | v86.4.2 (2026-09-09) | `ConstructEvent` verifies `Stripe-Signature` (`t=…,v1=…`, MAC over `timestamp.body`) with a default 5-minute tolerance *(inferred)*. Here: not implemented (the SPEC says so explicitly). |
+| [svix/svix-webhooks](https://github.com/svix/svix-webhooks) — **reference** (with the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) spec) | Rust | MIT | 3.4k | v2.6.0 (2026-09-29) | Multi-language libraries that verify the Standard Webhooks scheme: signed content is `msg_id.timestamp.payload`, timestamp checked against a tolerance for replay *(spec text read: it requires signing id + timestamp + body; base64 v1 header and tolerance details inferred)*. Here: `standard` signs and verifies `id.ts.body` with `v1` (HMAC-SHA256) and `v1a` (Ed25519) and refuses a timestamp outside `tolerance_s`; the `.prefixed` scheme (GitHub shape) stays body-only. |
+| [standard-webhooks/standard-webhooks](https://github.com/standard-webhooks/standard-webhooks) | Java (spec repo, libraries in many languages) | Apache-2.0 | 1.8k | v1.0.2 (2026-02-18) | The spec: HMAC-SHA256 symmetric and Ed25519 asymmetric variants (spec text read). Both are implemented here (`v1`, `v1a`). |
+| [stripe/stripe-go](https://github.com/stripe/stripe-go) (`webhook` package) | Go | MIT | 2.6k | v86.4.2 (2026-09-09) | `ConstructEvent` verifies `Stripe-Signature` (`t=…,v1=…`, MAC over `timestamp.body`) with a default 5-minute tolerance *(inferred)*. Here: `stripe` (the first `t=` wins, every `v1=` is tried, 300 s default tolerance, both directions). |
 | [octokit/webhooks.js](https://github.com/octokit/webhooks.js) | TypeScript | MIT | 349 | v14.2.0 (2025-12-03) | GitHub `X-Hub-Signature-256` verification plus typed event handling *(inferred)*. This is the one scheme this module covers exactly, including GitHub's published test triple. |
 | [google/go-github](https://github.com/google/go-github) (`ValidatePayload`) | Go | BSD-3-Clause | 11.3k | v92.0.0 (2026-09-14) | Verifies GitHub signatures from the request, supports several digests *(inferred)*. |
 | Zig ecosystem / `std` | Zig | — | — | — | Nothing found (a GitHub search for Zig repositories on "webhook" returned only applications). `std` provides HMAC and `timing_safe`, no webhook layer. |
@@ -34,13 +34,11 @@ against the provider SDKs and the Standard Webhooks spec that Svix maintains.
 **Where we are ahead:** the only Zig webhook-signature module found; constant-time compare, key
 rotation (any active secret verifies), a `router` middleware that reads the raw body before any
 parsing, allocation-free, and GitHub's own published vector as an external anchor.
-**Where we are behind** (re-checked 2026-10-04): no replay *cache* (a `webhook-id` seen twice
+**Where we are behind:** no replay *cache* (a `webhook-id` seen twice
 inside the window is the caller's to refuse — svix does not keep one either), no typed event
-payloads (octokit), no sender-side HTTP delivery/retry (svix's server). Built since the survey:
-Standard Webhooks `v1` + `v1a`, Stripe, Slack, the replay-tolerance window on all three, base64,
-SHA-1/SHA-512, and the middleware for every scheme.
+payloads (octokit), no sender-side HTTP delivery/retry (svix's server).
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` statement (no module NOTICE).
 
 ## Design & invariants
 Constant-time compare of the computed vs received signature (`std.crypto.timing_safe.eql`) — never a
@@ -53,9 +51,9 @@ own scheme (`X-Hub-Signature-256: sha256=<hex>`) exactly. The middleware reads t
 raw body **before** any parsing so the MAC covers exactly the bytes received. Immutable after init
 (secret set + config fixed); no shared mutable state, so sharing a single `Verifier` across all
 connection threads is safe without locking. Clean-room from RFC 2104 (HMAC) and the publicly-
-documented GitHub `X-Hub-Signature-256: sha256=<hex>` webhook convention — see NOTICE.
+documented GitHub `X-Hub-Signature-256: sha256=<hex>` webhook convention — see the README's `Provenance:` statement.
 
-**Schemes (2026-10-04).** All MACs go through one helper (`macParts`: HMAC over the
+**Schemes.** All MACs go through one helper (`macParts`: HMAC over the
 concatenation of parts, so `id.ts.body` is never assembled in memory) and one constant-time
 compare (`macEql`: `timing_safe.eql` over a zero-padded 64-byte array, so SHA-1/256/512 compare as
 one fixed size); a presented MAC is decoded only at its digest's exact encoded length (a
@@ -95,31 +93,33 @@ server's). Secret material lives in caller memory and in the `Verifier`'s copies
 not zeroize it.
 
 ## Verification
-An HMAC-SHA256 known-answer check, sign→verify round-trip and GitHub-style
-(`sha256=<hex>`) header-format parse/reject tests, constant-time-compare accept/reject, key-rotation
-(old+new secret) acceptance, tamper negatives (wrong secret, mutated body → reject). Stripe, Slack and Standard Webhooks are covered
-by the 2026-10-04 section below. Run: `zig build test-webhooksig`.
 
-**2026-10-04 (mvp → core).** Expected values from outside the module: the Standard Webhooks
-reference libraries' own sign test (`libraries/go/webhook_test.go` `TestWebhookSign`:
-`whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw`, `msg_p5jXN8AQM9LWM0D4loKWxJek`, 1614265330 →
-`v1,g0hM9SsE…`) and its multi-signature list; Slack's documented worked example (docs.slack.dev,
-re-verified with Python `hmac`); for the schemes no provider publishes a vector for, Python's
-`hmac` (Stripe, SHA-1, SHA-512, base64) and `openssl pkeyutl -sign` over RFC 8032 TEST 1's key
-(`v1a`), all as black boxes. The tolerance boundary is tested at exactly ±300 s (passes) and
-±301 s (refused); every scheme goes through the middleware over the wire. **Seeded sweep**
-(deterministic, ~0.3 s): 6 000 hostile header sets built from scheme fragments and damaged go
-through `standard`/`stripe`/`slack.verify` and three `Format`s — an accepted header must contain
-the one genuine signature in the fragment list, nothing else is ever accepted; reach pinned
-(measured: 5 genuine, 92 too old, 187 too new, 6 174 bad timestamps, 2 379 bad headers, 9 163
-no-match). Its oracle half signs random keys/ids/timestamps/payloads under all three timestamped
-schemes, verifies, and requires one flipped byte of signature, id or payload to be refused
-(4 500 round trips, 5 940 flips refused). **Mutation 2026-10-04:** 37 mutants (schemata,
-ReleaseSafe), 3 survived the first run, each killed by a test added with its reason (a signature
-one byte short whose missing byte is zero; secret/key sizes outside the spec; unpadded base64);
-0 surviving. **CT gate:** `check-ct-compare` counts 1 `timing_safe.eql` site (was 2: both now go
-through `macEql`) and 4 plain `std.mem.eql` (was 2: the new two compare the public version tags
-`v1`/`v1a`) — the pin in `scripts/checks/ct-compare-expected.tsv` needs `1	4`.
+- **Run:** `scripts/modtest webhooksig` (`zig build test-webhooksig`).
+- **Tests:** HMAC-SHA256 known answer, sign→verify round trip and the GitHub-style (`sha256=<hex>`) header parse/reject
+  tests, constant-time-compare accept/reject, key rotation (old + new secret), tamper negatives (wrong secret, mutated
+  body, same-length flip); every scheme over the wire through the middleware (`http.Server.serveStream`); the
+  tolerance boundary at exactly ±300 s (passes) and ±301 s (refused); secret and key sizes outside the spec,
+  unpadded base64, and a signature one byte short whose missing byte is zero.
+- **Oracles (black boxes):** the Standard Webhooks reference libraries' own sign test (the Go library's
+  `TestWebhookSign`) and its multi-signature list; Slack's documented worked example; Python's `hmac` for Stripe,
+  SHA-1, SHA-512 and base64; `openssl pkeyutl -sign` over RFC 8032 TEST 1's key for `v1a`.
+- **Seeded sweep:** a deterministic sweep of hostile header sets built from scheme fragments and damaged ones
+  through `standard`/`stripe`/`slack.verify` and three `Format`s: an accepted header must contain the one genuine
+  signature in the fragment list, nothing else is ever accepted; reach is pinned. Its oracle half signs random
+  keys, ids, timestamps and payloads under all three timestamped schemes, verifies, and requires one flipped byte
+  of signature, id or payload to be refused.
+- **No-panic sweep:** `Verifier.init` returns `error.InvalidOptions` for every option contract (one test each),
+  and the accepted-side tests pin the boundaries (`src/sweep_test.zig`).
+- **Fuzz:** `WEBHOOKSIG_FUZZ=<runs>[,<seed>]`, harness `webhooksig-verify` (testkit driver; the harness body is in
+  `src/root.zig`, shared plumbing in `src/fuzz_test.zig`).
+- **Constant time:** the next section; `check-ct-compare` pins the `timing_safe.eql` and plain `std.mem.eql` site
+  counts of `src/root.zig` in `scripts/checks/ct-compare-expected.tsv` (the compare goes through `macEql`; the
+  plain `mem.eql` sites compare public version tags).
+- **Dead stack:** `src/burn.zig` runs every secret-touching entry point one frame down and burns it;
+  `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (`standard.encodeSecret`) probe residue and the HMAC key /
+  Ed25519 secret as needles (ReleaseFast only).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
 **External anchor, and one refuted.** RFC 4231 (HMAC-SHA-2 test vectors) was evaluated and
 deliberately **not** adopted: this module's `Hmac` is `std.crypto.auth.hmac.sha2.HmacSha256` used
@@ -133,7 +133,7 @@ self-check against it; independently re-verified here with `openssl dgst -sha256
 adoption. Recorded as a provenance note in this module's README `Provenance:` statement (a short factual test-oracle
 triple, not a vendored corpus — no dedicated `modules/webhooksig/NOTICE` file).
 
-## Constant-time (ctgrind, 2026-11-13)
+## Constant time (ctgrind)
 
 `src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh webhooksig` (ReleaseFast, unattributed 0,
 controls and traps 0; pinned in `scripts/checks/ctgrind-expected.tsv`).
@@ -143,33 +143,25 @@ controls and traps 0; pinned in `scripts/checks/ctgrind-expected.tsv`).
   rotation set. The 110 contexts are the harness printing the verdict; the module itself takes
   no branch on the secret or the comparison result (`timing_safe.eql` over a fixed-size array,
   `ok = macEql(..) or ok` evaluates the compare first, every secret tried).
-- **sign: 77.** The MAC is public, but `encodeMac`'s hex table (root.zig:297/:298) and std base64
-  (via root.zig:302) index a table by each MAC octet before the caller can declassify it.
+- **sign: 77** (61 on the `cpu=x86_64` variant row). The MAC is public, but `encodeMac`'s hex table and std
+  base64 index a table by each MAC octet before the caller can declassify it.
 - **keys: 1.** `stripPrefix` -> `std.mem.trim` compares the key text's last character with SP and
-  TAB (root.zig:604). The base64 alphabet has neither, so for a valid key the outcome is constant
+  TAB. The base64 alphabet has neither, so for a valid key the outcome is constant
   and carries no key bit; left as is. `b64ct`'s decode/encode raise none.
-- **ed25519: 30.** 22 std base64 of the public signature (root.zig:533), 2 trims as above, std
+- **ed25519: 30.** 22 std base64 of the public signature (`signEd25519`), 2 trims as above, std
   edwards25519 `rejectIdentity` x3 (+2 in keygen) on public-key and nonce points (one bit, true
   except with probability ~2^-252), and the constant-time compare of the embedded public half
-  (root.zig:494), true for every valid key.
+  of a 64-byte signing key (`decodeSigningKey`), true for every valid key.
+
+## What is deliberately not done
+
+- **A seen-id replay cache** inside the tolerance window: it needs state and a clock the module does not own. A
+  caller's `ramcache`/`kv` keyed by `webhook-id` for `tolerance_s` does it (svix keeps none either).
+- **Zeroizing secrets**: the `Verifier` keeps raw secrets for its lifetime and the module does not wipe them (*Threat model*).
 
 ## Backlog / deferred
-**2026-10-04:** all three survey items are **done** (Standard Webhooks v1/v1a, Stripe, Slack with
-a tolerance window; base64; SHA-1/SHA-512; Ed25519). Still deferred: a seen-id replay cache inside
-the window (needs state and a clock the module does not own; a caller's `ramcache`/`kv` keyed by
-`webhook-id` for `tolerance_s` does it), other providers' bespoke shapes (Twilio's URL+params
-signature, AWS SNS certificates) until a consumer asks.
 
-**Survey 2026-09-30** (checked with `rg -n -i 'tolerance|timestamp|max_age' src/root.zig`: only the "not implemented" comment at root.zig:7):
-- ✅ (found implemented 2026-11-17: `standard`/`stripe`/`slack` in src/root.zig) **(survey 2026-09-30) Timestamped schemes with a replay tolerance** — Stripe (`t=…,v1=…`, MAC over `timestamp.body`), Slack (`v0:timestamp:body`) and Standard Webhooks (`id.timestamp.body`, base64) are the schemes most webhook receivers meet, and all carry a freshness window that this module cannot express; the SPEC already names Stripe. Effort: small–medium per scheme (a signed-payload builder, a header parser, a caller-supplied `now`, tolerance check; no clock in the module, per the house rule). Fits §2: yes.
-- ✅ (found implemented 2026-11-17: `Format`/`signFormat` in src/root.zig) **(survey 2026-09-30) Base64 signature encoding and other digests (SHA-1, SHA-512)** — hex/SHA-256 only today; some providers use base64 or SHA-1. Effort: small. Fits §2: yes.
-- ✅ (found implemented 2026-11-17: `standard.signEd25519` in src/root.zig) **(survey 2026-09-30) Ed25519 asymmetric verification** (Standard Webhooks asymmetric variant, Discord) — SPEC lists it as out of scope; `std` has Ed25519. Effort: small. Fits §2: yes.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · server · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **Other providers' bespoke shapes** (Twilio's URL + params signature, AWS SNS certificates) — until a consumer asks.
 
 ## Anchoring
 
@@ -179,5 +171,3 @@ src/root.zig.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/root.zig:456 asserts GitHub's own published canonical webhook-signature triple (payload, secret, sha256=757107ea0eb2...), which anchors the FRAMING; root.zig:434 records that RFC 4231 was REFUTED as this module's anchor because it exercises std.crypto's HMAC rather than anything here. Timing-safe compare and header parsing stay self
-
-**How it got there.** The anchoring work landed. DONE 9ca8ed7: RFC 4231 REFUTED (tests std.crypto); GitHub published triple used

@@ -34,7 +34,7 @@ module (same repo, MIT).
   `http.Server`'s connection threads; the free functions are pure.
 - **Deps:** `router` (Middleware / Ctx / Next, the reserved `Ctx.data`
   slot), `http` (`Request.header`, the body `reader()`, `ResponseWriter`),
-  and `std.crypto.auth.hmac.sha2.HmacSha256` + `std.crypto.timing_safe`.
+  `b64ct` (base64), and `std.crypto.auth.hmac` + `std.crypto.timing_safe`.
 
 Import name: registers as **`webhooksig`** — `@import("webhooksig")`.
 
@@ -192,16 +192,14 @@ middleware's `state` points at it).
 
 ## Verification
 
-`zig build test-webhooksig` — pure sign→verify round-trip; tampered-body /
-wrong-secret / malformed / wrong-prefix / same-length-flip rejection; a
-known HMAC-SHA256 test vector; custom / empty prefix; `Verifier` rotation
-(old + new secret both accepted, no early exit); plus wire-level tests over
-the socket-free `http.Server.serveStream` (correctly-signed body → 200 with
-the handler re-reading the stashed body; missing header / tampered body /
-wrong secret → 401 with the `WWW-Authenticate: Signature` challenge; custom
-header name + rotation over the wire). Since 2026-10-04: the Standard
-Webhooks reference library's sign vector, Slack's documented example,
-Python-`hmac` vectors for Stripe / SHA-1 / SHA-512 / base64, an
-`openssl`-signed Ed25519 `v1a` vector, the tolerance boundary both ways,
-every scheme through the middleware, and a seeded hostile-header sweep with
-a sign→verify→flip oracle.
+`scripts/modtest webhooksig` (`zig build test-webhooksig`): sign→verify round trips, tamper, wrong-secret, malformed
+and wrong-prefix rejection, a known HMAC-SHA256 vector, key rotation, wire-level tests over the socket-free
+`http.Server.serveStream`, the Standard Webhooks reference library's sign vector, Slack's documented example,
+Python-`hmac` vectors for Stripe / SHA-1 / SHA-512 / base64, an `openssl`-signed Ed25519 `v1a` vector, the
+tolerance boundary both ways, every scheme through the middleware, and a seeded hostile-header sweep with a
+sign→verify→flip oracle. See SPEC *Verification*.
+
+## Not provided
+
+A seen-`webhook-id` replay cache (the caller's), other providers' bespoke shapes (Twilio, AWS SNS): see SPEC
+*What is deliberately not done* and *Backlog / deferred*.
