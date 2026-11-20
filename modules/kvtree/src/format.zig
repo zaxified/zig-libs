@@ -197,7 +197,7 @@ pub fn overflowData(page: *const [page_size]u8) *const [ovf_data]u8 {
 /// Not `@memset`: without libc that lowers to `compiler_rt.memset`, which in
 /// Zig 0.16 stores ONE BYTE at a time -- measured at ~5 600 instructions per
 /// 4 KiB page in ReleaseFast, 19 % of the user-side cost of a `kvtree` commit
-/// (the web-server consumer perf audit, 2026-09-21). The vector loop is ~170. Volatile so LLVM's
+/// (the web-server consumer perf audit). The vector loop is ~170. Volatile so LLVM's
 /// loop-idiom pass cannot fold the loop back into that same `memset` call.
 pub fn zeroPage(page: *[page_size]u8) void {
     const V = @Vector(32, u8);
@@ -300,7 +300,7 @@ fn nodeLeftmost(page: *const [page_size]u8) PageId {
     return std.mem.readInt(u32, page[4..8], .little);
 }
 
-// SQLite-style point-of-use checking (owner decision 2026-10-29): node pages
+// SQLite-style point-of-use checking (owner decision): node pages
 // carry no CRC and `recover` validates them once, at open. A page can rot (or
 // be rewritten by another process) after that, so every offset, length and
 // count read out of a page below is compared against the page bounds where it
@@ -580,7 +580,7 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
 /// eight bytes per step: a big-endian load turns the first differing byte of a
 /// word into the word's order. Every descent and every commit fold compares
 /// keys; std's byte loop was the largest single cost of a resident `get`
-/// (perf, 2026-10-11).
+/// (perf).
 pub fn orderKeys(a: []const u8, b: []const u8) std.math.Order {
     const n = @min(a.len, b.len);
     var i: usize = 0;
@@ -605,7 +605,7 @@ fn binarySearch(comptime V: type, view: V, key: []const u8) error{Corrupt}!Searc
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         // A probe's first touch of its cell is a cache miss, and each probe
-        // waited for the one before it (perf 2026-10-25: 35 % of a resident
+        // waited for the one before it (perf: 35 % of a resident
         // get on one load). The next probe is the middle of one half or the
         // other; asking for both cells now overlaps the misses. The slot
         // directory itself is a line or two, warm after the first probe. A
@@ -939,7 +939,7 @@ fn encodeLeaf(page: *[page_size]u8, entries: []const Entry) void {
     // The cells sit at the end of the page, as always, but in ASCENDING key
     // order: a cursor then walks a leaf's memory forward, the direction the
     // hardware prefetcher follows best (a resident scan was 69 % first-touch
-    // misses on cells laid out downward, perf 2026-10-11). Readers go through
+    // misses on cells laid out downward, perf). Readers go through
     // the slot directory, so the order is no part of the format.
     var total: usize = 0;
     for (entries) |e| total += leafCellBytes(e.key.len, e.val.len);

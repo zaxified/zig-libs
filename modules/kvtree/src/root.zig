@@ -522,7 +522,7 @@ pub const Options = struct {
     /// Give the end of the file back once at least this many pages there are
     /// free and no open snapshot or cursor can still reach them: the high
     /// water drops in that commit and the file is truncated by the next one.
-    /// 0 = never shrink (the file only ever grows, as before 2026-09-29).
+    /// 0 = never shrink (the file only ever grows, as previously).
     /// Only a free TAIL goes; free pages below a live one are reused by later
     /// commits but not given back (that would take moving live pages down).
     /// The default, 16 pages (64 KiB), keeps a store that breathes by a few
@@ -1173,8 +1173,9 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
         // seam when there is one (a `pagecache` in front of the backend): a
         // resident page then costs no copy per level instead of a whole-page
         // `@memcpy` per level. Everything else here — the copy-on-write write
-        // path and the cursor's root-to-leaf frame stack — mutates or outlives
-        // its pages and correctly keeps its own copies.
+        // path — mutates its pages and so keeps its own copies; the cursor's
+        // root-to-leaf frame stack borrows each page when the store can lend
+        // (see `Cursor`).
         const ref = try pager.readPageRef(id);
         defer if (ref) |r| pager.releasePageRef(r);
         const bytes: *const [page_size]u8 = if (ref) |r| r.bytes[0..page_size] else blk: {
@@ -1287,7 +1288,7 @@ pub const Cursor = struct {
         page: [page_size]u8,
         /// The store's borrow of the page, when it lent one: no copy at all.
         /// A scan used to copy every page twice (into a frame, then the
-        /// frame onto the stack) — 60 % of a resident scan (perf, 2026-10-11).
+        /// frame onto the stack) — 60 % of a resident scan (perf).
         ref: ?kv.Storage.Ref,
         id: PageId,
         /// For a branch: ordinal of the child we descended into. For a leaf:
@@ -1821,7 +1822,7 @@ test "leafViewSafe accepts a real leaf, rejects an oversized value length" {
     // The largest INLINE length (no flag bit): 0xFFFF_FFFF would carry
     // `ovf_flag` and read as a 4-byte overflow reference, which fits — and
     // only failed here while the first slot's cell sat at the page's very
-    // end (cells were laid out downward until 2026-10-11).
+    // end (cells were laid out downward previously).
     const o = std.mem.readInt(u16, page[8..10], .little);
     std.mem.writeInt(u32, page[o + 2 ..][0..4], format.bucket_flag - 1, .little);
     try testing.expect(format.leafViewSafe(&page) == null);
@@ -2154,7 +2155,7 @@ test "getRef on a store that cannot lend is CannotLend, never a silent copy" {
     try std.testing.expectError(error.CannotLend, txn.getRef("k"));
 }
 
-// ── emptied nodes leave the tree (2026-09-28) ────────────────────────────────
+// ── emptied nodes leave the tree ────────────────────────────────
 //
 // A delete that empties a leaf drops it from its parent, a branch left with
 // no children goes the same way, and a root left with one child collapses.
@@ -3944,7 +3945,7 @@ test "buckets: recover rejects a version whose bucket cell is corrupt and adopts
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -3954,7 +3955,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── audit 2026-10-25 (mutation survivors): corruption guards and boundaries ──
+// ── audit (mutation survivors): corruption guards and boundaries ──
 
 /// Byte offset in the file of the `cell_off`-th byte after the cell of `key`
 /// in the leaf page `page_id` (`cell_off` 0 = the cell's key length field).
@@ -4325,7 +4326,7 @@ test "an empty transaction commits nothing: the meta, the txn id and the file st
     try testing.expectEqual(before.txn_id + 1, db.meta_rec.txn_id);
 }
 
-// ── no-panic sweep 2026-10-29 (KT-1 .. KT-11) ─────────────────────────────────
+// ── no-panic sweep (KT-1 .. KT-11) ─────────────────────────────────
 //
 // The file is untrusted data: forged at open, or rotted AFTER open (the pages
 // below are rewritten through the live `Pager`, the way media rot or another

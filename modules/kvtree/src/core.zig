@@ -141,7 +141,7 @@ pub const RecoverError = error{
 /// outgrows the general-purpose allocator's size classes, every chunk is an
 /// `mmap` on the way in and a `munmap` on the way out, and every page of it
 /// faults again on the next commit. Measured in the web-server consumer's `wdur` lane (durable
-/// PUT, 2026-09-30): 1.69 minor faults per request (0.30 at the 09-28 pin,
+/// PUT): 1.69 minor faults per request (0.30 at the 09-28 pin,
 /// before this module's 09-29 changes grew the scratch), ~5 k kernel
 /// instructions each; retained, 0.001, and -7 % instructions per request.
 /// The limit bounds what one huge commit leaves behind.
@@ -390,7 +390,7 @@ fn readForCommit(pager: *Pager, id: PageId, buf: *[page_size]u8) CommitError!voi
 /// A stable sort, then one compaction pass that keeps each key's LAST change
 /// (stability keeps equal keys in change order). O(n log n). It used to
 /// insert each change into a sorted array: O(n²) moves, 14 % of a 100 000-put
-/// transaction's whole run in the kvtree bench's preload (2026-10-11).
+/// transaction's whole run in the kvtree bench's preload.
 fn reduceChanges(arena: Allocator, changes: []const Change) CommitError!std.ArrayList(Op) {
     var ops = std.ArrayList(Op).initCapacity(arena, changes.len) catch return error.OutOfMemory;
     for (changes) |c| ops.appendAssumeCapacity(switch (c) {
@@ -1342,7 +1342,7 @@ fn fzMark(comptime i: usize) void {
 /// The corpus above, lightly damaged: one of `recover_seeds` serialised, then
 /// 0-2 knob words nudged (+-1 or a small value) and 0-3 page octets
 /// overwritten, replayed through `Smith`'s own input format. Random pages
-/// almost never make `recover` adopt a meta (0 in 200 000 runs, 2026-10-09);
+/// almost never make `recover` adopt a meta (0 in 200 000 runs);
 /// the corpus's adopted seeds do, and their neighbours are where a
 /// `candidateValid` or tree-walk check that is one off would show.
 /// (`Smith{ .in = ... }` over a STRUCTURED corpus entry, not random bytes --
@@ -1392,7 +1392,7 @@ test "fuzz harness: 150 seeds in every test run, and they get everywhere" {
         };
     }
     // `adopted` comes from the mutated corpus harness: random pages almost
-    // never pass `candidateValid` (0 in 200 000 driver runs, 2026-10-09).
+    // never pass `candidateValid` (0 in 200 000 driver runs).
     for (0..150) |sd| {
         var prng = std.Random.DefaultPrng.init(sd);
         var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -1606,7 +1606,7 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     // over 10 seeds x 4 data pages. Before the corpus there was ONE run, and
     // its four data pages were all shape 0.
     try testing.expectEqual([4]usize{ 25, 10, 1, 4 }, shapes);
-    // 2026-10-29 (no-panic sweep, KT-6): `candidateValid` now refuses a
+    // (no-panic sweep, KT-6): `candidateValid` now refuses a
     // freelist that names a live page or lists a page twice. The one seed with
     // a freelist (txn_id 7) drew fuzzed entry ids that collide, so it is
     // refused now: 1 adopted (txn_id 5), no freelist walked to the end by this
