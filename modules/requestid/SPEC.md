@@ -76,7 +76,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   propagates.
 - **`Options.header_name` is checked in `middleware()`:** it must be an RFC 9110 token and not
   `Content-Length` or `Transfer-Encoding` (the framing headers `http` treats specially), otherwise
-  every echo would fail or vanish; `middleware()` panics, in every build mode, on such a name.
+  every echo would fail or vanish; `middleware()` panics, in every build mode, on such a name; `validate(options)` returns `error.InvalidHeaderName` for the same condition (echo and chi's `RequestID` have no validator; the panic is kept, `validate` is additive).
 - **`fork()`:** a child inherits the prefix and the sequence if the parent generated an ID before
   forking, so parent and child then repeat each other's IDs; a pre-fork server must not generate
   before it forks.
@@ -143,8 +143,6 @@ figures, with their date, are the card's `**Performance:**` line; they are not r
 
 ## Backlog / deferred
 
-- **An erroring `validate(options)`** as the alternative to the checked panic in `middleware()` on an
-  unusable `header_name` (idea, LOW; the panic is the documented behaviour).
 
 ## Anchoring
 

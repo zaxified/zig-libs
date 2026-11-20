@@ -107,12 +107,28 @@ pub const Generator = struct {
     run: *const fn (context: ?*anyopaque, buf: *[max_adopt_len]u8) []const u8,
 };
 
+/// Why `validate` refused an `Options`.
+pub const ValidateError = error{
+    /// `header_name` is not an RFC 9110 token, or is a framing header
+    /// (`Content-Length`, `Transfer-Encoding`): every echo would fail.
+    InvalidHeaderName,
+};
+
+/// The non-panicking twin of `middleware()`'s check: `error.InvalidHeaderName`
+/// exactly when `middleware()` would panic on `options`. Call it at startup
+/// when the options come from configuration. (The panic stays: it is the
+/// documented behaviour for a programmer error in a literal.)
+pub fn validate(options: Options) ValidateError!void {
+    if (!isUsableHeaderName(options.header_name)) return error.InvalidHeaderName;
+}
+
 /// Config + the middleware over it. Immutable; share one across threads.
 pub const RequestId = struct {
     options: Options = .{},
 
     /// `ri` must outlive the router. Panics (in every build mode) on a
-    /// `header_name` the echo could never set — see `Options.header_name`.
+    /// `header_name` the echo could never set — see `Options.header_name`;
+    /// `validate(ri.options)` reports the same condition as an error.
     pub fn middleware(ri: *const RequestId) router.Middleware {
         if (!isUsableHeaderName(ri.options.header_name)) @panic("requestid: Options.header_name is not a usable header name");
         return .{ .state = @constCast(ri), .run = middlewareRun };
@@ -129,9 +145,9 @@ threadlocal var current_id: []const u8 = &.{};
 /// access log registered *outside* the middleware reads it once the chain
 /// returns) until the next request the middleware runs for, so a request
 /// that bypasses the middleware sees the previous one's ID: register it
-/// first. The bytes are always this thread's own copy — earlier an
-/// adopted ID pointed into the request head, which the next request on the
-/// connection overwrites.
+/// first. The bytes are always this thread's own copy (an adopted ID is
+/// copied, not a slice of the request head, which the next request on the
+/// connection overwrites).
 pub fn current() ?[]const u8 {
     return if (current_id.len == 0) null else current_id;
 }
@@ -696,6 +712,15 @@ test "header_name: tokens only, framing headers refused (middleware() panics on 
     try testing.expect(!isUsableHeaderName("X-Id\r\n"));
     try testing.expect(!isUsableHeaderName("Content-Length"));
     try testing.expect(!isUsableHeaderName("transfer-ENCODING"));
+}
+
+test "validate: the error twin of middleware()'s header_name panic" {
+    try validate(.{});
+    try validate(.{ .header_name = "x-correlation-id" });
+    try testing.expectError(error.InvalidHeaderName, validate(.{ .header_name = "" }));
+    try testing.expectError(error.InvalidHeaderName, validate(.{ .header_name = "X Request" }));
+    try testing.expectError(error.InvalidHeaderName, validate(.{ .header_name = "Content-Length" }));
+    try testing.expectError(error.InvalidHeaderName, validate(.{ .header_name = "transfer-encoding" }));
 }
 
 test "an adopted ID is this thread's copy, still current() for an outer middleware after the chain" {
