@@ -14,6 +14,7 @@
 const std = @import("std");
 const cbor = @import("cbor");
 const ctap2pin = @import("ctap2pin");
+const unitext = @import("unitext");
 const framing = @import("framing.zig");
 const getinfo = @import("getinfo.zig");
 
@@ -75,13 +76,75 @@ pub const default_min_pin_code_points = 4;
 /// (the spec's default is 4; `Info.effectiveMinPinLength()` gives the
 /// authenticator's) and at most 63 bytes.
 ///
-/// The caller supplies the PIN in Normalization Form C, as the spec requires;
-/// this module does not normalize (see SPEC.md, Backlog).
+/// The PIN must already be in Normalization Form C (CTAP 2.1 §6.5.1);
+/// `normalizePin` produces it. This check does not normalize: it stays
+/// constant-time in the PIN bytes.
 pub fn validateNewPin(pin: []const u8, min_code_points: u32) PinError!void {
     const r = utf8CountCt(pin);
     if (!r.valid) return error.PinNotUtf8;
     if (pin.len > max_pin_bytes) return error.PinTooLong;
     if (r.count < @max(min_code_points, default_min_pin_code_points)) return error.PinTooShort;
+}
+
+pub const NormalizePinError = error{
+    /// The bytes are not valid UTF-8.
+    PinNotUtf8,
+    /// The input, or its NFC form, is longer than `max_normalize_input` bytes.
+    PinTooLong,
+    OutOfMemory,
+};
+
+/// The longest input `normalizePin` takes, and the longest result it builds.
+/// A PIN is at most 63 bytes on the wire; the slack lets a decomposed PIN
+/// compose back down before `validateNewPin` judges its length.
+pub const max_normalize_input = 1024;
+
+/// CTAP 2.1 §6.5.1: "Platforms MUST enforce ... PIN are in Unicode
+/// normalization form C" (§6.5.5.5 / §6.5.5.6 collect it that way). The
+/// platform step that enforces it: `pin` in NFC (UAX #15, the sibling
+/// `unitext` module), newly allocated with `gpa`. Run it on a PIN taken
+/// from a user, then pass the result to `Client.setPin` / `changePin` /
+/// `getPinToken`; the caller wipes (`std.crypto.secureZero`) and frees it.
+///
+/// ⚠ Not constant-time and not wipe-clean: normalization branches and
+/// indexes tables on the PIN's code points, and `unitext`'s working buffers
+/// are freed without being wiped. The rest of the PIN path
+/// (`validateNewPin`, padding, hashing, encryption) stays constant-time;
+/// a caller for whom PIN timing or heap residue matters normalizes
+/// elsewhere or accepts ASCII PINs only (already NFC). python-fido2, the
+/// reference, does not normalize at all.
+pub fn normalizePin(gpa: Allocator, pin: []const u8) NormalizePinError![]u8 {
+    if (pin.len > max_normalize_input) return error.PinTooLong;
+    return unitext.normalize(gpa, pin, .nfc, .{ .max_output = max_normalize_input }) catch |e| switch (e) {
+        error.InvalidUtf8 => error.PinNotUtf8,
+        error.TooLarge => error.PinTooLong,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+test "normalizePin: NFC per CTAP 2.1 §6.5.1 -- composes, keeps NFC and ASCII as is, refuses bad UTF-8" {
+    const gpa = testing.allocator;
+    // "e" + COMBINING ACUTE (NFD) -> U+00E9 (NFC); the code-point count changes.
+    const nfd = "1234e\u{301}";
+    const n = try normalizePin(gpa, nfd);
+    defer gpa.free(n);
+    try testing.expectEqualStrings("1234\u{e9}", n);
+    // Four code points before NFC, three after: the length rule is judged on the NFC form.
+    try validateNewPin("abe\u{301}", 4);
+    const c = try normalizePin(gpa, "abe\u{301}");
+    defer gpa.free(c);
+    try testing.expectError(error.PinTooShort, validateNewPin(c, 4));
+    // Hangul jamo compose to one syllable; ASCII is unchanged.
+    const h = try normalizePin(gpa, "\u{1100}\u{1161}\u{11a8}0000");
+    defer gpa.free(h);
+    try testing.expectEqualStrings("\u{ac01}0000", h);
+    const a = try normalizePin(gpa, "hunter2");
+    defer gpa.free(a);
+    try testing.expectEqualStrings("hunter2", a);
+    try testing.expectError(error.PinNotUtf8, normalizePin(gpa, "12\xff34"));
+    const long: [max_normalize_input + 1]u8 = @splat('1');
+    try testing.expectError(error.PinTooLong, normalizePin(gpa, &long));
+    try testing.expectError(error.OutOfMemory, normalizePin(testing.failing_allocator, "1234"));
 }
 
 // ── constant-time UTF-8 validation + code-point count ───────────────────────

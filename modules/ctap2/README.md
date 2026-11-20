@@ -49,9 +49,10 @@ const pin_uv_auth_param = try token.authenticate(&client_data_hash);
 **Handling notes.** Each call runs a fresh key agreement and wipes the shared secret,
 the padded PIN and the PIN hash before it returns; a `Token` is wiped by `deinit`.
 The random source must be cryptographically secure (ECDH scalar, protocol-Two IVs).
-The PIN must arrive in Unicode Normalization Form C: there is no normalizer in
-`std`, so this module validates UTF-8 and counts code points but does not normalize
-(the sibling `unitext` has `normalize`; SPEC.md, Backlog). A wrong PIN costs a retry on the device: `error.PinInvalid`
+The PIN must be in Unicode Normalization Form C (CTAP 2.1 §6.5.1): run a PIN
+typed by a user through `ctap2.normalizePin(gpa, pin)` first (NFC via `unitext`;
+not constant-time, see SPEC.md; wipe and free the result). `setPin`/`changePin`/
+`getPinToken` validate UTF-8 and count code points but do not normalize. A wrong PIN costs a retry on the device: `error.PinInvalid`
 means "ask again", and after a `PinAuthBlocked` the authenticator needs a power
 cycle.
 

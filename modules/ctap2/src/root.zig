@@ -45,8 +45,8 @@ pub const meta = .{
     .platform = .any,
     .role = .codec, // wire framing + command encoding; the transport is the caller's
     .concurrency = .reentrant, // no globals; a `Client` holds only caller-supplied state
-    .model_after = "FIDO Alliance CTAP 2.1 (6.4, 6.5.5, 8.2, 11.2); python-fido2 used as a black-box oracle",
-    .deps = .{ "cbor", "ctap2pin" },
+    .model_after = "FIDO Alliance CTAP 2.1 (6.4, 6.5.1, 6.5.5, 8.2, 11.2); python-fido2 used as a black-box oracle",
+    .deps = .{ "cbor", "ctap2pin", "unitext" },
 };
 
 /// The sibling modules this one is built on, re-exported so a program that
@@ -70,6 +70,8 @@ pub const Permissions = clientpin.Permissions;
 pub const Token = clientpin.Token;
 pub const PinRetries = clientpin.PinRetries;
 pub const ClientPinError = clientpin.ClientPinError;
+pub const normalizePin = clientpin.normalizePin;
+pub const NormalizePinError = clientpin.NormalizePinError;
 
 test {
     _ = status;

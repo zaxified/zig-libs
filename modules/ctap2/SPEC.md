@@ -88,6 +88,14 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   points; at most 63 bytes; padded to 64. The current PIN is only length-capped (an
   older PIN may be shorter than today's policy). All of it is checked before the
   first byte is sent.
+- **NFC (§6.5.1).** "Platforms MUST enforce ... PIN are in Unicode normalization form C." The
+  enforcing step is `normalizePin(gpa, pin)` (NFC through the sibling `unitext` module), which
+  the caller runs on a PIN taken from a user before `setPin` / `changePin` / `getPinToken`;
+  the PIN rules above then judge the NFC form. It is opt-in and separate because it is
+  neither constant-time nor wipe-clean (normalization branches on the code points, `unitext`
+  frees its working buffers unwiped), while the PIN rules, padding, hashing and encryption
+  stay constant-time (ctgrind `pin` 0). The reference, python-fido2, does not normalize
+  (`fido2/ctap2/pin.py` encodes the `str` as given).
 - **Kept strict or lenient on purpose.** The authenticator's COSE_Key must carry `alg` -25 (the spec says MUST;
   python-fido2 does not check it, so an authenticator that omits it works there but not here). `rp_id` is not
   enforced client-side for `mc`/`ga` permissions; the authenticator answers `MissingParameter`.
@@ -172,9 +180,6 @@ against the spec's layouts and by round trip (no external CTAPHID capture).
 
 ## Backlog / deferred
 
-- **Unicode NFC normalization for PINs** (CTAP 2.1 §6.5.5.5 requires the platform to collect the PIN in NFC). This
-  module validates UTF-8 and counts code points and the caller normalizes. The sibling `unitext` module now has
-  `normalize` (NFC); using it here would add a dependency, which is undecided.
 - Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential) if a consumer appears.
 - Keep-alive status surfacing (`CTAPHID_KEEPALIVE` UPNEEDED vs PROCESSING) to the caller for UI; `Channel` currently
   discards keep-alives.
