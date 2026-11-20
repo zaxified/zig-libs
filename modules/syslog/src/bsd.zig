@@ -81,8 +81,7 @@ pub const Message = struct {
     severity: Severity = .notice,
     timestamp: ?Timestamp = null,
     /// Sent only when `validHostname` holds; `null`, empty or anything else
-    /// omits the field (see the file comment). Until 2026-10-05 the default
-    /// was `"-"`, which a receiver read as the TAG.
+    /// omits the field (see the file comment).
     hostname: ?[]const u8 = null,
     tag: []const u8 = "",
     pid: ?[]const u8 = null,
@@ -166,7 +165,7 @@ test "RFC 3164 line without a pid" {
 test "day 10 (the space-pad boundary) is NOT space-padded" {
     // The `< 10` vs `<= 10` boundary had no test pinned exactly at day 10 —
     // every other test uses a single-digit day (9). One day later than the
-    // other fixtures (2026-07-10, same time of day) exercises the boundary
+    // other fixtures (same time of day) exercises the boundary
     // directly.
     const msg = Message{
         .facility = .user,
@@ -234,10 +233,9 @@ test "TAG longer than 32 bytes is truncated" {
 }
 
 test "HOSTNAME: sent only when it is one; else omitted (glibc's shape)" {
-    // rsyslogd 8.2512 read each of these first words as the TAG
-    // (`rsyslog_oracle_vectors.zig` before 2026-10-05): the old default "-",
-    // an empty one, a trailing '-', an IPv6 literal, a word ending in ':',
-    // and a hostname that forges TAG and PID.
+    // rsyslogd 8.2512 read each of these first words as the TAG: the old
+    // default "-", an empty one, a trailing '-', an IPv6 literal, a word
+    // ending in ':', and a hostname that forges TAG and PID.
     var buf: [128]u8 = undefined;
     for ([_]?[]const u8{ null, "", "-", "--", "a-", "-a", "2001:db8::1", "::1", "h:", "host:1", "[h]", "evil app[1]:", "a..b", strRepeat("x", 64) }) |h| {
         const msg = Message{ .facility = .local0, .severity = .warning, .timestamp = .{ .unix_ms = 1783600496000 }, .hostname = h, .tag = "app", .pid = "123", .msg = "hello" };
@@ -262,7 +260,7 @@ test "PID: brackets cannot close [PID] early" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

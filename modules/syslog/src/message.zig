@@ -104,9 +104,9 @@ pub const DecomposeError = error{
 pub fn decompose(ts: Timestamp) DecomposeError!CalendarTime {
     // An offset past ±23:59 has no `±HH:MM` form: clamp it BEFORE shifting,
     // so the clock shown and the offset printed still name the caller's
-    // instant. Clamping only the printed suffix (as before 2026-10-05) moved
-    // the instant by the clamped-off minutes -- rsyslogd read 12:34:56Z sent
-    // with offset 1440 as 12:35:56Z (`rsyslog_oracle_test.zig`).
+    // instant. Clamping only the printed suffix moved the instant by the
+    // clamped-off minutes -- rsyslogd read 12:34:56Z sent with offset 1440
+    // as 12:35:56Z (`rsyslog_oracle_test.zig`).
     const offset: ?i16 = if (ts.offset_minutes) |om|
         std.math.clamp(om, -@as(i16, max_offset_minutes), @as(i16, max_offset_minutes))
     else
@@ -496,7 +496,7 @@ test "writeRfc3339 clamps a wild offset_minutes and still names the same instant
 }
 
 test "RFC 5424 edges: the first instant past year 9999, an empty field, a 33-byte SD-NAME" {
-    // Mutation 2026-10-04: three survivors, one assertion each.
+    // Mutation: three survivors, one assertion each.
     // DATE-FULLYEAR is 4DIGIT (RFC 5424 §6.2.3 / RFC 3339): one ms past
     // 9999-12-31T23:59:59.999 has no 4-digit form and is out of range.
     try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = 253402300800_000 }));
@@ -518,10 +518,10 @@ test "bufPrint reports NoSpaceLeft when the buffer is too small" {
 
 test "the calendar: leap days, year boundaries and both ends of the range" {
     // `decompose` is where the RFC 3339 timestamp's date comes from, and until
-    // 2026-08-29 it walked `std.time.epoch`'s year-at-a-time loop. The two
+    // It walked `std.time.epoch`'s year-at-a-time loop. The two
     // implementations agree on ordinary dates and differ where a calendar is
     // easy to get wrong, so those are what is pinned here rather than the
-    // 2026-07-09 instant the formatter tests already use.
+    // Instant the formatter tests already use.
     const cases = [_]struct { ms: i64, want: []const u8 }{
         .{ .ms = 0, .want = "1970-01-01T00:00:00.000Z" },
         .{ .ms = 1709164800_000, .want = "2024-02-29T00:00:00.000Z" }, // leap day
@@ -544,7 +544,7 @@ test "the calendar: leap days, year boundaries and both ends of the range" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

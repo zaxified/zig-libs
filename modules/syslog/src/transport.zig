@@ -56,7 +56,7 @@ fn buildDatagramOf(msg: anytype, scratch: []u8, opts: Options) []const u8 {
     // a message longer than `scratch` comes back exactly `limit` bytes long,
     // so `bytes.len > limit` alone missed it and the datagram went out cut
     // short WITHOUT the marker -- a silent truncation, the one thing the
-    // marker exists to rule out (audit 2026-10-04).
+    // marker exists to rule out.
     const overflowed = if (msg.format(&w)) |_| false else |_| true;
     const bytes = w.buffered();
 
@@ -698,7 +698,7 @@ test "buildDatagram passes a small message through unchanged" {
 test "buildDatagram: a budget shorter than the marker keeps only the marker's head" {
     // The datagram is "truncated to `opts.udp_limit`" (doc) -- even when the
     // marker itself does not fit; it is then cut, never written past the
-    // budget. Mutation 2026-10-04: an unclamped marker survived (it
+    // budget. Mutation: an unclamped marker survived (it
     // underflows `limit - mlen`).
     var scratch: [scratch_len]u8 = undefined;
     const msg = Message{ .msg = strRepeat("A", 100) };
@@ -711,7 +711,7 @@ test "buildDatagram marks a message that overflows the scratch buffer itself" {
     // `opts.trunc_marker` substituted for the overflowing tail". With a
     // budget at or above the scratch size, a message longer than the scratch
     // used to come back exactly `scratch.len` bytes and unmarked, because
-    // only `bytes.len > limit` was checked (audit 2026-10-04).
+    // only `bytes.len > limit` was checked.
     var scratch: [64]u8 = undefined;
     const msg = Message{ .msg = strRepeat("x", 200) };
     const dg = buildDatagram(&msg, &scratch, .{ .udp_limit = 2048 });
@@ -853,7 +853,7 @@ test "real UDP send is not exercised in unit tests" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GY). Findings SL-*, from
-//! the 2026-10-29 no-panic sweep of `syslog`.
+//! the no-panic sweep of `syslog`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -422,7 +422,7 @@ test "TcpEmitter.connect: an IPv6 loopback address connects and carries a frame 
     try testing.expectEqual(@as(u32, 0), st);
 }
 
-// ── wave goal3 (2026-11-02): the new pub inputs ─────────────────────────────
+// ── wave goal3: the new pub inputs ─────────────────────────────
 
 /// Bytes every parser is held to: each byte value alone and after a valid
 /// prefix, cut at every length, and lines of a single repeated byte.
@@ -665,7 +665,7 @@ test "ReconnectingEmitter (TCP loopback): the record after a peer restart arrive
 
 /// Exit 0: a connect that took its whole deadline still leaves the backoff after
 /// it. Measured from the attempt, as it was first, the backoff had passed by the
-/// time the connect failed: every send sat in `connect` again (review 2026-11-02).
+/// time the connect failed: every send sat in `connect` again.
 fn slowConnectBacksOff() u8 {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();

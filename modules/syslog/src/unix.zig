@@ -150,7 +150,7 @@ const FullQueueWait = struct {
 /// may carry any address -- an allocator hands out `maxInt`-aligned
 /// sentinels for `alloc(u8, 0)` -- and Linux checks the address even when the
 /// length is 0: `sendmsg` with such an `iovec` (or `sendto` with such a
-/// buffer) fails `EFAULT`. Found by the journald oracle 2026-10-05: one empty
+/// buffer) fails `EFAULT`. Found by the journald oracle: one empty
 /// field value from an allocator made the whole record fail `WriteFailed`.
 fn kernelPtr(bytes: []const u8) [*]const u8 {
     return if (bytes.len == 0) &newline_byte else bytes.ptr;
@@ -607,7 +607,7 @@ test "a socket path must leave room for the NUL; sendMessage counts its own fiel
     // `sockaddrUnix` doc: the path must fit "with room for the kernel's
     // implicit NUL terminator" -- a path of exactly `sun_path`'s size (108
     // on Linux) does not. `journal.max_fields` bounds MESSAGE plus the
-    // caller's fields. Mutation 2026-10-04: an off-by-one path check and a
+    // caller's fields. Mutation: an off-by-one path check and a
     // missing field-count check in `sendMessage` both survived.
     const sun_len = @typeInfo(@FieldType(linux.sockaddr.un, "path")).array.len;
     try std.testing.expectError(error.PathTooLong, UnixEmitter.open(strRepeat("p", sun_len)));
@@ -937,7 +937,7 @@ test "journal.Emitter.send: with the fallback off, too large is MessageTooLarge"
 test "journal: an empty value from an allocator is sent, not refused EFAULT" {
     // `alloc(u8, 0)` returns a sentinel address the kernel refuses even for
     // a zero-length iovec; `kernelPtr` substitutes a valid one. Before the
-    // fix this send failed `error.WriteFailed` (journald oracle 2026-10-05).
+    // fix this send failed `error.WriteFailed` (journald oracle).
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -998,7 +998,7 @@ test "journald oracle: journal.Emitter and UnixEmitter.sendBsd send the bytes jo
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -187,7 +187,7 @@ test "nowTimestamp returns a plausible post-2020 instant" {
     try std.testing.expect(now.unix_ms > 1_577_836_800_000);
 }
 
-// External anchor (2026-08-01): a real rsyslogd, both transports.
+// External anchor: a real rsyslogd, both transports.
 //
 // This exact message was sent for real — via this module's own `UdpEmitter`
 // and `TcpEmitter`, not hand-crafted bytes — to a real `rsyslogd 8.2512.0`
