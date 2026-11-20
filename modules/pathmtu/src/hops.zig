@@ -546,7 +546,7 @@ test "hopsWith: a clean path claims no uncertainty; unproved hops say so" {
     try testing.expect(!r3.hops[0].proved);
 }
 
-// ── whole-module mutation tests (2026-11-17) ───────────────────────────────
+// ── whole-module mutation tests ───────────────────────────────
 
 /// A scripted path with the knobs a real one has: per-router links, ICMP or
 /// silence above a link, silent routers, probes lost by call number, a local

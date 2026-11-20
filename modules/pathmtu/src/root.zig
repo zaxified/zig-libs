@@ -78,7 +78,7 @@
 //!    always a size this module probed and saw succeed. A kernel PMTUD
 //!    implementation does adopt the router's figure directly; this one does
 //!    not, because ICMP is unauthenticated and a forged hint otherwise names
-//!    the result outright (measured, first audit 2026-09-04).
+//!    the result outright (measured, first audit).
 //!  * `probe` — the live path: opens an `icmp.Socket` (DGRAM if unprivileged
 //!    ping is permitted, RAW otherwise — CAP_NET_RAW), wires it into
 //!    `searchWith` via `Prober`.
@@ -359,7 +359,7 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
 /// .{.iface = "lo"})` reads `mtu = 65535` against `iface_mtu = 65536`.
 /// `IPV6_MTU` has no such cap (the v6 link MTU is a 32-bit field, RFC 8200
 /// jumbograms): on `lo` it reads 65536, so the v6 comparison is uncapped
-/// (2026-11-17; the v4 cap was applied to v6 before and reported a false
+/// (the v4 cap was applied to v6 before and reported a false
 /// exception for `::1`).
 fn cacheIsException(family: icmp.Socket.Family, mtu: u32, im: u32) bool {
     const compare_mtu: u32 = switch (family) {
@@ -423,7 +423,7 @@ pub const SearchError = error{
     /// Previously a bare `std.debug.assert`: compiled out entirely in
     /// ReleaseFast/ReleaseSmall, so a violated precondition made `hi - lo`
     /// underflow on unsigned `u16` arithmetic in the loop below and hang
-    /// rather than panic (found by audit, 2026-08-18; see CHANGELOG.md).
+    /// rather than panic (found by audit; see CHANGELOG.md).
     CeilingTooLow,
 };
 
@@ -449,7 +449,7 @@ fn applyOutcome(size: u16, outcome: ProbeOutcome, lo: *u16, hi: *u16, saw_frag_n
             // `blackhole = false` is "the one direction the spoofed-hint case
             // structurally cannot produce".
             //
-            // Measured at the first audit (2026-09-04) against a prober whose
+            // Measured at the first audit against a prober whose
             // true path MTU is 300, answering the first (ceiling) probe with a
             // forged Fragmentation-Needed: **reported mtu = 1499,
             // blackhole = false, in 2 probes** — any value the attacker names
@@ -678,7 +678,7 @@ fn LiveProberFor(comptime hop_mode: bool) type {
 
         fn attempt(self: *Self, wire_size: u16) Reply {
             // Defense in depth for the exact invariant an audit found broken
-            // (2026-08-18; see CHANGELOG.md): `probe()` refuses any
+            // (see CHANGELOG.md): `probe` refuses any
             // `ceiling_mtu` above `max_probe_mtu` before this prober is ever
             // built (`ProbeError.CeilingTooHigh`), and `searchWith` never
             // probes a size above its own `ceiling` argument, so this can
@@ -735,7 +735,7 @@ fn LiveProberFor(comptime hop_mode: bool) type {
                     // clock — `timeout_ms` bounded how long this attempt sat
                     // IDLE, not how long it could run, and the quantity at risk
                     // is the second one. Measured at the first audit
-                    // (2026-09-04) with a 1 ms budget: **8739 unrelated packets
+                    // with a 1 ms budget: **8739 unrelated packets
                     // absorbed, one deadline check, 18 ms**. Anyone who can put
                     // ICMP on this host's loopback or guess `ident` gets that for
                     // free, and on the RAW lane the kernel delivers every ICMP
@@ -973,12 +973,12 @@ fn isTimeExceeded(family: icmp.Socket.Family, strip_ip_header: bool, packet: []c
 /// The search ceiling, from the two sources that can set it.
 ///
 /// ⚠ Extracted from `probe` so it can be tested **without a socket or any
-/// privilege**, which is the whole point: the 2026-08-18 CRITICAL was an
+/// privilege**, which is the whole point: the CRITICAL was an
 /// over-large ceiling reaching `LiveProber`'s fixed `max_probe_mtu`-byte stack
 /// buffer, and the fix guarded BOTH routes but only ONE was regression-tested.
 /// `Options.ceiling_mtu` is refused above `max_probe_mtu` and has two tests
 /// named for the finding; `Options.iface` -> `SIOCGIFMTU` is CLAMPED here and
-/// had none. Measured at the first audit (2026-09-04): changing this clamp to
+/// had none. Measured at the first audit: changing this clamp to
 /// 65535 left the suite green in Debug, ReleaseSafe **and** ReleaseFast, and
 /// `ifaceMtu("lo")` on an ordinary host is **65536** — so an entirely
 /// legitimate `probe(dest, .{ .iface = "lo" })` reproduced the original defect,
@@ -1016,8 +1016,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
     // module can ever probe is a caller stating an expectation the module
     // cannot meet (see `ProbeError.CeilingTooHigh`'s doc comment). This is
     // the one value on this path that used to flow unchecked into
-    // `LiveProber`'s fixed `max_probe_mtu`-sized stack buffer (audit,
-    // 2026-08-18; see CHANGELOG.md) -- checked here, before anything is
+    // `LiveProber`'s fixed `max_probe_mtu`-sized stack buffer (see CHANGELOG.md) -- checked here, before anything is
     // built from it, so the buffer invariant holds by construction for
     // every caller, not only a polite one.
     if (opts.ceiling_mtu) |c| {
@@ -1049,7 +1048,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         },
         .retries = opts.retries,
         .timeout_ms = opts.timeout_ms,
-        // Off-path-blind-spoofing hardening (audit finding #3, 2026-08-18;
+        // Off-path-blind-spoofing hardening (audit finding #3;
         // see SPEC.md "Threat model" for exactly which attacker this does
         // and does not raise the bar against). Was a fixed 1.
         .seq = randomStartSeq(),
@@ -1204,7 +1203,7 @@ const testing = std.testing;
 
 test "the interface-derived ceiling can never exceed the probe buffer" {
     // TEETH for the SECOND route into `LiveProber`'s fixed 9000-byte stack
-    // buffer. The 2026-08-18 CRITICAL was fixed on both routes and
+    // buffer. The CRITICAL was fixed on both routes and
     // regression-tested on one; measured at the first audit, changing this
     // clamp to 65535 left the suite green in all three modes while
     // `ifaceMtu("lo")` = 65536 on an ordinary host — a legitimate call
@@ -1258,7 +1257,7 @@ test "nudgePayloadLen: family-sized, so the nudge fits an ordinary link's own MT
 }
 
 test "the probe buffer ships zeroed, not as stale stack" {
-    // The other half of the same 2026-08-18 CRITICAL: with `buf` left
+    // The other half of the same CRITICAL: with `buf` left
     // `undefined`, every probe put whatever was on the stack past the 8-byte
     // echo header onto the wire, to a destination the caller merely named.
     // Reverting `@splat(0)` to `undefined` was green in every mode.
@@ -1415,8 +1414,7 @@ const FakeProber = struct {
 };
 
 test "applyOutcome: every guard on the router-supplied hint, and the IPv6 floor" {
-    // TEETH for four mutations that were all green at the first audit
-    // (2026-09-04). RFC 8201 §4 is a MUST — "a node MUST NOT reduce its
+    // TEETH for four mutations that were all green at the first audit. RFC 8201 §4 is a MUST — "a node MUST NOT reduce its
     // estimate of the Path MTU below the IPv6 minimum link MTU" — and RFC
     // 8200 §5 sets that minimum at 1280. Two lines make this module honour
     // it: the constant below, and `applyOutcome`'s `h > lo.*`.
@@ -1626,7 +1624,7 @@ test "searchWith: iface_mtu passes through unchanged" {
     try testing.expectEqual(@as(?u32, 9000), r.iface_mtu);
 }
 
-// -- regression: audit findings, 2026-08-18 -----------------------------------
+// -- regression: audit findings -----------------------------------
 //
 // Three confirmed defects: (1) an unclamped `Options.ceiling_mtu` overran
 // `LiveProber`'s fixed 9000-byte stack buffer -- Debug/ReleaseSafe panicked,
@@ -1714,7 +1712,7 @@ test "regression (finding #3): probe's live path no longer starts seq at the fix
     try testing.expect(seen_distinct);
 }
 
-// -- real-capture goldens (client--router--server veth sandbox, 2026-08-18) --
+// -- real-capture goldens (client--router--server veth sandbox) --
 //
 // See SPEC.md "Anchoring" for the full topology and method. Summary: inside
 // a throwaway, fully unprivileged `unshare --user --net` sandbox, three more
@@ -1801,7 +1799,7 @@ fn fuzzClassify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     // MINIMUM unless that `u64` already lies inside the range — no scaling,
     // no modulo. `Smith.bytes` above has already consumed the whole input, so
     // the `valueRangeAtMost`/`value` calls that used to stand here always
-    // returned 0. Instrumented at the first audit (2026-09-04): **1,000,000
+    // returned 0. Instrumented at the first audit: **1,000,000
     // rounds produced 3,000,000 `classify` calls, every one of them with a
     // zero-length packet, ident 0 and seq 0** — one input, and SPEC cited
     // this test for "malformed/hostile ICMP bytes never panic".
@@ -1822,7 +1820,7 @@ fn classifyAll(packet: []const u8, ident: u16, seq: u16) void {
     }) |c| if (c != null) fuzz_mark(.matched) else fuzz_mark(.rejected);
 }
 
-// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// ── deterministic fuzz driver ───────────────────────────────────
 //
 // `fuzzClassify` is generic over its source of choices
 // (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds it through `FuzzScript`,
@@ -2092,7 +2090,7 @@ test "live: query() against loopback, unprivileged (no CAP_NET_RAW needed)" {
     // `query` is the code under test: making it always return `SocketFailed`
     // turned this test into a SKIP with the whole suite green — a skip is a
     // pass, so the module's only live oracle for `query` could be deleted for
-    // free. Measured at the first audit (2026-09-04), mutation S01. The same
+    // free. Measured at the first audit, mutation S01. The same
     // shape SPEC records having fixed elsewhere, and `diskusage` carried in
     // its `detect()` skip.
     if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
@@ -2562,7 +2560,7 @@ test "live: probeHops over a forced RAW socket reaches loopback (skipped without
     try testing.expect(!r.uncertain and !r.timed_out);
 }
 
-// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+// ── whole-module mutation tests ────────────────────────────────
 
 const lo6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
