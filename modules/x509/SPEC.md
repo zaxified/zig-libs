@@ -18,12 +18,12 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-./README.md "Provenance" + /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's
+"Provenance" section.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked with `rg` over `src/` (`crl`, `policies`, `rfc822`, `inhibit` find no matching or processing code; `crl_sign` is only a parsed keyUsage bit). Competitor feature claims are *(inferred)* from prior knowledge of their public docs; none of their source was read.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked with `rg` over `src/`. Competitor feature claims are *(inferred)* from prior knowledge of their public docs; none of their source was read.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -33,9 +33,86 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.Certificate` | Zig | MIT | — | Zig 0.16.0 | Parse, hostname check, one signature link at a time, `Bundle` root store; no basicConstraints/keyUsage/pathLen/nameConstraints enforcement (ziglang/zig #35877), no RSA-PSS certificates, no ML-DSA/SLH-DSA, unchecked DER reader (this module's `safe.zig` documents the out-of-bounds). |
 | [RustCrypto/formats](https://github.com/RustCrypto/formats) (`x509-cert`) | Rust | Apache-2.0 OR MIT (API field empty; source not read) | 339 | push 2026-09-28 | Certificate/CRL/CSR parse and build types; no path validation *(inferred)*. |
 
-**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints of every RFC type, EKU chaining, policy processing), RSA-PSS certificates, ECDSA P-521 links and CRLs (std names the curve but refuses to verify it; since 2026-10-10 through the in-repo `p521` module), and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds. Against Go: directoryName constraints (Go has none), CRL revocation inside `verifyChain`, post-quantum chains *(inferred: neither Go nor rustls-webpki verifies them)*. **Where we are behind:** no certificate/CSR/CRL construction API (deliberate: this module is the verifier — see Backlog); revocation is CRL-only (delta and indirect CRLs refused; OCSP is the sibling `ocsp` module); one verified path returned, not every one; flat error set without Go's per-certificate detail. Go parity is measured, not claimed: `src/s2_oracle_test.zig` replays 395 Go verdicts (§ "Go Verify parity"), and `tools/interop.zig` judges them again with the Go on PATH, plus 1,544 generated cases (§ "Live Go oracle").
+**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints of every RFC type, EKU chaining, policy processing), RSA-PSS certificates, ECDSA P-521 links and CRLs (std names the curve but refuses to verify it; here through the in-repo `p521` module), and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds. Against Go: directoryName constraints (Go has none), CRL revocation inside `verifyChain`, post-quantum chains *(inferred: neither Go nor rustls-webpki verifies them)*. **Where we are behind:** no certificate/CSR/CRL construction API, one verified path returned (not every one), a flat error set without Go's per-certificate detail (all three deliberate, see *What is deliberately not done*); revocation is CRL-only (delta and indirect CRLs are refused, see *Backlog / deferred*; OCSP is the sibling `ocsp` module). Go parity is measured, not claimed: `src/s2_oracle_test.zig` replays 395 Go verdicts (§ "Go Verify parity"), and `tools/interop.zig` judges them again with the Go on PATH, plus 1,544 generated cases (§ "Live Go oracle").
 
-## ECDSA P-521 (2026-10-10)
+## Design & invariants
+
+**Two-layer module.** `extensions.zig` does purely mechanical,
+bounds-checked DER TLV decoding of the X.509v3 extension fields
+`std.crypto.Certificate.Parsed` does not expose — no policy decisions, no
+cryptography, just "turn these bytes into a typed Zig value." `chain.zig` is the
+RFC 5280 §6 path-validation DECISION layer built on top: given a
+peer-supplied certificate chain and a trust store, decide whether to trust it.
+That decision requires, per RFC 5280 — and `verifyChain` implements all of it:
+
+- Path building (finding a chain of issuer/subject matches from leaf to a
+  trust anchor, potentially among multiple same-subject-DN candidates —
+  RFC 5280 doesn't specify an algorithm for this; RFC 4158 is the closest
+  reference) — `buildPath`, with backtracking over alternate candidates.
+- Per-link cryptographic verification — std's `Parsed.verify` order and
+  errors (`verifyParsed`: issuer name, validity window, std's RSA gates — key DER,
+  exponent ≤ modulus length, signature length, 1024/2048/3072/4096-bit modulus), with
+  PKCS#1 v1.5 through `rsa.VerifyKey` and ECDSA under a P-256 key (any of
+  SHA-224/256/384/512) through `p256.sign.ecdsaVerifyDigest`; P-384 and Ed25519 stay on std;
+  RSASSA-PSS (`verifyPssLink`), ML-DSA (`verifyMlDsaLink`), SLH-DSA
+  (`verifySlhDsaLink`) and P-521 links are this module's own, since std cannot
+  parse or refuses them. One behaviour differs from std on purpose: std accepts an RSA
+  exponent of 1, under which any encoded message is its own signature; `rsa` refuses
+  `e < 3`, so such a link fails with `CertificateSignatureInvalid`. SHA-1 signatures are
+  refused unless `Options.allow_sha1_signatures` (§ "Go Verify parity").
+- basicConstraints/keyUsage enforcement (every non-leaf cert must be a CA
+  with `keyCertSign`) — real values come from `extensions.zig`; the
+  enforcement DECISION is `chain.zig`'s `checkIsCaSigner`. pathLenConstraint
+  parsing refuses a negative INTEGER and a value wider than four octets
+  (`extensions.zig` `parseSmallUint`).
+- pathLenConstraint bookkeeping with the self-issued-certificate exception
+  (RFC 5280 §6.1.4 (l) — the single most commonly-mis-implemented rule in
+  this whole algorithm: self-issued certificates, subject==issuer
+  byte-for-byte, do not count against ANY CA's path-length budget) —
+  `checkPathLength`.
+- Name-constraint matching (§6.1.4 (g), §4.2.1.10) — `names.zig`, one rule
+  per `GeneralName` type (dNSName/rfc822Name/URI host by the shared domain
+  rule, directoryName RDN prefix — both sides as RDN sequences, a `[4] Name`
+  unwrapped; attribute values compared as RFC 5280 §7.1
+  prepared strings (string type, ASCII case and white-space runs do not tell
+  two values apart — OpenSSL's canonical form; no Unicode case folding), an
+  unreadable name or base is `unsupported` and fails closed, iPAddress CIDR) applied to the accumulated
+  permitted/excluded subtrees from every CA in the path, under a comparison
+  budget — `checkNameConstraints`. Excluded subtrees are a union; permitted
+  subtrees INTERSECT (§6.1.4 (g)(1), as Go): each CA's permitted set that
+  restricts a name's type must admit it, its own entries being alternatives,
+  so a sub-CA cannot widen its issuer's constraint. A self-issued intermediate's subject is
+  checked against the name constraints above it (RFC 5280 §6.1.3 (b) exempts it; Go checks it too —
+  stricter, never wider).
+- Extended-key-usage consistency/chaining and the leaf's required-purpose
+  check — `checkExtendedKeyUsage`. An empty extendedKeyUsage grants no purpose (§ "Live Go oracle").
+- Hostname matching — `hostname.zig` (RFC 9525, Go `VerifyHostname`): SAN
+  only, never the commonName; DNS and IP hosts.
+- Certificate policies (§6.1.3 (d)–(f), §6.1.4, §6.1.5) — `policy.zig`, the
+  valid_policy_tree as RFC 9618's graph; `policy.decode`'s duplicate-policy check is
+  linear in the certificate's policy count (a hash set in the check's arena).
+- Extension hygiene — no repeated extension, no critical one this module does
+  not act on (`extensions.checkHygiene`).
+- Readers for consumers that pick a chain by its certificates: `chain.certValidity`,
+  `chain.certAuthorityKeyId`, `names.nameAttribute`. `names.parseIp4`/`parseIp6` are `netaddr`'s functions.
+- `extensions.zig` covers the fields listed in README.md; `authorityKeyIdentifier`'s
+  `[1]`/`[2]` (name+serial) forms are not parsed (`keyIdentifier [0]` covers essentially every CA in practice).
+
+A chain verification is its signatures and nothing else: path building, DER parsing, extension
+walking, name constraints and the safety guard are noise behind them. One `verifyChain` /
+`verifyChainPath` call parses each certificate once (a per-call `Memo` in `chain.zig`).
+
+Every named sub-algorithm in `chain.zig` has a doc comment naming exactly
+which of the above it covers. See `src/root.zig`'s module doc comment for
+the full `std.crypto.Certificate` recon this design decision (build on std,
+don't reparse/reverify) is based on.
+
+**Explicitly out of scope, not silently skipped:** OCSP in the path
+(RFC 6960 — a separate online data-fetching concern; CRL checking is opt-in via
+`Options.revocation`, § "CRL"). A consumer needing it must add it explicitly;
+`verifyChain` must never be mistaken for covering it.
+
+## ECDSA P-521
 
 std's `Certificate` names `secp521r1` but `Parsed.verify` returns
 `CertificateSignatureNamedCurveUnsupported` for it. Every link whose ISSUER
@@ -50,83 +127,14 @@ signature with the `p521` module's strict-DER `fromDer`; any failure is
 issuer's key, and parses a P-521 leaf, so `VerifiedChain.leaf` is set).
 The DER guards are unchanged: every certificate still passes
 `safe.validateForStdParse` in `buildPath` before any of this runs, and the new
-path reads only `parseShape`'s bounded walk. `safe.oid_secp521r1` is added
+path reads only `parseShape`'s bounded walk. `safe.oid_secp521r1` sits
 next to the other named-curve OIDs. Anchors: `p521_test.zig` — a P-521
 hierarchy (root SHA-512, intermediate SHA-384, leaf SHA-256), a P-256 leaf
 under the P-521 CA, a P-521 intermediate under a P-384 root, a P-521 CRL
 (revoked/good/tampered), tamper/expiry/wrong-anchor refusals.
+## Go Verify parity
 
-## Audit 2026-10-26 (A1)
-
-Review: `names.zig` (every matcher, the new RFC 5280 §7.1 directoryName comparison), `hostname.zig`,
-`chain.zig` name-constraint accumulation and `checkOneName`, path building and its budgets, validity,
-SHA-1 refusal, EKU chaining, with `extensions.zig`, `policy.zig` and `crl.zig` read for the mutant
-design. Findings, all fixed with tests:
-
-- **F1 (high, name-constraints bypass by a constrained sub-CA):** directoryName values were compared
-  byte for byte, so case, white space or another directory string type escaped an excluded subtree.
-- **F2 (medium):** an unreadable subject/SAN directoryName counted as outside — an excluded subtree
-  let it through. Now `unsupported`, which fails closed.
-- **F3 (low):** pathLenConstraint parsing read a negative INTEGER as positive and dropped the top
-  octet of a five-octet value.
-
-Noted, kept: a self-issued intermediate's subject is checked against the name constraints above it
-(RFC 5280 §6.1.3 (b) exempts it; Go checks it too — stricter, never wider); an empty
-extendedKeyUsage grants no purpose (§ "Live Go oracle").
-
-Mutation: one ReleaseSafe schemata binary, 95 mutants over `chain.zig` (35), `extensions.zig` (9),
-`policy.zig` (8), `crl.zig` (6), `names.zig` (28), `hostname.zig` (9). First run: 13 survived; 10
-asked for tests (above, all now killed by the test written for them), 3 are equivalent — the AKI/SKI
-candidate filter in `findIssuerAndVerify` for chain and anchor candidates (a candidate it lets
-through still fails its signature check, the verdict is the same) and a `*` label past the first in
-`validHostLabels` (such a name falls back to the exact comparison either way). Score 92/95, 3 eq.
-The instruments were deleted.
-
-Delta audit, same day, over the speed work (the per-call parse `Memo` in `chain.zig`,
-`extensions.extensionId`, and the `montint` R² derivation underneath, whose constants a montint test
-pins to a doubling reference): review plus 12 mutants. Two asked for tests — `VerifiedChain.leaf`
-taken from another path certificate (test "VerifiedChain.leaf is the leaf's own parse") and an
-extnID that is not an OBJECT IDENTIFIER — and two others (a new memo slot not reset) went away with
-the code: the slots now start `null` instead of `undefined`. Equivalent: the memo key's length
-compare (two certificates at one address with different lengths cannot both pass the DER guard)
-and not storing a shape (cost only). Cumulative 100/105, 5 eq. ctgrind re-run for `montint` and
-`rsa` (no context in the new derivation; digests re-pinned).
-
-## Live Go oracle (E1, S1, 2026-10-26)
-
-`tools/interop.zig` (`zig build interop-x509 [-- --seed N] [--write]`, needs `go`, stdlib only,
-GOPROXY=off) drives `tools/go_oracle` — Go `crypto/x509` through its public API; `go.mod` says
-`go 1.26`, so Go 1.26's GODEBUG defaults apply — and compares every verdict with `verifyChain` /
-`hostname.verify` under the options Go's call maps to (as in `s2_oracle_test.zig`). Cases:
-
-- **corpus** — the 395 records of `src/data/s2/corpus.bin`, judged again: a live verdict that
-  differs from the frozen one is a failure (the corpus went stale).
-- **generated** — certificates written by the program (own DER writer, P-256 keys from fixed
-  seeds, deterministic signatures): `dirname` (18 fixed rows), `eku-empty` (8), `validity` (one
-  second either side of every notBefore/notAfter on the chain, 18), and three PRNG families —
-  `name-constraints` (600: dNSName/rfc822Name/URI/iPAddress subtrees, permitted and excluded,
-  against 1–3 SANs of every type), `hostname` (600: wildcard, IP, case, trailing-dot and malformed
-  SANs, through `VerifyHostname` and through `Verify` with `DNSName`), `eku-pathlen` (300: EKU on
-  intermediate and leaf, pathLen on root and intermediates, one or two intermediates, the caller's
-  usages).
-
-Each row expects `agree`, `stricter` (Go accepts, we refuse, on the RFC rule printed with it) or
-`processes` (Go refuses a critical extension as unhandled, we process it); any other outcome fails
-the run. Run 2026-10-26 against go1.26.8, seeds 0x580920261026, 1, 2, 7, 9: 1,939 cases each,
-0 surprises, 17 expected leads (the 2 `*.com` corpus rows of § "Go Verify parity" + 15 generated).
-`--write` freezes the 15 generated lead rows into `src/data/s2/leads.bin` (corpus format v3: an
-expectation byte after `go_ok`; the fixed families are built before the seeded ones, so the file is
-the same for every seed), replayed without Go by the `lead:` test in `s2_oracle_test.zig`.
-
-Found by the first run (no code change): an empty extendedKeyUsage. RFC 5280 §4.2.1.12 makes it
-malformed (`SIZE (1..MAX)`); this module reads it as granting no usage, so with any usage asked
-for other than `any` the chain fails `ExtendedKeyUsageMismatch`; Go reads it as no restriction.
-Kept, as a `stricter` row. With no usage asked (`usages_any_of` empty, no `required_eku`) there is
-no EKU check and the empty extension passes, as every other EKU does.
-
-## Go Verify parity (S2, 2026-10-11)
-
-Survey 2026-10-11 (plan R0–R7); behaviour pinned by probes, not by
+Behaviour pinned by probes against Go 1.26 and the OpenSSL 3.5 CLI, not by
 reading Go's source (BSD-3; public API and `go doc` only). **Oracle:** `tools/go_oracle` (Go 1.26
 `x509.ParseCertificate` + `Verify`/`VerifyHostname` through the public API) and the OpenSSL 3.5 CLI,
 both driven by `tools/gen_names_fixtures.py`, which writes the committed corpus `src/data/s2/corpus.bin`
@@ -134,7 +142,7 @@ both driven by `tools/gen_names_fixtures.py`, which writes the committed corpus 
 `hostname.verify` and must agree with Go, except the cases listed in its `deliberate` table, which
 must disagree (so the table cannot go stale).
 
-What changed, each against Go's verdict:
+Behaviour, each against Go's verdict:
 
 - **Name constraints (`names.zig`):** rfc822Name and URI are matched; dNSName, mailbox domain and URI
   host share Go's domain rule (`example.com` = itself and subdomains, `.example.com` = subdomains
@@ -169,67 +177,35 @@ label after `*`) never match — Go matches `*.com` against `example.com`, OpenS
 EKU check is none (`usages_any_of` empty and `required_eku` null), where Go's default is serverAuth:
 this module serves OPC-UA / IEC 62351 leaves too; the replay test passes Go's default explicitly.
 
-## Design & invariants
+## Live Go oracle
 
-**Two-layer module.** `extensions.zig` (real, tested) does purely mechanical,
-bounds-checked DER TLV decoding of the X.509v3 extension fields
-`std.crypto.Certificate.Parsed` does not expose — no policy decisions, no
-cryptography, just "turn these bytes into a typed Zig value." `chain.zig`
-(API and algorithm both real, **DONE** — see "Status" below) is the RFC
-5280 §6 path-validation DECISION layer built on top: given a peer-supplied
-certificate chain and a trust store, decide whether to trust it. That
-decision requires, per RFC 5280 — and `verifyChain` implements all of it:
+`tools/interop.zig` (`zig build interop-x509 [-- --seed N] [--write]`, needs `go`, stdlib only,
+GOPROXY=off) drives `tools/go_oracle` — Go `crypto/x509` through its public API; `go.mod` says
+`go 1.26`, so Go 1.26's GODEBUG defaults apply — and compares every verdict with `verifyChain` /
+`hostname.verify` under the options Go's call maps to (as in `s2_oracle_test.zig`). Cases:
 
-- Path building (finding a chain of issuer/subject matches from leaf to a
-  trust anchor, potentially among multiple same-subject-DN candidates —
-  RFC 5280 doesn't specify an algorithm for this; RFC 4158 is the closest
-  reference) — `buildPath`, with backtracking over alternate candidates.
-- Per-link cryptographic verification — std's `Parsed.verify` order and
-  errors (`verifyParsed`), with PKCS#1 v1.5 through `rsa.VerifyKey` and
-  P-256 ECDSA through `p256` (§ Performance); P-384 and Ed25519 stay on std;
-  RSASSA-PSS (`verifyPssLink`), ML-DSA, SLH-DSA and P-521 links are this
-  module's own, since std cannot parse or refuses them. SHA-1 signatures are
-  refused unless `Options.allow_sha1_signatures` (§ "Go Verify parity").
-- basicConstraints/keyUsage enforcement (every non-leaf cert must be a CA
-  with `keyCertSign`) — real values come from `extensions.zig`; the
-  enforcement DECISION is `chain.zig`'s `checkIsCaSigner`.
-- pathLenConstraint bookkeeping with the self-issued-certificate exception
-  (RFC 5280 §6.1.4 (l) — the single most commonly-mis-implemented rule in
-  this whole algorithm: self-issued certificates, subject==issuer
-  byte-for-byte, do not count against ANY CA's path-length budget) —
-  `checkPathLength`.
-- Name-constraint matching (§6.1.4 (g), §4.2.1.10) — `names.zig`, one rule
-  per `GeneralName` type (dNSName/rfc822Name/URI host by the shared domain
-  rule, directoryName RDN prefix — both sides as RDN sequences, a `[4] Name`
-  unwrapped, since 2026-10-19; attribute values compared as RFC 5280 §7.1
-  prepared strings (string type, ASCII case and white-space runs do not tell
-  two values apart — OpenSSL's canonical form; no Unicode case folding), an
-  unreadable name or base `unsupported`, since 2026-10-26 —, iPAddress CIDR) applied to the accumulated
-  permitted/excluded subtrees from every CA in the path, under a comparison
-  budget — `checkNameConstraints`. Excluded subtrees are a union; permitted
-  subtrees INTERSECT (§6.1.4 (g)(1), as Go): each CA's permitted set that
-  restricts a name's type must admit it, its own entries being alternatives
-  (until 2026-10-19 all CAs' permitted entries were one union — a sub-CA could
-  widen its issuer's constraint).
-- Extended-key-usage consistency/chaining and the leaf's required-purpose
-  check — `checkExtendedKeyUsage`.
-- Hostname matching — `hostname.zig` (RFC 9525, Go `VerifyHostname`): SAN
-  only, never the commonName; DNS and IP hosts. Until 2026-10-11 this was
-  std's `verifyHostName`, which falls back to the CN and cannot match an IP.
-- Certificate policies (§6.1.3 (d)–(f), §6.1.4, §6.1.5) — `policy.zig`, the
-  valid_policy_tree as RFC 9618's graph.
-- Extension hygiene — no repeated extension, no critical one this module does
-  not act on (`extensions.checkHygiene`).
+- **corpus** — the 395 records of `src/data/s2/corpus.bin`, judged again: a live verdict that
+  differs from the frozen one is a failure (the corpus went stale).
+- **generated** — certificates written by the program (own DER writer, P-256 keys from fixed
+  seeds, deterministic signatures): `dirname` (18 fixed rows), `eku-empty` (8), `validity` (one
+  second either side of every notBefore/notAfter on the chain, 18), and three PRNG families —
+  `name-constraints` (600: dNSName/rfc822Name/URI/iPAddress subtrees, permitted and excluded,
+  against 1–3 SANs of every type), `hostname` (600: wildcard, IP, case, trailing-dot and malformed
+  SANs, through `VerifyHostname` and through `Verify` with `DNSName`), `eku-pathlen` (300: EKU on
+  intermediate and leaf, pathLen on root and intermediates, one or two intermediates, the caller's
+  usages).
 
-Every named sub-algorithm in `chain.zig` has a doc comment naming exactly
-which of the above it covers. See `src/root.zig`'s module doc comment for
-the full `std.crypto.Certificate` recon this design decision (build on std,
-don't reparse/reverify) is based on.
+Each row expects `agree`, `stricter` (Go accepts, we refuse, on the RFC rule printed with it) or
+`processes` (Go refuses a critical extension as unhandled, we process it); any other outcome fails
+the run. `--write` freezes the generated lead rows into `src/data/s2/leads.bin` (corpus format v3: an
+expectation byte after `go_ok`; the fixed families are built before the seeded ones, so the file is
+the same for every seed), replayed without Go by the `lead:` test in `s2_oracle_test.zig`.
 
-**Explicitly out of scope, not silently skipped:** OCSP in the path
-(RFC 6960 — a separate online data-fetching concern; CRL checking is opt-in via
-`Options.revocation`, § "CRL"). A consumer needing it must add it explicitly;
-`verifyChain` must never be mistaken for covering it.
+An empty extendedKeyUsage: RFC 5280 §4.2.1.12 makes it
+malformed (`SIZE (1..MAX)`); this module reads it as granting no usage, so with any usage asked
+for other than `any` the chain fails `ExtendedKeyUsageMismatch`; Go reads it as no restriction.
+Kept, as a `stricter` row. With no usage asked (`usages_any_of` empty, no `required_eku`) there is
+no EKU check and the empty extension passes, as every other EKU does.
 
 ## `safe.zig` — the shared certificate-DER safety guard
 
@@ -238,7 +214,7 @@ against its own unchecked DER reader, consolidating three previously
 independent copies (`x509`'s per-element `extensions.parseElement`, which
 stays for the per-field walks that need it; `iec62351`'s
 `tlsprofile.structurallySafe`; and `opcua`'s `security.safeCertificate`).
-Both `iec62351` and `opcua` now route through it.
+Both `iec62351` and `opcua` route through it.
 
 **The hazard.** `std.crypto.Certificate.der.Element.parse` reads its
 identifier/length octets with plain `bytes[i]` indexing and computes an
@@ -333,13 +309,8 @@ values, explicit shapes with too-few TBS fields / a non-SEQUENCE SPKI / a
 non-zero unused-bit count, and a `std.testing.fuzz` walk feeding arbitrary
 bytes into `spkiOf` and on into `rsa.PublicKey.fromDer` / `fromSec1`.
 
-**Why well-formedness is not enough — corrected 2026-09-01.** This section
-used to argue that a validated, zero-padded copy made `parse` total, on the
-grounds that "every loop std runs is bounded by an element end the validator
-already proved in-bounds, so a bounded number of probes cannot walk through 64
-zero bytes". **That argument is unsound and the guard it justified did not
-hold.** It reasons only about std probing for an OPTIONAL sibling at a
-boundary. The real hazard is different in kind:
+**Why well-formedness is not enough.** A validated, zero-padded copy does not make `parse` total. The
+hazard is not std probing for an OPTIONAL sibling at a boundary, which bounded padding covers; it is different in kind:
 
 `walk` descends into **constructed** elements. `Certificate.parse` descends
 into an element's content by **field position**, whatever the constructed bit
@@ -370,14 +341,18 @@ returns `start + 1` regardless, so `03 00` yields a slice whose start is one
 past its end — and here the padding actively *hid* the bug, satisfying the
 unguarded read so that the corruption surfaced downstream (a 4 GB
 `Parsed.signature()` in ReleaseFast) instead of aborting loudly. X.690 §8.6.2.3
-requires that octet to be present, so `walk` now rejects the encoding outright.
-The same missing precondition was live in `chain.zig`'s `parseShape`, which
-does not use this guard at all; it has its own `parseBitStringSafe` now.
+requires that octet to be present, so `walk` rejects the encoding outright.
+The same missing precondition applies to `chain.zig`'s `parseShape`, which
+does not use this guard at all; it has its own `parseBitStringSafe`.
 
-The zero-padded copy is still kept, for what it actually does: `30 02 30 00`
-used to be caught by the padding and is now refused by
-`requireStdDescentPoints` before std runs, but the boundary-probe case the
-padding covers is real and cheap to keep.
+
+`requireStdDescentPoints` also requires the trailing signatureValue BIT STRING (RFC 5280 §4.1): std reads its header at the
+end of `signatureAlgorithm`, so a certificate without it was well-formed DER yet made std read at the buffer's end
+(`safe.zig:364`, test "a certificate without its signatureValue is refused"). With that, every probe std makes lands inside
+the buffer, `verifyChain` needs no padded copy and its API takes the caller's slice as is; the zero-padded copy stays in
+`safeCertificate` as defence in depth for the boundary-probe case (`30 02 30 00` is refused by
+`requireStdDescentPoints` before std runs).
+
 
 ⚠ `requireStdDescentPoints` mirrors `std.crypto.Certificate.parse` as of Zig
 0.16 (re-read on 0.17.0: `der.Element.parse` unchanged), which is a coupling. The alternative is to stop offering a guarded
@@ -388,48 +363,53 @@ coverage — every-prefix and every-single-byte-mutation sweeps of a real
 fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, and
 a regression test pinned to the reproduced std hazard.
 
-## Performance — signatures through `p256` and `rsa.VerifyKey` (2026-10-11)
+## CRL (`crl.zig`)
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-x509`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 8.4 %): ref 0.68–0.77× Go 1.26.8 crypto/x509, against 0.85–0.95× (Go 1.26.0) on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement. The host's Go moved from 1.26.0 to 1.26.8 in between.
-
-**A chain verification is its signatures and nothing else** (measured 2026-09-08 and again by
-profile 2026-10-11): path building, DER parsing, extension walking, name constraints and the
-safety guard (`safeCertificate`, 334 ns) are noise behind them.
-
-`bench-x509` (`tools/bench.zig`) against Go 1.26.0 `crypto/x509`, TLS-client shape: leaf +
-intermediate verified to a root, host name and serverAuth EKU checked; ours also re-parses the
-trust anchor each call (its API takes DER), which favours Go.
-
-| workload | before (2026-10-10) | after, run 1 / run 2 (2026-10-11) |
-|---|---:|---:|
-| `verify_ecdsa256` (P-256 throughout) | 7.31× | **0.94× / 0.92×** |
-| `verify_rsa2048` (RSA-2048 PKCS#1 v1.5) | 6.68× | **0.85× / 0.81×** |
-| `verify_mixed` (P-256 leaf under RSA CAs) | 6.43× | **0.85× / 0.81×** |
-
-Run 2 is the card's (`BENCH_ROUNDS=5`, largest spread 4.7 %; run 1: 3 rounds, one 12 % spread).
-
-After the Go-parity work (policy processing, extension hygiene, own hostname check on every call),
-same bench, `BENCH_ROUNDS=5`: ecdsa256 0.95×, rsa2048 0.87×, mixed 0.85× (largest spread 5.7 %, run
-next to other test jobs) — now the card's numbers; the new passes cost a few µs against ~90 µs of
-signatures.
-
-Before, every link went to `std.crypto.Certificate.Parsed.verify`: P-256 through std's
-portable `pcurves` (~0.7 ms per signature) and RSA through `Certificate.rsa`, which builds a
-`std.crypto.ff.Modulus` per call. `verifyParsed` now does what `Parsed.verify` does, in the same
-order and with the same errors — issuer name, validity window, std's RSA gates (key DER,
-exponent ≤ modulus length, signature length, 1024/2048/3072/4096-bit modulus) — and hands the
-mathematics of the two common cases to this repository: PKCS#1 v1.5 to `rsa.VerifyKey`, ECDSA
-under a P-256 key (any of SHA-224/256/384/512) to `p256.sign.ecdsaVerifyDigest`. P-384 and
-Ed25519 stay on std; PSS, P-521, ML-DSA and SLH-DSA were already this module's own.
-
-This retires the 2026-09-08 decision to leave PKCS#1 v1.5 on std. It held while a cold
-`rsa.PublicKey.fromDer` cost 453 µs; the cost was two constant derivations the verify never
-needed — `ff.Modulus.fromBytes`'s own constants (skipped by `VerifyKey`) and `R mod m` by 64·L
-doublings from 1 (montint now starts at `2^(bits−1)`, one doubling for a full-width modulus).
-
-One behaviour differs from std on purpose: std accepts an RSA exponent of 1, under which any
-encoded message is its own signature; `rsa` refuses `e < 3`, so such a link now fails with
-`CertificateSignatureInvalid`.
+- **One signature core for certificates and CRLs.** A CRL has the certificate's outer shape
+  (`SEQUENCE { tbs, signatureAlgorithm, signatureValue }`), so `chain.verifySignedBy` verifies
+  it with the same dispatch as a chain link: ML-DSA and SLH-DSA (parameter set must equal the
+  issuer key's), RSASSA-PSS through `rsa.verifyPss`, everything else through std's
+  `Certificate.Parsed.verify` on a `Parsed` view carrying only what that function reads from
+  its subject (issuer name, algorithm, message, signature; validity made unbounded — a CRL's
+  window is thisUpdate/nextUpdate, checked by `crl.zig`). The issuer name must equal the
+  issuer certificate's subject on every path.
+- **Order of checks in `checkRevocation`:** parse (structure, v2, inner = outer algorithm
+  byte for byte, every entry and extension walked, unknown critical → error), delta refused,
+  certificate issuer = CRL issuer, `keyUsage.cRLSign`, AKI = SKI, signature, freshness, scope,
+  then the serial lookup. Serials compare by value (redundant leading zero octets ignored).
+- **Scope (§6.3.3 (b)(2), §5.2.5):** an IDP `fullName` must intersect (GeneralName byte
+  equality) a `fullName` in the certificate's own CRL distribution points; a certificate with
+  none is out of scope. `onlyContainsUserCerts` / `onlyContainsCACerts` against the
+  certificate's `basicConstraints.cA`. `onlySomeReasons`, `onlyContainsAttributeCerts` and a
+  `nameRelativeToCRLIssuer` distribution point are refused (`CrlScopeUnsupported`), as are
+  `indirectCRL` and the `certificateIssuer` entry extension, critical or not
+  (`IndirectCrlUnsupported`): a CRL that covers only part of the ground cannot prove "good".
+- **`certificateHold`** is reported as revoked with its reason; the caller decides whether a
+  hold rejects.
+- **Wired into `verifyChain` (opt-in `Options.revocation: ?Revocation`).** The
+  check is per link inside `acceptCandidate`, right after `verifyLink` + `checkIsCaSigner`:
+  the link's subject certificate is checked with its issuer certificate as the CRL issuer.
+  A revoked intermediate therefore fails that candidate and the existing backtracking tries
+  another same-subject candidate (cross-signed / re-issued CA); with a single candidate the
+  specific `CertificateRevoked` / `RevocationStatusUnknown` reaches the caller, with several
+  all failing it is `NoTrustedPath`, as for any other per-link failure. Trust anchors are never
+  checked (RFC 5280 §6.1: trusted inputs; a chain that carries its anchor still works).
+  `scope = .full_chain` (default) checks every non-anchor certificate, `.leaf_only` only the
+  leaf's link. Verdict for one certificate: every CRL in `crls` is tried; `.revoked` from any
+  one is `CertificateRevoked` (`certificateHold` included — the chain API has no "hold is
+  fine" mode; use `crl.checkRevocation` for that); else any `.good` is a verdict; a CRL that is
+  not about the certificate (`CrlIssuerMismatch`, `CrlKeyIdentifierMismatch`,
+  `CrlScopeMismatch`) or cannot vouch for it (expired, not yet valid, bad signature,
+  malformed, delta / indirect / reason-limited, no `cRLSign`, …) is skipped — a broken CRL
+  never yields "good". No verdict at all: `unknown = .reject` (default, fail closed) gives
+  `RevocationStatusUnknown`, `.allow` accepts. `revocation = null` (default) does no revocation check. The revocation errors are in `chain.VerifyChainError` (and so,
+  formally, in `crl.CheckError`, which includes that set; `crl.checkRevocation` never returns them). Tests: `chain_crl_test.zig`; three-level
+  fixtures `data/crl/chain_*` from `tools/gen_crl_chain_fixtures.py` (oracle: `openssl verify
+  -crl_check_all` / `-crl_check`, 10 cases; OpenSSL does not backtrack, so those cases are
+  asked one intermediate at a time).
+- **Oracle:** `tools/gen_crl_fixtures.py` builds the fixtures with Python `cryptography` and
+  OpenSSL 3.5 (ML-DSA-44), and aborts unless `openssl verify -crl_check` gives the same
+  good / revoked / out-of-scope verdict as the Zig tests expect.
 
 ## Threat model / out of scope
 
@@ -441,8 +421,7 @@ std primitive alone does *not* validate that a TLV's encoded length fits
 within the buffer, so a single malformed length field, read through a
 direct slice index rather than another `parse` call, could otherwise abort
 the process instead of surfacing `error.CertificateFieldHasInvalidLength`
-(found and fixed during development — a hand-built `nameConstraints` test
-fixture with a truncated `GeneralSubtree` triggered exactly this). The one
+(a hand-built `nameConstraints` test fixture with a truncated `GeneralSubtree` pins this). The one
 hand-rolled bit-index arithmetic (`parseKeyUsage`'s `bitAt`) is exercised
 against both a real generated fixture (CA vs. leaf, via
 `rsa.selfSignedCert`) and boundary reasoning in its own doc comment.
@@ -465,17 +444,13 @@ against both a real generated fixture (CA vs. leaf, via
   surfacing as a key-length error), rejects a public key or signature whose
   length is not the one that parameter set fixes, and verifies pure ML-DSA
   with an empty context string per RFC 9881 §4. Each of those four is checked
-  by a test that goes red when the check alone is removed. Two of those four
-  (the key-length and signature-length comparisons) were **not** pinned until
-  the 2026-09-01 audit added the tests; the claim is now true for the pair of
-  them the fixture corpus can express — the ML-DSA signature-length check is
-  reachable only through DER surgery, because an ML-DSA key length uniquely
-  determines its parameter set, so the SLH-DSA pair carries that shape instead
-  (SHA2-128s and SHA2-128f share a key length and differ only in signature
-  size).
+  by a test that goes red when the check alone is removed. The ML-DSA
+  signature-length check is reachable only through DER surgery, because an
+  ML-DSA key length uniquely determines its parameter set, so the SLH-DSA pair
+  carries that shape instead (SHA2-128s and SHA2-128f share a key length and
+  differ only in signature size).
 - The SLH-DSA path (`verifySlhDsaLink`) is the same shape over twelve
-  parameter sets — including the validity window, which for a while the code
-  checked and no test pinned, while this sentence implied otherwise. The parameter-set check matters MORE there than for ML-DSA,
+  parameter sets, validity window included. The parameter-set check matters MORE there than for ML-DSA,
   not less: `s` and `f` differ only in signature size and share a public-key
   length, and the two hash families at the same category share BOTH lengths —
   so for SHA2-128s against SHAKE-128s the set comparison is the only thing
@@ -502,15 +477,13 @@ A name or constraint a matching rule cannot read (malformed domain, a URI
 without a host or with an IP host, a mailbox that does not parse) and the
 four `GeneralName` types RFC 5280 gives no rule for (otherName, x400Address,
 ediPartyName, registeredID) fail **closed** on both sides: a false reject,
-never a bypass. Until 2026-10-11 rfc822Name and URI were in that set too, and
-a leading-dot or empty dNSName base matched nothing — as an excluded subtree a
-bypass (fixed, `89d5cc8c`).
+never a bypass.
 
 Attacker-controlled cost: N SAN entries × M accumulated subtrees is capped by
 `Options.max_constraint_comparisons` (250 000, `TooManyConstraints`), the
 policy graph by `policy.Options.max_graph_edges` (100 000,
-`PolicyGraphTooLarge`); the duplicate-extension scan is quadratic in the
-extension count of one certificate (≤ 64 KiB). Path building verifies at most
+`PolicyGraphTooLarge`) and its work by `policy.Options.max_steps`; the duplicate-extension scan is
+capped at `extensions.max_extensions` (128) and is quadratic in the extension count of one certificate (≤ 64 KiB). Path building verifies at most
 100 link signatures per `verifyChain`/`verifyChainPath` call
 (`chain.max_signature_checks`, private; Go's `maxChainSignatureChecks`):
 the depth-first search backtracks over every same-subject candidate, and a
@@ -518,32 +491,21 @@ peer-made chain of n CAs sharing one DN and one key (no AKI/SKI, nothing
 trusted needed) cost about e·n! verifications before the bound (leaf + 8:
 ~10^5 per call). Past it the candidate fails with `ChainTooLong`
 (`NoTrustedPath` when several candidates failed). Real chains need one check
-per link plus one per rejected same-DN candidate (audit 2026-10-19).
+per link plus one per rejected same-DN candidate. Trust anchors and `verifySignedBy`'s issuer
+pass `validateForStdParse` before std's parser reads them; buffers over 4 GiB are refused before std's
+u32 offsets.
 
-## Status
+## Verification
 
-`extensions.zig`: DONE for the fields listed in README.md; `authorityKeyIdentifier`'s
-`[1]`/`[2]` (name+serial) forms intentionally not parsed (add only if a
-consumer needs them — `keyIdentifier [0]` covers essentially every CA in
-practice). `chain.zig`: **DONE** — `verifyChain` plus the five named
-sub-algorithms (`buildPath`, `checkNameConstraints`, `checkPathLength`,
-`checkExtendedKeyUsage`, `verifyPssLink`) are implemented and covered by
-`chain_test.zig` (`zig build test-x509`, green in Debug and
-ReleaseFast), including an openssl-3.5-generated oracle chain per supported
-signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
-ECDSA P-521 (ecdsa-with-SHA256/384/512, `p521_test.zig`, fixtures from
-`tools/gen_p521_fixtures.py` with `openssl verify` agreeing on every verdict),
-Ed25519, ML-DSA-44/65/87, SLH-DSA in both hash families) and dedicated rejection-case hierarchies (expired/not-yet-valid,
-name-constraint violation, non-CA issuer, pathLenConstraint exceeded,
-self-issued not counted, tampered signature, EKU mismatch, unknown anchor).
-
-`safe.zig`: **DONE** — `validate`/`validateCertificate`/`safeCertificate`
-plus the union test suite described under "the shared certificate-DER safety
-guard" above (`zig build test-x509`, green in Debug and ReleaseFast).
-
-Not implemented, and not silently skipped (see "Explicitly out of scope"
-above): OCSP revocation checking. Name-constraint types without an RFC
-matching rule fail closed (§ Threat model).
+- **Run:** `scripts/modtest x509`; `zig build interop-x509 [-- --seed N] [--write]` runs the live Go oracle (needs `go`, stdlib only); the benches are `zig build bench-x509` (`tools/bench.zig`, with the `tools/go_bench`, `tools/c_bench` and `tools/rust_fast_bench` foreign sides).
+- **Chains:** `chain_test.zig` over an OpenSSL 3.5-generated hierarchy per supported signature algorithm (RSA PKCS#1 v1.5, RSASSA-PSS, ECDSA P-256, P-384 and P-521 (`p521_test.zig`, fixtures from `tools/gen_p521_fixtures.py`, `openssl verify` agreeing on every verdict), Ed25519, ML-DSA-44/65/87, SLH-DSA in both hash families, plus one self-signed certificate per SLH-DSA parameter set) and dedicated rejection hierarchies (expired / not-yet-valid, name-constraint violation, non-CA issuer, pathLenConstraint exceeded, self-issued not counted, tampered signature, EKU mismatch, unknown anchor).
+- **Go parity:** `s2_oracle_test.zig` replays the committed Go corpus and `src/data/s2/leads.bin`; `tools/interop.zig` judges the corpus again with the Go on PATH plus generated families (name constraints, hostnames, validity boundaries, EKU/pathLen, directoryName, empty EKU) (§ "Live Go oracle").
+- **Extensions, names, policy, readers:** `extensions.zig` against real certificates from `rsa.selfSignedCert` and hand-built DER fixtures for shapes that generator does not emit; `readers_test.zig`; `names` and hostname fixtures from `tools/gen_names_fixtures.py`; `certgen_test.zig`, `fixtures_test.zig`.
+- **CRL:** `crl_test.zig` and `chain_crl_test.zig` over fixtures from `tools/gen_crl_fixtures.py` and `tools/gen_crl_chain_fixtures.py`, whose verdicts the generators check against `openssl verify -crl_check` / `-crl_check_all` (OpenSSL does not backtrack, so the chain cases are asked one intermediate at a time).
+- **`safe.zig` and `spkiOf`:** the union of the three former guards' tests — every-prefix and every-single-byte-mutation sweeps of a real fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, regression tests pinned to the reproduced std hazards — plus the std field-walk cross-check of `spkiOf` (§ "`spkiOf`").
+- **Fuzz:** deterministic driver `X509_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), harnesses in `fuzz_test.zig`, `x509-names` (`names_fuzz_test.zig`) and `x509-policy` (`policy_fuzz_test.zig`, which compares the policy graph with a literal transcription of the RFC 5280 tree, RFC 9618 §4: same verdicts).
+- **Mutation:** operator-generated schemata over `chain.zig`, `extensions.zig`, `policy.zig`, `crl.zig`, `names.zig` and `hostname.zig`, ReleaseSafe, strict verdict. Equivalent classes: the AKI/SKI candidate filter in `findIssuerAndVerify` (a candidate it lets through still fails its signature check), a `*` label past the first in `validHostLabels` (falls back to the exact comparison either way), the parse memo's key length compare (two certificates at one address with different lengths cannot both pass the DER guard) and not storing a shape (cost only).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -554,105 +516,33 @@ matching rule fail closed (§ Threat model).
 
 **What the tests actually contain.** chains generated by real OpenSSL 3.5, cross-checked with openssl verify
 
-## CRL (`crl.zig`, 2026-09-30)
+## Performance
 
-- **One signature core for certificates and CRLs.** A CRL has the certificate's outer shape
-  (`SEQUENCE { tbs, signatureAlgorithm, signatureValue }`), so `chain.verifySignedBy` verifies
-  it with the same dispatch as a chain link: ML-DSA and SLH-DSA (parameter set must equal the
-  issuer key's), RSASSA-PSS through `rsa.verifyPss`, everything else through std's
-  `Certificate.Parsed.verify` on a `Parsed` view carrying only what that function reads from
-  its subject (issuer name, algorithm, message, signature; validity made unbounded — a CRL's
-  window is thisUpdate/nextUpdate, checked by `crl.zig`). The issuer name must equal the
-  issuer certificate's subject on every path.
-- **Order of checks in `checkRevocation`:** parse (structure, v2, inner = outer algorithm
-  byte for byte, every entry and extension walked, unknown critical → error), delta refused,
-  certificate issuer = CRL issuer, `keyUsage.cRLSign`, AKI = SKI, signature, freshness, scope,
-  then the serial lookup. Serials compare by value (redundant leading zero octets ignored).
-- **Scope (§6.3.3 (b)(2), §5.2.5):** an IDP `fullName` must intersect (GeneralName byte
-  equality) a `fullName` in the certificate's own CRL distribution points; a certificate with
-  none is out of scope. `onlyContainsUserCerts` / `onlyContainsCACerts` against the
-  certificate's `basicConstraints.cA`. `onlySomeReasons`, `onlyContainsAttributeCerts` and a
-  `nameRelativeToCRLIssuer` distribution point are refused (`CrlScopeUnsupported`), as are
-  `indirectCRL` and the `certificateIssuer` entry extension, critical or not
-  (`IndirectCrlUnsupported`): a CRL that covers only part of the ground cannot prove "good".
-- **`certificateHold`** is reported as revoked with its reason; the caller decides whether a
-  hold rejects.
-- **Wired into `verifyChain` (2026-09-30, opt-in `Options.revocation: ?Revocation`).** The
-  check is per link inside `acceptCandidate`, right after `verifyLink` + `checkIsCaSigner`:
-  the link's subject certificate is checked with its issuer certificate as the CRL issuer.
-  A revoked intermediate therefore fails that candidate and the existing backtracking tries
-  another same-subject candidate (cross-signed / re-issued CA); with a single candidate the
-  specific `CertificateRevoked` / `RevocationStatusUnknown` reaches the caller, with several
-  all failing it is `NoTrustedPath`, as for any other per-link failure. Trust anchors are never
-  checked (RFC 5280 §6.1: trusted inputs; a chain that carries its anchor still works).
-  `scope = .full_chain` (default) checks every non-anchor certificate, `.leaf_only` only the
-  leaf's link. Verdict for one certificate: every CRL in `crls` is tried; `.revoked` from any
-  one is `CertificateRevoked` (`certificateHold` included — the chain API has no "hold is
-  fine" mode; use `crl.checkRevocation` for that); else any `.good` is a verdict; a CRL that is
-  not about the certificate (`CrlIssuerMismatch`, `CrlKeyIdentifierMismatch`,
-  `CrlScopeMismatch`) or cannot vouch for it (expired, not yet valid, bad signature,
-  malformed, delta / indirect / reason-limited, no `cRLSign`, …) is skipped — a broken CRL
-  never yields "good". No verdict at all: `unknown = .reject` (default, fail closed) gives
-  `RevocationStatusUnknown`, `.allow` accepts. `revocation = null` (default) is the old
-  behaviour, byte for byte. The new errors are in `chain.VerifyChainError` (and so,
-  formally, in `crl.CheckError`, which includes that set; `crl.checkRevocation` never returns them). Tests: `chain_crl_test.zig`; three-level
-  fixtures `data/crl/chain_*` from `tools/gen_crl_chain_fixtures.py` (oracle: `openssl verify
-  -crl_check_all` / `-crl_check`, 10 cases; OpenSSL does not backtrack, so those cases are
-  asked one intermediate at a time).
-- **Oracle:** `tools/gen_crl_fixtures.py` builds the fixtures with Python `cryptography` and
-  OpenSSL 3.5 (ML-DSA-44), and aborts unless `openssl verify -crl_check` gives the same
-  good / revoked / out-of-scope verdict as the Zig tests expect (16 cases). Mutation run
-  (schemata, 2026-09-30): 25 mutants over the checks; the first round left four alive (the
-  algorithm-equality, version, unused-bits and `certificateIssuer` checks had no test that
-  needed them) — each got a fixture or test, and all 25 are killed.
+`zig build bench-x509` (`BENCH_ROUNDS=5`, `tools/bench.zig`), TLS-client shape: leaf + intermediate verified to a root,
+host name and serverAuth EKU checked, against Go `crypto/x509`, OpenSSL's `X509_verify_cert` (`tools/c_bench`) and
+rustls-webpki (`tools/rust_fast_bench`); ours also re-parses the trust anchor each call (its API takes DER), which favours
+Go. The card's `**Performance:**` line carries the figures and is authoritative.
+
+## What is deliberately not done
+
+- **Certificate / CSR / CRL construction.** This module is the verifier; signing needs private keys of every algorithm, and the one consumer, ACME, owns its CSR in `acme/src/x509.zig`.
+- **Every-valid-path enumeration.** `verifyChainPath` returns the first path, which is what consumers use.
+- **Go's per-certificate error detail** (`CertificateInvalidError`): the flat error set maps its reasons.
+- **`SystemRoots`.** No I/O (`meta.role = .util`).
+- **otherName / x400Address / ediPartyName / registeredID name constraints.** No RFC rule; they fail closed (§ Threat model).
+- **Subject-DN `emailAddress` as an rfc822Name constraint target.** Go does not either (OpenSSL does).
+- **`authorityKeyIdentifier` `[1]`/`[2]` (name+serial) forms.** Add only if a consumer needs them.
+- **`checkOneName` charging every visit.** It charges only same-type pairs, as Go keeps per-type lists and charges what it compares; charging every visit would move `max_constraint_comparisons` against Go (the counts are the compatibility surface). The other-type walk is one tag compare per entry.
+- **A budget on the public `checkNameConstraints`.** The caller owns both inputs; it is the budgeted function's unlimited twin by design, and a cap would add an error to a signature that cannot fail that way.
+- **`rdnEql` bounded below n·m.** One RDN's ATV count is bounded by the name's size, real names have 1-2, and Go's `rdnEql` is the same nested loop; it runs under the pair's single charge.
+- **OCSP in the path** (RFC 6960): the sibling `ocsp` module; see *Design & invariants*.
 
 ## Backlog / deferred
 
-- **Uncharged quadratic work left by the no-panic sweep (2026-10-28).** All bounded by certificate
-  size, none reachable without a CA the path already trusts. Settled 2026-11-19, sub-bullet by
-  sub-bullet:
-  - `policy.decode`'s duplicate-policy check — **DONE** (linear: a hash set in the check's arena;
-    same accept/refuse set, test in `chain_test.zig`).
-  - `checkOneName` charging only same-type pairs — **kept**: Go keeps per-type lists and charges
-    what it compares, so charging every visit would move `max_constraint_comparisons` against Go
-    (the counts are the compatibility surface). The other-type walk is one tag compare per entry.
-  - `rdnEql` n·m in one RDN's ATVs — **kept**: one RDN's ATV count is bounded by the name's size,
-    real names have 1-2, and Go's `rdnEql` is the same nested loop; it runs under the pair's single charge.
-  - public `checkNameConstraints` without a budget — **kept**: the caller owns both inputs
-    (permitted/excluded blobs and the names), the function is the budgeted one's unlimited twin by
-    design, and a cap here would add an error to a signature that cannot fail that way today.
-  - `crl.parse` per candidate attempt, uncached — **left**: a parse cache keyed by CRL slice needs
-    an owner and an invalidation rule across candidates (a new API surface); the work is linear in
-    the CRL per attempt and attempts are budgeted. Revisit with a measured consumer need.
-  - `Memo` past 12 certificates re-running `parseShape` — **left**: a chain over 12 certificates is
-    not a Web PKI shape, and the cost is linear per scan; raising `cap` only moves the cliff.
-  - Still open: the stack the ML-DSA-87 / SLH-DSA-256 verifiers need, not measured.
-
-- **Build option: post-quantum signature verifiers in chain building** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/chain.zig:681-686 dispatches
-  ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over algorithm.zig:37-113) for every chain verifier. Measured (HTTPS sizeprobe,
-  baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) →
-  such a chain is refused with `error.UnsupportedAlgorithm`. Small gain; do it only together with tlsclient's algorithm set.
-- **DONE 2026-10-11: speed.** Was 6.46–7.54× Go 1.26.0 crypto/x509 (P4, card `not measured`); now 0.81–0.92× (P2) — see § Performance.
-
-- **DONE 2026-10-10 (decided by the coordinator, delegated by the owner): `parse_slack` in
-  `verifyChain`.** The open question was whether std, seeing the caller's buffer without padding,
-  could still probe past its end. Reading `Certificate.parse` (0.16; the DER element reader is unchanged in 0.17.0) settles it: every probe lands
-  at the end of an element std just read, and with `requireStdDescentPoints` all of those lie
-  inside the buffer except the one after `signatureAlgorithm`, which reads the signatureValue
-  header. A certificate without its signatureValue was well-formed DER and passed the guard, so
-  std read that header at the buffer's end. The guard now requires the trailing BIT STRING
-  (RFC 5280 §4.1; regression test in `safe.zig`), so no probe leaves the buffer, no copy is
-  needed and the API is unchanged; the padding stays in `safeCertificate` as defence in depth.
-  The options weighed were (a) padded copies owned by `VerifiedChain` (BREAKING), (b) scratch
-  passed in by the caller, and (c) documenting the gap.
-
-- **CRL parsing and revocation check** — **DONE 2026-09-30 as `x509.crl`** (see § "CRL"), per
-  certificate; **the `verifyChain` wiring (`Options.revocation`: a CRL list, scope, and a policy
-  for "no CRL for this certificate") DONE 2026-09-30**. Still open: delta CRLs (§5.2.4),
-  indirect CRLs. The original entry follows.
-- ✅ DONE 2026-09-30 (`e9375deea` `crl.zig`, `534dbd124` `Options.revocation`: `chain.zig` checks every path certificate against the caller's CRLs with `crl.checkRevocation`, RFC 5280 §6.3; fetching stays the caller's). *(original)* **CRL parsing and revocation check in `verifyChain`** (survey 2026-09-30). rustls-webpki, Go (caller-side) and OpenSSL all offer it; here revocation is out of scope and `ocsp`/`ocspcache` are not wired into the path. A user with a private CA or mTLS deployment that relies on CRLs cannot use this module alone. Effort: medium (CRL DER, issuer/scope matching, signature, freshness). Fits §2. Overlaps the "explicitly out of scope" note above, which names it a separate data-fetching concern; the parse-and-check half is pure.
-- **DONE 2026-10-11: rfc822Name / URI name-constraint matching, certificate-policy processing** and the rest of the Go `Verify` parity plan (§ "Go Verify parity").
-- ~~**Readers acme needs (2026-10-16)**~~ — **DONE 2026-10-16**: `chain.certValidity`, `chain.certAuthorityKeyId` (`parseAuthorityKeyIdentifier` already existed, only the cert-level getter was private), `names.nameAttribute`. Open: `names.parseIp4/6` vs `netaddr`. *(original)*: `parseAuthorityKeyIdentifier` (keyIdentifier [0], beside `parseSubjectKeyIdentifier`), an issuer/subject attribute getter (`issuerAttribute(cert, oid)` — acme picks alternate chains by the topmost issuer CN), and a safe `notAfter`. Consumer: acme (replaces its own `certNotAfter`/`ariCertId`/`issuerCommonName`, see acme SPEC Backlog). Also `names.parseIp4/6` duplicate the `netaddr` module. Effort: small.
-- **Deliberately not doing (S2 survey 2026-10-11):** certificate / CSR / CRL construction (this module is the verifier; signing needs private keys of every algorithm, and the one consumer, ACME, owns its CSR in `acme/src/x509.zig`); every-valid-path enumeration (`verifyChainPath` returns the first, which is what consumers use); Go's per-certificate error detail (`CertificateInvalidError`) — the flat error set maps its reasons; `SystemRoots` (no I/O, `meta.role = .util`); matching otherName/x400/ediParty/registeredID (no RFC rule; fail closed); subject-DN `emailAddress` as rfc822Name (Go does not either).
-- **Possible later:** an optional diagnostics out-parameter naming the failing certificate (`NoTrustedPath` hides the cause when several same-subject candidates fail); Go's parse strictness for serial numbers (non-minimal INTEGER encoding refused by Go — probe O-parse; std's parser and `safe.zig` do not check it).
-
+- **Delta CRLs (RFC 5280 §5.2.4) and indirect CRLs** are refused (`DeltaCrlUnsupported`, `IndirectCrlUnsupported`; also `onlySomeReasons`, attribute-certificate CRLs and a `nameRelativeToCRLIssuer` distribution point, `CrlScopeUnsupported`): a CRL that covers only part of the ground cannot prove "good". Open.
+- **Build option: post-quantum signature verifiers in chain building** (design in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `src/chain.zig` dispatches ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over `algorithm.zig`) for every chain verifier. Measured (HTTPS sizeprobe, baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) → such a chain is refused with `error.UnsupportedAlgorithm`. Small gain; do it only together with the TLS client's algorithm set.
+- **`crl.parse` per candidate attempt is uncached.** A parse cache keyed by CRL slice needs an owner and an invalidation rule across candidates (a new API surface); the work is linear in the CRL per attempt and attempts are budgeted. Revisit with a measured consumer need.
+- **`Memo` past 12 certificates re-runs `parseShape`.** A chain over 12 certificates is not a Web PKI shape and the cost is linear per scan; raising `cap` only moves the cliff.
+- **Stack the ML-DSA-87 / SLH-DSA-256 verifiers need:** not measured.
+- **An optional diagnostics out-parameter naming the failing certificate** (`NoTrustedPath` hides the cause when several same-subject candidates fail).
+- **Go's parse strictness for serial numbers** (a non-minimal INTEGER encoding is refused by Go; std's parser and `safe.zig` do not check it).
