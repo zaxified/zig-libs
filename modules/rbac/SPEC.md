@@ -37,8 +37,9 @@ that covers RBAC and ABAC), with NIST/INCITS 359 as the model spec.
 **Where we are ahead:** the only Zig RBAC+ABAC engine; NIST-style hierarchy with cycle rejection
 at insertion, static separation of duty, XACML combining algorithms (`deny_overrides` default),
 depth-bounded evaluation (fail closed), type-checked comparisons, no allocation per decision.
-**Where we are behind:** policy files and storage adapters, wildcard/pattern matching, domains/
-tenants, resource roles, a policy language (→ Backlog).
+**Where we are behind:** policy files and storage adapters, domains/tenants, resource roles, a
+policy language, patterns beyond `keyMatch`-style `*` (no regex) (→ Backlog / deferred and
+*What is deliberately not done*).
 
 Authorization decision engine: RBAC (role-based) + ABAC (attribute-based). Usage: see
 ./README.md. No third-party source ported and no third-party implementation studied as a
@@ -70,7 +71,7 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   exclusive; `assignRole` checks the user's currently-held roles against every declared pair
   (order-independent) and rejects with `error.ConflictingRole` before the conflicting
   assignment lands. **Dynamic (session-based) SoD — where a user may hold both roles but not
-  *activate* both in the same session — is explicitly deferred**: this module has no session
+  *activate* both in the same session — is not provided**: this module has no session
   concept at all (RBAC "sessions" per NIST RBAC are out of scope; `check` takes a bare user
   id). A caller wanting dynamic SoD needs a session layer above this engine that tracks
   per-session active-role subsets and applies the same exclusivity pairs to that subset
@@ -84,9 +85,7 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   things forever (tested: 10k rounds, live bytes constant). Repeated role names across
   permissions/edges/assignments still each own a dupe (acceptable at admin scale). For the same
   reason every `add*` is idempotent — re-adding an existing permission, edge, SoD pair, role
-  or assignment is a no-op that allocates nothing (before 2026-09-30 `addPermission`/
-  `addHierarchy`/`addStaticSoD` appended a duplicate each call). A user with no roles left has
-  no entry.
+  or assignment is a no-op that allocates nothing. A user with no roles left has no entry.
 - **Revoke / remove (NIST `DeassignUser`, `RevokePermission`, `DeleteRole`).**
   `unassignRole(user, role)`, `removePermission(role, perm)`, `removeHierarchy(senior, junior)`,
   `removeStaticSoD(a, b)` return `error{UnknownRole}!bool` — `true` if something was removed,
@@ -111,6 +110,17 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   graph, so the DAG invariant needs no re-check. All removals are allocation-free (they can
   only free), hence cannot fail with `OutOfMemory`; each is O(size of the touched lists),
   `removeRole` O(roles + assignments + SoD pairs).
+- **Pattern permissions (opt-in, `Engine.initWithMatch(gpa, .key_match)`).** With the default
+  `Engine.init` (`Match.exact`) a stored permission is compared with the requested
+  `(action, resource)` by byte equality and `*` is an ordinary byte. With `.key_match` stored
+  permissions are patterns, Casbin `keyMatch`-style (`rbac.keyMatch(pattern, text)`, public): `*`
+  matches any run of bytes, possibly empty and including `/` and `:` (`/api/*` covers
+  `/api/a/b`, `read:*` covers `read:doc`), every other byte matches itself, a `*` in the
+  requested text is an ordinary byte; there is no escape, no other metacharacter and no regex.
+  The matcher is iterative with one backtrack point (the last `*`): O(pattern x text) worst
+  case, never exponential. The pattern applies to direct and inherited grants alike; the
+  idempotence and removal bookkeeping (`add*`, `removePermission`) stays exact byte equality
+  (a pattern is its own stored string). A policy that uses patterns must declare it at init.
 - **ABAC (`abac`) — a typed condition-tree evaluator, not a DSL.** Policies are built
   programmatically with a typed builder API (`abac.eq`/`abac.andAll`/`abac.attr`/…) rather
   than parsed from a string. This is a deliberate scope cut, not a shortcut: a string
@@ -165,18 +175,11 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   subject, is this token valid) is a different module's job (see `jwt`, `aaa-gate`); this
   module only decides "given this already-authenticated subject/attributes, is the action
   authorized."
-- **RBAC deferred:** dynamic/session-based SoD (see above); NIST RBAC "sessions" and
-  session-scoped role activation; permission-level or object-instance-level constraints
-  beyond the flat `(action, resource)` pair (e.g. row-level/ownership checks) — those are
-  naturally expressed as ABAC conditions instead (`resource.owner == subject.id`), not as an
-  RBAC extension.
-- **ABAC deferred:** a string policy DSL/parser (see design rationale above); the full XACML
-  request/response protocol (obligations, advice, multiple-decision profile, policy
-  administration point, PDP/PEP network protocol) — this module is the policy-decision
-  *core* (condition evaluation + combining algorithm) an application wires into its own
-  request path, not a XACML server; regex/wildcard/glob matching on string attributes (only
-  exact equality is provided — a caller wanting pattern matching composes it before calling
-  `put`, e.g. by pre-computing a `matches_pattern: bool` attribute).
+- **Out of scope** (sessions and dynamic SoD, a string policy DSL, the XACML protocol surface,
+  string-attribute pattern matching): *What is deliberately not done*. Object-instance
+  constraints beyond the flat `(action, resource)` pair (row-level/ownership checks) are
+  naturally expressed as ABAC conditions (`resource.owner == subject.id`), not as an RBAC
+  extension.
 - **Not a validator against malicious *policy authors*.** The depth bound defends the
   *evaluator* against a pathologically deep tree (accidental or adversarial), but the
   `Condition`/`Rule`/`Policy` values themselves come from trusted, in-process Zig code (the
@@ -192,80 +195,70 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   originate from less-trusted sources (hence that path is the one with the runtime depth
   bound).
 
+## What is deliberately not done
+
+- **Dynamic (session-based) SoD and NIST RBAC "sessions"** (session-scoped role activation): the module has no
+  session concept, `check` takes a bare user id (see *Design & invariants*, static separation of duty).
+- **A string policy DSL for ABAC:** typed builder API only, by design (a grammar and parser would need their own
+  parser-level DoS/injection hardening, see the ABAC design bullet).
+- **The full XACML protocol surface** (obligations, advice, multiple-decision profile, policy administration
+  point, PDP/PEP wire protocol): only the condition-evaluation and combining-algorithm core is in scope; an
+  application wires it into its own request path.
+- **Regex/wildcard/glob matching on ABAC string attributes:** only exact equality is provided; a caller wanting
+  pattern matching computes it before calling `put`, e.g. a `matches_pattern: bool` attribute. (Permission
+  patterns for RBAC are provided, opt-in: `Engine.initWithMatch`.)
+
 ## Verification
 
-`zig build test-rbac` (Debug) and `zig build test-rbac -Doptimize=ReleaseFast`,
-both green. This is policy logic with no external interop target — there is no third-party
-"RBAC KAT" or "ABAC KAT" corpus to validate against (unlike e.g. a crypto primitive or wire
-codec), so **self-constructed test cases are the correct verification approach here**, per
-the task brief. Coverage:
+`scripts/modtest rbac` (Debug) and `zig build test-rbac -Doptimize=ReleaseFast`. This is policy logic with no
+external interop target (no third-party "RBAC KAT" or "ABAC KAT" corpus exists), so self-constructed test cases
+are the verification approach. Coverage:
 
-- **RBAC:** direct grant permits (+ sibling: wrong action denies); inherited grant through
-  hierarchy permits (+ sibling: same setup without the hierarchy edge denies); denial when
-  unassigned (+ sibling: assigning the role flips it to permit); cycle detection rejects a
-  cyclic edge and a self-edge (+ sibling: a non-cyclic edge on the same chain succeeds);
-  static SoD rejects a conflicting assignment in both pair orderings (+ sibling: an unrelated
-  third role assigns fine); unknown-role errors from every mutating method that references a
-  role. Revoke/remove: unassign then `check` denies (+ siblings: other role/user keep
-  access); `removePermission` also revokes inherited copies; `removeRole` cascade
-  (assignments, permissions, edges, SoD gone, former holders denied, other roles unaffected,
-  no resurrection on re-add); `removeHierarchy` in a chain and in a diamond; SoD interaction;
-  remove-missing (`UnknownRole` vs `false`); a 10k-round churn test asserting live bytes stay
-  bounded (`FailingAllocator` counters); and a seeded random add/remove sequence test
-  (6 engines x 1500 ops over 5 roles/3 users/3 permissions) compared after every step with a
-  naive matrix reference model.
-- **ABAC:** every operator (`eq`/`ne`/`lt`/`le`/`gt`/`ge`/`in`) each with its minimal-flip
-  deny sibling; ordering-on-non-int is `error.TypeMismatch`; `And`/`Or`/`Not` composition
-  each with a sibling that flips the minimal clause; default-deny when no rule matches (+
-  sibling: matching the rule flips it to permit); `deny_overrides` vs `permit_overrides` on
-  the *identical* rule set and attributes (proving the algorithm, not rule order, decides);
-  the default algorithm is `deny_overrides`; depth-bound rejection of a 40-deep `not` chain
-  against `default_max_depth = 32` (+ sibling: the same shape at depth 10 evaluates
-  correctly, including odd/even negation parity) and its collapse to `Decision.deny` through
-  `evaluate`; a missing attribute is `Indeterminate` at the `evalCondition` level and collapses
-  to `Decision.deny` through `evaluate`.
+- **RBAC:** direct grant permits (+ sibling: wrong action denies); inherited grant through hierarchy permits (+
+  sibling: same setup without the hierarchy edge denies); denial when unassigned (+ sibling: assigning the role
+  flips it to permit); cycle detection rejects a cyclic edge and a self-edge (+ sibling: a non-cyclic edge on the
+  same chain succeeds); static SoD rejects a conflicting assignment in both pair orderings (+ sibling: an
+  unrelated third role assigns fine); unknown-role errors from every mutating method that references a role.
+  Revoke/remove: unassign then `check` denies (+ siblings: other role/user keep access); `removePermission` also
+  revokes inherited copies; `removeRole` cascade (assignments, permissions, edges, SoD gone, former holders
+  denied, other roles unaffected, no resurrection on re-add); `removeHierarchy` in a chain and in a diamond; SoD
+  interaction; remove-missing (`UnknownRole` vs `false`); a churn test asserting live bytes stay bounded
+  (`FailingAllocator` counters); and a seeded random add/remove sequence test compared after every step with a
+  naive matrix reference model (`RefModel`).
+- **Pattern permissions:** `key_match` engines match `*` runs, an empty run, exact entries beside patterns,
+  inherited patterns, and refuse prefixes without a star and a `*` in the request; the default engine keeps `*`
+  literal; `keyMatch` rules over empty, adjacent and repeated stars; a pathological pattern stays fast.
+- **ABAC:** every operator (`eq`/`ne`/`lt`/`le`/`gt`/`ge`/`in`) each with its minimal-flip deny sibling;
+  ordering-on-non-int is `error.TypeMismatch`; `eq`/`ne` across kinds and `in` over a differently-typed list
+  element or a non-list are `TypeMismatch`, never a silent result; `And`/`Or`/`Not` composition each with a
+  sibling that flips the minimal clause; default-deny when no rule matches (+ sibling: matching the rule flips
+  it to permit); `deny_overrides` vs `permit_overrides` on the *identical* rule set and attributes (proving the
+  algorithm, not rule order, decides), and `deny_overrides` with an Indeterminate rule beside a Permit fails
+  closed; the default algorithm is `deny_overrides`; depth-bound rejection of an over-deep `not` chain against
+  `default_max_depth` (+ siblings: the same shape under the bound evaluates correctly, including odd/even
+  negation parity, and a chain exactly `max_depth` deep evaluates while one more is rejected) and its collapse
+  to `Decision.deny` through `evaluate`; a missing attribute is `Indeterminate` at the `evalCondition` level and
+  collapses to `Decision.deny` through `evaluate`.
 
-Every "should-permit"/"should-match" test above has an adjacent "should-deny"/"should-fail"
-sibling built by the minimal change that flips the outcome (a wrong field, a missing edge, an
-unmet boundary, a swapped algorithm) — proving each check actually has discriminating power
-rather than passing by default-deny alone.
+Every "should-permit"/"should-match" test above has an adjacent "should-deny"/"should-fail" sibling built by the
+minimal change that flips the outcome (a wrong field, a missing edge, an unmet boundary, a swapped algorithm),
+proving each check actually has discriminating power rather than passing by default-deny alone.
 
-## Mutation run 2026-10-04
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
-55 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run), deny paths first: grants
-that would appear where the engine must deny (`check` default-deny in both branches, permission
-match `and` -> `or` / action only / resource only, transitive walk, static-SoD enforcement and its
-order independence, unknown-role rejections, cycle rejection), the revoke/remove family (idempotence,
-returned flags, cascade steps of `removeRole`, empty-user cleanup), and the ABAC evaluator (type-checked
-`eq`/`ne`, `lt`/`le`/`gt`/`ge` boundaries, `in`, and/or/not, depth bound, both combining algorithms,
-the collapse of NotApplicable/Indeterminate to Deny, rule-effect and attribute-category mix-ups).
-First run: 49 killed, 6 survived. Survivors and verdicts:
+## Open
 
-- Equivalent: `addHierarchy` without the explicit self-edge check (a self-edge is reachable from
-  itself, so the cycle check rejects it with the same `CyclicHierarchy`).
-- Test gaps, now killed: `eq`/`ne` across kinds silently `false` instead of `TypeMismatch` (for `ne`
-  that is a grant), `in` matching through a differently-typed list element, `in` against a non-list,
-  the inclusive depth bound (`depth == max_depth` allowed), and `deny_overrides` returning a
-  Permit although another rule was Indeterminate (the module fails closed: Indeterminate wins).
-
-Tests added: 4 (in `root.zig`, reasons in the comments). No findings. Final: 54 killed, 1 equivalent.
+- **Pattern permissions (`keyMatch`, `Engine.initWithMatch`) have had no mutation run:** the card's mutation entry
+  covers the module as it was before they were added.
 
 ## Backlog / deferred
 
-**Survey 2026-09-30** (checked with `rg -n 'revoke|remove|unassign' src/root.zig`: no hits; `rg -i 'wildcard|glob|domain|tenant' src/root.zig`: prose only):
-- **DONE 2026-09-30 — Revoke / remove operations** (`unassignRole`, `removePermission`, `removeRole`, `removeHierarchy`, plus `removeStaticSoD`) — see Design & invariants. Storage: real removal (individually owned allocations), not tombstones or rebuild. Verified by `modtest rbac` (see Verification).
-- **(survey 2026-09-30) Wildcard/pattern matching on `(action, resource)`** ✅ DONE 2026-11-16 (opt-in `Engine.initWithMatch(gpa, .key_match)` / `Engine.match`: stored permissions are patterns, `*` matches any run of bytes including `/`, so `/api/*` and `read:*` work; `rbac.keyMatch` public; default `.exact` unchanged; one backtrack point, O(pattern x text), never exponential; add/remove bookkeeping stays exact). Casbin `keyMatch`-style; no regex, no escape, no other metacharacter.
-- **(survey 2026-09-30) Domains/tenants** (a user holds different roles per tenant) — Casbin's "RBAC with domains"; multi-tenant SaaS is the common RBAC deployment. Effort: medium (a third key in assignments and `check`). Fits §2: yes.
-- **(survey 2026-09-30) Policy load/save** (already listed below as policy-file format) — Casbin users expect policies from a file or store; tag raised from "deferred" to "matters" because without it every consumer writes the same parser. Effort: medium. Fits §2: yes.
-
-
-- Dynamic (session-based) SoD — needs a session/role-activation concept this module
-  deliberately doesn't have (see Design & invariants).
-- Policy-file format / (de)serialization for either model.
-- String policy DSL for ABAC (typed builder API only, by design).
-- Full XACML protocol surface (obligations/advice/PAP/PDP-PEP wire protocol, multiple-decision
-  profile) — only the condition-evaluation + combining-algorithm core is in scope.
-- Pattern/regex/glob matching on string attributes.
+- **Domains/tenants** (a user holds different roles per tenant): Casbin's "RBAC with domains"; multi-tenant SaaS
+  is the common RBAC deployment. Effort: medium (a third key in assignments and `check`). Fits CONVENTIONS §2: yes.
+- **Policy load/save** (a policy-file format and (de)serialization for either model): Casbin users expect
+  policies from a file or store, and without it every consumer writes the same parser. Effort: medium. Fits
+  CONVENTIONS §2: yes.
 
 ## Anchoring
 

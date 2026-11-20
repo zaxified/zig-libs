@@ -20,8 +20,8 @@ authorized to do this."
   `Decision`, so default-deny isn't just documented, it's what callers actually branch on.
 
 Provenance: clean-room implementation from the public NIST RBAC / XACML specs — no
-third-party source ported or implementation consulted; see SPEC.md (§5:
-public-spec implementations need no NOTICE entry, so the module has none).
+third-party source ported or implementation consulted; public-spec implementations
+need no NOTICE entry (CONVENTIONS.md §5), so the module has none.
 
 ## RBAC API
 

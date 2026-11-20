@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-16** — Opt-in wildcard permissions: `rbac.Engine.initWithMatch(gpa, .key_match)` (and `Engine.match`, `rbac.Match`) make `check` treat stored permissions as `keyMatch` patterns (`*` = any run of bytes incl. `/`); public `rbac.keyMatch`. Matching is O(pattern x text), no exponential backtracking. Default `init` is unchanged (exact strings).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-04** — Tests: first mutation run (55 mutants, 54 killed, 1 equivalent); 4 tests added
   (`eq`/`ne` kind mismatch, `in` with mixed-type list and non-list RHS, inclusive depth bound,
   `deny_overrides` with an Indeterminate rule next to a Permit). No source change.
