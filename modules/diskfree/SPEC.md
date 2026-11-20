@@ -17,7 +17,6 @@
 **Downstream consumer:** yes
 
 Design + threat notes for auditors. Usage: see [`./README.md`](./README.md).
-
 ## Compared with
 
 Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (stars and activity for the rows added or
@@ -34,7 +33,7 @@ are wider by construction (verdict in "Parity verdicts").
 |---|---|---|--:|---|---|
 | [coreutils/coreutils](https://github.com/coreutils/coreutils) (`df`) — behaviour oracle | C | GPL-3.0 | 5.3k | v9.12 (2026-09-14) | Table of total/used/avail/use%/inodes per mount, fs type column, `df FILE` (the mount containing a path), hides pseudo filesystems unless `-a`, `-l` local only, human/SI formatting. Ours (2026-11-02): numbers (`Usage`), the listing (`table.readTable`, `-a`/`-l` as options), `df FILE` (`lookup.containing`, lexical), pseudo/network filtering (`classify`); human/SI formatting is the caller's. Checked against GNU `df` 9.7 live: 18/18 paths, no df-only row *(df features from its manual [V]; behaviour [V] by `tools/df-where-diff.sh`)*. |
 | [moby/sys](https://github.com/moby/sys) (`mountinfo` v0.7.3) — **reference** | Go | Apache-2.0 (LICENSE file read) | 104 | v0.7.3 (2026-10-26) | The mountinfo reader Docker/runc use: row parse with unescape, filters (`PrefixFilter`, `FSTypeFilter`, `ParentsFilter` = the mounts above a path), `Mounted(path)`, `PidMountInfo` (deprecated), reads `/proc/thread-self`. Ours: parse + unescape [V], `lookup.containing`/`isMountPoint`, `classify`, `mountinfo.readMountinfoOf(pid)`; filters are a loop over `[]MountinfoEntry` (rejected as API: no gain over a `for`). Chosen as reference over procfs for the fuller feature set. *(source read: mountinfo_linux.go, mountinfo.go [V])* |
-| [prometheus/procfs](https://github.com/prometheus/procfs) (`GetMounts`) | Go | Apache-2.0 | 886 | push 2026-10-23 | `GetMounts()`/`GetProcMounts(pid)`: a record per row with option MAPS; does not unescape paths; no filters or lookup. Slower than moby on the live row (1.7× slower than ours; see Performance). *(source read: mountinfo.go, internal/fs/fs.go [V])* |
+| [prometheus/procfs](https://github.com/prometheus/procfs) (`GetMounts`) | Go | Apache-2.0 | 886 | push 2026-10-23 | `GetMounts()`/`GetProcMounts(pid)`: a record per row with option MAPS; does not unescape paths; no filters or lookup. Slower than moby on the live row (1.7× slower than ours; see the card's `**Performance:**` line). *(source read: mountinfo.go, internal/fs/fs.go [V])* |
 | [uutils/coreutils](https://github.com/uutils/coreutils) (`df`) | Rust | MIT | 24.3k | push 2026-11-03 | A `df` program in Rust; not a library, so no API to compare. Behaviour not examined this run; GNU `df` is the oracle. *(licence from repository metadata [V]; not read)* |
 | [util-linux/util-linux](https://github.com/util-linux/util-linux) (`findmnt`, `libmount`) | C | GPL-2.0 (libmount: LGPL-2.1+ *inferred*) | 3.2k | push 2026-09-29 (no releases via API) | The mountinfo reader everybody uses; mount tree, propagation, path→mount lookup, fs-type/option filtering, `utab`/`fstab` merging. Ours: raw `mount_id`/`parent_id` and `optional_fields` only; no tree, no lookup, no fstab. |
 | [shirou/gopsutil](https://github.com/shirou/gopsutil) (`disk`) | Go | NOASSERTION (BSD-3-Clause per its README *inferred*; source not read) | 11.9k | v4.26.8 (2026-09-01) | Cross-platform (Linux, FreeBSD, Darwin, Windows per README): `Usage(path)` and `Partitions(all)` in one API, with pseudo-fs filtering by default. Ours: Linux only, two separate calls. |
@@ -44,29 +43,28 @@ are wider by construction (verdict in "Parity verdicts").
 | Zig `std` | Zig | MIT | — | 0.16.0 | Nothing: no `statfs`/`statvfs`, no `/proc/self/mounts` reader (`rg -in 'statfs|statvfs'` over `lib/std/os/linux.zig`, `posix.zig`, `Io/Dir.zig` hit nothing). |
 
 **Where we are ahead:** the only Zig implementation; no libc, no fork of `df`/`findmnt`; `statfs`/`statfs64` structs
-transcribed per architecture and live-checked through qemu-user on mips, mipsel, arm, mips64, mips64el and s390x (the
-last two were WRONG until 2026-11-03, see "Parity verdicts"); `f_bfree` vs `f_bavail` kept apart on purpose; octal-escaped
+transcribed per architecture and live-checked through qemu-user on mips, mipsel, arm, mips64, mips64el and s390x; `f_bfree` vs `f_bavail` kept apart on purpose; octal-escaped
 mount paths decoded; parsers are pure and fuzzed; reading is as fast as moby's (0.93–0.98×). **Where we are behind:**
-non-Linux platforms (gopsutil, sysinfo; by design), `fstatfs` (rejected), mount-tree awareness in path lookup.
+non-Linux platforms (gopsutil, sysinfo; by design) and `fstatfs` (both named in *What is deliberately not done*); path lookup walks the mount tree over mountinfo entries, but over plain `mounts` entries (no ids) it is longest-prefix.
 
-## Parity verdicts (survey 2026-11-02)
+## Parity verdicts
 
 | Gap (competitor feature) | Verdict |
 |---|---|
 | One call for "every mount with its usage" (gopsutil `Partitions`+`Usage`, sysinfo `Disks`, `df`) | **Done** `table.collect`/`readTable` (bounded, deduped by mount point, `-a`/`-l` options) |
-| Path -> containing mount (`df FILE`, `findmnt -T`, moby `ParentsFilter`) | **Done** `lookup.containing`/`locate` (lexical; symlinks are the caller's). Over mountinfo entries it walks the real mount TREE (stacked, bind and covered-by-a-later-ancestor mounts right, 10 checks in a user+mount namespace, 9 against `df` and 1 asserted); over plain `mounts` entries, which carry no ids, it is longest-prefix. A table cut at the read limit is reported (`Answer.table_truncated`, `Table.read_truncated`) |
+| Path -> containing mount (`df FILE`, `findmnt -T`, moby `ParentsFilter`) | **Done** `lookup.containing`/`locate` (lexical; symlinks are the caller's). Over mountinfo entries it walks the real mount TREE (stacked, bind and covered-by-a-later-ancestor mounts right); over plain `mounts` entries, which carry no ids, it is longest-prefix. A table cut at the read limit is reported (`Answer.table_truncated`, `Table.read_truncated`) |
 | "Is this path a mount point" (moby `Mounted`, `mountpoint`) | **Done** `lookup.isMountPoint` (table-only, lexical; moby stats the path instead) |
-| Pseudo / network filesystem classification (`df` default view, `-l`; gopsutil `all=false`) | **Done** `classify.isPseudo`/`isRemote`, by type NAME (no magic table); the oracle found `efivarfs` wrongly listed as pseudo, fixed |
-| Mount flags (`ST_RDONLY`…; gopsutil `Opts`, `statvfs.f_flag`) | **Done** `Usage.flags`, `St.*`, `isReadOnly`; equals glibc/Python `statvfs.f_flag` on 18/18 paths. musl's `f_flag` additionally keeps the kernel's `ST_VALID` (0x20) bit, measured with a static musl probe; `flags | St.valid` equals it. musl-on-the router-tool consumer: the bit is the only difference *(8 paths [V])* |
+| Pseudo / network filesystem classification (`df` default view, `-l`; gopsutil `all=false`) | **Done** `classify.isPseudo`/`isRemote`, by type NAME (no magic table) |
+| Mount flags (`ST_RDONLY`…; gopsutil `Opts`, `statvfs.f_flag`) | **Done** `Usage.flags`, `St.*`, `isReadOnly`; equals glibc/Python `statvfs.f_flag` (the kernel's `ST_VALID` bit 0x20 is masked). musl's `f_flag` additionally keeps `ST_VALID`, measured with a static musl probe; `flags \| St.valid` equals it. The only difference for a musl-based consumer is that bit |
 | `/proc/<pid>/mountinfo` (`findmnt --task`, moby `PidMountInfo`, procfs `GetProcMounts`) | **Done** `mountinfo.readMountinfoOf` |
-| Busybox-style rounded Use% | **Done** `Usage.usePercentNearest` (the router-tool consumer's own helper replicates it) |
-| `fstatfs` (fd-based) | **Rejected**: no competitor in the table exposes it (gopsutil, nix `statvfs` take paths), and `query` covers "the filesystem of this directory"; add it when a consumer holds only an fd |
-| Human/SI size formatting (`df -h`) | **Rejected**: presentation, the caller's; no sibling module owns it (`ls modules`: none) and `totalBytes()` etc. are the inputs |
-| Dedupe by device / hide bind mounts of one filesystem (GNU `df` default) | **Rejected**: policy; `Row` carries `device` and `usage` (and `table` dedupes the one thing that is not policy: a repeated mount point, keeping the mount on top). Cause of the 2026-11-02 listing difference established: df 9.7 shows a device once (a bind mount of a listed filesystem is hidden; experiment in a user+mount namespace, `tools/df-where-diff.sh`) and omits `squashfs` and `devtmpfs` from its default view (`df -a -t squashfs` lists 45, the default 0). `table.Options.skip_fs_types` (= `df -x`) with `table.df_default_skip` reproduces the type rule; it is not the default because OpenWrt's root is squashfs. The oracle FAILS on any df-only row and on any module-only row that is not a repeated device |
-| Mount tree (`findmnt`, `libmount`) | **Rejected** as before: the raw `mount_id`/`parent_id` are exposed |
-| Filesystem magic -> name | **Rejected** as before ("deliberately not done") |
+| Busybox-style rounded Use% | **Done** `Usage.usePercentNearest` |
+| `statfs` layout on every Linux ABI | **Done**: one struct family per kernel ABI, see *Wire format / algorithm* (including the mips64/mips64el n64 and s390x layouts), checked against the kernel UAPI headers and live under qemu-user |
+| `fstatfs` (fd-based) | **Rejected**, see *What is deliberately not done* |
+| Human/SI size formatting (`df -h`) | **Rejected**, see *What is deliberately not done* |
+| Dedupe by device / hide bind mounts of one filesystem (GNU `df` default) | **Rejected**, see *What is deliberately not done* (`table.Options.skip_fs_types` / `table.df_default_skip` reproduce the type rule) |
+| Mount tree (`findmnt`, `libmount`) | **Rejected**, see *What is deliberately not done* (the raw `mount_id`/`parent_id` are exposed) |
+| Filesystem magic -> name | **Rejected**, see *What is deliberately not done* |
 | Non-Linux (gopsutil, sysinfo, nix) | **Rejected**: Linux-only by design (`platform = .linux`) |
-| `statfs` layout on every Linux ABI | **Done and corrected**: `mips64`/`mips64el` n64 (own 128-byte `statfs`, MIPS field order) and `s390x` (88 bytes, 32-bit type/bsize) had been read through the asm-generic 120-byte struct: wrong values everywhere and, on mips64, an 8-byte kernel write past the buffer (plain `statfs` has no size argument). Both checked against the kernel UAPI headers (6.8 `arch/mips`, `arch/s390`, `asm-generic`) and live under `qemu-mips64`, `qemu-mips64el`, `qemu-s390x` |
 
 ## What this module is, and what it is not
 
@@ -79,7 +77,7 @@ and why it is not part of `procnet`" for why the two stay separate), not a
 `mount_id`/`parent_id` fields `mountinfo` hands back — a caller that wants
 the tree built into a data structure builds it from those), and not a
 filesystem-type-name resolver (`Usage.fs_type_magic` is the raw kernel magic
-number; see README's DEFER list).
+number; see *What is deliberately not done*).
 
 ## Wire format / algorithm
 
@@ -91,8 +89,8 @@ half, transcribed from the kernel UAPI headers rather than assumed:
 | Family | Syscall | Struct source | Size | Targets |
 |---|---|---|---|---|
 | `Native64` | `statfs` (no size arg) | `include/uapi/asm-generic/statfs.h`, `__BITS_PER_LONG == 64` branch | 120 | x86_64, aarch64, riscv64, loongarch64, powerpc64, sparc64 (no per-arch override in the kernel tree) |
-| `MipsNative64` | `statfs` (no size arg) | `arch/mips/include/uapi/asm/statfs.h`, `_MIPS_SIM_ABI64` (`statfs64` there is "Same as struct statfs") | 128 | mips64/mips64el n64: MIPS field order (`f_frsize` third, `f_bavail` after `f_ffree`), 5 spare words. Before 2026-11-03 this target used `Native64` |
-| `S390x` | `statfs` (no size arg) | `arch/s390/include/uapi/asm/statfs.h`, 64-bit branch | 88 | s390x: 32-bit `f_type`/`f_bsize`/`f_namelen`/`f_frsize`/`f_flags` beside 64-bit counters. Before 2026-11-03 this target used `Native64` |
+| `MipsNative64` | `statfs` (no size arg) | `arch/mips/include/uapi/asm/statfs.h`, `_MIPS_SIM_ABI64` (`statfs64` there is "Same as struct statfs") | 128 | mips64/mips64el n64: MIPS field order (`f_frsize` third, `f_bavail` after `f_ffree`), 5 spare words |
+| `S390x` | `statfs` (no size arg) | `arch/s390/include/uapi/asm/statfs.h`, 64-bit branch | 88 | s390x: 32-bit `f_type`/`f_bsize`/`f_namelen`/`f_frsize`/`f_flags` beside 64-bit counters |
 | `MipsStatfs64` | `statfs64` | `arch/mips/include/uapi/asm/statfs.h` | 96 | `.mips`/`.mipsel` (o32); `.mips64`/`.mips64el` built n32 (`gnuabin32`/`muslabin32`) |
 | `PackedGeneric32` | `statfs64` | asm-generic, packed (`packed,aligned(4)`) — ARM sets `ARCH_PACK_STATFS64` directly, per `arch/arm/…/statfs.h`; x86 packs only the separate `compat_statfs64` struct, via `ARCH_PACK_COMPAT_STATFS64` in `arch/x86/…/statfs.h` — see "x86 compat-layer assumption" below | 84 | arm/armeb/thumb/thumbeb, x86 (i386) |
 | `NaturalGeneric32` | `statfs64` | asm-generic, no arch override (natural C alignment) | 88 | powerpc(32), m68k, sparc(32), xtensa, riscv32, loongarch32, arc, csky, hexagon, or1k |
@@ -130,18 +128,15 @@ syscall table. This module keeps `.x86 => .packed32` (`family`'s `switch` in
 native i386 kernel, because native 32-bit x86 kernels are essentially
 extinct while 32-bit x86 userspace under an x86_64 kernel (multilib/compat)
 is the realistic deployment for anything this module would actually run on.
-That assumption was previously unstated anywhere in this file — it is now.
-
-It is also unverified by this repository (no i386 kernel, native or
-compat-hosting, in CI) and could in principle be wrong for a genuinely
-native i386 target. The severity of being wrong is bounded by the same
-self-checking property documented below: `do_statfs64` rejects a caller
-whose `sz` argument does not match its own struct's size, so a native i386
-kernel handed this module's 84-byte `PackedGeneric32` buffer (its own
-`statfs64` being 88 bytes) returns `EINVAL` rather than reading back a
-silently-misaligned `Usage` — a loud failure, not silent corruption, and no
-worse than the unverified-but-EINVAL-bounded status the Anchoring/Open
-sections already give `NaturalGeneric32`/`MipsStatfs64`.
+That choice is correct on the kernel that matters, measured on an x86_64 host, which is a
+compat-hosting kernel: a native i386 binary run on it reaches the real compat entry point, and
+`sz = 84` succeeds while `sz = 88`, `96`, `120`, `0` and `4096` all return `EINVAL`. So
+`.x86 => .packed32` is right for 32-bit x86 userspace under an x86_64 kernel, and the size check
+in `do_statfs64` is real rather than a hoped-for safety net. The mapping is held by a test
+(`familyFor`, statfs.zig:482). Not verified by this repository: a native i386 kernel (none in
+the lab; see *Open*). The severity of being wrong there is bounded by the same self-checking
+property documented below: a native i386 kernel handed the 84-byte buffer (its own `statfs64`
+is 88 bytes) returns `EINVAL` rather than a silently misaligned `Usage`.
 
 **Why `statfs64`, not `statfs`, wherever it exists.** The plain `statfs`
 struct's counters are kernel `long` — 32 bits on a 32-bit kernel ABI, which
@@ -184,13 +179,15 @@ computes used / (used + available) rounded up and is pinned to captured `df` out
 Anchoring). There is no single correct rounding rule, and the two real-world
 implementations pick differently:
 
-- **coreutils `df`** rounds *up* (`df.c`'s `usage_percent` in GNU coreutils
-  computes `used`/`total` and takes the `ceiling`, so any nonzero remainder
-  bumps the percentage to the next whole number).
+- **coreutils `df`** rounds *up* (the percentage is used / (used + available),
+  with any nonzero remainder bumping it to the next whole number; pinned by the
+  captured `df` golden, whose ext4 row has a root reserve and therefore separates
+  this denominator from `total`).
 - **busybox `df`** rounds to the *nearest* whole percent:
   `(used*100 + denom/2) / denom` (integer division with a pre-added half-
-  denominator, the standard round-half-up-via-integer-arithmetic idiom;
-  `denom` is `total`, `used` is `total - available`).
+  denominator, the standard round-half-up-via-integer-arithmetic idiom; the
+  same `used` and `denom = used + available` as above, which is what
+  `Usage.usePercentNearest` computes).
 
 The two disagree exactly at the boundary a truncating/flooring implementation
 would also get wrong, and disagree with each other by construction whenever
@@ -201,9 +198,22 @@ busybox's `df` and **37%** under a round-up implementation — a one-point
 difference from the identical underlying `f_blocks`/`f_bavail` numbers, pure
 rounding-rule choice. A consumer that wants busybox's round-to-nearest convention (most OpenWRT/embedded
 targets - this module's `.linux32` audience - report it; most desktop/server Linux reports
-coreutils' round-up) computes it from the raw `Usage` fields rather than from
-`usePercent()`; plain truncation matches neither and would read low compared to both
+coreutils' round-up) calls `Usage.usePercentNearest()` instead of `usePercent()`; plain truncation matches neither and would read low compared to both
 real-world tools.
+
+**Byte unit.** The block counts are in `f_frsize` units (`Usage.unitBytes`, statfs.zig:142; `f_bsize`
+only when the kernel reports 0), as POSIX `statvfs`, musl, glibc and GNU `df` count. A non-positive
+size (hostile or corrupt report) is clamped to 0, and the byte helpers saturate.
+
+**`lookup.Index`.** `lookup.containing` scans the table once per tree step: O(depth x n) per call,
+fine on a table the kernel wrote, but O(n^2) on a hostile saved table whose parent ids form a
+cycle. `lookup.Index.init` (lookup.zig:170) builds a parent-id sorted index once and
+`lookup.containingIndexed` (lookup.zig:208) answers from it, resolving a parent cycle by remembering
+the visited entries, O(n log n) in the worst case. The answer is identical to `containing` on every
+table (the walk still stops after `entries.len` steps, so the entry at that position of a cycle is
+returned); `containing` keeps its signature and stays non-allocating. `table.collectWith` builds one
+`Index` for all its `Options.tree` candidates (table.zig:127). The index is only for mountinfo
+entries and is not thread-safe.
 
 ## Constant-time contract
 
@@ -215,66 +225,49 @@ Not applicable — no secret material is handled anywhere in this module.
   `PATH_MAX`-derived buffer; a longer path returns `error.NameTooLong`
   rather than truncating.
 - `statfs.query` rejects a `path` containing an embedded NUL byte with
-  `error.InvalidPath`, checked before `toPosixPath` ever sees it.
+  `error.InvalidPath` (statfs.zig:595), checked before `toPosixPath` ever sees it.
   `toPosixPath` itself only `assert`s the absence of one — a crash in a
   safety-checked build, and in `ReleaseFast`, where `assert` compiles away, a
   silent truncation to whatever precedes the NUL: the caller would be told
-  about a shorter path than the one it actually gave. Measured: before the
-  check, `query("/\0/definitely/not/a/real/path")` in `ReleaseFast` returned
-  byte-identical numbers to `query("/")`, and in `ReleaseSafe` aborted. The
+  about a shorter path than the one it actually gave. The
   sibling `diskusage` module refuses the same input identically
-  (`stat.StatError.InvalidPath`), where a fuzz harness is what found it.
+  (`stat.StatError.InvalidPath`).
 - `mounts.readMounts`/`mountinfo.readMountinfo` cap the read at 1MiB
   (`mounts.mount_table_read_limit` / `mountinfo.mountinfo_read_limit`) —
-  chosen as generous headroom over any real host's mount table (this repo's
-  own dev host's `/proc/self/mounts` is ~4KiB for 63 mounts) while still
-  bounding allocation against a pathological mount count, matching
-  `procnet`'s `readVirtualFile` discipline (its own doc comment explains why
-  a streaming read is required at all: `/proc` files report size 0 from
-  `stat`). ⚠ That cap **truncates**; it does not reject. A table past the
-  limit comes back as its bounded prefix **with the partial final line
-  dropped by the reader**, so the caller gets a short listing — never an
-  empty one. ⚠ Until this module's first audit (2026-09-04) this said the
-  cut row was "skipped as malformed like any other", and the parsers do not
-  do that: a cut only produces too-few-columns if it lands *before* the last
-  required column, and once it lands inside the final column the row is
-  complete and is accepted carrying a **prefix** of that value. Measured on
-  a real 73-mount capture: a `mountinfo` row came back with `super_options`
-  = `rw,size=10` where the truth was `rw,size=1024k` — not a visibly broken
-  row, a well-formed wrong one, 100x off. Dropping the tail after the last
-  newline in `mounts.readVirtualFile` is what makes the promise true, and
-  `mountinfo` calls that same reader instead of carrying a duplicate of it
-  (the duplicate is why the false claim stood in two places at once).
-  ⚠ The commit that first made this claim did **not** actually remove the
-  duplicate — the edit never reached the file — so `mountinfo` kept the old
-  reader for one commit while the SPEC said otherwise. Caught by a peer
-  session watching a stuck process, not by the gate: the truncation test used
-  only row-aligned limits, so it could not tell the two behaviours apart. It
-  now cuts mid-row as well. This too matches `procnet`, and for the same reason it was
-  fixed there: as `allocRemaining(...) catch null` both readers returned
-  `null` on an oversized table, which is the value `readMounts`/
-  `readMountinfo` reserve for "`/proc` is not mounted" — a different fact,
-  and one the caller cannot tell apart. Measured on the defect: the cap
-  dropped to 300 bytes made `diskfree-demo` print "-- 0 filesystem(s)
-  shown." and exit 0 on a 63-mount host.
+  generous headroom over any real host's mount table (a 63-mount host's
+  `/proc/self/mounts` is ~4KiB) while bounding allocation against a pathological
+  mount count, matching `procnet`'s `readVirtualFile` discipline (a streaming
+  read is required at all because `/proc` files report size 0 from `stat`). ⚠ That
+  cap **truncates**; it does not reject. A table past the limit comes back as its
+  bounded prefix **with the partial final line dropped by the reader**
+  (`mounts.readVirtualFile`, shared by `mountinfo`), so the caller gets a short
+  listing — never an empty one and never a well-formed wrong row: a row cut
+  inside its last column would otherwise be accepted carrying a prefix of that
+  value (`super_options` = `rw,size=10` for `rw,size=1024k`). The `Limited` readers
+  (`mounts.readMountsLimited`, `mountinfo.readMountinfoLimited`) report the cut
+  (`Read.truncated`), which `lookup.locate` and `table.readTable` carry into
+  `Answer.table_truncated` / `Table.read_truncated`; `readVirtualFileCut` reports `cut = true`
+  also when `limit` equals the file length exactly (the reader stops at the limit before it
+  sees EOF; the text is whole then, so the flag errs on the safe side). `null` from a reader
+  means only "could not be opened or read" (e.g. `/proc` not mounted): an oversized table is
+  never `null`, and running out of memory is `error.OutOfMemory`, never "no data" or a short
+  table.
 - A malformed row in either parser (too few columns, non-numeric IDs, a
-  missing `-` separator, or — **F7 audit finding** — a second `-` token in
+  missing `-` separator, or a second bare `-` token in
   `mountinfo`, which a real kernel row never has: see `mountinfo.parseLine`'s
   doc comment) is skipped, not fatal — one corrupt line does not sink the
   whole table, matching `procnet`'s parsers.
-- **F7 audit finding: the 1 MiB read cap bounds bytes, not the allocation
-  count parsing turns them into.** Measured: 1 MiB of minimal rows
+- **The 1 MiB read cap bounds bytes, not the allocation
+  count parsing turns them into.** 1 MiB of minimal rows
   (`"a b c d\n"` × 131,072 for `mounts`, `"1 1 0:1 / / r x - t s r\n"` ×
   43,690 for `mountinfo`) parses in 0.05 s either way (the parse itself is
   linear), but collecting the ~830,000 resulting small allocations on
-  `std.heap.DebugAllocator` — this collection's own default debugging
-  allocator — takes **5.69 s**, ~114× slower than the **0.05 s** the same
+  `std.heap.DebugAllocator` takes 5.69 s, ~114× slower than the 0.05 s the same
   parse takes over an `ArenaAllocator`. Nothing here bounds allocation
   *count*, only byte volume. Reachability is genuinely limited (filling the
   reader's *own* `/proc/self/mountinfo` past 1 MiB needs mount privilege in
   the reader's mount namespace; the fully open path is a caller-supplied
-  snapshot, same trust boundary as the parsers' other adversarial-input
-  findings) — LOW, and left as a documented property rather than a code
+  snapshot) — LOW, and a documented property rather than a code
   change: **a caller parsing an untrusted or unbounded-size snapshot should
   use an arena (or another bulk allocator) rather than a general-purpose one**,
   the same advice `procnet`'s own high-row-count parsers give.
@@ -283,115 +276,29 @@ Not applicable — no secret material is handled anywhere in this module.
 
 **Anchor grade:** class B · oracle EXTERNAL
 
-- **Oracle EXTERNAL (2026-10-04): GNU coreutils `df`.** Two instruments, both driving `df` only
+- **Class B** — the wire formats (`statfs64` struct layout, `/proc/self/
+  mounts`/`mountinfo` text shape) are real external kernel ABI/UAPI
+  contracts another implementation must agree with, so an outside truth
+  exists.
+- **Oracle EXTERNAL: GNU coreutils `df`.** Two instruments, both driving `df` only
   through its public output (`df -B1 --output=size,used,avail,itotal,iused,iavail,pcent`):
   - **In the suite:** `src/testdata/df_golden.txt` (recipe `tools/capture-df-golden.sh`) holds,
-    for twelve real filesystems, the raw statfs numbers (`stat -f`) and what `df` printed for the
+    for real filesystems, the raw statfs numbers (`stat -f`) and what `df` printed for the
     same filesystem at the same moment (captured until two `stat -f` reads around the `df` call
     agree). The test rebuilds a `Usage` from the raw numbers and must reproduce every `df` column —
     Size, Used, Avail, inodes, Use% including its round-up and its `-` — exactly. Shapes covered:
     ext4 with a root reserve (Used + Avail < Size), vfat (no inodes), squashfs (100 %), tmpfs,
     efivarfs (1-byte blocks), and empty pseudo filesystems (`-`).
   - **By hand, live:** `tools/df-diff.sh` builds `tools/df_dump.zig` (the module's `query` + `Usage`
-    helpers over every mount in `/proc/self/mounts`) and compares it with one `df` call per mount.
-    Measured 2026-10-04 with df 9.7 on the x86_64 development host: **61 SAME, 2 DRIFT** (`/` and
-    `/run/snapd/ns`: used/avail moved 4–20 KiB between the two reads, totals equal), **0 DIFF, 0 SKIP**
-    over 63 mounts.
-  - **What it found:** nothing on that host — but asking the question exposed that the module
-    multiplied the block counts by `f_bsize`, where POSIX `statvfs` (and `df`, and musl's `statvfs`
-    fixup the `fragment_size` doc already cited) count in `f_frsize` units. Identical on every mount
-    there (`stat -f` shows the two sizes equal on all 63), wrong wherever they differ; fixed
-    (`Usage.unitBytes`) and pinned by a unit test from the POSIX definition, since no available
-    filesystem could exhibit it.
+    helpers over every mount in `/proc/self/mounts`) and compares it with one `df` call per mount
+    (verdicts SAME / DRIFT / DIFF / SKIP; DRIFT is used/avail moving between the two reads on a live
+    filesystem). Its differential is what established that the block counts are in `f_frsize` units
+    (see *Byte unit*): the two sizes are equal on the development host, so only a unit test
+    pinned from the POSIX definition can exhibit it.
   - **Blind spots, stated:** the golden and the live diff test the statfs → columns arithmetic and
     the x86_64 syscall path; the 32-bit/MIPS struct families stay anchored by the qemu-user runs
-    below, and the mount-table parsers by the real-`/proc` captures (`hostile-ns.sh`) — `df` does
-    not expose those to compare against.
-
-- **Evidence for the S2 features (2026-11-03), against GNU `df` 9.7 / Python `os.statvfs` / a static musl probe as black boxes:**
-  `tools/df-where-diff.sh` on the 75-mount development host: path -> mount **18 SAME, 0 DIFF** against
-  `df --output=target PATH` over 18 canonical paths; mount flags **18 SAME, 0 DIFF** against `os.statvfs(PATH).f_flag`
-  (found that the kernel's `ST_VALID` bit 0x20 rides in `f_flags`: masked; a static musl probe keeps it); the default listing
-  (with `df_default_skip`) **0 df-only rows, 1 module-only row = a repeated device**, `df -a` against `include_pseudo`
-  **74 = 74, equal**; the oracle fails on a df-only row or on a module-only row whose device is not shared with a listed
-  one (`tools/list_check.py`). It found `efivarfs` wrongly in the pseudo list (df lists it; fixed) and, after the first
-  review, that "last covering entry wins" was wrong on a real table (mount-ID order lists the real `/` after `/proc` and
-  `/dev`): the rule is now the mount tree for mountinfo entries.
-  `tools/df-where-ns.sh` (in `unshare -rm`, no root, host untouched), module against `df --output=target FILE`:
-  stacked tmpfs (file, dir, trailing slash), same-device bind, a mount point with a space (`\040`), and a mount covered by a
-  later ancestor mount: **9 SAME, 0 DIFF**, plus the covered path itself (df cannot answer: the directory is gone) asserted
-  to resolve to the covering mount.
-  `statfs` structs: every field offset is asserted at compile time against the kernel headers (not only the size), and the
-  live `query("/")` and field-sentinel tests run green under `qemu-mips`, `qemu-mipsel`, `qemu-arm`, `qemu-mips64`,
-  `qemu-mips64el`, `qemu-s390x` (31 filtered tests each); the unfiltered suite is green under `qemu-ppc64le`. **Not run live:**
-  mips n32 (`mips64-linux-muslabin32`; mapped to the o32 `statfs64` struct, and the target does not build with Zig 0.16, see Open) and
-  every `natural32` architecture except through the compile-time asserts.
-  New code is held by the deterministic fuzz harness `DISKFREE_FUZZ` (`src/lookup_fuzz_test.zig`): hostile mount tables
-  (octal escapes decoding to `/`, NUL, `.`, `..`, space) go through `parseMounts` AND `parseMountinfo`, then `containing`,
-  `locate`, `isMountPoint`, `collectWith` (with and without the mount tree, random parent ids incl. cycles) and
-  `Usage.usePercent*`, each against an independent model (component stack, dedupe/filter/cap/no-blocks model with the harness's
-  own type lists, u128 arithmetic). 100 000 runs per harness in ReleaseSafe green; 81 % of seeds reach the lookup
-  comparison (NUL paths 4 %, relative 15 %); ten hand-made mutants (first-wins dedupe, shortest/first lookup tie,
-  no-blocks filter off, cap counted after filters off by one, cap ignoring the type filter, skip list ignored, relative mount
-  point queried, floor instead of ceil percent, read-cut flag dropped, ...) are all killed.
-
-
-Previously (kept for the record — the evidence that made it REDERIVED):
-
-- **Class B** — the wire formats (`statfs64` struct layout, `/proc/self/
-  mounts`/`mountinfo` text shape) are real external kernel ABI/UAPI
-  contracts another implementation must agree with, so an outside truth
-  exists.
-- **Oracle REDERIVED**: `mounts.zig`/`mountinfo.zig` tests run against text
-  actually captured from this host's live `/proc/self/mounts` and
-  `/proc/self/mountinfo` (`src/testdata/*_sample.txt`) plus hand-authored
-  fixtures for the escaped-path case — an in-house oracle reaching the
-  answer by reading the real kernel output, which catches a parsing typo but
-  not a shared misreading of the escape rule. `statfs.zig`'s struct layouts
-  are re-derived from the kernel UAPI header text
-  (`/usr/src/linux-headers-*/arch/{x86,arm,mips}/include/uapi/asm/statfs.h`
-  and `include/uapi/asm-generic/statfs.h`, cross-checked against musl's own
-  per-arch `bits/statfs.h`, which independently confirmed the MIPS field
-  order) rather than a live syscall on every architecture — this repository
-  has no MIPS/ARM/x86(32) kernel to run against, only x86_64. The `Native64`
-  path (x86_64) *is* additionally live-verified: `query("/")` runs the real
-  syscall on every CI lane and asserts internally consistent, non-garbage
-  numbers.
-
-  The other three families were cross-compiled (not merely parsed) with `zig
-  build-obj -target <triple>`, forcing real semantic analysis of `query` (a
-  bare compile of `root.zig` with nothing calling into it analyses nothing —
-  verified by deliberately breaking a struct's `comptime` size assert and
-  seeing the "broken" build still exit 0, until an `export fn` that actually
-  calls `query` was added to force it), across x86 (i386), arm, mips, mipsel,
-  powerpc, riscv32, aarch64, riscv64, s390x, sparc64 and loongarch64. This
-  caught a real bug in this module before it shipped: the four families'
-  `comptime` size asserts are NOT pruned per-target (`family`'s `switch` in
-  `query` is pruned, but a file's top-level `comptime {}` blocks all run
-  whenever that file is analyzed at all, on whichever target is active), and
-  `extern struct` fields left at "natural" alignment size differently per
-  target — i386's SysV ABI aligns 8-byte scalars to 4 bytes, unlike every
-  other target here — so `MipsStatfs64`/`NaturalGeneric32` computed the wrong
-  size the moment i386 was the active target, even though neither struct is
-  ever used on i386. Every field 8 bytes or wider now carries an explicit
-  `align(8)`/`align(4)` (see the comment block above `Native64`), making each
-  struct's `@sizeOf` a fixed fact about the kernel ABI it represents,
-  independent of the active compilation target. Confirmed by mutating each of
-  the four size asserts in turn and observing the forced-analysis build fail
-  (previously silent), then reverting and observing it pass again, on the
-  same target that first exposed the bug. One target does not build at all —
-  `mips64-linux-muslabin32` (mips n32 ABI) — but the failure is entirely
-  inside `std.Io.Threaded`'s generic Linux file-mapping code and the
-  `MipsN32` syscall table (missing `.llseek`, an `arg6: u32` vs `u64`
-  mismatch), not in anything this module wrote; it looks like a gap in Zig
-  0.16.0's own std support for that specific ABI variant, not a `diskfree`
-  defect, and n32 (as opposed to o32, `.mips`/`.mipsel`, which build and
-  analyze cleanly) is not the concrete target this module's requirements
-  named.
-
-**Audit 2026-11-19 (whole-module mutation).** 279 schemata mutants over every non-test source file (`classify.zig`, `mounts.zig`, `mountinfo.zig`, `statfs.zig`, `lookup.zig`, `table.zig`; `root.zig` only re-exports): 214 over conditions and operators (dropped guards, off-by-one limits, swapped operands and fields, wrong errno class, skipped cleanups, inverted verdicts) plus 65 table-entry mutants (each name of the pseudo, remote and FUSE-remote tables dropped in turn). Result: 268 killed, 10 equivalent, 1 unobservable, 0 not run. The card's `268/279` replaces the earlier delta-only counts. Not mutated: the kernel-ABI struct declarations, their `comptime` size/offset assertions, the `St.*` constants and the `family` constant (compile-time, a runtime switch cannot reach them; the `familyFor` prongs and every `toUsage` arm ARE mutated and pinned by tests that run all families on any host), `tokenOffset`, the `|` joins of `unescapeOctal`'s three octal digits (disjoint bit fields, `+` is the same value) and printing. The first run left 61 survivors; tests added for them: digits without a backslash and `\018` stay literal in `unescapeOctal`, tab-separated and short rows in `parseMounts`, the `readMountsLimited` truncation flag and the exact limit boundary of `readVirtualFileCut`, a direct `mapErrno` test of every errno class, a root entry written as `//` for both lookup finders, a tree that is not entry-for-entry with the table, whole-name matching of `skip_fs_types`, the device of a `readTable` row, and golden lists of every name in the three classification tables (a name dropped from a table had survived for all but sixteen of them).
-
-Equivalent (10): the blank-line guards of both parsers (a blank line has no columns and is dropped by the column checks anyway); relaxing any one of the first three `orelse continue` columns of a mounts row (the next column's guard drops the same row, only the last column's guard is observable and is killed); the `pid == 0` guard of `readMountinfoOf` (`/proc/0/mountinfo` does not exist, the read is `null` either way); `unitBytes` `unit > 0` against `>= 0` (a 0 unit casts to 0); the `.ACCES, .PERM` switch label of `mapErrno` (a switch label is comptime, the mutant is inexpressible; the `.PERM` mapping itself is tested); the cycle detection of `Index` (cost-only: the walk is bounded by `entries.len` either way and the answer is identical); the `top == null` branch of `collectWith` (unreachable: a canonical mount point always covers itself). Unobservable (1): `readTable` passing no mount tree on (`o.tree = null`) differs only on a live table that contains a covered mount, and `readTable` reads `/proc/self/mountinfo` directly; an injectable source or a mount namespace would be needed. Observation, not pinned: `readVirtualFileCut` reports `cut = true` when `limit` equals the file length exactly (the reader stops at the limit before it sees EOF); the text is whole then, so the flag errs on the safe side.
+    (see *Verification*), and the mount-table parsers by the real-`/proc` captures (`hostile-ns.sh`) —
+    `df` does not expose those to compare against.
 
 ## What is deliberately not done
 
@@ -400,101 +307,96 @@ Equivalent (10): the blank-line guards of both parsers (a blank line has no colu
   duplicating it here would drift. `Usage.fs_type_magic` is exposed raw.
 - `fstatfs` (the file-descriptor-based sibling of `statfs`) — `query` takes
   a path, which covers "what does this directory's filesystem look like"
-  without requiring the caller to already have an open fd. Adding `fstatfs`
-  is a small, symmetric extension if a consumer needs it on an already-open
-  fd; deferred until one does.
+  without requiring the caller to already have an open fd, and no competitor in
+  the comparison table exposes it (gopsutil and nix `statvfs` take paths). Adding `fstatfs`
+  is a small, symmetric extension if a consumer holds only an fd.
+- Human/SI size formatting (`df -h`): presentation, the caller's; no sibling module owns it and
+  `totalBytes()` etc. are the inputs.
+- Deduplication by device / hiding bind mounts of one filesystem (GNU `df`'s default): policy.
+  `Row` carries `device` and `usage`, and `table` dedupes only the one thing that is not policy, a
+  repeated mount point (keeping the mount on top). GNU `df` 9.7 shows a device once (a bind mount of a
+  listed filesystem is hidden) and omits `squashfs` and `devtmpfs` from its default view;
+  `table.Options.skip_fs_types` (= `df -x`) with `table.df_default_skip` reproduces the type rule and
+  is not the default because OpenWrt's root is squashfs. The listing oracle (`tools/list_check.py`)
+  fails on any df-only row and on any module-only row that is not a repeated device.
 - `/proc/<pid>/mounts` for another process (`mountinfo.readMountinfoOf` covers
   `/proc/<pid>/mountinfo`, the richer file; the four-column `mounts` file has no `Of`
   variant, since `mountinfo` is the better source for a namespace question).
 - A `libmount`-style mount-tree builder over `mountinfo`'s `mount_id`/
   `parent_id` — the raw fields are exposed; building and maintaining a tree
   structure from them is consumer-side until something here needs it
-  internally.
+  internally. Path lookup does walk the tree internally over mountinfo entries.
+- Tree-aware lookup on plain `mounts` entries: only mountinfo entries carry the ids the walk needs;
+  over `mounts` entries `containing` is longest-prefix and cannot see a mount covered by a later
+  ancestor mount (use mountinfo).
+- Non-Linux platforms: the module is Linux-only by design (raw syscalls, no libc).
+- The x32 ABI `statfs64` layout is refused at compile time (statfs.zig:537) rather than guessed
+  at: not a target of this collection and no kernel header was checked against it.
 
-## What the fuzz harnesses actually ran, before and after
+## Verification
 
-⚠ **A `Smith` ranged draw returns the range's minimum unless the input bytes
-already lie inside the range.** `valueRangeAtMost`, `index` and `value`
-consume 8 bytes, read them as one little-endian `u64`, and hand back
-`weights[0].min` whenever that `u64` falls outside the requested range — no
-scaling, no modulo. A corpus of ASCII text never lands in a small range, so
-outside `zig build --fuzz` **every** ranged draw in both harnesses returned
-its minimum: branch 0, length 0. The whole fuzz lane for this module was
-`parseMounts("")` and `parseMountinfo("")`, twice per gate run.
+Run: `scripts/modtest diskfree`. The suite is offline apart from the live `query("/")` and `/proc`
+reads of the host; GNU `df`, namespaces and Go are needed only by the by-hand instruments in
+`tools/` (`tools/README.md`), which never run in `zig build`.
 
-Measured directly rather than inferred — with `Smith{ .in = "/dev/sda1 …" }`,
-`valueRangeAtMost(u8, 0, 1)`, `valueRangeAtMost(u16, 0, 2048)`, `value(u8)`
-and `index(165)` all return **0**, while an input crafted as in-range
-little-endian `u64` words returns 1, 900, 200 and 77. `Smith.bytes` is the
-exception: it copies the input faithfully in both modes.
-
-Two consequences were load-bearing here:
-
-- The `\400` overflow in `unescapeOctal` sat in a public entry point with a
-  fuzz harness pointed straight at it, and the harness never once reached the
-  escape decoder. Instrumented over **1,000,000 rounds of the old shape: zero
-  backslash bytes** ever reached it.
-- Its doc comment justified mutating a real capture on the grounds that this
-  "exercises `unescapeOctal`'s bounds check far more often than a from-scratch
-  random blob would" — and the capture it mutates contains **zero
-  backslashes**. The named mechanism was not there to begin with.
-
-Both harnesses now derive every decision from `Smith.bytes` and carry the
-escaped fixture as a second sample, so a corpus entry means something outside
-the fuzzer too. Re-measured against the defect deliberately reinstated: the
-new shape trips it in **~550 rounds**. The old `mutateSample` shape is shared
-with `procnet`'s, and this is a property of `Smith`, not of either module.
-
-## Backlog / deferred
-
-- ~~**`lookup.containing` on a hostile mountinfo snapshot**~~ **DONE 2026-11-19** *(2026-11-03)*: `lookup.Index` + `lookup.containingIndexed` answer from a parent-id sorted index (built once per table) and resolve a parent cycle by remembering the visited entries, so a cycle through every entry costs O(n) steps of O(log n + children) instead of n scans of the table; `table.collectWith` builds one `Index` for all its `Options.tree` candidates. The answer is identical to `containing` on every table (a randomized cross-check over 3000 hostile tables with cycles and duplicate ids; the walk still stops after `entries.len` steps, so the entry at that position of a cycle is returned). `containing` itself keeps its signature and stays non-allocating (O(depth x n) per call, fine on a kernel-written table); a caller with an untrusted saved table builds an `Index`. Delta mutation 2026-11-19: 17 mutants over `Index`/`containingIndexed`/`indexNext`, 16 killed, 1 EQUIVALENT (cost-only: disabling the cycle detection gives the same answer, because the walk is bounded by `entries.len` either way; the detection only avoids re-scanning non-covering children on every step of a hostile two-entry loop, a speed difference a test cannot assert on).
-
-Survey 2026-09-30 — missing and it matters (all pure Zig, fit CONVENTIONS §2; the module stays Linux-only by design):
-
-The 2026-09-30 survey items (path -> mount, pseudo/remote classification, mount flags, `/proc/<pid>/mountinfo`) were
-closed on 2026-11-03; `fstatfs` was rejected (see "Parity verdicts"). What is left:
-
-- (survey 2026-11-02) **Tree-aware lookup on plain `mounts` entries**: only mountinfo entries carry the ids the walk needs; over `mounts` entries `containing` is longest-prefix and cannot see a mount covered by a later ancestor mount (use mountinfo). Effort: none, by design.
-- (survey 2026-11-02) **Speed rows outside the bench**: the bench pairs the mountinfo parse, the live read and
-  `statfs("/")`; `table.readTable` (one `statfs` per mount, 220 µs on the 75-mount development host) has no like-for-like
-  reference (gopsutil/sysinfo were not built). A faster reader in another language than Go (Rust `procfs`, C libmount)
-  was not measured, hence "fastest ?".
-- (survey 2026-11-02) **Mounts-file parse with a reference**: `mounts.parseMounts` has no Go/Rust counterpart in the bench
-  (moby reads only mountinfo).
+- **Parsers:** `mounts.zig`/`mountinfo.zig` tests run against text captured from a live
+  `/proc/self/mounts` and `/proc/self/mountinfo` (`src/testdata/*_sample.txt`) plus hand-authored
+  fixtures for the octal-escape path (`src/testdata/*_escaped.txt`), including `unescapeOctal`
+  boundaries, short and tab-separated rows, a forged second `-` token, and the read-cut flag and
+  exact limit boundary of `readVirtualFileCut`. `tools/hostile-ns.sh` regenerates real kernel
+  output for a namespace with hostile mount points (with a `findmnt --json` cross-check).
+- **`statfs`:** every struct family's size and every field offset are asserted at compile time
+  against the kernel headers; `familyFor` (the architecture-to-layout mapping, x86's compat choice
+  included) and the `toUsage` field mapping of each family are tested on any host with a synthetic buffer; every errno
+  class through `mapErrno`; the NUL and over-long path refusals; the `df` golden above rebuilt
+  into `Usage` and compared column by column.
+- **Table, lookup, classify:** `table.collectWith` over a fake query (dedupe, filters, cap, covered
+  mounts, failed queries), `lookup` over stacked/bind/covered/space-in-path tables and hostile
+  parent cycles (a randomized cross-check of `Index` against `containing`), golden lists of
+  every name in the three classification tables.
+- **No-panic sweep:** `src/sweep_test.zig` pins that an allocation failure surfaces as
+  `error.OutOfMemory` from the parsers and readers, never as a short table or "no data".
+- **By-hand oracles against GNU `df`, Python `os.statvfs` and a static musl probe**
+  (`tools/df-where-diff.sh`, `tools/df-where-ns.sh`, `tools/list_check.py`, `tools/df-diff.sh`):
+  path -> mount against `df --output=target PATH`; the hard path cases in `unshare -rm` (stacked
+  tmpfs, a same-device bind, a mount point with a space, a mount covered by a later ancestor mount;
+  a covered path itself is asserted to resolve to the covering mount, `df` cannot answer it);
+  mount flags against `os.statvfs(PATH).f_flag`; the default listing and `df -a` against
+  `include_pseudo`. They found `efivarfs` wrongly in the pseudo list and that "last covering entry
+  wins" is wrong on a real table (mount-ID order lists the real `/` after `/proc` and `/dev`),
+  hence the mount-tree rule for mountinfo entries.
+- **Cross-architecture:** the live `query("/")` and field-sentinel tests were run by hand under
+  qemu-user for mips, mipsel, arm, mips64 and mips64el and s390x, and the unfiltered suite under
+  ppc64le; qemu-user thunks guest syscalls through its own independent transcription of each
+  `struct statfs64`, which confirms MIPS's field order. Two limits of that oracle: qemu-user does
+  not implement the kernel's `sz` check, and it cannot discriminate `packed32` from `natural32`
+  (identical field offsets, different trailing padding), so ARM's 84-byte choice rests on the
+  `EINVAL` net and the compile-time asserts. Not run live: mips n32 and every `natural32`
+  architecture (checked through the compile-time asserts only). Cross-compiling needs an exported
+  function that calls `query` to force semantic analysis (`zig build-obj -target <triple>`):
+  a bare compile of `root.zig` analyses nothing.
+- **Fuzz:** the deterministic driver `DISKFREE_FUZZ=<runs>[,<first seed>]` (testkit's driver, never
+  `zig build --fuzz`) runs three harnesses: `parseMounts` and `parseMountinfo` (`mounts.zig`,
+  `mountinfo.zig`) and `src/lookup_fuzz_test.zig`, which feeds hostile mount tables (octal escapes
+  decoding to `/`, NUL, `.`, `..`, space) through both parsers and then `containing`, `locate`,
+  `isMountPoint`, `collectWith` (with and without the mount tree, random parent ids including
+  cycles) and `Usage.usePercent*`, each against an independent model written in the harness
+  (component stack, dedupe/filter/cap model with the harness's own type lists, u128 arithmetic).
+  Every decision is read out of the byte blob (`src.bytes`): a `Smith` ranged draw returns its
+  range's minimum unless the input bytes already lie inside the range, so ranged draws outside
+  `--fuzz` would degenerate to branch 0, length 0.
+- **Bench:** `zig build bench-diskfree` (mountinfo parse, live read+parse and `statfs("/")` against
+  Go `moby/sys/mountinfo`, `prometheus/procfs` and `x/sys`, plus informational `lookup` and `table`
+  rows); the figures are the card's `**Performance:**` line.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- Not mutated: the kernel-ABI struct declarations, their `comptime` size/offset assertions, the `St.*` constants and the `family` constant (compile-time, a runtime switch cannot reach them; the `familyFor` prongs and every `toUsage` arm are mutated and pinned by tests that run all families on any host), `tokenOffset`, the `|` joins of `unescapeOctal`'s three octal digits (disjoint bit fields, `+` is the same value) and printing.
 
 ## Open
 
-- ~~`NaturalGeneric32`/`PackedGeneric32`/`MipsStatfs64` are unverified by a
-  live syscall on their actual target architectures.~~ **CLOSED by the first
-  audit (2026-09-04), by qemu-user.** `qemu-arm`/`qemu-mips`/`qemu-i386`/
-  `qemu-aarch64` thunk guest syscalls through their own independent
-  transcription of each architecture's `struct statfs64` — a foreign
-  implementation of exactly what this module hand-transcribed. All four
-  families give the right numbers on **eight architectures**, both
-  endiannesses, checked field-by-field against `stat -f /` on the host;
-  MIPS's distinctive field order is externally confirmed.
+- `mips64-linux-muslabin32` (mips n32 ABI) does not currently build at all — the failure is inside Zig 0.16.0's own `std.Io.Threaded`/`std.os.linux` support for that target (measured on 0.16, not re-checked on 0.17: a `.llseek` syscall missing from the `MipsN32` table, an `arg6` width mismatch), unrelated to this module's code. It is mapped to the o32 `statfs64` struct and never run live; o32 (`.mips`/`.mipsel`) builds and analyzes cleanly.
+- A native i386 kernel and the `natural32` architectures are not run live (see *Verification*); the `EINVAL` size check bounds the damage of a wrong layout.
 
-  ⚠ Two limits of that oracle, verified rather than assumed, because an
-  oracle's blind spot is the part that matters: qemu-user **does not
-  implement the kernel's `sz` check** (it accepted every size passed), and
-  it **cannot discriminate `packed32` from `natural32`** — the two have
-  identical field offsets and differ only in trailing padding. So ARM's
-  84-byte choice remains unanchored in the one way that would matter, and
-  the `EINVAL` net below is what stands behind it.
-- `mips64-linux-muslabin32` (mips n32 ABI) does not currently build at all —
-  the failure is inside Zig 0.16.0's own `std.Io.Threaded`/`std.os.linux`
-  support for that target (measured on 0.16, not re-checked on 0.17) (a `.llseek` syscall missing from the `MipsN32`
-  table, an `arg6` width mismatch), unrelated to this module's code. Not
-  investigated further here: out of scope for a `diskfree` fix, and o32
-  (`.mips`/`.mipsel`) — the concrete target this module's requirements
-  named — builds and analyzes cleanly.
-- ~~`.x86`'s mapping to `PackedGeneric32` assumes a 32-bit process under an
-  x86_64 kernel's compat syscall layer.~~ **CLOSED by the first audit
-  (2026-09-04), and the assumption is correct.** An x86_64 host *is* a
-  compat-hosting kernel, which the note above missed: a native i386 binary
-  run on one reaches the real compat entry point. Measured there —
-  `sz = 84` **succeeds**; `sz = 88`, `96`, `120`, `0` and `4096` all return
-  **EINVAL**. That settles both halves at once: `.x86 => .packed32` is
-  right, and `do_statfs64`'s size check is real rather than a hoped-for
-  safety net. The mapping is now held by a test (`familyFor`), which the
-  inline `switch` it replaced could not be.
+## Backlog / deferred
+
+- **Speed rows outside the bench**: the bench pairs the mountinfo parse, the live read and `statfs("/")`; `table.readTable` (one `statfs` per mount) has no like-for-like reference (gopsutil/sysinfo were not built). A faster reader in another language than Go (Rust `procfs`, C libmount) was not measured, hence the card's "fastest ?".
+- **Mounts-file parse with a reference**: `mounts.parseMounts` has no Go/Rust counterpart in the bench (moby reads only mountinfo).

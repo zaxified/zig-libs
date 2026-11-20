@@ -9,9 +9,8 @@ filesystem, `major:minor` — that `findmnt`/`libmount` actually read).
 
 Provenance: clean-room from `statfs(2)`, `proc(5)` and the kernel UAPI
 headers (`include/uapi/asm-generic/statfs.h` and the per-architecture
-overrides in `arch/{x86,arm,mips}/include/uapi/asm/statfs.h`) — no
-third-party source ported, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0). One design reference was studied, not ported:
+overrides in `arch/{x86,arm,mips,s390}/include/uapi/asm/statfs.h`) — no
+third-party source ported, so the module has no `NOTICE` of its own. One design reference was studied, not ported:
 musl libc's `src/stat/statvfs.c` (MIT) for its syscall-selection strategy —
 `statfs64` with an explicit `sizeof(*buf)` where the target has it,
 otherwise plain `statfs` — mirrored here because a native 64-bit `statfs`
@@ -19,11 +18,9 @@ struct already has 64-bit counters and gains nothing from the wider syscall.
 No musl source was copied. The `src/testdata/*_sample.txt` fixtures are raw
 captures of this host's own live `/proc/self/mounts`/`mountinfo` output (no
 third-party data); `src/testdata/*_escaped.txt` are hand-authored by our own
-tooling to exercise the octal-escape path deterministically. The 2026-11-03
-additions (`table`, `lookup`, `classify`, `Usage.flags`, the `mips64` and `s390x`
-`statfs` structs from `arch/{mips,s390}/include/uapi/asm/statfs.h`) are
-clean-room from `statfs(2)`/`proc(5)` and observed GNU `df` 9.7 / Python
-`os.statvfs` output. `tools/go_bench/go.mod` and `go.sum` pin
+tooling to exercise the octal-escape path deterministically. `table`, `lookup`, `classify`, `Usage.flags` and the `mips64` and `s390x`
+`statfs` structs are clean-room from `statfs(2)`/`proc(5)`, the
+kernel headers named above and observed GNU `df` 9.7 / Python `os.statvfs` output. `tools/go_bench/go.mod` and `go.sum` pin
 `github.com/moby/sys/mountinfo` v0.7.3 (Apache-2.0), `github.com/prometheus/procfs`
 v0.21.1 (Apache-2.0) and `golang.org/x/sys` v0.49.0 (BSD-3-Clause), written by
 `go get`/`go mod tidy` from the local Go module cache; they are bench references
@@ -103,9 +100,9 @@ kernel reports 0), as POSIX `statvfs` and `df` use it. **Checked against GNU
 `df` itself:** a golden of captured `df` output for twelve real filesystems
 is in the test suite (`tools/capture-df-golden.sh`), and `tools/df-diff.sh`
 compares the module with `df` live on every mount of the machine it runs on
-(2026-10-04: 61 SAME, 2 live-drift, 0 DIFF over 63 mounts).
+(verdict per mount: SAME, DRIFT on a live filesystem, DIFF, SKIP).
 
-**The `df` listing as data** (2026-11-03). `df`, `df -a`, `df -l`, `df FILE`:
+**The `df` listing as data.** `df`, `df -a`, `df -l`, `df FILE`:
 
 ```zig
 // Every mount with its statfs: pseudo filesystems hidden, one row per mount
@@ -141,15 +138,10 @@ including octal-escaped paths — see `mounts.unescapeOctal`'s doc comment);
 `readMounts`/`readMountinfo` are the thin live-file wrappers. A missing or
 unreadable `/proc` file returns `null`, not an error.
 
-## DEFER (beyond this module's current scope)
+## Not provided
 
-- Filesystem-type-magic → name resolution (`0xEF53` → `"ext4"`) — the
-  kernel's magic-number table is long and grows; `Usage.fs_type_magic` is
-  exposed raw and a caller compares against the specific constant it needs.
-- `/proc/<pid>/mounts` for another process — `mountinfo.readMountinfoOf(pid)`
-  covers `/proc/<pid>/mountinfo`, the better source for a namespace question.
-- `fstatfs` (by file descriptor), human/SI size formatting, a mount tree,
-  hiding bind mounts of one device (`df`'s policy): see SPEC "Parity verdicts".
-- `x32` ABI `statfs64` layout — refused at compile time
-  (`statfs.zig`'s `family` dispatch) rather than guessed at; not a target of
-  this collection.
+Filesystem-type-magic → name resolution (`Usage.fs_type_magic` is exposed raw), `/proc/<pid>/mounts`
+for another process (`mountinfo.readMountinfoOf` covers `/proc/<pid>/mountinfo`), `fstatfs`, human/SI
+size formatting, a mount-tree builder, hiding bind mounts of one device (`df`'s policy), non-Linux
+platforms and the `x32` ABI (refused at compile time) are left out; see SPEC *What is deliberately
+not done* and *Backlog / deferred*.
