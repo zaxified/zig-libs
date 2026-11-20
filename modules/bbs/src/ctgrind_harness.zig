@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — constant-time evidence for two of `bbs.zig`'s four
-//! Fable cores, as an actual committed program instead of an unmeasured
+//! core functions, as an actual committed program instead of an unmeasured
 //! sentence. Run it through `../../../scripts/checks/ctgrind.sh bbs` (once the
 //! coordinator adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this
 //! file's doc comment suggests below — that script REFUSES an unlisted

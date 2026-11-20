@@ -37,7 +37,7 @@
 //! - `keys.zig` — REAL. `KeyGen`/`SkToPk`, `SecretKey`/`PublicKey` + wire
 //!   codecs.
 //! - `bbs.zig` — `Signature`/`Proof` structs + byte codecs (REAL); the
-//!   four **FABLE CORE** functions `sign`/`verify`/`proofGen`/
+//!   four **core** functions `sign`/`verify`/`proofGen`/
 //!   `proofVerify` (implemented).
 //! - `gate.zig` — the single switch (`core_implemented`) gating the four
 //!   cores' KAT tests.
@@ -83,13 +83,13 @@ const bbs_mod = @import("bbs.zig");
 pub const BbsError = bbs_mod.BbsError;
 pub const Signature = bbs_mod.Signature;
 pub const Proof = bbs_mod.Proof;
-/// FABLE CORE — see `bbs.zig`.
+/// Core function — see `bbs.zig`.
 pub const sign = bbs_mod.sign;
-/// FABLE CORE — see `bbs.zig`.
+/// Core function — see `bbs.zig`.
 pub const verify = bbs_mod.verify;
-/// FABLE CORE — see `bbs.zig`.
+/// Core function — see `bbs.zig`.
 pub const proofGen = bbs_mod.proofGen;
-/// FABLE CORE — see `bbs.zig`.
+/// Core function — see `bbs.zig`.
 pub const proofVerify = bbs_mod.proofVerify;
 /// `randomScalarCount(U)` — how many random scalars `proofGen` takes.
 pub const randomScalarCount = bbs_mod.randomScalarCount;
@@ -157,10 +157,8 @@ test "meta.deps is exactly {bls12_381, entropy, wipealloc}" {
 }
 
 test "gate IS flipped (the four Fable cores are implemented)" {
-    // The scaffold-stage counterpart of this test asserted
-    // `!gate.core_implemented`; the Fable pass that implemented the four
-    // cores flipped `gate.zig`, so this now pins the POST-Fable state
-    // (and `kat_test.zig`'s gated byte-exact KATs actually run).
+    // Pins that the four cores are implemented (and so `kat_test.zig`'s
+    // gated byte-exact KATs actually run).
     try std.testing.expect(gate.core_implemented);
 }
 

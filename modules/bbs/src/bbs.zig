@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! bbs — the `Signature`/`Proof` wire types (REAL, byte-exact codecs) and
-//! the FOUR Fable-hard cores this module scaffolds around:
+//! the FOUR core functions:
 //! `sign`/`verify` (draft §3.5.1/§3.5.2, "CoreSign"/"CoreVerify" §3.6.1/
 //! §3.6.2) and `proofGen`/`proofVerify` (draft §3.5.3/§3.5.4, the
 //! selective-disclosure Fiat-Shamir NIZK — §3.6.3/§3.6.4 plus the
 //! `ProofInit`/`ProofFinalize`/`ProofVerifyInit`/`ProofChallengeCalculate`
-//! subroutines, §3.7). All four are IMPLEMENTED (a Fable pass filled the
-//! scaffold and flipped `gate.core_implemented = true`), each carrying a
+//! subroutines, §3.7). All four are IMPLEMENTED (`gate.core_implemented = true`), each carrying a
 //! complete per-step doc-comment contract transcribed from
-//! draft-irtf-cfrg-bbs-signatures-12 — see `../SPEC.md` for the pin and `gate.zig` for the scaffold-then-Fable
-//! discipline.
+//! draft-irtf-cfrg-bbs-signatures-12 — see `../SPEC.md` for the pin and `gate.zig` for the gate flag.
 //!
 //! **Why `proofGen`/`proofVerify`, not `sign`/`verify`, are the genuinely
 //! hard core**: `sign`/`verify` are a single Schnorr-like pairing
@@ -24,7 +22,7 @@
 //! backwards and the result can still "look plausible" — compile, run,
 //! even pass a lazy prove-then-verify smoke test — while being
 //! completely unsound), the same class of risk `bulletproofs`' IPA and
-//! `threshold_ecdsa`'s Πprm/Πmod document for their own Fable cores.
+//! `threshold_ecdsa`'s Πprm/Πmod document for their own cores.
 //!
 //! **Randomness — explicit parameter, not internal entropy** (see
 //! `../README.md`'s "Randomness" section): `proofGen` takes
@@ -425,7 +423,7 @@ fn negBp2() G2.Affine {
     return G2.Jacobian.fromAffine(cs.BP2).negate().toAffine();
 }
 
-// ── the four Fable-hard cores ────────────────────────────────────────────
+// ── the four core functions ────────────────────────────────────────────
 
 /// `ProofVerifyInit` (draft-12 §3.7.3) steps 2-4, MSM-crossover form:
 /// ```
@@ -488,7 +486,7 @@ pub fn Scheme(comptime Suite: type) type {
     return struct {
         pub const suite = Suite;
 
-        /// FABLE CORE — `Sign(SK, PK, header, messages)` (draft-12 §3.5.1
+        /// Core function — `Sign(SK, PK, header, messages)` (draft-12 §3.5.1
         /// Interface wrapping §3.6.1's `CoreSign`).
         ///
         /// Construction (draft §3.5.1 + §3.6.1, composed):
@@ -551,7 +549,7 @@ pub fn Scheme(comptime Suite: type) type {
             return (Signature{ .a = a, .e = e }).toBytes();
         }
 
-        /// FABLE CORE — `Verify(PK, signature, header, messages)` (draft §3.5.2
+        /// Core function — `Verify(PK, signature, header, messages)` (draft §3.5.2
         /// wrapping §3.6.2's `CoreVerify`).
         ///
         /// Construction (draft §3.5.2 + §3.6.2, composed):
@@ -602,7 +600,7 @@ pub fn Scheme(comptime Suite: type) type {
             });
         }
 
-        /// FABLE CORE — `ProofGen(PK, signature, header, ph, messages,
+        /// Core function — `ProofGen(PK, signature, header, ph, messages,
         /// disclosed_indexes, random_scalars)` (draft-12 §3.5.3 wrapping §3.6.3's
         /// `CoreProofGen`, itself `ProofInit` (§3.7.1) + `ProofChallengeCalculate`
         /// (§3.7.4) + `ProofFinalize` (§3.7.2)) — **the module's genuinely hard
@@ -747,7 +745,7 @@ pub fn Scheme(comptime Suite: type) type {
             return try out.toBytes(out_allocator);
         }
 
-        /// FABLE CORE — `ProofVerify(PK, proof, header, ph, disclosed_messages,
+        /// Core function — `ProofVerify(PK, proof, header, ph, disclosed_messages,
         /// disclosed_indexes)` (draft-12 §3.5.4 wrapping §3.6.4's
         /// `CoreProofVerify`, itself `ProofVerifyInit` (§3.7.3) +
         /// `ProofChallengeCalculate` (§3.7.4)).
@@ -1048,7 +1046,7 @@ test "proofVerify validates disclosed_messages/disclosed_indexes count before to
     ));
 }
 
-// ── refusals the mutation run of 2026-10-05 found unpinned ───────────────
+// ── refusals the mutation run found unpinned ───────────────
 
 /// `(0, 2)`: on `y² = x³ + 4`, of order 3, so outside `G1`.
 const g1_order3_compressed: [G1.compressed_bytes]u8 = [_]u8{0x80} ++ @as([G1.compressed_bytes - 1]u8, @splat(0));
@@ -1103,7 +1101,7 @@ test "proofGen refuses a zero r1 or r2 instead of emitting an identity Abar/Bbar
     // r1 = 0 makes Abar and Bbar the identity, r2 = 0 makes D the identity
     // and r3 = r2^-1 undefined: a proof no verifier can decode. Probability
     // ~2^-255 from a real draw; refused as malformed random scalars. The
-    // 2026-10-06 mutation run found the r1 check unpinned.
+    // mutation run found the r1 check unpinned.
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
     const sig = try sign(testing.allocator, &kp.sk, kp.pk, "", &messages);
@@ -1144,7 +1142,7 @@ test "proofVerify refuses more messages than indexes, index == L, a duplicate in
     try testing.expect(!try proofVerify(testing.allocator, kp.pk, forged_proof, "", "", &.{"a"}, &.{0}));
 }
 
-// ── the RNG seam (entropy re-audit 2026-08-13) ───────────────────────────
+// ── the RNG seam (entropy re-audit) ───────────────────────────
 
 test "RNG seam: calculateRandomScalars really draws entropy, and round-trips through proofGen/proofVerify" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1798,7 +1796,7 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
     //
     // Debug: measured ~32s for this test ALONE, isolated (dominated by
     // L=300's createGenerators + three separate MSM computations) --
-    // over the campaign's 10s per-test budget (audit A1, 2026-09-15 gate
+    // over the campaign's 10s per-test budget (audit A1, gate
     // survey). The large L values (16, 64, 300) are extended coverage past
     // the crossover, not the brief's mandated minimum (0, 1, 2) or the
     // "well past it" boundary (8 already clears msm_crossover == 2 by 4x) --

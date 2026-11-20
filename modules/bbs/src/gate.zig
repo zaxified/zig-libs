@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! gate — the single switch that turns on the tests exercising BBS's
-//! four Fable-hard cores: `bbs.zig`'s `sign`/`verify`/`proofGen`/
+//! four core functions: `bbs.zig`'s `sign`/`verify`/`proofGen`/
 //! `proofVerify`. One flag covers all four: `proofGen`/`proofVerify`
 //! (the genuinely hard selective-disclosure NIZK) cannot be exercised
 //! without `sign`/`verify` already working (every `ProofGen` fixture
@@ -18,18 +18,14 @@
 //! `mockedRandomScalars`, `keys.zig`'s `keyGen`/`skToPk`, and
 //! `bbs.Signature`/`bbs.Proof`'s struct + byte codecs — is fully real
 //! today and needs no gate; it is what proves the harness has teeth
-//! independent of whether the four cores are filled in yet (see
+//! independent of the four cores (see
 //! `kat_test.zig`'s primitive tests, byte-exact against draft-12's
 //! vectors for generators/`h2s`/`messages_to_scalars`/`KeyGen`).
 //!
-//! This is now `true`: a Fable pass implemented all four cores per
-//! `bbs.zig`'s per-step doc-comment contracts, so `kat_test.zig`'s
-//! gated tests are executed byte-exact assertions rather than
-//! `error.SkipZigTest` skips. (While it was `false` during the scaffold
-//! stage the gated tests reported SKIP — never PASS — a skip being no
-//! green light; they still compiled, so the four cores' signatures were
-//! type-checked at every call site even before the bodies existed.)
-//! Mirrors `bulletproofs`/`bn254`/`threshold_ecdsa`'s identical
-//! scaffold-then-implement discipline (CONVENTIONS.md's
-//! "gate-flag/dark-tests" convention).
+//! This is `true`: all four cores are implemented per `bbs.zig`'s per-step
+//! doc-comment contracts, so `kat_test.zig`'s gated tests are executed
+//! byte-exact assertions rather than `error.SkipZigTest` skips (a skip is no
+//! green light; with the flag `false` they would still compile, so the four
+//! cores' signatures stay type-checked at every call site). Same gate-flag
+//! convention as `bulletproofs`/`bn254`/`threshold_ecdsa`.
 pub const core_implemented = true;

@@ -263,7 +263,7 @@ inline fn scrubCalleeSaved() void {
 var heap_hits: Hits = @splat(0);
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     clearHeap();
     scrubCalleeSaved();
@@ -325,7 +325,7 @@ fn skipUnlessOptimized() !void {
 }
 
 // ── API adapter: the only place that names the shapes under test ────────────
-// (BEFORE the 2026-10-09 fix these took and returned the secrets by value.)
+// (BEFORE the fix these took and returned the secrets by value.)
 // `keyGen` used to return the key, `sign`/`proofGen` took it and the
 // signature by value, `calculateRandomScalars` returned its array.
 

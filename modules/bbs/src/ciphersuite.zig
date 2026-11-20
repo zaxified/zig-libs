@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! ciphersuite — the `BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_` ciphersuite
-//! constants and the "mechanical" (non-Fable) building blocks
+//! constants and the "mechanical" (non-core) building blocks
 //! draft-irtf-cfrg-bbs-signatures-12 §4 defines on top of them:
 //! `expand_message`/`hash_to_scalar` (§4.2.2), `create_generators`
 //! (§4.1.1), `messages_to_scalars` (§4.1.2), `calculate_domain`
 //! (§4.2.3), and the two random-scalar sources ProofGen needs
 //! (`calculate_random_scalars` §4.2.1 / the mocked, deterministic
 //! `seeded_random_scalars` §7.1). Every function here is REAL — none of
-//! it involves the zero-knowledge JUDGMENT `bbs.zig`'s four Fable cores
+//! it involves the zero-knowledge JUDGMENT `bbs.zig`'s four core functions
 //! carry; it is all either hashing (`std.crypto.hash.sha2.Sha256`
 //! via `bls12_381`'s `expandMessageXmd`) or deterministic point/scalar
 //! derivation with no soundness argument of its own.
@@ -18,7 +18,7 @@
 //! `Fr.reduceWide` for the `OS2IP(..) mod r` reduction every
 //! `hash_to_scalar`-shaped operation in this file performs. See
 //! `../SPEC.md` for the exact draft version pinned (draft-12; these primitives are
-//! byte-identical in draft-04, which the module pinned until 2026-10-06).
+//! byte-identical in draft-04, which the module pinned previously).
 //!
 //! ## DST hierarchy (draft-12 §3.5 / §4.1 / §4.2)
 //!

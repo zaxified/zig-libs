@@ -3,7 +3,7 @@
 //! §3.4.1/§3.4.2) and the `SecretKey`/`PublicKey` wire types. REAL — both
 //! functions are ordinary deterministic derivation (a `hash_to_scalar`
 //! call and a fixed-base scalar multiplication), with no ZK judgment;
-//! unlike `bbs.zig`'s four Fable cores, nothing here is gated.
+//! unlike `bbs.zig`'s four core functions, nothing here is gated.
 //!
 //! `SecretKey` wraps `ciphersuite.Fr` directly (a scalar `0 < sk < r`);
 //! `PublicKey` wraps a `G2` point (`W = sk * BP2` — draft §3.3.1: "public
@@ -25,7 +25,7 @@ pub const KeyGenError = error{
     /// draft §3.4.1 step 2: `key_info` MUST be at most 65535 bytes.
     KeyInfoTooLong,
     /// `key_material.len + 2 + key_info.len` exceeds this file's fixed
-    /// stack scratch buffer (`max_derive_input_len`) — a scaffold-stage
+    /// stack scratch buffer (`max_derive_input_len`) — an
     /// ergonomic limit (no allocator param), not a draft requirement;
     /// every published test vector and any realistic real-world
     /// `key_material`/`key_info` pair is far under this. Raise
@@ -214,7 +214,7 @@ test "keyGen rejects key_info longer than 65535 bytes" {
 }
 
 test "keyGen length edges: 31 bytes refused, 32 accepted; 65535-byte key_info is not KeyInfoTooLong" {
-    // Mutation run 2026-10-05: `< 31` and `>= 65535` both survived.
+    // Mutation run: `< 31` and `>= 65535` both survived.
     try testing.expectError(error.KeyMaterialTooShort, testKeyGen(strRepeat("0", 31), ""));
     _ = try testKeyGen(strRepeat("0", 32), "");
     const info: [65535]u8 = @splat('a');
@@ -264,7 +264,7 @@ test "SecretKey.deinit zeroes the scalar" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
