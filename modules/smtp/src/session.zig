@@ -2448,3 +2448,321 @@ test "BDAT: used only when asked for and advertised; an over-long line is refuse
     try testing.expectError(error.LineTooLong, s3.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = long }));
     try testing.expectEqual(State.ready, s3.state);
 }
+
+// ── boundaries and state left behind (whole-module mutation audit) ─────────
+
+fn expectIdle(s: *const Session) !void {
+    try testing.expectEqual(State.ready, s.state);
+    try testing.expectEqual(Phase.emit, s.phase);
+    try testing.expect(s.env == null);
+    try testing.expect(s.tx_error == null);
+}
+
+test "the server's AUTH error document is replaced, freed and cleared" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{});
+    defer s.deinit();
+    try s.storeAuthError("eyJzdGF0dXMiOiI0MDEifQ==");
+    try testing.expectEqualStrings("{\"status\":\"401\"}", s.authErrorJson().?);
+    try s.storeAuthError("eyJ4IjoxfQ==");
+    try testing.expectEqualStrings("{\"x\":1}", s.authErrorJson().?);
+    try s.storeAuthError("!!!");
+    try testing.expect(s.authErrorJson() == null);
+}
+
+test "transactions in a row: each outcome leaves an idle, clean session and the next one starts from zero" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .ehlo_domain = "c.example.org", .tls = .disabled });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try expectIdle(&s);
+    try testing.expectEqual(@as(u16, 250), s.lastReply().?.code);
+
+    const env: Envelope = .{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\r\n" };
+    const cmds = "MAIL FROM:<a@example.com> SIZE=3\r\nRCPT TO:<b@example.net>\r\nDATA\r\n";
+    // 1: delivered
+    try s.beginTransaction(env);
+    sc.sent.clearRetainingCapacity();
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expectEqualStrings(cmds ++ "x\r\n.\r\n", sc.sent.items);
+    try expectIdle(&s);
+    // 2: every recipient refused
+    try s.beginTransaction(env);
+    sc.sent.clearRetainingCapacity();
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "550 5.1.1 no\r\n", "554 no valid recipients\r\n" };
+    try testing.expectError(error.AllRecipientsRejected, sc.run(&s));
+    try expectIdle(&s);
+    // 3: delivered again, from a clean slate (nothing of the failed one is left)
+    try s.beginTransaction(env);
+    sc.sent.clearRetainingCapacity();
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expectEqualStrings(cmds ++ "x\r\n.\r\n", sc.sent.items);
+    try expectIdle(&s);
+    try testing.expect(s.recipients()[0].accepted);
+}
+
+test "an odd reply to MAIL FROM or DATA is an UnexpectedReply, and a policy complaint alone still delivers" {
+    const gpa = testing.allocator;
+    const env: Envelope = .{ .from = "a@example.com", .to = &.{ "b@example.net", "c@example.net" }, .body = "x\r\n" };
+    // 251 to MAIL FROM
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try s.beginTransaction(env);
+        sc.idx = 0;
+        sc.replies = &.{ "251 odd\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n" };
+        try testing.expectError(error.UnexpectedReply, sc.run(&s));
+        try expectIdle(&s);
+    }
+    // 250 where DATA wants 354
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try s.beginTransaction(env);
+        sc.idx = 0;
+        sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "250 odd\r\n" };
+        try testing.expectError(error.UnexpectedReply, sc.run(&s));
+        try expectIdle(&s);
+    }
+    // require_all_recipients with everyone accepted is no error at all
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .require_all_recipients = true });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try s.beginTransaction(env);
+        sc.idx = 0;
+        sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n" };
+        try sc.run(&s);
+        try expectIdle(&s);
+    }
+    // ... and with one refused the complaint is reported AFTER the real body went out
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .require_all_recipients = true });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try s.beginTransaction(env);
+        sc.idx = 0;
+        sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "550 no\r\n", "354 go\r\n", "250 queued\r\n" };
+        try testing.expectError(error.RecipientRejected, sc.run(&s));
+        try testing.expectEqual(@as(usize, 1), sc.bodies.items.len);
+        try testing.expectEqualStrings("x\r\n", sc.bodies.items[0]);
+        try expectIdle(&s);
+    }
+    // the same over BDAT
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .bdat = true, .require_all_recipients = true });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_chunking } };
+        defer sc.deinit();
+        try sc.run(&s);
+        sc.sent.clearRetainingCapacity();
+        try s.beginTransaction(env);
+        sc.idx = 0;
+        sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "550 no\r\n", "250 queued\r\n" };
+        try testing.expectError(error.RecipientRejected, sc.run(&s));
+        try testing.expect(std.mem.find(u8, sc.sent.items, "BDAT 3 LAST\r\nx\r\n") != null);
+        try expectIdle(&s);
+    }
+}
+
+test "envelope limits: max_recipients is inclusive and a bad sender is refused up front" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .tls = .disabled, .max_recipients = 2 });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250 x\r\n" } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expectError(error.InvalidAddress, s.beginTransaction(.{ .from = "not an address", .to = &.{"b@example.net"}, .body = "x" }));
+    try testing.expectEqual(State.ready, s.state);
+    try testing.expectError(error.TooManyRecipients, s.beginTransaction(.{ .from = null, .to = &.{ "b@example.net", "c@example.net", "d@example.net" }, .body = "x" }));
+    try s.beginTransaction(.{ .from = null, .to = &.{ "b@example.net", "c@example.net" }, .body = "x" });
+    try testing.expectEqual(State.transaction, s.state);
+}
+
+test "a QUIT requested mid-transaction waits for the transaction" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .tls = .disabled });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\r\n" });
+    s.requestQuit();
+    try testing.expectEqual(State.transaction, s.state);
+    sc.sent.clearRetainingCapacity();
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n" };
+    try sc.run(&s);
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "\r\n.\r\nQUIT\r\n"));
+    try testing.expectEqual(State.closed, s.state);
+}
+
+test "TLS that cannot be had closes the session" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .tls = .required });
+    defer s.deinit();
+    try testing.expectEqual(error.TlsUnavailable, s.tlsUnavailable());
+    try testing.expectEqual(State.closed, s.state);
+    var s2: Session = .init(gpa, .{ .tls = .required });
+    defer s2.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-mail.example.com\r\n250 STARTTLS\r\n", "454 TLS not available\r\n" } };
+    defer sc.deinit();
+    try testing.expectError(error.TransientFailure, sc.run(&s2));
+    try testing.expectEqual(State.closed, s2.state);
+}
+
+test "AUTH PLAIN: a server that challenges after the initial response gets it again" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u", .password = "p", .mechanisms = &.{.plain} },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-mail.example.com\r\n250 AUTH PLAIN\r\n", "334 \r\n", "235 ok\r\n" } };
+    defer sc.deinit();
+    try sc.run(&s);
+    var enc: [64]u8 = undefined;
+    const ir = try auth_mod.plainResponse(&enc, "", "u", "p");
+    const want = try gpa.print("EHLO localhost\r\nAUTH PLAIN {s}\r\n{s}\r\n", .{ ir, ir });
+    defer gpa.free(want);
+    try testing.expectEqualStrings(want, sc.sent.items);
+    try testing.expect(s.authenticated);
+    try expectIdle(&s);
+}
+
+test "OAUTHBEARER with an escaped authorization identity fits the buffers it sizes" {
+    const gpa = testing.allocator;
+    const user = "a,b=c@example.com";
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = user, .token = "tok", .mechanisms = &.{.oauthbearer} },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-mail.example.com\r\n250 AUTH OAUTHBEARER\r\n", "235 ok\r\n" } };
+    defer sc.deinit();
+    try sc.run(&s);
+    const scratch = try gpa.alloc(u8, auth_mod.oauthbearerRawLen(user, "tok"));
+    defer gpa.free(scratch);
+    const enc = try gpa.alloc(u8, auth_mod.encodedLen(scratch.len));
+    defer gpa.free(enc);
+    const ir = try auth_mod.oauthbearerResponse(enc, scratch, user, "tok");
+    const want = try gpa.print("EHLO localhost\r\nAUTH OAUTHBEARER {s}\r\n", .{ir});
+    defer gpa.free(want);
+    try testing.expectEqualStrings(want, sc.sent.items);
+}
+
+test "an initial response of exactly 12288 encoded octets is past the line ceiling, not past the buffer" {
+    const gpa = testing.allocator;
+    const user = "u@example.com";
+    for ([_]struct { raw: usize, err: SessionError }{
+        .{ .raw = 9216, .err = error.CommandTooLong },
+        .{ .raw = 9217, .err = error.NoSpaceLeft },
+    }) |c| {
+        const tok = try gpa.alloc(u8, c.raw - auth_mod.xoauth2RawLen(user, ""));
+        defer gpa.free(tok);
+        @memset(tok, 'x');
+        var s: Session = .init(gpa, .{
+            .tls = .disabled,
+            .allow_plaintext_auth = true,
+            .credentials = .{ .username = user, .token = tok, .mechanisms = &.{.xoauth2} },
+        });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-mail.example.com\r\n250 AUTH XOAUTH2\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(c.err, sc.run(&s));
+    }
+}
+
+const long_nonce_tail: [400]u8 = @splat('x');
+const scram_long_sf = "r=rOprNGfwEbeRWgbNEkqO" ++ &long_nonce_tail ++ ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+
+test "SCRAM-SHA-256: a long server nonce still fits the AUTH line ceiling (12288)" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, scramOpts("pencil"));
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        scram_ehlo,
+        "334 " ++ b64lit(scram_long_sf) ++ "\r\n",
+    } };
+    defer sc.deinit();
+    // the proof goes out (the script has no reply after it)
+    try testing.expectError(error.InvalidState, sc.run(&s));
+    try testing.expect(sc.sent.items.len > 512 + 40);
+}
+
+test "a refused BDAT chunk leaves an idle session and no stale error" {
+    const gpa = testing.allocator;
+    var sc: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc.deinit();
+    var s = try bdatSession(gpa, 8, &sc);
+    defer s.deinit();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "Subject: x\n.dot\nend" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 c1\r\n", "552 5.3.4 too big\r\n", "250 reset\r\n" };
+    try testing.expectError(error.PermanentFailure, sc.run(&s));
+    try expectIdle(&s);
+    try testing.expect(s.bdat_error == null);
+    // the delivered one clears it all too
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "ok" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try expectIdle(&s);
+}
+
+test "a refused greeting, plaintext AUTH or missing mechanism closes the session" {
+    const gpa = testing.allocator;
+    const cred: Credentials = .{ .username = "u", .password = "p", .mechanisms = &.{.plain} };
+    {
+        var s: Session = .init(gpa, .{ .tls = .required });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "502 no ehlo\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.GreetingRefused, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "554 go away\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.PermanentFailure, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .credentials = cred });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-m.example.com\r\n250 AUTH PLAIN\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.PlaintextAuthRefused, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .allow_plaintext_auth = true, .credentials = cred });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-m.example.com\r\n250 AUTH GSSAPI\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.NoSupportedAuthMechanism, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+}

@@ -754,3 +754,92 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "every limit is inclusive at its ceiling and refuses one past it" {
+    const gpa = testing.allocator;
+    // pending input
+    {
+        var p: Parser = .init(gpa, .{ .max_pending = 16 }, .{});
+        defer p.deinit();
+        try p.feed("0123456789abcdef");
+        try testing.expectError(error.PendingTooLarge, p.feed("x"));
+    }
+    // a line with its terminator still to come: max_line + 1 octets (a CR) may wait
+    {
+        var p: Parser = .init(gpa, .{ .max_line = 12 }, .{});
+        defer p.deinit();
+        try p.feed("250 abcdefgh\r");
+        try testing.expectEqual(@as(?Reply, null), try p.next());
+        try p.feed("x");
+        try testing.expectError(error.ReplyLineTooLong, p.next());
+    }
+    // a terminated line of exactly max_line octets
+    {
+        var p: Parser = .init(gpa, .{ .max_line = 12 }, .{});
+        defer p.deinit();
+        try p.feed("250 abcdefgh\r\n");
+        try testing.expectEqualStrings("abcdefgh", (try p.next()).?.text);
+        try p.feed("250 abcdefghi\r\n");
+        try testing.expectError(error.ReplyLineTooLong, p.next());
+    }
+    // reply codes: 100..599 and every digit
+    {
+        var p: Parser = .init(gpa, .{}, .{});
+        defer p.deinit();
+        try p.feed("259 x\r\n100 x\r\n599 x\r\n");
+        try testing.expectEqual(@as(u16, 259), (try p.next()).?.code);
+        try testing.expectEqual(@as(u16, 100), (try p.next()).?.code);
+        try testing.expectEqual(@as(u16, 599), (try p.next()).?.code);
+    }
+    for ([_][]const u8{ "25: x\r\n", "600 x\r\n", "099 x\r\n" }) |bad| {
+        var p: Parser = .init(gpa, .{}, .{});
+        defer p.deinit();
+        try p.feed(bad);
+        try testing.expectError(error.InvalidReplyCode, p.next());
+    }
+    // physical lines of one reply
+    {
+        var p: Parser = .init(gpa, .{ .max_lines = 3 }, .{});
+        defer p.deinit();
+        try p.feed("250-a\r\n250-b\r\n250 c\r\n");
+        try testing.expectEqual(@as(usize, 3), (try p.next()).?.lines);
+        try p.feed("250-a\r\n250-b\r\n250-c\r\n250 d\r\n");
+        try testing.expectError(error.ReplyTooLong, p.next());
+    }
+    // accumulated text: first line, then joined lines
+    {
+        var p: Parser = .init(gpa, .{ .max_text = 5 }, .{});
+        defer p.deinit();
+        try p.feed("250 12345\r\n250-12\r\n250 34\r\n");
+        try testing.expectEqualStrings("12345", (try p.next()).?.text);
+        try testing.expectEqualStrings("12\n34", (try p.next()).?.text);
+        try p.feed("250 123456\r\n");
+        try testing.expectError(error.ReplyTooLong, p.next());
+    }
+    {
+        var p: Parser = .init(gpa, .{ .max_text = 5 }, .{});
+        defer p.deinit();
+        try p.feed("250-12\r\n250 345\r\n");
+        try testing.expectError(error.ReplyTooLong, p.next());
+    }
+}
+
+test "the consumed prefix is released as replies are drained; isPositive spans 2yz and 3yz" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa, .{}, .{});
+    defer p.deinit();
+    for (0..50) |_| {
+        try p.feed("250 ok\r\n");
+        try testing.expectEqualStrings("ok", (try p.next()).?.text);
+        try testing.expect(p.pending.items.len <= 16);
+    }
+    const mk = struct {
+        fn r(code: u16) Reply {
+            return .{ .code = code, .enhanced = null, .text = "", .lines = 1 };
+        }
+    };
+    try testing.expect(mk.r(250).isPositive() and mk.r(354).isPositive());
+    try testing.expect(!mk.r(450).isPositive() and !mk.r(550).isPositive());
+    // RFC 3463: a subject and a detail of up to three digits each
+    try testing.expect(parseEnhanced("2.123.456 ok", 250) != null);
+}

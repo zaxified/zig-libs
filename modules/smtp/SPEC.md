@@ -6,7 +6,7 @@
 
 **Scope:** core — lettre 0.11 (Rust) as reference client; Go `net/smtp` / go-smtp as baseline (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation none · src ?
+**Audit:** review 2026-09-17 · mutation 2026-11-20 (819/846, 26 eq) · src 572259a12b763ec6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget clean, SMTP_FUZZ `smtp-client`: a whole conversation — plain, STARTTLS + AUTH with TLS required, STARTTLS stripped, opportunistic without TLS — with one server reply damaged / dropped / re-coded / garbage / doubled; the per-parser harnesses are unchanged) · ct 2026-10-10 (ctgrind: AUTH PLAIN/LOGIN password; 312 -> 6 in-file after the b64ct + masked credential-check fix, the 6 = one validity verdict per call)
 **Performance:** not measured
@@ -363,7 +363,18 @@ Constant time: `src/ctgrind_harness.zig` (target `auth`, ReleaseFast, run throug
 masked credential check); the residual in-file contexts are one validity verdict per call (the card's
 `**Hardening:**` line holds the figures).
 
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it (the card records none for this module).
+- **Mutation:** the whole production code, by mutant schemata (one build, one switch per mutant): every
+  condition clause negated, every ordering comparison at its boundary, every state and counter
+  assignment dropped, every `@min`/`@max` swapped: 846 mutants, 819 killed, 26 equivalent (a dead store, a
+  branch that repeats the code after it, a redundant `phase` assignment that an invariant makes a no-op,
+  cost-only flush and compaction thresholds), 1 open (the reset of the BDAT chunk buffer between a `free` and
+  its replacement, observable only with an allocation failure injected at that one call). Mutants inside the
+  test-support code (the scripted peer, the `Script` driver) are not counted. The first pass left 195
+  survivors; they became tests: every buffer, line, reply, command and recipient ceiling is pinned exactly
+  at the ceiling and one past it, the quoted-string and address-literal grammar at its edges, the folding,
+  quoted-printable and dot-stuffing column arithmetic, the encoded-word budget, and white-box assertions that
+  every transaction outcome leaves the `Session` idle (`.ready`, `.emit`, no envelope, no pending error).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Provenance
 

@@ -493,3 +493,20 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "limits are inclusive, a bare AUTH= keyword is ignored, BINARYMIME is modelled" {
+    const gpa = testing.allocator;
+    var four = try parse(gpa, "srv\nA\nB\nC\nD", .{ .max_lines = 4 });
+    four.deinit();
+    try testing.expectError(error.TooManyCapabilities, parse(gpa, "srv\nA\nB\nC\nD\nE", .{ .max_lines = 4 }));
+
+    // `AUTH=` with nothing after it is not the sendmail form; what follows it
+    // is not a mechanism list either.
+    var bare = try parse(gpa, "srv\nAUTH= PLAIN", .{});
+    defer bare.deinit();
+    try testing.expect(!bare.auth.plain and !bare.auth.any());
+
+    var bm = try parse(gpa, "srv\nBINARYMIME", .{});
+    defer bm.deinit();
+    try testing.expect(bm.binarymime and !bm.chunking);
+}

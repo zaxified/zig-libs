@@ -1063,3 +1063,213 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "Folder: widths are inclusive at fold_at and max_line, and every step keeps the count" {
+    const h = struct {
+        const FoldKind = enum { raw, token, append, fold, finish };
+        const FoldStep = struct { k: FoldKind, s: []const u8 = "" };
+        fn sRaw(s: []const u8) FoldStep {
+            return .{ .k = .raw, .s = s };
+        }
+        fn sTok(s: []const u8) FoldStep {
+            return .{ .k = .token, .s = s };
+        }
+        fn sApp(s: []const u8) FoldStep {
+            return .{ .k = .append, .s = s };
+        }
+        const sFold: FoldStep = .{ .k = .fold };
+        const sFin: FoldStep = .{ .k = .finish };
+
+        fn foldRun(opts: Options, steps: []const FoldStep, w: *std.Io.Writer) HeaderError!void {
+            var f: Folder = .init(w, opts);
+            for (steps) |st| switch (st.k) {
+                .raw => try f.raw(st.s),
+                .token => try f.token(st.s),
+                .append => try f.append(st.s),
+                .fold => try f.forceFold(),
+                .finish => try f.finishLine(),
+            };
+        }
+
+        fn expectFolded(want: []const u8, opts: Options, steps: []const FoldStep) !void {
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try foldRun(opts, steps, &aw.writer);
+            try testing.expectEqualStrings(want, aw.written());
+        }
+
+        fn expectFoldError(want: HeaderError, opts: Options, steps: []const FoldStep) !void {
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try testing.expectError(want, foldRun(opts, steps, &aw.writer));
+        }
+    };
+    const sRaw = h.sRaw;
+    const sTok = h.sTok;
+    const sApp = h.sApp;
+    const sFold = h.sFold;
+    const sFin = h.sFin;
+    const expectFolded = h.expectFolded;
+    const expectFoldError = h.expectFoldError;
+    const o: Options = .{ .fold_at = 10, .max_line = 15 };
+    // raw / a fresh token: exactly max_line fits, one more does not
+    try expectFolded("0123456789abcde", o, &.{sRaw("0123456789abcde")});
+    try expectFoldError(error.LineTooLong, o, &.{sRaw("0123456789abcdef")});
+    try expectFolded("0123456789abcde", o, &.{sTok("0123456789abcde")});
+    try expectFoldError(error.LineTooLong, o, &.{sTok("0123456789abcdef")});
+    // a fresh token counts toward the line, and clears `fresh`
+    try expectFolded("aaaaaa\r\n bbbb", o, &.{ sTok("aaaaaa"), sTok("bbbb") });
+    // a fold restarts the count at 1 (the space)
+    try expectFolded("aaaaaa\r\n bbbb cc", o, &.{ sTok("aaaaaa"), sTok("bbbb"), sTok("cc") });
+    // no fold when len + 1 + token is exactly fold_at
+    try expectFolded("ab cdefg", .{ .fold_at = 8, .max_line = 15 }, &.{ sRaw("ab"), sTok("cdefg") });
+    try expectFolded("ab\r\n cdefg", .{ .fold_at = 7, .max_line = 15 }, &.{ sRaw("ab"), sTok("cdefg") });
+    // a token of max_line - 1 is folded onto a line of its own and fits exactly
+    try expectFolded("ab\r\n 12345678", .{ .fold_at = 5, .max_line = 9 }, &.{ sRaw("ab"), sTok("12345678") });
+    // append: counts, and is inclusive
+    try expectFolded("aaaaaa,,,,,,,,,", o, &.{ sTok("aaaaaa"), sApp(",,,,,,,,,") });
+    try expectFoldError(error.LineTooLong, o, &.{ sTok("aaaaaa"), sApp(",,,,,,,,,,") });
+    try expectFolded("aaaaaa,,,,\r\n b", o, &.{ sTok("aaaaaa"), sApp(",,,,"), sTok("b") });
+    // forceFold: the next token sees a line holding one space, and is not fresh
+    try expectFolded("aaaaaa\r\n  bbbb", o, &.{ sTok("aaaaaa"), sFold, sTok("bbbb") });
+    try expectFolded("\r\n\r\n  y", o, &.{ sFin, sFold, sTok("y") });
+    // finishLine resets the count and makes the next token fresh
+    try expectFolded("0123456789\r\n0123456789", o, &.{ sRaw("0123456789"), sFin, sRaw("0123456789") });
+    try expectFolded("0123456789\r\nx", o, &.{ sRaw("0123456789"), sFin, sTok("x") });
+}
+
+test "encoded words fill their budget exactly, and long Q text is split" {
+    const gpa = testing.allocator;
+    // Q: "é" (6) + 'a' x 57 = 63 = 75 - 12 fills a word; the rest starts the next one
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var f: Folder = .init(&aw.writer, .{ .fold_at = 200 });
+    const text = "\xc3\xa9" ++ strRepeat("a", 100);
+    try writeEncodedWords(&f, text, .{ .fold_at = 200 });
+    var it = std.mem.tokenizeAny(u8, aw.written(), " \r\n");
+    const w1 = it.next().?;
+    try testing.expectEqual(@as(usize, 75), w1.len);
+    try testing.expect(std.mem.find(u8, w1, "?Q?") != null);
+    while (it.next()) |w| try testing.expect(w.len <= 75);
+
+    // B: charset "utf8" gives a budget of 64; 48 octets of payload encode to exactly 64
+    var bw: std.Io.Writer.Allocating = .init(gpa);
+    defer bw.deinit();
+    var f2: Folder = .init(&bw.writer, .{ .fold_at = 200, .charset = "utf8" });
+    try writeEncodedWords(&f2, strRepeat("\xc5\xbe", 30), .{ .fold_at = 200, .charset = "utf8" });
+    var it2 = std.mem.tokenizeAny(u8, bw.written(), " \r\n");
+    var first_word: std.ArrayList(u8) = .empty;
+    defer first_word.deinit(gpa);
+    try decodeEncodedWord(gpa, it2.next().?, &first_word);
+    try testing.expectEqual(@as(usize, 48), first_word.items.len);
+
+    // a charset name of 64 octets is the longest that leaves room for a word
+    const cs64 = strRepeat("c", 64);
+    var cw: std.Io.Writer.Allocating = .init(gpa);
+    defer cw.deinit();
+    var f3: Folder = .init(&cw.writer, .{ .fold_at = 200, .charset = cs64 });
+    try writeEncodedWords(&f3, "a", .{ .fold_at = 200, .charset = cs64 });
+    var cw2: std.Io.Writer.Allocating = .init(gpa);
+    defer cw2.deinit();
+    var f4: Folder = .init(&cw2.writer, .{ .fold_at = 200, .charset = cs64 ++ "c" });
+    try testing.expectError(error.LineTooLong, writeEncodedWords(&f4, "a", .{ .fold_at = 200, .charset = cs64 ++ "c" }));
+
+    // a word that just fits the room left on the line is not preceded by a fold
+    var dw: std.Io.Writer.Allocating = .init(gpa);
+    defer dw.deinit();
+    var f5: Folder = .init(&dw.writer, .{ .fold_at = 21 });
+    try writeEncodedWords(&f5, "a", .{ .fold_at = 21 });
+    try testing.expectEqualStrings("=?utf-8?Q?a?=", dw.written());
+
+    // after a fold the room is fold_at - 2; one octet of room is enough for one octet
+    var ew: std.Io.Writer.Allocating = .init(gpa);
+    defer ew.deinit();
+    var f6: Folder = .init(&ew.writer, .{ .fold_at = 15 });
+    try writeEncodedWords(&f6, "a", .{ .fold_at = 15 });
+    try testing.expectEqualStrings("\r\n  =?utf-8?Q?a?=", ew.written());
+}
+
+test "UTF-8 sequences are measured exactly" {
+    try testing.expectEqual(@as(usize, 2), utf8Len("\xc3\xa1"));
+    try testing.expectEqual(@as(usize, 1), utf8Len("\xc3"));
+    try testing.expect(headerTextNeedsEncoding("\x80") and !headerTextNeedsEncoding("~"));
+    try testing.expect(isAscii("\x7f") and !isAscii("\x80"));
+    try testing.expect(validHeaderName("!a~") and !validHeaderName(" a") and !validHeaderName("a\x7f") and !validHeaderName("a:b"));
+    try testing.expect(!nameNeedsQuoting("a!b") and nameNeedsQuoting("a\x01b") and !nameNeedsQuoting("a b"));
+}
+
+test "verbatim headers: line ceiling, folds and a CRLF with nothing after it" {
+    const gpa = testing.allocator;
+    const o: Options = .{ .max_line = 10 };
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try writeVerbatimHeader(&aw.writer, "X", "12345678", o);
+        try testing.expectError(error.LineTooLong, writeVerbatimHeader(&aw.writer, "X", "123456789", o));
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        // each physical line is within the ceiling; the sum is not
+        try writeVerbatimHeader(&aw.writer, "X", "aaaa\r\n bbbb", .{ .max_line = 6 });
+        try testing.expectEqualStrings("X:aaaa\r\n bbbb\r\n", aw.written());
+        try testing.expectError(error.ControlCharacterInHeader, writeVerbatimHeader(&aw.writer, "X", "a\r\n", o));
+        try testing.expectError(error.ControlCharacterInHeader, writeVerbatimHeader(&aw.writer, "X", "a\r", o));
+    }
+}
+
+test "quoted-printable: soft breaks are exact at column 75" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        // trailing whitespace at a line end: col + 3 == 75 stays, 76 breaks
+        .{ .in = strRepeat("a", 72) ++ " \n", .want = strRepeat("a", 72) ++ "=20\r\n" },
+        .{ .in = strRepeat("a", 73) ++ " \n", .want = strRepeat("a", 73) ++ "=\r\n=20\r\n" },
+        // whitespace followed by text: the held octet needs col + 1 <= 75
+        .{ .in = strRepeat("a", 74) ++ " b", .want = strRepeat("a", 74) ++ " =\r\nb" },
+        .{ .in = strRepeat("a", 75) ++ " b", .want = strRepeat("a", 75) ++ "=\r\n b" },
+        // a literal octet is column 75 at most; a triple needs three columns
+        .{ .in = strRepeat("a", 74) ++ "b", .want = strRepeat("a", 74) ++ "b" },
+        .{ .in = strRepeat("a", 75) ++ "b", .want = strRepeat("a", 75) ++ "=\r\nb" },
+        .{ .in = strRepeat("a", 72) ++ "\xff", .want = strRepeat("a", 72) ++ "=FF" },
+        .{ .in = strRepeat("a", 73) ++ "\xff", .want = strRepeat("a", 73) ++ "=\r\n=FF" },
+        // trailing whitespace at the very end
+        .{ .in = strRepeat("a", 72) ++ " ", .want = strRepeat("a", 72) ++ "=20" },
+        .{ .in = strRepeat("a", 73) ++ " ", .want = strRepeat("a", 73) ++ "=\r\n=20" },
+        // the printable range is 33..126 minus '='
+        .{ .in = "!~", .want = "!~" },
+        // the column restarts after a hard break and after a soft one
+        .{ .in = strRepeat("a", 70) ++ "\n" ++ strRepeat("b", 10), .want = strRepeat("a", 70) ++ "\r\n" ++ strRepeat("b", 10) },
+        .{ .in = strRepeat("a", 160), .want = strRepeat("a", 75) ++ "=\r\n" ++ strRepeat("a", 75) ++ "=\r\n" ++ strRepeat("a", 10) },
+        .{ .in = "a b \nc", .want = "a b=20\r\nc" },
+    };
+    for (cases) |c| {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try writeQuotedPrintable(&aw.writer, c.in);
+        try testing.expectEqualStrings(c.want, aw.written());
+    }
+}
+
+test "base64 body, verbatim CRLF and line-length checks at their edges" {
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const full: [114]u8 = @splat(0x55);
+    try writeBase64(&aw.writer, full[0..57]);
+    try testing.expectEqual(@as(usize, 76), aw.written().len);
+    aw.clearRetainingCapacity();
+    try writeBase64(&aw.writer, &full);
+    try testing.expectEqual(@as(usize, 76 + 2 + 76), aw.written().len);
+
+    aw.clearRetainingCapacity();
+    try writeVerbatimCrlf(&aw.writer, "a\r");
+    try writeVerbatimCrlf(&aw.writer, "a\rb\nc\r\nd");
+    try testing.expectEqualStrings("a\r\na\r\nb\r\nc\r\nd", aw.written());
+
+    try checkLineLengths("aaaa\r\n", 4);
+    try checkLineLengths("\n", 0);
+    try checkLineLengths("a\r\n\r\nb", 1);
+    try testing.expectError(error.LineTooLong, checkLineLengths("aaaaa\r\n", 4));
+    try testing.expectError(error.LineTooLong, checkLineLengths("aaaaa\n", 4));
+    try testing.expectError(error.LineTooLong, checkLineLengths("ok\naaaaa", 4));
+}

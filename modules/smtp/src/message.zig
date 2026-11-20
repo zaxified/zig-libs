@@ -1230,3 +1230,71 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "optional headers, control octets in references and Content-ID, raw headers" {
+    const gpa = testing.allocator;
+    var prng = fixedRandom(21);
+    const out = try render(gpa, .{
+        .from = .{ .addr = "a@example.com" },
+        .sender = .{ .addr = "s@example.com" },
+        .reply_to = &.{.{ .addr = "r@example.com" }},
+        .to = &.{.{ .addr = "b@example.net" }},
+        .cc = &.{.{ .addr = "c@example.net" }},
+        .date = epoch_2026,
+        .message_id = "id@example.com",
+        .references = &.{ "r1@example.com", "r2@example.com" },
+        .headers = &.{
+            .{ .name = "X-Raw", .value = "=?x?B?eA==?=", .raw = true },
+            .{ .name = "X-Plain", .value = "=?x?B?eA==?=" },
+        },
+        .body = .{ .multipart = .{ .parts = &.{
+            .{ .text = .{ .body = "x\r\n" } },
+            .{ .attachment = .{ .filename = "f.bin", .data = "x", .content_id = "cid@example.com" } },
+        } } },
+    }, prng.random(), .{});
+    defer gpa.free(out);
+    try testing.expect(std.mem.find(u8, out, "References: <r1@example.com> <r2@example.com>\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "Content-ID: <cid@example.com>\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "\r\nSender: <s@example.com>\r\n") != null or std.mem.find(u8, out, "\r\nSender: s@example.com\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "\r\nReply-To: ") != null);
+    try testing.expect(std.mem.find(u8, out, "\r\nCc: ") != null);
+    try testing.expect(std.mem.find(u8, out, "\r\nX-Raw: =?x?B?eA==?=\r\n") != null);
+    try testing.expect(std.mem.find(u8, out, "\r\nX-Plain: =?x?B?eA==?=\r\n") == null);
+
+    // CR, LF and NUL are refused in a Reference and in a Content-ID
+    for ([_][]const u8{ "a\rb", "a\nb", "a\x00b" }) |bad| {
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, .{
+            .from = .{ .addr = "a@example.com" },
+            .date = epoch_2026,
+            .references = &.{bad},
+            .body = .{ .text = .{ .body = "x\r\n" } },
+        }, prng.random(), .{}));
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, .{
+            .from = .{ .addr = "a@example.com" },
+            .date = epoch_2026,
+            .body = .{ .attachment = .{ .filename = "f.bin", .data = "x", .content_id = bad } },
+        }, prng.random(), .{}));
+    }
+}
+
+test "nesting depth and boundary size are inclusive at their ceilings" {
+    const gpa = testing.allocator;
+    var prng = fixedRandom(22);
+    const leaf = Part{ .text = .{ .body = "x\r\n" } };
+    const l1 = Part{ .multipart = .{ .parts = &.{leaf} } };
+    const out = try render(gpa, .{ .from = .{ .addr = "a@example.com" }, .date = epoch_2026, .body = l1 }, prng.random(), .{ .max_depth = 1 });
+    gpa.free(out);
+    // zero attempts is "no boundary could be chosen"
+    try testing.expectError(error.BoundaryCollision, render(gpa, .{ .from = .{ .addr = "a@example.com" }, .date = epoch_2026, .body = l1 }, prng.random(), .{ .max_boundary_attempts = 0 }));
+    // the boundary is at most 70 octets: prefix (10) + 60 is the last that fits
+    const o70 = try render(gpa, .{ .from = .{ .addr = "a@example.com" }, .date = epoch_2026, .body = l1 }, prng.random(), .{ .boundary_entropy = 60 });
+    gpa.free(o70);
+    try testing.expectError(error.BoundaryCollision, render(gpa, .{ .from = .{ .addr = "a@example.com" }, .date = epoch_2026, .body = l1 }, prng.random(), .{ .boundary_entropy = 61 }));
+}
+
+test "7bit is chosen only for ASCII within the line limit" {
+    try testing.expectEqual(Encoding.quoted_printable, autoTextEncoding("a\x80", 998));
+    try testing.expectEqual(Encoding.seven_bit, autoTextEncoding("aaaa", 4));
+    try testing.expectEqual(Encoding.quoted_printable, autoTextEncoding("aaaaa", 4));
+    try testing.expectEqual(Encoding.seven_bit, autoTextEncoding("aaaa\naaaa\r\naaaa", 4));
+}

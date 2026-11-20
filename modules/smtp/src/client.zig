@@ -1080,3 +1080,26 @@ test "fuzz driver: SMTP_FUZZ (client)" {
 test "fuzz harness: client, 500 seeds, reaches every outcome" {
     try ClientMark.reach(fuzzClient, "smtp-client", 500);
 }
+
+test "a body whose every chunk doubles to exactly half the buffer is flushed before the next chunk" {
+    const gpa = testing.allocator;
+    var srv = FakeServer.init(gpa, &.{
+        "250 mail.example.com\r\n",
+        "250 Ok\r\n",
+        "250 Ok\r\n",
+        "354 go\r\n",
+        "250 queued\r\n",
+    });
+    defer srv.deinit();
+    try srv.outbox.appendSlice(gpa, "220 ready\r\n");
+    // bare LFs become CRLF: each 1024-octet chunk is 2048 octets, half of body_buf
+    const body = try gpa.alloc(u8, 4096);
+    defer gpa.free(body);
+    @memset(body, '\n');
+    var c = try Client.init(gpa, srv.transport(), .{ .session = .{ .tls = .disabled }, .body_chunk = 1024 });
+    defer c.deinit();
+    try c.connect();
+    try c.sendEnvelope(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = body });
+    try testing.expectEqual(@as(usize, 8192), srv.messages.items[0].len);
+    try testing.expect(std.mem.startsWith(u8, srv.messages.items[0], "\r\n\r\n\r\n"));
+}

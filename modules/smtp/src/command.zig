@@ -856,3 +856,44 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "ceilings are inclusive; quoted strings and ASCII edges are exact" {
+    // builder: a buffer or line ceiling of exactly the command's size
+    var b6: [6]u8 = undefined;
+    try testing.expectEqualStrings("RSET\r\n", try rset(&b6, .{}));
+    try testing.expectEqualStrings("RSET\r\n", try rset(&b6, .{ .max_command_line = 6 }));
+    try testing.expectError(error.CommandTooLong, rset(&b6, .{ .max_command_line = 5 }));
+    // greeting domain ceiling
+    var line: [64]u8 = undefined;
+    try testing.expectEqualStrings("EHLO a.example\r\n", try ehlo(&line, "a.example", .{ .max_domain = 9 }));
+    try testing.expectError(error.PathTooLong, ehlo(&line, "a.example", .{ .max_domain = 8 }));
+    // xtext into a buffer of exactly its length
+    var x4: [4]u8 = undefined;
+    try testing.expectEqualStrings("a+3D", try xtext(&x4, "a="));
+    // mailbox ceilings: whole path, local part, domain
+    try validateMailbox("a@b.co", .{ .max_path = 8 }, false);
+    try testing.expectError(error.PathTooLong, validateMailbox("a@b.co", .{ .max_path = 7 }, false));
+    try validateMailbox("abcd@b.co", .{ .max_local_part = 4 }, false);
+    try testing.expectError(error.PathTooLong, validateMailbox("abcde@b.co", .{ .max_local_part = 4 }, false));
+    try validateMailbox("a@bb.co", .{ .max_domain = 5 }, false);
+    try testing.expectError(error.PathTooLong, validateMailbox("a@bbb.co", .{ .max_domain = 5 }, false));
+
+    // ASCII means below 0x80
+    try testing.expect(isAscii("abc\x7f") and !isAscii("a\x80"));
+
+    // quoted strings: the empty one, the edge characters, escapes, and what is not allowed
+    for ([_][]const u8{ "\"\"", "\" \"", "\"~\"", "\"a\\ b\"", "\"a\\~b\"", "\"a\\\\b\"", "\"a\\\"b\"" }) |ok| {
+        try testing.expect(validQuotedString(ok, false));
+    }
+    for ([_][]const u8{ "\"a\"b\"", "\"a\x01b\"", "\"a\x7f\"", "\"a\\\"", "\"\\\x01\"", "\"\\\x7f\"", "\"a\x80\"", "\"" }) |bad| {
+        try testing.expect(!validQuotedString(bad, false));
+    }
+    try testing.expect(validQuotedString("\"\x80\"", true));
+    try testing.expect(!validQuotedString("\"\x80\"", false));
+    // the same through the public check
+    try validateMailbox("\"a\\ b\"@example.com", .{}, false);
+    try testing.expectError(error.InvalidAddress, validateMailbox("\"a\"b\"@example.com", .{}, false));
+    try testing.expectError(error.InvalidAddress, validateMailbox("\"a\x01\"@example.com", .{}, false));
+    try testing.expectError(error.NonAsciiAddress, validateMailbox("a\x80@example.com", .{}, false));
+    try validateMailbox("\"\x80\"@example.com", .{}, true);
+}

@@ -714,3 +714,87 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+fn stuffedInto(s: *Stuffer, w: *std.Io.Writer.Allocating, in: []const u8) ![]const u8 {
+    const before = w.written().len;
+    try s.write(&w.writer, in);
+    return w.written()[before..];
+}
+
+test "line length is inclusive at the ceiling and every line break resets it" {
+    const gpa = testing.allocator;
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        var s: Stuffer = .init(.{ .max_line = 10 });
+        try s.write(&aw.writer, "0123456789");
+        var s2: Stuffer = .init(.{ .max_line = 10 });
+        try testing.expectError(error.LineTooLong, s2.write(&aw.writer, "01234567890"));
+    }
+    // A lone CR (normalising) and a LF both start a fresh line: the count restarts
+    // and a leading dot is doubled.
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        var s: Stuffer = .init(.{ .max_line = 5 });
+        try testing.expectEqualStrings("abcd\r\nabcd", try stuffedInto(&s, &aw, "abcd\rabcd"));
+        try testing.expectEqualStrings("\r\nabcd", try stuffedInto(&s, &aw, "\nabcd"));
+        var s2: Stuffer = .init(.{});
+        try testing.expectEqualStrings("a\r\n..b", try stuffedInto(&s2, &aw, "a\r.b"));
+    }
+    // finishChunked: completes a partial line once, and leaves a clean state
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        var s: Stuffer = .initChunked(.{ .max_line = 5 });
+        try testing.expectEqualStrings("abcd", try stuffedInto(&s, &aw, "abcd"));
+        try s.finishChunked(&aw.writer);
+        try s.finishChunked(&aw.writer);
+        try testing.expectEqualStrings("abcd\r\n", aw.written());
+        var s2: Stuffer = .initChunked(.{ .max_line = 5 });
+        var aw2: std.Io.Writer.Allocating = .init(gpa);
+        defer aw2.deinit();
+        _ = try stuffedInto(&s2, &aw2, "abcd\r");
+        try s2.finishChunked(&aw2.writer);
+        try testing.expectEqualStrings("efghi", try stuffedInto(&s2, &aw2, "efghi"));
+    }
+    // finish: terminator, then a clean state (no pending CR, line start, count 0)
+    {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        var s: Stuffer = .init(.{ .max_line = 5 });
+        _ = try stuffedInto(&s, &aw, "a\r");
+        try s.finish(&aw.writer);
+        try testing.expectEqualStrings("a\r\n.\r\n", aw.written());
+        try testing.expectEqualStrings("b", try stuffedInto(&s, &aw, "b"));
+
+        var s2: Stuffer = .init(.{ .max_line = 5 });
+        _ = try stuffedInto(&s2, &aw, "abcd");
+        try s2.finish(&aw.writer);
+        try testing.expectEqualStrings("efghi", try stuffedInto(&s2, &aw, "efghi"));
+
+        var s3: Stuffer = .init(.{});
+        _ = try stuffedInto(&s3, &aw, "x");
+        try s3.finish(&aw.writer);
+        try testing.expectEqualStrings("..y", try stuffedInto(&s3, &aw, ".y"));
+    }
+}
+
+test "a zero line ceiling refuses the doubled dot before writing it" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var s: Stuffer = .init(.{ .max_line = 0 });
+    try testing.expectError(error.LineTooLong, s.write(&aw.writer, "."));
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+}
+
+test "messageSize counts a body that ends in a lone CR" {
+    const cases = [_]struct { body: []const u8, size: u64 }{
+        .{ .body = "a\r", .size = 3 },
+        .{ .body = "\r", .size = 2 },
+        .{ .body = "a\r\n", .size = 3 },
+        .{ .body = "a\r\rb", .size = 8 },
+        .{ .body = "x\r\n.\r", .size = 6 },
+    };
+    for (cases) |c| try testing.expectEqual(c.size, try messageSize(c.body, .{}));
+}

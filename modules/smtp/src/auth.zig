@@ -798,3 +798,70 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "exact-fit buffers and ceilings are accepted, one past is refused" {
+    var big: [2048]u8 = undefined;
+    // PLAIN: a buffer of exactly the encoded size is enough.
+    const want = encodedLen(1 + 3 + 1 + 16);
+    try testing.expectEqual(want, (try plainResponse(big[0..want], "", "tim", "tanstaaftanstaaf")).len);
+    // The staging buffer is 1024 octets: a 1024-octet raw form fits, 1025 does not.
+    var pw: [1022]u8 = undefined;
+    @memset(&pw, 'p');
+    try testing.expectEqual(encodedLen(1024), (try plainResponse(&big, "", "a", pw[0..1021])).len);
+    try testing.expectError(error.NoSpaceLeft, plainResponse(&big, "", "a", pw[0..1022]));
+    // LOGIN and challenge decoding: the exact size.
+    try testing.expectEqualStrings("c2VjcmV0", try loginResponse(big[0..encodedLen(6)], "secret"));
+    try testing.expectEqualStrings("user", try decodeChallenge(big[0..4], "dXNlcg=="));
+    // A challenge that decodes to exactly "user" / "pass" is classified (the
+    // needle is as long as the haystack).
+    try testing.expectEqual(LoginStep.username, classifyLoginChallenge("VXNlcg=="));
+    try testing.expectEqual(LoginStep.password, classifyLoginChallenge("cGFzcw=="));
+}
+
+test "SCRAM-SHA-256: exact-fit buffers, wide counts, nonce and salt edges are accepted" {
+    var buf: [512]u8 = undefined;
+    // client-first into a buffer of exactly its length
+    var sc0 = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc0.deinit();
+    const first = try sc0.clientFirst(&buf);
+    var exact: [64]u8 = undefined;
+    try testing.expectEqualStrings(first, try sc0.clientFirst(exact[0..first.len]));
+
+    // client-final into a buffer of exactly its length
+    var sc1 = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc1.deinit();
+    try testing.expectEqualStrings(rfc7677_client_final, try sc1.clientFinal(buf[0..rfc7677_client_final.len], rfc7677_server_first, "pencil"));
+
+    // a 10-digit iteration count (leading zeros) is accepted; the proof covers the text as sent
+    var sc2 = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc2.deinit();
+    const fin2 = try sc2.clientFinal(&buf, "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0000004096", "pencil");
+    try testing.expect(std.mem.startsWith(u8, fin2, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p="));
+
+    // the first and the last printable nonce octets ('!' and '~') are legal
+    var sc3 = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc3.deinit();
+    _ = try sc3.clientFinal(&buf, "r=rOprNGfwEbeRWgbNEkqO!~,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", "pencil");
+
+    // a salt of exactly scram_max_salt_len octets is accepted, one more is not
+    var salt: [scram_max_salt_len + 3]u8 = @splat(7);
+    var enc: [400]u8 = undefined;
+    const gpa = testing.allocator;
+    const ok_salt = b64.Encoder.encode(&enc, salt[0..scram_max_salt_len]);
+    const sf_ok = try gpa.print("r=rOprNGfwEbeRWgbNEkqOx,s={s},i=4096", .{ok_salt});
+    defer gpa.free(sf_ok);
+    var sc4 = try ScramClient.init(gpa, "user", rfc7677_nonce);
+    defer sc4.deinit();
+    _ = try sc4.clientFinal(&buf, sf_ok, "pencil");
+    const big_salt = b64.Encoder.encode(&enc, salt[0 .. scram_max_salt_len + 1]);
+    const sf_big = try gpa.print("r=rOprNGfwEbeRWgbNEkqOx,s={s},i=4096", .{big_salt});
+    defer gpa.free(sf_big);
+    var sc5 = try ScramClient.init(gpa, "user", rfc7677_nonce);
+    defer sc5.deinit();
+    try testing.expectError(error.MalformedChallenge, sc5.clientFinal(&buf, sf_big, "pencil"));
+
+    // the iteration ceiling itself is accepted (PBKDF2 really runs 600000 rounds)
+    var sc6 = try ScramClient.init(gpa, "user", rfc7677_nonce);
+    defer sc6.deinit();
+    _ = try sc6.clientFinal(&buf, "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=600000", "pencil");
+}
