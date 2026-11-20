@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for `lninvoice`'s signing entry points (review
-//! 2026-10-09; SPEC § "Secret residue on the dead stack"). The signatures are
+//! Dead-stack residue probe for `lninvoice`'s signing entry points (SPEC § "Secret residue on the dead stack"). The signatures are
 //! `k256`'s (`ecdsa_recover.sign`, RFC 6979) and `bip340`'s (`sign`), each
 //! burned and probed in its own module; this probe checks what THIS module's
 //! frames around them leave: BOLT#11 `encode` with `.private_key`, BOLT#12

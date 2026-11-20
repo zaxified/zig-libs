@@ -863,7 +863,7 @@ fn hexToBytes(comptime n: usize, hex: []const u8) [n]u8 {
 
 // Hand-built (not fetched from a spec vector -- BOLT#12's own JSON test
 // vectors are invoice_request/invoice-oriented, out of this pass's scope)
-// [Corrected 2026-08-02: `bolt12/offers-test.json` IS offer-oriented after
+// [Corrected: `bolt12/offers-test.json` IS offer-oriented after
 // all -- the claim above was wrong, not just stale. It was reachable
 // without a network fetch all along (vendored in the sibling
 // `lightning/bolts` repo, not `bootstrap.bolt12.org`); it is now vendored
@@ -2291,7 +2291,7 @@ test "corpus: every BOLT#12 script builds a stream, and what the parsers made of
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -2412,7 +2412,7 @@ test "invoice_error: encode refuses what decode would refuse" {
     try testing.expectError(error.SuggestedValueWithoutField, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = @constCast("v"), .error_message = @constCast("e") }));
 }
 
-// ── whole-module mutation (2026-11-17): TLV-level boundary tests ────────────
+// ── whole-module mutation: TLV-level boundary tests ────────────
 
 /// One TLV record with a one-byte type and a one-byte length (types < 253, values < 253 bytes).
 fn mtlv(list: *std.ArrayList(u8), a: Allocator, t: u8, v: []const u8) !void {

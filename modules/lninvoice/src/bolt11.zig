@@ -504,7 +504,7 @@ pub const EncodeParams = struct {
 /// **`private_key` points at caller-owned storage** (CONVENTIONS §2.1 Z2):
 /// a pointer, so no copy of the key lands in `encode`'s frames or the
 /// caller's (as a by-value `[32]u8` it was copied into every frame the union
-/// passed through, where nothing wiped it — dead-stack sweep, 2026-10-08).
+/// passed through, where nothing wiped it — dead-stack sweep).
 /// The caller must `std.crypto.secureZero` its own key storage once the
 /// invoice is encoded. Prefer the `signature` variant where the key never has
 /// to cross this boundary at all.
@@ -1679,7 +1679,7 @@ test "BOLT#11 amount anchor (bitcoinjs/bolt11): the amount strings upstream reje
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -1689,7 +1689,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation (2026-11-17): crafted invoices and boundaries ─────
+// ── whole-module mutation: crafted invoices and boundaries ─────
 
 fn tfq(a: Allocator, list: *std.ArrayList(u5), tag: u5, value: []const u5) !void {
     try list.append(a, tag);

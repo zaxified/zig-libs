@@ -15,7 +15,7 @@
 //! Source: https://github.com/bitcoinjs/bolt11 (MIT, see
 //! `modules/lninvoice/NOTICE`), `test/fixtures.json` at commit
 //! `200c232d5b27f34fa948b35de4d39774ad4b063f` (2021-11-18), fetched
-//! 2026-08-06 from
+//! From
 //! https://raw.githubusercontent.com/bitcoinjs/bolt11/master/test/fixtures.json
 //!
 //! bitcoinjs/bolt11 is an independent JavaScript BOLT#11 implementation

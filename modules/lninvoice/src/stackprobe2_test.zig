@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for BOLT#11
-//! `encode` with a raw private key (the entry point burned in the 2026-10-09
+//! `encode` with a raw private key (the entry point burned in the
 //! sweep). The older `stackprobe_test.zig` keeps the needle-based probe of the
 //! whole signing path. ReleaseFast only (`skipUnlessOptimized`).
 

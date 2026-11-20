@@ -68,7 +68,7 @@ pub fn quintetsToBytesStrict(allocator: Allocator, quintets: []const u5) (Paddin
 /// a separate length field the way a BOLT#11 tagged field does — the
 /// quintet count itself is the only signal of how many bytes were meant).
 ///
-/// **`error.PaddingTooLong` (added 2026-08-02, external anchor: BOLT#12
+/// **`error.PaddingTooLong`(external anchor: BOLT#12
 /// `bolt12/offers-test.json` "Bech32 padding exceeds 4-bit limit")** —
 /// reference `convertbits(5, 8, pad=false)` (the same algorithm
 /// `quintetsToBytesStrict` implements) rejects whenever `bits >= frombits`
@@ -437,7 +437,7 @@ test "quintetsToUint / uintToQuintets: timestamp round-trip + minimal encoding" 
     try testing.expectEqual(@as(usize, 0), uintToQuintets(0, &buf2).len);
 }
 
-// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+// ── whole-module mutation: boundary tests ──────────────────────
 
 test "mutation: strict decode checks a single leftover padding bit" {
     const a = testing.allocator;

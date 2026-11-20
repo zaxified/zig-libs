@@ -6,8 +6,7 @@
 //! limit)"), so the `bech32` module's `encode`/`decode` — which enforce that
 //! ceiling via fixed ~90-byte stack buffers — cannot be reused for invoices.
 //! **The BCH checksum math and charset mapping are `bech32`'s own exported
-//! `polymod`/`charValue`/`toLower`/`hrpExpandInto` (M6, `A1/bech32.md`,
-//! 2026-09-15) — this file no longer carries a second copy of them.** What
+//! `polymod`/`charValue`/`toLower`/`hrpExpandInto` (M6, A1 audit) — this file no longer carries a second copy of them.** What
 //! genuinely differs, and stays here, is the HRP/data split: `splitHrp`
 //! deliberately omits `bech32.decode`'s `sep > max_hrp_len` (83) check,
 //! because BOLT#11/#12 have no such cap, and the allocator-owned buffer
@@ -163,23 +162,23 @@ pub fn encode(allocator: Allocator, hrp: []const u8, data: []const u5) (EncodeEr
 /// following whitespace — used to split a long offer/invoice across
 /// limited-length text fields like a tweet).
 ///
-/// **Corrected 2026-09-10 (wave-2 audit finding `lninvoice` F7).** BOLT#12's
+/// **Corrected (wave-2 audit finding `lninvoice` F7).** BOLT#12's
 /// prose — "if it encounters a `+` ... between two bech32 characters: MUST
 /// remove" — reads as if "bech32 character" means charset-membership, and a
-/// 2026-08-08 tightening implemented it that way (`isBech32Char` on both
+/// Tightening implemented it that way (`isBech32Char` on both
 /// neighbours). That is wrong: the bech32 charset deliberately excludes
 /// `1`/`b`/`i`/`o` (to avoid visual confusion), yet those are exactly the
 /// letters a BOLT#12 human-readable prefix is built from (`lno`/`lnr`/`lni`)
 /// and the `1` that separates it from the data part — so a `+` landing right
 /// after the HRP (`"lno1+..."`) has `1` as its left neighbour and was left
 /// un-stripped, silently failing to parse a real, spec-legal split point.
-/// `A1/lninvoice.md` F7 found this and could not anchor a fix: the vendored
+/// A1 audit F7 found this and could not anchor a fix: the vendored
 /// corpus passes under EITHER reading, so neither confirms nor refutes it.
 ///
 /// Two stronger oracles, fetched directly for this fix (no network at audit
 /// time; there was here):
 /// - `lightning/bolts` `bolt12/format-string-test.json` (the official
-///   conformance vectors already anchoring this function, 2026-08-02) — its
+///   conformance vectors already anchoring this function) — its
 ///   `"+ can join anywhere"` vector splices a `+` INSIDE the HRP itself
 ///   (`"l+no1..."`, valid), and none of its 11 cases actually exercises a
 ///   `1`/`b`/`i`/`o` neighbour either way, which is exactly how a stricter,
@@ -361,8 +360,8 @@ test "stripContinuation: removes '+' and following whitespace (BOLT#12 QR-split)
     try testing.expectEqualStrings("lno1xxxxxxxxyyyyyyyyyyyyzzzzz", stripped);
 }
 
-// Regression (wave-2 audit finding `lninvoice` F7, fixed 2026-09-10): the
-// 2026-08-08 tightening required BOTH neighbours to be members of the
+// Regression (wave-2 audit finding `lninvoice` F7, fixed): the
+// Tightening required BOTH neighbours to be members of the
 // 32-symbol bech32 DATA charset, which excludes `1`/`b`/`i`/`o` — exactly
 // the characters a BOLT#12 human-readable prefix (`lno`/`lnr`/`lni`) and its
 // `1` separator are made of. A `+` landing right after the HRP therefore had
@@ -759,7 +758,7 @@ test "corpus: every string script builds a string, and what decode made of it is
     try testing.expectEqual(@as(usize, 0), buildString(&.{}, &zero).len);
 }
 
-// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+// ── whole-module mutation: boundary tests ──────────────────────
 
 test "mutation: mixed case is detected at the letter-range edges a, z, A, Z" {
     const a = testing.allocator;
