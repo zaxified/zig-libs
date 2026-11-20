@@ -1349,7 +1349,7 @@ test "authData: extension data (ED) is parsed, and malformed extensions have tee
     //
     // External oracle: both inputs below were produced AND parsed back by
     // Yubico's python-fido2 2.2.1 (`fido2.webauthn.AuthenticatorData.create`
-    // / `AuthenticatorData(bytes)`), a black box, on:
+    // / `AuthenticatorData(bytes)`), a black box,:
     //   registration: rpIdHash=SHA-256("example.org"), flags UP|UV|AT|ED
     //     (0xc5), signCount 0, aaguid 00..0f, credential id c1 x16, an ES256
     //     key, extensions {"credProtect": 2, "hmac-secret": True} — python-
