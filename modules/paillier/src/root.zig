@@ -19,12 +19,11 @@
 //! and NOTICE), plus self-checking round-trip/homomorphic-property tests and
 //! a full-size `generate` round trip.
 //!
-//! This is Phase 1 of the I2 threshold-ECDSA arc: Paillier is the additively-
-//! homomorphic sub-primitive GG20/CMP threshold-ECDSA's MtA (multiplicative-
-//! to-additive) protocol builds on. The zero-knowledge proofs that protocol
-//! actually needs (proof of correct Paillier encryption, range proofs, MtA
-//! itself) are Phase 2, deliberately OUT OF SCOPE here — see "Phase-2
-//! boundary" below and the `// TODO(phase2)` markers.
+//! Paillier is the additively-homomorphic sub-primitive GG20/CMP
+//! threshold-ECDSA's MtA (multiplicative-to-additive) protocol builds on. The
+//! zero-knowledge proofs that protocol actually needs (proof of correct
+//! Paillier encryption, range proofs, MtA itself) are deliberately OUT OF
+//! SCOPE here — see "Phase-2 boundary" below.
 //!
 //! ## Fe construction contract — READ BEFORE CALLING `encrypt`/the homomorphic ops
 //!
@@ -58,7 +57,7 @@ const burn = @import("burn.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
-// x86_64, 2026-10-08; `verbose = true` prints the depths). The probe asserts
+// x86_64; `verbose = true` prints the depths). The probe asserts
 // that no secret survives, which a body outgrowing its burn would break.
 const generate_stack_burn = 176 * 1024;
 const from_primes_stack_burn = 176 * 1024;
@@ -153,15 +152,10 @@ fn byteLen(bit_count: usize) usize {
 // comptime `Modint` slot (a multiple of 4 limbs) that holds it. Constants are
 // computed once per key.
 //
-// Until 2026-10-02 only the modexps ran here: the reduction of `c` into the
-// mod-p²/q² domains, the Garner recombination, `g^m`'s `1 + m·n` and the
-// products with it stayed in `std.crypto.ff`, whose `reduce`/`montgomeryMul`/
-// `toBytes`/`fromBytes` branch on the values in ReleaseFast, and the
-// L-function divided with `std.math.big.int`'s variable-time `divFloor`
-// (ctgrind `paillier/crt`: 325 in-file contexts). All of it runs on
-// `DynModint` now. `std.crypto.ff` stays the public carrier type (`Fe`,
-// `Modulus`) and the key-derivation arithmetic; values cross between the two
-// through `feToElem`/`elemToFe`, which repack limbs by position only.
+// All of it runs on `DynModint` now. `std.crypto.ff` stays the public carrier
+// type (`Fe`, `Modulus`) and the key-derivation arithmetic; values cross
+// between the two through `feToElem`/`elemToFe`, which repack limbs by
+// position only.
 
 /// A modulus plus its Montgomery constants (run-time size).
 const MontParams = montint.DynModint(max_bits);
@@ -542,7 +536,7 @@ pub const GenerateError = FromPrimesError || error{InvalidBits};
 /// bytes), for deterministic/reproducible construction (KATs, testing) —
 /// mirrors `rsa.SecretKey.fromPrimes`.
 ///
-/// The factors are CHECKED, not trusted (audit F7, 2026-09-14):
+/// The factors are CHECKED, not trusted (audit F7):
 ///   - each must be prime — exact trial division up to 32 bits, otherwise a
 ///     sieve plus 64-round Miller-Rabin whose witnesses come from a CSPRNG
 ///     keyed by the factor itself (no `random` parameter needed; a composite
@@ -576,7 +570,7 @@ pub const GenerateError = FromPrimesError || error{InvalidBits};
 ///   4. `mu = L(g^lambda mod n²)⁻¹ mod n`, `L(x) = (x-1)/n` — for `g = n+1`
 ///      that is `lambda⁻¹ mod n` exactly (`(1+n)^λ ≡ 1 + λn`, `λ < n`),
 ///      computed by montint's constant-time `inverse`.
-/// Since 2026-10-03 every step on p, q is montint limb arithmetic,
+/// Every step on p, q is montint limb arithmetic,
 /// constant-time in their values up to the verdicts, except building the
 /// `std.crypto.ff` carriers of `p²`, `q²` (SPEC Backlog).
 pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8, out: *KeyPair) FromPrimesError!void {
@@ -609,7 +603,7 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     if (pb.len > modulus_bytes or qb.len > modulus_bytes) return error.InvalidPrimes;
 
     // The derivation runs on montint limbs, constant-time in p, q
-    // (2026-10-03; until then std.math.big.int — gcd, divFloor and an
+    // (until then std.math.big.int — gcd, divFloor and an
     // extended Euclid on secrets). The verdicts are the only branches on
     // them; building the `std.crypto.ff` carriers of p², q² (`crt.p_sq`,
     // `crt.q_sq`) is the one variable-time step left (SPEC Backlog).
@@ -806,11 +800,10 @@ fn limbsToBe(v: []const u64, out: []u8) void {
 // Timing: the search loop is data-dependent (every implementation's is),
 // but what it reveals is about REJECTED candidates; all candidate buffers
 // are secureZero'ed. Along a kept prime's path Miller-Rabin is
-// constant-time in its value since 2026-10-03
-// (`montint.DynModint.isProbablePrime`; `ff`'s pow, used until then,
-// branches on the exponent windows in ReleaseFast). Still observable: the
-// squaring count `s` (the 2-adic valuation of `p − 1`) and the sieve's `%`
-// on the candidate (`bytesMod`).
+// constant-time in its value (`montint.DynModint.isProbablePrime`; `ff`'s
+// pow, used until then, branches on the exponent windows in ReleaseFast).
+// Still observable: the squaring count `s` (the 2-adic valuation of `p −
+// 1`) and the sieve's `%` on the candidate (`bytesMod`).
 
 /// Miller-Rabin rounds per candidate — see the section comment above.
 const mr_rounds = 64;
@@ -1041,7 +1034,7 @@ fn nAsFeModNsq(n: Modulus, n_sq: Modulus) Fe {
 ///   - **A caller-supplied non-standard `g` (`PublicKey.fromBytes` with
 ///     explicit `g_bytes`):** the general modexp through montint
 ///     (`DynModint.pow`), constant-time in `m` — a plaintext, so possibly
-///     secret. Until 2026-10-02 this was `std.crypto.ff`'s `pow`, whose
+///     secret.
 ///     window select compiles to a conditional jump on the exponent in
 ///     ReleaseFast (ctgrind, the threshold_ecdsa `fac` finding). montint
 ///     yields `g^0 = 1` with no special case, so `m = 0` needs no branch.
@@ -1052,8 +1045,8 @@ fn gPow(pk: PublicKey, m: Fe) HomomorphicError!Fe {
 }
 
 /// `gPow` on montint elements — what `encrypt`/`addPlaintext` multiply with.
-/// Both branches run on montint (`1 + m·n` was `std.crypto.ff`'s `mul`/`add`
-/// until 2026-10-02); the branch itself is on the PUBLIC generator.
+/// Both branches run on montint; the branch itself is on the PUBLIC
+/// generator.
 fn gPowElem(pk: *const PublicKey, m: *const Fe) MontElem {
     const n_fe = nAsFeModNsq(pk.n, pk.n_sq);
     const g_std = pk.n_sq.add(n_fe, pk.n_sq.one()); // the standard generator, n+1
@@ -1082,7 +1075,7 @@ fn gPowElem(pk: *const PublicKey, m: *const Fe) MontElem {
 /// **A reused or unit `r` (`r = 1`, or any `r` such that `r^n ≡ 1 mod n²`,
 /// e.g. `r = n+1 = g`) makes the ciphertext publicly decryptable without the
 /// key** — `c = g^m` then, and `m = L(c)` needs no secret (paillier F11,
-/// wave-3 audit; recommended by the 2026-08-12 RNG-seam audit and not
+/// wave-3 audit; recommended by the RNG-seam audit and not
 /// previously written down). `r = 0` is rejected below
 /// (`error.InvalidRandomness`) since it can only ever produce a ciphertext
 /// `decrypt` itself then rejects (`gcd(0, n) = n`); no other unsafe-but-
@@ -1195,7 +1188,7 @@ pub const DecryptError = std.crypto.ff.NullExponentError || std.crypto.ff.Repres
 /// multiple of `n` (`c` not a ciphertext under this key) — both
 /// `error.InvalidCiphertext`, never a silently decrypted garbage value.
 ///
-/// `L` was `std.math.big.int`'s variable-time `divFloor` until 2026-10-02.
+/// `L` was `std.math.big.int`'s variable-time `divFloor` until.
 /// Its quotient is `m·λ mod n`, so its timing was a function of the
 /// plaintext and of `λ` — measured reaching that line (ctgrind
 /// `paillier/crt`, `noncrt`; `threshold_ecdsa` F5 and `paillier` F3 traced
@@ -1302,13 +1295,13 @@ fn decryptByValue(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
 
 // ── homomorphic ops (the whole point of this module) ─────────────────────
 //
-// TODO(phase2): the zero-knowledge proofs GG20/CMP threshold-ECDSA actually
+// Out of scope: the zero-knowledge proofs GG20/CMP threshold-ECDSA actually
 // needs around these operations (proof of correct Paillier encryption,
 // range proofs bounding the plaintext/randomness, and the MtA protocol that
 // composes addPlaintext+mulPlaintext+addCiphertexts into a secure share
-// conversion) are OUT OF SCOPE for this module. This module provides only
-// the core additively-homomorphic PKE; MtA/range-proofs are a separate,
-// later module (I2 Phase 2) that will depend on this one.
+// conversion). This module provides only the core additively-homomorphic
+// PKE; MtA and the range proofs live in `threshold_ecdsa`, which depends on
+// this module.
 
 pub const HomomorphicError = std.crypto.ff.NullExponentError || std.crypto.ff.RepresentationError;
 
@@ -1318,7 +1311,7 @@ pub const HomomorphicError = std.crypto.ff.NullExponentError || std.crypto.ff.Re
 /// `addPlaintext`/`mulPlaintext` below), on montint: a ciphertext operand
 /// can be an intermediate its owner never publishes — `threshold_ecdsa`'s MtA
 /// combines `c_A^b` with `Enc(β')` here — and `std.crypto.ff`'s `mul`
-/// branches on the Montgomery extra-reduction bit (ctgrind 2026-10-02,
+/// branches on the Montgomery extra-reduction bit (ctgrind,
 /// `threshold_ecdsa` rows). Cannot fail.
 pub fn addCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) Ciphertext {
     var r = pk.n_sq_mont.mul(&feToElem(&c1.c), &feToElem(&c2.c));
@@ -1394,7 +1387,7 @@ fn addPlaintextByValue(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Cip
 /// returns the deterministic, unblinded encryption of 0 (`c^0 = 1`, and
 /// `L(1^lambda) = 0` decrypts to 0) — exactly what `phe`'s `raw_mul` (python
 /// `pow(c, 0, n²) = 1`) produces. montint's ladder gives `c^0 = 1` itself,
-/// so there is no special case: until 2026-10-02 one was kept, and its
+/// so there is no special case: earlier one was kept, and its
 /// `k.isZero()` was a branch on the (possibly secret) scalar.
 ///
 /// Routed through montint (same `pk.n_sq_mont` params `encrypt`'s public
@@ -1747,7 +1740,7 @@ test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
 // checks, line ~733-734) survive the suite GREEN, same as `m11` did for the
 // later L-exactness check (see the census test below). Unlike `m11`, the
 // audit did not run a redundancy census for `m9`/`m10` and left them as
-// unexamined "real gaps" in its accounting. Ran one directly (2026-09-10,
+// unexamined "real gaps" in its accounting. Ran one directly (
 // dojezd): with each guard disabled in turn (`if (false and ...)`),
 // exhaustive `p == q` over `v` in `[2, 99]` and exhaustive `p` (or `q`) in
 // `{0, 1, 2}` against `q` (or `p`) in `[2, 99]`, both orders — **0 of either
@@ -1778,7 +1771,7 @@ test "fromPrimes closeness guard: |p − q| = 2^(nlen/2 − 100) exactly is refu
     var scratch_kp: KeyPair = undefined;
     // Two 256-bit primes exactly 2^156 apart (n is 512 bits, so the bound
     // is 2^(256 − 100)); FIPS 186-5 wants |p − q| > 2^156. Found offline
-    // (Python, 40-round Miller-Rabin); the mutation run of 2026-10-03 had
+    // (Python, 40-round Miller-Rabin); the mutation run had
     // `< 2^156` survive without this pair.
     var p: [32]u8 = undefined;
     var q: [32]u8 = undefined;
@@ -1793,7 +1786,7 @@ test "fromPrimes closeness guard: |p − q| = 2^(nlen/2 − 100) exactly is refu
 test "fromPrimes CRT exponents are λ mod p(p−1) exactly (factors of unequal size)" {
     // p 64-bit, q 256-bit: λ = lcm(p−1, q−1) exceeds p(p−1), so dp is a
     // real reduction (for same-size factors dp = λ, which hid a skipped
-    // reduction from the mutation run of 2026-10-03). Expected values from
+    // reduction from the mutation run of). Expected values from
     // Python's integers.
     var p: [8]u8 = undefined;
     var q: [32]u8 = undefined;
@@ -1825,7 +1818,7 @@ test "fromPrimes CRT exponents are λ mod p(p−1) exactly (factors of unequal s
 // exactly the class the hypothesis "the structural self-check in
 // `fromPrimesImpl` would catch it anyway" (which held for m9/m10/m11's
 // RANDOM composites) predicted would be caught too. Measured instead
-// (2026-09-10, dojezd): `fromPrimes` ACCEPTED 24 of 32 base-2 strong
+// (dojezd): `fromPrimes` ACCEPTED 24 of 32 base-2 strong
 // pseudoprime/`kat_q` pairs (both orders) as "valid" keys -- the structural
 // check has a blind spot for exactly this class of composite, because
 // pseudoprimes share deep number-theoretic structure with primes that
@@ -3410,7 +3403,7 @@ test "fuzz: paillier round trip and homomorphisms (Smith replay)" {
 // register passing) by value into `std.crypto.ff.Modulus.mul`, whose own
 // parameter-passing copy this module had no address to zero.
 //
-// ✅ CLOSED 2026-09-11 (paillier F2): `montMulSecret` routes the multiply
+// ✅ CLOSED (paillier F2): `montMulSecret` routes the multiply
 // through `montint` instead, and — the part that took a second round to
 // find — takes its operands by POINTER, not by value. Passing `sk.mu`
 // (still 512 B) by value into `montMulSecret` itself reproduced the exact
@@ -3520,7 +3513,7 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-// ── whole-module mutation round (2026-11-17) ─────────────────────────────────
+// ── whole-module mutation round ─────────────────────────────────
 
 fn leftPad(comptime N: usize, value: []const u8) [N]u8 {
     var out = @as([N]u8, @splat(0));

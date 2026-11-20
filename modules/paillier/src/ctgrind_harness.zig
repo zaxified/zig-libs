@@ -64,7 +64,7 @@
 //!   - `mul`    — `mulPlaintext`'s scalar `k` (the exponent montint's
 //!                ladder consumes since paillier F5, wave-3 audit —
 //!                previously `pk.n_sq.pow`; the `k.isZero()` special case
-//!                that branched on it was dropped 2026-10-02) is tainted;
+//!                that branched on it was dropped) is tainted;
 //!                the ciphertext operand is the fixed untainted public one.
 //!   - `addm`   — `addPlaintext`'s plaintext `m` is tainted; same fixed
 //!                ciphertext operand. Exercises `gPow`'s binomial-shortcut
@@ -214,7 +214,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target_arg });
 
-    // Target `keygen` (2026-10-03): `fromPrimes` itself on TAINTED p, q —
+    // Target `keygen`: `fromPrimes` itself on TAINTED p, q —
     // the factor checks (montint Miller-Rabin, closeness), n, λ by
     // `montint.nt.lcm`, µ = λ⁻¹ mod n, the CRT exponents and the Garner
     // coefficient, all montint since that day. Residue: the ff carriers of
