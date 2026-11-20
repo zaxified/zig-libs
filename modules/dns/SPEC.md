@@ -98,21 +98,21 @@ request it cannot verify) is reported as `PeerBadSig`/`PeerBadKey`. `Options.rec
 
 **Timeouts.** `Options.timeout_ms` (struct default `default_timeout_ms` = 5000) and `Options.attempts` (`default_attempts`)
 yield to resolv.conf's `options timeout:` / `attempts:` when the caller leaves them at those defaults AND resolv.conf is in
-play (no explicit `Options.servers`): `effectiveTimeoutMs` / `effectiveAttempts` (`Resolver.zig:1739-1751`). An explicit
+play (no explicit `Options.servers`): `effectiveTimeoutMs` / `effectiveAttempts` (`Resolver.zig`). An explicit
 non-default value always wins on the classic UDP/TCP path. Accepted cost: a caller who sets exactly the default's own value
 is indistinguishable from one who left it unset (telling them apart would make the fields `?u32`, a breaking type change);
 DoH's total timeout is set once at `init`. `Options.call_timeout_ms` (default 0 = off, Go's `ctx` deadline,
-`Resolver.zig:194`) bounds ONE public call across every attempt, server, search-list candidate and family: when it runs out
+`Resolver.zig`) bounds ONE public call across every attempt, server, search-list candidate and family: when it runs out
 the call ends with `error.Timeout` (a reply already in hand is still returned), and each attempt waits for the earlier of
-`timeout_ms` and what is left of it. The outermost public call owns the budget (`beginCall`, `Resolver.zig:1691`); not
+`timeout_ms` and what is left of it. The outermost public call owns the budget (`beginCall`, `Resolver.zig`); not
 applied to DoH.
 
 **DNS over TLS (RFC 7858).** `Transport.tls` (`Resolver.zig:102`) sends a query over TCP to `Options.dot_port` (853) inside a
 TLS session (`tlsclient`) with the RFC 1035 two-byte framing, one connection per exchange, bounded like TCP. Authenticated by
 default (`dot_tls`, strict: chain against the system CA bundle, certificate must carry `tls_server_name`, which is also the
 SNI; null checks the certificate against the server's IP and sends no SNI). A failed handshake is `error.TlsFailed`, never a
-plain-DNS retry (`Resolver.zig:553-557`); a build without `dns-dot` refuses `.tls` with `error.NoDotSupport`
-(`Resolver.zig:1208`, *Build options*).
+plain-DNS retry (`Resolver.zig`); a build without `dns-dot` refuses `.tls` with `error.NoDotSupport`
+(`Resolver.zig`, *Build options*).
 
 **Typed rdata.** `rdata.zig` gives typed views of TLSA, SSHFP, URI, NAPTR and SVCB/HTTPS rdata
 (`rdata.parse(T, arena, rec)` over `Record.data.unknown`); there is no new `Record.Data` variant, so the sibling `dnssec`
@@ -181,7 +181,7 @@ capped at 1 h), RFC 2308 (negative caching), RFC 8767 (serve-stale). Each `Answe
 | expiry | an answer expires `ttl` seconds after the moment its query was sent (the clock is read after a pool slot is held, before the call), not after it returned: it never outlives its TTL by the lookup's duration. `lookupIp` order is RFC 6724 as of the lookup time; a `.cache`/`.stale` hit is re-sorted on the caller's clone (never the stored copy, never under the table mutex) when `resort_ip_hits` (default true), so a route change shows in the order. Cost: one route query (UDP connect, nothing sent) per item per hit; `false` serves the order stored by the filling lookup. `sort_source` (default `netaddr.systemSource`) is the test seam | RFC 6724 §6 |
 | stale window | counts from EXPIRY (RFC 8767), not from the last good answer: an entry is servable for `ttl + stale_s`. "Keep the last answer N seconds" = `stale_s` = N minus the TTL the caller saw, or N as an upper bound. Negative answers (NXDOMAIN/NODATA) live for the SOA TTL (RFC 2308) clamped by `negative_*`; they get no doubling backoff, which is for upstream failures only | RFC 8767 §4, RFC 2308 |
 | per-key invalidation | `forget(kind, name)` (`kind`: `.ip .mx .ns .txt .cname`), `forgetReverse(ip)`, `forgetSrv(service, proto, name)` drop one key, answer and backoff alike, so its next lookup asks the network; an absent key is a no-op; a lookup of that key already in flight may still store its answer afterwards. `clear()` drops all | hickory/unbound per-name flush |
-| local refusal | a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`, `RequestTooLarge`, `InvalidOptions`, `NoDotSupport`, `NoDohEndpoint`) counts in no statistic and gives its budget token back (`isLocalRefusal`, `CachingResolver.zig:1001`, used at `:916`) | like the literal bypass |
+| local refusal | a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`, `RequestTooLarge`, `InvalidOptions`, `NoDotSupport`, `NoDohEndpoint`) counts in no statistic and gives its budget token back (`isLocalRefusal`, `CachingResolver.zig`, used at `:916`) | like the literal bypass |
 | stale reason | `Answer.stale_reason: ?Error`, set on `.stale`: the upstream failure just seen, the error the backoff holds, or `error.BudgetExceeded`; null otherwise | — |
 | time | whole seconds from a monotonic clock (`Options.clock` is the test seam); ages saturate, a clock going backwards neither underflows nor reports more than the stored TTL | — |
 

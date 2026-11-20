@@ -99,15 +99,15 @@ not implemented (*Backlog / deferred*).
 - **`keySort` is real** — pure lexicographic byte-sort
   (`std.mem.sort`/`std.mem.order`), byte-exact against
   `key_sort_vectors.json`.
-- **`SessionError`** is `KeyAggError || AggNonceError || ApplyTweakError` (`root.zig:712`), so `getSessionValues`
+- **`SessionError`** is `KeyAggError || AggNonceError || ApplyTweakError` (`root.zig`), so `getSessionValues`
   never panics, even on a hand-constructed (never `fromBytes`-validated) `SessionContext.aggnonce`, and an
   out-of-range tweak or a tweaked key at infinity is a session-level failure, as in BIP327's `GetSessionValues`.
 - **Index checks**: `partialSigVerify` returns `error.InvalidPublicKey` / `error.InvalidPubNonce` when `signer_index`
-  is past either list (`root.zig:1002-1003`) instead of indexing out of bounds.
+  is past either list (`root.zig`) instead of indexing out of bounds.
 - **Dead-stack burns**: `sign` runs its work in `noinline signBurned` with the key passed by pointer (so `sign`'s own
   frame holds none) and zeroes `sign_stack_burn` (32 KiB) bytes at that depth after it returns, on the error path too
-  (`root.zig:884-975`); `nonceGen` does the same through `burn.run` / `burn.nonce_burn` (`root.zig:369`,
-  `burn.zig:38`). The stack probes (*Verification*) go red if either burn is removed.
+  (`root.zig`); `nonceGen` does the same through `burn.run` / `burn.nonce_burn` (`root.zig`,
+  `burn.zig`). The stack probes (*Verification*) go red if either burn is removed.
 
 ## Threat model / limits
 
@@ -202,7 +202,7 @@ not implemented (*Backlog / deferred*).
   signer's secret key via the standard two-equations-two-unknowns Schnorr algebra. `sign` takes the `SecNonce` by
   pointer and zeroes it on entry, whatever the outcome (BIP327 `Sign`: `secnonce[0:64] = bytes(64, 0)`;
   libsecp256k1 `musig_partial_sign` does the same), so a second `sign` over it is `error.InvalidSecNonce`
-  (`root.zig:284-292`, `root.zig:898`). What remains the caller's: never duplicate or persist a `SecNonce` before
+  (`root.zig`). What remains the caller's: never duplicate or persist a `SecNonce` before
   signing (a copy is not reached).
 - **The mandatory self-verify in `Sign`**: BIP327's `Sign` algorithm
   requires running `PartialSigVerifyInternal` on the freshly-produced

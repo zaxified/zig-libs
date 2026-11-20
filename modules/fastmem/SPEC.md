@@ -119,7 +119,7 @@ library loaded into it.
   (nothing is touched, `dest` is returned); with a non-zero `len` a null `dest` or
   `src` traps (SIGILL) in every build mode instead of dereferencing null
   (undefined in C and, as `.?`, in ReleaseFast). `memset` traps with an inline-asm
-  `ud2` on x86-64 (`@trap()` elsewhere), `memcpy` with `@trap()` (`src/root.zig:101`,
+  `ud2` on x86-64 (`@trap()` elsewhere), `memcpy` with `@trap()` (`src/root.zig`,
   `:163`): not `@panic` or `orelse @panic`, because a call gave the function a
   stack frame on every call and the trap keeps it frameless.
 - `set`/`copy` take any length that describes memory the caller may write, so
@@ -129,7 +129,7 @@ library loaded into it.
   arm. `memmove` and `bcmp` are not provided.
 - The string paths (`rep stosq`, `rep movsb`) exist on x86-64 with 64-bit
   pointers only, and not under the C backend (`use_stos`, `use_movs`,
-  `src/root.zig:201`); every other build takes the vector loop.
+  `src/root.zig`); every other build takes the vector loop.
 
 ## Anchoring
 

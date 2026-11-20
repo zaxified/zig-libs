@@ -66,7 +66,7 @@ called out below.
 `Fe` stores the base-field value as **four full 2^64 little-endian limbs** (`[4]u64`), always canonical (`< p`) between
 operations, in the **Montgomery domain** (`limbs = a·2^256 mod p`, `R = 2^256`). `mul`/`sq` are a MULX/ADX product followed
 by a Montgomery REDC (`fast_core.montMul`/`montSq` and the register-returning `montMulRegs`/`montSqRegs` the field calls,
-`field.zig:281`): for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each of the four rounds' quotient digit is the low limb itself
+`field.zig`): for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each of the four rounds' quotient digit is the low limb itself
 and `m·p` is two shifts plus one 64×64 multiply. The portable path is `field.montMulPortable` (`montReducePortable`, the
 `(p+1)/2^64` shortcut, comptime-evaluable — the comb table is built through it); `oracle_test.zig` pins asm and portable to
 a naive textbook REDC. `fromBytes`/`fromInt` convert in (`·R²`, or `(x≪256) mod p` at comptime), `toBytes`/`toInt`/`isOdd`
@@ -193,7 +193,7 @@ inversions). ctgrind (row `comb`) measures that property.
 
 ## Design notes by feature
 
-- **Field in registers.** `fast_core.addRegs`/`subRegs` (`fast_core.zig:904`, `:956`) do the field add/sub on register
+- **Field in registers.** `fast_core.addRegs`/`subRegs` (`fast_core.zig`, `:956`) do the field add/sub on register
   operands (LLVM lowered the portable `u256` versions with `setb` to memory and `sbb $0` mask chains), and the Montgomery
   products return their result in registers (`montMulRegs`/`montSqRegs`) instead of through an out-pointer, with a
   canonical tail that subtracts `p` in place and adds it back masked. `cmov` stays out of the tail: memcheck flags a CMOVcc
@@ -205,10 +205,10 @@ inversions). ctgrind (row `comb`) measures that property.
   a result is stored only when a later op reads its slot from memory or it is an output). The operation order is
   nistz256's, chosen because every `adc`/`sbb`/`adcx`/`adox`/shift competes for the same two ports and a square costs a
   multiply in this core: doubling is 4M + 4S + 11 add/sub/half (`Z3 = 2·Y·Z`, `S = (2Y)²·X`, `8Y⁴` as half of `(2Y)⁴`;
-  `point_asm.zig:326`) instead of dbl-2001-b's 3M + 5S + 16, and the CT mixed addition is madd-2004-hmv, 8M + 3S + 7 add/sub
-  (`point_asm.zig:365`, `Jac.addMixedCtFormula`). `Jac.dblFormula` (dbl-2001-b) is kept as the oracle and as the
+  `point_asm.zig`) instead of dbl-2001-b's 3M + 5S + 16, and the CT mixed addition is madd-2004-hmv, 8M + 3S + 7 add/sub
+  (`point_asm.zig`, `Jac.addMixedCtFormula`). `Jac.dblFormula` (dbl-2001-b) is kept as the oracle and as the
   doubling where the field core is not asm, so the differential in `group.zig` compares bit for bit; `Jac.dblTimes` runs
-  a window's five doublings over one frame (`group.zig:866-899`). amd64 only, like the field core.
+  a window's five doublings over one frame (`group.zig`). amd64 only, like the field core.
 - **Windowed variable-base multiply (`mulCtWindowed`).** Fixed window w = 5, 52 signed digits in [−16, 15], a table of the
   magnitudes {1..16}·P built on a public schedule and made affine by one constant-time batch inversion
   (`batchToAffineCt`), then per digit 5 Jacobian doublings and one table add, top-down; the incomplete CT mixed addition
@@ -240,7 +240,7 @@ inversions). ctgrind (row `comb`) measures that property.
   `mulCtWindowed` with secret digits. Its in-file contexts are all verdicts: the two range checks on the secret
   (`ecdh.zig`, revealed by the error) and the product's `rejectIdentity` (`group.zig`).
   Portable path (no ADX/BMI2: aarch64, baseline x86-64): the conditional subtract of `montReducePortable` launders both of
-  its flags before combining them (`blackBox(d[1]) & ~blackBox(hi)`, `field.zig:263`), and the portable `Fe.add` does the
+  its flags before combining them (`blackBox(d[1]) & ~blackBox(hi)`, `field.zig`), and the portable `Fe.add` does the
   same, because LLVM lowered the combined bit to a `jae` in one inlined copy. The CI lane `ctgrind portable amd64`
   (`CTGRIND_CPU=x86_64`) measures this path against its own pins, so it is guarded as the native one is.
 - **Scalar**: `mul`/`add`/`sub`/codecs are std's constant-time fiat field, wrapped;
@@ -347,9 +347,9 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 
 ## Backlog / deferred
 
-- **Self-hosted Debug does not compile.** `fast_core.zig:81` says "No `movabsq` (rejected by the self-hosted assembler)",
-  but `fast_core.zig:560/712/921/924` and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also
-  runs out of registers lowering inline asm at `fast_core.zig:904/956` (`addRegs`/`subRegs`). Any consumer's `-fno-llvm`
+- **Self-hosted Debug does not compile.** `fast_core.zig` says "No `movabsq` (rejected by the self-hosted assembler)",
+  but `fast_core.zig` and the generated `point_asm.zig` use it; the self-hosted backend also
+  runs out of registers lowering inline asm at `fast_core.zig` (`addRegs`/`subRegs`). Any consumer's `-fno-llvm`
   Debug build (the edit loop) fails in p256. Plan: the module's own recipe (`movl $imm32` + `shlq`/`orq`), in the generator
   for `point_asm`; then a self-hosted Debug `modtest` lane (or a `-Dselfhosted` compile) so it cannot regress silently.
   montint has the same gap.

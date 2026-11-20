@@ -209,19 +209,19 @@ bags before unregistering: draining needs the global epoch to move at least 2 pa
 the last retire, and any concurrently pinned thread (e.g. one the OS preempted
 mid-pin) stalls that arbitrarily. `unregister` therefore does a **bounded**
 self-drain (`max_unregister_advances = num_epochs + 2` `tryAdvance` attempts, no
-backoff, no retry loop; `src/ebr.zig:467`, `src/ebr.zig:510`), which completes
+backoff, no retry loop; `src/ebr.zig`), which completes
 deterministically for a lone or last participant. If garbage remains, the slot is
 **orphaned**: `orphaned` is published with a release store, `in_use` stays set
-(the bags are live storage), and the call returns (`src/ebr.zig:516`). Any
+(the bags are live storage), and the call returns (`src/ebr.zig`). Any
 participant's next `tryAdvance` adopts the slot (`adoptOrphans`,
-`src/ebr.zig:552`: an acquire CAS on `orphaned` with one winner, the epoch
+`src/ebr.zig`: an acquire CAS on `orphaned` with one winner, the epoch
 re-read after acquiring), drains what has expired and frees it. `unregister`
 never waits on another thread, and the orphan slot cannot block an advance
 because the scan reads `local_epoch` (unpinned), not `in_use`. The grace-period
 theorem never names the draining thread, only the epoch it observed, so it is
 untouched; the one extra access is the `orphaned` release/acquire pair. A
 double `unregister` (a slot not `in_use`, or already orphaned) is a checked panic
-(`msg_unregister_unowned`, `src/ebr.zig:193`).
+(`msg_unregister_unowned`, `src/ebr.zig`).
 
 **Allocation on the retire path — the bounded reserve.** `retire` is called
 pinned and *after* the unlink, so by then the node is out of the structure and its
@@ -232,7 +232,7 @@ than one node and turns a recoverable allocator failure into a crash for every
 consumer. `retire` is therefore **infallible**, via two mechanisms, neither of
 which touches an ordering or the reclaim predicate:
 
-1. **A bounded reserve.** `Config.bag_reserve` (default 16, `src/ebr.zig:69`) limbo
+1. **A bounded reserve.** `Config.bag_reserve` (default 16, `src/ebr.zig`) limbo
    entries per bag per participant are pre-allocated in `Domain.init` — where a
    failure is just an `error.OutOfMemory` out of a constructor. Bags keep capacity
    across drains (`clearRetainingCapacity`), so once warm, retire never calls the
@@ -245,7 +245,7 @@ which touches an ordering or the reclaim predicate:
    the only one of the three responses that is safe in the reclamation sense. Nor
    is it a heap leak: the node is a pool slot, destroyed by `NodePool.deinit` at
    teardown regardless, so the loss is bounded pool capacity. It is counted
-   (`Domain.droppedRetires`, `src/ebr.zig:806`, quiescent-read) so a consumer that
+   (`Domain.droppedRetires`, `src/ebr.zig`, quiescent-read) so a consumer that
    cares can assert zero.
 
 `dequeue` keeps its `?u64` signature and contains no failure handling at all. The
@@ -276,7 +276,7 @@ contradiction. `slotIndex` is a stored index that continues across chunks;
 `NodePool` caches past their served range already fall back to the locked path.
 A scan that stops at the first chunk is the bug class this must exclude: the
 growing-registry stress (16 threads register into a one-slot domain while chunks
-are appended under the scan, `src/harness.zig:582`) targets it.
+are appended under the scan, `src/harness.zig`) targets it.
 
 **Nested pins.** `enterCriticalNested` (and `pin`) take an already pinned
 participant: they only count (`nested_pins`, owner-only), and only the
@@ -346,7 +346,7 @@ handshake, so there is no reclamation to prove. `len` is the one `seq_cst`
 reader: it re-reads `tail` around the `head` load so that the pair is a
 consistent snapshot. The refusal count is four cache-line stripes picked by a
 hash of the thread's stack address (`refusedCount` sums them,
-`src/bounded.zig:95`, `src/bounded.zig:412`): one shared counter made producers
+`src/bounded.zig`): one shared counter made producers
 spinning on a full ring fight over a single line.
 
 **Capacity.** A power of two (`pos mod capacity` is a mask, and positions wrap

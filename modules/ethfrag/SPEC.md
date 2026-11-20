@@ -59,7 +59,7 @@ separate gap scan). **That premise — every accepted interval lies within
 `[0, total_len)` — holds also for fragments accepted before any `more=false`
 fragment has established `total_len`**: the bounds check only exists once `total_len` is
 known, so `insert` re-checks the already accepted intervals the moment `total_len` is newly
-established (the retroactive bounds check, `root.zig:664`) and refuses the fragment that
+established (the retroactive bounds check, `root.zig`) and refuses the fragment that
 turns out to lie beyond it. Without it a specific offset/order combination could make
 `covered` reach `total_len` via bytes entirely OUTSIDE the real frame while a genuine gap
 remained INSIDE it, returning `.complete` over uninitialized allocator memory. Pinned by the
@@ -94,9 +94,9 @@ existing datagram drops that datagram. `Reassembler.totalBytes()` reads the curr
 `Reassembler.stats()` / `resetStats()` return the saturating `u64` tallies of `Stats`
 (completed, expired, overlap, out_of_bounds, protocol_violation, too_many_fragments, table_full,
 budget_exceeded, malformed; `Truncated`, `InvalidHeader`, `LengthMismatch` and
-`EmptyNonFinalFragment` all count as malformed, `root.zig:562`). `Reassembler.init` returns
+`EmptyNonFinalFragment` all count as malformed, `root.zig`). `Reassembler.init` returns
 `error.InvalidConfig` (`InitError`) for a zero `max_inflight`, `max_fragments_per_datagram` or
-`max_total_bytes`, or a `max_frame_len` of 0 or above the module ceiling (`root.zig:450`).
+`max_total_bytes`, or a `max_frame_len` of 0 or above the module ceiling (`root.zig`).
 **One `Reassembler` per peer:** the Linux kernel keys its fragment queues by
 (source, destination, protocol, id[, user / vrf]) and smoltcp by a per-protocol key type, but in
 both the peer identity is a field of the fragmented packet itself. Here it is not: the 8-byte header

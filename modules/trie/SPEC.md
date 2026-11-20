@@ -205,45 +205,45 @@ DFS a straight left-to-right edge walk.
 
 - **Range and prefix search.** `Frozen.range(gpa, Range, max_visited)` iterates the
   keys between two optional bounds (`Range.lo` inclusive and `hi` exclusive by
-  default, each switchable; `query.zig:84`, `:334`); positioning on the lower bound costs
+  default, each switchable; `query.zig`, `:334`); positioning on the lower bound costs
   O(lo.len) node decodes. `prefixesOf(text)` yields the stored keys that are prefixes
   of `text`, shortest first, and `longestPrefix(text)` the last of them
-  (`query.zig:368`, `:373`).
-- **Rank ↔ key.** `ordinal(key)` and `keyAt(i, key_buf)` (`query.zig:383`, `:408`)
+  (`query.zig`, `:373`).
+- **Rank ↔ key.** `ordinal(key)` and `keyAt(i, key_buf)` (`query.zig`, `:408`)
   need the per-edge `before` counts, written when the builder option `ordinals` is
-  set (`stream.zig:32`; four bytes per edge); a buffer without them returns
-  `error.NoOrdinals` (`OrdinalError`, `query.zig:45`), and version 1 never has them.
+  set (`stream.zig`; four bytes per edge); a buffer without them returns
+  `error.NoOrdinals` (`OrdinalError`, `query.zig`), and version 1 never has them.
   The rank is the 0-based position in sorted key order.
 - **Cursor.** `QueryOptions.after` makes `topN` consider only completions ranked
   strictly after the given one, so the last item of a page is the cursor of the next;
-  each page is a fresh walk under the same `max_visited` (`query.zig:61`).
-- **Streaming build.** `SortedBuilder` (`stream.zig:106`) takes keys in ascending
+  each page is a fresh walk under the same `max_visited` (`query.zig`).
+- **Streaming build.** `SortedBuilder` (`stream.zig`) takes keys in ascending
   order (equal keys allowed, the later value wins; a smaller key is `error.Unsorted`)
   and writes to any `std.Io.Writer`, holding only the current key's path.
-  `Builder.freezeTo(writer, opts)` (`builder.zig:213`) walks the in-memory trie in key
+  `Builder.freezeTo(writer, opts)` (`builder.zig`) walks the in-memory trie in key
   order into it; `freeze` is `freezeTo` into a growing buffer.
 - **Automaton search.** `Frozen.search(gpa, A, &aut, max_visited)` returns a
   `SearchIterator` over every key the automaton accepts, in ascending order
-  (`query.zig:354`). An automaton is any type with `State`, `start`, `isMatch`,
+  (`query.zig`). An automaton is any type with `State`, `start`, `isMatch`,
   `canMatch`, `willAlwaysMatch` and `accept`, checked at compile time
-  (`automaton.zig:43`); the built-ins are `Str`, `Subsequence`, `AlwaysMatch`,
+  (`automaton.zig`); the built-ins are `Str`, `Subsequence`, `AlwaysMatch`,
   `StartsWith`, `Union`, `Intersection`, `Complement` and the helpers `startsWith`,
-  `unionOf`, `intersectionOf`, `complementOf` (`automaton.zig:75`–`:281`). `canMatch`
+  `unionOf`, `intersectionOf`, `complementOf` (`automaton.zig`–`:281`). `canMatch`
   false prunes a subtree (also in the middle of a compressed edge); `willAlwaysMatch`
   true stops feeding bytes below the point. The contract follows fst 0.4.7's
   `Automaton` (`src/automaton.zig` cites file and line; the source was read for
   behaviour, nothing copied).
 - **Set operations.** `opIterator(gpa, indexes, SetOp, max_visited)` merges up to
-  `max_op_indexes` (64, `ops.zig:49`) frozen indexes in key order for `SetOp`
-  `union`, `intersection`, `difference` and `symmetric_difference` (`ops.zig:39`,
+  `max_op_indexes` (64, `ops.zig`) frozen indexes in key order for `SetOp`
+  `union`, `intersection`, `difference` and `symmetric_difference` (`ops.zig`,
   `:59`); each item lists the contributing indexes and their values
   (`IndexedValue`, `OpItem`). The budget is the total over all inputs. The output is
   in key order, so a union can be written straight into a `SortedBuilder`.
 - **Version 3 lookup.** `Frozen.lookup` walks version 3 in its own loop
-  (`lookupV3`, `query.zig:179`) which repeats the node checks of `format.nodeAtV3`
+  (`lookupV3`, `query.zig`) which repeats the node checks of `format.nodeAtV3`
   without building a node view; the labels of a node are matched and order-checked
-  16 lanes at a time, a run of 17..32 labels in one masked 32-byte compare (`format.zig:482`–`:531`) and the one child distance needed is a
-  single load (`readDistance`, `format.zig:470`). A differential test holds it to the
+  16 lanes at a time, a run of 17..32 labels in one masked 32-byte compare (`format.zig`–`:531`) and the one child distance needed is a
+  single load (`readDistance`, `format.zig`). A differential test holds it to the
   shared decoder walk on damaged, re-sealed buffers.
 
 ## DoS / bounded-work model
@@ -308,7 +308,7 @@ A frozen buffer may come from a file outside the process trust boundary
   bounds-checking, never over-read. A v2 root carrying a tail is `Corrupt`.
 - **The `max_visited == 0` ("unbounded") forms stop at the buffer's length.**
   `prefixIterator`, `range`, `search`, `topN` and `opIterator` with budget 0 return
-  `error.Corrupt` after `buf.len` node decodes (`query.zig:33`, `:574`, `:762`): a
+  `error.Corrupt` after `buf.len` node decodes (`query.zig`, `:574`, `:762`): a
   tree buffer (one parent per node, which the builders guarantee) has fewer nodes
   than bytes, while a hostile buffer in which edges share children (a DAG: under
   1 KB can enumerate 2^60 keys) hits the cap. The proof is by construction (one
@@ -317,14 +317,14 @@ A frozen buffer may come from a file outside the process trust boundary
   with an explicit budget. An explicit caller cap keeps `TooComplex` / truncation.
 - **The builders refuse what the query side cannot walk.** `Builder.insert` and
   `SortedBuilder.insert` return `error.KeyTooLong` for a key over `max_key_len`
-  (default `max_depth`, 4096; `builder.zig:113`, `stream.zig:120`), and
-  `freezeFromPairs*` the same (`builder.zig:47`). A `SortedBuilder` whose `insert`
+  (default `max_depth`, 4096; `builder.zig`, `stream.zig`), and
+  `freezeFromPairs*` the same (`builder.zig`). A `SortedBuilder` whose `insert`
   failed after it began changing state is poisoned: every later `insert` or
-  `finish` returns `error.Finished` (`stream.zig:114`, `:158`).
+  `finish` returns `error.Finished` (`stream.zig`, `:158`).
 - **`Header.verifyBody` refuses a buffer cut before the footer** (`Truncated`,
-  `format.zig:181`), so `Frozen.buf`, which is cut to the node region, is not
+  `format.zig`), so `Frozen.buf`, which is cut to the node region, is not
   re-verifiable and `loadVerified` takes the whole buffer.
-- **The public `trie.format` is curated** (`root.zig:64`): the header, the node
+- **The public `trie.format` is curated** (`root.zig`): the header, the node
   decoder and the error sets that sibling modules need; the byte-level helpers
   are not public. `Header.encode` and `Header.verifyBody` stay reachable through
   it.
@@ -340,10 +340,10 @@ file at a higher layer if producer authenticity matters.
 Run `scripts/modtest trie`; `zig build bench-trie` is the performance instrument, not a test.
 
 - **Differential oracle:** a naive sorted `[]const []const u8` + binary-search /
-  linear-prefix-scan reference (`Oracle`, `root.zig:135`) answers the same `lookup` /
+  linear-prefix-scan reference (`Oracle`, `root.zig`) answers the same `lookup` /
   prefix / top-N queries; a randomized differential over generated key sets must agree
   exactly, including top-N ordering and tie-break, over every format the writers
-  produce (`all_formats`, `root.zig:373`: version 1, 2 and 3, with and without ordinals).
+  produce (`all_formats`, `root.zig`: version 1, 2 and 3, with and without ordinals).
   It also checks range (random bounds and inclusivity), common prefixes, rank ↔ key and
   `topN` pages chained by `after`.
 - **Adversarial key sets:** empty key, prefix-of-another, duplicates (last-write-wins),
@@ -351,18 +351,18 @@ Run `scripts/modtest trie`; `zig build bench-trie` is the performance instrument
   differing only in the last byte.
 - **Round-trip:** in-memory answers == answers after build → freeze → load.
 - **Corrupt-buffer fuzz:** `std.testing.fuzz` harnesses with seed corpora over the loader
-  and query path (`root.zig:1144`, `:1249`; pinned to version-1 offsets), and a
+  and query path (`root.zig`, `:1249`; pinned to version-1 offsets), and a
   deterministic seeded sweep over version-2 and version-3 buffers (`sweepV2`,
-  `root.zig:1356`, test `root.zig:1391`) that RE-SEALS both CRCs on most inputs so the
+  `root.zig`, test `root.zig`) that RE-SEALS both CRCs on most inputs so the
   damage reaches the node walk instead of dying at the footer check, with its reach
   (loaded / verified / answered / `Corrupt`) pinned. These are in-test sweeps; the module
   has no `<M>_FUZZ` driver run.
 - **Positive controls:** hand-malformed buffers and a corrupted stored value
-  (`root.zig:947`) show the differential / robustness checks go RED.
+  (`root.zig`) show the differential / robustness checks go RED.
 - **Formats by hand:** a golden byte layout derived from the spec (not from the writer),
   one targeted damage per load / decode check for version 2 and for version 3
-  (`root.zig:1487`, `:1563`), and a reproduction of fst's `corrupt` experiment against
-  this module (`root.zig:1423`): damaged and re-sealed buffers are refused or answered,
+  (`root.zig`, `:1563`), and a reproduction of fst's `corrupt` experiment against
+  this module (`root.zig`): damaged and re-sealed buffers are refused or answered,
   never a panic.
 - **Automaton search and set operations:** the oracle checks `search` for nine automata
   (the three plain built-ins and six compositions with `StartsWith`, union, intersection
@@ -425,7 +425,7 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
 `prefixIterator` `next(buf)` path has no such multiplier — one key at a time.)
 
 `topN` also needs about 0.46 MB of the caller's stack per call (a `max_depth` array of
-frames and two `max_depth` byte arrays), whatever the input (`query.zig:285`); do not call
+frames and two `max_depth` byte arrays), whatever the input (`query.zig`); do not call
 it on a small thread stack.
 
 ## What is deliberately not done

@@ -150,12 +150,12 @@ prints, or from testing a hypothesis against the files. The non-obvious ones:
 ### 4c. Reading snarkjs's JSON
 
 `snarkjs_import.parseProof`, `parseVerifyingKey` (with `freeVerifyingKey`) and `parsePublic` read exactly the shape
-`snarkjs_export` writes (`snarkjs_import.zig:157,171,201,207`): canonical decimal strings, G1 as `[x,y,"1"]`, G2 as
+`snarkjs_export` writes (`snarkjs_import.zig`): canonical decimal strings, G1 as `[x,y,"1"]`, G2 as
 `[[x0,x1],[y0,y1],["1","0"]]` in math order, `"protocol": "groth16"` and `"curve": "bn128"` required, the infinity
 literals accepted, `nPublic` cross-checked against the `IC` length, unknown members such as `vk_alphabeta_12`
 ignored. It refuses, each as its own `ImportError`: invalid JSON, a wrong shape, a wrong protocol or curve, a
 non-canonical number (empty, sign, leading zero, non-digit, too large, or `>= p` / `>= r`), a point off the curve or
-the twist, a G2 point outside the order-`r` subgroup, an `nPublic` mismatch (`snarkjs_import.zig:29`). The export
+the twist, a G2 point outside the order-`r` subgroup, an `nPublic` mismatch (`snarkjs_import.zig`). The export
 tests' values round-trip, and snarkjs's own fixture proof verifies under the parsed key.
 
 ## 5. The Fable-vs-Opus tier call — **this core is Opus, not Fable**
@@ -255,12 +255,12 @@ parsed `.zkey` is still only as trustworthy as whoever made it.)
 
 **3. The evaluation domain is part of the statement.** `setup`, `prove` and
 `qap.checkDivisible` all refuse a constraint system larger than the domain
-(`error.DomainTooSmall`, `prover.zig:259,370`, `qap.zig:40`). The refusal is an error in every build mode, never an
+(`error.DomainTooSmall`, `prover.zig`, `qap.zig`). The refusal is an error in every build mode, never an
 assert: a circuit silently truncated to fit would give a CRS built from the truncated circuit, so the dropped
 constraints would be absent from the statement the verifier checks, with nothing at any layer reporting it.
-`zkprove` refuses a `2^28` domain (`ProveError.DomainTooLarge`, `zkprove.zig:47`: the coset needs a `2^29`-th root of
+`zkprove` refuses a `2^28` domain (`ProveError.DomainTooLarge`, `zkprove.zig`: the coset needs a `2^29`-th root of
 unity, which `Fr` does not have) and a witness whose length is not the key's `n_vars` (`WitnessMismatch`);
-`phase2.newZkey` refuses `CircuitTooLarge` and `PtauTooSmall` (`phase2.zig:62`).
+`phase2.newZkey` refuses `CircuitTooLarge` and `PtauTooSmall` (`phase2.zig`).
 
 **4. The zkey prover's default MSM is variable-time in the witness.**
 `msm.pippengerG1`/`pippengerG2` pick buckets by scalar digits and branch on
@@ -297,13 +297,13 @@ is the fix (backlog). `verify` checks neither the circuit hash nor the
 records before the last; it checks the key.
 
 **7. Readers refuse before they allocate.** `.r1cs` requires section 3, which pays 8 bytes per wire and so bounds
-`n_wires` by the file's size (`circom.zig:116-120`); `zkey` checks every section size against the header counts before
-allocating from one (`zkey.zig:179-271`). A 400-byte file cannot announce 2³² wires.
+`n_wires` by the file's size (`circom.zig`); `zkey` checks every section size against the header counts before
+allocating from one (`zkey.zig`). A 400-byte file cannot announce 2³² wires.
 
 **8. Secrets leave nothing on the dead stack.** `prover.setup`, `prover.prove`, `zkprove.prove`, `phase2.contribute`
 and `circom.parseWitness` take their secrets by pointer (`*const ToxicWaste`, `*const Randomizers`, `*const Fr`), run
 their bodies one frame down and zero the stack that body dirtied (`src/burn.zig`); `msm.pippengerG1/G2` wipe their limb
-and bucket scratch before freeing it. `Randomizers.randomInto(out, io)` (`prover.zig:86`) draws both scalars through
+and bucket scratch before freeing it. `Randomizers.randomInto(out, io)` (`prover.zig`) draws both scalars through
 `bn254.Fr.randomInto` straight into the caller's storage, so no copy stays in the caller's frame. `src/stackprobe_test.zig`
 (ReleaseFast only) pins it: toxic waste and everything derived from it, the witness, `r`, `s`, `r·s`, the QAP evaluations
 and quotient and the `r·δ`/`s·δ`/`r·s·δ` points as needles, plus the `Randomizers.randomInto` draw — 0 residues, with
@@ -391,7 +391,7 @@ computed from those inputs, not code or text of either project.
   is out of this module's scope, and circom's own native generator writes the `.wtns` (rapidsnark makes the same
   split). The survey's judgment, not a recorded owner decision.
 - **PLONK, FFLONK, Halo2, universal / updatable setup, custom gates, other curves** (survey, scope): the
-  scope explosion Groth16 was chosen to avoid. `.r1cs` custom-gate sections 4 and 5 are refused (`circom.zig:103`, `error.Unsupported`).
+  scope explosion Groth16 was chosen to avoid. `.r1cs` custom-gate sections 4 and 5 are refused (`circom.zig`, `error.Unsupported`).
 - **Proof recursion / aggregation.**
 - **A circuit / gadget DSL.** R1CS is hand-built or comes from circom; the constraint-synthesis API is Backlog item 9.
 - **Dropping the toy prover's dead C path.** The toy `prover.prove` interpolates C and

@@ -105,15 +105,15 @@ embedded NUL can never equal what the kernel echoes back, which it reads only up
 and `CTRL_ATTR_FAMILY_ID` inside `[GENL_ID_CTRL, GENL_MAX_ID]` — the kernel's own dynamic-id range
 (`GENL_MIN_ID`/`GENL_MAX_ID` in `linux/genetlink.h`; `GENL_MIN_ID == GENL_ID_CTRL` by the kernel's own
 `#define`). Any other shape is `error.MalformedReply`, the vocabulary used for a hostile or
-malformed datagram (`root.zig:699`, `root.zig:733`). `findMcastGroupId`'s group-name path has the
+malformed datagram (`root.zig`). `findMcastGroupId`'s group-name path has the
 matching hardening for its own two axes: a matching group entry whose id is 0 is
 `error.BadLength` (every id observed from a real kernel is dynamically assigned and nonzero,
-`root.zig:205`), and an empty `want` never matches an empty group name. `getFamily` and
+`root.zig`), and an empty `want` never matches an empty group name. `getFamily` and
 `listFamilies` apply the same record checks through `parseFamily` (non-empty name shorter than
-`GENL_NAMSIZ`, id in range, `root.zig:272`).
+`GENL_NAMSIZ`, id in range, `root.zig`).
 
 ## Reply loop message budget
-`ctrlGetFamilyOver` bounds its receive loop at `max_reply_messages` (65536, `root.zig:641`) datagrams,
+`ctrlGetFamilyOver` bounds its receive loop at `max_reply_messages` (65536, `root.zig`) datagrams,
 returning `error.TooManyMessages` (a member of `ResolveError`) when a peer never reaches `NLMSG_DONE`
 (a missing terminator, an endless `NLM_F_DUMP_INTR` stream, or a flood of foreign-`seq` datagrams).
 The collecting engine behind `getFamily`/`listFamilies` has the same budget and also caps the family
@@ -122,13 +122,13 @@ count at `GENL_MAX_ID`. `listFamilies` restarts a dump flagged `NLM_F_DUMP_INTR`
 
 ## `lastErrorMessage` freshness
 `lastErrorMessage` is documented as valid until the next request on the socket, so `ctrlGetFamily`
-clears `ext_ack_len` unconditionally before the request is even built (`root.zig:610`), matching how
+clears `ext_ack_len` unconditionally before the request is even built (`root.zig`), matching how
 `netlink.Socket.awaitAckStrict` clears its own `ext_ack_len`/`last_errno` before each bounded-engine
 call. A caller that inspects it after a successful request, or after a different failure, never reads
 stale text from an earlier, unrelated error.
 
 ## Sequence numbers and client-rejected requests
-The `GENL_NAMSIZ` check runs first, in `ctrlGetFamily` itself (`root.zig:606`), before `nextSeq()` is
+The `GENL_NAMSIZ` check runs first, in `ctrlGetFamily` itself (`root.zig`), before `nextSeq()` is
 called and before a transport view is taken, so a name too long to ever be sent does not advance the
 socket's sequence counter (no gap in an `strace` of the socket). `buildGetFamilyRequest`'s own check
 stays as defense in depth.

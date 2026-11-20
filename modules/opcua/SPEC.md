@@ -78,17 +78,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Design notes by feature
 
-- **Client-side SecureChannel renewal.** `SecureChannel.renew(now_ms, options)` (`root.zig:241`) sends
+- **Client-side SecureChannel renewal.** `SecureChannel.renew(now_ms, options)` (`root.zig`) sends
   `OpenSecureChannel` with `RequestType = Renew` (OPC 10000-4 §5.5.2) on the open channel: same channel id, policy and
   mode; at Sign/SignAndEncrypt fresh nonces are exchanged and the keys re-derived (P-SHA256, §6.7.5).
-  `renewalDue(now_ms)` (`root.zig:203`) / `renewIfDue(now_ms, options)` (`root.zig:253`) time it: **75 % of the revised
-  lifetime** (`renewal_fraction_percent`, `root.zig:141`), **but not sooner than `min_renewal_delay_ms` (50 ms,
-  `root.zig:138`) after the token arrived**; a revised lifetime of 0 is refused with `error.InvalidTokenLifetime`
-  (`services.zig:59`), and with no lifetime (`token_lifetime_ms == 0`) nothing is ever due. References: open62541's
+  `renewalDue(now_ms)` (`root.zig`) / `renewIfDue(now_ms, options)` (`root.zig`) time it: **75 % of the revised
+  lifetime** (`renewal_fraction_percent`, `root.zig`), **but not sooner than `min_renewal_delay_ms` (50 ms,
+  `root.zig`) after the token arrived**; a revised lifetime of 0 is refused with `error.InvalidTokenLifetime`
+  (`services.zig`), and with no lifetime (`token_lifetime_ms == 0`) nothing is ever due. References: open62541's
   client sets its next renewal to 75 % of the revised lifetime, node-opcua clamps its timer to `max(75 %, 50 ms)` (read
   as behaviour only). One deliberate difference: they count from the server's `CreatedAt` or a local timer; this module
   has no clock (`meta.platform = .any`), so the caller passes a monotonic `now_ms` to `open` (`OpenOptions.now_ms`,
-  `root.zig:164`) and `renew`, and the deadline is counted on that local clock, immune to server clock skew. The new
+  `root.zig`) and `renew`, and the deadline is counted on that local clock, immune to server clock skew. The new
   token and keys take over the moment the answer is read (what both references do); the server keeps accepting the old
   token for `token_renewal_overlap_ms`, capped at its own expiry, so a request in flight is not cut off. A refused
   renewal (a Bad answer, an answer naming another channel, an empty server nonce at a secured policy, a failed
@@ -96,22 +96,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   token lives; renewing a channel that was never opened or was closed is `error.InvalidSecureMessage` before any I/O.
   The client has one request in flight at a time, so `renew` is called between requests.
 - **Client-side subscription and path services.** `Subscription.setMonitoringMode(mode, item_ids)`
-  (`root.zig:1429`, §5.12.4) and `Subscription.modifyMonitoredItems(specs, timestamps)` (`root.zig:1371`, §5.12.3, no
-  filter, like `createMonitoredItems`) and `Session.translateBrowsePaths(paths)` (`root.zig:804`) are the raw services:
+  (`root.zig`, §5.12.4) and `Subscription.modifyMonitoredItems(specs, timestamps)` (`root.zig`, §5.12.3, no
+  filter, like `createMonitoredItems`) and `Session.translateBrowsePaths(paths)` (`root.zig`) are the raw services:
   one result per id / item / path (a stale id or a path that matched nothing is a Bad entry, not a failed call; an empty
   list is the server's ServiceFault, kept on `Channel.last_service_result`), and the caller frees the response with
   `services.freeSetMonitoringModeResponse` / `freeModifyMonitoredItemsResponse` /
-  `freeTranslateBrowsePathsToNodeIdsResponse` (`services.zig:2965,2913,2806`). The shape follows open62541 (the generated
+  `freeTranslateBrowsePathsToNodeIdsResponse` (`services.zig`). The shape follows open62541 (the generated
   service call, results as the server sent them); a one-path convenience is left to callers. `MonitoredItemModifySpec`
-  (`root.zig:1350`) carries the `ClientHandle`, because the spec puts it into the modified parameters and our server
+  (`root.zig`) carries the `ClientHandle`, because the spec puts it into the modified parameters and our server
   stores it: the `monitored_items` correlation table follows the new handle for every item whose result is not Bad, and
   a Bad result leaves the entry as it was. `setMonitoringMode` keeps no local bookkeeping (the client table does not
   track the mode).
 - **Per-policy RSA key-length band.** `SecurityPolicy.minAsymmetricKeyBits` / `maxAsymmetricKeyBits` / `allowsKeyBits`
-  (`security.zig:109-131`): 2048..4096 for `Basic256Sha256` and the reserved `Aes256_Sha256_RsaPss`
+  (`security.zig`): 2048..4096 for `Basic256Sha256` and the reserved `Aes256_Sha256_RsaPss`
   (`Aes128_Sha256_RsaOaep` has the same row but is not an enum value here; `Basic128Rsa15`/`Basic256` are not
   implemented, so their 1024..2048 row has nothing to attach to). Checked on the modulus length read from the
-  certificate's structure (`security.certificateKeyBits`, `security.zig:442`, over `rsa.PublicKey.modulusBitsFromDer`)
+  certificate's structure (`security.certificateKeyBits`, `security.zig`, over `rsa.PublicKey.modulusBitsFromDer`)
   before the key is parsed, so the answer is the same under every build profile. Enforced on the peer certificate key
   (server `checkPeerCertificate`: `BadCertificateUseNotAllowed`, what open62541 answers from `rsaNewChannelContext`,
   256..512 bytes; client `SecureChannel.open`: `error.KeyLengthOutOfPolicy`) and on the own key (server: OPN refused
@@ -120,17 +120,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   exact bit length (the spec text), not `(bits+7)/8`, so a non-byte-aligned 2041..2047-bit modulus is refused here and
   accepted there. node-opcua documents the same 2048/4096 rows. Testing escape
   `insecure_allow_key_length_outside_policy` on `GenerateSelfSignedOptions`, `SecurityContext` and `SecurityConfig`
-  (`security.zig:265,567`; named after rsa's `insecure_allow_small_modulus`); under it a key past the build's RSA
+  (`security.zig`; named after rsa's `insecure_allow_small_modulus`); under it a key past the build's RSA
   capacity still cannot be used (`BadCertificateInvalid`).
 - **NumericRange** (OPC 10000-4 §7.27). `numeric_range.zig`: `parse`, `Range.format`, `Range.init`, `readRange`,
-  `writeRange`; the server applies them in the Read handler and `NodeStore.writeAttributeRange` (`nodestore.zig:951`);
-  the client sends one with `Session.readAttributeRange` / `writeValueRange` (`root.zig:655,665`) or any
+  `writeRange`; the server applies them in the Read handler and `NodeStore.writeAttributeRange` (`nodestore.zig`);
+  the client sends one with `Session.readAttributeRange` / `writeValueRange` (`root.zig`) or any
   `ReadValueId.index_range` / `WriteValue.index_range` string. Spec first; open62541 (`UA_NumericRange_parse`,
   `checkAdjustRange`, `UA_Variant_copyRange`, `Variant_setRange`; MPL-2.0, read as behaviour only) where the spec is
   silent; node-opcua agrees where noted.
   - *Syntax:* `dimension[,dimension]*`, `dimension = n | n:m`, digits only, each index a `u32`; `n:m` needs `n < m`
     (`3:3` and `5:2` are errors; one element is `3`). Anything else is `BadIndexRangeInvalid`. Bounds: text at most 256
-    bytes, at most 16 dimensions (`numeric_range.zig:48-49`; open62541 allows 100), so nothing is allocated for an index,
+    bytes, at most 16 dimensions (`numeric_range.zig`; open62541 allows 100), so nothing is allocated for an index,
     only for the elements actually selected; all arithmetic is `u64`.
   - *Read:* a range reaching past the end is clipped (§7.27; open62541 clamps too); one that starts past the end, a
     dimension count different from the value's, an empty/null value, or a non-Value attribute is `BadIndexRangeNoData`.
@@ -298,7 +298,7 @@ on a different SecureChannel is `BadSecureChannelIdInvalid` (session transfer
 between channels is not implemented, which closes that door rather than
 opening it half-way).
 **Residual risk:** `Config.max_lifetime_count` (the ceiling on a granted `LifetimeCount`) below three keep-alive
-counts silently overrides §5.13.2's floor (`server.zig:2845-2847`, `@min(raw, cfg.max_lifetime_count)` after the
+counts silently overrides §5.13.2's floor (`server.zig`, `@min(raw, cfg.max_lifetime_count)` after the
 floor); it is an operator setting, not peer input.
 
 

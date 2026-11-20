@@ -65,13 +65,13 @@ design" below.
 - **`Fp` is hand-rolled, `Fr` is `montint.Field`** (`fp.zig`/
   `scalar.zig`). `Fp` has its own constant-time Montgomery backend
   (CIOS multiply, SOS squaring, six `u64` limbs, `blackBox` barrier;
-  `fp.zig` module doc). `Fr` is `montint.Field(r)` (`scalar.zig:69`):
+  `fp.zig` module doc). `Fr` is `montint.Field(r)` (`scalar.zig`):
   `std.crypto.ff` is not constant-time in ReleaseFast
   (`montgomeryMul`'s extra-reduction select and
   `powWithEncodedExponent`'s window select compile to conditional
   jumps), so every `Fr.mul` over a secret key or share would leak.
   `std.crypto.ff` remains only as the `modulus` constants and a test
-  oracle (`fp.zig:61`, `scalar.zig:27`). `Fp` encodes as 48 bytes (381-bit
+  oracle (`fp.zig`, `scalar.zig`). `Fp` encodes as 48 bytes (381-bit
   `p`), `Fr` as 32 bytes (255-bit `r`).
 - **Design references for the field-tower arithmetic** : Devegili–Ó hÉigeartaigh–Scott–Dahab's
   tower-field multiplication paper (`Fp6`/`Fp12` mul/square/inv), Adj &
@@ -97,7 +97,7 @@ design" below.
   hard-fails the build if a division is inexact). Tests pin them two
   ways: definitionally (`frobenius(a) == a^p` computed with plain
   mul/square) and byte-exactly against independently-recomputed values
-  (NOTICE). The coefficients are comptime constants (`fp6.zig:227` `frobenius_gamma_1`/`frobenius_gamma_2`, `fp12.zig:301` `frobenius_gamma`), so no `pow` runs per `frobenius` call.
+  (NOTICE). The coefficients are comptime constants (`fp6.zig` `frobenius_gamma_1`/`frobenius_gamma_2`, `fp12.zig` `frobenius_gamma`), so no `pow` runs per `frobenius` call.
 - **`Fp2` non-residue convention: `u² = -1`.** Confirmed by
   independently checking the `G2` generator on-curve under exactly this
   convention (`NOTICE`'s "Verification performed"). A different
@@ -137,7 +137,7 @@ design" below.
   convention `SPEC.md`'s Part-1 section documents) — line evaluations
   use the D-type untwisting map (Costello-Lange-Naehrig 2010).
 - **Miller loop (as implemented)**: per-pair `T` accumulators in
-  `g2.Jacobian` (`pairing.zig:254`, `TwistPoint`) — this module's own
+  `g2.Jacobian` (`pairing.zig`, `TwistPoint`) — this module's own
   complete group law, not a second copy of it. Each doubling/addition
   step multiplies its line value by the factor that clears the
   denominators (`2YZ³` for the tangent, `Z·h` for the chord) instead of
@@ -149,13 +149,13 @@ design" below.
   untwisted line by a fixed `w^3` factor per line, which the final
   exponentiation provably kills (`(w^3)^((p^12-1)/r) = 1`, derivation in
   `lineEval`'s doc comment) — giving the sparse `c0.c0/c0.c1/c1.c1`
-  ("014") shape, promoted to a dense `Fp12.mul` (`pairing.zig:327`; the
+  ("014") shape, promoted to a dense `Fp12.mul` (`pairing.zig`; the
   sparse multiply is open, Backlog). Multi-pairing shares one seed-bit
   walk + one accumulator per batch of up to 8 pairs
-  (`miller_batch_max`, `pairing.zig:236`; fixed stack storage,
+  (`miller_batch_max`, `pairing.zig`; fixed stack storage,
   allocation-free; the batch product is exact — squaring distributes — so
   batching only forgoes cross-batch shared squarings). The negative seed
-  is handled by ONE final conjugation (`pairing.zig:209`). The affine
+  is handled by ONE final conjugation (`pairing.zig`). The affine
   step functions survive as test-only references
   (`doublingStepAffineRef`, `additionStepAffineRef`).
 - **Final exponentiation hard part (as implemented)**: the
@@ -397,7 +397,7 @@ design" below.
 - **`KeyGen` (draft §2.3) and `keyGenV4`.** Mechanical
   HKDF-Extract/Expand construction over `std.crypto.kdf.hkdf.HkdfSha256`
   plus `Fr.reduceWide` (`OS2IP(OKM) mod r`). `keyGen` is draft -05;
-  `keyGenV4` (`bls_sig.zig:180`) is the draft -04 form blst's default
+  `keyGenV4` (`bls_sig.zig`) is the draft -04 form blst's default
   `key_gen` implements (the salt hashed before the first round, as
   EIP-2333's `derive_master_SK` does). The two differ, so a key generated
   by blst's default from the same IKM is not `keyGen`'s output. The draft's
@@ -483,7 +483,7 @@ design" below.
     subgroup validation simply isn't repeated per call (per-call re-validation costs minutes per test binary for zero added assurance). The cache is a write-once atomic pointer (lock-free; a
     first-load race means redundant validation, never a wrong result).
   - **First-load validation is parallelized** (`parseAndValidateEmbeddedSetup`):
-    setup points are PUBLIC (threat model below). The `G1` points use `g1.Jacobian.subgroupCheck`, the endomorphism test ("Subgroup checks" below); `subgroupCheckVartime` (`kzg.zig:299`) is kept only as a test reference. The per-point checks are independent and fan
+    setup points are PUBLIC (threat model below). The `G1` points use `g1.Jacobian.subgroupCheck`, the endomorphism test ("Subgroup checks" below); `subgroupCheckVartime` (`kzg.zig`) is kept only as a test reference. The per-point checks are independent and fan
     out across CPU cores (`std.Thread.spawn`, serial fallback if
     spawning fails). The 65 `G2` points ride on worker 0 with the
     existing constant-time check (not worth a `G2` vartime twin).
@@ -678,7 +678,7 @@ design" below.
     case fired (the accumulator's state is secret-dependent inside
     scalarMul).
   - `ctSelect` (`Fp`, lifted componentwise to `Fp2` and points) is a
-    limb-mask merge, the mask laundered through `blackBox`. The laundering is load-bearing: inlined into the `G1`/`G2` ladders, an unlaundered mask lowers to a conditional jump on the SCALAR BIT. `Fp2.isZero` is one accumulator (`fp2.zig:78`), not a short-circuit `and` that would branch inside `G2.add`'s identity checks.
+    limb-mask merge, the mask laundered through `blackBox`. The laundering is load-bearing: inlined into the `G1`/`G2` ladders, an unlaundered mask lowers to a conditional jump on the SCALAR BIT. `Fp2.isZero` is one accumulator (`fp2.zig`), not a short-circuit `and` that would branch inside `G2.add`'s identity checks.
   - `Fp.random`/`Fr.random` rejection-sample (never reduce a same-width
     sample — the classic bias footgun for these field shapes).
   Verification-side operations on public data (subgroup checks of
@@ -699,12 +699,12 @@ design" below.
   root `β`, the sign of `x`, the `ψ` coefficients) is pinned on the
   generators and, for `ψ`, by `ψ² − [t]ψ + [p] = 0` on non-members.
   The check is several times cheaper than the `[r]P == O` ladder. The
-  multiplication by `|x|` (`mulByAbsXPublic`, `g1.zig:379`,
-  `g2.zig:325`) branches only on the bits of that fixed public constant;
+  multiplication by `|x|` (`mulByAbsXPublic`, `g1.zig`,
+  `g2.zig`) branches only on the bits of that fixed public constant;
   the point arithmetic is the same complete branchless `double`/`add`,
   and `scalarMulBytes` (the secret-scalar engine) is unchanged. The
   `[r]P == O` form survives as the private test-only reference
-  `subgroupCheckByOrder` (`g1.zig:359`), which every differential test
+  `subgroupCheckByOrder` (`g1.zig`), which every differential test
   holds the fast check against: members (identity, generators, random
   multiples, cleared cofactors), random curve/twist points, `[r]R`
   torsion alone and added to members, points of order exactly 3 and 11
@@ -727,7 +727,7 @@ design" below.
   here: `T <- 2T` and `T <- T + Q` are `g2.Jacobian.double`/`add`.
   Evidence: the byte-exact `e(G1, G2)` KAT is unmoved, and a randomized
   differential agrees with the retained affine step references
-  (`doublingStepAffineRef`/`additionStepAffineRef`, `pairing.zig:807`/
+  (`doublingStepAffineRef`/`additionStepAffineRef`, `pairing.zig`/
   `:819`). ⚠ RAW Miller values carry that `Fp2` factor — they are not a
   wire format and no consumer may pin them; only the final-exponentiated
   pairing is a value.
@@ -780,9 +780,9 @@ design" below.
 
 - **Secrets in callers' frames.** The module's secret entry points burn their stack
   (`burn.zig`; the probe `src/stackprobe_test.zig` goes red when a body outgrows its burn).
-  `Fr.randomInto(out, io)` (`scalar.zig:184`) draws a scalar into the caller's slot under
-  `burn.run` (`burn.random_burn`). `Fr.random` (`scalar.zig:172`) returns a secret by value,
-  and `scalarMul` (`g1.zig:274`) and `msm` take scalars by value: a consumer that draws a nonce
+  `Fr.randomInto(out, io)` (`scalar.zig`) draws a scalar into the caller's slot under
+  `burn.run` (`burn.random_burn`). `Fr.random` (`scalar.zig`) returns a secret by value,
+  and `scalarMul` (`g1.zig`) and `msm` take scalars by value: a consumer that draws a nonce
   or blinding factor and multiplies with it outside the module's own entry points leaves it in
   its own frames and wraps the call in a burned frame of its own.
 
@@ -858,7 +858,7 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   deals shares of its own polynomial plus a complaint/justification round), a separate module with
   its own message shapes, not a variant of `splitSecretKey`.
 - **Threshold under MessageAugmentation.** `Threshold(_, .message_augmentation)` is a compile error
-  (`threshold.zig:242`): AUG signs `SkToPk(SK) || msg`, and under a share that prefix is the share's
+  (`threshold.zig`): AUG signs `SkToPk(SK) || msg`, and under a share that prefix is the share's
   key, so partials sign different messages and do not interpolate. No reference does threshold AUG
   either (drand's threshold network signs with Basic).
 - **Blame tooling.** No complaint/blame sub-protocol beyond `verifyPartialSignature`: there is no
@@ -867,7 +867,7 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   generating it and makes no claim about the ceremony's toxic waste.
 - **Other hash-to-curve suites.** The two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs and the `G1` SHAKE-256
   suite (BBS) are implemented; no `G2` XOF variant (no consumer), and the §5.3.3 long-DST rehash is
-  not implemented for either expander (`dst.len <= 255` is asserted, `hash_to_curve.zig:177`).
+  not implemented for either expander (`dst.len <= 255` is asserted, `hash_to_curve.zig`).
 - **Constant-time pairing, hash-to-curve, KZG.** They operate on public data; see the threat model.
 - **A shared `expand_message_xmd`.** The module carries its own general-`ell` implementation rather
   than depend on `frost` or `voprf` (each is hardcoded to a fixed `ell`, and a dependency edge to a
@@ -881,11 +881,11 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   `g1`/`g2`/`msm`/the scheme code). Wanted when a consumer cannot burn its own frame.
 - **Sparse Miller-loop multiplication.** A fresh line value is structurally sparse (3 nonzero `Fp2`
   coefficients of 6, the "014" shape `lineValue` documents); the baseline promotes it to a dense
-  `Fp12` (`pairing.zig:327`). A dedicated sparse multiply is a well-known follow-up
+  `Fp12` (`pairing.zig`). A dedicated sparse multiply is a well-known follow-up
   (`multiMillerLoop`'s own `TODO`), a fraction of the verification cost now that the point steps are
   inversion-free; measure before building.
 - **Fast cofactor clearing.** `g1`/`g2` `clearCofactor` multiply by the plain cofactor
-  (`g2.zig:352`); Bowe's untwist-Frobenius-twist technique is cheaper. For hash-to-curve the same
+  (`g2.zig`); Bowe's untwist-Frobenius-twist technique is cheaper. For hash-to-curve the same
   holds for the `h_eff` step (Scott [WB19] for `G1`, Budroni-Pintore [BP17]/Appendix G.3 for `G2`):
   today it is the generic constant-time `scalarMulBytes`, and `G2`'s 636-bit `h_eff` is the dominant
   hash-to-curve cost.
@@ -893,10 +893,10 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   saves one isogeny evaluation per `hash_to_curve`; a variable-time public-scalar multiplication for
   the `h_eff` step (the message is public).
 - **Fixed-window scalar multiplication** (currently constant-time double-and-add-always,
-  `g1.zig:287`).
+  `g1.zig`).
 - **Optional API additions if consumers appear.** A variable-time public-scalar `scalarMul` for
   verification-side hot paths; a secret-exponent (ladder) `Fp2.pow`; skipping the full final
-  exponentiation in `pairingCheck` when a cheaper not-equal-to-one test suffices (`pairing.zig:598`
+  exponentiation in `pairingCheck` when a cheaper not-equal-to-one test suffices (`pairing.zig`
   `TODO`).
 - **MSM beyond baseline Pippenger.** Signed/NAF digits, affine batch-inverted bucket additions,
   per-window parallelism (each addition still pays full Jacobian arithmetic); a cached

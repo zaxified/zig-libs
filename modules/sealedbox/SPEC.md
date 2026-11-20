@@ -56,7 +56,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   r^4..r^1. Same algorithms, same output: held by differential tests against std over every
   length/counter edge (in-file), the PyNaCl KATs and the 2000-case libsodium differential, and
   measured constant-time (`seal` 0 / `open` 1 = accept/reject, below). BLAKE2b is std's;
-  X25519 is ct25519's (its own ctgrind rows). `lanes` is capped at 16 (`xsalsa20poly1305.zig:34`):
+  X25519 is ct25519's (its own ctgrind rows). `lanes` is capped at 16 (`xsalsa20poly1305.zig`):
   `xorBlocks` transposes `n x n` groups of the 16 state words, so with more lanes (Hexagon HVX and
   RISC-V zvl1024b+ suggest 32 or more) there is no group and the keystream is never applied. A comptime
   assert in `xorBlocks` (power of two, at most 16) and a test of every width 1–16 against std on every
@@ -113,7 +113,7 @@ The ephemeral secret, the clamped scalar and the shared key are handled in `ct25
 `std.crypto.nacl`'s `SealedBox`/`Box` or std's Curve25519 scratch, which do not wipe. From `std.crypto` the module
 takes BLAKE2b (its input, the two public keys, is public), the public-key codecs, the `KeyPair` type and
 `secureZero`; no secret passes through std's X25519 or `Box`. An all-zero shared secret (a low-order point) is rejected
-by `ct25519`'s `scalarmultInto` (`error.IdentityElement`, `ct25519/src/root.zig:643`), not by a check in the
+by `ct25519`'s `scalarmultInto` (`error.IdentityElement`, `ct25519/src/root.zig`), not by a check in the
 installed Zig toolchain's standard library, so the small-order-point rejection this module depends on is a
 property of this repository (`kat_test.zig` pins it for `seal` and for `open`).
 

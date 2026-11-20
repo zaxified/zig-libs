@@ -79,7 +79,7 @@ start**.
   per host; a path is taken while its listener lives (`AddressInUse`), a missing
   one is `FileNotFound`, a crash removes the host's paths. Under the hood a Unix
   stream is a loopback stream on an address private to the host (`unix_ip`).
-  `socketpair` stays refused: std 0.17's `CreatePairOptions` (`Io/net.zig:1250`) names an *IP* family
+  `socketpair` stays refused: std 0.17's `CreatePairOptions` (`Io/net.zig`) names an *IP* family
   and Linux answers `socketpair(AF_INET)` with EOPNOTSUPP — the differential oracle
   caught simio offering a pair the real `Io` cannot make.
 - Names: `netLookup` resolves `HostOptions.name` (case-insensitive), IP literals

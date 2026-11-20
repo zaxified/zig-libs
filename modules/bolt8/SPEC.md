@@ -75,12 +75,12 @@ So the width split does not stop the handshake from being driven through
 `noise.HandshakeState`; it only needs the adapter below.
 ### 2. `noise`'s protocol-name lookup
 
-`HandshakeState.initialize` builds the protocol-name string from `dhName(DH)` (`noise/src/state.zig:24`). A DH
+`HandshakeState.initialize` builds the protocol-name string from `dhName(DH)` (`noise/src/state.zig`). A DH
 type outside `std` joins a suite by declaring `pub const noise_name`, which `dh.zig` does
-(`noise_name = "secp256k1"`, `dh.zig:41`), and `noise/src/patterns.zig:75` ships the `XK` pattern. So the type
+(`noise_name = "secp256k1"`, `dh.zig`), and `noise/src/patterns.zig` ships the `XK` pattern. So the type
 lookup no longer rules out `noise.HandshakeState` for this suite. This module nevertheless drives the three-act
 `Noise_XK` handshake itself (`handshake.zig`'s `Initiator`/`Responder`), reusing ONLY
-`noise.Suite(dh, ChaCha20Poly1305, SHA256).SymmetricState` (`handshake.zig:54`) and never `HandshakeState`; whether
+`noise.Suite(dh, ChaCha20Poly1305, SHA256).SymmetricState` (`handshake.zig`) and never `HandshakeState`; whether
 the generic state machine could replace the hand-written driver has not been tried or compared.
 `dh.zig` is the `DH` type parameter passed to `Suite(...)`: it supplies `public_length`, `KeyPair`, `noise_name`
 and a `scalarmult` alias for API-shape parity (`scalarmult` is never called by this module).
@@ -104,7 +104,7 @@ of `SymmetricState`'s own state machine, as long as one instance is threaded thr
   `ck', k' = HKDF(ck, k)` is the formula `mixKey` implements (`out = HKDF(ck, ikm, 2); ck = out[0]; cipher_state =
   initializeKey(out[1])`, which also resets the nonce to 0, the spec's "reset the nonce"). `transport.zig`'s
   `Direction.rotate()` builds a throwaway `SymmetricState` shell seeded with `(chain, cipher.k)` and calls
-  `.mixKey(&cipher.k)` (`transport.zig:80-85`).
+  `.mixKey(&cipher.k)` (`transport.zig`).
 
 So the code that decides when each DH happens and what is mixed into the running key at each act is exactly the six
 act functions (`Initiator.genAct1`/`.readAct2`/`.genAct3`, `Responder.readAct1`/`.genAct2`/`.readAct3`); everything
@@ -152,20 +152,20 @@ byte-for-byte what BOLT#8 spells out or what `noise`'s KAT-verified `SymmetricSt
     `Initiator.readAct2` is the mirror.
   - `Initiator.genAct3`: `encryptAndHash(ls.pub)` at nonce 1 → `se = ECDH(ls.priv, re)` → `mixKey(se)` →
     `encryptAndHash("")` → `split()` with `sk = pair[1].k`, `rk = pair[0].k`, `ck = ss.ck` (unmutated by `split`),
-    `handshake_hash = ss.h` (`handshake.zig:396-432`).
+    `handshake_hash = ss.h` (`handshake.zig`).
   - `Responder.readAct3`: `decryptAndHash(c)` at nonce 1 recovers `rs`; the recovered key is validated by the
     `se = ECDH(e.priv, rs)` call itself (`Secp256k1.fromSec1` → `error.InvalidPublicKey`) BEFORE it is stored in
     `rs_pub`; then `mixKey(se)` → `decryptAndHash(t)` → `split()` with the assignment order swapped (`rk` from
-    `pair[0]`, `sk` from `pair[1]`) (`handshake.zig:607-650`).
+    `pair[0]`, `sk` from `pair[1]`) (`handshake.zig`).
 - **Act ordering and failure.** Each object drives one handshake. Every act checks its own expected `state` first
   (`Initiator.State = start → awaiting_act2 → ready_act3 → done`, `Responder.State = start → ready_act2 →
-  awaiting_act3 → done`, both with `failed`, `handshake.zig:228,452`) and `errdefer`s into `.failed` on any error, so
+  awaiting_act3 → done`, both with `failed`, `handshake.zig`) and `errdefer`s into `.failed` on any error, so
   an act out of order, a retry of a failed act and a second `genAct1` on one object are all `error.WrongState`
   (never a silent reuse of the previous ephemeral share). An act that reads a field an earlier act fills (a
   caller set the pub `state` by hand) answers `error.WrongState` instead of panicking. `Responder.rs_pub` is set only
   from a parsed key and cleared again if the final MAC (`t`) fails, so a half-authenticated peer never looks
   authenticated.
-- **Entropy seam** (`handshake.Ephemeral`, `handshake.zig:110`). Act One's `e` is the initiator's only per-session
+- **Entropy seam** (`handshake.Ephemeral`, `handshake.zig`). Act One's `e` is the initiator's only per-session
   secret input: the Act-One wire bytes and `es` are pure functions of it. `Ephemeral` is a tagged union with a
   `csprng` arm (production: an assertion the caller makes about its generator) and a `seeded_for_test` arm, and a
   private `source()` accessor (the shape of `dtls`'s `Connection.Entropy`; `std.Random` is a vtable, so a bare
@@ -173,15 +173,15 @@ byte-for-byte what BOLT#8 spells out or what `noise`'s KAT-verified `SymmetricSt
   checks what is inside `.csprng`. `Initiator.ephemeral`/`Responder.ephemeral` are outputs: `genAct1`/`genAct2`
   always draw, so pre-setting the field cannot pin the share. The KAT injection Appendix A needs is
   `genAct1WithEphemeral`/`genAct2WithEphemeral`, declared `void` outside a test build (`testOnly`,
-  `handshake.zig:157`), so production code cannot express a pinned ephemeral.
+  `handshake.zig`), so production code cannot express a pinned ephemeral.
 - **Handshake result.** `HandshakeResult` carries `sk`, `rk`, `ck`, `handshake_hash` and `remote_static` (the peer's
   static key: the initiator's `rs`, or the responder's validated Act Three `rs`). `wipe()` zeroes `sk`/`rk`/`ck`
   (call it after `Transport.init`, which copies them); `handshake_hash` and `remote_static` are public and stay;
-  copies a caller made by value are not reached (`handshake.zig:166-192`).
+  copies a caller made by value are not reached (`handshake.zig`).
 - **Zeroization and the dead stack.** `Initiator.deinit`, `Responder.deinit`, `Transport.deinit` and
   `KeyPair.deinit` zero what the object directly owns. Secrets do not stay in dead frames either: `init`s and
   every act run one frame down and then zero 24 KiB at that depth (`burnStack`, `stack_burn`,
-  `handshake.zig:663,681`; volatile 16-byte vector stores, `k256`'s own 16 KiB `mul` burn sits under it);
+  `handshake.zig`; volatile 16-byte vector stores, `k256`'s own 16 KiB `mul` burn sits under it);
   `KeyPair` creation, `dh` and `Transport.init`/`Direction.init` run under `burn.run` (`burn.zig`: 32 KiB for the ECC
   paths, 4 KiB for the transport init). For that, `Initiator.init`/`Responder.init` take the `KeyPair` by pointer
   and `genAct3(&out)`/`readAct3(msg, &out)` write the `HandshakeResult` to `out` (a returned result would land in a
@@ -189,7 +189,7 @@ byte-for-byte what BOLT#8 spells out or what `noise`'s KAT-verified `SymmetricSt
   their own frames, so `sendMessage`/`recvLength`/`recvMessage` leave no key behind either. `dh`'s compressed
   shared point is dead-stack data inside the burned frame. `Direction.rotate`'s `SymmetricState` shell runs once per
   1000 messages and is not covered by the probe (see *Verification*).
-- **`NonceExhausted`** is in `SendError` and `RecvError` (`transport.zig:108-109`) but is structurally unreachable
+- **`NonceExhausted`** is in `SendError` and `RecvError` (`transport.zig`) but is structurally unreachable
   through this module's own `sendMessage`/`recvLength`/`recvMessage`: `maybeRotate` resets the nonce at
   `rotation_interval` (1000), so it never climbs toward `CipherState`'s exhaustion point. It stays in the sets
   because `CipherState` can still return it if `Direction`'s invariant is ever broken; a test pins it.
@@ -284,10 +284,10 @@ evasion as widening a pattern until a count goes away.
 | context | verdict |
 |---|---|
 | `rejectIdentity` at the end of k256's ladder, via `dh()` | Branch on "the product was the identity element", reachable only for `k ≡ 0 mod n`. The same class `k256`'s own table accounts for. |
-| scalar canonicality in `k256`, `if (d.isZero())` in `generateDeterministicBody` (`dh.zig:104`), `rejectIdentity` in `combMulBaseWithTable` | The three invalid-secret rejections of `generateDeterministic`. Each branches on the validity of a key that would be discarded anyway. The `isZero` check is in this module's own code. |
+| scalar canonicality in `k256`, `if (d.isZero())` in `generateDeterministicBody` (`dh.zig`), `rejectIdentity` in `combMulBaseWithTable` | The three invalid-secret rejections of `generateDeterministic`. Each branches on the validity of a key that would be discarded anyway. The `isZero` check is in this module's own code. |
 | the AEAD's tag-verify branch, twice in `act3` and twice in `transport` | Branching on the ANSWER is the API; the comparison that produced it is constant-time. Present because the AEAD key is tainted, so the answer is tainted too. |
 | `fromSec1`, `fromBytes`, `sqrt`, one `mul` — all in `act3` | Decompressing the peer's static key. `rs` is a PUBLIC key, but it arrives by decryption under a tainted key, so memcheck cannot know that. An artefact of the taint model, stated rather than patched around. |
-| `if (c.len != out.len + 16)` in `recvMessage` (`transport.zig:198`) | The length came from `recvLength`, i.e. from a decryption under a tainted key. A BOLT#8 message length is a public property of the frame. |
+| `if (c.len != out.len + 16)` in `recvMessage` (`transport.zig`) | The length came from `recvLength`, i.e. from a decryption under a tainted key. A BOLT#8 message length is a public property of the frame. |
 
 **Teeth.** A secret-dependent early return in `dh()` (an OR-fold over the key bytes and a compare, the defect
 class) moves the `dh` row up and fails `--check`; the source digest fires on the same edit.

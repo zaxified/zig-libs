@@ -45,8 +45,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Recoverable ECDSA lives in `k256`.** BOLT#11's recoverable-signature scheme (RFC 6979 deterministic sign + standard
   public-key recovery, `Q = r⁻¹(sR − eG)`) is general secp256k1 machinery, so it is `k256.ecdsa_recover`;
   `src/ecdsa_recover.zig` is a thin re-export (`sign`, `recoverPubkey`, `Signature`, `isLowS`, `SignError`,
-  `RecoverError`, `ecdsa_recover.zig:14-26`) that keeps `bolt11.zig`'s `ecdsa.*` call sites, and the root re-exports
-  `sign`/`recoverPubkey`/`Signature` (`root.zig:63-65`; `isLowS` is reached as `lninvoice.ecdsa_recover.isLowS`).
+  `RecoverError`, `ecdsa_recover.zig`) that keeps `bolt11.zig`'s `ecdsa.*` call sites, and the root re-exports
+  `sign`/`recoverPubkey`/`Signature` (`root.zig`; `isLowS` is reached as `lninvoice.ecdsa_recover.isLowS`).
 
 
 - **Fail-closed throughout, specific typed errors per rejection reason** — `bolt11.DecodeError` is
@@ -128,7 +128,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `RawHrp::from_str`) does `parts.1.parse::<u64>()` and only checks for overflow. A zero-amount invoice is reported as
   `amount_msat == 0` (not `null`, which means "no amount"); a caller that pays must treat `0` as it sees fit. `lnbc01u` reads
   as `lnbc1u` and `lnbc0001u` likewise, exactly as lnd and LDK read them through their integer parsers; `AmountError` has no
-  leading-zero member (`bolt11.zig:82-86`) and the zeros are skipped before the width guard (`bolt11.zig:100-105`). The
+  leading-zero member (`bolt11.zig`) and the zeros are skipped before the width guard (`bolt11.zig`). The
   writer side is pinned: `formatAmount` never emits a leading zero (only the bare `0` of a zero amount). The 20-digit width
   guard counts significant digits.
 
@@ -177,16 +177,16 @@ stream / `raw` buffer and are not decoded; the signed-blob correctness (Merkle r
 scalar fields are modelled fully.
 
 **Signature slot and stream order.** `encodeSignedInvoice`/`encodeSignedInvoiceRequest` assemble the output with the shared
-`appendSignedStream` (`bolt12.zig:536`): the caller's records with type < 240, then the `signature` record, then the records
+`appendSignedStream` (`bolt12.zig`): the caller's records with type < 240, then the `signature` record, then the records
 with type > 240 (private/experimental fields; every `invreq_*`/`invoice_*` type BOLT#12 defines is < 240), so the stream keeps
 BOLT#12's ascending type order across the signature slot. The signature is computed by `signMerkle` over the unsigned records
 in their original order; the Merkle root excludes the signature range (240–1000) wherever those records sit. The decoder
 (`lnwire.parseTlvStream`, shared with the offer decode) refuses any out-of-order stream with `NotStrictlyIncreasing`, the
-signature slot included (`lnwire/src/tlv.zig:216`).
+signature slot included (`lnwire/src/tlv.zig`).
 
 **Refunds and `invoice_error`.** A refund is an offer-less `invoice_request`: the same `lnr1...` object, so decode, `verify`
-and `encodeSignedInvoiceRequest` handle it, and `invoiceRequestIsRefund` (`bolt12.zig:740`) classifies one (no record of type
-1..79). `invoice_error` (`decodeInvoiceError`/`encodeInvoiceError`, `bolt12.zig:796,826`) is a bare TLV stream (no bech32
+and `encodeSignedInvoiceRequest` handle it, and `invoiceRequestIsRefund` (`bolt12.zig`) classifies one (no record of type
+1..79). `invoice_error` (`decodeInvoiceError`/`encodeInvoiceError`, `bolt12.zig`) is a bare TLV stream (no bech32
 string) with types 1 `erroneous_field` (a minimal `tu64`), 3 `suggested_value` and 5 `error`. It is strict: an unknown even
 type is refused, an unknown odd one ignored, types must be strictly increasing; `error` is mandatory, non-empty and valid
 UTF-8; `suggested_value` is accepted only together with `erroneous_field`; encode refuses what decode refuses, so its output
@@ -195,9 +195,9 @@ always decodes. No external vector exists for either: the tests are hand-built b
 **String handling.** `stripContinuation` (`bech32_raw.zig:207`) removes a `+` (and the whitespace after it) only when it is
 neither the first nor the last character, and a doubled `+` keeps the second one literally, so the string stays invalid.
 BOLT#12's three whole-stream decoders (offer, `invoice_request`, `invoice`) use
-`bitpack.quintetsToBytesMinimal` (`bolt12.zig:144,457,650`), which additionally refuses five or more leftover padding bits
+`bitpack.quintetsToBytesMinimal` (`bolt12.zig`), which additionally refuses five or more leftover padding bits
 (`PaddingTooLong`, as the reference `convertbits(5, 8, pad=false)` does); BOLT#11's per-field decode keeps
-`quintetsToBytesStrict` (`bitpack.zig:45`), which can legitimately carry five or more leftover zero bits.
+`quintetsToBytesStrict` (`bitpack.zig`), which can legitimately carry five or more leftover zero bits.
 
 
 ## Verification

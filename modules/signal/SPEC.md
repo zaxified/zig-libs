@@ -376,10 +376,10 @@ exact bytes and that nonce isn't published).
   missing check.
 - **Wire codecs.** `pqxdh.PreKeyBundle.toBytes`/`fromBytes` (`encoded_length` 1805:
   x3dh's 169-byte bundle `|| kem_prekey(1568) || kem_prekey_id(4 LE) ||
-  kem_prekey_signature(64)`; `src/pqxdh.zig:163`, error `InvalidPreKeyBundle`) and
+  kem_prekey_signature(64)`; `src/pqxdh.zig`, error `InvalidPreKeyBundle`) and
   `pqxdh.InitialMessage.toBytes`/`fromBytes` (`header_length` 1649: x3dh's header
   with `kem_prekey_id(4 LE) || kem_ciphertext(1568)` before the ciphertext length;
-  `src/pqxdh.zig:248`, error `InvalidInitialMessage`). This module's own layouts —
+  `src/pqxdh.zig`, error `InvalidInitialMessage`). This module's own layouts —
   Signal's protobufs are not reproduced.
 - **Not claimed**: byte-compatibility with Signal's own servers. Like
   `x3dh.zig`, this file uses its own `info` string — the spec leaves `info`

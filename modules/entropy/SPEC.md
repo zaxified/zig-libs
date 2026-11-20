@@ -82,7 +82,7 @@ into a whole-process outage. Two things bound it:
 
 `unavailable_message` covers exactly one fault: `error.EntropyUnavailable`, a
 machine or policy problem (seccomp, Landlock, a container profile, an
-unreachable `arc4random_buf`) (`src/root.zig:191`, `:259`). Two more aborts exist
+unreachable `arc4random_buf`) (`src/root.zig`, `:259`). Two more aborts exist
 and each has its own message, because each names a different cause, a bug in the
 `std.Io` handed in and not a machine fault: `canceled_contract_violation_message`
 (`randomSecure` returned `error.Canceled` although the draw ran blocked;
@@ -108,7 +108,7 @@ the section above argues for.
 `std.Io.Threaded.randomMainThread` wraps its `randomSecure` call in
 `swapCancelProtection(.blocked)` with a restoring `defer`. `fill` and `tryFill`
 block cancellation across the draw and restore the previous state, not
-`.unblocked`, on the way out (`src/root.zig:295`).
+`.unblocked`, on the way out (`src/root.zig`).
 
 The `error.Canceled` arm of the `randomSecure` switch is a real `@panic` with its
 own message (`canceled_contract_violation_message`, `:307`), not the
@@ -139,7 +139,7 @@ Two costs, neither hidden:
   optimized build does not reliably abort at all, since `unreachable` is a
   promise to the optimizer, not a check). So before the swap the slot is
   compared with `std.Io.unreachableSwapCancelProtection` and the call aborts with
-  `unsupported_io_message`, in every build mode (`src/root.zig:285`). It is a
+  `unsupported_io_message`, in every build mode (`src/root.zig`). It is a
   check for that one std-defined slot, not an allowlist of backends. `Threaded`,
   `Evented`, `Uring` and `Dispatch` all implement the slot, and no production
   caller has a reason to hand in an `Io` that cannot.
@@ -154,8 +154,8 @@ needles of the three abort tests pin the binding.
 `getrandom` that runs the kernel's own CRNG (a ChaCha20 state in user memory the
 kernel keys, reseeds and wipes across fork) with no syscall; Go 1.24+'s
 `crypto/rand.Read` and glibc 2.41+'s `arc4random` take it. `fill` and `tryFill`
-use it (`src/vgetrandom.zig`) only when all of these hold (`src/root.zig:293`,
-`src/vgetrandom.zig:38`):
+use it (`src/vgetrandom.zig`) only when all of these hold (`src/root.zig`,
+`src/vgetrandom.zig`):
 
 - Linux without libc (with libc std already calls `arc4random_buf`),
 - x86_64 (`__vdso_getrandom`, `LINUX_2.6`) or aarch64 (`__kernel_getrandom`,
@@ -235,7 +235,7 @@ one is undefined behaviour (all but three slots are mis-bound). Copying the
 vtable buys compilation against a moving std and nothing else. The rule:
 **every `std.Io` function reachable from `fill` or `SecureSource` needs an
 override in `CountingIo`.** Today that set is `random`, `randomSecure` and
-`swapCancelProtection` (`src/root.zig:454`). A mis-bound slot does not announce
+`swapCancelProtection` (`src/root.zig`). A mis-bound slot does not announce
 itself: `std.Io.Threaded.swapCancelProtection` discards its `userdata` and reads
 a thread-local, and both structs have alignment 8, so a missing override stayed
 green except for the one test that sees nothing happen.

@@ -133,7 +133,7 @@ compat-hosting kernel: a native i386 binary run on it reaches the real compat en
 `sz = 84` succeeds while `sz = 88`, `96`, `120`, `0` and `4096` all return `EINVAL`. So
 `.x86 => .packed32` is right for 32-bit x86 userspace under an x86_64 kernel, and the size check
 in `do_statfs64` is real rather than a hoped-for safety net. The mapping is held by a test
-(`familyFor`, statfs.zig:482). Not verified by this repository: a native i386 kernel (none in
+(`familyFor`, statfs.zig). Not verified by this repository: a native i386 kernel (none in
 the lab; see *Open*). The severity of being wrong there is bounded by the same self-checking
 property documented below: a native i386 kernel handed the 84-byte buffer (its own `statfs64`
 is 88 bytes) returns `EINVAL` rather than a silently misaligned `Usage`.
@@ -207,12 +207,12 @@ size (hostile or corrupt report) is clamped to 0, and the byte helpers saturate.
 
 **`lookup.Index`.** `lookup.containing` scans the table once per tree step: O(depth x n) per call,
 fine on a table the kernel wrote, but O(n^2) on a hostile saved table whose parent ids form a
-cycle. `lookup.Index.init` (lookup.zig:170) builds a parent-id sorted index once and
-`lookup.containingIndexed` (lookup.zig:208) answers from it, resolving a parent cycle by remembering
+cycle. `lookup.Index.init` (lookup.zig) builds a parent-id sorted index once and
+`lookup.containingIndexed` (lookup.zig) answers from it, resolving a parent cycle by remembering
 the visited entries, O(n log n) in the worst case. The answer is identical to `containing` on every
 table (the walk still stops after `entries.len` steps, so the entry at that position of a cycle is
 returned); `containing` keeps its signature and stays non-allocating. `table.collectWith` builds one
-`Index` for all its `Options.tree` candidates (table.zig:127). The index is only for mountinfo
+`Index` for all its `Options.tree` candidates (table.zig). The index is only for mountinfo
 entries and is not thread-safe.
 
 ## Constant-time contract
@@ -225,7 +225,7 @@ Not applicable — no secret material is handled anywhere in this module.
   `PATH_MAX`-derived buffer; a longer path returns `error.NameTooLong`
   rather than truncating.
 - `statfs.query` rejects a `path` containing an embedded NUL byte with
-  `error.InvalidPath` (statfs.zig:595), checked before `toPosixPath` ever sees it.
+  `error.InvalidPath` (statfs.zig), checked before `toPosixPath` ever sees it.
   `toPosixPath` itself only `assert`s the absence of one — a crash in a
   safety-checked build, and in `ReleaseFast`, where `assert` compiles away, a
   silent truncation to whatever precedes the NUL: the caller would be told
@@ -330,7 +330,7 @@ Not applicable — no secret material is handled anywhere in this module.
   over `mounts` entries `containing` is longest-prefix and cannot see a mount covered by a later
   ancestor mount (use mountinfo).
 - Non-Linux platforms: the module is Linux-only by design (raw syscalls, no libc).
-- The x32 ABI `statfs64` layout is refused at compile time (statfs.zig:537) rather than guessed
+- The x32 ABI `statfs64` layout is refused at compile time (statfs.zig) rather than guessed
   at: not a target of this collection and no kernel header was checked against it.
 
 ## Verification

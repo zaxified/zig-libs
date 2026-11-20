@@ -174,7 +174,7 @@ OpenSSL:
 
 The root cause is structural, traced in `ff.zig`: it stores **63-bit redundant
 limbs** (`carry_bits = 1`, `t_bits = 63`) and multiplies limbs via a 4-way
-half-limb `mulWide` (`ff.zig:907`). That representation *cannot* use the host's
+half-limb `mulWide` (`ff.zig`). That representation *cannot* use the host's
 add-with-carry (`ADCX/ADOX`) or widening multiply (`MULX`) — the exact
 instructions OpenSSL's `x86_64-mont5.pl` is built on. We cannot patch std, and
 this is not something the other modules can fix locally.

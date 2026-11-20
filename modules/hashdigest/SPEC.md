@@ -63,14 +63,14 @@ zig-libs authors — the constructions are public standards (RFC 7693 for BLAKE2
 
 - **Engines by target.** `sha2` (SHA-224/256/384/512, SHA-512/256) is used only on x86-64, where it dispatches at run
   time to SHA-NI/AVX2; every other target uses std's engines and the `sha2` import is never analysed there
-  (`src/root.zig:58-59`). The in-module BLAKE2b-256 is compiled in only when the build has AVX2 (`src/root.zig:60`):
+  (`src/root.zig`). The in-module BLAKE2b-256 is compiled in only when the build has AVX2 (`src/root.zig`):
   on baseline x86-64 it is slower than std's. Neither engine helps on MIPS32 / ARM32 (smaller and faster with std's
   there; both pass the module's tests under qemu), so `sha2`'s `.targets` stays `linux64`.
 - **BLAKE2b-256 engine** (`src/blake2b.zig`): four `@Vector(4, u64)` rows, G applied to columns, then to diagonals via
   lane shuffles; written from RFC 7693, streaming layout as std's. Unkeyed, 256-bit only (`Options` is empty,
-  `src/blake2b.zig:18`); byte-identical to `std.crypto.hash.blake2.Blake2b256`.
-- **`finalHex` finalises a copy of the state** (`Hasher.finalHex` `src/root.zig:110`, `MultiHasher.finalHex`
-  `src/root.zig:302`) and wipes the copy, so `update` may continue and `finalHex` may repeat (finalising in place
+  `src/blake2b.zig`); byte-identical to `std.crypto.hash.blake2.Blake2b256`.
+- **`finalHex` finalises a copy of the state** (`Hasher.finalHex` `src/root.zig`, `MultiHasher.finalHex`
+  `src/root.zig`) and wipes the copy, so `update` may continue and `finalHex` may repeat (finalising in place
   panics in std's SHA-3 on a later `update`).
 - **Checksum files** (`checksum`, `src/checksum.zig`): `Iterator` / `parseLine` read GNU lines (`hex  name`, `hex *name`),
   BSD tags (`ALGO (name) = hex`, tag table `tags`, `tagOf`), `\`-escaped names (`\\`, `\n`, `\r`), `#` comments, blank lines
@@ -82,16 +82,16 @@ zig-libs authors — the constructions are public standards (RFC 7693 for BLAKE2
   `max_name_len` (4096) bytes (`NameTooLong`). Format reference: GNU coreutils 9.7 and uutils 0.10 output (black box).
 - **Bounded file hashing.** `hashFileMax` / `hashFileInMax` / `sha256FileMax` take `max_bytes: ?u64` and return
   `error.FileTooLarge` once the file delivers more (exactly `max_bytes` passes; the read stops within one 64 KiB chunk
-  of the cap, `src/root.zig:353-358`); `checksum.Options.max_file_bytes` feeds it into `verifyEntry` / `verifyAll`
-  as `Status.too_large` / `Summary.too_large` (`src/checksum.zig:187-198`). The **default stays unlimited**, by the
+  of the cap, `src/root.zig`); `checksum.Options.max_file_bytes` feeds it into `verifyEntry` / `verifyAll`
+  as `Status.too_large` / `Summary.too_large` (`src/checksum.zig`). The **default stays unlimited**, by the
   reference rule: `sha256sum`, `shasum`, `b3sum`, Go's `io.Copy(hash, f)` and Python's `hashlib.file_digest` have no
   cap, and a silent default cap would turn a legitimate multi-GB image check into an error; a caller hashing untrusted
   paths sets it.
 - **XOF and BLAKE3 modes.** `xof` (SHAKE128, SHAKE256, BLAKE3: any output length including 0), `blake3Keyed`
-  (32-byte key) and `blake3DeriveKey` (context string + key material) go through std's engines (`src/root.zig:381-405`).
+  (32-byte key) and `blake3DeriveKey` (context string + key material) go through std's engines (`src/root.zig`).
   The two BLAKE3 entry points wipe the key copy and the state and run a 16 KiB dead-stack burn (`stack_burn`,
-  `src/root.zig:417`), checked by `src/stackprobe_test.zig` (8 KiB left residue for 3000 bytes of derive material).
-- **`Algorithm`.** Nine members (`src/root.zig:163`); `sha512_256` is NIST SHA-512/256 (distinct IV), not plain
+  `src/root.zig`), checked by `src/stackprobe_test.zig` (8 KiB left residue for 3000 bytes of derive material).
+- **`Algorithm`.** Nine members (`src/root.zig`); `sha512_256` is NIST SHA-512/256 (distinct IV), not plain
   truncation. `Algorithm.Impl` names the engine type of each.
 
 ## Threat model / out of scope

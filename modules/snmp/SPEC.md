@@ -65,30 +65,30 @@ types), X.690 (BER) — see README "Provenance"; no NOTICE entry needed.
 
 - **Walkers.** `Client.walker` / `V3Client.walker` walk a subtree by GetNext; `Client.bulkWalker` / `bulkWalkerWith` and
   `V3Client.bulkWalker` / `bulkWalkerWith` by GetBulk, default max-repetitions 10 (`default_max_repetitions`,
-  `client.zig:317`, net-snmp's `snmpbulkwalk` default). Every way a walk can end is final: the end of the subtree,
+  `client.zig`, net-snmp's `snmpbulkwalk` default). Every way a walk can end is final: the end of the subtree,
   endOfMibView, noSuchName, or an empty batch; a failing step finishes the walker, so a further `next()` sends
   nothing. A name that is not strictly greater than the previous one is `error.OidNotIncreasing`, max-repetitions
   0 is `error.InvalidMaxRepetitions`, and a v1 client's bulk walker answers `error.UnsupportedPdu`
-  (`client.zig:324-374`; `v3client.zig:802-906`).
+  (`client.zig`; `v3client.zig`).
 - **Retry policy (v1/v2c).** `Client.Options.retries` (default 5, net-snmp's `-r 5`): on `error.Timeout` or a reply
   with another request id the same bytes (same id) are re-sent, `retries + 1` tries in all, so a late reply to an
   earlier try is accepted by a later one. A transport failure, `Canceled`, an undecodable reply or a wrong PDU type
-  is returned at once (`client.zig:226-255`). The per-try timeout is the transport's own
+  is returned at once (`client.zig`). The per-try timeout is the transport's own
   (`UdpTransport.Options.timeout`, default `.none`, which blocks: set 1 s to match net-snmp). The module owns no clock
   policy. `V3Client` keeps its own single Report retry and adds no timeout retry.
 - **Notification sending.** `Client.trapV1`, `trapV2` (fire and forget, through the optional `Transport.sendFn`,
   otherwise `error.SendNotSupported`), `Client.inform` and `V3Client.inform` (wait for the Response; `inform` re-sends
   per `retries` on the v1/v2c client). For v2c and v3 the library inserts `sysUpTime.0` and `snmpTrapOID.0` as the first
   two varbinds (RFC 3416 §4.2.6); a payload varbind naming either is `error.ReservedVarbind`, and more than
-  `max_notification_varbinds` (32) payload varbinds is `error.TooManyOids` (`client.zig:142-170`,
-  `message.zig:394-430`). v3 **Trap** sending is not offered, see *Backlog / deferred*.
+  `max_notification_varbinds` (32) payload varbinds is `error.TooManyOids` (`client.zig`,
+  `message.zig`). v3 **Trap** sending is not offered, see *Backlog / deferred*.
 - **`msgID` / `msgMaxSize` ranges.** RFC 3412 §6 gives `msgID` 0..2147483647 and `msgMaxSize` 484..2147483647 and
   §7.2.2 says a message outside them is no SNMPv3Message. `v3.decode` refuses a negative `msgID` and a `msgMaxSize`
-  below `min_msg_max_size` (484) with `error.InvalidValue` (`v3.zig:202-203`); above `i32` max stays
+  below `min_msg_max_size` (484) with `error.InvalidValue` (`v3.zig`); above `i32` max stays
   `IntegerTooLarge`. net-snmp's `snmpv3_parse` (`snmplib/snmp_api.c`) rejects both with `SNMPERR_ASN_PARSE_ERR`; gosnmp
   stores both as `uint32` and does not range-check on receive, so the spec rule and the reference agree and the
   permissive one is the outlier. Encode side: the client's `msgID` counter runs 1..2^31-1 and wraps to 1, an
-  `initial_msg_id` below 0 is raised to 0 (`v3client.zig:295`), the default `msgMaxSize` is 65507, and `v3.encode*`
+  `initial_msg_id` below 0 is raised to 0 (`v3client.zig`), the default `msgMaxSize` is 65507, and `v3.encode*`
   itself writes whatever `i32` the caller puts in `EncodeParams` (documented, not checked). The client does not read a
   peer's `msgMaxSize` at all (no response-size clamping).
 

@@ -183,7 +183,7 @@ that looked like one.
 path back — a torn record's tail is repaired on `open`, mid-segment damage is
 `resync`/`skipSegment`'s to step over, a missing or wrong `.idx` is rebuilt by
 a walk — and so has a `MANIFEST` that fails its CRC or structural checks:
-`Log.rebuildManifest(gpa, store, ids)` (`src/root.zig:1591`). Given the
+`Log.rebuildManifest(gpa, store, ids)` (`src/root.zig`). Given the
 segments' ids, ascending, in the order they form the log, it reads each one's
 own header (which carries its first LSN, the base-LSN field) and, for every
 one but the last, its seal (the last record of a closed segment always lies

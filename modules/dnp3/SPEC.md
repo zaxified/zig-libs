@@ -347,18 +347,18 @@ declassifies exactly two public byte ranges (`makeMemDefined`, a no-op without `
   as the g120v5.
 
 The keys stay tainted. Native (skylake):
-- tainted in-file 6. All six are `aeskw` root.zig:203, the timing-safe integrity verdict, once
+- tainted in-file 6. All six are `aeskw` root.zig, the timing-safe integrity verdict, once
   per unwrap call site in the harness (genuine, tampered, other status) × 16/32-octet keys.
 - No context fires in `sa.zig` itself.
 - control 0; trap 0.
 
 x86_64 portable:
 - tainted in-file 121, identical to `keys`.
-- control 4: printing, Writer.zig:1943–1945.
+- control 4: printing, Writer.zig–1945.
 - trap 61, histogram:
-  - sa.zig:899 ×16 and sa.zig:73 ×8 (the status `ctEql`);
-  - sa.zig:896/897 ×4 each (the length checks);
-  - aeskw root.zig:203 ×6;
+  - sa.zig ×16 and sa.zig ×8 (the status `ctEql`);
+  - sa.zig ×4 each (the length checks);
+  - aeskw root.zig ×6;
   - Writer.zig ×12;
   - memcpy.zig ×11.
 

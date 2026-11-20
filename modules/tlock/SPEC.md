@@ -95,7 +95,7 @@ exact byte layout, including the one little-endian counter inside
 
 `encrypt` needs `Gid^r`; `bls12_381.Fp12` exports no `pow`, so `fp12Pow` is
 module-local in `tlock.zig` (mirroring how `vdf`'s `pow2Mod` is module-local;
-`src/tlock.zig:228`). It is a big-endian fixed-window (4-bit) exponentiation over
+`src/tlock.zig`). It is a big-endian fixed-window (4-bit) exponentiation over
 the exponent's canonical 32-byte encoding: a table of `base^0 … base^15` (the base
 is `Gid`, a pairing of public points, so building it needs no protection), then per
 window exactly four squarings and one multiplication, unconditionally, with no
@@ -226,7 +226,7 @@ read the contexts with `--stacks`.
 in it as an age `tlock` stanza and encrypts the file itself with age's STREAM, so a
 file of any length can be timelocked. `age.zig` reads and writes that format,
 written from the public age specification (C2SP `age.md`, `age-encryption.org/v1`);
-no age source was read (`src/age.zig:1`).
+no age source was read (`src/age.zig`).
 
 ```
 age-encryption.org/v1
@@ -240,7 +240,7 @@ age-encryption.org/v1
   file_key, sigma)`, and the round signature recovers it.
 - **Header MAC:** `HMAC-SHA-256` keyed with `HKDF-SHA-256(ikm = file_key, salt = "",
   info = "header")` over every header byte up to and including `---`, compared in
-  constant time (`macEql`, `src/age.zig:290`) before any payload byte is opened.
+  constant time (`macEql`, `src/age.zig`) before any payload byte is opened.
 - **Payload:** `payload_key = HKDF-SHA-256(ikm = file_key, salt = nonce, info =
   "payload")`; the plaintext is cut into 64 KiB chunks (`chunk_bytes`), each sealed
   with ChaCha20-Poly1305 (`chachapoly`, empty AD) under the 12-byte nonce

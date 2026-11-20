@@ -229,7 +229,7 @@ layout never depends on Zig's bitfield-packing rules.
   still to come, `Config.max_reply`); an entry whose reply does not fit is
   answered `reply_data_too_large` alone, and every handler that changes state
   checks that its reply fits before it changes anything, so an overflow
-  changes nothing (`adapter.zig:556-612`).
+  changes nothing (`adapter.zig`).
 
   The **TCP/IP Interface object** (class `0xF5`, instance 1; CIP Vol 2
   ch. 5-4) answers `Get_Attributes_All` (attributes 1 to 6 in order) and
@@ -538,13 +538,13 @@ containment, not confidentiality or integrity against an active attacker:
   connection id on the explicit path; libplctag (MPL-2.0, source read for behaviour only) checks the reply service only
   inside each typed tag handler and logs the connected-address id without comparing it; cpppo is copyleft and was not
   read. So there is no majority for either check. A connected reply is tied to its request by the CPF sequence count
-  (`SequenceMismatch`, `client.zig:323`) and every reply by the session handle (`SessionMismatch`, `client.zig:182`) and
+  (`SequenceMismatch`, `client.zig`) and every reply by the session handle (`SessionMismatch`, `client.zig`) and
   the one-request-one-reply stream order, so the stray-reply window equals the references'. A check on `sendCip` would
   also have to special-case `Unconnected_Send`, whose success reply carries the embedded service. Revisit only if a
   consumer shows a target that answers out of order. Related, also unchecked: `Client.forwardOpen` takes the connection
-  serial from the reply instead of comparing the originator triple (`client.zig:690`), and `multipleServices` accepts
-  fewer embedded replies than requests, returning the smaller count (`client.zig:583`).
-- **`Timeout.fromMilliseconds(0)` returns null** (`connmgr.zig:101`): zero ticks is not a timeout the function will
+  serial from the reply instead of comparing the originator triple (`client.zig`), and `multipleServices` accepts
+  fewer embedded replies than requests, returning the smaller count (`client.zig`).
+- **`Timeout.fromMilliseconds(0)` returns null** (`connmgr.zig`): zero ticks is not a timeout the function will
   encode. The references do not convert milliseconds at all: they send fixed non-zero raw pairs (pycomm3
   `PRIORITY`/`TIMEOUT_TICKS` `0x0A`/`0x05`, libplctag `AB_EIP_SECS_PER_TICK`/`AB_EIP_TIMEOUT_TICKS` `0x0A`/`0x0E`) or
   take the raw tick pair from the caller (EIPScanner's `ConnectionParameters`, default 0), so there is no reference

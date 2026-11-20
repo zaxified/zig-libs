@@ -230,7 +230,7 @@ zeros cannot hang `blind`. `blindSign`'s §7.2 blinding factor is drawn by
   own (montint's Montgomery and safegcd scratch), so `blind` and `blindSign`
   additionally ZERO THE STACK their callees used, in a `noinline` helper that
   runs after every other wipe (`blind_stack_burn` 256 KiB, `sign_stack_burn`
-  512 KiB; `root.zig:345`, `root.zig:352`). `src/stackprobe_test.zig` asserts
+  512 KiB; `root.zig`). `src/stackprobe_test.zig` asserts
   the result with a NEGATIVE and a POSITIVE control in the same binary
   (needles: `r`, the inverse's operand `m·r`, `r⁻¹`); removing the burn, or
   making the helper inlinable, brings the blinding factor back (the burn then
@@ -273,7 +273,7 @@ zeros cannot hang `blind`. `blindSign`'s §7.2 blinding factor is drawn by
   never an honest one: a draw misses with probability below one half).
   `blindSign`'s blinding draw lives in `rsa` (`drawBlindingPair`), also at most
   128 draws, then `error.EntropyFailure`, mapped to `SigningFailure`
-  (`root.zig:623`).
+  (`root.zig`).
 
 ## Verification
 

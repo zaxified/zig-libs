@@ -282,20 +282,20 @@ raw partition (same resume record — its position is just a key): a block whose
 below the cutoff goes whole; a block straddling it is rewritten with its suffix (the key — its
 last sample — is unchanged). `liveSize` adds each block's key + value bytes, still exact.
 `sweepToBudget` deletes units — a raw point or a whole block — oldest first by their oldest
-sample, across series (block before raw on a tie: any raw point that shadows a block sample has `ts ≥ block.first`, so block-first cannot delete a raw overwrite of a block's first sample while the block stays; a targeted test kills the reversed order, `root.zig:3773`, the model check does not — the budget must stop exactly between the two entries); `max_deletes` counts samples and is checked
+sample, across series (block before raw on a tie: any raw point that shadows a block sample has `ts ≥ block.first`, so block-first cannot delete a raw overwrite of a block's first sample while the block stays; a targeted test kills the reversed order, `root.zig`, the model check does not — the budget must stop exactly between the two entries); `max_deletes` counts samples and is checked
 before each unit. `deleteSeries` deletes both partitions in bounded chunks and the index entries
 in the last one. The id is dead afterwards: an `append` through a `SeriesId` held from before
 the delete writes samples no index points at (no listing, no budget sweep reaches them, but
 `liveSize` counts them) — re-resolve with `seriesId`, which hands out a fresh id.
 
 **Space.** Old stores need no migration: their samples are raw until `compact` runs. A 1000-sample
-15 s gauge encodes to 458 bytes in one block (`chunk.zig:994`, the size test); a series with only a
+15 s gauge encodes to 458 bytes in one block (`chunk.zig`, the size test); a series with only a
 few samples gains little (the block key dominates, and a 1-sample block costs more than its raw key).
 
 
 ## 5c. Housekeeping, cardinality, matchers, range delete, buckets
 
-- **`maintain(now, policy)`** (`root.zig:1306`) is the periodic housekeeping in one call: age retention
+- **`maintain(now, policy)`** (`root.zig`) is the periodic housekeeping in one call: age retention
   (`sweep(now -| retention)`), then compaction (`compact(now -| compact_after)`), then the size budget
   (`sweepToBudget(max_bytes)`). The order is deliberate: expired data is dropped before it is packed,
   and the budget sees the compacted size. Every `Policy` field is optional; each step keeps its own
@@ -331,7 +331,7 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
   the second cursor and its seek; any commit moves the version and re-checks (one seek per version), and
   once blocks have been seen (`blocks_seen`) `range` behaves as before. A flag found once at `init` was
   rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently
-  skip blocks (test: a second `Db` compacting is seen at once, `root.zig:3217`).
+  skip blocks (test: a second `Db` compacting is seen at once, `root.zig`).
 
 ## 6. Threat model / what can go wrong
 

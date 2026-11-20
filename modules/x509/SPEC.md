@@ -223,12 +223,12 @@ element's end as `start + declared_length` without clamping it to the buffer.
 several points probes for an OPTIONAL sibling at a boundary without first
 checking a byte exists there. On a malformed, attacker-supplied certificate
 (a TLS/OPC-UA/GOOSE peer certificate is fully attacker-controlled) this
-indexes past the buffer. **Verified on Zig 0.16.0 out of band** (`der.Element.parse` is unchanged in 0.17.0, `Certificate.zig:971-1000`: unchecked `bytes[i]`; the repros were not re-run): in **Debug**
+indexes past the buffer. **Verified on Zig 0.16.0 out of band** (`der.Element.parse` is unchanged in 0.17.0, `Certificate.zig`: unchecked `bytes[i]`; the repros were not re-run): in **Debug**
 it panics (`index out of bounds`, aborting the process); in **ReleaseFast**
 the same inputs either read out of bounds *silently* — returning a `Parsed`
 built from whatever lay past the buffer — or segfault. Reproductions used for
 the regression test: `30 02 30 00` (`SEQUENCE { SEQUENCE {} }`) panics at
-`Certificate.zig:905` in Debug and reads OOB (returns a bogus "parsed OK") in
+`Certificate.zig` in Debug and reads OOB (returns a bogus "parsed OK") in
 ReleaseFast; `30 82` (truncated length) segfaults in ReleaseFast.
 
 **Public surface.**
@@ -348,7 +348,7 @@ does not use this guard at all; it has its own `parseBitStringSafe`.
 
 `requireStdDescentPoints` also requires the trailing signatureValue BIT STRING (RFC 5280 §4.1): std reads its header at the
 end of `signatureAlgorithm`, so a certificate without it was well-formed DER yet made std read at the buffer's end
-(`safe.zig:364`, test "a certificate without its signatureValue is refused"). With that, every probe std makes lands inside
+(`safe.zig`, test "a certificate without its signatureValue is refused"). With that, every probe std makes lands inside
 the buffer, `verifyChain` needs no padded copy and its API takes the caller's slice as is; the zero-padded copy stays in
 `safeCertificate` as defence in depth for the boundary-probe case (`30 02 30 00` is refused by
 `requireStdDescentPoints` before std runs).

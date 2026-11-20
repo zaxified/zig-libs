@@ -28,7 +28,7 @@ measured by this survey; the only measured comparison is with `std.hash.Crc32` (
 | [trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) | Rust | Zlib | 697 | v0.6.8 (2026-09-15) | Rust zlib port; CRC-32 is an internal part of the deflate/gzip path, not the point of the crate *(inferred)*. |
 | [srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) | Rust | Apache-2.0 per API (crate is dual MIT/Apache-2.0 *(inferred)*) | 338 | no releases (push 2026-09-21) | "Fast, SIMD-accelerated CRC32 (IEEE)": several implementations (baseline 16 bytes/iteration, SIMD on x86 and arm64), `Hasher` with `combine` *(inferred)*. The same shape as ours. |
 | Go `hash/crc32` ([docs](https://pkg.go.dev/hash/crc32)) | Go | BSD-3-Clause | — | Go stdlib | `ChecksumIEEE`, `Update`, `New`; hardware-accelerated on amd64 and arm64; no `combine` in the standard library *(inferred)*. |
-| Zig `std.hash.Crc32` | Zig | MIT | — | Zig 0.16.0 | Same value; bytewise table, ~0.45 GB/s (measured here on 0.16, README *Speed*); no `combine`; no hardware path (0.17.0: `Crc32` = `@"CRC-32/ISO-HDLC"`, still the generic table, `hash/crc.zig:800`). |
+| Zig `std.hash.Crc32` | Zig | MIT | — | Zig 0.16.0 | Same value; bytewise table, ~0.45 GB/s (measured here on 0.16, README *Speed*); no `combine`; no hardware path (0.17.0: `Crc32` = `@"CRC-32/ISO-HDLC"`, still the generic table, `hash/crc.zig`). |
 
 **Where we are ahead:** of the Zig alternative (`std`), ~50x from 1 KiB (22.9 vs 0.45 GB/s on the measured
 i7-7920HQ) and the only `combine`; PCLMULQDQ folding and the ARMv8 `crc32x` path are chosen at run time without C or

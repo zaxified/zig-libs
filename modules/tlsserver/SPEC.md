@@ -78,7 +78,7 @@ receive key over (and `update_requested` is answered once), the server rekeys on
 `max_records_per_key` (2^23 records, asking the client to rekey too) or when the application
 calls `keyUpdate`; at most `max_key_updates` (32) KeyUpdates may come between two
 application-data records (rustls, BoringSSL); only a record with data refills that budget, an empty
-application-data record does not (BoringSSL `kMaxKeyUpdates`, `src/server.zig:2266-2268`). With `Config.tickets` it issues NewSessionTickets
+application-data record does not (BoringSSL `kMaxKeyUpdates`, `src/server.zig`). With `Config.tickets` it issues NewSessionTickets
 and resumes them (below). With `Config.client_auth` it asks for a client certificate, verifies
 the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with clientAuth) and the
 client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. The seams the web-server consumer's zero-copy codecs need are in:
@@ -439,7 +439,7 @@ the first whose algorithm the client offers and whose staples are the ones this 
 uncompressed. `check` refuses an entry whose `uncompressed_len` no longer matches (`CompressedStale`), and with the
 entry's `digest` set (SHA-256 of the uncompressed message) any other change too; without it a same-length replacement
 (a refreshed OCSP staple usually is one) is not seen, so the caller compresses again whenever it replaces the chain or
-a staple (`src/server.zig:183-196, 305-313`). Interop: OpenSSL 3.5 `s_client` decompresses a std-zlib entry; the BoGo
+a staple (`src/server.zig`). Interop: OpenSSL 3.5 `s_client` decompresses a std-zlib entry; the BoGo
 shim installs BoringSSL's three mock algorithms.
 
 **QUIC mode** (RFC 9001; rustls `quic::ServerConnection`). `Config.quic`: CRYPTO data in and out per encryption level
@@ -447,7 +447,7 @@ shim installs BoringSSL's three mock algorithms.
 transport parameters both ways, 0-RTT with the stack's resumption data and a veto (`setQuicResumptionData`,
 `Quic.accept_early`; the veto's reason is `quic_parameter_mismatch`), alerts as `quicAlert`. A QUIC ticket carries the
 stack's resumption data and resumes over QUIC only (ticket formats `format_quic` / `format_quic_raw`,
-`src/server.zig:992-1001`); `pendingOutput` gives one level at a time. Offloaded signing works the same way (`quicFeed`
+`src/server.zig`); `pendingOutput` gives one level at a time. Offloaded signing works the same way (`quicFeed`
 reports `signature_needed`).
 
 **HelloRetryRequest** (RFC 8446 §4.1.4, rustls 0.23 rules): when the client sent no share for
@@ -471,7 +471,7 @@ before the error is returned. A transport that ends before the handshake or mid-
 that may park while sending (fibers of one thread, an HTTP/2 stream per fiber) need a `Connection.Guard` (a mutex that
 parks): it is held wherever the connection changes or sends its output and released while a read waits. Writers are still
 serialised among themselves, there is one reader, `deinit` comes after every fiber is done with the connection, and `err`
-holds whichever side's error came last. The guard does not make the connection safe across threads (`src/connection.zig:46-60`).
+holds whichever side's error came last. The guard does not make the connection safe across threads (`src/connection.zig`).
 
 RFC 8446 §5, record layer over a byte stream:
 
@@ -594,7 +594,7 @@ Measured and held by `src/stackprobe_test.zig` (ReleaseFast). `burn.handshake_bu
 held by a stack probe in `src/interop_replay_test.zig` that replays recorded handshakes (full, hybrid, HRR, resumed, mTLS,
 RSA, P-384, Ed25519) through `Connection.handshake` in ReleaseFast; the client Certificate and CertificateVerify steps run
 unburned (they touch no secret; their verifier frames reach deep), so the mTLS cases are probed for needles only
-(`Expect.residue = false`, `src/interop_replay_test.zig:714`).
+(`Expect.residue = false`, `src/interop_replay_test.zig`).
 
 The receive side branches only on framing values (record types, lengths, the handshake header,
 the alert octets). Decrypted application data stays in the caller's buffer; joined handshake
@@ -931,10 +931,10 @@ Test classes, by area:
   contract).
 - **AES-CCM suites, brainpool and x448 / Ed448:** not offered (rustls's default provider neither); tlsfuzzer's scripts for them
   stay red by design (`tools/tlsfuzzer/baseline.tsv`). **FFDHE groups** (ffdhe2048 … ffdhe8192, `ffdhe_groups`) are served only
-  when `Config.groups` enables them: they are not in `default_groups` (`src/server.zig:1165-1174`).
+  when `Config.groups` enables them: they are not in `default_groups` (`src/server.zig`).
 - **psk_ke (PSK without (EC)DHE) and external PSKs:** never (rustls likewise).
 - **Post-handshake client authentication:** not in v1, and not in rustls either; a client's post-handshake message other than
-  KeyUpdate is refused (`src/server.zig:2530-2531`).
+  KeyUpdate is refused (`src/server.zig`).
 - **The early exporter** (`early_exporter_master_secret`, RFC 8446 §7.5's 0-RTT variant): rustls has none on the server.
 - **Compressed client certificates** (rustls `ServerConfig::cert_decompressors`: `compress_certificate` in the
   CertificateRequest and a decompressor bounded by `max_leaf_len`): BoGo has no server test for it, so parity does not ask.

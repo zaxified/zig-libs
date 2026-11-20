@@ -318,12 +318,12 @@ serve, so the property is worth having rather than disclaiming:
 ## Limits
 
 - **Widths.** BN254: `t = 2..17` (1..16 inputs); anything else is a `@compileError`
-  in `bn254.Perm` (`src/bn254_poseidon.zig:55`). BLS12-381: `t = 3` and `t = 5`
+  in `bn254.Perm` (`src/bn254_poseidon.zig`). BLS12-381: `t = 3` and `t = 5`
   only, `@compileError` otherwise. These are *policy* limits, not capability ones:
   there are no published parameters outside them, therefore no anchor, and with the
   rejection loop in place `grain.derive` reproduces upstream for any
   `(n, t, R_F, R_P)` without a sage run alongside. `mds_security.max_state_width`
-  (17) is the only hard ceiling (`src/grain.zig:227`); raising it costs compile time
+  (17) is the only hard ceiling (`src/grain.zig`); raising it costs compile time
   and stack, nothing else.
 - **Why BLS12-381 stops at `t = 3` and `t = 5`.** Upstream publishes reference
   scripts *and* test vectors for exactly those two widths over this field. There is

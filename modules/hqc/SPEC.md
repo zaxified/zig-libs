@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 A complete HQC KEM in three layers, with no allocation anywhere: the ring and PRNG foundation (`gf2x`, `prng`,
 `params`), the concatenated Reed-Muller/Reed-Solomon codec (`gf256`, `reedsolomon`, `reedmuller`, `code`), and the
-PKE with the salted Fujisaki-Okamoto KEM over it (`pke`, `kem`; `Hqc128`/`Hqc192`/`Hqc256` in `root.zig:129-133`),
+PKE with the salted Fujisaki-Okamoto KEM over it (`pke`, `kem`; `Hqc128`/`Hqc192`/`Hqc256` in `root.zig`),
 byte-exact against the official NIST KAT. See [README.md](README.md) for purpose and API.
 
 ## Spec version + why this one
@@ -73,7 +73,7 @@ byte-exact against the official NIST KAT. See [README.md](README.md) for purpose
   vectors that will not match this module and will read as a bug here — it is not one; this module targets the
   tagged release, and `next-release` is presumably itself heading toward whatever the eventual NIST FIPS draft
   becomes, which is the revision anticipated above. `zig-libs`'s own `model_after` field in `root.zig`'s `meta`
-  names the tag explicitly for exactly this reason (`root.zig:98`).
+  names the tag explicitly for exactly this reason (`root.zig`).
 - **KAT source**: `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
   (fetched via `curl`, not a paraphrasing tool — see
   `kat_vectors_kem.zig`) — the `.rsp` files ship count=0..99
@@ -114,7 +114,7 @@ byte-exact against the official NIST KAT. See [README.md](README.md) for purpose
   folding a `u64` word at a time). There are two multiply paths in `gf2x.zig`, producing bit-identical output (pinned
   by differential tests, see Verification):
   - **`mulClmul`**, comptime-selected whenever the target is `x86_64 + pclmul` (`clmul_supported`, `Ring.mul`,
-    `gf2x.zig:51-55,405`): a recursive Karatsuba multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
+    `gf2x.zig`): a recursive Karatsuba multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
     multiply (`clmul64`, `karatsuba_base = 8`), the same structural shape as the reference's word-aligned
     Toom-Cook/Karatsuba + `pclmul` elementary multiply (§3.3, Table 2): O(L^1.58) CLMULs instead of O(L²). The
     recursion is specialised on the comptime limb count, and the base-case leaf carries each partial product's high
@@ -137,7 +137,7 @@ byte-exact against the official NIST KAT. See [README.md](README.md) for purpose
   `scripts/checks/ctgrind-expected.tsv`) is what says what the compiled code does. Four places are held branch-free
   against the compiler, each load-bearing (deleting it moves a pinned count and turns `ctgrind.sh --check` red):
   - `prng.writeSupportToVector`: the mask of the scatter into the bit vector is laundered through
-    `asm volatile ("" : "+r" (mask))` (`prng.zig:318,341`). It is a masked select with no `if` in the source, and
+    `asm volatile ("" : "+r" (mask))` (`prng.zig`). It is a masked select with no `if` in the source, and
     LLVM turned it back into a branch that loads `bit_tab[k]` only on the taken path, over the long-term secret
     vector, on every decapsulation (adjudicated in the disassembly as real `je`/`jne`/`jb`). The barrier costs about
     6-8 % per KEM operation (measured keypair +6.9 %, encaps +8.4 %, decaps +6.2 %, ReleaseFast, `-Dcpu=native`),
@@ -145,13 +145,13 @@ byte-exact against the official NIST KAT. See [README.md](README.md) for purpose
     (`HQC_BENCH=1`).
   - `gf256.mul`/`inverse` do not index the `exp`/`log` tables: `mul` is the reference's own carryless multiply plus
     fixed-tap reduction (eight masked shift-and-xor steps, then eight masked folds), `inverse` is `a^254` by
-    square-and-multiply over a comptime exponent (`gf256.zig:135-175`). The table form was the only secret-INDEXED
+    square-and-multiply over a comptime exponent (`gf256.zig`). The table form was the only secret-INDEXED
     table load found in the repository. The tables remain (`reedsolomon.zig` indexes them at PUBLIC positions).
   - `sampleFixedWeightBiased`'s duplicate fixup blends under an arithmetic mask instead of `if (found)`
-    (`prng.zig:289-299`): the scan had no early exit, but the decision still branched on a value derived from the
+    (`prng.zig`): the scan had no early exit, but the decision still branched on a value derived from the
     secret support.
   - `reedsolomon`'s `maskNonzero` and Berlekamp-Massey's `mask12` are laundered through the same kind of barrier
-    (`reedsolomon.zig:33,357,427`).
+    (`reedsolomon.zig`).
 
   What is left in every pinned target is `sampleFixedWeightRejection`'s loop and accept decision (see *Threat model /
   limits*).
@@ -315,19 +315,19 @@ sequence). Fetched via the GitLab raw-file endpoint, same care as the rest
   not hold for the rejection sampler", not "the key is out"; memcheck sees branches and addresses, not cache timing.
 - **Stack.** `keypair`/`encaps`/`decaps` use stack proportional to the parameter set, up to `Kem.stack_bytes` (the
   dead-stack burn buffer is the peak: 128 / 256 / 384 KiB for decaps of HQC-128 / 192 / 256, plus the caller's
-  frames; `kem.zig:78-79,115-121`, `sweep_test.zig` pins the three sizes). Run them on a thread with at least
+  frames; `kem.zig`, `sweep_test.zig` pins the three sizes). Run them on a thread with at least
   `stack_bytes + 64 KiB`; a 128 KiB musl default thread stack is not enough.
 - **Custom parameter sets.** `gf2x.Ring(n)` and `prng.sampleVect` are `@compileError`s for `n % 64 == 0` (every real
   HQC `n` is prime: 17669 / 35851 / 57637); `sampleFixedWeightRejection` and `sampleFixedWeightBiased` are
   `@compileError`s for `weight > n`, and the rejection one for `threshold == 0` (each would loop forever or wrap)
-  (`gf2x.zig:193`, `prng.zig:188,224,225,275`). Only a custom `params.Params` reaches them; the real sets compile.
+  (`gf2x.zig`, `prng.zig`). Only a custom `params.Params` reaches them; the real sets compile.
   Caller-contract violations in `Ring.toBytes`/`setBit`/`getBit` and `prng.sampleVect` (a short output, a position
   `>= n`) are checked panics; `Ring.truncate` is total (`sweep_test.zig`).
 - **Verification tier of the hashes and the biased sampler.** `hashJ` is the least pinned primitive: it is used only
   on the rejection path, so the NIST KAT never reaches it; a test recomputes `K_bar = J(H(ek), sigma, c)` per the
-  spec over the received ciphertext (`kem_kat_test.zig:197`), but there is no external numeric pin for it. `hashH`
+  spec over the received ciphertext (`kem_kat_test.zig`), but there is no external numeric pin for it. `hashH`
   and `sampleFixedWeightBiased` are pinned end to end by the KEM KAT (`hashH` feeds `G` in `encaps`,
-  `kem.zig:197`; the biased sampler draws `r2`, `e`, `r1` in `Pke.encrypt`, `pke.zig:171-181`; any difference moves
+  `kem.zig`; the biased sampler draws `r2`, `e`, `r1` in `Pke.encrypt`, `pke.zig`; any difference moves
   the ciphertext bytes), though not individually: the reference's public `intermediates_values` dump prints neither
   `r1`/`r2`/`e` nor `H`/`J`.
 

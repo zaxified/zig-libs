@@ -51,7 +51,7 @@ bounded memory: `Reader` streams content via `read()` and auto-skips unread byte
 allocate exactly one flate window. Format subset (busybox + GNU): files/dirs/symlinks/hard links,
 GNU long-name('L')/long-link('K') records, ustar `prefix` field (honored only under POSIX `ustar\0`
 magic — GNU reuses those bytes for atime/ctime), octal and GNU/star base-256 size fields; pax
-'x' headers (`path`, `linkpath`, `size`, `uid`, `gid`, `mtime` override the ustar fields exactly, `uname`/`gname` set `Entry.uname`/`gname` (`root.zig:877`), other records parsed past; `mtime` keeps whole seconds plus nanoseconds in `Entry.mtime`/`mtime_nsec`, floor semantics for negative fractions, digits past the ninth cut; an empty value deletes the keyword, a repeated one is last-wins; a malformed header or a non-numeric/over-range `uid`/`gid`/`mtime` is `BadHeader`, payload capped at `max_pax_len`, a path at `max_name_len`), pax 'g' global headers skipped; unknown typeflags surface as `.other` (writer rejects with
+'x' headers (`path`, `linkpath`, `size`, `uid`, `gid`, `mtime` override the ustar fields exactly, `uname`/`gname` set `Entry.uname`/`gname` (`root.zig`), other records parsed past; `mtime` keeps whole seconds plus nanoseconds in `Entry.mtime`/`mtime_nsec`, floor semantics for negative fractions, digits past the ninth cut; an empty value deletes the keyword, a repeated one is last-wins; a malformed header or a non-numeric/over-range `uid`/`gid`/`mtime` is `BadHeader`, payload capped at `max_pax_len`, a path at `max_name_len`), pax 'g' global headers skipped; unknown typeflags surface as `.other` (writer rejects with
 `error.UnsupportedKind`). Writer: `WriteOptions.long_names` is `.gnu` (default, output byte-identical to
 every earlier release: 'L'/'K' records, `FieldOutOfRange` for ids/mtime that do not fit) or `.pax`: a pax
 'x' header (`././@PaxHeader`, records in key order `gid linkpath mtime path size uid`, each `"<len> <key>=<value>\n"`
@@ -88,11 +88,11 @@ logical size a few header bytes can declare: holes cost the reader nothing to de
 consumer a drain loop to read, so a consumer that copies to disk applies its own quota to
 `Entry.size` anyway. Sparse members are never written (a sparse file is packed whole). A member whose stored `size` its map does not use is
 `BadHeader` (exact, as Go: GNU tar 1.35 stops skipping earlier on such a header and would read a member `checkArchive`
-never saw, `root.zig:777-780`); `GNU.sparse.major` without a minor is `BadHeader` (`root.zig:702`); zero-length map
+never saw, `root.zig`); `GNU.sparse.major` without a minor is `BadHeader` (`root.zig`); zero-length map
 entries are dropped unvalidated and an empty pax `uname`/`gname` leaves the ustar field, both kept as policy.
 With `-Dtar-sparse=false` a sparse member is `BadHeader` (see *Build options*). `Reader.discard` skips in steps of at
 most 256 MiB because `std.Io.Reader.discardAll64` overflows `seek + n` on 32-bit targets for a declared size of a few
-GiB (`root.zig:912-927`; see *Backlog / deferred*).
+GiB (`root.zig`; see *Backlog / deferred*).
 
 **Extraction safety.** The module still writes no files; it ships the check an extractor needs.
 `checkPath` (empty, NUL, absolute, `..`), `checkEntry` (plus: only file/dir/symlink/hard link, a
@@ -137,7 +137,7 @@ neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-m
 effectively infinite) unless `packDirOptions` is used: `PackOptions.same_device` (a mount point keeps its header, is
 not descended and not counted in `skipped`; GNU tar `--one-file-system`), `max_entries` and `max_bytes`
 (`error.LimitExceeded`, the destination then holds an unfinished stream), defaults off so `packDir` is unchanged
-(`root.zig:1645-1660`); stored names are the given paths (a root `../x` yields an escaping archive). The module has no
+(`root.zig`); stored names are the given paths (a root `../x` yields an escaping archive). The module has no
 extractor: path-escape checks belong to whoever extracts.
 
 ## Verification

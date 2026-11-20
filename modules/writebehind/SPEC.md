@@ -119,7 +119,7 @@ How this module satisfies each:
 - **The `Sink` must tolerate concurrent calls** (multiple workers, plus the coordinator during
   `get` read-through and `recover`). The reference sinks serialize internally: `KvtreeSink` with a `kvtree.Lock`
   (a `std.Io.Mutex` when the `Db`'s storage has an `Io`, so a waiting flush task yields instead of spinning;
-  `kvtree` is single-writer), `MapSink` with a spinlock (`root.zig:186-262`).
+  `kvtree` is single-writer), `MapSink` with a spinlock (`root.zig`).
 
 ## The Sink vtable (extension point for DL6)
 
@@ -142,7 +142,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
 ## Recovery & liveness details
 
 - **`recover()`** dequeues the WAL globally (FIFO by id), applies each record to the sink, and acks
-  it — synchronous, no pool (`root.zig:828-847`). Call once after `init` over a non-empty WAL, before serving. It
+  it — synchronous, no pool (`root.zig`). Call once after `init` over a non-empty WAL, before serving. It
   stops at the first sink failure with `error.SinkWriteFailed` (the record goes back through `flushFailed`; the
   progress made so far stays) and resumes from there when called again.
 - **on_evict safety net.** A dirty entry evicted before flush fires `on_evict(dirty=true)`; the
@@ -155,7 +155,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   larger than the whole cache budget (`value.len > max_bytes`) and fires **no** `on_evict`. `kick()`'s only two
   sources are `drainDirty` and `orphans`, so a server whose flush loop is the documented periodic `drain()` tick
   would leave an **acked, durable** record pending forever while the WAL grew without bound. `put` therefore
-  checks `cache.isDirty(key)` after staging and registers a non-admitted key as an orphan (`root.zig:690`).
+  checks `cache.isDirty(key)` after staging and registers a non-admitted key as an orphan (`root.zig`).
   `startKey` takes the value from the WAL lease rather than from the cache, so an over-budget value flushes
   normally once selected.
 
@@ -165,7 +165,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   that was never resident honest. This module's contract is that the cache is only a *hint* about which keys are
   pending and the WAL is the authority.
 - **`flushAll` backstop.** If records remain but none are cache-dirty/orphan (e.g. a reopened WAL
-  the operator never `recover()`ed), `flushOneSync` drains them synchronously (`syncFlush`, `root.zig:1124-1195`).
+  the operator never `recover()`ed), `flushOneSync` drains them synchronously (`syncFlush`, `root.zig`).
   `deinit` calls `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
   is held (leased) for the rest of the pass so the next synchronous flush moves on to the next
   record, then returned to the WAL for a retry. A key that waits out its retry backoff is not
@@ -205,7 +205,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   (the record stays in the WAL) but a freed one would be a use-after-free. In both, the last harvest does not
   dispatch a key's next record — its lease is left in memory and the record stays in the WAL with no attempt
   counted. The tasks of jobs `shutdownNow` dropped unrun are freed (`in_flight` maps each key to its task)
-  (`root.zig:606-660`).
+  (`root.zig`).
 - **Sink write failure** → the record is `nack`'d back to the WAL, visible at once, and the key is
   registered as an orphan, so a later `drain` retries it; with `retry_backoff_ns > 0` the key (the
   failed record and every later record of the key) waits that long first, an in-memory per-key
@@ -220,7 +220,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   first and the retried older value would then overwrite it — last-writer-wins broken, and across a restart too,
   since the WAL persists the backoff (`recover`/`flushAll` would apply v2, then v1 once the backoff ran out). So the
   record goes back with no WAL-side backoff and stays its key's oldest; `startKey` skips a key while its
-  `retry_at` lies ahead (`giveBack`, `root.zig:1016-1072`). After a restart the record is retried without delay
+  `retry_at` lies ahead (`giveBack`, `root.zig`). After a restart the record is retried without delay
   (Kafka's `retry.backoff.ms` is an in-memory producer setting too). A WAL written by an earlier release can still
   hold a persisted backoff; such a record is counted as pending and flushed once visible.
 
@@ -234,7 +234,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   and the time allowed for retriable send failures", default 120 000 ms, from `ProducerConfig`).
   Ehcache's writers page leaves retry to the writer and states no flush deadline. Hence: block,
   retry, give up at 120 s with a typed error. 0 = no waiting (one synchronous pass), `maxInt` = no
-  limit (`Options.flush_timeout_ns`, `root.zig:341-347`). `deinit` uses the same bound (Kafka's `close()` blocks
+  limit (`Options.flush_timeout_ns`, `root.zig`). `deinit` uses the same bound (Kafka's `close()` blocks
   without one by default; here a dead sink would otherwise hold teardown forever, and the WAL keeps the records,
   so bounding it loses nothing; `deinitNoFlush` remains the immediate exit). Retrying forever by default is what
   keeps the durability guarantee against a sink that is down, full or refusing: a finite WAL attempt cap would

@@ -185,7 +185,7 @@ being "a selection", not a closed enum).
 **`max_depth` is a stack bound, not only a policy.** `decodeValue` is recursive; raising `DecodeOptions.max_depth`
 to thousands turns a typed `DepthLimitExceeded` into a stack overflow (SIGSEGV) on attacker-chosen input. On an
 8 MiB stack nested `0x81` arrays were measured fine at 4096 and fatal at 8192 in Debug, fine at 16384 and fatal at
-32768 in ReleaseFast (`DecodeOptions` doc comment, `src/root.zig:200-212`); the default 64 leaves a 64-256x margin.
+32768 in ReleaseFast (`DecodeOptions` doc comment, `src/root.zig`); the default 64 leaves a 64-256x margin.
 Raise it only against a stack you have measured.
 
 ## Verification

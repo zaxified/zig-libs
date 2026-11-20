@@ -326,23 +326,23 @@ the datagram it arrived in.
 ### 2.5 Design notes by feature
 
 - **Transport-generic collectors.** The reply collectors (`collectWiphys`, `collectInterfaces`, `collectInterface`,
-  `collectStations`, `collectScanResults`, `collectRegDomains`, `collectSurvey`, `collectPowerSave`, `src/client.zig:727-829`),
+  `collectStations`, `collectScanResults`, `collectRegDomains`, `collectSurvey`, `collectPowerSave`, `src/client.zig`),
   `dumpStep`, `awaitAckStep` and `waitForEventStep` take any transport (`cl: anytype`), so scripted-socket tests drive the
   filter, append and found-guard logic that a real generic-netlink socket cannot exercise (it answers only to nl80211
   commands and a radio needs hardware).
 - **Capability tables keep a fixed number of entries and say so.** More interface combinations than `max_iface_combinations`
   (32), limits than `max_iface_limits` (8), HE sets than `max_he_sets` (8) or extended-feature bytes than
   `max_ext_feature_bytes` (32) are dropped, not an error: `Wiphy.capabilities_truncated` / `Band.he_truncated` is set
-  (`src/caps.zig:207-232`, `src/wiphy.zig:63,144,186`). Bits past the kept bytes read as false through `hasExtFeature`.
+  (`src/caps.zig`, `src/wiphy.zig`). Bits past the kept bytes read as false through `hasExtFeature`.
 - **`HtCaps.txMaxStreams`** reads the streams field only when "Tx MCS Set Defined" is set and "Tx Rx MCS Set Not Equal" is
-  also set, as IEEE 802.11-2020 9.4.2.55.4 defines it; otherwise it returns 0 (`src/caps.zig:99-107`).
+  also set, as IEEE 802.11-2020 9.4.2.55.4 defines it; otherwise it returns 0 (`src/caps.zig`).
 - **Key material.** `buildConnect` reserves its capacity once, returns an exact copy and wipes its working buffer on every
-  path (`src/connect.zig:178-190`); `Nl80211.connect` wipes the request (`src/client.zig:326`); `pmkFromPassphrase` writes the
+  path (`src/connect.zig`); `Nl80211.connect` wipes the request (`src/client.zig`); `pmkFromPassphrase` writes the
   key through an out pointer. std's PBKDF2 and HMAC frames are not scrubbed: the module has no stack burn
-  (`src/connect.zig:148-150`).
-- **The radio-limits builder's coverage class** (`config.buildSetWiphyParams`) takes any `u8`, as `iw` and the kernel do (`src/config.zig:326,346`).
+  (`src/connect.zig`).
+- **The radio-limits builder's coverage class** (`config.buildSetWiphyParams`) takes any `u8`, as `iw` and the kernel do (`src/config.zig`).
 - **A scan on an interface that is administratively down** answers `ENETDOWN`; `errnoToError` maps it to `error.NetworkDown`
-  (`src/client.zig:103,137`), not `Unexpected`.
+  (`src/client.zig`), not `Unexpected`.
 
 ## 3. Threat model
 
@@ -386,14 +386,14 @@ constraints, so it cannot be used to escape a regulatory limit.
 
 **Limits a caller relies on.**
 
-- **Request/reply calls block without a deadline unless `setRecvTimeout` is set** (`src/client.zig:565`): the datagram budget
-  (`max_dump_messages`, 65536, `src/client.zig:596`), the byte budget (`max_dump_bytes`, 64 MiB, `src/client.zig:604`) and the
-  item budget (`max_dump_items`, 65536, `src/client.zig:676`) bound a talkative peer (`error.TooManyMessages`; close the client
-  after it, `src/client.zig:182`), a silent one is bounded only by `setRecvTimeout` or the caller polling `fd()`.
+- **Request/reply calls block without a deadline unless `setRecvTimeout` is set** (`src/client.zig`): the datagram budget
+  (`max_dump_messages`, 65536, `src/client.zig`), the byte budget (`max_dump_bytes`, 64 MiB, `src/client.zig`) and the
+  item budget (`max_dump_items`, 65536, `src/client.zig`) bound a talkative peer (`error.TooManyMessages`; close the client
+  after it, `src/client.zig`), a silent one is bounded only by `setRecvTimeout` or the caller polling `fd()`.
   `EventSocket.waitForEvent` blocks by design (§ 2.3).
 - **Parser ceilings are fixed constants:** `wiphy.max_wiphys` / `max_bands` / `max_channels_per_band` / `max_total_channels`
-  (256 / 16 / 1024 / 16384, `src/wiphy.zig:53-59`) and `reg.max_rules` / `max_domains` (1024 / 256, `src/reg.zig:36-37`); a well-formed
-  reply that outgrows one is `TooManyMessages` (`src/client.zig:629-649`).
+  (256 / 16 / 1024 / 16384, `src/wiphy.zig`) and `reg.max_rules` / `max_domains` (1024 / 256, `src/reg.zig`); a well-formed
+  reply that outgrows one is `TooManyMessages` (`src/client.zig`).
 - **Secrets on the stack:** PBKDF2 frames inside `pmkFromPassphrase` are not scrubbed (§ 2.5).
 
 ## What is deliberately not done
@@ -437,13 +437,13 @@ attribution.
 
 - **Typed events:** CONNECT / ROAM / DISCONNECT / NEW_STATION and `SCHED_SCAN_RESULTS` on the event socket. `Event` carries the
   command number with `status_code`, `reason_code` and `mac`, but only the scan-terminal predicates are modelled
-  (`src/client.zig:920-950`); every `iw event` user sees these. Decode only.
+  (`src/client.zig`); every `iw event` user sees these. Decode only.
 - **Capability decoding beyond HT/VHT/HE bytes:** HE/EHT per-bit accessors (needs a capture from an HE radio; this host's iwlwifi
   is 802.11ac), `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL`, and multi-link (`BSS_MLD_ADDR` / `MLO_LINK_ID`) handling beyond decoding the attributes.
 - **`SET_WIPHY` antenna masks** (channel, tx power, RTS/fragmentation, retry limits and coverage class are built).
 - **The third IEEE 802.11i H.4 vector (63 characters) is not pinned**; `pmkFromPassphrase`'s test pins two vectors and the
-  63-character length boundary only (`src/connect.zig:326-347`).
-- **An empty mesh id is passed to the kernel unchecked** (`src/modes.zig:73` rejects only more than 32 bytes).
+  63-character length boundary only (`src/connect.zig`).
+- **An empty mesh id is passed to the kernel unchecked** (`src/modes.zig` rejects only more than 32 bytes).
 - **Parser ceilings as options:** make the fixed ceilings (see § 3, Limits) options only if real hardware ever meets one.
 
 ## Anchoring

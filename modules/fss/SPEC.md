@@ -62,7 +62,7 @@ a copyrightable work) — the citation lives here.
 
 The output group is **`Z_{2^{8L}}`** (integers mod `2^{8L}`, i.e. `L`-byte
 little-endian, wrapping add), `L = out_bytes` a compile-time parameter
-(`Dpf(n, L)`, `L ∈ 1..32`, `dpf.zig:147`). Justification:
+(`Dpf(n, L)`, `L ∈ 1..32`, `dpf.zig`). Justification:
 
 - It is the **standard** DPF output group in the BGI construction: the final
   output correction word is computed once in the group and the two parties'
@@ -84,7 +84,7 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
 so it is only practical for small `n`; large-`n` DPFs use single-point `Eval`
 (`O(n)`) or the tree-reuse `evalFull`/`evalFullWith` over a domain **prefix**
 (§"Tree-reuse prefix evaluation" below), which costs `O(out.len)` regardless
-of `2^n`; `evalRangeWith` does the same for a window `[lo, hi)` (`dpf.zig:521`).
+of `2^n`; `evalRangeWith` does the same for a window `[lo, hi)` (`dpf.zig`).
 
 ## The Fable-core vs mechanical split
 
@@ -203,7 +203,7 @@ a skip is never a pass.
    composition and the seed-reuse leak control.
 6. **PRG and codec** (`prg.zig`, `dpf.zig`): `Aes128Mmo` pinned to FIPS-197 Appendix B and `convert` to the
    long-hand `H_2 ‖ H_3`; `convert(L)` is the low `L` bytes of `convert(32)` for every `L`; distinct format tags and
-   tagged round trip (`dpf.zig:640`ff).
+   tagged round trip (`dpf.zig`ff).
 
 - **Fuzz:** testkit's deterministic driver, `FSS_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`), harnesses
   `fss-dpf` and `fss-mpf`: generated key pairs reconstruct the point function through the byte codec, a wrong format
@@ -501,7 +501,7 @@ down under `burn.run`, which then zeroes the stack the body dirtied (`burn.zig`;
 `fromBytesTagged`), never returned: a returned key sits in the caller's result slot, above the burn.
 
 `Dpf.genWithSeeds` and `Mpf.genWithSeeds` take the point `α` and value `β` (`alphas`/`betas`) by `*const`, like the
-seeds (`dpf.zig:314`, `mpf.zig:233`); the body copies them inside its own burned frame, so `burn.run`'s argument tuple
+seeds (`dpf.zig`, `mpf.zig`); the body copies them inside its own burned frame, so `burn.run`'s argument tuple
 holds only pointers. A caller's own temporaries (the local the pointer points at, a `@intCast` result) are the
 caller's to wipe: the module cannot reach them. The `prg` `expand`/`convert` primitives keep their by-value shape
 (per-node hot calls under the walk's burn). The stack probe's needles are the seeds and serialized key bytes, so it
@@ -526,8 +526,8 @@ does not observe `α` itself; for `α` the guarantee is by construction.
 
 - **Zig 0.17: wide integer loads/stores on a possibly hot path**: 0.17 lowers a `@bitCast` between `[N]u8` (N > 8)
   and a wider-element type to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256). The widths here go
-  through `std.mem.readInt`/`writeInt` of `Elem` (up to `u256`) in `prg.zig:170,277`, `group.zig:47,53` and the key
-  codec (`dpf.zig:208,240`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
+  through `std.mem.readInt`/`writeInt` of `Elem` (up to `u256`) in `prg.zig`, `group.zig` and the key
+  codec (`dpf.zig`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
   share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative`
   (identical bytes, 8 instructions).
 - **Distributed comparison function (DCF) and interval functions** *(survey)*: the module doc names `dcf.zig` as the

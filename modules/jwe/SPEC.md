@@ -185,20 +185,20 @@ against the returned (declassified) one; the module's own branches on it stay co
 x86-64 (`scripts/test.sh ctgrind-portable`) the counts are `cpu=x86_64` variant rows: std's soft-AES
 key schedule (A1) and its `undefined` batch padding (A2) add contexts, none a jwe branch on a key.
 
-- **content 18** — GCM tag verdict `aesgcm` root.zig:1048 x3 (one per key size); CBC-HMAC tag
-  verdict `enc.zig:314` x6 (`timing_safe.eql` result, accept + reject, 3 encs), checked BEFORE any
-  decryption; PKCS#7 unpad result `aescbc` root.zig:651 x2; the plaintext length
-  (`root.zig:865` `n == plaintext.len` x3, its realloc std Allocator.zig:440 / PageAllocator.zig:226 x4).
+- **content 18** — GCM tag verdict `aesgcm` root.zig x3 (one per key size); CBC-HMAC tag
+  verdict `enc.zig` x6 (`timing_safe.eql` result, accept + reject, 3 encs), checked BEFORE any
+  decryption; PKCS#7 unpad result `aescbc` root.zig x2; the plaintext length
+  (`root.zig` `n == plaintext.len` x3, its realloc std Allocator.zig / PageAllocator.zig x4).
   All public: accept/reject, and a length the authenticated sender chose.
-- **kw 5** — `aeskw` root.zig:171 unwrap integrity verdict x2, `aesgcm` :1048 x3 (content tag + GCMKW
-  unwrap tag at `alg.zig:114`/`:116`). The unwrap verdict only picks the §11.5 decoy CEK.
-- **ecdh 8** — `ecdhes.zig:221` `rejectNonCanonical(d)` x2 (true for every valid key), p256
-  `group.zig:567` identity-result verdict x1 (delegated), std `curve25519.zig:77` `x2.isZero()`
+- **kw 5** — `aeskw` root.zig unwrap integrity verdict x2, `aesgcm` :1048 x3 (content tag + GCMKW
+  unwrap tag at `alg.zig`/`:116`). The unwrap verdict only picks the §11.5 decoy CEK.
+- **ecdh 8** — `ecdhes.zig` `rejectNonCanonical(d)` x2 (true for every valid key), p256
+  `group.zig` identity-result verdict x1 (delegated), std `curve25519.zig` `x2.isZero()`
   identity verdict x1, `aeskw` :171 x2, `aesgcm` :1048 x2.
 - **pbes2 3** — `aeskw` :171 x2, `aesgcm` :1048 x1; PBKDF2 over the tainted password raises none.
-- **rsa 20** (10 per `RSA-OAEP` / `RSA-OAEP-256`) — `rsa` root.zig:1286 F3 fault-check verdict;
-  root.zig:1883 the OAEP decode's single decision point (`valid != 1`); root.zig:1889 the recovered
-  message copy, whose size-class branches in the std memcpy are 6 contexts; `jwe` root.zig:761
+- **rsa 20** (10 per `RSA-OAEP` / `RSA-OAEP-256`) — `rsa` root.zig F3 fault-check verdict;
+  root.zig the OAEP decode's single decision point (`valid != 1`); root.zig the recovered
+  message copy, whose size-class branches in the std memcpy are 6 contexts; `jwe` root.zig
   `got.len != cek_len`; `aesgcm` :1048 content tag. The OAEP decode itself is branch-free
   (leading byte, lHash compare, separator scan and padding check are folded into one flag, no
   early exit by failure reason), so Manger's oracle has nothing to read. A bad key unwrap, of any

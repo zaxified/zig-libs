@@ -225,7 +225,7 @@ module, and a responder without a clock answers with the same error response as 
   (python-snap7's emulator does the same; a real CPU may answer `0xD605`, which the client reports
   as `PlcError`). The responder requires transport size octet string and a request-typed frame for a
   set, the client refuses a reply without the full sub-header and wipes its stack copies of the
-  encoded password (`client.zig:583-590`).
+  encoded password (`client.zig`).
 
 ## Verification
 
@@ -513,7 +513,7 @@ robustness and containment, not confidentiality or integrity against an active a
 
 - **Symbolic addressing over *classic* S7comm** (syntax id `0xB2`). In the `0x32` protocol only
   `S7ANY` (`0x10`) is built and decoded; a `0xB2` item is `error.UnsupportedSyntaxId`
-  (`items.zig:275`). The S7-1200/1500 symbolic world is handled by the **S7CommPlus** (`0x72`)
+  (`items.zig`). The S7-1200/1500 symbolic world is handled by the **S7CommPlus** (`0x72`)
   layer — see *S7CommPlus* — which is the protocol those CPUs actually speak for optimised-block
   access.
 - **PDU-level retry, reconnection and keepalive** (classic client and S7CommPlus alike). The client
@@ -521,7 +521,7 @@ robustness and containment, not confidentiality or integrity against an active a
   deployment wires reconnection into its own supervisor. There is no timer anywhere in this module.
 - **Multiple concurrent outstanding requests.** `Setup communication` negotiates `max AmQ` in both
   directions and this client always uses 1 (`Config.max_amq_calling` / `max_amq_called` default 1,
-  `client.zig:86-87`), which is what every S7 driver in practice does; the PDU reference is
+  `client.zig`), which is what every S7 driver in practice does; the PDU reference is
   incremented per request and the reply must echo it.
 - **`ISO-on-TCP` over anything but TCP** (MPI, Profibus, the `libnodave` serial paths). Out of scope.
 - **S7CommPlus encryption and the newest-firmware integrity cryptography.** The keyed digest and the
@@ -541,7 +541,7 @@ robustness and containment, not confidentiality or integrity against an active a
   `GetBlockInfo`).** What inventory tools use; Snap7 users call it routinely and the card's scope
   line names the gap. Medium effort, fits the module's scope.
 - **Fragmented (multi-PDU) SZL responses.** `readSzl` returns the first PDU and reports
-  `partial = true` when the CPU said more follow (`client.zig:484,512`); the continuation exchange
+  `partial = true` when the CPU said more follow (`client.zig`); the continuation exchange
   is not implemented, because no oracle here would produce one and guessing the sequencing would be
   worse than saying so.
 - **Cyclic services** (function group 2: subscribe to a variable and receive unsolicited push

@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 The key schedule's code lives in the `tls13` module (`tls13.keyschedule.dtls13`, shared with
 `tlsserver`); `src/keyschedule.zig` is a shim that binds it to the names below (only
 `deriveSequenceNumberKey` is defined here), and the KATs live with it. `certverify` is
-`tls13.certverify`, re-exported as `dtls.certverify` (`src/root.zig:346`; the signer burns
+`tls13.certverify`, re-exported as `dtls.certverify` (`src/root.zig`; the signer burns
 `ecdsa_burn`/`ed25519_burn`/`rsa_burn` are in `tls13/src/burn.zig`; `stackprobe_test.zig` still
 measures `certverify.sign` from here). The (EC)DHE key exchange is `tls13.kex`; `Connection.zig`
 keeps the group policy and wrappers named `ecdheGenerate`/`ecdheSharedSecret`/
@@ -463,7 +463,7 @@ epoch-0 record is checked against the window first and recorded only after it co
 next expected `message_seq` moved on) or was an accepted ChangeCipherSpec (the read epoch moved on)
 (`Connection12.processRecord`, `Progress`), and even then only if it moves the high mark at most one window
 width (64) past the current one, or past 0 before any (`Window.recordUnauthenticated`,
-`src/Connection12.zig:169`); a record further ahead is processed but not recorded. A duplicate, a partial
+`src/Connection12.zig`); a record further ahead is processed but not recorded. A duplicate, a partial
 fragment, a queued later message, an early ChangeCipherSpec, epoch-0 application data or a stateless
 HelloVerifyRequest exchange leave the window untouched. Companion rules: `handleFlight`'s retry-once from live
 bytes also drops a message in progress from an earlier call (not only the queue), but keeps the retry's
@@ -474,7 +474,7 @@ keeps no epoch-0 receive window at all (`hs0` counts sends only; duplicates are 
 `message_seq`), so it is not affected. The residual risks are in *Threat model*.
 
 **Plain-PSK premaster.** The plain-PSK premaster buffer is `2 + max(80, max_psk_len) + 2 + max_psk_len`
-bytes (`Connection12.zig:136`, `:1080`), because RFC 4279 §2's `other_secret` is `psk.len` zero bytes; the cap
+bytes (`Connection12.zig`, `:1080`), because RFC 4279 §2's `other_secret` is `psk.len` zero bytes; the cap
 `max_psk_len` is 512 (OpenSSL's `PSK_MAX_PSK_LEN`). The DTLS 1.3 PSK path has no such buffer (the PSK goes straight
 into HKDF-Extract; an over-long PSK identity is a typed `BufferTooShort` from the ClientHello's
 pre_shared_key buffer).
@@ -545,10 +545,10 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
 - **Cookie rotation.** RFC 9147 §5.1 RECOMMENDS accepting the previous `cookie_secret` for a period.
   `HelloRetryConfig` takes one secret; a caller wanting the overlap retries ClientHello2 under a second
   `Connection` configured with the older secret — caller policy.
-- **DTLS 1.3 flight accumulation.** `max_flight_bytes` (`Connection.zig:1030`) caps what is buffered
+- **DTLS 1.3 flight accumulation.** `max_flight_bytes` (`Connection.zig`) caps what is buffered
   unauthenticated; exactly one message is reassembled at a time. A peer that RETRANSMITS a whole flight it
   already sent, verbatim, into the middle of an incomplete accumulation is rejected (`handleFlight`'s "KNOWN
-  LIMIT", `Connection.zig:1907`) and the caller restarts; redundant fragments of the message being reassembled
+  LIMIT", `Connection.zig`) and the caller restarts; redundant fragments of the message being reassembled
   and retransmitted copies of consumed messages are absorbed. The 1.3 engine never splits what it SENDS, so it
   needs a peer MTU that fits its largest message (`max_cert_message_body` and friends); a tiny-MTU peer cannot be
   served a large certificate chain (Backlog).
@@ -586,10 +586,10 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
   never a group-change retry — deciding a group before the cookie verifies would mean holding more state for an
   unverified peer, which is what `sendHelloRetryRequest` exists not to do.
 - **`psk_dhe_ke`.** `.psk` mode stays PSK-only, so a retry carrying a `key_share` there is
-  `error.HelloRetryRequestUnsupported` (`Connection.zig:4225`) rather than a silent upgrade to an exchange this
+  `error.HelloRetryRequestUnsupported` (`Connection.zig`) rather than a silent upgrade to an exchange this
   engine does not run.
 - **More than ONE in-progress inbound handshake message in the 1.3 engine.** A fragment of a later message
-  arriving while an earlier one is incomplete is `error.InterleavedFragments` (`Connection.zig:785`) rather than
+  arriving while an earlier one is incomplete is `error.InterleavedFragments` (`Connection.zig`) rather than
   buffered — the deliberate cap on attacker-driven memory (see `max_flight_bytes`); no conforming sender produces
   that ordering. (The 1.2 engine queues later messages, bounded.)
 
@@ -789,7 +789,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   flight and post-handshake records are ACKed). Pairs with "DTLS 1.3 send-side fragmentation". Effort: medium.
 - **CCM / CCM_8 suites.** RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8.
   Blocked on a 12-byte-nonce CCM: std 0.17.1 exports only the 13-byte presets (its generic `AesCcm` is private,
-  `aes_ccm.zig:36`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse.
+  `aes_ccm.zig`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse.
   Wanted: an **`aesccm` module (12/13-byte nonce, tag 8/16) shared by oscore + dtls**. Effort: medium. Fits §2.
 - **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for
   1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.

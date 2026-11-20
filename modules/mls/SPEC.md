@@ -115,7 +115,7 @@ input as a whole, not incrementally), so they assemble their
 `KDFLabel`/`SignContent`/`EncryptContext` into a fixed 512-byte
 `label_scratch_len` stack buffer (matching `hpke.suite.labeledExpand`'s
 own 512-byte constant) and return `error.LabelTooLong` rather than
-silently truncating or panicking on overflow. Every label/context/content of the Part 1 primitives and the KAT vectors is a handful to a few dozen bytes, so 512 is comfortable headroom. Call sites whose argument has no realistic bound (a `GroupContext` with extensions, an `encrypted_group_info` carrying a ratchet tree, a `FramedContentTBS` for a Commit) use the exact-sized variants instead: `kdfLabelLen`/`ExpandWithLabelScratch`, `encryptContextLen`/`EncryptWithLabelScratch`/`DecryptWithLabelScratch`, `signContentLen`/`SignWithLabelAlloc`/`VerifyWithLabelAlloc` (`crypto.zig:144-155`, `279-301`, `344-370`). The fixed-buffer functions stay as the convenience for bounded callers.
+silently truncating or panicking on overflow. Every label/context/content of the Part 1 primitives and the KAT vectors is a handful to a few dozen bytes, so 512 is comfortable headroom. Call sites whose argument has no realistic bound (a `GroupContext` with extensions, an `encrypted_group_info` carrying a ratchet tree, a `FramedContentTBS` for a Commit) use the exact-sized variants instead: `kdfLabelLen`/`ExpandWithLabelScratch`, `encryptContextLen`/`EncryptWithLabelScratch`/`DecryptWithLabelScratch`, `signContentLen`/`SignWithLabelAlloc`/`VerifyWithLabelAlloc` (`crypto.zig`, `279-301`, `344-370`). The fixed-buffer functions stay as the convenience for bounded callers.
 
 **`treemath.zig` returns `null`, never panics, where the RFC's own Python
 raises an exception.** RFC 9420 Appendix C's reference `left`/`right`
@@ -182,7 +182,7 @@ be sorted in increasing order, so `ParentNode.withAppendedUnmerged` inserts in
 sorted position (an Add that reuses a blank leaf to the LEFT of an existing
 unmerged leaf would break an append-only list silently, until a `resolution`
 hands a path secret to the wrong node or a tree hash diverges). On decode,
-`RatchetTree.validateUnmergedLeaves` (`tree.zig:633`, `652`) refuses an entry
+`RatchetTree.validateUnmergedLeaves` (`tree.zig`, `652`) refuses an entry
 that is not a leaf index of the tree or does not strictly increase
 (`error.Malformed`). This is a memory-safety boundary: the wire type is a bare
 `u32`, `treekem.resolution` doubles it into a node index that callers
@@ -283,7 +283,7 @@ rather than attacker-driven growth.
   `framing.zig` imports `keyschedule.zig`, so §8.2 living in `keyschedule.zig`
   would be an import cycle.
 - **§8.3 external initialization** is `keyschedule.externalInitSender`/
-  `externalInitReceiver` (`keyschedule.zig:532`), over the sibling `hpke`'s
+  `externalInitReceiver` (`keyschedule.zig`), over the sibling `hpke`'s
   `setupBaseS`/`setupBaseR`/`Context.exportSecret`. It is the only
   derivation in `keyschedule.zig` with no external MLS vector: it is pinned by
   a sender/receiver round trip plus RFC 9180's own KATs one layer down, and
@@ -296,7 +296,7 @@ rather than attacker-driven growth.
   safe is the `confirmation_tag`, not §8.3's exchange.
 - **`confirmation_tag`/`membership_tag`** are implemented here, over Part 4's
   keys, but take already-encoded bytes; `framing.membershipTag`
-  (`framing.zig:581`) assembles the `AuthenticatedContentTBM` for them.
+  (`framing.zig`) assembles the `AuthenticatedContentTBM` for them.
 
 ## Part 5 — Message framing
 
@@ -389,7 +389,7 @@ Not here, and not stubbed:
   stages `decryptSenderData`/`decryptContent`/`parsePrivateContent` are exposed
   separately rather than behind one `unprivateMessage` callback.
 - **Randomness.** §6.3.1 requires a fresh random four-byte reuse guard per
-  message; `ProtectPrivateParams.reuse_guard` (`framing.zig:709`) is a caller
+  message; `ProtectPrivateParams.reuse_guard` (`framing.zig`) is a caller
   input, as `keyschedule.PreSharedKeyId.psk_nonce` is: this module never owns a
   randomness policy.
 
@@ -601,7 +601,7 @@ outright. This is why `treekem.resolutionExcluding` exists and why
 **The exclusion applies to the ENCRYPTION step only, not to §4.1.2's filter.**
 §7.5 places it inside "this resolution", while the loop is over §4.1.2's
 filtered direct path, which is defined purely on the tree
-(`treekem.filteredDirectPath` takes no excluded set, `treekem.zig:441`). A node
+(`treekem.filteredDirectPath` takes no excluded set, `treekem.zig`). A node
 whose copath subtree holds only same-Commit additions therefore stays on the
 path and carries an `UpdatePathNode` with ZERO ciphertexts. Dropping it would
 leave it blank, put the new member's leaf into the resolution of a blank node
@@ -622,10 +622,10 @@ Recorded sessions from another implementation exposed these; each is a design co
    `FramedContentTBS` for a Commit carries a whole `UpdatePath` — all kilobytes
    in a real group, so those call sites use the exact-sized variants (see
    *Design & invariants*). Because exact sizing makes `error.LabelTooLong`
-   unreachable in `welcome.decryptGroupSecrets` (`welcome.zig:690`), its `catch`
+   unreachable in `welcome.decryptGroupSecrets` (`welcome.zig`), its `catch`
    to `error.DecryptionFailed` can only mean a genuine AEAD or decap failure.
 2. **A PSK is input keying material of any width.** `keyschedule.PreSharedKey`'s
-   `secret` is `[]const u8` (`keyschedule.zig:796`): §8.4's first step is
+   `secret` is `[]const u8` (`keyschedule.zig`): §8.4's first step is
    `psk_extracted = KDF.Extract(0, psk)`, which has no required width (the
    passive-client vectors' external PSKs are 14 bytes).
 3. **`unmerged_leaves` is kept sorted** (Part 2).
@@ -659,7 +659,7 @@ both ways into a group (Part 6's `Welcome`, Part 9's external Commit). The gaps
 are named:
 
 - **No `PrivateMessage` handshakes** — `error.PrivateHandshakeNotSupported`
-  (`group.zig:1151`, `2481`). `secrettree.zig` owns §9's ratchets, but the group
+  (`group.zig`, `2481`). `secrettree.zig` owns §9's ratchets, but the group
   object does not drive them per epoch; that has its own generation and deletion
   policy. The passive-client vectors contain only `PublicMessage`s, and
   `kat_passive_test.zig` ASSERTS that, so the boundary is not an untested claim.
@@ -670,7 +670,7 @@ are named:
   verifies the signature on every `LeafNode` it installs. It does not check
   lifetimes, credential acceptability or capability support.
 - **Commit processing is transactional.** `processCommit` and `createCommit`
-  build a WORKING COPY (`Group.fork`, `group.zig:608`) and swap it in only after
+  build a WORKING COPY (`Group.fork`, `group.zig`) and swap it in only after
   the last fallible step (`reserveAdoption`, then the infallible `adopt`), so a
   refused or failed Commit leaves the group at its old epoch, still able to take
   the same Commit. This matters because an external Commit is signed with a key
@@ -678,7 +678,7 @@ are named:
   §12.4.2's confirmation-tag bullet, and a poisoned group would be disabled for
   every member that received the message. What a Commit's tree edits write or
   free is the tree's CONTAINERS (node array, leaf lists, `unmerged_leaves`),
-  never its byte fields, so `cloneTree` (`group.zig:413`) copies exactly those
+  never its byte fields, so `cloneTree` (`group.zig`) copies exactly those
   into an arena of its own and the bytes stay aliased. Every arena the group
   owns wipes its memory on release, so a refused Commit also leaves no copy of
   the path secret it decrypted. The cheap refusals still happen before the copy
@@ -687,7 +687,7 @@ are named:
 Two §12.2 rules are explicitly application-defined by the RFC ("multiple Add
 proposals that ... represent the same client according to the application, for
 example, identical signature keys"). They are implemented on the RFC's own
-parenthetical reading and exposed as `group.Policy` (`group.zig:305`),
+parenthetical reading and exposed as `group.Policy` (`group.zig`),
 defaulting ON, because the failure they prevent — a group silently containing
 two leaves for one client — is not detectable afterwards.
 
@@ -747,9 +747,9 @@ it specifies the ORDER in which a Commit and its Welcome are produced.
 `treemath.zig` has no `common_ancestor_semantic`/`common_ancestor_direct`
 (RFC 9420 Appendix C publishes them; see *Backlog / deferred*).
 §12.4.3.1's private-key installation step uses `group.commonAncestor` (a
-direct-path intersection, `group.zig:3493`), and the send side needs something
+direct-path intersection, `group.zig`), and the send side needs something
 Appendix C does not compute: the lowest node OF THE COMMITTER'S FILTERED DIRECT
-PATH covering a leaf, `treekem.Staged.pathSecretFor` (`treekem.zig:1028`).
+PATH covering a leaf, `treekem.Staged.pathSecretFor` (`treekem.zig`).
 
 One section disagrees with itself, and a creator has to pick a side:
 
@@ -810,10 +810,10 @@ which live in the receive code:
    reading.
 2. **A joiner's path-secret chain skips blank nodes.** §7.4's chain runs along
    the committer's FILTERED direct path, so `group.derivePathSecretsUp`
-   (`group.zig:3529`, the `t.nodes[node] == null` skip) takes no
+   (`group.zig`, the `t.nodes[node] == null` skip) takes no
    `DeriveSecret(., "path")` step at a filtered-out node; on a just-merged tree
    the blank nodes are exactly the filtered-out ones. The failure mode is quiet:
-   `adoptPathSecrets` (`group.zig:3219`) validates each stored secret against the
+   `adoptPathSecrets` (`group.zig`) validates each stored secret against the
    node's public key and drops the ones that do not match, so nothing fails at
    join time and it surfaces epochs later as a Commit the member cannot decrypt.
    No recorded session reaches this shape; a purpose-built scenario (three
@@ -824,12 +824,12 @@ which live in the receive code:
    proposals BEFORE the `UpdatePath` is decrypted, so by then the updating
    member's leaf already carries the Update's NEW `encryption_key` and the
    committer sealed a ciphertext to exactly that key. `Group` retains
-   `pending_updates` (public key to private key, epoch-scoped, `group.zig:510`)
+   `pending_updates` (public key to private key, epoch-scoped, `group.zig`)
    and swaps the key in as the Update is applied, whoever committed it. The only
    legal shape is proposer != committer (§12.2 forbids an Update generated by
    the committer).
 4. **`parentHash` walks §7.9.1's "next non-blank parent node" as written**
-   (`nextNonBlankAncestor`, `treekem.zig:389`) rather than via §4.1.2's filter.
+   (`nextNonBlankAncestor`, `treekem.zig`) rather than via §4.1.2's filter.
    §7.9.1 gives both descriptions as one thing, and at every call site they are
    one thing (`parentHash` is called on a leaf whose direct path was just
    merged). No test distinguishes the two; it is kept because it is what the
@@ -872,7 +872,7 @@ X25519 HPKE key of small order — a leaf's `encryption_key`, a KeyPackage's
 node's key `error.InvalidUpdatePath`). RFC 9420 does not name it, but such a
 key is unusable rather than a policy choice: every HPKE encapsulation to it
 fails (RFC 9180 §7.1.4), so admitting one only defers the failure to every
-later Commit that must encrypt to it. For the NIST-curve suites (0x0002/0x0005/0x0007) the same admission points refuse a key that `hpke`'s `validatePublicKey` refuses (not an uncompressed SEC1 point, non-canonical, off the curve), with the same `error.LeafNodeInvalid` (`isUnusableHpkeKey`, `group.zig:3453`). The test for the X25519 case is std's own: X25519 with a fixed clamped scalar returns `error.IdentityElement` exactly for the small-order points. All of these run in BOTH directions,
+later Commit that must encrypt to it. For the NIST-curve suites (0x0002/0x0005/0x0007) the same admission points refuse a key that `hpke`'s `validatePublicKey` refuses (not an uncompressed SEC1 point, non-canonical, off the curve), with the same `error.LeafNodeInvalid` (`isUnusableHpkeKey`, `group.zig`). The test for the X25519 case is std's own: X25519 with a fixed clamped scalar returns `error.IdentityElement` exactly for the small-order points. All of these run in BOTH directions,
 and all three `passive-client-*.json` sessions replay green with them on —
 which is itself a small piece of evidence that the reading is the same one
 the reference implementation uses.
@@ -1239,7 +1239,7 @@ embedded files are re-filtered from the same upstream commit to suites
   `io`-backed path to confirm the non-deterministic entry point itself
   works, not just the deterministic-input decrypt half.
 - **Retained memory of a long-lived `Group`.** Every adopted Commit keeps its
-  own arena (`epoch_arenas`, `group.zig:444`) until `deinit`, because the tree
+  own arena (`epoch_arenas`, `group.zig`) until `deinit`, because the tree
   aliases those bytes (`tree.zig`'s stated convention). Measured on a receiver in
   an eight-member group taking Update-only Commits: about 5.2 KB per epoch (21.7
   KB at epoch 1, 335 KB at epoch 61); each small arena's unused tail is the
@@ -1355,7 +1355,7 @@ requires every anchored field to differ while the path length stays the same
   `processCommit`, `updateLeaf`/`createProposal`, `joinByExternalCommit`; shapes
   including an empty full Commit, an Add with `external_pub` and extra GroupInfo
   extensions, an external PSK, a by-reference Update, a path omitted, an external
-  join with a PSK; `group.zig:7353`): every failure point leaves the group
+  join with a PSK; `group.zig`): every failure point leaves the group
   unchanged and able to take the same Commit, and no allocation leaks. A
   test-only hook seats a key admission would refuse so an HPKE failure midway
   through the Welcome slots and the UpdatePath ciphertexts is covered.
@@ -1393,11 +1393,11 @@ public entry point that handles secrets for residue on the dead stack
 **Known gaps in the evidence** (see *Open*): the resync case where the RECEIVER
 is the removed member; the secret tree's non-power-of-two shape against a
 vector; deleting the `rejectExternalCommitFraming` call from `processCommit`
-(`group.zig:1184`) turns no test red, because no decode path can produce a
+(`group.zig`) turns no test red, because no decode path can produce a
 `PublicMessage` with a `new_member_commit` sender and a non-null
 `membership_tag`: the call site is defensive against a future path (a
 `PrivateMessage` unprotect, a caller-built struct), its doc comment says so, and
-the function itself is tested directly (`group.zig:5364`); and `parentHash`'s
+the function itself is tested directly (`group.zig`); and `parentHash`'s
 §7.9.1 wording (Part 8), which no test distinguishes.
 
 ## Performance
@@ -1411,7 +1411,7 @@ AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
 - **A transport or Delivery Service.** Framing returns BYTES to send and takes
   bytes received; MLS does not specify a transport (§2's Delivery Service is an
   architectural role, not a protocol), so owning one would be an invention
-  (`meta.role = .util`, `src/root.zig:387`).
+  (`meta.role = .util`, `src/root.zig`).
 - **Suite negotiation inside a group.** The suite is a compile-time parameter
   (`comptime S`); a `Welcome`/`GroupInfo` of another suite is
   `error.CipherSuiteMismatch`, an Add naming another suite or version
@@ -1513,8 +1513,8 @@ Gaps that are unverified rather than unbuilt:
   is owning leaf bytes rather than aliasing them, which would let an epoch's
   arena go once nothing in the tree points into it.
 - **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret` takes one
-  as a parameter, but `schedule.suiteIdOf` (`hpke/src/schedule.zig:534`) is
-  private, so `keyschedule.hpkeSuiteId` (`keyschedule.zig:478`) restates the
+  as a parameter, but `schedule.suiteIdOf` (`hpke/src/schedule.zig`) is
+  private, so `keyschedule.hpkeSuiteId` (`keyschedule.zig`) restates the
   `Aead` to `aead_id` mapping (`@compileError` for an unregistered AEAD).
   `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so only that one mapping is
   duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have

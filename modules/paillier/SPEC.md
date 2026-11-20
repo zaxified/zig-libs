@@ -101,14 +101,14 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   Montgomery ladder sized to the key's actual width — `λ` is secret-key material, `k` may be a
   secret scalar. When the key carries its factors (`SecretKey.crt`, the `fromPrimes`/`generate`
   case), `decrypt` additionally splits into the Paillier-CRT path: two half-width constant-time
-  montint modexps (`c^dp mod p²`, `c^dq mod q²`) Garner-recombined (`decryptCrtX`, `root.zig:1227`).
+  montint modexps (`c^dp mod p²`, `c^dq mod q²`) Garner-recombined (`decryptCrtX`, `root.zig`).
   `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take `g^m` through montint as well.
   Everything is constant-time in the secret exponent/scalar's *value*. `mulPlaintext` has no `k = 0`
   short-circuit: montint's ladder yields `c^0 = 1` itself, so `k = 0` still returns the encryption of 0
   with no branch on `k`.
 - **CRT decrypt has no variable-time arithmetic of its own.** The Garner recombination, the `reduce` of
   `c` into the mod-p²/q² domains and the `mul`/`sub`/`add` run on `montint.DynModint`, values crossing
-  from the `ff` carrier by a positional limb repack (`feToElem`/`elemToFe`, `root.zig:184`, `:191`):
+  from the `ff` carrier by a positional limb repack (`feToElem`/`elemToFe`, `root.zig`, `:191`):
   `ff` field arithmetic branches in ReleaseFast (`reduce`'s `shiftIn`/compare, `montgomeryMul`'s
   extra-reduction bit). The ctgrind rows for `decrypt` (`crt`, `noncrt`) therefore hold only
   `decrypt`'s own rejection verdicts (`x = 0`, `x − 1` not a multiple of `n`, and for `noncrt` the
@@ -170,7 +170,7 @@ computation) and `rust-paillier`'s `Rerandomize` trait; it equals
 fail and checks nothing about `c` (as `addCiphertexts`). Constant-time policy as
 `encrypt`: `r` is the secret, it is the base of `powPublic` (public exponent `n`, montint
 multiply); `r` and all intermediates are wiped and the dead stack burnt
-(`rerandomize_stack_burn`, `root.zig:68`; the stack probe reads zero residue in ReleaseFast). The ctgrind
+(`rerandomize_stack_burn`, `root.zig`; the stack probe reads zero residue in ReleaseFast). The ctgrind
 rows are unchanged by it.
 
 ## Threat model / out of scope
@@ -197,10 +197,10 @@ rows are unchanged by it.
   reject random composites but accept some base-2 strong-pseudoprime pairings, and such a key would
   silently decrypt some plaintexts wrong (`2047 × 17`). So each factor must be prime — exact trial
   division up to 32 bits, above that the prime-search sieve plus 64-round Miller-Rabin
-  with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor (`factorIsPrime`, `root.zig:922`;
+  with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor (`factorIsPrime`, `root.zig`;
   deterministic, no `random` parameter; a composite built to pass still faces 4⁻⁶⁴ per attempt) —
   and `|p − q| > 2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) whenever `nlen/2 > 100`, the closeness rule
-  `generate` enforces with `topBitsMatch` (`factorsTooClose`, `root.zig:955`). Both refusals are
+  `generate` enforces with `topBitsMatch` (`factorsTooClose`, `root.zig`). Both refusals are
   `error.InvalidPrimes`; an oversized product is `Overflow`, checked first. `generate` skips the repeat
   (its factors already passed both). Deterministic construction remains for KATs/round-tripping stored keys.
 - **`fromPrimes` also requires `gcd(n, φ(n)) = 1`** (equivalently `gcd(λ, n) = 1`), a

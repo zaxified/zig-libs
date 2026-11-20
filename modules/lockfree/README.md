@@ -14,7 +14,7 @@ use-after-free/ABA-notorious kernel of any lock-free data structure.
 **Memory ordering.** The irreducible concurrency-correctness core — EBR's
 `enterCritical`/`exitCritical`/`retire`/`tryAdvance` and the queue's
 `enqueue`/`dequeue` CAS loops — sits behind `gate.fable_core_implemented`
-(`true`, `src/gate.zig:32`), each function carrying its memory-ordering argument
+(`true`, `src/gate.zig`), each function carrying its memory-ordering argument
 in place (the grace-period safety theorem lives at `ebr.Domain.tryAdvance`). The
 whole kernel uses a **`seq_cst` discipline**: Zig 0.16 removed `@fence`, so every
 reclamation-relevant atomic access (pin store, epoch loads/CAS, the scan loads,

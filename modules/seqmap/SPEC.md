@@ -71,11 +71,11 @@ No fuzz harness (the card's `**Hardening:**` line says why), no oracle: class C,
 ## What is deliberately not done
 
 - **No expiry or timer.** The map has no notion of time; `sent_ns` is carried for the caller's RTT arithmetic and is
-  never read (`src/root.zig:69-72`). Slots are freed by the caller on reply, timeout or send error.
-- **No search for a free slot.** `add` tries only the id under the cursor and does not scan (`src/root.zig:118-134`):
+  never read (`src/root.zig`). Slots are freed by the caller on reply, timeout or send error.
+- **No search for a free slot.** `add` tries only the id under the cursor and does not scan (`src/root.zig`):
   that keeps it O(1) when the table is nearly full.
 - **No anti-spoofing token and no unguessable ids.** Ids are sequential and predictable by design
-  (`src/root.zig:19-28`); a caller that must resist forged replies adds its own token.
+  (`src/root.zig`); a caller that must resist forged replies adds its own token.
 
 ## Backlog / deferred
 

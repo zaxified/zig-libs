@@ -50,7 +50,7 @@ documents. Documented FastAPI-shape compromises: path parameters are always `req
 `schema: {type: "string"}` unless `RouteExtra.path_parameters` declares a schema or description for the name; a `*wildcard` segment becomes a plain `{param}` (OpenAPI has no
 cross-segment template, matching FastAPI's own `:path` compromise); undocumented routes get a
 minimal 200-only operation; implicit HEAD→GET auto-route and 404/405 fallbacks are not emitted (they
-are dispatch behavior, not operations); CONNECT and extension-method (`.other`) routes are not emitted either (an OpenAPI 3.1 Path Item has no field for them, root.zig:630-632). `RouteDoc.request_schema` (JSON Schema as text) is parsed
+are dispatch behavior, not operations); CONNECT and extension-method (`.other`) routes are not emitted either (an OpenAPI 3.1 Path Item has no field for them, root.zig). `RouteDoc.request_schema` (JSON Schema as text) is parsed
 and re-emitted normalized/minified; malformed text is a typed `error.InvalidRequestSchema`, never a
 panic or silent drop. `RouteDoc.query_schema` (an object schema as text, or `allOf` of them) becomes one
 `in: query` parameter per property after the path parameters, required when any part requires it,
@@ -59,18 +59,18 @@ way is `error.InvalidQuerySchema`.
 
 **`operationId`:** always emitted, deterministically — lowercase method + `_` + the converted path's segments
 joined by `_`, a templated segment's `{`/`}` stripped (`GET /users/{id}` → `get_users_id`; `operationIdBase`,
-root.zig:1252). `RouteExtra.operation_id` replaces it for one route (root.zig:315). The base is NOT injective
+root.zig). `RouteExtra.operation_id` replaces it for one route (root.zig). The base is NOT injective
 (`/a/b` and `/a_b`, `/users` and `/users/`, `/u/:id` and `/u/id` share one), so an operation whose id an operation EARLIER in the
 document (paths in first-registration order, methods in `http.Method` order) already holds gets the
 base plus the smallest `_<n>`, n ≥ 2, that is neither another route's base nor already picked
-(`operationIds`, root.zig:1272); a route whose base collides with nothing keeps it, so existing documents'
+(`operationIds`, root.zig); a route whose base collides with nothing keeps it, so existing documents'
 ids do not move. `validateOpenApi31` refuses two operations (paths and webhooks together) with one id —
 `error.DuplicateOperationId` — so the self-check holds the property, not the construction.
 
 **UTF-8:** every `[]const u8` this module is about to hand to
 `std.json.Stringify` — `Info` fields, every `RouteDoc` string field, and each route's raw pattern
 (which also covers the converted path: `convertPattern` only rewrites `:`/`*`/`{`/`}`, all ASCII) —
-is checked with `std.unicode.utf8ValidateSlice` BEFORE any output is written (`checkUtf8`, root.zig:999), atomically failing
+is checked with `std.unicode.utf8ValidateSlice` BEFORE any output is written (`checkUtf8`, root.zig), atomically failing
 the whole build with `error.InvalidUtf8` rather than emitting a partial document. JSON text MUST be
 valid UTF-8 (RFC 8259 §8.1); `std.json.Stringify.write([]const u8)` does not enforce that itself —
 a non-UTF-8 slice silently becomes a JSON array of byte values instead of a string, and a raw
@@ -90,7 +90,7 @@ constraint (`/x/{id:[0-9]+}` and `/x/{id:[a-z]+}`, both `/x/{id}`): OpenAPI has 
 honest outcome is the error; the `Endpoint` then answers 500 until one route is excluded with `Info.include`.
 
 **Self-check:** `Generator.build` parses its own generated JSON back and runs `validateOpenApi31` (below) on it
-before returning (root.zig:414-430), so a defect in the generator itself is a `BuildError` (`SelfCheckMalformed`, or the
+before returning (root.zig), so a defect in the generator itself is a `BuildError` (`SelfCheckMalformed`, or the
 checker's error), never a served document. Costs one extra parse of the whole document, paid once per
 `Endpoint`'s lifetime (the outcome is cached after the first call). `Generator.write` builds the document in memory first,
 so the caller's writer receives either the whole validated document or nothing.
@@ -101,7 +101,7 @@ written and cannot trigger `error.InvalidUtf8`/`error.PathCollision` against one
 
 **Concurrency:** `Generator.build`/`Generator.write` are reentrant — pure
 functions of an immutable (post-`build`) `Router` — but `Endpoint` is `.threadsafe`, not
-`.reentrant`: it publishes the built document once under a lock (`Endpoint.spec`, root.zig:1600) and serves the same
+`.reentrant`: it publishes the built document once under a lock (`Endpoint.spec`, root.zig) and serves the same
 cached bytes for its whole lifetime; a route registered after the first request is invisible to
 it. The build itself runs OUTSIDE the lock, so concurrent first callers may each build once (bounded by the number of
 threads; the losers free their copy). A build that fails with a property of the route table (a bad `request_schema`)
@@ -113,12 +113,12 @@ registration (`add`/`addDoc`/`group`) has FULLY completed before the Router is h
 request thread happens to trigger the build, so a route registered concurrently with (not just
 chronologically before) that read races `Router`'s own backing slice. The fix is the same "building is
 single-owner" phase discipline `router/SPEC.md` §Concurrency already requires, not new synchronization. Responses carry a strong `ETag` (a fixed-seed Wyhash fingerprint of the cached
-document, `etagOf`, root.zig:1655); a matching `If-None-Match` gets `304` (`http.conditional`). `Endpoint` answers every
+document, `etagOf`, root.zig); a matching `If-None-Match` gets `304` (`http.conditional`). `Endpoint` answers every
 method other than GET/HEAD on its path (and on `docs_path`) with 405 + `Allow: GET, HEAD`, a CORS preflight `OPTIONS`
 included — register a CORS middleware before it if browsers on other origins fetch the spec. No external assets: Swagger-UI needs
 CDN JS/CSS (a CSP/provenance problem) so it is deliberately not served; the optional `docs_path` instead serves a tiny
 self-contained HTML viewer (inline CSS + vanilla JS, zero external requests; `Endpoint.path` is spliced into the script
-as an escaped string literal with `<` as `\u003c`, `writeScriptString`, root.zig:1775). Because the script and style are inline, a strict
+as an escaped string literal with `<` as `\u003c`, `writeScriptString`, root.zig). Because the script and style are inline, a strict
 `Content-Security-Policy` without `'unsafe-inline'` blocks the page: serve it under a policy that allows them, or not at all.
 Clean-room; design references only (behavior, no source
 copied — see NOTICE): FastAPI (document shape) and utoipa (route-metadata→spec mapping); format per
@@ -126,12 +126,12 @@ the OpenAPI Specification 3.1.0.
 
 ## Design notes by feature
 
-- **`components/schemas` and `$ref`.** `Info.schemas` (a named-schema registry, root.zig:186) is emitted once under `components.schemas`; `schemaRef(name)` (root.zig:193) builds the `$ref` text a route's schema fields carry (`request_schema`, `Response.schema`, `query_schema`). The same name with a different normalized body is `error.SchemaConflict` (identical repeats fold, a whitespace-different repeat included); an invalid entry is `error.InvalidComponentSchema`. `validateOpenApi31` resolves every local `$ref` as a JSON Pointer (`error.DanglingRef`; `%XX` decoded with exactly two hex digits per RFC 3986, a sign or a lone `%` stands for itself, `~0`/`~1` per RFC 6901; a `$ref` inside a subtree that has its own `$id` is not checked against the document (it points into that resource), and references to other documents are not followed). The registry lives in `Info`, not `RouteDoc` (that type belongs to `router`).
+- **`components/schemas` and `$ref`.** `Info.schemas` (a named-schema registry, root.zig) is emitted once under `components.schemas`; `schemaRef(name)` (root.zig) builds the `$ref` text a route's schema fields carry (`request_schema`, `Response.schema`, `query_schema`). The same name with a different normalized body is `error.SchemaConflict` (identical repeats fold, a whitespace-different repeat included); an invalid entry is `error.InvalidComponentSchema`. `validateOpenApi31` resolves every local `$ref` as a JSON Pointer (`error.DanglingRef`; `%XX` decoded with exactly two hex digits per RFC 3986, a sign or a lone `%` stands for itself, `~0`/`~1` per RFC 6901; a `$ref` inside a subtree that has its own `$id` is not checked against the document (it points into that resource), and references to other documents are not followed). The registry lives in `Info`, not `RouteDoc` (that type belongs to `router`).
 - **`servers`, security, extras.** `Info.servers`; `Info.security_schemes` (apiKey header/query/cookie, http basic, http bearer with format, OAuth2 implicit/password/clientCredentials/authorizationCode, openIdConnect) alongside `bearer_auth`; `Info.security` (document-wide; each entry is one alternative, so requirements are OR-combined) and per-operation `RouteExtra.security` (`&.{}` = public). `Info.route_extras` (matched to a route by method + raw pattern, first entry for a route wins) carries header/cookie parameters, `request_example` and `response_examples` (an `example` on the media type). An entry matching no registered route, or an example for an undocumented status, is `error.UnknownRouteExtra`; an entry for a route excluded by `Info.include` is not an error and is not emitted. The checker adds `UnknownSecurityScheme`, `InvalidSecurityScheme`, `InvalidServer`, `InvalidComponentName`. All of it is off by default, and then the output is byte-identical to the plain document.
 - **`info` and tags.** `Info.contact`, `Info.license` and top-level `Info.tags` (description and `externalDocs` per tag; names unique, `error.InvalidTags`; a tag used by a route need not be listed). The checker refuses a license without `name` or with both `identifier` and `url` (`InvalidLicense`).
 - **Other request media types and typed path parameters.** `RouteExtra.request_bodies` (`RequestBody{media_type, schema, example}`, emitted after the derived `application/json` body; the same media type twice, compared case-insensitively and including the derived body, is `error.DuplicateRequestBody`; an empty one is `error.InvalidMediaType`) and `request_body_required`. `RouteExtra.path_parameters` (`PathParameter{name, description, schema, deprecated}`), declared on the openapi side so `router` stays spec-agnostic; a name that is no capture of the pattern is `error.UnknownPathParameter`, and the checker refuses an `in: path` parameter missing from the template (`UndeclaredPathParameter`) and a template variable without one (`UnresolvedPathParameter`).
-- **`query_schema` shapes.** An object schema whose `properties` name the parameters, or `allOf` of such schemas (what `validate.writeJsonSchemaFor` writes when a type declares `validate_rules`), the schema's own `properties`/`required` counting beside its `allOf` parts. Parameters come in order of first appearance; one named by several parts gets `allOf` of its schemas and is required when any part requires it; `anyOf`/`oneOf`/`not`/`if` parts are skipped as conditional, a `$ref` part and a `required` name no part describes are `error.InvalidQuerySchema` (root.zig:1447).
-- **JSON text depth.** JSON text taken from the caller (`request_schema`, response and parameter schemas, components, examples) may nest at most 128 deep (`max_json_depth`, root.zig:725; deeper is `Invalid*Schema` / `InvalidExample`, because `std.json`'s writer asserts a depth of 256 in safe builds and overflows the stack in fast ones); `validateRefs` and the depth check are iterative (root.zig:2057), so a document nested ~10^5 deep is a verdict, not a stack overflow.
+- **`query_schema` shapes.** An object schema whose `properties` name the parameters, or `allOf` of such schemas (what `validate.writeJsonSchemaFor` writes when a type declares `validate_rules`), the schema's own `properties`/`required` counting beside its `allOf` parts. Parameters come in order of first appearance; one named by several parts gets `allOf` of its schemas and is required when any part requires it; `anyOf`/`oneOf`/`not`/`if` parts are skipped as conditional, a `$ref` part and a `required` name no part describes are `error.InvalidQuerySchema` (root.zig).
+- **JSON text depth.** JSON text taken from the caller (`request_schema`, response and parameter schemas, components, examples) may nest at most 128 deep (`max_json_depth`, root.zig; deeper is `Invalid*Schema` / `InvalidExample`, because `std.json`'s writer asserts a depth of 256 in safe builds and overflows the stack in fast ones); `validateRefs` and the depth check are iterative (root.zig), so a document nested ~10^5 deep is a verdict, not a stack overflow.
 
 ## Threat model / out of scope
 Not a security boundary: the generated document exposes exactly the route/method/doc metadata

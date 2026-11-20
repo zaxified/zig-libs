@@ -151,12 +151,12 @@ whole walk in wall time: once spent every further probe counts as unanswered wit
 `max_silent_hops` and `HopsResult.timed_out` is set. The walk allocates nothing.
 
 **Route PMTU is not consulted.** `probe` and `probeHops` set `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` on their own
-socket (`noRoutePmtu`, `src/root.zig:1135-1136`; a failure is harmless, the stricter mode stays), so a Fragmentation
+socket (`noRoutePmtu`, `src/root.zig`; a failure is harmless, the stricter mode stays), so a Fragmentation
 Needed forged against a live socket of the host — which lowers the kernel's cached PMTU for the destination for about
 ten minutes — cannot turn into a local `EMSGSIZE` that narrows the search with no router answering. `query` still reads
 the cached value: that is its job. `Result.cache_is_exception` compares `query`'s reading with the interface MTU; the
 comparison caps the interface MTU at 65535 for IPv4 only (`IP_MTU` cannot read more, `lo` is 65536), the IPv6 link MTU is
-a 32-bit quantity read as it is (`cacheIsException`, `src/root.zig:364`).
+a 32-bit quantity read as it is (`cacheIsException`, `src/root.zig`).
 
 ## Threat model / out of scope
 
@@ -459,7 +459,7 @@ the host changes).
 
 - **Next-hop MTU on the ping-socket (DGRAM) lane:** `icmp.Socket.ErrInfo` now carries `ee_info` (`sock_extended_err.ee_info`,
   the MTU a Fragmentation Needed reports), but `probe` and `probeHops` read only the error-queue entry's type, code and
-  offender (`src/root.zig:774`), so they bisect without a hint: results are exact but cost about 11 probes per narrowing. Plan:
+  offender (`src/root.zig`), so they bisect without a hint: results are exact but cost about 11 probes per narrowing. Plan:
   read `ee_info` where the entry arrives and feed it as the hint.
 - **A wall-clock bound for `probe`:** add one (as `probeHops` has `Options.deadline_ms`) only if a consumer forwards the
   `timeout_ms` and `retries` values that make the worst case long.

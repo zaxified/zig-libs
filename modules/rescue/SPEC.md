@@ -246,7 +246,7 @@ The card's `**Performance:**` line is the authority for figures; `README.md`
 **The S-box layer shape is load-bearing, not cosmetic.** Written the obvious
 way — `for (state) |*s| s.* = sboxInv(s.*)` — the 72-multiply body is far past
 LLVM's unroll threshold, so the `m` chains run strictly one after another and
-the layer costs `m` × 72 *latencies* (`sboxInvLayer`, `src/goldilocks.zig:202`).
+the layer costs `m` × 72 *latencies* (`sboxInvLayer`, `src/goldilocks.zig`).
 Advancing all `m` lanes one chain step at a time is the same instruction count
 with `m`-way ILP. The field's carry handling uses explicit comparison masks, not
 `@addWithOverflow` tuples (which LLVM spilled to the stack). Every RPO
@@ -316,7 +316,7 @@ Test classes:
   separation, merge, empty-input behaviour of both sponges, digest lengths.
 - **Field and permutation** (`src/goldilocks.zig`, `src/perm.zig`): differential
   against a `u128 % p` oracle, MDS invertibility, `permuteInverse` round trip.
-- `meta.deps` is empty (`src/root.zig:148`).
+- `meta.deps` is empty (`src/root.zig`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it. There is no
   mutation run recorded yet; the only mutation evidence is a manual five-mutation

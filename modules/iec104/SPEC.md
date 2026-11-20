@@ -101,41 +101,41 @@ depends on Zig's bitfield-packing rules.
 
 - **Parameter and protection-equipment types.** `P_ME_NA_1`/`P_ME_NB_1` carry a 3-octet `parameter` element (value as
   raw octets + QPM), `P_ME_NC_1` an R32 short float + QPM = 5 octets (`parameter_float`, `.{ .value = f32, .qpm = u8 }`,
-  IEC 60870-5-101 §7.3.5.3), `P_AC_NA_1` the 1-octet QPA (`asdu.zig:333-337,376,447-449,489`). The
+  IEC 60870-5-101 §7.3.5.3), `P_AC_NA_1` the 1-octet QPA (`asdu.zig`). The
   protection-equipment events (17–19, 38–40, `M_EP_TA_1` … `M_EP_TF_1`) are one object = a base element with its
   CP16Time2a, then the CP24 or CP56 tag: 17/38 `SEP`(1) + elapsed(2) (`protection_event`), 18/39 `SPE`(1) + `QDP`(1) +
   relay duration(2) (`protection_start`), 19/40 `OCI`(1) + `QDP`(1) + relay operating time(2) (`protection_output`), i.e.
-  6/7/7 octets with CP24 and 10/11/11 with CP56 (`asdu.zig:339-344,376-379,416-421`). Bit layouts (`info.zig:294-392`):
+  6/7/7 octets with CP24 and 10/11/11 with CP56 (`asdu.zig`). Bit layouts (`info.zig`):
   SEP ES bits 0-1 (coded like a double point), EI bit 3, BL/SB/NT/IV bits 4-7; SPE GS/SL1/SL2/SL3/SIE/SRD bits 0-5; OCI
   GC/CL1/CL2/CL3 bits 0-3; QDP EI bit 3, BL/SB/NT/IV bits 4-7. Reserved bits are masked on decode and written as zero.
   The layouts were cross-checked against lib60870-C's headers (read for layout facts only, GPL, no code taken). The type/
-  cause table allows the protection events with cause 3 (spontaneous) only (`TypeId.isSpontaneousOnly`, `asdu.zig:180`),
-  so `emitPoint` drops any interrogated cause (20..41) for them (`outstation.zig:398-404`) while `reportSpontaneous`
-  still sends them (`outstation.zig:213`). The table was read from a vendor interoperability list that reproduces it, not
+  cause table allows the protection events with cause 3 (spontaneous) only (`TypeId.isSpontaneousOnly`, `asdu.zig`),
+  so `emitPoint` drops any interrogated cause (20..41) for them (`outstation.zig`) while `reportSpontaneous`
+  still sends them (`outstation.zig`). The table was read from a vendor interoperability list that reproduces it, not
   from the standard text; lib60870-C's slave was not checked. The outstation never generates these events on its own.
 - **Global (broadcast) common address (§7.2.4).** The outstation answers a request on the global address only for the four
   type ids the standard defines it for — station and counter interrogation, clock synchronisation, reset process
-  (`broadcastable`, `outstation.zig:107`); anything else addressed to it, a control-direction command above all, is
-  dropped silently (`outstation.zig:169`), before the unknown-type-id branch, so an unmodelled type id on the global
+  (`broadcastable`, `outstation.zig`); anything else addressed to it, a control-direction command above all, is
+  dropped silently (`outstation.zig`), before the unknown-type-id branch, so an unmodelled type id on the global
   address is dropped too instead of being answered with cause 44. Every reply to a global request carries the station's
-  **own** address, in confirmation, data and termination alike (`replyCa`, `outstation.zig:394`; with two stations behind
+  **own** address, in confirmation, data and termination alike (`replyCa`, `outstation.zig`; with two stations behind
   one server, each answers once under its own address); a request to a common address the station does not serve gets
   that address echoed back with cause 46. A station configured with the all-ones address itself is refused at `init`
-  (`outstation.zig:132`), because it would switch the broadcast guard off. This matches a captured real RTU for global
+  (`outstation.zig`), because it would switch the broadcast guard off. This matches a captured real RTU for global
   interrogation, counter interrogation and clock synchronisation.
 - **Behaviour where the module differs from a real RTU on purpose.** After a select-before-operate execute the outstation's
-  `ACTIVATION TERMINATION` echoes the execute element (`outstation.zig:363-368`; the third-party RTU echoed the select
+  `ACTIVATION TERMINATION` echoes the execute element (`outstation.zig`; the third-party RTU echoed the select
   element); an unknown type id is answered with cause 44 negative (§7.2.3; the third-party RTU dropped it); a broadcast test
   command (type 107) is not answered (the third-party RTU answers it and echoes 0xFFFF). The state machine arms t1 on **any**
-  U-format *act*, `STARTDT` included (`armAct`, `state.zig:309-312`); `lib60870-C` does not arm t1 on an outstanding `STARTDT act`
+  U-format *act*, `STARTDT` included (`armAct`, `state.zig`); `lib60870-C` does not arm t1 on an outstanding `STARTDT act`
   (left unconfirmed it waits t3, sends `TESTFR act` and dies t1 after that), so this module hangs up earlier in that scenario.
   Both fit §5.5's "time-out of send or test APDUs"; ours is the stricter reading, one-way, and changes no frame on the wire.
 - **`transport`.** A buffered `Stream.Reader` can hold a whole APDU that a later `poll(2)` on the raw fd will never report
   as readable, because the bytes are in the reader's buffer, not in the socket; a read that always polled first would stall on
-  coalesced frames. `TcpTransport.readFn` checks `r.bufferedLen() == 0` before `waitReadable()` (`transport.zig:217`, and the
-  deadline variant at `transport.zig:154`). A paired `Stream.Reader`/`Stream.Writer` on one socket otherwise delivers every
+  coalesced frames. `TcpTransport.readFn` checks `r.bufferedLen() == 0` before `waitReadable()` (`transport.zig`, and the
+  deadline variant at `transport.zig`). A paired `Stream.Reader`/`Stream.Writer` on one socket otherwise delivers every
   write (probed on 0.16 over a loopback pair with `std.Io.Threaded`); the regression test `"TcpTransport delivers
-  write->read->write over a real socket (no env gate)"` (`transport.zig:388`) pins both properties and fails when the guard
+  write->read->write over a real socket (no env gate)"` (`transport.zig`) pins both properties and fails when the guard
   is removed.
 
 Concurrency: `.single_owner` — one `Client`/`Server` owns one connection's framer, counters and
@@ -292,9 +292,9 @@ What a full IEC 60870-5-104 implementation has and this one does not (planned it
   express them; they decode as `error.UnsupportedTypeId`.
 - **Parameter loading** (110–113) is recognised with the right element width, but the QPM/QPA qualifier semantics are passed
   through as raw octets rather than typed, and the outstation has no parameter store: a request of those types is answered
-  like any type the outstation does not handle, with cause 44 and the negative bit (`outstation.zig:200-207`).
+  like any type the outstation does not handle, with cause 44 and the negative bit (`outstation.zig`).
 - **`C_CD_NA_1` (delay acquisition)** is modelled by the codec, but the outstation has no handler for it (the generic
-  command path covers type ids 45–69 only, `asdu.zig:188-191`), so it is answered with cause 44; the background-scan cause (2)
+  command path covers type ids 45–69 only, `asdu.zig`), so it is answered with cause 44; the background-scan cause (2)
   is a name only, never generated by the outstation.
 - **Redundancy groups** (§5.2 / the redundancy annex): each `Client`/`Server` is one connection; the group-level arbitration
   (exactly one connection of several in the `started` state) is not implemented.
