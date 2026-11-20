@@ -13,9 +13,10 @@ storage side effect and proves recovery each time.
   simulation instead of a giant test corpus).
 - **Platform:** any — all I/O goes through `std.Io` behind the `Storage`
   seam (directory-fsync durability verified on Linux). **Role:** both.
-- **Concurrency:** `threadsafe` — one coarse spinlock over every operation
-  (see the honest caveats below).
-- **Deps:** none (std only).
+- **Concurrency:** `threadsafe` — writers serialized, readers shared (see
+  Concurrency below).
+- **Deps:** `clock` (the `Options.clock` / `sync_clock` time sources); otherwise
+  std only, I/O through `Storage` / `std.Io`.
 
 Provenance: clean-room. Design references only — Bitcask (Basho, Apache-2.0;
 the published log-structured model: append-only CRC'd record file + in-memory
@@ -166,6 +167,11 @@ one compaction (atomic rewrite, never an in-place header edit). An older build
 of this module refuses a version-2 file with `error.UnsupportedVersion` rather
 than taking op 2 for a torn record and truncating the log there.
 
+Every merge output also gets `<path>.<id>.hint` (magic `ZKVH`): per record its op, lengths,
+offset, expiry and key, then the data length it describes and a CRC-32. `open` uses a hint
+only if it is whole and consistent and replays the data file otherwise, so a hint is never
+needed for correctness.
+
 CRC-32 (IEEE) covers everything after the crc field. `open` replays the log
 to rebuild the keydir; replay stops at the first torn/corrupt record and
 **truncates** the file back to the last good one.
@@ -185,8 +191,10 @@ to rebuild the keydir; replay stops at the first torn/corrupt record and
   length/CRC on `open` and discarded; committed records survive.
 - Corruption policy: replay truncates at the *first* bad record — for
   mid-file media rot this also discards later records. v0 trades that rare
-  case for a provable invariant: everything reachable after `open` is
-  CRC-valid.
+  case for a simple invariant: every record `open` replays is CRC-valid (a bad
+  record in a sealed file is `error.Corrupt`, never cut). The one exception is a
+  hinted merge output, whose records are not re-read at `open`: `read_verify`
+  catches a rotten value at `get` instead.
 - After any storage-write error the store **poisons** itself (fail-stop —
   the fsyncgate lesson: a failed fsync leaves the page cache undefined).
   Mutations are refused; reads still serve the last consistent state;
@@ -197,9 +205,10 @@ to rebuild the keydir; replay stops at the first torn/corrupt record and
 
 ## Concurrency
 
-Internally synchronized with two locks. Writers (`put`, `delete`, `compact`,
-`sync`) are serialized by one mutex held for their whole duration, fsync
-included. Readers (`get`, `getBuf`, `exists`, `count`, `keys`, …) take a
+Internally synchronized with three locks. `merge` and `compact` are serialized by
+a merge lock; a merge copies under it alone, so writers and readers go on.
+Writers (`put`, `delete`, `compact`, `sync`) are serialized by one mutex held for
+their whole duration, fsync included. Readers (`get`, `getBuf`, `exists`, `count`, `keys`, …) take a
 read-write lock **shared**; a writer takes it exclusive only for its in-memory
 keydir update, never across a write or an fsync. So any number of readers run
 in parallel, a reader is never held up by a writer's disk flush, and it never
@@ -314,14 +323,15 @@ extras sit on top of it:
   (`generateTrace` captures a seed as a concrete, replayable `RecordedTrace`;
   `replayTrace` re-runs any subset deterministically without a live `Prng`).
 
-## Noted phases (deliberately not in v0)
+## Not provided
 
-Full randomized VOPR at scale; immutable/MVCC on-disk structure
-(HAMT/B-tree) with lockless readers; ordered/ranged scans; transactions
-(atomic batches exist, see above); secondary indexes; automatic compaction thresholds; in-memory value
-cache (compose with `ramcache`); shared/reader locks (the store is
-single-writer, so the cross-process lock is exclusive-only). The v0 keydir
-is an unordered hash map.
+No ordered index, ordered or range scans, MVCC, transactions beyond the atomic
+batch, secondary indexes, background expiry or compaction (the caller schedules
+`compact` / `merge`; `mergePlan` says when), in-memory value cache (compose with
+`ramcache`) or shared/reader locks (the store is single-writer, so the
+cross-process lock is exclusive-only). The keydir is an unordered hash map.
+SPEC.md *What is deliberately not done* has the reasons and *Backlog / deferred*
+what is planned.
 
 Tests: `zig build test-kv` (unit + sim-semantics + the fixed
 sweep + the randomized VOPR + the scheduler/shrink extras above;

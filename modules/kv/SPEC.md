@@ -39,7 +39,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [xit-vcs/xitdb](https://github.com/xit-vcs/xitdb) | Zig | MIT | 109 | pushed 2026-09-17 (no releases) | The Zig alternative: immutable persistent structures (HAMT/array list), snapshot semantics. Zig, embedded; no pluggable storage seam or fault-injection sweep *(inferred from README)*. |
 | [LMDB](https://github.com/LMDB/lmdb) | C | OpenLDAP Public License 2.8 | 3.0k | pushed 2026-08 | The de-facto embedded KV; ordered, MVCC, ACID txns, zero-copy reads. Not Bitcask-shaped, so not the field (owner, 2026-10-25: the field is Bitcask-model stores): against LMDB 0.9.31 kv's get was 6× and its scan 120× slower (pread per value then), its unsynced puts 3–4× faster. Source not read. |
 
-**Where we are ahead:** the only entry with a deterministic fault-injection sweep over every storage side effect (crash-anywhere, torn, reordered writes, shrinker) built in and shipped as part of the module, now over rotation, migration, merges and hints too; an injectable `Storage` seam (used by `kvtree`, `seglog` and others); cross-process `flock` exclusion with a killed-holder test; fail-stop poisoning after a write error; per-key expiry (Bitcask has one global expiry); pure Zig, no C. **On par since 2026-10-14:** sync policies, multi-file log with rotation, partial merges planned by Bitcask's triggers/thresholds and run beside writers, hint files, snapshot iteration, read-only opens beside a live writer, readers never waiting for a writer's fsync. **Added 2026-11-15:** atomic batch write (one record, one CRC, one sync; all of it or none after a crash; rosedb has batches, Bitcask does not), under the same fault sweep and VOPR. **Against the Go field, measured 2026-10-25** (the `**Ahead:**` line): the read-only open beside a writer is kv's alone, a torn tail never makes the store unopenable; the open is 0.27× the fastest (Performance), reads go through mmap (`FsStorage.initMmap`), as prologic/bitcask's sealed files do. **Where we are behind** (conscious, see Backlog): no background expiry or merge timer (the caller schedules both); a value whose record fails its CRC makes `open` refuse the whole store, where prologic/bitcask opens and fails that one key (the store's corruption policy).
+**Where we are ahead:** the only entry with a deterministic fault-injection sweep over every storage side effect (crash-anywhere, torn, reordered writes, shrinker) built in and shipped as part of the module, now over rotation, migration, merges and hints too; an injectable `Storage` seam (used by `kvtree`, `seglog` and others); cross-process `flock` exclusion with a killed-holder test; fail-stop poisoning after a write error; per-key expiry (Bitcask has one global expiry); pure Zig, no C. **On par since 2026-10-14:** sync policies, multi-file log with rotation, partial merges planned by Bitcask's triggers/thresholds and run beside writers, hint files, snapshot iteration, read-only opens beside a live writer, readers never waiting for a writer's fsync. **Added 2026-11-15:** atomic batch write (one record, one CRC, one sync; all of it or none after a crash; rosedb has batches, Bitcask does not), under the same fault sweep and VOPR. **Against the Go field, measured 2026-10-25** (the `**Ahead:**` line): the read-only open beside a writer is kv's alone, a torn tail never makes the store unopenable; the open is 0.27× the fastest (Performance), reads go through mmap (`FsStorage.initMmap`), as prologic/bitcask's sealed files do. **Where we are behind** (conscious, see *What is deliberately not done*): no background expiry or merge timer (the caller schedules both); a value whose record fails its CRC makes `open` refuse the whole store (a hinted merge output excepted: there `get` reports it), where prologic/bitcask opens and fails that one key (the store's corruption policy).
 
 ## Design & invariants
 
@@ -64,6 +64,24 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   because `compact()`'s `rename(2)` would otherwise strand it on an unlinked inode. Opt out:
   `Options.lock = .none`. See README for what is *not* promised (advisory only; NFS/SMB/9p/FUSE).
 
+## Locks and concurrency
+
+`Db` is internally synchronized by three locks, always taken in this order: `merge_lock` (serializes
+`merge` and `compact`; a merge copies under it alone, so writers and readers go on), the writer `lock`
+(one writer at a time, held for the whole write, fsync included) and the keydir `rw` (readers shared; a
+writer takes it exclusive only for its in-memory keydir update, never across a write or an fsync).
+Readers therefore run in parallel, are never held up by a writer's disk flush and never see a value
+before the sync policy made it durable. The read-write spin form is writer-preferring, so a stream of
+readers cannot starve a writer.
+
+Over a storage with an `Io` (`Storage.io`, set by `FsStorage`) the locks are `std.Io.Mutex` and
+`std.Io.RwLock`, so a waiting task yields to the `Io`: under an `Io` that runs several tasks on one
+thread, a spinning waiter would starve a holder suspended inside `writeAll` or `sync` for ever. Over an
+io-less storage (`SimStorage`, custom backends) they spin. `kv.Lock` is public for wrappers that hold
+their own lock across `Db` calls (`.{ .io = db.store.io }` gives them the same choice). `FsStorage`'s
+handle table has its own `table_lock` (`std.Io.Mutex`) around slot claim and release, because merges
+open hint files outside the writer lock and two threads can claim slots at once.
+
 ## Optional borrow methods on `Storage`
 
 `preadRef` / `releaseRef` are `?*const fn` vtable slots defaulting to `null`.
@@ -84,7 +102,7 @@ neither move nor change nor are freed. `pagecache` is the implementor today
 ## Optional preallocation and data-only sync
 
 `allocate` and `syncData` are two more `?*const fn` slots defaulting to `null`
-(2026-09-27, asked for by `seglog`).
+(asked for by `seglog`).
 
 - `Storage.allocate(h, len) → bool` is `fallocate(fd, 0, 0, len)`: the file
   becomes at least `len` long with its blocks reserved, reading as zeros past the
@@ -95,7 +113,7 @@ neither move nor change nor are freed. `pagecache` is the implementor today
   promise. The same guarantee for the bytes; cheaper when the size did not change.
 
 Why both: writes into reserved space do not change the size, so `fdatasync`
-after them records no metadata. Measured 2026-09-27 on NVMe ext4, 180-byte
+after them records no metadata. Measured on NVMe ext4, 180-byte
 appends each followed by a sync: growing the file ~305/s with either sync;
 reserved with `FALLOC_FL_KEEP_SIZE` ~309/s (the size still changes); reserved
 with the size extended + `fdatasync` 800–910/s. Only the last form is offered.
@@ -119,9 +137,7 @@ the same, and the size, which `fdatasync` may skip, is needed to read the bytes
 back, so it persists too. Tests: `sim: allocate …`, `sim: a write into reserved
 zeros …`, `sim: reorder over reserved zeros …`, `sim: truncate cuts reserved
 space …`, `sim: syncData is a durability barrier …`, and on the real
-filesystem `FsStorage: allocate reserves zeros …`. The undo for reserved
-writes and the torn-tail tearing were each removed on purpose, and a test
-failed each time.
+filesystem `FsStorage: allocate reserves zeros …`.
 
 ## Optional directory listing
 
@@ -135,10 +151,26 @@ point. `pagecache` forwards it. `Db` never lists: a store that derived its files
 adopt any stray file that looked like one; a durable record (a manifest) says which files belong,
 and a listing serves only recovery and tooling (rebuilding that record, finding strays).
 
+## Open modes on `Storage`
+
+- **`OpenMode.create_new`** (asked for by `seglog`): create the file, refuse with
+  `error.PathAlreadyExists` if the path exists — `O_CREAT|O_EXCL` in `FsStorage`, so the check and the
+  creation are one atomic step and of concurrent creators exactly one wins; an existing file is never
+  emptied. `SimStorage` refuses any name present in its volatile namespace (durable or not, as the
+  kernel does); a crash that loses an un-synced name also frees it. Equivalents: POSIX `O_EXCL`, Win32
+  `CREATE_NEW`, Rust `OpenOptions::create_new`, Python `"x"`.
+- **`OpenMode.read_only`**: open an existing file without creating, emptying or writing it — for a
+  reader of a store another process owns (first user: `seglog`'s read-only open). Absent →
+  `error.FileNotFound`, nothing created. `writeAll`/`truncate` on such a handle → `error.AccessDenied`,
+  refused by `FsStorage` and `SimStorage` themselves (not left to the errno Linux picks for a write to
+  `O_RDONLY`, which differs between `pwrite` and `ftruncate`); in `SimStorage` the refusal is not an
+  operation, so an armed crash does not fire on it. Wrappers (`vopr`, `pagecache`, the test doubles in
+  `kvtree`/`shardstore`/`tsdb`) pass the mode through. Tests: one per backend.
+
 ## Key expiry
 
-`putExpiring(key, value, expires_at_ms)` / `putTtl(key, value, ttl_ms)` (2026-09-30, first user:
-`sessions`' persistent store).
+`putExpiring(key, value, expires_at_ms)` / `putTtl(key, value, ttl_ms)` (first user:
+`sessions`' persistent store). A background expiry thread is not built (see *What is deliberately not done*).
 
 - **Wall clock, not monotonic.** The instant is stored on disk and must mean the same moment
   after a reboot, when `CLOCK_MONOTONIC` starts over. `Options.clock` (default
@@ -163,14 +195,11 @@ and a listing serves only recovery and tooling (rebuilding that record, finding 
 - **Tests:** unit tests per rule above; `fault_test.zig`'s expiry workload (v1 store with data →
   first expiring put = upgrade → expiring, plain, already-expired puts, overwrite, delete, two
   compactions) swept at every injection point in all four crash modes, with the model deciding
-  past/future from a fixed clock. Mutation-checked 2026-09-30 by schemata: 23 mutants (boundary
-  `<`→`<=`, each dropped filter, counter update, upgrade, replay check), 22 killed; the survivor
-  (the explicit `expires_at` compare in `read_verify`) is equivalent — the CRC over the field
-  catches the same rot.
+  past/future from a fixed clock.
 
 ## Multi-file log
 
-`Options.max_file_size` (2026-10-14, S2 survey R3; default 2 GiB, Bitcask's `max_file_size`): an
+`Options.max_file_size` (S2 survey R3; default 2 GiB, Bitcask's `max_file_size`): an
 append that would take the active data file past it first **rotates** — seals the active file
 (sync) and starts `<path>.<id>.data`. A record larger than the limit gets a file of its own.
 
@@ -197,24 +226,22 @@ append that would take the active data file past it first **rotates** — seals 
 - **`compact` on a multi-file store** writes every live record into new files (split at
   `max_file_size`, each synced), then one manifest naming them and listing the old as obsolete,
   then deletes the old files. Before the rename: errors leave the store usable and delete the new
-  files. From the rename on: poisoned, new files kept — **VOPR finding 2026-10-14**: the first
-  version deleted them when the dir sync after the rename failed, leaving a manifest naming
-  deleted files (`Corrupt` on reopen, seed 312 of the multi-file run).
+  files. From the rename on: poisoned, new files kept — deleting them when the dir sync after
+  the rename failed would leave a manifest naming deleted files (`Corrupt` on reopen; a VOPR finding).
 - **Per-file accounting** (`Db.DataFile`): live/dead bytes and keys per file, for merge planning;
   a unit test checks they sum to `deadBytes`/`count`.
 - **Tests:** unit tests (rotation + replay across files, merge deleting old files, sealed rot vs
   torn active tail, migration finished from the between-renames state, stray deletion); crash
   sweeps over the main and expiry scripts with `max_file_size = 64` in all four modes; the
   `SyncPolicy.none` sweep over rotations; VOPR with `max_file_size = 4096` (500 seeds, ≥ half end
-  multi-file). Mutants: no seal sync (red: no-sync rotation sweep), merge output not synced (red:
-  3 sweeps), no dir sync between migration renames (red: unit test).
+  multi-file).
 
 ## Merge (partial, concurrent)
 
 `Db.fileStats` (Bitcask `status`: per-file size, live/dead keys and bytes, fragmentation, expired
 keys counted dead), `Db.mergePlan(gpa, MergeThresholds)` (Bitcask `needs_merge` with its trigger
 and threshold defaults: fragmentation 60/40 %, dead bytes 512/128 MiB, small file 10 MiB; sealed
-files only — null when nothing triggers) and `Db.merge(ids)` (2026-10-14, S2 survey R3/R4).
+files only — null when nothing triggers) and `Db.merge(ids)` (S2 survey R3/R4).
 
 - **Two phases.** Copy under `merge_lock` only — writers and readers go on — then a swap under
   the writer lock and, for the keydir update, the exclusive keydir lock. The copy scans each
@@ -239,14 +266,11 @@ files only — null when nothing triggers) and `Db.merge(ids)` (2026-10-14, S2 s
   unmerged file + single-file merge; writers and readers proceed while a merge is parked between
   copy and swap; crash sweep over a partial-merge script in all four modes; VOPR multi-file run
   with random partial merges on even seeds; readers + writer + a merger thread on the real
-  filesystem under ThreadSanitizer — **which found a race** (the active file's `size` was stored
-  without the shared lock `fileStats` reads it under; now atomic). Mutants: markers never kept,
-  repoint without the "rewritten meanwhile" check, no output sync, outputs at the oldest position,
-  outputs dropped for a single-file merge — all red.
+  filesystem under ThreadSanitizer (the active file's `size` is atomic, since `fileStats` reads it under the shared lock).
 
 ## Hint files
 
-Every merge output (`merge`, multi-file `compact`) gets `<path>.<id>.hint` (2026-10-14, S2 survey
+Every merge output (`merge`, multi-file `compact`) gets `<path>.<id>.hint` (S2 survey
 R2, Bitcask hint files): per record op, key/value lengths, offset, expiry and the key — no value —
 then the data length it describes and a CRC-32. `open` applies a valid hint instead of reading the
 file's records and replays only what lies past the described length (the last `compact` output is
@@ -262,14 +286,14 @@ like Bitcask.
   the hint the store would be refused); rotten key byte in the hint (CRC → replay); forged hint
   with a valid CRC whose entries stop short of the claimed length (refused → replay); records
   appended past the hint replayed. Crash sweeps cover torn hints (every multi-file `compact`
-  writes them). Mutants: hint ignored, no CRC check, no coverage check — all red.
+  writes them).
 
 ## Iterator
 
 `Db.iterator(gpa, prefix)` → `Iterator` with `next() ?Pair` (key + value, valid until the next
-call), `remaining()`, `deinit()` (2026-10-14, S2 survey R6; Bitcask `fold`/iterator). Supersedes
-the 2026-09-30 decision "no value fold, use `keys` + `get`": that pair is not a consistent view —
-a merge or compaction between the two calls can return values from different moments.
+call), `remaining()`, `deinit()` (S2 survey R6; Bitcask `fold`/iterator). `keys` + `get` is not a
+consistent view — a merge or compaction between the two calls can return values from different
+moments — hence the iterator.
 
 - **Snapshot.** Under the shared keydir lock: a copy of every live (unexpired) key under the
   prefix and its entry, sorted bytewise; each referenced data file is **pinned** (atomic count)
@@ -277,20 +301,19 @@ a merge or compaction between the two calls can return values from different mom
 - **Pins.** A merge or compaction that retires a pinned file deletes its name (as always) but
   keeps its handle open in `Db.retired`; the last `deinit` closes and frees it (under the writer
   lock, against the retirement's own check, which runs under the writer lock and the exclusive
-  keydir lock). The single-file `compact` now builds a new `DataFile` for the renamed temp instead
+  keydir lock). The single-file `compact` builds a new `DataFile` for the renamed temp instead
   of rewriting the old one in place, so a snapshot keeps reading the old inode. `Db.close` frees
   whatever is still retired; iterators must be released first.
 - **Reads** take the shared keydir lock per `next` and CRC-check the record (`read_verify`).
 - **Tests:** snapshot unchanged by a later overwrite/delete/put, key order, prefix; expired keys not
   listed; reads across a multi-file `compact` (retired files pinned, freed at `deinit`) and across
   two single-file compactions; iterating readers in the ThreadSanitizer stress test (racing a
-  writer and a merger, 20 clean runs). Mutant: retirement ignoring pins — red (reads from closed
-  handles, leaks).
+  writer and a merger).
 
 ## Paged key scan
 
-`Db.scanKeys(gpa, prefix, after, limit)` → `ScanPage` (`keys`, `more`, `last()`, `deinit`) (2026-11-19,
-first user: `sessions`' `KvStore.iterate`, whose `keys` call held every session key in memory at once).
+`Db.scanKeys(gpa, prefix, after, limit)` → `ScanPage` (`keys`, `more`, `last()`, `deinit`) (first user:
+`sessions`' `KvStore.iterate`, whose `keys` call held every session key in memory at once).
 The at most `limit` smallest live keys under `prefix` that sort strictly after `after` (null = from the
 start), sorted bytewise; resume with `after = page.last()` while `page.more`.
 
@@ -298,7 +321,7 @@ start), sorted bytewise; resume with `after = page.last()` while `page.more`.
   keeps the `limit` smallest candidates in a bounded max-heap of borrowed keys (sized
   `min(limit, keydir entries)`, so a huge `limit` costs nothing extra), then copies them out before the
   lock is released. `more` = a candidate was turned away, so a full last page says `false` and needs no
-  extra call. `limit == 0` → `error.InvalidLimit` (new `ScanError = Allocator.Error || {InvalidLimit}`;
+  extra call. `limit == 0` → `error.InvalidLimit` (`ScanError = Allocator.Error || {InvalidLimit}`;
   Redis refuses `COUNT 0` too).
 - **Time per call: one keydir pass** — the keydir is a hash map, so there is no ordered index to seek;
   a full scan in pages of `limit` is `count / limit` passes. Ordered indexes stay out of scope (§ Threat
@@ -311,7 +334,7 @@ start), sorted bytewise; resume with `after = page.last()` while `page.more`.
   call; a key deleted or expired between pages is not listed if it sorts after the cursor, and stays
   listed if an earlier page returned it (a `get` then answers null). Values are not read (`get` per key,
   as for `keys`).
-- **Why this model (compared 2026-11-19):** Redis `SCAN` (redis.io/commands/scan, "Scan guarantees"):
+- **Why this model (compared with other stores):** Redis `SCAN` (redis.io/commands/scan, "Scan guarantees"):
   a full iteration returns every element present from start to end, may return one **more than once**,
   and elements added or removed meanwhile may or may not be returned — its cursor is a hash-table
   position (reverse-binary, to survive a resize). etcd (`Range` with `limit`, paging by
@@ -332,7 +355,7 @@ start), sorted bytewise; resume with `after = page.last()` while `page.more`.
 
 ## Read-only open
 
-`Options.read_only` (2026-10-14, S2 survey R5b; Bitcask's read-only `open/1`) opens a store another
+`Options.read_only` (S2 survey R5b; Bitcask's read-only `open/1`) opens a store another
 `Db` — this process or another — may be writing. `Db.refresh()` reloads it.
 
 - **Changes nothing.** No lock (the writer's exclusive one would refuse it anyway), no stale temp
@@ -343,23 +366,22 @@ start), sorted bytewise; resume with `after = page.last()` while `page.more`.
   error); `sync` is a no-op.
 - **Races with the writer.** A merge may delete a listed file between the reader's manifest read
   and its open: the reader starts over from the newer manifest (`error.Retry` inside `load`), up
-  to 16 times, then `error.Busy` (new `OpenError` member). Between a migration's renames (no
+  to 16 times, then `error.Busy` (an `OpenError` member). Between a migration's renames (no
   `<path>`, `.0.data` present) it reads the synced manifest temp. Once open, the reader holds its
   files' handles, so a writer deleting them does not affect the reader's view.
 - **`refresh`** = a full load beside the current view, then a swap; the old files are released
   pin-aware (an open `Iterator` keeps reading its snapshot). Cost: a full open — hints make merged
-  files cheap; the active file and unmerged sealed files are replayed. Incremental tail replay is
-  possible later if a caller needs it.
+  files cheap; the active file and unmerged sealed files are replayed. Incremental tail replay is a Backlog idea.
 - **Tests:** reader beside a live writer (view as of open, AccessDenied, refresh after rotation +
   migration + delete, reads served after the writer compacted its files away, iterator pinned
   across refresh); a reader changes nothing (no store created, mid-write tail and stray left
   alone); mid-migration read from the temp; a vanished listed file → `Busy` for a reader,
   `Corrupt` for a writer; real filesystem writer + reader; a refreshing read-only `Db` in the
-  ThreadSanitizer stress test (20 clean runs). Mutant: reader truncating the active tail — red.
+  ThreadSanitizer stress test.
 
 ## Sync policy
 
-`Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync
+`Options.sync` (S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync
 per `put`/`delete`, the contract every consumer was written against), `.none` (Bitcask's default:
 no fsync on writes) and `.interval_ms` (fsync inside the first write that finds the interval gone
 since the last sync — Bitcask's `{seconds, N}`; no timer thread, an idle store waits for the next
@@ -370,7 +392,7 @@ sync error poisons like a write error.
   barrier — `sync`, `compact` (the new file is synced before the rename), `open`, an interval
   sync — and nothing else: the recovered state is the state after some prefix of the writes.
   Holds because the log is append-only over the durable prefix and replay stops at the first
-  torn record or hole (§ Backlog, out-of-order durability), so a later record that persisted past
+  torn record or hole (see *Verification*, non-contiguous durability), so a later record that persisted past
   a lost earlier one is truncated, never adopted.
 - **`close`** syncs un-synced writes best-effort (`close` returns `void`); `sync` first is the way
   to learn the outcome. A poisoned store is not synced on close.
@@ -381,13 +403,12 @@ sync error poisons like a write error.
   all four modes (reorder over three seeds); recovery must equal the model after a prefix between
   the last completed barrier and the in-flight step, with teeth: acknowledged writes lost at some
   points, kept at others, real holes punched. Unit tests for `.always`/no-op `sync`,
-  `.interval_ms` with an injected clock, `close`'s sync and poisoned `sync`. Mutants
-  "`.none` syncs every write" and "close does not sync" each turn a test red (2026-10-14).
+  `.interval_ms` with an injected clock, `close`'s sync and poisoned `sync`.
 
 ## Atomic batch
 
 `Db.batch()` → `Batch` (`put`, `putTtl`, `putExpiring`, `delete`, `commit`, `clear`, `deinit`) and
-`Options.max_batch_bytes` (2026-11-15; survey 2026-09-30 "Atomic batch write", rosedb has it, Bitcask
+`Options.max_batch_bytes` (survey "Atomic batch write": rosedb has it, Bitcask
 does not): several puts and deletes that commit together, with one sync, and that a crash keeps whole
 or not at all.
 
@@ -403,7 +424,7 @@ or not at all.
   (2) `key_len == 0` and the body is non-empty, (3) the records tile the body exactly, each an op the
   module writes (0, 1 with no value, 2 with a real expiry; no batch inside a batch), and (4) the
   CRC over header and body holds. Pass 1 checks all of that and allocates nothing; only pass 2 reads
-  keys and touches the keydir, so a torn or forged batch applies **nothing** (the 2026-10-29 rule
+  keys and touches the keydir, so a torn or forged batch applies **nothing** (the rule
   "allocate after the CRC" holds: the lengths are trusted only once the CRC matches). A failing
   envelope is the torn tail: truncated in the active file (writer), the stopping point for a reader,
   `Corrupt` in a sealed file (a sealed file was synced whole). The envelope header's 13 bytes count
@@ -445,7 +466,7 @@ or not at all.
   and the store usable — except when the commit needs a rotation first (the first batch into a
   pre-batch active file, or a batch that does not fit): an allocation failure inside that rotation
   poisons the store, as it does for a `put` that rotates.
-- **Replay checks** (independent review 2026-11-15 of the batch layer, read-only Sonnet: no finding above LOW; delta mutation of the two fixes: dropping the inner-CRC check is killed by `forged envelopes` case 8, the pass-2 `Corrupt` arm is unobservable without a second process rewriting the file): besides the envelope CRC and the tiling, every
+- **Replay checks:** besides the envelope CRC and the tiling, every
   inner record's own CRC must hold, or the whole envelope is refused (a forged inner record would
   otherwise open, then fail `get` and every merge); and the second pass re-reading bytes the first
   pass accepted answers `Corrupt` if another process changed them in between — never a panic.
@@ -479,10 +500,10 @@ or not at all.
   `RecordedOp.batch`, replayed and cloned by the shrinker as ONE operation — ddmin drops or keeps a
   batch, it does not cut inside one), 500 seeds single- and multi-file with partial merges, teeth on
   acknowledged / survived / dropped batches; the recorded traces replay clean and a sabotaged one
-  is caught. `Replayer` no longer appends a garbage tail to a manifest (a store with batches is a
+  is caught. `Replayer` does not append a garbage tail to a manifest (a store with batches is a
   manifest store; the live runner never did).
 
-## Threat model / out of scope
+## Threat model / Limits
 
 Reliability, not adversarial security:
 - **Fault model:** torn writes, partial/short reads, garbage tails, and crash-at-any-point are the
@@ -490,161 +511,147 @@ Reliability, not adversarial security:
   durability invariants after each crash+recovery, with a **sabotage self-test** (a recovery that
   loses committed data MUST be caught → `error.InvariantViolation`). Reproducible from a fixed
   PRNG value (splitmix64, no clock/OS-rng).
-- **Out of scope (deferred):** MVCC / multi-version reads, HAMT on-disk index, ordered scans /
-  range queries, transactions, secondary indexes, and shared/reader locks — the randomized VOPR is
-  done; these on-disk/txn features are future work. (The **cross-process lock** was on this list
-  until 2026-08-06 and is now built — see Design & invariants; only the *shared* mode remains
-  deferred, the store being single-writer.) Not a networked/served DB (embedded,
-  in-process). No encryption-at-rest, no untrusted-input hardening on the log file (assumes the
-  file is the engine's own, not attacker-supplied).
+- **Hostile or foreign files:** a manifest, hint or data file that this module did not write never
+  crashes or exhausts `open`/`replay`/`compact`: a manifest whose `next_file_id` is past the id space,
+  or whose active file is version 1, is `Corrupt`; a hint whose per-entry expiry disagrees with its op
+  is not trusted (the data file is replayed) and one larger than twice its data file plus 20 bytes is
+  not read; `replay` CRC-checks a record larger than its window in pieces before allocating its key;
+  `FsStorage` answers a closed or out-of-range handle with `error.Unexpected`. Integrity is a CRC, not
+  an authentication: nothing protects against a forger who can compute CRCs, and there is no
+  encryption at rest.
+- **Out of scope:** MVCC / multi-version reads, an on-disk ordered or HAMT index, ordered scans / range
+  queries, transactions beyond the atomic batch, secondary indexes, and shared/reader locks (the store
+  is single-writer, so the cross-process lock is exclusive only). Not a networked/served DB (embedded,
+  in-process). The reasons are in *What is deliberately not done*.
+- **Handle table:** each data file holds a storage handle for as long as the store is open, and
+  `FsStorage` has `default_max_handles` (64) in all, shared with the lock file and temporaries, so with
+  the 2 GiB default `max_file_size` a store tops out near 60 files (about 120 GiB); the rotation that
+  needs the next handle fails with `HandleTableFull` and, because a rotation changes the namespace,
+  poisons the store until reopen (`FsStorageCapacity` or a larger `max_file_size` for stores that
+  large; `Options.max_file_size` doc comment).
+- **Lifetimes:** an `Iterator` must be released before its `Db` is closed (`Iterator.deinit` doc
+  comment). `SimStorage`, a test double, asserts on invalid handles by design.
 
 ## Verification
 
-Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuzz of recovery across
-torn/partial writes, short reads, garbage tails, and crash points ×4 modes (incl. non-contiguous /
-out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
-self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`.
+Run `scripts/modtest kv` (`zig build test-kv`); the VOPR, the fixed sweeps and the stress tests are
+ordinary tests. No foreign oracle exists (anchor class C); the oracle is the model (`src/vopr.zig`
+`modelMatches`, `src/fault_test.zig` `Model`). No fuzz obligation under `check-fuzz`; the randomized
+VOPR is the model-based fuzz. No constant-time claim (a key-value store).
 
-- **`OpenMode.create_new`** (2026-09-28, requested by the ingest daemon seglog, audit L1): create the
-  file, refuse with `error.PathAlreadyExists` if the path exists — `O_CREAT|O_EXCL` in
-  `FsStorage`, so the check and the creation are one atomic step and of concurrent creators
-  exactly one wins; an existing file is never emptied. `SimStorage` refuses any name present in
-  its volatile namespace (durable or not, as the kernel does); a crash that loses an un-synced
-  name also frees it. Equivalents: POSIX `O_EXCL`, Win32 `CREATE_NEW`, Rust
-  `OpenOptions::create_new`, Python `"x"`.
-- **`OpenMode.read_only`** (2026-09-22): open an existing file without creating, emptying or
-  writing it — for a reader of a store another process owns (first user: `seglog`'s read-only
-  open). Absent → `error.FileNotFound`, nothing created. `writeAll`/`truncate` on such a handle →
-  `error.AccessDenied`, refused by `FsStorage` and `SimStorage` themselves (not left to the errno
-  Linux picks for a write to `O_RDONLY`, which differs between `pwrite` and `ftruncate`); in
-  `SimStorage` the refusal is not an operation, so an armed crash does not fire on it. Wrappers
-  (`vopr`, `pagecache`, the test doubles in `kvtree`/`shardstore`/`tsdb`) pass the mode through.
-  Tests: one per backend, each RED against its mutant (read-only open that creates; truncate that
-  is not refused).
-- **Cross-process lock — modeled, not just implemented** (2026-08-06): `tryLockExclusive` is a
-  `Storage` vtable op and an injection point, so the fixed sweep crashes on the acquisition like
-  any other side effect (every point × the fixed sweep's three modes). `SimStorage` models a lock as belonging to an open
-  file *description* (a second `Handle` on the same name contends), released by `close` and by our
-  own crash but **not** by a `holdForeignLock` holder — which is what lets a sweep assert that a
-  post-crash recovery contended by another process is refused with `error.Locked` and leaves the
-  torn file byte-identical, then succeeds with full invariants once that process is gone.
-  `lock_unsupported` models a filesystem with no `flock` (`error.LockUnsupported`, never a silent
-  downgrade). The guarantee callers actually buy is proved by two **forked child processes**
-  (bounded: `alarm(2)` self-destruct + a deadline-and-`SIGKILL` reaper): a real second process is
-  refused, and a `SIGKILL`ed holder — no destructor, no unlock, nothing — leaves the store
-  immediately openable with its durable write intact.
-
-- **Fault-scheduling policy is a seam** (`scheduler.zig`, 2026-07-15): the epoch-planning
-  decision (which fault, how soon) that used to be inline in `Vopr.runSeed` is a pluggable
-  `FaultScheduler` (`Config.scheduler`). `uniformScheduler` is behaviorally identical to the old
-  inline logic (same PRNG draw order — no VOPR determinism/stats change). A `Coverage` tally
-  (fault-class × early/late-timing cells) is threaded through and recorded on every draw.
-- **Coverage-guided fault scheduling — implemented** (`scheduler.zig`, 2026-07-15):
-  `coverageGuidedScheduler(&state)` biases the (class × timing) draw toward the least-exercised
-  cells via a bandit-style epsilon-greedy rule (exploit = coldest reachable cell w/ random
-  tie-break; explore = 1-in-`explore_den` uniform draw). Its `CoverageGuided.session` tally
-  PERSISTS across seeds (the piece that made the difference — a per-seed tally degenerates to
-  uniform), so a session converges on all 13 reachable cells in ~13 exploit draws instead of
-  waiting for uniform sampling to stumble onto the ~1-in-24 rare cells. Fully seeded/deterministic;
-  a test asserts it leaves strictly fewer (class × bucket) cells uncovered than `uniformScheduler`
-  over an identical draw budget.
-- **Failing-seed search + delta-debugging shrinker** (`shrink.zig` + `vopr.zig`, 2026-07-15):
-  `findFailingSeed` sweeps a seed range through the VOPR and returns the first captured failure;
-  `run` is the CLI-style driver (`--seed`/`--search`/`--shrink`). `shrink` minimizes a failing run
-  to a small reproducer. The blocker — kv's VOPR derives its whole workload+fault schedule live
-  from the seed's `Prng`, so the captured `Event` trace is an observation, not a re-runnable
-  program — is resolved by a **trace-replay mode** in `vopr.zig`: `generateTrace` re-captures a
-  seed as a `RecordedTrace` (concrete op list with actual value bytes, crash mode/timing/reorder
-  seed, garbage bytes, sabotage), and `replayTrace` executes any subset deterministically without
-  a live `Prng`. `shrink` runs ddmin over that trace (drop ops → drop epochs → neutralize faults),
-  re-replaying after each cut and keeping the reduction only when the SAME invariant violation
-  still reproduces; a test shows it cuts a failing sabotage trace to a strictly smaller reproducer.
-
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` (lines 1–3230) incl. the `FsStorage` open/close/truncate/preadRef/remap/list guards; `sim.zig`, `vopr.zig`, `scheduler.zig`, `shrink.zig`, `prng.zig` are the oracle and stay unmutated; schemata in a detached copy, ReleaseSafe, strict verdict (30 s cap = hang), adversarial read while placing mutants): 617 mutants, 578 killed, 37 equivalent + 2 cut at cost, 0 undecided. The 2026-10-29 run (205 mutants) was thin: the first run here left 129 alive. 32 new tests with a `SpyStorage` decorator (failing rename/syncDir/delete/write, handle and sync counts, read-only mount) and an `expectAccounting` invariant (every byte after a header is a live or dead record; live keys add up to `count`, dead bytes to `deadBytes`) checked at every transition: a reader needs no write access of any kind; stale manifest temps; CRC-valid manifests of every size 8..27 and one over the 16 MiB cap; strays past `next_file_id`; bad magic/version in a listed file; unfinished migrations; six CRC-valid forged hints and tiny hint files; expiry hints; a forged op byte in replay; merge marker rules incl. an expired record over an older value; a failed delete retried at open; poison on failed rename/syncDir in compact, merge, mergeAll and rotation, no sync at close when poisoned, no output/handle/pending id after a failed merge or compaction; iterator pins across a merge; an OOM sweep over iterator creation; the clock at i64 max; the u32 key/value limit; recovery sync after cutting a torn tail. Cut: the manifest cap `>`/`>=` (needs a valid 16 MiB manifest, ~4.2 M obsolete ids), the twelfth mmap of one file (128 GiB sparse file). Not mutated: the oracle files above, asserts, `Storage` forwarding wrappers, `FsStorage` errno-mapping arms.
-
-**Delta mutation (2026-11-12, base `a383e3cc1`, the `loadManifest` read-only probe fix; whole-module run above):** the whole of `loadManifest`, schemata in a detached copy, ReleaseSafe, strict verdict: 49 mutants, 46 killed, 2 equivalent (a 24-byte manifest has zero ids and `n_files == 0` refuses it; `!ok` implies version 0, refused anyway), 1 cut at cost (the cap at exactly 1<<24, as above), 0 undecided. The fix's own test kills the probe regression; 2 new tests with `SpyStorage` failing the k-th `size`/`pread`: a refused open leaves 0 live handles (bad magic, wrong version on the active file), and a failing size, pread or allocation during open returns its error with 0 handles left.
-
-**Delta mutation (2026-11-15, base `cdee457d3`, the atomic batch):** the new code of `root.zig` — `Batch` (`add`, `putExpiring`, `putTtl`, `commit`, `keyOff`), `commitBatchLocked`, `appendVersioned` and its rotation version, the `rotateLocked` version parameter, `replayBatch` / `batchRecord`, the `replay` and `merge` branches for op 3, the `loadManifest` version 4 arms; schemata in a detached copy, ReleaseSafe, strict verdict (20 s cap = hang): 73 mutants, 71 killed (one by the hang cap: pass 2 not advancing; one by the leak detector: a keydir key not freed on a batch delete, 13 tests leak), 2 equivalent, 0 undecided. The first run left 6 alive and 1 unclear: three became tests (the `expiring` counter exact when a batch deletes or overwrites an expiring key; a record whose last CRC piece is one byte, applied whole and dropped when flipped), one a debug assertion (`ReplayWindow.view`'s contract `off + n <= file_size`: a mutant letting a batch's length check run one byte over read bytes the window never loaded and the CRC alone caught them), two equivalent. **Positive controls:** "replay does not check the envelope CRC" dies in the flipped-bit tests; "a torn envelope is skipped and its records replayed one by one" — the batch applied partially — dies in the torn-at-every-cut test, `op 3 in a v1 file`, the read-only opener test and the crash sweep (`batch sweep FAILED: mode=torn_tail … crash_point=24/66`); "no migration for the first batch" (op 3 into a v1/v2 file) dies in the reopen tests. **Equivalent:** (a) a delete's key copy made too, and counted in the capacity reserve (`op != op_del` skipped): a copy freed unused, room reserved for more keys than are inserted — cost only; (b) the CRC pass hashing in 7-byte pieces instead of window-sized ones: CRC-32 is the same over any split — cost only. **Not mutated, not observable:** the `@min(max_batch_bytes, maxInt(u32))` cap and the `maxInt(u32)` key/value length checks need a 4 GiB batch or a 4 GiB slice. **Not independently reviewed** (the whole-module review of 2026-11-12 predates the batch code): a read-only review of `replayBatch` / `commitBatchLocked` is open.
-
-**Delta mutation (2026-11-19, base `04c1315c4`, the paged key scan):** `Db.scanKeys` and its bounded heap (`Scan.siftUp`/`siftDown`); schemata in a detached copy, ReleaseSafe, the kit's runner filtered to the `scanKeys` tests, strict verdict (20 s cap = hang): 26 mutants, 26 killed, 0 equivalent, 0 undecided — the `limit == 0` refusal dropped and at `<= 1`; the errdefer freeing no key copy (leak); the heap sized by the store alone, by `limit` alone (a `maxInt` limit runs out of memory) and one short; the clock never read; the prefix, cursor (dropped, and `>=` instead of `>`) and expiry filters dropped; `n <= heap.len`; `more` never set; never replacing the root and replacing it the wrong way; each sift dropped; the copy taking the root every time; the final sort dropped; each sift comparison flipped or dropped, its bounds off by one, the right child never chosen, `i > 1` for `i > 0`. Card counts cumulative (72/75, 3 eq + 26/26). The review fixes after it changed only a test (a paged scan in the ThreadSanitizer stress test's readers) and a comment: no new mutants, src hash refreshed. **Not independently reviewed yet** (concurrency: the shared-lock pass and the copy-out before the lock is released).
+- **Fixed sweep** (`fault_test.zig`): a scripted workload is run once per (injection point × crash
+  mode) and after each reboot + reopen the test asserts: no acknowledged write lost, the recovered
+  state exactly equals the model with the in-flight operation either atomically applied or absent
+  (never a mix, never torn data), compaction crashes preserve the logical state, and the recovered
+  store accepts new durable writes. In-process, no randomness, no real process kill. Scripts: the main
+  one (puts, overwrites, deletes, compactions, edge keys), expiry (v1 store → first expiring put =
+  upgrade), multi-file (`max_file_size = 64`), partial merges, `SyncPolicy.none` and the atomic batch
+  (single-file and multi-file); the three simple modes (`lose_unsynced`, `keep_unsynced`, `torn_tail`)
+  at every point, `reorder_unsynced` with its own exhaustive sweep over several seeds and a teeth assert
+  that real holes are punched.
+- **Randomized VOPR** (`vopr.zig`): PRNG-driven workloads and fault schedules (torn/partial writes,
+  short reads, garbage tails, crash points × 4 crash modes) over chained epochs, with the options a
+  consumer can combine (`max_file_size` multi-file runs, `partial_merges`, `batches`). Invariants after
+  every crash + recovery and every clean close: durability of acknowledged operations; tail atomicity
+  (exactly the model, or the model plus the one in-flight operation); no torn or corrupt record ever
+  surfaced as valid; the keydir matches the replayed log; recovery never fails or panics and the
+  recovered store accepts new writes; compaction and `open` change no logical state. Teeth: minimum
+  counts of crashes, injected errors, short reads and garbage tails actually fired, and a sabotage
+  self-test (a deliberately data-losing recovery must be caught).
+- **Non-contiguous durability:** `CrashMode.reorder_unsynced` tracks every `writeAll` since the last
+  durability barrier as a byte range and on a crash keeps a seed-driven subset, so dropping an earlier
+  range while keeping a later one leaves a zero-filled hole between persisted regions. Recovery is
+  correct under it: the CRC fail-stop replay truncates at the first hole, so a persisted but orphaned
+  later record is never resurrected and committed records before a hole are never over-truncated (a hole
+  can only sit in the append-only tail above every fsync'd record; a direct replay-level test in
+  `root.zig`); and the only multi-write-before-sync window of the engine is `compact()`'s temp file,
+  which is discarded on reopen or adopted only after a full sync.
+- **Cross-process lock — modeled, not just implemented:** `tryLockExclusive` is a `Storage` vtable op
+  and an injection point, so the fixed sweep crashes on the acquisition like any other side effect.
+  `SimStorage` models a lock as belonging to an open file *description* (a second `Handle` on the
+  same name contends), released by `close` and by our own crash but **not** by a `holdForeignLock`
+  holder, which lets a sweep assert that a post-crash recovery contended by another process is
+  refused with `error.Locked`, leaves the torn file byte-identical and then succeeds once that process
+  is gone. `lock_unsupported` models a filesystem with no `flock` (`error.LockUnsupported`, never a
+  silent downgrade). The guarantee callers buy is proved by two **forked child processes** (bounded:
+  an `alarm(2)`-style self-destruct and a deadline-and-`SIGKILL` reaper): a real second process is
+  refused, and a `SIGKILL`ed holder leaves the store immediately openable with its durable write intact.
+- **Fault-scheduling policy is a seam** (`scheduler.zig`): the epoch-planning decision (which fault,
+  how soon) is a pluggable `FaultScheduler` (`vopr.Config.scheduler`). `uniformScheduler` is the flat
+  random default. `coverageGuidedScheduler(&state)` biases the (class × timing) draw toward the
+  least-exercised cells by a bandit-style epsilon-greedy rule (exploit = coldest reachable cell with a
+  random tie-break; explore = 1-in-`explore_den` uniform draw); its `CoverageGuided.session` tally
+  persists across seeds (a per-seed tally degenerates to uniform). A test asserts it leaves strictly
+  fewer cells uncovered than `uniformScheduler` over an identical draw budget.
+- **Failing-seed search and shrinker** (`shrink.zig`, `vopr.zig`): `findFailingSeed` sweeps a seed
+  range and returns the first captured failure; `run` is the CLI-style driver (`--seed`, `--search`,
+  `--shrink`, `--sabotage`, `--quiet`). The VOPR derives its workload live from the seed's `Prng`, so
+  a failure is reproduced by trace replay: `generateTrace` captures a seed as a `RecordedTrace`
+  (concrete operations with value bytes, crash mode and timing, garbage bytes, sabotage, batches as
+  one `RecordedOp.batch`, merges as `RecordedOp.merge` — a mask over the sealed files) and
+  `replayTrace` / `replayTraceOpts` execute any subset deterministically. `shrink` runs ddmin over the
+  trace (drop operations → drop epochs → neutralize faults), re-replaying after each cut and keeping
+  the reduction only when the same invariant violation reproduces; a batch or a merge is kept or
+  dropped as one operation.
+- **Test doubles and invariants:** `SpyStorage` (a decorator that fails the k-th rename, syncDir,
+  delete, write, size or pread, counts handles and syncs, and can mount read-only) and
+  `expectAccounting` (every byte after a file header is a live or dead record or an envelope header;
+  live keys add up to `count`, dead bytes to `deadBytes`), checked at every state transition.
+- **Concurrency tests:** readers are served while a writer is parked inside fsync and never see its
+  value early; readers, a writer and a merger thread (a refreshing read-only `Db` and paged scans
+  included) on the real filesystem, meant to be run under ThreadSanitizer (`-fllvm -fsanitize-thread`:
+  the self-hosted backend does not instrument); an mmap test with a writer appending and the file
+  remapped; a spin-lock test.
+- **Hostile files:** forged CRC-valid manifests of every size around the minimum and over the cap,
+  forged hints (entries stopping short of the claimed length, a tiny hint file), forged envelope
+  records (eight shapes), a forged op byte in replay, strays past `next_file_id`, a closed or
+  out-of-range handle.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Measured 2026-10-25** (`zig build bench-kv`, `BENCH_ROUNDS=5`, ReleaseFast, Zig 0.17.0, Go 1.26.8, desktop load only; largest spread 27.5 %), ns per op (one op = the row's whole batch):
+`zig build bench-kv` (always ReleaseFast; `tools/bench.zig` with its Go reference side under
+`tools/go_bench`, `tools/bitcask_bench` and `tools/nutsdb_bench`; needs Go and the pinned reference
+modules) measures `get_hit`, `put_new`, `update`, `put_sync`, `scan` and `open` against rosedb,
+prologic/bitcask and nutsdb on identical data; `tools/lead_probe` produces the feature and
+correctness leads on the card's `**Ahead:**` line. The figures are on the card's `**Performance:**`
+line (authoritative). What drives them: `FsStorage.initMmap` lends reads out of a mapping of the log
+(no syscall per get), a get is one read per record rather than three, the iterator's key snapshot is
+sorted with `std.sort.pdq` over an 8-byte prefix compare, and `put_sync` is fsync-bound (every durable
+put is a write plus an `fsync` on every side; the preallocation path is a Backlog item).
 
-| row | kv | rosedb (ref) | prologic/bitcask | nutsdb (keys in RAM) | kv / fastest |
-|---|--:|--:|--:|--:|--:|
-| get_hit (20 000 gets) | 11 606 044 | 80 442 507 | 11 636 284 | 71 829 432 | 1.00 (bitcask) |
-| put_new_1k | 1 822 232 | 3 387 623 | 2 076 172 | 4 529 638 | 0.88 (bitcask) |
-| update_1k | 2 053 046 | 4 169 681 | 2 119 531 | 5 264 275 | 0.97 (bitcask) |
-| put_sync_100 | 318 985 421 | 319 991 615 | 319 441 707 | 316 396 839 | 1.01 (nutsdb; fsync-bound) |
-| scan (100 000 keys + values) | 89 147 608 | 537 292 635 | 78 689 229 | 229 728 230 | 1.13 (bitcask) |
-| open_100k | 57 077 011 | 212 791 920 | 724 227 615 | 457 729 898 | 0.27 (rosedb) |
+## What is deliberately not done
 
-What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of the log: no syscall per get — a `pread` was ~40 % of a get on this host, in syscall entry/exit) and one read per record instead of three (header, key, value): get_hit 0.92× → 0.14× rosedb. The iterator's key snapshot sorted with `pdq` and an 8-byte compare instead of std's stable block sort (45 % of the scan): scan 0.30× → 0.17× rosedb. The field's benches (`tools/bitcask_bench`, `tools/nutsdb_bench`) were swept before their first build — every compiled file of their dependency closures (151 for nutsdb, 85 for prologic/bitcask) for `import "C"`, `unsafe`, `os/exec`, `net`, `init()` and `go:generate`: no cgo; `unsafe` only in mmap/syscall/tree plumbing; an uncalled `unix.Exec`; `net/http` only through testify in nutsdb's test utilities; no write outside the store's directory. Their fsyncs were counted with `strace` on put_sync_100: one per put on every side. Before: Zig 0.17.0, 2026-10-20, ref 0.25–1.00× (pread reads).
+- **A background expiry thread or merge timer.** `compact` and `merge` are the caller's to schedule
+  (`mergePlan` says when); an expired key costs memory and disk only until then.
+- **MVCC / on-disk ordered index / ordered scans / transactions / secondary indexes** — DON'T-BUILD-YET
+  (ecosystem-scanned): a multi-week build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with no
+  current consumer demanding scans or transactions. The plan for when it is greenlit is in *Backlog*.
+- **A value fold with a callback.** `Db.iterator` is the consistent snapshot view (Bitcask `fold`);
+  `keys` + `get` is not one.
+- **Shared/reader locks.** The store is single-writer; readers in other processes use
+  `Options.read_only`.
+- **Recovery beyond the first bad record in the active file.** Replay truncates at the first torn or
+  corrupt record, so mid-file media rot discards the records after it; the trade is the invariant that
+  everything replay accepts is CRC-valid (a sealed file's bad record is `Corrupt`, never cut).
+
+## Open
+
+Boundaries no test reaches because they need an input too large to build:
+- the manifest size cap at exactly `1 << 24` bytes (a valid 16 MiB manifest, about 4.2 million
+  obsolete ids);
+- the twelfth mmap of one file (a 128 GiB sparse file);
+- the `@min(max_batch_bytes, maxInt(u32))` cap and the `maxInt(u32)` key/value length checks (a 4 GiB
+  batch or slice);
+- the `Corrupt` arm of `replayBatch`'s second pass, reachable only when another process rewrites the
+  file between the two passes.
 
 ## Backlog / deferred
-- **FIXED 2026-11-12 — Finding (LOW, mutation run 2026-11-12): a refused writer open changes the disk.** Writers now probe a listed file with `.read_only` first (test: "open: a listed file that is missing is refused without being created"). Original note: A writer opening a manifest that lists a missing file first creates it empty (`.open_or_create` in `loadManifest`), then returns `Corrupt`. The refusal is right, but the evidence is gone: the missing file can no longer be told from one with a corrupt header, and an open that fails has written to the directory. The `error.FileNotFound => Corrupt` arm for writers is dead code. Fix: open listed files without create, map `FileNotFound` to `Corrupt`; with a test that the directory is byte-identical after the refused open.
-- **LOW (same run):** `count()`, `deadBytes()` and `fileStats()` use `liveAt(now)` without the `expires()` guard `get`/`keys`/`iterator` have — with an injected clock at exactly i64 max they drop non-expiring keys (the real clock cannot reach it). Two redundant size assignments around `adoptFile`. With the next kv source change.
 
-- **No-panic sweep 2026-10-29:** fixed K-1 (manifest `next_file_id` bound + `NoSpaceLeft` on id exhaustion), K-2/K-3 (hint expiry must agree with op), K-4 (replay checks the CRC in pieces before allocating the key), K-5 (hint size bounded by 2x data file + 20), K-6 (v1 active file in a manifest is Corrupt), K-7 (`FsStorage` handle checks), K-8/K-9 as docs; not fixed: K-7 for `SimStorage` (test double, asserts on handles by design), K-8 behaviour (a failed rotation still poisons the store, now documented with its ~60-file / 120 GiB size), K-9 (a lifetime contract, no guard possible without a refcount).
-
-- **FIXED (2026-10-01, simio kv pilot): the spinlock deadlocked under a fiber/evented `Io`.**
-  `Db` holds its lock across `Storage` calls (`writeAll`, `sync`). Under an `Io` that runs
-  several tasks on one OS thread (`std.Io.Evented`, simio), a task suspended inside one of those
-  calls handed the thread to the next task, which spun on the lock without ever reaching an
-  `Io` call. Fix: `Storage.io` (set by `FsStorage`); over a storage with an `Io` the lock is an
-  `std.Io.Mutex`, over an io-less one (`SimStorage`, custom backends) still the spinlock. Held by
-  the simio pilot test "two tasks of one thread share a Db" (hangs with the spinlock, verified)
-  and a kv test that `FsStorage` hands its `Io` through. The same question for other modules'
-  io-less locks is audited separately (simio SPEC § Pilots).
-- **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (ecosystem-scanned): multi-week+
-  build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with zero current consumers demanding
-  scans/txn. When greenlit: steal-patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC
-  over kv's existing atomic-swap seam) + TigerBeetle's VOPR methodology (not code); phased
-  ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
-  enough until then.
-- **VOPR fault-sweep DONE (2026-07-10):** green at 10× the shipped
-  run count (20k runs, no failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
-  covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
-- **Out-of-order / non-contiguous durability — COVERED 2026-07-10.** The former gap (`SimStorage`
-  could only collapse an un-synced window to a *contiguous prefix*) is closed: a new
-  `CrashMode.reorder_unsynced` tracks every `writeAll` since the last durability barrier as a
-  byte-range and, on crash, keeps a seed-driven **subset** of them — dropping an earlier range while
-  keeping a later one leaves a zero-filled *hole* between persisted regions (splitmix64,
-  deterministic, no clock/OS-rng). It is exercised generally in the VOPR (a 4th crash mode) and
-  targeted at `compact()`'s write-loop-then-single-`sync` temp-file window (root.zig ~632–648) by a
-  dedicated exhaustive sweep in `fault_test.zig` (every crash point × several seeds; a teeth assert
-  requires real holes to be punched). **Outcome: no defect — recovery is correct under
-  non-contiguous persistence.** Two structural reasons, now proven by the harness: (1) the CRC32
-  fail-stop replay truncates at the first hole, so a persisted-but-orphaned later record is *never*
-  resurrected, and committed records *before* a hole are never over-truncated (a hole can only sit
-  in the append-only tail, above every fsync'd record — direct replay-level test in `root.zig`);
-  (2) the only multi-write-before-`sync` window in the engine is `compact()`'s *temp* file, and the
-  temp is either discarded on reopen (crash before the rename) or adopted only *after* a full
-  `sync` (crash at/after the rename has no un-synced window), so recovery never depends on intra-file
-  write ordering. No product-code change was required — the temp-then-atomic-rename discipline was
-  already sound; the deliverable is the harness coverage that proves it.
-- **`Storage` directory listing** — DONE (2026-09-29, requested by the ingest daemon `seglog`
-  `manifestRebuild`, audit L4). See § "Optional directory listing".
-- ~~**Key iteration / fold over the keydir**~~ *(survey 2026-09-30)* — **DONE 2026-09-30** as `keys(gpa, prefix)`: a sorted snapshot of the live keys, taken under the lock. A value fold (`fold` in Bitcask) is not built: `get` per listed key does the same without holding the lock across the caller's function.
-- **Hint files / fast open** *(survey 2026-09-30)* — `open` replays the whole log, so start time grows with store size; Bitcask's hint files exist for exactly this. Effort: medium (a second CRC'd file rewritten by `compact`, torn-hint fallback to replay, needs the VOPR sweep extended). Fits §2.
-- **Data-file rotation / multi-file log** *(survey 2026-09-30)* — one ever-growing file means compaction rewrites everything; Bitcask merges sealed files incrementally. Effort: large (format v2, manifest). Fits §2.
-- ~~**Atomic batch write**~~ *(survey 2026-09-30)* — **DONE 2026-11-15**, see § "Atomic batch".
-- ~~**Paged key scan with bounded memory**~~ *(asked for by `sessions`, whose `KvStore.iterate` listed every key at once)* — **DONE 2026-11-19**, see § "Paged key scan".
-- ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
-- ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
-- ~~**Reader concurrency without a spinlock across fsync**~~ *(survey 2026-09-30)* — **DONE 2026-10-14 (in-process, S2 R5)**: writer mutex + keydir `RwLock`, exclusive only for the in-memory update. Tests: a reader answered (with the previous value) while a writer is parked inside fsync; readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer (`-fllvm -fsanitize-thread`; the self-hosted backend silently does not instrument — negative control needed it). Mutants: reader taking the writer lock (red), compaction swap without the exclusive lock (red + TSan races). Cross-process read-only open while a writer runs is the open half (S2 R5b).
-- ~~**FsStorage handle table is not safe for concurrent `open` from two threads**~~ *(found 2026-10-14 while reviewing R5)* — **FIXED 2026-10-14**: `table_lock` (an `std.Io.Mutex`) around slot claim and release. It mattered inside one `Db` too once merges open hint files outside the writer lock: ThreadSanitizer caught a merge and a rotation claiming slots at once in the stress test (3 of 12 runs).
-
-- **Speed: `put_sync_100` is fsync-bound at 1.01× rosedb** *(bench 2026-10-14)* — every durable put is write + `fsync` on both sides. Path to P1 there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space — measured 800–910 syncs/s vs ~305/s growing the file (§ "Optional preallocation"). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
-- ~~**VOPR trace replay does not know `merge`**~~ *(2026-10-14)* — **DONE 2026-11-15**: `RecordedOp.merge` (a mask over the sealed files, as ids are unknown at capture) is recorded by `generateTrace` under `Config.partial_merges`, replayed by `replayTraceOpts` (with the run's `Options`) and kept or dropped as one op by the shrinker.
-- ~~**Mutation run predates the 2026-10-14 rewrite**~~ — DONE 2026-10-25: full schemata run over `root.zig` (138 mutants, 27 tests added) plus a second over that day's changes (mmap reads, one-read get, merge clock, iterator sort: 42 mutants); 173 of 180 killed, 7 equivalent, each argued in the audit.
-
-## Status
-
-`gap · any · both · threadsafe` + deps: none (std only, I/O via `Storage`/`std.Io`) — canonical
-source is `pub const meta` in src/root.zig.
+- **LOW: `count()`, `deadBytes()` and `fileStats()` use `liveAt(now)` without the `expires()` guard** `get`/`keys`/`iterator` have — with an injected clock at exactly `maxInt(i64)` they drop non-expiring keys (the real clock cannot reach it). Also two redundant size assignments around `adoptFile`. With the next kv source change.
+- **Speed: `put_sync` is fsync-bound** — every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
+- **Incremental tail replay for `Db.refresh`.** A refresh is a full open (hints make merged files cheap; the active file and unmerged sealed files are replayed). Worth doing if a caller refreshes often. Idea.
+- **On-disk ordered index / MVCC / transactions** (deferred, see *What is deliberately not done*). When greenlit: steal patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC over kv's existing atomic-swap seam) and TigerBeetle's VOPR methodology (not code); phased: ordered-scan B-tree → MVCC snapshot reads → secondary indexes. Bitcask kv is enough until then.
 
 ## Anchoring
 
