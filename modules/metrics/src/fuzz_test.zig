@@ -362,6 +362,8 @@ const Check = struct {
         if (!known_kind) return error.BadLine;
         const gop = try c.typed.getOrPut(c.gpa, name);
         if (gop.found_existing) return error.Duplicate; // a repeated # TYPE fails the whole scrape
+        // OpenMetrics announces a counter without its `_total` suffix.
+        if (c.om and std.mem.eql(u8, kind, "counter") and std.mem.endsWith(u8, name, "_total")) return error.Family;
         c.family = name;
         c.family_kind = kind;
         c.prev_series = 0;
@@ -421,6 +423,8 @@ const Check = struct {
         const name = line[0..i];
         if (!nameOk(name, true)) return error.BadName;
         if (c.family.len == 0 or !std.mem.startsWith(u8, name, c.family)) return error.Family;
+        // ... and its samples carry it (a counter without one is typed `unknown`).
+        if (c.om and std.mem.eql(u8, c.family_kind, "counter") and !std.mem.endsWith(u8, name, "_total") and !std.mem.endsWith(u8, name, "_created")) return error.Family;
         var pairs: [24]Pair = undefined;
         var np: usize = 0;
         if (i < line.len and line[i] == '{') i = try labels(line, i + 1, &pairs, &np);
@@ -615,7 +619,12 @@ fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         const hv = if (d.byte() < 200) d.strAscii(&vb, &accept_vocab) else d.str(&vb, &label_vocab);
         w.print("{s}: {s}\r\n", .{ hn, hv }) catch {};
     }
-    if (d.byte() < 60) w.print("Content-Length: {d}\r\n", .{d.u64le()}) catch {};
+    if (d.byte() < 90) {
+        // Peer-declared lengths: anywhere in u64, and right at its top, where
+        // a request-size sum overflows.
+        const cl_len: u64 = if (d.byte() < 128) d.u64le() else std.math.maxInt(u64) - d.below(400);
+        w.print("Content-Length: {d}\r\n", .{cl_len}) catch {};
+    }
     w.writeAll("Connection: close\r\n\r\n") catch {};
 
     var in: std.Io.Reader = .fixed(w.buffered());
@@ -764,6 +773,13 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                     inline .counter, .gauge, .histogram, .summary => |vec, tag| {
                         if (vec.with(vals[0..nv])) |m| {
                             hit("with-" ++ @tagName(tag));
+                            // What an accepted tuple must satisfy (the registry's
+                            // limits above and the UTF-8 rule of `Label`).
+                            for (vals[0..nv]) |v| {
+                                if (v.len > reg.max_label_value_len) return error.LongValueAccepted;
+                                if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8Accepted;
+                            }
+                            if (vec.len() > reg.max_series_per_family) return error.TooManySeriesAccepted;
                             switch (tag) {
                                 .counter => m.add(d.u16le()),
                                 .gauge => m.set(d.f64v()),
@@ -786,10 +802,19 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 for (vals[0..row.nlabels], vbufs[0..row.nlabels]) |*v, *vb| v.* = d.str(vb, &label_vocab);
                 var exl: [4]metrics.Label = undefined;
                 var enb: [4][20]u8 = undefined;
-                var evb: [4][64]u8 = undefined;
+                var evb: [4][72]u8 = undefined;
                 const ne = d.below(5);
                 for (exl[0..ne], enb[0..ne], evb[0..ne]) |*l, *nb, *vb| {
-                    l.* = .{ .name = if (d.byte() < 180) pool_labels[d.below(pool_labels.len)] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
+                    // Some values run to the rune cap (128 runes in all) or past it.
+                    const long = d.byte() < 40;
+                    l.* = .{
+                        .name = if (d.byte() < 180) pool_labels[d.below(pool_labels.len)] else d.str(nb, &name_vocab),
+                        .value = if (long) blk: {
+                            const k = 20 + d.below(vb.len - 20);
+                            @memset(vb[0..k], 'x');
+                            break :blk vb[0..k];
+                        } else d.str(vb, &label_vocab),
+                    };
                 }
                 const ts: ?f64 = if (d.byte() < 128) d.f64v() else null;
                 switch (row.vec) {
