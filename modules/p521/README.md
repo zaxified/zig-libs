@@ -31,7 +31,7 @@ defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
 const sig = try kp.sign("message", null);          // RFC 6979 deterministic
 try sig.verify("message", kp.public_key);
 var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-const der = sig.toDer(&der_buf);                     // strict DER, ≤ 139 bytes
+const der = sig.toDer(&der_buf);                     // strict DER, ≤ 141 bytes
 const pk = try Ecdsa.PublicKey.fromSec1(&kp.public_key.toUncompressedSec1());
 
 // ECDH: x-coordinate of secret · peer, 66 bytes; compressed or uncompressed peer.
