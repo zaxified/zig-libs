@@ -376,8 +376,8 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   score of the best sampled grid is 0.55–0.57 about the horizontal axis, where about the vertical axis it is 1.0
   to 25°. The refinement (alignment patterns, `refine`) is the suspect: it takes one module size for both
   directions (`findAlignment` and `dropOutliers` are handed `c.module`), and a tilt about the horizontal axis changes the vertical one.
-  *BOUNCED: needs an experiment loop (render a tilted symbol, read it, change the vertical run's module size, repeat over the
-  sweep) that was not run; the first thing to try is a separate vertical module size from the finder runs.*
+  *Not attempted (wave 15, budget): it needs an experiment loop (render a tilted symbol, read it, change the vertical run's
+  module size, repeat over the sweep); the first thing to try is a separate vertical module size from the finder runs.*
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
   pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
   Diagnosed 2026-11-21 (version 1, "HELLO", 3 px per module, every 3° of rotation): 27 of 30 angles read; at the
@@ -385,5 +385,5 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   come out wrong, scattered over finder edges and data alike. With no alignment pattern the grid is three finder
   centres and nothing refines it, so a sub-pixel error in them moves every sample by a third of a module. It is
   the grid, not the binarisation: the cure would be a sub-pixel finder centre (edge fit rather than the run
-  midpoint), not tried. *BOUNCED: the same experiment loop (a binarisation or centre-fit change judged against the 3-pixel
-  version 1 sweep and the whole differential), not run in this wave.*
+  midpoint), not tried. *Not attempted (wave 15, budget): the same experiment loop (a binarisation or centre-fit change judged against the
+  3-pixel version 1 sweep and the whole differential).*

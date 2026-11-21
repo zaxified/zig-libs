@@ -250,11 +250,16 @@ an SDK run (see *Backlog / deferred*).
   gracefully (test "subscriptions/listen is the acknowledgment then the graceful close"); a
   held-open stream needs change notifications in `mcp` and a held-open response API in `http` (the
   io-less handler cannot park a connection today, see *GET is drain-and-close*). Effort: large;
-  depends on `http` and `mcp`.
+  depends on `http` and `mcp`. *BOUNCED: the held-open response API is a design of the `http` module, not of this one;
+  `mcp`'s side (`PushSink`, `notifyListChanged`, `notifyResourceUpdated`) is complete.*
 - **Cancellation reaching a running handler.** A closed SSE response stops the writes but cannot
-  interrupt the handler; needs a cancellation seam in `mcp`.
+  interrupt the handler. `mcp`'s seam exists (`ToolCall.cancelled()`, `Server.cancelInflight(peer, id)`, safe from another
+  thread); what is missing is `http` telling a running handler that its connection went away (a liveness probe or a close
+  callback), which the io-less handler contract does not have. *BOUNCED: an `http` seam, not this module's.*
 - **A differential run against an official SDK client speaking 2026-07-28.** The python-sdk oracle
-  above is the 2025-06-18 capture; the 2026-07-28 rules are anchored to the specification text.
+  above is the 2025-06-18 capture; the 2026-07-28 rules are anchored to the specification text. The oracle venv's Python SDK
+  2.3.0 names the 2026-07-28 revision in its source, so a live run is possible: a server binary over `http` and a driver, as
+  `mcp`'s `tools/sdk_oracle` does for stdio. *Not attempted (wave 15, budget).*
 
 ## Anchoring
 
