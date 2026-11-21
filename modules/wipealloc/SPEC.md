@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation 2026-11-18 (8/8, 0 eq) · src 587079bec2c92279
 
-**Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18) · panic 2026-11-18 (every pub entry point read: no `assert`, `unreachable`, `@panic` or `.?` in the module; every failure is the child's `null`)
+**Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18) · panic 2026-11-18 (every pub entry point read: no `assert`, `unreachable`, `@panic` or `.?` in `WipingAllocator`; every failure is the child's `null`); `SecureAllocator` (2026-11-21) panics by design on an overwritten canary in `free`, as libsodium aborts, and nowhere else
 
 **Performance:** not measured
 
@@ -29,7 +29,7 @@ Surveyed 2026-11-18 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | C | ISC | 14.1k | 1.0.22 (2026-04-09) | `sodium_malloc`/`sodium_free`: guard pages, canary, `mlock`, wipe on free. More protection per block; no `realloc`, so a growing buffer is the caller's copy. |
 | [RustCrypto/utils](https://github.com/RustCrypto/utils) (`zeroize`) | Rust | Apache-2.0 OR MIT *(inferred)* | 0.7k | push 2026-11-17 | `Zeroizing<Vec<u8>>` wipes the vector's contents on drop *(inferred from the crate's docs)*; a wrapper type, not an allocator, so third-party containers do not benefit. |
 
-**Where we are ahead:** a drop-in `std.mem.Allocator`, so every std container and arena that takes an allocator wipes its growth copies without code changes. **Where we are behind:** no guard pages, no `mlock`, no canary (→ Backlog).
+**Where we are ahead:** a drop-in `std.mem.Allocator`, so every std container and arena that takes an allocator wipes its growth copies without code changes; `SecureAllocator` adds `sodium_malloc`'s guard pages, canary and `mlock`. **Where we are behind:** no allocation tracking or quarantine, no in-place growth variant (→ *What is deliberately not done*).
 
 ## What this module is, and what it is not
 
@@ -68,6 +68,22 @@ over `memory.len`, a public length. The module makes no timing claim beyond that
 - Cost: one volatile store per byte on `free` (`std.crypto.secureZero`); a module
   that wants vector-width wipes can link `fastmem` for the whole binary.
 
+## Secure allocator (`SecureAllocator`)
+
+`SecureAllocator.init(lock)` (Linux; `getrandom` draws its canary) is a separate allocator for a handful of keys, after
+libsodium's `sodium_malloc` and OpenSSL's `OPENSSL_secure_malloc`. Per block: one anonymous mapping of
+`guard page | data pages | guard page` (the guards `PROT_NONE`), the data pages `mlock`ed (`Lock.best_effort` goes on
+unlocked when `RLIMIT_MEMLOCK` refuses, `.required` fails the allocation, `.off` does not try) and `MADV_DONTDUMP`ed, a
+16-byte per-allocator random canary directly in front of the block, and the block placed as far toward the upper guard
+as its alignment allows (a block whose length is a multiple of its alignment ends exactly at the guard, so any overrun
+faults). `free` checks the canary (`@panic` when overwritten, as libsodium aborts; `canaryIntact` for a caller that
+wants to ask), zeroes every data page with `secureZero` and unmaps the whole mapping (which also unlocks it).
+`resize`/`remap` are refused. A block of alignment above the page size, of length 0, or whose pages would pass 1 TiB
+is `null`. Cost: two system calls and at least three pages of address space per block. Tests (`src/root.zig`): guard
+pages on both sides and the data pages readable (`process_vm_readv` reports `EFAULT` for an unreadable page
+without a signal), alignment up to the page, the canary per allocator and its detection, `realloc`, `Lock.required`
+under `RLIMIT_MEMLOCK` of 0 (skipped when the limit cannot be set), and an unmapped block after `free`.
+
 ## Anchoring
 
 Expected values: the spy child's view of the block (all zero), the data after a
@@ -79,8 +95,13 @@ Our own reading of the contract.
 ## What is deliberately not done
 
 - **No allocation tracking and no quarantine** (libsodium's `sodium_malloc` does
-  these): this wipes on free and nothing else. **Never.** Guard pages / `mlock` and
-  the in-place growth variant are deferred, not refused: see *Backlog / deferred*.
+  these): this wipes on free and nothing else. **Never.**
+- **An in-place growth variant** (what `mls`'s private `Wiper` does under its arena:
+  grow-in-place `resize` forwarded, shrink and `remap` refused): neither OpenSSL nor libsodium offers
+  a growing wipe, and `mls` is the only consumer, so a second allocator type here would serve one caller
+  that already has it. Reopen when a second consumer needs it.
+- **A `realloc` for `SecureAllocator`** (neither libsodium's `sodium_malloc` nor OpenSSL's `OPENSSL_secure_malloc`
+  has one): `resize`/`remap` are refused, a growing buffer is alloc + copy + `free`.
 
 ## Verification
 
@@ -96,7 +117,4 @@ Our own reading of the contract.
 
 ## Backlog / deferred
 
-- **Locked, guard-paged secure heap** (`sodium_malloc`, `OPENSSL_secure_malloc`): deferred, a separate allocator; effort
-  medium; no consumer asks.
-- **In-place growth variant** (what `mls`'s private `Wiper` does under its arena: grow-in-place `resize` forwarded, shrink
-  and `remap` refused): deferred, a second allocator type in this module if a second consumer needs it.
+None open.

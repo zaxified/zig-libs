@@ -81,6 +81,131 @@ pub const WipingAllocator = struct {
     }
 };
 
+/// A locked, guard-paged allocator for key material (libsodium's `sodium_malloc`, OpenSSL's
+/// `OPENSSL_secure_malloc`): every block gets its own mapping of whole pages, a `PROT_NONE` guard
+/// page on each side, the block placed as far toward the upper guard as its alignment allows, a
+/// random canary directly in front of it, the pages locked into RAM (`mlock`) and kept out of core
+/// dumps (`MADV_DONTDUMP`), and the whole mapping zeroed and unmapped on `free`.
+///
+/// A write that runs past the end of a block faults on the guard page (a block whose length is a
+/// multiple of its alignment ends exactly at it); a write before the block that reaches the canary
+/// is found by `free`, which panics ("canary overwritten") rather than hand corrupted memory back
+/// quietly, as libsodium aborts. `resize` and `remap` are refused, like `WipingAllocator`, so a
+/// growing buffer is alloc + copy + `free` and the old block is wiped. The cost is two system
+/// calls and at least three pages of address space per block: use it for a handful of keys, never
+/// as the general-purpose allocator (a `std.ArrayList` of secrets behind `WipingAllocator` is the
+/// cheap form). Linux only; blocks of alignment above the page size are refused (`null`).
+pub const SecureAllocator = struct {
+    /// What a failing `mlock` (`RLIMIT_MEMLOCK` is often 64 KiB or 8 MiB) does.
+    lock: Lock = .best_effort,
+    /// Written in front of every block, checked on `free`; random per allocator.
+    canary: [canary_len]u8,
+
+    pub const Lock = enum {
+        /// Keep going unlocked: the guard pages and the wipe still apply (libsodium's behaviour).
+        best_effort,
+        /// The allocation fails (`null`, `error.OutOfMemory`) when the pages cannot be locked.
+        required,
+        /// Do not lock.
+        off,
+    };
+
+    /// The canary ends where the block starts.
+    pub const canary_len = 16;
+
+    /// The canary is drawn from the kernel (`getrandom`); `error.RandomFailed` when it cannot be.
+    pub fn init(lock: Lock) error{RandomFailed}!SecureAllocator {
+        var self: SecureAllocator = .{ .lock = lock, .canary = undefined };
+        var got: usize = 0;
+        while (got < canary_len) {
+            const rc = std.os.linux.getrandom(self.canary[got..].ptr, canary_len - got, 0);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => got += rc,
+                .INTR => {},
+                else => return error.RandomFailed,
+            }
+        }
+        return self;
+    }
+
+    /// The secure allocator. The returned value points at `self`, which must outlive every block
+    /// allocated through it and must not move.
+    pub fn allocator(self: *SecureAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &secure_vtable };
+    }
+
+    /// Whether the canary in front of `block` (a slice this allocator returned) is intact.
+    pub fn canaryIntact(self: *const SecureAllocator, block: []const u8) bool {
+        const c = block.ptr - canary_len;
+        return std.mem.eql(u8, c[0..canary_len], &self.canary);
+    }
+
+    const secure_vtable: Allocator.VTable = .{
+        .alloc = secureAlloc,
+        .resize = secureResize,
+        .remap = secureRemap,
+        .free = secureFree,
+    };
+
+    fn secureResize(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn secureRemap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    /// The data pages' size for a block: its length, the canary and the slack of the alignment,
+    /// rounded up to whole pages; null on overflow or past the 1 TiB cap.
+    fn dataLen(len: usize, align_bytes: usize, page: usize) ?usize {
+        const need = std.math.add(usize, len, canary_len + align_bytes) catch return null;
+        const total = std.math.add(usize, need, page - 1) catch return null;
+        const rounded = total / page * page;
+        return if (rounded > (1 << 40)) null else rounded;
+    }
+
+    fn secureAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
+        const self: *SecureAllocator = @ptrCast(@alignCast(ctx));
+        const linux = std.os.linux;
+        const page = std.heap.pageSize();
+        const align_bytes = alignment.toByteUnits();
+        if (align_bytes > page or len == 0) return null;
+        const data = dataLen(len, align_bytes, page) orelse return null;
+        const map = std.posix.mmap(null, data + 2 * page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return null;
+        const lo_guard = map.ptr;
+        const hi_guard = map.ptr + page + data;
+        if (linux.errno(linux.mprotect(lo_guard, page, .{})) != .SUCCESS or
+            linux.errno(linux.mprotect(hi_guard, page, .{})) != .SUCCESS)
+        {
+            std.posix.munmap(map);
+            return null;
+        }
+        const region = map.ptr + page;
+        if (self.lock != .off and linux.errno(linux.mlock(region, data)) != .SUCCESS and self.lock == .required) {
+            std.posix.munmap(map);
+            return null;
+        }
+        _ = linux.madvise(region, data, linux.MADV.DONTDUMP); // best effort: only keeps the pages out of core dumps
+        const end = @intFromPtr(region) + data;
+        const user = std.mem.alignBackward(usize, end - len, align_bytes);
+        const canary: [*]u8 = @ptrFromInt(user - canary_len);
+        @memcpy(canary[0..canary_len], &self.canary);
+        return @ptrFromInt(user);
+    }
+
+    fn secureFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, _: usize) void {
+        const self: *SecureAllocator = @ptrCast(@alignCast(ctx));
+        const page = std.heap.pageSize();
+        const data = dataLen(memory.len, alignment.toByteUnits(), page).?; // what `secureAlloc` computed for this block
+        const end = std.mem.alignForward(usize, @intFromPtr(memory.ptr) + memory.len, page);
+        const region: [*]u8 = @ptrFromInt(end - data);
+        if (!self.canaryIntact(memory)) @panic("wipealloc: canary overwritten (a write ran before the block)");
+        std.crypto.secureZero(u8, region[0..data]);
+        const map: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(end - data - page);
+        std.posix.munmap(map[0 .. data + 2 * page]); // unmapping also unlocks the pages
+    }
+};
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -191,4 +316,107 @@ test "init and the struct literal are the same adapter; an allocation failure pa
     var a2: WipingAllocator = .{ .child = failing.allocator() };
     try testing.expectError(error.OutOfMemory, a1.allocator().alloc(u8, 8));
     try testing.expectError(error.OutOfMemory, a2.allocator().alloc(u8, 8));
+}
+
+// ── SecureAllocator ─────────────────────────────────────────────────────────
+
+/// Whether a read of one byte at `p` succeeds: `process_vm_readv` on this process reports
+/// `EFAULT` for an unreadable page instead of raising a signal.
+fn readable(p: [*]const u8) bool {
+    var b: [1]u8 = undefined;
+    const local = [_]std.posix.iovec{.{ .base = &b, .len = 1 }};
+    const remote = [_]std.posix.iovec_const{.{ .base = p, .len = 1 }};
+    const rc = std.os.linux.process_vm_readv(std.os.linux.getpid(), &local, &remote, 0);
+    return std.os.linux.errno(rc) == .SUCCESS;
+}
+
+test "SecureAllocator: a block is usable, guard-paged on both sides, and its data pages are readable" {
+    var sa = try SecureAllocator.init(.best_effort);
+    const a = sa.allocator();
+    const page = std.heap.pageSize();
+    for ([_]usize{ 1, 7, 16, 100, page - 20, page, 3 * page + 5 }) |len| {
+        const buf = try a.alloc(u8, len);
+        defer a.free(buf);
+        @memset(buf, 0xa5);
+        try testing.expect(sa.canaryIntact(buf));
+        try testing.expect(readable(buf.ptr));
+        try testing.expect(readable(buf.ptr + len - 1));
+        // The block ends flush against the upper guard page (alignment 1), the page after is unreadable.
+        const end = std.mem.alignForward(usize, @intFromPtr(buf.ptr) + len, page);
+        try testing.expectEqual(@intFromPtr(buf.ptr) + len, end);
+        try testing.expect(!readable(@ptrFromInt(end)));
+        // The data pages start `dataLen` bytes before that end; the page before them is a guard too.
+        const first_data = end - SecureAllocator.dataLen(len, 1, page).?;
+        try testing.expect(readable(@ptrFromInt(first_data)));
+        try testing.expect(!readable(@ptrFromInt(first_data - page)));
+    }
+}
+
+test "SecureAllocator: alignment is honoured up to the page size, larger is refused" {
+    var sa = try SecureAllocator.init(.off);
+    const a = sa.allocator();
+    inline for (.{ 1, 8, 16, 64, 4096 }) |al| {
+        const buf = try a.alignedAlloc(u8, .fromByteUnits(al), 24);
+        defer a.free(buf);
+        try testing.expectEqual(@as(usize, 0), @intFromPtr(buf.ptr) % al);
+        try testing.expect(sa.canaryIntact(buf));
+    }
+    try testing.expectError(error.OutOfMemory, a.alignedAlloc(u8, .fromByteUnits(2 * std.heap.pageSize()), 8));
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, std.math.maxInt(usize)));
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, 1 << 41));
+}
+
+test "SecureAllocator: the canary is per allocator, an overwritten one is seen, resize and remap are refused, realloc copies" {
+    var s1 = try SecureAllocator.init(.off);
+    var s2 = try SecureAllocator.init(.off);
+    try testing.expect(!std.mem.eql(u8, &s1.canary, &s2.canary));
+    const a = s1.allocator();
+    const buf = try a.alloc(u8, 32);
+    try testing.expect(!s2.canaryIntact(buf));
+    try testing.expect(!a.resize(buf, 16));
+    try testing.expect(a.remap(buf, 64) == null);
+    @memset(buf, 0x11);
+    const bigger = try a.realloc(buf, 5000);
+    defer a.free(bigger);
+    try testing.expect(std.mem.allEqual(u8, bigger[0..32], 0x11));
+    try testing.expect(s1.canaryIntact(bigger));
+    // A damaged canary is visible (and `free` would panic, so the block is restored first).
+    bigger[0..].ptr[0] = 1;
+    (bigger.ptr - 1)[0] ^= 0xff;
+    try testing.expect(!s1.canaryIntact(bigger));
+    (bigger.ptr - 1)[0] ^= 0xff;
+    try testing.expect(s1.canaryIntact(bigger));
+}
+
+test "SecureAllocator: lock required fails when mlock does, best effort and off do not; many blocks come and go" {
+    // A limit of 0 bytes of locked memory makes `mlock` fail (unless the process may exceed it).
+    var old: std.os.linux.rlimit = undefined;
+    _ = std.os.linux.getrlimit(.MEMLOCK, &old);
+    var one = try SecureAllocator.init(.required);
+    var two = try SecureAllocator.init(.best_effort);
+    var three = try SecureAllocator.init(.off);
+    const zero: std.os.linux.rlimit = .{ .cur = 0, .max = old.max };
+    if (std.os.linux.errno(std.os.linux.setrlimit(.MEMLOCK, &zero)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = std.os.linux.setrlimit(.MEMLOCK, &old);
+    // Root or CAP_IPC_LOCK ignores the limit: then `required` succeeds and there is nothing to see.
+    if (one.allocator().alloc(u8, 8)) |b| {
+        one.allocator().free(b);
+    } else |e| try testing.expectEqual(error.OutOfMemory, e);
+    for ([_]*SecureAllocator{ &two, &three }) |sa| {
+        const a = sa.allocator();
+        var blocks: [20][]u8 = undefined;
+        for (&blocks, 0..) |*bp, i| bp.* = try a.alloc(u8, 10 + i);
+        for (blocks) |bp| a.free(bp);
+    }
+}
+
+test "SecureAllocator: free wipes the block's pages before unmapping" {
+    // The mapping is gone after `free`, so the wipe is checked through a child of `WipingAllocator`
+    // alone (above); here the data pages are inspected up to the `free` call.
+    var sa = try SecureAllocator.init(.off);
+    const a = sa.allocator();
+    const buf = try a.alloc(u8, 64);
+    @memset(buf, 0xee);
+    a.free(buf);
+    try testing.expect(!readable(buf.ptr)); // unmapped: a stale pointer faults instead of reading a secret
 }

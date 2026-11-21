@@ -27,6 +27,15 @@ Why it matters: in Debug and ReleaseSafe `Allocator.free` already poisons the
 block (`0xaa`); in ReleaseFast that memset compiles away and the wiper is what
 stands between a freed block and unrelated code.
 
+`SecureAllocator` is the heavier form for a handful of keys (libsodium's `sodium_malloc`): each block in its own
+mapping between two guard pages, `mlock`ed, with a canary in front of it, zeroed and unmapped on `free`.
+
+```zig
+var secure = try wipealloc.SecureAllocator.init(.best_effort);
+const key = try secure.allocator().alloc(u8, 32);
+defer secure.allocator().free(key);
+```
+
 Not a stack-burn helper (that is each module's private `burn.zig`, per
 CONVENTIONS §2.1 D3) and not a wiping arena: `mls` keeps its own `Wiper`
 because it forwards grow-in-place resizes (see SPEC).
