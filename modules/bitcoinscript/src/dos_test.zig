@@ -23,17 +23,21 @@ fn dummyCtx() txctx.TxContext {
     };
 }
 
-test "DoS: witness item count over the consensus-adjacent bound is rejected, no OOM" {
+test "DoS: a P2WSH witness stack over the 1000-entry stack limit is refused, no OOM" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const script_pubkey = [_]u8{ 0x00, 0x20 } ++ @as([32]u8, @splat(0xcc)); // P2WSH program
+    const witness_script = [_]u8{0x51}; // OP_1: pushing one more onto a full stack overflows it
+    var got: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&witness_script, &got, .{});
+    const script_pubkey = [_]u8{ 0x00, 0x20 } ++ got;
     var items: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
-    while (i < limits.max_stack_items_in_witness + 5) : (i += 1) try items.append(a, "x");
+    while (i < limits.max_stack_size) : (i += 1) try items.append(a, "x");
+    try items.append(a, &witness_script);
 
-    try testing.expectError(error.PushSize, verify.verifyScript(a, &.{}, &script_pubkey, items.items, .{ .witness = true }, dummyCtx()));
+    try testing.expectError(error.StackSize, verify.verifyScript(a, &.{}, &script_pubkey, items.items, .{ .witness = true }, dummyCtx()));
 }
 
 test "DoS: an oversized non-final witness item (P2WSH stack seed) is rejected" {

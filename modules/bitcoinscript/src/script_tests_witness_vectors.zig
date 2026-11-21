@@ -3,12 +3,12 @@
 // Do not hand-edit; regenerate instead.
 
 //! The **witness-bearing** rows of Bitcoin Core's `script_tests.json`
-//! (`bitcoin/bitcoin` `src/test/data/script_tests.json`, tag `v29.0`), which
+//! (`bitcoin/bitcoin` `src/test/data/script_tests.json`, tag `v31.1`), which
 //! the sibling `script_tests_vectors.zig` excludes wholesale.
 //!
 //! Measured against that upstream file, not against our importer: it holds
-//! **1258 array entries, 51 of them comment-only, so 1207 data rows**, and
-//! **107 of those data rows carry a witness field** (a leading
+//! **1273 array entries, 51 of them comment-only, so 1222 data rows**, and
+//! **113 of those data rows carry a witness field** (a leading
 //! `[<stack item hex>..., <amount in BTC>]` array). Zero of them set the
 //! `TAPROOT` flag -- Core keeps the BIP342 corpus in a different file
 //! (`script_assets_test.json`), so "no taproot rows here" is a property of
@@ -441,6 +441,16 @@ pub const vectors = [_]Vector{
         .comment = "Basic P2SH(P2WPKH)",
     },
     .{
+        .witness = &.{ "", "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0 0x14 0xfe78b0052557b3d67248d04e4f7b99c361167432",
+        .flags = .{ .p2sh = true, .witness = true, .witness_pubkeytype = true },
+        .expect = "Pubkeytype",
+        .core_expect = "WITNESS_PUBKEYTYPE",
+        .comment = "P2WPKH with invalid prefix for compressed key",
+    },
+    .{
         .witness = &.{ "", "304402207eb8a59b5c65fc3f6aeef77066556ed5c541948a53a3ba7f7c375b8eed76ee7502201e036a7a9a98ff919ff94dc905d67a1ec006f79ef7cff0708485c8bb79dce38e01", "5121038282263212c609d9ea2a6e3e172de238d8c39cabd5ac1ca10646e23fd5f51508210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179852ae" },
         .amount = 1,
         .script_sig = "",
@@ -746,8 +756,8 @@ pub const vectors = [_]Vector{
         .script_sig = "",
         .script_pubkey = "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
         .flags = .{ .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -756,8 +766,8 @@ pub const vectors = [_]Vector{
         .script_sig = "",
         .script_pubkey = "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
         .flags = .{ .minimalif = true, .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -866,8 +876,8 @@ pub const vectors = [_]Vector{
         .script_sig = "",
         .script_pubkey = "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
         .flags = .{ .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -876,8 +886,8 @@ pub const vectors = [_]Vector{
         .script_sig = "",
         .script_pubkey = "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
         .flags = .{ .minimalif = true, .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -986,8 +996,8 @@ pub const vectors = [_]Vector{
         .script_sig = "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
         .script_pubkey = "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
         .flags = .{ .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -996,8 +1006,8 @@ pub const vectors = [_]Vector{
         .script_sig = "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
         .script_pubkey = "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
         .flags = .{ .minimalif = true, .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -1106,8 +1116,8 @@ pub const vectors = [_]Vector{
         .script_sig = "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
         .script_pubkey = "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
         .flags = .{ .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
     },
     .{
@@ -1116,8 +1126,58 @@ pub const vectors = [_]Vector{
         .script_sig = "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
         .script_pubkey = "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
         .flags = .{ .minimalif = true, .p2sh = true, .witness = true },
-        .expect = "UnbalancedConditional",
-        .core_expect = "UNBALANCED_CONDITIONAL",
+        .expect = "InvalidStackOperation",
+        .core_expect = "INVALID_STACK_OPERATION",
         .comment = "",
+    },
+    .{
+        .witness = &.{ "1ffe1234567890", "00", "#SCRIPT# HASH256 DUP SHA1 DROP DUP DROP TOALTSTACK HASH256 DUP DROP TOALTSTACK FROMALTSTACK", "#CONTROLBLOCK#" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0x51 0x20 #TAPROOTOUTPUT#",
+        .flags = .{ .p2sh = true, .taproot = true, .witness = true },
+        .expect = null,
+        .core_expect = "OK",
+        .comment = "TAPSCRIPT Tests testing tapscript with many different op codes including ALTSTACK interactions",
+    },
+    .{
+        .witness = &.{ "abcdef", "#SCRIPT# 1 IF SHA256 ENDIF SIZE SWAP DROP 32 EQUAL", "#CONTROLBLOCK#" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0x51 0x20 #TAPROOTOUTPUT#",
+        .flags = .{ .p2sh = true, .taproot = true, .witness = true },
+        .expect = null,
+        .core_expect = "OK",
+        .comment = "TAPSCRIPT Test IF conditional when true",
+    },
+    .{
+        .witness = &.{ "abcdef", "#SCRIPT# 0 IF SHA256 ENDIF SIZE SWAP DROP 32 EQUAL", "#CONTROLBLOCK#" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0x51 0x20 #TAPROOTOUTPUT#",
+        .flags = .{ .p2sh = true, .taproot = true, .witness = true },
+        .expect = "EvalFalse",
+        .core_expect = "EVAL_FALSE",
+        .comment = "TAPSCRIPT Test IF conditional when false",
+    },
+    .{
+        .witness = &.{ "aa", "bb", "cc", "#SCRIPT# EQUAL IF DROP DROP ENDIF", "#CONTROLBLOCK#" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0x51 0x20 #TAPROOTOUTPUT#",
+        .flags = .{ .p2sh = true, .taproot = true, .witness = true },
+        .expect = null,
+        .core_expect = "OK",
+        .comment = "TAPSCRIPT Test that DROP operations do not execute inside of a false IF conditional",
+    },
+    .{
+        .witness = &.{ "aa", "#SCRIPT# 0 CHECKSIG", "#CONTROLBLOCK#" },
+        .amount = 1,
+        .script_sig = "",
+        .script_pubkey = "0x51 0x20 #TAPROOTOUTPUT#",
+        .flags = .{ .p2sh = true, .taproot = true, .witness = true },
+        .expect = "Pubkeytype",
+        .core_expect = "TAPSCRIPT_EMPTY_PUBKEY",
+        .comment = "TAPSCRIPT: OP_CHECKSIG with empty pubkey must fail",
     },
 };

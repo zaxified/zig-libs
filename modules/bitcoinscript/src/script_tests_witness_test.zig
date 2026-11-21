@@ -22,6 +22,7 @@ const asmparser = @import("asmparser.zig");
 const verify = @import("verify.zig");
 const txctx = @import("txctx.zig");
 const vectors_mod = @import("script_tests_witness_vectors.zig");
+const taproot = @import("taproot");
 
 // See the sibling file's note: `.vin`/`.vout` must be heap-allocated, because
 // these helpers take runtime parameters and an `&[_]T{...}` literal here would
@@ -65,19 +66,50 @@ fn buildSpendingTx(
     };
 }
 
-fn hexItems(allocator: std.mem.Allocator, hexes: []const []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, hexes.len);
-    for (hexes, 0..) |h, i| {
-        const buf = try allocator.alloc(u8, h.len / 2);
-        out[i] = try std.fmt.hexToBytes(buf, h);
+const script_marker = "#SCRIPT# ";
+const controlblock_marker = "#CONTROLBLOCK#";
+const taprootoutput_marker = "#TAPROOTOUTPUT#";
+
+/// A row's witness stack and scriptPubKey. Core's tapscript rows are
+/// templates: `#SCRIPT# <asm>` is the leaf script, `#CONTROLBLOCK#` its
+/// control block and `0x51 0x20 #TAPROOTOUTPUT#` the output committing to it
+/// (script_tests.cpp builds a single-leaf tree over a fixed internal key; any
+/// valid internal key gives the same verdicts, so the BIP341 NUMS point is
+/// used and the tree is built by the sibling `taproot` module).
+const Resolved = struct { witness: []const []const u8, script_pubkey: []const u8 };
+
+fn resolve(allocator: std.mem.Allocator, v: vectors_mod.Vector) !Resolved {
+    const out = try allocator.alloc([]const u8, v.witness.len);
+    var leaf: ?[]const u8 = null;
+    for (v.witness, 0..) |h, i| {
+        if (std.mem.startsWith(u8, h, script_marker)) {
+            leaf = try asmparser.assemble(allocator, h[script_marker.len..]);
+            out[i] = leaf.?;
+        } else if (!std.mem.eql(u8, h, controlblock_marker)) {
+            const buf = try allocator.alloc(u8, h.len / 2);
+            out[i] = try std.fmt.hexToBytes(buf, h);
+        } else {
+            out[i] = &.{};
+        }
     }
-    return out;
+    const tapout = std.mem.indexOf(u8, v.script_pubkey, taprootoutput_marker);
+    if (leaf == null and tapout == null) return .{ .witness = out, .script_pubkey = try asmparser.assemble(allocator, v.script_pubkey) };
+    const info = try taproot.buildFromLeaves(allocator, taproot.numsInternalKey(), &.{.{ .depth = 0, .script = leaf.? }});
+    for (v.witness, 0..) |h, i| {
+        if (std.mem.eql(u8, h, controlblock_marker)) out[i] = try info.controlBlockAlloc(allocator, 0);
+    }
+    const prefix = try asmparser.assemble(allocator, v.script_pubkey[0..tapout.?]);
+    const spk = try allocator.alloc(u8, prefix.len + 32);
+    @memcpy(spk[0..prefix.len], prefix);
+    @memcpy(spk[prefix.len..], &info.output.x);
+    return .{ .witness = out, .script_pubkey = spk };
 }
 
 fn runVector(allocator: std.mem.Allocator, v: vectors_mod.Vector) !void {
     const script_sig = try asmparser.assemble(allocator, v.script_sig);
-    const script_pubkey = try asmparser.assemble(allocator, v.script_pubkey);
-    const witness = try hexItems(allocator, v.witness);
+    const resolved = try resolve(allocator, v);
+    const script_pubkey = resolved.script_pubkey;
+    const witness = resolved.witness;
 
     const credit_tx = try buildCreditingTx(allocator, script_pubkey, v.amount);
     const credit_txid = try credit_tx.txid(allocator);
@@ -125,10 +157,10 @@ test "script_tests.json witness rows: every result class matches Bitcoin Core's"
         if (v.expect == null) ok_count += 1 else err_count += 1;
     }
     // Corpus-shape sanity, so a truncated or empty vectors file cannot "pass"
-    // with zero coverage. Upstream v29.0 has 107 witness rows: 42 OK, 65 error.
-    try testing.expectEqual(@as(usize, 107), vectors_mod.vectors.len);
-    try testing.expectEqual(@as(usize, 42), ok_count);
-    try testing.expectEqual(@as(usize, 65), err_count);
+    // with zero coverage. Upstream v31.1 has 113 witness rows: 45 OK, 68 error.
+    try testing.expectEqual(@as(usize, 113), vectors_mod.vectors.len);
+    try testing.expectEqual(@as(usize, 45), ok_count);
+    try testing.expectEqual(@as(usize, 68), err_count);
 }
 
 test "the witness corpus really does reach the segwit paths it claims to" {

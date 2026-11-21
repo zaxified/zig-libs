@@ -18,7 +18,7 @@
 //! as "NOT byte-exact against an external transaction vector"). That
 //! leaves the exact question a self-round-trip can never answer open: does
 //! this module's taproot verifier agree with Bitcoin Core's on REAL
-//! consensus transactions? These five vectors close that gap for a
+//! consensus transactions? These eight vectors close that gap for a
 //! representative slice of the taproot/tapscript surface:
 //!
 //! - `siglen_empty_keypath` — plain BIP341 key-path spend (single Schnorr
@@ -41,6 +41,9 @@
 //!   anyone-can-spend for unknown leaf versions (a future-upgrade
 //!   escape hatch), so this is a distinct code path from all the above
 //!   (`verifyTaprootScriptPath`'s unknown-leaf-version branch).
+//! - `sighash/keypath*` (three entries) — BIP341 KEY-path spends whose witness
+//!   carries an annex (`[signature, 0x50…]`): the sighash must commit to the
+//!   annex (`spend_type = 1`), which no script-path vector can show.
 //!
 //! Every entry below carries BOTH a `success` witness (must verify) and a
 //! `failure` witness (must fail) for the SAME transaction/prevout/flags —
@@ -48,7 +51,7 @@
 //! too (this is what gives the KAT teeth: flipping a byte in a vector
 //! should make the wrong side pass, not just make both sides fail).
 //!
-//! All five carry the exact same consensus flag set: `P2SH, DERSIG,
+//! All of them carry the exact same consensus flag set: `P2SH, DERSIG,
 //! CHECKLOCKTIMEVERIFY, CHECKSEQUENCEVERIFY, WITNESS, NULLDUMMY, TAPROOT`
 //! (Bitcoin Core's `script_assets_test.json` "flags" string for every
 //! taproot-flagged entry we sampled) — `consensus_kat_test.zig` hardcodes
@@ -153,6 +156,54 @@ pub const vectors = [_]Vector{
         .failure_witness = &.{
             "61",
             "c0b72183c9f60f81051641ec1119f4ca1048f83f6ebbfa3805731c0479a8c5d8ba7442ba539034b2067bd698804af25c3f58d06009743f0ed3b18819eff684c0368a7e9d8f4a71cf5b77c9ed0a0e8c125a5496e4c4f36e045b98cc64f611b56efb2712f4444661e1b026ee1a556cb176264536b2c722475596ff9c7b511a208212",
+        },
+    },
+    .{
+        .comment = "sighash/keypath_hashtype_2 (BIP341 key-path spend with an annex; script_assets_test.json entry 23)",
+        .tx_hex = "0100000001f217a4b1d4855de2b76000e0b6d556056f4bc1420c23a2267e5956c309549c9f5301000000aa5301a301f6508700000000001976a914abddafe0c2f4b0dca371e2f549545e150e9a572f88ac7ec78351",
+        .prevout_hexes = &.{
+            "664cfc01000000002251209e0c6f6cdbcd9057289ead2ceb38c7faf4c7d131fa5156b0aa25a3466e862517",
+        },
+        .index = 0,
+        .success_witness = &.{
+            "c2bdc23435c7bbdce741081181eecd31865f7d94fad6c49c8b1f4619aad72b83354530dbc9446243ff81e0dac2e77b2d437b9d53d279b535a23fb8c599454b3e02",
+            "50ba",
+        },
+        .failure_witness = &.{
+            "77ff905558d502d2ecd9db65f9738951f447dc862382e27a832dfb5348754f65b717612675ae8ee96b45c54937172cc965cf210eb5f96c8ba62cfe0430cd871102",
+            "50d75cd6",
+        },
+    },
+    .{
+        .comment = "sighash/purepk (BIP341 key-path spend with an annex; script_assets_test.json entry 94)",
+        .tx_hex = "0200000001437e26ca6121a4aa4500d026d6a3c2a719cc614b7f4e57dbf20ec52da9113b345400000000af12738b015ee11a01000000001976a91468d41e586903884f85494313816b73c219fda67e88ac6a566153",
+        .prevout_hexes = &.{
+            "4ce5de0100000000225120a78bc742b51345ffbccbcd3bc8868c65a301af3df8ea27dab317800819d0c859",
+        },
+        .index = 0,
+        .success_witness = &.{
+            "60404aa6ef9e6103bf312ef4ac2bfe66bcc7e420431f761e15ed51059d89b7b06a4c0f524bc053de8ba837bac7f7d1924c4958b126f8bc27d23b423fed8f3b5102",
+            "50c5900638",
+        },
+        .failure_witness = &.{
+            "905a2b9dc71b99ee36ae26910ed020bad2ec4d27b6c0537916fbc29da61a20110bb43d364e46b4fcd621785a282040e5aa59f06908d81febf7fbb60b6662343f02",
+            "50b535149d",
+        },
+    },
+    .{
+        .comment = "sighash/keypath (BIP341 key-path spend with an annex; script_assets_test.json entry 203)",
+        .tx_hex = "0200000001237c59f28c839c0aad8421d03db1341a6941c54615538560b3146f70127ff1267801000000f7ff00cc01d4a3fc0000000000160014af93210cb1359d507d4b3689da21cfa75803d86c734c7a54",
+        .prevout_hexes = &.{
+            "58168901000000002251207397ba021c08044034f00193b8c8d09c95b4843c1609e9133221fdf5f131540a",
+        },
+        .index = 0,
+        .success_witness = &.{
+            "4a093323d960d0eb5619f560565ec9f87941e519e50f0474a16b5613ea062555f75da0e5c0b59dfdf05f59536422a264ce0bc79c10f455f74b2da70b322315ad",
+            "50430811",
+        },
+        .failure_witness = &.{
+            "2d6cf849064fab2e8a1d3a3e8163f0efc68f7087e2f41eed1b0815acd517aa7d43e09e21a041b2a690c05de62df86eb1f717b737a1a48d334fed875dad03a3d081",
+            "50f185eceb34c2373055722f4742bff87ef24144eb1fa8e70675e967444c8f6ed20a9664e546bb11d8d5",
         },
     },
 };

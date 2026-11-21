@@ -113,8 +113,7 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
 zig build test-bitcoinscript --summary all
 ```
 
-Pinned rows from Bitcoin Core's official `script_tests.json` (a filtered subset of the non-witness rows and every
-witness-bearing row), the `CHECKLOCKTIMEVERIFY` / `CHECKSEQUENCEVERIFY` rows of `tx_valid.json` / `tx_invalid.json`,
+Every row of Bitcoin Core's official `script_tests.json` (v31.1), the whole `script_assets_test.json` corpus (opt-in: `tools/script_assets_fetch.sh`, `BITCOINSCRIPT_SCRIPT_ASSETS`), the `CHECKLOCKTIMEVERIFY` / `CHECKSEQUENCEVERIFY` rows of `tx_valid.json` / `tx_invalid.json`,
 real end-to-end spends
 (P2PKH/P2WPKH/P2TR key-path plus BIP342 tapscript script-path: `OP_CHECKSIG`, `OP_CHECKSIGADD`
 threshold, `OP_SUCCESSx`, empty-sig, and validation-weight exhaustion — `tapscript_test.zig`),

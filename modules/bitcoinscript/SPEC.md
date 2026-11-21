@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1207 data rows) and `script_assets_test.json` are the yardsticks; here every witness-bearing row plus a machine-filtered subset of the non-witness rows are pinned, not the full file. Core also has script compression (a UTXO storage format) — not provided; sigop counting, `Solver`/standardness and `ExtractDestination` are here (`sigops.zig`, `standard.zig`). |
+| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1222 data rows) and `script_assets_test.json` are the yardsticks; here all of the former are pinned and the latter runs in full as an opt-in oracle (eight entries pinned in the tree). Core also has script compression (a UTXO storage format) — not provided; sigop counting, `Solver`/standardness and `ExtractDestination` are here (`sigops.zig`, `standard.zig`). |
 | [btcsuite/btcd (`txscript`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Full engine plus `scriptbuilder.go`, `standard.go` (classification, sigop counts), `pkscript.go`, `taproot.go`, `sign.go`: a Go user gets a builder, a disassembler, standardness and signing beside the VM (file list read via the GitHub API). |
 | [rust-bitcoin/rust-bitcoin (`script`, `bitcoinconsensus` feature)](https://github.com/rust-bitcoin/rust-bitcoin) | Rust | CC0-1.0 | 2.7k | units-0.2.0 (tag; push 2026-09-30) | Script types, builder and asm/hex display; verification only by binding libbitcoinconsensus *(inferred)*. A pure-Rust interpreter exists in rust-miniscript for miniscript fragments only *(inferred)*. |
 | [rust-bitcoin/rust-miniscript](https://github.com/rust-bitcoin/rust-miniscript) | Rust | CC0-1.0 | 426 | push 2026-09-26 | Miniscript/descriptors and their satisfaction; no consensus VM, no descriptor layer here either. |
@@ -46,7 +46,7 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   to both call sites.
 - `limits.zig` — the consensus DoS bounds (`MAX_SCRIPT_SIZE`=10000, `MAX_SCRIPT_ELEMENT_SIZE`=520,
   `MAX_OPS_PER_SCRIPT`=201, `MAX_STACK_SIZE`=1000, `MAX_PUBKEYS_PER_MULTISIG`=20) plus one
-  module-added bound (`max_stack_items_in_witness`, see "Defensive bounds beyond consensus" below).
+  nothing module-added: no witness-item bound beyond consensus (see "No bound beyond consensus" below).
 - `flags.zig` — `ScriptFlags`, the `SCRIPT_VERIFY_*` set. Each field is documented with exactly
   what it gates; `.none`/`.standard` are convenience presets.
 - `txctx.zig` — `SigVersion` (`.base`/`.witness_v0`/`.tapscript`, selects legacy vs. BIP143 vs. BIP341/342 sighash) and
@@ -102,22 +102,20 @@ enclosing branch is currently executing (Bitcoin Core counts this before ever co
 size checked after every instruction. `interpreter.zig`'s tests exercise each of these; `dos_test.zig`
 adds `verifyScript`-level teeth (below).
 
-**Defensive bounds beyond consensus**: `verify.zig`'s `verifyWitnessProgram` caps witness item
-count (`limits.max_stack_items_in_witness`) and, for P2WSH's non-final stack-seed items and
-P2WPKH's `[sig, pubkey]`, each item's size (`limits.max_script_element_size`) — `error.PushSize`.
-True Bitcoin Core consensus does **not** bound raw witness-stack item bytes at this exact layer
-(it bounds them only indirectly, via the block *weight* limit, an orchestration-layer concern this
-standalone script-verifier library has no visibility into). Without this module-added bound, a
-caller handing `verifyScript` attacker-supplied witness data directly (fuzzing; a mempool-admission
-path with no separate weight check yet) has no memory bound at all. A production full node
-embedding this module for **block-validated** spends (where the weight limit is already enforced
-upstream) will never observe this bound trigger on a real, weight-valid block.
+**No bound beyond consensus on witness data**: `verifyWitnessProgram` bounds only what Bitcoin Core
+bounds — each stack item of an executed v0 script and each initial tapscript item at 520 bytes
+(`error.PushSize`), the executed stack at 1000 entries (`error.StackSize`, per instruction for v0, once up
+front for tapscript) — and nothing for witness versions the rules do not define (anyone-can-spend, any
+item count or size; Core's corpus has valid spends with 1003 witness items and 34 KB items). The witness
+stack is the caller's memory already and the unexecuted paths allocate nothing, so no bound is needed for
+safety; a node's real limit is the block weight, upstream of this layer.
 
 ## BIP342 tapscript
 
 Taproot **key-path** spending (a witness stack of exactly one element, optionally an annex) is a
 BIP340 Schnorr signature verified directly against the witness-program bytes over the BIP341
-key-path sighash — no script execution at all, per spec.
+key-path sighash — no script execution at all, per spec. An annex (`spend_type = 1`, `sha_annex`) is
+committed by that sighash (`bitcointx.bip341.keyPathSighash`).
 
 Taproot **script-path** spending (BIP341/342, a witness stack of ≥2 elements after annex-stripping)
 is implemented end to end:
@@ -164,17 +162,19 @@ is implemented end to end:
 external BIP341 vectors / `bitcointx`'s KAT-backed key-path sigMsg respectively. The end-to-end
 tapscript *spends* (`tapscript_test.zig`) are **constructed round-trips** (build output → sign the
 tapscript sighash → verify, each with a positive control), not byte-exact against an external
-consensus transaction vector. That gap is closed in part by
-`consensus_kat_test.zig`/`consensus_kat_vectors.zig`: five real transactions
-machine-extracted, byte for byte, from Bitcoin Core's own
+consensus transaction vector. That gap is closed by Bitcoin Core's own
 `bitcoin-core/qa-assets:unit_test_data/script_assets_test.json` corpus (the one
-`src/test/script_tests.cpp`'s `script_assets_test` runs), each with a `success` witness that MUST
-verify and a `failure` witness (same tx/prevouts/flags) that MUST fail, run through the real
-`verifyScript` entry point (full tx deserialization + all inputs' spent outputs, not a stand-in).
-Covers: plain key-path spend, a script-path spend with an annex, an `OP_SUCCESSx` short-circuit, a
-control-block length-validation failure, and the unknown-leaf-version anyone-can-spend path. This
-is a representative slice, not exhaustive coverage of the corpus (2244 entries upstream); widening it
-is in *Backlog / deferred*.
+`src/test/script_tests.cpp`'s `script_assets_test` runs; 2244 real transactions with all their prevouts, each
+with a `success` witness/scriptSig that MUST verify and, for 1493, a `failure` pair that MUST fail), run
+through the real `verifyScript` entry point (full tx deserialization + all inputs' spent outputs):
+
+- `consensus_kat_test.zig` / `consensus_kat_vectors.zig` pin eight entries in the tree, machine-extracted
+  byte for byte: a plain key-path spend, three key-path spends with an annex, a script-path spend with an
+  annex, an `OP_SUCCESSx` short-circuit, a control-block length-validation failure, and the
+  unknown-leaf-version anyone-can-spend path.
+- `script_assets_test.zig` runs the WHOLE corpus (9.2 MB, too big to vendor) when
+  `BITCOINSCRIPT_SCRIPT_ASSETS` names the file; `tools/script_assets_fetch.sh` downloads it, pinned by sha256,
+  into a gitignored directory. Skipped when unset. All 2244 entries pass.
 
 ### `FindAndDelete(vchSig)`
 
@@ -345,18 +345,13 @@ Run `scripts/modtest bitcoinscript`. Every vector file is machine-transcribed (n
 
 ### script_tests.json coverage
 
-`script_tests_vectors.zig` pins non-witness rows machine-filtered (not hand-picked) from Bitcoin Core's
-`src/test/data/script_tests.json` (the `bitcoin/bitcoin` `master` branch). The filter keeps only rows (a) with no
-witness field (those live in `script_tests_witness_vectors.zig`, below) and (b) whose `scriptSig`/`scriptPubKey`
-asm text uses only mnemonics this module's opcode table implements (a plain substring/token check, which
-mechanically excludes every BIP342 tapscript-only vector). Of the ~1108 rows surviving that filter, every row is kept
-for buckets with ≤20 members (every distinct error class Bitcoin Core's test suite exercises that this module can
-reach), and a fixed-seed random sample of 70 `OK` rows / 20 rows for buckets larger than 20
-(`EVAL_FALSE`/`BAD_OPCODE`/`INVALID_STACK_OPERATION`/`DISABLED_OPCODE`/`SCRIPTNUM`/`MINIMALDATA`/`SIG_DER`).
-`OP_CODESEPARATOR` and `CONST_SCRIPTCODE` rows are not filtered out: the corpus has a single `CODESEPARATOR` row and
-three non-witness `CONST_SCRIPTCODE` rows. The file also carries the rows of the current corpus that exercise
-signature/pubkey parsing without `STRICTENC`/`DERSIG`/`LOW_S` (the sampling had dropped them) and five hand-built
-hybrid-key parity / off-curve cases.
+`script_tests_vectors.zig` is Bitcoin Core's `src/test/data/script_tests.json` (tag v31.1) in full for the rows
+without a witness field: all 1109, in file order, no filter and no sampling, generated by
+`scripts/gen/gen-bitcoin-core-vectors.py --which script`. Core's error names map 1:1 onto this module's
+(`SCRIPTNUM` → `UnknownError`, `NULLFAIL` → `SigNullfail`); the rows with a witness field live in
+`script_tests_witness_vectors.zig` (below). `script_tests_extra_vectors.zig` holds the hand-written rows run
+beside them: variants of Core rows under fewer flags, `CONST_SCRIPTCODE` rows for `FindAndDelete(vchSig)`
+(the flag is absent from the corpus) and five hand-built hybrid-key parity / off-curve cases.
 
 The corpus cannot exercise `FindAndDelete(vchSig)` (Core tests that behaviour elsewhere), so two further sources pin it:
 
@@ -372,16 +367,17 @@ The corpus cannot exercise `FindAndDelete(vchSig)` (Core tests that behaviour el
 
 ### script_tests.json witness rows
 
-`script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` pin the rows the file above drops: every row
-of `script_tests.json` that carries a witness field (a leading `[<stack item hex>..., <amount in BTC>]` array), with no
-sampling and no mnemonic filter (they use only `NOP`/`HASH160`/`EQUAL`/`CHECKSIG`; counted on upstream `v29.0`:
-1258 array entries, 51 comment-only, 1207 data rows, of which 107 carry a witness). None of them sets `TAPROOT`:
-Core keeps the BIP342 corpus in `script_assets_test.json`.
+`script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` pin every row of `script_tests.json` (tag
+v31.1) that carries a witness field (a leading `[<stack item hex>..., <amount in BTC>]` array): 113 of the 1222
+data rows (1273 array entries, 51 comment-only), generated by the same script (`--which witness`). Five of
+them are tapscript rows written as templates (`#SCRIPT# <asm>`, `#CONTROLBLOCK#`, `0x51 0x20
+#TAPROOTOUTPUT#`); the runner builds the single-leaf tree with the sibling `taproot` module (test-only
+dependency) over the BIP341 NUMS internal key — any valid internal key gives the same verdicts.
 
 This is the external oracle for segwit v0: P2WPKH/P2WSH dispatch, `WITNESS_MALLEATED`, `WITNESS_MALLEATED_P2SH`,
 program length/version rules, witness-v0 `MINIMALIF`, post-witness `CLEANSTACK`, and the compressed-pubkey rule.
-`OP_IF`/`OP_NOTIF` on an empty stack is `UnbalancedConditional` (Core v29.0 `SCRIPT_ERR_UNBALANCED_CONDITIONAL`), the one
-place in `EvalScript` where a `stack.size() < n` check does NOT use `INVALID_STACK_OPERATION`.
+`OP_IF`/`OP_NOTIF` on an empty stack is `InvalidStackOperation` (Core v31.1; v29.0 and earlier named it
+`SCRIPT_ERR_UNBALANCED_CONDITIONAL`).
 
 One mapping is deliberately not injective and is recorded rather than hidden: Core's `WITNESS_PUBKEYTYPE` and
 `PUBKEYTYPE` both land on this module's single `Pubkeytype` (`sigcheck.zig`), so the corpus cannot distinguish them.
@@ -498,4 +494,4 @@ verifier.
 
 ## Backlog / deferred
 
-- **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — the non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
+None open.

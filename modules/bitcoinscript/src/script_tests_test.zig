@@ -23,6 +23,7 @@ const asmparser = @import("asmparser.zig");
 const verify = @import("verify.zig");
 const txctx = @import("txctx.zig");
 const vectors_mod = @import("script_tests_vectors.zig");
+const extra_mod = @import("script_tests_extra_vectors.zig");
 
 // NOTE: `.vin`/`.vout` are heap-allocated (via `allocator`, expected to be
 // an arena the caller tears down in bulk) rather than
@@ -99,20 +100,28 @@ fn runVector(allocator: std.mem.Allocator, v: vectors_mod.Vector) !void {
     }
 }
 
-test "script_tests.json pinned subset: every vector's result class matches Bitcoin Core's expectation" {
+test "script_tests.json: every non-witness row's result class matches Bitcoin Core's expectation" {
     var ok_count: usize = 0;
     var err_count: usize = 0;
-    for (vectors_mod.vectors) |v| {
+    var bad: usize = 0;
+    for (vectors_mod.vectors ++ extra_mod.vectors) |v| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        try runVector(arena.allocator(), v);
+        runVector(arena.allocator(), v) catch |e| {
+            if (e != error.VectorMismatch) {
+                std.debug.print("\nVECTOR ERROR {s}: scriptSig={s} scriptPubKey={s}\n", .{ @errorName(e), v.script_sig, v.script_pubkey });
+            }
+            bad += 1;
+        };
         if (v.expect == null) ok_count += 1 else err_count += 1;
     }
-    // Sanity on the corpus shape itself (catches an accidental empty/truncated
-    // vectors file from silently "passing" with zero coverage).
-    try testing.expect(ok_count > 30);
-    try testing.expect(err_count > 100);
-    try testing.expectEqual(vectors_mod.vectors.len, ok_count + err_count);
+    try testing.expectEqual(@as(usize, 0), bad);
+    // Sanity on the corpus shape itself: the whole 1109-row file plus the
+    // hand-built block (catches a truncated vectors file passing vacuously).
+    try testing.expect(ok_count >= 630);
+    try testing.expect(err_count >= 480);
+    try testing.expectEqual(vectors_mod.vectors.len + extra_mod.vectors.len, ok_count + err_count);
+    try testing.expectEqual(@as(usize, 1109), vectors_mod.vectors.len);
 }
 
 test "F7 regression: NULLFAIL takes precedence over NULLDUMMY when a script violates both" {

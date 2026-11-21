@@ -29,7 +29,7 @@ const consensus_flags: flags_mod.ScriptFlags = .{
     .taproot = true,
 };
 
-fn hexDecode(a: std.mem.Allocator, hex: []const u8) ![]u8 {
+pub fn hexDecode(a: std.mem.Allocator, hex: []const u8) ![]u8 {
     if (hex.len == 0) return &[_]u8{};
     const out = try a.alloc(u8, hex.len / 2);
     return try std.fmt.hexToBytes(out, hex);
@@ -41,7 +41,7 @@ fn hexDecode(a: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// export a standalone `TxOut` decoder (a `TxOut` only ever otherwise
 /// appears embedded in a full `Transaction`), so this is a thin
 /// module-local re-implementation of the same 2-field layout.
-fn decodePrevout(bytes: []const u8) !bitcointx.TxOut {
+pub fn decodePrevout(bytes: []const u8) !bitcointx.TxOut {
     if (bytes.len < 9) return error.Truncated;
     const value = std.mem.readInt(i64, bytes[0..8], .little);
     const len_r = try bitcointx.decodeCompactSize(bytes[8..]);

@@ -39,8 +39,11 @@
 //! - `sigops.zig` — sigop counting (`GetSigOpCount`, `GetTransactionSigOpCost`).
 //! - `standard.zig` — `Solver` / `IsStandard` / `ExtractDestination` template
 //!   classification of output scripts.
-//! - `script_tests_vectors.zig` / `script_tests_test.zig` — a pinned
-//!   subset of Bitcoin Core's official `script_tests.json` corpus.
+//! - `script_tests_vectors.zig` / `script_tests_test.zig` — every
+//!   non-witness row of Bitcoin Core's official `script_tests.json` corpus
+//!   (`script_tests_extra_vectors.zig`: hand-written rows beside them).
+//! - `script_assets_test.zig` — the whole `script_assets_test.json` corpus,
+//!   opt-in (`BITCOINSCRIPT_SCRIPT_ASSETS`).
 //! - `script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` —
 //!   the witness-bearing rows of that same corpus, which the file above
 //!   excludes; the external oracle for segwit v0.
@@ -125,6 +128,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("asmparser.zig");
     _ = @import("script_tests_vectors.zig");
+    _ = @import("script_tests_extra_vectors.zig");
     _ = @import("script_tests_test.zig");
     _ = @import("script_tests_witness_test.zig");
     _ = @import("e2e_test.zig");
@@ -139,6 +143,7 @@ test {
     _ = @import("tx_locktime_test.zig");
     _ = @import("consensus_kat_vectors.zig");
     _ = @import("consensus_kat_test.zig");
+    _ = @import("script_assets_test.zig");
     _ = @import("mutation_gap_test.zig");
 }
 

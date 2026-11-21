@@ -125,7 +125,7 @@ test "toAsm over the pinned script_tests.json rows: canonical scripts round trip
         }
     }
     // the corpus has hundreds of scripts of each kind; a collapse to a few means the check stopped running
-    if (counts.exact <= 300 or counts.fixed_point <= 500 or counts.errors <= 5 or counts.skipped >= 200) {
+    if (counts.exact <= 300 or counts.fixed_point <= 500 or counts.errors <= 5 or counts.skipped >= 700) {
         std.debug.print("counts: {any}\n", .{counts});
         return error.TestUnexpectedResult;
     }

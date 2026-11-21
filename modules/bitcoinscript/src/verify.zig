@@ -131,11 +131,13 @@ fn verifyTaproot(allocator: Allocator, program_x: []const u8, witness: []const [
         items = items[0 .. items.len - 1];
     }
     if (items.len == 0) return error.WitnessProgramWitnessEmpty;
-    if (items.len == 1) return verifyTaprootKeyPath(allocator, program_x, items[0], ctx);
+    if (items.len == 1) return verifyTaprootKeyPath(allocator, program_x, items[0], annex, ctx);
     return verifyTaprootScriptPath(allocator, program_x, items, annex, witness, flags, ctx);
 }
 
-fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, sig_bytes: []const u8, ctx: TxContext) VerifyError!void {
+/// BIP341 key-path: `annex` (the stripped last witness item, when present)
+/// is committed by the sighash (`spend_type = 1`, `sha_annex`).
+fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, sig_bytes: []const u8, annex: ?[]const u8, ctx: TxContext) VerifyError!void {
     if (sig_bytes.len != 64 and sig_bytes.len != 65) return error.InvalidTaprootSignature;
     const hash_type: u8 = if (sig_bytes.len == 65) sig_bytes[64] else bitcointx.bip341.SIGHASH_DEFAULT;
     if (sig_bytes.len == 65 and hash_type == bitcointx.bip341.SIGHASH_DEFAULT) return error.InvalidTaprootSignature;
@@ -144,10 +146,7 @@ fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, sig_bytes: 
 
     // BIP341: reuse the caller's per-transaction commitment hashes when it
     // has them — byte-identical either way (see `TxContext.precomputed`).
-    const msg = if (ctx.taprootPrecomputed()) |pre|
-        try bitcointx.bip341.sighashWith(allocator, pre, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs)
-    else
-        try bitcointx.bip341.sighash(allocator, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs);
+    const msg = try bitcointx.bip341.keyPathSighash(allocator, ctx.taprootPrecomputed(), ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs, annex);
 
     var xonly: [32]u8 = undefined;
     @memcpy(&xonly, program_x);
@@ -193,7 +192,7 @@ fn verifyTaprootScriptPath(
 
     // BIP342: the 520-byte-per-element limit and the 1000-element stack
     // limit are extended to the INITIAL stack.
-    if (initial_stack.len > limits.max_stack_size) return error.CleanStack;
+    if (initial_stack.len > limits.max_stack_size) return error.StackSize;
     for (initial_stack) |elem| {
         if (elem.len > limits.max_script_element_size) return error.PushSize;
     }
@@ -215,14 +214,11 @@ fn verifyTaprootScriptPath(
 
 // ── BIP141 segwit v0 / taproot dispatch ─────────────────────────────────
 
-/// `witness.len`/each item's size are bounded here defensively
-/// (`error.PushSize`) beyond what a bit-exact consensus port would enforce
-/// at this exact layer — true Bitcoin Core consensus bounds witness data
-/// only indirectly, via the block *weight* limit (an orchestration-layer
-/// concern outside a standalone script verifier). Without this, a caller
-/// that hands `verifyScript` attacker-supplied witness data directly
-/// (fuzzing, a mempool admission path with no separate weight check yet)
-/// would have no bound on the memory this function walks.
+/// Segwit program execution. The witness stack is the caller's, already in
+/// memory; this function adds no bound of its own beyond Core's: the 520-byte
+/// element limit and the 1000-entry stack limit of the executed script
+/// (`error.PushSize` / `error.StackSize`), nothing for witness versions the
+/// rules do not define (anyone-can-spend, any item count and size).
 fn verifyWitnessProgram(
     allocator: Allocator,
     wp: WitnessProgram,
@@ -231,8 +227,6 @@ fn verifyWitnessProgram(
     ctx: TxContext,
     is_p2sh: bool,
 ) VerifyError!void {
-    if (witness.len > limits.max_stack_items_in_witness) return error.PushSize;
-
     if (wp.version == 0) {
         var exec_stack: std.ArrayList([]const u8) = .empty;
         var script_pubkey: []const u8 = undefined;
@@ -246,8 +240,8 @@ fn verifyWitnessProgram(
             if (!std.mem.eql(u8, &got, wp.program)) return error.WitnessProgramMismatch;
             script_pubkey = witness_script; // size bound: interpreter.eval's own MAX_SCRIPT_SIZE check
             for (witness[0 .. witness.len - 1]) |item| {
-                // Defensive DoS bound beyond what a bit-exact consensus port
-                // would enforce here (module doc comment above).
+                // Consensus (Core `ExecuteWitnessScript`): witness-stack
+                // items over MAX_SCRIPT_ELEMENT_SIZE fail with PUSH_SIZE.
                 if (item.len > limits.max_script_element_size) return error.PushSize;
                 try exec_stack.append(allocator, item);
             }

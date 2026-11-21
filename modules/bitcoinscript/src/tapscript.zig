@@ -243,14 +243,7 @@ fn buildSigMsg(
     // The common BIP341 layout comes from `bitcointx` — one implementation of
     // a consensus-critical byte order, not two that can drift. Only the
     // BIP342 extension below is this module's own.
-    const annex_hash: ?[32]u8 = if (exec.annex) |annex| blk: {
-        // sha_annex = SHA256(compact_size(len) || annex), annex incl. 0x50 prefix.
-        var tmp: std.ArrayList(u8) = .empty;
-        defer tmp.deinit(allocator);
-        try appendCompactSize(&tmp, allocator, annex.len);
-        try tmp.appendSlice(allocator, annex);
-        break :blk sha256(tmp.items);
-    } else null;
+    const annex_hash: ?[32]u8 = if (exec.annex) |annex| bitcointx.bip341.annexHash(annex) else null;
 
     const common_opts: bitcointx.bip341.CommonOptions = .{
         // spend_type = 2*ext_flag + annex_present; ext_flag = 1 for tapscript.

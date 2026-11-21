@@ -16,5 +16,3 @@ pub const max_stack_size: usize = 1_000;
 pub const max_ops_per_script: usize = 201;
 /// `OP_CHECKMULTISIG`/`OP_CHECKMULTISIGVERIFY` public-key count ceiling.
 pub const max_pubkeys_per_multisig: i64 = 20;
-/// A witness stack (`vin[i]`'s items) may hold at most this many items.
-pub const max_stack_items_in_witness: usize = 1_000;

@@ -1087,15 +1087,12 @@ fn evalCore(
         } else if (instr.opcode == @backingInt(Opcode.OP_IF) or instr.opcode == @backingInt(Opcode.OP_NOTIF)) {
             var value = false;
             if (exec) {
-                // Core spells this one UNBALANCED_CONDITIONAL, not
-                // INVALID_STACK_OPERATION — `interpreter.cpp` (v29.0)
-                // `case OP_IF: case OP_NOTIF:` is
+                // Core v31.1 (`interpreter.cpp`, `case OP_IF: case OP_NOTIF:`):
                 // `if (stack.size() < 1) return set_error(serror,
-                // SCRIPT_ERR_UNBALANCED_CONDITIONAL);`. Every other
-                // `stack.size() < n` in `EvalScript` does use
-                // INVALID_STACK_OPERATION, which is why this one reads like a
-                // typo and was implemented as one.
-                if (stack.items.len < 1) return error.UnbalancedConditional;
+                // SCRIPT_ERR_INVALID_STACK_OPERATION);` — v29.0 and earlier
+                // spelled this one SCRIPT_ERR_UNBALANCED_CONDITIONAL. Both
+                // fail the script; only the class differs.
+                if (stack.items.len < 1) return error.InvalidStackOperation;
                 const top = stack.items[stack.items.len - 1];
                 // Bitcoin Core gates MINIMALIF on `sigversion ==
                 // WITNESS_V0` + the flag for segwit-v0, and makes it

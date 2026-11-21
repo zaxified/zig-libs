@@ -53,3 +53,6 @@ tools/zstd-silesia/
 # Foreign test suite fetched by modules/xml/tools/xmlconf_fetch.sh (sha256-pinned; never committed or redistributed).
 modules/xml/tools/xmlconf-suite/
 tools/arrow-venv/
+
+# Bitcoin Core script_assets_test.json fetched by modules/bitcoinscript/tools/script_assets_fetch.sh (sha256-pinned, 9 MB).
+modules/bitcoinscript/tools/script_assets/
