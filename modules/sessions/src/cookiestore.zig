@@ -473,6 +473,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const saved = ctx.data;
     ctx.data = &s;
     defer ctx.data = saved;
+    const saved_typed = try ctx.setTyped(Session, &s);
+    defer _ = ctx.setTyped(Session, saved_typed) catch {};
 
     next.run(ctx) catch |err| {
         // A logout must survive a failed handler (`Manager` evicts the

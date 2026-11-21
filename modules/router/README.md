@@ -69,8 +69,8 @@ try server.listen();
 
 Handlers get a `*Ctx`: the parsed `req` (`http.Server.Request`, including
 `query`), the `res` writer, `params.get("name")`, the app-wide `state`
-pointer (`Router.state`), a per-request `data` slot middleware can
-point at request-scoped values (how `aaa-gate` will attach an identity),
+pointer (`Router.state`), a per-request `data` slot and typed slots (`setTyped(T, ptr)` / `getTyped(T)`)
+middleware can point at request-scoped values (how `aaa-gate` attaches an identity),
 and `matchedPattern()` — the matched route's pattern (e.g. `"/users/:id"`,
 null in the 404/405 fallbacks), the bounded-cardinality label
 `metrics`/`openapi` need. Stateful middleware carry their own

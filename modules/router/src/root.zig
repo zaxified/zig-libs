@@ -218,6 +218,60 @@ pub const Ctx = struct {
     /// middleware conventionally writes `ctx.data` before calling
     /// `next.run`, which would clobber a value stashed there.
     _redirect: ?*const RedirectInfo = null,
+    /// Typed per-request slots (`setTyped` / `getTyped`); separate from `data`.
+    _typed: [typed_slots]TypedSlot = @splat(.{}),
+
+    /// Number of distinct typed values one request can carry at a time.
+    pub const typed_slots = 4;
+
+    const TypedSlot = struct { tag: ?*const anyopaque = null, ptr: ?*anyopaque = null };
+
+    /// A tag unique to `T` (the address of a per-type static), unforgeable
+    /// by anything that cannot name `T`.
+    fn typeTag(comptime T: type) *const anyopaque {
+        const S = struct {
+            var anchor: u8 = 0;
+            comptime {
+                _ = T;
+            }
+        };
+        return &S.anchor;
+    }
+
+    /// Store `value` under the key type `T` and return what was stored there
+    /// before (restore it with `defer`, as middleware does with `data`).
+    /// Unlike `data`, a typed slot is only ever read back as the `T` it was
+    /// stored as: a middleware that writes some other pointer into `data`
+    /// cannot make `getTyped(T)` return it (Go's typed context keys).
+    /// Storing null clears the slot. `error.TypedSlotsFull` when `typed_slots`
+    /// other keys are already set (restoring never fails).
+    pub fn setTyped(ctx: *Ctx, comptime T: type, value: ?*T) error{TypedSlotsFull}!?*T {
+        const tag = typeTag(T);
+        var free: ?*TypedSlot = null;
+        for (&ctx._typed) |*s| {
+            if (s.tag == tag) {
+                const old: ?*T = @ptrCast(@alignCast(s.ptr));
+                if (value) |v| {
+                    s.ptr = v;
+                } else {
+                    s.* = .{};
+                }
+                return old;
+            }
+            if (s.tag == null and free == null) free = s;
+        }
+        const v = value orelse return null;
+        const s = free orelse return error.TypedSlotsFull;
+        s.* = .{ .tag = tag, .ptr = v };
+        return null;
+    }
+
+    /// The value stored under key type `T` by `setTyped`, or null.
+    pub fn getTyped(ctx: *const Ctx, comptime T: type) ?*T {
+        const tag = typeTag(T);
+        for (ctx._typed) |s| if (s.tag == tag) return @ptrCast(@alignCast(s.ptr));
+        return null;
+    }
 
     /// The pattern of the route serving this request (e.g. "/users/:id"),
     /// router-owned. Null in the 404 and 405 fallback handlers (no route
@@ -5470,4 +5524,43 @@ test "hostile captures: a regexp constraint is anchored at both ends and matches
     try expectStatus(try dispatchDirect(&r, .get, "/u/12\n", "/u/12\n", &buf), "404");
     try expectStatus(try dispatchDirect(&r, .get, "/u/\n12", "/u/\n12", &buf), "404");
     try expectStatus(try dispatchDirect(&r, .get, "/u/\xe0\xa5\xa7\xe0\xa5\xa8", "/u/\xe0\xa5\xa7\xe0\xa5\xa8", &buf), "404");
+}
+
+test "typed slots: keyed by type, separate from data, restorable, bounded" {
+    const A = struct { n: u8 };
+    const B = struct { n: u8 };
+    const C = struct { n: u8 };
+    const D = struct { n: u8 };
+    const E = struct { n: u8 };
+    var empty: Params = .{};
+    var ctx: Ctx = .{ .req = undefined, .res = undefined, .params = &empty, .state = null };
+    var a: A = .{ .n = 1 };
+    var b: B = .{ .n = 2 };
+    try testing.expectEqual(@as(?*A, null), ctx.getTyped(A));
+    // a raw `data` pointer is never read back as a typed value
+    ctx.data = &b;
+    try testing.expectEqual(@as(?*A, null), ctx.getTyped(A));
+    try testing.expectEqual(@as(?*B, null), ctx.getTyped(B));
+    try testing.expectEqual(@as(?*A, null), try ctx.setTyped(A, &a));
+    try testing.expectEqual(@as(?*A, &a), ctx.getTyped(A));
+    try testing.expectEqual(@as(?*B, null), ctx.getTyped(B));
+    // replacing returns the previous value; restoring it works; null clears
+    var a2: A = .{ .n = 9 };
+    try testing.expectEqual(@as(?*A, &a), try ctx.setTyped(A, &a2));
+    try testing.expectEqual(@as(?*A, &a2), try ctx.setTyped(A, &a));
+    try testing.expectEqual(@as(?*A, &a), try ctx.setTyped(A, null));
+    try testing.expectEqual(@as(?*A, null), ctx.getTyped(A));
+    // the slots are bounded; restoring/clearing never fails
+    var c: C = .{ .n = 3 };
+    var d: D = .{ .n = 4 };
+    var e: E = .{ .n = 5 };
+    _ = try ctx.setTyped(A, &a);
+    _ = try ctx.setTyped(B, &b);
+    _ = try ctx.setTyped(C, &c);
+    _ = try ctx.setTyped(D, &d);
+    try testing.expectError(error.TypedSlotsFull, ctx.setTyped(E, &e));
+    try testing.expectEqual(@as(?*A, &a), try ctx.setTyped(A, &a));
+    _ = try ctx.setTyped(D, null);
+    _ = try ctx.setTyped(E, &e);
+    try testing.expectEqual(@as(?*E, &e), ctx.getTyped(E));
 }

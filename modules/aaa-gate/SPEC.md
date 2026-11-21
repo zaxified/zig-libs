@@ -133,9 +133,8 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   sanitizes/sets them; directly reachable, an attacker can pick any key value (subject to the
   `client_key_len_max` clamp) to split across many audit-coalescing buckets or collide with a
   victim's key.
-- `identityOf` trusts `ctx.data`: it casts the slot to this module's `Identity`, so a different middleware storing
-  another type there makes it undefined behaviour. The slot carries no tag (`router.Ctx` would need one); the
-  contract is documented, not enforced.
+- `identityOf` reads the gate's own typed `router.Ctx` slot (`getTyped(Identity)`), never the raw `ctx.data`: a
+  look-alike pointer in the raw slot is not seen. The gate also sets `ctx.data` for readers of the raw slot.
 - Does **NOT** defend against what a `token_verify`/`api_key_verify` callback or an `exempt`
   predicate decides: both are caller code running with the gate's authority. A verifier that
   compares with `std.mem.eql` reintroduces the timing oracle the gate exists to close, and an
@@ -203,8 +202,7 @@ line; that line is authoritative.
 
 ## Backlog / deferred
 
-- **`identityOf` trusts `ctx.data`** (sweep AAA-3, LOW): cannot be made total without a tag in `router.Ctx`
-  (a public change); the documented contract stays until then. See *Threat model*.
+None open.
 
 ## Anchoring
 

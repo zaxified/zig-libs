@@ -14,8 +14,8 @@
 //!
 //! On each request it **loads** the session named by the cookie (rejecting and
 //! evicting one past its idle or absolute timeout) or **creates** a fresh one,
-//! attaches the `*Session` to `ctx.data` (the slot `router` reserves —
-//! `sessionOf(ctx)` reads it back, the same pattern as `aaa-gate`'s identity),
+//! attaches the `*Session` to `ctx.data` and a typed `router.Ctx` slot
+//! (`sessionOf(ctx)` reads the typed one back, the same pattern as `aaa-gate`'s identity),
 //! runs the handler, then **saves**: it re-encodes the session into the store
 //! and stamps a refreshed `Set-Cookie` (rolling idle expiry). A handler may
 //! call `session.revoke()` (logout) — the middleware then **destroys** the
@@ -878,8 +878,7 @@ pub const IterateAction = enum {
 /// sessions middleware ran above the caller. Only meaningful below a
 /// `Manager.middleware()` in the chain.
 pub fn sessionOf(ctx: *const router.Ctx) ?*Session {
-    const p = ctx.data orelse return null;
-    return @ptrCast(@alignCast(p));
+    return ctx.getTyped(Session);
 }
 
 // ── the manager ─────────────────────────────────────────────────────────────
@@ -1374,6 +1373,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const saved = ctx.data;
     ctx.data = &s;
     defer ctx.data = saved;
+    const saved_typed = try ctx.setTyped(Session, &s);
+    defer _ = ctx.setTyped(Session, saved_typed) catch {};
 
     // A handler error propagates without a save — except a logout the handler
     // already asked for, which still happens: skipping it on an error (a

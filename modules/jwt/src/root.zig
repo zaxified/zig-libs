@@ -2390,10 +2390,11 @@ pub fn requireAnyScope(claims: Claims, wants: []const []const u8) ScopeError!voi
 
 /// Retrieve the `Identity` a `ResourceServer` attached, or null (out-of-scope
 /// method, or no such middleware ran). Only valid inside the middleware's inner
-/// chain. NOTE: `ctx.data` is a single shared slot — do not stack this behind
-/// another identity-attaching middleware (e.g. aaa-gate) on the same routes.
+/// chain. Read from this module's own typed `router.Ctx` slot, so another
+/// identity-attaching middleware (e.g. aaa-gate) stacked on the same routes
+/// neither overwrites nor is mistaken for it.
 pub fn identityOf(ctx: *const router.Ctx) ?*Identity {
-    return @ptrCast(@alignCast(ctx.data orelse return null));
+    return ctx.getTyped(Identity);
 }
 
 /// A `router.Middleware` enforcing a JWT Bearer policy backed by a `Provider`.
@@ -2604,6 +2605,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const saved = ctx.data;
     ctx.data = &ident;
     defer ctx.data = saved;
+    const saved_typed = try ctx.setTyped(Identity, &ident);
+    defer _ = ctx.setTyped(Identity, saved_typed) catch {};
     return next.run(ctx);
 }
 

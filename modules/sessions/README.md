@@ -135,8 +135,8 @@ try r.use(csrf.middleware());
 
 On each request it **loads** the session named by the cookie (rejecting and
 evicting one past its idle or absolute timeout) or **creates** a fresh one,
-attaches the `*Session` to `ctx.data` (the slot `router` reserves —
-`sessionOf(ctx)` reads it back, the `aaa-gate` identity pattern), runs the
+attaches the `*Session` to `ctx.data` and a typed `router.Ctx` slot
+(`sessionOf(ctx)` reads the typed one back, the `aaa-gate` identity pattern), runs the
 handler, then **saves**: it re-encodes the session into the store and stamps a
 refreshed `Set-Cookie` (rolling idle expiry). A session created for this request
 is saved only if the handler wrote to it (`setData`), called `session.keep()` or

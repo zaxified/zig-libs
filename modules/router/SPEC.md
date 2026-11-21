@@ -112,7 +112,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 Not a security primitive: raw byte matching means no percent-decoding and no case folding — ever,
 regardless of `normalize_path` — so anything relying on either for safety must handle it itself (or
 ahead of the router). `router` does not authenticate or authorize — identity attaches via a
-`Ctx.data` slot middleware (e.g. an auth layer) points at, not via router state. Handler/middleware
+`Ctx.data` slot or a typed slot (`Ctx.setTyped(T, …)` / `getTyped(T)`: keyed by type, up to 4 per request, never read back as another type) that middleware (e.g. an auth layer) fill, not via router state. Handler/middleware
 errors propagate to `http.Server`, which produces a plain 500 when nothing was sent; the router does
 not catch or classify errors itself.
 

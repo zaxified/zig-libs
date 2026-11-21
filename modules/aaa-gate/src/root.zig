@@ -22,8 +22,8 @@
 //!   `api_key_verify`. Missing, malformed or wrong credentials answer
 //!   **401** with `WWW-Authenticate: Bearer` and the chain is
 //!   short-circuited (`next` never runs). A valid request gets an
-//!   `Identity` attached to `ctx.data` (the slot `router` reserves for
-//!   this module) and flows on.
+//!   `Identity` attached to `ctx.data` and a typed `router.Ctx` slot
+//!   (`identityOf` reads the typed one) and flows on.
 //! - **Denial response.** The 401 body defaults to `Unauthorized\n` as
 //!   `text/plain`; `Options.deny_body` / `deny_content_type` replace both
 //!   (a JSON API answers denials in its own error shape without an outer
@@ -304,11 +304,11 @@ pub const Identity = struct {
 
 /// The identity the gate attached to this request, or null when no gate
 /// ran / the method was out of the protected scope. Only meaningful below
-/// a `Gate.middleware()` in the chain — the cast trusts that `ctx.data`
-/// was set by this module (the slot `router` reserves for it).
+/// a `Gate.middleware()` in the chain. Read from the gate's own typed
+/// `router.Ctx` slot, so a pointer another middleware parks in the raw
+/// `ctx.data` is never mistaken for an `Identity`.
 pub fn identityOf(ctx: *const router.Ctx) ?*Identity {
-    const p = ctx.data orelse return null;
-    return @ptrCast(@alignCast(p));
+    return ctx.getTyped(Identity);
 }
 
 /// One audited request (the audit-record fields, minus storage
@@ -1582,6 +1582,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const saved = ctx.data;
     ctx.data = &ident;
     defer ctx.data = saved;
+    const saved_typed = try ctx.setTyped(Identity, &ident);
+    defer _ = ctx.setTyped(Identity, saved_typed) catch {};
 
     const audited = g.on_audit != null and isMutating(ctx.req.method);
     next.run(ctx) catch |err| {
@@ -4408,6 +4410,27 @@ test "middleware: ctx.data is restored when the gate returns (an outer middlewar
     var buf: [1024]u8 = undefined;
     try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
     try testing.expect(seen_none);
+}
+
+var look_alike: Identity = .{ .scheme = .bearer, .user = "forged" };
+
+fn outerForgesData(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    ctx.data = &look_alike;
+    try next.run(ctx);
+}
+
+test "identityOf: a look-alike Identity written to the raw ctx.data slot is not seen" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .protect = .mutations });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .run = outerForgesData });
+    try r.use(g.middleware());
+    // GET is out of the gate's scope here: it attaches nothing, so identityOf must be null
+    // although `ctx.data` points at an `Identity`.
+    try r.get("/t", hNoIdentity);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "200");
 }
 
 // ── tests added by the grade-1 audit (each kills a surviving mutant) ──

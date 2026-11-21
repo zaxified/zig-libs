@@ -171,7 +171,7 @@ header values out of your request type remains yours.
   `token_verify` callback (below). Deny → **401** +
   `WWW-Authenticate: Bearer` (`realm="…"` when configured), plain-text
   body by default, chain short-circuited. Pass → an `Identity` on
-  `ctx.data` (the slot `router` reserved for this module; restored after
+  `ctx.data` and the typed `router.Ctx` slot `identityOf` reads (both restored after
   the chain), then `next`.
 - **Dynamic token store (`token_verify`).** The exact mirror of
   `api_key_verify` for bearer: a `TokenVerifyFn` consulted **after** the
