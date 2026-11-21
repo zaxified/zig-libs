@@ -28,7 +28,8 @@
 //!   match the address the request went to is reported as `.unhandled` and the
 //!   transaction stays outstanding, so the genuine answer (or the timeout) still
 //!   happens.
-//! * **A segmented response is refused explicitly.** This client advertises
+//! * **A segmented response is reassembled only with a buffer**
+//!   (`Config.reassembly`). Without one this client advertises
 //!   `max_segments = .unspecified` and does not set the
 //!   segmented-response-accepted bit, so a conforming device will never send
 //!   one; if one arrives anyway, the client answers `Abort` with
@@ -68,6 +69,21 @@ pub const Config = struct {
     /// Concurrent confirmed transactions. Fixed at compile time via the
     /// client's table size; this is the *soft* cap used by `nextInvokeId`.
     max_pending: u8 = 16,
+    /// Room to reassemble a **segmented response** (clause 5.4), owned by the
+    /// caller. With a buffer the client sets the segmented-response-accepted
+    /// bit, takes the segments of one response at a time (a `SegmentACK` per
+    /// window), and reports the whole as one `.complex_ack` whose `data`
+    /// borrows from this buffer until the next segmented response. With
+    /// `null` (the default) the client says it cannot reassemble and aborts
+    /// any segmented response with `segmentation_not_supported`.
+    reassembly: ?[]u8 = null,
+    /// The window of segments the client asks the device to send before it
+    /// acknowledges (clause 5.4.5; 1..127).
+    segment_window: u8 = 4,
+    /// Milliseconds to wait for the next segment before giving the response
+    /// up (clause 5.4.5.2's `Tseg`, doubled in the standard's default
+    /// `APDU_Segment_Timeout` of 2000 ms for a retry; here one wait).
+    segment_timeout_ms: u32 = 5000,
 };
 
 /// One outstanding confirmed request.
@@ -165,6 +181,38 @@ pub const WpmSpec = struct {
     writes: []const service.PropertyWrite,
 };
 
+/// What `max-segments-accepted` a client with this `reassembly` buffer can
+/// honestly offer: how many segments of the negotiated size fit it.
+fn maxSegmentsFor(config: Config) apdu.MaxSegments {
+    const buf = config.reassembly orelse return .unspecified;
+    const per = (config.max_apdu.octets() catch 50) - 5;
+    const n = buf.len / per;
+    if (n > 64) return .more_than_64;
+    if (n >= 64) return .sixty_four;
+    if (n >= 32) return .thirty_two;
+    if (n >= 16) return .sixteen;
+    if (n >= 8) return .eight;
+    if (n >= 4) return .four;
+    if (n >= 2) return .two;
+    return .unspecified;
+}
+
+/// A segmented response in progress.
+const Reassembly = struct {
+    active: bool = false,
+    invoke_id: u8 = 0,
+    peer: BipAddress = .{ .ip = @splat(0) },
+    svc: types.ConfirmedService = .read_property,
+    /// The sequence number the next segment must carry.
+    expected: u8 = 0,
+    len: usize = 0,
+    /// The window the sender announced (capped by ours), and how many
+    /// segments came since the last acknowledgement.
+    window: u8 = 1,
+    since_ack: u8 = 0,
+    last_ms: u64 = 0,
+};
+
 pub fn Client(comptime max_pending: usize) type {
     return struct {
         const Self = @This();
@@ -181,6 +229,8 @@ pub fn Client(comptime max_pending: usize) type {
         next_id: u8 = 0,
         rx: [transport.max_datagram]u8 = undefined,
         tx: [transport.max_datagram]u8 = undefined,
+        /// The segmented response being reassembled, if any (one at a time).
+        rs: Reassembly = .{},
 
         pub fn init(tp: Transport, config: Config) Self {
             return .{ .tp = tp, .config = config };
@@ -455,7 +505,7 @@ pub fn Client(comptime max_pending: usize) type {
         pub fn poll(self: *Self, now_ms: u64) Error!Event {
             if (try self.expire(now_ms)) |e| return e;
             const got = (try self.tp.recv(&self.rx)) orelse return .none;
-            return self.handle(got.from, got.bytes) catch |e| switch (e) {
+            return self.handle(got.from, got.bytes, now_ms) catch |e| switch (e) {
                 // A malformed datagram from a stranger must not kill the loop.
                 error.NotBvlc,
                 error.LengthMismatch,
@@ -499,7 +549,92 @@ pub fn Client(comptime max_pending: usize) type {
 
         // ── internals ──────────────────────────────────────────────────────
 
+        /// One segment of a segmented ComplexACK (clause 5.4.5): in order, it
+        /// is appended and acknowledged when the window is full or the last
+        /// one arrived; out of order, it is answered with a negative
+        /// `SegmentACK` naming the last in-order segment, which makes the
+        /// sender go back to the one after it.
+        fn handleSegment(self: *Self, origin: BipAddress, c: apdu.ComplexAck, now_ms: u64) Error!Event {
+            const buf = self.config.reassembly.?;
+            const seg = c.segment.?;
+            const claimed = blk: {
+                for (self.pending) |p| {
+                    if (p.active and p.invoke_id == c.invoke_id and p.peer.eql(origin)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!claimed) return unclaimed(origin, .complex_ack);
+            const rs = &self.rs;
+            if (seg.sequence_number == 0 and !(rs.active and rs.invoke_id == c.invoke_id and rs.peer.eql(origin))) {
+                rs.* = .{
+                    .active = true,
+                    .invoke_id = c.invoke_id,
+                    .peer = origin,
+                    .svc = c.service,
+                    .window = @max(1, @min(seg.window_size, self.config.segment_window)),
+                    .last_ms = now_ms,
+                };
+            } else if (!(rs.active and rs.invoke_id == c.invoke_id and rs.peer.eql(origin))) {
+                // A segment of something that was never started (or was
+                // given up): refuse it, so the sender stops.
+                try self.sendApdu(origin, .{ .abort = .{ .server = false, .invoke_id = c.invoke_id, .reason = .invalid_apdu_in_this_state } });
+                return unclaimed(origin, .complex_ack);
+            }
+            if (seg.sequence_number != rs.expected) {
+                try self.sendSegmentAck(origin, c.invoke_id, true, rs.expected -% 1, rs.window);
+                return .none;
+            }
+            if (c.data.len > buf.len - rs.len) {
+                try self.sendApdu(origin, .{ .abort = .{ .server = false, .invoke_id = c.invoke_id, .reason = .buffer_overflow } });
+                _ = self.retire(c.invoke_id, origin);
+                rs.active = false;
+                return .{ .segmented_response = .{ .from = origin, .invoke_id = c.invoke_id } };
+            }
+            @memcpy(buf[rs.len..][0..c.data.len], c.data);
+            rs.len += c.data.len;
+            rs.expected +%= 1;
+            rs.since_ack += 1;
+            rs.last_ms = now_ms;
+            // The transaction is alive while segments arrive.
+            for (&self.pending) |*p| {
+                if (p.active and p.invoke_id == c.invoke_id and p.peer.eql(origin)) p.deadline_ms = now_ms + self.config.segment_timeout_ms;
+            }
+            if (!seg.more_follows) {
+                try self.sendSegmentAck(origin, c.invoke_id, false, seg.sequence_number, rs.window);
+                _ = self.retire(c.invoke_id, origin);
+                rs.active = false;
+                return .{ .complex_ack = .{
+                    .from = origin,
+                    .invoke_id = c.invoke_id,
+                    .svc = rs.svc,
+                    .data = buf[0..rs.len],
+                } };
+            }
+            if (rs.since_ack >= rs.window) {
+                try self.sendSegmentAck(origin, c.invoke_id, false, seg.sequence_number, rs.window);
+                rs.since_ack = 0;
+            }
+            return .none;
+        }
+
+        fn sendSegmentAck(self: *Self, to: BipAddress, invoke_id: u8, negative: bool, seq: u8, window: u8) Error!void {
+            try self.sendApdu(to, .{ .segment_ack = .{
+                .negative = negative,
+                .server = false,
+                .invoke_id = invoke_id,
+                .sequence_number = seq,
+                .actual_window_size = window,
+            } });
+        }
+
         fn expire(self: *Self, now_ms: u64) Error!?Event {
+            // A segmented response that stopped coming is given up.
+            if (self.rs.active and now_ms >= self.rs.last_ms + self.config.segment_timeout_ms) {
+                const rs = &self.rs;
+                rs.active = false;
+                _ = self.retire(rs.invoke_id, rs.peer);
+                return .{ .timeout = .{ .peer = rs.peer, .invoke_id = rs.invoke_id, .svc = rs.svc } };
+            }
             for (&self.pending) |*p| {
                 if (!p.active or now_ms < p.deadline_ms) continue;
                 if (p.attempts_left == 0) {
@@ -520,7 +655,7 @@ pub fn Client(comptime max_pending: usize) type {
             return null;
         }
 
-        fn handle(self: *Self, from: BipAddress, dgram: []u8) Error!Event {
+        fn handle(self: *Self, from: BipAddress, dgram: []u8, now_ms: u64) Error!Event {
             const b = try bvll.decode(dgram);
             // A Forwarded-NPDU carries the *original* sender's address; a BBMD
             // relaying for a device is not itself the device, and replying to
@@ -551,6 +686,8 @@ pub fn Client(comptime max_pending: usize) type {
                     } };
                 },
                 .complex_ack => |c| {
+                    if (c.segment != null and self.config.reassembly != null)
+                        return self.handleSegment(origin, c, now_ms);
                     if (!self.retire(c.invoke_id, origin)) return unclaimed(origin, .complex_ack);
                     if (c.segment != null) {
                         // Refuse explicitly. Answering nothing would leave the
@@ -759,10 +896,11 @@ pub fn Client(comptime max_pending: usize) type {
                     .invoke_id = id,
                     .service = svc,
                     .max_apdu = self.config.max_apdu,
-                    // Deliberately `.unspecified` + SA clear: this client does not
-                    // reassemble, and saying so is what stops a device segmenting.
-                    .max_segments = .unspecified,
-                    .segmented_response_accepted = false,
+                    // `.unspecified` + SA clear without a reassembly buffer: this
+                    // client does not reassemble, and saying so is what stops a
+                    // device segmenting.
+                    .max_segments = maxSegmentsFor(self.config),
+                    .segmented_response_accepted = self.config.reassembly != null,
                     .data = body,
                 },
             }, &a_buf);

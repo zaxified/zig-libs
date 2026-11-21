@@ -12,12 +12,14 @@
 //!
 //! What it deliberately does not do:
 //!
-//! * **It never segments.** Its Device object advertises
-//!   `segmentation_supported = none` and it answers a request that would
-//!   overflow the peer's `max-APDU-length-accepted` with
-//!   `Abort(buffer_overflow)`, which is what clause 5.4 prescribes. A
-//!   ReadPropertyMultiple over a large object list therefore fails cleanly
-//!   rather than silently truncating.
+//! * **It segments only when told to** (`Config.segmented_responses`, off by
+//!   default). Without it the Device object advertises
+//!   `segmentation_supported = none` and a request whose answer would
+//!   overflow the peer's `max-APDU-length-accepted` gets
+//!   `Abort(buffer_overflow)`, which is what clause 5.4 prescribes: it fails
+//!   cleanly rather than silently truncating. With it, such an answer goes out
+//!   as a segmented ComplexACK to a requester that accepts them. It never
+//!   *receives* a segmented request.
 //! * **It has no persistence and no allocator.** The object table is the
 //!   caller's slice; property values live in it.
 
@@ -184,7 +186,26 @@ pub const Config = struct {
     /// must carry (1..20 characters; clause 16.1.2, 16.4.2). `null` accepts
     /// any password, or none: a simulator rarely has one.
     password: ?[]const u8 = null,
+    /// Send a reply larger than the requester's max APDU as a **segmented
+    /// ComplexACK** (clause 5.4.4) when the request accepts segmented
+    /// responses, instead of `Abort(buffer_overflow)`. The device then says
+    /// `segmentation_supported = transmit` in its I-Am. One segmented reply
+    /// is in flight at a time (up to `max_segmented_reply` octets); a second
+    /// request that needs one meanwhile is aborted with `out_of_resources`.
+    /// Off by default: the device then never segments, as before.
+    segmented_responses: bool = false,
+    /// The window of segments sent before an acknowledgement is awaited
+    /// (1..127), further limited by the requester's own window.
+    segment_window: u8 = 4,
+    /// Milliseconds to wait for a `SegmentACK` before the window is resent.
+    segment_timeout_ms: u32 = 2000,
+    /// Resends of a window before the transfer is abandoned with
+    /// `Abort(tsm_timeout)`.
+    segment_retries: u8 = 3,
 };
+
+/// The largest reply a segmented transfer can carry.
+pub const max_segmented_reply: usize = 8192;
 
 /// What `poll` reports — a device is mostly silent, so these are for logging
 /// and for tests rather than for control flow.
@@ -200,6 +221,8 @@ pub const Event = union(enum) {
     wrote: struct { object: ObjectId, property: PropertyIdentifier },
     /// Accepted or cancelled a COV subscription.
     subscribed: struct { object: ObjectId, cancelled: bool },
+    /// Finished a segmented reply: every segment was acknowledged.
+    segmented_reply_sent: struct { invoke_id: u8, segments: u16 },
     /// Served a `WritePropertyMultiple`: every write up to the first failure
     /// was applied (clause 15.10.2 does not roll back); `count` of them.
     wrote_multiple: struct { count: usize },
@@ -219,6 +242,24 @@ pub const Event = union(enum) {
     unhandled,
 };
 
+/// A segmented ComplexACK being sent.
+const SegTx = struct {
+    active: bool = false,
+    peer: BipAddress = .{ .ip = @splat(0) },
+    invoke_id: u8 = 0,
+    svc: types.ConfirmedService = .read_property,
+    data: [max_segmented_reply]u8 = undefined,
+    len: usize = 0,
+    seg_size: usize = 1,
+    total: u16 = 0,
+    /// The next segment to send, and the first one not yet acknowledged.
+    next: u16 = 0,
+    base: u16 = 0,
+    window: u8 = 1,
+    deadline_ms: u64 = 0,
+    retries_left: u8 = 0,
+};
+
 pub fn Device(comptime max_subscriptions: usize) type {
     return struct {
         const Self = @This();
@@ -236,6 +277,8 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// When a timed `disable` or `disable_initiation` lapses (`null`:
         /// until `enable` or a restart).
         comm_until_ms: ?u64 = null,
+        /// The segmented reply in flight (clause 5.4.4), if any.
+        seg: SegTx = .{},
 
         pub fn init(tp: Transport, config: Config, objects: []Object) Self {
             return .{ .tp = tp, .config = config, .objects = objects };
@@ -312,6 +355,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// lapsed subscription.
         pub fn poll(self: *Self, now_ms: u64) Error!Event {
             self.expireSubscriptions(now_ms);
+            try self.segmentTimer(now_ms);
             if (self.comm_until_ms) |t| if (now_ms >= t) {
                 self.comm = .enable;
                 self.comm_until_ms = null;
@@ -354,7 +398,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 .max_apdu_accepted = try self.config.max_apdu.octets(),
                 // This device does not reassemble and does not segment; saying
                 // so up front is what keeps a peer from ever trying.
-                .segmentation = .none,
+                .segmentation = if (self.config.segmented_responses) .transmit else .none,
                 .vendor_id = self.config.vendor_id,
             }).encode(w);
         }
@@ -412,8 +456,8 @@ pub fn Device(comptime max_subscriptions: usize) type {
                         return .unhandled;
                     }
                     return switch (r.service) {
-                        .read_property => self.handleReadProperty(origin, r),
-                        .read_property_multiple => self.handleRpm(origin, r),
+                        .read_property => self.handleReadProperty(origin, r, now_ms),
+                        .read_property_multiple => self.handleRpm(origin, r, now_ms),
                         .write_property => self.handleWriteProperty(origin, r),
                         .write_property_multiple => self.handleWpm(origin, r),
                         .device_communication_control => self.handleDcc(origin, r, now_ms),
@@ -428,6 +472,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                         },
                     };
                 },
+                .segment_ack => |sa| return self.handleSegmentAck(origin, sa, now_ms),
                 .simple_ack => |s| {
                     // The acknowledgement of one of our confirmed COV
                     // notifications.
@@ -437,6 +482,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                     return .none;
                 },
                 .abort, .reject, .err => {
+                    if (self.seg.active and self.seg.invoke_id == a.invokeId() and self.seg.peer.eql(origin)) self.seg.active = false;
                     for (&self.subs) |*sub| {
                         if (sub.active and sub.outstanding == a.invokeId()) sub.outstanding = null;
                     }
@@ -510,6 +556,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
             self: *Self,
             to: BipAddress,
             r: apdu.ConfirmedRequest,
+            now_ms: u64,
         ) Error!Event {
             const rp = service.ReadProperty.decode(r.data) catch {
                 try self.sendApdu(to, .{ .reject = .{
@@ -528,10 +575,10 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 return self.refuse(to, r.invoke_id, .read_property, .property, .property_is_not_an_array);
             }
 
-            var body: [transport.max_datagram]u8 = undefined;
-            var w = tag.Writer.init(&body);
-            var vbuf: [512]u8 = undefined;
-            var vw = tag.Writer.init(&vbuf);
+            var body: [max_segmented_reply]u8 = undefined;
+            var w = tag.Writer.init(if (self.config.segmented_responses) &body else body[0..transport.max_datagram]);
+            var vbuf: [4096]u8 = undefined;
+            var vw = tag.Writer.init(if (self.config.segmented_responses) &vbuf else vbuf[0..512]);
             if (rp.array_index != null and p.value == .priority_array) {
                 // Index 0 is the array's size, 1..16 one slot.
                 const ix = rp.array_index.?;
@@ -554,17 +601,13 @@ pub fn Device(comptime max_subscriptions: usize) type {
             }).encode(&w) catch
                 return self.abortOverflow(to, r.invoke_id);
 
-            try self.sendApdu(to, .{ .complex_ack = .{
-                .invoke_id = r.invoke_id,
-                .service = .read_property,
-                .data = w.written(),
-            } });
+            if (try self.replyComplex(to, r, .read_property, w.written(), now_ms)) |ev| return ev;
             return .{ .read = .{ .object = rp.object, .property = rp.property } };
         }
 
-        fn handleRpm(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
-            var body: [transport.max_datagram]u8 = undefined;
-            var w = tag.Writer.init(&body);
+        fn handleRpm(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest, now_ms: u64) Error!Event {
+            var body: [max_segmented_reply]u8 = undefined;
+            var w = tag.Writer.init(if (self.config.segmented_responses) &body else body[0..transport.max_datagram]);
             var b = service.RpmAckBuilder.init(&w);
 
             var it = service.RpmRequestIterator.init(r.data);
@@ -628,18 +671,14 @@ pub fn Device(comptime max_subscriptions: usize) type {
             }
             b.finish() catch return self.abortOverflow(to, r.invoke_id);
 
-            self.sendApdu(to, .{ .complex_ack = .{
-                .invoke_id = r.invoke_id,
-                .service = .read_property_multiple,
-                .data = w.written(),
-            } }) catch return self.abortOverflow(to, r.invoke_id);
+            if (self.replyComplex(to, r, .read_property_multiple, w.written(), now_ms) catch
+                return self.abortOverflow(to, r.invoke_id)) |ev| return ev;
             return .{ .read = .{ .object = last, .property = .all } };
         }
 
         fn emitValue(self: *Self, b: *service.RpmAckBuilder, prop: *const Property) Error!void {
-            _ = self;
-            var vbuf: [512]u8 = undefined;
-            var vw = tag.Writer.init(&vbuf);
+            var vbuf: [4096]u8 = undefined;
+            var vw = tag.Writer.init(if (self.config.segmented_responses) &vbuf else vbuf[0..512]);
             try prop.value.encode(&vw);
             try b.value(prop.id, null, vw.written());
         }
@@ -732,6 +771,115 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// stay applied. A request that cannot be decoded at all is rejected;
         /// one that breaks after a write was applied is an Error whose first
         /// failed attempt names object instance 4194303 (addendum 135-2016bl).
+        /// Sends a ComplexACK. When the device may segment and the reply is
+        /// larger than the requester's max APDU, it is sent as segments
+        /// instead (null is returned when it went out whole).
+        fn replyComplex(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest, svc: types.ConfirmedService, data: []const u8, now_ms: u64) Error!?Event {
+            if (self.config.segmented_responses) {
+                const mine = self.config.max_apdu.octets() catch 1476;
+                const theirs = r.max_apdu.octets() catch 50;
+                const limit = @min(mine, theirs);
+                if (3 + data.len > limit) return try self.startSegments(to, r, svc, data, limit, now_ms);
+            }
+            try self.sendApdu(to, .{ .complex_ack = .{ .invoke_id = r.invoke_id, .service = svc, .data = data } });
+            return null;
+        }
+
+        fn startSegments(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest, svc: types.ConfirmedService, data: []const u8, limit: usize, now_ms: u64) Error!?Event {
+            if (!r.segmented_response_accepted) {
+                try self.sendApdu(to, apdu.segmentationNotSupported(r.invoke_id, true));
+                return .{ .refused = .{ .class = .services, .code = .abort_segmentation_not_supported } };
+            }
+            const seg_size = limit - 5;
+            const total = (data.len + seg_size - 1) / seg_size;
+            const accepted: usize = switch (r.max_segments) {
+                .unspecified => 255,
+                .two => 2,
+                .four => 4,
+                .eight => 8,
+                .sixteen => 16,
+                .thirty_two => 32,
+                .sixty_four => 64,
+                .more_than_64 => 255,
+            };
+            if (data.len > max_segmented_reply or total > 255 or total > accepted) {
+                try self.sendApdu(to, .{ .abort = .{ .server = true, .invoke_id = r.invoke_id, .reason = .apdu_too_long } });
+                return .{ .refused = .{ .class = .services, .code = .abort_buffer_overflow } };
+            }
+            if (self.seg.active) {
+                try self.sendApdu(to, .{ .abort = .{ .server = true, .invoke_id = r.invoke_id, .reason = .out_of_resources } });
+                return .{ .refused = .{ .class = .resources, .code = .abort_other } };
+            }
+            const sg = &self.seg;
+            @memcpy(sg.data[0..data.len], data);
+            sg.active = true;
+            sg.peer = to;
+            sg.invoke_id = r.invoke_id;
+            sg.svc = svc;
+            sg.len = data.len;
+            sg.seg_size = seg_size;
+            sg.total = @intCast(total);
+            sg.next = 0;
+            sg.base = 0;
+            sg.window = @max(1, self.config.segment_window);
+            sg.retries_left = self.config.segment_retries;
+            try self.sendWindow(now_ms);
+            return .{ .read = .{ .object = self.deviceId(), .property = .all } };
+        }
+
+        /// Sends the segments from `next` up to the end of the window.
+        fn sendWindow(self: *Self, now_ms: u64) Error!void {
+            const sg = &self.seg;
+            while (sg.next < sg.total and sg.next < sg.base + sg.window) : (sg.next += 1) {
+                const off = @as(usize, sg.next) * sg.seg_size;
+                const chunk = sg.data[off..@min(off + sg.seg_size, sg.len)];
+                try self.sendApdu(sg.peer, .{ .complex_ack = .{
+                    .invoke_id = sg.invoke_id,
+                    .service = sg.svc,
+                    .segment = .{
+                        .sequence_number = @truncate(sg.next),
+                        .window_size = sg.window,
+                        .more_follows = sg.next + 1 < sg.total,
+                    },
+                    .data = chunk,
+                } });
+            }
+            sg.deadline_ms = now_ms + self.config.segment_timeout_ms;
+        }
+
+        /// A `SegmentACK` from the requester (clause 5.4.4): a positive one
+        /// opens the next window, a negative one makes the sender go back to
+        /// the segment after the one it names.
+        fn handleSegmentAck(self: *Self, from: BipAddress, sa: apdu.SegmentAck, now_ms: u64) Error!Event {
+            const sg = &self.seg;
+            if (!sg.active or sa.server or sa.invoke_id != sg.invoke_id or !from.eql(sg.peer)) return .none;
+            sg.base = @as(u16, sa.sequence_number) + 1;
+            if (sa.negative) sg.next = sg.base;
+            if (sg.base >= sg.total) {
+                sg.active = false;
+                return .{ .segmented_reply_sent = .{ .invoke_id = sa.invoke_id, .segments = sg.total } };
+            }
+            sg.window = @max(1, @min(sa.actual_window_size, self.config.segment_window));
+            sg.retries_left = self.config.segment_retries;
+            try self.sendWindow(now_ms);
+            return .none;
+        }
+
+        /// The window was not acknowledged in time: send it again, or give
+        /// the transfer up after the configured retries.
+        fn segmentTimer(self: *Self, now_ms: u64) Error!void {
+            const sg = &self.seg;
+            if (!sg.active or now_ms < sg.deadline_ms) return;
+            if (sg.retries_left == 0) {
+                sg.active = false;
+                try self.sendApdu(sg.peer, .{ .abort = .{ .server = true, .invoke_id = sg.invoke_id, .reason = .tsm_timeout } });
+                return;
+            }
+            sg.retries_left -= 1;
+            sg.next = sg.base;
+            try self.sendWindow(now_ms);
+        }
+
         fn handleWpm(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
             var it = service.WpmRequestIterator.init(r.data);
             var done: usize = 0;
@@ -1888,6 +2036,136 @@ test "TimeSynchronization and UTCTimeSynchronization reach the application, unco
     try testing.expectEqual(true, (try dev.poll(1)).time_synchronized.utc);
     var rx: [transport.max_datagram]u8 = undefined;
     try testing.expect((try rig.client_ep.transport().recv(&rx)) == null);
+}
+
+/// A device object whose `object_list` is `n` analog values: `5 * n` octets.
+const BigList = struct {
+    list: [3000]u8 = undefined,
+    props: [3]Property = undefined,
+    objects: [1]Object = undefined,
+    list_len: usize = 0,
+
+    fn wire(self: *BigList, n: usize) []Object {
+        var w = tag.Writer.init(&self.list);
+        for (0..n) |i| w.appObjectId(.{ .type = .analog_value, .instance = @intCast(i) }) catch unreachable;
+        self.list_len = w.written().len;
+        self.props = .{
+            .{ .id = .object_identifier, .value = .{ .object_id = .{ .type = .device, .instance = 599 } } },
+            .{ .id = .object_name, .value = .{ .string = "BIG" } },
+            .{ .id = .object_list, .value = .{ .raw = self.list[0..self.list_len] } },
+        };
+        self.objects = .{.{ .id = .{ .type = .device, .instance = 599 }, .properties = &self.props }};
+        return &self.objects;
+    }
+};
+
+/// Runs device and client until the client reports `want` (a tag of its event) or 60 rounds pass.
+fn pumpUntilComplex(dev: anytype, c: anytype, start_ms: u64) !client.Event {
+    var now = start_ms;
+    for (0..60) |_| {
+        _ = try dev.poll(now);
+        const ev = try c.poll(now);
+        switch (ev) {
+            .complex_ack, .abort, .err, .timeout, .segmented_response => return ev,
+            else => {},
+        }
+        now += 10;
+    }
+    return error.NoAnswer;
+}
+
+test "segmented reply: a ReadProperty larger than the requester's max APDU is reassembled" {
+    var rig: Rig = .{};
+    rig.wire();
+    var big: BigList = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .segmented_responses = true, .max_apdu = .up_to_1476 }, big.wire(300));
+    var reasm: [4096]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .max_apdu = .up_to_480, .reassembly = &reasm });
+
+    // The device advertises that it can transmit segmented messages.
+    try dev.announce();
+    var iam_rx: [transport.max_datagram]u8 = undefined;
+    const got = (try rig.client_ep.transport().recv(&iam_rx)).?;
+    const iam = try service.IAm.decode((try apdu.decode((try npdu.decode((try bvll.decode(got.bytes)).npdu().?)).payload.apdu)).unconfirmed_request.data);
+    try testing.expectEqual(types.Segmentation.transmit, iam.segmentation);
+
+    _ = try c.readProperty(rig.device_ep.address, .{ .type = .device, .instance = 599 }, .object_list, null, 0);
+    const ev = try pumpUntilComplex(&dev, &c, 0);
+    try testing.expectEqual(types.ConfirmedService.read_property, ev.complex_ack.svc);
+    const ack = try service.ReadPropertyAck.decode(ev.complex_ack.data);
+    try testing.expectEqualSlices(u8, big.list[0..big.list_len], ack.value);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    // 1500 octets of values at 475 per segment: four segments, acknowledged as one window.
+    try testing.expectEqual(@as(u16, 4), (try dev.poll(1_000)).segmented_reply_sent.segments);
+}
+
+test "segmented reply: a window of one is acknowledged segment by segment, a lost segment is resent" {
+    var rig: Rig = .{};
+    rig.wire();
+    var big: BigList = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .segmented_responses = true, .segment_window = 4 }, big.wire(300));
+    var reasm: [4096]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .max_apdu = .up_to_480, .reassembly = &reasm, .segment_window = 4 });
+
+    _ = try c.readProperty(rig.device_ep.address, .{ .type = .device, .instance = 599 }, .object_list, null, 0);
+    _ = try dev.poll(0); // the request: four segments go out
+    // Take them off the wire and hand the client segments 0, 2 and 3: segment 1 is lost.
+    var datagrams: [4][transport.max_datagram]u8 = undefined;
+    var lens: [4]usize = undefined;
+    for (0..4) |i| {
+        const d = (try rig.client_ep.transport().recv(&datagrams[i])).?;
+        lens[i] = d.bytes.len;
+    }
+    for ([_]usize{ 0, 2, 3 }) |i| rig.client_ep.inject(rig.device_ep.address, datagrams[i][0..lens[i]]);
+    _ = try c.poll(1); // segment 0 in order
+    _ = try c.poll(1); // segment 2: out of order, a negative SegmentACK for 0
+    _ = try c.poll(1); // segment 3: the same
+    // The device goes back to segment 1 and sends the rest of the window.
+    _ = try dev.poll(2);
+    _ = try dev.poll(2);
+    var done: ?client.Event = null;
+    for (0..20) |i| {
+        const ev = try c.poll(3 + i);
+        if (ev == .complex_ack) {
+            done = ev;
+            break;
+        }
+    }
+    const ack = try service.ReadPropertyAck.decode(done.?.complex_ack.data);
+    try testing.expectEqualSlices(u8, big.list[0..big.list_len], ack.value);
+}
+
+test "segmented reply: the requester that does not accept segments is aborted, a silent one times out" {
+    var rig: Rig = .{};
+    rig.wire();
+    var big: BigList = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .segmented_responses = true, .segment_timeout_ms = 100, .segment_retries = 2 }, big.wire(300));
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .max_apdu = .up_to_480 });
+    _ = try c.readProperty(rig.device_ep.address, .{ .type = .device, .instance = 599 }, .object_list, null, 0);
+    _ = try dev.poll(0);
+    const ev = try c.poll(1);
+    try testing.expectEqual(types.AbortReason.segmentation_not_supported, ev.abort.reason);
+
+    // A requester that accepts segments and then says nothing: the window is
+    // resent twice, then the transfer is abandoned.
+    var reasm: [4096]u8 = undefined;
+    var c2 = client.DefaultClient.init(rig.client_ep.transport(), .{ .max_apdu = .up_to_480, .reassembly = &reasm });
+    _ = try c2.readProperty(rig.device_ep.address, .{ .type = .device, .instance = 599 }, .object_list, null, 10);
+    _ = try dev.poll(10);
+    var drop: [transport.max_datagram]u8 = undefined;
+    while ((try rig.client_ep.transport().recv(&drop)) != null) {}
+    const sent_before = rig.device_ep.sent_count;
+    _ = try dev.poll(111); // first resend
+    _ = try dev.poll(212); // second resend
+    try testing.expect(rig.device_ep.sent_count > sent_before);
+    _ = try dev.poll(313); // out of retries: Abort(tsm_timeout)
+    try testing.expect(!dev.seg.active);
+    var last: types.AbortReason = .other;
+    while (try rig.client_ep.transport().recv(&drop)) |d| {
+        const a = try apdu.decode((try npdu.decode((try bvll.decode(d.bytes)).npdu().?)).payload.apdu);
+        if (a == .abort) last = a.abort.reason;
+    }
+    try testing.expectEqual(types.AbortReason.tsm_timeout, last);
 }
 
 test "the device refuses a segmented request rather than buffering it" {
