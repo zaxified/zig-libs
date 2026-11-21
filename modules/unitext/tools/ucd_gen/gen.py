@@ -11,7 +11,8 @@ ranges of DerivedCoreProperties.txt) from UCD files.
 
 Reads (all under the UCD directory): UnicodeData.txt, SpecialCasing.txt,
 CaseFolding.txt, DerivedNormalizationProps.txt, DerivedCoreProperties.txt,
-extracted/DerivedNumericType.txt, NormalizationTest.txt. Needs `zig` on PATH
+extracted/DerivedNumericType.txt, extracted/DerivedNumericValues.txt, EastAsianWidth.txt,
+NormalizationTest.txt. Needs `zig` on PATH
 only for `zig fmt --stdin`. Python 3 standard library only. The data are
 Unicode's (Unicode License v3, see the module's NOTICE); the encoding, the
 derived `unaccent` table and this code are ours.
@@ -21,6 +22,12 @@ What is derived here and how (the module's SPEC.md says the same):
   * General_Category, Bidi_Class (only WS/B/S matter: `isSpace`), the
     Uppercase / Lowercase / Cased / Case_Ignorable / Alphabetic properties and
     Numeric_Type -> one 16-bit record per code point (`gcflags`; bit 12 is the Alphabetic derived property).
+  * Bidi_Class (UnicodeData field 4), Bidi_Mirrored (field 9) and East_Asian_Width
+    (EastAsianWidth.txt, default N) -> one 16-bit record per code point (`uprops`).
+  * The decimal / digit fields of UnicodeData (6, 7) and the Numeric_Value of
+    extracted/DerivedNumericValues.txt (the CJK numerals included) -> `numrec`.
+  * The raw single-level decomposition mapping of UnicodeData field 5, with its
+    `<tag>` -> `rawdecomp` (`unicodedata.decomposition`).
   * Canonical_Combining_Class, NFC_QC / NFKC_QC (Yes, Maybe, No), NFD_QC,
     NFKD_QC -> one 16-bit record per code point (`norm`).
   * Full recursive canonical and compatibility decompositions (Hangul
@@ -52,6 +59,13 @@ GC_INDEX = {g: i for i, g in enumerate(GCS)}
 F_UPPER, F_LOWER, F_CASED, F_IGNORABLE, F_SPACE = 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 9
 NUM_SHIFT = 10  # bits 10-11: 0 none, 1 Numeric, 2 Digit, 3 Decimal
 F_ALPHABETIC = 1 << 12  # the Alphabetic derived property (DerivedCoreProperties.txt)
+
+BIDI = ["L", "R", "AL", "EN", "ES", "ET", "AN", "CS", "NSM", "BN", "B", "S", "WS", "ON", "LRE", "LRO", "RLE", "RLO",
+        "PDF", "LRI", "RLI", "FSI", "PDI"]
+EAW = ["N", "A", "F", "H", "Na", "W"]
+DECOMP_TAGS = ["font", "noBreak", "initial", "medial", "final", "isolated", "circle", "super", "sub", "vertical",
+               "wide", "narrow", "small", "square", "fraction", "compat"]
+# uprops layout (u16): bits 0-4 Bidi_Class + 1 (0 = no UnicodeData entry); bit 5 Bidi_Mirrored; bits 6-8 East_Asian_Width.
 
 # norm layout (u16): bits 0-7 ccc; 8-9 NFC_QC; 10-11 NFKC_QC (0 Yes, 1 Maybe, 2 No); 12 NFD_QC=No; 13 NFKD_QC=No.
 
@@ -143,12 +157,16 @@ class Ucd:
         self.load_props()
         self.load_casing()
         self.load_decomp()
+        self.load_eaw()
+        self.load_numeric_values()
 
     def load_unicode_data(self):
         n = MAX_CP + 1
         self.gc = [GC_INDEX["Cn"]] * n
         self.ccc = [0] * n
         self.bidi = [""] * n
+        self.mirrored = [False] * n
+        self.numfields = {}  # cp -> (decimal, digit, numeric) text fields
         self.name = {}
         self.decomp_raw = {}
         self.simple = {}  # cp -> (upper, lower, title) code points or None
@@ -166,8 +184,11 @@ class Ucd:
                 self.gc[c] = GC_INDEX[f[2]]
                 self.ccc[c] = int(f[3])
                 self.bidi[c] = f[4]
+                self.mirrored[c] = f[9] == "Y"
             if lo == cp:
                 self.name[cp] = name
+                if f[6] or f[7] or f[8]:
+                    self.numfields[cp] = (f[6], f[7], f[8])
                 if f[5]:
                     self.decomp_raw[cp] = f[5]
                 up = hexcp(f[12]) if f[12] else None
@@ -225,6 +246,24 @@ class Ucd:
                 self.fold_simple[cp] = tgt[0]
             elif f[1] == "F":
                 self.fold_full[cp] = tgt
+
+    def load_numeric_values(self):
+        # DerivedNumericValues.txt: `cp[..cp] ; float ; ; exact` -- every Numeric_Value, the Unihan ones
+        # (CJK numerals) included, which UnicodeData field 8 does not carry.
+        self.numval = {}
+        for f in data_lines(os.path.join(self.dir, "extracted", "DerivedNumericValues.txt")):
+            r = f[0]
+            lo, hi = (hexcp(x) for x in r.split("..")) if ".." in r else (hexcp(r),) * 2
+            for c in range(lo, hi + 1):
+                self.numval[c] = f[3]
+
+    def load_eaw(self):
+        self.eaw = ["N"] * (MAX_CP + 1)
+        for f in data_lines(os.path.join(self.dir, "EastAsianWidth.txt")):
+            r = f[0]
+            lo, hi = (hexcp(x) for x in r.split("..")) if ".." in r else (hexcp(r),) * 2
+            for c in range(lo, hi + 1):
+                self.eaw[c] = f[1]
 
     def load_decomp(self):
         self.canon = {}
@@ -389,6 +428,62 @@ def build(u):
         v |= u.numtype.get(c, 0) << NUM_SHIFT
         gcf[c] = v
     out.append(emit_table("gcflags", gcf, "u16", str, "General_Category (bits 0-4), flags (bit 12: Alphabetic) and Numeric_Type per code point."))
+
+    # uprops
+    up = [0] * n
+    for c in range(n):
+        v = (BIDI.index(u.bidi[c]) + 1) if u.bidi[c] else 0
+        if u.mirrored[c]:
+            v |= 1 << 5
+        v |= EAW.index(u.eaw[c]) << 6
+        up[c] = v
+    out.append(emit_table("uprops", up, "u16", str, "Bidi_Class + 1 (bits 0-4; 0 = no UnicodeData entry), Bidi_Mirrored (bit 5) and East_Asian_Width (bits 6-8: N A F H Na W) per code point."))
+
+    # numrec: decimal / digit / numeric fields
+    def numrec(c):
+        d, g, _ = u.numfields.get(c, ("", "", ""))
+        m = u.numval.get(c, "")
+        if not (d or g or m):
+            return (-1, -1, 0, 0)
+        num, den = 0, 1
+        if m:
+            if "/" in m:
+                a, b = m.split("/")
+                num, den = int(a), int(b)
+            else:
+                num = int(m)
+        return (int(d) if d else -1, int(g) if g else -1, num, den) if m else (int(d) if d else -1, int(g) if g else -1, 0, 0)
+    nr = [numrec(c) for c in range(n)]
+    out.append("/// `{ decimal, digit, num, den }` of UnicodeData fields 6-8 (decimal / digit -1 = none; den 0 = no numeric value).\n")
+    out.append("pub const NumRec = struct { decimal: i8, digit: i8, num: i64, den: u32 };\n")
+    out.append(emit_table("numrec", nr, "NumRec", lambda r: f".{{ .decimal = {r[0]}, .digit = {r[1]}, .num = {r[2]}, .den = {r[3]} }}", "The decimal, digit and numeric values of a code point."))
+
+    # rawdecomp: UnicodeData field 5 as written (single level), tag + code points
+    rpool = []
+    rpos = {}
+    rd = [(0, 0, 0)] * n
+    for c, raw in sorted(u.decomp_raw.items()):
+        parts = raw.split()
+        tag = 0
+        if parts[0].startswith("<"):
+            tag = DECOMP_TAGS.index(parts[0][1:-1]) + 1
+            parts = parts[1:]
+        t = tuple(hexcp(x) for x in parts)
+        if t not in rpos:
+            for i in range(len(rpool) - len(t) + 1):
+                if tuple(rpool[i:i + len(t)]) == t:
+                    rpos[t] = i
+                    break
+            else:
+                rpos[t] = len(rpool)
+                rpool.extend(t)
+        rd[c] = (rpos[t], len(t), tag)
+    assert len(rpool) < 65536
+    out.append("/// `{ off, len, tag }` into `rawdecomp_pool`: UnicodeData field 5 as written; tag 0 = canonical, 1.. = the `<tag>` (font, noBreak, ...); len 0 = no mapping.\n")
+    out.append("pub const RawDecomp = struct { off: u16, len: u8, tag: u8 };\n")
+    out.append(emit_table("rawdecomp", rd, "RawDecomp", lambda r: f".{{ .off = {r[0]}, .len = {r[1]}, .tag = {r[2]} }}", "The raw decomposition mapping of a code point (one level, as in UnicodeData.txt)."))
+    out.append("pub const rawdecomp_pool = [_]u32{\n" + "".join("    " + ", ".join(f"0x{v:X}" for v in rpool[i:i + 12]) + ",\n" for i in range(0, len(rpool), 12)) + "};\n")
+    sys.stderr.write(f"  rawdecomp pool {len(rpool)} code points\n")
 
     # norm
     nrm = [0] * n

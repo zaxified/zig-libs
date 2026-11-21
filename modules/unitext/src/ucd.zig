@@ -5,7 +5,7 @@
 //! U+10FFFF (a `u21` can hold up to 0x1FFFFF) reads as the table's default record.
 
 const std = @import("std");
-const t = @import("tables.zig");
+pub const t = @import("tables.zig");
 
 pub const max_cp: u21 = 0x10FFFF;
 
@@ -79,6 +79,19 @@ pub inline fn category(cp: u21) GeneralCategory {
 /// Numeric_Type (bits 10-11 of the record; bit 12 is `f_alphabetic`): 0 none, 1 Numeric, 2 Digit, 3 Decimal.
 pub inline fn numericType(cp: u21) u2 {
     return @intCast((flags(cp) >> num_shift) & 3);
+}
+
+/// The packed `uprops` record of `cp`: Bidi_Class + 1 (bits 0-4), Bidi_Mirrored (bit 5), East_Asian_Width (bits 6-8).
+pub inline fn uprops(cp: u21) u16 {
+    return look(t.uprops, cp);
+}
+
+pub inline fn numrec(cp: u21) t.NumRec {
+    return look(t.numrec, cp);
+}
+
+pub inline fn rawdecomp(cp: u21) t.RawDecomp {
+    return look(t.rawdecomp, cp);
 }
 
 /// The packed `norm` record of `cp`.

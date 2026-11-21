@@ -19,6 +19,7 @@ const testing = std.testing;
 const normalization_test = @embedFile("testdata/normalization_test.txt");
 const cpython_vectors = @embedFile("testdata/cpython_vectors.txt");
 const rust_vectors = @embedFile("testdata/rust_vectors.txt");
+const cpython_props_vectors = @embedFile("testdata/cpython_props_vectors.txt");
 
 /// `hex hex hex` -> UTF-8 appended to `out`.
 fn fromHex(out: *std.ArrayList(u8), a: std.mem.Allocator, field: []const u8) !void {
@@ -282,6 +283,78 @@ test "CPython vectors: every code point of the 16.0.0/17.0.0/18.0.0 intersection
 }
 
 // ── Rust ────────────────────────────────────────────────────────────────────
+
+test "CPython property vectors: decimal, digit, numeric, bidirectional, mirrored, east_asian_width, decomposition" {
+    var it = std.mem.splitScalar(u8, cpython_props_vectors, '\n');
+    var n: usize = 0;
+    var buf: [128]u8 = undefined;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var f = std.mem.splitScalar(u8, line, ';');
+        const cp: u21 = try std.fmt.parseInt(u21, f.next().?, 16);
+        const dec = f.next().?;
+        const dig = f.next().?;
+        const num = f.next().?;
+        const bidi = f.next().?;
+        const mir = f.next().?;
+        const eaw = f.next().?;
+        const dc = f.next().?;
+        errdefer std.debug.print("line: {s}\n", .{line});
+        if (dec.len == 0) try testing.expectEqual(@as(?u8, null), ut.decimalValue(cp)) else try testing.expectEqual(try std.fmt.parseInt(u8, dec, 10), ut.decimalValue(cp).?);
+        if (dig.len == 0) try testing.expectEqual(@as(?u8, null), ut.digitValue(cp)) else try testing.expectEqual(try std.fmt.parseInt(u8, dig, 10), ut.digitValue(cp).?);
+        if (num.len == 0) {
+            try testing.expect(ut.numericValue(cp) == null);
+        } else {
+            // CPython's float is num / den rounded once, which is what `toF64` computes
+            try testing.expectEqual(try std.fmt.parseFloat(f64, num), ut.numericValue(cp).?.toF64());
+        }
+        try testing.expectEqualStrings(bidi, if (ut.bidiClass(cp)) |b| bidiName(b) else "");
+        try testing.expectEqual(mir[0] == '1', ut.isMirrored(cp));
+        try testing.expectEqualStrings(eaw, eawName(ut.eastAsianWidth(cp)));
+        try testing.expectEqualStrings(dc, ut.decompositionText(cp, &buf));
+        n += 1;
+    }
+    try testing.expect(n > 20000);
+}
+
+fn bidiName(b: ut.BidiClass) []const u8 {
+    return switch (b) {
+        .l => "L",
+        .r => "R",
+        .al => "AL",
+        .en => "EN",
+        .es => "ES",
+        .et => "ET",
+        .an => "AN",
+        .cs => "CS",
+        .nsm => "NSM",
+        .bn => "BN",
+        .b => "B",
+        .s => "S",
+        .ws => "WS",
+        .on => "ON",
+        .lre => "LRE",
+        .lro => "LRO",
+        .rle => "RLE",
+        .rlo => "RLO",
+        .pdf => "PDF",
+        .lri => "LRI",
+        .rli => "RLI",
+        .fsi => "FSI",
+        .pdi => "PDI",
+    };
+}
+
+fn eawName(w: ut.EastAsianWidth) []const u8 {
+    return switch (w) {
+        .n => "N",
+        .a => "A",
+        .f => "F",
+        .h => "H",
+        .na => "Na",
+        .w => "W",
+    };
+}
 
 test "Rust vectors: to_lowercase / to_uppercase of every scalar value and of the strings" {
     const a = testing.allocator;

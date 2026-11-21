@@ -16,8 +16,8 @@ mkdir -p "$dir/extracted"
 curl -sfL --max-time 300 -o "$tmp/UCD.zip" "https://www.unicode.org/Public/$v/ucd/UCD.zip"
 (cd "$tmp" && unzip -q -o UCD.zip UnicodeData.txt SpecialCasing.txt CaseFolding.txt CompositionExclusions.txt \
     DerivedNormalizationProps.txt DerivedCoreProperties.txt NormalizationTest.txt PropList.txt \
-    Scripts.txt Blocks.txt \
-    extracted/DerivedNumericType.txt extracted/DerivedGeneralCategory.txt)
+    Scripts.txt Blocks.txt EastAsianWidth.txt \
+    extracted/DerivedNumericType.txt extracted/DerivedNumericValues.txt extracted/DerivedGeneralCategory.txt)
 cp "$tmp"/*.txt "$dir/"
 cp "$tmp"/extracted/*.txt "$dir/extracted/"
 echo "fetched UCD $v into $dir"

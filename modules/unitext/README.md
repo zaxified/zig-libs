@@ -7,7 +7,8 @@ Unicode text algorithms on UTF-8 strings, Unicode 18.0.0: **full case mapping**
 `Łódź` → `Lodz`, `Straße` → `Strasse`) and the Python-`str` **classification**
 (`isAlpha`, `isAlphabetic` (the Alphabetic property), `isDecimal`, `isDigit`, `isNumeric`, `isAlnum`, `isSpace`, `isUpper`,
 `isLower`, `isTitle`, `isPrintable`, `isAscii`) with per-code-point properties
-(`generalCategory`, `combiningClass`, `toLowerCp` …).
+(`generalCategory`, `combiningClass`, `toLowerCp` …) and the single-property lookups of `unicodedata`
+(`decimalValue`, `digitValue`, `numericValue`, `bidiClass`, `isMirrored`, `eastAsianWidth`, `decomposition`).
 
 ```zig
 const ut = @import("unitext");

@@ -108,6 +108,21 @@ pub const isCasedCp = props.isCasedCp;
 pub const isCaseIgnorableCp = props.isCaseIgnorableCp;
 pub const isPrintableCp = props.isPrintableCp;
 
+// single-property lookups (CPython `unicodedata`)
+pub const decimalValue = props.decimalValue;
+pub const digitValue = props.digitValue;
+pub const Numeric = props.Numeric;
+pub const numericValue = props.numericValue;
+pub const BidiClass = props.BidiClass;
+pub const bidiClass = props.bidiClass;
+pub const isMirrored = props.isMirrored;
+pub const EastAsianWidth = props.EastAsianWidth;
+pub const eastAsianWidth = props.eastAsianWidth;
+pub const DecompositionTag = props.DecompositionTag;
+pub const Decomposition = props.Decomposition;
+pub const decomposition = props.decomposition;
+pub const decompositionText = props.decompositionText;
+
 test {
     _ = ucd;
     _ = @import("utf8.zig");
