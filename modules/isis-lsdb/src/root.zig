@@ -77,6 +77,7 @@ pub const meta = .{
 
 pub const compare = @import("compare.zig");
 pub const store = @import("store.zig");
+pub const generate = @import("generate.zig");
 
 // ── the most-used surface, re-exported ───────────────────────────────────────
 pub const Lsdb = store.Lsdb;
@@ -661,6 +662,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("compare.zig");
     _ = @import("store.zig");
+    _ = @import("generate.zig");
     _ = @import("goldens.zig");
     _ = @import("bench.zig");
     _ = @import("fuzz_test.zig");

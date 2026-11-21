@@ -25,8 +25,8 @@
 //! while `count() < capacity`; past that, `insert` returns `error.DatabaseFull`
 //! (the store is left unchanged) rather than evicting a valid link-state record.
 //! An adversary flooding distinct LSP-IDs is therefore bounded by `capacity`.
-//! (ISO's LSPDBOverload response — setting the overload bit in our own LSP — is
-//! a documented hook, deferred to the LSP-generation layer.)
+//! (ISO's LSPDBOverload response is `Lsdb.isOverloaded`, which `generate.zig`
+//! turns into the overload bit of our own LSP.)
 
 const std = @import("std");
 const isis = @import("isis");
@@ -491,7 +491,7 @@ pub const Lsdb = struct {
     /// sequence space forever). The standard's remedy — mirrored by FRRouting's
     /// `own_lsp` branch in `isis_pdu.c:process_lsp`, which calls `lsp_inc_seqno`
     /// and re-floods — is to **re-originate at the challenger's sequence + 1**.
-    /// Since LSP generation is deferred (SPEC §8), this store instead:
+    /// The store only reports the challenge; `generate.zig` re-originates from it (SPEC §9):
     ///   - keeps its own copy untouched,
     ///   - sets `refresh_pending` and records `challenge_sequence` on it,
     ///   - sets SRM on **every** circuit (FRR floods the corrected LSP on all,

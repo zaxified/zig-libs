@@ -11,7 +11,8 @@ the `isis` codec), and reads/clears the flags to drive flooding.
 
 Status: the update process is complete: the store, the ISO §7.3.16.1
 comparison, time-injected aging/purge, the SRM/SSN flag matrix, CSNP/PSNP
-reconcile, and LSP/SNP authentication (RFC 5304/5310, see below). The flooding
+reconcile, LSP/SNP authentication (RFC 5304/5310, see below) and generation
+of our own LSP (`generate`, below). The flooding
 transmit loop (the SRM consumer) lives in the sibling `isis-flood`, SPF in
 `isis-spf`; see *Not provided* for what this module does not do.
 
@@ -124,9 +125,29 @@ are bounded twice more: by their own sub-budget `Config.request_capacity`
 (default `capacity/4`, so fabricated LSP-IDs can never deny admission to genuine
 LSPs) and by `Config.request_timeout` (default 60), after which `tick` drops them
 and reports `AgeReport.requests_expired`. Without the timeout one CSNP listing
-`capacity` fabricated LSP-IDs wedges the database permanently. (ISO's
-LSPDBOverload response — the overload bit — is a hook, deferred to the
-LSP-generation layer.)
+`capacity` fabricated LSP-IDs wedges the database permanently. When a new LSP-ID is shed with `DatabaseFull` the store is
+*overloaded* (`isOverloaded`, ISO §7.3.19): the generator advertises the
+overload bit until `tick` has seen room again for `Config.overload_recovery`.
+
+## Generating our own LSP
+
+`generate.generate(&db, origin, now, scratch)` builds fragment 0..n of this
+system's LSP (identity TLVs, IS neighbours, your raw TLVs), numbers each fragment
+above the stored copy and any neighbour's challenge, skips unchanged fragments,
+re-issues `refresh_pending` ones, purges fragments no longer needed, signs with
+`auth_keys[0]` when keys are set, and sets the overload bit while the store is
+overloaded. `generate.purgeFragments` withdraws a pseudonode LSP. Details: `SPEC.md` §9.
+
+```zig
+var scratch: [isis_lsdb.generate.default_buffer_size]u8 = undefined;
+const res = try isis_lsdb.generate.generate(&db, .{
+    .area_addresses = &.{&[_]u8{ 0x49, 0x00, 0x01 }},
+    .protocols_supported = &.{isis.tlvs.nlpid_ipv4},
+    .hostname = "r1",
+    .neighbours = &.{.{ .id = .{ 0, 0, 0, 0, 0, 0xB, 0 }, .metric = 10 }},
+}, now, &scratch);
+// res.written fragments are now in the database with SRM set on every circuit.
+```
 
 ## Time-injection contract
 
@@ -175,11 +196,10 @@ const count = db.summarise(&out, start_id, end_id, now);
 
 ## Not provided
 
-Generating and fragmenting our own LSP (the module raises `refresh_pending` and
-`challenge_sequence` and stops), LSPDBOverload, multi-topology, a level-agnostic
-instance (an L1 and an L2 database are two `Lsdb` instances) and more than 32
-circuits. The flooding loop and SPF are the siblings above. Reasons and the
-open items: `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
+A per-topology database (RFC 5120 has one LSDB; MT lives inside TLVs), a
+level-agnostic instance (an L1 and an L2 database are two `Lsdb` instances),
+more than 255 circuits, and the Purge Originator TLV on a *received* purge. The flooding loop and SPF are the siblings above.
+Reasons and the open items: `SPEC.md` *What is deliberately not done*.
 
 ## Test
 
