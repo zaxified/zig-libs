@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [skip2/go-qrcode](https://github.com/skip2/go-qrcode) | Go | MIT | 3.0k | pushed 2024-03-01 (no releases) | Encoder producing PNG, four ECC levels; README shows nothing about Kanji/ECI/Micro *(inferred: absent)*. Effectively unmaintained. |
 | [bensengupta/qr](https://github.com/bensengupta/qr) | Zig | MIT | 11 | pushed 2025-09-27 (no releases) | The closest Zig encoder found: a CLI-first encoder with ECC level and quiet-zone options; no decoder *(inferred from README)*. Other Zig hits (`nektro/zig-qrcode`, MPL-2.0, 4 stars; `korabdoroci/qrzig`, AGPL-3.0) are tiny. Zig `std` has no QR code. |
 
-**Where we are ahead:** the only one of these that both encodes and decodes with Reed-Solomon error correction (libqrencode, nayuki, qrcode-rust and go-qrcode are encoders; rqrr needs an image); structured append with a decode-side `decodePart` and `sequenceParity`; SVG and terminal renderers in the box; allocation-free; encoder placement and block structure checked byte-for-byte against segno (51 vectors), decoder against 160 segno grids. **Where we are behind:** Kanji mode, Micro QR and FNC1 (libqrencode and qrcode-rust have some or all of them); ECI and mixed-mode segments are in (`Options.eci`, `Options.optimize_segments`).
+**Where we are ahead:** the only one of these that both encodes and decodes with Reed-Solomon error correction (libqrencode, nayuki, qrcode-rust and go-qrcode are encoders; rqrr needs an image); structured append with a decode-side `decodePart` and `sequenceParity`; SVG and terminal renderers in the box; allocation-free; encoder placement and block structure checked byte-for-byte against segno (51 vectors), decoder against 160 segno grids. **Where we are behind:** Micro QR and FNC1 (libqrencode and qrcode-rust have some or all of them); ECI and mixed-mode segments are in (`Options.eci`, `Options.optimize_segments`).
 
 
 ## Design & invariants
@@ -143,8 +143,19 @@ symbol of a structured-append sequence carries it. The decoder accepts the 1-, 2
 3-byte forms and answers `error.BadData` for a truncated, reserved (`111xxxxx`),
 out-of-range, repeated or late designator, so mixed-charset symbols are refused.
 `decodePart` reports the number in `Part.eci` (null when absent, then the reader's
-default applies); `decode` drops it. An unimplemented segment mode (Kanji
-included) is `BadData`, not read as bytes.
+default applies); `decode` drops it. An unimplemented segment mode (FNC1)
+is `BadData`, not read as bytes. A Kanji segment (mode `0b1000`) reads 13 bits per character back to the Shift-JIS pair
+(`hi * 0xC0 + lo`, the two ranges told apart by the offset; a trail offset past 0xBC is `BadData`) and `decode` returns
+those bytes.
+
+**Kanji mode (`Options.mode = .kanji`).** After libqrencode (whose Kanji mode likewise takes Shift-JIS bytes from the
+caller): never picked automatically, the text is Shift-JIS bytes of even length, each pair 0x8140..0x9FFC or 0xE040..0xEBBF
+with a trail byte 0x40..0xFC other than 0x7F (else `error.ModeMismatch`); the count is in characters (8, 10, 12 bits by
+version range), `dataBits` counts 13 per character, a structured-append chunk never splits a pair, `eci` and
+`optimize_segments` cannot be combined with it. No table is carried: transcoding UTF-8 to Shift-JIS is the caller's
+(the `encoding` module has it). Tests: the standard's two worked values (0x935F is `0x0D9F`, 0xE4AA is `0x1AAA`), a round
+trip at every version range and ECC level, the standard's capacities in characters (version 1: 10 at L, 4 at H; version
+40 at L: 1817; one more is `TooLong`), and the decoder's trail check and both range ends.
 
 
 ## Threat model & out of scope
@@ -243,18 +254,21 @@ a missing panic.
 - **Reassembling a structured-append sequence:** holding sixteen decoded fragments needs storage this module does not have;
   `sequenceParity` is the check that makes the caller's reassembly safe.
 
+- **Incremental penalty evaluation.** `pickMask` applies, scores and un-applies eight masks over the whole symbol, eight
+  full passes at version 40, as nayuki's and libqrencode's encoders do; no consumer generates codes in bulk, and an
+  incremental score would be a second implementation of the four penalty rules to keep equal to the first (the golden
+  matrices pin the choice of mask).
+
 ## Backlog / deferred
 
-- **Kanji mode** (survey 2026-09-30). 13 bits per Japanese character versus 24 in UTF-8 bytes; matters to Japanese-text users,
-  the original QR audience. Needs a Shift-JIS table (a `charset`-style sibling or an embedded JIS X 0208 table). Effort:
-  medium. Fits §2 if the table is generated/embedded. Not scheduled: a caller would have to transcode into Shift-JIS first,
-  and byte mode carries the same text as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
-- **Micro QR (M1-M4)** (survey 2026-09-30). Small labels; libqrencode (experimental) and qrcode-rust have it. Effort: medium
-  (separate symbol geometry, masks, format info). Fits §2. Not scheduled: not needed by a caller that wants "put this text in
-  a QR code"; a separable addition that the design does not foreclose.
-- **Penalty evaluation cost.** `pickMask` applies, scores and un-applies eight masks over the whole symbol, eight full passes
-  at version 40. Fine for anything interactive; if a consumer ever generates codes in bulk, the scoring can be made
-  incremental.
+None open.
+
+## Roadmap
+
+- **Micro QR (M1-M4)** (survey 2026-09-30). Small labels; libqrencode (experimental) and qrcode-rust have it. A separate
+  symbol family: its own geometry (one finder pattern, no alignment), four masks, format information, the M1-M4 capacity
+  tables and a decoder path. Size: weeks of its own (with the oracle to check it against: segno encodes Micro QR); the
+  design does not foreclose it.
 
 ## Anchoring
 **Mixed.** The module-placement order and the error-correction block structure — the two things

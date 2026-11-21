@@ -133,9 +133,15 @@ single-mode result. It cannot be combined with `mode` or `eci`
 choice), and `decodePart` reports it in `Part.eci`. Only one designator per
 symbol, ahead of the data; mixed-charset symbols are refused.
 
+## Kanji mode
+
+`.{ .mode = .kanji }` packs Shift-JIS double-byte characters at 13 bits each (libqrencode's behaviour: the
+caller hands over Shift-JIS bytes, even length, no table is carried); it is never chosen automatically. The
+decoder returns the Shift-JIS bytes of a Kanji segment.
+
 ## Not provided
 
-Kanji mode, Micro QR and FNC1 (the decoder refuses a symbol that uses an
+Micro QR and FNC1 (the decoder refuses a symbol that uses an
 unimplemented segment mode with `error.BadData`; the encoder never emits one), and
 reading from an image: `decode` takes a matrix, and the sibling module `qrscan`
 produces it from a photograph. Reasons and the open items: `SPEC.md` *What is

@@ -22,11 +22,13 @@
 //! the field tables, the generator polynomials, the alignment-pattern centres
 //! and the codeword capacity.
 //!
-//! **Kanji mode is not implemented** and is not planned: it encodes Shift-JIS
-//! double-byte values, so a caller would have to transcode into it before
-//! arriving, and byte mode carries the same text as UTF-8 for the same or fewer
-//! bits in every case that is not almost entirely Japanese. `encode` never
-//! silently falls back — an input is numeric, alphanumeric or byte.
+//! **Kanji mode** (`Options.mode = .kanji`) packs Shift-JIS double-byte values
+//! at 13 bits each, as libqrencode does: the input is Shift-JIS *bytes* (the
+//! caller transcodes, there is no table here), never chosen automatically (byte
+//! mode carries the same text as UTF-8 for the same or fewer bits unless it is
+//! almost entirely Japanese), and the decoder returns the Shift-JIS bytes of a
+//! kanji segment. `encode` never silently falls back — an input is numeric,
+//! alphanumeric, byte, or kanji when forced.
 
 const std = @import("std");
 
@@ -75,6 +77,11 @@ pub const Mode = enum(u4) {
     numeric = 0b0001,
     alphanumeric = 0b0010,
     byte = 0b0100,
+    /// Shift-JIS double-byte characters, 13 bits each (ISO/IEC 18004 §7.4.6). Never picked by
+    /// `encode` on its own: force it with `Options.mode`, with the text given as Shift-JIS bytes
+    /// (an even length; each pair 0x8140..0x9FFC or 0xE040..0xEBBF with a trail byte 0x40..0xFC
+    /// other than 0x7F, else `error.ModeMismatch`). The decoder returns the Shift-JIS bytes.
+    kanji = 0b1000,
 };
 
 pub const Options = struct {
@@ -288,7 +295,11 @@ fn maxChunk(mode: Mode, version: u6, ecc: Ecc, head_bits: usize) usize {
     }
     // The character-count field is finite too, and for a short numeric symbol it
     // is the binding constraint rather than the capacity.
-    const count_max = (@as(usize, 1) << countBits(mode, version)) - 1;
+    var count_max = (@as(usize, 1) << countBits(mode, version)) - 1;
+    if (mode == .kanji) {
+        count_max *= 2; // the count is characters, `lo` and the chunk are bytes
+        lo &= ~@as(usize, 1); // a chunk never splits a double-byte character
+    }
     return @min(lo, count_max);
 }
 
@@ -589,7 +600,26 @@ fn modeFits(mode: Mode, text: []const u8) bool {
             if (alnumValue(c) == null) break false;
         } else true,
         .byte => true,
+        .kanji => kanjiFits(text),
     };
+}
+
+/// Shift-JIS double-byte values the Kanji mode can carry (§7.4.6): 0x8140..0x9FFC and 0xE040..0xEBBF,
+/// trail byte 0x40..0xFC without 0x7F.
+fn kanjiFits(text: []const u8) bool {
+    if (text.len % 2 != 0) return false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 2) {
+        const hi = text[i];
+        const lo = text[i + 1];
+        if (lo < 0x40 or lo > 0xFC or lo == 0x7F) return false;
+        const ok = (hi >= 0x81 and hi <= 0x9F) or (hi >= 0xE0 and hi <= 0xEB);
+        if (!ok) return false;
+        const v = @as(u16, hi) << 8 | lo;
+        if (v > 0x9FFC and v < 0xE040) return false; // gap cannot occur given the lead check, kept for clarity
+        if (v > 0xEBBF) return false;
+    }
+    return true;
 }
 
 fn pickMode(text: []const u8) Mode {
@@ -606,6 +636,7 @@ fn countBits(mode: Mode, version: u6) u5 {
         .numeric => ([_]u5{ 10, 12, 14 })[group],
         .alphanumeric => ([_]u5{ 9, 11, 13 })[group],
         .byte => ([_]u5{ 8, 16, 16 })[group],
+        .kanji => ([_]u5{ 8, 10, 12 })[group],
     };
 }
 
@@ -621,6 +652,8 @@ fn dataBits(mode: Mode, len: usize, version: u6) usize {
         // 2 characters per 11 bits, a trailing single in 6
         .alphanumeric => (len / 2) * 11 + (len % 2) * 6,
         .byte => len * 8,
+        // `len` is bytes (two per character), 13 bits per character.
+        .kanji => (len / 2) * 13,
     };
 }
 
@@ -789,7 +822,7 @@ fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc
 /// One segment: mode indicator, character count, data.
 fn putSegment(w: *BitWriter, mode: Mode, text: []const u8, version: u6) void {
     w.put(@backingInt(mode), 4);
-    w.put(text.len, countBits(mode, version));
+    w.put(if (mode == .kanji) text.len / 2 else text.len, countBits(mode, version));
     switch (mode) {
         .numeric => {
             var i: usize = 0;
@@ -812,6 +845,14 @@ fn putSegment(w: *BitWriter, mode: Mode, text: []const u8, version: u6) void {
             if (i < text.len) w.put(alnumValue(text[i]).?, 6);
         },
         .byte => for (text) |c| w.put(c, 8),
+        .kanji => {
+            var i: usize = 0;
+            while (i < text.len) : (i += 2) {
+                const val: u16 = @as(u16, text[i]) << 8 | text[i + 1];
+                const off = val - @as(u16, if (val <= 0x9FFC) 0x8140 else 0xC140);
+                w.put((off >> 8) * @as(usize, 0xC0) + (off & 0xFF), 13);
+            }
+        },
     }
 }
 
@@ -1554,7 +1595,8 @@ fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence, 
             0b0001 => .numeric,
             0b0010 => .alphanumeric,
             0b0100 => .byte,
-            else => return DecodeError.BadData, // incl. kanji
+            0b1000 => .kanji,
+            else => return DecodeError.BadData,
         };
         const count = r.take(countBits(mode, version)) orelse return DecodeError.BadData;
 
@@ -1609,6 +1651,23 @@ fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence, 
                     const v = r.take(8) orelse return DecodeError.BadData;
                     out[n] = @intCast(v);
                     n += 1;
+                }
+            },
+            .kanji => {
+                // 13 bits per character back to the Shift-JIS pair (§7.4.6): hi * 0xC0 + lo, with the
+                // two ranges 0x8140..0x9FFC and 0xE040..0xEBBF told apart by the offset. Every 13-bit
+                // value with lo <= 0xBC lands in one of them (0x1FFF is 0xEBBF), so lo is the only check.
+                for (0..count) |_| {
+                    const v = r.take(13) orelse return DecodeError.BadData;
+                    const hi: usize = v / 0xC0;
+                    const lo: usize = v % 0xC0;
+                    if (lo > 0xBC) return DecodeError.BadData;
+                    const off: usize = hi << 8 | lo;
+                    const val: usize = if (off <= 0x1EBC) off + 0x8140 else off + 0xC140;
+                    if (n + 2 > out.len) return DecodeError.BufferTooSmall;
+                    out[n] = @intCast(val >> 8);
+                    out[n + 1] = @intCast(val & 0xFF);
+                    n += 2;
                 }
             },
         }
@@ -2114,6 +2173,135 @@ test "decode rejects a malformed symbol rather than guessing" {
     try encode(&m, "0123456789012345", .{});
     var tiny: [4]u8 = undefined;
     try t.expectError(DecodeError.BufferTooSmall, decode(&m, &tiny));
+}
+
+test "kanji: the worked example of ISO/IEC 18004 §7.4.6 packs to 13 bits per character, the count is in characters" {
+    const t = std.testing;
+    // 0x935F -> 0x0D9F = 0110110011111, 0xE4AA -> 0x1AAA = 1101010101010 (the standard's two examples).
+    var buf: [8]u8 = @splat(0);
+    var w: BitWriter = .{ .buf = &buf };
+    putSegment(&w, .kanji, &.{ 0x93, 0x5F, 0xE4, 0xAA }, 1);
+    // 1000 | 00000010 (two characters, 8 count bits at version 1) | 13 bits | 13 bits
+    try t.expectEqual(@as(usize, 4 + 8 + 26), w.bit);
+    var want_buf: [8]u8 = @splat(0);
+    var want: BitWriter = .{ .buf = &want_buf };
+    want.put(0b1000, 4);
+    want.put(2, 8);
+    want.put(0b0110110011111, 13);
+    want.put(0b1101010101010, 13);
+    try t.expectEqualSlices(u8, &want_buf, &buf);
+}
+
+test "kanji: forced mode round-trips through decode at every version range; the decoder returns Shift-JIS bytes" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    var out: [512]u8 = undefined;
+    // 点茗 and a few more valid pairs, including both range ends and the 0x7F-adjacent trail bytes.
+    const text = [_]u8{ 0x93, 0x5F, 0xE4, 0xAA, 0x81, 0x40, 0x9F, 0xFC, 0xE0, 0x40, 0xEB, 0xBF, 0x88, 0x7E, 0x88, 0x80 };
+    for ([_]u6{ 2, 9, 10, 26, 27, 40 }) |v| {
+        for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+            try encode(&m, &text, .{ .mode = .kanji, .version = v, .ecc = ecc });
+            try t.expectEqualSlices(u8, &text, try decode(&m, &out));
+        }
+    }
+    // Picked version: 8 characters need version 1 at ECC L (capacity 10), version 2 at H (capacity 4 at v1).
+    try encode(&m, &text, .{ .mode = .kanji, .ecc = .low });
+    try t.expectEqual(@as(u6, 1), m.version);
+    try encode(&m, &text, .{ .mode = .kanji, .ecc = .high });
+    try t.expect(m.version > 1);
+}
+
+test "kanji: capacity in characters matches the standard (version 1: 10 at L, 4 at H; version 40-L: 1817), one more is TooLong" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    var big: [3640]u8 = undefined;
+    var i: usize = 0;
+    while (i < big.len) : (i += 2) {
+        big[i] = 0x88;
+        big[i + 1] = 0x9F;
+    }
+    try encode(&m, big[0 .. 10 * 2], .{ .mode = .kanji, .version = 1, .ecc = .low });
+    try t.expectError(Error.TooLong, encode(&m, big[0 .. 11 * 2], .{ .mode = .kanji, .version = 1, .ecc = .low }));
+    try encode(&m, big[0 .. 4 * 2], .{ .mode = .kanji, .version = 1, .ecc = .high });
+    try t.expectError(Error.TooLong, encode(&m, big[0 .. 5 * 2], .{ .mode = .kanji, .version = 1, .ecc = .high }));
+    try encode(&m, big[0 .. 1817 * 2], .{ .mode = .kanji, .version = 40, .ecc = .low });
+    try t.expectError(Error.TooLong, encode(&m, big[0 .. 1818 * 2], .{ .mode = .kanji, .version = 40, .ecc = .low }));
+}
+
+test "kanji: input that is not Shift-JIS double bytes is ModeMismatch; eci and optimize_segments cannot be combined; never chosen automatically" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    const good = [_]u8{ 0x93, 0x5F };
+    try t.expectError(Error.ModeMismatch, encode(&m, "abc", .{ .mode = .kanji }));
+    try t.expectError(Error.ModeMismatch, encode(&m, good[0..1], .{ .mode = .kanji })); // odd length
+    for ([_][2]u8{ .{ 0x80, 0x40 }, .{ 0xA0, 0x40 }, .{ 0xEC, 0x40 }, .{ 0xEB, 0xC0 }, .{ 0x88, 0x3F }, .{ 0x88, 0x7F }, .{ 0x88, 0xFD }, .{ 0x00, 0x00 } }) |bad| {
+        try t.expectError(Error.ModeMismatch, encode(&m, &bad, .{ .mode = .kanji }));
+    }
+    try t.expectError(Error.ModeMismatch, encode(&m, &good, .{ .mode = .kanji, .eci = 20 }));
+    try t.expectError(Error.ModeMismatch, encode(&m, &good, .{ .mode = .kanji, .optimize_segments = true }));
+    try encode(&m, &good, .{}); // default: byte mode, as ever
+    var out: [8]u8 = undefined;
+    try t.expectEqualSlices(u8, &good, try decode(&m, &out));
+    try t.expectEqual(Mode.byte, pickMode(&good));
+}
+
+test "kanji: a structured-append sequence splits on character boundaries and the parts reassemble" {
+    const t = std.testing;
+    var ms: [4]Matrix = undefined;
+    var text: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < text.len) : (i += 2) {
+        text[i] = 0x88 + @as(u8, @intCast(i / 2 % 4));
+        text[i + 1] = 0x40 + @as(u8, @intCast(i / 2 % 100));
+    }
+    const parts = try encodeSequence(&ms, &text, .{ .mode = .kanji, .version = 1, .ecc = .high });
+    try t.expect(parts.len > 1);
+    var got: [16]u8 = undefined;
+    var n: usize = 0;
+    for (parts) |*pm| {
+        var out: [64]u8 = undefined;
+        const part = try decodePart(pm, &out);
+        try t.expectEqual(@as(usize, 0), part.data.len % 2);
+        @memcpy(got[n..][0..part.data.len], part.data);
+        n += part.data.len;
+    }
+    try t.expectEqualSlices(u8, &text, got[0..n]);
+}
+
+test "kanji: the decoder refuses a 13-bit value outside both Shift-JIS ranges and a trail past 0xBC, and reads the two ranges" {
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    var seq: ?Sequence = null;
+    var eci: ?u32 = null;
+    // One-character kanji segment at version 1 (8 count bits) carrying the raw 13-bit value `v`.
+    const Case = struct { v: u32, want: ?[2]u8 };
+    const cases = [_]Case{
+        .{ .v = 0, .want = .{ 0x81, 0x40 } }, // first of the low range
+        .{ .v = 0x173C, .want = .{ 0x9F, 0xFC } }, // last of the low range (0x1E * 0xC0 + 0xBC)
+        .{ .v = 0xD9F, .want = .{ 0x93, 0x5F } }, // the standard's first example
+        .{ .v = 0x1AAA, .want = .{ 0xE4, 0xAA } }, // the second
+        .{ .v = 0xBD, .want = null }, // trail offset 0xBD: past 0xFC
+        .{ .v = 0x1FFF, .want = .{ 0xEB, 0xBF } }, // the largest 13-bit value is the last of the high range
+        .{ .v = 0x1EBD, .want = null }, // hi 0x1E, lo 0xBD: past the 0xBC trail offset (the gap between the ranges)
+    };
+    for (cases) |c| {
+        var b: TestBits = .{};
+        b.put(0b1000, 4);
+        b.put(1, 8);
+        b.put(c.v, 13);
+        if (c.want) |w| {
+            try t.expectEqualSlices(u8, &w, try parseSegments(b.bytes(), 1, &out, &seq, &eci));
+        } else {
+            try t.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq, &eci));
+        }
+    }
+    // A buffer one byte short of a character is BufferTooSmall, never a write past it.
+    var one: [1]u8 = undefined;
+    var b: TestBits = .{};
+    b.put(0b1000, 4);
+    b.put(1, 8);
+    b.put(0xD9F, 13);
+    try t.expectError(DecodeError.BufferTooSmall, parseSegments(b.bytes(), 1, &one, &seq, &eci));
 }
 
 /// The body of `fuzzDecode`. The seed layout is `sizeIndex, grid...`: the first
@@ -2641,8 +2829,8 @@ const TestBits = struct {
 
 test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
     // Mutating `else => return DecodeError.BadData` to `else => .byte` left the whole
-    // suite green: an ECI (0b0111) or Kanji (0b1000) segment would have been silently
-    // reinterpreted as byte data (ECI is implemented and is no longer in the refused list
+    // suite green: an FNC1 (0b0101 / 0b1001) segment would have been silently
+    // reinterpreted as byte data (ECI and Kanji are implemented and are no longer in the refused list
     // below), i.e. decoded to a different string, with nothing to say so.
     var out: [128]u8 = undefined;
     var seq: ?Sequence = null;
@@ -2655,7 +2843,7 @@ test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
     // still errored — by a route that has nothing to do with the guard. With a
     // count of 2 and two bytes behind it, the mutated decoder succeeds and
     // returns "hi", so only the guard itself can produce the refusal.
-    for ([_]u32{ 0b1000, 0b0101, 0b1001, 0b1111 }) |raw_mode| {
+    for ([_]u32{ 0b0101, 0b1001, 0b1111 }) |raw_mode| {
         var b: TestBits = .{};
         b.put(raw_mode, 4);
         b.put(2, 8); // a count a byte-mode reader would accept
