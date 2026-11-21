@@ -655,6 +655,11 @@ pub fn build(b: *std.Build) void {
         "zstd-all-strategies",
         "zstd: compress with every strategy, levels 1..22 (default true; profile=small false = fast and dfast only, a level resolving to a higher strategy is refused with LevelUnsupported, about 7 MB less code)",
     ));
+    zl_options.addOption(?[]const u8, "tz_zones", b.option(
+        []const u8,
+        "tz-zones",
+        "tz: compile in only these zones, a comma-separated list of names or `Area/*` prefixes (default all 598; an unknown zone is a compile error and a zone left out is find() == null, never UTC; the explicit knob only, profile=small leaves it alone)",
+    ));
     // fingerprint-exempt: end
     zl_options_mod = zl_options.createModule();
 

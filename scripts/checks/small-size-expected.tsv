@@ -10,3 +10,4 @@ zipstream	157000	2026-11-02: 512512 -> 197632 B (gain 314880), knob zipstream-bu
 tar	3500	2026-11-04: 179568 -> 172036 B text (gain 7532), knob tar-sparse; mips-linux-musl soft-float probe
 regex	56000	2026-11-21: 415264 -> 301960 B (gain 113304), knob regex-unicode (Unicode tables); compile-and-match probe, native x86_64
 zstd	250000	2026-11-21: 1051816 -> 546072 B (gain 505744), knob zstd-all-strategies; native x86_64
+tz	110000	2026-11-21: 378264 -> 157072 B (gain 221192), knob tz-zones=Europe/Prague,America/New_York,UTC (explicit; passed by small-sizes.sh); native x86_64

@@ -81,10 +81,12 @@ const RuleLabel = struct {
 };
 
 test "posix kat: every zone's footer era matches Python zoneinfo (2037..2050)" {
+    if (tz.zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try testing.expectEqual(tz.zones.len, kat.zone_names.len);
     try expectRows(&kat.zone_rows, ZoneByIndex{}, ZoneLabel{});
 }
 
 test "posix kat: POSIX strings no release ships match the glibc/Python/Go majority" {
+    if (tz.zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try expectRows(&kat.rule_rows, RuleByIndex{}, RuleLabel{});
 }

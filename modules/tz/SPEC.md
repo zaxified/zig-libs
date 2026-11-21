@@ -165,12 +165,22 @@ approximation, not a crash).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 
-## Backlog / deferred
+## Build options
 
-- **Build option: zone data subset** (CONVENTIONS §4.2; `tz-zones=Europe/*,UTC`, an unknown zone must stay an error,
-  never a UTC fallback). The compiled-in table is 213 KB (measured, see Table storage), so a subset would save well
-  over the 100 KB bar. Open: `-Dprofile=small` must give the size probe a measurable gain and a zone cut has no safe
-  default meaning for it. Waits on a decision.
+Consumer build options (CONVENTIONS §4.2), after chrono-tz's build-time zone filter (`CHRONO_TZ_TIMEZONE_FILTER`):
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `tz-zones` | comma-separated zone names and `Area/*` prefixes | every zone (graded) | unchanged (explicit only) |
+
+- **What it does:** `tz.zones`, `tz.find` and `tz.full` hold only the listed zones, filtered at compile time, so the
+  transition arrays of the rest never reach the binary. A zone left out is `find == null`, as an unknown name is: never a
+  UTC fallback. An empty entry, a `*` anywhere but at the end, or an entry that matches no zone is a compile error. The
+  tests that need every zone skip under the knob.
+- **Gain** (read-only probe `tools/sizeprobe.zig`, ReleaseSmall, native x86_64; the profile leaves the knob alone, so
+  `scripts/checks/small-sizes.sh` passes `-Dtz-zones=Europe/Prague,America/New_York,UTC` to the small build): see the
+  floor row in `scripts/checks/small-size-expected.tsv`): 378,264 -> 157,072 B, gain 221,192 (2026-11-21).
+- **Loses:** every zone not listed; a consumer taking zone names from users must list what it will accept.
 
 ## Anchoring
 

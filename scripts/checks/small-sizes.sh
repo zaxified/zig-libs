@@ -28,8 +28,14 @@ OUT=.zig-cache/small-sizes
 measure=0
 [[ "${1:-}" == --measure ]] && measure=1
 
+# Knobs a probe sets itself because `-Dprofile=small` leaves them alone (an explicit-only
+# knob; every module that does not read it ignores the argument).
+SMALL_EXTRA=(-Dtz-zones=Europe/Prague,America/New_York,UTC)
+
 for p in default small; do
-    if ! log=$(zig build sizeprobes -Doptimize=ReleaseSmall "-Dprofile=$p" -p "$OUT/$p" --summary none 2>&1); then
+    extra=()
+    [[ $p == small ]] && extra=("${SMALL_EXTRA[@]}")
+    if ! log=$(zig build sizeprobes -Doptimize=ReleaseSmall "-Dprofile=$p" "${extra[@]}" -p "$OUT/$p" --summary none 2>&1); then
         echo "small-sizes: building the size probes under -Dprofile=$p failed:" >&2
         echo "$log" >&2
         exit 1

@@ -113,6 +113,7 @@ fn checkLocal(z: *const tz.Zone, local: i64, code: u2, before: i32, after: i32, 
 }
 
 test "all kat: every zone matches Python zoneinfo, 1970..2050 (state, transitions, local time)" {
+    if (tz.zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     var r: Reader = .{ .b = bin };
     try testing.expectEqualStrings("TZKAT1\n", r.bytes(7));
     const rel = r.bytes(r.byte());

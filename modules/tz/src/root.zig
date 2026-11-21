@@ -16,6 +16,7 @@ const datefmt = @import("datefmt");
 const tz_data = @import("tz_data.zig");
 const tz_data_full = @import("tz_data_full.zig");
 const posix = @import("posix.zig");
+const zl_options = @import("zl_options");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -49,7 +50,68 @@ pub const Footer = posix.Footer;
 /// than three letters, an `Mm.w.d` out of range, trailing bytes). The names
 /// are slices of `s`.
 pub const parseFooter = posix.parse;
-pub const zones = tz_data.zones;
+
+/// The consumer's `-Dtz-zones` list, or null for every zone (the default, which
+/// the grade is measured on). See `selectZones`.
+pub const zone_filter: ?[]const u8 = zl_options.tz_zones;
+
+/// The compiled-in zones, sorted by name: all 598, or those `-Dtz-zones`
+/// names. A zone that is left out is simply not there: `find` returns null,
+/// never a UTC fallback.
+pub const zones = if (zone_filter) |f| selectZones(&tz_data.zones, f) else tz_data.zones;
+
+/// The zones of `all` that `list` names, in `all`'s order. `list` is
+/// comma-separated; an entry is a zone name or a prefix ending in `*`
+/// (`Europe/*`, `*` alone for every zone). Whitespace around an entry is
+/// ignored. An empty entry, a `*` anywhere but at the end, and an entry that
+/// matches no zone are compile errors: a typo must not build a binary that
+/// answers null for the zone the consumer meant.
+pub fn selectZones(comptime all: []const tz_data.Zone, comptime list: []const u8) [selectedCount(all, list)]tz_data.Zone {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var out: [selectedCount(all, list)]tz_data.Zone = undefined;
+        var n = 0;
+        for (all) |z| if (matchesList(z.name, list)) {
+            out[n] = z;
+            n += 1;
+        };
+        return out;
+    }
+}
+
+fn selectedCount(comptime all: []const tz_data.Zone, comptime list: []const u8) usize {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |raw| {
+            const e = std.mem.trim(u8, raw, " \t");
+            if (e.len == 0) @compileError("tz-zones: empty entry in the list");
+            if (std.mem.findScalar(u8, e, '*')) |at| if (at != e.len - 1) @compileError("tz-zones: `*` is only allowed at the end of an entry: " ++ e);
+            var hit = false;
+            for (all) |z| if (matchesEntry(z.name, e)) {
+                hit = true;
+                break;
+            };
+            if (!hit) @compileError("tz-zones: no zone matches " ++ e);
+        }
+        var n = 0;
+        for (all) |z| if (matchesList(z.name, list)) {
+            n += 1;
+        };
+        return n;
+    }
+}
+
+fn matchesEntry(name: []const u8, entry: []const u8) bool {
+    if (entry.len != 0 and entry[entry.len - 1] == '*') return std.mem.startsWith(u8, name, entry[0 .. entry.len - 1]);
+    return std.mem.eql(u8, name, entry);
+}
+
+fn matchesList(name: []const u8, list: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| if (matchesEntry(name, std.mem.trim(u8, raw, " \t"))) return true;
+    return false;
+}
 
 pub const Offset = struct {
     /// UTC offset in seconds (east of UTC positive: CEST = +7200).
@@ -60,7 +122,7 @@ pub const Offset = struct {
 /// Resolve an IANA zone id (`"Europe/Prague"`, `"America/New_York"`, `"UTC"`).
 /// Case-sensitive, matching the IANA database. Returns null for unknown names.
 pub fn find(name: []const u8) ?*const tz_data.Zone {
-    return findIn(&tz_data.zones, name);
+    return findIn(&zones, name);
 }
 
 /// The table with every change back to each zone's local mean time (pre-1970
@@ -69,11 +131,11 @@ pub fn find(name: []const u8) ?*const tz_data.Zone {
 /// abbreviation table, and they agree from 1970 on. About +79 KB, paid only
 /// by a program that references `full`.
 pub const full = struct {
-    pub const zones = tz_data_full.zones;
+    pub const zones = if (zone_filter) |f| selectZones(&tz_data_full.zones, f) else tz_data_full.zones;
 
     /// `tz.find` over the full table.
     pub fn find(name: []const u8) ?*const tz_data.Zone {
-        return findIn(&tz_data_full.zones, name);
+        return findIn(&full.zones, name);
     }
 };
 
@@ -640,6 +702,7 @@ const testing = std.testing;
 const local_kat = @import("local_kat.zig");
 
 test "resolveLocal: every Python-zoneinfo vector (same pinned tzdata)" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try testing.expectEqualStrings(local_kat.release, tz_release);
     var seen = @as([3]usize, @splat(0));
     for (local_kat.rows, 0..) |row, i| {
@@ -666,11 +729,13 @@ test "resolveLocal: every Python-zoneinfo vector (same pinned tzdata)" {
 const tz_release = "2026a";
 
 test "tz_release matches tz_data.zig's own header" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const src = @embedFile("tz_data.zig");
     try testing.expect(std.mem.find(u8, src, "IANA tzdata " ++ tz_release ++ " ") != null);
 }
 
 test "localToUtc: Prague spring gap and autumn fold under every policy" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Europe/Prague").?;
     // 2024-03-31: 02:00 CET -> 03:00 CEST. 02:30 does not exist.
     const gap = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 2, .minute = 30 });
@@ -699,6 +764,7 @@ test "localToUtc: Prague spring gap and autumn fold under every policy" {
 }
 
 test "resolveLocal: the POSIX-footer era (2040) and a fixed zone" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("America/New_York").?;
     // 2040-03-11 02:30 does not exist (second Sunday of March), 2040-11-04 01:30 twice.
     const gap = datefmt.partsToUnix(.{ .year = 2040, .month = 3, .day = 11, .hour = 2, .minute = 30 });
@@ -738,6 +804,7 @@ fn checkLocal(z: *const Zone, local: i64) !void {
 }
 
 test "resolveLocal: around EVERY explicit transition of EVERY zone, the defining property holds" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     var checked: usize = 0;
     for (&tz_data.zones) |*z| {
         for (0..z.len()) |i| {
@@ -755,6 +822,7 @@ test "resolveLocal: around EVERY explicit transition of EVERY zone, the defining
 }
 
 test "resolveLocal: random zones and local times 1900..2100" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     var prng = std.Random.DefaultPrng.init(0x7a5eed);
     const r = prng.random();
     var i: usize = 0;
@@ -766,10 +834,12 @@ test "resolveLocal: random zones and local times 1900..2100" {
 }
 
 test "zone count matches what the documentation states" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try testing.expectEqual(@as(usize, 598), tz_data.zones.len);
 }
 
 test "abbrevAt: table era, footer era, angle-bracket names, empty hand-built state" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const pr = find("Europe/Prague").?;
     try testing.expectEqualStrings("CET", abbrevAt(pr, 1705320000)); // 2024-01
     try testing.expectEqualStrings("CEST", abbrevAt(pr, 1721044800)); // 2024-07
@@ -791,6 +861,7 @@ test "abbrevAt: table era, footer era, angle-bracket names, empty hand-built sta
 }
 
 test "every shipped zone: stored footer == footer parsed per call (same answers), abbreviations resolve" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     var prng = std.Random.DefaultPrng.init(0xf007e4);
     const r = prng.random();
     for (&tz_data.zones) |*z| {
@@ -808,6 +879,7 @@ test "every shipped zone: stored footer == footer parsed per call (same answers)
 }
 
 test "no shipped zone truncates a resolveLocal window" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     for ([_][]const Zone{ &tz_data.zones, &full.zones }) |table| for (table) |*z| {
         for (0..z.len()) |i| {
             const ts = z.tsAt(i);
@@ -831,6 +903,7 @@ test "no shipped zone truncates a resolveLocal window" {
 }
 
 test "resolveLocal: a hand-built zone with more changes than the buffer holds is still exact" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // 40 alternating changes 60 s apart inside one window: the buffered path
     // truncates, `resolveExact` answers. The oracle scans every instant an offset of 0 or 3600 could name.
     var many: [40]Transition = undefined;
@@ -868,6 +941,7 @@ test "resolveLocal: a hand-built zone with more changes than the buffer holds is
 }
 
 test "parseFooter: a stored footer answers as the per-call parse does" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const text = "CET-1CEST,M3.5.0,M10.5.0/3";
     const f = parseFooter(text).?;
     const stored = Zone{ .name = "Test/stored", .init_off = 3600, .init_dst = false, .trans = &.{}, .posix = text, .footer = &f };
@@ -882,6 +956,7 @@ test "parseFooter: a stored footer answers as the per-call parse does" {
 }
 
 test "canonical: links point at their zone, canonical zones at nothing" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const ny = find("America/New_York").?;
     try testing.expect(ny.canonical == null);
     try testing.expectEqualStrings("America/New_York", canonicalName(ny));
@@ -902,6 +977,7 @@ test "canonical: links point at their zone, canonical zones at nothing" {
 }
 
 test "nextTransition / prevTransition: Prague through the table into the footer era" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Europe/Prague").?;
     // 2024-03-31T01:00:00Z CET -> CEST.
     const spring = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 1 });
@@ -936,6 +1012,7 @@ test "nextTransition / prevTransition: Prague through the table into the footer 
 }
 
 test "formatOffset: styles, signs, seconds, buffer" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     var buf: [max_offset_len]u8 = undefined;
     const Case = struct { off: i32, colon: []const u8, basic: []const u8, short: []const u8 };
     const cases = [_]Case{
@@ -960,6 +1037,7 @@ test "formatOffset: styles, signs, seconds, buffer" {
 }
 
 test "localToUnix: parts form agrees with localToUtc, rejects invalid fields" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Europe/Prague").?;
     // 2024-03-31 02:30 does not exist; 2024-10-27 02:30 happens twice.
     const gap = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 2, .minute = 30 });
@@ -972,6 +1050,7 @@ test "localToUnix: parts form agrees with localToUtc, rejects invalid fields" {
 }
 
 test "tz_data_full: same footer era, same history since 1970, LMT before" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try testing.expectEqual(tz_data.zones.len, full.zones.len);
     var prng = std.Random.DefaultPrng.init(0xf011);
     const r = prng.random();
@@ -1012,6 +1091,7 @@ test "tz_data_full: same footer era, same history since 1970, LMT before" {
 }
 
 test "find: known + unknown zones" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try testing.expect(find("Europe/Prague") != null);
     try testing.expect(find("America/New_York") != null);
     try testing.expect(find("UTC") != null);
@@ -1019,6 +1099,7 @@ test "find: known + unknown zones" {
 }
 
 test "offsetAt: Prague CET/CEST across a known transition" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Europe/Prague").?;
     // 2024-01-15 12:00 UTC → CET (+3600, no DST)
     try testing.expectEqual(@as(i32, 3600), offsetAt(z, 1705320000).off);
@@ -1029,6 +1110,7 @@ test "offsetAt: Prague CET/CEST across a known transition" {
 }
 
 test "offsetAt: New York EST/EDT" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("America/New_York").?;
     // 2024-01-15 12:00 UTC → EST (-18000)
     try testing.expectEqual(@as(i32, -18000), offsetAt(z, 1705320000).off);
@@ -1037,11 +1119,13 @@ test "offsetAt: New York EST/EDT" {
 }
 
 test "offsetAt: half-hour zone (Kolkata, no DST)" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Asia/Kolkata").?;
     try testing.expectEqual(@as(i32, 5 * 3600 + 1800), offsetAt(z, 1721044800).off);
 }
 
 test "offsetAt: POSIX footer applies far in the future (Prague 2040 summer)" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("Europe/Prague").?;
     // 2040-07-01 12:00 UTC — well past the last explicit transition → POSIX rule.
     const summer = datefmt.partsToUnix(.{ .year = 2040, .month = 7, .day = 1, .hour = 12 });
@@ -1053,6 +1137,7 @@ test "offsetAt: POSIX footer applies far in the future (Prague 2040 summer)" {
 }
 
 test "offsetAt: the exact transition instant already carries the NEW offset" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // Every other transition test in this file uses an arbitrary instant
     // well inside a transition period ("12:00 UTC"); none lands exactly ON
     // a transition's own timestamp, which is the one input that actually
@@ -1076,6 +1161,7 @@ test "offsetAt: the exact transition instant already carries the NEW offset" {
 }
 
 test "offsetAt: fixed UTC" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     const z = find("UTC").?;
     try testing.expectEqual(@as(i32, 0), offsetAt(z, 1721044800).off);
 }
@@ -1090,6 +1176,7 @@ test "offsetAt: fixed UTC" {
 // calendar date maps 1:1 onto a UTC instant.
 
 test "posix footer: Jn Julian-day rule — day 59 is Feb 28 regardless of leap year" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // Jn (1<=n<=365) never counts Feb 29: day 59 is Feb 28 in every year,
     // leap or not.
     const z = Zone{
@@ -1112,6 +1199,7 @@ test "posix footer: Jn Julian-day rule — day 59 is Feb 28 regardless of leap y
 }
 
 test "posix footer: n zero-based day-of-year rule — counts Feb 29 in leap years" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // Plain n (0<=n<=365) counts Feb 29: index 59 is March 1 in a non-leap
     // year but Feb 29 in a leap year (the index shifts once Feb 29 exists).
     const z = Zone{
@@ -1130,6 +1218,7 @@ test "posix footer: n zero-based day-of-year rule — counts Feb 29 in leap year
 }
 
 test "posix footer: leap-year positive control — Jn and n resolve to different calendar days" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // Same nominal day-number (59) parsed via the two rule forms must NOT
     // land on the same instant in a leap year: J59 is Feb 29-blind (always
     // Feb 28), plain 59 is Feb 29-aware (lands on Feb 29 itself in 2024).
@@ -1199,6 +1288,7 @@ const zone_name_seeds = [_][]const u8{
 };
 
 test "fuzz: find never panics, arbitrary or real zone-name bytes" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try std.testing.fuzz({}, fuzzFindNeverPanics, .{ .corpus = &zone_name_seeds });
 }
 
@@ -1212,6 +1302,7 @@ fn fuzzFindNeverPanics(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "corpus: every zone name reaches find, and the hit count is pinned" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // ⭐ The measurement, executable rather than written in a comment.
     //
     // ⚠ `find` returning null is not an error, so a "no crash" count would
@@ -1272,6 +1363,7 @@ const posix_footer_corpus = [_][]const u8{
 };
 
 test "fuzz: offsetAt's POSIX-TZ footer parser never panics, arbitrary or footer-shaped bytes" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     try std.testing.fuzz({}, fuzzPosixFooterNeverPanics, .{ .corpus = &posix_footer_corpus });
 }
 
@@ -1293,6 +1385,7 @@ const footerInstant = fz.footerInstant;
 const buildPosixFooter = fz.buildPosixFooter;
 
 test "corpus: every footer reaches offsetAt, and the generator actually varies" {
+    if (zone_filter != null) return error.SkipZigTest; // -Dtz-zones: these tests need every zone
     // ⭐ The measurement, executable rather than written in a comment.
     //
     // ⚠ `offsetAt` returns a value for ANY footer — a malformed one just
@@ -1364,4 +1457,42 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "selectZones: names, prefixes, whitespace, and the same order as the table" {
+    comptime {
+        const only = selectZones(&tz_data.zones, "UTC");
+        std.debug.assert(only.len == 1 and std.mem.eql(u8, only[0].name, "UTC"));
+        const two = selectZones(&tz_data.zones, " Europe/Prague ,UTC");
+        std.debug.assert(two.len == 2);
+        std.debug.assert(std.mem.order(u8, two[0].name, two[1].name) == .lt);
+        const eu = selectZones(&tz_data.zones, "Europe/*, UTC");
+        std.debug.assert(eu.len > 40);
+        const all = selectZones(&tz_data.zones, "*");
+        std.debug.assert(all.len == tz_data.zones.len);
+        // a name given twice, or by name and by prefix, is one zone
+        std.debug.assert(selectZones(&tz_data.zones, "UTC,UTC,U*").len == selectZones(&tz_data.zones, "U*").len);
+    }
+    // A selection answers as the full table does, and find() on it is null for the rest.
+    const sel = comptime selectZones(&tz_data.zones, "Europe/Prague,America/New_York");
+    try testing.expectEqual(@as(usize, 2), sel.len);
+    const p = findIn(&sel, "Europe/Prague").?;
+    try testing.expectEqual(offsetAt(find("Europe/Prague").?, 1705320000), offsetAt(p, 1705320000));
+    try testing.expectEqual(@as(?*const Zone, null), findIn(&sel, "Asia/Tokyo"));
+    try testing.expectEqual(@as(?*const Zone, null), findIn(&sel, "UTC")); // never a UTC fallback
+    // The same list over the full table keeps the pre-1970 history.
+    const fsel = comptime selectZones(&tz_data_full.zones, "Europe/Prague");
+    try testing.expectEqual(@as(i32, 3464), offsetAt(&fsel[0], -4_000_000_000).off);
+}
+
+test "-Dtz-zones: with no list every zone is there, with one find() sees exactly the listed" {
+    if (zone_filter == null) {
+        try testing.expectEqual(@as(usize, 598), zones.len);
+    } else {
+        for (&tz_data.zones) |*z| {
+            const listed = matchesList(z.name, zone_filter.?);
+            try testing.expectEqual(listed, find(z.name) != null);
+        }
+        try testing.expectEqual(@as(usize, zones.len), full.zones.len);
+    }
 }
