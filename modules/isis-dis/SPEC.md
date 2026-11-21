@@ -119,7 +119,7 @@ timer — modelling *that* would need hold-down state; IS-IS explicitly does not
 ### 5.1 Ids
 
 The DIS originates the pseudonode LSP representing the LAN. This module derives the
-ids it is keyed by (not its content — see *What is deliberately not done*):
+ids it is keyed by; the content is `pseudonode.zig` (§5.3):
 
 - **`lan_id` = DIS system-id (6) ‖ DIS pseudonode-id (1)** (7 octets). The
   pseudonode-id is per-candidate: for the local system it is the circuit's
@@ -156,14 +156,17 @@ pseudonode LSP. `at` carries the `now` from that `recompute` (a timestamp only �
 the election is independent of it). A steady recompute with the same winner
 returns `change == null`.
 
+### 5.3 What the DIS originates and sends (`pseudonode.zig`)
+
+- **`buildFragment(buf, result, members, first, opts)`** — one fragment of the pseudonode LSP: Extended IS Reachability (#22, RFC 5305) entries of metric 0, one per LAN member as `system-id ‖ 0`, the DIS itself first (ISO 10589 §7.3.8; the shape the surveyed implementations originate, holo's `lsp_build_tlvs_pseudo` among them). 23 entries per TLV, as many as the buffer holds; `Fragment.next` says where the following fragment (`opts.fragment + 1`) starts. LSP-ID = `Result.pseudonodeLspId()` with the fragment number in the last octet; flags zero; checksum stamped. `error.NotDis` unless the local system won. Narrow-metric (#2) pseudonode LSPs are not built (a wide-metric network is assumed, as `isis`'s own `addExtendedIsReach`).
+- **`buildPurge`** — the same LSP-ID with remaining lifetime 0 and no TLVs, for `resigned_dis` (ISO 10589 §7.3.16.4); the caller floods it and ages it out.
+- **`disHelloIntervalMs` / `helloIntervalMs`** — the DIS sends its LAN IIHs at one third of the configured interval (ISO 10589 §8.4.1.2), at least 1 ms.
+- **`PseudonodeIdAllocator`** — nonzero ids (the circuit id) distinct per LAN circuit of one system, lowest free first, 255 at most; `take` reserves a configured one.
+
 ## What is deliberately not done
 
 This module stops at the winner and the ids; the rest of the LAN machinery belongs to the sibling layers.
 
-- **Pseudonode LSP content** — building the pseudonode LSP body (the IS-Reachability
-  entries binding each LAN member to the pseudonode with metric 0, the SPB/area
-  TLVs) is an LSP-origination concern for an `isis-lsdb`/`isis-flood` consumer. This
-  module supplies only the LSP-ID and the became/resigned trigger (a builder is in *Backlog / deferred*).
 - **LAN adjacency formation** — the LAN variant of `isis-adj`: a LAN IIH does not
   use the RFC 5303 three-way handshake but the IS-Neighbours (#6) SNPA list to
   confirm two-way reachability, plus per-neighbour hold timers. This module takes
@@ -225,8 +228,7 @@ Provenance: clean-room from ISO/IEC 10589 §8.4.5 (public spec; no NOTICE entry 
 
 Missing-and-it-matters items from the 2026-09-30 competitive survey.
 
-- **Pseudonode LSP builder** (metric-0 IS-Reach #22 entries for each Up LAN member, on `became_dis`; purge on `resigned_dis`) (survey 2026-09-30). Why: election without the pseudonode LSP produces nothing on the wire; FRR/holo/goisis all do it. Effort: ~2 days on top of `isis` `LspBuilder`. Fits §2: yes.
-- **DIS hello interval helper and pseudonode-id allocator** (survey 2026-09-30). Why: ISO 10589 §8.4.1: the DIS sends IIHs at one third of the interval; a router DIS on several LANs needs distinct ids. Effort: ~1 day. Fits §2: yes.
+None open.
 
 ## Anchoring
 

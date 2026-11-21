@@ -10,9 +10,10 @@ returns — chiefly the `became_dis` / `resigned_dis` triggers that start or sto
 originating the LAN's pseudonode LSP.
 
 Status: **core** (grade 3). Implements the election rule + preemption +
-the pseudonode LSP-ID derivation + the DIS-change effect. The pseudonode LSP's
-*content*, LAN adjacency formation, and multi-level DIS are not provided here (the
-sibling layers' job) — see `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
+the pseudonode LSP-ID derivation + the DIS-change effect, and (`pseudonode.zig`) the
+pseudonode LSP itself, its purge, the DIS Hello interval and a pseudonode-id allocator.
+LAN adjacency formation and multi-level DIS are not provided here (the sibling layers'
+job) — see `SPEC.md` *What is deliberately not done*.
 
 Model after: **ISO/IEC 10589 §8.4.5** (LAN Designated-IS election).
 

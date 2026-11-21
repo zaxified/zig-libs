@@ -49,6 +49,7 @@ pub const meta = .{
 
 pub const election = @import("election.zig");
 pub const fsm = @import("fsm.zig");
+pub const pseudonode = @import("pseudonode.zig");
 
 // ── the most-used surface, re-exported ───────────────────────────────────────
 pub const SystemId = election.SystemId;
@@ -140,5 +141,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("election.zig");
     _ = @import("fsm.zig");
+    _ = @import("pseudonode.zig");
     _ = @import("goldens.zig");
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED `pseudonode` (`buildFragment`, `buildPurge`, `disHelloIntervalMs`, `helloIntervalMs`, `PseudonodeIdAllocator`): the pseudonode LSP the DIS originates (metric-0 Extended IS Reachability for the DIS and every member, split over fragments), its purge, the DIS Hello interval (one third of the configured one) and a per-circuit pseudonode-id allocator. Tests in `pseudonode.zig`.
 - **2026-10-04** — Tests: first mutation run (28 mutants, 28 killed); added tests for big-endian SNPA / system-id comparison (difference in the first octet) and for a local DIS that changes only its pseudonode id (no became/resigned). SPEC §5.2: change is keyed on `lan_id`.
 
 - **2026-08-06** — Security audit: three findings fixed, one documented as accepted (not
