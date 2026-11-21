@@ -1539,3 +1539,30 @@ test "dtls12: abbreviated handshake under loss — the client's final flight los
     try testing.expect(done.done and server.isConnected() and server.resumed());
     try exchangeData(&client, &server);
 }
+
+test "dtls12: OCSP staple (CertificateStatus, RFC 6066 §8) and SCT list (ServerHello, RFC 6962 §3.3.1) when asked for" {
+    const staple = "\x30\x03\x0a\x01\x00";
+    const scts = "\x00\x06\x00\x04\x05\x06\x07\x08";
+    const ecdsa = [_]CipherSuite12{.ecdhe_ecdsa_with_aes_128_gcm_sha256};
+    for ([_]bool{ true, false }) |ask| {
+        var scfg = ecdsaServerConfig(&ecdsa);
+        scfg.cert.?.ocsp_response = staple;
+        scfg.cert.?.sct_list = scts;
+        var ccfg = ecdsaClientConfig(&ecdsa);
+        ccfg.request_ocsp = ask;
+        ccfg.request_scts = ask;
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x70)));
+        const rnd = seeded(&csprng);
+        var client = try Connection12.clientInit(ccfg);
+        defer client.deinit();
+        var server = try Connection12.serverInit(scfg);
+        defer server.deinit();
+        var bufs: Bufs = .{};
+        try drive(&client, &server, rnd, &bufs);
+        if (ask) {
+            try testing.expectEqualSlices(u8, staple, client.peerOcspResponse().?);
+            try testing.expectEqualSlices(u8, scts, client.peerSctList().?);
+        } else try testing.expect(client.peerOcspResponse() == null and client.peerSctList() == null);
+        try exchangeData(&client, &server);
+    }
+}

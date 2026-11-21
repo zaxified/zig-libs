@@ -376,6 +376,8 @@ pub const max_ticket_len = connection.max_ticket_len;
 pub const ReplayGuard = connection.ReplayGuard;
 pub const strikeRegisterGuard = connection.strikeRegisterGuard;
 pub const max_early_data_len = connection.max_early_data_len;
+/// OCSP stapling / SCTs: `CertConfig.ocsp_response` / `sct_list`, `Config.request_ocsp` / `request_scts`, `peerOcspResponse` / `peerSctList`.
+pub const max_staple_len = connection.max_staple_len;
 /// DTLS 1.2 (RFC 5077): `Config.session_tickets12` / `Config.resumption12`, `Connection12.sessionTicket`.
 pub const SessionTicket12 = connection.SessionTicket12;
 

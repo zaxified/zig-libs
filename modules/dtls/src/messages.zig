@@ -980,22 +980,98 @@ fn readU24(buf: *const [3]u8) u24 {
 //     CertificateEntry certificate_list<0..2^24-1>;
 // } Certificate;
 //
-// Each `CertificateEntry`'s own extensions (OCSP stapling, SCT, ...) are OUT
-// OF SCOPE: `encodeCertificate` always emits an empty extensions list per
-// entry, and `decodeCertificate` validates their framing (length-prefix
-// bounds-checked, never trusted blindly) but does not parse or surface their
-// contents — this module has no use for them (see root.zig's "deferred"
-// list).
+// Each `CertificateEntry`'s own extensions: `encodeCertificate` emits an
+// empty list per entry; `encodeCertificateStapled` puts RFC 8446 §4.4.2.1's
+// OCSP `status_request` and RFC 6962 `signed_certificate_timestamp` on the
+// leaf. `decodeCertificate` validates their framing and hands the raw list
+// back (`CertificateEntry.extensions`); `leafStatus` reads the two.
+
+/// RFC 6066 §8 `status_request` (5) and RFC 6962 §3.3.1
+/// `signed_certificate_timestamp` (18).
+pub const ext_status_request: u16 = 5;
+pub const ext_signed_certificate_timestamp: u16 = 18;
+/// RFC 6066 §8: `status_type` ocsp.
+pub const status_type_ocsp: u8 = 1;
+/// A ClientHello `status_request` asking for OCSP with no responder IDs and
+/// no request extensions (what OpenSSL, wolfSSL and Go send).
+pub const status_request_ocsp = [_]u8{ status_type_ocsp, 0, 0, 0, 0 };
 
 pub const CertificateEntry = struct {
     cert_data: []const u8,
+    /// The entry's `extensions` list body (without its length prefix).
+    extensions: []const u8 = &.{},
 };
+
+/// What a leaf's `CertificateEntry` extensions carry (RFC 8446 §4.4.2.1).
+pub const LeafStatus = struct {
+    /// The DER `OCSPResponse` of a `CertificateStatus` of type ocsp.
+    ocsp_response: ?[]const u8 = null,
+    /// The `SignedCertificateTimestampList`, its 2-byte length included.
+    sct_list: ?[]const u8 = null,
+};
+
+/// Reads a leaf entry's `extensions` body. A `status_request` that is not
+/// an ocsp `CertificateStatus` with exactly one non-empty response, an
+/// empty SCT list, or any extension twice is `error.Malformed`; others are
+/// skipped.
+pub fn leafStatus(extensions: []const u8) MessageError!LeafStatus {
+    var st: LeafStatus = .{};
+    var i: usize = 0;
+    while (i < extensions.len) {
+        if (extensions.len - i < 4) return error.Malformed;
+        const t = std.mem.readInt(u16, extensions[i..][0..2], .big);
+        const n: usize = std.mem.readInt(u16, extensions[i + 2 ..][0..2], .big);
+        i += 4;
+        if (extensions.len - i < n) return error.Malformed;
+        const d = extensions[i..][0..n];
+        i += n;
+        switch (t) {
+            ext_status_request => {
+                if (st.ocsp_response != null) return error.Malformed;
+                st.ocsp_response = try decodeCertificateStatus(d);
+            },
+            ext_signed_certificate_timestamp => {
+                if (st.sct_list != null) return error.Malformed;
+                if (d.len < 2 or std.mem.readInt(u16, d[0..2], .big) != d.len - 2 or d.len == 2) return error.Malformed;
+                st.sct_list = d;
+            },
+            else => {},
+        }
+    }
+    return st;
+}
+
+/// RFC 6066 §8 `CertificateStatus` (also the DTLS 1.2 handshake message
+/// body): `status_type` ocsp + `OCSPResponse<1..2^24-1>`; returns the DER.
+pub fn decodeCertificateStatus(d: []const u8) MessageError![]const u8 {
+    if (d.len < 4 or d[0] != status_type_ocsp) return error.Malformed;
+    const n: usize = readU24(d[1..4]);
+    if (n == 0 or d.len != 4 + n) return error.Malformed;
+    return d[4..];
+}
+
+/// The `CertificateStatus` body for `ocsp_response` into `out`.
+pub fn encodeCertificateStatus(ocsp_response: []const u8, out: []u8) MessageError![]u8 {
+    if (ocsp_response.len == 0 or ocsp_response.len > 0xFFFFFF) return error.Malformed;
+    if (out.len < 4 + ocsp_response.len) return error.BufferTooShort;
+    out[0] = status_type_ocsp;
+    writeU24(out[1..4], @intCast(ocsp_response.len));
+    @memcpy(out[4..][0..ocsp_response.len], ocsp_response);
+    return out[0 .. 4 + ocsp_response.len];
+}
 
 /// Encodes a `Certificate` message body: `context` (<= 255 bytes) followed
 /// by `certs` (each a raw DER-encoded X.509 certificate, leaf first per RFC
 /// 8446 §4.4.2), each wrapped as a `CertificateEntry` with an empty
 /// extensions list.
 pub fn encodeCertificate(context: []const u8, certs: []const []const u8, out: []u8) MessageError![]u8 {
+    return encodeCertificateStapled(context, certs, .{}, out);
+}
+
+/// `encodeCertificate` with RFC 8446 §4.4.2.1's leaf extensions: the OCSP
+/// staple as a `status_request` `CertificateStatus`, the SCT list as
+/// `signed_certificate_timestamp` (as `tlsserver.messages.certificate`).
+pub fn encodeCertificateStapled(context: []const u8, certs: []const []const u8, leaf: LeafStatus, out: []u8) MessageError![]u8 {
     if (context.len > 255) return error.Malformed;
     if (out.len < 1 + context.len + 3) return error.BufferTooShort;
     var i: usize = 0;
@@ -1007,16 +1083,37 @@ pub fn encodeCertificate(context: []const u8, certs: []const []const u8, out: []
     const list_len_pos = i;
     i += 3; // certificate_list<0..2^24-1> length, patched below
     const list_start = i;
-    for (certs) |cert_data| {
+    for (certs, 0..) |cert_data, idx| {
         if (cert_data.len == 0 or cert_data.len > 0xFFFFFF) return error.Malformed;
         if (out.len < i + 3 + cert_data.len + 2) return error.BufferTooShort;
         writeU24(out[i..][0..3], @intCast(cert_data.len));
         i += 3;
         @memcpy(out[i..][0..cert_data.len], cert_data);
         i += cert_data.len;
-        // Per-entry extensions<0..2^16-1>: always empty (see doc comment above).
-        std.mem.writeInt(u16, out[i..][0..2], 0, .big);
+        // Per-entry extensions<0..2^16-1>: the leaf's staple and SCTs, if any.
+        const ext_len_pos = i;
         i += 2;
+        if (idx == 0) {
+            if (leaf.ocsp_response) |o| {
+                if (o.len == 0 or o.len > 0xFFFF - 4 - 4) return error.Malformed;
+                if (out.len < i + 4 + 4 + o.len + 2) return error.BufferTooShort;
+                std.mem.writeInt(u16, out[i..][0..2], ext_status_request, .big);
+                std.mem.writeInt(u16, out[i + 2 ..][0..2], @intCast(4 + o.len), .big);
+                _ = try encodeCertificateStatus(o, out[i + 4 ..]);
+                i += 4 + 4 + o.len;
+            }
+            if (leaf.sct_list) |l| {
+                if (l.len <= 2 or l.len > 0xFFFF - 4) return error.Malformed;
+                if (out.len < i + 4 + l.len + 2) return error.BufferTooShort;
+                std.mem.writeInt(u16, out[i..][0..2], ext_signed_certificate_timestamp, .big);
+                std.mem.writeInt(u16, out[i + 2 ..][0..2], @intCast(l.len), .big);
+                @memcpy(out[i + 4 ..][0..l.len], l);
+                i += 4 + l.len;
+            }
+        }
+        const ext_len = i - ext_len_pos - 2;
+        if (ext_len > 0xFFFF) return error.Malformed;
+        std.mem.writeInt(u16, out[ext_len_pos..][0..2], @intCast(ext_len), .big);
     }
     const list_len = i - list_start;
     if (list_len > 0xFFFFFF) return error.ListTooLong;
@@ -1068,10 +1165,11 @@ pub fn decodeCertificate(buf: []const u8, entries_out: []CertificateEntry) Messa
         const ext_len: usize = std.mem.readInt(u16, buf[i..][0..2], .big);
         i += 2;
         if (i + ext_len > list_end) return error.Malformed;
-        i += ext_len; // entry extensions: length-validated, contents discarded (see doc comment above)
+        const entry_exts = buf[i..][0..ext_len];
+        i += ext_len; // entry extensions: length-validated, read by `leafStatus`
 
         if (n >= entries_out.len) return error.TooManyCertificateEntries;
-        entries_out[n] = .{ .cert_data = cert_data };
+        entries_out[n] = .{ .cert_data = cert_data, .extensions = entry_exts };
         n += 1;
     }
     if (i != list_end) return error.Malformed;
@@ -2359,4 +2457,27 @@ test "ALPN: every truncation of a valid list is a typed error, never a panic" {
     for (0..body.len) |n| {
         if (AlpnIter.init(body[0..n])) |_| return error.TestUnexpectedResult else |e| try std.testing.expectEqual(error.Malformed, e);
     }
+}
+
+test "encodeCertificateStapled: the leaf's status_request and SCT list, RFC 8446 §4.4.2.1 (tlsserver's bytes), read back by leafStatus" {
+    var out: [128]u8 = undefined;
+    const scts = "\x00\x06\x00\x04\x05\x06\x07\x08";
+    const m = try encodeCertificateStapled("", &.{ "L", "I" }, .{ .ocsp_response = "\x30\x00", .sct_list = scts }, &out);
+    // The leaf entry as `tlsserver`'s messages test spells it, then the
+    // intermediate with an empty extension list.
+    const leaf = "\x00\x00\x01L" ++ "\x00\x16" ++ "\x00\x05\x00\x06\x01\x00\x00\x02\x30\x00" ++ "\x00\x12\x00\x08" ++ scts;
+    const inter = "\x00\x00\x01I\x00\x00";
+    try std.testing.expectEqualSlices(u8, "\x00" ++ "\x00\x00\x22" ++ leaf ++ inter, m);
+    var entries: [4]CertificateEntry = undefined;
+    const dec = try decodeCertificate(m, &entries);
+    const st = try leafStatus(dec.entries[0].extensions);
+    try std.testing.expectEqualSlices(u8, "\x30\x00", st.ocsp_response.?);
+    try std.testing.expectEqualSlices(u8, scts, st.sct_list.?);
+    try std.testing.expectEqual(@as(usize, 0), dec.entries[1].extensions.len);
+    // Malformed statuses: another status_type, an empty response, a list
+    // whose length disagrees, the same extension twice.
+    try std.testing.expectError(error.Malformed, leafStatus("\x00\x05\x00\x06\x02\x00\x00\x02\x30\x00"));
+    try std.testing.expectError(error.Malformed, leafStatus("\x00\x05\x00\x04\x01\x00\x00\x00"));
+    try std.testing.expectError(error.Malformed, leafStatus("\x00\x12\x00\x04\x00\x05\x01\x02"));
+    try std.testing.expectError(error.Malformed, leafStatus("\x00\x12\x00\x03\x00\x01\x07" ++ "\x00\x12\x00\x03\x00\x01\x07"));
 }

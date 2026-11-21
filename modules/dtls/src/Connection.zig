@@ -350,7 +350,24 @@ pub const CertConfig = struct {
     /// so give each thread its own (or none). Null: fresh blinding per
     /// signature. Ignored for a non-RSA key.
     rsa_blinding: ?*rsa.BlindingCache = null,
+    /// A server's OCSP staple for the leaf: a DER `OCSPResponse` (e.g. from
+    /// the `ocsp` module or a responder), sent to a client that asked
+    /// (`status_request`, RFC 6066 §8): in DTLS 1.3 in the leaf's
+    /// `CertificateEntry` (RFC 8446 §4.4.2.1), in 1.2 as a CertificateStatus
+    /// message. Borrowed; the caller refreshes it. As `tlsserver`'s
+    /// `CertifiedKey.ocsp_response`.
+    ocsp_response: ?[]const u8 = null,
+    /// A server's Certificate Transparency SCTs for the leaf: the RFC 6962
+    /// §3.3 `SignedCertificateTimestampList`, its 2-byte length included,
+    /// sent to a client that asked (`signed_certificate_timestamp`): in 1.3
+    /// in the leaf's entry, in 1.2 in the ServerHello. Borrowed.
+    sct_list: ?[]const u8 = null,
 };
+
+/// The largest OCSP staple and SCT list a client keeps
+/// (`Connection.peerOcspResponse` / `peerSctList`); larger ones fail the
+/// Certificate message (`error.Malformed`).
+pub const max_staple_len = 2048;
 
 /// Trust policy for a peer's presented certificate chain (RFC 8446 §4.4.2).
 /// Applies independently on each side: a client checks the server's chain
@@ -821,6 +838,17 @@ pub const Config = struct {
     /// default (as wolfSSL's `wolfSSL_UseSessionTicket` and pion's
     /// `SessionStore`): the ClientHello is unchanged without it.
     session_tickets12: bool = false,
+    /// Client (both engines, certificate modes): ask for the server's OCSP
+    /// staple (`status_request`, RFC 6066 §8) and keep it
+    /// (`peerOcspResponse`). Its verdict is the caller's — e.g. the `ocsp`
+    /// module's response check against the leaf and its issuer — as with
+    /// `tlsclient`'s `request_ocsp`, rustls and Go. Not asking is the default.
+    request_ocsp: bool = false,
+    /// Client: ask for Certificate Transparency SCTs
+    /// (`signed_certificate_timestamp`, RFC 6962 §3.3.1) and keep the list
+    /// (`peerSctList`); verifying them is the caller's (`tlsclient`'s
+    /// `request_scts`).
+    request_scts: bool = false,
     /// DTLS 1.3 client: application data to send as 0-RTT early data (RFC
     /// 8446 §2.3 / §4.2.10, RFC 9147 epoch 1) with `resumption` when the
     /// ticket allows that much (`SessionTicket.max_early_data`, at most
@@ -1460,7 +1488,7 @@ fn messageSeqOlderThan(a: u16, b: u16) bool {
 // larger than one record (`max_send_fragment_inner`, or the record that
 // `Config.max_datagram_len` allows) is sent as several fragments
 // (`writeFragmented`).
-const max_cert_message_body: usize = 1200;
+const max_cert_message_body: usize = 4096;
 /// The largest DTLSInnerPlaintext (fragment + content-type byte) one sealed
 /// handshake record carries, and the largest epoch-0 fragment piece.
 const max_send_fragment_inner: usize = 1500;
@@ -2206,6 +2234,15 @@ pub const Connection = struct {
     /// Client: the last NewSessionTicket received (`sessionTicket`).
     ticket: SessionTicket = undefined,
     ticket_live: bool = false,
+    // ── OCSP stapling / SCTs (RFC 8446 §4.4.2.1)
+    /// Server: the ClientHello asked for them.
+    ocsp_requested: bool = false,
+    sct_requested: bool = false,
+    /// Client: what the server's leaf entry carried.
+    peer_ocsp: [max_staple_len]u8 = undefined,
+    peer_ocsp_len: u16 = 0,
+    peer_sct: [max_staple_len]u8 = undefined,
+    peer_sct_len: u16 = 0,
     // ── 0-RTT (RFC 8446 §2.3 over RFC 9147's epoch 1)
     /// The server took the early data (`earlyDataAccepted`).
     early_accepted: bool = false,
@@ -2394,7 +2431,7 @@ pub const Connection = struct {
             const first = datagram[pos];
             const n = if (first & 0xe0 == 0x20) blk: {
                 // Unified header (RFC 9147 §4). Early records carry no CID.
-                const dec = record.decodeUnified(datagram[pos..], 0) catch return error.Malformed;
+                const dec = record.decodeUnified(datagram[pos..], if (first & 0x10 != 0) self.rxCidLen() else 0) catch return error.Malformed;
                 const len = dec.hdr.length orelse datagram.len - pos - dec.consumed;
                 if (datagram.len - pos - dec.consumed < len) return error.Malformed;
                 const total = dec.consumed + len;
@@ -2915,7 +2952,7 @@ pub const Connection = struct {
                     // one this side cannot use, is not.
                     if (@as(u32, hdr.fragment_offset) + hdr.fragment_length == hdr.length) {
                         self.peer_message_seq = expected +% 1;
-                        if (self.role == .client and hdr.fragment_offset == 0) try self.takeSessionTicket(frag);
+                        if (self.role == .client and self.resumption_live and hdr.fragment_offset == 0) try self.takeSessionTicket(frag);
                     }
                     ack = true;
                 },
@@ -2949,7 +2986,7 @@ pub const Connection = struct {
     fn takeSessionTicket(self: *Connection, body: []const u8) error{Malformed}!void {
         var ext_buf: [8]tlsresume.ticket.Extension = undefined;
         const nst = tlsresume.ticket.NewSessionTicket.decode(body, &ext_buf) catch return error.Malformed;
-        if (!self.resumption_live or nst.ticket_lifetime == 0 or nst.ticket.len > max_ticket_len) return;
+        if (nst.ticket_lifetime == 0 or nst.ticket.len > max_ticket_len) return;
         const alg = self.suite.hash();
         var t: SessionTicket = .{
             .suite = self.suite,
@@ -3216,6 +3253,19 @@ pub const Connection = struct {
     /// Whether the server took this handshake's 0-RTT early data (client:
     /// the EncryptedExtensions said so; server: it accepted it). A client
     /// whose early data was refused sends it again after the handshake.
+    /// Client: the OCSP response the server stapled to its leaf
+    /// (`Config.request_ocsp`), or null. Raw DER; check it before relying on
+    /// it. Aliases this `Connection`.
+    pub fn peerOcspResponse(self: *const Connection) ?[]const u8 {
+        return if (self.peer_ocsp_len > 0) self.peer_ocsp[0..self.peer_ocsp_len] else null;
+    }
+
+    /// Client: the `SignedCertificateTimestampList` the server sent
+    /// (`Config.request_scts`), its length prefix included, or null.
+    pub fn peerSctList(self: *const Connection) ?[]const u8 {
+        return if (self.peer_sct_len > 0) self.peer_sct[0..self.peer_sct_len] else null;
+    }
+
     pub fn earlyDataAccepted(self: *const Connection) bool {
         return self.early_accepted;
     }
@@ -3862,7 +3912,7 @@ pub const Connection = struct {
         const srtp_ext = try self.srtpOffer(&srtp_buf);
 
         var cid_buf: [1 + max_cid_len]u8 = undefined;
-        var exts_buf: [11 + dual12_extensions.len]messages.Extension = undefined;
+        var exts_buf: [13 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -3886,6 +3936,14 @@ pub const Connection = struct {
         }
         if (self.cidOffer(&cid_buf)) |e| {
             exts_buf[n_exts] = e;
+            n_exts += 1;
+        }
+        if (self.config.request_ocsp) {
+            exts_buf[n_exts] = .{ .ext_type = messages.ext_status_request, .data = &messages.status_request_ocsp };
+            n_exts += 1;
+        }
+        if (self.config.request_scts) {
+            exts_buf[n_exts] = .{ .ext_type = messages.ext_signed_certificate_timestamp, .data = &.{} };
             n_exts += 1;
         }
         if (self.config.allows(.dtls12)) {
@@ -4754,6 +4812,20 @@ pub const Connection = struct {
                 }
                 self.transcript.append(parsed.msg_type, parsed.body);
                 result.saw_cert = true;
+                if (dec.entries.len > 0 and signer_side == .server) {
+                    // RFC 8446 §4.4.2: only extensions this client asked for.
+                    const st = messages.leafStatus(dec.entries[0].extensions) catch return error.Malformed;
+                    if (st.ocsp_response) |o| {
+                        if (!self.config.request_ocsp or o.len > max_staple_len) return error.Malformed;
+                        @memcpy(self.peer_ocsp[0..o.len], o);
+                        self.peer_ocsp_len = @intCast(o.len);
+                    }
+                    if (st.sct_list) |l| {
+                        if (!self.config.request_scts or l.len > max_staple_len) return error.Malformed;
+                        @memcpy(self.peer_sct[0..l.len], l);
+                        self.peer_sct_len = @intCast(l.len);
+                    }
+                }
                 if (dec.entries.len > 0) {
                     const leaf = dec.entries[0].cert_data;
                     if (leaf.len > result.leaf_buf.len) return error.Malformed;
@@ -4783,6 +4855,7 @@ pub const Connection = struct {
             .wait_finished => blk: {
                 // 0-RTT records between the ClientHello and the client's
                 // Finished (epoch 1) are taken out first; refused ones dropped.
+                if (!self.did_resume) break :blk self.serverProcessClientFinished(datagram, entropy, now_ms, out);
                 var rest_buf: [max_flight_bytes]u8 = undefined;
                 const rest = try self.takeEarlyRecords(datagram, &rest_buf);
                 if (rest.len == 0) break :blk error.FlightIncomplete;
@@ -5136,6 +5209,12 @@ pub const Connection = struct {
         }
         try self.serverSelectAlpn(dec.extensions);
         try self.serverSelectSrtp(dec.extensions);
+        for (dec.extensions) |e| {
+            // RFC 6066 §8: an ocsp `status_request` (responder IDs and
+            // request extensions are not used); RFC 6962 §3.3.1: empty.
+            if (e.ext_type == messages.ext_status_request and e.data.len >= 1 and e.data[0] == messages.status_type_ocsp) self.ocsp_requested = true;
+            if (e.ext_type == messages.ext_signed_certificate_timestamp and e.data.len == 0) self.sct_requested = true;
+        }
         if (self.config.connection_id != null) {
             for (dec.extensions) |e| {
                 if (e.ext_type != ext_connection_id) continue;
@@ -5319,7 +5398,11 @@ pub const Connection = struct {
 
         if (if (self.did_resume) null else self.config.cert) |cc| {
             var cert_body_buf: [max_cert_message_body]u8 = undefined;
-            const cert_body = messages.encodeCertificate(&.{}, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
+            // RFC 8446 §4.4.2.1: the staple and SCTs only when asked for.
+            const cert_body = messages.encodeCertificateStapled(&.{}, cc.chain, .{
+                .ocsp_response = if (self.ocsp_requested) cc.ocsp_response else null,
+                .sct_list = if (self.sct_requested) cc.sct_list else null,
+            }, &cert_body_buf) catch return error.BufferTooShort;
             var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
             const cert_r = try self.sendEpoch2Message(.certificate, cert_body, &frag_buf, out[cursor..]);
             cursor += cert_r.bytes.len;
@@ -12676,4 +12759,46 @@ test "0-RTT: early data on a resumption is taken once (strike register), refused
     var buf: [4096]u8 = undefined;
     _ = try client.startHandshake(seededForTest(&csprng), 0, &buf);
     try testing.expect(!client.early_offered);
+}
+
+// ── OCSP stapling and SCTs (RFC 8446 §4.4.2.1) ────────────────────────────
+
+test "OCSP staple and SCT list ride the leaf's CertificateEntry when asked for, and only then" {
+    const staple = "\x30\x03\x0a\x01\x00"; // an OCSPResponse shape: SEQUENCE { ENUMERATED successful }
+    const scts = "\x00\x06\x00\x04\x05\x06\x07\x08";
+    for ([_]bool{ true, false }) |ask| {
+        var scfg = certDheServerConfig();
+        scfg.cert.?.ocsp_response = staple;
+        scfg.cert.?.sct_list = scts;
+        var ccfg = certDheClientConfig();
+        ccfg.request_ocsp = ask;
+        ccfg.request_scts = ask;
+        var client = try Connection.clientInit(ccfg);
+        defer client.deinit();
+        var server = try Connection.serverInit(scfg);
+        defer server.deinit();
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xb0)));
+        var buf1: [4096]u8 = undefined;
+        var buf2: [4096]u8 = undefined;
+        try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
+        if (ask) {
+            try testing.expectEqualSlices(u8, staple, client.peerOcspResponse().?);
+            try testing.expectEqualSlices(u8, scts, client.peerSctList().?);
+        } else {
+            try testing.expect(client.peerOcspResponse() == null and client.peerSctList() == null);
+        }
+        try expectRoundTrip(&client, &server, "stapled");
+    }
+    // A server with nothing to staple answers an asking client without one.
+    var ccfg = certDheClientConfig();
+    ccfg.request_ocsp = true;
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var server = try Connection.serverInit(certDheServerConfig());
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xb1)));
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
+    try testing.expect(client.peerOcspResponse() == null);
 }

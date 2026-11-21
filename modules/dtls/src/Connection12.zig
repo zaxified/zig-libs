@@ -98,6 +98,7 @@ pub const CipherSuite12 = suite12.CipherSuite12;
 pub const KeyExchange12 = suite12.KeyExchange12;
 pub const SessionTicket12 = conn13.SessionTicket12;
 const hs_new_session_ticket: u8 = 4; // RFC 5077 §3.3
+const hs_certificate_status: u8 = 22; // RFC 6066 §8
 const ext_session_ticket = tlsresume.ticket12.extension_type;
 const HashAlg = suitehash.HashAlg;
 
@@ -314,6 +315,17 @@ pub const Connection12 = struct {
     /// The last alert the peer sent (`level`, `description`), RFC 5246 §7.2.
     peer_alert: ?[2]u8 = null,
 
+    // ── OCSP stapling (RFC 6066 §8) and SCTs (RFC 6962 §3.3.1)
+    /// Server: the ClientHello asked. Client: the ServerHello announced a
+    /// CertificateStatus (`ocsp_expected`).
+    ocsp_requested: bool = false,
+    sct_requested: bool = false,
+    ocsp_expected: bool = false,
+    peer_ocsp: [conn13.max_staple_len]u8 = undefined,
+    peer_ocsp_len: u16 = 0,
+    peer_sct: [conn13.max_staple_len]u8 = undefined,
+    peer_sct_len: u16 = 0,
+
     // ── RFC 5077 session tickets
     /// Client: the ServerHello announced a NewSessionTicket. Server: one is
     /// sent in this handshake (the client sent the extension).
@@ -372,6 +384,18 @@ pub const Connection12 = struct {
     /// client after an abbreviated one.
     fn sentLastFlight(self: *const Connection12) bool {
         return (self.role == .server) != self.abbreviated;
+    }
+
+    /// Client: the OCSP response of the server's CertificateStatus
+    /// (`Config.request_ocsp`), or null. Raw DER; the caller checks it.
+    pub fn peerOcspResponse(self: *const Connection12) ?[]const u8 {
+        return if (self.peer_ocsp_len > 0) self.peer_ocsp[0..self.peer_ocsp_len] else null;
+    }
+
+    /// Client: the ServerHello's `SignedCertificateTimestampList`
+    /// (`Config.request_scts`), its length prefix included, or null.
+    pub fn peerSctList(self: *const Connection12) ?[]const u8 {
+        return if (self.peer_sct_len > 0) self.peer_sct[0..self.peer_sct_len] else null;
     }
 
     pub fn negotiatedSuite(self: *const Connection12) ?CipherSuite12 {
@@ -918,9 +942,10 @@ pub const Connection12 = struct {
             // What a client receives (from the server).
             .client => switch (t) {
                 m12.HandshakeType.certificate => 1,
-                m12.HandshakeType.server_key_exchange => 2,
-                m12.HandshakeType.certificate_request => 3,
-                m12.HandshakeType.server_hello_done => 4,
+                hs_certificate_status => 2,
+                m12.HandshakeType.server_key_exchange => 3,
+                m12.HandshakeType.certificate_request => 4,
+                m12.HandshakeType.server_hello_done => 5,
                 else => 0,
             },
             .server => switch (t) {
@@ -964,6 +989,15 @@ pub const Connection12 = struct {
                     try self.appendTranscript(t, seq, body);
                     switch (t) {
                         m12.HandshakeType.certificate => try self.clientCertificate(body, before),
+                        hs_certificate_status => {
+                            // RFC 6066 §8: announced by an empty
+                            // `status_request` in the ServerHello.
+                            if (!self.ocsp_expected or !self.got_certificate) return error.UnexpectedMessage;
+                            const resp = messages.decodeCertificateStatus(body) catch return error.Malformed;
+                            if (resp.len > conn13.max_staple_len) return error.Malformed;
+                            @memcpy(self.peer_ocsp[0..resp.len], resp);
+                            self.peer_ocsp_len = @intCast(resp.len);
+                        },
                         m12.HandshakeType.server_key_exchange => try self.clientServerKeyExchange(body),
                         m12.HandshakeType.certificate_request => try self.clientCertificateRequest(body),
                         m12.HandshakeType.server_hello_done => {
@@ -1085,7 +1119,7 @@ pub const Connection12 = struct {
             any_cert = any_cert or kx.usesCertificate();
         }
         var ext_buf: [512]u8 = undefined;
-        var exts: [11]m12.Extension = undefined;
+        var exts: [13]m12.Extension = undefined;
         var n: usize = 0;
         var used: usize = 0;
         if (any_ecdhe) {
@@ -1121,6 +1155,14 @@ pub const Connection12 = struct {
             @memcpy(ext_buf[used + 1 ..][0..c.len], c);
             exts[n] = .{ .ext_type = conn13.ext_connection_id, .data = ext_buf[used..][0 .. 1 + c.len] };
             used += 1 + c.len;
+            n += 1;
+        }
+        if (self.config.request_ocsp and any_cert) {
+            exts[n] = .{ .ext_type = messages.ext_status_request, .data = &messages.status_request_ocsp };
+            n += 1;
+        }
+        if (self.config.request_scts and any_cert) {
+            exts[n] = .{ .ext_type = messages.ext_signed_certificate_timestamp, .data = &.{} };
             n += 1;
         }
         // RFC 5077 §3.2: the ticket to resume, or empty to ask for one.
@@ -1229,6 +1271,19 @@ pub const Connection12 = struct {
             conn13.ext_connection_id => {
                 if (self.config.connection_id == null) return error.Malformed; // not offered
                 try self.takePeerCid(e.data);
+            },
+            messages.ext_status_request => {
+                // RFC 6066 §8: empty; a CertificateStatus follows the
+                // Certificate.
+                if (e.data.len != 0 or !self.config.request_ocsp) return error.Malformed;
+                self.ocsp_expected = true;
+            },
+            messages.ext_signed_certificate_timestamp => {
+                // RFC 6962 §3.3.1: the SignedCertificateTimestampList.
+                if (!self.config.request_scts or e.data.len <= 2 or e.data.len > conn13.max_staple_len or
+                    std.mem.readInt(u16, e.data[0..2], .big) != e.data.len - 2) return error.Malformed;
+                @memcpy(self.peer_sct[0..e.data.len], e.data);
+                self.peer_sct_len = @intCast(e.data.len);
             },
             ext_session_ticket => {
                 // RFC 5077 §3.2: empty, and only when offered.
@@ -1451,6 +1506,8 @@ pub const Connection12 = struct {
             conn13.ext_connection_id => cid_offer = e.data,
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
             ext_session_ticket => ticket_offer = e.data,
+            messages.ext_status_request => self.ocsp_requested = e.data.len >= 1 and e.data[0] == messages.status_type_ocsp,
+            messages.ext_signed_certificate_timestamp => self.sct_requested = e.data.len == 0,
             else => {},
         };
         // RFC 5746 §4.3: a server that never renegotiates MAY complete a
@@ -1557,7 +1614,7 @@ pub const Connection12 = struct {
             var ext_buf: [300]u8 = undefined;
             var srtp_buf: [5]u8 = undefined;
             var cid_buf: [1 + conn13.max_cid_len]u8 = undefined;
-            var exts: [6]m12.Extension = undefined;
+            var exts: [9]m12.Extension = undefined;
             var n: usize = 0;
             // RFC 5746 §3.6: answered only when the client signalled it
             // (RFC 5246 §7.4.1.4: no unsolicited extensions).
@@ -1592,6 +1649,19 @@ pub const Connection12 = struct {
                 exts[n] = .{ .ext_type = ext_session_ticket, .data = &.{} };
                 n += 1;
             }
+            // RFC 6066 §8 / RFC 6962 §3.3.1, certificate key exchanges of a
+            // full handshake only (an abbreviated one sends no Certificate).
+            const cert_cfg: ?conn13.CertConfig = if (self.kx.usesCertificate() and resumed_suite == null) self.config.cert else null;
+            if (cert_cfg) |cc| {
+                if (self.ocsp_requested and cc.ocsp_response != null) {
+                    exts[n] = .{ .ext_type = messages.ext_status_request, .data = &.{} };
+                    n += 1;
+                }
+                if (self.sct_requested and cc.sct_list != null) {
+                    exts[n] = .{ .ext_type = messages.ext_signed_certificate_timestamp, .data = cc.sct_list.? };
+                    n += 1;
+                }
+            }
             const sh = m12.encodeServerHello(.{ .random = self.server_random, .session_id = self.session_id[0..self.session_id_len], .cipher_suite = @backingInt(self.suite), .extensions = exts[0..n] }, &buf) catch return error.BufferTooShort;
             try self.sendMessage(.handshake_epoch0, m12.HandshakeType.server_hello, sh);
         }
@@ -1613,8 +1683,13 @@ pub const Connection12 = struct {
             return;
         }
         if (self.kx.usesCertificate()) {
-            const cb = m12.encodeCertificate(self.config.cert.?.chain, &buf) catch return error.BufferTooShort;
+            const cc = self.config.cert.?;
+            const cb = m12.encodeCertificate(cc.chain, &buf) catch return error.BufferTooShort;
             try self.sendMessage(.handshake_epoch0, m12.HandshakeType.certificate, cb);
+            if (self.ocsp_requested) if (cc.ocsp_response) |resp| {
+                const st = messages.encodeCertificateStatus(resp, &buf) catch return error.BufferTooShort;
+                try self.sendMessage(.handshake_epoch0, hs_certificate_status, st);
+            };
         }
         var ske_len: usize = 0;
         if (self.kx.isPsk() and (self.kx == .ecdhe_psk or self.config.psk_identity_hint.len > 0)) {
