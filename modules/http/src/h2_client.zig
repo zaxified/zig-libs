@@ -133,6 +133,10 @@ pub const Error = error{
     BodyTooLarge,
     /// `Session.readBody` with an empty `buf` (0 means "body complete").
     EmptyBuffer,
+    /// A shared session (`Session.share`): the calling task was canceled
+    /// while it waited for the peer — on another task's read, or in its
+    /// own when `Sync.read_canceled` says so. The session lives on.
+    Canceled,
     WriteFailed,
     OutOfMemory,
 };
@@ -358,8 +362,9 @@ pub const Session = struct {
     /// back inside. Writes to the transport happen under `mutex`, as one
     /// task's writes always have here. A reader whose read fails latches
     /// the session as `ConnectionClosed`, failing every stream on it, as a
-    /// dead socket does — so a reader task must not be canceled while
-    /// others still wait (its read is not cancel-safe).
+    /// dead socket does — unless `read_canceled` says the failure was the
+    /// reader's own cancelation; a canceled follower just stops waiting.
+    /// Either way that call fails `error.Canceled`.
     pub const Sync = struct {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
@@ -368,6 +373,12 @@ pub const Session = struct {
         reading: bool = false,
         /// Times a task read the transport as the leader (tests).
         reads: usize = 0,
+        /// Asked when the leader's read fails: whether that was its own
+        /// task's cancelation (the transport's error says so), not the
+        /// transport's death. True: that call fails `error.Canceled` and the
+        /// session lives on for the others. Null: every read failure is the
+        /// transport's (`ConnectionClosed`, latched).
+        read_canceled: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque) bool } = null,
 
         pub fn init(io: std.Io) Sync {
             return .{ .io = io };
@@ -894,8 +905,9 @@ pub const Session = struct {
         if (s.sync) |sy| {
             if (sy.reading) {
                 // Another task reads: its progress may be ours. The caller
-                // looks at its stream again either way.
-                sy.progress.waitUncancelable(sy.io, &sy.mutex);
+                // looks at its stream again either way. A cancelation of
+                // this task ends its wait, not the session.
+                sy.progress.wait(sy.io, &sy.mutex) catch return error.Canceled;
                 return;
             }
             sy.reading = true;
@@ -907,7 +919,10 @@ pub const Session = struct {
             // Every waiter looks again: at the frames folded below, or at
             // the latched failure, or to become the next reader.
             defer sy.progress.broadcast(sy.io);
-            _ = got catch return s.fail(error.ConnectionClosed);
+            _ = got catch {
+                if (sy.read_canceled) |rc| if (rc.func(rc.ctx)) return error.Canceled;
+                return s.fail(error.ConnectionClosed);
+            };
             return s.feed();
         }
         _ = s.in.peekGreedy(1) catch return s.fail(error.ConnectionClosed);

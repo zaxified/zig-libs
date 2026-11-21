@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no HTTP/3 (Go's stdlib has none either); one exchange per h2 client connection (no multiplexing, *Backlog*). The client has a cookie jar (`Client.Options.cookie_jar`) and an outbound proxy (forward and `CONNECT`, Go's environment rules). The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (*Design notes by feature*).
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no HTTP/3 (Go's stdlib has none either); the client's h2 sessions are driven by the requesting tasks themselves (no reader task of their own; see *Design notes*: Client h2 multiplexing). The client has a cookie jar (`Client.Options.cookie_jar`) and an outbound proxy (forward and `CONNECT`, Go's environment rules). The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (*Design notes by feature*).
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -185,6 +185,29 @@ security boundary.
 
 What each feature is and the decisions behind it. When each landed is in `CHANGELOG.md`; how it was verified is in
 *Verification*.
+
+**Client h2 multiplexing (Go's `Transport` / `http2.ClientConn`).**
+- *Shared sessions:* `h2_client.Session.Sync` + `Session.share` let several tasks drive one session. Every call holds
+  the `Sync`'s mutex; a call that must wait for the peer (a head, body octets, send credit) becomes the reader when no
+  task is reading and reads the transport with the mutex released, then folds what it read into every stream and
+  broadcasts `progress`; a call that finds another task reading waits on `progress` and looks at its stream again.
+  No reader task is started (leader/followers rather than Go's read-loop goroutine), so a `Session` needs no `Io`
+  concurrency of its own. Writes stay under the mutex, as one task's always were. A follower canceled while it waits
+  fails `error.Canceled` and the session lives on; so does a canceled reader when `Sync.read_canceled` says its read
+  failure was the cancelation (the `Client` reads the socket reader's error), else a failed read latches the session
+  as `ConnectionClosed`. Over TLS a read canceled inside a record may leave the record layer unusable, which then
+  fails the session: an h2 request's `total_timeout_ms` firing while it is the reader can cost the other requests on
+  that connection (Go avoids this with its dedicated read loop).
+- *Client (`Options.http2`):* an h2 connection stays in the pool while exchanges run on it: a checkout that finds one
+  pins it (a reference), opens an exchange `Conn` on it (own head and body buffers, `parent` = the connection,
+  `H2Stream` = the stream's state) and drops the pin; a dialed one goes into the pool the same way. A connection is
+  passed by when its session failed, saw GOAWAY or is at the server's `SETTINGS_MAX_CONCURRENT_STREAMS` (then the
+  request dials another, Go's default without `StrictMaxConcurrentStreams`); the pool reads that from atomics the
+  exchanges copy under the session lock, never taking the session lock itself. The socket closes when the pool let
+  go of the connection and its last exchange ended. `max_conns_per_host` counts connections, not streams.
+- *h2 upstream (`h2_upstream.Pool`):* every `Call` drives its connection's session the same way, so tasks collect
+  their streams in parallel; `beginStream`/`sendBody`/`awaitHead`/`readBody`/`finish` stream both bodies, and the
+  reverse proxy's h2 path relays them so.
 
 **Server lifecycle, timeouts, hooks (Go `net/http` parity, the S2 survey's R1, R2, R5).**
 - *Graceful lifecycle:* `shutdownGraceful(timeout_ms)`, `close`, `isDraining`, `setKeepAlivesEnabled`,
@@ -655,12 +678,6 @@ same thread).
 
 ## Backlog / deferred
 
-- **Client h2 multiplexing** *(deferred by the owner 2026-10-12; not done in wave 14: a redesign of `h2_client.Session`)*:
-  `Options.http2` checks an h2 connection out for one exchange like an h1 one, so concurrent requests to one origin open
-  several connections where Go's Transport shares one. Needs `h2_client.Session` driven by more than one task: a
-  leader that reads the socket WITHOUT holding the session lock while the others wait on a condition for progress (a
-  lock around the blocking engine deadlocks: the holder blocks on the socket while the stream whose unread data shut
-  the window waits for the lock). That means splitting the session's blocking read from its frame processing.
 - **A shared server-side `ResponseWriter` buffer pool** across connections (the client-side one is `bufpool`): a perf
   item, not attempted in wave 14 (needs a server bench A/B; see the `header_buf` note under *What is deliberately not
   done* for what the h1 frame costs).

@@ -73,7 +73,9 @@
 //! reader/writer over — the same `H2Session` drives it, transport owned by
 //! the caller.
 //!
-//! h2 pooling seam: an `H2Session` already multiplexes every request over
+//! h2 pooling seam (`connectH2c`/`connectH2Over`; the ALPN path,
+//! `Options.http2`, shares its pooled connections between concurrent
+//! requests — see there): an `H2Session` already multiplexes every request over
 //! its ONE connection — that IS h2's pooling, so the h1 idle `Pool` below
 //! does not apply to it and never touches `H2Session`/`connectH2c`/
 //! `connectH2Over` (checking an h2 connection in/out exclusively per
@@ -320,10 +322,13 @@ pub const Options = struct {
     /// `decompress`, `max_conns_per_host` and the timeouts mean the same on
     /// both protocols; `Response.trailer` reads an h2 trailer section.
     ///
-    /// One request at a time per connection: an h2 connection is checked out
-    /// of the pool for a whole exchange like an h1 one, so concurrent
-    /// requests to one origin open several connections where Go would
-    /// multiplex them on one (SPEC Backlog). A request that asks for a
+    /// Concurrent requests to one origin share its h2 connection as streams,
+    /// as Go's `Transport` does: the connection stays in the pool while
+    /// exchanges run on it, each on a `Conn` of its own, up to the server's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` (past it, or once the session saw
+    /// GOAWAY or failed, a request dials another connection). The tasks
+    /// drive the one session together (`h2_client.Session.Sync`): whichever
+    /// waits for the server reads for all. A request that asks for a
     /// protocol upgrade (`Connection: Upgrade` + `Upgrade`, e.g. WebSocket)
     /// never goes over h2, which has no upgrade: its dial offers only
     /// `http/1.1`, as Go's does for a WebSocket request. `http://` origins
@@ -345,6 +350,7 @@ pub const Http2 = struct {
 
     const VTable = struct {
         start: *const fn (conn: *Conn) Error!void,
+        open_stream: *const fn (phys: *Conn) Error!?*Conn,
         exchange: *const fn (conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead,
         open_upload: *const fn (conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void,
         upload_writer: *const fn (conn: *Conn) *std.Io.Writer,
@@ -354,7 +360,8 @@ pub const Http2 = struct {
         read_failure: *const fn (conn: *const Conn) ?Error,
         trailer: *const fn (conn: *const Conn, name: []const u8) ?[]const u8,
         release: *const fn (conn: *Conn) bool,
-        destroy: *const fn (conn: *Conn) void,
+        destroy: *const fn (conn: *Conn) bool,
+        destroy_stream: *const fn (conn: *Conn) bool,
     };
 };
 
@@ -1315,8 +1322,16 @@ pub const Response = struct {
 /// left it reusable (h1: keep-alive and the body read to its end; h2: the
 /// session healthy, the stream released or reset), else closed.
 fn retire(c: *Client, conn: *Conn) void {
+    if (conn.parent != null) {
+        // An h2 exchange: the stream ends; its connection stays pooled.
+        _ = c.options.http2.?.vt.release(conn);
+        conn.destroy();
+        return;
+    }
+    // An h2 connection itself carries no exchange (its exchanges retire on
+    // their own `Conn`s): a checkout that finds it dead passes it by.
     const reusable = if (conn.h2 != null)
-        c.options.http2.?.vt.release(conn)
+        true
     else
         conn.keep_alive_eligible and isBodyDrained(conn);
     if (c.options.pool.enabled and reusable) {
@@ -2131,8 +2146,13 @@ const Conn = struct {
     /// not counted.
     holds_slot: bool = false,
     /// Set when ALPN chose h2 (`Options.http2`): requests on this
-    /// connection run as streams of this session, one at a time.
+    /// connection run as streams of this session, each on an exchange
+    /// `Conn` of its own (`parent`, `h2_stream`) — concurrently.
     h2: ?*H2Conn = null,
+    /// An exchange on a shared h2 connection: the connection (whose socket
+    /// and TLS this one speaks through), and the stream's state.
+    parent: ?*Conn = null,
+    h2_stream: ?*H2Stream = null,
     /// Built by `Client.synthetic`: no socket, no pool slot, `slab` holds the
     /// head text and the body.
     synthetic: bool = false,
@@ -2149,17 +2169,20 @@ const Conn = struct {
 
     /// Decrypted (or plain) byte stream from the server.
     fn plainReader(conn: *Conn) *std.Io.Reader {
+        if (conn.parent) |p| return p.plainReader();
         if (conn.tls_client) |*t| return &t.reader;
         return &conn.sr.interface;
     }
 
     /// Plaintext writer towards the server (encrypting when TLS).
     fn plainWriter(conn: *Conn) *std.Io.Writer {
+        if (conn.parent) |p| return p.plainWriter();
         if (conn.tls_client) |*t| return &t.writer;
         return &conn.sw.interface;
     }
 
     fn flushAll(conn: *Conn) Error!void {
+        if (conn.parent) |p| return p.flushAll();
         conn.plainWriter().flush() catch return conn.writeFailure();
         // The TLS writer drains ciphertext into the socket writer — flush
         // that too.
@@ -2179,11 +2202,13 @@ const Conn = struct {
     /// funnel through the same socket reader/writer, so one check covers
     /// both.
     fn readFailure(conn: *Conn) Error {
+        if (conn.parent) |p| return p.readFailure();
         if (conn.sr.err) |err| if (err == error.Canceled) return error.Canceled;
         return error.ReadFailed;
     }
 
     fn writeFailure(conn: *Conn) Error {
+        if (conn.parent) |p| return p.writeFailure();
         if (conn.sw.err) |err| if (err == error.Canceled) return error.Canceled;
         return error.WriteFailed;
     }
@@ -2195,7 +2220,24 @@ const Conn = struct {
             gpa.destroy(conn);
             return;
         }
-        if (conn.h2 != null) conn.client.options.http2.?.vt.destroy(conn);
+        if (conn.parent) |phys| {
+            // An exchange: its stream state goes; the connection with it
+            // when this was the last user and the pool had let go.
+            const last = conn.client.options.http2.?.vt.destroy_stream(conn);
+            gpa.free(conn.slab);
+            gpa.destroy(conn);
+            if (last) phys.destroyNow();
+            return;
+        }
+        // An h2 connection still carrying exchanges stays open until the
+        // last one ends (`destroy_stream`).
+        if (conn.h2 != null and !conn.client.options.http2.?.vt.destroy(conn)) return;
+        conn.destroyNow();
+    }
+
+    /// Close the socket and free the connection (no h2 session left).
+    fn destroyNow(conn: *Conn) void {
+        const gpa = conn.client.gpa;
         conn.stream.close(conn.client.io);
         // After the close: a waiter woken here dials at once, and the cap
         // is on sockets the peer sees, not on our bookkeeping.
@@ -2205,16 +2247,39 @@ const Conn = struct {
     }
 };
 
-/// An h2 connection's session and the one exchange running on it
-/// (`Options.http2`), on the heap beside its `Conn`, whose plaintext reader
-/// and writer it speaks through.
+/// An h2 connection's session (`Options.http2`), on the heap beside its
+/// `Conn`, whose plaintext reader and writer it speaks through; shared by
+/// every exchange running on it (each a `Conn` of its own whose `parent` is
+/// this one, with an `H2Stream`), Go's `http2.ClientConn`. The pool holds
+/// the connection like an h1 one while it is idle or busy.
 const H2Conn = struct {
     conn: *Conn,
     session: h2_client.Session,
+    /// Every call on `session` holds its mutex; a call that waits for the
+    /// server reads for all with it released (`h2_client.Session.Sync`).
+    sync: h2_client.Session.Sync,
     /// The session's writer: bytes go to the TLS writer, and `flush` pushes
     /// them on to the socket (`Conn.flushAll`) — the TLS writer's own flush
     /// only seals records into the socket writer's buffer.
     out: std.Io.Writer,
+    /// One for the connection itself (dropped by its `destroy`: the pool
+    /// let go of it), one per exchange `Conn`; the socket closes at 0.
+    refs: std.atomic.Value(usize) = .init(1),
+    /// Exchanges in flight (`refs` but the connection's own), against the
+    /// server's `SETTINGS_MAX_CONCURRENT_STREAMS`.
+    streams: std.atomic.Value(u32) = .init(0),
+    /// The session as last seen under its lock (`h2glue.note`), for the
+    /// pool to read without it: no failure and no GOAWAY yet, and the
+    /// server's concurrent-stream limit.
+    accepting: std.atomic.Value(bool) = .init(true),
+    limit: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
+};
+
+/// One exchange on a shared h2 connection (`H2Conn`), beside the `Conn`
+/// that carries it through the client (its head and body buffers).
+const H2Stream = struct {
+    conn: *Conn,
+    shared: *H2Conn,
     /// The stream of the exchange in progress, until `release`.
     sid: ?u31 = null,
     /// The response body was read to END_STREAM.
@@ -2226,13 +2291,6 @@ const H2Conn = struct {
     /// An `Upload`'s request body as DATA frames, buffered in
     /// `Conn.body_buf` (free until the response body uses it).
     upload: std.Io.Writer,
-
-    /// A new exchange: forget the last one's outcome.
-    fn begin(h: *H2Conn) void {
-        h.done = false;
-        h.failure = null;
-        h.upload.end = 0;
-    }
 };
 
 /// The h2 half of `Client`, reached only through `Http2.alpn`'s function
@@ -2244,9 +2302,16 @@ const H2Conn = struct {
 /// §8.2.2) and a caller's `Host` becomes `:authority`, as in Go. The response
 /// head comes back as an `h1.ResponseHead` over the same fields, so cookies,
 /// redirects and `decompress` read it unchanged.
+///
+/// Multiplexing (Go's `Transport`): a checkout that finds an h2 connection
+/// (idle in the pool, or just dialed) opens an exchange `Conn` on it
+/// (`openStream`) and puts the connection straight back, so concurrent
+/// requests to one origin share it as streams, up to the server's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`; past that a checkout passes it by.
 const h2glue = struct {
     const vtable: Http2.VTable = .{
         .start = start,
+        .open_stream = openStream,
         .exchange = exchange,
         .open_upload = openUpload,
         .upload_writer = uploadWriter,
@@ -2257,6 +2322,7 @@ const h2glue = struct {
         .trailer = trailer,
         .release = release,
         .destroy = destroy,
+        .destroy_stream = destroyStream,
     };
 
     /// ALPN chose h2 on a fresh `conn`: send the connection preface.
@@ -2267,94 +2333,217 @@ const h2glue = struct {
         h.* = .{
             .conn = conn,
             .session = undefined,
+            .sync = .init(conn.client.io),
             .out = .{ .vtable = &.{ .drain = outDrain, .flush = outFlush }, .buffer = &.{} },
-            .body = .{ .vtable = &.{ .stream = bodyStream }, .buffer = conn.body_buf, .seek = 0, .end = 0 },
-            .upload = .{ .vtable = &.{ .drain = uploadDrain, .flush = uploadFlush }, .buffer = conn.body_buf },
         };
         // No session `user_agent`: the rendered head carries it.
         h.session = h2_client.Session.init(gpa, conn.plainReader(), &h.out, .{}) catch |err|
             return mapError(conn, err);
+        h.session.share(&h.sync);
+        h.sync.read_canceled = .{ .ctx = conn, .func = readCanceled };
         conn.h2 = h;
     }
 
-    fn destroy(conn: *Conn) void {
+    /// The reader's failure was its task's cancelation, not the socket's:
+    /// the session lives on for the other exchanges.
+    fn readCanceled(ctx: *anyopaque) bool {
+        const conn: *Conn = @ptrCast(@alignCast(ctx));
+        const e = conn.sr.err orelse return false;
+        if (e != error.Canceled) return false;
+        conn.sr.err = null;
+        return true;
+    }
+
+    /// Whether the session takes a new stream: alive, no GOAWAY, under the
+    /// server's concurrent-stream limit.
+    fn takesStream(h: *H2Conn) bool {
+        h.sync.lock();
+        note(h);
+        h.sync.unlock();
+        return h2Accepts(h);
+    }
+
+    /// Copy what the pool reads of the session (`H2Conn.accepting`,
+    /// `limit`); under the session lock.
+    fn note(h: *H2Conn) void {
+        const s = &h.session;
+        h.accepting.store(s.broken == null and s.goaway == null, .release);
+        h.limit.store(s.conn.remote_settings.max_concurrent_streams orelse std.math.maxInt(u32), .release);
+    }
+
+    /// Release the session lock, after `note`.
+    fn unlock(h: *H2Conn) void {
+        note(h);
+        h.sync.unlock();
+    }
+
+    /// A new exchange `Conn` on the h2 connection `phys`, or null when the
+    /// session takes no new stream (dead, GOAWAY, at its limit).
+    fn openStream(phys: *Conn) Error!?*Conn {
+        const c = phys.client;
+        const h = phys.h2.?;
+        if (!takesStream(h)) return null;
+        const o = &c.options;
+        const gpa = c.gpa;
+        const conn = try gpa.create(Conn);
+        errdefer gpa.destroy(conn);
+        const slab = try gpa.alloc(u8, o.max_head_bytes + body_scratch_len);
+        errdefer gpa.free(slab);
+        const st = try gpa.create(H2Stream);
+        conn.* = .{
+            .client = c,
+            .stream = phys.stream,
+            .sr = undefined,
+            .sw = undefined,
+            .tls_client = null,
+            .slab = slab,
+            .head_buf = slab[0..o.max_head_bytes],
+            .body_buf = slab[o.max_head_bytes..],
+            .body = .unset,
+            .origin = phys.origin,
+            .h2 = h,
+            .parent = phys,
+            .h2_stream = st,
+        };
+        st.* = .{
+            .conn = conn,
+            .shared = h,
+            .body = .{ .vtable = &.{ .stream = bodyStream }, .buffer = conn.body_buf, .seek = 0, .end = 0 },
+            .upload = .{ .vtable = &.{ .drain = uploadDrain, .flush = uploadFlush }, .buffer = conn.body_buf },
+        };
+        _ = h.refs.fetchAdd(1, .monotonic);
+        _ = h.streams.fetchAdd(1, .monotonic);
+        return conn;
+    }
+
+    /// Drop one reference to the shared connection; true at the last one
+    /// (the caller tears the connection down).
+    fn unref(h: *H2Conn) bool {
+        return h.refs.fetchSub(1, .acq_rel) == 1;
+    }
+
+    /// The connection `conn` (no exchange) let go of by the pool: torn
+    /// down once no exchange runs on it. False: still in use.
+    fn destroy(conn: *Conn) bool {
         const h = conn.h2.?;
+        if (!unref(h)) return false;
         h.session.deinit();
         conn.client.gpa.destroy(h);
         conn.h2 = null;
+        return true;
+    }
+
+    /// An exchange `Conn` is done: its stream ended (`release`) or not,
+    /// its references dropped. Frees the stream state; the caller frees the
+    /// `Conn`, and tears the connection down when this returns true.
+    fn destroyStream(conn: *Conn) bool {
+        const st = conn.h2_stream.?;
+        const h = st.shared;
+        if (st.sid != null) _ = release(conn);
+        conn.client.gpa.destroy(st);
+        conn.h2_stream = null;
+        _ = h.streams.fetchSub(1, .monotonic);
+        if (!unref(h)) return false;
+        h.session.deinit();
+        conn.client.gpa.destroy(h);
+        conn.parent.?.h2 = null;
+        return true;
     }
 
     fn exchange(conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, body: ?[]const u8, strip_sensitive: bool, ask_gzip: bool) Error!h1.ResponseHead {
-        const h = conn.h2.?;
+        const st = conn.h2_stream.?;
         var head: Rendered = try .init(conn, method, method_token, url, headers, plan, strip_sensitive, ask_gzip);
         defer head.deinit();
-        h.begin();
+        begin(st);
         // An empty or absent body: END_STREAM on the HEADERS frame.
-        h.sid = h.session.request(method, head.target, .{
-            .method_token = if (method == .other) method_token else "",
-            .scheme = @tagName(url.scheme),
-            .authority = head.authority,
-            .headers = head.fields,
-            .body = body,
-        }) catch |err| return fail(h, err);
-        return awaitHead(h);
+        {
+            st.shared.sync.lock();
+            defer unlock(st.shared);
+            st.sid = st.shared.session.request(method, head.target, .{
+                .method_token = if (method == .other) method_token else "",
+                .scheme = @tagName(url.scheme),
+                .authority = head.authority,
+                .headers = head.fields,
+                .body = body,
+            }) catch |err| return fail(st, err);
+        }
+        return awaitHead(st);
+    }
+
+    /// A new exchange: forget the last one's outcome.
+    fn begin(st: *H2Stream) void {
+        st.done = false;
+        st.failure = null;
+        st.upload.end = 0;
     }
 
     fn openUpload(conn: *Conn, method: http.Method, method_token: []const u8, url: http.Url, headers: []const http.Header, plan: BodyPlan, ask_gzip: bool) Error!void {
-        const h = conn.h2.?;
+        const st = conn.h2_stream.?;
         var head: Rendered = try .init(conn, method, method_token, url, headers, plan, false, ask_gzip);
         defer head.deinit();
-        h.begin();
-        h.sid = h.session.openStream(method, head.target, .{
+        begin(st);
+        st.shared.sync.lock();
+        defer unlock(st.shared);
+        st.sid = st.shared.session.openStream(method, head.target, .{
             .method_token = if (method == .other) method_token else "",
             .scheme = @tagName(url.scheme),
             .authority = head.authority,
             .headers = head.fields,
-        }) catch |err| return fail(h, err);
+        }) catch |err| return fail(st, err);
     }
 
     fn uploadWriter(conn: *Conn) *std.Io.Writer {
-        return &conn.h2.?.upload;
+        return &conn.h2_stream.?.upload;
     }
 
     fn finishUpload(conn: *Conn) Error!h1.ResponseHead {
-        const h = conn.h2.?;
-        if (h.failure) |f| return f;
-        h.upload.flush() catch return h.failure orelse error.WriteFailed;
-        h.session.closeSend(h.sid.?) catch |err| return fail(h, err);
-        return awaitHead(h);
+        const st = conn.h2_stream.?;
+        if (st.failure) |f| return f;
+        st.upload.flush() catch return st.failure orelse error.WriteFailed;
+        {
+            st.shared.sync.lock();
+            defer unlock(st.shared);
+            st.shared.session.closeSend(st.sid.?) catch |err| return fail(st, err);
+        }
+        return awaitHead(st);
     }
 
     /// Frame the response body: none after a HEAD or when the HEADERS frame
     /// ended the stream, else the stream's DATA.
     fn setupBodyH2(conn: *Conn, method: http.Method) void {
-        const h = conn.h2.?;
-        const sid = h.sid.?;
-        h.body.seek = 0;
-        h.body.end = 0;
-        if (method == .head or (h.session.ended(sid) and h.session.unreadLen(sid) == 0)) {
+        const st = conn.h2_stream.?;
+        const sid = st.sid.?;
+        st.body.seek = 0;
+        st.body.end = 0;
+        const s = &st.shared.session;
+        st.shared.sync.lock();
+        const empty = s.ended(sid) and s.unreadLen(sid) == 0;
+        unlock(st.shared);
+        if (method == .head or empty) {
             conn.body = .{ .none = .fixed("") };
-            h.done = true;
+            st.done = true;
         } else {
-            conn.body = .{ .h2 = &h.body };
+            conn.body = .{ .h2 = &st.body };
         }
     }
 
     fn drained(conn: *const Conn) bool {
-        const h = conn.h2.?;
-        return h.done and h.failure == null;
+        const st = conn.h2_stream.?;
+        return st.done and st.failure == null;
     }
 
     fn readFailure(conn: *const Conn) ?Error {
-        return conn.h2.?.failure;
+        return conn.h2_stream.?.failure;
     }
 
     fn trailer(conn: *const Conn, name: []const u8) ?[]const u8 {
-        const h = conn.h2.?;
+        const st = conn.h2_stream.?;
         // Like Go: the values are there after the body's EOF, not before,
         // even when the trailer section arrived with the first frames.
-        if (!h.done) return null;
-        const hl = h.session.trailers(h.sid orelse return null) orelse return null;
+        if (!st.done) return null;
+        st.shared.sync.lock();
+        defer unlock(st.shared);
+        const hl = st.shared.session.trailers(st.sid orelse return null) orelse return null;
         for (hl.fields) |f| {
             if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
         }
@@ -2365,19 +2554,34 @@ const h2glue = struct {
     /// is reset (RST_STREAM CANCEL, as Go does for a body closed early).
     /// Whether the connection can take another request.
     fn release(conn: *Conn) bool {
-        const h = conn.h2.?;
-        if (h.sid) |sid| {
-            const finished = h.session.ended(sid) and h.session.unreadLen(sid) == 0 and h.session.sendEnded(sid);
-            if (finished) h.session.release(sid) else h.session.cancel(sid, .cancel);
-            h.sid = null;
+        const st = conn.h2_stream.?;
+        const h = st.shared;
+        h.sync.lock();
+        defer unlock(h);
+        const s = &h.session;
+        if (st.sid) |sid| {
+            const finished = s.ended(sid) and s.unreadLen(sid) == 0 and s.sendEnded(sid);
+            if (finished) s.release(sid) else s.cancel(sid, .cancel);
+            st.sid = null;
         }
+        return s.broken == null and s.goaway == null;
+    }
+
+    /// Whether the session of the h2 connection `conn` is still usable.
+    fn usable(conn: *Conn) bool {
+        const h = conn.h2.?;
+        h.sync.lock();
+        defer h.sync.unlock();
         return h.session.broken == null and h.session.goaway == null;
     }
 
-    fn awaitHead(h: *H2Conn) Error!h1.ResponseHead {
-        const head = h.session.awaitHead(h.sid.?) catch |err| return fail(h, err);
-        return headFromFields(head.status, head.headers.fields, h.conn.head_buf) catch |err| {
-            h.failure = err;
+    fn awaitHead(st: *H2Stream) Error!h1.ResponseHead {
+        const h = st.shared;
+        h.sync.lock();
+        defer unlock(h);
+        const head = h.session.awaitHead(st.sid.?) catch |err| return fail(st, err);
+        return headFromFields(head.status, head.headers.fields, st.conn.head_buf) catch |err| {
+            st.failure = err;
             return err;
         };
     }
@@ -2418,9 +2622,9 @@ const h2glue = struct {
         return true;
     }
 
-    fn fail(h: *H2Conn, err: h2_client.Error) Error {
-        const e = mapError(h.conn, err);
-        h.failure = e;
+    fn fail(st: *H2Stream, err: h2_client.Error) Error {
+        const e = mapError(st.shared.conn, err);
+        st.failure = e;
         return e;
     }
 
@@ -2437,6 +2641,8 @@ const h2glue = struct {
             error.ProtocolError, error.MalformedResponse, error.UnknownStream, error.SendClosed => error.MalformedResponse,
             error.InvalidHeader => error.InvalidHeader,
             error.BodyTooLarge => error.BodyTooLarge,
+            // A task canceled while it waited on the shared session.
+            error.Canceled => error.Canceled,
             error.OutOfMemory => error.OutOfMemory,
             // `readBody` with an empty buffer; the body reader never passes one.
             error.EmptyBuffer => error.ReadFailed,
@@ -2454,13 +2660,16 @@ const h2glue = struct {
     }
 
     fn bodyStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const h: *H2Conn = @alignCast(@fieldParentPtr("body", r));
+        const h: *H2Stream = @alignCast(@fieldParentPtr("body", r));
         if (h.failure != null) return error.ReadFailed;
         if (h.done) return error.EndOfStream;
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
-        const n = h.session.readBody(h.sid.?, dest) catch |err| {
-            h.failure = mapError(h.conn, err);
+        h.shared.sync.lock();
+        const got = h.shared.session.readBody(h.sid.?, dest);
+        unlock(h.shared);
+        const n = got catch |err| {
+            h.failure = mapError(h.shared.conn, err);
             return error.ReadFailed;
         };
         if (n == 0) {
@@ -2472,7 +2681,7 @@ const h2glue = struct {
     }
 
     fn uploadDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const h: *H2Conn = @alignCast(@fieldParentPtr("upload", w));
+        const h: *H2Stream = @alignCast(@fieldParentPtr("upload", w));
         var total = w.end;
         try send(h, w.buffered());
         for (data[0 .. data.len - 1]) |d| {
@@ -2488,15 +2697,17 @@ const h2glue = struct {
     }
 
     fn uploadFlush(w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const h: *H2Conn = @alignCast(@fieldParentPtr("upload", w));
+        const h: *H2Stream = @alignCast(@fieldParentPtr("upload", w));
         try send(h, w.buffered());
         w.end = 0;
     }
 
-    fn send(h: *H2Conn, bytes: []const u8) std.Io.Writer.Error!void {
+    fn send(h: *H2Stream, bytes: []const u8) std.Io.Writer.Error!void {
         if (bytes.len == 0) return;
-        h.session.sendData(h.sid.?, bytes, false) catch |err| {
-            h.failure = mapError(h.conn, err);
+        h.shared.sync.lock();
+        defer unlock(h.shared);
+        h.shared.session.sendData(h.sid.?, bytes, false) catch |err| {
+            h.failure = mapError(h.shared.conn, err);
             return error.WriteFailed;
         };
     }
@@ -2759,9 +2970,21 @@ const Pool = struct {
             var match_idx: ?usize = null;
             for (p.idle.items, 0..) |it, idx| {
                 if (h1_only and it.conn.h2 != null) continue;
+                // An h2 connection that takes no new stream (dead, GOAWAY,
+                // at the server's limit) is passed by: the caller dials.
+                if (it.conn.h2) |h| if (!h2Accepts(h)) continue;
                 if (it.conn.origin.eql(scheme, host, port)) match_idx = idx;
             }
-            if (match_idx) |idx| found = p.idle.orderedRemove(idx).conn;
+            if (match_idx) |idx| {
+                const it = &p.idle.items[idx];
+                if (it.conn.h2) |h| {
+                    // Shared: it stays in the pool for the next request,
+                    // pinned for this one (`Conn.destroy` drops the pin).
+                    _ = h.refs.fetchAdd(1, .monotonic);
+                    it.idle_since_ms = now_ms;
+                    found = it.conn;
+                } else found = p.idle.orderedRemove(idx).conn;
+            }
         }
         for (reap_buf[0..reap_n]) |c| c.destroy();
         return found;
@@ -2885,6 +3108,15 @@ fn checkoutConn(
     while (true) {
         switch (try p.checkout(url.scheme, url.host, url.port, c.nowMs(), take_idle, h1_only)) {
             .idle => |conn| {
+                if (conn.h2 != null) {
+                    // A shared h2 connection, still in the pool and pinned
+                    // for us: an exchange of its own on it, then the pin
+                    // goes (the exchange holds its own reference).
+                    defer conn.destroy();
+                    const ex = (try c.options.http2.?.vt.open_stream(conn)) orelse continue;
+                    reused.* = true;
+                    return ex;
+                }
                 reused.* = true;
                 return conn;
             },
@@ -2901,6 +3133,16 @@ fn checkoutConn(
                     return err;
                 };
                 conn.holds_slot = counted;
+                if (conn.h2 != null) {
+                    const ex = c.h2Exchange(conn) catch |err| {
+                        conn.destroy();
+                        return err;
+                    } orelse {
+                        conn.destroy();
+                        return error.ConnectionClosed;
+                    };
+                    return ex;
+                }
                 return conn;
             },
             .wait => |epoch| {
@@ -2915,6 +3157,21 @@ fn checkoutConn(
             },
         }
     }
+}
+
+/// Whether the h2 connection `h` takes a new stream, as last seen
+/// (`h2glue.note`): read under the pool's lock, so no session lock here.
+fn h2Accepts(h: *const H2Conn) bool {
+    return h.accepting.load(.acquire) and h.streams.load(.acquire) < h.limit.load(.acquire);
+}
+
+/// An exchange `Conn` on the freshly dialed h2 connection `phys`
+/// (`h2glue.openStream`), `phys` handed to the pool (or let go of, without
+/// one); null when the session takes no new stream.
+fn h2Exchange(c: *Client, phys: *Conn) Error!?*Conn {
+    const ex = (try c.options.http2.?.vt.open_stream(phys)) orelse return null;
+    if (c.options.pool.enabled) c.pool.release(phys, c.nowMs()) else phys.destroy();
+    return ex;
 }
 
 /// `acquireConn`'s plaintext-only twin: same pool checkout, but a miss dials
@@ -3984,6 +4241,7 @@ test "readResponseHead: a bounded run of interim 1xx heads is skipped, an endles
     var head_buf: [512]u8 = undefined;
     var conn: Conn = undefined;
     conn.tls_client = null;
+    conn.parent = null;
     conn.head_buf = &head_buf;
     conn.sr = undefined;
 
@@ -4013,6 +4271,7 @@ test "setupBody framing decisions on fabricated heads" {
     var body_buf: [64]u8 = undefined;
     var conn: Conn = undefined;
     conn.tls_client = null;
+    conn.parent = null;
     conn.body_buf = &body_buf;
     // plainReader() would hand out conn.sr; give it a fixed reader instead.
     conn.sr = undefined;
@@ -8198,6 +8457,143 @@ test "http2: gzip decoding and a streamed upload" {
     try testing.expectEqual(@as(usize, 1), client.dialCount());
 }
 
+/// Runs each h2 handler on its own thread (joined by `join` once the server
+/// is down), so one connection's streams are answered at once.
+const H2ThreadDispatcher = struct {
+    threads: [64]std.Thread = undefined,
+    n: std.atomic.Value(usize) = .init(0),
+
+    fn iface(d: *H2ThreadDispatcher) Server.H2Dispatcher {
+        return .{ .ctx = d, .spawn = spawn, .max_concurrent_handlers = 16 };
+    }
+
+    fn spawn(ctx: ?*anyopaque, task: Server.H2Task) bool {
+        const d: *H2ThreadDispatcher = @ptrCast(@alignCast(ctx.?));
+        const i = d.n.load(.monotonic);
+        if (i == d.threads.len) return false;
+        d.threads[i] = std.Thread.spawn(.{}, run, .{task}) catch return false;
+        d.n.store(i + 1, .release);
+        return true;
+    }
+
+    fn run(task: Server.H2Task) void {
+        task.func(task.ctx);
+    }
+
+    fn join(d: *H2ThreadDispatcher) void {
+        for (d.threads[0..d.n.load(.acquire)]) |t| t.join();
+    }
+};
+
+var mx_fast_done: std.atomic.Value(bool) = .init(false);
+var mx_io: std.Io = undefined;
+
+/// `/slow` answers once `/fast` has been (or after 5 s, 504).
+fn mxHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/fast")) {
+        try rw.writeAll("fast");
+        mx_fast_done.store(true, .release);
+        return;
+    }
+    if (std.mem.eql(u8, req.path, "/slow")) {
+        var waited: usize = 0;
+        while (!mx_fast_done.load(.acquire)) : (waited += 1) {
+            if (waited == 1000) {
+                rw.setStatus(504);
+                return rw.writeAll("slow alone");
+            }
+            mx_io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
+        return rw.writeAll("slow");
+    }
+    try rw.writeAll("hello");
+}
+
+const MxCaller = struct {
+    client: *Client,
+    url: []const u8,
+    rounds: usize = 1,
+    status: u16 = 0,
+    body: [16]u8 = undefined,
+    len: usize = 0,
+    failed: ?anyerror = null,
+
+    fn run(m: *MxCaller) void {
+        for (0..m.rounds) |_| {
+            var res = m.client.request(.get, m.url, .{}) catch |e| {
+                m.failed = e;
+                return;
+            };
+            defer res.deinit();
+            m.status = res.status;
+            const b = res.readAllAlloc(testing.allocator, 64) catch |e| {
+                m.failed = e;
+                return;
+            };
+            defer testing.allocator.free(b);
+            m.len = @min(b.len, m.body.len);
+            @memcpy(m.body[0..m.len], b[0..m.len]);
+        }
+    }
+};
+
+test "http2: concurrent requests to one origin share its h2 connection as streams (Go's Transport)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    mx_io = io;
+    mx_fast_done.store(false, .release);
+    var td: H2ThreadDispatcher = .{};
+    var server = Server.init(io, gpa, .{ .handler = mxHandler, .enable_h2c = true, .h2_dispatcher = td.iface() });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const st = try std.Thread.spawn(.{}, h2ServeWrap, .{&server});
+    defer td.join();
+    defer st.join();
+    defer server.shutdown();
+    var url_buf: [3][64]u8 = undefined;
+    const port = server.boundAddress().getPort();
+    const root = try std.mem.print(&url_buf[0], "http://127.0.0.1:{d}/", .{port});
+    const slow_url = try std.mem.print(&url_buf[1], "http://127.0.0.1:{d}/slow", .{port});
+    const fast_url = try std.mem.print(&url_buf[2], "http://127.0.0.1:{d}/fast", .{port});
+
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 10_000 });
+    defer client.deinit();
+    try primeH2c(&client, root);
+
+    // The slow request is in flight (its response waits for the fast one)
+    // while the fast one runs on the same connection.
+    var slow: MxCaller = .{ .client = &client, .url = slow_url };
+    var fast: MxCaller = .{ .client = &client, .url = fast_url };
+    const ts = try std.Thread.spawn(.{}, MxCaller.run, .{&slow});
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    const tf = try std.Thread.spawn(.{}, MxCaller.run, .{&fast});
+    tf.join();
+    ts.join();
+    try testing.expectEqual(@as(?anyerror, null), fast.failed);
+    try testing.expectEqual(@as(?anyerror, null), slow.failed);
+    try testing.expectEqual(@as(u16, 200), fast.status);
+    try testing.expectEqualStrings("fast", fast.body[0..fast.len]);
+    try testing.expectEqual(@as(u16, 200), slow.status);
+    try testing.expectEqualStrings("slow", slow.body[0..slow.len]);
+
+    // Eight tasks, five requests each: every one on the one connection.
+    var callers: [8]MxCaller = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&callers, &threads) |*m, *t| {
+        m.* = .{ .client = &client, .url = root, .rounds = 5 };
+        t.* = try std.Thread.spawn(.{}, MxCaller.run, .{m});
+    }
+    for (threads) |t| t.join();
+    for (callers) |m| {
+        try testing.expectEqual(@as(?anyerror, null), m.failed);
+        try testing.expectEqualStrings("hello", m.body[0..m.len]);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+}
+
 test "http2: an upgrade request never takes an h2 connection" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -8269,7 +8665,9 @@ test "http2: a session that saw GOAWAY or broke is not reused" {
             1 => s.goaway = .{ .last_stream_id = 0, .code = .no_error },
             else => s.broken = error.ProtocolError,
         }
-        try testing.expectEqual(case == 0, h2glue.release(conn));
+        try testing.expectEqual(case == 0, h2glue.usable(conn));
+        // A checkout passes a dead one by: no exchange opens on it.
+        if (case != 0) try testing.expectEqual(@as(?*Conn, null), try h2glue.openStream(conn));
     }
 }
 
