@@ -46,6 +46,8 @@ pub const meta = .{
 
 pub const three_way = @import("three_way.zig");
 pub const fsm = @import("fsm.zig");
+pub const restart = @import("restart.zig");
+pub const adj_sid = @import("adj_sid.zig");
 
 // ── the most-used surface, re-exported ───────────────────────────────────────
 pub const Adjacency = fsm.Adjacency;
@@ -56,6 +58,12 @@ pub const Transition = fsm.Transition;
 pub const DownReason = fsm.DownReason;
 pub const RejectReason = fsm.RejectReason;
 pub const HelloFields = fsm.HelloFields;
+pub const Usage = fsm.Usage;
+pub const HelloPadding = fsm.HelloPadding;
+pub const Counters = fsm.Counters;
+pub const Restart = fsm.Restart;
+pub const AdjSid = fsm.AdjSid;
+pub const addPadding = fsm.addPadding;
 pub const RxHello = fsm.RxHello;
 pub const Time = fsm.Time;
 pub const SystemId = fsm.SystemId;
@@ -421,7 +429,12 @@ fn fuzzRx(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         if (adj.rxHelloBytes(input, now)) |eff| {
             RxMark.mark(.accepted);
             markEffect(eff);
-            if (eff.rejected != null) try std.testing.expect(std.meta.eql(before, adj));
+            if (eff.rejected != null) {
+                // Inert apart from the refusal counters.
+                var same = adj;
+                same.counters = before.counters;
+                try std.testing.expect(std.meta.eql(before, same));
+            }
             if (eff.transition) |t| {
                 try std.testing.expectEqual(before.currentState(), t.from);
                 try std.testing.expectEqual(adj.currentState(), t.to);
@@ -499,4 +512,7 @@ test {
     _ = @import("fsm.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("auth_test.zig");
+    _ = @import("extra_test.zig");
+    _ = @import("restart.zig");
+    _ = @import("adj_sid.zig");
 }

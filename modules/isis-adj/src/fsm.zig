@@ -24,6 +24,11 @@
 const std = @import("std");
 const isis = @import("isis");
 const three_way = @import("three_way.zig");
+const restart_mod = @import("restart.zig");
+const adj_sid = @import("adj_sid.zig");
+
+pub const Restart = restart_mod.Restart;
+pub const AdjSid = adj_sid.AdjSid;
 
 pub const ThreeWayState = three_way.ThreeWayState;
 pub const ThreeWayTlv = three_way.ThreeWayTlv;
@@ -155,6 +160,51 @@ pub const RejectReason = enum {
     /// Key ID, an unknown authentication type, or a malformed #10. RFC 5304
     /// §2 / RFC 5310 §3.5: the PDU is discarded.
     auth_failed,
+    /// `Config.protocols` is set and the neighbour's Protocols Supported (#129)
+    /// shares no NLPID with it (RFC 1195 section 2.2: a router must not form
+    /// an adjacency with a neighbour with which it has no protocol in common).
+    /// A neighbour that sends no #129 is taken to support CLNP only (0x81,
+    /// ISO 10589).
+    no_common_protocol,
+};
+
+/// Which levels an adjacency is used for (ISO/IEC 10589 section 8.2.2: the
+/// "Adjacency Usage"). It is a result of the level masks of both sides and of
+/// the area check, not a configuration, so a `.level1_2` circuit whose
+/// neighbour shares no area is a Level 2 adjacency, not a refused one.
+pub const Usage = enum {
+    level1,
+    level2,
+    level1_2,
+};
+
+/// When hellos are padded to `Config.mtu` with Padding (#8) TLVs (ISO 10589
+/// section 8.4.1: the hello is the test that the link carries full-size
+/// PDUs). FRR's `isis hello padding` has the same three settings.
+pub const HelloPadding = enum {
+    /// Never pad (the default, and what hellos looked like before the option).
+    never,
+    /// Pad every hello.
+    always,
+    /// Pad while the adjacency is not Up, then stop (RFC 3787 section 4.2's
+    /// recommendation: the bandwidth is spent only on proving the MTU).
+    during_formation,
+};
+
+/// ISO/IEC 10589 circuit and adjacency counters kept per `Adjacency`.
+pub const Counters = struct {
+    /// Transitions into or out of Up (adjacencyChanges).
+    adjacency_changes: u32 = 0,
+    /// Adjacencies that went from Initializing to Down without reaching Up
+    /// (initFails).
+    init_fails: u32 = 0,
+    /// IIHs accepted into the machine (including state-neutral ones).
+    hellos_accepted: u32 = 0,
+    /// Hold timer expiries.
+    hold_expirations: u32 = 0,
+    /// Refused IIHs, in total and per reason.
+    rejected_total: u32 = 0,
+    rejected: std.EnumArray(RejectReason, u32) = .initFill(0),
 };
 
 pub const Transition = struct { from: State, to: State };
@@ -243,6 +293,27 @@ pub const Config = struct {
     /// slice and every `secret` must outlive the `Adjacency`, and the caller
     /// wipes the secrets (`isis.auth.Key`).
     auth_keys: []const isis.auth.Key = &.{},
+    /// Our supported NLPIDs, sent as a Protocols Supported (#129) TLV
+    /// (0xCC IPv4, 0x8E IPv6, 0x81 CLNP). Empty (the default): no #129 is sent
+    /// and nothing is enforced. Non-empty: the TLV is added to every hello and a
+    /// neighbour sharing no NLPID is refused (`RejectReason.no_common_protocol`).
+    /// Borrowed.
+    protocols: []const u8 = &.{},
+    /// See `HelloPadding`.
+    hello_padding: HelloPadding = .never,
+    /// The size a padded hello is brought to: the circuit's MTU (the hello is
+    /// the whole link-layer payload, so use the largest PDU the circuit carries).
+    mtu: u16 = 1492,
+    /// RFC 5306 helper (neighbour) side. Off (the default): hellos are
+    /// processed as before and carry no Restart TLV. On: every hello carries a
+    /// Restart TLV (section 3.2: "MUST include this TLV") and a hello with RR
+    /// from the Up neighbour is helped (see `Adjacency.rxHello`).
+    graceful_restart_helper: bool = false,
+    /// A local Adj-SID label (RFC 8667 section 2.2) the adjacency owns while
+    /// it is Up, see `Adjacency.adjSid`. Null: none.
+    adj_sid_label: ?u20 = null,
+    /// The P flag of that SID: the value survives a restart.
+    adj_sid_persistent: bool = true,
 };
 
 /// Everything needed to build an outgoing P2P IIH, returned by the FSM so it
@@ -263,6 +334,13 @@ pub const HelloFields = struct {
     /// The key `buildHello` signs with (`Config.auth_keys[0]`), or `null`
     /// for an unauthenticated IIH.
     auth: ?isis.auth.Key = null,
+    /// `Config.protocols`, for a #129 TLV; empty adds none.
+    protocols: []const u8 = &.{},
+    /// Bring the hello to this many octets with Padding (#8) TLVs; 0 = none.
+    /// `buildHello` pads before it signs (RFC 5310 section 3.2).
+    pad_to: u16 = 0,
+    /// The Restart TLV to send; null = none.
+    restart: ?Restart = null,
 };
 
 /// A received P2P IIH reduced to the fields the FSM reasons about. Produced from
@@ -296,6 +374,11 @@ pub const RxHello = struct {
     /// speaking three-way (or omitted it): we can hear it but can never confirm
     /// the loop guard from it, so it can raise us at most to Initializing.
     three_way: ?ThreeWayTlv = null,
+    /// The neighbour's Protocols Supported (#129) value (raw NLPID octets), if
+    /// it sent the TLV.
+    neighbor_protocols: ?[]const u8 = null,
+    /// The neighbour's Restart TLV (#211), if present.
+    restart: ?Restart = null,
 };
 
 /// What changed as a result of an event. All fields are independent: a single
@@ -312,9 +395,21 @@ pub const Effect = struct {
     send_hello: ?HelloFields = null,
     /// A received IIH was ignored for this reason (no state change).
     rejected: ?RejectReason = null,
+    /// The adjacency usage after this event when it differs from before
+    /// (null at Down); set on the event that brings the adjacency to a usage.
+    usage_changed: bool = false,
+    /// RFC 5306 helper: the neighbour's restart started (true) or ended
+    /// (false) this call; null = no change.
+    restart_mode: ?bool = null,
+    /// The caller should send a complete set of CSNPs and set SRM on every LSP
+    /// of this circuit (RFC 5306 section 3.2.1 c, point-to-point).
+    send_csnp: bool = false,
+    /// The neighbour's SA flag changed to this value: while true the adjacency
+    /// must not be advertised in LSPs nor used in SPF (RFC 5306 section 3.2.2).
+    suppress_adjacency: ?bool = null,
 };
 
-pub const DecodeError = isis.pdu.DecodeError || isis.tlv.Error || three_way.DecodeError;
+pub const DecodeError = isis.pdu.DecodeError || isis.tlv.Error || three_way.DecodeError || restart_mod.DecodeError;
 
 /// One point-to-point adjacency. Single-owner: one caller/loop drives it; it is
 /// lock-free and holds no shared state.
@@ -333,6 +428,13 @@ pub const Adjacency = struct {
     /// The neighbour's 1-octet Local Circuit ID from the IIH it was accepted
     /// with; compared by `Config.detect_circuit_id_change`.
     neighbor_local_circuit_id: ?u8 = null,
+    /// What the adjacency is used for, from the level masks and the area
+    /// check of the IIH it was last accepted with; null at Down.
+    usage: ?Usage = null,
+    /// ISO 10589 counters.
+    counters: Counters = .{},
+    /// RFC 5306 helper state, see `Config.graceful_restart_helper`.
+    helper: restart_mod.HelperState = .{},
 
     /// Absolute deadline (in `now` units) past which the neighbour is considered
     /// gone. Refreshed to `now + neighbour.holding_time` on every accepted IIH.
@@ -368,6 +470,8 @@ pub const Adjacency = struct {
         self.neighbor_system_id = null;
         self.neighbor_ext_circuit_id = null;
         self.neighbor_local_circuit_id = null;
+        self.usage = null;
+        self.helper = .{};
         self.hold_deadline = 0;
         self.next_hello_due = now + self.cfg.hello_interval;
         var eff: Effect = .{ .send_hello = self.helloFields() };
@@ -375,7 +479,7 @@ pub const Adjacency = struct {
             eff.transition = .{ .from = prev, .to = .down };
             if (prev == .up) eff.adjacency_down = .stopped;
         }
-        return eff;
+        return self.note(eff);
     }
 
     /// Administratively tear the circuit down. If it was Up, reports
@@ -387,12 +491,14 @@ pub const Adjacency = struct {
         self.neighbor_system_id = null;
         self.neighbor_ext_circuit_id = null;
         self.neighbor_local_circuit_id = null;
+        self.usage = null;
+        self.helper = .{};
         var eff: Effect = .{};
         if (prev != .down) {
             eff.transition = .{ .from = prev, .to = .down };
             if (prev == .up) eff.adjacency_down = .stopped;
         }
-        return eff;
+        return self.note(eff);
     }
 
     /// The fields for an outgoing IIH reflecting the current state. Our TLV 240
@@ -416,7 +522,51 @@ pub const Adjacency = struct {
             .max_area_addresses = self.cfg.max_area_addresses,
             .three_way = tw,
             .auth = if (self.cfg.auth_keys.len != 0) self.cfg.auth_keys[0] else null,
+            .protocols = self.cfg.protocols,
+            .pad_to = self.padTo(),
+            .restart = if (self.cfg.graceful_restart_helper) .{} else null,
         };
+    }
+
+    fn padTo(self: *const Adjacency) u16 {
+        return switch (self.cfg.hello_padding) {
+            .never => 0,
+            .always => self.cfg.mtu,
+            .during_formation => if (self.state == .up) 0 else self.cfg.mtu,
+        };
+    }
+
+    /// The hello that acknowledges a restart request (RFC 5306 section 3.2.1
+    /// b): the current hello with RR clear, RA set and the time left on the
+    /// neighbour's hold timer (in the caller's unit, capped to 16 bits).
+    fn restartAck(self: *const Adjacency, now: Time) HelloFields {
+        var hf = self.helloFields();
+        const left = self.hold_deadline -| now;
+        hf.restart = .{ .ra = true, .remaining_time = @intCast(@min(left, std.math.maxInt(u16))) };
+        return hf;
+    }
+
+    /// The Adj-SID this adjacency owns right now: only while it is Up and not
+    /// suppressed by the neighbour's SA, and only with `Config.adj_sid_label`.
+    /// The caller carries it in the neighbour's IS reachability entry; it
+    /// withdraws it on `adjacency_down`.
+    pub fn adjSid(self: *const Adjacency) ?AdjSid {
+        const label = self.cfg.adj_sid_label orelse return null;
+        if (self.state != .up or self.helper.suppress) return null;
+        return .{ .sid = .{ .label = label }, .persistent = self.cfg.adj_sid_persistent };
+    }
+
+    /// Fold an `Effect` into `counters`.
+    fn note(self: *Adjacency, eff: Effect) Effect {
+        if (eff.adjacency_up or eff.adjacency_down != null) self.counters.adjacency_changes += 1;
+        if (eff.transition) |t| {
+            if (t.from == .initializing and t.to == .down) self.counters.init_fails += 1;
+        }
+        if (eff.rejected) |r| {
+            self.counters.rejected_total += 1;
+            self.counters.rejected.getPtr(r).* += 1;
+        }
+        return eff;
     }
 
     /// Advance timers. Expires the hold (→ Down) if the deadline has passed, and
@@ -434,15 +584,18 @@ pub const Adjacency = struct {
             self.neighbor_system_id = null;
             self.neighbor_ext_circuit_id = null;
             self.neighbor_local_circuit_id = null;
+            self.usage = null;
+            self.helper = .{};
             eff.transition = .{ .from = prev, .to = .down };
             if (prev == .up) eff.adjacency_down = .hold_expired;
+            self.counters.hold_expirations += 1;
         }
 
         if (now >= self.next_hello_due) {
             eff.send_hello = self.helloFields();
             self.next_hello_due = now + self.cfg.hello_interval;
         }
-        return eff;
+        return self.note(eff);
     }
 
     /// Decode raw P2P IIH bytes with the `isis` codec, extract the fields + TLV
@@ -462,22 +615,27 @@ pub const Adjacency = struct {
         // error left is about #10 itself.
         if (self.cfg.auth_keys.len != 0) {
             _ = isis.auth.verify(bytes, self.cfg.auth_keys) catch |e| switch (e) {
-                error.AuthMissing => return .{ .rejected = .auth_missing },
+                error.AuthMissing => return self.note(.{ .rejected = .auth_missing }),
                 error.KeyNotFound,
                 error.UnsupportedAuthType,
                 error.AuthFailed,
                 error.MalformedAuth,
-                => return .{ .rejected = .auth_failed },
+                => return self.note(.{ .rejected = .auth_failed }),
                 // `P2pHello.decode` and `tlv.count` above already accepted
                 // these bytes, so `verify`'s own decode cannot refuse them;
                 // propagated rather than asserted.
-                error.UnsupportedPduType => return .{ .rejected = .auth_failed },
+                error.UnsupportedPduType => return self.note(.{ .rejected = .auth_failed }),
                 else => |de| return de,
             };
         }
         var tw: ?ThreeWayTlv = null;
         if (try isis.tlv.findFirst(p.tlv_bytes, three_way.tlv_code)) |val| {
             tw = try ThreeWayTlv.decode(val);
+        }
+        const protocols: ?[]const u8 = try isis.tlv.findFirst(p.tlv_bytes, isis.tlvs.code.protocols_supported);
+        var rs: ?Restart = null;
+        if (self.cfg.graceful_restart_helper) {
+            if (try isis.tlv.findFirst(p.tlv_bytes, restart_mod.tlv_code)) |val| rs = try Restart.decode(val);
         }
         // Audit F8: a neighbour may legally split its announced areas across
         // MORE than one Area Addresses (#1) TLV. `findFirst` only ever sees the
@@ -512,6 +670,8 @@ pub const Adjacency = struct {
             .neighbor_area_addresses = area_addresses,
             .neighbor_area_addresses_more = more_buf[0..more_len],
             .three_way = tw,
+            .neighbor_protocols = protocols,
+            .restart = rs,
         }, now);
     }
 
@@ -520,6 +680,10 @@ pub const Adjacency = struct {
     /// returns the resulting `Effect`. Never returns an error — a hello it will
     /// not act on comes back as `Effect.rejected` with the state untouched.
     pub fn rxHello(self: *Adjacency, rx: RxHello, now: Time) Effect {
+        return self.note(self.rxHelloInner(rx, now));
+    }
+
+    fn rxHelloInner(self: *Adjacency, rx: RxHello, now: Time) Effect {
         if (!self.started) return .{ .rejected = .not_started };
 
         // ── acceptance checks (ISO 10589 §8.2, the cheap ones) ──────────────
@@ -551,13 +715,34 @@ pub const Adjacency = struct {
         // sub-states — rejecting a `.level1_2` circuit on an area mismatch
         // would also block the L2 component, which ISO 10589 says must still
         // form. Skipped entirely when `local_areas` is unconfigured.
-        if (self.cfg.circuit_type == .level1 and self.cfg.local_areas.len != 0) {
+        // Adjacency usage (ISO 10589 section 8.2.2): the levels both sides run,
+        // less Level 1 when the areas are disjoint. A `.level1_2` circuit with a
+        // disjoint-area neighbour that runs Level 2 is a Level 2 adjacency; with a
+        // Level-1-only neighbour nothing is left and the IIH is refused.
+        var levels: u2 = @backingInt(rx.circuit_type) & @backingInt(self.cfg.circuit_type);
+        if (levels & 1 != 0 and self.cfg.local_areas.len != 0) {
             if (!self.sharesArea(rx.neighbor_area_addresses) and
                 !self.sharesAreaInAny(rx.neighbor_area_addresses_more))
             {
-                return .{ .rejected = .area_mismatch };
+                levels &= ~@as(u2, 1);
             }
         }
+        if (levels == 0) return .{ .rejected = .area_mismatch };
+        const new_usage: Usage = switch (levels) {
+            1 => .level1,
+            2 => .level2,
+            else => .level1_2,
+        };
+        // Protocols Supported (RFC 1195 section 2.2). No #129 = CLNP only.
+        if (self.cfg.protocols.len != 0) {
+            const theirs = rx.neighbor_protocols orelse &[_]u8{0x81};
+            var common = false;
+            for (self.cfg.protocols) |n| {
+                if (std.mem.indexOfScalar(u8, theirs, n) != null) common = true;
+            }
+            if (!common) return .{ .rejected = .no_common_protocol };
+        }
+        const helping = self.cfg.graceful_restart_helper;
         // One circuit, one neighbour (ISO/IEC 10589 §8.2.4). Once the handshake
         // has COMPLETED, only that system-id drives this adjacency. Checked
         // BEFORE any mutation, so a stranger's IIH refreshes no hold, overwrites
@@ -573,6 +758,32 @@ pub const Adjacency = struct {
                 }
             }
         }
+        // RFC 5306 section 3.2.1 helper: a restart request from the Up neighbour
+        // changes no adjacency state, whatever the rest of the hello says (it
+        // may well carry a Down three-way state: the neighbour lost its
+        // adjacency state, which is the point). Only the first one refreshes
+        // the hold, so a neighbour that keeps restarting cannot keep the
+        // adjacency alive forever; the RA goes out at once and the caller
+        // sends the CSNPs.
+        if (helping and self.state == .up) if (rx.restart) |rs| {
+            if (rs.rr and self.neighbor_system_id != null and std.mem.eql(u8, &self.neighbor_system_id.?, &rx.source_id)) {
+                var eff: Effect = .{};
+                if (!self.helper.restart_mode) {
+                    self.helper.restart_mode = true;
+                    self.hold_deadline = now + @as(Time, rx.holding_time);
+                    eff.restart_mode = true;
+                }
+                if (rx.three_way) |tw| self.neighbor_ext_circuit_id = tw.extended_local_circuit_id;
+                if (rs.sa != self.helper.suppress) {
+                    self.helper.suppress = rs.sa;
+                    eff.suppress_adjacency = rs.sa;
+                }
+                self.counters.hellos_accepted += 1;
+                eff.send_hello = self.restartAck(now);
+                eff.send_csnp = true;
+                return eff;
+            }
+        };
         // RFC 5303 §3.2: a neighbour block that names someone else — or our
         // system on another circuit — means this PDU is not about THIS
         // adjacency at all. Discard it whole, before anything is touched.
@@ -608,6 +819,8 @@ pub const Adjacency = struct {
                         self.neighbor_system_id = null;
                         self.neighbor_ext_circuit_id = null;
                         self.neighbor_local_circuit_id = null;
+                        self.usage = null;
+                        self.helper = .{};
                         self.hold_deadline = 0;
                         var eff: Effect = .{ .transition = .{ .from = prev, .to = .down } };
                         if (prev == .up) eff.adjacency_down = .circuit_id_changed;
@@ -619,6 +832,9 @@ pub const Adjacency = struct {
         }
 
         // ── accepted: refresh hold + record the neighbour ───────────────────
+        const prev_usage = self.usage;
+        self.usage = new_usage;
+        self.counters.hellos_accepted += 1;
         self.hold_deadline = now + @as(Time, rx.holding_time);
         self.neighbor_system_id = rx.source_id;
         self.neighbor_local_circuit_id = rx.local_circuit_id;
@@ -679,6 +895,28 @@ pub const Adjacency = struct {
         // Audit F12: tell the neighbour about the new state now, not at the
         // next `hello_interval`.
         if (self.cfg.triggered_hello and eff.transition != null) eff.send_hello = self.helloFields();
+        eff.usage_changed = prev_usage != self.usage;
+        if (helping) {
+            // The neighbour's restart is over when it sends a hello without RR
+            // (section 3.2.1: normal processing resumes, done above).
+            const rs: Restart = rx.restart orelse .{};
+            if (self.helper.restart_mode and !rs.rr) {
+                self.helper.restart_mode = false;
+                eff.restart_mode = false;
+            }
+            if (rs.sa != self.helper.suppress) {
+                self.helper.suppress = rs.sa;
+                eff.suppress_adjacency = rs.sa;
+            }
+            // An RR from a neighbour with no Up adjacency: process normally
+            // (done) and answer with an RA anyway so that it does not wait out
+            // its timer (section 3.2.1, last paragraph).
+            if (rs.rr) {
+                var ack = self.helloFields();
+                ack.restart = .{ .ra = true, .remaining_time = self.cfg.holding_time };
+                eff.send_hello = ack;
+            }
+        }
         return eff;
     }
 
@@ -766,6 +1004,12 @@ pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong
         error.BufferTooSmall => return error.BufferTooSmall,
         error.ValueTooLong => return error.ValueTooLong,
     };
+    if (f.protocols.len != 0) try b.tlvs.addTlv(isis.tlvs.code.protocols_supported, f.protocols);
+    if (f.restart) |r| {
+        var rbuf: [Restart.max_len]u8 = undefined;
+        try b.tlvs.addTlv(restart_mod.tlv_code, r.encode(&rbuf));
+    }
+    if (f.pad_to != 0) try addPadding(&b.tlvs, isis.pdu.p2p_iih_fixed_len, f.pad_to);
     const n = b.finish().len;
     if (f.auth) |k| {
         // Our own freshly built P2P IIH with `k`'s placeholder: `sign` finds
@@ -774,6 +1018,21 @@ pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong
         isis.auth.sign(buf[0..n], k) catch return error.MalformedTlv;
     }
     return buf[0..n];
+}
+
+/// Append Padding (#8) TLVs until a PDU with `fixed` octets of header reaches
+/// `pad_to` octets. A PDU already that long gets none; a single missing octet
+/// cannot be filled (a TLV is at least two octets).
+pub fn addPadding(b: *isis.tlv.Builder, fixed: usize, pad_to: usize) error{ BufferTooSmall, ValueTooLong }!void {
+    const zeros: [255]u8 = @splat(0);
+    var rem: usize = pad_to -| (fixed + b.written().len);
+    while (rem >= 2) {
+        var chunk: usize = @min(rem - 2, 255);
+        // Never leave a remainder of one octet.
+        if (rem - chunk - 2 == 1) chunk -= 1;
+        try b.addTlv(isis.tlvs.code.padding, zeros[0..chunk]);
+        rem -= chunk + 2;
+    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
