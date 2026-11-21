@@ -32,7 +32,7 @@ Surveyed 2026-09-30 and re-surveyed against beevik/ntp v1.6.0 on 2026-11-02 per 
 | `RootDistance`, `MinError` | done: `QueryResult.rootDistanceNanos`, `Sample.minErrorNanos`; `rootDelayNanos`, `rootDispersionNanos`, `pollSeconds`, `precisionSeconds` |
 | `ReferenceString` | done: `Packet.referenceText` |
 | `Validate` (stratum, KoD, freshness 36 h, root distance 16 s, transmit before reference, leap 3) | done: `decodeResponse` + `checkSynchronization`; `query` runs both (`check_sync`, default on) |
-| server ticked backwards (T2 > T3) | done: `TransmitBeforeReceive` |
+| server ticked backwards (T2 > T3) | done: `TransmitBeforeReceive`, as beevik's `Validate` does; a coarse-clock server whose T2 and T3 straddle a tick in the wrong order after truncation would trip it, `check_sync = false` is the opt-out (none of chronyd 4.8's replies did) |
 | era handling (v4 timestamp before 1970 reads as era 1) | done and better: offsets are era-modulo (`Timestamp.diffNanos`), plus `toUnixNanosInferEra` and `toUnixNanosNear(pivot)` |
 | origin cookie check | done (32 CSPRNG bits, fail-closed; beevik 64 bits). Ours keeps `t1.seconds` on the wire; the cookie is 32 bits, a documented trade-off for a plausible request time |
 | symmetric-key auth MD5, SHA-1, SHA-256, SHA-512, AES-128/256-CMAC, crypto-NAK | done: `Auth` / `QueryOptions.auth`, std crypto only |
@@ -178,8 +178,7 @@ scripted loopback "server" tests skip themselves when the sandbox refuses a loop
 ## Backlog / deferred
 
 - **TTL/DSCP option:** `std.Io.net.BindOptions` offers no socket option (checked in Zig 0.17.0 `std/Io/net.zig`; not a zig-libs module gap); revisit when std grows one.
-- **Not measured for the "fastest" mark:** Rust sntpc and ntpd-rs (no crate in the cargo registry on the measuring host, offline), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`.
-- **`TransmitBeforeReceive` could refuse a coarse-clock server** whose T2 and T3 straddle a tick in the wrong order after truncation; `query` has `check_sync = false` for it. Revisit if a real server trips it (none of chronyd 4.8's replies did).
+- **Not measured for the "fastest" mark:** Rust sntpc and ntpd-rs (crates.io is reachable now: sntpc 0.11.0 is MIT OR Apache-2.0; needs an in-memory `NtpUdpSocket` harness like `go_bench`), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`.
 
 
 ## Anchoring
