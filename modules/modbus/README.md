@@ -124,7 +124,7 @@ packets.
 
 ## Not provided
 
-ASCII framing, TLS / Modbus Security and UDP variants, serial t1.5/t3.5 timing and a built-in TCP accept loop are left out by design, and FC 0x14/0x15 file records and FC 0x18 read FIFO are not implemented on either side; see SPEC *What is deliberately not done* and *Backlog / deferred*.
+ASCII framing, TLS / Modbus Security and UDP variants, serial t1.5/t3.5 timing and a built-in TCP accept loop are left out by design, and FC 0x14/0x15 file records and FC 0x18 read FIFO are not implemented on either side; see SPEC *What is deliberately not done*.
 
 Provenance: clean-room from the public Modbus Application Protocol
 Specification V1.1b3 and Modbus over Serial Line Specification V1.02

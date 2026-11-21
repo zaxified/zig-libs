@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [pymodbus](https://github.com/pymodbus-dev/pymodbus) | Python | NOASSERTION per API (BSD-style, inferred) | 2.8k | v3.15.0 (2026-08-13) | Full-featured, incl. device identification; used here as the black-box interop peer (`goldens.zig`). Source not read. |
 | [just-some-entity/modbus-zig](https://github.com/just-some-entity/modbus-zig) | Zig | GPL-3.0 | 0 | push 2026-01-27 | The only Zig Modbus repository found by search; copyleft, no adoption. Source not read. |
 
-**Where we are ahead:** the only permissively licensed, allocation-free pure-Zig codec + master + slave in one package; no libc, no runtime; server side is a pure function over caller-owned storage (simulated fleets), byte-checked against a live pymodbus session and dissected with Wireshark. **Where we are behind:** FC 0x14/0x15 file records and FC 0x18 read FIFO (→ *Backlog / deferred*); ASCII framing and TLS/UDP variants (→ *What is deliberately not done*); a TCP accept loop is left to the caller by design.
+**Where we are ahead:** the only permissively licensed, allocation-free pure-Zig codec + master + slave in one package; no libc, no runtime; server side is a pure function over caller-owned storage (simulated fleets), byte-checked against a live pymodbus session and dissected with Wireshark. **Where we are behind:** FC 0x14/0x15 file records and FC 0x18 read FIFO (→ *What is deliberately not done*); ASCII framing and TLS/UDP variants (→ *What is deliberately not done*); a TCP accept loop is left to the caller by design.
 
 ## Design & invariants
 Four allocation-free layers, all offline-testable. `pdu` — transport-independent request encode /
@@ -104,11 +104,12 @@ Run: `scripts/modtest modbus` (all tests are offline; add `-Doptimize=ReleaseFas
 - **Modbus Security / TLS and UDP variants** — transport security is entirely the caller's; the module touches a socket only in the optional `TcpTransport`.
 - **Serial timing** — the RTU t1.5/t3.5 silences are the transport's concern: the server delimits frames by what it is handed, measures no time and owns no clock (`RtuStream` delimits by function code and CRC instead).
 - **A TCP accept loop** — `handleAdu` is a pure function; running it over a socket (or over a simulated fleet) is the caller's job.
+- **FC 0x14/0x15 file records and FC 0x18 read FIFO** — optional codes of the Modbus Application Protocol; the reference libmodbus (its API index lists none of them) and tokio-modbus (its `Reader` trait: FC 1-4, 0x17, 0x2B/0x0E) do not offer them either, so by the owner policy (reference/majority) they are not built. The server answers them `IllegalFunction` (pinned by a test) and `RtuStream` can already size the frames.
 - **A "restart communications option" side effect beyond leaving listen-only mode** and, for argument 0xFF00, clearing the counters (server.zig).
 
 ## Backlog / deferred
 
-- **FC 0x14/0x15 file records and FC 0x18 read FIFO** — not implemented on either side (the server answers them `IllegalFunction`, server.zig test at line 1194; `RtuStream` can already size them). No plan until a consumer needs them.
+None open.
 
 ## Anchoring
 
