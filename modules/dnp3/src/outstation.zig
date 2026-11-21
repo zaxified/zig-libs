@@ -141,6 +141,13 @@ pub const AnalogInput = struct {
     class: ?EventClass = .class2,
     static_variation: u8 = 1,
     event_variation: u8 = 1,
+    /// Reporting deadband (g34): a change is an event only when it exceeds the
+    /// value last reported by more than this. 0 reports every change. The master
+    /// reads and writes it with g34.
+    deadband: f64 = 0,
+    /// The value last reported as an event (NaN: nothing reported yet, so the
+    /// next change always is). Maintained by `reportChange`.
+    reported: f64 = std.math.nan(f64),
     /// Reject an analog *output* write outside these bounds. Unused for
     /// inputs; kept here so both analog kinds share one struct shape is not
     /// needed — see `AnalogOutputStatus`.
@@ -660,6 +667,12 @@ pub const Outstation = struct {
             /// 0 means "all of them".
             limit: u32,
         },
+        /// g34: the reporting deadbands of analog input points `start..stop`.
+        deadbands: struct {
+            variation: u8,
+            start: u32,
+            stop: u32,
+        },
     };
 
     pub fn init(config: Config, db: Database, events: EventBuffer) Outstation {
@@ -732,6 +745,13 @@ pub const Outstation = struct {
     pub fn reportChange(self: *Outstation, kind: PointKind, index: u16, now_ms: u64) void {
         if (index >= self.db.count(kind)) return;
         const class = self.db.classOf(kind, index) orelse return;
+        if (kind == .analog_input) {
+            const p = &self.db.analog_inputs[index];
+            // g34 deadband: not an event unless the value moved more than the
+            // deadband from the last reported one.
+            if (p.deadband > 0 and !std.math.isNan(p.reported) and @abs(p.value - p.reported) <= p.deadband) return;
+            p.reported = p.value;
+        }
         self.events.push(.{
             .kind = kind,
             .index = index,
@@ -1054,6 +1074,24 @@ pub const Outstation = struct {
             };
         }
 
+        if (header.group == 34) {
+            if (header.variation != 0 and objects.g34.recordLen(header.variation) == null) return error.UnknownObject;
+            const n = self.db.analog_inputs.len;
+            if (n == 0) return error.UnknownObject;
+            const start: u32, const stop: u32 = switch (header.range) {
+                .all_values => .{ 0, @intCast(n - 1) },
+                .start_stop => |r| blk: {
+                    if (r.stop < r.start or r.stop >= n) return error.BadParameter;
+                    break :blk .{ r.start, r.stop };
+                },
+                .count => |c| blk: {
+                    if (c == 0 or c > n) return error.BadParameter;
+                    break :blk .{ 0, c - 1 };
+                },
+            };
+            return .{ .deadbands = .{ .variation = header.variation, .start = start, .stop = stop } };
+        }
+
         if (records.PointKind.fromEventGroup(header.group)) |kind| {
             if (header.variation != 0 and records.layoutOf(header.group, header.variation) == null) {
                 return error.UnknownObject;
@@ -1112,6 +1150,7 @@ pub const Outstation = struct {
                     &pos,
                     &cursor.item_pos,
                 ),
+                .deadbands => |d| self.emitDeadbands(d.variation, d.start, d.stop, out[0..limit], &pos, &cursor.item_pos),
                 .events => |e| blk: {
                     const before = cursor.events_sent;
                     const emitted = self.emitEvents(
@@ -1288,6 +1327,56 @@ pub const Outstation = struct {
             }
             if (r.emitted == 0) return false;
             if (r.emitted < run) return false;
+        }
+        return true;
+    }
+
+    /// The g34 deadbands of analog inputs `start..stop`, as one run per fragment
+    /// space. Variation 0 (the master did not choose) picks the smallest that
+    /// carries every value of the range: 16-bit, 32-bit, or float.
+    fn emitDeadbands(self: *Outstation, variation: u8, start: u32, stop: u32, out: []u8, pos: *usize, item_pos: *u64) bool {
+        const total = stop - start + 1;
+        while (item_pos.* < total) {
+            const first: u32 = start + @as(u32, @intCast(item_pos.*));
+            var v = variation;
+            if (v == 0) {
+                v = 1;
+                for (self.db.analog_inputs[first .. stop + 1]) |p| {
+                    const d = p.deadband;
+                    if (d != @floor(d) or d < 0 or d > 4294967295) {
+                        v = 3;
+                        break;
+                    }
+                    if (d > 65535) v = 2;
+                }
+            }
+            const each = objects.g34.recordLen(v).?;
+            const wide = stop > 0xFF;
+            const header_len: usize = if (wide) 7 else 5;
+            if (pos.* + header_len + each > out.len) return false;
+            const space = out.len - pos.* - header_len;
+            const fit: u32 = @intCast(@min(@as(u64, stop - first + 1), space / each));
+            const last = first + fit - 1;
+            const header = objects.ObjectHeader{
+                .group = 34,
+                .variation = v,
+                .qualifier = .{ .prefix_code = .none, .range_code = if (wide) .start_stop_2b else .start_stop_1b },
+                .range = .{ .start_stop = .{ .start = first, .stop = last } },
+            };
+            const hdr = objects.encodeObjectHeader(header, out[pos.*..]) catch return false;
+            pos.* += hdr.len;
+            var i: u32 = first;
+            while (i <= last) : (i += 1) {
+                const d = self.db.analog_inputs[i].deadband;
+                const w = switch (v) {
+                    1 => (objects.g34.V1{ .value = @intFromFloat(std.math.clamp(d, 0, 65535)) }).encode(out[pos.*..]),
+                    2 => (objects.g34.V2{ .value = @intFromFloat(std.math.clamp(d, 0, 4294967295)) }).encode(out[pos.*..]),
+                    else => (objects.g34.V3{ .value = @floatCast(d) }).encode(out[pos.*..]),
+                } catch return false;
+                pos.* += w.len;
+            }
+            item_pos.* += fit;
+            if (fit < stop - first + 1) return false;
         }
         return true;
     }
@@ -1505,6 +1594,59 @@ pub const Outstation = struct {
                 };
                 self.need_time = false;
                 rest = rest[objects.g50.V1.wire_len..];
+                continue;
+            }
+
+            if (h.group == 34) {
+                // Analog input reporting deadbands: set the threshold of each point.
+                const each = objects.g34.recordLen(h.variation) orelse {
+                    extra.object_unknown = true;
+                    break;
+                };
+                const prefix_len: usize = switch (h.qualifier.prefix_code) {
+                    .none => 0,
+                    .index_1b => 1,
+                    .index_2b => 2,
+                    else => {
+                        extra.parameter_error = true;
+                        break;
+                    },
+                };
+                const count = h.range.objectCount() orelse {
+                    extra.parameter_error = true;
+                    break;
+                };
+                if (count * (each + prefix_len) > rest.len) {
+                    extra.parameter_error = true;
+                    break;
+                }
+                var k: u64 = 0;
+                while (k < count) : (k += 1) {
+                    const idx: u64 = switch (prefix_len) {
+                        0 => switch (h.range) {
+                            .start_stop => |r| @as(u64, r.start) + k,
+                            else => {
+                                extra.parameter_error = true;
+                                break;
+                            },
+                        },
+                        1 => rest[0],
+                        else => std.mem.readInt(u16, rest[0..2], .little),
+                    };
+                    const rec = rest[prefix_len..];
+                    const value: f64 = switch (h.variation) {
+                        1 => @floatFromInt((objects.g34.V1.decode(rec) catch unreachable).value),
+                        2 => @floatFromInt((objects.g34.V2.decode(rec) catch unreachable).value),
+                        else => (objects.g34.V3.decode(rec) catch unreachable).value,
+                    };
+                    rest = rest[prefix_len + each ..];
+                    if (idx >= self.db.analog_inputs.len or std.math.isNan(value) or value < 0) {
+                        extra.parameter_error = true;
+                        continue;
+                    }
+                    self.db.analog_inputs[@intCast(idx)].deadband = value;
+                }
+                if (extra.parameter_error) break;
                 continue;
             }
 
@@ -2710,6 +2852,54 @@ test "events: an unsynchronised clock (NEED_TIME) precedes relative events with 
     const reply = (try station.handle(read, 3000, &out)).?;
     const body = (try application.decodeResponseHeader(reply.fragment)).rest;
     try testing.expectEqualSlices(u8, &.{ 51, 2, 0x07, 1 }, body[0..4]);
+}
+
+test "g34 deadband: written per point, read back, and an analog change inside it is not an event" {
+    var fix = Fixture{};
+    var station = fix.station(.{ .need_time_at_start = false });
+    var out: [512]u8 = undefined;
+    // WRITE g34v1 start-stop 1..2 = 10, 300 (qualifier 0x00).
+    const wr = [_]u8{ 0xC0, 0x02, 34, 1, 0x00, 1, 2, 10, 0, 0x2C, 0x01 };
+    const wreply = (try station.handle(&wr, 0, &out)).?;
+    try testing.expect(!(try application.decodeResponseHeader(wreply.fragment)).header.iin.parameter_error);
+    try testing.expectEqual(@as(f64, 10), fix.analogs[1].deadband);
+    try testing.expectEqual(@as(f64, 300), fix.analogs[2].deadband);
+    try testing.expectEqual(@as(f64, 0), fix.analogs[0].deadband);
+
+    // READ g34v0 over everything: v1 carries all four (all integral and below 65536).
+    var req: [32]u8 = undefined;
+    const read = try buildRead(&req, 1, &.{.{ .group = 34, .variation = 0, .qualifier = .{ .prefix_code = .none, .range_code = .all_values }, .range = .{ .all_values = {} } }});
+    const reply = (try station.handle(read, 1, &out)).?;
+    const body = (try application.decodeResponseHeader(reply.fragment)).rest;
+    try testing.expectEqualSlices(u8, &.{ 34, 1, 0x00, 0, 3, 0, 0, 10, 0, 0x2C, 0x01, 0, 0 }, body);
+
+    // A fractional deadband picks the float variation.
+    fix.analogs[0].deadband = 0.5;
+    const reply3 = (try station.handle(read, 2, &out)).?;
+    const body3 = (try application.decodeResponseHeader(reply3.fragment)).rest;
+    try testing.expectEqual(@as(u8, 3), body3[1]);
+
+    // Event filtering on analog input 1 (deadband 10): the first change always reports.
+    fix.analogs[1].deadband = 10;
+    station.update(.analog_input, 1, .{ .analog_int = 100 }, 10);
+    try testing.expectEqual(@as(usize, 1), station.events.len);
+    station.update(.analog_input, 1, .{ .analog_int = 105 }, 11); // within 10 of 100
+    try testing.expectEqual(@as(usize, 1), station.events.len);
+    station.update(.analog_input, 1, .{ .analog_int = 110 }, 12); // exactly the deadband: still inside
+    try testing.expectEqual(@as(usize, 1), station.events.len);
+    station.update(.analog_input, 1, .{ .analog_int = 111 }, 13); // beyond it
+    try testing.expectEqual(@as(usize, 2), station.events.len);
+    station.update(.analog_input, 1, .{ .analog_int = 100 }, 14); // measured against 111
+    try testing.expectEqual(@as(usize, 3), station.events.len);
+
+    // An index past the end, or a short body, is a parameter error and writes nothing.
+    const bad = [_]u8{ 0xC0, 0x02, 34, 1, 0x00, 9, 9, 5, 0 };
+    const breply = (try station.handle(&bad, 20, &out)).?;
+    try testing.expect((try application.decodeResponseHeader(breply.fragment)).header.iin.parameter_error);
+    const short = [_]u8{ 0xC0, 0x02, 34, 1, 0x00, 0, 1, 5, 0 };
+    const sreply = (try station.handle(&short, 21, &out)).?;
+    try testing.expect((try application.decodeResponseHeader(sreply.fragment)).header.iin.parameter_error);
+    try testing.expectEqual(@as(f64, 0.5), fix.analogs[0].deadband);
 }
 
 test "events: a confirm that never arrives puts them back on the queue" {

@@ -630,6 +630,67 @@ pub const g41 = struct {
     };
 };
 
+// ── g34: Analog Input Reporting Deadband ─────────────────────────────────────
+
+/// The threshold a change of an analog input must exceed before it produces an
+/// event. Read and written per point index; no flags octet.
+pub const g34 = struct {
+    /// g34v1: 16-bit unsigned deadband (2 octets, LE).
+    pub const V1 = struct {
+        value: u16,
+        pub const wire_len = 2;
+        pub fn encode(self: V1, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            std.mem.writeInt(u16, out[0..2], self.value, .little);
+            return out[0..wire_len];
+        }
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V1 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{ .value = std.mem.readInt(u16, bytes[0..2], .little) };
+        }
+    };
+
+    /// g34v2: 32-bit unsigned deadband (4 octets, LE).
+    pub const V2 = struct {
+        value: u32,
+        pub const wire_len = 4;
+        pub fn encode(self: V2, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            std.mem.writeInt(u32, out[0..4], self.value, .little);
+            return out[0..wire_len];
+        }
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V2 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{ .value = std.mem.readInt(u32, bytes[0..4], .little) };
+        }
+    };
+
+    /// g34v3: IEEE-754 single-precision deadband (4 octets, LE).
+    pub const V3 = struct {
+        value: f32,
+        pub const wire_len = 4;
+        pub fn encode(self: V3, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            std.mem.writeInt(u32, out[0..4], @bitCast(self.value), .little);
+            return out[0..wire_len];
+        }
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V3 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{ .value = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) };
+        }
+    };
+
+    /// Octets of one record of variation `v`, or null for a variation this module does not know.
+    pub fn recordLen(v: u8) ?usize {
+        return switch (v) {
+            1 => V1.wire_len,
+            2 => V2.wire_len,
+            3 => V3.wire_len,
+            else => null,
+        };
+    }
+};
+
 // ── g50: Time and Date ───────────────────────────────────────────────────────
 
 pub const g50 = struct {
@@ -652,6 +713,35 @@ pub const g50 = struct {
             return .{ .ms_since_epoch = std.mem.readInt(u48, bytes[0..6], .little) };
         }
     };
+
+    /// g50v4: indexed absolute time and long interval: 48-bit absolute time
+    /// (ms since the UNIX epoch), 32-bit interval, and an interval-units
+    /// octet (0 none, 1 ms, 2 s, 3 min, 4 h, 5 days, 6 weeks, 7 months, 8 seasons,
+    /// 9 years), 11 octets, LE. Carried with an index prefix.
+    pub const V4 = struct {
+        ms_since_epoch: u64,
+        interval: u32,
+        units: u8,
+
+        pub const wire_len = 11;
+
+        pub fn encode(self: V4, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            std.mem.writeInt(u48, out[0..6], @truncate(self.ms_since_epoch), .little);
+            std.mem.writeInt(u32, out[6..10], self.interval, .little);
+            out[10] = self.units;
+            return out[0..wire_len];
+        }
+
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V4 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{
+                .ms_since_epoch = std.mem.readInt(u48, bytes[0..6], .little),
+                .interval = std.mem.readInt(u32, bytes[6..10], .little),
+                .units = bytes[10],
+            };
+        }
+    };
 };
 
 // ── g51: Time and Date Common Time-of-Occurrence ────────────────────────────
@@ -666,6 +756,37 @@ pub const g51 = struct {
     pub const V2 = g50.V1;
     pub const wire_len = g50.V1.wire_len;
 };
+
+// ── g110 / g111: Octet String (static / event) ───────────────────────────────
+
+/// An octet string point: the object's **variation is its length** (1..255)
+/// and the record is the string's octets, with no flags and no time. g110 is
+/// the static object, g111 the event object (carried with an index prefix).
+pub const g110 = struct {
+    pub const max_len = 255;
+
+    /// The variation that carries `string` (its length), or null when it is
+    /// empty or longer than 255.
+    pub fn variationFor(string: []const u8) ?u8 {
+        if (string.len == 0 or string.len > max_len) return null;
+        return @intCast(string.len);
+    }
+
+    pub fn encode(string: []const u8, out: []u8) error{ BufferTooSmall, BadLength }![]u8 {
+        if (string.len == 0 or string.len > max_len) return error.BadLength;
+        if (out.len < string.len) return error.BufferTooSmall;
+        @memcpy(out[0..string.len], string);
+        return out[0..string.len];
+    }
+
+    /// The `variation` octets of `bytes` (a variation of 0 or beyond the bytes present is an error).
+    pub fn decode(variation: u8, bytes: []const u8) error{ShortRecord}![]const u8 {
+        if (variation == 0 or bytes.len < variation) return error.ShortRecord;
+        return bytes[0..variation];
+    }
+};
+
+pub const g111 = g110;
 
 // ── g60: Class Data (request-only markers, no object payload) ──────────────
 
@@ -947,4 +1068,34 @@ test "Range.objectSpanBytes: a hostile count yields a span too big to slice, not
     // `all_values` has no fixed count, so it has no fixed span either.
     const all: Range = .all_values;
     try testing.expectEqual(@as(?u64, null), all.objectSpanBytes(4));
+}
+
+test "g34 deadband records round trip; recordLen knows only v1-v3" {
+    var b: [4]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 0x34, 0x12 }, try (g34.V1{ .value = 0x1234 }).encode(&b));
+    try testing.expectEqual(@as(u16, 0x1234), (try g34.V1.decode(&.{ 0x34, 0x12 })).value);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, try (g34.V2{ .value = 1 }).encode(&b));
+    try testing.expectEqual(@as(f32, 2.5), (try g34.V3.decode(try (g34.V3{ .value = 2.5 }).encode(&b))).value);
+    try testing.expectError(error.ShortRecord, g34.V2.decode(&.{ 1, 2, 3 }));
+    try testing.expectEqual(@as(?usize, 4), g34.recordLen(3));
+    try testing.expectEqual(@as(?usize, null), g34.recordLen(4));
+    try testing.expectEqual(@as(?usize, null), g34.recordLen(0));
+}
+
+test "g50v4 and g110/g111 round trip; the octet-string variation is its length" {
+    var b: [16]u8 = undefined;
+    const t = g50.V4{ .ms_since_epoch = 0x0102_0304_0506, .interval = 60, .units = 2 };
+    const wire = try t.encode(&b);
+    try testing.expectEqualSlices(u8, &.{ 6, 5, 4, 3, 2, 1, 60, 0, 0, 0, 2 }, wire);
+    try testing.expectEqual(t, try g50.V4.decode(wire));
+    try testing.expectError(error.ShortRecord, g50.V4.decode(wire[0..10]));
+
+    try testing.expectEqual(@as(?u8, 5), g110.variationFor("hello"));
+    try testing.expectEqual(@as(?u8, null), g110.variationFor(""));
+    try testing.expectEqualSlices(u8, "hello", try g110.encode("hello", &b));
+    try testing.expectError(error.BadLength, g110.encode("", &b));
+    try testing.expectError(error.BufferTooSmall, g110.encode("hello", b[0..4]));
+    try testing.expectEqualSlices(u8, "hel", try g111.decode(3, "hello"));
+    try testing.expectError(error.ShortRecord, g110.decode(6, "hello"));
+    try testing.expectError(error.ShortRecord, g110.decode(0, "hello"));
 }

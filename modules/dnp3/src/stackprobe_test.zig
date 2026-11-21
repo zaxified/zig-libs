@@ -19,6 +19,9 @@ var monitoring_key: [32]u8 = undefined;
 var out: [80]u8 = undefined;
 var wrapped: [72]u8 = undefined;
 var unwrapped: [64]u8 = undefined;
+var wrapped_status: [128]u8 = undefined;
+var wrapped_status_len: usize = 0;
+const status_message = "dnp3 probe key-status message 0123456789";
 const challenge = "dnp3 probe challenge bytes";
 const asdu = "dnp3 probe critical asdu";
 const iv: [12]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
@@ -44,4 +47,14 @@ test "STACKPROBE: no key residue after the SA MAC and session-key paths" {
     @memcpy(&wrapped, out[0..72]);
     _ = try P.run("unwrapSessionKeys", sa.unwrapSessionKeys, .{ @as([]const u8, &update_key), @as([]const u8, &wrapped), @as(usize, 32), @as([]u8, &unwrapped) }, &unwrap_secrets, .{});
     try std.testing.expectEqualSlices(u8, &control_key, unwrapped[0..32]);
+
+    // The key-change path of the outstation integration: the status-binding layout.
+    const keys = [_][]const u8{ &key, &update_key, &control_key, &monitoring_key, &wrapped_status };
+    _ = try P.run("wrapSessionKeysWithStatus", sa.wrapSessionKeysWithStatus, .{ @as([]const u8, &update_key), @as([]const u8, &control_key), @as([]const u8, &monitoring_key), @as([]const u8, status_message), @as([]u8, &wrapped_status) }, &keys, .{});
+    // The wrapped length: key length (2) + both keys + status, padded to the 8-octet AES-KW
+    // block, plus the 8-octet integrity block. Fetched with a plain call, the probe run
+    // above returns a report, not the value.
+    var again: [128]u8 = undefined;
+    wrapped_status_len = (try sa.wrapSessionKeysWithStatus(&update_key, &control_key, &monitoring_key, status_message, &again)).len;
+    _ = try P.run("unwrapSessionKeysWithStatus", sa.unwrapSessionKeysWithStatus, .{ @as([]const u8, &update_key), @as([]const u8, wrapped_status[0..wrapped_status_len]), @as([]const u8, status_message), @as([]u8, &unwrapped) }, &unwrap_secrets, .{});
 }

@@ -117,6 +117,15 @@ which is a local programming mistake.
   closed, and `TIMEOUT` would tell a foreign station that somebody else holds an arm. The
   wrong-peer case is also the one refusal that does **not** consume the arm, so it cannot be used
   to cancel another station's select.
+- **Analog deadbands (g34).** `AnalogInput.deadband` (default 0) is the reporting threshold: `reportChange`
+  drops a change of an analog input unless it moved more than the deadband from the value last reported
+  (`reported`, initially none, so the first change always counts); exactly the deadband is inside it. READ of g34
+  (variation 0, 1, 2 or 3, all values, start-stop or count) returns the deadbands of the analog inputs, v1 (16-bit) when
+  every value of the range is a whole number below 65536, v2 (32-bit) up to 2^32-1, else v3 (single float)
+  when the master asks for variation 0. WRITE of g34 (start-stop, or 1/2-octet index prefix with count) sets them; an index
+  past the end, a negative or NaN value or a short body is IIN2.2 PARAMETER_ERROR for that object and the write
+  stops there. Analog outputs, counters and the other kinds have no deadband here (a counter's threshold is g21/g22
+  territory, not built).
 - **Relative-time events (g2v3, g4v3 and the other `rel16` variations).** A point whose
   `event_variation` selects a relative-time variation is reported with a 16-bit millisecond offset from a
   g51 common time-of-occurrence object that precedes it in the fragment (IEEE 1815-2012 Part 4 §4.2.2):
@@ -535,7 +544,8 @@ foreign SA master computes the same.
   through every MAC and the reply MAC; update and session keys through the key wrap; the SAv5
   status-bound wrap), read in *Key-wrap layout*.
 - **Stack probe:** `src/stackprobe_test.zig` (ReleaseFast) goes red when an SA entry point outgrows its
-  dead-stack burn in `src/burn.zig` or leaves a key in a frame.
+  dead-stack burn in `src/burn.zig` or leaves a key in a frame; it covers the MAC paths, the keys-only
+  wrap/unwrap and the key-change wrap/unwrap with the key-status message.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## What is deliberately not done
@@ -546,20 +556,26 @@ foreign SA master computes the same.
 - **Unsolicited retry policy.** `Outstation.unsolicited` builds the fragment and `confirmTimedOut`
   puts the events back; the retry timer, the back-off and the "unsolicited allowed after the first
   integrity poll" convention are the caller's, because the module owns no clock and no timer.
+- **File transfer (g70), device attributes (g0) and data sets (g85-g88).** Their wire formats and
+  procedures are in IEEE 1815-2012 Parts 4/5 only (paywalled); opendnp3, the permissively
+  licensed reference, lists none of them among its features, and the one implementation that does
+  (stepfunc) is source-available under a non-commercial licence that may not be read. Without a
+  readable second source a codec here would be a guess that no peer has checked, so they are not built.
+- **Octet-string points (g110/g111) in the outstation database, and g50v2.** The object codecs exist
+  (`objects.g110`/`g111`, `objects.g50.V4`), but the outstation's point database is a closed set of seven
+  fixed-record kinds; an octet-string kind (the variation is the length, so a run has no fixed record
+  size) touches the database, class polls and the event buffer. Not built until a user needs it.
 - **Several masters on one `Outstation`.** One `Outstation` is one DNP3 association; serving several
   masters means one `Outstation` per association over a shared point database, as both reference
   stacks do.
 
 ## Backlog / deferred
 
-- **Object groups not built:** file transfer (g70) and device attributes (g0), used by
-  commissioning and configuration tools (medium); data sets (g85-g88), octet strings (g110/g111),
-  time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation (g50v2/g51).
 - **Secure Authentication, what the outstation integration leaves out:** the SAv5/SAv6
   asymmetric update-key change (g120 v8/v10-v15), the g121/g122 security-statistic objects on
   the wire (counted in memory only), authenticated responses in the monitoring direction,
   AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
-  side, and a stack probe over the key-change path.
+  side.
 - **Open questions for the SA integration** (each needs the standard's text or a foreign
   implementation to settle): (a) which bytes count as "the key-status message" in the g120v6
   wrapped data (object body, whole object or ASDU) and the padding byte (the decision itself is in
