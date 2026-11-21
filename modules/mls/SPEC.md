@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src b7fe37e50bdfd4ca
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt, since 2026-11-21 `Group.protectApplication` from a real group; `ks` 0 / `tree` 0 / `priv` 4 / `group` 2 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
 **Performance:** ref 0.97–1.33× OpenMLS 0.9.0 (openmls_rust_crypto 0.6.0) · fastest ? (measured 2026-11-21; `zig build bench-mls`, suite 0x0001 application messages, wall time, two runs of 5 and 7 rounds on a shared host: protect+open of 64 B 1.29/1.33×, 1 KiB 1.21/1.30×, 16 KiB 0.99/0.98×, protect alone 64 B 1.32/1.28×, 16 KiB 0.99/0.98×; spreads 4-76 %, the small-message gap held in both)
 
 **Known defects:** none recorded
@@ -1473,12 +1473,21 @@ flipped Welcome/Commit bit is refused, and a refused Commit leaves the member
 able to take the genuine one.
 
 **Constant time** — `src/ctgrind_harness.zig` (suite `0x0001`, ReleaseFast,
-targets `ks`/`tree`/`priv`): `ks` taints the init, commit and PSK secrets through
+targets `ks`/`tree`/`priv`/`group`): `ks` taints the init, commit and PSK secrets through
 `deriveEpoch`; `tree` taints the encryption secret through every node secret, the
 ratchet base, `Ratchet` and `Window`; `priv` taints the content key/nonce,
 sender-data secret and signing key through `protectPrivate`, `decryptSenderData`
-and `decryptContent`. The `priv` in-file contexts are std's Ed25519 signing
-internals and the AES-GCM tag-verify outcome; expected counts are in
+and `decryptContent`; `group` taints a member's `EpochSecrets` and signing key
+after a real create + Add + Welcome and sends two `Group.protectApplication`
+messages (secret tree built and ratchet advanced under taint), which an
+untainted second member opens. The `priv` in-file contexts are std's Ed25519
+signing internals and the AES-GCM tag-verify outcome; `group`'s 2 are the same
+two signing sites (3 on the portable `cpu=x86_64` build, one more than native,
+like `priv`'s variant; not itemized). A tainted RECEIVER at the group level is
+not a claim row: it counts the processing of the decrypted sender data and
+content (ratchet selection by leaf index and generation, parsing, signature
+verification), 159 in-file contexts measured, each downstream of the two tag
+verdicts — data, not key. Expected counts are in
 `scripts/checks/ctgrind-expected.tsv` (native and `cpu=x86_64` rows). TreeKEM
 path secrets and HPKE are the `hpke` module's rows.
 

@@ -20,6 +20,21 @@
 //!    then the receiver's `senderDataKeys`, `decryptSenderData` and
 //!    `decryptContent`. The wire bytes `protectPrivate` returns are public and
 //!    are marked defined before the receiver parses them.
+//!  * `group` — the group-level application path (§6.3 through
+//!    `Group.protectApplication` / `Group.unprotectApplication`): alice
+//!    creates a group and adds bob (Commit + Welcome, untainted, from a
+//!    deterministic `Io`), bob joins; then alice's `EpochSecrets` and her
+//!    Ed25519 signing key are tainted. Alice protects two messages
+//!    (generations 0 and 1, so the ratchet advances under taint; her secret
+//!    tree is built from the tainted encryption secret on first use) and bob,
+//!    untainted, opens them as the check that the measured bytes are right.
+//!    The wire bytes are public and marked defined before bob reads them. The
+//!    receive side under a tainted key is `priv`'s: a group-level receiver
+//!    under taint also counts the processing of its decrypted sender data and
+//!    content (ratchet selection by leaf index and generation, parsing,
+//!    signature verification), which is data, not key — measured 2026-11-21
+//!    at 159 in-file contexts, every one downstream of the two AES-GCM tag
+//!    verdicts.
 //!
 //! Not measured here: TreeKEM path secrets and HPKE (`treekem`, `welcome`)
 //! — their KEM is the `hpke` module's, which carries its own rows.
@@ -36,7 +51,8 @@ const mls = @import("root.zig");
 
 const S = mls.suite.default;
 const KN = mls.secrettree.KeyNonce(S);
-const Target = enum { ks, tree, priv };
+const Target = enum { ks, tree, priv, group };
+const G = mls.group.Group(S);
 const Taint = enum { yes, no };
 
 fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
@@ -48,6 +64,54 @@ fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
 fn taintBytes(t: Taint, bytes: []u8) void {
     if (t == .yes) std.valgrind.memcheck.makeMemUndefined(bytes);
 }
+
+// A deterministic `Io.randomSecure` for the `group` target, so the printed
+// wire bytes (and so `out_sha`) are the same on every run.
+var det_counter: u64 = 0;
+fn detSecure(_: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+    var o: usize = 0;
+    while (o < buf.len) {
+        var h: [32]u8 = undefined;
+        var s = std.crypto.hash.sha2.Sha256.init(.{});
+        s.update("ctgrind-mls-group-draw");
+        s.update(std.mem.asBytes(&det_counter));
+        s.final(&h);
+        det_counter += 1;
+        const k = @min(h.len, buf.len - o);
+        @memcpy(buf[o..][0..k], h[0..k]);
+        o += k;
+    }
+}
+
+const Member = struct {
+    sig: S.Sig.KeyPair,
+    init_kp: S.Kem.KeyPair,
+    enc_kp: S.Kem.KeyPair,
+    kp_msg: []u8,
+    kp: mls.keypackage.KeyPackage,
+
+    fn init(arena: std.mem.Allocator, name: []const u8, seed: u8) !Member {
+        const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
+        const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+        const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+        const kp = try mls.keypackage.create(S, arena, .{
+            .signature_key_pair = &sig,
+            .init_key = init_kp.public_key,
+            .encryption_key = enc_kp.public_key,
+            .credential = .{ .basic = name },
+            .capabilities = .{
+                .versions = &.{1},
+                .cipher_suites = &.{1},
+                .extensions = &.{},
+                .proposals = &.{},
+                .credentials = &.{1},
+            },
+            .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+        });
+        const msg: mls.framing.MLSMessage = .{ .key_package = kp };
+        return .{ .sig = sig, .init_kp = init_kp, .enc_kp = enc_kp, .kp_msg = try msg.encodeAlloc(arena), .kp = kp };
+    }
+};
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
@@ -136,6 +200,70 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const pt = try mls.framing.decryptContent(S, gpa, pm, &kn, guard);
             std.debug.print("ctgrind_result={x}\n", .{std.mem.asBytes(&sd).*});
             std.debug.print("ctgrind_result={x}\n", .{pt});
+        },
+        .group => {
+            const pa = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, the group state outgrows the 64 KiB buffer
+            var threaded = std.Io.Threaded.init(pa, .{});
+            defer threaded.deinit();
+            const base_io = threaded.io();
+            var vt = base_io.vtable.*;
+            vt.randomSecure = detSecure;
+            const io: std.Io = .{ .userdata = base_io.userdata, .vtable = &vt };
+
+            var arena_state = std.heap.ArenaAllocator.init(pa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var alice = try Member.init(arena, "alice", 1);
+            const bob = try Member.init(arena, "bob", 2);
+
+            var a: G = undefined;
+            try G.create(pa, .{
+                .io = io,
+                .group_id = "ctgrind-mls-group",
+                .key_package_msg = alice.kp_msg,
+                .encryption_priv = &alice.enc_kp.secret_key,
+            }, &a);
+            defer a.deinit();
+            const props = [_]G.CommitSource{.{ .by_value = .{ .add = bob.kp } }};
+            const c = try a.createCommit(arena, .{
+                .io = io,
+                .signature_key_pair = &alice.sig,
+                .proposals = &props,
+            });
+            var b: G = undefined;
+            try G.fromWelcome(pa, .{
+                .welcome_msg = c.welcome.?,
+                .key_package_msg = bob.kp_msg,
+                .init_priv = &bob.init_kp.secret_key,
+                .encryption_priv = &bob.enc_kp.secret_key,
+            }, &b);
+            defer b.deinit();
+
+            // Only the SENDER is tainted: bob's copy of the same epoch stays
+            // defined, so his open checks the measured bytes without counting
+            // the processing of decrypted sender data and content (the leaf
+            // index and generation select a ratchet, the content is parsed and
+            // its signature verified), which follows from the plaintext being
+            // derived from a tainted key, not from a branch on the key.
+            taintBytes(taint, std.mem.asBytes(&a.secrets));
+            taintBytes(taint, std.mem.asBytes(&alice.sig.secret_key));
+
+            for ([_][]const u8{ "group application data under tainted keys", "second message, ratchet advanced" }) |data| {
+                const wire = try a.protectApplication(arena, .{
+                    .io = io,
+                    .signature_key_pair = &alice.sig,
+                    .data = data,
+                    .authenticated_data = "aad",
+                });
+                // Printed while still tainted (the propagation witness: the
+                // ciphertext and signature come from the tainted keys), then
+                // marked defined: on the wire it is public.
+                std.debug.print("ctgrind_result={x}\n", .{wire});
+                std.valgrind.memcheck.makeMemDefined(wire);
+                const got = try b.unprotectApplication(arena, wire);
+                if (got.sender != 0 or !std.mem.eql(u8, got.authenticated_data, "aad")) return error.WrongMessage;
+                std.debug.print("ctgrind_result={x}\n", .{got.data});
+            }
         },
     }
 }

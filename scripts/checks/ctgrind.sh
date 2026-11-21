@@ -288,7 +288,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: Megolm ratchet + signing key, session export, sealed pickle ──
     [megolm]="msg skey pickle"
     # ── 2026-10-10: ct-wave: MLS key schedule, secret tree, PrivateMessage ──
-    [mls]="ks tree priv"
+    [mls]="ks tree priv group"
     # ── 2026-10-10: ct-wave: OTP shared secret, codes, otpauth URI ──
     [otp]="code uri"
     # ── 2026-10-10: ct-wave: AES Key Wrap KEK + wrapped key ──
@@ -799,6 +799,7 @@ declare -A PATTERN=(
     [mls/ks]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
     [mls/tree]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
     [mls/priv]='keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
+    [mls/group]='group[.]zig|keyschedule[.]zig|secrettree[.]zig|framing[.]zig|crypto[.]zig|codec[.]zig|content[.]zig|suite[.]zig|burn[.]zig|root[.]zig'
     [otp/code]='root[.]zig|burn[.]zig'
     [otp/uri]='root[.]zig|otpauth[.]zig|burn[.]zig'
     [aeskw/wrap]='root[.]zig|burn[.]zig'
@@ -1201,6 +1202,7 @@ declare -A LABEL=(
     [mls/ks]='mls deriveEpoch (init/commit/psk secrets tainted)'
     [mls/tree]='mls secret tree + ratchets (encryption secret tainted)'
     [mls/priv]='mls protectPrivate + decrypt (keys, sd secret, sig key tainted)'
+    [mls/group]='mls Group.protectApplication (epoch secrets, sig key tainted) + untainted open'
     [otp/code]='otp hotp/totp/fmt/verify SHA-1/256/512 (secret tainted)'
     [otp/uri]='otp otpauth.format + totpCode (secret tainted)'
     [aeskw/wrap]='aeskw wrap/unwrap/tampered AES-128/192/256 (KEK+key tainted)'
