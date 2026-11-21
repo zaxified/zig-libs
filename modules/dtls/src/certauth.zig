@@ -55,7 +55,6 @@
 //! `opcua`, which had each grown their own guard against the same hazard.
 
 const std = @import("std");
-const rsa = @import("rsa");
 const x509 = @import("x509");
 const certverify = @import("tls13").certverify;
 
@@ -65,9 +64,9 @@ pub const Error = error{
     /// `cert_der` does not parse as a well-formed X.509 certificate at all.
     MalformedCertificate,
     /// The certificate's declared public-key algorithm is not one
-    /// `certverify.PublicKey` supports (only `rsaEncryption` /
-    /// `X9_62_id_ecPublicKey` on P-256 or P-384 / `curveEd25519` — NOT
-    /// `rsassa_pss`-tagged keys or P-521).
+    /// `certverify.PublicKey` supports (`rsaEncryption`,
+    /// `X9_62_id_ecPublicKey` on P-256, P-384 or P-521, Ed25519, ML-DSA — NOT
+    /// `rsassa_pss`-tagged keys).
     UnsupportedPublicKeyAlgorithm,
     /// The public-key bytes themselves fail to parse under their declared
     /// algorithm (malformed SEC1 point, malformed RSA DER, wrong-length
@@ -79,43 +78,14 @@ pub const Error = error{
 /// — the key `certverify.verify` needs to check a `CertificateVerify`
 /// signature produced by this certificate's holder.
 pub fn parseLeafPublicKey(cert_der: []const u8) Error!certverify.PublicKey {
-    // Routed through `x509.spkiOf`, NOT `std.crypto.Certificate.parse`: std's
-    // DER reader indexes without bounds checks and panics or reads out of
-    // bounds on hostile input, and a peer's Certificate message is exactly
-    // that. `spkiOf` walks the certificate with x509's own bounds-checked
-    // decoder, decodes no field contents at all, and fails closed.
-    const spki = x509.spkiOf(cert_der) catch return error.MalformedCertificate;
-    const key_bytes = spki.key_bits;
-
-    if (spki.algorithmIs(&x509.safe.oid_rsa_encryption)) {
-        return .{ .rsa = rsa.PublicKey.fromDer(key_bytes) catch return error.InvalidPublicKey };
-    }
-    if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
-        // No named curve (implicitCurve/specifiedCurve) is deliberately not
-        // decoded by `namedCurveOid`, so it lands here as unsupported rather
-        // than being guessed at.
-        const curve = spki.namedCurveOid() orelse return error.UnsupportedPublicKeyAlgorithm;
-        if (std.mem.eql(u8, curve, &x509.safe.oid_prime256v1)) {
-            return .{
-                .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(key_bytes) catch return error.InvalidPublicKey,
-            };
-        }
-        if (std.mem.eql(u8, curve, &x509.safe.oid_secp384r1)) {
-            return .{
-                .ecdsa_p384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(key_bytes) catch return error.InvalidPublicKey,
-            };
-        }
-        return error.UnsupportedPublicKeyAlgorithm; // P-521 and anything else
-    }
-    if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
-        const len = std.crypto.sign.Ed25519.PublicKey.encoded_length;
-        if (key_bytes.len != len) return error.InvalidPublicKey;
-        return .{
-            .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(key_bytes[0..len].*) catch return error.InvalidPublicKey,
-        };
-    }
-    // Includes rsassa_pss-tagged keys, which carry their own OID.
-    return error.UnsupportedPublicKeyAlgorithm;
+    // `tls13.certverify.publicKeyFromCert`, shared with `tlsserver`: routed through `x509.spkiOf`, NOT
+    // `std.crypto.Certificate.parse`: std's DER reader indexes without bounds checks and panics or reads out of
+    // bounds on hostile input, and a peer's Certificate message is exactly that.
+    return certverify.publicKeyFromCert(cert_der) catch |e| switch (e) {
+        error.MalformedCertificate => error.MalformedCertificate,
+        error.UnsupportedPublicKeyAlgorithm => error.UnsupportedPublicKeyAlgorithm,
+        error.InvalidPublicKey => error.InvalidPublicKey,
+    };
 }
 
 /// Minimal one-hop chain-to-trust-anchor check (see module doc comment for

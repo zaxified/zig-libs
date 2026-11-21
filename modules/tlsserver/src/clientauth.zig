@@ -22,9 +22,7 @@
 
 const std = @import("std");
 const x509 = @import("x509");
-const rsa = @import("rsa");
 const certverify = @import("tls13").certverify;
-const p521 = @import("p521");
 
 pub const Error = error{
     /// A malformed message (`decode_error`).
@@ -224,55 +222,20 @@ pub fn parseCertificateVerify(body: []const u8) Error!CertificateVerify {
 /// RSA (rsaEncryption), ECDSA P-256 / P-384 / P-521, Ed25519, ML-DSA — the
 /// keys `certverify` verifies with (as `dtls.certauth.parseLeafPublicKey`).
 pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
-    return publicKeyOf(x509.spkiOf(der) catch return error.BadCertificate);
+    return certverify.publicKeyFromCert(der) catch |e| keyError(e);
 }
 
 /// An RFC 7250 raw public key's (a DER SubjectPublicKeyInfo) key for
 /// `certverify.verify`: the keys `leafPublicKey` takes.
 pub fn rawPublicKey(spki_der: []const u8) VerifyError!certverify.PublicKey {
-    return publicKeyOf(x509.parseSpki(spki_der) catch return error.BadCertificate);
+    return certverify.publicKeyFromSpkiDer(spki_der) catch |e| keyError(e);
 }
 
-fn publicKeyOf(spki: x509.Spki) VerifyError!certverify.PublicKey {
-    const bits = spki.key_bits;
-    if (spki.algorithmIs(&x509.safe.oid_rsa_encryption))
-        return .{ .rsa = rsa.PublicKey.fromDer(bits) catch return error.BadCertificate };
-    if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
-        const curve = spki.namedCurveOid() orelse return error.UnsupportedCertificate;
-        if (std.mem.eql(u8, curve, &x509.safe.oid_prime256v1))
-            return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(bits) catch return error.BadCertificate };
-        if (std.mem.eql(u8, curve, &x509.safe.oid_secp384r1))
-            return .{ .ecdsa_p384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(bits) catch return error.BadCertificate };
-        if (std.mem.eql(u8, curve, &x509.safe.oid_secp521r1))
-            return .{ .ecdsa_p521 = p521.EcdsaP521Sha512.PublicKey.fromSec1(bits) catch return error.BadCertificate };
-        return error.UnsupportedCertificate;
-    }
-    if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
-        // RFC 8410 §3: the parameters MUST be absent (Go: "Ed25519 key
-        // encoded with illegal parameters").
-        if (spki.parameters != null) return error.BadCertificate;
-        const n = std.crypto.sign.Ed25519.PublicKey.encoded_length;
-        if (bits.len != n) return error.BadCertificate;
-        return .{ .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(bits[0..n].*) catch return error.BadCertificate };
-    }
-    // ML-DSA (RFC 9881): the encoded key, borrowed from `der`.
-    if (x509.MlDsa.map.get(spki.algorithm_oid)) |set| {
-        // RFC 9881 §2: the parameters MUST be absent, as for the private
-        // key (`keys.zig`).
-        if (spki.parameters != null) return error.BadCertificate;
-        // A key of another length is a malformed certificate, not a
-        // signature that fails (independent review 2026-10-21, LOW).
-        switch (set) {
-            inline else => |c| if (bits.len != x509.MlDsa.Impl(c).PublicKey.encoded_length) return error.BadCertificate,
-        }
-        return switch (set) {
-            .ml_dsa_44 => .{ .mldsa44 = bits },
-            .ml_dsa_65 => .{ .mldsa65 = bits },
-            .ml_dsa_87 => .{ .mldsa87 = bits },
-        };
-    }
-    // id-RSASSA-PSS keys …
-    return error.UnsupportedCertificate;
+fn keyError(e: certverify.KeyError) VerifyError {
+    return switch (e) {
+        error.MalformedCertificate, error.InvalidPublicKey => error.BadCertificate,
+        error.UnsupportedPublicKeyAlgorithm => error.UnsupportedCertificate,
+    };
 }
 
 /// RFC 8446 §4.4.2.2, RFC 5280 §4.2.1.3: a leaf whose `keyUsage` is present

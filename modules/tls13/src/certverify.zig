@@ -35,6 +35,7 @@ const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
 const ct25519 = @import("ct25519");
+const x509 = @import("x509");
 const burn = @import("burn.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa;
@@ -198,6 +199,70 @@ pub const PublicKey = union(enum) {
     mldsa65: []const u8,
     mldsa87: []const u8,
 };
+
+pub const KeyError = error{
+    /// The certificate or SubjectPublicKeyInfo does not decode (through `x509`'s bounds-checked reader).
+    MalformedCertificate,
+    /// A public-key algorithm `PublicKey` has no arm for: an EC key without a named curve or on another
+    /// curve, `rsassa-pss`-tagged RSA keys, anything else.
+    UnsupportedPublicKeyAlgorithm,
+    /// The key bytes fail to parse under the declared algorithm (a bad SEC1 point, RSA DER, a wrong-length
+    /// Ed25519 or ML-DSA key) or its parameters are present where RFC 8410 / RFC 9881 say absent.
+    InvalidPublicKey,
+};
+
+/// The `PublicKey` for a certificate's `SubjectPublicKeyInfo` (through `x509.spkiOf`: std's certificate
+/// parser indexes without bounds checks and is not safe on a peer's bytes): RSA (`rsaEncryption`), ECDSA
+/// P-256 / P-384 / P-521, Ed25519, ML-DSA-44/65/87. The ML-DSA arms borrow the key from `cert_der`.
+/// Shared by the engines (`dtls`, `tlsserver`).
+pub fn publicKeyFromCert(cert_der: []const u8) KeyError!PublicKey {
+    return publicKeyFromSpki(x509.spkiOf(cert_der) catch return error.MalformedCertificate);
+}
+
+/// `publicKeyFromCert` for a bare DER `SubjectPublicKeyInfo` (an RFC 7250 raw public key).
+pub fn publicKeyFromSpkiDer(spki_der: []const u8) KeyError!PublicKey {
+    return publicKeyFromSpki(x509.parseSpki(spki_der) catch return error.MalformedCertificate);
+}
+
+fn publicKeyFromSpki(spki: x509.Spki) KeyError!PublicKey {
+    const bits = spki.key_bits;
+    if (spki.algorithmIs(&x509.safe.oid_rsa_encryption))
+        return .{ .rsa = rsa.PublicKey.fromDer(bits) catch return error.InvalidPublicKey };
+    if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
+        // No named curve (implicitCurve / specifiedCurve) is not guessed at: unsupported.
+        const curve = spki.namedCurveOid() orelse return error.UnsupportedPublicKeyAlgorithm;
+        if (std.mem.eql(u8, curve, &x509.safe.oid_prime256v1))
+            return .{ .ecdsa_p256 = Ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(bits) catch return error.InvalidPublicKey };
+        if (std.mem.eql(u8, curve, &x509.safe.oid_secp384r1))
+            return .{ .ecdsa_p384 = Ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(bits) catch return error.InvalidPublicKey };
+        if (std.mem.eql(u8, curve, &x509.safe.oid_secp521r1))
+            return .{ .ecdsa_p521 = EcdsaP521.PublicKey.fromSec1(bits) catch return error.InvalidPublicKey };
+        return error.UnsupportedPublicKeyAlgorithm;
+    }
+    if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
+        // RFC 8410 §3: the parameters MUST be absent (Go: "Ed25519 key encoded with illegal parameters").
+        if (spki.parameters != null) return error.InvalidPublicKey;
+        const n = Ed25519.PublicKey.encoded_length;
+        if (bits.len != n) return error.InvalidPublicKey;
+        return .{ .ed25519 = Ed25519.PublicKey.fromBytes(bits[0..n].*) catch return error.InvalidPublicKey };
+    }
+    // ML-DSA (RFC 9881): the encoded key, borrowed from the input.
+    if (x509.MlDsa.map.get(spki.algorithm_oid)) |set| {
+        // RFC 9881 §2: the parameters MUST be absent. A key of another length is a malformed
+        // certificate, not a signature that fails.
+        if (spki.parameters != null) return error.InvalidPublicKey;
+        switch (set) {
+            inline else => |c| if (bits.len != x509.MlDsa.Impl(c).PublicKey.encoded_length) return error.InvalidPublicKey,
+        }
+        return switch (set) {
+            .ml_dsa_44 => .{ .mldsa44 = bits },
+            .ml_dsa_65 => .{ .mldsa65 = bits },
+            .ml_dsa_87 => .{ .mldsa87 = bits },
+        };
+    }
+    // Includes `rsassa-pss`-tagged keys, which carry their own OID.
+    return error.UnsupportedPublicKeyAlgorithm;
+}
 
 /// A CertificateVerify-capable secret (signing) key, tagged by key family --
 /// see `PublicKey`'s doc comment for the family/scheme pairing rule.
@@ -1584,4 +1649,46 @@ test "signWith: an RSA-PSS signature with a per-key blinding cache is the one si
     // The cache drew its pair from its own generator.
     var fresh = std.Random.DefaultPrng.init(4);
     try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&fresh), std.mem.asBytes(&blind_prng)));
+}
+
+// ── publicKeyFromCert / publicKeyFromSpkiDer ────────────────────────────────
+
+fn spkiDer(comptime prefix: []const u8, key: []const u8, out: []u8) []u8 {
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..][0..key.len], key);
+    return out[0 .. prefix.len + key.len];
+}
+
+test "publicKeyFromSpkiDer: Ed25519, P-256 and P-384 keys, and the KAT signature verifies under them" {
+    var buf: [200]u8 = undefined;
+    // SEQUENCE { SEQUENCE { OID id-Ed25519 }, BIT STRING (0 unused bits, 32 bytes) }
+    const ed = try publicKeyFromSpkiDer(spkiDer("\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00", &kat.ed25519_client.public_key_bytes, &buf));
+    try testing.expect(ed == .ed25519);
+    try verify(.ed25519, ed, .client, &kat.ed25519_client.transcript_hash, &kat.ed25519_client.signature);
+    try testing.expectError(error.InvalidSignature, verify(.ed25519, ed, .server, &kat.ed25519_client.transcript_hash, &kat.ed25519_client.signature));
+
+    const p256_key = try publicKeyFromSpkiDer(spkiDer("\x30\x59\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00", &kat.ecdsa_p256_server.public_key_uncompressed_sec1, &buf));
+    try testing.expect(p256_key == .ecdsa_p256);
+    try verify(.ecdsa_secp256r1_sha256, p256_key, .server, &kat.ecdsa_p256_server.transcript_hash, &kat.ecdsa_p256_server.signature_der);
+
+    const p384_key = try publicKeyFromSpkiDer(spkiDer("\x30\x76\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22\x03\x62\x00", &kat.ecdsa_p384_server.public_key_uncompressed_sec1, &buf));
+    try testing.expect(p384_key == .ecdsa_p384);
+}
+
+test "publicKeyFromSpkiDer: refusals are typed" {
+    var buf: [200]u8 = undefined;
+    const ed_key = &kat.ed25519_client.public_key_bytes;
+    // Ed25519 with a 31-byte key, and with parameters (RFC 8410 §3: MUST be absent).
+    try testing.expectError(error.InvalidPublicKey, publicKeyFromSpkiDer(spkiDer("\x30\x29\x30\x05\x06\x03\x2b\x65\x70\x03\x20\x00", ed_key[0..31], &buf)));
+    try testing.expectError(error.InvalidPublicKey, publicKeyFromSpkiDer(spkiDer("\x30\x2c\x30\x07\x06\x03\x2b\x65\x70\x05\x00\x03\x21\x00", ed_key, &buf)));
+    // A P-256 key that is not on the curve.
+    try testing.expectError(error.InvalidPublicKey, publicKeyFromSpkiDer(spkiDer("\x30\x59\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00", &(@as([65]u8, @splat(4))), &buf)));
+    // secp256k1, a curve with no arm; and no named curve at all.
+    try testing.expectError(error.UnsupportedPublicKeyAlgorithm, publicKeyFromSpkiDer(spkiDer("\x30\x56\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x0a\x03\x42\x00", &kat.ecdsa_p256_server.public_key_uncompressed_sec1, &buf)));
+    try testing.expectError(error.UnsupportedPublicKeyAlgorithm, publicKeyFromSpkiDer(spkiDer("\x30\x4f\x30\x09\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x03\x42\x00", &kat.ecdsa_p256_server.public_key_uncompressed_sec1, &buf)));
+    // id-RSASSA-PSS (1.2.840.113549.1.1.10) and an arbitrary other OID.
+    try testing.expectError(error.UnsupportedPublicKeyAlgorithm, publicKeyFromSpkiDer(spkiDer("\x30\x30\x30\x0b\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a\x03\x21\x00", ed_key, &buf)));
+    // Not DER at all.
+    try testing.expectError(error.MalformedCertificate, publicKeyFromSpkiDer("not a SubjectPublicKeyInfo"));
+    try testing.expectError(error.MalformedCertificate, publicKeyFromCert("junk"));
 }

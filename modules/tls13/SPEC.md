@@ -52,12 +52,12 @@ The TLS 1.3 handshake building blocks that more than one TLS-family engine in th
 needs, so each is written, anchored and audited once:
 
 - the RFC 8446 §7.1 key schedule (`keyschedule.zig`);
-- the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`);
+- the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify, and the `PublicKey` of a certificate's or raw public key's SubjectPublicKeyInfo (`certverify.publicKeyFromCert`, `publicKeyFromSpkiDer`: RSA, ECDSA P-256/384/521, Ed25519, ML-DSA, through `x509`'s bounds-checked walk; the one place both engines read a peer's key) (`certverify.zig`);
 - the (EC)DHE key exchange for x25519, secp256r1, secp384r1, secp521r1, ffdhe2048..ffdhe8192, ML-KEM-512/768/1024 and the hybrids X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 (`kex.zig`, `ffdhe.zig`);
 - the handshake transcript hash, generic over the suite hash (`transcript.zig`).
 
 **Not here:** anything that sends, parses or decides — handshake messages, the state machine,
-record protection, certificate parsing and chain verification, choosing a signature scheme or
+record protection, certificate chain verification (policy and anchors differ per engine), choosing a signature scheme or
 which groups to advertise and offer. Those stay in the engines (`dtls`, `tlsserver`,
 `tlsclient`) until a second engine needs the same piece; then it moves here (*Backlog*).
 
@@ -396,8 +396,5 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
 
 - *BOUNCED (quiet-host):* **Performance: `cli_x25519`.** `cli_x25519` (`ct25519`'s ladder against s2n-bignum) is the row over the 1.25×
   fastest-candidate bound; re-measure on a quiet host before the card says P1.
-- **`dtls` engine groups:** `tlsserver` serves secp521r1, MLKEM512/768/1024 and the NIST hybrids
-  (`extra_groups`, live against OpenSSL 3.5 and Go 1.26); `dtls` keeps its own accepted group list
-  without them.
-- **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
-  (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
+
+None open.
