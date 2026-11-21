@@ -21,7 +21,7 @@
 #              EXAMPLE judges itself against.
 #   interop  — what `zig build interop-<m>` needs, and NOTHING here is reached
 #              by any test: a C compiler and wolfSSL headers (dtls), and
-#              jinja2 / sympy / brotli / protobuf, a grpcio venv and an
+#              jinja2 / sympy / brotli / protobuf / pyarrow, a grpcio venv and an
 #              asyncua venv (the Python-driven ones; `signal` needs only
 #              python3, `dns` no peer at all). Since 2026-10-07 also the
 #              peers of the thirteen formerly local-only programs (netns
@@ -244,9 +244,13 @@ echo "::group::interop: python oracles"
 # full CI 43645078985) -- a moved oracle. A bump re-takes the fixtures with it.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
     "jinja2==3.1.6" "sympy==1.14.0" "brotli==1.2.1" "protobuf==4.21.12" >/dev/null 2>&1 || true
+# `interop-arrow` reads the writer's files back with pyarrow (modules/arrow/tools/check_ours.py), the version the
+# arrow card's reference names. Its own install line: a resolver conflict here must not take the four above with it.
+sudo pip3 install --break-system-packages -q --root-user-action=ignore "pyarrow==26.0.1" >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
-                   ("brotli", "brotli"), ("google.protobuf", "protobuf")):
+                   ("brotli", "brotli"), ("google.protobuf", "protobuf"),
+                   ("pyarrow", "pyarrow")):
     try:
         import importlib
         m = importlib.import_module(mod)
