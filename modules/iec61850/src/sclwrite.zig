@@ -19,12 +19,12 @@
 //! log / setting-group / GOOSE control blocks and instance values, and the whole
 //! `DataTypeTemplates` section.
 //!
-//! What is **not** emitted, because `scl.zig` does not parse it and inventing it
-//! would be worse than leaving it out: the `Substation` section, `Private` and
-//! `Text` elements, `Services`, `SampledValueControl` and `Inputs`/`ExtRef`.
-//! A document that had them loses them; `emitParsed` says so by refusing when
-//! `Scl.has_substation` is set unless the caller opts in. This is a *model*
-//! writer, not a round-tripping editor for someone else's file.
+//! Also emitted: the `Substation` section, `Services`, `Inputs`/`ExtRef`,
+//! `SampledValueControl`, the `desc` of the nodes and control blocks, and every
+//! `Text`/`Private` (and any other element the model has no field for) that
+//! `scl.zig` carried verbatim in an `Extras`. What is still the writer's own:
+//! attribute order, whitespace, comments and processing instructions, and an
+//! attribute that no field models (`emitParsed` cannot tell it was there).
 //!
 //! Two structural notes:
 //!
@@ -69,7 +69,9 @@ pub const Options = struct {
     indent: bool = true,
     /// Refuse a type graph with a cycle rather than writing it out.
     check_types: bool = true,
-    /// Emit a document even though the source had sections this writer drops.
+    /// Retained for source compatibility; it has no effect. Before the
+    /// `Substation` section was modelled, `emitParsed` refused a document that
+    /// had one unless this was set.
     allow_lossy: bool = false,
 };
 
@@ -80,13 +82,21 @@ pub const Document = struct {
     subnetworks: []const scl.Subnetwork = &.{},
     ieds: []const scl.Ied = &.{},
     templates: scl.Templates = .{},
+    substations: []const scl.Substation = &.{},
+    /// The `SCL` element's `version`, `revision` and `release`.
+    version: []const u8 = "",
+    revision: []const u8 = "",
+    release: []const u8 = "",
+    /// Prefixed namespace declarations to put on the root.
+    extra_namespaces: []const xml.NsDecl = &.{},
+    extras: scl.Extras = .{},
+    comm_extras: scl.Extras = .{},
 };
 
-/// Serialises a parsed document. Fails with `LossyDocument` when the source had
-/// a `Substation` section, because dropping the single-line diagram silently is
-/// exactly the kind of thing that makes a round trip a lie.
+/// Serialises a parsed document, `Substation` section and all. The caller owns
+/// the returned bytes. `LossyDocument` is no longer returned (see
+/// `Options.allow_lossy`).
 pub fn emitParsed(gpa: std.mem.Allocator, s: *const scl.Scl, options: Options) Error![]u8 {
-    if (s.has_substation and !options.allow_lossy) return error.LossyDocument;
     var o = options;
     if (o.namespace == null and s.doc.root.uri.len > 0) o.namespace = s.doc.root.uri;
     return emit(gpa, .{
@@ -94,6 +104,13 @@ pub fn emitParsed(gpa: std.mem.Allocator, s: *const scl.Scl, options: Options) E
         .subnetworks = s.subnetworks,
         .ieds = s.ieds,
         .templates = s.templates,
+        .substations = s.substations,
+        .version = s.version,
+        .revision = s.revision,
+        .release = s.release,
+        .extra_namespaces = s.extra_namespaces,
+        .extras = s.extras,
+        .comm_extras = s.comm_extras,
     }, o);
 }
 
@@ -105,27 +122,45 @@ pub fn emit(gpa: std.mem.Allocator, doc: Document, options: Options) Error![]u8 
     errdefer w.buf.deinit(gpa);
 
     try w.raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    w.extra_namespaces = doc.extra_namespaces;
     try w.raw("<SCL xmlns=\"");
     try w.text(options.namespace orelse scl.ns_2007);
-    try w.raw("\">\n");
+    try w.raw("\"");
+    for (doc.extra_namespaces) |d| {
+        try w.raw(" xmlns:");
+        try w.raw(d.prefix);
+        try w.raw("=\"");
+        try w.attrValue(d.uri);
+        try w.raw("\"");
+    }
+    try w.attrIf("version", doc.version);
+    try w.attrIf("revision", doc.revision);
+    try w.attrIf("release", doc.release);
+    try w.raw(">\n");
     w.depth = 1;
 
+    try w.rawAll(doc.extras.head);
     try w.open("Header");
     try w.attr("id", doc.header.id);
     try w.attrIf("version", doc.header.version);
     try w.attrIf("revision", doc.header.revision);
     try w.attrIf("toolID", doc.header.tool_id);
     try w.attrIf("nameStructure", doc.header.name_structure);
-    try w.closeEmpty();
+    try w.closeExtras(doc.header.extras, "Header");
 
-    if (doc.subnetworks.len > 0) {
+    for (doc.substations) |sub| try emitSubstation(&w, sub);
+
+    if (doc.subnetworks.len > 0 or !doc.comm_extras.isEmpty()) {
         try w.openDone("Communication");
+        try w.rawAll(doc.comm_extras.head);
         for (doc.subnetworks) |sub| try emitSubnetwork(&w, sub);
+        try w.rawAll(doc.comm_extras.tail);
         try w.end("Communication");
     }
 
     for (doc.ieds) |ied| try emitIed(&w, ied);
     try emitTemplates(&w, doc.templates);
+    try w.rawAll(doc.extras.tail);
 
     w.depth = 0;
     try w.raw("</SCL>\n");
@@ -179,27 +214,163 @@ fn walkDa(t: scl.Templates, id: []const u8, path: *[max_type_depth][]const u8, d
 
 // ── the sections ────────────────────────────────────────────────────────────
 
+fn emitSubstation(w: *Writer, sub: scl.Substation) Error!void {
+    try w.open("Substation");
+    try w.attr("name", sub.name);
+    try w.attrIf("desc", sub.desc);
+    const empty = sub.voltage_levels.len == 0 and sub.general_equipment.len == 0 and
+        sub.power_transformers.len == 0 and sub.lnodes.len == 0 and sub.extras.isEmpty();
+    if (empty) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(sub.extras.head);
+    for (sub.power_transformers) |p| try emitPowerTransformer(w, p);
+    for (sub.general_equipment) |e| try emitEquipment(w, e);
+    for (sub.lnodes) |l| try emitLNode(w, l);
+    for (sub.voltage_levels) |v| try emitVoltageLevel(w, v);
+    try w.rawAll(sub.extras.tail);
+    try w.end("Substation");
+}
+
+fn emitVoltageLevel(w: *Writer, v: scl.VoltageLevel) Error!void {
+    try w.open("VoltageLevel");
+    try w.attr("name", v.name);
+    try w.attrIf("desc", v.desc);
+    try w.attrIf("nomFreq", v.nom_freq);
+    try w.attrIf("numPhases", v.num_phases);
+    const empty = v.voltage == null and v.bays.len == 0 and v.general_equipment.len == 0 and
+        v.power_transformers.len == 0 and v.lnodes.len == 0 and v.extras.isEmpty();
+    if (empty) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(v.extras.head);
+    for (v.power_transformers) |p| try emitPowerTransformer(w, p);
+    for (v.general_equipment) |e| try emitEquipment(w, e);
+    for (v.lnodes) |l| try emitLNode(w, l);
+    if (v.voltage) |vo| {
+        try w.open("Voltage");
+        if (!std.mem.eql(u8, vo.unit, "V")) try w.attrIf("unit", vo.unit);
+        try w.attrIf("multiplier", vo.multiplier);
+        try w.closeInline();
+        try w.text(vo.value);
+        try w.rawEnd("Voltage");
+    }
+    for (v.bays) |b| try emitBay(w, b);
+    try w.rawAll(v.extras.tail);
+    try w.end("VoltageLevel");
+}
+
+fn emitBay(w: *Writer, b: scl.Bay) Error!void {
+    try w.open("Bay");
+    try w.attr("name", b.name);
+    try w.attrIf("desc", b.desc);
+    const empty = b.equipment.len == 0 and b.general_equipment.len == 0 and
+        b.power_transformers.len == 0 and b.connectivity_nodes.len == 0 and
+        b.lnodes.len == 0 and b.extras.isEmpty();
+    if (empty) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(b.extras.head);
+    for (b.power_transformers) |p| try emitPowerTransformer(w, p);
+    for (b.general_equipment) |e| try emitEquipment(w, e);
+    for (b.lnodes) |l| try emitLNode(w, l);
+    for (b.equipment) |e| try emitEquipment(w, e);
+    for (b.connectivity_nodes) |c| {
+        try w.open("ConnectivityNode");
+        try w.attr("name", c.name);
+        try w.attr("pathName", c.path_name);
+        try w.attrIf("desc", c.desc);
+        try w.closeEmpty();
+    }
+    try w.rawAll(b.extras.tail);
+    try w.end("Bay");
+}
+
+fn emitPowerTransformer(w: *Writer, p: scl.PowerTransformer) Error!void {
+    try w.open("PowerTransformer");
+    try w.attr("name", p.name);
+    try w.attrIf("desc", p.desc);
+    try w.attr("type", p.type);
+    if (p.virtual) try w.attrBool("virtual", true);
+    const empty = p.windings.len == 0 and p.terminals.len == 0 and p.lnodes.len == 0 and p.extras.isEmpty();
+    if (empty) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(p.extras.head);
+    for (p.lnodes) |l| try emitLNode(w, l);
+    for (p.terminals) |t| try emitTerminal(w, t);
+    for (p.windings) |e| try emitEquipment(w, e);
+    try w.rawAll(p.extras.tail);
+    try w.end("PowerTransformer");
+}
+
+fn emitEquipment(w: *Writer, e: scl.Equipment) Error!void {
+    const tag: []const u8 = switch (e.kind) {
+        .conducting => "ConductingEquipment",
+        .general => "GeneralEquipment",
+        .winding => "TransformerWinding",
+    };
+    try w.open(tag);
+    try w.attr("name", e.name);
+    try w.attrIf("desc", e.desc);
+    try w.attr("type", e.type);
+    if (e.virtual) try w.attrBool("virtual", true);
+    if (e.terminals.len == 0 and e.lnodes.len == 0 and e.extras.isEmpty()) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(e.extras.head);
+    for (e.lnodes) |l| try emitLNode(w, l);
+    for (e.terminals) |t| try emitTerminal(w, t);
+    try w.rawAll(e.extras.tail);
+    try w.end(tag);
+}
+
+fn emitLNode(w: *Writer, l: scl.LNodeRef) Error!void {
+    try w.open("LNode");
+    if (!std.mem.eql(u8, l.ied_name, "None")) try w.attrIf("iedName", l.ied_name);
+    try w.attrIf("ldInst", l.ld_inst);
+    try w.attrIf("prefix", l.prefix);
+    try w.attr("lnClass", l.ln_class);
+    try w.attrIf("lnInst", l.ln_inst);
+    try w.attrIf("lnType", l.ln_type);
+    try w.attrIf("desc", l.desc);
+    try w.closeEmpty();
+}
+
+fn emitTerminal(w: *Writer, t: scl.Terminal) Error!void {
+    try w.open("Terminal");
+    try w.attrIf("name", t.name);
+    try w.attr("connectivityNode", t.connectivity_node);
+    try w.attrIf("substationName", t.substation_name);
+    try w.attrIf("voltageLevelName", t.voltage_level_name);
+    try w.attrIf("bayName", t.bay_name);
+    try w.attrIf("lineName", t.line_name);
+    try w.attr("cNodeName", t.c_node_name);
+    try w.attrIf("desc", t.desc);
+    try w.closeEmpty();
+}
+
 fn emitSubnetwork(w: *Writer, sub: scl.Subnetwork) Error!void {
     try w.open("SubNetwork");
     try w.attr("name", sub.name);
     try w.attrIf("type", sub.type);
-    if (sub.aps.len == 0) return w.closeEmpty();
+    try w.attrIf("desc", sub.desc);
+    if (sub.aps.len == 0 and sub.extras.isEmpty()) return w.closeEmpty();
     try w.closeOpen();
+    try w.rawAll(sub.extras.head);
     for (sub.aps) |ap| {
         try w.open("ConnectedAP");
         try w.attr("iedName", ap.ied_name);
         try w.attr("apName", ap.ap_name);
-        const empty = ap.address.params.len == 0 and ap.gse.len == 0 and ap.smv.len == 0;
+        const empty = ap.address.params.len == 0 and ap.gse.len == 0 and ap.smv.len == 0 and ap.extras.isEmpty();
         if (empty) {
             try w.closeEmpty();
             continue;
         }
         try w.closeOpen();
+        try w.rawAll(ap.extras.head);
         try emitAddress(w, ap.address);
         for (ap.gse) |g| try emitCbAddress(w, "GSE", g);
         for (ap.smv) |g| try emitCbAddress(w, "SMV", g);
+        try w.rawAll(ap.extras.tail);
         try w.end("ConnectedAP");
     }
+    try w.rawAll(sub.extras.tail);
     try w.end("SubNetwork");
 }
 
@@ -221,9 +392,11 @@ fn emitCbAddress(w: *Writer, tag: []const u8, g: scl.CbAddress) Error!void {
     try w.attr("ldInst", g.ld_inst);
     try w.attr("cbName", g.cb_name);
     try w.closeOpen();
+    try w.rawAll(g.extras.head);
     try emitAddress(w, g.address);
     if (g.min_time_ms) |v| try w.textElement("MinTime", v);
     if (g.max_time_ms) |v| try w.textElement("MaxTime", v);
+    try w.rawAll(g.extras.tail);
     try w.end(tag);
 }
 
@@ -231,32 +404,58 @@ fn emitIed(w: *Writer, ied: scl.Ied) Error!void {
     try w.open("IED");
     try w.attr("name", ied.name);
     try w.attrIf("type", ied.type);
+    try w.attrIf("desc", ied.desc);
     try w.attrIf("manufacturer", ied.manufacturer);
     try w.attrIf("configVersion", ied.config_version);
-    if (ied.access_points.len == 0) return w.closeEmpty();
+    try w.attrIf("owner", ied.owner);
+    if (ied.access_points.len == 0 and ied.services == null and ied.extras.isEmpty()) return w.closeEmpty();
     try w.closeOpen();
+    try w.rawAll(ied.extras.head);
+    if (ied.services) |sv| try emitServices(w, sv);
     for (ied.access_points) |ap| {
         try w.open("AccessPoint");
         try w.attr("name", ap.name);
-        if (ap.devices.len == 0) {
+        try w.attrIf("desc", ap.desc);
+        const empty = ap.devices.len == 0 and ap.services == null and
+            ap.extras.isEmpty() and ap.server_extras.isEmpty();
+        if (empty) {
             try w.closeEmpty();
             continue;
         }
         try w.closeOpen();
-        try w.openDone("Server");
-        for (ap.devices) |ld| try emitLDevice(w, ld);
-        try w.end("Server");
+        try w.rawAll(ap.extras.head);
+        if (ap.devices.len > 0 or !ap.server_extras.isEmpty()) {
+            try w.openDone("Server");
+            try w.rawAll(ap.server_extras.head);
+            for (ap.devices) |ld| try emitLDevice(w, ld);
+            try w.rawAll(ap.server_extras.tail);
+            try w.end("Server");
+        }
+        if (ap.services) |sv| try emitServices(w, sv);
+        try w.rawAll(ap.extras.tail);
         try w.end("AccessPoint");
     }
+    try w.rawAll(ied.extras.tail);
     try w.end("IED");
+}
+
+fn emitServices(w: *Writer, sv: scl.Services) Error!void {
+    try w.open("Services");
+    try w.attrIf("nameLength", sv.name_length);
+    if (sv.elements.len == 0) return w.closeEmpty();
+    try w.closeOpen();
+    try w.rawAll(sv.elements);
+    try w.end("Services");
 }
 
 fn emitLDevice(w: *Writer, ld: scl.LDevice) Error!void {
     try w.open("LDevice");
     try w.attr("inst", ld.inst);
     try w.attrIf("ldName", ld.ld_name);
-    if (ld.lns.len == 0) return w.closeEmpty();
+    try w.attrIf("desc", ld.desc);
+    if (ld.lns.len == 0 and ld.extras.isEmpty()) return w.closeEmpty();
     try w.closeOpen();
+    try w.rawAll(ld.extras.head);
     // `LN0` must come first — the schema sequences it before the `LN`s.
     for (ld.lns) |ln| {
         if (ln.is_ln0) try emitLn(w, ln);
@@ -264,31 +463,36 @@ fn emitLDevice(w: *Writer, ld: scl.LDevice) Error!void {
     for (ld.lns) |ln| {
         if (!ln.is_ln0) try emitLn(w, ln);
     }
+    try w.rawAll(ld.extras.tail);
     try w.end("LDevice");
 }
 
 fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
     const tag: []const u8 = if (ln.is_ln0) "LN0" else "LN";
     try w.open(tag);
+    try w.attrIf("desc", ln.desc);
     try w.attrIf("prefix", ln.prefix);
     try w.attr("lnClass", ln.ln_class);
     try w.attr("inst", ln.inst);
     try w.attr("lnType", ln.ln_type);
     const empty = ln.dois.len == 0 and ln.data_sets.len == 0 and
         ln.report_controls.len == 0 and ln.gse_controls.len == 0 and
+        ln.smv_controls.len == 0 and ln.inputs == null and ln.extras.isEmpty() and
         ln.log_controls.len == 0 and ln.logs.len == 0 and ln.setting_control == null;
     if (empty) return w.closeEmpty();
     try w.closeOpen();
+    try w.rawAll(ln.extras.head);
 
     for (ln.data_sets) |ds| {
         try w.open("DataSet");
         try w.attr("name", ds.name);
         try w.attrIf("desc", ds.desc);
-        if (ds.fcdas.len == 0) {
+        if (ds.fcdas.len == 0 and ds.extras.isEmpty()) {
             try w.closeEmpty();
             continue;
         }
         try w.closeOpen();
+        try w.rawAll(ds.extras.head);
         for (ds.fcdas) |f| {
             try w.open("FCDA");
             try w.attrIf("ldInst", f.ld_inst);
@@ -300,6 +504,7 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
             try w.attr("fc", f.fc.name());
             try w.closeEmpty();
         }
+        try w.rawAll(ds.extras.tail);
         try w.end("DataSet");
     }
 
@@ -308,6 +513,7 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
     for (ln.log_controls) |l| {
         try w.open("LogControl");
         try w.attr("name", l.name);
+        try w.attrIf("desc", l.desc);
         // `datSet` and `logName` are written even when empty: the schema makes
         // `logName` mandatory, and a third-party model generator refuses a
         // `LogControl` without it. An empty attribute and an absent one are
@@ -334,15 +540,26 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
     for (ln.gse_controls) |g| {
         try w.open("GSEControl");
         try w.attr("name", g.name);
+        try w.attrIf("desc", g.desc);
         try w.attrIf("appID", g.app_id);
         try w.attrIf("datSet", g.dat_set);
         try w.attrUintDefault("confRev", g.conf_rev, 1);
         if (!std.mem.eql(u8, g.type, "GOOSE")) try w.attrIf("type", g.type);
         try w.attrBoolDefault("fixedOffs", g.fixed_offs, false);
-        try w.closeEmpty();
+        try w.closeExtras(g.extras, "GSEControl");
     }
 
+    for (ln.smv_controls) |sv| try emitSmvControl(w, sv);
+
     for (ln.dois) |d| try emitDoi(w, d);
+
+    if (ln.inputs) |inp| {
+        try w.openDone("Inputs");
+        try w.rawAll(inp.extras.head);
+        for (inp.ext_refs) |r| try emitExtRef(w, r);
+        try w.rawAll(inp.extras.tail);
+        try w.end("Inputs");
+    }
 
     // `<Log>` sits after the `DOI`s in `tAnyLN`'s sequence, which is where the
     // schema puts it and where every generator reading the file back expects
@@ -353,12 +570,66 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
         try w.attrIf("desc", l.desc);
         try w.closeEmpty();
     }
+    try w.rawAll(ln.extras.tail);
     try w.end(tag);
+}
+
+fn emitSmvControl(w: *Writer, sv: scl.SmvControl) Error!void {
+    try w.open("SampledValueControl");
+    try w.attr("name", sv.name);
+    try w.attrIf("desc", sv.desc);
+    try w.attrIf("datSet", sv.dat_set);
+    try w.attrUintDefault("confRev", sv.conf_rev, 1);
+    try w.attrIf("smvID", sv.smv_id);
+    try w.attrBoolDefault("multicast", sv.multicast, true);
+    try w.attrUint("smpRate", sv.smp_rate);
+    try w.attrUint("nofASDU", sv.nof_asdu);
+    if (!std.mem.eql(u8, sv.smp_mod, "SmpPerPeriod")) try w.attrIf("smpMod", sv.smp_mod);
+    try w.attrIf("securityEnable", sv.security_enable);
+    try w.closeOpen();
+    try w.rawAll(sv.extras.head);
+    const d = scl.SmvOpts{};
+    try w.open("SmvOpts");
+    try w.attrBoolDefault("refreshTime", sv.opts.refresh_time, d.refresh_time);
+    try w.attrBoolDefault("sampleSynchronized", sv.opts.sample_synchronized, d.sample_synchronized);
+    try w.attrBoolDefault("sampleRate", sv.opts.sample_rate, d.sample_rate);
+    try w.attrBoolDefault("dataSet", sv.opts.data_set, d.data_set);
+    try w.attrBoolDefault("security", sv.opts.security, d.security);
+    try w.attrBoolDefault("timestamp", sv.opts.timestamp, d.timestamp);
+    try w.attrBoolDefault("synchSourceId", sv.opts.synch_source_id, d.synch_source_id);
+    try w.closeEmpty();
+    try w.rawAll(sv.extras.tail);
+    try w.end("SampledValueControl");
+}
+
+fn emitExtRef(w: *Writer, r: scl.ExtRef) Error!void {
+    try w.open("ExtRef");
+    try w.attrIf("iedName", r.ied_name);
+    try w.attrIf("ldInst", r.ld_inst);
+    try w.attrIf("prefix", r.prefix);
+    try w.attrIf("lnClass", r.ln_class);
+    try w.attrIf("lnInst", r.ln_inst);
+    try w.attrIf("doName", r.do_name);
+    try w.attrIf("daName", r.da_name);
+    try w.attrIf("intAddr", r.int_addr);
+    try w.attrIf("desc", r.desc);
+    try w.attrIf("serviceType", r.service_type);
+    try w.attrIf("srcLDInst", r.src_ld_inst);
+    try w.attrIf("srcPrefix", r.src_prefix);
+    try w.attrIf("srcLNClass", r.src_ln_class);
+    try w.attrIf("srcLNInst", r.src_ln_inst);
+    try w.attrIf("srcCBName", r.src_cb_name);
+    try w.attrIf("pLN", r.p_ln);
+    try w.attrIf("pDO", r.p_do);
+    try w.attrIf("pDA", r.p_da);
+    try w.attrIf("pServT", r.p_serv_t);
+    try w.closeEmpty();
 }
 
 fn emitReportControl(w: *Writer, r: scl.ReportControl) Error!void {
     try w.open("ReportControl");
     try w.attr("name", r.name);
+    try w.attrIf("desc", r.desc);
     try w.attrIf("rptID", r.rpt_id);
     try w.attr("datSet", r.dat_set);
     try w.attrUint("confRev", r.conf_rev);
@@ -367,6 +638,7 @@ fn emitReportControl(w: *Writer, r: scl.ReportControl) Error!void {
     try w.attrUintDefault("bufTime", r.buf_time, 0);
     try w.attrBoolDefault("indexed", r.indexed, true);
     try w.closeOpen();
+    try w.rawAll(r.extras.head);
     try emitTrgOps(w, r.trg_ops);
     const d = scl.OptFields{};
     try w.open("OptFields");
@@ -383,6 +655,7 @@ fn emitReportControl(w: *Writer, r: scl.ReportControl) Error!void {
     try w.open("RptEnabled");
     try w.attrUintDefault("max", r.max_instances, 1);
     try w.closeEmpty();
+    try w.rawAll(r.extras.tail);
     try w.end("ReportControl");
 }
 
@@ -401,9 +674,11 @@ fn emitDoi(w: *Writer, d: scl.Doi) Error!void {
     try w.open("DOI");
     try w.attr("name", d.name);
     try w.attrIf("desc", d.desc);
-    if (d.dais.len == 0) return w.closeEmpty();
+    if (d.dais.len == 0 and d.extras.isEmpty()) return w.closeEmpty();
     try w.closeOpen();
+    try w.rawAll(d.extras.head);
     for (d.dais) |dai| try emitDai(w, dai);
+    try w.rawAll(d.extras.tail);
     try w.end("DOI");
 }
 
@@ -549,6 +824,7 @@ const Writer = struct {
     options: Options,
     buf: std.ArrayList(u8) = .empty,
     depth: usize = 0,
+    extra_namespaces: []const xml.NsDecl = &.{},
 
     fn raw(self: *Writer, s: []const u8) Error!void {
         try self.buf.appendSlice(self.gpa, s);
@@ -575,6 +851,53 @@ const Writer = struct {
 
     fn closeEmpty(self: *Writer) Error!void {
         try self.raw("/>\n");
+    }
+
+    /// Closes the start tag of an element whose only possible children are
+    /// carried `Extras`.
+    fn closeExtras(self: *Writer, extras: scl.Extras, name: []const u8) Error!void {
+        if (extras.isEmpty()) return self.closeEmpty();
+        try self.closeOpen();
+        try self.rawAll(extras.head);
+        try self.rawAll(extras.tail);
+        try self.end(name);
+    }
+
+    fn rawAll(self: *Writer, els: []const scl.Raw) Error!void {
+        for (els) |e| try self.rawElement(e);
+    }
+
+    /// Writes an element the model carried verbatim. The element is serialised
+    /// with its own prefixes; a prefix it uses that was declared on an ancestor
+    /// (and not on the root, where `extra_namespaces` puts it) is declared on
+    /// the element itself, so the output stays well-formed namespace-wise.
+    fn rawElement(self: *Writer, el: scl.Raw) Error!void {
+        var decls: std.ArrayList(xml.NsDecl) = .empty;
+        defer decls.deinit(self.gpa);
+        try decls.appendSlice(self.gpa, el.ns_decls);
+        const scope = try el.inScopeNamespaces(self.gpa);
+        defer self.gpa.free(scope);
+        next: for (scope) |d| {
+            if (d.prefix.len == 0) continue;
+            for (el.ns_decls) |own| {
+                if (std.mem.eql(u8, own.prefix, d.prefix)) continue :next;
+            }
+            for (self.extra_namespaces) |root| {
+                if (std.mem.eql(u8, root.prefix, d.prefix) and std.mem.eql(u8, root.uri, d.uri)) continue :next;
+            }
+            try decls.append(self.gpa, d);
+        }
+        var copy = el.*;
+        copy.ns_decls = decls.items;
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        xml.writer.writeElement(self.gpa, &aw.writer, &copy) catch |e| switch (e) {
+            error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+            else => return error.IllegalCharacter,
+        };
+        try self.pad();
+        try self.raw(aw.written());
+        try self.raw("\n");
     }
 
     fn closeOpen(self: *Writer) Error!void {
@@ -802,22 +1125,262 @@ test "a nested DAI path comes back as the same dotted path" {
     try testing.expect(found_ctl and found_nested);
 }
 
-test "a document with a Substation section is refused rather than silently trimmed" {
-    const with_substation =
-        \\<?xml version="1.0" encoding="UTF-8"?>
+/// A substation configuration with everything `scl.zig` used to drop: the
+/// single-line diagram, `Services`, `Inputs`, `SampledValueControl`, `desc`
+/// attributes and vendor `Private` content with its own namespace.
+const scd_source =
+    \\<?xml version="1.0" encoding="UTF-8"?>
+    \\<SCL xmlns="http://www.iec.ch/61850/2007/SCL" xmlns:ext="urn:vendor:ext" version="2007" revision="B" release="4">
+    \\  <Private type="top"><ext:Tool xmlns:inner="urn:inner" inner:k="v">one</ext:Tool></Private>
+    \\  <Header id="X" version="1" nameStructure="IEDName"><Text>about</Text><History><Hitem version="1" revision="a" when="today"/></History></Header>
+    \\  <Substation name="S1" desc="main">
+    \\    <PowerTransformer name="T1" type="PTR">
+    \\      <TransformerWinding name="W1" type="PTW"><Terminal name="T" connectivityNode="S1/E1/Q1/N1" cNodeName="N1"/></TransformerWinding>
+    \\    </PowerTransformer>
+    \\    <VoltageLevel name="E1" nomFreq="50" numPhases="3">
+    \\      <Voltage unit="V" multiplier="k">110</Voltage>
+    \\      <Bay name="Q1" desc="feeder">
+    \\        <LNode iedName="A" ldInst="LD0" lnClass="LLN0"/>
+    \\        <LNode lnClass="XCBR" lnInst="1" lnType="Spec"/>
+    \\        <ConductingEquipment name="QA1" type="CBR" virtual="true">
+    \\          <LNode iedName="A" ldInst="LD0" lnClass="XCBR" lnInst="1"/>
+    \\          <Terminal name="T1" connectivityNode="S1/E1/Q1/N1" cNodeName="N1"/>
+    \\          <SubEquipment name="ph" phase="A"/>
+    \\        </ConductingEquipment>
+    \\        <GeneralEquipment name="G" type="AXN"/>
+    \\        <ConnectivityNode name="N1" pathName="S1/E1/Q1/N1"/>
+    \\        <Function name="F1"><LNode lnClass="PDIS"/></Function>
+    \\      </Bay>
+    \\    </VoltageLevel>
+    \\  </Substation>
+    \\  <Communication>
+    \\    <Text>comm</Text>
+    \\    <SubNetwork name="N" type="8-MMS" desc="bus"><BitRate unit="b/s">100</BitRate>
+    \\      <ConnectedAP iedName="A" apName="P1">
+    \\        <Address><P type="IP">10.0.0.1</P></Address>
+    \\        <SMV ldInst="LD0" cbName="sv1"><Address><P type="APPID">4000</P></Address></SMV>
+    \\        <PhysConn type="Connection"><P type="Plug">RJ45</P></PhysConn>
+    \\      </ConnectedAP>
+    \\    </SubNetwork>
+    \\  </Communication>
+    \\  <IED name="A" desc="relay" owner="grid">
+    \\    <Services nameLength="64">
+    \\      <GetDirectory/><ConfDataSet max="8" maxAttributes="64" modify="false"/><GOOSE max="4"/>
+    \\      <SettingGroups><SGEdit/><ConfSG/></SettingGroups>
+    \\    </Services>
+    \\    <AccessPoint name="P1" desc="ap">
+    \\      <Server><Authentication/>
+    \\        <LDevice inst="LD0" desc="ld">
+    \\          <LN0 lnClass="LLN0" inst="" lnType="L" desc="zero">
+    \\            <DataSet name="DS" desc="ds"><FCDA ldInst="LD0" lnClass="XCBR" lnInst="1" doName="Pos" daName="stVal" fc="ST"/></DataSet>
+    \\            <ReportControl name="R" desc="rc" datSet="DS" confRev="1" buffered="false"><TrgOps dchg="true"/><OptFields/><RptEnabled max="2"/></ReportControl>
+    \\            <GSEControl name="G1" desc="gc" datSet="DS" appID="g"><Private type="p"/></GSEControl>
+    \\            <SampledValueControl name="MSVCB01" desc="sv" datSet="DS" smvID="svid" smpRate="80" nofASDU="1" confRev="2"><SmvOpts refreshTime="true" sampleRate="true"/></SampledValueControl>
+    \\            <SampledValueControl name="USV" datSet="DS" multicast="false" smvID="u" smpRate="4000" nofASDU="8" smpMod="SmpPerSec"><SmvOpts/></SampledValueControl>
+    \\            <Inputs>
+    \\              <ExtRef iedName="B" ldInst="LD0" lnClass="XCBR" lnInst="2" doName="Pos" daName="stVal" intAddr="in1" serviceType="GOOSE" srcLDInst="LD0" srcCBName="gcb" desc="sub"/>
+    \\              <ExtRef intAddr="loose"/>
+    \\              <SourceRef/>
+    \\            </Inputs>
+    \\            <Private type="ln"/>
+    \\          </LN0>
+    \\          <LN lnClass="XCBR" inst="1" lnType="X" desc="breaker"/>
+    \\        </LDevice>
+    \\      </Server>
+    \\      <Services><GetDirectory/></Services>
+    \\    </AccessPoint>
+    \\  </IED>
+    \\  <DataTypeTemplates>
+    \\    <LNodeType id="L" lnClass="LLN0"><DO name="Mod" type="MOD"/></LNodeType>
+    \\    <LNodeType id="X" lnClass="XCBR"><DO name="Pos" type="POS"/></LNodeType>
+    \\    <DOType id="MOD" cdc="ENC"><DA name="stVal" fc="ST" bType="INT32"/></DOType>
+    \\    <DOType id="POS" cdc="DPC"><DA name="stVal" fc="ST" bType="Dbpos"/></DOType>
+    \\  </DataTypeTemplates>
+    \\  <Line name="ln1"/>
+    \\</SCL>
+;
+
+test "a Substation section, Services, Inputs and SampledValueControl are parsed and carried through emit" {
+    var doc = try scl.parse(testing.allocator, scd_source, .{});
+    defer doc.deinit();
+    try testing.expect(doc.has_substation);
+    try testing.expectEqualStrings("2007", doc.version);
+    try testing.expectEqualStrings("B", doc.revision);
+    try testing.expectEqualStrings("4", doc.release);
+    try checkScd(&doc);
+
+    // What the old writer refused is now written, and what it wrote is read
+    // back into the same model.
+    const out = try emitParsed(testing.allocator, &doc, .{});
+    defer testing.allocator.free(out);
+    var again = try scl.parse(testing.allocator, out, .{});
+    defer again.deinit();
+    try checkScd(&again);
+
+    // A second emission is byte-identical: the writer is a fixed point.
+    const out2 = try emitParsed(testing.allocator, &again, .{});
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings(out, out2);
+
+    // `allow_lossy` is a no-op now.
+    const out3 = try emitParsed(testing.allocator, &doc, .{ .allow_lossy = true });
+    defer testing.allocator.free(out3);
+    try testing.expectEqualStrings(out, out3);
+}
+
+fn checkScd(doc: *const scl.Scl) !void {
+    // Substation.
+    try testing.expectEqual(@as(usize, 1), doc.substations.len);
+    const sub = doc.substations[0];
+    try testing.expectEqualStrings("S1", sub.name);
+    try testing.expectEqualStrings("main", sub.desc);
+    try testing.expectEqual(@as(usize, 1), sub.power_transformers.len);
+    try testing.expectEqual(@as(usize, 1), sub.power_transformers[0].windings.len);
+    try testing.expectEqual(scl.EquipmentKind.winding, sub.power_transformers[0].windings[0].kind);
+    try testing.expectEqual(@as(usize, 1), sub.power_transformers[0].windings[0].terminals.len);
+    const vl = sub.voltage_levels[0];
+    try testing.expectEqualStrings("50", vl.nom_freq);
+    try testing.expectEqualStrings("110", vl.voltage.?.value);
+    try testing.expectEqualStrings("k", vl.voltage.?.multiplier);
+    const bay = vl.bays[0];
+    try testing.expectEqualStrings("feeder", bay.desc);
+    try testing.expectEqual(@as(usize, 2), bay.lnodes.len);
+    try testing.expectEqualStrings("A", bay.lnodes[0].ied_name);
+    try testing.expectEqualStrings("None", bay.lnodes[1].ied_name);
+    try testing.expectEqualStrings("Spec", bay.lnodes[1].ln_type);
+    try testing.expectEqual(@as(usize, 1), bay.equipment.len);
+    const cbr = bay.equipment[0];
+    try testing.expectEqualStrings("CBR", cbr.type);
+    try testing.expect(cbr.virtual);
+    try testing.expectEqualStrings("N1", cbr.terminals[0].c_node_name);
+    try testing.expect(cbr.extras.find("SubEquipment") != null);
+    try testing.expectEqual(@as(usize, 1), bay.general_equipment.len);
+    try testing.expectEqualStrings("AXN", bay.general_equipment[0].type);
+    try testing.expectEqual(@as(usize, 1), bay.connectivity_nodes.len);
+    try testing.expect(bay.extras.find("Function") != null);
+    try testing.expectEqual(@as(usize, 2), sub.boundLnodeCount());
+
+    // Private / Text / History survive, with their own namespaces.
+    try testing.expect(doc.extras.find("Private") != null);
+    try testing.expect(doc.extras.find("Line") != null);
+    try testing.expect(doc.header.extras.find("History") != null);
+    try testing.expect(doc.header.extras.find("Text") != null);
+    try testing.expect(doc.comm_extras.find("Text") != null);
+    try testing.expectEqual(@as(usize, 1), doc.extra_namespaces.len);
+    const tool = doc.extras.find("Private").?.firstElementChild().?;
+    try testing.expectEqualStrings("Tool", tool.local);
+    try testing.expectEqualStrings("urn:vendor:ext", tool.uri);
+    try testing.expectEqualStrings("v", tool.attr("urn:inner", "k").?);
+
+    // Communication extras.
+    const net = doc.subnetworks[0];
+    try testing.expectEqualStrings("bus", net.desc);
+    try testing.expect(net.extras.find("BitRate") != null);
+    try testing.expect(net.aps[0].extras.find("PhysConn") != null);
+
+    // Services.
+    const ied = doc.ieds[0];
+    try testing.expectEqualStrings("relay", ied.desc);
+    try testing.expectEqualStrings("grid", ied.owner);
+    const sv = ied.services.?;
+    try testing.expectEqualStrings("64", sv.name_length);
+    try testing.expect(sv.has("GetDirectory"));
+    try testing.expect(!sv.has("FileHandling"));
+    try testing.expectEqual(@as(?u32, 8), sv.number("ConfDataSet", "max"));
+    try testing.expectEqualStrings("false", sv.attribute("ConfDataSet", "modify").?);
+    try testing.expectEqual(@as(?u32, 4), sv.number("GOOSE", "max"));
+    try testing.expect(sv.has("SettingGroups"));
+    try testing.expect(ied.access_points[0].services.?.has("GetDirectory"));
+    try testing.expect(!ied.access_points[0].server_extras.isEmpty());
+    try testing.expectEqualStrings("ap", ied.access_points[0].desc);
+
+    // Logical nodes.
+    const ld = ied.access_points[0].devices[0];
+    try testing.expectEqualStrings("ld", ld.desc);
+    const ln0 = ld.lns[0];
+    try testing.expectEqualStrings("zero", ln0.desc);
+    try testing.expectEqualStrings("breaker", ld.lns[1].desc);
+    try testing.expectEqualStrings("rc", ln0.report_controls[0].desc);
+    try testing.expectEqualStrings("gc", ln0.gse_controls[0].desc);
+    try testing.expect(ln0.gse_controls[0].extras.find("Private") != null);
+    try testing.expectEqualStrings("ds", ln0.data_sets[0].desc);
+    try testing.expect(ln0.extras.find("Private") != null);
+
+    // SampledValueControl.
+    try testing.expectEqual(@as(usize, 2), ln0.smv_controls.len);
+    const m = ln0.smv_controls[0];
+    try testing.expectEqualStrings("MSVCB01", m.name);
+    try testing.expect(m.multicast);
+    try testing.expectEqualStrings("svid", m.smv_id);
+    try testing.expectEqual(@as(u32, 80), m.smp_rate);
+    try testing.expectEqual(@as(u32, 1), m.nof_asdu);
+    try testing.expectEqual(@as(u32, 2), m.conf_rev);
+    try testing.expectEqualStrings("SmpPerPeriod", m.smp_mod);
+    try testing.expect(m.opts.refresh_time and m.opts.sample_rate and !m.opts.data_set);
+    const u = ln0.smv_controls[1];
+    try testing.expect(!u.multicast);
+    try testing.expectEqualStrings("SmpPerSec", u.smp_mod);
+    try testing.expectEqual(@as(u32, 8), u.nof_asdu);
+
+    // Inputs.
+    const inp = ln0.inputs.?;
+    try testing.expectEqual(@as(usize, 2), inp.ext_refs.len);
+    try testing.expectEqualStrings("B", inp.ext_refs[0].ied_name);
+    try testing.expectEqualStrings("in1", inp.ext_refs[0].int_addr);
+    try testing.expectEqualStrings("GOOSE", inp.ext_refs[0].service_type);
+    try testing.expectEqualStrings("gcb", inp.ext_refs[0].src_cb_name);
+    try testing.expectEqualStrings("loose", inp.ext_refs[1].int_addr);
+    try testing.expectEqualStrings("", inp.ext_refs[1].ied_name);
+    try testing.expect(inp.extras.find("SourceRef") != null);
+}
+
+test "sampled-value control blocks are part of the resolved name space, multicast under MS and unicast under US" {
+    var doc = try scl.parse(testing.allocator, scd_source, .{});
+    defer doc.deinit();
+    var model = try scl.resolve(&doc, testing.allocator, "A");
+    defer model.deinit();
+    try testing.expect(model.has("ALD0", "LLN0$MS$MSVCB01"));
+    try testing.expect(model.has("ALD0", "LLN0$MS$MSVCB01$MsvID"));
+    try testing.expect(model.has("ALD0", "LLN0$MS$MSVCB01$DstAddress$APPID"));
+    try testing.expect(model.has("ALD0", "LLN0$US$USV"));
+    try testing.expect(model.has("ALD0", "LLN0$US$USV$UsvID"));
+    try testing.expect(!model.has("ALD0", "LLN0$US$MSVCB01"));
+    try testing.expect(!model.has("ALD0", "LLN0$MS$USV"));
+}
+
+test "Private content keeps a prefix declared on an ancestor other than the root" {
+    const src =
+        \\<SCL xmlns="http://www.iec.ch/61850/2007/SCL">
+        \\  <Header id="X"/>
+        \\  <IED name="A" xmlns:v="urn:v"><Private type="p"><v:Item v:a="1"/></Private></IED>
+        \\</SCL>
+    ;
+    var doc = try scl.parse(testing.allocator, src, .{});
+    defer doc.deinit();
+    const out = try emitParsed(testing.allocator, &doc, .{});
+    defer testing.allocator.free(out);
+    var again = try scl.parse(testing.allocator, out, .{});
+    defer again.deinit();
+    const item = again.ieds[0].extras.find("Private").?.firstElementChild().?;
+    try testing.expectEqualStrings("urn:v", item.uri);
+    try testing.expectEqualStrings("1", item.attr("urn:v", "a").?);
+}
+
+test "an IED without Services keeps services null and LossyDocument is no longer returned" {
+    const src =
         \\<SCL xmlns="http://www.iec.ch/61850/2003/SCL">
         \\  <Header id="X"/>
         \\  <Substation name="S1"/>
+        \\  <IED name="A"/>
         \\</SCL>
     ;
-    var doc = try scl.parse(testing.allocator, with_substation, .{});
+    var doc = try scl.parse(testing.allocator, src, .{});
     defer doc.deinit();
     try testing.expect(doc.has_substation);
-    try testing.expectError(error.LossyDocument, emitParsed(testing.allocator, &doc, .{}));
-    // …and the caller can say "yes, I know".
-    const out = try emitParsed(testing.allocator, &doc, .{ .allow_lossy = true });
+    try testing.expect(doc.ieds[0].services == null);
+    const out = try emitParsed(testing.allocator, &doc, .{});
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.find(u8, out, "Substation") == null);
+    try testing.expect(std.mem.find(u8, out, "<Substation name=\"S1\"/>") != null);
 }
 
 test "a cyclic type graph is refused before anything is written" {

@@ -236,6 +236,260 @@ pub const Header = struct {
     tool_id: []const u8 = "",
     /// `IEDName` (the only value edition 2 allows) or `FuncName`.
     name_structure: []const u8 = "",
+    /// `Text` and the `History` of `Hitem`s.
+    extras: Extras = .{},
+};
+
+/// An element this model keeps **verbatim**: it points into the document tree
+/// that the `Scl` owns, so it lives exactly as long as the `Scl` does.
+pub const Raw = *const xml.Element;
+
+/// What a container carries that no typed field above models: `Text` and
+/// `Private` (the schema puts them first, and `Private` is by definition the
+/// vendor's own — it is carried, never interpreted) and any other child element
+/// the model has no field for (`Line`, `Process`, `Function`, `SubEquipment`,
+/// `TapChanger`, …). `sclwrite` writes `head` before the typed children and
+/// `tail` after them, so a document comes back with them in a schema-valid
+/// position.
+pub const Extras = struct {
+    head: []const Raw = &.{},
+    tail: []const Raw = &.{},
+
+    pub fn isEmpty(self: Extras) bool {
+        return self.head.len == 0 and self.tail.len == 0;
+    }
+
+    /// The first carried element with this local name, or null.
+    pub fn find(self: Extras, local: []const u8) ?Raw {
+        for (self.head) |e| {
+            if (std.mem.eql(u8, e.local, local)) return e;
+        }
+        for (self.tail) |e| {
+            if (std.mem.eql(u8, e.local, local)) return e;
+        }
+        return null;
+    }
+};
+
+// ── the Substation section (IEC 61850-6 §9) ─────────────────────────────────
+
+/// A `<LNode>`: the link from a place in the single-line diagram to a logical
+/// node of an IED — the reason the `Substation` section exists at all.
+pub const LNodeRef = struct {
+    ied_name: []const u8 = "None",
+    ld_inst: []const u8 = "",
+    prefix: []const u8 = "",
+    ln_class: []const u8,
+    ln_inst: []const u8 = "",
+    /// Set when the node is not yet bound to an IED (the specification phase).
+    ln_type: []const u8 = "",
+    desc: []const u8 = "",
+};
+
+/// A `<Terminal>`: where a piece of equipment attaches to a connectivity node.
+pub const Terminal = struct {
+    name: []const u8 = "",
+    c_node_name: []const u8,
+    connectivity_node: []const u8,
+    substation_name: []const u8 = "",
+    voltage_level_name: []const u8 = "",
+    bay_name: []const u8 = "",
+    line_name: []const u8 = "",
+    desc: []const u8 = "",
+};
+
+/// A `<ConnectivityNode>` of a bay.
+pub const ConnectivityNode = struct {
+    name: []const u8,
+    path_name: []const u8,
+    desc: []const u8 = "",
+};
+
+pub const EquipmentKind = enum {
+    /// `<ConductingEquipment>` — a breaker, a disconnector, a CT, …; `type` is its
+    /// three-letter class (`CBR`, `DIS`, `CTR`, …).
+    conducting,
+    /// `<GeneralEquipment>` — equipment without a conducting role (`AXN`, `BAT`, …).
+    general,
+    /// `<TransformerWinding>` of a power transformer (`type` is `PTW`).
+    winding,
+};
+
+pub const Equipment = struct {
+    kind: EquipmentKind = .conducting,
+    name: []const u8,
+    desc: []const u8 = "",
+    type: []const u8 = "",
+    /// `virtual="true"`: a stand-in for equipment outside the substation.
+    virtual: bool = false,
+    terminals: []const Terminal = &.{},
+    lnodes: []const LNodeRef = &.{},
+    /// `SubEquipment`, `TapChanger`, `EqFunction`, `Text`, `Private`.
+    extras: Extras = .{},
+};
+
+pub const PowerTransformer = struct {
+    name: []const u8,
+    desc: []const u8 = "",
+    /// `PTR` — the only value the schema allows.
+    type: []const u8 = "PTR",
+    virtual: bool = false,
+    windings: []const Equipment = &.{},
+    terminals: []const Terminal = &.{},
+    lnodes: []const LNodeRef = &.{},
+    extras: Extras = .{},
+};
+
+pub const Bay = struct {
+    name: []const u8,
+    desc: []const u8 = "",
+    equipment: []const Equipment = &.{},
+    general_equipment: []const Equipment = &.{},
+    power_transformers: []const PowerTransformer = &.{},
+    connectivity_nodes: []const ConnectivityNode = &.{},
+    lnodes: []const LNodeRef = &.{},
+    /// `Function`, `Text`, `Private`.
+    extras: Extras = .{},
+};
+
+/// `<Voltage unit="V" multiplier="k">110</Voltage>` of a voltage level.
+pub const Voltage = struct {
+    value: []const u8,
+    unit: []const u8 = "V",
+    multiplier: []const u8 = "",
+};
+
+pub const VoltageLevel = struct {
+    name: []const u8,
+    desc: []const u8 = "",
+    /// Absent when the file does not say.
+    nom_freq: []const u8 = "",
+    num_phases: []const u8 = "",
+    voltage: ?Voltage = null,
+    bays: []const Bay = &.{},
+    general_equipment: []const Equipment = &.{},
+    power_transformers: []const PowerTransformer = &.{},
+    lnodes: []const LNodeRef = &.{},
+    extras: Extras = .{},
+};
+
+pub const Substation = struct {
+    name: []const u8,
+    desc: []const u8 = "",
+    voltage_levels: []const VoltageLevel = &.{},
+    general_equipment: []const Equipment = &.{},
+    power_transformers: []const PowerTransformer = &.{},
+    lnodes: []const LNodeRef = &.{},
+    extras: Extras = .{},
+
+    /// The logical nodes bound to an IED anywhere below this substation — the
+    /// answer to "which IED belongs to which breaker". Counts, not copies:
+    /// walk the tree for the references themselves.
+    pub fn boundLnodeCount(self: Substation) usize {
+        var n: usize = countBound(self.lnodes);
+        for (self.general_equipment) |e| n += countBound(e.lnodes);
+        for (self.power_transformers) |p| n += countPt(p);
+        for (self.voltage_levels) |v| {
+            n += countBound(v.lnodes);
+            for (v.general_equipment) |e| n += countBound(e.lnodes);
+            for (v.power_transformers) |p| n += countPt(p);
+            for (v.bays) |b| {
+                n += countBound(b.lnodes);
+                for (b.equipment) |e| n += countBound(e.lnodes);
+                for (b.general_equipment) |e| n += countBound(e.lnodes);
+                for (b.power_transformers) |p| n += countPt(p);
+            }
+        }
+        return n;
+    }
+};
+
+fn countBound(lnodes: []const LNodeRef) usize {
+    var n: usize = 0;
+    for (lnodes) |l| {
+        if (l.ied_name.len > 0 and !std.mem.eql(u8, l.ied_name, "None")) n += 1;
+    }
+    return n;
+}
+
+fn countPt(p: PowerTransformer) usize {
+    var n = countBound(p.lnodes);
+    for (p.windings) |w| n += countBound(w.lnodes);
+    return n;
+}
+
+// ── Services (IEC 61850-6 §9.4.5) ───────────────────────────────────────────
+
+/// An IED's `<Services>`: the capability statement of the device. Each child
+/// (`GetDirectory`, `ConfDataSet`, `GOOSE`, `ReportSettings`, …) is carried
+/// verbatim, because the set is open-ended — every edition adds some — and a
+/// tool that only needs "does this IED offer `ConfReportControl`" asks `has`.
+pub const Services = struct {
+    /// `nameLength` — the longest object name the IED supports (8, 16, 32, 64, …).
+    name_length: []const u8 = "",
+    elements: []const Raw = &.{},
+
+    /// Does the IED declare this service (`GetDirectory`, `FileHandling`, …)?
+    pub fn has(self: Services, service: []const u8) bool {
+        return self.get(service) != null;
+    }
+
+    /// The element declaring a service, for its attributes and children.
+    pub fn get(self: Services, service: []const u8) ?Raw {
+        for (self.elements) |e| {
+            if (std.mem.eql(u8, e.local, service)) return e;
+        }
+        return null;
+    }
+
+    /// One attribute of a service, e.g. `attribute("ConfDataSet", "max")`.
+    pub fn attribute(self: Services, service: []const u8, name: []const u8) ?[]const u8 {
+        const e = self.get(service) orelse return null;
+        return e.attr("", name);
+    }
+
+    /// An unsigned attribute of a service, e.g. `number("GOOSE", "max")`.
+    pub fn number(self: Services, service: []const u8, name: []const u8) ?u32 {
+        const v = self.attribute(service, name) orelse return null;
+        return parseU32(v);
+    }
+};
+
+// ── Inputs / ExtRef (IEC 61850-6 §9.3.x) ────────────────────────────────────
+
+/// An `<ExtRef>` of an `<Inputs>` section: a data object or attribute this
+/// logical node *consumes* from another IED — the subscription half of a
+/// GOOSE or SV link, which the `GSEControl`/`SampledValueControl` of the
+/// publisher alone does not describe. Every attribute is optional in the schema.
+pub const ExtRef = struct {
+    ied_name: []const u8 = "",
+    ld_inst: []const u8 = "",
+    prefix: []const u8 = "",
+    ln_class: []const u8 = "",
+    ln_inst: []const u8 = "",
+    do_name: []const u8 = "",
+    da_name: []const u8 = "",
+    /// Where the value lands in *this* IED's own model (`intAddr`).
+    int_addr: []const u8 = "",
+    desc: []const u8 = "",
+    /// `Poll`, `Report`, `GOOSE` or `SMV` (edition 2).
+    service_type: []const u8 = "",
+    src_ld_inst: []const u8 = "",
+    src_prefix: []const u8 = "",
+    src_ln_class: []const u8 = "",
+    src_ln_inst: []const u8 = "",
+    src_cb_name: []const u8 = "",
+    /// Edition 2.1 pre-defined-attribute references (`pLN`, `pDO`, `pDA`, `pServT`).
+    p_ln: []const u8 = "",
+    p_do: []const u8 = "",
+    p_da: []const u8 = "",
+    p_serv_t: []const u8 = "",
+};
+
+pub const Inputs = struct {
+    ext_refs: []const ExtRef = &.{},
+    /// `SourceRef` (edition 2.1), `Text`, `Private`.
+    extras: Extras = .{},
 };
 
 /// One `<P type="…">value</P>`.
@@ -287,6 +541,7 @@ pub const CbAddress = struct {
     address: Address = .{},
     min_time_ms: ?u32 = null,
     max_time_ms: ?u32 = null,
+    extras: Extras = .{},
 };
 
 pub const ConnectedAp = struct {
@@ -295,12 +550,17 @@ pub const ConnectedAp = struct {
     address: Address = .{},
     gse: []const CbAddress = &.{},
     smv: []const CbAddress = &.{},
+    /// `PhysConn`, `Text`, `Private`.
+    extras: Extras = .{},
 };
 
 pub const Subnetwork = struct {
     name: []const u8,
     type: []const u8 = "",
+    desc: []const u8 = "",
     aps: []const ConnectedAp = &.{},
+    /// `BitRate`, `Text`, `Private`.
+    extras: Extras = .{},
 };
 
 /// One `<FCDA>` of a data set: a *functionally constrained* data attribute, or
@@ -357,6 +617,7 @@ pub const DataSet = struct {
     name: []const u8,
     desc: []const u8 = "",
     fcdas: []const Fcda = &.{},
+    extras: Extras = .{},
 };
 
 pub const TrgOps = struct {
@@ -398,6 +659,8 @@ pub const ReportControl = struct {
     max_instances: u8 = 1,
     trg_ops: TrgOps = .{},
     opt_fields: OptFields = .{},
+    desc: []const u8 = "",
+    extras: Extras = .{},
 };
 
 /// A `<LogControl>` — the log control block that decides what goes into a log.
@@ -409,6 +672,7 @@ pub const LogControl = struct {
     intg_pd: u32 = 0,
     reason_code: bool = false,
     trg_ops: TrgOps = .{},
+    desc: []const u8 = "",
 };
 
 /// A `<Log>` — the log *itself*, as opposed to the `<LogControl>` that decides
@@ -441,6 +705,42 @@ pub const GseControl = struct {
     /// `GOOSE` or `GSSE`.
     type: []const u8 = "GOOSE",
     fixed_offs: bool = false,
+    desc: []const u8 = "",
+    extras: Extras = .{},
+};
+
+/// A `<SampledValueControl>` — the sampled-value control block, the SV twin of
+/// `GseControl`. `multicast` (the default) is an `MSVCB` under `MS`; a unicast
+/// one is a `USVCB` under `US`.
+pub const SmvControl = struct {
+    name: []const u8,
+    desc: []const u8 = "",
+    dat_set: []const u8 = "",
+    conf_rev: u32 = 1,
+    /// `smvID`.
+    smv_id: []const u8 = "",
+    multicast: bool = true,
+    /// `smpRate`, samples per `smpMod` unit.
+    smp_rate: u32 = 0,
+    /// `nofASDU` — ASDUs per frame.
+    nof_asdu: u32 = 0,
+    /// `SmpPerPeriod`, `SmpPerSec` or `SecPerSmp`.
+    smp_mod: []const u8 = "SmpPerPeriod",
+    /// The `<SmvOpts>` flags; the schema default of every one is false.
+    opts: SmvOpts = .{},
+    /// `securityEnable`: `None`, `Signature` or `SignatureAndEncryption`.
+    security_enable: []const u8 = "",
+    extras: Extras = .{},
+};
+
+pub const SmvOpts = struct {
+    refresh_time: bool = false,
+    sample_synchronized: bool = false,
+    sample_rate: bool = false,
+    data_set: bool = false,
+    security: bool = false,
+    timestamp: bool = false,
+    synch_source_id: bool = false,
 };
 
 /// One `<DAI>` (or a `<DAI>` nested under `<SDI>`s): an instance value that
@@ -459,6 +759,7 @@ pub const Doi = struct {
     name: []const u8,
     desc: []const u8 = "",
     dais: []const Dai = &.{},
+    extras: Extras = .{},
 };
 
 pub const Ln = struct {
@@ -474,6 +775,13 @@ pub const Ln = struct {
     report_controls: []const ReportControl = &.{},
     gse_controls: []const GseControl = &.{},
     log_controls: []const LogControl = &.{},
+    /// `SampledValueControl`s (on `LN0`).
+    smv_controls: []const SmvControl = &.{},
+    /// The `<Inputs>` section: what this node consumes from other IEDs.
+    inputs: ?Inputs = null,
+    desc: []const u8 = "",
+    /// `Text`, `Private`, `SCLControl`, `SGVal`, … .
+    extras: Extras = .{},
     /// The `<Log>` elements this node owns. Parsed and emitted; nothing here
     /// interprets them beyond that — the runtime log lives in `logging.zig` and
     /// is configured by the caller, not by SCL.
@@ -496,7 +804,10 @@ pub const LDevice = struct {
     /// Edition 2's explicit `ldName`, when the file gives one. Otherwise the
     /// MMS domain is `<IED name><LDevice inst>`.
     ld_name: []const u8 = "",
+    desc: []const u8 = "",
     lns: []const Ln = &.{},
+    /// `Text`, `Private`, `AccessControl`.
+    extras: Extras = .{},
 
     /// The MMS domain this logical device is served under.
     pub fn domain(self: LDevice, ied_name: []const u8, out: []u8) Error![]const u8 {
@@ -515,7 +826,16 @@ pub const LDevice = struct {
 
 pub const AccessPoint = struct {
     name: []const u8,
+    desc: []const u8 = "",
     devices: []const LDevice = &.{},
+    /// The access point's own `<Services>`, when it has one.
+    services: ?Services = null,
+    /// `Text`, `Private`, `LN`s hung directly on the access point,
+    /// `ServerAt`, `GOOSESecurity`, `SMVSecurity`.
+    extras: Extras = .{},
+    /// What the `<Server>` element carries besides logical devices:
+    /// `Authentication`, `Association`, `Private`.
+    server_extras: Extras = .{},
 };
 
 pub const Ied = struct {
@@ -523,7 +843,13 @@ pub const Ied = struct {
     type: []const u8 = "",
     manufacturer: []const u8 = "",
     config_version: []const u8 = "",
+    desc: []const u8 = "",
+    owner: []const u8 = "",
     access_points: []const AccessPoint = &.{},
+    /// The IED's capability statement.
+    services: ?Services = null,
+    /// `Text`, `Private`, `KDC`.
+    extras: Extras = .{},
 };
 
 // ── data type templates ─────────────────────────────────────────────────────
@@ -643,8 +969,22 @@ pub const Scl = struct {
     subnetworks: []const Subnetwork,
     ieds: []const Ied,
     templates: Templates,
+    /// The `Substation` elements, in document order.
+    substations: []const Substation,
     has_substation: bool,
     options: Options,
+    /// The `SCL` element's own `version` (`2007`), `revision` (`B`) and `release`
+    /// (`4`) — which edition's schema the file claims.
+    version: []const u8,
+    revision: []const u8,
+    release: []const u8,
+    /// Namespace declarations other than the default one on the root, which
+    /// `Private` content routinely uses (`xmlns:xsi`, a vendor's own).
+    extra_namespaces: []const xml.NsDecl,
+    /// Root-level `Text`/`Private` (`head`) and `Line`/`Process` (`tail`).
+    extras: Extras,
+    /// What `Communication` carries besides `SubNetwork`s (`Text`, `Private`).
+    comm_extras: Extras,
 
     pub fn deinit(self: *Scl) void {
         self.doc.deinit();
@@ -714,6 +1054,11 @@ pub const Options = struct {
     /// adds `ResvTms` (multi-client edit reservation) and plenty of IEDs do not
     /// expose it, so the mandatory five are the default.
     sgcb_attributes: []const []const u8 = &default_sgcb_attributes,
+    /// The MMS attribute names of a **multicast** sampled-value control block
+    /// (`MS`) and of a **unicast** one (`US`). Self-derived from IEC 61850-7-2
+    /// and not confirmed against a peer, so a knob like the two above.
+    msvcb_attributes: []const []const u8 = &default_msvcb_attributes,
+    usvcb_attributes: []const []const u8 = &default_usvcb_attributes,
     /// Accept a `bType` outside the standard list rather than refusing the
     /// document. Vendor extensions do exist; the default is strict.
     allow_unknown_btype: bool = false,
@@ -815,6 +1160,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) Error
     var ieds: std.ArrayList(Ied) = .empty;
     var templates = Templates{};
     var has_substation = false;
+    var substations: std.ArrayList(Substation) = .empty;
+    var comm_extras = Extras{};
 
     var it = doc.root.elementIterator();
     while (it.next()) |el| {
@@ -825,10 +1172,13 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) Error
                 .revision = attrOr(el, "revision", ""),
                 .tool_id = attrOr(el, "toolID", ""),
                 .name_structure = attrOr(el, "nameStructure", ""),
+                .extras = try p.extrasOf(el, &.{}),
             };
         } else if (std.mem.eql(u8, el.local, "Substation")) {
             has_substation = true;
+            try substations.append(a, try p.substation(el));
         } else if (std.mem.eql(u8, el.local, "Communication")) {
+            comm_extras = try p.extrasOf(el, &.{"SubNetwork"});
             try p.communication(el, &subnetworks);
         } else if (std.mem.eql(u8, el.local, "IED")) {
             try ieds.append(a, try p.ied(el));
@@ -844,14 +1194,281 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) Error
         .subnetworks = try subnetworks.toOwnedSlice(a),
         .ieds = try ieds.toOwnedSlice(a),
         .templates = templates,
+        .substations = try substations.toOwnedSlice(a),
         .has_substation = has_substation,
         .options = options,
+        .version = attrOr(doc.root, "version", ""),
+        .revision = attrOr(doc.root, "revision", ""),
+        .release = attrOr(doc.root, "release", ""),
+        .extra_namespaces = try p.extraNamespaces(doc.root),
+        .extras = try p.extrasOf(doc.root, &.{ "Header", "Substation", "Communication", "IED", "DataTypeTemplates" }),
+        .comm_extras = comm_extras,
     };
 }
 
 const Parser = struct {
     a: std.mem.Allocator,
     options: Options,
+
+    /// The children of `el` that are not in `known`, sorted into `Text`/`Private`
+    /// (which the schema puts first) and everything else.
+    fn extrasOf(self: *Parser, el: *xml.Element, known: []const []const u8) Error!Extras {
+        var head: std.ArrayList(Raw) = .empty;
+        var tail: std.ArrayList(Raw) = .empty;
+        var it = el.elementIterator();
+        next: while (it.next()) |c| {
+            for (known) |k| {
+                if (std.mem.eql(u8, c.local, k)) continue :next;
+            }
+            if (std.mem.eql(u8, c.local, "Text") or std.mem.eql(u8, c.local, "Private")) {
+                try head.append(self.a, c);
+            } else {
+                try tail.append(self.a, c);
+            }
+        }
+        return .{
+            .head = try head.toOwnedSlice(self.a),
+            .tail = try tail.toOwnedSlice(self.a),
+        };
+    }
+
+    fn extraNamespaces(self: *Parser, root: *xml.Element) Error![]const xml.NsDecl {
+        var out: std.ArrayList(xml.NsDecl) = .empty;
+        for (root.ns_decls) |d| {
+            if (d.prefix.len > 0) try out.append(self.a, d);
+        }
+        return out.toOwnedSlice(self.a);
+    }
+
+    fn lnodeRefs(self: *Parser, el: *xml.Element) Error![]const LNodeRef {
+        var out: std.ArrayList(LNodeRef) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "LNode")) continue;
+            try out.append(self.a, .{
+                .ied_name = attrOr(c, "iedName", "None"),
+                .ld_inst = attrOr(c, "ldInst", ""),
+                .prefix = attrOr(c, "prefix", ""),
+                .ln_class = c.attr("", "lnClass") orelse return error.MissingAttribute,
+                .ln_inst = attrOr(c, "lnInst", ""),
+                .ln_type = attrOr(c, "lnType", ""),
+                .desc = attrOr(c, "desc", ""),
+            });
+        }
+        return out.toOwnedSlice(self.a);
+    }
+
+    fn terminals(self: *Parser, el: *xml.Element) Error![]const Terminal {
+        var out: std.ArrayList(Terminal) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "Terminal")) continue;
+            try out.append(self.a, .{
+                .name = attrOr(c, "name", ""),
+                .c_node_name = c.attr("", "cNodeName") orelse return error.MissingAttribute,
+                .connectivity_node = c.attr("", "connectivityNode") orelse return error.MissingAttribute,
+                .substation_name = attrOr(c, "substationName", ""),
+                .voltage_level_name = attrOr(c, "voltageLevelName", ""),
+                .bay_name = attrOr(c, "bayName", ""),
+                .line_name = attrOr(c, "lineName", ""),
+                .desc = attrOr(c, "desc", ""),
+            });
+        }
+        return out.toOwnedSlice(self.a);
+    }
+
+    fn equipment(self: *Parser, el: *xml.Element, kind: EquipmentKind) Error!Equipment {
+        return .{
+            .kind = kind,
+            .name = el.attr("", "name") orelse return error.MissingAttribute,
+            .desc = attrOr(el, "desc", ""),
+            .type = attrOr(el, "type", ""),
+            .virtual = boolAttr(el, "virtual", false),
+            .terminals = try self.terminals(el),
+            .lnodes = try self.lnodeRefs(el),
+            .extras = try self.extrasOf(el, &.{ "Terminal", "LNode" }),
+        };
+    }
+
+    fn powerTransformer(self: *Parser, el: *xml.Element) Error!PowerTransformer {
+        var windings: std.ArrayList(Equipment) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "TransformerWinding")) continue;
+            try windings.append(self.a, try self.equipment(c, .winding));
+        }
+        return .{
+            .name = el.attr("", "name") orelse return error.MissingAttribute,
+            .desc = attrOr(el, "desc", ""),
+            .type = attrOr(el, "type", "PTR"),
+            .virtual = boolAttr(el, "virtual", false),
+            .windings = try windings.toOwnedSlice(self.a),
+            .terminals = try self.terminals(el),
+            .lnodes = try self.lnodeRefs(el),
+            .extras = try self.extrasOf(el, &.{ "TransformerWinding", "Terminal", "LNode" }),
+        };
+    }
+
+    /// The `GeneralEquipment` and `PowerTransformer` children every level of the
+    /// single-line diagram may carry.
+    fn equipmentChildren(
+        self: *Parser,
+        el: *xml.Element,
+        general: *[]const Equipment,
+        transformers: *[]const PowerTransformer,
+    ) Error!void {
+        var ge: std.ArrayList(Equipment) = .empty;
+        var pt: std.ArrayList(PowerTransformer) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (std.mem.eql(u8, c.local, "GeneralEquipment")) {
+                try ge.append(self.a, try self.equipment(c, .general));
+            } else if (std.mem.eql(u8, c.local, "PowerTransformer")) {
+                try pt.append(self.a, try self.powerTransformer(c));
+            }
+        }
+        general.* = try ge.toOwnedSlice(self.a);
+        transformers.* = try pt.toOwnedSlice(self.a);
+    }
+
+    fn substation(self: *Parser, el: *xml.Element) Error!Substation {
+        var out = Substation{ .name = el.attr("", "name") orelse return error.MissingAttribute };
+        out.desc = attrOr(el, "desc", "");
+        try self.equipmentChildren(el, &out.general_equipment, &out.power_transformers);
+        out.lnodes = try self.lnodeRefs(el);
+        var levels: std.ArrayList(VoltageLevel) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "VoltageLevel")) continue;
+            try levels.append(self.a, try self.voltageLevel(c));
+        }
+        out.voltage_levels = try levels.toOwnedSlice(self.a);
+        out.extras = try self.extrasOf(el, &.{ "VoltageLevel", "GeneralEquipment", "PowerTransformer", "LNode" });
+        return out;
+    }
+
+    fn voltageLevel(self: *Parser, el: *xml.Element) Error!VoltageLevel {
+        var out = VoltageLevel{ .name = el.attr("", "name") orelse return error.MissingAttribute };
+        out.desc = attrOr(el, "desc", "");
+        out.nom_freq = attrOr(el, "nomFreq", "");
+        out.num_phases = attrOr(el, "numPhases", "");
+        try self.equipmentChildren(el, &out.general_equipment, &out.power_transformers);
+        out.lnodes = try self.lnodeRefs(el);
+        var bays: std.ArrayList(Bay) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (std.mem.eql(u8, c.local, "Voltage")) {
+                out.voltage = .{
+                    .value = std.mem.trim(u8, try c.textContent(self.a), " \t\r\n"),
+                    .unit = attrOr(c, "unit", "V"),
+                    .multiplier = attrOr(c, "multiplier", ""),
+                };
+            } else if (std.mem.eql(u8, c.local, "Bay")) {
+                try bays.append(self.a, try self.bay(c));
+            }
+        }
+        out.bays = try bays.toOwnedSlice(self.a);
+        out.extras = try self.extrasOf(el, &.{ "Voltage", "Bay", "GeneralEquipment", "PowerTransformer", "LNode" });
+        return out;
+    }
+
+    fn bay(self: *Parser, el: *xml.Element) Error!Bay {
+        var out = Bay{ .name = el.attr("", "name") orelse return error.MissingAttribute };
+        out.desc = attrOr(el, "desc", "");
+        try self.equipmentChildren(el, &out.general_equipment, &out.power_transformers);
+        out.lnodes = try self.lnodeRefs(el);
+        var eq: std.ArrayList(Equipment) = .empty;
+        var nodes: std.ArrayList(ConnectivityNode) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (std.mem.eql(u8, c.local, "ConductingEquipment")) {
+                try eq.append(self.a, try self.equipment(c, .conducting));
+            } else if (std.mem.eql(u8, c.local, "ConnectivityNode")) {
+                try nodes.append(self.a, .{
+                    .name = c.attr("", "name") orelse return error.MissingAttribute,
+                    .path_name = c.attr("", "pathName") orelse return error.MissingAttribute,
+                    .desc = attrOr(c, "desc", ""),
+                });
+            }
+        }
+        out.equipment = try eq.toOwnedSlice(self.a);
+        out.connectivity_nodes = try nodes.toOwnedSlice(self.a);
+        out.extras = try self.extrasOf(el, &.{ "ConductingEquipment", "ConnectivityNode", "GeneralEquipment", "PowerTransformer", "LNode" });
+        return out;
+    }
+
+    fn services(self: *Parser, el: *xml.Element) Error!Services {
+        var out: std.ArrayList(Raw) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| try out.append(self.a, c);
+        return .{
+            .name_length = attrOr(el, "nameLength", ""),
+            .elements = try out.toOwnedSlice(self.a),
+        };
+    }
+
+    fn inputs(self: *Parser, el: *xml.Element) Error!Inputs {
+        var refs: std.ArrayList(ExtRef) = .empty;
+        var it = el.elementIterator();
+        while (it.next()) |c| {
+            if (!std.mem.eql(u8, c.local, "ExtRef")) continue;
+            try refs.append(self.a, .{
+                .ied_name = attrOr(c, "iedName", ""),
+                .ld_inst = attrOr(c, "ldInst", ""),
+                .prefix = attrOr(c, "prefix", ""),
+                .ln_class = attrOr(c, "lnClass", ""),
+                .ln_inst = attrOr(c, "lnInst", ""),
+                .do_name = attrOr(c, "doName", ""),
+                .da_name = attrOr(c, "daName", ""),
+                .int_addr = attrOr(c, "intAddr", ""),
+                .desc = attrOr(c, "desc", ""),
+                .service_type = attrOr(c, "serviceType", ""),
+                .src_ld_inst = attrOr(c, "srcLDInst", ""),
+                .src_prefix = attrOr(c, "srcPrefix", ""),
+                .src_ln_class = attrOr(c, "srcLNClass", ""),
+                .src_ln_inst = attrOr(c, "srcLNInst", ""),
+                .src_cb_name = attrOr(c, "srcCBName", ""),
+                .p_ln = attrOr(c, "pLN", ""),
+                .p_do = attrOr(c, "pDO", ""),
+                .p_da = attrOr(c, "pDA", ""),
+                .p_serv_t = attrOr(c, "pServT", ""),
+            });
+        }
+        return .{
+            .ext_refs = try refs.toOwnedSlice(self.a),
+            .extras = try self.extrasOf(el, &.{"ExtRef"}),
+        };
+    }
+
+    fn smvControl(self: *Parser, c: *xml.Element) Error!SmvControl {
+        var out = SmvControl{
+            .name = c.attr("", "name") orelse return error.MissingAttribute,
+            .desc = attrOr(c, "desc", ""),
+            .dat_set = attrOr(c, "datSet", ""),
+            .conf_rev = parseU32(attrOr(c, "confRev", "1")) orelse 1,
+            .smv_id = attrOr(c, "smvID", ""),
+            .multicast = boolAttr(c, "multicast", true),
+            .smp_rate = parseU32(attrOr(c, "smpRate", "0")) orelse 0,
+            .nof_asdu = parseU32(attrOr(c, "nofASDU", "0")) orelse 0,
+            .smp_mod = attrOr(c, "smpMod", "SmpPerPeriod"),
+            .security_enable = attrOr(c, "securityEnable", ""),
+        };
+        var it = c.elementIterator();
+        while (it.next()) |o| {
+            if (!std.mem.eql(u8, o.local, "SmvOpts")) continue;
+            out.opts = .{
+                .refresh_time = boolAttr(o, "refreshTime", false),
+                .sample_synchronized = boolAttr(o, "sampleSynchronized", false),
+                .sample_rate = boolAttr(o, "sampleRate", false),
+                .data_set = boolAttr(o, "dataSet", false),
+                .security = boolAttr(o, "security", false),
+                .timestamp = boolAttr(o, "timestamp", false),
+                .synch_source_id = boolAttr(o, "synchSourceId", false),
+            };
+        }
+        out.extras = try self.extrasOf(c, &.{"SmvOpts"});
+        return out;
+    }
 
     fn communication(self: *Parser, el: *xml.Element, out: *std.ArrayList(Subnetwork)) Error!void {
         var it = el.elementIterator();
@@ -864,6 +1481,7 @@ const Parser = struct {
                 var gse: std.ArrayList(CbAddress) = .empty;
                 var smv: std.ArrayList(CbAddress) = .empty;
                 var addr = Address{};
+                const ap_extras = try self.extrasOf(ap, &.{ "Address", "GSE", "SMV" });
                 var c = ap.elementIterator();
                 while (c.next()) |child| {
                     if (std.mem.eql(u8, child.local, "Address")) {
@@ -880,12 +1498,15 @@ const Parser = struct {
                     .address = addr,
                     .gse = try gse.toOwnedSlice(self.a),
                     .smv = try smv.toOwnedSlice(self.a),
+                    .extras = ap_extras,
                 });
             }
             try out.append(self.a, .{
                 .name = attrOr(sub, "name", ""),
                 .type = attrOr(sub, "type", ""),
+                .desc = attrOr(sub, "desc", ""),
                 .aps = try aps.toOwnedSlice(self.a),
+                .extras = try self.extrasOf(sub, &.{"ConnectedAP"}),
             });
         }
     }
@@ -918,6 +1539,7 @@ const Parser = struct {
                 out.max_time_ms = try self.uintText(c);
             }
         }
+        out.extras = try self.extrasOf(el, &.{ "Address", "MinTime", "MaxTime" });
         return out;
     }
 
@@ -928,13 +1550,25 @@ const Parser = struct {
 
     fn ied(self: *Parser, el: *xml.Element) Error!Ied {
         var aps: std.ArrayList(AccessPoint) = .empty;
+        var services_el: ?Services = null;
         var it = el.elementIterator();
         while (it.next()) |ap| {
+            if (std.mem.eql(u8, ap.local, "Services")) {
+                services_el = try self.services(ap);
+                continue;
+            }
             if (!std.mem.eql(u8, ap.local, "AccessPoint")) continue;
             var devices: std.ArrayList(LDevice) = .empty;
+            var ap_services: ?Services = null;
+            var server_extras = Extras{};
             var s = ap.elementIterator();
             while (s.next()) |server| {
+                if (std.mem.eql(u8, server.local, "Services")) {
+                    ap_services = try self.services(server);
+                    continue;
+                }
                 if (!std.mem.eql(u8, server.local, "Server")) continue;
+                server_extras = try self.extrasOf(server, &.{"LDevice"});
                 var d = server.elementIterator();
                 while (d.next()) |ld| {
                     if (!std.mem.eql(u8, ld.local, "LDevice")) continue;
@@ -943,7 +1577,11 @@ const Parser = struct {
             }
             try aps.append(self.a, .{
                 .name = attrOr(ap, "name", ""),
+                .desc = attrOr(ap, "desc", ""),
                 .devices = try devices.toOwnedSlice(self.a),
+                .services = ap_services,
+                .extras = try self.extrasOf(ap, &.{ "Server", "Services" }),
+                .server_extras = server_extras,
             });
         }
         return .{
@@ -951,7 +1589,11 @@ const Parser = struct {
             .type = attrOr(el, "type", ""),
             .manufacturer = attrOr(el, "manufacturer", ""),
             .config_version = attrOr(el, "configVersion", ""),
+            .desc = attrOr(el, "desc", ""),
+            .owner = attrOr(el, "owner", ""),
             .access_points = try aps.toOwnedSlice(self.a),
+            .services = services_el,
+            .extras = try self.extrasOf(el, &.{ "AccessPoint", "Services" }),
         };
     }
 
@@ -966,7 +1608,9 @@ const Parser = struct {
         return .{
             .inst = el.attr("", "inst") orelse return error.MissingAttribute,
             .ld_name = attrOr(el, "ldName", ""),
+            .desc = attrOr(el, "desc", ""),
             .lns = try lns.toOwnedSlice(self.a),
+            .extras = try self.extrasOf(el, &.{ "LN0", "LN" }),
         };
     }
 
@@ -977,6 +1621,8 @@ const Parser = struct {
         var gcbs: std.ArrayList(GseControl) = .empty;
         var lcbs: std.ArrayList(LogControl) = .empty;
         var logs: std.ArrayList(Log) = .empty;
+        var smvs: std.ArrayList(SmvControl) = .empty;
+        var inputs_el: ?Inputs = null;
         var sgcb: ?SettingControl = null;
 
         var it = el.elementIterator();
@@ -987,9 +1633,14 @@ const Parser = struct {
                 try sets.append(self.a, try self.dataSet(c));
             } else if (std.mem.eql(u8, c.local, "ReportControl")) {
                 try rcbs.append(self.a, try self.reportControl(c));
+            } else if (std.mem.eql(u8, c.local, "SampledValueControl")) {
+                try smvs.append(self.a, try self.smvControl(c));
+            } else if (std.mem.eql(u8, c.local, "Inputs")) {
+                inputs_el = try self.inputs(c);
             } else if (std.mem.eql(u8, c.local, "LogControl")) {
                 var lcb = LogControl{
                     .name = c.attr("", "name") orelse return error.MissingAttribute,
+                    .desc = attrOr(c, "desc", ""),
                     .dat_set = attrOr(c, "datSet", ""),
                     .log_name = attrOr(c, "logName", ""),
                     .log_ena = boolAttr(c, "logEna", true),
@@ -1027,6 +1678,8 @@ const Parser = struct {
                     .conf_rev = parseU32(attrOr(c, "confRev", "1")) orelse 1,
                     .type = attrOr(c, "type", "GOOSE"),
                     .fixed_offs = boolAttr(c, "fixedOffs", false),
+                    .desc = attrOr(c, "desc", ""),
+                    .extras = try self.extrasOf(c, &.{}),
                 });
             }
         }
@@ -1043,6 +1696,10 @@ const Parser = struct {
             .log_controls = try lcbs.toOwnedSlice(self.a),
             .logs = try logs.toOwnedSlice(self.a),
             .setting_control = sgcb,
+            .smv_controls = try smvs.toOwnedSlice(self.a),
+            .inputs = inputs_el,
+            .desc = attrOr(el, "desc", ""),
+            .extras = try self.extrasOf(el, &.{ "DOI", "DataSet", "ReportControl", "LogControl", "Log", "SettingControl", "GSEControl", "SampledValueControl", "Inputs" }),
         };
     }
 
@@ -1065,12 +1722,13 @@ const Parser = struct {
             .name = el.attr("", "name") orelse return error.MissingAttribute,
             .desc = attrOr(el, "desc", ""),
             .fcdas = try fcdas.toOwnedSlice(self.a),
+            .extras = try self.extrasOf(el, &.{"FCDA"}),
         };
     }
 
     fn reportControl(self: *Parser, el: *xml.Element) Error!ReportControl {
-        _ = self;
         var out = ReportControl{
+            .desc = attrOr(el, "desc", ""),
             .name = el.attr("", "name") orelse return error.MissingAttribute,
             .rpt_id = attrOr(el, "rptID", ""),
             .dat_set = attrOr(el, "datSet", ""),
@@ -1108,6 +1766,7 @@ const Parser = struct {
             }
         }
         if (out.max_instances == 0) out.max_instances = 1;
+        out.extras = try self.extrasOf(el, &.{ "TrgOps", "OptFields", "RptEnabled" });
         return out;
     }
 
@@ -1118,6 +1777,7 @@ const Parser = struct {
             .name = el.attr("", "name") orelse return error.MissingAttribute,
             .desc = attrOr(el, "desc", ""),
             .dais = try dais.toOwnedSlice(self.a),
+            .extras = try self.extrasOf(el, &.{ "SDI", "DAI" }),
         };
     }
 
@@ -1341,6 +2001,18 @@ pub const default_gocb_attributes = [_][]const u8{
     "GoEna", "GoID", "DatSet", "ConfRev", "NdsCom", "DstAddress", "MinTime", "MaxTime", "FixedOffs",
 };
 
+/// A multicast sampled-value control block (IEC 61850-7-2 §18). `DstAddress`
+/// is a structure, like a GOOSE control block's.
+pub const default_msvcb_attributes = [_][]const u8{
+    "SvEna", "MsvID", "DatSet", "ConfRev", "SmpMod", "SmpRate", "OptFlds", "DstAddress",
+};
+
+/// A unicast sampled-value control block: no destination address, but a
+/// reservation, because one client at a time owns it.
+pub const default_usvcb_attributes = [_][]const u8{
+    "SvEna", "UsvID", "DatSet", "ConfRev", "SmpMod", "SmpRate", "OptFlds", "Resv",
+};
+
 /// A log control block (IEC 61850-7-2 §16).
 pub const default_lcb_attributes = [_][]const u8{
     "LogEna", "LogRef", "DatSet", "OldEntrTm", "NewEntrTm", "OldEntr", "NewEntr", "TrgOps", "IntgPd",
@@ -1457,6 +2129,7 @@ fn resolveLn(ctx: *ResolveCtx, scl: *const Scl, node: Ln) Error!void {
     for (node.gse_controls) |gcb| {
         seen.insert(if (std.mem.eql(u8, gcb.type, "GSSE")) .GS else .GO);
     }
+    for (node.smv_controls) |scb| seen.insert(if (scb.multicast) .MS else .US);
     if (node.log_controls.len > 0) seen.insert(.LG);
     // The setting-group control block lives under `SP`, which is otherwise the
     // setpoint constraint — one of SCL's less obvious overloads.
@@ -1472,6 +2145,7 @@ fn resolveLn(ctx: *ResolveCtx, scl: *const Scl, node: Ln) Error!void {
         switch (fc) {
             .RP, .BR => try resolveRcbs(ctx, node, fc_name, fc),
             .GO, .GS => try resolveGocbs(ctx, node, fc_name, fc),
+            .MS, .US => try resolveSvcbs(ctx, node, fc_name, fc),
             .LG => try resolveLcbs(ctx, node, fc_name),
             .SP => try resolveSgcb(ctx, node, fc_name),
             else => {},
@@ -1531,6 +2205,27 @@ fn resolveGocbs(ctx: *ResolveCtx, node: Ln, fc_name: []const u8, fc: Fc) Error!v
         for (default_gocb_attributes) |attr| {
             var attr_buf: [acsi.max_reference_len]u8 = undefined;
             const an = try join(&attr_buf, gcb_name, attr);
+            const is_struct = std.mem.eql(u8, attr, "DstAddress");
+            try emit(ctx, an, fc, null, 3, !is_struct, null, "");
+            if (!is_struct) continue;
+            for (dst_address_members) |m| {
+                var m_buf: [acsi.max_reference_len]u8 = undefined;
+                try emit(ctx, try join(&m_buf, an, m), fc, null, 4, true, null, "");
+            }
+        }
+    }
+}
+
+fn resolveSvcbs(ctx: *ResolveCtx, node: Ln, fc_name: []const u8, fc: Fc) Error!void {
+    const attrs = if (fc == .MS) ctx.scl.options.msvcb_attributes else ctx.scl.options.usvcb_attributes;
+    for (node.smv_controls) |scb| {
+        if (scb.multicast != (fc == .MS)) continue;
+        var scb_buf: [acsi.max_reference_len]u8 = undefined;
+        const scb_name = try join(&scb_buf, fc_name, scb.name);
+        try emit(ctx, scb_name, fc, null, 2, false, null, "");
+        for (attrs) |attr| {
+            var attr_buf: [acsi.max_reference_len]u8 = undefined;
+            const an = try join(&attr_buf, scb_name, attr);
             const is_struct = std.mem.eql(u8, attr, "DstAddress");
             try emit(ctx, an, fc, null, 3, !is_struct, null, "");
             if (!is_struct) continue;
