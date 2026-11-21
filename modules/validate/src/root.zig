@@ -396,6 +396,9 @@ pub const Format = enum {
     local_time,
     /// `date_time` without the offset requirement: ISO 8601 local date-time.
     local_date_time,
+    /// go-playground `iso3166_2`: an ISO 3166-2 subdivision code (`US-CA`,
+    /// `CZ-10`), from go's table (5,001 entries), exact case.
+    iso3166_2,
 };
 
 /// Caller-supplied predicate, run after all built-in checks pass the type
@@ -534,8 +537,9 @@ pub const Rule = struct {
     /// when the object is complete, on the tree and the streaming path
     /// alike. Empty = none, and a rule without them behaves exactly as it
     /// did before this field existed. Ignored on `items` element rules
-    /// (an element has no sibling), by `parseQueryLeaky`'s `validate_rules`, and
-    /// in the schema `rulesFor` derives (put them in `T.validate_rules`).
+    /// (an element has no sibling) and in the schema `rulesFor` derives (put
+    /// them in `T.validate_rules`, where `parseQueryLeaky` runs them too, on
+    /// the query's coerced values as `validateQuery` does).
     cross: []const Cross = &.{},
 };
 
@@ -2185,6 +2189,7 @@ pub fn validateFormat(format: Format, s: []const u8) bool {
         .date_time => isDateTime(s, true),
         .local_time => isTime(s, false),
         .local_date_time => isDateTime(s, false),
+        .iso3166_2 => fmtx.isIso(s, .subdivision),
         .duration => isDuration(s),
         .json_pointer => isJsonPointer(s),
         .uuid3 => isUuidVersion(s, '3', false, true),
@@ -2290,6 +2295,7 @@ fn formatMessage(format: Format) []const u8 {
         .date_time => "Input should be a valid date-time",
         .local_time => "Input should be a valid local time",
         .local_date_time => "Input should be a valid local date-time",
+        .iso3166_2 => "Input should be a valid ISO 3166-2 subdivision code",
         .duration => "Input should be a valid duration",
         .json_pointer => "Input should be a valid JSON Pointer",
         .uuid3 => "Input should be a valid version 3 UUID",
@@ -3683,11 +3689,13 @@ pub fn parseQueryLeaky(comptime T: type, arena: Allocator, query: []const u8, li
         errdefer b.abort();
         for (schema, values) |*rule, v| try checkQueryValue(&b, rule, v);
         const first_pass_len = b.list.items.len;
-        for (extra) |*rule| {
+        const slots = try crossSlotsFor(&b, extra, QuerySource{ .query = query, .a = b.a() });
+        for (extra, 0..) |*rule, i| {
             const v = for (std.meta.fieldNames(T), values) |name, fv| {
                 if (std.mem.eql(u8, name, rule.field)) break fv;
             } else try findQueryParam(arena, query, rule.field);
             try checkQueryValue(&b, rule, v);
+            try checkParamCross(&b, rule, slots, i);
         }
         b.dedupeFrom(first_pass_len);
         if (b.list.items.len != 0) return .{ .invalid = b.finish() };
@@ -6278,6 +6286,7 @@ fn formatName(f: Format) []const u8 {
         .date_time => "date-time",
         .local_time => "local-time",
         .local_date_time => "local-date-time",
+        .iso3166_2 => "iso3166_2",
         .duration => "duration",
         .json_pointer => "json-pointer",
         .uuid3 => "uuid3",
@@ -7645,6 +7654,24 @@ test "parseQueryLeaky: every field kind decodes; defaults fill the rest" {
     try testing.expect(!d.exact);
     try testing.expectEqual(.asc, d.sort);
     try testing.expectEqualStrings("cz", &d.code);
+}
+
+test "parseQueryLeaky: Rule.cross in validate_rules runs on the coerced values" {
+    const Range = struct {
+        lo: u32 = 0,
+        hi: u32 = 0,
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "hi", .kind = .int, .cross = &.{.{ .op = .gte_field, .other = "lo" }} },
+        };
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const ok = (try parseQueryLeaky(Range, arena.allocator(), "lo=3&hi=9", .{})).ok;
+    try testing.expectEqual(@as(u32, 9), ok.hi);
+    const bad = try parseQueryLeaky(Range, arena.allocator(), "lo=9&hi=3", .{});
+    try testing.expect(bad == .invalid);
+    try testing.expectEqualStrings("hi", bad.invalid.errors[0].path);
+    try testing.expectEqualStrings("greater_than_equal_field", bad.invalid.errors[0].code);
 }
 
 test "parseQueryLeaky: decoding, first duplicate wins, encoded key, unknown keys ignored" {
@@ -9695,6 +9722,7 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x60\x00" ++ "a <b>bold</b> text"), // html
     fuzzseed.seed("\x61\x00" ++ "23:59:59"), // local_time
     fuzzseed.seed("\x62\x00" ++ "2026-09-07T12:00:00"), // local_date_time
+    fuzzseed.seed("\x63\x00" ++ "US-CA"), // iso3166_2
     fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
 };
 
@@ -9930,7 +9958,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     // selects. All of them, and the accepted count beside it so a corpus of
     // refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = @as([99]bool, @splat(false));
+    var seen = @as([100]bool, @splat(false));
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -9943,14 +9971,14 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 99), formats.len);
+    try testing.expectEqual(@as(usize, 100), formats.len);
     for (seen) |v| try testing.expect(v);
     // Measured (21 / 12; before: 1 format, 0 non-empty strings, 0
     // accepted).: +24 seeds for the go-playground formats, 21 of
     // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
     // one-character base64_raw_url are the refusals).
-    try testing.expectEqual(@as(usize, 110), nonempty);
-    try testing.expectEqual(@as(usize, 98), accepted);
+    try testing.expectEqual(@as(usize, 111), nonempty);
+    try testing.expectEqual(@as(usize, 99), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
@@ -13359,6 +13387,7 @@ const format_name_table = [_]struct { Format, []const u8 }{
     .{ .html, "html" },
     .{ .local_time, "local-time" },
     .{ .local_date_time, "local-date-time" },
+    .{ .iso3166_2, "iso3166_2" },
 };
 
 test "a1 mutation: JSON Schema `format` name of every Format (the go-playground tag, or the JSON Schema name)" {

@@ -237,7 +237,7 @@ colours (`hexcolor` `rgb` `rgba` `hsl` `hsla` `cmyk`), `isbn` `isbn10` `isbn13` 
 `ulid` `base32` `multibyte` `datauri` `alphaunicode` `alphanumunicode` `non_control_character` `cidrv4` `cidrv6`,
 hostnames and origins (`fqdn` `dns_rfc1035_label` `hostname_rfc952` `hostname_port` `origin`), `urn_rfc2141`
 `urn_rfc8141` `html_encoded` `url_encoded` `html`, socket addresses (`tcp4_addr` `tcp6_addr` `tcp_addr` `udp4_addr`
-`udp6_addr` `udp_addr` `ip4_addr` `ip6_addr` `ip_addr`, literal IPs only), ISO code sets (`iso3166_1_alpha2`
+`udp6_addr` `udp_addr` `ip4_addr` `ip6_addr` `ip_addr`, literal IPs only), ISO code sets (`iso3166_1_alpha2` `iso3166_2`
 `iso3166_1_alpha2_eu` `iso3166_1_alpha3` `iso3166_1_alpha3_eu` `iso3166_1_alpha_numeric`
 `iso3166_1_alpha_numeric_eu` `iso4217` `iso4217_numeric`), `bcp47_language_tag` `bcp47_strict_language_tag`,
 `bic_iso_9362_2014` `bic`, `credit_card` `luhn_checksum`, `cve` `ssn` `ein` `cron`. All pure, no

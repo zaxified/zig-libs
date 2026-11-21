@@ -25,8 +25,8 @@ def modroot():
 def go_map(src, name):
     m = re.search(r"^var %s = map\[[a-z]+\]struct\{\}\{(.*?)^\}" % name, src, re.S | re.M)
     body = re.sub(r"//[^\n]*", "", m.group(1))
-    return sorted(set(re.findall(r'"([A-Z0-9]+)"|\b(\d+):', body) and
-                      [a or b for a, b in re.findall(r'"([A-Z0-9]+)"|\b(\d+):', body)]))
+    return sorted(set(re.findall(r'"([A-Z0-9-]+)"|\b(\d+):', body) and
+                      [a or b for a, b in re.findall(r'"([A-Z0-9-]+)"|\b(\d+):', body)]))
 
 
 def ranges():
@@ -59,6 +59,7 @@ def main():
         ("iso3166_1_alpha3", "iso3166_1_alpha3", cc, False), ("iso3166_1_alpha3_eu", "iso3166_1_alpha3_eu", cc, False),
         ("iso3166_1_numeric", "iso3166_1_alpha_numeric", cc, True),
         ("iso3166_1_numeric_eu", "iso3166_1_alpha_numeric_eu", cc, True),
+        ("iso3166_2", "iso3166_2", cc, False),
         ("iso4217", "iso4217", cur, False), ("iso4217_numeric", "iso4217_numeric", cur, True)]:
         keys = go_map(src, gname)
         if num:

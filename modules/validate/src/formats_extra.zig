@@ -812,7 +812,7 @@ fn code3(s: []const u8) ?u16 {
     return v;
 }
 
-pub const Iso = enum { alpha2, alpha2_eu, alpha3, alpha3_eu, numeric, numeric_eu, currency, currency_numeric };
+pub const Iso = enum { alpha2, alpha2_eu, alpha3, alpha3_eu, numeric, numeric_eu, currency, currency_numeric, subdivision };
 
 pub fn isIso(s: []const u8, which: Iso) bool {
     return switch (which) {
@@ -822,6 +822,7 @@ pub fn isIso(s: []const u8, which: Iso) bool {
         .alpha3_eu => hasText(&tables.iso3166_1_alpha3_eu, s),
         .numeric => if (code3(s)) |v| hasCode(&tables.iso3166_1_numeric, v) else false,
         .numeric_eu => if (code3(s)) |v| hasCode(&tables.iso3166_1_numeric_eu, v) else false,
+        .subdivision => hasText(&tables.iso3166_2, s),
         .currency => hasText(&tables.iso4217, s),
         .currency_numeric => if (code3(s)) |v| hasCode(&tables.iso4217_numeric, v) else false,
     };

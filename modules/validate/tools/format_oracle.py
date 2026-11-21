@@ -59,7 +59,7 @@ TAGS = {
     "cidr": "cidr",
     "mac": "mac",
 }
-TAGS.update({n: n for n in """hexcolor rgb rgba hsl hsla cmyk isbn isbn10 isbn13 issn eth_addr eth_addr_checksum btc_addr btc_addr_bech32 uuid3_rfc4122 uuid4_rfc4122 uuid5_rfc4122 ulid base32 multibyte datauri alphaunicode alphanumunicode cidrv4 cidrv6 fqdn dns_rfc1035_label hostname_rfc952 hostname_port origin urn_rfc2141 urn_rfc8141 html_encoded url_encoded tcp4_addr tcp6_addr tcp_addr udp4_addr udp6_addr udp_addr ip4_addr ip6_addr ip_addr iso3166_1_alpha2 iso3166_1_alpha2_eu iso3166_1_alpha3 iso3166_1_alpha3_eu iso3166_1_alpha_numeric iso3166_1_alpha_numeric_eu iso4217 iso4217_numeric bcp47_language_tag bcp47_strict_language_tag bic_iso_9362_2014 bic credit_card luhn_checksum cve ssn ein cron""".split()})
+TAGS.update({n: n for n in """hexcolor rgb rgba hsl hsla cmyk isbn isbn10 isbn13 issn eth_addr eth_addr_checksum btc_addr btc_addr_bech32 uuid3_rfc4122 uuid4_rfc4122 uuid5_rfc4122 ulid base32 multibyte datauri alphaunicode alphanumunicode cidrv4 cidrv6 fqdn dns_rfc1035_label hostname_rfc952 hostname_port origin urn_rfc2141 urn_rfc8141 html_encoded url_encoded tcp4_addr tcp6_addr tcp_addr udp4_addr udp6_addr udp_addr ip4_addr ip6_addr ip_addr iso3166_2 iso3166_1_alpha2 iso3166_1_alpha2_eu iso3166_1_alpha3 iso3166_1_alpha3_eu iso3166_1_alpha_numeric iso3166_1_alpha_numeric_eu iso4217 iso4217_numeric bcp47_language_tag bcp47_strict_language_tag bic_iso_9362_2014 bic credit_card luhn_checksum cve ssn ein cron""".split()})
 
 TAGS["hostname_rfc952"] = "hostname"  # go names the RFC 952 check plain `hostname`
 
@@ -247,6 +247,7 @@ SEEDS.update({
     "ip4_addr": ["1.2.3.4", "::ffff:1.2.3.4", "1.2.3.4:80", "0.0.0.0", "255.255.255.255", "01.2.3.4", "1.2.3", "localhost", "::1", "", "1.2.3.4 "],
     "ip6_addr": ["::1", "2001:db8::1", "::ffff:1.2.3.4", "fe80::1%eth0", "[::1]", "1.2.3.4", "", "::", "1:2:3:4:5:6:7:8", "1::2::3"],
     "ip_addr": ["1.2.3.4", "::1", "::ffff:1.2.3.4", "fe80::1%eth0", "localhost", "1.2.3.4:80", "[::1]", "", "256.0.0.1", "::"],
+    "iso3166_2": ["US-CA", "CZ-10", "CZ-PR", "us-ca", "US-ZZ", "", "US", "CA-ON", "GB-ENG", "GB-LND", "FR-75", "DE-BE", "AD-02", "CZ-10 ", "CZ_10", "CZ10", "-", "US-", "ZW-MV", "XK-01"],
     "iso3166_1_alpha2": ["US", "CZ", "us", "XX", "", "USA", "840", "GB", "UK", "EU", "AX", "XK", "ZZ", "U", "US ", "cz"],
     "iso3166_1_alpha2_eu": ["CZ", "DE", "FR", "US", "GB", "GR", "EL", "de", "", "HR", "SE"],
     "iso3166_1_alpha3": ["USA", "CZE", "XXX", "usa", "US", "GBR", "UKR", "", "ABW", "XKX", "ZZZ", "USAA"],
@@ -316,7 +317,7 @@ def mutate(rng, s, alphabet=ALPHABET):
     return bytes(b)
 
 
-NEW_FORMATS = set("""hexcolor rgb rgba hsl hsla cmyk isbn isbn10 isbn13 issn eth_addr eth_addr_checksum btc_addr btc_addr_bech32 uuid3_rfc4122 uuid4_rfc4122 uuid5_rfc4122 ulid base32 multibyte datauri alphaunicode alphanumunicode cidrv4 cidrv6 fqdn dns_rfc1035_label hostname_rfc952 hostname_port origin urn_rfc2141 urn_rfc8141 html_encoded url_encoded tcp4_addr tcp6_addr tcp_addr udp4_addr udp6_addr udp_addr ip4_addr ip6_addr ip_addr iso3166_1_alpha2 iso3166_1_alpha2_eu iso3166_1_alpha3 iso3166_1_alpha3_eu iso3166_1_alpha_numeric iso3166_1_alpha_numeric_eu iso4217 iso4217_numeric bcp47_language_tag bcp47_strict_language_tag bic_iso_9362_2014 bic credit_card luhn_checksum cve ssn ein cron""".split())
+NEW_FORMATS = set("""hexcolor rgb rgba hsl hsla cmyk isbn isbn10 isbn13 issn eth_addr eth_addr_checksum btc_addr btc_addr_bech32 uuid3_rfc4122 uuid4_rfc4122 uuid5_rfc4122 ulid base32 multibyte datauri alphaunicode alphanumunicode cidrv4 cidrv6 fqdn dns_rfc1035_label hostname_rfc952 hostname_port origin urn_rfc2141 urn_rfc8141 html_encoded url_encoded tcp4_addr tcp6_addr tcp_addr udp4_addr udp6_addr udp_addr ip4_addr ip6_addr ip_addr iso3166_2 iso3166_1_alpha2 iso3166_1_alpha2_eu iso3166_1_alpha3 iso3166_1_alpha3_eu iso3166_1_alpha_numeric iso3166_1_alpha_numeric_eu iso4217 iso4217_numeric bcp47_language_tag bcp47_strict_language_tag bic_iso_9362_2014 bic credit_card luhn_checksum cve ssn ein cron""".split())
 
 
 def corpus():
@@ -371,6 +372,20 @@ def dt_offset(s):
         while i < len(s) and s[i:i + 1].isdigit():
             i += 1
     return s[i:]
+
+
+def dt_leap_ok(s):
+    """The module's verdict on a date-time Go's layout accepts once normalised: a leap
+    second (`:60`) only where the clock and the offset say 23:59 UTC (RFC 3339 5.7)."""
+    if s[17:19] != b"60":
+        return True
+    off = dt_offset(s) or b""
+    mins = 0
+    if off[:1] in (b"+", b"-") and len(off) == 6:
+        mins = int(off[1:3]) * 60 + int(off[4:6])
+        if off[:1] == b"-":
+            mins = -mins
+    return (int(s[11:13]) * 60 + int(s[14:16]) - mins) % 1440 == 23 * 60 + 59
 
 
 def dt_norm(s):
@@ -660,7 +675,7 @@ CLASSES = [
      lambda f, s, go: False),
     ("DT_PROFILE", "profile: date_time also takes lower-case t/z (RFC 3339 5.6 NOTE), and a leap second (go takes none; this one takes 23:59:60 UTC, RFC 3339 5.7) (SPEC Format); go's time.Parse takes none of them (an offset-less time is `local_date_time`, not `date_time`: RFC 3339)",
      lambda f, s, go: f == "date_time" and not go and dt_norm(s) != s and AUX.get(("datetime=2006-01-02T15:04:05Z07:00", dt_norm(s)), False),
-     lambda f, s, go: True),
+     lambda f, s, go: dt_leap_ok(s)),
     ("CIDR_MAPPED", "GO DEFECT: go's cidrv4 takes the IPv6 text ::ffff:a.b.c.d/n (net.IP.To4) and its cidrv6 refuses it; RFC 4291 2.5.5.2 makes it an IPv6 prefix",
      lambda f, s, go: f in ("cidrv4", "cidrv6") and mapped(s) and AUX.get(("cidr", s), False) and go == (f == "cidrv4") and not re.search(rb"/0[0-9]", s),
      lambda f, s, go: f == "cidrv6"),
