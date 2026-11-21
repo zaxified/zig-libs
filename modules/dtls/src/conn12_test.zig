@@ -1190,3 +1190,24 @@ test "dtls12: once a message completed from the queue, a forged fragment cannot 
     const f6 = try server.handleFlight(f5, rnd, 0, &bufs.b);
     try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
 }
+
+test "dtls12: use_srtp (RFC 5764) in the hellos, server preference, same SRTP keying material" {
+    var c = pskConfig(.client, &.{.psk_with_aes_128_gcm_sha256});
+    c.srtp_profiles = &.{ 0x0001, 0x0007 };
+    var s = pskConfig(.server, &.{.psk_with_aes_128_gcm_sha256});
+    s.srtp_profiles = &.{ 0x0007, 0x0001 };
+    var client = try Connection12.clientInit(c);
+    defer client.deinit();
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x82)));
+    var bufs: Bufs = undefined;
+    try drive(&client, &server, seeded(&csprng), &bufs);
+    try testing.expectEqual(@as(?u16, 0x0007), client.negotiatedSrtpProfile());
+    try testing.expectEqual(@as(?u16, 0x0007), server.negotiatedSrtpProfile());
+    var kc: [60]u8 = undefined;
+    var ks: [60]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &kc);
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &ks);
+    try testing.expectEqualSlices(u8, &kc, &ks);
+}

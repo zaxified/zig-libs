@@ -295,6 +295,8 @@ pub const Connection12 = struct {
 
     alpn: [255]u8 = undefined,
     alpn_len: u8 = 0,
+    /// RFC 5764: the negotiated SRTP protection profile, 0 = none.
+    srtp_profile: u16 = 0,
     /// The last alert the peer sent (`level`, `description`), RFC 5246 §7.2.
     peer_alert: ?[2]u8 = null,
 
@@ -327,6 +329,12 @@ pub const Connection12 = struct {
 
     pub fn negotiatedAlpn(self: *const Connection12) ?[]const u8 {
         return if (self.alpn_len == 0) null else self.alpn[0..self.alpn_len];
+    }
+
+    /// RFC 5764: the SRTP protection profile both sides agreed on, or null
+    /// (`Config.srtp_profiles`).
+    pub fn negotiatedSrtpProfile(self: *const Connection12) ?u16 {
+        return if (self.srtp_profile == 0) null else self.srtp_profile;
     }
 
     pub fn isConnected(self: *const Connection12) bool {
@@ -887,7 +895,7 @@ pub const Connection12 = struct {
             any_cert = any_cert or kx.usesCertificate();
         }
         var ext_buf: [512]u8 = undefined;
-        var exts: [8]m12.Extension = undefined;
+        var exts: [9]m12.Extension = undefined;
         var n: usize = 0;
         var used: usize = 0;
         if (any_ecdhe) {
@@ -908,6 +916,12 @@ pub const Connection12 = struct {
             const a = try messages.encodeAlpn(self.config.alpn_protocols, ext_buf[used..]);
             used += a.len;
             exts[n] = .{ .ext_type = m12.ext_alpn, .data = a };
+            n += 1;
+        }
+        if (self.config.srtp_profiles.len > 0) {
+            const u = try messages.encodeUseSrtp(self.config.srtp_profiles, "", ext_buf[used..]);
+            used += u.len;
+            exts[n] = .{ .ext_type = messages.ext_use_srtp, .data = u };
             n += 1;
         }
         exts[n] = .{ .ext_type = m12.ext_extended_master_secret, .data = &.{} };
@@ -987,6 +1001,15 @@ pub const Connection12 = struct {
                 ems = true;
             },
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
+            messages.ext_use_srtp => {
+                // RFC 5764 §4.1.1 / §4.1.3: one profile we offered, and no
+                // MKI (we sent none).
+                if (self.config.srtp_profiles.len == 0) return error.Malformed;
+                const ans = messages.decodeUseSrtp(e.data) catch return error.Malformed;
+                if (ans.count() != 1 or ans.mki.len != 0) return error.Malformed;
+                if (std.mem.indexOfScalar(u16, self.config.srtp_profiles, ans.profile(0)) == null) return error.Malformed;
+                self.srtp_profile = ans.profile(0);
+            },
             m12.ext_alpn => {
                 if (self.config.alpn_protocols.len == 0) return error.Malformed;
                 const name = messages.decodeAlpnSelected(e.data) catch return error.Malformed;
@@ -1183,6 +1206,7 @@ pub const Connection12 = struct {
         var client_groups: []const u8 = &.{};
         var client_schemes: []const u8 = &.{};
         var alpn_offer: ?[]const u8 = null;
+        var srtp_offer: ?[]const u8 = null;
         var ems = false;
         var ri = m12.offersSuite(dec.cipher_suites_raw, m12.empty_renegotiation_info_scsv);
         for (dec.extensions) |e| switch (e.ext_type) {
@@ -1194,6 +1218,7 @@ pub const Connection12 = struct {
                 ri = true;
             },
             m12.ext_alpn => alpn_offer = e.data,
+            messages.ext_use_srtp => srtp_offer = e.data,
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
             else => {},
         };
@@ -1253,6 +1278,13 @@ pub const Connection12 = struct {
             @memcpy(self.alpn[0..picked.len], picked);
             self.alpn_len = @intCast(picked.len);
         }
+        // use_srtp (RFC 5764 §4.1.1), as the 1.3 server does.
+        if (self.config.srtp_profiles.len > 0) {
+            if (srtp_offer) |offer| {
+                const so = messages.decodeUseSrtp(offer) catch return error.Malformed;
+                self.srtp_profile = messages.selectSrtpProfile(self.config.srtp_profiles, so) orelse 0;
+            }
+        }
 
         source(entropy).bytes(&self.server_random);
         // RFC 8446 §4.1.3: a server that could have spoken 1.3 says so.
@@ -1263,7 +1295,8 @@ pub const Connection12 = struct {
         var buf: [max_message_len]u8 = undefined;
         {
             var ext_buf: [300]u8 = undefined;
-            var exts: [4]m12.Extension = undefined;
+            var srtp_buf: [5]u8 = undefined;
+            var exts: [5]m12.Extension = undefined;
             var n: usize = 0;
             // RFC 5746 §3.6: answered only when the client signalled it
             // (RFC 5246 §7.4.1.4: no unsolicited extensions).
@@ -1282,6 +1315,10 @@ pub const Connection12 = struct {
             if (self.alpn_len > 0) {
                 const a = try messages.encodeAlpn(&.{self.alpn[0..self.alpn_len]}, &ext_buf);
                 exts[n] = .{ .ext_type = m12.ext_alpn, .data = a };
+                n += 1;
+            }
+            if (self.negotiatedSrtpProfile()) |p| {
+                exts[n] = .{ .ext_type = messages.ext_use_srtp, .data = try messages.encodeUseSrtp(&.{p}, "", &srtp_buf) };
                 n += 1;
             }
             const sh = m12.encodeServerHello(.{ .random = self.server_random, .cipher_suite = @backingInt(self.suite), .extensions = exts[0..n] }, &buf) catch return error.BufferTooShort;

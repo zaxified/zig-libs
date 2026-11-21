@@ -797,6 +797,84 @@ pub fn decodeEncryptedExtensions(buf: []const u8, out: []Extension) MessageError
 /// Encodes `protocols` as an ALPN extension body. Every name must be 1..255
 /// bytes (`error.Malformed` otherwise, never a truncated length byte), and
 /// the list must not be empty.
+// ── RFC 5764 §4.1.1 use_srtp (DTLS-SRTP) ─────────────────────────────────
+
+/// The `use_srtp` extension's type (RFC 5764 §9). Both DTLS versions carry
+/// it: 1.2 in ClientHello / ServerHello, 1.3 in ClientHello /
+/// EncryptedExtensions (RFC 8446 §4.2's table).
+pub const ext_use_srtp: u16 = 14;
+
+/// A decoded `UseSRTPData`: `profiles` is the raw list of 2-byte
+/// `SRTPProtectionProfile`s (`profile(i)`), `mki` the `srtp_mki`.
+pub const UseSrtp = struct {
+    profiles: []const u8,
+    mki: []const u8,
+
+    pub fn count(self: UseSrtp) usize {
+        return self.profiles.len / 2;
+    }
+
+    pub fn profile(self: UseSrtp, i: usize) u16 {
+        return std.mem.readInt(u16, self.profiles[2 * i ..][0..2], .big);
+    }
+
+    pub fn offers(self: UseSrtp, p: u16) bool {
+        for (0..self.count()) |i| if (self.profile(i) == p) return true;
+        return false;
+    }
+};
+
+/// `SRTPProtectionProfiles<2..2^16-1> || opaque srtp_mki<0..255>`.
+pub fn encodeUseSrtp(profiles: []const u16, mki: []const u8, out: []u8) MessageError![]u8 {
+    if (profiles.len == 0 or mki.len > 255) return error.Malformed;
+    const list_len = 2 * profiles.len;
+    if (list_len > std.math.maxInt(u16)) return error.ListTooLong;
+    const total = 2 + list_len + 1 + mki.len;
+    if (out.len < total) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], @intCast(list_len), .big);
+    for (profiles, 0..) |p, i| std.mem.writeInt(u16, out[2 + 2 * i ..][0..2], p, .big);
+    out[2 + list_len] = @intCast(mki.len);
+    @memcpy(out[3 + list_len ..][0..mki.len], mki);
+    return out[0..total];
+}
+
+/// The `encodeUseSrtp` inverse: a non-empty, even-length profile list, the
+/// MKI, and nothing after it (`error.Malformed` otherwise).
+pub fn decodeUseSrtp(data: []const u8) MessageError!UseSrtp {
+    if (data.len < 2) return error.Malformed;
+    const list_len = std.mem.readInt(u16, data[0..2], .big);
+    if (list_len == 0 or list_len % 2 != 0 or data.len < 2 + @as(usize, list_len) + 1) return error.Malformed;
+    const mki_len = data[2 + list_len];
+    if (data.len != 3 + @as(usize, list_len) + mki_len) return error.Malformed;
+    return .{ .profiles = data[2..][0..list_len], .mki = data[3 + list_len ..][0..mki_len] };
+}
+
+/// Server-side selection: this side's first preference the offer also
+/// lists (OpenSSL's server picks from its own list the same way), or null
+/// (RFC 5764 §4.1.1: no common profile → no `use_srtp` in the answer).
+pub fn selectSrtpProfile(ours: []const u16, offer: UseSrtp) ?u16 {
+    for (ours) |p| if (offer.offers(p)) return p;
+    return null;
+}
+
+test "use_srtp: encode/decode round trip, selection by our preference, malformed shapes" {
+    var buf: [32]u8 = undefined;
+    const e = try encodeUseSrtp(&.{ 0x0007, 0x0001 }, "", &buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 4, 0, 7, 0, 1, 0 }, e);
+    const d = try decodeUseSrtp(e);
+    try std.testing.expectEqual(@as(usize, 2), d.count());
+    try std.testing.expectEqual(@as(u16, 1), d.profile(1));
+    try std.testing.expectEqual(@as(?u16, 1), selectSrtpProfile(&.{ 0x0002, 0x0001, 0x0007 }, d));
+    try std.testing.expectEqual(@as(?u16, null), selectSrtpProfile(&.{0x0008}, d));
+    const m = try encodeUseSrtp(&.{0x0001}, "ab", &buf);
+    try std.testing.expectEqualStrings("ab", (try decodeUseSrtp(m)).mki);
+    for ([_][]const u8{ &.{}, &.{0}, &.{ 0, 0, 0 }, &.{ 0, 1, 0, 0 }, &.{ 0, 2, 0, 1 }, &.{ 0, 2, 0, 1, 1 }, &.{ 0, 2, 0, 1, 0, 9 } }) |bad| {
+        try std.testing.expectError(error.Malformed, decodeUseSrtp(bad));
+    }
+    try std.testing.expectError(error.BufferTooShort, encodeUseSrtp(&.{1}, "", buf[0..4]));
+    try std.testing.expectError(error.Malformed, encodeUseSrtp(&.{}, "", &buf));
+}
+
 pub fn encodeAlpn(protocols: []const []const u8, out: []u8) MessageError![]u8 {
     if (protocols.len == 0) return error.Malformed;
     var list_len: usize = 0;

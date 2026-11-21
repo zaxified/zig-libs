@@ -219,6 +219,9 @@ pub const ConfigError = error{
     /// `Config.alpn_protocols` holds an empty name, a name over 255 bytes,
     /// or more than `max_alpn_list_len` bytes once encoded (RFC 7301 §3.1).
     InvalidAlpnProtocols,
+    /// `Config.srtp_profiles` holds more than `max_srtp_profiles` entries or
+    /// the reserved value 0x0000.
+    InvalidSrtpProfiles,
     /// `key_exchange = .psk` and no suite in `Config.cipher_suites` has the
     /// hash `Config.psk_hash` names. RFC 8446 §4.2.11: an external PSK is
     /// bound to one hash and is usable only with suites of that hash, so
@@ -523,6 +526,17 @@ pub const Config = struct {
     /// `error.NoApplicationProtocol` (RFC 7301 §3.2's
     /// `no_application_protocol`). The result is `negotiatedAlpn`.
     alpn_protocols: []const []const u8 = &.{},
+    /// RFC 5764 `use_srtp` (DTLS-SRTP): the SRTP protection profiles this
+    /// side accepts, preference order (e.g. 0x0007 SRTP_AEAD_AES_128_GCM,
+    /// 0x0001 SRTP_AES128_CM_HMAC_SHA1_80). Empty (the default) = not
+    /// offered / not answered. A CLIENT offers the list (with an empty MKI);
+    /// a SERVER answers with its first preference the client also listed
+    /// (OpenSSL's server order) and an empty MKI, or with nothing when none
+    /// overlaps (RFC 5764 §4.1.1 — not an error). Both engines: 1.2 in the
+    /// hellos, 1.3 in ClientHello / EncryptedExtensions. The result is
+    /// `negotiatedSrtpProfile`; the keying material is
+    /// `exportKeyingMaterial("EXTRACTOR-dtls_srtp", "", out)` (§4.2).
+    srtp_profiles: []const u16 = &.{},
 
     // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only
     // connection byte-identical to what it was before 1.2 existed.
@@ -610,6 +624,8 @@ pub const Config = struct {
             }
             if (alpn_len > max_alpn_list_len) return error.InvalidAlpnProtocols;
         }
+        if (self.srtp_profiles.len > max_srtp_profiles) return error.InvalidSrtpProfiles;
+        for (self.srtp_profiles) |p| if (p == 0) return error.InvalidSrtpProfiles;
         switch (self.key_exchange) {
             .psk => {
                 if (self.psk.len == 0) return error.EmptyPsk;
@@ -1013,10 +1029,13 @@ const KeyUpdateState = enum { idle, queued, in_flight };
 /// next to a hybrid key share; real lists ("h2", "coap", "webrtc", ...) are
 /// a few dozen bytes.
 const max_alpn_list_len = 256;
+/// `Config.srtp_profiles` cap: RFC 5764 §4.1.2 and RFC 7714 define six
+/// profiles; sixteen leaves room for later ones.
+pub const max_srtp_profiles = 16;
 
 /// The EncryptedExtensions this server sends: list length + one ALPN
 /// extension (4-byte header + 2-byte list length + 1 + 255-byte name).
-const ee_body_cap = 2 + 4 + 2 + 1 + 255;
+const ee_body_cap = 2 + 4 + 2 + 1 + 255 + 4 + 5; // + use_srtp: one profile, empty MKI
 /// The EncryptedExtensions body a client accepts. Was 64; the ALPN answer
 /// alone can be 264 bytes, and a real server may add `server_name`,
 /// `max_fragment_length`, `supported_groups` (RFC 8446 §4.2) on top.
@@ -1676,6 +1695,8 @@ pub const Connection = struct {
     /// none was (see `negotiatedAlpn`).
     alpn: [255]u8 = undefined,
     alpn_len: u8 = 0,
+    /// RFC 5764: the negotiated SRTP protection profile, 0 = none.
+    srtp_profile: u16 = 0,
 
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
@@ -2627,6 +2648,43 @@ pub const Connection = struct {
         return if (self.alpn_len == 0) null else self.alpn[0..self.alpn_len];
     }
 
+    /// RFC 5764: the SRTP protection profile both sides agreed on, or null
+    /// (not offered, not configured on the server, or no common profile).
+    pub fn negotiatedSrtpProfile(self: *const Connection) ?u16 {
+        return if (self.srtp_profile == 0) null else self.srtp_profile;
+    }
+
+    /// Client: the ClientHello's `use_srtp`, or null with no
+    /// `Config.srtp_profiles`.
+    fn srtpOffer(self: *const Connection, buf: *[2 + 2 * max_srtp_profiles + 1]u8) HandshakeError!?messages.Extension {
+        if (self.config.srtp_profiles.len == 0) return null;
+        const data = try messages.encodeUseSrtp(self.config.srtp_profiles, "", buf);
+        return .{ .ext_type = messages.ext_use_srtp, .data = data };
+    }
+
+    /// Server: RFC 5764 §4.1.1 selection over the ClientHello's extensions.
+    fn serverSelectSrtp(self: *Connection, exts: []const messages.Extension) HandshakeError!void {
+        self.srtp_profile = 0;
+        if (self.config.srtp_profiles.len == 0) return;
+        for (exts) |e| {
+            if (e.ext_type != messages.ext_use_srtp) continue;
+            const offer = messages.decodeUseSrtp(e.data) catch return error.Malformed;
+            self.srtp_profile = messages.selectSrtpProfile(self.config.srtp_profiles, offer) orelse 0;
+            return;
+        }
+    }
+
+    /// Client: the server's `use_srtp` answer — exactly one profile this
+    /// client offered, and (§4.1.3) no MKI, since this client sends none.
+    fn clientAcceptSrtp(self: *Connection, data: []const u8) HandshakeError!void {
+        if (self.config.srtp_profiles.len == 0) return error.Malformed;
+        const ans = messages.decodeUseSrtp(data) catch return error.Malformed;
+        if (ans.count() != 1 or ans.mki.len != 0) return error.Malformed;
+        const p = ans.profile(0);
+        if (std.mem.indexOfScalar(u16, self.config.srtp_profiles, p) == null) return error.Malformed;
+        self.srtp_profile = p;
+    }
+
     /// Client: the ClientHello's ALPN extension, or `null` with no
     /// `Config.alpn_protocols`. `Config.validate` bounded the list.
     fn alpnOffer(self: *const Connection, buf: *[max_alpn_list_len]u8) HandshakeError!?messages.Extension {
@@ -2667,9 +2725,14 @@ pub const Connection = struct {
     /// send is `unsupported_extension`).
     fn clientAcceptAlpn(self: *Connection, ee_body: []const u8) HandshakeError!void {
         self.alpn_len = 0;
+        self.srtp_profile = 0;
         var ext_buf: [16]messages.Extension = undefined;
         const exts = messages.decodeEncryptedExtensions(ee_body, &ext_buf) catch return error.Malformed;
         for (exts) |e| {
+            if (e.ext_type == messages.ext_use_srtp) {
+                try self.clientAcceptSrtp(e.data);
+                continue;
+            }
             if (e.ext_type != @backingInt(messages.ExtensionType.application_layer_protocol_negotiation)) continue;
             const name = messages.decodeAlpnSelected(e.data) catch return error.Malformed;
             for (self.config.alpn_protocols) |ours| {
@@ -2802,7 +2865,10 @@ pub const Connection = struct {
         var alpn_buf: [max_alpn_list_len]u8 = undefined;
         const alpn_ext = try self.alpnOffer(&alpn_buf);
 
-        var exts_buf: [8 + dual12_extensions.len]messages.Extension = undefined;
+        var srtp_buf: [2 + 2 * max_srtp_profiles + 1]u8 = undefined;
+        const srtp_ext = try self.srtpOffer(&srtp_buf);
+
+        var exts_buf: [9 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2819,6 +2885,10 @@ pub const Connection = struct {
             n_exts += 1;
         }
         if (alpn_ext) |e| {
+            exts_buf[n_exts] = e;
+            n_exts += 1;
+        }
+        if (srtp_ext) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
         }
@@ -2955,7 +3025,10 @@ pub const Connection = struct {
         var alpn_buf: [max_alpn_list_len]u8 = undefined;
         const alpn_ext = try self.alpnOffer(&alpn_buf);
 
-        var exts_buf: [6 + dual12_extensions.len]messages.Extension = undefined;
+        var srtp_buf: [2 + 2 * max_srtp_profiles + 1]u8 = undefined;
+        const srtp_ext = try self.srtpOffer(&srtp_buf);
+
+        var exts_buf: [7 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2970,6 +3043,10 @@ pub const Connection = struct {
             n_exts += 1;
         }
         if (alpn_ext) |e| {
+            exts_buf[n_exts] = e;
+            n_exts += 1;
+        }
+        if (srtp_ext) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
         }
@@ -4124,6 +4201,7 @@ pub const Connection = struct {
             if (suite != committed) return error.NoCipherSuiteOverlap;
         }
         try self.serverSelectAlpn(dec.extensions);
+        try self.serverSelectSrtp(dec.extensions);
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
         // extracted): commit it to the transcript, which from here on runs
@@ -4209,11 +4287,20 @@ pub const Connection = struct {
         // EncryptedExtensions: empty, or the RFC 7301 selection (a list of
         // exactly one name).
         var alpn_sel_buf: [2 + 1 + 255]u8 = undefined;
-        const ee_exts_one = [1]messages.Extension{.{
-            .ext_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation),
-            .data = if (self.negotiatedAlpn()) |name| try messages.encodeAlpn(&.{name}, &alpn_sel_buf) else &.{},
-        }};
-        const ee_exts: []const messages.Extension = if (self.alpn_len != 0) &ee_exts_one else &.{};
+        var ee_ext_arr: [2]messages.Extension = undefined;
+        var n_ee: usize = 0;
+        if (self.negotiatedAlpn()) |name| {
+            ee_ext_arr[n_ee] = .{ .ext_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation), .data = try messages.encodeAlpn(&.{name}, &alpn_sel_buf) };
+            n_ee += 1;
+        }
+        // RFC 5764 §4.1.1 / RFC 8446 §4.2: use_srtp answers in
+        // EncryptedExtensions, one profile, an empty MKI.
+        var srtp_sel_buf: [5]u8 = undefined;
+        if (self.negotiatedSrtpProfile()) |p| {
+            ee_ext_arr[n_ee] = .{ .ext_type = messages.ext_use_srtp, .data = try messages.encodeUseSrtp(&.{p}, "", &srtp_sel_buf) };
+            n_ee += 1;
+        }
+        const ee_exts: []const messages.Extension = ee_ext_arr[0..n_ee];
         var ee_body_buf: [ee_body_cap]u8 = undefined;
         const ee_body = messages.encodeEncryptedExtensions(ee_exts, &ee_body_buf) catch return error.BufferTooShort;
         self.transcript.append(@backingInt(messages.HandshakeType.encrypted_extensions), ee_body);
@@ -10773,4 +10860,60 @@ test "hello_retry.refuse_fragmented_client_hello: a fragmented ClientHello is re
     var s3 = try Connection.serverInit(strict);
     defer s3.deinit();
     _ = try expectHelloRetryRequest((try s3.handleFlight(whole, rnd, 0, &b2)).out);
+}
+
+// ── use_srtp (RFC 5764) ──────────────────────────────────────────────────
+
+test "use_srtp (1.3): the server's first preference the client offered, in EncryptedExtensions; both sides export the same SRTP keying material" {
+    const srtp_gcm: u16 = 0x0007;
+    const srtp_80: u16 = 0x0001;
+    var cc = Config{ .role = .client, .psk_identity = "device-042", .psk = "a-shared-pre-shared-key", .srtp_profiles = &.{ srtp_80, srtp_gcm } };
+    var sc = cc;
+    sc.role = .server;
+    sc.srtp_profiles = &.{ srtp_gcm, srtp_80 };
+    var client = try Connection.clientInit(cc);
+    defer client.deinit();
+    var server = try Connection.serverInit(sc);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x81)));
+    var b1: [2048]u8 = undefined;
+    var b2: [2048]u8 = undefined;
+    try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+    try testing.expectEqual(@as(?u16, srtp_gcm), client.negotiatedSrtpProfile());
+    try testing.expectEqual(@as(?u16, srtp_gcm), server.negotiatedSrtpProfile());
+    var kc: [60]u8 = undefined;
+    var ks: [60]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &kc);
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &ks);
+    try testing.expectEqualSlices(u8, &kc, &ks);
+
+    // No overlap: no answer, not an error; a server without a list ignores the offer.
+    cc.srtp_profiles = &.{0x0002};
+    for ([_][]const u16{ &.{srtp_gcm}, &.{} }) |server_list| {
+        sc.srtp_profiles = server_list;
+        var c2 = try Connection.clientInit(cc);
+        defer c2.deinit();
+        var s2 = try Connection.serverInit(sc);
+        defer s2.deinit();
+        try driveHandshake(&c2, &s2, seededForTest(&csprng), &b1, &b2);
+        try testing.expectEqual(@as(?u16, null), c2.negotiatedSrtpProfile());
+        try testing.expectEqual(@as(?u16, null), s2.negotiatedSrtpProfile());
+    }
+}
+
+test "use_srtp (1.3): the client refuses an answer it cannot accept" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .srtp_profiles = &.{ 0x0001, 0x0007 } });
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    try c.clientAcceptSrtp(try messages.encodeUseSrtp(&.{0x0007}, "", &buf));
+    try testing.expectEqual(@as(?u16, 0x0007), c.negotiatedSrtpProfile());
+    try testing.expectError(error.Malformed, c.clientAcceptSrtp(try messages.encodeUseSrtp(&.{0x0002}, "", &buf)));
+    try testing.expectError(error.Malformed, c.clientAcceptSrtp(try messages.encodeUseSrtp(&.{ 0x0001, 0x0007 }, "", &buf)));
+    try testing.expectError(error.Malformed, c.clientAcceptSrtp(try messages.encodeUseSrtp(&.{0x0001}, "x", &buf)));
+    var none = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer none.deinit();
+    try testing.expectError(error.Malformed, none.clientAcceptSrtp(try messages.encodeUseSrtp(&.{0x0001}, "", &buf)));
+    try testing.expectError(error.InvalidSrtpProfiles, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .srtp_profiles = &.{0} }).validate());
+    const many: [max_srtp_profiles + 1]u16 = @splat(1);
+    try testing.expectError(error.InvalidSrtpProfiles, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .srtp_profiles = &many }).validate());
 }

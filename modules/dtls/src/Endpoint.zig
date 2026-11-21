@@ -146,6 +146,12 @@ pub const Endpoint = union(enum) {
         };
     }
 
+    pub fn negotiatedSrtpProfile(self: *const Endpoint) ?u16 {
+        return switch (self.*) {
+            inline else => |*c| c.negotiatedSrtpProfile(),
+        };
+    }
+
     pub fn deinit(self: *Endpoint) void {
         switch (self.*) {
             inline else => |*c| c.deinit(),
