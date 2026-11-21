@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [brave-experiments/frodo-pir](https://github.com/brave-experiments/frodo-pir) | Rust | MPL-2.0 | 78 | push 2024-01-10 | Single-server LWE PIR (FrodoPIR); weak-copyleft, source not read. Different security model. |
 | Zig ecosystem | Zig | — | — | — | No PIR library in `std`; none found on GitHub (search 2026-09-30). |
 
-**Where we are ahead:** the only PIR library found for Zig; the reference's two-server DPF trust model, with `k`-record retrieval in one round trip, an aggregate query, keyword lookup, range sharding for multi-core servers and malicious-server detection (`verify.zig`), and — unlike SimplePIR — no per-client hint download. **Where we are behind:** no cuckoo- or simple-hashed sparse database (keyword collisions are false negatives the operator must provision away), no single-server PIR (the non-collusion assumption stays), and no wire format compatible with the reference's protobuf messages (→ *What is deliberately not done*).
+**Where we are ahead:** the only PIR library found for Zig; the reference's two-server DPF trust model, with `k`-record retrieval in one round trip, an aggregate query, keyword lookup, range sharding for multi-core servers and malicious-server detection (`verify.zig`), and — unlike SimplePIR — no per-client hint download. **Where we are behind:** no simple-hashed sparse database (the cuckoo-hashed one is `Cuckoo`), no single-server PIR (the non-collusion assumption stays), and no wire format compatible with the reference's protobuf messages (→ *What is deliberately not done*).
 
 ## Why this is a module and not an addition to `fss`
 
@@ -337,17 +337,29 @@ The `Verified` layer gets the same one-line wrapper over its own `query`.
   side channels. A no-I/O module cannot provide, or even meaningfully specify,
   that pipeline (§"Where the library stops"); a deployment that has one can
   simply use index PIR directly — nothing here blocks it.
-- **Cuckoo hashing / batch codes** were already consciously rejected for
-  `fss`'s multi-point construction, with a stated revisit trigger (`fss`
-  SPEC). Nothing about keyword lookup distinguishes it from that rejection —
-  the mechanism would buy multi-slot placement (each key gets 2–3 candidate
-  slots, resolving collisions by displacement) at the price of the failure
-  probability, the stash policy, and — decisive here — **per-lookup
-  multi-slot queries whose shape the whole design exists to keep constant**.
-  Querying all candidate slots unconditionally (the leak-free way to do
-  cuckoo lookup) is `Multi(k)` composed with `keywordIndex` variants, which a
-  deployment can build above this layer if collision-freedom is worth k× the
-  work; it is not this module's default.
+- **Cuckoo hashing** is offered as an opt-in layer, not the default: see
+  *Collision-free keyword lookup* below. The default stays the single public
+  hash, one slot, one query.
+
+### Collision-free keyword lookup (`cuckoo.zig`)
+
+`Cuckoo(domain_bits, h)` — the reference's cuckoo-hashed sparse database
+(google/distributed_point_functions `pir/`, `num_hash_functions` candidate
+buckets, the client queries every one). `candidates(seed, keyword)` gives `h`
+slots, `SHA-256(seed || i || keyword) mod 2^domain_bits`; the operator places
+every keyword offline with `place(seed, keywords, table, slot_of, max_kicks)`
+(a random walk whose victim choice is a PRNG keyed by the public `seed`, so a
+placement is reproducible; `error.TableFull` when the walk exceeds
+`max_kicks` or there are more keywords than slots — re-seed and retry, no
+stash), builds the database from `table`, and publishes `seed`. The client
+retrieves all `h` candidates with `Multi(h)`, **always all of them**, and
+keeps the record whose key field matches: the query shape is `Multi(h)`'s for
+every keyword, present or absent, so the leakage statement is `Multi(h)`'s
+(`k = h` is public). Cost: `h`× the server work of `queryKeyword`, in exchange
+for no false negative. Tests: every keyword on one of its candidates and no
+slot shared (1500 keywords, `2^11` slots, `h = 3`), `TableFull`, buffer
+checks, and an end-to-end retrieval of present keywords and an absent one
+through `Multi(3)` (`src/cuckoo.zig`).
 
 ## Range sharding (`answerRange` / `answerSlicesRange` / `accumulate`)
 
@@ -751,7 +763,6 @@ Without them the STAT test would prove nothing about its own sensitivity.
 ## Backlog / deferred
 
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128/u256`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `wordAt`, `writeWord`, `reconstructFromBytes*`, `queryBody` (per database word). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
-- **Collision-free keyword lookup** (cuckoo- or simple-hashed database with a client that queries the candidate slots): the reference has dedicated cuckoo-hashed and simple-hashed sparse PIR; here `keywordIndex` is a single public hash, so a collision is a false negative the operator must provision away. Cuckoo placement is rejected in `fss` with a stated revisit trigger (§"What is deliberately not done"), so this is a question of revisiting that trigger. Medium; fits §2.
 
 ## Anchoring — no external vector exists, and why
 

@@ -127,6 +127,10 @@ pub const VerifiedWith = verify_mod.VerifiedWith;
 
 /// A borrowed, fixed-record-length view over a database. See `db.zig`.
 pub const Database = db_mod.Database;
+/// Cuckoo-hashed keyword placement and candidate slots (`cuckoo.zig`):
+/// collision-free keyword lookup through `Multi(h)`.
+pub const cuckoo = @import("cuckoo.zig");
+pub const Cuckoo = cuckoo.Cuckoo;
 
 /// Smallest DPF domain (in bits) addressing `count` records. See `db.zig`.
 pub const domainBitsFor = db_mod.domainBitsFor;
@@ -145,6 +149,7 @@ test {
     _ = pir_mod;
     _ = verify_mod;
     _ = @import("privacy_test.zig");
+    _ = cuckoo;
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");

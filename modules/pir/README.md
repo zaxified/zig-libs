@@ -251,9 +251,11 @@ Read the security statement before relying on it (`SPEC.md`
 
 Single-server PIR, a wire format compatible with another implementation,
 recovery or attribution after a lying server is detected, a verified `Multi(k)`,
-sublinear batch PIR, and collision resolution for keyword lookup (a collision
-makes the losing keyword unreachable; provision `domain_bits` as above) are
-not provided. The reasons are in `SPEC.md` §"What is deliberately not done"
+and sublinear batch PIR are not provided. Collision-free keyword lookup is the
+opt-in `pir.Cuckoo(domain_bits, h)`: the operator places each keyword at one
+of `h` public candidate slots (`place`, publishing the `seed`), the client
+queries all `h` candidates with `Multi(h)` (`candidates`) and keeps the record
+whose key field matches. The reasons are in `SPEC.md` §"What is deliberately not done"
 and §"Backlog / deferred".
 
 ## Verify
