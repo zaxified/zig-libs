@@ -553,8 +553,8 @@ p256	ReleaseFast	ecdh	1	3	a015020354119889	7746c55c1426e84a
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, privateOpCrtPtr in root.zig (--stacks).
-rsa	ReleaseFast	crt	1	1	afe353b978d76c8f	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	afe353b978d76c8f	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	68f0f90ce09104ad	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	68f0f90ce09104ad	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -565,8 +565,8 @@ rsa	ReleaseFast	noncrt	1	0	afe353b978d76c8f	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig `drawBlindingPair` draw, `privateOpCrtPtr` F3 twice).
-rsa	ReleaseFast	crtbl	1	2	afe353b978d76c8f	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	afe353b978d76c8f	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	68f0f90ce09104ad	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	68f0f90ce09104ad	d4057b00f9df7b56
 # rsa oaepnf (2026-11-13) — rsa.decryptOaepHNoFail end to end (CRT op + OAEP unpad)
 # on a real 32-byte-CEK ciphertext, p/q/dp/dq/qinv tainted. The 1 in-file context
 # is privateOpCrtPtr's F3 verdict (root.zig, reached from the private-op entry points), the same
@@ -575,7 +575,7 @@ rsa	ReleaseFast	crtcache	1	4	afe353b978d76c8f	d4057b00f9df7b56
 # is returned as data (before 2026-11-13: `if (valid == 1)` + a copy from a
 # secret offset, 2 contexts at root.zig `ctEqMaskUsize`). The 21 witness contexts are
 # the harness's std.debug.print of ok/msg/raw.
-rsa	ReleaseFast	oaepnf	1	1	afe353b978d76c8f	7e7c9776c2e11410
+rsa	ReleaseFast	oaepnf	1	1	68f0f90ce09104ad	7e7c9776c2e11410
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -587,14 +587,14 @@ rsa	ReleaseFast	oaepnf	1	1	afe353b978d76c8f	7e7c9776c2e11410
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	afe353b978d76c8f	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	68f0f90ce09104ad	2cb28867b78d48a6
 # rsa pemenc (2026-11-17) — SecretKey.toPem(.pkcs1) of the KAT key, d/dP/dQ/qInv
 # and the primes (with their Montgomery params) tainted. 0 in-file: marshal's
 # INTEGER trim is branch-free and declassifies only what DER publishes (the
 # length and the 0x00 sign pad; before 2026-11-17: 8 contexts at its
 # `while field[z] == 0` / `field[z] & 0x80`); base64 is b64ct. Witness: the
 # harness printing the text.
-rsa	ReleaseFast	pemenc	1	0	42dcbae43030c9c7	c782967c3894b9d5
+rsa	ReleaseFast	pemenc	1	0	89d3135013bf9dba	c782967c3894b9d5
 # rsa pemdec (2026-11-17) — SecretKey.fromPem of an untainted key's PEM text with
 # exactly the base64 characters whose six bits all lie in the CONTENT of d, dP,
 # dQ, qInv tainted (p, q untainted on purpose: fromPem re-derives the key from
@@ -605,7 +605,7 @@ rsa	ReleaseFast	pemenc	1	0	42dcbae43030c9c7	c782967c3894b9d5
 # (2) montint nt.divExact's divisibility verdict (d − dP by p−1, d − dQ by q−1),
 # folded into checkWireFields' single verdict and constant for a valid key. That
 # verdict itself is declassified (the call's result). Witness: printing d.
-rsa	ReleaseFast	pemdec	1	2	b58a43d3704f0147	2cb28867b78d48a6
+rsa	ReleaseFast	pemdec	1	2	92819c48aeca7293	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig `xmssPkFromSig`) at a fourth address (loop unrolled).
@@ -1498,7 +1498,7 @@ noise	ReleaseFast	transport	1	6	52e4f61d12470285	b4443cf65f6c3849
 # 2026-10-26 (audit) — rsa_pkcs1_sha1 no longer offered + review fixes: counts
 # unchanged (kex 15, cv 30); kex output pin moved with the ClientHello again.
 # 2026-11-01 — tlsclient on the `mlkem` module (0b84d2aa): the 12 std ML-KEM sampleUniformRejection contexts are gone -> kex 3 (P-256/P-384 keygen). cv digest only. Re-pinned from full CI 41323098008.
-tlsclient	ReleaseFast	kex	1	3	da40f4905caead06	c72177e1594131b1
+tlsclient	ReleaseFast	kex	1	3	541fa853f982532c	c72177e1594131b1
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1511,7 +1511,7 @@ tlsclient	ReleaseFast	kex	1	3	da40f4905caead06	c72177e1594131b1
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	b8ae5c848bbad1a4	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	871a179c2a9113f8	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1614,9 +1614,9 @@ dtls	ReleaseFast	app12	1	3	7c3551830fa8767a	a30c6f8f370c5fa7
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0): hs 28 -> 22, no increase. -4: std ecdsa finalizePrehashed / mem contexts of certverify.signEcdsaP256 (p256 `fromStd` now declassifies r/s, the published signature). -3 +1: std edwards25519/ed25519 contexts replaced by one in certverify.zig signEd25519 (Ed25519 signs on ct25519 since e62faa4f; verdicts at the key-consistency eql and the identity check of R). kex.generateNist -> generateNistAt is a rename (same 4 contexts). app: aesgcm frames re-inlined, still 8.
-tlsserver	ReleaseFast	hs	1	22	fb87f2d57a0db818	18b712e147be54c3
+tlsserver	ReleaseFast	hs	1	22	25e02f2db7d88b7f	18b712e147be54c3
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): tlsserver app 8 -> 7, down by one after chachapoly's short AEAD engine (no tlsserver source changed). Owner rule: no local ctgrind re-run.
-tlsserver	ReleaseFast	app	1	7	fb87f2d57a0db818	ded7de421ed83ff8
+tlsserver	ReleaseFast	app	1	7	25e02f2db7d88b7f	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1625,7 +1625,7 @@ tlsserver	ReleaseFast	app	1	7	fb87f2d57a0db818	ded7de421ed83ff8
 # field (TicketFields.parse) and the ticket's transport compared with this connection's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned (recordings recaptured).
 # 2026-11-01 — ticket 77 -> 78: +1 tlsresume psk.zig `checkContext` (`context.len > 255` guard of HKDF-Expand-Label, 277f16a0 no-panic sweep) on the decrypted ticket's ticket_nonce length -- class (a), ticket metadata (the nonce length into HKDF-Expand-Label is already listed above).
-tlsserver	ReleaseFast	ticket	1	78	fb87f2d57a0db818	915935a402728fb8
+tlsserver	ReleaseFast	ticket	1	78	25e02f2db7d88b7f	915935a402728fb8
 # 2026-10-22 — ech 384: the recorded Go ECH sessions (go-ech, go-ech-hrr) up to the first
 # flight with the ECH private key tainted. Read by stack (--stacks): 1 context below hpke is
 # std's X25519 identity verdict (curve25519.zig `ladder`, `x2.isZero()` on the decap result — the
@@ -1642,7 +1642,7 @@ tlsserver	ReleaseFast	ticket	1	78	fb87f2d57a0db818	915935a402728fb8
 # 2026-11-15 — ech 384 -> 381 after `Protection.wipe` moved to a vector zeroize and the record_burn /
 # server_suite_order knobs landed (2810fced1); -3, matched by count, NOT read by --stacks (re-pinned from
 # full CI 43679781095's ctgrind lane, owner rule: ctgrind re-pins come from full CI). No increase on any row.
-tlsserver	ReleaseFast	ech	1	381	fb87f2d57a0db818	c257fcbb1b68d8df
+tlsserver	ReleaseFast	ech	1	456	25e02f2db7d88b7f	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
@@ -2153,36 +2153,36 @@ aaa-gate	ReleaseFast	basic	2	2	a761d6b21479b999	3e1202ab86ba6261
 # (~2^-1023) and its Bellcore fault-check verdict `m^e == c`; both are the rsa module's.
 tls13	ReleaseFast	ks256	1	0	d0fabfca5c31fdd3	18a96cec5170f807
 tls13	ReleaseFast	ks384	1	0	d0fabfca5c31fdd3	db1fe2ab079078cc
-tls13	ReleaseFast	x25519_shared	1	0	ed80464b8e0301c2	d94c3e5680258153
-tls13	ReleaseFast	x25519_server	1	0	ed80464b8e0301c2	a919bb6546cae368
-tls13	ReleaseFast	p256_shared	1	3	ed80464b8e0301c2	5a6d8909c5c9f606
-tls13	ReleaseFast	p256_server	1	6	ed80464b8e0301c2	67961397c7d98630
-tls13	ReleaseFast	p384_shared	1	0	ed80464b8e0301c2	45045869c00fe557
-tls13	ReleaseFast	p384_server	1	2	ed80464b8e0301c2	26b0ae6910184a6a
-tls13	ReleaseFast	p521_shared	1	0	ed80464b8e0301c2	9ec5a4f021d54e9f
-tls13	ReleaseFast	p521_server	1	2	ed80464b8e0301c2	6e20f5c6c27ede32
-tls13	ReleaseFast	x25519mlkem768_shared	1	0	ed80464b8e0301c2	6b26c450a8a3715f
-tls13	ReleaseFast	x25519mlkem768_server	1	0	ed80464b8e0301c2	3335c00d4dcdf9e5
-tls13	ReleaseFast	p256mlkem768_shared	1	3	ed80464b8e0301c2	0562298b6b4ed1d7
-tls13	ReleaseFast	p256mlkem768_server	1	6	ed80464b8e0301c2	6ad88ed04597333d
-tls13	ReleaseFast	p384mlkem1024_shared	1	0	ed80464b8e0301c2	bcd570a3852296cd
-tls13	ReleaseFast	p384mlkem1024_server	1	2	ed80464b8e0301c2	6d80f51094ad54d8
-tls13	ReleaseFast	mlkem1024_shared	1	0	ed80464b8e0301c2	6a1d3611f8476fd8
-tls13	ReleaseFast	mlkem1024_server	1	0	ed80464b8e0301c2	19e46831cc1a1cf5
-tls13	ReleaseFast	mlkem512_shared	1	0	ed80464b8e0301c2	a9ce49823000523b
-tls13	ReleaseFast	mlkem512_server	1	0	ed80464b8e0301c2	9472e04fd5f89f9f
-tls13	ReleaseFast	mlkem768_shared	1	0	ed80464b8e0301c2	7792a1c40c30279b
-tls13	ReleaseFast	mlkem768_server	1	0	ed80464b8e0301c2	8b8273e3bd568f8c
-tls13	ReleaseFast	ffdhe2048_shared	1	1	eac9d33a79a1e701	d26f953a2378a42e
-tls13	ReleaseFast	ffdhe2048_server	1	2	eac9d33a79a1e701	1e89b555c395bc7c
-tls13	ReleaseFast	ffdhe3072_shared	1	1	eac9d33a79a1e701	10318e7476d44855
-tls13	ReleaseFast	ffdhe3072_server	1	2	eac9d33a79a1e701	727fe78e6b3b4f10
+tls13	ReleaseFast	x25519_shared	1	0	4115b347f0c1b95d	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	4115b347f0c1b95d	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	4115b347f0c1b95d	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	4115b347f0c1b95d	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	4115b347f0c1b95d	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	4115b347f0c1b95d	26b0ae6910184a6a
+tls13	ReleaseFast	p521_shared	1	0	4115b347f0c1b95d	9ec5a4f021d54e9f
+tls13	ReleaseFast	p521_server	1	2	4115b347f0c1b95d	6e20f5c6c27ede32
+tls13	ReleaseFast	x25519mlkem768_shared	1	0	4115b347f0c1b95d	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	4115b347f0c1b95d	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	3	4115b347f0c1b95d	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	4115b347f0c1b95d	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	0	4115b347f0c1b95d	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	4115b347f0c1b95d	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	0	4115b347f0c1b95d	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	4115b347f0c1b95d	19e46831cc1a1cf5
+tls13	ReleaseFast	mlkem512_shared	1	0	4115b347f0c1b95d	a9ce49823000523b
+tls13	ReleaseFast	mlkem512_server	1	0	4115b347f0c1b95d	9472e04fd5f89f9f
+tls13	ReleaseFast	mlkem768_shared	1	0	4115b347f0c1b95d	7792a1c40c30279b
+tls13	ReleaseFast	mlkem768_server	1	0	4115b347f0c1b95d	8b8273e3bd568f8c
+tls13	ReleaseFast	ffdhe2048_shared	1	1	b437815d39a1247a	d26f953a2378a42e
+tls13	ReleaseFast	ffdhe2048_server	1	2	b437815d39a1247a	1e89b555c395bc7c
+tls13	ReleaseFast	ffdhe3072_shared	1	1	b437815d39a1247a	10318e7476d44855
+tls13	ReleaseFast	ffdhe3072_server	1	2	b437815d39a1247a	727fe78e6b3b4f10
 # 2026-11-01 — sign_p256 23 -> 10: p256 `fromStd` declassifies r/s (the published signature), so the toDer / memcpy / trimStart contexts on the signature length are gone. Left (--stacks): 5 Scalar.fromBytes (std pcurves common.zig `fromBytes`, deterministicScalar range loop), 2 finalizePrehashed r/s == 0 verdicts (ecdsa.zig), 1 comb group.zig, 2 p256 sign.zig (scalarInRange verdict on the key).
-tls13	ReleaseFast	sign_p256	1	10	f05bb5c29db55b1b	8a465d8b96fa4da8
-tls13	ReleaseFast	sign_p384	1	0	f05bb5c29db55b1b	13a390049cce9da1
-tls13	ReleaseFast	sign_p521	1	0	f05bb5c29db55b1b	08857000a3012635
-tls13	ReleaseFast	sign_ed25519	1	2	f05bb5c29db55b1b	8b5e38c1062658b2
-tls13	ReleaseFast	sign_rsa	1	2	f05bb5c29db55b1b	15b034e3d63aca72
+tls13	ReleaseFast	sign_p256	1	10	69553ad2bf53c3ad	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	69553ad2bf53c3ad	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	69553ad2bf53c3ad	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	2	69553ad2bf53c3ad	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	69553ad2bf53c3ad	15b034e3d63aca72
 
 # mlkem — added 2026-11-01. d‖z (keygen), m (encaps), dk + ciphertext (decaps)
 # tainted; every in-file count is an exact 0. rho is declassified inside
@@ -2442,17 +2442,17 @@ ct25519	ReleaseFast	x25519	1	1	9a52995b15c26959	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64
 hpke	ReleaseFast	xwing_decap	1	1	9792528fc668b453	a1bdb379c24261c4	cpu=x86_64
-tlsclient	ReleaseFast	kex	1	5	da40f4905caead06	dcbfcf24be022c59	cpu=x86_64 control=1 trap=1
-tlsclient	ReleaseFast	cv	1	33	b8ae5c848bbad1a4	a92e71f50313cf2b	cpu=x86_64
-tlsserver	ReleaseFast	hs	1	24	fb87f2d57a0db818	18b712e147be54c3	cpu=x86_64
-tlsserver	ReleaseFast	ech	1	368	fb87f2d57a0db818	c257fcbb1b68d8df	cpu=x86_64
+tlsclient	ReleaseFast	kex	1	5	541fa853f982532c	dcbfcf24be022c59	cpu=x86_64 control=1 trap=1
+tlsclient	ReleaseFast	cv	1	33	871a179c2a9113f8	a92e71f50313cf2b	cpu=x86_64
+tlsserver	ReleaseFast	hs	1	24	25e02f2db7d88b7f	18b712e147be54c3	cpu=x86_64
+tlsserver	ReleaseFast	ech	1	442	25e02f2db7d88b7f	c257fcbb1b68d8df	cpu=x86_64
 mls	ReleaseFast	priv	1	5	3eb090c51a286cc7	616cb338b933af50	cpu=x86_64
 wireguard	ReleaseFast	handshake	1	13	7bbcc4ca9cbbe5bf	40f18e84501394fa	cpu=x86_64
 wireguard	ReleaseFast	tunnel	1	14	7bbcc4ca9cbbe5bf	8f458611fc103bea	cpu=x86_64
-tls13	ReleaseFast	x25519_shared	1	1	ed80464b8e0301c2	d94c3e5680258153	cpu=x86_64
-tls13	ReleaseFast	x25519_server	1	1	ed80464b8e0301c2	a919bb6546cae368	cpu=x86_64
-tls13	ReleaseFast	x25519mlkem768_shared	1	1	ed80464b8e0301c2	6b26c450a8a3715f	cpu=x86_64
-tls13	ReleaseFast	x25519mlkem768_server	1	1	ed80464b8e0301c2	3335c00d4dcdf9e5	cpu=x86_64
+tls13	ReleaseFast	x25519_shared	1	1	4115b347f0c1b95d	d94c3e5680258153	cpu=x86_64
+tls13	ReleaseFast	x25519_server	1	1	4115b347f0c1b95d	a919bb6546cae368	cpu=x86_64
+tls13	ReleaseFast	x25519mlkem768_shared	1	1	4115b347f0c1b95d	6b26c450a8a3715f	cpu=x86_64
+tls13	ReleaseFast	x25519mlkem768_server	1	1	4115b347f0c1b95d	3335c00d4dcdf9e5	cpu=x86_64
 #
 # S -- code shape, same verdicts at one more or fewer site (portable vs native --stacks diff,
 # 2026-11-18): acme keycodec der.zig `expect`/parseEcInner +1..2, scalarInRange -4; webhooksig encodeMac
