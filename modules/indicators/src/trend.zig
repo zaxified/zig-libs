@@ -402,6 +402,12 @@ pub const CkspCore = struct {
     pub fn lookback(p: CkspParams) usize {
         return range.AtrCoreT.lookback(atrParams(p)) + p.stop_period - 1 + extra(p);
     }
+    fn atrCore(p: CkspParams) Error!range.AtrCoreT {
+        return range.AtrCoreT.init(atrParams(p));
+    }
+    fn firstStop(p: CkspParams) usize {
+        return range.AtrCoreT.lookback(atrParams(p)) + extra(p);
+    }
     pub fn init(p: CkspParams) Error!CkspCore {
         try validate(p);
         return .{
@@ -447,8 +453,148 @@ pub fn ckspLookback(p: CkspParams) Error!usize {
     try CkspCore.validate(p);
     return CkspCore.lookback(p);
 }
-/// `gpa` provides `2 * stop_period` f64 of scratch.
+/// A rolling extremum over `buf.len` values, one value per `push` (van Herk /
+/// Gil-Werman, as TA-Lib's own CKSP does): the window ending in slot `j` is
+/// the current block's prefix extremum joined with the previous block's suffix
+/// extremum from slot `j + 1`. A slot holds the raw value while its block is
+/// filling and becomes the suffix extremum, in place, when the block completes
+/// (slot `j + 1` is always still the previous block's when slot `j` is
+/// written). The answer of `push` is a full window from the `buf.len`-th push on.
+fn BlockExt(comptime is_max: bool) type {
+    return struct {
+        buf: []f64,
+        j: usize = 0,
+        pre: f64 = 0.0,
+        full: bool = false,
+
+        /// The better of two finite values, without a branch (a data-dependent
+        /// `if` here mispredicts about half the time on a random walk).
+        inline fn best(a: f64, b: f64) f64 {
+            return if (is_max) @max(a, b) else @min(a, b);
+        }
+        fn push(s: *@This(), v: f64) f64 {
+            const w = s.buf.len;
+            const j = s.j;
+            s.pre = if (j == 0) v else best(v, s.pre);
+            s.buf[j] = v;
+            const r = if (j + 1 == w or !s.full) s.pre else best(s.pre, s.buf[j + 1]);
+            if (j + 1 == w) {
+                var k = w - 1;
+                while (k > 0) {
+                    k -= 1;
+                    s.buf[k] = best(s.buf[k], s.buf[k + 1]);
+                }
+                s.j = 0;
+                s.full = true;
+            } else {
+                s.j = j + 1;
+            }
+            return r;
+        }
+    };
+}
+
+/// The batch CKSP as one pass of four block-wise extrema and the Wilder ATR
+/// (`CkspCore`'s arithmetic, bit for bit), for inputs where an extremum's only
+/// freedom is gone: every high and low finite and not zero (a tie between +0.0
+/// and -0.0 would pick a sign by the window's shape), every close finite, and
+/// every stop finite. Null when the inputs are not like that (the caller runs
+/// `CkspCore`); the outputs are then unspecified.
+fn ckspBlocks(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []const T, close: []const T, high_stop: []T, low_stop: []T, p: CkspParams) ?usize {
+    const n = high.len;
+    if (low.len != n or close.len != n or high_stop.len != n or low_stop.len != n) return null;
+    CkspCore.validate(p) catch return null;
+    var bad = false;
+    for (high, low, close) |h, l, c| {
+        const hv: f64 = h;
+        const lv: f64 = l;
+        bad = bad or !std.math.isFinite(hv) or !std.math.isFinite(lv) or !std.math.isFinite(@as(f64, c)) or hv == 0.0 or lv == 0.0;
+    }
+    if (bad) return null;
+    const lb = CkspCore.lookback(p);
+    const nan = std.math.nan(T);
+    @memset(high_stop[0..@min(lb, n)], nan);
+    @memset(low_stop[0..@min(lb, n)], nan);
+    if (lb >= n) return lb;
+
+    const pp = p.period;
+    const q = p.stop_period;
+    // No room for the four buffers: the generic core, which needs `2 * q`, answers.
+    const bufs = gpa.alloc(f64, 2 * (pp + q)) catch return null;
+    defer gpa.free(bufs);
+    var hh: BlockExt(true) = .{ .buf = bufs[0..pp] };
+    var ll: BlockExt(false) = .{ .buf = bufs[pp .. 2 * pp] };
+    var hs: BlockExt(true) = .{ .buf = bufs[2 * pp .. 2 * pp + q] };
+    var ls: BlockExt(false) = .{ .buf = bufs[2 * pp + q ..] };
+    var atr = CkspCore.atrCore(p) catch return null;
+    const first_stop = CkspCore.firstStop(p);
+    const Stage = struct {
+        hh: *BlockExt(true),
+        ll: *BlockExt(false),
+        hs: *BlockExt(true),
+        ls: *BlockExt(false),
+        high_stop: []T,
+        low_stop: []T,
+        mult: f64,
+        win_start: usize,
+        first_stop: usize,
+        lb: usize,
+        finite: bool = true,
+
+        /// Bar `i` with its ATR (null while the ATR has no output).
+        inline fn feed(st: *@This(), i: usize, h: f64, l: f64, a: ?f64) void {
+            if (i < st.win_start) return;
+            const hv = st.hh.push(h);
+            const lv = st.ll.push(l);
+            if (i < st.first_stop) return;
+            const band = st.mult * a.?;
+            const hsv = hv - band;
+            const lsv = lv + band;
+            st.finite = st.finite and std.math.isFinite(hsv) and std.math.isFinite(lsv);
+            const hm = st.hs.push(hsv);
+            const lm = st.ls.push(lsv);
+            if (i >= st.lb) {
+                st.high_stop[i] = core.to(T, hm);
+                st.low_stop[i] = core.to(T, lm);
+            }
+        }
+    };
+    var st: Stage = .{ .hh = &hh, .ll = &ll, .hs = &hs, .ls = &ls, .high_stop = high_stop, .low_stop = low_stop, .mult = p.multiplier, .win_start = first_stop + 1 - pp, .first_stop = first_stop, .lb = lb };
+    var i: usize = 0;
+    // The ATR through its core until it is a bare recurrence, then the same
+    // arithmetic inline (`AtrCore.steadyRun`'s), so no optional is carried per bar.
+    while (i < n and !atr.steady()) : (i += 1) {
+        const h: f64 = high[i];
+        const l: f64 = low[i];
+        st.feed(i, h, l, atr.step(.{ .high = h, .low = l, .close = close[i] }));
+    }
+    var prev = atr.prev;
+    var cy = atr.tr.prev_close;
+    const beta = atr.beta;
+    const alpha = atr.alpha;
+    while (i < n) : (i += 1) {
+        const h: f64 = high[i];
+        const l: f64 = low[i];
+        const cl: f64 = close[i];
+        var greatest = h - l;
+        const v2 = @abs(cy - h);
+        if (v2 > greatest) greatest = v2;
+        const v3 = @abs(cy - l);
+        if (v3 > greatest) greatest = v3;
+        cy = cl;
+        prev = @mulAdd(f64, beta, prev, alpha * greatest);
+        st.feed(i, h, l, prev);
+    }
+    const finite = st.finite;
+    if (!finite) return null;
+    return lb;
+}
+
+/// `gpa` provides scratch: `2 * (period + stop_period)` f64 for finite,
+/// non-zero input (one pass of block-wise extrema; the generic core answers if
+/// that cannot be had), `2 * stop_period` for any other input (the generic core).
 pub fn cksp(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []const T, close: []const T, high_stop: []T, low_stop: []T, p: CkspParams) core.AllocError!usize {
+    if (ckspBlocks(T, gpa, high, low, close, high_stop, low_stop, p)) |lb| return lb;
     return hist.batchAlloc(T, CkspCore, gpa, .{ high, low, close }, .{ high_stop, low_stop }, p);
 }
 pub fn CkspStream(comptime T: type) type {
@@ -564,4 +710,67 @@ test "zigzag: a bar index past 2^31 saturates the i32 pivot index instead of tra
     d.pivot = 10.0;
     const q = d.step({}, .{ .high = 10.0, .low = 10.0 }) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i32, 1000), q.pivot_idx);
+}
+
+test "cksp: the block-wise pass equals the generic core bit for bit (f64 and f32), and steps aside for zeros, NaN and overflow" {
+    const gpa = std.testing.allocator;
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    th.walkBars(&h, &l, &c, 7);
+    var got: [2][n]f64 = undefined;
+    var want: [2][n]f64 = undefined;
+    const params = [_]CkspParams{
+        .{},
+        .{ .period = 2, .stop_period = 1 },
+        .{ .period = 2, .multiplier = 0.0, .stop_period = 2 },
+        .{ .period = 3, .multiplier = 2.5, .stop_period = 40 },
+        .{ .period = 50, .multiplier = 1.5, .stop_period = 3 },
+        .{ .period = 17, .stop_period = 17 },
+        .{ .period = 10, .stop_period = 9, .unstable = .{ .bars = 25 } },
+        .{ .period = 10, .stop_period = 9, .unstable = .auto4 },
+        .{ .period = 300, .stop_period = 300 },
+        .{ .period = 800, .stop_period = 5 },
+    };
+    for (params) |p| {
+        const lb = try cksp(f64, gpa, &h, &l, &c, &got[0], &got[1], p);
+        const lb_ref = try hist.batchAlloc(f64, CkspCore, gpa, .{ &h, &l, &c }, .{ &want[0], &want[1] }, p);
+        try std.testing.expectEqual(lb_ref, lb);
+        try th.expectSameBits(&want[0], &got[0]);
+        try th.expectSameBits(&want[1], &got[1]);
+        // the fast pass really ran (it answers, the fallback is for other input)
+        try std.testing.expect(ckspBlocks(f64, gpa, &h, &l, &c, &got[0], &got[1], p) != null);
+    }
+    // f32 in and out: the f64 result rounded once, as the generic core does
+    var h32: [n]f32 = undefined;
+    var l32: [n]f32 = undefined;
+    var c32: [n]f32 = undefined;
+    for (&h32, &l32, &c32, h, l, c) |*a, *b, *d, x, y, z| {
+        a.* = @floatCast(x);
+        b.* = @floatCast(y);
+        d.* = @floatCast(z);
+    }
+    var g32: [2][n]f32 = undefined;
+    var w32: [2][n]f32 = undefined;
+    const p32: CkspParams = .{ .period = 12, .stop_period = 7 };
+    _ = try cksp(f32, gpa, &h32, &l32, &c32, &g32[0], &g32[1], p32);
+    _ = try hist.batchAlloc(f32, CkspCore, gpa, .{ &h32, &l32, &c32 }, .{ &w32[0], &w32[1] }, p32);
+    for (0..2) |k| for (g32[k], w32[k]) |a, b| try std.testing.expect(th.sameBits(a, b));
+    // an allocator with no room for the four buffers: the generic core answers
+    var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try std.testing.expect(ckspBlocks(f64, fa.allocator(), &h, &l, &c, &got[0], &got[1], .{}) == null);
+    // a zero, a NaN or an overflow: the generic core answers (null from the fast pass)
+    var hz = h;
+    hz[100] = 0.0;
+    try std.testing.expect(ckspBlocks(f64, gpa, &hz, &l, &c, &got[0], &got[1], .{}) == null);
+    var cn = c;
+    cn[100] = std.math.nan(f64);
+    try std.testing.expect(ckspBlocks(f64, gpa, &h, &l, &cn, &got[0], &got[1], .{}) == null);
+    var hb = h;
+    var lb2 = l;
+    hb[300] = 1e308;
+    lb2[300] = -1e308;
+    try std.testing.expect(ckspBlocks(f64, gpa, &hb, &lb2, &c, &got[0], &got[1], .{ .multiplier = 1e30 }) == null);
+    _ = try cksp(f64, gpa, &hb, &lb2, &c, &got[0], &got[1], .{ .multiplier = 1e30 });
 }

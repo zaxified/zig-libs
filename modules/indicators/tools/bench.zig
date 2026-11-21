@@ -248,6 +248,8 @@ const rows = [_]Row{
     W("cdlmorningstar", ind.candles.cdlmorningstar, .ohlc, .i1, false, .{ .penetration = 0.3 }),
     W("cdlhikkake", ind.candles.cdlhikkake, .ohlc, .i1, false, .{}),
     W("cdl3whitesoldiers", ind.candles.cdl3whitesoldiers, .ohlc, .i1, false, .{}),
+    W("pso", ind.pso, .hlc, .f1, false, .{ .fastk = 8, .ema = 5 }),
+    W("cksp", ind.cksp, .hlc, .f2, true, .{ .period = 10, .multiplier = 1.0, .stop_period = 9 }),
 };
 
 // ── streams: n updates ───────────────────────────────────────────────────────
