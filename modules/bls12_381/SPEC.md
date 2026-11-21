@@ -227,8 +227,9 @@ design" below.
   `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite of draft-irtf-cfrg-bbs-signatures
   Appendix A.1 (`hashToCurveG1PartsWith(.xof_shake256, ..)`; G2 has no XOF
   variant — no consumer). K.6-anchored; the G1 suite itself is anchored by
-  `bbs`'s draft-12 SHAKE-256 generators. The §5.3.3 long-DST rehash is
-  implemented for the XMD expander only (the XOF one asserts `dst.len <= 255`).
+  `bbs`'s draft-12 SHAKE-256 generators. A DST over 255 bytes is reduced per
+  §5.3.3 (`SHAKE256("H2C-OVERSIZE-DST-" || DST, 32)`, `k = 128`). The engine is
+  generic over the XOF and also pinned to K.4/K.5 (SHAKE128, K.5 with a 256-byte DST).
 - **`expand_message_xmd`** is `sha2.expandMessageXmd` over std's
   `Sha256` (the collection's one generic RFC 9380 §5.3.1 copy, shared with
   `bn254`, `voprf` and `frost`); `expandMessageXmd`/`expandMessageXmdParts`
@@ -866,9 +867,7 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
 - **Ceremony generation or security.** The module consumes a published trusted setup; it has no role in
   generating it and makes no claim about the ceremony's toxic waste.
 - **Other hash-to-curve suites.** The two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs and the `G1` SHAKE-256
-  suite (BBS) are implemented; no `G2` XOF variant (no consumer), and the §5.3.3 long-DST rehash is
-  not implemented for the XOF expander (`dst.len <= 255` is asserted there, `hash_to_curve.zig`; the
-  XMD expander has it).
+  suite (BBS) are implemented; no `G2` XOF variant (no consumer).
 - **Constant-time pairing, hash-to-curve, KZG.** They operate on public data; see the threat model.
 - **Variable-time public-scalar `scalarMul`, a secret-exponent `Fp2.pow` ladder, a cheaper
   `pairingCheck` not-equal-to-one test** as public API: no consumer asks for them, and blst (the
