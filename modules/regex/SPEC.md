@@ -177,6 +177,16 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   ASCII words, no match; A/B in one binary, best of 7, the VM's best above the DFA's worst on every row):
   `\b[a-z]{3}[0-9]\b` 2.6–3.0×, `\b{start}[a-z]+[0-9]` 7.5×, `(?Rm)^[a-z]+[0-9]$` 1.9–2.0×,
   `\b\w+[0-9]\b` 8.5–9.0× faster than the VM.
+- **The byte DFA** (`ByteDfa`; `isMatch`, `fullMatch` in bytes mode, programs ≤ 128 instructions): the same lazy DFA
+  one byte per step. A state is the bytes-mode set VM's threads before their closure — those at the position, and
+  those inside a UTF-8 sequence by how many bytes they still wait (1–3) — plus the class of the byte before (past
+  ASCII: no word, no line end, as `bytesBefore`/`bytesAt` give the ASCII assertions). A step closes the threads at the
+  position with the byte known, and each consuming instruction takes what `consumeBytes` gives (one byte for a byte
+  class, a whole valid sequence otherwise, then waits). Transitions over every byte are cached, but over a valid lead
+  byte (C2..F4), which needs the bytes after it; 32 states in ~10.4 KiB of stack. Under a Unicode word assertion the
+  DFA gives up at the first byte past ASCII and the set VM answers. Measured 2026-11-21 against the set VM
+  (ReleaseFast, `isMatch` with no match over 1 MiB; A/B in one binary, best of 7, 2 rounds, the VM's best above the
+  DFA's worst on every row): ASCII text 14–42×; text with 10 % `é` 5.6–11.9× faster.
 - **Backwards from the end** (`isMatch`): when every path to the match passes `\z`
   and not every one starts with `\A` (`Prefilter.end_anchored`), every match ends at the end of
   the text, so the lazy DFA runs from there towards the start (RE2's and Rust's reverse anchored
@@ -359,8 +369,10 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 All open.
 
-- **Bytes mode in the DFAs** — bytes mode (`Options.utf8 = false`, `Regex.vm_only`) runs the VMs only and has no
-  prefilter either.
+- **Bytes mode in `Matcher`'s engines** — `isMatch`/`fullMatch` in bytes mode run the byte DFA (above), but
+  `Matcher.find`/`captures` (`Regex.vm_only`) still run the backtracker and the Pike VM only, and bytes mode has no
+  prefilter. `FindDfa` would need the byte DFA's waiting threads in its ordered lists and a backward pass that reads a
+  sequence from its last byte; the prefilter, `first`/`lit` computed over the program's byte classes as raw bytes.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state

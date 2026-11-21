@@ -812,7 +812,104 @@ pub const Regex = struct {
     /// sequence of `w` bytes waits `w - 1` steps (`rem`) before its closure,
     /// as the states inside a UTF-8 automaton would.
     fn runSetBytes(re: *const Regex, input: []const u8, full: bool) bool {
+        if (re.insts.len <= Dfa.max_insts) if (re.runByteDfa(input, full)) |found| return found;
         return re.runSetBytesEnd(input, full) != null;
+    }
+
+    /// `runSetBytes` as a lazy DFA (`ByteDfa`), one step per byte: a state
+    /// is `bytesLoop`'s threads before their closure — at the position, and
+    /// the ones inside a UTF-8 sequence by how many bytes they wait — plus
+    /// what the byte before the position was, as far as an assertion can
+    /// tell. Null (the set VM answers) under a Unicode word assertion at the
+    /// first byte past ASCII, whose code point the contexts cannot class.
+    /// `noinline`: its stack scratch is never live with `bytesLoop`'s.
+    noinline fn runByteDfa(re: *const Regex, input: []const u8, full: bool) ?bool {
+        std.debug.assert(re.insts.len <= Dfa.max_insts);
+        var d: ByteDfa = undefined;
+        d.n = 0;
+        // A thread may start at every position, not only the first.
+        const restart = !full;
+        var first: ByteDfa.Key = @splat(.{ 0, 0 });
+        first[0][0] = 1;
+        var s = d.add(first, .ofIf(re.asserts, null));
+        var pos: usize = 0;
+        while (true) {
+            if (pos == input.len) return re.byteDfaAccepts(d.keys[s][0], d.ctxs[s], restart);
+            const c = input[pos];
+            if (re.ascii_dfa and c >= 0x80) return null;
+            const t = d.trans[s][c];
+            if (t >= 2) {
+                s = t - 2;
+                pos += 1;
+                continue;
+            }
+            if (t == 1) return true;
+            probe(.dfa_step);
+            // A valid lead byte: whether the sequence it starts is taken
+            // depends on the bytes after it — never cached.
+            var cache = c < 0xc2 or c > 0xf4;
+            const next = re.byteDfaStep(d.keys[s], d.ctxs[s], input, pos, restart, full) orelse {
+                if (cache) d.trans[s][c] = 1;
+                return true;
+            };
+            if (!restart and isEmptyKey(next)) return false; // no thread left
+            const ctx: Dfa.Ctx = .ofIf(re.asserts, if (c < 0x80) c else 0xfffd);
+            const ns = d.find(next, ctx) orelse blk: {
+                if (d.n == ByteDfa.max_states) {
+                    probe(.dfa_reset);
+                    // Full: start over; the current state is not needed again.
+                    d.n = 0;
+                    cache = false;
+                }
+                break :blk d.add(next, ctx);
+            };
+            if (cache) d.trans[s][c] = ns + 2;
+            pos += 1;
+            s = ns;
+        }
+    }
+
+    fn isEmptyKey(k: ByteDfa.Key) bool {
+        for (k) |set| if (set[0] != 0 or set[1] != 0) return false;
+        return true;
+    }
+
+    /// One `ByteDfa` step from `k` after `ctx` over the byte at `pos`: the
+    /// key for the position after it, or null when a match ends before the
+    /// byte (never in a full match). A thread that takes a sequence of `w`
+    /// bytes (`consumeBytes`) waits in `[w - 1]`; the waiting ones move up.
+    fn byteDfaStep(re: *const Regex, k: ByteDfa.Key, ctx: Dfa.Ctx, input: []const u8, pos: usize, restart: bool, full: bool) ?ByteDfa.Key {
+        var here = k[0];
+        if (restart) here[0] |= 1;
+        const c = input[pos];
+        // The ASCII assertions see any byte past ASCII as no word, no line
+        // end (`bytesAt`); the Unicode ones never get here past ASCII.
+        var matched: bool = undefined;
+        const cl = re.dfaClosure(here, ctx.rep(), if (c < 0x80) c else 0xfffd, &matched);
+        if (matched and !full) return null;
+        var nk: ByteDfa.Key = .{ k[1], k[2], k[3], .{ 0, 0 } };
+        for (cl, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const pc: u16 = @intCast(wi * 64 + @ctz(w));
+                if (re.insts[pc] == .match) continue;
+                const took = re.consumeBytes(pc, input, pos) orelse continue;
+                // A consuming instruction is never last (the program ends in `match`).
+                std.debug.assert(pc + 1 < re.insts.len);
+                nk[took - 1][(pc + 1) >> 6] |= @as(u64, 1) << @truncate(pc + 1);
+            }
+        }
+        return nk;
+    }
+
+    /// Does `ByteDfa` set `k` (the threads at the position) after `ctx` reach
+    /// the match at the end of the text?
+    fn byteDfaAccepts(re: *const Regex, k: Dfa.Set, ctx: Dfa.Ctx, restart: bool) bool {
+        var here = k;
+        if (restart) here[0] |= 1;
+        var matched: bool = undefined;
+        _ = re.dfaClosure(here, ctx.rep(), null, &matched);
+        return matched;
     }
 
     noinline fn runSetBytesEnd(re: *const Regex, input: []const u8, full: bool) ?usize {
@@ -1481,6 +1578,43 @@ const Dfa = struct {
         if (d.find(k, ctx)) |i| return i;
         if (d.n == max_states) d.n = 0;
         return d.add(k, ctx, restart);
+    }
+};
+
+/// `Regex.runByteDfa`'s scratch, on the stack (~10.4 KiB): `Dfa`'s table
+/// for bytes mode, the transitions over every byte (`trans[s][c]` as
+/// `Dfa.trans`; a valid lead byte, C2..F4, is never cached).
+const ByteDfa = struct {
+    const max_states = Dfa.max_states;
+    /// `[r]`: the instructions whose closure is taken `r` bytes on — at the
+    /// position for `r` = 0, the threads inside a UTF-8 sequence after.
+    const Key = [4]Dfa.Set;
+
+    keys: [max_states]Key,
+    ctxs: [max_states]Dfa.Ctx,
+    n: u8,
+    trans: [max_states][256]u8,
+
+    fn find(d: *const ByteDfa, k: Key, ctx: Dfa.Ctx) ?u8 {
+        for (d.keys[0..d.n], d.ctxs[0..d.n], 0..) |key, c, i| {
+            if (c == ctx and keyEql(key, k)) return @intCast(i);
+        }
+        return null;
+    }
+
+    fn keyEql(a: Key, b: Key) bool {
+        for (a, b) |x, y| if (x[0] != y[0] or x[1] != y[1]) return false;
+        return true;
+    }
+
+    /// Add a state (the table has room).
+    fn add(d: *ByteDfa, k: Key, ctx: Dfa.Ctx) u8 {
+        const i = d.n;
+        d.keys[i] = k;
+        d.ctxs[i] = ctx;
+        @memset(&d.trans[i], 0);
+        d.n += 1;
+        return i;
     }
 };
 
@@ -6309,8 +6443,13 @@ test "mutation B: the byte-mode set VM stops a full match when no thread is left
     @memset(text, 'y');
     text[0] = 'x';
     probe_counts = .initFill(0);
-    try testing.expect(!rb.fullMatch(text));
+    try testing.expect(rb.runSetBytesEnd(text, true) == null); // the set VM itself
     try testing.expect(probe_counts.get(.bytes_step) <= 3);
+    // And the byte DFA `fullMatch` runs.
+    probe_counts = .initFill(0);
+    try testing.expect(!rb.fullMatch(text));
+    try testing.expect(probe_counts.get(.dfa_step) <= 3);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.bytes_step));
 }
 
 /// `(A)(x*)Z` read from `from`: a first candidate of `spent` bytes that fails
@@ -6621,7 +6760,7 @@ const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
     .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0 },
     .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0 },
     .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0 },
-    .{ 16695608249434358507, 0, 0, 0, 0, 0, 0, 0, 0, 0, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6588, 6918, 0, 0, 3771, 0, 0, 0 },
+    .{ 16695608249434358507, 0, 51, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6588, 6918, 0, 0, 3717, 0, 0, 0 },
     .{ 7222689674609703483, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 150, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 160, 0, 0, 0 },
     .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0 },
     .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0 },
@@ -7290,6 +7429,63 @@ test "mutation M: bytes mode finds a four-byte code point on the Pike VM" {
         try testing.expectEqual(Span{ .start = 0, .end = 4 }, caps[1].?);
         try testing.expectEqual(Span{ .start = 4, .end = 8 }, caps[2].?);
     }
+}
+
+test "bytes mode: isMatch/fullMatch's byte DFA gives the set VM's answers" {
+    const gpa = testing.allocator;
+    const patterns = [_][]const u8{
+        "(?-u:\\xff)+|b",    "(?-u)[\\x80-\\xff]{2}",
+        "é+",
+        "(?-u:.)a",          "(?s-u:.)+$",
+        ".é",
+        "(?-u:\\b)ab",       "\\bab\\b",
+        "(?Rm)^ab$",         "(?m)^\\w+$",
+        "a(?-u:\\xc3)\\xa9", "[^a]b",
+        "(?-u:[^a])b",
+        "😀|(?-u:\\xf0)",
+        "\\Aé\\z",
+        "(?-u:\\B)x",        "",
+        "\\w+(?-u:\\x80)",
+    };
+    const texts = [_][]const u8{
+        "",                 "ab",           "b",
+        "é",
+        "éé ab",
+        "\xff\xffb",        "a\xc3",        "\xc3\xa9a",
+        "\xc3a",            "ab\r\nab\r\n", "x ab\nab",
+        "\xf0\x9f\x98\x80", "\xf0\x9f\x98", "\x80b",
+        "aé\x80",
+        "\xe2\x82\xac x",   "ab\xff ab",
+    };
+    for (patterns) |pat| {
+        var re = try Regex.compileOptions(gpa, pat, .{ .syntax = .rust, .utf8 = false });
+        defer re.deinit(gpa);
+        try testing.expect(re.bytes);
+        for (texts) |t| {
+            errdefer std.debug.print("/{s}/ on \"{s}\"\n", .{ pat, t });
+            try testing.expectEqual(re.runSetBytesEnd(t, false) != null, re.isMatch(t));
+            try testing.expectEqual(re.runSetBytesEnd(t, true) != null, re.fullMatch(t));
+            for (0..t.len + 1) |n| try testing.expectEqual(re.runSetBytesEnd(t[0..n], false) != null, re.isMatch(t[0..n]));
+        }
+    }
+    // ASCII and continuation bytes are cached; a valid lead byte is
+    // stepped each time; a Unicode word assertion gives up past ASCII.
+    var re = try Regex.compileOptions(gpa, "(?-u:\\xff)z", .{ .syntax = .rust, .utf8 = false });
+    defer re.deinit(gpa);
+    probe_counts = .initFill(0);
+    try testing.expect(!re.isMatch("abababababababababab\x80\x80\x80\x80"));
+    try testing.expect(probe_counts.get(.dfa_step) <= 4);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.bytes_step));
+    probe_counts = .initFill(0);
+    try testing.expect(!re.isMatch("éééééé"));
+    try testing.expect(probe_counts.get(.dfa_step) >= 6);
+    var ub = try Regex.compileOptions(gpa, "\\bab", .{ .syntax = .rust, .utf8 = false });
+    defer ub.deinit(gpa);
+    try testing.expect(ub.ascii_dfa);
+    probe_counts = .initFill(0);
+    try testing.expect(ub.isMatch("é ab"));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.dfa_step));
+    try testing.expect(probe_counts.get(.bytes_step) > 0);
 }
 
 test "Rust-grammar assertions run Matcher's find DFAs and the one-pass engine: same answers as the Pike VM" {
