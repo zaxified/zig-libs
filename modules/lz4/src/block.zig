@@ -698,15 +698,13 @@ fn optTarget(level: u8) usize {
         else => 4096,
     };
 }
-/// Chain links followed per position. liblz4 follows 96, 512 and 16384 at
-/// levels 10..12 with a finder that gets more out of each link; this chain
-/// search needs more links to match the size liblz4 reaches at the level
-/// (measured on 400 KB of generated text: 384 links stand for liblz4's 96, 1024
-/// for 512, and past 1024 the size stops falling).
+/// Chain links followed per position: liblz4's 96, 512 and 16384 at levels
+/// 10..12. This chain search gets less out of each link than liblz4's finder,
+/// so levels 10 and 11 can come out a little larger than `lz4 -10` / `-11`.
 fn optAttempts(level: u8) u32 {
     return switch (level) {
-        10 => 384,
-        11 => 1024,
+        10 => 96,
+        11 => 512,
         else => 16384,
     };
 }

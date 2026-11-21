@@ -898,7 +898,7 @@ test "hc levels with a dictionary: block and frame, linked and independent" {
     }
 }
 
-test "optimal parser (levels 10..12): smaller than the lazy matcher, deeper never worse, every shape and the awkward ones round-trip" {
+test "optimal parser (levels 10..12): levels 11 and 12 smaller than the lazy matcher, deeper never worse, every shape and the awkward ones round-trip" {
     const data = try dictText(gpa, 400_000, 11);
     defer gpa.free(data);
     const dst = try gpa.alloc(u8, lz4.compressBlockBound(data.len));
@@ -909,8 +909,9 @@ test "optimal parser (levels 10..12): smaller than the lazy matcher, deeper neve
     var prev = l9;
     for ([_]u8{ 10, 11, 12 }) |lv| {
         const n = try lz4.compressBlock(data, dst, .{ .hc_level = lv });
-        try testing.expect(n < l9);
-        try testing.expect(n <= prev); // more links and a longer target: never larger here
+        // Level 10 follows liblz4's 96 links and may be larger than level 9 on text.
+        if (lv > 10) try testing.expect(n < l9);
+        if (lv > 10) try testing.expect(n <= prev); // more links and a longer target: never larger here
         prev = n;
         try testing.expectEqual(data.len, try lz4.decompressBlock(dst[0..n], back));
         try testing.expectEqualSlices(u8, data, back);
