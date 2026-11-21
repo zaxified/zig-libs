@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Fetch crumsort 1.2.1.3 (scandum/crumsort, Unlicense) into the gitignored
-# tools/crumsort_src/ for `BENCH_CRUMSORT=modules/sort/tools/crumsort_src zig build bench-sort`
+# Fetch crumsort 1.2.1.3 (scandum/crumsort, Unlicense) into
+# .zig-cache/bench-sort/crumsort_src/ (outside the module tree) for `BENCH_CRUMSORT=.zig-cache/bench-sort/crumsort_src zig build bench-sort`
 # (the C side of the "alt" column, see README). The sources are checked against
 # the digests below; nothing from there is vendored.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 commit=d21d7c3aa13212c234967a9aaf037690825916be
-mkdir -p crumsort_src
-cd crumsort_src
+dest=../../../.zig-cache/bench-sort/crumsort_src
+mkdir -p "$dest"
+cd "$dest"
 for f in quadsort.h quadsort.c crumsort.c crumsort.h; do
     curl -fsSL -o "$f" "https://raw.githubusercontent.com/scandum/crumsort/$commit/src/$f"
 done
