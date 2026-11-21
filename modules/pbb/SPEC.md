@@ -201,9 +201,7 @@ separate layer (802.1AE MACsec on the backbone, or the WireGuard tunnel in the
 - **802.1ah management / OUI-scoped TLVs** and any control-plane signalling.
 - **Forwarding / FDB / MAC learning** — backbone next-hop selection and the
   B-MAC/C-MAC learning state live in `l2forward`; this codec only frames bytes.
-- **B-MAC/C-MAC semantics** — group-address/multicast B-DA conventions, I-SID→
-  B-MAC derivation, and backbone MAC assignment are provisioning/forwarding
-  concerns, not framing.
+- **B-MAC/C-MAC semantics beyond the default group address** — `isidGroupBMac` derives the Default Backbone Destination of an I-SID (OUI 00-1E-83, I/G bit set, then the 24-bit I-SID; IEEE 802.1Q-2018 §26.4, secondary sources agree on the `01-1E-83` prefix; the clause text itself was not readable, so the layout is not golden-checked against a primary vector); other group-address conventions, backbone MAC assignment and the C-VID to I-SID mapping are provisioning/forwarding concerns, not framing.
 
 ## Verification
 
@@ -245,9 +243,7 @@ Run `scripts/modtest pbb` (Debug), `-Doptimize=ReleaseFast`, and `zig fmt --chec
 
 ## Backlog / deferred
 
-- **I-SID to group B-MAC helper.** The 01-1E-83 + I-SID derivation used for SPB
-  multicast B-DAs *(inferred from vendor practice; secondary descriptions agree: OUI 00-1E-83 + the 3-octet I-SID with the I/G bit set, so I-SID 1 is 01-1E-83-00-00-01; the IEEE 802.1Q clause text was not readable, so no primary citation yet)*; this SPEC currently
-  calls it a provisioning concern. Ask before adding. Effort: small. Fits CONVENTIONS §2.
+None open.
 
 ## Anchoring
 

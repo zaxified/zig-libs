@@ -128,6 +128,24 @@ pub const max_frame_len: usize = std.math.maxInt(u16);
 /// Largest representable I-SID (24-bit). Enforced by the `u24` type on `Fields`.
 pub const max_isid: u24 = std.math.maxInt(u24);
 
+/// The I-SID-derived group B-MAC (the 802.1ah "Backbone Service Instance Group
+/// Address", the Default Backbone Destination of a service instance): the
+/// OUI 00-1E-83 with the I/G (group) bit set, i.e. `01-1E-83`, followed by the
+/// 24-bit I-SID big-endian. I-SID 1 gives `01:1e:83:00:00:01`. Use it as the
+/// B-DA of a BUM frame of that service; IEEE 802.1Q-2018 §26.4 (802.1ah) names
+/// the mapping; vendor descriptions agree on the `01-1E-83` prefix (the clause
+/// text itself was not readable, so this is not golden-checked against it).
+pub fn isidGroupBMac(isid: u24) Mac {
+    return .{ 0x01, 0x1E, 0x83, @truncate(isid >> 16), @truncate(isid >> 8), @truncate(isid) };
+}
+
+/// The I-SID of a group B-MAC built by `isidGroupBMac`, or null for any other
+/// address (a different prefix, or a unicast one).
+pub fn groupBMacIsid(mac: Mac) ?u24 {
+    if (mac[0] != 0x01 or mac[1] != 0x1E or mac[2] != 0x83) return null;
+    return (@as(u24, mac[3]) << 16) | (@as(u24, mac[4]) << 8) | mac[5];
+}
+
 // ── B-Tag (optional backbone S-Tag) ────────────────────────────────────────────
 
 /// The optional 802.1ad S-Tag carried on the backbone VLAN. Absent (`b_tag =
@@ -444,6 +462,16 @@ const testing = std.testing;
 // 802.1ah / 802.1Q-2014 clause 9.7 layout** — no packet capture was available, so
 // every octet is annotated with the field and offset it encodes and cross-checked
 // against the bit table in the module doc comment.
+
+test "isidGroupBMac: 01-1E-83 prefix, I-SID big-endian, round trip" {
+    try std.testing.expectEqual(Mac{ 0x01, 0x1E, 0x83, 0x00, 0x00, 0x01 }, isidGroupBMac(1));
+    try std.testing.expectEqual(Mac{ 0x01, 0x1E, 0x83, 0xFF, 0xFF, 0xFF }, isidGroupBMac(max_isid));
+    try std.testing.expectEqual(Mac{ 0x01, 0x1E, 0x83, 0x12, 0x34, 0x56 }, isidGroupBMac(0x123456));
+    try std.testing.expect(isidGroupBMac(0)[0] & 1 == 1); // the I/G bit is set
+    for ([_]u24{ 0, 1, 0x00FF00, 0x123456, max_isid }) |i| try std.testing.expectEqual(@as(?u24, i), groupBMacIsid(isidGroupBMac(i)));
+    try std.testing.expectEqual(@as(?u24, null), groupBMacIsid(.{ 0x00, 0x1E, 0x83, 0, 0, 1 })); // unicast OUI
+    try std.testing.expectEqual(@as(?u24, null), groupBMacIsid(.{ 0x01, 0x1E, 0x84, 0, 0, 1 }));
+}
 
 test "golden: full frame with B-Tag, byte-exact + decode recovers every field" {
     const fields: Fields = .{
