@@ -308,6 +308,11 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
   requires the chain's leaf to carry it, which a recorded Pebble chain never does.
 - **Mock CA that signs the CSR's key:** the mock issues a fixed chain whatever the CSR, so the Manager's full path is
   exercised only by Pebble; a signing mock would bring it into the lane.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
