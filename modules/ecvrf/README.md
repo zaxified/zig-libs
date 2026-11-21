@@ -96,10 +96,19 @@ try-and-increment) is `ecvrf.ell2.prove` / `ell2.proveKeyPair` /
 loop over `alpha` is data-dependent). The two are not interchangeable: a
 proof of one never verifies under the other.
 
+**ECVRF-P256-SHA256-TAI / -SSWU** (`suite_string` 0x01 / 0x02, SEC1
+compressed 33-byte keys, 81-byte proofs, 32-byte outputs):
+
+```zig
+const S = ecvrf.p256_sha256_sswu; // or p256_sha256_tai
+const kp = try S.KeyPair.init(&sk); // sk: [32]u8 big-endian in [1, q-1]
+const pi = kp.prove(alpha);
+const beta = try S.verify(&kp.pk, alpha, &pi);
+```
+
 ## Not provided
 
-The other ciphersuites of RFC 9381: **ECVRF-P256-SHA256-TAI / -SSWU**
-(NIST P-256) are open work (SPEC *Backlog / deferred*); the non-elliptic-curve **RSA-FDH-VRF** family
+The non-elliptic-curve **RSA-FDH-VRF** family
 (Appendix A) and batch verification are refused (SPEC *What is
 deliberately not done*).
 
@@ -107,11 +116,15 @@ deliberately not done*).
 
 ```
 ecvrf → ct25519 (constant-time mul / mulBase for secret scalars)
+      → sha2 (expand_message_xmd, ELL2)
+      → p256 (P-256 suites: curve, SEC1, RFC 6979 nonce)
+      → voprf (P-256 SSWU hash_to_field + map)
       → std.crypto.ecc.Edwards25519 (+ its scalar submodule)
-      → std.crypto.hash.sha2.Sha512
+      → std.crypto.hash.sha2.Sha512 / Sha256
 ```
 
-One sibling zig-libs module dependency (`ct25519`); otherwise pure `std`.
+Four sibling zig-libs module dependencies; otherwise pure `std`. A program that uses only the
+edwards25519 suites compiles none of `p256`/`voprf` (Zig analyses only what is referenced).
 
 ## Verify
 

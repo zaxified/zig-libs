@@ -44,9 +44,11 @@
 //! The sibling ciphersuite **ECVRF-EDWARDS25519-SHA512-ELL2**
 //! (`suite_string = 0x04`, RFC 9380 Elligator2 hash-to-curve, no
 //! data-dependent loop over `alpha`) is the `ell2` namespace, anchored on
-//! RFC 9381 Appendix B.4. Not here: **ECVRF-P256-SHA256-TAI/-SSWU** (P-256
-//! with SEC1 point encoding) and the **RSA-FDH-VRF** family (RFC 9381
-//! Appendix A, a different, non-elliptic-curve construction).
+//! RFC 9381 Appendix B.4. **ECVRF-P256-SHA256-TAI/-SSWU** (`suite_string`
+//! 0x01/0x02, SEC1 compressed points, RFC 6979 nonce) are `p256_sha256_tai` /
+//! `p256_sha256_sswu` (`p256vrf.zig`), anchored on Appendix B.1/B.2. Not here:
+//! the **RSA-FDH-VRF** family (RFC 9381 Appendix A, a different,
+//! non-elliptic-curve construction).
 //!
 //! Provenance: clean-room from RFC 9381 (a public IETF/IRTF spec — no
 //! third-party source ported). See `NOTICE`.
@@ -56,7 +58,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381 Verifiable Random Function) — prove/verify a deterministic, unbiasable output under a public key.",
+    .doc = "ECVRF (RFC 9381 Verifiable Random Function: edwards25519 TAI/ELL2, P-256 TAI/SSWU) — prove/verify a deterministic, unbiasable output under a public key.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -66,7 +68,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every function here is a plain caller-owned value
     .model_after = "RFC 9381 §5 (Elliptic Curve VRF) + §5.5's ECVRF-EDWARDS25519-SHA512-TAI ciphersuite fixing, referencing RFC 8032 §5.1.2/§5.1.5 for point/scalar encoding and secret-key derivation; std.crypto.ecc.Edwards25519 (+ its scalar submodule) and std.crypto.hash.sha2.Sha512 supply every primitive",
-    .deps = .{ "ct25519", "sha2" }, // ct25519: constant-time secret-scalar multiply (see ecvrf.zig's module doc comment); sha2: expand_message_xmd of the ELL2 suite
+    .deps = .{ "ct25519", "sha2", "p256", "voprf" }, // ct25519: constant-time secret-scalar multiply (see ecvrf.zig's module doc comment); sha2: expand_message_xmd of the ELL2 suite; p256: the P-256 suites' curve and RFC 6979 nonce; voprf: the P-256 SSWU map
 };
 
 pub const ecvrf = @import("ecvrf.zig");
@@ -100,6 +102,12 @@ pub const proofToHash = ecvrf.proofToHash;
 pub const verify = ecvrf.verify;
 /// ECVRF-EDWARDS25519-SHA512-ELL2 (`suite_string = 0x04`).
 pub const ell2 = ecvrf.ell2;
+/// The P-256 ciphersuites (`p256vrf.zig`).
+pub const p256vrf = @import("p256vrf.zig");
+/// ECVRF-P256-SHA256-TAI (`suite_string = 0x01`).
+pub const p256_sha256_tai = p256vrf.tai;
+/// ECVRF-P256-SHA256-SSWU (`suite_string = 0x02`).
+pub const p256_sha256_sswu = p256vrf.sswu;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -113,12 +121,16 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = p256vrf;
+    _ = @import("p256_kat_test.zig");
 }
 
-test "meta.deps is exactly {ct25519, sha2} (the constant-time secret-scalar ladder, ELL2's expand_message_xmd)" {
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps is exactly {ct25519, sha2, p256, voprf} (the constant-time secret-scalar ladder, ELL2's expand_message_xmd, the P-256 suites' curve and SSWU map)" {
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
     try std.testing.expectEqualStrings("ct25519", meta.deps[0]);
     try std.testing.expectEqualStrings("sha2", meta.deps[1]);
+    try std.testing.expectEqualStrings("p256", meta.deps[2]);
+    try std.testing.expectEqualStrings("voprf", meta.deps[3]);
 }
 
 test "suite_string is 0x03 (ECVRF-EDWARDS25519-SHA512-TAI), not the sibling ELL2 ciphersuite's 0x04" {

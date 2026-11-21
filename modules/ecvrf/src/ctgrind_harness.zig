@@ -105,12 +105,14 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
 /// `verify`.
 const alpha_text = "ctgrind harness alpha";
 
-const Target = enum { prove, verify };
+const Target = enum { prove, verify, p256_tai, p256_sswu };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "prove")) return .prove;
     if (std.mem.eql(u8, s, "verify")) return .verify;
+    if (std.mem.eql(u8, s, "p256_tai")) return .p256_tai;
+    if (std.mem.eql(u8, s, "p256_sswu")) return .p256_sswu;
     return error.UnknownTarget;
 }
 
@@ -167,6 +169,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const beta = try reloadVolatile(@TypeOf(res), &res);
 
             std.debug.print("beta={x}\n", .{beta});
+        },
+        // The P-256 suites: `x = SK` tainted through `KeyPair.init` (range
+        // check, `Y = x*B`) and `prove` (`Gamma = x*H`, the RFC 6979 nonce,
+        // `k*B`, `k*H`, `s = k + c*x`); `Y` declassified as above.
+        inline .p256_tai, .p256_sswu => |t| {
+            const S = if (t == .p256_tai) root.p256_sha256_tai else root.p256_sha256_sswu;
+            var sk: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash("ctgrind-ecvrf-harness-p256-key-v1", &sk, .{});
+            if (taint == .yes) memcheck.makeMemUndefined(&sk);
+            const secret = reloadVolatile([32]u8, &sk);
+            var kp = S.KeyPair.init(&secret) catch unreachable; // a hash is in range
+            if (taint == .yes) memcheck.makeMemDefined(&kp.pk);
+            kp.pk = reloadVolatile([33]u8, &kp.pk);
+            const pi = kp.prove(alpha_text);
+            std.debug.print("pk={x}\n", .{kp.pk});
+            std.debug.print("pi={x}\n", .{pi}); // propagation witness
         },
     }
 }

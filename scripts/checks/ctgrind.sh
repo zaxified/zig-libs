@@ -184,7 +184,7 @@ declare -A TARGETS=(
     # constant-time comparisons per file — measured on that mutation, it is
     # the ONLY one of suite/ctgrind counts/pin that goes red for a reason
     # about the comparison.
-    [ecvrf]="prove verify"
+    [ecvrf]="prove verify p256_tai p256_sswu"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa combblind signblind ecdsablind"
     [montint]="small portable asmcore field ffcontrol dyn"
@@ -539,6 +539,8 @@ declare -A PATTERN=(
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
     [ecvrf/verify]='ecvrf[.]zig'
+    [ecvrf/p256_tai]='p256vrf[.]zig'
+    [ecvrf/p256_sswu]='p256vrf[.]zig'
     [ed448/full]='ed448[.]zig|field[.]zig|x448[.]zig|scalar[.]zig'
     [ed448/ladder]='ed448[.]zig|field[.]zig|scalar[.]zig'
     # k256's own sources. `fast_core.zig` is in the field/mul/comb/sign
@@ -1094,6 +1096,8 @@ declare -A LABEL=(
     [decaf448/scalarmul]='decaf448+ed448'
     [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
     [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'
+    [ecvrf/p256_tai]='ecvrf P-256 TAI KeyPair.init + prove (sk; Y declassified)'
+    [ecvrf/p256_sswu]='ecvrf P-256 SSWU KeyPair.init + prove (sk; Y declassified)'
     [ed448/full]='ed448 src'
     [ed448/ladder]='ed448 src'
     [k256/field]='k256 field+asm'

@@ -525,7 +525,8 @@ pub fn rawToDer(sig_rs: [64]u8, buf: *[der_max_len]u8) []const u8 {
 
 // ── RFC 6979 §3.2 deterministic nonce (HMAC-SHA256 DRBG) ────────────────────
 
-/// The RFC 6979 nonce for `(privkey, hash32)`.
+/// The RFC 6979 §3.2 nonce for `(privkey, hash32)`, `hash32 = SHA-256(m)`
+/// (public: `ecvrf`'s P-256 suites take their nonce from it, RFC 9381 §5.4.2.1).
 ///
 /// Specialised to P-256/SHA-256, where the hash length equals the group-order
 /// byte length (32 == 32), so RFC 6979's `bits2int` is the identity and
@@ -533,7 +534,7 @@ pub fn rawToDer(sig_rs: [64]u8, buf: *[der_max_len]u8) []const u8 {
 /// with different sizes would need the bit-shifting the RFC describes; this is
 /// deliberately not written generically for a case the module cannot reach.
 /// Mirrors `k256.ecdsa_recover`'s DRBG, which the same reasoning covers.
-fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
+pub fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
     const h1 = reduceToScalar(hash32).toBytes(.big);
 
     var v: [32]u8 = @as([32]u8, @splat(0x01));

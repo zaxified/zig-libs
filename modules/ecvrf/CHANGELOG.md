@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Added: ECVRF-P256-SHA256-TAI and -SSWU (RFC 9381 `suite_string` 0x01/0x02), `ecvrf.p256_sha256_tai` / `p256_sha256_sswu`: `KeyPair.init` (`error.InvalidSecretKey` for `SK` outside `[1, q-1]`), `KeyPair.prove`, `verify`, `proofToHash`, `encodeToCurve`; byte-exact against RFC 9381 Appendix B.1/B.2 (`H`, `k`, `U`, `V`, `pi`, `beta`, SSWU `u`). New dependencies: `p256` (curve, RFC 6979 nonce) and `voprf` (the P-256 SSWU map). ctgrind rows `p256_tai`/`p256_sswu`. The edwards25519 API is unchanged.
 - **2026-11-21** — Added: ECVRF-EDWARDS25519-SHA512-ELL2 (RFC 9381 `suite_string = 0x04`), `ecvrf.ell2.prove` / `proveKeyPair` / `verify` / `proofToHash` / `encodeToCurve`, byte-exact against RFC 9381 Appendix B.4. New dependency: `sha2` (`expandMessageXmd`). The TAI API is unchanged.
 - **2026-11-17** — Cleanup, **NO CONSUMER-VISIBLE CHANGE:** `ExpandedSecretKey.prefix` (written, wiped, never read; the nonce re-derives it from the seed) removed with its three wipes; mutation counts on the card are now 88/110 (22 eq). ctgrind counts unchanged, source digests re-taken.
 - **2026-11-17** — Whole-module mutation of `src/ecvrf.zig` and `src/burn.zig` (114 mutants, 88 killed, 26 EQUIVALENT/UNOBSERVABLE; card now carries whole-module counts). 1 test added (a low-order Gamma answers `InvalidProof`). No source change, no behaviour change.
