@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Derived `red` / `sfq`-RED parameters: what `tc qdisc add ... red` computes
 //! from `limit`, `min`, `max`, `avpkt`, `burst`, `probability` and `bandwidth`
 //! before it sends the request. A caller can state the intent (the same words as
