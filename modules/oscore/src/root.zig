@@ -58,7 +58,7 @@
 //! ## Scope / non-goals
 //!
 //! This module is **CoAP-agnostic by design**: it never imports the
-//! sibling `coap` module (no build dep on it — `meta.deps` is only `aesccm`) and never
+//! sibling `coap` module (no build dep — `meta.deps = .{}`) and never
 //! parses/serializes a CoAP message itself. `protect`/`unprotect` operate
 //! on the RFC 8613 §5.3 "plaintext" (CoAP Code + Class E options + payload
 //! marker + payload) and the §5.4 "options" (Class I options) as OPAQUE
@@ -1424,9 +1424,8 @@ test {
     _ = @import("fuzz_test.zig");
 }
 
-test "meta.deps is exactly the AEAD module (coap-agnostic — see module doc comment)" {
-    try std.testing.expectEqual(1, meta.deps.len);
-    try std.testing.expectEqualStrings("aesccm", meta.deps[0]);
+test "meta.deps is empty (coap-agnostic — see module doc comment)" {
+    try std.testing.expectEqual(0, meta.deps.len);
 }
 
 test "algorithm/wire size constants match AES-CCM-16-64-128" {
