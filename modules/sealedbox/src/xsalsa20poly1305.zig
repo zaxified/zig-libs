@@ -18,7 +18,8 @@ const mem = std.mem;
 const math = std.math;
 const crypto = std.crypto;
 
-pub const poly1305 = @import("poly1305.zig");
+/// `chachapoly`'s lane-parallel Poly1305 (API-identical to std's; the plain std one where no vector unit exists).
+const poly1305 = @import("chachapoly").Poly1305;
 
 pub const key_length = 32;
 pub const nonce_length = 24;

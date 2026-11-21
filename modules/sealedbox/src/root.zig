@@ -43,7 +43,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "libsodium crypto_box_seal / Go nacl/box",
-    .deps = .{ "ct25519", "b64ct" }, // ct25519: X25519 comb keygen + MULX ladder, byte-exact with std's; b64ct: the secret key's base64 (constant time)
+    .deps = .{ "ct25519", "b64ct", "chachapoly" }, // ct25519: X25519 comb keygen + MULX ladder, byte-exact with std's; b64ct: the secret key's base64 (constant time)
 };
 
 pub const SealedBox = std.crypto.nacl.SealedBox;

@@ -48,7 +48,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `keyPairFromSecretKey` recover a keypair from a stored secret (via ct25519's `X25519.recoverPublicKeyInto`)
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.
 - **One primitive implemented here, on purpose:** XSalsa20-Poly1305
-  (`src/xsalsa20poly1305.zig`, `src/poly1305.zig`). std's computes one Salsa20 block and one
+  (`src/xsalsa20poly1305.zig`; its Poly1305 is `chachapoly`'s). std's computes one Salsa20 block and one
   Poly1305 block per step, which held 64 KiB at 2.3–2.4x libsodium's time (measured), too slow for a
   consumed module. Salsa20 runs
   `lanes` blocks at once (state word i of every block in one `@Vector`, 8 with AVX2), Poly1305 runs
@@ -142,7 +142,7 @@ against every Zig release).
   recipient, short or garbage ciphertext, a forged tag that agrees with the real one in its first 1/2/4/8
   bytes, a degenerate/small-order recipient key or ephemeral key (`kat_test.zig`), RFC 7748 X25519 vectors, key
   text codecs (exact strings, malformed input as typed errors, the secret parsers zeroing `out` on every error,
-  a key whose base64 uses both `+` and `/`). Primitives (`xsalsa20poly1305.zig`, `poly1305.zig`): differential
+  a key whose base64 uses both `+` and `/`). Primitives (`xsalsa20poly1305.zig`; the Poly1305 underneath is `chachapoly`'s and is tested there): differential
   against std over lengths and counters, at every lane width 1–16, in place against out of place, the
   Poly1305 reduction edge states against a wide-integer reference, the RFC 8439 vector. No-panic sweep
   (`sweep_test.zig`): `sealedLen` saturates, every ciphertext shorter than the overhead, a wrong-size `out` in
@@ -212,11 +212,6 @@ shuffle), so further bulk gain would come from fusing the Poly1305 pass into the
 
 ## Backlog / deferred
 
-- **Own lane-parallel Poly1305 duplicates `chachapoly`'s:** `src/poly1305.zig` (4-way, 26-bit limbs) and
-  `chachapoly/src/poly1305.zig` (L-lane) are two independent implementations of the same thing (about 9.5 KB of
-  a router-tool consumer's binary is this copy). Dedupe: use chachapoly's (or one shared module), keep the
-  differential tests against std; check grade/ctgrind of both. Salsa20 (about 4.6 KB) has no sibling and stays.
-  Separately, a `.small` profile could pick a scalar Poly1305 (CONVENTIONS §4.2): measure after the dedupe.
 - **Speed to parity (P2 needs at most 1x on every row):** fuse the Poly1305 pass into the encrypt/decrypt
   loop (one read of the ciphertext instead of two). Not measured against the fastest field implementation yet
   (the card's `fastest ?`).
