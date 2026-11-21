@@ -53,7 +53,7 @@ placement).
 - **Compact serialization for encryption; JSON serialization for decryption** (RFC 7516 §3.1, §7.2). `decryptJson` reads
   the Flattened and General forms: the three header objects (protected, shared unprotected, per-recipient) are merged
   with unique names, the AEAD's AAD is `BASE64URL(protected)` plus `.` `aad` when present, and recipients are tried in
-  order (a recipient the key cannot serve is skipped; the first that decrypts wins; else the last error). `encryptJson`
+  order (a recipient the key cannot serve is skipped; the first that decrypts wins; else the last error). With `recipients` present a top-level `header` / `encrypted_key` is ignored entirely (RFC 7516 §7.2.1 forbids a producer to write them, go-jose does, and panva/jose, nimbus-jose-jwt and jwcrypto read `recipients` only): it is not in the header union, not the AAD and never tried as a key. `encryptJson`
   re-frames one compact encryption as a Flattened or single-recipient General document; `encryptJsonRecipients` writes
   several recipients (one `encrypted_key` and per-recipient `header` each, one shared `iv` / `ciphertext` / `tag`) and the
   `aad` member: one CEK is drawn and wrapped per recipient by the same per-algorithm arms as `encryptCompact` (`wrapKey`),
@@ -254,7 +254,7 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 - **JSON, several recipients** (`root.zig` tests): a five-recipient General document (A128KW, A256KW, RSA-OAEP, ECDH-ES+A128KW with
   `apu` / `apv`, A128GCMKW) with `aad` under A128GCM, A256GCM and A128CBC-HS256 decrypts for every recipient's key, a
   changed `aad` is `AuthenticationFailed`, the Flattened form with an empty `aad`, `dir` alone, and the refusals (`dir` next
-  to another recipient, none, Flattened with two, unknown `enc`). Not compared with go-jose / panva/jose output (not on this machine).
+  to another recipient, none, Flattened with two, unknown `enc`). `tools/interop.zig` (`zig build interop-jwe`, `tools/gojose/` driver, go-jose v4.1.4 from the Go module cache) is the foreign anchor, both directions: general documents with seven recipients (A128KW, A256KW, A128GCMKW, RSA-OAEP, RSA-OAEP-256, ECDH-ES+A128KW, PBES2-HS256+A128KW) and flattened documents per `alg` (and direct ECDH-ES), under four `enc`, with and without `aad`; every recipient is opened alone with its own key by the other side. Not compared with panva/jose.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
 

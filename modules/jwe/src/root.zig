@@ -930,8 +930,9 @@ fn mergeHeader(arena: std.mem.Allocator, into: *std.json.ObjectMap, from: ?std.j
 /// order with `key`: one whose header (protected + shared unprotected + its own, names unique) names an `alg` the
 /// key cannot serve (`KeyMaterialMismatch`, `AlgMismatch`, ...) is skipped, and the first that decrypts wins; if none
 /// does, the last error is returned. The AEAD's AAD is `BASE64URL(protected)` and, when the document carries an
-/// `aad` member, `"." || aad` (§5.1). A document with both `recipients` and top-level `header` / `encrypted_key`
-/// is malformed. Returns `gpa`-owned plaintext.
+/// `aad` member, `"." || aad` (§5.1). With `recipients` present, a top-level `header` / `encrypted_key` (which §7.2.1
+/// forbids, and go-jose writes) is ignored entirely: not in the header union, not the AAD, not tried as a key.
+/// Returns `gpa`-owned plaintext.
 // secret-api-ok: KeyMaterial holds only BORROWED slices / pointers; a by-value copy copies a pointer, never key bytes
 pub fn decryptJson(
     gpa: std.mem.Allocator,
@@ -991,7 +992,8 @@ fn decryptJsonBody(
     var recipients: [max_json_recipients]Recipient = undefined;
     var n_rec: usize = 0;
     if (top.get("recipients")) |rv| {
-        if (top.get("header") != null or top.get("encrypted_key") != null) return error.MalformedToken;
+        // A top-level `header` / `encrypted_key` next to `recipients` is ignored (go-jose writes one; RFC 7516 §7.2.1
+        // forbids producers to; panva/jose, nimbus and jwcrypto read `recipients` only).
         const arr = switch (rv) {
             .array => |a| a,
             else => return error.MalformedToken,
@@ -1499,6 +1501,24 @@ test "JSON serialization: a two-recipient general JWE decrypts for either recipi
     const dup = try std.mem.replaceOwned(u8, gpa, doc, "\"kid\":\"one\"", "\"enc\":\"A128GCM\"");
     defer gpa.free(dup);
     try std.testing.expectError(error.MalformedToken, decryptJson(gpa, .{ .symmetric = &k1 }, dup, .{}));
+    // A stray top-level `header` / `encrypted_key` beside `recipients` (go-jose writes one, RFC 7516 §7.2.1 forbids it)
+    // has no effect: not in the header union (its `alg` / `enc` are not used), not tried as a key, not in the AAD.
+    const stray = try std.mem.replaceOwned(u8, gpa, doc, "{\"protected\"", "{\"header\":{\"alg\":\"A256KW\",\"enc\":\"A256GCM\"},\"encrypted_key\":\"AAAA\",\"protected\"");
+    defer gpa.free(stray);
+    try std.testing.expect(stray.len > doc.len);
+    for ([_]*const [16]u8{ &k1, &k2 }) |k| {
+        const pt = try decryptJson(gpa, .{ .symmetric = k }, stray, .{});
+        defer gpa.free(pt);
+        try std.testing.expectEqualStrings("two recipients", pt);
+    }
+    try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &other }, stray, .{}));
+    // Our own writers never emit them: no top-level `header` / `encrypted_key` in a general document.
+    const ours = try encryptJson(gpa, .general, .A128KW, .A128GCM, .{ .symmetric = &k1 }, "x", seededForTest(), .{});
+    defer gpa.free(ours);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, ours, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("recipients") != null);
+    try std.testing.expect(parsed.value.object.get("header") == null and parsed.value.object.get("encrypted_key") == null);
 }
 
 test "ECDH-ES+A256KW over X25519 real round-trip" {
