@@ -928,7 +928,7 @@ pub const Fabric = struct {
         // Initial DIS election on every LAN circuit (and the pseudonode LSP of
         // the ones this node wins), before the node's own LSP names the DIS.
         for (self.nodes[node].lan_circuits) |*c| {
-            _ = self.runElection(c, now);
+            _ = self.runElection(node, c, now);
             if (c.is_dis) {
                 c.pn_live = true;
                 try self.originatePseudonode(node, c, now);
@@ -1065,7 +1065,7 @@ pub const Fabric = struct {
             },
             // The SNP positive control: drop the summary rather than reconcile
             // it, leaving flooding as the only mechanism in the fabric.
-            .csnp => |c| {
+            .csnp => {
                 if (self.ignore_snp) return;
                 // On a LAN only the DIS's summary counts (§7.3.15.2); anyone
                 // else's is not part of the protocol here.
@@ -1080,7 +1080,6 @@ pub const Fabric = struct {
                     },
                     else => return,
                 };
-                if (lan) |lc| try self.requestFromCsnp(sim, node, lc, c, now);
             },
             .psnp => {
                 if (self.ignore_snp) return;
@@ -1245,7 +1244,7 @@ pub const Fabric = struct {
 
     /// Recompute the DIS of one LAN circuit over this node's view of the segment
     /// (`isis-dis`). Returns whether the elected DIS changed.
-    fn runElection(self: *Fabric, c: *LanCircuit, now: Time) bool {
+    fn runElection(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) bool {
         const ls = &self.lans[c.lan];
         var cands: [max_lan_members]isis_dis.Candidate = undefined;
         var n: usize = 0;
@@ -1257,6 +1256,7 @@ pub const Fabric = struct {
         c.election.local.priority = c.prio[c.slot];
         const eff = c.election.recompute(cands[0..n], now);
         c.is_dis = eff.result.is_local_dis;
+        self.nodes[node].sched.setDis(c.iface, c.is_dis);
         for (ls.members[0..ls.count], 0..) |m, i| {
             if (std.mem.eql(u8, &systemIdForNode(m.node), &eff.result.dis_system_id)) c.dis_slot = @intCast(i);
         }
@@ -1279,7 +1279,7 @@ pub const Fabric = struct {
                     c.alive[ev.slot] = false;
                 },
             }
-            const changed = self.runElection(c, now);
+            const changed = self.runElection(node, c, now);
             if (c.pn_live and !c.is_dis) {
                 c.pn_live = false;
                 try self.purgePseudonode(node, c, now);
@@ -1499,21 +1499,13 @@ pub const Fabric = struct {
 
     /// Transmit one flooding effect on a LAN circuit: a frame on a broadcast
     /// segment reaches every member, so it is sent to each one this node believes
-    /// alive (each copy is impaired by its own member-pair link).
-    ///
-    /// `isis-flood` has no broadcast mode (this module's SPEC §12, the gap): it treats the LAN
-    /// circuit as point-to-point, so the two broadcast rules are applied here —
-    /// (1) an LSP sent on a LAN is not retransmitted until acknowledged: SRM is
-    /// cleared on transmission (ISO 10589 §7.3.15.1), the DIS's CSNP repairs
-    /// whatever was lost; (2) only the DIS transmits CSNPs, and the DIS transmits
-    /// no PSNP.
+    /// alive (each copy is impaired by its own member-pair link). The broadcast
+    /// rules (SRM cleared on transmission, CSNP only from the DIS, PSNP only from
+    /// a non-DIS, the PSNP request from a CSNP) are `isis-flood`'s and
+    /// `isis-lsdb`'s; `Options.lan_csnp = false` is the negative control that
+    /// swallows the DIS's CSNPs here.
     fn sendOnLan(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, e: isis_flood.Effect) anyerror!void {
-        const ns = &self.nodes[node];
-        switch (e.kind) {
-            .lsp => {},
-            .csnp => if (!c.is_dis or !self.opts.lan_csnp) return,
-            .psnp => if (c.is_dis) return,
-        }
+        if (e.kind == .csnp and !self.opts.lan_csnp) return;
         const ls = &self.lans[c.lan];
         for (ls.members[0..ls.count], 0..) |m, i| {
             if (i == c.slot or !c.alive[i]) continue;
@@ -1522,65 +1514,6 @@ pub const Fabric = struct {
                 .psnp, .csnp => self.stats.snp_tx += 1,
             }
             try sim.send(node, m.node, e.bytes);
-        }
-        if (e.kind == .lsp) {
-            const lsp = isis.Lsp.decode(e.bytes) catch return;
-            ns.lsdb.clearSrm(lsp.lsp_id, e.iface);
-        }
-    }
-
-    /// The request half of ISO 10589 §7.3.15.2 for a CSNP received on a LAN: an LSP
-    /// the DIS lists at a newer sequence number than ours (or that we lack) is
-    /// asked for with a PSNP.
-    ///
-    /// Harness-side workaround for a gap in `isis-lsdb`: its CSNP reconcile marks
-    /// the missing/newer entries for a request through `setSsnIfP2p`, i.e. only on
-    /// point-to-point circuits, so on a broadcast circuit no PSNP request is ever
-    /// produced and a member that lost an LSP never asks for it (the completeness
-    /// half — the DIS lacks something the member has — does work, it sets SRM).
-    /// The PSNP is built here from the CSNP's entries with `isis-flood`'s PSNP
-    /// builder; the DIS answers it through the ordinary `reconcilePsnp`.
-    fn requestFromCsnp(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, csnp: isis.Csnp, now: Time) anyerror!void {
-        const ns = &self.nodes[node];
-        var want: [isis_flood.snp.max_entries_per_pdu]isis.tlvs.LspEntry = undefined;
-        var n: usize = 0;
-        var tlv_it = isis.tlv.TlvIterator.init(csnp.tlv_bytes);
-        while (tlv_it.next() catch return) |t| {
-            if (t.code != isis.tlvs.code.lsp_entries) continue;
-            var ei = isis.tlvs.LspEntryIterator.init(t.value);
-            while (ei.next() catch return) |entry| {
-                const have = ns.lsdb.get(entry.lsp_id, now);
-                var ours: isis.tlvs.LspEntry = .{ .remaining_lifetime = 0, .lsp_id = entry.lsp_id, .sequence_number = 0, .checksum = 0 };
-                if (have) |v| {
-                    if (!v.is_request) {
-                        if (v.sequence_number >= entry.sequence_number) continue;
-                        ours = .{ .remaining_lifetime = v.remaining_lifetime, .lsp_id = entry.lsp_id, .sequence_number = v.sequence_number, .checksum = v.checksum };
-                    }
-                }
-                want[n] = ours;
-                n += 1;
-                if (n == want.len) {
-                    try self.sendPsnpOnLan(sim, node, c, want[0..n]);
-                    n = 0;
-                }
-            }
-        }
-        if (n > 0) try self.sendPsnpOnLan(sim, node, c, want[0..n]);
-    }
-
-    fn sendPsnpOnLan(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, entries: []const isis.tlvs.LspEntry) anyerror!void {
-        var scratch: [512]u8 = undefined;
-        var src: [7]u8 = undefined;
-        src[0..6].* = self.nodes[node].system_id;
-        src[6] = 0;
-        const ns = &self.nodes[node];
-        const key: ?isis.auth.Key = if (ns.auth_keys.len != 0 and (self.opts.auth.?.auth_snp)) ns.auth_keys[0] else null;
-        const bytes = try isis_flood.snp.buildPsnpSigned(&scratch, src, false, entries, key);
-        const ls = &self.lans[c.lan];
-        for (ls.members[0..ls.count], 0..) |m, i| {
-            if (i == c.slot or !c.alive[i]) continue;
-            self.stats.snp_tx += 1;
-            try sim.send(node, m.node, bytes);
         }
     }
 
@@ -3280,7 +3213,7 @@ test "challenges (§7.3.16.1): a newer copy of our LSP or pseudonode LSP is out-
     try testing.expectEqual(@as(?u32, 21), fab.pseudonodeSequence(3, 0, 3));
 }
 
-test "LAN sends: only the DIS sends CSNPs, the DIS sends no PSNP; a member asks only for what it lacks, in PDUs of at most 15" {
+test "LAN sends: the scheduler is told who the DIS is; a member asks only for what it lacks" {
     var fab = try Fabric.init(testing.allocator, lan_topo, 3);
     defer fab.deinit();
     var d: Direct = .{};
@@ -3289,33 +3222,34 @@ test "LAN sends: only the DIS sends CSNPs, the DIS sends no PSNP; a member asks 
     const member = &fab.nodes[1].lan_circuits[0];
     const dis = &fab.nodes[3].lan_circuits[0];
     try testing.expect(!member.is_dis and dis.is_dis);
-    const bytes = [_]u8{0};
+    try testing.expect(fab.nodes[3].sched.dis.isSet(dis.iface) and !fab.nodes[1].sched.dis.isSet(member.iface));
 
-    const before = fab.stats.snp_tx;
-    try fab.sendOnLan(&d.sim, 1, member, .{ .iface = member.iface, .kind = .csnp, .bytes = &bytes });
-    try fab.sendOnLan(&d.sim, 3, dis, .{ .iface = dis.iface, .kind = .psnp, .bytes = &bytes });
-    try testing.expectEqual(before, fab.stats.snp_tx);
-    try fab.sendOnLan(&d.sim, 3, dis, .{ .iface = dis.iface, .kind = .csnp, .bytes = &bytes });
-    try testing.expectEqual(before + 3, fab.stats.snp_tx); // to the three other members
-
-    // A CSNP listing exactly what member 1 holds requests nothing...
+    // A CSNP from the DIS listing exactly what member 1 holds requests nothing...
     var scratch: [2048]u8 = undefined;
     const held = fab.nodes[1].lsdb.get(lspIdOf(systemIdForNode(1), 0), 0).?;
     const same = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = held.remaining_lifetime, .lsp_id = held.lsp_id, .sequence_number = held.sequence_number, .checksum = held.checksum }};
     const from3 = neighbourId7(systemIdForNode(3));
-    try fab.requestFromCsnp(&d.sim, 1, member, try isis.Csnp.decode(try isis_flood.snp.buildCsnp(&scratch, from3, false, @splat(0), @splat(0xFF), &same)), 0);
-    try testing.expectEqual(before + 3, fab.stats.snp_tx);
+    const before = fab.stats.snp_tx;
+    try Fabric.onMessage(&fab, &d.sim, 1, 3, try isis_flood.snp.buildCsnp(&scratch, from3, false, @splat(0), @splat(0xFF), &same));
+    fab.horizon = 1_000;
+    try fab.pollAndSend(&d.sim, 1, 0);
+    try testing.expectEqual(before, fab.stats.snp_tx); // a member sends no CSNP, and asks for nothing
 
-    // ...and 16 unknown LSPs are requested in two PSNPs (15 + 1), each to the
-    // three other members.
-    var many: [16]isis.tlvs.LspEntry = undefined;
+    // ...and 8 unknown LSPs are requested in one PSNP, sent to the three other
+    // members (the 15-per-PDU split is `isis-flood`'s own test; the database holds
+    // a bounded number of request placeholders).
+    var many: [8]isis.tlvs.LspEntry = undefined;
     for (&many, 0..) |*e, i| e.* = .{ .remaining_lifetime = 1_000, .lsp_id = lspIdOf(systemIdForNode(@intCast(100 + i)), 0), .sequence_number = 1, .checksum = 0x0101 };
     var cbuf: [1024]u8 = undefined;
     var cb = try isis.pdu.CsnpBuilder.init(&cbuf, .{ .source_id = from3, .start_lsp_id = @splat(0), .end_lsp_id = @splat(0xFF) });
-    try isis.tlvs.addLspEntries(&cb.tlvs, many[0..15]); // one #9 TLV holds 15
-    try isis.tlvs.addLspEntries(&cb.tlvs, many[15..]);
-    try fab.requestFromCsnp(&d.sim, 1, member, try isis.Csnp.decode(cb.finish()), 0);
-    try testing.expectEqual(before + 3 + 6, fab.stats.snp_tx);
+    try isis.tlvs.addLspEntries(&cb.tlvs, &many);
+    try Fabric.onMessage(&fab, &d.sim, 1, 3, cb.finish());
+    try fab.pollAndSend(&d.sim, 1, 1);
+    try testing.expectEqual(before + 3, fab.stats.snp_tx);
+    // The DIS itself sends no PSNP, whatever it lacks.
+    const dis_before = fab.stats.snp_tx;
+    try fab.pollAndSend(&d.sim, 3, 3);
+    try testing.expectEqual(dis_before + 3, fab.stats.snp_tx); // its CSNP to 3 members, no PSNP
 }
 
 test "TEETH: a pseudonode sequence that goes backwards is caught; isDead honours the horizon; every extra fragment is originated" {
@@ -3660,11 +3594,18 @@ test "auth: a LAN member's PSNP request is signed, and unsigned when auth_snp is
         var d: Direct = .{};
         try d.start(&fab);
         defer d.deinit();
+        // Member 0 sees a CSNP entry it lacks at a newer sequence: SSN, then a PSNP.
+        var scratch: [512]u8 = undefined;
+        const from3 = neighbourId7(systemIdForNode(3));
+        const csnp = try isis.Csnp.decode(try isis_flood.snp.buildCsnp(&scratch, from3, false, @splat(0), @splat(0xFF), &entries));
+        fab.nodes[0].lsdb.reconcileCsnp(csnp, fab.nodes[0].lan_circuits[0].iface, 0);
         const before = queuedAuth(&d.sim);
-        try fab.sendPsnpOnLan(&d.sim, 0, &fab.nodes[0].lan_circuits[0], &entries);
+        fab.horizon = 1_000;
+        try fab.pollAndSend(&d.sim, 0, 0);
         const after = queuedAuth(&d.sim);
-        try testing.expectEqual(@as(usize, 3), (after.signed + after.unsigned) - (before.signed + before.unsigned)); // the other 3 members
-        try testing.expectEqual(if (snp_on) @as(usize, 3) else 0, after.signed - before.signed);
+        // The PSNP to the other 3 members and the initial CSNP on the P2P tail
+        // circuit; LSPs are always signed, SNPs only with auth_snp.
+        try testing.expectEqual(if (snp_on) @as(usize, 0) else 4, after.unsigned - before.unsigned);
     }
 }
 

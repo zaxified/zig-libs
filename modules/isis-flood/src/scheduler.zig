@@ -406,7 +406,8 @@ pub const Scheduler = struct {
 
             // ── 2. PSNP acks / requests (SSN) — chunked, after partialSNPInterval ─
             var ssn_probe = db.ssnIterator(iface);
-            if (ssn_probe.next() == null) {
+            // ISO 10589 §7.3.15.2: the DIS of a broadcast circuit sends no PSNP.
+            if ((broadcast and self.dis.isSet(iface)) or ssn_probe.next() == null) {
                 self.psnp_due[iface] = null;
             } else {
                 const due = self.psnp_due[iface] orelse now +| self.cfg.partial_snp_interval;
@@ -1184,6 +1185,43 @@ test "snp_pdu_len packs several #9 TLVs per CSNP and the ranges still tile" {
     try testing.expectEqual(snp.max_lsp_id, prev_end.?);
     try testing.expectEqual(@as(usize, 200), total);
     try testing.expect(tlv_count > 3);
+}
+
+test "broadcast circuit: an LSP is sent once and SRM cleared; CSNP only from the DIS; PSNP only from a non-DIS" {
+    var bcast = InterfaceSet.empty;
+    bcast.set(0);
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .broadcast_interfaces = bcast });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .broadcast_interfaces = bcast });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    // Received on iface 1: SRM on the broadcast iface 0, and SSN toward 1.
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 1, 0);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    // A request SSN on the broadcast circuit: what a CSNP entry we lack leaves.
+    var cbuf: [256]u8 = undefined;
+    const lacking = [_]LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = idOf(sys_other, 1), .sequence_number = 1, .checksum = 0x2222 }};
+    const csnp = try isis.Csnp.decode(try snp.buildCsnp(&cbuf, .{ 0xDE, 0xAD, 0, 0, 0, 0, 0 }, false, @splat(0), @splat(0xFF), &lacking));
+    db.reconcileCsnp(csnp, 0, 0);
+    const up = oneUp(0);
+
+    // Not the DIS: the LSP goes out once and SRM is cleared (no retransmit);
+    // the PSNP request goes out; no CSNP.
+    var r = sched.poll(0, up, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r.effects, .lsp));
+    try testing.expectEqual(@as(usize, 1), countKind(r.effects, .psnp));
+    try testing.expectEqual(@as(usize, 0), countKind(r.effects, .csnp));
+    try testing.expect(!db.srmIsSet(idOf(sys_other, 0), 0));
+    r = sched.poll(100, up, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 0), countKind(r.effects, .lsp));
+    try testing.expectEqual(@as(usize, 0), countKind(r.effects, .csnp));
+
+    // The DIS: CSNPs on the cadence, never a PSNP.
+    sched.setDis(0, true);
+    r = sched.poll(200, up, &db, &out, &scratch);
+    try testing.expect(countKind(r.effects, .csnp) >= 1);
+    try testing.expectEqual(@as(usize, 0), countKind(r.effects, .psnp));
 }
 
 test "up-interface gating: SRM on a down iface is not sent; sent once it is Up" {

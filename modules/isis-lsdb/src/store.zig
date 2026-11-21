@@ -1326,12 +1326,14 @@ pub const Lsdb = struct {
             e.snp_seen = true;
             if (e.is_request) {
                 // We already want it — keep requesting.
-                self.setSsnIfP2p(entry.lsp_id, iface);
+                self.queueSsn(entry.lsp_id, iface);
                 return;
             }
             switch (compare(their, e.versionAt(now))) {
-                // Their copy is newer → request it (SSN → PSNP).
-                .newer => self.setSsnIfP2p(entry.lsp_id, iface),
+                // Their copy is newer → request it (SSN → PSNP). On a broadcast
+                // circuit too: the PSNP is how a member asks the DIS for what its
+                // CSNP shows it lacks (ISO 10589 §7.3.15.2).
+                .newer => self.queueSsn(entry.lsp_id, iface),
                 // Ours is newer → flood ours to them (SRM).
                 .older => self.queueSrm(entry.lsp_id, iface),
                 // In sync → stop flooding it to them (implicit ack).
@@ -1385,7 +1387,9 @@ pub const Lsdb = struct {
             };
             self.request_count += 1;
         }
-        self.setSsnIfP2p(id, iface);
+        // A request, unlike an acknowledgement, is also sent on a broadcast
+        // circuit (ISO 10589 §7.3.15.2).
+        self.queueSsn(id, iface);
     }
 };
 
@@ -1905,6 +1909,31 @@ test "broadcast interface: newer LSP received on it is not SSN-acked" {
     try testing.expectEqual(@as(usize, 0), db.ssnSet(id).?.count());
     // SRM still set on the other circuits.
     try testing.expect(db.srmSet(id).?.isSet(0));
+}
+
+test "broadcast interface: a CSNP entry newer than ours, or one we lack, is requested with SSN on it" {
+    var bcast = InterfaceSet.empty;
+    bcast.set(2);
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8, .broadcast_interfaces = bcast });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 0, 0);
+    const held = idOf(sys_other, 0);
+    const lacking = idOf(sys_other, 1);
+    const entries = [_]isis.tlvs.LspEntry{
+        .{ .remaining_lifetime = 1000, .lsp_id = held, .sequence_number = 5, .checksum = 0x1111 },
+        .{ .remaining_lifetime = 1000, .lsp_id = lacking, .sequence_number = 1, .checksum = 0x2222 },
+    };
+    var cbuf: [256]u8 = undefined;
+    const csnp = try isis.Csnp.decode(buildCsnp(&cbuf, &entries));
+    db.reconcileCsnp(csnp, 2, 0);
+    // The DIS's CSNP is answered with a request on the broadcast circuit...
+    try testing.expect(db.ssnSet(held).?.isSet(2));
+    try testing.expect(db.ssnSet(lacking).?.isSet(2));
+    // ...and a second CSNP keeps asking for the placeholder.
+    db.clearSsn(lacking, 2);
+    db.reconcileCsnp(csnp, 2, 1);
+    try testing.expect(db.ssnSet(lacking).?.isSet(2));
 }
 
 // ── regression: ISO 10589 receive-side self-defences (hostile on-link peer) ───
