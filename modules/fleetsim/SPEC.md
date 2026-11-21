@@ -554,7 +554,12 @@ two programs exchanging messages defined by public specifications (MODBUS Applic
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Declarative descriptions of the six other protocols** (DNP3 point tables, IEC 104 points, BACnet objects, S7 data blocks, OPC UA nodes, ENIP assemblies): ModbusPal and the pymodbus simulator describe register maps; the other responders keep their state in caller-owned object models that need a schema of their own per protocol. Not started; each is its own schema.
+  Project size: a schema and a responder wiring per protocol, six of them (weeks); needs the per-protocol object-model design first.
 
 ## Anchoring
 

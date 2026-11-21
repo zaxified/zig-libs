@@ -703,6 +703,11 @@ makes these bound tests rather than "it errored eventually" tests.
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Arbitrary-precision integers (D3).** Python grows, we raise `OutOfRange`; matters only for factorial-style
   arithmetic in templates. Large: a bignum `Value` kind and every integer filter. No general bignum module exists in the
   collection (`montint` is modular arithmetic), so it needs a decision on where one would live; waits for it.
+  Project size: a bignum `Value` kind and every integer filter, plus a general bignum module that does not exist yet (weeks); needs a decision where the bignum lives.

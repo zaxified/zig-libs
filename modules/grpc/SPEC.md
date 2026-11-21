@@ -449,6 +449,11 @@ Each item is refused with its reason here; the ones that are open work are also 
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
 - **Retries/hedging, name resolution and load balancing, keepalive** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections (and keepalive needs a PING API on `http.h2_client.Session`, which it does not have).
+  Project size: a channel that owns its connections plus a PING API on `http.h2_client.Session` (weeks); needs that channel type first.

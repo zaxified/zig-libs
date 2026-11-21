@@ -139,12 +139,15 @@ codec's concern.
 - **tokio's `Framed` / stream adapters** (`new_framed`, `new_read`, `new_write`): async runtime types; the module
   works on any `std.Io.Reader` / `Writer` and has the non-blocking `Decoder`.
 - **A separate native-endian flag:** the caller passes `@import("builtin").cpu.arch.endian()` as `Prefix.endian`.
+- **Netty `failFast = false`** of `LengthFieldBasedFrameDecoder` (read, then discard, the whole oversize frame before
+  reporting it): the module behaves as Netty's default `failFast = true`, refusing an oversize frame at its prefix
+  (sticky error), which is also all tokio offers; the discard-then-report mode only delays the error.
 - **`skip` past the head, or a frame shorter than the head bytes it keeps** (tokio accepts both and then hands
   out frames without consuming input): `BadLength`.
 
 ## Backlog / deferred
 
-- **Netty `failFast`** of `LengthFieldBasedFrameDecoder`: deferred (tokio has no counterpart; `Decoder` already refuses an oversize frame at its prefix, and the error is sticky).
+None open.
 
 ## Anchoring
 
