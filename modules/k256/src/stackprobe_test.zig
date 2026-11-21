@@ -151,6 +151,13 @@ noinline fn callSign() void {
     std.mem.doNotOptimizeAway(&sig_sink);
 }
 
+var cur_bl: group.Blinding = undefined;
+
+noinline fn callSignBlinded() void {
+    sig_sink = ecdsa_recover.signBlinded(&cur_bl, &cur_pk, cur_hash) catch unreachable;
+    std.mem.doNotOptimizeAway(&sig_sink);
+}
+
 /// Negative control: public data only, same depth.
 noinline fn callInnocent() void {
     std.crypto.hash.sha2.Sha256.hash(&cur_hash, &hash_sink, .{});
@@ -258,8 +265,13 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     var total: [needles.len]usize = @splat(0);
     var sum: usize = 0;
     resetDepths();
+    const seed: [32]u8 = @splat(0x77);
+    cur_bl = group.Blinding.fromSeed(&seed);
     for (0..5) |_| {
         measure(callSign);
+        sum += countAll(&needles, &total);
+        // The blinded signer (`signBlinded`) holds the same secrets.
+        measure(callSignBlinded);
         sum += countAll(&needles, &total);
     }
     measure(callSign);
@@ -269,7 +281,7 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     // a passing test as a FAIL (scripts/lib/test-lib.sh).
     errdefer {
         std.debug.print("\n=== STACKPROBE k256 G2 ({t}, window {d} KiB): NEG={d} POS={d} dirty={d} B ===\n", .{ builtin.mode, WINDOW / 1024, neg, pos, depth });
-        for (needle_names, total) |name, h| std.debug.print("    {s:<42} {d} (5 calls)\n", .{ name, h });
+        for (needle_names, total) |name, h| std.debug.print("    {s:<42} {d} (5 + 5 blinded calls)\n", .{ name, h });
         std.debug.print("    hits {d}..{d} B below the region top\n", .{ hit_min_depth, hit_max_depth });
     }
 
@@ -361,6 +373,11 @@ noinline fn callBip340Sign() void {
     std.mem.doNotOptimizeAway(&bip340_sink);
 }
 
+noinline fn callBip340SignBlinded() void {
+    bip340_sink = sign_mod.bip340SignBlinded(&cur_bl, &cur_pk, bip340_msg, cur_aux) catch unreachable;
+    std.mem.doNotOptimizeAway(&bip340_sink);
+}
+
 test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack after sign.bip340Sign" {
     if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
@@ -397,8 +414,12 @@ test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack 
 
         var hits = @as([needles.len]usize, @splat(0));
         resetDepths();
+        const seed: [32]u8 = @splat(0x78);
+        cur_bl = group.Blinding.fromSeed(&seed);
         for (0..5) |_| {
             measure(callBip340Sign);
+            _ = countAll(&needles, &hits);
+            measure(callBip340SignBlinded);
             _ = countAll(&needles, &hits);
         }
         measure(callBip340Sign);
@@ -458,4 +479,52 @@ test "STACKPROBE (review 2026-10-08): no scalar residue on the dead stack after 
     try std.testing.expectEqual(@as(usize, 0), be_hits);
     try std.testing.expectEqual(@as(usize, 0), le_hits);
     try std.testing.expectEqual(@as(usize, 0), mem_hits);
+}
+
+// ── `Secp256k1.combMulBaseBlinded` (2026-11-21) ──────────────────
+//
+// The blinded fixed-base multiply: besides the scalar, the comb's actual
+// input `d = s + (n − b)` and the blinding scalar `b` are secrets.
+
+noinline fn callCombMulBaseBlinded() void {
+    point_sink = group.Secp256k1.combMulBaseBlinded(&cur_bl, cur_scalar, .big) catch unreachable;
+    std.mem.doNotOptimizeAway(&point_sink);
+}
+
+test "STACKPROBE: no scalar, comb-input or blinding residue on the dead stack after Secp256k1.combMulBaseBlinded" {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+
+    std.crypto.hash.sha2.Sha256.hash("k256 stackprobe combMulBaseBlinded secret scalar", &cur_scalar, .{});
+    cur_scalar[0] &= 0x7f;
+    const seed: [32]u8 = @splat(0x79);
+    cur_bl = group.Blinding.fromSeed(&seed);
+    const n = @import("scalar.zig").field_order;
+    const s_int = std.mem.readInt(u256, &cur_scalar, .big);
+    var b_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b_be, n - cur_bl.neg_b, .big);
+    var d_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &d_be, @intCast((@as(u320, s_int) + cur_bl.neg_b) % n), .big);
+    const needles = [_][32]u8{ cur_scalar, le(cur_scalar), d_be, le(d_be), b_be, le(b_be) };
+    cur_hash = @splat(0x5b);
+    leak_src = le(d_be);
+
+    var scratch = @as([needles.len]usize, @splat(0));
+    measure(callInnocent);
+    const neg = countAll(&needles, &scratch);
+    measure(callLeaky);
+    const pos = countIn(&needles[3]);
+
+    var hits = @as([needles.len]usize, @splat(0));
+    resetDepths();
+    for (0..5) |_| {
+        measure(callCombMulBaseBlinded);
+        _ = countAll(&needles, &hits);
+    }
+    measure(callCombMulBaseBlinded);
+    const depth = dirtyDepth();
+    errdefer std.debug.print("\n=== STACKPROBE k256 combMulBaseBlinded ({t}) NEG={d} POS={d} per-needle={any} (5 calls), dirty {d} B, hits {d}..{d} B ===\n", .{ builtin.mode, neg, pos, hits, depth, hit_min_depth, hit_max_depth });
+
+    try std.testing.expectEqual(@as(usize, 0), neg);
+    try std.testing.expect(pos >= 1);
+    for (hits) |h| try std.testing.expectEqual(@as(usize, 0), h);
 }

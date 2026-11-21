@@ -194,7 +194,7 @@ fn secretScalar(comptime domain: []const u8) [32]u8 {
     return s;
 }
 
-const Target = enum { field, mul, comb, sign, ecdsa };
+const Target = enum { field, mul, comb, sign, ecdsa, combblind, signblind, ecdsablind };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -203,6 +203,9 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "comb")) return .comb;
     if (std.mem.eql(u8, s, "sign")) return .sign;
     if (std.mem.eql(u8, s, "ecdsa")) return .ecdsa;
+    if (std.mem.eql(u8, s, "combblind")) return .combblind;
+    if (std.mem.eql(u8, s, "signblind")) return .signblind;
+    if (std.mem.eql(u8, s, "ecdsablind")) return .ecdsablind;
     return error.UnknownTarget;
 }
 
@@ -327,6 +330,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const sig = try ecdsa_recover.sign(&privkey, hash32);
             std.debug.print("r={x} s={x} recid={d}\n", .{ sig.r, sig.s, sig.recid });
+        },
+        // The blinded paths (`Blinding`, libsecp256k1's context
+        // randomisation): the scalar or key AND the whole blinding state
+        // (`−b`, `b·G`, `f`, `f²`, `f³`) tainted. The state is derived once
+        // per process from a seed; what runs per signature is its use.
+        .combblind, .signblind, .ecdsablind => {
+            const seed = secretBytes(32, "ctgrind-k256-harness-blinding-seed-v1");
+            var bl = root.Blinding.fromSeed(&seed);
+            taintIf(tainted, std.mem.asBytes(&bl));
+            var k = secretScalar("ctgrind-k256-harness-blinded-secret-v1");
+            taintIf(tainted, &k);
+            const s = reloadVolatile(32, &k);
+            switch (target) {
+                .combblind => {
+                    const q = try Secp256k1.combMulBaseBlinded(&bl, s, .big);
+                    std.debug.print("x={x}\n", .{q.x.toBytes(.big)});
+                    std.debug.print("y={x}\n", .{q.y.toBytes(.big)});
+                    std.debug.print("z={x}\n", .{q.z.toBytes(.big)});
+                },
+                .signblind => {
+                    const aux_rand = secretBytes(32, "ctgrind-k256-harness-aux-rand-v1");
+                    const sig = try sign.bip340SignBlinded(&bl, &s, "ctgrind harness message", aux_rand);
+                    std.debug.print("sig={x}\n", .{sig});
+                },
+                .ecdsablind => {
+                    const hash32 = secretBytes(32, "ctgrind-k256-harness-ecdsa-message-hash-v1");
+                    const sig = try ecdsa_recover.signBlinded(&bl, &s, hash32);
+                    std.debug.print("r={x} s={x} recid={d}\n", .{ sig.r, sig.s, sig.recid });
+                },
+                else => unreachable,
+            }
         },
     }
 }

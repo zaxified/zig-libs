@@ -24,6 +24,8 @@ const scalarmod = @import("scalar.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Secp256k1 = group.Secp256k1;
+const Blinding = group.Blinding;
+const IdentityElementError = std.crypto.errors.IdentityElementError;
 const Scalar = scalarmod.Scalar;
 const Fe = @import("field.zig").Fe;
 
@@ -64,9 +66,23 @@ pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 /// The key by pointer (BREAKING): by value, the caller's frame kept
 /// a copy of it (`stackprobe_test.zig`, direct-region engine).
 pub fn bip340Sign(secret_key: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
-    const result = bip340SignInner(secret_key, msg, aux_rand);
+    const result = bip340SignInner(secret_key, msg, aux_rand, null);
     burnBip340Stack();
     return result;
+}
+
+/// `bip340Sign` with both fixed-base multiplies (`d'·G`, `k'·G`) blinded by
+/// `blinding` (`Secp256k1.combMulBaseBlinded`, libsecp256k1's
+/// `secp256k1_context_randomize`). The same signature as `bip340Sign`.
+pub fn bip340SignBlinded(blinding: *const Blinding, secret_key: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+    const result = bip340SignInner(secret_key, msg, aux_rand, blinding);
+    burnBip340Stack();
+    return result;
+}
+
+/// `s·G` through the comb, blinded when a `Blinding` is given.
+inline fn mulG(bl: ?*const Blinding, s: [32]u8) IdentityElementError!Secp256k1 {
+    return if (bl) |b| Secp256k1.combMulBaseBlinded(b, s, .big) else Secp256k1.combMulBase(s, .big);
 }
 
 /// `bip340SignInner`'s call tree reached 2.7 KiB in ReleaseFast;
@@ -88,7 +104,7 @@ noinline fn burnBip340Stack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-noinline fn bip340SignInner(secret_key_ptr: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
+noinline fn bip340SignInner(secret_key_ptr: *const [32]u8, msg: []const u8, aux_rand: [32]u8, bl: ?*const Blinding) SignError![64]u8 {
     // The copy lives in this burned frame, not in `bip340Sign`'s.
     const secret_key = secret_key_ptr.*;
     // d' = int(sk), 0 < d' < n.
@@ -97,7 +113,7 @@ noinline fn bip340SignInner(secret_key_ptr: *const [32]u8, msg: []const u8, aux_
 
     // P = d'·G; even-y-normalize the effective scalar d. Constant-time
     // fixed-base comb multiply (secret scalar `d'`).
-    const P = Secp256k1.combMulBase(secret_key, .big) catch return error.InvalidSecretKey;
+    const P = mulG(bl, secret_key) catch return error.InvalidSecretKey;
     const Pa = P.affineCoordinates();
     const d = if (Pa.y.isOdd()) dp.neg() else dp;
     const d_bytes = d.toBytes(.big);
@@ -115,7 +131,7 @@ noinline fn bip340SignInner(secret_key_ptr: *const [32]u8, msg: []const u8, aux_
 
     // R = k'·G; even-y-normalize k. Constant-time fixed-base comb multiply
     // (SECRET nonce `k'` — the security-critical call).
-    const R = Secp256k1.combMulBase(k0.toBytes(.big), .big) catch return error.InvalidNonce;
+    const R = mulG(bl, k0.toBytes(.big)) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
     const rx = Ra.x.toBytes(.big);
     const k = if (Ra.y.isOdd()) k0.neg() else k0;
@@ -399,4 +415,20 @@ test "the local seedInto helper produces what Smith.slice reads back" {
     var buf: [32]u8 = undefined;
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
+}
+
+test "bip340SignBlinded == bip340Sign, and it verifies" {
+    const sk: [32]u8 = @splat(0x3c);
+    const aux: [32]u8 = @splat(0x07);
+    const seed: [32]u8 = @splat(0x99);
+    const bl = Blinding.fromSeed(&seed);
+    const fixed = Blinding.fromSeed(null);
+    const msg = "blinded";
+    const want = try bip340Sign(&sk, msg, aux);
+    try std.testing.expectEqualSlices(u8, &want, &(try bip340SignBlinded(&bl, &sk, msg, aux)));
+    try std.testing.expectEqualSlices(u8, &want, &(try bip340SignBlinded(&fixed, &sk, msg, aux)));
+    const P = try Secp256k1.combMulBase(sk, .big);
+    try std.testing.expect(bip340Verify(P.affineCoordinates().x.toBytes(.big), msg, want));
+    const zero: [32]u8 = @splat(0);
+    try std.testing.expectError(error.InvalidSecretKey, bip340SignBlinded(&bl, &zero, msg, aux));
 }

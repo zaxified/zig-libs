@@ -307,9 +307,16 @@ pub const Secp256k1 = struct {
         // By pointer to a zeroed local, as `combMulBase` (Zig 0.17: a by-value
         // `[32]u8` argument is a copy in the calling frame, above the burn).
         // The caller's own copy of `s_` stays the caller's (see `mulInto`).
-        var s = s_;
-        defer std.crypto.secureZero(u8, &s);
-        const result = mulInner(p, &s, endian);
+        var s: [32]u8 = undefined;
+        return mulZeroing(p, s_, endian, &s);
+    }
+
+    /// `mul`'s body with its scalar copy as an out-parameter, so a test can
+    /// see the wipe (`inline`: the copy stays in `mul`'s frame, as before).
+    inline fn mulZeroing(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian, s: *[32]u8) IdentityElementError!Secp256k1 {
+        s.* = s_;
+        defer std.crypto.secureZero(u8, s);
+        const result = mulInner(p, s, endian);
         burnMulStack();
         return result;
     }
@@ -503,7 +510,16 @@ pub const Secp256k1 = struct {
     /// n/2, where the argument fails, so it stays complete. Every branch here
     /// is on the PUBLIC window index.
     pub fn combMulBaseWithTable(tab: *const CombTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        const k = scalarValue(s_, endian);
+        const proj = combProjective(tab, scalarValue(s_, endian), false, undefined);
+        try proj.rejectIdentityOneBranch();
+        return proj;
+    }
+
+    /// The comb's loop, `k·G` in projective form with no identity check.
+    /// `blinded`: the first loaded entry is rescaled to the Jacobian
+    /// `(x·f², y·f³, f)` of `bl` (libsecp256k1's `proj_blind`), so the
+    /// accumulator's coordinates do not follow from the scalar alone.
+    inline fn combProjective(tab: *const CombTable, k: u256, comptime blinded: bool, bl: *const Blinding) Secp256k1 {
         var acc = CtJac.identity;
         var started: u64 = 0;
         var carry: u64 = 0;
@@ -541,6 +557,7 @@ pub const Secp256k1 = struct {
             if (i + 1 < fb_t) { // PUBLIC loop index
                 const sum = addMixedCtJac(acc, g);
                 var cand = CtJac{ .x = g.x, .y = g.y, .z = Fe.one };
+                if (comptime blinded) cand = .{ .x = g.x.mul(bl.f2), .y = g.y.mul(bl.f3), .z = bl.f };
                 blendJac(&cand, sum, blackBox(started));
                 blendJac(&acc, cand, nonzero);
                 started |= nonzero;
@@ -553,11 +570,45 @@ pub const Secp256k1 = struct {
                 blendLimbs(&proj.x, sum.x, nonzero);
                 blendLimbs(&proj.y, sum.y, nonzero);
                 blendLimbs(&proj.z, sum.z, nonzero);
-                try proj.rejectIdentityOneBranch();
                 return proj;
             }
         }
         unreachable;
+    }
+
+    /// `combMulBase` with libsecp256k1's `ecmult_gen` blinding
+    /// (`secp256k1_context_randomize`): the comb runs on `s − b` for the
+    /// `Blinding`'s secret `b`, its accumulator starts at a rescaled
+    /// representative, and `b·G` is added at the end — so neither the table
+    /// lookups nor the intermediate coordinates are functions of `s` alone.
+    /// The same point as `combMulBase(s)` for every `s` (any 32 bytes, reduced
+    /// mod n); `error.IdentityElement` iff `s ≡ 0 (mod n)`. Constant time and
+    /// burned like `combMulBase`.
+    pub inline fn combMulBaseBlinded(bl: *const Blinding, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        var s = s_;
+        defer std.crypto.secureZero(u8, &s);
+        const result = combMulBaseBlindedInner(bl, &s, endian);
+        burnCombStack();
+        return result;
+    }
+
+    noinline fn combMulBaseBlindedInner(bl: *const Blinding, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        // d = (s + (n − b)) mod n on plain integers: `s < 2^256 < 2n` and
+        // `n − b < n`, so two masked subtractions of n reduce it. (std's
+        // `Scalar.fromBytes64` would branch on the secret: its halves go
+        // through `Field.fromBytes`' canonicity check.)
+        var d: u320 = @as(u320, scalarValue(s_.*, endian)) + bl.neg_b;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&d));
+        inline for (0..2) |_| {
+            const dn = @subWithOverflow(d, @as(u320, scalarmod.field_order));
+            // keep d iff the subtraction borrowed; the bit laundered.
+            const keep: u320 = 0 -% @as(u320, blackBox(0 -% @as(u64, dn[1])) & 1);
+            d = (d & keep) | (dn[0] & ~keep);
+        }
+        const proj = combProjective(&comb_table, @truncate(d), true, bl);
+        const r = proj.addMixed(bl.b_g);
+        try r.rejectIdentityOneBranch();
+        return r;
     }
 
     /// Mixed addition `p + q` with `q` AFFINE: RCB algorithm 8 (complete for
@@ -894,6 +945,82 @@ comptime {
 /// points, `43 · 32 · 64 B = 88 064 B` of `.rodata` (was `65 · 8 · 96 B =
 /// 49 920 B`, w = 4 projective, previously).
 pub const CombTable = [fb_t][fb_teeth]AffineCoordinates;
+
+/// The secret state of `Secp256k1.combMulBaseBlinded`, libsecp256k1's
+/// `secp256k1_context_randomize` for the fixed-base multiply: a scalar `b`
+/// (kept as `−b mod n`), the point `b·G`, and a nonzero field element `f`
+/// that rescales the comb's first entry. Derive a fresh one per process (or
+/// per signing session) with `random`, or from a 32-byte secret seed with
+/// `fromSeed`; `fromSeed(null)` is the fixed, non-random state (`b = 1`,
+/// `f = 1`), as libsecp256k1 resets on a NULL seed. Wipe with `wipe`.
+pub const Blinding = struct {
+    /// `n − b`, canonical (`0 < b < n`).
+    neg_b: u256,
+    b_g: AffineCoordinates,
+    f: field.Fe,
+    f2: field.Fe,
+    f3: field.Fe,
+
+    const tag = "zig-libs k256 blinding v1";
+
+    /// The state derived from `seed` (under a module tag: `b` from 255 bits
+    /// of SHA-512, `f` from SHA-256 with the top bit cleared), or the fixed
+    /// state for `null`.
+    pub fn fromSeed(seed: ?*const [32]u8) Blinding {
+        var out: Blinding = undefined;
+        fromSeedInto(&out, seed);
+        return out;
+    }
+
+    /// `fromSeed` into `out`, leaving no copy of the state in this frame's
+    /// caller (the form `random` uses).
+    pub fn fromSeedInto(out: *Blinding, seed_opt: ?*const [32]u8) void {
+        const seed = seed_opt orelse {
+            out.* = .{ .neg_b = scalarmod.field_order - 1, .b_g = Secp256k1.basePoint.affineCoordinates(), .f = field.Fe.one, .f2 = field.Fe.one, .f3 = field.Fe.one };
+            return;
+        };
+        var h: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &h);
+        var hs = std.crypto.hash.sha2.Sha512.init(.{});
+        hs.update(tag ++ " b");
+        hs.update(seed);
+        hs.final(&h);
+        // b: 255 hash bits, so `b < 2^255 < n` needs no reduction (std's
+        // would branch on the secret); b = 0 (probability 2^-255) would make
+        // b·G the identity, so it becomes 1.
+        var b: u256 = std.mem.readInt(u256, h[0..32], .big) & (std.math.maxInt(u256) >> 1);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+        b |= @intFromBool(b == 0);
+        var fb: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &fb);
+        var hf = std.crypto.hash.sha2.Sha256.init(.{});
+        hf.update(tag ++ " f");
+        hf.update(seed);
+        hf.final(&fb);
+        fb[0] &= 0x7f; // < 2^255 < p: canonical
+        var f = field.Fe.fromBytes(fb, .big) catch unreachable;
+        f.cMov(field.Fe.one, @intFromBool(f.isZero()));
+        var b_be: [32]u8 = undefined;
+        std.mem.writeInt(u256, &b_be, b, .big);
+        defer std.crypto.secureZero(u8, &b_be);
+        const bg = Secp256k1.combMulBase(b_be, .big) catch unreachable; // 0 < b < n
+        const f2 = f.sq();
+        out.* = .{ .neg_b = scalarmod.field_order - b, .b_g = bg.affineCoordinates(), .f = f, .f2 = f2, .f3 = f2.mul(f) };
+    }
+
+    /// A fresh state from 32 bytes of `io`'s randomness.
+    pub fn random(io: std.Io) Blinding {
+        var seed: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        io.random(&seed);
+        return fromSeed(&seed);
+    }
+
+    /// Zero the state.
+    pub fn wipe(self: *Blinding) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
 
 /// Jacobian `(X : Y : Z)` ↔ affine `(X/Z², Y/Z³)` for the constant-time comb
 /// accumulator ONLY. Unlike `ecmult.Gej`, nothing here branches: the comb's
@@ -1533,4 +1660,67 @@ test "sK: mulDoubleBasePublic recognises G by its exact limbs only (−G, and G'
     const fake = Secp256k1{ .x = G.x, .y = G.y, .z = field.Fe.zero };
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(fake, s1, P, s2, .big));
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(P, s2, fake, s1, .big));
+}
+
+test "mul zeroes its copy of the scalar, on success and on the identity error" {
+    var buf: [32]u8 = undefined;
+    var k: [32]u8 = @splat(0x5c);
+    _ = try Secp256k1.mulZeroing(Secp256k1.basePoint, k, .big, &buf);
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
+    k = @splat(0);
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulZeroing(Secp256k1.basePoint, k, .big, &buf));
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
+}
+
+test "combMulBaseBlinded == combMulBase on 0, 1, n − 1, n, a wrapping s + (−b), 2^256 − 1 and random scalars" {
+    const n = scalarmod.field_order;
+    var seed: [32]u8 = @splat(0x42);
+    var bl = Blinding.fromSeed(&seed);
+    defer bl.wipe();
+    const fixed = Blinding.fromSeed(null);
+    // b itself: s − b ≡ 0, the comb's accumulator ends at O and b·G is all.
+    var b_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b_be, n - bl.neg_b, .big);
+    var cases: [9][32]u8 = undefined;
+    std.mem.writeInt(u256, &cases[0], 0, .big);
+    std.mem.writeInt(u256, &cases[1], 1, .big);
+    std.mem.writeInt(u256, &cases[2], n - 1, .big);
+    std.mem.writeInt(u256, &cases[3], n, .big);
+    cases[4] = b_be;
+    // s just below b: s − b wraps mod n.
+    std.mem.writeInt(u256, &cases[5], std.mem.readInt(u256, &b_be, .big) - 1, .big);
+    cases[6] = @splat(0xff);
+    var prng = std.Random.DefaultPrng.init(0x6b25_6b1d);
+    prng.random().bytes(&cases[7]);
+    prng.random().bytes(&cases[8]);
+    for (cases) |s| {
+        for ([_]*const Blinding{ &bl, &fixed }) |b| {
+            const want = Secp256k1.combMulBase(s, .big);
+            const got = Secp256k1.combMulBaseBlinded(b, s, .big);
+            if (want) |w| {
+                try std.testing.expect(w.equivalent(try got));
+            } else |e| try std.testing.expectError(e, got);
+            var le = s;
+            std.mem.reverse(u8, &le);
+            const got_le = Secp256k1.combMulBaseBlinded(b, le, .little);
+            if (want) |w| try std.testing.expect(w.equivalent(try got_le)) else |e| try std.testing.expectError(e, got_le);
+        }
+    }
+}
+
+test "Blinding: the fixed state is b = 1, f = 1; seeds give different states; wipe zeroes" {
+    const fixed = Blinding.fromSeed(null);
+    try std.testing.expect(fixed.b_g.x.equivalent(Secp256k1.basePoint.affineCoordinates().x));
+    try std.testing.expect(fixed.f.equivalent(field.Fe.one));
+    const s1: [32]u8 = @splat(1);
+    const s2: [32]u8 = @splat(2);
+    var a = Blinding.fromSeed(&s1);
+    const b = Blinding.fromSeed(&s2);
+    try std.testing.expect(!a.b_g.x.equivalent(b.b_g.x));
+    try std.testing.expect(!a.f.equivalent(b.f));
+    try std.testing.expect(a.f2.equivalent(a.f.sq()) and a.f3.equivalent(a.f2.mul(a.f)));
+    const again = Blinding.fromSeed(&s1);
+    try std.testing.expect(again.b_g.x.equivalent(a.b_g.x));
+    a.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&a), 0));
 }

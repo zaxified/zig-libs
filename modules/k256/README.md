@@ -70,6 +70,15 @@ const ok3 = k256.sign.ecdsaVerifyLowS(pubkey_sec1, msg, sig_rs);  // rejects the
 // e.g. Lightning BOLT#11's invoice signature).
 const rsig = try k256.ecdsa_recover.sign(&privkey, hash32);
 const q = try k256.ecdsa_recover.recoverPubkey(hash32, rsig.r, rsig.s, rsig.recid);
+
+// Blinding (libsecp256k1's context randomisation): the same results, with the
+// fixed-base multiply's inputs and coordinates randomised. One per process or
+// session; wipe it when done.
+var bl = k256.Blinding.random(io);
+defer bl.wipe();
+const pk = try k256.Secp256k1.combMulBaseBlinded(&bl, secret_key, .big);
+const bsig = try k256.sign.bip340SignBlinded(&bl, &secret_key, msg, aux_rand);
+const brsig = try k256.ecdsa_recover.signBlinded(&bl, &privkey, hash32);
 ```
 
 `k256.Scalar` (arithmetic mod the group order `n`) is re-exported from std on
@@ -106,7 +115,7 @@ live on the card's Performance line (see `SPEC.md`'s Performance section).
 
 ## Not provided
 
-ElligatorSwift (BIP324), Silent Payments (BIP352) helpers, context blinding, an aarch64 field asm
+ElligatorSwift (BIP324), Silent Payments (BIP352) helpers, an aarch64 field asm
 and hybrid SEC1 tags (`06` / `07`) are not provided; the scalar field is std's. See `SPEC.md`:
 *What is deliberately not done* and *Backlog / deferred*.
 

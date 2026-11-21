@@ -40,6 +40,7 @@ const sign_mod = @import("sign.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const Secp256k1 = group.Secp256k1;
+const Blinding = group.Blinding;
 const Fe = fieldmod.Fe;
 const Scalar = scalarmod.Scalar;
 
@@ -143,7 +144,16 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 /// The key by pointer (BREAKING): by value, the caller's frame kept
 /// a copy of it (`stackprobe_test.zig`, direct-region engine).
 pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
-    const result = signInner(privkey, hash32, combMulBaseCommit);
+    const result = signInner(privkey, hash32, combMulBaseCommit, null);
+    burnSignStack();
+    return result;
+}
+
+/// `sign` with the nonce commitment `k·G` blinded by `blinding`
+/// (`Secp256k1.combMulBaseBlinded`, libsecp256k1's
+/// `secp256k1_context_randomize`). The same signature as `sign`.
+pub fn signBlinded(blinding: *const Blinding, privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
+    const result = signInner(privkey, hash32, combMulBaseCommit, blinding);
     burnSignStack();
     return result;
 }
@@ -203,7 +213,7 @@ noinline fn burnSignStack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commit: CommitFn) SignError!Signature {
+noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commit: CommitFn, bl: ?*const Blinding) SignError!Signature {
     // The copy lives in this burned frame, not in `sign`'s.
     const privkey = privkey_ptr.*;
     const d = Scalar.fromBytes(privkey, .big) catch return error.InvalidPrivateKey;
@@ -214,7 +224,7 @@ noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commi
     defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
     var k_bytes = k.toBytes(.big);
     defer std.crypto.secureZero(u8, &k_bytes);
-    const R = commit(k_bytes, .big) catch return error.InvalidNonce;
+    const R = (if (bl) |b| Secp256k1.combMulBaseBlinded(b, k_bytes, .big) else commit(k_bytes, .big)) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
     // ECDSA (SEC 1 §4.1.3) defines r = x(R) mod n, and std's signer and
     // libsecp256k1 both reduce. A1 audit G7: this line used to be
@@ -564,7 +574,7 @@ test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through 
     for (&privkey, 0..) |*b, i| b.* = @intCast(0x21 +% i);
     const hash = beOf(0x6b_32_35_36_47_37);
 
-    const sig = signInner(&privkey, hash, Injected.commit) catch |err| {
+    const sig = signInner(&privkey, hash, Injected.commit, null) catch |err| {
         std.debug.print("G7 sign seam: signInner returned error.{t} for R.x >= n\n", .{err});
         return err;
     };
@@ -652,12 +662,29 @@ test "sK: sign refuses r = 0 (R.x = n) and s = 0 (e = −r·d) through the signi
     const xn = try Fe.fromBytes(beOf(n), .big);
     const yn = try Secp256k1.recoverY(xn, false);
     Injected.point = try Secp256k1.fromAffineCoordinates(.{ .x = xn, .y = yn });
-    try testing.expectError(error.InvalidNonce, signInner(&privkey, hash, Injected.commit));
+    try testing.expectError(error.InvalidNonce, signInner(&privkey, hash, Injected.commit, null));
 
     // s = 0: R = G, hash e = −r·d, so e + r·d ≡ 0 whatever the nonce is.
     Injected.point = Secp256k1.basePoint;
     const r = reduceToScalar(Secp256k1.basePoint.x.toBytes(.big));
     const d = try Scalar.fromBytes(privkey, .big);
     const e = r.mul(d).neg();
-    try testing.expectError(error.InvalidNonce, signInner(&privkey, e.toBytes(.big), Injected.commit));
+    try testing.expectError(error.InvalidNonce, signInner(&privkey, e.toBytes(.big), Injected.commit, null));
+}
+
+test "signBlinded == sign (RFC 6979: deterministic), and the key recovers" {
+    const privkey: [32]u8 = @splat(0x21);
+    const seed: [32]u8 = @splat(0x5e);
+    const bl = Blinding.fromSeed(&seed);
+    for (0..4) |i| {
+        var h: [32]u8 = @splat(@intCast(i));
+        h[0] = 0xa5;
+        const want = try sign(&privkey, h);
+        const got = try signBlinded(&bl, &privkey, h);
+        try std.testing.expectEqualSlices(u8, &want.r, &got.r);
+        try std.testing.expectEqualSlices(u8, &want.s, &got.s);
+        try std.testing.expectEqual(want.recid, got.recid);
+        const q = try recoverPubkey(h, got.r, got.s, got.recid);
+        try std.testing.expect(q.equivalent(try Secp256k1.combMulBase(privkey, .big)));
+    }
 }

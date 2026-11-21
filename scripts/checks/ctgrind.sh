@@ -186,7 +186,7 @@ declare -A TARGETS=(
     # about the comparison.
     [ecvrf]="prove verify"
     [ed448]="full ladder"
-    [k256]="field mul comb sign ecdsa"
+    [k256]="field mul comb sign ecdsa combblind signblind ecdsablind"
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign secpt ecdh"
@@ -550,6 +550,9 @@ declare -A PATTERN=(
     [k256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/sign]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/ecdsa]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/combblind]='group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/signblind]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/ecdsablind]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # montint: `montint.zig` is the portable CIOS + powMont, `asm_core.zig` the
     # gated amd64 core, `limbs.zig` the add/sub/select primitives underneath
     # both. All three are montint's own files; nothing in std shares a basename
@@ -1087,6 +1090,9 @@ declare -A LABEL=(
     [k256/comb]='k256 group+field'
     [k256/sign]='k256 src'
     [k256/ecdsa]='k256 ecdsa src'
+    [k256/combblind]='k256 combMulBaseBlinded (s + Blinding)'
+    [k256/signblind]='k256 bip340SignBlinded (sk + Blinding)'
+    [k256/ecdsablind]='k256 ecdsa signBlinded (key + Blinding)'
     [montint/small]='montint src'
     [montint/portable]='montint src'
     [montint/asmcore]='montint src'

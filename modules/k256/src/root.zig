@@ -47,6 +47,8 @@ pub const Fe = field.Fe;
 pub const Secp256k1 = group.Secp256k1;
 /// A point in affine coordinates.
 pub const AffineCoordinates = group.AffineCoordinates;
+/// `Secp256k1.combMulBaseBlinded`'s secret state (libsecp256k1's context randomisation).
+pub const Blinding = group.Blinding;
 /// A scalar-field element (mod the group order `n`).
 pub const Scalar = scalar.Scalar;
 
