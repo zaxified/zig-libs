@@ -237,7 +237,7 @@ A caller on a small thread or coroutine stack (below roughly 48 KiB free)
 overflows with no guard page check from this module. Not measured against
 the stack sizes of the consumers (the web-server consumer's TLS handshake thread, the router-tool consumer tasks);
 whoever runs hpke on a custom stack must check.
-`src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation, the pq KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
+`src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation (DHKEM(X448) included: derive, encap, decap, both auth halves), the pq KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
 against the keys, DH outputs (both coordinates), `eae_prk`, the shared secret,
 the key schedule's `secret`, the AEAD key, AES round keys and GHASH key, and the
 exporter secret.

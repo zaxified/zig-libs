@@ -3,7 +3,7 @@
 //! Dead-stack residue probe for the secret paths of the module: the `Group`
 //! state machine (`create`, `fromWelcome`, `createCommit` with an Add and with
 //! a path update, `processCommit`, `updateLeaf`, `joinByExternalCommit`,
-//! `epochAuthenticator`) and the building blocks under it (`crypto`,
+//! `epochAuthenticator`, `protectApplication`, `unprotectApplication`) and the building blocks under it (`crypto`,
 //! `keyschedule`, `secrettree`, `framing`, `welcome`, `treekem`). Kept in the
 //! module per `CONVENTIONS.md` §9.
 //!
@@ -363,6 +363,7 @@ const base_c1 = 1; // commit 1 (Add bob): draws 1..5
 const base_c2 = 6; // commit 2 (path update): draws 6..10
 const base_ext = 11; // external join: draws 11..15
 const base_lo = 3; // low-level calls that draw
+const base_app = 16; // protectApplication: the reuse_guard draw (public in the message)
 
 fn die(comptime what: []const u8) noreturn {
     @panic("mls stackprobe: " ++ what ++ " failed");
@@ -574,6 +575,14 @@ fn setUp(ci: u8) !void {
     try bob.join(welcome1, &b1);
     sb1 = b1.secrets;
     pb1 = PathCopy.of(&b1);
+
+    // an epoch-1 application message from alice, for bob's unprotectApplication
+    {
+        var ta: G = undefined;
+        mkA1(&ta);
+        rec_counter = base_app;
+        app_msg = try ta.protectApplication(gpa, .{ .io = rec_io, .signature_key_pair = &alice.sig, .data = app_data });
+    }
 
     // epoch 2: alice commits a path update, bob follows
     doCommit2(&a1);
@@ -853,6 +862,18 @@ noinline fn callExternalJoin() void {
         .signature_key_pair = &dave.sig,
     }, &join_sink) catch die("joinByExternalCommit");
 }
+const app_data = "mls probe application message";
+var app_msg: []u8 = undefined;
+var app_sink: []u8 = undefined;
+var app_recv_sink: G.ApplicationMessage = undefined;
+noinline fn callProtectApplication() void {
+    const a = take();
+    rec_counter = base_app;
+    app_sink = a.protectApplication(gpa, .{ .io = rec_io, .signature_key_pair = &alice.sig, .data = app_data }) catch die("protectApplication");
+}
+noinline fn callUnprotectApplication() void {
+    app_recv_sink = take().unprotectApplication(gpa, app_msg) catch die("unprotectApplication");
+}
 noinline fn callEpochAuthenticator() void {
     ea_g.epochAuthenticator(&ea_sink);
 }
@@ -1124,6 +1145,35 @@ test "STACKPROBE: no secret residue on the dead stack (mls Group)" {
         addControl(&n);
         n.sort();
         bad += try runProbe("Group.epochAuthenticator", callEpochAuthenticator, &n);
+
+        // Group.protectApplication (alice) / unprotectApplication (bob), epoch 1:
+        // the secret tree from encryption_secret, alice's application ratchet
+        // and its generation-0 key and nonce.
+        {
+            var app_base: [32]u8 = undefined;
+            try secrettree.ratchetBaseSecret(S, &s1.encryption_secret, 2, 0, .application, &app_base);
+            var rt: secrettree.Ratchet(S) = undefined;
+            secrettree.Ratchet(S).init(&app_base, &rt);
+            var kn: KN = undefined;
+            try rt.current(&kn);
+            n = .{};
+            addSecrets(&n, &s1);
+            add(&n, "app ratchet", &app_base);
+            add(&n, "app ratchet", &rt.secret);
+            addKn(&n, &kn);
+            for (0..3) |ni| {
+                var ns: [32]u8 = undefined;
+                try secrettree.nodeSecret(S, &s1.encryption_secret, 2, ni, &ns);
+                add(&n, "node secret", &ns);
+            }
+            addSigning(&n, &alice.sig);
+            addControl(&n);
+            n.sort();
+            fillA1();
+            bad += try runProbe("Group.protectApplication", callProtectApplication, &n);
+            fillB1();
+            bad += try runProbe("Group.unprotectApplication", callUnprotectApplication, &n);
+        }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

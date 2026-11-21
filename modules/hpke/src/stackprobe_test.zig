@@ -871,3 +871,112 @@ test "STACKPROBE: no pq key, ML-KEM or combined-secret residue on the dead stack
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── DHKEM(X448, HKDF-SHA512) ────────────────────────────────────────────────
+
+const X4 = hpke.X448Kem;
+const x448 = @import("ed448").x448;
+const HkdfSha512 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha512);
+
+var x4_eph: X4.KeyPair = undefined;
+var x4_r: X4.KeyPair = undefined;
+var x4_s: X4.KeyPair = undefined;
+var x4_ikm: [64]u8 = undefined;
+var x4_kp_sink: X4.KeyPair = undefined;
+var x4_encapped_sink: X4.Encapped = undefined;
+var ss64_sink: [64]u8 = undefined;
+
+noinline fn callX4Derive() void {
+    X4.deriveKeyPair(&x4_kp_sink, &x4_ikm);
+}
+noinline fn callX4Encap() void {
+    X4.encapDeterministic(&x4_encapped_sink, x4_r.public_key, &x4_eph) catch unreachable;
+}
+noinline fn callX4Decap() void {
+    X4.decap(&ss64_sink, x4_eph.public_key, &x4_r) catch unreachable;
+}
+noinline fn callX4AuthEncap() void {
+    X4.authEncapDeterministic(&x4_encapped_sink, x4_r.public_key, &x4_s, &x4_eph) catch unreachable;
+}
+noinline fn callX4AuthDecap() void {
+    X4.authDecap(&ss64_sink, x4_eph.public_key, &x4_r, x4_s.public_key) catch unreachable;
+}
+
+fn ikm64(i: u8) [64]u8 {
+    var out: [64]u8 = undefined;
+    out[0..32].* = caseKey(i);
+    out[32..].* = caseKey(i +% 100);
+    return out;
+}
+
+test "STACKPROBE: no key or DH residue on the dead stack after DHKEM(X448)" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |c| {
+        const ci: u8 = @intCast(c);
+        x4_ikm = ikm64(ci);
+        X4.deriveKeyPair(&x4_eph, &ikm64(ci + 10));
+        X4.deriveKeyPair(&x4_r, &ikm64(ci + 20));
+        X4.deriveKeyPair(&x4_s, &ikm64(ci + 30));
+        leak_src = x4_r.secret_key[0..LEAK].*;
+        var n: Needles = .{};
+
+        // DeriveKeyPair: ikm, dkp_prk and the derived key.
+        const ksid = suite.kemSuiteId(X4.kem_id);
+        n.addBytes("ikm", &x4_ikm);
+        var dkp_prk: [HkdfSha512.prk_length]u8 = undefined;
+        suite.labeledExtract(HkdfSha512, &dkp_prk, &ksid, "", "dkp_prk", &x4_ikm);
+        n.addBytes("dkp_prk", &dkp_prk);
+        var kp: X4.KeyPair = undefined;
+        X4.deriveKeyPair(&kp, &x4_ikm);
+        n.addBytes("sk", &kp.secret_key);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("X448 deriveKeyPair", callX4Derive, &n);
+
+        // encap / decap (the DH is the same either side).
+        var dh: [64 + 48]u8 = undefined;
+        try x448.scalarmult(dh[0..56], &x4_eph.secret_key, x4_r.public_key);
+        var ss: [X4.Nsecret]u8 = undefined;
+        try X4.decap(&ss, x4_eph.public_key, &x4_r);
+        n = .{};
+        n.addBytes("skE", &x4_eph.secret_key);
+        n.addBytes("dh", dh[0..56]);
+        addKem(&n, HkdfSha512, X4.kem_id, dh[0..56], &ss);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("X448 encapDeterministic", callX4Encap, &n);
+        n = .{};
+        n.addBytes("skR", &x4_r.secret_key);
+        n.addBytes("dh", dh[0..56]);
+        addKem(&n, HkdfSha512, X4.kem_id, dh[0..56], &ss);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("X448 decap", callX4Decap, &n);
+
+        // Auth modes: dh || dh2.
+        var adh: [112]u8 = undefined;
+        adh[0..56].* = dh[0..56].*;
+        try x448.scalarmult(adh[56..112], &x4_s.secret_key, x4_r.public_key);
+        var ass: [X4.Nsecret]u8 = undefined;
+        try X4.authDecap(&ass, x4_eph.public_key, &x4_r, x4_s.public_key);
+        n = .{};
+        n.addBytes("skE", &x4_eph.secret_key);
+        n.addBytes("skS", &x4_s.secret_key);
+        n.addBytes("dh", adh[0..56]);
+        n.addBytes("dh2", adh[56..]);
+        addKem(&n, HkdfSha512, X4.kem_id, &adh, &ass);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("X448 authEncapDeterministic", callX4AuthEncap, &n);
+        n = .{};
+        n.addBytes("skR", &x4_r.secret_key);
+        n.addBytes("dh", adh[0..56]);
+        n.addBytes("dh2", adh[56..]);
+        addKem(&n, HkdfSha512, X4.kem_id, &adh, &ass);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("X448 authDecap", callX4AuthDecap, &n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

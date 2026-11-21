@@ -1484,7 +1484,11 @@ path secrets and HPKE are the `hpke` module's rows.
 
 **Dead-stack probes** — `src/stackprobe_test.zig` (ReleaseFast) probes every
 public entry point that handles secrets for residue on the dead stack
-(`src/burn.zig` zeroes it); 0 residues expected.
+(`src/burn.zig` zeroes it), `Group.protectApplication` / `unprotectApplication`
+included (the epoch's secret tree, the sender's application ratchet and its
+key and nonce as needles); `createSuccessor` is `create` plus the resumption
+PSK, both probed on their own (`Group.create`, `keyschedule.pskSecret`). 0
+residues expected.
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
