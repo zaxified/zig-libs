@@ -202,6 +202,10 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+test {
+    _ = @import("fuzz_test.zig");
+}
+
 const testing = std.testing;
 
 fn hex(comptime s: []const u8) [s.len / 2]u8 {

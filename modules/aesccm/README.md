@@ -29,4 +29,4 @@ plaintext buffer is zeroed on it).
 Verified against NIST SP 800-38C Appendix C, RFC 3610's packet vectors and an
 OpenSSL KAT table (`tools/ccm_kats.py`). See `SPEC.md`.
 
-Provenance: original work of the zig-libs authors (MIT), implemented directly from RFC 3610 and NIST SP 800-38C.
+Provenance: original work of the zig-libs authors (MIT), implemented directly from RFC 3610 and NIST SP 800-38C. Test data: the RFC 3610 and SP 800-38C example vectors (reproduced from those public documents), and a KAT table observed from OpenSSL (Python `cryptography` AESCCM) run as a black-box oracle by `tools/ccm_kats.py`.

@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz none · ct 2026-11-21 (ctgrind `aead`: key and plaintext tainted through seal / open / tampered open, AES-128 and AES-256, tags 8 and 16)
+**Hardening:** fuzz none (harness `aesccm-open` added 2026-11-21, not yet budget-run) · ct 2026-11-21 (ctgrind `aead`: key and plaintext tainted through seal / open / tampered open, AES-128 and AES-256, tags 8 and 16)
 
 **Performance:** not measured
 
@@ -74,7 +74,8 @@ additional data) are public. Machine-checked by `scripts/checks/ctgrind.sh aescc
 
 ## Verification
 
-`scripts/modtest aesccm`: the vectors above, every single-bit flip of ciphertext and tag rejected with the plaintext
+`scripts/modtest aesccm`: the vectors above, the fuzz harness `aesccm-open` (`src/fuzz_test.zig`, `AESCCM_FUZZ=<runs>`;
+four profiles, genuine opened, damaged ciphertext / tag / AD / nonce / truncation refused with the buffer zeroed), every single-bit flip of ciphertext and tag rejected with the plaintext
 zeroed, additional data / nonce changes rejected, the boundary errors. `scripts/checks/ctgrind.sh aesccm`: target
 `aead`. The card's `**Audit:**` line is the current review/mutation score.
 
