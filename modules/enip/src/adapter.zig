@@ -48,13 +48,13 @@
 //!   and 10 (external access), returned in the order the request asked for
 //!   them, resuming across replies through `partial_transfer` when the whole
 //!   list does not fit one message.
+//! * class 0x6C, the **Template Object**, for the user-defined types of
+//!   `Config.udts`: `Get_Attribute_List` (attributes 1, 2, 4, 5) and the
+//!   template read, so a structure tag reads as named members.
 //!
 //! Deliberately absent, because a simulator that pretends otherwise is worse
 //! than one with an honest edge:
 //!
-//! * the **Template Object** (class 0x6C) and therefore user-defined types —
-//!   `TagBinding.isEnumerable` explains why struct-typed bindings are left
-//!   out of the list rather than advertised and then unexplainable;
 //! * **program-scoped tags**: there are no `Program:` symbols, so a tool that
 //!   asks for a program's scope gets an empty list, and the Program Name
 //!   object names one program that owns nothing;
@@ -82,14 +82,49 @@ pub const Error = error{
     BufferTooSmall,
 };
 
+/// One member of a user-defined type (a Template Object member, 8 octets on
+/// the wire: info, type word, offset).
+pub const UdtMember = struct {
+    name: []const u8,
+    /// The member's atomic type, or `.structure` for a nested UDT (then `udt`
+    /// is set). Strings and bit members are not modelled: give them as the
+    /// `sint`/`dint` host they sit in.
+    type: types.DataType,
+    /// For `.structure`: the nested UDT (its template instance id goes into
+    /// the type word).
+    udt: ?*const Udt = null,
+    /// 0 for a scalar, else the array length.
+    array_len: u16 = 0,
+    /// Offset of the member in the structure, in octets.
+    offset: u32,
+};
+
+/// A user-defined type, served by the Template Object (class 0x6C). `id` is
+/// the template instance number (1..4095, what the symbol type word carries
+/// in its low 12 bits); `handle` the structure handle a Read Tag of a tag of
+/// this type reports (a CRC of the definition on a real controller).
+pub const Udt = struct {
+    id: u16,
+    name: []const u8,
+    handle: u16,
+    /// Size of one value in octets.
+    size: u32,
+    members: []const UdtMember,
+};
+
 /// One tag this adapter serves.
 pub const TagBinding = struct {
     name: []const u8,
     type: types.DataType,
     /// The tag's octets. Element count is `bytes.len / type.elementSize()`.
     bytes: []u8,
+    /// The tag's user-defined type, for `type == .structure`: the tag is then
+    /// listed with the structure bit and the template id, and a Read Tag
+    /// carries the handle. The `Udt` must also be in `Config.udts`.
+    udt: ?*const Udt = null,
 
     pub fn elementSize(self: TagBinding) usize {
+        if (self.udt) |u| return @max(1, u.size);
         return self.type.elementSize() orelse 1;
     }
 
@@ -102,17 +137,17 @@ pub const TagBinding = struct {
     ///
     /// Only types with a **known fixed element size** are enumerated, because
     /// only for those is the element count recoverable from `bytes.len` — the
-    /// adapter stores octets and nothing else. That excludes the structured
-    /// codes (`structure`, `abbreviated_structure`), and excluding them is
-    /// deliberate rather than incidental: advertising a struct-typed symbol
-    /// promises a Template Object (class 0x6C) describing its members, and
-    /// this adapter does not implement one. It also excludes the strings and
-    /// `date_and_time`, whose width `DataType.elementSize` refuses to guess.
+    /// adapter stores octets and nothing else. A structure is known by its
+    /// `udt` (its size is the type's, and the Template Object describes its
+    /// members); one without a `udt` is left out, because advertising a
+    /// struct-typed symbol promises that description. The strings and
+    /// `date_and_time` are excluded too, their width `DataType.elementSize`
+    /// refuses to guess.
     ///
     /// A non-enumerable binding is still fully readable and writable **by
     /// name** — it is invisible to discovery, not absent from the device.
     pub fn isEnumerable(self: TagBinding) bool {
-        return self.type.elementSize() != null;
+        return self.udt != null or self.type.elementSize() != null;
     }
 
     /// Array dimensions this binding advertises: 0 (a scalar) or 1.
@@ -128,11 +163,13 @@ pub const TagBinding = struct {
 
     /// The Symbol Object's attribute 2, the `symbol_type` word: the atomic
     /// type code in the low octet, the number of array dimensions in bits
-    /// 13-14. Bit 15 (structure) and bit 12 (system tag) are always clear
-    /// here — see `isEnumerable` for why there is no structure case.
+    /// 13-14. A structure sets bit 15 and carries its template id in the low
+    /// 12 bits; bit 12 (system tag) is always clear.
     pub fn symbolType(self: TagBinding) u16 {
+        const dims = @as(u16, self.dimensionCount()) << 13;
+        if (self.udt) |u| return 0x8000 | (u.id & 0x0FFF) | dims;
         const code: u16 = @truncate(@backingInt(self.type));
-        return (code & 0x00FF) | (@as(u16, self.dimensionCount()) << 13);
+        return (code & 0x00FF) | dims;
     }
 };
 
@@ -171,6 +208,12 @@ pub const Config = struct {
     /// (speed, flags, MAC address). Served by default; `null` withholds it.
     /// It is read-only: `Set_Attribute_Single` on it is `service_not_supported`.
     ethernet_link: ?stdobj.EthLinkConfig = .{},
+    /// The user-defined types the **Template Object** (class 0x6C) serves,
+    /// one instance each (`Udt.id`): `Get_Attribute_List` of attributes 1, 2,
+    /// 4 and 5 and `Read Tag` of the member definitions, which is how a
+    /// Logix driver turns a structure read into named members. Empty
+    /// withholds the class.
+    udts: []const Udt = &.{},
     /// The **Assembly** object (class 0x04): the instances a scanner reads
     /// (and, where `writable`, writes) as raw octets. Empty by default, which
     /// withholds the class (`path_destination_unknown`); with at least one
@@ -399,6 +442,12 @@ pub const Adapter = struct {
         switch (req.service) {
             @backingInt(cip.Service.multiple_service_packet) => return self.multipleService(req, out, depth),
             @backingInt(cip.Service.get_attributes_all) => return self.getAttributesAll(req, class, out),
+            @backingInt(cip.Service.get_attribute_list) => {
+                if (class != null and class.? == @backingInt(cip.ClassCode.template)) {
+                    return self.templateAttributeList(req, out);
+                }
+                return errorReply(req.service, .service_not_supported, out);
+            },
             @backingInt(cip.Service.get_attribute_single) => return self.getAttributeSingle(req, class, out),
             @backingInt(cip.Service.set_attribute_single) => {
                 if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
@@ -431,7 +480,14 @@ pub const Adapter = struct {
                 }
                 return errorReply(req.service, .service_not_supported, out);
             },
-            cip.LogixService.read_tag => return self.readTag(req, false, out),
+            // 0x4C is Read Tag on a symbol and Read Template on the Template
+            // Object: the class in the path decides.
+            cip.LogixService.read_tag => {
+                if (class != null and class.? == @backingInt(cip.ClassCode.template)) {
+                    return self.templateRead(req, out);
+                }
+                return self.readTag(req, false, out);
+            },
             cip.LogixService.read_tag_fragmented => return self.readTag(req, true, out),
             cip.LogixService.write_tag => return self.writeTag(req, false, out),
             cip.LogixService.write_tag_fragmented => return self.writeTag(req, true, out),
@@ -1024,6 +1080,146 @@ pub const Adapter = struct {
         }).encode(out) catch error.BufferTooSmall;
     }
 
+    // ── the Template Object (class 0x6C) ──────────────────────────────────
+
+    /// What a Template Object reads as: the member definitions (8 octets
+    /// each: `info` = array length, `type` = the symbol type word, `offset`),
+    /// then the template name with its `;n` suffix and the member names, each
+    /// NUL-terminated, and NULs up to the length the definition size
+    /// (attribute 4, in 32-bit words, less the 23 octets a Logix controller
+    /// does not return) promises. Written into `out`; null when it does not
+    /// fit.
+    fn templateBytes(u: *const Udt, out: []u8) ?[]const u8 {
+        var n: usize = 0;
+        for (u.members) |m| {
+            if (out.len < n + 8) return null;
+            const ty: u16 = if (m.udt) |nested|
+                0x8000 | (nested.id & 0x0FFF)
+            else
+                @as(u16, @truncate(@backingInt(m.type))) & 0x00FF;
+            const type_word = ty | (if (m.array_len > 0) @as(u16, 0x2000) else 0);
+            std.mem.writeInt(u16, out[n..][0..2], m.array_len, .little);
+            std.mem.writeInt(u16, out[n + 2 ..][0..2], type_word, .little);
+            std.mem.writeInt(u32, out[n + 4 ..][0..4], m.offset, .little);
+            n += 8;
+        }
+        if (out.len < n + u.name.len + 3) return null;
+        @memcpy(out[n..][0..u.name.len], u.name);
+        n += u.name.len;
+        out[n] = ';';
+        out[n + 1] = 'n';
+        out[n + 2] = 0;
+        n += 3;
+        for (u.members) |m| {
+            if (out.len < n + m.name.len + 1) return null;
+            @memcpy(out[n..][0..m.name.len], m.name);
+            n += m.name.len;
+            out[n] = 0;
+            n += 1;
+        }
+        const padded = templateLen(n);
+        if (out.len < padded) return null;
+        @memset(out[n..padded], 0);
+        return out[0..padded];
+    }
+
+    /// The template read length for `n` octets of definition: the least
+    /// length that makes `(n + 23)` a whole number of 32-bit words, which is
+    /// what attribute 4 can express.
+    fn templateLen(n: usize) usize {
+        const words = (n + 23 + 3) / 4;
+        return words * 4 - 23;
+    }
+
+    fn findTemplate(self: *const Adapter, path: []const u8) ?*const Udt {
+        const id = (epath.findLogical(path, .instance) catch null) orelse return null;
+        for (self.cfg.udts) |*u| {
+            if (u.id == id) return u;
+        }
+        return null;
+    }
+
+    /// `Get_Attribute_List` (0x03) on a template instance: attributes 1
+    /// (structure handle, UINT), 2 (member count, UINT), 4 (definition size in
+    /// 32-bit words, UDINT) and 5 (structure size in octets, UDINT). The reply
+    /// is the count, then per attribute its id, a status (0, or 0x14 for one
+    /// that is not served, with no value) and the value.
+    fn templateAttributeList(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        const u = self.findTemplate(req.path) orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        if (req.data.len < 2) return errorReply(req.service, .not_enough_data, out);
+        const count = std.mem.readInt(u16, req.data[0..2], .little);
+        if (req.data.len < 2 + @as(usize, count) * 2) return errorReply(req.service, .not_enough_data, out);
+        var scratch: [4096]u8 = undefined;
+        const body_len = templateBytes(u, &scratch) orelse return errorReply(req.service, .reply_data_too_large, out);
+        const def_words: u32 = @intCast((body_len.len + 23) / 4);
+
+        var body: [128]u8 = undefined;
+        std.mem.writeInt(u16, body[0..2], count, .little);
+        var n: usize = 2;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const attr = std.mem.readInt(u16, req.data[2 + i * 2 ..][0..2], .little);
+            if (n + 4 + 4 > body.len) return errorReply(req.service, .reply_data_too_large, out);
+            std.mem.writeInt(u16, body[n..][0..2], attr, .little);
+            switch (attr) {
+                1 => {
+                    std.mem.writeInt(u16, body[n + 2 ..][0..2], 0, .little);
+                    std.mem.writeInt(u16, body[n + 4 ..][0..2], u.handle, .little);
+                    n += 6;
+                },
+                2 => {
+                    std.mem.writeInt(u16, body[n + 2 ..][0..2], 0, .little);
+                    std.mem.writeInt(u16, body[n + 4 ..][0..2], @intCast(u.members.len), .little);
+                    n += 6;
+                },
+                4 => {
+                    std.mem.writeInt(u16, body[n + 2 ..][0..2], 0, .little);
+                    std.mem.writeInt(u32, body[n + 4 ..][0..4], def_words, .little);
+                    n += 8;
+                },
+                5 => {
+                    std.mem.writeInt(u16, body[n + 2 ..][0..2], 0, .little);
+                    std.mem.writeInt(u32, body[n + 4 ..][0..4], u.size, .little);
+                    n += 8;
+                },
+                else => {
+                    std.mem.writeInt(u16, body[n + 2 ..][0..2], @backingInt(cip.GeneralStatus.attribute_not_supported), .little);
+                    n += 4;
+                },
+            }
+        }
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = body[0..n],
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// Read Template (0x4C on class 0x6C): `UDINT offset, UINT count` in, the
+    /// definition octets from there out, as `partial_transfer` when they do not
+    /// fit one reply.
+    fn templateRead(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        const u = self.findTemplate(req.path) orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        if (req.data.len < 6) return errorReply(req.service, .not_enough_data, out);
+        const offset = std.mem.readInt(u32, req.data[0..4], .little);
+        const want = std.mem.readInt(u16, req.data[4..6], .little);
+        var scratch: [4096]u8 = undefined;
+        const all = templateBytes(u, &scratch) orelse return errorReply(req.service, .reply_data_too_large, out);
+        if (offset > all.len) return errorReply(req.service, .invalid_parameter_value, out);
+        const room = @min(self.cfg.max_reply, out.len) -| 8;
+        const avail = all[offset..];
+        const give = @min(@min(avail.len, want), room);
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = if (give < @min(avail.len, want)) .partial_transfer else .success,
+            .additional_status = &.{},
+            .data = avail[0..give],
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
     // ── tag services ───────────────────────────────────────────────────────
 
     /// The binding a request path names, addressed either way a Logix client
@@ -1110,7 +1306,11 @@ pub const Adapter = struct {
         const partial = give < want;
 
         var body: [4096]u8 = undefined;
-        const td = types.TagData{ .type = tag.type, .data = tag.bytes[start..][0..give] };
+        const td = types.TagData{
+            .type = tag.type,
+            .structure_handle = if (tag.udt) |u| u.handle else null,
+            .data = tag.bytes[start..][0..give],
+        };
         const encoded = td.encode(&body) catch return error.BufferTooSmall;
         self.reads += 1;
         return (cip.Reply{

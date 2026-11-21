@@ -320,10 +320,9 @@ layout never depends on Zig's bitfield-packing rules.
   high enough — a device that hands ids out and then refuses them browses and
   cannot be read.
 
-  The boundary is deliberate and narrow: **no Template Object (`0x6C`)**, so
-  struct-typed bindings are left out of the uploaded list rather than
-  advertised as something whose layout cannot then be described; no
-  program-scoped tags; no other Symbol Object attribute or service. A
+  The boundary is deliberate and narrow: no program-scoped tags; no other Symbol Object attribute or
+  service. A struct-typed binding is listed only when it names its `Udt` (`TagBinding.udt`): the Template Object below
+  describes it. One without a `udt` stays out of the list (readable by name). A
   one-element binding is advertised as a scalar, because `TagBinding` does not
   distinguish `DINT` from `DINT[1]`, and multi-dimensional arrays are
   advertised flat. It is a discoverable simulator, not a ControlLogix model.
@@ -430,8 +429,10 @@ client sends.
 - **Port segments beyond `01 00`.** The extended-link-address form (`0x10 | port`, size, address) and the extended-port
   escape (`0x0F`, 16-bit port) are decoded and re-encoded from the documented layout.
 - **Network segments and the electronic key.** Decoded and re-encoded from the documented layouts.
-- **Structure (UDT) reads.** The `0x02A0` + handle shape is implemented and tested from the specification; the simulator
-  serves no UDTs, so no captured structure read exists. This is the largest self-derived area (see *Backlog / deferred*).
+- **Structure (UDT) reads.** The `0x02A0` + handle shape is implemented from the specification; a stock `pycomm3`
+  (1.2.16) reads structures of the simulator, with their templates, through `tools/udt_serve.zig` + `tools/udt_oracle.py`
+  (nested types, arrays, handle; external, live, not a capture). The member layout and the template name's `;n` suffix
+  are what pycomm3's parser accepts; they are not checked against a controller's own bytes.
 - **Sequenced Address items and the sockaddr-info items.** Codecs only; implicit I/O was never exercised.
 - **CIP data types beyond INT, DINT, REAL and SHORT_STRING.** Round-trip tested against their documented codes and widths.
 - **`Get_Attribute_List` / `Set_Attribute_List`.** Encoders and a reply iterator built from the specification.
@@ -554,9 +555,6 @@ containment, not confidentiality or integrity against an active attacker:
 
 ## Backlog / deferred
 
-- **Logix Template Object (0x6C) and UDT member decoding.** The first thing a pycomm3 user hits (structures read as named
-  members); it would also let the adapter advertise struct-typed tags, which are left out of the uploaded tag list today.
-  Medium effort, fits CONVENTIONS §2. Ranked first by the survey.
 - **Implicit I/O connection engine (Class 0/1, UDP 2222).** The Sequenced Address item (`0x8002`) and the Sockaddr Info
   items (`0x8000`/`0x8001`) encode and decode and `Forward_Open` carries the parameters an I/O connection needs, but
   there is no cyclic producer, no RPI timer, no connection watchdog, no sequence-number gap detection, no multicast group
@@ -571,6 +569,10 @@ containment, not confidentiality or integrity against an active attacker:
   (`0xF5`), Ethernet Link (`0xF6`) and, when `Config.assemblies` is non-empty, Assembly (`0x04`) objects and no other
   class. The Message Router, Connection, Port (`0xF4`) and Connection Configuration objects are named in `ClassCode` and
   not implemented on the target side (a client can address any of them with the generic attribute services).
+
+## Template Object and user-defined types
+
+`Config.udts` (`adapter.Udt`: template instance `id` 1..4095, `name`, structure `handle`, `size`, `members`) makes the adapter serve the **Template Object** (class 0x6C, one instance per type): `Get_Attribute_List` (0x03) answers attributes 1 (structure handle, UINT), 2 (member count, UINT), 4 (definition size in 32-bit words, UDINT) and 5 (structure size in octets, UDINT) as count, then per attribute id + status + value (0x14 and no value for one not served); `Read Template` (0x4C on this class, where it is Read Tag on a symbol) returns the definition from `offset` for `count` octets, as `partial_transfer` when the reply cannot hold them. The definition is one 8-octet descriptor per member (`UINT info` = array length, `UINT type` = the symbol type word, `UDINT offset`; an array sets bit 13, a nested type is `0x8000 | template id`), then the template name with the `;n` suffix and the member names, each NUL-terminated, padded with NULs so that `length + 23` is a whole number of words (a driver reads `4 * words - 23` octets). `TagBinding.udt` marks a structure tag: the Symbol Object lists it with the symbol type word `0x8000 | id`, and Read Tag answers `0x02A0` + the handle + the octets. Members are atomic types, arrays of them and nested types; strings and BOOL bit members are not modelled (give the host `SINT`/`DINT`). Checked live against `pycomm3` 1.2.16 (`tools/udt_oracle.py` against `tools/udt_serve.zig`).
 
 ## Anchoring
 

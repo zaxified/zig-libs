@@ -88,9 +88,10 @@ fleet-simulation target.
   open a session and upload the tag list off it — the Program Name object
   (`0x64`) and the Symbol Object's `Get_Instance_Attribute_List` (`0x6B` /
   `0x55`) are served, so tags are discovered rather than configured in. The
-  boundary is deliberate: no Template Object (`0x6C`), so struct-typed
-  bindings stay out of the uploaded list (they remain readable by name), and
-  there are no program-scoped tags. See SPEC.md.
+  boundary is deliberate: there are no program-scoped tags. User-defined types are served through the
+  **Template Object** (`0x6C`): give the adapter `Config.udts` and bind a tag with `.type = .structure, .udt = &udt`,
+  and a stock `pycomm3.LogixDriver` lists it, fetches the template and reads the structure as named members
+  (nested types and arrays included). See SPEC.md.
   It also serves the **TCP/IP Interface object** (`0xF5`, instance 1) scanners
   and commissioning tools read: status, configuration capability and control,
   the physical link path, the interface configuration (address, mask, gateway,
@@ -118,7 +119,7 @@ fleet-simulation target.
 
 ## Not provided
 
-No implicit (Class 0/1) I/O engine, no Template Object or UDT member decoding, no CIP Safety, Sync or Security, no
+No implicit (Class 0/1) I/O engine, no UDT member decoding on the client side, no CIP Safety, Sync or Security, no
 PCCC. See SPEC.md, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Use

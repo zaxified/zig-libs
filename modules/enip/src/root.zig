@@ -3395,3 +3395,144 @@ test "assembly object: the client and the adapter, round trip" {
     try testing.expectError(error.CipError, c.getAttributesAll(class, 100));
     try testing.expectEqualSlices(u8, &.{ 3, 0 }, try c.getAttributeSingle(class, 0, 3));
 }
+
+// ── the Template Object and user-defined types ─────────────────────────────
+
+const udt_pump_members = [_]adapter.UdtMember{
+    .{ .name = "Speed", .type = .real, .offset = 0 },
+    .{ .name = "Count", .type = .dint, .offset = 4 },
+    .{ .name = "Flags", .type = .sint, .array_len = 4, .offset = 8 },
+};
+const udt_pump: adapter.Udt = .{ .id = 1, .name = "Pump", .handle = 0x1234, .size = 12, .members = &udt_pump_members };
+const udt_plant_members = [_]adapter.UdtMember{
+    .{ .name = "P1", .type = .structure, .udt = &udt_pump, .offset = 0 },
+    .{ .name = "Total", .type = .dint, .offset = 12 },
+};
+const udt_plant: adapter.Udt = .{ .id = 2, .name = "Plant", .handle = 0x4321, .size = 16, .members = &udt_plant_members };
+
+fn templateRig(motor: []u8, plant: []u8) struct { tags: [2]TagBinding, udts: [2]adapter.Udt } {
+    return .{
+        .tags = .{
+            .{ .name = "Motor", .type = .structure, .bytes = motor, .udt = &udt_pump },
+            .{ .name = "Site", .type = .structure, .bytes = plant, .udt = &udt_plant },
+        },
+        .udts = .{ udt_pump, udt_plant },
+    };
+}
+
+fn templateRequest(service: u8, template_id: u8, data: []const u8, out: []u8) []const u8 {
+    var pb: [8]u8 = undefined;
+    const path = epath.logicalPath(@backingInt(cip.ClassCode.template), template_id, null, &pb) catch unreachable;
+    return (cip.Request{ .service = service, .path = path, .data = data }).encode(out) catch unreachable;
+}
+
+test "template object: attributes, the member definitions and the structure tag listing" {
+    var motor: [12]u8 = @splat(0);
+    var plant: [16]u8 = @splat(0);
+    var rig = templateRig(&motor, &plant);
+    var target = Adapter.init(.{ .udts = &rig.udts }, &rig.tags);
+    var rq: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+
+    // The tag list reports both as structures with their template ids.
+    var recs: [4]SymbolRecord = undefined;
+    const list = try cip.Reply.decode(try target.messageRouter(symbolListRequest(0, &rq), &out));
+    try testing.expectEqual(@as(usize, 2), try parseSymbolRecords(list.data, &recs));
+    try testing.expectEqual(@as(u16, 0x8001), recs[0].symbol_type);
+    try testing.expectEqual(@as(u16, 0x8002), recs[1].symbol_type);
+
+    // A Read Tag answers with the structure type code, the handle, the data.
+    var rt: [48]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    var sb = epath.Builder.init(&pb);
+    try sb.symbol("Motor");
+    motor[4] = 7;
+    const read = try cip.Reply.decode(try target.messageRouter(
+        try (cip.Request{ .service = cip.LogixService.read_tag, .path = sb.bytes(), .data = &.{ 1, 0 } }).encode(&rt),
+        &out,
+    ));
+    try testing.expectEqual(cip.GeneralStatus.success, read.general_status);
+    const td = try types.TagData.decode(read.data);
+    try testing.expectEqual(types.DataType.structure, td.type);
+    try testing.expectEqual(@as(?u16, 0x1234), td.structure_handle);
+    try testing.expectEqual(@as(u8, 7), td.data[4]);
+
+    // Get_Attribute_List: 4 (definition size), 5 (size), 2 (members), 1 (handle), 3 (not served).
+    const want = [_]u16{ 5, 4, 5, 2, 1, 3 };
+    var ad: [14]u8 = undefined;
+    std.mem.writeInt(u16, ad[0..2], 5, .little);
+    for (want[1..], 0..) |a, i| std.mem.writeInt(u16, ad[2 + i * 2 ..][0..2], a, .little);
+    const attrs = try cip.Reply.decode(try target.messageRouter(templateRequest(@backingInt(cip.Service.get_attribute_list), 1, ad[0..12], &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, attrs.general_status);
+    const d = attrs.data;
+    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, d[0..2], .little));
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, d[2..4], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, d[4..6], .little));
+    const def_words = std.mem.readInt(u32, d[6..10], .little);
+    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, d[10..12], .little));
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, d[14..18], .little));
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, d[18..20], .little));
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, d[22..24], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, d[24..26], .little));
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, d[28..30], .little));
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, d[30..32], .little)); // attribute 3 ...
+    try testing.expectEqual(@as(u16, 0x14), std.mem.readInt(u16, d[32..34], .little)); // ... not supported
+    try testing.expectEqual(@as(usize, 34), d.len);
+
+    // Read Template: the whole definition in one reply, as the driver asks (4 * words - 23 octets).
+    var rd: [6]u8 = undefined;
+    std.mem.writeInt(u32, rd[0..4], 0, .little);
+    std.mem.writeInt(u16, rd[4..6], @intCast(def_words * 4 - 23), .little);
+    const tpl = try cip.Reply.decode(try target.messageRouter(templateRequest(cip.LogixService.read_tag, 1, &rd, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, tpl.general_status);
+    try testing.expectEqual(@as(usize, def_words * 4 - 23), tpl.data.len);
+    // Three members, 8 octets each: info, type word, offset.
+    const t = tpl.data;
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, t[0..2], .little));
+    try testing.expectEqual(@as(u16, 0x00CA), std.mem.readInt(u16, t[2..4], .little)); // REAL
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, t[12..16], .little)); // Count's offset
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, t[16..18], .little)); // Flags[4]
+    try testing.expectEqual(@as(u16, 0x20C2), std.mem.readInt(u16, t[18..20], .little)); // SINT array
+    try testing.expectEqualStrings("Pump;n", std.mem.sliceTo(t[24..], 0));
+    var names = std.mem.splitScalar(u8, t[24..], 0);
+    try testing.expectEqualStrings("Pump;n", names.next().?);
+    try testing.expectEqualStrings("Speed", names.next().?);
+    try testing.expectEqualStrings("Count", names.next().?);
+    try testing.expectEqualStrings("Flags", names.next().?);
+    while (names.next()) |rest| try testing.expectEqual(@as(usize, 0), rest.len); // only padding left
+
+    // A nested UDT's member carries the template id and the structure bit.
+    const tpl2 = try cip.Reply.decode(try target.messageRouter(templateRequest(cip.LogixService.read_tag, 2, &rd, &rq), &out));
+    try testing.expectEqual(@as(u16, 0x8001), std.mem.readInt(u16, tpl2.data[2..4], .little));
+
+    // Unknown template; an offset past the end.
+    const none = try cip.Reply.decode(try target.messageRouter(templateRequest(cip.LogixService.read_tag, 9, &rd, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, none.general_status);
+    std.mem.writeInt(u32, rd[0..4], 4000, .little);
+    const past = try cip.Reply.decode(try target.messageRouter(templateRequest(cip.LogixService.read_tag, 1, &rd, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.invalid_parameter_value, past.general_status);
+}
+
+test "template object: a definition too big for one reply continues through partial_transfer" {
+    var motor: [12]u8 = @splat(0);
+    var plant: [16]u8 = @splat(0);
+    var rig = templateRig(&motor, &plant);
+    var target = Adapter.init(.{ .udts = &rig.udts, .max_reply = 40 }, &rig.tags);
+    var rq: [64]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var all: [128]u8 = undefined;
+    var got: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 10) : (rounds += 1) {
+        var rd: [6]u8 = undefined;
+        std.mem.writeInt(u32, rd[0..4], @intCast(got), .little);
+        std.mem.writeInt(u16, rd[4..6], 200, .little);
+        const r = try cip.Reply.decode(try target.messageRouter(templateRequest(cip.LogixService.read_tag, 1, &rd, &rq), &out));
+        @memcpy(all[got..][0..r.data.len], r.data);
+        got += r.data.len;
+        if (r.general_status == .success) break;
+        try testing.expectEqual(cip.GeneralStatus.partial_transfer, r.general_status);
+    }
+    try testing.expect(rounds > 0 and rounds < 10);
+    try testing.expectEqualStrings("Pump;n", std.mem.sliceTo(all[24..got], 0));
+}
