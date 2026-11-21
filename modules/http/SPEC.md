@@ -326,7 +326,8 @@ forwarded by `connMain`; working memory from the stream's arena only for a gzip 
   reference: Go `ServeTLS`, dusty, zzz). Each accepted connection runs a `tlsserver` handshake over the raw socket
   (the stall, head and write timeouts apply to it; a per-connection CSPRNG seeded from the OS replaces
   `Config.random`), then the HTTP/1.1 loop, or the HTTP/2 loop when ALPN chose `h2`, with the same handler, caps and
-  hooks as plain HTTP. `Config.alpn_protocols` decides the version (leave `h2` out for HTTP/1.1 only). The loops
+  hooks as plain HTTP; `Request.is_tls` is true there (and for `serveByAlpn`, `StreamOptions.is_tls`, `h2_server.Options.is_tls`; the transport the
+  server itself saw, so false behind a TLS-terminating proxy). `Config.alpn_protocols` decides the version (leave `h2` out for HTTP/1.1 only). The loops
   read and write through adapters with a buffer of their own, because `tlsserver`'s zero-copy reader and writer cannot
   hand out a request line or a chunk cut by a record boundary. `close_notify` is sent at the end. The TLS record
   buffers (about 16 KiB in; out: the first handshake flight, `tlsserver.server.minOutputLen` of a fixed

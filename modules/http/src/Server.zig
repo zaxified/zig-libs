@@ -1746,6 +1746,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .error_headers = o.error_headers,
                 .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
                 .peer = peer,
+                .is_tls = tls_sess != null,
                 .max_header_bytes = o.max_header_bytes,
                 .max_body_bytes = o.max_body_bytes,
                 .response_buffer_size = o.response_buffer_size,
@@ -1785,6 +1786,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .error_headers = o.error_headers,
         .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
         .peer = peer,
+        .is_tls = tls_sess != null,
         .max_request_line_bytes = o.max_request_line_bytes,
         .max_body_bytes = o.max_body_bytes,
         .on_conn_state = o.on_conn_state,
@@ -2371,6 +2373,9 @@ pub const StreamOptions = struct {
     /// connection (`Request.peerAddress`); null = unknown (socket-free).
     /// The serving loop always fills it from the accepted socket.
     peer: ?net.IpAddress = null,
+    /// Surfaced as `Request.is_tls` on every request of this stream: set it
+    /// when `in`/`out` are the plaintext side of a TLS connection.
+    is_tls: bool = false,
     /// Request line longer than this → 414 (see `Options`). null = no
     /// extra bound (the head buffer still applies).
     max_request_line_bytes: ?usize = null,
@@ -2853,6 +2858,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .body = &body,
         .context = opts.context,
         .peer = opts.peer,
+        .is_tls = opts.is_tls,
         .conn_request_index = req_index,
         .control = opts.control,
     };
@@ -3131,6 +3137,12 @@ pub const Request = struct {
     context: ?*anyopaque,
     /// Socket peer address — see `peerAddress`.
     peer: ?net.IpAddress = null,
+    /// True when the request arrived over a TLS connection this server
+    /// terminated itself (`Options.tls`, or `serveByAlpn`, whose caller
+    /// handed over the TLS plaintext). False on plain TCP, on a socket-free
+    /// `serveStream` without `StreamOptions.is_tls`, and always behind a
+    /// TLS-terminating proxy: the hop to this server is the transport seen.
+    is_tls: bool = false,
     /// 0-based request ordinal on this connection — see `connRequestIndex`.
     conn_request_index: u32 = 0,
     /// A pending `100 Continue` (h1 `Expect: 100-continue`): the response

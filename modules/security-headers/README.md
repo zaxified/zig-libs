@@ -135,6 +135,16 @@ and registration at <https://hstspreload.org> (it is effectively permanent).
 Like helmet, a `preload` without those two is refused: `init` returns
 `error.InvalidHstsPreload`, and `applyStatic` fails to compile.
 
+RFC 6797 §7.2 says an HSTS host must not send the header over plain HTTP.
+helmet always sends it; unrolled/secure sends it only on a TLS request. Set
+`hsts_if` to send it per request: `.hsts_if = security_headers.onlyTls` sends
+it only on connections `http.Server` terminated as TLS (`Request.is_tls`), and
+behind a TLS-terminating proxy a predicate of your own reads the forwarded
+scheme you trust (`fn (*const http.Server.Request) bool`). The default (null)
+sends it on every response, as helmet does. With a predicate set, `apply`,
+`applyStatic`, `staticHeaders` and `headerList` (no request to ask) leave the
+header out; the middleware and `applyRequest` ask the request.
+
 ## CSP posture (off by default — deliberate)
 
 There is no universally-safe CSP: a browser-app policy and a JSON-API policy
@@ -220,9 +230,9 @@ header entirely, configure `http.Server` with `.server_name = null`.
 ## Not provided
 
 No request-time directive callbacks (the nonce is the explicit
-`applyCspNonce`), no CSP hash helper, no SSL redirect or host allow-list, no
+`applyCspNonce`), no CSP hash helper (not in helmet; compute the digest yourself), no SSL redirect or host allow-list, no
 `Reporting-Endpoints` helper (use `extra`); see SPEC *What is deliberately
-not done* and *Backlog / deferred*.
+not done*.
 
 ## Verification
 

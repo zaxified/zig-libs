@@ -518,10 +518,15 @@ pub fn serveByAlpn(
     s: AlpnServe,
 ) void {
     switch (protocolFromAlpn(negotiated)) {
-        .h2 => h2_server.serveStream(s.gpa, in, out, peer, s.h2),
+        .h2 => {
+            var opts = s.h2;
+            opts.is_tls = true;
+            h2_server.serveStream(s.gpa, in, out, peer, opts);
+        },
         .http11, .unknown => {
             var opts = s.h1;
             opts.peer = peer;
+            opts.is_tls = true;
             Server.serveStream(opts, in, out, s.h1_buffers);
         },
     }

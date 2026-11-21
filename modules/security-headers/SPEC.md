@@ -99,6 +99,14 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
   `renderNonce` refuses a `csp.Nonce` text outside the CSP base64-value alphabet (a hand-built `Nonce` has a
   public `text`) and a `nonce_in` directive that is not a source list or whose list is `'none'`
   (`NonceDirectiveInvalid`), or is absent from the policy (`NonceDirectiveMissing`).
+- **HSTS per request (`Options.hsts_if`).** RFC 6797 §7.2 (MUST NOT over non-secure transport) beats
+  helmet 8.3.0, which always sends it; unrolled/secure and gin-contrib/secure send it on a TLS request only. The
+  default stays helmet's (every response), because a TLS-terminating proxy hides the transport from this
+  server and a silent default would drop the header there. `hsts_if` takes `fn (*const http.Server.Request) bool`;
+  `onlyTls` accepts `Request.is_tls` (set by `http.Server` for `Options.tls`, by `serveByAlpn`, and by
+  `StreamOptions.is_tls` / `h2_server.Options.is_tls` for a caller-terminated TLS). `apply`, `applyStatic`,
+  `staticHeaders` and `headerList` have no request and omit the header when a predicate is set; `applyRequest`
+  and `middleware` ask it.
 - **CSP builder caller lists are linear:** `csp.build` / `render` / `renderNonce` track `remove`, `nonce_in`
   and the per-directive checks with bitmaps over the closed `Name` enum, so a repeated name in `remove` or
   `nonce_in` is idempotent (set semantics) and a `directives` list naming a directive twice is
@@ -117,16 +125,19 @@ Not a WAF or input validator: it only sets response headers, it never inspects o
 - **HSTS** is meaningful only over HTTPS: browsers ignore it over plain HTTP, so shipping it is harmless
   there, but deploying it on a host not actually served via TLS is a caller misconfiguration this module
   cannot detect (and once cached, browsers refuse plain-HTTP access for `max-age`, so `preload` is opt-in and
-  effectively permanent). RFC 6797 §7.2 says an HSTS host must not send the header over plain HTTP; the module
-  does not know the transport (see Backlog).
+  effectively permanent). RFC 6797 §7.2 says an HSTS host must not send the header over plain HTTP: the default
+  (helmet's) sends it on every response; `Options.hsts_if` makes it per request (see Design).
 - **The CSP nonce** is only as good as its use: it must be fresh per response (`applyCspNonce` draws one per
   call), must not be served from a cache shared between users and must not be put into attacker-controllable
   markup; the builder cannot check any of that.
 - **`init`'s byte check is strict.** It counts lent values too, so a configuration over the 4 KiB copy budget
   (a very large CSP) is refused even though the lent values would fit on the wire. Decided (owner delegated,
   safe default): it stays strict; a documented opt-out is added only if a consumer needs a CSP over 4 KiB.
-- **CSP builder checks are partial.** Any quoted token passes (`'selff'`, an empty `'nonce-'`), `'none'`
-  beside other sources is accepted, and a directive outside the `Name` enum needs the raw string (see Backlog).
+- **CSP builder checks are structural, not semantic.** A quoted source must be a CSP3 keyword, a `'nonce-…'`
+  or a `'sha256|384|512-…'` of the digest's length, and `'none'` may not share a list with other sources
+  (a browser ignores both mistakes silently). A keyword the table does not know yet (CSP is still gaining
+  them) and a directive outside the `Name` enum go through the raw string of `Options`. The builder cannot
+  judge whether a policy is *useful*.
 
 ## Verification
 
@@ -178,19 +189,10 @@ Run: `scripts/modtest security-headers`.
 
 - **Reporting-Endpoints / Report-To.** helmet 8.3.0 has none either; reachable through `extra`. Rejected for
   parity.
+- **CSP hash helper (`'sha256-…'` of an inline block).** helmet 8.3.0 has none; a hash is a value the caller
+  gives (`'sha256-…'`, length-checked by the builder).
 - **Request-time directive callbacks, SSL redirect, host allow-list** (see Compared with): the nonce is an
   explicit call, and the others are not response headers.
-
-## Backlog / deferred
-
-- **HSTS only over a secure transport** — RFC 6797 §7.2: an HSTS host MUST NOT send the header over plain HTTP.
-  The module does not know the transport (no `is_tls` on the request); a predicate option
-  (`fn (*const router.Ctx) bool`) would need that flag from `http`.
-- **CSP builder: quoted keywords and `'none'`** — any quoted token passes (`'selff'`, an empty `'nonce-'`),
-  `'none'` beside other sources is accepted, and directives outside the `Name` enum (`fenced-frame-src`,
-  `webrtc`) need the raw string.
-- **CSP hash helper (`'sha256-…'` of an inline block)** — values can be given by hand today; a helper would
-  hash at comptime. Not in helmet 8.3.0. Low priority.
 
 ## Anchoring
 

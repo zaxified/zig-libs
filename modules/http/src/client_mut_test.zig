@@ -275,6 +275,7 @@ fn tlsListenerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror
         for (0..40) |_| try rw.writeAll(&chunk);
         return;
     }
+    if (std.mem.eql(u8, req.path, "/tls")) return rw.writeAll(if (req.is_tls) "tls=1" else "tls=0");
     var total: usize = 0;
     var buf: [4096]u8 = undefined;
     const r = req.reader();
@@ -328,6 +329,16 @@ fn tlsListenerRig(client_h2: bool) !void {
     const url = try std.mem.print(&url_buf, "https://127.0.0.1:{d}/", .{port});
     const big_url = try std.mem.print(url_buf[0..], "https://127.0.0.1:{d}/big", .{port});
 
+    // The request knows its transport (`Request.is_tls`), on h1 and h2.
+    {
+        var tls_buf: [64]u8 = undefined;
+        const tls_url = try std.mem.print(&tls_buf, "https://127.0.0.1:{d}/tls", .{port});
+        var res = try client.request(.get, tls_url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 16);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("tls=1", body);
+    }
     // A body spread over several records, both ways.
     {
         var res = try client.request(.get, big_url, .{});

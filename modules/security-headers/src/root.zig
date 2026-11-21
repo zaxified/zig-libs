@@ -162,6 +162,17 @@ pub const hsts_preload_min_age_s: u64 = 31_536_000;
 pub const Options = struct {
     /// `Strict-Transport-Security`; null = omit. HTTPS-only in effect.
     hsts: ?Hsts = .{},
+    /// Send `Strict-Transport-Security` only on requests this predicate
+    /// accepts; null (the default, helmet's behaviour) = on every response.
+    /// RFC 6797 §7.2: an HSTS host MUST NOT send the header over non-secure
+    /// transport (unrolled/secure and gin-contrib/secure check the request
+    /// the same way; helmet does not). `onlyTls` accepts what this server
+    /// terminated as TLS (`Request.is_tls`); behind a TLS-terminating proxy
+    /// pass a predicate reading the forwarded scheme the deployment trusts.
+    /// Evaluated by `middleware` and `applyRequest`. `apply` (no request) and
+    /// the error-reply lists (`staticHeaders`, `headerList`, which also have
+    /// none) leave the header out when a predicate is set, never guessing.
+    hsts_if: ?*const fn (*const http.Server.Request) bool = null,
     /// `Content-Security-Policy`; **off by default** — no universally-safe
     /// policy exists. See `csp_api` / `csp_helmet_default` for postures.
     content_security_policy: ?[]const u8 = null,
@@ -559,7 +570,13 @@ pub const SecurityHeaders = struct {
         // the response, so a peer-chosen header that an earlier middleware
         // copied (a 200-byte adopted request id) cannot starve this module
         // into a 500 (review GJ RID-1 / SH-A).
-        if (o.hsts != null) try res.setHeader("Strict-Transport-Security", sh.hstsValue());
+        if (o.hsts != null and o.hsts_if == null) try res.setHeader("Strict-Transport-Security", sh.hstsValue());
+        try sh.applyRest(res);
+    }
+
+    /// Every header after HSTS, in wire order.
+    fn applyRest(sh: *const SecurityHeaders, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        const o = &sh.options;
         if (o.content_security_policy) |v| try res.setHeaderBorrowed("Content-Security-Policy", .{ .bytes = v });
         if (o.content_security_policy_report_only) |v| try res.setHeaderBorrowed("Content-Security-Policy-Report-Only", .{ .bytes = v });
         if (o.x_content_type_options) try res.setHeaderStatic("X-Content-Type-Options", "nosniff");
@@ -576,6 +593,15 @@ pub const SecurityHeaders = struct {
         if (o.x_xss_protection) try res.setHeaderStatic("X-XSS-Protection", "0");
         if (o.server) |v| try res.setHeaderBorrowed("Server", .{ .bytes = v });
         for (o.extra) |h| try res.setHeader(h.name, h.value);
+    }
+
+    /// `apply` for one request: `apply`, except that a configured
+    /// `Options.hsts_if` is asked about `req` and the HSTS header is set only
+    /// when it answers true. The `middleware` calls this.
+    pub fn applyRequest(sh: *const SecurityHeaders, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        const o = &sh.options;
+        if (o.hsts != null and (if (o.hsts_if) |f| f(req) else true)) try res.setHeader("Strict-Transport-Security", sh.hstsValue());
+        try sh.applyRest(res);
     }
 
     /// `apply` for a configuration known at compile time: the same header
@@ -611,7 +637,9 @@ pub const SecurityHeaders = struct {
             if (closedSetViolation(&options)) |field|
                 @compileError("security-headers: " ++ field ++ " holds a value outside its closed set (see InitError.InvalidPolicyValue)");
             var list: []const http.Header = &.{};
-            if (options.hsts) |h| list = staticPut(list, "Strict-Transport-Security", hstsStaticValue(h));
+            if (options.hsts) |h| if (options.hsts_if == null) {
+                list = staticPut(list, "Strict-Transport-Security", hstsStaticValue(h));
+            };
             if (options.content_security_policy) |v| list = staticPut(list, "Content-Security-Policy", v);
             if (options.content_security_policy_report_only) |v| list = staticPut(list, "Content-Security-Policy-Report-Only", v);
             if (options.x_content_type_options) list = staticPut(list, "X-Content-Type-Options", "nosniff");
@@ -669,7 +697,7 @@ pub const SecurityHeaders = struct {
     pub fn headerList(sh: *const SecurityHeaders, out: []http.Header) error{NoSpaceLeft}![]const http.Header {
         const o = &sh.options;
         var n: usize = 0;
-        if (o.hsts != null) try listPut(out, &n, "Strict-Transport-Security", sh.hstsValue());
+        if (o.hsts != null and o.hsts_if == null) try listPut(out, &n, "Strict-Transport-Security", sh.hstsValue());
         if (o.content_security_policy) |v| try listPut(out, &n, "Content-Security-Policy", v);
         if (o.content_security_policy_report_only) |v| try listPut(out, &n, "Content-Security-Policy-Report-Only", v);
         if (o.x_content_type_options) try listPut(out, &n, "X-Content-Type-Options", "nosniff");
@@ -726,6 +754,12 @@ pub const SecurityHeaders = struct {
     }
 };
 
+/// `Options.hsts_if` predicate for a server that terminates TLS itself:
+/// true when the request arrived over `http.Server`'s TLS listener.
+pub fn onlyTls(req: *const http.Server.Request) bool {
+    return req.is_tls;
+}
+
 /// Everything `applyCspNonce` / `applyCspWithNonce` can fail with: building
 /// the policy, or writing it onto the response.
 pub const CspNonceError = csp.Error || http.Server.ResponseWriter.SetHeaderError;
@@ -770,7 +804,7 @@ pub fn applyCspNonce(
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const sh: *const SecurityHeaders = @ptrCast(@alignCast(state.?));
-    try sh.apply(ctx.res);
+    try sh.applyRequest(ctx.req, ctx.res);
     return next.run(ctx);
 }
 
@@ -841,6 +875,10 @@ const Writer = std.Io.Writer;
 /// Drive a router through `http.Server.serveStream` with canned wire bytes
 /// (same harness as the router/ratelimit/throttle tests).
 fn runWireNamed(r: *router.Router, bytes: []const u8, out_buf: []u8, server_name: ?[]const u8) []const u8 {
+    return runWireTls(r, bytes, out_buf, server_name, false);
+}
+
+fn runWireTls(r: *router.Router, bytes: []const u8, out_buf: []u8, server_name: ?[]const u8, is_tls: bool) []const u8 {
     var in: Reader = .fixed(bytes);
     var out: Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -851,6 +889,7 @@ fn runWireNamed(r: *router.Router, bytes: []const u8, out_buf: []u8, server_name
         .handler = r.handler(),
         .context = r,
         .server_name = server_name,
+        .is_tls = is_tls,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
@@ -1242,6 +1281,52 @@ test "HSTS: value format for every flag combination" {
 
     const off: SecurityHeaders = try .init(.{ .hsts = null });
     try testing.expectEqualStrings("", off.hstsValue());
+}
+
+test "HSTS predicate: onlyTls sends the header over TLS only (RFC 6797 section 7.2)" {
+    const sh: SecurityHeaders = try .init(.{ .hsts_if = onlyTls });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const plain = runWireTls(&r, wire("/t"), &buf, null, false);
+    try expectStatus(plain, "200");
+    try expectNoHeader(plain, "Strict-Transport-Security");
+    try expectHeaderLine(plain, "X-Frame-Options: DENY"); // the rest is unconditional
+    const tls = runWireTls(&r, wire("/t"), &buf, null, true);
+    try expectHeaderLine(tls, "Strict-Transport-Security: max-age=31536000; includeSubDomains");
+    // HSTS stays the first configured header on the wire.
+    const first = std.mem.find(u8, tls, "\r\n").? + 2;
+    try testing.expect(std.mem.startsWith(u8, tls[first..], "Strict-Transport-Security:"));
+}
+
+fn forwardedHttps(req: *const http.Server.Request) bool {
+    return if (req.header("X-Forwarded-Proto")) |v| std.mem.eql(u8, v, "https") else false;
+}
+
+test "HSTS predicate: a deployment predicate decides; apply and the error lists never guess" {
+    const sh: SecurityHeaders = try .init(.{ .hsts_if = forwardedHttps });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+
+    var buf: [2048]u8 = undefined;
+    const via_proxy = runWireTls(&r, "GET /t HTTP/1.1\r\nHost: t\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n", &buf, null, false);
+    try expectHeaderLine(via_proxy, "Strict-Transport-Security: max-age=31536000; includeSubDomains");
+    const direct = runWireTls(&r, wire("/t"), &buf, null, true); // TLS flag alone is not this predicate
+    try expectNoHeader(direct, "Strict-Transport-Security");
+
+    // No request, no verdict: the HSTS header is left out of every request-free path.
+    var list: [SecurityHeaders.max_header_list_len]http.Header = undefined;
+    for (try sh.headerList(&list)) |h| try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "Strict-Transport-Security"));
+    for (comptime staticHeaders_hsts_if()) |h| try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "Strict-Transport-Security"));
+}
+
+fn staticHeaders_hsts_if() []const http.Header {
+    return SecurityHeaders.staticHeaders(.{ .hsts_if = onlyTls });
 }
 
 test "precedence: a handler's own header replaces the middleware default" {

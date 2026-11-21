@@ -215,6 +215,9 @@ pub const Options = struct {
     now: ?Server.StreamOptions.Now = null,
     /// Socket peer address, surfaced on every `Request` (`peerAddress`).
     peer: ?std.Io.net.IpAddress = null,
+    /// Surfaced as `Request.is_tls` on every request: set when `in`/`out`
+    /// are the plaintext side of a TLS connection (h2 over TLS, ALPN `h2`).
+    is_tls: bool = false,
     /// Bounds one decoded request header list — advertised as
     /// SETTINGS_MAX_HEADER_LIST_SIZE and enforced by the HPACK decoder
     /// (an over-limit block is a connection COMPRESSION_ERROR → GOAWAY;
@@ -2179,6 +2182,7 @@ const Session = struct {
             .trailer_block = trailer_block,
             .context = s.opts.context,
             .peer = s.opts.peer,
+            .is_tls = s.opts.is_tls,
             .conn_request_index = req_index,
             .stream_id = id,
         };

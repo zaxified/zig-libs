@@ -25,6 +25,11 @@
 //!   quotes (`self`, `none`, `unsafe-inline`, ...) is `UnquotedKeyword` --
 //!   in a browser `self` is a host named "self", never the keyword;
 //! - quotes must be balanced (`'self'`), `MalformedQuote` otherwise;
+//! - a quoted source must be a CSP3 keyword, `'nonce-<base64>'` or
+//!   `'sha256|384|512-<base64>'` of the digest's length, else
+//!   `UnknownQuotedSource` (a browser ignores `'selff'`); a directive naming
+//!   `'none'` beside other sources is `NoneWithOtherSources` (CSP3 ignores
+//!   the `'none'`); a directive outside `Name` is given by the raw string;
 //! - a value is one token: no space, no `;` (would start a new directive),
 //!   no `,` (would start a new policy), no control characters, no non-ASCII
 //!   -- `InvalidCharacter`;
@@ -52,6 +57,7 @@ pub const Name = enum {
     object_src,
     child_src,
     frame_src,
+    fenced_frame_src,
     worker_src,
     manifest_src,
     base_uri,
@@ -62,6 +68,7 @@ pub const Name = enum {
     report_to,
     require_trusted_types_for,
     trusted_types,
+    webrtc,
     upgrade_insecure_requests,
     block_all_mixed_content,
 
@@ -69,7 +76,7 @@ pub const Name = enum {
     /// keyword-quoting check and must not be empty.
     fn isSourceList(n: Name) bool {
         return switch (n) {
-            .sandbox, .report_uri, .report_to, .require_trusted_types_for, .trusted_types, .upgrade_insecure_requests, .block_all_mixed_content => false,
+            .sandbox, .report_uri, .report_to, .require_trusted_types_for, .trusted_types, .webrtc, .upgrade_insecure_requests, .block_all_mixed_content => false,
             else => true,
         };
     }
@@ -120,6 +127,13 @@ pub const default_directives = [_]Directive{
 pub const Error = error{
     UnquotedKeyword,
     MalformedQuote,
+    /// A quoted source that is none of the CSP3 keywords, a `'nonce-…'` with
+    /// a base64 value, or a `'sha256|384|512-…'` of the right length
+    /// (`'selff'`, `'nonce-'`, `'sha256-short'`): a browser ignores it.
+    UnknownQuotedSource,
+    /// `'none'` together with other sources: CSP3 ignores the `'none'`, so
+    /// the policy allows what the rest names, never "nothing".
+    NoneWithOtherSources,
     InvalidCharacter,
     EmptyValue,
     EmptyDirective,
@@ -145,6 +159,35 @@ const keywords = [_][]const u8{
     "unsafe-allow-redirects", "allow-duplicates", "inline-speculation-rules", "trusted-types-eval",
 };
 
+/// CSP3 §2.3.1 source expressions that are written in quotes: a keyword
+/// (`keywords`, any case), `nonce-<base64-value>` or
+/// `sha256|384|512-<base64-value>` (the value's length is the digest's, with
+/// or without `=` padding; the alphabet admits base64url too).
+fn knownQuotedSource(inner: []const u8) bool {
+    for (keywords) |k| if (std.ascii.eqlIgnoreCase(k, inner)) return true;
+    if (inner.len > "nonce-".len and std.ascii.eqlIgnoreCase(inner[0.."nonce-".len], "nonce-"))
+        return base64Value(inner["nonce-".len..]) != null;
+    inline for (.{ .{ "sha256-", 32 }, .{ "sha384-", 48 }, .{ "sha512-", 64 } }) |h| {
+        if (inner.len > h[0].len and std.ascii.eqlIgnoreCase(inner[0..h[0].len], h[0])) {
+            const body = base64Value(inner[h[0].len..]) orelse return false;
+            return body == (h[1] * 4 + 2) / 3 or body == (h[1] + 2) / 3 * 4;
+        }
+    }
+    return false;
+}
+
+/// Length of the non-padding part when `t` is a CSP `base64-value`
+/// (`1*( ALPHA / DIGIT / "+" / "/" / "-" / "_" ) *2"="`), else null.
+fn base64Value(t: []const u8) ?usize {
+    var end = t.len;
+    while (end > 0 and t[end - 1] == '=') end -= 1;
+    if (t.len - end > 2 or end == 0) return null;
+    for (t[0..end]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '-' or c == '_')) return null;
+    }
+    return end;
+}
+
 fn checkValue(name: Name, v: []const u8) Error!void {
     if (v.len == 0) return error.EmptyValue;
     for (v) |c| {
@@ -155,7 +198,9 @@ fn checkValue(name: Name, v: []const u8) Error!void {
     const q_last = v[v.len - 1] == '\'';
     if (q_first or q_last) {
         if (v.len < 2 or !q_first or !q_last) return error.MalformedQuote;
-        if (std.mem.findScalar(u8, v[1 .. v.len - 1], '\'') != null) return error.MalformedQuote;
+        const inner = v[1 .. v.len - 1];
+        if (std.mem.findScalar(u8, inner, '\'') != null) return error.MalformedQuote;
+        if (!knownQuotedSource(inner)) return error.UnknownQuotedSource;
         return;
     }
     for (keywords) |k| if (std.ascii.eqlIgnoreCase(k, v)) return error.UnquotedKeyword;
@@ -262,6 +307,8 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
         const with_nonce = nonce != null and nonced[@backingInt(name)];
         if (values.len == 0 and !with_nonce and !name.mayBeEmpty()) return error.EmptyDirective;
         for (values) |v| try checkValue(name, v);
+        if (name.isSourceList() and values.len > 1)
+            for (values) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NoneWithOtherSources;
 
         if (idx != 0) try out.put(";");
         try out.putName(name);
@@ -446,6 +493,54 @@ test "validation: quotes must be balanced" {
     try testing.expectError(error.MalformedQuote, one(.script_src, "'a'b'"));
 }
 
+test "validation: a quoted source is a CSP3 keyword, a nonce or a hash of the right length" {
+    const h256: [43]u8 = @splat('A');
+    const h384: [64]u8 = @splat('B');
+    const h512: [86]u8 = @splat('C');
+    try one(.script_src, "'nonce-" ++ "abcDEF012+/-_" ++ "'");
+    try one(.script_src, "'NONCE-abc=='");
+    try one(.script_src, "'sha256-" ++ &h256 ++ "'");
+    try one(.script_src, "'sha256-" ++ h256 ++ "='");
+    try one(.script_src, "'sha384-" ++ h384 ++ "'");
+    try one(.script_src, "'sha512-" ++ h512 ++ "=='");
+    try one(.script_src, "'Strict-Dynamic'");
+    for ([_][]const u8{ "'selff'", "'nonce-'", "'nonce-a b'", "'nonce-a$'", "'nonce-==='", "'nonce-='", "'sha256-'", "'sha256-short'", "'sha256-" ++ h256 ++ "==='", "'sha384-" ++ h256 ++ "'", "'sha512-" ++ h384 ++ "'", "'sha1-" ++ h256 ++ "'", "''", "'unsafe'", "'self '" }) |v| {
+        const e = one(.script_src, v);
+        try testing.expect(std.meta.isError(e));
+        try testing.expect(e == error.UnknownQuotedSource or e == error.MalformedQuote or e == error.InvalidCharacter);
+    }
+    try testing.expectError(error.UnknownQuotedSource, one(.script_src, "'selff'"));
+    try testing.expectError(error.UnknownQuotedSource, one(.style_src, "'nonce-'"));
+    try testing.expectError(error.UnknownQuotedSource, one(.style_src, "'sha256-short'"));
+    try testing.expectError(error.UnknownQuotedSource, one(.style_src, "'sha384-" ++ h256 ++ "'"));
+    // not a source list: the raw tokens stay free
+    try one(.trusted_types, "'selff'");
+    try one(.require_trusted_types_for, "'script'");
+}
+
+test "validation: 'none' beside other sources is refused, alone it is the policy" {
+    var buf: [128]u8 = undefined;
+    const bad: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .object_src, .values = &.{ "'none'", "https:" } }} };
+    try testing.expectError(error.NoneWithOtherSources, render(bad, &buf));
+    const bad2: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .object_src, .values = &.{ "https:", "'NONE'" } }} };
+    try testing.expectError(error.NoneWithOtherSources, render(bad2, &buf));
+    try one(.object_src, "'none'");
+    // `none` in a token directive is a plain token, not the keyword
+    const ok: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .trusted_types, .values = &.{ "'none'", "foo" } }} };
+    _ = try render(ok, &buf);
+}
+
+test "directives beyond the first 26: fenced-frame-src is a source list, webrtc a token" {
+    var buf: [128]u8 = undefined;
+    const spec: Spec = .{ .use_defaults = false, .directives = &.{
+        .{ .name = .fenced_frame_src, .values = &.{ "'self'", "https://a.example" } },
+        .{ .name = .webrtc, .values = &.{"'block'"} },
+    } };
+    try testing.expectEqualStrings("fenced-frame-src 'self' https://a.example;webrtc 'block'", try render(spec, &buf));
+    try testing.expectError(error.UnquotedKeyword, one(.fenced_frame_src, "self"));
+    try testing.expectError(error.EmptyDirective, render(.{ .use_defaults = false, .directives = &.{.{ .name = .webrtc }} }, &buf));
+}
+
 test "validation: injection characters inside values are refused" {
     try testing.expectError(error.InvalidCharacter, one(.script_src, "a.example;script-src *"));
     try testing.expectError(error.InvalidCharacter, one(.script_src, "a.example,b.example"));
@@ -607,7 +702,7 @@ fn classOf(n: Name) Class {
     return switch (n) {
         .upgrade_insecure_requests, .block_all_mixed_content => .flag,
         .sandbox => .sandbox,
-        .report_uri, .report_to, .require_trusted_types_for, .trusted_types => .token,
+        .report_uri, .report_to, .require_trusted_types_for, .trusted_types, .webrtc => .token,
         else => .source,
     };
 }
