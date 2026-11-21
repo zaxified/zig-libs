@@ -2966,9 +2966,12 @@ test "an allocation failure while arming a failure entry still returns the upstr
     try h.start(.v4);
     defer h.stop();
     h.stub.mode.store(.servfail, .release);
+    // Every resize/remap is refused: whether a growing buffer moves in place depends on the heap's layout
+    // (ReleaseFast differs from the safe modes), and that would change the number of allocations, hence
+    // where the arming ones sit. Refused, a buffer always grows by a fresh allocation: the count is fixed.
     var total: usize = 0;
     {
-        var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var counting = std.testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
         var c = try CachingResolver.init(counting.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
         defer c.deinit();
         try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com"));
@@ -2980,7 +2983,7 @@ test "an allocation failure while arming a failure entry still returns the upstr
     // positions where the answer is still the upstream error, with nothing armed.
     var armed_ok: usize = 0;
     for (0..total) |k| {
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k, .resize_fail_index = 0 });
         var c = try CachingResolver.init(failing.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
         defer c.deinit();
         if (c.lookupIp("down.example.com")) |ans| {
