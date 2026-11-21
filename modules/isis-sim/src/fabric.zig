@@ -182,6 +182,9 @@ const csnp_interval: Time = 1_000_000_000;
 /// `tick`s the LSDBs, so nothing ages; this only has to stay non-zero.
 const lsp_lifetime: u16 = 65_535;
 
+/// The most circuits (point-to-point plus LAN) one node may have.
+const max_circuits = 256;
+
 const timer_poll: u64 = 0;
 /// "This node cold-restarted": drop its LSDB and its flooding state and
 /// re-originate (see `Fabric.restart`).
@@ -1169,21 +1172,24 @@ pub const Fabric = struct {
     fn originatePseudonode(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) anyerror!void {
         const ns = &self.nodes[node];
         const ls = &self.lans[c.lan];
-        c.pn_seq += 1;
         self.stats.last_change = now;
-        var buf: [1024]u8 = undefined;
-        var b = try isis.pdu.LspBuilder.init(&buf, .{
-            .remaining_lifetime = self.stampedLifetime(),
-            .lsp_id = self.pseudonodeId(node, c.lan),
-            .sequence_number = c.pn_seq,
-            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
-        });
-        try ns.addAuth(&b.tlvs);
+        var members: [max_lan_members]isis_lsdb.generate.Neighbour = undefined;
+        var n: usize = 0;
         for (ls.members[0..ls.count], 0..) |m, i| {
             if (!c.alive[i]) continue;
-            try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(systemIdForNode(m.node)), 0, &.{});
+            members[n] = .{ .id = neighbourId7(systemIdForNode(m.node)), .metric = 0 };
+            n += 1;
         }
-        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
+        var scratch: [isis_lsdb.generate.default_buffer_size]u8 = undefined;
+        // Always written: a membership change is a content change, and a
+        // re-election after a resignation lands above the purge it left.
+        _ = try isis_lsdb.generate.generate(&ns.lsdb, .{
+            .pseudonode = @intCast(c.lan + 1),
+            .lifetime = self.stampedLifetime(),
+            .neighbours = members[0..n],
+            .force = true,
+        }, now, &scratch);
+        if (ns.lsdb.get(self.pseudonodeId(node, c.lan), now)) |v| c.pn_seq = v.sequence_number;
     }
 
     /// A resigning DIS purges the pseudonode LSP it had been originating
@@ -1191,17 +1197,10 @@ pub const Fabric = struct {
     /// and floods the purge.
     fn purgePseudonode(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) anyerror!void {
         const ns = &self.nodes[node];
-        c.pn_seq += 1;
         self.stats.last_change = now;
-        var buf: [64]u8 = undefined;
-        var b = try isis.pdu.LspBuilder.init(&buf, .{
-            .remaining_lifetime = 0,
-            .lsp_id = self.pseudonodeId(node, c.lan),
-            .sequence_number = c.pn_seq,
-            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
-        });
-        try ns.addAuth(&b.tlvs);
-        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
+        var scratch: [isis_lsdb.generate.min_buffer_size]u8 = undefined;
+        _ = try isis_lsdb.generate.purgeFragments(&ns.lsdb, @intCast(c.lan + 1), false, 0, now, &scratch);
+        if (ns.lsdb.get(self.pseudonodeId(node, c.lan), now)) |v| c.pn_seq = v.sequence_number;
     }
 
     /// Record and raise a safety-invariant violation. `check` never overwrites
@@ -1278,37 +1277,33 @@ pub const Fabric = struct {
     /// self-originated (floods out every circuit).
     fn originate(self: *Fabric, node: NodeId, now: Time) anyerror!void {
         const ns = &self.nodes[node];
-        ns.seq += 1;
-
-        var buf: [1024]u8 = undefined;
         self.stats.last_change = now;
-        var b = try isis.pdu.LspBuilder.init(&buf, .{
-            .remaining_lifetime = self.stampedLifetime(),
-            .lsp_id = lspIdOf(ns.system_id, 0),
-            .sequence_number = ns.seq,
-            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
-        });
-        try ns.addAuth(&b.tlvs);
+        // The neighbours as `isis-lsdb`'s generator takes them: one Extended IS
+        // Reachability entry per up circuit, and on a LAN the pseudonode instead
+        // of every other member (ISO 10589 §7.2.5).
+        var nbrs: [max_circuits]isis_lsdb.generate.Neighbour = undefined;
+        var n: usize = 0;
         for (ns.neighbours, 0..) |nb, iface| {
             if (ns.link_failed[iface]) continue;
-            const nbr_sys = self.nodes[nb.node].system_id;
-            try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(nbr_sys), nb.metric, &.{});
+            nbrs[n] = .{ .id = neighbourId7(self.nodes[nb.node].system_id), .metric = nb.metric };
+            n += 1;
         }
-        // On a LAN a router lists the LAN's pseudonode (DIS system-id ++ circuit
-        // id) instead of every other member (ISO 10589 §7.2.5).
         for (ns.lan_circuits) |c| {
             const dis = systemIdForNode(self.lans[c.lan].members[c.dis_slot].node);
             var id7 = neighbourId7(dis);
             id7[6] = @intCast(c.lan + 1);
-            try isis.tlvs.addExtendedIsReach(&b.tlvs, id7, self.lans[c.lan].metric, &.{});
+            nbrs[n] = .{ .id = id7, .metric = self.lans[c.lan].metric };
+            n += 1;
         }
-        // ISO 10589 §7.3.11: the *source* IS computes the LSP Checksum when the
-        // LSP is generated. This is that source, so it stamps — and it must, or
-        // the very first hop's `insert` (which arrives on a circuit, and so runs
-        // the §7.3.14.2 e) receive check) discards the LSP as corrupt and the
-        // fabric never floods anything. Two nodes holding the same LSP hold the
-        // same bytes, so equal-sequence copies still compare `.same`.
-        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
+        // The generator owns the sequence number: `max(stored, challenge) + 1`
+        // for a changed, challenged or due fragment, nothing for an unchanged
+        // one. It also stamps the checksum (§7.3.11) and signs when keyed.
+        var scratch: [isis_lsdb.generate.default_buffer_size]u8 = undefined;
+        _ = try isis_lsdb.generate.generate(&ns.lsdb, .{
+            .lifetime = self.stampedLifetime(),
+            .neighbours = nbrs[0..n],
+        }, now, &scratch);
+        if (ns.lsdb.get(lspIdOf(ns.system_id, 0), now)) |v| ns.seq = v.sequence_number;
 
         // Positive control for `check`'s LSDB-count tripwire: emit additional
         // LSP fragments for this system. Each is a distinct LSP-ID, so the
