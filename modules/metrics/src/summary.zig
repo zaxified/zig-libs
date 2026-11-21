@@ -428,7 +428,9 @@ test "compress: a two-sample list merges when the invariant allows it" {
 }
 
 test "a flush that fails part-way drops exactly the values it did not merge" {
-    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    // Resizes and remaps are refused, so the list grows by fresh allocations only: whether a buffer grows in
+    // place depends on the heap's layout (it differs per optimize mode), and would move the failing allocation.
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     var s = try Summary.init(fa.allocator(), .{
         .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }},
         .age_buckets = 1,
