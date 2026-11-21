@@ -1867,7 +1867,9 @@ fn runServeMulti(gpa: std.mem.Allocator, f: *Fleet, bindings: []const Binding, o
     var cue: CueIo = .init(io, .{ .hold_after_listens = @intCast(bindings.len) });
     var fut = try io.concurrent(serveTcpMulti, .{ gpa, cue.io(), f, bindings, opts });
     if (!awaitCue(&CueIo.listens, @intCast(bindings.len))) return neverListened(io, &fut, "serveTcpMulti cannot bind 127.0.0.1");
-    var threads: [4]?std.Thread = @splat(null);
+    const threads = try gpa.alloc(?std.Thread, scripts.len);
+    defer gpa.free(threads);
+    @memset(threads, null);
     for (scripts, 0..) |*s, i| {
         s.port = CueIo.port(port_of[i]);
         threads[i] = std.Thread.spawn(.{}, scriptClient, .{s}) catch |e| {
@@ -1921,6 +1923,34 @@ test "serveTcpMulti: exact counters, replies go to the asker only, and the run e
     try testing.expectEqual(@as(usize, 2 * rep_len), scripts[0].got);
     try testing.expectEqual(@as(usize, 2 * rep_len), scripts[1].got);
     try testing.expect(rep.duration_ms >= 40);
+}
+
+test "serveTcpMulti: a hundred masters at one fleet, all connected at once, each answered, none refused" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    const masters = 100;
+    var reqs: [masters][req_len]u8 = undefined;
+    var steps: [masters][1]ScriptStep = undefined;
+    var scripts: [masters]Script = undefined;
+    for (&scripts, &steps, &reqs, 0..) |*sc, *st, *rq, i| {
+        st.* = .{.{ .bytes = readReq(rq, @intCast(i + 1)) }};
+        // Staggered, so no two masters speak in the same poll round: a reply
+        // goes to the peer that spoke last, and each must get its own.
+        sc.* = .{ .steps = st, .want_bytes = rep_len, .start_delay_ms = 150 + 4 * i, .linger_ms = 10 };
+    }
+    var ports: [masters]usize = @splat(0);
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = masters }, &scripts, &ports);
+    try testing.expectEqual(@as(usize, masters), rep.peers_accepted);
+    try testing.expectEqual(@as(usize, 0), rep.peers_refused);
+    try testing.expectEqual(@as(usize, masters), rep.peak_concurrent);
+    try testing.expectEqual(@as(usize, masters), rep.frames_in);
+    try testing.expectEqual(@as(usize, masters * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, masters), rep.frames_out);
+    try testing.expectEqual(@as(usize, masters * rep_len), rep.bytes_out);
+    for (scripts) |sc| try testing.expectEqual(@as(usize, rep_len), sc.got);
 }
 
 test "serveTcpMulti: a connection beyond max_peers is refused when it is accepted, not before" {

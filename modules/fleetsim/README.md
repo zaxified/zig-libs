@@ -141,7 +141,7 @@ const report = try fleetsim.serveTcpMulti(gpa, io, &f, &bindings, .{
 
 ## Not provided
 
-No declarative fleet file or CLI (fleets are built in Zig code), no serial/RTU inter-character timing,
+No declarative fleet file or CLI (fleets are built in Zig code), no bus-level serial model (`serial_rtu.Framer` only cuts a byte stream into RTU frames by silence),
 no TLS, authentication or rate limiting in the bindings (a lab fixture, not a server), no fleet-native
 shrinker. See `SPEC.md` *Threat model / Limits*, *What is deliberately not done* and *Backlog / deferred*.
 

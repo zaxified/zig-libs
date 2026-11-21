@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [open62541/open62541](https://github.com/open62541/open62541) | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | A full OPC UA stack that can host a simulated server; a stack, not a fleet. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'modbus simulator'` and `'industrial protocol device simulator'`: no Zig result). |
 
-**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (*Evidence against third-party masters*). **Where we are behind:** no GUI or declarative config file for building a fleet (fleets are built in Zig code), a TCP/UDP binding that is a lab fixture (no serial/RTU timing, no TLS, no rate limiting), a multi-master binding proved with two peers, and a scale test that is Modbus-only (→ *Backlog / deferred*).
+**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (*Evidence against third-party masters*). **Where we are behind:** no GUI or declarative config file for building a fleet (fleets are built in Zig code), and a TCP/UDP binding that is a lab fixture (no TLS, no rate limiting) (→ *Backlog / deferred*).
 
 ## Design & invariants
 
@@ -185,6 +185,17 @@ than a refusal.
 its own accept), so a fault at t=15 s means something different to every
 session, while `serveTcpMulti` keeps one clock for the whole run.
 
+## Serial RTU framing (`rtu.zig`, `fleetsim.serial_rtu`)
+
+MODBUS over Serial Line v1.02 §2.5.1.1: a frame ends after 3.5 character times of silence and the next byte begins a new one; bytes
+of one frame more than 1.5 character times apart make it invalid. `Framer` (`Timing.forBaud`: 11-bit characters up to 19200 baud,
+the fixed 750 us / 1750 us above) takes the arrival time of each chunk in microseconds (the caller's injected time, so a run stays
+replayable), `push` returns the frame a gap of at least t3.5 completed, `poll(now)` the one the silence has completed by `now`,
+`nextDeadlineUs` when that will be; a frame with an inner gap over t1.5 and one over 256 bytes are dropped and counted
+(`Stats.broken`, `.overlong`). Two requests with no silence between them stay one frame, as on a real line (RTU has no length
+field). The frames go to `Fleet.submit` (a Modbus RTU adapter answers each; tested). Not modelled: the bus's half-duplex turnaround and
+the slave's own t3.5 before a reply.
+
 ## The determinism argument
 
 Everything that could differ between two runs is either injected or seeded:
@@ -322,8 +333,10 @@ and there are no capacity losses. Memory is about 3 kB per node including its po
 adapter, restart snapshot and share of the fixed pools. Wall-clock and RSS figures are not
 recorded here; the card's `**Performance:**` line says `not measured`.
 
-The binding constraint is not the scheduler but per-protocol state. A Modbus node is about 300
-bytes of adapter plus its registers. An OPC UA node needs an allocator, a `NodeStore` and a
+The binding constraint is not the scheduler but per-protocol state. Measured, as `@sizeOf` of the adapter
+(`test "scale: what each protocol adapter itself costs per node"`, bounded there; the registers, tags, points and buffers a
+node is given are the caller's): Modbus 424 bytes, S7comm 320, OPC UA 920 (its `NodeStore` and receive buffers are heap, below),
+EtherNet/IP 984, DNP3 1328, IEC 104 2168. A Modbus node is therefore about 300 to 450 bytes of adapter plus its registers. An OPC UA node needs an allocator, a `NodeStore` and a
 receive buffer sized by the negotiated limits (at least 8 KiB, 64 KiB by default) plus a
 reassembly buffer, about a megabyte each in a realistic configuration, so an OPC UA fleet is
 measured in hundreds, not thousands. That is a property of the protocol, not of this module.
@@ -444,7 +457,7 @@ would break the total order that makes replay work).
 
 - **RTU framing is `opaque_whole`** (`node.zig`): a Modbus RTU node cannot be fed a concatenated
   stream, only whole frames, because RTU has no length field (real RTU uses inter-character timing).
-  Fine for TCP fleets; a serial-gateway simulation would need t3.5 gap modelling.
+  `serial_rtu.Framer` cuts a byte stream into frames by silence (below); the fleet itself still takes whole frames.
 - **`serveTcpMulti` fans a node's unsolicited traffic to every peer on that node's listener.** For a
   device with several masters subscribed that is the right behaviour; where the masters are meant to
   be isolated it is not, and the binding cannot tell the difference.
@@ -473,10 +486,12 @@ Test classes, by file:
 - **`drivers.zig`:** every driver, edge cases, PRNG draw counts.
 - **`fleet.zig`:** the scheduler (tick scheduling, heal clearing, trace ring wrap, slot flag reuse, stats counters,
   slot-pool return), the toy-node determinism test.
+- **`rtu.zig`:** the timings for 9600, 19200 and above; a frame ended by the next chunk and by `poll` (one microsecond short of t3.5 does not end it); one-byte chunks and a gap just under t1.5 stay one frame; a gap in (t1.5, t3.5) drops it and the next frame is fine; two requests with no silence are one frame; an over-long frame is dropped once and the framer recovers; an RTU Modbus node in a `Fleet` answers both requests of a framed stream.
 - **`shim.zig`:** the `Window` buffer discipline (all-or-nothing datagrams, the latching `overflow`).
 - **`tcp.zig`:** loopback-socket tests for exact `Report` counters, session limits, split frames, idle rounds, refusal,
-  routing and UDP; the multi-peer binding driven by two in-process clients at once (`FLEETSIM_EXPECT_TCP=1` makes a
-  skip a failure).
+  routing and UDP; the multi-peer binding driven by two in-process clients at once and by a hundred (every master connected
+  before the first is served, staggered so each reply goes to its asker: 100 accepted, none refused, peak 100, 100 frames in
+  and out; `FLEETSIM_EXPECT_TCP=1` makes a skip a failure).
 - **`root.zig`:** the three determinism proofs, the scale run, the hostile-input cases, the verdict blocks and the
   live tests.
 - **`vopr.zig`:** the netsim model-checking harness: a bounded seed sweep over the real `ModbusNode` that must stay clean,
@@ -508,6 +523,10 @@ two programs exchanging messages defined by public specifications (MODBUS Applic
   values as opposed to server diagnostics, and inventing one here would be a guess about the caller's address space.
 - **No per-object save/restore of BACnet `StatusFlags` on `trouble_off`:** it would need per-object storage; a healthy simulated
   point has clear flags.
+- **Per-peer session identity in `serveTcpMulti`:** DNP3 and OPC UA keep one session each; giving the binding a peer id
+  would let it isolate masters instead of fanning unsolicited traffic out, and it needs an identity parameter on the node
+  interface that no consumer has asked for and no reference simulator (ModbusPal, the pymodbus simulator) models. Left until
+  a consumer needs it.
 - **Liveness is not an invariant of the model-checking harness** (see "Searching for a failure").
 - **No authentication, encryption or rate limiting in the bindings** (see "Threat model / Limits").
 
@@ -516,14 +535,6 @@ two programs exchanging messages defined by public specifications (MODBUS Applic
 - **A fleet-native shrinker (idea):** delta-debugging over a netsim `FaultTrace` works end to end on a fleet, so a failing run comes
   back as a minimised fault trace. What does not exist is a shrinker over the fleet's own inputs (`Fault` lists and submitted frames),
   which a failure that a netsim schedule cannot express would need.
-- **Modbus RTU inter-character timing (t3.5) for gateway-style tests (planned, survey 2026-09-30):** ModbusPal users on serial gateways
-  hit it. Effort: medium; fits §2.
-- **A mixed-protocol scale test (open):** the scale test is Modbus-only; the per-protocol memory figures for the six other adapters are
-  reasoned, not measured.
-- **Per-peer session identity in `serveTcpMulti` (open, belongs with whoever needs it):** DNP3 and OPC UA have one; it would let the binding
-  isolate masters instead of fanning unsolicited traffic out.
-- **Driving many masters at one fleet (unverified):** the multi-peer binding is proved with two concurrent peers (the offline test and the
-  live run) and 29 sequential peers; `max_peers` is honoured and over-limit connections are counted, but nothing has driven 100 masters.
 - **A declarative fleet description plus a small CLI that starts a fleet (idea, survey 2026-09-30):** ModbusPal and the pymodbus simulator are
   used by people who do not write code. Effort: medium; fits CONVENTIONS §2 (parser over `std`, no deps).
 

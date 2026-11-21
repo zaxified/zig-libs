@@ -77,6 +77,9 @@ pub const fleet = @import("fleet.zig");
 pub const adapters = @import("adapters.zig");
 pub const tcp = @import("tcp.zig");
 
+/// Modbus RTU framing by silence (t1.5 / t3.5) for serial-gateway style tests; see `rtu.zig`.
+pub const serial_rtu = @import("rtu.zig");
+
 pub const Node = node.Node;
 pub const NodeId = node.NodeId;
 pub const NodeError = node.NodeError;
@@ -1123,6 +1126,27 @@ test "scale: 1000 in-process Modbus nodes, advanced over simulated minutes" {
         if (storage[i * regs_per_node] != 0) moved += 1;
     }
     try testing.expect(moved > n_signals / 2);
+}
+
+test "scale: what each protocol adapter itself costs per node (struct sizes; the buffers a node is given are the caller's)" {
+    const ad = @import("adapters.zig");
+    const sizes = .{
+        .{ "modbus", @sizeOf(ad.Modbus) },
+        .{ "dnp3", @sizeOf(ad.Dnp3) },
+        .{ "iec104", @sizeOf(ad.Iec104) },
+        .{ "s7comm", @sizeOf(ad.S7comm) },
+        .{ "enip", @sizeOf(ad.Enip) },
+        .{ "opcua", @sizeOf(ad.Opcua) },
+    };
+    if (verboseSkip()) inline for (sizes) |p| std.debug.print("adapter {s}: {d} bytes\n", .{ p[0], p[1] });
+    // The adapters but OPC UA are small enough that a thousand of them are a few MiB; the SPEC's per-protocol
+    // table quotes these numbers, so a change that makes one grow past its bound is a change to read there.
+    try testing.expect(@sizeOf(ad.Modbus) <= 1024);
+    try testing.expect(@sizeOf(ad.Dnp3) <= 8192);
+    try testing.expect(@sizeOf(ad.Iec104) <= 8192);
+    try testing.expect(@sizeOf(ad.S7comm) <= 8192);
+    try testing.expect(@sizeOf(ad.Enip) <= 8192);
+    try testing.expect(@sizeOf(ad.Opcua) <= 65536);
 }
 
 // ── live: a real third-party master drives a simulated node ─────────────────
@@ -2991,6 +3015,7 @@ test {
     _ = @import("fleet.zig");
     _ = @import("adapters.zig");
     _ = @import("tcp.zig");
+    _ = @import("rtu.zig");
     _ = @import("shim.zig");
     _ = @import("goldens.zig");
     _ = @import("master_goldens.zig");
