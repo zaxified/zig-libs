@@ -8,7 +8,8 @@
 //! THIS IS A PROGRAM, NOT A TEST. `zig build interop-dnssec` runs it and `zig build check-interop` compiles it.
 //! Needs `ldns-verify-zone` (package `ldnsutils`) on PATH; if it is missing the program says so and exits 2. No
 //! network. Run from the repository root; the zones go to `.zig-cache/interop-dnssec/`. Exit 0 = every zone was
-//! accepted and every tampered zone refused.
+//! accepted and every tampered zone refused. Then `unbound.zig`: `dnssec.walk` against libunbound (`unbound-host`) on a
+//! signed three-zone hierarchy (skipped when `unbound-host` is not installed).
 
 const std = @import("std");
 const dnssec = @import("dnssec");
@@ -178,6 +179,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    failures += try @import("unbound.zig").run(arena, io);
     return if (failures == 0) 0 else 1;
 }
 

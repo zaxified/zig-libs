@@ -178,7 +178,7 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
   unsigned delegation and an NSEC3 Opt-Out cover (insecure), an unsupported-algorithm DS (insecure), and bogus for a
   tampered answer, a stranger's DS, DNSKEY, DS signer or NSEC signer, a missing DS with no denial, a lying NSEC bitmap,
   the wrong anchor and every RRSIG window edge; `root_anchors` are checked against the IANA root KSK DNSKEYs
-  (tags 20326 and 38696). Not run against a live resolver or `delv` (*Open*).
+  (tags 20326 and 38696). Against a foreign validator (`tools/unbound.zig`, run by `zig build interop-dnssec`): a signed three-zone hierarchy built with `sign.zig` (root, `lab`, `example.lab`, Ed25519, an unsigned delegation `insecure.lab`, NSEC denials) is served to libunbound (`unbound-host -v`, `auth-zone` files, a network namespace without interfaces) and to the walker; secure, insecure delegation, an A record altered after signing and a DS of another key get the same verdict from both (skipped when `unbound-host` is missing). Against real Internet answers it is not run (*Open*).
 - **Published vectors:** the RFC 8080 §6.2 Ed448 examples (`src/rfc8080_test.zig`), the RFC 4034 Appendix B key tag.
 - **Fuzz** (`src/fuzz_test.zig` and the harnesses beside their corpora): the parsers and `validate` under testkit's
   deterministic driver as `DNSSEC_FUZZ`; a genuine RRset is secure, a damaged signature bogus, damaged wire never
@@ -205,9 +205,7 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
 
 ## Open
 
-- **Chain walker against a live validator:** `walk.validateRrset` is tested on a synthetic hierarchy only; a run
-  against real answers (`delv`, or a recursive resolver's DS / DNSKEY / NSEC3 responses, root KSK rollover included)
-  is not done.
+- **Chain walker against real answers:** the walker agrees with libunbound on a local signed hierarchy with NSEC (`tools/unbound.zig`); NSEC3 and Opt-Out responses, answers from the live DNS and a root KSK rollover are not run against a foreign validator.
 - **Plain-NSEC denial proof not `ldns`-oracle-verified:** `nsec.proveDenial` is unit-tested against the RFC 4034
   §6.1 ordering and positive/adversarial cases, but its reasoning is not checked against an independent validator the
   way the NSEC3 proof is.
