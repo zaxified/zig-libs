@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no ReInit/branch, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -1146,13 +1146,18 @@ the choice, and no vector exercises it.
   KeyPackage supplies the identity half of its leaf and §7.5 samples the
   encryption key; nothing else is settable.
 
-## Cipher suites 0x0002/0x0003/0x0005/0x0007
+## Cipher suites 0x0002 to 0x0007
 
 (X25519/ChaCha20-Poly1305/SHA-256/Ed25519), `0x0005` (P-521/AES-256-GCM/
 SHA-512/ECDSA-P521) and `0x0007` (P-384/AES-256-GCM/SHA-384/ECDSA-P384). Every
 primitive is a sibling's. The KEMs are `hpke`'s, the AEADs `aesgcm`'s and
 `chachapoly`'s (through `hpke.ChaCha20Poly1305`), and the ECDSA schemes come
-from `p256`/`p384`/`p521`.
+from `p256`/`p384`/`p521`. `0x0004` (X448/AES-256-GCM/SHA-512/Ed448) and
+`0x0006` (X448/ChaCha20-Poly1305/SHA-512/Ed448) run on `hpke.X448Kem` and the
+sibling `ed448` module, wrapped as `suite.Ed448` in the `std.crypto.sign`
+shape `CipherSuite` expects (pure Ed448, empty context; raw 57-byte keys and
+114-byte signatures, like Ed25519's); all seven registry suites are in
+`suite.supported`.
 
 **Suite choice is a compile-time parameter.** That is the existing design
 (`comptime S: type`), and it matches how the references bind a suite: OpenMLS
@@ -1203,9 +1208,13 @@ bytes, and ours verifies and fails under another label. In
 message-protection, `protectPublic`'s output equals the vector's once the
 signature and the membership tag are substituted back. Our membership tag
 and signature both verify, and `protectPrivate`'s output decrypts with the
-same keys to the vector's body under a verifying signature. The suite-filtered
-embedded files are re-filtered from the same upstream commit to suites
-{1, 2, 3, 5, 7} (`NOTICE`), in upstream order, with records unmodified.
+same keys to the vector's body under a verifying signature. The four files
+that used to be suite-filtered (tree-validation, treekem,
+passive-client-welcome, passive-client-handling-commit) now hold all seven
+suites' records of the same upstream commit (`NOTICE`), in upstream order,
+unmodified, re-serialised compactly (`json.dumps(…, separators=(',', ':'))`
+plus a newline — the recipe reproduces the earlier filtered files byte for
+byte).
 
 ## Threat model
 
@@ -1560,9 +1569,6 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **More cipher suites: 0x0004 and 0x0006 (X448/Ed448).** `ed448` has the
-  signature side, but `hpke` has no DHKEM(X448); instantiate both suites when
-  that lands.
 - **ReInit and subgroup branch (§11.2/§11.3).** Effort: small-medium; the
   resumption PSKs they need exist.
 - **`Group`'s retained state grows with session length** (Threat model). The fix

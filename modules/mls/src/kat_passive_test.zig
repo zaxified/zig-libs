@@ -31,12 +31,10 @@
 //! entry in `epochs` apply the Commit using the `proposals` it references
 //! and compare that epoch's `epoch_authenticator`.
 //!
-//! **What the embedded files are reduced to, and the assertion that guards
-//! it.** Both are filtered to cipher suite `0x0001` (the only suite
-//! `suite.zig` wires) — the exact `jq` expression is in `NOTICE`. The
-//! filter keeps whole entries, so no recorded session is truncated: every
-//! session that runs here runs to its last Commit. The coverage the
-//! reduction rests on is ASSERTED below (`passive-client-welcome`'s four
+//! **What the embedded files hold, and the assertion that guards it.** Both
+//! carry every upstream record, for all seven cipher suites (`NOTICE`), so
+//! no recorded session is truncated: every session that runs here runs to
+//! its last Commit. The coverage the suite rests on is ASSERTED below (`passive-client-welcome`'s four
 //! combinations of tree-source × PSK-presence; `passive-client-handling-
 //! commit`'s epochs with no proposals, with one, and with several; and, for
 //! both, that every message really is a `PublicMessage`), so a future

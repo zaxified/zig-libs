@@ -10,11 +10,12 @@ read, and it is in this file's git history if it is ever wanted back.
 1. THE 15 JSON FILES under `src/data/` are the MLS working group's interop
    test vectors, taken from https://github.com/mlswg/mls-implementations at
    commit `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (2026-04-22). Nine are
-   redistributed in full and without modification; five keep a subset of the
-   upstream records (the records of the cipher suites this module wires, in
-   upstream order), every retained record unmodified; `tree-operations.json`
-   holds all five of its upstream records unmodified but re-serialised, so its
-   bytes differ while its content does not.
+   redistributed in full and without modification; `messages.json` keeps a
+   subset of the upstream records (20 of 300, in upstream order), every
+   retained record unmodified; `tree-validation.json`, `treekem.json`,
+   `passive-client-welcome.json`, `passive-client-handling-commit.json` and
+   `tree-operations.json` hold all of their upstream records unmodified but
+   re-serialised, so their bytes differ while their content does not.
 
    These files were contributed to an IETF working group, which makes them
    IETF Contributions (RFC 5378 §1.a), and TLP 5.0 §3.a grants anyone the

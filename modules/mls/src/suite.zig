@@ -31,6 +31,7 @@ const burn = @import("burn.zig");
 const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
+const ed448 = @import("ed448").ed448;
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
 /// `CipherSuite` value to. The ones this module instantiates are listed in
@@ -273,6 +274,98 @@ pub const Mls256P384Aes256GcmSha384P384 = CipherSuite(
     .mls_256_dhkemp384_aes256gcm_sha384_p384,
 );
 
+/// RFC 8032 Ed448 (pure, empty context — RFC 9420 §5.1.2 names "Ed448" from
+/// the TLS SignatureScheme registry, i.e. RFC 8032's PureEdDSA) in the
+/// `std.crypto.sign.Ed25519` shape `CipherSuite` expects, over the sibling
+/// `ed448` module (std has no Ed448). Keys and signatures travel raw
+/// (57-byte public key, 114-byte `R || S`), as Ed25519's do.
+pub const Ed448 = struct {
+    pub const PublicKey = struct {
+        bytes: [encoded_length]u8,
+
+        pub const encoded_length = 57;
+
+        /// Refuses an encoding that is not a point of the curve, as
+        /// `std.crypto.sign.Ed25519.PublicKey.fromBytes` does.
+        pub fn fromBytes(b: [encoded_length]u8) ed448.Point.DecodeError!PublicKey {
+            _ = try ed448.Point.fromBytes(b);
+            return .{ .bytes = b };
+        }
+
+        pub fn toBytes(pk: PublicKey) [encoded_length]u8 {
+            return pk.bytes;
+        }
+    };
+
+    pub const Signature = struct {
+        bytes: [encoded_length]u8,
+
+        pub const encoded_length = ed448.Signature.encoded_length; // 114
+
+        /// The split is checked at `verify` (a non-canonical `S` fails
+        /// verification there, RFC 8032 §5.2.7 step 1).
+        pub fn fromBytes(b: [encoded_length]u8) Signature {
+            return .{ .bytes = b };
+        }
+
+        pub fn toBytes(sig: Signature) [encoded_length]u8 {
+            return sig.bytes;
+        }
+
+        pub fn verify(sig: Signature, msg: []const u8, pk: PublicKey) !void {
+            const s = ed448.Signature.fromBytes(sig.bytes) catch return error.SignatureVerificationFailed;
+            return ed448.verify(s, msg, "", ed448.PublicKey.fromBytes(pk.bytes));
+        }
+    };
+
+    pub const KeyPair = struct {
+        public_key: PublicKey,
+        inner: ed448.KeyPair,
+
+        pub const seed_length = 57;
+
+        /// RFC 8032 §5.2.5 from a 57-byte seed. Error union for the
+        /// `std.crypto.sign` shape; it never fails.
+        pub fn generateDeterministic(seed: [seed_length]u8) error{}!KeyPair {
+            var kp: KeyPair = undefined;
+            ed448.KeyPair.createInto(&kp.inner, &seed);
+            kp.public_key = .{ .bytes = kp.inner.public_key.toBytes() };
+            return kp;
+        }
+
+        /// Ed448 is deterministic; `noise` exists for the shape and is
+        /// ignored.
+        pub fn sign(kp: *const KeyPair, msg: []const u8, noise: ?[32]u8) ed448.SignError!Signature {
+            _ = noise;
+            const sig = try ed448.sign(&kp.inner, msg, "");
+            return .{ .bytes = sig.toBytes() };
+        }
+    };
+};
+
+/// `0x0004` = `MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448`: DHKEM(X448,
+/// HKDF-SHA512) + AES-256-GCM + SHA-512 + Ed448, on `hpke.X448Kem` and the
+/// sibling `ed448` module.
+pub const Mls256X448Aes256GcmSha512Ed448 = CipherSuite(
+    hpke.X448Kem,
+    aesgcm.Aes256Gcm,
+    std.crypto.kdf.hkdf.HkdfSha512,
+    std.crypto.hash.sha2.Sha512,
+    Ed448,
+    .mls_256_dhkemx448_aes256gcm_sha512_ed448,
+);
+
+/// `0x0006` = `MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448`: `0x0004`
+/// with ChaCha20-Poly1305.
+pub const Mls256X448ChaCha20Poly1305Sha512Ed448 = CipherSuite(
+    hpke.X448Kem,
+    hpke.ChaCha20Poly1305,
+    std.crypto.kdf.hkdf.HkdfSha512,
+    std.crypto.hash.sha2.Sha512,
+    Ed448,
+    .mls_256_dhkemx448_chacha20poly1305_sha512_ed448,
+);
+
 /// The suite a caller with no suite-negotiation needs of its own should
 /// reach for first — RFC 9420 §16.1's mandatory-to-implement `0x0001`.
 pub const default = Mls128X25519Aes128GcmSha256Ed25519;
@@ -284,7 +377,9 @@ pub const supported = .{
     Mls128X25519Aes128GcmSha256Ed25519,
     Mls128P256Aes128GcmSha256P256,
     Mls128X25519ChaCha20Poly1305Sha256Ed25519,
+    Mls256X448Aes256GcmSha512Ed448,
     Mls256P521Aes256GcmSha512P521,
+    Mls256X448ChaCha20Poly1305Sha512Ed448,
     Mls256P384Aes256GcmSha384P384,
 };
 
@@ -347,6 +442,36 @@ test "0x0007: widths match RFC 9420 §17.1's MLS_256_DHKEMP384_AES256GCM_SHA384_
     try testing.expectEqual(@as(usize, 48), S7.Nm);
     try testing.expectEqual(@as(usize, 97), S7.Nspk);
     try testing.expectEqual(@as(usize, 48), S7.Nssk);
+}
+
+test "0x0004/0x0006: widths match RFC 9420 §17.1's X448/Ed448 rows, and Ed448 signs and verifies" {
+    inline for (.{ Mls256X448Aes256GcmSha512Ed448, Mls256X448ChaCha20Poly1305Sha512Ed448 }, .{ 0x0004, 0x0006 }) |S, id| {
+        try testing.expectEqual(@as(u16, id), @backingInt(S.id));
+        try testing.expect(!S.sig_is_ecdsa);
+        try testing.expectEqual(@as(usize, 64), S.Nh);
+        try testing.expectEqual(@as(usize, 32), S.Nk);
+        try testing.expectEqual(@as(usize, 64), S.Nm);
+        try testing.expectEqual(@as(usize, 114), S.Nx);
+        try testing.expectEqual(@as(usize, 57), S.Nspk);
+        try testing.expectEqual(@as(usize, 57), S.Nssk);
+        try testing.expectEqual(@as(usize, 56), S.Kem.Npk);
+    }
+    const S = Mls256X448Aes256GcmSha512Ed448;
+    // RFC 8032 §7.4 "-----blank" (Ed448, empty message, empty context).
+    var seed: [57]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, "6c82a562cb808d10d632be89c8513ebf6c929f34ddfa8c9f63c9960ef6e348a3528c8a3fcc2f044e39a3fc5b94492f8f032e7549a20098f95b");
+    var want_pk: [57]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_pk, "5fd7449b59b461fd2ce787ec616ad46a1da1342485a70e1f8a0ea75d80e96778edf124769b46c7061bd6783df1e50f6cd1fa1abeafe8256180");
+    var want_sig: [114]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_sig, "533a37f6bbe457251f023c0d88f976ae2dfb504a843e34d2074fd823d41a591f2b233f034f628281f2fd7a22ddd47d7828c59bd0a21bfd3980ff0d2028d4b18a9df63e006c5d1c2d345b925d8dc00b4104852db99ac5c7cdda8530a113a0f4dbb61149f05a7363268c71d95808ff2e652600");
+    var kp: S.Sig.KeyPair = undefined;
+    try S.signatureKeyPair(&seed, &kp);
+    try testing.expectEqualSlices(u8, &want_pk, &S.encodePublicKey(kp.public_key));
+    const sig = S.encodeSignature(try kp.sign("", null));
+    try testing.expectEqualSlices(u8, &want_sig, sig.slice());
+    try (try S.decodeSignature(sig.slice())).verify("", try S.decodePublicKey(&want_pk));
+    try testing.expectError(error.SignatureVerificationFailed, (try S.decodeSignature(sig.slice())).verify("x", kp.public_key));
+    try testing.expectError(error.WrongKeyLength, S.decodeSignature(sig.slice()[0..113]));
 }
 
 test "ECDSA encodings: compressed keys and malformed DER are refused, a signature round-trips" {
