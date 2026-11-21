@@ -67,6 +67,7 @@ _ = try log.dropBefore(today - 30);               // never drops the newest
 - `firstLsn()`, `lastLsn()` and `isEmpty()` (null on a read-only log),
   `get(lsn, buf)` (one record's payload by LSN) and `dropBeforeLsn(lsn)` (drops the
   closed segments wholly below it) are on `Log` and `Concurrent`.
+- `truncateAfter(lsn)` removes every record above `lsn` (a replicated log's uncommitted tail); the next append reuses `lsn + 1`. A raw segment only; stale positions past `lsn` after it.
 
 **Seek.** `log.seek(lsn)` and `log.seekTime(t)` return the `Position` to start
 an iterator from: the segment from the manifest, then a sparse index per

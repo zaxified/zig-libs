@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New: `Log.truncateAfter(lsn)` / `Concurrent.truncateAfter` (+ `TruncateError`) — remove every record above `lsn` (tidwall `TruncateBack`); the segment holding it is cut and becomes active again, later segments are dropped, LSNs above `lsn` are reused by the next appends. Additive.
+- **2026-11-21** — New: `Options.now_ctx`, `Options.monotonic_ns_ctx` and `Options.clock_ctx` — the two clocks with a context pointer instead of a global; they win over `now` / `monotonic_ns`. Additive.
 - **2026-11-16** — Review LOW-7: a read-only `Log` keeps the index it rebuilds for the newest segment (which has no
   `.idx` until sealed) and extends it over the appended tail, so `seek` / `seekTime` there no longer re-walk the whole
   segment per call. The cache covers only whole CRC-valid records and is dropped on a new newest segment, a shrunk

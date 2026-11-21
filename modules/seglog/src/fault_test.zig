@@ -41,6 +41,8 @@ const Step = union(enum) {
     /// `compact(id)`, dropping every payload that starts with "x".
     compact: u64,
     compress: u64,
+    /// `truncateAfter(lsn)`.
+    truncate_after: u64,
 };
 
 fn dropX(_: void, r: seglog.Record) bool {
@@ -141,6 +143,35 @@ const script_compress = [_]Step{
 
 const compress_ids = [_]u64{ 40, 41, 42 };
 
+/// `truncateAfter` between appends and rotations: a cut inside a sealed
+/// segment (the later ones dropped, the segment reopened without its seal), a
+/// no-op, a cut inside the first segment, and a cut that only removes a seal.
+/// A crash leaves the log as it was, cut at the segment's end (the later
+/// segments gone, the seal still there), or fully cut.
+const script_truncate = [_]Step{
+    .{ .rotate = 50 },
+    .{ .append = "a" },
+    .{ .append_many = &.{ "m1", "m2", "m3" } },
+    .{ .rotate = 51 },
+    .{ .append = "b" },
+    .{ .append = "c" },
+    .{ .rotate = 52 },
+    .{ .append = "d" },
+    .{ .truncate_after = 5 }, // keeps b, drops c and segment 52
+    .{ .append = "e" },
+    .{ .truncate_after = 6 }, // the last record: no I/O
+    .{ .truncate_after = 3 }, // inside segment 50: drops 51
+    .{ .append = "f" },
+    .{ .rotate = 53 },
+    .{ .append = "g" },
+    .{ .truncate_after = 4 }, // segment 50 ends at LSN 4: only the seal goes, 53 is dropped
+    .{ .append = "h" },
+};
+
+const truncate_no_io = [_]usize{10};
+
+const truncate_ids = [_]u64{ 50, 51, 52, 53 };
+
 /// The model, the driver and the recovery check for one script under one
 /// sync policy.
 /// `concurrent`: drive the script through `Concurrent` (one thread) instead
@@ -193,6 +224,22 @@ fn Sweep(comptime sc: []const Step, comptime ids: []const u64, comptime policy: 
                     },
                     .sync => s.unsynced = 0,
                     .compress => {},
+                    .truncate_after => |l| {
+                        if (l + 1 >= s.next_lsn) return;
+                        var seg: u64 = 0;
+                        for (s.recs.items) |r| if (r.lsn == l) {
+                            seg = r.seg;
+                        };
+                        var i: usize = 0;
+                        while (i < s.recs.items.len) {
+                            if (s.recs.items[i].lsn > l) _ = s.recs.orderedRemove(i) else i += 1;
+                        }
+                        const at = std.mem.findScalar(u64, s.live.items, seg).?;
+                        s.live.shrinkRetainingCapacity(at + 1);
+                        s.active = seg;
+                        s.next_lsn = l + 1;
+                        s.unsynced = 0;
+                    },
                     .compact => |id| {
                         var i: usize = 0;
                         while (i < s.recs.items.len) {
@@ -275,6 +322,29 @@ fn Sweep(comptime sc: []const Step, comptime ids: []const u64, comptime policy: 
 
             switch (sc[completed]) {
                 .append, .drop_before, .sync, .compact, .compress => try out.append(gpa, try State.after(sc[0 .. completed + 1])),
+                .truncate_after => |l| {
+                    // The later segments leave the log before the segment is
+                    // cut: between the two it is the newest, sealed, whole.
+                    if (base.active != null and l + 1 < base.next_lsn) {
+                        var seg: u64 = 0;
+                        for (base.recs.items) |r| if (r.lsn == l) {
+                            seg = r.seg;
+                        };
+                        if (seg != base.active.?) {
+                            var mid = try base.clone();
+                            errdefer mid.deinit();
+                            var i: usize = 0;
+                            while (i < mid.recs.items.len) {
+                                if (mid.recs.items[i].seg > seg) _ = mid.recs.orderedRemove(i) else i += 1;
+                            }
+                            const at = std.mem.findScalar(u64, mid.live.items, seg).?;
+                            mid.live.shrinkRetainingCapacity(at + 1);
+                            mid.active = null;
+                            try out.append(gpa, mid);
+                        }
+                    }
+                    try out.append(gpa, try State.after(sc[0 .. completed + 1]));
+                },
                 .append_many => |ps| for (1..ps.len + 1) |j| {
                     var s = try base.clone();
                     errdefer s.deinit();
@@ -318,6 +388,7 @@ fn Sweep(comptime sc: []const Step, comptime ids: []const u64, comptime policy: 
                     .sync => c.sync(),
                     .compact => |id| if (c.compact(id, {}, dropX)) |_| {} else |e| e,
                     .compress => |id| if (c.compress(id)) |_| {} else |e| e,
+                    .truncate_after => |l| c.truncateAfter(l),
                 };
                 result catch |e| switch (e) {
                     error.Crashed => return .{ .completed = i, .crashed = true },
@@ -344,6 +415,7 @@ fn Sweep(comptime sc: []const Step, comptime ids: []const u64, comptime policy: 
                     .sync => log.sync(),
                     .compact => |id| if (log.compact(id, {}, dropX)) |_| {} else |e| e,
                     .compress => |id| if (log.compress(id)) |_| {} else |e| e,
+                    .truncate_after => |l| log.truncateAfter(l),
                 };
                 result catch |e| switch (e) {
                     error.Crashed => return .{ .completed = i, .crashed = true },
@@ -500,6 +572,8 @@ const ConcurrentAlways = Sweep(&script, &script_ids, .always, true, 0);
 const ConcurrentManual = Sweep(&script_deferred, &deferred_ids, .manual, true, 0);
 const Compacting = Sweep(&script_compact, &compact_ids, .always, false, 0);
 const Compressing = Sweep(&script_compress, &compress_ids, .always, false, 0);
+const Truncating = Sweep(&script_truncate, &truncate_ids, .always, false, 0);
+const TruncatingConcurrent = Sweep(&script_truncate, &truncate_ids, .always, true, 0);
 const PreallocAlways = Sweep(&script, &script_ids, .always, false, 128);
 const PreallocManual = Sweep(&script_deferred, &deferred_ids, .manual, false, 128);
 const PreallocConcurrent = Sweep(&script, &script_ids, .always, true, 128);
@@ -672,6 +746,14 @@ test "fault sweep with compression: the raw segment or the compressed one, never
     try sweepEveryModel(Compressing);
     _ = try sweepReorder(Compressing);
     try sweepInsideRecovery(Compressing);
+}
+
+test "fault sweep with truncateAfter: cut at the segment's end or fully cut, never a gap, and the log goes on" {
+    try workloadIsSane(Truncating, &script_truncate, &truncate_no_io, 60);
+    try sweepEveryModel(Truncating);
+    _ = try sweepReorder(Truncating);
+    try sweepInsideRecovery(Truncating);
+    try sweepEveryModel(TruncatingConcurrent);
 }
 
 test "fault sweep, preallocated: zeros past the data are the end of it, never damage and never a cut" {

@@ -1158,6 +1158,12 @@ pub const Options = struct {
     /// caller's own time. The unit is the caller's (for example epoch seconds).
     /// Times need not be monotonic: a seal records their range, not order.
     now: ?*const fn () i64 = null,
+    /// `now` with a context: a clock that needs state (an `Io`, a fake clock
+    /// of a test) gets `clock_ctx` instead of a global. Wins over `now` when
+    /// both are set.
+    now_ctx: ?*const fn (?*anyopaque) i64 = null,
+    /// What `now_ctx` and `monotonic_ns_ctx` are called with.
+    clock_ctx: ?*anyopaque = null,
     /// How far `append`/`appendAt`/`appendMany`/`appendEntries` trust a
     /// timestamp (L3, ingest-consumer audit): one absurd value — a caller's
     /// bug, not necessarily a crash — otherwise becomes the segment's
@@ -1174,6 +1180,8 @@ pub const Options = struct {
     /// latency of every data fsync (`SyncLatency`); without it, the log has
     /// no clock of its own (the simulator stays deterministic).
     monotonic_ns: ?*const fn () u64 = null,
+    /// `monotonic_ns` with `clock_ctx`; wins over it when both are set.
+    monotonic_ns_ctx: ?*const fn (?*anyopaque) u64 = null,
     /// Bytes between two entries of a segment's sparse index (`seek`,
     /// `seekTime`). 0: no index — a seek walks the segment from its start.
     index_interval: u32 = 4096,
@@ -1407,6 +1415,20 @@ pub const RotateError = Storage.Error || error{
 };
 
 pub const DropError = Storage.Error || error{ Poisoned, ReadOnly };
+
+/// `OpenError`'s members come from the re-adoption of the cut segment (the
+/// same walk `open` does); `Locked` and `NotFound` cannot occur.
+pub const TruncateError = OpenError || error{
+    Poisoned,
+    ReadOnly,
+    /// `lsn` is below the log's first record: a truncation keeps at least
+    /// that record (tidwall/wal's `TruncateBack` and commitlog's `truncate`
+    /// refuse the same), `dropBefore` is what removes records from the front.
+    OutOfRange,
+    /// The segment that would be cut is compressed (`compress`), which is
+    /// read-only: nothing was changed.
+    CompressedSegment,
+};
 
 pub const IterError = Storage.Error || error{
     /// A record failed its CRC, a length ran past the segment, a closed
@@ -1824,13 +1846,14 @@ pub const Log = struct {
     }
 
     fn clockNs(self: *const Log) u64 {
+        if (self.opts.monotonic_ns_ctx) |f| return f(self.opts.clock_ctx);
         return if (self.opts.monotonic_ns) |f| f() else 0;
     }
 
     /// A data fsync done, `ns` long (0 without a clock).
     fn countSync(self: *Log, ns: u64) void {
         self.counters.syncs += 1;
-        if (self.opts.monotonic_ns != null) self.counters.sync_latency.record(ns);
+        if (self.opts.monotonic_ns != null or self.opts.monotonic_ns_ctx != null) self.counters.sync_latency.record(ns);
     }
 
     /// Counters since `open`, and the log's state now. Of a writer.
@@ -1896,6 +1919,7 @@ pub const Log = struct {
     }
 
     fn stamp(self: *const Log) i64 {
+        if (self.opts.now_ctx) |f| return f(self.opts.clock_ctx);
         return if (self.opts.now) |f| f() else 0;
     }
 
@@ -2004,6 +2028,118 @@ pub const Log = struct {
         while (k + 1 < n and self.live_lsn.items[k + 1] <= lsn) k += 1;
         if (k == 0) return 0;
         return self.dropBefore(self.live.items[k]);
+    }
+
+    /// Remove every record above `lsn`, so that `lsn` becomes the last one and
+    /// the next append gets `lsn + 1` (tidwall/wal `TruncateBack`, commitlog
+    /// `truncate`, raft-wal's suffix truncation, Kafka's leader-change
+    /// truncation; the use is a replicated log dropping an uncommitted tail).
+    /// A no-op when `lsn` is at or above the last record. `lsn` below the first
+    /// record is `error.OutOfRange`.
+    ///
+    /// The one operation that **reuses LSNs** and the one that reopens a sealed
+    /// segment: the segment holding `lsn` loses everything after the record
+    /// (its seal, if it had one) and becomes the active segment again, every
+    /// later segment is dropped and its files deleted. Positions, iterators
+    /// and a read-only reader's view past `lsn` are stale afterwards. Needs a
+    /// raw segment (`error.CompressedSegment` otherwise, nothing changed).
+    ///
+    /// Crash order: the manifest first drops the later segments (a crash
+    /// there leaves the log cut at that segment's end, whole, no gap), then the
+    /// segment is cut at the record boundary and synced. The call is durable
+    /// when it returns; after a crash either state is a log whose records are
+    /// consecutive from its first LSN.
+    pub fn truncateAfter(self: *Log, lsn: u64) TruncateError!void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.poisoned) return error.Poisoned;
+        const first = self.firstLsn() orelse return;
+        const last = self.lastLsn() orelse return;
+        if (lsn >= last) return;
+        if (lsn < first) return error.OutOfRange;
+
+        // The segment holding `lsn`: the newest one whose first LSN is at or
+        // below it.
+        const n = self.live.items.len;
+        var k: usize = 0;
+        while (k + 1 < n and self.live_lsn.items[k + 1] <= lsn) k += 1;
+        if (self.live_form.items[k] != form_raw) return error.CompressedSegment;
+        const id = self.live.items[k];
+        const base = self.live_lsn.items[k];
+        const later = n - k - 1;
+
+        // Find where the cut goes before anything changes: the offset of the
+        // first record above `lsn`, or of the seal, whichever comes first.
+        var nb: [seg_name_len]u8 = undefined;
+        const seg_name = segName(&nb, id);
+        const cut = cut: {
+            const h = try self.store.open(seg_name, .read_only);
+            defer self.store.close(h);
+            const size = try self.store.size(h);
+            var w: Window = .{};
+            defer w.deinit(self.gpa);
+            var off: u64 = segment_header_len;
+            if (size < off) return error.Corrupt;
+            // A sealed segment's seal and records are checked by the reader;
+            // here only the records up to the cut must parse.
+            while (true) {
+                const raw = switch (try parseAt(&w, self.gpa, self.store, h, off, size, self.opts.max_record_len)) {
+                    .record => |r| r,
+                    // The newest segment may end in a torn tail: a cut at it
+                    // is the same cut `open` would make.
+                    .short, .bad_crc => if (k + 1 == n) break :cut off else return error.Corrupt,
+                    .too_long => return error.Corrupt,
+                };
+                switch (raw.typ) {
+                    rec_data => if (raw.lsn > lsn) break :cut off,
+                    rec_seal => break :cut off,
+                    else => return error.Corrupt,
+                }
+                off += raw.len;
+            }
+        };
+        _ = base;
+
+        // Allocations before the view changes (as `dropBefore`).
+        try self.pending.ensureUnusedCapacity(self.gpa, later);
+        try self.scratch.ensureTotalCapacity(self.gpa, manifestSize(k + 1, self.pending.items.len + later));
+
+        // The writer's handle and the reader's cache describe the old end.
+        if (self.active) |*a| {
+            a.index.deinit(self.gpa);
+            self.retire(a.handle);
+            self.active = null;
+        }
+        self.dropSeekCache();
+
+        if (later != 0) {
+            self.pending.appendSliceAssumeCapacity(self.live.items[k + 1 .. n]);
+            self.live.shrinkRetainingCapacity(k + 1);
+            self.live_lsn.shrinkRetainingCapacity(k + 1);
+            self.live_form.shrinkRetainingCapacity(k + 1);
+            // The later segments leave the log here, atomically.
+            try self.commitManifest();
+        }
+        // The sealed segment's index describes bytes that are about to go.
+        var ib: [seg_name_len]u8 = undefined;
+        self.store.delete(idxName(&ib, id)) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => |x| return self.poison(x),
+        };
+        {
+            const h = self.store.open(seg_name, .open_or_create) catch |e| return self.poison(e);
+            defer self.store.close(h);
+            self.store.truncate(h, cut) catch |e| return self.poison(e);
+            self.store.sync(h) catch |e| return self.poison(e);
+        }
+        // Re-adopt the segment as the active one: tally, index, next LSN.
+        const cut_before = self.cut_on_open;
+        self.openNewest() catch |e| {
+            self.poisoned = true; // the view no longer matches the disk
+            return e;
+        };
+        self.cut_on_open = cut_before;
+        self.deletePending() catch |e| return self.poison(e);
+        self.counters.segments_dropped += later;
     }
 
     /// `appendMany` with each record's own timestamp: an import of records
@@ -3893,6 +4029,12 @@ pub const Concurrent = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         return c.log.get(lsn, buf);
+    }
+
+    pub fn truncateAfter(c: *Concurrent, lsn: u64) TruncateError!void {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.truncateAfter(lsn);
     }
 
     pub fn dropBeforeLsn(c: *Concurrent, lsn: u64) DropError!usize {
@@ -9350,6 +9492,87 @@ test "G1: get does not return a neighbour when compaction dropped the record" {
     try testing.expectError(error.NotFound, log.get(1, &buf));
     try testing.expectEqualStrings("p2", try log.get(2, &buf));
     try testing.expectError(error.NotFound, log.get(3, &buf));
+}
+
+test "truncateAfter: cuts inside a sealed segment, drops later ones, reuses LSNs, survives a reopen" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try threeSegments(&log); // 1 = p1..p3, 2 = p4..p6, 3 = p7 (active)
+    // No-ops and refusals.
+    try log.truncateAfter(7);
+    try log.truncateAfter(1000);
+    _ = try log.dropBeforeLsn(4);
+    try testing.expectError(error.OutOfRange, log.truncateAfter(3));
+    // Into the sealed segment 2: p4, p5 stay; segment 3 goes.
+    try log.truncateAfter(5);
+    try testing.expectEqualSlices(u64, &.{2}, log.segments());
+    try testing.expectEqual(@as(?u64, 5), log.lastLsn());
+    try testing.expectEqual(@as(u64, 6), log.nextLsn());
+    var nb: [seg_name_len]u8 = undefined;
+    try testing.expect(sim.fileContent(segName(&nb, 3)) == null);
+    try expectPayloads(&log, null, &.{ "p4", "p5" });
+    const a = try log.append("q6"); // LSN 6 again
+    try testing.expectEqual(@as(u64, 6), a.lsn);
+    try expectPayloads(&log, null, &.{ "p4", "p5", "q6" });
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("q6", try log.get(6, &buf));
+    try testing.expectError(error.NotFound, log.get(7, &buf));
+    try testing.expectEqual(@as(?Position, null), try log.seek(7));
+    // Down to the last record of a segment: only the seal goes.
+    try log.rotate(5);
+    _ = try log.append("q7");
+    try log.truncateAfter(6);
+    try testing.expectEqualSlices(u64, &.{2}, log.segments()); // q7 was segment 5's only record
+    try expectPayloads(&log, null, &.{ "p4", "p5", "q6" });
+    try log.truncateAfter(6);
+    // Everything but the first record.
+    try log.truncateAfter(4);
+    try testing.expectEqualSlices(u64, &.{2}, log.segments());
+    try expectPayloads(&log, null, &.{"p4"});
+    _ = try log.append("r5");
+    // Reopen: the same log, and appends continue.
+    log.close();
+    log = try openSim(&sim);
+    try expectPayloads(&log, null, &.{ "p4", "r5" });
+    try testing.expectEqual(@as(u64, 6), log.nextLsn());
+    _ = try log.append("r6");
+    // A reader may not truncate.
+    var r = try openReader(&sim);
+    defer r.close();
+    try testing.expectError(error.ReadOnly, r.truncateAfter(4));
+}
+
+const CtxClock = struct {
+    t: i64 = 100,
+    mono: u64 = 0,
+    fn now(c: ?*anyopaque) i64 {
+        const self: *CtxClock = @ptrCast(@alignCast(c.?));
+        self.t += 1;
+        return self.t;
+    }
+    fn monotonic(c: ?*anyopaque) u64 {
+        const self: *CtxClock = @ptrCast(@alignCast(c.?));
+        self.mono += 1000;
+        return self.mono;
+    }
+};
+
+test "clock with a context: stamps and fsync latency come from the caller's state" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var ck: CtxClock = .{};
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .now_ctx = CtxClock.now, .monotonic_ns_ctx = CtxClock.monotonic, .clock_ctx = &ck });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    var it = log.iterator(null);
+    defer it.deinit();
+    const r = (try it.next()).?;
+    try testing.expect(r.ts > 100);
+    try testing.expect(ck.t > 100);
+    try testing.expect(log.stats().sync_latency.count > 0);
 }
 
 test "G1: dropBeforeLsn drops whole closed segments below the LSN, never the newest" {
