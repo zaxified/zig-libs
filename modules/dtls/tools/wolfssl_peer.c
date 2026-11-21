@@ -158,6 +158,11 @@ static const char *g_alpn = NULL;        // ALPN list offered (client) / accepte
 static const char *g_alpn_expect = NULL; // client: the name the server must answer
 static int g_keyupdate = 0;              // 1: our side initiates, 2: wolfSSL initiates
 static int g_cid = 0;                    // RFC 9146 / RFC 9147 section 9 connection ID
+// The `*-resume` certificate modes: a second connection resumes the first
+// one's session ticket (wolfSSL's default ticket key; HAVE_SESSION_TICKET).
+// The server prints `RESUMED <0|1>` per connection and fails unless the second
+// one resumed; the client fails unless `wolfSSL_session_reused` says so.
+static int g_resume = 0;
 
 // The connection IDs of the `*-cid` modes: wolfSSL asks for `kWolfCid`, and
 // the Zig side for `kZigCid` (duplicated in `tools/interop.zig`).
@@ -481,9 +486,17 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     printf("READY\n");
     fflush(stdout);
 
+    for (int round = 0; round < (g_resume ? 2 : 1); round++) {
     char probe[1];
     struct sockaddr_in peer = {0};
     socklen_t peer_len = sizeof(peer);
+    if (round > 0) {
+        // The next connection comes from a new client socket: drop the
+        // association and anything the old peer still sends.
+        struct sockaddr unspec = {0};
+        unspec.sa_family = AF_UNSPEC;
+        connect(fd, &unspec, sizeof(unspec));
+    }
     if (recvfrom(fd, probe, sizeof(probe), MSG_PEEK, (struct sockaddr *)&peer,
                  &peer_len) < 0) {
         perror("recvfrom peek");
@@ -513,6 +526,15 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
     if (report_alpn(ssl)) return 1;
+    if (g_resume) {
+        int reused = wolfSSL_session_reused(ssl);
+        printf("RESUMED %d\n", reused);
+        fflush(stdout);
+        if (reused != round) {
+            fprintf(stderr, "connection %d: session_reused %d\n", round + 1, reused);
+            return 1;
+        }
+    }
 
     // With `verify_peer` the handshake above cannot have succeeded without a
     // client certificate that chained to the anchor, but say so explicitly:
@@ -539,6 +561,7 @@ static int run_cert_server(int port, struct cert_server_opts o) {
 
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
+    }
     wolfSSL_CTX_free(ctx);
     close(fd);
     return 0;
@@ -571,6 +594,8 @@ static int run_cert_client(int port, int group) {
     if (!load_anchor(ctx)) return 1;
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
+    WOLFSSL_SESSION *saved = NULL;
+    for (int round = 0; round < (g_resume ? 2 : 1); round++) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -603,6 +628,10 @@ static int run_cert_client(int port, int group) {
         fprintf(stderr, "dtls_set_mtu failed\n");
         return 1;
     }
+    if (saved && wolfSSL_set_session(ssl, saved) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "set_session failed\n");
+        return 1;
+    }
     int rc = wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -611,14 +640,25 @@ static int run_cert_client(int port, int group) {
                 wolfSSL_ERR_error_string((unsigned long)err, buf));
         return 1;
     }
+    if (g_resume) {
+        int reused = wolfSSL_session_reused(ssl);
+        printf("RESUMED %d\n", reused);
+        fflush(stdout);
+        if (reused != round) {
+            fprintf(stderr, "connection %d: session_reused %d\n", round + 1, reused);
+            return 1;
+        }
+    }
     // The verify result is the point of this mode, so it is asserted rather
     // than assumed: X509_V_OK means the chain we presented chained to the
-    // anchor and its CertificateVerify signature checked out.
+    // anchor and its CertificateVerify signature checked out (on a resumed
+    // connection: the result carried over from the session's first one).
     long verify = wolfSSL_get_verify_result(ssl);
     if (verify != WOLFSSL_X509_V_OK) {
         fprintf(stderr, "peer chain not verified: %ld\n", verify);
         return 1;
     }
+    if (round == 0) {
     WOLFSSL_X509 *peer_cert = wolfSSL_get_peer_certificate(ssl);
     if (!peer_cert) { fprintf(stderr, "no peer certificate\n"); return 1; }
     char *subject =
@@ -626,6 +666,7 @@ static int run_cert_client(int port, int group) {
     printf("PEERCERT %s\n", subject ? subject : "?");
     fflush(stdout);
     wolfSSL_X509_free(peer_cert);
+    }
 
     const char *hello = "hello from wolfssl cert client";
     if (wolfSSL_write(ssl, hello, (int)strlen(hello)) <= 0) {
@@ -639,10 +680,18 @@ static int run_cert_client(int port, int group) {
     printf("ECHO %s\n", msg);
     fflush(stdout);
 
+    if (g_resume && round == 0) {
+        // The ticket came with the server's first flight after the handshake,
+        // read by wolfSSL_read above.
+        saved = wolfSSL_get1_session(ssl);
+        if (!saved) { fprintf(stderr, "no session to resume\n"); return 1; }
+    }
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
-    wolfSSL_CTX_free(ctx);
     close(fd);
+    }
+    if (saved) wolfSSL_SESSION_free(saved);
+    wolfSSL_CTX_free(ctx);
     return 0;
 }
 
@@ -1060,6 +1109,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-cert-ku-theirs") == 0) {
         g_keyupdate = 2;
         rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-cert-resume") == 0) {
+        g_resume = 1;
+        rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "client-cert-resume") == 0) {
+        g_resume = 1;
+        rc = run_cert_client(port, WOLFSSL_ECC_X25519);
     } else if (strcmp(argv[1], "client-cert") == 0) {
         rc = run_cert_client(port, WOLFSSL_ECC_X25519);
     } else if (strcmp(argv[1], "client-cert-mlkem") == 0) {

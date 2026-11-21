@@ -170,6 +170,11 @@ const Case = struct {
     sha384: bool = false,
     /// Ask for a connection ID (`zig_cid`); the peer asks for `wolf_cid`.
     cid: bool = false,
+    /// A second connection resumes the first one's session ticket (RFC 8446
+    /// §2.2, `psk_dhe_ke`): our client offers wolfSSL's ticket, or our server
+    /// (with `Config.tickets`) takes back the one it issued. Live-only: the
+    /// second connection is not recorded.
+    resumption: bool = false,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
@@ -472,6 +477,27 @@ const cases = [_]Case{
         .app_send = "hello from zig-libs, certificate mode",
         .app_expect = "hello from zig-libs, certificate mode",
         .why = "wolfSSL's KeyUpdate after a certificate handshake reaches OUR client engine and its message under the new keys decrypts",
+    },
+    .{
+        .name = "cert-client-resume",
+        .flow = .client,
+        .peer_mode = "server-cert-resume",
+        .seed = 0x3d,
+        .cert_mode = true,
+        .resumption = true,
+        .app_send = "hello from zig-libs, certificate mode",
+        .app_expect = "hello from zig-libs, certificate mode",
+        .why = "session resumption against a live server: our client keeps wolfSSL's NewSessionTicket and a second connection offers it (psk_dhe_ke, res binder); wolfSSL resumes (session_reused 1) and no certificate is exchanged",
+    },
+    .{
+        .name = "cert-server-resume",
+        .flow = .server,
+        .peer_mode = "client-cert-resume",
+        .seed = 0x4e,
+        .cert_mode = true,
+        .resumption = true,
+        .app_expect = "hello from wolfssl cert client",
+        .why = "OUR NewSessionTicket against a live client: wolfSSL stores it, offers it on a second connection, and OUR server resumes it (wolfSSL_session_reused 1)",
     },
 };
 
@@ -887,6 +913,35 @@ fn clientConfigBase(case: Case, fx: *const Fixtures) dtls.Config {
     };
 }
 
+/// The resumption cases' ticket sealing (`Config.tickets`): AES-256-GCM
+/// under a fixed test key, `nonce || ciphertext || tag`.
+const InteropTicketer = struct {
+    const A = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const key: [32]u8 = @splat(0x5a);
+    const ctx_byte: u8 = 0;
+
+    fn ticketer() dtls.Ticketer {
+        return .{ .ctx = &ctx_byte, .seal = seal, .open = open };
+    }
+
+    fn seal(_: *const anyopaque, pt: []const u8, nonce: [12]u8, out: []u8) ?[]u8 {
+        const n = 12 + pt.len + 16;
+        if (out.len < n) return null;
+        @memcpy(out[0..12], &nonce);
+        var tag: [16]u8 = undefined;
+        A.encrypt(out[12..][0..pt.len], &tag, pt, "", nonce, key);
+        @memcpy(out[12 + pt.len ..][0..16], &tag);
+        return out[0..n];
+    }
+
+    fn open(_: *const anyopaque, blob: []const u8, _: i64, out: []u8) ?[]u8 {
+        if (blob.len < 28 or out.len < blob.len - 28) return null;
+        const n = blob.len - 28;
+        A.decrypt(out[0..n], blob[12..][0..n], blob[12 + n ..][0..16].*, "", blob[0..12].*, key) catch return null;
+        return out[0..n];
+    }
+};
+
 fn serverConfigBase(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
     if (!case.cert_mode) return .{
         .role = .server,
@@ -909,6 +964,8 @@ fn serverConfigBase(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.
             .private_key = fx.serverKey(),
         },
         .alpn_protocols = case.alpn,
+        .tickets = if (case.resumption) .{ .ticketer = InteropTicketer.ticketer() } else null,
+        .now_sec = if (case.resumption) valid_now_sec else 0,
     };
 }
 
@@ -1091,6 +1148,7 @@ fn runClientFlow(
     var plain: [2048]u8 = undefined;
     const echoed = try recvApplicationData(io, sock, &conn, &rx, &plain, rec, null);
     try expectBytes("echoed application data", case.app_expect, echoed);
+    if (case.resumption) try resumeClient(io, case, fx, &server_addr, &conn, rnd, &stdout_reader.interface);
 
     switch (case.key_update) {
         .none => {},
@@ -1143,6 +1201,42 @@ fn runClientFlow(
         } else false;
         if (!found) return error.PeerNeverReportedOurCertificate;
     }
+}
+
+/// The second connection of a client resumption case: a fresh socket offers
+/// the ticket `first` kept, the handshake must resume (no certificate), the
+/// echo must come back, and the peer must report `RESUMED 1`.
+fn resumeClient(io: std.Io, case: Case, fx: *const Fixtures, server_addr: *const net.IpAddress, first: *const Connection, rnd: dtls.Entropy, peer_out: *std.Io.Reader) !void {
+    var ticket = (first.sessionTicket() orelse return error.NoTicketFromPeer).*;
+    defer ticket.wipe();
+    var off: Recorder = .{ .enabled = false, .out = undefined };
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var cfg = clientConfig(case, fx);
+    cfg.resumption = &ticket;
+    var conn = try Connection.clientInit(cfg);
+    defer conn.deinit();
+    var out: [4096]u8 = undefined;
+    var rx: [2048]u8 = undefined;
+    try sock.send(io, server_addr, try conn.startHandshake(rnd, 0, &out));
+    var steps: usize = 0;
+    while (conn.state != .connected) : (steps += 1) {
+        if (steps > 16) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        const result = try conn.handleFlight(incoming.data, rnd, 0, &out);
+        if (result.out.len > 0) try sock.send(io, server_addr, result.out);
+    }
+    if (!conn.resumed()) return error.TicketNotResumed;
+    try sock.send(io, server_addr, try conn.send(case.app_send, &out));
+    var plain: [2048]u8 = undefined;
+    try expectBytes("echo on the resumed connection", case.app_expect, try recvApplicationData(io, sock, &conn, &rx, &plain, &off, null));
+    var lines: usize = 0;
+    while (lines < 8) : (lines += 1) {
+        const line = peerLine(peer_out) catch break;
+        if (std.mem.eql(u8, line, "RESUMED 1")) return;
+    }
+    return error.PeerDidNotResume;
 }
 
 /// What a KeyUpdate case needs to answer a peer's KeyUpdate: where to send, a
@@ -1291,6 +1385,34 @@ fn keyUpdateTheirsServer(io: std.Io, sock: net.Socket, peer: *const net.IpAddres
     rec.hexArg("out", record);
     rec.end();
     try sock.send(io, peer, record);
+}
+
+/// The second connection of a server resumption case: the wolfSSL client
+/// comes back from a new socket with OUR ticket; the handshake must resume
+/// and its message is echoed. Datagrams still arriving from the first
+/// connection's address (its ACK of the ticket, its close_notify) are not
+/// the new client's and are dropped.
+fn resumeServer(io: std.Io, case: Case, fx: *const Fixtures, sock: net.Socket, old_peer: net.IpAddress, rnd: dtls.Entropy) !void {
+    var off: Recorder = .{ .enabled = false, .out = undefined };
+    var conn = try Connection.serverInit(serverConfig(case, fx, null));
+    defer conn.deinit();
+    var out: [4096]u8 = undefined;
+    var rx: [2048]u8 = undefined;
+    var peer: net.IpAddress = undefined;
+    var steps: usize = 0;
+    while (conn.state != .connected) : (steps += 1) {
+        if (steps > 24) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        if (incoming.from.eql(&old_peer)) continue;
+        peer = incoming.from;
+        const result = try conn.handleFlight(incoming.data, rnd, 0, &out);
+        if (result.out.len > 0) try sock.send(io, &peer, result.out);
+    }
+    if (!conn.resumed()) return error.TicketNotResumed;
+    var plain: [2048]u8 = undefined;
+    const received = try recvApplicationData(io, sock, &conn, &rx, &plain, &off, null);
+    try expectBytes("received on the resumed connection", case.app_expect, received);
+    try sock.send(io, &peer, try conn.send(received, &out));
 }
 
 /// The application-data read both directions share. A real peer puts other
@@ -1472,6 +1594,7 @@ fn runServerFlow(
     rec.hexArg("out", echo);
     rec.end();
     try sock.send(io, &peer_addr, echo);
+    if (case.resumption) try resumeServer(io, case, fx, sock, peer_addr, rnd);
     switch (case.key_update) {
         .none => {},
         .theirs => try keyUpdateTheirsServer(io, sock, &peer_addr, &conn.?, &out, &rx, &plain, rec),
@@ -2501,7 +2624,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // Marked BEFORE the case header goes in, so a failure rolls back
             // the header too rather than leaving a case with no body.
             const mark = t13.written().len;
-            rec.enabled = capture;
+            // A resumption case spans two connections and a ticket key the
+            // replay has no line for: live-only, never in the transcript.
+            rec.enabled = capture and !case.resumption;
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
             const result = switch (case.flow) {
