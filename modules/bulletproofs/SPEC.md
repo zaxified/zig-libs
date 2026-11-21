@@ -297,6 +297,8 @@ is done and testable but the other isn't. `kat_test.zig`'s gated tests report SK
 - **An arithmetic-circuit / R1CS proof API.** dalek's is experimental and unpublished (`yoloproofs`,
   feature-gated), so nobody ships it stable; recorded so it is not proposed again as a gap.
 - **Compatibility with secp256k1-zkp or Monero.** Other curves and other transcripts.
+- **Wider values (`n > 64`):** the reference, dalek's `RangeProof`, accepts only `n ∈ {8, 16, 32, 64}` with a `u64`
+  value; this module matches it.
 
 ## Anchoring
 
@@ -365,5 +367,3 @@ cannot see an error both sides share.
 ## Backlog / deferred
 
 - **Multi-party aggregation (dalek's dealer/party protocol):** parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
-- **Wider values (`n > 64`):** `v` is a `u64`; a wider variant needs a bignum witness type threaded through
-  `prove`'s bit-decomposition step — mechanical widening, no new cryptographic core; no consumer needs it. Effort: medium.
