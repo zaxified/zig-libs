@@ -128,6 +128,7 @@ pub const wol = @import("wol.zig");
 /// `PRIVFLAGS_GET`/`SET`.
 pub const privflags = @import("privflags.zig");
 pub const debug = @import("debug.zig");
+pub const plca_mm = @import("plca_mm.zig");
 /// `RSS_GET` (hash function, key, indirection table).
 pub const rss = @import("rss.zig");
 /// `TSINFO_GET`.
@@ -183,6 +184,13 @@ pub const Wol = wol.Wol;
 pub const WolSet = wol.WolSet;
 pub const Privflags = privflags.Privflags;
 pub const Debug = debug.Debug;
+pub const PlcaCfg = plca_mm.PlcaCfg;
+pub const PlcaSet = plca_mm.PlcaSet;
+pub const PlcaStatus = plca_mm.PlcaStatus;
+pub const Mm = plca_mm.Mm;
+pub const MmSet = plca_mm.MmSet;
+pub const MmStats = plca_mm.MmStats;
+pub const MmVerifyStatus = plca_mm.MmVerifyStatus;
 pub const DebugSet = debug.DebugSet;
 pub const PhcVclocks = debug.PhcVclocks;
 pub const FecStats = eee_fec.FecStats;
@@ -231,6 +239,11 @@ pub const buildWol = wol.buildWol;
 pub const buildSetWol = wol.buildSetWol;
 pub const buildPrivflags = privflags.buildPrivflags;
 pub const buildDebug = debug.buildDebug;
+pub const buildPlcaCfg = plca_mm.buildPlcaCfg;
+pub const buildPlcaStatus = plca_mm.buildPlcaStatus;
+pub const buildSetPlca = plca_mm.buildSetPlca;
+pub const buildMm = plca_mm.buildMm;
+pub const buildSetMm = plca_mm.buildSetMm;
 pub const buildSetDebug = debug.buildSetDebug;
 pub const buildPhcVclocks = debug.buildPhcVclocks;
 pub const buildFecWith = eee_fec.buildFecWith;
@@ -897,6 +910,7 @@ test {
     _ = wol;
     _ = privflags;
     _ = debug;
+    _ = plca_mm;
     _ = tsinfo;
     _ = rss;
     _ = client;

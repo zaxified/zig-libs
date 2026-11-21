@@ -59,6 +59,7 @@ const privflags_mod = @import("privflags.zig");
 const tsinfo_mod = @import("tsinfo.zig");
 const rss_mod = @import("rss.zig");
 const debug_mod = @import("debug.zig");
+const plca_mm = @import("plca_mm.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
 /// used by `EventSocket` below.
@@ -654,6 +655,49 @@ pub const Ethtool = struct {
         var reply = try cl.exchangeGet(msg, seq, uapi.FEC.HEADER, target);
         defer reply.deinit(cl.allocator());
         return eee_fec.parseFec(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_PLCA_GET_CFG` — 10BASE-T1S PLCA configuration. Unprivileged; `NotSupported` on a PHY without
+    /// PLCA.
+    pub fn plca(cl: *Ethtool, target: header.Target) RequestError!plca_mm.PlcaCfg {
+        const seq = cl.sock.nextSeq();
+        const msg = try plca_mm.buildPlcaCfg(cl.allocator(), cl.family_id, seq, target);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PLCA.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return plca_mm.parsePlcaCfg(reply.attrs) catch error.MalformedReply;
+    }
+
+    /// `ETHTOOL_MSG_PLCA_SET_CFG`. Needs **CAP_NET_ADMIN**.
+    pub fn setPlca(cl: *Ethtool, target: header.Target, set: plca_mm.PlcaSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try plca_mm.buildSetPlca(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.PLCA.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_PLCA_GET_STATUS` — is the PLCA cycle running. Unprivileged.
+    pub fn plcaStatus(cl: *Ethtool, target: header.Target) RequestError!plca_mm.PlcaStatus {
+        const seq = cl.sock.nextSeq();
+        const msg = try plca_mm.buildPlcaStatus(cl.allocator(), cl.family_id, seq, target);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PLCA.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return plca_mm.parsePlcaStatus(reply.attrs) catch error.MalformedReply;
+    }
+
+    /// `ETHTOOL_MSG_MM_GET` — the MAC merge (frame preemption) layer; with `want_stats` also its counters
+    /// (`Mm.stats`). Unprivileged; `NotSupported` on a MAC without it.
+    pub fn mm(cl: *Ethtool, target: header.Target, want_stats: bool) RequestError!plca_mm.Mm {
+        const seq = cl.sock.nextSeq();
+        const msg = try plca_mm.buildMm(cl.allocator(), cl.family_id, seq, target, want_stats);
+        var reply = try cl.exchangeGet(msg, seq, uapi.MM.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return plca_mm.parseMm(reply.attrs) catch error.MalformedReply;
+    }
+
+    /// `ETHTOOL_MSG_MM_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setMm(cl: *Ethtool, target: header.Target, set: plca_mm.MmSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try plca_mm.buildSetMm(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.MM.HEADER, target);
     }
 
     // ── every device at once (NLM_F_DUMP) ──────────────────────────────────

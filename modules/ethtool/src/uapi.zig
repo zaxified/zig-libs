@@ -519,6 +519,47 @@ pub const EEE = struct {
     pub const TX_LPI_TIMER: u16 = 7;
 };
 
+pub const PLCA = struct {
+    pub const HEADER: u16 = 1;
+    /// u16.
+    pub const VERSION: u16 = 2;
+    /// u8 bool.
+    pub const ENABLED: u16 = 3;
+    /// u8 bool (`GET_STATUS`).
+    pub const STATUS: u16 = 4;
+    /// u32.
+    pub const NODE_CNT: u16 = 5;
+    pub const NODE_ID: u16 = 6;
+    pub const TO_TMR: u16 = 7;
+    pub const BURST_CNT: u16 = 8;
+    pub const BURST_TMR: u16 = 9;
+};
+
+pub const MM = struct {
+    pub const HEADER: u16 = 1;
+    pub const PMAC_ENABLED: u16 = 2; // u8
+    pub const TX_ENABLED: u16 = 3; // u8
+    pub const TX_ACTIVE: u16 = 4; // u8
+    pub const TX_MIN_FRAG_SIZE: u16 = 5; // u32
+    pub const RX_MIN_FRAG_SIZE: u16 = 6; // u32
+    pub const VERIFY_ENABLED: u16 = 7; // u8
+    pub const VERIFY_STATUS: u16 = 8; // u8
+    pub const VERIFY_TIME: u16 = 9; // u32
+    pub const MAX_VERIFY_TIME: u16 = 10; // u32
+    pub const STATS: u16 = 11; // nest
+};
+
+/// The attributes inside the `MM.STATS` nest, all `u64`.
+pub const MM_STAT = struct {
+    pub const PAD: u16 = 1;
+    pub const REASSEMBLY_ERRORS: u16 = 2;
+    pub const SMD_ERRORS: u16 = 3;
+    pub const REASSEMBLY_OK: u16 = 4;
+    pub const RX_FRAG_COUNT: u16 = 5;
+    pub const TX_FRAG_COUNT: u16 = 6;
+    pub const HOLD_COUNT: u16 = 7;
+};
+
 pub const DEBUG = struct {
     pub const HEADER: u16 = 1;
     /// Bitset of `NETIF_MSG_*` classes.
