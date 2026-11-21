@@ -421,7 +421,7 @@ test can fail for want of hardware.**
   `dummy` on demand, so a capture is reachable.
 
 **Port functions, subfunctions, port parameters, reporter messages, notification filter.** `Port.function` decodes the
-`PORT_FUNCTION` nest (hardware address of up to 32 bytes, `FnState`, `FnOpstate`, capability bits `FN_CAP`, max IO
+`PORT_FUNCTION` nest (hardware address of up to 32 bytes, `PortFnState`, `PortFnOpstate`, capability bits `FN_CAP`, max IO
 event queues, the presence of the function's own devlink instance); `Port.has_function` stays. `setPortFunction`
 sends the nest for `PORT_SET` (refused: nothing set, an address that is empty or over 32 bytes, a state other than
 inactive/active, capability `value` bits outside `selector`, which the kernel's bitfield32 validation refuses too);

@@ -165,10 +165,27 @@ const next_due = manager.maintain();
 - **A fleet** sharing one storage: issuance runs under a storage lock, and
   `distributed_challenges = true` puts challenge data into storage so the node
   the CA reaches can answer for another node's order.
-- **OCSP stapling** (`Options.ocsp = .{ .transport = ocspcache.httpTransport(&http_client) }`): `maintain` keeps a
-  verified staple for every certificate whose leaf names an OCSP responder; `certificate` returns it as
-  `Material.ocsp_staple` for the TLS `status_request`. A failed fetch keeps the old staple until it expires; a
-  `revoked` answer renews the certificate at once (`Event.ocsp`).
+- **OCSP stapling** (`Options.ocsp = .{ .stapler = ... }`): `maintain` keeps a verified staple for every certificate
+  and `certificate` returns it as `Material.ocsp_staple` for the TLS `status_request`. A failed fetch keeps the old
+  staple until it expires; a `revoked` answer renews the certificate at once (`Event.ocsp`). The `Stapler` is yours;
+  `ocspcache` does the work (the manager does not depend on it):
+
+  ```zig
+  fn refresh(ctx: ?*anyopaque, gpa: Allocator, leaf: []const u8, issuer: []const u8, previous: ?[]const u8, now: i64) acme.Manager.StapleResult {
+      const my: *My = @ptrCast(@alignCast(ctx.?));
+      if ((ocspcache.discoverResponderUrl(leaf) catch null) == null) return .none;
+      var cache = ocspcache.Cache.init(gpa, my.transport, .{}); // ocspcache.httpTransport(&http_client)
+      defer cache.deinit();
+      const imported = if (previous) |p| if (cache.importStaple(leaf, issuer, p, now)) true else |_| false else false;
+      const fetched = cache.needsRefresh(leaf, now);
+      if (fetched) cache.refresh(leaf, issuer, now) catch |err| {
+          if (err == error.CertRevoked) return .revoked;
+          return .{ .failed = .{ .problem = @errorName(err), .keep_until = if (imported) my.until(&cache, leaf, now) else null } };
+      };
+      // export the entry with `cache.exportEntries`: its `response_der` and `next_update_unix`
+      return if (fetched) .{ .staple = .{ .der = der_copy, .until = next_update } } else .{ .keep = next_update };
+  }
+  ```
 - **Issued chains are checked**: verified to `trust_anchors` (default: the
   chain's own top certificate — set the CA roots when the storage is shared),
   every name covered, the key matching. A bad chain is a failure, never served.

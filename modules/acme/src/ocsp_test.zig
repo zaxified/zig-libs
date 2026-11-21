@@ -82,6 +82,53 @@ const Responder = struct {
     }
 };
 
+/// The adapter the README shows: `ocspcache` does the discovery, the fetch, the verification and reports `nextUpdate`.
+const CacheStapler = struct {
+    transport: ocspcache.Transport,
+
+    fn stapler(c: *CacheStapler) Manager.Stapler {
+        return .{ .ctx = c, .refresh = refresh };
+    }
+
+    fn untilOf(cache: *ocspcache.Cache, gpa: Allocator, leaf: []const u8, now: i64) ?struct { der: []u8, until: i64 } {
+        const list = cache.exportEntries(gpa, now) catch return null;
+        defer ocspcache.Cache.freeExported(gpa, list);
+        const key = ocspcache.Cache.subjectKey(leaf);
+        for (list) |x| if (std.mem.eql(u8, &x.subject_key, &key)) {
+            const der = gpa.dupe(u8, x.response_der) catch return null;
+            return .{ .der = der, .until = x.next_update_unix };
+        };
+        return null;
+    }
+
+    fn refresh(ctx: ?*anyopaque, gpa: Allocator, leaf: []const u8, issuer: []const u8, previous: ?[]const u8, now: i64) Manager.StapleResult {
+        const c: *CacheStapler = @ptrCast(@alignCast(ctx.?));
+        const url = ocspcache.discoverResponderUrl(leaf) catch null;
+        if (url == null) return .none;
+        var cache = ocspcache.Cache.init(gpa, c.transport, .{});
+        defer cache.deinit();
+        var imported = false;
+        if (previous) |p| imported = if (cache.importStaple(leaf, issuer, p, now)) true else |_| false;
+        var fetched = false;
+        if (cache.needsRefresh(leaf, now)) {
+            cache.refresh(leaf, issuer, now) catch |err| {
+                if (err == error.CertRevoked) return .revoked;
+                var keep: ?i64 = null;
+                if (imported) if (untilOf(&cache, gpa, leaf, now)) |k| {
+                    gpa.free(k.der);
+                    keep = k.until;
+                };
+                return .{ .failed = .{ .problem = @errorName(err), .keep_until = keep } };
+            };
+            fetched = true;
+        }
+        const k = untilOf(&cache, gpa, leaf, now) orelse return .{ .failed = .{ .problem = "OutOfMemory" } };
+        if (fetched) return .{ .staple = .{ .der = k.der, .until = k.until } };
+        gpa.free(k.der);
+        return .{ .keep = k.until };
+    }
+};
+
 const Events = struct {
     stapled: usize = 0,
     revoked: usize = 0,
@@ -111,6 +158,7 @@ const Lab = struct {
     ca: signing_ca.SigningCa,
     issuer: Issuer,
     responder: Responder,
+    cache_stapler: CacheStapler,
     events: Events = .{},
 
     fn init(l: *Lab, with_url: bool) !void {
@@ -121,6 +169,7 @@ const Lab = struct {
         if (with_url) l.ca.ocsp_url = "http://ocsp.test/";
         l.issuer = .{ .ca = &l.ca };
         l.responder = .{ .ca = &l.ca, .clock = &l.clock };
+        l.cache_stapler = .{ .transport = l.responder.transport() };
         l.events = .{};
     }
 
@@ -138,7 +187,7 @@ const Lab = struct {
             .random_seed = 3,
             .node_id = "node-a",
             .use_ari = false,
-            .ocsp = .{ .transport = l.responder.transport() },
+            .ocsp = .{ .stapler = l.cache_stapler.stapler() },
         });
         errdefer m.deinit();
         try m.addIssuer(l.issuer.issuer());

@@ -169,6 +169,11 @@ MODULES = {
             "HealthState": "HEALTH_REPORTER_STATE",
             "ParamType": "VAR_ATTR_TYPE",
         },
+        # The one irregular spelling of the port-function attributes: the kernel's first one says FUNCTION where
+        # its siblings say FN (`DEVLINK_PORT_FUNCTION_ATTR_HW_ADDR`, `DEVLINK_PORT_FN_ATTR_STATE`).
+        "member_aliases": {
+            "PORT_FN_ATTR.HW_ADDR": "DEVLINK_PORT_FUNCTION_ATTR_HW_ADDR",
+        },
         # Repo-local sizing constants (`bus_name_max`, `ifnamesize`, …) that
         # have no kernel spelling. Every enum member resolves; if this number
         # grows, something stopped being checked.

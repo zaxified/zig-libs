@@ -179,10 +179,11 @@ Run: `scripts/modtest idempotency`.
 
 ## Backlog / deferred
 
-- **A bundled shared backend** — e.g. over a `kv` server or a SQL store, closing the first-flight race
-  across processes. Today: implement `Backend` over the shared store (contract on the type; `lease_ns` for
-  crashed holders). Effort: medium, needs a shared store in zig-libs first. Fits §2.
+None open.
 
+## Roadmap
+
+- **A bundled backend shared between hosts** — over a network key-value or SQL store, closing the first-flight race across machines (`KvBackend` already closes it across processes on one host, through `kv`'s cross-process lock). Today: implement `Backend` over the shared store (contract on the type; `lease_ns` for crashed holders). Size: weeks — zig-libs has no network key-value or SQL client yet, so it needs a new store module (a client with an atomic set-if-absent and a lease) before the backend is a few hundred lines. Fits §2.
 
 ## Anchoring
 

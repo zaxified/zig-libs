@@ -62,8 +62,8 @@ pub const Function = struct {
     hw_addr_buf: [max_hw_addr]u8 = @splat(0),
     hw_addr_len: u8 = 0,
     has_hw_addr: bool = false,
-    state: ?uapi.FnState = null,
-    opstate: ?uapi.FnOpstate = null,
+    state: ?uapi.PortFnState = null,
+    opstate: ?uapi.PortFnOpstate = null,
     /// The capability bits that are set (`uapi.FN_CAP`); the selector the kernel echoes is not kept.
     caps: ?u32 = null,
     max_io_eqs: ?u32 = null,
@@ -84,21 +84,21 @@ pub fn parseFunction(nest_bytes: []const u8) codec.Error!Function {
     var f: Function = .{};
     var it: codec.AttrIterator = .{ .buf = nest_bytes };
     while (try it.next()) |a| switch (a.type) {
-        uapi.FN_ATTR.HW_ADDR => {
+        uapi.PORT_FN_ATTR.HW_ADDR => {
             if (a.data.len > max_hw_addr) return error.BadLength;
             @memcpy(f.hw_addr_buf[0..a.data.len], a.data);
             f.hw_addr_len = @intCast(a.data.len);
             f.has_hw_addr = true;
         },
-        uapi.FN_ATTR.STATE => f.state = @fromBackingInt(@intCast(try a.asU8())),
-        uapi.FN_ATTR.OPSTATE => f.opstate = @fromBackingInt(@intCast(try a.asU8())),
-        uapi.FN_ATTR.CAPS => {
+        uapi.PORT_FN_ATTR.STATE => f.state = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.PORT_FN_ATTR.OPSTATE => f.opstate = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.PORT_FN_ATTR.CAPS => {
             // struct nla_bitfield32 { u32 value; u32 selector; }
             if (a.data.len != 8) return error.BadLength;
             f.caps = std.mem.readInt(u32, a.data[0..4], native_endian);
         },
-        uapi.FN_ATTR.MAX_IO_EQS => f.max_io_eqs = try a.asU32(),
-        uapi.FN_ATTR.DEVLINK => f.has_devlink = true,
+        uapi.PORT_FN_ATTR.MAX_IO_EQS => f.max_io_eqs = try a.asU32(),
+        uapi.PORT_FN_ATTR.DEVLINK => f.has_devlink = true,
         else => {},
     };
     return f;
@@ -238,7 +238,7 @@ pub const FunctionSet = struct {
     /// The function's hardware (MAC) address, 1..32 bytes.
     hw_addr: ?[]const u8 = null,
     /// Activate or deactivate the function (`.active`, `.inactive`).
-    state: ?uapi.FnState = null,
+    state: ?uapi.PortFnState = null,
     /// Capability bits to change: the bits of `selector` are set to the matching bits of `value`.
     caps: ?struct { value: u32, selector: u32 } = null,
     /// How many IO event queues the function may use.
@@ -261,15 +261,15 @@ pub fn appendSetFunction(
     if (f.caps) |c| if (c.value & ~c.selector != 0) return error.InvalidRequest;
     try handle.appendPort(gpa, list, p);
     const nest = try codec.nestBegin(gpa, list, uapi.ATTR.PORT_FUNCTION);
-    if (f.hw_addr) |a| try appendBytes(gpa, list, uapi.FN_ATTR.HW_ADDR, a);
-    if (f.state) |s| try codec.appendAttrU8(gpa, list, uapi.FN_ATTR.STATE, @backingInt(s));
+    if (f.hw_addr) |a| try appendBytes(gpa, list, uapi.PORT_FN_ATTR.HW_ADDR, a);
+    if (f.state) |s| try codec.appendAttrU8(gpa, list, uapi.PORT_FN_ATTR.STATE, @backingInt(s));
     if (f.caps) |c| {
         var bf: [8]u8 = undefined;
         std.mem.writeInt(u32, bf[0..4], c.value, native_endian);
         std.mem.writeInt(u32, bf[4..8], c.selector, native_endian);
-        try appendBytes(gpa, list, uapi.FN_ATTR.CAPS, &bf);
+        try appendBytes(gpa, list, uapi.PORT_FN_ATTR.CAPS, &bf);
     }
-    if (f.max_io_eqs) |n| try codec.appendAttrU32(gpa, list, uapi.FN_ATTR.MAX_IO_EQS, n);
+    if (f.max_io_eqs) |n| try codec.appendAttrU32(gpa, list, uapi.PORT_FN_ATTR.MAX_IO_EQS, n);
     codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
@@ -806,15 +806,15 @@ test "parse decodes a subfunction's function nest" {
     try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_sf));
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_PCI_SF_NUMBER, 88);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.PORT_FUNCTION);
-    try codec.appendAttr(gpa, &list, uapi.FN_ATTR.HW_ADDR, &.{ 0x00, 0x00, 0x00, 0x00, 0x88, 0x88 });
-    try codec.appendAttrU8(gpa, &list, uapi.FN_ATTR.STATE, 1);
-    try codec.appendAttrU8(gpa, &list, uapi.FN_ATTR.OPSTATE, 1);
+    try codec.appendAttr(gpa, &list, uapi.PORT_FN_ATTR.HW_ADDR, &.{ 0x00, 0x00, 0x00, 0x00, 0x88, 0x88 });
+    try codec.appendAttrU8(gpa, &list, uapi.PORT_FN_ATTR.STATE, 1);
+    try codec.appendAttrU8(gpa, &list, uapi.PORT_FN_ATTR.OPSTATE, 1);
     var bf: [8]u8 = undefined;
     std.mem.writeInt(u32, bf[0..4], uapi.FN_CAP.ROCE | uapi.FN_CAP.IPSEC_CRYPTO, native_endian);
     std.mem.writeInt(u32, bf[4..8], 0xf, native_endian);
-    try codec.appendAttr(gpa, &list, uapi.FN_ATTR.CAPS, &bf);
-    try codec.appendAttrU32(gpa, &list, uapi.FN_ATTR.MAX_IO_EQS, 12);
-    const dl = try codec.nestBegin(gpa, &list, uapi.FN_ATTR.DEVLINK);
+    try codec.appendAttr(gpa, &list, uapi.PORT_FN_ATTR.CAPS, &bf);
+    try codec.appendAttrU32(gpa, &list, uapi.PORT_FN_ATTR.MAX_IO_EQS, 12);
+    const dl = try codec.nestBegin(gpa, &list, uapi.PORT_FN_ATTR.DEVLINK);
     try codec.nestEnd(&list, dl);
     try codec.nestEnd(&list, nest);
 
@@ -822,8 +822,8 @@ test "parse decodes a subfunction's function nest" {
     try testing.expect(p.has_function);
     const f = p.function.?;
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0x88, 0x88 }, f.hwAddr().?);
-    try testing.expectEqual(@as(?uapi.FnState, .active), f.state);
-    try testing.expectEqual(@as(?uapi.FnOpstate, .attached), f.opstate);
+    try testing.expectEqual(@as(?uapi.PortFnState, .active), f.state);
+    try testing.expectEqual(@as(?uapi.PortFnOpstate, .attached), f.opstate);
     try testing.expect(f.hasCap(uapi.FN_CAP.ROCE));
     try testing.expect(!f.hasCap(uapi.FN_CAP.MIGRATABLE));
     try testing.expect(f.hasCap(uapi.FN_CAP.IPSEC_CRYPTO));
@@ -834,11 +834,11 @@ test "parse decodes a subfunction's function nest" {
     try testing.expect((try parseFunction(&.{})).state == null);
     var bad: std.ArrayList(u8) = .empty;
     defer bad.deinit(gpa);
-    try codec.appendAttr(gpa, &bad, uapi.FN_ATTR.CAPS, &.{ 1, 2, 3 });
+    try codec.appendAttr(gpa, &bad, uapi.PORT_FN_ATTR.CAPS, &.{ 1, 2, 3 });
     try testing.expectError(error.BadLength, parseFunction(bad.items));
     var long: std.ArrayList(u8) = .empty;
     defer long.deinit(gpa);
-    try codec.appendAttr(gpa, &long, uapi.FN_ATTR.HW_ADDR, &@as([33]u8, @splat(1)));
+    try codec.appendAttr(gpa, &long, uapi.PORT_FN_ATTR.HW_ADDR, &@as([33]u8, @splat(1)));
     try testing.expectError(error.BadLength, parseFunction(long.items));
 }
 
@@ -863,12 +863,12 @@ test "buildSetPortFunction sends the port handle and a function nest; refusals n
         saw_fn = true;
         const f = try parseFunction(a.data);
         try testing.expectEqualSlices(u8, &.{ 0x02, 0, 0, 0, 0, 1 }, f.hwAddr().?);
-        try testing.expectEqual(@as(?uapi.FnState, .active), f.state);
+        try testing.expectEqual(@as(?uapi.PortFnState, .active), f.state);
         try testing.expectEqual(@as(?u32, uapi.FN_CAP.ROCE), f.caps);
         try testing.expectEqual(@as(?u32, 8), f.max_io_eqs);
         // The selector is on the wire next to the value.
         var jt = a.nested();
-        while (try jt.next()) |x| if (x.type == uapi.FN_ATTR.CAPS) {
+        while (try jt.next()) |x| if (x.type == uapi.PORT_FN_ATTR.CAPS) {
             try testing.expectEqual(uapi.FN_CAP.ROCE | uapi.FN_CAP.MIGRATABLE, std.mem.readInt(u32, x.data[4..8], native_endian));
         };
     }

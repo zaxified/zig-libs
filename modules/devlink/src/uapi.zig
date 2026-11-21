@@ -302,7 +302,7 @@ pub const ATTR = struct {
 };
 
 /// `enum devlink_port_function_attr`: the attributes inside `DEVLINK_ATTR_PORT_FUNCTION`.
-pub const FN_ATTR = struct {
+pub const PORT_FN_ATTR = struct {
     pub const HW_ADDR: u16 = 1; // binary
     pub const STATE: u16 = 2; // u8
     pub const OPSTATE: u16 = 3; // u8
@@ -311,7 +311,7 @@ pub const FN_ATTR = struct {
     pub const MAX_IO_EQS: u16 = 6; // u32
 };
 
-/// `DEVLINK_PORT_FN_CAP_*`: the capability bits of a port function (`FN_ATTR.CAPS`).
+/// `DEVLINK_PORT_FN_CAP_*`: the capability bits of a port function (`PORT_FN_ATTR.CAPS`).
 pub const FN_CAP = struct {
     pub const ROCE: u32 = 1 << 0;
     pub const MIGRATABLE: u32 = 1 << 1;
@@ -320,14 +320,14 @@ pub const FN_CAP = struct {
 };
 
 /// `enum devlink_port_fn_state`: the administrative state of a function.
-pub const FnState = enum(u8) {
+pub const PortFnState = enum(u8) {
     inactive = 0,
     active = 1,
     _,
 };
 
 /// `enum devlink_port_fn_opstate`: whether the driver is attached to the function.
-pub const FnOpstate = enum(u8) {
+pub const PortFnOpstate = enum(u8) {
     detached = 0,
     attached = 1,
     _,

@@ -28,10 +28,11 @@
 //!   autocert's redirect-to-HTTPS fallback) and TLS-ALPN-01
 //!   (`tlsAlpnMaterial`) itself — give `challengeSolvers()` to the
 //!   `Client`s. DNS-01 stays the client's (`Options.dns_publisher`, `acmedns`).
-//! - **OCSP stapling** (CertMagic's staple maintenance): `Options.ocsp` has
-//!   `maintain` fetch, verify (`ocspcache`) and refresh an OCSP response for
-//!   each certificate whose leaf names a responder, hand it out as
-//!   `Material.ocsp_staple`, and renew a certificate the CA reports revoked.
+//! - **OCSP stapling** (CertMagic's staple maintenance): with `Options.ocsp`
+//!   `maintain` keeps an OCSP response per certificate through the caller's
+//!   `Stapler` (fetch and verification are theirs; `ocspcache` does both),
+//!   hands it out as `Material.ocsp_staple`, and renews a certificate the CA
+//!   reports revoked.
 //! - **on-demand** (autocert `HostPolicy`, CertMagic `OnDemandConfig`):
 //!   `Options.on_demand` obtains a certificate during the first handshake
 //!   for a name the policy allows, rate-limited.
@@ -56,7 +57,6 @@ const router = @import("router");
 const pkix = @import("x509");
 const rsa = @import("rsa");
 const keycodec = @import("keycodec");
-const ocspcache = @import("ocspcache");
 const netaddr = @import("netaddr");
 const Client = @import("Client.zig");
 const jws = @import("jws.zig");
@@ -138,8 +138,8 @@ pub const Options = struct {
     http_redirect: bool = false,
     on_event: ?EventHook = null,
     on_demand: ?OnDemand = null,
-    /// Keep an OCSP staple for every certificate whose leaf has an OCSP
-    /// responder URL and whose chain carries its issuer (CertMagic's OCSP
+    /// Keep an OCSP staple for every certificate whose chain carries its
+    /// issuer, through the caller's `Stapler` (CertMagic's OCSP
     /// maintenance); null: none.
     ocsp: ?Ocsp = null,
     /// Time source, epoch seconds; null: the io's real clock.
@@ -150,20 +150,42 @@ pub const Options = struct {
 
 pub const IssuerPolicy = enum { in_order, random };
 
-/// OCSP stapling. `maintain` checks each certificate every `interval_s`
-/// seconds; a check fetches a fresh response when there is none or the cached
-/// one is within `config.refresh_margin_seconds` of its `nextUpdate`, and
-/// verifies it (`ocspcache.Cache.refresh`). A failed fetch keeps the staple
-/// served until it expires (nginx and CertMagic do the same). A verified
-/// `revoked` answer drops the staple and renews the certificate at once.
-/// A certificate whose leaf has no OCSP URL (Let's Encrypt, since 2025) or
-/// whose chain lacks the issuer is left alone.
+/// What a `Stapler` answers for one certificate.
+pub const StapleResult = union(enum) {
+    /// A verified, current response: DER, allocated with the `gpa` the call was given (the manager owns it from
+    /// here), servable until `until` (epoch seconds, normally its `nextUpdate`).
+    staple: struct { der: []u8, until: i64 },
+    /// The `previous` staple is still good and not due for a refresh: keep it until `until`.
+    keep: i64,
+    /// The CA's signed answer is "revoked": stop stapling, renew the certificate now.
+    revoked,
+    /// Nothing to staple for this certificate (the CA runs no OCSP responder for it).
+    none,
+    /// No answer this time (a soft failure: unreachable responder, a response that does not verify, ...).
+    /// `problem` is for the event; `keep_until` is set when the `previous` staple is still servable, so the
+    /// manager keeps it.
+    failed: struct { problem: []const u8, keep_until: ?i64 = null },
+};
+
+/// Gets and verifies OCSP responses; the manager only schedules, stores and serves them. `ocspcache.Cache` does
+/// the whole job (discover the responder URL, fetch, verify against the issuer, report `nextUpdate`): see the
+/// README for a ten-line adapter. Called from the thread that runs `maintain`, one certificate at a time, outside
+/// the manager's lock; it may block on the network.
+pub const Stapler = struct {
+    ctx: ?*anyopaque = null,
+    /// `leaf_der` (issued by `issuer_der`, both DER) at epoch second `now`. `previous` is the staple the manager
+    /// holds, or one it loaded from storage after a restart (never trusted: verify it before answering `keep`),
+    /// null when there is none. Allocate a `staple` with `gpa`.
+    refresh: *const fn (ctx: ?*anyopaque, gpa: Allocator, leaf_der: []const u8, issuer_der: []const u8, previous: ?[]const u8, now: i64) StapleResult,
+};
+
+/// OCSP stapling. `maintain` checks each certificate every `interval_s` seconds through `stapler`. A failed check
+/// keeps the old staple while the stapler says it is servable (nginx and CertMagic do the same); a `revoked` answer
+/// drops the staple and renews the certificate at once. A certificate whose chain does not carry its issuer is
+/// left alone.
 pub const Ocsp = struct {
-    /// How responders are reached, e.g. `ocspcache.httpTransport(&client)`.
-    transport: ocspcache.Transport,
-    config: ocspcache.Config = .{},
-    /// Seconds between checks (a failed check is retried after a tenth of this,
-    /// at least a minute); at least 60.
+    stapler: Stapler,
+    /// Seconds between checks (a failed check is retried after a tenth of this, at least a minute); at least 60.
     interval_s: u32 = 3600,
 };
 
@@ -1005,10 +1027,8 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
     }
 }
 
-/// One OCSP check of the entry's certificate (it is busy, we are outside the
-/// lock). A throwaway `ocspcache.Cache` does the verified fetch: the entry's
-/// own staple (or the stored one) is imported into it first, so a still-fresh
-/// staple costs no request, and the result is copied back.
+/// One OCSP check of the entry's certificate (it is busy, we are outside the lock): hand the leaf, its issuer and
+/// the staple we hold (or the stored one) to the `Stapler` and act on its answer.
 fn refreshOcsp(m: *Manager, e: *Entry, t: i64) void {
     const oc = m.options.ocsp orelse return;
     const interval: i64 = @max(oc.interval_s, 60);
@@ -1020,57 +1040,48 @@ fn refreshOcsp(m: *Manager, e: *Entry, t: i64) void {
         return m.ocspDone(e, 0); // no usable chain: nothing to staple
     };
     if (chain.len < 2) return m.ocspDone(e, 0); // no issuer to ask for
-    const leaf = chain[0];
-    const issuer = chain[1];
-    const url = ocspcache.discoverResponderUrl(leaf) catch null;
-    if (url == null) return m.ocspDone(e, 0); // this CA has no OCSP
 
-    var cache = ocspcache.Cache.init(m.gpa, oc.transport, oc.config);
-    defer cache.deinit();
-    var imported = false;
-    if (e.staple) |st| {
-        imported = if (cache.importStaple(leaf, issuer, st, t)) true else |_| false;
-    } else if (m.options.storage.load(m.gpa, m.keyOf(e, ".ocsp").slice())) |blob| {
-        defer m.gpa.free(blob);
-        imported = if (cache.importStaple(leaf, issuer, blob, t)) true else |_| false;
-    } else |_| {}
-
-    var fetched = false;
-    if (cache.needsRefresh(leaf, t)) {
-        cache.refresh(leaf, issuer, t) catch |err| {
-            if (err == error.CertRevoked) return m.ocspRevoked(e, t);
-            // Soft fail: the staple we have (if any) is still served.
-            m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .failed, .problem = @errorName(err), .response_der = null } });
-            if (imported) _ = m.adoptStaple(e, &cache, leaf, t, false);
-            return m.ocspDone(e, t +| retry);
-        };
-        fetched = true;
+    var stored: ?[]u8 = null;
+    defer if (stored) |b| m.gpa.free(b);
+    const previous: ?[]const u8 = if (e.staple) |st| st else blk: {
+        stored = m.options.storage.load(m.gpa, m.keyOf(e, ".ocsp").slice()) catch null;
+        break :blk stored;
+    };
+    const had_staple = e.staple != null;
+    const res = oc.stapler.refresh(oc.stapler.ctx, m.gpa, chain[0], chain[1], previous, t);
+    switch (res) {
+        .none => m.ocspDone(e, 0),
+        .revoked => m.ocspRevoked(e, t),
+        .keep => |until| {
+            if (!had_staple) if (previous) |p| m.adoptStaple(e, p, until, false);
+            m.ocspDone(e, t +| interval);
+        },
+        .staple => |s| {
+            m.adoptStaple(e, s.der, s.until, true);
+            m.gpa.free(s.der);
+            m.ocspDone(e, t +| interval);
+        },
+        .failed => |f| {
+            m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .failed, .problem = f.problem, .response_der = null } });
+            if (!had_staple) if (previous) |p| if (f.keep_until) |until| m.adoptStaple(e, p, until, false);
+            m.ocspDone(e, t +| retry);
+        },
     }
-    _ = m.adoptStaple(e, &cache, leaf, t, fetched);
-    m.ocspDone(e, t +| interval);
 }
 
-/// Copy the cache's staple for `leaf` into the entry (and storage, when it was just fetched).
-fn adoptStaple(m: *Manager, e: *Entry, cache: *ocspcache.Cache, leaf: []const u8, t: i64, fetched: bool) bool {
-    const list = cache.exportEntries(m.gpa, t) catch return false;
-    defer ocspcache.Cache.freeExported(m.gpa, list);
-    const key = ocspcache.Cache.subjectKey(leaf);
-    for (list) |x| {
-        if (!std.mem.eql(u8, &x.subject_key, &key)) continue;
-        const copy = m.gpa.dupe(u8, x.response_der) catch return false;
-        m.mutex.lockUncancelable(m.io);
-        if (e.staple) |old| m.gpa.free(old);
-        e.staple = copy;
-        e.staple_until = x.next_update_unix;
-        const removed = e.removed;
-        m.mutex.unlock(m.io);
-        if (fetched and !removed) {
-            m.options.storage.store(m.keyOf(e, ".ocsp").slice(), copy) catch {};
-            m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .stapled, .problem = "", .response_der = copy } });
-        }
-        return true;
+/// Make `der` (copied) the entry's staple, servable until `until`; `fresh` writes it to storage and reports it.
+fn adoptStaple(m: *Manager, e: *Entry, der: []const u8, until: i64, fresh: bool) void {
+    const copy = m.gpa.dupe(u8, der) catch return;
+    m.mutex.lockUncancelable(m.io);
+    if (e.staple) |old| m.gpa.free(old);
+    e.staple = copy;
+    e.staple_until = until;
+    const removed = e.removed;
+    m.mutex.unlock(m.io);
+    if (fresh and !removed) {
+        m.options.storage.store(m.keyOf(e, ".ocsp").slice(), copy) catch {};
+        m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .stapled, .problem = "", .response_der = copy } });
     }
-    return false;
 }
 
 fn ocspDone(m: *Manager, e: *Entry, next: i64) void {

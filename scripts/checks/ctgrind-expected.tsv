@@ -1790,12 +1790,12 @@ aesccm	ReleaseFast	aead	1	8	e36c5e8d79e2c281	d38f305d54b5a2c3
 # verdicts along a handshake and data, plus innerLength on the decrypted inner IP
 # header (version and length, the packet's, not a key's). No context on a key byte,
 # and no table load. Positive evidence is the witness: every row prints derived bytes.
-wireguard	ReleaseFast	keyb64	1	1	7bbcc4ca9cbbe5bf	bdb7682658e5959b
-wireguard	ReleaseFast	keyhex	1	1	7bbcc4ca9cbbe5bf	1e487ba1ad51a2cb
-wireguard	ReleaseFast	handshake	1	4	7bbcc4ca9cbbe5bf	40f18e84501394fa
-wireguard	ReleaseFast	transport	1	1	7bbcc4ca9cbbe5bf	fe029b53e647276b
-wireguard	ReleaseFast	cookie	1	0	7bbcc4ca9cbbe5bf	786bd5e71e9b6d06
-wireguard	ReleaseFast	tunnel	1	9	7bbcc4ca9cbbe5bf	8f458611fc103bea
+wireguard	ReleaseFast	keyb64	1	1	e3bba5e674102f92	bdb7682658e5959b
+wireguard	ReleaseFast	keyhex	1	1	e3bba5e674102f92	1e487ba1ad51a2cb
+wireguard	ReleaseFast	handshake	1	4	e3bba5e674102f92	40f18e84501394fa
+wireguard	ReleaseFast	transport	1	1	e3bba5e674102f92	fe029b53e647276b
+wireguard	ReleaseFast	cookie	1	0	e3bba5e674102f92	786bd5e71e9b6d06
+wireguard	ReleaseFast	tunnel	1	9	e3bba5e674102f92	8f458611fc103bea
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
@@ -2532,8 +2532,8 @@ tlsserver	ReleaseFast	hs	1	24	25e02f2db7d88b7f	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	442	25e02f2db7d88b7f	c257fcbb1b68d8df	cpu=x86_64
 mls	ReleaseFast	priv	1	5	3eb090c51a286cc7	616cb338b933af50	cpu=x86_64
 mls	ReleaseFast	group	1	3	93f740bb89511bda	f4c3dc710c6be88a	cpu=x86_64
-wireguard	ReleaseFast	handshake	1	13	7bbcc4ca9cbbe5bf	40f18e84501394fa	cpu=x86_64
-wireguard	ReleaseFast	tunnel	1	14	7bbcc4ca9cbbe5bf	8f458611fc103bea	cpu=x86_64
+wireguard	ReleaseFast	handshake	1	13	e3bba5e674102f92	40f18e84501394fa	cpu=x86_64
+wireguard	ReleaseFast	tunnel	1	14	e3bba5e674102f92	8f458611fc103bea	cpu=x86_64
 tls13	ReleaseFast	x25519_shared	1	1	4115b347f0c1b95d	d94c3e5680258153	cpu=x86_64
 tls13	ReleaseFast	x25519_server	1	1	4115b347f0c1b95d	a919bb6546cae368	cpu=x86_64
 tls13	ReleaseFast	x25519mlkem768_shared	1	1	4115b347f0c1b95d	6b26c450a8a3715f	cpu=x86_64

@@ -194,18 +194,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   caller configured, so its hosts are trusted; everything the CA says later must stay on them.
   certbot, lego and acme.sh do no such check (they follow the CA wherever it points); this module is
   stricter on purpose (security first, opt-out kept).
-  **OCSP stapling** (`Options.ocsp`, CertMagic's staple maintenance): for each certificate whose leaf has an OCSP
-  responder URL (AIA) and whose chain carries its issuer, `maintain` checks every `interval_s` (default an hour)
-  through a throwaway `ocspcache.Cache` — the entry's own staple (or the stored `certificates/<name>.ocsp`) is imported
-  and re-verified first, a fresh one costs no request, one within `config.refresh_margin_seconds` (12 h) of its
-  `nextUpdate` is fetched anew (`ocspcache` verifies it against the issuer; only `good` is kept) — and copies the
-  result to the entry and to storage. `certificate` hands it out as `Material.ocsp_staple`, never past its
-  `nextUpdate`. A failed check keeps the old staple (soft fail, as nginx and CertMagic), is reported as an
-  `ocsp` event with kind `failed` and retried after a tenth of the interval (a minute at least). A verified `revoked`
-  answer drops the staple and the stored copy, reports kind `revoked` and renews the certificate at once. The transport
-  (`ocspcache.Transport`, e.g. `httpTransport`) is the caller's. A leaf without an OCSP URL (Let's Encrypt switched its
-  responders off in 2025) or a chain without the issuer is left alone (CertMagic fetches a missing issuer through the
-  AIA `caIssuers` URL; not done here, the chain the CA returns carries it).
+  **OCSP stapling** (`Options.ocsp`, CertMagic's staple maintenance): for each certificate whose chain carries the leaf's
+  issuer, `maintain` calls the caller's `Stapler` every `interval_s` (default an hour) with the leaf, the issuer and
+  the staple it holds (or the stored `certificates/<name>.ocsp` after a restart, never trusted) and acts on the answer:
+  `staple` (a verified response and the time it stops being servable) is kept, stored and reported as an `ocsp` event;
+  `keep` leaves the held one; `none` (the CA has no responder for the leaf; Let's Encrypt switched its responders off in
+  2025) stops the checks for this certificate; `failed` is a soft failure (reported, retried after a tenth of the
+  interval, at least a minute, the old staple served while the stapler says it still is); `revoked` drops the staple and
+  the stored copy, is reported and renews the certificate at once. `certificate` hands the staple out as
+  `Material.ocsp_staple`, never past its `until`. The stapler is where the work is: `ocspcache.Cache` discovers the
+  responder URL, fetches through a `Transport`, verifies against the issuer and reports `nextUpdate`; the README shows
+  the ten-line adapter and `src/ocsp_test.zig` runs it. The manager does not depend on `ocspcache` or `ocsp`, so a
+  server that wants no stapling carries neither. A missing issuer is not fetched through the AIA `caIssuers` URL as
+  CertMagic does: the chain the CA returns carries it.
 - DNS-01 proves control of the domain's DNS zone, and a wildcard certificate covers every name under
   it: the publisher's DNS credentials are as sensitive as the account key, and they stay the caller's
   (the library never sees them). Out of scope (see *What is deliberately not done*, *Backlog / deferred*): DNS provider integrations beyond
@@ -275,7 +276,7 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
   parsing, the whole issuance with an ES384 account and certificate key. External oracles: openssl built the P-384 CSR
   and the P-384/P-256 PKCS#8 keys (our PEM output is byte-identical), Python computed the P-384 canonical JWK and
   thumbprint.
-- **OCSP stapling (`src/ocsp_test.zig`):** the signing mock CA issues leaves with an AIA responder URL and signs real
+- **OCSP stapling (`src/ocsp_test.zig`):** the `ocspcache` adapter behind a `Stapler`; the signing mock CA issues leaves with an AIA responder URL and signs real
   OCSP responses (`SigningCa.ocspResponse`) behind a mock transport; an injected clock makes every schedule exact. Covers
   the staple after issuance, no request while fresh, the refresh ahead of `nextUpdate`, a failing responder keeping the
   staple until it expires and recovering, `revoked` renewing the certificate, a leaf without a responder, and a restart
