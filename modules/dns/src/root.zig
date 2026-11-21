@@ -165,6 +165,7 @@ test {
     _ = @import("fuzz_test.zig");
     // No-panic sweep (wave GV).
     _ = @import("sweep_test.zig");
+    _ = @import("features_test.zig");
 }
 
 test "reverseName: IPv4" {

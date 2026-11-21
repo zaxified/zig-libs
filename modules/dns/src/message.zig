@@ -107,6 +107,9 @@ pub const Rcode = enum(u12) {
     not_auth = 9,
     not_zone = 10,
     bad_vers = 16,
+    /// RFC 7873 §5.2.3: the server cookie in the query was missing or wrong;
+    /// the reply carries the right one.
+    bad_cookie = 23,
     _,
 };
 

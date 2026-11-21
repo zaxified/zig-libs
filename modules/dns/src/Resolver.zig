@@ -94,8 +94,68 @@ rotate_next: usize = 0,
 /// End of the current public call's `call_timeout_ms` budget; set by the
 /// OUTERMOST public call only (`beginCall`), so nested calls share it.
 call_deadline: ?std.Io.Clock.Timestamp = null,
+/// Per-server memory (failover marks, DNS cookies, the idle DoT session),
+/// allocated by `ensureState` when an option needs it. Shared by the
+/// parallel family's copy of the Resolver, hence the mutex inside.
+state: ?*State = null,
 
 const max_no_edns = 8;
+/// Servers `State` keeps marks and cookies for (the oldest entry is replaced).
+const max_tracked = 16;
+/// Servers of one query the failover memory orders (the rest keep their place).
+const max_ordered = 64;
+
+/// RFC 7873 §4: the server cookie is 8..32 bytes.
+const max_server_cookie = 32;
+const cookie_option = 10;
+const padding_option = 12;
+
+const Health = struct {
+    ip: ?netaddr.Ip = null,
+    /// When the server last failed (`Clock.awake`, ns); meaningful while `failed`.
+    failed_ns: i96 = 0,
+    failed: bool = false,
+};
+
+const CookieSlot = struct {
+    ip: ?netaddr.Ip = null,
+    client: [8]u8 = @splat(0),
+    server: [max_server_cookie]u8 = @splat(0),
+    server_len: u8 = 0,
+};
+
+/// One idle DoT session, owned by whoever took it out of `State.dot`.
+const DotConn = struct {
+    server: netaddr.Ip,
+    slab: []u8,
+    stream: net.Stream,
+    sr: net.Stream.Reader,
+    sw: net.Stream.Writer,
+    tc: tlsclient.Client,
+
+    fn close(c: *DotConn, io: std.Io, gpa: std.mem.Allocator) void {
+        c.tc.end() catch {};
+        c.sw.interface.flush() catch {};
+        c.stream.close(io);
+        std.crypto.secureZero(u8, c.slab);
+        gpa.free(c.slab);
+        gpa.destroy(c);
+    }
+};
+
+const State = struct {
+    mutex: std.Io.Mutex = .init,
+    health: [max_tracked]Health = @splat(.{}),
+    health_next: u8 = 0,
+    cookies: [max_tracked]CookieSlot = @splat(.{}),
+    cookies_next: u8 = 0,
+    dot: if (dot_enabled) ?*DotConn else void = if (dot_enabled) null else {},
+
+    fn healthOf(st: *State, ip: netaddr.Ip) ?*Health {
+        for (&st.health) |*h| if (h.ip) |x| if (x.eql(ip)) return h;
+        return null;
+    }
+};
 
 pub const Family = enum { any, v4, v6 };
 
@@ -106,7 +166,7 @@ pub const Transport = enum {
     tcp,
     /// DNS over TLS (RFC 7858): TCP to `Options.dot_port`, a TLS handshake,
     /// then the RFC 1035 §4.2.2 two-byte framing inside the session. One
-    /// connection per exchange. Authenticated by default (`dot_tls`,
+    /// connection per exchange (`Options.dot_reuse` keeps it open). Authenticated by default (`dot_tls`,
     /// `tls_server_name`); a failed handshake is `error.TlsFailed`, never a
     /// plain-DNS retry. Needs a build with `dot_enabled`, else `NoDotSupport`.
     /// `doh_url`, when set, still wins over every transport.
@@ -218,6 +278,45 @@ pub const Options = struct {
     /// EDNS options sent with every query (cookie, NSID, padding …), at most
     /// `message.max_edns_options_len` bytes; else `InvalidOptions`.
     edns_options: []const message.EdnsOption = &.{},
+    /// RFC 7873 DNS cookies (BIND, Knot, Unbound, PowerDNS Recursor, dig and
+    /// miekg/dns do them; Go's resolver, glibc and dnspython do not, so off by
+    /// default): every plain UDP/TCP/DoT query to a server carries a COOKIE
+    /// option -- an 8-byte client cookie made from `io.random` and kept per
+    /// server for the life of the `Resolver`, plus the server cookie the
+    /// server last returned. A reply whose client cookie differs from ours
+    /// is dropped like a spoofed datagram (RFC 7873 §5.2.3); a BADCOOKIE
+    /// reply (RCODE 23) is asked once more with the server cookie it carried.
+    /// A server that answers without a COOKIE option is accepted (§5.2.1).
+    /// Not applied to DoH, to `exchange`, nor to a query a server refused
+    /// EDNS for. An explicit COOKIE option in `edns_options` is sent as is,
+    /// in addition. Needs `edns_udp_size`.
+    cookies: bool = false,
+    /// RFC 8467 §4.1 block-length padding of queries (the recommended block
+    /// is 128): over `.tls` and DoH, an RFC 7830 padding option of zero bytes
+    /// makes the query a multiple of this many bytes, so its size reveals
+    /// less. 0 = none. Needs `edns_udp_size`; a block over
+    /// `message.max_edns_options_len` (128, the usable maximum) is
+    /// `InvalidOptions`; padding that does not fit that bound together with the
+    /// other options is left out. Not applied to `exchange` or to plain UDP/TCP.
+    edns_padding_block: u16 = 0,
+    /// Server failover memory (c-ares `ARES_OPT_SERVER_FAILOVER`; hickory
+    /// orders servers by past performance): null = none, every query starts
+    /// at the first server (or the next with `rotate`), as Go does. When set,
+    /// a server whose attempt failed (no reply in time, a network failure, a
+    /// failure rcode) is asked after the others until `Failover.retry_delay_ms`
+    /// has passed, and then, with a `Failover.retry_percent` chance per
+    /// query, in its normal place again. A success clears the mark. The memory
+    /// belongs to the `Resolver` (a `CachingResolver` keeps one per pooled
+    /// `Resolver`).
+    server_failover: ?Failover = null,
+    /// DoT connection reuse (RFC 7858 §3.4): `transport = .tls` keeps the
+    /// session open after an exchange and sends the next query over it,
+    /// instead of one connection per exchange. One idle session per
+    /// `Resolver` (for one server); a session the server dropped meanwhile is
+    /// replaced by a fresh one and the query repeated once. It is closed by
+    /// `deinit`, by an exchange error, or when another server is asked. The
+    /// default, one connection per exchange, holds no socket between calls.
+    dot_reuse: bool = false,
     /// DNS 0x20 (draft-vixie-dnsext-dns0x20; c-ares `ARES_FLAG_DNS0X20`,
     /// hickory `case_randomization`): every UDP query spells its name with
     /// randomly mixed ASCII case, and a reply must echo the question in
@@ -239,6 +338,14 @@ pub const Options = struct {
     resolv_conf_recheck_ms: ?u32 = 5000,
     hosts_path: []const u8 = "/etc/hosts",
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
+};
+
+/// `Options.server_failover` (c-ares defaults: 5 s, 10 %).
+pub const Failover = struct {
+    /// A failed server is left to the end of the line for at least this long.
+    retry_delay_ms: u32 = 5000,
+    /// Then each query puts it back in its place with this chance (0..100).
+    retry_percent: u8 = 10,
 };
 
 pub const Error = error{
@@ -310,6 +417,10 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Resolver {
 }
 
 pub fn deinit(r: *Resolver) void {
+    if (r.state) |st| {
+        if (dot_enabled) if (st.dot) |c| c.close(r.io, r.gpa);
+        r.gpa.destroy(st);
+    }
     if (dot_enabled) r.dot_ca.deinit(r.gpa);
     if (doh_enabled) if (r.http_client) |*c| c.deinit();
     if (r.conf_text) |t| r.gpa.free(t);
@@ -550,6 +661,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
     // DoT CA bundle) and the copy's is never freed (review X).
     // This also lets `no-aaaa`/`single-request` count on the first lookup.
     if (r.options.servers.len == 0) try r.ensureConfig();
+    try r.ensureState();
     if (dot_enabled and r.options.doh_url == null and r.options.transport == .tls and r.options.dot_tls.verify == .strict)
         r.dot_ca.load(r.gpa, r.io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1211,9 +1323,13 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     // below cannot fail differently).
     _ = try r.encodeChecked(&qbuf, name, ty, 0);
 
+    try r.ensureState();
     const servers = try r.serverList();
     const rbuf = try r.gpa.alloc(u8, @max(512, r.options.edns_udp_size orelse 0));
     defer r.gpa.free(rbuf);
+    // `server_failover`: the servers that failed recently are asked after the
+    // others (bit i = servers[i]); none without the option.
+    const down = r.downMask(servers);
 
     var last_err: ?Error = null;
     // The last reply from a server that failed (`serverFailed`), kept in case
@@ -1223,28 +1339,50 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var attempt: u8 = 0;
     rounds: while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         const first = r.rotateStart(servers.len);
-        for (0..servers.len) |k| {
-            const server = servers[(first + k) % servers.len];
-            // `call_timeout_ms` spent: no new attempt (a failed server's
-            // reply already in hand is still returned below).
-            if (r.callExpired()) {
-                last_err = error.Timeout;
-                break :rounds;
+        for (0..2) |pass| {
+            if (pass == 1 and down == 0) break;
+            for (0..servers.len) |k| {
+                const idx = (first + k) % servers.len;
+                const is_down = idx < max_ordered and (down >> @intCast(idx)) & 1 != 0;
+                if (is_down != (pass == 1)) continue;
+                const server = servers[idx];
+                // `call_timeout_ms` spent: no new attempt (a failed server's
+                // reply already in hand is still returned below).
+                if (r.callExpired()) {
+                    last_err = error.Timeout;
+                    break :rounds;
+                }
+                const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
+                var msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse {
+                    r.noteServer(server, false);
+                    continue;
+                };
+                // RFC 6891 §7: a server that answers an EDNS query with FORMERR
+                // (and no OPT of its own) or BADVERS does not speak EDNS; ask it
+                // once more in plain RFC 1035 form, and from now on only so. Not
+                // on SERVFAIL (DNS flag day 2020). The retry is checked like any
+                // reply (id, question), so a spoofed FORMERR can only cost this
+                // server its EDNS, never inject an answer.
+                if (edns and refusesEdns(&msg)) {
+                    msg.deinit();
+                    r.rememberNoEdns(server);
+                    msg = (try r.askServer(server, name, ty, &qbuf, rbuf, false, &last_err)) orelse {
+                        r.noteServer(server, false);
+                        continue;
+                    };
+                }
+                // RFC 7873 §5.2.3: BADCOOKIE carries the server cookie to use;
+                // `askServer` learned it, so asking once more sends it.
+                if (r.options.cookies and edns and msg.rcode() == .bad_cookie) {
+                    msg.deinit();
+                    msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse {
+                        r.noteServer(server, false);
+                        continue;
+                    };
+                }
+                r.noteServer(server, !serverFailed(msg.rcode()));
+                return settle(&failed, msg) orelse continue;
             }
-            const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
-            var msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse continue;
-            // RFC 6891 §7: a server that answers an EDNS query with FORMERR
-            // (and no OPT of its own) or BADVERS does not speak EDNS; ask it
-            // once more in plain RFC 1035 form, and from now on only so. Not
-            // on SERVFAIL (DNS flag day 2020). The retry is checked like any
-            // reply (id, question), so a spoofed FORMERR can only cost this
-            // server its EDNS, never inject an answer.
-            if (edns and refusesEdns(&msg)) {
-                msg.deinit();
-                r.rememberNoEdns(server);
-                msg = (try r.askServer(server, name, ty, &qbuf, rbuf, false, &last_err)) orelse continue;
-            }
-            return settle(&failed, msg) orelse continue;
         }
     }
     if (failed) |msg| return msg;
@@ -1254,7 +1392,18 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
 /// One attempt at one server: a fresh id, UDP (TCP on truncation, or
 /// `transport = .tcp`), the reply decoded and checked against the question.
 /// Null after a transport failure (recorded in `last_err`): try the next.
+/// With `Options.cookies` the reply's COOKIE option is checked and learned.
 fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Type, qbuf: []u8, rbuf: []u8, edns: bool, last_err: *?Error) Error!?message.Message {
+    var msg = (try r.askOnce(server, name, ty, qbuf, rbuf, edns, last_err)) orelse return null;
+    if (!(r.options.cookies and edns)) return msg;
+    errdefer msg.deinit();
+    // UDP replies that fail this are dropped inside `udpExchange`; this is the
+    // TCP/DoT path, where a mismatch is a malformed answer.
+    if (!r.learnCookie(server, &msg)) return error.MalformedResponse;
+    return msg;
+}
+
+fn askOnce(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Type, qbuf: []u8, rbuf: []u8, edns: bool, last_err: *?Error) Error!?message.Message {
     // A fresh transaction id for EVERY datagram sent. One id per `query`
     // meant a retry re-used an id an off-path attacker may already have seen
     // or guessed on the previous attempt, so every round was another shot at
@@ -1267,7 +1416,7 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
     var mixed_buf: [message.max_name_text_len + 1]u8 = undefined;
     const exact = r.options.case_randomization and !r.useTcp();
     const sent = if (exact) r.mixCase(name, &mixed_buf) else name;
-    const packet = try r.encodeFor(qbuf, sent, ty, id, edns);
+    const packet = try r.encodeFor(qbuf, sent, ty, id, edns, server);
 
     if (r.useTcp()) {
         const raw = r.streamExchange(server, packet) catch |err| switch (err) {
@@ -1281,7 +1430,7 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
         return try r.decodeResponse(raw, id, name, ty, false);
     }
 
-    const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = sent, .ty = ty, .exact_case = exact }) catch |err| switch (err) {
+    const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = sent, .ty = ty, .exact_case = exact, .cookie = if (r.options.cookies and edns) r.clientCookie(server) else null }) catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |e| return e,
         else => {
             last_err.* = err;
@@ -1345,6 +1494,139 @@ fn rememberNoEdns(r: *Resolver, server: netaddr.Ip) void {
     r.no_edns_next = (r.no_edns_next + 1) % max_no_edns;
 }
 
+// ── per-server memory: failover marks and DNS cookies ──────────────────────
+
+fn needsState(r: *const Resolver) bool {
+    const o = r.options;
+    if (o.server_failover != null) return true;
+    if (o.cookies and o.doh_url == null) return true;
+    return dot_enabled and o.dot_reuse and o.transport == .tls and o.doh_url == null;
+}
+
+/// Allocate `state` when an option needs it. Called before anything copies
+/// the Resolver (the parallel family's copy shares the pointer).
+fn ensureState(r: *Resolver) Error!void {
+    if (r.state != null or !r.needsState()) return;
+    const st = try r.gpa.create(State);
+    st.* = .{};
+    r.state = st;
+}
+
+fn nowNs(r: *const Resolver) i96 {
+    return std.Io.Clock.Timestamp.now(r.io, .awake).raw.nanoseconds;
+}
+
+/// True with probability `percent` / 100.
+fn chance(r: *const Resolver, percent: u8) bool {
+    if (percent >= 100) return true;
+    if (percent == 0) return false;
+    var b: [2]u8 = undefined;
+    r.io.random(&b);
+    return std.mem.readInt(u16, &b, .little) % 100 < percent;
+}
+
+/// `Options.server_failover`: bit i of the result is set when `servers[i]`
+/// failed and is not due for another try on this query.
+fn downMask(r: *Resolver, servers: []const netaddr.Ip) u64 {
+    const fo = r.options.server_failover orelse return 0;
+    const st = r.state orelse return 0;
+    const now = r.nowNs();
+    var mask: u64 = 0;
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    for (servers[0..@min(servers.len, max_ordered)], 0..) |ip, i| {
+        const h = st.healthOf(ip) orelse continue;
+        if (!h.failed) continue;
+        const due = now - h.failed_ns >= @as(i96, fo.retry_delay_ms) * std.time.ns_per_ms;
+        if (due and r.chance(fo.retry_percent)) continue;
+        mask |= @as(u64, 1) << @intCast(i);
+    }
+    return mask;
+}
+
+/// Record how asking `server` went (a no-op without `server_failover`).
+fn noteServer(r: *Resolver, server: netaddr.Ip, ok: bool) void {
+    if (r.options.server_failover == null) return;
+    const st = r.state orelse return;
+    const now = r.nowNs();
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    if (st.healthOf(server)) |h| {
+        h.failed = !ok;
+        if (!ok) h.failed_ns = now;
+        return;
+    }
+    if (ok) return;
+    st.health[st.health_next] = .{ .ip = server, .failed_ns = now, .failed = true };
+    st.health_next = (st.health_next + 1) % max_tracked;
+}
+
+fn cookieSlot(r: *const Resolver, st: *State, server: netaddr.Ip) *CookieSlot {
+    for (&st.cookies) |*c| if (c.ip) |ip| if (ip.eql(server)) return c;
+    const c = &st.cookies[st.cookies_next];
+    st.cookies_next = (st.cookies_next + 1) % max_tracked;
+    c.* = .{ .ip = server };
+    r.io.random(&c.client);
+    return c;
+}
+
+/// The 8-byte client cookie for `server` (RFC 7873 §4.1: random, per server).
+fn clientCookie(r: *const Resolver, server: netaddr.Ip) ?[8]u8 {
+    const st = r.state orelse return null;
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    return r.cookieSlot(st, server).client;
+}
+
+/// The COOKIE option data for `server` -- client cookie, then the server
+/// cookie learned from it, if any -- written to `buf`.
+fn cookieOption(r: *const Resolver, server: netaddr.Ip, buf: *[8 + max_server_cookie]u8) []const u8 {
+    const st = r.state.?;
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    const c = r.cookieSlot(st, server);
+    @memcpy(buf[0..8], &c.client);
+    @memcpy(buf[8..][0..c.server_len], c.server[0..c.server_len]);
+    return buf[0 .. 8 + c.server_len];
+}
+
+fn findCookie(msg: *const message.Message) ?[]const u8 {
+    for (msg.additionals) |a| if (a.data == .opt) {
+        var rest = a.data.opt.options;
+        while (rest.len >= 4) {
+            const code = std.mem.readInt(u16, rest[0..2], .big);
+            const len = std.mem.readInt(u16, rest[2..4], .big);
+            if (rest.len < 4 + @as(usize, len)) return null;
+            if (code == cookie_option) return rest[4..][0..len];
+            rest = rest[4 + len ..];
+        }
+    };
+    return null;
+}
+
+/// RFC 7873 §5.2.3: a reply's COOKIE option must carry our client cookie and
+/// be 8 or 16..40 bytes; a reply without one is a server that does not speak
+/// cookies (§5.2.1) and passes.
+fn cookieReplyOk(msg: *const message.Message, client: [8]u8) bool {
+    const c = findCookie(msg) orelse return true;
+    if (c.len < 8 or (c.len > 8 and c.len < 16) or c.len > 8 + max_server_cookie) return false;
+    return std.mem.eql(u8, c[0..8], &client);
+}
+
+/// Check the reply's COOKIE option against `server`'s client cookie and keep
+/// its server cookie. False: the client cookie differs (drop the reply).
+fn learnCookie(r: *Resolver, server: netaddr.Ip, msg: *const message.Message) bool {
+    const st = r.state orelse return true;
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    const slot = r.cookieSlot(st, server);
+    if (!cookieReplyOk(msg, slot.client)) return false;
+    const c = findCookie(msg) orelse return true;
+    slot.server_len = @intCast(c.len - 8);
+    @memcpy(slot.server[0..slot.server_len], c[8..]);
+    return true;
+}
+
 /// Send a message the caller built — an RFC 2136 UPDATE (`update.send`), a
 /// NOTIFY, a TSIG-signed query — to `server` and return the raw reply
 /// (gpa-owned). UDP, retried over TCP when the reply is truncated; TCP from
@@ -1363,6 +1645,7 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
     if (packet.len < message.header_len) return error.MalformedResponse;
     if (packet.len > std.math.maxInt(u16)) return error.RequestTooLarge;
     if (r.options.transport == .tls and !dot_enabled) return error.NoDotSupport;
+    try r.ensureState();
     const id = std.mem.readInt(u16, packet[0..2], .big);
     const tcp_only = r.useTcp() or packet.len > 512;
     var no_rbuf: [0]u8 = .{};
@@ -1420,24 +1703,70 @@ fn settle(failed: *?message.Message, msg: message.Message) ?message.Message {
 }
 
 fn encodeChecked(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16) Error![]u8 {
-    return r.encodeFor(buf, name, ty, id, true);
+    return r.encodeFor(buf, name, ty, id, true, null);
 }
 
 /// `edns = false`: the plain RFC 1035 form for a server that refused EDNS —
-/// no OPT record, so no DO bit and no options either.
-fn encodeFor(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: bool) Error![]u8 {
+/// no OPT record, so no DO bit and no options either. `server` is the one the
+/// query goes to (null for DoH and for a validation encode): it selects the
+/// COOKIE option (`Options.cookies`).
+fn encodeFor(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: bool, server: ?netaddr.Ip) Error![]u8 {
     // `edns = true` passes the options as configured, so a DO bit or options
     // without `edns_udp_size` is still refused (`InvalidOptions`); only the
     // fallback strips the OPT-borne fields on purpose.
-    return message.encodeQuery(buf, name, ty, .{
+    const o = r.options;
+    if (edns and o.edns_udp_size == null and (o.cookies or o.edns_padding_block != 0)) return error.InvalidOptions;
+    var qo: message.QueryOptions = .{
         .id = id,
-        .edns_udp_size = if (edns) r.options.edns_udp_size else null,
-        .recursion_desired = r.options.recursion_desired,
-        .dnssec_ok = edns and r.options.dnssec_ok,
-        .authentic_data = r.options.authentic_data,
-        .checking_disabled = r.options.checking_disabled,
-        .edns_options = if (edns) r.options.edns_options else &.{},
-    }) catch |err| switch (err) {
+        .edns_udp_size = if (edns) o.edns_udp_size else null,
+        .recursion_desired = o.recursion_desired,
+        .dnssec_ok = edns and o.dnssec_ok,
+        .authentic_data = o.authentic_data,
+        .checking_disabled = o.checking_disabled,
+        .edns_options = if (edns) o.edns_options else &.{},
+    };
+    const want_cookie = edns and o.cookies and server != null and o.doh_url == null and r.state != null;
+    const encrypted = o.doh_url != null or o.transport == .tls;
+    const want_pad = edns and o.edns_padding_block != 0 and encrypted;
+    var opts: [message.max_edns_options_len / 4 + 2]message.EdnsOption = undefined;
+    var cookie_buf: [8 + max_server_cookie]u8 = undefined;
+    var pad_buf: [max_padding_block]u8 = @splat(0);
+    if (want_cookie or want_pad) {
+        if (o.edns_options.len > message.max_edns_options_len / 4) return error.InvalidOptions;
+        @memcpy(opts[0..o.edns_options.len], o.edns_options);
+        var n = o.edns_options.len;
+        if (want_cookie) {
+            opts[n] = .{ .code = cookie_option, .data = r.cookieOption(server.?, &cookie_buf) };
+            n += 1;
+        }
+        qo.edns_options = opts[0..n];
+        if (want_pad) {
+            const block: usize = o.edns_padding_block;
+            if (block > pad_buf.len) return error.InvalidOptions;
+            const plain = try encodeMapped(buf, name, ty, qo);
+            // RFC 8467 §4.1: the whole message, option header included, a
+            // multiple of the block.
+            const rem = (plain.len + 4) % block;
+            opts[n] = .{ .code = padding_option, .data = pad_buf[0..if (rem == 0) 0 else block - rem] };
+            qo.edns_options = opts[0 .. n + 1];
+            // Does not fit with the other options: sent unpadded.
+            return encodeMapped(buf, name, ty, qo) catch |err| switch (err) {
+                error.InvalidOptions => {
+                    qo.edns_options = opts[0..n];
+                    return encodeMapped(buf, name, ty, qo);
+                },
+                else => |e| e,
+            };
+        }
+    }
+    return encodeMapped(buf, name, ty, qo);
+}
+
+/// More than the options of a query can hold (`message.max_edns_options_len`).
+const max_padding_block = message.max_edns_options_len;
+
+fn encodeMapped(buf: []u8, name: []const u8, ty: message.Type, qo: message.QueryOptions) Error![]u8 {
+    return message.encodeQuery(buf, name, ty, qo) catch |err| switch (err) {
         error.BufferTooSmall => unreachable, // max_query_len always fits
         error.NameTooLong => error.NameTooLong,
         error.BadName => error.BadName,
@@ -1843,7 +2172,7 @@ const UdpResult = struct {
 };
 
 /// What `query` asked, for `udpExchange` to recognise its answer by.
-const Expect = struct { name: []const u8, ty: message.Type, exact_case: bool = false };
+const Expect = struct { name: []const u8, ty: message.Type, exact_case: bool = false, cookie: ?[8]u8 = null };
 
 /// One UDP round-trip. Datagrams from the wrong peer, with the wrong id, that
 /// are no response or (with `expect`) no answer to the question are ignored
@@ -1889,7 +2218,8 @@ fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rb
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             };
-            m.deinit();
+            defer m.deinit();
+            if (e.cookie) |c| if (!cookieReplyOk(&m, c)) continue;
         };
         return .{ .data = incoming.data, .truncated = incoming.flags.trunc };
     }
@@ -1988,6 +2318,53 @@ fn tlsExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 
 
 fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
     if (!dot_enabled) return error.NoDotSupport;
+    const reuse = r.options.dot_reuse and r.state != null;
+    var fresh = true;
+    var conn: ?*DotConn = null;
+    if (reuse) {
+        const st = r.state.?;
+        st.mutex.lockUncancelable(r.io);
+        conn = st.dot;
+        st.dot = null;
+        st.mutex.unlock(r.io);
+        if (conn) |c| {
+            if (c.server.eql(server)) {
+                fresh = false;
+            } else {
+                c.close(r.io, r.gpa);
+                conn = null;
+            }
+        }
+    }
+    while (true) {
+        const c = conn orelse try r.dotConnect(server);
+        conn = null;
+        // Whatever happens, the session is closed unless it goes back.
+        var keep = false;
+        defer if (!keep) c.close(r.io, r.gpa);
+        const out = r.dotRoundTrip(c, packet) catch |err| switch (err) {
+            // A session the server closed while idle: once more on a new one.
+            error.NetworkFailed, error.TlsFailed => if (!fresh) {
+                fresh = true;
+                continue;
+            } else return err,
+            else => |e| return e,
+        };
+        if (reuse) {
+            const st = r.state.?;
+            st.mutex.lockUncancelable(r.io);
+            if (st.dot == null) {
+                st.dot = c;
+                keep = true;
+            }
+            st.mutex.unlock(r.io);
+        }
+        return out;
+    }
+}
+
+/// Connect and handshake: a new session, owned by the caller (`DotConn.close`).
+fn dotConnect(r: *Resolver, server: netaddr.Ip) Error!*DotConn {
     const io = r.io;
     const gpa = r.gpa;
     const strict = r.options.dot_tls.verify == .strict;
@@ -2001,8 +2378,10 @@ fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
     // side one record plus the 2-byte length. Heap, not stack: the handshake
     // is deep enough already.
     const record_len = tlsclient.Client.min_buffer_len;
+    const c = try gpa.create(DotConn);
+    errdefer gpa.destroy(c);
     const slab = try gpa.alloc(u8, 3 * record_len + 512);
-    defer {
+    errdefer {
         std.crypto.secureZero(u8, slab);
         gpa.free(slab);
     }
@@ -2017,9 +2396,12 @@ fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
         error.Timeout => return error.Timeout,
         else => return error.NetworkFailed,
     };
-    defer stream.close(io);
-    var sr = stream.reader(io, sock_r);
-    var sw = stream.writer(io, sock_w);
+    errdefer stream.close(io);
+    c.server = server;
+    c.slab = slab;
+    c.stream = stream;
+    c.sr = stream.reader(io, sock_r);
+    c.sw = stream.writer(io, sock_w);
 
     var name_buf: [netaddr.max_ip_text_len]u8 = undefined;
     const host = r.options.tls_server_name orelse netaddr.formatIp(server, &name_buf);
@@ -2027,8 +2409,7 @@ fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
     defer std.crypto.secureZero(u8, &entropy);
     // Key material: fail closed instead of `io.random`'s fallback.
     io.randomSecure(&entropy) catch return error.TlsFailed;
-    var tc: tlsclient.Client = undefined;
-    tlsclient.Client.initInto(&tc, &sr.interface, &sw.interface, .{
+    tlsclient.Client.initInto(&c.tc, &c.sr.interface, &c.sw.interface, .{
         .host = if (strict) .{ .explicit = host } else .no_verification,
         .ca = if (strict) .{ .bundle = .{
             .gpa = gpa,
@@ -2042,30 +2423,32 @@ fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
         .realtime_now = std.Io.Clock.real.now(io),
     }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        error.ReadFailed => return readFailure(&sr),
-        error.WriteFailed => return writeFailure(&sw),
+        error.ReadFailed => return readFailure(&c.sr),
+        error.WriteFailed => return writeFailure(&c.sw),
         else => return error.TlsFailed,
     };
-    const w = &tc.writer;
-    w.writeInt(u16, @intCast(packet.len), .big) catch return writeFailure(&sw);
-    w.writeAll(packet) catch return writeFailure(&sw);
-    w.flush() catch return writeFailure(&sw);
-    // The TLS writer hands its records to the socket writer; send them.
-    sw.interface.flush() catch return writeFailure(&sw);
+    return c;
+}
 
-    const len = tc.reader.takeInt(u16, .big) catch |e| switch (e) {
+/// One framed query and its reply over an established session.
+fn dotRoundTrip(r: *Resolver, c: *DotConn, packet: []const u8) Error![]u8 {
+    const w = &c.tc.writer;
+    w.writeInt(u16, @intCast(packet.len), .big) catch return writeFailure(&c.sw);
+    w.writeAll(packet) catch return writeFailure(&c.sw);
+    w.flush() catch return writeFailure(&c.sw);
+    // The TLS writer hands its records to the socket writer; send them.
+    c.sw.interface.flush() catch return writeFailure(&c.sw);
+
+    const len = c.tc.reader.takeInt(u16, .big) catch |e| switch (e) {
         error.EndOfStream => return error.NetworkFailed,
-        error.ReadFailed => return tlsReadFailure(&tc, &sr),
+        error.ReadFailed => return tlsReadFailure(&c.tc, &c.sr),
     };
-    const out = try gpa.alloc(u8, len);
-    errdefer gpa.free(out);
-    tc.reader.readSliceAll(out) catch |e| switch (e) {
+    const out = try r.gpa.alloc(u8, len);
+    errdefer r.gpa.free(out);
+    c.tc.reader.readSliceAll(out) catch |e| switch (e) {
         error.EndOfStream => return error.NetworkFailed,
-        error.ReadFailed => return tlsReadFailure(&tc, &sr),
+        error.ReadFailed => return tlsReadFailure(&c.tc, &c.sr),
     };
-    // Best effort: close_notify, so the server sees a finished session.
-    tc.end() catch {};
-    sw.interface.flush() catch {};
     return out;
 }
 
@@ -5300,8 +5683,13 @@ const DotStub = struct {
     mode: Mode = .answer,
     /// Queries received (framed and decrypted).
     queries: std.atomic.Value(u32) = .init(0),
+    /// Connections accepted so far; `run` serves up to `max_conns` of them.
+    conns: std.atomic.Value(u32) = .init(0),
+    max_conns: u32 = 1,
 
     const Mode = enum {
+        /// `answer` on every query of a connection until the client closes it.
+        answer_loop,
         /// A canned A answer (EchoStub.a_honest) for the question asked.
         answer,
         /// A length prefix announcing 200 bytes, 10 of them, then close_notify.
@@ -5309,7 +5697,7 @@ const DotStub = struct {
     };
 
     fn run(st: *DotStub) void {
-        st.serve() catch {};
+        for (0..st.max_conns) |_| st.serve() catch return;
     }
 
     fn serve(st: *DotStub) !void {
@@ -5331,27 +5719,31 @@ const DotStub = struct {
         var conn = tlsserver.Connection.init(&cfg, &sr.interface, &sw.interface, joiner);
         defer conn.deinit();
 
-        const data = (try conn.read()) orelse return;
-        if (data.len < 2 + message.header_len) return;
-        const len = std.mem.readInt(u16, data[0..2], .big);
-        if (data.len != 2 + @as(usize, len)) return;
-        _ = st.queries.fetchAdd(1, .release);
-        const q = data[2..];
-        var out: [2 + 512]u8 = undefined;
-        switch (st.mode) {
-            .answer => {
-                const question = q[message.header_len..][0..EchoStub.questionLen(q[message.header_len..])];
-                const resp = stubResponse(out[2..], q, 0x8180, question, EchoStub.a_honest, 1);
-                std.mem.writeInt(u16, out[0..2], @intCast(resp.len), .big);
-                try conn.writeAll(out[0 .. 2 + resp.len]);
-            },
-            .short_frame => {
-                std.mem.writeInt(u16, out[0..2], 200, .big);
-                @memset(out[2..12], 0xab);
-                try conn.writeAll(out[0..12]);
-            },
+        _ = st.conns.fetchAdd(1, .release);
+        while (try conn.read()) |data| {
+            if (data.len < 2 + message.header_len) return;
+            const len = std.mem.readInt(u16, data[0..2], .big);
+            if (data.len != 2 + @as(usize, len)) return;
+            _ = st.queries.fetchAdd(1, .release);
+            const q = data[2..];
+            var out: [2 + 512]u8 = undefined;
+            switch (st.mode) {
+                .answer, .answer_loop => {
+                    const question = q[message.header_len..][0..EchoStub.questionLen(q[message.header_len..])];
+                    const resp = stubResponse(out[2..], q, 0x8180, question, EchoStub.a_honest, 1);
+                    std.mem.writeInt(u16, out[0..2], @intCast(resp.len), .big);
+                    try conn.writeAll(out[0 .. 2 + resp.len]);
+                    if (st.mode == .answer_loop) continue;
+                },
+                .short_frame => {
+                    std.mem.writeInt(u16, out[0..2], 200, .big);
+                    @memset(out[2..12], 0xab);
+                    try conn.writeAll(out[0..12]);
+                },
+            }
+            try conn.close();
+            return;
         }
-        try conn.close();
     }
 };
 
@@ -5572,4 +5964,117 @@ test "built without DoT (-Ddns-dot=false), transport .tls is refused on query an
     var qbuf: [message.max_query_len]u8 = undefined;
     const packet = try r.encodeChecked(&qbuf, "example.com", .a, 1);
     try testing.expectError(error.NoDotSupport, r.exchange(.{ .v4 = .{ 127, 0, 0, 1 } }, packet));
+}
+
+test "DoT dot_reuse: two queries share one session; without it each opens its own" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer_loop, "localhost", .strict);
+    rig.r.options.dot_reuse = true;
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    // Registered after the await: runs first, and closing the session ends the server loop.
+    defer fut.await(io);
+    defer rig.deinit(io);
+
+    for (0..3) |_| {
+        var msg = try rig.r.query("example.com", .a);
+        defer msg.deinit();
+        try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    }
+    try testing.expectEqual(@as(u32, 3), rig.stub.queries.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), rig.stub.conns.load(.acquire));
+    try testing.expect(rig.r.state.?.dot != null); // idle, waiting for the next query
+}
+
+test "DoT dot_reuse: a session the server closed is replaced and the query repeated once" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, "localhost", .strict); // one answer per connection, then close_notify
+    rig.stub.max_conns = 2;
+    rig.r.options.dot_reuse = true;
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+    defer rig.deinit(io);
+
+    for (0..2) |_| {
+        var msg = try rig.r.query("example.com", .a);
+        defer msg.deinit();
+        try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    }
+    try testing.expectEqual(@as(u32, 2), rig.stub.queries.load(.acquire));
+    try testing.expectEqual(@as(u32, 2), rig.stub.conns.load(.acquire));
+}
+
+test "DoT dot_reuse: a failed exchange does not leave a session behind" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .short_frame, "localhost", .strict);
+    rig.r.options.dot_reuse = true;
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+    defer rig.deinit(io);
+
+    try testing.expectError(error.NetworkFailed, rig.r.query("example.com", .a));
+    try testing.expect(rig.r.state.?.dot == null);
+}
+
+test "encodeFor: RFC 8467 block padding over .tls and DoH only; unpadded when it cannot fit" {
+    const long = @as([60]u8, @splat('x')) ++ ".".* ++ @as([60]u8, @splat('y')) ++ ".example.net".*;
+    const names = [_][]const u8{ "a.b", "example.com", "a-rather-long-label.subdomain.example.org", &long };
+    var buf: [message.max_query_len]u8 = undefined;
+    for ([_]u16{ 128, 64, 32 }) |block| for (names) |name| for ([_]bool{ true, false }) |doh| {
+        const r: Resolver = .{
+            .io = undefined,
+            .gpa = testing.allocator,
+            .options = .{
+                .transport = if (doh) .auto else .tls,
+                .doh_url = if (doh) "https://dns.example/dns-query" else null,
+                .edns_padding_block = block,
+            },
+            .http_client = null,
+            .conf = null,
+            .conf_text = null,
+        };
+        const packet = try r.encodeFor(&buf, name, .a, 0, true, null);
+        try testing.expectEqual(@as(usize, 0), packet.len % block);
+        var msg = try message.decode(testing.allocator, packet);
+        defer msg.deinit();
+        const opts = msg.additionals[0].data.opt.options;
+        try testing.expectEqual(@as(u16, padding_option), std.mem.readInt(u16, opts[0..2], .big));
+        for (opts[4..]) |b| try testing.expectEqual(@as(u8, 0), b);
+    };
+
+    var r: Resolver = .{ .io = undefined, .gpa = testing.allocator, .options = .{ .edns_padding_block = 128 }, .http_client = null, .conf = null, .conf_text = null };
+    // Plain UDP/TCP and `edns = false`: no padding.
+    const plain = try r.encodeFor(&buf, "example.com", .a, 0, true, null);
+    try testing.expect(std.mem.readInt(u16, plain[plain.len - 2 ..][0..2], .big) == 0); // RDLENGTH of the bare OPT
+    r.options.transport = .tls;
+    const no_edns = try r.encodeFor(&buf, "example.com", .a, 0, false, null);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, no_edns[10..12], .big)); // ARCOUNT
+    // An option list that leaves no room for the padding is sent as it is.
+    const big: [100]u8 = @splat(7);
+    const opts = [_]message.EdnsOption{.{ .code = 3, .data = &big }};
+    r.options.edns_options = &opts;
+    const unpadded = try r.encodeFor(&buf, "example.com", .a, 0, true, null);
+    try testing.expect(unpadded.len % 128 != 0);
+    try testing.expectEqual(@as(usize, 12 + 13 + 4 + 11 + 104), unpadded.len);
+    // Block too large, or no EDNS to carry it.
+    r.options.edns_options = &.{};
+    r.options.edns_padding_block = 129;
+    try testing.expectError(error.InvalidOptions, r.encodeFor(&buf, "example.com", .a, 0, true, null));
+    r.options.edns_padding_block = 128;
+    r.options.edns_udp_size = null;
+    try testing.expectError(error.InvalidOptions, r.encodeFor(&buf, "example.com", .a, 0, true, null));
 }

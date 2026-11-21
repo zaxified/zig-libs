@@ -180,6 +180,10 @@ everything it returns lives in `arena`.
 - `case_randomization = true` (DNS 0x20, off by default as in c-ares and
   hickory): UDP queries go out in random case and a reply must echo it
   exactly; a server that folds case then times out every query.
+- Per-server memory, all off by default: `server_failover = .{}` (a server that failed is asked last for 5 s, then
+  retried with a 10 % chance per query, as c-ares), `cookies = true` (RFC 7873: client cookie per server, server cookie
+  learned, BADCOOKIE retried), `edns_padding_block = 128` (RFC 8467 query padding over DoT and DoH) and
+  `dot_reuse = true` (one idle DoT session kept for the next query, RFC 7858 §3.4).
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
   set `edns_udp_size = null` for plain RFC 1035 queries.
 - DoH uses query id 0 (RFC 8484 §4.1 cache friendliness).
