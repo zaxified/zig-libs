@@ -114,7 +114,7 @@ per reply (those limits as text are about 2.9 MB), lines of 512 bytes. `conf.Opt
 
 ## Backlog / deferred
 
-- **The root-gated live test shells out to `ip`.** `runIp()` in `src/root.zig` is the one external-process use in the whole repo (zig-libs is otherwise pure Zig, no exec). Either replace it with a direct rtnetlink `RTM_NEWLINK`/`IFLA_LINKINFO` call (consistent with the module's own netlink-native style) or document and allowlist the exception.
+None open.
 
 ## What is deliberately not done
 

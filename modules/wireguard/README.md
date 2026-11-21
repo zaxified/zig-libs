@@ -210,7 +210,7 @@ re-export of the `genetlink` module).
 - **Verification:** offline golden-byte + parser + fuzz tests are the gate;
   an unprivileged integration test exercises live nlctrl family resolution,
   and a root-gated test (skipped otherwise) round-trips a config on a real
-  wg interface created via `ip link add … type wireguard`.
+  wg interface created over rtnetlink (`netlink`'s `linkAdd`, kind `wireguard`).
 
 ## Not provided
 

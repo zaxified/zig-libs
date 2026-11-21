@@ -2430,39 +2430,37 @@ test "integration: nlctrl family resolve (unprivileged)" {
     }
 }
 
-/// Run `ip` with the given arguments; error.SkipZigTest when unavailable.
-fn runIp(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
-    const candidates = [_][]const u8{ "ip", "/usr/sbin/ip", "/sbin/ip" };
-    for (candidates) |argv0| {
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(gpa);
-        try argv.append(gpa, argv0);
-        try argv.appendSlice(gpa, args);
-        const res = std.process.run(gpa, io, .{ .argv = argv.items }) catch continue;
-        defer gpa.free(res.stdout);
-        defer gpa.free(res.stderr);
-        return switch (res.term) {
-            .exited => |code| code,
-            else => 255,
-        };
+/// A wireguard device created over rtnetlink (no `ip`); deleted again on `deinit`.
+const TestLink = struct {
+    nl: netlink.Socket,
+    ifindex: u32,
+
+    /// error.SkipZigTest when the kernel has no wireguard link type or rtnetlink cannot be opened.
+    fn create(gpa: std.mem.Allocator, ifname: []const u8) !TestLink {
+        var nl = netlink.Socket.open(gpa) catch return error.SkipZigTest;
+        errdefer nl.close();
+        nl.linkAdd(.{ .name = ifname, .kind = "wireguard" }, .{}) catch return error.SkipZigTest;
+        const links = try nl.links();
+        defer gpa.free(links);
+        for (links) |l| if (std.mem.eql(u8, l.name(), ifname)) return .{ .nl = nl, .ifindex = l.index };
+        return error.SkipZigTest;
     }
-    return error.SkipZigTest;
-}
+
+    fn deinit(l: *TestLink) void {
+        l.nl.linkDel(l.ifindex) catch {};
+        l.nl.close();
+    }
+};
 
 test "integration (root): set + get round-trip on a real wg interface" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest; // needs CAP_NET_ADMIN
     const gpa = testing.allocator;
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
     const ifname = "zigwgtest0";
     // Requires the wireguard kernel module; skip when unavailable.
-    if (try runIp(gpa, io, &.{ "link", "add", ifname, "type", "wireguard" }) != 0)
-        return error.SkipZigTest;
-    defer _ = runIp(gpa, io, &.{ "link", "del", ifname }) catch 255;
+    var link = try TestLink.create(gpa, ifname);
+    defer link.deinit();
 
     var wg = Wireguard.open(gpa) catch return error.SkipZigTest;
     defer wg.close();
