@@ -185,16 +185,27 @@ Every line below holds for both suites (the §8.3/D.1 vectors mirror §8.4/D.2).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 
+## What is deliberately not done
+
+- **A stack burn in `verify` / `proofVerify`.** The verifier holds no secret of its own (public key, signature or
+  proof, disclosed messages); `random_scalars`, the messages and the caller's `SecretKey` copies are the caller's to
+  wipe (the example does it for the scalars). The signer side (`sign`, `proofGen`, key generation) is burned.
+- **A "which messages are disclosed" convenience API** beyond `disclosed_indexes: []const usize`: that is the
+  draft's own `ProofGen` interface (§3.5.3) and zkryptium's; a caller that holds a per-message reveal flag builds the
+  index list in one loop.
+
 ## Backlog / deferred
 
-- **Dead stack: `verify` / `proofVerify` and the callers' own copies.** The verifier side holds no secret of its own;
-  `random_scalars`, the messages and the caller's `SecretKey` copies are the caller's to wipe (the example does it for
-  the scalars). Not covered by the stack-burn work.
+None open.
+
+## Roadmap
+
 - **Blind BBS signatures (`draft-irtf-cfrg-bbs-blind-signatures`)** (survey 2026-09-30): lets a holder hide messages
   from the signer; zkryptium ships it. `sign` has no `commitment` parameter (draft §5.11's extension point); a
-  blind-BBS extension would need its own Interface layer per draft §3.8's "Defining New Interfaces" rules. Effort:
-  medium. Fits §2.
+  blind-BBS extension would need its own Interface layer per draft §3.8's "Defining New Interfaces" rules.
+  Size: weeks — a separate draft with its own interface, commitment and proof of commitment, blind sign/verify and
+  blind proof generation, two ciphersuites and their vectors.
 - **Pseudonyms / per-verifier linkability (`draft-irtf-cfrg-bbs-per-verifier-linkability`)** (survey 2026-09-30):
-  unlinkable-but-consistent identifiers per verifier, in zkryptium. Effort: medium. Fits §2.
-- **A "which messages are disclosed" convenience API** beyond the raw `disclosed_indexes: []const usize` that
-  `proofGen` takes.
+  unlinkable-but-consistent identifiers per verifier, in zkryptium.
+  Size: weeks — builds on the blind-signature interface above (pseudonym secret committed at issuance), its own
+  draft and vectors.
