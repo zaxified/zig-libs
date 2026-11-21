@@ -803,6 +803,9 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   delivered reversed and duplicated, a fragmented retransmission, the forged-fragment flood, `record.nextDatagram`
   at its boundaries; the epoch-0 replay window tests in `Connection12.zig` and `conn12_test.zig`; `Connection.zig`'s
   test that an injected epoch-0 record with a huge number does not affect the 1.3 engine.
+- **Bench:** `zig build bench-dtls` (`tools/bench.zig`, ReleaseFast, no foreign side): the per-record AEAD call
+  against a cached AES-GCM context, seal and open at 64..1400 bytes, gated on identical output, and the whole
+  `send` + `recv` of a connected pair; prints the ratio and the spread of the rounds.
 - **Fuzz:** `DTLS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` selects a harness):
   `dtls-handshake` (PSK, HelloRetryRequest cookie and (EC)DHE with one flight damaged; certificate-authenticated
   flights are not driven), `dtls-record`, `dtls-wire`, `dtls-keyupdate` (`src/fuzz_test.zig`); `dtls12-handshake`
@@ -839,9 +842,13 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 
 ## Backlog / deferred
 
-- **AEAD record protection is the stateless per-record call** of the `aesgcm` module (AES-128-GCM); the bulk
-  path is not re-measured since it moved there. A cached context would need per-epoch key storage behind the generic
-  `Protection(Aead)` shared with ChaCha20. Deferred until a consumer measures DTLS throughput.
+- **AEAD record protection is the stateless per-record call** of the `aesgcm` module: every record re-runs the
+  AES key expansion and the GHASH key setup. `zig build bench-dtls` (`tools/bench.zig`) measures it against a cached
+  `aesgcm` `Context` (first run, 2026-11-21, ReleaseFast, 3 rounds on a loaded machine, spread up to 40 %): cached /
+  per-record 0.20–0.23 at 64-byte records, 0.31–0.35 at 256, 0.52–0.58 at 1024, 0.61–0.65 at 1400 (AES-128 and
+  AES-256, seal and open); a whole `send` + `recv` of 64 bytes on AES-128-GCM is ~1.2 µs, of which ~0.6 µs is the two
+  per-record AEAD calls. The rewrite (per-epoch `Context` storage behind `Protection(Aead)`, which ChaCha20 shares
+  without needing it) waits for a quiet-machine A/B with the spread below the effect.
 - **DTLS 1.2 plain PSK against a live peer.** `psk_with_aes_128_gcm_sha256` is self-interop only, because Debian's
   wolfSSL has no static PSK; an OpenSSL `s_server -dtls1_2 -psk` case would cover it.
 - **KeyUpdate / ALPN against a live peer, the rest:** a wolfSSL-initiated KeyUpdate with wolfSSL as the client, and
