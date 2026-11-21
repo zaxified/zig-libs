@@ -144,6 +144,7 @@ Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI si
 - **A BPF optimiser:** the code is longer than libpcap's with the same verdicts on every tcpdump oracle row (known deviations: offline `ip and vlan` without an id, which libpcap refuses and this compiles; live `ip and vlan 5`, where libpcap's own program accepts nothing and ours accepts the frame it names); the kernel runs both within noise, and libpcap's shorter programs run faster in the same interpreter (`filter_run_lp` against `filter_run` in the bench). A real, measurable gain, not built.
 - **pcapng Name Resolution, Interface Statistics, Decryption Secrets and custom blocks:** skipped by length, not interpreted.
 - **IPv6 Neighbor Discovery codec:** not here; the sibling `l2disco.nd` (RFC 4861 messages, options, the ICMPv6 checksum, NS/RS builders) is the ND counterpart to `rawsock.arp`; a caller sends its frames with `Socket.sendRaw`. libpcap has no ND codec either.
+- **`recvmmsg` batching, a TX ring, `PACKET_FANOUT` with the ring:** libpcap has none of them (it receives with `recvfrom` or a ring, sends with `send`); `Socket.joinFanout` covers fanout for the plain socket. No consumer is throughput-bound (the router-tool consumer captures a handful of LLDP/CDP/DHCP frames).
 - **BSD `/dev/bpf` and other operating systems:** Linux-only is the documented AF_PACKET ceiling, permanent, not a gap to close.
 
 ## Backlog / deferred
@@ -151,7 +152,7 @@ Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI si
 - **`geneve` and the label-stack forms of `mpls`.** libpcap emits 50 instructions walking the Geneve option length through the scratch memory for IPv4 and IPv6 UDP port 6081 (a computed-offset run-time part like the live `vlan`'s); a second `mpls` is a test of the next label (bottom-of-stack clear), and the offsets after it move by 4 per label. No consumer; not built.
 - **The IPC gap to the distro libpcap.so.** Same instruction count or fewer (0.93), 1.18× the cycles on `filter_run`; unprofiled. To chase it: `perf stat -e instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u` for `bench-rawsock fixed filter_run 3000` against `FIXED_REPS=3000 .zig-cache/bench-rawsock/foreign_bench .zig-cache/bench-rawsock filter_run` (the distro-linked foreign binary), then `perf record -e cycles:u` and `perf annotate` of `exec` against `bpf_filter`; compare the dispatch `switch` layout (jump table or compare chain) and the `-Djcc-safe` effect.
 - **802.11 savefiles and monitor mode.** Radiotap, the `wlan` qualifiers; no consumer, and no 802.11 capture to anchor a live path on this machine.
-- **`recvmmsg` batching, a TX ring, `TPACKET_V2`, `PACKET_FANOUT` with the ring.** No consumer is throughput-bound (the router-tool consumer captures a handful of LLDP/CDP/DHCP frames).
+- **`TPACKET_V2` receive ring.** libpcap offers V1, V2 and V3 rings (V2 for kernels and drivers where V3 retire timers misbehave); `Ring` is V3 only. A V2 ring (one frame header per packet, `tpacket2_hdr`) needs the hardening V3 has: hostile frame-header checks, a fake-mapping state-machine test, a fuzz harness with a reach assertion, a live veth test. Not built; no consumer.
 
 
 ## Anchoring
