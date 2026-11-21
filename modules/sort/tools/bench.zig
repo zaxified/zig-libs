@@ -266,8 +266,29 @@ pub fn main(init: std.process.Init) !u8 {
     // one build, 1.25× in the next, same source).
     const jcc_safe = if (init.environ_map.get("BENCH_JCC_SAFE")) |v| std.mem.eql(u8, v, "1") else false;
     const rust = buildRust(arena, io, init.environ_map, abs, jcc_safe) catch return 1;
-    const cc: []const []const u8 = if (jcc_safe) &.{ "g++", "-std=c++20", "-Wa,-mbranches-within-32B-boundaries" } else &.{ "g++", "-std=c++20" };
-    const cpp = bench.buildForeign(arena, io, bench_name, cc, abs, "modules/sort/tools/cpp_bench/main.cpp", &.{}) catch return 1;
+    var cc_flags: std.ArrayList([]const u8) = .empty;
+    try cc_flags.appendSlice(arena, &.{ "g++", "-std=c++20" });
+    if (jcc_safe) try cc_flags.append(arena, "-Wa,-mbranches-within-32B-boundaries");
+    // BENCH_CRUMSORT=<dir with crumsort.h> (`tools/fetch_crumsort.sh`) or
+    // BENCH_VQSORT=<Highway source dir> (`tools/fetch_vqsort.sh`): the "alt"
+    // side is that sort on the unstable `u64` / `u32` rows (and only those)
+    // instead of libstdc++.
+    const crumsort_dir = init.environ_map.get("BENCH_CRUMSORT");
+    const vqsort_dir = init.environ_map.get("BENCH_VQSORT");
+    const int_only = crumsort_dir != null or vqsort_dir != null;
+    var cc_libs: []const []const u8 = &.{};
+    if (crumsort_dir) |d| {
+        try cc_flags.appendSlice(arena, &.{ "-DALT_CRUMSORT", "-I", d });
+        // `-x c` for the shim (g++ would read a `.c` file as C++), then back to the default.
+        cc_libs = &.{ "-x", "c", "modules/sort/tools/crumsort_shim.c", "-x", "none" };
+    } else if (vqsort_dir) |d| {
+        try cc_flags.appendSlice(arena, &.{ "-DALT_VQSORT", "-DHWY_COMPILE_ONLY_STATIC=1", "-I", d });
+        var libs: std.ArrayList([]const u8) = .empty;
+        for ([_][]const u8{ "hwy/contrib/sort/vqsort.cc", "hwy/contrib/sort/vqsort_u64a.cc", "hwy/contrib/sort/vqsort_u32a.cc", "hwy/targets.cc", "hwy/per_target.cc", "hwy/abort.cc", "hwy/print.cc" }) |f|
+            try libs.append(arena, try arena.print("{s}/{s}", .{ d, f }));
+        cc_libs = libs.items;
+    }
+    const cpp = bench.buildForeign(arena, io, bench_name, cc_flags.items, abs, "modules/sort/tools/cpp_bench/main.cpp", cc_libs) catch return 1;
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -277,6 +298,7 @@ pub fn main(init: std.process.Init) !u8 {
     var sum: bench.Summary = .{};
     for (names) |name| {
         if (!bench.selected(name, filters)) continue;
+        if (int_only and !(std.mem.startsWith(u8, name, "u_u64_") or std.mem.startsWith(u8, name, "u_u32_"))) continue;
         var ours: bench.Side = .{};
         var ref: bench.Side = .{};
         var alt: bench.Side = .{};

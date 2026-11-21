@@ -17,7 +17,20 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
+
+#ifdef ALT_VQSORT
+// Built with -DALT_VQSORT (bench.zig, env BENCH_VQSORT): the unstable `u64` /
+// `u32` workloads run Highway's vqsort (SIMD quicksort) instead of std::sort.
+#include "hwy/contrib/sort/vqsort.h"
+#endif
+#ifdef ALT_CRUMSORT
+// Built with -DALT_CRUMSORT (bench.zig, env BENCH_CRUMSORT): the unstable `u64`
+// / `u32` workloads run crumsort (C, tools/crumsort_shim.c) instead of std::sort.
+extern "C" void crumsort_u64(void *, size_t);
+extern "C" void crumsort_u32(void *, size_t);
+#endif
 
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -108,7 +121,23 @@ static void run(const char *name, const std::string &alg, const std::vector<T> &
     time_it(name, [&]() -> uint64_t {
         std::copy(in.begin(), in.end(), w.begin());
         if (alg == "u") {
+#if defined(ALT_VQSORT)
+            if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, uint32_t>) {
+                hwy::VQSort(w.data(), w.size(), hwy::SortAscending());
+            } else {
+                std::sort(w.begin(), w.end(), less);
+            }
+#elif defined(ALT_CRUMSORT)
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                crumsort_u64(w.data(), w.size());
+            } else if constexpr (std::is_same_v<T, uint32_t>) {
+                crumsort_u32(w.data(), w.size());
+            } else {
+                std::sort(w.begin(), w.end(), less);
+            }
+#else
             std::sort(w.begin(), w.end(), less);
+#endif
         } else if (alg == "s") {
             std::stable_sort(w.begin(), w.end(), less);
         } else {
@@ -132,7 +161,13 @@ int main(int argc, char **argv) {
     const std::string &alg = parts[0], &ty = parts[1], &pat = parts[2], &ns = parts[3];
     size_t n = std::stoul(ns.substr(0, ns.size() - 1)) * (ns.back() == 'k' ? 1000 : 1000000);
     SplitMix r{0x5eed};
+#if defined(ALT_VQSORT)
+    fprintf(stderr, "Highway vqsort 1.3.0 (hwy::VQSort; unstable u64 / u32 rows only), gcc %d.%d\n", __GNUC__, __GNUC_MINOR__);
+#elif defined(ALT_CRUMSORT)
+    fprintf(stderr, "crumsort 1.2.1.3 (crumsort_prim; unstable u64 / u32 rows only), gcc %d.%d\n", __GNUC__, __GNUC_MINOR__);
+#else
     fprintf(stderr, "C++ libstdc++ %d (std::sort / std::stable_sort / std::nth_element), g++ %d.%d\n", _GLIBCXX_RELEASE, __GNUC__, __GNUC_MINOR__);
+#endif
     if (ty == "u64") {
         std::vector<uint64_t> v(n);
         for (size_t i = 0; i < n; i++) v[i] = value(r, pat, i, n);

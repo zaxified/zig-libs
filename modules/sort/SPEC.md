@@ -37,16 +37,16 @@ are compared by documentation and, where marked, measured as black boxes.
 | [ziglang/zig](https://github.com/ziglang/zig) `std.sort.pdq` / `block` / `heap` / `insertion` | Zig | MIT | 43.3k | 0.17.0 | the closest alternative for a Zig user: same signature; no selection; 2–4× slower (README). `isSorted`, `binarySearch`, `lowerBound` are there and not repeated here |
 | [orlp/glidesort](https://github.com/orlp/glidesort) | Rust | MIT OR Apache-2.0 (crates.io, inferred) | 1.7k | v0.1.2 (2023) | stable, can sort on caller memory (`sort_with_buffer`); not read, not measured |
 | [orlp/pdqsort](https://github.com/orlp/pdqsort) | C++ | Zlib | 2.5k | 2023-12 push | the pdqsort std's is ported from; not measured |
-| [scandum/crumsort](https://github.com/scandum/crumsort), [fluxsort](https://github.com/scandum/fluxsort) | C | Unlicense | 337 / 750 | 2024-07 push | branchless unstable/stable sorts often near ipnsort on integers; not read, not measured (Backlog) |
-| [google/highway](https://github.com/google/highway) vqsort | C++ | Apache-2.0 OR BSD-3-Clause (inferred) | 5.9k | 2026-10 push | SIMD sort of integer/float keys only; not read, not measured |
+| [scandum/crumsort](https://github.com/scandum/crumsort), [fluxsort](https://github.com/scandum/fluxsort) | C | Unlicense | 337 / 750 | 2024-07 push | unstable/stable sorts for integers (crumsort 1.2.1.3, `crumsort_prim`, black box, default build, not JCC-mitigated: `BENCH_CRUMSORT`, `tools/fetch_crumsort.sh`). **Not faster than ours on random keys** (`u_u64_rand` 1k / 100k / 1m, `u_u32_rand_100k`: 0.9–1.2× ours' time, within the spreads), **13× faster on `u_u64_tail_100k`** (a sorted run with a random 1 % tail: 0.11 ms against 1.44 ms, spreads 0.6 % and 11 %: it finds the run and merges the tail, ipnsort does not either), slower on ascending / descending input. Not read. |
+| [google/highway](https://github.com/google/highway) vqsort | C++ | Apache-2.0 OR BSD-3-Clause (inferred) | 5.9k | 2026-10 push | SIMD sort of integer/float keys only (vqsort 1.3.0 through `hwy::VQSort`, black box, native AVX2, default build: `BENCH_VQSORT`, `tools/fetch_vqsort.sh`). **Faster than ours on random integers:** `u_u32_rand_100k` 3.0× (spreads 3 % and 48 %), `u_u64_dup16_100k` 1.8×, `u_u64_rand_100k` / `1m` 1.25× / 1.33× (spreads of 6–39 %, the larger ones under a shared machine: the direction stands, the size does not), `u_u64_saw_100k` 1.4×; 11–20× slower on ascending and descending input (no presorted detection) and no comparator, no records, no strings, no stable variant. Not read. |
 | [rayon-rs/rayon](https://github.com/rayon-rs/rayon) `par_sort` | Rust | MIT OR Apache-2.0 | 13.4k | 2026-08 push | parallel sorts (a separate crate) — not here (Backlog) |
 | [nessex/rdst](https://github.com/nessex/rdst), [lakwet/voracious_sort](https://github.com/lakwet/voracious_sort) | Rust | Apache-2.0 / MIT | 7 / 78 | 2026 | radix sorts — not here (Backlog) |
 
 **Where we are ahead:** a stable sort without an allocator (vs Rust std);
 2–4× std's sorts; a lying comparator gets a permutation back instead of a
 panic. **Where we are behind:** no radix or parallel sort (both separate
-crates in Rust), no `partial_sort` (C++; see *What is deliberately not done*), C++'s introsort is faster on nearly sorted input with a
-random tail (as it is against Rust).
+crates in Rust, see *What is deliberately not done*), no `partial_sort` (C++), C++'s introsort is faster on nearly sorted input with a
+random tail (as it is against Rust), and on integer keys two specialised sorts beat the comparison sort: crumsort on a run with a random tail (13×) and vqsort on random keys (1.25–3×).
 
 ## What this module is, and what it is not
 
@@ -194,16 +194,11 @@ anchor.
 - **`sort_by_cached_key`.** In Zig it is a caller-side two-liner (compute the keys into an array, sort
   indices by them).
 - **`partial_sort`** (C++). `selectNth(k)` then `unstable` on `items[0..k]` is the same result.
+- **Radix sort for integer keys.** Rust std (the reference), Go, `std.sort`, libstdc++ and glidesort have none; radix sorts are separate crates there (rdst, voracious_sort). The two sorts that do beat ours on integers (*Compared with*) are not radix sorts: vqsort is SIMD and crumsort is an adaptive quad/merge sort, so a radix sort would be a new algorithm chasing a gap it was not measured to close.
+- **Adopting `sort` in the modules that sort** (zstd's dictionary builder, tsdb, the percentile code, tabular, `IpSetBuilder`, geoindex, kvtree, kv, the trie builder, jinja's `sort` filter). Nothing measured says a sort is on any of their hot paths; each moves when its own profile shows one, and the call is `std.sort` today.
+- **Parallel sort** (rayon `par_sort`). Rust std's sorts are sequential and rayon is a separate crate; `std.Io` tasks would add a scheduler dependency to a module that has none.
+- **An index-based `sortContext(a, b, ctx)`** (std's `pdqContext` shape). Rust std has no such form; the sorts move elements through a hole, not `swap(i, j)`, so it would be a second algorithm, and `std.sort.pdqContext` covers the shape.
 
 ## Backlog / deferred
 
-- **Radix sort for integer keys** (`u32`/`u64`/`i64`/`f64` via a key function). Rust std has none; a measured
-  win over ipnsort on ≥ 10⁴ random integer keys would be an `**Ahead:** speed` claim.
-- **Candidate consumers** (sort share not yet profiled): zstd dict_builder, tsdb,
-  finstats/metrics/latency-stats percentiles (`selectNth`), tabular, netaddr `IpSetBuilder`, geoindex,
-  kvtree, kv, trie builder, jinja `sort` filter (stable).
-- **Measure crumsort/fluxsort and vqsort** as further "fastest" candidates for integer keys (C, Unlicense /
-  C++, Apache-2.0); the card's fastest is over Rust std and C++ libstdc++ only.
-- **Parallel sort** (rayon `par_sort` shape) over `std.Io` tasks.
-- **An index-based `sortContext(a, b, ctx)`** (std's `pdqContext` shape): the sorts move elements through a
-  hole, not `swap(i, j)`, so it needs a different algorithm; std's `pdqContext` covers it today.
+None open.

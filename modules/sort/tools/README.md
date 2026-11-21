@@ -6,6 +6,8 @@ Kept instruments (CONVENTIONS.md §9, kind 3).
 |---|---|---|---|
 | `bench.zig` | `zig build bench-sort`: ours vs Rust std (reference) vs C++ libstdc++ over 31 workloads (unstable, stable, select; `u64`/`u32`/32-byte record/string; random, 16 distinct, ascending, descending, saw, sorted with a random tail; 1k–1M) | `cargo`, `g++` | the card's `**Performance:**` line |
 | `rust_bench/` | the reference side: Rust std `sort_unstable` / `sort` / `select_nth_unstable`, std only (no crates), built `-C target-cpu=native` | `cargo` (offline) | one row per run |
+| `fetch_crumsort.sh`, `crumsort_shim.c` | `BENCH_CRUMSORT=modules/sort/tools/crumsort_src zig build bench-sort -- u_u64 u_u32`: the "alt" side is crumsort 1.2.1.3 (C, Unlicense; fetched pinned and digest-checked into the gitignored `crumsort_src/`) on the unstable integer rows instead of libstdc++ | `curl`, `g++` | the *Compared with* figures |
+| `fetch_vqsort.sh` | `BENCH_VQSORT=modules/sort/tools/vqsort_src/highway-1.3.0 zig build bench-sort -- u_u64 u_u32`: the same with Highway's vqsort (Apache-2.0; tarball digest-checked into the gitignored `vqsort_src/`), compiled for the native target (`HWY_COMPILE_ONLY_STATIC`) | `curl`, `g++` | the *Compared with* figures |
 | `cpp_bench/main.cpp` | the second side: `std::sort` / `std::stable_sort` / `std::nth_element` | `g++` | one row per run |
 
 All three sides generate the same inputs from the same seed (bench.zig's
