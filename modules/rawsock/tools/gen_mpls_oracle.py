@@ -12,8 +12,8 @@ Needs tcpdump (libpcap 1.10.x). No privileges. Frame i is stamped at second 1000
 
 Not in the table: `ip and mpls` (libpcap's optimiser sees it can never match and refuses it with
 "expression rejects all packets"; filter.compile, which has no optimiser, builds the program that
-never matches), and the nesting `mpls 5 or mpls 100`, `pppoes 7 or pppoes 9`, `mpls and mpls` (libpcap reads a
-second `mpls` as the next label of the stack, which `filter.compile` has no form for and refuses).
+never matches). A second `mpls` is the next label of the stack (the label before it must not be the
+bottom one), as libpcap reads it; the offsets after it move by 4 per label.
 """
 import os, struct, subprocess, sys
 
@@ -74,6 +74,11 @@ frames = [
     eth(0x8864, pppoe(7, 0x0021, ip4(17, A2, A1, udp(53, 4000)))),                  # 11 PPPoE session 7, IPv4 UDP src 53
     eth(0x0806, struct.pack('>HHBBH6s4s6s4s', 1, 0x0800, 6, 4, 1, SRC, bytes(A1), bytes(6), bytes(A2))),  # 12 ARP
     eth(0x8847, label(100, 1) + ip6(6, V2, V1, tcp(80, 9))),                        # 13 MPLS label 100, IPv6 TCP src 80
+    eth(0x8847, label(7, 0) + label(8, 0) + label(9, 1) + ip4(6, A1, A2, tcp(1, 80))),  # 14 three labels, IPv4 TCP 80
+    eth(0x8847, label(5, 0) + label(6, 1) + ip6(17, V1, V2, udp(5000, 53))),         # 15 two labels, IPv6 UDP 53
+    eth(0x8847, label(7, 0) + label(9, 1) + ip4(17, A2, A1, udp(53, 4000))),         # 16 two labels, IPv4 UDP src 53
+    eth(0x8864, pppoe(7, 0x0281, label(7, 0) + label(9, 1) + ip4(6, A1, A2, tcp(1, 80)))),   # 17 PPPoE session, PPP MPLS, two labels, IPv4 TCP 80
+    eth(0x8864, pppoe(9, 0x0281, label(5, 1) + ip6(17, V1, V2, udp(5000, 53)))),             # 18 PPPoE session 9, PPP MPLS, one label, IPv6 UDP 53
 ]
 
 EXPRESSIONS = [
@@ -85,6 +90,18 @@ EXPRESSIONS = [
     'mpls and ether src 00:11:22:33:44:55', 'mpls and ether proto 0x800', 'mpls and net 10.0.0.0/8', 'mpls and host 10.0.0.2',
     'mpls and icmp', 'mpls and ip[8] = 64', 'mpls and tcp[13] & 2 != 0', 'mpls and less 100', 'mpls and portrange 50-60',
     'not mpls and ip', 'mpls and ip6 and tcp',
+    'mpls and mpls', 'mpls 7 and mpls 9', 'mpls 5 and mpls 9', 'mpls 7 and mpls', 'mpls and mpls 9', 'mpls and mpls and ip',
+    'mpls 7 and mpls 9 and ip', 'mpls and mpls and ip6', 'mpls and mpls and mpls', 'mpls 7 and mpls 8 and mpls 9',
+    'mpls 7 and mpls 8 and mpls 9 and ip', 'mpls and mpls and tcp', 'mpls and mpls and udp', 'mpls and mpls and tcp port 80',
+    'mpls and mpls and udp src port 53', 'mpls and mpls and ip src host 10.0.0.1', 'mpls and mpls and ip6 host 2001:db8::1',
+    'mpls 5 or mpls 100', 'mpls or mpls', 'mpls 7 and mpls 9 or ip', 'not (mpls and mpls)', 'mpls and mpls and not ip',
+    'mpls and mpls and ip[8] = 64', 'mpls and mpls and tcp[13] & 2 != 0', 'mpls and mpls and host 10.0.0.2',
+    'mpls and mpls and mpls and ip', 'mpls and mpls and arp', 'mpls and mpls and vlan', 'mpls and mpls and pppoes',
+    'mpls and mpls and ether src 00:11:22:33:44:55', 'mpls and mpls and net 10.0.0.0/8',
+    'pppoes and mpls and mpls', 'mpls and mpls and mpls 9',
+    'pppoes and mpls 5', 'pppoes 7 and mpls 5', 'pppoes and mpls 7 and mpls 9', 'pppoes and mpls and ip', 'pppoes and mpls and ip6',
+    'pppoes and mpls and mpls and ip', 'pppoes and mpls 5 and ip6', 'pppoes and mpls and tcp', 'pppoes and mpls and udp port 53',
+    'pppoes and mpls and not ip', 'pppoes and mpls and tcp port 80', 'pppoes and mpls and ip src host 10.0.0.1',
     'pppoes and ip', 'pppoes and ip6', 'pppoes 7 and ip', 'pppoes 9 and ip6', 'pppoes and tcp', 'pppoes and udp',
     'pppoes 7 and tcp port 80', 'pppoes and tcp port 443', 'pppoes and udp src port 53', 'pppoes and ip src host 10.0.0.1',
     'pppoes and ip6 host 2001:db8::1', 'pppoes and ip proto 6', 'pppoes and not ip', 'pppoes and (ip or ip6)', 'pppoes or ip',

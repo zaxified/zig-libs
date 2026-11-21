@@ -75,7 +75,8 @@
 //!
 //! * `inbound`, `outbound`, `ifindex N`: the kernel's packet type and interface index
 //!   (`SKF_AD_PKTTYPE`, `SKF_AD_IFINDEX`); live only, `runLiveMeta` answers them from the metadata.
-//!   `mpls [N]` and `pppoes [N]` work alone only.
+//!   `mpls [N]` (a stack: each further `mpls` is the next label), `pppoes [N]` and `geneve [vni]` shift or re-base what is
+//!   written after them, as libpcap does (see the SPEC).
 //! * Compile nesting is bounded (`Parser.max_depth` 16 parentheses / `not`), left-deep
 //!   chains are walked by a loop: the deepest accepted input compiles in a 64 KiB stack.
 //!
@@ -83,8 +84,8 @@
 //! and `gateway` (the resolver, /etc/ethers), `ip broadcast` / `ip multicast`
 //! (the interface netmask), service names for ports, computed offsets
 //! (`ip[ip[0] & 0xf]`), `protochain` (libpcap's program jumps backwards: the
-//! kernel refuses it with EINVAL, `tools/protochain_probe.py`), MPLS and the
-//! link types beyond the six above (802.11, PPP...). The generated code is not
+//! kernel refuses it with EINVAL, `tools/protochain_probe.py`) and the
+//! link types beyond the seven above (802.11...). The generated code is not
 //! optimised: longer than libpcap's, with the same verdicts on every row of the tcpdump oracle (known deviations: offline `ip and vlan` without an id, which libpcap refuses; live `ip and vlan 5`, where libpcap's own program accepts nothing; and libpcap's quirk that a failed live `vlan` test leaves the shift at 4, so `vlan or ip` misses plain IPv4, repeated here). A program
 //! may use `ja` stubs for jumps over 255 instructions (as libpcap does) and
 //! is refused past `max_insns` (4096).
@@ -482,6 +483,14 @@ const Test = struct {
     /// Loads go through the run-time vlan shift in M[0] (`ldx M[0]; ld [x+off]`,
     /// the live ancillary form after a `vlan`).
     dyn: bool = false,
+    /// The scratch slot `dyn` loads read the base from: 0 for the live `vlan`'s shift;
+    /// after `geneve` 0 is the inner EtherType's offset, 1 the inner link header, 2 the inner network header.
+    dyn_reg: u32 = 0,
+    /// After `geneve`, a link-header test (MAC address, `multicast`, `ether[..]`): false when
+    /// the inner frame has no Ethernet header (slots 1 and 2 are equal).
+    gv_link: bool = false,
+    /// This test reads the EtherType (so, after `geneve`, the inner one).
+    ety: bool = false,
     k: u32,
 };
 
@@ -489,6 +498,9 @@ const Node = union(enum) {
     /// The first `vlan [N]` of a live (ancillary) program: is the tag present
     /// as metadata or still in the frame, and set M[0] to the shift.
     vlan_live: ?u16,
+    /// `geneve [vni]`: the outer UDP port 6081 datagram over IPv4 or IPv6, version 0 and, when given,
+    /// this VNI; sets scratch slots 0..2 for the primitives after it.
+    geneve: ?u32,
     @"and": [2]*const Node,
     @"or": [2]*const Node,
     not: *const Node,
@@ -674,6 +686,7 @@ fn compileCore(gpa: ?std.mem.Allocator, out_buf: []BpfInsn, scratch: *Scratch, a
     }
 
     var g: Gen = .{ .a = scratch_a, .store_shift = live };
+    const gv_init = p.gv_used;
     // Past the growth steps of a typical filter in one allocation each.
     try g.code.ensureTotalCapacity(g.a, 32);
     try g.labels.ensureTotalCapacity(g.a, 32);
@@ -683,6 +696,12 @@ fn compileCore(gpa: ?std.mem.Allocator, out_buf: []BpfInsn, scratch: *Scratch, a
         // the kernel's check accepts the reads.
         try g.emit(.{ .insn = .{ .code = op.ld | op.w | op.imm, .jt = 0, .jf = 0, .k = 0 } });
         try g.emit(.{ .insn = .{ .code = op.st, .jt = 0, .jf = 0, .k = 0 } });
+    }
+    if (gv_init) {
+        // The inner-frame slots read as zero on a path that never ran `geneve` (`geneve or tcp`,
+        // `not geneve and ip`: libpcap leaves them undefined and the kernel refuses such a program).
+        try g.ins(op.ld | op.w | op.imm, 0);
+        for ([_]u32{ 0, 1, 2 }) |slot| try g.ins(op.st, slot);
     }
     const t_label = try g.newLabel();
     const f_label = try g.newLabel();
@@ -770,6 +789,103 @@ const Gen = struct {
         }
     }
 
+    /// `geneve [vni]`, the shape libpcap emits (tcpdump 4.99 / libpcap 1.10 `-d`): the outer frame is IPv4 (not a
+    /// fragment) or IPv6 (next header UDP, no extension headers), the UDP destination port is 6081, the
+    /// Geneve version is 0 and the VNI, when given, matches. Then M[0] is the offset of the inner EtherType
+    /// (the Geneve protocol type; for an Ethernet payload, 0x6558, the inner frame's own), M[1] the inner
+    /// frame's first byte and M[2] its network header (14 bytes later for an Ethernet payload).
+    fn geneveCode(g: *Gen, vni: ?u32, t: usize, f: usize) !void {
+        const v6 = try g.newLabel();
+        const a4 = try g.newLabel();
+        const b4 = try g.newLabel();
+        const c4 = try g.newLabel();
+        const d4 = try g.newLabel();
+        const e4 = try g.newLabel();
+        const a6 = try g.newLabel();
+        const b6 = try g.newLabel();
+        const c6 = try g.newLabel();
+        const d6 = try g.newLabel();
+        const tail = try g.newLabel();
+        const eth = try g.newLabel();
+        const noteth = try g.newLabel();
+        // IPv4: X = the header length for every load below.
+        try g.ins(op.ld | op.h | op.abs, 12);
+        try g.jump(op.jmp | op.jeq | op.k, 0x0800, a4, v6);
+        try g.place(a4);
+        try g.ins(op.ld | op.b | op.abs, 23);
+        try g.jump(op.jmp | op.jeq | op.k, 17, b4, f);
+        try g.place(b4);
+        try g.ins(op.ld | op.h | op.abs, 20);
+        try g.jump(op.jmp | op.jset | op.k, 0x1fff, f, c4);
+        try g.place(c4);
+        try g.ins(op.ldx | op.b | op.msh, 14);
+        try g.ins(op.ld | op.h | op.ind, 16);
+        try g.jump(op.jmp | op.jeq | op.k, 6081, d4, f);
+        try g.place(d4);
+        try g.ins(op.ld | op.b | op.ind, 22);
+        try g.ins(op.alu | op.@"and" | op.k, 0xc0);
+        try g.jump(op.jmp | op.jeq | op.k, 0, e4, f);
+        try g.place(e4);
+        if (vni) |v| {
+            try g.ins(op.ld | op.w | op.ind, 26);
+            try g.ins(op.alu | op.@"and" | op.k, 0xffffff00);
+            const done = try g.newLabel();
+            try g.jump(op.jmp | op.jeq | op.k, v << 8, done, f);
+            try g.place(done);
+        }
+        try g.ins(op.misc | op.txa, 0);
+        try g.jump(op.jmp | op.jeq | op.x, 0, tail, tail);
+        // IPv6: the header is 40 bytes.
+        try g.place(v6);
+        try g.ins(op.ld | op.h | op.abs, 12);
+        try g.jump(op.jmp | op.jeq | op.k, 0x86dd, a6, f);
+        try g.place(a6);
+        try g.ins(op.ld | op.b | op.abs, 20);
+        try g.jump(op.jmp | op.jeq | op.k, 17, b6, f);
+        try g.place(b6);
+        try g.ins(op.ld | op.h | op.abs, 56);
+        try g.jump(op.jmp | op.jeq | op.k, 6081, c6, f);
+        try g.place(c6);
+        try g.ins(op.ld | op.b | op.abs, 62);
+        try g.ins(op.alu | op.@"and" | op.k, 0xc0);
+        try g.jump(op.jmp | op.jeq | op.k, 0, d6, f);
+        try g.place(d6);
+        if (vni) |v| {
+            try g.ins(op.ld | op.w | op.abs, 66);
+            try g.ins(op.alu | op.@"and" | op.k, 0xffffff00);
+            const done = try g.newLabel();
+            try g.jump(op.jmp | op.jeq | op.k, v << 8, done, f);
+            try g.place(done);
+        }
+        try g.ins(op.ldx | op.w | op.imm, 40);
+        // The Geneve header starts at 14 + header length + 8 (UDP).
+        try g.place(tail);
+        try g.ins(op.misc | op.txa, 0);
+        try g.ins(op.alu | op.add | op.k, 22);
+        try g.ins(op.misc | op.tax, 0);
+        try g.ins(op.alu | op.add | op.k, 2);
+        try g.ins(op.st, 0);
+        try g.ins(op.ld | op.b | op.ind, 0);
+        try g.ins(op.alu | op.@"and" | op.k, 0x3f); // option length, in 4-byte units
+        try g.ins(op.alu | 0x20 | op.k, 4); // mul
+        try g.ins(op.alu | op.add | op.k, 8);
+        try g.ins(op.alu | op.add | op.x, 0);
+        try g.ins(op.st, 1);
+        try g.ins(op.ld | op.h | op.ind, 2);
+        try g.ins(op.ldx | op.w | op.mem, 1);
+        try g.jump(op.jmp | op.jeq | op.k, 0x6558, eth, noteth);
+        try g.place(eth);
+        try g.ins(op.misc | op.txa, 0);
+        try g.ins(op.alu | op.add | op.k, 12);
+        try g.ins(op.st, 0);
+        try g.ins(op.alu | op.add | op.k, 2);
+        try g.ins(op.misc | op.tax, 0);
+        try g.place(noteth);
+        try g.ins(0x03, 2); // stx M[2]
+        try g.ins(op.ld | op.w | op.imm, 0);
+        try g.jump(op.jmp | op.jeq | op.k, 0, t, f);
+    }
+
     /// A left-deep `and`/`or` chain (the parser builds `a and b and c ...` that way, with no
     /// depth of its own) walked WITHOUT native recursion down its left spine: the labels
     /// are worked out from the outside in, the code is emitted from the inside out, as
@@ -823,6 +939,7 @@ const Gen = struct {
         if (depth > max_gen_depth) return error.FilterTooComplex;
         switch (n.*) {
             .vlan_live => |id| try g.vlanLive(id, t, f),
+            .geneve => |vni| try g.geneveCode(vni, t, f),
             .@"and", .@"or" => try g.genChain(n, t, f, depth),
             .not => |inner| try g.gen(inner, f, t, depth + 1),
             .t => |c| {
@@ -831,7 +948,15 @@ const Gen = struct {
                 } else if (c.dyn) {
                     // libpcap's `ldx M[0]; ld [x + off]`; an indirect test adds the
                     // IPv4 header length to the shift first.
-                    try g.emit(.{ .insn = .{ .code = op.ldx | op.w | op.mem, .jt = 0, .jf = 0, .k = 0 } });
+                    if (c.gv_link) {
+                        // After `geneve`: no Ethernet header inside (slots 1 and 2 equal) is false.
+                        const has = try g.newLabel();
+                        try g.ins(op.ld | op.w | op.mem, 1);
+                        try g.ins(op.ldx | op.w | op.mem, 2);
+                        try g.jump(op.jmp | op.jeq | op.x, 0, f, has);
+                        try g.place(has);
+                    }
+                    try g.emit(.{ .insn = .{ .code = op.ldx | op.w | op.mem, .jt = 0, .jf = 0, .k = c.dyn_reg } });
                     if (c.ind) {
                         try g.emit(.{ .insn = .{ .code = op.ld | op.b | op.ind, .jt = 0, .jf = 0, .k = c.msh } });
                         try g.emit(.{ .insn = .{ .code = op.alu | op.@"and" | op.k, .jt = 0, .jf = 0, .k = 0xf } });
@@ -1090,6 +1215,10 @@ const Parser = struct {
     /// the label stack's bottom bit and the version nibble / the PPP protocol field.
     in_mpls: bool = false,
     in_pppoes: bool = false,
+    /// A `geneve` primitive was seen: the primitives written after it address the encapsulated frame
+    /// through scratch slots (libpcap's form), and a test of one is a `.dyn` load of slot 0, 1 or 2.
+    geneve: bool = false,
+    gv_used: bool = false,
     /// Some primitive loads through the run-time shift (so M[0] is needed).
     dyn_used: bool = false,
     /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
@@ -1130,7 +1259,21 @@ const Parser = struct {
             c.dyn = true;
             p.dyn_used = true;
         }
-        if (!c.fixed and !c.len and c.off < ancillary_base) {
+        if (p.geneve and !c.len and c.off < ancillary_base) {
+            c.dyn = true;
+            p.gv_used = true;
+            if (c.fixed) {
+                c.dyn_reg = 1;
+                c.gv_link = true;
+            } else if (c.ety) {
+                c.dyn_reg = 0;
+                c.off = 0;
+            } else if (c.off >= 14) {
+                c.dyn_reg = 2;
+                c.off -= 14;
+                if (c.ind) c.msh -= 14;
+            } else return error.UnsupportedExpression;
+        } else if (!c.fixed and !c.len and c.off < ancillary_base) {
             c.off = std.math.cast(u32, @as(i64, c.off) + p.shift) orelse return error.UnsupportedExpression;
             if (c.ind) c.msh = std.math.cast(u32, @as(i64, c.msh) + p.shift) orelse return error.UnsupportedExpression;
         }
@@ -1262,15 +1405,16 @@ const Parser = struct {
             // protocol field) and tests IPv4 / IPv6 there by the bottom-of-stack bit and the
             // version nibble / by the PPP protocol. Built for one of either, followed by IP,
             // IPv6 and what rides on them; what libpcap refuses over MPLS ("unsupported protocol over
-            // mpls": `arp`, `vlan`, a second `mpls`) is `UnsupportedExpression` here as well, and
-            // so are the live ancillary `vlan` form around them and the nesting of the two.
+            // mpls": `arp`, `vlan`) is `UnsupportedExpression` here as well, and
+            // so are the live ancillary `vlan` form around them and the nesting of the two
+            // (a second `mpls` is the next label of the stack, as in libpcap).
             try p.ethernetOnly();
-            if (p.live or p.in_mpls) return error.UnsupportedExpression;
             const mpls = eql(first, "mpls");
-            if (p.in_pppoes) {
-                // Over a PPPoE session: the PPP protocol field only (0x0281 for `mpls`, 0x8864 for a second `pppoes`), no shift.
+            if (p.live or p.geneve or (p.in_mpls and !mpls)) return error.UnsupportedExpression;
+            if (p.in_pppoes and !mpls) {
+                // A second `pppoes`: the PPP protocol field only (0x8864), no shift.
                 if (try p.lex.peek()) |nxt| if (parseNum(u32, nxt) != null) return error.UnsupportedExpression;
-                return p.etherType(if (mpls) 0x8847 else 0x8864);
+                return p.etherType(0x8864);
             }
             var id: ?u32 = null;
             if (try p.lex.peek()) |nxt| if (parseNum(u32, nxt) != null) {
@@ -1278,14 +1422,37 @@ const Parser = struct {
                 id = parseNum(u32, nxt).?;
                 if (id.? > (if (mpls) @as(u32, 0xfffff) else 0xffff)) return error.Syntax;
             };
-            var n = try p.etherType(if (mpls) 0x8847 else 0x8864);
+            // A second `mpls` is the next label of the stack, as in libpcap: the label before it must not be the
+            // bottom one (its S bit clear; a clear bit in the byte the shift already points past), and no EtherType test.
+            var n = if (p.in_mpls)
+                try p.node(.{ .not = try p.t(.{ .size = .b, .off = 12, .kind = .set, .k = 0x01 }) })
+            else
+                try p.etherType(if (mpls) 0x8847 else 0x8864);
             if (id) |v| n = try p.both(.@"and", n, try p.t(.{ .size = .w, .off = 14, .mask = if (mpls) 0xfffff000 else 0xffff, .k = if (mpls) v << 12 else v }));
             if (mpls) p.in_mpls = true else p.in_pppoes = true;
             p.shift += if (mpls) 4 else 8;
             return n;
         }
         if (eql(first, "ifname") or eql(first, "rnr") or eql(first, "ruleset") or eql(first, "reason") or eql(first, "action") or eql(first, "srnr") or eql(first, "subrulenum")) return error.UnsupportedExpression; // OpenBSD pflog only (libpcap: "supported only on PF linktype")
-        if (eql(first, "geneve")) return error.UnsupportedExpression; // see SPEC: a computed-offset option walk, not built
+        if (eql(first, "geneve")) {
+            // Ethernet only, and before any `vlan`, `mpls` or `pppoes` (their shifts and this one's
+            // registers do not combine), once.
+            try p.ethernetOnly();
+            if (p.live or p.geneve or p.shift != 0 or p.in_mpls or p.in_pppoes or p.saw_vlan) return error.UnsupportedExpression;
+            var vni: ?u32 = null;
+            if (try p.lex.peek()) |nxt| if (parseNum(u32, nxt)) |v| {
+                _ = try p.lex.next();
+                if (v > 0xffffff) return error.Syntax;
+                vni = v;
+            };
+            p.geneve = true;
+            p.leaves += 1;
+            if (p.leaves > max_insns) {
+                p.too_complex = true;
+                return p.capNode();
+            }
+            return p.node(.{ .geneve = vni });
+        }
         if (eql(first, "ip")) {
             const nxt = (try p.lex.peek()) orelse return p.etherType(0x0800);
             if (eql(nxt, "proto")) {
@@ -1354,7 +1521,7 @@ const Parser = struct {
     /// `vlan` and `vlan N` as the WHOLE expression (see `compileOpts`).
     fn vlan(p: *Parser) CompileError!*const Node {
         try p.ethernetOnly();
-        if (p.in_mpls or p.in_pppoes) return error.UnsupportedExpression; // libpcap: "no VLAN match after MPLS"
+        if (p.in_mpls or p.in_pppoes or p.geneve) return error.UnsupportedExpression; // libpcap: "no VLAN match after MPLS"
         const before = p.leaves;
         var id: ?u16 = null;
         if (try p.lex.peek()) |nxt| if (parseNum(u16, nxt) != null) {
@@ -1652,7 +1819,7 @@ const Parser = struct {
                 0x8848 => 0x0283,
                 else => ty,
             } }),
-            .ethernet, .linux_sll => return p.t(.{ .size = .h, .off = 12, .k = ty }),
+            .ethernet, .linux_sll => return p.t(.{ .size = .h, .off = 12, .ety = true, .k = ty }),
         }
     }
 
@@ -2643,9 +2810,9 @@ test "runLiveMeta answers the kernel's ancillary words from the metadata, and th
     for ([_][]const u8{ "mpls 1048575", "mpls", "pppoes 65535", "pppoes", "pppoed" }) |e| testing.allocator.free(try compile(testing.allocator, e));
     // Combined with IP and what rides on it they compile (see "mpls and pppoes combined" below); `ip and mpls` is
     // the program libpcap's optimiser refuses ("rejects all packets"): here it compiles and matches nothing.
-    for ([_][]const u8{ "mpls and ip", "ip and mpls", "pppoes and ip", "pppoes 7 or tcp", "not mpls and ip" }) |e| testing.allocator.free(try compile(testing.allocator, e));
+    for ([_][]const u8{ "mpls and ip", "ip and mpls", "pppoes and ip", "pppoes 7 or tcp", "not mpls and ip", "mpls and mpls", "mpls 5 or mpls 100" }) |e| testing.allocator.free(try compile(testing.allocator, e));
     // What libpcap refuses over MPLS / PPPoE, or this compiler has no form for: nesting, `arp`, `vlan`, MAC addresses over PPPoE.
-    for ([_][]const u8{ "mpls and mpls", "mpls 5 or mpls 100", "pppoes 7 or pppoes 9", "mpls and pppoes", "mpls and arp", "mpls and rarp", "mpls and vlan", "pppoes and vlan 5", "pppoes and ether src 00:11:22:33:44:55", "pppoes and ether host 00:11:22:33:44:55", "pppoes and multicast", "pppoes and broadcast" }) |e| {
+    for ([_][]const u8{ "pppoes 7 or pppoes 9", "mpls and pppoes", "mpls and arp", "mpls and rarp", "mpls and vlan", "pppoes and vlan 5", "pppoes and ether src 00:11:22:33:44:55", "pppoes and ether host 00:11:22:33:44:55", "pppoes and multicast", "pppoes and broadcast" }) |e| {
         testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e)) catch |er| {
             std.debug.print("expression: {s}\n", .{e});
             return er;
@@ -2653,7 +2820,7 @@ test "runLiveMeta answers the kernel's ancillary words from the metadata, and th
     }
     // The live ancillary vlan form around them has no form for them either.
     try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "vlan and mpls and ip", .{ .vlan_ancillary = true }));
-    for ([_][]const u8{ "geneve", "ifname x", "rnr 1", "decnet", "lane" }) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+    for ([_][]const u8{ "ifname x", "rnr 1", "decnet", "lane" }) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
 }
 
 const mpls_oracle = @import("testdata/mpls_oracle.zig");
@@ -2685,6 +2852,45 @@ test "compile: mpls and pppoes combined with IP, IPv6 and what rides on them sel
     defer testing.allocator.free(never);
     try verdictsOf(never, &corpus, &got);
     try testing.expectEqual(@as(usize, 0), got.items.len);
+}
+
+const geneve_oracle = @import("testdata/geneve_oracle.zig");
+
+test "compile: geneve alone and combined with IP, IPv6, ports, MAC addresses and what rides on them select the frames tcpdump selects" {
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    const corpus = hex(geneve_oracle.corpus);
+    var selecting: usize = 0;
+    for (geneve_oracle.oracle) |o| {
+        const prog = compile(testing.allocator, o[0]) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+        defer testing.allocator.free(prog);
+        try validate(prog); // the kernel's checker: every scratch slot written before it is read, on every path
+        try verdictsOf(prog, &corpus, &got);
+        testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+        if (got.items.len != 0) selecting += 1;
+    }
+    // Not vacuous: most rows select something.
+    try testing.expect(selecting > geneve_oracle.oracle.len / 2);
+    for (geneve_oracle.refused) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+    for (geneve_oracle.not_built) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+    // The VNI is 24 bits; other links have no Geneve form here.
+    try testing.expectError(error.Syntax, compile(testing.allocator, "geneve 16777216"));
+    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "geneve", .{ .link = .linux_sll }));
+    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "geneve and ip", .{ .vlan_ancillary = true, .link = .raw }));
+    // After `geneve` the slots read as zero on a path that never ran it, and the program is still valid.
+    for ([_][]const u8{ "geneve or tcp", "not geneve and ip", "not geneve and ether src 01:02:03:04:05:06" }) |e| {
+        const prog = try compile(testing.allocator, e);
+        defer testing.allocator.free(prog);
+        try validate(prog);
+        var rd = try pcap.Reader.init(&corpus);
+        while (try rd.next()) |rec| _ = run(prog, rec.data);
+    }
 }
 
 test "compile: protocol and EtherType names mean their numbers (each table entry used)" {
@@ -3593,6 +3799,7 @@ const filter_seeds = [_][]const u8{
     testkit.fuzz.seed("ip and vlan and vlan 7 and udp[2:2] = 53"),
     testkit.fuzz.seed("ip6 proto 17 or arp host 10.0.0.1 or ether proto 0x800"), // link-specific refusals
     testkit.fuzz.seed("inbound and ifindex 2 or mpls 5 or pppoes 7 or outbound"), // kernel metadata and the alone-only shifters
+    testkit.fuzz.seed("geneve 5 and ip and tcp dst port 80 or mpls and mpls and ip"), // the geneve slots and a label stack
     testkit.fuzz.seed(""),
 };
 

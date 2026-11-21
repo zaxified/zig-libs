@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change (previously `UnsupportedExpression`):** `geneve [vni]` compiles as libpcap does (outer IPv4 / IPv6 UDP 6081, Geneve version 0, VNI, then the primitives after it address the inner frame through scratch slots, MAC addresses included); a second `mpls` is the next label of the stack (`mpls 5 and mpls 7`, `mpls and mpls and ip`) and `pppoes and mpls` shifts by one label and takes a label number (before: no shift after it). 61 geneve and 108 mpls/pppoes rows checked against `tcpdump -r`; the kernel accepts the geneve programs.
+
 - **2026-11-21** — **CONSUMER-VISIBLE (additive):** `ring.RingV2`, `ring.OptionsV2`, `ring.FrameV2`: an opt-in `TPACKET_V2` receive ring (one `tpacket2_hdr` frame per packet, the V3 ring's hostile-header checks, ticketed `release`, kernel packet/drop counters). `Ring` (V3) unchanged.
 
 - **2026-11-21** — **BREAKING (enum widened):** `filter.Link` gains `ppp` (DLT_PPP 9: a 4-byte header, address, control and the PPP protocol; `Link.fromDlt(9)` names it). `compileOpts(..., .{ .link = .ppp })` compiles for a PPP savefile as libpcap does (IPv4 0x0021, IPv6 0x0057, ARP as is); an exhaustive `switch` over `Link` needs the new prong. 52 expression rows checked against `tcpdump -y PPP -r`.

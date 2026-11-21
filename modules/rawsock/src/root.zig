@@ -3027,6 +3027,19 @@ test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears
     again.deinit();
 }
 
+test "live: the kernel's checker accepts the geneve programs (scratch slots, the option-length walk; needs CAP_NET_RAW + netns)" {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    for ([_][]const u8{ "geneve", "geneve 5 and ip", "geneve and tcp dst port 80", "geneve and ether src 02:00:00:00:00:01", "geneve or tcp" }) |e| {
+        const prog = try filter.compile(testing.allocator, e);
+        defer testing.allocator.free(prog);
+        var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 50, .filter = prog }) catch |er| switch (er) {
+            error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+            else => return er,
+        };
+        cap.close();
+    }
+}
+
 test "live: a TPACKET_V2 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
     _ = ifaceByName("lo") catch return error.SkipZigTest;
     bringLoopbackUp();
