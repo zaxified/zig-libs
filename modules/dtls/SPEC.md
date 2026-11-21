@@ -535,9 +535,10 @@ collection's `tlsserver` / `tlsclient`, whose API shapes `Ticketer`, `StekTicket
   default count) on the application epoch after the client's Finished — in the same datagram as the ACK — and `poll`
   retransmits it until an ACK names it. The ticket is the `Ticketer`'s sealed blob of this module's state (version,
   suite, issue time, `ticket_age_add`, lifetime, `max_early_data`, the PSK derived from the resumption master secret
-  with a 1-byte nonce); lifetime 12 h (`tlsserver`/rustls), clock `Config.now_sec`. It shares the one post-handshake
+  with a 1-byte nonce, the negotiated ALPN protocol); lifetime 12 h (`tlsserver`/rustls), clock `Config.now_sec`. It shares the one post-handshake
   slot with CID updates (`connectionIdUpdatePending` is true until it is ACKed). A client keeps the last ticket that
-  arrives whole in one record (`Connection.sessionTicket`); a fragmented one is ACKed and not kept.
+  arrives whole in one record (`Connection.sessionTicket`) together with the connection's ALPN protocol
+  (`SessionTicket.alpnProtocol`); a fragmented one is ACKed and not kept.
 - **1.3 resumption** runs in the certificate modes with `psk_dhe_ke` — the PSK plus a fresh (EC)DHE share, what
   rustls, OpenSSL and wolfSSL offer by default; `.psk` mode, already a PSK handshake, neither issues nor offers
   tickets. The client offers `Config.resumption` as the one identity with its obfuscated age and a `"res binder"`
@@ -549,14 +550,17 @@ collection's `tlsserver` / `tlsclient`, whose API shapes `Ticketer`, `StekTicket
   (§4.3.2) or CertificateVerify — and `Connection.resumed()` is true on both sides; a client refuses a server that
   sends certificate messages on a resumption, or selects a PSK it did not offer.
 - **0-RTT (RFC 8446 §2.3, §4.2.10; RFC 9147 epoch 1, no EndOfEarlyData).** A client with `Config.early_data` and a
-  ticket whose `max_early_data` allows it sends `early_data` in its first ClientHello (never after a retry) and the
+  ticket whose `max_early_data` allows it, and whose ALPN protocol (if any) is in `Config.alpn_protocols` (rustls
+  checks the same), sends `early_data` in its first ClientHello (never after a retry) and the
   data in epoch-1 records under `client_early_traffic_secret` right behind it; early records are not retransmitted.
   The server takes them only with `Tickets.max_early_data` > 0 (capped at `max_early_data_len`, 4096), a `replay`
   guard that admits the ticket (asked last; fail closed), the reported age within `max_age_skew_s` (60 s, BoringSSL /
-  rustls), the ticket's suite, no retry and no ALPN (the ticket does not record the original protocol, which §4.2.10
-  requires to match); it announces the acceptance in EncryptedExtensions and keeps the data for
+  rustls), the ticket's suite, no retry and the ticket's ALPN protocol selected again (none for none; §4.2.10 MUST);
+  it announces the acceptance in EncryptedExtensions and keeps the data for
   `Connection.earlyData()` — early records in the ClientHello's datagram or between it and the client's Finished. A
-  refused early record is dropped unread; more early data than allowed is `error.UnexpectedMessage`.
+  refused early record is dropped unread; more early data than allowed is `error.UnexpectedMessage`. A client whose
+  early data was accepted under another ALPN protocol than the ticket's fails `error.Malformed` (§4.2.10; rustls:
+  `illegal_parameter`). Tickets sealed before the ALPN field (state version 1) no longer open: a full handshake.
 - **DTLS 1.2 tickets (RFC 5077) and the abbreviated handshake (RFC 5246 §7.3),** every key exchange. A client with
   `Config.session_tickets12` sends an empty SessionTicket extension and keeps the ticket (`Connection12.sessionTicket`,
   holding the suite, EMS flag and master secret); with `Config.resumption12` it offers one with a fresh 32-byte
@@ -724,9 +728,9 @@ collection's `tlsserver` / `tlsclient`, whose API shapes `Ticketer`, `StekTicket
 - **`psk_dhe_ke`.** `.psk` mode stays PSK-only, so a retry carrying a `key_share` there is
   `error.HelloRetryRequestUnsupported` (`Connection.zig`) rather than a silent upgrade to an exchange this
   engine does not run.
-- **Resumption in `.psk` mode, more than one ticket per handshake, 0-RTT with ALPN, a client's own OCSP staple.**
+- **Resumption in `.psk` mode, more than one ticket per handshake, a client's own OCSP staple.**
   An external-PSK handshake gains nothing from a resumption PSK; one ticket is wolfSSL's default (OpenSSL and rustls
-  send two); 0-RTT with ALPN would need the protocol in the ticket (§4.2.10); a server asking for the CLIENT's staple
+  send two); a server asking for the CLIENT's staple
   (`status_request` in a 1.3 CertificateRequest) is offered by almost nobody.
 - **More than ONE in-progress inbound handshake message in the 1.3 engine.** A fragment of a later message
   arriving while an earlier one is incomplete is `error.InterleavedFragments` (`Connection.zig`) rather than
@@ -898,7 +902,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   resume behind a HelloRetryRequest cookie, the fallbacks (no tickets, expired, corrupt blob, foreign ring) and a
   forged binder; 1.2 abbreviated handshakes for ECDHE_ECDSA, PSK and ECDHE_PSK, the fallbacks and a lost client final
   flight; 0-RTT taken once (strike register), refused without a guard, past the skew and over the limit, early data in
-  a datagram of its own; OCSP staple and SCT list in both engines, and `messages.encodeCertificateStapled` against
+  a datagram of its own, with ALPN taken only under the ticket's protocol (and the ticket state's ALPN codec); OCSP staple and SCT list in both engines, and `messages.encodeCertificateStapled` against
   `tlsserver`'s bytes.
 - **Bench:** `zig build bench-dtls` (`tools/bench.zig`, ReleaseFast, no foreign side): the per-record AEAD call
   against a cached AES-GCM context, seal and open at 64..1400 bytes, gated on identical output, and the whole

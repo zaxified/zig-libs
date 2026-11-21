@@ -562,9 +562,20 @@ pub const SessionTicket = struct {
     received_at_s: i64,
     /// The ticket's `early_data` extension (RFC 8446 §4.2.10), 0 if absent.
     max_early_data: u32,
+    /// The ALPN protocol the issuing connection negotiated (`alpn_len == 0`:
+    /// none). RFC 8446 §4.2.10: 0-RTT runs under the PSK's ALPN, so early
+    /// data is offered only when this protocol (if any) is in the resuming
+    /// `Config.alpn_protocols`.
+    alpn: [255]u8 = @splat(0),
+    alpn_len: u8 = 0,
 
     pub fn identity(self: *const SessionTicket) []const u8 {
         return self.ticket[0..self.ticket_len];
+    }
+
+    /// The ALPN protocol recorded with the ticket, `null` for none.
+    pub fn alpnProtocol(self: *const SessionTicket) ?[]const u8 {
+        return if (self.alpn_len == 0) null else self.alpn[0..self.alpn_len];
     }
 
     pub fn wipe(self: *SessionTicket) void {
@@ -606,10 +617,13 @@ pub const ticket12_state_version: u8 = 2;
 pub const ticket12_state_len = 1 + 2 + 1 + 8 + 4 + 48;
 
 /// The server's ticket plaintext: version, suite, issued-at (s), age_add,
-/// lifetime, max_early_data, the PSK length and the PSK.
-const ticket_state_version: u8 = 1;
+/// lifetime, max_early_data, the PSK length, the PSK, the ALPN length and the
+/// negotiated ALPN protocol (RFC 8446 §4.2.10: 0-RTT must match it). Version 3
+/// (1 had no ALPN; 2 is the DTLS 1.2 ticket): a version-1 ticket no longer
+/// parses and that client gets a full handshake.
+const ticket_state_version: u8 = 3;
 const ticket_state_head = 1 + 2 + 8 + 4 + 4 + 4 + 1;
-const max_ticket_state = ticket_state_head + suitehash.max_hash_len;
+const max_ticket_state = ticket_state_head + suitehash.max_hash_len + 1 + 255;
 const max_sealed_ticket = max_ticket_state + tlsresume.stek.overhead;
 
 const TicketState = struct {
@@ -619,6 +633,8 @@ const TicketState = struct {
     lifetime_s: u32,
     max_early_data: u32,
     psk: Secret,
+    alpn: [255]u8 = @splat(0),
+    alpn_len: u8 = 0,
 
     fn serialize(self: *const TicketState, out: *[max_ticket_state]u8) []u8 {
         const n = self.suite.hash().len();
@@ -630,7 +646,10 @@ const TicketState = struct {
         std.mem.writeInt(u32, out[19..23], self.max_early_data, .big);
         out[23] = @intCast(n);
         @memcpy(out[ticket_state_head..][0..n], self.psk[0..n]);
-        return out[0 .. ticket_state_head + n];
+        const a = ticket_state_head + n;
+        out[a] = self.alpn_len;
+        @memcpy(out[a + 1 ..][0..self.alpn_len], self.alpn[0..self.alpn_len]);
+        return out[0 .. a + 1 + self.alpn_len];
     }
 
     /// Null for anything this server would not have written.
@@ -638,7 +657,8 @@ const TicketState = struct {
         if (bytes.len < ticket_state_head or bytes[0] != ticket_state_version) return null;
         const suite = cipherSuiteFromU16(std.mem.readInt(u16, bytes[1..3], .big)) orelse return null;
         const n = suite.hash().len();
-        if (bytes[23] != n or bytes.len != ticket_state_head + n) return null;
+        const a = ticket_state_head + n;
+        if (bytes[23] != n or bytes.len < a + 1 or bytes.len != a + 1 + @as(usize, bytes[a])) return null;
         var st: TicketState = .{
             .suite = suite,
             .issued_s = std.mem.readInt(i64, bytes[3..11], .big),
@@ -646,8 +666,10 @@ const TicketState = struct {
             .lifetime_s = std.mem.readInt(u32, bytes[15..19], .big),
             .max_early_data = std.mem.readInt(u32, bytes[19..23], .big),
             .psk = undefined,
+            .alpn_len = bytes[a],
         };
         @memcpy(st.psk[0..n], bytes[ticket_state_head..][0..n]);
+        @memcpy(st.alpn[0..st.alpn_len], bytes[a + 1 ..][0..st.alpn_len]);
         return st;
     }
 };
@@ -3000,6 +3022,8 @@ pub const Connection = struct {
         };
         @memcpy(t.ticket[0..nst.ticket.len], nst.ticket);
         if (nst.maxEarlyDataSize()) |m| t.max_early_data = m;
+        t.alpn = self.alpn;
+        t.alpn_len = self.alpn_len;
         suitehash.deriveResumptionPsk(alg, &t.psk, &self.resumption_master, nst.ticket_nonce);
         if (self.ticket_live) self.ticket.wipe();
         self.ticket = t;
@@ -3621,6 +3645,23 @@ pub const Connection = struct {
                 }
             } else return error.Malformed;
         }
+        // RFC 8446 §4.2.10: early data runs under the PSK's ALPN, so a server
+        // that accepts it with another protocol (or none for one) is a
+        // protocol violation (rustls: illegal_parameter).
+        if (self.early_accepted) {
+            const t = self.config.resumption.?;
+            if (!std.mem.eql(u8, t.alpn[0..t.alpn_len], self.alpn[0..self.alpn_len])) return error.Malformed;
+        }
+    }
+
+    /// Whether a ticket's ALPN protocol (`null`: none) is consistent with the
+    /// resuming client's `alpn_protocols`: none, or one of them.
+    fn alpnOffered(offer: []const []const u8, ticket_alpn: ?[]const u8) bool {
+        const want = ticket_alpn orelse return true;
+        for (offer) |p| {
+            if (std.mem.eql(u8, p, want)) return true;
+        }
+        return false;
     }
 
     // ── handshake flight engine (RFC 9147 §5, PSK-only) ──────────────────
@@ -3971,8 +4012,11 @@ pub const Connection = struct {
             n_exts += 1;
             // RFC 8446 §4.2.10: early data only in a first ClientHello, of
             // no more than the ticket allows.
+            // The ticket's ALPN must be on offer again (§4.2.10; rustls
+            // checks the same before sending early data).
             self.early_offered = !self.saw_hello_retry_request and self.config.early_data.len > 0 and
-                self.config.early_data.len <= @min(t.max_early_data, max_early_data_len);
+                self.config.early_data.len <= @min(t.max_early_data, max_early_data_len) and
+                alpnOffered(self.config.alpn_protocols, t.alpnProtocol());
             if (self.early_offered) {
                 exts_buf[n_exts] = .{ .ext_type = ext_early_data, .data = &.{} };
                 n_exts += 1;
@@ -5525,14 +5569,15 @@ pub const Connection = struct {
 
     /// RFC 8446 §4.2.10 / §8 on the server: the client offered early data on
     /// a resumption without a HelloRetryRequest, the ticket allows it, the
-    /// suite is the ticket's, no ALPN was negotiated (the ticket does not
-    /// record the original one, which §4.2.10 requires to match), the
-    /// reported ticket age is within `max_age_skew_s` of the server's, and
-    /// `Tickets.replay` admits the ticket — asked last.
+    /// suite is the ticket's, the ALPN just selected is the ticket's (none
+    /// for none; §4.2.10: MUST be the same), the reported ticket age is
+    /// within `max_age_skew_s` of the server's, and `Tickets.replay` admits
+    /// the ticket — asked last.
     fn acceptEarlyData(self: *Connection, st: *const TicketState, exts: []const messages.Extension, suite: CipherSuite, retried: bool) bool {
         const tk = self.config.tickets orelse return false;
         const guard = tk.replay orelse return false;
-        if (retried or st.max_early_data == 0 or st.suite != suite or self.alpn_len != 0) return false;
+        if (retried or st.max_early_data == 0 or st.suite != suite) return false;
+        if (!std.mem.eql(u8, st.alpn[0..st.alpn_len], self.alpn[0..self.alpn_len])) return false;
         var offered = false;
         var psk_data: []const u8 = &.{};
         for (exts) |e| {
@@ -5632,6 +5677,8 @@ pub const Connection = struct {
             .lifetime_s = @min(tk.lifetime_s, tlsresume.ticket.max_ticket_lifetime_s),
             .max_early_data = @min(tk.max_early_data, max_early_data_len),
             .psk = undefined,
+            .alpn = self.alpn,
+            .alpn_len = self.alpn_len,
         };
         defer std.crypto.secureZero(u8, &st.psk);
         suitehash.deriveResumptionPsk(alg, &st.psk, &self.resumption_master, &nonce);
@@ -12678,7 +12725,12 @@ fn earlyServerConfig(tkr: *const TestTicketer, guard: ?ReplayGuard) Config {
 /// A resumption offering `early` as 0-RTT; returns whether the server took it
 /// and checks what it received.
 fn earlyHandshake(scfg: Config, t: *const SessionTicket, early: []const u8, seed: u8, split: bool) !bool {
+    return earlyHandshakeAlpn(scfg, t, early, seed, split, &.{});
+}
+
+fn earlyHandshakeAlpn(scfg: Config, t: *const SessionTicket, early: []const u8, seed: u8, split: bool, client_alpn: []const []const u8) !bool {
     var ccfg = certDheClientConfig();
+    ccfg.alpn_protocols = client_alpn;
     ccfg.resumption = t;
     ccfg.early_data = early;
     var client = try Connection.clientInit(ccfg);
@@ -12759,6 +12811,75 @@ test "0-RTT: early data on a resumption is taken once (strike register), refused
     var buf: [4096]u8 = undefined;
     _ = try client.startHandshake(seededForTest(&csprng), 0, &buf);
     try testing.expect(!client.early_offered);
+}
+
+test "0-RTT with ALPN (RFC 8446 §4.2.10): the ticket records the protocol; early data only under the same one" {
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    var reg = tlsresume.replay.StrikeRegister.init(testing.allocator, 16, 121_000);
+    defer reg.deinit();
+    const guard = strikeRegisterGuard(&reg);
+    var scfg = earlyServerConfig(&tkr, guard);
+    scfg.alpn_protocols = &.{ "coap", "h2" };
+    var ccfg = certDheClientConfig();
+    ccfg.alpn_protocols = &.{"coap"};
+    var t = try ticketHandshake(scfg, ccfg, 0xc0);
+    defer t.wipe();
+    try testing.expectEqualStrings("coap", t.alpnProtocol().?);
+
+    // Same protocol negotiated again: accepted.
+    try testing.expect(try earlyHandshakeAlpn(scfg, &t, "alpn early", 0xc1, false, &.{"coap"}));
+
+    // The server now picks another protocol: refused, 1-RTT goes on under it.
+    var t2 = try ticketHandshake(scfg, ccfg, 0xc2);
+    defer t2.wipe();
+    var scfg_h2 = scfg;
+    scfg_h2.alpn_protocols = &.{ "h2", "coap" };
+    try testing.expect(!try earlyHandshakeAlpn(scfg_h2, &t2, "alpn early", 0xc3, false, &.{ "coap", "h2" }));
+
+    // The server no longer does ALPN at all: refused (the ticket's "coap" ≠ none).
+    var t3 = try ticketHandshake(scfg, ccfg, 0xc4);
+    defer t3.wipe();
+    var scfg_none = scfg;
+    scfg_none.alpn_protocols = &.{};
+    try testing.expect(!try earlyHandshakeAlpn(scfg_none, &t3, "alpn early", 0xc5, false, &.{"coap"}));
+
+    // A ticket without ALPN, a resumption that negotiates one: refused.
+    var t4 = try ticketHandshake(scfg, certDheClientConfig(), 0xc6);
+    defer t4.wipe();
+    try testing.expectEqual(@as(?[]const u8, null), t4.alpnProtocol());
+    try testing.expect(!try earlyHandshakeAlpn(scfg, &t4, "alpn early", 0xc7, false, &.{"h2"}));
+
+    // The client no longer offers the ticket's protocol: it sends no early data.
+    var c = ccfg;
+    c.alpn_protocols = &.{"h2"};
+    c.resumption = &t3;
+    c.early_data = "x";
+    var client = try Connection.clientInit(c);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xc8)));
+    var buf: [4096]u8 = undefined;
+    _ = try client.startHandshake(seededForTest(&csprng), 0, &buf);
+    try testing.expect(!client.early_offered);
+}
+
+test "0-RTT with ALPN: the ticket state round-trips the protocol; a version-1 state no longer parses" {
+    var st: TicketState = .{ .suite = .aes_128_gcm_sha256, .issued_s = 7, .age_add = 9, .lifetime_s = 60, .max_early_data = 100, .psk = @splat(0x11) };
+    @memcpy(st.alpn[0..2], "h2");
+    st.alpn_len = 2;
+    var buf: [max_ticket_state]u8 = undefined;
+    const bytes = st.serialize(&buf);
+    const back = TicketState.parse(bytes).?;
+    try testing.expectEqualStrings("h2", back.alpn[0..back.alpn_len]);
+    try testing.expectEqual(@as(u32, 100), back.max_early_data);
+    // Truncated ALPN, trailing byte, the old version: all refused.
+    try testing.expect(TicketState.parse(bytes[0 .. bytes.len - 1]) == null);
+    var longer: [max_ticket_state]u8 = undefined;
+    @memcpy(longer[0..bytes.len], bytes);
+    longer[bytes.len] = 0;
+    try testing.expect(TicketState.parse(longer[0 .. bytes.len + 1]) == null);
+    longer[0] = 1;
+    try testing.expect(TicketState.parse(longer[0..bytes.len]) == null);
 }
 
 // ── OCSP stapling and SCTs (RFC 8446 §4.4.2.1) ────────────────────────────
