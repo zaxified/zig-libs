@@ -29,6 +29,24 @@ const tlv = @import("tlv.zig");
 /// reachable through the raw walker.
 pub const code = struct {
     pub const area_addresses: u8 = 1;
+    /// Extended Sequence Number (RFC 7602 section 3).
+    pub const extended_sequence_number: u8 = 11;
+    /// Purge Originator Identification (RFC 6232).
+    pub const purge_originator: u8 = 13;
+    /// IP Internal Reachability (RFC 1195, legacy narrow metrics).
+    pub const ip_internal_reachability: u8 = 128;
+    /// IP External Reachability (RFC 1195, legacy narrow metrics).
+    pub const ip_external_reachability: u8 = 130;
+    /// IPv6 Interface Address (RFC 5308 section 3).
+    pub const ipv6_interface_address: u8 = 232;
+    /// MT Intermediate Systems (RFC 5120 section 7.2).
+    pub const mt_is_reachability: u8 = 222;
+    /// Multi-Topology (RFC 5120 section 7.1), carried in IIHs and LSP fragment 0.
+    pub const multi_topology: u8 = 229;
+    /// MT IP Reachability (RFC 5120 section 7.3).
+    pub const mt_ip_reachability: u8 = 235;
+    /// MT IPv6 Reachability (RFC 5120 section 7.4).
+    pub const mt_ipv6_reachability: u8 = 237;
     pub const is_neighbours_lsp: u8 = 2;
     pub const is_neighbours_iih: u8 = 6;
     pub const padding: u8 = 8;
@@ -295,10 +313,9 @@ pub const ExtIpReachIterator = struct {
     }
 };
 
-/// Appends one Extended IP Reachability (#135) TLV with a single entry.
-pub fn addExtIpReach(b: *tlv.Builder, e: ExtIpReachEntry) (tlv.BuildError || ParseError)!void {
+/// Serialises one #135 entry into `scratch`, returning its length.
+fn writeExtIpReach(scratch: []u8, e: ExtIpReachEntry) (tlv.BuildError || ParseError)!usize {
     if (e.prefix_len > 32) return error.BadTlvLength;
-    var scratch: [tlv.max_value_len]u8 = undefined;
     const nbytes: usize = (e.prefix_len + 7) / 8;
     const has_sub = e.sub_tlvs.len != 0;
     const total = 5 + nbytes + (if (has_sub) 1 + e.sub_tlvs.len else 0);
@@ -312,7 +329,14 @@ pub fn addExtIpReach(b: *tlv.Builder, e: ExtIpReachEntry) (tlv.BuildError || Par
         scratch[5 + nbytes] = @intCast(e.sub_tlvs.len);
         @memcpy(scratch[6 + nbytes ..][0..e.sub_tlvs.len], e.sub_tlvs);
     }
-    try b.addTlv(code.extended_ip_reachability, scratch[0..total]);
+    return total;
+}
+
+/// Appends one Extended IP Reachability (#135) TLV with a single entry.
+pub fn addExtIpReach(b: *tlv.Builder, e: ExtIpReachEntry) (tlv.BuildError || ParseError)!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    const n = try writeExtIpReach(&scratch, e);
+    try b.addTlv(code.extended_ip_reachability, scratch[0..n]);
 }
 
 /// One IPv6 Reachability (#236) entry: `metric(4) || control(1) ||
@@ -372,10 +396,9 @@ pub const Ipv6ReachIterator = struct {
     }
 };
 
-/// Appends one IPv6 Reachability (#236) TLV with a single entry.
-pub fn addIpv6Reach(b: *tlv.Builder, e: Ipv6ReachEntry) (tlv.BuildError || ParseError)!void {
+/// Serialises one #236 entry into `scratch`, returning its length.
+fn writeIpv6Reach(scratch: []u8, e: Ipv6ReachEntry) (tlv.BuildError || ParseError)!usize {
     if (e.prefix_len > 128) return error.BadTlvLength;
-    var scratch: [tlv.max_value_len]u8 = undefined;
     const nbytes: usize = (@as(usize, e.prefix_len) + 7) / 8;
     const has_sub = e.sub_tlvs.len != 0;
     const total = 6 + nbytes + (if (has_sub) 1 + e.sub_tlvs.len else 0);
@@ -390,7 +413,314 @@ pub fn addIpv6Reach(b: *tlv.Builder, e: Ipv6ReachEntry) (tlv.BuildError || Parse
         scratch[6 + nbytes] = @intCast(e.sub_tlvs.len);
         @memcpy(scratch[7 + nbytes ..][0..e.sub_tlvs.len], e.sub_tlvs);
     }
-    try b.addTlv(code.ipv6_reachability, scratch[0..total]);
+    return total;
+}
+
+/// Appends one IPv6 Reachability (#236) TLV with a single entry.
+pub fn addIpv6Reach(b: *tlv.Builder, e: Ipv6ReachEntry) (tlv.BuildError || ParseError)!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    const n = try writeIpv6Reach(&scratch, e);
+    try b.addTlv(code.ipv6_reachability, scratch[0..n]);
+}
+
+// ── #128 / #130 legacy IP reachability (RFC 1195 section 5.2) ────────────────
+
+/// One legacy IP reachability entry: four 1-octet metrics, IP address and
+/// subnet mask. The default metric octet is `U/D(1) | I/E(1) | metric(6)`
+/// (RFC 5302 section 3.1 reuses the top bit as Up/Down); the delay, expense
+/// and error octets are `S(1) | I/E(1) | metric(6)` and stay raw (S = 1 means
+/// "not supported"), like `IsReachEntry`.
+pub const IpReachEntry = struct {
+    /// The 6-bit default metric value.
+    default_metric: u6,
+    /// The default metric's I/E bit: an external metric type.
+    default_external: bool = false,
+    /// Up/Down bit of the default metric octet (RFC 5302).
+    up_down: bool = false,
+    delay_metric: u8 = 0x80,
+    expense_metric: u8 = 0x80,
+    error_metric: u8 = 0x80,
+    address: [4]u8,
+    mask: [4]u8,
+
+    /// The prefix length when `mask` is contiguous (a run of ones from the
+    /// top), else null.
+    pub fn prefixLen(e: IpReachEntry) ?u8 {
+        const m = std.mem.readInt(u32, &e.mask, .big);
+        const ones = @clz(~m);
+        const expect: u32 = if (ones == 0) 0 else ~@as(u32, 0) << @intCast(32 - ones);
+        if (ones == 32) return 32;
+        if (m != expect) return null;
+        return @intCast(ones);
+    }
+};
+
+/// Walks a legacy IP reachability (#128 or #130) value: repeated 12-octet records.
+pub const IpReachIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) IpReachIterator {
+        return .{ .buf = value };
+    }
+
+    pub fn next(it: *IpReachIterator) ParseError!?IpReachEntry {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 12 > it.buf.len) return error.BadTlvLength;
+        const e = it.buf[it.pos..][0..12];
+        it.pos += 12;
+        return .{
+            .default_metric = @intCast(e[0] & 0x3f),
+            .default_external = (e[0] & 0x40) != 0,
+            .up_down = (e[0] & 0x80) != 0,
+            .delay_metric = e[1],
+            .expense_metric = e[2],
+            .error_metric = e[3],
+            .address = e[4..8].*,
+            .mask = e[8..12].*,
+        };
+    }
+};
+
+/// Appends a legacy IP reachability TLV (`code.ip_internal_reachability` or
+/// `code.ip_external_reachability`) from a slice of entries.
+pub fn addIpReach(b: *tlv.Builder, tlv_code: u8, entries: []const IpReachEntry) tlv.BuildError!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    var n: usize = 0;
+    for (entries) |e| {
+        if (n + 12 > scratch.len) return error.ValueTooLong;
+        scratch[n] = @as(u8, e.default_metric) | (if (e.default_external) @as(u8, 0x40) else 0) | (if (e.up_down) @as(u8, 0x80) else 0);
+        scratch[n + 1] = e.delay_metric;
+        scratch[n + 2] = e.expense_metric;
+        scratch[n + 3] = e.error_metric;
+        @memcpy(scratch[n + 4 ..][0..4], &e.address);
+        @memcpy(scratch[n + 8 ..][0..4], &e.mask);
+        n += 12;
+    }
+    try b.addTlv(tlv_code, scratch[0..n]);
+}
+
+// ── #132 IP Interface Address / #232 IPv6 Interface Address ──────────────────
+
+/// Walks an IP Interface Address (#132, RFC 1195) value: a flat list of 4-octet addresses.
+pub const Ipv4AddressIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) Ipv4AddressIterator {
+        return .{ .buf = value };
+    }
+
+    pub fn next(it: *Ipv4AddressIterator) ParseError!?[4]u8 {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 4 > it.buf.len) return error.BadTlvLength;
+        const a = it.buf[it.pos..][0..4].*;
+        it.pos += 4;
+        return a;
+    }
+};
+
+/// Walks an IPv6 Interface Address (#232, RFC 5308 section 3) value: a flat list of 16-octet addresses.
+pub const Ipv6AddressIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) Ipv6AddressIterator {
+        return .{ .buf = value };
+    }
+
+    pub fn next(it: *Ipv6AddressIterator) ParseError!?[16]u8 {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 16 > it.buf.len) return error.BadTlvLength;
+        const a = it.buf[it.pos..][0..16].*;
+        it.pos += 16;
+        return a;
+    }
+};
+
+/// Appends an IP Interface Address (#132) TLV.
+pub fn addIpv4InterfaceAddresses(b: *tlv.Builder, addrs: []const [4]u8) tlv.BuildError!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    var n: usize = 0;
+    for (addrs) |a| {
+        if (n + 4 > scratch.len) return error.ValueTooLong;
+        @memcpy(scratch[n..][0..4], &a);
+        n += 4;
+    }
+    try b.addTlv(code.ip_interface_address, scratch[0..n]);
+}
+
+/// Appends an IPv6 Interface Address (#232) TLV.
+pub fn addIpv6InterfaceAddresses(b: *tlv.Builder, addrs: []const [16]u8) tlv.BuildError!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    var n: usize = 0;
+    for (addrs) |a| {
+        if (n + 16 > scratch.len) return error.ValueTooLong;
+        @memcpy(scratch[n..][0..16], &a);
+        n += 16;
+    }
+    try b.addTlv(code.ipv6_interface_address, scratch[0..n]);
+}
+
+// ── #13 Purge Originator Identification (RFC 6232) ───────────────────────────
+
+/// The Purge Originator Identification (#13) TLV: the system-id of the IS that
+/// generated or inserted the purge and, when it received the purge from a
+/// neighbour, that neighbour's system-id. Six-octet system-ids (the modeled ID length).
+pub const PurgeOriginator = struct {
+    originator: [6]u8,
+    /// The upstream IS the purge was received from; present when the count is 2.
+    sender: ?[6]u8 = null,
+
+    /// `BadTlvLength` unless the count octet is 1 or 2 and the value has exactly that many ids.
+    pub fn decode(value: []const u8) ParseError!PurgeOriginator {
+        if (value.len < 1) return error.BadTlvLength;
+        const n = value[0];
+        if (n != 1 and n != 2) return error.BadTlvLength;
+        if (value.len != 1 + @as(usize, n) * 6) return error.BadTlvLength;
+        return .{ .originator = value[1..7].*, .sender = if (n == 2) value[7..13].* else null };
+    }
+};
+
+/// Appends a Purge Originator Identification (#13) TLV.
+pub fn addPurgeOriginator(b: *tlv.Builder, p: PurgeOriginator) tlv.BuildError!void {
+    var v: [13]u8 = undefined;
+    v[0] = if (p.sender != null) 2 else 1;
+    @memcpy(v[1..7], &p.originator);
+    if (p.sender) |s| @memcpy(v[7..13], &s);
+    try b.addTlv(code.purge_originator, v[0..if (p.sender != null) 13 else 7]);
+}
+
+// ── #11 Extended Sequence Number (RFC 7602) ──────────────────────────────────
+
+/// The Extended Sequence Number (#11) TLV: a 64-bit session sequence number
+/// and a 32-bit packet sequence number (RFC 7602 section 3).
+pub const ExtSeqNum = struct {
+    session: u64,
+    packet: u32,
+
+    /// `BadTlvLength` unless the value is exactly 12 octets.
+    pub fn decode(value: []const u8) ParseError!ExtSeqNum {
+        if (value.len != 12) return error.BadTlvLength;
+        return .{
+            .session = std.mem.readInt(u64, value[0..8], .big),
+            .packet = std.mem.readInt(u32, value[8..12], .big),
+        };
+    }
+};
+
+/// Appends an Extended Sequence Number (#11) TLV.
+pub fn addExtSeqNum(b: *tlv.Builder, e: ExtSeqNum) tlv.BuildError!void {
+    var v: [12]u8 = undefined;
+    std.mem.writeInt(u64, v[0..8], e.session, .big);
+    std.mem.writeInt(u32, v[8..12], e.packet, .big);
+    try b.addTlv(code.extended_sequence_number, &v);
+}
+
+// ── multi-topology TLVs (RFC 5120) ───────────────────────────────────────────
+
+/// A multi-topology TLV value split into its 12-bit MT ID and the entries after
+/// the 2-octet preamble (#222 / #235 / #237: the 4 high bits are reserved,
+/// sent as zero and ignored on receipt). RFC 5120 says a TLV with MT ID 0 is
+/// ignored; `split` reports it as `MtIdZero` so the caller can skip it.
+pub const MtValue = struct {
+    mt_id: u12,
+    entries: []const u8,
+
+    pub const Error = ParseError || error{MtIdZero};
+
+    pub fn split(value: []const u8) Error!MtValue {
+        if (value.len < 2) return error.BadTlvLength;
+        const id: u12 = @truncate(std.mem.readInt(u16, value[0..2], .big));
+        if (id == 0) return error.MtIdZero;
+        return .{ .mt_id = id, .entries = value[2..] };
+    }
+
+    /// The entries of an MT IS Neighbors (#222) value, as for #22.
+    pub fn isReach(m: MtValue) ExtIsReachIterator {
+        return ExtIsReachIterator.init(m.entries);
+    }
+    /// The entries of an MT IP Reachability (#235) value, as for #135.
+    pub fn ipReach(m: MtValue) ExtIpReachIterator {
+        return ExtIpReachIterator.init(m.entries);
+    }
+    /// The entries of an MT IPv6 Reachability (#237) value, as for #236.
+    pub fn ipv6Reach(m: MtValue) Ipv6ReachIterator {
+        return Ipv6ReachIterator.init(m.entries);
+    }
+};
+
+/// One component of a Multi-Topology (#229) TLV: `O(1) A(1) R(2) MT-ID(12)`.
+pub const MtComponent = struct {
+    mt_id: u12,
+    overload: bool = false,
+    attach: bool = false,
+};
+
+/// Walks a Multi-Topology (#229) value: 2-octet components.
+pub const MtComponentIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) MtComponentIterator {
+        return .{ .buf = value };
+    }
+
+    pub fn next(it: *MtComponentIterator) ParseError!?MtComponent {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 2 > it.buf.len) return error.BadTlvLength;
+        const w = std.mem.readInt(u16, it.buf[it.pos..][0..2], .big);
+        it.pos += 2;
+        return .{ .mt_id = @truncate(w), .overload = (w & 0x8000) != 0, .attach = (w & 0x4000) != 0 };
+    }
+};
+
+/// Appends a Multi-Topology (#229) TLV.
+pub fn addMultiTopology(b: *tlv.Builder, comps: []const MtComponent) tlv.BuildError!void {
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    var n: usize = 0;
+    for (comps) |c| {
+        if (n + 2 > scratch.len) return error.ValueTooLong;
+        const w: u16 = @as(u16, c.mt_id) | (if (c.overload) @as(u16, 0x8000) else 0) | (if (c.attach) @as(u16, 0x4000) else 0);
+        std.mem.writeInt(u16, scratch[n..][0..2], w, .big);
+        n += 2;
+    }
+    try b.addTlv(code.multi_topology, scratch[0..n]);
+}
+
+fn mtPreamble(scratch: []u8, mt_id: u12) void {
+    std.mem.writeInt(u16, scratch[0..2], mt_id, .big);
+}
+
+/// Appends an MT IS Neighbors (#222) TLV with one entry (as `addExtendedIsReach`).
+pub fn addMtIsReach(b: *tlv.Builder, mt_id: u12, neighbour_id: [7]u8, metric: u24, sub_tlvs: []const u8) (tlv.BuildError || ParseError)!void {
+    if (mt_id == 0) return error.BadTlvLength;
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    if (13 + sub_tlvs.len > scratch.len or sub_tlvs.len > 255) return error.ValueTooLong;
+    mtPreamble(&scratch, mt_id);
+    @memcpy(scratch[2..9], &neighbour_id);
+    std.mem.writeInt(u24, scratch[9..12], metric, .big);
+    scratch[12] = @intCast(sub_tlvs.len);
+    @memcpy(scratch[13..][0..sub_tlvs.len], sub_tlvs);
+    try b.addTlv(code.mt_is_reachability, scratch[0 .. 13 + sub_tlvs.len]);
+}
+
+/// Appends an MT IP Reachability (#235) TLV with one entry (as `addExtIpReach`).
+pub fn addMtIpReach(b: *tlv.Builder, mt_id: u12, e: ExtIpReachEntry) (tlv.BuildError || ParseError)!void {
+    if (mt_id == 0) return error.BadTlvLength;
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    mtPreamble(&scratch, mt_id);
+    const n = try writeExtIpReach(scratch[2..], e);
+    try b.addTlv(code.mt_ip_reachability, scratch[0 .. 2 + n]);
+}
+
+/// Appends an MT IPv6 Reachability (#237) TLV with one entry (as `addIpv6Reach`).
+pub fn addMtIpv6Reach(b: *tlv.Builder, mt_id: u12, e: Ipv6ReachEntry) (tlv.BuildError || ParseError)!void {
+    if (mt_id == 0) return error.BadTlvLength;
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    mtPreamble(&scratch, mt_id);
+    const n = try writeIpv6Reach(scratch[2..], e);
+    try b.addTlv(code.mt_ipv6_reachability, scratch[0 .. 2 + n]);
 }
 
 // ── #129 Protocols Supported / #137 Dynamic Hostname ─────────────────────────
@@ -656,4 +986,150 @@ test "IPv6 reachability: lies and out-of-range lengths are typed errors" {
     try testing.expectError(error.BadTlvLength, it4.next());
     var it5 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0 });
     try testing.expectError(error.BadTlvLength, it5.next());
+}
+
+test "legacy IP reachability: layout, flags, contiguous mask" {
+    var buf: [64]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    try addIpReach(&b, code.ip_internal_reachability, &.{
+        .{ .default_metric = 10, .address = .{ 10, 0, 0, 0 }, .mask = .{ 255, 0, 0, 0 } },
+        .{ .default_metric = 63, .default_external = true, .up_down = true, .delay_metric = 5, .address = .{ 192, 0, 2, 0 }, .mask = .{ 255, 0, 255, 0 } },
+    });
+    const v = (try tlv.findFirst(b.written(), code.ip_internal_reachability)).?;
+    try testing.expectEqualSlices(u8, &.{ 10, 0x80, 0x80, 0x80, 10, 0, 0, 0, 255, 0, 0, 0 }, v[0..12]);
+    try testing.expectEqual(@as(u8, 0x80 | 0x40 | 63), v[12]);
+    var it = IpReachIterator.init(v);
+    const a = (try it.next()).?;
+    try testing.expectEqual(@as(?u8, 8), a.prefixLen());
+    const c = (try it.next()).?;
+    try testing.expect(c.default_external and c.up_down);
+    try testing.expectEqual(@as(u6, 63), c.default_metric);
+    try testing.expectEqual(@as(u8, 5), c.delay_metric);
+    try testing.expectEqual(@as(?u8, null), c.prefixLen());
+    try testing.expectEqual(@as(?IpReachEntry, null), try it.next());
+    var bad = IpReachIterator.init(v[0..11]);
+    try testing.expectError(error.BadTlvLength, bad.next());
+    const z: IpReachEntry = .{ .default_metric = 0, .address = @splat(0), .mask = @splat(0) };
+    try testing.expectEqual(@as(?u8, 0), z.prefixLen());
+    var f = z;
+    f.mask = @splat(255);
+    try testing.expectEqual(@as(?u8, 32), f.prefixLen());
+    f.mask = .{ 255, 255, 255, 254 };
+    try testing.expectEqual(@as(?u8, 31), f.prefixLen());
+}
+
+test "interface address TLVs round-trip and refuse partial records" {
+    var buf: [128]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    try addIpv4InterfaceAddresses(&b, &.{ .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 } });
+    var a6: [16]u8 = @splat(0);
+    a6[0] = 0xfe;
+    a6[1] = 0x80;
+    try addIpv6InterfaceAddresses(&b, &.{a6});
+    var it = Ipv4AddressIterator.init((try tlv.findFirst(b.written(), code.ip_interface_address)).?);
+    try testing.expectEqual([4]u8{ 10, 0, 0, 1 }, (try it.next()).?);
+    try testing.expectEqual([4]u8{ 10, 0, 0, 2 }, (try it.next()).?);
+    try testing.expectEqual(@as(?[4]u8, null), try it.next());
+    var it6 = Ipv6AddressIterator.init((try tlv.findFirst(b.written(), code.ipv6_interface_address)).?);
+    try testing.expectEqual(a6, (try it6.next()).?);
+    try testing.expectEqual(@as(?[16]u8, null), try it6.next());
+    var p4 = Ipv4AddressIterator.init(&.{ 1, 2, 3 });
+    try testing.expectError(error.BadTlvLength, p4.next());
+    var p6 = Ipv6AddressIterator.init(&@as([15]u8, @splat(0)));
+    try testing.expectError(error.BadTlvLength, p6.next());
+}
+
+test "purge originator (RFC 6232): one or two ids, nothing else" {
+    var buf: [64]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    const o = [6]u8{ 0, 0, 0, 0, 0, 1 };
+    const s = [6]u8{ 0, 0, 0, 0, 0, 2 };
+    try addPurgeOriginator(&b, .{ .originator = o });
+    try addPurgeOriginator(&b, .{ .originator = o, .sender = s });
+    var ti = tlv.TlvIterator.init(b.written());
+    const t1 = (try ti.next()).?;
+    try testing.expectEqual(code.purge_originator, t1.code);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 1 }, t1.value);
+    const p1 = try PurgeOriginator.decode(t1.value);
+    try testing.expectEqual(@as(?[6]u8, null), p1.sender);
+    const p2 = try PurgeOriginator.decode((try ti.next()).?.value);
+    try testing.expectEqual(s, p2.sender.?);
+    try testing.expectEqual(o, p2.originator);
+    try testing.expectError(error.BadTlvLength, PurgeOriginator.decode(&.{}));
+    try testing.expectError(error.BadTlvLength, PurgeOriginator.decode(&.{ 0, 1, 2, 3, 4, 5, 6 }));
+    try testing.expectError(error.BadTlvLength, PurgeOriginator.decode(&.{ 3, 1, 2, 3, 4, 5, 6 }));
+    try testing.expectError(error.BadTlvLength, PurgeOriginator.decode(&.{ 2, 1, 2, 3, 4, 5, 6 })); // count 2, one id
+    try testing.expectError(error.BadTlvLength, PurgeOriginator.decode(&.{ 1, 1, 2, 3, 4, 5, 6, 7 })); // count 1, extra octet
+}
+
+test "extended sequence number (RFC 7602): 12 octets, session then packet" {
+    var buf: [32]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    try addExtSeqNum(&b, .{ .session = 0x0102030405060708, .packet = 0x0a0b0c0d });
+    try testing.expectEqualSlices(u8, &.{ 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 0x0a, 0x0b, 0x0c, 0x0d }, b.written());
+    const e = try ExtSeqNum.decode((try tlv.findFirst(b.written(), code.extended_sequence_number)).?);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), e.session);
+    try testing.expectEqual(@as(u32, 0x0a0b0c0d), e.packet);
+    try testing.expectError(error.BadTlvLength, ExtSeqNum.decode(&@as([11]u8, @splat(0))));
+    try testing.expectError(error.BadTlvLength, ExtSeqNum.decode(&@as([13]u8, @splat(0))));
+}
+
+test "multi-topology TLVs (RFC 5120): preamble, entries, MT ID 0 ignored" {
+    var buf: [128]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    const nbr = [7]u8{ 0, 0, 0, 0, 0, 3, 0 };
+    try addMtIsReach(&b, 2, nbr, 77, &.{ 4, 1, 9 });
+    try addMtIpReach(&b, 0xabc, .{ .metric = 5, .prefix_len = 24, .prefix = .{ 10, 1, 2, 0 } });
+    try addMtIpv6Reach(&b, 3, .{ .metric = 6, .external = true, .prefix_len = 8, .prefix = @as([16]u8, @splat(0xff)) });
+    var ti = tlv.TlvIterator.init(b.written());
+    const t222 = (try ti.next()).?;
+    try testing.expectEqual(code.mt_is_reachability, t222.code);
+    try testing.expectEqualSlices(u8, &.{ 0, 2 }, t222.value[0..2]);
+    const m1 = try MtValue.split(t222.value);
+    try testing.expectEqual(@as(u12, 2), m1.mt_id);
+    var mi1 = m1.isReach();
+    const e1 = (try mi1.next()).?;
+    try testing.expectEqual(nbr, e1.neighbour_id);
+    try testing.expectEqual(@as(u24, 77), e1.metric);
+    try testing.expectEqualSlices(u8, &.{ 4, 1, 9 }, e1.sub_tlvs);
+    const t235 = (try ti.next()).?;
+    try testing.expectEqual(code.mt_ip_reachability, t235.code);
+    const m2 = try MtValue.split(t235.value);
+    try testing.expectEqual(@as(u12, 0xabc), m2.mt_id);
+    try testing.expectEqual(@as(u8, 0x0a), t235.value[0]);
+    var mi2 = m2.ipReach();
+    const e2 = (try mi2.next()).?;
+    try testing.expectEqual(@as(u8, 24), e2.prefix_len);
+    try testing.expectEqual(@as(u32, 5), e2.metric);
+    const t237 = (try ti.next()).?;
+    try testing.expectEqual(code.mt_ipv6_reachability, t237.code);
+    const m3 = try MtValue.split(t237.value);
+    var mi3 = m3.ipv6Reach();
+    const e3 = (try mi3.next()).?;
+    try testing.expect(e3.external);
+    try testing.expectEqual(@as(u8, 0xff), e3.prefix[0]);
+    // The reserved high bits are ignored on receipt; MT ID 0 is reported.
+    try testing.expectEqual(@as(u12, 7), (try MtValue.split(&.{ 0xf0, 7 })).mt_id);
+    try testing.expectError(error.MtIdZero, MtValue.split(&.{ 0xf0, 0 }));
+    try testing.expectError(error.BadTlvLength, MtValue.split(&.{1}));
+    var none: [64]u8 = undefined;
+    var nb = tlv.Builder.init(&none);
+    try testing.expectError(error.BadTlvLength, addMtIpReach(&nb, 0, .{ .metric = 0, .prefix_len = 0, .prefix = @splat(0) }));
+    try testing.expectError(error.BadTlvLength, addMtIsReach(&nb, 0, nbr, 0, &.{}));
+    try testing.expectError(error.BadTlvLength, addMtIpv6Reach(&nb, 0, .{ .metric = 0, .prefix_len = 0, .prefix = @splat(0) }));
+}
+
+test "multi-topology (#229) components carry O/A and the 12-bit id" {
+    var buf: [32]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    try addMultiTopology(&b, &.{ .{ .mt_id = 0 }, .{ .mt_id = 2, .overload = true }, .{ .mt_id = 4095, .attach = true } });
+    try testing.expectEqualSlices(u8, &.{ 229, 6, 0, 0, 0x80, 2, 0x4f, 0xff }, b.written());
+    var it = MtComponentIterator.init((try tlv.findFirst(b.written(), code.multi_topology)).?);
+    try testing.expectEqual(MtComponent{ .mt_id = 0 }, (try it.next()).?);
+    try testing.expectEqual(MtComponent{ .mt_id = 2, .overload = true }, (try it.next()).?);
+    try testing.expectEqual(MtComponent{ .mt_id = 4095, .attach = true }, (try it.next()).?);
+    try testing.expectEqual(@as(?MtComponent, null), try it.next());
+    var bad = MtComponentIterator.init(&.{ 0, 1, 2 });
+    _ = try bad.next();
+    try testing.expectError(error.BadTlvLength, bad.next());
 }
