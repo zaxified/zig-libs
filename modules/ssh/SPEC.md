@@ -468,6 +468,14 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
   carries the counter byte by byte, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (0.96x
   OpenSSL EVP CTR at 16 KiB) is the shape for aes192, and the same counter over std's `AesEncryptCtx` for
   aes128/256 (std's own `modes.ctr` is 2.3x slower on Zig 0.17, #36256). Needs a packet-rate bench first.
+- **Userauth methods and callbacks not provided:** `hostbased` (RFC 4252 §9), the §8 password-change
+  sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), and from Go's server a
+  per-connection `BannerCallback` (the banner is a static `AuthConfig.banner`), `AuthLogCallback` for
+  successes (`on_rejected` covers refusals), `VerifiedPublicKeyCallback`, `PreAuthConnCallback` and the
+  `source-address` check (the module never sees the peer address).
+
+## Roadmap
+
 - **Go `x/crypto/ssh` parity, phase P3** (owner goal: "our ssh qualitatively at the level of the Go
   implementation"): a server API in Go's shape (channels and requests handed to the application, which
   also lifts the batch-handler and server-side `signal`/`exit-signal` limits), streamlocal, a `Signer` +
@@ -476,14 +484,11 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
   DH-sha1, `ssh-rsa` SHA-1; the lists are runtime-configurable and a legacy name would live only in the
   `supported_*` ceiling, off by default). Older network gear that offers only CTR/HMAC-SHA1 is the use
   case. Effort: small-medium for certificates and the agent client, each.
-- **Userauth methods and callbacks not provided:** `hostbased` (RFC 4252 §9), the §8 password-change
-  sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), and from Go's server a
-  per-connection `BannerCallback` (the banner is a static `AuthConfig.banner`), `AuthLogCallback` for
-  successes (`on_rejected` covers refusals), `VerifiedPublicKeyCallback`, `PreAuthConnCallback` and the
-  `source-address` check (the module never sees the peer address).
+  Size: months in total (a server API in Go's shape, an agent client, certificates, GSSAPI, the legacy opt-ins: each its own piece with Go/OpenSSH interop tests).
 - **SFTP client** (draft-ietf-secsh-filexfer-02 v3). File transfer is the other reason people use SSH from a
   library (russh and libssh2 have it). It would be its own module on top of `subsystem`; no sibling exists.
   Effort: large. Fits the scope.
+  Size: weeks (a new module over `subsystem`, draft-02 v3 packets, OpenSSH sftp-server interop).
 
 ## Anchoring
 
