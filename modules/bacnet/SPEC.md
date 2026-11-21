@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-05 (43/43) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BACNET_FUZZ) · ct n/a — building automation, no auth (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-11-21 (2,000,000-run budget per harness clean, BACNET_FUZZ) · ct n/a — building automation, no auth (keyword review, 2026-10-07)
 
 **Performance:** not measured
 
@@ -281,7 +281,7 @@ decoder.
 - **Fuzz:** the deterministic driver, `BACNET_FUZZ=<runs>[,<first seed>]` (`_ONLY` selects a harness; names are
   `bacnet-<file>-<function>`): the BVLC decoders (both link layers: `bvll`, `sc` decode and options), the NPDU and APDU
   decoders, the tag decoder (`skip`, application values, `openedBlock`, header round trip), the service decoders and
-  service-integer narrowing, `Device`, `ScNode` and `ScHub`. The same harnesses run as `std.testing.fuzz` corpus
+  service-integer narrowing, the event-service decoders (`events`), `Device` (with a reassembly buffer, up to four datagrams per run so that a segmented request is a conversation), `Client` (a segmented request in flight, answers and event notifications from the peer), `ScNode` and `ScHub`. The same harnesses run as `std.testing.fuzz` corpus
   targets.
 - **ctgrind:** none; building automation, no secrets (card, Hardening line).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run

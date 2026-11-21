@@ -2034,3 +2034,76 @@ test "a stale response to an already-retired transaction is not a second answer"
     try testing.expectEqual(std.meta.Tag(Event).unhandled, std.meta.activeTag(ev));
     try testing.expectEqual(apdu.PduType.complex_ack, ev.unhandled.pdu_type);
 }
+
+// ── fuzzing: a client with a segmented request in flight ────────────────────
+
+const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
+
+/// Whole datagrams from the device the client is talking to: SegmentACKs for
+/// the request it is sending (in order, repeated, out of range), a segmented
+/// ComplexACK, answers, aborts, event notifications.
+const client_seeds = [_][]const u8{
+    fuzzSeed("810a000a010041000004"), // positive server SegmentACK for segment 0
+    fuzzSeed("810a000a010041000104"), // ... for segment 1
+    fuzzSeed("810a000a010043000004"), // negative, naming segment 0
+    fuzzSeed("810a000a01004300ff04"), // negative, naming a segment never sent
+    fuzzSeed("810a000a010071000008"), // Abort(tsm_timeout) from the server
+    fuzzSeed("810a000c01003c0000040c3e"), // first segment of a ComplexACK
+    fuzzSeed("810a0009010020000f"), // SimpleACK
+    fuzzSeed("810a002c010030001d0e0c0000000519032a05603e1905190019093f49005a05a06e2164216421c86f0f1901"), // GetEventInformation ACK
+    fuzzSeed("810a00410100100309071c020002572c000000053e19053f4903596469057c00686f7489009901a900b903ce5e0c42b700001a04802c400000003c42b400005fcf"), // unconfirmed event notification
+    fuzzSeed("810a004301040005010209071c020002572c000000053e19053f4903596469057c00686f7489009901a900b903ce5e0c42b700001a04802c400000003c42b400005fcf"), // confirmed one
+};
+
+test "fuzz: the client never crashes on arbitrary datagrams while it sends a segmented request" {
+    try std.testing.fuzz({}, fuzzClientSmith, .{ .corpus = &client_seeds });
+}
+
+const fuzzClientMark = fz.Marker(enum { ran, nonempty, several });
+
+fn fuzzClientSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClient(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var rig: Rig = .{};
+    rig.wire();
+    var req: [512]u8 = undefined;
+    var reasm: [96]u8 = undefined;
+    var c = DefaultClient.init(rig.client_ep.transport(), .{
+        .request_buffer = &req,
+        .reassembly = &reasm,
+        .segment_window = 2,
+        .segment_timeout_ms = 50,
+        .apdu_timeout_ms = 50,
+        .retries = 1,
+    });
+    // A device that takes 128-octet APDUs and segments: the 400-octet request
+    // goes out as four segments, two at a time.
+    c.learnPeer(rig.device_ep.address, 128, .both);
+    _ = c.sendConfirmed(rig.device_ep.address, .write_property_multiple, &@as([400]u8, @splat(0)), 0) catch return;
+
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &client_seeds);
+    fuzzClientMark.mark(.ran);
+    if (len != 0) fuzzClientMark.mark(.nonempty);
+    rig.client_ep.inject(rig.device_ep.address, buf[0..len]);
+    _ = c.poll(1) catch {};
+    const more = src.valueRangeAtMost(u8, 0, 3);
+    if (more != 0) fuzzClientMark.mark(.several);
+    for (0..more) |i| {
+        const n = fz.drawInput(S, src, &buf, &client_seeds);
+        rig.client_ep.inject(rig.device_ep.address, buf[0..n]);
+        _ = c.poll(2 + @as(u64, i) * 40) catch {};
+    }
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzClient)" {
+    try fz.fuzz_driver.run(fuzzClient, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-client-client" });
+}
+
+test "fuzz harness: fuzzClient, 400 seeds, reaches every outcome" {
+    try fuzzClientMark.reach(fuzzClient, "bacnet-client-client", 400);
+}

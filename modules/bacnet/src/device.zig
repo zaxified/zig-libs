@@ -3191,13 +3191,19 @@ const device_seeds = [_][]const u8{
     fuzzSeed("81ff0004"), // unknown BVLC function
     fuzzSeed("820b0004"), // not BACnet/IP at all
     fuzzSeed("810b0000"), // declared length zero
+    fuzzSeed("810a001301040c050100040f0c004000011955"), // first segment of a segmented WriteProperty
+    fuzzSeed("810a001301040c050101040f3e4441f000003f"), // its second segment
+    fuzzSeed("810a000d010408050102040f3a"), // a last segment (MOR clear)
+    fuzzSeed("810a001f01040005010009071c0000000529033e19053f4b006f705e19065f"), // AcknowledgeAlarm
+    fuzzSeed("810a000f01040005011d0c00000005"), // GetEventInformation after an object
+    fuzzSeed("810a000a010400050103"), // GetAlarmSummary
 };
 
 test "fuzz: the device never crashes on an arbitrary datagram" {
     try std.testing.fuzz({}, fuzzDeviceSmith, .{ .corpus = &device_seeds });
 }
 
-const fuzzDeviceMark = fz.Marker(enum { ran, nonempty });
+const fuzzDeviceMark = fz.Marker(enum { ran, nonempty, several });
 
 fn fuzzDeviceSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzDevice(std.testing.Smith, smith, std.testing.allocator);
@@ -3208,7 +3214,9 @@ fn fuzzDevice(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var rig: Rig = .{};
     rig.wire();
     var db = Db.init();
-    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, db.wire());
+    // A small reassembly buffer, so a run of segments can fill it.
+    var reasm: [96]u8 = undefined;
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .reassembly = &reasm, .segment_timeout_ms = 50 }, db.wire());
 
     var buf: [256]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
@@ -3223,6 +3231,16 @@ fn fuzzDevice(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (len != 0) fuzzDeviceMark.mark(.nonempty);
     rig.device_ep.inject(rig.client_ep.address, buf[0..len]);
     _ = dev.poll(0) catch {};
+    // Up to three more datagrams: a segmented request is a conversation, and
+    // the reassembly state must survive whatever follows its first segment.
+    // (Drawn after the first slice, so corpus replay is unchanged.)
+    const more = src.valueRangeAtMost(u8, 0, 3);
+    if (more != 0) fuzzDeviceMark.mark(.several);
+    for (0..more) |i| {
+        const n = fz.drawInput(S, src, &buf, &device_seeds);
+        rig.device_ep.inject(rig.client_ep.address, buf[0..n]);
+        _ = dev.poll(@as(u64, i) * 40) catch {};
+    }
 }
 
 test "fuzz driver: BACNET_FUZZ (fuzzDevice)" {

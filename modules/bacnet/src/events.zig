@@ -679,3 +679,72 @@ test "GetAlarmSummary-ACK: golden bytes both ways" {
     try testing.expectEqual(Transition.to_offnormal, Transition.into(.low_limit));
     try testing.expectEqual(Transition.to_fault, Transition.into(.fault));
 }
+
+// ── fuzzing: every decoder over arbitrary bodies ───────────────────────────
+
+const fuzzSeed = testkit.fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
+
+const event_seeds = [_][]const u8{
+    fuzzSeed("09071c020002572c000000053e19053f4903596469057c00686f7489009901a900b903ce5e0c42b700001a04802c400000003c42b400005fcf"), // notification
+    fuzzSeed("09071c0000000529033e19053f4b006f705e19065f"), // AcknowledgeAlarm
+    fuzzSeed("0c00000005"), // GetEventInformation
+    fuzzSeed("0e0c0000000519032a05603e1905190019093f49005a05a06e2164216421c86f0f1901"), // its ACK
+    fuzzSeed("c4000000059103820560"), // GetAlarmSummary ACK
+    fuzzSeed("3e19053f"), // a wrapped time stamp
+    fuzzSeed("0e0c000000051903"), // truncated inside a summary
+};
+
+test "fuzz: events decoders never crash on arbitrary bodies" {
+    try std.testing.fuzz({}, fuzzEventsSmith, .{ .corpus = &event_seeds });
+}
+
+const fuzzEventsMark = fz.Marker(enum { ran, nonempty, notification, ack, summary_list, alarm_list });
+
+fn fuzzEventsSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzEvents(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzEvents(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [192]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &event_seeds);
+    fuzzEventsMark.mark(.ran);
+    if (len != 0) fuzzEventsMark.mark(.nonempty);
+    const data = buf[0..len];
+
+    if (EventNotification.decode(data)) |n| {
+        fuzzEventsMark.mark(.notification);
+        if (n.values) |v| _ = OutOfRange.decodeValues(v) catch {};
+        // What decodes must encode again (the optional pieces are all in range).
+        var out: [256]u8 = undefined;
+        var w = tag.Writer.init(&out);
+        n.encode(&w) catch {};
+    } else |_| {}
+    if (AcknowledgeAlarm.decode(data)) |_| fuzzEventsMark.mark(.ack) else |_| {}
+    _ = GetEventInformation.decode(data) catch {};
+    if (GetEventInformationAck.decode(data)) |g| {
+        var it = g.summaries();
+        var guard: usize = 0;
+        while (guard < 64) : (guard += 1) {
+            _ = (it.next() catch break) orelse break;
+            fuzzEventsMark.mark(.summary_list);
+        }
+    } else |_| {}
+    var ait = AlarmSummaryIterator.init(data);
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        _ = (ait.next() catch break) orelse break;
+        fuzzEventsMark.mark(.alarm_list);
+    }
+    var r = tag.Reader.init(data);
+    _ = TimeStamp.decodeCtx(&r, 3) catch {};
+}
+
+test "fuzz driver: BACNET_FUZZ (fuzzEvents)" {
+    try fz.fuzz_driver.run(fuzzEvents, .{ .prefix = "BACNET_FUZZ", .name = "bacnet-events-events" });
+}
+
+test "fuzz harness: fuzzEvents, 600 seeds, reaches every outcome" {
+    try fuzzEventsMark.reach(fuzzEvents, "bacnet-events-events", 600);
+}

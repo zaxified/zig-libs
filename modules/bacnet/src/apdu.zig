@@ -830,6 +830,16 @@ fn fuzzApdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const a = decode(input) catch return;
     var out: [256]u8 = undefined;
     const again = encode(a, &out) catch return;
+    // The WritePropertyMultiple Error is the one PDU with two accepted
+    // spellings (the plain pair is read, the `[0]`-wrapped one is written):
+    // it must decode to the same fields again, not to the same octets.
+    if (a == .err and a.err.service == .write_property_multiple) {
+        const b = (try decode(again)).err;
+        try testing.expectEqual(a.err.class, b.class);
+        try testing.expectEqual(a.err.code, b.code);
+        try testing.expectEqualSlices(u8, a.err.extra, b.extra);
+        return;
+    }
     try testing.expectEqualSlices(u8, input, again);
 }
 
