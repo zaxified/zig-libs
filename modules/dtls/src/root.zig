@@ -426,7 +426,7 @@ pub const meta = .{
     // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "aesccm", "tls13", "mlkem" }, // aesccm: the CCM suites of both engines (12-byte-nonce CCM, std has none); mlkem: only the tests name it (Connection.zig's PQ-share canonical check, stackprobe); the runtime ML-KEM is tls13.kex's; tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20), certverify and kex; aesgcm: Connection.zig's AES-128-GCM and AES-256-GCM suites (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "aesccm", "tls13", "mlkem", "tlsresume" }, // tlsresume: the STEK ring (`StekTicketer`), the NewSessionTicket codecs and the strike register; aesccm: the CCM suites of both engines (12-byte-nonce CCM, std has none); mlkem: only the tests name it (Connection.zig's PQ-share canonical check, stackprobe); the runtime ML-KEM is tls13.kex's; tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20), certverify and kex; aesgcm: Connection.zig's AES-128-GCM and AES-256-GCM suites (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
