@@ -51,14 +51,14 @@ See `SPEC.md` for the full design/threat-model writeup and exactly what's deferr
 - **Housekeeping** (`housekeeping.zig`) — `ping`/`pong` (modern BIP31 nonce form), `addr`/`getaddr`,
   `reject` (BIP61 — implemented, but flagged deprecated: disabled by Bitcoin Core since v0.18.0,
   removed entirely in v0.20.0).
+- **`addrv2`** (`addrv2.zig`, BIP155) — variable-length peer addresses (IPv4, IPv6, TorV3, I2P, CJDNS, kept-unknown ids), checked lengths, `usable()` for the ranges Core ignores; **compact filters** (`compact_filters.zig`, BIP157) — `getcfilters`/`cfilter`/`getcfheaders`/`cfheaders`/`getcfcheckpt`/`cfcheckpt`, `filterHash`/`filterHeader`; **compact blocks** (`compact_block.zig`, BIP152) — `cmpctblock`/`getblocktxn`/`blocktxn` with the differential index lists and the SipHash short ids.
 - **Relay negotiation** (`relay.zig`) — `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool`
   (payload-less, checked by `expectEmpty`), `feefilter`, `sendcmpct`.
 
 ## Not provided
 
-`addrv2` (BIP155, so a caller that sends `sendaddrv2` cannot yet decode the reply), BIP157 compact-filter
-messages, the rest of BIP152 compact blocks (`cmpctblock`/`getblocktxn`/`blocktxn`) and BIP324 v2
-transport are open (SPEC.md § Backlog / deferred). BIP37 bloom filters, the retired IP-Transactions
+BIP324 v2 transport (a module of its own, SPEC.md § Roadmap) and the BIP158 Golomb-coded filter
+decoder (`cfilter` carries the filter bytes opaque) are not provided. BIP37 bloom filters, the retired IP-Transactions
 messages (`checkorder`/`submitorder`/`reply`), `alert` and the legacy pre-BIP31 `ping` are deliberately
 left out (SPEC.md § What is deliberately not done).
 

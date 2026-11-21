@@ -59,6 +59,9 @@
 //! - `relay.zig` -- the feature/relay-policy messages around the
 //!   handshake: `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool`
 //!   (no payload), `feefilter`, `sendcmpct`.
+//! - `addrv2.zig` -- BIP155 `addrv2` (variable-length peer addresses).
+//! - `compact_filters.zig` -- the six BIP157 compact-filter messages.
+//! - `compact_block.zig` -- BIP152 `cmpctblock`/`getblocktxn`/`blocktxn` and short ids.
 
 const std = @import("std");
 
@@ -87,6 +90,9 @@ pub const inventory = @import("inventory.zig");
 pub const block = @import("block.zig");
 pub const housekeeping = @import("housekeeping.zig");
 pub const relay = @import("relay.zig");
+pub const addrv2 = @import("addrv2.zig");
+pub const compact_filters = @import("compact_filters.zig");
+pub const compact_block = @import("compact_block.zig");
 
 // ── re-exports: envelope ─────────────────────────────────────────────────
 
@@ -212,6 +218,9 @@ test {
     _ = block;
     _ = housekeeping;
     _ = relay;
+    _ = addrv2;
+    _ = compact_filters;
+    _ = compact_block;
 }
 
 test "meta.deps names bitcointx" {

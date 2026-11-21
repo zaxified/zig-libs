@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **ADDITIVE:** `addrv2` (BIP155: `addrv2.decodeAddrV2`/`serializeAddrV2`, network ids, checked lengths, `Entry.usable`, conversion to and from `TimedNetAddr`), the six BIP157 compact-filter messages and `filterHash`/`filterHeader` (`compact_filters`), and BIP152 `cmpctblock`/`getblocktxn`/`blocktxn` with `shortIdKey`/`shortId` (`compact_block`). New modules `addrv2`, `compact_filters`, `compact_block` are exported from the root.
 
 - **2026-10-10** — tests: deterministic fuzz driver `BTCP2P_FUZZ` over the existing harnesses (header, block, relay, varbytes, addr, reject, netaddr, version, inventory, locator, headers, envelope); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 41 of 41 killed, 0 equivalent; 6 tests added (command

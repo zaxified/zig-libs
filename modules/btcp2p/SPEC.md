@@ -39,7 +39,7 @@ Re-surveyed 2026-10-05 after `relay.zig` landed (the same day as the first surve
 
 Pure codec, no I/O, no allocation beyond what the caller's `Allocator` provides (except
 `envelope.zig`'s magic-byte lookups and `block_header.zig`'s `blockHash`, which touch no
-allocator at all — fixed-size stack buffers). Nine files:
+allocator at all — fixed-size stack buffers). Twelve files:
 
 - `envelope.zig` — magic bytes for the four networks, the 24-byte header (magic + 12-byte
   NUL-padded command + little-endian length + double-SHA256 checksum), `decodeMessage`/
@@ -69,6 +69,15 @@ allocator at all — fixed-size stack buffers). Nine files:
   not expect one back from a modern Core node nor build handshake logic that waits on it.
 - `relay.zig` — the feature/relay-policy messages around the handshake: `sendheaders`, `wtxidrelay`,
   `sendaddrv2`, `mempool` (payload-less, checked by `expectEmpty`), `feefilter`, `sendcmpct`.
+- `addrv2.zig` — BIP155 `addrv2`. Follows Bitcoin Core's deserializer (BIP155 table of network ids and lengths, 1000 entries,
+  512-octet addresses): a known id with the wrong length, an over-long address or a big count is an error; an unknown id is
+  kept; `Entry.usable()` is false for TorV2, unknown ids, CJDNS without the 0xFC prefix and IPv6 in the IPv4-mapped / 6to4 /
+  Teredo / OnionCat / internal ranges, which Core skips without dropping the message.
+- `compact_filters.zig` — the six BIP157 messages (fixed fields and 32-octet hash lists; trailing bytes are an error) and the
+  `sha256d` chain helpers.
+- `compact_block.zig` — BIP152 `cmpctblock`/`getblocktxn`/`blocktxn`; differential indexes (each difference and absolute index
+  at most 65535, as Core), the 66666 element bound, prefilled transactions through `bitcointx`; `shortIdKey`/`shortId`
+  (SipHash-2-4 over `SHA256(header || nonce)`, low 6 octets) checked against an independent SipHash (`tools/shortid_kat.py`).
 
 Concurrency: `.reentrant` — every function is a pure transform over caller-owned values, no
 shared/global state.
@@ -198,6 +207,11 @@ Run: `scripts/modtest btcp2p`. Tests sit beside the code in each `src/*.zig`.
 
 ## What is deliberately not done
 
+- **The BIP158 Golomb-coded filter itself** (decode, `matchAny`): `cfilter` carries the bytes opaque and `filterHash`/
+  `filterHeader` chain them. A Golomb-Rice set decoder is a separate construction with its own published vectors
+  (bitcoin/bips `bip-0158`), which this session could not fetch reliably; its home is its own module, not this codec.
+- **A cap on `cfheaders`/`cfcheckpt` list lengths**: BIP157 states none for the reply (Core's `MAX_GETCFHEADERS` is a
+  request-side limit, exported as a constant); the remaining-bytes bound applies.
 - **BIP37 bloom filters** (`filterload`/`filteradd`/`filterclear`/`merkleblock`) — Bitcoin Core has served
   them only with `-peerbloomfilters` (off by default) since v0.19 *(inferred)*, and BIP157 replaces them
   for light clients. Listed so the absence is a decision, not an oversight.
@@ -222,23 +236,11 @@ Run: `scripts/modtest btcp2p`. Tests sit beside the code in each `src/*.zig`.
 
 ## Backlog / deferred
 
-- **`addrv2` (BIP155) decoder/encoder** — a materially different, wider address format (variable-length
-  network-ID + address, for Tor v3/I2P/CJDNS peers) layered over `addr`'s role; genuinely new surface,
-  not a small delta on `NetAddr`. Core relays those addresses only in `addrv2`; Tor alone is ~63% of
-  reachable nodes *(inferred, Bitnodes via search)*, so a crawler on legacy `addr` misses most of the
-  network, and a caller that sends this module's `sendaddrv2` receives a message it cannot decode.
-  Needs the BIP155 network-ID table with per-network address lengths (refuse a known ID with the wrong
-  length), CompactSize `services`, the 1000-entry cap and the BIP155 512-byte address bound. Effort M
-  (S-M of code, the rest is vectors). **This plus the next item is what stands between `mvp` and
-  `core`.**
-- **BIP157 compact-filter messages** (`getcfilters`/`cfilter`/`getcfheaders`/`cfheaders`/`getcfcheckpt`/
-  `cfcheckpt`) — the light-client protocol Core serves with `-peerblockfilters`; without it a light
-  client must download full blocks. The messages are fixed fields + hash lists (effort S-M);
-  decoding/matching the BIP158 Golomb-coded filter itself is a separate M (possibly its own module).
-- **BIP152 compact blocks** (`cmpctblock`/`getblocktxn`/`blocktxn`; `sendcmpct` is implemented) — the
-  efficient block relay; optional for a client (Core falls back to `inv`/`headers` + full `block` when
-  `sendcmpct` is not negotiated), so backlog-grade. Differential index encoding + SipHash-2-4 short
-  transaction IDs (`std` has SipHash). Effort M.
-- **BIP324 v2 encrypted transport** — Core's default outbound transport; needs ElligatorSwift
-  (secp256k1) + ChaCha20-Poly1305 (`std` has the AEAD). Effort L; a separate `bip324` module is the
-  likelier home. Backlog-grade while Core still accepts v1 *(inferred)*.
+None open.
+
+## Roadmap
+
+- **BIP324 v2 encrypted transport** — Core's default outbound transport; needs ElligatorSwift (secp256k1) + ChaCha20-Poly1305
+  (`std` has the AEAD). Project size (weeks: a new module with its own handshake state machine, the ElligatorSwift
+  encoding and a test-vector campaign); a separate `bip324` module is the likelier home. Backlog-grade while Core still
+  accepts v1 *(inferred)*.
