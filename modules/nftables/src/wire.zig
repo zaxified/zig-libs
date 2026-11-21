@@ -629,6 +629,79 @@ pub const ObjectData = union(enum) {
 /// One state timeout of a `ct timeout` object.
 pub const CtTimeout = struct { attr: u16, seconds: u32 };
 
+/// States a `ct timeout` object can carry: TCP has 11, the largest protocol.
+pub const max_ct_timeouts = 16;
+
+/// The decoded state of a `ct timeout` object: its protocol and an iterator
+/// over the per-state timeouts, which borrows from the object's `data` (so no
+/// allocator is needed; `ObjectData` cannot carry the list for the same reason).
+pub const CtTimeoutView = struct {
+    l3proto: u16 = 0,
+    l4proto: u8 = 0,
+    /// The raw `NFTA_CT_TIMEOUT_DATA` nest.
+    data: []const u8 = &.{},
+
+    /// Walks the states in the order the kernel sent them.
+    pub fn iterator(v: CtTimeoutView) CtTimeoutIterator {
+        return .{ .attrs = .{ .buf = v.data } };
+    }
+
+    /// Copies the states into `out` and returns how many; one that does not fit
+    /// is dropped (a TCP object has 11, UDP 2).
+    pub fn collect(v: CtTimeoutView, out: []CtTimeout) DecodeError!usize {
+        var it = v.iterator();
+        var n: usize = 0;
+        while (try it.next()) |t| {
+            if (n == out.len) break;
+            out[n] = t;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The timeout of one state by its protocol attribute number (TCP
+    /// `established` = 3), or null when the object does not set it.
+    pub fn get(v: CtTimeoutView, attr: u16) DecodeError!?u32 {
+        var it = v.iterator();
+        while (try it.next()) |t| {
+            if (t.attr == attr) return t.seconds;
+        }
+        return null;
+    }
+};
+
+pub const CtTimeoutIterator = struct {
+    attrs: nl.AttrIterator,
+
+    pub fn next(it: *CtTimeoutIterator) DecodeError!?CtTimeout {
+        const a = (try it.attrs.next()) orelse return null;
+        return .{ .attr = a.type, .seconds = try a.asBe32() };
+    }
+};
+
+/// Decode a `ct timeout` object's `NFTA_OBJ_DATA`: the protocol and the nest of
+/// per-state timeouts. Null when the protocol attributes are missing.
+pub fn decodeCtTimeout(data: []const u8) DecodeError!?CtTimeoutView {
+    var v: CtTimeoutView = .{};
+    var seen_l3 = false;
+    var seen_l4 = false;
+    var it: nl.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        NFTA_CT_TIMEOUT.L3PROTO => {
+            v.l3proto = try a.asBe16();
+            seen_l3 = true;
+        },
+        NFTA_CT_TIMEOUT.L4PROTO => {
+            v.l4proto = try a.asU8();
+            seen_l4 = true;
+        },
+        NFTA_CT_TIMEOUT.DATA => v.data = a.data,
+        else => {},
+    };
+    if (!seen_l3 or !seen_l4) return null;
+    return v;
+}
+
 /// `enum nft_ct_helper_attributes` / `nft_ct_timeout_*` / `nft_ct_expectation_*`.
 pub const NFTA_CT_HELPER = struct {
     pub const NAME: u16 = 1;
@@ -1615,9 +1688,16 @@ pub const ObjectInfo = struct {
     quota: ?struct { bytes: u64 = 0, consumed: u64 = 0, flags: u32 = 0 } = null,
 
     /// The typed state for every object type this module can create
-    /// (`decodeObjectData`); null for other types. Borrows from `data`.
+    /// (`decodeObjectData`); null for other types, and for `ct timeout`, whose
+    /// per-state list is read through `ctTimeout`. Borrows from `data`.
     pub fn state(o: ObjectInfo) DecodeError!?ObjectData {
         return decodeObjectData(o.obj_type, o.data);
+    }
+
+    /// The typed state of a `ct timeout` object; null for any other type.
+    pub fn ctTimeout(o: ObjectInfo) DecodeError!?CtTimeoutView {
+        if (o.obj_type != @backingInt(expr.ObjectType.ct_timeout)) return null;
+        return try decodeCtTimeout(o.data);
     }
 };
 
@@ -1947,7 +2027,8 @@ pub fn decodeObjectData(obj_type: u32, data: []const u8) DecodeError!?ObjectData
             .over = (if (at[expr.NFTA_CONNLIMIT.FLAGS]) |a| try a.asBe32() else 0) & expr.NFT_CONNLIMIT_F_INV != 0,
         } },
         // `ct timeout` carries a slice of attr/seconds pairs, which needs an
-        // allocator to return: read `data` with `nl.AttrIterator`.
+        // allocator to return: read it with `ObjectInfo.ctTimeout` /
+        // `decodeCtTimeout` (an iterator over the borrowed data).
         else => return null,
     }
 }
@@ -2996,6 +3077,43 @@ test "decodeObjectData: every creatable object type decodes back to what addObje
         const info = try decodeObject(m.payload);
         try testing.expectEqualDeep(spec, (try info.state()).?);
     }
+}
+
+test "ct timeout: the per-state list decodes through the view, without an allocator" {
+    const gpa = testing.allocator;
+    var b = try Batch.init(gpa, 0, .{ .ack = false });
+    defer b.deinit();
+    const states = [_]CtTimeout{ .{ .attr = 1, .seconds = 120 }, .{ .attr = 3, .seconds = 100 }, .{ .attr = 8, .seconds = 10 } };
+    try b.addObject(.{ .family = .inet, .table = "filter", .name = "ctt", .obj = .{ .ct_timeout = .{ .l3proto = 2, .l4proto = 6, .timeouts = &states } } });
+    const bytes = try b.finish();
+    var it: nl.MessageIterator = .{ .buf = bytes };
+    _ = try it.next();
+    const info = try decodeObject((try it.next()).?.payload);
+    try testing.expect((try info.state()) == null);
+    const v = (try info.ctTimeout()).?;
+    try testing.expectEqual(@as(u16, 2), v.l3proto);
+    try testing.expectEqual(@as(u8, 6), v.l4proto);
+    var out: [max_ct_timeouts]CtTimeout = undefined;
+    try testing.expectEqual(@as(usize, 3), try v.collect(&out));
+    try testing.expectEqualSlices(CtTimeout, &states, out[0..3]);
+    // A short output keeps what fits.
+    var two: [2]CtTimeout = undefined;
+    try testing.expectEqual(@as(usize, 2), try v.collect(&two));
+    try testing.expectEqual(@as(?u32, 100), try v.get(3));
+    try testing.expectEqual(@as(?u32, null), try v.get(2));
+    // Another object type has no ct timeout, and a nest that is not whole is an error.
+    var c = try Batch.init(gpa, 0, .{ .ack = false });
+    defer c.deinit();
+    try c.addObject(.{ .family = .inet, .table = "filter", .name = "c", .obj = .{ .counter = .{} } });
+    var it2: nl.MessageIterator = .{ .buf = try c.finish() };
+    _ = try it2.next();
+    const counter = try decodeObject((try it2.next()).?.payload);
+    try testing.expect((try counter.ctTimeout()) == null);
+    var bad = v;
+    bad.data = v.data[0 .. v.data.len - 2];
+    try testing.expectError(error.Truncated, bad.collect(&out));
+    // Without the protocol attributes there is nothing to decode.
+    try testing.expect((try decodeCtTimeout(&.{})) == null);
 }
 
 test "decoders read the new set, chain and flowtable attributes" {

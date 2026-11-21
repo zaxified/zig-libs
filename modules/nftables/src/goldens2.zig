@@ -1100,3 +1100,90 @@ test "log group and queue-threshold past 16 bits are refused, not truncated" {
     try testing.expectError(error.InvalidExpression, expr.appendExpr(gpa, &list, .{ .log = .{ .group = 65536 } }));
     try testing.expectError(error.InvalidExpression, expr.appendExpr(gpa, &list, .{ .log = .{ .qthreshold = 70000 } }));
 }
+
+// ── queue by register and register-register bitwise (captured 2026-11-21) ───
+// Each against a table `filter` with an `input` base chain, in `unshare -rn`.
+
+// ### nft add rule inet filter input queue flags bypass to numgen inc mod 2
+const g_queue_to_numgen =
+    "140000001000010000000000000000000000000a88000000060a010c0100000000000000010000000b00010066696c7465" ++
+    "7200000a000200696e7075740000005c000480340001800b0001006e756d67656e00002400028008000100000000010800" ++
+    "02000000000208000300000000000800040000000000240001800a00010071756575650000001400028006000300000100" ++
+    "000800040000000001140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input queue to jhash ip saddr mod 4
+const g_queue_to_jhash =
+    "140000001000010000000000000000000000000a14010000060a010c0100000000000000010000000b00010066696c7465" ++
+    "7200000a000200696e707574000000e800048024000180090001006d6574610000000014000280080002000000000f0800" ++
+    "0100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100020000" ++
+    "00340001800c0001007061796c6f6164002400028008000100000000020800020000000001080003000000000c08000400" ++
+    "00000004440001800900010068617368000000003400028008000100000000020800020000000001080003000000000408" ++
+    "00040000000004080006000000000008000700000000001c0001800a00010071756575650000000c000280080004000000" ++
+    "0001140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input meta mark set meta mark or ct mark
+const g_bitwise_or_regs =
+    "140000001000010000000000000000000000000ad4000000060a010c0100000000000000010000000b00010066696c7465" ++
+    "7200000a000200696e707574000000a800048024000180090001006d657461000000001400028008000200000000030800" ++
+    "01000000000120000180070001006374000014000280080002000000000308000100000000023c0001800c000100626974" ++
+    "77697365002c00028008000100000000010800080000000002080002000000000108000600000000040800030000000004" ++
+    "24000180090001006d65746100000000140002800800020000000003080003000000000114000000110001000200000000" ++
+    "0000000000000a";
+
+fn bitwiseRegsProgram(p: *expr.Program, op: expr.BoolOp) void {
+    _ = p.push(.{ .meta_load = .{ .key = .mark, .dreg = .r1 } });
+    _ = p.push(.{ .ct_load = .{ .key = expr.NFT_CT.MARK, .dreg = .r2 } });
+    _ = p.push(.{ .bitwise_reg = .{ .sreg = .r1, .sreg2 = .r2, .dreg = .r1, .len = 4, .op = op } });
+    _ = p.push(.{ .meta_set = .{ .key = .mark, .sreg = .r1 } });
+}
+
+test "golden: rule — queue flags bypass to numgen inc mod 2 (SREG_QNUM, flags present)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.push(.{ .numgen = .{ .dreg = .r1, .kind = .incremental, .modulus = 2 } });
+    _ = p.queueTo(.r1, .{ .bypass = true });
+    try ruleGolden(g_queue_to_numgen, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — queue to jhash ip saddr mod 4 (SREG_QNUM alone: no flags attribute)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.nfprotoDep(.ip);
+    _ = p.push(.{ .payload_load = .{ .base = .nh, .offset = 12, .len = 4, .dreg = .r2 } });
+    _ = p.push(.{ .hash = .{ .kind = .jenkins, .dreg = .r1, .sreg = .r2, .len = 4, .modulus = 4 } });
+    _ = p.queueTo(.r1, .{});
+    try ruleGolden(g_queue_to_jhash, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — meta mark set meta mark or ct mark (register-register bitwise)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    bitwiseRegsProgram(&p, .bit_or);
+    try ruleGolden(g_bitwise_or_regs, .inet, "filter", "input", &p);
+}
+
+test "register-register bitwise: and/xor differ from or only in OP, and decode back typed" {
+    var a = expr.Program.init(gpa, .inet);
+    defer a.deinit();
+    bitwiseRegsProgram(&a, .bit_and);
+    var x = expr.Program.init(gpa, .inet);
+    defer x.deinit();
+    bitwiseRegsProgram(&x, .bit_xor);
+    var b1 = try nftBatch();
+    defer b1.deinit();
+    try b1.addRule(.{ .family = .inet, .table = "filter", .chain = "input", .exprs = try a.finish() });
+    const and_bytes = try b1.finish();
+    var b2 = try nftBatch();
+    defer b2.deinit();
+    try b2.addRule(.{ .family = .inet, .table = "filter", .chain = "input", .exprs = try x.finish() });
+    const xor_bytes = try b2.finish();
+    // The captured `and` and `xor` rules are the `or` golden with OP = 3 and 5.
+    var want_and: [g_bitwise_or_regs.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_and, g_bitwise_or_regs);
+    var want_xor = want_and;
+    const op_at = std.mem.find(u8, &want_and, &.{ 0x08, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x04 }).? + 7;
+    want_and[op_at] = 3;
+    want_xor[op_at] = 5;
+    try testing.expectEqualSlices(u8, &want_and, and_bytes);
+    try testing.expectEqualSlices(u8, &want_xor, xor_bytes);
+}

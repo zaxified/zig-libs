@@ -139,6 +139,7 @@ pub const NFTA_BITWISE = struct {
     pub const XOR: u16 = 5;
     pub const OP: u16 = 6;
     pub const DATA: u16 = 7;
+    pub const SREG2: u16 = 8;
 };
 
 /// `enum nft_lookup_attributes`.
@@ -447,6 +448,10 @@ pub const DynsetOp = enum(u32) { add = 0, update = 1, delete = 2 };
 /// Direction of a `bitwise` shift (`NFT_BITWISE_LSHIFT` / `_RSHIFT`).
 pub const ShiftDir = enum(u32) { left = 1, right = 2 };
 
+/// A register-register boolean operator of `bitwise` (`NFT_BITWISE_AND`, `_OR`,
+/// `_XOR`; kernel 5.12): `dreg = sreg <op> sreg2`.
+pub const BoolOp = enum(u32) { bit_and = 3, bit_or = 4, bit_xor = 5 };
+
 /// `enum nft_reject_inet_code` — the family-independent reject codes an
 /// `inet`/`bridge`/`netdev` rule uses (`reject with icmpx …`).
 pub const IcmpxCode = enum(u8) {
@@ -672,8 +677,12 @@ pub const Expr = union(enum) {
     /// `reject` — `type` is `NFT_REJECT_*`, `icmp_code` the ICMP/ICMPX code
     /// (0 for a TCP RST). Build it with `Program.reject`.
     reject: struct { type: u32, icmp_code: u8 },
-    /// `queue` — hand the packet to userspace on `num` … `num + total - 1`.
-    queue: struct { num: u16, total: u16 = 1, flags: u16 = 0 },
+    /// `queue` — hand the packet to userspace on `num` … `num + total - 1`, or,
+    /// with `sreg`, on the queue number held in that register (`queue to
+    /// numgen inc mod 2`; `NFTA_QUEUE_SREG_QNUM`, kernel 5.x). With `sreg` the
+    /// `num`/`total` attributes are not sent, and `flags` only when non-zero,
+    /// as `nft` does.
+    queue: struct { num: u16 = 0, total: u16 = 1, flags: u16 = 0, sreg: ?Reg = null },
     /// `redir` — `redirect [to :port]`, the port read from a register.
     redir: struct { reg_proto_min: ?Reg = null, reg_proto_max: ?Reg = null, flags: u32 = 0 },
     /// `quota` — anonymous byte quota. `over` matches once it is exceeded.
@@ -686,6 +695,11 @@ pub const Expr = union(enum) {
     /// `and`/`or`/`xor` operators are never needed: `nft` itself lowers
     /// those to mask/xor (captured), which `bitwise` already carries.
     bitshift: struct { sreg: Reg, dreg: Reg, len: u32, dir: ShiftDir, amount: u32 },
+    /// `bitwise` of two registers (`meta mark or ct mark`): `dreg = sreg <op>
+    /// sreg2` over `len` bytes. `nft` sends this for an operator whose second
+    /// operand is not a constant; with a constant it sends the mask/xor form
+    /// (`bitwise`).
+    bitwise_reg: struct { sreg: Reg, sreg2: Reg, dreg: Reg, len: u32, op: BoolOp },
     /// `exthdr` — IPv6 extension header / TCP option / IPv4 option / SCTP
     /// chunk / DCCP option. Exactly one of `dreg` (load) and `sreg` (set).
     exthdr: struct {
@@ -788,6 +802,7 @@ pub const Expr = union(enum) {
             .objref => "objref",
             .byteorder => "byteorder",
             .bitshift => "bitwise",
+            .bitwise_reg => "bitwise",
             .exthdr => "exthdr",
             .fib => "fib",
             .hash => "hash",
@@ -1010,14 +1025,20 @@ pub fn appendExpr(
             try nl.appendAttrU8(gpa, list, NFTA_REJECT.ICMP_CODE, r.icmp_code);
         },
         .queue => |q| {
-            // ⚠ Checked here, not only in `Program.queue`: an empty range
-            // or one wrapping past 65535 reaches the kernel otherwise, and a
-            // hand-built `Expr` never passes through the Program.
-            if (q.total == 0 or @as(u32, q.num) + q.total - 1 > std.math.maxInt(u16))
-                return error.InvalidQueueRange;
-            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.NUM, q.num);
-            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.TOTAL, q.total);
-            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.FLAGS, q.flags);
+            if (q.sreg) |reg| {
+                // The queue number comes from a register: no range to check.
+                if (q.flags != 0) try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.FLAGS, q.flags);
+                try nl.appendAttrBe32(gpa, list, NFTA_QUEUE.SREG_QNUM, @backingInt(reg));
+            } else {
+                // ⚠ Checked here, not only in `Program.queue`: an empty range
+                // or one wrapping past 65535 reaches the kernel otherwise, and a
+                // hand-built `Expr` never passes through the Program.
+                if (q.total == 0 or @as(u32, q.num) + q.total - 1 > std.math.maxInt(u16))
+                    return error.InvalidQueueRange;
+                try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.NUM, q.num);
+                try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.TOTAL, q.total);
+                try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.FLAGS, q.flags);
+            }
         },
         .redir => |r| {
             if (r.reg_proto_min) |reg|
@@ -1056,6 +1077,13 @@ pub fn appendExpr(
             var amount: [4]u8 = undefined;
             std.mem.writeInt(u32, &amount, b.amount, builtin.cpu.arch.endian());
             try appendData(gpa, list, NFTA_BITWISE.DATA, .{ .value = &amount });
+        },
+        .bitwise_reg => |b| {
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG, @backingInt(b.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG2, @backingInt(b.sreg2));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.DREG, @backingInt(b.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.OP, @backingInt(b.op));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.LEN, b.len);
         },
         .exthdr => |x| {
             if ((x.dreg == null) == (x.sreg == null)) return error.InvalidExpression;
@@ -1336,6 +1364,15 @@ pub fn decodeExpr(view: ExprView) nl.Error!Expr {
                 .amount = std.mem.readInt(u32, amt[0..4], builtin.cpu.arch.endian()),
             } };
         }
+        if (op >= 3 and op <= 5) {
+            return .{ .bitwise_reg = .{
+                .sreg = sreg,
+                .sreg2 = (try at.reg(NFTA_BITWISE.SREG2)) orelse return raw,
+                .dreg = dreg,
+                .len = len,
+                .op = @fromBackingInt(@intCast(op)),
+            } };
+        }
         return raw;
     }
     if (eq(n, "lookup")) {
@@ -1407,6 +1444,7 @@ pub fn decodeExpr(view: ExprView) nl.Error!Expr {
         .icmp_code = (try at.g8(NFTA_REJECT.ICMP_CODE)) orelse 0,
     } };
     if (eq(n, "queue")) return .{ .queue = .{
+        .sreg = try at.reg(NFTA_QUEUE.SREG_QNUM),
         .num = (try at.g16(NFTA_QUEUE.NUM)) orelse 0,
         .total = (try at.g16(NFTA_QUEUE.TOTAL)) orelse 1,
         .flags = (try at.g16(NFTA_QUEUE.FLAGS)) orelse 0,
@@ -2058,6 +2096,15 @@ pub const Program = struct {
         if (opts.bypass) flags |= NFT_QUEUE_FLAG_BYPASS;
         if (opts.fanout) flags |= NFT_QUEUE_FLAG_CPU_FANOUT;
         return p.push(.{ .queue = .{ .num = num, .total = opts.total, .flags = flags } });
+    }
+
+    /// `queue [flags bypass,fanout] to <register>`: the queue number is whatever
+    /// an earlier `numgen`/`hash`/load left in `reg`. Push that expression first.
+    pub fn queueTo(p: *Program, reg: Reg, opts: QueueOptions) *Program {
+        var flags: u16 = 0;
+        if (opts.bypass) flags |= NFT_QUEUE_FLAG_BYPASS;
+        if (opts.fanout) flags |= NFT_QUEUE_FLAG_CPU_FANOUT;
+        return p.push(.{ .queue = .{ .flags = flags, .sreg = reg } });
     }
 
     /// `redirect [to :<port>]` (nat chains). The port goes through a

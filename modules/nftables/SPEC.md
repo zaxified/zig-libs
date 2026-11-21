@@ -57,7 +57,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-07. **Licence
 | concatenated set keys (`ipv4_addr . inet_service`), interval concatenation (pipapo, `KEY_END`, field lengths), anonymous sets, dynamic/object/expr set flags, policy, gc-interval, per-element expiration, comment (userdata), catch-all element, per-element counter, 20 more datatypes | **have** |
 | element lookup (`getSetElems`), `reset set`, `flush set`, `destroy element` | **have** |
 | table flags (dormant/owner/persist), chain flags (hw offload), multi-device base chains, chain rename, `flush table`, `destroy` of every object, `replace rule`, `reset rules`/`reset counters` | **have** |
-| stateful objects limit, ct helper, secmark, ct timeout, ct expectation, synproxy, connlimit (typed decode of every one except ct timeout: `decodeObjectData` returns null for it — the per-state entry list needs an allocator — so `ObjectInfo.data` stays the way to read it; open, see *Backlog / deferred*) | **have** |
+| stateful objects limit, ct helper, secmark, ct timeout, ct expectation, synproxy, connlimit (typed decode of every one; a ct timeout's per-state list is read through `ObjectInfo.ctTimeout`, an allocation-free iterator, because `ObjectData` cannot carry a slice) | **have** |
 | tunnel object | **not doing**, see *What is deliberately not done* |
 | flowtables (add/delete/list, hook, priority, devices, flags) | **have**; the hardware-offload path cannot be exercised in a netns and is encoded only |
 | `nft monitor` (`Socket.openMonitor`, `nextEvents`, `wire.eventOf`), `NFT_MSG_NEWGEN` ids | **have** |
@@ -211,7 +211,9 @@ registers no ingress hook for those chain types. `MetaKey.ibridgename`/`obridgen
 
 **Flowtables, events, generation.** `NEWFLOWTABLE` carries FLAGS (always), then a HOOK nest with number, priority and an `NFTA_FLOWTABLE_HOOK_DEVS` list of `NFTA_DEVICE_NAME`. The kernel multicasts every committed change on `NFNLGRP_NFTABLES`; `Socket.openMonitor(gpa, Group.NFTABLES)` binds it and `nextEvents` iterates a datagram of `wire.Event`s (object kind, new/delete, payload for the matching decoder); `error.Overrun` means events were lost and a dump must resynchronise. `getGenId` is a plain request answered by one `NEWGEN`; `BatchOptions.gen_id` puts it on `BATCH_BEGIN` as `NFNL_BATCH_GENID`, after which the kernel refuses a batch built against a stale ruleset. `getGenId` and `getRule` are plain requests answered by one message. `getSetElems` is **not**: the kernel answers a `GETSETELEM` naming N keys with N `NEWSETELEM` messages and nothing else, so it is sent with `NLM_F_ACK` and reads until the ACK (seen live in `unshare -rn`: two keys, two replies, then the ACK; returning after the first reply would silently lose the rest — pinned by `scanSetElemReplies` over the kernel's bytes, `kernel_dumps.k_get2_ack`).
 
-**Objects.** `ObjectData` models every type `nft` creates except tunnel: limit (the `limit` statement's attributes), ct helper (name without a NUL, as captured), secmark (context without a NUL), ct timeout (per-state seconds under the protocol's own attribute numbers), ct expectation (`NFTA_CT_EXPECT_TIMEOUT` is the one host-order integer), synproxy, connlimit. `ObjectInfo.state()` decodes any of them from a dump (a ct timeout stays raw: its entry list needs an allocator).
+**Queue by register and register-register bitwise.** `queue` takes `sreg` (`NFTA_QUEUE_SREG_QNUM`): the queue number is whatever an earlier `numgen`/`hash` left in the register (`queue to numgen inc mod 2`, `Program.queueTo`); with it `NUM`/`TOTAL` are not sent and `FLAGS` only when non-zero, exactly as `nft` does (captured). `bitwise_reg` is `bitwise` with `SREG2` and an `AND`/`OR`/`XOR` operator (kernel 5.12; `nft` sends it for `meta mark or ct mark`, and the mask/xor form when the operand is a constant); attribute order SREG, SREG2, DREG, OP, LEN as captured.
+
+**Objects.** `ObjectData` models every type `nft` creates except tunnel: limit (the `limit` statement's attributes), ct helper (name without a NUL, as captured), secmark (context without a NUL), ct timeout (per-state seconds under the protocol's own attribute numbers), ct expectation (`NFTA_CT_EXPECT_TIMEOUT` is the one host-order integer), synproxy, connlimit. `ObjectInfo.state()` decodes any of them from a dump except ct timeout, whose list is read with `ObjectInfo.ctTimeout()` (`wire.CtTimeoutView`: protocol, `iterator`, `collect`, `get(attr)`; pinned against the kernel's own dump of a TCP timeout object).
 
 ## Threat model / out of scope
 The JSON builder never touches netlink and never applies anything. The native backend does apply
@@ -260,6 +262,8 @@ Capture-derived facts recorded as tests rather than byte goldens: the set dataty
 
 **Live tests** (`unshare -rn`):
 
+- *Parity additions* (`src/live_parity_test.zig`). A concatenated set with two elements, read back through the dumps and through `nft list table` (type and elements as `nft` spells them), then `destroy element` of a present and an absent key; `replace rule` (same handle, new expressions, `nft list chain` shows the new rule only), `rename chain` by handle (the rules follow), `destroy` of an absent chain, set, table and rule and of present ones; and the ruleset monitor, which reports a table, chain, rule and a generation for a commit and the matching deletions for `delete table`.
+
 - *Round-trip.* One batch creates a table, a base chain, a set with two elements and two rules; `listTables`/`listChains`/`listSets`/`listSetElems`/`listRules` read every one of them back and check the decoded fields (hook number, priority, policy, key length, expression names, the `bitwise` the `/12` prefix forces); one rule is deleted by the handle the kernel reported, the other survives; the table is dropped and confirmed gone.
 - *Atomic rollback.* A two-command batch whose second command references a non-existent chain: `commit` returns `error.NotFound`, `lastFailure()` reports `stage = .message`, `index = 1`, `command = "NEWRULE"`, `code = -2`, and the table created by command #0 is not in the ruleset.
 - *Unspec-family sweep.* Two tables in two different families (`inet` and `ip`); one `listTables(null)` call returns both in a single dump, each tagged with its own real family byte (the request bytes are pinned offline in `wire.zig`'s "family = null sends NFPROTO_UNSPEC" test).
@@ -287,10 +291,7 @@ Capture-derived facts recorded as tests rather than byte goldens: the set dataty
 
 ## Backlog / deferred
 
-- **`ct timeout` typed decode.** `decodeObjectData` returns null for it (the per-state entry list needs an allocator), so `ObjectInfo.data` is the way to read it.
-- **Expressions not modelled.** `SREG_QNUM` queue selection (the `queue` expression carries NUM/TOTAL/FLAGS only) and bitwise boolean operators (`nft` lowers them to mask/xor, captured; the decoder returns `.raw` for one). `Expr.raw` reaches both.
-- **Live lane for the parity additions** (unprivileged `unshare -rn`): the byte goldens and the `nft -c -j` shape check are the evidence; a live round trip of concatenated sets, destroy, replace, rename and the monitor against a real kernel (read back through `nft list ruleset`) is not written; the live tests above cover the earlier feature set.
-- **Non-x86 goldens.** The captures are little-endian; every golden test skips on a big-endian host (netlink's host-endian header fields would differ). The wire layer itself is endian-explicit and would need a big-endian capture to be pinned.
+- **Non-x86 goldens** (wait: hardware). The captures are little-endian; every golden test skips on a big-endian host (netlink's host-endian header fields would differ). The wire layer itself is endian-explicit and would need a big-endian capture to be pinned; no big-endian machine is available here.
 
 ## Anchoring
 

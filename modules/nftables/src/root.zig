@@ -1764,6 +1764,7 @@ test {
     if (builtin.os.tag == .linux) {
         _ = native;
         _ = @import("consistency.zig");
+        _ = @import("live_parity_test.zig");
     }
     // External anchor: the JSON builder's output as a real `nft` applied and
     // listed it (tools/interop.zig), replayed without nft or privileges.

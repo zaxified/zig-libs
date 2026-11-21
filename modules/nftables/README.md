@@ -153,7 +153,7 @@ defer objs.deinit();
 ```
 
 Also native: `reject` (`icmp`/`icmpx`/`tcp_reset`), `queue` (range, bypass,
-fanout), `redirect [to :port]`, anonymous `quota`, `ip6 saddr/daddr` with
+fanout, or a queue number from a register), `redirect [to :port]`, anonymous `quota`, `ip6 saddr/daddr` with
 prefixes, the `inet` ingress hook (`.hook = .ingress, .dev = "lo"`), the
 bridge-name meta keys, and the `nft` parity set: `byteorder`, bitshifts,
 `exthdr`, `fib`, `hash`, `numgen`, `range`, `rt`, `socket`, `notrack`, `dup`,

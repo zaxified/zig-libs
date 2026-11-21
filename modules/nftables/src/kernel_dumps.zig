@@ -265,7 +265,21 @@ test "kernel dump: objects, typed state" {
             1 => try testing.expectEqualDeep(wire.ObjectData{ .quota = .{ .bytes = 10 * 1024 * 1024, .over = true } }, st.?),
             2 => try testing.expectEqualDeep(wire.ObjectData{ .limit = .{ .rate = 10, .burst = 5 } }, st.?),
             3 => try testing.expectEqualDeep(wire.ObjectData{ .synproxy = .{ .mss = 1460, .wscale = 7, .flags = 3 } }, st.?),
-            4 => try testing.expect(st == null), // ct timeout: not typed (needs an allocator)
+            4 => {
+                // ct timeout: the per-state list is read through `ctTimeout`.
+                try testing.expect(st == null);
+                const ct = (try o.ctTimeout()).?;
+                try testing.expectEqual(@as(u16, 2), ct.l3proto);
+                try testing.expectEqual(@as(u8, 6), ct.l4proto);
+                var states: [wire.max_ct_timeouts]wire.CtTimeout = undefined;
+                const n = try ct.collect(&states);
+                // `nft` sent `established : 100, close : 10`; the kernel reports
+                // every TCP state, the unset ones at their defaults.
+                try testing.expect(n >= 2);
+                try testing.expectEqual(@as(?u32, 100), try ct.get(3));
+                try testing.expectEqual(@as(?u32, 10), try ct.get(8));
+                try testing.expectEqual(@as(?u32, null), try ct.get(99));
+            },
             5 => try testing.expectEqualDeep(wire.ObjectData{ .ct_expect = .{ .l3proto = 2, .l4proto = 6, .dport = 5000, .timeout_ms = 60000, .size = 12 } }, st.?),
             else => unreachable,
         }
