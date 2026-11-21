@@ -1,0 +1,11 @@
+[package]
+name = "entropy_rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+getrandom = "=0.3.4"
+
+[profile.release]
+opt-level = 3

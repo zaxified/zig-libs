@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time · panic 2026-10-30 (sweep + blind review: `tryFill` (error instead of abort) added, `fill` keeps the fail-closed abort; delta audit 4/4)
 
-**Performance:** ref 0.92–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.88–1.03× Go crypto/rand.Read · fastest 0.99–1.16× the best of Go crypto/rand.Read, glibc 2.43 arc4random_buf, getrandom(2) and Rust getrandom 0.3.4 (measured 2026-11-22)
 
 **Evidence:** model — vDSO symbol lookup against an independent section-table model on every exported symbol; output invariants (byte chi-square, per-position coverage) on every route; route pinned by `CountingIo`
 **Model:** src/vgetrandom.zig:modelSymbols · src/vgetrandom.zig:ModelSym
@@ -255,8 +255,11 @@ test says so.
 ## What a draw costs, and why the adapter is not where to fix it
 
 The benchmark is `zig build bench-entropy` (`tools/bench.zig`, Go's
-`crypto/rand.Read` as the reference); the card's Performance line carries the
-figures. The numbers below are for the syscall route (a draw that does not take
+`crypto/rand.Read` as the reference, and as the field's other paths glibc's
+`arc4random_buf`, the bare `getrandom(2)` wrapper and the Rust `getrandom` crate); the card's Performance line carries
+the figures (three runs on 2026-11-22: 4 KiB and 1 MiB fills sit within 3 % of every
+candidate, the kernel being the cost; the 32-byte fill is 12–16 % behind the Rust crate and 5–8 % behind glibc, ahead of
+Go's by 3–12 %). The numbers below are for the syscall route (a draw that does not take
 the vDSO), which is what a `SecureSource` pays whenever `fill` falls back to
 `randomSecure`.
 
@@ -393,7 +396,7 @@ filled the whole buffer.
 
 ## Verification
 
-- **Run:** `scripts/modtest entropy` (tests are in `src/root.zig` and `src/vgetrandom.zig`); `zig build bench-entropy` is the benchmark (needs a Go toolchain, standard library only).
+- **Run:** `scripts/modtest entropy` (tests are in `src/root.zig` and `src/vgetrandom.zig`); `zig build bench-entropy` is the benchmark (needs a Go toolchain, standard library only, a C compiler and cargo for the other candidates).
 - **Abort tests:** a forked child per abort cause; the no-entropy one uses a seccomp filter (x86_64 Linux, skipped where it cannot be installed).
 - **Route and output tests:** `CountingIo` route assertions, whole-buffer coverage, a byte chi-square and per-position check on every route (`Model and invariants`), and a negative control that the uniformity checks reject a stuck position and a counter.
 - **vDSO tests:** the lookup against a section-table model on every exported symbol of the running kernel's vDSO; pool and slot invariants (every state inside the mapping, in its own page, apart from the others; refusal while initializing or unavailable; scan from the hint, wrap, give up when all slots are taken); a scripted stand-in for the vDSO function (`vgetrandom.func`) driving short returns, a zero and an error; a synthetic ELF image reaching what the real vDSO cannot (load bias, a `PT_DYNAMIC` whose offset and address differ, each missing table, which symbol types and binds may bind, DT_HASH before DT_GNU_HASH and DT_GNU_HASH alone, the version check needing both DT_VERSYM and DT_VERDEF); direct tests of `versionMatches` and `gnuHashSymCount`. The vDSO tests gate on `symbolPresent()` and then require `draw` to succeed, so a broken pool does not look like a kernel without the feature.
@@ -411,4 +414,4 @@ filled the whole buffer.
 
 ## Backlog / deferred
 
-- **Speed: "fastest in the field" is not measured.** The vDSO path puts `fill` at the reference (Go's `crypto/rand.Read`) on Linux without libc; the card's Performance line has the ratio. Rust `getrandom` takes the syscall, so Go's vDSO path is likely the fastest, but no run against `getrandom`, libsodium or glibc `arc4random` exists to say so.
+None open.
