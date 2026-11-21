@@ -36,6 +36,41 @@ pub const RefError = error{TooLong};
 /// between `a` and `b`, over bytes. Allocation-free; both inputs must be
 /// ≤ `max_ref_len`. Symmetric: `osaDistance(a, b) == osaDistance(b, a)`.
 pub fn osaDistance(a: []const u8, b: []const u8) RefError!u32 {
+    return osa(u8, a, b);
+}
+
+/// `osaDistance` over Unicode scalar values (`SearchOptions.unit = .codepoint`): a
+/// multi-byte character is one symbol, so `ě` for `e` is distance 1. Bytes that
+/// are not well-formed UTF-8 are one symbol each, above every scalar value, which
+/// is how the search reads them. The limit is `max_ref_len` BYTES of each input.
+pub fn osaDistanceCodepoints(a: []const u8, b: []const u8) RefError!u32 {
+    if (a.len > max_ref_len or b.len > max_ref_len) return error.TooLong;
+    var sa: [max_ref_len]u32 = undefined;
+    var sb: [max_ref_len]u32 = undefined;
+    return osa(u32, sa[0..symbols(a, &sa)], sb[0..symbols(b, &sb)]);
+}
+
+fn symbols(text: []const u8, out: []u32) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (len != 0 and i + len <= text.len) {
+            if (std.unicode.utf8Decode(text[i..][0..len])) |cp| {
+                out[n] = cp;
+                n += 1;
+                i += len;
+                continue;
+            } else |_| {}
+        }
+        out[n] = @as(u32, 0x110000) + text[i];
+        n += 1;
+        i += 1;
+    }
+    return n;
+}
+
+fn osa(comptime T: type, a: []const T, b: []const T) RefError!u32 {
     if (a.len > max_ref_len or b.len > max_ref_len) return error.TooLong;
     const n = b.len;
 
@@ -126,6 +161,17 @@ test "osa: multi-byte UTF-8 counts as multiple byte edits" {
     // 'ě' is 0xC4 0x9B (2 bytes); replacing it with ASCII 'e' is one deletion +
     // one substitution over bytes = distance 2.
     try testing.expectEqual(@as(u32, 2), try osaDistance("město", "mesto"));
+}
+
+test "osa codepoints: a diacritic is one edit, not two; malformed bytes are one symbol each" {
+    try testing.expectEqual(@as(u32, 1), try osaDistanceCodepoints("město", "mesto"));
+    try testing.expectEqual(@as(u32, 1), try osaDistanceCodepoints("šěs", "ěšs")); // two characters transposed
+    try testing.expectEqual(@as(u32, 0), try osaDistanceCodepoints("abc", "abc"));
+    try testing.expectEqual(@as(u32, 1), try osaDistanceCodepoints("a\xC4", "a")); // a truncated sequence is one symbol
+    try testing.expectEqual(@as(u32, 2), try osaDistanceCodepoints("a\xE1\x80", "a")); // two bytes, two symbols
+    try testing.expectEqual(@as(u32, 1), try osaDistanceCodepoints("\xED\xA0\x80", "\xED\xA0")); // a surrogate is three symbols
+    try testing.expectEqual(@as(u32, 3), try osaDistanceCodepoints("\xED\xA0\x80", ""));
+    try testing.expectEqual(@as(u32, 1), try osaDistanceCodepoints("\xC0\x80", "\xC0")); // overlong: two symbols
 }
 
 test "osa: rejects over-long inputs" {

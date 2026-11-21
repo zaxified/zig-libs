@@ -59,7 +59,19 @@ pub const max_depth: usize = 1024;
 pub const max_k: u8 = 254;
 
 /// Options controlling `search`'s bounded work.
+pub const Unit = enum {
+    /// An edit is one byte (the default; a multi-byte character costs several).
+    byte,
+    /// An edit is one Unicode scalar value, so `e` for `ě` is one substitution and
+    /// a transposition swaps two characters. Bytes that are not well-formed UTF-8
+    /// count one symbol each; `distance.osaDistanceCodepoints` is the reference.
+    /// The index itself is the same bytes either way.
+    codepoint,
+};
+
 pub const SearchOptions = struct {
+    /// What one edit is: a byte or a Unicode scalar value. `Match.distance` is in it.
+    unit: Unit = .byte,
     /// Maximum number of trie nodes `search` may decode before it stops and
     /// reports `.truncated_budget`. This is the DoS guard: a short query with a
     /// large `k` sits above much of the set, so this caps worst-case latency.
@@ -148,7 +160,33 @@ pub const Frozen = struct {
         key_buf: []u8,
         opts: SearchOptions,
     ) SearchError!SearchResult {
-        return searchInto(self.inner, query, k, results, key_buf, opts);
+        return switch (opts.unit) {
+            inline else => |u| searchInto(false, u == .codepoint, self.inner, query, k, results, key_buf, opts),
+        };
+    }
+
+    /// Typeahead: find every stored key that has a PREFIX within OSA edit distance `k`
+    /// of `query` — the user typed the start of a key, typos included — ranked and
+    /// bounded exactly as `search` (`Match.distance` is the best such prefix's
+    /// distance; `search` compares against the whole key). The query itself may
+    /// be as short as the user's partial input; an exact prefix has distance 0.
+    /// Lucene's `FuzzySuggester` and Elasticsearch's fuzzy completion suggester
+    /// answer the same question. Everything under an accepted prefix is a match,
+    /// so a short query with `k >= 1` can sit above most of the set: the visit
+    /// budget (`SearchOptions.max_visited`) is what bounds it, and `status`
+    /// tells whether it was hit. Same buffers, errors and zero allocation as
+    /// `search`.
+    pub fn searchPrefix(
+        self: Frozen,
+        query: []const u8,
+        k: u8,
+        results: []Match,
+        key_buf: []u8,
+        opts: SearchOptions,
+    ) SearchError!SearchResult {
+        return switch (opts.unit) {
+            inline else => |u| searchInto(true, u == .codepoint, self.inner, query, k, results, key_buf, opts),
+        };
     }
 };
 
@@ -205,12 +243,158 @@ const Selector = struct {
 
 // ── the DP-over-trie walk ─────────────────────────────────────────────────────
 
+/// The first symbol value of a byte that is not part of a well-formed UTF-8
+/// sequence (`unit = .codepoint`): above every scalar value, so it never equals one.
+const invalid_base: u32 = 0x110000;
+
+/// Incremental UTF-8 decoder for `unit = .codepoint`: one symbol per scalar value,
+/// and one symbol per byte of anything that is not well-formed (a stray
+/// continuation byte, a lead that is never completed, an overlong or surrogate
+/// encoding, a byte above F4). `distance.osaDistanceCodepoints` reads the same
+/// rule with `std.unicode`.
+const Dec = struct {
+    need: u8 = 0, // continuation bytes still expected
+    cnt: u8 = 0, // bytes pending (the lead and the continuations so far)
+    val: u32 = 0,
+    buf: [3]u8 = undefined,
+
+    const Out = struct {
+        syms: [4]u32 = undefined,
+        n: usize = 0,
+        fn push(o: *Out, v: u32) void {
+            o.syms[o.n] = v;
+            o.n += 1;
+        }
+    };
+
+    fn contOk(lead: u8, cnt: u8, c: u8) bool {
+        const lo: u8, const hi: u8 = if (cnt != 1) .{ 0x80, 0xBF } else switch (lead) {
+            0xE0 => .{ 0xA0, 0xBF },
+            0xED => .{ 0x80, 0x9F },
+            0xF0 => .{ 0x90, 0xBF },
+            0xF4 => .{ 0x80, 0x8F },
+            else => .{ 0x80, 0xBF },
+        };
+        return c >= lo and c <= hi;
+    }
+
+    fn feed(self: *Dec, c: u8) Out {
+        var o: Out = .{};
+        if (self.need > 0) {
+            if (contOk(self.buf[0], self.cnt, c)) {
+                self.val = (self.val << 6) | (c & 0x3F);
+                self.need -= 1;
+                if (self.need == 0) {
+                    o.push(self.val);
+                    self.cnt = 0;
+                    self.val = 0;
+                } else {
+                    self.buf[self.cnt] = c;
+                    self.cnt += 1;
+                }
+                return o;
+            }
+            o = self.flush();
+            self.* = .{};
+        }
+        switch (c) {
+            0...0x7F => o.push(c),
+            0xC2...0xDF => self.open(c, 1, c & 0x1F),
+            0xE0...0xEF => self.open(c, 2, c & 0x0F),
+            0xF0...0xF4 => self.open(c, 3, c & 0x07),
+            else => o.push(invalid_base + c),
+        }
+        return o;
+    }
+
+    fn open(self: *Dec, c: u8, need: u8, val: u32) void {
+        self.need = need;
+        self.cnt = 1;
+        self.val = val;
+        self.buf[0] = c;
+    }
+
+    /// The pending bytes as the invalid symbols they become if the key ends here.
+    fn flush(self: Dec) Out {
+        var o: Out = .{};
+        for (self.buf[0..self.cnt]) |b| o.push(invalid_base + b);
+        return o;
+    }
+};
+
+/// The query as symbols: bytes, or (`cp`) scalar values.
+fn querySymbols(comptime cp: bool, query: []const u8, out: *[max_query_len]u32) usize {
+    var n: usize = 0;
+    if (!cp) {
+        for (query) |c| {
+            out[n] = c;
+            n += 1;
+        }
+        return n;
+    }
+    var dec: Dec = .{};
+    for (query) |c| {
+        const o = dec.feed(c);
+        for (o.syms[0..o.n]) |sy| {
+            out[n] = sy;
+            n += 1;
+        }
+    }
+    const o = dec.flush();
+    for (o.syms[0..o.n]) |sy| {
+        out[n] = sy;
+        n += 1;
+    }
+    return n;
+}
+
+/// The DP rows of one search: `rows[i]` is the row of the path's first `i` symbols
+/// against the query's.
+const Dp = struct {
+    q: []const u32,
+    cap: u16,
+    rows: *[max_depth + 1][max_query_len + 1]u8,
+    syms: *[max_depth + 1]u32, // syms[i]: the i-th symbol of the path (1-based)
+
+    /// Compute `rows[si + 1]` from `rows[si]` (and `rows[si - 1]` for the
+    /// transposition term) for the symbol `sym`; returns that row's minimum.
+    fn extend(dp: Dp, si: usize, sym: u32) u16 {
+        const m = dp.q.len;
+        const prev = &dp.rows[si];
+        const cur = &dp.rows[si + 1];
+        cur[0] = @intCast(@min(@as(u16, @intCast(si + 1)), dp.cap));
+        var row_min: u16 = cur[0];
+        var j: usize = 1;
+        while (j <= m) : (j += 1) {
+            const cost: u16 = if (sym == dp.q[j - 1]) 0 else 1;
+            var v: u16 = @min(@min(@as(u16, cur[j - 1]) + 1, @as(u16, prev[j]) + 1), @as(u16, prev[j - 1]) + cost);
+            // Adjacent transposition: needs a previous symbol, sym == q[j-2] and
+            // the symbol before it on the path == q[j-1].
+            if (si >= 1 and j >= 2 and sym == dp.q[j - 2] and dp.syms[si] == dp.q[j - 1]) {
+                v = @min(v, @as(u16, dp.rows[si - 1][j - 2]) + 1);
+            }
+            if (v > dp.cap) v = dp.cap;
+            cur[j] = @intCast(v);
+            if (v < row_min) row_min = v;
+        }
+        dp.syms[si + 1] = sym;
+        return row_min;
+    }
+};
+
 /// `depth` is the node's byte depth: in a v2 (path-compressed) index one edge
 /// stands for `label ++ child.tail`, so a node can sit several bytes below
-/// its parent, and the DP keeps one row per BYTE, not per node.
-const Frame = struct { node: format.NodeView, edge_idx: u16, depth: usize };
+/// its parent, and the DP keeps one row per SYMBOL (a byte, or with
+/// `unit = .codepoint` a scalar value), not per node.
+/// `best` (prefix mode only): the smallest distance of an ancestor's path, itself
+/// included, to the whole query; `k + 1` while none is within `k`. `settled`: no
+/// longer path can beat `best` (the row minimum has reached it), so the rest of the
+/// subtree needs no DP rows.
+const Frame = struct { node: format.NodeView, edge_idx: u16, depth: usize, best: u8, settled: bool };
 
 fn searchInto(
+    comptime prefix: bool,
+    comptime cp: bool,
     f: trie.Frozen,
     query: []const u8,
     k: u8,
@@ -222,16 +406,23 @@ fn searchInto(
     if (k > max_k) return error.DistanceTooLarge;
 
     var sel = Selector.init(results, key_buf);
-    const m = query.len;
     const cap: u16 = @as(u16, k) + 1; // any true distance > k collapses to this
 
-    // DP rows, one per byte depth on the current path. row_store[d][0..m+1] is
-    // the row for the path prefix of length d. u8 cells: every distance we care
-    // about is ≤ k ≤ 254, and values above k are capped at `cap` (≤ 255).
+    var qbuf: [max_query_len]u32 = undefined;
+    const m = querySymbols(cp, query, &qbuf);
+
+    // DP rows, one per symbol depth on the current path. rows[i][0..m+1] is the
+    // row for the path's first i symbols. u8 cells: every distance we care about
+    // is ≤ k ≤ 254, and values above k are capped at `cap` (≤ 255).
     var row_store: [max_depth + 1][max_query_len + 1]u8 = undefined;
+    var sym_store: [max_depth + 1]u32 = undefined;
+    const dp: Dp = .{ .q = qbuf[0..m], .cap = cap, .rows = &row_store, .syms = &sym_store };
     // Reconstructed key: path_store[0..depth] are the bytes root→node.
     var path_store: [max_depth]u8 = undefined;
     var stack: [max_depth + 1]Frame = undefined;
+    // codepoint unit: the decoder state and the symbol count at each byte depth.
+    var dec_store: [if (cp) max_depth + 1 else 0]Dec = undefined;
+    var sd_store: [if (cp) max_depth + 1 else 0]u16 = undefined;
 
     // Root: depth 0, path "". row[0][j] = min(j, cap) (j deletions from query).
     const root = try f.rootNode();
@@ -239,12 +430,16 @@ fn searchInto(
         var j: usize = 0;
         while (j <= m) : (j += 1) row_store[0][j] = @intCast(@min(@as(u16, @intCast(j)), cap));
     }
+    if (cp) {
+        dec_store[0] = .{};
+        sd_store[0] = 0;
+    }
     if (root.terminal and row_store[0][m] <= k) {
         try sel.consider(.{ .distance = row_store[0][m], .value = root.value, .key = path_store[0..0] });
     }
 
     var sp: usize = 1;
-    stack[0] = .{ .node = root, .edge_idx = 0, .depth = 0 };
+    stack[0] = .{ .node = root, .edge_idx = 0, .depth = 0, .best = if (prefix) row_store[0][m] else @intCast(cap), .settled = prefix and row_store[0][m] == 0 };
     var visited: usize = 0;
     var status: SearchStatus = .complete;
 
@@ -267,43 +462,64 @@ fn searchInto(
         const end = top.depth + 1 + child.tail.len; // child's byte depth
         if (end > max_depth) return error.KeyTooLong;
 
-        // Extend the DP one row per byte of the edge's string `label ++ tail`.
-        var d = top.depth; // depth of the row being extended
+        // Extend the DP one row per symbol of the edge's string `label ++ tail`.
+        var d = top.depth; // byte depth of the byte being added
+        var si: usize = if (cp) sd_store[d] else d; // symbols on the path so far
+        var dec: Dec = if (cp) dec_store[d] else .{};
+        var pb: u8 = top.best; // prefix mode: best prefix distance on this path so far
+        var settled = top.settled;
         var bi: usize = 0;
         while (bi <= child.tail.len) : (bi += 1) {
             const c = if (bi == 0) e.label else child.tail[bi - 1];
-            const nd = d + 1;
-            // Compute row nd from row d and, for the transposition term, row d-1.
             path_store[d] = c;
-            const prev = &row_store[d];
-            const cur = &row_store[nd];
-            cur[0] = @intCast(@min(@as(u16, @intCast(nd)), cap));
-            var row_min: u16 = cur[0];
-            var j: usize = 1;
-            while (j <= m) : (j += 1) {
-                const cost: u16 = if (c == query[j - 1]) 0 else 1;
-                var v: u16 = @min(@min(@as(u16, cur[j - 1]) + 1, @as(u16, prev[j]) + 1), @as(u16, prev[j - 1]) + cost);
-                // Adjacent transposition: needs a previous byte (d ≥ 1) and
-                // c == query[j-2], prev_char == query[j-1] where prev_char is
-                // the byte before c on the path = path_store[d-1].
-                if (d >= 1 and j >= 2 and c == query[j - 2] and path_store[d - 1] == query[j - 1]) {
-                    v = @min(v, @as(u16, row_store[d - 1][j - 2]) + 1);
-                }
-                if (v > cap) v = cap;
-                cur[j] = @intCast(v);
-                if (v < row_min) row_min = v;
+            d += 1;
+            if (settled) {
+                // A prefix of this path is within `k` and no longer prefix can be
+                // closer: every key below matches at `pb`, no row is needed.
+                continue;
             }
-            // Prune: if the whole row already exceeds k, no longer path can
-            // reach ≤ k (row minimum is non-decreasing down every path). Skip
-            // this subtree — even mid-edge.
-            if (row_min > k) continue :outer;
-            d = nd;
+            var fed: Dec.Out = .{};
+            if (cp) {
+                fed = dec.feed(c);
+            } else {
+                fed.push(c);
+            }
+            for (fed.syms[0..fed.n]) |sy| {
+                const row_min = dp.extend(si, sy);
+                si += 1;
+                if (prefix and row_store[si][m] < pb) pb = row_store[si][m];
+                if (prefix and pb <= k and row_min >= pb) settled = true;
+                // Prune: if the whole row already exceeds k, no longer path can
+                // reach ≤ k (row minimum is non-decreasing down every path). Skip
+                // this subtree — even mid-edge.
+                if (row_min > k and !(prefix and pb <= k)) continue :outer;
+                if (settled) break;
+            }
+            if (cp) {
+                dec_store[d] = dec;
+                sd_store[d] = @intCast(si);
+            }
         }
 
-        if (child.terminal and row_store[end][m] <= k) {
-            try sel.consider(.{ .distance = row_store[end][m], .value = child.value, .key = path_store[0..end] });
+        if (child.terminal) {
+            // A key that ends inside a UTF-8 sequence: its pending bytes are symbols too.
+            var tsi = si;
+            var tpb = pb;
+            if (cp and !settled and dec.need > 0) {
+                const fl = dec.flush();
+                for (fl.syms[0..fl.n]) |sy| {
+                    _ = dp.extend(tsi, sy);
+                    tsi += 1;
+                    if (prefix and row_store[tsi][m] < tpb) tpb = row_store[tsi][m];
+                }
+            }
+            if (prefix) {
+                if (tpb <= k) try sel.consider(.{ .distance = tpb, .value = child.value, .key = path_store[0..end] });
+            } else if (row_store[tsi][m] <= k) {
+                try sel.consider(.{ .distance = row_store[tsi][m], .value = child.value, .key = path_store[0..end] });
+            }
         }
-        stack[sp] = .{ .node = child, .edge_idx = 0, .depth = end };
+        stack[sp] = .{ .node = child, .edge_idx = 0, .depth = end, .best = pb, .settled = settled };
         sp += 1;
     }
 

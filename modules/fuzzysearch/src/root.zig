@@ -56,6 +56,7 @@ pub const FreezeError = trie.FreezeError;
 pub const Frozen = search.Frozen;
 pub const Match = search.Match;
 pub const SearchOptions = search.SearchOptions;
+pub const Unit = search.Unit;
 pub const SearchResult = search.SearchResult;
 pub const SearchStatus = search.SearchStatus;
 pub const SearchError = search.SearchError;
@@ -67,6 +68,9 @@ pub const max_k = search.max_k;
 /// The reference OSA (restricted Damerau–Levenshtein) distance over bytes — a
 /// public single-pair verification helper (also the differential-test oracle).
 pub const osaDistance = distance.osaDistance;
+
+/// `osaDistance` over Unicode scalar values, the reference for `SearchOptions.unit = .codepoint`.
+pub const osaDistanceCodepoints = distance.osaDistanceCodepoints;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ─────────────────────────
 
@@ -112,11 +116,38 @@ const Oracle = struct {
         return .{ .keys = keys, .vals = vals };
     }
 
-    /// All matches within `k`, ranked best-first (into `arena`).
-    fn matches(self: Oracle, arena: std.mem.Allocator, query: []const u8, k: u8) ![]OracleMatch {
+    fn dist(query: []const u8, key: []const u8, unit: search.Unit) !u32 {
+        return switch (unit) {
+            .byte => distance.osaDistance(query, key),
+            .codepoint => distance.osaDistanceCodepoints(query, key),
+        };
+    }
+
+    /// The smallest distance from `query` to a prefix of `key` (the empty prefix included):
+    /// a byte prefix, or in the codepoint unit a prefix of the key's symbols (cut where a
+    /// character, or a malformed byte, ends).
+    fn prefixDistance(query: []const u8, key: []const u8, unit: search.Unit) !u32 {
+        var best: u32 = try dist(query, "", unit);
+        var i: usize = 0;
+        while (i < key.len) {
+            const len: usize = if (unit == .byte) 1 else blk: {
+                const n = std.unicode.utf8ByteSequenceLength(key[i]) catch break :blk 1;
+                if (i + n > key.len) break :blk 1;
+                _ = std.unicode.utf8Decode(key[i..][0..n]) catch break :blk 1;
+                break :blk n;
+            };
+            i += len;
+            best = @min(best, try dist(query, key[0..i], unit));
+        }
+        return best;
+    }
+
+    /// All matches within `k`, ranked best-first (into `arena`); `prefix`: the
+    /// distance is to the best prefix of the key (`Frozen.searchPrefix`).
+    fn matches(self: Oracle, arena: std.mem.Allocator, query: []const u8, k: u8, prefix: bool, unit: search.Unit) ![]OracleMatch {
         var list: std.ArrayListUnmanaged(OracleMatch) = .empty;
         for (self.keys, self.vals) |kk, vv| {
-            const d = try distance.osaDistance(query, kk);
+            const d = if (prefix) try prefixDistance(query, kk, unit) else try dist(query, kk, unit);
             if (d <= k) try list.append(arena, .{ .distance = d, .value = vv, .key = kk });
         }
         std.mem.sort(OracleMatch, list.items, {}, struct {
@@ -169,7 +200,7 @@ fn mutate(arena: std.mem.Allocator, rnd: std.Random, base: []const u8, edits: us
     return buf.items;
 }
 
-fn differentialRound(seed: u64, count: usize, fmt: trie.FreezeOptions) !void {
+fn differentialRound(seed: u64, count: usize, fmt: trie.FreezeOptions, prefix: bool, unit: search.Unit) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -203,10 +234,13 @@ fn differentialRound(seed: u64, count: usize, fmt: trie.FreezeOptions) !void {
         var results: [N]Match = undefined;
         var kb: [N * 32]u8 = undefined;
         // Unbounded budget: the returned items must be the exact ranked best-N.
-        const r = try f.search(query, k, &results, &kb, .{ .max_visited = 0 });
+        const r = if (prefix)
+            try f.searchPrefix(query, k, &results, &kb, .{ .max_visited = 0, .unit = unit })
+        else
+            try f.search(query, k, &results, &kb, .{ .max_visited = 0, .unit = unit });
         try testing.expectEqual(SearchStatus.complete, r.status);
 
-        const want = try oracle.matches(arena, query, k);
+        const want = try oracle.matches(arena, query, k, prefix, unit);
         const want_n = @min(@as(usize, N), want.len);
         try testing.expectEqual(want_n, r.items.len);
         for (0..want_n) |i| {
@@ -217,7 +251,7 @@ fn differentialRound(seed: u64, count: usize, fmt: trie.FreezeOptions) !void {
         // Every reported match really is within k and at its true OSA distance.
         for (r.items) |it| {
             try testing.expect(it.distance <= k);
-            try testing.expectEqual(it.distance, try osaDistance(query, it.key));
+            try testing.expectEqual(it.distance, if (prefix) try Oracle.prefixDistance(query, it.key, unit) else try Oracle.dist(query, it.key, unit));
         }
     }
 }
@@ -231,9 +265,97 @@ test "differential: pruned automaton walk vs brute-force OSA over many key sets"
     for (both_formats) |fmt| {
         var seed: u64 = 1;
         while (seed <= 40) : (seed += 1) {
-            try differentialRound(seed, 40, fmt);
+            try differentialRound(seed, 40, fmt, false, .byte);
         }
     }
+}
+
+test "differential: searchPrefix vs brute-force best-prefix OSA over many key sets" {
+    for (both_formats) |fmt| {
+        var seed: u64 = 101;
+        while (seed <= 140) : (seed += 1) {
+            try differentialRound(seed, 40, fmt, true, .byte);
+        }
+    }
+}
+
+test "differential: unit = .codepoint (search and searchPrefix) vs brute-force OSA over scalar values" {
+    // The key alphabet is raw bytes of Czech diacritics, so keys hold valid two-byte
+    // characters AND stray, truncated and mis-ordered bytes: the malformed rule is exercised too.
+    for (both_formats) |fmt| {
+        var seed: u64 = 201;
+        while (seed <= 240) : (seed += 1) {
+            try differentialRound(seed, 40, fmt, false, .codepoint);
+            try differentialRound(seed + 100, 40, fmt, true, .codepoint);
+        }
+    }
+}
+
+test "codepoint unit: a one-letter diacritic typo is one edit, and byte unit still sees two" {
+    const buf = try trie.freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "město", .value = 1 },
+        .{ .key = "mesto", .value = 2 },
+        .{ .key = "měšťan", .value = 3 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var results: [8]Match = undefined;
+    var kb: [8 * 32]u8 = undefined;
+    var r = try f.search("mesto", 1, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 1), r.items.len); // bytes: ě costs 2
+    r = try f.search("mesto", 1, &results, &kb, .{ .unit = .codepoint });
+    try testing.expectEqual(@as(usize, 2), r.items.len);
+    try testing.expectEqualStrings("mesto", r.items[0].key);
+    try testing.expectEqual(@as(u32, 1), r.items[1].distance);
+    try testing.expectEqualStrings("město", r.items[1].key);
+    // a transposition of two multi-byte characters is one edit
+    const b2 = try trie.freezeFromPairs(testing.allocator, testing.allocator, &.{.{ .key = "ěš", .value = 1 }});
+    defer testing.allocator.free(b2);
+    const f2 = try Frozen.load(b2);
+    r = try f2.search("šě", 1, &results, &kb, .{ .unit = .codepoint });
+    try testing.expectEqual(@as(usize, 1), r.items.len);
+    r = try f2.search("šě", 1, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 0), r.items.len);
+    // typeahead: "mes" is a prefix of "mesto" and one edit from the prefix "měs" of "město" (not of "měšťan": two)
+    r = try f.searchPrefix("mes", 1, &results, &kb, .{ .unit = .codepoint });
+    try testing.expectEqual(@as(usize, 2), r.items.len);
+    r = try f.searchPrefix("mes", 1, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 1), r.items.len); // bytes: ě costs 2
+}
+
+test "searchPrefix: typeahead with a typo, exact prefixes first, and the empty and over-long cases" {
+    const buf = try trie.freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "vaclavske namesti", .value = 10 },
+        .{ .key = "vaclavska", .value = 5 },
+        .{ .key = "vodickova", .value = 7 },
+        .{ .key = "praha", .value = 1 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var results: [8]Match = undefined;
+    var kb: [8 * 32]u8 = undefined;
+    // "vaclvs" is one deletion from the prefix "vaclavs" of two keys; the exact prefix "vaclav" is 0 for nothing here
+    var r = try f.searchPrefix("vaclvs", 1, &results, &kb, .{});
+    try testing.expectEqual(SearchStatus.complete, r.status);
+    try testing.expectEqual(@as(usize, 2), r.items.len);
+    try testing.expectEqualStrings("vaclavske namesti", r.items[0].key); // value 10 beats 5 at the same distance
+    try testing.expectEqual(@as(u32, 1), r.items[0].distance);
+    // an exact prefix is distance 0 and outranks a typo'd one
+    r = try f.searchPrefix("vaclav", 1, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 2), r.items.len);
+    try testing.expectEqual(@as(u32, 0), r.items[0].distance);
+    // plain `search` of the same query finds neither (the keys are far longer)
+    const whole = try f.search("vaclav", 1, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 0), whole.items.len);
+    // k = 0 is an exact prefix search
+    r = try f.searchPrefix("v", 0, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 3), r.items.len);
+    // the empty query is a prefix of every key
+    r = try f.searchPrefix("", 0, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 4), r.items.len);
+    // the visit budget bounds it like `search`
+    r = try f.searchPrefix("", 0, &results, &kb, .{ .max_visited = 2 });
+    try testing.expectEqual(SearchStatus.truncated_budget, r.status);
 }
 
 test "differential: adversarial hand-picked key sets and boundary queries" {
@@ -262,7 +384,7 @@ test "differential: adversarial hand-picked key sets and boundary queries" {
                 var results: [16]Match = undefined;
                 var kb: [16 * 16]u8 = undefined;
                 const r = try f.search(query, k, &results, &kb, .{ .max_visited = 0 });
-                const want = try oracle.matches(arena, query, k);
+                const want = try oracle.matches(arena, query, k, false, .byte);
                 const want_n = @min(@as(usize, 16), want.len);
                 try testing.expectEqual(want_n, r.items.len);
                 for (0..want_n) |i| {
@@ -292,7 +414,7 @@ test "round-trip: build → freeze → load → search equals in-memory brute fo
     var results: [8]Match = undefined;
     var kb: [8 * 32]u8 = undefined;
     const r = try f.search("vaclvske", 2, &results, &kb, .{ .max_visited = 0 });
-    const want = try oracle.matches(arena, "vaclvske", 2);
+    const want = try oracle.matches(arena, "vaclvske", 2, false, .byte);
     try testing.expectEqual(want.len, r.items.len);
     for (want, r.items) |w, got| {
         try testing.expectEqual(w.distance, got.distance);

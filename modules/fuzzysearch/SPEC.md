@@ -87,10 +87,31 @@ Damerau–Levenshtein — which allows a transposed pair to be edited again and 
 an alphabet-indexed last-occurrence table — cannot be computed from a fixed number
 of previous rows and is a **deliberately deferred** non-goal.
 
-Distance is over **bytes**. A multi-byte UTF-8 codepoint is several byte-edits.
-Unicode-aware distance (collation, case-folding, diacritic-insensitivity) is the
-caller's obligation, discharged by folding keys and query identically before
-indexing — the same contract as `trie`.
+Distance is over **bytes** by default: a multi-byte UTF-8 codepoint is several
+byte-edits. `SearchOptions.unit = .codepoint` counts Unicode scalar values (Lucene's
+`FuzzyQuery` works on code points too): the walk feeds each byte to an incremental
+UTF-8 decoder kept per byte depth, and a DP row is computed per decoded symbol, not
+per byte. Malformed input has no retroactive reading: every byte of a sequence that
+turns out not to be well-formed (a stray continuation byte, a lead that is never
+completed, an overlong or surrogate encoding, a byte above `F4`) is one symbol of its
+own, above every scalar value, and a key that ends inside a sequence counts its
+pending bytes the same way. `distance.osaDistanceCodepoints` implements that rule
+independently with `std.unicode` and is what the differential tests compare against.
+Collation, case-folding and diacritic-insensitivity are still the caller's job,
+discharged by folding keys and query identically before indexing — the same contract
+as `trie`.
+
+### Prefix search
+
+`Frozen.searchPrefix` answers the typeahead question: which keys have a PREFIX within
+`k` of the query (Lucene's `FuzzySuggester`, Elasticsearch's fuzzy completion
+suggester). The walk is the same; `Match.distance` is the best prefix's distance, kept
+per path as `best`. Once a prefix is within `k` and the row minimum has reached `best`
+(no longer prefix can be closer, the row minimum being non-decreasing) the subtree is
+`settled`: every key below matches at `best`, and the walk only enumerates it, with no
+DP rows. A query shorter than `k` therefore matches everything (the empty prefix is
+within `k`), bounded by `max_visited` like any wide search. The differential tests
+compare it with the best byte (or symbol) prefix by brute force.
 
 ### Cost model
 
@@ -221,9 +242,6 @@ Run with `scripts/modtest fuzzysearch` (or `zig build test-fuzzysearch`
   typo-tolerance uses. Swappable behind the same `search` API.
 - **Weighted / custom edit costs** (keyboard-adjacency, OCR-confusion weights).
   The metric is fixed unit-cost OSA.
-- **Transposition of multi-byte codepoints as a single edit.** Distance is over
-  bytes; a codepoint-level metric is the caller's normalization concern (an
-  opt-in UTF-8-aware metric is in *Backlog / deferred*).
 
 ## Anchoring
 
@@ -236,6 +254,8 @@ Run with `scripts/modtest fuzzysearch` (or `zig build test-fuzzysearch`
 
 ## Backlog / deferred
 
-- **Prefix-anchored fuzzy autocomplete** — typeahead users type a *prefix* with a typo (the driving address case); the query must be within `k` edits of a whole key. A hybrid of `trie.topN` and this walk: walk the automaton, then take `trie.topN` under accepting nodes. Effort: medium. Fits CONVENTIONS §2.
-- **Codepoint-level distance** — a diacritic or any non-ASCII letter costs 2+ edits, so `k=1` misses a one-letter Czech typo on `ě`. The design leaves folding to the caller, but an opt-in UTF-8-aware metric is what users of SymSpell/Lucene get for free. Effort: medium. Fits §2.
-- **Word-level correction / segmentation** — SymSpell's compound correction and word segmentation (`"thequickbrown"`) for multi-word input. Effort: medium-large; possibly a separate module. Fits §2.
+None open.
+
+## Roadmap
+
+- **Word-level correction / segmentation** — SymSpell's compound correction and word segmentation (`"thequickbrown"`) for multi-word input. Fits CONVENTIONS §2. Size: a new feature family, likely a separate module on top of `search`: it needs a word-frequency dictionary convention (the stored `u32` as a count and a total), a scoring model (unigram and bigram log-probabilities, a per-edit penalty), split/merge handling of adjacent tokens, and its own oracle (SymSpell's published results).

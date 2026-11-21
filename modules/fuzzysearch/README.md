@@ -47,12 +47,15 @@ follows out of the buffer is bounds-checked by `trie`'s decoder.
 
 ## Contracts
 
-- **Keys are arbitrary bytes; edit distance is over BYTES.** A multi-byte UTF-8
+- **Keys are arbitrary bytes; by default an edit is one BYTE.** A multi-byte UTF-8
   codepoint counts as several byte-edits (replacing `ě` (`0xC4 0x9B`) with `e`
-  (`0x65`) is distance 2). Unicode-aware matching (NFC / case-folding /
-  diacritic-stripping) is the **caller's** job: fold both the stored keys and the
-  query the same way *before* indexing — the same normalization contract as
-  `trie`. The empty key and the empty query are both allowed.
+  (`0x65`) is distance 2). `SearchOptions.unit = .codepoint` makes an edit one
+  Unicode scalar value (`ě` for `e` is 1, two adjacent characters swapped is 1);
+  bytes that are not well-formed UTF-8 count one symbol each, and
+  `osaDistanceCodepoints` is the reference. Normalization (NFC / case-folding /
+  diacritic-stripping) is still the **caller's** job: fold both the stored keys
+  and the query the same way *before* indexing — the same contract as `trie`.
+  The empty key and the empty query are both allowed.
 - **Metric: OSA (optimal string alignment)** — the *restricted*
   Damerau–Levenshtein distance: insertion, deletion, substitution, and
   transposition of two adjacent bytes, each one edit, under the OSA restriction
@@ -97,6 +100,10 @@ var key_buf: [10 * 128]u8 = undefined;
 const r = try f.search("vaclvske", 2, &results, &key_buf, .{});
 // r.items ranked best-first: each has .distance (0..=k), .value, .key
 // r.status == .complete or .truncated_budget
+
+// Typeahead: keys with a PREFIX within k edits of what was typed (same buffers, ranking, budget).
+const t = try f.searchPrefix("vaclv", 1, &results, &key_buf, .{});
+// Character-level edits instead of byte-level: `.{ .unit = .codepoint }`.
 
 // Single-pair verification helper (the reference metric).
 const d = try fuzzysearch.osaDistance("teh", "the"); // 1
