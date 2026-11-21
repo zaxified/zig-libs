@@ -1157,7 +1157,7 @@ ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	two	1	5	1b2ea97a80cc47e9	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	1b2ea97a80cc47e9	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	04a4f7caf30f2695	b40b02f9cf423f05
+fss	ReleaseFast	gen	1	0	e594abde8386c95f	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
 # staying branch-free at genWithSeeds'. Fixed by laundering the mask through
@@ -1167,7 +1167,7 @@ fss	ReleaseFast	gen	1	0	04a4f7caf30f2695	b40b02f9cf423f05
 # `key.cw_final & (0 -% @as(Elem, t))` (dpf.zig) compiled to `test $0x1,%r13b` / `je` over the
 # load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
 # now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
-fss	ReleaseFast	eval	1	0	04a4f7caf30f2695	da79011b1ab46d96
+fss	ReleaseFast	eval	1	0	e594abde8386c95f	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	b5e0aaa8f81c3991	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	b5e0aaa8f81c3991	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	b5e0aaa8f81c3991	51de1d1011ed3c4c
@@ -2393,8 +2393,8 @@ saml	ReleaseFast	sign	1	45	6c9ac2d2df017817	88075a41bcf0b2bb
 # -mcpu=x86_64.
 oscore	ReleaseFast	protect	1	80	5348e0af1901ba83	6eac6a90e3479ab8	cpu=x86_64 control=2 trap=2
 oscore	ReleaseFast	unprotect	1	81	5348e0af1901ba83	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
-fss	ReleaseFast	gen	1	0	04a4f7caf30f2695	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
-fss	ReleaseFast	eval	1	0	04a4f7caf30f2695	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
+fss	ReleaseFast	gen	1	0	e594abde8386c95f	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
+fss	ReleaseFast	eval	1	0	e594abde8386c95f	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	96d433b8d464dac1	b60805fea700d105	cpu=x86_64 control=8 trap=8
 # aesccm on x86_64 (2026-11-21, full CI 44922862032 ctgrind-portable; read with --stacks and
 # valgrind --track-origins): claim 192 in-file = 184 A1 (std soft.zig `expandKey` masked S-box loads

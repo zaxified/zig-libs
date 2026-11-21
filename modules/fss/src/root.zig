@@ -79,6 +79,8 @@ pub const Dpf = dpf.Dpf;
 /// `DpfWith(P, n, L)` — the same, with the PRG chosen explicitly. The PRG is
 /// part of the key format; see `Key.key_format`.
 pub const DpfWith = dpf.DpfWith;
+pub const DpfGroup = dpf.DpfGroup;
+pub const DpfGroupWith = dpf.DpfGroupWith;
 /// The one way `Key.fromBytesTagged` can fail (`error.UnsupportedKeyFormat`).
 pub const KeyFormatError = dpf.KeyFormatError;
 

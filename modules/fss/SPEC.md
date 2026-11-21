@@ -74,9 +74,15 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
 - `+%`/`-%` on an exact-width `uN` already reduce mod `2^{8L}` with no
   conditional, so the group arithmetic is branch-free and trivially constant
   in the value (see `group.zig`).
-- The **GF(2)^m XOR group** is the other textbook choice; it is the special
-  case where `add == sub == XOR`. It is a trivial variant of the same code
-  path (a one-line group swap) and is not built (see *Backlog / deferred*).
+- Other groups go through `DpfGroup(n, Gr)` / `DpfGroupWith(P, n, Gr)`
+  (`Dpf(n, L)` is `DpfGroup(n, group.Z2k(L))`, byte for byte): a group is an
+  unsigned-integer `Elem`, `byte_len`, `add`/`sub`/`neg` and `fromPrg(p, seed)`.
+  Shipped: `group.Xor(L)` — `({0,1}^{8L}, ⊕)`, `add == sub == ⊕`, the shares
+  reconstruct by XOR (PIR-by-XOR) — and `group.ZMod(N)` for `2 ≤ N ≤ 2^64`
+  (e.g. a VDAF field's additive group), whose `fromPrg` reduces 192 PRG bits
+  mod `N` bit-serially with a masked subtract (distance from uniform `< 2^-128`;
+  a library `%` on a secret 192-bit value would be variable-time) and whose
+  `add`/`neg` reduce with a mask. `Mpf` and `Dcf` stay on `Z_{2^{8L}}`.
 
 **Domain parameterization:** the input domain is `{0,1}^n` (indices
 `0..2^n`), `n = n_bits` a compile-time parameter, `n ∈ 1..31`. Bits are read
@@ -205,7 +211,10 @@ a skip is never a pass.
    long-hand `H_2 ‖ H_3`; `convert(L)` is the low `L` bytes of `convert(32)` for every `L`; distinct format tags and
    tagged round trip (`dpf.zig`ff).
 
-7. **DCF** (`dcf.zig`): every point of every `α` of a 4-bit domain under both PRGs reconstructs `β·[x < α]`, plus
+7. **Output groups** (`group.zig`, `dpf.zig`): `Xor` and `ZMod` group laws, `ZMod.fromPrg` against the 192-bit `%`,
+   and `DpfGroupWith` over `Xor(8)`, `ZMod(Goldilocks)`, `ZMod(97)` under both PRGs: full-domain reconstruction,
+   `evalFull` equal to `evalAll`, the key codec round trip.
+8. **DCF** (`dcf.zig`): every point of every `α` of a 4-bit domain under both PRGs reconstructs `β·[x < α]`, plus
    1-bit and 32-byte-group corners, random `(α, β)` over 10 bits, `β = 0`, an interval as the difference of two
    DCFs, a single key's shares not collapsing to `0/1`, and the key codec round trip.
 
@@ -539,8 +548,6 @@ does not observe `α` itself; for `α` the guarantee is by construction.
   *External-reference anchoring*.
 - **A header on the wire codec.** `toBytes`/`fromBytes` stay header-free (a constant tag byte would hand an observer
   a constant and break `pir`'s no-structural-constant-bytes census); the tag lives in the storage codec only.
-- **A second output type for the XOR group in the first version** — `add == sub == XOR` is a one-line group swap,
-  listed under Backlog with the other groups.
 
 ## Backlog / deferred
 
@@ -553,9 +560,9 @@ does not observe `α` itself; for `α` the guarantee is by construction.
 - **Incremental / hierarchical DPF (IDPF)** *(survey)*: the headline feature of the reference library; private heavy
   hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes
   internally but there is no per-level output/CW. Medium.
-- **Non-`Z_{2^{8L}}` output groups** (`XOR`, `Z_N`, tuples/vectors of elements) *(survey, inferred from Google's
-  API)*: only the additive `Z_{2^{8L}}` group exists (`group.zig`); PIR-by-XOR and VDAF-style field elements need
-  others. Small-medium.
+- **Tuple/vector output groups** *(survey, inferred from Google's API)*: `Z_{2^{8L}}`, `Xor(L)` and `ZMod(N)` exist
+  (`DpfGroup`); a tuple of elements (one correction word per component, as Google's `Tuple<...>` value types) does
+  not, nor `ZMod` for `N > 2^64`. Small-medium.
 
 ## Anchoring
 

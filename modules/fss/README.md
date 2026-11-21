@@ -94,6 +94,10 @@ try D.Key.fromBytesTagged(&reloaded, &stored); // error.UnsupportedKeyFormat
 // recorded KAT vectors are stated over) stays available:
 const S = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
 
+// Other output groups: XOR shares (PIR-by-XOR) or Z_N (a field's additive group).
+const X = fss.DpfGroup(16, fss.group.Xor(32));
+const F = fss.DpfGroup(16, fss.group.ZMod(0xffff_ffff_0000_0001));
+
 // Distributed comparison: shares of beta·[x < alpha] (same seed contract).
 const C = fss.Dcf(16, 8);
 var ck: [2]C.Key = undefined;
@@ -195,7 +199,7 @@ the `firstMismatch` checker) are core-independent and prove the harness has teet
 
 ## Not provided
 
-Incremental (hierarchical) DPFs and non-`Z_{2^{8L}}` output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
+Incremental (hierarchical) DPFs and tuple/vector output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
 libraries are refused (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party

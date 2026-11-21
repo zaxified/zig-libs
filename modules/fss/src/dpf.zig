@@ -143,15 +143,30 @@ pub fn Dpf(comptime n_bits: usize, comptime out_bytes: usize) type {
 /// interchangeable, which is what `Key.key_format` / `Key.toBytesTagged` exist
 /// to make visible.
 pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usize) type {
-    if (n_bits < 1 or n_bits > 31) @compileError("Dpf: n_bits must be in 1..31");
     if (out_bytes < 1 or out_bytes > 32) @compileError("Dpf: out_bytes must be in 1..32");
+    return DpfGroupWith(P, n_bits, group.Z2k(out_bytes));
+}
+
+/// A DPF whose output group is `Gr` (`group.Z2k(L)`, `group.Xor(L)`,
+/// `group.ZMod(N)`, or any type with the same interface: `Elem` an unsigned
+/// integer, `byte_len`, `add`/`sub`/`neg`, and `fromPrg(p, seed)` mapping a
+/// PRG seed to a (near-)uniform element), with the default PRG.
+pub fn DpfGroup(comptime n_bits: usize, comptime Gr: type) type {
+    return DpfGroupWith(prg_mod.default, n_bits, Gr);
+}
+
+/// `DpfGroup` with an explicitly chosen PRG. `DpfWith(P, n, L)` is
+/// `DpfGroupWith(P, n, group.Z2k(L))`, byte for byte.
+pub fn DpfGroupWith(comptime P: type, comptime n_bits: usize, comptime Gr: type) type {
+    if (n_bits < 1 or n_bits > 31) @compileError("Dpf: n_bits must be in 1..31");
+    const out_bytes = Gr.byte_len;
     return struct {
         pub const n = n_bits;
         /// the PRG this instantiation is built on (`prg.zig`)
         pub const Prg = P;
-        pub const G = group.Z2k(out_bytes);
-        /// output-group element type (Z_{2^{8*out_bytes}})
-        pub const Elem = G.Int;
+        pub const G = Gr;
+        /// output-group element type
+        pub const Elem = G.Elem;
         /// domain index type: an `n`-bit unsigned integer in `0..2^n`
         pub const Index = @Int(.unsigned, n_bits);
         /// number of points in the domain (`2^n`)
@@ -363,8 +378,8 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             }
 
             // cw_final = (-1)^{t1^n} · (β − Convert(s0^n) + Convert(s1^n))
-            const c0 = p.convert(out_bytes, cur0);
-            const c1 = p.convert(out_bytes, cur1);
+            const c0 = G.fromPrg(p, cur0);
+            const c1 = G.fromPrg(p, cur1);
             const raw: Elem = G.add(G.sub(beta, c0), c1);
             // `t1` is key material; select the negation without branching.
             const neg_mask: Elem = secretMask(Elem, t1);
@@ -404,7 +419,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                 xorMasked(&s, c.s_cw, t);
                 t = nt;
             }
-            const leaf: Elem = p.convert(out_bytes, s);
+            const leaf: Elem = G.fromPrg(p, s);
             const out = G.add(leaf, key.cw_final & secretMask(Elem, t));
             const b_mask: Elem = 0 -% @as(Elem, b);
             return (G.neg(out) & b_mask) | (out & ~b_mask);
@@ -567,7 +582,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             const size = @as(usize, 1) << @intCast(n_bits - level);
             if (base + size <= lo) return;
             if (level == n_bits) {
-                const leaf: Elem = p.convert(out_bytes, s);
+                const leaf: Elem = G.fromPrg(p, s);
                 const v0 = G.add(leaf, key.cw_final & secretMask(Elem, t));
                 const b_mask: Elem = 0 -% @as(Elem, b);
                 emit(context, base, (G.neg(v0) & b_mask) | (v0 & ~b_mask));
@@ -746,4 +761,35 @@ test "secretMask is 0 or all-ones at every width, at runtime and at comptime" {
         comptime std.debug.assert(secretMask(T, 0) == 0);
         comptime std.debug.assert(secretMask(T, 1) == ~@as(T, 0));
     }
+}
+
+test "DpfGroup: XOR and Z_N output groups reconstruct the point function" {
+    const prgs = .{ prg_mod.Aes128Mmo, prg_mod.Sha256Prg };
+    inline for (prgs) |P| {
+        inline for (.{ group.Xor(8), group.ZMod(0xffff_ffff_0000_0001), group.ZMod(97) }) |Gr| {
+            const D = DpfGroupWith(P, 6, Gr);
+            const s0: Seed = @splat(0x31);
+            const s1: Seed = @splat(0x7c);
+            for ([_]D.Index{ 0, 17, 63 }) |alpha| {
+                const beta: D.Elem = 42;
+                var keys: [2]D.Key = undefined;
+                D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
+                var e0: [D.domain_size]D.Elem = undefined;
+                var e1: [D.domain_size]D.Elem = undefined;
+                D.evalAll(0, &keys[0], &e0);
+                D.evalAll(1, &keys[1], &e1);
+                try std.testing.expectEqual(@as(?usize, null), D.firstMismatch(&e0, &e1, alpha, beta));
+                var f0: [D.domain_size]D.Elem = undefined;
+                D.evalFull(0, &keys[0], &f0);
+                try std.testing.expectEqualSlices(D.Elem, &e0, &f0);
+                var buf: [D.Key.serialized_len]u8 = undefined;
+                keys[1].toBytes(&buf);
+                var back: D.Key = undefined;
+                D.Key.fromBytes(&back, &buf);
+                try std.testing.expectEqualDeep(keys[1], back);
+            }
+        }
+    }
+    // Z2k through DpfGroupWith is DpfWith, byte for byte.
+    try std.testing.expect(DpfWith(prg_mod.Sha256Prg, 5, 4) == DpfGroupWith(prg_mod.Sha256Prg, 5, group.Z2k(4)));
 }

@@ -26,6 +26,13 @@ pub fn Z2k(comptime L: usize) type {
         /// so ordinary `+%`/`-%` already reduce mod 2^{8L}.
         pub const Int = @Int(.unsigned, 8 * L);
 
+        pub const Elem = Int;
+
+        /// A PRG seed's element: `convert`'s `8L` uniform bits.
+        pub fn fromPrg(p: anytype, seed: [16]u8) Int {
+            return p.convert(L, seed);
+        }
+
         /// group addition (mod 2^{8L})
         pub fn add(a: Int, b: Int) Int {
             return a +% b;
@@ -51,6 +58,78 @@ pub fn Z2k(comptime L: usize) type {
         /// decode a group element from its little-endian encoding
         pub fn fromBytes(b: [L]u8) Int {
             return std.mem.readInt(Int, &b, .little);
+        }
+    };
+}
+
+/// The XOR group `({0,1}^{8L}, ⊕)`: `add == sub == ⊕`, `neg` the identity.
+/// With it the two DPF shares reconstruct by XOR (PIR-by-XOR: a server's
+/// answer is the XOR of the records its share selects).
+pub fn Xor(comptime L: usize) type {
+    if (L == 0) @compileError("Xor: L must be > 0");
+    return struct {
+        pub const byte_len = L;
+        pub const Int = @Int(.unsigned, 8 * L);
+        pub const Elem = Int;
+
+        pub fn fromPrg(p: anytype, seed: [16]u8) Int {
+            return p.convert(L, seed);
+        }
+        pub fn add(a: Int, b: Int) Int {
+            return a ^ b;
+        }
+        pub fn sub(a: Int, b: Int) Int {
+            return a ^ b;
+        }
+        pub fn neg(a: Int) Int {
+            return a;
+        }
+    };
+}
+
+/// The additive group `Z_N` for a modulus `2 ≤ N ≤ 2^64` (a prime field's
+/// additive group for a prime `N`, e.g. a VDAF field), elements `u64` in
+/// `[0, N)`, 8 bytes on the wire. `fromPrg` reduces 192 PRG bits mod `N`
+/// (statistical distance from uniform `< 2^-128`), bit-serially. `add`/`sub`/`neg` reduce
+/// with a mask, never a branch on an element.
+pub fn ZMod(comptime N: u65) type {
+    if (N < 2 or N > (1 << 64)) @compileError("ZMod: N must be in 2..2^64");
+    return struct {
+        pub const byte_len = 8;
+        pub const modulus = N;
+        pub const Elem = u64;
+
+        pub fn fromPrg(p: anytype, seed: [16]u8) u64 {
+            const wide: u192 = p.convert(24, seed);
+            // Bit-serial reduction with a masked subtract: a `%` on a 192-bit
+            // value is a library division whose time depends on its operands,
+            // and the PRG output is secret.
+            var r: u66 = 0;
+            var i: usize = 192;
+            while (i > 0) {
+                i -= 1;
+                r = (r << 1) | @as(u66, @as(u1, @truncate(wide >> @intCast(i))));
+                const d: u66 = r -% N;
+                const keep_r: u66 = 0 -% (d >> 65); // borrow ⇒ r < N
+                r = (r & keep_r) | (d & ~keep_r);
+            }
+            return @intCast(r);
+        }
+        /// `a + b mod N` for canonical `a, b`.
+        pub fn add(a: u64, b: u64) u64 {
+            const s: u65 = @as(u65, a) + b;
+            const r: u65 = s -% N;
+            // r's top bit set (borrow) iff s < N: keep s, else r.
+            const keep_s: u65 = 0 -% (r >> 64);
+            return @truncate((s & keep_s) | (r & ~keep_s));
+        }
+        pub fn neg(a: u64) u64 {
+            const r: u65 = @as(u65, N) - a; // in (0, N]
+            const is_n: u65 = 0 -% @as(u65, @intFromBool(r == N));
+            return @truncate(r & ~is_n);
+        }
+        pub fn sub(a: u64, b: u64) u64 {
+            return add(a, neg(b));
         }
     };
 }
@@ -83,5 +162,37 @@ test "Z2k works at multiple widths" {
         const G = Z2k(L);
         try std.testing.expectEqual(@as(usize, L), G.byte_len);
         try std.testing.expectEqual(@as(G.Int, 0), G.add(G.neg(3), 3));
+    }
+}
+
+test "Xor and ZMod obey the group law" {
+    const X = Xor(4);
+    try std.testing.expectEqual(@as(X.Int, 0), X.add(0xabcd, 0xabcd));
+    try std.testing.expectEqual(@as(X.Int, 0x1234), X.neg(0x1234));
+    const P = ZMod(0xffff_ffff_0000_0001); // the Goldilocks prime
+    const Z7 = ZMod(7);
+    for (0..7) |a| for (0..7) |b| {
+        try std.testing.expectEqual(@as(u64, (a + b) % 7), Z7.add(a, b));
+        try std.testing.expectEqual(@as(u64, (a + 7 - b) % 7), Z7.sub(a, b));
+    };
+    try std.testing.expectEqual(@as(u64, 0), Z7.neg(0));
+    const big: u64 = 0xffff_ffff_0000_0000;
+    try std.testing.expectEqual(@as(u64, big - 1), P.add(big, big));
+    try std.testing.expectEqual(@as(u64, 0), P.add(big, P.neg(big)));
+    const Full = ZMod(1 << 64);
+    try std.testing.expectEqual(@as(u64, 1), Full.add(std.math.maxInt(u64), 2));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), Full.neg(1));
+}
+
+test "ZMod.fromPrg equals the 192-bit value mod N" {
+    const prg = @import("prg.zig");
+    const p = prg.Sha256Prg.init();
+    inline for (.{ 7, 0xffff_ffff_0000_0001, 1 << 64, 3 }) |N| {
+        const Z = ZMod(N);
+        for (0..20) |i| {
+            const seed: [16]u8 = @splat(@intCast(i * 13));
+            const wide: u192 = p.convert(24, seed);
+            try std.testing.expectEqual(@as(u64, @intCast(wide % N)), Z.fromPrg(p, seed));
+        }
     }
 }
