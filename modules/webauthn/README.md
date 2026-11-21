@@ -8,7 +8,7 @@ primitives — `p256` (ES256), `p384` (ES384), `p521` (ES512), `std.crypto.sign.
 CBOR/COSE — not a new crypto implementation.
 
 **Status: assertion verify complete (ES256/ES384/ES512/EdDSA/RS256). Attestation verify
-complete for `none`/`packed`/`fido-u2f`/`apple`/`tpm`; `android-key` is implemented but blocked on `x509.safe`.** See `SPEC.md`
+complete for `none`/`packed`/`fido-u2f`/`apple`/`tpm`/`android-key`.** See `SPEC.md`
 for the full threat model and *Backlog / deferred*.
 
 **Deps:** `cbor` (CBOR/COSE), `rsa`, `p256`, `p384`, `p521`, `x509` (certificate parsing through
