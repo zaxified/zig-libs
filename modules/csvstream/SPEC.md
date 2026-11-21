@@ -229,7 +229,8 @@ submodule's tests run under a bare re-export.
   line, `skipinitialspace`, null results, tie order, the sniffed dialect read back, `hasHeader` cases).
 - **Fuzz** (`CSVSTREAM_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver; `src/fuzz_test.zig`). Harnesses
   `csvstream-line` (the record iterator), `csvstream-split` (`splitFields`) and `csvstream-dialect` (the dialect
-  options, with the event-jumping scanner checked against a bytewise reference); reach labels are asserted in every
+  options, with the event-jumping scanner checked against a bytewise reference) and `csvstream-sniff` (`sniff` and
+  `hasHeader` over a small CSV alphabet; 100,000 runs clean); reach labels are asserted in every
   test run.
 - **Constant time:** n/a — CSV parsing of cooperative input, no secret.
 - **Bench:** `zig build bench-csvstream` (`tools/bench.zig`, with `tools/go_bench` for the Go side).

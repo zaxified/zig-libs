@@ -14,8 +14,9 @@ const testing = std.testing;
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const line = @import("line.zig");
+const sniff = @import("sniff.zig");
 
-pub const Label = enum { records, unbalanced, fields, strict_refused, escaped, trimmed, comment_skipped, spanned, fallback };
+pub const Label = enum { records, unbalanced, fields, strict_refused, escaped, trimmed, comment_skipped, spanned, fallback, sniffed, sniff_none, header_found };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -229,11 +230,31 @@ fn sameFields(x: []const []const u8, y: []const []const u8) bool {
     return true;
 }
 
+/// `sniff` and `hasHeader` over text drawn from a small CSV alphabet: no panic, a delimiter from
+/// the candidate set, and the sniffed dialect usable by `hasHeader`.
+pub fn sniffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var raw: [384]u8 = undefined;
+    const len: usize = src.slice(&raw);
+    const alphabet = ",;\t|\"'\n\nab1 .-";
+    for (raw[0..len]) |*b| b.* = alphabet[b.* % alphabet.len];
+    const text = raw[0..len];
+    for ([_]sniff.SniffOptions{ .{}, .{ .delimiters = ",;\t|: '\"ab1" }, .{ .min_consistency = 0.5, .max_lines = 3 } }) |o| {
+        if (sniff.sniff(text, o)) |d| {
+            mark(.sniffed);
+            try testing.expect(std.mem.indexOfScalar(u8, o.delimiters, d.delimiter) != null);
+            if (try sniff.hasHeader(arena.allocator(), text, d)) mark(.header_found);
+        } else mark(.sniff_none);
+    }
+}
+
 test "fuzz driver: CSVSTREAM_FUZZ" {
     try fuzz_driver.runAll(.{
         .{ lineHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-line" } },
         .{ splitHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-split" } },
         .{ dialectHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-dialect" } },
+        .{ sniffHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-sniff" } },
     });
 }
 
@@ -252,6 +273,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         dialectHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("csvstream dialect seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        sniffHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("csvstream sniff seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }
