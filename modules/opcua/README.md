@@ -249,7 +249,7 @@ Each a `Bad…` status rather than a silent partial answer: security policies ot
 (`Basic128Rsa15`, `Basic256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), `X509IdentityToken`/`IssuedIdentityToken`,
 a trust store and certificate revocation (no CRL/OCSP — fold that into your `certificate_policy`),
 `ApplicationUri`-vs-SAN matching, deadband/event filters and events, HistoryRead, node management, PubSub, and the full
-standard NodeSet. `IndexRange` is applied on Read and Write but ignored on monitored items. What is deliberately refused
+standard NodeSet. `IndexRange` is applied on Read, Write and monitored items. What is deliberately refused
 is in SPEC.md *What is deliberately not done*; what is wanted and open is in *Backlog / deferred*.
 
 ## Verification

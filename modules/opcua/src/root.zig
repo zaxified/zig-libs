@@ -2292,8 +2292,65 @@ test "Subscription offline flow: CreateSubscription -> CreateMonitoredItems -> P
 // see the module's part-3 implementation report for whether this actually
 // ran in a given environment.
 
-const live_container_name = "opcua-zig-libs-live-test";
-const live_endpoint_url = "opc.tcp://127.0.0.1:4840/";
+const live_container_base = "opcua-zig-libs-live-test";
+const live_subs_container_base = "opcua-zig-libs-live-test-subs";
+const live_secure_container_base = "opcua-zig-libs-live-test-secure";
+
+/// One live run's identity: a container name unique to the process and port,
+/// and an ephemeral host port the container's 4840 is published on, so two test
+/// runs at once (two worktrees, a test run next to a mutation run) never share a
+/// name or a port. The fixed name and `--network host` used to make them
+/// collide.
+const LiveRun = struct {
+    name_buf: [112]u8 = undefined,
+    name_len: usize = 0,
+    port: u16 = 0,
+    publish_buf: [32]u8 = undefined,
+    publish_len: usize = 0,
+    url_buf: [48]u8 = undefined,
+    url_len: usize = 0,
+
+    /// Picks a free loopback port (bind to port 0, read it back, release it).
+    fn init(io: std.Io, base: []const u8) !LiveRun {
+        var r: LiveRun = .{};
+        const any = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+        var listener = try any.listen(io, .{ .reuse_address = true });
+        r.port = listener.socket.address.getPort();
+        listener.socket.close(io);
+        r.name_len = (try std.fmt.bufPrint(&r.name_buf, "{s}-{d}-{d}", .{ base, std.os.linux.getpid(), r.port })).len;
+        r.publish_len = (try std.fmt.bufPrint(&r.publish_buf, "127.0.0.1:{d}:4840", .{r.port})).len;
+        r.url_len = (try std.fmt.bufPrint(&r.url_buf, "opc.tcp://127.0.0.1:{d}/", .{r.port})).len;
+        return r;
+    }
+
+    fn name(r: *const LiveRun) []const u8 {
+        return r.name_buf[0..r.name_len];
+    }
+
+    fn publish(r: *const LiveRun) []const u8 {
+        return r.publish_buf[0..r.publish_len];
+    }
+
+    fn url(r: *const LiveRun) []const u8 {
+        return r.url_buf[0..r.url_len];
+    }
+};
+
+/// True once the container's log says the TCP layer listens. A published port
+/// accepts connections before the server inside is up, so a connect is no
+/// readiness signal any more; the log is.
+fn waitListening(gpa: std.mem.Allocator, io: std.Io, name: []const u8) bool {
+    var attempt: usize = 0;
+    while (attempt < 60) : (attempt += 1) {
+        if (runPodman(gpa, io, &.{ "logs", name })) |res| {
+            defer res.deinit(gpa);
+            if (std.mem.indexOf(u8, res.stdout, "listening") != null or
+                std.mem.indexOf(u8, res.stderr, "listening") != null) return true;
+        } else |_| {}
+        sleepMs(250);
+    }
+    return false;
+}
 
 const PodmanResult = struct {
     exit_code: ?u8,
@@ -2361,10 +2418,6 @@ fn stopContainer(gpa: std.mem.Allocator, io: std.Io, name: []const u8) void {
     result.deinit(gpa);
 }
 
-fn stopLiveContainer(gpa: std.mem.Allocator, io: std.Io) void {
-    stopContainer(gpa, io, live_container_name);
-}
-
 test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateSession -> Read/Browse/Write/Call -> close" {
     const testing = std.testing;
     const gpa = testing.allocator;
@@ -2373,12 +2426,14 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Leftover cleanup from a previous crashed run, best-effort.
-    stopLiveContainer(gpa, io);
+    const run = try LiveRun.init(io, live_container_base);
+    // A container of the same name (the same process and port) cannot exist
+    // unless this process left it; best-effort.
+    stopContainer(gpa, io, run.name());
 
     var run_result = runPodman(gpa, io, &.{
-        "run",    "--rm",              "-d", "--network", "host",
-        "--name", live_container_name,
+        "run",    "--rm",     "-d", "-p", run.publish(),
+        "--name", run.name(),
         "--pull=never", // fail fast (not "hang pulling") if the image is missing
         "docker.io/open62541/open62541:latest",
     }) catch |err| switch (err) {
@@ -2396,19 +2451,23 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         );
         return error.SkipZigTest;
     }
-    defer stopLiveContainer(gpa, io);
+    defer stopContainer(gpa, io, run.name());
 
-    // Poll for the server's opc.tcp listener to come up (container start is
+    // Wait for the server's opc.tcp listener to come up (container start is
     // asynchronous; the demo server takes a moment to initialize its address
     // space before `TCP network layer listening` — observed ~0.2-1s locally).
+    if (!waitListening(gpa, io, run.name())) {
+        if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: the server did not report listening within 15s.\n", .{});
+        return error.SkipZigTest;
+    }
     var stream: std.Io.net.Stream = blk: {
         var attempt: usize = 0;
         while (attempt < 60) : (attempt += 1) {
-            const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+            const addr = std.Io.net.IpAddress.parse("127.0.0.1", run.port) catch unreachable;
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             sleepMs(250);
         }
-        if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: could not connect to the published port within 15s.\n", .{});
         return error.SkipZigTest;
     };
     defer stream.close(io);
@@ -2424,7 +2483,7 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         .send_buffer_size = 65536,
         .max_message_size = 0,
         .max_chunk_count = 0,
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
 
     var ch: SecureChannel = undefined;
@@ -2441,7 +2500,7 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
             .discovery_profile_uri = null,
             .discovery_urls = null,
         },
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
     defer session.deinit();
     try session.activate(null);
@@ -2672,10 +2731,8 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
     try testing.expect(after_renew.value != null);
 }
 
-const live_subs_container_name = "opcua-zig-libs-live-test-subs";
-
 test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonitoredItems -> Publish -> DataChangeNotification -> ack -> DeleteSubscriptions" {
-    // A separate container (own name/port-independent-but-same-host-network,
+    // A separate container (own name and published port,
     // started/torn down within this test) rather than folding this into the
     // Read/Browse/Write/Call LIVE test above — keeps the two independently
     // rerunnable and keeps this test's failure blast radius from taking the
@@ -2687,11 +2744,12 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     defer threaded.deinit();
     const io = threaded.io();
 
-    stopContainer(gpa, io, live_subs_container_name); // leftover cleanup, best-effort
+    const run = try LiveRun.init(io, live_subs_container_base);
+    stopContainer(gpa, io, run.name()); // leftover cleanup, best-effort
 
     var run_result = runPodman(gpa, io, &.{
-        "run",    "--rm",                   "-d",           "--network",                            "host",
-        "--name", live_subs_container_name, "--pull=never", "docker.io/open62541/open62541:latest",
+        "run",    "--rm",     "-d",           "-p",                                   run.publish(),
+        "--name", run.name(), "--pull=never", "docker.io/open62541/open62541:latest",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
             if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: `podman` is not available in this environment.\n", .{});
@@ -2707,16 +2765,20 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
         );
         return error.SkipZigTest;
     }
-    defer stopContainer(gpa, io, live_subs_container_name);
+    defer stopContainer(gpa, io, run.name());
 
+    if (!waitListening(gpa, io, run.name())) {
+        if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: the server did not report listening within 15s.\n", .{});
+        return error.SkipZigTest;
+    }
     var stream: std.Io.net.Stream = blk: {
         var attempt: usize = 0;
         while (attempt < 60) : (attempt += 1) {
-            const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+            const addr = std.Io.net.IpAddress.parse("127.0.0.1", run.port) catch unreachable;
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             sleepMs(250);
         }
-        if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: could not connect to the published port within 15s.\n", .{});
         return error.SkipZigTest;
     };
     defer stream.close(io);
@@ -2732,7 +2794,7 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
         .send_buffer_size = 65536,
         .max_message_size = 0,
         .max_chunk_count = 0,
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
 
     var ch: SecureChannel = undefined;
@@ -2749,7 +2811,7 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
             .discovery_profile_uri = null,
             .discovery_urls = null,
         },
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
     defer session.deinit();
     try session.activate(null);
@@ -2854,8 +2916,6 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     try sub.delete();
 }
 
-const live_secure_container_name = "opcua-zig-libs-live-test-secure";
-
 /// A `Hasher`-shaped byte sink for `Reader.hashed`/`Writer.hashed`: instead of
 /// hashing, it appends every byte that streams through to an owned
 /// `ArrayList` — a zero-behavioral-effect tee (the bytes still flow to the
@@ -2937,10 +2997,11 @@ fn liveSecureSequence(
     server_certificate: []const u8,
     random: std.Random,
     capture_tag: []const u8,
+    run: *const LiveRun,
 ) !void {
     const testing = std.testing;
 
-    const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", run.port) catch unreachable;
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -2976,7 +3037,7 @@ fn liveSecureSequence(
         .send_buffer_size = 65536,
         .max_message_size = 0,
         .max_chunk_count = 0,
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
 
     var ch: SecureChannel = undefined;
@@ -3009,7 +3070,7 @@ fn liveSecureSequence(
             .discovery_profile_uri = null,
             .discovery_urls = null,
         },
-        .endpoint_url = live_endpoint_url,
+        .endpoint_url = run.url(),
     });
     defer session.deinit();
     try session.activate(null);
@@ -3044,11 +3105,12 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     defer threaded.deinit();
     const io = threaded.io();
 
-    stopContainer(gpa, io, live_secure_container_name); // leftover cleanup, best-effort
+    const run = try LiveRun.init(io, live_secure_container_base);
+    stopContainer(gpa, io, run.name()); // leftover cleanup, best-effort
 
     var run_result = runPodman(gpa, io, &.{
-        "run",                                  "--rm",                                         "-d",                                         "--network",
-        "host",                                 "--name",                                       live_secure_container_name,                   "--pull=never",
+        "run",                                  "--rm",                                         "-d",                                         "-p",
+        run.publish(),                          "--name",                                       run.name(),                                   "--pull=never",
         "docker.io/open62541/open62541:latest",
         // The image's CMD, minus its implicit empty trust list:
         "/opt/open62541/build/bin/examples/server_ctt", "/opt/open62541/pki/created/server_cert.der", "/opt/open62541/pki/created/server_key.der",
@@ -3068,19 +3130,23 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
         );
         return error.SkipZigTest;
     }
-    defer stopContainer(gpa, io, live_secure_container_name);
+    defer stopContainer(gpa, io, run.name());
 
+    if (!waitListening(gpa, io, run.name())) {
+        if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: the server did not report listening within 15s.\n", .{});
+        return error.SkipZigTest;
+    }
     // Wait for the listener, then close the probe connection — the secure
     // sequences below open their own.
     {
         var probe: std.Io.net.Stream = blk: {
             var attempt: usize = 0;
             while (attempt < 60) : (attempt += 1) {
-                const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+                const addr = std.Io.net.IpAddress.parse("127.0.0.1", run.port) catch unreachable;
                 if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
                 sleepMs(250);
             }
-            if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not connect to the published port within 15s.\n", .{});
             return error.SkipZigTest;
         };
         probe.close(io);
@@ -3088,7 +3154,7 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
 
     // Pin the server's certificate straight out of the running container.
     var cert_result = try runPodman(gpa, io, &.{
-        "exec", live_secure_container_name, "cat", "/opt/open62541/pki/created/server_cert.der",
+        "exec", run.name(), "cat", "/opt/open62541/pki/created/server_cert.der",
     });
     defer cert_result.deinit(gpa);
     if (cert_result.exit_code != 0 or cert_result.stdout.len == 0) {
@@ -3129,10 +3195,12 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_cert_path, .data = credentials.certificate_der });
     defer std.Io.Dir.cwd().deleteFile(io, host_cert_path) catch {};
     {
-        var mkdir_result = try runPodman(gpa, io, &.{ "exec", live_secure_container_name, "mkdir", "-p", "/trust" });
+        var mkdir_result = try runPodman(gpa, io, &.{ "exec", run.name(), "mkdir", "-p", "/trust" });
         defer mkdir_result.deinit(gpa);
         if (mkdir_result.exit_code != 0) return error.SkipZigTest;
-        var cp_result = try runPodman(gpa, io, &.{ "cp", host_cert_path, live_secure_container_name ++ ":/trust/client_cert.der" });
+        var cp_buf: [160]u8 = undefined;
+        const cp_target = try std.fmt.bufPrint(&cp_buf, "{s}:/trust/client_cert.der", .{run.name()});
+        var cp_result = try runPodman(gpa, io, &.{ "cp", host_cert_path, cp_target });
         defer cp_result.deinit(gpa);
         if (cp_result.exit_code != 0) {
             if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman cp` into the container failed.\nstderr: {s}\n", .{cp_result.stderr});
@@ -3143,8 +3211,8 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     // SignAndEncrypt is the headline mode; Sign proves the
     // signature-only symmetric framing (no padding, no encryption) against
     // the same server.
-    try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign_and_encrypt");
-    try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign");
+    try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign_and_encrypt", &run);
+    try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign", &run);
 }
 
 // ── scripted peers for the client bookkeeping that a real server never exercises ──

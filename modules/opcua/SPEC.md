@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [locka99/opcua](https://github.com/locka99/opcua) / [FreeOpcUa/async-opcua](https://github.com/FreeOpcUa/async-opcua) | Rust | MPL-2.0 | 575 / 154 | push 2025-04-08 / 2026-09-09 | The Rust options (the first stale, the second its async successor *(inferred)*). Not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos opcua --language=zig` found nothing. |
 
-**Where we are ahead:** the only Zig OPC UA, client and server, allocation-disciplined and I/O-free (byte-in/byte-out server state machine, caller-driven clock) and MIT where the C/Rust references are MPL and the Python one LGPL; secured server (`Basic256Sha256` Sign/SignAndEncrypt) verified against open62541 binaries and asyncua. **Where we are behind:** events/alarms and monitored-item filters, HistoryRead, NumericRange on monitored items, node management, newer security policies (`Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), X509/Issued identity tokens, PKI trust store, full standard NodeSet, PubSub (→ Backlog items).
+**Where we are ahead:** the only Zig OPC UA, client and server, allocation-disciplined and I/O-free (byte-in/byte-out server state machine, caller-driven clock) and MIT where the C/Rust references are MPL and the Python one LGPL; secured server (`Basic256Sha256` Sign/SignAndEncrypt) verified against open62541 binaries and asyncua. **Where we are behind:** events/alarms and monitored-item filters, HistoryRead, node management, newer security policies (`Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), X509/Issued identity tokens, PKI trust store, full standard NodeSet, PubSub (→ Backlog items).
 
 ## Design & invariants
 
@@ -152,7 +152,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     copy and swapped in, so every refusal leaves the stored value untouched. Writing into the bytes of String elements
     (one more dimension than the array): one String per selected element, each exactly as wide as the byte range; every
     selected element must contain the range (`NoData`); counts and widths are checked (`DataMismatch`).
-  - *Limits:* monitored items ignore `IndexRange` (Backlog); a range with more than 16 dimensions is refused.
+  - *Monitored items:* the `IndexRange` of `ItemToMonitor` is parsed at `CreateMonitoredItems` (bad syntax is
+    `BadIndexRangeInvalid` for that item) and kept with the item. The initial value and every sample are narrowed by the same code
+    as Read, so only the selected part is compared (a change outside the range queues nothing) and reported; a
+    range that selects nothing (the array shrank, a non-Value attribute) is sampled as a status-only `BadIndexRangeNoData`
+    value, reported once and again when data returns. The range cannot be changed by `ModifyMonitoredItems` (it
+    belongs to the monitored target). Behaviour as Read; the spec does not say what a monitored item does when the range
+    selects nothing, open62541 and node-opcua report the Bad status as a value.
+  - *Limits:* a range with more than 16 dimensions is refused.
 
 
 ## Threat model
@@ -327,7 +334,12 @@ whether a state machine in `root` (client) or `server` (server) uses it.
 ## Verification
 
 Run `scripts/modtest opcua` (add `-Doptimize=ReleaseFast` for the optimised-build probes). The LIVE tests need a
-container runtime (`podman`) and skip loudly when it or the port is unavailable.
+container runtime (`podman`) and skip loudly when it or the port is unavailable. The tests of our client against an
+open62541 *server* publish the container's 4840 on an ephemeral loopback port, under a container name made of the
+process id and that port, so two runs at once do not share either; readiness is the server's own "listening" log line (a
+published port accepts connections before the server is up). The tests of open62541's *clients* against our server
+keep the port 4840 (the image's example clients dial it without arguments) and a process-unique container name: a second
+run at once finds the port taken and skips loudly instead of failing.
 
 - **Offline:** RFC/spec-shaped round-trips for every built-in type, transport framing, secure-channel KATs,
   address-space unit tests, and an end-to-end suite that drives the *server* with the module's own *client* encoder
@@ -360,7 +372,7 @@ container runtime (`podman`) and skip loudly when it or the port is unavailable.
   - *their client -> our server:* open62541's stock `tutorial_client_firststeps`, `client_subscription_loop`, `client`
     (GetEndpoints on its own connection, username login, Browse, Read/Write of a String NodeId, subscription, method
     Call) and `client_encryption` (picks our SignAndEncrypt endpoint out of `GetEndpoints` itself), run from
-    `docker.io/open62541/open62541` with `--network host`; their stdout is the assertion;
+    `docker.io/open62541/open62541` with `--network host` (process-unique container names); their stdout is the assertion;
   - *our client -> their server:* a real `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt, client-side
     renewal, `translateBrowsePaths`, `modifyMonitoredItems`, `setMonitoringMode`, and ranged reads/writes of its Demo
     Int32 scalar, `Int32[10]` and `Int32[3][3]` (one table compared as a whole; the lines marked KNOWN DIFFERENCE are
@@ -460,9 +472,7 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 
 ## Backlog / deferred
 
-- **LIVE fixture is not safe to run twice at once.** The open62541 LIVE tests start a container with a fixed name (`opcua-zig-libs-live-test`) on the fixed port 4840, so two test runs in parallel (two worktrees, or a test run next to a mutation run) break each other with spurious failures and extra skips, and a crashed run leaves a stale container behind. Next: a per-run container name and an ephemeral host port passed to the tests, and removal of a stale container of the same run at start.
 - **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
-- **NumericRange on monitored items:** the `IndexRange` of a `MonitoredItemCreateRequest`'s `ItemToMonitor` is ignored (the whole value is sampled and reported); Read and Write apply it.
 - **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`** (survey): `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
 - **Monitored-item filters (deadband) and events/alarms & conditions** (survey): nearly every open62541/node-opcua user subscribes with a deadband; events are the next request; medium (deadband) to large (A&C), fits §2.
 - **HistoryRead** (survey): needed for historian access; medium, fits §2 (the store is caller-supplied).

@@ -486,6 +486,10 @@ pub const MonitoredItem = struct {
     discard_oldest: bool,
     timestamps_to_return: services.TimestampsToReturn,
     next_sample_ms: i64,
+    /// The `IndexRange` of the monitored item's target (§7.27): only the
+    /// selected part of an array/string Value is sampled, compared and
+    /// reported. Null: the whole value.
+    range: ?numeric_range.Range = null,
     /// The last sampled value — the data-change comparison baseline. Owned.
     last_value: ?encoding.DataValue = null,
     /// Values sampled since the last publish, oldest first. Owned.
@@ -2344,15 +2348,31 @@ pub const Connection = struct {
             // A Bad read (unknown node, not readable, ...) is the answer as it
             // is; a range on any attribute but Value has no data to select.
             if (dv.status) |sc| if (sc & 0x8000_0000 != 0) return dv;
-            if (rv.attribute_id != services.attribute_id.value) return .{ .status = status.bad_index_range_no_data };
-            const whole = dv.value orelse return .{ .status = status.bad_index_range_no_data };
-            dv.value = numeric_range.readRange(ctx.arena, whole, r) catch |err| return .{ .status = switch (err) {
-                error.IndexRangeInvalid => status.bad_index_range_invalid,
-                error.IndexRangeNoData => status.bad_index_range_no_data,
-                error.OutOfMemory => status.bad_out_of_memory,
-            } };
+            switch (selectRange(ctx.arena, dv, rv.attribute_id, r)) {
+                .ok => |sel| dv = sel,
+                .bad => |sc| return .{ .status = sc },
+            }
         }
         return applyTimestamps(dv, ttr, ctx.srv.dateTime(ctx.now_ms));
+    }
+
+    /// The part of a read `dv` a NumericRange selects: the value narrowed
+    /// (allocated from `arena`), or the Bad status a Read answers with.
+    fn selectRange(
+        arena: std.mem.Allocator,
+        dv: encoding.DataValue,
+        attribute_id: u32,
+        r: *const numeric_range.Range,
+    ) union(enum) { ok: encoding.DataValue, bad: encoding.StatusCode } {
+        if (attribute_id != services.attribute_id.value) return .{ .bad = status.bad_index_range_no_data };
+        const whole = dv.value orelse return .{ .bad = status.bad_index_range_no_data };
+        var out = dv;
+        out.value = numeric_range.readRange(arena, whole, r) catch |err| return .{ .bad = switch (err) {
+            error.IndexRangeInvalid => status.bad_index_range_invalid,
+            error.IndexRangeNoData => status.bad_index_range_no_data,
+            error.OutOfMemory => status.bad_out_of_memory,
+        } };
+        return .{ .ok = out };
     }
 
     /// Trim/fill the timestamps a `DataValue` leaves the server with
@@ -3002,6 +3022,14 @@ pub const Connection = struct {
                 return result;
             }
         }
+        // NumericRange (§7.27) of the target: syntax first, like Read.
+        var range: ?numeric_range.Range = null;
+        if (target.index_range) |text| {
+            if (text.len != 0) range = numeric_range.parse(text) catch {
+                result.status_code = status.bad_index_range_invalid;
+                return result;
+            };
+        }
         // Only the "no filter" case is implemented — an event/deadband filter
         // is rejected rather than silently ignored (which would hand the
         // client values it did not ask for).
@@ -3023,6 +3051,7 @@ pub const Connection = struct {
             .discard_oldest = spec.requested_parameters.discard_oldest,
             .timestamps_to_return = ttr,
             .next_sample_ms = ctx.now_ms + @as(i64, @intFromFloat(sampling)),
+            .range = range,
         };
         errdefer item.deinit(ctx.srv.allocator);
         ctx.srv.next_monitored_item_id +%= 1;
@@ -3031,7 +3060,8 @@ pub const Connection = struct {
         // §5.12.1.2: the initial value is reported as soon as the item is
         // created — every real client (open62541 included) expects it.
         if (item.monitoring_mode != .disabled) {
-            const initial = applyTimestamps(probe, item.timestamps_to_return, ctx.srv.dateTime(ctx.now_ms));
+            const narrowed = if (item.range) |*r| sampleNarrowed(ctx.arena, probe, item.attribute_id, r) else probe;
+            const initial = applyTimestamps(narrowed, item.timestamps_to_return, ctx.srv.dateTime(ctx.now_ms));
             try item.queue.append(ctx.srv.allocator, try nodestore.dupDataValue(ctx.srv.allocator, initial));
             item.last_value = try nodestore.dupDataValue(ctx.srv.allocator, initial);
         }
@@ -3041,6 +3071,23 @@ pub const Connection = struct {
         result.revised_sampling_interval = sampling;
         result.revised_queue_size = queue_size;
         return result;
+    }
+
+    /// A sample narrowed to the item's range. A Bad read stays as it is; a
+    /// range that selects nothing (the array shrank, the attribute is not
+    /// Value, ...) becomes a status-only value, so the client is told once the
+    /// state changes in either direction.
+    fn sampleNarrowed(
+        arena: std.mem.Allocator,
+        raw: encoding.DataValue,
+        attribute_id: u32,
+        r: *const numeric_range.Range,
+    ) encoding.DataValue {
+        if (raw.status) |sc| if (sc & 0x8000_0000 != 0) return raw;
+        return switch (selectRange(arena, raw, attribute_id, r)) {
+            .ok => |v| v,
+            .bad => |sc| .{ .status = sc },
+        };
     }
 
     fn reviseSampling(cfg: Config, sub: *const Subscription, requested: f64) f64 {
@@ -3314,7 +3361,11 @@ pub const Connection = struct {
             if (item.next_sample_ms <= now_ms) item.next_sample_ms = now_ms + step;
 
             const raw = srv.store.readAttribute(item.node_id, item.attribute_id);
-            const dv = applyTimestamps(raw, item.timestamps_to_return, srv.dateTime(now_ms));
+            // The narrowed value lives in a scratch arena until it is duplicated below.
+            var scratch = std.heap.ArenaAllocator.init(srv.allocator);
+            defer scratch.deinit();
+            const narrowed = if (item.range) |*r| sampleNarrowed(scratch.allocator(), raw, item.attribute_id, r) else raw;
+            const dv = applyTimestamps(narrowed, item.timestamps_to_return, srv.dateTime(now_ms));
             const changed = if (item.last_value) |last| nodestore.dataValueChanged(last, dv) else true;
             if (!changed) continue;
 
@@ -11425,4 +11476,88 @@ test "NumericRange: write precedence (object value, user access, empty value) an
     try testing.expectEqual(status.bad_index_range_no_data, r.results.?[2].status.?);
     try testing.expectEqual(status.bad_index_range_no_data, r.results.?[3].status.?);
     try testing.expectEqual(@as(u32, 3), r.results.?[4].value.?.array.items.uint32.?[0]);
+}
+
+test "monitored item: IndexRange selects what is sampled, compared and reported (§7.27)" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const arr_id: encoding.NodeId = .{ .string = .{ .namespace = rig.answer_id.string.namespace, .id = "the.array" } };
+    var first_values = [_]i32{ 10, 20, 30, 40, 50 };
+    try rig.store.addVariable(.{
+        .node_id = arr_id,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = arr_id.string.namespace, .name = "the.array" },
+        .value = .{ .array = .{ .items = .{ .int32 = &first_values } } },
+        .data_type = nodestore.n0(nodestore.id.int32),
+        .access_level = nodestore.access_level.read_write,
+    });
+    const created = try newSub(&rig, 100, 3, 30, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const val = services.attribute_id.value;
+    var items = [_]services.MonitoredItemCreateRequest{
+        mkItem(arr_id, val, 1, .reporting, -1, 10, true),
+        mkItem(arr_id, val, 2, .reporting, -1, 10, true),
+        mkItem(arr_id, val, 3, .reporting, -1, 10, true),
+        mkItem(arr_id, val, 4, .reporting, -1, 10, true),
+        mkItem(arr_id, services.attribute_id.browse_name, 5, .reporting, -1, 10, true),
+    };
+    items[0].item_to_monitor.index_range = "1:2";
+    items[1].item_to_monitor.index_range = "";
+    items[2].item_to_monitor.index_range = "7";
+    items[3].item_to_monitor.index_range = "2:1";
+    items[4].item_to_monitor.index_range = "0";
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .neither, &items);
+    defer services.freeCreateMonitoredItemsResponse(gpa, r);
+    // Bad syntax is refused at creation; a range past the array is accepted
+    // and reports its Bad status; a range on another attribute likewise.
+    try testing.expectEqual(status.good, r.results.?[0].status_code);
+    try testing.expectEqual(status.good, r.results.?[1].status_code);
+    try testing.expectEqual(status.good, r.results.?[2].status_code);
+    try testing.expectEqual(status.bad_index_range_invalid, r.results.?[3].status_code);
+    try testing.expectEqual(status.good, r.results.?[4].status_code);
+    const sub = mutSub(&rig, 0);
+    try testing.expectEqual(@as(usize, 4), sub.monitored_items.items.len);
+
+    const Probe = struct {
+        fn ints(item: *const MonitoredItem, at: usize) []const i32 {
+            return item.queue.items[at].value.?.array.items.int32.?;
+        }
+    };
+    const narrowed = &sub.monitored_items.items[0];
+    const whole = &sub.monitored_items.items[1];
+    const past = &sub.monitored_items.items[2];
+    const other = &sub.monitored_items.items[3];
+    try testing.expectEqualSlices(i32, &[_]i32{ 20, 30 }, Probe.ints(narrowed, 0));
+    try testing.expectEqualSlices(i32, &first_values, Probe.ints(whole, 0));
+    try testing.expectEqual(status.bad_index_range_no_data, past.queue.items[0].status.?);
+    try testing.expectEqual(status.bad_index_range_no_data, other.queue.items[0].status.?);
+
+    // A change outside the range queues nothing for the narrowed item; a
+    // change inside queues the narrowed value only.
+    var changed_outside = [_]i32{ 11, 20, 30, 40, 51 };
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .int32 = &changed_outside } } }, null);
+    try rig.tick(100);
+    try testing.expectEqual(@as(usize, 1), narrowed.queue.items.len);
+    try testing.expectEqual(@as(usize, 2), whole.queue.items.len);
+    var changed_inside = [_]i32{ 11, 21, 30, 40, 51 };
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .int32 = &changed_inside } } }, null);
+    try rig.tick(200);
+    try testing.expectEqual(@as(usize, 2), narrowed.queue.items.len);
+    try testing.expectEqualSlices(i32, &[_]i32{ 21, 30 }, Probe.ints(narrowed, 1));
+    // The array shrinks below the range: the item reports the Bad status once
+    // (a repeat of the same status is no change), and a value again afterwards.
+    var short = [_]i32{1};
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .int32 = &short } } }, null);
+    try rig.tick(300);
+    try testing.expectEqual(@as(usize, 3), narrowed.queue.items.len);
+    try testing.expectEqual(status.bad_index_range_no_data, narrowed.queue.items[2].status.?);
+    try rig.tick(400);
+    try testing.expectEqual(@as(usize, 3), narrowed.queue.items.len);
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .int32 = &changed_inside } } }, null);
+    try rig.tick(500);
+    try testing.expectEqual(@as(usize, 4), narrowed.queue.items.len);
+    try testing.expectEqualSlices(i32, &[_]i32{ 21, 30 }, Probe.ints(narrowed, 3));
 }

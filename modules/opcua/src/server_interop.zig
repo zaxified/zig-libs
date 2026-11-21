@@ -733,10 +733,17 @@ const LiveClient = struct {
 /// own — their container going away is the signal.
 const StopMarker = struct { text: []const u8, count: usize };
 
+/// `base` made unique to this process, so two test runs never address each
+/// other's containers. (The port 4840 the image's client examples dial stays
+/// fixed: a second run's bind fails and skips loudly instead.)
+fn processUniqueName(buf: []u8, base: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}-{d}", .{ base, std.os.linux.getpid() }) catch base;
+}
+
 fn runLiveClient(
     gpa: std.mem.Allocator,
     io: std.Io,
-    name: []const u8,
+    base_name: []const u8,
     example: []const u8,
     options: Driver.ServeOptions,
     stop_marker: ?StopMarker,
@@ -745,6 +752,8 @@ fn runLiveClient(
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE opcua server interop needs Linux (podman --network host).\n", .{});
         return error.SkipZigTest;
     }
+    var name_buf: [96]u8 = undefined;
+    const name = processUniqueName(&name_buf, base_name);
     stopContainer(gpa, io, name); // leftover cleanup from a crashed run
 
     var driver: Driver = undefined;
@@ -1931,7 +1940,8 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
     defer threaded.deinit();
     const io = threaded.io();
 
-    const name = "opcua-zig-libs-server-encryption";
+    var name_buf: [96]u8 = undefined;
+    const name = processUniqueName(&name_buf, "opcua-zig-libs-server-encryption");
     stopContainer(gpa, io, name); // leftover cleanup from a crashed run
 
     if (!makeO62ClientPki(gpa, io)) {
