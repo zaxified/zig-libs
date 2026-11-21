@@ -5717,6 +5717,11 @@ pub const CompressOptions = struct {
     /// fixed, as with `mode`), in place of `mode`'s; at `.q11` the search for the cheapest
     /// pair starts from them. Null: the mode's, else 0 and 0.
     distance: ?DistanceParams = null,
+    /// Literal context modelling, from `.q6` up (google/brotli's inverse of
+    /// `BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING`): false writes every literal
+    /// with one code and no context map: faster to decode, a little larger on text
+    /// and much larger on font-like data. `.q0`, `.q1` and `.q4` have none either way.
+    literal_context_modeling: bool = true,
 
     pub const default_block_size = compressed_block_size;
 
@@ -5810,6 +5815,7 @@ fn compressStreamed(gpa: std.mem.Allocator, output: *std.Io.Writer, input: []con
         .prepared_dictionary = opts.prepared_dictionary,
         .mode = opts.mode,
         .distance = opts.distance,
+        .literal_context_modeling = opts.literal_context_modeling,
     });
     defer sw.deinit();
     sw.writer.writeAll(input) catch return sw.err orelse error.WriteFailed;
@@ -5837,6 +5843,36 @@ pub fn windowBits(n: usize, opts: CompressOptions) u5 {
 /// dictionary has a table of its own.)
 pub fn tableSize(input_len: usize, wbits: u5) usize {
     return @min(input_len, @as(usize, 1) << wbits);
+}
+
+/// An upper bound of the memory `compressWith` holds at its peak for `input_len` bytes, in bytes, without the
+/// input and the output (google/brotli's `BrotliEncoderEstimatePeakMemoryUsage`): the match finder's table
+/// (sized by the input, up to 2 MiB), the per-block command, cost and histogram arrays of
+/// the effort, the prefix codes. Fitted to what a counting allocator saw on random, text-like and
+/// run-heavy inputs of 0 to 2 MB at every effort and window (the test holds it as a bound there) and
+/// rounded up, so it is generous (within about 2x of the worst measured, more for tiny inputs); `Compressor`
+/// keeps its tables between calls, `parallel.compress` holds one such set per worker, a raw `dictionary` adds
+/// its `PreparedDictionary` (`PreparedDictionary.init` allocates for it) and `.q11` on inputs far beyond the window
+/// was not measured. `opts` as for `compressWith` (the window does not enter: tables were measured as large with a small window).
+pub fn estimatePeakMemory(opts_in: CompressOptions, input_len: usize) usize {
+    const opts = opts_in.sanitized();
+    // The tables and the per-block arrays follow the input up to 2 MiB whatever the window (measured with
+    // windows of 4 KiB up to 2 MiB); `.q9`'s table doubles in steps, hence its plateaus.
+    const n: u64 = @min(@as(u64, input_len), 2 << 20);
+    const k: u64 = 1 << 10;
+    const n1: u64 = @min(n, 70 * k);
+    const n2: u64 = @min(n, 1024 * k);
+    const q4: u64 = 220 * k + 20 * n1 + 4 * (n -| 70 * k);
+    const q9: u64 = if (n <= 300 * k) 300 * k + 62 * n else if (n <= 1024 * k) 20480 * k else 40960 * k;
+    const est: u64 = switch (opts.effort) {
+        .q0 => 256 * k + n / 2,
+        .q1 => 280 * k + 10 * n2 + 3 * (n -| 1024 * k) / 2,
+        .q4 => @min(q4, 5632 * k),
+        .q6 => 64 * k + 35 * n1 + 4 * (n -| 70 * k),
+        .q9 => q9,
+        .q11 => 1200 * k + 150 * n,
+    };
+    return std.math.cast(usize, est) orelse std.math.maxInt(usize);
 }
 
 pub const CompressIntoError = std.mem.Allocator.Error || error{
@@ -5971,6 +6007,7 @@ fn oneShot(core: *Core, input: []const u8, opts: CompressOptions) std.mem.Alloca
     core.size_hint = input.len;
     core.mode = opts.mode;
     core.distance = opts.distance;
+    core.literal_context_modeling = opts.literal_context_modeling;
     core.setData(input);
     try core.writeHeader();
     var off: usize = 0;
@@ -6029,6 +6066,8 @@ pub const Core = struct {
     mode: Mode = .generic,
     /// `CompressOptions.distance` / `StreamOptions.distance`.
     distance: ?DistanceParams = null,
+    /// `CompressOptions.literal_context_modeling` / `StreamOptions.literal_context_modeling`.
+    literal_context_modeling: bool = true,
     /// The prefix dictionary's length (`attachDictionary`), 0 without:
     /// static-dictionary words count past it, at every level.
     dict_len: usize = 0,
@@ -6486,7 +6525,7 @@ pub const Core = struct {
         if (!env.large_window) {
             env.dist = if (c.effort == .q11) chooseDistParams(c.cmds.items, c.ring, c.origDist()) else c.origDist();
         }
-        const first = (try tryBlock(c.tempAlloc(), dst, out, off, end, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
+        const first = (try tryBlock(c.tempAlloc(), dst, out, off, end, c.cmds.items, is_last, &trial, c.effort, !c.literal_context_modeling, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
         // keep whichever is really shorter (a flat, small alphabet is where

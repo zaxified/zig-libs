@@ -80,7 +80,11 @@ fn roundTrip(gpa: std.mem.Allocator, input: []const u8, opts: brotli.CompressOpt
 
 test "sweep: every effort over every shape at sizes around the tables' and blocks' limits" {
     const gpa = testing.allocator;
-    const sizes = [_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097, 9000 };
+    const all_sizes = [_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097, 9000 };
+    // An unoptimized build is ~5x slower (the whole sweep took minutes): there every power-of-two edge keeps
+    // one side (0, 1, 3, 8, 17, 64, 129, 256, 1025, 4096, 9000); the optimized lanes (CI) run all of them.
+    const quick_sizes = [_]usize{ 0, 1, 3, 8, 17, 64, 129, 256, 1025, 4096, 9000 };
+    const sizes: []const usize = if (@import("builtin").mode == .debug) &quick_sizes else &all_sizes;
     for (efforts) |effort| {
         for (0..11) |shape| {
             for (sizes, 0..) |n, i| {
@@ -191,4 +195,108 @@ test "DistanceParams: sanitized, round-trips, equals the font mode's pair, chang
         try sw.finish();
         try testing.expectEqualSlices(u8, one, out.written());
     }
+}
+
+test "literal_context_modeling = false: every effort round-trips, below .q6 nothing changes, from .q6 the literals take one code (never smaller on font-like data), a stream writes the one-shot bytes" {
+    const gpa = testing.allocator;
+    const input = try brotli.interop_corpus.fontLike(gpa, 40_000, 7);
+    defer gpa.free(input);
+    for (efforts) |effort| {
+        const on = try brotli.compressWith(gpa, input, .{ .effort = effort });
+        defer gpa.free(on);
+        const off = try brotli.compressWith(gpa, input, .{ .effort = effort, .literal_context_modeling = false });
+        defer gpa.free(off);
+        try roundTrip(gpa, input, .{ .effort = effort, .literal_context_modeling = false });
+        if (effort == .q0 or effort == .q1 or effort == .q4) {
+            try testing.expectEqualSlices(u8, on, off);
+        } else {
+            try testing.expect(off.len >= on.len);
+        }
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var sw = try brotli.StreamWriter.init(gpa, &out.writer, &.{}, .{ .effort = effort, .window_bits = 16, .size_hint = input.len, .literal_context_modeling = false });
+        defer sw.deinit();
+        try sw.writer.writeAll(input);
+        try sw.finish();
+        const one = try brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .literal_context_modeling = false });
+        defer gpa.free(one);
+        try testing.expectEqualSlices(u8, one, out.written());
+    }
+    // On font-like data context modelling pays at .q9 (the reason it is on by default).
+    const on9 = try brotli.compressWith(gpa, input, .{ .effort = .q9 });
+    defer gpa.free(on9);
+    const off9 = try brotli.compressWith(gpa, input, .{ .effort = .q9, .literal_context_modeling = false });
+    defer gpa.free(off9);
+    try testing.expect(off9.len > on9.len);
+}
+
+const Peak = struct {
+    backing: std.mem.Allocator,
+    cur: usize = 0,
+    peak: usize = 0,
+    fn allocator(w: *Peak) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn bump(w: *Peak, d: isize) void {
+        w.cur = @intCast(@as(isize, @intCast(w.cur)) + d);
+        w.peak = @max(w.peak, w.cur);
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *Peak = @ptrCast(@alignCast(ctx));
+        const p = w.backing.rawAlloc(len, al, ra) orelse return null;
+        w.bump(@intCast(len));
+        return p;
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const w: *Peak = @ptrCast(@alignCast(ctx));
+        if (!w.backing.rawResize(m, al, n, ra)) return false;
+        w.bump(@as(isize, @intCast(n)) - @as(isize, @intCast(m.len)));
+        return true;
+    }
+    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const w: *Peak = @ptrCast(@alignCast(ctx));
+        const p = w.backing.rawRemap(m, al, n, ra) orelse return null;
+        w.bump(@as(isize, @intCast(n)) - @as(isize, @intCast(m.len)));
+        return p;
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const w: *Peak = @ptrCast(@alignCast(ctx));
+        w.backing.rawFree(m, al, ra);
+        w.bump(-@as(isize, @intCast(m.len)));
+    }
+};
+
+test "estimatePeakMemory bounds what compressWith allocates at its peak (output included), on every effort, shape, window and size tried" {
+    const gpa = testing.allocator;
+    const debug = @import("builtin").mode == .debug;
+    const sizes = if (debug) [_]usize{ 0, 1, 1000, 20_000, 70_000, 150_000 } else [_]usize{ 0, 1, 1000, 20_000, 70_000, 150_000, 300_000, 600_000 };
+    for (sizes) |n| {
+        for ([_]u8{ 5, 7, 8 }) |shape| {
+            const input = try fill(gpa, shape, n, 1);
+            defer gpa.free(input);
+            for (efforts) |effort| {
+                for ([_]?u5{ null, 12, 16 }) |wb| {
+                    var pk: Peak = .{ .backing = gpa };
+                    const opts: brotli.CompressOptions = .{ .effort = effort, .window_bits = wb };
+                    const out = try brotli.compressWith(pk.allocator(), input, opts);
+                    pk.allocator().free(out);
+                    const est = brotli.estimatePeakMemory(opts, n);
+                    // The estimate leaves the input and the output out, as google's does.
+                    if (pk.peak > est + brotli.maxCompressedSize(n, opts)) {
+                        std.debug.print("UNDER n={d} shape={d} {s} wb={?d} peak={d} est={d}\n", .{ n, shape, @tagName(effort), wb, pk.peak, est });
+                        return error.EstimateTooLow;
+                    }
+                    // And is not a wild over-estimate: within 40x for a stream of any size here (tiny inputs pay the fixed parts).
+                    if (est > 40 * pk.peak + (1 << 20)) {
+                        std.debug.print("OVER n={d} shape={d} {s} wb={?d} peak={d} est={d}\n", .{ n, shape, @tagName(effort), wb, pk.peak, est });
+                        return error.EstimateTooHigh;
+                    }
+                }
+            }
+        }
+    }
+    // Monotone in the input length and the effort's cost class, and finite for the largest window.
+    try testing.expect(brotli.estimatePeakMemory(.{ .effort = .q11 }, 1 << 20) > brotli.estimatePeakMemory(.{ .effort = .q9 }, 1 << 20));
+    try testing.expect(brotli.estimatePeakMemory(.{ .effort = .q9 }, 1 << 20) >= brotli.estimatePeakMemory(.{ .effort = .q9 }, 1 << 10));
+    _ = brotli.estimatePeakMemory(.{ .effort = .q11, .window_bits = 30 }, std.math.maxInt(usize));
 }

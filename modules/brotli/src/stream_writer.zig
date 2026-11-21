@@ -60,6 +60,8 @@ pub const StreamOptions = struct {
     mode: encoder.Mode = .generic,
     /// As `CompressOptions.distance`.
     distance: ?encoder.DistanceParams = null,
+    /// As `CompressOptions.literal_context_modeling`.
+    literal_context_modeling: bool = true,
 
     /// `block_size` and `window_bits` clamped into their ranges, as
     /// `CompressOptions.sanitized` (`init` and `reset` apply it).
@@ -164,6 +166,7 @@ pub const StreamWriter = struct {
         sw.core.size_hint = o.size_hint orelse 0;
         sw.core.mode = o.mode;
         sw.core.distance = o.distance;
+        sw.core.literal_context_modeling = o.literal_context_modeling;
         try sw.core.writeHeader();
     }
 

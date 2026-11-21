@@ -77,6 +77,61 @@ pub fn compress(gpa: std.mem.Allocator, io: std.Io, input: []const u8, opts_in: 
     return compressJobs(gpa, io, input, opts, std.math.clamp(job, min_job_size, max_job_size), @max(threads, 1));
 }
 
+/// Where a part sits in the stream `compressPart` builds.
+pub const Part = struct {
+    /// The first part writes the stream header (the window size); every other part omits it
+    /// (google/brotli: `BROTLI_PARAM_STREAM_OFFSET` other than 0 omits the header).
+    first: bool = true,
+    /// The last part ends the stream (the final meta-block); every other part ends on a byte
+    /// boundary, as a flush does, so the parts join by concatenation.
+    last: bool = true,
+};
+
+pub const PartError = std.mem.Allocator.Error || error{
+    /// `opts.window_bits` is null (the parts cannot agree on a window an input length would
+    /// pick), or a prefix dictionary is set (not split, as in `compress`).
+    Unsupported,
+};
+
+/// One part of a stream built in pieces by separate calls, possibly on separate machines or at
+/// separate times (rust-brotli's appendable streams and `catli`, google/brotli's
+/// `BROTLI_PARAM_STREAM_OFFSET`): the concatenation of the parts' bytes, the first with
+/// `Part.first` and the last with `Part.last`, is one ordinary Brotli stream of the parts'
+/// inputs one after the other. `history` is the data BEFORE `input` (all of it or its last
+/// `window - 16` bytes): copies and static-dictionary words reach back into it as in
+/// `compress`'s jobs, so every call must see the same stream position. `opts` must be the
+/// same in every call and name `window_bits`. Like those jobs, a part after the first writes
+/// no short distance code for an old distance until it has written four of its own. Caller
+/// owns the result.
+pub fn compressPart(gpa: std.mem.Allocator, history: []const u8, input: []const u8, opts_in: CompressOptions, part: Part) PartError![]u8 {
+    const opts = opts_in.sanitized();
+    const wbits = opts.window_bits orelse return error.Unsupported;
+    if (opts.dictionary.len != 0 or opts.prepared_dictionary != null) return error.Unsupported;
+    if (input.len == 0 and !part.first and !part.last) return gpa.alloc(u8, 0);
+    const prefix = @min(history.len, (@as(usize, 1) << wbits) - 16);
+    const data = try gpa.alloc(u8, prefix + input.len);
+    defer gpa.free(data);
+    @memcpy(data[0..prefix], history[history.len - prefix ..]);
+    @memcpy(data[prefix..], input);
+    const size = encoder.tableSize(data.len, wbits);
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, size, data.len);
+    defer core.deinit();
+    core.keep_temp = true;
+    core.mode = opts.mode;
+    core.distance = opts.distance;
+    core.literal_context_modeling = opts.literal_context_modeling;
+    core.startJob(data, prefix, history.len - prefix);
+    if (part.first) try core.writeHeader();
+    var off = prefix;
+    while (off < data.len) {
+        const block_end = off + @min(data.len - off, opts.block_size);
+        try core.compressBlock(off, block_end, part.last and block_end == data.len);
+        off = block_end;
+    }
+    if (part.last) try core.finish() else try core.flushToByte();
+    return gpa.dupe(u8, core.w.buf.items);
+}
+
 /// `ParallelOptions.job_size`'s default for a window of `wbits`.
 pub fn jobSize(wbits: u5) usize {
     return @max(@as(usize, 1) << 20, @as(usize, 2) << wbits);
@@ -169,6 +224,7 @@ const Shared = struct {
         const c = &core.*.?;
         c.mode = s.opts.mode;
         c.distance = s.opts.distance;
+        c.literal_context_modeling = s.opts.literal_context_modeling;
         c.startJob(data, prefix, start - prefix);
         if (i == 0) try c.writeHeader();
         const last = end == input.len;
@@ -418,4 +474,55 @@ fn parallelHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 
 test "fuzz driver: parallel jobs join into a stream that decodes (BROTLI_FUZZ)" {
     try fuzz_driver.run(parallelHarness, .{ .prefix = "BROTLI_FUZZ", .name = "parallel" });
+}
+
+test "compressPart: parts of any cut, joined, are one stream that decodes to the input (every effort, empty and tiny parts, a window smaller than the history)" {
+    const gpa = testing.allocator;
+    const input = try mixed(gpa, 40_000);
+    defer gpa.free(input);
+    const cuts = [_][]const usize{
+        &.{ 0, 40_000 },
+        &.{ 0, 1, 40_000 },
+        &.{ 0, 9_999, 10_000, 10_000, 25_000, 40_000 },
+        &.{ 0, 0, 3, 17_000, 17_001, 40_000 },
+    };
+    inline for (all_efforts) |e| {
+        for ([_]u5{ 16, 12, 18 }) |wb| {
+            for (cuts) |cut| {
+                const opts: CompressOptions = .{ .effort = e, .window_bits = wb, .block_size = 6000 };
+                var joined: std.ArrayList(u8) = .empty;
+                defer joined.deinit(gpa);
+                for (0..cut.len - 1) |i| {
+                    const part = try compressPart(gpa, input[0..cut[i]], input[cut[i]..cut[i + 1]], opts, .{ .first = i == 0, .last = i == cut.len - 2 });
+                    defer gpa.free(part);
+                    try joined.appendSlice(gpa, part);
+                }
+                try expectRoundTrip(input, joined.items, false);
+            }
+        }
+    }
+}
+
+test "compressPart: one part that is first and last is the stream compressWith writes; the parts' header and ending are as stated" {
+    const gpa = testing.allocator;
+    const input = try mixed(gpa, 20_000);
+    defer gpa.free(input);
+    inline for (all_efforts) |e| {
+        const opts: CompressOptions = .{ .effort = e, .window_bits = 16 };
+        const want = try encoder.compressWith(gpa, input, opts);
+        defer gpa.free(want);
+        const got = try compressPart(gpa, &.{}, input, opts, .{});
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+    // A part that is not first starts without the header: it is not a stream of its own.
+    const opts: CompressOptions = .{ .window_bits = 16 };
+    const tail = try compressPart(gpa, input[0..5000], input[5000..], opts, .{ .first = false });
+    defer gpa.free(tail);
+    try testing.expectError(error.Unsupported, compressPart(gpa, &.{}, input, .{}, .{}));
+    try testing.expectError(error.Unsupported, compressPart(gpa, &.{}, input, .{ .window_bits = 16, .dictionary = "abc" }, .{}));
+    // An empty middle part writes nothing.
+    const none = try compressPart(gpa, input, &.{}, opts, .{ .first = false, .last = false });
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }

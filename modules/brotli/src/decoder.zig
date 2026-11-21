@@ -61,6 +61,13 @@ pub const Options = struct {
     /// Called with what metadata meta-blocks carry (google/brotli's
     /// metadata callbacks); without it they are skipped.
     metadata: ?Metadata = null,
+    /// Streaming decoders (`decompressStream`, `Decompressor`): allocate the whole
+    /// window ring as soon as the window size is known, instead of growing it from
+    /// 64 KiB as output arrives (google/brotli's
+    /// `BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION`). One allocation,
+    /// no copy while the ring grows; a small body then costs the full window
+    /// (still capped by `max_output`). The output is the same.
+    fixed_ring: bool = false,
 
     pub const Metadata = struct {
         context: *anyopaque,
@@ -1689,7 +1696,7 @@ const RingSink = struct {
         const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << @intCast(wbits)) + prefix_len) catch return error.OutOfMemory;
         const cap_pow2 = std.math.ceilPowerOfTwo(usize, @max(s.options.max_output, 1)) catch window;
         s.limit = @min(window, cap_pow2);
-        const len = @min(s.limit, initial_len);
+        const len = if (s.options.fixed_ring) s.limit else @min(s.limit, initial_len);
         s.buf = try s.gpa.alloc(u8, len);
         s.mask = len - 1;
     }

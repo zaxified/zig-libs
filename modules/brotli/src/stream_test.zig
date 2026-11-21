@@ -683,3 +683,63 @@ test "no-panic sweep B-4: an unbuffered streaming reader ends the input, never a
     defer out.deinit();
     try testing.expectError(error.TruncatedInput, brotli.decompressStream(testing.allocator, &tr.interface, &out.writer, .{}));
 }
+
+/// Records what is asked of the allocator it wraps: the first allocation of 64 KiB or more, the largest one,
+/// and how many times an allocation was resized or remapped in place.
+const Watch = struct {
+    backing: std.mem.Allocator,
+    first_big: usize = 0,
+    max_len: usize = 0,
+    grows: usize = 0,
+
+    fn allocator(w: *Watch) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *Watch = @ptrCast(@alignCast(ctx));
+        if (len >= 1 << 16 and w.first_big == 0) w.first_big = len;
+        w.max_len = @max(w.max_len, len);
+        return w.backing.rawAlloc(len, al, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const w: *Watch = @ptrCast(@alignCast(ctx));
+        if (m.len >= 1 << 16) w.grows += 1;
+        return w.backing.rawResize(m, al, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const w: *Watch = @ptrCast(@alignCast(ctx));
+        if (m.len >= 1 << 16) w.grows += 1;
+        return w.backing.rawRemap(m, al, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const w: *Watch = @ptrCast(@alignCast(ctx));
+        w.backing.rawFree(m, al, ra);
+    }
+};
+
+test "Options.fixed_ring: the whole window is allocated at once and never grown, the output is the same" {
+    const gpa = testing.allocator;
+    const input = try corpus.fontLike(gpa, 300_000, 3);
+    defer gpa.free(input);
+    const comp = try brotli.compressWith(gpa, input, .{ .effort = .q1, .window_bits = 20 });
+    defer gpa.free(comp);
+
+    var grown: Watch = .{ .backing = gpa };
+    const a = try streamDecode(grown.allocator(), comp, 0, .{});
+    defer gpa.free(a);
+    try testing.expectEqualSlices(u8, input, a);
+    // Default: the ring starts at 64 KiB and grows (a resize in place or a copy into a bigger block).
+    try testing.expectEqual(@as(usize, 1 << 16), grown.first_big);
+
+    var fixed: Watch = .{ .backing = gpa };
+    const b = try streamDecode(fixed.allocator(), comp, 0, .{ .fixed_ring = true });
+    defer gpa.free(b);
+    try testing.expectEqualSlices(u8, input, b);
+    try testing.expectEqual(@as(usize, 1 << 20), fixed.first_big);
+    try testing.expectEqual(@as(usize, 0), fixed.grows);
+    // Capped by `max_output`: a cap below the window shrinks the ring, fixed or not.
+    var capped: Watch = .{ .backing = gpa };
+    const c = try streamDecode(capped.allocator(), comp, 0, .{ .fixed_ring = true, .max_output = 400_000 });
+    defer gpa.free(c);
+    try testing.expectEqual(@as(usize, 1 << 19), capped.first_big);
+}

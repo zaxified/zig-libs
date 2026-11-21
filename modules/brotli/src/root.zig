@@ -105,6 +105,8 @@ pub const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictio
 /// The longest stream `compressWith` gives for `n` input bytes (exact:
 /// incompressible input reaches it).
 pub const maxCompressedSize = encoder.maxCompressedSize;
+/// An upper bound of `compressWith`'s peak memory without input and output; see `encoder.estimatePeakMemory`.
+pub const estimatePeakMemory = encoder.estimatePeakMemory;
 pub const min_window_bits = encoder.min_window_bits;
 pub const max_window_bits = encoder.max_window_bits;
 pub const max_large_window_bits = encoder.max_large_window_bits;
