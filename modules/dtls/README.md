@@ -198,12 +198,35 @@ Both engines split what they send when `Config.max_datagram_len` is set (see
 peer that *fragments*, not one that retransmits a whole flight verbatim into
 the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 
+## Resumption, 0-RTT, OCSP stapling
+
+```zig
+// Server: tickets sealed under a tlsresume STEK ring the caller rotates.
+var ring: tlsresume.stek.DefaultRing = .init();
+ring.rotate(1, &stek_key, now_s);
+const tkr: dtls.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
+server_cfg.tickets = .{ .ticketer = tkr.ticketer() }; // + .max_early_data / .replay for 0-RTT
+server_cfg.now_sec = now_s;
+server_cfg.cert.?.ocsp_response = staple_der; // sent to clients that ask
+
+// Client, DTLS 1.3 certificate mode: keep the ticket, offer it next time.
+var t = conn.sessionTicket().?.*; // after recv reported the NewSessionTicket
+next_cfg.resumption = &t;         // psk_dhe_ke, no certificate; conn.resumed()
+next_cfg.early_data = "0-RTT";    // optional; conn.earlyDataAccepted()
+next_cfg.request_ocsp = true;     // conn.peerOcspResponse(): raw DER, verify it (e.g. the ocsp module)
+// DTLS 1.2: Config.session_tickets12 / Config.resumption12, Connection12.sessionTicket().
+```
+
+Session tickets in both engines (1.3: `psk_dhe_ke` in the certificate modes; 1.2: RFC 5077 with the abbreviated
+handshake), 0-RTT early data in 1.3 (single use through `Tickets.replay`), OCSP stapling and SCTs in both engines.
+Resumption and stapling are live-checked against wolfSSL 5.9.1; 0-RTT is self-interop only (Debian's wolfSSL has no
+early data). Details: [SPEC.md](SPEC.md) *Session resumption, 0-RTT, OCSP stapling*.
+
 ## Not provided
 
-Resumption and tickets, 0-RTT and `CertificateEntry` extensions (OCSP stapling) are not built (RFC 5280 path building is
-`PeerVerify.chain`; `.trust_anchor` stays one-hop); DTLS 1.2 CBC suites, static-RSA key exchange,
-compression, renegotiation and DTLS 1.0 are refused on purpose. See [SPEC.md](SPEC.md) *Backlog /
-deferred* and *What is deliberately not done*.
+DTLS 1.2 CBC suites, static-RSA key exchange, compression, renegotiation and DTLS 1.0 are refused on purpose (RFC 5280
+path building is `PeerVerify.chain`; `.trust_anchor` stays one-hop). See [SPEC.md](SPEC.md) *Backlog / deferred* and
+*What is deliberately not done*.
 
 ## DTLS 1.2 and version negotiation
 

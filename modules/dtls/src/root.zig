@@ -260,10 +260,14 @@
 //! control records, automatic rekey at `Config.key_update_after_records`);
 //! the RFC 8446 §7.5 exporter (`Connection.exportKeyingMaterial`, `"dtls13"`
 //! labels per RFC 9147 §5.9); RFC 7301 ALPN (`Config.alpn_protocols`,
-//! `Connection.negotiatedAlpn`). NewSessionTicket is ACKed and ignored.
+//! `Connection.negotiatedAlpn`). A NewSessionTicket is kept on a connection
+//! that can resume (`Connection.sessionTicket`), ACKed and skipped otherwise.
 //!
-//! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
-//! resumption (`res binder`/NewSessionTicket).
+//! **Resumption, 0-RTT, stapling:** session tickets in both engines
+//! (`Config.tickets`, `Config.resumption`, `Config.session_tickets12` /
+//! `resumption12`), 0-RTT early data in 1.3 (`Config.early_data`,
+//! `Tickets.replay`), OCSP stapling and SCTs (`CertConfig.ocsp_response` /
+//! `sct_list`, `Config.request_ocsp` / `request_scts`); see SPEC.md.
 //!
 //! **AEAD/CCM:** std's CCM presets are all nonce-13 and the parametric
 //! `AesCcm` is private, while the TLS/DTLS 1.3 profile needs a 12-byte
