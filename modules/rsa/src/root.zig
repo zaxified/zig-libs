@@ -3356,17 +3356,43 @@ const sieve_primes = blk: {
     break :blk list;
 };
 
-/// Big-endian unsigned `bytes` mod `divisor` (u128 intermediate: safe for any
-/// u64 divisor). Used for the pre-sieve and the p mod e reduction only —
-/// variable-time, never touches a kept secret in a data-dependent way beyond
-/// the (public-fate) reject/accept decision itself.
-fn bytesMod(bytes: []const u8, divisor: u64) u64 {
-    std.debug.assert(divisor != 0);
+/// `floor(2^80 / d) + 1`: the multiplier `bytesModCt` divides by `d` with
+/// (Granlund–Montgomery; exact for every dividend below 2^40 and `d < 2^32`).
+fn reciprocal(d: u64) u128 {
+    std.debug.assert(d >= 3 and d < (1 << 32));
+    return (@as(u128, 1) << 80) / d + 1;
+}
+
+/// The sieve primes' `reciprocal`s, computed once at comptime.
+const sieve_reciprocals: [sieve_primes.len]u128 = blk: {
+    var r: [sieve_primes.len]u128 = undefined;
+    for (&r, sieve_primes) |*x, sp| x.* = (@as(u128, 1) << 80) / sp + 1;
+    break :blk r;
+};
+
+/// Big-endian unsigned `bytes` mod `d` (`d < 2^32`, `m = reciprocal(d)`) with
+/// no division instruction: each step's quotient is `(x·m) >> 80` for
+/// `x = 256·r + byte < 2^40`, exact because `m·d − 2^80 ≤ d` and `x·d < 2^80`.
+/// The candidate prime goes through here (the pre-sieve and `p mod e`), so
+/// a `%` — whose latency depends on its operands — would time a kept prime's
+/// residues; multiplication does not.
+fn bytesModCt(bytes: []const u8, d: u64, m: u128) u64 {
     var r: u64 = 0;
     for (bytes) |b| {
-        r = @intCast(((@as(u128, r) << 8) | b) % divisor);
+        const x: u128 = (@as(u128, r) << 8) | b;
+        const q = (x * m) >> 80;
+        r = @intCast(x - q * d);
     }
     return r;
+}
+
+/// Trial division for a PUBLIC `x < 2^32` (the public exponent).
+fn isSmallPrime(x: u64) bool {
+    if (x < 2) return false;
+    if (x % 2 == 0) return x == 2;
+    var d: u64 = 3;
+    while (d * d <= x) : (d += 2) if (x % d == 0) return false;
+    return true;
 }
 
 /// Set bit `bit` (LSB = 0) of a big-endian byte string.
@@ -3427,6 +3453,9 @@ fn generatePrime(random: std.Random, prime_bits: usize, e: u64, out: []u8) void 
     std.debug.assert(out.len == byteLen(prime_bits));
     std.debug.assert(prime_bits >= 128); // callers: >= 256 (bits >= 512)
     const top_mask = @as(u8, 0xff) >> @intCast(8 * out.len - prime_bits);
+    // e is public: its reciprocal and primality are computed in the clear.
+    const e_recip = reciprocal(e);
+    const e_is_prime = isSmallPrime(e);
     candidates: while (true) {
         random.bytes(out);
         out[0] &= top_mask;
@@ -3436,15 +3465,19 @@ fn generatePrime(random: std.Random, prime_bits: usize, e: u64, out: []u8) void 
 
         // Trial-division pre-sieve. Candidates are >= 2^127, so a zero
         // remainder always means a proper factor, never candidate == prime.
-        for (sieve_primes) |sp| {
-            if (bytesMod(out, sp) == 0) continue :candidates;
+        for (sieve_primes, sieve_reciprocals) |sp, m| {
+            if (bytesModCt(out, sp, m) == 0) continue :candidates;
         }
 
         // gcd(e, p-1) = 1, via (p-1) mod e: e | p-1 (rem 0) or a shared
         // factor both make e non-invertible mod λ(n) — reject either way.
-        const p_mod_e = bytesMod(out, e);
-        const p1_mod_e = (p_mod_e + e - 1) % e; // no overflow: e < 2^32
-        if (p1_mod_e == 0 or std.math.gcd(e, p1_mod_e) != 1) continue :candidates;
+        // For a prime e (65537, 3) the rem-0 test is the whole condition, so
+        // the variable-time Euclid runs only for a composite e.
+        const p_mod_e = bytesModCt(out, e, e_recip);
+        var p1_mod_e = p_mod_e + e - 1; // < 2e < 2^33
+        p1_mod_e -= e & (@as(u64, 0) -% @intFromBool(p1_mod_e >= e));
+        if (p1_mod_e == 0) continue :candidates;
+        if (!e_is_prime and std.math.gcd(e, p1_mod_e) != 1) continue :candidates;
 
         // Odd, exactly prime_bits bits (both set above): the candidate as a
         // montint modulus of known length, Miller-Rabin on it constant-time
@@ -8677,4 +8710,30 @@ test "ffModulusSecret equals Modulus.fromBytes field for field" {
         try testing.expectEqual(want.zero.v.limbs_len, got.zero.v.limbs_len);
         try testing.expectEqualSlices(u64, &want.zero.v.limbs_buffer, &got.zero.v.limbs_buffer);
     }
+}
+
+test "bytesModCt equals % for every sieve prime, e = 3, 65537 and 2^32 - 5, on edge and random inputs" {
+    var prng = std.Random.DefaultPrng.init(0x51e7e);
+    var buf: [128]u8 = undefined;
+    const extra = [_]u64{ 3, 65537, 4294967291, 4294967295 };
+    for (0..64) |round| {
+        prng.random().bytes(&buf);
+        if (round == 0) @memset(&buf, 0xff);
+        if (round == 1) @memset(&buf, 0);
+        for (sieve_primes, sieve_reciprocals) |sp, m| {
+            try testing.expectEqual(bytesModSlow(&buf, sp), bytesModCt(&buf, sp, m));
+        }
+        for (extra) |d| try testing.expectEqual(bytesModSlow(&buf, d), bytesModCt(&buf, d, reciprocal(d)));
+    }
+}
+
+test "isSmallPrime" {
+    for ([_]u64{ 2, 3, 5, 17, 257, 65537, 4294967291 }) |x| try testing.expect(isSmallPrime(x));
+    for ([_]u64{ 0, 1, 4, 9, 15, 65535, 4294967295 }) |x| try testing.expect(!isSmallPrime(x));
+}
+
+fn bytesModSlow(bytes: []const u8, d: u64) u64 {
+    var r: u64 = 0;
+    for (bytes) |b| r = @intCast(((@as(u128, r) << 8) | b) % d);
+    return r;
 }

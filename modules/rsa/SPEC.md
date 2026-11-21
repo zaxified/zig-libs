@@ -250,8 +250,11 @@ PublicKey.fromBytes does" covers both the default and the escape floor.
   Fermat self-check and the sign-time fault check refuses the key). Primes from an untrusted source:
   `fromPrimesWith(.., .{ .check_primality = true })`, 64 Miller-Rabin rounds on each with witnesses from a ChaCha CSPRNG
   keyed by SHA-256 of the prime (deterministic, `paillier.fromPrimes`'s shape), 2 × 64 modexps of the prime size.
-- The prime search's sieve and Miller-Rabin's squaring count are observable for a kept
-  prime (Backlog).
+- The prime search's remainders (the trial-division pre-sieve and `p mod e`) are computed without a division instruction
+  (`bytesModCt`: a precomputed `floor(2^80/d) + 1` reciprocal per divisor, exact for the 40-bit step dividends; 2026-11-21),
+  so a kept prime's residues do not set the latency; for a prime `e` (65537, 3) the `gcd(e, p − 1)` test is the
+  rem-0 check alone, the variable-time Euclid running only for a composite `e`. Miller-Rabin's squaring count
+  `s = v2(p − 1)` remains a property of the kept prime (see *What is deliberately not done*).
 - A `BlindingCache` holds key material (`r^e mod p` and `r⁻¹ mod p` give `p` by a gcd with `n`): it is wiped by `deinit`, and the
   per-operation stack burn does not cover it. One cache per thread, no lock.
 - A hostile PBES2 file can cost up to ~0.3–1 s of PBKDF2 (the cap is fixed, Backlog).
@@ -312,6 +315,11 @@ What the figures depend on:
   against this module's 36 µs, before the later speed work.
 
 ## What is deliberately not done
+
+- **`p ≡ 3 (mod 4)` candidates** (so Miller-Rabin's `s = v2(p − 1)` is always 1): it would narrow the key distribution
+  to half of the primes, which no reference does (Go's `crypto/rsa`, BoringSSL and OpenSSL draw from all odd
+  candidates; FIPS 186-5 B.3.3 does not restrict it); the squaring count reveals a few low bits of `p − 1` of a prime
+  whose remaining bits stay secret.
 
 - **RSAES-PKCS1-v1_5 encryption and decryption** (decided 2026-09-30). *Never* as a
   general-purpose decrypt; the encrypt side *not now*.
@@ -378,14 +386,13 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 ## Backlog / deferred
 
-- **Prime search sieve.** `bytesMod`'s `%` on the candidate (variable-latency division) and Miller-Rabin's squaring count
-  `s = v2(p − 1)` stay observable for a kept prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole
-  table, and `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits CONVENTIONS §2.
 - **PEM `aes256-ctr` decryption on Zig 0.17.** The encrypted-OpenSSH-key path (`std.crypto.core.modes.ctr` over std `Aes256`
   in `src/root.zig`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per
-  key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap).
+  key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap). Bounced (quiet
+  phase): a performance item, to be measured on a quiet host.
 - **Performance, remaining lever:** the modexp itself (REDC is about 54 % of it at L = 16, i.e. 2048-bit keys); the blinded
   `.csprng` rows additionally carry the stateless draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes.
+  Bounced (quiet phase): performance.
 
 ## Anchoring
 
