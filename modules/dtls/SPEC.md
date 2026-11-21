@@ -661,7 +661,10 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
 
 `tools/interop.zig` runs real DTLS 1.3 handshakes over a loopback UDP socket
 against **wolfSSL 5.9.1**, in both roles and in both PSK and certificate mode,
-each followed by an application-data round trip — twenty-two cases in all (including ALPN in both roles, a KeyUpdate from each side, and the four AES-256-GCM-SHA384 PSK cases).
+each followed by an application-data round trip — twenty-six cases in all (including ALPN in both roles and in
+certificate mode, a KeyUpdate from each side in PSK and in certificate mode and a wolfSSL client's KeyUpdate against
+our server, and the four AES-256-GCM-SHA384 PSK cases). The committed transcript holds twenty-two of them (Backlog:
+re-capture).
 
 **It is a PROGRAM, not a test, and that is the design.** A
 zig-libs module is standalone Zig with no external dependency; an anchor against
@@ -851,8 +854,10 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   AES-256, seal and open); a whole `send` + `recv` of 64 bytes on AES-128-GCM is ~1.2 µs, of which ~0.6 µs is the two
   per-record AEAD calls. The rewrite (per-epoch `Context` storage behind `Protection(Aead)`, which ChaCha20 shares
   without needing it) waits for a quiet-machine A/B with the spread below the effect.
-- **KeyUpdate / ALPN against a live peer, the rest:** a wolfSSL-initiated KeyUpdate with wolfSSL as the client, and
-  ALPN and KeyUpdate in certificate mode.
+- **Re-capture of the 1.3 transcript.** Four live 1.3 cases (`psk-server-keyupdate-theirs`, `cert-client-alpn`,
+  `cert-client-keyupdate-ours`, `cert-client-keyupdate-theirs`) pass against wolfSSL 5.9.1 but are not yet in
+  `src/testdata/wolfssl_transcript.txt`: `zig build interop-dtls -- --capture --version 13`, then
+  `wolfssl_replay.zig`'s `recorded_cases_floor` 22 → 26 and `fuzz_corpus.zig`'s pinned frame counts.
 - **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for
   1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
 - **Connection ID, the rest (RFC 9146 / RFC 9147 §9).** DTLS 1.3 negotiates and uses one CID per direction (see
