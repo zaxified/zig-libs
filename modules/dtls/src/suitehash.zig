@@ -88,6 +88,37 @@ pub fn binderKey(alg: HashAlg, out: *Secret, early_secret: *const Secret) void {
     }
 }
 
+/// RFC 8446 §7.1's `"res binder"` key: the binder key of a resumption PSK.
+pub fn resumptionBinderKey(alg: HashAlg, out: *Secret, early_secret: *const Secret) void {
+    switch (alg) {
+        inline else => |a| @import("tls13").keyschedule.dtls13.resumptionBinderKey(Types(a).Hkdf, out[0..Types(a).n], early_secret[0..Types(a).n], emptyHash(a)),
+    }
+}
+
+/// RFC 8446 §7.1: `resumption_master_secret = Derive-Secret(master_secret,
+/// "res master", ClientHello...client Finished)`.
+pub fn deriveResumptionMasterSecret(alg: HashAlg, out: *Secret, master_secret: *const Secret, th: []const u8) void {
+    switch (alg) {
+        inline else => |a| @import("tls13").keyschedule.dtls13.deriveResumptionMasterSecret(Types(a).Hkdf, out[0..Types(a).n], master_secret[0..Types(a).n], th),
+    }
+}
+
+/// RFC 8446 §4.6.1: a ticket's PSK, `HKDF-Expand-Label(resumption_master_secret,
+/// "resumption", ticket_nonce, Hash.length)`.
+pub fn deriveResumptionPsk(alg: HashAlg, out: *Secret, resumption_master_secret: *const Secret, ticket_nonce: []const u8) void {
+    switch (alg) {
+        inline else => |a| @import("tls13").keyschedule.dtls13.deriveResumptionPsk(Types(a).Hkdf, out[0..Types(a).n], resumption_master_secret[0..Types(a).n], ticket_nonce),
+    }
+}
+
+/// RFC 8446 §7.1: `client_early_traffic_secret = Derive-Secret(early_secret,
+/// "c e traffic", ClientHello)`.
+pub fn clientEarlyTrafficSecret(alg: HashAlg, out: *Secret, early_secret: *const Secret, th: []const u8) void {
+    switch (alg) {
+        inline else => |a| keyschedule.deriveSecret(Types(a).Hkdf, out[0..Types(a).n], early_secret[0..Types(a).n], "c e traffic", th),
+    }
+}
+
 /// RFC 8446 §4.2.11.2 binder over `truncated_hash`; returns `out`'s live part.
 pub fn pskBinder(alg: HashAlg, out: *Secret, binder_key: *const Secret, truncated_hash: []const u8) []const u8 {
     switch (alg) {

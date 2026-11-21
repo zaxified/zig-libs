@@ -64,6 +64,7 @@ const certauth = @import("certauth.zig");
 const x509 = @import("x509");
 const suite12 = @import("suite12.zig");
 const messages12 = @import("messages12.zig");
+const tlsresume = @import("tlsresume");
 pub const ProtocolVersion = suite12.ProtocolVersion;
 pub const CipherSuite12 = suite12.CipherSuite12;
 
@@ -419,6 +420,148 @@ pub const ChainVerify = struct {
     revocation: ?x509.chain.Revocation = null,
 };
 
+// ── session resumption (RFC 8446 §2.2 / §4.6.1 over RFC 9147) ──────────────
+
+/// Seals and opens this server's session tickets (rustls `ProducesTickets`,
+/// the shape `tlsserver.Ticketer` has): the blob format and the key rotation
+/// are its own. `StekTicketer` wraps a `tlsresume` STEK ring.
+pub const Ticketer = struct {
+    ctx: *const anyopaque,
+    /// Seal `plaintext` (secret: it holds the resumption PSK) into `out`
+    /// under the AEAD nonce `nonce`; null if it cannot (no key, no room).
+    seal: *const fn (ctx: *const anyopaque, plaintext: []const u8, nonce: [12]u8, out: []u8) ?[]u8,
+    /// Open a blob this server sealed under a key still accepted at `now_s`
+    /// into `out`, returning a prefix of `out`; null for anything else.
+    open: *const fn (ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8,
+};
+
+/// A `Ticketer` over a `tlsresume.StekRing(depth)`: AES-256-GCM, the key id
+/// as AAD, keys past `policy.lifetime_s` refused. The ring is read, never
+/// changed: its owner rotates it (`maybeRotate`). One ring is one trust
+/// domain: servers sharing a ring resume each other's sessions.
+pub fn StekTicketer(comptime Ring: type) type {
+    return struct {
+        const Self = @This();
+
+        ring: *const Ring,
+        policy: tlsresume.stek.RotationPolicy = .{},
+
+        /// The `Ticketer` points at `self`: it must outlive every
+        /// `Connection` whose `Config.tickets` holds it.
+        pub fn ticketer(self: *const Self) Ticketer {
+            return .{ .ctx = self, .seal = seal, .open = open };
+        }
+
+        fn seal(ctx: *const anyopaque, plaintext: []const u8, nonce: [12]u8, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            return self.ring.seal(plaintext, nonce, out) catch null;
+        }
+
+        fn open(ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            return self.ring.openAt(blob, now_s, self.policy, out) catch null;
+        }
+    };
+}
+
+/// A DTLS 1.3 server's session tickets (`Config.tickets`): after a
+/// certificate-mode (`.cert_dhe`) handshake the server sends one
+/// NewSessionTicket (wolfSSL's default count), and a later ClientHello
+/// offering it resumes with `psk_dhe_ke` (RFC 8446 §4.2.9: the PSK plus a
+/// fresh (EC)DHE exchange, no certificate). The clock is `Config.now_sec`.
+pub const Tickets = struct {
+    ticketer: Ticketer,
+    /// The `ticket_lifetime` advertised, in seconds (at most 7 days, RFC 8446
+    /// §4.6.1); an older ticket is not resumed. 12 hours, as `tlsserver`
+    /// (rustls). 0 sends no ticket (a lifetime of 0 tells the client to
+    /// discard it).
+    lifetime_s: u32 = 12 * 3600,
+    /// The `max_early_data_size` advertised in the ticket (RFC 8446
+    /// §4.2.10): 0 (the default) offers no 0-RTT. See `Config.early_data`.
+    max_early_data: u32 = 0,
+};
+
+/// The longest ticket blob a client keeps (`SessionTicket.ticket`); a
+/// NewSessionTicket with a longer one is ACKed and not stored.
+pub const max_ticket_len = 512;
+
+/// A session ticket a DTLS 1.3 client received (`Connection.sessionTicket`)
+/// and can offer on a later connection (`Config.resumption`). A plain value:
+/// copy it out, keep it as long as `lifetime_s` allows. It holds the
+/// resumption PSK — keep it secret and `wipe` it when done.
+pub const SessionTicket = struct {
+    /// The suite of the connection that issued it; the resumption must use a
+    /// suite of the same hash (RFC 8446 §4.2.11).
+    suite: CipherSuite,
+    psk: Secret,
+    ticket: [max_ticket_len]u8,
+    ticket_len: u16,
+    ticket_age_add: u32,
+    lifetime_s: u32,
+    /// `Config.now_sec` of the connection that received it (seconds); a
+    /// caller with a better clock may overwrite it. The ticket age a client
+    /// reports is `Config.now_sec - received_at_s` of the resuming
+    /// connection.
+    received_at_s: i64,
+    /// The ticket's `early_data` extension (RFC 8446 §4.2.10), 0 if absent.
+    max_early_data: u32,
+
+    pub fn identity(self: *const SessionTicket) []const u8 {
+        return self.ticket[0..self.ticket_len];
+    }
+
+    pub fn wipe(self: *SessionTicket) void {
+        std.crypto.secureZero(u8, &self.psk);
+    }
+};
+
+/// The server's ticket plaintext: version, suite, issued-at (s), age_add,
+/// lifetime, max_early_data, the PSK length and the PSK.
+const ticket_state_version: u8 = 1;
+const ticket_state_head = 1 + 2 + 8 + 4 + 4 + 4 + 1;
+const max_ticket_state = ticket_state_head + suitehash.max_hash_len;
+const max_sealed_ticket = max_ticket_state + tlsresume.stek.overhead;
+
+const TicketState = struct {
+    suite: CipherSuite,
+    issued_s: i64,
+    age_add: u32,
+    lifetime_s: u32,
+    max_early_data: u32,
+    psk: Secret,
+
+    fn serialize(self: *const TicketState, out: *[max_ticket_state]u8) []u8 {
+        const n = self.suite.hash().len();
+        out[0] = ticket_state_version;
+        std.mem.writeInt(u16, out[1..3], @backingInt(self.suite), .big);
+        std.mem.writeInt(i64, out[3..11], self.issued_s, .big);
+        std.mem.writeInt(u32, out[11..15], self.age_add, .big);
+        std.mem.writeInt(u32, out[15..19], self.lifetime_s, .big);
+        std.mem.writeInt(u32, out[19..23], self.max_early_data, .big);
+        out[23] = @intCast(n);
+        @memcpy(out[ticket_state_head..][0..n], self.psk[0..n]);
+        return out[0 .. ticket_state_head + n];
+    }
+
+    /// Null for anything this server would not have written.
+    fn parse(bytes: []const u8) ?TicketState {
+        if (bytes.len < ticket_state_head or bytes[0] != ticket_state_version) return null;
+        const suite = cipherSuiteFromU16(std.mem.readInt(u16, bytes[1..3], .big)) orelse return null;
+        const n = suite.hash().len();
+        if (bytes[23] != n or bytes.len != ticket_state_head + n) return null;
+        var st: TicketState = .{
+            .suite = suite,
+            .issued_s = std.mem.readInt(i64, bytes[3..11], .big),
+            .age_add = std.mem.readInt(u32, bytes[11..15], .big),
+            .lifetime_s = std.mem.readInt(u32, bytes[15..19], .big),
+            .max_early_data = std.mem.readInt(u32, bytes[19..23], .big),
+            .psk = undefined,
+        };
+        @memcpy(st.psk[0..n], bytes[ticket_state_head..][0..n]);
+        return st;
+    }
+};
+
 pub const Config = struct {
     role: Role,
     /// Which key-exchange to run. `.psk` (default) keeps the original
@@ -584,6 +727,20 @@ pub const Config = struct {
     /// record (Finished included) is a `tls12_cid` record carrying the
     /// peer's CID when it asked for a non-empty one.
     connection_id: ?[]const u8 = null,
+    /// DTLS 1.3 server: issue session tickets after each `.cert_dhe` /
+    /// `.cert_dhe_insecure_unauthenticated` handshake and resume the ones
+    /// offered back (`psk_dhe_ke`). Null (the default) issues none and
+    /// ignores offered tickets (a full handshake). Ignored in `.psk` mode,
+    /// whose handshake already is a PSK one. The clock is `now_sec`.
+    tickets: ?Tickets = null,
+    /// DTLS 1.3 client: a ticket from an earlier connection
+    /// (`Connection.sessionTicket`) to offer in the ClientHello, with a fresh
+    /// key share (`psk_key_exchange_modes` = `psk_dhe_ke`, as rustls,
+    /// OpenSSL and wolfSSL offer by default). A server that takes it skips
+    /// the certificate (`Connection.resumed`); one that does not runs the
+    /// full handshake. Borrowed for the life of the `Connection`. Ignored in
+    /// `.psk` mode.
+    resumption: ?*const SessionTicket = null,
 
     // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only
     // connection byte-identical to what it was before 1.2 existed.
@@ -1079,6 +1236,12 @@ pub const max_new_cids = 4;
 pub const max_cid_spares = 4;
 /// header + `cids<0..2^16-1>` + usage.
 const max_cid_msg = handshake.header_len + 2 + max_new_cids * (1 + max_cid_len) + 1;
+/// This server's NewSessionTicket body: lifetime, age_add, a 1-byte nonce,
+/// the sealed ticket, an `early_data` extension.
+const max_nst_body = 4 + 4 + 1 + 1 + 2 + max_sealed_ticket + 2 + 8;
+/// The one post-handshake message this side has in flight (`cm_*`): a CID
+/// update or a NewSessionTicket.
+const max_post_hs_msg = @max(max_cid_msg, handshake.header_len + max_nst_body);
 
 /// RFC 9147 §9 `ConnectionIdUsage`.
 pub const ConnectionIdUsage = enum(u8) {
@@ -1805,7 +1968,7 @@ pub const Connection = struct {
     /// One NewConnectionId / RequestConnectionId of ours in flight,
     /// retransmitted by `poll` until an ACK names one of its records.
     cm_state: KeyUpdateState = .idle,
-    cm_msg: [max_cid_msg]u8 = undefined,
+    cm_msg: [max_post_hs_msg]u8 = undefined,
     cm_msg_len: u16 = 0,
     cm_records: [max_ku_records]flight.RecordNumber = undefined,
     cm_records_len: u8 = 0,
@@ -1933,6 +2096,23 @@ pub const Connection = struct {
     /// `acceptCookie`). Fragments below this are treated as retransmission
     /// and skipped; fragments above it are `error.InterleavedFragments`.
     peer_message_seq: ?u16 = null,
+
+    // ── session resumption (DTLS 1.3, `.cert_dhe` modes) ──
+    /// This handshake resumed a ticket (`Config.resumption` taken).
+    did_resume: bool = false,
+    /// Client: the PSK of the ticket offered, kept from the ClientHello until
+    /// the ServerHello says whether it was taken.
+    offered_psk: Secret = undefined,
+    /// Server: the master secret, kept from the ServerHello flight to the
+    /// client's Finished (the resumption master secret's input).
+    master_secret: Secret = undefined,
+    master_live: bool = false,
+    /// RFC 8446 §7.1's resumption master secret, from the client's Finished.
+    resumption_master: Secret = undefined,
+    resumption_live: bool = false,
+    /// Client: the last NewSessionTicket received (`sessionTicket`).
+    ticket: SessionTicket = undefined,
+    ticket_live: bool = false,
 
     pub const InitError = ConfigError;
 
@@ -2506,9 +2686,13 @@ pub const Connection = struct {
                 },
                 hs_type_new_session_ticket => {
                     // Only the final fragment completes the message; any
-                    // fragment is ACKed (its bytes are not needed here).
-                    if (@as(u32, hdr.fragment_offset) + hdr.fragment_length == hdr.length)
+                    // fragment is ACKed. A ticket that arrives whole in one
+                    // record is kept (`sessionTicket`); a fragmented one, or
+                    // one this side cannot use, is not.
+                    if (@as(u32, hdr.fragment_offset) + hdr.fragment_length == hdr.length) {
                         self.peer_message_seq = expected +% 1;
+                        if (self.role == .client and hdr.fragment_offset == 0) try self.takeSessionTicket(frag);
+                    }
                     ack = true;
                 },
                 // RFC 9147 §9, one fragment each (the messages are small).
@@ -2531,6 +2715,35 @@ pub const Connection = struct {
         if (ack) self.queueAck(rn);
         if (saw_key_update) return error.ReceivedKeyUpdate;
         return error.ReceivedPostHandshakeMessage;
+    }
+
+    /// RFC 8446 §4.6.1 on the client: decodes a NewSessionTicket body and,
+    /// when the handshake left a resumption master secret and the ticket
+    /// fits, derives its PSK and keeps it as `sessionTicket` (replacing an
+    /// earlier one). A body that does not decode is `error.Malformed`; a
+    /// lifetime of 0 discards the ticket (§4.6.1).
+    fn takeSessionTicket(self: *Connection, body: []const u8) error{Malformed}!void {
+        var ext_buf: [8]tlsresume.ticket.Extension = undefined;
+        const nst = tlsresume.ticket.NewSessionTicket.decode(body, &ext_buf) catch return error.Malformed;
+        if (!self.resumption_live or nst.ticket_lifetime == 0 or nst.ticket.len > max_ticket_len) return;
+        const alg = self.suite.hash();
+        var t: SessionTicket = .{
+            .suite = self.suite,
+            .psk = undefined,
+            .ticket = undefined,
+            .ticket_len = @intCast(nst.ticket.len),
+            .ticket_age_add = nst.ticket_age_add,
+            .lifetime_s = nst.ticket_lifetime,
+            .received_at_s = self.config.now_sec,
+            .max_early_data = 0,
+        };
+        @memcpy(t.ticket[0..nst.ticket.len], nst.ticket);
+        if (nst.maxEarlyDataSize()) |m| t.max_early_data = m;
+        suitehash.deriveResumptionPsk(alg, &t.psk, &self.resumption_master, nst.ticket_nonce);
+        if (self.ticket_live) self.ticket.wipe();
+        self.ticket = t;
+        self.ticket_live = true;
+        t.wipe();
     }
 
     fn applyPeerKeyUpdate(self: *Connection) void {
@@ -2769,6 +2982,22 @@ pub const Connection = struct {
     /// Note this is per-`Connection`, and a stateless server uses a fresh
     /// `Connection` per datagram — so on the server it reports what THIS
     /// object did, not what the handshake as a whole did.
+    /// Whether this handshake resumed a session ticket (`Config.resumption`
+    /// on the client, `Config.tickets` on the server): authenticated by the
+    /// ticket's PSK, no certificate exchanged.
+    pub fn resumed(self: *const Connection) bool {
+        return self.did_resume;
+    }
+
+    /// The last NewSessionTicket the server sent this client, ready for
+    /// `Config.resumption` on a later connection; null until one arrived (a
+    /// server sends it right after the handshake: `recv` reports it as
+    /// `error.ReceivedPostHandshakeMessage`). Aliases this `Connection`:
+    /// copy it out before `deinit`, which wipes it.
+    pub fn sessionTicket(self: *const Connection) ?*const SessionTicket {
+        return if (self.ticket_live) &self.ticket else null;
+    }
+
     pub fn sawHelloRetryRequest(self: Connection) bool {
         return self.saw_hello_retry_request;
     }
@@ -2790,6 +3019,13 @@ pub const Connection = struct {
         std.crypto.secureZero(u8, &self.ap_write_secret);
         std.crypto.secureZero(u8, &self.ap_read_secret);
         std.crypto.secureZero(u8, &self.exporter_master);
+        std.crypto.secureZero(u8, &self.offered_psk);
+        std.crypto.secureZero(u8, &self.master_secret);
+        std.crypto.secureZero(u8, &self.resumption_master);
+        std.crypto.secureZero(u8, &self.ticket.psk);
+        self.master_live = false;
+        self.resumption_live = false;
+        self.ticket_live = false;
         secureZeroDirKeys(&self.prev_read_keys);
         self.prev_read_live = false;
         // `.cert_dhe` ephemeral X25519 private key — already wiped mid-handshake
@@ -3378,7 +3614,7 @@ pub const Connection = struct {
         const srtp_ext = try self.srtpOffer(&srtp_buf);
 
         var cid_buf: [1 + max_cid_len]u8 = undefined;
-        var exts_buf: [8 + dual12_extensions.len]messages.Extension = undefined;
+        var exts_buf: [10 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -3411,12 +3647,55 @@ pub const Connection = struct {
             }
         }
 
-        return messages.encodeClientHello(.{
+        // Resumption (RFC 8446 §4.2.11): the ticket as the one PSK identity,
+        // `psk_dhe_ke` only (this mode always sends a key share), the binder
+        // under `"res binder"`. Not on a retry whose suite has another hash
+        // than the ticket's (§4.1.4: such a PSK is dropped from ClientHello2).
+        const ticket: ?*const SessionTicket = if (self.config.resumption) |t| blk: {
+            if (self.hrr_cipher_suite) |hs| {
+                const hrr_suite = cipherSuiteFromU16(hs) orelse break :blk null;
+                if (hrr_suite.hash() != t.suite.hash()) break :blk null;
+            }
+            break :blk t;
+        } else null;
+        var modes_buf: [4]u8 = undefined;
+        var psk_buf: [2 + 2 + max_ticket_len + 4 + 2 + 1 + suitehash.max_hash_len]u8 = undefined;
+        if (ticket) |t| {
+            exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.psk_key_exchange_modes), .data = try messages.encodePskKeyExchangeModes(&.{.psk_dhe_ke}, &modes_buf) };
+            n_exts += 1;
+            // RFC 8446 §4.2.11.1: the age in milliseconds plus `ticket_age_add`, mod 2^32.
+            const age_s: i64 = @max(0, self.config.now_sec - t.received_at_s);
+            const age_ms: u32 = @truncate(@as(u64, @intCast(age_s)) *% 1000);
+            const identities = [_]messages.PskIdentity{.{ .identity = t.identity(), .obfuscated_ticket_age = age_ms +% t.ticket_age_add }};
+            const binders = [_][]const u8{suitehash.zeros(t.suite.hash())};
+            exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = try messages.encodeOfferedPsks(.{ .identities = &identities, .binders = &binders }, &psk_buf) };
+            n_exts += 1;
+        }
+
+        const ch_full = try messages.encodeClientHello(.{
             .random = self.client_random,
             .legacy_session_id = &.{},
             .cipher_suites = cs_list,
             .extensions = exts_buf[0..n_exts],
         }, body_buf);
+        if (ticket) |t| {
+            const alg = t.suite.hash();
+            @memcpy(self.offered_psk[0..alg.len()], t.psk[0..alg.len()]);
+            const binder_len: usize = 2 + 1 + alg.len();
+            if (ch_full.len < binder_len) return error.Malformed;
+            var th_buf: Secret = undefined;
+            const binder_th = self.transcript.wouldBeHash(alg, @backingInt(messages.HandshakeType.client_hello), ch_full.len, ch_full[0 .. ch_full.len - binder_len], &th_buf);
+            var es: Secret = undefined;
+            var bk: Secret = undefined;
+            var binder: Secret = undefined;
+            defer std.crypto.secureZero(u8, &es);
+            defer std.crypto.secureZero(u8, &bk);
+            suitehash.earlySecret(alg, &es, t.psk[0..alg.len()]);
+            suitehash.resumptionBinderKey(alg, &bk, &es);
+            const b = suitehash.pskBinder(alg, &binder, &bk, binder_th);
+            @memcpy(ch_full[ch_full.len - b.len ..], b);
+        }
+        return ch_full;
     }
 
     /// `.cert_dhe` server helper: finds a usable share in the CLIENT's
@@ -4245,7 +4524,7 @@ pub const Connection = struct {
     fn handleFlightServer(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.state) {
             .start => self.serverProcessClientHello(datagram, entropy, now_ms, out),
-            .wait_finished => self.serverProcessClientFinished(datagram, out),
+            .wait_finished => self.serverProcessClientFinished(datagram, entropy, now_ms, out),
             else => error.WrongState,
         };
     }
@@ -4553,10 +4832,35 @@ pub const Connection = struct {
             },
         }
 
-        const suite = selectCipherSuite(&self.config, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        // Resumption (`Config.tickets`, `.cert_dhe` modes): a ticket this
+        // server sealed, offered as identity 0 under `psk_dhe_ke`, still
+        // within its lifetime, and a suite of its hash offered (the
+        // HelloRetryRequest's suite, if one was sent). Anything short of that
+        // is ignored and the handshake runs in full (RFC 8446 §4.2.11: the
+        // server MAY ignore a PSK). A ticket that opens but whose binder does
+        // not verify aborts (§4.2.11: MUST).
+        var resume_state: ?TicketState = null;
+        defer if (resume_state) |*r| std.crypto.secureZero(u8, &r.psk);
+        if (self.config.key_exchange.isCertDhe()) {
+            if (self.config.tickets) |tk| resume_state = self.serverOpenTicket(tk, dec.extensions);
+        }
+        const suite = blk: {
+            if (resume_state) |r| {
+                if (selectCipherSuiteOfHash(&self.config, dec.cipher_suites_raw, r.suite.hash())) |s_| {
+                    if (retry_suite == null or retry_suite.? == s_) break :blk s_;
+                }
+                std.crypto.secureZero(u8, &resume_state.?.psk);
+                resume_state = null;
+            }
+            break :blk selectCipherSuite(&self.config, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        };
         const alg = suite.hash();
         // RFC 8446 §7.1: no PSK ⇒ PSK = 0^Hash.length, of the suite's hash.
-        if (self.config.key_exchange.isCertDhe()) suitehash.earlySecret(alg, &es, suitehash.zeros(alg));
+        if (resume_state) |*r| {
+            try self.serverCheckResumptionBinder(ch_body, dec.extensions, alg, r.psk[0..alg.len()]);
+            suitehash.earlySecret(alg, &es, r.psk[0..alg.len()]);
+            self.did_resume = true;
+        } else if (self.config.key_exchange.isCertDhe()) suitehash.earlySecret(alg, &es, suitehash.zeros(alg));
         // RFC 8446 §4.1.4: "Servers MUST ensure that they negotiate the same
         // cipher suite when receiving a conformant updated ClientHello", and
         // a client MUST abort if the ServerHello's suite differs from the
@@ -4615,13 +4919,25 @@ pub const Connection = struct {
         var sh_cid_buf: [1 + max_cid_len]u8 = undefined;
         sh_cid_buf[0] = self.cid_own_len;
         @memcpy(sh_cid_buf[1..][0..self.cid_own_len], self.cid_own[0..self.cid_own_len]);
-        const sh_exts_all = [_]messages.Extension{
-            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
-            sh_ext,
-            // RFC 9146 §3: the server's CID, in the ServerHello.
-            .{ .ext_type = ext_connection_id, .data = sh_cid_buf[0 .. 1 + @as(usize, self.cid_own_len)] },
-        };
-        const sh_exts = sh_exts_all[0..if (self.cid_negotiated) @as(usize, 3) else 2];
+        var sh_psk_buf: [2]u8 = undefined;
+        messages.encodeSelectedIdentity(0, &sh_psk_buf);
+        var sh_exts_all: [4]messages.Extension = undefined;
+        var n_sh: usize = 0;
+        sh_exts_all[n_sh] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions };
+        n_sh += 1;
+        sh_exts_all[n_sh] = sh_ext;
+        n_sh += 1;
+        // RFC 8446 §4.2.11: a resumption names the PSK taken (identity 0).
+        if (self.did_resume) {
+            sh_exts_all[n_sh] = .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = &sh_psk_buf };
+            n_sh += 1;
+        }
+        // RFC 9146 §3: the server's CID, in the ServerHello.
+        if (self.cid_negotiated) {
+            sh_exts_all[n_sh] = .{ .ext_type = ext_connection_id, .data = sh_cid_buf[0 .. 1 + @as(usize, self.cid_own_len)] };
+            n_sh += 1;
+        }
+        const sh_exts = sh_exts_all[0..n_sh];
         var sh_body_buf: [max_server_hello_body]u8 = undefined;
         // RFC 9147 §5: "DTLS implementations do not use the TLS 1.3
         // 'compatibility mode' ... DTLS servers MUST NOT echo the
@@ -4699,7 +5015,9 @@ pub const Connection = struct {
         // `config.request_client_cert` nor `config.cert` is set, reproducing
         // the original PSK-only flight 2 exactly.
 
-        if (self.config.request_client_cert) {
+        // A resumption authenticates by the PSK: no CertificateRequest (RFC
+        // 8446 §4.3.2: "MUST NOT" in a PSK handshake), no Certificate.
+        if (self.config.request_client_cert and !self.did_resume) {
             // RFC 8446 §4.3.2: CertificateRequest MUST carry a
             // `signature_algorithms` extension telling the client what
             // schemes this server can verify — the client's own
@@ -4715,7 +5033,7 @@ pub const Connection = struct {
             cursor += r.bytes.len;
         }
 
-        if (self.config.cert) |cc| {
+        if (if (self.did_resume) null else self.config.cert) |cc| {
             var cert_body_buf: [max_cert_message_body]u8 = undefined;
             const cert_body = messages.encodeCertificate(&.{}, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
             var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
@@ -4748,6 +5066,12 @@ pub const Connection = struct {
         suitehash.deriveMasterSecret(alg, &ms, &hs_secret);
         const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
         suitehash.deriveApplicationSecrets(alg, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, th_through_server_finished);
+        // Kept to the client's Finished for the resumption master secret.
+        if (self.config.tickets != null and self.config.key_exchange.isCertDhe()) {
+            self.master_secret = ms;
+            self.master_live = true;
+        }
+        std.crypto.secureZero(u8, &ms);
 
         try self.cacheFlight(now_ms);
         self.state = .wait_finished;
@@ -4761,11 +5085,11 @@ pub const Connection = struct {
     /// client's Finished, verifies its `verify_data`, and installs the
     /// application traffic secrets derived earlier. Transitions
     /// `.wait_finished` -> `.connected`.
-    fn serverProcessClientFinished(self: *Connection, datagram: []const u8, out: []u8) HandshakeError!HandshakeResult {
+    fn serverProcessClientFinished(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         var pos: usize = 0;
         const cert_result = try self.consumeOptionalCertMessages(datagram, &pos, .client, false);
         if (cert_result.saw_cert and cert_result.leaf_len > 0 and !cert_result.saw_cv) return error.Malformed;
-        if (self.config.request_client_cert) {
+        if (self.config.request_client_cert and !self.did_resume) {
             // A client that was asked for a certificate MUST answer with a
             // Certificate message (possibly an empty one, RFC 8446 §4.4.2's
             // "no certificate available" — a genuine protocol answer, not a
@@ -4808,7 +5132,132 @@ pub const Connection = struct {
         const ack_body = flight.encodeAck(cert_result.acks.items(), &ack_body_buf) catch
             return error.BufferTooShort;
         const ack_record = try self.protectRecord(content_type_ack, ack_body, out);
-        return .{ .out = ack_record, .done = true };
+        var cursor = ack_record.len;
+
+        // RFC 8446 §4.6.1: the session ticket, after the handshake, on the
+        // application epoch; retransmitted by `poll` until ACKed.
+        if (self.master_live) {
+            const th_through_client_finished = self.transcript.currentHash(alg, &th_buf);
+            suitehash.deriveResumptionMasterSecret(alg, &self.resumption_master, &self.master_secret, th_through_client_finished);
+            self.resumption_live = true;
+            std.crypto.secureZero(u8, &self.master_secret);
+            self.master_live = false;
+            if (self.queueSessionTicket(entropy)) {
+                const rn: flight.RecordNumber = .{ .epoch = self.write_epoch, .sequence_number = self.send_seq };
+                const rec = try self.protectRecord(content_type_handshake, self.cm_msg[0..self.cm_msg_len], out[cursor..]);
+                cursor += rec.len;
+                self.cm_records[0] = rn;
+                self.cm_records_len = 1;
+                self.cm_records_next = 1 % max_ku_records;
+                self.cm_state = .in_flight;
+                self.cm_timer.arm(now_ms);
+            }
+        }
+        return .{ .out = out[0..cursor], .done = true };
+    }
+
+    /// Opens an offered ticket (`serverProcessClientHello`): `psk_dhe_ke`
+    /// offered, identity 0 a blob `tk.ticketer` opens under a key it still
+    /// accepts at `Config.now_sec`, its state well-formed and not older than
+    /// its lifetime. Null otherwise — the caller runs a full handshake.
+    fn serverOpenTicket(self: *const Connection, tk: Tickets, exts: []const messages.Extension) ?TicketState {
+        var psk_data: ?[]const u8 = null;
+        var dhe_ok = false;
+        for (exts) |e| {
+            if (e.ext_type == @backingInt(messages.ExtensionType.pre_shared_key)) psk_data = e.data;
+            if (e.ext_type == @backingInt(messages.ExtensionType.psk_key_exchange_modes)) {
+                var modes_buf: [8]messages.PskKeyExchangeMode = undefined;
+                const modes = messages.decodePskKeyExchangeModes(e.data, &modes_buf) catch return null;
+                for (modes) |m| {
+                    if (m == .psk_dhe_ke) dhe_ok = true;
+                }
+            }
+        }
+        if (!dhe_ok) return null;
+        var ids_buf: [4]messages.PskIdentity = undefined;
+        var binders_buf: [4][]const u8 = undefined;
+        const offered = messages.decodeOfferedPsks(psk_data orelse return null, &ids_buf, &binders_buf) catch return null;
+        if (offered.identities.len == 0 or offered.binders.len == 0) return null;
+        var plain: [max_ticket_state]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
+        const opened = tk.ticketer.open(tk.ticketer.ctx, offered.identities[0].identity, self.config.now_sec, &plain) orelse return null;
+        if (opened.len > plain.len) return null;
+        var st = TicketState.parse(opened) orelse return null;
+        const age = self.config.now_sec -| st.issued_s;
+        if (age < 0 or age > st.lifetime_s) {
+            std.crypto.secureZero(u8, &st.psk);
+            return null;
+        }
+        return st;
+    }
+
+    /// RFC 8446 §4.2.11.2 for a resumption PSK (`"res binder"`): binder 0
+    /// over the ClientHello truncated before the binders list.
+    fn serverCheckResumptionBinder(self: *const Connection, ch_body: []const u8, exts: []const messages.Extension, alg: suitehash.HashAlg, psk: []const u8) HandshakeError!void {
+        var psk_data: []const u8 = &.{};
+        for (exts) |e| {
+            if (e.ext_type == @backingInt(messages.ExtensionType.pre_shared_key)) psk_data = e.data;
+        }
+        var ids_buf: [4]messages.PskIdentity = undefined;
+        var binders_buf: [4][]const u8 = undefined;
+        const offered = messages.decodeOfferedPsks(psk_data, &ids_buf, &binders_buf) catch return error.Malformed;
+        const binder0 = offered.binders[0];
+        if (binder0.len != alg.len()) return error.Malformed;
+        // The truncation point: see the `.psk` path above (3 bytes back from
+        // binder 0: its length byte and the list's 2-byte length).
+        const truncate_at = (@intFromPtr(binder0.ptr) - 3) - @intFromPtr(ch_body.ptr);
+        if (truncate_at > ch_body.len) return error.Malformed;
+        var es: Secret = undefined;
+        var bk: Secret = undefined;
+        defer std.crypto.secureZero(u8, &es);
+        defer std.crypto.secureZero(u8, &bk);
+        suitehash.earlySecret(alg, &es, psk);
+        suitehash.resumptionBinderKey(alg, &bk, &es);
+        var th_buf: Secret = undefined;
+        const binder_th = self.transcript.wouldBeHash(alg, @backingInt(messages.HandshakeType.client_hello), ch_body.len, ch_body[0..truncate_at], &th_buf);
+        var expected: Secret = undefined;
+        const eb = suitehash.pskBinder(alg, &expected, &bk, binder_th);
+        if (!suitehash.macEql(alg, eb, binder0)) return error.BinderVerifyFailed;
+    }
+
+    /// Builds this server's NewSessionTicket into the post-handshake slot
+    /// (`cm_*`); false when there is none to send (no ticket lifetime, the
+    /// slot busy, the ticketer refused).
+    fn queueSessionTicket(self: *Connection, entropy: Entropy) bool {
+        const tk = self.config.tickets orelse return false;
+        if (tk.lifetime_s == 0 or self.cm_state != .idle) return false;
+        const alg = self.suite.hash();
+        const nonce = [_]u8{0}; // one ticket per connection (RFC 8446 §4.6.1: unique per connection)
+        var st: TicketState = .{
+            .suite = self.suite,
+            .issued_s = self.config.now_sec,
+            .age_add = entropy.source().int(u32),
+            .lifetime_s = @min(tk.lifetime_s, tlsresume.ticket.max_ticket_lifetime_s),
+            .max_early_data = tk.max_early_data,
+            .psk = undefined,
+        };
+        defer std.crypto.secureZero(u8, &st.psk);
+        suitehash.deriveResumptionPsk(alg, &st.psk, &self.resumption_master, &nonce);
+        var plain_buf: [max_ticket_state]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain_buf);
+        const plain = st.serialize(&plain_buf);
+        var aead_nonce: [12]u8 = undefined;
+        entropy.source().bytes(&aead_nonce);
+        var blob_buf: [max_sealed_ticket]u8 = undefined;
+        const blob = tk.ticketer.seal(tk.ticketer.ctx, plain, aead_nonce, &blob_buf) orelse return false;
+        var ed_buf: [4]u8 = undefined;
+        const ed_ext = [_]tlsresume.ticket.Extension{tlsresume.ticket.earlyDataExtension(tk.max_early_data, &ed_buf)};
+        const nst: tlsresume.ticket.NewSessionTicket = .{
+            .ticket_lifetime = st.lifetime_s,
+            .ticket_age_add = st.age_add,
+            .ticket_nonce = &nonce,
+            .ticket = blob,
+            .extensions = if (tk.max_early_data > 0) &ed_ext else &.{},
+        };
+        var body_buf: [max_nst_body]u8 = undefined;
+        const body = nst.encode(&body_buf) catch return false;
+        self.queueCidMessage(hs_type_new_session_ticket, body);
+        return true;
     }
 
     /// RFC 8446 §4.1.4 / RFC 9147 §5.3: the server refused to proceed on
@@ -5054,8 +5503,23 @@ pub const Connection = struct {
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
                 self.ecdhe_expanded.wipe();
                 self.ecdhe_secret_live = false;
+                // RFC 8446 §4.2.11: a `pre_shared_key` in the ServerHello
+                // selects an offered PSK — the ticket, identity 0, the only
+                // one offered — whose hash must be the suite's.
+                var psk_selected = false;
+                for (sh_dec.extensions) |e| {
+                    if (e.ext_type != @backingInt(messages.ExtensionType.pre_shared_key)) continue;
+                    const t = self.config.resumption orelse return error.NoMatchingPskIdentity;
+                    if (e.data.len != 2) return error.Malformed;
+                    if (messages.decodeSelectedIdentity(e.data[0..2]) != 0) return error.NoMatchingPskIdentity;
+                    if (t.suite.hash() != alg) return error.NoCipherSuiteOverlap;
+                    psk_selected = true;
+                }
                 var es: Secret = undefined;
-                suitehash.earlySecret(alg, &es, suitehash.zeros(alg));
+                defer std.crypto.secureZero(u8, &es);
+                suitehash.earlySecret(alg, &es, if (psk_selected) self.offered_psk[0..alg.len()] else suitehash.zeros(alg));
+                std.crypto.secureZero(u8, &self.offered_psk);
+                self.did_resume = psk_selected;
                 suitehash.deriveHandshakeSecret(alg, &hs_secret, &es, shared.slice());
                 std.crypto.secureZero(u8, &shared.bytes); // forward secrecy: drop the (EC)DHE shared secret
             },
@@ -5087,7 +5551,12 @@ pub const Connection = struct {
         // so `peer_verify` would never be consulted and the handshake would
         // complete anonymously. `require_peer_cert` stays the knob for the
         // PSK-with-certificates mode, where the PSK already authenticates.
-        if (cert_result.leaf_len == 0 and (self.config.require_peer_cert or self.config.key_exchange.requiresPeerAuth()))
+        if (self.did_resume) {
+            // RFC 8446 §2.2: a resumption authenticates by the PSK; a server
+            // that sends a Certificate or CertificateRequest anyway is off
+            // the protocol (§4.3.2: "MUST NOT send the CertificateRequest").
+            if (cert_result.saw_cert or cert_result.requested_client_cert) return error.UnexpectedMessage;
+        } else if (cert_result.leaf_len == 0 and (self.config.require_peer_cert or self.config.key_exchange.requiresPeerAuth()))
             return error.PeerCertificateRequired;
 
         const server_fin = messages.decodeFinished(cert_result.finishedVerifyData());
@@ -5152,6 +5621,15 @@ pub const Connection = struct {
         self.message_seq +%= 1;
         const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
         cursor += client_fin_record.len;
+
+        // RFC 8446 §7.1: the resumption master secret, through the client's
+        // Finished — what a NewSessionTicket's PSK is derived from.
+        if (self.config.key_exchange.isCertDhe()) {
+            const th_through_client_finished = self.transcript.currentHash(alg, &th_buf);
+            suitehash.deriveResumptionMasterSecret(alg, &self.resumption_master, &ms, th_through_client_finished);
+            self.resumption_live = true;
+        }
+        std.crypto.secureZero(u8, &ms);
 
         try self.installApplicationSecrets(suite, ap.client[0..alg.len()], ap.server[0..alg.len()]);
         // `now_ms` is used only on the HelloRetryRequest path above (arming
@@ -5356,6 +5834,18 @@ pub fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48)
 /// RFC 8446 §4.1.4 requires the HelloRetryRequest and the eventual
 /// ServerHello to select the same suite, and the surest way to guarantee
 /// that is for both to run the same code over the same inputs.
+/// `selectCipherSuite` restricted to suites of `alg` (a resumption PSK's hash).
+fn selectCipherSuiteOfHash(config: *const Config, offered_raw: []const u8, alg: suitehash.HashAlg) ?CipherSuite {
+    for (config.cipher_suites) |want| {
+        if (want.hash() != alg or !Connection.suiteUsable(config, want)) continue;
+        var it = messages.CipherSuiteIter{ .raw = offered_raw };
+        while (it.next()) |offered| {
+            if (offered == @backingInt(want)) return want;
+        }
+    }
+    return null;
+}
+
 fn selectCipherSuite(config: *const Config, offered_raw: []const u8) ?CipherSuite {
     for (config.cipher_suites) |want| {
         if (!Connection.suiteUsable(config, want)) continue;
@@ -11570,4 +12060,211 @@ test "connection ID updates: refused without a negotiated CID, malformed bodies 
     try testing.expectError(error.Malformed, c2.takeNewConnectionIds(&.{ 0, 0, 0 })); // empty list
     try c2.takeNewConnectionIds(&.{ 0, 4, 1, 'a', 1, 'b', 0 });
     try testing.expectEqualStrings("a", c2.peerConnectionId().?);
+}
+
+// ── session resumption (DTLS 1.3) ──────────────────────────────────────────
+
+const TestTicketer = StekTicketer(tlsresume.stek.DefaultRing);
+
+fn ticketRing() tlsresume.stek.DefaultRing {
+    var ring: tlsresume.stek.DefaultRing = .init();
+    ring.rotate(1, &@as([32]u8, @splat(0x42)), cert_kat.valid_now_sec);
+    return ring;
+}
+
+/// Delivers every record of `bytes` to `to`; post-handshake messages and
+/// ACKs are expected, application data is not.
+fn deliverPostHandshake(to: *Connection, bytes: []const u8) !void {
+    var rest = bytes;
+    var plain: [512]u8 = undefined;
+    while (rest.len > 0) {
+        const n = try recordWireLen(rest);
+        if (to.recv(rest[0..n], &plain)) |_| {
+            return error.TestUnexpectedApplicationData;
+        } else |e| switch (e) {
+            error.ReceivedAck, error.ReceivedPostHandshakeMessage => {},
+            else => return e,
+        }
+        rest = rest[n..];
+    }
+}
+
+/// A full cert-DHE handshake whose server issues a ticket; returns the
+/// client's copy of it.
+fn ticketHandshake(server_cfg: Config, client_cfg: Config, seed: u8) !SessionTicket {
+    var client = try Connection.clientInit(client_cfg);
+    defer client.deinit();
+    var server = try Connection.serverInit(server_cfg);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+    try testing.expect(cf.done);
+    const sr = try server.handleFlight(cf.out, rnd, 0, &buf2);
+    try testing.expect(sr.done);
+    try testing.expect(!client.resumed() and !server.resumed());
+    try testing.expect(server.connectionIdUpdatePending()); // the ticket awaits its ACK
+    try deliverPostHandshake(&client, sr.out);
+    const t = client.sessionTicket() orelse return error.TestNoTicket;
+    // The client ACKs it; the server's slot clears.
+    var ack_store: [256]u8 = undefined;
+    const ack = (try pollOne(&client, 1, &ack_store)) orelse return error.TestNoAck;
+    try deliverPostHandshake(&server, ack);
+    try testing.expect(!server.connectionIdUpdatePending());
+    return t.*;
+}
+
+fn resumptionServerConfig(tkr: *const TestTicketer) Config {
+    var c = certDheServerConfig();
+    c.tickets = .{ .ticketer = tkr.ticketer() };
+    c.now_sec = cert_kat.valid_now_sec;
+    return c;
+}
+
+test "resumption: a ticket from a cert-DHE handshake resumes with psk_dhe_ke, no certificate, app data round-trips" {
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    var scfg = resumptionServerConfig(&tkr);
+    var t = try ticketHandshake(scfg, certDheClientConfig(), 0x90);
+    defer t.wipe();
+    try testing.expectEqual(CipherSuite.aes_128_gcm_sha256, t.suite);
+    try testing.expectEqual(@as(u32, 12 * 3600), t.lifetime_s);
+    try testing.expectEqual(@as(u32, 0), t.max_early_data);
+
+    var ccfg = certDheClientConfig();
+    ccfg.now_sec += 30;
+    scfg.now_sec += 30;
+    ccfg.resumption = &t;
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var server = try Connection.serverInit(scfg);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expect(server.resumed());
+    // Flight 2 is ServerHello + EncryptedExtensions + Finished only: the
+    // certificate flight of the first handshake is not repeated.
+    try testing.expectEqual(@as(usize, 3), countRecords(f2.out));
+    const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+    try testing.expect(cf.done and client.resumed());
+    const sr = try server.handleFlight(cf.out, rnd, 0, &buf2);
+    try testing.expect(sr.done);
+    try expectSameKeys(&client, &server);
+    try deliverPostHandshake(&client, sr.out);
+    // A resumed connection issues a fresh ticket too (RFC 8446 §4.6.1).
+    try testing.expect(client.sessionTicket() != null);
+    try testing.expect(!std.mem.eql(u8, client.sessionTicket().?.identity(), t.identity()));
+    try expectRoundTrip(&client, &server, "resumed");
+    try expectRoundTrip(&server, &client, "resumed back");
+}
+
+test "resumption: an unusable ticket falls back to a full handshake; a forged binder aborts" {
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    const scfg = resumptionServerConfig(&tkr);
+    var t = try ticketHandshake(scfg, certDheClientConfig(), 0x92);
+    defer t.wipe();
+
+    const Case = enum { no_tickets, expired, corrupt_blob, other_ring, forged_binder };
+    for ([_]Case{ .no_tickets, .expired, .corrupt_blob, .other_ring, .forged_binder }) |case| {
+        var tc = t;
+        var sc = scfg;
+        var other_ring = ticketRing();
+        other_ring.rotate(1, &@as([32]u8, @splat(0x43)), cert_kat.valid_now_sec);
+        const other: TestTicketer = .{ .ring = &other_ring };
+        switch (case) {
+            .no_tickets => sc.tickets = null,
+            .expired => sc.now_sec += 12 * 3600 + 1,
+            .corrupt_blob => tc.ticket[20] ^= 1,
+            .other_ring => sc.tickets = .{ .ticketer = other.ticketer() },
+            .forged_binder => tc.psk[0] ^= 1,
+        }
+        var ccfg = certDheClientConfig();
+        ccfg.resumption = &tc;
+        var client = try Connection.clientInit(ccfg);
+        defer client.deinit();
+        var server = try Connection.serverInit(sc);
+        defer server.deinit();
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x93)));
+        const rnd = seededForTest(&csprng);
+        var buf1: [4096]u8 = undefined;
+        var buf2: [4096]u8 = undefined;
+        const ch = try client.startHandshake(rnd, 0, &buf1);
+        if (case == .forged_binder) {
+            try testing.expectError(error.BinderVerifyFailed, server.handleFlight(ch, rnd, 0, &buf2));
+            continue;
+        }
+        const f2 = try server.handleFlight(ch, rnd, 0, &buf2);
+        const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+        _ = try server.handleFlight(cf.out, rnd, 0, &buf2);
+        try testing.expect(!client.resumed() and !server.resumed());
+        try expectRoundTrip(&client, &server, "full handshake");
+    }
+}
+
+test "resumption: a client that offered no ticket rejects a ServerHello selecting a PSK" {
+    // A server that answers with `pre_shared_key` though no ticket was
+    // offered: the client refuses (RFC 8446 §4.2.11).
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    const scfg = resumptionServerConfig(&tkr);
+    var t = try ticketHandshake(scfg, certDheClientConfig(), 0x94);
+    defer t.wipe();
+    var ccfg = certDheClientConfig();
+    ccfg.resumption = &t;
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var server = try Connection.serverInit(scfg);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x95)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expect(server.resumed());
+    var plain_client = try Connection.clientInit(certDheClientConfig());
+    defer plain_client.deinit();
+    _ = try plain_client.startHandshake(rnd, 0, &buf1);
+    try testing.expectError(error.NoMatchingPskIdentity, plain_client.handleFlight(f2.out, rnd, 0, &buf1));
+}
+
+test "resumption: behind the server's HelloRetryRequest cookie, ClientHello2 carries the ticket with a binder over the retry transcript" {
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    var scfg = resumptionServerConfig(&tkr);
+    var t = try ticketHandshake(scfg, certDheClientConfig(), 0x96);
+    defer t.wipe();
+    scfg.hello_retry = .{ .cookie_secret = hrr_cookie_secret, .peer_binding = "198.51.100.7:4433" };
+
+    var ccfg = certDheClientConfig();
+    ccfg.resumption = &t;
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x97)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var first = try Connection.serverInit(scfg);
+    defer first.deinit();
+    const hrr = try first.handleFlight(ch1, rnd, 0, &buf2);
+    _ = try expectHelloRetryRequest(hrr.out);
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    var server = try Connection.serverInit(scfg);
+    defer server.deinit();
+    const f2 = try server.handleFlight(ch2.out, rnd, 0, &buf2);
+    try testing.expect(server.resumed());
+    const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+    try testing.expect(cf.done and client.resumed() and client.sawHelloRetryRequest());
+    _ = try server.handleFlight(cf.out, rnd, 0, &buf2);
+    try expectRoundTrip(&client, &server, "resumed after a retry");
 }
