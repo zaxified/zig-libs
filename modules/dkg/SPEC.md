@@ -432,7 +432,8 @@ here.
 ## What is deliberately not done
 
 - **`n`-of-`n` and any `n < 2t − 1`**: refused (`NoHonestMajority`), because GJKR needs an
-  honest majority; a FROST-style DKG with a proof of knowledge takes any `t ≤ n` (see Backlog).
+  honest majority; a FROST-style DKG with a proof of knowledge takes any `t ≤ n` — that one is
+  `frost.dkg` (frost-core's DKG, for FROST signing; this module's shares feed ECDSA).
 - **Revoking old shares on resharing**: not possible by construction; the guarantee is proactive.
 - **Encrypting or wrapping snapshots**: the references do not either; protection at rest is the
   caller's.
@@ -457,14 +458,19 @@ The transcript is deterministic (coefficients hashed from labels), regenerated b
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Resharing with aux refresh**: a membership change needs new parties' Paillier / ring-Pedersen
   material; today it is attached by the caller.
-- **A FROST-flavoured DKG (Pedersen DKG with proof of knowledge, RFC 9591 ciphersuite)**: sibling
-  `frost` has only a trusted dealer, and frost-core ships a DKG; the `commit.zig` / `core.zig`
-  pieces are curve-generic in spirit but bound to secp256k1 `Element` / `Scalar` from
-  `threshold_ecdsa`. Effort: medium; belongs with the `frost` module. Fits §2.
+  Size: weeks — it is CGGMP21's auxiliary-info refresh protocol (with its Paillier-Blum and
+  ring-Pedersen proofs), the same sub-protocol as the next-but-one item; do the two together.
 - **CGGMP21 signing-phase identifiable abort** (naming a culprit during signing): a separate
   increment on top of `threshold_ecdsa` signing.
+  Size: weeks — new proofs and a blame round in `threshold_ecdsa`'s signing, not in this module.
 - **Distributed aux-parameter generation** (jointly producing the ring-Pedersen `(Ñ, h1, h2)`
   and Paillier moduli): here those are per-party local key material attached by
   `assembleKeyShares`.
+  Size: weeks — CGGMP21's aux-info generation as a network protocol (cggmp21's separate
+  `aux_info_gen`), with its zero-knowledge proofs.
