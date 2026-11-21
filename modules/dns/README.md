@@ -184,6 +184,10 @@ everything it returns lives in `arena`.
   retried with a 10 % chance per query, as c-ares), `cookies = true` (RFC 7873: client cookie per server, server cookie
   learned, BADCOOKIE retried), `edns_padding_block = 128` (RFC 8467 query padding over DoT and DoH) and
   `dot_reuse = true` (one idle DoT session kept for the next query, RFC 7858 §3.4).
+- Routing and observation, off by default: `routes` (split DNS: names under a domain go to their own servers, longest domain
+  wins), `parallel_servers = 2` (ask that many servers at once, first usable reply wins; needs a thread-tolerant allocator),
+  `filter_addresses = &dns.Resolver.private_ranges` (drop private addresses from `lookupIp`, Unbound `private-address`) and
+  `server_metrics = true` with `Resolver.serverStats` (queries, replies, timeouts, round-trip time per server).
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
   set `edns_udp_size = null` for plain RFC 1035 queries.
 - DoH uses query id 0 (RFC 8484 §4.1 cache friendliness).
@@ -244,5 +248,5 @@ network) and `zig build live-dns` (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of
 
 DNSSEC validation (the sibling `dnssec` module; `authenticated` is a trusted
 upstream's AD bit), IDNA, per-address TTLs, server failover memory, DNS cookie
-state, DoT connection reuse and RFC 8467 padding, DoQ / DoH3, split DNS. See
+state, DoT connection reuse and RFC 8467 padding, DoQ / DoH3. See
 `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.

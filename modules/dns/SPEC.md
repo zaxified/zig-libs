@@ -130,6 +130,24 @@ that the parallel A/AAAA copy shares under a mutex; a `CachingResolver` therefor
   of the state for the exchange, so concurrent exchanges never share a session and an error, a cancel or a deadline closes
   it rather than put it back. A reused session that fails is replaced once; a fresh one that fails is the error.
 
+**Routing, parallel asks, filters, metrics.** Four more opt-in options on `Resolver.Options`:
+- `routes` (split DNS: dnsmasq `server=/domain/ip`, Unbound `forward-zone`, systemd-resolved routing domains; Go, glibc and
+  c-ares have none, so empty): a name at or under a route's `domain` is asked at that route's servers; the longest domain wins
+  (label-aligned, ASCII case-insensitive), "" or "." is the catch-all, every search-list candidate is routed by its own name, a
+  route without servers is `InvalidOptions`. Not applied to DoH or `exchange`.
+- `parallel_servers` (hickory `num_concurrent_reqs`, dnsmasq `all-servers`; Go, glibc and c-ares ask one at a time, so 1): the
+  servers of a round are asked in groups of this many on copies of the `Resolver` (as the parallel A/AAAA does), the first reply
+  that is not a server failure wins, the rest are canceled and a finished loser's reply freed; a group whose members all failed is
+  followed by the next, and the usual order (`rotate`, failover marks) decides the groups. Up to 64 servers; it needs a `gpa` that
+  tolerates several threads (the family copies use a locking wrapper, but the winning reply outlives it).
+- `filter_addresses` (Unbound `private-address`, dnsmasq `ignore-address` / `stop-dns-rebind`): `lookupIp` drops A/AAAA addresses
+  inside the prefixes; a reply left without any is NODATA, not an empty "found". `private_ranges` is the usual list. `query`,
+  `reverse` and /etc/hosts are not filtered.
+- `server_metrics` (hickory keeps the same per name server): `serverStats(out)` returns per server the queries, replies, rcode
+  failures, timeouts, other errors and the round-trip time (last, mean); the 16 most recent servers are kept. A "query" is one ask of
+  one server with its follow-ups (TCP on truncation, plain form, BADCOOKIE repeat). A `CachingResolver` keeps one set per pooled
+  `Resolver` and exposes none.
+
 **Typed rdata.** `rdata.zig` gives typed views of TLSA, SSHFP, URI, NAPTR and SVCB/HTTPS rdata
 (`rdata.parse(T, arena, rec)` over `Record.data.unknown`); there is no new `Record.Data` variant, so the sibling `dnssec`
 module's switches are unchanged (README *Layout*).
@@ -408,8 +426,7 @@ Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names 
   query. Medium.
 - **IDNA (UTS #46 / RFC 5891) name encoding**: dnspython encodes U-labels; Go, c-ares and hickory leave it to the caller,
   as this module does. Needs Unicode mapping tables (a sibling module's job, not the resolver's).
-- **Split DNS, DoQ / DoH3, parallel servers, answer filters, per-server metrics**: service-level (systemd-resolved per-link
-  routing) or hickory feature flags; DoQ/DoH3 need a QUIC stack the collection does not have. Niche for a stub resolver.
+- **DoQ / DoH3**: need a QUIC stack the collection does not have.
 
 ## Anchoring
 

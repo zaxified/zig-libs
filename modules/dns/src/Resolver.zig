@@ -149,7 +149,23 @@ const State = struct {
     health_next: u8 = 0,
     cookies: [max_tracked]CookieSlot = @splat(.{}),
     cookies_next: u8 = 0,
+    stats: [max_tracked]ServerStats = undefined,
+    stats_len: u8 = 0,
+    stats_next: u8 = 0,
     dot: if (dot_enabled) ?*DotConn else void = if (dot_enabled) null else {},
+
+    fn statsOf(st: *State, ip: netaddr.Ip) *ServerStats {
+        for (st.stats[0..st.stats_len]) |*x| if (x.server.eql(ip)) return x;
+        if (st.stats_len < max_tracked) {
+            st.stats[st.stats_len] = .{ .server = ip };
+            st.stats_len += 1;
+            return &st.stats[st.stats_len - 1];
+        }
+        const x = &st.stats[st.stats_next];
+        st.stats_next = (st.stats_next + 1) % max_tracked;
+        x.* = .{ .server = ip };
+        return x;
+    }
 
     fn healthOf(st: *State, ip: netaddr.Ip) ?*Health {
         for (&st.health) |*h| if (h.ip) |x| if (x.eql(ip)) return h;
@@ -336,8 +352,87 @@ pub const Options = struct {
     /// only where resolv.conf is read at all (no explicit `servers`, or the
     /// search list in use).
     resolv_conf_recheck_ms: ?u32 = 5000,
+    /// Split DNS (dnsmasq `server=/domain/ip`, Unbound `forward-zone`,
+    /// systemd-resolved routing domains): a query whose name is at or under a
+    /// route's `domain` goes to that route's `servers` instead of the default
+    /// list (`servers` / resolv.conf); the LONGEST matching domain wins, a
+    /// `domain` of "" or "." matches every name. Matching is label-aligned
+    /// and ASCII case-insensitive; every candidate of a search-list expansion
+    /// is routed by its own name. A route without servers is
+    /// `InvalidOptions`. Not applied to DoH or to `exchange` (the caller names
+    /// the server). The slices must outlive the Resolver.
+    routes: []const Route = &.{},
+    /// Servers asked at the same time per round (hickory `num_concurrent_reqs`,
+    /// dnsmasq `all-servers`): the first reply that is not a server failure
+    /// wins and the others are canceled. 1 (the default, as Go, glibc and
+    /// c-ares) asks one server at a time and moves on after a failure or a
+    /// timeout; 0 is `InvalidOptions`. The servers are taken in the usual
+    /// order (`rotate`, failover marks) in groups of this many; a group whose
+    /// members all failed is followed by the next. Needs an `Io` with
+    /// concurrency (else the group runs one after the other), at most 64
+    /// servers (more are asked one at a time), and a `gpa` safe to use from
+    /// several threads (as `CachingResolver` already requires). Not applied to
+    /// DoH. CONSUMER-VISIBLE: several servers see every query.
+    parallel_servers: u8 = 1,
+    /// Answer filter for `lookupIp` (Unbound `private-address`, dnsmasq
+    /// `ignore-address` and `stop-dns-rebind`): an A / AAAA record whose address
+    /// lies in one of these prefixes is dropped from the answer; when that
+    /// leaves nothing the result is NODATA. `private_ranges` is the usual
+    /// rebinding-protection list. Does not touch `query`, `reverse` or
+    /// /etc/hosts.
+    filter_addresses: []const netaddr.Prefix = &.{},
+    /// Per-server counters (`Resolver.serverStats`): queries, replies,
+    /// timeouts, errors, rcode failures and round-trip time per server (hickory
+    /// keeps the same per name server). Costs one mutex per asked server.
+    server_metrics: bool = false,
     hosts_path: []const u8 = "/etc/hosts",
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
+};
+
+/// `Options.routes`: names under `domain` are asked at `servers`.
+pub const Route = struct {
+    domain: []const u8,
+    servers: []const netaddr.Ip,
+};
+
+/// The ranges `Options.filter_addresses` is usually set to: what a public name
+/// has no business resolving to (RFC 1918, loopback, link-local, CGNAT, ULA,
+/// "this network", IPv4-mapped).
+pub const private_ranges = [_]netaddr.Prefix{
+    netaddr.parsePrefix("0.0.0.0/8").?,
+    netaddr.parsePrefix("10.0.0.0/8").?,
+    netaddr.parsePrefix("100.64.0.0/10").?,
+    netaddr.parsePrefix("127.0.0.0/8").?,
+    netaddr.parsePrefix("169.254.0.0/16").?,
+    netaddr.parsePrefix("172.16.0.0/12").?,
+    netaddr.parsePrefix("192.168.0.0/16").?,
+    netaddr.parsePrefix("::1/128").?,
+    netaddr.parsePrefix("::ffff:0:0/96").?,
+    netaddr.parsePrefix("fc00::/7").?,
+    netaddr.parsePrefix("fe80::/10").?,
+};
+
+/// Counters of one server (`Resolver.serverStats`). A "query" is one ask of
+/// the server for one name and type: its retries over TCP, without EDNS or
+/// with a cookie are part of it.
+pub const ServerStats = struct {
+    server: netaddr.Ip,
+    queries: u64 = 0,
+    /// A reply of any rcode came back.
+    replies: u64 = 0,
+    /// Of `replies`: SERVFAIL, NOTIMP or REFUSED.
+    failure_rcodes: u64 = 0,
+    /// No reply in time.
+    timeouts: u64 = 0,
+    /// No reply for another reason (socket error, TLS, malformed answer).
+    errors: u64 = 0,
+    rtt_total_ns: u64 = 0,
+    rtt_last_ns: u64 = 0,
+
+    /// Mean round-trip time over the replies; null with none.
+    pub fn rttMeanNs(s: ServerStats) ?u64 {
+        return if (s.replies == 0) null else s.rtt_total_ns / s.replies;
+    }
 };
 
 /// `Options.server_failover` (c-ares defaults: 5 s, 10 %).
@@ -707,8 +802,8 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
                 r.rotate_next = r6.rotate_next;
                 defer if (res4) |*m| m.deinit() else |_| {};
                 defer if (res6) |*m| m.deinit() else |_| {};
-                try takeFamily(arena, &list, candidate, .a, &res4, &cand, &last_err, &partial);
-                try takeFamily(arena, &list, candidate, .aaaa, &res6, &cand, &last_err, &partial);
+                try takeFamily(arena, &list, candidate, .a, &res4, &cand, &last_err, &partial, r.options.filter_addresses);
+                try takeFamily(arena, &list, candidate, .aaaa, &res6, &cand, &last_err, &partial, r.options.filter_addresses);
                 break :families;
             }
             const types: []const message.Type = switch (fam) {
@@ -719,7 +814,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
             for (types) |ty| {
                 var res = r.query(candidate, ty);
                 defer if (res) |*m| m.deinit() else |_| {};
-                try takeFamily(arena, &list, candidate, ty, &res, &cand, &last_err, &partial);
+                try takeFamily(arena, &list, candidate, ty, &res, &cand, &last_err, &partial, r.options.filter_addresses);
             }
             break :families;
         }
@@ -1324,12 +1419,15 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     _ = try r.encodeChecked(&qbuf, name, ty, 0);
 
     try r.ensureState();
-    const servers = try r.serverList();
+    if (r.options.parallel_servers == 0) return error.InvalidOptions;
+    const servers = try r.serversFor(name);
     const rbuf = try r.gpa.alloc(u8, @max(512, r.options.edns_udp_size orelse 0));
     defer r.gpa.free(rbuf);
     // `server_failover`: the servers that failed recently are asked after the
     // others (bit i = servers[i]); none without the option.
     const down = r.downMask(servers);
+    const group: usize = r.options.parallel_servers;
+    const parallel = group > 1 and servers.len > 1 and servers.len <= max_ordered;
 
     var last_err: ?Error = null;
     // The last reply from a server that failed (`serverFailed`), kept in case
@@ -1339,6 +1437,32 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var attempt: u8 = 0;
     rounds: while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         const first = r.rotateStart(servers.len);
+        if (parallel) {
+            // The usual order (healthy servers, then the marked ones), asked
+            // `parallel_servers` at a time.
+            var order: [max_ordered]u8 = undefined;
+            var n: usize = 0;
+            for (0..2) |pass| {
+                if (pass == 1 and down == 0) break;
+                for (0..servers.len) |k| {
+                    const idx = (first + k) % servers.len;
+                    if (((down >> @intCast(idx)) & 1 != 0) != (pass == 1)) continue;
+                    order[n] = @intCast(idx);
+                    n += 1;
+                }
+            }
+            var pos: usize = 0;
+            while (pos < n) {
+                if (r.callExpired()) {
+                    last_err = error.Timeout;
+                    break :rounds;
+                }
+                const end = @min(n, pos + group);
+                if (try r.askGroup(servers, order[pos..end], name, ty, &failed, &last_err)) |msg| return msg;
+                pos = end;
+            }
+            continue :rounds;
+        }
         for (0..2) |pass| {
             if (pass == 1 and down == 0) break;
             for (0..servers.len) |k| {
@@ -1352,41 +1476,119 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                     last_err = error.Timeout;
                     break :rounds;
                 }
-                const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
-                var msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse {
-                    r.noteServer(server, false);
+                var ask_err: ?Error = null;
+                const t0 = r.nowNsIf();
+                var msg = (try r.askFull(server, name, ty, &qbuf, rbuf, &ask_err)) orelse {
+                    r.noteServer(server, .{ .no_reply = ask_err }, r.sinceNs(t0));
+                    if (ask_err) |e| last_err = e;
                     continue;
                 };
-                // RFC 6891 §7: a server that answers an EDNS query with FORMERR
-                // (and no OPT of its own) or BADVERS does not speak EDNS; ask it
-                // once more in plain RFC 1035 form, and from now on only so. Not
-                // on SERVFAIL (DNS flag day 2020). The retry is checked like any
-                // reply (id, question), so a spoofed FORMERR can only cost this
-                // server its EDNS, never inject an answer.
-                if (edns and refusesEdns(&msg)) {
-                    msg.deinit();
-                    r.rememberNoEdns(server);
-                    msg = (try r.askServer(server, name, ty, &qbuf, rbuf, false, &last_err)) orelse {
-                        r.noteServer(server, false);
-                        continue;
-                    };
-                }
-                // RFC 7873 §5.2.3: BADCOOKIE carries the server cookie to use;
-                // `askServer` learned it, so asking once more sends it.
-                if (r.options.cookies and edns and msg.rcode() == .bad_cookie) {
-                    msg.deinit();
-                    msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse {
-                        r.noteServer(server, false);
-                        continue;
-                    };
-                }
-                r.noteServer(server, !serverFailed(msg.rcode()));
+                r.noteServer(server, .{ .reply = msg.rcode() }, r.sinceNs(t0));
                 return settle(&failed, msg) orelse continue;
             }
         }
     }
     if (failed) |msg| return msg;
     return last_err orelse error.Timeout;
+}
+
+/// One server, one query, with the follow-ups a reply can call for: the plain
+/// form for a server that refused EDNS (RFC 6891 §7), the repeat after a
+/// BADCOOKIE (RFC 7873 §5.2.3). Null after a transport failure (its error in
+/// `last_err`).
+fn askFull(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Type, qbuf: []u8, rbuf: []u8, last_err: *?Error) Error!?message.Message {
+    const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
+    var msg = (try r.askServer(server, name, ty, qbuf, rbuf, edns, last_err)) orelse return null;
+    // RFC 6891 §7: a server that answers an EDNS query with FORMERR
+    // (and no OPT of its own) or BADVERS does not speak EDNS; ask it
+    // once more in plain RFC 1035 form, and from now on only so. Not
+    // on SERVFAIL (DNS flag day 2020). The retry is checked like any
+    // reply (id, question), so a spoofed FORMERR can only cost this
+    // server its EDNS, never inject an answer.
+    if (edns and refusesEdns(&msg)) {
+        msg.deinit();
+        r.rememberNoEdns(server);
+        msg = (try r.askServer(server, name, ty, qbuf, rbuf, false, last_err)) orelse return null;
+    }
+    // RFC 7873 §5.2.3: BADCOOKIE carries the server cookie to use;
+    // `askServer` learned it, so asking once more sends it.
+    if (r.options.cookies and edns and msg.rcode() == .bad_cookie) {
+        msg.deinit();
+        msg = (try r.askServer(server, name, ty, qbuf, rbuf, edns, last_err)) orelse return null;
+    }
+    return msg;
+}
+
+const GroupResult = struct {
+    slot: u8,
+    out: Error!?message.Message,
+    err: ?Error,
+    rtt_ns: u64,
+};
+
+fn groupTask(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Type, slot: u8) GroupResult {
+    var qbuf: [message.max_query_len]u8 = undefined;
+    const rbuf = r.gpa.alloc(u8, @max(512, r.options.edns_udp_size orelse 0)) catch
+        return .{ .slot = slot, .out = error.OutOfMemory, .err = null, .rtt_ns = 0 };
+    defer r.gpa.free(rbuf);
+    var err: ?Error = null;
+    const t0 = r.nowNsIf();
+    const out = r.askFull(server, name, ty, &qbuf, rbuf, &err);
+    return .{ .slot = slot, .out = out, .err = err, .rtt_ns = r.sinceNs(t0) };
+}
+
+/// `Options.parallel_servers`: ask the servers `idxs` of `servers` at once, on
+/// copies of this Resolver (as the parallel address families do), and return the
+/// first reply that is not a server failure; the others are canceled. Null when
+/// every one of them failed (their failed replies go through `settle`, their
+/// errors into `last_err`).
+fn askGroup(r: *Resolver, servers: []const netaddr.Ip, idxs: []const u8, name: []const u8, ty: message.Type, failed: *?message.Message, last_err: *?Error) Error!?message.Message {
+    const Sel = std.Io.Select(union(enum) { done: GroupResult });
+    var buf: [max_ordered]Sel.Union = undefined;
+    var sel = Sel.init(r.io, buf[0..idxs.len]);
+    var copies: [max_ordered]Resolver = undefined;
+    for (idxs, 0..) |idx, i| {
+        copies[i] = r.*;
+        sel.async(.done, groupTask, .{ &copies[i], servers[idx], name, ty, @as(u8, @intCast(i)) });
+    }
+    var winner: ?message.Message = null;
+    var fatal: ?Error = null;
+    var left = idxs.len;
+    while (left > 0 and winner == null and fatal == null) {
+        const got = sel.await() catch |err| {
+            fatal = err;
+            break;
+        };
+        left -= 1;
+        const res = got.done;
+        const server = servers[idxs[res.slot]];
+        const out = res.out catch |err| {
+            fatal = err;
+            continue;
+        };
+        const msg = out orelse {
+            r.noteServer(server, .{ .no_reply = res.err }, res.rtt_ns);
+            if (res.err) |e| last_err.* = e;
+            continue;
+        };
+        r.noteServer(server, .{ .reply = msg.rcode() }, res.rtt_ns);
+        if (settle(failed, msg)) |m| winner = m;
+    }
+    // The losers: cancel them and free what a finished one left behind.
+    while (sel.cancel()) |got| {
+        if (got.done.out) |maybe| {
+            if (maybe) |m| {
+                var x = m;
+                x.deinit();
+            }
+        } else |_| {}
+    }
+    for (copies[0..idxs.len]) |*c| for (c.no_edns) |e| if (e) |ip| r.rememberNoEdns(ip);
+    if (fatal) |e| {
+        if (winner) |*w| w.deinit();
+        return e;
+    }
+    return winner;
 }
 
 /// One attempt at one server: a fresh id, UDP (TCP on truncation, or
@@ -1498,7 +1700,7 @@ fn rememberNoEdns(r: *Resolver, server: netaddr.Ip) void {
 
 fn needsState(r: *const Resolver) bool {
     const o = r.options;
-    if (o.server_failover != null) return true;
+    if (o.server_failover != null or o.server_metrics) return true;
     if (o.cookies and o.doh_url == null) return true;
     return dot_enabled and o.dot_reuse and o.transport == .tls and o.doh_url == null;
 }
@@ -1544,13 +1746,55 @@ fn downMask(r: *Resolver, servers: []const netaddr.Ip) u64 {
     return mask;
 }
 
-/// Record how asking `server` went (a no-op without `server_failover`).
-fn noteServer(r: *Resolver, server: netaddr.Ip, ok: bool) void {
-    if (r.options.server_failover == null) return;
+/// How asking one server went.
+const Outcome = union(enum) {
+    /// A reply with this rcode.
+    reply: message.Rcode,
+    /// Nothing usable came back (the error that ended the ask, if any).
+    no_reply: ?Error,
+};
+
+/// Time stamp for per-server metrics (0 when they are off).
+fn nowNsIf(r: *const Resolver) i96 {
+    return if (r.options.server_metrics) r.nowNs() else 0;
+}
+
+fn sinceNs(r: *const Resolver, t0: i96) u64 {
+    if (!r.options.server_metrics) return 0;
+    return @intCast(@max(0, r.nowNs() - t0));
+}
+
+/// Record how asking `server` went: the failover mark (`server_failover`) and
+/// the counters (`server_metrics`); a no-op with neither.
+fn noteServer(r: *Resolver, server: netaddr.Ip, outcome: Outcome, rtt_ns: u64) void {
+    const track = r.options.server_failover != null;
+    if (!track and !r.options.server_metrics) return;
     const st = r.state orelse return;
+    const ok = switch (outcome) {
+        .reply => |rc| !serverFailed(rc),
+        .no_reply => false,
+    };
     const now = r.nowNs();
     st.mutex.lockUncancelable(r.io);
     defer st.mutex.unlock(r.io);
+    if (r.options.server_metrics) {
+        const x = st.statsOf(server);
+        x.queries += 1;
+        switch (outcome) {
+            .reply => |rc| {
+                x.replies += 1;
+                if (serverFailed(rc)) x.failure_rcodes += 1;
+                x.rtt_total_ns +|= rtt_ns;
+                x.rtt_last_ns = rtt_ns;
+            },
+            .no_reply => |e| if (e != null and e.? == error.Timeout) {
+                x.timeouts += 1;
+            } else {
+                x.errors += 1;
+            },
+        }
+    }
+    if (!track) return;
     if (st.healthOf(server)) |h| {
         h.failed = !ok;
         if (!ok) h.failed_ns = now;
@@ -1559,6 +1803,18 @@ fn noteServer(r: *Resolver, server: netaddr.Ip, ok: bool) void {
     if (ok) return;
     st.health[st.health_next] = .{ .ip = server, .failed_ns = now, .failed = true };
     st.health_next = (st.health_next + 1) % max_tracked;
+}
+
+/// The per-server counters of `Options.server_metrics`, at most `out.len`
+/// servers (the 16 most recent are kept); returns how many were written. Zero
+/// without the option.
+pub fn serverStats(r: *Resolver, out: []ServerStats) usize {
+    const st = r.state orelse return 0;
+    st.mutex.lockUncancelable(r.io);
+    defer st.mutex.unlock(r.io);
+    const n = @min(out.len, st.stats_len);
+    @memcpy(out[0..n], st.stats[0..n]);
+    return n;
 }
 
 fn cookieSlot(r: *const Resolver, st: *State, server: netaddr.Ip) *CookieSlot {
@@ -1809,7 +2065,7 @@ const default_servers = [_]netaddr.Ip{
 /// collected (owner-chain checked, into the result's arena `a`), the reply's
 /// verdict tallied, and failures remembered — a failed family is tolerated
 /// (Go aggregates too) but marks the result `partial`.
-fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, ty: message.Type, res: *Error!message.Message, cand: *Tally, last_err: *?Error, partial: *bool) Error!void {
+fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, ty: message.Type, res: *Error!message.Message, cand: *Tally, last_err: *?Error, partial: *bool, filter: []const netaddr.Prefix) Error!void {
     const msg = res.* catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |e| return e,
         else => {
@@ -1825,8 +2081,26 @@ fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate:
         partial.* = true;
         return;
     }
+    const before = list.items.len;
     try collectAddresses(a, list, &msg, candidate, ty);
-    cand.add(judge(&msg, candidate, ty));
+    var verdict = judge(&msg, candidate, ty);
+    // `Options.filter_addresses`: every address of the reply was filtered out.
+    if (filter.len > 0 and list.items.len > before) {
+        var kept = before;
+        for (list.items[before..]) |ip| {
+            if (filtered(filter, ip)) continue;
+            list.items[kept] = ip;
+            kept += 1;
+        }
+        if (kept == before) verdict.status = .nodata;
+        list.shrinkRetainingCapacity(kept);
+    }
+    cand.add(verdict);
+}
+
+fn filtered(filter: []const netaddr.Prefix, ip: netaddr.Ip) bool {
+    for (filter) |p| if (p.contains(ip)) return true;
+    return false;
 }
 
 fn queryInto(r: *Resolver, name: []const u8, ty: message.Type, out: *(Error!message.Message)) void {
@@ -1914,6 +2188,33 @@ fn serverList(r: *Resolver) Error![]const netaddr.Ip {
     try r.ensureConfig();
     const from_conf = r.conf.?.servers();
     return if (from_conf.len > 0) from_conf else &default_servers;
+}
+
+/// The servers for `name`: the longest matching `Options.routes` entry, else
+/// the default list.
+fn serversFor(r: *Resolver, name: []const u8) Error![]const netaddr.Ip {
+    for (r.options.routes) |rt| if (rt.servers.len == 0) return error.InvalidOptions;
+    if (routeFor(r.options.routes, name)) |rt| return rt.servers;
+    return r.serverList();
+}
+
+/// `Options.routes`: the route with the longest domain that `name` is at or
+/// under (label-aligned, ASCII case-insensitive, trailing dots ignored); the
+/// first of equally long ones.
+fn routeFor(routes: []const Route, name: []const u8) ?*const Route {
+    const n = if (std.mem.eql(u8, name, ".")) "" else stripRootDot(name);
+    var best: ?*const Route = null;
+    var best_len: usize = 0;
+    for (routes) |*rt| {
+        const d = if (std.mem.eql(u8, rt.domain, ".")) "" else stripRootDot(rt.domain);
+        const under = d.len == 0 or (n.len >= d.len and std.ascii.eqlIgnoreCase(n[n.len - d.len ..], d) and
+            (n.len == d.len or n[n.len - d.len - 1] == '.'));
+        if (under and (best == null or d.len > best_len)) {
+            best = rt;
+            best_len = d.len;
+        }
+    }
+    return best;
 }
 
 fn ensureConfig(r: *Resolver) Error!void {
@@ -6077,4 +6378,32 @@ test "encodeFor: RFC 8467 block padding over .tls and DoH only; unpadded when it
     r.options.edns_padding_block = 128;
     r.options.edns_udp_size = null;
     try testing.expectError(error.InvalidOptions, r.encodeFor(&buf, "example.com", .a, 0, true, null));
+}
+
+test "routes: the longest matching domain wins, matching is label-aligned and case-insensitive" {
+    const lo1 = netaddr.Ip{ .v4 = .{ 127, 0, 0, 1 } };
+    const lo2 = netaddr.Ip{ .v4 = .{ 127, 0, 0, 2 } };
+    const a = [_]netaddr.Ip{lo1};
+    const b = [_]netaddr.Ip{lo2};
+    const routes = [_]Route{
+        .{ .domain = "example.com", .servers = &a },
+        .{ .domain = "Corp.Example.COM.", .servers = &b },
+        .{ .domain = ".", .servers = &a },
+    };
+    const f = routeFor;
+    try testing.expect(f(&routes, "host.corp.example.com").?.servers[0].eql(lo2));
+    try testing.expect(f(&routes, "CORP.example.com.").?.servers[0].eql(lo2));
+    try testing.expect(f(&routes, "www.example.com").?.servers[0].eql(lo1));
+    try testing.expect(f(&routes, "notexample.com").?.domain.len == 1); // "." only: not under example.com
+    try testing.expect(f(routes[0..2], "notexample.com") == null);
+    try testing.expect(f(routes[0..2], "example.org") == null);
+    try testing.expect(f(&routes, ".").?.domain.len == 1);
+    try testing.expect(f(&.{}, "example.com") == null);
+}
+
+test "private_ranges: the usual rebinding targets are in, public addresses are out" {
+    for ([_][]const u8{ "10.0.0.1", "172.31.255.255", "192.168.1.1", "127.0.0.1", "169.254.1.1", "100.64.0.1", "fd00::1", "fe80::1", "::1" }) |t|
+        try testing.expect(filtered(&private_ranges, netaddr.parseIp(t).?));
+    for ([_][]const u8{ "8.8.8.8", "172.32.0.1", "192.0.2.1", "2001:db8::1", "100.128.0.1" }) |t|
+        try testing.expect(!filtered(&private_ranges, netaddr.parseIp(t).?));
 }

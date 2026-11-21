@@ -19,11 +19,15 @@ const Stub = struct {
     max: usize,
     served: usize = 0,
     /// Per query served: the length of its COOKIE option data (0: none) and the client cookie.
+    /// Queries received (before any delay), the address answered with, a delay before answering.
+    seen: usize = 0,
+    ip: [4]u8 = .{ 192, 0, 2, 1 },
+    delay_ms: i64 = 0,
     cookie_len: [4]usize = @splat(0),
     client: [4][8]u8 = @splat(@splat(0)),
     server_part: [4][8]u8 = @splat(@splat(0)),
 
-    const Mode = enum { answer, servfail, cookie_good, cookie_bad_client, badcookie };
+    const Mode = enum { answer, servfail, silent, cookie_good, cookie_bad_client, badcookie };
 
     fn run(st: *Stub) void {
         while (st.served < st.max) st.serveOne() catch return;
@@ -34,6 +38,12 @@ const Stub = struct {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
         const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
         const q = incoming.data;
+        st.seen += 1;
+        if (st.mode == .silent) {
+            st.served += 1;
+            return;
+        }
+        if (st.delay_ms > 0) try st.io.sleep(.fromMilliseconds(st.delay_ms), .awake);
         var qend: usize = message.header_len;
         while (q[qend] != 0) qend += @as(usize, q[qend]) + 1;
         qend += 1 + question_end_fixed;
@@ -57,7 +67,7 @@ const Stub = struct {
 
         var out: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out);
-        const answer = "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x01";
+        const answer = "\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ &st.ip;
         const bad = st.mode == .badcookie and cookie.len == 8;
         const with_cookie = (st.mode == .cookie_good or st.mode == .cookie_bad_client or st.mode == .badcookie) and cookie.len >= 8;
         const flags: u16 = if (st.mode == .servfail) 0x8182 else if (bad) 0x8187 else 0x8180;
@@ -259,4 +269,198 @@ test "failover memory: every server down still returns the last failure, as befo
     fb.await(io);
     try testing.expectEqual(@as(usize, 2), a.served);
     try testing.expectEqual(@as(usize, 2), b.served);
+}
+
+const lo3 = netaddr.Ip{ .v4 = .{ 127, 0, 0, 3 } };
+const three_servers = [_]netaddr.Ip{ lo1, lo2, lo3 };
+
+fn firstA(m: *const message.Message) [4]u8 {
+    return m.answers[0].data.a;
+}
+
+test "routes: split DNS sends each name to its own servers; a route without servers is refused" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .answer, 2);
+    defer a.sock.close(io);
+    a.ip = .{ 192, 0, 2, 10 };
+    var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .answer, 2);
+    defer b.sock.close(io);
+    b.ip = .{ 192, 0, 2, 20 };
+    var fa = try io.concurrent(Stub.run, .{&a});
+    var fb = try io.concurrent(Stub.run, .{&b});
+    const to_b = [_]netaddr.Ip{lo2};
+    const routes = [_]Resolver.Route{.{ .domain = "corp.example", .servers = &to_b }};
+    var r = resolver(io, &one_server, a.sock.address.getPort());
+    r.options.routes = &routes;
+    defer r.deinit();
+    for ([_][]const u8{ "www.corp.example", "www.public.example", "corp.example", "notcorp.example" }, [_][4]u8{ b.ip, a.ip, b.ip, a.ip }) |name, want| {
+        var m = try r.query(name, .a);
+        defer m.deinit();
+        try testing.expectEqualSlices(u8, &want, &firstA(&m));
+    }
+    try testing.expectEqual(@as(usize, 2), a.served);
+    try testing.expectEqual(@as(usize, 2), b.served);
+    fa.await(io);
+    fb.await(io);
+    const empty = [_]Resolver.Route{.{ .domain = "x", .servers = &.{} }};
+    r.options.routes = &empty;
+    try testing.expectError(error.InvalidOptions, r.query("a.example", .a));
+}
+
+test "parallel servers: the first usable reply wins, a slow server does not hold the query" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .answer, 1);
+    defer a.sock.close(io);
+    a.ip = .{ 192, 0, 2, 10 };
+    a.delay_ms = 700;
+    var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .answer, 1);
+    defer b.sock.close(io);
+    b.ip = .{ 192, 0, 2, 20 };
+    var fa = try io.concurrent(Stub.run, .{&a});
+    var fb = try io.concurrent(Stub.run, .{&b});
+    var r = resolver(io, &two_servers, a.sock.address.getPort());
+    r.options.timeout_ms = 3000;
+    r.options.parallel_servers = 2;
+    defer r.deinit();
+    var m = try r.query("example.com", .a);
+    defer m.deinit();
+    try testing.expectEqualSlices(u8, &b.ip, &firstA(&m)); // serial would have waited for A
+    try testing.expectEqual(@as(usize, 1), a.seen); // and A was asked too
+    fa.cancel(io);
+    fb.await(io);
+}
+
+test "parallel servers: failure replies do not win, groups follow one another, serial stays serial" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]u8{ 2, 3, 1 }, [_]usize{ 1, 1, 1 }) |par, want_third| {
+        var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .servfail, 1);
+        defer a.sock.close(io);
+        var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .servfail, 1);
+        defer b.sock.close(io);
+        var c = try bindStub(io, .{ 127, 0, 0, 3 }, a.sock.address.getPort(), .answer, 1);
+        defer c.sock.close(io);
+        c.ip = .{ 192, 0, 2, 30 };
+        var fa = try io.concurrent(Stub.run, .{&a});
+        var fb = try io.concurrent(Stub.run, .{&b});
+        var fc = try io.concurrent(Stub.run, .{&c});
+        var r = resolver(io, &three_servers, a.sock.address.getPort());
+        r.options.parallel_servers = par;
+        var m = try r.query("example.com", .a);
+        try testing.expectEqualSlices(u8, &c.ip, &firstA(&m));
+        m.deinit();
+        r.deinit();
+        fa.await(io);
+        fb.await(io);
+        fc.await(io);
+        try testing.expectEqual(want_third, c.served);
+        try testing.expectEqual(@as(usize, 1), a.served);
+        try testing.expectEqual(@as(usize, 1), b.served);
+    }
+}
+
+test "parallel servers: every server failing still returns the failure; zero is refused" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .servfail, 1);
+    defer a.sock.close(io);
+    var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .servfail, 1);
+    defer b.sock.close(io);
+    var fa = try io.concurrent(Stub.run, .{&a});
+    var fb = try io.concurrent(Stub.run, .{&b});
+    var r = resolver(io, &two_servers, a.sock.address.getPort());
+    r.options.parallel_servers = 2;
+    defer r.deinit();
+    var m = try r.query("example.com", .a);
+    try testing.expectEqual(message.Rcode.serv_fail, m.rcode());
+    m.deinit();
+    fa.await(io);
+    fb.await(io);
+    r.options.parallel_servers = 0;
+    try testing.expectError(error.InvalidOptions, r.query("example.com", .a));
+}
+
+test "filter_addresses: a filtered answer is NODATA, a kept one stays; private_ranges cover the usual suspects" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .answer, 3);
+    defer stub.sock.close(io);
+    stub.ip = .{ 10, 1, 2, 3 };
+    var fut = try io.concurrent(Stub.run, .{&stub});
+    defer fut.cancel(io);
+    var r = resolver(io, &one_server, stub.sock.address.getPort());
+    r.options.family = .v4;
+    defer r.deinit();
+    var plain = try r.lookupIp("example.com");
+    try testing.expectEqual(@as(usize, 1), plain.items.len);
+    plain.deinit();
+    r.options.filter_addresses = &Resolver.private_ranges;
+    var gone = try r.lookupIp("example.com");
+    try testing.expectEqual(@as(usize, 0), gone.items.len);
+    try testing.expectEqual(Resolver.Status.nodata, gone.status);
+    gone.deinit();
+    const other = [_]netaddr.Prefix{netaddr.parsePrefix("192.0.2.0/24").?};
+    r.options.filter_addresses = &other;
+    var kept = try r.lookupIp("example.com");
+    try testing.expectEqual(@as(usize, 1), kept.items.len);
+    kept.deinit();
+}
+
+test "server metrics: per-server queries, replies, rcode failures, timeouts and round-trip time" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .silent, 2);
+    defer a.sock.close(io);
+    var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .servfail, 2);
+    defer b.sock.close(io);
+    var c = try bindStub(io, .{ 127, 0, 0, 3 }, a.sock.address.getPort(), .answer, 2);
+    defer c.sock.close(io);
+    var fa = try io.concurrent(Stub.run, .{&a});
+    var fb = try io.concurrent(Stub.run, .{&b});
+    var fc = try io.concurrent(Stub.run, .{&c});
+    var r = resolver(io, &three_servers, a.sock.address.getPort());
+    r.options.server_metrics = true;
+    r.options.timeout_ms = 200;
+    defer r.deinit();
+    var none: [4]Resolver.ServerStats = undefined;
+    for (0..2) |_| {
+        var m = try r.query("example.com", .a);
+        m.deinit();
+    }
+    fa.await(io);
+    fb.await(io);
+    fc.await(io);
+    const n = r.serverStats(&none);
+    try testing.expectEqual(@as(usize, 3), n);
+    for (none[0..n]) |s| {
+        if (s.server.eql(lo1)) {
+            try testing.expectEqual(@as(u64, 2), s.queries);
+            try testing.expectEqual(@as(u64, 2), s.timeouts);
+            try testing.expectEqual(@as(u64, 0), s.replies);
+            try testing.expectEqual(@as(?u64, null), s.rttMeanNs());
+        } else if (s.server.eql(lo2)) {
+            try testing.expectEqual(@as(u64, 2), s.queries);
+            try testing.expectEqual(@as(u64, 2), s.replies);
+            try testing.expectEqual(@as(u64, 2), s.failure_rcodes);
+        } else {
+            try testing.expect(s.server.eql(lo3));
+            try testing.expectEqual(@as(u64, 2), s.queries);
+            try testing.expectEqual(@as(u64, 2), s.replies);
+            try testing.expectEqual(@as(u64, 0), s.failure_rcodes);
+            try testing.expect(s.rttMeanNs() != null);
+            try testing.expect(s.rtt_last_ns > 0);
+        }
+    }
+    // Off by default: nothing is kept.
+    var q = resolver(io, &one_server, 1);
+    defer q.deinit();
+    try testing.expectEqual(@as(usize, 0), q.serverStats(&none));
 }
