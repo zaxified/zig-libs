@@ -163,10 +163,15 @@ controls and traps 0; pinned in `scripts/checks/ctgrind-expected.tsv`).
 - **A seen-id replay cache** inside the tolerance window: it needs state and a clock the module does not own. A
   caller's `ramcache`/`kv` keyed by `webhook-id` for `tolerance_s` does it (svix keeps none either).
 - **Zeroizing secrets**: the `Verifier` keeps raw secrets for its lifetime and the module does not wipe them (*Threat model*).
+- **Other providers' bespoke shapes** (Twilio's URL plus sorted parameters, AWS SNS's certificate chain): the reference
+  (Standard Webhooks / svix) and the surveyed SDKs each cover their own provider's scheme only. Twilio's needs the full
+  request URL and the form parameters (not a raw body), SNS's a certificate fetch and an RSA verification, so neither is
+  an HMAC over `id.timestamp.body` or a header-and-prefix variation of one. The `Format` knobs (header, prefix, digest,
+  encoding, timestamp tolerance) cover the schemes that are.
 
 ## Backlog / deferred
 
-- **Other providers' bespoke shapes** (Twilio's URL + params signature, AWS SNS certificates) — until a consumer asks.
+None open.
 
 ## Anchoring
 

@@ -157,12 +157,15 @@ Format: Google Authenticator "Key Uri Format"
   the last whole-module mutation run and the delta runs after it. Mutants behind the
   comptime `Hmac` type selection cannot be switched at run time; every RFC vector
   pins them.
+- **Differential oracle** (`tools/oracle.sh`, `tools/karlseguin_oracle.zig`): karlseguin/otp.zig (MIT, pinned commit,
+  fetched into the repo's cache, never vendored) against `totpFmt` over random secrets of 1 to 100 bytes (so both
+  sides' HMAC key hashing runs), times up to 2^33, periods 1 to 86400, 1 to 9 digits, SHA-1 and SHA-256 (the
+  algorithms that library has): 320,000 cases (seeds 1 and 2), identical code strings. Run through `hw run`.
 - **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 160 mutants over `root.zig` and `otpauth.zig`: truncation, `totpVerify`/`hotpVerify`/`hotpResync` windows and compares, `fmtCode`, `parse`, `format`): 157 killed, 3 equivalent, 0 open. Equivalent: an empty query pair (`pair.len == 0` skip: its empty name matches no known parameter and is ignored anyway); `secret=` with the explicit `value.len == 0` check removed and the `n == 0` check removed (each alone: an empty value decodes to 0 bytes and the other check yields the same `InvalidSecret`; for a non-empty value the decoder never returns 0 bytes, because `=`-only text fails `.padding = .optional`). Not mutated: the comptime `Hmac` type selection (pinned by every RFC vector).
 
 ## Backlog / deferred
 
-**Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/otp.zig`. Beyond the RFC 4226/6238 vectors, generate random secrets, counters, times, digit counts and algorithms, then require identical codes from both. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
+None open.
 
 ## Anchoring
 

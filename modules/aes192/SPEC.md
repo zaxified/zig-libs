@@ -201,16 +201,17 @@ of EVP because the burn is 512 bytes and the expansion works on `u32` words (*De
 - **An own software AES** written here: not done. The software backend is std 0.17's bitsliced
   core, copied verbatim (`src/bitsliced.zig`, only the std `@import` changed) because std keeps
   it private; re-copy it when std changes it (its sha256 is in the file header).
+- **Software key expansion through the bitsliced core:** not done. `subWord` runs std's masked S-box on the software
+  backend, level with std's own soft `expandKey` and with the soft paths of the reference implementations; running it
+  through `bitsliced.Wide.encrypt`'s S-box would make the expansion constant time too, at a bitsliced batch per SubWord
+  (8 per key), for a software-only path whose expansion runs once per key. The AES-NI backend, which is what consumers
+  run, does not use it.
 - **aeskeygenassist-based expansion on AES-NI:** not done. The generic expansion is the same
   code on every backend and runs once per key; with word-wide XORs it is already 0.74–0.81×
   OpenSSL's EVP key setup (*Performance*), so a second, x86-only path buys nothing a user sees.
 
 ## Backlog / deferred
 
-- **Software key expansion through the bitsliced core:** `subWord` still runs std's masked S-box on the software
-  backend (level with std's own soft `expandKey`). Running SubWord through `bitsliced.Wide.encrypt`'s S-box instead
-  would make the expansion constant time too, better than std, at the cost of a bitsliced batch per SubWord (8 per
-  key). Open: no consumer asked, and the masked lookup runs once per key.
 - **Performance P2 to P1:** P1 needs `fastest <= 1.25x` and only OpenSSL is measured. Candidates: aws-lc / BoringSSL,
   Go `crypto/aes` (as an `alt` side in `tools/bench.zig`).
 

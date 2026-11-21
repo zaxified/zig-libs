@@ -365,7 +365,11 @@ byte-array to wider-lane vector `@bitCast` byte by byte.
   faster below; P1 needs `fastest ≤ 1.25×`, and no other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
   family as OpenSSL, plus VAES paths), Go `crypto/cipher`. Add them as an `alt` side in
   `tools/bench.zig` when one is installable on the host.
-- *BOUNCED (hardware):* **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch**: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
+
+## Roadmap
+
+- **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch**: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
+  Size: weeks (an assembly-grade kernel plus dispatch); needs arm64 hardware to measure and to run ctgrind.
 
 ## Open
 
