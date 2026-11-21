@@ -168,6 +168,7 @@ const Shared = struct {
         }
         const c = &core.*.?;
         c.mode = s.opts.mode;
+        c.distance = s.opts.distance;
         c.startJob(data, prefix, start - prefix);
         if (i == 0) try c.writeHeader();
         const last = end == input.len;

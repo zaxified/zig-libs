@@ -85,6 +85,8 @@ pub const Effort = encoder.Effort;
 /// What the input is (google/brotli's `BROTLI_PARAM_MODE`; `.font` sets
 /// NPOSTFIX/NDIRECT from `.q4`).
 pub const Mode = encoder.Mode;
+/// NPOSTFIX/NDIRECT for `CompressOptions.distance` (google/brotli's `BROTLI_PARAM_NPOSTFIX` / `BROTLI_PARAM_NDIRECT`).
+pub const DistanceParams = encoder.DistanceParams;
 /// `compressWith` into the caller's buffer (no output allocation);
 /// `maxCompressedSize` bytes always suffice, else `error.OutputTooLarge`
 /// only when the stream does not fit.
@@ -141,6 +143,7 @@ test {
     _ = @import("audit_encoder_test.zig");
     _ = @import("block_split.zig");
     _ = @import("greedy_split.zig");
+    _ = @import("sweep_test.zig");
     _ = @import("dictionary_hash.zig");
 }
 

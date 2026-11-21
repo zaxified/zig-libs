@@ -58,6 +58,8 @@ pub const StreamOptions = struct {
     prepared_dictionary: ?*const PreparedDictionary = null,
     /// As `CompressOptions.mode`.
     mode: encoder.Mode = .generic,
+    /// As `CompressOptions.distance`.
+    distance: ?encoder.DistanceParams = null,
 
     /// `block_size` and `window_bits` clamped into their ranges, as
     /// `CompressOptions.sanitized` (`init` and `reset` apply it).
@@ -65,6 +67,7 @@ pub const StreamOptions = struct {
         var r = o;
         r.block_size = std.math.clamp(o.block_size, 1, encoder.compressed_block_size);
         r.window_bits = std.math.clamp(o.window_bits, encoder.min_window_bits, encoder.max_large_window_bits);
+        if (o.distance) |d| r.distance = d.sanitized();
         return r;
     }
 
@@ -160,6 +163,7 @@ pub const StreamWriter = struct {
         sw.core.setData(sw.hist.items);
         sw.core.size_hint = o.size_hint orelse 0;
         sw.core.mode = o.mode;
+        sw.core.distance = o.distance;
         try sw.core.writeHeader();
     }
 

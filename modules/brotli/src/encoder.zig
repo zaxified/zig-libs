@@ -99,6 +99,7 @@ const min_match = 4;
 /// a 64 KiB font got 1 331 copies with it, 315 without (google q6: 1 298),
 /// and 1.6 % smaller; text ±0.1 %.
 const min_ring_match = 2;
+
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
 /// q11: 14). Copy lengths themselves reach far higher (RFC 7932 copy code 23).
@@ -5712,6 +5713,10 @@ pub const CompressOptions = struct {
     prepared_dictionary: ?*const PreparedDictionary = null,
     /// What the input is (google/brotli's `BROTLI_PARAM_MODE`).
     mode: Mode = .generic,
+    /// NPOSTFIX and NDIRECT for every meta-block from `.q4` up (below it the codes are
+    /// fixed, as with `mode`), in place of `mode`'s; at `.q11` the search for the cheapest
+    /// pair starts from them. Null: the mode's, else 0 and 0.
+    distance: ?DistanceParams = null,
 
     pub const default_block_size = compressed_block_size;
 
@@ -5723,6 +5728,7 @@ pub const CompressOptions = struct {
         var r = o;
         r.block_size = std.math.clamp(o.block_size, 1, compressed_block_size);
         if (o.window_bits) |w| r.window_bits = std.math.clamp(w, min_window_bits, max_large_window_bits);
+        if (o.distance) |d| r.distance = d.sanitized();
         return r;
     }
 };
@@ -5735,6 +5741,24 @@ pub const CompressOptions = struct {
 /// is chosen per block by cost either way). Below `.q4`, and with a large
 /// window, the mode changes nothing.
 pub const Mode = enum { generic, text, font };
+
+/// NPOSTFIX and NDIRECT (RFC 7932 §4) for the encoder to write, as google/brotli's
+/// `BROTLI_PARAM_NPOSTFIX` / `BROTLI_PARAM_NDIRECT` (`CompressOptions.distance`): the
+/// distance alphabet gets `ndirect` codes for the shortest distances as they are
+/// and `npostfix` low bits of every longer distance in the code, which suits data whose
+/// offsets are multiples of `1 << npostfix` (fonts, tables).
+pub const DistanceParams = struct {
+    /// 0..3 (the type bounds it).
+    npostfix: u2 = 0,
+    /// Rounded down to a multiple of `1 << npostfix` and clamped below `16 << npostfix`.
+    ndirect: u8 = 0,
+
+    /// `ndirect` made valid for `npostfix` (google `ndirect_msb`).
+    pub fn sanitized(d: DistanceParams) DistanceParams {
+        const msb: u8 = @min(d.ndirect >> d.npostfix, 15);
+        return .{ .npostfix = d.npostfix, .ndirect = msb << d.npostfix };
+    }
+};
 
 /// The NPOSTFIX/NDIRECT google/brotli's font mode writes.
 const font_dist: DistParams = .{ .npostfix = 1, .ndirect = 12 };
@@ -5785,6 +5809,7 @@ fn compressStreamed(gpa: std.mem.Allocator, output: *std.Io.Writer, input: []con
         .dictionary = opts.dictionary,
         .prepared_dictionary = opts.prepared_dictionary,
         .mode = opts.mode,
+        .distance = opts.distance,
     });
     defer sw.deinit();
     sw.writer.writeAll(input) catch return sw.err orelse error.WriteFailed;
@@ -5945,6 +5970,7 @@ fn oneShot(core: *Core, input: []const u8, opts: CompressOptions) std.mem.Alloca
     }
     core.size_hint = input.len;
     core.mode = opts.mode;
+    core.distance = opts.distance;
     core.setData(input);
     try core.writeHeader();
     var off: usize = 0;
@@ -6001,6 +6027,8 @@ pub const Core = struct {
     size_hint: usize = 0,
     /// `CompressOptions.mode` / `StreamOptions.mode`.
     mode: Mode = .generic,
+    /// `CompressOptions.distance` / `StreamOptions.distance`.
+    distance: ?DistanceParams = null,
     /// The prefix dictionary's length (`attachDictionary`), 0 without:
     /// static-dictionary words count past it, at every level.
     dict_len: usize = 0,
@@ -6100,6 +6128,7 @@ pub const Core = struct {
 
     /// NPOSTFIX/NDIRECT the mode asks for (`Mode`).
     fn origDist(c: *const Core) DistParams {
+        if (c.distance) |d| return .{ .npostfix = d.npostfix, .ndirect = d.ndirect };
         return if (c.mode == .font) font_dist else .{};
     }
 
