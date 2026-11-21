@@ -82,7 +82,9 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
   (e.g. a VDAF field's additive group), whose `fromPrg` reduces 192 PRG bits
   mod `N` bit-serially with a masked subtract (distance from uniform `< 2^-128`;
   a library `%` on a secret 192-bit value would be variable-time) and whose
-  `add`/`neg` reduce with a mask. `Mpf` and `Dcf` stay on `Z_{2^{8L}}`.
+  `add`/`neg` reduce with a mask; `group.Vector(L, k)` — `k` independent
+  `Z_{2^{8L}}` components packed in one integer, added per component with no
+  carry between them (`L·k ≤ 32`). `Mpf`, `Idpf` and `Dcf` stay on `Z_{2^{8L}}`.
 
 **Domain parameterization:** the input domain is `{0,1}^n` (indices
 `0..2^n`), `n = n_bits` a compile-time parameter, `n ∈ 1..31`. Bits are read
@@ -211,8 +213,8 @@ a skip is never a pass.
    long-hand `H_2 ‖ H_3`; `convert(L)` is the low `L` bytes of `convert(32)` for every `L`; distinct format tags and
    tagged round trip (`dpf.zig`ff).
 
-7. **Output groups** (`group.zig`, `dpf.zig`): `Xor` and `ZMod` group laws, `ZMod.fromPrg` against the 192-bit `%`,
-   and `DpfGroupWith` over `Xor(8)`, `ZMod(Goldilocks)`, `ZMod(97)` under both PRGs: full-domain reconstruction,
+7. **Output groups** (`group.zig`, `dpf.zig`): `Xor`, `ZMod` and `Vector` group laws, `ZMod.fromPrg` against the
+   192-bit `%`, and `DpfGroupWith` over `Xor(8)`, `ZMod(Goldilocks)`, `ZMod(97)`, `Vector(4, 3)` under both PRGs: full-domain reconstruction,
    `evalFull` equal to `evalAll`, the key codec round trip.
 8. **IDPF** (`idpf.zig`): every prefix at every level of a 6-bit domain under both PRGs, random `α`/`β_ℓ`; the
    last level equal to `Dpf` share for share; key codec round trip.
@@ -571,9 +573,9 @@ does not observe `α` itself; for `α` the guarantee is by construction.
   codec (`dpf.zig`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
   share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative`
   (identical bytes, 8 instructions).
-- **Tuple/vector output groups** *(survey, inferred from Google's API)*: `Z_{2^{8L}}`, `Xor(L)` and `ZMod(N)` exist
-  (`DpfGroup`); a tuple of elements (one correction word per component, as Google's `Tuple<...>` value types) does
-  not, nor `ZMod` for `N > 2^64`. Small-medium.
+- **Heterogeneous tuples and wide fields** *(survey, inferred from Google's API)*: `Z_{2^{8L}}`, `Xor(L)`, `ZMod(N)`
+  and the homogeneous `Vector(L, k)` exist (`DpfGroup`); a tuple mixing group types (Google's `Tuple<...>`), a
+  vector wider than 32 bytes, and `ZMod` for `N > 2^64` (a 128-bit VDAF field) do not. Small-medium.
 
 ## Anchoring
 

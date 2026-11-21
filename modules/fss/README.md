@@ -205,7 +205,7 @@ the `firstMismatch` checker) are core-independent and prove the harness has teet
 
 ## Not provided
 
-Tuple/vector output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
+Heterogeneous tuple output groups and fields wider than 64 bits are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
 libraries are refused (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party

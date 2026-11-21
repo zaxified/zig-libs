@@ -134,6 +134,45 @@ pub fn ZMod(comptime N: u65) type {
     };
 }
 
+/// A vector of `k` independent `Z_{2^{8L}}` components (Google's tuple value
+/// types for a homogeneous tuple), packed little-endian into one `8·L·k`-bit
+/// integer, component `i` in bits `[8L·i, 8L·(i+1))`. Group operations act per
+/// component, with no carry between components. `L·k ≤ 32` (one `convert`).
+pub fn Vector(comptime L: usize, comptime k: usize) type {
+    if (L == 0 or k == 0 or L * k > 32) @compileError("Vector: need L, k > 0 and L*k <= 32");
+    return struct {
+        pub const byte_len = L * k;
+        pub const components = k;
+        pub const Comp = @Int(.unsigned, 8 * L);
+        pub const Elem = @Int(.unsigned, 8 * L * k);
+
+        pub fn fromPrg(p: anytype, seed: [16]u8) Elem {
+            return p.convert(L * k, seed);
+        }
+        pub fn get(a: Elem, i: usize) Comp {
+            return @truncate(a >> @intCast(8 * L * i));
+        }
+        pub fn pack(c: [k]Comp) Elem {
+            var out: Elem = 0;
+            for (c, 0..) |x, i| out |= @as(Elem, x) << @intCast(8 * L * i);
+            return out;
+        }
+        pub fn add(a: Elem, b: Elem) Elem {
+            var c: [k]Comp = undefined;
+            for (&c, 0..) |*x, i| x.* = get(a, i) +% get(b, i);
+            return pack(c);
+        }
+        pub fn sub(a: Elem, b: Elem) Elem {
+            var c: [k]Comp = undefined;
+            for (&c, 0..) |*x, i| x.* = get(a, i) -% get(b, i);
+            return pack(c);
+        }
+        pub fn neg(a: Elem) Elem {
+            return sub(0, a);
+        }
+    };
+}
+
 // ── tests (REAL, ungated — prove the group law holds) ─────────────────────
 
 test "Z2k add/sub/neg wrap mod 2^{8L}" {
@@ -195,4 +234,16 @@ test "ZMod.fromPrg equals the 192-bit value mod N" {
             try std.testing.expectEqual(@as(u64, @intCast(wide % N)), Z.fromPrg(p, seed));
         }
     }
+}
+
+test "Vector adds per component with no carry between components" {
+    const V = Vector(2, 3);
+    const a = V.pack(.{ 0xffff, 1, 0x8000 });
+    const b = V.pack(.{ 1, 2, 0x8000 });
+    const c = V.add(a, b);
+    try std.testing.expectEqual(@as(V.Comp, 0), V.get(c, 0));
+    try std.testing.expectEqual(@as(V.Comp, 3), V.get(c, 1));
+    try std.testing.expectEqual(@as(V.Comp, 0), V.get(c, 2));
+    try std.testing.expectEqual(@as(V.Elem, 0), V.add(a, V.neg(a)));
+    try std.testing.expectEqual(V.sub(a, b), V.add(a, V.neg(b)));
 }

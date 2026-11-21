@@ -766,7 +766,7 @@ test "secretMask is 0 or all-ones at every width, at runtime and at comptime" {
 test "DpfGroup: XOR and Z_N output groups reconstruct the point function" {
     const prgs = .{ prg_mod.Aes128Mmo, prg_mod.Sha256Prg };
     inline for (prgs) |P| {
-        inline for (.{ group.Xor(8), group.ZMod(0xffff_ffff_0000_0001), group.ZMod(97) }) |Gr| {
+        inline for (.{ group.Xor(8), group.ZMod(0xffff_ffff_0000_0001), group.ZMod(97), group.Vector(4, 3) }) |Gr| {
             const D = DpfGroupWith(P, 6, Gr);
             const s0: Seed = @splat(0x31);
             const s1: Seed = @splat(0x7c);
