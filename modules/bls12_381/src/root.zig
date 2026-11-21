@@ -86,7 +86,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
     .concurrency = .reentrant, // every type is a plain value type; kzg's only global is a write-once atomic memo of the embedded (compile-time-constant) trusted setup
     .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; Fp is a hand-rolled constant-time Montgomery field, Fr is montint.Field",
-    .deps = .{ "entropy", "montint" }, // entropy backs `Fr.random`; montint.Field is `Fr`'s constant-time arithmetic
+    .deps = .{ "entropy", "montint", "sha2" }, // entropy backs `Fr.random`; montint.Field is `Fr`'s constant-time arithmetic; sha2: RFC 9380 expand_message_xmd
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

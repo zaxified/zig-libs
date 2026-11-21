@@ -44,25 +44,10 @@
 //! for its own purpose — landing arbitrary points in the subgroup — it
 //! just is not RFC 9380's `clear_cofactor`).
 //!
-//! **`expand_message_xmd` reuse decision**: `modules/frost` and
-//! `modules/voprf` each already carry an in-module `expand_message_xmd`
-//! (RFC 9380 §5.3.1) — frost's specialized to SHA-256/`ell=2`
-//! (`len_in_bytes=48`), voprf's to SHA-512/`ell=1` (`len_in_bytes<=64`).
-//! Neither is reusable here without either (a) a cross-module dependency
-//! (this module would need to import `frost`, adding a `deps` edge to a
-//! threshold-signature module for one hash primitive — a layering
-//! smell flagged for the orchestrator/owner, NOT done unilaterally) or
-//! (b) generalizing frost's SHA-256 variant to arbitrary `ell` (this
-//! module needs `ell=4` for `G1`'s `count=2,m=1,L=64` hash_to_field call
-//! and `ell=8` for `G2`'s `count=2,m=2,L=64` — both bigger than frost's
-//! hardcoded `ell=2`). Given `CONVENTIONS.md`'s zero-cross-module-crypto-
-//! dependency posture and this module's own self-contained-clean-room
-//! precedent (Parts 1-2 read no third-party source), this file
-//! REIMPLEMENTS `expand_message_xmd` from the RFC 9380 §5.3.1 pseudocode
-//! directly, generalized to any `ell` up to 255 (frost/voprf's fixed-`ell`
-//! versions are each a specialization of this general shape) — this is a
-//! deliberate, flagged departure from a literal reuse instruction; see
-//! `SPEC.md`'s design record for the full reasoning.
+//! **`expand_message_xmd`** is the collection's one generic copy,
+//! `sha2.expandMessageXmd` (RFC 9380 §5.3.1, over std's `Sha256`); the
+//! `expandMessageXmd`/`expandMessageXmdParts` below keep this module's
+//! SHA-256 names for `bbs` and other callers.
 //!
 //! Zig std GAP: yes — nothing in `std` supplies RFC 9380 hash-to-curve
 //! machinery; `std.crypto.hash.sha2.Sha256` supplies the hash function
@@ -72,6 +57,7 @@
 //! — both REAL, no new big-integer primitive is implemented here.
 
 const std = @import("std");
+const sha2 = @import("sha2");
 const fp = @import("fp.zig");
 const fp2mod = @import("fp2.zig");
 const g1 = @import("g1.zig");
@@ -120,42 +106,11 @@ fn fp2c(comptime c0_hex: *const [96:0]u8, comptime c1_hex: *const [96:0]u8) Fp2 
 
 // ── expand_message_xmd (RFC 9380 §5.3.1) — REAL ────────────────────────
 
-/// RFC 9380 §5.3.1 `expand_message_xmd`, specialized to SHA-256
-/// (`b_in_bytes = 32`, `s_in_bytes = 64`) but GENERAL in `len_in_bytes`
-/// (hence `ell = ceil(len_in_bytes / 32)`, up to the RFC's own `ell <=
-/// 255` ceiling) — unlike `frost`'s hardcoded `ell = 2` or `voprf`'s
-/// hardcoded `ell = 1` (see this file's module doc comment for why
-/// those two aren't reused directly). `len_in_bytes` is `comptime`
-/// because every call site here has a fixed, suite-determined length
-/// (`128` for `G1`'s `hash_to_field(msg, 2)`, `256` for `G2`'s) and a
-/// comptime length lets the return type be a plain fixed-size array
-/// (no allocator).
-///
-/// Construction (RFC 9380 §5.3.1, verbatim):
-/// ```
-/// DST_prime   = DST || I2OSP(len(DST), 1)
-/// Z_pad       = I2OSP(0, s_in_bytes)                    # 64 zero bytes
-/// l_i_b_str   = I2OSP(len_in_bytes, 2)                  # big-endian u16
-/// msg_prime   = Z_pad || msg || l_i_b_str || I2OSP(0,1) || DST_prime
-/// b_0         = H(msg_prime)
-/// b_1         = H(b_0 || I2OSP(1, 1) || DST_prime)
-/// b_i         = H(strxor(b_0, b_{i-1}) || I2OSP(i, 1) || DST_prime)   for i in 2..ell
-/// uniform_bytes = b_1 || b_2 || ... || b_ell
-/// return substr(uniform_bytes, 0, len_in_bytes)
-/// ```
-/// `dst.len` MUST be `<= 255` (RFC 9380's own DST-length ceiling before
-/// the "long DST" re-hashing procedure of §5.3.3 applies — every DST
-/// this module's two target suites use, e.g.
-/// `"QUUX-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_"`, is far under
-/// this, so the assert is defensive, not a real constraint).
-///
-/// Verified byte-exact against RFC 9380 Appendix K.1's
-/// `expand_message_xmd(SHA-256)` vectors (DST =
-/// `"QUUX-V01-CS02-with-expander-SHA256-128"`) for both published
-/// `len_in_bytes` values, `0x20` (`ell = 1`) and `0x80` (`ell = 4`) —
-/// see the tests below. The `ell = 4` case in particular exercises the
-/// general multi-block loop frost/voprf's fixed-`ell` specializations
-/// never needed.
+/// RFC 9380 §5.3.1 `expand_message_xmd` with SHA-256 (every RFC 9380
+/// BLS12-381 suite's expander): `sha2.expandMessageXmd(Sha256, ..)`, any
+/// `len_in_bytes` up to `255 * 32`. A `dst` over 255 bytes is reduced to
+/// `SHA-256("H2C-OVERSIZE-DST-" || DST)` (§5.3.3). Pinned here against
+/// RFC 9380 Appendix K.1 at `len_in_bytes` 0x20 and 0x80.
 pub fn expandMessageXmd(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
     return expandMessageXmdParts(len_in_bytes, &.{msg}, dst);
 }
@@ -167,65 +122,7 @@ pub fn expandMessageXmd(comptime len_in_bytes: usize, msg: []const u8, dst: []co
 /// MessageAugmentation BLS scheme needs to hash `PK || message` for an
 /// arbitrarily long message with no allocator.
 pub fn expandMessageXmdParts(comptime len_in_bytes: usize, parts: []const []const u8, dst: []const u8) [len_in_bytes]u8 {
-    const Sha256 = std.crypto.hash.sha2.Sha256;
-    const b_in_bytes = Sha256.digest_length; // 32
-    const s_in_bytes = 64; // SHA-256 input block size
-
-    const ell = comptime (len_in_bytes + b_in_bytes - 1) / b_in_bytes;
-    comptime std.debug.assert(len_in_bytes > 0);
-    comptime std.debug.assert(ell <= 255);
-    std.debug.assert(dst.len <= 255);
-
-    var dst_prime_buf: [256]u8 = undefined;
-    @memcpy(dst_prime_buf[0..dst.len], dst);
-    dst_prime_buf[dst.len] = @intCast(dst.len);
-    const dst_prime = dst_prime_buf[0 .. dst.len + 1];
-
-    const z_pad = @as([s_in_bytes]u8, @splat(0));
-    var l_i_b_str: [2]u8 = undefined;
-    std.mem.writeInt(u16, &l_i_b_str, len_in_bytes, .big);
-
-    var h0 = Sha256.init(.{});
-    h0.update(&z_pad);
-    for (parts) |part| h0.update(part);
-    h0.update(&l_i_b_str);
-    h0.update(&[_]u8{0x00});
-    h0.update(dst_prime);
-    var b0: [b_in_bytes]u8 = undefined;
-    h0.final(&b0);
-
-    var out: [len_in_bytes]u8 = undefined;
-
-    var h1 = Sha256.init(.{});
-    h1.update(&b0);
-    h1.update(&[_]u8{0x01});
-    h1.update(dst_prime);
-    var b_prev: [b_in_bytes]u8 = undefined;
-    h1.final(&b_prev);
-    {
-        const n = @min(b_in_bytes, len_in_bytes);
-        @memcpy(out[0..n], b_prev[0..n]);
-    }
-
-    comptime var i: usize = 2;
-    inline while (i <= ell) : (i += 1) {
-        var xored: [b_in_bytes]u8 = undefined;
-        for (&xored, b0, b_prev) |*o, x, y| o.* = x ^ y;
-
-        var hi = Sha256.init(.{});
-        hi.update(&xored);
-        hi.update(&[_]u8{@intCast(i)});
-        hi.update(dst_prime);
-        var bi: [b_in_bytes]u8 = undefined;
-        hi.final(&bi);
-
-        const offset = (i - 1) * b_in_bytes;
-        const n = @min(b_in_bytes, len_in_bytes - offset);
-        @memcpy(out[offset..][0..n], bi[0..n]);
-        b_prev = bi;
-    }
-
-    return out;
+    return sha2.expandMessageXmd(std.crypto.hash.sha2.Sha256, len_in_bytes, parts, dst);
 }
 
 /// Which RFC 9380 §5.3 `expand_message` a hash-to-field runs: the XMD
@@ -240,8 +137,8 @@ pub const Expander = enum { xmd_sha256, xof_shake256 };
 /// msg_prime     = msg || I2OSP(len_in_bytes, 2) || DST_prime
 /// uniform_bytes = SHAKE256(msg_prime, len_in_bytes)
 /// ```
-/// `dst.len` MUST be `<= 255` (as for `expandMessageXmd`; the §5.3.3
-/// long-DST rehash is not implemented). Verified byte-exact against RFC
+/// `dst.len` MUST be `<= 255` (the §5.3.3 long-DST rehash is not
+/// implemented for the XOF expander; `expandMessageXmd` has it). Verified byte-exact against RFC
 /// 9380 Appendix K.6 at `len_in_bytes` 0x20 and 0x80.
 pub fn expandMessageXof(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
     return expandMessageXofParts(len_in_bytes, &.{msg}, dst);
@@ -866,6 +763,12 @@ test "expandMessageXmd: RFC 9380 Appendix K.1, len_in_bytes=0x20 (ell=1), all 5 
         const got = expandMessageXmd(32, vec.msg, k1_dst);
         try std.testing.expectEqualSlices(u8, &expected, &got);
     }
+}
+
+test "expandMessageXmd: a DST over 255 bytes is reduced (RFC 9380 Appendix K.2, \"abc\", 0x20)" {
+    const long_dst = "QUUX-V01-CS02-with-expander-SHA256-128-long-DST-" ++ @as([208]u8, @splat('1'));
+    try std.testing.expectEqual(@as(usize, 256), long_dst.len);
+    try std.testing.expectEqualSlices(u8, &hexN(32, "52dbf4f36cf560fca57dedec2ad924ee9c266341d8f3d6afe5171733b16bbb12"), &expandMessageXmd(32, "abc", long_dst));
 }
 
 test "expandMessageXmd: RFC 9380 Appendix K.1, len_in_bytes=0x80 (ell=4), all 5 messages" {

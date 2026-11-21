@@ -121,3 +121,11 @@ computed pairing outputs via the KAT harness this NOTICE documents (see
    2026-10-26 this KAT was a proof copied from
    `darkforest-eth/darkforest-v0.3`, a repository with no licence; it was
    removed because data without an MIT-compatible grant may not live here.
+
+7. Hash to `G2` (`src/hash_to_curve.zig`): the test vectors of the suites
+   `BN254G2_XMD:SHA-256_SVDW_RO_` / `_NU_` are transcribed from
+   gnark-crypto v0.19.2, `ecc/bn254/hash_vectors_test.go`
+   (https://github.com/Consensys/gnark-crypto, Apache-2.0): test data
+   (field elements and points), cited at the tables. Its
+   `ecc/bn254/hash_to_g2.go` was read as the design reference for `L = 48`
+   and the cofactor-clearing formula; no code was ported.

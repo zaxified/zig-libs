@@ -101,6 +101,7 @@
 
 const std = @import("std");
 const ct25519 = @import("ct25519");
+const sha2 = @import("sha2");
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const protocol = @import("protocol.zig");
 
@@ -169,7 +170,7 @@ pub const meta = .{
     .model_after = "RFC 9497 (\"Oblivious Pseudorandom Functions (OPRFs) Using Prime-Order Groups\"), all §4 ciphersuites, OPRF+VOPRF+POPRF modes; RFC 9380 §5.3 expand_message_xmd/xof, §6.6.2 simplified SWU, Appendix B hash_to_ristretto255 / Appendix C hash_to_decaf448; std.crypto.ecc.Ristretto255 and the decaf448/p256/p384/p521 siblings supply the groups",
     // constant-time secret-scalar multiply (ristretto255), and the other
     // four ciphersuites' groups
-    .deps = .{ "ct25519", "decaf448", "p256", "p384", "p521" },
+    .deps = .{ "ct25519", "decaf448", "p256", "p384", "p521", "sha2" }, // sha2: RFC 9380 expand_message_xmd
 };
 
 // ── the default ciphersuite (RFC 9497 §4.1), source-compatible API ───────
@@ -186,44 +187,23 @@ pub const Nh: usize = Default.Nh;
 pub const Mode = protocol.Mode;
 pub const contextString = Default.contextString;
 
-/// RFC 9380 §5.4.1 `expand_message_xmd` with SHA-512, specialized to
-/// `len_in_bytes <= 64` (`ell = 1`). `msg` may be passed as multiple parts.
-/// Validated standalone against RFC 9380 Appendix K.3 (`kat_test.zig`).
-/// The general expander (any SHA-2 hash, any `ell`) is `h2c.expandMessageXmd`.
-/// Caller contract: `dst` is 1..255 bytes (RFC 9380 §5.3.1 step 1); anything
-/// else is a checked `@panic("voprf: ...")`, never undefined behaviour.
+/// RFC 9380 §5.3.1 `expand_message_xmd` with SHA-512 and
+/// `len_in_bytes <= 64` (`ell = 1`), what every RFC 9497 ristretto255 /
+/// SHA-512 call needs: `sha2.expandMessageXmd(Sha512, ..)` (the general
+/// expander, any SHA-2 hash and `ell`, is also `h2c.expandMessageXmd`).
+/// `msg` may be passed as multiple parts. Validated against RFC 9380
+/// Appendix K.3 (`kat_test.zig`).
+/// Caller contract: `dst` is not empty (RFC 9380 §3.1); an empty one is a
+/// checked `@panic("voprf: ...")`, never undefined behaviour. A `dst` over
+/// 255 bytes is reduced to `SHA-512("H2C-OVERSIZE-DST-" || DST)` (§5.3.3).
 pub fn expandMessageXmd(
     comptime len_in_bytes: usize,
     msg_parts: []const []const u8,
     dst: []const u8,
 ) [len_in_bytes]u8 {
     comptime std.debug.assert(len_in_bytes > 0 and len_in_bytes <= 64); // ell == 1
-    if (dst.len == 0 or dst.len > 255) @panic("voprf: expandMessageXmd: DST must be 1..255 bytes");
-    const block_size = 128; // SHA-512 input block size (s_in_bytes)
-    const z_pad = @as([block_size]u8, @splat(0));
-    var l_i_b_str: [2]u8 = undefined;
-    std.mem.writeInt(u16, &l_i_b_str, len_in_bytes, .big);
-    const dst_len = [1]u8{@intCast(dst.len)};
-
-    var h0 = Sha512.init(.{});
-    h0.update(&z_pad);
-    for (msg_parts) |part| h0.update(part);
-    h0.update(&l_i_b_str);
-    h0.update(&[1]u8{0x00});
-    h0.update(dst);
-    h0.update(&dst_len);
-    var b_0: [64]u8 = undefined;
-    h0.final(&b_0);
-
-    var h1 = Sha512.init(.{});
-    h1.update(&b_0);
-    h1.update(&[1]u8{0x01});
-    h1.update(dst);
-    h1.update(&dst_len);
-    var b_1: [64]u8 = undefined;
-    h1.final(&b_1);
-
-    return b_1[0..len_in_bytes].*;
+    if (dst.len == 0) @panic("voprf: expandMessageXmd: DST must not be empty");
+    return sha2.expandMessageXmd(Sha512, len_in_bytes, msg_parts, dst);
 }
 
 pub const InvalidInputError = protocol.InvalidInputError;

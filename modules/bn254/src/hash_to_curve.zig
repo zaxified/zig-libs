@@ -1,35 +1,41 @@
 // SPDX-License-Identifier: MIT
-//! RFC 9380 `hash_to_curve` onto BN254's G2 with the Shallue–van de
-//! Woestijne map: the suite `BN254G2_XMD:SHA-256_SVDW_RO_` that gnark-crypto
-//! ships as `bn254.HashToG2(msg, dst)` (RFC 9380 defines the construction,
-//! not a BN254 suite; gnark-crypto's is the one in use).
+//! RFC 9380 hash-to-curve onto BN254's G2 with the Shallue–van de
+//! Woestijne map: the suites `BN254G2_XMD:SHA-256_SVDW_RO_`
+//! (`hashToCurveG2`) and `BN254G2_XMD:SHA-256_SVDW_NU_` (`encodeToCurveG2`)
+//! that gnark-crypto ships as `HashToG2` / `EncodeToG2` in its `bn254`
+//! package (RFC 9380 defines the construction, not a BN254 suite;
+//! gnark-crypto's are the ones in use).
 //!
-//!   1. `hash_to_field(msg, 2)` — `expand_message_xmd` with SHA-256 (§5.3.1),
-//!      `L = 48` bytes per `Fp` coordinate, two `Fp2` elements `u0`, `u1`.
+//!   1. `hash_to_field(msg, count)` — `expand_message_xmd` with SHA-256
+//!      (§5.3.1, `sha2.expandMessageXmd`), `L = 48` bytes per `Fp`
+//!      coordinate, `count` `Fp2` elements (2 for `_RO_`, 1 for `_NU_`).
 //!   2. `Q_i = map_to_curve_svdw(u_i)` (§6.6.1, straight-line form F.1) on the
 //!      twist `E': y² = x³ + b'`, `b' = 3/(9+u)`, with `Z = 1` (the first
 //!      value `find_z_svdw`, §H.1, accepts — re-derived by the tests below)
 //!      and `sgn0` of §4.1 for `m = 2`.
-//!   3. `clear_cofactor(Q0 + Q1)`: the endomorphism form of Fuentes-Castañeda,
+//!   3. `clear_cofactor`: the endomorphism form of Fuentes-Castañeda,
 //!      Knapp and Rodríguez-Henríquez ("Faster hashing to G2", SAC 2011, §6.1)
 //!      gnark-crypto uses, `[x]Q + ψ([3x]Q) + ψ²([x]Q) + ψ³(Q)`, `x` the BN
 //!      seed. It lands in the order-r subgroup; a plain `[2p − r]Q` would too,
 //!      but would give a different point than every other implementation of
 //!      the suite.
 //!
-//! Every input is public (a hash input), so nothing here is constant-time
-//! by requirement; the map is straight-line anyway.
+//! The DST may have any length (one over 255 bytes is reduced per RFC 9380
+//! §5.3.3). Not constant-time by requirement (a hash input is public in
+//! every use here); the map is straight-line apart from `sqrt`.
 //!
-//! Anchored by gnark-crypto's published vectors (`u0`, `u1`, `Q0`, `Q1` and
-//! the output for five messages, below) and by an RFC 9380 model in Python
-//! that reproduced them before this file was written.
+//! Anchored by gnark-crypto's published vectors (`u`, `Q` and the output for
+//! five messages per suite, below) and by an RFC 9380 model in Python that
+//! reproduced the `_RO_` ones before this file was written.
 
 const std = @import("std");
-const bn254 = @import("bn254");
+const sha2 = @import("sha2");
+const fp = @import("fp.zig");
+const g2 = @import("g2.zig");
 
-const Fp = bn254.Fp;
-const Fp2 = bn254.Fp2;
-const G2 = bn254.G2;
+const Fp = fp.Fp;
+const Fp2 = g2.Fp2;
+const G2 = g2;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const p_int: u384 = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
@@ -45,19 +51,30 @@ const seed_be: [8]u8 = blk: {
     break :blk b;
 };
 
-/// `H(msg)`: a point of the order-r subgroup of G2 (RFC 9380 `hash_to_curve`,
-/// random-oracle variant). `dst` is the domain separation tag, 1..255 bytes.
-pub fn hashToG2(msg: []const u8, comptime dst: []const u8) G2.Affine {
-    const u = hashToField(msg, dst);
-    const q0 = G2.Jacobian.fromAffine(mapToCurve(u[0]));
-    const q1 = G2.Jacobian.fromAffine(mapToCurve(u[1]));
-    return clearCofactor(q0.add(q1)).toAffine();
+/// `hash_to_curve(msg)` (RFC 9380 §3, random-oracle variant), suite
+/// `BN254G2_XMD:SHA-256_SVDW_RO_` under the caller's `dst`: a point of the
+/// order-r subgroup of G2. gnark-crypto's `HashToG2(msg, dst)`.
+pub fn hashToCurveG2(msg: []const u8, dst: []const u8) G2.Affine {
+    const u = hashToFieldFp2(2, msg, dst);
+    const q0 = G2.Jacobian.fromAffine(mapToCurveG2(u[0]));
+    const q1 = G2.Jacobian.fromAffine(mapToCurveG2(u[1]));
+    return clearCofactorG2(q0.add(q1)).toAffine();
 }
 
-/// RFC 9380 §5.2 `hash_to_field(msg, 2)` over `Fp2` (`m = 2`, `L = 48`).
-fn hashToField(msg: []const u8, comptime dst: []const u8) [2]Fp2 {
-    const uniform = expandMessageXmd(2 * 2 * field_l, msg, dst);
-    var out: [2]Fp2 = undefined;
+/// `encode_to_curve(msg)` (RFC 9380 §3, nonuniform variant), suite
+/// `BN254G2_XMD:SHA-256_SVDW_NU_`: one field element, one map, the
+/// cofactor cleared. Cheaper than `hashToCurveG2`, but its output is not
+/// uniform (RFC 9380 §10.4: use `hashToCurveG2` unless the protocol says
+/// otherwise). gnark-crypto's `EncodeToG2(msg, dst)`.
+pub fn encodeToCurveG2(msg: []const u8, dst: []const u8) G2.Affine {
+    const u = hashToFieldFp2(1, msg, dst);
+    return clearCofactorG2(G2.Jacobian.fromAffine(mapToCurveG2(u[0]))).toAffine();
+}
+
+/// RFC 9380 §5.2 `hash_to_field(msg, count)` over `Fp2` (`m = 2`, `L = 48`).
+pub fn hashToFieldFp2(comptime count: usize, msg: []const u8, dst: []const u8) [count]Fp2 {
+    const uniform = sha2.expandMessageXmd(Sha256, count * 2 * field_l, &.{msg}, dst);
+    var out: [count]Fp2 = undefined;
     for (&out, 0..) |*e, i| {
         e.* = .{
             .c0 = fpFromWide(uniform[(2 * i) * field_l ..][0..field_l]),
@@ -72,38 +89,6 @@ fn fpFromWide(bytes: *const [field_l]u8) Fp {
     var b: [32]u8 = undefined;
     std.mem.writeInt(u256, &b, v, .big);
     return Fp.fromBytes(b) catch unreachable; // v < p
-}
-
-/// RFC 9380 §5.3.1 `expand_message_xmd` with SHA-256.
-fn expandMessageXmd(comptime len: usize, msg: []const u8, comptime dst: []const u8) [len]u8 {
-    const b_len = Sha256.digest_length;
-    const ell = (len + b_len - 1) / b_len;
-    comptime {
-        if (len == 0 or len > 65535 or ell > 255) @compileError("expand_message_xmd: length out of range");
-        if (dst.len == 0 or dst.len > 255) @compileError("expand_message_xmd: DST must be 1..255 bytes");
-    }
-    const dst_prime = dst ++ [1]u8{dst.len};
-    var h0 = Sha256.init(.{});
-    h0.update(&@as([Sha256.block_length]u8, @splat(0)));
-    h0.update(msg);
-    h0.update(&[3]u8{ len >> 8, len & 0xff, 0 });
-    h0.update(dst_prime);
-    var b0: [b_len]u8 = undefined;
-    h0.final(&b0);
-
-    var out: [ell * b_len]u8 = undefined;
-    var prev: [b_len]u8 = b0;
-    for (0..ell) |i| {
-        var x: [b_len]u8 = undefined;
-        for (&x, b0, prev) |*o, a, b| o.* = if (i == 0) a else a ^ b;
-        var h = Sha256.init(.{});
-        h.update(&x);
-        h.update(&[1]u8{@intCast(i + 1)});
-        h.update(dst_prime);
-        h.final(&prev);
-        out[i * b_len ..][0..b_len].* = prev;
-    }
-    return out[0..len].*;
 }
 
 // ── the SVDW map (RFC 9380 §6.6.1, constants of §F.1 for A = 0, Z = 1) ──────
@@ -131,7 +116,7 @@ const svdw_c3 = fp2Hex("29fd332ab7260112b801fa95b21af64e2e6da55f90a3e510fcbe5737
 const svdw_c4 = fp2Hex("17365bbe63b1d2078632fe0eb2ac5a41b4e6a9c08b98676721010b008d4eaf99", "0f57ffe5fc79e19cd689d7aa4209cad8fe164d7f4694786b388732a995d03755");
 
 /// `(p − 1)/2`: Euler's criterion in `Fp`.
-const legendre_exp: [32]u8 = bn254.fp.pExponentBytes(-1, 2);
+const legendre_exp: [32]u8 = fp.pExponentBytes(-1, 2);
 
 /// `a` is a square in `Fp2` iff its norm `c0² + c1²` is a square in `Fp`.
 fn isSquare(a: Fp2) bool {
@@ -152,9 +137,10 @@ fn curveRhs(x: Fp2, b: Fp2) Fp2 {
     return x.square().mul(x).add(b);
 }
 
-/// `map_to_curve_svdw(u)`: a point of the twist `E'` (not yet in G2).
-fn mapToCurve(u: Fp2) G2.Affine {
-    const b = bn254.g2.twistB();
+/// `map_to_curve_svdw(u)` (RFC 9380 §6.6.1): a point of the twist `E'`, not
+/// yet in G2 (`clearCofactorG2` takes it there).
+pub fn mapToCurveG2(u: Fp2) G2.Affine {
+    const b = g2.twistB();
     var tv1 = u.square().mul(svdw_c1);
     const tv2 = Fp2.one.add(tv1);
     tv1 = Fp2.one.sub(tv1);
@@ -175,18 +161,19 @@ fn mapToCurve(u: Fp2) G2.Affine {
 
 // ── cofactor clearing ───────────────────────────────────────────────────────
 
-/// `ψ(X, Y, Z) = (X̄·γx, Ȳ·γy, Z̄)`, the twist Frobenius (`bn254`'s `psi_gamma_*`).
+/// `ψ(X, Y, Z) = (X̄·γx, Ȳ·γy, Z̄)`, the twist Frobenius (`g2.psi_gamma_*`).
 fn psi(p: G2.Jacobian) G2.Jacobian {
     return .{
-        .x = p.x.frobenius().mul(bn254.g2.psi_gamma_x),
-        .y = p.y.frobenius().mul(bn254.g2.psi_gamma_y),
+        .x = p.x.frobenius().mul(g2.psi_gamma_x),
+        .y = p.y.frobenius().mul(g2.psi_gamma_y),
         .z = p.z.frobenius(),
     };
 }
 
-/// `[x]Q + ψ([3x]Q) + ψ²([x]Q) + ψ³(Q)` (SAC 2011, §6.1; gnark-crypto's
-/// `G2Jac.ClearCofactor`): a point of the order-r subgroup for every `Q` on `E'`.
-fn clearCofactor(q: G2.Jacobian) G2.Jacobian {
+/// RFC 9380 `clear_cofactor` for this suite: `[x]Q + ψ([3x]Q) + ψ²([x]Q) +
+/// ψ³(Q)` (SAC 2011, §6.1; gnark-crypto's `G2Jac.ClearCofactor`): a point of
+/// the order-r subgroup for every `Q` on `E'`.
+pub fn clearCofactorG2(q: G2.Jacobian) G2.Jacobian {
     const xq = q.scalarMulBytes(&seed_be);
     const t1 = psi(xq.double().add(xq));
     const t2 = psi(psi(xq));
@@ -269,21 +256,71 @@ const vectors = [_]Vector{
     },
 };
 
-test "hashToG2: gnark-crypto's BN254G2_XMD:SHA-256_SVDW_RO_ vectors (u0, u1, Q0, Q1, P)" {
+test "hashToCurveG2: gnark-crypto's BN254G2_XMD:SHA-256_SVDW_RO_ vectors (u0, u1, Q0, Q1, P)" {
     for (vectors) |v| {
-        const u = hashToField(v.msg, quux_dst);
+        const u = hashToFieldFp2(2, v.msg, quux_dst);
         try testing.expect(u[0].eql(try fp2FromHex(v.u0)));
         try testing.expect(u[1].eql(try fp2FromHex(v.u1)));
-        try expectPoint(mapToCurve(u[0]), v.q0[0], v.q0[1]);
-        try expectPoint(mapToCurve(u[1]), v.q1[0], v.q1[1]);
-        const p = hashToG2(v.msg, quux_dst);
+        try expectPoint(mapToCurveG2(u[0]), v.q0[0], v.q0[1]);
+        try expectPoint(mapToCurveG2(u[1]), v.q1[0], v.q1[1]);
+        const p = hashToCurveG2(v.msg, quux_dst);
+        try expectPoint(p, v.p[0], v.p[1]);
+        try testing.expect(G2.Jacobian.fromAffine(p).subgroupCheck());
+    }
+}
+
+const NuVector = struct { msg: []const u8, u: []const u8, q: [2][]const u8, p: [2][]const u8 };
+
+const quux_nu_dst = "QUUX-V01-CS02-with-BN254G2_XMD:SHA-256_SVDW_NU_";
+
+/// gnark-crypto v0.19.2, `ecc/bn254/hash_vectors_test.go`, `encodeToG2Vector`
+/// (Apache-2.0; test data, transcribed).
+const nu_vectors = [_]NuVector{
+    .{
+        .msg = "",
+        .u = "0x5952a51e848675c06172da425edc1c471c11db4bc51cfb84c097bdbcf22b6b5,0x4f8c1f037b231d08ea68f3e23b8e3c708d3993a1577d1bcfc92c2392a82c47e",
+        .q = .{ "0x1aff45b8bec4d8c0b48638acd6aa6886d9c0202c8f415061673ec4a1eb520af6,0x19abe65fd87b71da2f78347494f28418dee2f1b75956f0dddc4efb98837e325d", "0x1f01deb60bef6c08b36bb2cb465efdd20b597532e05a27c45034a729f8fe8f59,0x2e76aede179fdb62bdba78c6f28566f68aa721f3220a853b65c79f135e427ef7" },
+        .p = .{ "0x4e9ea7f5807198397a99e234e91d4b9e6cadf0135ebedd97fd75cffed6e994d,0x70077acfda8443392fb30222ba96b63f4b734e678494bf4ed0e07074b440a7b", "0x2d3653bf41ec170ce2d48774d02393c8d5f60fee5690b4f8cbc8531e269227f9,0xa7cf5d0d356f0c4d163570209e5f8f749bf91dc2a7d9ba58199a95ce02242b4" },
+    },
+    .{
+        .msg = "abc",
+        .u = "0x25f701986d04721d21b118002eeaad1b8ecc8de722d4d8e7ad5f060518ea5c7c,0xf05f22acfb3bf7abb1f8f1b80e0de029a20a2b96c6eefa2f371431bbfca04a3",
+        .q = .{ "0x2216ec5165748117d5aecf12f1eff5f6380367163e351d591f5de9aebfe5f82e,0x2dc39518b60217999eadc27840962dd62ffb38e7d7e6c72a208206e6b2c07028", "0xb424f1cc74e01e0d61084ecfb3785bc8a66443d99be786c387a4d5e1ad91832,0xbb538ea60a53b3c933726e61a57e753a8919a75d8c600f8f6af6bbf460a57ee" },
+        .p = .{ "0x101e2f3d9fa22cb435ecb67d5284dc27c247856d6de4e420e1812e0bcea5afd8,0x29226a3ca7415a541599274bf9e805050c82d443fd953481b17236325be3b6b7", "0x290bf12841dd276211effe86af369c11a2cb364c443981d0faf347cfb7b68715,0x2e7c8a61fe36735852597ac564966560afe0ef8221918d5534e57f3096f7047d" },
+    },
+    .{
+        .msg = "abcdef0123456789",
+        .u = "0xeb05b113763043309faadf3c004ac0eb40f948faed5d83d4d1f0571112ca09c,0x1730924259ae2e94ae7ee719c1eeb5d6328b6963819ee4065541dfdefb5e7a07",
+        .q = .{ "0x1f3620223ed7115c479ed1150b509886c8ecf7411e004e943f544829ed3fc56f,0x3063a2d037058a1ff49edba42f2f78d3fdd03e592bd3df415d04176ba269c7c7", "0x1d1a9b20266ba09a594e299ca4c9e27564218986669d1fa90566764f5a8ac63a,0x7f48bbaf8c038ad3a2167a9e43e583a73d6a88795e574c4e26834fbcf2bb44b" },
+        .p = .{ "0xfcda542dd52f0e527bf828e63fe2a1f63a05c9a5c7a28865cfef247c6e1e8a6,0x2d0bb492bb59847c106af8285fae5be0b5f96b6dcad56b3a0c7ddc364ae55a3a", "0x172d50b483e9bb9aa230e7cb82fbd522af1b73c1643bbd022614533311071780,0xafb68b6e28f44f49d6ab4c3014e73f7e07fd4d0b13a9519b798e9f1927a47b9" },
+    },
+    .{
+        .msg = "q128_" ++ @as([128]u8, @splat('q')),
+        .u = "0x47b36a3ec43c92ae9070ef71f85016bd5a08c1bd0ca487672f176061ca09159,0x248076a8b63f52e5f3c7228411637e04cbd0cb36940ee3a257f60ce49e75fe86",
+        .q = .{ "0x1db4c6c448341a408bd60ebf8d19bfc149927dbd5af0af598d4c6d2f1629bd8a,0x2d61dff76daa91b0044f83074f4c841e0bbf3711f5b8a7ac8e0618b29fce6d92", "0x1dedea44e27ea061f38fd062e2b1c6d93db96a32cf5a214da49f39eeeb803791,0x113a4cf8a33642670164f11b2ef257f6653ae8045ac58fc172f022f3f8107c4a" },
+        .p = .{ "0x1d050758368c65df07014cab4752d8244ddf21691ab6418a3493bcc2a946b38d,0x2596aa6bcb29439a9cdc7cfe0b9d247a890a4295dc17d053c293c7e40c27387f", "0x2f84eec5eaa87952d0d81c93c3f470c1e1a00d0ba307d8fda78b76841aca8e82,0x27aef639d6eb4157c6f076e9fdae2f9eb15042dea92304fc54ebd5f69c5c3443" },
+    },
+    .{
+        .msg = "a512_" ++ @as([512]u8, @splat('a')),
+        .u = "0x2f3b24a712fbb1272e51db197d666cdad2cc94c2a6e7b77d99e97d8a705a8a50,0x253bcb542b718219fe2f6de276c6d86965d610b3e66bd0448576db18e1e9ab3f",
+        .q = .{ "0x2376cb494d599bbe8523817d9702f0da6e6e0ba7f321dcccb720cd5696f57de7,0x2228f04e096f6802387d0d40b3b575afd66281de5d734b33da09fbb86cef5a1a", "0x17332e7ce9faf26d7f5c5cf247ea51f48594238faeb0be338462895016da6738,0xcbd6f12f78c47d3f46238782e5d297ab15a1b8f5c065a8ba52620c16d555fa0" },
+        .p = .{ "0x13729abbd4fbe2a13bc742960afa9053a4e6be06ea712b0d18153a9ec3854a7,0x261e8ebaff3438064599465bb52880e8e8a663b27cfb6d794d90ac60437819a9", "0x132285a30dc36cc14da2d145390a6328e574155ebaece32856fb890d1f7ba16e,0x6bd9197b3c0c1cc4d17695042dcbaf0168329a113d358c3b17885f71a394986" },
+    },
+};
+
+test "encodeToCurveG2: gnark-crypto's BN254G2_XMD:SHA-256_SVDW_NU_ vectors (u, Q, P)" {
+    for (nu_vectors) |v| {
+        const u = hashToFieldFp2(1, v.msg, quux_nu_dst);
+        try testing.expect(u[0].eql(try fp2FromHex(v.u)));
+        try expectPoint(mapToCurveG2(u[0]), v.q[0], v.q[1]);
+        const p = encodeToCurveG2(v.msg, quux_nu_dst);
         try expectPoint(p, v.p[0], v.p[1]);
         try testing.expect(G2.Jacobian.fromAffine(p).subgroupCheck());
     }
 }
 
 test "SVDW constants: re-derived from their RFC 9380 definitions (A = 0, Z = 1)" {
-    const b = bn254.g2.twistB();
+    const b = g2.twistB();
     const gz = curveRhs(svdw_z, b);
     const three: Fp2 = .{ .c0 = try Fp.fromInt(u8, 3), .c1 = Fp.zero };
     const two: Fp2 = .{ .c0 = try Fp.fromInt(u8, 2), .c1 = Fp.zero };
@@ -316,7 +353,7 @@ test "isSquare agrees with Fp2.sqrt; sgn0 follows RFC 9380 §4.1" {
 }
 
 test "map_to_curve: the exceptional inputs (tv1·tv2 = 0) still land on the twist" {
-    const b = bn254.g2.twistB();
+    const b = g2.twistB();
     // u = 0, and every u with c1·u² = ±1, where `inv0` returns 0.
     var inputs: [5]Fp2 = @splat(Fp2.zero);
     var n: usize = 1;
@@ -330,17 +367,17 @@ test "map_to_curve: the exceptional inputs (tv1·tv2 = 0) still land on the twis
     }
     try testing.expect(n > 1);
     for (inputs[0..n]) |u| {
-        const q = mapToCurve(u);
+        const q = mapToCurveG2(u);
         try testing.expect(q.y.square().eql(curveRhs(q.x, b)));
     }
 }
 
-test "clearCofactor: the raw SVDW point is outside G2, the cleared one inside" {
-    const q = mapToCurve(hashToField("cofactor", quux_dst)[0]);
+test "clearCofactorG2: the raw SVDW point is outside G2, the cleared one inside" {
+    const q = mapToCurveG2(hashToFieldFp2(1, "cofactor", quux_dst)[0]);
     const j = G2.Jacobian.fromAffine(q);
     try testing.expect(j.isOnCurve());
     try testing.expect(!j.subgroupCheck());
-    const c = clearCofactor(j);
+    const c = clearCofactorG2(j);
     try testing.expect(!c.isIdentity());
     try testing.expect(c.subgroupCheck());
 }

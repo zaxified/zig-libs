@@ -227,23 +227,14 @@ design" below.
   `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite of draft-irtf-cfrg-bbs-signatures
   Appendix A.1 (`hashToCurveG1PartsWith(.xof_shake256, ..)`; G2 has no XOF
   variant — no consumer). K.6-anchored; the G1 suite itself is anchored by
-  `bbs`'s draft-12 SHAKE-256 generators. The §5.3.3 long-DST rehash is not
-  implemented for either expander (`dst.len <= 255` asserted).
-- **`expand_message_xmd` reuse decision (flagged, not unilateral)**:
-  `modules/frost` and `modules/voprf` each already carry an in-module
-  `expand_message_xmd`, but both are hardcoded to a fixed `ell`
-  (frost: SHA-256/`ell=2`; voprf: SHA-512/`ell=1`) that is too narrow
-  for this module's needs (`G1`'s `hash_to_field(msg,2)` needs `ell=4`;
-  `G2`'s needs `ell=8`), and reusing either directly would add a
-  cross-module dependency edge from `bls12_381` to a threshold-signature
-  or OPRF module for one hash primitive — a layering smell. This pass
-  REIMPLEMENTS `expand_message_xmd` from the RFC 9380 §5.3.1 pseudocode
-  directly, generalized to any `ell <= 255` (frost's/voprf's versions
-  are each a specialization of this general shape) — a deliberate,
-  explicitly-flagged departure from a literal "reuse the existing
-  implementation" instruction; the owner may instead choose to factor a
-  shared `expand_message_xmd` helper across all three modules later,
-  but that is a cross-module refactor this module does not make unilaterally.
+  `bbs`'s draft-12 SHAKE-256 generators. The §5.3.3 long-DST rehash is
+  implemented for the XMD expander only (the XOF one asserts `dst.len <= 255`).
+- **`expand_message_xmd`** is `sha2.expandMessageXmd` over std's
+  `Sha256` (the collection's one generic RFC 9380 §5.3.1 copy, shared with
+  `bn254`, `voprf` and `frost`); `expandMessageXmd`/`expandMessageXmdParts`
+  keep this module's SHA-256 names. Any `ell <= 255`; a DST over 255 bytes
+  is reduced per §5.3.3 (`SHA-256("H2C-OVERSIZE-DST-" || DST)`, as blst
+  does). K.1 is pinned here, K.1–K.3 in `sha2`.
 - **The `Fp` wide-reduction gap**: `hash_to_field`'s `OS2IP(tv) mod p`
   step needs to reduce a 512-bit (`L=64`-byte) integer into `Fp`
   (384-bit container). `scalar.zig`'s `Fr.reduceWide` already solves the

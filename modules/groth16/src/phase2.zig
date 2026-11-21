@@ -31,7 +31,7 @@
 //! `e(g1_s, g2_spx) = e(g1_sx, g2_sp)` and `e(δ_before, g2_spx) =
 //! e(δ_after, g2_sp)`: δ moved by the same `x` in G1 and G2, and the record
 //! (name included) is the one its transcript names. `g2_sp` is hashed to the
-//! curve (RFC 9380 SVDW, `hash_to_g2.zig`), so its discrete log is unknown
+//! curve (RFC 9380 SVDW, `bn254.hash_to_curve`), so its discrete log is unknown
 //! and `g2_spx` cannot be written without `x` — the knowledge-of-exponent
 //! argument of the Bowe–Gabizon–Miers MPC (IACR ePrint 2017/1050). The tag
 //! is this module's own (snarkjs derives its `g2_sp` differently), so a
@@ -46,7 +46,6 @@ const zkey_mod = @import("zkey.zig");
 const circom = @import("circom.zig");
 const ptau_mod = @import("ptau.zig");
 const msm = @import("msm.zig");
-const hash_to_g2 = @import("hash_to_g2.zig");
 
 const Fr = bn254.Fr;
 const G1 = bn254.G1;
@@ -370,17 +369,17 @@ fn g2Sp(transcript: [64]u8) G2.Affine {
 //
 // `g2_sp` must be a G2 point whose discrete log nobody knows, or `[x]₂` can be
 // read off a record (§ 5b item 6). RFC 9380 `hash_to_curve` with the SVDW map
-// (`hash_to_g2.zig`: gnark-crypto's `BN254G2_XMD:SHA-256_SVDW_RO_` suite) under
+// (`bn254.hash_to_curve`: gnark-crypto's `BN254G2_XMD:SHA-256_SVDW_RO_` suite) under
 // this module's own domain separation tag.
 
 /// The domain separation tag of `hashToG2` (RFC 9380 §3.1 shape).
 pub const hash_to_g2_dst = "ZIG-LIBS-GROTH16-PHASE2-V2-CS01-with-BN254G2_XMD:SHA-256_SVDW_RO_";
 
 /// A point of the order-r subgroup of G2 determined by `msg`, with a discrete
-/// log nobody knows (in the random-oracle model): `hash_to_g2.hashToG2(msg,
-/// hash_to_g2_dst)`.
+/// log nobody knows (in the random-oracle model):
+/// `bn254.hash_to_curve.hashToCurveG2(msg, hash_to_g2_dst)`.
 pub fn hashToG2(msg: []const u8) G2.Affine {
-    return hash_to_g2.hashToG2(msg, hash_to_g2_dst);
+    return bn254.hash_to_curve.hashToCurveG2(msg, hash_to_g2_dst);
 }
 
 // ── rescaling C and H by 1/x ────────────────────────────────────────────────

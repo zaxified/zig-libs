@@ -1013,8 +1013,8 @@ ibe	ReleaseFast	fp12pow	1	0	ed4966aba724ecd3	d2e187260f9f18a2
 # counts), plus 2 eqlBytes and 2 branches comparing them with the listed,
 # public commitments. Diffed context by context against 50d173d8; the harness
 # lists commitments from an untainted twin of the nonce inputs.
-frost	ReleaseFast	commit	1	8	47df53872439d078	94a2e96655c4ce21
-frost	ReleaseFast	sign	1	13	47df53872439d078	1da8c496388f45b0
+frost	ReleaseFast	commit	1	8	f33f15db63223552	94a2e96655c4ce21
+frost	ReleaseFast	sign	1	13	f33f15db63223552	1da8c496388f45b0
 # Zig 0.17.0 (2026-10-18): sign 101 -> 103 (bound <=101 -> <=103), BENIGN (public input). k256
 # `Fe.fromBytes`'s `v >= p` test (field.zig) now shows under BOTH `XOnlyPublicKey.fromBytes`
 # and `lift` inside musig2 `cpoint` (x3 each, was x3): LLVM 22 no longer folds lift's repeated
@@ -1820,9 +1820,9 @@ base32	ReleaseFast	decode	1	8	821c5a78a8508658	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	9344b78de27bedf3	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	9344b78de27bedf3	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	9344b78de27bedf3	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	8e43bbbd5da21844	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	8e43bbbd5da21844	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	8e43bbbd5da21844	f2504d3c494735f2
 # voprf (2026-11-13): the protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
 # (every RFC 9497 suite through one generic layer); PATTERN widened to those files. The three
 # ristretto255 rows above kept their counts (5/8/3, same contexts, same out digests).
@@ -1861,18 +1861,18 @@ voprf	ReleaseFast	keygen	1	3	9344b78de27bedf3	f2504d3c494735f2
 #                 it (main 2026-11-13); h2c now uses the sibling's `Fe.cMov` for p256 and p521
 #                 (re-measured: every count unchanged) and keeps its own laundered byte select
 #                 for p384, whose `Fe.cMov` still builds its mask from the bare bit.
-voprf	ReleaseFast	decaf448-server	1	21	9344b78de27bedf3	9543f02b1201b9cb
-voprf	ReleaseFast	decaf448-client	1	19	9344b78de27bedf3	969cd54fa62ca9e8
-voprf	ReleaseFast	decaf448-keygen	1	6	9344b78de27bedf3	d3f8144ee6d4be08
-voprf	ReleaseFast	p256-server	1	59	9344b78de27bedf3	6afdfb7a486b2a85
-voprf	ReleaseFast	p256-client	1	27	9344b78de27bedf3	5d8dfb2d4afe8974
-voprf	ReleaseFast	p256-keygen	1	12	9344b78de27bedf3	d26dc23c71b4c631
-voprf	ReleaseFast	p384-server	1	30	9344b78de27bedf3	5ed6c2e0c382fda2
-voprf	ReleaseFast	p384-client	1	15	9344b78de27bedf3	ff25c1410ee44fb9
-voprf	ReleaseFast	p384-keygen	1	3	9344b78de27bedf3	c65d6fb0102b9c90
-voprf	ReleaseFast	p521-server	1	26	9344b78de27bedf3	5a0178ab968c5fe9
-voprf	ReleaseFast	p521-client	1	7	9344b78de27bedf3	c519de5273b05353
-voprf	ReleaseFast	p521-keygen	1	3	9344b78de27bedf3	517083316574f2e7
+voprf	ReleaseFast	decaf448-server	1	21	8e43bbbd5da21844	9543f02b1201b9cb
+voprf	ReleaseFast	decaf448-client	1	19	8e43bbbd5da21844	969cd54fa62ca9e8
+voprf	ReleaseFast	decaf448-keygen	1	6	8e43bbbd5da21844	d3f8144ee6d4be08
+voprf	ReleaseFast	p256-server	1	59	8e43bbbd5da21844	6afdfb7a486b2a85
+voprf	ReleaseFast	p256-client	1	27	8e43bbbd5da21844	5d8dfb2d4afe8974
+voprf	ReleaseFast	p256-keygen	1	12	8e43bbbd5da21844	d26dc23c71b4c631
+voprf	ReleaseFast	p384-server	1	30	8e43bbbd5da21844	5ed6c2e0c382fda2
+voprf	ReleaseFast	p384-client	1	15	8e43bbbd5da21844	ff25c1410ee44fb9
+voprf	ReleaseFast	p384-keygen	1	3	8e43bbbd5da21844	c65d6fb0102b9c90
+voprf	ReleaseFast	p521-server	1	26	8e43bbbd5da21844	5a0178ab968c5fe9
+voprf	ReleaseFast	p521-client	1	7	8e43bbbd5da21844	c519de5273b05353
+voprf	ReleaseFast	p521-keygen	1	3	8e43bbbd5da21844	517083316574f2e7
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
@@ -1913,8 +1913,8 @@ opcua	ReleaseFast	chunk	1	14	0dd1fbac129468b8	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
-sha2	ReleaseFast	hash	1	0	c0604079a0eaadee	5159f9e4e7e6085d
-sha2	ReleaseFast	hmac	1	0	c0604079a0eaadee	f0186875cfa058e3
+sha2	ReleaseFast	hash	1	0	233c48d562fffbd2	5159f9e4e7e6085d
+sha2	ReleaseFast	hmac	1	0	233c48d562fffbd2	f0186875cfa058e3
 # xmss (2026-10-10) — sign: keyGen + 5 signs at h=4 with SK_SEED/SK_PRF
 # tainted. 2 = the WOTS chain length loop (root.zig `chain`): its count is a
 # base-w digit of H_msg(r, root, idx, M), and r = PRF(SK_PRF, idx) is
@@ -2517,7 +2517,7 @@ coconut	ReleaseFast	user_issue	1	27	01094de468b4fd8b	af24664cb307a403	cpu=x86_64
 # only as consequences of k. The secret `k` goes through `mulSecret` (protocol.zig `computeCompositesFast`), which is not
 # involved. On native the same table load is attributed to addAffineVt (-2), because the asm field
 # mul is inlined there.
-voprf	ReleaseFast	p384-server	1	32	9344b78de27bedf3	5ed6c2e0c382fda2	cpu=x86_64
+voprf	ReleaseFast	p384-server	1	32	8e43bbbd5da21844	5ed6c2e0c382fda2	cpu=x86_64
 acme	ReleaseFast	pem	1	43	5338dfdbd665eb9f	e3f3e71bec825dd7	cpu=x86_64
 acme	ReleaseFast	pem384	1	44	5338dfdbd665eb9f	5eb84a3bc4959381	cpu=x86_64
 acme	ReleaseFast	pkcs8	1	46	5338dfdbd665eb9f	b26448f1c577ca4e	cpu=x86_64

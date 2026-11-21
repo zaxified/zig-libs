@@ -41,6 +41,15 @@ const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.Hmac(sha2.Sha38
 _ = sha2.Sha256.backend();                      // .stdlib / .cryptogams_shani / .cryptogams_avx2 / .simd / .scalar
 ```
 
+**Hash-to-curve expander.** `sha2.expandMessageXmd(Hash, len, parts, dst)` is
+RFC 9380's `expand_message_xmd` (§5.3.1; a DST over 255 bytes reduced per
+§5.3.3), generic over std's or this module's SHA-2 types, for the curve
+modules' hash-to-curve:
+
+```zig
+const u = sha2.expandMessageXmd(std.crypto.hash.sha2.Sha256, 96, &.{ "msg" }, "MY-DST-V01");
+```
+
 **Which path runs.** `.stdlib` for SHA-224/256 where the build target has
 SHA hardware instructions (x86-64 SHA-NI, ARMv8 `sha2`). There std is the
 faster one, and this module hands it the blocks. Otherwise, on x86-64 ELF

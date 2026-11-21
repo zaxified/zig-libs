@@ -138,6 +138,7 @@
 //! sizes) and is explicitly out of scope for this pass.
 
 const std = @import("std");
+const sha2 = @import("sha2");
 
 /// Re-exported for callers (and `kat_test.zig`) that need to construct a
 /// raw curve point directly (e.g. deriving a `VerifyingShare` from a
@@ -166,7 +167,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "RFC 9591 (\"The Flexible Round-Optimized Schnorr Threshold (FROST) Protocol for Two-Round Schnorr Signatures\"), §6.5 secp256k1/SHA-256 ciphersuite; RFC 9380 (hash-to-curve) §5.3/§5.4.1 expand_message_xmd/hash_to_field for H1-H3; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
-    .deps = .{"k256"}, // the curve group
+    .deps = .{ "k256", "sha2" }, // the curve group; sha2: RFC 9380 expand_message_xmd
 };
 
 // ── ciphersuite constants (RFC 9591 §6.5) ───────────────────────────────
@@ -196,21 +197,16 @@ pub const Ns: usize = 32;
 // DST = contextString || label. H4, H5 are plain tagged SHA-256 (no
 // expand_message_xmd): `SHA256(contextString || label || m)`.
 //
-// `expandMessageXmd48` below is deliberately specialized to
-// `len_in_bytes = 48` (this ciphersuite's ONLY value: `hash_to_field`'s
-// `L = ceil((ceil(log2(p)) + k) / 8)` with `p` = the secp256k1 order
-// (256-bit) and `k` = 128 (the target security level) works out to 48
-// for every one of H1/H2/H3 — RFC 9380 §5.1/§8.9's "L" table lists 48 for
-// secp256k1), NOT a general-purpose arbitrary-length implementation —
-// there is no other length this ciphersuite ever needs. `ell = 2` (two
-// SHA-256 blocks, `ceil(48/32)`) is likewise hardcoded.
+// `expandMessageXmd48` below is `sha2.expandMessageXmd` (the collection's
+// one generic RFC 9380 §5.3.1 copy) at SHA-256 and `len_in_bytes = 48`,
+// this ciphersuite's only value: `hash_to_field`'s `L = ceil((ceil(log2(p))
+// + k) / 8)` with `p` the secp256k1 order (256-bit) and `k = 128` is 48 for
+// every one of H1/H2/H3 (RFC 9380 §5.1/§8.9's "L" table lists 48 for
+// secp256k1).
 
-/// RFC 9380 §5.4.1 `expand_message_xmd` specialized to SHA-256
-/// (`b_in_bytes = 32`, `s_in_bytes = 64`) and `len_in_bytes = 48`
-/// (`ell = 2`). `dst` MUST be ≤ 255 bytes (RFC 9380's own DST-length
-/// ceiling; this ciphersuite's DSTs — `contextString` plus a 3-5 byte
-/// label — are always ≤ 32, far under the limit, so this is a defensive
-/// assert, not a real constraint in practice).
+/// RFC 9380 §5.3.1 `expand_message_xmd` with SHA-256 and
+/// `len_in_bytes = 48` (`ell = 2`). This ciphersuite's DSTs —
+/// `contextString` plus a 3-5 byte label — are always ≤ 32 bytes.
 ///
 /// `msg_parts` is hashed as the CONCATENATION of every part, streamed
 /// through incremental `Sha256.update` calls — this avoids ever
@@ -224,45 +220,7 @@ pub const Ns: usize = 32;
 /// function IS `h1`/`h2`/`h3`'s shared inner step) — see
 /// `kat_test.zig`.
 fn expandMessageXmd48(msg_parts: []const []const u8, dst: []const u8) [48]u8 {
-    std.debug.assert(dst.len <= 255);
-    var dst_prime_buf: [256]u8 = undefined;
-    @memcpy(dst_prime_buf[0..dst.len], dst);
-    dst_prime_buf[dst.len] = @intCast(dst.len);
-    const dst_prime = dst_prime_buf[0 .. dst.len + 1];
-
-    const z_pad = @as([64]u8, @splat(0)); // s_in_bytes for SHA-256
-    const l_i_b_str = [_]u8{ 0x00, 0x30 }; // I2OSP(48, 2)
-
-    var hasher0 = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher0.update(&z_pad);
-    for (msg_parts) |part| hasher0.update(part);
-    hasher0.update(&l_i_b_str);
-    hasher0.update(&[_]u8{0x00}); // I2OSP(0, 1)
-    hasher0.update(dst_prime);
-    var b0: [32]u8 = undefined;
-    hasher0.final(&b0);
-
-    var hasher1 = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher1.update(&b0);
-    hasher1.update(&[_]u8{0x01}); // I2OSP(1, 1)
-    hasher1.update(dst_prime);
-    var b1: [32]u8 = undefined;
-    hasher1.final(&b1);
-
-    var xored: [32]u8 = undefined;
-    for (&xored, b0, b1) |*o, x, y| o.* = x ^ y;
-
-    var hasher2 = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher2.update(&xored);
-    hasher2.update(&[_]u8{0x02}); // I2OSP(2, 1)
-    hasher2.update(dst_prime);
-    var b2: [32]u8 = undefined;
-    hasher2.final(&b2);
-
-    var out: [48]u8 = undefined;
-    out[0..32].* = b1;
-    out[32..48].* = b2[0..16].*;
-    return out;
+    return sha2.expandMessageXmd(std.crypto.hash.sha2.Sha256, 48, msg_parts, dst);
 }
 
 /// `hash_to_field(msg, count=1)` (RFC 9380 §5.3) for the secp256k1

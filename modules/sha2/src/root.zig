@@ -48,6 +48,9 @@
 //!
 //! Every backend produces the same bytes; the tests hold each one to std and to
 //! the FIPS 180-4 / NIST example vectors.
+//!
+//! Also here: `expandMessageXmd` (RFC 9380 §5.3.1, `xmd.zig`), the SHA-2
+//! expander of hash-to-curve, shared by the curve modules.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,6 +81,12 @@ pub const Sha512_256 = Sha2(u64, sha512tIv(256), 256);
 pub const Sha256T192 = Sha2(u32, iv256, 192);
 pub const Sha512T224 = Sha2(u64, iv512, 224);
 pub const Sha512T256 = Sha2(u64, iv512, 256);
+
+/// RFC 9380 §5.3.1 `expand_message_xmd`, generic over a SHA-2 type (std's or
+/// this module's): the hash-to-curve expander, kept here once for every
+/// curve module (`xmd.zig`).
+pub const xmd = @import("xmd.zig");
+pub const expandMessageXmd = xmd.expandMessageXmd;
 
 /// How the compression function runs, per word size. Fixed at compile time,
 /// except the two `.cryptogams_*` paths, chosen at run time when the CPU has
@@ -762,6 +771,7 @@ const testing = std.testing;
 test {
     _ = @import("bench.zig");
     _ = @import("count.zig");
+    _ = xmd;
 }
 
 fn unhex(comptime n: usize, hex: []const u8) [n]u8 {

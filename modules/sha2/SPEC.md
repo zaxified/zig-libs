@@ -37,7 +37,12 @@ SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 (FIPS
 `Sha512T256`, all with the public declarations of `std.crypto.hash.sha2`'s
 types of the same names, and a faster compression function on x86-64 without
 SHA-NI: CRYPTOGAMS' SHA-NI and AVX2 assembly, chosen at run time (see
-NOTICE), with a pure-Zig SIMD and scalar engine everywhere else. It is **not**:
+NOTICE), with a pure-Zig SIMD and scalar engine everywhere else.
+
+It also holds the collection's one copy of RFC 9380's `expand_message_xmd`
+(`expandMessageXmd`, `src/xmd.zig`, see *expand_message_xmd*), the SHA-2
+expander every hash-to-curve suite runs; `bls12_381`, `bn254`, `voprf` and
+`frost` call it instead of carrying their own. It is **not**:
 
 - an HMAC or HKDF: std's generic `Hmac(H)` and `Hkdf(Hmac)` instantiate over
   these types unchanged (tested), so there is nothing to add;
@@ -208,6 +213,22 @@ under `qemu-x86_64 -cpu max`, where HMAC-SHA-256 takes this path. The XMM/YMM re
 return, on both assembly paths (`vzeroupper` clears only the upper
 halves); neither std nor OpenSSL clears them either.
 
+## expand_message_xmd
+
+`expandMessageXmd(Hash, len_in_bytes, parts, dst)` is RFC 9380 §5.3.1, generic
+over the hash type (std's SHA-2 types and this module's; the callers keep
+std's). The message comes as parts, streamed into `b_0` without being
+concatenated. `len_in_bytes` is comptime, so `0`, more than 65535 or
+`ell > 255` is a compile error (§5.3.1 step 2). A DST over 255 bytes is reduced
+to `H("H2C-OVERSIZE-DST-" || DST)` (§5.3.3), as blst and RustCrypto's
+`hash2curve` do; an empty DST is accepted (RFC 9380 §3.1 forbids empty tags
+for a suite: the caller's contract, which `voprf` enforces). `b_0` and the
+last `b_i` are wiped before return. It branches only on lengths. Tests
+(`src/xmd.zig`): RFC 9380 Appendix K.1 (SHA-256), K.2 (SHA-256, 256-byte DST)
+and K.3 (SHA-512), every message and both lengths, through std's and this
+module's hash types; parts equal the concatenated message; a long DST equals
+its reduced form, 255 bytes is not reduced; `ell = 255`.
+
 ## Limits and refusals
 
 None beyond FIPS 180-4's: any length, any split of `update` calls, any
@@ -277,7 +298,8 @@ alignment (loads are unaligned; `@ptrCast` to `*align(1)` vectors).
   The opt-in `SHA2_BIG=1` test (ReleaseFast) feeds 4 GiB + 64 bytes in one `update`.
 - **Known answers and oracles:** the FIPS 180-4 / NIST vectors for every backend, one million `'a'`, RFC 4231
   and RFC 5869 through std's `Hmac`/`Hkdf`; the live OpenSSL oracle `tools/interop.zig`
-  (`zig build interop-sha2`, `tools/openssl_oracle.c`); see *Anchoring*.
+  (`zig build interop-sha2`, `tools/openssl_oracle.c`); see *Anchoring*. `expandMessageXmd`: RFC 9380 Appendix
+  K.1–K.3 (`src/xmd.zig`).
 - **Differential against std** (`src/root.zig`): every length 0 … 1024 one-shot and split, random lengths to 64 KiB
   with block-edge splits, every SIMD lane count at every offset, byte-at-a-time with `peek`, long runs across the
   2^20-block call limit, comptime evaluation, guard-page runs (no read outside the input) for every backend.

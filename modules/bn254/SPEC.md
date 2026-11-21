@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ethereum/py_ecc](https://github.com/ethereum/py_ecc) | Python | MIT | 231 | v3.0.0 (2020-05-12), pushed 2025-12-17 | Not a competitor: the oracle this module's pairing KATs were generated from. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No pairing-friendly curves. A GitHub search for BN254 in Zig found nothing. |
 
-**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication; compressed `G1`/`G2` points in gnark-crypto's convention and a public Pippenger MSM. **Where we are behind:** no arkworks-convention compressed encoding, no Groth16 prover, no hash-to-curve (→ *What is deliberately not done*).
+**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication; compressed `G1`/`G2` points in gnark-crypto's convention and a public Pippenger MSM. **Where we are behind:** no arkworks-convention compressed encoding, no Groth16 prover, no hash-to-curve onto `G1` (→ *What is deliberately not done*).
 
 ## Purpose
 
@@ -640,6 +640,32 @@ conversion temporaries dirtied 0.4 KiB in ReleaseFast), and the drawn bytes are 
 (`randomIntoBuf` takes the scratch buffer as an out-parameter so the wipe is testable).
 `bls12_381` has the same entry point.
 
+## Hash to `G2` (`hash_to_curve.zig`)
+
+RFC 9380 hash-to-curve onto `G2`, gnark-crypto's suites (RFC 9380 defines none for BN254):
+`hashToCurveG2(msg, dst)` = `BN254G2_XMD:SHA-256_SVDW_RO_` (gnark-crypto `HashToG2`),
+`encodeToCurveG2(msg, dst)` = `..._NU_` (`EncodeToG2`). Stages, each public:
+`hashToFieldFp2(count, msg, dst)` (`expand_message_xmd` with SHA-256 through
+`sha2.expandMessageXmd`, `L = 48`; a DST over 255 bytes is reduced per §5.3.3);
+`mapToCurveG2(u)`, the SVDW map (§6.6.1, straight-line form of Appendix F.1) on the
+twist with `Z = 1`, the first value `find_z_svdw` (§H.1) accepts; `clearCofactorG2(q)` =
+`[x]Q + ψ([3x]Q) + ψ²([x]Q) + ψ³(Q)` (Fuentes-Castañeda–Knapp–Rodríguez-Henríquez, SAC 2011,
+§6.1; gnark-crypto's `G2Jac.ClearCofactor`), which lands in the order-r subgroup on the
+same point as every other implementation of the suite (a plain `[2p − r]Q` would give a
+different one). Not constant-time by requirement (hash inputs are public in every
+in-repo use; `groth16`'s contribution records hash a public transcript).
+
+Design reference: RFC 9380 and, for the two choices the RFC leaves to a suite on this
+curve (`L = 48`, the cofactor-clearing formula), gnark-crypto (Apache-2.0,
+`ecc/bn254/hash_to_g2.go`, v0.19.2, read). No code was ported; the SVDW constants were
+derived from the RFC's formulas and are re-derived by a test.
+
+Tests: gnark-crypto v0.19.2's published vectors (`ecc/bn254/hash_vectors_test.go`, test
+data): five messages per suite, `u`, `Q` and the output each (`_RO_` also reproduced by
+an independent RFC 9380 model in Python); the SVDW constants against their definitions;
+`isSquare` against `sqrt`, `sgn0` per §4.1; the map's exceptional inputs (`tv1·tv2 = 0`)
+land on the twist; the raw map point outside `G2`, the cleared one inside.
+
 ## Multi-scalar multiplication (`msm.zig`)
 
 `msm(G, allocator, points, scalars)` (and `g1Msm`/`g2Msm`) computes `sum_i scalars[i] * points[i]` by Pippenger's bucket method: each
@@ -665,8 +691,7 @@ and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalar
 
 - **Compressed points in arkworks' convention** (little-endian `x`, flags on the last byte): only gnark-crypto's convention is offered (see "Compressed points").
 - **A public `isLexicographicallyLargest`:** the compressed codecs keep their own private `isLargest`; EIP-196/197 define no compressed form, so the precompile path needs none.
-- **`G2` cofactor value / `clearCofactor` and hash-to-curve:** BN254 has no standardized hash-to-`G2` used by EIP-197 precompile semantics or Groth16 verification (both only consume
-  caller-supplied `G2` points), so cofactor clearing has no consumer; `subgroupCheck` alone is sufficient and exercised. Revisit only if a future part adds hash-to-`G2`.
+- **Hash-to-curve onto `G1`** (gnark-crypto's `BN254G1_XMD:SHA-256_SVDW_*` suites): no in-repo consumer; `hash_to_curve.zig` covers `G2`, the group a ceremony or BLS-on-BN254 hashes to.
 - **A Groth16 prover:** the module verifies proofs (snarkjs-produced ones included) but does not produce them.
 - **A batched `groth16.verify` accumulation:** the verifier's own `msm` is a plain loop of `scalarMul`/`add` (a handful of public inputs, no allocator); the Pippenger `msm.zig` is a separate public API.
 - **Gas or an EVM model:** the precompiles carry none; mapping `error.*` to "revert" is a future EVM-interpreter caller's job.

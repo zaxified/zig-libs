@@ -273,7 +273,8 @@ Run: `scripts/modtest voprf`. Tests sit beside the code (`kat_test.zig`, `suite_
 - **No-panic sweep** (`sweep_test.zig`, one test per finding): a batch longer than `max_batch_length` is
   an error at every batch entry point; all-0xff and all-zero secrets never panic on any suite or entry
   point; hostile element and proof encodings are errors on every suite; wiped per-role objects stay
-  total; `expandMessageXmd` accepts the whole 1..255 DST range.
+  total; `expandMessageXmd` accepts the whole 1..255 DST range and reduces a longer DST (RFC 9380
+  §5.3.3, `sha2.expandMessageXmd`); only an empty DST is a checked `@panic`.
 - **Dead-stack residue:** `stackprobe_test.zig` (ReleaseFast/ReleaseSmall only), see *Secret residue on
   the dead stack*; ristretto255 only (→ Backlog).
 - **Fuzz:** harnesses generic over their choice source, run by `std.testing.fuzz` and by the

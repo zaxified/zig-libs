@@ -133,10 +133,15 @@ flag bits `0b10`/`0b11`/`0b01` = smaller `y`/larger `y`/infinity on top of byte
 0; `G2` `x = A1 || A0`, decode is subgroup-checked). arkworks' little-endian
 convention is not offered. EIP-196/197 itself stays uncompressed.
 
+Hash to `G2` (`hash_to_curve.zig`): RFC 9380 with the Shallue–van de Woestijne map,
+gnark-crypto's suites `BN254G2_XMD:SHA-256_SVDW_RO_` (`hashToCurveG2(msg, dst)`) and
+`_NU_` (`encodeToCurveG2`), plus the stages `hashToFieldFp2`, `mapToCurveG2` and
+`clearCofactorG2`. gnark-crypto's published vectors are reproduced. The expander is
+`sha2.expandMessageXmd`.
+
 ## Not provided
 
-No Groth16 prover, no hash-to-curve or `G2` cofactor-clearing (`G1`'s cofactor is 1, and
-BN254 has no standardized hash-to-`G2` needed for EIP-197/Groth16 verification), no
+No Groth16 prover, no hash-to-curve onto `G1` (only onto `G2`, below), no
 arkworks-convention compressed points, no public `isLexicographicallyLargest`, no gas or EVM
 model. Reasons in `SPEC.md` *What is deliberately not done*; open optimizations in
 *Backlog / deferred*.

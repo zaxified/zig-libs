@@ -59,6 +59,8 @@ pub const pairing = @import("pairing.zig");
 pub const precompiles = @import("precompiles.zig");
 pub const groth16 = @import("groth16.zig");
 pub const msm = @import("msm.zig");
+/// RFC 9380 hash-to-curve onto `G2` (SVDW, gnark-crypto's suites).
+pub const hash_to_curve = @import("hash_to_curve.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -102,7 +104,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing
     .concurrency = .reentrant, // every type is a plain value type, no shared state
     .model_after = "BN254 / alt-bn128 (EIP-196/197) field tower; Fp is this module's own constant-time CIOS/SOS Montgomery arithmetic over four 64-bit limbs (Fr is montint.Field), modelled on the sibling bls12_381 module and adapted to BN254's modulus/non-residues",
-    .deps = .{"montint"}, // montint.Field is `Fr`'s constant-time arithmetic
+    .deps = .{ "montint", "sha2" }, // montint.Field is `Fr`'s constant-time arithmetic; sha2: RFC 9380 expand_message_xmd
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -123,6 +125,7 @@ test {
     _ = precompiles;
     _ = groth16;
     _ = msm;
+    _ = hash_to_curve;
     _ = @import("fuzz_test.zig");
     _ = @import("audit_test.zig");
 }

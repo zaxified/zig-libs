@@ -149,3 +149,16 @@ test "expandMessageXmd accepts the whole 1..255 DST range (sweep VOPRF-5)" {
     _ = voprf.expandMessageXmd(32, &.{"m"}, &d255);
     _ = voprf.expandMessageXmd(64, &.{"m"}, "d");
 }
+
+test "expandMessageXmd: a DST over 255 bytes is reduced per RFC 9380 §5.3.3, both expanders" {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const long: [300]u8 = @splat('L');
+    var reduced: [64]u8 = undefined;
+    var h = Sha512.init(.{});
+    h.update("H2C-OVERSIZE-DST-");
+    h.update(&long);
+    h.final(&reduced);
+    const want = voprf.expandMessageXmd(64, &.{"m"}, &reduced);
+    try testing.expectEqualSlices(u8, &want, &voprf.expandMessageXmd(64, &.{"m"}, &long));
+    try testing.expectEqualSlices(u8, &want, &voprf.h2c.expandMessageXmd(Sha512, 64, &.{"m"}, &long));
+}

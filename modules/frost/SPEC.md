@@ -59,7 +59,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (48 bytes → mod `p`, not a direct 32-byte parse). `H4`/`H5` ARE simple
   tagged SHA-256 (`SHA256(contextString || label || m)`, no
   `expand_message_xmd`) — do not confuse the two hash SHAPES within the
-  same ciphersuite.
+  same ciphersuite. `expand_message_xmd` itself is `sha2.expandMessageXmd`
+  (the collection's one RFC 9380 §5.3.1 copy, its K.1–K.3 vectors in `sha2`).
 - **Validation of the hash layer**: RFC 9591's own Appendix E.5 vector
   does not publish an `expand_message_xmd`/`hash_to_field` KAT in
   isolation (RFC 9380 has its own separate vector suite for that, not

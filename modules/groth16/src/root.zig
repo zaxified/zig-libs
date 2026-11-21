@@ -77,7 +77,6 @@ pub const circom = @import("circom.zig");
 pub const ptau = @import("ptau.zig");
 pub const zkprove = @import("zkprove.zig");
 pub const phase2 = @import("phase2.zig");
-pub const hash_to_g2 = @import("hash_to_g2.zig");
 pub const solidity = @import("solidity.zig");
 
 // Convenience re-exports.
@@ -134,7 +133,6 @@ test {
     _ = ptau;
     _ = zkprove;
     _ = phase2;
-    _ = hash_to_g2;
     _ = @import("snarkjs_files_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("harness_test.zig");

@@ -4,7 +4,7 @@
 //! `std` nor the `p256`/`p384`/`p521` siblings provide:
 //!
 //!   - `expandMessageXmd` — §5.3.1 over any std SHA-2 hash, any `ell` up to
-//!     255 (the SHA-512/64-byte special case in `root.zig` predates it);
+//!     255 (`sha2.expandMessageXmd`, re-exported);
 //!   - `expandMessageXof` — §5.3.2 over SHAKE256 (decaf448-SHAKE256);
 //!   - `Nist(...)` — `hash_to_field` (§5.2, `m = 1`), the simplified SWU map
 //!     (§6.6.2) with `sqrt_ratio` for `q = 3 (mod 4)` (Appendix F.2.1.2),
@@ -24,6 +24,7 @@
 //! comptime constants (exponent bits, lengths).
 
 const std = @import("std");
+const sha2 = @import("sha2");
 
 /// An optimization barrier on a byte: the result is `x`, but the compiler
 /// can no longer prove it is 0 or 1, so a mask built from it is not turned
@@ -37,66 +38,13 @@ pub fn launder(x: u8) u8 {
 }
 
 /// RFC 9380 §5.3.1 `expand_message_xmd(msg, DST, len_in_bytes)` with hash
-/// `Hash` (a `std.crypto.hash.sha2` type). `msg` is given as consecutive
-/// parts (`parts[0] || parts[1] || ...`, never concatenated in memory).
-/// `len_in_bytes` and `dst` are comptime, so the §5.3.1 step-1 bounds
-/// (`ell <= 255`, `len <= 65535`, `len(DST) <= 255`) are compile errors,
-/// not runtime refusals. Same shape as `bls12_381`'s
-/// `expandMessageXmdParts`, generic over the hash.
-pub fn expandMessageXmd(
-    comptime Hash: type,
-    comptime len_in_bytes: usize,
-    parts: []const []const u8,
-    comptime dst: []const u8,
-) [len_in_bytes]u8 {
-    const b_in_bytes = Hash.digest_length;
-    const s_in_bytes = Hash.block_length;
-    const ell = comptime (len_in_bytes + b_in_bytes - 1) / b_in_bytes;
-    comptime {
-        if (len_in_bytes == 0 or len_in_bytes > 65535 or ell > 255) @compileError("expand_message_xmd: len_in_bytes out of range");
-        if (dst.len == 0 or dst.len > 255) @compileError("expand_message_xmd: DST must be 1..255 bytes");
-    }
-    const dst_prime = dst ++ [1]u8{@intCast(dst.len)};
-    const z_pad = @as([s_in_bytes]u8, @splat(0));
-    const l_i_b_str = [2]u8{ @intCast(len_in_bytes >> 8), @intCast(len_in_bytes & 0xff) };
-
-    var h0 = Hash.init(.{});
-    h0.update(&z_pad);
-    for (parts) |part| h0.update(part);
-    h0.update(&l_i_b_str);
-    h0.update(&[1]u8{0x00});
-    h0.update(dst_prime);
-    var b0: [b_in_bytes]u8 = undefined;
-    h0.final(&b0);
-
-    var out: [len_in_bytes]u8 = undefined;
-    var b_prev: [b_in_bytes]u8 = undefined;
-    var h1 = Hash.init(.{});
-    h1.update(&b0);
-    h1.update(&[1]u8{0x01});
-    h1.update(dst_prime);
-    h1.final(&b_prev);
-    {
-        const n = @min(b_in_bytes, len_in_bytes);
-        @memcpy(out[0..n], b_prev[0..n]);
-    }
-    comptime var i: usize = 2;
-    inline while (i <= ell) : (i += 1) {
-        var xored: [b_in_bytes]u8 = undefined;
-        for (&xored, b0, b_prev) |*o, x, y| o.* = x ^ y;
-        var hi = Hash.init(.{});
-        hi.update(&xored);
-        hi.update(&[1]u8{@intCast(i)});
-        hi.update(dst_prime);
-        hi.final(&b_prev);
-        const offset = (i - 1) * b_in_bytes;
-        const n = @min(b_in_bytes, len_in_bytes - offset);
-        @memcpy(out[offset..][0..n], b_prev[0..n]);
-    }
-    std.crypto.secureZero(u8, &b0);
-    std.crypto.secureZero(u8, &b_prev);
-    return out;
-}
+/// `Hash` (a `std.crypto.hash.sha2` type): `sha2.expandMessageXmd`, the
+/// collection's one generic copy. `msg` is given as consecutive parts
+/// (`parts[0] || parts[1] || ...`, never concatenated in memory);
+/// `len_in_bytes` out of §5.3.1's range is a compile error; a `dst` over
+/// 255 bytes is reduced to `H("H2C-OVERSIZE-DST-" || DST)` (§5.3.3).
+/// It branches only on the lengths, never on the message.
+pub const expandMessageXmd = sha2.expandMessageXmd;
 
 /// RFC 9380 §5.3.2 `expand_message_xof` with SHAKE256 (the decaf448-SHAKE256
 /// expander, RFC 9497 §4.2), message as parts, comptime length and DST.
