@@ -1705,6 +1705,10 @@ otp	ReleaseFast	uri	1	0	ad3875b611617c80	36cedfe2472c9cba
 # size. 2026-11-16: + RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, whose
 # folded AIV/MLI/padding verdict adds the same twice per KEK size: 12.
 aeskw	ReleaseFast	wrap	1	12	88dac35c72f0539b	23036d19c2656c6a
+# aesccm (2026-11-21) — aead: key + plaintext tainted, AES-128/256 with tags
+# 8/16 (12-byte nonce): seal, open, tampered open. 8 = the tag verdict after
+# the timing-safe compare (root.zig `open`), accept + reject per profile.
+aesccm	ReleaseFast	aead	1	8	53ad584409f5c6a1	d38f305d54b5a2c3
 # wireguard (2026-11-03) — messages and public keys declassified where they leave the
 # function that made them (they go on the wire). Read off the --stacks log:
 # keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag

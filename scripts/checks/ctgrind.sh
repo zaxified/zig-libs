@@ -293,6 +293,8 @@ declare -A TARGETS=(
     [otp]="code uri"
     # ── 2026-10-10: ct-wave: AES Key Wrap KEK + wrapped key ──
     [aeskw]="wrap"
+    # ── 2026-11-21: AES-CCM key + plaintext through seal/open/tampered open ──
+    [aesccm]="aead"
     # 2026-11-03: key text codecs, the handshake, the data plane, the cookie layer, Tunnel.
     [wireguard]="keyb64 keyhex handshake transport cookie tunnel"
     # ── 2026-10-10: ct-wave: AEAD framing channel keys + plaintext ──
@@ -419,6 +421,7 @@ declare -A MODES=(
     [mls]="ReleaseFast"
     [otp]="ReleaseFast"
     [aeskw]="ReleaseFast"
+    [aesccm]="ReleaseFast"
     [wireguard]="ReleaseFast"
     [aeadframe]="ReleaseFast"
     [tenantkex]="ReleaseFast"
@@ -796,6 +799,7 @@ declare -A PATTERN=(
     [otp/code]='root[.]zig|burn[.]zig'
     [otp/uri]='root[.]zig|otpauth[.]zig|burn[.]zig'
     [aeskw/wrap]='root[.]zig|burn[.]zig'
+    [aesccm/aead]='root[.]zig'
     [wireguard/keyb64]='root[.]zig|handshake[.]zig|noise[.]zig|transport[.]zig|tunnel[.]zig|uapi[.]zig|burn[.]zig|field[.]zig|fe64[.]zig'
     [wireguard/keyhex]='root[.]zig|handshake[.]zig|noise[.]zig|transport[.]zig|tunnel[.]zig|uapi[.]zig|burn[.]zig|field[.]zig|fe64[.]zig'
     [wireguard/handshake]='root[.]zig|handshake[.]zig|noise[.]zig|transport[.]zig|tunnel[.]zig|uapi[.]zig|burn[.]zig|field[.]zig|fe64[.]zig'
@@ -1194,6 +1198,7 @@ declare -A LABEL=(
     [otp/code]='otp hotp/totp/fmt/verify SHA-1/256/512 (secret tainted)'
     [otp/uri]='otp otpauth.format + totpCode (secret tainted)'
     [aeskw/wrap]='aeskw wrap/unwrap/tampered AES-128/192/256 (KEK+key tainted)'
+    [aesccm/aead]='aesccm seal/open/tampered AES-128/256 tags 8/16 (key+plaintext tainted)'
     [wireguard/keyb64]='wireguard key <-> base64 (CT; 1 = accept/reject)'
     [wireguard/keyhex]='wireguard key <-> hex for the userspace protocol (CT; 1 = accept/reject)'
     [wireguard/handshake]='wireguard Noise_IKpsk2 both roles (statics, ephemerals, PSK tainted)'
