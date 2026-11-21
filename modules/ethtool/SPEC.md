@@ -219,6 +219,8 @@ getter.
 
 **PLCA and MAC merge.** `plca` / `setPlca` / `plcaStatus` (`PLCA_GET_CFG`, `SET_CFG`, `GET_STATUS`: version `u16`, enabled and status `u8`, node count, node ID, timers and burst counts `u32`) and `mm` / `setMm` (`MM_GET`/`SET`: the preemptable MAC and transmit flags, fragment sizes, verification status (`MmVerifyStatus`) and times, and with `want_stats` the six `u64` counters of `ETHTOOL_A_MM_STATS`). Every field of a reply is optional. A set refuses what the kernel's policy refuses: PLCA node ID above 255, node count 0 or above 255, burst count above 255, MM verify time outside 1..128 ms. The widths follow the UAPI header and the kernel policy as documented; no driver on the build host implements either family, so these are tests of constructed messages.
 
+**Timestamping: TSINFO statistics and provider, TSCONFIG.** `TsInfo` also decodes the `STATS` nest (TX packets, lost, errors, unconfirmed one-step packets), the hardware timestamp provider (PHC index and qualifier), the source and the PHY index; `tsInfoStats` asks for the counters with `ETHTOOL_FLAG_STATS`. `tsConfig` / `setTsConfig` (`TSCONFIG_GET`/`SET`) read and change the hardware timestamping configuration: the provider nest and the TX-type, RX-filter and flag bitsets, set by name or index (not both). The set is built from the UAPI header's layout and is a test of constructed messages: no driver on the build host implements it.
+
 ## What is deliberately not done
 
 - **A second transport beyond the two ioctl calls.** `SIOCETHTOOL` is used only for `drvinfo()` and
@@ -454,7 +456,6 @@ Reachable through `Ethtool.raw`, not modelled; all fit CONVENTIONS §2 (netlink 
 
 | command family | why deferred |
 |---|---|
-| `TSCONFIG`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed |
 | `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have (effort: medium) |
 | `RSS_SET` (and the `RSS_GET` per-flow `FLOW_HASH` nest / dump form), `PSE`, `PHY`, `TUNNEL_INFO`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
 

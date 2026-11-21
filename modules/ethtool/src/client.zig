@@ -771,6 +771,33 @@ pub const Ethtool = struct {
         return tsinfo_mod.parseTsInfo(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
     }
 
+    /// `ETHTOOL_MSG_TSINFO_GET` with `ETHTOOL_FLAG_STATS`: also the timestamping counters (`TsInfo.stats`). The
+    /// provider, source and PHY index are decoded by `tsInfo` too. Unprivileged. Free with `deinit`.
+    pub fn tsInfoStats(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!tsinfo_mod.TsInfo {
+        const seq = cl.sock.nextSeq();
+        const msg = try tsinfo_mod.buildTsInfoWith(cl.allocator(), cl.family_id, seq, target, form, true);
+        var reply = try cl.exchangeGet(msg, seq, uapi.TSINFO.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return tsinfo_mod.parseTsInfo(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_TSCONFIG_GET` — the hardware timestamping configuration (provider, TX types, RX filters, flags).
+    /// Unprivileged. Free with `deinit`.
+    pub fn tsConfig(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!tsinfo_mod.TsConfig {
+        const seq = cl.sock.nextSeq();
+        const msg = try tsinfo_mod.buildTsConfig(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.TSCONFIG.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return tsinfo_mod.parseTsConfig(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_TSCONFIG_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setTsConfig(cl: *Ethtool, target: header.Target, set: tsinfo_mod.TsConfigSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try tsinfo_mod.buildSetTsConfig(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.TSCONFIG.HEADER, target);
+    }
+
     // ── multicast groups ───────────────────────────────────────────────────
 
     /// Resolve the family's `monitor` multicast group to its dynamic id.

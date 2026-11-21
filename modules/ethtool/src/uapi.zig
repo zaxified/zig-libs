@@ -659,6 +659,38 @@ pub const TSINFO = struct {
     pub const RX_FILTERS: u16 = 4;
     /// u32: index of the PTP hardware clock, absent when there is none.
     pub const PHC_INDEX: u16 = 5;
+    /// Nest of timestamping statistics (`TS_STAT`); asked for with `ETHTOOL_FLAG_STATS`.
+    pub const STATS: u16 = 6;
+    /// Nest naming the hardware timestamp provider (`TS_HWTSTAMP_PROVIDER`).
+    pub const HWTSTAMP_PROVIDER: u16 = 7;
+    /// u32: where the timestamps come from (MAC, PHY, ...).
+    pub const HWTSTAMP_SOURCE: u16 = 8;
+    /// u32: index of the PHY that stamps, when the source is a PHY.
+    pub const HWTSTAMP_PHYINDEX: u16 = 9;
+};
+
+/// The attributes inside the `TSINFO.STATS` nest, all `u64`.
+pub const TS_STAT = struct {
+    pub const TX_PKTS: u16 = 1;
+    pub const TX_LOST: u16 = 2;
+    pub const TX_ERR: u16 = 3;
+    pub const TX_ONESTEP_PKTS_UNCONFIRMED: u16 = 4;
+};
+
+/// The attributes inside a hardware-timestamp-provider nest (`TSINFO.HWTSTAMP_PROVIDER`, `TSCONFIG.HWTSTAMP_PROVIDER`).
+pub const TS_HWTSTAMP_PROVIDER = struct {
+    /// u32.
+    pub const INDEX: u16 = 1;
+    /// u32: 0 precise (IEEE 1588), 1 approximate.
+    pub const QUALIFIER: u16 = 2;
+};
+
+pub const TSCONFIG = struct {
+    pub const HEADER: u16 = 1;
+    pub const HWTSTAMP_PROVIDER: u16 = 2; // nest (`TS_HWTSTAMP_PROVIDER`)
+    pub const TX_TYPES: u16 = 3; // bitset
+    pub const RX_FILTERS: u16 = 4; // bitset
+    pub const HWTSTAMP_FLAGS: u16 = 5; // bitset
 };
 
 // ── features ──────────────────────────────────────────────────────────────
