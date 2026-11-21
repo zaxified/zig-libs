@@ -1086,6 +1086,12 @@ hpke	ReleaseFast	open	1	1	022a4ca3029f9812	59883c70dcd08ee6
 # are declassified there, see modules/p521/SPEC.md).
 hpke	ReleaseFast	p521_decap	1	0	5e01e253fa45faa6	f9c48b1e130f8af6
 hpke	ReleaseFast	p521_authdecap	1	0	5e01e253fa45faa6	f00506c9b354a23b
+# hpke x448 (2026-11-21) — DHKEM(X448, HKDF-SHA512) on ed448's x448, skR (and skS) tainted.
+# decap 2 / authdecap 4 in-file = two contexts per X448 DH (one DH in decap, two in authDecap);
+# not yet itemized with --stacks (the all-zero shared-secret verdict of RFC 7748 §6.2 is the
+# expected one). decap also reports 1 unattributed context.
+hpke	ReleaseFast	x448_decap	1	2	5e01e253fa45faa6	c94ae9fab2a935ca
+hpke	ReleaseFast	x448_authdecap	1	4	5e01e253fa45faa6	da63850068c269fd
 # hpke pq KEMs and the one-stage schedule (2026-10-31). Tainted: the serialized seed, std
 # ML-KEM's expanded private state (`sk.sk`, `sk.z`) and, for the hybrids, the curve scalar.
 # In-file contexts are all std's or a sibling module's, none in pq.zig/kdf.zig/schedule.zig:

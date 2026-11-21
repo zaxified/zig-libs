@@ -47,6 +47,8 @@
 //!   perf-specialized sibling exists for P-384 — see `dhkem.zig`'s module
 //!   doc comment).
 //!
+//! * `x448_decap` / `x448_authdecap` — DHKEM(X448, HKDF-SHA512), on the
+//!   `ed448` module's `x448` ladder.
 //! * `p521_decap` / `p521_authdecap` — DHKEM(P-521, HKDF-SHA512),
 //! whose group arithmetic is this repo's `p521` module
 //!   (`ecdhInto`; its own harness pins the multiply at 0 in-file).
@@ -383,6 +385,8 @@ const Target = enum {
     p384_authdecap,
     p521_decap,
     p521_authdecap,
+    x448_decap,
+    x448_authdecap,
     // draft-ietf-hpke-pq: pq KEM decapsulation, one row per family.
     mlkem768_decap,
     mlkem1024_decap,
@@ -474,6 +478,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             "ctgrind-hpke-p521-authdecap-recipient-ikm",
             "ctgrind-hpke-p521-authdecap-sender-ikm",
             "ctgrind-hpke-p521-authdecap-ephemeral-ikm",
+        ),
+        .x448_decap => try kemDecap(
+            dhkem.X448Kem,
+            taint,
+            "ctgrind-hpke-x448-decap-recipient-ikm",
+            "ctgrind-hpke-x448-decap-ephemeral-ikm",
+        ),
+        .x448_authdecap => try kemAuthDecap(
+            dhkem.X448Kem,
+            taint,
+            "ctgrind-hpke-x448-authdecap-recipient-ikm",
+            "ctgrind-hpke-x448-authdecap-sender-ikm",
+            "ctgrind-hpke-x448-authdecap-ephemeral-ikm",
         ),
         .mlkem768_decap => try pqDecap(hpke.MlKem768Kem, taint, "ctgrind-hpke-mlkem768-decap"),
         .mlkem1024_decap => try pqDecap(hpke.MlKem1024Kem, taint, "ctgrind-hpke-mlkem1024-decap"),

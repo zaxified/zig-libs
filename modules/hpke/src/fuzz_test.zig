@@ -82,7 +82,7 @@ pub fn Marker(comptime Label: type) type {
 
 const root = @import("root.zig");
 
-const SealMark = Marker(enum { x25519, p256, p384, genuine_opened, tamper_refused });
+const SealMark = Marker(enum { x25519, p256, p384, x448, genuine_opened, tamper_refused });
 
 test "fuzz driver: HPKE_FUZZ (seal + open)" {
     try fuzz_driver.run(sealOpenHarness, .{ .prefix = "HPKE_FUZZ", .name = "hpke-seal-open", .scale = 16 });
@@ -108,7 +108,7 @@ fn sealOpenHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     src.bytes(&aad_buf);
     const aad = aad_buf[0..src.valueRangeAtMost(u8, 0, aad_buf.len)];
     const info = ikm[64..][0..src.valueRangeAtMost(u8, 0, 16)];
-    switch (src.valueRangeAtMost(u8, 0, 2)) {
+    switch (src.valueRangeAtMost(u8, 0, 3)) {
         0 => {
             SealMark.mark(.x25519);
             try sealOpenOne(root.X25519Kem, aesgcm.Aes128Gcm, 32, &ikm, info, aad, pt, src.value(bool));
@@ -117,9 +117,14 @@ fn sealOpenHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
             SealMark.mark(.p256);
             try sealOpenOne(root.P256Kem, root.ChaCha20Poly1305, 32, &ikm, info, aad, pt, src.value(bool));
         },
-        else => {
+        2 => {
             SealMark.mark(.p384);
             try sealOpenOne(root.P384Kem, aesgcm.Aes256Gcm, 48, &ikm, info, aad, pt, src.value(bool));
+        },
+        else => {
+            // DHKEM(X448, HKDF-SHA512) on `ed448`'s x448.
+            SealMark.mark(.x448);
+            try sealOpenOne(root.X448Kem, root.ChaCha20Poly1305, 64, &ikm, info, aad, pt, src.value(bool));
         },
     }
 }
