@@ -197,7 +197,8 @@ fn optionalBase64(
 /// algorithm produced).
 pub const EncodeParams = struct {
     alg: []const u8,
-    enc: []const u8,
+    /// Null leaves `enc` out: the per-recipient header of a JSON serialization (its `enc` is in the protected header).
+    enc: ?[]const u8,
     kid: ?[]const u8 = null,
     cty: ?[]const u8 = null,
     iv: ?[]const u8 = null,
@@ -258,8 +259,10 @@ fn writeAll(js: *std.json.Stringify, params: EncodeParams) std.Io.Writer.Error!v
     try js.beginObject();
     try js.objectField("alg");
     try js.write(params.alg);
-    try js.objectField("enc");
-    try js.write(params.enc);
+    if (params.enc) |e| {
+        try js.objectField("enc");
+        try js.write(e);
+    }
     if (params.kid) |v| {
         try js.objectField("kid");
         try js.write(v);

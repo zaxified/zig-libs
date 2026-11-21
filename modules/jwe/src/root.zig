@@ -10,8 +10,8 @@
 //!
 //! **Compact serialization** (RFC 7516 §3.1) for encrypting and decrypting; the General/Flattened JSON
 //! serializations (§7.2) are read by `decryptJson` (any number of recipients, `aad`, shared unprotected header)
-//! and written for one recipient by `encryptJson`. Encrypting to several recipients at once (one CEK wrapped
-//! per recipient) is not offered: this module's single-`KeyMaterial` API has no seam for it (see SPEC.md).
+//! and written by `encryptJson` (one recipient, re-framing the compact token) and `encryptJsonRecipients` (one CEK
+//! wrapped for several recipients, with the `aad` member).
 //!
 //! **Content encryption (`enc`, RFC 7518 §5)**:
 //!   - `A128GCM`/`A256GCM` — REAL (`aesgcm.Aes128Gcm`/`Aes256Gcm`); `A192GCM` —
@@ -266,6 +266,8 @@ pub const EncryptError = error{
     /// Compact serialization carries no additional AAD (RFC 7516 §5.1) —
     /// `aad_extra` must be empty.
     CompactSerializationNoAad,
+    /// `encryptJsonRecipients`: no recipient, more than `max_json_recipients`, or `.flattened` with other than one.
+    InvalidRecipients,
 } || alg.Error || enc.Error || header.EncodeError;
 
 /// Largest PBES2 iteration count (`p2c`) this module will perform on a
@@ -326,6 +328,7 @@ noinline fn ecdhesEncryptKey(
     random: std.Random,
     opts: EncryptOptions,
     cek: []u8,
+    shared_cek: bool,
     ek_buf: *[max_encrypted_key_len]u8,
     epk_coords: *ecdhes.Coordinates,
 ) EncryptError![]const u8 {
@@ -361,8 +364,123 @@ noinline fn ecdhesEncryptKey(
     defer std.crypto.secureZero(u8, &kek_buf);
     const kek = kek_buf[0..kek_len];
     ecdhes.concatKdfSha256(z, @tagName(key_alg), apu, apv, kek);
-    random.bytes(cek);
+    if (!shared_cek) random.bytes(cek);
     return try alg.aeskw.wrap(kek, cek, ek_buf);
+}
+
+/// What wrapping the CEK for one recipient produced: the Encrypted Key and the header members that belong to it.
+/// Slices point into the struct itself: it must not move after `wrapKey` filled it.
+const Wrapped = struct {
+    ek_buf: [max_encrypted_key_len]u8 = undefined,
+    encrypted_key: []const u8 = &.{},
+    wrap_iv: ?[12]u8 = null,
+    wrap_tag: ?[16]u8 = null,
+    pbes2_salt_buf: [alg.max_pbes2_salt_value_len]u8 = undefined,
+    pbes2_salt: ?[]const u8 = null,
+    pbes2_iterations: ?u32 = null,
+    epk_coords: ecdhes.Coordinates = undefined, // written before any read (ECDH-ES arm only)
+    epk_curve: ?ecdhes.Curve = null,
+
+    fn epkParams(self: *const Wrapped) ?header.EpkParams {
+        const curve = self.epk_curve orelse return null;
+        return .{ .kty = curve.jwkKty(), .crv = curve.jwkCrv(), .x = self.epk_coords.xSlice(), .y = self.epk_coords.ySlice() };
+    }
+};
+
+/// Produce the Encrypted Key of `key_alg` for `cek` (`cek.len` is the `content_enc` key size). With `shared_cek` the
+/// CEK is already filled in (one CEK wrapped for several recipients) and `dir` / `ECDH-ES`, whose CEK is derived,
+/// are `UnsupportedAlg`; otherwise the arm draws the CEK (or derives it) into `cek`.
+fn wrapKey(
+    w: *Wrapped,
+    key_alg: Alg,
+    content_enc: Enc,
+    key: KeyMaterial,
+    entropy: Entropy,
+    random: std.Random,
+    opts: EncryptOptions,
+    cek: []u8,
+    shared_cek: bool,
+) EncryptError!void {
+    w.encrypted_key = switch (key_alg) {
+        .dir => blk: {
+            const shared = switch (key) {
+                .symmetric => |s| s,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (shared_cek) return error.UnsupportedAlg; // direct encryption has exactly one recipient
+            _ = try alg.dirCek(shared, cek.len, cek);
+            break :blk &.{};
+        },
+        .@"RSA-OAEP", .@"RSA-OAEP-256" => blk: {
+            const pk = switch (key) {
+                .rsa_public => |p| p,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (!shared_cek) random.bytes(cek);
+            const hash: alg.OaepHash = if (key_alg == .@"RSA-OAEP") .sha1 else .sha256;
+            break :blk try alg.rsaOaepWrap(pk, hash, entropy, cek, &w.ek_buf);
+        },
+        .A128KW, .A192KW, .A256KW => blk: {
+            const kek = switch (key) {
+                .symmetric => |s| s,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (!shared_cek) random.bytes(cek);
+            break :blk try alg.aeskw.wrap(kek, cek, &w.ek_buf);
+        },
+        .A128GCMKW, .A192GCMKW, .A256GCMKW => blk: {
+            const kek = switch (key) {
+                .symmetric => |s| s,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (!shared_cek) random.bytes(cek);
+            var iv: [12]u8 = undefined;
+            random.bytes(&iv);
+            var tag: [16]u8 = undefined;
+            const ct = try alg.gcmkwWrap(kek, iv, cek, &w.ek_buf, &tag);
+            w.wrap_iv = iv;
+            w.wrap_tag = tag;
+            break :blk ct;
+        },
+        .@"PBES2-HS256+A128KW", .@"PBES2-HS384+A192KW", .@"PBES2-HS512+A256KW" => blk: {
+            const password = switch (key) {
+                .password => |p| p,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (!shared_cek) random.bytes(cek);
+            const salt_len = @min(opts.pbes2_salt_len, w.pbes2_salt_buf.len);
+            const salt = w.pbes2_salt_buf[0..salt_len];
+            random.bytes(salt);
+            const variant: alg.Pbes2Variant = switch (key_alg) {
+                .@"PBES2-HS256+A128KW" => .hs256_a128kw,
+                .@"PBES2-HS384+A192KW" => .hs384_a192kw,
+                .@"PBES2-HS512+A256KW" => .hs512_a256kw,
+                else => unreachable,
+            };
+            var kek_buf: [32]u8 = undefined;
+            const kek = try alg.pbes2DeriveKek(variant, password, salt, opts.pbes2_iterations, &kek_buf);
+            w.pbes2_salt = salt;
+            w.pbes2_iterations = opts.pbes2_iterations;
+            break :blk try alg.aeskw.wrap(kek, cek, &w.ek_buf);
+        },
+        .@"ECDH-ES", .@"ECDH-ES+A128KW", .@"ECDH-ES+A192KW", .@"ECDH-ES+A256KW" => blk: {
+            const pk = switch (key) {
+                .ec_public => |p| p,
+                else => return error.KeyMaterialMismatch,
+            };
+            if (shared_cek and key_alg == .@"ECDH-ES") return error.UnsupportedAlg; // direct agreement has exactly one recipient
+            const curve = std.meta.activeTag(pk);
+            // The secret-touching part (ephemeral key, Z, KEK) runs one frame
+            // down and is burned after it returns; only public results
+            // (`epk_coords`, the wrapped key) and the CEK come back.
+            const r = ecdhesEncryptKey(key_alg, content_enc, pk, entropy, random, opts, cek, shared_cek, &w.ek_buf, &w.epk_coords);
+            burn.stack(burn.ecdh_burn + burn.content_burn / 2);
+            const ek = try r;
+            w.epk_curve = curve;
+            break :blk ek;
+        },
+        .unknown => unreachable,
+    };
 }
 
 /// Encrypt `plaintext` into a compact-serialization JWE. `entropy` supplies
@@ -406,99 +524,9 @@ pub fn encryptCompact(
     // The CEK (random, or the ECDH-ES / `dir` derived key) never left in the frame.
     defer std.crypto.secureZero(u8, &cek_buf);
     const cek = cek_buf[0..cek_len];
-    var ek_buf: [max_encrypted_key_len]u8 = undefined;
-
-    var wrap_iv: ?[12]u8 = null;
-    var wrap_tag: ?[16]u8 = null;
-    var pbes2_salt_buf: [alg.max_pbes2_salt_value_len]u8 = undefined;
-    var pbes2_salt: ?[]const u8 = null;
-    var pbes2_iterations: ?u32 = null;
-    var epk_coords: ecdhes.Coordinates = undefined; // written before any read (ECDH-ES arm only)
-    var epk_params: ?header.EpkParams = null;
-
-    const encrypted_key: []const u8 = switch (key_alg) {
-        .dir => blk: {
-            const shared = switch (key) {
-                .symmetric => |s| s,
-                else => return error.KeyMaterialMismatch,
-            };
-            _ = try alg.dirCek(shared, cek_len, cek);
-            break :blk &.{};
-        },
-        .@"RSA-OAEP", .@"RSA-OAEP-256" => blk: {
-            const pk = switch (key) {
-                .rsa_public => |p| p,
-                else => return error.KeyMaterialMismatch,
-            };
-            random.bytes(cek);
-            const hash: alg.OaepHash = if (key_alg == .@"RSA-OAEP") .sha1 else .sha256;
-            break :blk try alg.rsaOaepWrap(pk, hash, entropy, cek, &ek_buf);
-        },
-        .A128KW, .A192KW, .A256KW => blk: {
-            const kek = switch (key) {
-                .symmetric => |s| s,
-                else => return error.KeyMaterialMismatch,
-            };
-            random.bytes(cek);
-            break :blk try alg.aeskw.wrap(kek, cek, &ek_buf);
-        },
-        .A128GCMKW, .A192GCMKW, .A256GCMKW => blk: {
-            const kek = switch (key) {
-                .symmetric => |s| s,
-                else => return error.KeyMaterialMismatch,
-            };
-            random.bytes(cek);
-            var iv: [12]u8 = undefined;
-            random.bytes(&iv);
-            var tag: [16]u8 = undefined;
-            const ct = try alg.gcmkwWrap(kek, iv, cek, &ek_buf, &tag);
-            wrap_iv = iv;
-            wrap_tag = tag;
-            break :blk ct;
-        },
-        .@"PBES2-HS256+A128KW", .@"PBES2-HS384+A192KW", .@"PBES2-HS512+A256KW" => blk: {
-            const password = switch (key) {
-                .password => |p| p,
-                else => return error.KeyMaterialMismatch,
-            };
-            random.bytes(cek);
-            const salt_len = @min(opts.pbes2_salt_len, pbes2_salt_buf.len);
-            const salt = pbes2_salt_buf[0..salt_len];
-            random.bytes(salt);
-            const variant: alg.Pbes2Variant = switch (key_alg) {
-                .@"PBES2-HS256+A128KW" => .hs256_a128kw,
-                .@"PBES2-HS384+A192KW" => .hs384_a192kw,
-                .@"PBES2-HS512+A256KW" => .hs512_a256kw,
-                else => unreachable,
-            };
-            var kek_buf: [32]u8 = undefined;
-            const kek = try alg.pbes2DeriveKek(variant, password, salt, opts.pbes2_iterations, &kek_buf);
-            pbes2_salt = salt;
-            pbes2_iterations = opts.pbes2_iterations;
-            break :blk try alg.aeskw.wrap(kek, cek, &ek_buf);
-        },
-        .@"ECDH-ES", .@"ECDH-ES+A128KW", .@"ECDH-ES+A192KW", .@"ECDH-ES+A256KW" => blk: {
-            const pk = switch (key) {
-                .ec_public => |p| p,
-                else => return error.KeyMaterialMismatch,
-            };
-            const curve = std.meta.activeTag(pk);
-            // The secret-touching part (ephemeral key, Z, KEK) runs one frame
-            // down and is burned after it returns; only public results
-            // (`epk_coords`, the wrapped key) and the CEK come back.
-            const r = ecdhesEncryptKey(key_alg, content_enc, pk, entropy, random, opts, cek, &ek_buf, &epk_coords);
-            burn.stack(burn.ecdh_burn + burn.content_burn / 2);
-            const ek = try r;
-            epk_params = .{
-                .kty = curve.jwkKty(),
-                .crv = curve.jwkCrv(),
-                .x = epk_coords.xSlice(),
-                .y = epk_coords.ySlice(),
-            };
-            break :blk ek;
-        },
-        .unknown => unreachable,
-    };
+    var w: Wrapped = .{};
+    try wrapKey(&w, key_alg, content_enc, key, entropy, random, opts, cek, false);
+    const encrypted_key = w.encrypted_key;
 
     var header_buf: [header.max_header_json_len]u8 = undefined;
     const header_json = header.encode(&header_buf, .{
@@ -506,13 +534,13 @@ pub fn encryptCompact(
         .enc = @tagName(content_enc),
         .kid = opts.kid,
         .cty = opts.cty,
-        .iv = if (wrap_iv) |*v| v[0..] else null,
-        .tag = if (wrap_tag) |*v| v[0..] else null,
-        .p2s = pbes2_salt,
-        .p2c = pbes2_iterations,
-        .epk = epk_params,
-        .apu = if (epk_params != null) opts.apu else null,
-        .apv = if (epk_params != null) opts.apv else null,
+        .iv = if (w.wrap_iv) |*v| v[0..] else null,
+        .tag = if (w.wrap_tag) |*v| v[0..] else null,
+        .p2s = w.pbes2_salt,
+        .p2c = w.pbes2_iterations,
+        .epk = w.epkParams(),
+        .apu = if (w.epk_curve != null) opts.apu else null,
+        .apv = if (w.epk_curve != null) opts.apv else null,
     }) catch return error.HeaderTooLarge;
 
     var content_iv: [16]u8 = undefined;
@@ -719,8 +747,8 @@ pub const JsonForm = enum { flattened, general };
 
 /// Re-serialize a compact JWE as the JSON serialization of one recipient (flattened, or general with a
 /// single-element `recipients` array). The protected header, encrypted key, IV, ciphertext and tag are the
-/// compact token's own segments, so the result decrypts with the same key through `decryptJson`. Multiple
-/// recipients and a JSON `aad` need the CEK shared across recipients and are not produced (see SPEC).
+/// compact token's own segments, so the result decrypts with the same key through `decryptJson`.
+/// For several recipients and the JSON `aad` member see `encryptJsonRecipients`.
 pub fn encryptJson(
     gpa: std.mem.Allocator,
     form: JsonForm,
@@ -743,6 +771,131 @@ pub fn encryptJson(
         .flattened => try std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"encrypted_key\":\"{s}\",\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{ protected, ek, iv, ct, tag }),
         .general => try std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"recipients\":[{{\"encrypted_key\":\"{s}\"}}],\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{ protected, ek, iv, ct, tag }),
     };
+}
+
+/// One recipient of `encryptJsonRecipients`: the key-management algorithm, the recipient's key and its own
+/// `kid` / ECDH-ES `apu`/`apv` / PBES2 parameters (`EncryptOptions.cty` is the document's, in `JsonEncryptOptions`).
+pub const JsonRecipient = struct {
+    key_alg: Alg,
+    key: KeyMaterial,
+    opts: EncryptOptions = .{},
+};
+
+pub const JsonEncryptOptions = struct {
+    /// Additional authenticated data (RFC 7516 §5.1, §7.2.1): written as the `aad` member and appended to the AEAD's
+    /// AAD as `"." || BASE64URL(aad)`. `null` writes no member; an empty slice writes an empty one.
+    aad: ?[]const u8 = null,
+    /// `cty` of the protected header.
+    cty: ?[]const u8 = null,
+};
+
+/// Encrypt `plaintext` to one or several recipients as a JWE JSON serialization (RFC 7516 §7.2). The protected header
+/// carries `enc` (and `cty`); every recipient has its own unprotected `header` (`alg`, `kid`, `epk`, `iv` / `tag`,
+/// `p2s` / `p2c`, `apu` / `apv`) and `encrypted_key`. With more than one recipient one fresh CEK is drawn and wrapped
+/// for each (RSA-OAEP*, AxxxKW, AxxxGCMKW, PBES2-*, ECDH-ES+AxxxKW); `dir` and direct `ECDH-ES`, whose CEK is derived
+/// from one key, are `UnsupportedAlg` there and only allowed as the sole recipient. `form = .flattened` needs exactly
+/// one recipient. The result decrypts through `decryptJson` for every recipient's key. Returns a `gpa`-owned string.
+// secret-api-ok: KeyMaterial holds only BORROWED slices / pointers; a by-value copy copies a pointer, never key bytes
+pub fn encryptJsonRecipients(
+    gpa: std.mem.Allocator,
+    form: JsonForm,
+    content_enc: Enc,
+    recipients: []const JsonRecipient,
+    plaintext: []const u8,
+    entropy: Entropy,
+    jopts: JsonEncryptOptions,
+) EncryptError![]u8 {
+    const random: std.Random = switch (entropy) {
+        .csprng => |r| r,
+        .fixed_for_test => |r| r,
+    };
+    if (content_enc == .unknown) return error.UnsupportedEnc;
+    const cek_len = content_enc.cekLen() orelse return error.UnsupportedEnc;
+    if (recipients.len == 0 or recipients.len > max_json_recipients) return error.InvalidRecipients;
+    if (form == .flattened and recipients.len != 1) return error.InvalidRecipients;
+
+    var cek_buf: [max_cek_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &cek_buf);
+    const cek = cek_buf[0..cek_len];
+    const shared = recipients.len > 1;
+    if (shared) random.bytes(cek);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const b64 = std.base64.url_safe_no_pad;
+
+    const Out = struct { header: []const u8, ek_b64: []const u8 };
+    const outs = try arena.alloc(Out, recipients.len);
+    for (recipients, outs) |r, *out| {
+        if (r.key_alg == .unknown) return error.UnsupportedAlg;
+        var w: Wrapped = .{};
+        try wrapKey(&w, r.key_alg, content_enc, r.key, entropy, random, r.opts, cek, shared);
+        var header_buf: [header.max_header_json_len]u8 = undefined;
+        const header_json = header.encode(&header_buf, .{
+            .alg = @tagName(r.key_alg),
+            .enc = null,
+            .kid = r.opts.kid,
+            .iv = if (w.wrap_iv) |*v| v[0..] else null,
+            .tag = if (w.wrap_tag) |*v| v[0..] else null,
+            .p2s = w.pbes2_salt,
+            .p2c = w.pbes2_iterations,
+            .epk = w.epkParams(),
+            .apu = if (w.epk_curve != null) r.opts.apu else null,
+            .apv = if (w.epk_curve != null) r.opts.apv else null,
+        }) catch return error.HeaderTooLarge;
+        const ek_b64 = try arena.alloc(u8, b64.Encoder.calcSize(w.encrypted_key.len));
+        _ = b64.Encoder.encode(ek_b64, w.encrypted_key);
+        out.* = .{ .header = try arena.dupe(u8, header_json), .ek_b64 = ek_b64 };
+    }
+
+    const protected_json = try std.json.Stringify.valueAlloc(arena, .{ .enc = @tagName(content_enc), .cty = jopts.cty }, .{ .emit_null_optional_fields = false });
+    const protected_b64 = try arena.alloc(u8, b64.Encoder.calcSize(protected_json.len));
+    _ = b64.Encoder.encode(protected_b64, protected_json);
+    var aad_b64: ?[]u8 = null;
+    if (jopts.aad) |a| {
+        aad_b64 = try arena.alloc(u8, b64.Encoder.calcSize(a.len));
+        _ = b64.Encoder.encode(aad_b64.?, a);
+    }
+    const aead_aad = if (aad_b64) |ab| try std.fmt.allocPrint(arena, "{s}.{s}", .{ protected_b64, ab }) else protected_b64;
+
+    var content_iv: [16]u8 = undefined;
+    const iv_len = content_enc.ivLen().?;
+    random.bytes(content_iv[0..iv_len]);
+    const tag_len = content_enc.tagLen().?;
+    const ct_scratch = try arena.alloc(u8, plaintext.len + 16);
+    var tag_buf: [enc.max_tag_len]u8 = undefined;
+    const ct_len = try enc.encrypt(content_enc, cek, content_iv[0..iv_len], aead_aad, plaintext, ct_scratch, tag_buf[0..tag_len]);
+
+    const iv_b64 = try arena.alloc(u8, b64.Encoder.calcSize(iv_len));
+    _ = b64.Encoder.encode(iv_b64, content_iv[0..iv_len]);
+    const ct_b64 = try arena.alloc(u8, b64.Encoder.calcSize(ct_len));
+    _ = b64.Encoder.encode(ct_b64, ct_scratch[0..ct_len]);
+    const tag_b64 = try arena.alloc(u8, b64.Encoder.calcSize(tag_len));
+    _ = b64.Encoder.encode(tag_b64, tag_buf[0..tag_len]);
+
+    var doc: std.Io.Writer.Allocating = .init(gpa);
+    errdefer doc.deinit();
+    const wr = &doc.writer;
+    (blk: {
+        wr.print("{{\"protected\":\"{s}\"", .{protected_b64}) catch |e| break :blk e;
+        if (aad_b64) |ab| wr.print(",\"aad\":\"{s}\"", .{ab}) catch |e| break :blk e;
+        if (form == .general) {
+            wr.writeAll(",\"recipients\":[") catch |e| break :blk e;
+            for (outs, 0..) |o, i| {
+                if (i != 0) wr.writeByte(',') catch |e| break :blk e;
+                wr.print("{{\"header\":{s}", .{o.header}) catch |e| break :blk e;
+                if (o.ek_b64.len != 0) wr.print(",\"encrypted_key\":\"{s}\"", .{o.ek_b64}) catch |e| break :blk e;
+                wr.writeByte('}') catch |e| break :blk e;
+            }
+            wr.writeByte(']') catch |e| break :blk e;
+        } else {
+            wr.print(",\"header\":{s}", .{outs[0].header}) catch |e| break :blk e;
+            if (outs[0].ek_b64.len != 0) wr.print(",\"encrypted_key\":\"{s}\"", .{outs[0].ek_b64}) catch |e| break :blk e;
+        }
+        wr.print(",\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{ iv_b64, ct_b64, tag_b64 }) catch |e| break :blk e;
+    }) catch return error.OutOfMemory;
+    return doc.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 fn jsonString(obj: std.json.ObjectMap, name: []const u8) DecryptError!?[]const u8 {
@@ -2434,4 +2587,77 @@ test "a GCMKW key of an impossible length is UnsupportedKeyLength, a configurati
     const z = @as([16]u8, @splat(0));
     const token = try buildCompact(a, hdr, &z, &z, &z, &z);
     try std.testing.expectError(error.UnsupportedKeyLength, decryptCompact(std.testing.allocator, .{ .symmetric = &kek20 }, token, .{}));
+}
+
+// ── JSON serialization: several recipients and aad on encrypt (RFC 7516 §7.2.1, Appendix A.4 shape) ───────────
+
+test "encryptJsonRecipients: every recipient of a general JWE decrypts it, aad is bound, A.4 shape" {
+    const gpa = std.testing.allocator;
+    const kek_a: [16]u8 = @splat(0x11);
+    const kek_b: [32]u8 = @splat(0x22);
+    var rsa_kp: rsa.KeyPair = undefined;
+    try rsa.generate(&rsa_kp, seededForTest().fixed_for_test, 1024, 65537);
+    var ec: ecdhes.EphemeralKeyPair = undefined;
+    ecdhes.generateEphemeral(&ec, .p256, seededForTest());
+    const recipients = [_]JsonRecipient{
+        .{ .key_alg = .A128KW, .key = .{ .symmetric = &kek_a }, .opts = .{ .kid = "a" } },
+        .{ .key_alg = .A256KW, .key = .{ .symmetric = &kek_b }, .opts = .{ .kid = "b" } },
+        .{ .key_alg = .@"RSA-OAEP", .key = .{ .rsa_public = rsa_kp.public_key }, .opts = .{ .kid = "c" } },
+        .{ .key_alg = .@"ECDH-ES+A128KW", .key = .{ .ec_public = ec.public }, .opts = .{ .apu = "u", .apv = "v" } },
+        .{ .key_alg = .A128GCMKW, .key = .{ .symmetric = &kek_a } },
+    };
+    const keys = [_]KeyMaterial{
+        .{ .symmetric = &kek_a }, .{ .symmetric = &kek_b }, .{ .rsa_private = &rsa_kp.secret_key }, .{ .ec_private = &ec.private }, .{ .symmetric = &kek_a },
+    };
+    for ([_]Enc{ .A128GCM, .A256GCM, .@"A128CBC-HS256" }) |content| {
+        const doc = try encryptJsonRecipients(gpa, .general, content, &recipients, "to five recipients", seededForTest(), .{ .aad = "extra data", .cty = "text/plain" });
+        defer gpa.free(doc);
+        // The RFC 7516 A.4 shape: enc in the protected header, alg / kid per recipient.
+        try std.testing.expect(std.mem.find(u8, doc, "\"recipients\":[{\"header\":{\"alg\":\"A128KW\",\"kid\":\"a\"}") != null);
+        try std.testing.expect(std.mem.find(u8, doc, "\"aad\":\"ZXh0cmEgZGF0YQ\"") != null);
+        for (keys) |k| {
+            const plain = try decryptJson(gpa, k, doc, .{});
+            defer gpa.free(plain);
+            try std.testing.expectEqualStrings("to five recipients", plain);
+        }
+        // A changed aad member breaks the AEAD for everyone.
+        const tampered = try gpa.dupe(u8, doc);
+        defer gpa.free(tampered);
+        const at = std.mem.find(u8, tampered, "\"aad\":\"ZXh0") orelse return error.TestUnexpectedResult;
+        tampered[at + 8] = 'Z' ^ 0x20; // 'Z' -> 'z'
+        try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, keys[0], tampered, .{}));
+    }
+}
+
+test "encryptJsonRecipients: flattened with aad, the sole direct recipient, refusals" {
+    const gpa = std.testing.allocator;
+    const key: [32]u8 = @splat(0x33);
+    const one = [_]JsonRecipient{.{ .key_alg = .A256KW, .key = .{ .symmetric = &key } }};
+    const flat = try encryptJsonRecipients(gpa, .flattened, .A256GCM, &one, "flat", seededForTest(), .{ .aad = "" });
+    defer gpa.free(flat);
+    try std.testing.expect(std.mem.find(u8, flat, "\"recipients\"") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "\"aad\":\"\"") != null);
+    const plain = try decryptJson(gpa, .{ .symmetric = &key }, flat, .{});
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("flat", plain);
+
+    // dir alone is fine: no encrypted_key member.
+    const dir = [_]JsonRecipient{.{ .key_alg = .dir, .key = .{ .symmetric = &key } }};
+    const d = try encryptJsonRecipients(gpa, .general, .A256GCM, &dir, "dir", seededForTest(), .{});
+    defer gpa.free(d);
+    try std.testing.expect(std.mem.find(u8, d, "encrypted_key") == null);
+    const dp = try decryptJson(gpa, .{ .symmetric = &key }, d, .{});
+    defer gpa.free(dp);
+    try std.testing.expectEqualStrings("dir", dp);
+
+    // dir next to another recipient, none, flattened with two, an unknown alg.
+    const two = [_]JsonRecipient{ one[0], dir[0] };
+    try std.testing.expectError(error.UnsupportedAlg, encryptJsonRecipients(gpa, .general, .A256GCM, &two, "x", seededForTest(), .{}));
+    try std.testing.expectError(error.InvalidRecipients, encryptJsonRecipients(gpa, .general, .A256GCM, &.{}, "x", seededForTest(), .{}));
+    const two_kw = [_]JsonRecipient{ one[0], one[0] };
+    try std.testing.expectError(error.InvalidRecipients, encryptJsonRecipients(gpa, .flattened, .A256GCM, &two_kw, "x", seededForTest(), .{}));
+    try std.testing.expectError(error.UnsupportedEnc, encryptJsonRecipients(gpa, .general, .unknown, &one, "x", seededForTest(), .{}));
+    // A wrong key for the one recipient it was not made for fails closed.
+    const other: [32]u8 = @splat(0x34);
+    try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &other }, flat, .{}));
 }

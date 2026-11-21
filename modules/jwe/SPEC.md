@@ -31,8 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only Zig JWE known; RFC 7516 Appendix A worked examples as tests;
 verify-before-decrypt CBC-HMAC with a single error for tag or padding failure; refuses `zip`
 outright (a deliberate anti-zip-bomb stance that go-jose, which implements DEF, does not take)
-and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** encrypting to
-several recipients at once (see *Design*), RSA1_5 (refused, see *What is deliberately not done*). ECDH-ES on P-256, P-384, P-521 and X25519 is implemented.
+and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** RSA1_5 (refused, see *What is deliberately not done*). ECDH-ES on P-256, P-384, P-521 and X25519 is implemented.
 
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./NOTICE (module-local — see its own note on
@@ -55,12 +54,12 @@ placement).
   the Flattened and General forms: the three header objects (protected, shared unprotected, per-recipient) are merged
   with unique names, the AEAD's AAD is `BASE64URL(protected)` plus `.` `aad` when present, and recipients are tried in
   order (a recipient the key cannot serve is skipped; the first that decrypts wins; else the last error). `encryptJson`
-  re-frames one compact encryption as a Flattened or single-recipient General document. Producing **multiple recipients** (one `encrypted_key` per recipient, one
-  shared `ciphertext`/`tag`) sharing one CEK — this module's
-  `KeyMaterial`/`encryptCompact` shape is single-recipient by construction
-  (one `alg` + one key in, one `encrypted_key` out). Adding JSON
-  serialization later means adding a multi-recipient encrypt entry point,
-  not just a different framing — a real API change, not a formatting detail.
+  re-frames one compact encryption as a Flattened or single-recipient General document; `encryptJsonRecipients` writes
+  several recipients (one `encrypted_key` and per-recipient `header` each, one shared `iv` / `ciphertext` / `tag`) and the
+  `aad` member: one CEK is drawn and wrapped per recipient by the same per-algorithm arms as `encryptCompact` (`wrapKey`),
+  `dir` and direct `ECDH-ES` (their CEK is derived from one key) only as the sole recipient (RFC 7516 §5.1: direct modes
+  have exactly one recipient); `enc` (and `cty`) sit in the protected header, `alg` / `kid` / `epk` / ... per recipient,
+  the RFC 7516 Appendix A.4 shape. At most `max_json_recipients` (32), the number `decryptJson` reads.
 - **`gpa`-owned results, not caller-supplied fixed buffers.** Unlike `rsa`
   (bounded by a fixed max modulus) or `jwt` (bounded token/claim sizes via an
   arena), JWE plaintext is arbitrary application data with no natural upper
@@ -168,7 +167,7 @@ placement).
   wrong-KEK/corrupted-input unwrap into a timing oracle. On failure the
   output buffer is zeroed (`std.crypto.secureZero`) so no partially-unwrapped
   key material leaks to the caller.
-- **Out of scope for v1:** encrypting to several recipients in one document (see Design above), a JSON `aad` on encrypt, and any `enc`/`alg` this file doesn't
+- **Out of scope for v1:** any `enc`/`alg` this file doesn't
   list. `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (RFC 7518 §4.6,
   elliptic-curve key agreement on P-256, P-384, P-521 or X25519 + the Concat KDF; P-384 and P-521 are checked against std's P-384 and the `p384`/`p521` modules' own ECDH, no foreign KAT) ARE in
   scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
@@ -252,6 +251,10 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 - **Constant time:** the ctgrind harness (`src/ctgrind_harness.zig`) and its pinned table, see
   *Constant-time (ctgrind)*.
 - **Mutation.** A whole-module strict schemata run over `header.zig`, `root.zig`, `alg.zig`, `enc.zig` and `ecdhes.zig`: 178 mutants on the header parse (member type, base64url length and alphabet, `p2c` range, member caps at `max_member_len`, `zip`/`crit`) and encode caps, the `p2c` bound and `p2s` minimum, the RFC 7516 section 11.5 collapse (each error class kept apart) and the decoy CEK, the `alg`/`enc` dispatch (RSA-OAEP hash, PBES2 variant and PRF, KEK sizes, AlgorithmID, entropy draws), the empty-Encrypted-Key rules, every length check of the GCM and CBC-HMAC primitives and their tag compares, the ECDH-ES curve and coordinate checks and the Concat KDF. 172 are killed and 6 equivalent. 64 survived the first pass and are now killed by tests: the CEK, wrap IV and PBES2 salt coming from the entropy in order, RSA-OAEP and RSA-OAEP-256 and all three PBES2 variants end to end, the decoy being keyed (a token sealed under the key-less hash of its Encrypted Key does not open), a missing `p2s` or `p2c` refused, the ECDH-ES typed errors, PBES2-HS384/HS512 key derivation against an independent PBKDF2 oracle, exact length edges of every primitive, and a P-256 `epk` without `y` where `(x, x)` is a curve point. Equivalent: `encryptCompact`'s unknown-`enc` check (the next line returns the same error), the CBC-HMAC empty-ciphertext check (unpadding refuses it with the same error), `OutOfMemory` kept out of the collapse (`unwrapCek` never allocates), and three decoy details only a holder of the key can observe (domain string, binding to the Encrypted Key, the tail beyond the digest of a 64-octet CEK). Not mutated: the point arithmetic (owned by `p256`) and the dead-stack burns.
+- **JSON, several recipients** (`root.zig` tests): a five-recipient General document (A128KW, A256KW, RSA-OAEP, ECDH-ES+A128KW with
+  `apu` / `apv`, A128GCMKW) with `aad` under A128GCM, A256GCM and A128CBC-HS256 decrypts for every recipient's key, a
+  changed `aad` is `AuthenticationFailed`, the Flattened form with an empty `aad`, `dir` alone, and the refusals (`dir` next
+  to another recipient, none, Flattened with two, unknown `enc`). Not compared with go-jose / panva/jose output (not on this machine).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
 
@@ -275,9 +278,5 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 
 ## Backlog / deferred
 
-- **Encrypting to multiple recipients in one JSON document, and the JSON `aad` member on encrypt** — go-jose and
-  panva/jose do both; needs an encrypt entry point that draws one CEK and wraps it per recipient (the per-algorithm
-  arms of `encryptCompact` draw their own CEK today). `decryptJson` already reads such documents. Effort: medium.
-  NOT REACHED (budget).
 - **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
   bench of its own. BOUNCED: needs a quiet host for numbers (quiet phase).
