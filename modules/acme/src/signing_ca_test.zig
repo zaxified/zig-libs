@@ -75,6 +75,23 @@ const Der = struct {
         return d.tlv(0x17, &.{s});
     }
 
+    fn generalizedTime(d: Der, unix: i64) ![]u8 {
+        const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(unix) };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
+        var buf: [15]u8 = undefined;
+        const s = try std.mem.print(&buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{
+            @as(u32, yd.year),
+            md.month.numeric(),
+            md.day_index + 1,
+            ds.getHoursIntoDay(),
+            ds.getMinutesIntoHour(),
+            ds.getSecondsIntoMinute(),
+        });
+        return d.tlv(0x18, &.{s});
+    }
+
     fn extension(d: Der, ext_oid: []const u8, critical: bool, value: []const u8) ![]u8 {
         const octets = try d.tlv(0x04, &.{value});
         if (critical) return d.seq(&.{ try d.oid(ext_oid), try d.tlv(0x01, &.{&.{0xff}}), octets });
@@ -126,6 +143,10 @@ pub const SigningCa = struct {
     /// SHA-1 of the CA public key point: the leaves' authorityKeyIdentifier (ARI's CertID needs one).
     key_id: [20]u8,
     next_serial: u32 = 0x1000,
+    /// Set: the leaves carry an Authority Information Access extension with this OCSP responder URL.
+    ocsp_url: ?[]const u8 = null,
+    /// The serial of the leaf `issue` signed last.
+    last_serial: u32 = 0,
 
     pub fn init(gpa: Allocator, seed_byte: u8, not_before: i64, not_after: i64) !SigningCa {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -182,6 +203,13 @@ pub const SigningCa = struct {
         const aki = try d.extension(&.{ 0x55, 0x1d, 0x23 }, false, try d.seq(&.{try d.tlv(0x80, &.{&ca.key_id})}));
         const serial = ca.next_serial;
         ca.next_serial += 1;
+        ca.last_serial = serial;
+        var exts: std.ArrayList([]const u8) = .empty;
+        try exts.appendSlice(d.a, &.{ bc, ku, eku, san, aki });
+        if (ca.ocsp_url) |url| {
+            const ad = try d.seq(&.{ try d.oid(&.{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01 }), try d.tlv(0x86, &.{url}) });
+            try exts.append(d.a, try d.extension(&.{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 }, false, try d.seq(&.{ad})));
+        }
         const tbs = try d.seq(&.{
             try d.tlv(0xa0, &.{try d.int(2)}),
             try d.int(serial),
@@ -190,7 +218,7 @@ pub const SigningCa = struct {
             try d.seq(&.{ try d.utcTime(not_before), try d.utcTime(not_after) }),
             try d.name(parsed.sans[0]),
             try csrSpkiCopy(d, csr_der),
-            try d.tlv(0xa3, &.{try d.seq(&.{ bc, ku, eku, san, aki })}),
+            try d.tlv(0xa3, &.{try d.seq(exts.items)}),
         });
         const leaf = try d.signed(ca.kp, tbs);
         const leaf_pem = try x509.pemEncode(gpa, "CERTIFICATE", leaf);
@@ -198,6 +226,45 @@ pub const SigningCa = struct {
         return std.mem.concat(gpa, u8, &.{ leaf_pem, ca.ca_pem });
     }
 };
+
+pub const OcspStatus = union(enum) { good, revoked: i64 };
+
+/// A DER `OCSPResponse` (successful) for the certificate with `serial` this CA signed, signed by the CA itself
+/// (responder id by key hash), with the given validity window; `next_update` null leaves the field out.
+pub fn ocspResponse(ca: *const SigningCa, gpa: Allocator, serial: u32, status: OcspStatus, this_update: i64, next_update: ?i64) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const d: Der = .{ .a = arena_state.allocator() };
+    var name_hash: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(try d.name("acme mock CA"), &name_hash, .{});
+    const cert_id = try d.seq(&.{
+        try d.seq(&.{ try d.oid(&.{ 0x2b, 0x0e, 0x03, 0x02, 0x1a }), &.{ 0x05, 0x00 } }),
+        try d.tlv(0x04, &.{&name_hash}),
+        try d.tlv(0x04, &.{&ca.key_id}),
+        try d.int(serial),
+    });
+    const cert_status: []const u8 = switch (status) {
+        .good => &.{ 0x80, 0x00 },
+        .revoked => |at| try d.tlv(0xa1, &.{try d.generalizedTime(at)}),
+    };
+    const single = try d.seq(&.{
+        cert_id,
+        cert_status,
+        try d.generalizedTime(this_update),
+        if (next_update) |nu| try d.tlv(0xa0, &.{try d.generalizedTime(nu)}) else &.{},
+    });
+    const tbs = try d.seq(&.{
+        try d.tlv(0xa2, &.{try d.tlv(0x04, &.{&ca.key_id})}), // responderID byKey
+        try d.generalizedTime(this_update),
+        try d.seq(&.{single}),
+    });
+    const basic = try d.signed(ca.kp, tbs);
+    const response_bytes = try d.seq(&.{
+        try d.oid(&.{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01 }),
+        try d.tlv(0x04, &.{basic}),
+    });
+    return gpa.dupe(u8, try d.seq(&.{ try d.tlv(0x0a, &.{&.{0x00}}), try d.tlv(0xa0, &.{response_bytes}) }));
+}
 
 fn csrSpkiCopy(d: Der, csr_der: []const u8) ![]u8 {
     return d.a.dupe(u8, try csrSpki(csr_der));

@@ -207,7 +207,7 @@ pub const module_list = [_]Module{
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct", "cookies", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" }, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "keycodec" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "keycodec", "ocspcache" }, .test_deps = &.{"testkit"}, .loopback = true },
     // DNS-01 helpers + publishers for acme; a sibling so acme's consumers do not carry dns/procrun.
     .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },

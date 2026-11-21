@@ -127,6 +127,9 @@ const Recorder = struct {
     installed: usize = 0,
     failed: usize = 0,
     storage_failed: usize = 0,
+    ocsp_stapled: usize = 0,
+    ocsp_revoked: usize = 0,
+    ocsp_failed: usize = 0,
     last_source: ?Manager.Event.Source = null,
     last_issuer: [16]u8 = @splat(0),
     last_not_after: i64 = 0,
@@ -154,6 +157,13 @@ const Recorder = struct {
                 @memcpy(r.last_problem[0..@min(f.problem.len, 64)], f.problem[0..@min(f.problem.len, 64)]);
             },
             .storage_failed => r.storage_failed += 1,
+            .ocsp => |o| {
+                switch (o.kind) {
+                    .stapled => r.ocsp_stapled += 1,
+                    .revoked => r.ocsp_revoked += 1,
+                    .failed => r.ocsp_failed += 1,
+                }
+            },
         }
     }
 

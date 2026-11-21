@@ -28,6 +28,10 @@
 //!   autocert's redirect-to-HTTPS fallback) and TLS-ALPN-01
 //!   (`tlsAlpnMaterial`) itself — give `challengeSolvers()` to the
 //!   `Client`s. DNS-01 stays the client's (`Options.dns_publisher`, `acmedns`).
+//! - **OCSP stapling** (CertMagic's staple maintenance): `Options.ocsp` has
+//!   `maintain` fetch, verify (`ocspcache`) and refresh an OCSP response for
+//!   each certificate whose leaf names a responder, hand it out as
+//!   `Material.ocsp_staple`, and renew a certificate the CA reports revoked.
 //! - **on-demand** (autocert `HostPolicy`, CertMagic `OnDemandConfig`):
 //!   `Options.on_demand` obtains a certificate during the first handshake
 //!   for a name the policy allows, rate-limited.
@@ -52,6 +56,7 @@ const router = @import("router");
 const pkix = @import("x509");
 const rsa = @import("rsa");
 const keycodec = @import("keycodec");
+const ocspcache = @import("ocspcache");
 const netaddr = @import("netaddr");
 const Client = @import("Client.zig");
 const jws = @import("jws.zig");
@@ -133,6 +138,10 @@ pub const Options = struct {
     http_redirect: bool = false,
     on_event: ?EventHook = null,
     on_demand: ?OnDemand = null,
+    /// Keep an OCSP staple for every certificate whose leaf has an OCSP
+    /// responder URL and whose chain carries its issuer (CertMagic's OCSP
+    /// maintenance); null: none.
+    ocsp: ?Ocsp = null,
     /// Time source, epoch seconds; null: the io's real clock.
     clock: ?Clock = null,
     /// Seed for the renewal-time jitter; null: drawn from the io.
@@ -140,6 +149,23 @@ pub const Options = struct {
 };
 
 pub const IssuerPolicy = enum { in_order, random };
+
+/// OCSP stapling. `maintain` checks each certificate every `interval_s`
+/// seconds; a check fetches a fresh response when there is none or the cached
+/// one is within `config.refresh_margin_seconds` of its `nextUpdate`, and
+/// verifies it (`ocspcache.Cache.refresh`). A failed fetch keeps the staple
+/// served until it expires (nginx and CertMagic do the same). A verified
+/// `revoked` answer drops the staple and renews the certificate at once.
+/// A certificate whose leaf has no OCSP URL (Let's Encrypt, since 2025) or
+/// whose chain lacks the issuer is left alone.
+pub const Ocsp = struct {
+    /// How responders are reached, e.g. `ocspcache.httpTransport(&client)`.
+    transport: ocspcache.Transport,
+    config: ocspcache.Config = .{},
+    /// Seconds between checks (a failed check is retried after a tenth of this,
+    /// at least a minute); at least 60.
+    interval_s: u32 = 3600,
+};
 
 const IssuerSlot = struct {
     issuer: Issuer,
@@ -269,7 +295,19 @@ pub const Event = union(enum) {
     storage_failed: struct {
         names: []const []const u8,
     },
+    /// An OCSP check (`Options.ocsp`) finished with news: a new staple, a
+    /// revocation (the certificate is renewed at once) or a failure (the old
+    /// staple keeps being served while it is valid).
+    ocsp: struct {
+        names: []const []const u8,
+        kind: OcspKind,
+        /// The error name for `.failed`, empty otherwise.
+        problem: []const u8,
+        /// The new staple for `.stapled`, else null.
+        response_der: ?[]const u8,
+    },
 
+    pub const OcspKind = enum { stapled, revoked, failed };
     pub const Source = enum { storage, issued };
 };
 
@@ -279,8 +317,12 @@ pub const Material = struct {
     chain_pem: []u8,
     key_pem: []u8,
     not_after: i64,
+    /// The verified DER `OCSPResponse` to staple, while it is still valid
+    /// (`Options.ocsp`); null: none.
+    ocsp_staple: ?[]u8 = null,
 
     pub fn deinit(mt: *Material, gpa: Allocator) void {
+        if (mt.ocsp_staple) |s| gpa.free(s);
         gpa.free(mt.chain_pem);
         std.crypto.secureZero(u8, mt.key_pem);
         gpa.free(mt.key_pem);
@@ -407,6 +449,11 @@ const Entry = struct {
     ari_at: ?i64 = null,
     ari_start: i64 = 0,
     ari_end: i64 = 0,
+    /// The OCSP staple (DER) and the epoch second it stops being servable.
+    staple: ?[]u8 = null,
+    staple_until: i64 = 0,
+    /// Next OCSP check; 0 = none (OCSP off, or nothing to staple).
+    ocsp_at: i64 = 0,
     failures: u32 = 0,
     /// Set after a failure or while another node holds the lock: the next
     /// attempt, overriding the renewal schedule. 0 = none.
@@ -420,7 +467,8 @@ const Entry = struct {
     fn dueAt(e: *const Entry) i64 {
         if (e.retry_at != 0) return e.retry_at;
         if (e.cert == null) return 0;
-        return @min(e.renew_at, e.ari_at orelse std.math.maxInt(i64));
+        const due = @min(e.renew_at, e.ari_at orelse std.math.maxInt(i64));
+        return if (e.ocsp_at != 0) @min(due, e.ocsp_at) else due;
     }
 };
 
@@ -507,6 +555,7 @@ fn dropEntryLocked(m: *Manager, e: *Entry) void {
 
 fn freeEntry(m: *Manager, e: *Entry) void {
     if (e.cert) |*ct| ct.deinit(m.gpa);
+    if (e.staple) |st| m.gpa.free(st);
     for (e.names) |n| m.gpa.free(n);
     m.gpa.free(e.names);
     m.gpa.free(e.stem);
@@ -663,7 +712,9 @@ fn finishStep(m: *Manager, e: *Entry) void {
 /// The work for one due entry (it is busy; we are outside the lock).
 fn step(m: *Manager, e: *Entry, t: i64) void {
     const needs_cert = e.cert == null or t >= e.renew_at or e.retry_at != 0;
-    if (needs_cert) m.obtain(e, t) else m.pollAri(e, t);
+    if (needs_cert) return m.obtain(e, t);
+    if (e.ari_at) |at| if (at <= t) m.pollAri(e, t);
+    if (e.ocsp_at != 0 and e.ocsp_at <= t) m.refreshOcsp(e, t);
 }
 
 /// Load from storage, else (under the fleet lock) issue.
@@ -817,6 +868,10 @@ fn install(m: *Manager, e: *Entry, ct: Cert, t: i64, source: Event.Source, issue
     e.cert = ct;
     e.renew_at = ratioRenewAt(ct.not_before, ct.not_after, m.options.renewal_window_pct);
     e.ari_at = if (has_ari) t else null;
+    // A new certificate has no staple yet; the first check runs at once.
+    if (e.staple) |st| m.gpa.free(st);
+    e.staple = null;
+    e.ocsp_at = if (m.options.ocsp != null) t else 0;
     e.ari_start = 0;
     e.ari_end = 0;
     e.failures = 0;
@@ -950,6 +1005,94 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
     }
 }
 
+/// One OCSP check of the entry's certificate (it is busy, we are outside the
+/// lock). A throwaway `ocspcache.Cache` does the verified fetch: the entry's
+/// own staple (or the stored one) is imported into it first, so a still-fresh
+/// staple costs no request, and the result is copied back.
+fn refreshOcsp(m: *Manager, e: *Entry, t: i64) void {
+    const oc = m.options.ocsp orelse return;
+    const interval: i64 = @max(oc.interval_s, 60);
+    const retry: i64 = @max(@divFloor(interval, 10), 60);
+    const ct = e.cert.?; // busy: stable
+    var arena_state = std.heap.ArenaAllocator.init(m.gpa);
+    defer arena_state.deinit();
+    const chain = splitPemChain(arena_state.allocator(), ct.chain_pem) catch {
+        return m.ocspDone(e, 0); // no usable chain: nothing to staple
+    };
+    if (chain.len < 2) return m.ocspDone(e, 0); // no issuer to ask for
+    const leaf = chain[0];
+    const issuer = chain[1];
+    const url = ocspcache.discoverResponderUrl(leaf) catch null;
+    if (url == null) return m.ocspDone(e, 0); // this CA has no OCSP
+
+    var cache = ocspcache.Cache.init(m.gpa, oc.transport, oc.config);
+    defer cache.deinit();
+    var imported = false;
+    if (e.staple) |st| {
+        imported = if (cache.importStaple(leaf, issuer, st, t)) true else |_| false;
+    } else if (m.options.storage.load(m.gpa, m.keyOf(e, ".ocsp").slice())) |blob| {
+        defer m.gpa.free(blob);
+        imported = if (cache.importStaple(leaf, issuer, blob, t)) true else |_| false;
+    } else |_| {}
+
+    var fetched = false;
+    if (cache.needsRefresh(leaf, t)) {
+        cache.refresh(leaf, issuer, t) catch |err| {
+            if (err == error.CertRevoked) return m.ocspRevoked(e, t);
+            // Soft fail: the staple we have (if any) is still served.
+            m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .failed, .problem = @errorName(err), .response_der = null } });
+            if (imported) _ = m.adoptStaple(e, &cache, leaf, t, false);
+            return m.ocspDone(e, t +| retry);
+        };
+        fetched = true;
+    }
+    _ = m.adoptStaple(e, &cache, leaf, t, fetched);
+    m.ocspDone(e, t +| interval);
+}
+
+/// Copy the cache's staple for `leaf` into the entry (and storage, when it was just fetched).
+fn adoptStaple(m: *Manager, e: *Entry, cache: *ocspcache.Cache, leaf: []const u8, t: i64, fetched: bool) bool {
+    const list = cache.exportEntries(m.gpa, t) catch return false;
+    defer ocspcache.Cache.freeExported(m.gpa, list);
+    const key = ocspcache.Cache.subjectKey(leaf);
+    for (list) |x| {
+        if (!std.mem.eql(u8, &x.subject_key, &key)) continue;
+        const copy = m.gpa.dupe(u8, x.response_der) catch return false;
+        m.mutex.lockUncancelable(m.io);
+        if (e.staple) |old| m.gpa.free(old);
+        e.staple = copy;
+        e.staple_until = x.next_update_unix;
+        const removed = e.removed;
+        m.mutex.unlock(m.io);
+        if (fetched and !removed) {
+            m.options.storage.store(m.keyOf(e, ".ocsp").slice(), copy) catch {};
+            m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .stapled, .problem = "", .response_der = copy } });
+        }
+        return true;
+    }
+    return false;
+}
+
+fn ocspDone(m: *Manager, e: *Entry, next: i64) void {
+    m.mutex.lockUncancelable(m.io);
+    defer m.mutex.unlock(m.io);
+    e.ocsp_at = next;
+}
+
+/// The CA says the certificate is revoked: stop stapling, renew now.
+fn ocspRevoked(m: *Manager, e: *Entry, t: i64) void {
+    m.mutex.lockUncancelable(m.io);
+    if (e.staple) |st| m.gpa.free(st);
+    e.staple = null;
+    e.ocsp_at = 0;
+    e.renew_at = t;
+    const removed = e.removed;
+    m.mutex.unlock(m.io);
+    m.options.storage.delete(m.keyOf(e, ".ocsp").slice()) catch {};
+    if (removed) return;
+    m.emit(&.{ .ocsp = .{ .names = namesView(e), .kind = .revoked, .problem = "", .response_der = null } });
+}
+
 fn emit(m: *Manager, event: *const Event) void {
     const hook = m.options.on_event orelse return;
     hook.call(hook.ctx, event);
@@ -985,9 +1128,9 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     var deadline: ?std.Io.Timeout = null;
     m.mutex.lockUncancelable(m.io);
     while (m.lookup(name)) |e| {
-        if (e.cert) |ct| {
+        if (e.cert != null) {
             defer m.mutex.unlock(m.io);
-            return try copyMaterial(gpa, ct);
+            return try copyMaterial(gpa, e, t);
         }
         // Another handshake is obtaining this on-demand name: wait for
         // that result. A `manage`d name's first issuance (which may take
@@ -1047,18 +1190,22 @@ fn onDemandObtain(m: *Manager, gpa: Allocator, e: *Entry) error{OutOfMemory}!?Ma
     m.obtain(e, m.now());
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
-    const result: ?Material = if (e.cert) |ct| copyMaterial(gpa, ct) catch null else null;
+    const result: ?Material = if (e.cert != null) copyMaterial(gpa, e, m.now()) catch null else null;
     e.busy = false;
     if (e.removed) m.freeEntry(e);
     m.idle.broadcast(m.io);
     return result;
 }
 
-fn copyMaterial(gpa: Allocator, ct: Cert) error{OutOfMemory}!Material {
+fn copyMaterial(gpa: Allocator, e: *const Entry, t: i64) error{OutOfMemory}!Material {
+    const ct = e.cert.?;
     const chain = try gpa.dupe(u8, ct.chain_pem);
     errdefer gpa.free(chain);
     const key = try gpa.dupe(u8, ct.key_pem);
-    return .{ .chain_pem = chain, .key_pem = key, .not_after = ct.not_after };
+    errdefer gpa.free(key);
+    // A staple past its `nextUpdate` is never handed out.
+    const staple: ?[]u8 = if (e.staple) |st| (if (t <= e.staple_until) try gpa.dupe(u8, st) else null) else null;
+    return .{ .chain_pem = chain, .key_pem = key, .not_after = ct.not_after, .ocsp_staple = staple };
 }
 
 /// Exact name, then `*.` + parent (one label only). Lock held.

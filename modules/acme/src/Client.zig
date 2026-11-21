@@ -5893,7 +5893,7 @@ test "W5: AcmeIssuer through the mock CA, HTTP-01 answered by the Manager's solv
                     r.failed += 1;
                     @memcpy(r.problem[0..@min(f.problem.len, 96)], f.problem[0..@min(f.problem.len, 96)]);
                 },
-                .storage_failed => {},
+                .storage_failed, .ocsp => {},
             }
         }
     };
@@ -7946,6 +7946,7 @@ test "Manager over AcmeIssuer against the signing mock CA: issues for the minted
                     h.issued += 1;
                 },
                 .failed, .storage_failed => h.failed += 1,
+                .ocsp => {},
             }
         }
     };

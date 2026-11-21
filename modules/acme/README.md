@@ -165,6 +165,10 @@ const next_due = manager.maintain();
 - **A fleet** sharing one storage: issuance runs under a storage lock, and
   `distributed_challenges = true` puts challenge data into storage so the node
   the CA reaches can answer for another node's order.
+- **OCSP stapling** (`Options.ocsp = .{ .transport = ocspcache.httpTransport(&http_client) }`): `maintain` keeps a
+  verified staple for every certificate whose leaf names an OCSP responder; `certificate` returns it as
+  `Material.ocsp_staple` for the TLS `status_request`. A failed fetch keeps the old staple until it expires; a
+  `revoked` answer renews the certificate at once (`Event.ocsp`).
 - **Issued chains are checked**: verified to `trust_anchors` (default: the
   chain's own top certificate — set the CA roots when the storage is shared),
   every name covered, the key matching. A bad chain is a failure, never served.

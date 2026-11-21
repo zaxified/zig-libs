@@ -418,6 +418,7 @@ const Events = struct {
                 e.failed += 1;
                 std.debug.print("manager: storing an issued certificate failed\n", .{});
             },
+            .ocsp => {},
         }
     }
 };
