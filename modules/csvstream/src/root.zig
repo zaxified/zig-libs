@@ -172,6 +172,19 @@ pub const parseFloat = coerce.parseFloat;
 /// Parses a field as a bool (`true`/`false`/`1`/`0`, case-insensitive).
 pub const parseBool = coerce.parseBool;
 
+// ── Struct mapping (opt-in) ───────────────────────────────────────────────────
+
+/// Record ↔ struct mapping by comptime reflection (rust-csv serde, Go `csvutil`): `record.deserialize`
+/// (by header name or position), `record.nextRecord` (from a `StreamReader`), `record.serialize` and
+/// `record.writeHeader`. Integers, floats, bools, enums, `[]const u8` and optionals of those.
+pub const record = @import("record.zig");
+
+// ── Dialect sniffing (opt-in) ─────────────────────────────────────────────────
+
+/// Python `csv.Sniffer`: `sniff.sniff(sample, .{})` (delimiter, quote, `skipinitialspace` as `trim`) and
+/// `sniff.hasHeader` (does the first row look like a header). Heuristics over a sample; null when unsure.
+pub const sniff = @import("sniff.zig");
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -180,6 +193,8 @@ test {
     _ = writer;
     _ = header;
     _ = coerce;
+    _ = record;
+    _ = sniff;
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
 }

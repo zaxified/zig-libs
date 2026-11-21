@@ -238,6 +238,5 @@ inconsistent fixture pair. See NOTICE for provenance.
 A custom record terminator and a multi-byte delimiter, a push-parser DFA, input
 transcoding (compose with the `encoding` module), writer `NonNumeric` quoting, and
 reading quoted newlines by default (`.span` is the opt-in) are refused by design;
-struct/serde mapping, dialect sniffing and a full SIMD tokenizer are open
-items. The reasons and the open items are in `SPEC.md`, *What is deliberately not done*
-and *Backlog / deferred*.
+a full SIMD tokenizer is not done. The reasons and the open items are in `SPEC.md`,
+*What is deliberately not done* and *Backlog / deferred*. Struct mapping is `record`, dialect sniffing `sniff`.
