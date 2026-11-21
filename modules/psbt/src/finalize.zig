@@ -814,7 +814,7 @@ fn finalizeOneInput(
     old.deinit(allocator);
 }
 
-pub const FinalizeSetupError = Allocator.Error || bitcointx.tx.DeserializeError || bitcointx.precomputed.PrecomputedError;
+pub const FinalizeSetupError = Allocator.Error || psbt.UnsignedTxError || bitcointx.precomputed.PrecomputedError;
 
 /// Finalizes every input of `ps` it can, mutating `ps.inputs` in place
 /// (module doc comment: `Psbt.inputs` is a slice, so mutation through this
@@ -896,7 +896,7 @@ pub const ExtractError = error{
     /// is complete -- surfaced here as a typed refusal rather than a
     /// partial `Transaction`).
     InputNotFinalized,
-} || Allocator.Error || bitcointx.tx.DeserializeError || WitnessStackError;
+} || Allocator.Error || psbt.UnsignedTxError || WitnessStackError;
 
 /// Splices every input's finalized scriptSig/scriptWitness into the
 /// unsigned transaction, producing a network-ready `bitcointx.Transaction`

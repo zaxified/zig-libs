@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `psbt` — BIP174 Partially Signed Bitcoin Transaction (PSBT) v0: binary
+//! `psbt` — BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 and BIP370 v2: binary
 //! (de)serialization plus the Combiner role. Parses untrusted PSBT bytes
 //! fail-closed; see SPEC.md for the full threat model and scope cuts.
 //!
@@ -10,9 +10,11 @@
 //! `<keylen><keytype+keydata><valuelen><valuedata>` records terminated by a
 //! `0x00` byte. `<keytype>` is itself a minimally-encoded CompactSize
 //! prefix of the key bytes; `<keydata>` is whatever follows it within the
-//! key. The number of input/output maps is exactly the unsigned
-//! transaction's `vin`/`vout` count (BIP174 gives no explicit count field
-//! for either — the unsigned tx is the sole source of truth).
+//! key. In a version 0 PSBT the number of input/output maps is exactly the
+//! unsigned transaction's `vin`/`vout` count (BIP174 gives no explicit count
+//! field for either — the unsigned tx is the sole source of truth); a version 2
+//! PSBT (BIP370, see `v2.zig`) has no unsigned tx and declares both counts in
+//! its global map.
 //!
 //! ## Ownership / zero-copy
 //!
@@ -59,7 +61,7 @@ const appendCompactSize = bitcointx.tx.appendCompactSize;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization plus the Combiner (merge) role, over `bitcointx`.",
+    .doc = "BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 and BIP370 v2 — binary (de)serialization plus the Combiner (merge) role, over `bitcointx`.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -81,6 +83,16 @@ pub const magic = [_]u8{ 0x70, 0x73, 0x62, 0x74, 0xff };
 pub const global_key = struct {
     pub const UNSIGNED_TX: u64 = 0x00;
     pub const XPUB: u64 = 0x01;
+    /// BIP370 (PSBTv2): the transaction version, `<i32 LE>`.
+    pub const TX_VERSION: u64 = 0x02;
+    /// BIP370: the locktime used when no input requires one, `<u32 LE>`.
+    pub const FALLBACK_LOCKTIME: u64 = 0x03;
+    /// BIP370: the number of inputs, a CompactSize.
+    pub const INPUT_COUNT: u64 = 0x04;
+    /// BIP370: the number of outputs, a CompactSize.
+    pub const OUTPUT_COUNT: u64 = 0x05;
+    /// BIP370: one byte of `tx_modifiable` flags (bit 0 inputs, bit 1 outputs, bit 2 has SIGHASH_SINGLE).
+    pub const TX_MODIFIABLE: u64 = 0x06;
     pub const VERSION: u64 = 0xfb;
     pub const PROPRIETARY: u64 = 0xfc;
 };
@@ -101,6 +113,16 @@ pub const input_key = struct {
     pub const SHA256: u64 = 0x0b;
     pub const HASH160: u64 = 0x0c;
     pub const HASH256: u64 = 0x0d;
+    /// BIP370: the 32-byte txid of the spent transaction (wire byte order).
+    pub const PREVIOUS_TXID: u64 = 0x0e;
+    /// BIP370: the spent output index, `<u32 LE>`.
+    pub const OUTPUT_INDEX: u64 = 0x0f;
+    /// BIP370: the input's sequence number, `<u32 LE>` (absent: 0xffffffff).
+    pub const SEQUENCE: u64 = 0x10;
+    /// BIP370: a Unix-time lock the input requires, `<u32 LE>` >= 500000000.
+    pub const REQUIRED_TIME_LOCKTIME: u64 = 0x11;
+    /// BIP370: a block-height lock the input requires, `<u32 LE>` in 1..499999999.
+    pub const REQUIRED_HEIGHT_LOCKTIME: u64 = 0x12;
     pub const PROPRIETARY: u64 = 0xfc;
     /// BIP371's taproot key-path signature (not part of BIP174 v0 proper —
     /// added here so `finalize.zig` can assemble a P2TR key-path witness;
@@ -129,6 +151,10 @@ pub const output_key = struct {
     pub const REDEEM_SCRIPT: u64 = 0x00;
     pub const WITNESS_SCRIPT: u64 = 0x01;
     pub const BIP32_DERIVATION: u64 = 0x02;
+    /// BIP370: the output amount in satoshis, `<i64 LE>`.
+    pub const AMOUNT: u64 = 0x03;
+    /// BIP370: the output script (scriptPubKey).
+    pub const SCRIPT: u64 = 0x04;
     /// BIP371 output fields: the internal key, the script tree
     /// (`{depth leaf-version script-len script}*`) and per-key derivations.
     pub const TAP_INTERNAL_KEY: u64 = 0x05;
@@ -226,26 +252,52 @@ pub const Psbt = struct {
         self.* = undefined;
     }
 
-    /// Decodes the mandatory `PSBT_GLOBAL_UNSIGNED_TX` value. Caller owns
-    /// the returned `Transaction` (`.deinit`); its byte content still
-    /// borrows from the buffer `parse` was called with. Every `Psbt` this
-    /// module hands back (from `parse` or `combine`) is guaranteed to have
-    /// this record — constructing a `Psbt` any other way and calling this
-    /// is a caller-construction contract, not untrusted-input territory
-    /// (a missing record is `unreachable` here; `bitcointx.serializeSegwit`
+    /// The unsigned transaction. Caller owns the returned `Transaction`
+    /// (`.deinit`); its byte content still borrows from the buffer `parse`
+    /// was called with. A version 0 PSBT decodes its `PSBT_GLOBAL_UNSIGNED_TX`;
+    /// a version 2 PSBT (BIP370) has none, so the transaction is built from
+    /// the version 2 fields (every scriptSig empty, `PSBT_IN_SEQUENCE` or
+    /// 0xffffffff, the locktime of `lockTime`) and fails with
+    /// `error.ConflictingLocktimes` when no locktime satisfies all inputs.
+    /// Every `Psbt` this module hands back (from `parse` or `combine`) has
+    /// the fields this needs — constructing a `Psbt` any other way and calling
+    /// this is a caller-construction contract, not untrusted-input territory
+    /// (a missing field is `unreachable` here; `bitcointx.serializeSegwit`
     /// refuses its analogous witness-count mismatch with a typed error).
-    pub fn unsignedTx(self: Psbt, allocator: Allocator) bitcointx.tx.DeserializeError!bitcointx.Transaction {
-        const r = self.global.find(global_key.UNSIGNED_TX) orelse unreachable;
-        return bitcointx.deserialize(allocator, r.value);
+    pub fn unsignedTx(self: Psbt, allocator: Allocator) UnsignedTxError!bitcointx.Transaction {
+        if (self.global.find(global_key.UNSIGNED_TX)) |r| return bitcointx.deserialize(allocator, r.value);
+        return v2.buildTx(allocator, self, false);
     }
 
     /// `PSBT_GLOBAL_VERSION`, or `null` if omitted (BIP174: version 0).
-    /// `parse` already rejects a nonzero value with `error.UnsupportedPsbtVersion`
-    /// (BIP174 §"Version 0"), so this always returns `0` when non-null.
+    /// `parse` accepts only 0 and 2 (BIP370); see `psbtVersion` for the
+    /// effective version.
     pub fn version(self: Psbt) ?u32 {
         const r = self.global.find(global_key.VERSION) orelse return null;
         return std.mem.readInt(u32, r.value[0..4], .little);
     }
+
+    /// The effective PSBT version: 0 when `PSBT_GLOBAL_VERSION` is omitted
+    /// or 0, otherwise the declared value (2 for BIP370).
+    pub fn psbtVersion(self: Psbt) u32 {
+        return globalVersion(self.global);
+    }
+};
+
+fn globalVersion(global: Map) u32 {
+    const r = global.find(global_key.VERSION) orelse return 0;
+    return std.mem.readInt(u32, r.value[0..4], .little);
+}
+
+/// What `Psbt.unsignedTx` can fail with: the decode of a version 0
+/// `PSBT_GLOBAL_UNSIGNED_TX`, or (version 2) allocation and a locktime no
+/// input set agrees on.
+pub const UnsignedTxError = bitcointx.tx.DeserializeError || error{
+    /// BIP370 §"Determining Lock Time": one input requires only a time lock
+    /// and another only a height lock, so no `nLockTime` satisfies both.
+    ConflictingLocktimes,
+    /// A version 2 `Psbt` assembled by hand lacks a field BIP370 requires (`parse` never returns one).
+    MissingRequiredField,
 };
 
 // ── BIP32 derivation value view (shared by XPUB / BIP32_DERIVATION) ────
@@ -381,11 +433,13 @@ pub const RecordError = error{
     InvalidTapTree,
     /// A BIP373 aggregate or participant key that is not a valid compressed curve point.
     InvalidPublicKey,
-    /// `PSBT_GLOBAL_VERSION` is present with a nonzero value. BIP174
-    /// §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
-    /// or include it and set it to 0." This module implements BIP174 v0
-    /// only (BIP370/PSBTv2 is out of scope -- see SPEC.md), so a PSBT that
-    /// declares a different version cannot be correctly interpreted and
+    /// `PSBT_IN_REQUIRED_TIME_LOCKTIME` below 500000000, or
+    /// `PSBT_IN_REQUIRED_HEIGHT_LOCKTIME` of 0 or 500000000 and above (BIP370).
+    InvalidLocktime,
+    /// `PSBT_GLOBAL_VERSION` is present with a value other than 0 and 2.
+    /// BIP174 §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
+    /// or include it and set it to 0"; BIP370 defines 2 (1 is skipped). A PSBT
+    /// that declares another version cannot be correctly interpreted and
     /// must be rejected rather than silently parsed as if it were v0.
     UnsupportedPsbtVersion,
 };
@@ -395,8 +449,15 @@ pub const ParseError = bitcointx.tx.DeserializeError || RecordError || error{
     BadMagic,
     /// The same raw key (keytype + keydata) appears twice in one map.
     DuplicateKey,
-    /// The global map has no `PSBT_GLOBAL_UNSIGNED_TX` record.
+    /// A version 0 PSBT's global map has no `PSBT_GLOBAL_UNSIGNED_TX` record.
     MissingUnsignedTx,
+    /// A version 2 PSBT lacks a field BIP370 requires: `PSBT_GLOBAL_TX_VERSION`,
+    /// `_INPUT_COUNT`, `_OUTPUT_COUNT`, an input's `PREVIOUS_TXID` or
+    /// `OUTPUT_INDEX`, an output's `AMOUNT` or `SCRIPT`.
+    MissingRequiredField,
+    /// A field of the other PSBT version: `PSBT_GLOBAL_UNSIGNED_TX` in version 2,
+    /// or any BIP370 field in version 0.
+    FieldNotAllowedInVersion,
     /// The unsigned tx is BIP144 witness-serialized; BIP174 requires the
     /// old (non-witness) serialization here.
     UnsignedTxNotLegacySerialization,
@@ -446,6 +507,16 @@ pub fn requireFixedValueLen(r: Record, n: usize) RecordError!void {
     if (r.value.len != n) return error.InvalidFixedFieldLength;
 }
 
+/// Lock times below this are block heights, at or above it Unix times (consensus).
+const locktime_threshold: u32 = 500_000_000;
+
+/// The CompactSize a count field holds, `null` unless it is minimally encoded and fills `value`.
+fn countValue(value: []const u8) ?u64 {
+    const r = bitcointx.decodeCompactSize(value) catch return null;
+    if (r.consumed != value.len) return null;
+    return r.value;
+}
+
 fn requireBip32ValueShape(r: Record) RecordError!void {
     if (r.value.len < 4 or (r.value.len - 4) % 4 != 0) return error.InvalidFixedFieldLength;
 }
@@ -457,10 +528,23 @@ pub fn validateGlobalRecord(r: Record) RecordError!void {
         global_key.VERSION => {
             try requireNoKeyData(r);
             try requireFixedValueLen(r, 4);
-            // BIP174 §"Version 0": a present PSBT_GLOBAL_VERSION must be 0.
-            if (std.mem.readInt(u32, r.value[0..4], .little) != 0) return error.UnsupportedPsbtVersion;
+            // BIP174 §"Version 0" / BIP370: 0 or 2 only.
+            const v = std.mem.readInt(u32, r.value[0..4], .little);
+            if (v != 0 and v != 2) return error.UnsupportedPsbtVersion;
         },
         global_key.XPUB => try requireBip32ValueShape(r),
+        global_key.TX_VERSION, global_key.FALLBACK_LOCKTIME => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+        },
+        global_key.INPUT_COUNT, global_key.OUTPUT_COUNT => {
+            try requireNoKeyData(r);
+            _ = countValue(r.value) orelse return error.InvalidFixedFieldLength;
+        },
+        global_key.TX_MODIFIABLE => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 1);
+        },
         else => {}, // unknown / PROPRIETARY -- opaque passthrough
     }
 }
@@ -479,6 +563,25 @@ pub fn validateInputRecord(r: Record) RecordError!void {
             try requireNoKeyData(r);
             try requireFixedValueLen(r, 4);
         },
+        input_key.PREVIOUS_TXID => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 32);
+        },
+        input_key.OUTPUT_INDEX, input_key.SEQUENCE => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+        },
+        input_key.REQUIRED_TIME_LOCKTIME => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+            if (std.mem.readInt(u32, r.value[0..4], .little) < locktime_threshold) return error.InvalidLocktime;
+        },
+        input_key.REQUIRED_HEIGHT_LOCKTIME => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+            const h = std.mem.readInt(u32, r.value[0..4], .little);
+            if (h == 0 or h >= locktime_threshold) return error.InvalidLocktime;
+        },
         input_key.PARTIAL_SIG => try requirePubkeyLen(r),
         input_key.BIP32_DERIVATION => {
             try requirePubkeyLen(r);
@@ -491,7 +594,11 @@ pub fn validateInputRecord(r: Record) RecordError!void {
 /// Structural check of one output-map record.
 pub fn validateOutputRecord(r: Record) RecordError!void {
     switch (r.keytype) {
-        output_key.REDEEM_SCRIPT, output_key.WITNESS_SCRIPT => try requireNoKeyData(r),
+        output_key.REDEEM_SCRIPT, output_key.WITNESS_SCRIPT, output_key.SCRIPT => try requireNoKeyData(r),
+        output_key.AMOUNT => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 8);
+        },
         output_key.BIP32_DERIVATION => {
             try requirePubkeyLen(r);
             try requireBip32ValueShape(r);
@@ -512,17 +619,13 @@ fn validateOutputMap(m: Map) RecordError!void {
     for (m.records) |r| try validateOutputRecord(r);
 }
 
-/// Parses a whole PSBT buffer. Rejects on any structural or per-field
-/// violation (see `ParseError`) — never panics on malformed/truncated/
-/// adversarial bytes (see SPEC.md "Threat model").
-pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
-    if (bytes.len < magic.len or !std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
-    var offset: usize = magic.len;
+const MapCounts = struct { inputs: usize, outputs: usize };
 
-    var global = try parseMap(allocator, bytes, &offset);
-    errdefer global.deinit(allocator);
-    try validateGlobalMap(global);
-
+/// Version 0: the input/output map counts are the unsigned transaction's.
+fn v0Counts(allocator: Allocator, global: Map) ParseError!MapCounts {
+    for (global.records) |r| {
+        if (r.keydata.len == 0 and isV2GlobalKey(r.keytype)) return error.FieldNotAllowedInVersion;
+    }
     const utx_rec = global.find(global_key.UNSIGNED_TX) orelse return error.MissingUnsignedTx;
     // `bitcointx.deserialize` now refuses a BIP144-marked tx whose witness
     // stacks are all empty (`error.SuperfluousWitnessRecord`, wave-2 audit
@@ -549,8 +652,46 @@ pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
     for (utx.vin) |vin| {
         if (vin.script_sig.len != 0) return error.UnsignedTxHasScriptSig;
     }
-    const n_in = utx.vin.len;
-    const n_out = utx.vout.len;
+    return .{ .inputs = utx.vin.len, .outputs = utx.vout.len };
+}
+
+fn isV2GlobalKey(keytype: u64) bool {
+    return switch (keytype) {
+        global_key.TX_VERSION, global_key.FALLBACK_LOCKTIME, global_key.INPUT_COUNT, global_key.OUTPUT_COUNT, global_key.TX_MODIFIABLE => true,
+        else => false,
+    };
+}
+
+/// Version 2 (BIP370): no unsigned transaction; the counts are explicit fields.
+/// `remaining` is the number of bytes after the global map: every map is at least
+/// its terminator byte, so a larger count is truncated input (never allocated for).
+fn v2Counts(global: Map, remaining: usize) ParseError!MapCounts {
+    if (global.find(global_key.UNSIGNED_TX) != null) return error.FieldNotAllowedInVersion;
+    if (global.find(global_key.TX_VERSION) == null) return error.MissingRequiredField;
+    const n_in = countValue((global.find(global_key.INPUT_COUNT) orelse return error.MissingRequiredField).value) orelse unreachable;
+    const n_out = countValue((global.find(global_key.OUTPUT_COUNT) orelse return error.MissingRequiredField).value) orelse unreachable;
+    if (n_in > remaining or n_out > remaining - n_in) return error.Truncated;
+    return .{ .inputs = @intCast(n_in), .outputs = @intCast(n_out) };
+}
+
+/// Parses a whole PSBT buffer. Rejects on any structural or per-field
+/// violation (see `ParseError`) — never panics on malformed/truncated/
+/// adversarial bytes (see SPEC.md "Threat model").
+pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
+    if (bytes.len < magic.len or !std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
+    var offset: usize = magic.len;
+
+    var global = try parseMap(allocator, bytes, &offset);
+    errdefer global.deinit(allocator);
+    try validateGlobalMap(global);
+
+    const version_value = globalVersion(global);
+    const counts: MapCounts = if (version_value == 0)
+        try v0Counts(allocator, global)
+    else
+        try v2Counts(global, bytes.len - offset);
+    const n_in = counts.inputs;
+    const n_out = counts.outputs;
 
     var inputs: std.ArrayList(Map) = .empty;
     errdefer {
@@ -563,6 +704,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
             var m = try parseMap(allocator, bytes, &offset);
             errdefer m.deinit(allocator);
             try validateInputMap(m);
+            try v2.checkInputMap(m, version_value);
             try inputs.append(allocator, m);
         }
     }
@@ -578,6 +720,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
             var m = try parseMap(allocator, bytes, &offset);
             errdefer m.deinit(allocator);
             try validateOutputMap(m);
+            try v2.checkOutputMap(m, version_value);
             try outputs.append(allocator, m);
         }
     }
@@ -621,9 +764,11 @@ pub fn serialize(allocator: Allocator, p: Psbt) Allocator.Error![]u8 {
 
 // ── combine (Combiner role) ─────────────────────────────────────────────
 
-pub const CombineError = Allocator.Error || error{
-    /// The two PSBTs' `PSBT_GLOBAL_UNSIGNED_TX` values differ (BIP174: "A
-    /// Combiner must not combine two different PSBTs") -- includes the
+pub const CombineError = UnsignedTxError || error{
+    /// The two PSBTs describe different transactions (BIP174: "A
+    /// Combiner must not combine two different PSBTs"): their
+    /// `PSBT_GLOBAL_UNSIGNED_TX` values differ, or (version 2) their unique ids
+    /// (BIP370) do, or they are of different versions -- includes the
     /// degenerate case of a differing input/output map count.
     DifferentTransactions,
 };
@@ -698,10 +843,18 @@ fn mergeMaps(allocator: Allocator, a: Map, b: Map) Allocator.Error!Map {
 /// Combiner to "arbitrarily choose" here. Fails if `a`/`b` are not PSBTs
 /// for the same transaction.
 pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
-    const a_tx = a.global.find(global_key.UNSIGNED_TX) orelse unreachable;
-    const b_tx = b.global.find(global_key.UNSIGNED_TX) orelse unreachable;
-    if (!std.mem.eql(u8, a_tx.value, b_tx.value)) return error.DifferentTransactions;
+    if (a.psbtVersion() != b.psbtVersion()) return error.DifferentTransactions;
     if (a.inputs.len != b.inputs.len or a.outputs.len != b.outputs.len) return error.DifferentTransactions;
+    if (a.psbtVersion() == 2) {
+        // BIP370: PSBTs are the same when their unique ids are (sequences can differ).
+        const a_id = try v2.uniqueId(allocator, a);
+        const b_id = try v2.uniqueId(allocator, b);
+        if (!std.mem.eql(u8, &a_id, &b_id)) return error.DifferentTransactions;
+    } else {
+        const a_tx = a.global.find(global_key.UNSIGNED_TX) orelse unreachable;
+        const b_tx = b.global.find(global_key.UNSIGNED_TX) orelse unreachable;
+        if (!std.mem.eql(u8, a_tx.value, b_tx.value)) return error.DifferentTransactions;
+    }
 
     var global = try mergeMaps(allocator, a.global, b.global);
     errdefer global.deinit(allocator);
@@ -743,6 +896,7 @@ pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
 // callers only need `@import("psbt")`.
 
 pub const bip371 = @import("bip371.zig");
+pub const v2 = @import("v2.zig");
 const update = @import("update.zig");
 pub const CreateError = update.CreateError;
 pub const UpdateError = update.UpdateError;
@@ -804,8 +958,11 @@ test {
     _ = @import("core_kat_test.zig");
     _ = @import("regtest_kat_test.zig");
     _ = bip371;
+    _ = v2;
     _ = update;
     _ = @import("bip_vectors.zig");
+    _ = @import("bip370_vectors.zig");
+    _ = @import("bip370_test.zig");
     _ = @import("update_test.zig");
     _ = @import("bip371_test.zig");
     _ = @import("finalize_taproot_test.zig");

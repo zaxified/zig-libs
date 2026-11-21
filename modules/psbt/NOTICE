@@ -159,3 +159,13 @@ MIT License, reproduced for the Bitcoin Core material above
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
     DEALINGS IN THE SOFTWARE.
+
+## BIP370 — "PSBT Version 2"
+
+  https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki
+  Author: Ava Chow <me@achow101.com>
+  Licensed under the 2-clause BSD license (`License: BSD-2-Clause` in the BIP's
+  header). Its "Test Vectors" section (24 invalid PSBTs, 14 valid PSBTs, 10
+  locktime cases) is reproduced programmatically, Base64 as published, in
+  `src/bip370_vectors.zig`; the copyright line and the BSD-2-Clause text above
+  apply to it unchanged.

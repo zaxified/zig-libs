@@ -37,17 +37,11 @@
 //!    shapes (`bip371.zig`), each with a specific error. `invalid[39]`/`[40]`
 //!    (a UTXO that does not bind to its input) are accepted by `parse`, a pure
 //!    wire codec, and refused by `finalize` (group B2). **Everything else
-//!    Core's `invalid`/`invalid_with_msg` sets exercise that this module
-//!    accepts is out of its declared scope, not a bug.** Every remaining case
-//!    was individually decoded (its keytypes inspected directly, not guessed
-//!    from Core's message) and falls into exactly one bucket: MuSig2 fields
-//!    (`0x1a`-`0x1c`, BIP373, which Core validates) or BIP370 (PSBTv2) fields
-//!    coexisting with or instead of this module's v0 fields. None of this is
-//!    validated by BIP174 v0's own wire-format rules; accepting it as opaque
-//!    passthrough is the documented behaviour (SPEC.md "Known vs. unknown key
-//!    types"), not a security hole -- `finalize` never consumes any of these
-//!    fields. Test groups B/C below assert this explicitly (ACCEPT, not
-//!    reject) so the claim is checked, not assumed.
+//!    Core's `invalid`/`invalid_with_msg` sets exercise is refused too**: the
+//!    BIP373 MuSig2 fields (`0x1a`-`0x1c`) are validated, and BIP370 (PSBTv2)
+//!    fields in a version 0 PSBT are `error.FieldNotAllowedInVersion` (group C).
+//!    Every case was individually decoded (its keytypes inspected directly, not
+//!    guessed from Core's message). The pure-PSBTv2 `valid` vectors parse (group F).
 //!
 //! 3. **`valid[5]` hits the ALREADY-DOCUMENTED `bitcointx` 0-vin/BIP144-marker
 //!    ambiguity, via a new error code.** `kat_vectors.zig`'s BIP174 "PSBT with
@@ -58,12 +52,12 @@
 //!    `error.TooManyItems` instead. Still fail-closed, same underlying
 //!    limitation, not a new independent bug -- test group E below.
 //!
-//! `invalid_with_msg`: `{20, 21, 22}` are rejected with
-//! `error.UnsupportedPsbtVersion` (the PSBTv2 marker; Core's own stated
-//! reason is more specific), `[0]` with `error.InvalidFixedFieldLength` (the
-//! BIP371 taproot BIP32 derivation shape), `[1]` with
-//! `error.InvalidTapTree`; the rest are BIP373 MuSig2 field defects, rejected
-//! with `InvalidKeyDataLength` / `InvalidFixedFieldLength` / `InvalidPublicKey`.
+//! `invalid_with_msg`: `{20, 21, 22}` are rejected with `error.FieldNotAllowedInVersion`
+//! (`UNSIGNED_TX` in a version 2 PSBT), `error.MissingRequiredField` (no
+//! `TX_VERSION`) and `error.InvalidLocktime` (a height lock of 0), `[0]` with
+//! `error.InvalidFixedFieldLength` (the BIP371 taproot BIP32 derivation shape),
+//! `[1]` with `error.InvalidTapTree`; the rest are BIP373 MuSig2 field defects,
+//! rejected with `InvalidKeyDataLength` / `InvalidFixedFieldLength` / `InvalidPublicKey`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -94,17 +88,19 @@ test "Core invalid[]: BIP174-v0-scope violations are rejected (includes the PSBT
     }
 }
 
-test "Core invalid[19] and invalid[42]: PSBT_GLOBAL_VERSION=1/2 specifically rejected with error.UnsupportedPsbtVersion" {
+test "Core invalid[19] and invalid[42]: version 1 is UnsupportedPsbtVersion, version 2 with an unsigned tx FieldNotAllowedInVersion" {
     const allocator = testing.allocator;
     for (vectors.invalid_v0_scope) |case| {
         if (case.core_index != 19 and case.core_index != 42) continue;
         const raw = try hexToBytesAlloc(allocator, case.hex);
         defer allocator.free(raw);
-        try testing.expectError(error.UnsupportedPsbtVersion, psbt.parse(allocator, raw));
+        // [19]: version 1 (undefined); [42]: version 2 beside PSBT_GLOBAL_UNSIGNED_TX.
+        const want = if (case.core_index == 19) error.UnsupportedPsbtVersion else error.FieldNotAllowedInVersion;
+        try testing.expectError(want, psbt.parse(allocator, raw));
     }
 }
 
-// ── B: BIP371 field defects -- REJECTED; C: out-of-scope BIP370 (PSBTv2) content -- ACCEPTED, not a bug ──
+// ── B: BIP371 field defects -- REJECTED; C: BIP370 (PSBTv2) fields in a version 0 PSBT -- REJECTED ──
 
 /// BIP371 field defects Core's `invalid` set lists; `parse` has validated these
 /// since the BIP371 typed fields landed (`bip371.zig`), each with the error for
@@ -134,25 +130,20 @@ test "Core invalid[]: BIP371 field defects are rejected with the specific error 
     try testing.expectEqual(@as(usize, 11), n);
 }
 
-test "Core invalid[]: BIP370 (PSBTv2) field mixes are accepted as opaque passthrough (documented scope cut, not a bug)" {
+test "Core invalid[]: BIP370 (PSBTv2) field mixes in a version 0 PSBT are rejected" {
     const allocator = testing.allocator;
+    var n: usize = 0;
     for (vectors.invalid_out_of_scope) |case| {
         if (std.mem.eql(u8, case.reason, "taproot")) continue;
         const raw = try hexToBytesAlloc(allocator, case.hex);
         defer allocator.free(raw);
-        var result = psbt.parse(allocator, raw) catch |err| {
-            std.debug.print(
-                "FAIL (expected ACCEPT as out-of-scope [{s}], but parse rejected): core_index={d} err={}\n",
-                .{ case.reason, case.core_index, err },
-            );
+        testing.expectError(error.FieldNotAllowedInVersion, psbt.parse(allocator, raw)) catch |err| {
+            std.debug.print("FAIL: core_index={d} [{s}]\n", .{ case.core_index, case.reason });
             return err;
         };
-        // Round-trips too -- opaque passthrough must still be byte-exact.
-        const reser = try psbt.serialize(allocator, result);
-        defer allocator.free(reser);
-        try testing.expectEqualSlices(u8, raw, reser);
-        result.deinit(allocator);
+        n += 1;
     }
+    try testing.expectEqual(@as(usize, 12), n);
 }
 
 test "Core invalid_with_msg: all 23 rejected (3 as PSBTv2, 2 BIP371 defects, 18 BIP373 MuSig2 defects)" {
@@ -163,9 +154,14 @@ test "Core invalid_with_msg: all 23 rejected (3 as PSBTv2, 2 BIP371 defects, 18 
         const result = psbt.parse(allocator, raw);
         switch (case.core_index) {
             20, 21, 22 => {
-                // Defensible: parse detects the PSBTv2 marker itself, even
-                // though Core's own stated reason is more specific.
-                testing.expectError(error.UnsupportedPsbtVersion, result) catch |err| {
+                // "PSBT_GLOBAL_UNSIGNED_TX is not allowed in PSBTv2", "PSBT_GLOBAL_TX_VERSION is
+                // required in PSBTv2", "Required height based locktime is invalid (0)".
+                const want: anyerror = switch (case.core_index) {
+                    20 => error.FieldNotAllowedInVersion,
+                    21 => error.MissingRequiredField,
+                    else => error.InvalidLocktime,
+                };
+                testing.expectError(want, result) catch |err| {
                     std.debug.print("FAIL: core_index={d} (core msg: \"{s}\")\n", .{ case.core_index, case.core_message });
                     return err;
                 };
@@ -278,16 +274,23 @@ test "Core valid[5]: same documented bitcointx 0-vin/BIP144-marker ambiguity as 
     }
 }
 
-// ── F: valid[] that are pure PSBTv2 -- out of scope, correctly rejected ──
+// ── F: valid[] that are pure PSBTv2 (BIP370) -- accepted, byte-exact round trip ──
 
-test "Core valid[] PSBTv2-only vectors: correctly rejected with error.UnsupportedPsbtVersion (BIP370 is out of scope, not a bug)" {
+test "Core valid[] PSBTv2-only vectors: parsed, byte-exact round trip, unsigned tx buildable" {
     const allocator = testing.allocator;
     for (vectors.valid_out_of_scope_psbtv2) |case| {
         const raw = try hexToBytesAlloc(allocator, case.hex);
         defer allocator.free(raw);
-        testing.expectError(error.UnsupportedPsbtVersion, psbt.parse(allocator, raw)) catch |err| {
-            std.debug.print("FAIL: core_index={d}\n", .{case.core_index});
+        var ps = psbt.parse(allocator, raw) catch |err| {
+            std.debug.print("FAIL: core_index={d} err={}\n", .{ case.core_index, err });
             return err;
         };
+        defer ps.deinit(allocator);
+        try testing.expectEqual(@as(u32, 2), ps.psbtVersion());
+        const again = try psbt.serialize(allocator, ps);
+        defer allocator.free(again);
+        try testing.expectEqualSlices(u8, raw, again);
+        var tx = try ps.unsignedTx(allocator);
+        tx.deinit(allocator);
     }
 }

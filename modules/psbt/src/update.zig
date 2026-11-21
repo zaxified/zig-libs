@@ -58,7 +58,7 @@ pub const CreateError = Allocator.Error || error{
     UnsignedTxHasWitness,
 };
 
-pub const UpdateError = psbt.RecordError || bitcointx.tx.DeserializeError || Allocator.Error || error{
+pub const UpdateError = psbt.RecordError || psbt.UnsignedTxError || Allocator.Error || error{
     InputIndexOutOfRange,
     OutputIndexOutOfRange,
     /// `setInputNonWitnessUtxo`: the transaction does not hash to the txid the

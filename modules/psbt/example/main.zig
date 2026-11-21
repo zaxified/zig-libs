@@ -254,7 +254,7 @@ pub fn main() !void {
         var versioned = try buildSkeleton(gpa, utx_bytes);
         defer versioned.deinit(gpa);
         var bad_version: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bad_version, 2, .little);
+        std.mem.writeInt(u32, &bad_version, 3, .little);
         versioned.global = try replaceMap(gpa, versioned.global, &.{
             .{ .keytype = psbt.global_key.VERSION, .keydata = &.{}, .value = &bad_version },
         });
@@ -264,7 +264,7 @@ pub fn main() !void {
         if (psbt.parse(gpa, versioned_wire)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
-            error.UnsupportedPsbtVersion => std.debug.print("PSBT_GLOBAL_VERSION=2: UnsupportedPsbtVersion (expected)\n", .{}),
+            error.UnsupportedPsbtVersion => std.debug.print("PSBT_GLOBAL_VERSION=3: UnsupportedPsbtVersion (expected)\n", .{}),
             else => return err,
         }
     }

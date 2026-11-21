@@ -24,9 +24,9 @@
 //! (1) a genuine BIP174 gap this module had -- `PSBT_GLOBAL_VERSION`
 //! was checked for shape but never for value, though BIP174 §"Version 0" requires it be 0
 //! if present; now fixed in `root.zig` (`error.UnsupportedPsbtVersion`) -- `invalid[19]` is the
-//! external oracle for that fix. (2) The rest of Core's "invalid" set that this module still
-//! accepts is uniformly BIP370 (PSBTv2)/BIP371 (Taproot single-sig)/MuSig2 field content --
-//! explicitly out of this module's stated scope (SPEC.md), not bugs; each entry below is
+//! external oracle for that fix. (2) The rest of Core's "invalid" set was BIP370 (PSBTv2)/BIP371 (Taproot single-sig)/MuSig2
+//! field content, once outside this module's scope; BIP371, BIP373 and BIP370 are now all
+//! validated and every entry is a reject (see `core_kat_test.zig`); each entry below is
 //! tagged with which. (The two TXID-of-NON_WITNESS_UTXO-matches-prevout entries originally
 //! bucketed here as §"Signer"-role are the exception, reclassified -- see
 //! `invalid_utxo_binding`.) (3) One of Core's "valid" vectors (`valid[5]`) hits the SAME documented
@@ -65,11 +65,9 @@ pub const invalid_v0_scope = [_]Case{
 
 pub const OutOfScopeCase = struct { core_index: usize, hex: []const u8, reason: []const u8 };
 
-/// Core `invalid[N]` entries whose violation is BIP370/BIP371/MuSig2/Signer-role
-/// content this module deliberately does not validate (see SPEC.md's scope cuts).
-/// `psbt.parse` currently ACCEPTS every one of these -- correctly, per that scope cut,
-/// not a bug. `reason`: "taproot" (BIP371 single-sig field shape/content), "psbtv2_*_mix"
-/// (BIP370 field coexisting with/instead of the v0 fields this module reads).
+/// Core `invalid[N]` entries the BIP371 field checks and the BIP370 version rules refuse (the
+/// name is from before they did). `reason`: "taproot" (BIP371 single-sig field shape/content),
+/// "psbtv2_*_mix" (a BIP370 field in a version 0 PSBT: `error.FieldNotAllowedInVersion`).
 /// The two UTXO-binding entries that used to be listed here as
 /// "signer_role_consistency" were NOT out of scope — see `invalid_utxo_binding`.
 pub const invalid_out_of_scope = [_]OutOfScopeCase{
@@ -176,9 +174,7 @@ pub const valid_known_ambiguity = [_]Case{
 
 /// Core `valid[N]` entries that are pure PSBTv2 (BIP370) PSBTs -- no
 /// `PSBT_GLOBAL_UNSIGNED_TX` at all, only `PSBT_GLOBAL_TX_VERSION`/`INPUT_COUNT`/
-/// `OUTPUT_COUNT`/etc. Valid to Core (which implements PSBTv2); out of scope for this
-/// module (BIP174 v0 only, SPEC.md), so `psbt.parse` correctly rejects every one of
-/// these with `error.UnsupportedPsbtVersion` -- not a bug.
+/// `OUTPUT_COUNT`/etc. `psbt.parse` accepts every one and reserializes it byte-exact.
 pub const valid_out_of_scope_psbtv2 = [_]Case{
     .{ .core_index = 34, .hex = "70736274ff01020402000000010401010105010201fb040200000000010e200b0ad921419c1c8719735d72dc739f9ea9e0638d1fe4c1eef0f9944084815fc8010f0400000000000103080008af2f000000000104160014c430f64c4756da310dbd1a085572ef299926272c000103088bbdeb0b0000000001041600144dd193ac964a56ac1b9e1cca8454fe2f474f851300" },
     .{ .core_index = 35, .hex = "70736274ff01020402000000010401010105010201fb0402000000000100520200000001c1aa256e214b96a1822f93de42bff3b5f3ff8d0519306e3515d7515a5e805b120000000000ffffffff0118c69a3b00000000160014b0a3af144208412693ca7d166852b52db0aef06e0000000001011f18c69a3b00000000160014b0a3af144208412693ca7d166852b52db0aef06e010e200b0ad921419c1c8719735d72dc739f9ea9e0638d1fe4c1eef0f9944084815fc8010f040000000000220202d601f84846a6755f776be00e3d9de8fb10acc935fb83c45fb0162d4cad5ab79218f69d873e540000800100008000000080000000002a0000000103080008af2f000000000104160014c430f64c4756da310dbd1a085572ef299926272c00220202e36fbff53dd534070cf8fd396614680f357a9b85db7340bf1cfa745d2ad7b34018f69d873e54000080010000800000008001000000640000000103088bbdeb0b0000000001041600144dd193ac964a56ac1b9e1cca8454fe2f474f851300" },

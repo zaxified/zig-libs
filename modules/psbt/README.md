@@ -1,7 +1,7 @@
 # psbt
 
-BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization, the Creator and
-Updater roles (`fromUnsignedTx`, typed `set*` functions), BIP371 taproot fields, Base64 I/O, the Combiner
+BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 and BIP370 v2 — binary (de)serialization, the Creator and
+Updater roles (`fromUnsignedTx`, typed `set*` functions), the v2 Constructor (`psbt.v2`), BIP371 taproot fields, Base64 I/O, the Combiner
 role, and (via the sibling `bitcoinscript` Script interpreter) the Input Finalizer and Transaction
 Extractor roles, built on `bitcointx` for the embedded unsigned transaction / UTXO tx bodies. Parses
 untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what is not
@@ -127,9 +127,9 @@ this module cannot accept (a `bitcointx`-inherited wire-format ambiguity, not a 
 accounting are in `SPEC.md` "Verification".
 
 Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external oracle,
-`core_kat_vectors.zig`/`core_kat_test.zig`): a present `PSBT_GLOBAL_VERSION` must be `0` (BIP174
-§"Version 0"), Core's BIP371 taproot-field and BIP373 MuSig2 defects are rejected, and the BIP370 content this module
-deliberately does not validate is asserted as accepted passthrough.
+`core_kat_vectors.zig`/`core_kat_test.zig`): `PSBT_GLOBAL_VERSION` must be 0 or 2, Core's BIP371 taproot-field and BIP373 MuSig2 defects are rejected, the BIP370
+field mixes are refused, and Core's pure-PSBTv2 valid vectors parse. The BIP's own BIP370 vectors are in
+`bip370_test.zig`.
 
 The two spend shapes neither BIP174 nor Core's JSON reach, native P2WPKH and native P2WSH 2-of-3
 multisig, are anchored by captures from a real Bitcoin Core regtest node
