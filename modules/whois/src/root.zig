@@ -28,6 +28,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const netaddr = @import("netaddr");
+const unitext = @import("unitext");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -42,7 +43,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere
     .model_after = "RFC 3912 whois; IANA/registry referral chain",
-    .deps = .{"netaddr"}, // special-use address classification for the referral SSRF guard
+    .deps = .{ "netaddr", "unitext" }, // netaddr: special-use address classification for the referral SSRF guard; unitext: IDNA for `idnQuery`
 };
 
 // ── constants ───────────────────────────────────────────────────────────────
@@ -81,6 +82,38 @@ pub fn formatQuery(buf: []u8, query: []const u8) QueryError![]const u8 {
     return buf[0 .. query.len + 2];
 }
 
+/// Stack scratch `idnQuery` hands to `unitext.idna` (a query is at most `max_query_len` bytes).
+const idn_scratch_bytes = 32 * 1024;
+
+/// IDN conversion of a query, as the reference `whois` client does (it runs libidn2 over a
+/// query): a query that is ONE token (no space) with a byte >= 0x80 is converted by UTS #46
+/// `toAscii` (`unitext.idna`; each non-ASCII label becomes `xn--` + Punycode) into `buf` and
+/// returned; any other query (all ASCII, or several words: a flag plus a name, an organisation)
+/// is returned unchanged, the same slice. A Unicode domain reaches most port-43 servers as
+/// raw UTF-8 otherwise, which they reject.
+///
+/// `error.InvalidQuery`: not well-formed UTF-8, or UTS #46 refuses the name (`InvalidDomain`);
+/// `error.QueryTooLong`: the A-label form is longer than `max_query_len` or `buf`. The result is
+/// not CR/LF-checked here: `formatQuery` does that on the way to the wire.
+pub fn idnQuery(buf: []u8, query: []const u8, opts: unitext.idna.Options) QueryError![]const u8 {
+    if (std.mem.findScalar(u8, query, ' ') != null) return query;
+    if (isAsciiOnly(query)) return query;
+    var scratch: [idn_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const out = unitext.idna.toAscii(fba.allocator(), query, opts) catch |e| switch (e) {
+        error.OutOfMemory, error.TooLarge => return error.QueryTooLong,
+        error.InvalidUtf8, error.InvalidDomain => return error.InvalidQuery,
+    };
+    if (out.len > max_query_len or out.len > buf.len) return error.QueryTooLong;
+    @memcpy(buf[0..out.len], out);
+    return buf[0..out.len];
+}
+
+fn isAsciiOnly(s: []const u8) bool {
+    for (s) |c| if (c >= 0x80) return false;
+    return true;
+}
+
 /// Documented ARIN convenience: `n <ip>` restricts the match to network
 /// objects (plain `<ip>` also works but can return multiple records).
 pub fn arinIpQuery(buf: []u8, ip_text: []const u8) QueryError![]const u8 {
@@ -91,6 +124,23 @@ pub fn arinIpQuery(buf: []u8, ip_text: []const u8) QueryError![]const u8 {
 /// domain records (a bare name can fuzzy-match nameserver/registrar objects).
 pub fn verisignDomainQuery(buf: []u8, domain: []const u8) QueryError![]const u8 {
     return prefixedQuery(buf, "domain ", domain);
+}
+
+/// Documented DENIC convenience: `-T dn,ace <name>` makes whois.denic.de answer a `.de` domain
+/// with the full record (holder, contacts, name servers) and the ACE form of the name; a bare
+/// name returns only the status line. The reference `whois` client adds the same switches.
+pub fn denicDomainQuery(buf: []u8, domain: []const u8) QueryError![]const u8 {
+    return prefixedQuery(buf, "-T dn,ace ", domain);
+}
+
+/// Documented JPNIC convenience: `<ip>/e` makes whois.nic.ad.jp answer in English instead of
+/// Japanese (JPNIC's own usage text: "add '/e' at the end").
+pub fn jpnicEnglishQuery(buf: []u8, ip_text: []const u8) QueryError![]const u8 {
+    if (ip_text.len > max_query_len - 2 or buf.len < ip_text.len + 4) return error.QueryTooLong;
+    for (ip_text) |c| if (c == '\r' or c == '\n') return error.InvalidQuery;
+    @memcpy(buf[0..ip_text.len], ip_text);
+    @memcpy(buf[ip_text.len..][0..4], "/e\r\n");
+    return buf[0 .. ip_text.len + 4];
 }
 
 fn prefixedQuery(buf: []u8, prefix: []const u8, rest: []const u8) QueryError![]const u8 {
@@ -496,6 +546,10 @@ pub const LookupOptions = struct {
     /// reference `whois` client does. Set false to send `query` verbatim to
     /// every hop.
     per_server_syntax: bool = true,
+    /// Convert a Unicode domain query to its A-label form first (`idnQuery`), as the reference
+    /// `whois` client does. Null (the default) sends the query as given: raw UTF-8, which most
+    /// port-43 servers reject. `.{}` is the WHATWG defaults of `unitext.idna.Options`.
+    idna: ?unitext.idna.Options = null,
 };
 
 /// Hop-aware query formatting used by `lookup`. Known registries get their
@@ -512,6 +566,11 @@ pub fn serverQuery(buf: []u8, server: []const u8, query: []const u8) QueryError!
         if (std.ascii.eqlIgnoreCase(host, "whois.verisign-grs.com") and
             std.mem.findScalar(u8, query, '.') != null and netaddr.parseIp(query) == null)
             return verisignDomainQuery(buf, query);
+        if (std.ascii.eqlIgnoreCase(host, "whois.denic.de") and
+            std.mem.findScalar(u8, query, '.') != null and netaddr.parseIp(query) == null)
+            return denicDomainQuery(buf, query);
+        if (std.ascii.eqlIgnoreCase(host, "whois.nic.ad.jp") and netaddr.parseIp(query) != null)
+            return jpnicEnglishQuery(buf, query);
     }
     return formatQuery(buf, query);
 }
@@ -570,10 +629,12 @@ pub const LookupError = QueryError || TransportError || error{
 /// `error.ResponseTooLarge` rather than truncate).
 pub fn lookup(
     transport: Transport,
-    query: []const u8,
+    raw_query: []const u8,
     opts: LookupOptions,
     response_buf: []u8,
 ) LookupError!Lookup {
+    var idn_buf: [max_query_len]u8 = undefined;
+    const query = if (opts.idna) |o| try idnQuery(&idn_buf, raw_query, o) else raw_query;
     var query_buf: [max_query_len + 2]u8 = undefined;
     const wire = try formatQuery(&query_buf, query);
 
@@ -834,10 +895,7 @@ pub const TcpTransport = struct {
 /// shape as `probe`'s `resolveAll` (`modules/probe/src/root.zig:837`).
 fn anyResolvedIsSpecialUse(addrs: []const std.Io.net.IpAddress) bool {
     for (addrs) |addr| {
-        const ip: netaddr.Ip = switch (addr) {
-            .ip4 => |a| .{ .v4 = a.bytes },
-            .ip6 => |a| .{ .v6 = a.bytes },
-        };
+        const ip = netaddr.Ip.fromStd(addr);
         if (isSpecialUseIp(ip)) return true;
     }
     return false;
@@ -1133,6 +1191,23 @@ test "lookup: per_server_syntax=false sends the bare query to every hop" {
     try testing.expectEqual(@as(usize, 3), scripted.call_count);
     for (scripted.calls[0..scripted.call_count]) |*c|
         try testing.expectEqualStrings("example.com\r\n", c.queryText());
+}
+
+test "serverQuery: DENIC and JPNIC flags, only for the query kind they are documented for" {
+    var b: [128]u8 = undefined;
+    try testing.expectEqualStrings("-T dn,ace example.de\r\n", try serverQuery(&b, "whois.denic.de", "example.de"));
+    try testing.expectEqualStrings("-T dn,ace xn--bcher-kva.de\r\n", try serverQuery(&b, "WHOIS.DENIC.DE.", "xn--bcher-kva.de"));
+    try testing.expectEqualStrings("192.0.2.1\r\n", try serverQuery(&b, "whois.denic.de", "192.0.2.1"));
+    try testing.expectEqualStrings("AS64496\r\n", try serverQuery(&b, "whois.denic.de", "AS64496"));
+    try testing.expectEqualStrings("-T dn example.de\r\n", try serverQuery(&b, "whois.denic.de", "-T dn example.de")); // already has flags: sent as is
+    try testing.expectEqualStrings("192.0.2.1/e\r\n", try serverQuery(&b, "whois.nic.ad.jp", "192.0.2.1"));
+    try testing.expectEqualStrings("2001:db8::1/e\r\n", try serverQuery(&b, "whois.nic.ad.jp", "2001:db8::1"));
+    try testing.expectEqualStrings("AS64496\r\n", try serverQuery(&b, "whois.nic.ad.jp", "AS64496")); // AS lookups need JPNIC's advanced syntax
+    try testing.expectEqualStrings("192.0.2.1\r\n", try serverQuery(&b, "whois.ripe.net", "192.0.2.1"));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.QueryTooLong, serverQuery(&tiny, "whois.nic.ad.jp", "192.0.2.1"));
+    try testing.expectError(error.QueryTooLong, serverQuery(&tiny, "whois.denic.de", "example.de"));
+    try testing.expectError(error.InvalidQuery, jpnicEnglishQuery(&b, "1.2.3.4\r\nx"));
 }
 
 test "serverQuery: ARIN n-flag for IPs, Verisign domain-flag for names, bare elsewhere" {
@@ -2237,4 +2312,46 @@ test "TcpTransport: a canceled bounded read (timeout_ms set) surfaces error.Canc
     const result = fut.cancel(io);
     try testing.expect(reached);
     try testing.expectError(error.Canceled, result);
+}
+
+test "idnQuery: a Unicode domain becomes its A-label form, everything else passes through unchanged" {
+    var buf: [max_query_len]u8 = undefined;
+    // Straight from UTS #46 / IdnaTestV2 and RFC 3492 style vectors.
+    try testing.expectEqualStrings("xn--bcher-kva.example", try idnQuery(&buf, "b\xc3\xbccher.example", .{}));
+    try testing.expectEqualStrings("xn--mnchen-3ya.de", try idnQuery(&buf, "M\xc3\xbcnchen.de", .{})); // mapped to lower case first
+    try testing.expectEqualStrings("xn--e1afmkfd.xn--p1ai", try idnQuery(&buf, "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80.\xd1\x80\xd1\x84", .{}));
+    // Pass-through: ASCII, an IP, a flag plus a name, an organisation with a non-ASCII letter.
+    const same = [_][]const u8{ "example.com", "192.0.2.1", "AS64500", "-r example.com", "org M\xc3\xbcller GmbH", "" };
+    for (same) |q| {
+        const got = try idnQuery(&buf, q, .{});
+        try testing.expectEqual(q.ptr, got.ptr);
+        try testing.expectEqual(q.len, got.len);
+    }
+    // Refusals.
+    try testing.expectError(error.InvalidQuery, idnQuery(&buf, "bad\xffutf8.example", .{}));
+    try testing.expectError(error.InvalidQuery, idnQuery(&buf, "a..\xc3\xbc", .{ .verify_dns_length = true }));
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.QueryTooLong, idnQuery(&tiny, "b\xc3\xbccher.example", .{}));
+}
+
+test "lookup with LookupOptions.idna sends the A-label form to every hop; without it the bytes go as given" {
+    const Rec = struct {
+        var seen: [64]u8 = undefined;
+        var len: usize = 0;
+        fn exchange(_: *anyopaque, _: []const u8, _: u16, query: []const u8, out: []u8) TransportError!usize {
+            len = @min(query.len, seen.len);
+            @memcpy(seen[0..len], query[0..len]);
+            const reply = "domain: x\n";
+            @memcpy(out[0..reply.len], reply);
+            return reply.len;
+        }
+    };
+    var dummy: u8 = 0;
+    const t: Transport = .{ .ctx = &dummy, .exchangeFn = Rec.exchange };
+    var resp: [256]u8 = undefined;
+    _ = try lookup(t, "b\xc3\xbccher.example", .{ .root = "whois.example", .idna = .{} }, &resp);
+    try testing.expectEqualStrings("xn--bcher-kva.example\r\n", Rec.seen[0..Rec.len]);
+    _ = try lookup(t, "b\xc3\xbccher.example", .{ .root = "whois.example" }, &resp);
+    try testing.expectEqualStrings("b\xc3\xbccher.example\r\n", Rec.seen[0..Rec.len]);
+    try testing.expectError(error.InvalidQuery, lookup(t, "bad\xff.example", .{ .root = "whois.example", .idna = .{} }, &resp));
 }

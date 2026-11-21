@@ -40,7 +40,10 @@ _ = whois.parseServerRef("whois://h.example:43"); // handles whois:// URL form
 _ = whois.fieldValue(reply, "Registrar WHOIS Server"); // ?[]const u8, trimmed
 
 // Per-hop syntax (used by lookup; LookupOptions.per_server_syntax = false to disable)
-_ = try whois.serverQuery(&qbuf, "whois.arin.net", "192.0.2.1"); // "n 192.0.2.1\r\n"
+_ = try whois.serverQuery(&qbuf, "whois.arin.net", "192.0.2.1"); // "n 192.0.2.1\r\n" (ARIN, Verisign, DENIC, JPNIC flags)
+
+// Unicode domains: LookupOptions.idna = .{} converts the query to xn-- form (UTS #46) first
+_ = try whois.idnQuery(&qbuf, "b\xc3\xbccher.example", .{}); // "xn--bcher-kva.example"
 
 // Full lookup with referral chasing over a caller-provided transport seam
 var buf: [16 * 1024]u8 = undefined; // per-response byte cap

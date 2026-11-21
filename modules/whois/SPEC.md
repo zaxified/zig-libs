@@ -29,7 +29,7 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot); s
 | [saidutt46/domain-check](https://github.com/saidutt46/domain-check) | Rust | NOASSERTION (not read) | 308 | push 2026-09-29 | A domain-availability tool: "RDAP with WHOIS fallback", CLI + Rust library. Shows where Rust users go for WHOIS: a bundled tool, not a protocol crate *(no standalone protocol crate above 100 stars found in a `whois language:rust` search)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | `std` has none; GitHub search `whois language:zig` returned no repository on 2026-09-30. |
 
-**Where we are ahead:** the only WHOIS client in Zig (search above); zero-allocation and I/O-agnostic (`Transport` seam); the referral chase is bounded on depth, cycles and response size and refuses special-use referral targets (also after resolution in `TcpTransport`), which neither README above describes; CRLF-injection-proof query formatting · **Where we are behind:** per-server query syntax covers only ARIN and Verisign (the reference client has more flags), no IDN/punycode conversion (→ Backlog), no built-in TLD→server table (relies on the IANA hop), no reply parsing beyond referral keys (both by design, see *What is deliberately not done*).
+**Where we are ahead:** the only WHOIS client in Zig (search above); zero-allocation and I/O-agnostic (`Transport` seam); the referral chase is bounded on depth, cycles and response size and refuses special-use referral targets (also after resolution in `TcpTransport`), which neither README above describes; CRLF-injection-proof query formatting · **Where we are behind:** per-server query syntax covers ARIN, Verisign, DENIC and JPNIC (the reference client has a few more), IDN conversion is opt-in (`LookupOptions.idna` / `idnQuery`, `unitext.idna`), no built-in TLD→server table (relies on the IANA hop), no reply parsing beyond referral keys (both by design, see *What is deliberately not done*).
 
 ## Design & invariants
 Transport seam, zero allocation: `Transport` is one function — connect to `server:port`, send the
@@ -45,7 +45,9 @@ format; `fieldValue` (case-insensitive key, trimmed value) is the only concessio
 `parseServerRef` never error on garbage. Query safety: `formatQuery` rejects embedded CR/LF (would
 inject a second WHOIS command) and enforces `max_query_len`. Reentrant — no shared state anywhere.
 
-Per-hop query syntax: `serverQuery(buf, server, query)` is what `lookup` uses for each hop (`LookupOptions.per_server_syntax`, default `true`; `false` sends `query` verbatim to every hop). Following the reference client's per-server flags: `whois.arin.net` gets `n <ip>` for an IP literal, `whois.verisign-grs.com` gets `domain <name>` for a dotted non-IP name; any other server, any other query kind (ASN, handle) and any query that already contains a space get the bare query. The host comparison is ASCII case-insensitive and ignores one trailing dot. Only these two registries' flags are built in; the others the reference client knows (DENIC, JPNIC) are not added, only inferred (see Backlog).
+Per-hop query syntax: `serverQuery(buf, server, query)` is what `lookup` uses for each hop (`LookupOptions.per_server_syntax`, default `true`; `false` sends `query` verbatim to every hop). Following the reference client's per-server flags: `whois.arin.net` gets `n <ip>` for an IP literal, `whois.verisign-grs.com` gets `domain <name>` for a dotted non-IP name; any other server, any other query kind (ASN, handle) and any query that already contains a space get the bare query. The host comparison is ASCII case-insensitive and ignores one trailing dot. `whois.denic.de` gets `-T dn,ace <name>` for a dotted non-IP name (full record plus the ACE form; the switches the reference client adds; seen in jwhois's configuration, `domainr/whois` and the Haskell `whois` package, the same string everywhere), and `whois.nic.ad.jp` gets `<ip>/e` for an IP literal (English output; JPNIC's own usage text; AS lookups need JPNIC's advanced syntax and stay bare). Only these four registries' flags are built in; others are not added unless a documented syntax is found (`serverQuery` is the one place for a table entry).
+
+**IDN (`LookupOptions.idna`, `idnQuery`).** A Unicode domain reaches most port-43 servers as raw UTF-8 and is rejected; the reference client converts through libidn2. `idnQuery(buf, query, opts)` converts ONE-token queries with a byte >= 0x80 by UTS #46 `toAscii` (`unitext.idna`: each non-ASCII label becomes `xn--` + Punycode); an ASCII query, an IP, a flag plus a name and an organisation with a non-ASCII letter pass through unchanged. `InvalidQuery` for ill-formed UTF-8 or a name UTS #46 refuses, `QueryTooLong` past `max_query_len`. `LookupOptions.idna = null` (default) sends the query as given; `.{}` (the WHATWG defaults of `unitext.idna.Options`) converts before the first hop, so every hop sees the A-label form. Opt-in as in `dns` (`Options.idna`), so existing callers' bytes do not change.
 Clean-room from RFC 3912 plus the documented IANA/registry referral-line conventions (IANA `refer:`,
 ARIN `ReferralServer:`, Verisign `Registrar WHOIS Server:`, the `whois://` URL form) — no third-party
 whois implementation consulted or copied; nothing to attribute (the module-local `NOTICE` is a
@@ -108,8 +110,7 @@ Run: `scripts/modtest whois` (the `whois` build step; the module is tagged `timi
 
 ## Backlog / deferred
 
-- **IDN (punycode/UTS #46) conversion of the query** *(survey 2026-09-30)*. A Unicode domain reaches the registry as raw UTF-8, which most port-43 servers reject; the reference client converts. Effort: medium; there is no sibling punycode/IDNA module in `modules/`. Fits CONVENTIONS §2.
-- **Per-server flags for further registries (DENIC, JPNIC-style switches).** Not added because the syntax is only inferred, not read from a source; `serverQuery` is the one place to add a table entry.
+None open.
 
 ## Anchoring
 
