@@ -54,7 +54,8 @@ scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
   -Mdatefmt=modules/datefmt/src/root.zig \
   -Mchachapoly=modules/chachapoly/src/root.zig \
   -Mcrc32c=modules/crc32c/src/root.zig \
-  --dep p256 --dep chachapoly --dep entropy --dep p521 --dep aesgcm --dep p384 --dep ct25519 --dep mlkem -Mhpke=modules/hpke/src/root.zig \
+  --dep entropy -Med448=modules/ed448/src/root.zig \
+  --dep p256 --dep chachapoly --dep entropy --dep p521 --dep aesgcm --dep p384 --dep ct25519 --dep mlkem --dep ed448 -Mhpke=modules/hpke/src/root.zig \
   --dep netaddr --dep crc32c -Mproxyproto=modules/proxyproto/src/root.zig \
   --dep rsa --dep ct25519 --dep p256 --dep p384 --dep p521 --dep mlkem --dep montint -Mtls13=modules/tls13/src/root.zig \
   --dep tls13 --dep aesgcm --dep chachapoly --dep netaddr --dep x509 --dep rsa --dep keycodec --dep tlsresume --dep p521 --dep hpke -Mtlsserver=modules/tlsserver/src/root.zig
