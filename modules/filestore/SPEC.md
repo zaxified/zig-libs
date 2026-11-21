@@ -185,7 +185,8 @@ Accepted, none a data-integrity defect of a returned write:
   bytes under the new deadline.
 - `list`/`iterate` include expired-unswept records (by design: `sweep` relies on it).
 - `list`/`listTyped` materialise every name (`listTyped` every record's bytes) in the caller's arena;
-  `iterate`/`iteratePrefix` walk keys without that.
+  `iterate`/`iteratePrefix` walk keys, and `iterateTyped`/`iterateTypedPrefix` records, one at a time without that
+  (a per-record arena reset between calls bounds the memory).
 - A FIFO planted at a record path blocks the opening call.
 - A caller that wraps `lockKey` around `casPutBytes`/`putWithTTL` self-deadlocks (the `flock` is per open
   file description).
@@ -199,7 +200,7 @@ Run `scripts/modtest filestore` (tests are disk-bound: every write is durable). 
 - **Layout and safety:** `segmentSafe` on every public entry point, the 128-byte name edge, `writeFileAtomic`,
   hostile `base` contents (a directory where a record or sidecar is expected, foreign names, a corrupt or
   oversized sidecar) never a crash, a stray `.part` temp invisible to `list`/`get`.
-- **Records:** put/get/delete/list round trips, typed JSON and `listTyped`'s skip count, `putManyBytes`
+- **Records:** put/get/delete/list round trips, typed JSON, `listTyped`'s skip count and `iterateTyped` (reset arena, prefix, skipped, missing kind), `putManyBytes`
   validating the whole batch before writing, the 64 MiB edge, `iterate`/`listPrefix`/`has`/`eraseKind`,
   streaming `createTemp`/`commit`/`openRecord`, `importFile` (copy and move, permissions, non-regular
   source refused), `encodeKey`/`decodeKey` round trip and uniqueness.
@@ -233,8 +234,7 @@ Run `scripts/modtest filestore` (tests are disk-bound: every write is durable). 
 
 ## Backlog / deferred
 
-- **`listTyped` iterator or paged form:** `listTyped` still materialises every record's bytes in the
-  caller's arena (keys have `iterate`/`iteratePrefix`).
+None open.
 
 ## Anchoring
 

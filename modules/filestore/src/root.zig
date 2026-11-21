@@ -882,20 +882,65 @@ pub const Store = struct {
     /// *counted* (`skipped`), never silently discarded via a bare
     /// `catch continue`. Allocations in `arena`.
     pub fn listTyped(self: Store, comptime T: type, arena: std.mem.Allocator, kind: []const u8) !struct { items: []T, skipped: usize } {
-        const keys = try self.list(arena, kind);
+        var it = try self.iterateTyped(T, kind);
+        defer it.deinit();
         var items: std.ArrayList(T) = .empty;
-        var skipped: usize = 0;
-        for (keys) |key| {
-            // A key could vanish between `list` and here (concurrent delete);
-            // treat that the same as "not present in this snapshot".
-            const bytes = (try self.getBytes(arena, kind, key)) orelse continue;
-            const value = std.json.parseFromSliceLeaky(T, arena, bytes, .{}) catch {
-                skipped += 1;
-                continue;
-            };
-            try items.append(arena, value);
-        }
-        return .{ .items = try items.toOwnedSlice(arena), .skipped = skipped };
+        while (try it.next(arena)) |entry| try items.append(arena, entry.value);
+        return .{ .items = try items.toOwnedSlice(arena), .skipped = it.skipped };
+    }
+
+    /// One record of a `TypedIterator`: its key (valid until the next call to
+    /// `next` or `deinit`) and the parsed value (allocated in the arena given to `next`).
+    pub fn TypedEntry(comptime T: type) type {
+        return struct { key: []const u8, value: T };
+    }
+
+    /// `listTyped` one record at a time: only the current record's bytes and
+    /// value are alive, so a caller with a per-record arena (reset between
+    /// calls) walks a kind of any size in bounded memory. Same filter as
+    /// `list`; unparseable records are skipped and counted in `skipped`, a
+    /// record that vanished since the directory was read is skipped silently.
+    /// Call `deinit`.
+    pub fn TypedIterator(comptime T: type) type {
+        return struct {
+            store: Store,
+            kind: []const u8,
+            keys: KeyIterator,
+            /// Records whose bytes did not parse as `T`, so far.
+            skipped: usize = 0,
+
+            /// The next record that parses, or null at the end. `arena` receives
+            /// the record's bytes and everything `T` holds.
+            pub fn next(it: *@This(), arena: std.mem.Allocator) !?TypedEntry(T) {
+                while (try it.keys.next()) |key| {
+                    // A key could vanish between the directory read and here
+                    // (concurrent delete): "not present in this snapshot".
+                    const bytes = (try it.store.getBytes(arena, it.kind, key)) orelse continue;
+                    const value = std.json.parseFromSliceLeaky(T, arena, bytes, .{}) catch {
+                        it.skipped += 1;
+                        continue;
+                    };
+                    return .{ .key = key, .value = value };
+                }
+                return null;
+            }
+
+            pub fn deinit(it: *@This()) void {
+                it.keys.deinit();
+            }
+        };
+    }
+
+    /// Walk a kind's records parsed as `T`, one at a time — see `TypedIterator`.
+    /// A missing kind directory is an empty walk.
+    pub fn iterateTyped(self: Store, comptime T: type, kind: []const u8) !TypedIterator(T) {
+        return self.iterateTypedPrefix(T, kind, "");
+    }
+
+    /// `iterateTyped`, keeping only keys that start with `prefix` (borrowed for
+    /// the iterator's lifetime).
+    pub fn iterateTypedPrefix(self: Store, comptime T: type, kind: []const u8, prefix: []const u8) !TypedIterator(T) {
+        return .{ .store = self, .kind = kind, .keys = try self.iteratePrefix(kind, prefix) };
     }
 };
 
@@ -1552,6 +1597,46 @@ test "typed JSON: put/get round-trip" {
     try store.put(gpa, TestRecord, "records", "r1", .{ .id = "r1", .count = 8 });
     const rec2 = (try store.get(TestRecord, arena, "records", "r1")).?;
     try t.expectEqual(@as(u32, 8), rec2.count);
+}
+
+test "iterateTyped: one record at a time with a reset arena, prefix filter, skipped count, missing kind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    try store.put(gpa, TestRecord, "records", "a1", .{ .id = "a1", .count = 1 });
+    try store.put(gpa, TestRecord, "records", "a2", .{ .id = "a2", .count = 2 });
+    try store.put(gpa, TestRecord, "records", "b1", .{ .id = "b1", .count = 3 });
+    try store.putBytes("records", "a3", "{not json");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var it = try store.iterateTyped(TestRecord, "records");
+    defer it.deinit();
+    var sum: u64 = 0;
+    var n: usize = 0;
+    while (try it.next(arena_state.allocator())) |e| {
+        try t.expectEqualStrings(e.value.id, e.key);
+        sum += e.value.count;
+        n += 1;
+        _ = arena_state.reset(.retain_capacity); // only the current record is alive
+    }
+    try t.expectEqual(@as(usize, 3), n);
+    try t.expectEqual(@as(u64, 6), sum);
+    try t.expectEqual(@as(usize, 1), it.skipped);
+
+    var pit = try store.iterateTypedPrefix(TestRecord, "records", "a");
+    defer pit.deinit();
+    var pn: usize = 0;
+    while (try pit.next(arena_state.allocator())) |_| pn += 1;
+    try t.expectEqual(@as(usize, 2), pn);
+    try t.expectEqual(@as(usize, 1), pit.skipped);
+
+    var none = try store.iterateTyped(TestRecord, "nope");
+    defer none.deinit();
+    try t.expect((try none.next(arena_state.allocator())) == null);
+    try t.expectError(error.InvalidName, store.iterateTyped(TestRecord, "../x"));
 }
 
 test "listTyped: parses every record, tolerantly skips corrupt JSON, reports count" {

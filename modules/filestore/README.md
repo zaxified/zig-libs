@@ -50,6 +50,8 @@ const keys = try store.list(arena, "devices");               // [][]const u8
 try store.put(gpa, MyRecord, "devices", "dev-1", value);
 const rec = try store.get(MyRecord, arena, "devices", "dev-1");         // ?MyRecord
 const all = try store.listTyped(MyRecord, arena, "devices");            // struct{ items: []MyRecord, skipped: usize }
+var it = try store.iterateTyped(MyRecord, "devices");                   // one record per next(arena); it.skipped counts the unparseable
+defer it.deinit();
 
 // TTL / expiry — wall-clock via store.clock (injectable in tests)
 // store.ttl = false;  // opt out: skip the .expiry probe on every getBytes
