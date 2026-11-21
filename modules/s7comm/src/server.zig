@@ -66,6 +66,16 @@ pub const Config = struct {
     /// SZL `0x0232` index `0x0004` (protection). Null: the list is answered
     /// "not available".
     protection: ?userdata.Protection = null,
+    /// Blocks reported by the block services (group 3). Every bound DB area
+    /// is listed as well (load and MC7 size = its length) unless an entry here
+    /// names the same DB, which then wins. Empty and no DB bound: the lists are
+    /// empty and `GetBlockInfo` answers "object does not exist".
+    blocks: []const userdata.BlockInfo = &.{},
+    /// Largest payload of one Userdata answer PDU; a longer answer (a long SZL
+    /// list, many blocks) goes out in several PDUs the client collects with
+    /// follow-up requests. Zero: whatever the negotiated PDU length leaves
+    /// (480 octets: 454). A small value forces fragmentation in tests.
+    max_userdata_payload: u16 = 0,
 };
 
 /// A caller-supplied clock for the time-of-day services.
@@ -98,6 +108,22 @@ pub const Responder = struct {
     /// a clear-password request, a failed set, and a COTP connect or
     /// disconnect (a legitimation belongs to one connection).
     legitimated: bool = false,
+    /// A multi-PDU Userdata answer in progress: what the next follow-up
+    /// request continues. Cleared by a COTP connect or disconnect and by any
+    /// request that is not the follow-up.
+    cont: ?Continuation = null,
+
+    const Continuation = struct {
+        const Kind = enum { szl, list };
+        kind: Kind,
+        group: userdata.FunctionGroup,
+        sub: u8,
+        id: u16 = 0,
+        index: u16 = 0,
+        block_type: userdata.BlockType = .db,
+        offset: usize = 0,
+        sequence: u8 = 0,
+    };
 
     pub fn init(config: Config, areas: []const AreaBinding) Responder {
         return .{ .config = config, .areas = areas };
@@ -121,6 +147,7 @@ pub const Responder = struct {
                 self.connected = true;
                 // A legitimation belongs to one connection.
                 self.legitimated = false;
+                self.cont = null;
                 var body: [64]u8 = undefined;
                 // Echo the client's parameters back, which is what a real CPU
                 // does and what makes the rack/slot round trip visible.
@@ -138,6 +165,7 @@ pub const Responder = struct {
             .dr, .dc => {
                 self.connected = false;
                 self.legitimated = false;
+                self.cont = null;
                 return null;
             },
             .dt => |dt| {
@@ -315,13 +343,21 @@ pub const Responder = struct {
         const p = try userdata.Param.decode(pdu.parameters);
         if (p.function_group == .time_functions) return self.handleTime(p, pdu, out);
         if (p.function_group == .security) return self.handleSecurity(p, pdu, out);
+        if (p.function_group == .block_functions) return self.handleBlocks(p, pdu, out);
         if (p.function_group != .cpu_functions or
             p.subfunction != @backingInt(userdata.CpuSubfunction.read_szl))
         {
             return error.Unsupported;
         }
         const block = try userdata.DataBlock.decode(pdu.data);
-        const req = try userdata.SzlRequest.decode(block.payload);
+        var offset: usize = 0;
+        const req: userdata.SzlRequest = if (self.followUp(p, block, .szl)) |c| blk: {
+            offset = c.offset;
+            break :blk .{ .id = c.id, .index = c.index };
+        } else blk: {
+            self.cont = null;
+            break :blk try userdata.SzlRequest.decode(block.payload);
+        };
 
         var payload: [1024]u8 = undefined;
         const szl = switch (req.id) {
@@ -362,23 +398,197 @@ pub const Responder = struct {
             else => null,
         };
 
+        var more = false;
+        var piece: ?[]const u8 = null;
+        if (szl) |s| {
+            const room = self.fragmentRoom();
+            const from = @min(offset, s.len);
+            const to = @min(from + room, s.len);
+            piece = s[from..to];
+            more = to < s.len;
+            self.cont = if (more) .{
+                .kind = .szl,
+                .group = .cpu_functions,
+                .sub = p.subfunction,
+                .id = req.id,
+                .index = req.index,
+                .offset = to,
+                .sequence = p.sequence +% 1,
+            } else null;
+        } else self.cont = null;
+
         var params: [userdata.Param.response_len]u8 = undefined;
         const rp = try (userdata.Param{
             .message_type = .response,
             .function_group = .cpu_functions,
             .subfunction = p.subfunction,
-            .sequence = p.sequence,
-            .last_data_unit = .no_more,
+            .sequence = if (more) p.sequence +% 1 else p.sequence,
+            .last_data_unit = if (more) .more_follows else .no_more,
             .error_code = if (szl == null) 0xD401 else 0,
         }).encodeResponse(&params);
 
         var data: [1040]u8 = undefined;
-        const db = if (szl) |s|
+        const db = if (piece) |s|
             try userdata.DataBlock.encode(.success, .octet_string, s, &data)
         else
             try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
 
         return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
+    }
+
+    /// Payload octets one Userdata answer PDU may carry: the negotiated PDU
+    /// length less the 10-octet header, the 12-octet parameter block and the
+    /// 4-octet data header, capped by `Config.max_userdata_payload`.
+    fn fragmentRoom(self: *const Responder) usize {
+        const pdu: usize = if (self.pdu_length != 0) self.pdu_length else 480;
+        var room: usize = if (pdu > 26) pdu - 26 else 1;
+        if (self.config.max_userdata_payload != 0) room = @min(room, self.config.max_userdata_payload);
+        return @min(room, 1024);
+    }
+
+    /// The pending continuation when `block` is the follow-up request of it:
+    /// an empty request block, the same group and subfunction, the sequence
+    /// octet the previous answer carried.
+    fn followUp(self: *Responder, p: userdata.Param, block: userdata.DataBlock, kind: Continuation.Kind) ?Continuation {
+        const c = self.cont orelse return null;
+        if (c.kind != kind or c.group != p.function_group or c.sub != p.subfunction) return null;
+        if (p.message_type != .request or block.payload.len != 0 or p.sequence != c.sequence) return null;
+        return c;
+    }
+
+    /// Group 3: `ListBlocks`, `ListBlocksOfType`, `GetBlockInfo`. The lists
+    /// come from `Config.blocks` and the bound DB areas.
+    fn handleBlocks(self: *Responder, p: userdata.Param, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        const sub: userdata.BlockSubfunction = @fromBackingInt(p.subfunction);
+        var payload: [1024]u8 = undefined;
+        var result: ?[]const u8 = null;
+        var more = false;
+        var rc: items.ReturnCode = .object_does_not_exist;
+        const db_in = userdata.DataBlock.decode(pdu.data) catch null;
+        if (p.message_type == .request) switch (sub) {
+            .list_all => {
+                var c: userdata.BlockCounts = .{};
+                c.ob = self.countOf(.ob);
+                c.fb = self.countOf(.fb);
+                c.fc = self.countOf(.fc);
+                c.db = self.countOf(.db);
+                c.sdb = self.countOf(.sdb);
+                c.sfc = self.countOf(.sfc);
+                c.sfb = self.countOf(.sfb);
+                result = try c.encode(&payload);
+                self.cont = null;
+            },
+            .list_of_type => if (db_in) |db| {
+                var offset: usize = 0;
+                var t: userdata.BlockType = undefined;
+                if (self.followUp(p, db, .list)) |c| {
+                    offset = c.offset;
+                    t = c.block_type;
+                } else if (userdata.decodeListOfTypeRequest(db.payload)) |bt| {
+                    t = bt;
+                } else |_| {
+                    rc = .data_type_inconsistent;
+                    t = .db;
+                    self.cont = null;
+                    return self.blockAnswer(p, pdu, null, false, rc, out);
+                }
+                const per_pdu = self.fragmentRoom() / userdata.BlockEntry.wire_len;
+                const total: usize = self.countOf(t);
+                var n: usize = 0;
+                var i = offset;
+                while (i < total and n < per_pdu) : (i += 1) {
+                    const b = self.nthBlock(t, i).?;
+                    _ = try (userdata.BlockEntry{ .number = b.number, .flags = b.flags, .language = b.language })
+                        .encode(payload[n * userdata.BlockEntry.wire_len ..]);
+                    n += 1;
+                }
+                result = payload[0 .. n * userdata.BlockEntry.wire_len];
+                more = i < total;
+                self.cont = if (more) .{
+                    .kind = .list,
+                    .group = .block_functions,
+                    .sub = p.subfunction,
+                    .block_type = t,
+                    .offset = i,
+                    .sequence = p.sequence +% 1,
+                } else null;
+            },
+            .block_info => if (db_in) |db| {
+                self.cont = null;
+                if (userdata.decodeBlockInfoRequest(db.payload)) |ref| {
+                    if (self.findBlock(ref.block_type, ref.number)) |info| {
+                        result = try info.encode(&payload);
+                    }
+                } else |_| {
+                    rc = .data_type_inconsistent;
+                }
+            },
+            _ => {},
+        };
+        return self.blockAnswer(p, pdu, result, more, rc, out);
+    }
+
+    fn blockAnswer(self: *Responder, p: userdata.Param, pdu: s7.Pdu, result: ?[]const u8, more: bool, rc: items.ReturnCode, out: []u8) Error![]u8 {
+        var params: [userdata.Param.response_len]u8 = undefined;
+        const rp = try (userdata.Param{
+            .message_type = .response,
+            .function_group = .block_functions,
+            .subfunction = p.subfunction,
+            .sequence = if (more) p.sequence +% 1 else p.sequence,
+            .last_data_unit = if (more) .more_follows else .no_more,
+            .error_code = if (result == null) userdata.ErrorCode.not_available else 0,
+        }).encodeResponse(&params);
+        var data: [1040]u8 = undefined;
+        const db = if (result) |r|
+            try userdata.DataBlock.encode(.success, .octet_string, r, &data)
+        else
+            try userdata.DataBlock.encode(rc, .null_size, &.{}, &data);
+        return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
+    }
+
+    /// Block `n` (0-based) of type `t`: the configured blocks first, then
+    /// the bound DB areas no configured entry names.
+    fn nthBlock(self: *const Responder, t: userdata.BlockType, n: usize) ?userdata.BlockInfo {
+        var seen: usize = 0;
+        for (self.config.blocks) |b| {
+            if (b.block_type != t) continue;
+            if (seen == n) return b;
+            seen += 1;
+        }
+        if (t == .db) for (self.areas) |a| {
+            if (a.area != .db) continue;
+            if (self.configured(.db, a.db_number)) continue;
+            if (seen == n) return areaBlock(a);
+            seen += 1;
+        };
+        return null;
+    }
+
+    fn configured(self: *const Responder, t: userdata.BlockType, number: u16) bool {
+        for (self.config.blocks) |b| if (b.block_type == t and b.number == number) return true;
+        return false;
+    }
+
+    fn areaBlock(a: AreaBinding) userdata.BlockInfo {
+        const size: u32 = @intCast(@min(a.bytes.len, 0xFFFF));
+        return .{
+            .block_type = .db,
+            .number = a.db_number,
+            .load_size = size,
+            .mc7_size = @intCast(size),
+        };
+    }
+
+    fn countOf(self: *const Responder, t: userdata.BlockType) u16 {
+        var n: usize = 0;
+        while (self.nthBlock(t, n) != null) n += 1;
+        return @intCast(@min(n, 0xFFFF));
+    }
+
+    fn findBlock(self: *const Responder, t: userdata.BlockType, number: u16) ?userdata.BlockInfo {
+        var n: usize = 0;
+        while (self.nthBlock(t, n)) |b| : (n += 1) if (b.number == number) return b;
+        return null;
     }
 
     /// Group 7. Read clock answers with the 10-octet date-time; set clock

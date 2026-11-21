@@ -780,6 +780,17 @@ test "live: our client against a real S7 server" {
         .{ c.pduLength(), rack, slot, multi[1].return_code, split_ok, records, status },
     );
     try testing.expect(records > 0);
+
+    // Block services (group 3): the registered DBs must be listed, and the
+    // list of DBs must agree with the count.
+    const counts = try c.listBlocks();
+    var entries: [32]userdata.BlockEntry = undefined;
+    const dbs = try c.listBlocksOfType(.db, &entries);
+    std.debug.print("live S7: blocks db={d} listed={d}\n", .{ counts.db, dbs.len });
+    try testing.expect(counts.db >= 1);
+    try testing.expectEqual(@as(usize, counts.db), dbs.len);
+    const info = try c.getBlockInfo(.db, dbs[0].number);
+    try testing.expectEqual(dbs[0].number, info.number);
 }
 
 // Set S7COMM_TEST_LISTEN=host:port and point a real S7 client at it (a `snap7`
@@ -819,7 +830,12 @@ test "live: a real S7 client against our responder" {
         .{ .area = .flags, .bytes = &flags },
     };
     // Group 5 and SZL 0x0232 for tools/gos7_client_drive (password "s7live").
+    const blocks = [_]userdata.BlockInfo{
+        .{ .block_type = .ob, .number = 1, .language = 3, .load_size = 300, .mc7_size = 180, .author = "DRIVE   ".*, .version = 17 },
+        .{ .block_type = .fc, .number = 5 },
+    };
     var r = Responder.init(.{
+        .blocks = &blocks,
         .password = "s7live",
         .protection = .{ .sch_schal = 2, .sch_par = 3, .sch_rel = 1, .bart_sch = 3, .anl_sch = 2 },
     }, &areas);
@@ -870,4 +886,113 @@ fn classify(frame: []const u8, reads: *usize, writes: *usize, userdata_requests:
         else => {},
     }
     return false;
+}
+
+test "round trip: block list, list of type and block info" {
+    var db1: [16]u8 = @splat(0);
+    var db7: [64]u8 = @splat(0);
+    var areas = [_]AreaBinding{
+        .{ .area = .db, .db_number = 1, .bytes = &db1 },
+        .{ .area = .db, .db_number = 7, .bytes = &db7 },
+    };
+    const blocks = [_]userdata.BlockInfo{
+        .{ .block_type = .ob, .number = 1, .language = 3, .load_size = 200, .mc7_size = 120, .author = "OPERATOR".*, .version = 17, .checksum = 0xBEEF },
+        .{ .block_type = .fc, .number = 3, .language = 2 },
+        .{ .block_type = .fc, .number = 12 },
+        // Names DB 7, which is also bound: the configured entry wins.
+        .{ .block_type = .db, .number = 7, .load_size = 999, .mc7_size = 64 },
+        .{ .block_type = .db, .number = 100 },
+    };
+    var r = Responder.init(.{ .blocks = &blocks }, &areas);
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const counts = try c.listBlocks();
+    try testing.expectEqual(userdata.BlockCounts{ .ob = 1, .fc = 2, .db = 3 }, counts);
+
+    var entries: [8]userdata.BlockEntry = undefined;
+    const fcs = try c.listBlocksOfType(.fc, &entries);
+    try testing.expectEqual(@as(usize, 2), fcs.len);
+    try testing.expectEqual(@as(u16, 3), fcs[0].number);
+    try testing.expectEqual(@as(u8, 2), fcs[0].language);
+    try testing.expectEqual(@as(u16, 12), fcs[1].number);
+    // Configured DBs first, then the bound DB nobody configured.
+    const dbs = try c.listBlocksOfType(.db, &entries);
+    try testing.expectEqual(@as(usize, 3), dbs.len);
+    try testing.expectEqual(@as(u16, 7), dbs[0].number);
+    try testing.expectEqual(@as(u16, 100), dbs[1].number);
+    try testing.expectEqual(@as(u16, 1), dbs[2].number);
+    try testing.expectEqual(@as(usize, 0), (try c.listBlocksOfType(.sdb, &entries)).len);
+    try testing.expectError(error.BufferTooSmall, c.listBlocksOfType(.db, entries[0..2]));
+
+    const ob1 = try c.getBlockInfo(.ob, 1);
+    try testing.expectEqual(blocks[0], ob1);
+    const db1_info = try c.getBlockInfo(.db, 1);
+    try testing.expectEqual(@as(u32, 16), db1_info.load_size);
+    try testing.expectEqual(@as(u16, 16), db1_info.mc7_size);
+    try testing.expectEqual(@as(u32, 999), (try c.getBlockInfo(.db, 7)).load_size);
+    try testing.expectError(error.PlcError, c.getBlockInfo(.db, 2));
+    try testing.expectError(error.PlcError, c.getBlockInfo(.sfb, 1));
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+}
+
+test "round trip: block list of type spans several PDUs" {
+    var store: [8]u8 = @splat(0);
+    var areas: [5]AreaBinding = undefined;
+    for (&areas, 0..) |*a, i| a.* = .{ .area = .db, .db_number = @intCast(10 + i), .bytes = &store };
+    // Two entries per PDU.
+    var r = Responder.init(.{ .max_userdata_payload = 8 }, &areas);
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    var entries: [8]userdata.BlockEntry = undefined;
+    const got = try c.listBlocksOfType(.db, &entries);
+    try testing.expectEqual(@as(usize, 5), got.len);
+    for (got, 0..) |e, i| try testing.expectEqual(@as(u16, @intCast(10 + i)), e.number);
+    // The continuation is gone after the last PDU.
+    try testing.expect(r.cont == null);
+    // A list that ends on a PDU boundary has no empty tail PDU.
+    var r2 = Responder.init(.{ .max_userdata_payload = 20 }, &areas);
+    var p2 = PairedTransport{ .responder = &r2 };
+    var c2 = try Client.init(p2.seam(), &buf, .{});
+    try c2.connect();
+    try testing.expectEqual(@as(usize, 5), (try c2.listBlocksOfType(.db, &entries)).len);
+    try testing.expectEqual(@as(usize, 0), p2.failures);
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+}
+
+test "round trip: a fragmented SZL list is assembled by readSzlAll" {
+    // Three 28-octet records of SZL 0x0011.
+    var recs: [84]u8 = undefined;
+    for (&recs, 0..) |*b, i| b.* = @intCast(i);
+    var r = Responder.init(.{ .szl_0011 = &recs, .max_userdata_payload = 30 }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    // The ordinary call returns the first PDU and says so.
+    const first = try c.readSzl(0x0011, 0);
+    try testing.expect(first.partial);
+
+    var out: [128]u8 = undefined;
+    const szl = try c.readSzlAll(0x0011, 0, &out);
+    try testing.expectEqual(@as(u16, 3), szl.header.record_count);
+    try testing.expectEqual(@as(u16, 28), szl.header.record_length);
+    try testing.expectEqualSlices(u8, &recs, szl.records);
+    try testing.expectEqual(@as(u8, 56), szl.record(2).?[0]);
+
+    // Too small a buffer is refused, not truncated.
+    try testing.expectError(error.BufferTooSmall, c.readSzlAll(0x0011, 0, out[0..60]));
+    // A list that fits one PDU is the same call.
+    var r2 = Responder.init(.{}, &.{});
+    var p2 = PairedTransport{ .responder = &r2 };
+    var c2 = try Client.init(p2.seam(), &buf, .{});
+    try c2.connect();
+    const one = try c2.readSzlAll(userdata.SzlId.cpu_status, 0, &out);
+    try testing.expectEqual(CpuStatus.run, userdata.cpuStatusFrom(one).?);
+    try testing.expectEqual(@as(usize, 0), paired.failures);
 }

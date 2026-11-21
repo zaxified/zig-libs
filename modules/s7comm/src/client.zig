@@ -61,6 +61,8 @@ pub const Error = error{
     /// The COTP `CC`'s `dst_ref` does not echo this connection's `src_ref`
     /// (F11).
     CotpReferenceMismatch,
+    /// A multi-PDU answer kept announcing more PDUs past `max_fragments`.
+    TooManyFragments,
 } || transport.TransportError || tpkt.Error || cotp.Error || s7.Error ||
     items.Error || vars.Error || userdata.Error || address.Error;
 
@@ -480,7 +482,7 @@ pub const Client = struct {
     pub const Szl = struct {
         response: userdata.SzlResponse,
         /// True when the CPU said more PDUs follow. Only the first is
-        /// returned — see SPEC.md, "Deferred".
+        /// returned; `readSzlAll` follows the continuation.
         partial: bool,
     };
 
@@ -507,10 +509,159 @@ pub const Client = struct {
         if (rp.error_code != 0) return error.PlcError;
         const db = try userdata.DataBlock.decode(pdu.data);
         if (!db.return_code.isSuccess()) return error.ItemError;
-        return .{
-            .response = try userdata.SzlResponse.decode(db.payload),
-            .partial = rp.last_data_unit == .more_follows,
-        };
+        if (rp.last_data_unit == .more_follows) {
+            // The first PDU of a longer list: its header may promise more
+            // records than this PDU holds, so keep the whole records that
+            // arrived (`readSzlAll` collects the rest).
+            const f = try userdata.SzlResponse.decodeFirstFragment(db.payload);
+            const rl: usize = f.header.record_length;
+            const whole = if (rl == 0) 0 else f.records.len / rl * rl;
+            return .{ .response = .{ .header = f.header, .records = f.records[0..whole] }, .partial = true };
+        }
+        return .{ .response = try userdata.SzlResponse.decode(db.payload), .partial = false };
+    }
+
+    // ── Userdata with continuation ─────────────────────────────────────────
+
+    /// Most follow-up PDUs one answer may take. A hostile peer that keeps
+    /// saying "more follows" ends in `error.TooManyFragments` instead of a
+    /// loop.
+    pub const max_fragments: usize = 4096;
+
+    const UserdataReply = struct { param: userdata.Param, block: userdata.DataBlock };
+
+    /// One Userdata request and its checked answer: the reply must be a
+    /// Userdata response of the same group and subfunction with error word 0.
+    fn userdataCall(
+        self: *Client,
+        group: userdata.FunctionGroup,
+        sub: u8,
+        sequence: u8,
+        block: []const u8,
+    ) Error!UserdataReply {
+        var params: [userdata.Param.request_len]u8 = undefined;
+        _ = try (userdata.Param{
+            .message_type = .request,
+            .function_group = group,
+            .subfunction = sub,
+            .sequence = sequence,
+        }).encodeRequest(&params);
+        const pdu = try self.exchange(.userdata, &params, &[_][]const u8{block});
+        if (pdu.header.rosctr != .userdata) return error.UnexpectedReply;
+        if (pdu.parameters.len < userdata.Param.response_len) return error.UnexpectedReply;
+        const rp = try userdata.Param.decode(pdu.parameters);
+        if (!rp.isResponse() or rp.function_group != group or rp.subfunction != sub) {
+            return error.UnexpectedReply;
+        }
+        if (rp.error_code != 0) return error.PlcError;
+        const db = try userdata.DataBlock.decode(pdu.data);
+        if (!db.return_code.isSuccess()) return error.ItemError;
+        return .{ .param = rp, .block = db };
+    }
+
+    /// The follow-up request of a multi-PDU answer: the same group and
+    /// subfunction, the previous answer's sequence octet echoed, and the
+    /// empty request block `0a 00 00 00` (python-snap7 3.1.0's
+    /// `build_userdata_followup_request`).
+    fn userdataFollowUp(self: *Client, group: userdata.FunctionGroup, sub: u8, prev: userdata.Param) Error!UserdataReply {
+        var data: [4]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
+        return self.userdataCall(group, sub, prev.sequence, block);
+    }
+
+    /// Reads one system status list whatever the number of PDUs it takes:
+    /// the first PDU carries the eight-octet header and the first records,
+    /// every follow-up PDU carries more record octets (no header). The
+    /// assembled answer lives in `out` (header first), so `out` must hold the
+    /// header and every record; a list that does not fit is
+    /// `error.BufferTooSmall`. When the CPU's header counted only its first
+    /// PDU's records, the count is corrected to the records received. The
+    /// continuation exchange follows python-snap7 3.1.0 (MIT); the real Snap7
+    /// library and a CPU that fragments were not available, see SPEC.
+    pub fn readSzlAll(self: *Client, id: u16, index: u16, out: []u8) Error!userdata.SzlResponse {
+        if (!self.connected) return error.NotConnected;
+        var req: [4]u8 = undefined;
+        const payload = try (userdata.SzlRequest{ .id = id, .index = index }).encode(&req);
+        var data: [8]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.success, .octet_string, payload, &data);
+        const sub = @backingInt(userdata.CpuSubfunction.read_szl);
+
+        var r = try self.userdataCall(.cpu_functions, sub, 0, block);
+        const first = try userdata.SzlResponse.decodeFirstFragment(r.block.payload);
+        if (out.len < r.block.payload.len) return error.BufferTooSmall;
+        @memcpy(out[0..r.block.payload.len], r.block.payload);
+        var n: usize = r.block.payload.len;
+        var fragments: usize = 0;
+        while (r.param.last_data_unit == .more_follows) {
+            fragments += 1;
+            if (fragments > max_fragments) return error.TooManyFragments;
+            r = try self.userdataFollowUp(.cpu_functions, sub, r.param);
+            if (out.len - n < r.block.payload.len) return error.BufferTooSmall;
+            @memcpy(out[n..][0..r.block.payload.len], r.block.payload);
+            n += r.block.payload.len;
+        }
+        const rl: usize = first.header.record_length;
+        const have = n - userdata.SzlHeader.wire_len;
+        if (rl != 0 and have / rl > first.header.record_count) {
+            // Header counted fewer records than arrived: the list is longer
+            // than its first PDU. Correct the count to what was received.
+            const total = have / rl;
+            if (total > 0xFFFF) return error.BadSzl;
+            std.mem.writeInt(u16, out[6..8], @intCast(total), .big);
+        }
+        return userdata.SzlResponse.decode(out[0..n]);
+    }
+
+    // ── Block services (group 3) ───────────────────────────────────────────
+
+    /// `ListBlocks`: how many blocks of each type the CPU holds.
+    pub fn listBlocks(self: *Client) Error!userdata.BlockCounts {
+        if (!self.connected) return error.NotConnected;
+        var data: [4]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
+        const r = try self.userdataCall(.block_functions, @backingInt(userdata.BlockSubfunction.list_all), 0, block);
+        return userdata.BlockCounts.decode(r.block.payload);
+    }
+
+    /// `ListBlocksOfType`: the blocks of one type, across as many PDUs as the
+    /// CPU needs. Fills `out` and returns the filled prefix; more blocks than
+    /// `out` holds is `error.BufferTooSmall`.
+    pub fn listBlocksOfType(self: *Client, t: userdata.BlockType, out: []userdata.BlockEntry) Error![]userdata.BlockEntry {
+        if (!self.connected) return error.NotConnected;
+        var req: [4]u8 = undefined;
+        const payload = try userdata.encodeListOfTypeRequest(t, &req);
+        var data: [8]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, payload, &data);
+        const sub = @backingInt(userdata.BlockSubfunction.list_of_type);
+        var r = try self.userdataCall(.block_functions, sub, 0, block);
+        var n: usize = 0;
+        var fragments: usize = 0;
+        while (true) {
+            const pl = r.block.payload;
+            if (pl.len % userdata.BlockEntry.wire_len != 0) return error.BadBlockList;
+            var i: usize = 0;
+            while (userdata.BlockEntry.at(pl, i)) |e| : (i += 1) {
+                if (n == out.len) return error.BufferTooSmall;
+                out[n] = e;
+                n += 1;
+            }
+            if (r.param.last_data_unit != .more_follows) break;
+            fragments += 1;
+            if (fragments > max_fragments) return error.TooManyFragments;
+            r = try self.userdataFollowUp(.block_functions, sub, r.param);
+        }
+        return out[0..n];
+    }
+
+    /// `GetBlockInfo`: the header record of one block.
+    pub fn getBlockInfo(self: *Client, t: userdata.BlockType, number: u16) Error!userdata.BlockInfo {
+        if (!self.connected) return error.NotConnected;
+        var req: [8]u8 = undefined;
+        const payload = try userdata.encodeBlockInfoRequest(t, number, &req);
+        var data: [12]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, payload, &data);
+        const r = try self.userdataCall(.block_functions, @backingInt(userdata.BlockSubfunction.block_info), 0, block);
+        return userdata.BlockInfo.decode(r.block.payload);
     }
 
     /// The CPU's run/stop state, from SZL `0x0424`.

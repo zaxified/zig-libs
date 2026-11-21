@@ -204,10 +204,18 @@ See SPEC.md, "S7CommPlus", for the field-by-field breakdown; what is missing
 (encryption, the newest-firmware integrity cryptography, subscriptions, symbolic
 sub-path resolution, block up/download) is under "Not provided" below.
 
+## Block services and long SZL lists
+
+`Client.listBlocks()` (block counts per type), `listBlocksOfType(.db, &entries)`
+(numbers, across as many PDUs as the CPU needs) and `getBlockInfo(.db, 1)` (the
+78-octet header record) answer the inventory questions; `readSzlAll(id, index,
+&buf)` assembles an SZL list that spans several PDUs. The responder serves the
+block calls from `ResponderConfig.blocks` and its bound DB areas. See SPEC.md,
+"Block services (function group 3) and multi-PDU answers".
+
 ## Not provided
 
-Block services (list, info, upload, download), fragmented SZL continuation,
-cyclic subscriptions, symbolic (`0xB2`) addressing over classic S7comm (use
+Block upload and download, cyclic subscriptions, symbolic (`0xB2`) addressing over classic S7comm (use
 `s7plus`), retry/reconnect/keepalive, concurrent outstanding requests, and
 S7CommPlus encryption are not implemented. SPEC.md "What is deliberately not
 done" gives the reasons, "Backlog / deferred" what may still come.

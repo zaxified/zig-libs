@@ -13,7 +13,7 @@ import sys
 import time
 
 import snap7
-from snap7.type import Area
+from snap7.type import Area, Block
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 10503
 
@@ -47,6 +47,17 @@ try:
         print("cpu_state       =", c.get_cpu_state())
     except Exception as e:
         print("cpu_state       : FAILED", type(e).__name__, e)
+    try:
+        bl = c.list_blocks()
+        print("list_blocks     = OB", bl.OBCount, "FC", bl.FCCount, "DB", bl.DBCount)
+        print("list_blocks_of_type(DB) =", c.list_blocks_of_type(Block.DB, 10))
+        print("list_blocks_of_type(FC) =", c.list_blocks_of_type(Block.FC, 10))
+        bi = c.get_block_info(Block.OB, 1)
+        print("get_block_info(OB1)     = mc7", bi.MC7Size, "load", bi.LoadSize, "author", bytes(bi.Author), "version", bi.Version)
+        bi = c.get_block_info(Block.DB, 1)
+        print("get_block_info(DB1)     = mc7", bi.MC7Size, "load", bi.LoadSize)
+    except Exception as e:
+        print("block services  : FAILED", type(e).__name__, e)
     try:
         d = c.db_read(77, 0, 4)
         print("db_read(77)     = UNEXPECTED SUCCESS", d.hex())

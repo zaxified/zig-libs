@@ -49,6 +49,12 @@ pub const Error = error{
     /// A date-time is not the 10-octet form, has a BCD digit above 9, or a
     /// field outside its range (month, day of month, hour, ...).
     BadDateTime,
+    /// A block-list payload is not a whole number of four-octet entries, or
+    /// an entry lacks its `0x30` marker.
+    BadBlockList,
+    /// A block-info payload is not the 78-octet record, or the request
+    /// payload is not the documented shape.
+    BadBlockInfo,
 } || items.Error;
 
 /// High nibble of the `type|group` octet.
@@ -287,6 +293,23 @@ pub const SzlResponse = struct {
         return .{ .header = h, .records = records[0..need] };
     }
 
+    /// Decodes the first PDU of a fragmented answer: the header, and whatever
+    /// records the PDU carries (the header counts the whole list or this
+    /// PDU's share, depending on the CPU, so it is not checked against the
+    /// octets present).
+    pub fn decodeFirstFragment(bytes: []const u8) Error!struct { header: SzlHeader, records: []const u8 } {
+        if (bytes.len < SzlHeader.wire_len) return error.BadSzl;
+        return .{
+            .header = .{
+                .id = std.mem.readInt(u16, bytes[0..2], .big),
+                .index = std.mem.readInt(u16, bytes[2..4], .big),
+                .record_length = std.mem.readInt(u16, bytes[4..6], .big),
+                .record_count = std.mem.readInt(u16, bytes[6..8], .big),
+            },
+            .records = bytes[SzlHeader.wire_len..],
+        };
+    }
+
     pub fn encode(h: SzlHeader, records: []const u8, out: []u8) Error![]u8 {
         if (out.len < SzlHeader.wire_len + records.len) return error.BufferTooSmall;
         out[0] = @intCast(h.id >> 8);
@@ -339,6 +362,260 @@ pub fn cpuStatusFrom(resp: SzlResponse) ?CpuStatus {
     if (rec.len <= cpu_status_offset) return null;
     return @fromBackingInt(@intCast(rec[cpu_status_offset]));
 }
+
+// ── Block services (group 3) ────────────────────────────────────────────────
+
+/// Subfunctions of `block_functions` (group 3).
+pub const BlockSubfunction = enum(u8) {
+    /// `ListBlocks`: how many blocks of each type exist.
+    list_all = 0x01,
+    /// `ListBlocksOfType`: the numbers of the blocks of one type.
+    list_of_type = 0x02,
+    /// `GetBlockInfo`: the header record of one block.
+    block_info = 0x03,
+    _,
+};
+
+/// Block type codes of the block services: the ASCII characters `8`, `A`..`F`.
+/// Codes as python-snap7 3.1.0 (MIT) lists them.
+pub const BlockType = enum(u8) {
+    ob = 0x38,
+    db = 0x41,
+    sdb = 0x42,
+    fc = 0x43,
+    sfc = 0x44,
+    fb = 0x45,
+    sfb = 0x46,
+    _,
+
+    /// The seven types `ListBlocks` reports, in the order the responder
+    /// emits them.
+    pub const all = [_]BlockType{ .ob, .fb, .fc, .db, .sdb, .sfc, .sfb };
+};
+
+/// Marker octet in front of every block-service entry (`'0'`).
+pub const block_marker: u8 = 0x30;
+
+/// Number of blocks per type, the answer to `ListBlocks`.
+pub const BlockCounts = struct {
+    ob: u16 = 0,
+    fb: u16 = 0,
+    fc: u16 = 0,
+    db: u16 = 0,
+    sdb: u16 = 0,
+    sfc: u16 = 0,
+    sfb: u16 = 0,
+
+    pub const entry_len: usize = 4;
+
+    pub fn of(self: BlockCounts, t: BlockType) u16 {
+        return switch (t) {
+            .ob => self.ob,
+            .fb => self.fb,
+            .fc => self.fc,
+            .db => self.db,
+            .sdb => self.sdb,
+            .sfc => self.sfc,
+            .sfb => self.sfb,
+            _ => 0,
+        };
+    }
+
+    /// Encodes the seven `30 <type> <count:2>` entries.
+    pub fn encode(self: BlockCounts, out: []u8) Error![]u8 {
+        const n = BlockType.all.len * entry_len;
+        if (out.len < n) return error.BufferTooSmall;
+        for (BlockType.all, 0..) |t, i| {
+            const e = out[i * entry_len ..][0..entry_len];
+            e[0] = block_marker;
+            e[1] = @backingInt(t);
+            std.mem.writeInt(u16, e[2..4], self.of(t), .big);
+        }
+        return out[0..n];
+    }
+
+    /// Decodes the entries; a type this module does not know is skipped, a
+    /// type listed twice keeps the last count. A payload that is not whole
+    /// entries, or an entry without the `0x30` marker, is `BadBlockList`.
+    pub fn decode(payload: []const u8) Error!BlockCounts {
+        if (payload.len % entry_len != 0) return error.BadBlockList;
+        var c: BlockCounts = .{};
+        var i: usize = 0;
+        while (i < payload.len) : (i += entry_len) {
+            if (payload[i] != block_marker) return error.BadBlockList;
+            const n = std.mem.readInt(u16, payload[i + 2 ..][0..2], .big);
+            switch (@as(BlockType, @fromBackingInt(@intCast(payload[i + 1])))) {
+                .ob => c.ob = n,
+                .fb => c.fb = n,
+                .fc => c.fc = n,
+                .db => c.db = n,
+                .sdb => c.sdb = n,
+                .sfc => c.sfc = n,
+                .sfb => c.sfb = n,
+                _ => {},
+            }
+        }
+        return c;
+    }
+};
+
+/// One entry of the `ListBlocksOfType` answer: the block number, an octet
+/// whose meaning no source documents (python-snap7: "Unknown", Snap7's
+/// `TDataFunGetBotItem`) and the block language.
+pub const BlockEntry = struct {
+    number: u16,
+    /// The undocumented octet; passed through.
+    flags: u8 = 0,
+    /// Block language code (`BlockInfo.language`'s encoding).
+    language: u8 = 0,
+
+    pub const wire_len: usize = 4;
+
+    pub fn encode(self: BlockEntry, out: []u8) Error![]u8 {
+        if (out.len < wire_len) return error.BufferTooSmall;
+        std.mem.writeInt(u16, out[0..2], self.number, .big);
+        out[2] = self.flags;
+        out[3] = self.language;
+        return out[0..wire_len];
+    }
+
+    /// Entry `i` of a payload (or one fragment of it); null past the end.
+    pub fn at(payload: []const u8, i: usize) ?BlockEntry {
+        const off = std.math.mul(usize, i, wire_len) catch return null;
+        if (off + wire_len > payload.len) return null;
+        return .{
+            .number = std.mem.readInt(u16, payload[off..][0..2], .big),
+            .flags = payload[off + 2],
+            .language = payload[off + 3],
+        };
+    }
+};
+
+/// The request payload of `ListBlocksOfType`: `30 <type> 0a 00`.
+pub fn encodeListOfTypeRequest(t: BlockType, out: []u8) Error![]u8 {
+    if (out.len < 4) return error.BufferTooSmall;
+    out[0] = block_marker;
+    out[1] = @backingInt(t);
+    out[2] = 0x0A;
+    out[3] = 0x00;
+    return out[0..4];
+}
+
+/// The block type a `ListBlocksOfType` request payload names. Only the
+/// leading `30 <type>` is read (Snap7's trailing `0a 00` is not checked, as
+/// python-snap7's server does).
+pub fn decodeListOfTypeRequest(payload: []const u8) Error!BlockType {
+    if (payload.len < 2 or payload[0] != block_marker) return error.BadBlockInfo;
+    return @fromBackingInt(@intCast(payload[1]));
+}
+
+/// The request payload of `GetBlockInfo`: `30 <type> 41 <number as five
+/// ASCII digits>`.
+pub fn encodeBlockInfoRequest(t: BlockType, number: u16, out: []u8) Error![]u8 {
+    if (out.len < 8) return error.BufferTooSmall;
+    out[0] = block_marker;
+    out[1] = @backingInt(t);
+    out[2] = 'A';
+    var n: u32 = number;
+    var i: usize = 8;
+    while (i > 3) {
+        i -= 1;
+        out[i] = '0' + @as(u8, @intCast(n % 10));
+        n /= 10;
+    }
+    return out[0..8];
+}
+
+pub const BlockRef = struct { block_type: BlockType, number: u16 };
+
+/// Decodes a `GetBlockInfo` request payload (at least eight octets, the
+/// five digits ASCII, a number above 65535 refused).
+pub fn decodeBlockInfoRequest(payload: []const u8) Error!BlockRef {
+    if (payload.len < 8 or payload[0] != block_marker) return error.BadBlockInfo;
+    var n: u32 = 0;
+    for (payload[3..8]) |c| {
+        if (c < '0' or c > '9') return error.BadBlockInfo;
+        n = n * 10 + (c - '0');
+    }
+    if (n > 0xFFFF) return error.BadBlockInfo;
+    return .{ .block_type = @fromBackingInt(@intCast(payload[1])), .number = @intCast(n) };
+}
+
+/// The `GetBlockInfo` answer: Snap7's 78-octet `TResDataBlockInfo`. Offsets
+/// after python-snap7 3.1.0 (MIT, `s7protocol.py`); the real Snap7 library
+/// and a CPU were not available, so the layout is as verified as that
+/// reimplementation is. The two dates are kept as their raw six octets
+/// (python-snap7 splits them `ms(2) days(2) reserved(2)`, a CPU's DATE_AND_TIME
+/// is a 32-bit millisecond count and a 16-bit day count: unverified, so no
+/// calendar is derived).
+pub const BlockInfo = struct {
+    block_type: BlockType,
+    flags: u8 = 0,
+    language: u8 = 0,
+    number: u16,
+    /// Octets the block occupies in load memory.
+    load_size: u32 = 0,
+    code_date: [6]u8 = @splat(0),
+    interface_date: [6]u8 = @splat(0),
+    sbb_length: u16 = 0,
+    local_data: u16 = 0,
+    mc7_size: u16 = 0,
+    author: [8]u8 = @splat(' '),
+    family: [8]u8 = @splat(' '),
+    header: [8]u8 = @splat(' '),
+    version: u8 = 0,
+    checksum: u16 = 0,
+
+    pub const wire_len: usize = 78;
+
+    pub fn encode(self: BlockInfo, out: []u8) Error![]u8 {
+        if (out.len < wire_len) return error.BufferTooSmall;
+        const b = out[0..wire_len];
+        @memset(b, 0);
+        b[0] = block_marker;
+        b[1] = @backingInt(self.block_type);
+        b[9] = self.flags;
+        b[10] = self.language;
+        b[11] = @backingInt(self.block_type); // sub-block type, as python-snap7's emulator
+        std.mem.writeInt(u16, b[12..14], self.number, .big);
+        std.mem.writeInt(u32, b[14..18], self.load_size, .big);
+        @memcpy(b[22..28], &self.code_date);
+        @memcpy(b[28..34], &self.interface_date);
+        std.mem.writeInt(u16, b[34..36], self.sbb_length, .big);
+        std.mem.writeInt(u16, b[38..40], self.local_data, .big);
+        std.mem.writeInt(u16, b[40..42], self.mc7_size, .big);
+        @memcpy(b[42..50], &self.author);
+        @memcpy(b[50..58], &self.family);
+        @memcpy(b[58..66], &self.header);
+        b[66] = self.version;
+        std.mem.writeInt(u16, b[68..70], self.checksum, .big);
+        return b;
+    }
+
+    /// Decodes the record; a shorter payload is `BadBlockInfo`, a longer one
+    /// is read from its first 78 octets (CPUs may append reserved words).
+    pub fn decode(payload: []const u8) Error!BlockInfo {
+        if (payload.len < wire_len) return error.BadBlockInfo;
+        const b = payload;
+        return .{
+            .block_type = @fromBackingInt(@intCast(b[1])),
+            .flags = b[9],
+            .language = b[10],
+            .number = std.mem.readInt(u16, b[12..14], .big),
+            .load_size = std.mem.readInt(u32, b[14..18], .big),
+            .code_date = b[22..28].*,
+            .interface_date = b[28..34].*,
+            .sbb_length = std.mem.readInt(u16, b[34..36], .big),
+            .local_data = std.mem.readInt(u16, b[38..40], .big),
+            .mc7_size = std.mem.readInt(u16, b[40..42], .big),
+            .author = b[42..50].*,
+            .family = b[50..58].*,
+            .header = b[58..66].*,
+            .version = b[66],
+            .checksum = std.mem.readInt(u16, b[68..70], .big),
+        };
+    }
+};
 
 // ── Security (group 5) ──────────────────────────────────────────────────────
 
@@ -852,6 +1129,100 @@ test "cpu status is read from the 0x0424 record" {
         &wire3,
     );
     try testing.expect(cpuStatusFrom(try SzlResponse.decode(short)) == null);
+}
+
+test "block service payloads: requests, counts, entries and the 78-octet info record" {
+    var b: [80]u8 = undefined;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x41, 0x0A, 0x00 }, try encodeListOfTypeRequest(.db, &b));
+    try testing.expectEqual(BlockType.db, try decodeListOfTypeRequest(&[_]u8{ 0x30, 0x41, 0x0A, 0x00 }));
+    try testing.expectEqual(BlockType.sfc, try decodeListOfTypeRequest(&[_]u8{ 0x30, 0x44 }));
+    try testing.expectError(error.BadBlockInfo, decodeListOfTypeRequest(&[_]u8{ 0x31, 0x41 }));
+    try testing.expectError(error.BadBlockInfo, decodeListOfTypeRequest(&[_]u8{0x30}));
+
+    // `30 <type> 'A' <five ASCII digits>`, as python-snap7 3.1.0 builds it.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x41, 0x41, '0', '0', '0', '1', '0' }, try encodeBlockInfoRequest(.db, 10, &b));
+    try testing.expectEqualSlices(u8, "\x30\x38A65535", try encodeBlockInfoRequest(.ob, 65535, &b));
+    const ref = try decodeBlockInfoRequest("\x30\x43A00042");
+    try testing.expectEqual(BlockType.fc, ref.block_type);
+    try testing.expectEqual(@as(u16, 42), ref.number);
+    try testing.expectError(error.BadBlockInfo, decodeBlockInfoRequest("\x30\x43A65536"));
+    try testing.expectError(error.BadBlockInfo, decodeBlockInfoRequest("\x30\x43A00x42"));
+    try testing.expectError(error.BadBlockInfo, decodeBlockInfoRequest("\x30\x43A0004"));
+    try testing.expectError(error.BadBlockInfo, decodeBlockInfoRequest("\x31\x43A00042"));
+    try testing.expectError(error.BufferTooSmall, encodeBlockInfoRequest(.db, 1, b[0..7]));
+
+    // ListBlocks: seven entries, `30 type count`, the emulator's order.
+    const counts: BlockCounts = .{ .ob = 1, .fb = 2, .fc = 3, .db = 0x0102, .sdb = 5, .sfc = 6, .sfb = 7 };
+    const enc = try counts.encode(&b);
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x30, 0x38, 0, 1, 0x30, 0x45, 0, 2, 0x30, 0x43, 0, 3, 0x30, 0x41, 1, 2,
+        0x30, 0x42, 0, 5, 0x30, 0x44, 0, 6, 0x30, 0x46, 0, 7,
+    }, enc);
+    try testing.expectEqual(counts, try BlockCounts.decode(enc));
+    // An unknown type is skipped; a ragged payload and a missing marker are not.
+    try testing.expectEqual(BlockCounts{ .db = 9 }, try BlockCounts.decode(&[_]u8{ 0x30, 0x99, 0, 4, 0x30, 0x41, 0, 9 }));
+    try testing.expectError(error.BadBlockList, BlockCounts.decode(&[_]u8{ 0x30, 0x41, 0 }));
+    try testing.expectError(error.BadBlockList, BlockCounts.decode(&[_]u8{ 0x31, 0x41, 0, 1 }));
+    try testing.expectEqual(BlockCounts{}, try BlockCounts.decode(&.{}));
+    try testing.expectError(error.BufferTooSmall, counts.encode(b[0..27]));
+
+    const e = try (BlockEntry{ .number = 0x0102, .flags = 3, .language = 4 }).encode(&b);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, e);
+    try testing.expectEqual(@as(u16, 0x0102), BlockEntry.at(e, 0).?.number);
+    try testing.expect(BlockEntry.at(e, 1) == null);
+    try testing.expect(BlockEntry.at(e[0..3], 0) == null);
+    try testing.expectError(error.BufferTooSmall, (BlockEntry{ .number = 1 }).encode(b[0..3]));
+
+    // The info record at the offsets python-snap7 reads.
+    const info: BlockInfo = .{
+        .block_type = .fb,
+        .flags = 0x01,
+        .language = 0x05,
+        .number = 0x1234,
+        .load_size = 0x00010203,
+        .code_date = .{ 1, 2, 3, 4, 5, 6 },
+        .interface_date = .{ 7, 8, 9, 10, 11, 12 },
+        .sbb_length = 0x0A0B,
+        .local_data = 0x0C0D,
+        .mc7_size = 0x0E0F,
+        .author = "ABCDEFGH".*,
+        .family = "IJKLMNOP".*,
+        .header = "QRSTUVWX".*,
+        .version = 0x21,
+        .checksum = 0xCAFE,
+    };
+    const rec = try info.encode(&b);
+    try testing.expectEqual(@as(usize, 78), rec.len);
+    try testing.expectEqual(@as(u8, 0x30), rec[0]);
+    try testing.expectEqual(@as(u8, 0x45), rec[1]);
+    try testing.expectEqual(@as(u8, 0x01), rec[9]);
+    try testing.expectEqual(@as(u8, 0x05), rec[10]);
+    try testing.expectEqual(@as(u8, 0x45), rec[11]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0x34 }, rec[12..14]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, rec[14..18]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6 }, rec[22..28]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x0A, 0x0B }, rec[34..36]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x0C, 0x0D }, rec[38..40]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x0E, 0x0F }, rec[40..42]);
+    try testing.expectEqualSlices(u8, "ABCDEFGHIJKLMNOPQRSTUVWX", rec[42..66]);
+    try testing.expectEqual(@as(u8, 0x21), rec[66]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xCA, 0xFE }, rec[68..70]);
+    try testing.expectEqual(info, try BlockInfo.decode(rec));
+    // Reserved words behind the record are ignored; a short record is refused.
+    var longer: [90]u8 = @splat(0xEE);
+    @memcpy(longer[0..78], rec);
+    try testing.expectEqual(info, try BlockInfo.decode(&longer));
+    try testing.expectError(error.BadBlockInfo, BlockInfo.decode(rec[0..77]));
+    try testing.expectError(error.BufferTooSmall, info.encode(b[0..77]));
+}
+
+test "SZL first fragment keeps the header and whatever records arrived" {
+    const bytes = [_]u8{ 0x00, 0x11, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x03, 0xAA, 0xBB };
+    const f = try SzlResponse.decodeFirstFragment(&bytes);
+    try testing.expectEqual(@as(u16, 3), f.header.record_count);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, f.records);
+    try testing.expectError(error.BadSzl, SzlResponse.decode(&bytes));
+    try testing.expectError(error.BadSzl, SzlResponse.decodeFirstFragment(bytes[0..7]));
 }
 
 /// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
