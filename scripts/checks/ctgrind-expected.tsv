@@ -266,7 +266,7 @@ oscore	ReleaseFast	unprotect	1	1	5348e0af1901ba83	ed85db89e3d7e9fd
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
 isis	ReleaseFast	md5	1	0	0373b1aa690293c1	348beddaddc06aa1
 isis	ReleaseFast	sha256	1	0	0373b1aa690293c1	a8ea418331958712
-ssh	ReleaseFast	dh	1	4	b75a041dcd98c994	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	4955fcb9a013ec1a	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig `powWithEncodedExponentInternal` -> `cmov`) and compiles to a jump per
 # table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
@@ -293,8 +293,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	b75a041dcd98c994	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	20	b75a041dcd98c994	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	4955fcb9a013ec1a	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	20	4955fcb9a013ec1a	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
@@ -311,7 +311,7 @@ ssh	ReleaseFast	ecdh	1	20	b75a041dcd98c994	8683e4aaf784b64c
 # replaced decoder (std.mem.indexOfPos = Boyer-Moore-Horspool + std.base64 table decode): 18 in
 # mem.zig/base64.zig on the first and second measurement. It must stay >= 1; no witness, since a
 # value loaded through a tainted table index reads as defined to memcheck.
-ssh	ReleaseFast	pem	1	3	9fe6fac5aed0aea0	2ba7559fa99a2188
+ssh	ReleaseFast	pem	1	3	44bc21276091fd81	2ba7559fa99a2188
 ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
@@ -978,7 +978,10 @@ paillier	ReleaseFast	addm	1	0	14b7f5ff2a91b536	526f0de009c0cbfb
 # 0.17 memset is `memsetSmallPowerOf2`/`shortMemset` recursion, more distinct addresses for the
 # same calls. Every class is one listed above; no new source line, no limb-value branch. Bound
 # tightened to the measurement (output pin unchanged, the run is deterministic).
-paillier	ReleaseFast	keygen	1	<=314	14b7f5ff2a91b536	61a35e2d95a376cf
+# paillier keygen <=314 -> exact 270 (2026-11-21): three --check runs with the harness's fixed
+# seed measured 270 in-file / 272 total each time, so the count is deterministic and is pinned
+# exactly; every context is one of the classes listed above.
+paillier	ReleaseFast	keygen	1	270	14b7f5ff2a91b536	61a35e2d95a376cf
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
 # tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
 # FELL because the Miller loop stopped inverting -- 32e751ad dropped
@@ -2509,7 +2512,7 @@ xmlenc	ReleaseFast	kw	1	182	d6941608df256e41	65e898b409f3bf26	cpu=x86_64 control
 # `cipher_suites`), so out_sha is its own.
 # ssh ecdh: no variant since 2026-11-18 -- the fromScalar zero verdict is declassified (ssh audit c1),
 # and portable now reads 20, equal to the plain row.
-ssh	ReleaseFast	pem	1	4	9fe6fac5aed0aea0	2ba7559fa99a2188	cpu=x86_64
+ssh	ReleaseFast	pem	1	4	44bc21276091fd81	2ba7559fa99a2188	cpu=x86_64
 ct25519	ReleaseFast	x25519	1	1	9a52995b15c26959	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64
@@ -2536,6 +2539,10 @@ coconut	ReleaseFast	user_issue	1	27	01094de468b4fd8b	af24664cb307a403	cpu=x86_64
 # coconut blind_prepare +6 on the portable lane (2026-11-21): the same bls12_381 fp.zig sqrt shape as
 # user_issue above, reached through hash-to-curve of the published cm.
 coconut	ReleaseFast	blind_prepare	1	51	966e28a34bfb344b	053f2af7fbd7948d	cpu=x86_64
+# paillier keygen on the portable lane (2026-11-21): 260 in-file in one CTGRIND_CPU=x86_64 run (the native
+# row is 270, deterministic over three runs). Measured once only, so this row keeps a bound;
+# its contexts were not re-read frame by frame (the bound is the native exact count).
+paillier	ReleaseFast	keygen	1	<=270	14b7f5ff2a91b536	61a35e2d95a376cf	cpu=x86_64
 # voprf p384-server (+4 at p384 field.zig, objdump of the x86_64 harness, 2026-11-18): all 4 are
 # `Use of uninitialised value of size 8` at 0x10d9c0d `mov (%rsi),%r12`, the first load of the out-of-
 # line `mulPortable` through a pointer to the wNAF table point. Callers: group.zig addAffineVt
