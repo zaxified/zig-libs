@@ -257,3 +257,19 @@ test "crc64: extend continues a prefix CRC, from any split" {
     }
     try std.testing.expectEqual(@as(u64, 0), Crc64.hash(""));
 }
+
+fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
+    var buf: [2048]u8 = undefined;
+    const n = smith.slice(&buf);
+    const want = std.hash.crc.@"CRC-64/XZ".hash(buf[0..n]);
+    try std.testing.expectEqual(want, Crc64.hash(buf[0..n]));
+    const k = smith.index(n + 1);
+    var c = Crc64.init();
+    c.update(buf[0..k]);
+    c.update(buf[k..n]);
+    try std.testing.expectEqual(want, c.final());
+}
+
+test "fuzz: any bytes, any split: equal to std's CRC-64/XZ" {
+    try std.testing.fuzz({}, fuzzOne, .{});
+}

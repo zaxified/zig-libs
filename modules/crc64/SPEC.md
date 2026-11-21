@@ -8,11 +8,10 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz none · ct n/a — checksum only, no secret
+**Hardening:** fuzz none · ct n/a — checksum only, no secret · panic n/a — every length is a valid input; no cast, unwrap or assert on a data path
 
 **Performance:** not measured
 
-**Evidence:** model — `std.hash.crc` CRC-64/XZ at every length 0..600 and split; frozen values from liblzma
 
 **Known defects:** none recorded
 
@@ -64,7 +63,7 @@ the table path alone against the kernel.
 
 ## Verification
 
-Run: `scripts/modtest crc64`. The kernel test is skipped where the CPU or the backend has no PCLMULQDQ (the table
+Run: `scripts/modtest crc64`. A `std.testing.fuzz` harness compares any bytes at any split with `std` (no driver run recorded). The kernel test is skipped where the CPU or the backend has no PCLMULQDQ (the table
 path is then the only one). The card's `**Audit:**` line is the current score.
 
 ## What is deliberately not done
