@@ -372,6 +372,8 @@ pub const Ticketer = connection.Ticketer;
 pub const StekTicketer = connection.StekTicketer;
 pub const SessionTicket = connection.SessionTicket;
 pub const max_ticket_len = connection.max_ticket_len;
+/// DTLS 1.2 (RFC 5077): `Config.session_tickets12` / `Config.resumption12`, `Connection12.sessionTicket`.
+pub const SessionTicket12 = connection.SessionTicket12;
 
 // ── DTLS 1.2 (RFC 6347) and version negotiation ────────────
 /// The DTLS 1.2 engine: same method shape as `Connection`, same `Config`

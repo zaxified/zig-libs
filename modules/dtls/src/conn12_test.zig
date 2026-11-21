@@ -1392,3 +1392,150 @@ test "dtls12 CID: fragmented flights cut with nextDatagramCid, certificate mode"
     try testing.expectEqualStrings("s-22", client.peerConnectionId().?);
     try exchangeData(&client, &server);
 }
+
+// ── RFC 5077 session tickets, abbreviated handshake (RFC 5246 §7.3) ───────
+
+const tlsresume = @import("tlsresume");
+const TestTicketer12 = conn13.StekTicketer(tlsresume.stek.DefaultRing);
+
+fn ticketRing12() tlsresume.stek.DefaultRing {
+    var ring: tlsresume.stek.DefaultRing = .init();
+    ring.rotate(7, &@as([32]u8, @splat(0x24)), now_sec);
+    return ring;
+}
+
+/// A full handshake whose client asks for a ticket; returns it.
+fn ticket12(ccfg: Config, scfg: Config, seed: u8) !conn13.SessionTicket12 {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+    const rnd = seeded(&csprng);
+    var cc = ccfg;
+    cc.session_tickets12 = true;
+    var client = try Connection12.clientInit(cc);
+    defer client.deinit();
+    var server = try Connection12.serverInit(scfg);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    try drive(&client, &server, rnd, &bufs);
+    try testing.expect(!client.resumed() and !server.resumed());
+    try exchangeData(&client, &server);
+    return (client.sessionTicket() orelse return error.TestNoTicket).*;
+}
+
+fn resume12(ccfg: Config, scfg: Config, t: *const conn13.SessionTicket12, seed: u8, want_resumed: bool) !void {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+    const rnd = seeded(&csprng);
+    var cc = ccfg;
+    cc.resumption12 = t;
+    var client = try Connection12.clientInit(cc);
+    defer client.deinit();
+    var server = try Connection12.serverInit(scfg);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    try drive(&client, &server, rnd, &bufs);
+    try testing.expectEqual(want_resumed, client.resumed());
+    try testing.expectEqual(want_resumed, server.resumed());
+    try exchangeData(&client, &server);
+    if (want_resumed) {
+        // A ticket was asked for again (the extension carried the old one):
+        // a fresh one came with the abbreviated flight.
+        const fresh = client.sessionTicket() orelse return error.TestNoTicket;
+        try testing.expect(!std.mem.eql(u8, fresh.identity(), t.identity()));
+    }
+}
+
+test "dtls12: RFC 5077 ticket from a full handshake resumes with an abbreviated one (ECDHE_ECDSA, PSK, ECDHE_PSK)" {
+    var ring = ticketRing12();
+    const tkr: TestTicketer12 = .{ .ring = &ring };
+    const Pair = struct { c: Config, s: Config };
+    const ecdsa = [_]CipherSuite12{.ecdhe_ecdsa_with_aes_128_gcm_sha256};
+    const psk = [_]CipherSuite12{.psk_with_aes_128_gcm_sha256};
+    const epsk = [_]CipherSuite12{.ecdhe_psk_with_chacha20_poly1305_sha256};
+    var pairs = [_]Pair{
+        .{ .c = ecdsaClientConfig(&ecdsa), .s = ecdsaServerConfig(&ecdsa) },
+        .{ .c = pskConfig(.client, &psk), .s = pskConfig(.server, &psk) },
+        .{ .c = pskConfig(.client, &epsk), .s = pskConfig(.server, &epsk) },
+    };
+    for (&pairs, 0..) |*p, i| {
+        p.s.tickets = .{ .ticketer = tkr.ticketer() };
+        p.s.now_sec = now_sec;
+        p.c.now_sec = now_sec;
+        var t = try ticket12(p.c, p.s, @intCast(0x30 + i));
+        defer t.wipe();
+        try testing.expect(t.ems);
+        try testing.expectEqual(@as(u32, 12 * 3600), t.lifetime_hint_s);
+        try resume12(p.c, p.s, &t, @intCast(0x40 + i), true);
+    }
+}
+
+test "dtls12: an unusable ticket, or a server without tickets, runs the full handshake" {
+    var ring = ticketRing12();
+    const tkr: TestTicketer12 = .{ .ring = &ring };
+    const ecdsa = [_]CipherSuite12{.ecdhe_ecdsa_with_aes_128_gcm_sha256};
+    var scfg = ecdsaServerConfig(&ecdsa);
+    scfg.tickets = .{ .ticketer = tkr.ticketer() };
+    var t = try ticket12(ecdsaClientConfig(&ecdsa), scfg, 0x50);
+    defer t.wipe();
+
+    // No tickets on the server: the extension is ignored, no ticket issued.
+    var plain = ecdsaServerConfig(&ecdsa);
+    plain.now_sec = now_sec;
+    try resume12(ecdsaClientConfig(&ecdsa), plain, &t, 0x51, false);
+    // A corrupted ticket, an expired one: full handshakes.
+    var bad = t;
+    bad.ticket[5] ^= 1;
+    try resume12(ecdsaClientConfig(&ecdsa), scfg, &bad, 0x52, false);
+    var late = scfg;
+    late.now_sec = now_sec + 12 * 3600 + 1;
+    try resume12(ecdsaClientConfig(&ecdsa), late, &t, 0x53, false);
+    // A suite the client no longer offers: full handshake in another suite.
+    const other = [_]CipherSuite12{.ecdhe_ecdsa_with_aes_256_gcm_sha384};
+    var scfg2 = ecdsaServerConfig(&.{ .ecdhe_ecdsa_with_aes_128_gcm_sha256, .ecdhe_ecdsa_with_aes_256_gcm_sha384 });
+    scfg2.tickets = scfg.tickets;
+    try resume12(ecdsaClientConfig(&other), scfg2, &t, 0x54, false);
+}
+
+test "dtls12: abbreviated handshake under loss — the client's final flight lost, resent on the server's retransmission" {
+    var ring = ticketRing12();
+    const tkr: TestTicketer12 = .{ .ring = &ring };
+    const ecdsa = [_]CipherSuite12{.ecdhe_ecdsa_with_aes_128_gcm_sha256};
+    var scfg = ecdsaServerConfig(&ecdsa);
+    scfg.tickets = .{ .ticketer = tkr.ticketer() };
+    var t = try ticket12(ecdsaClientConfig(&ecdsa), scfg, 0x60);
+    defer t.wipe();
+
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x61)));
+    const rnd = seeded(&csprng);
+    var cc = ecdsaClientConfig(&ecdsa);
+    cc.resumption12 = &t;
+    var client = try Connection12.clientInit(cc);
+    defer client.deinit();
+    var server = try Connection12.serverInit(scfg);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    var tmp: [8192]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f2 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    try testing.expect(!server.isConnected());
+    const f3 = try client.handleFlight(f2.out, rnd, 0, &bufs.a);
+    try testing.expect(f3.done and client.isConnected() and client.resumed()); // f3 LOST
+    // The server times out and resends its flight; the connected client
+    // reports it from `recv` and answers from `poll`.
+    const f2_again = (try server.poll(1000, &tmp)).?;
+    var b: [256]u8 = undefined;
+    var rest = f2_again;
+    var saw = false;
+    while (rest.len > 0) {
+        const h = try record.decodePlaintext(rest);
+        const n = record.plaintext_header_len + h.length;
+        if (client.recv(rest[0..n], &b)) |_| return error.TestUnexpectedData else |e| switch (e) {
+            error.ReceivedPostHandshakeMessage => saw = true,
+            else => return e,
+        }
+        rest = rest[n..];
+    }
+    try testing.expect(saw);
+    const f3_again = (try client.poll(1000, &tmp)).?;
+    const done = try server.handleFlight(f3_again, rnd, 1000, &bufs.b);
+    try testing.expect(done.done and server.isConnected() and server.resumed());
+    try exchangeData(&client, &server);
+}

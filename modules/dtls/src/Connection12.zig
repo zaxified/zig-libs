@@ -85,6 +85,7 @@ const suitehash = @import("suitehash.zig");
 const certauth = @import("certauth.zig");
 const certverify = @import("tls13").certverify;
 const kex = @import("tls13").kex;
+const tlsresume = @import("tlsresume");
 
 pub const Config = conn13.Config;
 pub const Role = conn13.Role;
@@ -95,6 +96,9 @@ pub const InitError = conn13.ConfigError;
 pub const HandshakeResult = conn13.Connection.HandshakeResult;
 pub const CipherSuite12 = suite12.CipherSuite12;
 pub const KeyExchange12 = suite12.KeyExchange12;
+pub const SessionTicket12 = conn13.SessionTicket12;
+const hs_new_session_ticket: u8 = 4; // RFC 5077 §3.3
+const ext_session_ticket = tlsresume.ticket12.extension_type;
 const HashAlg = suitehash.HashAlg;
 
 pub const State = enum {
@@ -310,6 +314,20 @@ pub const Connection12 = struct {
     /// The last alert the peer sent (`level`, `description`), RFC 5246 §7.2.
     peer_alert: ?[2]u8 = null,
 
+    // ── RFC 5077 session tickets
+    /// Client: the ServerHello announced a NewSessionTicket. Server: one is
+    /// sent in this handshake (the client sent the extension).
+    ticket_expected: bool = false,
+    /// This handshake is an abbreviated one (RFC 5246 §7.3) resuming a ticket.
+    abbreviated: bool = false,
+    /// The session ID the client offered with its ticket (RFC 5077 §3.4) and
+    /// the server echoes when it resumes.
+    session_id: [32]u8 = undefined,
+    session_id_len: u8 = 0,
+    /// Client: the last ticket received (`sessionTicket`).
+    ticket: SessionTicket12 = undefined,
+    ticket_live: bool = false,
+
     // secret-api-ok: a fresh value holds no key material; Config is slices and pointers only.
     pub fn clientInit(config: Config) InitError!Connection12 {
         try config.validate();
@@ -326,11 +344,34 @@ pub const Connection12 = struct {
 
     pub fn deinit(self: *Connection12) void {
         std.crypto.secureZero(u8, &self.master);
+        std.crypto.secureZero(u8, &self.ticket.master);
+        self.ticket_live = false;
         self.write_keys.wipe();
         self.read_keys.wipe();
         std.crypto.secureZero(u8, &self.ecdhe_secret);
         self.keys_live = false;
         self.ecdhe_live = false;
+    }
+
+    /// Whether this handshake was an abbreviated one resuming a session
+    /// ticket (`Config.resumption12` taken by the server).
+    pub fn resumed(self: *const Connection12) bool {
+        return self.abbreviated;
+    }
+
+    /// The last NewSessionTicket the server issued this client
+    /// (`Config.session_tickets12`), ready for `Config.resumption12` on a
+    /// later connection; null if none. Aliases this connection: copy it out
+    /// before `deinit`, which wipes it.
+    pub fn sessionTicket(self: *const Connection12) ?*const SessionTicket12 {
+        return if (self.ticket_live) &self.ticket else null;
+    }
+
+    /// The side that sent the handshake's last flight answers a peer's
+    /// retransmission of its own: the server after a full handshake, the
+    /// client after an abbreviated one.
+    fn sentLastFlight(self: *const Connection12) bool {
+        return (self.role == .server) != self.abbreviated;
     }
 
     pub fn negotiatedSuite(self: *const Connection12) ?CipherSuite12 {
@@ -394,6 +435,10 @@ pub const Connection12 = struct {
     fn startBody(self: *Connection12, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError![]const u8 {
         if (self.role != .client or self.state != .start) return error.WrongState;
         source(entropy).bytes(&self.client_random);
+        if (self.config.resumption12 != null) {
+            source(entropy).bytes(&self.session_id);
+            self.session_id_len = 32;
+        }
         const body = try self.buildClientHello(&self.ch_body);
         self.ch_body_len = body.len;
         return self.sendClientHello(now_ms, out);
@@ -537,7 +582,7 @@ pub const Connection12 = struct {
         if (hdr.epoch == 0) {
             // Unauthenticated: only ever a retransmission of the peer's
             // epoch-0 handshake messages (its final flight, server side).
-            if (hdr.content_type == content_handshake and self.role == .server) self.resend_pending = true;
+            if (hdr.content_type == content_handshake and self.sentLastFlight()) self.resend_pending = true;
             return error.ReceivedPostHandshakeMessage;
         }
         if (hdr.epoch != 1) return error.Malformed;
@@ -561,7 +606,7 @@ pub const Connection12 = struct {
                 // A retransmitted Finished (the peer lost ours), or a
                 // HelloRequest / ClientHello asking to renegotiate, which
                 // this module never does.
-                if (self.role == .server) self.resend_pending = true;
+                if (self.sentLastFlight()) self.resend_pending = true;
                 return error.ReceivedPostHandshakeMessage;
             },
             else => return error.Malformed,
@@ -593,7 +638,7 @@ pub const Connection12 = struct {
                 return error.ReceivedAlert;
             },
             content_handshake => {
-                if (self.role == .server) self.resend_pending = true;
+                if (self.sentLastFlight()) self.resend_pending = true;
                 return error.ReceivedPostHandshakeMessage;
             },
             else => return error.Malformed,
@@ -729,7 +774,7 @@ pub const Connection12 = struct {
         if (self.read_epoch != 0 or !self.keys_live) return false;
         return switch (self.role) {
             .client => self.state == .wait_server_finished,
-            .server => self.state == .wait_client_flight and self.got_cke and (!self.client_cert_presented or self.got_cv),
+            .server => self.state == .wait_client_flight and (self.abbreviated or (self.got_cke and (!self.client_cert_presented or self.got_cv))),
         };
     }
 
@@ -898,9 +943,16 @@ pub const Connection12 = struct {
                     m12.HandshakeType.server_hello => {
                         try self.clientServerHello(body);
                         try self.appendTranscript(t, seq, body);
-                        self.state = .wait_server_hello_done;
                         self.last_rank = 0;
                         self.timer.reset();
+                        if (self.abbreviated) {
+                            // RFC 5246 §7.3: the session's master secret, new
+                            // keys from the new randoms; the server's
+                            // [NewSessionTicket], CCS and Finished come next.
+                            self.master = self.config.resumption12.?.master;
+                            self.installKeyBlock();
+                            self.state = .wait_server_finished;
+                        } else self.state = .wait_server_hello_done;
                     },
                     else => return error.UnexpectedMessage,
                 },
@@ -922,12 +974,32 @@ pub const Connection12 = struct {
                     }
                 },
                 .wait_server_finished => {
+                    if (t == hs_new_session_ticket) {
+                        // RFC 5077 §3.3: announced in the ServerHello, sent
+                        // before the server's ChangeCipherSpec.
+                        if (!self.ticket_expected) return error.UnexpectedMessage;
+                        self.ticket_expected = false;
+                        try self.appendTranscript(t, seq, body);
+                        try self.takeTicket(body);
+                        return;
+                    }
                     if (t != m12.HandshakeType.finished) return error.UnexpectedMessage;
+                    if (self.ticket_expected) return error.UnexpectedMessage; // announced, not sent
                     var th: suitehash.Secret = undefined;
                     const expected = prf12.finishedVerifyData(self.suite.hash(), &self.master, false, self.transcriptHash(&th));
                     if (body.len != prf12.verify_data_len or !std.crypto.timing_safe.eql([prf12.verify_data_len]u8, expected, body[0..prf12.verify_data_len].*))
                         return error.FinishedVerifyFailed;
                     try self.appendTranscript(t, seq, body);
+                    if (self.abbreviated) {
+                        // RFC 5246 §7.3: the client's ChangeCipherSpec and
+                        // Finished close an abbreviated handshake.
+                        self.tx_len = 0;
+                        try self.cacheEntry(.change_cipher_spec, &.{1});
+                        var th2: suitehash.Secret = undefined;
+                        const vd = prf12.finishedVerifyData(self.suite.hash(), &self.master, true, self.transcriptHash(&th2));
+                        try self.sendMessage(.handshake_epoch1, m12.HandshakeType.finished, &vd);
+                        try self.emitFlight(o);
+                    }
                     self.state = .connected;
                     self.timer.reset();
                 },
@@ -939,6 +1011,18 @@ pub const Connection12 = struct {
                     try self.serverClientHello(seq, body, entropy, now_ms, o);
                 },
                 .wait_client_flight => {
+                    if (self.abbreviated) {
+                        // RFC 5246 §7.3: only the client's Finished is left.
+                        if (t != m12.HandshakeType.finished) return error.UnexpectedMessage;
+                        var th: suitehash.Secret = undefined;
+                        const expected = prf12.finishedVerifyData(self.suite.hash(), &self.master, true, self.transcriptHash(&th));
+                        if (body.len != prf12.verify_data_len or !std.crypto.timing_safe.eql([prf12.verify_data_len]u8, expected, body[0..prf12.verify_data_len].*))
+                            return error.FinishedVerifyFailed;
+                        try self.appendTranscript(t, seq, body);
+                        self.state = .connected;
+                        self.timer.reset();
+                        return;
+                    }
                     const r = rank(.server, t);
                     if (r == 0 or r <= self.last_rank) return error.UnexpectedMessage;
                     // RFC 5246 §7.4.6: after a CertificateRequest the client
@@ -969,7 +1053,7 @@ pub const Connection12 = struct {
                             if (body.len != prf12.verify_data_len or !std.crypto.timing_safe.eql([prf12.verify_data_len]u8, expected, body[0..prf12.verify_data_len].*))
                                 return error.FinishedVerifyFailed;
                             try self.appendTranscript(t, seq, body);
-                            try self.serverFinalFlight(o);
+                            try self.serverFinalFlight(entropy, o);
                         },
                         else => unreachable,
                     }
@@ -1001,7 +1085,7 @@ pub const Connection12 = struct {
             any_cert = any_cert or kx.usesCertificate();
         }
         var ext_buf: [512]u8 = undefined;
-        var exts: [10]m12.Extension = undefined;
+        var exts: [11]m12.Extension = undefined;
         var n: usize = 0;
         var used: usize = 0;
         if (any_ecdhe) {
@@ -1039,10 +1123,18 @@ pub const Connection12 = struct {
             used += 1 + c.len;
             n += 1;
         }
+        // RFC 5077 §3.2: the ticket to resume, or empty to ask for one.
+        if (self.config.resumption12) |t| {
+            exts[n] = .{ .ext_type = ext_session_ticket, .data = t.identity() };
+            n += 1;
+        } else if (self.config.session_tickets12) {
+            exts[n] = .{ .ext_type = ext_session_ticket, .data = &.{} };
+            n += 1;
+        }
         exts[n] = .{ .ext_type = m12.ext_extended_master_secret, .data = &.{} };
         exts[n + 1] = .{ .ext_type = m12.ext_renegotiation_info, .data = &m12.renegotiation_info_initial };
         n += 2;
-        return m12.encodeClientHello(.{ .random = self.client_random, .cipher_suites = suites[0..ns], .extensions = exts[0..n] }, buf) catch |e| switch (e) {
+        return m12.encodeClientHello(.{ .random = self.client_random, .session_id = self.session_id[0..self.session_id_len], .cipher_suites = suites[0..ns], .extensions = exts[0..n] }, buf) catch |e| switch (e) {
             error.BufferTooShort => error.BufferTooShort,
             else => error.Malformed,
         };
@@ -1138,12 +1230,28 @@ pub const Connection12 = struct {
                 if (self.config.connection_id == null) return error.Malformed; // not offered
                 try self.takePeerCid(e.data);
             },
+            ext_session_ticket => {
+                // RFC 5077 §3.2: empty, and only when offered.
+                if (e.data.len != 0 or !(self.config.session_tickets12 or self.config.resumption12 != null)) return error.Malformed;
+                self.ticket_expected = true;
+            },
             // RFC 5246 §7.4.1.4: a server MUST NOT send an extension the
             // client did not offer.
             else => return error.Malformed,
         };
         if (!ri_ok) return error.SecureRenegotiationRequired;
         if (!ems and self.config.require_extended_master_secret) return error.ExtendedMasterSecretRequired;
+        // RFC 5077 §3.4: a server that takes the ticket echoes the session ID
+        // the client sent with it.
+        if (self.config.resumption12) |t| {
+            if (self.session_id_len > 0 and std.mem.eql(u8, sh.session_id, self.session_id[0..self.session_id_len])) {
+                if (suite != t.suite) return error.Malformed; // RFC 5246 §7.4.1.3: the session's suite
+                // RFC 7627 §5.3: a session with the extended master secret
+                // resumes only with it, one without only without.
+                if (ems != t.ems) return error.ExtendedMasterSecretRequired;
+                self.abbreviated = true;
+            }
+        }
         self.ems = ems;
         self.suite = suite;
         self.kx = suite.keyExchange().?;
@@ -1327,6 +1435,7 @@ pub const Connection12 = struct {
         var alpn_offer: ?[]const u8 = null;
         var srtp_offer: ?[]const u8 = null;
         var cid_offer: ?[]const u8 = null;
+        var ticket_offer: ?[]const u8 = null;
         var ems = false;
         var ri = m12.offersSuite(dec.cipher_suites_raw, m12.empty_renegotiation_info_scsv);
         for (dec.extensions) |e| switch (e.ext_type) {
@@ -1341,6 +1450,7 @@ pub const Connection12 = struct {
             messages.ext_use_srtp => srtp_offer = e.data,
             conn13.ext_connection_id => cid_offer = e.data,
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
+            ext_session_ticket => ticket_offer = e.data,
             else => {},
         };
         // RFC 5746 §4.3: a server that never renegotiates MAY complete a
@@ -1366,11 +1476,25 @@ pub const Connection12 = struct {
             peer_schemes = messages.filterU16ListExtension(client_schemes, self.advertisedSchemes(&mine), &peer_schemes_buf) catch return error.Malformed;
         }
 
+        // RFC 5077 §3.1: an offered ticket this server sealed, still within
+        // its lifetime, of a suite the client offers and this side runs, and
+        // with the same extended-master-secret use (RFC 7627 §5.3), resumes
+        // with an abbreviated handshake; anything else is a full one.
+        var resumed_master: [prf12.master_secret_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &resumed_master);
+        var resumed_suite: ?CipherSuite12 = null;
+        if (self.config.tickets) |tk| {
+            if (ticket_offer) |offer| {
+                self.ticket_expected = tk.lifetime_s > 0;
+                if (offer.len > 0) resumed_suite = self.openTicket12(tk, offer, dec.cipher_suites_raw, &resumed_master);
+            }
+        }
+
         // Suite: our preference, among what the client offered and what this
         // side can actually complete.
         var group: u16 = 0;
         var scheme: u16 = 0;
-        const chosen: CipherSuite12 = for (self.config.cipher_suites12) |s| {
+        const chosen: CipherSuite12 = if (resumed_suite) |rs| rs else for (self.config.cipher_suites12) |s| {
             if (!self.offeredSuite(s) or !m12.offersSuite(dec.cipher_suites_raw, @backingInt(s))) continue;
             const kx = s.keyExchange().?;
             if (kx.usesEcdhe()) {
@@ -1418,6 +1542,13 @@ pub const Connection12 = struct {
         source(entropy).bytes(&self.server_random);
         // RFC 8446 §4.1.3: a server that could have spoken 1.3 says so.
         if (self.config.allows(.dtls13)) self.server_random[24..32].* = m12.downgrade_sentinel_12;
+        if (resumed_suite != null) {
+            // RFC 5077 §3.4: echo the client's session ID.
+            if (dec.session_id.len > 32) return error.Malformed;
+            @memcpy(self.session_id[0..dec.session_id.len], dec.session_id);
+            self.session_id_len = @intCast(dec.session_id.len);
+            self.abbreviated = true;
+        }
 
         // Flight 4.
         self.tx_len = 0;
@@ -1457,8 +1588,29 @@ pub const Connection12 = struct {
                 exts[n] = .{ .ext_type = conn13.ext_connection_id, .data = cid_buf[0 .. 1 + @as(usize, self.cid_own_len)] };
                 n += 1;
             }
-            const sh = m12.encodeServerHello(.{ .random = self.server_random, .cipher_suite = @backingInt(self.suite), .extensions = exts[0..n] }, &buf) catch return error.BufferTooShort;
+            if (self.ticket_expected) {
+                exts[n] = .{ .ext_type = ext_session_ticket, .data = &.{} };
+                n += 1;
+            }
+            const sh = m12.encodeServerHello(.{ .random = self.server_random, .session_id = self.session_id[0..self.session_id_len], .cipher_suite = @backingInt(self.suite), .extensions = exts[0..n] }, &buf) catch return error.BufferTooShort;
             try self.sendMessage(.handshake_epoch0, m12.HandshakeType.server_hello, sh);
+        }
+        if (self.abbreviated) {
+            // RFC 5246 §7.3: ServerHello, [NewSessionTicket],
+            // ChangeCipherSpec, Finished; the client's CCS + Finished last.
+            self.master = resumed_master;
+            self.installKeyBlock();
+            if (self.ticket_expected) try self.sendTicket12(entropy);
+            try self.cacheEntry(.change_cipher_spec, &.{1});
+            var th: suitehash.Secret = undefined;
+            const vd = prf12.finishedVerifyData(self.suite.hash(), &self.master, false, self.transcriptHash(&th));
+            try self.sendMessage(.handshake_epoch1, m12.HandshakeType.finished, &vd);
+            try self.emitFlight(o);
+            self.timer.reset();
+            self.timer.arm(now_ms);
+            self.state = .wait_client_flight;
+            self.last_rank = 0;
+            return;
         }
         if (self.kx.usesCertificate()) {
             const cb = m12.encodeCertificate(self.config.cert.?.chain, &buf) catch return error.BufferTooShort;
@@ -1538,8 +1690,9 @@ pub const Connection12 = struct {
         if (self.cert_requested and self.config.require_peer_cert and !self.client_cert_presented) return error.PeerCertificateRequired;
     }
 
-    fn serverFinalFlight(self: *Connection12, o: *Out) HandshakeError!void {
+    fn serverFinalFlight(self: *Connection12, entropy: Entropy, o: *Out) HandshakeError!void {
         self.tx_len = 0;
+        if (self.ticket_expected) try self.sendTicket12(entropy);
         try self.cacheEntry(.change_cipher_spec, &.{1});
         var th: suitehash.Secret = undefined;
         const vd = prf12.finishedVerifyData(self.suite.hash(), &self.master, false, self.transcriptHash(&th));
@@ -1576,6 +1729,12 @@ pub const Connection12 = struct {
         var sh: suitehash.Secret = undefined;
         const session_hash = self.transcriptHash(&sh);
         prf12.masterSecret(alg, pms, self.ems, &self.client_random, &self.server_random, session_hash, &self.master);
+        self.installKeyBlock();
+    }
+
+    /// The key block from `master` and the two randoms (RFC 5246 §6.3).
+    fn installKeyBlock(self: *Connection12) void {
+        const alg = self.suite.hash();
         const bulk = self.suite.bulk();
         const kl = bulk.keyLen();
         const il = bulk.fixedIvLen();
@@ -1605,6 +1764,69 @@ pub const Connection12 = struct {
         ck.wipe();
         sk.wipe();
         self.keys_live = true;
+    }
+
+    /// Server: opens an offered RFC 5077 ticket (`serverClientHello`); the
+    /// session's suite when it can be resumed, its master secret in
+    /// `master_out`. Null for anything else (a full handshake follows).
+    fn openTicket12(self: *const Connection12, tk: conn13.Tickets, blob: []const u8, offered_raw: []const u8, master_out: *[prf12.master_secret_len]u8) ?CipherSuite12 {
+        var plain: [conn13.ticket12_state_len + 64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
+        const st = tk.ticketer.open(tk.ticketer.ctx, blob, self.config.now_sec, &plain) orelse return null;
+        if (st.len != conn13.ticket12_state_len or st[0] != conn13.ticket12_state_version) return null;
+        const suite: CipherSuite12 = @fromBackingInt(std.mem.readInt(u16, st[1..3], .big));
+        const ems = st[3] == 1;
+        const issued = std.mem.readInt(i64, st[4..12], .big);
+        const lifetime = std.mem.readInt(u32, st[12..16], .big);
+        const age = self.config.now_sec -| issued;
+        if (age < 0 or age > lifetime) return null;
+        if (ems != self.ems) return null;
+        if (!self.offeredSuite(suite) or !m12.offersSuite(offered_raw, @backingInt(suite))) return null;
+        @memcpy(master_out, st[16..][0..prf12.master_secret_len]);
+        return suite;
+    }
+
+    /// Server: seals this session (`master`, suite, EMS) and sends it as a
+    /// NewSessionTicket (RFC 5077 §3.3); a ticketer that refuses sends the
+    /// empty ticket §3.3 allows after the announcement.
+    fn sendTicket12(self: *Connection12, entropy: Entropy) HandshakeError!void {
+        const tk = self.config.tickets.?;
+        var st: [conn13.ticket12_state_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &st);
+        st[0] = conn13.ticket12_state_version;
+        std.mem.writeInt(u16, st[1..3], @backingInt(self.suite), .big);
+        st[3] = @intFromBool(self.ems);
+        std.mem.writeInt(i64, st[4..12], self.config.now_sec, .big);
+        const lifetime = @min(tk.lifetime_s, tlsresume.ticket.max_ticket_lifetime_s);
+        std.mem.writeInt(u32, st[12..16], lifetime, .big);
+        @memcpy(st[16..][0..prf12.master_secret_len], &self.master);
+        var nonce: [12]u8 = undefined;
+        source(entropy).bytes(&nonce);
+        var blob_buf: [conn13.ticket12_state_len + tlsresume.stek.overhead]u8 = undefined;
+        const blob = tk.ticketer.seal(tk.ticketer.ctx, &st, nonce, &blob_buf) orelse blob_buf[0..0];
+        var body_buf: [6 + blob_buf.len]u8 = undefined;
+        const body = (tlsresume.ticket12.NewSessionTicket12{ .lifetime_hint_s = lifetime, .ticket = blob }).encode(&body_buf) catch return error.BufferTooShort;
+        try self.sendMessage(.handshake_epoch0, hs_new_session_ticket, body);
+    }
+
+    /// Client: keeps the ticket of a NewSessionTicket (RFC 5077 §3.3); an
+    /// empty one withdraws the announcement, one over `max_ticket_len` is
+    /// not kept.
+    fn takeTicket(self: *Connection12, body: []const u8) HandshakeError!void {
+        const nst = tlsresume.ticket12.NewSessionTicket12.decode(body) catch return error.Malformed;
+        if (nst.isWithdrawal() or nst.ticket.len > conn13.max_ticket_len) return;
+        if (self.ticket_live) self.ticket.wipe();
+        self.ticket = .{
+            .suite = self.suite,
+            .master = self.master,
+            .ems = self.ems,
+            .ticket = undefined,
+            .ticket_len = @intCast(nst.ticket.len),
+            .lifetime_hint_s = nst.lifetime_hint_s,
+            .received_at_s = self.config.now_sec,
+        };
+        @memcpy(self.ticket.ticket[0..nst.ticket.len], nst.ticket);
+        self.ticket_live = true;
     }
 
     fn transcriptHash(self: *const Connection12, out: *suitehash.Secret) []const u8 {

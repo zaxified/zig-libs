@@ -515,6 +515,39 @@ pub const SessionTicket = struct {
     }
 };
 
+/// A DTLS 1.2 session ticket (RFC 5077) a client received
+/// (`Connection12.sessionTicket`) and can offer again (`Config.resumption12`)
+/// for an abbreviated handshake (RFC 5246 §7.3). A plain value holding the
+/// session's master secret: keep it secret, `wipe` it when done.
+pub const SessionTicket12 = struct {
+    suite: CipherSuite12,
+    master: [48]u8,
+    /// RFC 7627: the session used the extended master secret; a resumption
+    /// must negotiate it again (§5.3).
+    ems: bool,
+    ticket: [max_ticket_len]u8,
+    ticket_len: u16,
+    /// The server's `ticket_lifetime_hint` (s), 0 = unspecified.
+    lifetime_hint_s: u32,
+    /// `Config.now_sec` when it arrived.
+    received_at_s: i64,
+
+    pub fn identity(self: *const SessionTicket12) []const u8 {
+        return self.ticket[0..self.ticket_len];
+    }
+
+    pub fn wipe(self: *SessionTicket12) void {
+        std.crypto.secureZero(u8, &self.master);
+    }
+};
+
+/// The DTLS 1.2 server's ticket plaintext (RFC 5077 §4's recommended
+/// content, minus what the engine does not keep): version 2, suite, EMS
+/// flag, issued-at (s), lifetime, master secret. Version 2 keeps a 1.2
+/// ticket from parsing as a 1.3 one under the same `Ticketer`.
+pub const ticket12_state_version: u8 = 2;
+pub const ticket12_state_len = 1 + 2 + 1 + 8 + 4 + 48;
+
 /// The server's ticket plaintext: version, suite, issued-at (s), age_add,
 /// lifetime, max_early_data, the PSK length and the PSK.
 const ticket_state_version: u8 = 1;
@@ -727,11 +760,13 @@ pub const Config = struct {
     /// record (Finished included) is a `tls12_cid` record carrying the
     /// peer's CID when it asked for a non-empty one.
     connection_id: ?[]const u8 = null,
-    /// DTLS 1.3 server: issue session tickets after each `.cert_dhe` /
-    /// `.cert_dhe_insecure_unauthenticated` handshake and resume the ones
-    /// offered back (`psk_dhe_ke`). Null (the default) issues none and
-    /// ignores offered tickets (a full handshake). Ignored in `.psk` mode,
-    /// whose handshake already is a PSK one. The clock is `now_sec`.
+    /// Server session tickets. DTLS 1.3: issued after each `.cert_dhe` /
+    /// `.cert_dhe_insecure_unauthenticated` handshake and resumed when
+    /// offered back (`psk_dhe_ke`); ignored in `.psk` mode, whose handshake
+    /// already is a PSK one. DTLS 1.2 (RFC 5077, every key exchange): issued
+    /// when the client sends the SessionTicket extension, and an offered one
+    /// resumes with an abbreviated handshake. Null (the default) issues none
+    /// and ignores offered tickets (a full handshake). The clock is `now_sec`.
     tickets: ?Tickets = null,
     /// DTLS 1.3 client: a ticket from an earlier connection
     /// (`Connection.sessionTicket`) to offer in the ClientHello, with a fresh
@@ -741,6 +776,16 @@ pub const Config = struct {
     /// full handshake. Borrowed for the life of the `Connection`. Ignored in
     /// `.psk` mode.
     resumption: ?*const SessionTicket = null,
+    /// DTLS 1.2 client: send an empty RFC 5077 SessionTicket extension and
+    /// keep the ticket a server issues (`Connection12.sessionTicket`). Off by
+    /// default (as wolfSSL's `wolfSSL_UseSessionTicket` and pion's
+    /// `SessionStore`): the ClientHello is unchanged without it.
+    session_tickets12: bool = false,
+    /// DTLS 1.2 client: a ticket to resume (RFC 5077 §3.4: offered in the
+    /// SessionTicket extension with a fresh session ID); a server that takes
+    /// it answers with an abbreviated handshake (`Connection12.resumed`).
+    /// Implies `session_tickets12`. Borrowed for the life of the connection.
+    resumption12: ?*const SessionTicket12 = null,
 
     // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only
     // connection byte-identical to what it was before 1.2 existed.
