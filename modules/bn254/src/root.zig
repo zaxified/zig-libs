@@ -59,7 +59,7 @@ pub const pairing = @import("pairing.zig");
 pub const precompiles = @import("precompiles.zig");
 pub const groth16 = @import("groth16.zig");
 pub const msm = @import("msm.zig");
-/// RFC 9380 hash-to-curve onto `G2` (SVDW, gnark-crypto's suites).
+/// RFC 9380 hash-to-curve onto `G1` and `G2` (SVDW, gnark-crypto's suites).
 pub const hash_to_curve = @import("hash_to_curve.zig");
 
 pub const Fp = fp.Fp;

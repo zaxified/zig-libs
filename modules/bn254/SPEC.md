@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ethereum/py_ecc](https://github.com/ethereum/py_ecc) | Python | MIT | 231 | v3.0.0 (2020-05-12), pushed 2025-12-17 | Not a competitor: the oracle this module's pairing KATs were generated from. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No pairing-friendly curves. A GitHub search for BN254 in Zig found nothing. |
 
-**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication; compressed `G1`/`G2` points in gnark-crypto's convention and a public Pippenger MSM. **Where we are behind:** no arkworks-convention compressed encoding, no Groth16 prover, no hash-to-curve onto `G1` (→ *What is deliberately not done*).
+**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication; compressed `G1`/`G2` points in gnark-crypto's convention and a public Pippenger MSM. **Where we are behind:** no arkworks-convention compressed encoding, no Groth16 prover (→ *What is deliberately not done*).
 
 ## Purpose
 
@@ -640,9 +640,19 @@ conversion temporaries dirtied 0.4 KiB in ReleaseFast), and the drawn bytes are 
 (`randomIntoBuf` takes the scratch buffer as an out-parameter so the wipe is testable).
 `bls12_381` has the same entry point.
 
-## Hash to `G2` (`hash_to_curve.zig`)
+## Hash to `G1` and `G2` (`hash_to_curve.zig`)
 
-RFC 9380 hash-to-curve onto `G2`, gnark-crypto's suites (RFC 9380 defines none for BN254):
+`G1`: `hashToCurveG1(msg, dst)` = `BN254G1_XMD:SHA-256_SVDW_RO_` (gnark-crypto `HashToG1`),
+`encodeToCurveG1(msg, dst)` = `..._NU_` (`EncodeToG1`); stages `hashToFieldFp(count, msg, dst)`
+(`L = 48`, gnark-crypto's `fp.Hash`) and `mapToCurveG1(u)`, the SVDW map on `y² = x³ + 3` with
+`Z = 1` (gnark-crypto's constant, and the first value `find_z_svdw` accepts). `G1` has cofactor 1,
+so there is no clearing step (gnark-crypto has none either). Tests: gnark-crypto v0.19.2's
+`hashToG1Vector`/`encodeToG1Vector` (five messages each, `u`, `Q`, output), first reproduced by an
+RFC 9380 model in Python that also checked gnark-crypto's Montgomery-form SVDW constants; the
+constants re-derived from their definitions; the exceptional inputs land on the curve; a DST over
+255 bytes is accepted.
+
+`G2`: RFC 9380 hash-to-curve onto the twist, gnark-crypto's suites (RFC 9380 defines none for BN254):
 `hashToCurveG2(msg, dst)` = `BN254G2_XMD:SHA-256_SVDW_RO_` (gnark-crypto `HashToG2`),
 `encodeToCurveG2(msg, dst)` = `..._NU_` (`EncodeToG2`). Stages, each public:
 `hashToFieldFp2(count, msg, dst)` (`expand_message_xmd` with SHA-256 through
@@ -691,7 +701,6 @@ and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalar
 
 - **Compressed points in arkworks' convention** (little-endian `x`, flags on the last byte): only gnark-crypto's convention is offered (see "Compressed points").
 - **A public `isLexicographicallyLargest`:** the compressed codecs keep their own private `isLargest`; EIP-196/197 define no compressed form, so the precompile path needs none.
-- **Hash-to-curve onto `G1`** (gnark-crypto's `BN254G1_XMD:SHA-256_SVDW_*` suites): no in-repo consumer; `hash_to_curve.zig` covers `G2`, the group a ceremony or BLS-on-BN254 hashes to.
 - **A Groth16 prover:** the module verifies proofs (snarkjs-produced ones included) but does not produce them.
 - **A batched `groth16.verify` accumulation:** the verifier's own `msm` is a plain loop of `scalarMul`/`add` (a handful of public inputs, no allocator); the Pippenger `msm.zig` is a separate public API.
 - **Gas or an EVM model:** the precompiles carry none; mapping `error.*` to "revert" is a future EVM-interpreter caller's job.
