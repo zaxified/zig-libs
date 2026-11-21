@@ -38,7 +38,7 @@ See `src/oracle_test.zig` + `src/oracle_vectors.zig`.
 ## Not provided
 
 No delegation-chain walker from a root trust anchor (this module validates one zone cut, see `chain.zig`), no RFC 5011
-rollover, no zone signing or key generation, and no choice of the strongest algorithm among several signatures
+rollover, no key generation (`sign.zig` signs RRsets and builds DNSKEY / DS data), and no choice of the strongest algorithm among several signatures
 (RFC 6840 §5.11): the resolver's job. The plain-NSEC denial proof (`nsec.proveDenial`) is unit-tested but not yet
 checked against `ldns` the way the NSEC3 proof is. Details and open work: `SPEC.md` *Threat model*, *Backlog /
 deferred*, *Open*.
@@ -52,6 +52,7 @@ deferred*, *Open*.
 | `src/nsec3.zig` | owner-hash labels (base32hex via the `base32` module) + NSEC3 iterated-SHA-1 hash (RFC 5155 §5); closest-encloser / next-closer denial proof incl. Opt-Out (RFC 5155 §8) | real, oracle-verified |
 | `src/nsec.zig` | plain-NSEC (non-NSEC3) denial proof (RFC 4035 §5.4): canonical-order gap coverage (RFC 4034 §6.1), NODATA, wildcard, insecure-delegation | real, tested |
 | `src/keys.zig` | DNSKEY public-key wire decode (RFC 3110/6605/8080) + per-algorithm signature verify dispatch | real, tested |
+| `src/sign.zig` | Zone signing: RRSIG creation (RSA 8/10, ECDSA 13/14, Ed25519), DNSKEY / DS rdata encoding | real, tested |
 | `src/ds.zig` | DS digest computation (RFC 4034 §5.1.4) + DNSKEY matching | real, tested |
 | `src/canonical.zig` | RFC 4034 §3.1.8.1 canonical RRset signed-data construction (wildcard + original-TTL + embedded-name lowering) | real, oracle-verified |
 | `src/policy.zig` | RFC 8624 DNSKEY-algorithm / DS-digest validation policy (`Policy`, default refuses the MUST NOT rows; `ValidateOptions.policy`, `chain.validateDnskeySetPolicy`) | real, tested |

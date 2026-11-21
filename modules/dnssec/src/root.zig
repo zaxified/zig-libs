@@ -88,6 +88,8 @@ pub const policy = @import("policy.zig");
 
 /// DS-to-DNSKEY delegation-chain link — real, oracle-verified.
 pub const chain = @import("chain.zig");
+/// Zone signing: DNSKEY / DS record data and RRSIG creation (`sign.zig`).
+pub const sign = @import("sign.zig");
 
 test {
     _ = wire;
@@ -98,6 +100,7 @@ test {
     _ = ds;
     _ = canonical;
     _ = chain;
+    _ = sign;
     _ = policy;
     _ = @import("oracle_test.zig");
     _ = @import("rfc8080_test.zig");

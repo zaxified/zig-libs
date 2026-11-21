@@ -189,9 +189,10 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
   (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
 - **RFC 5011 trust-anchor rollover** (survey). In Unbound and Hickory. Effort: medium (state machine with clock).
   Fits §2.
-- **Zone/RRset signing (`rrsig` creation, DS from DNSKEY, key-tag) for algorithms 8/13/14/15** (survey). miekg/dns,
-  ldns and dnspython sign; someone building an authoritative tool or a test-zone generator needs it. Effort: medium;
-  std has the ECDSA/Ed25519 signers, RSA signing in the `rsa` sibling (inferred, not checked). Fits §2.
+- **Signing oracle:** `sign.zig` (RRSIG creation for algorithms 8, 10, 13, 14, 15, DNSKEY / DS rdata, RFC 3110 RSA key
+  encoding; deterministic, no clock or RNG) is checked only by verifying its output with this module's own
+  `keys.verifySignature` over `canonical.buildSignedData`, not yet by a foreign verifier (`ldns-verify-zone`,
+  dnspython). Ed448 (16) has no signer in `ed448`. Key generation stays the caller's (std / `rsa` generate).
 
 ## Open
 
