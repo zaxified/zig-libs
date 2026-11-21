@@ -318,6 +318,9 @@ alignment (loads are unaligned; `@ptrCast` to `*align(1)` vectors).
   dispatch and the call limit; the assembly itself and the comptime constants are not mutated (any change to them
   fails the FIPS answers and the OpenSSL oracle).
 - **Bench:** `zig build bench-sha2` (`tools/bench.zig`) against OpenSSL; `src/bench.zig` against std.
+- **32-bit targets:** the test file compiles and passes for `arm-linux-musleabi` and `mips-linux-musl` (run under
+  `qemu-arm`/`qemu-mips`, 2026-11-21: `zig test -target … --test-cmd qemu-… --test-cmd-bin`); the 4 GiB test skips
+  where `usize` is 32 bits. `.targets` stays linux64 (no CI lane for them).
 
 ## Speed
 
@@ -358,8 +361,6 @@ one instruction per word.
 
 ## Backlog / deferred
 
-- **32-bit targets:** this module's own tests do not compile for `mips-linux-musl` or `arm-linux-musleabi` (seen by
-  `hashdigest`), cause not examined. `.targets` stays linux64 and `hashdigest` uses std there.
 - **SHA512 extension (x86).** CRYPTOGAMS has had a SHA512-extension path
   since 2023. It needs Arrow Lake or later, and neither the development CPU
   nor QEMU 10.2's TCG runs it, so it would ship untested. Revisit when a

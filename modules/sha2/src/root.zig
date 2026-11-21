@@ -1187,8 +1187,10 @@ test "4 GiB + 64 bytes in one update (opt-in: SHA2_BIG=1, ReleaseFast)" {
     // Untouched anonymous pages read as zeros without resident memory.
     if (std.testing.environ.getPosix("SHA2_BIG") == null) return error.SkipZigTest;
     if (!cpuRuns(.avx2)) return error.SkipZigTest;
+    // 4 GiB does not fit a 32-bit `usize` (and the AVX2 path is x86-64 only).
+    if (@sizeOf(usize) < 8) return error.SkipZigTest;
     defer test_hooks.forced = null;
-    const len = ((1 << 26) + 1) * 64;
+    const len: usize = if (@sizeOf(usize) >= 8) ((1 << 26) + 1) * 64 else 0;
     const m = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     defer std.posix.munmap(m);
     var want: [32]u8 = undefined;
@@ -1293,7 +1295,8 @@ fn fuzzAgreeSmith(_: void, smith: *std.testing.Smith) !void {
 
 /// A message length: under the driver a third of the draws sit within two
 /// octets of a padding boundary (55/56/63/64, 111/112/127/128 and their
-/// multiples), where the one-block / two-block finalisation switches.
+/// multiples), where the one-block / two-block finalisation switches, and
+/// one in 24 is the empty message.
 fn fuzzLen(comptime S: type, src: *S, cap: usize) usize {
     if (S != fuzz_driver.Rng) return src.slice(fuzz_buf[0..cap]);
     if (src.valueRangeAtMost(u8, 0, 2) == 0) {
@@ -1305,6 +1308,10 @@ fn fuzzLen(comptime S: type, src: *S, cap: usize) usize {
         markAgree(.boundary);
         return len;
     }
+    // The empty message on purpose, 1 draw in 16: left to `slice`, how often
+    // it comes out depends on the PRNG's `usize` width, and on a 32-bit target
+    // 300 seeds never drew it.
+    if (src.valueRangeAtMost(u8, 0, 15) == 0) return 0;
     return src.slice(fuzz_buf[0..cap]);
 }
 
