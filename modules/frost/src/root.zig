@@ -281,6 +281,20 @@ pub fn h5(msg: []const u8) [32]u8 {
     return out;
 }
 
+/// `HDKG(m)`: `hash_to_field(m, 1)` with `DST = contextString || "dkg"` —
+/// not part of RFC 9591 (which leaves key generation out), but the
+/// challenge hash frost-core's `FROST(secp256k1, SHA-256)` ciphersuite
+/// defines for the distributed key generation's proof of knowledge
+/// (`dkg.zig`). Same construction as `h1`..`h3`.
+pub fn hdkg(msg: []const u8) Scalar {
+    return hashToScalar(context_string ++ "dkg", &.{msg});
+}
+
+/// Distributed key generation (frost-core's `dkg` module: the FROST paper's
+/// two-round Pedersen DKG with a Schnorr proof of knowledge of each
+/// participant's secret). See `dkg.zig`.
+pub const dkg = @import("dkg.zig");
+
 // ── nonce_generate (RFC 9591 §4.1) — REAL, pure H3 glue ─────────────────
 
 /// RFC 9591 §4.1 `nonce_generate(secret)`: `H3(random_bytes ||
@@ -1033,35 +1047,9 @@ noinline fn round2SignBurned(
     return SignatureShare.fromScalar(sig_share);
 }
 
-/// Audit 2026-10-08 (HIGH). `generateNonces`, `round1Commit` and
-/// `round2Sign` had no stack burn: measured with `stackprobe_test.zig`
-/// (ReleaseFast), each left the signing share and/or the secret nonces on
-/// the dead stack — and a nonce next to the published signature share is
-/// `lambda_i·sk_i`, i.e. the share. Same fix as `bip340.sign`: each runs its
-/// work one `noinline` frame down (secrets passed on by value — taking a
-/// parameter's address makes Zig copy it into the public function's own
-/// frame, above the burn, as bip340's review R1 measured) and `stack_burn` bytes at that depth
-/// are zeroed after it returns. `stackprobe_test.zig` asserts zero residue
-/// and prints how deep each call dirtied the stack (19 KB for `round2Sign`).
-const stack_burn = 32 * 1024;
-
-/// `noinline` is load-bearing (as `bip340`'s `burnSignStack`): inlined, the
-/// buffer lands in the caller's frame, above the region to clear.
-/// Volatile stores keep the dead store.
-noinline fn burnStack() void {
-    // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
-    // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
-    // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
-    // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
-    // the buffer alone did not stop it). At 16 the frame needs no realignment and
-    // the buffer ends at the saved frame pointer.
-    const V = @Vector(2, u64);
-    var buf: [stack_burn / @sizeOf(V)]V align(16) = undefined;
-    const p: [*]align(16) volatile V = &buf;
-    for (0..buf.len) |i| p[i] = @splat(0);
-}
+/// The dead-stack burn every secret-touching entry point runs after its
+/// `noinline` body (`burn.zig`, shared with `dkg.zig`).
+const burnStack = @import("burn.zig").burnStack;
 
 pub const AggregateError = error{
     OutOfMemory,
@@ -1532,6 +1520,7 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("dkg_test.zig");
 }
 
 test "meta.model_after names RFC 9591 and the secp256k1 ciphersuite" {

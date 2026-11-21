@@ -103,6 +103,12 @@ frost.verify(msg, sig: Signature, group_public_key: GroupPublicKey) bool
 frost.trustedDealerKeygen(allocator, secret_key: Scalar, coefficients: []const Scalar, max_participants: u16, min_participants: u16) !TrustedDealerKeygenResult
 frost.secretShareCombine(shares: []const ParticipantShare) !Scalar
 frost.vssVerify(share: *const ParticipantShare, vss_commitment: []const Element) !bool   // RFC 9591 C.2
+
+// Distributed key generation (frost-core's dkg: part1 / part2 / part3):
+frost.dkg.part1(allocator, out: *dkg.Round1SecretPackage, identifier, max_signers, min_signers, coefficients: []const Scalar, nonce: *const Scalar) !dkg.Round1Package
+frost.dkg.part2(allocator, out: *dkg.Round2SecretPackage, secret: *const dkg.Round1SecretPackage, round1_packages: []const dkg.Round1Received, culprit: ?*Identifier) ![]dkg.Round2Package
+frost.dkg.part3(allocator, out: *dkg.KeyPackage, secret: *const dkg.Round2SecretPackage, round1_packages, round2_packages: []const dkg.Round2Received, culprit: ?*Identifier) !dkg.PublicKeyPackage
+frost.dkg.verifyProofOfKnowledge(sender: Identifier, package: dkg.Round1Package) bool
 ```
 
 ## Usage
@@ -131,12 +137,12 @@ std.debug.assert(frost.verify(msg, sig, keygen.group_public_key));
 zig build test-frost
 ```
 
-RFC 9591 Appendix E.5 known-answer tests for every core, an end-to-end (2,3)
-round trip, deterministic fuzz harnesses (`FROST_FUZZ`) and a dead-stack probe
+RFC 9591 Appendix E.5 known-answer tests for every core, frost-core's published
+DKG vector, an end-to-end (2,3) round trip, deterministic fuzz harnesses (`FROST_FUZZ`) and a dead-stack probe
 for the secrets; `SPEC.md` *Verification* lists the classes.
 
 ## Not provided
 
-Other ciphersuites (ristretto255, Ed25519, Ed448, P-256), distributed key
-generation, a BIP-340/Taproot-compatible variant, share refresh, repair and
-re-randomized signatures: see `SPEC.md` *Compared with* and *Backlog / deferred*.
+Other ciphersuites (ristretto255, Ed25519, Ed448, P-256), a BIP-340/Taproot-compatible
+variant, share refresh, repair and re-randomized signatures: see `SPEC.md` *Compared with*
+and *Roadmap*.

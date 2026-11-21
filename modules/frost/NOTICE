@@ -63,6 +63,15 @@ in this module — see `root.zig`'s explicit BIP340-incompatibility
 finding for why FROST(secp256k1, SHA-256) cannot share `bip340`'s
 sign/verify/codec logic.
 
+Distributed key generation (`src/dkg.zig`, 2026-11-21): follows
+frost-core (ZcashFoundation/frost, https://github.com/ZcashFoundation/frost,
+MIT OR Apache-2.0), `frost-core/src/keys/dkg.rs` and
+`frost-secp256k1/src/lib.rs` (`HDKG`) at frost-core v3.0.0, read as the
+design reference; no code was ported. The test vector in
+`src/dkg_test.zig` is transcribed from
+`frost-secp256k1/tests/helpers/vectors_dkg.json` (same repository and
+licence): test data (scalars and points), cited at the table.
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
 **Status: scaffold.** Wire codecs, RFC §4.3 list operations, and the five

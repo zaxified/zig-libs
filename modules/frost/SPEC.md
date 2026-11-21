@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No threshold-signature code. |
 | sibling [`musig2`](../musig2/README.md) | Zig | this repo | — | — | n-of-n BIP-327 multi-signature giving BIP-340 signatures; the answer for a Taproot user who does not need `t < n`. Not a FROST substitute. |
 
-**Where we are ahead:** the only RFC-vector-anchored FROST in Zig that we found (the one other Zig FROST, `bsvz-frost`, was not examined beyond its description): every intermediate value of RFC 9591 Appendix E.5 is pinned byte-exact (binding factors, nonces, shares, final signature); nominally distinct wire types (`SigningShare` vs `SignatureShare`) so a share cannot be passed where a signature share belongs; explicit-randomness inputs so signing is replayable; mutation-audited; ctgrind harness; dead-stack probe. **Where we are behind:** one ciphersuite of the RFC's five (secp256k1 only — the RFC's recommended ristretto255 and the widely deployed Ed25519 are absent) (→ Backlog); no distributed key generation (frost-core has one; the sibling `dkg` is GJKR for ECDSA only); no BIP-340 / Taproot-compatible variant (`frost-secp256k1-tr`, multi-party-sig); no share refresh, repair or re-randomized signatures.
+**Where we are ahead:** the only RFC-vector-anchored FROST in Zig that we found (the one other Zig FROST, `bsvz-frost`, was not examined beyond its description): every intermediate value of RFC 9591 Appendix E.5 is pinned byte-exact (binding factors, nonces, shares, final signature); nominally distinct wire types (`SigningShare` vs `SignatureShare`) so a share cannot be passed where a signature share belongs; explicit-randomness inputs so signing is replayable; mutation-audited; ctgrind harness; dead-stack probe; frost-core's distributed key generation (`frost.dkg`), checked against frost-core's published DKG vector. **Where we are behind:** one ciphersuite of the RFC's five (secp256k1 only — the RFC's recommended ristretto255 and the widely deployed Ed25519 are absent) (→ Roadmap); no BIP-340 / Taproot-compatible variant (`frost-secp256k1-tr`, multi-party-sig); no share refresh, repair or re-randomized signatures.
 
 ## Design
 
@@ -180,10 +180,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   dealer must generate good randomness, delete `secret_key`/
   `secret_key_shares` after distribution, and keep them confidential
   until distributed — this module's `trustedDealerKeygen` does not (and
-  cannot) enforce any of that; it is a pure computation. A production
-  deployment wanting to avoid a single trusted dealer needs a distributed
-  key-generation protocol, which is explicitly out of scope for RFC 9591
-  itself and not yet in this module (see Backlog).
+  cannot) enforce any of that; it is a pure computation. A deployment
+  that must not have a single trusted dealer uses the distributed key
+  generation (`frost.dkg`, below), which RFC 9591 itself leaves out.
 - **`verify`/`verifySignatureShare` never panic on adversarial input** —
   `verify` returns `bool` (every malformed input is `false`); `verifySignatureShare`
   returns an error union for malformed input and `false` for a well-formed share that does not
@@ -224,13 +223,60 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - Ristretto255/Ed25519/Ed448/P-256 ciphersuites (RFC 9591 §6.1-§6.4) —
   not yet, see Roadmap; each needs its own module (different
   group/hash/`Ne`/`Ns`).
-- Distributed key generation (an alternative to Appendix C's trusted
-  dealer) — RFC 9591 does not specify one, so the first version left it
-  out; not yet, see Backlog.
 - Distributed/removed-Coordinator deployment shapes (RFC 9591 §7.5) — the
   Coordinator role here is left to the caller/consumer, same as the RFC's
   own framing (this module supplies the per-role FUNCTIONS, not a
   network protocol or role-assignment policy).
+
+## Distributed key generation (`dkg.zig`)
+
+`frost.dkg` is frost-core's `dkg` module (the reference: ZcashFoundation/frost, frost-core v3.0.0,
+`frost-core/src/keys/dkg.rs`, read; MIT OR Apache-2.0): the FROST paper's two-round Pedersen DKG with a
+Schnorr proof of knowledge of each participant's constant term (Komlo–Goldberg 2020, Figure 1). RFC 9591
+specifies none (its Appendix C is the trusted dealer); the construction, the challenge hash and the checks
+are frost-core's.
+
+- `part1(allocator, out: *Round1SecretPackage, identifier, max_signers, min_signers, coefficients: []const
+  Scalar, nonce: *const Scalar) !Round1Package`: Feldman commitment `φ_j = a_j·G` to the `min_signers`
+  coefficients (`a_0` first) and the proof `(R, μ)`, `R = k·G`, `μ = k + a_0·c`,
+  `c = HDKG(SerializeScalar(i) || SerializeElement(φ_0) || SerializeElement(R))`; `frost.hdkg` is
+  `hash_to_field` with DST `contextString || "dkg"` (frost-core's `HDKG` for this ciphersuite). The
+  randomness is the caller's, as in the rest of the module.
+- `part2(allocator, out: *Round2SecretPackage, secret: *const Round1SecretPackage, round1_packages: []const
+  Round1Received, culprit: ?*Identifier) ![]Round2Package`: frost-core's checks in its order — exactly
+  `max_signers - 1` packages (`IncorrectNumberOfPackages`), the own identifier absent
+  (`UnknownIdentifier`), every commitment of length `min_signers` (`IncorrectNumberOfCommitments`), then
+  each proof (`InvalidProofOfKnowledge`, sender in `culprit`) — and the shares `f_i(ℓ)` to send privately.
+  frost-core's packages are a map keyed by sender, so a repeated sender cannot occur there; here it is
+  `DuplicatedIdentifier` (frost-core's name for a repeated identifier elsewhere).
+- `part3(allocator, out: *KeyPackage, secret: *const Round2SecretPackage, round1_packages, round2_packages:
+  []const Round2Received, culprit) !PublicKeyPackage`: counts and sender sets (`IncorrectPackage` for a
+  round-1 sender with no share), each share checked with `vssVerify` against its sender's commitment
+  (`InvalidSecretShare`, sender in `culprit`), `s_i = Σ f_ℓ(i)`, the group key `Σ φ_ℓ0` and every
+  participant's verifying share from the summed commitments (ascending by identifier, as frost-core's
+  `BTreeMap`). `InvalidCommitment` covers an identity in the summed commitment (cancelling polynomials;
+  frost-core fails there on serialization).
+- `verifyProofOfKnowledge(sender, package) bool` is public (frost-core's is `internals`-only) for a
+  coordinator that relays round-1 packages.
+- Secrets: `coefficients`, `nonce`, the received shares; every part runs one `noinline` frame down and
+  burns the stack after it (`burn.zig`, shared with signing); the secret packages and `Round2Package`
+  lists have wiping `deinit`/`freeRound2Packages`. The `KeyPackage` feeds `generateNonces`/`round2Sign`
+  directly.
+- Channels are the caller's (DKG requirement): round-1 packages over an authenticated broadcast, round-2
+  shares over confidential authenticated point-to-point channels; `sender` is what the channel vouches for.
+- Not offered: frost-core's serde/postcard package encoding (a versioned header around the same
+  elements and scalars) — the packages here are plain values whose parts have this module's codecs.
+
+Tests (`dkg_test.zig`): frost-core v3.0.0's published DKG vector for this ciphersuite
+(`frost-secp256k1/tests/helpers/vectors_dkg.json`, 2-of-3), run as frost-core's own `check_dkg_keygen`
+does — each participant's polynomial reproduces its published commitment, `part2` accepts the two
+published proofs made by frost-core (pinning `HDKG`'s DST and preimage) and sends the published shares,
+`part3` on the published received shares gives the published signing share, verifying share, group key
+and all three verifying shares (an RFC model in Python checked the vector first); the published proofs
+refused under another sender, another commitment or a bent `μ`; a 3-of-5 run whose output every
+participant agrees on, reconstructs `Σ a_i0` from any 3 shares (and all 5), and signs and verifies with
+3 signers; a bent proof and a bent share refused with the sender named; every count and identifier check;
+no leak under an allocation failure in any part.
 
 ## The ten threshold-specific cryptographic cores
 
@@ -308,7 +354,7 @@ Run `scripts/modtest frost` (the dead-stack probe runs in ReleaseFast only; Debu
 
 ## Backlog / deferred
 
-- **Distributed key generation for FROST** — the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why the first version did too, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
+None open.
 
 ## Roadmap
 

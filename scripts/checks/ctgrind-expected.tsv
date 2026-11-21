@@ -1013,8 +1013,8 @@ ibe	ReleaseFast	fp12pow	1	0	ed4966aba724ecd3	d2e187260f9f18a2
 # counts), plus 2 eqlBytes and 2 branches comparing them with the listed,
 # public commitments. Diffed context by context against 50d173d8; the harness
 # lists commitments from an untainted twin of the nonce inputs.
-frost	ReleaseFast	commit	1	8	cb31fcdd067bb0e8	94a2e96655c4ce21
-frost	ReleaseFast	sign	1	13	cb31fcdd067bb0e8	1da8c496388f45b0
+frost	ReleaseFast	commit	1	8	c58795725fdff352	94a2e96655c4ce21
+frost	ReleaseFast	sign	1	13	c58795725fdff352	1da8c496388f45b0
 # Zig 0.17.0 (2026-10-18): sign 101 -> 103 (bound <=101 -> <=103), BENIGN (public input). k256
 # `Fe.fromBytes`'s `v >= p` test (field.zig) now shows under BOTH `XOnlyPublicKey.fromBytes`
 # and `lift` inside musig2 `cpoint` (x3 each, was x3): LLVM 22 no longer folds lift's repeated
