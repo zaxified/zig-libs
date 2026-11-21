@@ -268,6 +268,11 @@ pub const Config = struct {
     /// transfer. With `null` (the default) a segmented request is answered
     /// with `Abort(segmentation_not_supported)`.
     reassembly: ?[]u8 = null,
+    /// Evaluate **intrinsic reporting** on every `poll`: the objects whose
+    /// `event_state` property carries `Property.event` are tested against
+    /// their limits (`EventData`). Off by default, so a device that has no
+    /// such objects does not scan its object table for them on every poll.
+    intrinsic_reporting: bool = false,
 };
 
 /// The largest reply a segmented transfer can carry.
@@ -743,6 +748,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// `Property.event` is tested against its limits; the first one whose
         /// condition has held for its delay makes the transition.
         fn evaluateEvents(self: *Self, now_ms: u64) Error!?Event {
+            if (!self.config.intrinsic_reporting) return null;
             for (self.objects) |*obj| {
                 const esp = obj.find(.event_state) orelse continue;
                 const ed = esp.event orelse continue;
@@ -2933,7 +2939,7 @@ test "intrinsic reporting: limit crossed for the delay, notified, listed, acknow
     var rig: Rig = .{};
     rig.wire();
     var adb: AlarmDb = .{};
-    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, adb.wire());
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .intrinsic_reporting = true }, adb.wire());
     var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
     const dev_addr = rig.device_ep.address;
     const ai1: ObjectId = .{ .type = .analog_input, .instance = 1 };
@@ -3067,7 +3073,7 @@ test "intrinsic reporting: a disabled transition is not announced and needs no a
     var rig: Rig = .{};
     rig.wire();
     var adb: AlarmDb = .{};
-    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, adb.wire());
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .intrinsic_reporting = true }, adb.wire());
     var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
     const ai1: ObjectId = .{ .type = .analog_input, .instance = 1 };
     var heard: [4]Heard = undefined;
