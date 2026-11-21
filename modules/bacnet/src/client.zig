@@ -621,6 +621,16 @@ pub fn Client(comptime max_pending: usize) type {
             return self.sendConfirmed(to, .get_alarm_summary, &.{}, now_ms);
         }
 
+        /// Asks the device to silence, reset or unsilence its life safety
+        /// objects (clause 13.13); `request.object` names one, or leaves it
+        /// to all. The answer is a `.simple_ack` for `.life_safety_operation`.
+        pub fn lifeSafetyOperation(self: *Self, to: BipAddress, request: events.LifeSafetyOperationRequest, now_ms: u64) Error!u8 {
+            var body: [96]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try request.encode(&w);
+            return self.sendConfirmed(to, .life_safety_operation, w.written(), now_ms);
+        }
+
         // ── the poll loop ──────────────────────────────────────────────────
 
         /// Receives at most one datagram, expires at most one transaction, and

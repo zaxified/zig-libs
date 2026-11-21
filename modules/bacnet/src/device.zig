@@ -146,7 +146,7 @@ pub const Property = struct {
     /// `COV_Increment` is measured against (set by the device).
     cov_last: ?f32 = null,
     /// Turns an object's `event_state` property into **intrinsic reporting**
-    /// for an analog object (clause 13.3.2, OUT_OF_RANGE): the caller's
+    /// for an analog object (clause 13.3, OUT_OF_RANGE): the caller's
     /// `EventData` holds the state machine, and the device keeps the
     /// object's `event_state`, `acked_transitions` and `event_time_stamps`
     /// properties in step with it (see `EventData`).
@@ -156,7 +156,7 @@ pub const Property = struct {
 /// The state of one object's intrinsic reporting, in the caller's storage
 /// (attach it with `Property.event` on the object's `event_state` property).
 ///
-/// The algorithm is OUT_OF_RANGE (clause 13.3.2) over the object's own
+/// The algorithm is OUT_OF_RANGE (clause 13.3) over the object's own
 /// properties: Real `present_value`, `high_limit`, `low_limit`, `deadband`,
 /// BitString `limit_enable` (low, high) and `event_enable` (to-offnormal,
 /// to-fault, to-normal), Unsigned `notification_class`, `time_delay` and
@@ -177,9 +177,31 @@ pub const EventData = struct {
     /// A transition the condition currently asks for, and since when.
     pending: ?types.EventState = null,
     pending_since_ms: u64 = 0,
+    /// The event type of the notification each of those transitions sent
+    /// (an acknowledgement notification repeats it).
+    stamp_types: [3]events.EventType = @splat(.none),
+    /// The reliability that put the object in `fault`.
+    reliability: types.Reliability = .no_fault_detected,
+    /// CHANGE_OF_VALUE: the value a notification was last sent for.
+    cov_init: bool = false,
+    cov_is_bits: bool = false,
+    cov_real: f32 = 0,
+    cov_unused: u3 = 0,
+    cov_bits_len: u8 = 0,
+    cov_bits: [16]u8 = @splat(0),
     acked_octet: [1]u8 = .{0xE0},
     stamps_wire: [24]u8 = undefined,
     stamps_wire_len: usize = 0,
+
+    fn saveBits(self: *EventData, bs: tag.BitString) void {
+        @memcpy(self.cov_bits[0..bs.bytes.len], bs.bytes);
+        self.cov_bits_len = @intCast(bs.bytes.len);
+        self.cov_unused = bs.unused_bits;
+    }
+
+    fn savedBits(self: *const EventData) tag.BitString {
+        return .{ .unused_bits = self.cov_unused, .bytes = self.cov_bits[0..self.cov_bits_len] };
+    }
 
     /// Writes the state into the object's `event_state`,
     /// `acked_transitions` and `event_time_stamps` properties (those that
@@ -310,6 +332,10 @@ pub const Event = union(enum) {
     /// Intrinsic reporting moved an object to a new event state (and sent
     /// the notifications its Notification Class asks for).
     event_transition: struct { object: ObjectId, from: types.EventState, to: types.EventState },
+    /// Accepted a `LifeSafetyOperation`; the device models no life safety
+    /// object, so the application does what `request` asks of `object` (every
+    /// life safety object of the device when null).
+    life_safety_operation: struct { process_id: u32, request: events.LifeSafetyOperation, object: ?ObjectId },
     /// Accepted an `AcknowledgeAlarm`.
     alarm_acknowledged: struct { object: ObjectId, state: types.EventState },
     /// Refused a request.
@@ -371,6 +397,449 @@ fn bitsOf(p: ?*Property) ?events.TransitionBits {
     const q = p orelse return null;
     if (q.value != .bit_string) return null;
     return events.TransitionBits.fromBitString(.{ .unused_bits = q.value.bit_string.unused_bits, .bytes = q.value.bit_string.bytes });
+}
+
+// ── event algorithms (clause 13.3) ──────────────────────────────────────────
+//
+// `planEvent` looks at one event-initiating object and says which state its
+// algorithm asks for right now; the device then applies the time delay, makes
+// the transition and sends the notifications. The algorithms are the state
+// machines of clause 13.3 as the permissive reference stacks run them
+// (bacpypes3's `local/event.py` is the written form): a condition has to hold
+// for the time delay (`time_delay` for off-normal and fault, `time_delay_normal`
+// or else `time_delay` for the return to normal), fault detection takes
+// precedence over every algorithm, and a fault goes back to normal first and is
+// judged again after that.
+
+/// The inputs a notification's event values are built from.
+const Ctx = union(enum) {
+    none,
+    out_of_range: struct { pv: f32, db: f32, hi: f32, lo: f32 },
+    floating_limit: struct { pv: f32, sp: f32, lo_diff: f32, hi_diff: f32 },
+    unsigned_range: struct { pv: u64, hi: u64, lo: u64 },
+    change_of_state: events.PropertyState,
+    command_failure: struct { cmd: Value, fb: Value },
+    change_of_bitstring: tag.BitString,
+    change_of_value_real: f32,
+    change_of_value_bits: tag.BitString,
+};
+
+/// What one object's algorithm asks for.
+const Plan = struct {
+    event_type: events.EventType = .none,
+    /// Seconds a condition must hold before a transition to an off-normal
+    /// state or to fault, and, when set, before one to normal.
+    delay: u32 = 0,
+    delay_normal: ?u32 = null,
+    /// The state the condition asks for; null keeps the current one.
+    want: ?types.EventState = null,
+    reliability: types.Reliability = .no_fault_detected,
+    ctx: Ctx = .none,
+    /// The object whose status flags and values a notification carries.
+    monitored: *Object,
+};
+
+fn valueOf(obj: *const Object, id: PropertyIdentifier) ?Value {
+    return (obj.find(id) orelse return null).value;
+}
+
+fn reliabilityOf(obj: *const Object) types.Reliability {
+    const v = valueOf(obj, .reliability) orelse return .no_fault_detected;
+    return if (v == .enumerated) @fromBackingInt(v.enumerated) else .no_fault_detected;
+}
+
+fn valueEql(a: Value, b: Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .boolean => |x| b == .boolean and b.boolean == x,
+        .unsigned => |x| b == .unsigned and b.unsigned == x,
+        .signed => |x| b == .signed and b.signed == x,
+        .real => |x| b == .real and b.real == x,
+        .double => |x| b == .double and b.double == x,
+        .enumerated => |x| b == .enumerated and b.enumerated == x,
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .bit_string => |x| b == .bit_string and x.unused_bits == b.bit_string.unused_bits and std.mem.eql(u8, x.bytes, b.bit_string.bytes),
+        .object_id => |x| b == .object_id and x.eql(b.object_id),
+        .raw => |x| b == .raw and std.mem.eql(u8, x, b.raw),
+        .priority_array => false,
+    };
+}
+
+/// The state an out-of-range type algorithm asks for. `.normal` is the
+/// return once the value is `db` inside a limit (or the limit is disabled).
+fn rangeWant(state: types.EventState, pv: f32, hi: f32, lo: f32, db: f32, hi_en: bool, lo_en: bool) ?types.EventState {
+    return switch (state) {
+        .normal => if (hi_en and pv > hi) .high_limit else if (lo_en and pv < lo) .low_limit else null,
+        .high_limit => if (lo_en and pv < lo) .low_limit else if (!hi_en or pv < hi - db) .normal else null,
+        .low_limit => if (hi_en and pv > hi) .high_limit else if (!lo_en or pv > lo + db) .normal else null,
+        else => null,
+    };
+}
+
+/// Unsigned range (clause 13.3): no deadband, normal again as soon as the
+/// value is inside both limits.
+fn unsignedRangeWant(state: types.EventState, pv: u64, hi: u64, lo: u64, hi_en: bool, lo_en: bool) ?types.EventState {
+    const above = hi_en and pv > hi;
+    const below = lo_en and pv < lo;
+    return switch (state) {
+        .normal => if (above) .high_limit else if (below) .low_limit else null,
+        .high_limit => if (below) .low_limit else if (!above) .normal else null,
+        .low_limit => if (above) .high_limit else if (!below) .normal else null,
+        else => null,
+    };
+}
+
+/// Normal <-> offnormal for an "is the value one of these" algorithm.
+fn stateWant(state: types.EventState, hit: bool) ?types.EventState {
+    return switch (state) {
+        .normal => if (hit) .offnormal else null,
+        .offnormal => if (!hit) .normal else null,
+        else => null,
+    };
+}
+
+/// Does `pv` equal the state `st`? A Boolean matches choice 0, an Unsigned
+/// choice 11 (`unsigned-value`), an Enumerated any other choice.
+fn stateMatches(pv: Value, st: events.PropertyState) bool {
+    return switch (pv) {
+        .boolean => |b| st.choice == events.PropertyState.boolean_value and st.value == @intFromBool(b),
+        .unsigned => |u| st.choice == events.PropertyState.unsigned_value and st.value == u,
+        .enumerated => |e| st.choice != events.PropertyState.boolean_value and st.choice != events.PropertyState.unsigned_value and st.value == e,
+        else => false,
+    };
+}
+
+/// `pv` as a `PropertyState` (the choice follows the value's datatype;
+/// `hint` is the choice for an Enumerated).
+fn stateOf(pv: Value, hint: u32) ?events.PropertyState {
+    return switch (pv) {
+        .boolean => |b| .{ .choice = events.PropertyState.boolean_value, .value = @intFromBool(b) },
+        .unsigned => |u| .{ .choice = events.PropertyState.unsigned_value, .value = u },
+        .enumerated => |e| .{ .choice = hint, .value = e },
+        else => null,
+    };
+}
+
+/// True when `pv` is one of the application-tagged Unsigned values of the
+/// raw list `list` (`alarm_values`, `fault_values`).
+fn inUnsignedList(list: Value, pv: Value) bool {
+    if (list != .raw or pv != .unsigned) return false;
+    var r = tag.Reader.init(list.raw);
+    while (!r.atEnd()) {
+        const v = (r.expectApp(.unsigned) catch return false).unsigned;
+        if (v == pv.unsigned) return true;
+    }
+    return false;
+}
+
+/// True when `pv`, restricted to the bits of `mask`, equals `cand` restricted
+/// the same way (two bit strings of different length never match).
+fn maskedEql(pv: tag.BitString, cand: tag.BitString, mask: tag.BitString) bool {
+    if (pv.bitCount() != cand.bitCount()) return false;
+    var i: usize = 0;
+    while (i < pv.bitCount()) : (i += 1) {
+        if (mask.bit(i) and pv.bit(i) != cand.bit(i)) return false;
+    }
+    return true;
+}
+
+fn asBits(v: Value) ?tag.BitString {
+    return if (v == .bit_string) .{ .unused_bits = v.bit_string.unused_bits, .bytes = v.bit_string.bytes } else null;
+}
+
+const Resolved = union(enum) {
+    ok: struct { obj: *Object, prop: *Property },
+    fault: types.Reliability,
+};
+
+/// Finds the property a reference names in this device: another device, an
+/// array index, or a missing object or property cannot be read here.
+fn resolveRef(objects: []Object, device: ObjectId, ref: events.PropertyReference) Resolved {
+    if (ref.device) |d| {
+        if (!d.eql(device)) return .{ .fault = .communication_failure };
+    }
+    if (ref.array_index != null) return .{ .fault = .configuration_error };
+    for (objects) |*o| {
+        if (!o.id.eql(ref.object)) continue;
+        const p = o.find(ref.property) orelse return .{ .fault = .configuration_error };
+        return .{ .ok = .{ .obj = o, .prop = p } };
+    }
+    return .{ .fault = .configuration_error };
+}
+
+/// The plan for `obj`, or null when it cannot be evaluated at all (the
+/// properties its algorithm needs are missing).
+fn planEvent(objects: []Object, device: ObjectId, obj: *Object, ed: *EventData) ?Plan {
+    return switch (obj.id.type) {
+        .event_enrollment => planEnrollment(objects, device, obj, ed),
+        .binary_input, .binary_value => planBinary(obj, ed.state),
+        .multi_state_input, .multi_state_value => planMultiState(obj, ed.state),
+        .binary_output, .multi_state_output => planCommandFailure(obj, ed.state),
+        else => planAnalog(obj, ed.state),
+    };
+}
+
+fn intrinsicDelays(obj: *const Object, pl: *Plan) void {
+    pl.delay = unsignedOf(obj.find(.time_delay)) orelse 0;
+    pl.delay_normal = unsignedOf(obj.find(.time_delay_normal));
+}
+
+/// OUT_OF_RANGE (clause 13.3) on an analog object's own properties.
+fn planAnalog(obj: *Object, state: types.EventState) ?Plan {
+    const pv = realOf(obj.find(.present_value)) orelse return null;
+    const hi = realOf(obj.find(.high_limit)) orelse return null;
+    const lo = realOf(obj.find(.low_limit)) orelse return null;
+    const db = realOf(obj.find(.deadband)) orelse 0;
+    const lim = bitsOf(obj.find(.limit_enable)) orelse return null;
+    var pl: Plan = .{ .event_type = .out_of_range, .monitored = obj, .reliability = reliabilityOf(obj) };
+    intrinsicDelays(obj, &pl);
+    pl.ctx = .{ .out_of_range = .{ .pv = pv, .db = db, .hi = hi, .lo = lo } };
+    // limit_enable: bit 0 low, bit 1 high.
+    pl.want = rangeWant(state, pv, hi, lo, db, lim.get(.to_fault), lim.get(.to_offnormal));
+    return pl;
+}
+
+/// CHANGE_OF_STATE (clause 13.3) on a binary object: the value equals
+/// `alarm_value`.
+fn planBinary(obj: *Object, state: types.EventState) ?Plan {
+    const pv = valueOf(obj, .present_value) orelse return null;
+    const av = valueOf(obj, .alarm_value) orelse return null;
+    if (pv != .enumerated or av != .enumerated) return null;
+    var pl: Plan = .{ .event_type = .change_of_state, .monitored = obj, .reliability = reliabilityOf(obj) };
+    intrinsicDelays(obj, &pl);
+    pl.ctx = .{ .change_of_state = .{ .choice = events.PropertyState.binary_value, .value = pv.enumerated } };
+    pl.want = stateWant(state, pv.enumerated == av.enumerated);
+    return pl;
+}
+
+/// CHANGE_OF_STATE on a multi-state input or value: the value is one of
+/// `alarm_values`; one of `fault_values` is a fault (`multi_state_fault`).
+fn planMultiState(obj: *Object, state: types.EventState) ?Plan {
+    const pv = valueOf(obj, .present_value) orelse return null;
+    if (pv != .unsigned) return null;
+    const av = valueOf(obj, .alarm_values) orelse return null;
+    var pl: Plan = .{ .event_type = .change_of_state, .monitored = obj, .reliability = reliabilityOf(obj) };
+    intrinsicDelays(obj, &pl);
+    pl.ctx = .{ .change_of_state = .{ .choice = events.PropertyState.unsigned_value, .value = pv.unsigned } };
+    pl.want = stateWant(state, inUnsignedList(av, pv));
+    if (pl.reliability == .no_fault_detected) {
+        if (valueOf(obj, .fault_values)) |fv| {
+            if (inUnsignedList(fv, pv)) pl.reliability = .multi_state_fault;
+        }
+    }
+    return pl;
+}
+
+/// COMMAND_FAILURE (clause 13.3) on an output object: `feedback_value`
+/// differs from `present_value`.
+fn planCommandFailure(obj: *Object, state: types.EventState) ?Plan {
+    const pv = valueOf(obj, .present_value) orelse return null;
+    const fb = valueOf(obj, .feedback_value) orelse return null;
+    var pl: Plan = .{ .event_type = .command_failure, .monitored = obj, .reliability = reliabilityOf(obj) };
+    intrinsicDelays(obj, &pl);
+    pl.ctx = .{ .command_failure = .{ .cmd = pv, .fb = fb } };
+    pl.want = stateWant(state, !valueEql(pv, fb));
+    return pl;
+}
+
+/// An Event Enrollment object (clause 12.12): the algorithm named by
+/// `event_parameters` over the property `object_property_reference` names,
+/// which has to be in this device.
+fn planEnrollment(objects: []Object, device: ObjectId, obj: *Object, ed: *EventData) ?Plan {
+    const ref_raw = valueOf(obj, .object_property_reference) orelse return null;
+    const par_raw = valueOf(obj, .event_parameters) orelse return null;
+    if (ref_raw != .raw or par_raw != .raw) return null;
+    var pl: Plan = .{ .monitored = obj, .reliability = reliabilityOf(obj) };
+    pl.delay_normal = unsignedOf(obj.find(.time_delay_normal));
+
+    var rr = tag.Reader.init(ref_raw.raw);
+    const ref = events.PropertyReference.decode(&rr) catch {
+        pl.reliability = if (pl.reliability == .no_fault_detected) .configuration_error else pl.reliability;
+        return pl;
+    };
+    const params = events.EventParameters.decode(par_raw.raw) catch {
+        pl.reliability = if (pl.reliability == .no_fault_detected) .configuration_error else pl.reliability;
+        return pl;
+    };
+    pl.event_type = params.eventType();
+    pl.delay = switch (params) {
+        .none => 0,
+        inline else => |p| p.time_delay,
+    };
+    if (unsignedOf(obj.find(.time_delay))) |d| pl.delay = d;
+
+    const res = resolveRef(objects, device, ref);
+    const mon: *Object, const prop: *Property = switch (res) {
+        .ok => |ok| .{ ok.obj, ok.prop },
+        .fault => |rel| {
+            if (pl.reliability == .no_fault_detected) pl.reliability = rel;
+            return pl;
+        },
+    };
+    pl.monitored = mon;
+    if (pl.reliability == .no_fault_detected and reliabilityOf(mon) != .no_fault_detected)
+        pl.reliability = .monitored_object_fault;
+    const pv = prop.value;
+    const state = ed.state;
+
+    switch (params) {
+        .none => {},
+        .out_of_range => |p| {
+            if (pv != .real) return configError(&pl);
+            pl.ctx = .{ .out_of_range = .{ .pv = pv.real, .db = p.deadband, .hi = p.high_limit, .lo = p.low_limit } };
+            pl.want = rangeWant(state, pv.real, p.high_limit, p.low_limit, p.deadband, true, true);
+        },
+        .floating_limit => |p| {
+            if (pv != .real) return configError(&pl);
+            const sp = switch (resolveRef(objects, device, p.setpoint)) {
+                .ok => |ok| ok.prop.value,
+                .fault => return configError(&pl),
+            };
+            if (sp != .real) return configError(&pl);
+            pl.ctx = .{ .floating_limit = .{ .pv = pv.real, .sp = sp.real, .lo_diff = p.low_diff_limit, .hi_diff = p.high_diff_limit } };
+            pl.want = rangeWant(state, pv.real, sp.real + p.high_diff_limit, sp.real - p.low_diff_limit, p.deadband, true, true);
+        },
+        .unsigned_range => |p| {
+            if (pv != .unsigned) return configError(&pl);
+            pl.ctx = .{ .unsigned_range = .{ .pv = pv.unsigned, .hi = p.high_limit, .lo = p.low_limit } };
+            pl.want = unsignedRangeWant(state, pv.unsigned, p.high_limit, p.low_limit, true, true);
+        },
+        .change_of_state => |p| {
+            var hit = false;
+            var hint: u32 = events.PropertyState.binary_value;
+            var it = events.EventParameters.statesIterator(p.values);
+            while (it.next() catch return configError(&pl)) |st| {
+                if (stateMatches(pv, st)) hit = true;
+                if (pv == .enumerated and st.choice != events.PropertyState.boolean_value and st.choice != events.PropertyState.unsigned_value) hint = st.choice;
+            }
+            const st = stateOf(pv, hint) orelse return configError(&pl);
+            pl.ctx = .{ .change_of_state = st };
+            pl.want = stateWant(state, hit);
+        },
+        .change_of_bitstring => |p| {
+            const bits = asBits(pv) orelse return configError(&pl);
+            var hit = false;
+            var it = events.EventParameters.bitstringsIterator(p.values);
+            while (it.next() catch return configError(&pl)) |cand| {
+                if (maskedEql(bits, cand, p.bitmask)) hit = true;
+            }
+            pl.ctx = .{ .change_of_bitstring = bits };
+            pl.want = stateWant(state, hit);
+        },
+        .change_of_value => |p| switch (p.criteria) {
+            .increment => |incr| {
+                if (pv != .real) return configError(&pl);
+                if (!ed.cov_init or ed.cov_is_bits) {
+                    ed.cov_init = true;
+                    ed.cov_is_bits = false;
+                    ed.cov_real = pv.real;
+                } else if (state == .normal and @abs(pv.real - ed.cov_real) >= incr) {
+                    pl.ctx = .{ .change_of_value_real = pv.real };
+                    pl.want = .normal;
+                }
+            },
+            .bitmask => |mask| {
+                const bits = asBits(pv) orelse return configError(&pl);
+                if (bits.bytes.len > ed.cov_bits.len) return configError(&pl);
+                if (!ed.cov_init or !ed.cov_is_bits) {
+                    ed.cov_init = true;
+                    ed.cov_is_bits = true;
+                    ed.saveBits(bits);
+                } else if (state == .normal and !maskedEql(bits, ed.savedBits(), mask)) {
+                    pl.ctx = .{ .change_of_value_bits = bits };
+                    pl.want = .normal;
+                }
+            },
+        },
+        .command_failure => |p| {
+            const fb = switch (resolveRef(objects, device, p.feedback)) {
+                .ok => |ok| ok.prop.value,
+                .fault => return configError(&pl),
+            };
+            pl.ctx = .{ .command_failure = .{ .cmd = pv, .fb = fb } };
+            pl.want = stateWant(state, !valueEql(pv, fb));
+        },
+    }
+    return pl;
+}
+
+fn configError(pl: *Plan) Plan {
+    if (pl.reliability == .no_fault_detected) pl.reliability = .configuration_error;
+    pl.want = null;
+    return pl.*;
+}
+
+/// The `status_flags` of the monitored object with `in_alarm` and `fault`
+/// following the new state and reliability.
+fn statusFlagsFor(pl: Plan, to: types.EventState) types.StatusFlags {
+    var sf: types.StatusFlags = .{};
+    if (pl.monitored.find(.status_flags)) |p| {
+        if (p.value == .bit_string and p.value.bit_string.bytes.len > 0)
+            sf = types.StatusFlags.fromOctet(p.value.bit_string.bytes[0]);
+    }
+    sf.in_alarm = to != .normal;
+    sf.fault = pl.reliability != .no_fault_detected;
+    return sf;
+}
+
+/// Writes the `[12]` event values of the transition `from` -> `to` into `w`;
+/// false (nothing written) when the algorithm has none to carry.
+fn writeEventValues(w: *tag.Writer, pl: Plan, from: types.EventState, to: types.EventState) Error!bool {
+    const sf = statusFlagsFor(pl, to);
+    if (from == .fault or to == .fault) {
+        // A transition into or out of fault is always CHANGE_OF_RELIABILITY
+        // (clause 13.9.1.1.7); the object's current values ride along.
+        var pbuf: [96]u8 = undefined;
+        var pw = tag.Writer.init(&pbuf);
+        const mon = pl.monitored;
+        const ids: []const PropertyIdentifier = switch (mon.id.type) {
+            .binary_output, .multi_state_output => &.{ .present_value, .feedback_value },
+            .event_enrollment => &.{ .object_property_reference, .reliability, .status_flags },
+            else => &.{.present_value},
+        };
+        for (ids) |id| {
+            const v = valueOf(mon, id) orelse continue;
+            pw.ctxEnumerated(0, @backingInt(id)) catch break;
+            pw.open(2) catch break;
+            v.encode(&pw) catch break;
+            pw.close(2) catch break;
+        }
+        try (events.ChangeOfReliability{
+            .reliability = if (to == .fault) pl.reliability else .no_fault_detected,
+            .status_flags = sf,
+            .property_values = pw.written(),
+        }).encodeValues(w);
+        return true;
+    }
+    switch (pl.ctx) {
+        .none => return false,
+        .out_of_range => |c| {
+            const hi_side = to == .high_limit or (to == .normal and from == .high_limit);
+            try (events.OutOfRange{ .exceeding_value = c.pv, .status_flags = sf, .deadband = c.db, .exceeded_limit = if (hi_side) c.hi else c.lo }).encodeValues(w);
+        },
+        .floating_limit => |c| {
+            const hi_side = to == .high_limit or (to == .normal and from == .high_limit);
+            try (events.FloatingLimit{ .reference_value = c.pv, .status_flags = sf, .setpoint_value = c.sp, .error_limit = if (hi_side) c.hi_diff else c.lo_diff }).encodeValues(w);
+        },
+        .unsigned_range => |c| {
+            const hi_side = to == .high_limit or (to == .normal and from == .high_limit);
+            try (events.UnsignedRange{ .exceeding_value = c.pv, .status_flags = sf, .exceeded_limit = if (hi_side) c.hi else c.lo }).encodeValues(w);
+        },
+        .change_of_state => |st| try (events.ChangeOfState{ .new_state = st, .status_flags = sf }).encodeValues(w),
+        .command_failure => |c| {
+            var cb: [24]u8 = undefined;
+            var fb: [24]u8 = undefined;
+            var cw = tag.Writer.init(&cb);
+            var fw = tag.Writer.init(&fb);
+            try c.cmd.encode(&cw);
+            try c.fb.encode(&fw);
+            try (events.CommandFailure{ .command_value = cw.written(), .status_flags = sf, .feedback_value = fw.written() }).encodeValues(w);
+        },
+        .change_of_bitstring => |b| try (events.ChangeOfBitstring{ .referenced_bitstring = b, .status_flags = sf }).encodeValues(w),
+        .change_of_value_real => |v| try (events.ChangeOfValue{ .new_value = .{ .changed_value = v }, .status_flags = sf }).encodeValues(w),
+        .change_of_value_bits => |b| try (events.ChangeOfValue{ .new_value = .{ .changed_bits = b }, .status_flags = sf }).encodeValues(w),
+    }
+    return true;
 }
 
 /// The notification priority of a transition from the class's `priority`
@@ -663,6 +1132,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 .acknowledge_alarm => self.handleAcknowledgeAlarm(origin, r),
                 .get_event_information => self.handleGetEventInformation(origin, r),
                 .get_alarm_summary => self.handleGetAlarmSummary(origin, r),
+                .life_safety_operation => self.handleLifeSafetyOperation(origin, r),
                 else => blk: {
                     try self.sendApdu(origin, .{ .reject = .{
                         .invoke_id = r.invoke_id,
@@ -744,27 +1214,21 @@ pub fn Device(comptime max_subscriptions: usize) type {
 
         // ── alarms and events (clause 13) ──────────────────────────────────
 
-        /// One round of intrinsic reporting: every object with
-        /// `Property.event` is tested against its limits; the first one whose
+        /// One round of event detection: every object with `Property.event` is
+        /// judged by its algorithm (`planEvent`); the first one whose
         /// condition has held for its delay makes the transition.
         fn evaluateEvents(self: *Self, now_ms: u64) Error!?Event {
             if (!self.config.intrinsic_reporting) return null;
             for (self.objects) |*obj| {
                 const esp = obj.find(.event_state) orelse continue;
                 const ed = esp.event orelse continue;
-                const pv = realOf(obj.find(.present_value)) orelse continue;
-                const hi = realOf(obj.find(.high_limit)) orelse continue;
-                const lo = realOf(obj.find(.low_limit)) orelse continue;
-                const db = realOf(obj.find(.deadband)) orelse 0;
-                const lim = bitsOf(obj.find(.limit_enable)) orelse continue;
-                const lo_en = lim.get(.to_offnormal); // bit 0: low limit enable
-                const hi_en = lim.get(.to_fault); // bit 1: high limit enable
-                const want: ?types.EventState = switch (ed.state) {
-                    .normal => if (hi_en and pv > hi) .high_limit else if (lo_en and pv < lo) .low_limit else null,
-                    .high_limit => if (lo_en and pv < lo) .low_limit else if (!hi_en or pv < hi - db) .normal else null,
-                    .low_limit => if (hi_en and pv > hi) .high_limit else if (!lo_en or pv > lo + db) .normal else null,
-                    else => null,
-                };
+                const pl = planEvent(self.objects, self.deviceId(), obj, ed) orelse continue;
+                // Fault detection takes precedence over every algorithm, and a
+                // fault goes back to normal before the algorithm is judged.
+                const faulty = pl.reliability != .no_fault_detected;
+                const want: ?types.EventState = if (faulty)
+                    (if (ed.state != .fault or ed.reliability != pl.reliability) .fault else null)
+                else if (ed.state == .fault) .normal else pl.want;
                 const to = want orelse {
                     ed.pending = null;
                     continue;
@@ -773,36 +1237,34 @@ pub fn Device(comptime max_subscriptions: usize) type {
                     ed.pending = to;
                     ed.pending_since_ms = now_ms;
                 }
-                const delay_s: u32 = if (to == .normal)
-                    unsignedOf(obj.find(.time_delay_normal)) orelse unsignedOf(obj.find(.time_delay)) orelse 0
-                else
-                    unsignedOf(obj.find(.time_delay)) orelse 0;
+                const delay_s: u32 = if (to == .normal) (pl.delay_normal orelse pl.delay) else pl.delay;
                 if (now_ms -| ed.pending_since_ms < @as(u64, delay_s) * 1000) continue;
 
                 const from = ed.state;
                 ed.state = to;
                 ed.pending = null;
+                if (to == .fault) ed.reliability = pl.reliability;
                 self.event_seq +%= 1;
                 const tr = events.Transition.into(to);
                 const stamp: events.TimeStamp = .{ .sequence_number = self.event_seq };
+                const etype: events.EventType = if (from == .fault or to == .fault) .change_of_reliability else pl.event_type;
                 ed.stamps[@backingInt(tr)] = stamp;
                 ed.stamp_states[@backingInt(tr)] = to;
+                ed.stamp_types[@backingInt(tr)] = etype;
+                switch (pl.ctx) {
+                    .change_of_value_real => |v| ed.cov_real = v,
+                    .change_of_value_bits => |b| ed.saveBits(b),
+                    else => {},
+                }
                 const enabled = (bitsOf(obj.find(.event_enable)) orelse events.TransitionBits.all).get(tr);
                 const cls = self.classOf(obj);
                 const needs_ack = if (cls) |c| (bitsOf(c.find(.ack_required)) orelse events.TransitionBits{}).get(tr) else false;
                 ed.acked.set(tr, !(enabled and needs_ack));
                 ed.sync(obj.properties);
                 if (enabled and self.comm == .enable) {
-                    const exceeded: f32 = if (to == .high_limit or (to == .normal and from == .high_limit)) hi else lo;
-                    var sf: types.StatusFlags = .{};
-                    if (obj.find(.status_flags)) |p| {
-                        if (p.value == .bit_string and p.value.bit_string.bytes.len > 0)
-                            sf = types.StatusFlags.fromOctet(p.value.bit_string.bytes[0]);
-                    }
-                    sf.in_alarm = to != .normal;
-                    var vbuf: [48]u8 = undefined;
+                    var vbuf: [224]u8 = undefined;
                     var vw = tag.Writer.init(&vbuf);
-                    try (events.OutOfRange{ .exceeding_value = pv, .status_flags = sf, .deadband = db, .exceeded_limit = exceeded }).encodeValues(&vw);
+                    const has_values = try writeEventValues(&vw, pl, from, to);
                     try self.distribute(obj, cls, tr, .{
                         .process_id = 0,
                         .initiating_device = self.deviceId(),
@@ -810,12 +1272,12 @@ pub fn Device(comptime max_subscriptions: usize) type {
                         .time_stamp = stamp,
                         .notification_class = unsignedOf(obj.find(.notification_class)) orelse 0,
                         .priority = classPriority(cls, tr),
-                        .event_type = .out_of_range,
+                        .event_type = etype,
                         .notify_type = @fromBackingInt(enumOf(obj.find(.notify_type)) orelse 0),
                         .ack_required = needs_ack,
                         .from_state = from,
                         .to_state = to,
-                        .values = vw.written()[1 .. vw.written().len - 1],
+                        .values = if (has_values) vw.written()[1 .. vw.written().len - 1] else null,
                     });
                 }
                 return .{ .event_transition = .{ .object = obj.id, .from = from, .to = to } };
@@ -850,7 +1312,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 const to = d.address orelse continue;
                 var n = base;
                 n.process_id = d.process_id;
-                var body: [192]u8 = undefined;
+                var body: [352]u8 = undefined;
                 var w = tag.Writer.init(&body);
                 try n.encode(&w);
                 if (d.confirmed) {
@@ -902,12 +1364,36 @@ pub fn Device(comptime max_subscriptions: usize) type {
                     .time_stamp = ak.time_of_ack,
                     .notification_class = unsignedOf(obj.find(.notification_class)) orelse 0,
                     .priority = classPriority(cls, tr),
-                    .event_type = .out_of_range,
+                    .event_type = ed.stamp_types[ti],
                     .notify_type = .ack_notification,
                     .to_state = ak.state,
                 });
             }
             return .{ .alarm_acknowledged = .{ .object = obj.id, .state = ak.state } };
+        }
+
+        /// `LifeSafetyOperation` (clause 13.13): checked and acknowledged,
+        /// then reported as `Event.life_safety_operation` for the application
+        /// to act on. A named object has to be a life safety point or zone of
+        /// this device.
+        fn handleLifeSafetyOperation(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            const req = events.LifeSafetyOperationRequest.decode(r.data) catch |e| {
+                const reason: types.RejectReason = switch (e) {
+                    error.InvalidValue, error.InvalidParameter => .parameter_out_of_range,
+                    error.MissingParameter => .missing_required_parameter,
+                    else => .invalid_tag,
+                };
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = reason } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            };
+            if (req.object) |o| {
+                const obj = self.find(o) orelse
+                    return self.refuse(to, r.invoke_id, .life_safety_operation, .object, .unknown_object);
+                if (obj.id.type != .life_safety_point and obj.id.type != .life_safety_zone)
+                    return self.refuse(to, r.invoke_id, .life_safety_operation, .object, .unsupported_object_type);
+            }
+            try self.sendApdu(to, .{ .simple_ack = .{ .invoke_id = r.invoke_id, .service = .life_safety_operation } });
+            return .{ .life_safety_operation = .{ .process_id = req.process_id, .request = req.request, .object = req.object } };
         }
 
         /// The room a GetEventInformation / GetAlarmSummary answer may use.
@@ -3092,6 +3578,489 @@ test "intrinsic reporting: a disabled transition is not announced and needs no a
     _ = try dev.poll(3_000);
     try testing.expectEqual(types.EventState.high_limit, (try dev.poll(5_000)).event_transition.to);
     try testing.expectEqual(@as(usize, 0), try hearEvents(&c, 5_000, &heard));
+}
+
+// ── the other event algorithms, Event Enrollment, fault detection ───────────
+
+// Destination of the unconfirmed process 7 at the rig's client, valid every
+// day and time, all three transitions (the first of `alarm_recipients`, but
+// with to-fault as well).
+const all_recipients = hex("8201feb400000000b4173b3b631e21006506c0000201bac01f21071082" ++ "05e0");
+
+/// What the client heard of one notification, decoded at once (the slices
+/// borrow from the client's buffer until its next poll).
+const Got = struct {
+    etype: events.EventType,
+    from: ?types.EventState,
+    to: types.EventState,
+    ack_required: ?bool,
+    vals: ?events.EventValues,
+};
+
+fn hear1(c: anytype, now: u64) !?Got {
+    while (true) {
+        switch (try c.poll(now)) {
+            .none => return null,
+            .event_notification => |e| {
+                const n = e.notification;
+                return .{
+                    .etype = n.event_type,
+                    .from = n.from_state,
+                    .to = n.to_state,
+                    .ack_required = n.ack_required,
+                    .vals = if (n.values) |v| try events.EventValues.decode(n.event_type, v) else null,
+                };
+            },
+            else => {},
+        }
+    }
+}
+
+/// A device with one event-initiating object (`ini`) and a Notification Class
+/// that sends everything to the rig's client; `mon` is the monitored object
+/// of an Event Enrollment (or the object itself for intrinsic reporting).
+const EvFx = struct {
+    rig: Rig = .{},
+    ini: [16]Property = undefined,
+    n_ini: usize = 0,
+    mon: [10]Property = undefined,
+    n_mon: usize = 0,
+    cls: [5]Property = undefined,
+    objs: [3]Object = undefined,
+    n_objs: usize = 0,
+    ed: EventData = .{},
+    par: [160]u8 = undefined,
+    refb: [32]u8 = undefined,
+    dev: DefaultDevice = undefined,
+    c: client.DefaultClient = undefined,
+
+    fn addIni(self: *EvFx, p: Property) void {
+        self.ini[self.n_ini] = p;
+        self.n_ini += 1;
+    }
+
+    fn addMon(self: *EvFx, p: Property) void {
+        self.mon[self.n_mon] = p;
+        self.n_mon += 1;
+    }
+
+    fn start(self: *EvFx, ini_id: ObjectId, mon_id: ?ObjectId) void {
+        self.rig.wire();
+        self.addIni(.{ .id = .object_identifier, .value = .{ .object_id = ini_id } });
+        self.addIni(.{ .id = .notification_class, .value = .{ .unsigned = 3 } });
+        self.addIni(.{ .id = .notify_type, .value = .{ .enumerated = 0 } });
+        self.addIni(.{ .id = .event_enable, .value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0xE0} } } });
+        self.addIni(.{ .id = .event_state, .value = .{ .enumerated = 0 }, .event = &self.ed });
+        self.addIni(.{ .id = .acked_transitions, .value = .null });
+        self.addIni(.{ .id = .event_time_stamps, .value = .null });
+        self.cls = .{
+            .{ .id = .object_identifier, .value = .{ .object_id = .{ .type = .notification_class, .instance = 3 } } },
+            .{ .id = .notification_class, .value = .{ .unsigned = 3 } },
+            .{ .id = .priority, .value = .{ .raw = &alarm_priorities } },
+            .{ .id = .ack_required, .value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0x00} } } },
+            .{ .id = .recipient_list, .value = .{ .raw = &all_recipients } },
+        };
+        self.objs[0] = .{ .id = ini_id, .properties = self.ini[0..self.n_ini] };
+        self.objs[1] = .{ .id = .{ .type = .notification_class, .instance = 3 }, .properties = &self.cls };
+        self.n_objs = 2;
+        if (mon_id) |m| {
+            self.addMon(.{ .id = .object_identifier, .value = .{ .object_id = m } });
+            self.objs[2] = .{ .id = m, .properties = undefined };
+            self.n_objs = 3;
+        }
+    }
+
+    /// Call once every property is added.
+    fn finish(self: *EvFx) void {
+        self.objs[0].properties = self.ini[0..self.n_ini];
+        if (self.n_objs == 3) self.objs[2].properties = self.mon[0..self.n_mon];
+        self.ed.sync(self.ini[0..self.n_ini]);
+        self.dev = DefaultDevice.init(self.rig.device_ep.transport(), .{ .instance = 599, .intrinsic_reporting = true }, self.objs[0..self.n_objs]);
+        self.c = client.DefaultClient.init(self.rig.client_ep.transport(), .{});
+    }
+
+    /// Sets the enrollment's `event_parameters` and the reference to the
+    /// monitored property.
+    fn setEnrollment(self: *EvFx, params: events.EventParameters, ref: events.PropertyReference) !void {
+        var w = tag.Writer.init(&self.par);
+        try params.encode(&w);
+        self.addIni(.{ .id = .event_parameters, .value = .{ .raw = w.written() } });
+        var rw = tag.Writer.init(&self.refb);
+        try ref.encode(&rw);
+        self.addIni(.{ .id = .object_property_reference, .value = .{ .raw = rw.written() } });
+        self.addIni(.{ .id = .reliability, .value = .{ .enumerated = 0 } });
+    }
+
+    fn monProp(self: *EvFx, id: PropertyIdentifier) *Property {
+        for (self.mon[0..self.n_mon]) |*p| if (p.id == id) return p;
+        unreachable;
+    }
+
+    fn iniProp(self: *EvFx, id: PropertyIdentifier) *Property {
+        for (self.ini[0..self.n_ini]) |*p| if (p.id == id) return p;
+        unreachable;
+    }
+
+    /// One device poll then the client's: the transition (or null).
+    fn step(self: *EvFx, now: u64) !?Got {
+        const ev = try self.dev.poll(now);
+        if (ev != .event_transition) return null;
+        return try hear1(&self.c, now);
+    }
+};
+
+const av1: ObjectId = .{ .type = .analog_value, .instance = 1 };
+const ee1: ObjectId = .{ .type = .event_enrollment, .instance = 1 };
+
+fn monAnalog(f: *EvFx, pv: Value) void {
+    f.addMon(.{ .id = .present_value, .value = pv });
+    f.addMon(.{ .id = .status_flags, .value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0x00} } } });
+    f.addMon(.{ .id = .reliability, .value = .{ .enumerated = 0 } });
+}
+
+const pv_ref: events.PropertyReference = .{ .object = av1, .property = .present_value };
+
+test "event enrollment: OUT_OF_RANGE over a referenced property, with its deadband" {
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .real = 50 });
+    try f.setEnrollment(.{ .out_of_range = .{ .time_delay = 0, .low_limit = 10, .high_limit = 90, .deadband = 5 } }, pv_ref);
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    f.monProp(.present_value).value = .{ .real = 95 };
+    var g = (try f.step(1)).?;
+    try testing.expectEqual(events.EventType.out_of_range, g.etype);
+    try testing.expectEqual(types.EventState.high_limit, g.to);
+    try testing.expectEqual(@as(f32, 90), g.vals.?.out_of_range.exceeded_limit);
+    try testing.expectEqual(@as(f32, 95), g.vals.?.out_of_range.exceeding_value);
+    // Inside the deadband it stays; below it, back to normal (still the high limit exceeded).
+    f.monProp(.present_value).value = .{ .real = 87 };
+    try testing.expectEqual(@as(?Got, null), try f.step(2));
+    f.monProp(.present_value).value = .{ .real = 84 };
+    g = (try f.step(3)).?;
+    try testing.expectEqual(types.EventState.normal, g.to);
+    try testing.expectEqual(@as(f32, 90), g.vals.?.out_of_range.exceeded_limit);
+    // The enrollment's own properties follow.
+    try testing.expectEqual(@as(u32, 0), f.iniProp(.event_state).value.enumerated);
+}
+
+test "event enrollment: the time delay holds a transition back, time_delay_normal the return" {
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .real = 95 });
+    try f.setEnrollment(.{ .out_of_range = .{ .time_delay = 3, .low_limit = 10, .high_limit = 90, .deadband = 0 } }, pv_ref);
+    f.addIni(.{ .id = .time_delay_normal, .value = .{ .unsigned = 1 } });
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    try testing.expectEqual(@as(?Got, null), try f.step(2_999));
+    try testing.expectEqual(types.EventState.high_limit, (try f.step(3_000)).?.to);
+    f.monProp(.present_value).value = .{ .real = 50 };
+    try testing.expectEqual(@as(?Got, null), try f.step(4_000));
+    try testing.expectEqual(types.EventState.normal, (try f.step(5_000)).?.to);
+}
+
+test "event enrollment: FLOATING_LIMIT follows the setpoint" {
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .real = 71 });
+    f.addMon(.{ .id = .setpoint, .value = .{ .real = 70 } });
+    try f.setEnrollment(.{ .floating_limit = .{
+        .time_delay = 0,
+        .setpoint = .{ .object = av1, .property = .setpoint },
+        .low_diff_limit = 4,
+        .high_diff_limit = 5,
+        .deadband = 1,
+    } }, pv_ref);
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    f.monProp(.present_value).value = .{ .real = 76 };
+    var g = (try f.step(1)).?;
+    try testing.expectEqual(events.EventType.floating_limit, g.etype);
+    try testing.expectEqual(types.EventState.high_limit, g.to);
+    try testing.expectEqual(@as(f32, 5), g.vals.?.floating_limit.error_limit);
+    try testing.expectEqual(@as(f32, 70), g.vals.?.floating_limit.setpoint_value);
+    // The setpoint moves, and the same value is now inside the band.
+    f.monProp(.setpoint).value = .{ .real = 76 };
+    g = (try f.step(2)).?;
+    try testing.expectEqual(types.EventState.normal, g.to);
+    f.monProp(.present_value).value = .{ .real = 70 };
+    g = (try f.step(3)).?;
+    try testing.expectEqual(types.EventState.low_limit, g.to);
+    try testing.expectEqual(@as(f32, 4), g.vals.?.floating_limit.error_limit);
+}
+
+test "event enrollment: UNSIGNED_RANGE" {
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .unsigned = 500 });
+    try f.setEnrollment(.{ .unsigned_range = .{ .time_delay = 0, .low_limit = 10, .high_limit = 1000 } }, pv_ref);
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    f.monProp(.present_value).value = .{ .unsigned = 1500 };
+    var g = (try f.step(1)).?;
+    try testing.expectEqual(events.EventType.unsigned_range, g.etype);
+    try testing.expectEqual(types.EventState.high_limit, g.to);
+    try testing.expectEqual(@as(u64, 1000), g.vals.?.unsigned_range.exceeded_limit);
+    f.monProp(.present_value).value = .{ .unsigned = 5 };
+    g = (try f.step(2)).?;
+    try testing.expectEqual(types.EventState.low_limit, g.to);
+    try testing.expectEqual(@as(u64, 10), g.vals.?.unsigned_range.exceeded_limit);
+    f.monProp(.present_value).value = .{ .unsigned = 100 };
+    try testing.expectEqual(types.EventState.normal, (try f.step(3)).?.to);
+}
+
+test "event enrollment: CHANGE_OF_STATE, CHANGE_OF_BITSTRING and COMMAND_FAILURE" {
+    {
+        var f: EvFx = .{};
+        f.start(ee1, av1);
+        monAnalog(&f, .{ .enumerated = 0 });
+        try f.setEnrollment(.{ .change_of_state = .{ .time_delay = 0, .values = &hex("1901") } }, pv_ref);
+        f.finish();
+        try testing.expectEqual(@as(?Got, null), try f.step(0));
+        f.monProp(.present_value).value = .{ .enumerated = 1 };
+        var g = (try f.step(1)).?;
+        try testing.expectEqual(events.EventType.change_of_state, g.etype);
+        try testing.expectEqual(types.EventState.offnormal, g.to);
+        try testing.expectEqual(events.PropertyState{ .choice = 1, .value = 1 }, g.vals.?.change_of_state.new_state);
+        f.monProp(.present_value).value = .{ .enumerated = 0 };
+        g = (try f.step(2)).?;
+        try testing.expectEqual(types.EventState.normal, g.to);
+        try testing.expectEqual(@as(u32, 0), g.vals.?.change_of_state.new_state.value);
+    }
+    {
+        // Unsigned values (multi-state) match choice 11 only.
+        var f: EvFx = .{};
+        f.start(ee1, av1);
+        monAnalog(&f, .{ .unsigned = 2 });
+        try f.setEnrollment(.{ .change_of_state = .{ .time_delay = 0, .values = &hex("b903" ++ "b904") } }, pv_ref);
+        f.finish();
+        try testing.expectEqual(@as(?Got, null), try f.step(0));
+        f.monProp(.present_value).value = .{ .unsigned = 4 };
+        const g = (try f.step(1)).?;
+        try testing.expectEqual(events.PropertyState{ .choice = 11, .value = 4 }, g.vals.?.change_of_state.new_state);
+    }
+    {
+        var f: EvFx = .{};
+        f.start(ee1, av1);
+        monAnalog(&f, .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0xA0} } });
+        // Mask the two high bits; alarm when they read 10.
+        try f.setEnrollment(.{ .change_of_bitstring = .{
+            .time_delay = 0,
+            .bitmask = .{ .unused_bits = 4, .bytes = &.{0xC0} },
+            .values = &hex("820480"),
+        } }, pv_ref);
+        f.finish();
+        // 1010 & 1100 = 1000 matches at once.
+        var g = (try f.step(0)).?;
+        try testing.expectEqual(events.EventType.change_of_bitstring, g.etype);
+        try testing.expectEqual(types.EventState.offnormal, g.to);
+        try testing.expectEqual(@as(u8, 0xA0), g.vals.?.change_of_bitstring.referenced_bitstring.bytes[0]);
+        f.monProp(.present_value).value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0x60} } };
+        g = (try f.step(1)).?;
+        try testing.expectEqual(types.EventState.normal, g.to);
+    }
+    {
+        var f: EvFx = .{};
+        f.start(ee1, av1);
+        monAnalog(&f, .{ .enumerated = 1 });
+        f.addMon(.{ .id = .feedback_value, .value = .{ .enumerated = 1 } });
+        try f.setEnrollment(.{ .command_failure = .{ .time_delay = 0, .feedback = .{ .object = av1, .property = .feedback_value } } }, pv_ref);
+        f.finish();
+        try testing.expectEqual(@as(?Got, null), try f.step(0));
+        f.monProp(.feedback_value).value = .{ .enumerated = 0 };
+        var g = (try f.step(1)).?;
+        try testing.expectEqual(events.EventType.command_failure, g.etype);
+        try testing.expectEqual(types.EventState.offnormal, g.to);
+        try testing.expectEqualSlices(u8, &hex("9101"), g.vals.?.command_failure.command_value);
+        try testing.expectEqualSlices(u8, &hex("9100"), g.vals.?.command_failure.feedback_value);
+        f.monProp(.feedback_value).value = .{ .enumerated = 1 };
+        g = (try f.step(2)).?;
+        try testing.expectEqual(types.EventState.normal, g.to);
+    }
+}
+
+test "event enrollment: CHANGE_OF_VALUE reports each change of the increment, from normal to normal" {
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .real = 50 });
+    try f.setEnrollment(.{ .change_of_value = .{ .time_delay = 0, .criteria = .{ .increment = 0.5 } } }, pv_ref);
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0)); // the first value is only remembered
+    f.monProp(.present_value).value = .{ .real = 50.25 };
+    try testing.expectEqual(@as(?Got, null), try f.step(1));
+    f.monProp(.present_value).value = .{ .real = 50.5 };
+    var g = (try f.step(2)).?;
+    try testing.expectEqual(events.EventType.change_of_value, g.etype);
+    try testing.expectEqual(types.EventState.normal, g.to);
+    try testing.expectEqual(@as(?types.EventState, .normal), g.from);
+    try testing.expectEqual(@as(f32, 50.5), g.vals.?.change_of_value.new_value.changed_value);
+    try testing.expectEqual(@as(?Got, null), try f.step(3)); // measured from the last report
+    f.monProp(.present_value).value = .{ .real = 51.1 };
+    g = (try f.step(4)).?;
+    try testing.expectEqual(@as(f32, 51.1), g.vals.?.change_of_value.new_value.changed_value);
+
+    var b: EvFx = .{};
+    b.start(ee1, av1);
+    monAnalog(&b, .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0xA0} } });
+    try b.setEnrollment(.{ .change_of_value = .{ .time_delay = 0, .criteria = .{ .bitmask = .{ .unused_bits = 4, .bytes = &.{0xC0} } } } }, pv_ref);
+    b.finish();
+    try testing.expectEqual(@as(?Got, null), try b.step(0));
+    // A change outside the mask is not reported, one inside is.
+    b.monProp(.present_value).value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0xB0} } };
+    try testing.expectEqual(@as(?Got, null), try b.step(1));
+    b.monProp(.present_value).value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0x70} } };
+    g = (try b.step(2)).?;
+    try testing.expectEqual(@as(u8, 0x70), g.vals.?.change_of_value.new_value.changed_bits.bytes[0]);
+}
+
+test "fault detection: an unresolvable reference, a faulty monitored object, a remote device" {
+    // A reference to an object that is not there: configuration error.
+    var f: EvFx = .{};
+    f.start(ee1, av1);
+    monAnalog(&f, .{ .real = 50 });
+    try f.setEnrollment(.{ .out_of_range = .{ .time_delay = 0, .low_limit = 10, .high_limit = 90, .deadband = 0 } }, .{ .object = .{ .type = .analog_value, .instance = 77 }, .property = .present_value });
+    f.finish();
+    var g = (try f.step(0)).?;
+    try testing.expectEqual(events.EventType.change_of_reliability, g.etype);
+    try testing.expectEqual(types.EventState.fault, g.to);
+    try testing.expectEqual(types.Reliability.configuration_error, g.vals.?.change_of_reliability.reliability);
+    try testing.expectEqual(@as(?bool, null), @as(?bool, null));
+
+    // The monitored object reports a fault: monitored-object-fault; it clears, and normal is judged anew.
+    var h: EvFx = .{};
+    h.start(ee1, av1);
+    monAnalog(&h, .{ .real = 95 });
+    try h.setEnrollment(.{ .out_of_range = .{ .time_delay = 0, .low_limit = 10, .high_limit = 90, .deadband = 0 } }, pv_ref);
+    h.monProp(.reliability).value = .{ .enumerated = @backingInt(types.Reliability.open_loop) };
+    h.finish();
+    g = (try h.step(0)).?;
+    try testing.expectEqual(types.EventState.fault, g.to);
+    try testing.expectEqual(types.Reliability.monitored_object_fault, g.vals.?.change_of_reliability.reliability);
+    try testing.expect(g.vals.?.change_of_reliability.status_flags.fault and g.vals.?.change_of_reliability.status_flags.in_alarm);
+    // The enrollment's own properties are listed with the fault.
+    try testing.expect(g.vals.?.change_of_reliability.property_values.len > 0);
+    h.monProp(.reliability).value = .{ .enumerated = 0 };
+    g = (try h.step(1)).?;
+    try testing.expectEqual(types.EventState.normal, g.to);
+    try testing.expectEqual(@as(?types.EventState, .fault), g.from);
+    try testing.expectEqual(events.EventType.change_of_reliability, g.etype);
+    try testing.expectEqual(types.Reliability.no_fault_detected, g.vals.?.change_of_reliability.reliability);
+    // The value is still out of range: the algorithm takes over.
+    g = (try h.step(2)).?;
+    try testing.expectEqual(types.EventState.high_limit, g.to);
+    try testing.expectEqual(events.EventType.out_of_range, g.etype);
+
+    // A property of another device cannot be read here.
+    var r: EvFx = .{};
+    r.start(ee1, av1);
+    monAnalog(&r, .{ .real = 50 });
+    try r.setEnrollment(.{ .out_of_range = .{ .time_delay = 0, .low_limit = 10, .high_limit = 90, .deadband = 0 } }, .{ .object = av1, .property = .present_value, .device = .{ .type = .device, .instance = 4000 } });
+    r.finish();
+    g = (try r.step(0)).?;
+    try testing.expectEqual(types.Reliability.communication_failure, g.vals.?.change_of_reliability.reliability);
+}
+
+test "intrinsic reporting on binary and multi-state objects, and a fault of the object itself" {
+    const bi1: ObjectId = .{ .type = .binary_input, .instance = 1 };
+    var f: EvFx = .{};
+    f.start(bi1, null);
+    f.addIni(.{ .id = .present_value, .value = .{ .enumerated = 0 } });
+    f.addIni(.{ .id = .alarm_value, .value = .{ .enumerated = 1 } });
+    f.addIni(.{ .id = .time_delay, .value = .{ .unsigned = 1 } });
+    f.addIni(.{ .id = .reliability, .value = .{ .enumerated = 0 } });
+    f.addIni(.{ .id = .status_flags, .value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &.{0x00} } } });
+    f.finish();
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    f.iniProp(.present_value).value = .{ .enumerated = 1 };
+    try testing.expectEqual(@as(?Got, null), try f.step(0));
+    var g = (try f.step(1_000)).?;
+    try testing.expectEqual(events.EventType.change_of_state, g.etype);
+    try testing.expectEqual(types.EventState.offnormal, g.to);
+    try testing.expectEqual(@as(u32, 1), g.vals.?.change_of_state.new_state.value);
+    try testing.expect(g.vals.?.change_of_state.status_flags.in_alarm);
+    // A fault of the object itself takes precedence, and clears again.
+    f.iniProp(.reliability).value = .{ .enumerated = @backingInt(types.Reliability.no_sensor) };
+    _ = try f.step(2_000);
+    g = (try f.step(3_000)).?;
+    try testing.expectEqual(types.EventState.fault, g.to);
+    try testing.expectEqual(types.Reliability.no_sensor, g.vals.?.change_of_reliability.reliability);
+    f.iniProp(.reliability).value = .{ .enumerated = 0 };
+    _ = try f.step(4_000);
+    try testing.expectEqual(types.EventState.normal, (try f.step(5_000)).?.to);
+    // Fault is a to-fault transition: Acked_Transitions, event time stamps.
+    try testing.expectEqual(@as(u32, 0), f.iniProp(.event_state).value.enumerated);
+
+    const msv1: ObjectId = .{ .type = .multi_state_value, .instance = 1 };
+    var m: EvFx = .{};
+    m.start(msv1, null);
+    m.addIni(.{ .id = .present_value, .value = .{ .unsigned = 1 } });
+    m.addIni(.{ .id = .alarm_values, .value = .{ .raw = &hex("2102" ++ "2103") } });
+    m.addIni(.{ .id = .fault_values, .value = .{ .raw = &hex("2105") } });
+    m.finish();
+    try testing.expectEqual(@as(?Got, null), try m.step(0));
+    m.iniProp(.present_value).value = .{ .unsigned = 3 };
+    g = (try m.step(1)).?;
+    try testing.expectEqual(types.EventState.offnormal, g.to);
+    try testing.expectEqual(events.PropertyState{ .choice = 11, .value = 3 }, g.vals.?.change_of_state.new_state);
+    // A fault value is a multi-state fault.
+    m.iniProp(.present_value).value = .{ .unsigned = 5 };
+    g = (try m.step(2)).?;
+    try testing.expectEqual(types.EventState.fault, g.to);
+    try testing.expectEqual(types.Reliability.multi_state_fault, g.vals.?.change_of_reliability.reliability);
+    m.iniProp(.present_value).value = .{ .unsigned = 1 };
+    try testing.expectEqual(types.EventState.normal, (try m.step(3)).?.to);
+
+    const bo1: ObjectId = .{ .type = .binary_output, .instance = 1 };
+    var o: EvFx = .{};
+    o.start(bo1, null);
+    o.addIni(.{ .id = .present_value, .value = .{ .enumerated = 1 } });
+    o.addIni(.{ .id = .feedback_value, .value = .{ .enumerated = 1 } });
+    o.finish();
+    try testing.expectEqual(@as(?Got, null), try o.step(0));
+    o.iniProp(.feedback_value).value = .{ .enumerated = 0 };
+    g = (try o.step(1)).?;
+    try testing.expectEqual(events.EventType.command_failure, g.etype);
+    try testing.expectEqual(types.EventState.offnormal, g.to);
+    // The acknowledgement notification repeats the event type.
+    o.iniProp(.feedback_value).value = .{ .enumerated = 1 };
+    g = (try o.step(2)).?;
+    try testing.expectEqual(types.EventState.normal, g.to);
+}
+
+test "LifeSafetyOperation: acknowledged and reported; the object must be a life safety object of the device" {
+    var rig: Rig = .{};
+    rig.wire();
+    const lsp: ObjectId = .{ .type = .life_safety_point, .instance = 3 };
+    var pp = [_]Property{.{ .id = .object_identifier, .value = .{ .object_id = lsp } }};
+    var ap = [_]Property{.{ .id = .object_identifier, .value = .{ .object_id = av1 } }};
+    var objs = [_]Object{ .{ .id = lsp, .properties = &pp }, .{ .id = av1, .properties = &ap } };
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, &objs);
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const dev_addr = rig.device_ep.address;
+
+    _ = try c.lifeSafetyOperation(dev_addr, .{ .process_id = 7, .source = "op", .request = .silence, .object = lsp }, 0);
+    var ev = try dev.poll(0);
+    try testing.expectEqual(events.LifeSafetyOperation.silence, ev.life_safety_operation.request);
+    try testing.expectEqual(@as(u32, 7), ev.life_safety_operation.process_id);
+    try testing.expectEqual(@as(?ObjectId, lsp), ev.life_safety_operation.object);
+    const cev = try c.poll(1);
+    try testing.expectEqual(types.ConfirmedService.life_safety_operation, cev.simple_ack.svc);
+
+    // No object: the whole device.
+    _ = try c.lifeSafetyOperation(dev_addr, .{ .process_id = 8, .source = "op", .request = .reset_alarm }, 2);
+    ev = try dev.poll(2);
+    try testing.expectEqual(@as(?ObjectId, null), ev.life_safety_operation.object);
+    _ = try c.poll(3);
+
+    // An object that is not there, and one that is not a life safety object.
+    _ = try c.lifeSafetyOperation(dev_addr, .{ .process_id = 7, .source = "op", .request = .silence, .object = .{ .type = .life_safety_zone, .instance = 9 } }, 4);
+    _ = try dev.poll(4);
+    const e1 = try c.poll(5);
+    try testing.expectEqual(types.ErrorCode.unknown_object, e1.err.code);
+    _ = try c.lifeSafetyOperation(dev_addr, .{ .process_id = 7, .source = "op", .request = .silence, .object = av1 }, 6);
+    _ = try dev.poll(6);
+    const e2 = try c.poll(7);
+    try testing.expectEqual(types.ErrorCode.unsupported_object_type, e2.err.code);
 }
 
 test "an unsupported confirmed service is Rejected" {

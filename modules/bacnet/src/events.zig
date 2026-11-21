@@ -217,7 +217,7 @@ fn narrow8(v: u64) Error!u8 {
 }
 
 /// The `[5]` block of an OUT_OF_RANGE notification's event values
-/// (clause 13.3.2): the value that crossed, the object's status flags, the
+/// (clause 13.3): the value that crossed, the object's status flags, the
 /// deadband and the limit.
 pub const OutOfRange = struct {
     exceeding_value: f32,
@@ -512,6 +512,615 @@ pub const AlarmSummaryIterator = struct {
     }
 };
 
+// ── event values of the other algorithms (clause 13.2, 21) ──────────────────
+
+fn ctxBitString(w: *tag.Writer, n: u32, bs: tag.BitString) Error!void {
+    if (bs.bytes.len == 0 and bs.unused_bits != 0) return error.InvalidValue;
+    try w.header(.{ .class = .context, .number = n, .form = .primitive, .len = @intCast(bs.bytes.len + 1) });
+    try w.byte(bs.unused_bits);
+    try w.raw(bs.bytes);
+}
+
+fn readCtxBitString(r: *tag.Reader, n: u32) Error!tag.BitString {
+    const t = try r.next();
+    if (!t.isContext(n)) return error.UnexpectedTag;
+    if (t.len < 1) return error.InvalidLength;
+    const d = try r.take(t.len);
+    if (d[0] > 7 or (d.len == 1 and d[0] != 0)) return error.InvalidValue;
+    return .{ .unused_bits = @intCast(d[0]), .bytes = d[1..] };
+}
+
+fn putStatusFlags(w: *tag.Writer, n: u32, sf: types.StatusFlags) Error!void {
+    try w.tagged(.context, n, &.{ 4, sf.toOctet() });
+}
+
+fn getStatusFlags(r: *tag.Reader, n: u32) Error!types.StatusFlags {
+    const t = try r.next();
+    if (!t.isContext(n) or t.len != 2) return error.UnexpectedTag;
+    const sf = try r.take(2);
+    return types.StatusFlags.fromOctet(sf[1]);
+}
+
+/// One `BACnetPropertyStates` value (clause 21): a CHOICE whose alternatives
+/// are all a Boolean, an Enumerated or an Unsigned, so a choice number and
+/// the value is the whole of it. A context-tagged Boolean and a one-octet
+/// Unsigned are the same octets, which is why one `value` serves both.
+pub const PropertyState = struct {
+    /// The CHOICE number (`boolean_value` ... `life_safety_state`, below).
+    choice: u32,
+    value: u32,
+
+    pub const boolean_value: u32 = 0;
+    pub const binary_value: u32 = 1;
+    pub const event_type: u32 = 2;
+    pub const polarity: u32 = 3;
+    pub const reliability: u32 = 7;
+    pub const state: u32 = 8;
+    pub const unsigned_value: u32 = 11;
+    pub const life_safety_mode: u32 = 12;
+    pub const life_safety_state: u32 = 13;
+
+    /// The alternative alone, as it sits inside a list of states.
+    pub fn encode(self: PropertyState, w: *tag.Writer) Error!void {
+        try w.ctxUnsigned(self.choice, self.value);
+    }
+
+    pub fn decode(r: *tag.Reader) Error!PropertyState {
+        const t = try r.next();
+        if (t.class != .context or t.form != .primitive) return error.UnexpectedTag;
+        if (t.len == 0 or t.len > 4) return error.InvalidLength;
+        const v = try tag.unpackUnsigned(try r.take(t.len));
+        return .{ .choice = t.number, .value = @intCast(v) };
+    }
+
+    /// The alternative wrapped in context tag `n` (a named parameter).
+    pub fn encodeCtx(self: PropertyState, w: *tag.Writer, n: u32) Error!void {
+        try w.open(n);
+        try self.encode(w);
+        try w.close(n);
+    }
+
+    pub fn decodeCtx(r: *tag.Reader, n: u32) Error!PropertyState {
+        try r.expectOpen(n);
+        const s = try decode(r);
+        try r.expectClose(n);
+        return s;
+    }
+};
+
+/// Writes `[12] { [choice] { body } }` around `body`.
+fn writeValues(w: *tag.Writer, choice: u32, ctx: anytype, comptime body: fn (@TypeOf(ctx), *tag.Writer) Error!void) Error!void {
+    try w.open(12);
+    try w.open(choice);
+    try body(ctx, w);
+    try w.close(choice);
+    try w.close(12);
+}
+
+/// `CHANGE_OF_BITSTRING` event values (clause 13.3, `[0]`).
+pub const ChangeOfBitstring = struct {
+    referenced_bitstring: tag.BitString,
+    status_flags: types.StatusFlags = .{},
+
+    pub fn encodeValues(self: ChangeOfBitstring, w: *tag.Writer) Error!void {
+        try writeValues(w, 0, self, body);
+    }
+    fn body(self: ChangeOfBitstring, w: *tag.Writer) Error!void {
+        try ctxBitString(w, 0, self.referenced_bitstring);
+        try putStatusFlags(w, 1, self.status_flags);
+    }
+    pub fn decodeValues(values: []const u8) Error!ChangeOfBitstring {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(0);
+        const bs = try readCtxBitString(&r, 0);
+        const sf = try getStatusFlags(&r, 1);
+        try r.expectClose(0);
+        return .{ .referenced_bitstring = bs, .status_flags = sf };
+    }
+};
+
+/// `CHANGE_OF_STATE` event values (clause 13.3, `[1]`).
+pub const ChangeOfState = struct {
+    new_state: PropertyState,
+    status_flags: types.StatusFlags = .{},
+
+    pub fn encodeValues(self: ChangeOfState, w: *tag.Writer) Error!void {
+        try writeValues(w, 1, self, body);
+    }
+    fn body(self: ChangeOfState, w: *tag.Writer) Error!void {
+        try self.new_state.encodeCtx(w, 0);
+        try putStatusFlags(w, 1, self.status_flags);
+    }
+    pub fn decodeValues(values: []const u8) Error!ChangeOfState {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(1);
+        const st = try PropertyState.decodeCtx(&r, 0);
+        const sf = try getStatusFlags(&r, 1);
+        try r.expectClose(1);
+        return .{ .new_state = st, .status_flags = sf };
+    }
+};
+
+/// `CHANGE_OF_VALUE` event values (clause 13.3, `[2]`): the changed bits of
+/// a bit string, or the new value of a Real.
+pub const ChangeOfValue = struct {
+    new_value: union(enum) { changed_bits: tag.BitString, changed_value: f32 },
+    status_flags: types.StatusFlags = .{},
+
+    pub fn encodeValues(self: ChangeOfValue, w: *tag.Writer) Error!void {
+        try writeValues(w, 2, self, body);
+    }
+    fn body(self: ChangeOfValue, w: *tag.Writer) Error!void {
+        try w.open(0);
+        switch (self.new_value) {
+            .changed_bits => |b| try ctxBitString(w, 0, b),
+            .changed_value => |v| try w.ctxReal(1, v),
+        }
+        try w.close(0);
+        try putStatusFlags(w, 1, self.status_flags);
+    }
+    pub fn decodeValues(values: []const u8) Error!ChangeOfValue {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(2);
+        try r.expectOpen(0);
+        const t = try r.peek();
+        const nv: @FieldType(ChangeOfValue, "new_value") = if (t.isContext(0))
+            .{ .changed_bits = try readCtxBitString(&r, 0) }
+        else
+            .{ .changed_value = try ctxReal(&r, 1) };
+        try r.expectClose(0);
+        const sf = try getStatusFlags(&r, 1);
+        try r.expectClose(2);
+        return .{ .new_value = nv, .status_flags = sf };
+    }
+};
+
+/// `COMMAND_FAILURE` event values (clause 13.3, `[3]`). The command and
+/// feedback values are any application-tagged datum; they are handed back as
+/// the octets inside their brackets.
+pub const CommandFailure = struct {
+    command_value: []const u8,
+    status_flags: types.StatusFlags = .{},
+    feedback_value: []const u8,
+
+    pub fn encodeValues(self: CommandFailure, w: *tag.Writer) Error!void {
+        try writeValues(w, 3, self, body);
+    }
+    fn body(self: CommandFailure, w: *tag.Writer) Error!void {
+        try w.open(0);
+        try w.raw(self.command_value);
+        try w.close(0);
+        try putStatusFlags(w, 1, self.status_flags);
+        try w.open(2);
+        try w.raw(self.feedback_value);
+        try w.close(2);
+    }
+    pub fn decodeValues(values: []const u8) Error!CommandFailure {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(3);
+        const cv = try r.openedBlock(0);
+        const sf = try getStatusFlags(&r, 1);
+        const fv = try r.openedBlock(2);
+        try r.expectClose(3);
+        return .{ .command_value = cv, .status_flags = sf, .feedback_value = fv };
+    }
+};
+
+/// `FLOATING_LIMIT` event values (clause 13.3, `[4]`).
+pub const FloatingLimit = struct {
+    reference_value: f32,
+    status_flags: types.StatusFlags = .{},
+    setpoint_value: f32,
+    /// The difference to the setpoint that was exceeded.
+    error_limit: f32,
+
+    pub fn encodeValues(self: FloatingLimit, w: *tag.Writer) Error!void {
+        try writeValues(w, 4, self, body);
+    }
+    fn body(self: FloatingLimit, w: *tag.Writer) Error!void {
+        try w.ctxReal(0, self.reference_value);
+        try putStatusFlags(w, 1, self.status_flags);
+        try w.ctxReal(2, self.setpoint_value);
+        try w.ctxReal(3, self.error_limit);
+    }
+    pub fn decodeValues(values: []const u8) Error!FloatingLimit {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(4);
+        const rv = try ctxReal(&r, 0);
+        const sf = try getStatusFlags(&r, 1);
+        const sp = try ctxReal(&r, 2);
+        const el = try ctxReal(&r, 3);
+        try r.expectClose(4);
+        return .{ .reference_value = rv, .status_flags = sf, .setpoint_value = sp, .error_limit = el };
+    }
+};
+
+/// `UNSIGNED_RANGE` event values (clause 13.3, `[11]`).
+pub const UnsignedRange = struct {
+    exceeding_value: u64,
+    status_flags: types.StatusFlags = .{},
+    exceeded_limit: u64,
+
+    pub fn encodeValues(self: UnsignedRange, w: *tag.Writer) Error!void {
+        try writeValues(w, 11, self, body);
+    }
+    fn body(self: UnsignedRange, w: *tag.Writer) Error!void {
+        try w.ctxUnsigned(0, self.exceeding_value);
+        try putStatusFlags(w, 1, self.status_flags);
+        try w.ctxUnsigned(2, self.exceeded_limit);
+    }
+    pub fn decodeValues(values: []const u8) Error!UnsignedRange {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(11);
+        const ev = try r.ctxUnsigned(0);
+        const sf = try getStatusFlags(&r, 1);
+        const el = try r.ctxUnsigned(2);
+        try r.expectClose(11);
+        return .{ .exceeding_value = ev, .status_flags = sf, .exceeded_limit = el };
+    }
+};
+
+/// `CHANGE_OF_RELIABILITY` event values (clause 13.3, `[19]`): what a
+/// to-fault transition carries.
+pub const ChangeOfReliability = struct {
+    reliability: types.Reliability,
+    status_flags: types.StatusFlags = .{},
+    /// The octets inside `[2]`: a list of `BACnetPropertyValue`, usually empty.
+    property_values: []const u8 = &.{},
+
+    pub fn encodeValues(self: ChangeOfReliability, w: *tag.Writer) Error!void {
+        try writeValues(w, 19, self, body);
+    }
+    fn body(self: ChangeOfReliability, w: *tag.Writer) Error!void {
+        try w.ctxEnumerated(0, @backingInt(self.reliability));
+        try putStatusFlags(w, 1, self.status_flags);
+        try w.open(2);
+        try w.raw(self.property_values);
+        try w.close(2);
+    }
+    pub fn decodeValues(values: []const u8) Error!ChangeOfReliability {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(19);
+        const rel: types.Reliability = @fromBackingInt(try r.ctxEnumerated(0));
+        const sf = try getStatusFlags(&r, 1);
+        const pv = try r.openedBlock(2);
+        try r.expectClose(19);
+        return .{ .reliability = rel, .status_flags = sf, .property_values = pv };
+    }
+};
+
+/// `CHANGE_OF_LIFE_SAFETY` event values (clause 13.3, `[8]`). The three
+/// enumerations (`BACnetLifeSafetyState`, `BACnetLifeSafetyMode`,
+/// `BACnetLifeSafetyOperation`) are carried as numbers.
+pub const ChangeOfLifeSafety = struct {
+    new_state: u32,
+    new_mode: u32,
+    status_flags: types.StatusFlags = .{},
+    operation_expected: u32,
+
+    pub fn encodeValues(self: ChangeOfLifeSafety, w: *tag.Writer) Error!void {
+        try writeValues(w, 8, self, body);
+    }
+    fn body(self: ChangeOfLifeSafety, w: *tag.Writer) Error!void {
+        try w.ctxEnumerated(0, self.new_state);
+        try w.ctxEnumerated(1, self.new_mode);
+        try putStatusFlags(w, 2, self.status_flags);
+        try w.ctxEnumerated(3, self.operation_expected);
+    }
+    pub fn decodeValues(values: []const u8) Error!ChangeOfLifeSafety {
+        var r = tag.Reader.init(values);
+        try r.expectOpen(8);
+        const ns = try r.ctxEnumerated(0);
+        const nm = try r.ctxEnumerated(1);
+        const sf = try getStatusFlags(&r, 2);
+        const oe = try r.ctxEnumerated(3);
+        try r.expectClose(8);
+        return .{ .new_state = ns, .new_mode = nm, .status_flags = sf, .operation_expected = oe };
+    }
+};
+
+/// The event values of a notification, by event type, for the algorithms
+/// this module knows. `decode` returns null for an event type it has no
+/// codec for (the raw `EventNotification.values` stay available).
+pub const EventValues = union(enum) {
+    change_of_bitstring: ChangeOfBitstring,
+    change_of_state: ChangeOfState,
+    change_of_value: ChangeOfValue,
+    command_failure: CommandFailure,
+    floating_limit: FloatingLimit,
+    out_of_range: OutOfRange,
+    change_of_life_safety: ChangeOfLifeSafety,
+    unsigned_range: UnsignedRange,
+    change_of_reliability: ChangeOfReliability,
+
+    pub fn decode(event_type: EventType, values: []const u8) Error!?EventValues {
+        return switch (event_type) {
+            .change_of_bitstring => .{ .change_of_bitstring = try ChangeOfBitstring.decodeValues(values) },
+            .change_of_state => .{ .change_of_state = try ChangeOfState.decodeValues(values) },
+            .change_of_value => .{ .change_of_value = try ChangeOfValue.decodeValues(values) },
+            .command_failure => .{ .command_failure = try CommandFailure.decodeValues(values) },
+            .floating_limit => .{ .floating_limit = try FloatingLimit.decodeValues(values) },
+            .out_of_range => .{ .out_of_range = try OutOfRange.decodeValues(values) },
+            .change_of_life_safety => .{ .change_of_life_safety = try ChangeOfLifeSafety.decodeValues(values) },
+            .unsigned_range => .{ .unsigned_range = try UnsignedRange.decodeValues(values) },
+            .change_of_reliability => .{ .change_of_reliability = try ChangeOfReliability.decodeValues(values) },
+            else => null,
+        };
+    }
+};
+
+// ── Event_Parameters of an Event Enrollment object (clause 12.12.11) ────────
+
+/// `BACnetObjectPropertyReference` / `BACnetDeviceObjectPropertyReference`
+/// (clause 21): an object, one of its properties, an optional array index
+/// and, for the device form, the device that holds the object.
+pub const PropertyReference = struct {
+    object: ObjectId,
+    property: types.PropertyIdentifier,
+    array_index: ?u32 = null,
+    /// Absent: the object is in the device that holds the reference.
+    device: ?ObjectId = null,
+
+    pub fn encode(self: PropertyReference, w: *tag.Writer) Error!void {
+        try w.ctxObjectId(0, self.object);
+        try w.ctxEnumerated(1, @backingInt(self.property));
+        if (self.array_index) |i| try w.ctxUnsigned(2, i);
+        if (self.device) |d| try w.ctxObjectId(3, d);
+    }
+
+    pub fn decode(r: *tag.Reader) Error!PropertyReference {
+        var out: PropertyReference = undefined;
+        out.object = try r.ctxObjectId(0);
+        out.property = @fromBackingInt(try r.ctxEnumerated(1));
+        out.array_index = null;
+        out.device = null;
+        if (!r.atEnd() and (try r.peek()).isContext(2)) out.array_index = try narrow32(try r.ctxUnsigned(2));
+        if (!r.atEnd() and (try r.peek()).isContext(3)) out.device = try r.ctxObjectId(3);
+        return out;
+    }
+
+    pub fn encodeCtx(self: PropertyReference, w: *tag.Writer, n: u32) Error!void {
+        try w.open(n);
+        try self.encode(w);
+        try w.close(n);
+    }
+
+    pub fn decodeCtx(r: *tag.Reader, n: u32) Error!PropertyReference {
+        const inner = try r.openedBlock(n);
+        var ir = tag.Reader.init(inner);
+        const out = try decode(&ir);
+        if (!ir.atEnd()) return error.InvalidParameter;
+        return out;
+    }
+};
+
+/// `BACnetEventParameter` (clause 12.12.11, 21): what the Event Enrollment
+/// object's `Event_Parameters` property holds, by algorithm. Lists are
+/// handed back as the octets they occupy; `statesIterator` and
+/// `bitstringsIterator` walk them.
+pub const EventParameters = union(enum) {
+    change_of_bitstring: struct { time_delay: u32, bitmask: tag.BitString, values: []const u8 },
+    change_of_state: struct { time_delay: u32, values: []const u8 },
+    change_of_value: struct { time_delay: u32, criteria: union(enum) { bitmask: tag.BitString, increment: f32 } },
+    command_failure: struct { time_delay: u32, feedback: PropertyReference },
+    floating_limit: struct { time_delay: u32, setpoint: PropertyReference, low_diff_limit: f32, high_diff_limit: f32, deadband: f32 },
+    out_of_range: struct { time_delay: u32, low_limit: f32, high_limit: f32, deadband: f32 },
+    unsigned_range: struct { time_delay: u32, low_limit: u64, high_limit: u64 },
+    /// `NONE`: the object detects nothing (`[20]` Null).
+    none,
+
+    pub fn eventType(self: EventParameters) EventType {
+        return switch (self) {
+            .change_of_bitstring => .change_of_bitstring,
+            .change_of_state => .change_of_state,
+            .change_of_value => .change_of_value,
+            .command_failure => .command_failure,
+            .floating_limit => .floating_limit,
+            .out_of_range => .out_of_range,
+            .unsigned_range => .unsigned_range,
+            .none => .none,
+        };
+    }
+
+    pub fn encode(self: EventParameters, w: *tag.Writer) Error!void {
+        switch (self) {
+            .change_of_bitstring => |p| {
+                try w.open(0);
+                try w.ctxUnsigned(0, p.time_delay);
+                try ctxBitString(w, 1, p.bitmask);
+                try w.open(2);
+                try w.raw(p.values);
+                try w.close(2);
+                try w.close(0);
+            },
+            .change_of_state => |p| {
+                try w.open(1);
+                try w.ctxUnsigned(0, p.time_delay);
+                try w.open(1);
+                try w.raw(p.values);
+                try w.close(1);
+                try w.close(1);
+            },
+            .change_of_value => |p| {
+                try w.open(2);
+                try w.ctxUnsigned(0, p.time_delay);
+                try w.open(1);
+                switch (p.criteria) {
+                    .bitmask => |b| try ctxBitString(w, 0, b),
+                    .increment => |v| try w.ctxReal(1, v),
+                }
+                try w.close(1);
+                try w.close(2);
+            },
+            .command_failure => |p| {
+                try w.open(3);
+                try w.ctxUnsigned(0, p.time_delay);
+                try p.feedback.encodeCtx(w, 1);
+                try w.close(3);
+            },
+            .floating_limit => |p| {
+                try w.open(4);
+                try w.ctxUnsigned(0, p.time_delay);
+                try p.setpoint.encodeCtx(w, 1);
+                try w.ctxReal(2, p.low_diff_limit);
+                try w.ctxReal(3, p.high_diff_limit);
+                try w.ctxReal(4, p.deadband);
+                try w.close(4);
+            },
+            .out_of_range => |p| {
+                try w.open(5);
+                try w.ctxUnsigned(0, p.time_delay);
+                try w.ctxReal(1, p.low_limit);
+                try w.ctxReal(2, p.high_limit);
+                try w.ctxReal(3, p.deadband);
+                try w.close(5);
+            },
+            .unsigned_range => |p| {
+                try w.open(11);
+                try w.ctxUnsigned(0, p.time_delay);
+                try w.ctxUnsigned(1, p.low_limit);
+                try w.ctxUnsigned(2, p.high_limit);
+                try w.close(11);
+            },
+            .none => try w.ctxNull(20),
+        }
+    }
+
+    /// Decodes the whole property value (exactly one choice).
+    pub fn decode(data: []const u8) Error!EventParameters {
+        var r = tag.Reader.init(data);
+        const out = try decodeFrom(&r);
+        if (!r.atEnd()) return error.InvalidParameter;
+        return out;
+    }
+
+    fn decodeFrom(r: *tag.Reader) Error!EventParameters {
+        const t = try r.peek();
+        if (t.class != .context) return error.UnexpectedTag;
+        if (t.isContext(20)) {
+            _ = try r.next();
+            if (t.len != 0) return error.InvalidLength;
+            return .none;
+        }
+        const body = try r.openedBlock(t.number);
+        var b = tag.Reader.init(body);
+        const delay = try narrow32(try b.ctxUnsigned(0));
+        const out: EventParameters = switch (t.number) {
+            0 => blk: {
+                const mask = try readCtxBitString(&b, 1);
+                break :blk .{ .change_of_bitstring = .{ .time_delay = delay, .bitmask = mask, .values = try b.openedBlock(2) } };
+            },
+            1 => .{ .change_of_state = .{ .time_delay = delay, .values = try b.openedBlock(1) } },
+            2 => blk: {
+                const crit = try b.openedBlock(1);
+                var cr = tag.Reader.init(crit);
+                const c: @FieldType(@FieldType(EventParameters, "change_of_value"), "criteria") = if ((try cr.peek()).isContext(0))
+                    .{ .bitmask = try readCtxBitString(&cr, 0) }
+                else
+                    .{ .increment = try ctxReal(&cr, 1) };
+                if (!cr.atEnd()) return error.InvalidParameter;
+                break :blk .{ .change_of_value = .{ .time_delay = delay, .criteria = c } };
+            },
+            3 => .{ .command_failure = .{ .time_delay = delay, .feedback = try PropertyReference.decodeCtx(&b, 1) } },
+            4 => blk: {
+                const sp = try PropertyReference.decodeCtx(&b, 1);
+                const lo = try ctxReal(&b, 2);
+                const hi = try ctxReal(&b, 3);
+                const db = try ctxReal(&b, 4);
+                break :blk .{ .floating_limit = .{ .time_delay = delay, .setpoint = sp, .low_diff_limit = lo, .high_diff_limit = hi, .deadband = db } };
+            },
+            5 => blk: {
+                const lo = try ctxReal(&b, 1);
+                const hi = try ctxReal(&b, 2);
+                const db = try ctxReal(&b, 3);
+                break :blk .{ .out_of_range = .{ .time_delay = delay, .low_limit = lo, .high_limit = hi, .deadband = db } };
+            },
+            11 => blk: {
+                const lo = try b.ctxUnsigned(1);
+                const hi = try b.ctxUnsigned(2);
+                break :blk .{ .unsigned_range = .{ .time_delay = delay, .low_limit = lo, .high_limit = hi } };
+            },
+            else => return error.UnexpectedTag,
+        };
+        if (!b.atEnd()) return error.InvalidParameter;
+        return out;
+    }
+
+    /// Walks a `change_of_state` list of `BACnetPropertyStates`.
+    pub fn statesIterator(values: []const u8) StatesIterator {
+        return .{ .r = tag.Reader.init(values) };
+    }
+
+    pub const StatesIterator = struct {
+        r: tag.Reader,
+        pub fn next(self: *StatesIterator) Error!?PropertyState {
+            if (self.r.atEnd()) return null;
+            return try PropertyState.decode(&self.r);
+        }
+    };
+
+    /// Walks a `change_of_bitstring` list of bit strings.
+    pub fn bitstringsIterator(values: []const u8) BitstringsIterator {
+        return .{ .r = tag.Reader.init(values) };
+    }
+
+    pub const BitstringsIterator = struct {
+        r: tag.Reader,
+        pub fn next(self: *BitstringsIterator) Error!?tag.BitString {
+            if (self.r.atEnd()) return null;
+            return (try self.r.expectApp(.bit_string)).bit_string;
+        }
+    };
+};
+
+/// `BACnetLifeSafetyOperation` (clause 21): what a `LifeSafetyOperation`
+/// request asks for.
+pub const LifeSafetyOperation = enum(u32) {
+    none = 0,
+    silence = 1,
+    silence_audible = 2,
+    silence_visual = 3,
+    reset = 4,
+    reset_alarm = 5,
+    reset_fault = 6,
+    unsilence = 7,
+    unsilence_audible = 8,
+    unsilence_visual = 9,
+    _,
+};
+
+/// `LifeSafetyOperation` request (clause 13.13).
+pub const LifeSafetyOperationRequest = struct {
+    process_id: u32,
+    source: []const u8,
+    request: LifeSafetyOperation,
+    /// Absent: the request is for every life safety object of the device.
+    object: ?ObjectId = null,
+
+    pub fn encode(self: LifeSafetyOperationRequest, w: *tag.Writer) Error!void {
+        try w.ctxUnsigned(0, self.process_id);
+        try w.ctxString(1, self.source);
+        try w.ctxEnumerated(2, @backingInt(self.request));
+        if (self.object) |o| try w.ctxObjectId(3, o);
+    }
+
+    pub fn decode(data: []const u8) Error!LifeSafetyOperationRequest {
+        var r = tag.Reader.init(data);
+        const pid = try narrow32(try r.ctxUnsigned(0));
+        const src = try r.ctxString(1);
+        const op: LifeSafetyOperation = @fromBackingInt(try r.ctxEnumerated(2));
+        var obj: ?ObjectId = null;
+        if (!r.atEnd()) obj = try r.ctxObjectId(3);
+        if (!r.atEnd()) return error.InvalidParameter;
+        return .{
+            .process_id = pid,
+            .source = src.asUtf8() orelse return error.InvalidValue,
+            .request = op,
+            .object = obj,
+        };
+    }
+};
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -678,6 +1287,184 @@ test "GetAlarmSummary-ACK: golden bytes both ways" {
     try testing.expectEqual(Transition.to_normal, Transition.into(.normal));
     try testing.expectEqual(Transition.to_offnormal, Transition.into(.low_limit));
     try testing.expectEqual(Transition.to_fault, Transition.into(.fault));
+}
+
+// The goldens below are bacpypes3 0.0.106 output (black box; recipe in
+// `tools/event_goldens.py`, second half): the choice alone, which is what
+// sits inside `[12]`.
+
+fn expectValues(golden: []const u8, v: anytype) !void {
+    var buf: [128]u8 = undefined;
+    var w = tag.Writer.init(&buf);
+    try v.encodeValues(&w);
+    const out = w.written();
+    try testing.expectEqual(@as(u8, 0xCE), out[0]);
+    try testing.expectEqualSlices(u8, golden, out[1 .. out.len - 1]);
+}
+
+test "event values of the other algorithms: golden bytes both ways" {
+    const sf1: types.StatusFlags = .{ .in_alarm = true };
+
+    const g_bits = hex("0e0a03b01a04800f");
+    try expectValues(&g_bits, ChangeOfBitstring{ .referenced_bitstring = .{ .unused_bits = 3, .bytes = &.{0xB0} }, .status_flags = sf1 });
+    const bits = try ChangeOfBitstring.decodeValues(&g_bits);
+    try testing.expectEqual(@as(usize, 5), bits.referenced_bitstring.bitCount());
+    try testing.expect(bits.referenced_bitstring.bit(2) and !bits.referenced_bitstring.bit(1));
+
+    const g_state = hex("1e0e19010f1a04801f");
+    try expectValues(&g_state, ChangeOfState{ .new_state = .{ .choice = PropertyState.binary_value, .value = 1 }, .status_flags = sf1 });
+    const st = try ChangeOfState.decodeValues(&g_state);
+    try testing.expectEqual(@as(u32, 1), st.new_state.value);
+    try testing.expect(st.status_flags.in_alarm);
+
+    const g_cov_bits = hex("2e0e0a05600f1a04802f");
+    try expectValues(&g_cov_bits, ChangeOfValue{ .new_value = .{ .changed_bits = .{ .unused_bits = 5, .bytes = &.{0x60} } }, .status_flags = sf1 });
+    try testing.expectEqual(@as(u8, 0x60), (try ChangeOfValue.decodeValues(&g_cov_bits)).new_value.changed_bits.bytes[0]);
+    const g_cov_real = hex("2e0e1c414800000f1a04802f");
+    try expectValues(&g_cov_real, ChangeOfValue{ .new_value = .{ .changed_value = 12.5 }, .status_flags = sf1 });
+    try testing.expectEqual(@as(f32, 12.5), (try ChangeOfValue.decodeValues(&g_cov_real)).new_value.changed_value);
+
+    const g_cmd = hex("3e0e91010f1a04802e91002f3f");
+    try expectValues(&g_cmd, CommandFailure{ .command_value = &hex("9101"), .status_flags = sf1, .feedback_value = &hex("9100") });
+    const cf = try CommandFailure.decodeValues(&g_cmd);
+    try testing.expectEqualSlices(u8, &hex("9101"), cf.command_value);
+    try testing.expectEqualSlices(u8, &hex("9100"), cf.feedback_value);
+
+    const g_fl = hex("4e0c428f00001a04802c428c00003c3f8000004f");
+    try expectValues(&g_fl, FloatingLimit{ .reference_value = 71.5, .status_flags = sf1, .setpoint_value = 70.0, .error_limit = 1.0 });
+    try testing.expectEqual(@as(f32, 71.5), (try FloatingLimit.decodeValues(&g_fl)).reference_value);
+
+    const g_ur = hex("be0a05dc1a04802a03e8bf");
+    try expectValues(&g_ur, UnsignedRange{ .exceeding_value = 1500, .status_flags = sf1, .exceeded_limit = 1000 });
+    try testing.expectEqual(@as(u64, 1000), (try UnsignedRange.decodeValues(&g_ur)).exceeded_limit);
+
+    const g_rel = hex("fe1309021a04c02e2fff13");
+    try expectValues(&g_rel, ChangeOfReliability{ .reliability = .over_range, .status_flags = .{ .in_alarm = true, .fault = true } });
+    const rel = try ChangeOfReliability.decodeValues(&g_rel);
+    try testing.expectEqual(types.Reliability.over_range, rel.reliability);
+    try testing.expect(rel.status_flags.fault and rel.property_values.len == 0);
+
+    // With the monitored object's values (what a device sends with a fault).
+    const g_relpv = hex("fe13090e1a04c02e09552e4442be00002f09672e910e2f2fff13");
+    try expectValues(&g_relpv, ChangeOfReliability{
+        .reliability = .monitored_object_fault,
+        .status_flags = .{ .in_alarm = true, .fault = true },
+        .property_values = &hex("09552e4442be00002f09672e910e2f"),
+    });
+    try testing.expectEqual(@as(usize, 15), (try ChangeOfReliability.decodeValues(&g_relpv)).property_values.len);
+
+    const g_ls = hex("8e090219012a048039018f");
+    try expectValues(&g_ls, ChangeOfLifeSafety{ .new_state = 2, .new_mode = 1, .status_flags = sf1, .operation_expected = 1 });
+    try testing.expectEqual(@as(u32, 1), (try ChangeOfLifeSafety.decodeValues(&g_ls)).operation_expected);
+
+    // The union picks the codec by event type; types without one give null.
+    const v = (try EventValues.decode(.floating_limit, &g_fl)).?;
+    try testing.expectEqual(@as(f32, 70.0), v.floating_limit.setpoint_value);
+    try testing.expectEqual(@as(?EventValues, null), try EventValues.decode(.buffer_ready, &g_fl));
+    // A block of another choice, and every truncation, are typed errors.
+    try testing.expectError(error.UnexpectedTag, ChangeOfState.decodeValues(&g_fl));
+    for ([_][]const u8{ &g_bits, &g_state, &g_cov_bits, &g_cov_real, &g_cmd, &g_fl, &g_ur, &g_rel, &g_ls }) |g| {
+        for (0..g.len) |cut| {
+            _ = ChangeOfBitstring.decodeValues(g[0..cut]) catch {};
+            _ = ChangeOfState.decodeValues(g[0..cut]) catch {};
+            _ = ChangeOfValue.decodeValues(g[0..cut]) catch {};
+            _ = CommandFailure.decodeValues(g[0..cut]) catch {};
+            _ = FloatingLimit.decodeValues(g[0..cut]) catch {};
+            _ = UnsignedRange.decodeValues(g[0..cut]) catch {};
+            _ = ChangeOfReliability.decodeValues(g[0..cut]) catch {};
+            _ = ChangeOfLifeSafety.decodeValues(g[0..cut]) catch {};
+        }
+    }
+}
+
+fn expectParams(golden: []const u8, p: EventParameters) !void {
+    var buf: [128]u8 = undefined;
+    var w = tag.Writer.init(&buf);
+    try p.encode(&w);
+    try testing.expectEqualSlices(u8, golden, w.written());
+}
+
+test "Event_Parameters and property references: golden bytes both ways" {
+    const ai5_pv: PropertyReference = .{ .object = ai5, .property = .present_value };
+    const g_ref = hex("0c000000051955");
+    var buf: [64]u8 = undefined;
+    var w = tag.Writer.init(&buf);
+    try ai5_pv.encode(&w);
+    try testing.expectEqualSlices(u8, &g_ref, w.written());
+    const full: PropertyReference = .{ .object = .{ .type = .multi_state_value, .instance = 5 }, .property = .present_value, .array_index = 3, .device = .{ .type = .device, .instance = 599 } };
+    w = tag.Writer.init(&buf);
+    try full.encode(&w);
+    const g_full = hex("0c04c00005195529033c02000257");
+    try testing.expectEqualSlices(u8, &g_full, w.written());
+    var r = tag.Reader.init(&g_full);
+    const back = try PropertyReference.decode(&r);
+    try testing.expectEqual(@as(?u32, 3), back.array_index);
+    try testing.expectEqual(@as(u22, 599), back.device.?.instance);
+
+    const g_bs = hex("0e09051a04c02e8204808204402f0f");
+    try expectParams(&g_bs, .{ .change_of_bitstring = .{ .time_delay = 5, .bitmask = .{ .unused_bits = 4, .bytes = &.{0xC0} }, .values = &hex("820480820440") } });
+    const p_bs = try EventParameters.decode(&g_bs);
+    var bit_it = EventParameters.bitstringsIterator(p_bs.change_of_bitstring.values);
+    try testing.expectEqual(@as(u8, 0x80), (try bit_it.next()).?.bytes[0]);
+    try testing.expectEqual(@as(u8, 0x40), (try bit_it.next()).?.bytes[0]);
+    try testing.expectEqual(@as(?tag.BitString, null), try bit_it.next());
+
+    const g_st = hex("1e09051e1901b9031f1f");
+    try expectParams(&g_st, .{ .change_of_state = .{ .time_delay = 5, .values = &hex("1901b903") } });
+    const p_st = try EventParameters.decode(&g_st);
+    var st_it = EventParameters.statesIterator(p_st.change_of_state.values);
+    try testing.expectEqual(PropertyState{ .choice = 1, .value = 1 }, (try st_it.next()).?);
+    try testing.expectEqual(PropertyState{ .choice = 11, .value = 3 }, (try st_it.next()).?);
+    try testing.expectEqual(@as(?PropertyState, null), try st_it.next());
+
+    const g_ci = hex("2e09051e1c3f0000001f2f");
+    try expectParams(&g_ci, .{ .change_of_value = .{ .time_delay = 5, .criteria = .{ .increment = 0.5 } } });
+    try testing.expectEqual(@as(f32, 0.5), (try EventParameters.decode(&g_ci)).change_of_value.criteria.increment);
+    const g_cm = hex("2e09051e0a05e01f2f");
+    try expectParams(&g_cm, .{ .change_of_value = .{ .time_delay = 5, .criteria = .{ .bitmask = .{ .unused_bits = 5, .bytes = &.{0xE0} } } } });
+    try testing.expectEqual(@as(u8, 0xE0), (try EventParameters.decode(&g_cm)).change_of_value.criteria.bitmask.bytes[0]);
+
+    const g_cmd = hex("3e09051e0c0000000519551f3f");
+    try expectParams(&g_cmd, .{ .command_failure = .{ .time_delay = 5, .feedback = ai5_pv } });
+    try testing.expect((try EventParameters.decode(&g_cmd)).command_failure.feedback.object.eql(ai5));
+
+    const g_fl = hex("4e09051e0c0000000519551f2c3fc000003c402000004c3f0000004f");
+    try expectParams(&g_fl, .{ .floating_limit = .{ .time_delay = 5, .setpoint = ai5_pv, .low_diff_limit = 1.5, .high_diff_limit = 2.5, .deadband = 0.5 } });
+    try testing.expectEqual(@as(f32, 2.5), (try EventParameters.decode(&g_fl)).floating_limit.high_diff_limit);
+
+    const g_oor = hex("5e09051c412000002c42b400003c400000005f");
+    try expectParams(&g_oor, .{ .out_of_range = .{ .time_delay = 5, .low_limit = 10.0, .high_limit = 90.0, .deadband = 2.0 } });
+    try testing.expectEqual(@as(f32, 90.0), (try EventParameters.decode(&g_oor)).out_of_range.high_limit);
+
+    const g_ur = hex("be0905190a295abf");
+    try expectParams(&g_ur, .{ .unsigned_range = .{ .time_delay = 5, .low_limit = 10, .high_limit = 90 } });
+    try testing.expectEqual(@as(u64, 90), (try EventParameters.decode(&g_ur)).unsigned_range.high_limit);
+
+    const g_none = hex("f814");
+    try expectParams(&g_none, .none);
+    try testing.expectEqual(EventType.none, (try EventParameters.decode(&g_none)).eventType());
+    try testing.expectEqual(EventType.floating_limit, (try EventParameters.decode(&g_fl)).eventType());
+
+    // Trailing octets, an unknown choice and every truncation are typed errors.
+    try testing.expectError(error.InvalidParameter, EventParameters.decode(&hex("f81400")));
+    try testing.expectError(error.UnexpectedTag, EventParameters.decode(&hex("9e09051f")));
+    for ([_][]const u8{ &g_bs, &g_st, &g_ci, &g_cm, &g_cmd, &g_fl, &g_oor, &g_ur, &g_none }) |g| {
+        for (0..g.len) |cut| _ = EventParameters.decode(g[0..cut]) catch {};
+    }
+}
+
+test "LifeSafetyOperation: golden bytes both ways" {
+    var buf: [32]u8 = undefined;
+    const with: LifeSafetyOperationRequest = .{ .process_id = 7, .source = "op", .request = .silence, .object = .{ .type = .life_safety_point, .instance = 3 } };
+    const g_with = hex("09071b006f7029013c05400003");
+    try testing.expectEqualSlices(u8, &g_with, try encodeOf(with, &buf));
+    const back = try LifeSafetyOperationRequest.decode(&g_with);
+    try testing.expectEqual(LifeSafetyOperation.silence, back.request);
+    try testing.expectEqual(@as(u22, 3), back.object.?.instance);
+    const g_all = hex("09071b006f702905");
+    try testing.expectEqualSlices(u8, &g_all, try encodeOf(LifeSafetyOperationRequest{ .process_id = 7, .source = "op", .request = .reset_alarm }, &buf));
+    try testing.expectEqual(@as(?ObjectId, null), (try LifeSafetyOperationRequest.decode(&g_all)).object);
+    try testing.expectError(error.UnexpectedTag, LifeSafetyOperationRequest.decode(&hex("09071b006f70290500")));
 }
 
 // ── fuzzing: every decoder over arbitrary bodies ───────────────────────────
