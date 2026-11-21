@@ -234,7 +234,7 @@ and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are th
 
 ## Backlog / deferred
 
-- **B6** Speed, what is left (not attempted in wave 14: a perf claim needs interleaved ReleaseFast A/B runs
+- *BOUNCED (quiet-host):* **B6** Speed, what is left (not attempted in wave 14: a perf claim needs interleaved ReleaseFast A/B runs
   with a spread below the effect, and the benchmark queue was shared with other agents' jobs, so a spread
   that small could not be had): (a) the decoder's loop is a JCC-erratum layout lottery on
   Skylake-family hosts (well behind liblz4 unpadded across builds of nearly the same code, level with it

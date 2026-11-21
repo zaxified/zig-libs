@@ -355,7 +355,7 @@ decoders' scratch.
 
 ## Backlog / deferred
 
-- **libolm / vodozemac pickle import**: a client migrating from libolm or vodozemac storage would need to read their pickle formats. Not readable here; migration means re-sharing or exporting sessions. Needs a published layout description or MIT source to implement from — not the Apache-2.0 code. Effort: medium.
+- *BOUNCED (other):* **libolm / vodozemac pickle import**: a client migrating from libolm or vodozemac storage would need to read their pickle formats. Not readable here; migration means re-sharing or exporting sessions. Needs a published layout description or MIT source to implement from — not the Apache-2.0 code. Effort: medium.
 
 
 ## Anchoring

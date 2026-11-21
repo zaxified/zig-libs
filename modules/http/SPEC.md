@@ -685,7 +685,7 @@ same thread).
 
 ## Backlog / deferred
 
-- **Differential oracle against karlseguin/http.zig (httpz)** — feed the same raw request bytes to both h1 parsers and
+- *BOUNCED (owner):* **Differential oracle against karlseguin/http.zig (httpz)** — feed the same raw request bytes to both h1 parsers and
   compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers), as a `tools/`
   oracle (MIT, Zig 0.16). Blocked: building a fresh third-party checkout was refused in the agent sandbox; it needs an
   owner OK (recipe: clone at a pinned commit into a gitignored `tools/` directory, build it there, run both sides from

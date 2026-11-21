@@ -536,16 +536,16 @@ Consumer build options (CONVENTIONS §4.2):
 
 ## Backlog / deferred
 
-- **L=16 REDC + `condSubInto` (speed beyond P2)** — deferred by the owner until the http TLS server exists and is measured:
+- *BOUNCED (owner):* **L=16 REDC + `condSubInto` (speed beyond P2)** — deferred by the owner until the http TLS server exists and is measured:
   the REDC rows are 54 % of `pow` at L=16 (latency-bound `u = w·n0inv` chain) and `condSubInto` 7.7 %; estimate 10–20 %
   on an RSA-2048 signature, unmeasured. No grade effect (P2 already).
-- **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5×
+- *BOUNCED (hardware):* **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5×
   slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64
   CI. Fits §2.
 - **Large-size SOS + Karatsuba modmul path.** The Karatsuba/schoolbook full-product pair in `limbs.zig`
   (`karatsuba_threshold = 16`, descriptive) is the building block for a separate full multiply followed by a Montgomery
   reduce at large sizes; it is not wired into the modmul, and the tuned crossover is a bench-time question.
-- **Per-µarch tuning of the small-L cutoffs** (`asm_min_limbs`, `sqr_min_limbs`, `fixed_min_limbs` are single-host
+- *BOUNCED (hardware):* **Per-µarch tuning of the small-L cutoffs** (`asm_min_limbs`, `sqr_min_limbs`, `fixed_min_limbs` are single-host
   measurements).
 
 ## Provenance

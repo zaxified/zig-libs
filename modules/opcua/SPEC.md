@@ -516,5 +516,10 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 ## Backlog / deferred
 
 - **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
+
+## Roadmap
+
 - **Events and alarms & conditions** (survey): the `EventFilter` on monitored items, `EventNotificationList`, the event type model and conditions (OPC 10000-9); large, fits §2.
+  Size: weeks to months: the OPC 10000-9 event model (EventFilter on monitored items, EventNotificationList, event types, alarm and condition state machines), needs the Part 9 type model plus a conformance peer.
 - **Full standard NodeSet + node management + PubSub (Part 14)** (survey): large, fits §2 for NodeSet (generated data); PubSub is a project of its own.
+  Size: months: generated NodeSet data and node management are weeks, PubSub (Part 14: UADP/JSON message mappings, MQTT/UDP transports) is a project of its own, needs the Part 14 text and a PubSub peer.

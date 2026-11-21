@@ -278,5 +278,5 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 
 ## Backlog / deferred
 
-- **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
-  bench of its own. BOUNCED: needs a quiet host for numbers (quiet phase).
+- *BOUNCED (quiet-host):* **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
+  bench of its own. Needs a quiet host for numbers (quiet phase).

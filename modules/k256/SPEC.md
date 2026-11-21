@@ -471,7 +471,7 @@ the integers from the lattice basis) with zero-run wNAF; sign rides the fixed-ba
   arbitrary points still runs the RCB `glvCombine` (no consumer on a hot path).
 - **Secret-path `mul` speed** (variable base, w = 4 projective, RCB): did not get the comb's
   treatment; an affine per-call table needs a constant-time batch inversion. Not measured.
-- **aarch64 field asm**: arm64 (Lightning nodes on ARM boards, phones) runs the portable limb-level
+- *BOUNCED (hardware):* **aarch64 field asm**: arm64 (Lightning nodes on ARM boards, phones) runs the portable limb-level
   path only; decred's package ships amd64 assembly, libsecp256k1 has 32/64-bit generic and ARM asm.
   Effort M-L, untestable without arm64 CI. Fits §2.
 - **Safegcd inverse for the scalar field**: the base-field inverse is done; the scalar-field inverse

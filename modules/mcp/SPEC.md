@@ -517,8 +517,8 @@ shapes of the client declaration. The iframe bridge belongs to the host and the 
 - **Re-check two equivalence arguments** at the next whole-module mutation run: `compileText`'s `literalDepthOk` and
   `cancelInflight`'s `conformingId` guard are judged equivalent because `std.json` and `Stringify` are bounded by a
   buffer.
-- **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
-  held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete. *BOUNCED: needs a held-open response seam in
+- *BOUNCED (other):* **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
+  held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete. *needs a held-open response seam in
   `http` (see `mcp-http`'s Backlog).*
 
 ## Anchoring

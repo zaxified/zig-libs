@@ -604,7 +604,7 @@ is the authoritative figure set.
 ## Backlog / deferred
 
 - **Runtime-agile suite selection** (Go `NewKEM`/`NewKDF`/`NewAEAD` by id): suites are comptime types here. A protocol that negotiates the suite (ECH, MLS) switches over the ids it supports itself (`tlsserver/src/ech.zig` does). Small; only if a consumer asks.
-- **One-stage psk mode has no published vector:** the draft's vectors and Go's are base mode only; psk over a one-stage KDF follows draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage` text and is pinned by round trips only (`kat_go_test.zig`). Re-anchor when a psk vector is published.
+- *BOUNCED (waits-external):* **One-stage psk mode has no published vector:** the draft's vectors and Go's are base mode only; psk over a one-stage KDF follows draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage` text and is pinned by round trips only (`kat_go_test.zig`). Re-anchor when a psk vector is published.
 
 ## Anchoring
 

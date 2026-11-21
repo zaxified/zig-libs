@@ -448,7 +448,7 @@ attribution.
 
 ## Backlog / deferred
 
-- **HE/EHT capability per-bit accessors** (wait: hardware and reference). The HE MAC/PHY/MCS bytes and the EHT rate fields are decoded
+- *BOUNCED (hardware):* **HE/EHT capability per-bit accessors** (wait: hardware and reference). The HE MAC/PHY/MCS bytes and the EHT rate fields are decoded
   and carried unchanged; named bit accessors need either a capture from an HE/EHT radio (this host's iwlwifi is 802.11ac, so a
   table built from memory could not be checked against anything) or a permissive source for the bit layout (IEEE 802.11ax/be is
   paywalled; the kernel's `ieee80211.h` is GPL-2.0 and was not read).

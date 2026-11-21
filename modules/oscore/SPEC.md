@@ -409,9 +409,13 @@ material.
 
 ## Backlog / deferred
 
-- **EDHOC (RFC 9528) key exchange**: OSCORE is used with a pre-shared master secret only, which is the deployment problem the IETF built EDHOC to solve; aiocoap has experimental EDHOC (README) and points at the `lakers` implementation. No sibling. Large (a month: CBOR/COSE, X25519/P-256, signatures, test vectors from RFC 9529 *(inferred)*); fits §2 (`std.crypto` covers the primitives).
-- **Group OSCORE** (draft-ietf-core-oscore-groupcomm): multicast use; needs signature countersignatures. Large; fits §2. Moving draft, not an RFC yet as far as checked *(inferred)*; defer.
+- *BOUNCED (waits-external):* **Group OSCORE** (draft-ietf-core-oscore-groupcomm): multicast use; needs signature countersignatures. Large; fits §2. Moving draft, not an RFC yet as far as checked *(inferred)*; defer.
 - **Other AEAD algorithms** (AES-CCM-16-64-128 only today; `Algorithm` has one member): RFC 8613 makes only AES-CCM-16-64-128 mandatory; ChaCha20-Poly1305 (COSE 24) and AES-GCM are the usual additions on hardware without CCM offload. Small (nonce length and ID width become algorithm-dependent); fits §2. Candidate for "deliberately not doing" if the maintainer wants MTI only.
+
+## Roadmap
+
+- **EDHOC (RFC 9528) key exchange**: OSCORE is used with a pre-shared master secret only, which is the deployment problem the IETF built EDHOC to solve; aiocoap has experimental EDHOC (README) and points at the `lakers` implementation. No sibling. Large (a month: CBOR/COSE, X25519/P-256, signatures, test vectors from RFC 9529 *(inferred)*); fits §2 (`std.crypto` covers the primitives).
+  Size: a month: EDHOC (CBOR/COSE, X25519/P-256, signatures, RFC 9529 vectors) as a new key-exchange module, needs a sibling module and its test vectors.
 
 ## Anchoring
 

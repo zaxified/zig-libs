@@ -425,7 +425,7 @@ Bench: `zig build bench-hqc` (`tools/bench.zig`, ReleaseFast, the authors' code 
   slower (figures: the card's `**Performance:**` line) for keygen/encaps/decaps of all three sets. Likely sources:
   the GF(2)[x] multiply (CLMUL here, AVX2 in the authors' lane) and the RS/RM decoder vectorisation; profile before
   choosing (`HQC_PROFILE=1` workload in `src/bench.zig`). Pure Zig, fits CONVENTIONS §2.
-- **Follow the standard once NIST publishes HQC (draft FIPS).** Upstream `next-release` already differs from
+- *BOUNCED (waits-external):* **Follow the standard once NIST publishes HQC (draft FIPS).** Upstream `next-release` already differs from
   `v5.0.0` in sampler and GF(2^8) polynomial (see *Spec version*), and liboqs will move with it; a consumer that
   interoperates with liboqs after that point needs the new bytes. Effort: moderate (constants and sampler, plus new
   KATs), pure Zig, fits CONVENTIONS §2. Blocked on the published standard/tag, not on us.

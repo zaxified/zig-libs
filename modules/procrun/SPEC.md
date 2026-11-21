@@ -186,7 +186,7 @@ table empties with the reap).
 
 ## Backlog / deferred
 
-- **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner (wait: no Windows machine here; the new `Handle.retain`/pidfd code is Linux-tested only, the Windows branch type-checks lazily and was not built).
+- *BOUNCED (hardware):* **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner (wait: no Windows machine here; the new `Handle.retain`/pidfd code is Linux-tested only, the Windows branch type-checks lazily and was not built).
 
 ## Anchoring
 

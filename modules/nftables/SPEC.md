@@ -291,7 +291,7 @@ Capture-derived facts recorded as tests rather than byte goldens: the set dataty
 
 ## Backlog / deferred
 
-- **Non-x86 goldens** (wait: hardware). The captures are little-endian; every golden test skips on a big-endian host (netlink's host-endian header fields would differ). The wire layer itself is endian-explicit and would need a big-endian capture to be pinned; no big-endian machine is available here.
+- *BOUNCED (hardware):* **Non-x86 goldens** (wait: hardware). The captures are little-endian; every golden test skips on a big-endian host (netlink's host-endian header fields would differ). The wire layer itself is endian-explicit and would need a big-endian capture to be pinned; no big-endian machine is available here.
 
 ## Anchoring
 

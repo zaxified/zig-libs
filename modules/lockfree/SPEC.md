@@ -996,14 +996,14 @@ bench did not change it.
 
 ## Backlog / deferred
 
-- **A litmus pair for `SegQueue`'s retire/scan shape** — blocked on tooling: `litmus/run.sh` needs `herd7`, which this
+- *BOUNCED (tool):* **A litmus pair for `SegQueue`'s retire/scan shape** — blocked on tooling: `litmus/run.sh` needs `herd7`, which this
   machine does not have (an OCaml + libgmp toolchain, not installable here without root). The encoding is settled: the
   consumer's item copy then its `read` release store against the scanner's acquire load of `read` then the recycle
   write (load buffering, bug = the copy sees the recycled value; control = a plain `read` store), and the `pending`
   stack's release CAS push against the acquire swap-all then the load of `pending_next` (message passing, as
   `msqueue-*`, with an RMW on the flag). Four files per shape (`aarch64`/`riscv` × `rel-acq`/`relaxed`) plus the
   `run.sh` rows, each to be run for its verdict before it is committed.
-- **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7) — needs the hardware.
+- *BOUNCED (hardware):* **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7) — needs the hardware.
 
 ## Anchoring
 

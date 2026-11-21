@@ -268,7 +268,7 @@ pattern precompiled here against a compile per node on the foreign sides, a desi
 
 ## Backlog / deferred
 
-- **Speed: `eval_filter` against serde_json_path** — BOUNCED to the quiet-host phase (a speedup claim needs numbers a loaded host cannot give). The one like-with-like row over 1.25× the fastest (see the
+- *BOUNCED (quiet-host):* **Speed: `eval_filter` against serde_json_path** — quiet-host phase (a speedup claim needs numbers a loaded host cannot give). The one like-with-like row over 1.25× the fastest (see the
   card's Performance line). A singular query in a comparison builds a sub-`Ctx` and walks through `evalSegs`; a
   direct walk for singular queries is the first thing to try, keeping the work charges the sweep tests pin.
 - **The card's one unexplained mutation survivor** (from the first whole-module run, which did not record which

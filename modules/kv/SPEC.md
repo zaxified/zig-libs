@@ -649,7 +649,7 @@ Boundaries no test reaches because they need an input too large to build:
 
 ## Backlog / deferred
 
-- **Speed: `put_sync` is fsync-bound** — BOUNCED to the quiet-host phase: the speedup is the whole point and an fsync rate cannot be measured on a host whose disk other jobs share (a rewrite whose speedup cannot be shown is not committed). Every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
+- *BOUNCED (quiet-host):* **Speed: `put_sync` is fsync-bound** — the speedup is the whole point and an fsync rate cannot be measured on a host whose disk other jobs share (a rewrite whose speedup cannot be shown is not committed). Every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
 
 ## Roadmap
 

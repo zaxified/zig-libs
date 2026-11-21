@@ -171,8 +171,8 @@ Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] script
 
 ## Backlog / deferred
 
-- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here (*BOUNCED: waits on `std`*).
-- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only; correctness under qemu aarch64 is covered). *BOUNCED: needs an arm64 machine.*
+- *BOUNCED (waits-external):* **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here (*waits on `std`*).
+- *BOUNCED (hardware):* **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only; correctness under qemu aarch64 is covered). *needs an arm64 machine.*
 
 ## Anchoring
 

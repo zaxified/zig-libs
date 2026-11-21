@@ -254,7 +254,7 @@ network policy) rather than gating the whole router with `.all`.
 
 ## Backlog / deferred
 
-- **Differential oracle against karlseguin/metrics.zig** (MIT, Zig 0.16): register the same counters, gauges and histograms in
+- *BOUNCED (owner):* **Differential oracle against karlseguin/metrics.zig** (MIT, Zig 0.16): register the same counters, gauges and histograms in
   both and compare the expositions. Not a byte diff: that library writes label names sorted, no HELP unless given and a
   different series order, so the comparison would be of the parsed samples (name, label set, value) plus how label values with
   `"`, `\` and newlines are written. Blocked: building the fresh third-party checkout was refused in the agent sandbox; it

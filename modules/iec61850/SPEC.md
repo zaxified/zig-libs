@@ -516,7 +516,7 @@ are checked against this module's own client decoders, not against a third-party
 
 ## Backlog / deferred
 
-- **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
+- *BOUNCED (paywalled):* **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
   **Blocked on a verifiable wire layout (wait, not a size problem).** The standard is not redistributable and the
   only readable open description (a journal article's prose: SI `0xA1`/`0xA2`, common header PI `0x80`, SPDU length 4,
   SPDU number 4, version 2 = 1, time of current key 4, time to next key 2, security algorithms 2, key id 4, then payload
