@@ -127,6 +127,12 @@ pub const meta = .{
 // Re-export it (via `kvtree`, which already re-exports the identical types) so
 // a consumer wires a WAL backend without importing `kv` directly: production
 // `FsStorage`, deterministic `SimStorage`.
+/// `Sink` over a SQL table through a caller-supplied `Executor`; see `sqlsink.zig`.
+pub const SqlSink = @import("sqlsink.zig").SqlSink;
+pub const SqlExecutor = @import("sqlsink.zig").Executor;
+pub const SqlDialect = @import("sqlsink.zig").Dialect;
+pub const SqlConfig = @import("sqlsink.zig").Config;
+
 pub const Storage = kvtree.Storage;
 pub const FsStorage = kvtree.FsStorage;
 pub const SimStorage = kvtree.SimStorage;
@@ -153,7 +159,32 @@ pub const Sink = struct {
         /// result with `gpa` (caller frees). `null` field ⇒ no read-through (a
         /// cache miss with no readable sink returns `null`).
         read: ?*const fn (ptr: *anyopaque, gpa: Allocator, key: []const u8) anyerror!?[]u8 = null,
+        /// Optional batch write (`Options.batch_size` > 1 uses it): apply the
+        /// operations in order, ideally in one transaction (a SQL sink: one
+        /// commit per batch instead of one per key). All slices are borrowed
+        /// for the call. An error means "not known to be applied": the
+        /// coordinator then writes the operations one by one through `write` /
+        /// `delete`, so a single poison record cannot hold the others back.
+        /// Every key appears at most once per batch.
+        write_batch: ?*const fn (ptr: *anyopaque, ops: []const BatchOp) anyerror!void = null,
     };
+
+    /// One operation of `VTable.write_batch`.
+    pub const BatchOp = struct {
+        kind: Op,
+        key: []const u8,
+        /// The value of a `.put`; empty for a `.del`.
+        value: []const u8,
+    };
+
+    pub fn canBatch(self: Sink) bool {
+        return self.vtable.write_batch != null;
+    }
+    /// Returns `error.NoBatch` if the sink provides no `write_batch`.
+    pub fn writeBatch(self: Sink, ops: []const BatchOp) anyerror!void {
+        const f = self.vtable.write_batch orelse return error.NoBatch;
+        return f(self.ptr, ops);
+    }
 
     pub fn write(self: Sink, key: []const u8, value: []const u8) anyerror!void {
         return self.vtable.write(self.ptr, key, value);
@@ -170,6 +201,9 @@ pub const Sink = struct {
         return self.vtable.read != null;
     }
 };
+
+/// A write operation: an upsert or a delete.
+pub const Op = enum { put, del };
 
 /// A tiny test/utility spinlock (pure `std.atomic`) used to make the
 /// single-writer reference sinks safe under concurrent flush.
@@ -269,7 +303,14 @@ pub const MapSink = struct {
         return self.map.get(key);
     }
 
-    const vtable = Sink.VTable{ .write = vWrite, .delete = vDelete, .read = vRead };
+    const vtable = Sink.VTable{ .write = vWrite, .delete = vDelete, .read = vRead, .write_batch = vBatch };
+
+    fn vBatch(ptr: *anyopaque, ops: []const Sink.BatchOp) anyerror!void {
+        for (ops) |op| switch (op.kind) {
+            .put => try vWrite(ptr, op.key, op.value),
+            .del => try vDelete(ptr, op.key),
+        };
+    }
 
     fn cast(ptr: *anyopaque) *MapSink {
         return @ptrCast(@alignCast(ptr));
@@ -382,6 +423,28 @@ pub const Options = struct {
     /// `error.Backpressure`. 0 = never wait (one flush pass, then fail).
     /// Default 60 s, Kafka's `max.block.ms`. Ignored while `max_unflushed` is 0.
     put_block_ns: u64 = 60 * std.time.ns_per_s,
+    /// Batch writes: up to this many flushes (records of different keys) go to
+    /// the sink in one `Sink.write_batch` call, one pool job. 1 (the default)
+    /// = one sink call per record, as before; a sink without `write_batch`
+    /// also keeps that. Ehcache write-behind's `batchSize`. A batch that
+    /// fails is retried record by record, so a record the sink rejects delays
+    /// only itself.
+    batch_size: usize = 1,
+    /// With `batch_size` > 1: how long a partial batch may wait for more
+    /// records before it is written anyway (Ehcache's `maxWriteDelay`; ns on
+    /// `wal_mono_clock`, measured at `drain`, so it is as fine as the caller's
+    /// tick). 0 (the default) = no wait: whatever one `drain` collected is
+    /// written. Capped at 30 s (the WAL lease of a waiting record lasts 60 s).
+    /// `flushAll`, `sync` and back-pressure write a partial batch at once.
+    batch_max_delay_ns: u64 = 0,
+    /// Coalesce superseded writes (Ehcache write-behind's coalescing): a `put`
+    /// or `del` cancels the key's older records that have not reached a worker
+    /// yet, so a key overwritten N times between two flushes costs one sink
+    /// write and the WAL does not carry the N-1 stale ones. The new record is
+    /// durable before the old one is removed, so a crash in between replays
+    /// both (the same result). A record already leased by a flush is never
+    /// cancelled. Default false: every acknowledged write reaches the sink.
+    coalesce_writes: bool = false,
     /// WAL clocks (injectable for deterministic tests). Defaults use the OS
     /// clocks. Delivery visibility uses only `delay = 0`, so the wall clock
     /// merely needs to be non-decreasing.
@@ -416,8 +479,6 @@ pub const FlushError = error{
     FlushIncomplete,
 };
 
-const Op = enum { put, del };
-
 /// See `Coordinator.held`.
 const Held = struct {
     lease: jobqueue.Lease,
@@ -447,6 +508,11 @@ const FlushTask = struct {
     lease: jobqueue.Lease,
     ok: bool = false,
     next: ?*FlushTask = null,
+    /// The head task of a batch job owns the batch: every member (itself
+    /// included) and the operations handed to `Sink.write_batch`. Freed with
+    /// the head.
+    members: []*FlushTask = &.{},
+    ops: []Sink.BatchOp = &.{},
 };
 
 pub const Coordinator = struct {
@@ -468,6 +534,17 @@ pub const Coordinator = struct {
     /// `Options.max_unflushed` / `Options.put_block_ns`.
     max_unflushed: usize,
     put_block_ns: u64,
+    /// `Options.batch_size` (1 when the sink cannot batch) and delay.
+    batch_size: usize,
+    batch_delay_ns: u64,
+    /// Flushes leased and registered in flight but not yet submitted: they
+    /// wait for the batch to fill or its delay to pass (`dispatchStaged`).
+    staged: std.ArrayList(*FlushTask) = .empty,
+    staged_since: u64 = 0,
+    /// `Options.coalesce_writes`: per key, the WAL id of its newest record
+    /// (owns keys). Dropped when the key is fully flushed.
+    coalesce: bool,
+    latest: std.StringHashMapUnmanaged(jobqueue.JobId) = .empty,
 
     /// Records the WAL gave up on (dead-lettered) because the sink kept
     /// rejecting them. Only ever non-zero when a finite `max_flush_attempts`
@@ -569,6 +646,9 @@ pub const Coordinator = struct {
                 options.max_flush_attempts,
             .max_unflushed = options.max_unflushed,
             .put_block_ns = options.put_block_ns,
+            .batch_size = if (options.sink.canBatch()) @max(options.batch_size, 1) else 1,
+            .batch_delay_ns = @min(options.batch_max_delay_ns, 30 * std.time.ns_per_s),
+            .coalesce = options.coalesce_writes,
             .scratch_arena = std.heap.ArenaAllocator.init(gpa),
         };
 
@@ -613,6 +693,8 @@ pub const Coordinator = struct {
         self.wal.close();
         self.cache.deinit();
         self.freeInFlight();
+        self.staged.deinit(self.gpa);
+        self.freeLatest();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.freeRetry();
@@ -647,6 +729,8 @@ pub const Coordinator = struct {
         // task was never handed back, so free it here (its WAL record stays
         // durable for the next process's `recover()`).
         self.freeInFlight();
+        self.staged.deinit(self.gpa);
+        self.freeLatest();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.freeRetry();
@@ -668,11 +752,12 @@ pub const Coordinator = struct {
         if (key.len > jobqueue.max_field_len) return error.KeyTooLarge; // before any wait
         try self.awaitCapacity();
         // Durable WAL append FIRST — after this the write survives a crash.
-        _ = self.wal.enqueue("put", value, .{
+        const id = self.wal.enqueue("put", value, .{
             .partition = key,
             .max_attempts = self.wal_max_attempts,
         }) catch |e| return mapWalErr(e);
         self.unflushed += 1;
+        self.supersede(key, id);
         // Stage in the cache (marks the entry dirty). OOM here is non-fatal to
         // durability: the WAL record still drives the flush/recovery.
         self.cache.put(key, value, 0, 0, 0);
@@ -698,11 +783,12 @@ pub const Coordinator = struct {
     pub fn del(self: *Coordinator, key: []const u8) PutError!void {
         if (key.len > jobqueue.max_field_len) return error.KeyTooLarge; // before any wait
         try self.awaitCapacity();
-        _ = self.wal.enqueue("del", "", .{
+        const id = self.wal.enqueue("del", "", .{
             .partition = key,
             .max_attempts = self.wal_max_attempts,
         }) catch |e| return mapWalErr(e);
         self.unflushed += 1;
+        self.supersede(key, id);
         // The durable WAL delete record is already written; an OOM below
         // must not be swallowed (F3) — a dropped tombstone would silently
         // un-shadow the deleted key's stale cached value on `get`, the same
@@ -722,6 +808,7 @@ pub const Coordinator = struct {
         const deadline = start +| @as(i96, self.put_block_ns);
         while (true) {
             self.drain();
+            self.dispatchStaged(true);
             if (self.unflushed < self.max_unflushed) return;
             // Records not reachable through the cache: flush one synchronously,
             // as `flushAll` does, so waiting is never stuck on them.
@@ -783,6 +870,7 @@ pub const Coordinator = struct {
         // next synchronous flush moves on to the next record) and returned to
         // the WAL once nothing else is visible (`releaseHeld`).
         self.drain();
+        self.dispatchStaged(true);
         while (self.unflushed > 0 or self.in_flight.count() > 0) {
             if (self.in_flight.count() == 0) {
                 // Records remain but nothing is in flight (e.g. WAL entries from
@@ -812,6 +900,7 @@ pub const Coordinator = struct {
                 .clock = .awake,
             } }) catch {};
             self.drain();
+            self.dispatchStaged(true);
         }
     }
     /// Alias — a graceful-shutdown / barrier `sync`.
@@ -873,6 +962,52 @@ pub const Coordinator = struct {
     pub fn poisoned(self: *Coordinator, gpa: Allocator) ![]jobqueue.DeadLetter {
         return self.wal.deadLetterList(gpa);
     }
+    /// What `resolvePoisonedDeletes` does with the dead-lettered deletes.
+    pub const PoisonedAction = enum {
+        /// Give each one a fresh set of attempts (an operator fixed the sink):
+        /// it is flushed again, and its tombstone is reclaimed when it lands.
+        retry,
+        /// Accept the loss: drop the record, its tombstone and the cached
+        /// value. The sink still holds the pre-delete value, so a later `get`
+        /// miss reads it back through the sink (the key reappears).
+        discard,
+    };
+
+    /// The compaction pass for the residue of a poisoned delete (a finite
+    /// `max_flush_attempts` only): every dead-lettered **delete** whose key is
+    /// still shadowed by its tombstone is retried or discarded, and the
+    /// tombstone follows. Returns how many were resolved. Dead-lettered puts
+    /// are left alone (a newer write of the key may exist, which a retry
+    /// would overwrite; `poisoned` lists them), and so is a delete whose
+    /// tombstone a later `put` already cleared (that put superseded it).
+    pub fn resolvePoisonedDeletes(self: *Coordinator, action: PoisonedAction) Allocator.Error!usize {
+        const dead = try self.wal.deadLetterList(self.gpa);
+        defer jobqueue.Queue.freeDeadLetterList(self.gpa, dead);
+        var n: usize = 0;
+        for (dead) |d| {
+            if (!std.mem.eql(u8, d.job_type, "del")) continue;
+            if (!self.tombstones.contains(d.partition)) continue;
+            switch (action) {
+                .retry => {
+                    try self.addKeySet(&self.orphans, d.partition);
+                    const requeued = self.wal.requeueDead(d.id, .{}) catch false;
+                    if (!requeued) continue;
+                    if (self.n_poisoned > 0) self.n_poisoned -= 1;
+                    self.unflushed += 1;
+                },
+                .discard => {
+                    const removed = self.wal.cancel(d.id) catch false;
+                    if (!removed) continue;
+                    if (self.n_poisoned > 0) self.n_poisoned -= 1;
+                    _ = self.cache.remove(d.partition);
+                    self.dropTombstone(d.partition);
+                },
+            }
+            n += 1;
+        }
+        return n;
+    }
+
     /// Release a `poisoned` snapshot.
     pub fn freePoisoned(gpa: Allocator, list: []jobqueue.DeadLetter) void {
         jobqueue.Queue.freeDeadLetterList(gpa, list);
@@ -920,6 +1055,7 @@ pub const Coordinator = struct {
             } else {
                 _ = self.cache.markClean(t.key);
                 self.removeKeySet(&self.orphans, t.key);
+                self.forgetLatest(t.key);
                 // F2: a durably-applied delete is exactly the point it is safe
                 // to garbage-collect its tombstone — the sink no longer has the
                 // key, so a future `get` miss (cache-miss + sink read-through)
@@ -965,6 +1101,7 @@ pub const Coordinator = struct {
         for (self.scratch.items) |k| self.startKey(k);
         self.scratch.clearRetainingCapacity();
         _ = self.scratch_arena.reset(.retain_capacity);
+        self.dispatchStaged(false);
     }
 
     fn collectDirty(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
@@ -989,6 +1126,7 @@ pub const Coordinator = struct {
             // No WAL record for this key: reconcile stale bookkeeping.
             _ = self.cache.markClean(key);
             self.removeKeySet(&self.orphans, key);
+            self.forgetLatest(key);
             return;
         };
         self.startFlush(key, lease);
@@ -1048,6 +1186,7 @@ pub const Coordinator = struct {
             } else {
                 _ = self.cache.markClean(key);
                 self.removeKeySet(&self.orphans, key);
+                self.forgetLatest(key);
                 // Deliberately NOT the F2 tombstone-GC step of `finishTask`: a
                 // dead-lettered delete never actually reached the sink (that is
                 // what `poisonedCount`/`n_poisoned` mean), so the sink still
@@ -1109,12 +1248,109 @@ pub const Coordinator = struct {
             self.freeTask(task);
             return false;
         };
+        if (self.batch_size > 1) {
+            // Wait for the batch: the key is in flight, its lease is held.
+            if (self.staged.items.len == 0) self.staged_since = self.mono.now();
+            self.staged.append(self.gpa, task) catch {
+                self.clearInFlight(key);
+                self.freeTask(task);
+                return false;
+            };
+            if (self.staged.items.len >= self.batch_size) self.dispatchStaged(true);
+            return true;
+        }
         self.pool.submit(.{ .func = flushEntry, .ctx = task }) catch {
             self.clearInFlight(key);
             self.freeTask(task);
             return false;
         };
         return true;
+    }
+
+    /// Submit the staged flushes as one batch job: now (`force`, or the batch
+    /// is full), or once `batch_delay_ns` has passed since the first one was
+    /// staged. A lone staged flush goes out as an ordinary job.
+    fn dispatchStaged(self: *Coordinator, force: bool) void {
+        if (self.staged.items.len == 0) return;
+        if (!force and self.staged.items.len < self.batch_size and self.batch_delay_ns > 0 and
+            self.mono.now() -| self.staged_since < self.batch_delay_ns) return;
+        const members = self.staged.toOwnedSlice(self.gpa) catch {
+            // No room to hand the batch over: put the leases back one by one
+            // (from a copy: giving one back may stage the next record of a key).
+            const copy = self.gpa.dupe(*FlushTask, self.staged.items) catch return; // retried by the next dispatch
+            self.staged.clearRetainingCapacity();
+            defer self.gpa.free(copy);
+            self.failStaged(copy);
+            return;
+        };
+        defer self.gpa.free(members);
+        if (members.len == 1) {
+            const t = members[0];
+            self.pool.submit(.{ .func = flushEntry, .ctx = t }) catch self.failStaged(members);
+            return;
+        }
+        const ops = self.gpa.alloc(Sink.BatchOp, members.len) catch {
+            self.failStaged(members);
+            return;
+        };
+        const owned = self.gpa.dupe(*FlushTask, members) catch {
+            self.gpa.free(ops);
+            self.failStaged(members);
+            return;
+        };
+        for (owned, ops) |t, *o| o.* = .{ .kind = t.op, .key = t.key, .value = t.value };
+        const head = owned[0];
+        head.members = owned;
+        head.ops = ops;
+        self.pool.submit(.{ .func = flushBatchEntry, .ctx = head }) catch {
+            head.members = &.{};
+            head.ops = &.{};
+            self.gpa.free(owned);
+            self.gpa.free(ops);
+            self.failStaged(members);
+        };
+    }
+
+    /// The batch could not be submitted: every member's lease goes back to the
+    /// WAL like a failed write (the nack counts an attempt), and a key whose
+    /// record was dead-lettered advances.
+    fn failStaged(self: *Coordinator, members: []const *FlushTask) void {
+        for (members) |t| {
+            self.clearInFlight(t.key);
+            if (self.giveBack(t.key, t.lease)) |next| self.startFlush(t.key, next);
+            self.freeTask(t);
+        }
+    }
+
+    /// `Options.coalesce_writes`: `new_id` is the newest record of `key`; the
+    /// previous newest one is cancelled if no worker holds it yet (and the WAL
+    /// did not dead-letter it).
+    fn supersede(self: *Coordinator, key: []const u8, new_id: jobqueue.JobId) void {
+        if (!self.coalesce) return;
+        if (self.latest.getPtr(key)) |slot| {
+            const prev = slot.*;
+            slot.* = new_id;
+            if (self.wal.status(prev)) |st| {
+                if (st == .ready) {
+                    if (self.wal.cancel(prev)) |removed| {
+                        if (removed and self.unflushed > 0) self.unflushed -= 1;
+                    } else |_| {}
+                }
+            }
+            return;
+        }
+        const dup = self.gpa.dupe(u8, key) catch return;
+        self.latest.put(self.gpa, dup, new_id) catch self.gpa.free(dup);
+    }
+
+    fn forgetLatest(self: *Coordinator, key: []const u8) void {
+        if (self.latest.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+    }
+
+    fn freeLatest(self: *Coordinator) void {
+        var it = self.latest.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.latest.deinit(self.gpa);
     }
 
     /// Synchronously flush the single oldest queued WAL record (any key) on the
@@ -1183,6 +1419,7 @@ pub const Coordinator = struct {
             } else {
                 _ = self.cache.markClean(key);
                 self.removeKeySet(&self.orphans, key);
+                self.forgetLatest(key);
             }
             return .landed;
         } else |_| {
@@ -1403,6 +1640,8 @@ pub const Coordinator = struct {
     }
 
     fn freeTask(self: *Coordinator, t: *FlushTask) void {
+        if (t.members.len > 0) self.gpa.free(t.members);
+        if (t.ops.len > 0) self.gpa.free(t.ops);
         self.gpa.free(t.key);
         self.gpa.free(t.value);
         self.gpa.destroy(t);
@@ -1465,6 +1704,37 @@ fn flushEntry(ctx: *anyopaque) void {
     c.io.futexWake(u32, &c.completion_gen.raw, std.math.maxInt(u32));
 }
 
+/// The worker-thread body of a batch job (`ctx` is the head task, which owns
+/// the member list): one `Sink.write_batch` call; when it fails, the members
+/// are written one by one so each gets its own verdict. Every member is handed
+/// back on the completion list, then the coordinator is woken once.
+fn flushBatchEntry(ctx: *anyopaque) void {
+    const head: *FlushTask = @ptrCast(@alignCast(ctx));
+    const c = head.coord;
+    const members = head.members;
+    if (c.sink.writeBatch(head.ops)) |_| {
+        for (members) |t| t.ok = true;
+    } else |_| {
+        for (members) |t| {
+            const res = switch (t.op) {
+                .put => c.sink.write(t.key, t.value),
+                .del => c.sink.delete(t.key),
+            };
+            t.ok = if (res) |_| true else |_| false;
+        }
+    }
+    // `members` belongs to the head, which the coordinator frees only after it
+    // takes this lock to harvest the list: the slice is not read past the unlock.
+    c.completion_lock.lock();
+    for (members) |t| {
+        t.next = c.completion_head;
+        c.completion_head = t;
+    }
+    c.completion_lock.unlock();
+    _ = c.completion_gen.fetchAdd(1, .release);
+    c.io.futexWake(u32, &c.completion_gen.raw, std.math.maxInt(u32));
+}
+
 fn mapWalErr(e: anyerror) PutError {
     return switch (e) {
         error.FieldTooLarge => error.KeyTooLarge,
@@ -1483,6 +1753,10 @@ fn mapWalErr(e: anyerror) PutError {
 // under both Debug and ReleaseFast (`zig build test-writebehind [-Doptimize=ReleaseFast]`).
 
 const testing = std.testing;
+
+test {
+    _ = @import("sqlsink.zig");
+}
 
 /// A test rig: an `Io`, an in-memory `MapSink`, and a `SimStorage` for the WAL,
 /// all torn down together. `wal_sim` outlives a reopen so crash-recovery over a
@@ -4539,4 +4813,315 @@ test "deinit after a timed-out flushAll burns no attempt on a record it can no l
     defer c2.deinit();
     try testing.expectEqual(@as(usize, 0), c2.wal.deadLetterCount());
     try testing.expectEqual(@as(usize, 1), c2.pendingCount());
+}
+
+// ── batching and coalescing ──────────────────────────────────────────────────
+
+/// A sink that counts what reaches it: single writes and deletes, batches (and
+/// their sizes), with a switch to reject the key "bad" the way a constraint
+/// violation would (a batch holding it fails as a whole).
+const CountSink = struct {
+    inner: MapSink,
+    singles: std.atomic.Value(usize) = .init(0),
+    batches: std.atomic.Value(usize) = .init(0),
+    max_batch: std.atomic.Value(usize) = .init(0),
+    batched_ops: std.atomic.Value(usize) = .init(0),
+    deletes: std.atomic.Value(usize) = .init(0),
+    reject_bad: bool = false,
+    reject_del: bool = false,
+
+    fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        const self: *CountSink = @ptrCast(@alignCast(ptr));
+        if (self.reject_bad and std.mem.eql(u8, key, "bad")) return error.Rejected;
+        _ = self.singles.fetchAdd(1, .monotonic);
+        return MapSink.vWrite(&self.inner, key, value);
+    }
+    fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *CountSink = @ptrCast(@alignCast(ptr));
+        if (self.reject_del) return error.Rejected;
+        _ = self.deletes.fetchAdd(1, .monotonic);
+        return MapSink.vDelete(&self.inner, key);
+    }
+    fn vBatch(ptr: *anyopaque, ops: []const Sink.BatchOp) anyerror!void {
+        const self: *CountSink = @ptrCast(@alignCast(ptr));
+        _ = self.batches.fetchAdd(1, .monotonic);
+        _ = self.batched_ops.fetchAdd(ops.len, .monotonic);
+        _ = self.max_batch.fetchMax(ops.len, .monotonic);
+        for (ops) |op| if (self.reject_bad and std.mem.eql(u8, op.key, "bad")) return error.Rejected;
+        for (ops) |op| switch (op.kind) {
+            .put => try MapSink.vWrite(&self.inner, op.key, op.value),
+            .del => try MapSink.vDelete(&self.inner, op.key),
+        };
+    }
+    fn vRead(ptr: *anyopaque, gpa: Allocator, key: []const u8) anyerror!?[]u8 {
+        const self: *CountSink = @ptrCast(@alignCast(ptr));
+        return MapSink.vRead(&self.inner, gpa, key);
+    }
+    const vt = Sink.VTable{ .write = vWrite, .delete = vDelete, .read = vRead, .write_batch = vBatch };
+    fn sink(self: *CountSink) Sink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+};
+
+const BatchRig = struct {
+    threaded: std.Io.Threaded,
+    sink: CountSink,
+    wal_sim: SimStorage,
+    clk: FakeClock = .{},
+
+    fn init(rig: *BatchRig) void {
+        rig.* = .{
+            .threaded = std.Io.Threaded.init(testing.allocator, .{}),
+            .sink = .{ .inner = MapSink.init(testing.allocator) },
+            .wal_sim = SimStorage.init(testing.allocator),
+        };
+    }
+    fn deinit(rig: *BatchRig) void {
+        rig.wal_sim.deinit();
+        rig.sink.inner.deinit();
+        rig.threaded.deinit();
+    }
+    fn open(rig: *BatchRig, o: struct { batch_size: usize = 1, delay: u64 = 0, coalesce: bool = false, attempts: u32 = 0, fake: bool = false }) !*Coordinator {
+        return Coordinator.init(testing.allocator, .{
+            .io = rig.threaded.io(),
+            .sink = rig.sink.sink(),
+            .wal_store = rig.wal_sim.storage(),
+            .wal_path = "wal.jq",
+            .max_cache_bytes = 1 << 20,
+            .max_cache_entries = 1024,
+            .n_workers = 2,
+            .batch_size = o.batch_size,
+            .batch_max_delay_ns = o.delay,
+            .coalesce_writes = o.coalesce,
+            .max_flush_attempts = o.attempts,
+            .wal_wall_clock = if (o.fake) .{ .ctx = &rig.clk, .nowFn = FakeClock.wall } else .system,
+            .wal_mono_clock = if (o.fake) .{ .ctx = &rig.clk, .nowFn = FakeClock.mono } else .monotonic,
+        });
+    }
+};
+
+test "batch_size: records of different keys reach the sink in batches, none singly" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{ .batch_size = 4 });
+    defer c.deinit();
+    var kb: [16]u8 = undefined;
+    for (0..10) |i| {
+        const k = std.fmt.bufPrint(&kb, "key{d}", .{i}) catch unreachable;
+        try c.put(k, k);
+    }
+    try c.del("key3");
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 9), rig.sink.inner.count());
+    try testing.expect(rig.sink.inner.peek("key3") == null);
+    try testing.expectEqualStrings("key7", rig.sink.inner.peek("key7").?);
+    try testing.expectEqual(@as(usize, 0), rig.sink.singles.load(.monotonic));
+    // The delete of key3 follows its put (one flush per key at a time): it may go out alone.
+    try testing.expectEqual(@as(usize, 11), rig.sink.batched_ops.load(.monotonic) + rig.sink.deletes.load(.monotonic));
+    try testing.expect(rig.sink.max_batch.load(.monotonic) <= 4);
+    try testing.expect(rig.sink.batches.load(.monotonic) >= 3);
+}
+
+test "batch_size 1 (default) never uses write_batch" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{});
+    defer c.deinit();
+    for (0..6) |i| {
+        var kb: [8]u8 = undefined;
+        const k = std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable;
+        try c.put(k, "v");
+    }
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), rig.sink.batches.load(.monotonic));
+    try testing.expectEqual(@as(usize, 6), rig.sink.singles.load(.monotonic));
+}
+
+test "batch_size: a rejected record does not hold the others back (record-by-record fallback)" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.sink.reject_bad = true;
+    const c = try rig.open(.{ .batch_size = 8, .attempts = 2 });
+    defer c.deinit();
+    try c.put("a", "1");
+    try c.put("bad", "x");
+    try c.put("c", "3");
+    try c.put("d", "4");
+    try c.flushAll();
+    try testing.expectEqualStrings("1", rig.sink.inner.peek("a").?);
+    try testing.expectEqualStrings("3", rig.sink.inner.peek("c").?);
+    try testing.expectEqualStrings("4", rig.sink.inner.peek("d").?);
+    try testing.expect(rig.sink.inner.peek("bad") == null);
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "batch_max_delay_ns: a partial batch waits for its delay, flushAll does not" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{ .batch_size = 100, .delay = 5 * std.time.ns_per_s, .fake = true });
+    defer c.deinit();
+    try c.put("a", "1");
+    try c.put("b", "2");
+    c.drain();
+    try testing.expectEqual(@as(usize, 2), c.inFlightCount()); // staged, not written
+    try testing.expectEqual(@as(usize, 0), rig.sink.inner.count());
+    _ = rig.clk.ns.fetchAdd(4 * std.time.ns_per_s, .monotonic);
+    c.drain();
+    try testing.expectEqual(@as(usize, 0), rig.sink.inner.count());
+    _ = rig.clk.ns.fetchAdd(2 * std.time.ns_per_s, .monotonic);
+    c.drain();
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 2), rig.sink.inner.count());
+    try testing.expectEqual(@as(usize, 1), rig.sink.batches.load(.monotonic));
+
+    // flushAll writes a partial batch at once, no clock movement needed.
+    try c.put("c", "3");
+    c.drain();
+    try testing.expectEqual(@as(usize, 2), rig.sink.inner.count());
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 3), rig.sink.inner.count());
+}
+
+test "batch teardown without flush frees staged work and keeps the WAL for recovery" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(.{ .batch_size = 100, .delay = 5 * std.time.ns_per_s, .fake = true });
+        try c.put("a", "1");
+        try c.put("b", "2");
+        c.drain(); // staged
+        c.deinitNoFlush();
+    }
+    const c2 = try rig.open(.{ .batch_size = 4, .fake = true });
+    defer c2.deinit();
+    try c2.recover();
+    try testing.expectEqualStrings("1", rig.sink.inner.peek("a").?);
+    try testing.expectEqualStrings("2", rig.sink.inner.peek("b").?);
+}
+
+test "coalesce_writes: N overwrites between two flushes cost one sink write and no stale WAL records" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{ .coalesce = true });
+    defer c.deinit();
+    var vb: [8]u8 = undefined;
+    for (0..50) |i| {
+        const v = std.fmt.bufPrint(&vb, "v{d}", .{i}) catch unreachable;
+        try c.put("hot", v);
+    }
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try testing.expectEqual(@as(usize, 1), c.wal.totalCount());
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 1), rig.sink.singles.load(.monotonic));
+    try testing.expectEqualStrings("v49", rig.sink.inner.peek("hot").?);
+    try testing.expectEqual(@as(usize, 0), c.wal.totalCount());
+
+    // put then del: the put is dropped, the delete lands; del then put: the put lands.
+    try c.put("x", "1");
+    try c.del("x");
+    try c.put("y", "1");
+    try c.del("y");
+    try c.put("y", "2");
+    try c.flushAll();
+    try testing.expect(rig.sink.inner.peek("x") == null);
+    try testing.expectEqualStrings("2", rig.sink.inner.peek("y").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "coalesce_writes off (default): every write reaches the sink" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{});
+    defer c.deinit();
+    for (0..5) |_| try c.put("hot", "v");
+    try testing.expectEqual(@as(usize, 5), c.pendingCount());
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 5), rig.sink.singles.load(.monotonic));
+}
+
+test "coalesce_writes: a record already leased is never cancelled; a crash after coalescing recovers the last value" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(.{ .coalesce = true });
+        try c.put("k", "old");
+        c.drain(); // the flush for "old" is leased by a worker (or done)
+        try c.put("k", "mid");
+        try c.put("k", "new");
+        c.deinitNoFlush();
+    }
+    const c2 = try rig.open(.{ .coalesce = true });
+    defer c2.deinit();
+    try c2.recover();
+    try testing.expectEqualStrings("new", rig.sink.inner.peek("k").?);
+}
+
+test "resolvePoisonedDeletes: retry flushes the delete again and reclaims its tombstone" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(.{ .attempts = 2 });
+    defer c.deinit();
+    try c.put("k", "v");
+    try c.flushAll();
+    rig.sink.reject_del = true;
+    try c.del("k");
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 1), c.tombstones.count());
+    try testing.expect((try c.get("k")) == null); // shadowed by the tombstone
+    // Still rejected: the retry is poisoned again, the residue stays.
+    try testing.expectEqual(@as(usize, 1), try c.resolvePoisonedDeletes(.retry));
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 1), c.tombstones.count());
+    // The sink is fixed.
+    rig.sink.reject_del = false;
+    try testing.expectEqual(@as(usize, 1), try c.resolvePoisonedDeletes(.retry));
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 0), c.tombstones.count());
+    try testing.expect(rig.sink.inner.peek("k") == null);
+    try testing.expect((try c.get("k")) == null);
+    try testing.expectEqual(@as(usize, 0), try c.resolvePoisonedDeletes(.retry)); // nothing left
+}
+
+test "resolvePoisonedDeletes: discard drops the record and tombstone, the key reappears from the sink; puts and superseded deletes are left" {
+    var rig: BatchRig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.sink.reject_bad = true;
+    const c = try rig.open(.{ .attempts = 2 });
+    defer c.deinit();
+    try c.put("k", "v");
+    try c.put("j", "w");
+    try c.flushAll();
+    rig.sink.reject_del = true;
+    try c.del("k");
+    try c.del("j");
+    try c.put("bad", "x"); // a poisoned put
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 3), c.poisonedCount());
+    // `j` is written again: its tombstone is gone, its dead delete is superseded.
+    rig.sink.reject_del = false;
+    try c.put("j", "w2");
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.tombstones.count());
+    try testing.expectEqual(@as(usize, 1), try c.resolvePoisonedDeletes(.discard));
+    try testing.expectEqual(@as(usize, 2), c.poisonedCount()); // j's dead delete and the put remain
+    try testing.expectEqual(@as(usize, 0), c.tombstones.count());
+    try testing.expectEqualStrings("v", (try c.get("k")).?); // the sink still had it
+    try testing.expectEqualStrings("w2", (try c.get("j")).?);
+    try testing.expectEqual(@as(usize, 0), try c.resolvePoisonedDeletes(.discard));
 }

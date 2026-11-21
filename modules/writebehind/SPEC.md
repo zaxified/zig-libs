@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jorgebay/write-behind-cache-worker](https://github.com/jorgebay/write-behind-cache-worker) | Go | MIT | 4 | push 2025-01 | A small Go example (found by search; not read). |
 | Zig ecosystem | Zig | — | — | — | No write-behind library found (`gh search repos 'write-behind cache'`: no Zig result). |
 
-**Where we are ahead:** the only one of these with a crash-safe contract: `put` returns only after its WAL record is fsync'd and `recover()` re-applies it *(Ehcache's durability: undocumented on the page read)*; per-key flush ordering, tombstone-based read-shadowing of deletes, bounded retries with dead-lettering (`max_flush_attempts`), and a pluggable `Sink` vtable. **Where we are behind:** no batching or write delay, no coalescing of superseded writes, back-pressure only on request (`Options.max_unflushed`, default 0 = `put` never blocks and the WAL is unbounded), the write side is single-owner, one sink adapter (`kvtree`) besides the in-memory `MapSink` (→ Backlog).
+**Where we are ahead:** the only one of these with a crash-safe contract: `put` returns only after its WAL record is fsync'd and `recover()` re-applies it *(Ehcache's durability: undocumented on the page read)*; per-key flush ordering, tombstone-based read-shadowing of deletes, bounded retries with dead-lettering (`max_flush_attempts`), and a pluggable `Sink` vtable. **Where we are behind:** batching (`batch_size`, `batch_max_delay_ns`) and coalescing (`coalesce_writes`) are opt-in, back-pressure only on request (`Options.max_unflushed`, default 0 = `put` never blocks and the WAL is unbounded), the write side is single-owner, sink adapters `KvtreeSink`, `SqlSink` (over a caller's driver) and the in-memory `MapSink`.
 
 
 ## What it is
@@ -134,6 +134,28 @@ pub const Sink = struct {
     };
 };
 ```
+
+**Batch writes.** `Sink.VTable.write_batch` (optional) takes up to `Options.batch_size` operations on different
+keys (Ehcache's `batchSize`): the coordinator stages the leased records of one `drain`, submits them as one pool job
+and a batch that fails is retried record by record through `write`/`delete`, so one record the sink rejects delays
+only itself (a poisoned record still dead-letters alone). `Options.batch_max_delay_ns` (Ehcache's `maxWriteDelay`,
+checked at `drain`, capped at 30 s) lets a partial batch wait for more; `flushAll`, `sync` and back-pressure write
+it at once. Per-key flush ordering is unchanged: a key is in at most one flush, so a batch never holds two records of
+a key, and the next record of a key follows its predecessor's batch. Defaults (1, 0) keep the one-call-per-record
+behaviour.
+
+**Coalescing.** `Options.coalesce_writes` (off by default, as in Ehcache): a `put` or `del` cancels the key's
+previous newest WAL record if it is still ready (`jobqueue.cancel`; a leased, dead-lettered or already acked one is
+left), after the new record is durable. A key overwritten N times between two flushes costs one sink write and no
+stale WAL records; a crash between the two WAL steps replays both, with the same result. The per-key id of the newest
+record lives in memory and is dropped when the key is fully flushed.
+
+**`SqlSink`** (`src/sqlsink.zig`) is the DL6 adapter: a `(key, value)` table behind a caller-implemented `Executor`
+(`exec`, `query_value`, `begin`, `commit`, `rollback`), so there is no driver dependency here. Upserts use `ON
+CONFLICT ... DO UPDATE` (PostgreSQL, SQLite) or `ON DUPLICATE KEY UPDATE` (MySQL); identifiers are validated and
+quoted at `init`, keys and values are bound binary parameters; `write_batch` is one transaction (rolled back whole on
+the first failure, then the coordinator retries the records singly). **Not verified against a live database** (none
+available): the tests drive it through a recording executor over an in-memory table.
 
 A DL6 SQL sink implements `write`/`delete` against a table (upsert / delete-by-key) and, if it
 supports point reads, `read` for read-through — no coordinator change. `write`/`delete`/`read` may
@@ -259,8 +281,11 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   **poisoned** (dead-lettered) delete: it never reached the sink, so dropping its tombstone would
   let a later `get` read-through resurrect the stale value — deliberately conservative, and only
   reachable with a finite `Options.max_flush_attempts` (the default never dead-letters). For that
-  edge case, prefer periodic `flushAll` + a fresh coordinator, or a sink whose read-through returns
-  the (now absent) key.
+  edge case `resolvePoisonedDeletes(.retry)` gives each dead-lettered delete (whose key is still shadowed) a fresh
+  set of attempts, so the sink write and the tombstone's reclamation happen after an operator fixed the sink;
+  `.discard` accepts the loss (the record, its tombstone and the cached value go; the sink still holds the old value,
+  so a later `get` reads it back through the sink). Dead-lettered puts are left alone (a newer write of the key may
+  exist, which a retry would overwrite), as is a dead delete whose tombstone a later `put` already cleared.
 - **Key size** is capped at `jobqueue.max_field_len` (4096) — it is the WAL partition; value size at
   the WAL payload cap (default 1 MiB). Both surface as typed `PutError`s before any durable write.
 - Correctness of the async wake/park, the lock-free queue, and the durable log lives in
@@ -376,22 +401,13 @@ wire format of its own; WAL records, checksums and torn tails are `jobqueue`'s a
   explicit opt-in whose drops are counted and listed.
 - **No synthetic `on_evict` and no `ramcache` change for non-admitted values.** The coordinator registers such a key
   as an orphan itself (see *Non-admission safety net*).
-- **No value-coalescing or per-key version tracking for last-writer-wins.** Each `put` appends its own WAL record
-  and the WAL id order is the version order (see *Why LWW holds without value-coalescing*); coalescing superseded
-  records is a space optimization listed in the backlog.
+- **No per-key version tracking for last-writer-wins.** Each `put` appends its own WAL record and the WAL id order
+  is the version order (see *Why LWW holds without value-coalescing*); `Options.coalesce_writes` is an opt-in space
+  and sink-write optimization on top, not something correctness rests on.
 - **No distributed or cross-process operation, no multi-key sink transactions** (see *Threat model*).
 
 ## Backlog / deferred
-
-- **DL6 SQL sink adapter** (the primary reason the `Sink` vtable exists).
-- **Coalescing superseded WAL records for a hot key** (bounded WAL growth under repeated overwrites); correctness
-  already holds without it, this is a space optimization. Survey priority raised: with back-pressure now present,
-  coalescing is the gap a user of Ehcache write-behind hits first.
-- **A compaction pass for the tombstone behind a poisoned delete.** The tombstone is retained forever by design
-  (see *Threat model*), reachable only with a finite `max_flush_attempts`; there is no compaction pass for that
-  residue, only the `flushAll`-and-restart workaround.
-- **Batched sink writes with a maximum delay** (`Sink.writeBatch`): Ehcache's headline write-behind option, and what
-  makes a SQL sink affordable (one transaction per batch instead of per key). Effort: medium; fits CONVENTIONS §2.
+- none.
 
 ## Anchoring
 

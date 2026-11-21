@@ -79,9 +79,16 @@ try c.flushAll(); // block until the cache is clean (graceful barrier); alias: s
                   // error.FlushIncomplete after Options.flush_timeout_ns (default 120 s)
 ```
 
-- `Sink` is a small vtable (`write` / `delete` / optional `read`); implement it
-  to target any durable store. `KvtreeSink` (durable) and `MapSink` (in-memory)
-  are provided. A SQL sink (DL6) slots in without touching this module.
+- `Sink` is a small vtable (`write` / `delete` / optional `read` / optional
+  `write_batch`); implement it to target any durable store. `KvtreeSink`
+  (durable), `MapSink` (in-memory) and `SqlSink` (a `(key, value)` table behind
+  your driver's `SqlExecutor`: PostgreSQL / SQLite / MySQL upserts, one
+  transaction per batch) are provided.
+- `Options.batch_size` / `batch_max_delay_ns` write up to N keys per sink call
+  (a failed batch is retried record by record); `Options.coalesce_writes` drops
+  the superseded records of a key that was overwritten before its flush;
+  `resolvePoisonedDeletes(.retry | .discard)` clears the tombstones of deletes
+  the WAL gave up on (finite `max_flush_attempts` only).
 - **A sink that rejects writes costs liveness, not data.** Failed sink writes go
   back to the WAL and are retried indefinitely (each key after
   `Options.retry_backoff_ns`), so `flushAll` against a permanently-failing sink
