@@ -443,8 +443,17 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 - **PKI:** no trust store, no chain building, no CRL/OCSP, no `ApplicationUri`-vs-SAN matching — see the threat model;
   the accept/reject verdict is the caller's `CertificatePolicy`. A library that invented a trust list would be wrong
   everywhere.
-- **Filters:** no deadband or event filters on monitored items (`BadMonitoredItemFilterUnsupported`), and therefore no
-  events, no `EventNotificationList` production, no alarms & conditions (Backlog).
+- **Filters:** a `DataChangeFilter` is applied (see below); an event filter (or any other filter type) on a monitored item is
+  `BadMonitoredItemFilterUnsupported`, and therefore no events, no `EventNotificationList` production, no alarms & conditions (Backlog).
+- **DataChangeFilter** (OPC 10000-4 §7.22.2, `server.zig`). `ItemToMonitor` with a `DataChangeFilter` (ExtensionObject id 724: Trigger,
+  DeadbandType, DeadbandValue; applied on create and on `ModifyMonitoredItems`, which replaces the old filter). Trigger `Status` reports only a
+  status change, `StatusValue` (the default without a filter) a status or value change, `StatusValueTimestamp` also a change of the source
+  timestamp. An **absolute** deadband applies to a numeric Value (Byte..Double scalars and arrays of them): a change is reported when it is
+  *more* than the deadband away from the **last reported** value (a NaN difference counts; any element of an array; a length change),
+  the first value is always reported. Refusals per item: a deadband on a non-numeric Value or another attribute `BadFilterNotAllowed`, a
+  negative or non-finite deadband or an unknown DeadbandType `BadDeadbandFilterInvalid`, an unknown Trigger or a body that is not 16 octets
+  `BadMonitoredItemFilterInvalid`, a **percent** deadband `BadMonitoredItemFilterUnsupported` (it needs the node's EURange property, which
+  the store does not model). open62541 and node-opcua offer the same trigger/absolute/percent set.
 - **Node management:** no AddNodes/AddReferences/DeleteNodes/DeleteReferences (`BadServiceUnsupported`) — the address
   space is built by the host program, not over the wire (Backlog).
 - **Other service sets:** no Query, no HistoryRead/HistoryUpdate (Backlog), no RegisterNodes/UnregisterNodes, no
@@ -474,6 +483,6 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 
 - **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
 - **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`** (survey): `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
-- **Monitored-item filters (deadband) and events/alarms & conditions** (survey): nearly every open62541/node-opcua user subscribes with a deadband; events are the next request; medium (deadband) to large (A&C), fits §2.
+- **Events and alarms & conditions** (survey): the `EventFilter` on monitored items, `EventNotificationList`, the event type model and conditions (OPC 10000-9); large, fits §2. Also the percent deadband, which needs the EURange property of the node (small once the store models it).
 - **HistoryRead** (survey): needed for historian access; medium, fits §2 (the store is caller-supplied).
 - **Full standard NodeSet + node management + PubSub (Part 14)** (survey): large, fits §2 for NodeSet (generated data); PubSub is a project of its own.

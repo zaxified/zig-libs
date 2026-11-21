@@ -475,6 +475,117 @@ const ContinuationPoint = struct {
     }
 };
 
+/// `DataChangeFilter.Trigger`: Status = only a status change is reported,
+/// StatusValue (the default without a filter) = status or value, StatusValueTimestamp
+/// = also a change of the source timestamp.
+pub const DataChangeTrigger = enum(u32) { status = 0, status_value = 1, status_value_timestamp = 2 };
+
+/// A parsed DataChangeFilter, or the Bad status the monitored item is refused with.
+const FilterParse = union(enum) { ok: struct { trigger: DataChangeTrigger, deadband: ?f64 }, bad: encoding.StatusCode };
+
+fn scalarF64(sc: encoding.VariantScalar) ?f64 {
+    return switch (sc) {
+        inline .sbyte, .byte, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float, .double => |x| switch (@typeInfo(@TypeOf(x))) {
+            .int => @floatFromInt(x),
+            else => @floatCast(x),
+        },
+        else => null,
+    };
+}
+
+fn isNumericVariant(v: encoding.Variant) bool {
+    return switch (v) {
+        .empty => false,
+        .scalar => |sc| scalarF64(sc) != null,
+        .array => |a| switch (a.items) {
+            .sbyte, .byte, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float, .double => true,
+            else => false,
+        },
+    };
+}
+
+/// Whether `new` differs from `last` by more than the absolute `deadband`
+/// (§7.22.2: strictly more; a NaN or infinite difference counts). Null when the
+/// two are not comparable numeric values of the same shape — the caller then
+/// falls back to plain equality.
+fn deadbandExceeded(last: encoding.Variant, new: encoding.Variant, deadband: f64) ?bool {
+    if (std.meta.activeTag(last) != std.meta.activeTag(new)) return null;
+    switch (new) {
+        .empty => return null,
+        .scalar => |ns| {
+            const a = scalarF64(last.scalar) orelse return null;
+            const b = scalarF64(ns) orelse return null;
+            if (std.meta.activeTag(last.scalar) != std.meta.activeTag(ns)) return null;
+            return !(@abs(b - a) <= deadband);
+        },
+        .array => |na| {
+            const la = last.array;
+            if (std.meta.activeTag(la.items) != std.meta.activeTag(na.items)) return null;
+            switch (na.items) {
+                inline .sbyte, .byte, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float, .double => |maybe, tag| {
+                    const Slice = @typeInfo(@TypeOf(maybe)).optional.child;
+                    const ys: Slice = maybe orelse &.{};
+                    const xs = @field(la.items, @tagName(tag)) orelse &.{};
+                    if (xs.len != ys.len) return true;
+                    for (xs, ys) |x, y| {
+                        const a = scalarF64(@unionInit(encoding.VariantScalar, @tagName(tag), x)).?;
+                        const b = scalarF64(@unionInit(encoding.VariantScalar, @tagName(tag), y)).?;
+                        if (!(@abs(b - a) <= deadband)) return true;
+                    }
+                    return false;
+                },
+                else => return null,
+            }
+        },
+    }
+}
+
+/// Whether the new sample is a change for `item` (§5.12.1.4 and the item's DataChangeFilter).
+fn itemChanged(item: *const MonitoredItem, last: encoding.DataValue, dv: encoding.DataValue) bool {
+    if ((last.status orelse 0) != (dv.status orelse 0)) return true;
+    if (item.trigger == .status) return false;
+    var changed = nodestore.dataValueChanged(last, dv);
+    if (item.deadband) |db| {
+        if (last.value != null and dv.value != null) {
+            if (deadbandExceeded(last.value.?, dv.value.?, db)) |d| changed = d;
+        }
+    }
+    if (!changed and item.trigger == .status_value_timestamp) {
+        changed = !std.meta.eql(last.source_timestamp, dv.source_timestamp);
+    }
+    return changed;
+}
+
+/// Parses the filter of a monitored item. `no_body` or empty: the default
+/// (StatusValue, no deadband). Anything that is not a DataChangeFilter (an
+/// EventFilter, an AggregateFilter) is unsupported. Percent deadbands need the
+/// node's EURange, which the store does not model: unsupported too.
+fn parseDataChangeFilter(f: encoding.ExtensionObject, attribute_id: u32, current: encoding.DataValue) FilterParse {
+    if (f.encoding == .no_body or f.body.len == 0) return .{ .ok = .{ .trigger = .status_value, .deadband = null } };
+    if (!services.nodeIdEql(f.type_id, services.type_id.data_change_filter) or f.encoding != .byte_string) {
+        return .{ .bad = status.bad_monitored_item_filter_unsupported };
+    }
+    if (f.body.len != 16) return .{ .bad = status.bad_monitored_item_filter_invalid };
+    const trigger_raw = std.mem.readInt(u32, f.body[0..4], .little);
+    const db_type = std.mem.readInt(u32, f.body[4..8], .little);
+    const db_value: f64 = @bitCast(std.mem.readInt(u64, f.body[8..16], .little));
+    if (trigger_raw > 2) return .{ .bad = status.bad_monitored_item_filter_invalid };
+    const trigger: DataChangeTrigger = @fromBackingInt(@intCast(trigger_raw));
+    switch (db_type) {
+        0 => return .{ .ok = .{ .trigger = trigger, .deadband = null } },
+        1 => {
+            if (!std.math.isFinite(db_value) or db_value < 0) return .{ .bad = status.bad_deadband_filter_invalid };
+            // §7.22.2: a deadband applies to numeric Values only.
+            const numeric = attribute_id == services.attribute_id.value and
+                if (current.value) |v| isNumericVariant(v) else false;
+            if (!numeric) return .{ .bad = status.bad_filter_not_allowed };
+            return .{ .ok = .{ .trigger = trigger, .deadband = db_value } };
+        },
+        2 => return .{ .bad = status.bad_monitored_item_filter_unsupported },
+        else => return .{ .bad = status.bad_deadband_filter_invalid },
+    }
+}
+
 pub const MonitoredItem = struct {
     id: u32,
     client_handle: u32,
@@ -490,6 +601,10 @@ pub const MonitoredItem = struct {
     /// selected part of an array/string Value is sampled, compared and
     /// reported. Null: the whole value.
     range: ?numeric_range.Range = null,
+    /// DataChangeFilter (OPC 10000-4 §7.22.2): what counts as a change, and the
+    /// absolute deadband of a numeric value (null: none).
+    trigger: DataChangeTrigger = .status_value,
+    deadband: ?f64 = null,
     /// The last sampled value — the data-change comparison baseline. Owned.
     last_value: ?encoding.DataValue = null,
     /// Values sampled since the last publish, oldest first. Owned.
@@ -3030,13 +3145,16 @@ pub const Connection = struct {
                 return result;
             };
         }
-        // Only the "no filter" case is implemented — an event/deadband filter
-        // is rejected rather than silently ignored (which would hand the
+        // A DataChangeFilter (trigger, absolute deadband) is applied; any other
+        // filter is rejected rather than silently ignored (which would hand the
         // client values it did not ask for).
-        if (spec.requested_parameters.filter.encoding != .no_body and spec.requested_parameters.filter.body.len != 0) {
-            result.status_code = status.bad_monitored_item_filter_unsupported;
-            return result;
-        }
+        const parsed = switch (parseDataChangeFilter(spec.requested_parameters.filter, target.attribute_id, probe)) {
+            .ok => |ok| ok,
+            .bad => |sc| {
+                result.status_code = sc;
+                return result;
+            },
+        };
 
         const sampling = reviseSampling(ctx.srv.config, sub, spec.requested_parameters.sampling_interval);
         const queue_size = @max(@as(u32, 1), @min(spec.requested_parameters.queue_size, 1000));
@@ -3052,6 +3170,8 @@ pub const Connection = struct {
             .timestamps_to_return = ttr,
             .next_sample_ms = ctx.now_ms + @as(i64, @intFromFloat(sampling)),
             .range = range,
+            .trigger = parsed.trigger,
+            .deadband = parsed.deadband,
         };
         errdefer item.deinit(ctx.srv.allocator);
         ctx.srv.next_monitored_item_id +%= 1;
@@ -3130,6 +3250,22 @@ pub const Connection = struct {
                 };
                 continue;
             };
+            // A new filter replaces the old one (an absent one resets to the default).
+            const probe = ctx.srv.store.readAttribute(item.node_id, item.attribute_id);
+            const parsed = switch (parseDataChangeFilter(mod.requested_parameters.filter, item.attribute_id, probe)) {
+                .ok => |ok| ok,
+                .bad => |sc| {
+                    results[i] = .{
+                        .status_code = sc,
+                        .revised_sampling_interval = item.sampling_interval_ms,
+                        .revised_queue_size = item.queue_size,
+                        .filter_result = services.no_filter,
+                    };
+                    continue;
+                },
+            };
+            item.trigger = parsed.trigger;
+            item.deadband = parsed.deadband;
             const sampling = reviseSampling(ctx.srv.config, sub, mod.requested_parameters.sampling_interval);
             item.sampling_interval_ms = sampling;
             item.queue_size = @max(@as(u32, 1), @min(mod.requested_parameters.queue_size, 1000));
@@ -3366,7 +3502,7 @@ pub const Connection = struct {
             defer scratch.deinit();
             const narrowed = if (item.range) |*r| sampleNarrowed(scratch.allocator(), raw, item.attribute_id, r) else raw;
             const dv = applyTimestamps(narrowed, item.timestamps_to_return, srv.dateTime(now_ms));
-            const changed = if (item.last_value) |last| nodestore.dataValueChanged(last, dv) else true;
+            const changed = if (item.last_value) |last| itemChanged(item, last, dv) else true;
             if (!changed) continue;
 
             // Every allocation happens before anything owned is released or
@@ -11560,4 +11696,112 @@ test "monitored item: IndexRange selects what is sampled, compared and reported 
     try rig.tick(500);
     try testing.expectEqual(@as(usize, 4), narrowed.queue.items.len);
     try testing.expectEqualSlices(i32, &[_]i32{ 21, 30 }, Probe.ints(narrowed, 3));
+}
+
+fn dcFilter(trigger: u32, db_type: u32, db: f64, body: *[16]u8) encoding.ExtensionObject {
+    std.mem.writeInt(u32, body[0..4], trigger, .little);
+    std.mem.writeInt(u32, body[4..8], db_type, .little);
+    std.mem.writeInt(u64, body[8..16], @bitCast(db), .little);
+    return .{ .type_id = services.type_id.data_change_filter, .encoding = .byte_string, .body = body };
+}
+
+test "DataChangeFilter: absolute deadband, trigger, refusals (OPC 10000-4 §7.22.2)" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const arr_id: encoding.NodeId = .{ .string = .{ .namespace = rig.answer_id.string.namespace, .id = "db.array" } };
+    var arr0 = [_]f64{ 1.0, 2.0, 3.0 };
+    try rig.store.addVariable(.{
+        .node_id = arr_id,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = arr_id.string.namespace, .name = "db.array" },
+        .value = .{ .array = .{ .items = .{ .double = &arr0 } } },
+        .data_type = nodestore.n0(nodestore.id.double),
+        .access_level = nodestore.access_level.read_write,
+    });
+    const created = try newSub(&rig, 100, 3, 30, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const val = services.attribute_id.value;
+    var bodies: [8][16]u8 = undefined;
+    var items = [_]services.MonitoredItemCreateRequest{
+        mkItem(rig.answer_id, val, 1, .reporting, -1, 20, true), // [0] absolute 5, StatusValue
+        mkItem(arr_id, val, 2, .reporting, -1, 20, true), // [1] array, absolute 0.5
+        mkItem(rig.answer_id, val, 3, .reporting, -1, 20, true), // [2] percent: unsupported
+        mkItem(rig.answer_id, val, 4, .reporting, -1, 20, true), // [3] negative deadband
+        mkItem(rig.answer_id, services.attribute_id.browse_name, 5, .reporting, -1, 20, true), // [4] not numeric
+        mkItem(rig.answer_id, val, 6, .reporting, -1, 20, true), // [5] trigger 7
+        mkItem(rig.answer_id, val, 7, .reporting, -1, 20, true), // [6] wrong body length
+        mkItem(rig.answer_id, val, 8, .reporting, -1, 20, true), // [7] Status trigger
+    };
+    items[0].requested_parameters.filter = dcFilter(1, 1, 5.0, &bodies[0]);
+    items[1].requested_parameters.filter = dcFilter(1, 1, 0.5, &bodies[1]);
+    items[2].requested_parameters.filter = dcFilter(1, 2, 10.0, &bodies[2]);
+    items[3].requested_parameters.filter = dcFilter(1, 1, -1.0, &bodies[3]);
+    items[4].requested_parameters.filter = dcFilter(1, 1, 1.0, &bodies[4]);
+    items[5].requested_parameters.filter = dcFilter(7, 0, 0, &bodies[5]);
+    items[6].requested_parameters.filter = .{ .type_id = services.type_id.data_change_filter, .encoding = .byte_string, .body = "short" };
+    items[7].requested_parameters.filter = dcFilter(0, 0, 0, &bodies[7]);
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .neither, &items);
+    defer services.freeCreateMonitoredItemsResponse(gpa, r);
+    const res = r.results.?;
+    try testing.expectEqual(status.good, res[0].status_code);
+    try testing.expectEqual(status.good, res[1].status_code);
+    try testing.expectEqual(status.bad_monitored_item_filter_unsupported, res[2].status_code);
+    try testing.expectEqual(status.bad_deadband_filter_invalid, res[3].status_code);
+    try testing.expectEqual(status.bad_filter_not_allowed, res[4].status_code);
+    try testing.expectEqual(status.bad_monitored_item_filter_invalid, res[5].status_code);
+    try testing.expectEqual(status.bad_monitored_item_filter_invalid, res[6].status_code);
+    try testing.expectEqual(status.good, res[7].status_code);
+    const sub = mutSub(&rig, 0);
+    try testing.expectEqual(@as(usize, 3), sub.monitored_items.items.len);
+    const scalar = &sub.monitored_items.items[0];
+    const array = &sub.monitored_items.items[1];
+    const status_only = &sub.monitored_items.items[2];
+    try testing.expectEqual(@as(?f64, 5.0), scalar.deadband);
+    try testing.expectEqual(DataChangeTrigger.status, status_only.trigger);
+
+    // The initial value is always reported; then only moves beyond the deadband
+    // against the LAST REPORTED value (42): 44 and 47 (diff 5, not more) are not,
+    // 48 is, and the next comparison is against 48.
+    try expectQueue(scalar, &.{42});
+    try writeAnswerValue(&rig, 44);
+    try rig.tick(100);
+    try writeAnswerValue(&rig, 47);
+    try rig.tick(200);
+    try expectQueue(scalar, &.{42});
+    try writeAnswerValue(&rig, 48);
+    try rig.tick(300);
+    try expectQueue(scalar, &.{ 42, 48 });
+    try writeAnswerValue(&rig, 43);
+    try rig.tick(400);
+    try expectQueue(scalar, &.{ 42, 48 }); // |43 - 48| = 5
+    try writeAnswerValue(&rig, 42);
+    try rig.tick(500);
+    try expectQueue(scalar, &.{ 42, 48, 42 }); // 6 away from 48
+    // The Status trigger reports no value change at all.
+    try expectQueue(status_only, &.{42});
+
+    // An array moves when any element does, or its length changes.
+    try testing.expectEqual(@as(usize, 1), array.queue.items.len);
+    var arr1 = [_]f64{ 1.2, 2.0, 3.0 };
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .double = &arr1 } } }, null);
+    try rig.tick(600);
+    try testing.expectEqual(@as(usize, 1), array.queue.items.len); // 0.2 <= 0.5
+    var arr2 = [_]f64{ 1.2, 2.0, 3.6 };
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .double = &arr2 } } }, null);
+    try rig.tick(700);
+    try testing.expectEqual(@as(usize, 2), array.queue.items.len); // 3.6 vs the reported 3.0
+    var arr3 = [_]f64{ 1.2, 2.0 };
+    _ = try rig.store.setValue(arr_id, .{ .array = .{ .items = .{ .double = &arr3 } } }, null);
+    try rig.tick(800);
+    try testing.expectEqual(@as(usize, 3), array.queue.items.len);
+
+    // deadbandExceeded: mismatched shapes are not comparable; NaN counts as a change.
+    try testing.expect(deadbandExceeded(.{ .scalar = .{ .int32 = 1 } }, .{ .scalar = .{ .double = 1 } }, 1) == null);
+    try testing.expect(deadbandExceeded(.{ .scalar = .{ .string = "a" } }, .{ .scalar = .{ .string = "b" } }, 1) == null);
+    try testing.expectEqual(@as(?bool, true), deadbandExceeded(.{ .scalar = .{ .double = 1 } }, .{ .scalar = .{ .double = std.math.nan(f64) } }, 1));
+    try testing.expectEqual(@as(?bool, false), deadbandExceeded(.{ .scalar = .{ .uint64 = 10 } }, .{ .scalar = .{ .uint64 = 15 } }, 5));
+    try testing.expectEqual(@as(?bool, true), deadbandExceeded(.{ .scalar = .{ .uint64 = 10 } }, .{ .scalar = .{ .uint64 = 16 } }, 5));
 }

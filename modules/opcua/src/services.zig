@@ -156,6 +156,8 @@ pub const type_id = struct {
     /// NotificationData`, never as a top-level MSG body, but belong in this
     /// well-known-ids table alongside the others.
     pub const data_change_notification = n0(811);
+    /// `DataChangeFilter_Encoding_DefaultBinary` (OPC 10000-4 §7.22.2).
+    pub const data_change_filter = n0(724);
     pub const status_change_notification = n0(820);
     pub const event_notification_list = n0(916);
     pub const publish_request = n0(826);
@@ -228,7 +230,10 @@ pub const status = struct {
     pub const bad_not_implemented: encoding.StatusCode = 0x8040_0000;
     pub const bad_monitoring_mode_invalid: encoding.StatusCode = 0x8041_0000;
     pub const bad_monitored_item_id_invalid: encoding.StatusCode = 0x8042_0000;
+    pub const bad_monitored_item_filter_invalid: encoding.StatusCode = 0x8043_0000;
     pub const bad_monitored_item_filter_unsupported: encoding.StatusCode = 0x8044_0000;
+    pub const bad_filter_not_allowed: encoding.StatusCode = 0x8045_0000;
+    pub const bad_deadband_filter_invalid: encoding.StatusCode = 0x808E_0000;
     pub const bad_continuation_point_invalid: encoding.StatusCode = 0x804A_0000;
     pub const bad_no_continuation_points: encoding.StatusCode = 0x804B_0000;
     pub const bad_reference_type_id_invalid: encoding.StatusCode = 0x804C_0000;
