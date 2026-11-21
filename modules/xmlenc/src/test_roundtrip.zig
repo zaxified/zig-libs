@@ -2093,3 +2093,133 @@ test "encryptData: fresh key and IV per call; a wrong KEK and a flipped cipherte
     try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(alloc, doc.root, &kp.secret_key, .{ .kek = &wrong }));
     try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .aes_kw = "short" }, random, .{}));
 }
+
+// ── ECDH-ES (XML Encryption 1.1 §5.6.4) ─────────────────────────────────────────────────────────────────────────
+
+fn ecKeyPair(comptime curve: xmlenc.EcCurve, fill: u8) !struct { sk: xmlenc.EcPrivateKey, pk: xmlenc.EcPublicKey } {
+    const jwe = @import("jwe");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(fill)));
+    var pair: jwe.ecdhes.EphemeralKeyPair = undefined;
+    jwe.ecdhes.generateEphemeral(&pair, curve, .{ .fixed_for_test = prng.random() });
+    return .{ .sk = pair.private, .pk = pair.public };
+}
+
+test "ECDH-ES: encryptData round-trips through decryptData on every curve, wrap size, KDF digest and content" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x51)));
+    const random = prng.random();
+    const msg = "<a:Doc xmlns:a=\"urn:x\">ecdh round trip</a:Doc>";
+    inline for (.{ xmlenc.EcCurve.p256, xmlenc.EcCurve.p384, xmlenc.EcCurve.p521 }, 0..) |curve, ci| {
+        const kp = try ecKeyPair(curve, 0x60 + @as(u8, @intCast(ci)));
+        for ([_]u16{ 128, 192, 256 }) |wrap| {
+            for (std.enums.values(xmlenc.OaepDigest)) |digest| {
+                for ([_]xmlenc.ContentEnc{ .aes128_cbc, .aes256_gcm }) |content| {
+                    const xml_text = try xmlenc.encryptData(alloc, msg, .{ .ecdh_es = .{
+                        .recipient = kp.pk,
+                        .wrap_bits = wrap,
+                        .digest = digest,
+                        .party_u_info = "alice",
+                        .party_v_info = if (ci == 1) "" else "bob",
+                    } }, random, .{ .content = content });
+                    defer alloc.free(xml_text);
+                    var doc = try xml.parse(alloc, xml_text, .{});
+                    defer doc.deinit();
+                    const plain = try xmlenc.decryptData(alloc, doc.root, &(try makeKey()).secret_key, .{ .ec_private_key = &kp.sk });
+                    defer alloc.free(plain);
+                    try std.testing.expectEqualStrings(msg, plain);
+                }
+            }
+        }
+    }
+}
+
+test "ECDH-ES: the writer's document names the method, the KDF parameters and the ephemeral key" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x52)));
+    const kp = try ecKeyPair(.p256, 0x70);
+    const xml_text = try xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .wrap_bits = 128, .party_u_info = "AB", .recipient_key_name = "rcpt-1" } }, prng.random(), .{});
+    defer alloc.free(xml_text);
+    const must = [_][]const u8{
+        "Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"",
+        "Algorithm=\"http://www.w3.org/2009/xmlenc11#ECDH-ES\"",
+        "Algorithm=\"http://www.w3.org/2009/xmlenc11#ConcatKDF\"",
+        "PartyUInfo=\"004142\"",
+        "PartyVInfo=\"00\"",
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+        "<dsig11:NamedCurve URI=\"urn:oid:1.2.840.10045.3.1.7\"/>",
+        "<xenc:RecipientKeyInfo><ds:KeyName>rcpt-1</ds:KeyName></xenc:RecipientKeyInfo>",
+    };
+    for (must) |m| try std.testing.expect(std.mem.indexOf(u8, xml_text, m) != null);
+    // AlgorithmID defaults to the kw-aes128 URI in hex, behind the padding-bits octet.
+    var id_hex: [2 * 100]u8 = undefined;
+    const want_id = try std.fmt.bufPrint(&id_hex, "AlgorithmID=\"00{x}\"", .{"http://www.w3.org/2001/04/xmlenc#kw-aes128"});
+    try std.testing.expect(std.mem.indexOf(u8, xml_text, want_id) != null);
+    // A fresh ephemeral key per message.
+    const again = try xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .wrap_bits = 128, .party_u_info = "AB" } }, prng.random(), .{});
+    defer alloc.free(again);
+    try std.testing.expect(!std.mem.eql(u8, xml_text, again));
+}
+
+test "ECDH-ES: wrong recipient key, other curve, no key, off-curve originator point and bad parameters fail closed" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x53)));
+    const random = prng.random();
+    const rsa_sk = (try makeKey()).secret_key;
+    const kp = try ecKeyPair(.p256, 0x71);
+    const other = try ecKeyPair(.p256, 0x72);
+    const p384 = try ecKeyPair(.p384, 0x73);
+    const xml_text = try xmlenc.encryptData(alloc, "secret", .{ .ecdh_es = .{ .recipient = kp.pk } }, random, .{});
+    defer alloc.free(xml_text);
+    var doc = try xml.parse(alloc, xml_text, .{});
+    defer doc.deinit();
+
+    const plain = try xmlenc.decryptData(alloc, doc.root, &rsa_sk, .{ .ec_private_key = &kp.sk });
+    alloc.free(plain);
+    try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(alloc, doc.root, &rsa_sk, .{ .ec_private_key = &other.sk }));
+    try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(alloc, doc.root, &rsa_sk, .{ .ec_private_key = &p384.sk }));
+    try std.testing.expectError(error.KekNotProvided, xmlenc.decryptData(alloc, doc.root, &rsa_sk, .{}));
+    // A symmetric KEK does not stand in for the agreement.
+    const kek: [32]u8 = @splat(1);
+    try std.testing.expectError(error.KekNotProvided, xmlenc.decryptData(alloc, doc.root, &rsa_sk, .{ .kek = &kek }));
+
+    // Edits of the document: each must be refused with the matching error.
+    const Edit = struct { from: []const u8, to: []const u8, err: anyerror };
+    const edits = [_]Edit{
+        .{ .from = "xmlenc11#ECDH-ES", .to = "xmlenc11#ECDH-XX", .err = error.UnsupportedAlgorithm },
+        .{ .from = "xmlenc11#ConcatKDF", .to = "xmlenc11#PBKDF2", .err = error.UnsupportedAlgorithm },
+        .{ .from = "urn:oid:1.2.840.10045.3.1.7", .to = "urn:oid:1.3.132.0.10", .err = error.UnsupportedAlgorithm },
+        .{ .from = "xmlenc#sha256\"/></xenc11:ConcatKDFParams>", .to = "xmlenc#ripemd160\"/></xenc11:ConcatKDFParams>", .err = error.UnsupportedAlgorithm },
+        .{ .from = "PartyUInfo=\"00\"", .to = "PartyUInfo=\"0300\"", .err = error.UnsupportedAlgorithm }, // padding bits: not whole octets
+        .{ .from = "PartyUInfo=\"00\"", .to = "PartyUInfo=\"0\"", .err = error.MalformedStructure },
+        .{ .from = "PartyUInfo=\"00\"", .to = "PartyUInfo=\"zz\"", .err = error.MalformedStructure },
+    };
+    for (edits) |e| {
+        const at = std.mem.indexOf(u8, xml_text, e.from) orelse return error.EditNotFound;
+        const edited = try std.mem.concat(alloc, u8, &.{ xml_text[0..at], e.to, xml_text[at + e.from.len ..] });
+        defer alloc.free(edited);
+        var d2 = try xml.parse(alloc, edited, .{});
+        defer d2.deinit();
+        try std.testing.expectError(@as(anyerror, e.err), @as(anyerror!void, if (xmlenc.decryptData(alloc, d2.root, &rsa_sk, .{ .ec_private_key = &kp.sk })) |p| alloc.free(p) else |err| err));
+    }
+
+    // An originator point that is not on the curve: the last byte of the point flipped.
+    const key_at = std.mem.indexOf(u8, xml_text, "<dsig11:PublicKey>").? + "<dsig11:PublicKey>".len;
+    const end = std.mem.indexOfPos(u8, xml_text, key_at, "</dsig11:PublicKey>").?;
+    var point: [65]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&point, xml_text[key_at..end]);
+    point[64] ^= 1;
+    var point_b64: [std.base64.standard.Encoder.calcSize(65)]u8 = undefined;
+    const bad_point = std.base64.standard.Encoder.encode(&point_b64, &point);
+    const bad_doc = try std.mem.concat(alloc, u8, &.{ xml_text[0..key_at], bad_point, xml_text[end..] });
+    defer alloc.free(bad_doc);
+    var d3 = try xml.parse(alloc, bad_doc, .{});
+    defer d3.deinit();
+    try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(alloc, d3.root, &rsa_sk, .{ .ec_private_key = &kp.sk }));
+
+    // Writer-side refusals: an empty OtherInfo (xmlsec1 refuses it), an unknown wrap size, X25519.
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .algorithm_id = "" } }, random, .{}));
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .wrap_bits = 100 } }, random, .{}));
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .recipient_key_name = "a<b" } }, random, .{}));
+    const x = xmlenc.EcPublicKey{ .x25519 = @splat(9) };
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = x } }, random, .{}));
+}

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-11-17 (181/208, 27 eq) · src 61a8b906746a83ac
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 3 / cbc 14 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 3 / cbc 14 / rsa15 3 / kw 4 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
 
 **Performance:** not measured
 
@@ -39,11 +39,11 @@ RSA-OAEP with decoupled digest/MGF1 (incl. the SHA-256 + MGF1-SHA-1 shape real I
 off by default, AES-KW, AES-128/256 CBC and GCM; generic error collapse plus a decoy CEK against unwrap-side timing
 (measured, see *Constant-time posture*); ciphertext cap; CipherReference refused before any crypto. **Where we are
 behind:** no
-3DES, no ECDH-ES key agreement (see *What is deliberately not done* and *Backlog / deferred*).
+3DES, no ECDH-ES over X25519 (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## Scope
 
-Decryption is the purpose: we are the receiving party with the private key. `encryptData(alloc, plaintext, EncryptKey, random, EncryptOptions)` is the writer for an IdP or a test peer: a fresh random content key (the caller's CSPRNG), delivered by RSA-OAEP (`digest` / `mgf` among SHA-1/256/384/512; SHA-1/SHA-1 is written as `rsa-oaep-mgf1p`) or RFC 3394 key wrap under a caller KEK (`kw-aes128/192/256`), content AES-128/192/256-GCM (12-byte random IV) or -CBC (16-byte random IV, XML-Enc padding), output `<xenc:EncryptedData>` text with the `ds:KeyInfo/xenc:EncryptedKey` structure `decryptData` reads. The writer is checked by round trip through `decryptData` (all content x delivery combinations); no foreign decryptor has read its output yet.
+Decryption is the purpose: we are the receiving party with the private key. `encryptData(alloc, plaintext, EncryptKey, random, EncryptOptions)` is the writer for an IdP or a test peer: a fresh random content key (the caller's CSPRNG), delivered by RSA-OAEP (`digest` / `mgf` among SHA-1/256/384/512; SHA-1/SHA-1 is written as `rsa-oaep-mgf1p`) or RFC 3394 key wrap under a caller KEK (`kw-aes128/192/256`), content AES-128/192/256-GCM (12-byte random IV) or -CBC (16-byte random IV, XML-Enc padding), output `<xenc:EncryptedData>` text with the `ds:KeyInfo/xenc:EncryptedKey` structure `decryptData` reads. `EncryptKey.ecdh_es` is the XML Encryption 1.1 §5.6.4 key agreement: a fresh ephemeral key on the recipient's NIST curve (`jwe.ecdhes`), ConcatKDF (§5.4.1, SHA-1/256/384/512) into a `kw-aes128/192/256` key-encryption key, the ephemeral public key as `dsig11:ECKeyValue` in `OriginatorKeyInfo`; `decryptData` takes the recipient's `Options.ec_private_key`. AlgorithmID defaults to the key-wrap URI (SP 800-56A: the algorithm the derived key is for; the spec leaves it open, xmlsec1 reads whatever the document says but refuses an empty OtherInfo). The writer is checked by round trip through `decryptData` (all content x delivery combinations) and by xmlsec1 (`tools/interop.zig`, *Verification*).
 
 Everything else a decryptor could be asked to dereference or trust is refused; the list and the reasons are in
 *What is deliberately not done*. The caller supplies the key (`sk` / `Options.kek`).
@@ -237,9 +237,22 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
   - A tampered copy (one base64 char flipped in the content `CipherValue`) that `xmlsec1 --decrypt` itself refuses is
     refused here too (`error.DecryptionError`).
 
-  `xmlsec1 --decrypt` independently confirmed all three outcomes on these exact bytes before they were pasted in. The
-  reverse direction ("xmlsec1 decrypts what we produce") does not apply: this module is decrypt-only by design and has no
-  encrypt API to hand xmlsec1 anything.
+  `xmlsec1 --decrypt` independently confirmed all three outcomes on these exact bytes before they were pasted in.
+- **Foreign decryptor of `encryptData`** (`tools/interop.zig`, `zig build interop-xmlenc`; needs `xmlsec1` >= 1.3 with the
+  OpenSSL backend and `openssl`): 84 documents (RSA-OAEP SHA-1/SHA-256/SHA-384+MGF1-SHA-1/SHA-512 and `kw-aes128/192/256`
+  x the six content algorithms x `#Element` / `#Content`) and 144 ECDH-ES documents (P-256, P-384, P-521 x ConcatKDF
+  SHA-1/256/384/512 x four shapes of PartyUInfo / PartyVInfo x `kw-aes128/192/256`) decrypt under `xmlsec1 --decrypt` to the
+  exact plaintext (xmlsec1 1.3.9). xmlsec1 finds the key by name only (`--lax-key-search` for the RSA / KEK documents,
+  whose EncryptedKey carries no KeyName; for ECDH-ES the recipient's private key and the originator's public key, by name)
+  and neither writes nor reads a `dsig11:ECKeyValue`, so the program swaps the originator key for a name and gives xmlsec1
+  the ephemeral public key as PEM.
+- **ECDH-ES, the other direction** (`src/ecdh_fixtures.zig`, made by `tools/gen_ecdh_fixtures.py`): three documents written
+  by xmlsec1 (P-256 / SHA-256 / kw-aes128 / aes128-cbc, P-384 / SHA-512 / kw-aes192 / aes192-gcm with an empty PartyUInfo,
+  P-521 / SHA-256 / kw-aes256 / aes256-gcm with an empty PartyVInfo), the originator's `ECKeyValue` spliced in, decrypt
+  to the plaintext xmlsec1 itself recovers; a flipped recipient scalar is refused. These pin the ConcatKDF layout: the
+  key is `H(counter || Z || AlgorithmID || PartyUInfo || PartyVInfo || SuppPubInfo || SuppPrivInfo)` over the unpadded
+  values (§5.4.1), `Z` the x coordinate of the shared point at field width, nothing else in OtherInfo (no key length).
+  `concatKdf` is also checked against an independent construction (Python `hashlib`) for SHA-1 (two blocks), SHA-256 and SHA-512.
 - **Teeth (with positive controls):** GCM tag tamper → `DecryptionError`; CBC corrupted block → `DecryptionError`; unknown
   content/key algorithm → `UnsupportedAlgorithm`; `rsa-1_5` without opt-in → `WeakRsa15NotAllowed`; wrong private key →
   `DecryptionError`; CipherReference → `CipherReferenceUnsupported`; non-base64 CipherValue → `MalformedStructure`;
@@ -270,12 +283,14 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 - **3DES (`tripledes-cbc`)** — decision (user, 2026-09-30): a 64-bit block cipher (Sweet32), disallowed by NIST
   SP800-131A for encryption since 2024; a legacy IdP that still sends it is refused (`UnsupportedAlgorithm`), not
   decrypted.
+- **ECDH-ES over X25519 / X448 (`xenc11` has no URI for them), ECDH-ES with explicit curve parameters (`ECParameters`),
+  compressed points, static-static ECDH, `DH-ES` (finite-field Diffie-Hellman), ConcatKDF parameters that are not whole
+  octets (a padding count other than 0 is `UnsupportedAlgorithm`), and the `KA-Nonce` / `SuppPubInfo` semantics beyond
+  concatenating them:** the spec's required curve is P-256 (P-384 and P-521 recommended), which are done; xmlsec1 supports
+  none of the rest in a way we can check.
 
 ## Backlog / deferred
 
-- **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey:** used by newer eIDAS/SAML profiles that avoid
-  RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256 ECDH + Concat KDF; check siblings). Low to
-  medium priority; fits the module's scope.
 - **Bulk path after the move to `aesgcm`:** AES-GCM decryption runs on the `aesgcm` module (Zig 0.17 #36256); the bulk
   path was not re-measured at that move. The card says Performance is not measured, so this stays open until a bench
   exists. BOUNCED: needs a quiet host for numbers (quiet phase).

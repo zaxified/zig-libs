@@ -184,3 +184,39 @@ test "EXTERNAL anchor: tampered content ciphertext xmlsec1 refuses to decrypt is
     defer doc.deinit();
     try testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, &(try spKey()), .{}));
 }
+
+// ── ECDH-ES key agreement (XML Encryption 1.1 §5.6.4) ──────────────────────────────────────────────────────────
+
+const ecdh_fixtures = @import("ecdh_fixtures.zig");
+
+fn scalarKey(comptime curve: xmlenc.EcCurve, hex: []const u8) !xmlenc.EcPrivateKey {
+    const width = comptime curve.coordinateLen();
+    var d: [width]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&d, hex);
+    return switch (curve) {
+        .p256 => .{ .p256 = d },
+        .p384 => .{ .p384 = d },
+        .p521 => .{ .p521 = d },
+        .x25519 => unreachable,
+    };
+}
+
+test "EXTERNAL anchor: xmlsec1-written ECDH-ES documents (P-256 / P-384 / P-521, ConcatKDF SHA-256 / SHA-512, kw-aes128/192/256) decrypt" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(usize, 3), ecdh_fixtures.fixtures.len);
+    inline for (ecdh_fixtures.fixtures, .{ xmlenc.EcCurve.p256, xmlenc.EcCurve.p384, xmlenc.EcCurve.p521 }) |f, curve| {
+        const sk = try scalarKey(curve, f.scalar_hex);
+        var doc = try xml.parse(a, f.xml, .{});
+        defer doc.deinit();
+        const plain = try xmlenc.decryptData(a, doc.root, &(try spKey()), .{ .ec_private_key = &sk });
+        defer a.free(plain);
+        try testing.expectEqualStrings(std.mem.trimEnd(u8, f.plaintext, "\n"), std.mem.trimEnd(u8, plain, "\n"));
+
+        // The same document under another recipient key (the key of another curve, or a flipped scalar) is refused.
+        var other = sk;
+        switch (other) {
+            inline else => |*d| d[d.len - 1] ^= 1,
+        }
+        try testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, &(try spKey()), .{ .ec_private_key = &other }));
+    }
+}

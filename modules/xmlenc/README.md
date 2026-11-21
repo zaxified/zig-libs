@@ -6,7 +6,7 @@ so the SAML SP can run signature verification and XSW defense on it. eIDAS
 requires encrypted assertions; this closes the SAML cluster's last gap.
 
 Decryption is the purpose (we are the relying party with the private key); `encryptData` writes the matching
-`EncryptedData` (RSA-OAEP or AES key wrap for the content key, AES-GCM or AES-CBC content) for an IdP or a test peer.
+`EncryptedData` (RSA-OAEP, AES key wrap or ECDH-ES key agreement for the content key, AES-GCM or AES-CBC content) for an IdP or a test peer.
 `CipherReference` (external ciphertext URI), and ciphertext `Transforms` are out
 of scope and rejected. See `SPEC.md` for the full algorithm allow-list and
 security posture.
@@ -22,7 +22,9 @@ specifications. No third-party XML-Enc implementation was consulted, so no
   DigestMethod and MGF resolved INDEPENDENTLY, MGF defaulting to MGF1-SHA1
   when the element is absent whatever the digest is), and — gated behind `allow_weak_rsa15` —
   `rsa-1_5`. Optional `kw-aes128`/`kw-aes192`/`kw-aes256` symmetric key wrap (RFC 3394) when
-  a KEK is supplied.
+  a KEK is supplied, or — `xenc11:ECDH-ES` key agreement (P-256, P-384, P-521; ConcatKDF with SHA-1/256/384/512)
+  — the key-encryption key derived from the recipient's `Options.ec_private_key` and the originator's ephemeral
+  `dsig11:ECKeyValue` in the EncryptedKey's `AgreementMethod`.
 - **Content:** `aes128-cbc`, `aes192-cbc`, `aes256-cbc`, `aes128-gcm`,
   `aes192-gcm`, `aes256-gcm` (AES-192 via the `aes192`/`aesgcm` modules; std
   ships only AES-128/256). GCM and OAEP are the safe, preferred paths.

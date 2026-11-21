@@ -32,6 +32,7 @@ const WipingAllocator = @import("wipealloc").WipingAllocator; // wipes every blo
 const rsa = @import("rsa");
 const aescbc = @import("aescbc");
 const aeskw = @import("aeskw");
+const ecdhes = @import("jwe").ecdhes; // the NIST-curve ECDH primitive (P-256 / P-384 / P-521) of the XML-Enc 1.1 ECDH-ES key agreement
 
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -48,7 +49,7 @@ const Aes192Gcm = @import("aesgcm").Aes192Gcm;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "XML-Encryption (xmlenc-core-1) decryption and encryption — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify; `encryptData` writes `EncryptedData`",
+    .doc = "XML-Encryption (xmlenc-core-1) decryption and encryption — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW/ECDH-ES key delivery + AES-GCM/CBC content), decrypt-then-verify; `encryptData` writes `EncryptedData`",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -58,7 +59,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, // aes192: the AES-192 block cipher (std has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc", "jwe" }, // jwe: `jwe.ecdhes`, the P-256/P-384/P-521 ECDH of ECDH-ES key agreement; aes192: the AES-192 block cipher (std has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────
@@ -69,6 +70,8 @@ pub const xenc_ns = "http://www.w3.org/2001/04/xmlenc#";
 pub const xenc11_ns = "http://www.w3.org/2009/xmlenc11#";
 /// XML-Signature namespace (2000/09) — KeyInfo, DigestMethod.
 pub const ds_ns = "http://www.w3.org/2000/09/xmldsig#";
+/// XML-Signature 1.1 namespace (2009) — `dsig11:ECKeyValue`, the ECDH-ES originator key.
+pub const dsig11_ns = "http://www.w3.org/2009/xmldsig11#";
 /// SAML 2.0 assertion namespace (for the EncryptedAssertion wrapper).
 pub const saml_ns = "urn:oasis:names:tc:SAML:2.0:assertion";
 
@@ -90,7 +93,14 @@ const alg_kw_aes128 = xenc_ns ++ "kw-aes128";
 const alg_kw_aes192 = xenc_ns ++ "kw-aes192";
 const alg_kw_aes256 = xenc_ns ++ "kw-aes256";
 
-// Digest methods (for OAEP).
+// Key agreement (XML Encryption 1.1 §5.6.4) and its KDF (§5.4.1).
+const alg_ecdh_es = xenc11_ns ++ "ECDH-ES";
+const alg_concat_kdf = xenc11_ns ++ "ConcatKDF";
+const curve_uri_p256 = "urn:oid:1.2.840.10045.3.1.7";
+const curve_uri_p384 = "urn:oid:1.3.132.0.34";
+const curve_uri_p521 = "urn:oid:1.3.132.0.35";
+
+// Digest methods (for OAEP and ConcatKDF).
 const alg_sha1 = ds_ns ++ "sha1";
 const alg_sha256 = xenc_ns ++ "sha256";
 const alg_sha384 = "http://www.w3.org/2001/04/xmldsig-more#sha384";
@@ -119,6 +129,13 @@ pub const Options = struct {
     /// algorithm.
     kek: ?[]const u8 = null,
 
+    /// The recipient's static EC private key for an `EncryptedKey` whose KeyInfo carries an
+    /// `xenc:AgreementMethod` of `xenc11:ECDH-ES` (XML Encryption 1.1 §5.6.4): P-256, P-384 or P-521 (the
+    /// originator's key must be on the same curve). `null` makes such an EncryptedKey fail with
+    /// `error.KekNotProvided`. The derived key-encryption key is `ConcatKDF` of the shared secret (§5.4.1) and
+    /// unwraps the content key with the `kw-aes*` method named by the EncryptedKey; `kek` is not consulted then.
+    ec_private_key: ?*const EcPrivateKey = null,
+
     /// Upper bound on the decoded content ciphertext, in bytes (DoS guard on an
     /// attacker-sized CipherValue). Default 4 MiB — far above any real SAML
     /// assertion.
@@ -131,6 +148,11 @@ pub const Options = struct {
     /// the cap. 65,536 is far past any assertion (`saml` itself allows 8,192).
     max_elements: usize = 65536,
 };
+
+/// The EC key types of `jwe.ecdhes` (`EcPublicKey.fromCoordinates`, `EcPrivateKey{ .p256 = scalar }`).
+pub const EcPublicKey = ecdhes.PublicKey;
+pub const EcPrivateKey = ecdhes.PrivateKey;
+pub const EcCurve = ecdhes.Curve;
 
 pub const Error = error{
     /// Structure present but not an algorithm on the allow-list (includes
@@ -362,7 +384,36 @@ pub const EncryptKey = union(enum) {
     rsa_oaep: struct { key: rsa.PublicKey, digest: OaepDigest = .sha256, mgf: OaepDigest = .sha256 },
     /// RFC 3394 AES key wrap under a shared key-encryption key of 16, 24 or 32 bytes (`kw-aes128/192/256`).
     aes_kw: []const u8,
+    /// XML Encryption 1.1 ECDH-ES: a fresh ephemeral EC key pair on the recipient's curve, the shared secret
+    /// turned into a key-encryption key by ConcatKDF, and the content key wrapped under it with `kw-aes*`. The
+    /// EncryptedKey carries the `xenc:AgreementMethod` with the ephemeral public key (`dsig11:ECKeyValue`).
+    ecdh_es: EcdhEs,
 };
+
+/// Parameters of `EncryptKey.ecdh_es`.
+pub const EcdhEs = struct {
+    /// The recipient's static public key (P-256, P-384 or P-521; X25519 is `UnsupportedAlgorithm`).
+    recipient: EcPublicKey,
+    /// Size of the AES key wrap (and so of the derived key-encryption key), 128, 192 or 256 bits.
+    wrap_bits: u16 = 256,
+    /// ConcatKDF digest (`DigestMethod`).
+    digest: OaepDigest = .sha256,
+    /// ConcatKDF `AlgorithmID`, `PartyUInfo`, `PartyVInfo` as whole octets (the bit string is `value`,
+    /// written as hexBinary with the leading padding-octet `00`). `algorithm_id` null writes the URI of the
+    /// `kw-aes*` method (what SP 800-56A's AlgorithmID names: the algorithm the derived key is for). Each is
+    /// at most `max_kdf_param_len` octets, and the three together must not be empty (xmlsec1 refuses an empty
+    /// OtherInfo).
+    algorithm_id: ?[]const u8 = null,
+    party_u_info: []const u8 = "",
+    party_v_info: []const u8 = "",
+    /// Written as `xenc:RecipientKeyInfo/ds:KeyName`, the hint for which private key to use (the Example 42 of the
+    /// spec carries one; xmlsec1 refuses an AgreementMethod without a RecipientKeyInfo). Must not contain `<`, `>`,
+    /// `&` or `"`.
+    recipient_key_name: ?[]const u8 = null,
+};
+
+/// Longest ConcatKDF `AlgorithmID` / `PartyUInfo` / `PartyVInfo` value (octets) read or written.
+pub const max_kdf_param_len: usize = 128;
 
 pub const EncryptOptions = struct {
     content: ContentEnc = .aes256_gcm,
@@ -378,6 +429,8 @@ pub const EncryptError = error{
     /// The wrapped key did not fit (key transport failure).
     EncryptionError,
 } || std.mem.Allocator.Error;
+
+const b64_enc = std.base64.standard.Encoder;
 
 /// Encrypt `plaintext` into an `<xenc:EncryptedData>` element (returned as XML text, owned by `alloc`) whose
 /// `ds:KeyInfo/xenc:EncryptedKey` carries a fresh random content key, delivered by `key`. This is the encrypting
@@ -464,9 +517,73 @@ pub fn encryptData(
             try method_xml.appendSlice(alloc, "<xenc:EncryptionMethod Algorithm=\"" ++ uri ++ "\"/>");
             break :blk aeskw.wrap(kek, cek_s, &wrapped_buf) catch return error.EncryptionError;
         },
+        .ecdh_es => |ec| blk: {
+            const wrap_uri = switch (ec.wrap_bits) {
+                128 => alg_kw_aes128,
+                192 => alg_kw_aes192,
+                256 => alg_kw_aes256,
+                else => return error.UnsupportedAlgorithm,
+            };
+            const kek_len: usize = ec.wrap_bits / 8;
+            const algorithm_id = ec.algorithm_id orelse wrap_uri;
+            if (algorithm_id.len > max_kdf_param_len or ec.party_u_info.len > max_kdf_param_len or
+                ec.party_v_info.len > max_kdf_param_len) return error.UnsupportedAlgorithm;
+            if (algorithm_id.len + ec.party_u_info.len + ec.party_v_info.len == 0) return error.UnsupportedAlgorithm;
+            const curve = std.meta.activeTag(ec.recipient);
+            if (curve == .x25519) return error.UnsupportedAlgorithm;
+            const key_name = ec.recipient_key_name orelse "";
+            if (std.mem.findAny(u8, key_name, "<>&\"") != null) return error.UnsupportedAlgorithm;
+
+            var eph: ecdhes.EphemeralKeyPair = undefined;
+            defer eph.private.wipe();
+            ecdhes.generateEphemeral(&eph, curve, .{ .csprng = random });
+            var z_buf: [ecdhes.max_z_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, &z_buf);
+            const z = ecdhes.deriveZ(&eph.private, ec.recipient, &z_buf) catch return error.EncryptionError;
+            var info: [3 * max_kdf_param_len]u8 = undefined;
+            var info_len: usize = 0;
+            for ([_][]const u8{ algorithm_id, ec.party_u_info, ec.party_v_info }) |part| {
+                @memcpy(info[info_len..][0..part.len], part);
+                info_len += part.len;
+            }
+            var kek_buf: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &kek_buf);
+            concatKdf(ec.digest, z, info[0..info_len], kek_buf[0..kek_len]);
+
+            const coords = eph.public.coordinates();
+            var point: [1 + 2 * ecdhes.max_coordinate_len]u8 = undefined;
+            point[0] = 0x04;
+            @memcpy(point[1..][0..coords.len], coords.xSlice());
+            @memcpy(point[1 + coords.len ..][0..coords.len], coords.ySlice().?);
+            const point_len = 1 + 2 * @as(usize, coords.len);
+            var point_b64: [b64_enc.calcSize(1 + 2 * ecdhes.max_coordinate_len)]u8 = undefined;
+            const point_text = b64_enc.encode(&point_b64, point[0..point_len]);
+
+            try method_xml.print(alloc, "<xenc:EncryptionMethod Algorithm=\"{s}\"/><ds:KeyInfo><xenc:AgreementMethod Algorithm=\"" ++ alg_ecdh_es ++
+                "\"><xenc11:KeyDerivationMethod Algorithm=\"" ++ alg_concat_kdf ++ "\"><xenc11:ConcatKDFParams AlgorithmID=\"00{x}\" PartyUInfo=\"00{x}\" PartyVInfo=\"00{x}\">" ++
+                "<ds:DigestMethod Algorithm=\"{s}\"/></xenc11:ConcatKDFParams></xenc11:KeyDerivationMethod><xenc:OriginatorKeyInfo><ds:KeyValue>" ++
+                "<dsig11:ECKeyValue xmlns:dsig11=\"" ++ dsig11_ns ++ "\"><dsig11:NamedCurve URI=\"{s}\"/><dsig11:PublicKey>{s}</dsig11:PublicKey></dsig11:ECKeyValue>" ++
+                "</ds:KeyValue></xenc:OriginatorKeyInfo>", .{
+                wrap_uri,
+                algorithm_id,
+                ec.party_u_info,
+                ec.party_v_info,
+                digestUri(ec.digest),
+                switch (curve) {
+                    .p256 => curve_uri_p256,
+                    .p384 => curve_uri_p384,
+                    .p521 => curve_uri_p521,
+                    .x25519 => unreachable,
+                },
+                point_text,
+            });
+            if (key_name.len != 0) try method_xml.print(alloc, "<xenc:RecipientKeyInfo><ds:KeyName>{s}</ds:KeyName></xenc:RecipientKeyInfo>", .{key_name});
+            try method_xml.appendSlice(alloc, "</xenc:AgreementMethod></ds:KeyInfo>");
+            break :blk aeskw.wrap(kek_buf[0..kek_len], cek_s, &wrapped_buf) catch return error.EncryptionError;
+        },
     };
 
-    const b64 = std.base64.standard.Encoder;
+    const b64 = b64_enc;
     const key_b64 = try alloc.alloc(u8, b64.calcSize(wrapped.len));
     defer alloc.free(key_b64);
     _ = b64.encode(key_b64, wrapped);
@@ -506,6 +623,116 @@ fn mgfUri(h: OaepHash) []const u8 {
         .sha384 => alg_mgf1sha384,
         .sha512 => alg_mgf1sha512,
     };
+}
+
+// ── ECDH-ES key agreement (XML Encryption 1.1 §5.6.4, ConcatKDF §5.4.1) ─────
+
+/// AlgorithmID, PartyUInfo, PartyVInfo, SuppPubInfo and SuppPrivInfo, each at most `max_kdf_param_len` octets.
+const kdf_max_other_info = 5 * max_kdf_param_len;
+
+/// The `xenc:AgreementMethod` of an EncryptedKey (`ds:KeyInfo/xenc:AgreementMethod`), if it has one.
+fn agreementMethod(enc_key: *const xml.Element) ?*const xml.Element {
+    const key_info = childEl(enc_key, ds_ns, "KeyInfo") orelse return null;
+    return childEl(key_info, xenc_ns, "AgreementMethod");
+}
+
+/// ConcatKDF (NIST SP 800-56A §5.8.1, one step): the leftmost `out.len` octets of
+/// `H(counter_1 || Z || OtherInfo) || H(counter_2 || Z || OtherInfo) || ...`, the counter a 32-bit big-endian
+/// integer from 1. `OtherInfo` is the concatenation of the (unpadded) AlgorithmID, PartyUInfo, PartyVInfo,
+/// SuppPubInfo and SuppPrivInfo values, as XML Encryption 1.1 §5.4.1 spells it; the key length is `out.len`.
+fn concatKdf(digest: OaepHash, z: []const u8, other_info: []const u8, out: []u8) void {
+    switch (digest) {
+        inline else => |d| {
+            const H = oaepHashType(d);
+            var counter: u32 = 1;
+            var written: usize = 0;
+            while (written < out.len) : (counter += 1) {
+                var h = H.init(.{});
+                var c: [4]u8 = undefined;
+                std.mem.writeInt(u32, &c, counter, .big);
+                h.update(&c);
+                h.update(z);
+                h.update(other_info);
+                var block: [H.digest_length]u8 = undefined;
+                h.final(&block);
+                defer std.crypto.secureZero(u8, &block);
+                const n = @min(block.len, out.len - written);
+                @memcpy(out[written..][0..n], block[0..n]);
+                written += n;
+            }
+        },
+    }
+}
+
+/// One `ConcatKDFParams` attribute: hexBinary of `[number of padding bits][octets]` (§5.4.1). Absent or empty
+/// is the empty bit string; a padding count other than 0 (a bit string that is not whole octets) is not
+/// supported. The octets go into `out`.
+fn kdfParam(params: *const xml.Element, name: []const u8, out: *[max_kdf_param_len]u8) Error![]const u8 {
+    const text = params.attr("", name) orelse return out[0..0];
+    if (text.len == 0) return out[0..0];
+    var raw: [1 + max_kdf_param_len]u8 = undefined;
+    if (text.len % 2 != 0 or text.len / 2 > raw.len) return error.MalformedStructure;
+    const bytes = std.fmt.hexToBytes(&raw, text) catch return error.MalformedStructure;
+    if (bytes[0] != 0) return error.UnsupportedAlgorithm;
+    @memcpy(out[0 .. bytes.len - 1], bytes[1..]);
+    return out[0 .. bytes.len - 1];
+}
+
+fn digestFromUri(uri: []const u8) Error!OaepHash {
+    if (eq(uri, alg_sha1)) return .sha1;
+    if (eq(uri, alg_sha256)) return .sha256;
+    if (eq(uri, alg_sha384)) return .sha384;
+    if (eq(uri, alg_sha512)) return .sha512;
+    return error.UnsupportedAlgorithm;
+}
+
+/// Derive the key-encryption key (`kek_out.len` octets) of an ECDH-ES `agreement`: the originator's public key
+/// (`OriginatorKeyInfo/KeyValue/ECKeyValue`, a named P-256 / P-384 / P-521 curve and an uncompressed point) times
+/// the recipient's `Options.ec_private_key`, through the declared ConcatKDF. A point that is not on the curve, or
+/// is on another curve than the recipient's key, is `DecryptionError` (the originator key is attacker-chosen and
+/// this fails before any secret-dependent work).
+fn ecdhEsKek(alloc: std.mem.Allocator, agreement: *const xml.Element, options: Options, kek_out: []u8) Error!void {
+    const alg = agreement.attr("", "Algorithm") orelse return error.MalformedStructure;
+    if (!eq(alg, alg_ecdh_es)) return error.UnsupportedAlgorithm;
+    const sk = options.ec_private_key orelse return error.KekNotProvided;
+
+    const kdm = childEl(agreement, xenc11_ns, "KeyDerivationMethod") orelse return error.MalformedStructure;
+    const kdf_alg = kdm.attr("", "Algorithm") orelse return error.MalformedStructure;
+    if (!eq(kdf_alg, alg_concat_kdf)) return error.UnsupportedAlgorithm;
+    const params = childEl(kdm, xenc11_ns, "ConcatKDFParams") orelse return error.MalformedStructure;
+    const digest_method = childEl(params, ds_ns, "DigestMethod") orelse return error.MalformedStructure;
+    const digest = try digestFromUri(digest_method.attr("", "Algorithm") orelse return error.MalformedStructure);
+    var info: [kdf_max_other_info]u8 = undefined;
+    var info_len: usize = 0;
+    inline for (.{ "AlgorithmID", "PartyUInfo", "PartyVInfo", "SuppPubInfo", "SuppPrivInfo" }) |name| {
+        const v = try kdfParam(params, name, info[info_len..][0..max_kdf_param_len]);
+        info_len += v.len;
+    }
+
+    const originator = childEl(agreement, xenc_ns, "OriginatorKeyInfo") orelse return error.MalformedStructure;
+    const key_value = childEl(originator, ds_ns, "KeyValue") orelse return error.MalformedStructure;
+    const ec_value = childEl(key_value, dsig11_ns, "ECKeyValue") orelse return error.UnsupportedAlgorithm;
+    const named = childEl(ec_value, dsig11_ns, "NamedCurve") orelse return error.UnsupportedAlgorithm;
+    const uri = named.attr("", "URI") orelse return error.MalformedStructure;
+    const curve: ecdhes.Curve = if (eq(uri, curve_uri_p256))
+        .p256
+    else if (eq(uri, curve_uri_p384))
+        .p384
+    else if (eq(uri, curve_uri_p521))
+        .p521
+    else
+        return error.UnsupportedAlgorithm;
+    const point_el = childEl(ec_value, dsig11_ns, "PublicKey") orelse return error.MalformedStructure;
+    const width = curve.coordinateLen();
+    const point = try decodeBase64FromElement(alloc, point_el, 1 + 2 * ecdhes.max_coordinate_len);
+    defer alloc.free(point);
+    if (point.len != 1 + 2 * width or point[0] != 0x04) return error.MalformedStructure;
+    const peer = ecdhes.PublicKey.fromCoordinates(curve, point[1..][0..width], point[1 + width ..][0..width]) catch return error.DecryptionError;
+
+    var z_buf: [ecdhes.max_z_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &z_buf);
+    const z = ecdhes.deriveZ(sk, peer, &z_buf) catch return error.DecryptionError;
+    concatKdf(digest, z, info[0..info_len], kek_out);
 }
 
 // ── content algorithm classification ────────────────────────────────────────
@@ -610,9 +837,19 @@ fn unwrapCek(
         if (!options.allow_weak_rsa15) return error.WeakRsa15NotAllowed;
         return try rsaPkcs1v15Unwrap(sk, wrapped, out, want);
     } else if (eq(alg, alg_kw_aes128) or eq(alg, alg_kw_aes192) or eq(alg, alg_kw_aes256)) {
-        const kek = options.kek orelse return error.KekNotProvided;
         const kek_want: usize = if (eq(alg, alg_kw_aes128)) 16 else if (eq(alg, alg_kw_aes192)) 24 else 32;
-        if (kek.len != kek_want) return error.UnsupportedAlgorithm;
+        // An EncryptedKey whose KeyInfo carries an AgreementMethod gets its key-encryption key from the ECDH-ES
+        // key agreement (§5.6.4); every other kw-aes* EncryptedKey uses the caller's `Options.kek`.
+        var derived: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &derived);
+        const kek: []const u8 = if (agreementMethod(enc_key)) |agreement| blk: {
+            try ecdhEsKek(alloc, agreement, options, derived[0..kek_want]);
+            break :blk derived[0..kek_want];
+        } else blk: {
+            const k = options.kek orelse return error.KekNotProvided;
+            if (k.len != kek_want) return error.UnsupportedAlgorithm;
+            break :blk k;
+        };
         return try aesKwUnwrap(kek, wrapped, out, want);
     }
     return error.UnsupportedAlgorithm;
@@ -1946,4 +2183,20 @@ test "Z1: the plaintext of a document that fails to parse is wiped before it is 
     } else |_| {}
     try testing.expect(watch.seen > 0);
     try testing.expect(!watch.leaked);
+}
+
+test "concatKdf: SP 800-56A one-step KDF against an independent construction (hashlib over counter || Z || OtherInfo)" {
+    // Expected values computed with Python's hashlib for the same inputs: Z = 00 01 .. 1f, OtherInfo = 00 'A' 'B' 'C' 'D'.
+    var z: [32]u8 = undefined;
+    for (&z, 0..) |*b, i| b.* = @intCast(i);
+    const info = [_]u8{ 0, 'A', 'B', 'C', 'D' };
+    var out40: [40]u8 = undefined; // two SHA-1 blocks
+    concatKdf(.sha1, &z, &info, &out40);
+    try std.testing.expectEqualStrings("068f8751bf65b59d3166daf65c6d5306b9fca65df53332c0d61cf6120dd188e656bb07631e6dc67d", &std.fmt.bytesToHex(out40, .lower));
+    var out32: [32]u8 = undefined;
+    concatKdf(.sha256, &z, &info, &out32);
+    try std.testing.expectEqualStrings("f46da7a9251eea83e84ed83184fcc0076071164bfccb332fc6e5142e211d4a8f", &std.fmt.bytesToHex(out32, .lower));
+    var out24: [24]u8 = undefined; // a prefix of one SHA-512 block
+    concatKdf(.sha512, &z, &info, &out24);
+    try std.testing.expectEqualStrings("3e4b98057deee3bac78f96676e909a210e260e35407e1689", &std.fmt.bytesToHex(out24, .lower));
 }

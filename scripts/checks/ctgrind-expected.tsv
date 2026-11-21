@@ -2366,11 +2366,14 @@ mcp	ReleaseFast	control	1	>=1	f58c2a60efeb0f78	77618407a4b8daaf
 #            accept/reject branch, documented in its doc comment) + aesgcm tag verdict. It was 4:
 #            the masked extraction loop (`ctEqMaskUsize(s, sep_idx)`) was compiled to a branch on
 #            the separator position; an asm barrier (`blackBox`) fixed it, measured.
-#   kw 3     aeskw unwrapBody (integrity-check verdict) + aesgcm tag verdict, accept and reject.
-xmlenc	ReleaseFast	oaep	1	3	8b2df4f9374df64b	b6a414715b391ccc
-xmlenc	ReleaseFast	cbc	1	14	8b2df4f9374df64b	cb2ee56c03b2b7a6
-xmlenc	ReleaseFast	rsa15	1	3	8b2df4f9374df64b	fcf38565ab1ce414
-xmlenc	ReleaseFast	kw	1	3	8b2df4f9374df64b	65e898b409f3bf26
+#   kw 4     aeskw unwrapBody (integrity-check verdict) + aesgcm tag verdict, accept and reject. It was 3 until
+#            2026-11-21 (ECDH-ES arm in unwrapCek): the same two sites, but the accept and the reject run now reach
+#            them through different return addresses in main, so memcheck keeps both stacks apart (--stacks: top
+#            frames unwrapBody aeskw root.zig:203 and open aesgcm root.zig:1048, no ECDH-ES / ConcatKDF frame).
+xmlenc	ReleaseFast	oaep	1	3	d6941608df256e41	b6a414715b391ccc
+xmlenc	ReleaseFast	cbc	1	14	d6941608df256e41	cb2ee56c03b2b7a6
+xmlenc	ReleaseFast	rsa15	1	3	d6941608df256e41	fcf38565ab1ce414
+xmlenc	ReleaseFast	kw	1	4	d6941608df256e41	65e898b409f3bf26
 # saml, 2026-11-13 (sweep hB): the SP's RSA private key signing a LogoutRequest and a redirect
 # query string (`sign_with` / `buildSignedRedirectQuery`).
 #   sign 45  1 = rsa privateOpCrtPtr (the F3 fault-check verdict, rsa's own row) + 44 =
@@ -2478,8 +2481,8 @@ jwe	ReleaseFast	pbes2	1	182	bc797aec0c4d53a2	45882587fad30673	cpu=x86_64 control
 megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
 megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
 megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64
-xmlenc	ReleaseFast	cbc	1	72	8b2df4f9374df64b	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
-xmlenc	ReleaseFast	kw	1	182	8b2df4f9374df64b	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
+xmlenc	ReleaseFast	cbc	1	72	d6941608df256e41	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
+xmlenc	ReleaseFast	kw	1	182	d6941608df256e41	65e898b409f3bf26	cpu=x86_64 control=6 trap=6
 #
 # B --std X25519 identity check (curve25519.zig `ladder`, public-point outcome), plus C (std mem.eql chunk
 # branch on a public key) for wireguard and tlsclient cv/mls/ssh pem. tlsclient kex also has A2 (std

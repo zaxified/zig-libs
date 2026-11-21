@@ -308,7 +308,7 @@ pub const module_list = [_]Module{
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256", "p384", "p521", "wipealloc" }, .test_deps = &.{"testkit"} },
     .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "p256", "x509", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, .heavy = true, .test_deps = &.{"testkit"} },
+    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc", "jwe" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{ "testkit", "aes192" } }, // aes192: the AES-192 KAT/fuzz cases (the API is generic over the cipher type)
     .{ .name = "aeskw", .libs = &.{"web"}, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} }, // aes192: the 24-byte KEK arm
     .{ .name = "aes192", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
