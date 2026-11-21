@@ -60,6 +60,7 @@ const tsinfo_mod = @import("tsinfo.zig");
 const rss_mod = @import("rss.zig");
 const debug_mod = @import("debug.zig");
 const plca_mm = @import("plca_mm.zig");
+const phy_tunnel = @import("phy_tunnel.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
 /// used by `EventSocket` below.
@@ -796,6 +797,26 @@ pub const Ethtool = struct {
         const seq = cl.sock.nextSeq();
         const msg = try tsinfo_mod.buildSetTsConfig(cl.allocator(), cl.family_id, seq, target, set);
         try cl.exchangeAck(msg, seq, uapi.TSCONFIG.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_PHY_GET` for one PHY of the device (`--show-phys`). Unprivileged. The PHY is the header's
+    /// `PHY_INDEX` when the kernel needs one; with none the first answers.
+    pub fn phy(cl: *Ethtool, target: header.Target) RequestError!phy_tunnel.Phy {
+        const seq = cl.sock.nextSeq();
+        const msg = try phy_tunnel.buildPhy(cl.allocator(), cl.family_id, seq, target);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PHY.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return phy_tunnel.parsePhy(reply.attrs) catch error.MalformedReply;
+    }
+
+    /// `ETHTOOL_MSG_TUNNEL_INFO_GET` — the UDP tunnel ports the NIC offloads (`--show-tunnels`). Unprivileged;
+    /// `NotSupported` without offload support. Free with `deinit`.
+    pub fn tunnelInfo(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!phy_tunnel.TunnelInfo {
+        const seq = cl.sock.nextSeq();
+        const msg = try phy_tunnel.buildTunnelInfo(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.TUNNEL_INFO.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return phy_tunnel.parseTunnelInfo(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
     }
 
     // ── multicast groups ───────────────────────────────────────────────────

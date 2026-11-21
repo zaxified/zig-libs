@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NEW: PHY list and tunnel offload info.** `Ethtool.phy` (`Phy`) and `tunnelInfo` (`TunnelInfo`, `buildPhy`, `buildTunnelInfo`).
 - **2026-11-21** — **NEW: timestamping configuration and TSINFO statistics.** `Ethtool.tsConfig` / `setTsConfig` (`TsConfig`, `TsConfigSet`), `tsInfoStats`; `TsInfo` gains the fields `stats`, `provider`, `source` and `phy_index` (`TsStats`, `TsProvider`).
 - **2026-11-21** — **NEW: PLCA and MAC merge.** `Ethtool.plca` / `setPlca` / `plcaStatus` (`PlcaCfg`, `PlcaSet`, `PlcaStatus`) and `mm` / `setMm` (`Mm`, `MmSet`, `MmStats`, `MmVerifyStatus`), with their `build*` encoders.
 - **2026-11-21** — **NEW: message level, PHC virtual clocks, FEC statistics and all-devices dumps.** `Ethtool.debug` / `setDebug` (`DEBUG_GET`/`SET`, `Debug`, `DebugSet`), `phcVclocks` (`PHC_VCLOCKS_GET`, `PhcVclocks`), `fecStats` (`FEC_GET` with the stats flag; `Fec` gains the field `stats`, `FecStats`, `FecCounter`, `buildFecWith`), and `linkInfoAll`, `linkStateAll`, `ringsAll`, `channelsAll` (an `NLM_F_DUMP` with an empty header nest). Source-breaking only for code that builds a `Fec` literal without field names.

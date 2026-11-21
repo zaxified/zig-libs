@@ -221,6 +221,8 @@ getter.
 
 **Timestamping: TSINFO statistics and provider, TSCONFIG.** `TsInfo` also decodes the `STATS` nest (TX packets, lost, errors, unconfirmed one-step packets), the hardware timestamp provider (PHC index and qualifier), the source and the PHY index; `tsInfoStats` asks for the counters with `ETHTOOL_FLAG_STATS`. `tsConfig` / `setTsConfig` (`TSCONFIG_GET`/`SET`) read and change the hardware timestamping configuration: the provider nest and the TX-type, RX-filter and flag bitsets, set by name or index (not both). The set is built from the UAPI header's layout and is a test of constructed messages: no driver on the build host implements it.
 
+**PHY and tunnel offload info.** `phy` (`PHY_GET`: index, driver and device names, upstream type and index, SFP names, all without allocation) and `tunnelInfo` (`TUNNEL_INFO_GET`: per table its size, the accepted tunnel types as a bitset and the offloaded ports, port decoded from network byte order; at most 16 tables of 64 entries, more is `BadLength`). Attribute numbers are checked against the kernel header by `check-uapi`; the layouts are tests of constructed messages (no driver on the build host implements either).
+
 ## What is deliberately not done
 
 - **A second transport beyond the two ioctl calls.** `SIOCETHTOOL` is used only for `drvinfo()` and
@@ -457,7 +459,7 @@ Reachable through `Ethtool.raw`, not modelled; all fit CONVENTIONS §2 (netlink 
 | command family | why deferred |
 |---|---|
 | `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have (effort: medium) |
-| `RSS_SET` (and the `RSS_GET` per-flow `FLOW_HASH` nest / dump form), `PSE`, `PHY`, `TUNNEL_INFO`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
+| `RSS_SET` (and the `RSS_GET` per-flow `FLOW_HASH` nest / dump form), `PSE`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
 
 ## Provenance
 

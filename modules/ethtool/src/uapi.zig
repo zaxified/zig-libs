@@ -560,6 +560,44 @@ pub const MM_STAT = struct {
     pub const HOLD_COUNT: u16 = 7;
 };
 
+pub const PHY = struct {
+    pub const HEADER: u16 = 1;
+    pub const INDEX: u16 = 2; // u32
+    pub const DRVNAME: u16 = 3; // string
+    pub const NAME: u16 = 4; // string
+    pub const UPSTREAM_TYPE: u16 = 5; // u32
+    pub const UPSTREAM_INDEX: u16 = 6; // u32
+    pub const UPSTREAM_SFP_NAME: u16 = 7; // string
+    pub const DOWNSTREAM_SFP_NAME: u16 = 8; // string
+};
+
+pub const TUNNEL_INFO = struct {
+    pub const HEADER: u16 = 1;
+    /// Nest of `TUNNEL_UDP`.
+    pub const UDP_PORTS: u16 = 2;
+};
+
+pub const TUNNEL_UDP = struct {
+    /// Nest (repeated) of `TUNNEL_UDP_TABLE`.
+    pub const TABLE: u16 = 1;
+};
+
+pub const TUNNEL_UDP_TABLE = struct {
+    /// u32: how many ports the table holds.
+    pub const SIZE: u16 = 1;
+    /// Bitset of the tunnel types the table accepts.
+    pub const TYPES: u16 = 2;
+    /// Nest (repeated) of `TUNNEL_UDP_ENTRY`.
+    pub const ENTRY: u16 = 3;
+};
+
+pub const TUNNEL_UDP_ENTRY = struct {
+    /// u16, network byte order.
+    pub const PORT: u16 = 1;
+    /// u32: the tunnel type's bit.
+    pub const TYPE: u16 = 2;
+};
+
 pub const DEBUG = struct {
     pub const HEADER: u16 = 1;
     /// Bitset of `NETIF_MSG_*` classes.

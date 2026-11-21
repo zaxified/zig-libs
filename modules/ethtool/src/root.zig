@@ -129,6 +129,7 @@ pub const wol = @import("wol.zig");
 pub const privflags = @import("privflags.zig");
 pub const debug = @import("debug.zig");
 pub const plca_mm = @import("plca_mm.zig");
+pub const phy_tunnel = @import("phy_tunnel.zig");
 /// `RSS_GET` (hash function, key, indirection table).
 pub const rss = @import("rss.zig");
 /// `TSINFO_GET`.
@@ -184,6 +185,8 @@ pub const Wol = wol.Wol;
 pub const WolSet = wol.WolSet;
 pub const Privflags = privflags.Privflags;
 pub const Debug = debug.Debug;
+pub const Phy = phy_tunnel.Phy;
+pub const TunnelInfo = phy_tunnel.TunnelInfo;
 pub const TsConfig = tsinfo.TsConfig;
 pub const TsConfigSet = tsinfo.TsConfigSet;
 pub const TsStats = tsinfo.TsStats;
@@ -243,6 +246,8 @@ pub const buildWol = wol.buildWol;
 pub const buildSetWol = wol.buildSetWol;
 pub const buildPrivflags = privflags.buildPrivflags;
 pub const buildDebug = debug.buildDebug;
+pub const buildPhy = phy_tunnel.buildPhy;
+pub const buildTunnelInfo = phy_tunnel.buildTunnelInfo;
 pub const buildPlcaCfg = plca_mm.buildPlcaCfg;
 pub const buildPlcaStatus = plca_mm.buildPlcaStatus;
 pub const buildSetPlca = plca_mm.buildSetPlca;
@@ -915,6 +920,7 @@ test {
     _ = privflags;
     _ = debug;
     _ = plca_mm;
+    _ = phy_tunnel;
     _ = tsinfo;
     _ = rss;
     _ = client;
