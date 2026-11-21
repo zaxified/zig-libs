@@ -5,7 +5,8 @@ W3C XML-Encryption (xmlenc-core-1) **decryption** — recover the plaintext
 so the SAML SP can run signature verification and XSW defense on it. eIDAS
 requires encrypted assertions; this closes the SAML cluster's last gap.
 
-Decryption only (we are the relying party with the private key). Encryption,
+Decryption is the purpose (we are the relying party with the private key); `encryptData` writes the matching
+`EncryptedData` (RSA-OAEP or AES key wrap for the content key, AES-GCM or AES-CBC content) for an IdP or a test peer.
 `CipherReference` (external ciphertext URI), and ciphertext `Transforms` are out
 of scope and rejected. See `SPEC.md` for the full algorithm allow-list and
 security posture.

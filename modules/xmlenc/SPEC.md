@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-W3C XML-Encryption (xmlenc-core-1) **decryption** for the SAML cluster. The
+W3C XML-Encryption (xmlenc-core-1) **decryption** (and `encryptData`) for the SAML cluster. The
 relying party (SP) holds the RSA private key and recovers the plaintext
 `<saml:Assertion>` octets from a `<xenc:EncryptedData>` (typically wrapped in
 `<saml:EncryptedAssertion>`), so the existing `saml` parse → signature-verify →
@@ -38,13 +38,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 RSA-OAEP with decoupled digest/MGF1 (incl. the SHA-256 + MGF1-SHA-1 shape real IdPs emit), `rsa-1_5` gated
 off by default, AES-KW, AES-128/256 CBC and GCM; generic error collapse plus a decoy CEK against unwrap-side timing
 (measured, see *Constant-time posture*); ciphertext cap; CipherReference refused before any crypto. **Where we are
-behind:** decrypt only (by design), no
+behind:** no
 3DES, no ECDH-ES key agreement (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## Scope
 
-Decryption only. We are the receiving party with the private key. Encryption /
-ciphertext generation is **out of scope**.
+Decryption is the purpose: we are the receiving party with the private key. `encryptData(alloc, plaintext, EncryptKey, random, EncryptOptions)` is the writer for an IdP or a test peer: a fresh random content key (the caller's CSPRNG), delivered by RSA-OAEP (`digest` / `mgf` among SHA-1/256/384/512; SHA-1/SHA-1 is written as `rsa-oaep-mgf1p`) or RFC 3394 key wrap under a caller KEK (`kw-aes128/192/256`), content AES-128/192/256-GCM (12-byte random IV) or -CBC (16-byte random IV, XML-Enc padding), output `<xenc:EncryptedData>` text with the `ds:KeyInfo/xenc:EncryptedKey` structure `decryptData` reads. The writer is checked by round trip through `decryptData` (all content x delivery combinations); no foreign decryptor has read its output yet.
 
 Everything else a decryptor could be asked to dereference or trust is refused; the list and the reasons are in
 *What is deliberately not done*. The caller supplies the key (`sk` / `Options.kek`).
@@ -274,16 +273,12 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 
 ## Backlog / deferred
 
-- **Encryption (`encryptData`).** The reference encrypts: xmlsec1's `--encrypt` (`xmlSecEncCtxXmlEncrypt` /
-  `xmlSecEncCtxBinaryEncrypt` in its API), so an IdP or a test peer built on this module needs another tool today.
-  Not small: an `EncryptedData`/`EncryptedKey` writer (RSA-OAEP key transport, AES-GCM content, the template
-  serialisation) is a second half of the module. Effort: medium.
 - **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey:** used by newer eIDAS/SAML profiles that avoid
   RSA transport; xmlsec supports it *(inferred)*. Effort: medium (needs P-256 ECDH + Concat KDF; check siblings). Low to
   medium priority; fits the module's scope.
 - **Bulk path after the move to `aesgcm`:** AES-GCM decryption runs on the `aesgcm` module (Zig 0.17 #36256); the bulk
   path was not re-measured at that move. The card says Performance is not measured, so this stays open until a bench
-  exists.
+  exists. BOUNCED: needs a quiet host for numbers (quiet phase).
 
 ## Anchoring
 

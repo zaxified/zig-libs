@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! xmlenc — W3C XML-Encryption (xmlenc-core-1) DECRYPTION for the SAML cluster.
+//! xmlenc — W3C XML-Encryption (xmlenc-core-1) for the SAML cluster: decryption, and `encryptData`.
 //!
 //! Purpose: close the SAML cluster's last gap. `saml` detects a
 //! `<saml:EncryptedAssertion>` and refuses it with
@@ -9,8 +9,8 @@
 //! `<xenc:EncryptedData>` so the existing parse -> signature-verify -> XSW
 //! path can run over the decrypted assertion.
 //!
-//! **DECRYPTION ONLY.** We are the receiving party with the private key;
-//! encryption / ciphertext generation is out of scope, as are CipherReference
+//! Decryption is the point (we are the receiving party with the private key);
+//! `encryptData` is the matching writer for an IdP or a test peer. CipherReference
 //! (external URI dereference — SSRF/XXE surface) and any ds:Transforms on the
 //! ciphertext.
 //!
@@ -48,7 +48,7 @@ const Aes192Gcm = @import("aesgcm").Aes192Gcm;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "XML-Encryption (xmlenc-core-1) **decryption only** — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify",
+    .doc = "XML-Encryption (xmlenc-core-1) decryption and encryption — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify; `encryptData` writes `EncryptedData`",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -315,6 +315,197 @@ pub fn decryptDataToDocument(
     wiper.* = .{ .child = alloc };
     const doc = try xml.parse(wiper.allocator(), plain, .{ .id_attr_names = &.{"ID"}, .max_elements = options.max_elements });
     return .{ .doc = doc, .plaintext = plain, .wiper = wiper };
+}
+
+// ── encryption ──────────────────────────────────────────────────────────────
+
+/// Content encryption algorithms `encryptData` can produce (the allow-list's AES-CBC and AES-GCM rows).
+pub const ContentEnc = enum {
+    aes128_cbc,
+    aes192_cbc,
+    aes256_cbc,
+    aes128_gcm,
+    aes192_gcm,
+    aes256_gcm,
+
+    fn uri(self: ContentEnc) []const u8 {
+        return switch (self) {
+            .aes128_cbc => alg_aes128_cbc,
+            .aes192_cbc => alg_aes192_cbc,
+            .aes256_cbc => alg_aes256_cbc,
+            .aes128_gcm => alg_aes128_gcm,
+            .aes192_gcm => alg_aes192_gcm,
+            .aes256_gcm => alg_aes256_gcm,
+        };
+    }
+
+    fn keyLen(self: ContentEnc) usize {
+        return switch (self) {
+            .aes128_cbc, .aes128_gcm => 16,
+            .aes192_cbc, .aes192_gcm => 24,
+            .aes256_cbc, .aes256_gcm => 32,
+        };
+    }
+
+    fn isGcm(self: ContentEnc) bool {
+        return self == .aes128_gcm or self == .aes192_gcm or self == .aes256_gcm;
+    }
+};
+
+/// Hash choice for RSA-OAEP key transport (`DigestMethod` / `MGF`).
+pub const OaepDigest = OaepHash;
+
+/// How `encryptData` delivers the content key.
+pub const EncryptKey = union(enum) {
+    /// RSAES-OAEP to the recipient's public key. `digest` / `mgf` default to SHA-256 / SHA-256 (xenc11
+    /// `rsa-oaep`); SHA-1 for both is written as the legacy `rsa-oaep-mgf1p` URI.
+    rsa_oaep: struct { key: rsa.PublicKey, digest: OaepDigest = .sha256, mgf: OaepDigest = .sha256 },
+    /// RFC 3394 AES key wrap under a shared key-encryption key of 16, 24 or 32 bytes (`kw-aes128/192/256`).
+    aes_kw: []const u8,
+};
+
+pub const EncryptOptions = struct {
+    content: ContentEnc = .aes256_gcm,
+    /// `Type` attribute of the EncryptedData: the encrypted octets are a serialized element
+    /// (`#Element`, what SAML's `EncryptedAssertion` carries) or element content (`#Content`).
+    type_element: bool = true,
+};
+
+pub const EncryptError = error{
+    /// The plaintext is too long for the algorithm (OAEP: more than the modulus allows for a key; never for the
+    /// content), or the KEK length is not 16, 24 or 32.
+    UnsupportedAlgorithm,
+    /// The wrapped key did not fit (key transport failure).
+    EncryptionError,
+} || std.mem.Allocator.Error;
+
+/// Encrypt `plaintext` into an `<xenc:EncryptedData>` element (returned as XML text, owned by `alloc`) whose
+/// `ds:KeyInfo/xenc:EncryptedKey` carries a fresh random content key, delivered by `key`. This is the encrypting
+/// half of `decryptData` (an IdP or a test peer); the output decrypts with it and with xmlsec1.
+///
+/// `random` supplies the content key, the IV and the OAEP seed and MUST be cryptographically secure. GCM IVs are
+/// 12 random bytes per message and CBC IVs 16, as the XML-Enc 1.1 formats prescribe; CBC padding is XML-Enc's
+/// (random bytes, last byte the count). The content key is wiped before return.
+pub fn encryptData(
+    alloc: std.mem.Allocator,
+    plaintext: []const u8,
+    key: EncryptKey,
+    random: std.Random,
+    options: EncryptOptions,
+) EncryptError![]u8 {
+    const content = options.content;
+    var cek: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &cek);
+    const cek_s = cek[0..content.keyLen()];
+    random.bytes(cek_s);
+
+    // Content: IV ‖ ciphertext (‖ tag for GCM).
+    const bs = aescbc.block_len;
+    const iv_len: usize = if (content.isGcm()) 12 else bs;
+    const body_cap = if (content.isGcm()) plaintext.len + 16 else aescbc.paddedLenPkcs7(plaintext.len);
+    const cipher = try alloc.alloc(u8, iv_len + body_cap);
+    defer alloc.free(cipher);
+    random.bytes(cipher[0..iv_len]);
+    if (content.isGcm()) {
+        const npub = cipher[0..12].*;
+        const ct = cipher[12..][0..plaintext.len];
+        const tag = cipher[12 + plaintext.len ..][0..16];
+        switch (content.keyLen()) {
+            16 => Aes128Gcm.encrypt(ct, tag, plaintext, "", npub, cek[0..16].*),
+            24 => Aes192Gcm.encryptInto(ct, tag, plaintext, "", npub, cek[0..24]),
+            else => Aes256Gcm.encrypt(ct, tag, plaintext, "", npub, cek[0..32].*),
+        }
+    } else {
+        const padded = try alloc.alloc(u8, body_cap);
+        defer {
+            std.crypto.secureZero(u8, padded);
+            alloc.free(padded);
+        }
+        const n = aescbc.padIso10126(plaintext, padded, random) catch return error.EncryptionError;
+        const iv = cipher[0..bs].*;
+        _ = (switch (content.keyLen()) {
+            16 => aescbc.encrypt(Aes128, cek[0..16], iv, padded[0..n], cipher[bs..]),
+            24 => aescbc.encrypt(Aes192, cek[0..24], iv, padded[0..n], cipher[bs..]),
+            else => aescbc.encrypt(Aes256, cek[0..32], iv, padded[0..n], cipher[bs..]),
+        }) catch return error.EncryptionError;
+    }
+
+    // Key delivery.
+    var wrapped_buf: [rsa.max_modulus_len]u8 = undefined;
+    var method_xml: std.ArrayList(u8) = .empty;
+    defer method_xml.deinit(alloc);
+    const wrapped: []const u8 = switch (key) {
+        .rsa_oaep => |r| blk: {
+            if (r.digest == .sha1 and r.mgf == .sha1) {
+                try method_xml.appendSlice(alloc, "<xenc:EncryptionMethod Algorithm=\"" ++ alg_rsa_oaep_mgf1p ++ "\"/>");
+            } else {
+                try method_xml.appendSlice(alloc, "<xenc:EncryptionMethod Algorithm=\"" ++ alg_rsa_oaep ++ "\"><ds:DigestMethod Algorithm=\"");
+                try method_xml.appendSlice(alloc, digestUri(r.digest));
+                try method_xml.appendSlice(alloc, "\"/><xenc11:MGF Algorithm=\"");
+                try method_xml.appendSlice(alloc, mgfUri(r.mgf));
+                try method_xml.appendSlice(alloc, "\"/></xenc:EncryptionMethod>");
+            }
+            inline for (.{ .sha1, .sha256, .sha384, .sha512 }) |d| {
+                inline for (.{ .sha1, .sha256, .sha384, .sha512 }) |m| {
+                    if (r.digest == d and r.mgf == m) {
+                        break :blk rsa.encryptOaepH(r.key, oaepHashType(d), oaepHashType(m), random, cek_s, "", &wrapped_buf) catch return error.EncryptionError;
+                    }
+                }
+            }
+            unreachable;
+        },
+        .aes_kw => |kek| blk: {
+            const uri = switch (kek.len) {
+                16 => alg_kw_aes128,
+                24 => alg_kw_aes192,
+                32 => alg_kw_aes256,
+                else => return error.UnsupportedAlgorithm,
+            };
+            try method_xml.appendSlice(alloc, "<xenc:EncryptionMethod Algorithm=\"" ++ uri ++ "\"/>");
+            break :blk aeskw.wrap(kek, cek_s, &wrapped_buf) catch return error.EncryptionError;
+        },
+    };
+
+    const b64 = std.base64.standard.Encoder;
+    const key_b64 = try alloc.alloc(u8, b64.calcSize(wrapped.len));
+    defer alloc.free(key_b64);
+    _ = b64.encode(key_b64, wrapped);
+    const data_b64 = try alloc.alloc(u8, b64.calcSize(cipher.len));
+    defer alloc.free(data_b64);
+    _ = b64.encode(data_b64, cipher);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "<xenc:EncryptedData xmlns:xenc=\"" ++ xenc_ns ++ "\" xmlns:xenc11=\"" ++ xenc11_ns ++ "\" xmlns:ds=\"" ++ ds_ns ++ "\" Type=\"");
+    try out.appendSlice(alloc, if (options.type_element) xenc_ns ++ "Element" else xenc_ns ++ "Content");
+    try out.appendSlice(alloc, "\"><xenc:EncryptionMethod Algorithm=\"");
+    try out.appendSlice(alloc, content.uri());
+    try out.appendSlice(alloc, "\"/><ds:KeyInfo><xenc:EncryptedKey>");
+    try out.appendSlice(alloc, method_xml.items);
+    try out.appendSlice(alloc, "<xenc:CipherData><xenc:CipherValue>");
+    try out.appendSlice(alloc, key_b64);
+    try out.appendSlice(alloc, "</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>");
+    try out.appendSlice(alloc, data_b64);
+    try out.appendSlice(alloc, "</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>");
+    return out.toOwnedSlice(alloc);
+}
+
+fn digestUri(h: OaepHash) []const u8 {
+    return switch (h) {
+        .sha1 => alg_sha1,
+        .sha256 => alg_sha256,
+        .sha384 => alg_sha384,
+        .sha512 => alg_sha512,
+    };
+}
+
+fn mgfUri(h: OaepHash) []const u8 {
+    return switch (h) {
+        .sha1 => alg_mgf1sha1,
+        .sha256 => alg_mgf1sha256,
+        .sha384 => alg_mgf1sha384,
+        .sha512 => alg_mgf1sha512,
+    };
 }
 
 // ── content algorithm classification ────────────────────────────────────────

@@ -2037,3 +2037,59 @@ test "decryptDataToDocument: the recovered tree indexes ID attributes" {
     defer inner.deinit(a);
     try std.testing.expect(inner.doc.getElementById("_a1b2") != null);
 }
+
+test "encryptData: every content algorithm and key delivery round-trips through decryptData" {
+    const alloc = std.testing.allocator;
+    const kp = try makeKey();
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3c)));
+    const random = prng.random();
+    const kek16: [16]u8 = @splat(0x11);
+    const kek24: [24]u8 = @splat(0x22);
+    const kek32: [32]u8 = @splat(0x33);
+    const keys = [_]xmlenc.EncryptKey{
+        .{ .rsa_oaep = .{ .key = kp.public_key } },
+        .{ .rsa_oaep = .{ .key = kp.public_key, .digest = .sha1, .mgf = .sha1 } },
+        .{ .rsa_oaep = .{ .key = kp.public_key, .digest = .sha256, .mgf = .sha1 } },
+        .{ .aes_kw = &kek16 },
+        .{ .aes_kw = &kek24 },
+        .{ .aes_kw = &kek32 },
+    };
+    const lens = [_]usize{ 0, 1, 15, 16, 17, 255 };
+    for (std.enums.values(xmlenc.ContentEnc)) |content| {
+        for (keys) |key| {
+            for (lens) |n| {
+                var msg: [255]u8 = undefined;
+                for (msg[0..n], 0..) |*b, i| b.* = @intCast((i * 7 + n) & 0xff);
+                const xml_text = try xmlenc.encryptData(alloc, msg[0..n], key, random, .{ .content = content });
+                defer alloc.free(xml_text);
+                var doc = try xml.parse(alloc, xml_text, .{});
+                defer doc.deinit();
+                const kek: ?[]const u8 = switch (key) {
+                    .aes_kw => |k| k,
+                    else => null,
+                };
+                const plain = try xmlenc.decryptData(alloc, doc.root, &kp.secret_key, .{ .kek = kek });
+                defer alloc.free(plain);
+                try std.testing.expectEqualSlices(u8, msg[0..n], plain);
+            }
+        }
+    }
+}
+
+test "encryptData: fresh key and IV per call; a wrong KEK and a flipped ciphertext byte fail closed" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3d)));
+    const random = prng.random();
+    const kek: [16]u8 = @splat(0x44);
+    const a = try xmlenc.encryptData(alloc, "same message", .{ .aes_kw = &kek }, random, .{});
+    defer alloc.free(a);
+    const b = try xmlenc.encryptData(alloc, "same message", .{ .aes_kw = &kek }, random, .{});
+    defer alloc.free(b);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    const kp = try makeKey();
+    var doc = try xml.parse(alloc, a, .{});
+    defer doc.deinit();
+    const wrong: [16]u8 = @splat(0x45);
+    try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(alloc, doc.root, &kp.secret_key, .{ .kek = &wrong }));
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .aes_kw = "short" }, random, .{}));
+}
