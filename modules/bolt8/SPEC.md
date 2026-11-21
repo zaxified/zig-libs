@@ -11,7 +11,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per target, 5 targets, BOLT8_FUZZ) · ct 2026-09-08 (ctgrind) · panic 2026-11-14 (sweep of every pub entry point: the wire parsers, secp256k1 inputs, send/recv, the 1000-message rotation are clean; LOW `readAct2`/`genAct3`/`genAct2`/`readAct3` panicked on `.?` when a caller set the pub `state` field by hand ahead of the act that fills it, now `error.WrongState` and the object goes to `.failed`)
 
-**Performance:** ref 0.53–1.28× lnd brontide v0.21.3-beta · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.45–0.88× lnd brontide v0.21.3-beta · fastest ? (measured 2026-11-22)
 
 **Known defects:** none recorded
 
@@ -344,7 +344,8 @@ runs 600 messages across a key rotation; a secret path it does not drive is not 
 ## Performance
 
 `zig build bench-bolt8` (`tools/bench.zig`) against lnd's `brontide`; the card's `**Performance:**` line carries
-the figures.
+the figures (two runs on 2026-11-22: handshake 0.45×, 1 KiB 0.79–0.88×, 64 KiB 0.71–0.79×; the transport gap of
+the 2026-10 measurement closed when `chachapoly` took Go's `x/crypto` assembly route).
 
 ## What is deliberately not done
 
@@ -374,6 +375,4 @@ measured run.
 
 ## Backlog / deferred
 
-- **Transport throughput is above 1.1× lnd `brontide`'s on 1 KiB and 64 KiB messages** (the card's performance
-  limit); the handshake is faster than `brontide`'s. The gap sits in the AEAD, not in this module's framing: Go's
-  `x/crypto` has amd64 assembly for ChaCha20-Poly1305. Closing it belongs to the `chachapoly` module.
+None open.
