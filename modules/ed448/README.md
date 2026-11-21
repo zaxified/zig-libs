@@ -98,9 +98,15 @@ Wycheproof `ed448_test.json` cases; the per-file suites add
 field/scalar/point self-checks (inverse, sqrt, encode/decode
 round-trips, non-canonical rejects).
 
+## Hash to curve
+
+`ed448.h2c.hashToCurve(msg, dst)` / `encodeToCurve(msg, dst)`: RFC 9380's `edwards448_XOF:SHAKE256_ELL2_RO_` /
+`_NU_`, a `Point` (the stages `hashToField`, `mapToCurve`, `expandMessageXof` are public too). Anchored by RFC 9380
+Appendix J.7.
+
 ## Not provided
 
-RFC 9380 hash-to-curve, batch verification and key blinding, a cofactorless `verify`, and the all-zero
+Batch verification and key blinding, a cofactorless `verify`, and the all-zero
 shared-secret check in `x448.scalarmult` (the caller's). See SPEC *What is deliberately not done* and
 *Backlog / deferred*.
 

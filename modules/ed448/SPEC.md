@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves) `ed448-goldilocks` | Rust | Apache-2.0 OR MIT (crate manifest + LICENSE-MIT/-APACHE) | 876 (monorepo) | crate 0.14.0-pre.15; no GitHub releases, pushed 2026-09-28 | Pre-release crate whose README says "NOT BEEN AUDITED OR REVIEWED". Exposes the curve, Curve448, Decaf448, RFC 9380 hash-to-curve/hash-to-scalar and an optional signing feature; group-level API (points, scalars), where this module offers the two protocols plus raw `Point`. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No 448-bit curve at all (checked `lib/std/crypto/`: `25519/`, `pcurves/{p256,p384,secp256k1}`, no 448 field or curve). |
 
-**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none; the Ed448 to X448 key conversion (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`) that libdecaf and `std`'s `X25519.KeyPair.fromEd25519` offer. **Where we are behind:** RFC 9380 edwards448 hash-to-curve that the Rust crate offers (→ *Backlog / deferred*), and batch verification / key blinding that CIRCL-style toolkits offer as extras (→ *What is deliberately not done*); none of these is part of what OpenSSL offers for Ed448/X448.
+**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none; the Ed448 to X448 key conversion (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`) that libdecaf and `std`'s `X25519.KeyPair.fromEd25519` offer. **Where we are behind:** batch verification / key blinding that CIRCL-style toolkits offer as extras (→ *What is deliberately not done*); none of these is part of what OpenSSL offers for Ed448/X448.
 
 ## Design
 
@@ -276,6 +276,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   protocol layer built on top, matching `std.crypto.dh.X25519`'s
   identical choice to leave the check to the caller.
 
+## Hash to curve (`h2c.zig`)
+
+RFC 9380 §8.6's edwards448 suites, as `ed448-goldilocks` offers them: `h2c.hashToCurve(msg, dst)`
+(`edwards448_XOF:SHAKE256_ELL2_RO_`), `h2c.hashToCurveParts` (the message as parts), `h2c.encodeToCurve`
+(`_NU_`), and the stages `h2c.hashToField(count, parts, dst)` (`expand_message_xof` with SHAKE256, `k = 224`,
+`L = 84`; a DST over 255 bytes reduced to `SHAKE256("H2C-OVERSIZE-DST-" || DST, 56)`, §5.3.3),
+`h2c.mapToCurve(u)` (Elligator 2 on curve448 with `Z = −1`, Appendix G.2.3, then RFC 7748's 4-isogeny in
+Appendix G.2.4's fraction form, returned projective without an inversion) and `h2c.expandMessageXof`. The cofactor
+(`h_eff = 4`) is cleared with `Point.clearCofactor`. The map is straight-line with `ctSelect`s, as the RFC writes
+it. The expander is this module's own (`decaf448`, which depends on this module, keeps its runtime-length copy for
+`k = 224` too). Tests (`h2c_test.zig`): RFC 9380 Appendix J.7.1 and J.7.2 — `u`, the first mapped point and `P`
+for all five messages of each suite (an RFC model in Python reproduced them first); parts equal the
+concatenation; the oversize-DST reduction; the exceptional inputs `u ∈ {0, ±1}` land on the curve.
+
 ## What is deliberately not done
 
 - **A cofactorless `verifyStrict`** (RFC 8032 §5.2.7's `[S]B = R + [k]A'`): `verify`/`verifyPh` are
@@ -361,7 +375,6 @@ forced-inline `mulI`/`squareI`) are in *Design*.
   roughly ≥ 100 KB or a consumer request). `baseComb: [112][16]Point` ≈ 1792 points ×
   ~224 B ≈ 400 KB of table (estimate). `.small` → a smaller comb (fewer teeth or w=4 windowed) — slower keygen/sign, same constant-time
   guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
-- **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
 - **`scalar.zig` `condSubL` mask not laundered**: `Fe`'s selects use `field.blackBox`; the same change on the scalar's conditional subtraction made `decaf448`'s `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
 - **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 

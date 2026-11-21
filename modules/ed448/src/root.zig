@@ -55,6 +55,8 @@ pub const field = @import("field.zig");
 pub const x448 = @import("x448.zig");
 pub const ed448 = @import("ed448.zig");
 pub const scalar = @import("scalar.zig");
+/// RFC 9380 hash-to-curve for edwards448 (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`).
+pub const h2c = @import("h2c.zig");
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -66,6 +68,8 @@ test {
     _ = x448;
     _ = ed448;
     _ = scalar;
+    _ = h2c;
+    _ = @import("h2c_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("rfc8032_vectors.zig");
     _ = @import("wycheproof_vectors.zig");
