@@ -229,10 +229,11 @@ Run: `scripts/modtest tcplan`. Everything is pure logic, so the tests need no pr
 
 ## Backlog / deferred
 
-- **Live reconcile (diff of target vs kernel state)** (survey 2026-09-30): diffing a target topology against the kernel's
-  current state to emit a *minimal* add/change/del sequence needs a state read-back (a `tc` dump) and a diff engine.
-  tcplan emits a full create-or-replace plan today; a reconciling caller replays it idempotently with `.replace`. The
-  reference reloads a running shaper incrementally *(inferred)*. Effort L. Fits §2.
+None open.
+
+## Roadmap
+
+- **Live reconcile (diff of target vs kernel state)** (survey 2026-09-30): diffing a target topology against the kernel's current state to emit a *minimal* add/change/del sequence needs a state read-back (a `tc` dump) and a diff engine. tcplan emits a full create-or-replace plan today; a reconciling caller replays it idempotently with `.replace`. The reference reloads a running shaper incrementally *(inferred)*. Size: a dump decoder for every qdisc/class/filter kind this module emits plus a diff engine, weeks; needs the `tc` module's dump path. Fits §2.
 
 ## Anchoring
 

@@ -375,7 +375,11 @@ Four layers, in increasing order of what they can prove.
 
 ## Backlog / deferred
 
-- **Canonical proto3 JSON mapping** (and with it the well-known types' JSON forms: RFC 3339 timestamps, `"1.5s"` durations, `Struct` as an object, `Any` with `@type`) and the text format. zig-protobuf ships it (beta); gRPC-gateway and REST users need it. A layer above the wire format: the comptime schema carries no JSON names (`json_name`, lowerCamelCase), int64-as-string and base64 rules, enum names, or a resolver for `Any`, and JSON is a second codec over every kind with its own conformance suite. Effort large; `std.json` is in std (see also the sibling `jsonshape`).
+None open.
+
+## Roadmap
+
+- **Canonical proto3 JSON mapping** (and with it the well-known types' JSON forms: RFC 3339 timestamps, `"1.5s"` durations, `Struct` as an object, `Any` with `@type`) and the text format. zig-protobuf ships it (beta); gRPC-gateway and REST users need it. A layer above the wire format: the comptime schema carries no JSON names (`json_name`, lowerCamelCase), int64-as-string and base64 rules, enum names, or a resolver for `Any`, and JSON is a second codec over every kind with its own conformance suite. `std.json` is in std (see also the sibling `jsonshape`). Size: a second codec over every field kind plus a conformance suite, weeks; needs a schema extension (JSON names) first.
 
 ## Anchoring
 

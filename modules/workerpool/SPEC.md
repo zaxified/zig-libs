@@ -374,8 +374,11 @@ loud, bounded failure; `std.testing.allocator` catches leaks and double frees.
 
 ## Backlog / deferred
 
-- **Priority / fairness** — a single FIFO queue today; a multi-queue or work-stealing variant
-  (crossbeam-deque style) is deferred until a consumer needs it.
+None open.
+
+## Roadmap
+
+- **Priority / fairness: a multi-queue or work-stealing variant** (crossbeam-deque style) of the single-FIFO pool. Size: a multi-threaded rewrite of the scheduler core (per-worker deques, stealing protocol, quiescence contract re-proved), weeks; waits for a consumer that needs it.
 
 ## Anchoring
 

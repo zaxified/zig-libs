@@ -306,9 +306,11 @@ parallel — no more, no less.
 
 ## Backlog / deferred
 
-Refusals stay in "What it does NOT guarantee".
+None open. Refusals stay in "What it does NOT guarantee".
 
-- (survey 2026-09-30) Fixed hash-slot indirection (slots -> shards) so `n_shards` can grow without rehashing every key, as Redis Cluster and Vitess do. Effort: large (migration protocol, manifest change); fits §2.
+## Roadmap
+
+- **Fixed hash-slot indirection (slots -> shards)** so `n_shards` can grow without rehashing every key, as Redis Cluster and Vitess do (survey 2026-09-30). Size: a migration protocol (moving slots between live shards under reads and writes), a manifest-format change and crash recovery for a half-finished move, weeks; needs a decision on what a reader sees mid-migration. Fits §2.
 
 ## Anchoring
 
