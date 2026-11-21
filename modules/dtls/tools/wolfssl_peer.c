@@ -87,6 +87,15 @@
 //                                     # KeyUpdate (`wolfSSL_update_keys`) after
 //                                     # the echo and sends a message under the
 //                                     # new keys; our side must accept it.
+//   ./wolfssl_peer client-ku-theirs <port>
+//                                     # PSK CLIENT that, after the echo, starts
+//                                     # a KeyUpdate, sends a message under its
+//                                     # new keys and expects it echoed back.
+//   ./wolfssl_peer server-cert-alpn <port>
+//   ./wolfssl_peer server-cert-ku-ours <port>
+//   ./wolfssl_peer server-cert-ku-theirs <port>
+//                                     # `server-cert` with the ALPN / KeyUpdate
+//                                     # switches of the PSK modes above.
 //
 // Deliberate configuration, each item chosen to match what this module
 // implements — a mismatch here would make the test prove nothing:
@@ -175,6 +184,35 @@ static int report_alpn(WOLFSSL *ssl) {
         fprintf(stderr, "ALPN answer is not \"%s\"\n", g_alpn_expect);
         return 1;
     }
+    return 0;
+}
+
+// The client side of mode 2: wolfSSL starts a KeyUpdate, sends a message under
+// its new keys and must get exactly that message echoed back.
+static int client_keyupdate_round(WOLFSSL *ssl) {
+    if (wolfSSL_update_keys(ssl) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "update_keys failed\n");
+        return 1;
+    }
+    const char *note = "wolfssl after its keyupdate";
+    int len = (int)strlen(note);
+    if (wolfSSL_write(ssl, note, len) != len) {
+        fprintf(stderr, "write after update_keys failed\n");
+        return 1;
+    }
+    printf("KEYUPDATE sent\n");
+    fflush(stdout);
+    char msg[256];
+    int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
+    if (n != len || memcmp(msg, note, (size_t)len) != 0) {
+        int err = n < 0 ? wolfSSL_get_error(ssl, n) : 0;
+        char buf[80];
+        fprintf(stderr, "echo after keyupdate is not the message (read %d, error %d %s)\n", n, err,
+                err ? wolfSSL_ERR_error_string((unsigned long)err, buf) : "");
+        return 1;
+    }
+    printf("ECHO %.*s\n", n, msg);
+    fflush(stdout);
     return 0;
 }
 
@@ -412,6 +450,7 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
     if (!o.hrr_cookie) wolfSSL_disable_hrr_cookie(ssl);
+    if (apply_alpn(ssl)) return 1;
     if (o.mtu > 0 && wolfSSL_dtls_set_mtu(ssl, (unsigned short)o.mtu) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "dtls_set_mtu(%d) failed\n", o.mtu);
         return 1;
@@ -426,6 +465,7 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     }
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
+    if (report_alpn(ssl)) return 1;
 
     // With `verify_peer` the handshake above cannot have succeeded without a
     // client certificate that chained to the anchor, but say so explicitly:
@@ -448,6 +488,7 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     printf("RECV %s\n", msg);
     fflush(stdout);
     if (wolfSSL_write(ssl, msg, n) != n) { fprintf(stderr, "write failed\n"); return 1; }
+    if (g_keyupdate && keyupdate_round(ssl)) return 1;
 
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
@@ -604,6 +645,7 @@ static int run_client(int port) {
     msg[n] = '\0';
     printf("ECHO %s\n", msg);
     fflush(stdout);
+    if (g_keyupdate == 2 && client_keyupdate_round(ssl)) return 1;
 
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
@@ -872,6 +914,8 @@ int main(int argc, char **argv) {
                 "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
                 "server-cert-mutual|client|client-cert|client-cert-mlkem|"
                 "server-alpn|client-alpn|server-ku-ours|server-ku-theirs|"
+                "client-ku-theirs|server-cert-alpn|server-cert-ku-ours|"
+                "server-cert-ku-theirs|"
                 "server-aes256|server-aes256-hrr|client-aes256|"
                 "12-{server,client}-{psk,ecdsa,ecdsa-aes256,ecdsa-chacha,"
                 "ecdsa-p256,ecdsa-mutual,rsa} <port> [mtu] | version\n",
@@ -944,6 +988,18 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-ku-theirs") == 0) {
         g_keyupdate = 2;
         rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "client-ku-theirs") == 0) {
+        g_keyupdate = 2;
+        rc = run_client(port);
+    } else if (strcmp(argv[1], "server-cert-alpn") == 0) {
+        g_alpn = "coap";
+        rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-cert-ku-ours") == 0) {
+        g_keyupdate = 1;
+        rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-cert-ku-theirs") == 0) {
+        g_keyupdate = 2;
+        rc = run_cert_server(port, cert);
     } else if (strcmp(argv[1], "client-cert") == 0) {
         rc = run_cert_client(port, WOLFSSL_ECC_X25519);
     } else if (strcmp(argv[1], "client-cert-mlkem") == 0) {

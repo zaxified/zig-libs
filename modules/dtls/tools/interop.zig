@@ -403,6 +403,50 @@ const cases = [_]Case{
         .app_expect = "hello from wolfssl cert client",
         .why = "wolfSSL offers the 1216-byte hybrid share and OUR server must encapsulate to it — the server half of the PQ hybrid, checked by foreign code",
     },
+    .{
+        .name = "psk-server-keyupdate-theirs",
+        .flow = .server,
+        .peer_mode = "client-ku-theirs",
+        .seed = 0x5b,
+        .key_update = .theirs,
+        .app_expect = "hello from wolfssl client",
+        .why = "a wolfSSL CLIENT's KeyUpdate against OUR server: recv reports ReceivedKeyUpdate, our ACK (and our answering update) goes out, the message under its new keys decrypts and our echo is what it reads back",
+    },
+    .{
+        .name = "cert-client-alpn",
+        .flow = .client,
+        .peer_mode = "server-cert-alpn",
+        .seed = 0x3d,
+        .cert_mode = true,
+        .alpn = &.{ "h3", "coap" },
+        .expect_alpn = "coap",
+        .expect_peer_alpn = "coap",
+        .app_send = "hello from zig-libs, certificate mode",
+        .app_expect = "hello from zig-libs, certificate mode",
+        .why = "ALPN in certificate mode: the name rides in the EncryptedExtensions of a certificate flight (X25519 + ECDSA P-256), and both sides name coap",
+    },
+    .{
+        .name = "cert-client-keyupdate-ours",
+        .flow = .client,
+        .peer_mode = "server-cert-ku-ours",
+        .seed = 0x3d,
+        .cert_mode = true,
+        .key_update = .ours,
+        .app_send = "hello from zig-libs, certificate mode",
+        .app_expect = "hello from zig-libs, certificate mode",
+        .why = "OUR KeyUpdate after a certificate handshake (traffic secrets from the (EC)DHE schedule, not a PSK): wolfSSL ACKs, answers with its own, and the data after it moves under epoch-4 keys both ways",
+    },
+    .{
+        .name = "cert-client-keyupdate-theirs",
+        .flow = .client,
+        .peer_mode = "server-cert-ku-theirs",
+        .seed = 0x3d,
+        .cert_mode = true,
+        .key_update = .theirs,
+        .app_send = "hello from zig-libs, certificate mode",
+        .app_expect = "hello from zig-libs, certificate mode",
+        .why = "wolfSSL's KeyUpdate after a certificate handshake reaches OUR client engine and its message under the new keys decrypts",
+    },
 };
 
 // ── the recorder ──────────────────────────────────────────────────────────
@@ -1180,6 +1224,35 @@ fn keyUpdateTheirs(io: std.Io, sock: net.Socket, peer: *const net.IpAddress, con
     try expectBytes("echo after wolfSSL's KeyUpdate", msg, echoed);
 }
 
+/// A wolfSSL CLIENT's KeyUpdate against our server: as `keyUpdateTheirs`, then
+/// the message it sent under its new keys is echoed back, and the peer exits
+/// 0 only if the echo is that message.
+fn keyUpdateTheirsServer(io: std.Io, sock: net.Socket, peer: *const net.IpAddress, conn: *Connection, out: []u8, rx: []u8, plain: []u8, rec: *Recorder) !void {
+    const epoch0 = conn.read_epoch;
+    var now: u64 = 1000;
+    var emitted: usize = 0;
+    const fl: Flusher = .{ .peer = peer, .out = out, .now = &now, .emitted = &emitted };
+    const got = try recvApplicationData(io, sock, conn, rx, plain, rec, fl);
+    try expectBytes("message under wolfSSL's updated keys", "wolfssl after its keyupdate", got);
+    // Copied out: `recvControl` below decrypts into the same buffer.
+    var note_buf: [64]u8 = undefined;
+    @memcpy(note_buf[0..got.len], got);
+    const note = note_buf[0..got.len];
+    if (emitted == 0) return error.NoKeyUpdateWasReceived;
+    if (conn.read_epoch != epoch0 + 1) return error.PeerKeyUpdateNotApplied;
+    var datagrams: usize = 0;
+    while (emitted >= 2 and conn.write_epoch == epoch0 and datagrams < 8) : (datagrams += 1) {
+        try recvControl(io, sock, conn, rx, plain, rec, fl);
+    }
+    recordEpochs(rec, conn);
+    const record = try conn.send(note_buf[0..note.len], out);
+    rec.op("send");
+    rec.hexArg("in", note_buf[0..note.len]);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, peer, record);
+}
+
 /// The application-data read both directions share. A real peer puts other
 /// things on the application epoch first: wolfSSL ACKs our Finished (RFC 9147
 /// §7) and sends a NewSessionTicket. Neither is application data and neither is
@@ -1358,16 +1431,24 @@ fn runServerFlow(
     rec.hexArg("out", echo);
     rec.end();
     try sock.send(io, &peer_addr, echo);
+    switch (case.key_update) {
+        .none => {},
+        .theirs => try keyUpdateTheirsServer(io, sock, &peer_addr, &conn.?, &out, &rx, &plain, rec),
+        .ours => return error.UnsupportedCase,
+    }
 
     // The peer exits 0 only after `wolfSSL_get_verify_result` returned
     // X509_V_OK (certificate modes) and the echo came back — so a non-zero
     // status here means the chain we presented was not accepted, not merely
     // that the socket closed. The peer's exit status is the peer's verdict;
     // it is recorded as a note because the replay has no peer to ask.
+    var err_buf: [4096]u8 = undefined;
+    var err_reader = child.stderr.?.reader(io, &err_buf);
+    const peer_says = err_reader.interface.allocRemaining(gpa, .limited(4096)) catch "";
     const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) {
-            std.debug.print("  peer exited {d}, not 0\n", .{code});
+            std.debug.print("  peer exited {d}, not 0; it said: {s}\n", .{ code, peer_says });
             return error.PeerRejectedUs;
         },
         else => return error.PeerDiedAbnormally,
