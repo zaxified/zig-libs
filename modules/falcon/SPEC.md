@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cloudflare/circl](https://github.com/cloudflare/circl) | Go | BSD-3-Clause (its `LICENSE`, "Copyright (c) 2019 Cloudflare"); API: NOASSERTION | 1.7k | v1.6.5 (2026-08-05) | Has ML-DSA and SLH-DSA under `sign/`; no Falcon directory in `sign/` (listing checked 2026-09-30). |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | ML-DSA and ML-KEM only; no Falcon. |
 
-**Where we are ahead:** the only Falcon in pure Zig, with no C and no libc; nothing else Zig-side has one. Signing and keygen are byte-exact against the NIST Round-3 KAT files at both degrees, and the whole FP path is integer emulation with a machine-checked "no hardware FP instruction" gate (`check-fp-freedom.sh`). **Where we are behind:** the padded signature format (liboqs ships it), expanded signing keys, no fast native-FP path (by design, ~5× slower signing), no SIMD; no FIPS 206 rebase (no draft exists yet, per the authors' own README) (→ Backlog items). ctgrind still reports leaks in `fpr` and the sampler (see Threat model) — that is the anchor/audit story, not a scope one.
+**Where we are ahead:** the only Falcon in pure Zig, with no C and no libc; nothing else Zig-side has one. Signing and keygen are byte-exact against the NIST Round-3 KAT files at both degrees, and the whole FP path is integer emulation with a machine-checked "no hardware FP instruction" gate (`check-fp-freedom.sh`). **Where we are behind:** expanded signing keys, no fast native-FP path (by design, ~5× slower signing), no SIMD; no FIPS 206 rebase (no draft exists yet, per the authors' own README) (→ Backlog items). ctgrind still reports leaks in `fpr` and the sampler (see Threat model) — that is the anchor/audit story, not a scope one.
 
 ## Design
 
@@ -244,6 +244,22 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   KAT-pins NTRUSolve in isolation: solving from the vectors' own (f, g)
   reproduces the sk's F byte-exactly at both degrees.
 
+## Padded signature format
+
+`signPadded` / `signPadded1024` and `PublicKey.verifyPadded` implement the
+reference's `FALCON_SIG_PADDED`, which liboqs and PQClean ship as
+`Falcon-padded-512/-1024` (PQClean `falcon-padded-512/clean/pqclean.c`, MIT, read
+as the format reference): `0x30 + logn || nonce (40) || compressed s2 || zero
+bytes`, exactly 666 / 1280 bytes. Signing is `signRandomized` into the fixed body
+(a draw whose compressed s2 does not fit is re-drawn, as the reference loops);
+verification decodes the compressed s2 from the front of the body
+(`Codec.compDecodePrefix`) and requires every byte after it to be zero, as
+PQClean's `do_verify`. Tests (`padded_test.zig`): a KAT-path compressed signature
+repacked into the padded layout verifies and `signPadded`'s body unpacks to a
+compressed signature that verifies (both degrees); a wrong header, a nonzero pad
+byte and another message are refused. No byte-exact padded vector: liboqs
+publishes only hashes of its padded KAT responses.
+
 ## What is deliberately not done
 
 - **No deterministic signing mode.** Falcon specifies none (no anchor for a
@@ -273,19 +289,15 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
 
 ## Backlog / deferred
 
-- **Padded signature format, Falcon-padded-512/-1024.** liboqs exposes them
-  beside the compressed format; a protocol that needs a fixed-size signature
-  (fixed-width fields, constant-length records) cannot use the compressed one.
-  Small: a different header byte and zero-padding to 666 / 1280 bytes plus the
-  strict decode rule, checkable against the reference's padded vectors. Fits
-  CONVENTIONS §2 (pure Zig).
 - **Rebase onto FN-DSA (FIPS 206) once a draft is published.** The main way
   this module goes stale: expect a header-byte / domain-separation / pre-hash
-  revision, not an NTT/math revision. Moderate, pure Zig.
+  revision, not an NTT/math revision. Moderate, pure Zig. Bounced (wait): no
+  Initial Public Draft as of 2026-11-21.
 - **Expanded (precomputed-tree) signing key.** The reference offers it for
   repeated signing under one key; here every signature rebuilds the Gram matrix
   and LDL tree, and the integer-emulated FP is already about 5x slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
+  Bounced (quiet phase): a performance item, to be measured A/B on a quiet host.
 - **Dead-stack probe below the top NTRUSolve level.** The probe sees the entry
   points and the top-level RNS limbs of f and g; the intermediate big-integer
   limbs of the F/G recursion levels (depth > 0) have no independent model short

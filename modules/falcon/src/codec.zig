@@ -144,6 +144,14 @@ pub fn Codec(comptime Ring: type) type {
         /// exactly `in.len` bytes (the reference enforces the same via its
         /// length check).
         pub fn compDecode(out: *[Ring.n]i16, in: []const u8) error{InvalidEncoding}!void {
+            if (try compDecodePrefix(out, in) != in.len) return error.InvalidEncoding;
+        }
+
+        /// `compDecode` without the exact-length rule: decodes a canonical
+        /// compressed s2 from the front of `in` and returns the number of
+        /// bytes it used (the reference `comp_decode`'s return value). The
+        /// padded format checks the rest itself.
+        pub fn compDecodePrefix(out: *[Ring.n]i16, in: []const u8) error{InvalidEncoding}!usize {
             var acc: u32 = 0;
             var acc_len: u5 = 0;
             var v: usize = 0;
@@ -171,10 +179,9 @@ pub fn Codec(comptime Ring: type) type {
                 if (s and m == 0) return error.InvalidEncoding; // "-0" forbidden
                 coef.* = if (s) -@as(i16, @intCast(m)) else @intCast(m);
             }
-            // Unused bits in the last byte must be zero, and the signature
-            // field must be exactly consumed (no trailing bytes).
+            // Unused bits in the last byte must be zero.
             if ((acc & ((@as(u32, 1) << acc_len) - 1)) != 0) return error.InvalidEncoding;
-            if (v != in.len) return error.InvalidEncoding;
+            return v;
         }
 
         /// Compress a signature value s2 (inverse of `compDecode`;

@@ -117,6 +117,15 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
         /// 0x20 + logn.
         pub const sig_header: u8 = 0x20 + @as(u8, logn_);
 
+        /// Header byte of a padded signature (`0x30 + logn`, the reference's
+        /// `FALCON_SIG_PADDED` and liboqs/PQClean's `Falcon-padded-*`).
+        pub const padded_sig_header: u8 = 0x30 + @as(u8, logn_);
+
+        /// Length of a padded signature: header, nonce and the compressed
+        /// s2 zero-padded to a fixed size (666 at n = 512, 1280 at
+        /// n = 1024; the reference's `FALCON_SIG_PADDED_SIZE`).
+        pub const padded_sig_length: usize = if (logn_ == 9) 666 else 1280;
+
         /// floor(beta^2) — inclusive bound on |(s1, s2)|^2 at this degree.
         pub const sig_bound: u64 = sig_bound_;
 
@@ -163,7 +172,25 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
                 if (sig_field.len < 2 or sig_field[0] != Self.sig_header) return error.InvalidSignature;
                 var s2: [n]i16 = undefined;
                 Codec.compDecode(&s2, sig_field[1..]) catch return error.InvalidSignature;
+                return verifyS2(pk, msg, nonce, &s2);
+            }
 
+            /// Verify a padded signature (`padded_sig_header || nonce ||
+            /// compressed s2 || zero bytes`, exactly `padded_sig_length`
+            /// bytes) over `msg`: the reference's `FALCON_SIG_PADDED`,
+            /// liboqs/PQClean `Falcon-padded-512/-1024`'s detached
+            /// signature. As PQClean's `do_verify`, the compressed value
+            /// must be canonical and every byte after it zero.
+            pub fn verifyPadded(pk: *const @This(), msg: []const u8, sig: *const [Self.padded_sig_length]u8) VerifyError!void {
+                if (sig[0] != Self.padded_sig_header) return error.InvalidSignature;
+                const body = sig[1 + nonce_length ..];
+                var s2: [n]i16 = undefined;
+                const used = Codec.compDecodePrefix(&s2, body) catch return error.InvalidSignature;
+                for (body[used..]) |b| if (b != 0) return error.InvalidSignature;
+                return verifyS2(pk, msg, sig[1..][0..nonce_length], &s2);
+            }
+
+            fn verifyS2(pk: *const @This(), msg: []const u8, nonce: *const [nonce_length]u8, s2: *const [n]i16) VerifyError!void {
                 var c: Ring.Poly = undefined;
                 Codec.hashToPoint(nonce, msg, &c);
 
@@ -292,6 +319,28 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
             return Self.Signer.signWithRng(&sk.tree, msg, rng, nonce_out, sig_out, Self.sig_bound);
         }
 
+        /// `signRandomized` in the padded format (`verifyPadded`'s
+        /// layout): the compressed s2 must fit `padded_sig_length - 41`
+        /// bytes — a draw that does not is re-drawn, as the reference
+        /// does — and the rest is zero. The signing itself is
+        /// `signRandomized`'s (burned, retry-bounded).
+        pub fn signPadded(
+            sk: *const Self.SigningKey,
+            msg: []const u8,
+            rng: std.Random,
+            out: *[Self.padded_sig_length]u8,
+        ) Self.Signer.SignError!void {
+            // The compressed signer writes its own header byte first; it
+            // lands in the last nonce byte's slot and the nonce copy below
+            // overwrites it.
+            var nonce: [nonce_length]u8 = undefined;
+            const body = out[nonce_length..];
+            const len = try Self.Signer.signWithRng(&sk.tree, msg, rng, &nonce, body, Self.sig_bound);
+            @memset(body[len..], 0);
+            out[1..][0..nonce_length].* = nonce;
+            out[0] = Self.padded_sig_header;
+        }
+
         // Deliberately ABSENT: a seeded "deterministic" signing mode.
         //
         // This module used to expose `signDeterministic(sk, msg, seed)`,
@@ -369,6 +418,10 @@ pub const SigningKey = P512.SigningKey;
 pub const KeygenError = P512.KeygenError;
 pub const generateKeyPair = P512.generateKeyPair;
 pub const signRandomized = P512.signRandomized;
+/// Padded signature format, Falcon-512 (666 bytes, header 0x39).
+pub const padded_sig_header: u8 = P512.padded_sig_header;
+pub const padded_sig_length: usize = P512.padded_sig_length;
+pub const signPadded = P512.signPadded;
 
 // ---- Falcon-1024: same shape, `_1024`-suffixed. ----
 
@@ -393,6 +446,10 @@ pub const SigningKey1024 = P1024.SigningKey;
 pub const KeygenError1024 = P1024.KeygenError;
 pub const generateKeyPair1024 = P1024.generateKeyPair;
 pub const signRandomized1024 = P1024.signRandomized;
+/// Padded signature format, Falcon-1024 (1280 bytes, header 0x3a).
+pub const padded_sig_header_1024: u8 = P1024.padded_sig_header;
+pub const padded_sig_length_1024: usize = P1024.padded_sig_length;
+pub const signPadded1024 = P1024.signPadded;
 
 test "no seeded signing mode in the public surface (salt-reuse guard)" {
     // Guard for the decision documented at `signRandomized`: the removed
@@ -436,6 +493,7 @@ test {
     _ = @import("fpr.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("padded_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("keygen_sign_test.zig");
     _ = @import("kat_sign_test.zig");

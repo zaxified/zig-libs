@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **New:** the padded signature format (liboqs/PQClean `Falcon-padded-512/-1024`, the reference's `FALCON_SIG_PADDED`): `signPadded` / `signPadded1024`, `PublicKey.verifyPadded`, `padded_sig_header`/`padded_sig_length` (and `_1024`); `Codec.compDecodePrefix` (the compressed decode without the exact-length rule, which `compDecode` keeps). Additive.
 - **2026-11-17** — tests: whole-module mutation of falcon (1393 mutants, 1252 killed, 141 argued; SPEC "Audit 2026-11-17"). New `src/boundary_test.zig` plus unit tests in `gaussian.zig` and `ntru.zig` (exact-bound norm in verify and sign, hash-to-point model, codec edges, `fpr` against the hardware, general-input LDL, NTRU equation of generated keys, `zint*` primitives, `solveNtru` limit). No change in `src/` outside tests; no behaviour change.
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `ntru` shift `scl` is a direct `@intCast(@rem(scale_k, 31))` again; the detour through u32 was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** `ntru` key-generation shift `scl: u5 = @intCast(@rem(scale_k, 31))` (i32 source) lowered to `trunc nsw` under zig 0.17.0, poison for 16..30; now narrowed through same-width u32. Same keys as before (KATs unchanged).

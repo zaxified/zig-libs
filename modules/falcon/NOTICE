@@ -49,3 +49,8 @@ The only intentional divergence from the reference source is the PRIMES table
 other ported routines follow the reference's structure and arithmetic exactly.
 The module's verification path and wire codecs are separately clean-room from
 the Falcon specification — see the repository NOTICE (design references).
+
+The padded signature format (2026-11-21, `signPadded`/`verifyPadded`) follows
+the layout and decode rule of PQClean's `crypto_sign/falcon-padded-512/clean/
+pqclean.c` (https://github.com/PQClean/PQClean, MIT, the Falcon Project's
+code), read as the format reference; no code was copied.

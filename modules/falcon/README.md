@@ -46,10 +46,12 @@ module doc).
 
 ## Not provided
 
-The padded (fixed-size) signature format, expanded signing keys, a native-FP
-fast path and a deterministic signing mode: see SPEC.md *What is deliberately
-not done* and *Backlog / deferred*. Only the compressed signature format the
-KATs use is implemented.
+Expanded signing keys, a native-FP fast path and a deterministic signing mode:
+see SPEC.md *What is deliberately not done* and *Backlog / deferred*. Signatures
+come in the compressed format the KATs use and in the padded (fixed-size) format
+of liboqs/PQClean `Falcon-padded-512/-1024`: `signPadded` / `signPadded1024`
+write `padded_sig_length` (666) / `padded_sig_length_1024` (1280) bytes,
+`PublicKey.verifyPadded(msg, &sig)` checks them.
 
 The KAT oracle is the official **NIST Round-3** `falcon512-KAT.rsp` and
 `falcon1024-KAT.rsp` (FIPS 206 / FN-DSA is still a draft standard; Round-3
