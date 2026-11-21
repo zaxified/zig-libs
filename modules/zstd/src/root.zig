@@ -168,6 +168,11 @@ pub const Error = frame.Error || error{
     LevelUnsupported,
 };
 
+/// `-Dzstd-all-strategies` (SPEC, *Build options*): false when this build
+/// compresses only with `fast` and `dfast`, so that a level resolving to
+/// another strategy is `error.LevelUnsupported`.
+pub const all_strategies = params.all_strategies;
+
 pub const max_level = params.max_level;
 pub const min_level = params.min_level;
 pub const default_level = params.default_level;
@@ -736,6 +741,7 @@ test {
     _ = @import("sweep_dec_test.zig");
     _ = @import("seekable_test.zig");
     _ = @import("decoder_test.zig");
+    _ = @import("inplace_test.zig");
     _ = @import("dmut_test.zig");
     _ = @import("dopen_test.zig");
     _ = @import("dopen2_test.zig");
@@ -781,6 +787,7 @@ test "empty input is the 9-byte frame libzstd emits" {
 }
 
 test "round trip through std's decoder and this one at every implemented level" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var src: [40000]u8 = undefined;
     var prng: std.Random.DefaultPrng = .init(0x5eed);
@@ -810,6 +817,22 @@ test "round trip through std's decoder and this one at every implemented level" 
 test "levels above 22 are refused, not clamped" {
     var buf: [64]u8 = undefined;
     try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 23 }));
+}
+
+test "a level whose strategy this build leaves out is refused, the others compress (zstd-all-strategies)" {
+    // levels 1 and 3 resolve to fast and dfast, level 19 to btultra2, at any size
+    var buf: [256]u8 = undefined;
+    const src = "refusal refusal refusal refusal refusal refusal";
+    for ([_]i32{ 1, 3, 19 }) |level| {
+        const want_ok = params.all_strategies or level < 5;
+        if (want_ok) {
+            const n = try compress(std.testing.allocator, &buf, src, .{ .level = level });
+            var back: [src.len]u8 = undefined;
+            try std.testing.expectEqual(src.len, try decompress(std.testing.allocator, &back, buf[0..n]));
+        } else {
+            try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, src, .{ .level = level }));
+        }
+    }
 }
 
 test "a skippable frame is written as libzstd writes it and read back" {

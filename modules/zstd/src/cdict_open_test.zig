@@ -152,6 +152,7 @@ fn greedyCDictLen(zeros: usize) !usize {
 }
 
 test "w10zb2 a greedy CDict loads a dictionary of over 16 MiB whole (the short-cache limit is for fast and dfast)" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     try std.testing.expect(try greedyCDictLen(8 << 20) < 1024);
     try std.testing.expect(try greedyCDictLen((16 << 20) + 4096) < 1024);
 }

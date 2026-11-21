@@ -41,6 +41,7 @@ const advanced = [_]zstd.Advanced{
 };
 
 test "a compressor allocates exactly its estimate, and no size needs more than the estimate for any" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try input(gpa, "csv-600000");
     defer gpa.free(src);
@@ -71,6 +72,7 @@ test "a compressor allocates exactly its estimate, and no size needs more than t
 }
 
 test "a stream allocates exactly its estimate; without a size, no frame needs more" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try input(gpa, "csv-600000");
     defer gpa.free(src);
@@ -121,6 +123,7 @@ test "a stream allocates exactly its estimate; without a size, no frame needs mo
 }
 
 test "a static workspace of the estimate is enough, a byte less is not, and it is never replaced" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try input(gpa, "csv-200000-0");
     defer gpa.free(src);
@@ -159,6 +162,7 @@ test "a static workspace of the estimate is enough, a byte less is not, and it i
 }
 
 test "a workspace three times too big is replaced after 128 frames, as libzstd does" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try input(gpa, "csv-600000");
     defer gpa.free(src);
@@ -183,6 +187,7 @@ test "a workspace three times too big is replaced after 128 frames, as libzstd d
 }
 
 test "indexing restarts near the index limit, with the same bytes" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try input(gpa, "csv-600000");
     defer gpa.free(src);

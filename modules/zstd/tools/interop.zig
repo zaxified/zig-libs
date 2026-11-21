@@ -21,7 +21,7 @@
 //!                 on a random call schedule (continue/flush/end steps,
 //!                 output buffer size, pledged size): the same bytes.
 //!   - `decode`    libzstd's frames of the `compress` family through both
-//!                 decoders in zdec.c's three modes (one-shot into
+//!                 decoders in zdec.c's three modes and zoracle's in-place one (one-shot into
 //!                 `decompressBound`, streaming fed whole, streaming one byte
 //!                 per call): the same output.
 //!   - `damaged`   small frames of both encoders with bits flipped, bytes
@@ -578,6 +578,23 @@ fn oursDecode(gpa: std.mem.Allocator, mode: u8, magicless: bool, dict: DictUse, 
         };
         return .{ .ok = gpa.realloc(dst, n) catch dst[0..n] };
     }
+    if (mode == 3) {
+        // in place: bound + margin bytes, the frames at the end, decoded over themselves
+        std.debug.assert(prefix == null);
+        const bound = zstd.decompressBound(src) catch return .{ .err = error.SrcSizeWrong };
+        const margin = zstd.decompressionMargin(src) catch |e| return .{ .err = e };
+        if (bound > max_output) return .{ .err = error.OutOfMemory };
+        const total = @as(usize, @intCast(bound)) + margin;
+        if (src.len > total) return .{ .err = error.SrcSizeWrong };
+        var d = zstd.Decompressor.init(gpa, .{ .format = format, .dictionary = dict_bytes }) catch |e| return .{ .err = e };
+        defer d.deinit();
+        const buf = try gpa.alloc(u8, total);
+        defer gpa.free(buf);
+        const at = buf[total - src.len ..];
+        @memcpy(at, src);
+        const n = d.decompress(buf, at) catch |e| return .{ .err = e };
+        return .{ .ok = try gpa.dupe(u8, buf[0..n]) };
+    }
     var s = zstd.DecompressStream.init(gpa, .{ .window_log_max = 31, .format = format, .dictionary = dict_bytes, .prefix = prefix }) catch |e| return .{ .err = e };
     defer s.deinit();
     const ochunk: usize = if (mode == 1) 1 << 17 else 997;
@@ -721,8 +738,8 @@ fn familyCompress(ctx: *Ctx, n: usize, with_dicts: bool) !void {
 /// give `want` (or both refuse alike: a frame over the memory cap).
 fn decodeBoth(ctx: *Ctx, i: usize, frame: []const u8, magicless: bool, dict: DictUse, want: []const u8) !void {
     const gpa = ctx.gpa;
-    for ([_]u8{ 0, 1, 2 }) |mode| {
-        if (mode == 0 and (magicless or dict.mode == .prefix)) continue; // zdec mode 0: zstd1 frames, no prefix
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        if ((mode == 0 or mode == 3) and (magicless or dict.mode == .prefix)) continue; // zdec mode 0: zstd1 frames, no prefix
         if (mode == 2 and frame.len > 64 << 10) continue; // one byte per call: keep it to small frames
         const theirs = try ctx.peer.decode(mode, magicless, dict, frame);
         defer freeReply(gpa, theirs);
@@ -813,8 +830,8 @@ fn familyDamaged(ctx: *Ctx, n: usize) !void {
                 },
             }
         }
-        for ([_]u8{ 0, 1, 2 }) |mode| {
-            if (mode == 0 and (base.magicless or base.dict.mode == .prefix)) continue;
+        for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+            if ((mode == 0 or mode == 3) and (base.magicless or base.dict.mode == .prefix)) continue;
             const theirs = try ctx.peer.decode(mode, base.magicless, base.dict, buf.items);
             defer freeReply(gpa, theirs);
             const ours = try oursDecode(gpa, mode, base.magicless, base.dict, buf.items);

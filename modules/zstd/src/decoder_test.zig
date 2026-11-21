@@ -73,6 +73,7 @@ test "skippable frames are skipped, read, and recognised" {
 }
 
 test "concatenated frames decode to the concatenation; size queries agree" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const a = try zstd.compressAlloc(gpa, strRepeat("first frame ", 50), .{ .level = 3 });
     defer gpa.free(a);
     const b = try zstd.compressAlloc(gpa, strRepeat("second one, checksummed ", 70), .{ .level = 19, .checksum = true });
@@ -180,6 +181,7 @@ test "frame header errors" {
 }
 
 test "every truncation of a frame is refused" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const z = try zstd.compressAlloc(gpa, strRepeat("truncate me somewhere, anywhere at all ", 30), .{ .level = 5, .checksum = true });
     defer gpa.free(z);
     var out: [2048]u8 = undefined;
@@ -227,6 +229,7 @@ test "a raw block larger than the block maximum: one-shot takes it, the piecewis
 }
 
 test "a context is reusable across frames and after errors" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var d = try zstd.Decompressor.init(gpa, .{});
     defer d.deinit();
     var out: [4096]u8 = undefined;
@@ -521,6 +524,7 @@ fn decodeWith(mode: dblock.PrefetchMode, src: []const u8) Outcome {
 }
 
 test "the prefetching sequence loop decodes as the plain one, valid and damaged frames" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // No corpus input is large enough for the decoder to pick the
     // prefetching loop by itself (offsets of 4 MB and up), so both loops are
     // forced, and must agree on every frame and every damaged copy: the
@@ -571,6 +575,7 @@ fn decodeAsm(on: bool, src: []const u8) Outcome {
 }
 
 test "the assembly Huffman loops decode as the Zig ones, valid and damaged frames" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     if (!huf_dec.asm_supported) return error.SkipZigTest;
     defer huf_dec.setAsmForTest(true);
     var prng: std.Random.DefaultPrng = .init(0x5eed_4a53);
@@ -620,6 +625,7 @@ fn decodeFastSeq(on: bool, src: []const u8) Outcome {
 }
 
 test "the assembly sequence loop decodes as the Zig one, valid and damaged frames" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     if (!dblock.fast_seq_supported) return error.SkipZigTest;
     defer dblock.setFastSeqForTest(true);
     var prng: std.Random.DefaultPrng = .init(0x5eed_2035);

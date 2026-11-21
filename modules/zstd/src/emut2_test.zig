@@ -168,6 +168,7 @@ test "ZSTD_storeSeq marks a length long only above 0xFFFF (literals) or 0xFFFF +
 }
 
 test "a literal run of 0xFFFF and a match of 0xFFFF + 3 stay short lengths" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // libzstd's ZSTD_storeSeq marks a length as long only above 0xFFFF
     // (literals) or above 0xFFFF + MINMATCH (matches); the run and the
     // match are swept around the edge so that the match finders land on it.
@@ -230,6 +231,7 @@ fn stableRun(src: []const u8, level: i32, room: usize) ![]u8 {
 }
 
 test "superblocks into a stable output buffer: at every room near a sub-block's edges, refused or a valid frame" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // Sub-blocks (targetCBlockSize) write straight into the caller's buffer
     // here, so each room check of compressSuperBlock meets the room it
     // guards. libzstd writes past the end at some of these rooms (see
@@ -385,6 +387,7 @@ fn superblockInput(layout: []const u8) ![]u8 {
 }
 
 test "superblock goldens: blocks without a sequence, sub-blocks, raw tails, literal sampling and block splits are libzstd's" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // ZSTD_compressSuperBlock. With 1024-byte blocks the noise blocks have
     // no sequence: dummy sequence statistics (predefined tables, no repeat
     // of the old ones for the next block), one sub-block of literals and a

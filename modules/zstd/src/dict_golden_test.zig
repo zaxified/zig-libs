@@ -189,10 +189,12 @@ test "every finished-dictionary run has a row, and nothing else does" {
 }
 
 test "finished dictionaries are byte-identical to libzstd 1.5.7's" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     try finished(&.{1});
 }
 
 test "the optimizers give libzstd's single-threaded dictionaries with threads" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     try finished(&.{ 2, 3, 8 });
 }
 

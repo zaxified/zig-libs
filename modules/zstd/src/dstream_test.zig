@@ -61,6 +61,7 @@ fn corpusInput(name: []const u8) ![]u8 {
 }
 
 test "streamed decoding equals the input under every call pattern" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const plans = [_]Plan{
         .{ .in_max = 1, .out_max = 1 },
         .{ .in_max = 7, .out_max = 4096 },
@@ -85,6 +86,7 @@ test "streamed decoding equals the input under every call pattern" {
 }
 
 test "a window-sized ring: a stream without content size, window smaller than the input" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // window 1 KB so the ring wraps many times and matches cross it
     const src = try corpusInput("far-repeat");
     defer gpa.free(src);
@@ -107,6 +109,7 @@ test "a window-sized ring: a stream without content size, window smaller than th
 }
 
 test "concatenated and skippable frames stream one after another" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const a = try zstd.compressAlloc(gpa, strRepeat("first ", 300), .{});
     defer gpa.free(a);
     const b = try zstd.compressAlloc(gpa, strRepeat("second ", 300), .{ .level = 9, .checksum = true });
@@ -213,6 +216,7 @@ test "a corrupt frame is refused by the stream as by the one-shot decoder" {
 }
 
 test "DecompressReader reads every frame of another reader" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const src = try corpusInput("csv-131073");
     defer gpa.free(src);
     const z = try zstd.compressAlloc(gpa, src, .{ .level = 7, .checksum = true });

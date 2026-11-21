@@ -16,7 +16,9 @@
  *                 + u32 input bytes, blob src          -> ZSTD_compressStream2
  *   'D' decode    u8 mode (0 one-shot into ZSTD_decompressBound bytes,
  *                 1 streaming fed whole, 2 streaming fed one byte per call
- *                 into 997-byte output buffers), u8 magicless, u8 dict mode
+ *                 into 997-byte output buffers, 3 in place: one-shot over a
+ *                 bound + ZSTD_decompressionMargin buffer holding the frames
+ *                 at its end), u8 magicless, u8 dict mode
  *                 (0 none, 1 ZSTD_DCtx_loadDictionary, 2 ZSTD_DCtx_refPrefix),
  *                 blob dict, blob src
  *   'T' train     u32 capacity, u32 n, n × u32 sizes, blob samples
@@ -269,7 +271,7 @@ static void opDecode(void)
     Blob dict = rdblob();
     Blob src = rdblob();
     size_t r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_format, magicless ? ZSTD_f_zstd1_magicless : ZSTD_f_zstd1);
-    if (!ZSTD_isError(r) && mode != 0) r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
+    if (!ZSTD_isError(r) && mode != 0 && mode != 3) r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
     if (!ZSTD_isError(r) && dmode == 1) r = ZSTD_DCtx_loadDictionary(dctx, dict.p, dict.n);
     if (!ZSTD_isError(r) && dmode == 2) r = ZSTD_DCtx_refPrefix(dctx, dict.p, dict.n);
     if (ZSTD_isError(r)) {
@@ -293,6 +295,37 @@ static void opDecode(void)
             r = ZSTD_decompressDCtx(dctx, dst, (size_t)bound, src.p, src.n);
             if (ZSTD_isError(r)) replyErr(r); else replyOk(dst, r);
             free(dst);
+        }
+    } else if (mode == 3) {
+        /* in place: a buffer of bound + ZSTD_decompressionMargin bytes with the
+         * frames at its end, decoded by ZSTD_decompressDCtx over itself */
+        unsigned long long const bound = ZSTD_decompressBound(src.p, src.n);
+        size_t const margin = ZSTD_decompressionMargin(src.p, src.n);
+        if (bound == ZSTD_CONTENTSIZE_ERROR) {
+            uint8_t one = 1;
+            wr(&one, 1);
+            wr32(ZSTD_error_srcSize_wrong);
+            fflush(stdout);
+        } else if (ZSTD_isError(margin)) {
+            replyErr(margin);
+        } else if (bound > (1u << 30)) {
+            uint8_t one = 1;
+            wr(&one, 1);
+            wr32(ZSTD_error_memory_allocation);
+            fflush(stdout);
+        } else if (src.n > (size_t)bound + margin) {
+            uint8_t one = 1;
+            wr(&one, 1);
+            wr32(ZSTD_error_srcSize_wrong);
+            fflush(stdout);
+        } else {
+            size_t const total = (size_t)bound + margin;
+            uint8_t* buf = malloc(total + 1);
+            if (!buf) die("out of memory");
+            memcpy(buf + total - src.n, src.p, src.n);
+            r = ZSTD_decompressDCtx(dctx, buf, total, buf + total - src.n, src.n);
+            if (ZSTD_isError(r)) replyErr(r); else replyOk(buf, r);
+            free(buf);
         }
     } else {
         size_t const ochunk = mode == 1 ? (size_t)1 << 17 : 997;

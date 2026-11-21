@@ -279,6 +279,7 @@ test "every sequence case has a golden row, and nothing else does" {
 }
 
 test "the sequence-level API is byte-identical to libzstd 1.5.7, errors included" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var comp: zstd.Compressor = .init(gpa);
     defer comp.deinit();
@@ -354,6 +355,7 @@ test "the sequence-level API is byte-identical to libzstd 1.5.7, errors included
 }
 
 test "compressing generated sequences round-trips, with and without delimiters" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const case = findCase("mix-300000-9");
     const src = try gpa.alloc(u8, case.len);

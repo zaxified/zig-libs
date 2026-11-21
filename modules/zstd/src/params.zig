@@ -9,6 +9,22 @@
 //! the table sizes decide which matches are found.
 
 const std = @import("std");
+const zl_options = @import("zl_options");
+
+/// `-Dzstd-all-strategies` (CONVENTIONS 4.2, SPEC § Build options): false
+/// compiles only the `fast` and `dfast` strategies, as libzstd's
+/// `ZSTD_EXCLUDE_*_BLOCK_COMPRESSOR` macros do for the rest; a level whose
+/// resolved strategy is `greedy` or above is then `error.LevelUnsupported`.
+/// Default true; `-Dprofile=small` false.
+pub const all_strategies: bool = zl_options.zstd_all_strategies orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+
+/// Whether this build compresses with `s` (see `all_strategies`).
+pub fn strategySupported(s: Strategy) bool {
+    return all_strategies or @backingInt(s) <= @backingInt(Strategy.dfast);
+}
 
 /// `ZSTD_strategy`, numbered as in libzstd: several decisions compare it
 /// numerically (`strategy >= ZSTD_lazy`, `9 - strategy`, table indices).

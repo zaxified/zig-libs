@@ -164,6 +164,7 @@ test "every streaming case has a golden row, and nothing else does" {
 }
 
 test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
     var dec_zstd1 = try zstd.Decompressor.init(gpa, .{});
@@ -279,6 +280,7 @@ fn feedFrame(gpa: std.mem.Allocator, s: *stream.Stream, src: []const u8, out: *s
 }
 
 test "after its end a stream goes on with a new frame of unknown size, as libzstd" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // libzstd resets the session at the end of a frame
     // (`ZSTD_CCtx_reset(ZSTD_reset_session_only)`): the pledged size is
     // forgotten, the options stay, and the context is reused.
@@ -323,6 +325,7 @@ test "after its end a stream goes on with a new frame of unknown size, as libzst
 }
 
 test "reset abandons a frame and starts over with new options" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const case = findCase("csv-131073");
     const src = try gpa.alloc(u8, case.len);
@@ -500,6 +503,7 @@ test "stable buffers leave the stream's own out of the workspace, as estimated" 
 }
 
 test "stable output: one byte less than the least room libzstd succeeds in is refused, as by libzstd" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // the golden rows at that least room (`stableOutBuffer=1,o<min>,...`
     // in `corpus.stream_cases`) pin the bytes; here the room one byte short
     const gpa = std.testing.allocator;
@@ -543,6 +547,7 @@ test "stable output: one byte less than the least room libzstd succeeds in is re
 }
 
 test "stable output: every room below the least libzstd succeeds in is refused (block splitter)" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // with the post-block splitter a block goes out as partitions, each
     // checked for its header's room where it lands; libzstd refuses each of
     // these 32 rooms (zstream)

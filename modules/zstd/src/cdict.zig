@@ -278,7 +278,7 @@ pub fn loadDictionaryContent(ms: *match.MatchState, ls: ?*ldm.State, content: []
     switch (cp.strategy) {
         .fast => match.fillHashTableFor(ms, iend, dtlm, tfp),
         .dfast => match.fillDoubleHashTableFor(ms, iend, dtlm, tfp),
-        .greedy, .lazy, .lazy2 => if (ms.dedicated_dict_search) {
+        .greedy, .lazy, .lazy2 => if (comptime !params.all_strategies) unreachable else if (ms.dedicated_dict_search) {
             std.debug.assert(ms.chain_table.len != 0);
             lazy.ddsLoadDictionary(ms, iend - match.hash_read_size);
         } else if (ms.use_row) {
@@ -288,7 +288,7 @@ pub fn loadDictionaryContent(ms: *match.MatchState, ls: ?*ldm.State, content: []
             lazy.insertDictionary(ms, iend - match.hash_read_size);
         },
         // we want the dictionary table fully sorted
-        .btlazy2, .btopt, .btultra, .btultra2 => opt.updateTreeDictionary(ms, iend - match.hash_read_size, iend),
+        .btlazy2, .btopt, .btultra, .btultra2 => if (comptime !params.all_strategies) unreachable else opt.updateTreeDictionary(ms, iend - match.hash_read_size, iend),
     }
     ms.next_to_update = iend;
 }
@@ -400,6 +400,7 @@ pub const CDict = struct {
         if (opts.level > params.max_level) return error.LevelUnsupported;
         try opts.advanced.check();
         const t = Tables.of(dict_size, opts);
+        if (!params.strategySupported(t.cp.strategy)) return error.LevelUnsupported;
         return (t.hash_len + t.chain_len) * @sizeOf(u32) + t.tag_len + if (copied) dict_size else 0;
     }
 
@@ -434,6 +435,7 @@ pub const CDict = struct {
         if (opts.level > params.max_level) return error.LevelUnsupported;
         try opts.advanced.check();
         const t = Tables.of(dict.len, opts);
+        if (!params.strategySupported(t.cp.strategy)) return error.LevelUnsupported;
         const cp = t.cp;
         const dds = t.dds;
         const use_row = t.use_row;
@@ -709,6 +711,7 @@ test "the dedicated dictionary search's support and parameters are libzstd's" {
 }
 
 test "estimateSize is what a CDict holds" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const dict = try gpa.alloc(u8, 120_000);
     defer gpa.free(dict);

@@ -289,6 +289,8 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
         },
     }) catch |e| return switch (e) {
         error.OutOfMemory => oom(n),
+        // a strategy this build leaves out (`params.all_strategies`)
+        error.LevelUnsupported => error.LevelUnsupported,
         else => unreachable, // raw content from in-range parameters
     };
     defer cdict.deinit();

@@ -67,6 +67,7 @@ fn compressCase(gpa: std.mem.Allocator, c: *zstd.Compressor, rc: corpus.RoomCase
 }
 
 test "the least room libzstd succeeds in gives its frame here, one byte less DstSizeTooSmall" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var c: zstd.Compressor = .init(gpa);
     defer c.deinit();

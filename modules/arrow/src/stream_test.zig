@@ -679,6 +679,10 @@ test "compression: zstd round trip of every column type, stream and file, one ba
     const plain = try stream.writeStream(gpa, big, .{});
     defer gpa.free(plain);
     for ([_]i32{ -5, 0, 1, 19 }) |level| {
+        if (level == 19 and !zstd.all_strategies) { // -Dzstd-all-strategies=false: level 19 is refused
+            try testing.expectError(error.Unsupported, stream.writeStream(gpa, big, .{ .compression = .zstd, .compression_level = level }));
+            continue;
+        }
         const z = try stream.writeStream(gpa, big, .{ .compression = .zstd, .compression_level = level });
         defer gpa.free(z);
         try testing.expect(z.len * 4 < plain.len);

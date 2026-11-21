@@ -97,6 +97,7 @@ fn begin(c: *zstd.Compressor, r: goldens.Row, src: []const u8, dict: []const u8,
 }
 
 test "buffer-less frames and their copies are libzstd's" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     for (goldens.rows, 0..) |r, i| {
         // New contexts, as zcopy's: a copy keeps the tag table its context
@@ -201,6 +202,7 @@ test "a pledged size is held to exactly" {
 }
 
 test "a copy is independent of its original, and without tags of what it held before" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // The copy owns its tables: the original compressing first, or the copy
     // having served another dictionary, changes nothing. Level 3 (`dfast`,
     // no row match finder, whose tags are not copied but kept) with a

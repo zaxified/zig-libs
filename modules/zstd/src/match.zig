@@ -749,7 +749,7 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             7 => dfastExtDictBlock(ms, ss, rep, istart, src_size, 7),
             else => dfastExtDictBlock(ms, ss, rep, istart, src_size, 4),
         },
-        .greedy, .lazy, .lazy2, .btlazy2 => return lazy.compressBlock(ms, ss, rep, istart, src_size),
+        .greedy, .lazy, .lazy2, .btlazy2 => if (comptime !params.all_strategies) unreachable else return lazy.compressBlock(ms, ss, rep, istart, src_size),
         // the optimal parsers pick their extDict variant themselves
         else => {},
     };
@@ -766,10 +766,12 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             7 => dfastBlock(ms, ss, rep, istart, src_size, 7),
             else => dfastBlock(ms, ss, rep, istart, src_size, 4),
         },
-        .greedy, .lazy, .lazy2, .btlazy2 => lazy.compressBlock(ms, ss, rep, istart, src_size),
-        .btopt => opt.compressBlock(ms, ss, rep, istart, src_size, 0),
-        .btultra => opt.compressBlock(ms, ss, rep, istart, src_size, 2),
-        .btultra2 => opt.compressBlockUltra2(ms, ss, rep, istart, src_size),
+        // unreachable when the build has only fast and dfast: `begin` refuses
+        // any other strategy (`params.all_strategies`)
+        .greedy, .lazy, .lazy2, .btlazy2 => if (comptime !params.all_strategies) unreachable else lazy.compressBlock(ms, ss, rep, istart, src_size),
+        .btopt => if (comptime !params.all_strategies) unreachable else opt.compressBlock(ms, ss, rep, istart, src_size, 0),
+        .btultra => if (comptime !params.all_strategies) unreachable else opt.compressBlock(ms, ss, rep, istart, src_size, 2),
+        .btultra2 => if (comptime !params.all_strategies) unreachable else opt.compressBlockUltra2(ms, ss, rep, istart, src_size),
     };
 }
 

@@ -378,8 +378,7 @@ pub fn findDecompressedSize(src_in: []const u8) Error!?u64 {
 
 /// `ZSTD_decompressionMargin`: how far the end of the compressed data must
 /// lie behind the end of the output for in-place decompression. Computed
-/// as libzstd does, for sizing only: this port's `decompress` does not
-/// decode in place (overlapping buffers are a checked panic).
+/// as libzstd does, to size an in-place `Decompressor.decompress`.
 pub fn decompressionMargin(src_in: []const u8) Error!usize {
     var src = src_in;
     var margin: usize = 0;
@@ -824,14 +823,22 @@ pub const Decompressor = struct {
             if (c_block_size > remaining) return error.SrcSizeWrong;
             const block = src[ip.*..][0..c_block_size];
             const cap = dst.len - op;
+            // `ZSTD_decompressFrame`'s `oBlockEnd`: with the input inside the
+            // output buffer (in place), a compressed block may write only up
+            // to the start of its own data, never over what it still reads.
+            const blk_addr = @intFromPtr(block.ptr);
+            const op_addr = @intFromPtr(dst.ptr) + op;
+            const block_cap = if (blk_addr >= op_addr and blk_addr - op_addr < cap) blk_addr - op_addr else cap;
             const decoded: usize = switch (bp.block_type) {
                 2 => blk: {
                     const v = d.history(dst[op..]);
-                    break :blk try dblock.decompressBlock(st, &v.h, v.op, cap, block, false);
+                    break :blk try dblock.decompressBlock(st, &v.h, v.op, block_cap, block, false);
                 },
                 0 => blk: {
                     if (c_block_size > cap) return error.DstSizeTooSmall;
-                    @memcpy(dst[op..][0..c_block_size], block);
+                    // `ZSTD_copyRawBlock` is a memmove: in place the data
+                    // moves down over itself
+                    @memmove(dst[op..][0..c_block_size], block);
                     break :blk c_block_size;
                 },
                 1 => blk: {
@@ -864,9 +871,15 @@ pub const Decompressor = struct {
 
     /// `ZSTD_decompressDCtx`: decodes every frame in `src` (concatenated
     /// frames and skippable frames allowed) into `dst`. Returns the number
-    /// of bytes written. `dst` and `src` must not overlap: this port does
-    /// not decode in place (libzstd's in-place mode is Backlog), so an
-    /// overlap is a checked panic rather than an aliased copy.
+    /// of bytes written. `src` may lie inside `dst` (in-place decoding, as
+    /// `ZSTD_decompress` allows: `src` ends at `dst`'s end, at least
+    /// `decompressionMargin(src)` bytes behind the end of the output, and
+    /// starts at or after `dst`'s start): a compressed block then writes
+    /// only up to its own data, and a frame that outruns the margin is an
+    /// error or damaged output (the checksum, when there is one, says
+    /// which), never a memory error. An overlap with `src` starting before
+    /// `dst` has no valid use (the output would pass over input not yet
+    /// read) and is a checked panic.
     ///
     /// With `Options.ddicts` set, libzstd's own one-shot
     /// `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx` resolves ONE
@@ -885,9 +898,9 @@ pub const Decompressor = struct {
     /// (mirroring "last ref'd"), else none, fixed for the whole call.
     pub fn decompress(d: *Decompressor, dst: []u8, src: []const u8) Error!usize {
         if (dst.len != 0 and src.len != 0 and
-            @intFromPtr(dst.ptr) < @intFromPtr(src.ptr) + src.len and
-            @intFromPtr(src.ptr) < @intFromPtr(dst.ptr) + dst.len)
-            @panic("zstd: decompress dst and src overlap (in-place decoding is not supported)");
+            @intFromPtr(src.ptr) < @intFromPtr(dst.ptr) and
+            @intFromPtr(dst.ptr) < @intFromPtr(src.ptr) + src.len)
+            @panic("zstd: decompress src starts before dst and overlaps it (only in-place layouts, src inside dst, decode)");
         try d.options.check();
         var ip: usize = 0;
         var op: usize = 0;

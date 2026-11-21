@@ -121,6 +121,7 @@ fn readBack(z: []const u8, src: []const u8, g: goldens.Golden) !void {
 }
 
 test "seekable streams are byte-identical to libzstd 1.5.7's ZSTD_seekable_CStream, and read back" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var mismatches: usize = 0;
     for (goldens.rows) |g| {
         const case = findCase(g.case);
@@ -155,6 +156,7 @@ test "seekable streams are byte-identical to libzstd 1.5.7's ZSTD_seekable_CStre
 }
 
 test "a reused stream gives a fresh one's bytes" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const case = findCase("words-16385");
     const src = try gpa.alloc(u8, case.len);
     defer gpa.free(src);
@@ -189,6 +191,7 @@ test "max_frame_size above 1 GiB is refused" {
 }
 
 test "a seek table for frames made elsewhere (FrameLog)" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // three ordinary frames, then a table written by hand into a 5-byte
     // buffer at a time
     const parts = comptime [_][]const u8{ strRepeat("alpha ", 50), strRepeat("beta ", 70), strRepeat("gamma ", 30) };

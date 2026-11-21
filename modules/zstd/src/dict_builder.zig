@@ -2259,6 +2259,7 @@ test "optimizer: every thread count keeps the single-threaded winner, ties inclu
 }
 
 test "parallel optimizers: memory_limit bounds the sum; the result does not change" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     if (comptime builtin.single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     const gpa = testing.allocator;
     const gen = try testSet("json-200");
@@ -2582,6 +2583,7 @@ test "LimitedAllocator: shrunk in place, the difference is live no more" {
 }
 
 test "the complete trainers hold their working memory under memory_limit" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const gen = try testSet("json-2000");
     defer gen.deinit(gpa);
@@ -2614,6 +2616,7 @@ test "the complete trainers hold their working memory under memory_limit" {
 }
 
 test "trainFromSlices copies the samples and trains as the contiguous trainers do" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const gen = try testSet("words-300");
     defer gen.deinit(gpa);

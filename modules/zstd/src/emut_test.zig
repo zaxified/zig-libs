@@ -86,6 +86,7 @@ fn fill(buf: []u8, kind: u8, seed: u64) void {
 }
 
 test "short room: DstSizeTooSmall below the frame, the same frame from the least room up, never a panic or a stray byte" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var c: zstd.Compressor = .init(gpa);
     defer c.deinit();
     const big = try gpa.alloc(u8, 3 * 131072 + 4096);

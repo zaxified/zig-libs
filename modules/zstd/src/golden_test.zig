@@ -46,6 +46,7 @@ test "every covered corpus combination has a golden row, and nothing else does" 
 }
 
 test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes back" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
     var dec = try zstd.Decompressor.init(gpa, .{});

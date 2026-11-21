@@ -539,6 +539,7 @@ test "decoder fuzz seeds decode as libzstd wrote them" {
 }
 
 test "fuzz: every input round-trips through std's decoder" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     try std.testing.fuzz({}, fuzzCompress, .{ .corpus = &fuzz_seed_corpus });
 }
 
@@ -547,10 +548,12 @@ test "fuzz: arbitrary bytes never crash the decoder" {
 }
 
 test "fuzz: every input streamed round-trips through std's decoder" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     try std.testing.fuzz({}, fuzzStream, .{ .corpus = &fuzz_seed_corpus });
 }
 
 test "fuzz corpus reaches the compressor intact" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // Draws exactly as the harness does: a seed must come back as its own
     // bytes, or the ordinary lane is not running what the corpus says.
     var nonempty: usize = 0;
@@ -590,6 +593,7 @@ test "fuzz driver: ZSTD_FUZZ" {
 }
 
 test "fuzz harness: seeds in every test run, and it gets everywhere" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     reach = @splat(0);
     // 25 per target: a compression run is a round trip of up to 64 KB at the
     // Debug lane's speed.

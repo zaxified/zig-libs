@@ -176,6 +176,7 @@ fn text(buf: []u8) void {
 }
 
 test "a frame per buffer fill, whatever the write sizes" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     var src: [10_000]u8 = undefined;
     text(&src);

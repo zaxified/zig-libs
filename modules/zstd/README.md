@@ -529,6 +529,13 @@ frame queries (`numFrames`, `frameCompressedOffset`, `offsetToFrameIndex`,
 content does not match its checksum), `FrameIndexTooLarge`,
 `DstSizeTooSmall`, and the decoder's.
 
+## Build options
+
+`-Dzstd-all-strategies=false` (the default under `-Dprofile=small`) builds
+only the `fast` and `dfast` strategies; a level that needs another is
+`error.LevelUnsupported`. A program that calls `compress` is about half a
+megabyte smaller (ReleaseSmall). SPEC.md, *Build options*.
+
 ## Not provided
 
 Run-time CPU dispatch (build for the target CPU instead), libzstd's legacy

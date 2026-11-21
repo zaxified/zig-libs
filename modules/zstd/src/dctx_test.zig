@@ -86,6 +86,7 @@ fn zdecStream(s: *zstd.DecompressStream, z: []const u8, want: []const u8, whole:
 }
 
 test "max_block_size refuses frames exactly where libzstd does, and sizes the stream's buffers as libzstd" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var src: []u8 = &.{};
     defer gpa.free(src);
     var frame: []u8 = &.{};
@@ -314,6 +315,7 @@ fn decodeInPieces(s: *zstd.DecompressStream, z: []const u8, want: []const u8, st
 }
 
 test "a decoder in a caller's workspace: exactly estimateDecompressorSize, nothing allocated" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const est = zstd.estimateDecompressorSize();
     const ws = try workspace(est);
     defer gpa.free(ws);
@@ -392,6 +394,7 @@ test "a DDict in a caller's workspace: its content by copy exactly fills the est
 }
 
 test "copyFrom (ZSTD_copyDCtx): a prepared context copied before and during a frame" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const src = try corpusInput("csv-600000");
     defer gpa.free(src);
     var dd = try zstd.DDict.init(gpa, dict_kats.full_dict, .auto);
@@ -490,6 +493,7 @@ test "copyFrom (ZSTD_copyDCtx) mid-frame with a DDict: the copy reads the same D
 }
 
 test "copyFrom (ZSTD_copyDCtx) at every block boundary: each copy goes on as its original would" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // 1 KB blocks, so later blocks lean on earlier ones: repeat offsets
     // carried over, Huffman and FSE tables repeated. The copies are decoded
     // only after the original has finished its frame and then decoded

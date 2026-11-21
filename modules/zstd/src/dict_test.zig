@@ -191,6 +191,7 @@ fn withDict(opts: zstd.Options, d: zstd.Dictionary) zstd.Options {
 }
 
 test "output with dictionaries is byte-identical to libzstd 1.5.7" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
     var ctx: zstd.Compressor = .init(gpa);
@@ -243,6 +244,7 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
 }
 
 test "every strategy's dictMatchState variant attaches where libzstd would, D1-D3 together" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // D1 (fast/dfast), D2 (greedy..btlazy2) and D3 (the optimal parsers)
     // together give every strategy a dictMatchState variant, so
     // `error.DictAttachUnsupported` no longer has a strategy left to name
@@ -280,6 +282,7 @@ test "every strategy's dictMatchState variant attaches where libzstd would, D1-D
 }
 
 test "the attach cutoffs are libzstd's, per strategy" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var raw: [5000]u8 = undefined;
     corpus.generate(.{ .name = "", .len = raw.len, .kind = .words, .seed = 1 }, &raw);
@@ -353,6 +356,7 @@ test "a prefix serves one frame; an empty dictionary is none" {
 }
 
 test "a dedicated-search CDict: greedy..lazy2 only, bucketed, always attached" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var raw: [30000]u8 = undefined;
     corpus.generate(.{ .name = "", .len = raw.len, .kind = .csv, .seed = 5 }, &raw);
@@ -417,6 +421,7 @@ fn streamAttached(dst: []u8, src: []const u8, level: i32, cd: *const zstd.CDict,
 }
 
 test "prefetching an attached CDict's tables changes no byte" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // `ZSTD_c_prefetchCDictTables` is speed only; the block functions that
     // read it (fast and dfast attached) must still give libzstd's bytes,
     // which the frames without it are pinned to.

@@ -318,6 +318,7 @@ fn randCParams(r: std.Random) zstd.CParams {
 }
 
 test "probe: random buffer-less call orders never crash (sweep ZE-4)" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var data: [60000]u8 = undefined;
     text(&data, 11);
     var dict_src: [3000]u8 = undefined;
@@ -491,6 +492,7 @@ test "FrameWriter.init: its own buffer is freed when the scratch allocation fail
 }
 
 test "a dictionary's Huffman table with a code past the cost scale is compressed with (sweep audit ZE-6b)" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     var buf: [60000]u8 = undefined;
     text(&buf, 13);
     var sizes: [100]usize = undefined;

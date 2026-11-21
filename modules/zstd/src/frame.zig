@@ -1266,7 +1266,8 @@ pub const Compressor = struct {
     /// parameters `cp` (the level's, sized for `pledged`), resizing the
     /// workspace if it is too small or has long been three times too big.
     /// `buffered` adds a stream's input and output buffers.
-    pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool, reset: Reset) error{OutOfMemory}!void {
+    pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool, reset: Reset) error{ OutOfMemory, LevelUnsupported }!void {
+        if (!params.strategySupported(cp.strategy)) return error.LevelUnsupported;
         const l = Layout.compute(cp, pledged, opts, buffered);
 
         const ms_old = comp.c.ms;

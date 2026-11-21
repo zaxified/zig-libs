@@ -9,3 +9,4 @@ ssh	77000	2026-10-18: 184720 -> 29440 B (gain 155280; ssh-gex-max-bits alone -> 
 zipstream	157000	2026-11-02: 512512 -> 197632 B (gain 314880), knob zipstream-builtin-decoders; read-only probe, native x86_64
 tar	3500	2026-11-04: 179568 -> 172036 B text (gain 7532), knob tar-sparse; mips-linux-musl soft-float probe
 regex	56000	2026-11-21: 415264 -> 301960 B (gain 113304), knob regex-unicode (Unicode tables); compile-and-match probe, native x86_64
+zstd	250000	2026-11-21: 1051816 -> 546072 B (gain 505744), knob zstd-all-strategies; native x86_64

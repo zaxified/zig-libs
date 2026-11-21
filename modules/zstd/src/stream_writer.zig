@@ -211,6 +211,7 @@ fn text(buf: []u8) void {
 }
 
 test "the stream Stream gives for the same calls, whatever the writes and the buffer" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 700_000);
     defer gpa.free(src);
@@ -336,6 +337,7 @@ fn writeFrame(sw: *StreamWriter, src: []const u8, step: usize) !void {
 }
 
 test "reset: frame after frame, each the bytes a fresh stream gives" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 300_000);
     defer gpa.free(src);
@@ -365,6 +367,7 @@ test "reset: frame after frame, each the bytes a fresh stream gives" {
 }
 
 test "reset abandons a frame mid-way and clears a failure" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 200_000);
     defer gpa.free(src);
@@ -400,6 +403,7 @@ test "reset abandons a frame mid-way and clears a failure" {
 }
 
 test "the scratch's length does not change the bytes" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 250_000);
     defer gpa.free(src);

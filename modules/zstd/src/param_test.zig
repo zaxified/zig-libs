@@ -137,6 +137,7 @@ test "every parameter case has a golden row, and nothing else does" {
 }
 
 test "output with advanced parameters is byte-identical to libzstd 1.5.7, and decodes back" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
     // one context for every frame (see golden_test.zig)
@@ -327,6 +328,7 @@ test "without the content size flag the header records no size" {
 }
 
 test "FrameWriter frames carry the advanced parameters" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = strRepeat("frame writer, frame writer, frame writer", 30);
     const adv: zstd.Advanced = .{ .format = .magicless, .content_size = false, .strategy = .btopt };

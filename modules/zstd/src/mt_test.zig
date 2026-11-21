@@ -96,6 +96,7 @@ fn decodeBack(gpa: std.mem.Allocator, mc: corpus.MtCase, dict: []const u8, frame
 }
 
 test "multithreaded output is libzstd's for every worker count, and decodes back" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     // Under qemu-mips this test's pool and buffer churn trips qemu's own
     // page_find_range_empty assertion (SPEC.md, *Portability*); its two
     // axes run in full elsewhere: 32-bit on i386 and ARM, big-endian on
@@ -312,6 +313,7 @@ fn held(mt: ?*zstdmt.MtCtx, own: usize) usize {
 }
 
 test "the size estimates count the workers, and hold as a bound" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const src = try gpa.alloc(u8, 10 * zstdmt.job_size_min + 1000);
     defer gpa.free(src);
@@ -435,6 +437,7 @@ fn runOnPool(gpa: std.mem.Allocator, pool: *zstd.ThreadPool, workers: u32, part:
 }
 
 test "a shared thread pool gives the same bytes, smaller or larger than nb_workers" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     if (comptime @import("builtin").single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest; // see above
     const gpa = std.testing.allocator;
@@ -474,6 +477,7 @@ fn concurrently(pool: *zstd.ThreadPool) !void {
 }
 
 test "compressors and streams on several threads share one pool at once" {
+    if (!@import("params.zig").all_strategies) return error.SkipZigTest;
     if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest; // see above
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const gpa = std.testing.allocator;

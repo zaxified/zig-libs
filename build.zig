@@ -641,6 +641,11 @@ pub fn build(b: *std.Build) void {
         "tar-sparse",
         "tar: read sparse members, GNU 'S' and pax GNU.sparse (default true; profile=small false = 'S' is .other, GNU.sparse.* records are parsed past)",
     ));
+    zl_options.addOption(?bool, "zstd_all_strategies", b.option(
+        bool,
+        "zstd-all-strategies",
+        "zstd: compress with every strategy, levels 1..22 (default true; profile=small false = fast and dfast only, a level resolving to a higher strategy is refused with LevelUnsupported, about 7 MB less code)",
+    ));
     // fingerprint-exempt: end
     zl_options_mod = zl_options.createModule();
 
