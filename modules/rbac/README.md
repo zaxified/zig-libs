@@ -3,8 +3,8 @@
 Authorization **decision engine**: RBAC (role-based, NIST core + hierarchical) and ABAC
 (attribute-based, a depth-bounded typed condition-tree evaluator with XACML-style combining
 algorithms), sharing one `Decision{ result: permit|deny, reason }` result shape. Pure policy
-logic — no crypto, no I/O, no persistence: both models are built/loaded in memory by the
-caller. Identity/authentication (is this token valid, who is this subject) is a different
+logic — no crypto, no I/O, no storage: both models are built/loaded in memory by the
+caller (the RBAC engine also reads and writes Casbin-style policy text, and `rbac.Domains` keeps one engine per tenant). Identity/authentication (is this token valid, who is this subject) is a different
 module's job (see `jwt`, `aaa-gate`); `rbac` only answers "is this already-identified subject
 authorized to do this."
 
@@ -71,6 +71,22 @@ All strings passed to a mutating `Engine` method are duped into individually own
 — callers never need to keep arguments alive past the call — and freed again when the item is
 removed, so a long-lived engine's memory follows the live policy, not its change history. Every
 `add*` is idempotent.
+
+## Policy text and tenants
+
+```zig
+// Casbin-style CSV: p, role, resource, action · g, user, role · g2, senior, junior · sod, a, b · r, role
+var engine = try rbac.Engine.fromPolicy(gpa, .exact,
+    \\p, editor, doc, write
+    \\g, alice, editor
+    \\g2, editor, viewer
+, &diag);                       // diag.line names the line of an error; nothing is left behind on error
+try engine.savePolicy(writer);  // sorted, so equal policies give equal text; load-then-save is a fixed point
+
+// One engine per tenant; roles, permissions and assignments are all per domain.
+var tenants = try rbac.Domains.fromPolicy(gpa, .exact, "p, admin, acme, /billing, read\ng, alice, admin, acme\n", null);
+_ = tenants.check("acme", "alice", "read", "/billing");   // permit; any other domain denies
+```
 
 ## ABAC API
 

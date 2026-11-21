@@ -16,17 +16,19 @@
 //!     across a rule set with an XACML-style combining algorithm
 //!     (`deny_overrides` default, `permit_overrides` also supported).
 //!
-//! This is a decision engine, not a persistence layer: both models are
+//! This is a decision engine, not a storage layer: both models are
 //! built/loaded into memory by the caller (`rbac.Engine` owns its own
 //! duped strings and frees them on removal; `abac.Policy`/`abac.Attributes` borrow
 //! whatever the caller passes in and must outlive the `evaluate` call).
 //!
-//! No crypto, no I/O, no external policy-file format — see SPEC.md for what
+//! The RBAC engine reads and writes its policy as Casbin-style CSV text (`policy.zig`) and `rbac.Domains` keeps
+//! one engine per tenant. No crypto, no I/O — see SPEC.md for what
 //! is deliberately out of scope (dynamic/session SoD, full XACML request
 //! context, a string policy DSL).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const policy_text = @import("policy.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -159,6 +161,13 @@ pub const rbac = struct {
     /// Every add operation is idempotent (re-adding something present is a
     /// no-op that allocates nothing), so repeated add/remove of the same
     /// item cannot grow the engine.
+    pub const PolicyError = policy_text.Error;
+    pub const PolicyDiag = policy_text.Diag;
+    pub const PolicySaveError = policy_text.SaveError;
+    /// One `Engine` per tenant: roles, permissions, hierarchy, SoD and assignments are all per domain (Casbin's
+    /// "RBAC with domains").
+    pub const Domains = policy_text.Domains;
+
     pub const Engine = struct {
         gpa: Allocator,
         /// Permission comparison used by `check` (not by the idempotence /
@@ -492,6 +501,21 @@ pub const rbac = struct {
         /// `action`/`resource`. Default-deny: an unknown user, a user with
         /// no roles assigned, or a user whose roles (direct + inherited)
         /// don't cover this permission all return `.deny`.
+        /// Adds the records of policy text (Casbin-style CSV, see `policy.zig`); additive, not atomic.
+        pub fn loadPolicy(self: *Engine, text: []const u8, diag: ?*PolicyDiag) PolicyError!void {
+            return policy_text.load(self, text, diag);
+        }
+
+        /// A new engine from policy text; nothing is left behind when a record fails.
+        pub fn fromPolicy(allocator: Allocator, match: Match, text: []const u8, diag: ?*PolicyDiag) PolicyError!Engine {
+            return policy_text.fromPolicy(allocator, match, text, diag);
+        }
+
+        /// Writes the policy as text that `loadPolicy` reads back to an equal policy, in a fixed order.
+        pub fn savePolicy(self: *const Engine, w: *std.Io.Writer) PolicySaveError!void {
+            return policy_text.save(self, w);
+        }
+
         pub fn check(self: *const Engine, user: []const u8, action: []const u8, resource: []const u8) Decision {
             const held = self.assignments.getPtr(user) orelse
                 return deny("no roles assigned to this user (default-deny)");
@@ -1860,6 +1884,10 @@ test "abac: missing attribute is Indeterminate, collapses to Deny" {
     try testing.expectEqual(Result.deny, d.result);
 
     try testing.expectError(error.MissingAttribute, abac.evalCondition(rules[0].condition, &attrs, abac.default_max_depth));
+}
+
+test {
+    _ = policy_text;
 }
 
 test "Decision.isPermit collapses non-permit results" {

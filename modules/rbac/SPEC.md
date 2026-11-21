@@ -37,7 +37,7 @@ that covers RBAC and ABAC), with NIST/INCITS 359 as the model spec.
 **Where we are ahead:** the only Zig RBAC+ABAC engine; NIST-style hierarchy with cycle rejection
 at insertion, static separation of duty, XACML combining algorithms (`deny_overrides` default),
 depth-bounded evaluation (fail closed), type-checked comparisons, no allocation per decision.
-**Where we are behind:** policy files and storage adapters, domains/tenants, resource roles, a
+**Where we are behind:** storage adapters (the policy text is the interchange), resource roles, a
 policy language, patterns beyond `keyMatch`-style `*` (no regex) (→ Backlog / deferred and
 *What is deliberately not done*).
 
@@ -164,12 +164,33 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   original detail (e.g. "indeterminate: condition tree exceeded max evaluation depth") even
   after the collapse, so nothing is lost for logging.
 
+- **Domains / tenants (`rbac.Domains`)** — Casbin's "RBAC with domains": one `Engine` per domain name, so roles,
+  their permissions, the hierarchy, SoD pairs and user assignments are all per domain (what Casbin's model does:
+  `p, sub, dom, obj, act`, `g, user, role, dom`). A user's role in one domain grants nothing in another; an unknown
+  domain denies (`Decision.reason` says so). `engine(domain)` creates the domain's engine on first use;
+  `removeDomain` drops it with everything in it. `initWithMatch` gives every domain's engine the same permission
+  matching. Roles shared across tenants are not modelled (Casbin's domain-wildcard matching functions are not
+  followed): declare the role in each domain that uses it.
+- **Policy text (`Engine.loadPolicy` / `fromPolicy` / `savePolicy`, `Domains` likewise)** — Casbin policy files are
+  CSV records (`p, alice, data1, read`), and so is this: `p, role, resource, action`, `g, user, role` (assignment),
+  `g2, senior, junior` (hierarchy; Casbin spells role inheritance `g` too, the module keeps users and roles
+  apart, so a Casbin file's role-to-role `g` lines become `g2`), `sod, a, b` and `r, role` (a role nothing else
+  mentions); `Domains` files add the domain where Casbin puts it. `#` comments, blank lines, trimmed fields and
+  double-quoted fields (`""` for a quote) as in Casbin's CSV adapter. A role is declared by any mention, and loading
+  declares every role first and then applies permissions, hierarchy, SoD pairs and assignments, so the file's order
+  is free and its SoD pairs constrain its own assignments. Syntax is checked for the whole text before anything is
+  applied (`InvalidPolicy`, the line in `PolicyDiag`); a semantic failure (`CyclicHierarchy`, `ConflictingRole`)
+  names its line and leaves the earlier records in `loadPolicy` (additive) — `fromPolicy` builds a fresh engine and
+  frees it on error. `savePolicy` writes roles, permissions, hierarchy, SoD pairs and assignments, each sorted, so
+  equal policies give equal text and load-then-save is a fixed point; a name with a line break is
+  `Unrepresentable` (nothing written). `Engine.match` is not in the text.
+
 ## Threat model / out of scope
 
-- **Not a persistence layer.** Both models are built/loaded into memory by the caller — no
-  policy-file format (JSON/YAML/XACML-XML), no serialization, no storage backend. A caller
-  wanting a wire format defines and parses it themselves, then constructs `rbac.Engine`
-  calls / `abac.Policy` values from the result.
+- **Not a persistence layer.** Both models live in memory; the RBAC engine can read and write its policy as text
+  (see *Policy text*), the ABAC `Policy` cannot (typed values, no parser, by design), and there is no storage
+  backend. Reading a policy file from an untrusted source is the caller's to bound: `loadPolicy` takes the whole
+  text and is linear in it (five passes), so cap the size before calling.
 - **No crypto, no I/O.** This module never touches the network, disk, or `std.crypto` — it is
   pure decision logic over caller-supplied structures. Identity/authentication (who is this
   subject, is this token valid) is a different module's job (see `jwt`, `aaa-gate`); this
@@ -209,6 +230,11 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
   patterns for RBAC are provided, opt-in: `Engine.initWithMatch`.)
 
 ## Verification
+
+Policy text and domains (`src/policy.zig`): a hand-written, unordered Casbin-style file decides like the API-built
+engine; save-then-load is a fixed point with commas, quotes and padding in names; syntax errors carry their line and
+apply nothing; cycle and SoD conflicts in a file name their line and `fromPolicy` leaks nothing; a name with a line
+break is refused; per-tenant roles, permissions, hierarchy and SoD, unknown tenants, tenant removal.
 
 `scripts/modtest rbac` (Debug) and `zig build test-rbac -Doptimize=ReleaseFast`. This is policy logic with no
 external interop target (no third-party "RBAC KAT" or "ABAC KAT" corpus exists), so self-constructed test cases
@@ -254,11 +280,7 @@ proving each check actually has discriminating power rather than passing by defa
 
 ## Backlog / deferred
 
-- **Domains/tenants** (a user holds different roles per tenant): Casbin's "RBAC with domains"; multi-tenant SaaS
-  is the common RBAC deployment. Effort: medium (a third key in assignments and `check`). Fits CONVENTIONS §2: yes.
-- **Policy load/save** (a policy-file format and (de)serialization for either model): Casbin users expect
-  policies from a file or store, and without it every consumer writes the same parser. Effort: medium. Fits
-  CONVENTIONS §2: yes.
+None open.
 
 ## Anchoring
 
