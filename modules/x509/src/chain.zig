@@ -131,6 +131,35 @@ pub const Options = struct {
     /// inhibitAnyPolicy is enforced. `acceptable` is Go's
     /// `CertificatePolicies`.
     policy: policy.Options = .{},
+    /// When non-null, path building records here the failure that got furthest
+    /// (`Diagnostics`); `null` (the default) records nothing. Unlike the
+    /// returned error, which collapses to `NoTrustedPath` when several
+    /// same-subject candidates fail, this names the link and the cause.
+    diagnostics: ?*Diagnostics = null,
+};
+
+/// Where path building failed (`Options.diagnostics`): the deepest link whose
+/// issuer candidate was rejected, the way OpenSSL reports an error depth and
+/// the failing certificate. Only path-building failures are recorded (link
+/// signature, validity, CA checks, revocation, chain length, no issuer
+/// found); the post-build checks (name constraints, policy, EKU, hostname)
+/// return their own specific error unchanged. The slices borrow the
+/// caller's `chain`/`trust_anchors` buffers. Reset it before reuse.
+pub const Diagnostics = struct {
+    /// Position of `subject` in the path being built (0 is the leaf).
+    depth: u32 = 0,
+    /// The certificate whose issuer could not be established.
+    subject: ?CertDer = null,
+    /// The issuer candidate that was rejected; `null` when no certificate
+    /// matched the subject's issuer name at all.
+    issuer: ?CertDer = null,
+    /// Why: the error of that link.
+    cause: ?VerifyChainError = null,
+
+    fn note(d: *Diagnostics, depth: u32, subject: CertDer, issuer: ?CertDer, cause: VerifyChainError) void {
+        if (d.cause != null and depth <= d.depth) return;
+        d.* = .{ .depth = depth, .subject = subject, .issuer = issuer, .cause = cause };
+    }
 };
 
 /// Revocation policy for `verifyChain` (`Options.revocation`). Every link the
@@ -580,16 +609,25 @@ fn findIssuerAndVerify(
         try candidates.append(gpa, .{ .der = a_der, .is_anchor = true, .anchor_index = i, .chain_index = null });
     }
 
-    if (candidates.items.len == 0) return error.NoTrustedPath;
+    if (candidates.items.len == 0) {
+        if (opts.diagnostics) |d| d.note(depth, cur_der, null, error.NoTrustedPath);
+        return error.NoTrustedPath;
+    }
 
     if (candidates.items.len == 1) {
-        return acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path, checks, memo);
+        acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path, checks, memo) catch |e| {
+            if (opts.diagnostics) |d| d.note(depth, cur_der, candidates.items[0].der, e);
+            return e;
+        };
+        return;
     }
 
     for (candidates.items) |cand| {
         if (acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, cand, used_chain, depth, path, checks, memo)) {
             return;
-        } else |_| {}
+        } else |e| {
+            if (opts.diagnostics) |d| d.note(depth, cur_der, cand.der, e);
+        }
     }
     return error.NoTrustedPath;
 }

@@ -127,6 +127,39 @@ test "tampered signature byte rejected with CertificateSignatureInvalid" {
     try testing.expectError(error.CertificateSignatureInvalid, chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid }));
 }
 
+test "diagnostics name the link where path building stopped" {
+    // No anchor: the intermediate's issuer is not found; the failing subject
+    // is the intermediate at depth 1.
+    {
+        const chain = [_]chain_mod.CertDer{ &fx.leaf_rsa, &fx.inter_rsa };
+        var diag: chain_mod.Diagnostics = .{};
+        try testing.expectError(error.NoTrustedPath, chain_mod.verifyChain(testing.allocator, &chain, &.{}, .{ .now_sec = now_valid, .diagnostics = &diag }));
+        try testing.expectEqual(@as(u32, 1), diag.depth);
+        try testing.expectEqualSlices(u8, &fx.inter_rsa, diag.subject.?);
+        try testing.expect(diag.issuer == null);
+        try testing.expectEqual(error.NoTrustedPath, diag.cause.?);
+    }
+    // A tampered leaf signature: depth 0, the issuer candidate is named.
+    {
+        const chain = [_]chain_mod.CertDer{ &fx.leaf_rsa_tampered, &fx.inter_rsa };
+        const anchors = [_]chain_mod.CertDer{&fx.root_rsa};
+        var diag: chain_mod.Diagnostics = .{};
+        try testing.expectError(error.CertificateSignatureInvalid, chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid, .diagnostics = &diag }));
+        try testing.expectEqual(@as(u32, 0), diag.depth);
+        try testing.expectEqualSlices(u8, &fx.leaf_rsa_tampered, diag.subject.?);
+        try testing.expectEqualSlices(u8, &fx.inter_rsa, diag.issuer.?);
+        try testing.expectEqual(error.CertificateSignatureInvalid, diag.cause.?);
+    }
+    // Success leaves it untouched.
+    {
+        const chain = [_]chain_mod.CertDer{ &fx.leaf_rsa, &fx.inter_rsa };
+        const anchors = [_]chain_mod.CertDer{&fx.root_rsa};
+        var diag: chain_mod.Diagnostics = .{};
+        _ = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid, .diagnostics = &diag });
+        try testing.expect(diag.cause == null);
+    }
+}
+
 test "unknown trust anchor rejected with NoTrustedPath" {
     const chain = [_]chain_mod.CertDer{ &fx.leaf_rsa, &fx.inter_rsa };
     const anchors = [_]chain_mod.CertDer{};

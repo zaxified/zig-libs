@@ -178,6 +178,7 @@ pub const verifyChain = chain.verifyChain;
 pub const verifyChainPath = chain.verifyChainPath;
 pub const VerifiedPath = chain.VerifiedPath;
 pub const Options = chain.Options;
+pub const Diagnostics = chain.Diagnostics;
 pub const VerifiedChain = chain.VerifiedChain;
 pub const VerifyChainError = chain.VerifyChainError;
 pub const PubKeyAlgo = algorithm.PubKeyAlgo;
