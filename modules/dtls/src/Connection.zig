@@ -45,8 +45,7 @@
 //! `negotiatedAlpn`).
 //!
 //! **Deliberately out of scope** (see `startHandshake`'s doc comment and
-//! `root.zig` for the full list): 0-RTT, session resumption, and (inherited
-//! from `aead.zig`) the CCM suites.
+//! `root.zig` for the full list): 0-RTT and session resumption.
 
 const std = @import("std");
 const messages = @import("messages.zig");
@@ -185,10 +184,8 @@ pub const ConfigError = error{
     EmptyPskIdentity,
     NoCipherSuites,
     /// `Config.cipher_suites` offers a suite this module cannot install keys
-    /// for. Both CCM suites are in that position: Zig std (checked on 0.17.1) ships
-    /// only a 13-byte-nonce CCM. Caught here rather than after a completed
-    /// handshake, where it used to surface as `error.UnsupportedSuite` from
-    /// `installApplicationKeys`.
+    /// for. Every `CipherSuite` value is wired since the CCM pair was
+    /// (2026-11-21); kept for a value added to the enum before its AEAD.
     UnsupportedSuite,
     /// `Config.hello_retry` was set with an empty `cookie_secret`: the
     /// cookie's MAC would be keyed by nothing, so anyone could mint one.
@@ -388,15 +385,10 @@ pub const Config = struct {
     /// Both ends must agree, as on the PSK itself.
     psk_hash: HashAlg = .sha256,
     /// Preference order, most-preferred first.
-    /// Defaults to AES-128-GCM, the one mandatory-to-implement TLS 1.3 suite.
-    /// It used to default to `.aes_128_ccm_8_sha256` -- the CoAP profile's
-    /// choice, and the obvious pick for this module's target consumer -- but
-    /// `suiteParams` returns null for both CCM suites, because Zig std (checked on 0.17.1) ships
-    /// only a 13-byte-nonce CCM. So that default passed `validate`, completed a
-    /// handshake, and failed at `installApplicationKeys` with
-    /// `error.UnsupportedSuite`: a config that could never work, in the mode a
-    /// consumer was most likely to reach for. Name a CCM suite explicitly and
-    /// `validate` now says no immediately (see below).
+    /// Defaults to AES-128-GCM, the one mandatory-to-implement TLS 1.3 suite,
+    /// then AES-256-GCM (pion/dtls's and wolfSSL's order). The RFC 7925
+    /// constrained-device profile wants `.aes_128_ccm_8_sha256`; name it
+    /// explicitly (both CCM suites run on the `aesccm` module).
     cipher_suites: []const CipherSuite = &default_cipher_suites,
 
     // ── certificate mode (RFC 8446 §4.4), all ADDITIVE / optional — see
@@ -2387,12 +2379,15 @@ pub const Connection = struct {
             }
         }
 
-        // DTLSInnerPlaintext = content || content_type (no extra padding).
+        // DTLSInnerPlaintext = content || content_type, zero-padded only
+        // where RFC 9147 §4.2.3 needs it (`minInnerLen`).
         var inner_buf: [1500]u8 = undefined;
         if (payload.len + 1 > inner_buf.len) return error.BufferTooShort;
         @memcpy(inner_buf[0..payload.len], payload);
         inner_buf[payload.len] = inner_content_type;
-        const inner = inner_buf[0 .. payload.len + 1];
+        const inner_len = @max(payload.len + 1, minInnerLen(params));
+        @memset(inner_buf[payload.len + 1 .. inner_len], 0);
+        const inner = inner_buf[0..inner_len];
 
         const ct_len = inner.len + params.tag_len;
         const seq_len: record.SeqNumLen = if (self.send_seq <= 0xff) .short else .long;
@@ -3103,7 +3098,9 @@ pub const Connection = struct {
         if (fragment_bytes.len + 1 > inner_buf.len) return error.BufferTooShort;
         @memcpy(inner_buf[0..fragment_bytes.len], fragment_bytes);
         inner_buf[fragment_bytes.len] = inner_type;
-        const inner = inner_buf[0 .. fragment_bytes.len + 1];
+        const inner_len = @max(fragment_bytes.len + 1, minInnerLen(params));
+        @memset(inner_buf[fragment_bytes.len + 1 .. inner_len], 0);
+        const inner = inner_buf[0..inner_len];
 
         const ct_len = inner.len + params.tag_len;
         const seq_len: record.SeqNumLen = if (self.hs2.send_seq <= 0xff) .short else .long;
@@ -4670,6 +4667,8 @@ const chachapoly = @import("chachapoly");
 
 const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 const Aes256Gcm = @import("aesgcm").Aes256Gcm;
+const Aes128Ccm = @import("aesccm").Aes128Ccm;
+const Aes128Ccm8 = @import("aesccm").Aes128Ccm8;
 // The `chacha20_poly1305_sha256` suite is RFC 8439's plain ChaCha20-Poly1305
 // (NOT XChaCha), so the SIMD `chachapoly` sibling applies here — see
 // `aead.zig`'s differential test for the byte-identity proof against std,
@@ -4681,13 +4680,23 @@ const SuiteParams = struct { key_len: u8, sn_len: u8, tag_len: u8, is_chacha: bo
 /// Returns the record-layer parameters for the suites whose 12-byte-nonce
 /// AEAD is validated here, or `null` for suites this pass does not wire
 /// (the CCM suites — std ships only a 13-byte-nonce CCM; see aead.zig).
+/// RFC 9147 §4.2.3: the sequence-number mask samples the first 16 bytes of
+/// the ciphertext, and "Senders MUST pad short plaintexts out (using the
+/// conventional record padding mechanism) in order to make a suitable-length
+/// ciphertext" — only CCM_8's 8-byte tag can leave a record shorter.
+fn minInnerLen(params: SuiteParams) usize {
+    return 16 -| params.tag_len;
+}
+
 fn suiteParams(suite: CipherSuite) ?SuiteParams {
     return switch (suite) {
         .aes_128_gcm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false },
         // RFC 9147 §4.2.3: the AES sn key is the AEAD key's length.
         .aes_256_gcm_sha384 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = false },
         .chacha20_poly1305_sha256 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = true },
-        .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => null,
+        // RFC 9147 §4.2.3: CCM is AES-based, so the AES sn mask and a key-length sn key.
+        .aes_128_ccm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false },
+        .aes_128_ccm_8_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 8, .is_chacha = false },
     };
 }
 
@@ -4724,7 +4733,8 @@ fn protectDispatch(
         .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
         .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
-        else => error.UnsupportedSuite,
+        .aes_128_ccm_sha256 => aead.Protection(Aes128Ccm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
+        .aes_128_ccm_8_sha256 => aead.Protection(Aes128Ccm8).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
     };
 }
 
@@ -4741,16 +4751,16 @@ fn unprotectDispatch(
         .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
         .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
-        else => error.UnsupportedSuite,
+        .aes_128_ccm_sha256 => aead.Protection(Aes128Ccm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
+        .aes_128_ccm_8_sha256 => aead.Protection(Aes128Ccm8).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
     };
 }
 
 fn snMaskDispatch(suite: CipherSuite, keys: *const DirKeys, sample: []const u8, seq_bytes: []u8) !void {
     return switch (suite) {
-        .aes_128_gcm_sha256 => aead.encryptSequenceNumberAes(keys.sn_key[0..16], sample, seq_bytes),
+        .aes_128_gcm_sha256, .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => aead.encryptSequenceNumberAes(keys.sn_key[0..16], sample, seq_bytes),
         .aes_256_gcm_sha384 => aead.encryptSequenceNumberAes(keys.sn_key[0..32], sample, seq_bytes),
         .chacha20_poly1305_sha256 => aead.encryptSequenceNumberChaCha20(keys.sn_key[0..32], sample, seq_bytes),
-        else => error.UnsupportedSuite,
     };
 }
 
@@ -4941,27 +4951,17 @@ test "Config.validate: rejects an empty cipher-suite list" {
     try testing.expectError(error.NoCipherSuites, cfg.validate());
 }
 
-test "Config.validate: rejects a suite this module cannot install keys for" {
-    // `ConfigError.UnsupportedSuite`'s only test. Both CCM suites are in that
-    // position (`suiteParams` returns null for both — std ships only
-    // a 13-byte-nonce CCM), and naming one must fail HERE, at config time,
-    // not after a handshake has completed and spent a flight.
-    for ([_]CipherSuite{ .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 }) |ccm| {
-        const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret", .cipher_suites = &.{ccm} };
-        try testing.expectError(error.UnsupportedSuite, cfg.validate());
-        // …and the guard must look at the WHOLE list, not just its head: a
-        // usable first preference does not excuse an unusable second.
-        const cfg_tail = Config{
-            .role = .client,
-            .psk_identity = "id",
-            .psk = "secret",
-            .cipher_suites = &.{ .aes_128_gcm_sha256, ccm },
-        };
-        try testing.expectError(error.UnsupportedSuite, cfg_tail.validate());
+test "Config.validate: every CipherSuite value is wired, the CCM pair included" {
+    // `ConfigError.UnsupportedSuite` guards a suite `suiteParams` has no entry
+    // for; since the CCM suites run on `aesccm` there is none, and every value
+    // must pass both `validate` and the constructor.
+    for (std.enums.values(CipherSuite)) |suite| {
+        try testing.expect(suiteParams(suite) != null);
+        const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret", .psk_hash = suite.hash(), .cipher_suites = &.{suite} };
+        try cfg.validate();
+        var c = try Connection.clientInit(cfg);
+        c.deinit();
     }
-    // The same rejection through the constructor a consumer actually calls.
-    const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret", .cipher_suites = &.{.aes_128_ccm_8_sha256} };
-    try testing.expectError(error.UnsupportedSuite, Connection.clientInit(cfg));
 }
 
 test "Config.validate: accepts a sane config" {
@@ -5123,11 +5123,86 @@ test "record round-trip self-consistency: ChaCha20-Poly1305" {
     try roundtripSuite(.chacha20_poly1305_sha256);
 }
 
-test "installApplicationKeys: CCM suites are honestly rejected (std nonce gap)" {
-    const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
-    var conn = try Connection.clientInit(cfg);
-    const ap = deriveApSecrets(cfg.psk);
-    try testing.expectError(error.UnsupportedSuite, conn.installApplicationKeys(.aes_128_ccm_8_sha256, &ap.c, &ap.s));
+test "record round-trip self-consistency: AES-128-CCM and AES-128-CCM-8" {
+    try roundtripSuite(.aes_128_ccm_sha256);
+    try roundtripSuite(.aes_128_ccm_8_sha256);
+}
+
+test "CCM_8: a short record is padded to a 16-byte ciphertext (RFC 9147 §4.2.3) and the padding is stripped" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_ccm_8_sha256, 0x7d, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var wire: [64]u8 = undefined;
+    var plain: [64]u8 = undefined;
+    for ([_][]const u8{ "", "x", "1234567", "12345678" }) |msg| {
+        const rec = try client.send(msg, &wire);
+        const dec = try record.decodeUnified(rec, 0);
+        // inner = msg || type, padded to 8; ciphertext = inner || 8-byte tag.
+        try testing.expectEqual(@max(msg.len + 1, 8) + 8, rec.len - dec.consumed);
+        try testing.expectEqualStrings(msg, try server.recv(rec, &plain));
+    }
+    // AES-128-CCM's 16-byte tag never needs it.
+    var c2: Connection = undefined;
+    var s2: Connection = undefined;
+    try connectedPair(.aes_128_ccm_sha256, 0x7e, &c2, &s2);
+    defer c2.deinit();
+    defer s2.deinit();
+    const rec = try c2.send("", &wire);
+    try testing.expectEqual(@as(usize, 1 + 16), rec.len - (try record.decodeUnified(rec, 0)).consumed);
+    try testing.expectEqualStrings("", try s2.recv(rec, &plain));
+}
+
+test "CCM suites: the record is the aesccm AEAD byte for byte (12-byte nonce, tags 16 and 8)" {
+    var keys = DirKeys{ .key_len = 16, .sn_len = 16 };
+    for (&keys.key, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    for (&keys.iv, 0..) |*b, i| b.* = @truncate(i * 5 + 2);
+    const inner = "application bytes\x17";
+    const aad = [_]u8{ 0x2e, 0x05, 0x00, 0x1a };
+    var out: [64]u8 = undefined;
+    const npub = aead.Protection(Aes128Ccm).nonce(keys.iv, 3, 5);
+    // CCM (16-byte tag)
+    const n16 = try protectDispatch(.aes_128_ccm_sha256, &keys, 3, 5, inner, &aad, &out);
+    var c16: [inner.len]u8 = undefined;
+    var t16: [16]u8 = undefined;
+    try @import("aesccm").Aes128Ccm.encrypt(&c16, &t16, inner, &aad, npub, keys.key[0..16].*);
+    try testing.expectEqual(inner.len + 16, n16);
+    try testing.expectEqualSlices(u8, &c16, out[0..inner.len]);
+    try testing.expectEqualSlices(u8, &t16, out[inner.len..n16]);
+    // CCM_8 (8-byte tag)
+    const n8 = try protectDispatch(.aes_128_ccm_8_sha256, &keys, 3, 5, inner, &aad, &out);
+    var t8: [8]u8 = undefined;
+    try @import("aesccm").Aes128Ccm8.encrypt(&c16, &t8, inner, &aad, npub, keys.key[0..16].*);
+    try testing.expectEqual(inner.len + 8, n8);
+    try testing.expectEqualSlices(u8, &c16, out[0..inner.len]);
+    try testing.expectEqualSlices(u8, &t8, out[inner.len..n8]);
+    var back: [64]u8 = undefined;
+    try testing.expectEqual(inner.len, try unprotectDispatch(.aes_128_ccm_8_sha256, &keys, 3, 5, out[0..n8], &aad, &back));
+    try testing.expectEqualSlices(u8, inner, back[0..inner.len]);
+    out[0] ^= 1;
+    try testing.expectError(error.DecryptionFailed, unprotectDispatch(.aes_128_ccm_8_sha256, &keys, 3, 5, out[0..n8], &aad, &back));
+}
+
+test "CCM suites: PSK and certificate handshakes complete under both" {
+    try loopbackHandshake(.aes_128_ccm_sha256);
+    try loopbackHandshake(.aes_128_ccm_8_sha256);
+    for ([_]CipherSuite{ .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 }) |suite| {
+        var cc = certDheClientConfig();
+        cc.cipher_suites = &.{suite};
+        var sc = certDheServerConfig();
+        sc.cipher_suites = &.{ .aes_128_gcm_sha256, suite };
+        var client = try Connection.clientInit(cc);
+        defer client.deinit();
+        var server = try Connection.serverInit(sc);
+        defer server.deinit();
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7f)));
+        var b1: [4096]u8 = undefined;
+        var b2: [4096]u8 = undefined;
+        try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+        try testing.expectEqual(suite, server.suite);
+        try expectRoundTrip(&client, &server, "ccm cert");
+    }
 }
 
 // ── handshake flight engine: the mandatory oracle ────────────────────────
@@ -10108,12 +10183,12 @@ test "audit: client: the server's flight — message types, suite, Certificate w
     @memcpy(dg[0..pr.f2_len], pr.f2[0..pr.f2_len]);
     dg[13] = @backingInt(messages.HandshakeType.certificate);
     try testing.expectError(error.UnexpectedMessage, pr.client.handleFlight(dg[0..pr.f2_len], rnd, 0, &b1));
-    // A CCM suite this module knows by number but cannot protect records with.
+    // A suite the client did not offer (a CCM one: wired, but not configured).
     var vb: [4]u8 = undefined;
     const sv = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &vb);
     var shb: [128]u8 = undefined;
     const sh_ccm = try messages.encodeServerHello(.{ .random = @splat(1), .legacy_session_id_echo = &.{}, .cipher_suite = @backingInt(CipherSuite.aes_128_ccm_sha256), .extensions = &.{.{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sv }} }, &shb);
-    try testing.expectError(error.UnsupportedSuite, pr.client.handleFlight(try auditPlainRecord(@backingInt(messages.HandshakeType.server_hello), 0, 0, sh_ccm, &dg), rnd, 0, &b1));
+    try testing.expectError(error.NoCipherSuiteOverlap, pr.client.handleFlight(try auditPlainRecord(@backingInt(messages.HandshakeType.server_hello), 0, 0, sh_ccm, &dg), rnd, 0, &b1));
     // And the genuine flight still completes.
     try testing.expect((try pr.client.handleFlight(pr.f2[0..pr.f2_len], rnd, 0, &b1)).done);
 }

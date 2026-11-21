@@ -163,6 +163,15 @@ test "dtls12: self-interop for every ECDHE_RSA suite, RSA-PSS preferred over PKC
     }
 }
 
+test "dtls12: the RFC 6655 / RFC 7251 AES-128-CCM and CCM_8 suites (RFC 7925's profile), PSK and ECDHE_ECDSA" {
+    for ([_]CipherSuite12{ .psk_with_aes_128_ccm, .psk_with_aes_128_ccm_8 }) |s| {
+        try roundTrip(pskConfig(.client, &.{s}), pskConfig(.server, &.{s}), s);
+    }
+    for ([_]CipherSuite12{ .ecdhe_ecdsa_with_aes_128_ccm, .ecdhe_ecdsa_with_aes_128_ccm_8 }) |s| {
+        try roundTrip(ecdsaClientConfig(&.{s}), ecdsaServerConfig(&.{ .ecdhe_ecdsa_with_aes_128_gcm_sha256, s }), s);
+    }
+}
+
 test "dtls12: ECDHE_RSA with a peer that offers only PKCS#1 v1.5 (rsa_pkcs1_sha256)" {
     // A client whose `signature_algorithms` holds nothing but ECDSA: its
     // 1.2 advertisement is then {ecdsa_secp256r1_sha256, rsa_pkcs1_sha256,

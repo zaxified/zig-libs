@@ -11,17 +11,12 @@
 //! byte-checkable against OpenSSL: `aesgcm.Aes128Gcm` /
 //! `aesgcm.Aes256Gcm` and `chacha_poly.ChaCha20Poly1305`.
 //!
-//! **AES-CCM caveat (honest).** DTLS/TLS 1.3 mandate a 12-byte AEAD nonce.
-//! Zig std's CCM PRESETS (0.17.1) (`aes_ccm.Aes128Ccm8`, etc.) are all fixed at
-//! a 13-byte nonce and the parametric `AesCcm(...)` generator is private, so
-//! there is NO way to instantiate a 12-byte-nonce CCM from std presets. The
-//! `AES_128_CCM_8_SHA256` suite (RFC 7925's CoAP default) therefore CANNOT
-//! be driven correctly through `Protection(Aes128Ccm8)` — its 13-byte nonce
-//! would break interop. Rather than silently ship a wrong-width nonce, CCM
-//! is left UNWIRED here: a 12-byte-nonce CCM (own port, or a future std that
-//! exposes the generic) is required first. This corrects the scaffold's
-//! recon note, which said "AES-CCM is NOT a std gap" — true for a 13-byte
-//! nonce, but the TLS/DTLS profile needs 12.
+//! **AES-CCM.** DTLS/TLS 1.3 mandate a 12-byte AEAD nonce, and Zig std's
+//! CCM presets (0.17.1) are all fixed at 13 bytes with the generic private,
+//! so the CCM suites run on the `aesccm` module's `Aes128Ccm` /
+//! `Aes128Ccm8` (12-byte nonce, tags 16 / 8), whose `encrypt` returns an
+//! error union (boundary errors instead of std's asserts) — `protect` maps
+//! one to `BufferTooShort`, which no record this module builds can reach.
 
 const std = @import("std");
 const burn = @import("burn.zig");
@@ -44,7 +39,7 @@ pub fn Protection(comptime Aead: type) type {
             // nonce are the AEAD's full nonce width; the profile requires 12.
             if (nonce_length != 12) @compileError(
                 "dtls: TLS/DTLS 1.3 record protection requires a 12-byte AEAD nonce; " ++
-                    @typeName(Aead) ++ " has a different nonce_length (see the AES-CCM caveat in aead.zig)",
+                    @typeName(Aead) ++ " has a different nonce_length",
             );
         }
 
@@ -96,7 +91,8 @@ pub fn Protection(comptime Aead: type) type {
             if (out.len < total) return error.BufferTooShort;
             const npub = nonce(static_iv, epoch, sequence_number);
             var tag: [tag_length]u8 = undefined;
-            Aead.encrypt(out[0..plaintext.len], &tag, plaintext, additional_data, npub, key.*);
+            const sealed = Aead.encrypt(out[0..plaintext.len], &tag, plaintext, additional_data, npub, key.*);
+            if (@typeInfo(@TypeOf(sealed)) == .error_union) sealed catch return error.BufferTooShort;
             @memcpy(out[plaintext.len..][0..tag_length], &tag);
             return total;
         }

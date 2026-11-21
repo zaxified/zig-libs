@@ -10,6 +10,8 @@
 //!     own 64-bit `epoch || sequence_number` as `nonce_explicit` (RFC 5288
 //!     §3 allows any value that never repeats under one key; the record
 //!     number never does, RFC 6347 §4.1).
+//!   * AES-CCM and AES-CCM-8 (RFC 6655 §3, the `aesccm` module): the same
+//!     salt || `nonce_explicit` layout as GCM, tags of 16 and 8 bytes.
 //!   * ChaCha20-Poly1305 (RFC 7905 §2): no explicit part; the nonce is the
 //!     12-byte `client/server_write_IV` XOR the left-padded 64-bit
 //!     `epoch || sequence_number`.
@@ -27,15 +29,19 @@ const burn = @import("burn.zig");
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
 const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 const ChaCha20Poly1305 = @import("chachapoly").ChaCha20Poly1305;
+const Aes128Ccm = @import("aesccm").Aes128Ccm;
+const Aes128Ccm8 = @import("aesccm").Aes128Ccm8;
 
 pub const Bulk = enum {
     aes_128_gcm,
     aes_256_gcm,
     chacha20_poly1305,
+    aes_128_ccm,
+    aes_128_ccm_8,
 
     pub fn keyLen(self: Bulk) usize {
         return switch (self) {
-            .aes_128_gcm => 16,
+            .aes_128_gcm, .aes_128_ccm, .aes_128_ccm_8 => 16,
             .aes_256_gcm, .chacha20_poly1305 => 32,
         };
     }
@@ -44,21 +50,30 @@ pub const Bulk = enum {
     /// ChaCha20-Poly1305 (RFC 7905 §2).
     pub fn fixedIvLen(self: Bulk) usize {
         return switch (self) {
-            .aes_128_gcm, .aes_256_gcm => 4,
+            .aes_128_gcm, .aes_256_gcm, .aes_128_ccm, .aes_128_ccm_8 => 4,
             .chacha20_poly1305 => 12,
         };
     }
 
-    /// Bytes a protected record adds to its plaintext: the GCM explicit
-    /// nonce plus the 16-byte tag.
+    /// The AEAD tag: 16 bytes, 8 for CCM_8 (RFC 6655 §3).
+    pub fn tagLen(self: Bulk) usize {
+        return if (self == .aes_128_ccm_8) 8 else 16;
+    }
+
+    /// Whether the record carries an 8-byte explicit nonce (RFC 5288 §3,
+    /// RFC 6655 §3); ChaCha20-Poly1305 has none (RFC 7905 §2).
+    pub fn hasExplicitNonce(self: Bulk) bool {
+        return self != .chacha20_poly1305;
+    }
+
+    /// Bytes a protected record adds to its plaintext: the explicit nonce
+    /// plus the tag.
     pub fn overhead(self: Bulk) usize {
-        return switch (self) {
-            .aes_128_gcm, .aes_256_gcm => 8 + 16,
-            .chacha20_poly1305 => 16,
-        };
+        return (if (self.hasExplicitNonce()) @as(usize, 8) else 0) + self.tagLen();
     }
 };
 
+/// The longest tag of any bulk cipher (`Bulk.tagLen`).
 pub const tag_len = 16;
 
 /// One direction's write key and IV.
@@ -93,7 +108,7 @@ fn additionalData(epoch: u16, seq: u48, content_type: u8, plaintext_len: usize) 
 fn nonce(keys: *const DirKeys, rn: [8]u8) [12]u8 {
     var n: [12]u8 = undefined;
     switch (keys.bulk) {
-        .aes_128_gcm, .aes_256_gcm => {
+        .aes_128_gcm, .aes_256_gcm, .aes_128_ccm, .aes_128_ccm_8 => {
             n[0..4].* = keys.iv[0..4].*;
             n[4..12].* = rn;
         },
@@ -120,7 +135,7 @@ fn sealBody(keys: *const DirKeys, epoch: u16, seq: u48, content_type: u8, plaint
     const ad = additionalData(epoch, seq, content_type, plaintext.len);
     const n = nonce(keys, rn);
     var body = out[record.plaintext_header_len..][0..frag_len];
-    if (keys.bulk != .chacha20_poly1305) {
+    if (keys.bulk.hasExplicitNonce()) {
         body[0..8].* = rn;
         body = body[8..];
     }
@@ -130,8 +145,11 @@ fn sealBody(keys: *const DirKeys, epoch: u16, seq: u48, content_type: u8, plaint
         .aes_128_gcm => Aes128Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key[0..16].*),
         .aes_256_gcm => Aes256Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key),
         .chacha20_poly1305 => ChaCha20Poly1305.encrypt(ct, &tag, plaintext, &ad, n, keys.key),
+        .aes_128_ccm => Aes128Ccm.encrypt(ct, &tag, plaintext, &ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
+        .aes_128_ccm_8 => Aes128Ccm8.encrypt(ct, tag[0..8], plaintext, &ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
     }
-    body[plaintext.len..][0..tag_len].* = tag;
+    const tl = keys.bulk.tagLen();
+    @memcpy(body[plaintext.len..][0..tl], tag[0..tl]);
     return out[0 .. record.plaintext_header_len + frag_len];
 }
 
@@ -149,9 +167,9 @@ fn openBody(keys: *const DirKeys, hdr: record.PlaintextHeader, fragment: []const
     var n: [12]u8 = undefined;
     var body = fragment;
     switch (keys.bulk) {
-        .aes_128_gcm, .aes_256_gcm => {
-            // The explicit nonce is whatever the SENDER chose (RFC 5288 §3),
-            // not necessarily its record number.
+        .aes_128_gcm, .aes_256_gcm, .aes_128_ccm, .aes_128_ccm_8 => {
+            // The explicit nonce is whatever the SENDER chose (RFC 5288 §3,
+            // RFC 6655 §3), not necessarily its record number.
             n[0..4].* = keys.iv[0..4].*;
             n[4..12].* = fragment[0..8].*;
             body = fragment[8..];
@@ -159,12 +177,13 @@ fn openBody(keys: *const DirKeys, hdr: record.PlaintextHeader, fragment: []const
         .chacha20_poly1305 => n = nonce(keys, recordNumber(hdr.epoch, hdr.sequence_number)),
     }
     const ad = additionalData(hdr.epoch, hdr.sequence_number, hdr.content_type, pt_len);
-    const tag = body[pt_len..][0..tag_len].*;
     const pt = out[0..pt_len];
-    const r = switch (keys.bulk) {
-        .aes_128_gcm => Aes128Gcm.decrypt(pt, body[0..pt_len], tag, &ad, n, keys.key[0..16].*),
-        .aes_256_gcm => Aes256Gcm.decrypt(pt, body[0..pt_len], tag, &ad, n, keys.key),
-        .chacha20_poly1305 => ChaCha20Poly1305.decrypt(pt, body[0..pt_len], tag, &ad, n, keys.key),
+    const r: anyerror!void = switch (keys.bulk) {
+        .aes_128_gcm => Aes128Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key[0..16].*),
+        .aes_256_gcm => Aes256Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key),
+        .chacha20_poly1305 => ChaCha20Poly1305.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key),
+        .aes_128_ccm => Aes128Ccm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key[0..16].*),
+        .aes_128_ccm_8 => Aes128Ccm8.decrypt(pt, body[0..pt_len], body[pt_len..][0..8].*, &ad, n, keys.key[0..16].*),
     };
     r catch {
         std.crypto.secureZero(u8, pt);
@@ -178,7 +197,7 @@ fn openBody(keys: *const DirKeys, hdr: record.PlaintextHeader, fragment: []const
 const testing = std.testing;
 
 test "record12: seal/open round trip for every bulk cipher; any flipped byte fails" {
-    for ([_]Bulk{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 }) |bulk| {
+    for ([_]Bulk{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .aes_128_ccm, .aes_128_ccm_8 }) |bulk| {
         var k = DirKeys{ .bulk = bulk };
         for (&k.key, 0..) |*b, i| b.* = @intCast(i);
         for (&k.iv, 0..) |*b, i| b.* = @intCast(0x80 + i);
@@ -230,4 +249,28 @@ test "record12: RFC 5288 §3 nonce = salt || explicit, RFC 7905 §2 nonce = IV x
     std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(&ct, &tag, "xyz", &ad2, n, c.key);
     try testing.expectEqualSlices(u8, &ct, rec2[13..16]);
     try testing.expectEqualSlices(u8, &tag, rec2[16..32]);
+}
+
+test "record12: RFC 6655 §3 CCM nonce = salt || explicit, tags 16 and 8 (layout check against aesccm)" {
+    var k = DirKeys{ .bulk = .aes_128_ccm_8 };
+    k.key = @splat(0x17);
+    k.iv = @splat(0);
+    k.iv[0..4].* = .{ 9, 8, 7, 6 };
+    var buf: [64]u8 = undefined;
+    const rec = try seal(&k, 1, 0x0a0b, 23, "ccm", &buf);
+    try testing.expectEqual(@as(usize, 13 + 8 + 3 + 8), rec.len);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 0, 0, 0x0a, 0x0b }, rec[13..21]);
+    const ad = [_]u8{ 0, 1, 0, 0, 0, 0, 0x0a, 0x0b, 23, 0xfe, 0xfd, 0, 3 };
+    const n = [12]u8{ 9, 8, 7, 6, 0, 1, 0, 0, 0, 0, 0x0a, 0x0b };
+    var ct: [3]u8 = undefined;
+    var t8: [8]u8 = undefined;
+    try Aes128Ccm8.encrypt(&ct, &t8, "ccm", &ad, n, k.key[0..16].*);
+    try testing.expectEqualSlices(u8, &ct, rec[21..24]);
+    try testing.expectEqualSlices(u8, &t8, rec[24..32]);
+    k.bulk = .aes_128_ccm;
+    const rec16 = try seal(&k, 1, 0x0a0b, 23, "ccm", &buf);
+    var t16: [16]u8 = undefined;
+    try Aes128Ccm.encrypt(&ct, &t16, "ccm", &ad, n, k.key[0..16].*);
+    try testing.expectEqualSlices(u8, &ct, rec16[21..24]);
+    try testing.expectEqualSlices(u8, &t16, rec16[24..40]);
 }
