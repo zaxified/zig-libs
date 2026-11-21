@@ -477,6 +477,103 @@ fn encoderParity(c: *Ctx) !void {
     }
 }
 
+/// Code-like bytes: random with branch opcodes planted for every converter.
+fn branchy(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    const out = try gpa.alloc(u8, n);
+    var prng = std.Random.DefaultPrng.init(0xb7c);
+    const r = prng.random();
+    r.bytes(out);
+    var i: usize = 0;
+    while (i + 8 < n) : (i += 4 + r.uintLessThan(usize, 24)) {
+        switch (r.uintLessThan(u8, 8)) {
+            0 => out[i] = 0xE8,
+            1 => out[i + 3] = 0xEB,
+            2 => {
+                out[i] = 0x48;
+                out[i + 3] = 1;
+            },
+            3 => out[i + 3] = 0x94,
+            4 => {
+                out[i] = 0x40;
+                out[i + 1] &= 0x3F;
+            },
+            5 => {
+                out[i + 1] = 0xF0 | (out[i + 1] & 7);
+                out[i + 3] = 0xF8 | (out[i + 3] & 7);
+            },
+            6 => {
+                out[i + 3] = 0x90;
+                out[i] = 0x10 | (out[i] & 0x1F);
+                out[i + 5] = 0x0A | (out[i + 5] & 0xF0);
+            },
+            else => out[i] = 0xE9,
+        }
+        if (r.boolean()) {
+            out[i + 4] = 0;
+            out[i + 2] = 0xFF;
+        }
+    }
+    return out;
+}
+
+/// BCJ / delta chains, multi-block output and `-T` against the `xz` program:
+/// its bytes must equal ours, and ours must decode them.
+fn filterAndBlockParity(c: *Ctx) !void {
+    const Case = struct {
+        args: []const []const u8,
+        preset: u4,
+        filters: []const lzma.Filter = &.{},
+        block_size: u64 = 0,
+        threads: u32 = 1,
+        shape: []const u8 = "branchy",
+    };
+    const cases = [_]Case{
+        .{ .args = &.{ "-T1", "--x86", "--lzma2=preset=3" }, .preset = 3, .filters = &.{.{ .x86 = .{} }} },
+        .{ .args = &.{ "-T1", "--x86=start=4096", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .x86 = .{ .start_offset = 4096 } }} },
+        .{ .args = &.{ "-T1", "--arm", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .arm = .{} }} },
+        .{ .args = &.{ "-T1", "--armthumb", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .armthumb = .{} }} },
+        .{ .args = &.{ "-T1", "--arm64", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .arm64 = .{} }} },
+        .{ .args = &.{ "-T1", "--arm64=start=64", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .arm64 = .{ .start_offset = 64 } }} },
+        .{ .args = &.{ "-T1", "--powerpc", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .powerpc = .{} }} },
+        .{ .args = &.{ "-T1", "--ia64", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .ia64 = .{} }} },
+        .{ .args = &.{ "-T1", "--sparc", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .sparc = .{} }} },
+        .{ .args = &.{ "-T1", "--delta=dist=4", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .delta = 4 }}, .shape = "records-400k" },
+        .{ .args = &.{ "-T1", "--delta=dist=256", "--lzma2=preset=1" }, .preset = 1, .filters = &.{.{ .delta = 256 }} },
+        .{ .args = &.{ "-T1", "--delta=dist=3", "--x86", "--lzma2=preset=2" }, .preset = 2, .filters = &.{ .{ .delta = 3 }, .{ .x86 = .{} } } },
+        .{ .args = &.{ "-T1", "--arm64", "--delta=dist=2", "--sparc", "--lzma2=preset=1" }, .preset = 1, .filters = &.{ .{ .arm64 = .{} }, .{ .delta = 2 }, .{ .sparc = .{} } } },
+        .{ .args = &.{ "-T1", "--lzma2=preset=1", "--block-size=100000" }, .preset = 1, .block_size = 100000, .shape = "text-150k" },
+        .{ .args = &.{ "-T1", "--lzma2=preset=3", "--block-size=65536", "--check=sha256" }, .preset = 3, .block_size = 65536, .shape = "mixed-200k" },
+        .{ .args = &.{ "-T1", "--x86", "--lzma2=preset=1", "--block-size=50000" }, .preset = 1, .filters = &.{.{ .x86 = .{} }}, .block_size = 50000 },
+        .{ .args = &.{ "-T2", "--lzma2=preset=1", "--block-size=77777" }, .preset = 1, .block_size = 77777, .threads = 2, .shape = "records-400k" },
+        .{ .args = &.{ "-T3", "--lzma2=preset=1,dict=64KiB" }, .preset = 1, .threads = 3, .shape = "mixed-3m" },
+        .{ .args = &.{ "-T2", "-1" }, .preset = 1, .threads = 2, .shape = "mixed-3m" },
+    };
+    for (cases, 0..) |cs, i| {
+        if (!c.mine()) continue;
+        const plain = if (std.mem.eql(u8, cs.shape, "branchy")) try branchy(c.gpa, 300_000) else try corpus.generate(c.gpa, corpus.find(cs.shape).?);
+        defer c.gpa.free(plain);
+        const want = c.xzCli(plain, cs.args) catch |e| {
+            c.fail("xz program refused filter case {d} ({s})", .{ i, @errorName(e) });
+            continue;
+        };
+        defer c.gpa.free(want);
+        c.checks += 2;
+        var o: lzma.EncodeOptions = .{ .lzma = lzma.preset(cs.preset, false), .filters = cs.filters, .block_size = cs.block_size, .threads = cs.threads };
+        if (cs.args.len > 1 and std.mem.indexOf(u8, cs.args[1], "dict=64KiB") != null) o.lzma.dict_size = 65536;
+        if (std.mem.indexOf(u8, cs.args[cs.args.len - 1], "sha256") != null) o.check = .sha256;
+        const got = try lzma.compress(c.gpa, plain, .xz, o);
+        defer c.gpa.free(got);
+        if (!std.mem.eql(u8, want, got)) {
+            const at = std.mem.indexOfDiff(u8, want, got) orelse @min(want.len, got.len);
+            c.put("got.xz", got) catch {};
+            c.put("want.xz", want) catch {};
+            c.fail("filter case {d} {s}: {d} bytes vs xz's {d}, first difference at {d}", .{ i, cs.shape, got.len, want.len, at });
+        }
+        var what: [32]u8 = undefined;
+        expectSame(c, try std.mem.print(&what, "xz filter case {d}", .{i}), cs.shape, lzma.decompress(c.gpa, want, .xz, dec_opts), plain);
+    }
+}
+
 fn inList(list: []const []const u8, x: []const u8) bool {
     for (list) |l| if (std.mem.eql(u8, l, x)) return true;
     return false;
@@ -599,6 +696,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var quick = false;
     var decoder_only = false;
     var encoder_only = false;
+    var filters_only = false;
     var shard: ?usize = null;
     var nshards: usize = @min(max_shards, std.Thread.getCpuCount() catch 1);
     var pass: std.ArrayList([]const u8) = .empty;
@@ -606,7 +704,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     const self_exe = args.next() orelse return 2;
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--quick")) quick = true else if (std.mem.eql(u8, a, "--decoder")) decoder_only = true else if (std.mem.eql(u8, a, "--encoder")) encoder_only = true else if (std.mem.eql(u8, a, "--shard")) {
+        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--quick")) quick = true else if (std.mem.eql(u8, a, "--decoder")) decoder_only = true else if (std.mem.eql(u8, a, "--encoder")) encoder_only = true else if (std.mem.eql(u8, a, "--filters")) filters_only = true else if (std.mem.eql(u8, a, "--shard")) {
             // internal: `--shard K/N`, what the parent below passes its children
             const v = args.next() orelse return 2;
             const slash = std.mem.indexOfScalar(u8, v, '/') orelse return 2;
@@ -615,7 +713,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (nshards == 0 or shard.? >= nshards) return 2;
             continue;
         } else {
-            std.debug.print("usage: interop-lzma [--capture] [--quick] [--decoder] [--encoder]\n", .{});
+            std.debug.print("usage: interop-lzma [--capture] [--quick] [--decoder] [--encoder] [--filters]\n", .{});
             return 2;
         }
         try pass.append(gpa, a);
@@ -658,14 +756,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         goldens.deinit(gpa);
     }
     if (capture) c.goldens = &goldens;
-    if (!encoder_only) {
+    if (!encoder_only and !filters_only) {
         try decodeFromLiblzma(&c);
         try decodeFromPython(&c);
         try decodeFromXzProgram(&c);
         try structureChecks(&c);
         try mutantChecks(&c);
     }
-    if (!decoder_only) try encoderParity(&c);
+    if (!decoder_only and !filters_only) try encoderParity(&c);
+    if (!decoder_only or filters_only) try filterAndBlockParity(&c);
 
     if (shard != null) {
         var rb: [48]u8 = undefined;

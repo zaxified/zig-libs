@@ -36,8 +36,8 @@ own description or was measured as a black box.
 
 **Where we are ahead:** the only pure-Zig implementation with an encoder, and the only one whose
 compressor output is checked equal to liblzma's; typed errors, a dictionary and an output cap, and
-a pull `std.Io.Reader` / push `std.Io.Writer` interface. **Where we are behind:** no BCJ / delta
-filters (`error.UnsupportedFilter`), no multi-threaded or multi-block output (B1, B2).
+a pull `std.Io.Reader` / push `std.Io.Writer` interface. **Where we are behind:** no RISC-V
+filter (`error.UnsupportedFilter`), no preset dictionary, no sync-flush.
 
 ## What this module is, and what it is not
 
@@ -52,8 +52,8 @@ reads what liblzma reads and refuses what it refuses, within the limits listed b
 repetitive data costs up to a dictionary of chain steps per byte; `nice_len` is already limited to 273.
 `LzmaOptions.max_depth` (0 = none) is an opt-in ceiling: a larger `depth` is `error.InvalidOptions`.
 
-**Not here (expected by some, deliberately absent):** BCJ and delta filters (the decoder names
-them: `error.UnsupportedFilter`), multi-threaded and multi-block `.xz` compression, the preset
+**Not here (expected by some, deliberately absent):** the RISC-V filter (the decoder names it:
+`error.UnsupportedFilter`), the preset
 dictionary, sync-flush, `.lz` (lzip), `.7z`, raw LZMA1 without an end marker as *encoder* output,
 the `xz` command-line program.
 
@@ -81,7 +81,13 @@ the `xz` command-line program.
   with filter chain and optional sizes, LZMA2 data, padding to 4, check), index (record count,
   unpadded/uncompressed size per block, padding, CRC-32), footer (CRC-32, index size, flags, `YZ`);
   streams may be concatenated with zero padding (multiples of 4) between them. This module writes
-  one block with unknown sizes in its header, as `xz` and Python's `lzma` do.
+  one block with unknown sizes in its header by default, as `xz -T1` and Python's `lzma` do;
+  `EncodeOptions.block_size` starts a new block (a fresh dictionary and coder) every that many
+  uncompressed bytes (`xz --block-size`), and `threads != 1` (`compress`/`compressInto`) compresses
+  the blocks in parallel and writes each header with both sizes, sized as liblzma's multi-threaded
+  encoder sizes it (the widths of the LZMA2 bound and of the block size, the real numbers zero-padded),
+  so the bytes are `xz -TN`'s for any N but 1. The default block size of `threads != 1` is `xz`'s: 3 x the
+  dictionary, at least 1 MiB (`mtBlockSize`).
 - **The encoder's decisions** that make the bytes liblzma's: the same window (a sliding buffer of
   `1.5 x dict`, moved in multiples of 16), the same finders (hc3/hc4 hash chains, bt2/bt3/bt4
   binary trees on a cyclic array, hash functions from the CRC-32 table, 32-bit positions
@@ -97,8 +103,8 @@ the `xz` command-line program.
   x86-64 LLVM builds liblzma's bit-tree, matched-literal and direct-bit sequences are multi-output inline asm (the
   registers stay in registers; the self-hosted x86_64 backend takes the Zig path, `use_asm`); the dictionary ring is
   `overshoot` (16) bytes longer than its window, so a match copy is whole 16-byte moves with no length branch; CRC-64
-  is PCLMULQDQ folding with run-time CPUID detection and a table fallback (`src/crc64.zig`; the encoder and
-  `xzfmt`'s index still use std's). liblzma's reverse-tree asm (position special / align bits, measured at most 1 %)
+  is PCLMULQDQ folding with run-time CPUID detection and a table fallback (the `crc64` module, also used by the encoder
+  and `xzfmt`'s index). liblzma's reverse-tree asm (position special / align bits, measured at most 1 %)
   is not ported.
 
 ## Constant-time contract
@@ -112,7 +118,14 @@ None claimed: the data is public. There is no secret in this module.
   stream can produce (the known size, or `max_output`).
 - `DecodeOptions.max_output`: the total output; one byte over is `error.OutputTooLarge` (the
   decoder never produces more than 1 byte past the cap).
-- Filters: only LZMA2 is read; BCJ, delta and every other filter ID is `error.UnsupportedFilter`.
+- Filters: a chain of up to three of delta (id 0x03) and the branch converters x86, PowerPC, IA-64, ARM, ARM Thumb,
+  SPARC and ARM64 (ids 0x04..0x0A; see `filters.Filter`) in front of the final LZMA2, as
+  the `.xz` format specifies; the decoder undoes them in reverse order through a 64 KiB work buffer and holds back
+  at most 15 bytes per stage until more input or the end of the block (the unconverted tail then passes through, as
+  liblzma's). A chain that does not end in LZMA2, an unknown id (RISC-V 0x0B included) or refused properties (a delta
+  distance outside 1..256, a start offset that is not a multiple of the converter's alignment, a property size other
+  than 0 or 4) is `error.UnsupportedFilter`. The block's check covers the converted (original) bytes and is compared
+  once the held-back tail has been flushed.
   Check types: none, CRC-32, CRC-64, SHA-256; the others are `error.UnsupportedCheck` (liblzma skips
   the verification instead).
 - LZMA2 chunks: the first must reset the dictionary, an LZMA chunk needs properties once, control
@@ -153,10 +166,9 @@ None claimed: the data is public. There is no secret in this module.
 
 ## What is deliberately not done
 
-- **BCJ / delta / ARM64 / RISC-V filters** — the decoder could apply them, the encoder could emit
-  them; nothing in the target (ZIP methods 14 and 95) uses them. Named refusal in the meantime.
-- **Preset dictionaries, sync-flush, multi-block and multi-threaded `.xz` output** — not needed;
-  a block per stream is what the single-threaded `xz` writes.
+- **The RISC-V filter** (id 0x0B, liblzma 5.6; xz-java and the Go readers listed above lack it): a pair-matching
+  converter that is not worth its size without a consumer. The decoder names it (`error.UnsupportedFilter`).
+- **Preset dictionaries and sync-flush** — not needed by the target (ZIP methods 14 and 95).
 - **Reading `.lz` (lzip) or `.7z`** — never; other formats.
 
 ## Open
@@ -196,8 +208,4 @@ algorithm*.
 
 ## Backlog / deferred
 
-- **B1** Multi-block `.xz` output with a block size (the block encoder is a loop over the existing
-  LZ encoder with a reset window); would match `xz --block-size` bytes.
-- **B2** Parallel blocks (`xz -T`), after B1.
-- **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
-- **B7** A public CRC-64/XZ (PCLMULQDQ + slicing-by-8) beside the `crc32` module; `src/crc64.zig` is the private one the decoder uses (the encoder and `xzfmt`'s index still use std's).
+None open.

@@ -12,7 +12,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "XZ Utils liblzma 5.8.1 (0BSD); output checked against it",
-    .deps = .{},
+    .deps = .{"crc64"},
 };
 
 const decoder = @import("decoder.zig");
@@ -41,6 +41,8 @@ pub const LzmaOptions = encoder.LzmaOptions;
 pub const Check = encoder.Check;
 pub const MatchFinder = encoder.MatchFinder;
 pub const Mode = encoder.Mode;
+pub const Filter = encoder.Filter;
+pub const mtBlockSize = encoder.mtBlockSize;
 pub const preset = encoder.preset;
 pub const compress = encoder.compress;
 pub const compressInto = encoder.compressInto;
@@ -50,7 +52,8 @@ pub const StreamWriter = encoder.StreamWriter;
 
 test {
     _ = @import("shapes.zig");
-    _ = @import("crc64.zig");
+    _ = @import("filters.zig");
+    _ = @import("filters_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("encoder_test.zig");
     _ = @import("fuzz_test.zig");

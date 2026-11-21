@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-//! CRC-64/XZ (ECMA-182, reflected), the `.xz` CRC64 check. On x86-64 with
-//! PCLMULQDQ (detected at run time) the folding kernel of liblzma's
+//! crc64 -- CRC-64/XZ (ECMA-182 polynomial, reflected: the `.xz` CRC64 check,
+//! Go's `crc64.ECMA`, liblzma's `lzma_crc64`). On x86-64 with PCLMULQDQ
+//! (detected at run time) the folding kernel of liblzma's
 //! `check/crc_x86_clmul.h` (0BSD, see NOTICE): four lanes folded 512 bits at
 //! a time, one lane 128 bits at a time, Barrett reduction to 64 bits. The
 //! constants are liblzma's (`crc_clmul_consts_gen.c`). Below 16 bytes, for
 //! the tail under 16 bytes and on other targets, slicing-by-8 tables.
-//!
-//! Private to lzma: std's `CRC-64/XZ` is table-driven one byte at a time
-//! (~5 % of an lzma decode). A public CRC-64 next to the `crc32` module is
-//! SPEC.md Backlog B7.
+//! The same value as `std.hash.crc.@"CRC-64/XZ"` (a drop-in for its
+//! `hash`/`update`/`final` shape), several times faster.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +16,18 @@ const builtin = @import("builtin");
 /// 0x42F0E1EBA9EA3693, bit-reflected.
 const poly: u64 = 0xC96C_5795_D787_0F42;
 
+pub const meta = .{
+    .doc = "CRC-64/XZ (ECMA-182, the .xz check) -- x86-64 PCLMULQDQ folding picked at run time, slicing-by-8 fallback; drop-in for std.hash.crc CRC-64/XZ, streaming, extend.",
+    .platform_note = "any (x86-64 PCLMULQDQ asm + portable fallback)",
+    .targets = .{.linux64},
+    .platform = .any,
+    .role = .util,
+    .concurrency = .reentrant,
+    .model_after = "liblzma lzma_crc64 (check/crc64_fast.c, crc_x86_clmul.h)",
+    .deps = .{},
+};
+
+/// Streaming CRC-64/XZ in the shape of `std.hash.crc.@"CRC-64/XZ"`.
 pub const Crc64 = struct {
     /// The finished CRC of the bytes so far (0 for none).
     value: u64 = 0,
@@ -33,12 +44,13 @@ pub const Crc64 = struct {
         return self.value;
     }
 
+    /// The CRC of `bytes` in one call.
     pub fn hash(bytes: []const u8) u64 {
         return extend(0, bytes);
     }
 };
 
-/// The CRC of `a ++ bytes` from the CRC `crc` of `a`.
+/// The CRC of `a ++ bytes` from the CRC `crc` of `a` (liblzma's `lzma_crc64(bytes, len, crc)`).
 pub fn extend(crc: u64, bytes: []const u8) u64 {
     var reg = ~crc;
     var p = bytes;
@@ -207,4 +219,41 @@ test "crc64: the table path alone equals the kernel" {
     while (n <= buf.len) : (n += 16) {
         try std.testing.expectEqual(tableUpdate(~@as(u64, 0x1234), buf[0..n]), pclmulRegister(~@as(u64, 0x1234), buf[0..n]));
     }
+}
+
+/// 100003 bytes of `kat_input`, the CRC-64 liblzma computed (`tools/gen_kat.py`).
+fn katInput(buf: []u8) void {
+    var x: u32 = 12345;
+    for (buf) |*b| {
+        x = x *% 1664525 +% 1013904223;
+        b.* = @truncate(x >> 24);
+    }
+}
+
+test "crc64: values liblzma computed (tools/gen_kat.py), at the lengths around every fold boundary" {
+    const kat = [_]struct { n: usize, crc: u64 }{
+        .{ .n = 1, .crc = 0xd7532e49984f3e05 },
+        .{ .n = 15, .crc = 0x4ed7002d38b6238a },
+        .{ .n = 16, .crc = 0xff4ed7002d38b623 },
+        .{ .n = 17, .crc = 0xf4b031bdd8467e26 },
+        .{ .n = 63, .crc = 0x52b7de86ba27ab49 },
+        .{ .n = 64, .crc = 0xbf217724a84eeefb },
+        .{ .n = 65, .crc = 0x7defc97205b0ce6c },
+        .{ .n = 1000, .crc = 0x2c0e8d107614692f },
+        .{ .n = 65536, .crc = 0xad4f556ef57c8a40 },
+        .{ .n = 100003, .crc = 0xa2482a75ea4257b7 },
+    };
+    var buf: [100003]u8 = undefined;
+    katInput(&buf);
+    for (kat) |k| try std.testing.expectEqual(k.crc, Crc64.hash(buf[0..k.n]));
+}
+
+test "crc64: extend continues a prefix CRC, from any split" {
+    var buf: [5000]u8 = undefined;
+    katInput(&buf);
+    const whole = Crc64.hash(&buf);
+    for ([_]usize{ 0, 1, 15, 16, 17, 1000, 4999, 5000 }) |k| {
+        try std.testing.expectEqual(whole, extend(Crc64.hash(buf[0..k]), buf[k..]));
+    }
+    try std.testing.expectEqual(@as(u64, 0), Crc64.hash(""));
 }

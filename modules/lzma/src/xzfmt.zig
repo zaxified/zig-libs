@@ -5,6 +5,8 @@
 //! checked against.
 
 const std = @import("std");
+const filters = @import("filters.zig");
+const crc64 = @import("crc64");
 
 pub const header_magic = [6]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
 pub const footer_magic = [2]u8{ 'Y', 'Z' };
@@ -63,6 +65,10 @@ pub const BlockHeader = struct {
     compressed_size: ?u64 = null,
     uncompressed_size: ?u64 = null,
     dict_size: u32 = 0,
+    /// The filters before LZMA2, in header order (the encoder applies them in
+    /// this order, the decoder undoes them in reverse).
+    filters: [filters.Filter.max_chain]filters.Filter = undefined,
+    n_filters: u8 = 0,
 };
 
 pub const BlockError = error{ BadHeader, UnsupportedFilter };
@@ -111,21 +117,27 @@ pub fn parseBlockHeader(buf: []const u8) BlockError!BlockHeader {
     }
     var unsupported = false;
     var lzma2_props: ?u8 = null;
-    for (0..n_filters) |_| {
+    for (0..n_filters) |k| {
         const id = vliFrom(body, &pos) orelse return error.BadHeader;
         const psize = vliFrom(body, &pos) orelse return error.BadHeader;
         if (psize > body.len - pos) return error.BadHeader;
         const props = body[pos..][0..@intCast(psize)];
         pos += props.len;
         if (id == filter_lzma2) {
-            if (props.len != 1) return error.BadHeader;
+            // LZMA2 is the last filter, and only the last.
+            if (props.len != 1 or k != n_filters - 1) return error.BadHeader;
             lzma2_props = props[0];
+        } else if (k == n_filters - 1) {
+            // A chain must end in LZMA2 (liblzma: an options error).
+            return error.UnsupportedFilter;
+        } else if (filters.Filter.fromProps(id, props)) |f| {
+            h.filters[h.n_filters] = f;
+            h.n_filters += 1;
         } else unsupported = true;
     }
     if (unsupported) return error.UnsupportedFilter;
-    if (n_filters != 1) return error.BadHeader;
     for (body[pos..]) |x| if (x != 0) return error.BadHeader;
-    h.dict_size = lzma2DictSize(lzma2_props.?) orelse return error.BadHeader;
+    h.dict_size = lzma2DictSize(lzma2_props orelse return error.BadHeader) orelse return error.BadHeader;
     return h;
 }
 
@@ -135,7 +147,7 @@ pub fn parseBlockHeader(buf: []const u8) BlockError!BlockHeader {
 pub const IndexHash = struct {
     count: u64 = 0,
     total: u64 = 0,
-    crc: std.hash.crc.@"CRC-64/XZ" = std.hash.crc.@"CRC-64/XZ".init(),
+    crc: crc64.Crc64 = crc64.Crc64.init(),
 
     pub fn add(h: *IndexHash, unpadded: u64, uncompressed: u64) error{Overflow}!void {
         if (unpadded > vli_max or uncompressed > vli_max) return error.Overflow;

@@ -44,8 +44,8 @@ chunks to the `0x00` end byte).
 
 `xz` support: concatenated streams and stream padding, block header sizes (present or not), block
 padding, the index checked against the blocks, CRC-32, CRC-64 and SHA-256 checks verified.
-Refused by name, not misread: BCJ and delta filters (`error.UnsupportedFilter`) and check types
-other than those four (`error.UnsupportedCheck`).
+BCJ (x86, PowerPC, IA-64, ARM, ARM Thumb, SPARC, ARM64) and delta filter chains are decoded. Refused by name, not
+misread: the RISC-V filter (`error.UnsupportedFilter`) and check types other than those four (`error.UnsupportedCheck`).
 
 A failure is a typed `DecodeError` (`BadMagic`, `BadHeader`, `BadFooter`, `BadIndex`,
 `UnsupportedFilter`, `UnsupportedCheck`, `DictTooLarge`, `CorruptData`, `CheckMismatch`,
@@ -78,10 +78,12 @@ const raw = try lzma.compress(gpa, input, .lzma1, .{ .lzma = o });
 (`lc`, `lp`, `pb`, `dict_size`, `mode`, `mf`, `nice_len`, `depth`) can be changed after. The
 output depends on the input and the options only, not on how the input was cut into writes.
 `compressInto` writes into a buffer (`compressBound(n)` bytes always fit). `EncodeFormat` is `.xz`
-(one LZMA2 block, sizes unknown in the block header — what `xz` and Python's `lzma` write),
+(by default one LZMA2 block, sizes unknown in the block header — what `xz -T1` and Python's `lzma` write; `EncodeOptions`
+also takes `filters` (BCJ / delta, `xz --x86 ...`), `block_size` (`xz --block-size`) and `threads` (`xz -T`, in `compress` /
+`compressInto`, with the blocks compressed in parallel; `gpa` must be thread-safe)),
 `.lzma_alone`, `.lzma1` (end marker, no header) or `.lzma2`.
 
-Not here: multi-threaded or multi-block `.xz` output, BCJ / delta filters, preset dictionaries,
+Not here: the RISC-V filter, preset dictionaries,
 sync-flush, LZMA1 without the end marker. See SPEC.md.
 
 Run `zig build example-lzma` / `zig build run-example-lzma` for a complete round trip.

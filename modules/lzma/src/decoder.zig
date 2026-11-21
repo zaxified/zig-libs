@@ -9,7 +9,8 @@ const Writer = std.Io.Writer;
 const c = @import("common.zig");
 const dec = @import("lzma_dec.zig");
 const xzfmt = @import("xzfmt.zig");
-const crc64 = @import("crc64.zig");
+const crc64 = @import("crc64");
+const filters = @import("filters.zig");
 
 pub const Error = error{
     /// The `.xz` stream magic is wrong.
@@ -20,7 +21,8 @@ pub const Error = error{
     BadFooter,
     /// The index does not describe the blocks that were decoded.
     BadIndex,
-    /// A filter other than LZMA2 (BCJ, delta, ...) or an unknown filter ID.
+    /// A filter chain that does not end in LZMA2, an unknown filter ID or
+    /// refused filter properties (the filters understood are in `filters.Filter`).
     UnsupportedFilter,
     /// An integrity-check type other than none, CRC32, CRC64, SHA-256.
     UnsupportedCheck,
@@ -203,6 +205,13 @@ pub const Decoder = struct {
     block_out: u64 = 0,
     index: xzfmt.IndexHash = .{},
     stream_started: bool = false,
+    /// The current block has filters (BCJ, delta): `chain` converts the LZMA2
+    /// output, `fr` is the converted bytes not yet handed out.
+    chain: ?*filters.Chain = null,
+    chain_active: bool = false,
+    fr: []const u8 = &.{},
+    /// The block's stored check, compared once the filtered tail is flushed.
+    check_stored: ?[32]u8 = null,
 
     /// `in` needs a non-empty buffer (an empty one cannot take a byte): a
     /// zero-capacity reader that is not `Reader.fixed` is a checked panic
@@ -216,6 +225,7 @@ pub const Decoder = struct {
     pub fn deinit(d: *Decoder) void {
         if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf.ptr[0 .. d.dict.buf.len + dec.Dict.overshoot]);
         d.gpa.destroy(d.lz);
+        if (d.chain) |ch| d.gpa.destroy(ch);
         d.* = undefined;
     }
 
@@ -225,10 +235,44 @@ pub const Decoder = struct {
     pub fn read(d: *Decoder, dest: []u8) Error!usize {
         if (d.failed) |e| return e;
         if (dest.len == 0) return 0;
-        return d.readInner(dest) catch |e| {
+        return (if (d.format == .xz) d.readXz(dest) else d.readInner(dest)) catch |e| {
             d.failed = e;
             return e;
         };
+    }
+
+    /// `readInner` plus the filter chain of a block that has one: the LZMA2
+    /// output goes through `chain`, whose held-back tail is flushed (and the
+    /// block's check compared) when the block ends.
+    fn readXz(d: *Decoder, dest: []u8) Error!usize {
+        while (true) {
+            if (d.fr.len != 0) {
+                const n = @min(dest.len, d.fr.len);
+                @memcpy(dest[0..n], d.fr[0..n]);
+                d.fr = d.fr[n..];
+                return n;
+            }
+            if (!d.chain_active) {
+                const n = try d.readInner(dest);
+                if (n == 0 and d.chain_active) continue; // a filtered block began
+                return n;
+            }
+            const ch = d.chain.?;
+            const n = try d.readInner(ch.input()[0..filters.chunk]);
+            if (n == 0) {
+                // The block ended: pass the held-back tail, then judge the check.
+                d.fr = ch.feed(0, true);
+                d.check.update(d.fr);
+                d.chain_active = false;
+                if (d.check_stored) |st| {
+                    d.check_stored = null;
+                    try d.verifyCheck(&st);
+                }
+            } else {
+                d.fr = ch.feed(n, false);
+                d.check.update(d.fr);
+            }
+        }
     }
 
     // ── input helpers ───────────────────────────────────────────────────
@@ -345,7 +389,12 @@ pub const Decoder = struct {
                 if (n != 0) return n;
             },
             .lzma2_control => try d.lzma2Control(),
-            .xz_block => try d.xzBlockStart(),
+            .xz_block => {
+                // A filtered block ended: the caller flushes its tail first.
+                if (d.chain_active) return 0;
+                try d.xzBlockStart();
+                if (d.chain_active) return 0;
+            },
         };
     }
 
@@ -382,7 +431,7 @@ pub const Decoder = struct {
             if (d.seg_known) d.seg_left -= n;
             d.total_out += n;
             d.block_out += n;
-            if (d.phaseIsXz()) d.check.update(dest[0..n]);
+            if (d.phaseIsXz() and !d.chain_active) d.check.update(dest[0..n]);
             if (d.total_out > d.max_out) return error.OutputTooLarge;
         }
         return n;
@@ -544,6 +593,12 @@ pub const Decoder = struct {
         try d.setupDict(d.block.dict_size, d.block.uncompressed_size);
         d.need_dict_reset = true;
         d.need_props = true;
+        if (d.block.n_filters != 0) {
+            if (d.chain == null) d.chain = try d.gpa.create(filters.Chain);
+            d.chain.?.init(d.block.filters[0..d.block.n_filters], false);
+            d.chain_active = true;
+            d.fr = &.{};
+        }
         d.phase = .lzma2_control;
     }
 
@@ -560,6 +615,14 @@ pub const Decoder = struct {
         const csize = xzfmt.checkSize(d.stream_check);
         var stored: [32]u8 = undefined;
         try d.readBytes(stored[0..csize]);
+        // With filters the data the check covers is still in the chain.
+        if (d.chain_active) d.check_stored = stored else try d.verifyCheck(&stored);
+        const unpadded = @as(u64, b.header_size) + d.block_in + csize;
+        d.index.add(unpadded, d.block_out) catch return error.CorruptData;
+        d.phase = .xz_block;
+    }
+
+    fn verifyCheck(d: *Decoder, stored: *const [32]u8) Error!void {
         switch (d.check) {
             .none => {},
             .crc32 => |h| {
@@ -575,9 +638,6 @@ pub const Decoder = struct {
                 if (!std.mem.eql(u8, &out, stored[0..32])) return error.CheckMismatch;
             },
         }
-        const unpadded = @as(u64, b.header_size) + d.block_in + csize;
-        d.index.add(unpadded, d.block_out) catch return error.CorruptData;
-        d.phase = .xz_block;
     }
 
     /// The 0x00 index indicator was just read.
