@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change (previously `UnsupportedExpression`):** `mpls [N]` and `pppoes [N]` combine with other primitives as in libpcap: what follows is shifted (4 / 8 bytes), `ip` / `ip6` over MPLS are the bottom-of-stack bit and the version nibble, over PPPoE the PPP protocol field (0x0021 / 0x0057). `arp`, `vlan`, a second `mpls`, nesting and the live ancillary `vlan` form around them stay `UnsupportedExpression`; MAC addresses and `multicast` over PPPoE too (libpcap refuses them). 66 rows checked against `tcpdump -r`.
+
 - **2026-11-21** — **CONSUMER-VISIBLE (additive):** `filter.compileInto(out, scratch, expr, opts)`: a compile with no allocator (caller-owned working buffer and output slice; `error.OutOfMemory` when either is too small), the same program as `compileOpts`. `compile`/`compileOpts` unchanged (internal `Scratch` buffer's overflow arena is now optional).
 
 - **2026-11-20** — **Behaviour change:** a filter with more than `max_insns` comparisons that is also malformed is now `error.Syntax` (it used to be `FilterTooComplex` the moment the cap was passed, before the parser reached the error); a well-formed over-long filter is still `FilterTooComplex`. The parser keeps reading past the cap without building more nodes.

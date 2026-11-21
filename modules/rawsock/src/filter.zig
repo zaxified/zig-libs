@@ -655,7 +655,6 @@ fn compileCore(gpa: ?std.mem.Allocator, out_buf: []BpfInsn, scratch: *Scratch, a
     // libpcap then shifts the later primitives' offsets by a run-time amount
     // (`ldx M[1]`): alone it is the plain form above, combined with other
     // primitives the whole expression is parsed again in the run-time form.
-    if (p.alone_only and p.leaves != p.alone_leaves) return error.UnsupportedExpression;
     var live = false;
     if (p.saw_vlan and opts.vlan_ancillary) {
         scratch.fba.reset();
@@ -1083,9 +1082,11 @@ const Parser = struct {
     /// the shift in M[0].
     live: bool = false,
     live_x: bool = false,
-    /// `mpls` / `pppoes` were seen and how many leaves they made (alone only).
-    alone_only: bool = false,
-    alone_leaves: usize = 0,
+    /// An `mpls` / `pppoes` primitive was seen (libpcap shifts and re-reads what FOLLOWS it,
+    /// as with `vlan`): the offsets moved by 4 / 8 are in `shift`, and an IPv4 / IPv6 test is
+    /// the label stack's bottom bit and the version nibble / the PPP protocol field.
+    in_mpls: bool = false,
+    in_pppoes: bool = false,
     /// Some primitive loads through the run-time shift (so M[0] is needed).
     dyn_used: bool = false,
     /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
@@ -1254,11 +1255,20 @@ const Parser = struct {
             return p.etherType(0x8863); // PPPoE discovery
         }
         if (eql(first, "mpls") or eql(first, "pppoes")) {
-            // Alone only: in libpcap everything written after them moves (the label
-            // stack / the PPPoE header), which this compiler has no form for.
+            // libpcap shifts everything written after them (the label / the PPPoE header + the PPP
+            // protocol field) and tests IPv4 / IPv6 there by the bottom-of-stack bit and the
+            // version nibble / by the PPP protocol. Built for one of either, followed by IP,
+            // IPv6 and what rides on them; what libpcap refuses over MPLS ("unsupported protocol over
+            // mpls": `arp`, `vlan`, a second `mpls`) is `UnsupportedExpression` here as well, and
+            // so are the live ancillary `vlan` form around them and the nesting of the two.
             try p.ethernetOnly();
+            if (p.live or p.in_mpls) return error.UnsupportedExpression;
             const mpls = eql(first, "mpls");
-            const before = p.leaves;
+            if (p.in_pppoes) {
+                // Over a PPPoE session: the PPP protocol field only (0x0281 for `mpls`, 0x8864 for a second `pppoes`), no shift.
+                if (try p.lex.peek()) |nxt| if (parseNum(u32, nxt) != null) return error.UnsupportedExpression;
+                return p.etherType(if (mpls) 0x8847 else 0x8864);
+            }
             var id: ?u32 = null;
             if (try p.lex.peek()) |nxt| if (parseNum(u32, nxt) != null) {
                 _ = try p.lex.next();
@@ -1266,9 +1276,9 @@ const Parser = struct {
                 if (id.? > (if (mpls) @as(u32, 0xfffff) else 0xffff)) return error.Syntax;
             };
             var n = try p.etherType(if (mpls) 0x8847 else 0x8864);
-            if (id) |v| n = try p.both(.@"and", n, try p.t(.{ .size = .w, .off = 14, .fixed = true, .mask = if (mpls) 0xfffff000 else 0xffff, .k = if (mpls) v << 12 else v }));
-            p.alone_only = true;
-            p.alone_leaves += p.leaves - before;
+            if (id) |v| n = try p.both(.@"and", n, try p.t(.{ .size = .w, .off = 14, .mask = if (mpls) 0xfffff000 else 0xffff, .k = if (mpls) v << 12 else v }));
+            if (mpls) p.in_mpls = true else p.in_pppoes = true;
+            p.shift += if (mpls) 4 else 8;
             return n;
         }
         if (eql(first, "ifname") or eql(first, "rnr") or eql(first, "ruleset") or eql(first, "reason") or eql(first, "action") or eql(first, "srnr") or eql(first, "subrulenum")) return error.UnsupportedExpression; // OpenBSD pflog only (libpcap: "supported only on PF linktype")
@@ -1341,6 +1351,7 @@ const Parser = struct {
     /// `vlan` and `vlan N` as the WHOLE expression (see `compileOpts`).
     fn vlan(p: *Parser) CompileError!*const Node {
         try p.ethernetOnly();
+        if (p.in_mpls or p.in_pppoes) return error.UnsupportedExpression; // libpcap: "no VLAN match after MPLS"
         const before = p.leaves;
         var id: ?u16 = null;
         if (try p.lex.peek()) |nxt| if (parseNum(u16, nxt) != null) {
@@ -1447,6 +1458,7 @@ const Parser = struct {
         if (std.mem.readInt(u32, &addr, .big) & ~(p.mask_override orelse maskOf(pl)) != 0) return error.Syntax;
         if (fam == .ip4) return p.ipAddr(dir, addr, pl);
         if (p.opts.link == .raw or p.opts.link == .bsd_null or p.opts.link == .bsd_loop) return p.ipAddr(dir, addr, pl); // no ARP there
+        if (p.in_mpls) return p.ipAddr(dir, addr, pl); // libpcap drops the ARP and RARP forms of a bare host over MPLS
         const arp_or_rarp = try p.both(.@"or", try p.arpAddr(0x0806, dir, addr, pl), try p.arpAddr(0x8035, dir, addr, pl));
         return p.both(.@"or", try p.ipAddr(dir, addr, pl), arp_or_rarp);
     }
@@ -1479,6 +1491,7 @@ const Parser = struct {
 
     fn multicast(p: *Parser) CompileError!*const Node {
         try p.ethernetOnly();
+        if (p.in_pppoes) return error.UnsupportedExpression; // libpcap: the link type is PPP from here
         return p.t(.{ .size = .b, .off = 0, .kind = .set, .fixed = true, .k = 1 });
     }
 
@@ -1581,6 +1594,27 @@ const Parser = struct {
     }
 
     fn etherType(p: *Parser, ty: u16) !*const Node {
+        if (p.in_mpls) {
+            // Over MPLS: the label's bottom-of-stack bit (the byte before the shifted payload) and the IP version nibble.
+            const nibble: u32 = switch (ty) {
+                0x0800 => 0x40,
+                0x86dd => 0x60,
+                else => return error.UnsupportedExpression,
+            };
+            const bos = try p.t(.{ .size = .b, .off = 12, .mask = 0x01, .k = 0x01 });
+            return p.both(.@"and", bos, try p.t(.{ .size = .b, .off = 14, .mask = 0xf0, .k = nibble }));
+        }
+        if (p.in_pppoes) {
+            // Over a PPPoE session: the PPP protocol field in place of the EtherType (IPv4 0x0021, IPv6 0x0057, MPLS 0x0281 / 0x0283; other values as they are).
+            const ppp: u32 = switch (ty) {
+                0x0800 => 0x0021,
+                0x86dd => 0x0057,
+                0x8847 => 0x0281,
+                0x8848 => 0x0283,
+                else => ty,
+            };
+            return p.t(.{ .size = .h, .off = 12, .k = ppp });
+        }
         switch (p.opts.link) {
             .raw => {
                 // No EtherType: the IP version nibble. Anything else never matches
@@ -1613,6 +1647,7 @@ const Parser = struct {
 
     fn etherAddr(p: *Parser, dir: Dir, mac: [6]u8) CompileError!*const Node {
         try p.ethernetOnly();
+        if (p.in_pppoes) return error.UnsupportedExpression; // libpcap: the link type is PPP from here
         if (dir == .either) return p.both(.@"or", try p.etherAddr(.src, mac), try p.etherAddr(.dst, mac));
         const base: u32 = if (dir == .src) 6 else 0;
         return p.both(
@@ -2551,7 +2586,7 @@ test "compile: the deepest accepted inputs fit in a 64 KiB stack" {
     }
 }
 
-test "runLiveMeta answers the kernel's ancillary words from the metadata, and mpls / pppoes stay alone" {
+test "runLiveMeta answers the kernel's ancillary words from the metadata, and the mpls / pppoes limits" {
     const a = ancillary_base;
     const words = [_]struct { size: u16, off: u32 }{ .{ .size = op.h, .off = a + 4 }, .{ .size = op.w, .off = a + 8 }, .{ .size = op.b, .off = a + 48 }, .{ .size = op.h, .off = a + 44 } };
     const meta: LiveMeta = .{ .vlan_tci = 0x6007, .pkttype = 4, .ifindex = 77 };
@@ -2562,13 +2597,53 @@ test "runLiveMeta answers the kernel's ancillary words from the metadata, and mp
         try testing.expectEqual(@as(u32, 0), runLiveMeta(&prog, "", .{})); // no tag, host packet, interface 0
         try testing.expectEqual(@as(u32, 0), run(&prog, "")); // run has no metadata: the load drops the frame
     }
-    // mpls / pppoes: the label / session id limits, and only alone.
+    // mpls / pppoes: the label / session id limits.
     for ([_][]const u8{ "mpls 1048576", "pppoes 65536", "mpls 4294967296" }) |e| try testing.expectError(error.Syntax, compile(testing.allocator, e));
     for ([_][]const u8{ "mpls 1048575", "mpls", "pppoes 65535", "pppoes", "pppoed" }) |e| testing.allocator.free(try compile(testing.allocator, e));
-    for ([_][]const u8{ "mpls and ip", "ip and mpls", "pppoes and ip", "pppoes 7 or tcp", "not mpls and ip" }) |e| {
-        try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+    // Combined with IP and what rides on it they compile (see "mpls and pppoes combined" below); `ip and mpls` is
+    // the program libpcap's optimiser refuses ("rejects all packets"): here it compiles and matches nothing.
+    for ([_][]const u8{ "mpls and ip", "ip and mpls", "pppoes and ip", "pppoes 7 or tcp", "not mpls and ip" }) |e| testing.allocator.free(try compile(testing.allocator, e));
+    // What libpcap refuses over MPLS / PPPoE, or this compiler has no form for: nesting, `arp`, `vlan`, MAC addresses over PPPoE.
+    for ([_][]const u8{ "mpls and mpls", "mpls 5 or mpls 100", "pppoes 7 or pppoes 9", "mpls and pppoes", "mpls and arp", "mpls and rarp", "mpls and vlan", "pppoes and vlan 5", "pppoes and ether src 00:11:22:33:44:55", "pppoes and ether host 00:11:22:33:44:55", "pppoes and multicast", "pppoes and broadcast" }) |e| {
+        testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e)) catch |er| {
+            std.debug.print("expression: {s}\n", .{e});
+            return er;
+        };
     }
+    // The live ancillary vlan form around them has no form for them either.
+    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "vlan and mpls and ip", .{ .vlan_ancillary = true }));
     for ([_][]const u8{ "geneve", "ifname x", "rnr 1", "decnet", "lane" }) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+}
+
+const mpls_oracle = @import("testdata/mpls_oracle.zig");
+
+test "compile: mpls and pppoes combined with IP, IPv6 and what rides on them select the frames tcpdump selects" {
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    const corpus = hex(mpls_oracle.corpus);
+    var shifted: usize = 0;
+    for (mpls_oracle.oracle) |o| {
+        const prog = compile(testing.allocator, o[0]) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+        defer testing.allocator.free(prog);
+        try validate(prog);
+        try verdictsOf(prog, &corpus, &got);
+        testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+        if (got.items.len != 0) shifted += 1;
+    }
+    // Not vacuous: most rows select something.
+    try testing.expect(shifted > mpls_oracle.oracle.len / 2);
+    for (mpls_oracle.refused) |e| try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, e));
+    // The same program over the live-metadata run and a frame with the label stack deeper than the first label.
+    const never = try compile(testing.allocator, "ip and mpls");
+    defer testing.allocator.free(never);
+    try verdictsOf(never, &corpus, &got);
+    try testing.expectEqual(@as(usize, 0), got.items.len);
 }
 
 test "compile: protocol and EtherType names mean their numbers (each table entry used)" {

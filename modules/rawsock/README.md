@@ -122,4 +122,4 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 
 ## Not provided
 
-`recvmmsg` batching, a TX ring, `TPACKET_V2`, IPv6 Neighbor-Discovery helpers, 802.11 and foreign PPP savefiles, a filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump; `run` is loop-free), `mpls`/`pppoes` combined with other primitives and `geneve`; Linux only (no BSD `/dev/bpf`). Why, and what is planned: SPEC *What is deliberately not done* and *Backlog / deferred*.
+`recvmmsg` batching, a TX ring, `TPACKET_V2`, IPv6 Neighbor-Discovery helpers, 802.11 and foreign PPP savefiles, a filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump; `run` is loop-free), `geneve` and a stack of `mpls` labels; Linux only (no BSD `/dev/bpf`). Why, and what is planned: SPEC *What is deliberately not done* and *Backlog / deferred*.
