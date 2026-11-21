@@ -531,8 +531,9 @@ pub const Options = struct {
 /// `Link.dlt`): `ethernet` [EN10MB 1], `linux_sll` [LINUX_SLL 113, `-i any`
 /// in libpcap's default], `linux_sll2` [LINUX_SLL2 276, what tcpdump 4.99 picks
 /// for `-i any`], `raw` [RAW 101], `bsd_null` [NULL 0: a 4-byte address-family
-/// word in the byte order of the capturing host] and `bsd_loop` [LOOP 108: the
-/// same word in network order].
+/// word in the byte order of the capturing host], `bsd_loop` [LOOP 108: the
+/// same word in network order] and `ppp` [PPP 9: address, control and a 2-byte
+/// protocol field before the IP header].
 pub const Link = enum {
     ethernet,
     linux_sll,
@@ -540,6 +541,7 @@ pub const Link = enum {
     linux_sll2,
     bsd_null,
     bsd_loop,
+    ppp,
 
     /// The `pcap` savefile link-type number (`pcap.Header.linktype`).
     pub fn dlt(l: Link) u32 {
@@ -549,6 +551,7 @@ pub const Link = enum {
             .raw => 101,
             .linux_sll2 => 276,
             .bsd_null => 0,
+            .ppp => 9,
             .bsd_loop => 108,
         };
     }
@@ -568,7 +571,7 @@ pub const Link = enum {
             .linux_sll => 16,
             .raw => 0,
             .linux_sll2 => 20,
-            .bsd_null, .bsd_loop => 4,
+            .bsd_null, .bsd_loop, .ppp => 4,
         };
     }
 };
@@ -1578,7 +1581,7 @@ const Parser = struct {
         if (eql(name, "ether")) {
             // libpcap reads `ether[N]` as link-header byte N on NULL, LOOP and
             // cooked v2 as well (`tcpdump -y NULL -d 'ether[0] = 1'` is `ldb [0]`).
-            if (p.opts.link != .bsd_null and p.opts.link != .bsd_loop and p.opts.link != .linux_sll2) try p.ethernetOnly();
+            if (p.opts.link != .bsd_null and p.opts.link != .bsd_loop and p.opts.link != .linux_sll2 and p.opts.link != .ppp) try p.ethernetOnly();
             return p.relation(.{ .size = size, .off = off, .fixed = true, .k = 0 }, null);
         }
         if (eql(name, "ip") or eql(name, "ip6") or eql(name, "arp") or eql(name, "rarp")) {
@@ -1641,6 +1644,14 @@ const Parser = struct {
             },
             // The protocol is the first field of the cooked-v2 header.
             .linux_sll2 => return p.t(.{ .size = .h, .off = 0, .fixed = true, .k = ty }),
+            // PPP: the protocol field after the address and control bytes, in place of the EtherType (IPv4 0x0021, IPv6 0x0057, MPLS 0x0281 / 0x0283; ARP and the rest as they are, as libpcap compiles them).
+            .ppp => return p.t(.{ .size = .h, .off = 2, .fixed = true, .k = switch (ty) {
+                0x0800 => 0x0021,
+                0x86dd => 0x0057,
+                0x8847 => 0x0281,
+                0x8848 => 0x0283,
+                else => ty,
+            } }),
             .ethernet, .linux_sll => return p.t(.{ .size = .h, .off = 12, .k = ty }),
         }
     }
@@ -2284,6 +2295,36 @@ fn verdictsOf(prog: []const BpfInsn, corpus: []const u8, out: *std.ArrayList(usi
     while (try r.next()) |rec| {
         if (run(prog, rec.data) != 0) try out.append(testing.allocator, @intCast(rec.ts_ns / std.time.ns_per_s - 1000));
     }
+}
+
+const ppp_oracle = @import("testdata/ppp_oracle.zig");
+
+test "compile: a DLT_PPP savefile selects the frames tcpdump -y PPP selects, and the refusals match" {
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    const corpus = hex(ppp_oracle.corpus);
+    const rd = try pcap.Reader.init(&corpus);
+    try testing.expectEqual(Link.ppp.dlt(), rd.header.linktype);
+    try testing.expectEqual(@as(?Link, .ppp), Link.fromDlt(9));
+    var nonempty: usize = 0;
+    for (ppp_oracle.oracle) |o| {
+        const prog = compileOpts(testing.allocator, o[0], .{ .link = .ppp }) catch |e| {
+            std.debug.print("ppp expression: {s}\n", .{o[0]});
+            return e;
+        };
+        defer testing.allocator.free(prog);
+        try validate(prog);
+        try verdictsOf(prog, &corpus, &got);
+        testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
+            std.debug.print("ppp expression: {s}\n", .{o[0]});
+            return e;
+        };
+        if (got.items.len != 0) nonempty += 1;
+    }
+    try testing.expect(nonempty > ppp_oracle.oracle.len / 2);
+    for (ppp_oracle.refused) |e| try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, e, .{ .link = .ppp }));
+    // libpcap builds `mpls` / `pppoes` on PPP; this compiler has no form for them there.
+    for ([_][]const u8{ "mpls", "pppoes", "pppoed" }) |e| try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, e, .{ .link = .ppp }));
 }
 
 test "compile: SLL and raw-IP savefiles select the frames tcpdump -y selects" {
