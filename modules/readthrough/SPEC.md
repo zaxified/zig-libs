@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [eko/gocache](https://github.com/eko/gocache) | Go | MIT | 2.9k | push 2026-09-13 | README: a "loadable cache" wrapper over interchangeable stores (memory, Redis, and others). |
 | [karlseguin/cache.zig](https://github.com/karlseguin/cache.zig) + [karlseguin/singleflight.zig](https://github.com/karlseguin/singleflight.zig) | Zig | MIT | 92 / 9 | push 2026-08 / 2026-04 | The Zig alternatives (descriptions from the GitHub search only, READMEs not read): a thread-safe expiration-aware LRU cache, and a separate single-flight; no cache with a built-in loader was found. `ramcache` in this repo is the storage layer underneath ours. |
 
-**Where we are ahead:** the only Zig option found that joins storage (W-TinyLFU), loader and cross-thread miss coalescing in one API *(inferred from the search descriptions)*; negative caching of "not found" and, opt-in, of loader errors; an injectable clock so TTL logic is tested without sleeping; invalidate-during-load never loses the invalidation; O(1) `invalidateAll` by generation bump. **Where we are behind:** no stale-while-revalidate / `refreshAfterWrite` (→ Backlog), no per-call loader, one spinlock over the whole map, byte-slice keys and values only, `get` returns an owned copy.
+**Where we are ahead:** the only Zig option found that joins storage (W-TinyLFU), loader and cross-thread miss coalescing in one API *(inferred from the search descriptions)*; negative caching of "not found" and, opt-in, of loader errors; an injectable clock so TTL logic is tested without sleeping; invalidate-during-load never loses the invalidation; O(1) `invalidateAll` by generation bump. **Where we are behind:** `refreshAfterWrite` reloads on a caller's thread, not in a background executor (§ 8), no per-call loader, one spinlock over the whole map, byte-slice keys and values only, `get` returns an owned copy.
 
 ## 1. Concurrency model — why `.threadsafe`
 
@@ -124,17 +124,10 @@ caching** entirely (every miss re-hits the loader).
   O(1), no sweep. This is precisely `ramcache`'s generation axis, used as
   intended.
 
-- **`invalidate(key)`** is the one thing `ramcache` does not offer through the API this
-  module uses (`get` / `put` / `clear` / generation / `isDirty`): its generation axis is
-  a single global counter, not per-key. A single-key invalidation therefore shadows
-  the entry by overwriting it with a reserved **poison generation** (`maxInt(u64)`,
-  which the live generation never reaches) and immediately reads the key under the
-  live generation, which drops the shadow, so the slot is freed at once rather than
-  lazily; a burst of invalidations does not displace live entries. To avoid inserting
-  a junk entry for a key that was never cached, presence is first probed with
-  `ramcache.isDirty` (side-effect free and exact here because every entry
-  `readthrough` stores is dirty: it never calls `markClean`). `ramcache` has a
-  per-key `remove`; switching to it is in *Backlog / deferred*.
+- **`invalidate(key)`** drops the entry at once with `ramcache.Cache.remove` (a no-op for an
+  absent key, so nothing is inserted for a key that was never cached) and poisons a load in
+  flight for the key. The poison flag, not the cache, is what makes that load's late store
+  lose: the leader reads it under the same lock `invalidate` holds, before it stores anything.
 
 - **Invalidate during an in-flight load.** Both `invalidate(key)` and
   `invalidateAll()` set the `poisoned` flag on any matching in-flight `Call`.
@@ -196,6 +189,24 @@ lock**, so `f` must be cheap and non-reentrant.
   memory) the whole call returns that error, nothing is leaked, and values loaded
   for the other keys stay cached. This is Caffeine's `getAll` / `loadAll` shape.
 
+## 8. Refresh after write
+
+`Options.refresh_after_ns` (Caffeine's `refreshAfterWrite`; `<= 0` = off). A positive entry
+is stored as `[R][refresh_at: i64 LE][value]` (`refresh_at` = store time + `refresh_after_ns`)
+instead of `[V][value]`; negative entries carry no deadline. A `get` that finds such an entry
+past `refresh_at` (strictly later, like the TTL boundary) but not expired serves it, and if no
+load of the key is in flight that caller becomes the refresher: it registers a `Call`
+(single-flight, poison-aware, exactly like a miss leader), runs the loader on its own thread,
+stores the result and returns it. Every other `get` of the key during that load is a plain hit
+on the old value and never blocks. A failed reload returns the old value, leaves it cached and
+the next `get` tries again; a reload that finds the key absent replaces the entry with a
+negative one (Caffeine removes the entry on a null reload). `refresh_after_ns < ttl_ns` is the
+refresh-ahead: a hot key is renewed before it can miss.
+`Cache.refresh(key)` reloads unconditionally (Caffeine `LoadingCache.refresh`), single-flight
+with other loads; a caller that wants background refreshing runs it from its own pool, which
+keeps this module free of an executor dependency. `getAll` and `ifCached` serve a due entry
+without refreshing it. `Stats.refreshes` counts these loads (also in `loads`).
+
 ## Verification
 
 `scripts/modtest readthrough` (or `zig build test-readthrough`, also
@@ -228,6 +239,11 @@ key or value).
   lock (not the loader, which is off-lock) could contend; a striped-lock or
   sharded-map refinement is unmeasured and unwarranted until a real workload
   shows it.
+- **A background executor for refreshes** — Caffeine refreshes on its executor; here the
+  caller's thread reloads (§ 8) and `Cache.refresh` is the hook for a caller's own pool.
+  A `workerpool` dependency would make a cache own threads.
+- **Probabilistic early expiration** (XFetch) — neither Caffeine nor moka has it;
+  `refresh_after_ns` below `ttl_ns` renews a hot key deterministically.
 - **Metrics beyond the counters** (latency histograms, per-key load timing) — left
   to the consumer's observability layer.
 
@@ -243,19 +259,4 @@ key or value).
 
 ## Backlog / deferred
 
-- **Stale-while-revalidate / `refreshAfterWrite`** (the Caffeine feature its users
-  reach for first: it removes synchronous misses for hot keys). Serving a stale entry
-  while a single refresh runs needs either a background executor (a `workerpool`
-  dependency this module does not take, it keeps a leader on the caller's thread) or
-  an async runtime, plus a precise staleness-window contract. The single-flight
-  machinery is the foundation: the refresh would be a leader whose result replaces
-  the stale entry while `get`s keep serving stale. Effort: medium; fits CONVENTIONS
-  §2 if the refresh runs on the caller's thread or a caller-supplied executor.
-- **Refresh-ahead / probabilistic early expiration** (recompute a hot key just before
-  its TTL to avoid a synchronous miss): a follow-on to the item above.
-- **`invalidate` via `ramcache.Cache.remove`.** `ramcache` gained a per-key `remove`
-  after the poison-generation shadow (§4) was built. Switching would drop the shadow
-  entry, but it needs an analysis of the race with a load in flight for the same key
-  (the shadow's generation is what makes that load's late `put` lose) before it
-  replaces a mechanism that is tested and correct. Not a defect; a simplification to
-  evaluate.
+None open.

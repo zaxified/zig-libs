@@ -334,3 +334,64 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+const TestClock = struct {
+    t: std.atomic.Value(i64) = .init(0),
+    fn nowFn(ctx: *anyopaque) i64 {
+        return @as(*TestClock, @ptrCast(@alignCast(ctx))).t.load(.monotonic);
+    }
+    fn clock(self: *TestClock) rt.Clock {
+        return .{ .ctx = self, .now_fn = nowFn };
+    }
+};
+
+test "refresh_after_ns: while one caller reloads a due entry, every other get is served the old value at once" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dummy = std.atomic.Value(u32).init(0);
+
+    var gl = GatedLoader{ .io = io, .value = "v1" };
+    var clk = TestClock{};
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = gl.loader(),
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .refresh_after_ns = 10,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+
+    gl.open();
+    c.free(try c.get("k")); // prime with "v1"
+    gl.gate.store(0, .release); // the next load parks
+    gl.value = "v2";
+    clk.t.store(11, .monotonic); // due, far from expiry
+
+    var w = GetWorker{ .cache = &c, .key = "k", .want = "v2" };
+    const t = try std.Thread.spawn(.{}, GetWorker.run, .{&w});
+    const Pred = struct {
+        c: *rt.Cache,
+        fn check(self: @This()) bool {
+            return self.c.getStats().refreshes >= 1;
+        }
+    };
+    waitUntil(io, &dummy, Pred{ .c = &c });
+
+    // The refresher is parked inside the loader: these must not block.
+    for (0..5) |_| {
+        const r = try c.get("k");
+        defer c.free(r);
+        try testing.expectEqualStrings("v1", r.value);
+    }
+    try testing.expectEqual(@as(u64, 2), gl.calls.load(.monotonic));
+    gl.open();
+    t.join();
+    try testing.expect(w.ok); // the refresher itself got the new value
+    const after = try c.get("k");
+    defer c.free(after);
+    try testing.expectEqualStrings("v2", after.value);
+    try testing.expectEqual(@as(u64, 2), gl.calls.load(.monotonic));
+}

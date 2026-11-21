@@ -55,7 +55,7 @@ source consulted or copied). The W-TinyLFU store underneath is
 
 See `SPEC.md` for the concurrency model + rationale, the single-flight
 mechanism, the exact invalidate-during-load / TTL=0 / loader-panic edge
-semantics, and what is open (stale-while-revalidate) or deliberately not done (*Backlog / deferred*, *What is deliberately not done*).
+semantics, and what is deliberately not done (*What is deliberately not done*).
 
 ## Without the router (and without HTTP)
 
@@ -99,6 +99,7 @@ var c = readthrough.Cache.init(gpa, .{
     .io = io,                       // futex for coalesced-follower waits
     .loader = .{ .load = load },
     .ttl_ns = 5 * std.time.ns_per_s,       // positive-entry TTL (0 = no time expiry)
+    .refresh_after_ns = 3 * std.time.ns_per_s,   // optional: serve stale, one caller reloads (0 = off)
     .negative_ttl_ns = 500 * std.time.ns_per_ms, // 0 disables negative caching
     .cache_loader_errors = false,          // opt-in error caching
     .max_bytes = 64 << 20,
@@ -114,6 +115,7 @@ switch (r) {
 }
 
 c.invalidate("user:42");            // next get(key) reloads
+try c.refresh("user:42");           // reload now, single-flight; an error keeps the old entry
 c.invalidateAll();                  // generation bump — everything reloads
 const s = c.getStats();             // hits / misses / loads / coalesced / ...
 ```

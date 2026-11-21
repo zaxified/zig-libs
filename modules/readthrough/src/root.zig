@@ -15,6 +15,8 @@
 //!      Go's `singleflight`, Caffeine's loading cache).
 //!   3. **TTL + explicit invalidation.** Per-entry TTL, `invalidate(key)`, and a
 //!      generation-bump `invalidateAll()` (reusing `ramcache`'s generation axis).
+//!   3b. **Refresh after write.** Optionally (`Options.refresh_after_ns`) a due,
+//!      still-fresh entry is served while one caller reloads it (`refresh` reloads on demand).
 //!   4. **Negative caching.** A loader "not found" (and, opt-in, a loader error)
 //!      is cacheable for a separate, short TTL so a missing/erroring key does
 //!      not hammer the backend on every request.
@@ -168,6 +170,10 @@ pub const Stats = struct {
     negative_hits: u64 = 0,
     /// `invalidate` + `invalidateAll` calls.
     invalidations: u64 = 0,
+    /// Loads that replaced a still-fresh entry: a `refresh_after_ns` refresh
+    /// or an explicit `refresh`. They are counted in `loads` too, so the
+    /// single-flight bound is `loads <= misses + refreshes`.
+    refreshes: u64 = 0,
 };
 
 /// Returned by `get` when a hit lands on a negatively-cached loader *error*
@@ -182,15 +188,11 @@ pub const CachedLoaderError = error{CachedLoaderError};
 // ramcache stores opaque bytes; we prefix one tag byte so a stored value's
 // kind (positive / negative-missing / negative-error) survives a round trip.
 const tag_value: u8 = 'V';
+/// A positive value that also carries its refresh deadline (`Options.refresh_after_ns`):
+/// `[tag_refresh][refresh_at: i64 LE][value]`.
+const tag_refresh: u8 = 'R';
 const tag_missing: u8 = 'N';
 const tag_error: u8 = 'E';
-
-// A generation reserved for "poisoned" (per-key invalidated) entries. It never
-// equals the live generation (which starts at 1 and only increments), so such
-// an entry is always seen stale by the next `get` and dropped by ramcache. A
-// 64-bit counter incremented once per `invalidateAll` cannot reach this in any
-// realistic lifetime.
-const poison_gen: u64 = std.math.maxInt(u64);
 
 /// A tiny `std.atomic` spinlock — 0.16 has no `std.Thread.Mutex`; this is the
 /// same shape `writebehind`/`lockfree` use for short critical sections.
@@ -241,6 +243,14 @@ pub const Options = struct {
     /// `ttl_ns`. See `TtlFn`. `ttl_ctx` is passed to it.
     ttl_fn: ?TtlFn = null,
     ttl_ctx: ?*anyopaque = null,
+    /// Refresh-after-write (Caffeine `refreshAfterWrite`), in ns; `<= 0` = off.
+    /// A positive entry older than this but not yet expired is still served:
+    /// the first `get` to see it due reloads it on ITS OWN thread (single-flight,
+    /// every other `get` of the key keeps getting the old value meanwhile) and
+    /// returns the new value; if that reload fails the old value is returned and
+    /// stays cached, and the next `get` tries again. Choose it below `ttl_ns`
+    /// so a hot key is renewed before it ever misses.
+    refresh_after_ns: i64 = 0,
     /// TTL for a negative (missing / error) entry, in ns. `<= 0` disables
     /// negative caching entirely (every miss re-hits the loader).
     negative_ttl_ns: i64 = 0,
@@ -264,6 +274,7 @@ pub const Cache = struct {
     ttl_ns: i64,
     ttl_fn: ?TtlFn,
     ttl_ctx: ?*anyopaque,
+    refresh_after_ns: i64,
     negative_ttl_ns: i64,
     cache_loader_errors: bool,
     clock: ?Clock,
@@ -286,6 +297,7 @@ pub const Cache = struct {
             .ttl_ns = options.ttl_ns,
             .ttl_fn = options.ttl_fn,
             .ttl_ctx = options.ttl_ctx,
+            .refresh_after_ns = options.refresh_after_ns,
             .negative_ttl_ns = options.negative_ttl_ns,
             .cache_loader_errors = options.cache_loader_errors,
             .clock = options.clock,
@@ -343,11 +355,21 @@ pub const Cache = struct {
         if (self.decodeFreshLocked(key)) |dec| {
             self.stats.hits += 1;
             switch (dec) {
-                .value => |v| {
+                .value, .stale => |v| {
                     const dup = self.gpa.dupe(u8, v) catch {
                         self.lock.unlock();
                         return error.OutOfMemory;
                     };
+                    if (dec == .stale and !self.in_flight.contains(key)) {
+                        // Refresh due and nobody is on it: this caller reloads.
+                        const rcall = self.register(key, true) catch |e| {
+                            self.gpa.free(dup);
+                            self.lock.unlock();
+                            return e;
+                        };
+                        self.lock.unlock();
+                        return self.lead(key, rcall, dup);
+                    }
                     self.lock.unlock();
                     return .{ .value = dup };
                 },
@@ -380,25 +402,55 @@ pub const Cache = struct {
         }
 
         // Become the leader: register an in-flight Call, then load unlocked.
-        const call = self.gpa.create(Call) catch {
+        const call = self.register(key, false) catch |e| {
             self.lock.unlock();
-            return error.OutOfMemory;
+            return e;
         };
-        call.* = .{};
-        const kdup = self.gpa.dupe(u8, key) catch {
-            self.gpa.destroy(call);
-            self.lock.unlock();
-            return error.OutOfMemory;
-        };
-        self.in_flight.put(self.gpa, kdup, call) catch {
-            self.gpa.free(kdup);
-            self.gpa.destroy(call);
-            self.lock.unlock();
-            return error.OutOfMemory;
-        };
-        self.stats.loads += 1;
         self.lock.unlock();
+        return self.lead(key, call, null);
+    }
 
+    /// Reload `key` now, whatever is cached (Caffeine `LoadingCache.refresh`):
+    /// single-flight with every other load of the key, the result replaces the
+    /// entry (a "not found" becomes a negative entry), and a loader error leaves
+    /// the old entry in place and is returned. Runs the loader on the calling
+    /// thread, so a caller that wants background refreshing calls it from its
+    /// own pool.
+    pub fn refresh(self: *Cache, key: []const u8) anyerror!void {
+        self.lock.lock();
+        if (self.in_flight.get(key)) |call| {
+            call.refs += 1;
+            self.lock.unlock();
+            const r = try self.awaitCall(call);
+            self.free(r);
+            return;
+        }
+        const call = self.register(key, true) catch |e| {
+            self.lock.unlock();
+            return e;
+        };
+        self.lock.unlock();
+        self.free(try self.lead(key, call, null));
+    }
+
+    /// Create and publish the in-flight `Call` for `key` (the caller is its
+    /// leader). Caller holds the lock; on error nothing is registered.
+    fn register(self: *Cache, key: []const u8, is_refresh: bool) error{OutOfMemory}!*Call {
+        const call = try self.gpa.create(Call);
+        errdefer self.gpa.destroy(call);
+        call.* = .{};
+        const kdup = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(kdup);
+        try self.in_flight.put(self.gpa, kdup, call);
+        self.stats.loads += 1;
+        if (is_refresh) self.stats.refreshes += 1;
+        return call;
+    }
+
+    /// The leader's half of a load (lock NOT held): run the loader, store the
+    /// outcome, publish it. `stale` is the value a refresh falls back to (and
+    /// frees) when the reload fails.
+    fn lead(self: *Cache, key: []const u8, call: *Call, stale: ?[]u8) anyerror!Loaded {
         // The one backend fetch, off the lock.
         const outcome = self.loader.load(self.loader.ctx, key);
         // Per-entry TTL, also off the lock (`bytes` is still borrowed here).
@@ -432,7 +484,7 @@ pub const Cache = struct {
                 // The store is independent of the copy and still worth doing:
                 // it is fail-soft, and a populated cache makes the next get
                 // succeed. It does not paper over the error above.
-                if (!poisoned) self.storeLocked(key, tag_value, bytes, entry_ttl);
+                if (!poisoned) self.storeValueLocked(key, bytes, entry_ttl);
             },
             .missing => {
                 call.result = .missing;
@@ -450,7 +502,12 @@ pub const Cache = struct {
         self.lock.unlock();
         self.io.futexWake(u32, &call.done.raw, std.math.maxInt(u32));
 
-        return self.finish(call);
+        const r = self.finish(call);
+        const s = stale orelse return r;
+        if (r) |loaded| {
+            self.gpa.free(s);
+            return loaded;
+        } else |_| return .{ .value = s };
     }
 
     // ── bulk read path ────────────────────────────────────────────────────────
@@ -528,7 +585,7 @@ pub const Cache = struct {
             if (self.decodeFreshLocked(key)) |dec| {
                 self.stats.hits += 1;
                 switch (dec) {
-                    .value => |v| out[i] = .{ .value = self.gpa.dupe(u8, v) catch {
+                    .value, .stale => |v| out[i] = .{ .value = self.gpa.dupe(u8, v) catch {
                         err = error.OutOfMemory;
                         break :phase1;
                     } },
@@ -631,7 +688,7 @@ pub const Cache = struct {
                             } else |e| {
                                 call.result = .{ .err = e };
                             }
-                            if (!poisoned) self.storeLocked(key, tag_value, bytes, entry_ttl);
+                            if (!poisoned) self.storeValueLocked(key, bytes, entry_ttl);
                         },
                         .missing => {
                             call.result = .missing;
@@ -715,7 +772,7 @@ pub const Cache = struct {
         };
         self.stats.hits += 1;
         switch (dec) {
-            .value => |v| {
+            .value, .stale => |v| {
                 f(ctx, v);
                 return true;
             },
@@ -737,21 +794,10 @@ pub const Cache = struct {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.in_flight.get(key)) |call| call.poisoned = true;
-        // All our stored entries are dirty (we never markClean), so `isDirty`
-        // is a side-effect-free presence test — avoid inserting junk for an
-        // absent key. Shadow a present entry with a poison generation...
-        if (self.store.isDirty(key)) {
-            self.store.put(key, "", self.now(), 1, poison_gen);
-            // ...then immediately reclaim the slot: `ramcache` has no
-            // `remove(key)`, but a `get` under the REAL current generation
-            // sees the poison entry's generation mismatch and drops it right
-            // there (the same lazy-drop path a future caller would have
-            // triggered) — so the slot and its allocation are freed now,
-            // not whenever something else next happens to touch this key. A
-            // burst of invalidations across hot keys no longer transiently
-            // displaces live entries or inflates `stats.entries`.
-            _ = self.store.get(key, self.now(), self.generation);
-        }
+        // Drop the entry now (`ramcache.remove`; a no-op for an absent key). A
+        // load still in flight cannot bring it back: its leader checks
+        // `poisoned` under this same lock before it stores anything.
+        _ = self.store.remove(key);
         self.stats.invalidations += 1;
     }
 
@@ -777,7 +823,8 @@ pub const Cache = struct {
 
     // ── internals ─────────────────────────────────────────────────────────────
 
-    const Decoded = union(enum) { value: []const u8, missing, err, corrupt };
+    /// `stale` is a positive value whose `refresh_after_ns` deadline has passed.
+    const Decoded = union(enum) { value: []const u8, stale: []const u8, missing, err, corrupt };
 
     /// Look up `key` and, if fresh, decode its tag. Caller holds the lock. The
     /// returned `value` slice borrows ramcache storage — valid only while the
@@ -802,6 +849,11 @@ pub const Cache = struct {
         if (raw.len == 0) return .corrupt;
         return switch (raw[0]) {
             tag_value => .{ .value = raw[1..] },
+            tag_refresh => blk: {
+                if (raw.len < 9) break :blk .corrupt;
+                const at = std.mem.readInt(i64, raw[1..9], .little);
+                break :blk if (self.now() > at) .{ .stale = raw[9..] } else .{ .value = raw[9..] };
+            },
             tag_missing => .missing,
             tag_error => .err,
             else => .corrupt,
@@ -817,6 +869,18 @@ pub const Cache = struct {
         buf[0] = tag;
         @memcpy(buf[1..], payload);
         // ramcache dupes `buf` internally, so freeing our temp is correct.
+        self.store.put(key, buf, self.now(), ttl, self.generation);
+    }
+
+    /// Store a positive value: tagged with its refresh deadline when
+    /// `refresh_after_ns` is on. Caller holds the lock; fail-soft like `storeLocked`.
+    fn storeValueLocked(self: *Cache, key: []const u8, value: []const u8, ttl: i64) void {
+        if (self.refresh_after_ns <= 0) return self.storeLocked(key, tag_value, value, ttl);
+        const buf = self.gpa.alloc(u8, value.len + 9) catch return;
+        defer self.gpa.free(buf);
+        buf[0] = tag_refresh;
+        std.mem.writeInt(i64, buf[1..9], self.now() +| self.refresh_after_ns, .little);
+        @memcpy(buf[9..], value);
         self.store.put(key, buf, self.now(), ttl, self.generation);
     }
 
@@ -946,6 +1010,7 @@ const Rig = struct {
     fn open(rig: *Rig, opts: struct {
         ttl_ns: i64 = 0,
         ttl_fn: ?TtlFn = null,
+        refresh_after_ns: i64 = 0,
         negative_ttl_ns: i64 = 0,
         cache_loader_errors: bool = false,
         max_entries: usize = 64,
@@ -956,6 +1021,7 @@ const Rig = struct {
             .clock = rig.clock.clock(),
             .ttl_ns = opts.ttl_ns,
             .ttl_fn = opts.ttl_fn,
+            .refresh_after_ns = opts.refresh_after_ns,
             .negative_ttl_ns = opts.negative_ttl_ns,
             .cache_loader_errors = opts.cache_loader_errors,
             .max_bytes = 1 << 20,
@@ -1038,6 +1104,92 @@ test "distinct keys load independently" {
     try testing.expectEqualStrings("1", a.value);
     try testing.expectEqualStrings("2", b.value);
     try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+}
+
+test "refresh_after_ns: the first get past the deadline reloads and returns the new value" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "v1");
+    var c = rig.open(.{ .ttl_ns = 100, .refresh_after_ns = 30 });
+    defer c.deinit();
+
+    rig.clock.t = 1000;
+    c.free(try c.get("k")); // load #1
+    try rig.ldr.put(testing.allocator, "k", "v2");
+    rig.clock.t = 1030; // exactly at the deadline: not yet due
+    const a = try c.get("k");
+    defer c.free(a);
+    try testing.expectEqualStrings("v1", a.value);
+    try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1031; // due: this caller reloads
+    const b = try c.get("k");
+    defer c.free(b);
+    try testing.expectEqualStrings("v2", b.value);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), c.getStats().refreshes);
+    // The renewed entry has a new deadline and a new TTL window (1031 + 30).
+    rig.clock.t = 1060;
+    const d = try c.get("k");
+    defer c.free(d);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1062;
+    c.free(try c.get("k"));
+    try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic));
+}
+
+test "refresh_after_ns: a failed refresh serves the old value, keeps it, and retries on the next get" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "old");
+    var c = rig.open(.{ .ttl_ns = 1000, .refresh_after_ns = 10 });
+    defer c.deinit();
+
+    rig.clock.t = 1;
+    c.free(try c.get("k"));
+    rig.ldr.fail = true;
+    rig.clock.t = 20;
+    const a = try c.get("k"); // refresh fails -> stale value, no error
+    defer c.free(a);
+    try testing.expectEqualStrings("old", a.value);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+    const b = try c.get("k"); // still due: tries again
+    defer c.free(b);
+    try testing.expectEqualStrings("old", b.value);
+    try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic));
+    rig.ldr.fail = false;
+    try rig.ldr.put(testing.allocator, "k", "new");
+    const d = try c.get("k");
+    defer c.free(d);
+    try testing.expectEqualStrings("new", d.value);
+    // refresh to "not found" replaces the entry with a negative one
+    rig.ldr.table.clearRetainingCapacity();
+    rig.clock.t = 40;
+    try testing.expect((try c.get("k")) == .missing);
+}
+
+test "refresh(key): reloads a fresh entry, an error keeps the old one, an absent key just loads" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "v1");
+    var c = rig.open(.{ .ttl_ns = 1000 });
+    defer c.deinit();
+
+    try c.refresh("k"); // absent: loads
+    try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic));
+    try rig.ldr.put(testing.allocator, "k", "v2");
+    try c.refresh("k"); // fresh: reloaded anyway
+    const a = try c.get("k");
+    defer c.free(a);
+    try testing.expectEqualStrings("v2", a.value);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+    rig.ldr.fail = true;
+    try testing.expectError(error.BackendDown, c.refresh("k"));
+    const b = try c.get("k");
+    defer c.free(b);
+    try testing.expectEqualStrings("v2", b.value);
 }
 
 test "TTL: an entry past its TTL reloads (deterministic clock, no sleep)" {
