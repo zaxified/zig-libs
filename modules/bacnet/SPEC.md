@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bacnet-stack/bacnet-stack](https://github.com/bacnet-stack/bacnet-stack) — **reference** | C | GPL-2.0-or-later WITH GCC-exception-2.0 (its README) | 598 | push 2026-09-29 (no latest-release tag found) | Its README: BACnet/IP (with BBMD), IPv6, Ethernet, MS/TP and BACnet/SC data links, router and gateway apps, ports to embedded targets. We have IP and SC only; and no segmentation, alarms/events, device management beyond DeviceCommunicationControl/ReinitializeDevice/TimeSync, priority array. |
+| [bacnet-stack/bacnet-stack](https://github.com/bacnet-stack/bacnet-stack) — **reference** | C | GPL-2.0-or-later WITH GCC-exception-2.0 (its README) | 598 | push 2026-09-29 (no latest-release tag found) | Its README: BACnet/IP (with BBMD), IPv6, Ethernet, MS/TP and BACnet/SC data links, router and gateway apps, ports to embedded targets. We have IP and SC only; and no segmentation, alarms/events, device management beyond DeviceCommunicationControl/ReinitializeDevice/TimeSync. |
 | [JoelBender/bacpypes3](https://github.com/JoelBender/bacpypes3) | Python | licence not reported by API (bacpypes, its predecessor, is MIT) | 97 | v0.0.108 (2026-09-19) | The Python reference for byte-comparison here (black-box); full client/server incl. segmentation *(inferred)*. Source not read. |
 | [jscott3201/rusty-bacnet](https://github.com/jscott3201/rusty-bacnet) | Rust | MIT | 28 | v0.11.0 (README); push 2026-09-30 | Young Rust stack targeting ASHRAE 135-2020 with clause-level conformance tracking, Python bindings, CLI (its README). |
 | [bacnet-rs/bacnet-rs](https://github.com/bacnet-rs/bacnet-rs) | Rust | other (per API) | 27 | push 2026-09-21 | Rust stack; licence unclear, not read. |
 | [alexbeltran/gobacnet](https://github.com/alexbeltran/gobacnet) | Go | GPL-2.0 | 53 | push 2024-05-09 | Go client; not read. |
 | [GavinMallott/BACnet-zig](https://github.com/GavinMallott/BACnet-zig) | Zig | none stated | 0 | push 2024-11-07 | Only Zig BACnet repository found; abandoned; no licence so not read. |
 
-**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), alarms/events, commandable priority array, BBMD behaviour, MS/TP, IPv6, file/object-management services (→ Backlog items).
+**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), alarms/events, BBMD behaviour, MS/TP, IPv6, file/object-management services (→ Backlog items).
 
 ## Design & invariants
 
@@ -241,12 +241,14 @@ a fuzz test asserts `skip` always makes forward progress so a hostile buffer can
 `Client.poll` and `Device.poll` swallow *decode* errors into `.none` (a malformed datagram from a
 stranger must not kill the loop) while still propagating transport failures.
 
-### Commissioning services (`WritePropertyMultiple`, `DeviceCommunicationControl`, `ReinitializeDevice`, time synchronisation)
+### Commissioning services (`WritePropertyMultiple`, `DeviceCommunicationControl`, `ReinitializeDevice`, time synchronisation, commandable properties)
 
 - **`WritePropertyMultiple`** (clause 15.10): `service` has the request builder and iterator and `encodeFirstFailedWrite` / `FirstFailedWrite`; `Client.writePropertyMultiple`; the device applies the writes in order and stops at the first that fails, **earlier writes stay applied** (clause 15.10.2: processed in order, not atomic, no rollback) and the Error PDU names the failed one. A request that cannot be read at all, with nothing written, is a Reject; one that breaks after a write was applied is an Error whose first failed attempt is object instance 4194303 (addendum 135-2016bl). The Error PDU of this service wraps class and code in `errorType [0]` (`apdu.zig`; the plain pair is still read), and `Client.Event.err.extra` carries the first failed attempt.
 - **`DeviceCommunicationControl`** (16.1): the device keeps `comm` and an optional lapse time. `disable` answers nothing but `DeviceCommunicationControl` and `ReinitializeDevice`; `disable_initiation` answers as usual (including an I-Am to a Who-Is) but `announce()` and COV notifications send nothing. `Config.password` (1..20 characters) is checked when set (`Error(security, password_failure)`); unset accepts any. A duration is in minutes on the injected clock.
 - **`ReinitializeDevice`** (16.4): the password is checked, `coldstart`, `warmstart` and `activate_changes` are acknowledged and reported as `Event.reinitialize` for the application to act on (the module cannot restart anything); the backup and restore states are `Error(services, optional_functionality_not_supported)`.
 - **`TimeSynchronization` / `UTCTimeSynchronization`** (16.7, 16.8): unconfirmed; the device reports `Event.time_synchronized` and has no clock of its own to set. `Client.timeSynchronization` sends one to an address or broadcasts it.
+
+- **Commandable properties and `COV_Increment`** (clause 19.2, 13.1.2): a `present_value` with `Property.priority_slots` (the caller's `[16]?Value`) is commandable. A write at priority `p` (16 when none is given, WriteProperty and WritePropertyMultiple alike) fills slot `p`, a Null empties it, and the stored value is the highest-priority non-empty slot, else the sibling `relinquish_default` property; priority 6 (minimum on/off) is `write_access_denied` for clients; a datum of another kind is `invalid_data_type`. The array is served by a sibling `priority_array` property carrying `Value.priority_array` (the same slots): the whole array, `[0]` its size, `[1..16]` one slot (`invalid_array_index` beyond). A property without `priority_slots` keeps the old rule (a relinquish is refused unless the stored value is Null). `Device.update` notifies a Real `present_value` only when it moved by at least the object's `cov_increment` property from the value last notified (an object without that property notifies on every update).
 
 Anchoring: byte goldens derived from the clause 21 ASN.1 productions (self), the `WritePropertyMultiple-Error` shape from the standard's Error PDU table and interpretation IC 135-2012-7; no foreign-stack capture of these services yet.
 
@@ -474,8 +476,7 @@ Labelled honestly, because it was **not** checked against another implementation
 
 ## What is deliberately not done
 
-Out of scope for this module as it stands, each with a reason. Open items with a plan (segmentation, the commissioning
-services, the commandable priority array and `COV_Increment`, BBMD behaviour, alarms and events, MS/TP) are in
+Out of scope for this module as it stands, each with a reason. Open items with a plan (segmentation, BBMD behaviour, alarms and events, MS/TP) are in
 *Backlog / deferred*.
 
 - **TLS itself, and certificate handling.** BACnet/SC is *implemented*; the TLS underneath it is a
@@ -565,7 +566,6 @@ its clause citations live in this file and in the module's doc comments.
 ## Backlog / deferred
 
 - (survey 2026-09-30) **Segmentation (clause 5.4)**: without it `ReadProperty(object-list)` on any real device with hundreds of objects fails; the first thing a BMS integrator hits; medium-large (window state machine, time-injected), fits §2. Ranked first. Segmented PDUs are parsed correctly and refused explicitly with `Abort(segmentation_not_supported)`; what is missing is buffering the segments and driving the SegmentACK window, so a `ReadProperty` of a large `object-list`, or an RPM whose answer exceeds the peer's max-APDU, fails cleanly with an `Abort` instead of succeeding.
-- (survey 2026-09-30) **Commandable priority array (16 slots + relinquish default) and COV_Increment on the device**: a simulated BACnet device that cannot be commanded is not a faithful fleet target; medium, fits §2. Today `WriteProperty`'s priority is decoded, carried and reported, but the device stores one value per property rather than sixteen slots plus a relinquish default, so it answers a relinquish with `optional_functionality_not_supported` unless the stored value is already Null; and it notifies subscribers on every `update`, not only when the change exceeds the object's COV increment.
 - (survey 2026-09-30) **BBMD behaviour and foreign-device registration timer**: needed across IP subnets; medium, fits §2. Registering as a foreign device (with its 30-second grace period and re-registration timer), maintaining a broadcast distribution table and re-emitting broadcasts as `Forwarded-NPDU` are policy this module encodes for but does not perform.
 - (survey 2026-09-30) **Alarms and events (intrinsic reporting, GetEventInformation, AcknowledgeAlarm)**: large sub-protocol with its own state machine (`AcknowledgeAlarm`, `GetAlarmSummary`, `GetEnrollmentSummary`, `GetEventInformation`, both event-notification services, the Event Enrollment object); fits §2.
 - (survey 2026-09-30) **MS/TP (clause 9)**: bacnet-stack has it. The RS-485 master-slave/token-passing data link has completely different framing (preamble, CRC, token rotation) with a real-time token timer, and needs a serial port to verify; it would be its own module — a question whether this is "never in this module" or "sibling module later".

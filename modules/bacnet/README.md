@@ -74,7 +74,8 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
   ReadProperty, ReadPropertyMultiple (including the wildcards), WriteProperty,
   WritePropertyMultiple, DeviceCommunicationControl (password, timed `disable` and
   `disable_initiation`), ReinitializeDevice (acknowledged, handed to the application),
-  TimeSynchronization (handed to the application) and SubscribeCOV, emits COV notifications on change, expires subscriptions,
+  TimeSynchronization (handed to the application) and SubscribeCOV (honouring `COV_Increment`),
+  and commandable properties (sixteen priority slots plus a relinquish default), emits COV notifications on change, expires subscriptions,
   and answers a unicast question with a unicast reply. Stand one up per
   simulated device.
 - **`sc`** (Annex AB) — the **BACnet/SC** virtual link layer, which replaces
@@ -122,7 +123,7 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 
 No APDU segmentation (segmented PDUs are parsed and refused with `Abort`), no TLS (a seam, never verified), no
 MS/TP, IPv6 or BBMD behaviour, no alarms/events, backup/restore, file services, no
-commandable priority array; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
+a priority array only on properties the caller marks commandable; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 
 ## Use
 

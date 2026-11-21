@@ -55,6 +55,12 @@ pub const Value = union(enum) {
     object_id: ObjectId,
     /// Already-tagged octets, emitted verbatim.
     raw: []const u8,
+    /// A commandable property's priority array: sixteen slots, `null` for
+    /// "no command at this priority", encoded as an array of
+    /// `BACnetPriorityValue` (a Null or the value's own application tag). The
+    /// slots are those of the sibling property that carries
+    /// `Property.priority_slots` (the same pointer).
+    priority_array: *const [16]?Value,
 
     pub fn encode(self: Value, w: *tag.Writer) tag.Error!void {
         switch (self) {
@@ -72,6 +78,9 @@ pub const Value = union(enum) {
             }),
             .object_id => |o| try w.appObjectId(o),
             .raw => |r| try w.raw(r),
+            .priority_array => |slots| for (slots) |slot| {
+                if (slot) |v| try v.encode(w) else try w.appNull();
+            },
         }
     }
 
@@ -118,6 +127,19 @@ pub const Property = struct {
     /// Whether it belongs to the object's *required* set, for the RPM
     /// `REQUIRED`/`OPTIONAL` wildcards.
     required: bool = true,
+    /// Makes this property (a `present_value`) **commandable** (clause 19.2):
+    /// the sixteen priority slots, in the caller's storage. A write at
+    /// priority `p` (16 when none is given) fills slot `p`, a relinquish
+    /// (a Null) empties it, and `value` is always the highest-priority
+    /// non-empty slot, or else the object's `relinquish_default` property
+    /// (which must exist and carry the property's kind). Priority 6 is
+    /// reserved for the minimum on/off algorithm and refused to clients. Serve
+    /// the array with a sibling property
+    /// `.{ .id = .priority_array, .value = .{ .priority_array = slots } }`.
+    priority_slots: ?*[16]?Value = null,
+    /// The last value a COV notification was sent for, which
+    /// `COV_Increment` is measured against (set by the device).
+    cov_last: ?f32 = null,
 };
 
 /// One object in the device's database.
@@ -283,7 +305,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
             const obj = self.find(id) orelse return;
             const p = obj.find(prop) orelse return;
             p.value = v;
-            if (p.cov_reported) try self.notifyCov(obj, now_ms);
+            if (p.cov_reported and self.covDue(obj, p)) try self.notifyCov(obj, now_ms);
         }
 
         /// Receives at most one datagram, answers it, and expires at most one
@@ -502,7 +524,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 return self.refuse(to, r.invoke_id, .read_property, .property, .unknown_property);
             // An array index on a property this device stores as a scalar is
             // an error, not something to ignore.
-            if (rp.array_index != null and p.value != .raw) {
+            if (rp.array_index != null and p.value != .raw and p.value != .priority_array) {
                 return self.refuse(to, r.invoke_id, .read_property, .property, .property_is_not_an_array);
             }
 
@@ -510,7 +532,20 @@ pub fn Device(comptime max_subscriptions: usize) type {
             var w = tag.Writer.init(&body);
             var vbuf: [512]u8 = undefined;
             var vw = tag.Writer.init(&vbuf);
-            try p.value.encode(&vw);
+            if (rp.array_index != null and p.value == .priority_array) {
+                // Index 0 is the array's size, 1..16 one slot.
+                const ix = rp.array_index.?;
+                const slots = p.value.priority_array;
+                if (ix == 0) {
+                    try vw.appUnsigned(16);
+                } else if (ix <= 16) {
+                    if (slots[ix - 1]) |v| try v.encode(&vw) else try vw.appNull();
+                } else {
+                    return self.refuse(to, r.invoke_id, .read_property, .property, .invalid_array_index);
+                }
+            } else {
+                try p.value.encode(&vw);
+            }
             (service.ReadPropertyAck{
                 .object = rp.object,
                 .property = rp.property,
@@ -621,14 +656,11 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 } });
                 return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
             };
-            const target = switch (self.checkWrite(wp.object, wp.property, wp.value, wp.isRelinquish())) {
+            const target = switch (self.checkWrite(wp.object, wp.property, wp.value, wp.isRelinquish(), wp.priority)) {
                 .ok => |t| t,
                 .refused => |e| return self.refuse(to, r.invoke_id, .write_property, e.class, e.code),
             };
-            const p = target.prop;
-            const parsed = target.value;
-
-            p.value = parsed;
+            applyWrite(target, wp.priority);
             try self.sendApdu(to, .{ .simple_ack = .{
                 .invoke_id = r.invoke_id,
                 .service = .write_property,
@@ -637,7 +669,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
         }
 
         const WriteCheck = union(enum) {
-            ok: struct { prop: *Property, value: Value },
+            ok: struct { obj: *Object, prop: *Property, value: Value },
             refused: struct { class: types.ErrorClass, code: types.ErrorCode },
         };
 
@@ -645,22 +677,54 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// applied: the object and property exist, the property is writable,
         /// a relinquish has something to hand back to, the datum has the
         /// property's type.
-        fn checkWrite(self: *Self, oid: ObjectId, property: PropertyIdentifier, value: []const u8, relinquish: bool) WriteCheck {
+        fn checkWrite(self: *Self, oid: ObjectId, property: PropertyIdentifier, value: []const u8, relinquish: bool, priority: ?u8) WriteCheck {
             const obj = self.find(oid) orelse
                 return .{ .refused = .{ .class = .object, .code = .unknown_object } };
             const p = obj.find(property) orelse
                 return .{ .refused = .{ .class = .property, .code = .unknown_property } };
             if (!p.writable)
                 return .{ .refused = .{ .class = .property, .code = .write_access_denied } };
+            if (p.priority_slots != null) {
+                // Commandable: a relinquish is a Null, whatever the kind of the
+                // property; priority 6 belongs to the minimum on/off algorithm.
+                if (priority != null and priority.? == 6)
+                    return .{ .refused = .{ .class = .property, .code = .write_access_denied } };
+                if (relinquish) return .{ .ok = .{ .obj = obj, .prop = p, .value = .null } };
+                const cv = Value.parse(value) orelse
+                    return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
+                if (!Value.sameKind(cv, p.value))
+                    return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
+                return .{ .ok = .{ .obj = obj, .prop = p, .value = cv } };
+            }
             // Relinquishing is not "write null": it hands the slot back, and a
-            // device with no priority array has nothing to hand back to.
+            // property with no priority array has nothing to hand back to.
             if (relinquish and p.value != .null)
                 return .{ .refused = .{ .class = .property, .code = .optional_functionality_not_supported } };
             const parsed = Value.parse(value) orelse
                 return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
             if (!Value.sameKind(parsed, p.value))
                 return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
-            return .{ .ok = .{ .prop = p, .value = parsed } };
+            return .{ .ok = .{ .obj = obj, .prop = p, .value = parsed } };
+        }
+
+        /// Stores a checked write: a plain property takes the value, a
+        /// commandable one fills or empties the slot at `priority` (16 when
+        /// none) and takes the highest-priority command, else the
+        /// `relinquish_default`.
+        fn applyWrite(t: anytype, priority: ?u8) void {
+            const slots = t.prop.priority_slots orelse {
+                t.prop.value = t.value;
+                return;
+            };
+            const ix: usize = (priority orelse 16) - 1;
+            slots[ix] = if (t.value == .null) null else t.value;
+            for (slots) |slot| {
+                if (slot) |v| {
+                    t.prop.value = v;
+                    return;
+                }
+            }
+            if (t.obj.find(.relinquish_default)) |d| t.prop.value = d.value;
         }
 
         /// `WritePropertyMultiple` (clause 15.10): the writes are applied in
@@ -676,9 +740,9 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 var wi = spec.writes();
                 while (true) {
                     const pw = (wi.next() catch return self.wpmDecodeFailure(to, r.invoke_id, done)) orelse break;
-                    switch (self.checkWrite(spec.object, pw.property, pw.value, pw.isRelinquish())) {
+                    switch (self.checkWrite(spec.object, pw.property, pw.value, pw.isRelinquish(), pw.priority)) {
                         .ok => |t| {
-                            t.prop.value = t.value;
+                            applyWrite(t, pw.priority);
                             done += 1;
                         },
                         .refused => |e| return self.wpmFailure(to, r.invoke_id, e.class, e.code, spec.object, pw.property, pw.array_index),
@@ -880,6 +944,24 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 const exp = s.expires_ms orelse continue;
                 if (now_ms >= exp) s.active = false;
             }
+        }
+
+        /// `COV_Increment` (clause 13.1.2): a `present_value` that is a Real
+        /// notifies only when it moved by at least the object's
+        /// `cov_increment` property (a Real) since the last value notified;
+        /// anything else, and an object without the property, always
+        /// notifies.
+        fn covDue(self: *Self, obj: *Object, p: *Property) bool {
+            _ = self;
+            if (p.id != .present_value or p.value != .real) return true;
+            const inc_prop = obj.find(.cov_increment) orelse return true;
+            if (inc_prop.value != .real) return true;
+            const now = p.value.real;
+            if (p.cov_last) |last| {
+                if (@abs(now - last) < inc_prop.value.real) return false;
+            }
+            p.cov_last = now;
+            return true;
         }
 
         fn notifyCov(self: *Self, obj: *Object, now_ms: u64) Error!void {
@@ -1344,6 +1426,165 @@ test "COV: subscribe, get the initial value, then get changes" {
     // Writing a property nobody watches produces nothing.
     try dev.update(ai, .units, .{ .enumerated = 62 }, 2000);
     try testing.expectEqual(client.Event.none, try c.poll(2000));
+}
+
+/// A commandable analog value (instance 9) with a COV increment of 1.0.
+const Cmd = struct {
+    slots: [16]?Value = @splat(null),
+    props: [6]Property = undefined,
+    objects: [1]Object = undefined,
+
+    fn wire(self: *Cmd) []Object {
+        self.props = .{
+            .{ .id = .object_identifier, .value = .{ .object_id = .{ .type = .analog_value, .instance = 9 } } },
+            .{ .id = .object_name, .value = .{ .string = "CMD" } },
+            .{ .id = .present_value, .value = .{ .real = 5.0 }, .writable = true, .cov_reported = true, .priority_slots = &self.slots },
+            .{ .id = .priority_array, .value = .{ .priority_array = &self.slots } },
+            .{ .id = .relinquish_default, .value = .{ .real = 5.0 }, .writable = true },
+            .{ .id = .cov_increment, .value = .{ .real = 1.0 }, .writable = true, .required = false },
+        };
+        self.objects = .{.{ .id = .{ .type = .analog_value, .instance = 9 }, .properties = &self.props }};
+        return &self.objects;
+    }
+};
+
+fn writeReal(c: anytype, to: BipAddress, prio: ?u8, v: f32, now: u64) !void {
+    var vb: [8]u8 = undefined;
+    var vw = tag.Writer.init(&vb);
+    try vw.appReal(v);
+    _ = try c.writeProperty(to, .{ .type = .analog_value, .instance = 9 }, .present_value, null, vw.written(), prio, now);
+}
+
+test "commandable priority array: the highest priority wins, a relinquish falls through to the default" {
+    var rig: Rig = .{};
+    rig.wire();
+    var cmd: Cmd = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, cmd.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const to = rig.device_ep.address;
+    const av9: ObjectId = .{ .type = .analog_value, .instance = 9 };
+
+    try writeReal(&c, to, 8, 20.0, 0);
+    _ = try dev.poll(0);
+    _ = try c.poll(1);
+    try testing.expectEqual(@as(f32, 20.0), cmd.props[2].value.real);
+    // A lower priority (a larger number) does not take over ...
+    try writeReal(&c, to, 10, 30.0, 2);
+    _ = try dev.poll(2);
+    _ = try c.poll(3);
+    try testing.expectEqual(@as(f32, 20.0), cmd.props[2].value.real);
+    try testing.expectEqual(@as(f32, 30.0), cmd.slots[9].?.real);
+    // ... until the higher one is relinquished.
+    _ = try c.relinquish(to, av9, .present_value, 8, 4);
+    _ = try dev.poll(4);
+    try testing.expectEqual(types.ConfirmedService.write_property, (try c.poll(5)).simple_ack.svc);
+    try testing.expectEqual(@as(f32, 30.0), cmd.props[2].value.real);
+    try testing.expect(cmd.slots[7] == null);
+    // Without a priority a write goes to slot 16.
+    try writeReal(&c, to, null, 7.0, 6);
+    _ = try dev.poll(6);
+    _ = try c.poll(7);
+    try testing.expectEqual(@as(f32, 7.0), cmd.slots[15].?.real);
+    // Everything relinquished: the relinquish default.
+    _ = try c.relinquish(to, av9, .present_value, 10, 8);
+    _ = try dev.poll(8);
+    _ = try c.poll(9);
+    _ = try c.relinquish(to, av9, .present_value, 16, 10);
+    _ = try dev.poll(10);
+    _ = try c.poll(11);
+    try testing.expectEqual(@as(f32, 5.0), cmd.props[2].value.real);
+
+    // Priority 6 is the minimum on/off algorithm's, a wrong datatype is refused.
+    try writeReal(&c, to, 6, 1.0, 12);
+    _ = try dev.poll(12);
+    try testing.expectEqual(types.ErrorCode.write_access_denied, (try c.poll(13)).err.code);
+    var ub: [8]u8 = undefined;
+    var uw = tag.Writer.init(&ub);
+    try uw.appUnsigned(3);
+    _ = try c.writeProperty(to, av9, .present_value, null, uw.written(), 8, 14);
+    _ = try dev.poll(14);
+    try testing.expectEqual(types.ErrorCode.invalid_data_type, (try c.poll(15)).err.code);
+
+    // WritePropertyMultiple commands and relinquishes through the same path.
+    var rb: [8]u8 = undefined;
+    var rw = tag.Writer.init(&rb);
+    try rw.appReal(12.5);
+    _ = try c.writePropertyMultiple(to, &.{.{ .object = av9, .writes = &.{.{ .property = .present_value, .value = rw.written(), .priority = 3 }} }}, 16);
+    _ = try dev.poll(16);
+    _ = try c.poll(17);
+    try testing.expectEqual(@as(f32, 12.5), cmd.props[2].value.real);
+}
+
+test "commandable priority array: priority_array and relinquish_default read back, by index too" {
+    var rig: Rig = .{};
+    rig.wire();
+    var cmd: Cmd = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, cmd.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const to = rig.device_ep.address;
+    const av9: ObjectId = .{ .type = .analog_value, .instance = 9 };
+    try writeReal(&c, to, 2, 21.0, 0);
+    _ = try dev.poll(0);
+    _ = try c.poll(1);
+
+    _ = try c.readProperty(to, av9, .priority_array, null, 2);
+    _ = try dev.poll(2);
+    const whole = (try c.poll(3)).complex_ack;
+    var ack = try service.ReadPropertyAck.decode(whole.data);
+    // 16 elements: Null, a Real at the second slot, then Nulls.
+    var r = tag.Reader.init(ack.value);
+    var n: usize = 0;
+    while (!r.atEnd()) : (n += 1) {
+        const v = try r.appValue();
+        if (n == 1) try testing.expectEqual(@as(f32, 21.0), v.real) else try testing.expect(v == .null);
+    }
+    try testing.expectEqual(@as(usize, 16), n);
+    ack = undefined;
+
+    _ = try c.readProperty(to, av9, .priority_array, 0, 4);
+    _ = try dev.poll(4);
+    const size_ack = try service.ReadPropertyAck.decode((try c.poll(5)).complex_ack.data);
+    var sr = tag.Reader.init(size_ack.value);
+    try testing.expectEqual(@as(u64, 16), (try sr.appValue()).unsigned);
+    _ = try c.readProperty(to, av9, .priority_array, 2, 6);
+    _ = try dev.poll(6);
+    const one = try service.ReadPropertyAck.decode((try c.poll(7)).complex_ack.data);
+    var or_ = tag.Reader.init(one.value);
+    try testing.expectEqual(@as(f32, 21.0), (try or_.appValue()).real);
+    _ = try c.readProperty(to, av9, .priority_array, 17, 8);
+    _ = try dev.poll(8);
+    try testing.expectEqual(types.ErrorCode.invalid_array_index, (try c.poll(9)).err.code);
+    // An array index on a plain property is still refused.
+    _ = try c.readProperty(to, av9, .present_value, 1, 10);
+    _ = try dev.poll(10);
+    try testing.expectEqual(types.ErrorCode.property_is_not_an_array, (try c.poll(11)).err.code);
+}
+
+test "COV_Increment: a Real present_value notifies only after moving by the increment" {
+    var rig: Rig = .{};
+    rig.wire();
+    var cmd: Cmd = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, cmd.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const av9: ObjectId = .{ .type = .analog_value, .instance = 9 };
+    _ = try c.subscribeCov(rig.device_ep.address, 1, av9, false, 0, 0);
+    _ = try dev.poll(0);
+    _ = try c.poll(1); // the SimpleACK
+    _ = try c.poll(1); // the initial notification
+
+    // The first change notifies (nothing has been notified by `update` yet) ...
+    try dev.update(av9, .present_value, .{ .real = 5.4 }, 10);
+    try testing.expect((try c.poll(10)) == .cov);
+    // ... a move of 0.5 from the last notified value does not ...
+    try dev.update(av9, .present_value, .{ .real = 5.9 }, 20);
+    try testing.expectEqual(client.Event.none, try c.poll(20));
+    try dev.update(av9, .present_value, .{ .real = 4.9 }, 30);
+    try testing.expectEqual(client.Event.none, try c.poll(30));
+    // ... a move of 1.0 or more does, either way.
+    try dev.update(av9, .present_value, .{ .real = 6.4 }, 40);
+    try testing.expect((try c.poll(40)) == .cov);
+    try dev.update(av9, .present_value, .{ .real = 5.3 }, 50);
+    try testing.expect((try c.poll(50)) == .cov);
 }
 
 test "COV: confirmed notifications are acknowledged by the client" {
