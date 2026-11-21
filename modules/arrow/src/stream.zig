@@ -1315,8 +1315,9 @@ const Reader = struct {
         // entries of one dictionary's deltas always were).
         const n: u64 = @intCast(db.data.length);
         if (d.used and @as(u64, d.len) + n > r.opts.max_rows) return error.LimitExceeded;
-        d.len += @intCast(n);
-        d.gens.items[d.gens.items.len - 1].len += n;
+        // An unread dictionary is not bounded by `max_rows` as a sum: saturate rather than wrap.
+        d.len +|= std.math.cast(usize, n) orelse std.math.maxInt(usize);
+        d.gens.items[d.gens.items.len - 1].len +|= n;
         if (!d.used) return;
         var c = try r.prepare(db.data, body, d.ctr, null);
         if (r.big) c.body = try r.swapBody(c, (&d.value)[0..1]);
@@ -1337,7 +1338,7 @@ const Reader = struct {
         const saved = r.cells;
         defer r.cells = saved;
         var total: u64 = 0;
-        for (chunks) |c| total += @intCast(c.rb.length);
+        for (chunks) |c| total +|= @intCast(c.rb.length); // each already within `max_rows`; saturating, so a huge `max_rows` cannot wrap the sum
         if (total > r.opts.max_rows) return error.LimitExceeded;
         const columns = try r.a.alloc(Column, top.pick.len);
         const data = try r.a.alloc(ColumnData, top.pick.len);

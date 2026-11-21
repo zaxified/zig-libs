@@ -56,8 +56,9 @@ pub fn readMessage(buf: []const u8, pos: *usize) Error!Read {
 /// metadata padded to 8 bytes, then `body` (whose length must already be a
 /// multiple of 8, as `BodyBuilder` makes it).
 pub fn writeMessage(gpa: std.mem.Allocator, out: *std.ArrayList(u8), metadata: []const u8, body: []const u8) error{OutOfMemory}!void {
-    std.debug.assert(body.len % 8 == 0);
+    if (body.len % 8 != 0) @panic("arrow.ipc.writeMessage: the body length must be a multiple of 8 (BodyBuilder makes it so)");
     const padded = std.mem.alignForward(usize, metadata.len, 8);
+    if (padded > std.math.maxInt(u32)) return error.OutOfMemory; // the length prefix is 32 bits
     // The 8-byte prefix keeps the metadata (and so the body after it) 8-aligned in the output.
     try out.ensureUnusedCapacity(gpa, 8 + padded + body.len);
     out.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeToLittle(u32, continuation)));

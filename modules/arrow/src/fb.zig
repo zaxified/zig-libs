@@ -157,6 +157,12 @@ pub const Vector = struct {
 /// buffer (stable while the buffer grows toward the front).
 pub const Ref = u32;
 
+/// A builder contract violation (a table opened inside a table, a field outside one, a field id past `max_fields`)
+/// is a checked panic with a message, in every optimize mode: the caller's own bug, never undefined behaviour.
+fn contract(ok: bool, comptime what: []const u8) void {
+    if (!ok) @panic("arrow.fb.Builder: " ++ what);
+}
+
 pub const Builder = struct {
     gpa: std.mem.Allocator,
     /// The bytes live in `buf[head..]`.
@@ -234,11 +240,14 @@ pub const Builder = struct {
 
     fn pushOffset(b: *Builder, target: Ref) error{OutOfMemory}!void {
         try b.prep(4, 4);
-        try b.pushInt(u32, b.size() + 4 - target);
+        // A buffer within a few bytes of the u32 limit has no room for the offset: not a wrap.
+        const dist = @as(u64, b.size()) + 4 - target;
+        if (dist > std.math.maxInt(u32)) return error.OutOfMemory;
+        try b.pushInt(u32, @intCast(dist));
     }
 
     pub fn createString(b: *Builder, s: []const u8) error{OutOfMemory}!Ref {
-        std.debug.assert(!b.in_table);
+        contract(!b.in_table, "called inside an open table (endTable first)");
         if (s.len > std.math.maxInt(u32) - 8) return error.OutOfMemory;
         try b.prep(4, s.len + 1);
         try b.pad(1); // NUL
@@ -249,7 +258,7 @@ pub const Builder = struct {
 
     /// A vector of scalars.
     pub fn createVector(b: *Builder, comptime T: type, items: []const T) error{OutOfMemory}!Ref {
-        std.debug.assert(!b.in_table);
+        contract(!b.in_table, "called inside an open table (endTable first)");
         const es = if (T == bool) 1 else @sizeOf(T);
         try b.prep(4, es * items.len);
         try b.prep(es, es * items.len);
@@ -264,7 +273,7 @@ pub const Builder = struct {
 
     /// A vector of inline structs, given as `n` records of `elem_size` bytes, aligned to `alignment`.
     pub fn createStructVector(b: *Builder, bytes: []const u8, elem_size: usize, alignment: usize) error{OutOfMemory}!Ref {
-        std.debug.assert(!b.in_table and bytes.len % elem_size == 0);
+        contract(!b.in_table and elem_size != 0 and bytes.len % elem_size == 0, "createStructVector inside a table, or a zero element size, or bytes that are not whole elements");
         try b.prep(4, bytes.len);
         try b.prep(alignment, bytes.len);
         try b.pushBytes(bytes);
@@ -274,7 +283,7 @@ pub const Builder = struct {
 
     /// A vector of offsets (tables or strings).
     pub fn createOffsetVector(b: *Builder, refs: []const Ref) error{OutOfMemory}!Ref {
-        std.debug.assert(!b.in_table);
+        contract(!b.in_table, "called inside an open table (endTable first)");
         try b.prep(4, 4 * refs.len);
         var i = refs.len;
         while (i > 0) {
@@ -286,7 +295,7 @@ pub const Builder = struct {
     }
 
     pub fn startTable(b: *Builder) void {
-        std.debug.assert(!b.in_table);
+        contract(!b.in_table, "called inside an open table (endTable first)");
         b.in_table = true;
         b.nslots = 0;
         @memset(&b.slots, 0);
@@ -294,7 +303,7 @@ pub const Builder = struct {
     }
 
     fn mark(b: *Builder, id: u16) void {
-        std.debug.assert(b.in_table and id < max_fields);
+        contract(b.in_table and id < max_fields, "a field added outside startTable .. endTable, or a field id of max_fields or more");
         b.slots[id] = b.size();
         b.nslots = @max(b.nslots, id + 1);
     }
@@ -324,7 +333,7 @@ pub const Builder = struct {
     }
 
     pub fn endTable(b: *Builder) error{OutOfMemory}!Ref {
-        std.debug.assert(b.in_table);
+        contract(b.in_table, "endTable without startTable");
         try b.prep(4, 4);
         try b.pushInt(i32, 0); // soffset to the vtable, patched below
         const obj = b.size();
@@ -348,7 +357,7 @@ pub const Builder = struct {
 
     /// Writes the root offset and returns the finished buffer (owned by the builder until `deinit`).
     pub fn finish(b: *Builder, root_ref: Ref) error{OutOfMemory}![]const u8 {
-        std.debug.assert(!b.in_table);
+        contract(!b.in_table, "called inside an open table (endTable first)");
         try b.prep(@max(b.min_align, 8), 4);
         try b.pushOffset(root_ref);
         return b.buf[b.head..];
