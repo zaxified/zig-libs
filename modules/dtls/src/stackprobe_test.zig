@@ -918,6 +918,7 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
         keyschedule.earlySecret(T.Hkdf, &es, &zero_psk);
         n.addBig("server sign key", &cert_kat.server_secret_key_bytes);
         if (set.mutual) n.addBig("client sign key", &cert_kat.client_secret_key_bytes);
+        try liveSignatureNeedles(n, set);
     }
     n.addBig("early secret", &es);
     var derived: [L]u8 = undefined;
@@ -968,6 +969,139 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
     return ctl;
 }
 
+// ── the ECDSA nonce of the live CertificateVerify ──────────────────────────
+//
+// The first test measures `certverify.sign` on a fixed transcript hash; here the
+// nonce of the signature a live handshake actually SENT becomes a needle too.
+// The CertificateVerify is read back from the wire: the sender's epoch-2 records
+// are opened with its handshake keys (as the receiver does), the transcript is
+// rebuilt from the messages, and `k` is solved from the signature over exactly
+// that content (`ecdsaNeedles`). Teeth: each signature must verify under the
+// sender's public key, and the rebuilt transcript through the server Finished
+// must equal the server's own.
+
+const record = @import("record.zig");
+const aead = @import("aead.zig");
+const hs_frame = @import("handshake.zig");
+const Aes128Gcm = @import("aesgcm").Aes128Gcm;
+const Aes256Gcm = @import("aesgcm").Aes256Gcm;
+const Aes128Ccm = @import("aesccm").Aes128Ccm;
+const Aes128Ccm8 = @import("aesccm").Aes128Ccm8;
+const ChaCha20Poly1305 = @import("chachapoly").ChaCha20Poly1305;
+
+const Msg = struct { t: u8, body: []const u8 };
+const max_msgs = 12;
+const MsgList = struct {
+    m: [max_msgs]Msg = undefined,
+    len: usize = 0,
+    plain: [6][2048]u8 = undefined,
+};
+var flight_ch: MsgList = .{};
+var flight_sv: MsgList = .{};
+var flight_cl: MsgList = .{};
+
+/// One epoch-2 record opened with the sender's handshake `keys`: the
+/// DTLSInnerPlaintext content, or empty for a non-handshake record (ACK).
+fn openEpoch2(suite: dtls.CipherSuite, keys: anytype, rec_bytes: []const u8, seq: u64, out: []u8) ![]const u8 {
+    const dec = try record.decodeUnified(rec_bytes, 0);
+    const hdr_len = dec.consumed;
+    const ct = rec_bytes[hdr_len..][0..dec.hdr.length.?];
+    var hdr: [8]u8 = undefined;
+    @memcpy(hdr[0..hdr_len], rec_bytes[0..hdr_len]);
+    const nseq: usize = if (dec.hdr.seq_len == .short) 1 else 2;
+    const seq_bytes = hdr[1..][0..nseq];
+    switch (suite) {
+        .aes_128_gcm_sha256, .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => try aead.decryptSequenceNumberAes(keys.sn_key[0..16], ct[0..16], seq_bytes),
+        .aes_256_gcm_sha384 => try aead.decryptSequenceNumberAes(keys.sn_key[0..32], ct[0..16], seq_bytes),
+        .chacha20_poly1305_sha256 => try aead.decryptSequenceNumberChaCha20(keys.sn_key[0..32], ct[0..16], seq_bytes),
+    }
+    const low: u64 = if (nseq == 1) seq_bytes[0] else std.mem.readInt(u16, hdr[1..3], .big);
+    const mask: u64 = if (nseq == 1) 0xff else 0xffff;
+    try std.testing.expectEqual(seq & mask, low);
+    const len = switch (suite) {
+        .aes_128_gcm_sha256 => try aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, 2, seq, ct, hdr[0..hdr_len], out),
+        .aes_256_gcm_sha384 => try aead.Protection(Aes256Gcm).unprotect(keys.key[0..32], keys.iv, 2, seq, ct, hdr[0..hdr_len], out),
+        .chacha20_poly1305_sha256 => try aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32], keys.iv, 2, seq, ct, hdr[0..hdr_len], out),
+        .aes_128_ccm_sha256 => try aead.Protection(Aes128Ccm).unprotect(keys.key[0..16], keys.iv, 2, seq, ct, hdr[0..hdr_len], out),
+        .aes_128_ccm_8_sha256 => try aead.Protection(Aes128Ccm8).unprotect(keys.key[0..16], keys.iv, 2, seq, ct, hdr[0..hdr_len], out),
+    };
+    var end = len;
+    while (end > 0 and out[end - 1] == 0) end -= 1;
+    try std.testing.expect(end > 0);
+    if (out[end - 1] != 22) return out[0..0];
+    return out[0 .. end - 1];
+}
+
+/// The handshake messages of a flight, in order: epoch-0 records as sent,
+/// epoch-2 ones opened with `keys` (record numbers from 0).
+fn flightMessages(suite: dtls.CipherSuite, keys: anytype, records: []const u8, list: *MsgList) !void {
+    list.len = 0;
+    var rest = records;
+    var seq: u64 = 0;
+    var slot: usize = 0;
+    while (rest.len != 0) {
+        const sp = record.nextDatagram(rest, 1);
+        const r = sp.datagram;
+        rest = sp.rest;
+        var plain: []const u8 = undefined;
+        if (r[0] == 22) {
+            plain = r[record.plaintext_header_len..];
+        } else if (r[0] & 0xe0 == 0x20) {
+            plain = try openEpoch2(suite, keys, r, seq, &list.plain[slot]);
+            slot += 1;
+            seq += 1;
+        } else continue;
+        while (plain.len >= hs_frame.header_len) {
+            const h = try hs_frame.decodeHeader(plain);
+            try std.testing.expect(h.fragment_offset == 0 and h.fragment_length == h.length);
+            list.m[list.len] = .{ .t = h.msg_type, .body = plain[hs_frame.header_len..][0..h.length] };
+            list.len += 1;
+            plain = plain[hs_frame.header_len + h.length ..];
+        }
+    }
+}
+
+/// Appends `list` to `t`; a CertificateVerify on the way is checked and its
+/// nonce added. Returns how many there were.
+fn walkFlight(n: *Needles, t: *suitehash.Transcript, comptime alg: suitehash.HashAlg, list: *const MsgList, side: certverify.Side, sk_bytes: *const [32]u8) !usize {
+    var cvs: usize = 0;
+    for (list.m[0..list.len]) |m| {
+        if (m.t == 15) {
+            var th_buf: [48]u8 = undefined;
+            const th = t.currentHash(alg, &th_buf);
+            var content_buf: [certverify.max_signed_content_len]u8 = undefined;
+            const content = try certverify.buildSignedContent(side, th, &content_buf);
+            try std.testing.expectEqual(@as(u16, 0x0403), std.mem.readInt(u16, m.body[0..2], .big));
+            const sig_len_cv = std.mem.readInt(u16, m.body[2..4], .big);
+            const sig = m.body[4..][0..sig_len_cv];
+            const kp = try Ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(sk_bytes.*));
+            try (try Ecdsa.EcdsaP256Sha256.Signature.fromDer(sig)).verify(content, kp.public_key);
+            try ecdsaNeedles(P256, Ecdsa.EcdsaP256Sha256, Sha256, n, sk_bytes, content, sig);
+            cvs += 1;
+        }
+        t.append(m.t, m.body);
+    }
+    return cvs;
+}
+
+fn liveSignatureNeedles(n: *Needles, comptime set: Set) !void {
+    const alg = comptime set.suite.hash();
+    const sv = &pre[@backingInt(Step.s_fin)];
+    try flightMessages(set.suite, sv.hs_write_keys, stepIn(.s_hello), &flight_ch);
+    try flightMessages(set.suite, sv.hs_write_keys, stepIn(.c_flight2), &flight_sv);
+    var t: suitehash.Transcript = .{};
+    t.select(alg);
+    try std.testing.expectEqual(@as(usize, 0), try walkFlight(n, &t, alg, &flight_ch, .client, &cert_kat.client_secret_key_bytes));
+    try std.testing.expectEqual(@as(usize, 1), try walkFlight(n, &t, alg, &flight_sv, .server, &cert_kat.server_secret_key_bytes));
+    var a: [48]u8 = undefined;
+    var b: [48]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, sv.transcript.currentHash(alg, &a), t.currentHash(alg, &b));
+    if (set.mutual) {
+        try flightMessages(set.suite, sv.hs_read_keys, stepIn(.s_fin), &flight_cl);
+        try std.testing.expectEqual(@as(usize, 1), try walkFlight(n, &t, alg, &flight_cl, .client, &cert_kat.client_secret_key_bytes));
+    }
+}
+
 test "STACKPROBE: no ECDHE, key-schedule or record-key residue on the dead stack after a full handshake" {
     try skipUnlessOptimized();
     var bad: usize = 0;
@@ -981,6 +1115,170 @@ test "STACKPROBE: no ECDHE, key-schedule or record-key residue on the dead stack
         inline for (comptime std.meta.tags(Step)) |st| {
             cur_step = st;
             bad += try runProbe("kex " ++ set.name ++ " " ++ @tagName(st), callStep, &needles_store);
+        }
+        prep_fn = noPrep;
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The HelloRetryRequest cookie flow (RFC 9147 §5.1)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A handshake whose server answers ClientHello1 with a stateless retry
+// (`Config.hello_retry`) and whose ClientHello2 is answered by a second, fresh
+// server `Connection` — what a cookie-checking server runs. Steps: the client's
+// ClientHello1, the first server's retry, the client's ClientHello2, the second
+// server's flight, the client's Finished, the server's last step; each restored
+// and re-seeded as above. Needles: the cookie secret and the HMAC state keyed
+// with it; the entropy that is not on the wire (and its X25519 images); the PSK
+// or the server's signing key and the X25519 shared secret; the handshake and
+// application traffic secrets and every record key read from the live
+// connections.
+
+const HStep = enum(u8) { c_start, s_hrr, c_hrr, s_hello, c_flight2, s_fin };
+const h_n = 6;
+var h_server1: Connection = undefined;
+var h_pre: [h_n]Connection = undefined;
+var h_in: [h_n][6144]u8 = undefined;
+var h_in_len: [h_n]usize = @splat(0);
+var h_rec: [h_n]Rec = undefined;
+var h_cur: HStep = .c_start;
+var cookie_secret_store: [32]u8 = undefined;
+const h_binding = "198.51.100.7:4433";
+
+fn hConn(st: HStep) *Connection {
+    return switch (st) {
+        .c_start, .c_hrr, .c_flight2 => &live_client,
+        .s_hrr => &h_server1,
+        .s_hello, .s_fin => &live_server,
+    };
+}
+
+fn hIn(i: usize) []const u8 {
+    return h_in[i][0..h_in_len[i]];
+}
+
+/// API adapter for the retry flow.
+fn hDoStep(st: HStep) void {
+    const ent: dtls.Entropy = .{ .seeded_for_test = rec.random() };
+    if (st == .c_start) {
+        const o = live_client.startHandshake(ent, 0, &out_buf) catch return failStep();
+        out_len = o.len;
+        return;
+    }
+    const r = hConn(st).handleFlight(hIn(@backingInt(st)), ent, 0, &out_buf) catch return failStep();
+    out_len = r.out.len;
+}
+
+noinline fn hCallStep() void {
+    hDoStep(h_cur);
+}
+
+fn hPrep() void {
+    @memcpy(std.mem.asBytes(hConn(h_cur)), std.mem.asBytes(&h_pre[@backingInt(h_cur)]));
+    rec.reset(cur_seed +% @backingInt(h_cur));
+}
+
+/// Walk the retry handshake once; each step's output is the next one's input.
+fn hReference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
+    live_client = try Connection.clientInit(cfg_c);
+    h_server1 = try Connection.serverInit(cfg_s);
+    live_server = try Connection.serverInit(cfg_s);
+    h_in_len = @splat(0);
+    for (0..h_n) |i| {
+        const st: HStep = @fromBackingInt(@intCast(i));
+        h_cur = st;
+        @memcpy(std.mem.asBytes(&h_pre[i]), std.mem.asBytes(hConn(st)));
+        hPrep();
+        step_failed = false;
+        hDoStep(st);
+        try std.testing.expect(!step_failed);
+        h_rec[i] = rec;
+        if (i + 1 < h_n) {
+            @memcpy(h_in[i + 1][0..out_len], out_buf[0..out_len]);
+            h_in_len[i + 1] = out_len;
+        }
+    }
+    try std.testing.expect(h_server1.sawHelloRetryRequest());
+    try std.testing.expect(live_server.sawHelloRetryRequest());
+    try std.testing.expectEqual(dtls.connection.State.connected, live_client.state);
+    try std.testing.expectEqual(dtls.connection.State.connected, live_server.state);
+}
+
+fn hOnWire(chunk: []const u8) bool {
+    for (0..h_n) |i| {
+        if (std.mem.find(u8, hIn(i), chunk) != null) return true;
+    }
+    return false;
+}
+
+fn hBuildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
+    n.len = 0;
+    n.n_names = 0;
+    const aes = set.suite == .aes_128_gcm_sha256 or set.suite == .aes_128_ccm_sha256 or set.suite == .aes_128_ccm_8_sha256;
+    const L = comptime set.suite.hash().len();
+    for (0..h_n) |i| {
+        const r = &h_rec[i];
+        for (0..r.n_ent) |e| {
+            const chunk = r.log[r.ent_off[e]..][0..r.ent_len[e]];
+            if (hOnWire(chunk)) continue;
+            n.addBig("entropy", chunk);
+            if (chunk.len == 32) {
+                var cl: [32]u8 = chunk[0..32].*;
+                cl[0] &= 248;
+                cl[31] &= 127;
+                cl[31] |= 64;
+                n.addBig("x25519 scalar", &cl);
+            }
+        }
+    }
+    n.addBig("cookie secret", &cookie_secret_store);
+    const hm = std.crypto.auth.hmac.sha2.HmacSha256.init(&cookie_secret_store);
+    n.addImage("cookie hmac", std.mem.asBytes(&hm));
+    const sv = &h_pre[@backingInt(HStep.s_fin)];
+    if (set.psk) {
+        n.addBig("psk", &psk_store);
+    } else {
+        const cl = &h_pre[@backingInt(HStep.c_flight2)];
+        n.addBig("ecdhe secret", cl.ecdhe_secret[0..32]);
+        const ss = try X25519.scalarmult(cl.ecdhe_secret[0..32].*, sv.ecdhe_public[0..32].*);
+        n.addBig("dh shared", &ss);
+        n.addBig("server sign key", &cert_kat.server_secret_key_bytes);
+    }
+    n.addBig("hs traffic c", sv.hs_traffic_client[0..L]);
+    n.addBig("hs traffic s", sv.hs_traffic_server[0..L]);
+    n.addBig("ap traffic c", sv.pending_ap_client[0..L]);
+    n.addBig("ap traffic s", sv.pending_ap_server[0..L]);
+    addDir(n, sv.hs_write_keys, aes);
+    addDir(n, sv.hs_read_keys, aes);
+    addDir(n, live_client.write_keys, aes);
+    addDir(n, live_client.read_keys, aes);
+    addDir(n, live_server.write_keys, aes);
+    addDir(n, live_server.read_keys, aes);
+    var ctl: [LEAK]u8 = undefined;
+    Sha256.hash("hrr " ++ set.name, &ctl, .{});
+    n.addBig("control", &ctl);
+    n.sort();
+    return ctl;
+}
+
+test "STACKPROBE: no cookie-secret, ECDHE, traffic-secret or record-key residue on the dead stack through a HelloRetryRequest cookie handshake" {
+    try skipUnlessOptimized();
+    const hrr_sets = [_]Set{ sets[0], sets[2] }; // psk aes128gcm, cert x25519 aes128gcm
+    var bad: usize = 0;
+    inline for (hrr_sets, 0..) |set, si| {
+        Sha256.hash(set.name, &psk_store, .{});
+        Sha256.hash("cookie " ++ set.name, &cookie_secret_store, .{});
+        cur_seed = 0xC00C_0000 + si * 64;
+        var cfg = try configs(set);
+        cfg.s.hello_retry = .{ .cookie_secret = &cookie_secret_store, .peer_binding = h_binding };
+        try hReference(cfg.c, cfg.s);
+        leak_src = try hBuildNeedles(&needles_store, set);
+        prep_fn = hPrep;
+        inline for (comptime std.meta.tags(HStep)) |st| {
+            h_cur = st;
+            bad += try runProbe("hrr " ++ set.name ++ " " ++ @tagName(st), hCallStep, &needles_store);
         }
         prep_fn = noPrep;
     }

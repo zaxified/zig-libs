@@ -820,7 +820,13 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   decrypted content, none a branch on a key.
 - **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` drive the burned entry points through full
   in-memory handshakes (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; GCM, ChaCha20 and CCM;
-  a server flight-2 retransmission through `poll`).
+  a server flight-2 retransmission through `poll`), and the HelloRetryRequest cookie flow (PSK and cert X25519: the
+  first server's stateless retry, ClientHello2, a second fresh server; the cookie secret and its HMAC state are
+  needles). The ECDSA nonce of each CertificateVerify a live handshake sent is a needle too: the probe opens the
+  sender's epoch-2 records with its handshake keys, rebuilds the transcript, checks the signature and solves `k`
+  from it. By design and not dead stack: the standalone helpers `keyschedule.*`, `aead.Protection`, `record.*`
+  return secrets by value into the CALLER's frame, and the live `Connection` keeps `pending_ap_*`, `hs_*` keys and
+  traffic secrets until `deinit`.
 
 ## Anchoring
 
@@ -852,10 +858,3 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   module checks CRLs). Effort: medium.
 - **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
   bug the two happen to share would still pass; mbedTLS or picotls would be the natural cross-check.
-- **Dead-stack hygiene, what the sweep does not cover yet.** The full-handshake probe drives `poll`'s handshake
-  retransmission (step `s_poll`, burned since 2026-11-21) and the CCM suites; still not driven: the
-  HelloRetryRequest/cookie flows (the probe's step table is the plain four-flight handshake; a retry needs a second
-  server `Connection`), and the ECDSA nonce of a live CertificateVerify (measured only by `certverify.sign`'s own
-  probe). By design and not dead stack: the standalone helpers `keyschedule.*`, `aead.Protection`, `record.*` return
-  secrets by value into the CALLER's frame, and the live `Connection` keeps `pending_ap_*`, `hs_*` keys and traffic
-  secrets until `deinit`. Effort: small.
