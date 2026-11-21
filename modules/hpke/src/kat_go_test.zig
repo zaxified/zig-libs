@@ -13,8 +13,8 @@
 //!   KDFs, and P-384 (an external anchor `P384Kem` never had: RFC 9180 publishes
 //!   no P-384 vector). Every intermediate the vector carries is compared.
 //!
-//! Skipped: DHKEM(X448) (0x0021), not implemented (SPEC Backlog). Go itself
-//! skips ML-KEM-512 and TurboSHAKE; they run here.
+//! Every vector runs, DHKEM(X448) (0x0021) included. Go itself skips
+//! ML-KEM-512 and TurboSHAKE; they run here.
 
 const std = @import("std");
 const testing = std.testing;
@@ -33,6 +33,7 @@ fn KemOf(comptime id: u16) ?type {
         0x0011 => dhkem.P384Kem,
         0x0012 => dhkem.P521Kem,
         0x0020 => dhkem.X25519Kem,
+        0x0021 => dhkem.X448Kem,
         0x0040 => pq.MlKem512Kem,
         0x0041 => pq.MlKem768Kem,
         0x0042 => pq.MlKem1024Kem,
@@ -101,6 +102,12 @@ fn check(comptime Kem: type, comptime Kdf: type, comptime Aead: type, comptime v
         var from_seed: Kem.KeyPair = undefined;
         Kem.fromSeed(&from_seed, (try unhex(a, v.skRm))[0..Kem.Nsk]);
         try expectHex(a, v.pkRm, &from_seed.public_key);
+    } else if (Kem == dhkem.X448Kem) {
+        // RFC 9180 §7.1.2: X448's `SerializePrivateKey` clamps; the key is
+        // stored unclamped (clamped at use), like X25519's.
+        var clamped = skR.secret_key;
+        @import("ed448").x448.clamp(&clamped);
+        try expectHex(a, v.skRm, &clamped);
     } else if (Kem != dhkem.X25519Kem) {
         try expectHex(a, v.skRm, &skR.secret_key);
     }
@@ -209,8 +216,8 @@ test "Go crypto/hpke vectors: rfc9180.json + hpke-pq.json through setupBaseS/R, 
             ran += 1;
         }
     }
-    // 24 rfc9180 + 13 hpke-pq, minus the X448 one.
-    try testing.expectEqual(@as(usize, 36), ran);
+    // 24 rfc9180 + 13 hpke-pq.
+    try testing.expectEqual(@as(usize, 37), ran);
 }
 
 test "pq KEMs: psk mode round-trips over a one-stage and a two-stage KDF" {

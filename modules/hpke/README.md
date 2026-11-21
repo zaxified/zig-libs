@@ -168,7 +168,7 @@ scripts/modtest hpke
 
 Test classes: RFC 9180 Appendix A (A.1 to A.4, A.6) byte-exact in all four modes
 through the key-schedule, `Context`, `setup*` and single-shot entry points; Go 1.26
-`crypto/hpke`'s vectors (every KEM, KDF and AEAD it offers, X448 excepted); a frozen replay
+`crypto/hpke`'s vectors (every KEM, KDF and AEAD it offers, X448 included); a frozen replay
 of the live Go differential run (*Interop*); negative paths (low-order and malformed
 keys, `VerifyPSKInputs` and the §5.1.2 PSK floor, `seq` fail-closed at the ceiling,
 wrong-`pkS`/`psk`/mode rejection); no-panic sweep and boundary tests; deterministic fuzz
@@ -194,7 +194,7 @@ binary because `testing/cryptotest` is the only way to pin Go's randomness.
 
 ## Not provided
 
-No runtime-agile suite selection (suites are comptime types), no X448 DHKEM, no
+No runtime-agile suite selection (suites are comptime types), no
 `auth`/`auth_psk` mode for the pq KEMs, and no `validatePublicKey` for X25519: `SPEC.md`
 *What is deliberately not done* and *Backlog / deferred* give the reasons and what is open.
 

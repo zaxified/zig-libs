@@ -74,6 +74,7 @@ pub const KemId = enum(u16) {
     dhkem_p384_hkdf_sha384 = 0x0011,
     dhkem_p521_hkdf_sha512 = 0x0012,
     dhkem_x25519_hkdf_sha256 = 0x0020,
+    dhkem_x448_hkdf_sha512 = 0x0021,
     /// draft-ietf-hpke-pq: pure ML-KEM (FIPS 203) and the three hybrids
     /// (`pq.zig`). `mlkem768_x25519` is X-Wing.
     ml_kem_512 = 0x0040,

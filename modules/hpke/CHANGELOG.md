@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New `X448Kem` (`KemId.dhkem_x448_hkdf_sha512`, 0x0021): DHKEM(X448, HKDF-SHA512) over the sibling `ed448` module's `x448` (new dep), all four modes' KEM half, `keyPairFromSecret`. A low-order peer key is `error.DhFailed`, a non-canonical one `error.DeserializeError`. Anchored to Go 1.26's X448 vector (now run, not skipped). Adding the `KemId` value is source-breaking for an exhaustive `switch` over `KemId` (it is non-exhaustive, `_`, so only a switch without `else`/`_` prong is affected).
+
 - **2026-11-21** — `schedule.suiteIdOf(Kem, Aead, Nh)` and `schedule.aeadIdOf(Aead)` are now `pub`: the RFC 9180 §7.2.1 `suite_id` a `Context.exportSecret` caller must pass, from the same types the context was built with. Additive.
 
 - **2026-11-17** — New: `P256Kem`/`P384Kem`/`P521Kem.validatePublicKey(&pk)`, an admission check that refuses (`error.DeserializeError`) exactly the public keys `encap` would refuse (SEC1 uncompressed, canonical, on the curve), so a protocol (MLS KeyPackage `init_key` / leaf `encryption_key`) can refuse an invalid point when it receives it. Same accept set as Go `crypto/ecdh` `NewPublicKey`.

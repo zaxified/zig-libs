@@ -45,6 +45,8 @@ const P384 = @import("p384").P384;
 // every DH with a secret scalar, `mulInto` for the key derivation.
 const p521 = @import("p521");
 const ct25519 = @import("ct25519");
+// X448 (std has none): the sibling `ed448` module's RFC 7748 ladder.
+const x448 = @import("ed448").x448;
 const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -340,6 +342,205 @@ pub const X25519Kem = struct {
         extractAndExpand(HkdfSha256, kem_id, Nsecret, out, &dh, &kem_context);
     }
 };
+
+// ── DHKEM(X448, HKDF-SHA512) — RFC 9180 §7.1, kem_id 0x0021 ─────────────
+
+/// `dhkem_x448_hkdf_sha512` (RFC 9180 §7.1 Table 2): Nsecret = 64
+/// (HKDF-SHA512's `Nh`), Npk = Nsk = 56 (X448's widths, RFC 7748 §5). The
+/// same shape as `X25519Kem` one curve up, over the sibling `ed448` module's
+/// `x448` ladder. Differences that matter:
+///
+///   * `DeriveKeyPair` expands `sk` to 56 bytes under HKDF-SHA512 (§7.1.3);
+///     the scalar is clamped at use, and stored unclamped like X25519's;
+///   * a u-coordinate that is not the canonical encoding of a field element
+///     (`>= p`) is refused (`error.DeserializeError`) — `x448` rejects it
+///     rather than reducing it (see its `scalarmult`);
+///   * the all-zero DH output (a low-order peer point) is `error.DhFailed`,
+///     RFC 9180 §7.1.4's "MUST check" — checked here, because `x448` itself
+///     returns it.
+///
+/// Anchored by Go 1.26 `crypto/hpke`'s X448 vector (`hpke-pq.json`, X448 +
+/// TurboSHAKE256 + ChaCha20-Poly1305: derived key pair, enc, key, nonce,
+/// exporter secret, encryptions, exports — `kat_go_test.zig`).
+pub const X448Kem = struct {
+    pub const kem_id: u16 = @backingInt(suite.KemId.dhkem_x448_hkdf_sha512);
+    pub const Nsecret: usize = 64;
+    pub const Npk: usize = x448.public_length; // 56
+    pub const Nsk: usize = x448.scalar_length; // 56
+
+    pub const KeyPair = struct {
+        public_key: [Npk]u8,
+        secret_key: [Nsk]u8,
+    };
+    pub const PublicKey = [Npk]u8;
+    pub const EncappedKey = [Npk]u8;
+
+    pub const Encapped = struct {
+        shared_secret: [Nsecret]u8,
+        enc: EncappedKey,
+    };
+
+    /// `DeriveKeyPair(random(Nsk))`, as `X25519Kem.generateKeyPair`.
+    pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
+        var ikm: [Nsk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ikm);
+        entropy.fill(io, &ikm);
+        deriveKeyPair(out, &ikm);
+    }
+
+    /// RFC 9180 §7.1.3 `DeriveKeyPair(ikm)` for X448: `dkp_prk =
+    /// LabeledExtract("", "dkp_prk", ikm)`, `sk = LabeledExpand(dkp_prk,
+    /// "sk", "", 56)` under HKDF-SHA512 and `kemSuiteId(0x0021)`.
+    pub fn deriveKeyPair(out: *KeyPair, ikm: []const u8) void {
+        burn.run(burn.kem_burn, void, deriveKeyPairBody, .{ out, ikm });
+    }
+
+    fn deriveKeyPairBody(out: *KeyPair, ikm: []const u8) void {
+        const kem_suite_id = comptime suite.kemSuiteId(kem_id);
+        var dkp_prk: [HkdfSha512.prk_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &dkp_prk);
+        suite.labeledExtract(HkdfSha512, &dkp_prk, &kem_suite_id, "", "dkp_prk", ikm);
+        suite.labeledExpand(HkdfSha512, &kem_suite_id, &dkp_prk, "sk", "", &out.secret_key) catch unreachable;
+        // The base point is canonical, so `scalarmult` cannot refuse it.
+        out.public_key = x448.recoverPublicKey(&out.secret_key) catch unreachable;
+    }
+
+    /// RFC 9180 §7.1.2 `DeserializePrivateKey(sk)` plus the public half.
+    /// Every 56-byte string is an X448 private key (clamped at use), so this
+    /// never fails.
+    pub fn keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        return burn.run(burn.kem_burn, KeyPairFromSecretError!void, keyPairFromSecretBody, .{ out, sk });
+    }
+
+    fn keyPairFromSecretBody(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        out.secret_key = sk.*;
+        out.public_key = x448.recoverPublicKey(sk) catch unreachable;
+    }
+
+    /// X448 with RFC 9180 §7.1.4's zero check folded in.
+    fn dh(out: *[Npk]u8, sk: *const [Nsk]u8, pk: *const PublicKey) error{ DhFailed, DeserializeError }!void {
+        x448.scalarmult(out, sk, pk.*) catch return error.DeserializeError;
+        var acc: u8 = 0;
+        for (out) |b| acc |= b;
+        if (acc == 0) return error.DhFailed;
+    }
+
+    pub fn encap(out: *Encapped, pkR: PublicKey, io: std.Io) EncapError!void {
+        var eph: KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
+        generateKeyPair(&eph, io);
+        return encapDeterministic(out, pkR, &eph);
+    }
+
+    /// RFC 9180 §4.1 `Encap(pkR)` with the ephemeral injected (see
+    /// `X25519Kem.encapDeterministic` for the recipe).
+    pub fn encapDeterministic(out: *Encapped, pkR: PublicKey, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, encapBody, .{ out, &pkR, eph });
+    }
+
+    fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        var shared: [Npk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &shared);
+        try dh(&shared, &eph.secret_key, pkR);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk..].* = pkR.*;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, &out.shared_secret, &shared, &kem_context);
+        out.enc = eph.public_key;
+    }
+
+    /// RFC 9180 §4.1 `Decap(enc, skR)`.
+    pub fn decap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, decapBody, .{ out, &enc, skR });
+    }
+
+    fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out);
+        var shared: [Npk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &shared);
+        try dh(&shared, &skR.secret_key, enc);
+        var kem_context: [2 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc.*;
+        kem_context[Npk..].* = skR.public_key;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, out, &shared, &kem_context);
+    }
+
+    /// RFC 9180 §4.1 `AuthEncap(pkR, skS)`: `dh || dh2` as one ikm,
+    /// `kem_context = enc || pkR || pk(skS)`.
+    pub fn authEncapDeterministic(out: *Encapped, pkR: PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        return burn.run(burn.kem_burn, EncapError!void, authEncapBody, .{ out, &pkR, skS, eph });
+    }
+
+    fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        var shared: [2 * Npk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &shared);
+        try dh(shared[0..Npk], &eph.secret_key, pkR);
+        try dh(shared[Npk..], &skS.secret_key, pkR);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = eph.public_key;
+        kem_context[Npk .. 2 * Npk].* = pkR.*;
+        kem_context[2 * Npk ..].* = skS.public_key;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, &out.shared_secret, &shared, &kem_context);
+        out.enc = eph.public_key;
+    }
+
+    /// RFC 9180 §4.1 `AuthDecap(enc, skR, pkS)`.
+    pub fn authDecap(out: *[Nsecret]u8, enc: EncappedKey, skR: *const KeyPair, pkS: PublicKey) DecapError!void {
+        return burn.run(burn.kem_burn, DecapError!void, authDecapBody, .{ out, &enc, skR, &pkS });
+    }
+
+    fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out);
+        var shared: [2 * Npk]u8 = undefined;
+        defer std.crypto.secureZero(u8, &shared);
+        try dh(shared[0..Npk], &skR.secret_key, enc);
+        try dh(shared[Npk..], &skR.secret_key, pkS);
+        var kem_context: [3 * Npk]u8 = undefined;
+        kem_context[0..Npk].* = enc.*;
+        kem_context[Npk .. 2 * Npk].* = skR.public_key;
+        kem_context[2 * Npk ..].* = pkS.*;
+        extractAndExpand(HkdfSha512, kem_id, Nsecret, out, &shared, &kem_context);
+    }
+};
+
+test "X448Kem: encap/decap and auth agree, a low-order or non-canonical key is refused" {
+    var r: X448Kem.KeyPair = undefined;
+    X448Kem.deriveKeyPair(&r, "recipient ikm");
+    var s: X448Kem.KeyPair = undefined;
+    X448Kem.deriveKeyPair(&s, "sender ikm");
+    var e: X448Kem.KeyPair = undefined;
+    X448Kem.deriveKeyPair(&e, "ephemeral ikm");
+    var from_sk: X448Kem.KeyPair = undefined;
+    try X448Kem.keyPairFromSecret(&from_sk, &r.secret_key);
+    try std.testing.expectEqualSlices(u8, &r.public_key, &from_sk.public_key);
+
+    var sent: X448Kem.Encapped = undefined;
+    try X448Kem.encapDeterministic(&sent, r.public_key, &e);
+    var got: [X448Kem.Nsecret]u8 = undefined;
+    try X448Kem.decap(&got, sent.enc, &r);
+    try std.testing.expectEqualSlices(u8, &sent.shared_secret, &got);
+
+    var auth: X448Kem.Encapped = undefined;
+    try X448Kem.authEncapDeterministic(&auth, r.public_key, &s, &e);
+    try X448Kem.authDecap(&got, auth.enc, &r, s.public_key);
+    try std.testing.expectEqualSlices(u8, &auth.shared_secret, &got);
+    try std.testing.expect(!std.mem.eql(u8, &auth.shared_secret, &sent.shared_secret));
+    // A different sender key is a different secret.
+    try X448Kem.authDecap(&got, auth.enc, &r, e.public_key);
+    try std.testing.expect(!std.mem.eql(u8, &auth.shared_secret, &got));
+
+    // u = 0 and u = 1 are of low order: the DH output is all zero.
+    var low: X448Kem.PublicKey = @splat(0);
+    try std.testing.expectError(error.DhFailed, X448Kem.encapDeterministic(&sent, low, &e));
+    low[0] = 1;
+    try std.testing.expectError(error.DhFailed, X448Kem.decap(&got, low, &r));
+    // p = 2^448 - 2^224 - 1 itself is not a canonical encoding.
+    var p_enc: X448Kem.PublicKey = @splat(0xff);
+    p_enc[28] = 0xfe;
+    try std.testing.expectError(error.DeserializeError, X448Kem.encapDeterministic(&sent, p_enc, &e));
+}
 
 // ── DHKEM(P-256, HKDF-SHA256) — RFC 9180 §7.1, kem_id 0x0010 ────────────
 
