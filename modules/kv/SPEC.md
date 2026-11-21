@@ -631,6 +631,7 @@ put is a write plus an `fsync` on every side; the preallocation path is a Backlo
   `keys` + `get` is not one.
 - **Shared/reader locks.** The store is single-writer; readers in other processes use
   `Options.read_only`.
+- **Incremental tail replay for `Db.refresh`.** A reader's refresh is a full open (hints make merged files cheap; the active file and unmerged sealed files are replayed). Bitcask's read-only handles and the other stores compared here have no incremental refresh, and no caller refreshes often enough to show the cost; it needs the keydir to remember a replay offset per file and a manifest check for rotations and merges. Revisit with a caller that refreshes in a loop.
 - **Recovery beyond the first bad record in the active file.** Replay truncates at the first torn or
   corrupt record, so mid-file media rot discards the records after it; the trade is the invariant that
   everything replay accepts is CRC-valid (a sealed file's bad record is `Corrupt`, never cut).
@@ -648,9 +649,11 @@ Boundaries no test reaches because they need an input too large to build:
 
 ## Backlog / deferred
 
-- **Speed: `put_sync` is fsync-bound** — every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
-- **Incremental tail replay for `Db.refresh`.** A refresh is a full open (hints make merged files cheap; the active file and unmerged sealed files are replayed). Worth doing if a caller refreshes often. Idea.
-- **On-disk ordered index / MVCC / transactions** (deferred, see *What is deliberately not done*). When greenlit: steal patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC over kv's existing atomic-swap seam) and TigerBeetle's VOPR methodology (not code); phased: ordered-scan B-tree → MVCC snapshot reads → secondary indexes. Bitcask kv is enough until then.
+- **Speed: `put_sync` is fsync-bound** — BOUNCED to the quiet-host phase: the speedup is the whole point and an fsync rate cannot be measured on a host whose disk other jobs share (a rewrite whose speedup cannot be shown is not committed). Every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
+
+## Roadmap
+
+- **On-disk ordered index / MVCC / transactions** (deferred, see *What is deliberately not done*). When greenlit: steal patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC over kv's existing atomic-swap seam) and TigerBeetle's VOPR methodology (not code); phased: ordered-scan B-tree → MVCC snapshot reads → secondary indexes. Bitcask kv is enough until then. Size: a multi-week build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) that needs a consumer demanding scans or transactions.
 
 ## Anchoring
 
