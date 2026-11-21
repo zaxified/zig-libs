@@ -273,7 +273,7 @@ declare -A TARGETS=(
     # ── 2026-10-09: consumed modules (ct-wave): MESSAGE-INTEGRITY key /
     # long-term password, CSRF key + session id, MQTT password + auth data ──
     [stun]="mi mi256 ltkey"
-    [sessions]="csrf newid"
+    [sessions]="csrf newid idhash"
     [mqtt]="encode decode pwverify"
     # ── 2026-10-10: ct-wave: Noise statics, ephemerals, PSK, transport keys ──
     [noise]="hs transport"
@@ -774,6 +774,7 @@ declare -A PATTERN=(
     [stun/ltkey]='root[.]zig|md5[.]zig'
     [sessions/csrf]='root[.]zig|csrf[.]zig|idhex[.]zig|hmac[.]zig|sha2[.]zig|timing_safe[.]zig'
     [sessions/newid]='root[.]zig|idhex[.]zig'
+    [sessions/idhash]='root[.]zig|sha2[.]zig'
     [mqtt/encode]='packet[.]zig'
     [mqtt/decode]='packet[.]zig'
     [mqtt/pwverify]='acl[.]zig'
@@ -1175,6 +1176,7 @@ declare -A LABEL=(
     [stun/ltkey]='stun longTermKey MD5 (password tainted)'
     [sessions/csrf]='sessions Csrf.token+verify (key tainted)'
     [sessions/newid]='sessions session-id hex (idhex, id tainted)'
+    [sessions/idhash]='sessions store key SHA-256(id) (hash_id_in_store, id tainted)'
     [mqtt/encode]='mqtt encode CONNECT/AUTH (password+auth data)'
     [mqtt/decode]='mqtt decode CONNECT/AUTH (credential bytes tainted)'
     [mqtt/pwverify]='mqtt acl.Passwords.verify (password tainted)'

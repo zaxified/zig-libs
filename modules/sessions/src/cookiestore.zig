@@ -115,6 +115,11 @@ pub const CookieOptions = struct {
     cookie_path: ?[]const u8 = "/",
     cookie_domain: ?[]const u8 = null,
     same_site: cookies.SameSite = .lax,
+    /// CHIPS `Partitioned` attribute: the browser keys the cookie by the
+    /// top-level site, which a cross-site embed (`same_site = .none`) needs
+    /// once third-party cookies are blocked. Requires `secure`
+    /// (`error.InvalidCookieOptions` otherwise). Default false.
+    partitioned: bool = false,
     secure: bool = true,
     allow_insecure_cookie: bool = false,
     /// As `Options.persist_untouched_sessions`.
@@ -139,6 +144,7 @@ pub const CookieManager = struct {
     cookie_path: ?[]const u8,
     cookie_domain: ?[]const u8,
     same_site: cookies.SameSite,
+    partitioned: bool,
     secure: bool,
     persist_untouched_sessions: bool,
     persist_cookie: bool,
@@ -184,6 +190,7 @@ pub const CookieManager = struct {
             .secure = secure,
             .http_only = true,
             .same_site = options.same_site,
+            .partitioned = options.partitioned,
         };
         var probe_buf: [max_cookie_line]u8 = undefined;
         const bare = probe.bufPrint(&probe_buf) catch |err| switch (err) {
@@ -207,6 +214,7 @@ pub const CookieManager = struct {
             .cookie_path = options.cookie_path,
             .cookie_domain = options.cookie_domain,
             .same_site = options.same_site,
+            .partitioned = options.partitioned,
             .secure = secure,
             .persist_untouched_sessions = options.persist_untouched_sessions,
             .persist_cookie = options.persist_cookie,
@@ -428,6 +436,7 @@ pub const CookieManager = struct {
             .secure = m.secure,
             .http_only = true,
             .same_site = m.same_site,
+            .partitioned = m.partitioned,
         };
         const line = sc.bufPrint(buf) catch |err| return switch (err) {
             error.BufferTooSmall => error.NoSpaceLeft,

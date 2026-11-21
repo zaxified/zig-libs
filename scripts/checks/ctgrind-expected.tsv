@@ -1436,9 +1436,11 @@ stun	ReleaseFast	ltkey	1	0	bd4df5e08776eb07	f48e64fbf4283df1
 # sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
-# bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	fdd1c94c7423a6fe	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	219f8536123f8967	7a197b81f402a7ea
+# bytes through idhex.encode (what Manager.newId runs on its draw); idhash: the
+# session id through SHA-256, the store-key hash under hash_id_in_store.
+sessions	ReleaseFast	csrf	1	0	049bc1d45bd458ed	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	f11922fe5a2b5b26	7a197b81f402a7ea
+sessions	ReleaseFast	idhash	1	0	20e4b947fbd47e62	e2cd48972864f904
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.

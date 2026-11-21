@@ -21,6 +21,14 @@
 //!    so its bytes cannot be tainted from outside; the encoding is the only
 //!    thing it does to them.)
 //!
+//!  * `idhash` — the session id as the secret, through the one call
+//!    `Manager.storeKey` makes under `Options.hash_id_in_store`
+//!    (`Sha256.hash(id)`), at the default id (32 bytes, 64 hex digits) and the maximum (128 digits)
+//!    This is the part of the store lookup that runs on the secret;
+//!    the store then compares the hash (public) and not the id, and without
+//!    `hash_id_in_store` the store's own hash-and-compare of the raw id is
+//!    outside this row (as in every hash-keyed session store).
+//!
 //! Before 2026-10-09 both sites hex-encoded through a 16-byte table indexed
 //! by the secret nibble (`std.fmt.bytesToHex` in `Csrf.token`, a literal
 //! `"0123456789abcdef"[b >> 4]` in `newId`) — memcheck counts each such load
@@ -38,7 +46,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const idhex = @import("idhex.zig");
 
-const Target = enum { csrf, newid };
+const Target = enum { csrf, newid, idhash };
 const Taint = enum { yes, no };
 
 /// A runtime (not comptime-foldable) stand-in for a secret, so tainting it
@@ -58,6 +66,12 @@ fn reloadVolatile(comptime n: usize, src: *const [n]u8) [n]u8 {
         o.* = vb.*;
     }
     return out;
+}
+
+/// `Manager.storeKey`'s call, out of line so that a finding inside it is
+/// named by this frame and a finding in the printing below is not.
+noinline fn hashKey(id: []const u8, out: *[32]u8) void {
+    std.crypto.hash.sha2.Sha256.hash(id, out, .{});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -93,6 +107,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             res[tok.len] = @intFromBool(ok_good);
             res[tok.len + 1] = @intFromBool(ok_forged);
             std.debug.print("ctgrind_result={x}\n", .{res});
+        },
+        .idhash => {
+            var raw = secretBytes(root.max_id_bytes * 2, "ctgrind-sessions-idhash-v1");
+            if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&raw);
+            const id = reloadVolatile(root.max_id_bytes * 2, &raw);
+            var h: [32]u8 = undefined;
+            hashKey(id[0..64], &h);
+            std.debug.print("ctgrind_result={x}\n", .{h});
+            hashKey(&id, &h);
+            std.debug.print("ctgrind_result={x}\n", .{h});
         },
         .newid => {
             // 32 B (the default id_bytes) and 64 B (max_id_bytes).

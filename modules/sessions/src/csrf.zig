@@ -50,12 +50,25 @@ pub const default_cookie_name = "csrf_token";
 pub const default_form_field = "csrf_token";
 pub const default_session_cookie = "session";
 
+/// A fresh 32-byte CSRF key from the CSPRNG behind `io` (`Io.randomSecure`).
+pub fn randomKey(io: std.Io) std.Io.RandomSecureError![32]u8 {
+    var k: [32]u8 = undefined;
+    try io.randomSecure(&k);
+    return k;
+}
+
 /// A signed double-submit CSRF guard. Immutable once built; share one across
-/// threads. `key` is the HMAC secret — provision it out of band (32 random
-/// bytes, kept server-side); rotating it invalidates all outstanding tokens
-/// (a documented DEFER: dual-key rotation).
+/// threads. `key` is the HMAC secret — provision it out of band (`randomKey`:
+/// 32 random bytes, kept server-side); rotate it through `previous_keys`.
+/// A token is bound to the session id, so `Manager.regenerate` (a new id)
+/// invalidates the token of the old session.
 pub const Csrf = struct {
     key: [32]u8,
+    /// Earlier keys whose tokens `verify` still accepts (rotation: put the
+    /// new secret in `key`, the old one here until its tokens have aged out;
+    /// `token` always signs with `key`). Every key is tried, with no early
+    /// exit, so the time does not tell which one matched. Default none.
+    previous_keys: []const [32]u8 = &.{},
     /// Cookie the fresh token is delivered in (JS-readable → not HttpOnly).
     cookie_name: []const u8 = default_cookie_name,
     /// Request header the token is read from first.
@@ -80,6 +93,9 @@ pub const Csrf = struct {
     cookie_sessions: ?*const cookiestore.CookieManager = null,
     /// `SameSite` for the token cookie.
     same_site: cookies.SameSite = .lax,
+    /// CHIPS `Partitioned` for the token cookie; set it with the session
+    /// cookie's (`Options.partitioned`) in a cross-site embed. Requires `secure`.
+    partitioned: bool = false,
     /// `Secure` for the token cookie.
     secure: bool = true,
     /// The methods that require a valid token (the unsafe ones).
@@ -119,8 +135,12 @@ pub const Csrf = struct {
         const hex_ok = idhex.decode(&got, presented_tok);
         var want: [mac_length]u8 = undefined;
         Hmac.create(&want, session_id, &c.key);
-        const mac_ok = std.crypto.timing_safe.eql([mac_length]u8, want, got);
-        return (@intFromBool(mac_ok) & hex_ok) == 1;
+        var ok: u1 = @intFromBool(std.crypto.timing_safe.eql([mac_length]u8, want, got));
+        for (c.previous_keys) |*k| {
+            Hmac.create(&want, session_id, k);
+            ok |= @intFromBool(std.crypto.timing_safe.eql([mac_length]u8, want, got));
+        }
+        return (ok & hex_ok) == 1;
     }
 
     /// The token presented on `req`: the header value first, then the
@@ -201,6 +221,7 @@ pub const Csrf = struct {
             .secure = c.secure,
             .http_only = false, // the client's JS must read it to echo it
             .same_site = c.same_site,
+            .partitioned = c.partitioned,
         };
         return sc.bufPrint(buf);
     }
@@ -809,4 +830,41 @@ test "Csrf.validate agrees with issue: options it accepts yield a Set-Cookie, op
         const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session=abc\r\nConnection: close\r\n\r\n", &out);
         try testing.expectEqual(c == &good, headerValue(got, "Set-Cookie") != null);
     }
+}
+
+test "previous_keys: tokens of a rotated-out key still verify, the new key signs" {
+    const old_key: [32]u8 = @splat(1);
+    const new_key: [32]u8 = @splat(2);
+    var b1: [token_hex_len]u8 = undefined;
+    var b2: [token_hex_len]u8 = undefined;
+    const old_tok = (Csrf{ .key = old_key }).token("sid", &b1);
+    const rotated = Csrf{ .key = new_key, .previous_keys = &.{old_key} };
+    try testing.expect(rotated.verify("sid", old_tok));
+    const new_tok = rotated.token("sid", &b2);
+    try testing.expect(rotated.verify("sid", new_tok));
+    var b3: [token_hex_len]u8 = undefined;
+    try testing.expectEqualStrings(new_tok, (Csrf{ .key = new_key }).token("sid", &b3));
+    try testing.expect(!(Csrf{ .key = old_key }).verify("sid", new_tok)); // the old config cannot read new tokens
+    // Dropped from the list: refused. Another session id: refused.
+    try testing.expect(!(Csrf{ .key = new_key }).verify("sid", old_tok));
+    try testing.expect(!rotated.verify("other", old_tok));
+    try testing.expect(!rotated.verify("sid", old_tok[0 .. old_tok.len - 1]));
+}
+
+test "a token dies with its session id (regenerate rotates the token)" {
+    const c = Csrf{ .key = @splat(7) };
+    var b: [token_hex_len]u8 = undefined;
+    const tok = c.token("session-before-login", &b);
+    try testing.expect(c.verify("session-before-login", tok));
+    try testing.expect(!c.verify("session-after-login", tok));
+}
+
+test "partitioned token cookie" {
+    const c = Csrf{ .key = @splat(7), .same_site = .none, .partitioned = true };
+    try c.validate();
+    var buf: [Csrf.cookie_line_max]u8 = undefined;
+    const tok: [token_hex_len]u8 = @splat('a');
+    const line = try c.cookieLine(&tok, &buf);
+    try testing.expect(std.mem.endsWith(u8, line, "; Secure; SameSite=None; Partitioned"));
+    try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(7), .secure = false, .partitioned = true }).validate());
 }

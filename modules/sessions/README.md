@@ -92,7 +92,7 @@ const n = try mgr.iterate(gpa, &uid, ofUser); // number destroyed
 `iterate` visits every live (not expired) session; `.destroy` removes it through the store's
 delete, so a request that already holds the session cannot save it back. `KvStore` supports
 it, listing `KvStore.Config.iterate_page` keys (default 4096) per `kv` scan page, so its memory
-does not grow with the number of sessions; over `RamcacheStore` it returns `error.Unsupported`.
+does not grow with the number of sessions; over `RamcacheStore` it copies `iterate_page` records (default 128) out of the cache per lock hold, and a grow of the cache's index between pages restarts the walk (a session may then be shown twice). A third-party `Store` without an enumerator returns `error.Unsupported`.
 
 A `RamcacheStore` keys the cache by the cookie value (or its hash) with no prefix: give it a
 `ramcache.Cache` of its own, never one shared with other data — a client chooses the key it
@@ -215,9 +215,8 @@ The clock is injected (`Options.clock`) so timeout tests are deterministic.
 
 What this module refuses to do (a Redis/SQL store, typed getters, a user → sessions
 index, CSRF body-field extraction in the middleware, server-side revocation of a
-`CookieManager` session …) and what is still open (`SameSite=None` flows, CSRF token
-rotation, `iterate` over `RamcacheStore`) are listed, with the reasons, in
-[`SPEC.md`](SPEC.md) under *What is deliberately not done* and *Backlog / deferred*.
+`CookieManager` session …) are listed, with the reasons, in
+[`SPEC.md`](SPEC.md) under *What is deliberately not done*.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 OWASP Session Management and CSRF Prevention Cheat Sheets. No third-party

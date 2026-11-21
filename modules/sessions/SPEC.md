@@ -10,7 +10,7 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-19 (504/548, 44 eq) · src 4d766a2ffc941d05
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SESSIONS_FUZZ) · ct 2026-10-09 (ctgrind: CSRF key/token + session id tainted, `csrf` + `newid`, 0 in-file after the idhex fix) · panic 2026-10-28 (independent sweep of every pub entry point: no peer-reachable panic; stored last generation no longer overflows the save, unwritable cookie options refused at `init`, caller-written lengths a checked panic)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SESSIONS_FUZZ) · ct 2026-11-21 (ctgrind: CSRF key/token + session id tainted, `csrf` + `newid` + `idhash`, 0 in-file after the idhex fix) · panic 2026-10-28 (independent sweep of every pub entry point: no peer-reachable panic; stored last generation no longer overflows the save, unwritable cookie options refused at `init`, caller-written lengths a checked panic)
 
 **Performance:** ref 0.04–0.15× alexedwards/scs v2.9.0 + memstore · fastest 0.15× scs (row `new_session`; gofiber/fiber v3.6.1 `middleware/session` + its memory storage measured beside it, faster than scs only on `load_read`, 0.05× there; net of each side's HTTP stack; `tools/go_fast_bench`) (measured 2026-10-24)
 
@@ -78,6 +78,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   documented `allow_insecure_cookie` dev escape hatch would then ship a cookie the browser silently
   drops (`Secure` off + `__Host-` name is invalid), turning a dev convenience into "user is
   mysteriously never logged in" — see the pinned end-to-end test in `root.zig`.
+- **Cross-site flows (`SameSite=None`):** `Options.same_site = .none` (needs `secure`; `init` and `Csrf.validate` refuse it
+  otherwise) with `Options.partitioned = true` writes CHIPS `Partitioned` (scs 2.9 has the same switch), on `Manager`,
+  `CookieManager` and `Csrf`; set it on the session and the token cookie both, since a browser that blocks third-party
+  cookies keys each by the top-level site. Without `Lax` the browser sends the cookie on cross-site requests, so the CSRF
+  token is the defence, not the cookie attribute.
+- **CSRF key provisioning and rotation:** `randomCsrfKey(io)` draws a key from the CSPRNG. `Csrf.previous_keys` lists rotated-out
+  keys whose tokens still verify while `key` signs new ones (every key is tried, no early exit); drop an old key once its
+  tokens have aged out (the token cookie has no expiry of its own, so that is the session's lifetime). Token rotation
+  proper is `Manager.regenerate`: the token is bound to the session id.
 - **CSRF — signed double-submit (`Csrf`):** the token is `HMAC-SHA256(key, session_id)`, hex-encoded
   — bound to the session (a token for session A never verifies for B, no cross-session replay) and
   stateless (the server recomputes the expected MAC). **The comparison is
@@ -295,9 +304,13 @@ the values API, iterate, hashed ids, the model test, fuzz harnesses), `src/csrf.
 - **Fuzz:** the record decode, the cookie header parse (each also over damaged corpus inputs) and the
   values decode, run by testkit's deterministic driver as `SESSIONS_FUZZ`, with a fixed-seed reach test
   in every run.
-- **Constant time:** ctgrind rows `csrf` (CSRF key and token, session id tainted) and `newid` in
+- **Constant time:** ctgrind rows `csrf` (CSRF key and token, session id tainted), `newid` and `idhash` in
   `scripts/checks/ctgrind-expected.tsv`; dead-stack burn of the HMAC (`src/burn.zig`) checked by
-  `src/stackprobe_test.zig`. The store lookup by id is outside these rows (*Backlog / deferred*).
+  `src/stackprobe_test.zig`. `idhash` is the one call `Manager.storeKey` makes under `Options.hash_id_in_store`
+  (SHA-256 over the secret id, 0 in-file). The store's own lookup is outside the rows: under `hash_id_in_store` it
+  compares `SHA-256(id)`, which tells a timing attacker nothing usable; without it `ramcache` (`getImpl`) and `kv`
+  (`KvStore.key`) hash and compare the raw id, as every hash-keyed session store does (Go's, Rails'), and the
+  mitigation is the option.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 - **Comparative tooling** (`tools/`): `bench.zig` against scs (`go_bench/`) and fiber (`go_fast_bench/`);
@@ -334,24 +347,17 @@ figures, with their date, are the card's `**Performance:**` line; they are not r
   delete/regenerate cannot be undone.
 - **Automatic CSRF body form-field extraction in the middleware** — refused: draining the streamed body
   there would steal it from the handler; a classic hidden-form-field flow calls `Csrf.verify` itself.
+- **Synchronizer-token CSRF mode** (a random token kept in the session, as Django, Rails and Spring do for server-rendered
+  forms) — not offered: the token here is `HMAC(key, session id)`, bound to the session like a stored one, stateless, and
+  rotated by every `Manager.regenerate` (a new id is a new token); a stored token would add per-session state and a
+  session write on the first safe request (which would persist anonymous sessions, the fill-up `keep()` exists to
+  prevent). scs, the reference, has no CSRF layer. An app that wants one stores a random value with `putValue` and
+  compares it itself.
 - **Server-side revocation of a `CookieManager` session** — impossible by design (no server state); use
   `Manager` and a store when a logout must end the session everywhere.
 
 ## Backlog / deferred
-
-- **`SameSite=None` cross-site flows** — not supported.
-- **CSRF token rotation / synchronizer-token mode, `Csrf.key` provisioning/rotation** — not built; the key
-  is caller-supplied and static for the process lifetime.
-- **`RamcacheStore` iterate** — `Manager.iterate` returns `error.Unsupported` over it (`KvStore` supports
-  it). Needs a `ramcache` entry iterator that does not exist: `ramcache` has only `drainDirty` (dirty
-  entries, callback under the cache's walk), the vtable forbids holding the store lock across `visit`, and
-  a bounded walk would need a resumable cursor over an evicting, unordered cache — a new `ramcache` API,
-  not a small additive change.
-- **ct, not measured: the store lookup by session id.** `m.store.get` hashes and compares the id inside
-  ramcache (`getImpl`) / kv (`KvStore.key`), outside this card's ctgrind rows — as in every hash-keyed
-  session store (Go's, Rails'); worth a look if ramcache/kv get a ct axis. With `Options.hash_id_in_store`
-  the store compares `SHA-256(id)`, which tells a timing attacker nothing usable; the SHA-256 itself runs
-  here, on the secret, with the library's ordinary hash, outside the ctgrind rows.
+- none.
 
 ## Anchoring
 

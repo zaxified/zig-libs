@@ -31,8 +31,8 @@
 //! `clearValues` are a key/value + flash layer over the data blob (see
 //! `values.zig`); `Session.rememberMe` with `Options.persist_cookie = false`
 //! makes the cookie a browser-session cookie unless remembered;
-//! `Manager.iterate` walks every live session (logout-everywhere; `KvStore`
-//! only); `Options.hash_id_in_store` keys the store by SHA-256(id).
+//! `Manager.iterate` walks every live session (logout-everywhere; `KvStore` and
+//! `RamcacheStore`); `Options.hash_id_in_store` keys the store by SHA-256(id).
 //!
 //! ## Cookie hardening (OWASP Session Management Cheat Sheet)
 //!
@@ -110,6 +110,8 @@ pub const CookieMode = cookiestore.CookieMode;
 
 /// CSRF (signed double-submit) — see `csrf.zig`.
 pub const Csrf = csrf.Csrf;
+/// A fresh CSRF key from the CSPRNG: `Csrf{ .key = try randomCsrfKey(io) }`.
+pub const randomCsrfKey = csrf.randomKey;
 pub const csrf_token_hex_len = csrf.token_hex_len;
 
 // ── tunables ────────────────────────────────────────────────────────────────
@@ -323,6 +325,10 @@ pub const RamcacheStore = struct {
     /// only). A backstop so abandoned sessions don't pin memory forever.
     ttl_ns: i64 = default_absolute_timeout_ns,
     lock: std.atomic.Mutex = .unlocked,
+    /// Records `iterate` copies out of the cache per lock hold (its memory is
+    /// this many records, up to `max_session_bytes` each; writers wait for one
+    /// page, never for the callback).
+    iterate_page: usize = 128,
 
     /// The `Store` view of this backend (per-instance state, no globals). The
     /// `RamcacheStore` must outlive the `Manager` using it, at a stable
@@ -331,7 +337,7 @@ pub const RamcacheStore = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .touch = touchImpl };
+    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .touch = touchImpl, .iterate = iterateImpl };
 
     // Value framing: [generation u64 LE] ++ record.
     const gen_prefix_len = 8;
@@ -396,6 +402,83 @@ pub const RamcacheStore = struct {
         lockSpin(&self.lock);
         defer self.lock.unlock();
         _ = self.cache.remove(id); // absent ⇒ generation 0: no stale save matches
+    }
+
+    /// One page of records copied out of the cache under the lock.
+    const ScanPage = struct {
+        gpa: Allocator,
+        ids: std.ArrayList([]u8) = .empty,
+        values: std.ArrayList([]u8) = .empty,
+        failed: bool = false,
+
+        fn hook(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+            const pg: *ScanPage = @ptrCast(@alignCast(ctx.?));
+            if (pg.failed) return;
+            if (value.len <= gen_prefix_len) return; // not a framed live record
+            const id = pg.gpa.dupe(u8, key) catch {
+                pg.failed = true;
+                return;
+            };
+            const v = pg.gpa.dupe(u8, value) catch {
+                pg.gpa.free(id);
+                pg.failed = true;
+                return;
+            };
+            pg.ids.append(pg.gpa, id) catch {
+                pg.gpa.free(id);
+                pg.gpa.free(v);
+                pg.failed = true;
+                return;
+            };
+            pg.values.append(pg.gpa, v) catch {
+                pg.gpa.free(pg.ids.pop().?);
+                pg.gpa.free(v);
+                pg.failed = true;
+            };
+        }
+
+        fn deinit(pg: *ScanPage) void {
+            for (pg.ids.items) |x| pg.gpa.free(x);
+            for (pg.values.items) |x| pg.gpa.free(x);
+            pg.ids.deinit(pg.gpa);
+            pg.values.deinit(pg.gpa);
+        }
+    };
+
+    /// Every live record, `iterate_page` at a time through `ramcache`'s
+    /// `scan`: a page is copied out under the store's lock, then shown with
+    /// the lock released, so the callback may `delete` (or save). Weakly
+    /// consistent, like `KvStore`'s walk and Caffeine's `asMap()`: a session
+    /// live for the whole walk is shown at least once, and exactly once unless
+    /// the cache's index grew or was rebuilt between two pages (the walk then
+    /// starts over and may show a session twice); one created or removed
+    /// meanwhile may or may not be shown. A record past the cache's own
+    /// expiry is not shown. Costs one page of copies.
+    fn iterateImpl(
+        ptr: *anyopaque,
+        gpa: Allocator,
+        ctx: ?*anyopaque,
+        visit: *const fn (ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool,
+    ) StoreError!void {
+        const self: *RamcacheStore = @ptrCast(@alignCast(ptr));
+        var cursor: ramcache.Cache.ScanCursor = .{};
+        while (true) {
+            var page: ScanPage = .{ .gpa = gpa };
+            defer page.deinit();
+            const now = self.clock.now();
+            lockSpin(&self.lock);
+            const done = self.cache.scan(&cursor, now, 0, @max(self.iterate_page, 1), ScanPage.hook, &page);
+            self.lock.unlock();
+            if (page.failed) return error.OutOfMemory;
+            for (page.ids.items, page.values.items) |id, v| {
+                const loaded: Loaded = .{
+                    .record = v[gen_prefix_len..],
+                    .generation = std.mem.readInt(u64, v[0..gen_prefix_len], .little),
+                };
+                if (!visit(ctx, id, loaded)) return;
+            }
+            if (done) return;
+        }
     }
 };
 
@@ -825,6 +908,11 @@ pub const Options = struct {
     cookie_domain: ?[]const u8 = null,
     /// `SameSite` attribute (default `.lax` — sane CSRF baseline).
     same_site: cookies.SameSite = .lax,
+    /// CHIPS `Partitioned` attribute: the browser keys the cookie by the
+    /// top-level site, which a cross-site embed (`same_site = .none`) needs
+    /// once third-party cookies are blocked. Requires `secure`
+    /// (`error.InvalidCookieOptions` otherwise). Default false.
+    partitioned: bool = false,
     /// Emit `Secure` (HTTPS-only). Default true; drop it only via
     /// `allow_insecure_cookie` for a plain-HTTP dev server.
     secure: bool = true,
@@ -868,6 +956,7 @@ pub const Manager = struct {
     cookie_path: ?[]const u8,
     cookie_domain: ?[]const u8,
     same_site: cookies.SameSite,
+    partitioned: bool,
     secure: bool,
     persist_untouched_sessions: bool,
     persist_cookie: bool,
@@ -921,6 +1010,7 @@ pub const Manager = struct {
             .secure = options.secure and !options.allow_insecure_cookie,
             .http_only = true,
             .same_site = options.same_site,
+            .partitioned = options.partitioned,
         };
         var probe_buf: [cookie_line_max]u8 = undefined;
         _ = probe.bufPrint(&probe_buf) catch return error.InvalidCookieOptions;
@@ -936,6 +1026,7 @@ pub const Manager = struct {
             .cookie_path = options.cookie_path,
             .cookie_domain = options.cookie_domain,
             .same_site = options.same_site,
+            .partitioned = options.partitioned,
             .secure = options.secure and !options.allow_insecure_cookie,
             .persist_untouched_sessions = options.persist_untouched_sessions,
             .persist_cookie = options.persist_cookie,
@@ -1159,7 +1250,13 @@ pub const Manager = struct {
     /// only; **`s.id()` is the store key** -- the cookie id, unless
     /// `Options.hash_id_in_store`, when it is `SHA-256(id)` as raw bytes and
     /// must not be treated as a cookie value. `error.Unsupported` when the store
-    /// cannot enumerate (`RamcacheStore` has no entry iterator; `KvStore` can).
+    /// cannot enumerate (a third-party `Store` without `VTable.iterate`).
+    ///
+    /// Over `RamcacheStore` the walk is paged too (`iterate_page` records copied
+    /// per lock hold); a session live throughout is shown at least once, and a
+    /// grow of the cache's index between pages restarts the walk, so one may be
+    /// shown twice (`f` then runs twice for it: make it idempotent, as a
+    /// compare-and-destroy is).
     ///
     /// Over `KvStore` the walk is paged, not one snapshot: a session created
     /// during it may or may not be shown, and each page is a full pass over
@@ -1235,6 +1332,7 @@ pub const Manager = struct {
             .secure = m.secure,
             .http_only = true,
             .same_site = m.same_site,
+            .partitioned = m.partitioned,
         };
         // addSetCookie copies the bytes into the writer's own header_buf
         // before returning, so this local only has to outlive the call.
@@ -3869,14 +3967,63 @@ test "Manager.iterate: logout-everywhere for one user over KvStore; the CAS stil
     try testing.expectEqual(@as(usize, 0), ctx.seen);
 }
 
-test "Manager.iterate: RamcacheStore cannot enumerate" {
+test "Manager.iterate: a Store without VTable.iterate cannot enumerate" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    const base = env.store.store();
+    var vt = base.vtable.*;
+    vt.iterate = null;
+    const bare: Store = .{ .ptr = base.ptr, .vtable = &vt };
+    var m = try Manager.init(testing.allocator, bare, .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = 10_000, .absolute_timeout_ns = 100_000 });
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectError(error.Unsupported, m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 0), ctx.seen);
+}
+
+test "Manager.iterate: logout-everywhere over RamcacheStore, in pages, the CAS still holds" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    env.store.iterate_page = 2; // five sessions: three pages
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    var stale: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(&ids[0], &stale));
+
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectEqual(@as(usize, 3), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 5), ctx.seen);
+    var l: Session = .{};
+    for (ids[0..3]) |*id| try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+    for (ids[3..5]) |*id| try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+    try testing.expect(!m.persist(&stale));
+
+    ctx = .{ .uid = "B", .stop_after = 1 };
+    try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    // Past the idle timeout nothing is shown.
+    env.clk.now_ns += 20_000;
+    ctx = .{ .uid = "B" };
+    try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 0), ctx.seen);
+}
+
+test "RamcacheStore.iterate: an allocation failure is OutOfMemory, never a leak" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
     var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
-    var ctx: Logout = .{ .uid = "A" };
-    try testing.expectError(error.Unsupported, m.iterate(testing.allocator, &ctx, Logout.visit));
-    try testing.expectEqual(@as(usize, 0), ctx.seen);
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var ctx: Logout = .{ .uid = "none" };
+        if (m.iterate(failing.allocator(), &ctx, Logout.visit)) |_| {} else |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
 }
 
 // Whole-module mutation run 2026-11-12: `iterateImpl`'s `orelse continue` for a key that is
@@ -4301,6 +4448,37 @@ test "Manager: Domain, Path and SameSite reach the Set-Cookie" {
         try testing.expect(std.mem.find(u8, sc, "Path=/app") != null);
         try testing.expect(std.mem.find(u8, sc, v.want) != null);
     }
+}
+
+test "Manager: partitioned reaches the Set-Cookie and needs Secure" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    const m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .same_site = .none,
+        .partitioned = true,
+    });
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("x");
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    m.save(&rw, &s);
+    try rw.end();
+    const sc = headerValue(out.buffered(), "Set-Cookie").?;
+    try testing.expect(std.mem.find(u8, sc, "; Secure; HttpOnly; SameSite=None; Partitioned") != null);
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .partitioned = true,
+        .secure = false,
+        .allow_insecure_cookie = true,
+    }));
 }
 
 test "Manager.init: the dry run prints the longest Max-Age, so the 512-byte line limit is exact" {

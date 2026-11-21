@@ -880,6 +880,7 @@ fn initWith(env: *Env, o: struct {
     domain: ?[]const u8 = null,
     path: ?[]const u8 = "/",
     same_site: cookies.SameSite = .lax,
+    partitioned: bool = false,
     id_bytes: usize = 16,
     max_cookie_bytes: usize = cookiestore.default_max_cookie_bytes,
 }) !CookieManager {
@@ -893,6 +894,7 @@ fn initWith(env: *Env, o: struct {
         .cookie_domain = o.domain,
         .cookie_path = o.path,
         .same_site = o.same_site,
+        .partitioned = o.partitioned,
         .id_bytes = o.id_bytes,
         .max_cookie_bytes = o.max_cookie_bytes,
     });
@@ -1167,4 +1169,27 @@ test "middleware: the 500 that carries the clearing cookie has a text body" {
     try testing.expectEqualStrings("500", statusOf(got));
     try testing.expect(std.mem.find(u8, got, "Content-Type: text/plain") != null);
     try testing.expect(std.mem.find(u8, got, "Internal Server Error\n") != null);
+}
+
+test "CookieManager: partitioned is a Partitioned attribute and needs Secure" {
+    var env: Env = .{};
+    var m = try initWith(&env, .{ .name = "sid3", .same_site = .none, .partitioned = true });
+    var app: App = .{ .m = &m, .action = .put_uid };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var o1: [8192]u8 = undefined;
+    const first = request(&r, "GET", null, "", &o1);
+    const sc = setCookie(first, "sid3").?;
+    try testing.expect(std.mem.find(u8, sc, "SameSite=None; Partitioned") != null);
+    try testing.expectError(error.InvalidCookieOptions, CookieManager.init(.{
+        .io = testing.io,
+        .keys = env.keys[0..1],
+        .clock = env.clk.clock(),
+        .secure = false,
+        .allow_insecure_cookie = true,
+        .partitioned = true,
+    }));
 }
