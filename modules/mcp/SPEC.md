@@ -468,7 +468,7 @@ that the user who opens it is the user it was minted for) is the application's, 
 
 No diary here: the card's `**Performance:**` line carries the figures. The benchmark is `zig build bench-mcp`
 (`tools/bench.zig`; five stdio sessions of 64 requests each against the Go SDK, `tools/go_bench`, and the Rust SDK,
-`tools/rs_field`), plus the official Python SDK 2.3.0 as a speed context (`tools/py_bench`, `MCPServer` over its stdio runner on in-memory streams, EOF withheld until every request is answered as on the Go side; not a card figure). Measured 2026-11-21 under a loaded shared host: ours/python 0.0011-0.0037 (python spread up to 9x between rounds, the effect is two orders of magnitude, so the claim is only "over 100x faster per session"). The TypeScript SDK needs Node.
+`tools/rs_field`), plus the official Python SDK 2.3.0 as a speed context (`tools/py_bench`, `MCPServer` over its stdio runner on in-memory streams, EOF withheld until every request is answered as on the Go side; not a card figure). Measured 2026-11-21 under a loaded shared host: ours/python 0.0011-0.0037 (python spread up to 9x between rounds, the effect is two orders of magnitude, so the claim is only "over 100x faster per session"). The official TypeScript SDK 1.32.2 (Node 22) is one more row (`tools/ts_bench`, `McpServer` over `StdioServerTransport` on in-memory streams, the input ended only once every request is answered; not a card figure). Measured 2026-11-21 (two runs, 3 and 5 rounds, on a loaded shared host; counts agree): ours/typescript 0.0154-0.1185 (about 9x to 65x faster per session; the TypeScript spread between rounds reached 65 %, far below the effect, so the claim is only "at least 8x faster"): `tools/list` with 20 tools is the widest gap (about 0.75 ms against 42-49 ms), `initialize` alone the narrowest (about 0.07 ms against 1.7-1.8 ms).
 
 **MCP Apps (`apps.zig`).** The Python SDK's `mcp.server.apps` and the TypeScript `registerAppTool` / `registerAppResource` over the
 existing `meta_json` and `setCapabilityExtras`: `toolMeta(arena, "ui://…", visibility)` writes `{"ui":{"resourceUri":…,"visibility":[…]}}`,
@@ -514,14 +514,12 @@ shapes of the client declaration. The iframe bridge belongs to the host and the 
 
 ## Backlog / deferred
 
-- **Speed against the TypeScript SDK is not measured.** The TypeScript SDK now runs as a differential peer (`tools/sdk_oracle/drive_ts.mjs`,
-  18 checks, session era; Node 22 and the SDK installed without root, see the script's header); a speed harness next to
-  `py_bench` is not written.
 - **Re-check two equivalence arguments** at the next whole-module mutation run: `compileText`'s `literalDepthOk` and
   `cancelInflight`'s `conformingId` guard are judged equivalent because `std.json` and `Stringify` are bounded by a
   buffer.
 - **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
-  held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete.
+  held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete. *BOUNCED: needs a held-open response seam in
+  `http` (see `mcp-http`'s Backlog).*
 
 ## Anchoring
 

@@ -55,9 +55,10 @@
 //! `tools/sdk_oracle`; `BENCH_PY=0` skips it, as does a missing venv) is timed
 //! the same way as one more row per workload, through `MCPServer` and its stdio
 //! runner over in-memory streams; it is a speed context, not part of the card's
-//! `ref` / `fastest` figures. Its count must agree too. The TypeScript SDK needs
-//! Node, which this host has only inside a browser-test cache (no `npm`, so no
-//! SDK): not measured.
+//! `ref` / `fastest` figures. Its count must agree too. The official TypeScript SDK
+//! (`tools/ts_bench`, `McpServer` over `StdioServerTransport` on in-memory streams, Node
+//! and the SDK installed as `tools/sdk_oracle/drive_ts.mjs` describes; `BENCH_TS=0` skips
+//! it, as does a missing Node) is one more row of the same kind.
 
 const std = @import("std");
 const bench = @import("benchkit");
@@ -71,6 +72,7 @@ const ref_card = "modelcontextprotocol/go-sdk v1.8.0";
 const fast_rs_manifest = "modules/mcp/tools/rs_field/Cargo.toml";
 const fast_rs_exe = "modules/mcp/tools/rs_field/target/release/mcp_rs_field";
 const py_exe = "modules/mcp/tools/py_bench/run.sh";
+const ts_exe = "modules/mcp/tools/ts_bench/run.sh";
 
 const names = [_][]const u8{ "tools_call_echo", "tools_list_20", "resources_read", "prompts_get", "initialize_only" };
 const n_req = 64;
@@ -186,6 +188,10 @@ pub fn main(init: std.process.Init) !u8 {
     var py_banner: []const u8 = "";
     var worst_py: f64 = 0;
     var best_py: f64 = std.math.inf(f64);
+    const use_ts = if (init.environ_map.get("BENCH_TS")) |v| !std.mem.eql(u8, v, "0") else nodeAvailable(io, init.environ_map);
+    var ts_banner: []const u8 = "";
+    var worst_ts: f64 = 0;
+    var best_ts: f64 = std.math.inf(f64);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -203,10 +209,12 @@ pub fn main(init: std.process.Init) !u8 {
         var go: bench.Side = .{};
         var rs: bench.Side = .{};
         var py: bench.Side = .{};
+        var ts: bench.Side = .{};
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
             if (use_fast) rs.add(try bench.foreign(arena, io, bench_name, fast_rs_exe, abs, name, &rs_banner));
             if (use_py) py.add(try bench.foreign(arena, io, bench_name, py_exe, abs, name, &py_banner));
+            if (use_ts) ts.add(try bench.foreign(arena, io, bench_name, ts_exe, abs, name, &ts_banner));
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const ratio = ours.best_ns / go.best_ns;
@@ -232,8 +240,18 @@ pub fn main(init: std.process.Init) !u8 {
             best_py = @min(best_py, py_ratio);
             try w.print("{s:<18} {s:>12} {d:>12.0} {d:>8.4} {s:>7} {d:>6.1}%  python-sdk{s}\n", .{ "", "", py.best_ns, py_ratio, "", 100 * py.spread(false), if (py_same) "" else " ≠ " ++ ref_short });
         }
+        if (use_ts) {
+            const ts_same = ts.count == go.count;
+            mismatch = mismatch or !ts_same;
+            max_spread = @max(max_spread, ts.spread(false));
+            const ts_ratio = ours.best_ns / ts.best_ns;
+            worst_ts = @max(worst_ts, ts_ratio);
+            best_ts = @min(best_ts, ts_ratio);
+            try w.print("{s:<18} {s:>12} {d:>12.0} {d:>8.4} {s:>7} {d:>6.1}%  typescript-sdk{s}\n", .{ "", "", ts.best_ns, ts_ratio, "", 100 * ts.spread(false), if (ts_same) "" else " ≠ " ++ ref_short });
+        }
         try w.flush();
     }
+    if (use_ts and ts_banner.len > 0) try w.print("typescript: {s}\n", .{std.mem.trim(u8, ts_banner, " \n")});
     if (use_py and py_banner.len > 0) try w.print("python: {s}\n", .{std.mem.trim(u8, py_banner, " \n")});
     if (rs_banner.len > 0) try w.print("field: {s}\n", .{std.mem.trim(u8, rs_banner, " \n")});
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -245,6 +263,7 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
     if (use_fast) try w.print("worst ours/fastest = {d:.2}\n", .{worst_fast});
     if (use_py and worst_py > 0) try w.print("ours/python-sdk = {d:.4}-{d:.4} (not a card figure)\n", .{ best_py, worst_py });
+    if (use_ts and worst_ts > 0) try w.print("ours/typescript-sdk = {d:.4}-{d:.4} (not a card figure)\n", .{ best_ts, worst_ts });
     if (filters.len == 0) {
         if (use_fast)
             try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× rmcp 3.7.0 (Rust) (measured <today>)\n", .{ best, worst, ref_card, worst_fast })
@@ -265,6 +284,20 @@ fn pythonAvailable(io: std.Io, environ: *const std.process.Environ.Map) bool {
     const home = environ.get("HOME") orelse return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/.local/share/zig-libs/oracle-venvs/mcp/bin/python", .{home}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// The TypeScript side needs Node (`MCP_NODE` or the default of `tools/ts_bench/run.sh`) and the SDK
+/// installed as `tools/sdk_oracle/drive_ts.mjs` describes.
+fn nodeAvailable(io: std.Io, environ: *const std.process.Environ.Map) bool {
+    if (environ.get("MCP_NODE")) |p| {
+        std.Io.Dir.cwd().access(io, p, .{}) catch return false;
+        return true;
+    }
+    const home = environ.get("HOME") orelse return false;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/.local/share/zig-libs/oracle-bin/node/bin/node", .{home}) catch return false;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
