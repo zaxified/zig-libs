@@ -394,6 +394,21 @@ fn plainTexts(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]const
     return out;
 }
 
+/// The codes of a categorical column as ints, a null cell as -1 (no code is negative): equal
+/// categories have equal codes within one column (the dictionary holds each text once), so the
+/// codes group as the texts do, with the missing cells one group of their own as `.as_null` says.
+/// Valid for the keys of one frame only (two frames' dictionaries number their texts apart).
+fn categoricalCodes(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]const i64 {
+    if (col != .categorical) return null;
+    const c = col.categorical;
+    if (c.codes.values.len != rows) return null;
+    const n_dict = c.dict.offsets.len -| 1;
+    const out = try a.alloc(i64, rows);
+    // A code past the dictionary reads as null (`CatColumn.at`), so it is the null group here too.
+    for (out, c.codes.values, 0..) |*o, code, ri| o.* = if (c.codes.isValid(ri) and code < n_dict) code else -1;
+    return out;
+}
+
 const pos_zero = [_]usize{0};
 
 fn factorColumn(a: std.mem.Allocator, f: Frame, ci: usize) Error!keys.Factors {
@@ -401,6 +416,7 @@ fn factorColumn(a: std.mem.Allocator, f: Frame, ci: usize) Error!keys.Factors {
     if (f.len > 0) {
         if (try intsWithMissing(a, col, f.len)) |xs| return keys.factorizeInts(a, xs);
         if (try plainTexts(a, col, f.len)) |xs| return keys.factorizeTexts(a, xs);
+        if (try categoricalCodes(a, col, f.len)) |xs| return keys.factorizeInts(a, xs);
     }
     return keys.factorize(a, try keyRows(a, f, &.{ci}), &pos_zero, .as_null);
 }
@@ -950,6 +966,30 @@ fn plainInts(f: Frame, idxs: []const usize) ?[]const i64 {
     return col.int.values;
 }
 
+/// The codes of a single categorical key column with no null and every code inside its
+/// dictionary, as ints. Two columns' codes compare only when `sameDict`.
+fn plainCodes(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error!?[]const i64 {
+    if (idxs.len != 1 or f.len == 0) return null;
+    const col = colOf(f, idxs[0]);
+    if (col != .categorical or col.categorical.codes.valid != null) return null;
+    const xs = (try categoricalCodes(a, col, f.len)) orelse return null;
+    for (xs) |x| if (x < 0) return null;
+    return xs;
+}
+
+/// Whether two dictionaries hold the same texts in the same order (their codes then mean the same).
+fn sameDict(x: fm.TextColumn, y: fm.TextColumn) bool {
+    if (x.offsets.len != y.offsets.len) return false;
+    if (x.offsets.len == 0) return true;
+    const n = x.offsets.len - 1;
+    for (0..n) |i| {
+        const tx = x.at(i) orelse return false;
+        const ty = y.at(i) orelse return false;
+        if (!std.mem.eql(u8, tx, ty)) return false;
+    }
+    return true;
+}
+
 const Lookup = struct {
     /// `hits[i]` = the build side's group of probe row `i`, or `keys.none`.
     hits: []u32,
@@ -965,6 +1005,15 @@ fn lookupKeys(a: std.mem.Allocator, build: Frame, bk: []const usize, probe: Fram
             const g = try keys.factorizeInts(a, bi);
             try keys.probeInts(&g.table, pi, hits);
             return .{ .hits = hits, .ids = g.ids, .groups = g.groups() };
+        }
+    }
+    if (try plainCodes(a, build, bk)) |bi| {
+        if (try plainCodes(a, probe, pk)) |pi| {
+            if (sameDict(colOf(build, bk[0]).categorical.dict, colOf(probe, pk[0]).categorical.dict)) {
+                const g = try keys.factorizeInts(a, bi);
+                try keys.probeInts(&g.table, pi, hits);
+                return .{ .hits = hits, .ids = g.ids, .groups = g.groups() };
+            }
         }
     }
     const positions = struct {

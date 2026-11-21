@@ -254,3 +254,59 @@ test "duration: ts - ts, ts + dur, total_*, cast, writers and reader" {
     try st.expectCol(ctt, "t", &.{ txt("PT1.5S"), .null });
     try testing.expectError(error.CastFailed, df.cast(a, tx, .{ .col = "t", .to = .duration, .on_error = .fail }));
 }
+
+test "group, distinct, join and pivot keyed on a categorical's codes give the text keys' answers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try st.mk(a, &.{ .{ .name = "c", .type = .text }, .{ .name = "v", .type = .int }, .{ .name = "k", .type = .text } }, &.{
+        &.{ txt("b"), int(1), txt("x") }, &.{ txt("a"), int(2), txt("y") }, &.{ .null, int(3), txt("x") },    &.{ txt("b"), int(4), txt("y") },
+        &.{ .null, int(5), txt("x") },    &.{ txt("c"), int(6), txt("y") }, &.{ txt("a"), int(7), txt("x") },
+    });
+    const f = try df.cast(a, raw, .{ .col = "c", .to = .categorical });
+    const spec: df.AggregateSpec = .{ .group_by = &.{"c"}, .aggs = &.{.{ .src = "v", .out = "s", .func = .sum }} };
+    // first-seen order, the null rows one group
+    const g = try df.aggregate(a, f, spec);
+    try expectSameCells(try df.aggregate(a, raw, spec), g);
+    try testing.expectEqual(@as(usize, 4), g.len);
+    try st.expectCol(g, "s", &.{ int(5), int(9), int(8), int(6) });
+    // two keys, one categorical and one text
+    const spec2: df.AggregateSpec = .{ .group_by = &.{ "c", "k" }, .aggs = &.{.{ .src = "v", .out = "s", .func = .sum }} };
+    try expectSameCells(try df.aggregate(a, raw, spec2), try df.aggregate(a, f, spec2));
+    // distinct keeps first, last and none like the text column
+    for ([_]@TypeOf((df.DistinctSpec{ .keys = &.{} }).keep){ .first, .last, .none }) |keep| {
+        const dspec: df.DistinctSpec = .{ .keys = &.{"c"}, .keep = keep };
+        try expectSameCells(try df.distinct(a, raw, dspec), try df.distinct(a, f, dspec));
+    }
+    // join: the same dictionary on both sides (codes compare), a dictionary with another
+    // category (texts compare), and a null key (no match)
+    const r_same = try st.mk(a, &.{ .{ .name = "c", .type = .text }, .{ .name = "w", .type = .int } }, &.{ &.{ txt("a"), int(10) }, &.{ txt("b"), int(20) }, &.{ txt("c"), int(30) } });
+    const r_more = try st.mk(a, &.{ .{ .name = "c", .type = .text }, .{ .name = "w", .type = .int } }, &.{ &.{ txt("a"), int(10) }, &.{ txt("b"), int(20) }, &.{ txt("z"), int(30) }, &.{ txt("c"), int(40) } });
+    const r_null = try st.mk(a, &.{ .{ .name = "c", .type = .text }, .{ .name = "w", .type = .int } }, &.{ &.{ txt("a"), int(10) }, &.{ .null, int(20) }, &.{ txt("c"), int(30) } });
+    const lv = try st.mk(a, &.{ .{ .name = "c", .type = .text }, .{ .name = "v", .type = .int } }, &.{ &.{ txt("c"), int(1) }, &.{ txt("a"), int(2) }, &.{ txt("b"), int(3) }, &.{ txt("a"), int(4) } });
+    const lc = try df.cast(a, lv, .{ .col = "c", .to = .categorical });
+    for ([_]df.Frame{ r_same, r_more, r_null }) |r| {
+        const rc = try df.cast(a, r, .{ .col = "c", .to = .categorical });
+        for ([_]df.JoinHow{ .inner, .left }) |how| {
+            const jspec: df.JoinSpec = .{ .on = "c", .how = how };
+            const want = try df.join(a, lv, r, jspec);
+            const got = try df.join(a, lc, rc, jspec);
+            try testing.expectEqual(want.len, got.len);
+            for (0..want.len) |ri| {
+                try testing.expect(st.same(want.cell(ri, "c").?, got.cell(ri, "c").?));
+                try testing.expect(st.same(want.cell(ri, "v").?, got.cell(ri, "v").?));
+                try testing.expect(st.same(want.cell(ri, "w").?, got.cell(ri, "w").?));
+            }
+        }
+    }
+    // pivot over categorical keys
+    const pspec: df.PivotSpec = .{ .row_key = "c", .col_key = "k", .value_col = "v" };
+    const pw = try df.pivot(a, raw, pspec);
+    const pg = try df.pivot(a, f, pspec);
+    try testing.expectEqual(pw.len, pg.len);
+    try testing.expectEqual(pw.columns.len, pg.columns.len);
+    for (pw.columns, 0..) |col, ci| {
+        for (0..pw.len) |ri| try testing.expect(st.same(pw.columnAt(ci).get(ri), pg.columnAt(ci).get(ri)));
+        try testing.expectEqualStrings(col.name, pg.columns[ci].name);
+    }
+}

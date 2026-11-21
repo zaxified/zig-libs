@@ -88,8 +88,12 @@ them: both sort a categorical lexically, as here). Every verb that does not name
 reads it through `get` as text; `take` (so `filter`, `sort`, `head`, joins' payload) gathers
 the codes and shares the dictionary, `concat` encodes the union again. A column declared
 categorical may hold plain text storage (a `FrameBuilder` frame): it reads the same. Categories
-in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, in § Design notes by feature); group/join/sort
-over the codes rather than the text (the speed of an encoded key) is in § Backlog / deferred. A duration is ISO 8601 in CSV and JSON
+in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, in § Design notes by feature); group, `distinct`, `pivot`
+and a join key run over the codes: a single categorical key column factorizes its codes as ints (the null cells one group of
+their own), a join does so when both sides are one categorical key with no null and the same dictionary, else it reads the
+texts; sort has always compared the codes (measured over 1 M rows and 1 000 categories, `group_cat` 15 ms against 64 ms
+over the text path, `join_cat` 34 ms against `join_txt`'s 77 ms; `window`'s `cummin` and `rank` over a categorical keep
+reading the text: the answer is the same, only the speed is not an encoded key's). A duration is ISO 8601 in CSV and JSON
 (`formatIsoDuration`, polars' JSON form, delegating to `datefmt`'s ISO 8601 duration functions; polars refuses a duration in CSV, pandas writes
 `1 days 02:03:04`, which `parseDurationCell` reads too) and polars' `1d 2h` in `format`.
 `mutate` gives an expression the temporal type it keeps (`expr.temporalType`: `ts - ts` a
@@ -1205,6 +1209,5 @@ the end cell with 0).
 Open items only; everything here is LOW unless marked, and none is a known wrong answer without a refusal or a note in the sections above.
 
 - **Build size knobs (CONVENTIONS §4.2; owner decision):** `regex` brings its Unicode tables and `unitext` adds 158,056 B (+15%) to a ReleaseSmall binary that calls `mutate` with one `add`; a `dataframe-regex` and a `dataframe-unicode` option (default on, off = the former ASCII behaviour) would remove them: measure with a size probe, the owner decides.
-- **Categoricals and speed:** group/join/sort keyed on the codes of an unordered categorical column (the speed of an encoded key; measure first); `pivot` and the order-aware `window` functions (`cummin`, `rank`) still read a categorical's text.
 - **Nested keys:** group/join/sort keys over list and struct columns take the encoded-row path with no typed fast path (measure first).
 - **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.

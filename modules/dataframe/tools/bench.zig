@@ -34,6 +34,10 @@
 //! (`k_txt` contains "99", literal; count: rows + the rows that do) and `strptime`
 //! (D: 1 M rows of ISO date text, parsed with `%Y-%m-%d` to a date column; count: rows
 //! + sum of the days of month).
+//!
+//! `group_cat` (wave 14): `group_txt` over L with `k_txt` a categorical column (1 000
+//! categories; pandas `category`, polars `Categorical`), built outside the clock; count as
+//! `group_txt`. `join_cat`: `join_txt` with both sides categorical (T's dictionary equals L's). No DuckDB row.
 
 const std = @import("std");
 const bench = @import("benchkit");
@@ -45,9 +49,9 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { fill_null, join_asof, top_k, win_shift, win_rank, value_counts, describe, concat, str_contains, strptime, read_csv, write_csv, write_json, write_ndjson, group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
+const Op = enum { fill_null, join_asof, top_k, win_shift, win_rank, value_counts, describe, concat, str_contains, strptime, read_csv, write_csv, write_json, write_ndjson, group_int, group_null, group_hi, group_txt, group_two, group_cat, group_stats, join_inner, join_left, join_txt, join_cat, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
 
-const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []const u8, a: Frame, d: Frame };
+const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []const u8, a: Frame, d: Frame, cat: Frame, tcat: Frame };
 
 fn frameSum(f: Frame, name: []const u8) f64 {
     const c = f.column(name).?;
@@ -220,6 +224,10 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
             const o = try df.aggregate(a, c.l, .{ .group_by = &.{ "k_int", "k2" }, .aggs = &.{s_v} });
             return cnt(o.len, frameSum(o, "s"));
         },
+        .group_cat => {
+            const o = try df.aggregate(a, c.cat, .{ .group_by = &.{"k_txt"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.len, frameSum(o, "s"));
+        },
         .group_stats => {
             const o = try df.aggregate(a, c.l, .{ .group_by = &.{"k_int"}, .aggs = &.{
                 .{ .src = "v", .out = "c", .func = .count },
@@ -238,6 +246,10 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
         },
         .join_txt => {
             const o = try df.join(a, c.l, c.t, .{ .on = "k_txt", .how = .inner });
+            return cnt(o.len, frameSum(o, "tv"));
+        },
+        .join_cat => {
+            const o = try df.join(a, c.cat, c.tcat, .{ .on = "k_txt", .how = .inner });
             return cnt(o.len, frameSum(o, "tv"));
         },
         .sort_float => {
@@ -423,7 +435,7 @@ fn wrapper(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, abs: []const u8, p
 /// The rows DuckDB has no like-for-like form of (or none worth an unfair sort/format).
 fn noDuck(op: Op) bool {
     return switch (op) {
-        .mutate, .rolling, .cumsum, .pivot, .read_csv, .write_csv, .write_json, .write_ndjson, .fill_null, .win_shift, .win_rank, .describe, .strptime => true,
+        .mutate, .rolling, .cumsum, .pivot, .read_csv, .write_csv, .write_json, .write_ndjson, .fill_null, .win_shift, .win_rank, .describe, .strptime, .group_cat, .join_cat => true,
         else => false,
     };
 }
@@ -451,7 +463,7 @@ pub fn main(init: std.process.Init) !void {
     huge_always = if (env.get("BENCH_HUGE")) |v| std.mem.eql(u8, v, "always") else false;
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
-    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv, .a = tb.a, .d = tb.d };
+    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv, .a = tb.a, .d = tb.d, .cat = try df.cast(a, tb.l, .{ .col = "k_txt", .to = .categorical }), .tcat = try df.cast(a, tb.t, .{ .col = "k_txt", .to = .categorical }) };
 
     const pandas_exe = try wrapper(a, io, dir, abs, py, "pandas");
     const alt_exe = try wrapper(a, io, dir, abs, py, alt);
