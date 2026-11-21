@@ -125,12 +125,11 @@ locale gets `null` (safe failure), not a mis-parsed number silently accepted.
 - **Currency symbols.** Babel's `parse_decimal` reads none either; the module hands the ungrouped half of the job to `decimal`.
 - **Likely-subtag resolution of unknown locale names.** `locale` matches CLDR identifiers only
   (ASCII case-insensitive, `-` as `_`); an unknown name is null.
+- **CJK 4-digit myriad grouping, the native percent sign (`٪`) and prefix percent (tr `%12`), CLDR's `minimumGroupingDigits`.** The reference (Babel's `parse_decimal`) reads none of them, and no consumer has asked; by the owner policy (items the reference lacks) they are not built.
 
 ## Backlog / deferred
 
-- **Not built, no consumer has asked** (effort M each): CJK 4-digit myriad grouping, the native percent
-  sign (`٪`) and prefix percent (tr `%12`), CLDR's `minimumGroupingDigits` (Babel's `parse_decimal` reads
-  none of them either).
+None open.
 
 ## Anchoring
 
