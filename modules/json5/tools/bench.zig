@@ -47,7 +47,10 @@ const ref_script = "modules/json5/tools/bench_ref.js";
 const ref_short = "ref";
 const fast_rs_manifest = "modules/json5/tools/rs_field/Cargo.toml";
 const fast_rs_exe = "modules/json5/tools/rs_field/target/release/json5_rs_field";
-const fast_contenders = [_][]const u8{ "json5", "json-five" };
+const fast_py_exe = ".zig-cache/bench-json5/venv/bin/python";
+const fast_py_script = "modules/json5/tools/py_field.py";
+// The third contender (pyjson5) is timed only when its venv exists (see py_field.py).
+const fast_contenders = [_][]const u8{ "json5", "json-five", "pyjson5" };
 const gpa = std.heap.smp_allocator;
 
 const Kind = enum { parse, preprocess };
@@ -331,6 +334,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
     if (use_fast) rustBuild(arena, io) catch return 1;
+    const have_py = use_fast and blk: {
+        std.Io.Dir.cwd().access(io, fast_py_exe, .{}) catch break :blk false;
+        break :blk true;
+    };
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -354,7 +361,10 @@ pub fn main(init: std.process.Init) !u8 {
         for (0..rounds) |_| {
             if (has_ref) ref.add(try bench.foreignArgv(arena, io, bench_name, &.{ "bun", ref_script, abs, wk.name }, wk.name, &banner));
             if (has_ref and use_fast) for (fast_contenders, &fast, &fast_banners) |c, *side, *fb| {
-                side.add(try bench.foreignArgv(arena, io, bench_name, &.{ fast_rs_exe, abs, wk.name, c }, wk.name, fb));
+                if (std.mem.eql(u8, c, "pyjson5")) {
+                    if (!have_py) continue;
+                    side.add(try bench.foreignArgv(arena, io, bench_name, &.{ fast_py_exe, fast_py_script, abs, wk.name }, wk.name, fb));
+                } else side.add(try bench.foreignArgv(arena, io, bench_name, &.{ fast_rs_exe, abs, wk.name, c }, wk.name, fb));
             };
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
@@ -375,6 +385,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (use_fast) {
             var fastest: f64 = std.math.inf(f64);
             for (fast_contenders, fast) |c, side| {
+                if (std.mem.eql(u8, c, "pyjson5") and !have_py) continue;
                 fastest = @min(fastest, side.best_ns);
                 max_spread = @max(max_spread, side.spread(false));
                 const fsame = side.count == ref.count;

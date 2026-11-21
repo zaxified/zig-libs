@@ -12,7 +12,7 @@
 
 **Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, JSON5_FUZZ; 3 harnesses incl. the single-pass reader against the two-stage path, ReleaseSafe) · ct n/a — JSON5 parsing (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator pass + independent sweep of every pub entry point: the diagnostic prefix no longer grows with an input run of `_` (quadratic output), recovery counters widened)
 
-**Performance:** ref 0.04–0.05× json5/json5 2.2.3 (bun 1.3.12; `zig build bench-json5`: 1.4 KB config ×1000, 1 MB JSON, 1.1 MB JSON5, `parseFromSlice` into `std.json.Value` vs `JSON5.parse`) · fastest 0.68× the json5 crate 1.3.1 (Rust, into `serde_json::Value`; json-five 0.3.1 timed beside it, 0.36–0.55×; pyjson5 not timed) (measured 2026-10-24)
+**Performance:** ref 0.04–0.05× json5/json5 2.2.3 (bun 1.3.12; `zig build bench-json5`: 1.4 KB config ×1000, 1 MB JSON, 1.1 MB JSON5, `parseFromSlice` into `std.json.Value` vs `JSON5.parse`) · fastest 0.68× the json5 crate 1.3.1 (Rust, into `serde_json::Value`; json-five 0.3.1 timed beside it, 0.36–0.55×, and pyjson5 2.0.1 (Cython/C++, `tools/py_field.py`) at 0.31–0.49×, i.e. 2–3× slower than this module) (measured 2026-11-21)
 
 **Known defects:** none recorded
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.json` | Zig | MIT | — | Zig 0.16.0 | Strict JSON only: no comments, trailing commas or unquoted keys (no comment handling in `lib/std/json/Scanner.zig`). This module exists to feed it. |
 | sibling `yaml` | Zig | MIT | — | this repo | A YAML parser accepts most of what a JSON5 config uses (comments, unquoted keys), with a different data model; not a substitute for JSON5 output. *(inferred from YAML being a JSON superset; module not read)* |
 
-**Where we are ahead:** the only entry that **keeps `std.json` as the parser** (output feeds `parseFromSlice` unchanged, so struct decoding, limits and error sets stay std's), and the only one with an **editor mode**: `preprocessAnnotated` recovers from broken input and reports each problem as a `$err_N` entry with its source line, guaranteed not to change whether the document parses; validated against 112 fixtures of the upstream `json5-tests` corpus in both directions. Against the two Rust crates (`tools/rs_field`): faster on every workload, it refuses two documents the json5 crate 1.3.1 wrongly accepts, and it reads big integers both crates refuse (card `**Ahead:**`). **Where we are behind:** 5 of those 112 fixtures (the ones with `Infinity`/`NaN`) are not asserted in the ordinary loop because they are an error **by design** by default; they parse under `non_finite = .quoted`, which its own test asserts. Unquoted keys accept a superset of ES5.1 IdentifierName instead of Unicode ID_Start/ID_Continue, and there is no reviver/replacer, streaming reader or comment-preserving round trip (all in *What is deliberately not done*). No speed lead is claimed over pyjson5, which was not timed (Backlog).
+**Where we are ahead:** the only entry that **keeps `std.json` as the parser** (output feeds `parseFromSlice` unchanged, so struct decoding, limits and error sets stay std's), and the only one with an **editor mode**: `preprocessAnnotated` recovers from broken input and reports each problem as a `$err_N` entry with its source line, guaranteed not to change whether the document parses; validated against 112 fixtures of the upstream `json5-tests` corpus in both directions. Against the two Rust crates (`tools/rs_field`): faster on every workload, it refuses two documents the json5 crate 1.3.1 wrongly accepts, and it reads big integers both crates refuse (card `**Ahead:**`). **Where we are behind:** 5 of those 112 fixtures (the ones with `Infinity`/`NaN`) are not asserted in the ordinary loop because they are an error **by design** by default; they parse under `non_finite = .quoted`, which its own test asserts. Unquoted keys accept a superset of ES5.1 IdentifierName instead of Unicode ID_Start/ID_Continue, and there is no reviver/replacer, streaming reader or comment-preserving round trip (all in *What is deliberately not done*). Against pyjson5 2.0.1 (Cython over a C++ core) the module is 2–3× faster on all three workloads (`tools/py_field.py`, measured 2026-11-21, spreads 3–17 % against ratios of 0.31–0.49).
 
 ## Design & invariants
 
@@ -207,7 +207,7 @@ Run `scripts/modtest json5` (Debug), `-Doptimize=ReleaseFast`, and `zig fmt --ch
 The reference oracle is re-taken with `zig build interop-json5 -- --check` (needs `bun` with the
 `json5@2.2.3` package in its install cache; see the header of `tools/interop.zig`); the comparative
 benchmark behind the card's `**Performance:**` line is `zig build bench-json5` (`tools/bench.zig`,
-`tools/bench_ref.js`; the Rust comparison is `tools/rs_field`).
+`tools/bench_ref.js`; the Rust comparison is `tools/rs_field`, the pyjson5 one `tools/py_field.py`).
 
 - **Preprocessor and annotated recovery.** Unit tests per construct for both entry points (comments,
   quote conversion and escaping, control characters, line continuations, JSON5 whitespace, key
@@ -275,10 +275,7 @@ asserts against that convention, with two carved-out groups:
 
 ## Backlog / deferred
 
-- **Speed lead over pyjson5.** The card's `fastest` figure is against the json5 crate 1.3.1 and
-  json-five 0.3.1; Kijewski's pyjson5 2.0.1 (Cython, C++ core) has not been timed — building it from its
-  `.pyx` was refused by the session's permission check. Its decoder, read in full, goes character by
-  character into a UCS-4 buffer, so a lead is likely; claim `speed —` only after timing it.
+None open.
 
 ## Anchoring
 
